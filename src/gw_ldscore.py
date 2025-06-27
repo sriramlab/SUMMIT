@@ -34,14 +34,14 @@ def read_cov(
     # 1) load .fam
     fam = pd.read_csv(
         fam_filename,
-        delim_whitespace=True,
+        sep=r'\s+',
         header=None,
         usecols=[0,1],
         names=['FID','IID']
     )
 
     # 2) load covariate file
-    cov = pd.read_csv(cov_filename, delim_whitespace=True)
+    cov = pd.read_csv(cov_filename, sep=r'\s+')
     merged = fam.merge(cov, on=['FID','IID'], how='right', indicator=True)
     missing = merged.loc[merged['_merge'] != 'both', ['FID','IID']]
     if not missing.empty:
@@ -308,7 +308,7 @@ class GenomewideLDScore:
         self.end_time = utils._get_time()
         self.log._log(f"Calculation of genome-wide LD score ended at "+utils._get_timestr(self.end_time))
         self.log._log("Runtime: "+format(self.end_time - self.start_time, '.3f')+" s")
-        self.log._save_log(self.outpath+".log")
+        self.log._save_log(self.outpath+".gw.log")
 
         
 

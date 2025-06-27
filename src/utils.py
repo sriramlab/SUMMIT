@@ -4,7 +4,6 @@ import os
 import re
 import time
 import datetime
-import statsmodels.api as sm
 
 def _replace_None(li: list):
     """

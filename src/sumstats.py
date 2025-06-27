@@ -9,6 +9,7 @@ import utils
 import numpy as np
 import pandas as pd
 from os import listdir
+import sys
 
 class Sumstats:
     '''
@@ -85,47 +86,68 @@ class Sumstats:
     def _match_snps(self):
         ''' 
         match SNPs used for trace calculations & summary statistics
-        returns a nested list of (nblks, nbins, blk_size)
         '''
         matched_zscores = []
         nsnps_blk = np.zeros((self.nblks, self.nbins))
+
         if (self.snplist is None):
             # using all the SNPs
             for i in range(self.nblks):
                 blk_size = self.nsnps//self.nblks
-                blk_zscores = np.array(self.zscores[blk_size*i: blk_size*(i+1)] if (i < self.nblks-1) else self.zscores[blk_size*i: ])
-                blk_annot = self.annot[blk_size*i:blk_size*(i+1)] if (i < self.nblks-1) else self.annot[blk_size*i:]
-                partition, nsnps_partition = utils._partition_bin_non_overlapping(blk_zscores, blk_annot, self.nbins)
-                matched_zscores.append(partition)
-                nsnps_blk[i] = nsnps_partition
-            self.log._log("Using " + str(self.nsnps) + " SNPs to calculate the RHS of the normal equation...")
-        else:
-            zscore_dict = dict(zip(self.snpids, self.zscores))
-            snpid_dict = dict(zip(self.snpids, self.snplist))
-            self.matched_snps = np.array([snpid_dict.get(pid) for pid in self.snpids])
-            nmissing = len(self.snplist) - len(self.matched_snps)
-            for i in range(self.nblks):
-                blk_size = len(self.snplist)//self.nblks
-                blk = self.snplist[blk_size*i: blk_size*(i+1)] if (i < self.nblks-1) else self.snplist[blk_size*i: ]
-                blk_zscores = np.array([zscore_dict.get(pid) for pid in blk])
-                
+                blk_zscores = np.array(self.zscores[blk_size*i: blk_size*(i+1)] if (i < self.nblks-1) else self.zscores[blk_size*i:])
                 blk_annot = self.annot[blk_size*i:blk_size*(i+1)] if (i < self.nblks-1) else self.annot[blk_size*i:]
                 partition, nsnps_partition = utils._partition_bin_non_overlapping(blk_zscores, blk_annot, self.nbins)
                 matched_zscores.append(partition)
                 nsnps_blk[i] = nsnps_partition
 
-            self.log._log("Matched "+str(len(self.snplist) - nmissing)+" SNPs in phenotype "+self.name+\
-                  ", out of "+str(len(self.snplist))+" SNPs ("+str(nmissing)+" missing)")
-        
+            self.log._log("Using " + str(self.nsnps) + " SNPs to calculate the RHS of the normal equation...")
+            # overall histogram on the full set
+            self.zscores_bin, self.nsnps_bin = utils._partition_bin_non_overlapping(self.zscores, self.annot, self.nbins)
+
+        else:
+            # build z-score lookup by SNP ID
+            zscore_dict = dict(zip(self.snpids, self.zscores))
+
+            # keep only SNPs in the snplist for which we have summary stats
+            present = [pid for pid in self.snplist if pid in zscore_dict]
+            missing = set(self.snplist) - set(present)
+            self.matched_snps = np.array(present)
+
+            self.log._log("Matched "+str(len(present))+" SNPs in phenotype "+self.name+", out of "+str(len(self.snplist))+" SNPs ("+str(len(missing))+" missing)")
+
+            # align z-scores & annotations to the filtered list
+            all_z = np.array([zscore_dict[pid] for pid in present])
+            idx_map = dict(zip(self.snplist, range(len(self.snplist))))
+            all_ann = np.array([self.annot[idx_map[pid]] for pid in present])
+
+            total = len(present)
+            if (total < 1):
+                self.log._log("!!! No SNPs are matched. Please check input files. !!!")
+                sys.exit(1)
+                
+            blk_size = total//self.nblks
+            for i in range(self.nblks):
+                start = blk_size*i
+                end = blk_size*(i+1) if (i < self.nblks-1) else total
+
+                blk_zscores = all_z[start:end]
+                blk_annot = all_ann[start:end]
+
+                partition, nsnps_partition = utils._partition_bin_non_overlapping(blk_zscores, blk_annot, self.nbins)
+                matched_zscores.append(partition)
+                nsnps_blk[i] = nsnps_partition
+
+            self.zscores_bin, self.nsnps_bin = utils._partition_bin_non_overlapping(all_z, all_ann, self.nbins)
+
+        # store block‐wise results
         self.nsnps_blk = nsnps_blk
         self.zscores_blk = matched_zscores
-        self.zscores_bin, self.nsnps_bin = utils._partition_bin_non_overlapping(self.zscores, self.annot, self.nbins)
 
-        removesnps = None
-        ## if SNP filtering is on
+        # optional chisq filtering
         if (self.chisq_threshold is not None):
             self.log._log("Filtering SNPs with chi-sq greater than "+str(self.chisq_threshold))
             self.removesnps = self._filter_snps()
+
             
         
     def _calc_rhs_h2(self):

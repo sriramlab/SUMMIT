@@ -258,7 +258,6 @@ class Trace:
         Read the LD score matrix (X^T Xz) instead of trace summaries. Works with either the (truncated) LDSC LD scores (.l2.ldscore.gz) or
         the genome-wide LD scores (.gw.ldscore.gz)
         '''
-        #self.ldscores_df = pd.read_csv(self.ldscorespath, compression='gzip', sep='\t', index_col=False)
         self.ldscores_df = pd.read_csv(self.ldscorespath, compression='gzip', sep=r'\s+', index_col=False)
         self.ldscores = self.ldscores_df.iloc[:, 3:].to_numpy()
         self.snplist = self.ldscores_df['SNP'].to_numpy()
@@ -266,42 +265,3 @@ class Trace:
         self.nbins = self.ldscores.shape[1]
         self.log._log("Loaded the LD score matrix with "+str(self.nsnps)+" SNPs and "+\
                         str(self.nbins)+" bins")
-        
-
-    # def _read_one_rhe(self, filename, idx):
-    #     # read in metadata
-    #     nsamp, nsnps, nblks, nbins = 0, 0, 0, 0
-    #     # the number of blocks in all the trace stats must be the same
-    #     with open(filename+".MN", 'r') as fd:
-    #         next(fd)
-    #         nsamp, nsnps, nblks, nbins = map(int, fd.readline().split(','))
-    #     self.nsamp.append(nsamp)
-    #     if not idx:
-    #         self.nblks = nblks
-    #         self.nbins = nbins
-    #     elif (nblks != self.nblks):
-    #         self.log._log("!!! RHE output "+filename+" has incorrect number of jackknife blocks !!!")
-    #         return
-    #     elif (nbins != self.nbins):
-    #         self.log._log("!!! RHE output "+filename+" has incorrect number of annotation bins !!!")
-    #         return
-    #     trace = np.zeros((self.nblks+1, self.nbins, self.nbins))
-    #     nsnps_blk = np.zeros((self.nblks+1, self.nbins))
-        
-    #     # read in trace values
-    #     for cnt, vals in enumerate(utils._read_multiple_lines(filename+".trace", self.nbins)):
-    #         trace[cnt] = vals[:, :-1]
-    #         nsnps_blk[cnt] = vals[:, -1].transpose()
-        
-    #     # calculate sum of block LD for each jackknife subsample
-    #     lsum = np.zeros((nblks+1, self.nbins, self.nbins))
-    #     for k in range(self.nbins):
-    #         for l in range(self.nbins):
-    #             for j in range(self.nblks+1):
-    #                 lsum[j, k, l] =  utils._calc_lsum(trace[j, k, l], nsamp, nsnps_blk[j, k], nsnps_blk[j, l])
-    #     self.lsums.append(lsum)
-    #     self.nrhe += 1
-    #     # if idx is 0, save # of SNPs in each jackknife subsample (this should be the same in all outputs)
-    #     if not idx:
-    #         self.nsnps_blk = nsnps_blk
-    #         self.nsnps = nsnps
