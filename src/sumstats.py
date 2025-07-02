@@ -44,34 +44,49 @@ class Sumstats:
             self.log._log("!!! SNP list (.bim) must be input in order to perform both-side SNP filtering! !!!")
             return
         self.name = None
-        self.removesnps = None
+        self.removesnps = [] ## store any SNPs that are removed from estimation
         
     def _filter_snps(self):
         ''' 
-        TODO: Remove SNPs with chi-sq statistic above threshold. For 'problem' SNPs, change 
+        TODO: Remove SNPs with chi-sq statistic above threshold or NaN values. For 'problem' SNPs, change 
         beta to zero and reduce nsnps. This function must be called during match_snps
         return list of SNPs that were removed
         '''
-        chisq = pow(self.zscores, 2)
         removesnps = []
-        for i in range(self.nsnps):
-            if (chisq[i] > self.chisq_threshold):
-                self.zscores[i] = .0
-                self.nsnps -= 1
-                if (self.snplist is not None):
-                    if (self.matched_snps[i] is not None):
-                        removesnps.append(self.matched_snps[i])
-        self.log._log("Removed "+str(len(removesnps))+" SNPs with chi-sq above the threshold")
-        return removesnps
+        chisq = pow(self.zscores, 2)
+
+        keep_mask = (chisq <= self.chisq_threshold) & (~np.isnan(chisq))
+        for pid, keep in zip(self.snpids, keep_mask):
+            if not keep:
+                removesnps.append(pid)
         
+        self.snpids  = [pid for pid, keep in zip(self.snpids, keep_mask) if keep]
+        self.zscores = self.zscores[keep_mask]
+        self.nsnps   = len(self.zscores)
+
+        self.log._log(f"Removed {len(removesnps)} SNPs with chi-sq above the threshold {self.chisq_threshold}")
+        
+        return removesnps
+
     def _read_sumstats(self, path, name):
         ''' Read in summary statistics for a single phenotype '''
-        # snpid = []
-        # Nmiss = []
-        # zscores = []
         self.name = name        
         # TODO: implement snplist matching with dataframe instead
-        sumdf = pd.read_csv(path, sep='\s+')
+        sumdf = pd.read_csv(path, sep=r'\s+')
+
+        # drop any row with missing N or Z
+        ncol = utils._parse_column_name(sumdf, ['N','n'], 3)
+        zcol = utils._parse_column_name(sumdf, ['Z','z'], 3)
+        idcol = utils._parse_column_name(sumdf, ['ID','id','snp','SNP'], 0)
+        drop_mask = sumdf[ncol].isna() | sumdf[zcol].isna()
+
+        # keep those SNP IDs for both-sides filtering
+        self.removesnps = sumdf.loc[drop_mask, idcol].dropna().astype(str).tolist()
+
+        self.log._log(f"Dropping {len(self.removesnps)} SNPs with NA values.")
+
+        sumdf = sumdf.loc[~drop_mask].reset_index(drop=True)
+
         Nmiss = utils._parse_column(sumdf, ['N', 'n'], 3)
         zscores = utils._parse_column(sumdf, ['Z', 'z'], 3)
         self.snpids = utils._parse_column(sumdf, ['ID', 'id', 'snp', 'SNP'], 0)
@@ -89,6 +104,10 @@ class Sumstats:
         '''
         matched_zscores = []
         nsnps_blk = np.zeros((self.nblks, self.nbins))
+
+        if (self.chisq_threshold is not None):
+            self.log._log(f"Filtering SNPs with chi-sq greater than {self.chisq_threshold}")
+            self.removesnps.extend(self._filter_snps())
 
         if (self.snplist is None):
             # using all the SNPs
@@ -141,14 +160,7 @@ class Sumstats:
 
         # store block‐wise results
         self.nsnps_blk = nsnps_blk
-        self.zscores_blk = matched_zscores
-
-        # optional chisq filtering
-        if (self.chisq_threshold is not None):
-            self.log._log("Filtering SNPs with chi-sq greater than "+str(self.chisq_threshold))
-            self.removesnps = self._filter_snps()
-
-            
+        self.zscores_blk = matched_zscores            
         
     def _calc_rhs_h2(self):
         ''' calculate the RHS of the normal equation in h2 calculation '''

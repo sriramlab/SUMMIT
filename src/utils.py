@@ -149,6 +149,19 @@ def _parse_column(df, letters, min_index=3):
     else:
         return df[matching_columns[0]].values
 
+def _parse_column_name(df, letters, min_index=3):
+    '''
+    select only the column names that include certain letters & after certain column index
+    '''
+    matching_columns = [col for col in df.columns[min_index:] if any(letter in col for letter in letters)]
+
+    if len(matching_columns) == 0:
+        raise ValueError(f"No column containing any of the letters {letters} found starting from column {min_index}.")
+    elif len(matching_columns) > 1:
+        raise ValueError(f"Multiple columns containing the letters {letters} found: {matching_columns}. Expected only one.")
+    else:
+        return matching_columns[0]
+
 def _solve_linear_equation(X, y, method='lstsq'):
     '''
     Solve system of linear equations (either least square or QR)
