@@ -8,21 +8,17 @@ import sys
 
 class Sumrhe:
     def __init__(self, bim_path=None, sum_path=None, save_path=None, h2_path=None, out=None, chisq_threshold=0, \
-            log=None, mem=False, allsnp=False, verbose=False, filter_both=False, ldscores=None, njack=None, annot=None):
+            log=None, mem=False, verbose=False, ldscores=None, njack=None, annot=None):
         self.mem = mem
         self.log = log
         self.start_time = utils._get_time()
         self.log._log("Analysis started at: "+utils._get_timestr(self.start_time))
         self.tr = Trace(bimpath=bim_path, sumpath=sum_path, savepath=save_path, ldscores=ldscores, log=self.log, nblks=njack, annot=annot, verbose=verbose)
-        self.snplist = self.tr.snplist
         self.nblks = self.tr.nblks
-        self.annot = self.tr.annot
         self.annot_header = self.tr.annot_header
         self.nbins = self.tr.nbins
-        if (allsnp):
-            self.sums = Sumstats(nblks=self.nblks, chisq_threshold=chisq_threshold, log=self.log, annot=self.annot, nbins=self.nbins)
-        else:
-            self.sums = Sumstats(nblks=self.nblks, snplist = self.snplist, chisq_threshold=chisq_threshold, log=self.log, annot=self.annot, nbins=self.nbins)
+        self.sums = Sumstats(nblks=self.nblks, chisq_threshold=chisq_threshold, log=self.log, annot_df=self.tr.annot_df, nbins=self.nbins)
+        
         self.h2_dir = None
         # check whether the path for sumstats is a directory or a file (or even regex). count # of phenotypes
         # TODO: allow regex matching for file names
@@ -52,7 +48,6 @@ class Sumrhe:
         self.hsums = np.zeros((self.npheno, self.nbins+2, 2)) # partitioned h2 + total h2
 
         self.out = out
-        self.filter_both = filter_both
         self.verbose = verbose
 
     def _calc_h2(self, idx):
@@ -80,9 +75,7 @@ class Sumrhe:
         for i in range(self.npheno):
             h2_path=self.h2_dir[i]
             removesnps = self.sums._process(h2_path, self.phen_names[i])
-            self.tr._reset()
-            if (removesnps is not None) and (self.filter_both):
-                self.tr._filter_snps(removesnps)
+            self.tr._filter_snps(removesnps) # always try to filter both sides
             self.nsamp.append(self.sums.nsamp)
             self._calc_h2(i)
             self._run_jackknife(i)

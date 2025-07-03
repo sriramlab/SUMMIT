@@ -16,62 +16,35 @@ class Sumstats:
     Sumstats class is called in the sums (sums.py) module. It's called after the trace module, which will then call this module
     in order to read in the phenotype sumstats. Current version can store only a single phenotype sumstats at a time (to save memory)
     '''
-    def __init__(self, nblks=100, snplist = None, chisq_threshold=0, log=None, both_side=False, annot=None, nbins=1):
+    def __init__(self, nblks=100, chisq_threshold=0, log=None, both_side=False, annot_df=None, nbins=1):
         self.log = log
         self.nblks = nblks
         self.nbins = nbins
-        self.snplist = snplist
-        if snplist is None:
-            self.log._log("!!! Missing the list of SNPs used in trace calculation."+\
-                  " All SNPs in the phenotype sumstats will be used. !!!")
-        else:
-            self.nsnps_trace = len(snplist)
-        self.snpids = []
-        self.annot = annot
+        # self.snplist = snplist
+        # if snplist is None:
+        #     self.log._log("!!! Missing the list of SNPs used in trace calculation."+\
+        #           " All SNPs in the phenotype sumstats will be used. !!!")
+        # else:
+        #     self.nsnps_trace = len(snplist)
+        self.annot_df = annot_df
+        self.snpids = len(annot_df)
+        self.annot = None # annotation for partitioned heritability (if None, assume single-bin)
         self.zscores = []
         self.zscores_bin = [] # list of list, where zscores are partitioned by bin assignment
         self.zscores_blk = [] # list of list of list, where zscores are partitioned by blk & bin assignment
         self.RHS = None # array of RHS for each pheno
-        self.annot = annot # annotation for partitioned heritability (if None, assume single-bin)
         self.nsamp = 0
         self.nsnps = 0
         self.nsnps_blk = None # array for keeping track of number of SNPs in each leave-one-out blk
         self.nsnps_bin = None # total number of SNPs for each bin
         self.chisq_threshold = chisq_threshold # if positive value, then remove snps with chisq above it
-        self.both_side = both_side # whether you filter SNPs on both sides. MUST have the snplist.
         self.matched_snps = None # array of matched SNPs
-        if (self.both_side) and (snplist is None):
-            self.log._log("!!! SNP list (.bim) must be input in order to perform both-side SNP filtering! !!!")
-            return
         self.name = None
         self.removesnps = [] ## store any SNPs that are removed from estimation
-        
-    def _filter_snps(self):
-        ''' 
-        TODO: Remove SNPs with chi-sq statistic above threshold or NaN values. For 'problem' SNPs, change 
-        beta to zero and reduce nsnps. This function must be called during match_snps
-        return list of SNPs that were removed
-        '''
-        removesnps = []
-        chisq = pow(self.zscores, 2)
-
-        keep_mask = (chisq <= self.chisq_threshold) & (~np.isnan(chisq))
-        for pid, keep in zip(self.snpids, keep_mask):
-            if not keep:
-                removesnps.append(pid)
-        
-        self.snpids  = [pid for pid, keep in zip(self.snpids, keep_mask) if keep]
-        self.zscores = self.zscores[keep_mask]
-        self.nsnps   = len(self.zscores)
-
-        self.log._log(f"Removed {len(removesnps)} SNPs with chi-sq above the threshold {self.chisq_threshold}")
-        
-        return removesnps
 
     def _read_sumstats(self, path, name):
         ''' Read in summary statistics for a single phenotype '''
-        self.name = name        
-        # TODO: implement snplist matching with dataframe instead
+        self.name = name
         sumdf = pd.read_csv(path, sep=r'\s+')
 
         # drop any row with missing N or Z
@@ -85,18 +58,14 @@ class Sumstats:
 
         self.log._log(f"Dropping {len(self.removesnps)} SNPs with NA values.")
 
-        sumdf = sumdf.loc[~drop_mask].reset_index(drop=True)
+        sumdf = sumdf.loc[~drop_mask]
 
-        Nmiss = utils._parse_column(sumdf, ['N', 'n'], 3)
-        zscores = utils._parse_column(sumdf, ['Z', 'z'], 3)
-        self.snpids = utils._parse_column(sumdf, ['ID', 'id', 'snp', 'SNP'], 0)
+        sumdf = sumdf.rename(columns = {idcol: 'SNP', zcol: 'Z', ncol: 'N'})
 
-        nsamp = float(max(Nmiss))
-        zscores = np.array(zscores)*np.sqrt(np.array(Nmiss)/nsamp)
-        self.zscores = zscores
-        self.nsamp = nsamp
-        self.nsnps = len(zscores)
-        return zscores
+        sumdf['Z'] = sumdf['Z']*np.sqrt(sumdf['N']/sumdf['N'].max())
+
+        self.sumdf = sumdf[['SNP','Z']].copy()
+        self.nsamp = float(sumdf['N'].max())
 
     def _match_snps(self):
         ''' 
@@ -107,56 +76,63 @@ class Sumstats:
 
         if (self.chisq_threshold is not None):
             self.log._log(f"Filtering SNPs with chi-sq greater than {self.chisq_threshold}")
-            self.removesnps.extend(self._filter_snps())
+            chisq = self.sumdf['Z']**2
+            keep  = (chisq <= self.chisq_threshold) & (~chisq.isna())
+            chisq_snps = self.sumdf.loc[~keep, 'SNP'].tolist()
+            self.removesnps += chisq_snps
+            self.sumdf = self.sumdf.loc[keep]
+            self.log._log(f"Removed {len(chisq_snps)} SNPs with chi-sq above the threshold {self.chisq_threshold} ({len(self.sumdf)} SNPs remaining)")
 
-        if (self.snplist is None):
-            # using all the SNPs
-            for i in range(self.nblks):
-                blk_size = self.nsnps//self.nblks
-                blk_zscores = np.array(self.zscores[blk_size*i: blk_size*(i+1)] if (i < self.nblks-1) else self.zscores[blk_size*i:])
-                blk_annot = self.annot[blk_size*i:blk_size*(i+1)] if (i < self.nblks-1) else self.annot[blk_size*i:]
-                partition, nsnps_partition = utils._partition_bin_non_overlapping(blk_zscores, blk_annot, self.nbins)
-                matched_zscores.append(partition)
-                nsnps_blk[i] = nsnps_partition
+        # if (self.snplist is None):
+        #     # using all the SNPs
+        #     for i in range(self.nblks):
+        #         blk_size = self.nsnps//self.nblks
+        #         blk_zscores = np.array(self.zscores[blk_size*i: blk_size*(i+1)] if (i < self.nblks-1) else self.zscores[blk_size*i:])
+        #         blk_annot = self.annot[blk_size*i:blk_size*(i+1)] if (i < self.nblks-1) else self.annot[blk_size*i:]
+        #         partition, nsnps_partition = utils._partition_bin_non_overlapping(blk_zscores, blk_annot, self.nbins)
+        #         matched_zscores.append(partition)
+        #         nsnps_blk[i] = nsnps_partition
 
-            self.log._log("Using " + str(self.nsnps) + " SNPs to calculate the RHS of the normal equation...")
-            # overall histogram on the full set
-            self.zscores_bin, self.nsnps_bin = utils._partition_bin_non_overlapping(self.zscores, self.annot, self.nbins)
+        #     self.log._log("Using " + str(self.nsnps) + " SNPs to calculate the RHS of the normal equation...")
+        #     # overall histogram on the full set
+        #     self.zscores_bin, self.nsnps_bin = utils._partition_bin_non_overlapping(self.zscores, self.annot, self.nbins)
 
-        else:
-            # build z-score lookup by SNP ID
-            zscore_dict = dict(zip(self.snpids, self.zscores))
+        # else: # FIXME: snplist is now always provided!
+        
+        # match summary statistics with annot_df
+        df = self.sumdf.merge(self.annot_df, how='inner', on='SNP')
+        missing = set(self.annot_df['SNP']) - set(df['SNP'])
+        if missing:
+            self.removesnps.extend(list(missing))
+        self.matched_snps = np.array(df['SNP'])
+        self.log._log(f"Matched {len(df)} SNPs in phenotype {self.name} out of {len(self.annot_df)} annotated SNPs ({len(missing)} missing or filtered)")
+    
+        # align z-scores & annotations to the filtered list
+        all_z    = df['Z'].values
+        ann_cols = df.columns[-self.nbins:]
+        all_ann  = df[ann_cols].values
+        total = len(df)
+        
+        blk_size = total//self.nblks
+        
+        for i in range(self.nblks):
+            start = blk_size*i
+            end = blk_size*(i+1) if (i < self.nblks-1) else total
 
-            # keep only SNPs in the snplist for which we have summary stats
-            present = [pid for pid in self.snplist if pid in zscore_dict]
-            missing = set(self.snplist) - set(present)
-            self.matched_snps = np.array(present)
+            blk_zscores = all_z[start:end]
+            blk_annot = all_ann[start:end]
 
-            self.log._log("Matched "+str(len(present))+" SNPs in phenotype "+self.name+", out of "+str(len(self.snplist))+" SNPs ("+str(len(missing))+" missing)")
+            partition, nsnps_partition = utils._partition_bin_non_overlapping(blk_zscores, blk_annot, self.nbins)
+            matched_zscores.append(partition)
+            nsnps_blk[i] = nsnps_partition
 
-            # align z-scores & annotations to the filtered list
-            all_z = np.array([zscore_dict[pid] for pid in present])
-            idx_map = dict(zip(self.snplist, range(len(self.snplist))))
-            all_ann = np.array([self.annot[idx_map[pid]] for pid in present])
+        self.zscores_bin, self.nsnps_bin = utils._partition_bin_non_overlapping(all_z, all_ann, self.nbins)
 
-            total = len(present)
-            if (total < 1):
-                self.log._log("!!! No SNPs are matched. Please check input files. !!!")
+        # check if any bins are empty
+        for b in range(self.nbins):
+            if (self.nsnps_bin[b] == 0):
+                self.log._log(f"!!! Bin {b} contains zero SNPs after matching. Please check your annotation and SNP lists. !!!")
                 sys.exit(1)
-                
-            blk_size = total//self.nblks
-            for i in range(self.nblks):
-                start = blk_size*i
-                end = blk_size*(i+1) if (i < self.nblks-1) else total
-
-                blk_zscores = all_z[start:end]
-                blk_annot = all_ann[start:end]
-
-                partition, nsnps_partition = utils._partition_bin_non_overlapping(blk_zscores, blk_annot, self.nbins)
-                matched_zscores.append(partition)
-                nsnps_blk[i] = nsnps_partition
-
-            self.zscores_bin, self.nsnps_bin = utils._partition_bin_non_overlapping(all_z, all_ann, self.nbins)
 
         # store block‐wise results
         self.nsnps_blk = nsnps_blk

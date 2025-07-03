@@ -29,11 +29,10 @@ class Trace:
         self.nsnps = 0 # number of SNPs is fixed
         self.nsnps_blk = None # array for keeping track of number of SNPs in each leave-one-out blk
         self.nsnps_bin = None
-        self.nsnps_blk_filt = None # this is the nsnps for each jn, which is filtered in case of --filter-both-sides
         self.verbose = verbose
         if (bimpath is None) or (bimpath == ""):
             if (self.ldscorespath is None):
-                self.log._log("!!! SNP list (.bim) is generally recommended if using trace summaries (.tr) !!!")
+                self.log._log("!!! SNP list (.bim) is required if using trace summaries (.tr) !!!")
         elif (bimpath.endswith(".bim")):
             with open(bimpath, 'r') as fd:
                 for line in fd:
@@ -51,31 +50,63 @@ class Trace:
         self._read_annot(annot)
     
     def _read_annot(self, annot_path):
+        # use single bin
         if (annot_path is None):
-            self.annot_header = np.array(['L2'])
-            self.annot = np.ones((self.nsnps, 1))
-            self.log._log("Running with single component")
+            header = np.array(['L2'])
+            annot = np.ones((self.nsnps, 1))
+            self.log._log("Running with single component annotation...")
         else:
-            self.annot_header, self.annot = utils._read_with_optional_header(annot_path)
-            if (self.annot.ndim == 1):
-                self.annot = self.annot.reshape(-1, 1)
-            if (self.annot_header is None):
-                self.annot_header = np.array(['L2_'+str(i) for i in range(self.annot.shape[1])])
-            self.log._log("Read SNP partition annotation of dimensions "+str(self.annot.shape))
-        if (self.nbins != self.annot.shape[1]) or (self.nsnps != self.annot.shape[0]):
-            self.log._log("!!! number of components in annotation does not match the input trace summary !!!")
-            sys.exit(1)
-        self.blk_size = self.nsnps//self.nblks
-        self.log._log("Number of jackknife blocks: "+str(self.nblks)+", blk_size: "+str(self.blk_size))
-        self.nsnps_bin = self.annot.sum(axis=0)
-        self.nsnps_blk = np.full((self.nblks+1, self.nbins), self.nsnps_bin)
-        for i in range(self.nblks):
-            idx_start = self.blk_size*i
-            idx_end = self.blk_size*(i+1)
-            if (i==self.nblks-1):
-                idx_end = self.nsnps
-            self.nsnps_blk[i] -= self.annot[idx_start: idx_end].sum(axis=0)
-       
+            try: # try reading full annotation dataframe (.annot or .annot.gz)
+                df = pd.read_csv(annot_path, sep=r'\s+', compression='infer')
+                if 'SNP' not in df.columns:
+                    raise ValueError("!!! Input annotation file is not in correct format !!!")
+                # annotation bins are all cols after the first three metadata columns ('CHR', 'SNP', 'BP')
+                annot_cols = df.columns.tolist()[3:]
+                self.annot_header = np.array(annot_cols)
+                annot_df = df[['SNP'] + annot_cols].copy()
+                
+                overlap = [snp for snp in self.snplist if snp in annot_df['SNP'].values]
+                missing = set(self.snplist) - set(overlap)
+                if missing:
+                    self.log._log(f"Dropping {len(missing)} SNPs from annotation as they are missing LD information.")
+                    
+                annot_df = (annot_df.set_index('SNP').loc[overlap].reset_index())
+                self.annot_df = annot_df
+                self.annot = annot_df[annot_cols].values
+                self.log._log("Read full annotation of shape " + str(self.annot.shape))
+                
+                # prune LD scores if present
+                if getattr(self, 'ldscores', None) is not None:
+                    ld_df = (self.ldscores_df.set_index('SNP').loc[overlap].reset_index())
+                    self.ldscores_df = ld_df
+                    self.ldscores = ld_df.iloc[:, 3:].to_numpy()
+                    self.nsnps = len(overlap)
+                    self.snplist = overlap
+                    self.log._log(f"Pruned LD‐score to {self.nsnps} SNPs that match with the annotation file.")
+            
+            except ValueError: # try reading thin annot
+                if (self.snplist is None):
+                    raise ValueError("!!! Thin annotation requires a BIM/snplist when using trace-summaries !!!")
+                header, annot = utils._read_with_optional_header(annot_path)
+                if annot.ndim == 1: # single bin
+                    annot = annot.reshape(-1, 1)
+                else:
+                    annot = annot.reshape(-1, annot.shape[-1])
+                if header is None:
+                    header = np.array([f'bin_{i}' for i in range(annot.shape[1])])
+                cols = header.tolist()
+                
+                if (self.nbins != annot.shape[1]) or (self.nsnps != annot.shape[0]):
+                    self.log._log("!!! number of components in annotation does not match the input trace/LD summary !!!")
+                    sys.exit(1)
+                
+                annot_df = pd.DataFrame(annot, index=self.snplist, columns=cols)
+                annot_df.reset_index(inplace=True)
+                annot_df.rename(columns={'index':'SNP'}, inplace=True)
+                self.annot_header = np.array(cols)
+                self.annot_df = annot_df
+                self.annot = annot_df[cols].values
+                self.log._log("Read thin annotation matrix of shape " + str(self.annot.shape))      
     
     def _save_trace(self):
         ''' Save trace summaries as a file'''
@@ -156,7 +187,19 @@ class Trace:
         ## TODO: is it correct to take a weighted average by sample size?
         self.sums = np.average(self.sums, axis=0, weights=self.nsamp)
         self.nsamp = np.mean(self.nsamp)
-        return self.sums
+
+    def _read_ldscores(self):
+        '''
+        Read the LD score matrix (X^T Xz) instead of trace summaries. Works with either the (truncated) LDSC LD scores (.l2.ldscore.gz) or
+        the genome-wide LD scores (.gw.ldscore.gz)
+        '''
+        self.ldscores_df = pd.read_csv(self.ldscorespath, compression='gzip', sep=r'\s+', index_col=False)
+        self.ldscores = self.ldscores_df.iloc[:, 3:].to_numpy()
+        self.snplist = self.ldscores_df['SNP'].to_numpy()
+        self.nsnps = self.ldscores.shape[0]
+        self.nbins = self.ldscores.shape[1]
+        self.log._log("Loaded the LD score matrix with "+str(self.nsnps)+" SNPs and "+\
+                        str(self.nbins)+" bins")
 
     def _calc_trace(self, nsample):
         self.log._log("Calculating trace...")
@@ -196,46 +239,38 @@ class Trace:
                     if (noverlap is not None): # constrained version with N is available
                         trace[j, k, l] += noverlap
         return trace
-        
-    def _reset(self):
-        '''
-        this is for running multiple phenotypes; reset the *_filt params
-        '''
-        self.nsnps_blk_filt = self.nsnps_blk
-        self.sums_filt = self.sums
-        self.nsnps_blk_filt = self.nsnps_blk
 
-    def _filter_snps(self, removelist):
+    def _filter_snps(self, removesnps):
         '''
-        Remove the SNPs in the removelist from trace calculation. If (truncated) LD scores are available,
-        then use a scaled trace contribution from those SNPs; otherwise, assume uniform LD mapping (i.e.,
-        long-distance LD distribution is the same for all the SNPs)
-        Since different SNPs are filtered for each phenotype, modify only the "_filt" parameters
+        Remove the SNPs in the removesnps from trace calculation. Only possible when LD scores are used as input.
         '''
-        # filter w/o ldscores
-        if (self.ldscores is None):
-            # filter w/o snplist (.bim): since we don't know which jn block
-            # they belong to, treat as uniform chance of belonging to any block
-            if (len(self.snplist) == 0):
-                self.sums_filt *= (1 - len(removelist)/self.nsnps_blk_filt)
-                self.nsnps_blk_filt -= len(removelist)*(self.nblks-1)/self.nblks
-            # we know where the snp belongs to, but don't have their (truncated) LD information
-            # then simply scale each block 
-            else:
-                self._calc_blk_ld()
-                self._map_idx()
-                removeidx = [self.mapping.get(snp, None) for snp in removelist]
-                indices, counts = np.unique(removeidx, return_counts=True)
-                # for idx, cnt in zip(indices, counts):
-                #     self.ldsums_blk_filt[idx] *= (1 - cnt/self.nsnps_blk_filt[idx])
-                #     self.nsnps_blk_filt[idx] -= cnt
-                # print(sum(self.ldsums_blk_filt))
-                # print(sum(self.nsnps_blk_filt))
-                #updated_sums = self._calc_jn_subsample(self.ldsums_blk_filt)
-                #print(updated_sums[:-1].min(), updated_sums[:-1].mean(), updated_sums.max(), updated_sums[-1])
-        ### TODO: it's possible that some of the SNPs in the trace is not included in the sumstat
-        ### in this case perhaps it's possible to remove those SNPs in the trace calculations as well
-        ### implement this
+        if self.ldscores is None:
+            return
+        
+        mask = ~self.annot_df['SNP'].isin(removesnps)
+        
+        new_snps = self.annot_df.loc[mask, 'SNP'].tolist()
+        self.nsnps = len(new_snps)
+
+        self.annot = self.annot_df.loc[mask, list(self.annot_header)].to_numpy()
+        self.ldscores = self.ldscores_df.loc[mask, self.ldscores_df.columns[3:]].to_numpy()
+
+        self.blk_size = self.nsnps // self.nblks
+        self.nsnps_bin = self.annot.sum(axis=0)
+
+        self.nsnps_blk = np.full((self.nblks+1, self.nbins), self.nsnps_bin)
+        for j in range(self.nblks):
+            start = self.blk_size * j
+            end   = self.blk_size*(j+1) if (j < self.nblks-1) else self.nsnps
+            self.nsnps_blk[j] -= self.annot[start:end].sum(axis=0)
+
+        n_removed = len(self.annot_df) - mask.sum()
+        self.log._log(f"Filtered {n_removed} SNPs from the Trace module. Shape of final annotation used for analysis: {self.annot.shape}")
+        if (n_removed/len(self.annot_df) > 0.01):
+            self.log._log(f"[WARNING: Removing too many Trace SNPs will result in under-estimated heritability!]\n"+\
+                "[We recommend using a better curated reference LD score panel with a more similar SNP set to the summary statistics SNPs.]")
+
+            
 
     def _calc_trace_from_ldscores(self, N):
         trace = np.full((self.nblks+1, self.nbins+1, self.nbins+1), N)
@@ -252,16 +287,3 @@ class Trace:
                         ld_sum_jn = ld_sum
                     trace[j, k, l] = utils._calc_trace_from_ld(ld_sum_jn, N, self.nsnps_blk[j, k], self.nsnps_blk[j, l])
         return trace
-
-    def _read_ldscores(self):
-        '''
-        Read the LD score matrix (X^T Xz) instead of trace summaries. Works with either the (truncated) LDSC LD scores (.l2.ldscore.gz) or
-        the genome-wide LD scores (.gw.ldscore.gz)
-        '''
-        self.ldscores_df = pd.read_csv(self.ldscorespath, compression='gzip', sep=r'\s+', index_col=False)
-        self.ldscores = self.ldscores_df.iloc[:, 3:].to_numpy()
-        self.snplist = self.ldscores_df['SNP'].to_numpy()
-        self.nsnps = self.ldscores.shape[0]
-        self.nbins = self.ldscores.shape[1]
-        self.log._log("Loaded the LD score matrix with "+str(self.nsnps)+" SNPs and "+\
-                        str(self.nbins)+" bins")

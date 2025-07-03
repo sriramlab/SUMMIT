@@ -15,20 +15,18 @@ parser.add_argument("--trace", default=None, type=str, \
 parser.add_argument("--save-trace", default=None, type=str, \
                     help='File path for saving (aggregated) trace summaries (.tr) and corresponding metadata (.MN)')
 parser.add_argument("--bim", default=None, type=str, \
-                    help='File path for the reference .bim file used for trace calculation (optional)')
+                    help='File path for the reference .bim file used for trace calculation (required for trace summaries).')
 parser.add_argument("--max-chisq", action='store', default=None, type=float, \
                     help='Filter out SNPs with chi-sq statistic above the threshold.'
                     ' This can be done either only on the yKy or on both sides (use --filter-both-sides);'
                     ' with many non-polygenic SNPs, one-sided filtering might not be accurate')
-parser.add_argument("--filter-both-sides", action='store_true', default=False, \
-                    help='When filtering SNPs, remove their effects on both trace and yKy.'
-                    ' This requires the (truncated) LD scores of all the SNPs used in trace calculation')
+# parser.add_argument("--filter-both-sides", action='store_true', default=False, \
+#                     help='When filtering SNPs, remove their effects on both trace and yKy.'
+#                     ' This requires the (truncated) LD scores of all the SNPs used in trace calculation')
 parser.add_argument("--ldscores", default=None, type=str, \
                     help='File path for LD scores of the reference SNPs. You may use either the traditional (truncated) LD scores (.l2.ldscore.gz) or genome-wide stochastic LD scores (.gw.ldscore.gz)')
 parser.add_argument("--out", default=None, type=str, \
                     help='Output file path to save the analysis log and result (.log) or the genome-wide LD scores (.gw.ldscore.gz)')
-parser.add_argument("--all-snps", action='store_true', default=False,\
-                    help="Use all the SNPs in the phenotype sumamry statistics. Make sure this is safe to do so.")
 parser.add_argument("--verbose", action="store_true", default=False,\
                     help='Verbose mode: print out the normal equations')
 parser.add_argument("--suppress", action="store_true", default=False,\
@@ -37,6 +35,8 @@ parser.add_argument("--njack", default=100, type=int, \
                     help='Number of jackknife blocks (only if using LD scores as input)')
 parser.add_argument("--annot", default=None, type=str, \
                     help='Path of the annotation file (only if using partitioned heritability)')
+parser.add_argument("--thin-annot", action='store_true', default=False, \
+                    help='Use thin annotation (annotation matrix only) instead of full annotation file')
 parser.add_argument("--geno", default=None, type=str, \
                     help='Path of the genotype file to calculate the genome-wide LD scores. Calculates partitioned scores if --annot is also specified.')
 parser.add_argument("--nworkers", default=4, type=int, \
@@ -60,6 +60,7 @@ parser.add_argument("--intercept-rg", action='store', default=None, type=float, 
 parser.add_argument("--pheno-rg", default=None, type=str, \
                     help="Comma-separated file path for a pair of (overlapping) individual-level phenotypes used in the pair of summary statistics (--rg). "
                     "This option may yield more accurate estimates (alternative to --intercept-rg).")
+
 
 if __name__ == '__main__':
     args = parser.parse_args()
@@ -93,17 +94,17 @@ if __name__ == '__main__':
     elif (args.h2 is not None):
         if (args.trace is None) and (args.ldscores is None):
             log._log("!!! Either trace summary or LD score (truncated or genome-wide) must be provided !!!")
+            if (args.trace is not None) and (args.bim is None):
+                log._log("!!! .bim file used for trace summary calculation must also be provided !!!")
+                sys.exit(1)
             sys.exit(1)
-        # if (args.save_trace is not None) and ((args.rhe is None) and (args.ldscores is None)):
-        #     # TODO: allow combining the trace summaries with rhe traceoutputs
-        #     log._log("!!! RHE trace output or LD scores must be provided for --save-trace !!!")
         if (args.max_chisq is not None):
             if (args.max_chisq <= .0):
                 log._log("!!! max-chisq must be a positive value !!!")
                 sys.exit(1)
         sums = Sumrhe(bim_path=args.bim, sum_path=args.trace, save_path = args.save_trace, h2_path=args.h2,\
-            chisq_threshold=args.max_chisq, log=log, out=args.out, allsnp=args.all_snps, verbose=args.verbose, \
-                filter_both=args.filter_both_sides, ldscores=args.ldscores, njack=args.njack, annot=args.annot)
+            chisq_threshold=args.max_chisq, log=log, out=args.out, verbose=args.verbose, ldscores=args.ldscores,\
+            njack=args.njack, annot=args.annot)
         sums._run()
         sums._logoff()
     elif (args.rg is not None):
@@ -115,7 +116,7 @@ if __name__ == '__main__':
             sys.exit(1)
         rg = Sumcore(bim_path=args.bim, save_path = args.save_trace, rg=args.rg,\
             chisq_threshold=args.max_chisq, log=log, verbose=args.verbose, out=args.out, \
-            filter_both=args.filter_both_sides, ldscores=args.ldscores, njack=args.njack, annot=args.annot, \
+            ldscores=args.ldscores, njack=args.njack, annot=args.annot, \
             intercept=args.intercept_rg, phenos=args.pheno_rg)
         rg._run()
         rg._logoff()
