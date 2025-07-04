@@ -4,6 +4,7 @@ import os
 import re
 import time
 import datetime
+import glob
 
 def _replace_None(li: list):
     """
@@ -135,6 +136,54 @@ def _get_timestr(current_time):
     timezone = datetime.datetime.now(datetime.timezone.utc).astimezone().tzinfo
     timestr = str(time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(current_time)))+" "+str(timezone)
     return timestr
+
+def _parse_sumdir(path):
+    '''
+    check whether the path for sumstats is a directory or a file (or even regex).
+    TODO: allow regex matching for file names
+    '''
+    if not os.path.exists(path):
+        raise ValueError(f"--h2 path '{path}' does not exist")
+    # if dir, glob for anything with “.sumstat” in the name
+    if os.path.isdir(path):
+        pattern = os.path.join(path.rstrip("/"), "*.sumstat*")
+        sum_files = sorted(glob.glob(pattern))
+        if not sum_files:
+            raise ValueError(f"--h2 path '{path}' contains no '*.sumstat*' files")
+        return sum_files
+
+    # if file, only accept if it has “.sumstat” in the basename
+    if os.path.isfile(path):
+        name = os.path.basename(path)
+        if ".sumstat" in name:
+            return [path]
+        else:
+            raise ValueError(f"--h2 file '{path}' is not a '*.sumstat*' file")
+    raise ValueError(f"--h2 path '{path}' is invalid")
+
+def _parse_rgdir(rg):
+    """
+    Parse an --rg argument string into exactly two sumstat file paths.
+    Accepts any filename containing '.sumstat' (e.g. .sumstat, .sumstat.gz, etc.)
+    """
+    if rg is None:
+        raise ValueError("--rg must be provided for genetic correlation.")
+
+    paths = rg.split(",")
+    if len(paths) != 2:
+        raise ValueError("--rg must be exactly two comma-separated '*.sumstat*' files.")
+
+    validated = []
+    for p in paths:
+        if not os.path.isfile(p):
+            raise ValueError(f"--rg path '{p}' does not exist or is not a file.")
+        if ".sumstat" not in os.path.basename(p):
+            raise ValueError(f"--rg file '{p}' is not a valid '*.sumstat*' file.")
+        validated.append(p)
+
+    return validated
+
+
     
 def _parse_column(df, letters, min_index=3):
     '''

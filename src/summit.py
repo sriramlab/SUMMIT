@@ -114,7 +114,7 @@ if __name__ == '__main__':
         if (args.intercept_rg is not None and args.pheno_rg is not None):
             log._log("!!! --intercept-rg and --pheno-rg cannot be used together; please use one of the two options !!!")
             sys.exit(1)
-        rg = Sumcore(bim_path=args.bim, save_path = args.save_trace, rg=args.rg,\
+        rg = Sumcore(bim_path=args.bim, save_path=args.save_trace, rg=args.rg,\
             chisq_threshold=args.max_chisq, log=log, verbose=args.verbose, out=args.out, \
             ldscores=args.ldscores, njack=args.njack, annot=args.annot, \
             intercept=args.intercept_rg, phenos=args.pheno_rg)

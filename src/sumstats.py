@@ -20,16 +20,10 @@ class Sumstats:
         self.log = log
         self.nblks = nblks
         self.nbins = nbins
-        # self.snplist = snplist
-        # if snplist is None:
-        #     self.log._log("!!! Missing the list of SNPs used in trace calculation."+\
-        #           " All SNPs in the phenotype sumstats will be used. !!!")
-        # else:
-        #     self.nsnps_trace = len(snplist)
         self.annot_df = annot_df
         self.snpids = len(annot_df)
         self.annot = None # annotation for partitioned heritability (if None, assume single-bin)
-        self.zscores = []
+        self.zscores = None
         self.zscores_bin = [] # list of list, where zscores are partitioned by bin assignment
         self.zscores_blk = [] # list of list of list, where zscores are partitioned by blk & bin assignment
         self.RHS = None # array of RHS for each pheno
@@ -45,12 +39,14 @@ class Sumstats:
     def _read_sumstats(self, path, name):
         ''' Read in summary statistics for a single phenotype '''
         self.name = name
-        sumdf = pd.read_csv(path, sep=r'\s+')
+        sumdf = pd.read_csv(path, sep=r'\s+', compression='infer')
 
         # drop any row with missing N or Z
         ncol = utils._parse_column_name(sumdf, ['N','n'], 3)
         zcol = utils._parse_column_name(sumdf, ['Z','z'], 3)
         idcol = utils._parse_column_name(sumdf, ['ID','id','snp','SNP'], 0)
+        a1col = utils._parse_column_name(sumdf, ['A1','ALT'], 1)
+        a2col = utils._parse_column_name(sumdf, ['A2','REF'], 1)
         drop_mask = sumdf[ncol].isna() | sumdf[zcol].isna()
 
         # keep those SNP IDs for both-sides filtering
@@ -60,11 +56,11 @@ class Sumstats:
 
         sumdf = sumdf.loc[~drop_mask]
 
-        sumdf = sumdf.rename(columns = {idcol: 'SNP', zcol: 'Z', ncol: 'N'})
+        sumdf = sumdf.rename(columns = {idcol: 'SNP', zcol: 'Z', ncol: 'N', a1col:'A1', a2col:'A2'})
 
         sumdf['Z'] = sumdf['Z']*np.sqrt(sumdf['N']/sumdf['N'].max())
 
-        self.sumdf = sumdf[['SNP','Z']].copy()
+        self.sumdf = sumdf[['SNP','Z','A1','A2']].copy()
         self.nsamp = float(sumdf['N'].max())
 
     def _match_snps(self):
@@ -82,22 +78,6 @@ class Sumstats:
             self.removesnps += chisq_snps
             self.sumdf = self.sumdf.loc[keep]
             self.log._log(f"Removed {len(chisq_snps)} SNPs with chi-sq above the threshold {self.chisq_threshold} ({len(self.sumdf)} SNPs remaining)")
-
-        # if (self.snplist is None):
-        #     # using all the SNPs
-        #     for i in range(self.nblks):
-        #         blk_size = self.nsnps//self.nblks
-        #         blk_zscores = np.array(self.zscores[blk_size*i: blk_size*(i+1)] if (i < self.nblks-1) else self.zscores[blk_size*i:])
-        #         blk_annot = self.annot[blk_size*i:blk_size*(i+1)] if (i < self.nblks-1) else self.annot[blk_size*i:]
-        #         partition, nsnps_partition = utils._partition_bin_non_overlapping(blk_zscores, blk_annot, self.nbins)
-        #         matched_zscores.append(partition)
-        #         nsnps_blk[i] = nsnps_partition
-
-        #     self.log._log("Using " + str(self.nsnps) + " SNPs to calculate the RHS of the normal equation...")
-        #     # overall histogram on the full set
-        #     self.zscores_bin, self.nsnps_bin = utils._partition_bin_non_overlapping(self.zscores, self.annot, self.nbins)
-
-        # else: # FIXME: snplist is now always provided!
         
         # match summary statistics with annot_df
         df = self.sumdf.merge(self.annot_df, how='inner', on='SNP')
@@ -127,6 +107,9 @@ class Sumstats:
             nsnps_blk[i] = nsnps_partition
 
         self.zscores_bin, self.nsnps_bin = utils._partition_bin_non_overlapping(all_z, all_ann, self.nbins)
+        
+        # full list of zscores
+        self.zscores = df['Z'].values ## FIXME: this might become obsolete once I clean the SUMCORE code
 
         # check if any bins are empty
         for b in range(self.nbins):

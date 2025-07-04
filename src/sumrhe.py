@@ -19,25 +19,10 @@ class Sumrhe:
         self.nbins = self.tr.nbins
         self.sums = Sumstats(nblks=self.nblks, chisq_threshold=chisq_threshold, log=self.log, annot_df=self.tr.annot_df, nbins=self.nbins)
         
-        self.h2_dir = None
-        # check whether the path for sumstats is a directory or a file (or even regex). count # of phenotypes
-        # TODO: allow regex matching for file names
-        if os.path.exists(h2_path):
-            if os.path.isdir(h2_path):
-                self.log._log("Reading phenotype sumstat files from a directory...")
-                sum_files = sorted([f for f in os.listdir(h2_path) if f.endswith('.sumstat')])
-                self.h2_dir = [h2_path.rstrip("/")+"/"+name for name in sum_files]
-                if (len(self.h2_dir) == 0):
-                    self.log._log(f"!!! --h2 path {h2_path} has no valid phenotype summary files (.sumstat) !!!")
-                    sys.exit(1)
-            elif os.path.isfile(h2_path):
-                self.log._log("Reading a single phenotype sumstat file")
-                self.h2_dir = [h2_path]
-            else:
-                self.log._log(f"!!! --h2 path {h2_path} is invalid !!!")
-                sys.exit(1)
-        else:
-            self.log._log(f"!!! --h2 path {h2_path} is invalid !!!")
+        try:
+            self.h2_dir = utils._parse_sumdir(h2_path)
+        except ValueError as e:
+            self.log._log(f"Error reading sumstat files: {e}")
             sys.exit(1)
 
         self.npheno = len(self.h2_dir)

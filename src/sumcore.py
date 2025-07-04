@@ -22,42 +22,38 @@ class Sumcore(Sumrhe):
         if (self.phenos is not None):
             self.estimate_overlap_cov()
 
-        # initialize Trace (for two‐trait rg we still use the same LD‐scores and snplist)
+        # initialize Trace
         self.tr = Trace(bimpath=bim_path, sumpath=None, savepath=save_path,
                         ldscores=ldscores, log=self.log, nblks=njack,
                         annot=annot, verbose=verbose)
-        self.snplist      = self.tr.snplist
-        self.nblks        = self.tr.nblks
-        self.nsnps        = self.tr.nsnps
-        self.annot        = self.tr.annot
+        self.nblks = self.tr.nblks
         self.annot_header = self.tr.annot_header
-        self.nbins        = self.tr.nbins
+        self.nbins = self.tr.nbins
 
+        # parameter containers
         self.gamma_g = np.zeros(self.nblks+1)
         self.c_opt = np.zeros(self.nblks+1)
         self.rg = np.zeros(self.nblks+1)
 
         # parse --rg argument: must be two comma‐separated .sumstat paths
-        if rg is None:
-            self.log._log("ERROR: --rg must be provided for genetic correlation.")
+        try:
+            self.phen_dir = utils._parse_rgdir(rg)
+        except ValueError as e:
+            self.log._log(f"Error reading sumstat file pair: {e}")
             sys.exit(1)
-        paths = rg.split(",")
-        if len(paths) != 2:
-            self.log._log("ERROR: --rg must be exactly two comma‐separated sumstat files.")
-            sys.exit(1)
-        self.phen_dir   = paths
-        self.npheno     = 2
-        self.phen_names = [os.path.basename(p).replace(".sumstat","") for p in paths]
+        self.npheno = 2
+        self.phen_names = [os.path.basename(name)[:-8] for name in self.phen_dir]
 
         self.sums = []
         for pth, name in zip(self.phen_dir, self.phen_names):
             ss = Sumstats(nblks=self.nblks,
-                          snplist=self.snplist,
                           chisq_threshold=chisq_threshold,
                           log=self.log,
-                          annot=self.annot,
+                          annot_df = self.tr.annot_df,
                           nbins=self.nbins)
             self.sums.append(ss)
+        
+        self.nsnps        = self.tr.nsnps
 
         # storage for heritabilities
         self.nsamp  = []
@@ -68,12 +64,12 @@ class Sumcore(Sumrhe):
         self.filter_both = filter_both
     
     def _run(self):
+        # TODO: Implement allele alignment
+        # Sketch: align the SNPs first. 
         for i in range(2):
             pheno_path = self.phen_dir[i]
             removesnps  = self.sums[i]._process(pheno_path, self.phen_names[i])
-            # self.tr._reset()
-            # if removesnps and self.filter_both:
-            #     self.tr._filter_snps(removesnps)
+            self.tr._filter_snps(removesnps) # always try to filter both sides
             self.nsamp.append(self.sums[i].nsamp)
 
             rhs     = self.sums[i].rhs
@@ -91,6 +87,7 @@ class Sumcore(Sumrhe):
         z2 = self.sums[1].zscores
         l2 = self.tr.ldscores
         n1, n2 = float(self.nsamp[0]), float(self.nsamp[1])
+        
         
         if self.intercept is None and self.phenos is None:
             self.gamma_g, self.c_opt = utils._bivariate_regression_jn(l2, z1 * z2, 1.0 / l2, self.nblks, n1, n2, self.tr.nsnps_blk)

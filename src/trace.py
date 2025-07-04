@@ -52,8 +52,13 @@ class Trace:
     def _read_annot(self, annot_path):
         # use single bin
         if (annot_path is None):
-            header = np.array(['L2'])
+            self.annot_header = np.array(['L2'])
             annot = np.ones((self.nsnps, 1))
+            annot_df = pd.DataFrame(annot, index=self.snplist, columns=self.annot_header.tolist())
+            annot_df.reset_index(inplace=True)
+            annot_df.rename(columns={'index':'SNP'}, inplace=True)
+            self.annot_df = annot_df
+            self.annot = annot_df[self.annot_header].values
             self.log._log("Running with single component annotation...")
         else:
             try: # try reading full annotation dataframe (.annot or .annot.gz)
@@ -70,16 +75,15 @@ class Trace:
                 if missing:
                     self.log._log(f"Dropping {len(missing)} SNPs from annotation as they are missing LD information.")
                     
-                annot_df = (annot_df.set_index('SNP').loc[overlap].reset_index())
-                self.annot_df = annot_df
-                self.annot = annot_df[annot_cols].values
+                self.annot_df = (annot_df.set_index('SNP').loc[overlap].reset_index())
+                self.annot = self.annot_df[annot_cols].values
                 self.log._log("Read full annotation of shape " + str(self.annot.shape))
                 
                 # prune LD scores if present
                 if getattr(self, 'ldscores', None) is not None:
                     ld_df = (self.ldscores_df.set_index('SNP').loc[overlap].reset_index())
                     self.ldscores_df = ld_df
-                    self.ldscores = ld_df.iloc[:, 3:].to_numpy()
+                    self.ldscores = ld_df.iloc[:, 3:].to_numpy() # we assume 'CHR' 'SNP' 'bp' as the first three
                     self.nsnps = len(overlap)
                     self.snplist = overlap
                     self.log._log(f"Pruned LD‐score to {self.nsnps} SNPs that match with the annotation file.")
@@ -87,26 +91,23 @@ class Trace:
             except ValueError: # try reading thin annot
                 if (self.snplist is None):
                     raise ValueError("!!! Thin annotation requires a BIM/snplist when using trace-summaries !!!")
-                header, annot = utils._read_with_optional_header(annot_path)
-                if annot.ndim == 1: # single bin
-                    annot = annot.reshape(-1, 1)
+                self.annot_header, self.annot = utils._read_with_optional_header(annot_path)
+                if self.annot.ndim == 1: # single bin
+                    self.annot = self.annot.reshape(-1, 1)
                 else:
-                    annot = annot.reshape(-1, annot.shape[-1])
-                if header is None:
-                    header = np.array([f'bin_{i}' for i in range(annot.shape[1])])
-                cols = header.tolist()
+                    self.annot = self.annot.reshape(-1, self.annot.shape[-1])
+                if self.annot_header is None:
+                    self.annot_header = np.array([f'bin_{i}' for i in range(self.annot.shape[1])])
                 
-                if (self.nbins != annot.shape[1]) or (self.nsnps != annot.shape[0]):
-                    self.log._log("!!! number of components in annotation does not match the input trace/LD summary !!!")
-                    sys.exit(1)
+                self.annot_df = pd.DataFrame(self.annot, index=self.snplist, columns=self.annot_header.tolist())
+                self.annot_df.reset_index(inplace=True)
+                self.annot_df.rename(columns={'index':'SNP'}, inplace=True)
+                self.log._log("Read thin annotation matrix of shape " + str(self.annot.shape))
+            
+            if (self.nbins != self.annot.shape[1]) or (self.nsnps != self.annot.shape[0]):
+                self.log._log("!!! number of components in annotation does not match the input trace/LD summary !!!")
+                sys.exit(1)
                 
-                annot_df = pd.DataFrame(annot, index=self.snplist, columns=cols)
-                annot_df.reset_index(inplace=True)
-                annot_df.rename(columns={'index':'SNP'}, inplace=True)
-                self.annot_header = np.array(cols)
-                self.annot_df = annot_df
-                self.annot = annot_df[cols].values
-                self.log._log("Read thin annotation matrix of shape " + str(self.annot.shape))      
     
     def _save_trace(self):
         ''' Save trace summaries as a file'''
