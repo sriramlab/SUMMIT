@@ -102,6 +102,7 @@ class GenomewideLDScore:
                  annot_path,
                  out_path,
                  log,
+                 rand_dist,
                  covar_path=None,
                  num_vecs=10,
                  num_workers=4,
@@ -115,6 +116,7 @@ class GenomewideLDScore:
         self.step_size = step_size
         self.log = log
         self.verbose = verbose
+        self.rand_dist = rand_dist
 
         # read .bim and annotation
         self._read_bim(bed_path + ".bim")
@@ -150,7 +152,16 @@ class GenomewideLDScore:
         Xz = np.zeros((self.nbins, self.nsamp, self.nvecs))
 
         rng = np.random.default_rng([j, self.root_seed] if self.root_seed is not None else None)
-        Zs = rng.standard_normal(size=(nsnps, self.nvecs))
+        if self.rand_dist == "normal":
+            Zs = rng.standard_normal(size=(nsnps, self.nvecs))
+
+        elif self.rand_dist == "rademacher":
+            Zs = rng.integers(0, 2, size=(nsnps, self.nvecs)) * 2 - 1
+
+        elif self.rand_dist == "spherical":
+            Zs = rng.standard_normal(size=(nsnps, self.nvecs))
+            norms = np.linalg.norm(Zs, axis=0)
+            Zs = Zs / norms[None, :] * np.sqrt(nsnps)
 
         # read + standardize
         geno = self.G.read(index=np.s_[:, blk_start:blk_end])
@@ -250,7 +261,7 @@ class GenomewideLDScore:
         self.start_time = utils._get_time()
         self.log._log("Genome-wide LD score calculation started at: "+utils._get_timestr(self.start_time))
         self.log._log(f"num_vecs: {self.nvecs}, num_workers: {self.nworkers}, step_size: {self.step_size}, seed: {self.root_seed}")
-
+        self.log._log(f"Using {self.rand_dist} random vectors.")
         self.nblks = len(np.arange(self.nsnps)[::self.step_size])
         Xz_input = []
         XtXz_input = []

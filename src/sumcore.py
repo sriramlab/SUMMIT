@@ -65,7 +65,7 @@ class Sumcore(Sumrhe):
     
     def _run(self):
         # TODO: Implement allele alignment
-        # Sketch: align the SNPs first. 
+        # Sketch: align the SNPs first. Calculate heritability 
         for i in range(2):
             pheno_path = self.phen_dir[i]
             removesnps  = self.sums[i]._process(pheno_path, self.phen_names[i])
@@ -88,6 +88,10 @@ class Sumcore(Sumrhe):
         l2 = self.tr.ldscores
         n1, n2 = float(self.nsamp[0]), float(self.nsamp[1])
         
+        print("printing out input for biv reg")
+        print(f"z1: {z1[:10]}")
+        print(f"z2: {z2[:10]}")
+        print(f"l2: {l2[:10]}")
         
         if self.intercept is None and self.phenos is None:
             self.gamma_g, self.c_opt = utils._bivariate_regression_jn(l2, z1 * z2, 1.0 / l2, self.nblks, n1, n2, self.tr.nsnps_blk)

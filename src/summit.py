@@ -60,6 +60,8 @@ parser.add_argument("--intercept-rg", action='store', default=None, type=float, 
 parser.add_argument("--pheno-rg", default=None, type=str, \
                     help="Comma-separated file path for a pair of (overlapping) individual-level phenotypes used in the pair of summary statistics (--rg). "
                     "This option may yield more accurate estimates (alternative to --intercept-rg).")
+parser.add_argument("--rand-dist", default='normal', type=str, \
+                    help="Specify which distribution to use to generate random vectors ('normal', 'rademacher', 'spherical'). Default is normal distribution.")
 
 
 if __name__ == '__main__':
@@ -88,7 +90,7 @@ if __name__ == '__main__':
         if (args.out is None):
             log._log("!!! An output path to save the genome-wide LD scores must be provided !!!")
             sys.exit(1)
-        gwld = GenomewideLDScore(bed_path=args.geno, annot_path=args.annot, out_path=args.out, covar_path=args.covar, \
+        gwld = GenomewideLDScore(bed_path=args.geno, annot_path=args.annot, out_path=args.out, covar_path=args.covar, rand_dist=args.rand_dist,\
             log=log, num_vecs=args.nvecs, num_workers=args.nworkers, step_size=args.step_size, seed=args.seed, verbose=args.verbose)
         gwld._compute_ldscore()
     elif (args.h2 is not None):
