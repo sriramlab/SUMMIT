@@ -87,14 +87,11 @@ class Sumcore(Sumrhe):
         z2 = self.sums[1].zscores
         l2 = self.tr.ldscores
         n1, n2 = float(self.nsamp[0]), float(self.nsamp[1])
-        
-        print("printing out input for biv reg")
-        print(f"z1: {z1[:10]}")
-        print(f"z2: {z2[:10]}")
-        print(f"l2: {l2[:10]}")
+        nsnps_bin = self.tr.nsnps_bin
         
         if self.intercept is None and self.phenos is None:
-            self.gamma_g, self.c_opt = utils._bivariate_regression_jn(l2, z1 * z2, 1.0 / l2, self.nblks, n1, n2, self.tr.nsnps_blk)
+            self.gamma_g, self.c_opt = utils.bivariate_regression_partitioned_jn(l2, z1 * z2, 1.0 / l2, self.nblks, n1, n2, self.tr.nsnps_blk)
+            print(self.gamma_g)
         else:
             # additional information to constrain moments
             if self.intercept is not None:
@@ -114,18 +111,38 @@ class Sumcore(Sumrhe):
                 self.gamma_g[i] = h2_est[0]
 
         self.gamma_g_se = utils._calc_jackknife_se(self.gamma_g)[1]
+        print(self.herits[0, :, 0].shape)
         self.rg = self.gamma_g / np.sqrt(self.herits[0, :, 0]*self.herits[1, :, 0])
         self.rg_se = utils._calc_jackknife_se(self.rg)[1]
 
         self.log._log("\n=== SUM-CORE genetic covariance & correlation ===")
-        self.log._log(
-            f"^^^ [{self.phen_names[0]} & {self.phen_names[1]}] Estimated genetic cov. "
-            rf"(γ_g): {self.gamma_g[-1]:.6f} SE: {self.gamma_g_se:.6f}"
-        )
-        self.log._log(
-            f"^^^ [{self.phen_names[0]} & {self.phen_names[1]}] Estimated genetic cor. "
-            rf"(r_g): {self.rg[-1]:.6f} SE: {self.rg_se:.6f}"
-        )
+        if self.nbins > 1:
+            for j, header in enumerate(self.annot_header):
+                self.log._log(
+                    f"^^^ [{self.phen_names[0]} & {self.phen_names[1]}] "
+                    f"Estimated genetic cov. bin {header} "
+                    rf"(γ_g_{header}): {self.gamma_g[-1, j]:.6f} "
+                    rf"SE: {self.gamma_g_se[j]:.6f}"
+                )
+            for j, header in enumerate(self.annot_header):
+                self.log._log(
+                    f"^^^ [{self.phen_names[0]} & {self.phen_names[1]}] "
+                    f"Estimated genetic cor. bin {header} "
+                    rf"(r_g_{header}): {self.rg[-1, j]:.6f} "
+                    rf"SE: {self.rg_se[j]:.6f}"
+                )
+        else:
+            self.log._log(
+                f"^^^ [{self.phen_names[0]} & {self.phen_names[1]}] "
+                rf"Estimated genetic cov. (γ_g): {np.squeeze(self.gamma_g[-1]):.6f} "
+                rf"SE: {np.squeeze(self.gamma_g_se):.6f}"
+            )
+            self.log._log(
+                f"^^^ [{self.phen_names[0]} & {self.phen_names[1]}] "
+                rf"Estimated genetic cor. (r_g): {np.squeeze(self.rg[-1]):.6f} "
+                rf"SE: {np.squeeze(self.rg_se):.6f}"
+            )
+
 
     def _logoff(self):
         for i, name in enumerate(self.phen_names):

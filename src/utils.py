@@ -221,89 +221,96 @@ def _solve_linear_equation(X, y, method='lstsq'):
         Q, R = scipy.linalg.qr(X)
         return scipy.linalg.solve_triangular(R, np.dot(Q.T, y))
 
-def _bivariate_regression_jn(l2, y, w, nblks, n1, n2, nsnps):
+import numpy as np
+
+def bivariate_regression_partitioned_jn(l2_bins, y, w, nblks,
+                                        n1, n2, nsnps_blk):
     """
-    Jackknife WLS for y_j = beta * l2_j + c + e_j with arbitrary weights w_j.
-    Returns gamma estimates such that the *last* element is the point estimate
-    (using all SNPs) and the first nblks elements are leave-one-block-out jackknife.
+    Leave-one-block-out jack-knife WLS for partitioned SCORE / SUMCORE
+    **using pre-computed SNP counts per replicate**.
 
     Parameters
     ----------
-    l2    : array_like, shape (M,)
-        LD scores.
-    y     : array_like, shape (M,)
-        Response (e.g., z1*z2).
-    w     : array_like, shape (M,)
-        Weights for WLS.
-    nblks : int
-        Number of jackknife blocks.
-    n1, n2: float
-        Sample sizes for scaling gamma.
-    nsnps : array_like, shape (nblks+1,)
-        Number of SNPs included in each subsample.  Last entry corresponds to full data.
+    l2_bins : (M, K) ndarray[float]
+        LD scores for K annotation bins.  Non-member SNPs must carry 0.0.
+    y       : (M,) ndarray[float]
+        SNP-wise product z1 * z2.
+    w       : (M,) ndarray[float]
+        Positive, finite WLS weights (≈ 1 / l2_total).
+    nblks   : int
+        Number of jack-knife blocks.
+    n1, n2  : float
+        GWAS sample sizes.
+    nsnps_blk : (nblks+1, K) ndarray[int]
+        SNP counts **after** leaving out block j (rows 0…nblks-1)
+        and for the full data set (last row).  That is,
+            nsnps_blk[j, k] = #SNPs of bin k present in replicate j.
 
     Returns
     -------
-    gamma_all : ndarray, shape (nblks+1,)
-        Gamma estimates: [gamma_j1,...,gamma_jn, gamma_full].
-    c_all     : ndarray, shape (nblks+1,)
-        Intercept estimates: [c_j1,...,c_jn, c_full].
+    gamma_all : (nblks+1, K) ndarray[float]
+        γ̂ for every replicate and annotation bin.
+    c_all     : (nblks+1,) ndarray[float]
+        Intercept estimates (last element = full data).
     """
-    l2 = np.squeeze(np.asarray(l2))
-    y = np.squeeze(np.asarray(y))
-    w = np.squeeze(np.asarray(w))
-    nsnps = np.squeeze(np.asarray(nsnps))
-    if l2.ndim != 1 or y.ndim != 1 or w.ndim != 1:
-        raise ValueError("l2, y, and w must be 1D arrays")
-    M = l2.shape[0]
-    if y.shape[0] != M or w.shape[0] != M:
-        raise ValueError("l2, y, and w must have the same length")
-    if nsnps.ndim != 1 or nsnps.shape[0] != nblks + 1:
-        raise ValueError("nsnps must have length nblks+1")
+    # ---------- validation --------------------------------------------------
+    l2_bins   = np.asarray(l2_bins, dtype=float)
+    y         = np.asarray(y,       dtype=float).ravel()
+    w         = np.asarray(w,       dtype=float).ravel()
+    nsnps_blk = np.asarray(nsnps_blk, dtype=int)
 
-    # full-data normal-equation totals
-    A00_tot = np.dot(w, l2 * l2)
-    A01_tot = np.dot(w, l2)
-    A11_tot = np.sum(w)
-    b0_tot = np.dot(w * l2, y)
-    b1_tot = np.dot(w, y)
+    if l2_bins.ndim != 2:
+        raise ValueError("l2_bins must be 2-D (M, K)")
+    M, K = l2_bins.shape
+    if y.size != M or w.size != M:
+        raise ValueError("Shapes of l2_bins, y, w are inconsistent")
+    if nsnps_blk.shape != (nblks + 1, K):
+        raise ValueError("nsnps_blk must be (nblks+1, K)")
+    if not np.all(np.isfinite(w)) or np.any(w <= 0):
+        raise ValueError("Weights must be positive and finite")
 
-    # assign SNPs to blocks
-    blk_size = M // nblks
-    blk_idx = np.empty(M, dtype=int)
-    for i in range(nblks - 1):
-        start = i * blk_size
-        blk_idx[start:start + blk_size] = i
-    blk_idx[(nblks - 1) * blk_size:] = nblks - 1
+    # ---------- design matrix  X = [1 | l2_bin1 … l2_binK] ------------------
+    X = np.empty((M, K + 1), dtype=float)
+    X[:, 0]  = 1.0
+    X[:, 1:] = l2_bins
 
-    # per-block contributions
-    A00_blk = np.bincount(blk_idx, weights=w * l2 * l2, minlength=nblks)
-    A01_blk = np.bincount(blk_idx, weights=w * l2, minlength=nblks)
-    A11_blk = np.bincount(blk_idx, weights=w, minlength=nblks)
-    b0_blk = np.bincount(blk_idx, weights=w * l2 * y, minlength=nblks)
-    b1_blk = np.bincount(blk_idx, weights=w * y, minlength=nblks)
+    # ---------- jack-knife block index -------------------------------------
+    blk_idx = np.repeat(np.arange(nblks), M // nblks)
+    blk_idx = np.append(blk_idx,
+                        np.full(M - blk_idx.size, nblks - 1))
 
-    # leave-one-block-out totals
-    A00 = A00_tot - A00_blk
-    A01 = A01_tot - A01_blk
-    A11 = A11_tot - A11_blk
-    b0 = b0_tot - b0_blk
-    b1 = b1_tot - b1_blk
+    # ---------- totals over all SNPs ---------------------------------------
+    WX       = w[:, None] * X                # (M, K+1)
+    SXX_tot  = WX.T @ X                      # (K+1, K+1)
+    SXY_tot  = WX.T @ y                      # (K+1,)
 
-    # jackknife estimates
-    denom = A00 * A11 - A01**2
-    beta_j = (b0 * A11 - A01 * b1) / denom
-    c_j = (A00 * b1 - b0 * A01) / denom
+    # ---------- per-block contributions via bincount -----------------------
+    SXX_blk = np.zeros((nblks, K + 1, K + 1), dtype=float)
+    SXY_blk = np.zeros((nblks, K + 1),        dtype=float)
+    tmp = np.empty(M, dtype=float)
 
-    # full-data estimate
-    denom0 = A00_tot * A11_tot - A01_tot**2
-    beta0 = (b0_tot * A11_tot - A01_tot * b1_tot) / denom0
-    c0 = (A00_tot * b1_tot - b0_tot * A01_tot) / denom0
+    for c in range(K + 1):
+        for d in range(c, K + 1):            # exploit symmetry
+            tmp[:] = w * X[:, c] * X[:, d]
+            S = np.bincount(blk_idx, tmp, minlength=nblks)
+            SXX_blk[:, c, d] = S
+            if d != c:
+                SXX_blk[:, d, c] = S
+        tmp[:] = w * X[:, c] * y
+        SXY_blk[:, c] = np.bincount(blk_idx, tmp, minlength=nblks)
 
-    # assemble: jackknife estimates first, then full-data
-    beta_all = np.concatenate((beta_j, [beta0]))
-    c_all = np.concatenate((c_j, [c0]))
+    # ---------- leave-one-block-out totals ---------------------------------
+    SXX = SXX_tot[None, :, :] - SXX_blk       # (nblks, K+1, K+1)
+    SXY = SXY_tot[None, :]   - SXY_blk        # (nblks, K+1)
 
-    # recover gamma: scale by nsnps (aligned so last nsnps is full data)
-    gamma_all = (nsnps / np.sqrt(n1 * n2)) * beta_all
+    # ---------- solve  (Xᵀ W X) β = Xᵀ W y  -------------------------------
+    beta_j = np.linalg.solve(SXX, SXY[..., None])[..., 0]  # (nblks, K+1)
+    beta_full = np.linalg.solve(SXX_tot, SXY_tot)
+    beta_all  = np.vstack([beta_j, beta_full[None, :]])    # (nblks+1, K+1)
+
+    # ---------- scale to γ̂ -------------------------------------------------
+    scale      = nsnps_blk / np.sqrt(n1 * n2)              # (nblks+1, K)
+    gamma_all  = scale * beta_all[:, 1:]                   # drop intercept
+    c_all      = beta_all[:, 0]
+
     return gamma_all, c_all

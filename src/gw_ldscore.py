@@ -221,7 +221,10 @@ class GenomewideLDScore:
             self.l2cols, self.annot = utils._read_with_optional_header(annot_path)
             if (self.annot.ndim == 1):
                 self.annot = self.annot.reshape(-1, 1)
-            self.log._log("Read SNP partition annotation of dimensions "+str(self.annot.shape))
+            self.log._log(f"Read SNP partition annotation in {annot_path}")
+
+        self.log._log(f"Number of samples: {self.nsamp}")
+        self.log._log(f"Number of total SNPs: {self.nsnps}, annotation shape: {self.annot.shape}")
         
         if (self.nsnps != self.annot.shape[0]):
             self.log._log(f"!!! number of SNPs in annotation ({self.annot.shape[0]}) does not match the input genotype file ({self.nsnps}) !!!")

@@ -60,8 +60,8 @@ parser.add_argument("--intercept-rg", action='store', default=None, type=float, 
 parser.add_argument("--pheno-rg", default=None, type=str, \
                     help="Comma-separated file path for a pair of (overlapping) individual-level phenotypes used in the pair of summary statistics (--rg). "
                     "This option may yield more accurate estimates (alternative to --intercept-rg).")
-parser.add_argument("--rand-dist", default='normal', type=str, \
-                    help="Specify which distribution to use to generate random vectors ('normal', 'rademacher', 'spherical'). Default is normal distribution.")
+parser.add_argument("--rand-dist", default='spherical', type=str, \
+                    help="Specify which distribution to use to generate random vectors ('normal', 'rademacher', 'spherical'). Default is spherical distribution.")
 
 
 if __name__ == '__main__':
