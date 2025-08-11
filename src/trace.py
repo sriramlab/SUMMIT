@@ -99,7 +99,8 @@ class Trace:
                 if self.annot_header is None:
                     self.annot_header = np.array([f'bin_{i}' for i in range(self.annot.shape[1])])
                 
-                self.annot_df = pd.DataFrame(self.annot, index=self.snplist, columns=self.annot_header.tolist())
+                self.annot_header = list(self.annot_header)
+                self.annot_df = pd.DataFrame(self.annot, index=self.snplist, columns=self.annot_header)
                 self.annot_df.reset_index(inplace=True)
                 self.annot_df.rename(columns={'index':'SNP'}, inplace=True)
                 self.log._log("Read thin annotation matrix of shape " + str(self.annot.shape))
