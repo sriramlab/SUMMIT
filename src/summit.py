@@ -62,6 +62,8 @@ parser.add_argument("--pheno-rg", default=None, type=str, \
                     "This option may yield more accurate estimates (alternative to --intercept-rg).")
 parser.add_argument("--rand-dist", default='spherical', type=str, \
                     help="Specify which distribution to use to generate random vectors ('normal', 'rademacher', 'spherical'). Default is spherical distribution.")
+parser.add_argument("--dtype", default='float32', type=str, \
+                    help="Specify the dtype to use for calculations (either float32 or float64). Default is float32.")
 
 
 if __name__ == '__main__':

@@ -7,7 +7,7 @@ import pandas as pd
 from bed_reader import open_bed
 import multiprocessing as mp
 from tqdm import tqdm
-import scipy
+from scipy.linalg import blas as fblas
 import sys
 import gc
 
@@ -108,7 +108,8 @@ class GenomewideLDScore:
                  num_workers=4,
                  step_size=1000,
                  seed=None,
-                 verbose=False):
+                 verbose=False,
+                 dtype='float32'):
         self.G = open_bed(bed_path + ".bed")
         self.nsamp, self.nsnps = self.G.shape
         self.nvecs = num_vecs
@@ -116,6 +117,7 @@ class GenomewideLDScore:
         self.step_size = step_size
         self.log = log
         self.verbose = verbose
+        self.dtype = np.float32 if dtype in (np.float32, 'float32', 'f4') else np.float64
         self.rand_dist = rand_dist
 
         # read .bim and annotation
@@ -138,6 +140,8 @@ class GenomewideLDScore:
                 logger             = self.log,
                 verbose            = self.verbose
             )
+            self.C = np.asarray(self.C, dtype=self.dtype, order='F')
+            self.cov_R = np.asarray(self.cov_R, dtype=self.dtype, order='F')
         else:
             self.C = None
             self.cov_R = None
@@ -164,20 +168,24 @@ class GenomewideLDScore:
             Zs = Zs / norms[None, :] * np.sqrt(nsnps)
 
         # read + standardize
-        geno = self.G.read(index=np.s_[:, blk_start:blk_end])
+        geno = self.G.read(index=np.s_[:, blk_start:blk_end], dtype=self.dtype)
         means = np.nanmean(geno, axis=0)
         stds  = np.nanstd(geno, axis=0)
+        stds[stds == 0] = 1.0
         geno  = (geno - means) / stds
         geno[np.isnan(geno)] = 0
-        geno = np.array(geno, order='F')
+        geno = np.asarray(geno, order='F')
 
         # regress out covariates if present
         if self.C is not None:
-            geno = geno - self.C.dot(self.cov_R.dot(geno))
+            geno -= self.C.dot(self.cov_R.dot(geno))
 
-        Zs = np.array(Zs, order='F')
+        Zs = np.asarray(Zs, order='F')
+        gemm = fblas.sgemm if self.dtype is np.float32 else fblas.dgemm
         for k, binidx in enumerate(idxs):
-            Xz[k, :, :] = scipy.linalg.blas.sgemm(1.0, geno[:, binidx], Zs[binidx, :])
+            if len(binidx) == 0:
+                continue
+            Xz[k, :, :] = gemm(1.0, geno[:, binidx], Zs[binidx, :])
 
         return Xz
    
@@ -188,10 +196,10 @@ class GenomewideLDScore:
         """
         blk_start, blk_end = blk_idx
 
-        geno = self.G.read(index=np.s_[:, blk_start:blk_end])
+        geno = self.G.read(index=np.s_[:, blk_start:blk_end], dtype=self.dtype)
         means = np.nanmean(geno, axis=0)
         stds = np.nanstd(geno, axis=0)
-
+        stds[stds == 0] = 1.0
         geno = (geno-means)/stds
         geno[np.isnan(geno)] = 0
 
@@ -200,12 +208,15 @@ class GenomewideLDScore:
 
         ## TODO: benchmark sgemm vs. np broadcasting - in small scale, looks like sgemm is faster (could be b/c sgemm is used in Xz estimation)
         geno_t = np.array(geno.T, order='F')
-        XtXz = np.zeros((blk_end - blk_start, self.nbins, self.nvecs))
+        meansq_blk = np.zeros((blk_end - blk_start, self.nbins))
+        gemm = fblas.sgemm if self.dtype is np.float32 else fblas.dgemm
+        work = np.empty((blk_end - blk_start, self.nvecs), dtype=self.dtype, order='F')
         for k in range(self.nbins):
-            XtXz[:, k, :] = scipy.linalg.blas.sgemm(1.0, geno_t, self.Xz[k])
-
-        #XtXz = np.einsum('nm,knb->mkb', geno, self.Xz)
-        return (blk_start, blk_end, XtXz)
+            gemm(1.0, geno, self.Xz[k], c=work, beta=0.0, trans_a=True, overwrite_c=1)
+            work /= self.nsamp
+            meansq_blk[:, k] = np.mean(work*work, axis=1)
+        
+        return (blk_start, blk_end, meansq_blk)
 
 
     def _read_annot(self, annot_path):
@@ -275,7 +286,7 @@ class GenomewideLDScore:
             Xz_input.append((j, idx_start, idx_end, self._partition_index(np.arange(len(annot_blk)), annot_blk)))
             XtXz_input.append((idx_start, idx_end))
         
-        self.Xz = np.zeros((self.nbins, self.nsamp, self.nvecs))
+        self.Xz = np.zeros((self.nbins, self.nsamp, self.nvecs), dtype=self.dtype)
 
         with mp.Pool(self.nworkers) as pool:
             with tqdm(total=self.nblks) as pbar:
@@ -289,25 +300,24 @@ class GenomewideLDScore:
         self.Xz_time = utils._get_time()
         self.log._log("Calculation of Xz (for each partition) completed. Runtime: "+format(self.Xz_time - self.start_time, '.3f')+" s")
 
-        self.XtXz = np.zeros((self.nsnps, self.nbins, self.nvecs))
+        self.meansq = np.zeros((self.nsnps, self.nbins), dtype=self.dtype)
 
         with mp.Pool(self.nworkers) as pool:
             with tqdm(total=self.nblks) as pbar:
                 pbar.set_description('Calculating XtXz')
                 for result in pool.imap_unordered(self._compute_XtXz_blk, XtXz_input):
-                    idx_start, idx_end, XtXz_blk = result
-                    self.XtXz[idx_start:idx_end, :, :] = XtXz_blk
+                    idx_start, idx_end, meansq_blk = result
+                    self.meansq[idx_start:idx_end, :] = meansq_blk
                     gc.collect()
                     pbar.update()
         pool.join()
-
-        self.XtXz = self.XtXz / self.nsamp
 
         self.XtXz_time = utils._get_time()
         self.log._log("Calculation of XtXz (for each partition) completed. Runtime: "+format(self.XtXz_time - self.Xz_time, '.3f')+" s")
 
         self.log._log("Converting XtXz into genome-wide (partitioned) LD scores.")
-        self.gwldscore = self.nsamp/(self.nsamp+1) * (np.square(self.XtXz).mean(axis=2) - self.nsnps_bin/self.nsamp)
+        self.gwldscore = self.nsamp/(self.nsamp+1) * (self.meansq - self.nsnps_bin / self.nsamp)
+        self.gwldscore = self.gwldscore.astype(np.float64, copy=False)
         self.log._log(f"Saving the genome-wide (partitioned) LD scores into: {self.outpath}.gw.ldscore.gz")
         snpcols = ['CHR', 'SNP', 'BP']
         if (self.snplist is None):
@@ -323,17 +333,3 @@ class GenomewideLDScore:
         self.log._log(f"Calculation of genome-wide LD score ended at "+utils._get_timestr(self.end_time))
         self.log._log("Runtime: "+format(self.end_time - self.start_time, '.3f')+" s")
         self.log._save_log(self.outpath+".gw.log")
-
-        
-
-
-
-
-
-        
-
-
-
-        
-
-            
