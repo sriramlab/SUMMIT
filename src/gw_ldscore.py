@@ -12,6 +12,52 @@ import sys
 import gc
 from multiprocessing import shared_memory
 import atexit
+import math
+import os
+
+def _bytes_human(n):
+    # human-readable bytes
+    if n is None: return "n/a"
+    if n < 1024: return f"{n} B"
+    for unit in ["KB","MB","GB","TB","PB"]:
+        n /= 1024.0
+        if n < 1024.0:
+            return f"{n:,.2f} {unit}"
+    return f"{n:,.2f} EB"
+
+def _rss_snapshot(label, logger=None, include_children=True):
+    """Log current RSS (resident memory). Tries psutil, then resource (Linux/Mac)."""
+    rss = None
+    total = None
+    num_children = 0
+    try:
+        import psutil
+        p = psutil.Process()
+        rss = p.memory_info().rss
+        total = rss
+        if include_children:
+            kids = p.children(recursive=True)
+            num_children = len(kids)
+            total += sum(c.memory_info().rss for c in kids if c.is_running())
+    except Exception:
+        # Fallback: resource (ru_maxrss is kB on Linux, bytes on macOS)
+        try:
+            import resource
+            r = resource.getrusage(resource.RUSAGE_SELF)
+            # Linux reports kB, macOS bytes; detect via magnitude
+            ru = r.ru_maxrss
+            rss = ru * 1024 if ru < 10**9 else ru
+            total = rss
+        except Exception:
+            pass
+
+    msg = (f"[mem] {label}: parent RSS={_bytes_human(rss)}; "
+           f"parent+children≈{_bytes_human(total)}; children={num_children}")
+    if logger:
+        try: logger._log(msg)
+        except Exception: print(msg, file=sys.stderr, flush=True)
+    else:
+        print(msg, file=sys.stderr, flush=True)
 
 
 # -------------------- shared-memory worker globals --------------------
@@ -339,6 +385,8 @@ class GenomewideLDScore:
         self.log._log(f"num_vecs: {self.nvecs}, num_workers: {self.nworkers}, step_size: {self.step_size}, seed: {self.root_seed}")
         self.log._log(f"Using {self.rand_dist} random vectors.")
         self.nblks = len(np.arange(self.nsnps)[::self.step_size])
+        self._print_expected_mem('Xz')
+        _rss_snapshot("pre-alloc", self.log)
         
         Xz_input = []
         XtXz_input = []
@@ -367,7 +415,10 @@ class GenomewideLDScore:
         # per-bin locks
         xz_locks = [mp.Lock() for _ in range(self.nbins)]
 
+        _rss_snapshot("after SHM alloc", self.log)
+
         # ----------------- Phase 1: build Xz in shared memory -----------------
+        self._print_expected_mem('Xz')
         with mp.Pool(self.nworkers,
                      initializer=_init_shared,
                      initargs=(shm_xz.name, xz_shape2d, None, None,
@@ -376,10 +427,12 @@ class GenomewideLDScore:
                 for _ in pool.imap_unordered(self._compute_Xz_blk, Xz_input):
                     pbar.update()
 
+        _rss_snapshot("after Xz", self.log)
         self.Xz_time = utils._get_time()
         self.log._log("Calculation of Xz (for each partition) completed. Runtime: "+format(self.Xz_time - self.start_time, '.3f')+" s")
 
         # ----------------- Phase 2: fill meansq in shared memory -----------------
+        self._print_expected_mem('XtXz')
         with mp.Pool(self.nworkers,
                      initializer=_init_shared,
                      initargs=(shm_xz.name, xz_shape2d, shm_ms.name, ms_shape,
@@ -388,6 +441,7 @@ class GenomewideLDScore:
                 for _ in pool.imap_unordered(self._compute_XtXz_blk, XtXz_input):
                     pbar.update()
 
+        _rss_snapshot("after XtXz", self.log)
         self.XtXz_time = utils._get_time()
         self.log._log("Calculation of XtXz (for each partition) completed. Runtime: "+format(self.XtXz_time - self.Xz_time, '.3f')+" s")
 
@@ -419,3 +473,42 @@ class GenomewideLDScore:
         gc.collect()
         shm_xz.close(); shm_xz.unlink()
         shm_ms.close(); shm_ms.unlink()
+        _rss_snapshot("post-cleanup", self.log)
+    
+    def _print_expected_mem(self, phase, block_len=None, k_max=None):
+        """
+        Rough upper-bound memory accounting for this run.
+        phase: 'Xz' or 'XtXz'
+        block_len: defaults to min(step_size, nsnps) for estimates
+        k_max: optional per-bin SNPs in block; if None we ignore A/B temps
+        """
+        b = np.dtype(self.dtype).itemsize
+        B, N, M, V, S, W = self.nbins, self.nsamp, self.nsnps, self.nvecs, self.step_size, self.nworkers
+        L = block_len if block_len is not None else min(S, M)
+
+        # Shared (parent) arrays
+        xz_bytes = N * (V * B) * b           # Xz2d shape (N, V*B)
+        ms_bytes = M * B * b                 # meansq (M, B)
+
+        # Per-worker temps
+        geno_blk = N * L * b                 # geno block (N × L)
+        if phase == 'Xz':
+            # we accumulate in-place; A/B temps depend on per-bin K.
+            # If you pass k_max, include a pessimistic bound; else omit.
+            per_worker = geno_blk
+            if k_max is not None:
+                A = N * k_max * b            # N × K
+                Btmp = k_max * V * b         # K × V
+                per_worker += max(A, 0) + max(Btmp, 0)
+        else:  # XtXz
+            work = L * V * b                 # (L × V) buffer
+            per_worker = geno_blk + work
+
+        total_est = xz_bytes + ms_bytes + W * per_worker
+
+        self.log._log(
+            f"[expected {phase}] dtype={self.dtype}, B={B}, N={N}, M={M}, V={V}, S={S}, W={W} "
+            f"→ parent(Xz2d+meansq)≈{_bytes_human(xz_bytes + ms_bytes)}, "
+            f"per-worker temps≈{_bytes_human(per_worker)}, "
+            f"total≈{_bytes_human(total_est)}"
+        )
