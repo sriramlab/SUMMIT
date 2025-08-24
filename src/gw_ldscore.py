@@ -10,6 +10,64 @@ from tqdm import tqdm
 from scipy.linalg import blas as fblas
 import sys
 import gc
+from multiprocessing import shared_memory
+import atexit
+
+
+# -------------------- shared-memory worker globals --------------------
+_g_Xz2d = None
+_g_meansq = None
+_g_xz_locks = None
+_g_shm_xz = None
+_g_shm_ms = None
+
+def _worker_cleanup():
+    # drop array views first
+    global _g_Xz2d, _g_meansq, _g_shm_xz, _g_shm_ms
+    _g_Xz2d = None
+    _g_meansq = None
+    try:
+        if _g_shm_xz is not None:
+            _g_shm_xz.close()
+    except Exception:
+        pass
+    try:
+        if _g_shm_ms is not None:
+            _g_shm_ms.close()
+    except Exception:
+        pass
+    _g_shm_xz = None
+    _g_shm_ms = None
+
+def _init_shared(xz_name, xz_shape2d, meansq_name, meansq_shape, dtype_str, xz_locks):
+    import numpy as _np
+    from multiprocessing import shared_memory as _sm
+    global _g_Xz2d, _g_meansq, _g_xz_locks, _g_shm_xz, _g_shm_ms
+
+    dt = _np.dtype(dtype_str)
+
+    if xz_name is not None:
+        _g_shm_xz = _sm.SharedMemory(name=xz_name)
+        nrows, ncols = xz_shape2d
+        _g_Xz2d = _np.frombuffer(_g_shm_xz.buf, dtype=dt, count=nrows*ncols)\
+                  .reshape((nrows, ncols), order='F')
+    else:
+        _g_shm_xz = None
+        _g_Xz2d = None
+
+    if meansq_name is not None:
+        _g_shm_ms = _sm.SharedMemory(name=meansq_name)
+        M, B = meansq_shape
+        _g_meansq = _np.ndarray((M, B), dtype=dt, buffer=_g_shm_ms.buf)
+    else:
+        _g_shm_ms = None
+        _g_meansq = None
+
+    _g_xz_locks = xz_locks
+
+    # ensure clean shutdown in the worker
+    atexit.register(_worker_cleanup)
+
 
 def read_cov(
         cov_filename: str,
@@ -153,7 +211,6 @@ class GenomewideLDScore:
     def _compute_Xz_blk(self, blk_idxs):
         j, blk_start, blk_end, idxs = blk_idxs
         nsnps = sum(len(binidx) for binidx in idxs)
-        Xz = np.zeros((self.nbins, self.nsamp, self.nvecs))
 
         rng = np.random.default_rng([j, self.root_seed] if self.root_seed is not None else None)
         if self.rand_dist == "normal":
@@ -169,25 +226,30 @@ class GenomewideLDScore:
 
         # read + standardize
         geno = self.G.read(index=np.s_[:, blk_start:blk_end], dtype=self.dtype)
-        means = np.nanmean(geno, axis=0)
-        stds  = np.nanstd(geno, axis=0)
+        means = np.nanmean(geno, axis=0, dtype=self.dtype)
+        stds  = np.nanstd(geno, axis=0, dtype=self.dtype)
         stds[stds == 0] = 1.0
         geno  = (geno - means) / stds
-        geno[np.isnan(geno)] = 0
-        geno = np.asarray(geno, order='F')
+        np.nan_to_num(geno, copy=False)
+        geno = np.asarray(geno, dtype=self.dtype, order='F')
 
         # regress out covariates if present
         if self.C is not None:
             geno -= self.C.dot(self.cov_R.dot(geno))
 
-        Zs = np.asarray(Zs, order='F')
+        Zs = np.asarray(Zs, order='F', dtype=self.dtype)
         gemm = fblas.sgemm if self.dtype is np.float32 else fblas.dgemm
+
         for k, binidx in enumerate(idxs):
             if len(binidx) == 0:
                 continue
-            Xz[k, :, :] = gemm(1.0, geno[:, binidx], Zs[binidx, :])
-
-        return Xz
+            A = np.asfortranarray(geno[:, binidx], dtype=self.dtype)   # (N × K)
+            B = np.asfortranarray(Zs[binidx, :],  dtype=self.dtype)    # (K × V)
+            c_view = _g_Xz2d[:, k*self.nvecs:(k+1)*self.nvecs]         # (N × V), Fortran view
+            with _g_xz_locks[k]:
+                # c := 1.0*A@B + 1.0*c   (accumulate)
+                gemm(1.0, A, B, c=c_view, beta=1.0, overwrite_c=1)
+        return 1
    
 
     def _compute_XtXz_blk(self, blk_idx):
@@ -195,29 +257,29 @@ class GenomewideLDScore:
         For blk genotype, multiply with X_k z to get XtXkz.
         """
         blk_start, blk_end = blk_idx
+        gemm = fblas.sgemm if self.dtype is np.float32 else fblas.dgemm
 
         geno = self.G.read(index=np.s_[:, blk_start:blk_end], dtype=self.dtype)
-        means = np.nanmean(geno, axis=0)
-        stds = np.nanstd(geno, axis=0)
+        means = np.nanmean(geno, axis=0, dtype=self.dtype)
+        stds = np.nanstd(geno, axis=0, dtype=self.dtype)
         stds[stds == 0] = 1.0
         geno = (geno-means)/stds
-        geno[np.isnan(geno)] = 0
+        np.nan_to_num(geno, copy=False)
+        geno  = np.asarray(geno, dtype=self.dtype, order='F')
 
         if self.C is not None:
             geno = geno - self.C.dot(self.cov_R.dot(geno))
 
-        ## TODO: benchmark sgemm vs. np broadcasting - in small scale, looks like sgemm is faster (could be b/c sgemm is used in Xz estimation)
-        geno_t = np.array(geno.T, order='F')
-        meansq_blk = np.zeros((blk_end - blk_start, self.nbins))
-        gemm = fblas.sgemm if self.dtype is np.float32 else fblas.dgemm
-        work = np.empty((blk_end - blk_start, self.nvecs), dtype=self.dtype, order='F')
-        for k in range(self.nbins):
-            gemm(1.0, geno, self.Xz[k], c=work, beta=0.0, trans_a=True, overwrite_c=1)
-            work /= self.nsamp
-            meansq_blk[:, k] = np.mean(work*work, axis=1)
-        
-        return (blk_start, blk_end, meansq_blk)
+        block_len = blk_end - blk_start
+        work = np.empty((block_len, self.nvecs), dtype=self.dtype, order='F')
 
+        # For each bin, multiply and write means directly into shared meansq
+        for k in range(self.nbins):
+            Xz_k = _g_Xz2d[:, k*self.nvecs:(k+1)*self.nvecs]  # (N × V), Fortran view
+            gemm(1.0, geno, Xz_k, c=work, beta=0.0, trans_a=True, overwrite_c=1)  # geno^T @ Xz_k
+            work *= (1.0 / self.nsamp)
+            _g_meansq[blk_start:blk_end, k] = np.mean(work * work, axis=1)
+        return 1
 
     def _read_annot(self, annot_path):
         """
@@ -277,8 +339,10 @@ class GenomewideLDScore:
         self.log._log(f"num_vecs: {self.nvecs}, num_workers: {self.nworkers}, step_size: {self.step_size}, seed: {self.root_seed}")
         self.log._log(f"Using {self.rand_dist} random vectors.")
         self.nblks = len(np.arange(self.nsnps)[::self.step_size])
+        
         Xz_input = []
         XtXz_input = []
+        
         for j in range(self.nblks):
             idx_start = self.step_size*j
             idx_end = self.nsnps if j==self.nblks-1 else self.step_size*(j+1)
@@ -286,38 +350,52 @@ class GenomewideLDScore:
             Xz_input.append((j, idx_start, idx_end, self._partition_index(np.arange(len(annot_blk)), annot_blk)))
             XtXz_input.append((idx_start, idx_end))
         
-        self.Xz = np.zeros((self.nbins, self.nsamp, self.nvecs), dtype=self.dtype)
+        # ----------------- allocate shared Xz (2D Fortran) and meansq -----------------
+        itemsize = np.dtype(self.dtype).itemsize
+        xz_shape2d = (self.nsamp, self.nvecs * self.nbins)   # Fortran 2D
+        ms_shape   = (self.nsnps, self.nbins)
 
-        with mp.Pool(self.nworkers) as pool:
-            with tqdm(total=self.nblks) as pbar:
-                pbar.set_description('Calculating Xz')
-                for result in pool.imap_unordered(self._compute_Xz_blk, Xz_input):
-                    self.Xz += result
-                    gc.collect()
+        shm_xz = shared_memory.SharedMemory(create=True, size=int(np.prod(xz_shape2d)) * itemsize)
+        # Parent's view (Fortran)
+        self.Xz2d = np.frombuffer(shm_xz.buf, dtype=self.dtype, count=xz_shape2d[0]*xz_shape2d[1]).reshape(xz_shape2d, order='F')
+        self.Xz2d.fill(0)
+
+        shm_ms = shared_memory.SharedMemory(create=True, size=int(np.prod(ms_shape)) * itemsize)
+        self.meansq = np.ndarray(ms_shape, dtype=self.dtype, buffer=shm_ms.buf)
+        self.meansq.fill(0)
+
+        # per-bin locks
+        xz_locks = [mp.Lock() for _ in range(self.nbins)]
+
+        # ----------------- Phase 1: build Xz in shared memory -----------------
+        with mp.Pool(self.nworkers,
+                     initializer=_init_shared,
+                     initargs=(shm_xz.name, xz_shape2d, None, None,
+                               np.dtype(self.dtype).str, xz_locks)) as pool:
+            with tqdm(total=self.nblks, desc='Calculating Xz') as pbar:
+                for _ in pool.imap_unordered(self._compute_Xz_blk, Xz_input):
                     pbar.update()
-        pool.join()
 
         self.Xz_time = utils._get_time()
         self.log._log("Calculation of Xz (for each partition) completed. Runtime: "+format(self.Xz_time - self.start_time, '.3f')+" s")
 
-        self.meansq = np.zeros((self.nsnps, self.nbins), dtype=self.dtype)
-
-        with mp.Pool(self.nworkers) as pool:
-            with tqdm(total=self.nblks) as pbar:
-                pbar.set_description('Calculating XtXz')
-                for result in pool.imap_unordered(self._compute_XtXz_blk, XtXz_input):
-                    idx_start, idx_end, meansq_blk = result
-                    self.meansq[idx_start:idx_end, :] = meansq_blk
-                    gc.collect()
+        # ----------------- Phase 2: fill meansq in shared memory -----------------
+        with mp.Pool(self.nworkers,
+                     initializer=_init_shared,
+                     initargs=(shm_xz.name, xz_shape2d, shm_ms.name, ms_shape,
+                               np.dtype(self.dtype).str, xz_locks)) as pool:
+            with tqdm(total=self.nblks, desc='Calculating XtXz') as pbar:
+                for _ in pool.imap_unordered(self._compute_XtXz_blk, XtXz_input):
                     pbar.update()
-        pool.join()
 
         self.XtXz_time = utils._get_time()
         self.log._log("Calculation of XtXz (for each partition) completed. Runtime: "+format(self.XtXz_time - self.Xz_time, '.3f')+" s")
 
+        # ----------------- finish / save -----------------
         self.log._log("Converting XtXz into genome-wide (partitioned) LD scores.")
         self.gwldscore = self.nsamp/(self.nsamp+1) * (self.meansq - self.nsnps_bin / self.nsamp)
         self.gwldscore = self.gwldscore.astype(np.float64, copy=False)
+
         self.log._log(f"Saving the genome-wide (partitioned) LD scores into: {self.outpath}.gw.ldscore.gz")
         snpcols = ['CHR', 'SNP', 'BP']
         if (self.snplist is None):
@@ -329,7 +407,15 @@ class GenomewideLDScore:
         self.gwldscore = pd.DataFrame(self.gwldscore, columns = self.l2cols)
         self.gwldscore = pd.concat([self.snpdf, self.gwldscore], axis=1)
         self.gwldscore.to_csv(f'{self.outpath}.gw.ldscore.gz', index=False, compression='gzip', sep='\t', float_format='%.3f')
+
         self.end_time = utils._get_time()
         self.log._log(f"Calculation of genome-wide LD score ended at "+utils._get_timestr(self.end_time))
         self.log._log("Runtime: "+format(self.end_time - self.start_time, '.3f')+" s")
         self.log._save_log(self.outpath+".gw.log")
+
+        # ----------------- free shared memory -----------------
+        self.Xz2d = None
+        self.meansq = None
+        gc.collect()
+        shm_xz.close(); shm_xz.unlink()
+        shm_ms.close(); shm_ms.unlink()
