@@ -211,15 +211,33 @@ def _parse_column_name(df, letters, min_index=3):
     else:
         return matching_columns[0]
 
-def _solve_linear_equation(X, y, method='lstsq'):
-    '''
-    Solve system of linear equations (either least square or QR)
-    '''
-    if (method == 'lstsq'):
+def _solve_linear_equation(X, y, method='auto'):
+    """
+    Solve A x = b.
+    Supports batched solves:
+      X shape: (..., p, p)
+      y shape: (..., p) or (..., p, k)
+    For SPD matrices, Cholesky is fastest and most stable.
+    """
+    X = np.asarray(X)
+    y = np.asarray(y)
+
+    if method == 'lstsq':
+        # Keep your original behavior if explicitly requested
         return np.linalg.lstsq(X, y, rcond=None)[0]
-    else:
-        Q, R = scipy.linalg.qr(X)
-        return scipy.linalg.solve_triangular(R, np.dot(Q.T, y))
+
+    # Try Cholesky (fast path)
+    try:
+        L = np.linalg.cholesky(X)               # (..., p, p)
+        # forward solve L z = y
+        z = np.linalg.solve(L, y[..., None]).squeeze(-1)  # (..., p) or (..., p, k)
+        # backward solve L.T x = z
+        x = np.linalg.solve(np.swapaxes(L, -1, -2), z[..., None]).squeeze(-1)
+        return x
+    except np.linalg.LinAlgError:
+        # Fall back to generic solver (still batched)
+        return np.linalg.solve(X, y)
+
 
 import numpy as np
 

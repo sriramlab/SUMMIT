@@ -42,11 +42,15 @@ class Sumrhe:
         self.verbose = verbose
 
     def _calc_sigmas(self, idx):
-        rhs = self.sums.rhs
-        pred_tr = self.tr._calc_trace(self.nsamp[idx])
-        for i in range(self.nblks+1):
-            sig_est = utils._solve_linear_equation(pred_tr[i], rhs[i])
-            self.sigmas[idx][i] = np.append(sig_est, sig_est[:-1].sum())
+        rhs = self.sums.rhs                              # (nblks+1, p)
+        pred_tr = self.tr._calc_trace(self.nsamp[idx])       # (nblks+1, p, p)
+
+        sig_est = utils._solve_linear_equation(pred_tr, rhs) # (nblks+1, p)
+
+        # store [sigma_g1^2,...,sigma_gK^2, sigma_e^2, sum_g]
+        self.sigmas[idx, :, :self.nbins+1] = sig_est
+        self.sigmas[idx, :, -1] = sig_est[:, :self.nbins].sum(axis=1)
+
         if self.verbose:
             names = [f"sigma^2_g{t}" for t in range(self.nbins)] + ["sigma^2_e"]
             self.log._log("Normal equation:\n"+np.array2string(pred_tr[self.nblks], precision=2, separator=', ')+"\n\t\t*\n"\
@@ -55,49 +59,116 @@ class Sumrhe:
         return self.sigmas[idx]
 
     def _calc_h2(self, idx):
-        '''
-        calculate heritabilities from variance components (supports overlapping annotations)
-        '''
-        full_overlap = self.tr.annot.T @ self.tr.annot # (K, K): |S_k \cap S_c|
-        full_counts  = self.tr.annot.sum(axis=0) # (K, ): M_c
+        """
+        Vectorized, filter-aware h^2 calculation (supports overlapping annotations).
+        Assumes Trace._filter_snps() has already been called for this phenotype,
+        so self.tr.annot/self.tr.nsnps/self.tr.blk_size reflect the finalized SNP set.
+        """
+        A = self.tr.annot                    # shape (M, K), typically {0,1} but can be floats
+        M, K = A.shape
+        B = self.nblks
 
-        for j in range(self.nblks):
-            start = self.tr.blk_size * j
-            end   = self.tr.blk_size*(j+1) if (j < self.nblks-1) else self.tr.nsnps
-            ab = self.tr.annot[start:end]
-            overlap_j = full_overlap - (ab.T @ ab)
-            counts_j = full_counts - ab.sum(axis=0)
-            with np.errstate(divide='ignore', invalid='ignore'):
-                h2_cat_j = (overlap_j / counts_j[None, :]) @ self.sigmas[idx, j, :self.nbins]
-                h2_cat_j[~np.isfinite(h2_cat_j)] = 0.0
-            self.herits[idx, j, :self.nbins] = h2_cat_j
+        # ----- One-time per-phenotype precompute (after filtering) -----
+        # Use float32 to leverage fast sgemm; cast once.
+        A32 = np.asarray(A, dtype=np.float32, order='C')
 
-        # point estimate
+        # Full overlaps and counts
+        overlap_full = A32.T @ A32           # (K, K)
+        counts_full  = A32.sum(axis=0)       # (K, )
+
+        # Per-block overlaps and counts
+        overlap_blk = np.empty((B, K, K), dtype=np.float32)
+        counts_blk  = np.empty((B, K),     dtype=np.float32)
+
+        # Vectorized block boundaries
+        # (equal-sized except possibly the last in your current setup; filtering may unbalance counts but the slices are still valid)
+        bs = self.tr.blk_size
+        starts = bs * np.arange(B)
+        ends   = starts + bs
+        ends[-1] = self.tr.nsnps  # ensure last block reaches end
+
+        # Compute ab.T @ ab once per block (K is small; BLAS makes this fast)
+        for j in range(B):
+            ab = A32[starts[j]:ends[j], :]          # (m_j, K), contiguous slice
+            overlap_blk[j] = ab.T @ ab              # (K, K)
+            counts_blk[j]  = ab.sum(axis=0)         # (K, )
+
+        # ----- Jackknife LOO numerator/denominator (batched over blocks) -----
+        # LOO overlaps/counts = full - block
+        overlap_minus = overlap_full[None, :, :] - overlap_blk     # (B, K, K)
+        counts_minus  = counts_full[None, :]    - counts_blk       # (B, K)
+
         with np.errstate(divide='ignore', invalid='ignore'):
-            h2_cat_full = (full_overlap / full_counts[None, :]) @ self.sigmas[idx, self.nblks, :self.nbins]
+            ratio_minus = overlap_minus / counts_minus[:, None, :] # (B, K, K)
+
+        # ----- Batched contraction to get all LOO h2 per category -----
+        # sigma_g (LOO) per block/category
+        sigma_g_minus = self.sigmas[idx, :B, :K]                   # (B, K)
+        # h2_cat_minus[b, c] = sum_k ratio_minus[b, c, k] * sigma_g_minus[b, k]
+        h2_cat_minus  = np.einsum('bck,bk->bc', ratio_minus, sigma_g_minus, optimize=True)
+        h2_cat_minus[~np.isfinite(h2_cat_minus)] = 0.0
+        self.herits[idx, :B, :K] = h2_cat_minus
+
+        # ----- Point estimate (full) -----
+        with np.errstate(divide='ignore', invalid='ignore'):
+            ratio_full   = overlap_full / counts_full[None, :]      # (K, K)
+            h2_cat_full  = ratio_full @ self.sigmas[idx, B, :K]     # (K, )
             h2_cat_full[~np.isfinite(h2_cat_full)] = 0.0
-        self.herits[idx, self.nblks, :self.nbins] = h2_cat_full
-        self.herits[idx, :, -1] = self.sigmas[idx, :, :self.nbins].sum(axis=1)
+        self.herits[idx, B, :K] = h2_cat_full
+
+        # Total h2 across categories is just the sum of sigma_g^2
+        self.herits[idx, :, -1] = self.sigmas[idx, :, :K].sum(axis=1)
+
     
     def _calc_enrich(self, idx):
-        h2_cat = self.herits[idx, :, :self.nbins]
-        h2_tot = self.herits[idx, :, -1]
+        """
+        Enrichment = (h2_cat / h2_tot) / prop, with prop built from LOO bin counts.
+        Handles overlapping annotations. Vectorized over jackknife blocks.
+        """
+        A = np.asarray(self.tr.annot, dtype=np.float32)   # (M, K)
+        M, K = A.shape
+        B    = self.nblks
 
-        M_bin = self.tr.nsnps_blk.astype(float)  # (nblks+1, nbins)
+        # --- Full counts per bin (overlaps allowed) ---
+        counts_full = A.sum(axis=0)                       # (K,)
 
-        M_tot = np.zeros(self.nblks+1, dtype=float)
-        for j in range(self.nblks):
-            start = self.tr.blk_size * j
-            end   = self.tr.blk_size*(j+1) if (j < self.nblks-1) else self.tr.nsnps
-            M_tot[j] = float(self.tr.nsnps - (end - start))
-        M_tot[self.nblks] = float(self.tr.nsnps)
+        # --- Per-block bin counts (in-block) ---
+        bs = self.tr.blk_size
+        starts = bs * np.arange(B)
+        ends   = starts + bs
+        ends[-1] = self.tr.nsnps
+
+        counts_blk = np.empty((B, K), dtype=np.float32)
+        blk_sizes  = np.empty(B,    dtype=np.int64)
+        for j in range(B):
+            ab = A[starts[j]:ends[j], :]                  # (m_j, K)
+            counts_blk[j] = ab.sum(axis=0)
+            blk_sizes[j]  = ab.shape[0]
+
+        # --- LOO bin counts & totals ---
+        # For j-th LOO replicate: remaining SNPs in bin k = counts_full[k] - counts_blk[j, k]
+        M_bin = np.empty((B + 1, K), dtype=np.float64)
+        M_bin[:B, :] = counts_full[None, :] - counts_blk
+        M_bin[B,  :] = counts_full
+
+        # Total SNPs per replicate (not "sum of bin counts" since bins can overlap)
+        M_tot = np.empty(B + 1, dtype=np.float64)
+        M_tot[:B] = float(self.tr.nsnps) - blk_sizes
+        M_tot[B]  = float(self.tr.nsnps)
+
+        # --- Build prop and enrichment ---
+        h2_cat = self.herits[idx, :, :K]                  # (B+1, K)
+        h2_tot = self.herits[idx, :, -1]                  # (B+1,)
 
         with np.errstate(divide='ignore', invalid='ignore'):
-            prop = M_bin / M_tot[:, None]
+            prop = M_bin / M_tot[:, None]                 # (B+1, K)
             enr  = (h2_cat / h2_tot[:, None]) / prop
-            enr[~np.isfinite(enr)] = np.nan
+            # mark invalid as NaN; we’ll handle them in jackknife
+            invalid = (~np.isfinite(enr)) | (prop <= 0.0) | (h2_tot[:, None] <= 0.0)
+            enr[invalid] = np.nan
 
         self.enrich[idx] = enr
+
 
     def _run_jackknife(self, idx):
         ''' run snp-level block jackknife '''
