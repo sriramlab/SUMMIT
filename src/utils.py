@@ -62,28 +62,127 @@ def _calc_rg_const_trace_from_ld(ldsum, n1, n2, m1, m2):
     '''
     return ldsum*n1*n2/(m1*m2)
 
+
+# ----------------------- Batched vectorized versions ----------------------- #
+
+def _calc_trace_from_ld_batch(ldsum, n, m1, m2):
+    """
+    Batched version of _calc_trace_from_ld with broadcasting.
+    Inputs
+      ldsum : (..., K, K)
+      n     : scalar or broadcastable to (..., 1, 1)
+      m1    : (..., K, 1)  LOO bin counts for 'row' bin
+      m2    : (..., 1, K)  LOO bin counts for 'col' bin
+    Returns
+      trace : (..., K, K)
+    Fills positions with zero denominator with n (your original fill).
+    """
+    ldsum = np.asarray(ldsum, dtype=np.float64)
+    n     = np.asarray(n,     dtype=np.float64)
+    m1    = np.asarray(m1,    dtype=np.float64)
+    m2    = np.asarray(m2,    dtype=np.float64)
+
+    denom = m1 * m2                         # (..., K, K)
+    with np.errstate(divide='ignore', invalid='ignore'):
+        out = ldsum * (n ** 2) / denom + n  # broadcasted compute
+    # where denom <= 0 (or NaN), fall back to n
+    valid = (denom > 0) & np.isfinite(denom)
+    out = np.where(valid, out, n)
+    return out
+
+
+def _calc_rg_trace_from_ld_batch(ldsum, n1, n2, m1, m2):
+    """
+    Batched version of _calc_rg_trace_from_ld with broadcasting.
+    Inputs
+      ldsum : (..., K, K)
+      n1,n2 : scalars
+      m1    : (..., K, 1)
+      m2    : (..., 1, K)
+    Returns
+      rg_trace : (..., K, K)
+    Fills positions with zero denominator with 0.0.
+    """
+    ldsum = np.asarray(ldsum, dtype=np.float64)
+    n1 = float(n1)
+    n2 = float(n2)
+    m1 = np.asarray(m1, dtype=np.float64)
+    m2 = np.asarray(m2, dtype=np.float64)
+
+    denom = m1 * m2
+    with np.errstate(divide='ignore', invalid='ignore'):
+        out = ldsum * (n1 * n2) / denom
+    valid = (denom > 0) & np.isfinite(denom)
+    out = np.where(valid, out, 0.0)
+    return out
+
+
+# ----------------------- Jackknife helpers ----------------------- #
+
 def _calc_jn_subsample(alist):
-    '''
-    From a list/array return an array of leave-one-out (jackknife) subsamples
-    the last element is the sum of all elements
-    '''
+    """
+    From a list/array return an array of leave-one-out (jackknife) subsamples.
+    The last element is the sum of all elements.
+    """
     total = sum(alist)
     jn_sub = [total - val for val in alist]
     jn_sub.append(total)
     return np.array(jn_sub)
 
-def _calc_jackknife_se(alist):
-    '''
-    alist should have shape (nblks+1,) where the last value is the total estimate
-    '''
-    n_total = alist.shape[0]
-    nblks   = n_total - 1
-    leave_out = alist[:nblks, ...]
-    est_full  = alist[-1, ...]
-    sum_sq = np.sum((leave_out - est_full)**2, axis=0)
-    se_jk = np.sqrt((nblks - 1) / nblks * sum_sq)
+
+def _calc_jackknife_se(alist, axis=0, center='full', nan_policy='propagate'):
+    """
+    Jackknife SE along `axis` for arrays shaped (B+1, ...), where the last slice
+    is the full-sample estimate and the first B are LOO replicates.
+
+    Matches the legacy (slow) implementation by default:
+      center='full' and nan_policy='propagate'  ->  centers at full and propagates NaNs.
+
+    Options:
+      center: 'full' (legacy) or 'mean' (standard jackknife center at LOO mean)
+      nan_policy: 'propagate' (legacy), or 'omit' (ignore NaNs per-coordinate)
+
+    Returns: (est_full, se_jk) with est_full = last slice on `axis`.
+    """
+    a = np.asarray(alist)
+    # full-sample estimate (last slice on axis)
+    est_full = np.take(a, indices=-1, axis=axis)
+
+    # LOO replicates = all but last
+    slicer = [slice(None)] * a.ndim
+    slicer[axis] = slice(0, -1)
+    reps = a[tuple(slicer)]                   # shape: (n, ...)
+
+    # move jk axis to front
+    reps = np.moveaxis(reps, axis, 0)         # (n, ...)
+
+    # center choice
+    if center == 'full':
+        # broadcast est_full across replicate axis
+        center_arr = est_full
+    elif center == 'mean':
+        center_arr = np.nanmean(reps, axis=0) if nan_policy == 'omit' else reps.mean(axis=0)
+    else:
+        raise ValueError("center must be 'full' or 'mean'")
+
+    diffs = reps - center_arr  # (n, ...)
+
+    if nan_policy == 'omit':
+        finite = np.isfinite(diffs)
+        m = finite.sum(axis=0)                         # effective replicates per coordinate
+        diffs = np.where(finite, diffs, 0.0)
+        ss = (diffs * diffs).sum(axis=0)
+        with np.errstate(divide='ignore', invalid='ignore'):
+            var_jk = (np.maximum(m - 1, 0) / np.maximum(m, 1)) * ss
+            se_jk = np.sqrt(var_jk)
+            se_jk[m < 1] = np.nan
+    else:  # 'propagate' (legacy behavior)
+        ss = (diffs * diffs).sum(axis=0)
+        n = diffs.shape[0]
+        se_jk = np.sqrt((n - 1) / n * ss)
 
     return est_full, se_jk
+
 
 def _read_multiple_lines(file_path, num_lines, sep=','):
     '''
