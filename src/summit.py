@@ -95,7 +95,8 @@ if __name__ == '__main__':
             log._log("!!! An output path to save the genome-wide LD scores must be provided !!!")
             sys.exit(1)
         gwld = GenomewideLDScore(bed_path=args.geno, annot_path=args.annot, out_path=args.out, covar_path=args.covar, rand_dist=args.rand_dist,\
-            log=log, num_vecs=args.nvecs, num_workers=args.nworkers, step_size=args.step_size, seed=args.seed, verbose=args.verbose, num_threads=args.num_threads)
+            log=log, num_vecs=args.nvecs, num_workers=args.nworkers, step_size=args.step_size, seed=args.seed, verbose=args.verbose, \
+                num_threads=args.num_threads)
         gwld._compute_ldscore()
     elif (args.h2 is not None):
         if (args.trace is None) and (args.ldscores is None):
