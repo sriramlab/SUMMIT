@@ -12,11 +12,37 @@ import sys
 import gc
 from multiprocessing import shared_memory
 import atexit
-import math
 import os
 
+def limit_blas_threads(n: int = 4):
+    """
+    Cap BLAS/OpenMP thread teams so mp.Pool workers don't oversubscribe the CPU.
+    Call this BEFORE spawning any Pools.
+    """
+    import os
+    n = max(1, int(n))
+    os.environ["OMP_NUM_THREADS"] = str(n)
+    os.environ["MKL_NUM_THREADS"] = str(n)
+    os.environ["OPENBLAS_NUM_THREADS"] = str(n)
+    os.environ["BLIS_NUM_THREADS"] = str(n)
+    os.environ["VECLIB_MAXIMUM_THREADS"] = str(n)
+    os.environ["NUMEXPR_NUM_THREADS"] = str(n)
+    os.environ["MKL_DYNAMIC"] = "FALSE"
+    os.environ["OMP_DYNAMIC"] = "FALSE"
+    # Best-effort runtime setters (safe if unavailable)
+    try:
+        import mkl  # type: ignore
+        mkl.set_num_threads(n)
+    except Exception:
+        pass
+    try:
+        from threadpoolctl import threadpool_limits  # type: ignore
+        threadpool_limits(limits=n)
+    except Exception:
+        pass
+
+
 def _bytes_human(n):
-    # human-readable bytes
     if n is None: return "n/a"
     if n < 1024: return f"{n} B"
     for unit in ["KB","MB","GB","TB","PB"]:
@@ -26,7 +52,6 @@ def _bytes_human(n):
     return f"{n:,.2f} EB"
 
 def _rss_snapshot(label, logger=None, include_children=True):
-    """Log current RSS (resident memory). Tries psutil, then resource (Linux/Mac)."""
     rss = None
     total = None
     num_children = 0
@@ -40,11 +65,9 @@ def _rss_snapshot(label, logger=None, include_children=True):
             num_children = len(kids)
             total += sum(c.memory_info().rss for c in kids if c.is_running())
     except Exception:
-        # Fallback: resource (ru_maxrss is kB on Linux, bytes on macOS)
         try:
             import resource
             r = resource.getrusage(resource.RUSAGE_SELF)
-            # Linux reports kB, macOS bytes; detect via magnitude
             ru = r.ru_maxrss
             rss = ru * 1024 if ru < 10**9 else ru
             total = rss
@@ -59,16 +82,14 @@ def _rss_snapshot(label, logger=None, include_children=True):
     else:
         print(msg, file=sys.stderr, flush=True)
 
-
 # -------------------- shared-memory worker globals --------------------
-_g_Xz2d = None
-_g_meansq = None
+_g_Xz2d = None           # (N × V*B), holds either Xz or M·Xz depending on phase
+_g_meansq = None         # (M × B)
 _g_xz_locks = None
 _g_shm_xz = None
 _g_shm_ms = None
 
 def _worker_cleanup():
-    # drop array views first
     global _g_Xz2d, _g_meansq, _g_shm_xz, _g_shm_ms
     _g_Xz2d = None
     _g_meansq = None
@@ -110,110 +131,95 @@ def _init_shared(xz_name, xz_shape2d, meansq_name, meansq_shape, dtype_str, xz_l
         _g_meansq = None
 
     _g_xz_locks = xz_locks
-
-    # ensure clean shutdown in the worker
     atexit.register(_worker_cleanup)
 
-
+# -------------------- covariate reader → orthonormal Q --------------------
 def read_cov(
-        cov_filename: str,
-        fam_filename: str,
-        std: bool = True,
-        cov_impute_method: str = "ignore",
-        one_hot_conversion: bool = False,
-        categorical_threshold: int = 100,
-        logger = None,
-        verbose = False
-    ):
-    """
-    1) Read PLINK .fam to get FID/IID sample order.
-    2) Read covariate file, merge on FID/IID (error if mismatch).
-    3) Drop FID, IID, handle missingness/imputation.
-    4) Optionally one-hot encode categoricals.
-    5) If std=True, center & scale each covariate column.
-    6) Return:
-         C : (n_samples x n_covariates) array,
-         R : (n_covariates x n_samples) regression matrix = (C^T C)^{-1} C^T
-    """
-    # 1) load .fam
-    fam = pd.read_csv(
-        fam_filename,
-        sep=r'\s+',
-        header=None,
-        usecols=[0,1],
-        names=['FID','IID']
-    )
-
-    # 2) load covariate file
+    cov_filename: str,
+    fam_filename: str,
+    std: bool = True,
+    cov_impute_method: str = "ignore",   # drop rows with any NA
+    one_hot_conversion: bool = False,
+    categorical_threshold: int = 100,
+    logger=None,
+    verbose=False
+):
+    fam = pd.read_csv(fam_filename, sep=r'\s+', header=None, usecols=[0,1], names=['FID','IID'])
     cov = pd.read_csv(cov_filename, sep=r'\s+')
-    merged = fam.merge(cov, on=['FID','IID'], how='right', indicator=True)
-    missing = merged.loc[merged['_merge'] != 'both', ['FID','IID']]
-    if not missing.empty:
-        if verbose:
-            raise ValueError(
-                f"Samples in {fam_filename} not found in {cov_filename}:\n"
-                f"{missing.to_string(index=False)}"
-            )
-        else:
-            raise ValueError(
-                f"!!! {len(missing)} Samples are not found in {cov_filename} !!!"
-            )
-    merged = merged.drop(columns=['_merge'])
 
-    # 3) drop IDs, handle missingness
+    merged = fam.merge(cov, on=['FID','IID'], how='left', indicator=True)
+    n_missing_in_cov = (merged['_merge'] != 'both').sum()
+    if n_missing_in_cov:
+        raise ValueError(f"{n_missing_in_cov} .fam samples not found in covariate file (FID/IID mismatch).")
+    merged.drop(columns=['_merge'], inplace=True)
+
     df = merged.drop(columns=['FID','IID']).copy()
-    n_covariates = len(df.columns)
-    is_na = df.isin(['NA', -9]).any(axis=1)
-    if cov_impute_method == "ignore":
-        if is_na.any():
-            idx = np.where(is_na)[0].tolist()
-            raise ValueError(f"Missing covariate entries at rows: {idx}")
-    else:
-        df.replace({'NA': np.nan, -9: np.nan}, inplace=True)
-        for col in df.columns:
-            df[col].fillna(df[col].mean(), inplace=True)
+    for c in df.columns:
+        df[c] = pd.to_numeric(df[c], errors='coerce')
 
-    # 4) one-hot encode if requested
     if one_hot_conversion:
-        for col in df.columns:
-            if df[col].nunique() <= categorical_threshold:
-                dummies = pd.get_dummies(df[col], prefix=col, drop_first=False)
-                df = df.drop(columns=[col]).join(dummies)
+        small = [c for c in df.columns if df[c].nunique() <= categorical_threshold]
+        if small:
+            df = pd.get_dummies(df, columns=small, drop_first=True)
 
-    # 5) standardize if requested
-    if std:
+    if cov_impute_method == "ignore":
+        keep_mask = ~df.isna().any(axis=1)
+        dropped = (~keep_mask).sum()
+        if logger: logger._log(f"Dropping {dropped} samples due to missing covariates.")
+        df = df.loc[keep_mask].reset_index(drop=True)
+    else:
+        df = df.apply(lambda s: s.fillna(s.mean()), axis=0)
+        keep_mask = np.ones(len(df), dtype=bool)
+
+    zvc = df.std(ddof=0) == 0
+    if zvc.any():
+        drop_cols = zvc.index[zvc].tolist()
+        if logger: logger._log(f"Dropping {len(drop_cols)} constant covariates: {drop_cols[:10]}{'...' if len(drop_cols)>10 else ''}")
+        df.drop(columns=drop_cols, inplace=True)
+
+    if std and not df.empty:
         df = (df - df.mean()) / df.std(ddof=1)
+        bad_cols = [c for c in df.columns if df[c].isna().all()]
+        if bad_cols:
+            if logger: logger._log(f"Dropping malformed covariate columns after standardization: {bad_cols}")
+            df.drop(columns=bad_cols, inplace=True)
 
-    C = df.values  # shape (n_samples, n_cov)
+    if df.empty:
+        raise ValueError("After cleaning, no usable covariates remain.")
 
-    # 6) build regression matrix R = (C^T C)^{-1} C^T
-    CtC = C.T @ C
-    inv_CtC = np.linalg.inv(CtC)
-    R = inv_CtC @ C.T  # shape (n_cov, n_samples)
-    
+    C64 = df.to_numpy(dtype=np.float64)
+    Q, _ = np.linalg.qr(C64, mode='reduced')     # Q: (N_kept × p_eff)
+    C = np.asfortranarray(Q)
+    R = np.asfortranarray(Q.T)
+
+    keep_idx = np.flatnonzero(keep_mask.values) if isinstance(keep_mask, pd.Series) else np.flatnonzero(keep_mask)
+
     if logger:
-        logger._log(
-            f"Read {cov_filename} for {n_covariates} covariates (samples merged with {fam_filename}).\n"
-            f"C shape={C.shape}, R shape={R.shape}, std={std}, one_hot={one_hot_conversion}, verbose={verbose}"
-        )
+        logger._log(f"Read {cov_filename}: kept {C.shape[0]} samples, {C.shape[1]} effective covariates. "
+                    f"C shape={C.shape}, R shape=({R.shape[0]},{R.shape[1]}).")
 
-    return C, R
+    return C, R, keep_idx
 
-
+# -------------------- main class --------------------
 class GenomewideLDScore:
     def __init__(self,
-                 bed_path,
-                 annot_path,
-                 out_path,
-                 log,
-                 rand_dist,
-                 covar_path=None,
-                 num_vecs=10,
-                 num_workers=4,
-                 step_size=1000,
-                 seed=None,
-                 verbose=False,
-                 dtype='float32'):
+                bed_path,
+                annot_path,
+                out_path,
+                log,
+                rand_dist,
+                covar_path=None,
+                num_vecs=10,
+                num_workers=4,
+                step_size=1000,
+                seed=None,
+                verbose=False,
+                dtype='float32',
+                num_threads: int = 4):        # <-- NEW: cap BLAS threads
+        # Limit BLAS threads up front (before we spawn any Pools)
+        self.num_threads = num_threads
+        limit_blas_threads(self.num_threads)
+
         self.G = open_bed(bed_path + ".bed")
         self.nsamp, self.nsnps = self.G.shape
         self.nvecs = num_vecs
@@ -231,57 +237,67 @@ class GenomewideLDScore:
         else:
             self._read_annot(None)
 
-        # read & build covariate residualizer
+        # covariates → orthonormal Q (C) and Q^T (cov_R)
         if covar_path is not None:
             fam_file = bed_path + ".fam"
-            self.C, self.cov_R = read_cov(
-                cov_filename       = covar_path,
-                fam_filename       = fam_file,
-                std                = True,
-                cov_impute_method  = "ignore",
-                one_hot_conversion = False,
-                categorical_threshold = 100,
-                logger             = self.log,
-                verbose            = self.verbose
+            self.C, self.cov_R, self.keep_rows = read_cov(
+                cov_filename=covar_path,
+                fam_filename=fam_file,
+                std=True,
+                cov_impute_method="ignore",
+                one_hot_conversion=False,
+                categorical_threshold=100,
+                logger=self.log,
+                verbose=self.verbose
             )
+            self.nsamp = self.C.shape[0]
+            self.log._log(f"Final sample count after covariate filtering: {self.nsamp}")
             self.C = np.asarray(self.C, dtype=self.dtype, order='F')
             self.cov_R = np.asarray(self.cov_R, dtype=self.dtype, order='F')
         else:
+            self.keep_rows = None
             self.C = None
             self.cov_R = None
             self.log._log("No covariate correction will be applied.")
 
+        self.p_eff = self.C.shape[1] if self.C is not None else 0
+        self.N_eff = self.nsamp - self.p_eff
+        if self.N_eff <= 1:
+            raise ValueError(f"N_eff={self.N_eff} is too small after covariate projection.")
+
         self.root_seed = seed
         self.outpath = out_path
 
+
+    # ------------------ Phase 1 worker: build X_k z (raw-space) ------------------
     def _compute_Xz_blk(self, blk_idxs):
+        """
+        For block [blk_start:blk_end), build per-bin X_k z and accumulate into shared _g_Xz2d.
+        NO covariate residualization here; standardize genotypes in RAW space only.
+        """
         j, blk_start, blk_end, idxs = blk_idxs
         nsnps = sum(len(binidx) for binidx in idxs)
 
         rng = np.random.default_rng([j, self.root_seed] if self.root_seed is not None else None)
         if self.rand_dist == "normal":
             Zs = rng.standard_normal(size=(nsnps, self.nvecs))
-
         elif self.rand_dist == "rademacher":
             Zs = rng.integers(0, 2, size=(nsnps, self.nvecs)) * 2 - 1
-
         elif self.rand_dist == "spherical":
             Zs = rng.standard_normal(size=(nsnps, self.nvecs))
             norms = np.linalg.norm(Zs, axis=0)
             Zs = Zs / norms[None, :] * np.sqrt(nsnps)
 
-        # read + standardize
-        geno = self.G.read(index=np.s_[:, blk_start:blk_end], dtype=self.dtype)
+        row_sel = self.keep_rows if self.keep_rows is not None else slice(None)
+        geno = self.G.read(index=np.s_[row_sel, blk_start:blk_end], dtype=self.dtype)
+
+        # standardize in raw space
         means = np.nanmean(geno, axis=0, dtype=self.dtype)
         stds  = np.nanstd(geno, axis=0, dtype=self.dtype)
         stds[stds == 0] = 1.0
         geno  = (geno - means) / stds
         np.nan_to_num(geno, copy=False)
         geno = np.asarray(geno, dtype=self.dtype, order='F')
-
-        # regress out covariates if present
-        if self.C is not None:
-            geno -= self.C.dot(self.cov_R.dot(geno))
 
         Zs = np.asarray(Zs, order='F', dtype=self.dtype)
         gemm = fblas.sgemm if self.dtype is np.float32 else fblas.dgemm
@@ -291,47 +307,72 @@ class GenomewideLDScore:
                 continue
             A = np.asfortranarray(geno[:, binidx], dtype=self.dtype)   # (N × K)
             B = np.asfortranarray(Zs[binidx, :],  dtype=self.dtype)    # (K × V)
-            c_view = _g_Xz2d[:, k*self.nvecs:(k+1)*self.nvecs]         # (N × V), Fortran view
+            c_view = _g_Xz2d[:, k*self.nvecs:(k+1)*self.nvecs]         # (N × V)
             with _g_xz_locks[k]:
-                # c := 1.0*A@B + 1.0*c   (accumulate)
                 gemm(1.0, A, B, c=c_view, beta=1.0, overwrite_c=1)
         return 1
-   
 
+    # ------------------ Phase 2 worker: multiply (MG)^T (MB) ------------------
     def _compute_XtXz_blk(self, blk_idx):
         """
-        For blk genotype, multiply with X_k z to get XtXkz.
+        For genotype block G (columns blk_start:blk_end), let Y = M·G if covariates else G.
+        Multiply for each bin k: work = Y^T @ (MB_k), where _g_Xz2d already holds MB_k.
+        Scale by 1/N_denom, write mean of squares across V into _g_meansq.
+        ALSO return:
+        - resvar_block: residual variances of left SNPs in this block (length L),
+        - sum_by_bin_block: per-bin sum of residual variances contributed by RIGHT SNPs
+            from this block (length B), to build the data-adaptive baseline.
         """
         blk_start, blk_end = blk_idx
         gemm = fblas.sgemm if self.dtype is np.float32 else fblas.dgemm
 
-        geno = self.G.read(index=np.s_[:, blk_start:blk_end], dtype=self.dtype)
+        row_sel = self.keep_rows if self.keep_rows is not None else slice(None)
+        geno = self.G.read(index=np.s_[row_sel, blk_start:blk_end], dtype=self.dtype)
+
+        # raw-space standardization
         means = np.nanmean(geno, axis=0, dtype=self.dtype)
-        stds = np.nanstd(geno, axis=0, dtype=self.dtype)
+        stds  = np.nanstd(geno, axis=0, dtype=self.dtype)
         stds[stds == 0] = 1.0
-        geno = (geno-means)/stds
+        geno  = (geno - means) / stds
         np.nan_to_num(geno, copy=False)
         geno  = np.asarray(geno, dtype=self.dtype, order='F')
-
-        if self.C is not None:
-            geno = geno - self.C.dot(self.cov_R.dot(geno))
 
         block_len = blk_end - blk_start
         work = np.empty((block_len, self.nvecs), dtype=self.dtype, order='F')
 
+        # Left projection once per block if covariates: Y = G - PG, else Y = G
+        if self.C is not None:
+            tmpG = self.cov_R @ geno   # (p × L)
+            PG   = self.C @ tmpG       # (N × L)
+            Y    = geno - PG
+            N_denom = self.N_eff
+        else:
+            Y = geno
+            N_denom = self.nsamp
+
+        # residual variances for left SNPs in this block (float64 for stability)
+        resvar_block = (np.sum(Y * Y, axis=0, dtype=np.float64) / float(N_denom))  # shape (L,)
+
         # For each bin, multiply and write means directly into shared meansq
         for k in range(self.nbins):
-            Xz_k = _g_Xz2d[:, k*self.nvecs:(k+1)*self.nvecs]  # (N × V), Fortran view
-            gemm(1.0, geno, Xz_k, c=work, beta=0.0, trans_a=True, overwrite_c=1)  # geno^T @ Xz_k
-            work *= (1.0 / self.nsamp)
+            MB_k = _g_Xz2d[:, k*self.nvecs:(k+1)*self.nvecs]  # (N × V), already M·X_k z if covariates, else X_k z
+            gemm(1.0, Y, MB_k, c=work, beta=0.0, trans_a=True, overwrite_c=1)  # Y^T @ MB_k
+            work *= (1.0 / float(N_denom))
             _g_meansq[blk_start:blk_end, k] = np.mean(work * work, axis=1)
-        return 1
 
+        # RIGHT-side residual-variance sums for baseline, from this block:
+        # sum_by_bin_block[b] = sum_{m in block ∩ bin b} Var(M x_m)
+        # We can compute Var(M x_m) for RIGHT SNPs in this block as the diagonal of (1/N_denom) * (M G)ᵀ (M G).
+        # But we already computed Y = M·G; its columnwise squared norms / N_denom give us exactly those vars.
+        annot_blk = (self.annot[blk_start:blk_end] != 0)          # (L × B) bool
+        # (B,) using bool→float multiply: sum over L
+        sum_by_bin_block = annot_blk.T.dot(resvar_block)          # (B,)
+        # Return to parent for accumulation
+        return (blk_start, resvar_block, sum_by_bin_block)
+
+
+    # ------------------ I/O helpers ------------------
     def _read_annot(self, annot_path):
-        """
-        Read in the annotation. If the file includes a header, save it as the names for the annotations.
-        If not, then have dummy names and read in the annotation.
-        """
         if (annot_path is None):
             self.l2cols = None
             self.annot = np.ones((self.nsnps, 1))
@@ -368,29 +409,33 @@ class GenomewideLDScore:
             sys.exit(1)
     
     def _partition_index(self, snpidx, annot) -> list[np.ndarray]:
-        """
-        partition snp indices by annotation
-        """
-        return [snpidx[annot[:, c] == 1] for c in range(self.nbins)]
+        return [snpidx[(annot[:, c] != 0)] for c in range(self.nbins)]
 
-
+    # ------------------ main compute ------------------
     def _compute_ldscore(self):
         """
-        Use multi-processing to calculate the X_j^T X_k Z.
-        General sketch: read in each block of genotype, calculate X_k Z for that blk. Aggregate X_k through all blks.
-        Then re-read each blk from the start, multiply by the previous result (loop over k) to get X_j ^ T X_k (no need for agg this time).
+        Phase 1: build X_k z (raw standardization).  (No covariate work here.)
+        If covariates present, parent converts Xz2d → M·Xz2d in-place after Phase 1.
+        Phase 2: for each block, Y = G or M·G; compute Y^T @ (M·X_k z) with 1 GEMM per bin.
+        After Phase 2, subtract the data-adaptive baseline for squared partial covariances:
+            meansq[j,k] -= Var(M g_j) * (sum_{m in bin k} Var(M x_m)) / N_denom
+        and write results.
         """
         self.start_time = utils._get_time()
         self.log._log("Genome-wide LD score calculation started at: "+utils._get_timestr(self.start_time))
         self.log._log(f"num_vecs: {self.nvecs}, num_workers: {self.nworkers}, step_size: {self.step_size}, seed: {self.root_seed}")
         self.log._log(f"Using {self.rand_dist} random vectors.")
+        if self.C is not None:
+            self.log._log(f"Both-side covariate correction enabled (N_eff={self.N_eff}, p={self.p_eff}).")
+        else:
+            self.log._log("No covariates: using raw-space estimator (original speed/memory).")
+
         self.nblks = len(np.arange(self.nsnps)[::self.step_size])
         self._print_expected_mem('Xz')
         _rss_snapshot("pre-alloc", self.log)
         
         Xz_input = []
         XtXz_input = []
-        
         for j in range(self.nblks):
             idx_start = self.step_size*j
             idx_end = self.nsnps if j==self.nblks-1 else self.step_size*(j+1)
@@ -398,114 +443,177 @@ class GenomewideLDScore:
             Xz_input.append((j, idx_start, idx_end, self._partition_index(np.arange(len(annot_blk)), annot_blk)))
             XtXz_input.append((idx_start, idx_end))
         
-        # ----------------- allocate shared Xz (2D Fortran) and meansq -----------------
-        itemsize = np.dtype(self.dtype).itemsize
-        xz_shape2d = (self.nsamp, self.nvecs * self.nbins)   # Fortran 2D
-        ms_shape   = (self.nsnps, self.nbins)
+        shm_xz = shm_ms = None
+        try:
+            # ----------------- allocate shared Xz (2D Fortran) and meansq -----------------
+            itemsize = np.dtype(self.dtype).itemsize
+            xz_shape2d = (self.nsamp, self.nvecs * self.nbins)
+            ms_shape   = (self.nsnps, self.nbins)
 
-        shm_xz = shared_memory.SharedMemory(create=True, size=int(np.prod(xz_shape2d)) * itemsize)
-        # Parent's view (Fortran)
-        self.Xz2d = np.frombuffer(shm_xz.buf, dtype=self.dtype, count=xz_shape2d[0]*xz_shape2d[1]).reshape(xz_shape2d, order='F')
-        self.Xz2d.fill(0)
+            shm_xz = shared_memory.SharedMemory(create=True, size=int(np.prod(xz_shape2d)) * itemsize)
+            self.Xz2d = np.frombuffer(shm_xz.buf, dtype=self.dtype,
+                                    count=xz_shape2d[0]*xz_shape2d[1]).reshape(xz_shape2d, order='F')
+            self.Xz2d.fill(0)
 
-        shm_ms = shared_memory.SharedMemory(create=True, size=int(np.prod(ms_shape)) * itemsize)
-        self.meansq = np.ndarray(ms_shape, dtype=self.dtype, buffer=shm_ms.buf)
-        self.meansq.fill(0)
+            shm_ms = shared_memory.SharedMemory(create=True, size=int(np.prod(ms_shape)) * itemsize)
+            self.meansq = np.ndarray(ms_shape, dtype=self.dtype, buffer=shm_ms.buf)
+            self.meansq.fill(0)
 
-        # per-bin locks
-        xz_locks = [mp.Lock() for _ in range(self.nbins)]
+            xz_locks = [mp.Lock() for _ in range(self.nbins)]
 
-        _rss_snapshot("after SHM alloc", self.log)
+            _rss_snapshot("after SHM alloc", self.log)
 
-        # ----------------- Phase 1: build Xz in shared memory -----------------
-        self._print_expected_mem('Xz')
-        with mp.Pool(self.nworkers,
-                     initializer=_init_shared,
-                     initargs=(shm_xz.name, xz_shape2d, None, None,
-                               np.dtype(self.dtype).str, xz_locks)) as pool:
-            with tqdm(total=self.nblks, desc='Calculating Xz') as pbar:
-                for _ in pool.imap_unordered(self._compute_Xz_blk, Xz_input):
-                    pbar.update()
+            # ----------------- Phase 1: build Xz in shared memory -----------------
+            self._print_expected_mem('Xz')
+            with mp.Pool(self.nworkers,
+                        initializer=_init_shared,
+                        initargs=(shm_xz.name, xz_shape2d, None, None,
+                                np.dtype(self.dtype).str, xz_locks)) as pool:
+                with tqdm(total=self.nblks, desc='Calculating Xz') as pbar:
+                    for _ in pool.imap_unordered(self._compute_Xz_blk, Xz_input):
+                        pbar.update()
 
-        _rss_snapshot("after Xz", self.log)
-        self.Xz_time = utils._get_time()
-        self.log._log("Calculation of Xz (for each partition) completed. Runtime: "+format(self.Xz_time - self.start_time, '.3f')+" s")
+            _rss_snapshot("after Xz", self.log)
+            self.Xz_time = utils._get_time()
+            self.log._log("Calculation of Xz (for each partition) completed. Runtime: "+format(self.Xz_time - self.start_time, '.3f')+" s")
 
-        # ----------------- Phase 2: fill meansq in shared memory -----------------
-        self._print_expected_mem('XtXz')
-        with mp.Pool(self.nworkers,
-                     initializer=_init_shared,
-                     initargs=(shm_xz.name, xz_shape2d, shm_ms.name, ms_shape,
-                               np.dtype(self.dtype).str, xz_locks)) as pool:
-            with tqdm(total=self.nblks, desc='Calculating XtXz') as pbar:
-                for _ in pool.imap_unordered(self._compute_XtXz_blk, XtXz_input):
-                    pbar.update()
+            # ----------------- Covariate step (parent only): Xz2d ← M·Xz2d (in-place) -----------------
+            if self.C is not None:
+                self.log._log("Projecting Xz onto covariate-orthogonal space: Xz ← (I - QQ^T) Xz (in-place)")
+                # Project in bin-chunks to give BLAS fatter blocks (tune chunk_bins if desired)
+                chunk_bins = 4
+                for b0 in range(0, self.nbins, chunk_bins):
+                    b1 = min(self.nbins, b0 + chunk_bins)
+                    c0 = b0 * self.nvecs
+                    c1 = b1 * self.nvecs
+                    X = self.Xz2d[:, c0:c1]           # (N × chunk)
+                    tmp = self.cov_R @ X              # (p × chunk)
+                    X  -= self.C @ tmp                # in-place: now M·X_k z
+                    del tmp, X
+                _rss_snapshot("after in-place projection of Xz", self.log)
 
-        _rss_snapshot("after XtXz", self.log)
-        self.XtXz_time = utils._get_time()
-        self.log._log("Calculation of XtXz (for each partition) completed. Runtime: "+format(self.XtXz_time - self.Xz_time, '.3f')+" s")
+            # ----------------- Phase 2: fill meansq in shared memory -----------------
+            self._print_expected_mem('XtXz')
 
-        # ----------------- finish / save -----------------
-        self.log._log("Converting XtXz into genome-wide (partitioned) LD scores.")
-        self.gwldscore = self.nsamp/(self.nsamp+1) * (self.meansq - self.nsnps_bin / self.nsamp)
-        self.gwldscore = self.gwldscore.astype(np.float64, copy=False)
+            # Buffers for adaptive baseline
+            N_denom = self.N_eff if self.C is not None else self.nsamp
+            self.resvar_left = np.empty(self.nsnps, dtype=np.float64)
+            self.sum_resvar_by_bin = np.zeros(self.nbins, dtype=np.float64)
 
-        self.log._log(f"Saving the genome-wide (partitioned) LD scores into: {self.outpath}.gw.ldscore.gz")
-        snpcols = ['CHR', 'SNP', 'BP']
-        if (self.snplist is None):
-            self.snpdf = pd.DataFrame(np.nan*np.ones((self.nsnps, 3)), columns=snpcols)
-        else:
-            self.snpdf = self.snplist.iloc[:, :3]
-            self.snpdf.columns = snpcols
-        
-        self.gwldscore = pd.DataFrame(self.gwldscore, columns = self.l2cols)
-        self.gwldscore = pd.concat([self.snpdf, self.gwldscore], axis=1)
-        self.gwldscore.to_csv(f'{self.outpath}.gw.ldscore.gz', index=False, compression='gzip', sep='\t', float_format='%.3f')
+            with mp.Pool(self.nworkers,
+                        initializer=_init_shared,
+                        initargs=(shm_xz.name, xz_shape2d, shm_ms.name, ms_shape,
+                                np.dtype(self.dtype).str, xz_locks)) as pool:
+                with tqdm(total=self.nblks, desc='Calculating XtXz') as pbar:
+                    for result in pool.imap_unordered(self._compute_XtXz_blk, XtXz_input):
+                        blk_start, resvar_block, sum_by_bin_block = result
+                        L = resvar_block.shape[0]
+                        self.resvar_left[blk_start:blk_start+L] = resvar_block
+                        self.sum_resvar_by_bin += sum_by_bin_block
+                        pbar.update()
 
-        self.end_time = utils._get_time()
-        self.log._log(f"Calculation of genome-wide LD score ended at "+utils._get_timestr(self.end_time))
-        self.log._log("Runtime: "+format(self.end_time - self.start_time, '.3f')+" s")
-        self.log._save_log(self.outpath+".gw.log")
+            _rss_snapshot("after XtXz", self.log)
+            self.XtXz_time = utils._get_time()
+            self.log._log("Calculation of XtXz (for each partition) completed. Runtime: "+format(self.XtXz_time - self.Xz_time, '.3f')+" s")
 
-        # ----------------- free shared memory -----------------
-        self.Xz2d = None
-        self.meansq = None
-        gc.collect()
-        shm_xz.close(); shm_xz.unlink()
-        shm_ms.close(); shm_ms.unlink()
-        _rss_snapshot("post-cleanup", self.log)
+            # ----------------- Adaptive baseline subtraction (covariance null) -----------------
+            self.log._log("Applying data-adaptive baseline for squared partial covariances.")
+            baseline_cols = (self.sum_resvar_by_bin / float(N_denom)).astype(self.meansq.dtype, copy=False)  # (B,)
+            # Subtract in blocks to limit peak memory
+            for s in range(0, self.nsnps, self.step_size):
+                e = min(self.nsnps, s + self.step_size)
+                left = self.resvar_left[s:e].astype(self.meansq.dtype, copy=False)[:, None]                  # (L×1)
+                self.meansq[s:e, :] -= left * baseline_cols[None, :]                                         # (L×B)
+            del baseline_cols
+
+            # ----------------- finish / save -----------------
+            # After adaptive baseline, 'meansq' is already the LD score estimate in covariance geometry.
+            self.gwldscore = self.meansq.astype(np.float64, copy=False)  # make a non-SHM copy for pandas/IO
+
+            self.log._log(f"Saving the genome-wide (partitioned) LD scores into: {self.outpath}.gw.ldscore.gz")
+            snpcols = ['CHR', 'SNP', 'BP']
+            if (self.snplist is None):
+                self.snpdf = pd.DataFrame(np.nan*np.ones((self.nsnps, 3)), columns=snpcols)
+            else:
+                self.snpdf = self.snplist.iloc[:, :3]
+                self.snpdf.columns = snpcols
+            
+            scores_df = pd.DataFrame(self.gwldscore, columns=self.l2cols)
+            out_df = pd.concat([self.snpdf, scores_df], axis=1)
+            out_df.to_csv(f'{self.outpath}.gw.ldscore.gz', index=False, compression='gzip', sep='\t', float_format='%.6f')
+
+            # ----------------- post-run statistics -----------------
+            try:
+                desc = scores_df.describe(percentiles=[0.25, 0.5, 0.75]).loc[['count','mean','std','min','25%','50%','75%','max']]
+                self.log._log("Per-bin LD score summary (count/mean/std/min/25%/50%/max):")
+                with pd.option_context('display.width', 140, 'display.max_columns', None, 'display.float_format', '{:.6g}'.format):
+                    self.log._log("\n" + desc.to_string())
+
+                corr = scores_df.corr(method='pearson')
+                self.log._log("Correlation matrix across bins (Pearson, over SNP-wise LD scores):")
+                with pd.option_context('display.width', 140, 'display.max_columns', None, 'display.float_format', '{:.4f}'.format):
+                    self.log._log("\n" + corr.to_string())
+            except Exception as e:
+                self.log._log(f"[warn] Failed to compute summary stats / correlation: {e}")
+
+            self.end_time = utils._get_time()
+            self.log._log(f"Calculation of genome-wide LD score ended at "+utils._get_timestr(self.end_time))
+            self.log._log("Runtime: "+format(self.end_time - self.start_time, '.3f')+" s")
+            self.log._save_log(self.outpath+".gw.log")
+        except KeyboardInterrupt:
+            self.log._log("KeyboardInterrupt received — terminating workers and cleaning shared memory.")
+            raise
+        finally:
+            # Ensure NO numpy views remain before closing SHM
+            try:
+                self.Xz2d = None
+                self.meansq = None
+                gc.collect()
+            finally:
+                # Close/unlink with BufferError tolerance
+                if shm_xz is not None:
+                    try:
+                        shm_xz.close()
+                    except BufferError as e:
+                        self.log._log(f"[warn] shm_xz.close raised BufferError: {e}. Proceeding to unlink; OS will free when mappings are gone.")
+                    finally:
+                        try: shm_xz.unlink()
+                        except FileNotFoundError: pass
+                        except Exception as e: self.log._log(f"[warn] shm_xz.unlink: {e}")
+                if shm_ms is not None:
+                    try:
+                        shm_ms.close()
+                    except BufferError as e:
+                        self.log._log(f"[warn] shm_ms.close raised BufferError: {e}. Proceeding to unlink; OS will free when mappings are gone.")
+                    finally:
+                        try: shm_ms.unlink()
+                        except FileNotFoundError: pass
+                        except Exception as e: self.log._log(f"[warn] shm_ms.unlink: {e}")
+            _rss_snapshot("post-cleanup", self.log)
+
     
     def _print_expected_mem(self, phase, block_len=None, k_max=None):
         """
         Rough upper-bound memory accounting for this run.
         phase: 'Xz' or 'XtXz'
-        block_len: defaults to min(step_size, nsnps) for estimates
-        k_max: optional per-bin SNPs in block; if None we ignore A/B temps
         """
         b = np.dtype(self.dtype).itemsize
         B, N, M, V, S, W = self.nbins, self.nsamp, self.nsnps, self.nvecs, self.step_size, self.nworkers
-        L = block_len if block_len is not None else min(S, M)
+        L = min(S, M)
 
         # Shared (parent) arrays
         xz_bytes = N * (V * B) * b           # Xz2d shape (N, V*B)
         ms_bytes = M * B * b                 # meansq (M, B)
 
         # Per-worker temps
-        geno_blk = N * L * b                 # geno block (N × L)
+        geno_blk = N * L * b
         if phase == 'Xz':
-            # we accumulate in-place; A/B temps depend on per-bin K.
-            # If you pass k_max, include a pessimistic bound; else omit.
             per_worker = geno_blk
-            if k_max is not None:
-                A = N * k_max * b            # N × K
-                Btmp = k_max * V * b         # K × V
-                per_worker += max(A, 0) + max(Btmp, 0)
-        else:  # XtXz
-            work = L * V * b                 # (L × V) buffer
+        else:
+            work = L * V * b
             per_worker = geno_blk + work
 
         total_est = xz_bytes + ms_bytes + W * per_worker
-
         self.log._log(
             f"[expected {phase}] dtype={self.dtype}, B={B}, N={N}, M={M}, V={V}, S={S}, W={W} "
             f"→ parent(Xz2d+meansq)≈{_bytes_human(xz_bytes + ms_bytes)}, "

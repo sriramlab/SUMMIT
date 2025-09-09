@@ -41,6 +41,8 @@ parser.add_argument("--geno", default=None, type=str, \
                     help='Path of the genotype file to calculate the genome-wide LD scores. Calculates partitioned scores if --annot is also specified.')
 parser.add_argument("--nworkers", default=4, type=int, \
                     help='Number of workers for multiprocessing to calculate stochastic genome-wide LD scores. Default is 4.')
+parser.add_argument("--num-threads", default=4, type=int, \
+                    help='Cap the number of threads for BLAS to limit CPU usage. Default is 4.')
 parser.add_argument("--nvecs", default=10, type=int, \
                     help='Number of random vectors to use for estimating stochastic genome-wide LD scores. Default is 10.')
 parser.add_argument("--step_size", default=1000, type=int, \
@@ -93,7 +95,7 @@ if __name__ == '__main__':
             log._log("!!! An output path to save the genome-wide LD scores must be provided !!!")
             sys.exit(1)
         gwld = GenomewideLDScore(bed_path=args.geno, annot_path=args.annot, out_path=args.out, covar_path=args.covar, rand_dist=args.rand_dist,\
-            log=log, num_vecs=args.nvecs, num_workers=args.nworkers, step_size=args.step_size, seed=args.seed, verbose=args.verbose)
+            log=log, num_vecs=args.nvecs, num_workers=args.nworkers, step_size=args.step_size, seed=args.seed, verbose=args.verbose, num_threads=args.num_threads)
         gwld._compute_ldscore()
     elif (args.h2 is not None):
         if (args.trace is None) and (args.ldscores is None):
