@@ -142,7 +142,8 @@ def read_cov(
     one_hot_conversion: bool = False,
     categorical_threshold: int = 100,
     logger=None,
-    verbose=False
+    verbose=False,
+    sample_idx=None,
 ):
     fam = pd.read_csv(fam_filename, sep=r'\s+', header=None, usecols=[0,1], names=['FID','IID'])
     cov = pd.read_csv(cov_filename, sep=r'\s+')
@@ -152,6 +153,10 @@ def read_cov(
     if n_missing_in_cov:
         raise ValueError(f"{n_missing_in_cov} .fam samples not found in covariate file (FID/IID mismatch).")
     merged.drop(columns=['_merge'], inplace=True)
+    
+    if sample_idx is not None:
+        sample_idx = np.asarray(sample_idx, dtype=int)
+        merged = merged.iloc[sample_idx].reset_index(drop=True)
 
     df = merged.drop(columns=['FID','IID']).copy()
     for c in df.columns:
@@ -192,13 +197,17 @@ def read_cov(
     C = np.asfortranarray(Q)
     R = np.asfortranarray(Q.T)
 
-    keep_idx = np.flatnonzero(keep_mask.values) if isinstance(keep_mask, pd.Series) else np.flatnonzero(keep_mask)
-
+    km = np.flatnonzero(keep_mask.values) if isinstance(keep_mask, pd.Series) else np.flatnonzero(keep_mask)
+    if sample_idx is not None:
+        keep_idx_global = np.asarray(sample_idx, dtype=int)[km]
+    else:
+        keep_idx_global = km
+        
     if logger:
         logger._log(f"Read {cov_filename}: kept {C.shape[0]} samples, {C.shape[1]} effective covariates. "
                     f"C shape={C.shape}, R shape=({R.shape[0]},{R.shape[1]}).")
 
-    return C, R, keep_idx
+    return C, R, keep_idx_global
 
 # -------------------- main class --------------------
 class GenomewideLDScore:
@@ -216,7 +225,8 @@ class GenomewideLDScore:
                 verbose=False,
                 dtype='float32',
                 num_threads: int = 1,
-                eps_var: float = 1e-8):        # small floor for variances
+                eps_var: float = 1e-8,
+                rand_samp=None): # float in (0,1] or int in [100, N]
         # Cap BLAS threads before any Pools spawn
         self.num_threads = int(num_threads)
         try:
@@ -235,6 +245,24 @@ class GenomewideLDScore:
         self.verbose = verbose
         self.dtype = np.float32 if dtype in (np.float32, 'float32', 'f4') else np.float64
         self.rand_dist = rand_dist
+        self.root_seed = seed
+        rng = np.random.default_rng(self.root_seed)
+        
+        # -------- resolve random subsample of individuals --------
+        base_idx = np.arange(self.nsamp, dtype=int)
+        sel_idx = None
+        if rand_samp is not None:
+            if isinstance(rand_samp, (float, np.floating)):
+                if not (0.0 < rand_samp <= 1.0):
+                    raise ValueError("--rand-samp float must be in (0,1].")
+                k = int(np.floor(rand_samp * self.nsamp))
+                k = max(1, min(k, self.nsamp))
+            else:
+                k = int(rand_samp)
+                if not (100 <= k <= self.nsamp):
+                    raise ValueError("--rand-samp int must be in [100, N].")
+            sel_idx = np.sort(rng.choice(base_idx, size=k, replace=False))
+            self.log._log(f"Randomly subsampling individuals: {k}/{self.nsamp} ({k/self.nsamp:.1%})")
 
         # read .bim and annotation
         self._read_bim(bed_path + ".bim")
@@ -246,7 +274,7 @@ class GenomewideLDScore:
         # covariates → orthonormal Q (C) and Q^T (cov_R); drop NA rows
         if covar_path is not None:
             fam_file = bed_path + ".fam"
-            self.C, self.cov_R, self.keep_rows = read_cov(
+            C, R, keep_idx_global = read_cov(
                 cov_filename=covar_path,
                 fam_filename=fam_file,
                 std=True,
@@ -254,24 +282,31 @@ class GenomewideLDScore:
                 one_hot_conversion=False,
                 categorical_threshold=100,
                 logger=self.log,
-                verbose=self.verbose
+                verbose=self.verbose,
+                sample_idx=sel_idx if sel_idx is not None else None,   # <-- NEW
             )
+            # Final selected rows are those covariate-kept (already global indices)
+            self.row_sel = np.asarray(keep_idx_global, dtype=int)
+            self.C = np.asarray(C, dtype=self.dtype, order='F')
+            self.cov_R = np.asarray(R, dtype=self.dtype, order='F')
             self.nsamp = self.C.shape[0]
-            self.log._log(f"Final sample count after covariate filtering: {self.nsamp}")
-            self.C = np.asarray(self.C, dtype=self.dtype, order='F')
-            self.cov_R = np.asarray(self.cov_R, dtype=self.dtype, order='F')
+            self.log._log(f"Final sample count after covariate filtering/subsample: {self.nsamp}")
         else:
-            self.keep_rows = None
+            # No covariates: just use the random subsample or all rows
+            self.row_sel = sel_idx if sel_idx is not None else None
             self.C = None
             self.cov_R = None
-            self.log._log("No covariate correction will be applied.")
+            if self.row_sel is not None:
+                self.nsamp = len(self.row_sel)
+                self.log._log(f"No covariates. Using random subsample: {self.nsamp} individuals.")
+            else:
+                self.log._log("No covariates and no subsampling: using all individuals.")
 
         self.p_eff = self.C.shape[1] if self.C is not None else 0
         self.N_eff = self.nsamp - self.p_eff
         if self.N_eff <= 1:
-            raise ValueError(f"N_eff={self.N_eff} is too small after covariate projection.")
-
-        self.root_seed = seed
+            raise ValueError(f"N_eff={self.N_eff} is too small after projection.")
+        
         self.outpath = out_path
 
         # storage used by correlation mode
@@ -289,7 +324,7 @@ class GenomewideLDScore:
             return np.ones(self.nsnps, dtype=np.float64)
 
         self.log._log("Precomputing residual variances Var(M x_m) for all SNPs (1 pass).")
-        row_sel = self.keep_rows if self.keep_rows is not None else slice(None)
+        row_sel = self.row_sel if self.row_sel is not None else slice(None)
         resvar = np.empty(self.nsnps, dtype=np.float64)
         N_denom = float(self.N_eff)
 
@@ -339,7 +374,7 @@ class GenomewideLDScore:
             norms = np.linalg.norm(Zs, axis=0)
             Zs = Zs / norms[None, :] * np.sqrt(nsnps)
 
-        row_sel = self.keep_rows if self.keep_rows is not None else slice(None)
+        row_sel = self.row_sel if self.row_sel is not None else slice(None)
         geno = self.G.read(index=np.s_[row_sel, blk_start:blk_end], dtype=self.dtype)
 
         # raw-space standardization
@@ -379,7 +414,7 @@ class GenomewideLDScore:
         blk_start, blk_end = blk_idx
         gemm = fblas.sgemm if self.dtype is np.float32 else fblas.dgemm
 
-        row_sel = self.keep_rows if self.keep_rows is not None else slice(None)
+        row_sel = self.row_sel if self.row_sel is not None else slice(None)
         geno = self.G.read(index=np.s_[row_sel, blk_start:blk_end], dtype=self.dtype)
 
         # raw-space standardization
