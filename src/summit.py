@@ -43,8 +43,8 @@ parser.add_argument("--nworkers", default=4, type=int, \
                     help='Number of workers for multiprocessing to calculate stochastic genome-wide LD scores. Default is 4.')
 parser.add_argument("--num-threads", default=4, type=int, \
                     help='Cap the number of threads for BLAS to limit CPU usage. Default is 4.')
-parser.add_argument("--nvecs", default=10, type=int, \
-                    help='Number of random vectors to use for estimating stochastic genome-wide LD scores. Default is 10.')
+parser.add_argument("--nvecs", default=1000, type=int, \
+                    help='Number of random vectors to use for estimating stochastic genome-wide LD scores. Default is 1000.')
 parser.add_argument("--step_size", default=1000, type=int, \
                     help='Number of SNPs to process in each step of estimating stochastic genome-wide LD scores. Default is 1000.')
 parser.add_argument("--seed", default=None, type=int, \
@@ -68,6 +68,8 @@ parser.add_argument("--dtype", default='float32', type=str, \
                     help="Specify the dtype to use for calculations (either float32 or float64). Default is float32.")
 parser.add_argument("--rand-samp", default=None, type=float, \
                     help="Select a random subset of the samples for LD score calculation. Pass a value between (0, 1] for a ratio, and an integer greater than 100 for the number of samples.)")
+parser.add_argument("--ddof", default=1, type=int, \
+                    help="Specify the delta degrees of freedom (ddof) for estimating genome-wide LD scores. Default is 1 (empirical SD).")
 
 
 if __name__ == '__main__':
@@ -98,7 +100,7 @@ if __name__ == '__main__':
             sys.exit(1)
         gwld = GenomewideLDScore(bed_path=args.geno, annot_path=args.annot, out_path=args.out, covar_path=args.covar, rand_dist=args.rand_dist,\
             log=log, num_vecs=args.nvecs, num_workers=args.nworkers, step_size=args.step_size, seed=args.seed, verbose=args.verbose, \
-                num_threads=args.num_threads, rand_samp=args.rand_samp)
+                dtype = args.dtype, num_threads=args.num_threads, rand_samp=args.rand_samp)
         gwld._compute_ldscore()
     elif (args.h2 is not None):
         if (args.trace is None) and (args.ldscores is None):
