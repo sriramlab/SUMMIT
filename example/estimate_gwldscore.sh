@@ -4,5 +4,6 @@ python3 ../src/summit.py --geno ./small \
                   --nvecs 100 \
                   --nworkers 8 \
                   --step_size 1000 \
-                  --out small
+                  --out small \
+                  --rand-samp 0.8
 

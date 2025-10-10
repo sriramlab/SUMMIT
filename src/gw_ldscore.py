@@ -225,7 +225,7 @@ class GenomewideLDScore:
                 seed=None,
                 verbose=False,
                 dtype='float32',
-                num_threads: int = 1,
+                num_threads: int = 4,
                 eps_var: float = 1e-8,
                 rand_samp=None, # float in (0,1] or int in [100, N]
                 ddof = 1):
@@ -744,9 +744,7 @@ class GenomewideLDScore:
                         except Exception as e: self.log._log(f"[warn] shm_ms.unlink: {e}")
             _rss_snapshot("post-cleanup", self.log)
 
-
-
-    
+   
     def _print_expected_mem(self, phase, block_len=None, k_max=None):
         """
         Rough upper-bound memory accounting for this run.
