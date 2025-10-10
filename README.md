@@ -127,7 +127,7 @@ This script should run within a few seconds and create a gzip file named ```smal
 ## TODO's
 ✅ genetic correlation
 
-☑️ both-side filtering of outlier SNPs
+✅ both-side filtering of outlier SNPs
 
 ☑️ partitioned genetic correlation
 
