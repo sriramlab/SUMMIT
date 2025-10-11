@@ -225,7 +225,7 @@ class GenomewideLDScore:
                 seed=None,
                 verbose=False,
                 dtype='float32',
-                num_threads: int = 4,
+                num_threads: int = 1,
                 eps_var: float = 1e-8,
                 rand_samp=None, # float in (0,1] or int in [100, N]
                 ddof = 1):
@@ -364,6 +364,7 @@ class GenomewideLDScore:
         Build per-bin X_k z and accumulate into shared _g_Xz2d.
         We DO NOT project by M here; parent will do Xz2d ← M·Xz2d after Phase 1.
         For partial correlations, scale each SNP column by 1/sqrt(Var(M x_m)+eps) *before* GEMM.
+        For continuous annotations, ALSO scale by sqrt(a_{i,k}) so that we estimate ∑_i a_{i,k} r_{ji}^2.
         """
         j, blk_start, blk_end, idxs = blk_idxs
         L = blk_end - blk_start
@@ -392,15 +393,22 @@ class GenomewideLDScore:
         Zs = np.asarray(Zs, order='F', dtype=self.dtype)
         gemm = fblas.sgemm if self.dtype is np.float32 else fblas.dgemm
 
-        # Right-side normalization to partial correlations
         inv_sqrt = self.inv_sqrt_resvar_all[blk_start:blk_end]  # (L,)
+
         for k, binidx in enumerate(idxs):
             if len(binidx) == 0:
                 continue
-            A = np.asfortranarray(geno[:, binidx], dtype=self.dtype)      # (N × K)
-            # scale columns by 1/sqrt(Var(M x_m))
-            A *= inv_sqrt[binidx][None, :]                                # in-place
-            B = np.asfortranarray(Zs[binidx, :], dtype=self.dtype)        # (K × V)
+
+            # Columns for SNPs with a_{i,k} != 0 in this block
+            A = np.asfortranarray(geno[:, binidx], dtype=self.dtype)  # (N × K)
+
+            # --- continuous weighting: multiply columns by 1/sqrt(Var(M x_i)) * sqrt(a_{i,k}) ---  # <<< MODIFIED
+            w = self.annot[blk_start:blk_end, k][binidx].astype(self.dtype, copy=False)           # <<< MODIFIED
+            sqrtw = np.sqrt(w, dtype=np.float64).astype(self.dtype, copy=False)                   # <<< MODIFIED
+            scale = (inv_sqrt[binidx] * sqrtw).astype(self.dtype, copy=False)                     # <<< MODIFIED
+            A *= scale[None, :]                                                                    # <<< MODIFIED
+
+            B = np.asfortranarray(Zs[binidx, :], dtype=self.dtype)  # (K × V)
             c_view = _g_Xz2d[:, k*self.nvecs:(k+1)*self.nvecs]
             with _g_xz_locks[k]:
                 gemm(1.0, A, B, c=c_view, beta=1.0, overwrite_c=1)
@@ -461,43 +469,37 @@ class GenomewideLDScore:
         Read annotation for gw_ldscore:
         • LDSC-style full .annot(.gz): columns [CHR, BP, SNP, CM, <bins...>]
         • or 'thin' matrix (no base cols), via utils._read_with_optional_header.
-        Requirements:
-        • Binary bins (0/1), overlaps allowed.
-        • Final row order MUST match .bim SNP order and length (no dropping).
+        Supports binary OR continuous annotations. Values must be >= 0.
+        Final row order MUST match .bim SNP order and length (no dropping).
         """
         if annot_path is None:
-            # single-bin fallback
             self.l2cols = None
             self.annot = np.ones((self.nsnps, 1), dtype=np.float64)
             self.nbins = 1
-            self.nsnps_bin = self.annot.sum(axis=0).astype(np.float64)
+            self.nsnps_bin = self.annot.sum(axis=0, dtype=np.float64)  # ∑ weights (here = M)
             self.log._log("Calculating genome-wide (non-partitioned) LD score")
-            # default L2 names
             self.l2cols = [f"L2_{i}" for i in range(self.nbins)]
             self.log._log(f"Number of samples: {self.nsamp}")
             self.log._log(f"Number of total SNPs: {self.nsnps}, annotation shape: {self.annot.shape}")
             return
 
-        # Try LDSC-style first
         parsed_ldsc = False
         try:
-            df = pd.read_csv(annot_path, sep=r'\s+', compression='infer', dtype={'CHR':str, 'BP':np.int64, 'SNP':str, 'CM':float})
+            df = pd.read_csv(annot_path, sep=r'\s+', compression='infer',
+                            dtype={'CHR':str, 'BP':np.int64, 'SNP':str, 'CM':float})
             base_cols = ['CHR', 'BP', 'SNP', 'CM']
             if all(c in df.columns[:4].tolist() for c in base_cols) and 'SNP' in df.columns:
                 annot_cols = [c for c in df.columns if c not in base_cols]
                 if len(annot_cols) == 0:
                     raise ValueError("No annotation columns found after [CHR,BP,SNP,CM].")
-                # Align to .bim order if needed
+
                 bim_snps = self.snplist.iloc[:, 1].astype(str).tolist()
                 ann_snps = df['SNP'].astype(str).tolist()
 
                 if ann_snps == bim_snps:
-                    # already aligned
                     ann_mat = df[annot_cols].to_numpy(dtype=np.float64, copy=False)
                 else:
-                    # allow extras in annot; forbid missing BIM SNPs
-                    ann_set = set(ann_snps)
-                    bim_set = set(bim_snps)
+                    ann_set = set(ann_snps); bim_set = set(bim_snps)
                     missing_in_annot = len(bim_set - ann_set)
                     extra_in_annot   = len(ann_set - bim_set)
                     if missing_in_annot > 0:
@@ -508,43 +510,54 @@ class GenomewideLDScore:
                     if extra_in_annot > 0:
                         self.log._log(f"[info] Annotation contains {extra_in_annot} extra SNP(s) not in BIM; "
                                     f"keeping BIM SNPs only and reordering to BIM.")
-                    # Reindex to BIM order; extras are dropped implicitly
                     ann_mat = df.set_index('SNP').loc[bim_snps, annot_cols].to_numpy(dtype=np.float64, copy=False)
 
-                # binary check (warn if not strictly 0/1)
+                # --- sanitize & flag continuous ---
+                np.nan_to_num(ann_mat, copy=False)  # replace NaN/±inf with finite values (0 by default)
+                if (ann_mat < 0).any():
+                    self.log._log("[warn] Negative annotation values found; clipping to 0.")
+                    ann_mat[ann_mat < 0] = 0.0
                 uniq = np.unique(ann_mat)
-                if not np.all(np.isin(uniq, [0.0, 1.0])):
-                    self.log._log(f"[warn] Annotation appears non-binary (values found: {uniq[:8]}{'...' if uniq.size>8 else ''}). "
-                                "Proceeding, but gw_ldscore assumes binary bins.")
+                is_binary = np.all(np.isin(uniq, [0.0, 1.0]))
+                self.is_continuous = (not is_binary)
+                if self.is_continuous:
+                    self.log._log("[info] Detected continuous annotations (non 0/1 values).")
+                else:
+                    self.log._log("[info] Detected binary annotations (0/1).")
 
                 self.annot = ann_mat
                 self.nbins = self.annot.shape[1]
                 self.l2cols = annot_cols
                 parsed_ldsc = True
                 self.log._log(f"Read LDSC-style annotation with shape {self.annot.shape}")
-        except Exception as e:
-            # fall through to thin parser
+        except Exception:
             parsed_ldsc = False
 
         if not parsed_ldsc:
-            # Thin annotation: matrix only (N×B), optionally with header
             self.l2cols, arr = utils._read_with_optional_header(annot_path)
             if arr.ndim == 1:
                 arr = arr.reshape(-1, 1)
-            self.annot = arr.astype(np.float64, copy=False)
+            arr = arr.astype(np.float64, copy=False)
+            np.nan_to_num(arr, copy=False)
+            if (arr < 0).any():
+                self.log._log("[warn] Negative annotation values found; clipping to 0.")
+                arr[arr < 0] = 0.0
+            uniq = np.unique(arr)
+            is_binary = np.all(np.isin(uniq, [0.0, 1.0]))
+            self.is_continuous = (not is_binary)
+            self.annot = arr
             if self.l2cols is None:
                 self.l2cols = [f"L2_{i}" for i in range(self.annot.shape[1])]
             self.nbins = self.annot.shape[1]
             self.log._log(f"Read thin annotation matrix with shape {self.annot.shape}")
 
-        # Final validations
         if self.annot.shape[0] != self.nsnps:
             self.log._log(f"!!! number of SNPs in annotation ({self.annot.shape[0]}) "
                         f"does not match the input genotype file ({self.nsnps}) !!!")
             sys.exit(1)
 
-        # Per-bin sizes (binary overlap OK)
-        self.nsnps_bin = self.annot.sum(axis=0, dtype=np.float64)
+        # For continuous: this is ∑_j a_{j,k}; for binary: #SNPs in bin.
+        self.nsnps_bin = self.annot.sum(axis=0, dtype=np.float64)  # <<< MODIFIED
 
         self.log._log(f"Number of samples: {self.nsamp}")
         self.log._log(f"Number of total SNPs: {self.nsnps}, annotation shape: {self.annot.shape}")
@@ -684,20 +697,21 @@ class GenomewideLDScore:
 
             # ---- Post-run stats ----
             try:
+                # Per-bin summaries
                 desc = scores_df.describe(percentiles=[0.25, 0.5, 0.75]).loc[['count','mean','std','min','25%','50%','75%','max']]
                 self.log._log("Per-bin LD score summary (count/mean/std/min/25%/50%/75%/max):")
-                with pd.option_context('display.width', 140, 'display.max_columns', None, 'display.float_format', '{:.6g}'.format):
-                    self.log._log("\n" + desc.to_string())
+                with pd.option_context('display.width', 140, 'display.max_columns', None, 'display.float_format', '{:.6f}'.format):
+                    self.log._log(desc.to_string() + "\n")
 
                 corr = scores_df.corr(method='pearson')
-                self.log._log("Correlation matrix across bins (Pearson, over SNP-wise LD scores):")
+                self.log._log("Correlation matrix across bins (Pearson):")
                 with pd.option_context('display.width', 140, 'display.max_columns', None, 'display.float_format', '{:.4f}'.format):
                     self.log._log("\n" + corr.to_string())
-                col_sums = pd.Series(self.nsnps_bin.astype(np.int64), index=self.l2cols)
-                lines = ["Annotation Matrix Column Sums"] + [f"{k:<35} {v:d}" for k, v in col_sums.items()]
+
+                col_sums = pd.Series(self.nsnps_bin, index=self.l2cols)
+                lines = ["Annotation Column Sums"] + [f"{k:<35} {v:.6f}" for k, v in col_sums.items()]
                 self.log._log("\n" + "\n".join(lines))
 
-                # Row-sum summary
                 row_sums = self.annot.sum(axis=1, dtype=np.float64)
                 desc = pd.Series(row_sums).describe(percentiles=[0.25, 0.5, 0.75])
                 self.log._log("\nSummary of Annotation Matrix Row Sums")
@@ -705,6 +719,7 @@ class GenomewideLDScore:
                     ordered = ['count','mean','std','min','25%','50%','75%','max']
                     lines = [f"{k:<6} {desc[k]:.4f}" for k in ordered]
                     self.log._log("\n".join(lines))
+
             except Exception as e:
                 self.log._log(f"[warn] Failed to compute summary stats / correlation: {e}")
             
@@ -744,7 +759,9 @@ class GenomewideLDScore:
                         except Exception as e: self.log._log(f"[warn] shm_ms.unlink: {e}")
             _rss_snapshot("post-cleanup", self.log)
 
-   
+
+
+    
     def _print_expected_mem(self, phase, block_len=None, k_max=None):
         """
         Rough upper-bound memory accounting for this run.

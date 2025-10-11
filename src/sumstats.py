@@ -123,7 +123,7 @@ class Sumstats:
         
     def _calc_rhs_h2(self):
         ''' calculate the RHS of the normal equation in h2 calculation '''
-        self.rhs = np.full((self.nblks+1, self.nbins+1), self.nsamp)
+        self.rhs = np.full((self.nblks+1, self.nbins+1), self.nsamp - 1)
         for i in range(self.nbins):
             total_zTz = np.dot(self.zscores_bin[i], self.zscores_bin[i])
             for j in range(self.nblks+1):

@@ -329,6 +329,7 @@ class Trace:
         # Assemble (K+1)x(K+1): fill noise row/col with N
         out = np.full((B + 1, K + 1, K + 1), float(N), dtype=np.float64)
         out[:, :K, :K] = trace_KK
+        out[:, K, K] = float(N-1)
         return out
 
     # ------------------------- (optional) rg path ------------------------- #

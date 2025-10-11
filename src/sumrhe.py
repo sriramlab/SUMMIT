@@ -8,7 +8,7 @@ import sys
 
 class Sumrhe:
     def __init__(self, bim_path=None, sum_path=None, save_path=None, h2_path=None, out=None, chisq_threshold=0, \
-            log=None, mem=False, verbose=False, ldscores=None, njack=None, annot=None):
+            log=None, mem=False, verbose=False, ldscores=None, njack=None, annot=None, report_tau: bool = True):
         self.mem = mem
         self.log = log
         self.start_time = utils._get_time()
@@ -40,6 +40,13 @@ class Sumrhe:
 
         self.out = out
         self.verbose = verbose
+        self.report_tau = bool(report_tau) 
+        
+        if self.report_tau:
+            self.tau         = np.zeros((self.npheno, self.nblks+1, self.nbins), dtype=np.float64)
+            self.tau_star    = np.zeros((self.npheno, self.nblks+1, self.nbins), dtype=np.float64)
+            self.tau_sums    = np.zeros((self.npheno, self.nbins, 2), dtype=np.float64)  # [point, SE]
+            self.tau_star_sums = np.zeros((self.npheno, self.nbins, 2), dtype=np.float64)
 
     def _calc_sigmas(self, idx):
         rhs = self.sums.rhs                              # (nblks+1, p)
@@ -168,6 +175,73 @@ class Sumrhe:
             enr[invalid] = np.nan
 
         self.enrich[idx] = enr
+        
+    def _calc_tau(self, idx):
+        """
+        Compute LDSC τ_k and τ*_k across all jackknife replicates (B LOO + full).
+        τ_k(b)      = σ^2_{g,k}(b) / sum_j a_{j,k}(b)
+        τ*_k(b)     = τ_k(b) * [ sd(a_k)(b) / ( h2_tot(b) / M(b) ) ]
+        Uses LOO sums and sumsq to get per-replicate sd(a_k).
+        """
+        A = np.asarray(self.tr.annot, dtype=np.float64)   # (M, K) after filtering for this phenotype
+        M_full, K = A.shape
+        B = self.nblks
+
+        # Per-column sums and sums of squares (full)
+        Ak_full   = A.sum(axis=0)                         # ∑ a_{j,k}
+        Ak2_full  = (A*A).sum(axis=0)                     # ∑ a_{j,k}^2
+
+        # Per-block (in-block) sums, sums of squares, and block sizes
+        bs = self.tr.blk_size
+        starts = bs * np.arange(B)
+        ends   = starts + bs
+        ends[-1] = self.tr.nsnps
+
+        Ak_blk  = np.empty((B, K), dtype=np.float64)
+        Ak2_blk = np.empty((B, K), dtype=np.float64)
+        m_blk   = np.empty(B,      dtype=np.int64)
+        for b in range(B):
+            ab = A[starts[b]:ends[b], :]
+            Ak_blk[b]  = ab.sum(axis=0)
+            Ak2_blk[b] = (ab*ab).sum(axis=0)
+            m_blk[b]   = ab.shape[0]
+
+        # Build per-replicate totals (B LOO + full)
+        M_rep   = np.empty(B+1, dtype=np.float64)
+        M_rep[:B] = M_full - m_blk
+        M_rep[B]  = M_full
+
+        Ak_rep   = np.empty((B+1, K), dtype=np.float64)   # ∑ a over replicate
+        Ak2_rep  = np.empty((B+1, K), dtype=np.float64)   # ∑ a^2 over replicate
+        Ak_rep[:B, :]  = Ak_full[None, :] - Ak_blk
+        Ak2_rep[:B, :] = Ak2_full[None, :] - Ak2_blk
+        Ak_rep[B,  :]  = Ak_full
+        Ak2_rep[B, :]  = Ak2_full
+
+        # σ_g^2 per replicate/category and total h^2 per replicate
+        sigma_g_rep = self.sigmas[idx, :, :K]            # (B+1, K)
+        h2_tot_rep  = self.herits[idx, :, -1]            # (B+1,)
+
+        # τ: safe divide (0 where Ak==0 or not finite)
+        with np.errstate(divide='ignore', invalid='ignore'):
+            tau = sigma_g_rep / Ak_rep
+            tau[~np.isfinite(tau)] = 0.0
+
+        # sd(a_k) per replicate from sums and sums of squares (population-style sd)
+        # var = E[a^2] - (E[a])^2, with E[…] over replicate SNPs
+        with np.errstate(divide='ignore', invalid='ignore'):
+            meanA   = Ak_rep / M_rep[:, None]
+            meanA2  = Ak2_rep / M_rep[:, None]
+            varA    = np.maximum(meanA2 - meanA*meanA, 0.0)
+            sdA     = np.sqrt(varA, dtype=np.float64)
+
+            denom   = h2_tot_rep / M_rep                   # (B+1,)
+            tau_star = tau * (sdA / denom[:, None])
+            tau_star[~np.isfinite(tau_star)] = 0.0
+
+        self.tau[idx]      = tau
+        self.tau_star[idx] = tau_star
+
 
 
     def _run_jackknife(self, idx):
@@ -180,11 +254,19 @@ class Sumrhe:
     
         self.enrich_sums[idx, :, 0] = self.enrich[idx, self.nblks]
         self.enrich_sums[idx, :, 1] = utils._calc_jackknife_se(self.enrich[idx])[1]
+        
+        if self.report_tau:
+            self.tau_sums[idx, :, 0]      = self.tau[idx, self.nblks]
+            self.tau_sums[idx, :, 1]      = utils._calc_jackknife_se(self.tau[idx])[1]
+            self.tau_star_sums[idx, :, 0] = self.tau_star[idx, self.nblks]
+            self.tau_star_sums[idx, :, 1] = utils._calc_jackknife_se(self.tau_star[idx])[1]
 
         if (self.verbose):
             self.log._log("Sigma solution & jackknife SE:\n"+np.array2string(self.sigsums, precision=5, separator=', '))
             self.log._log("Heritability (category) & jackknife SE:\n"+np.array2string(self.hersums, precision=5, separator=', '))
             self.log._log("Enrichment & jackknife SE:\n"+np.array2string(self.enrich_sums, precision=5, separator=', '))
+            if self.report_tau:
+                self.log._log("Tau & Tau* (point, SE):\n" + np.array2string(np.stack([self.tau_sums[idx,:,0], self.tau_sums[idx,:,1]], axis=1), precision=5, separator=', '))
 
     def _run(self):
         for i in range(self.npheno):
@@ -195,6 +277,8 @@ class Sumrhe:
 
             self._calc_sigmas(i)
             self._calc_h2(i)
+            if self.report_tau:
+                self._calc_tau(i) 
             self._calc_enrich(i)
             self._run_jackknife(i)
     
@@ -208,13 +292,20 @@ class Sumrhe:
                     h2se  = self.hersums[i, j, 1]
                     enr   = self.enrich_sums[i, j, 0]
                     ense  = self.enrich_sums[i, j, 1]
-                    self.log._log(
-                        f"^^^ Phenotype {i} Bin [{self.annot_header[j]}] "
-                        f"sigma_g^2: {sig:.5f} (SE: {sigse:.5f}) "
-                        f"h^2_cat: {h2:.5f} (SE: {h2se:.5f}) "
-                        f"Enrichment: {enr:.5f} (SE: {ense:.5f})"
-                    )
-            # total SNP h2 (sum sigma_g^2)
+
+                    line = (f"^^^ Phenotype {i} Bin [{self.annot_header[j]}] "
+                            f"sigma_g^2: {sig:.5f} (SE: {sigse:.5f}) "
+                            f"h^2_cat: {h2:.5f} (SE: {h2se:.5f}) "
+                            f"Enrichment: {enr:.5f} (SE: {ense:.5f})")
+                    if self.report_tau:
+                        t    = self.tau_sums[i, j, 0]
+                        tse  = self.tau_sums[i, j, 1]
+                        ts   = self.tau_star_sums[i, j, 0]
+                        tsse = self.tau_star_sums[i, j, 1]
+                        line += f" tau: {t:.6g} (SE: {tse:.6g}) tau_*: {ts:.6g} (SE: {tsse:.6g})"
+                    self.log._log(line)
+
+            # total SNP h2
             h2tot   = self.hersums[i, -1, 0]
             h2totse = self.hersums[i, -1, 1]
             self.log._log("^^^ Phenotype "+str(i)+" Total SNP heritability (h^2): "

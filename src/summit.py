@@ -20,9 +20,6 @@ parser.add_argument("--max-chisq", action='store', default=None, type=float, \
                     help='Filter out SNPs with chi-sq statistic above the threshold.'
                     ' This can be done either only on the yKy or on both sides (use --filter-both-sides);'
                     ' with many non-polygenic SNPs, one-sided filtering might not be accurate')
-# parser.add_argument("--filter-both-sides", action='store_true', default=False, \
-#                     help='When filtering SNPs, remove their effects on both trace and yKy.'
-#                     ' This requires the (truncated) LD scores of all the SNPs used in trace calculation')
 parser.add_argument("--ldscores", default=None, type=str, \
                     help='File path for LD scores of the reference SNPs. You may use either the traditional (truncated) LD scores (.l2.ldscore.gz) or genome-wide stochastic LD scores (.gw.ldscore.gz)')
 parser.add_argument("--out", default=None, type=str, \
