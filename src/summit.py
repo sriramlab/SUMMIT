@@ -8,6 +8,10 @@ import argparse
 import sys
 import numpy as np
 
+from pathlib import Path
+import tempfile
+import os
+
 parser = argparse.ArgumentParser(description='SUMMIT: integrated tool for heritability & genetic correlation')
 parser.add_argument("--trace", default=None, type=str, \
                     help='File path for trace summary statistics (.tr) and corresponding metadata (.MN).'
@@ -69,6 +73,50 @@ parser.add_argument("--ddof", default=1, type=int, \
                     help="Specify the delta degrees of freedom (ddof) for estimating genome-wide LD scores. Default is 1 (empirical SD).")
 
 
+def _check_outdir(path_str: str, create: bool = True, log=None):
+    """
+    Check whether the outdir exists & is writable
+    Creates the directory (parents=True) if `create` is True.
+
+    Raises SystemExit(1) on failure after logging a clear message.
+    """
+    if not path_str:
+        return  # nothing to do
+
+    p = Path(path_str)
+
+    # Treat --out / --save-trace as FILE paths; guard against someone passing a dir
+    if path_str.endswith(os.sep):
+        # If the user accidentally gave a trailing slash, treat it as a directory target
+        parent = p
+    else:
+        parent = p.parent if p.parent != Path('') else Path('.')  # current dir if no parent part
+
+    try:
+        if create:
+            parent.mkdir(parents=True, exist_ok=True)
+
+        # Basic permission check
+        if not os.access(parent, os.W_OK):
+            raise PermissionError(f"Directory '{parent}' is not writable by the current user.")
+
+        # Stronger check: try creating a temp file
+        with tempfile.NamedTemporaryFile(dir=str(parent), prefix='.summit_perm_check_', delete=True):
+            pass
+
+        if log:
+            log._log(f"[io] Using output directory: {parent}")
+
+    except Exception as e:
+        if log:
+            log._log(f"!!! Cannot write to output directory '{parent}': {e} !!!")
+        else:
+            print(f"!!! Cannot write to output directory '{parent}': {e} !!!", file=sys.stderr)
+        sys.exit(1)
+
+
+
+
 if __name__ == '__main__':
     args = parser.parse_args()
     log = Logger(suppress = args.suppress)
@@ -91,10 +139,13 @@ if __name__ == '__main__':
             log._log(arg[i] if i==0 else '\t\t'+arg[i])
         i += 1
 
+    if (args.out is None):
+        log._log("!!! An output path to save the results must be provided !!!")
+        sys.exit(1)
+    else:
+        _check_outdir(args.out, create=True, log=log)
+
     if (args.geno is not None):
-        if (args.out is None):
-            log._log("!!! An output path to save the genome-wide LD scores must be provided !!!")
-            sys.exit(1)
         gwld = GenomewideLDScore(bed_path=args.geno, annot_path=args.annot, out_path=args.out, covar_path=args.covar, rand_dist=args.rand_dist,\
             log=log, num_vecs=args.nvecs, num_workers=args.nworkers, step_size=args.step_size, seed=args.seed, verbose=args.verbose, \
                 dtype = args.dtype, num_threads=args.num_threads, rand_samp=args.rand_samp)
