@@ -44,7 +44,7 @@ parser.add_argument("--num-threads", default=4, type=int, \
                     help='Cap the number of threads for BLAS to limit CPU usage. Default is 4.')
 parser.add_argument("--nvecs", default=10000, type=int, \
                     help='Number of random vectors to use for estimating stochastic genome-wide LD scores. Default is 10000.')
-parser.add_argument("--step_size", default=1000, type=int, \
+parser.add_argument("--step-size", default=1000, type=int, \
                     help='Number of SNPs to process in each step of estimating stochastic genome-wide LD scores. Default is 1000.')
 parser.add_argument("--seed", default=None, type=int, \
                     help='Seed for estimating stochastic genome-wide LD scores. If not specified, the default numpy (pseudo) random number generator will be used.')

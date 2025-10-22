@@ -3,7 +3,7 @@ python3 ../src/summit.py --geno ./small \
                   --covar ./small.cov \
                   --nvecs 100 \
                   --nworkers 8 \
-                  --step_size 1000 \
+                  --step-size 1000 \
                   --out small \
                   --rand-samp 0.8
 
