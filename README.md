@@ -115,7 +115,7 @@ This script should run within a few seconds and create a gzip file named ```smal
 --geno : Path of the genotype file to calculate the genome-wide LD scores. Calculates partitioned scores if --annot is also specified.
 --nworkers : Number of workers for multiprocessing to calculate stochastic genome-wide LD scores. Default is 4.
 --num-threads: Cap the number of threads for BLAS to limit CPU usage. Default is 4.
---nvecs : Number of random vectors to use for estimating stochastic genome-wide LD scores. Default is 1000.
+--nvecs : Number of random vectors to use for estimating stochastic genome-wide LD scores. Default is 10000.
 --step_size : Number of SNPs to process in each step of estimating stochastic genome-wide LD scores. Default is 1000.
 --seed : Seed for estimating stochastic genome-wide LD scores. If not specified, the default numpy (pseudo) random number generator will be used.
 --h2 : File path for phenotype-specific summary statistics (.sumstat[.gz]) to estimate heritability. If the path is a directory, all summary statistics (ending with .sumstat[.gz]) will be used.
