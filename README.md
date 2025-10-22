@@ -95,7 +95,7 @@ python3 ../src/summit.py --geno ./small \
                   --out ./small.2bins \
                   --nvecs 100 \
                   --nworkers 8 \
-                  --step_size 1000
+                  --step-size 1000
 ```
 This script should run within a few seconds and create a gzip file named ```small.2bins.gw.ldscore.gz``` and ```small.2bins.gw.log```. The file format of ```small.2bins.gw.ldscore.gz``` is identical to the traditional LDSC LD scores, where the first three columns are metadata ('CHR', 'SNP', 'BP'), and the remaining columns the (partitioned) LD scores.
 
@@ -116,7 +116,7 @@ This script should run within a few seconds and create a gzip file named ```smal
 --nworkers : Number of workers for multiprocessing to calculate stochastic genome-wide LD scores. Default is 4.
 --num-threads: Cap the number of threads for BLAS to limit CPU usage. Default is 4.
 --nvecs : Number of random vectors to use for estimating stochastic genome-wide LD scores. Default is 10000.
---step_size : Number of SNPs to process in each step of estimating stochastic genome-wide LD scores. Default is 1000.
+--step-size : Number of SNPs to process in each step of estimating stochastic genome-wide LD scores. Default is 1000.
 --seed : Seed for estimating stochastic genome-wide LD scores. If not specified, the default numpy (pseudo) random number generator will be used.
 --h2 : File path for phenotype-specific summary statistics (.sumstat[.gz]) to estimate heritability. If the path is a directory, all summary statistics (ending with .sumstat[.gz]) will be used.
 --rg : Comma-separated file path for a pair of phenotype-specific summary statistics (.sumstat[.gz]) to estimate genetic correlation (rg).
