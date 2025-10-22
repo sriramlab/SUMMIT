@@ -104,24 +104,27 @@ This script should run within a few seconds and create a gzip file named ```smal
 ```
 --trace : File path for trace summary statistics (.tr) and corresponding metadata (.MN). If the path is a directory, all trace summaires (ending with .tr) will be used by aggregating them.
 --save-trace : File path for saving (aggregated) trace summaries (.tr) and corresponding metadata (.MN)
+--bim : File path for the reference .bim file used for trace calculation (required for trace summaries)
+--max-chisq : Filter out SNPs with chi-sq statistic above the threshold.
+--ldscores : File path for LD scores of the reference SNPs. You may use either the traditional (truncated) LD scores (.l2.ldscore.gz) or genome-wide stochastic LD scores (.gw.ldscore.gz)
+--out : Output file path to save the analysis log and result (.log) or the genome-wide LD scores (.gw.ldscore.gz)
+--verbose : Verbose mode: print out the normal equations
+--suppress : Suppress mode: do not print out the outputs to stdout (log file only)
+--njack : Number of jackknife blocks (only if using LD scores as input). Default is 100
+--annot : Path of the annotation file (if using partitioned heritability). You may either use the "thin annot" (annotation matrix only) or the LDSC-style annotation files (.annot.gz).
+--geno : Path of the genotype file to calculate the genome-wide LD scores. Calculates partitioned scores if --annot is also specified.
+--nworkers : Number of workers for multiprocessing to calculate stochastic genome-wide LD scores. Default is 4.
+--num-threads: Cap the number of threads for BLAS to limit CPU usage. Default is 4.
+--nvecs : Number of random vectors to use for estimating stochastic genome-wide LD scores. Default is 1000.
+--step_size : Number of SNPs to process in each step of estimating stochastic genome-wide LD scores. Default is 1000.
+--seed : Seed for estimating stochastic genome-wide LD scores. If not specified, the default numpy (pseudo) random number generator will be used.
 --h2 : File path for phenotype-specific summary statistics (.sumstat[.gz]) to estimate heritability. If the path is a directory, all summary statistics (ending with .sumstat[.gz]) will be used.
 --rg : Comma-separated file path for a pair of phenotype-specific summary statistics (.sumstat[.gz]) to estimate genetic correlation (rg).
 --covar : Path of the covariate file to adjust for when calculating the genome-wide LD scores. If not specified, no covariates adjustments are made.
---bim : File path for the reference .bim file used for trace calculation (optional)
---out : Output file path to save the analysis log and result (.log) or the genome-wide LD scores (.gw.ldscore.gz)
---max-chisq : Filter out SNPs with chi-sq statistic above the threshold.
---filter-both-sides : When filtering SNPs, remove their effects on both trace and yKy.
---ldscore : File path for LD scores of the reference SNPs. You may use either the traditional (truncated) LD scores (.l2.ldscore.gz) or genome-wide stochastic LD scores (.gw.ldscore.gz)
---all-snps : Use all the SNPs in the phenotype sumamry statistics. Make sure this is safe to do so.
---verbose : Verbose mode: print out the normal equations
---suppress : Suppress mode: do not print out the outputs to stdout (log file only)
---njack : Number of jackknife blocks (only if using LD scores as input)
---annot : Path of the annotation file (if using partitioned heritability)
---geno : Path of the genotype file to calculate the genome-wide LD scores. Calculates partitioned scores if --annot is also specified.
---nworkers : Number of workers for multiprocessing to calculate stochastic genome-wide LD scores. Default is 4.
---nvecs : Number of random vectors to use for estimating stochastic genome-wide LD scores. Default is 10.
---step_size : Number of SNPs to process in each step of estimating stochastic genome-wide LD scores. Default is 1000.
---seed : Seed for estimating stochastic genome-wide LD scores. If not specified, the default numpy (pseudo) random number generator will be used.
+--rand-dist : Specify which distribution to use to generate random vectors ('normal', 'rademacher', 'spherical'). Default is spherical distribution.
+--dtype : Specify the dtype to use for calculations (either float32 or float64). Default is float32.
+--rand-samp : Select a random subset of the samples for LD score calculation. Pass a value between (0, 1] for a ratio, and an integer greater than 100 for the number of samples.
+--ddof : Specify the delta degrees of freedom (ddof) for estimating genome-wide LD scores. Default is 1 (empirical SD).
 ```
 
 ## TODO's
