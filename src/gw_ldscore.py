@@ -14,6 +14,7 @@ from multiprocessing import shared_memory
 import atexit
 import os
 
+
 def limit_blas_threads(n: int = 4):
     """
     Cap BLAS/OpenMP thread teams so mp.Pool workers don't oversubscribe the CPU.
@@ -317,6 +318,48 @@ class GenomewideLDScore:
         self.resvar_all = None          # (M,) Var(M x_m)
         self.inv_sqrt_resvar_all = None # (M,) 1/sqrt(Var(M x_m)+eps)
 
+    def _auto_vchunk(self, phase: str) -> int:
+        """
+        Pick a V-chunk so each worker stays well under memory pressure.
+        phase: 'Xz' (Phase 1) or 'XtXz' (Phase 2).
+        Heuristic: give each worker ~60% of available RAM divided by nworkers;
+        leave headroom for OS/other arrays. Floor at 256 and cap at V.
+        """
+        b = np.dtype(self.dtype).itemsize
+        N   = int(self.nsamp)
+        L   = int(min(self.step_size, self.nsnps))
+        V   = int(self.nvecs)
+        W   = max(1, int(self.nworkers))
+
+        # Baseline per-worker footprint (dominated by genotype block N×L)
+        geno_blk = N * L * b  # bytes
+
+        # Available memory → per-worker budget
+        try:
+            import psutil
+            avail = int(psutil.virtual_memory().available)
+            # If running inside a cgroup/container, psutil respects the limit.
+        except Exception:
+            # Fallback: assume 8 GB free if psutil is unavailable.
+            avail = 8 * (1024 ** 3)
+
+        # generous but safe-ish per-worker budget
+        budget_per_worker = max(512 * (1024 ** 2), int(0.60 * avail / W))
+
+        # How many bytes we can spend on the V-chunk buffer for this phase
+        # Both phases allocate an (L × v_chunk) temp (Z-chunk in Phase 1, 'work' in Phase 2)
+        extra = budget_per_worker - geno_blk
+        if extra <= 0:
+            # If geno block alone exceeds budget, pick the smallest usable chunk.
+            return max(128, min(V, 512))
+
+        bytes_per_v = L * b  # one column across L rows
+        v_chunk = int(extra // bytes_per_v)
+        # Clamp
+        v_chunk = max(256, min(V, v_chunk))
+        # Nicer GEMM widths: round up to a multiple of 64 (keeps BLAS happy)
+        v_chunk = min(V, ((v_chunk + 63) // 64) * 64)
+        return v_chunk
 
     def _precompute_residual_variances(self):
         """
@@ -361,105 +404,167 @@ class GenomewideLDScore:
     # ------------------ Phase 1 worker: build X_k z (raw-space) ------------------
     def _compute_Xz_blk(self, blk_idxs):
         """
-        Build per-bin X_k z and accumulate into shared _g_Xz2d.
-        We DO NOT project by M here; parent will do Xz2d ← M·Xz2d after Phase 1.
-        For partial correlations, scale each SNP column by 1/sqrt(Var(M x_m)+eps) *before* GEMM.
-        For continuous annotations, ALSO scale by sqrt(a_{i,k}) so that we estimate ∑_i a_{i,k} r_{ji}^2.
+        Phase 1 (chunked V): build X_k z and accumulate into shared _g_Xz2d.
+        We draw Z in chunks of v columns (L × v), reuse that chunk across all bins,
+        and do A(N×K) @ B(K×v) → add into the appropriate (N × v) slice of Xz2d.
+
+        Right-normalization to partial correlations:
+        A columns are scaled by inv_sqrt_resvar_all * sqrt(a_{i,k}) if annotations are continuous.
         """
+        import numpy as _np
+        from scipy.linalg import blas as _blas
+
         j, blk_start, blk_end, idxs = blk_idxs
         L = blk_end - blk_start
+        if L <= 0:
+            return 1
 
-        rng = np.random.default_rng([j, self.root_seed] if self.root_seed is not None else None)
-        if self.rand_dist == "normal":
-            Zs = rng.standard_normal(size=(L, self.nvecs))
-        elif self.rand_dist == "rademacher":
-            Zs = rng.integers(0, 2, size=(L, self.nvecs)) * 2 - 1
-        elif self.rand_dist == "spherical":
-            Zs = rng.standard_normal(size=(L, self.nvecs))
-            norms = np.linalg.norm(Zs, axis=0)
-            Zs = Zs / norms[None, :] * np.sqrt(L)
+        # Heuristic V chunk (compute once in parent if you prefer)
+        vchunk = getattr(self, "v_chunk_xz", None)
+        if not vchunk:
+            vchunk = self._auto_vchunk('Xz')
 
+        # PRNG
+        rng = _np.random.default_rng([j, self.root_seed] if self.root_seed is not None else None)
+
+        # Read genotype block and standardize (raw-space)
         row_sel = self.row_sel if self.row_sel is not None else slice(None)
-        geno = self.G.read(index=np.s_[row_sel, blk_start:blk_end], dtype=self.dtype)
-
-        # raw-space standardization
-        means = np.nanmean(geno, axis=0, dtype=self.dtype)
-        stds  = np.nanstd(geno, axis=0, dtype=self.dtype, ddof=self.ddof)
+        geno = self.G.read(index=_np.s_[row_sel, blk_start:blk_end], dtype=self.dtype)
+        means = _np.nanmean(geno, axis=0, dtype=self.dtype)
+        stds  = _np.nanstd(geno, axis=0, dtype=self.dtype, ddof=self.ddof)
         stds[stds == 0] = 1.0
         geno  = (geno - means) / stds
-        np.nan_to_num(geno, copy=False)
-        geno = np.asarray(geno, dtype=self.dtype, order='F')
+        _np.nan_to_num(geno, copy=False)
+        geno = _np.asarray(geno, dtype=self.dtype, order='F')  # (N × L)
 
-        Zs = np.asarray(Zs, order='F', dtype=self.dtype)
-        gemm = fblas.sgemm if self.dtype is np.float32 else fblas.dgemm
-
+        # Per-SNP right scaling
         inv_sqrt = self.inv_sqrt_resvar_all[blk_start:blk_end]  # (L,)
 
+        # GEMM selector
+        gemm = _blas.sgemm if self.dtype is _np.float32 else _blas.dgemm
+
+        # Pre-extract all A_k (N×K) once per bin to reuse across v-chunks
+        # and apply right scaling (and sqrt(annot) if continuous)
+        A_list = [None] * self.nbins
         for k, binidx in enumerate(idxs):
             if len(binidx) == 0:
                 continue
+            # N × K view
+            A = _np.asfortranarray(geno[:, binidx], dtype=self.dtype)
 
-            # Columns for SNPs with a_{i,k} != 0 in this block
-            A = np.asfortranarray(geno[:, binidx], dtype=self.dtype)  # (N × K)
+            # scale columns by 1/sqrt(Var(M x_i)) and (if continuous) sqrt(a_{i,k})
+            scale = inv_sqrt[binidx].astype(self.dtype, copy=False)
+            if getattr(self, "is_continuous", False):
+                w = self.annot[blk_start:blk_end, k][binidx].astype(self.dtype, copy=False)
+                # use float64 for the sqrt, then cast back (more stable)
+                scale = (scale * _np.sqrt(w, dtype=_np.float64).astype(self.dtype, copy=False))
+            A *= scale[None, :]
+            A_list[k] = A  # cache
 
-            # --- continuous weighting: multiply columns by 1/sqrt(Var(M x_i)) * sqrt(a_{i,k}) ---  # <<< MODIFIED
-            w = self.annot[blk_start:blk_end, k][binidx].astype(self.dtype, copy=False)           # <<< MODIFIED
-            sqrtw = np.sqrt(w, dtype=np.float64).astype(self.dtype, copy=False)                   # <<< MODIFIED
-            scale = (inv_sqrt[binidx] * sqrtw).astype(self.dtype, copy=False)                     # <<< MODIFIED
-            A *= scale[None, :]                                                                    # <<< MODIFIED
+        # Process V in chunks
+        for c0 in range(0, self.nvecs, vchunk):
+            c1 = min(self.nvecs, c0 + vchunk)
+            v  = c1 - c0
 
-            B = np.asfortranarray(Zs[binidx, :], dtype=self.dtype)  # (K × V)
-            c_view = _g_Xz2d[:, k*self.nvecs:(k+1)*self.nvecs]
-            with _g_xz_locks[k]:
-                gemm(1.0, A, B, c=c_view, beta=1.0, overwrite_c=1)
+            # Draw Z-chunk of shape (L × v)
+            if self.rand_dist == "normal":
+                Z_chunk = rng.standard_normal(size=(L, v)).astype(self.dtype, copy=False, order='F')
+            elif self.rand_dist == "rademacher":
+                Z_chunk = (rng.integers(0, 2, size=(L, v)) * 2 - 1).astype(self.dtype, copy=False, order='F')
+            elif self.rand_dist == "spherical":
+                Z_chunk = rng.standard_normal(size=(L, v)).astype(self.dtype, copy=False)
+                norms = _np.linalg.norm(Z_chunk, axis=0)
+                Z_chunk = (Z_chunk / norms[None, :]) * _np.sqrt(L, dtype=_np.float64)
+                Z_chunk = _np.asfortranarray(Z_chunk.astype(self.dtype, copy=False))
+            else:
+                # default to normal
+                Z_chunk = rng.standard_normal(size=(L, v)).astype(self.dtype, copy=False, order='F')
+
+            # For each bin: A(N×K) @ B(K×v), accumulate into Xz2d[:, k*V + c0 : k*V + c1]
+            for k, binidx in enumerate(idxs):
+                if len(binidx) == 0:
+                    continue
+                A = A_list[k]                         # (N × K)
+                B = _np.asfortranarray(Z_chunk[binidx, :], dtype=self.dtype)  # (K × v)
+                c_view = _g_Xz2d[:, k*self.nvecs + c0 : k*self.nvecs + c1]    # (N × v)
+                with _g_xz_locks[k]:
+                    gemm(1.0, A, B, c=c_view, beta=1.0, overwrite_c=1)
+
         return 1
-
 
 
     # ------------------ Phase 2 worker: multiply (MG)^T (MB) ------------------
     def _compute_XtXz_blk(self, blk_idx):
         """
-        For genotype block G (columns blk_start:blk_end), form Y = M·G (if covariates) or G.
-        Row-scale by 1/sqrt(Var(M g_j)+eps) so left columns also have unit variance after projection.
-        Then for each bin k: work = Y^T @ (MB_k), scale by 1/N_eff, square and average across V.
+        Phase 2 (chunked V): Y = M·G (or G); left-normalize to partial correlations,
+        then for each bin accumulate sum_j ( (Y^T @ MB_k)_j^2 ) across V **in chunks**.
+        Writes mean-of-squares into shared _g_meansq[blk_start:blk_end, k].
         """
+        import numpy as _np
+        from scipy.linalg import blas as _blas
+
         blk_start, blk_end = blk_idx
-        gemm = fblas.sgemm if self.dtype is np.float32 else fblas.dgemm
+        L = blk_end - blk_start
+        if L <= 0:
+            return 1
+
+        vchunk = getattr(self, "v_chunk_xtxz", None)
+        if not vchunk:
+            vchunk = self._auto_vchunk('XtXz')
 
         row_sel = self.row_sel if self.row_sel is not None else slice(None)
-        geno = self.G.read(index=np.s_[row_sel, blk_start:blk_end], dtype=self.dtype)
+        gemm = _blas.sgemm if self.dtype is _np.float32 else _blas.dgemm
 
-        # raw-space standardization
-        means = np.nanmean(geno, axis=0, dtype=self.dtype)
-        stds  = np.nanstd(geno, axis=0, dtype=self.dtype, ddof=self.ddof)
+        # Read & standardize (raw-space)
+        geno = self.G.read(index=_np.s_[row_sel, blk_start:blk_end], dtype=self.dtype)
+        means = _np.nanmean(geno, axis=0, dtype=self.dtype)
+        stds  = _np.nanstd(geno, axis=0, dtype=self.dtype, ddof=self.ddof)
         stds[stds == 0] = 1.0
         geno  = (geno - means) / stds
-        np.nan_to_num(geno, copy=False)
-        geno  = np.asarray(geno, dtype=self.dtype, order='F')
+        _np.nan_to_num(geno, copy=False)
+        geno  = _np.asarray(geno, dtype=self.dtype, order='F')  # (N × L)
 
+        # Project: Y = (I - C R) G  (C = Q, R = Q^T)
         if self.C is not None:
-            tmpG = self.cov_R @ geno   # (p × L)
-            PG   = self.C @ tmpG       # (N × L)
-            Y    = geno - PG
-            N_denom = self.N_eff
+            tmpG = self.cov_R @ geno       # (p × L)
+            Y    = geno - (self.C @ tmpG)  # (N × L)
+            N_denom = float(self.N_eff)
         else:
             Y = geno
-            N_denom = self.nsamp
+            N_denom = float(self.nsamp)
 
-        # left-side normalization to partial correlations
-        resvar_block = (np.sum(Y * Y, axis=0, dtype=self.dtype) / float(N_denom - 1))  # (L,)
-        inv_sqrt_left = 1.0 / np.sqrt(np.maximum(resvar_block, self.eps_var))
-        inv_sqrt_left = inv_sqrt_left.astype(self.dtype, copy=False)
+        # Left normalization to partial correlations
+        resvar_block = _np.sum(Y * Y, axis=0, dtype=self.dtype) / float(N_denom - 1)  # (L,)
+        inv_sqrt_left = (1.0 / _np.sqrt(_np.maximum(resvar_block, self.eps_var))).astype(self.dtype, copy=False)
 
-        block_len = blk_end - blk_start
-        work = np.empty((block_len, self.nvecs), dtype=self.dtype, order='F')
+        # Allocate an accumulator for this block & per-bin mean-of-squares across V
+        # We'll accumulate sum over V of squared entries, then divide by V once.
+        # Layout note: acc is (L,), we'll reuse for each bin.
+        work = _np.empty((L, vchunk), dtype=self.dtype, order='F')  # reused
+        scale_cols = np.array(1.0 / float(N_denom - 1), dtype=self.dtype).item()
 
         for k in range(self.nbins):
-            MB_k = _g_Xz2d[:, k*self.nvecs:(k+1)*self.nvecs]  # (N × V); already right-normalized and projected
-            gemm(1.0, Y, MB_k, c=work, beta=0.0, trans_a=True, overwrite_c=1)  # Y^T @ MB_k
-            work *= inv_sqrt_left[:, None]                     # row-scale (left normalization)
-            work *= (1.0 / float(N_denom-1))                     # divide by N_eff
-            _g_meansq[blk_start:blk_end, k] = np.mean(work * work, axis=1)
+            acc = _np.zeros(L, dtype=self.dtype, order='F')  # sum of squares across V
+
+            # Process V in chunks so work stays (L × vchunk)
+            for c0 in range(0, self.nvecs, vchunk):
+                c1 = min(self.nvecs, c0 + vchunk)
+                v  = c1 - c0
+
+                MB_k = _g_Xz2d[:, k*self.nvecs + c0 : k*self.nvecs + c1]  # (N × v), already right-normalized & projected
+
+                # work = Y^T @ MB_k  → (L × v)
+                gemm(1.0, Y, MB_k, c=work[:, :v], beta=0.0, trans_a=True, overwrite_c=1)
+                # left normalization + divide by N_eff-1
+                work[:, :v] *= inv_sqrt_left[:, None]
+                work[:, :v] *= scale_cols
+
+                # accumulate squared values along V
+                acc += _np.sum(work[:, :v] * work[:, :v], axis=1, dtype=self.dtype)
+
+            # write mean across V
+            _g_meansq[blk_start:blk_end, k] = (acc / float(self.nvecs)).astype(_g_meansq.dtype, copy=False)
+
         return 1
 
 
@@ -597,6 +702,11 @@ class GenomewideLDScore:
             self.log._log(f"Covariate-adjusted partial correlations (N_eff={self.N_eff}, p={self.p_eff}).")
         else:
             self.log._log("No covariates: standard LD scores (squared correlations).")
+        
+        # Pick chunk sizes (you can also make them CLI flags)
+        self.v_chunk_xz   = self._auto_vchunk('Xz')
+        self.v_chunk_xtxz = self._auto_vchunk('XtXz')
+        self.log._log(f"Using V-chunk sizes: Phase1 (Xz)={self.v_chunk_xz}, Phase2 (XtXz)={self.v_chunk_xtxz}")
 
         # ---- Phase 0: per-SNP residual variances and inverse sqrt (right side) ----
         self.resvar_all = self._precompute_residual_variances()
@@ -758,30 +868,19 @@ class GenomewideLDScore:
                         except FileNotFoundError: pass
                         except Exception as e: self.log._log(f"[warn] shm_ms.unlink: {e}")
             _rss_snapshot("post-cleanup", self.log)
-
-
-
     
     def _print_expected_mem(self, phase, block_len=None, k_max=None):
-        """
-        Rough upper-bound memory accounting for this run.
-        phase: 'Xz' or 'XtXz'
-        """
         b = np.dtype(self.dtype).itemsize
         B, N, M, V, S, W = self.nbins, self.nsamp, self.nsnps, self.nvecs, self.step_size, self.nworkers
         L = min(S, M)
 
-        # Shared (parent) arrays
-        xz_bytes = N * (V * B) * b           # Xz2d shape (N, V*B)
-        ms_bytes = M * B * b                 # meansq (M, B)
+        xz_bytes = N * (V * B) * b
+        ms_bytes = M * B * b
 
-        # Per-worker temps
+        vchunk = (self.v_chunk_xz if phase == 'Xz'
+                else getattr(self, 'v_chunk_xtxz', self.nvecs))
         geno_blk = N * L * b
-        if phase == 'Xz':
-            per_worker = geno_blk
-        else:
-            work = L * V * b
-            per_worker = geno_blk + work
+        per_worker = geno_blk + (L * min(vchunk, V) * b)  # chunked temp
 
         total_est = xz_bytes + ms_bytes + W * per_worker
         self.log._log(
@@ -790,3 +889,4 @@ class GenomewideLDScore:
             f"per-worker temps≈{_bytes_human(per_worker)}, "
             f"total≈{_bytes_human(total_est)}"
         )
+

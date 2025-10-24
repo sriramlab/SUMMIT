@@ -33,18 +33,20 @@ parser.add_argument("--verbose", action="store_true", default=False,\
 parser.add_argument("--suppress", action="store_true", default=False,\
                     help='Suppress mode: do not print out the outputs to stdout (log file only)')
 parser.add_argument("--njack", default=100, type=int, \
-                    help='Number of jackknife blocks (only if using LD scores as input). Default is 100.')
+                    help='Number of jackknife blocks (only if using LD scores as input)')
 parser.add_argument("--annot", default=None, type=str, \
                     help='Path of the annotation file (only if using partitioned heritability)')
+parser.add_argument("--thin-annot", action='store_true', default=False, \
+                    help='Use thin annotation (annotation matrix only) instead of full annotation file')
 parser.add_argument("--geno", default=None, type=str, \
                     help='Path of the genotype file to calculate the genome-wide LD scores. Calculates partitioned scores if --annot is also specified.')
 parser.add_argument("--nworkers", default=4, type=int, \
                     help='Number of workers for multiprocessing to calculate stochastic genome-wide LD scores. Default is 4.')
 parser.add_argument("--num-threads", default=4, type=int, \
                     help='Cap the number of threads for BLAS to limit CPU usage. Default is 4.')
-parser.add_argument("--nvecs", default=10000, type=int, \
-                    help='Number of random vectors to use for estimating stochastic genome-wide LD scores. Default is 10000.')
-parser.add_argument("--step-size", default=1000, type=int, \
+parser.add_argument("--nvecs", default=1000, type=int, \
+                    help='Number of random vectors to use for estimating stochastic genome-wide LD scores. Default is 1000.')
+parser.add_argument("--step_size", default=1000, type=int, \
                     help='Number of SNPs to process in each step of estimating stochastic genome-wide LD scores. Default is 1000.')
 parser.add_argument("--seed", default=None, type=int, \
                     help='Seed for estimating stochastic genome-wide LD scores. If not specified, the default numpy (pseudo) random number generator will be used.')
@@ -66,7 +68,7 @@ parser.add_argument("--rand-dist", default='spherical', type=str, \
 parser.add_argument("--dtype", default='float32', type=str, \
                     help="Specify the dtype to use for calculations (either float32 or float64). Default is float32.")
 parser.add_argument("--rand-samp", default=None, type=float, \
-                    help="Select a random subset of the samples for LD score calculation. Pass a value between (0, 1] for a ratio, and an integer greater than 100 for the number of samples.")
+                    help="Select a random subset of the samples for LD score calculation. Pass a value between (0, 1] for a ratio, and an integer greater than 100 for the number of samples.)")
 parser.add_argument("--ddof", default=1, type=int, \
                     help="Specify the delta degrees of freedom (ddof) for estimating genome-wide LD scores. Default is 1 (empirical SD).")
 
