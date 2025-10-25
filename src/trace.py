@@ -25,7 +25,7 @@ class Trace:
         self.nblks = nblks  # nblks specified only if using ld proj; otherwise overwritten by trace summaries.
         self.ntrace = 0
         self.K = []
-        self.snplist = []              # <-- initialize
+        self.snplist = []
         self.nsamp = []                # number of samples used for trace summaries (can vary)
         self.nsnps = 0                 # total SNPs
         self.nsnps_blk = None          # (B+1, K): LOO bin counts
@@ -85,40 +85,55 @@ class Trace:
             annot_df.reset_index(inplace=True)
             annot_df.rename(columns={'index': 'SNP'}, inplace=True)
             self.annot_df = annot_df
-            self.annot = annot_df[self.annot_header].values
+            self.annot = self.annot_df[self.annot_header].values
             self.nbins = 1
             self.log._log("Running with single component annotation...")
             return
 
         try:
-            # full .annot or .annot.gz
+            # full .annot or .annot.gz (kept)
             df = pd.read_csv(annot_path, sep=r'\s+', compression='infer')
             if 'SNP' not in df.columns:
                 raise ValueError("!!! Input annotation file is not in correct format !!!")
-            annot_cols = df.columns.tolist()[3:]  # after CHR,SNP,BP
+
+            cols = df.columns.tolist()
+            first4 = cols[:4]
+            must = {'CHR', 'BP', 'SNP'}
+            if not must.issubset(set(first4)):
+                raise ValueError("!!! Input annotation file is not in correct format: "
+                                "first columns must include CHR,BP,SNP (and optional CM) !!!")
+            start_idx = 4 if ('CM' in first4) else 3
+            annot_cols = cols[start_idx:]         # bins start here
             self.annot_header = np.array(annot_cols)
+
+            # Only keep SNP + annotation columns
             annot_df = df[['SNP'] + annot_cols].copy()
 
             if self.snplist:
-                overlap = [snp for snp in self.snplist if snp in annot_df['SNP'].values]
-                missing = set(self.snplist) - set(overlap)
-                if missing:
-                    self.log._log(f"Dropping {len(missing)} SNPs from annotation as they are missing LD information.")
-                self.annot_df = (annot_df.set_index('SNP').loc[overlap].reset_index())
+                # Align to BIM order; drop SNPs missing from annotation
+                ann_indexed = annot_df.set_index('SNP')
+                aligned = ann_indexed.reindex(self.snplist)  # BIM order, NaN for missing
+                missing_mask = aligned[annot_cols].isna().all(axis=1)
+                n_missing = int(missing_mask.sum())
+                if n_missing:
+                    self.log._log(f"Dropping {n_missing} SNPs from annotation as they are missing LD information.")
+
+                aligned = aligned[~missing_mask]
+                self.annot_df = aligned.reset_index().rename(columns={'index': 'SNP'})
                 self.annot = self.annot_df[annot_cols].values
                 self.nsnps = self.annot.shape[0]
-                self.snplist = overlap
+                self.snplist = self.annot_df['SNP'].tolist()
             else:
-                # no BIM provided; keep all rows
+                # no BIM provided; keep all rows (kept)
                 self.annot_df = annot_df.copy()
-                self.annot = annot_df[annot_cols].values
+                self.annot = self.annot_df[annot_cols].values
                 self.nsnps = self.annot.shape[0]
-                self.snplist = annot_df['SNP'].tolist()
+                self.snplist = self.annot_df['SNP'].tolist()
 
             self.nbins = len(annot_cols)
             self.log._log("Read full annotation of shape " + str(self.annot.shape))
 
-            # prune LD-scores if present
+            # prune LD-scores if present (unchanged)
             if getattr(self, 'ldscores', None) is not None:
                 ld_df = (self.ldscores_df.set_index('SNP').loc[self.snplist].reset_index())
                 self.ldscores_df = ld_df
@@ -126,7 +141,7 @@ class Trace:
                 self.log._log(f"Pruned LD-score to {self.nsnps} SNPs that match the annotation file.")
 
         except ValueError:
-            # thin annotation (no header)
+            # thin annotation (unchanged)
             if (not self.snplist):
                 raise ValueError("!!! Thin annotation requires a BIM/snplist when using trace-summaries !!!")
             self.annot_header, self.annot = utils._read_with_optional_header(annot_path)
@@ -147,6 +162,7 @@ class Trace:
         if (self.nbins is None) or (self.nsnps is None):
             self.log._log("!!! number of components or SNP count unresolved !!!")
             sys.exit(1)
+
 
     def _save_trace(self):
         """Save trace summaries as files (format preserved from your original code)."""
@@ -234,7 +250,14 @@ class Trace:
         the genome-wide LD scores (.gw.ldscore.gz)
         """
         self.ldscores_df = pd.read_csv(self.ldscorespath, compression='gzip', sep=r'\s+', index_col=False)
-        self.ldscores = self.ldscores_df.iloc[:, 3:].to_numpy()
+        ldcols = self.ldscores_df.columns.tolist()
+        first4 = ldcols[:4]
+        must = {'CHR', 'BP', 'SNP'}
+        if not must.issubset(set(first4)):
+            raise ValueError("!!! Input LD score file is not in correct format: "
+                             "first columns must include CHR,BP,SNP (and optional CM) !!!")
+        start_idx = 4 if ('CM' in first4) else 3
+        self.ldscores = self.ldscores_df.iloc[:, start_idx:].to_numpy()
         self.snplist = self.ldscores_df['SNP'].to_numpy().tolist()
         self.nsnps = self.ldscores.shape[0]
         self.nbins = self.ldscores.shape[1]

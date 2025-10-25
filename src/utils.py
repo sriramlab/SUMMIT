@@ -29,14 +29,36 @@ def _partition_bin_non_overlapping(jn_values: np.ndarray, jn_annot: np.ndarray, 
 
 def _partition_bin_overlapping(jn_values: np.ndarray, jn_annot: np.ndarray, nbins: int):
     """
-    Partition the first array (a 1D np array) by the annotation (a 1D array). return a nested list.
-    This function assumes that a SNP can belong to multiple bins.
+    Partition the 1D array `jn_values` into `nbins` lists using the 2D
+    indicator/weight matrix `jn_annot` (shape: [num_snps, nbins]).
+    A SNP belongs to bin b if jn_annot[i, b] != 0.
     """
+    import numpy as np
+
+    jn_values = np.asarray(jn_values)
+    jn_annot  = np.asarray(jn_annot)
+
+    # Handle single-bin edge case: allow 1D annot
+    if jn_annot.ndim == 1:
+        jn_annot = jn_annot.reshape(-1, 1)
+
+    if jn_annot.shape[0] != jn_values.shape[0]:
+        raise ValueError("jn_values and jn_annot must have the same number of rows (SNPs).")
+
     partitions = {i: [] for i in range(nbins)}
-    for bin in range(nbins):
-        partitions[bin] = [jn_values[snp] for snp in range(len(jn_values)) if jn_annot[row, bin]]
-    snp_cnts = [len(partitions[i]) - sum(1 for s in partitions[i] if s is None) for i in range(nbins)]
+
+    # Vectorized selection per bin; treat any non-zero as membership
+    for b in range(nbins):
+        col = jn_annot[:, b]
+        mask = (col != 0)  # works for bool or numeric (binary/continuous)
+        partitions[b] = jn_values[mask].tolist()
+
+    # Count SNPs per bin (you never append None, so no need to subtract)
+    snp_cnts = [len(partitions[i]) for i in range(nbins)]
+
+    # Preserve your existing return shape and None-handling helper
     return [_replace_None(partitions[i]) for i in range(nbins)], snp_cnts
+
 
 def _calc_lsum(tr, n, m1, m2):
     '''

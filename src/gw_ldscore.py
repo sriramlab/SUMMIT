@@ -30,7 +30,6 @@ def limit_blas_threads(n: int = 4):
     os.environ["NUMEXPR_NUM_THREADS"] = str(n)
     os.environ["MKL_DYNAMIC"] = "FALSE"
     os.environ["OMP_DYNAMIC"] = "FALSE"
-    # Best-effort runtime setters (safe if unavailable)
     try:
         import mkl  # type: ignore
         mkl.set_num_threads(n)
@@ -662,7 +661,7 @@ class GenomewideLDScore:
             sys.exit(1)
 
         # For continuous: this is ∑_j a_{j,k}; for binary: #SNPs in bin.
-        self.nsnps_bin = self.annot.sum(axis=0, dtype=np.float64)  # <<< MODIFIED
+        self.nsnps_bin = self.annot.sum(axis=0, dtype=np.float64)
 
         self.log._log(f"Number of samples: {self.nsamp}")
         self.log._log(f"Number of total SNPs: {self.nsnps}, annotation shape: {self.annot.shape}")

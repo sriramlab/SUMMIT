@@ -102,11 +102,11 @@ class Sumstats:
             blk_zscores = all_z[start:end]
             blk_annot = all_ann[start:end]
 
-            partition, nsnps_partition = utils._partition_bin_non_overlapping(blk_zscores, blk_annot, self.nbins)
+            partition, nsnps_partition = utils._partition_bin_overlapping(blk_zscores, blk_annot, self.nbins)
             matched_zscores.append(partition)
             nsnps_blk[i] = nsnps_partition
 
-        self.zscores_bin, self.nsnps_bin = utils._partition_bin_non_overlapping(all_z, all_ann, self.nbins)
+        self.zscores_bin, self.nsnps_bin = utils._partition_bin_overlapping(all_z, all_ann, self.nbins)
         
         # full list of zscores
         self.zscores = df['Z'].values ## FIXME: this might become obsolete once I clean the SUMCORE code
