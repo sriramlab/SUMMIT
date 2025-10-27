@@ -251,6 +251,9 @@ class GenomewideLDScore:
         rng = np.random.default_rng(self.root_seed)
         self.ddof = ddof
         
+        self.start_time = utils._get_time()
+        self.log._log("Genome-wide LD score calculation started at: "+utils._get_timestr(self.start_time))
+        
         # -------- resolve random subsample of individuals --------
         base_idx = np.arange(self.nsamp, dtype=int)
         sel_idx = None
@@ -403,93 +406,57 @@ class GenomewideLDScore:
     # ------------------ Phase 1 worker: build X_k z (raw-space) ------------------
     def _compute_Xz_blk(self, blk_idxs):
         """
-        Phase 1 (chunked V): build X_k z and accumulate into shared _g_Xz2d.
-        We draw Z in chunks of v columns (L × v), reuse that chunk across all bins,
-        and do A(N×K) @ B(K×v) → add into the appropriate (N × v) slice of Xz2d.
-
-        Right-normalization to partial correlations:
-        A columns are scaled by inv_sqrt_resvar_all * sqrt(a_{i,k}) if annotations are continuous.
+        Build per-bin X_k z and accumulate into shared _g_Xz2d.
         """
-        import numpy as _np
-        from scipy.linalg import blas as _blas
-
-        j, blk_start, blk_end, idxs = blk_idxs
+        j, blk_start, blk_end = blk_idxs
         L = blk_end - blk_start
-        if L <= 0:
-            return 1
 
-        # Heuristic V chunk (compute once in parent if you prefer)
-        vchunk = getattr(self, "v_chunk_xz", None)
-        if not vchunk:
-            vchunk = self._auto_vchunk('Xz')
+        rng = np.random.default_rng([j, self.root_seed] if self.root_seed is not None else None)
+        if self.rand_dist == "normal":
+            Zs = rng.standard_normal(size=(L, self.nvecs))
+        elif self.rand_dist == "rademacher":
+            Zs = rng.integers(0, 2, size=(L, self.nvecs)) * 2 - 1
+        else:
+            Zs = rng.standard_normal(size=(L, self.nvecs))
+            norms = np.linalg.norm(Zs, axis=0)
+            Zs = Zs / norms[None, :] * np.sqrt(L)
 
-        # PRNG
-        rng = _np.random.default_rng([j, self.root_seed] if self.root_seed is not None else None)
-
-        # Read genotype block and standardize (raw-space)
         row_sel = self.row_sel if self.row_sel is not None else slice(None)
-        geno = self.G.read(index=_np.s_[row_sel, blk_start:blk_end], dtype=self.dtype)
-        means = _np.nanmean(geno, axis=0, dtype=self.dtype)
-        stds  = _np.nanstd(geno, axis=0, dtype=self.dtype, ddof=self.ddof)
+        geno = self.G.read(index=np.s_[row_sel, blk_start:blk_end], dtype=self.dtype)
+
+        # raw-space standardization
+        means = np.nanmean(geno, axis=0, dtype=self.dtype)
+        stds  = np.nanstd(geno, axis=0, dtype=self.dtype, ddof=self.ddof)
         stds[stds == 0] = 1.0
         geno  = (geno - means) / stds
-        _np.nan_to_num(geno, copy=False)
-        geno = _np.asarray(geno, dtype=self.dtype, order='F')  # (N × L)
+        np.nan_to_num(geno, copy=False)
+        geno  = np.asarray(geno, dtype=self.dtype, order='F')
 
-        # Per-SNP right scaling
+        Zs = np.asarray(Zs, order='F', dtype=self.dtype)
+        gemm = fblas.sgemm if self.dtype is np.float32 else fblas.dgemm
+
         inv_sqrt = self.inv_sqrt_resvar_all[blk_start:blk_end]  # (L,)
+        annot_blk = self.annot[blk_start:blk_end, :]            # (L × nbins)
 
-        # GEMM selector
-        gemm = _blas.sgemm if self.dtype is _np.float32 else _blas.dgemm
-
-        # Pre-extract all A_k (N×K) once per bin to reuse across v-chunks
-        # and apply right scaling (and sqrt(annot) if continuous)
-        A_list = [None] * self.nbins
-        for k, binidx in enumerate(idxs):
-            if len(binidx) == 0:
+        # For each bin, pick active SNPs and scale columns by inv_sqrt * sqrt(weight)
+        for k in range(self.nbins):
+            # boolean mask of SNPs in this block with nonzero weight in bin k
+            mask = annot_blk[:, k] != 0
+            if not np.any(mask):
                 continue
-            # N × K view
-            A = _np.asfortranarray(geno[:, binidx], dtype=self.dtype)
 
-            # scale columns by 1/sqrt(Var(M x_i)) and (if continuous) sqrt(a_{i,k})
-            scale = inv_sqrt[binidx].astype(self.dtype, copy=False)
-            if getattr(self, "is_continuous", False):
-                w = self.annot[blk_start:blk_end, k][binidx].astype(self.dtype, copy=False)
-                # use float64 for the sqrt, then cast back (more stable)
-                scale = (scale * _np.sqrt(w, dtype=_np.float64).astype(self.dtype, copy=False))
-            A *= scale[None, :]
-            A_list[k] = A  # cache
+            # gather
+            A = np.asfortranarray(geno[:, mask], dtype=self.dtype)      # (N × K)
+            w = annot_blk[mask, k].astype(self.dtype, copy=False)       # (K,)
+            scale = (inv_sqrt[mask] * np.sqrt(w, dtype=np.float64)).astype(self.dtype, copy=False)
+            A *= scale[None, :]                                         # column scale
 
-        # Process V in chunks
-        for c0 in range(0, self.nvecs, vchunk):
-            c1 = min(self.nvecs, c0 + vchunk)
-            v  = c1 - c0
-
-            # Draw Z-chunk of shape (L × v)
-            if self.rand_dist == "normal":
-                Z_chunk = rng.standard_normal(size=(L, v)).astype(self.dtype, copy=False, order='F')
-            elif self.rand_dist == "rademacher":
-                Z_chunk = (rng.integers(0, 2, size=(L, v)) * 2 - 1).astype(self.dtype, copy=False, order='F')
-            elif self.rand_dist == "spherical":
-                Z_chunk = rng.standard_normal(size=(L, v)).astype(self.dtype, copy=False)
-                norms = _np.linalg.norm(Z_chunk, axis=0)
-                Z_chunk = (Z_chunk / norms[None, :]) * _np.sqrt(L, dtype=_np.float64)
-                Z_chunk = _np.asfortranarray(Z_chunk.astype(self.dtype, copy=False))
-            else:
-                # default to normal
-                Z_chunk = rng.standard_normal(size=(L, v)).astype(self.dtype, copy=False, order='F')
-
-            # For each bin: A(N×K) @ B(K×v), accumulate into Xz2d[:, k*V + c0 : k*V + c1]
-            for k, binidx in enumerate(idxs):
-                if len(binidx) == 0:
-                    continue
-                A = A_list[k]                         # (N × K)
-                B = _np.asfortranarray(Z_chunk[binidx, :], dtype=self.dtype)  # (K × v)
-                c_view = _g_Xz2d[:, k*self.nvecs + c0 : k*self.nvecs + c1]    # (N × v)
-                with _g_xz_locks[k]:
-                    gemm(1.0, A, B, c=c_view, beta=1.0, overwrite_c=1)
-
+            B = np.asfortranarray(Zs[mask, :], dtype=self.dtype)        # (K × V)
+            c_view = _g_Xz2d[:, k*self.nvecs:(k+1)*self.nvecs]          # (N × V)
+            with _g_xz_locks[k]:
+                gemm(1.0, A, B, c=c_view, beta=1.0, overwrite_c=1)
         return 1
+
 
 
     # ------------------ Phase 2 worker: multiply (MG)^T (MB) ------------------
@@ -693,8 +660,6 @@ class GenomewideLDScore:
                 compute Y^T @ (MB_k), divide by N_eff, square, and average across V.
         Baseline: subtract M_k / N_eff per bin (correlation null).
         """
-        self.start_time = utils._get_time()
-        self.log._log("Genome-wide LD score calculation started at: "+utils._get_timestr(self.start_time))
         self.log._log(f"num_vecs: {self.nvecs}, num_workers: {self.nworkers}, step_size: {self.step_size}, seed: {self.root_seed}")
         self.log._log(f"Using {self.rand_dist} random vectors.")
         if self.C is not None:
@@ -721,7 +686,7 @@ class GenomewideLDScore:
             idx_start = self.step_size*j
             idx_end = self.nsnps if j==self.nblks-1 else self.step_size*(j+1)
             annot_blk = self.annot[idx_start:idx_end]
-            Xz_input.append((j, idx_start, idx_end, self._partition_index(np.arange(len(annot_blk)), annot_blk)))
+            Xz_input.append((j, idx_start, idx_end))
             XtXz_input.append((idx_start, idx_end))
 
         shm_xz = shm_ms = None

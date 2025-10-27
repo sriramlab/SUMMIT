@@ -138,12 +138,16 @@ if __name__ == '__main__':
         else:
             log._log(arg[i] if i==0 else '\t\t'+arg[i])
         i += 1
+    log._log("==========================================================================")
 
     if (args.out is None):
         log._log("!!! An output path to save the results must be provided !!!")
         sys.exit(1)
     else:
         _check_outdir(args.out, create=True, log=log)
+    
+    log.install_excepthook()
+    log.attach_file(args.out + (".gw.log" if args.geno else ".log"))
 
     if (args.geno is not None):
         gwld = GenomewideLDScore(bed_path=args.geno, annot_path=args.annot, out_path=args.out, covar_path=args.covar, rand_dist=args.rand_dist,\
