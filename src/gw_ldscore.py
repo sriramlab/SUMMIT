@@ -13,6 +13,7 @@ import gc
 from multiprocessing import shared_memory
 import atexit
 import os
+import ctypes
 
 
 def limit_blas_threads(n: int = 4):
@@ -710,13 +711,18 @@ class GenomewideLDScore:
 
             # ---- Phase 1: build Xz ----
             self._print_expected_mem('Xz')
-            with mp.Pool(self.nworkers,
+            with mp.Pool(self.nworkers, maxtasksperchild=8,
                         initializer=_init_shared,
                         initargs=(shm_xz.name, xz_shape2d, None, None,
                                 np.dtype(self.dtype).str, xz_locks)) as pool:
                 with tqdm(total=self.nblks, desc='Calculating Xz') as pbar:
                     for _ in pool.imap_unordered(self._compute_Xz_blk, Xz_input):
                         pbar.update()
+            
+            try:
+                ctypes.CDLL("libc.so.6").malloc_trim(0)
+            except Exception:
+                pass
 
             _rss_snapshot("after Xz", self.log)
             self.Xz_time = utils._get_time()
@@ -738,13 +744,18 @@ class GenomewideLDScore:
 
             # ---- Phase 2: fill meansq ----
             self._print_expected_mem('XtXz')
-            with mp.Pool(self.nworkers,
+            with mp.Pool(self.nworkers, maxtasksperchild=8,
                         initializer=_init_shared,
                         initargs=(shm_xz.name, xz_shape2d, shm_ms.name, ms_shape,
                                 np.dtype(self.dtype).str, xz_locks)) as pool:
                 with tqdm(total=self.nblks, desc='Calculating XtXz') as pbar:
                     for _ in pool.imap_unordered(self._compute_XtXz_blk, XtXz_input):
                         pbar.update()
+            try:
+                ctypes.CDLL("libc.so.6").malloc_trim(0)
+            except Exception:
+                pass
+
 
             _rss_snapshot("after XtXz", self.log)
             self.XtXz_time = utils._get_time()
@@ -801,7 +812,8 @@ class GenomewideLDScore:
 
             self.end_time = utils._get_time()
             self.log._log(f"Calculation of genome-wide LD score ended at "+utils._get_timestr(self.end_time))
-            self.log._log("Runtime: "+format(self.end_time - self.start_time, '.3f')+" s")
+            self.runtime=self.end_time - self.start_time
+            self.log._log("Runtime: "+format(self.runtime, '.3f')+f" s ({self.runtime//3600} hr {(self.runtime%3600)//60} m {(self.runtime%60):.3f} s)")
             self.log._save_log(self.outpath+".gw.log")
         except KeyboardInterrupt:
             self.log._log("KeyboardInterrupt received — terminating workers and cleaning shared memory.")
