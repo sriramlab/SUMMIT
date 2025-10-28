@@ -14,7 +14,13 @@ from multiprocessing import shared_memory
 import atexit
 import os
 import ctypes
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
+_THREAD_LOCAL = threading.local()
 
+os.environ.setdefault("MALLOC_ARENA_MAX", "2")           # limit per-process arenas
+os.environ.setdefault("MALLOC_TRIM_THRESHOLD_", "131072")  # bytes; encourage trims
+os.environ.setdefault("MALLOC_MMAP_THRESHOLD_", "131072")  # bytes; mmap large blocks
 
 def limit_blas_threads(n: int = 4):
     """
@@ -83,40 +89,53 @@ def _rss_snapshot(label, logger=None, include_children=True):
     else:
         print(msg, file=sys.stderr, flush=True)
 
-# ---- parallel prepass context + worker ----
-_RESVAR_CTX = {}
+def _resvar_worker_thread(span,
+                          bed_prefix: str,
+                          row_sel,
+                          dtype: np.dtype,
+                          ddof: int,
+                          C: np.ndarray | None,
+                          R: np.ndarray | None,
+                          N_eff: float,
+                          eps: float):
+    """
+    Worker for Var(M x_m) on SNP columns [s:e], using threads
+    """
+    s, e = span
 
-def _resvar_worker(args):
-    # module-level worker so Pool can pickle it
-    import numpy as _np
-    s, e = args
-    ctx = _RESVAR_CTX
+    # Thread-local bed handle (avoid cross-thread sharing of a single handle)
+    G = getattr(_THREAD_LOCAL, "G", None)
+    Gid = getattr(_THREAD_LOCAL, "bed_prefix", None)
+    if (G is None) or (Gid != bed_prefix):
+        G = open_bed(bed_prefix + ".bed")
+        _THREAD_LOCAL.G = G
+        _THREAD_LOCAL.bed_prefix = bed_prefix
 
-    G       = ctx['G']          # bed_reader handle (safe with fork)
-    row_sel = ctx['row_sel']    # slice or index array
-    dtype   = ctx['dtype']
-    ddof    = ctx['ddof']
-    C       = ctx['C']          # (N × p) orthonormal
-    R       = ctx['R']          # (p × N) = C^T
-    N_denom = ctx['N_denom']
+    # Row selection
+    rows = row_sel if row_sel is not None else slice(None)
 
-    # read genotype block
-    Gblk = G.read(index=_np.s_[row_sel, s:e], dtype=dtype)
-
-    # raw-space standardization
-    means = _np.nanmean(Gblk, axis=0, dtype=dtype)
-    stds  = _np.nanstd(Gblk,  axis=0, dtype=dtype, ddof=ddof)
+    # 1) Read & standardize in raw space
+    geno = G.read(index=np.s_[rows, s:e], dtype=dtype)          # (N × L)
+    means = np.nanmean(geno, axis=0, dtype=dtype)
+    stds  = np.nanstd( geno, axis=0, dtype=dtype, ddof=ddof)
     stds[stds == 0] = 1.0
-    Gblk = (Gblk - means) / stds
-    _np.nan_to_num(Gblk, copy=False)
-    Gblk = _np.asarray(Gblk, dtype=dtype, order='F')
+    np.subtract(geno, means, out=geno)
+    np.divide(  geno, stds,  out=geno)
+    np.nan_to_num(geno, copy=False)
+    geno = np.asfortranarray(geno, dtype=dtype)
 
-    # project left: M·Gblk  where M = I - C R
-    tmp  = R @ Gblk          # (p × L)
-    Gblk -= C @ tmp          # (N × L) in-place
+    # 2) Project: Y = (I - C R) * geno  (C: N×p with orthonormal cols; R = C^T in same dtype)
+    if C is not None and R is not None:
+        tmp = R @ geno              # (p × L)
+        Y   = geno - (C @ tmp)      # (N × L)
+        del tmp
+    else:
+        Y = geno
 
-    out = _np.sum(Gblk * Gblk, axis=0, dtype=dtype) / float(N_denom - 1)
-    return (s, e, out)      
+    # 3) Variance with denominator (N_eff - 1), all in dtype
+    resvar = np.sum(Y * Y, axis=0, dtype=dtype) / float(N_eff - 1)
+    inv_sqrt_resvar = (1.0 / np.sqrt(np.maximum(resvar, eps))).astype(dtype, copy=False)
+    return (s, e, inv_sqrt_resvar)
 
 # -------------------- shared-memory worker globals --------------------
 _g_Xz2d = None           # (N × V*B), holds either Xz or M·Xz depending on phase
@@ -262,7 +281,7 @@ class GenomewideLDScore:
                 verbose=False,
                 dtype='float32',
                 num_threads: int = 1,
-                eps_var: float = 1e-8,
+                eps_var: float = 1e-10,
                 rand_samp=None, # float in (0,1] or int in [100, N]
                 ddof = 1):
         # Cap BLAS threads before any Pools spawn
@@ -353,216 +372,195 @@ class GenomewideLDScore:
         self.outpath = out_path
 
         # storage used by correlation mode
-        self.resvar_all = None          # (M,) Var(M x_m)
         self.inv_sqrt_resvar_all = None # (M,) 1/sqrt(Var(M x_m)+eps)
 
     def _auto_vchunk(self, phase: str) -> int:
         """
-        Pick a V-chunk so each worker stays well under memory pressure.
-        phase: 'Xz' (Phase 1) or 'XtXz' (Phase 2).
-        Heuristic: give each worker ~60% of available RAM divided by nworkers;
-        leave headroom for OS/other arrays. Floor at 256 and cap at V.
+        Conservative V-chunk sizing.
+        Reserve headroom for the parent shared arrays (Xz2d + meansq),
+        then give each worker ~20% of the remaining available memory.
+        Floor at 64 and round up to a multiple of 64 for BLAS.
         """
         b = np.dtype(self.dtype).itemsize
         N   = int(self.nsamp)
-        L   = int(min(self.step_size, self.nsnps))
+        M   = int(self.nsnps)
+        B   = int(self.nbins)
         V   = int(self.nvecs)
+        S   = int(min(self.step_size, self.nsnps))
         W   = max(1, int(self.nworkers))
 
-        # Baseline per-worker footprint (dominated by genotype block N×L)
-        geno_blk = N * L * b  # bytes
+        # Parent SHM footprint we already committed (or will commit): N*(V*B) + M*B
+        parent_bytes = (N * (V * B) + M * B) * b
 
-        # Available memory → per-worker budget
         try:
             import psutil
             avail = int(psutil.virtual_memory().available)
-            # If running inside a cgroup/container, psutil respects the limit.
         except Exception:
-            # Fallback: assume 8 GB free if psutil is unavailable.
-            avail = 8 * (1024 ** 3)
+            avail = 8 * (1024 ** 3)  # 8 GB fallback
 
-        # generous but safe-ish per-worker budget
-        budget_per_worker = max(512 * (1024 ** 2), int(0.60 * avail / W))
+        # Guard: do not assume we can use all available memory.
+        # Reserve at least the parent footprint and only use a small slice of the rest.
+        remain = max(0, avail - parent_bytes)
+        budget_per_worker = max(64 * (1024 ** 2), int(0.20 * remain / W))  # 20% of the remainder
 
-        # How many bytes we can spend on the V-chunk buffer for this phase
-        # Both phases allocate an (L × v_chunk) temp (Z-chunk in Phase 1, 'work' in Phase 2)
+        geno_blk = N * S * b
         extra = budget_per_worker - geno_blk
         if extra <= 0:
-            # If geno block alone exceeds budget, pick the smallest usable chunk.
-            return max(128, min(V, 512))
+            return min(V, 64)  # bare minimum
 
-        bytes_per_v = L * b  # one column across L rows
+        bytes_per_v = S * b  # one (L×1) column
         v_chunk = int(extra // bytes_per_v)
-        # Clamp
-        v_chunk = max(256, min(V, v_chunk))
-        # Nicer GEMM widths: round up to a multiple of 64 (keeps BLAS happy)
+        v_chunk = max(64, min(V, v_chunk))
+        # round up to multiple of 64 for nicer GEMM kernels
         v_chunk = min(V, ((v_chunk + 63) // 64) * 64)
         return v_chunk
-
+    
     def _precompute_residual_variances(self):
         """
-        Compute Var(M x_m) for ALL SNPs.
-        Parallelized with multiprocessing (processes) on Linux via 'fork'.
-        Falls back to single-process if 'fork' unavailable.
+        Precompute inv sqrt residual variances per SNP, consistent with XtXz.
+        Handles: standardization (ddof), nan->0 imputation, and optional projection.
         """
-        if self.C is None:
-            self.log._log("No covariates: residual variances are 1; skipping prepass.")
-            return np.ones(self.nsnps, dtype=self.dtype)
-
-        self.log._log("Precomputing residual variances Var(M x_m) for all SNPs.")
-
         row_sel = self.row_sel if self.row_sel is not None else slice(None)
-        N_denom = float(self.N_eff)
-        resvar = np.empty(self.nsnps, dtype=self.dtype)
+        inv = np.empty(self.nsnps, dtype=self.dtype)
 
-        # Make SNP chunks using your existing step_size
         chunks = [(s, min(self.nsnps, s + self.step_size))
                 for s in range(0, self.nsnps, self.step_size)]
         if not chunks:
             self.log._log("[warn] No SNP chunks formed; returning zeros.")
             return np.zeros(self.nsnps, dtype=self.dtype)
 
-        # Populate module-level ctx
-        global _RESVAR_CTX
-        _RESVAR_CTX = {
-            'G': self.G,               # inherited by forked children (no pickling)
-            'row_sel': row_sel,
-            'dtype': self.dtype,
-            'ddof': int(self.ddof),
-            'C': self.C,               # (N × p)
-            'R': self.cov_R,           # (p × N)
-            'N_denom': N_denom,
-        }
+        for s, e in chunks:
+            G = self.G.read(index=np.s_[row_sel, s:e], dtype=self.dtype)  # (N × L)
+            means = np.nanmean(G, axis=0, dtype=self.dtype)
+            stds  = np.nanstd( G, axis=0, dtype=self.dtype, ddof=self.ddof)
+            stds[stds == 0] = 1.0
+            G = (G - means) / stds
+            np.nan_to_num(G, copy=False)  # mean-imputation at 0 after centering
 
-        # Try 'fork'; if not available, fall back to single-process
-        try:
-            ctx = mp.get_context('fork')
-            use_pool = True
-        except ValueError:
-            self.log._log("[info] 'fork' context not available; running prepass single-process.")
-            use_pool = False
+            if self.C is not None:
+                tmp = self.cov_R @ G
+                G   = G - (self.C @ tmp)
+                del tmp
+                N_denom = float(self.N_eff)
+            else:
+                N_denom = float(self.nsamp)
 
-        if use_pool:
-            try:
-                limit_blas_threads(self.num_threads)
-            except Exception:
-                pass
+            var = np.sum(G * G, axis=0, dtype=self.dtype) / max(N_denom - 1.0, 1.0)
+            inv[s:e] = (1.0 / np.sqrt(np.maximum(var, self.eps_var))).astype(self.dtype, copy=False)
 
-            # recycle children to release glibc arenas
-            maxtasks = max(4, min(16, len(chunks) // max(1, self.nworkers)))
-            with ctx.Pool(processes=self.nworkers, maxtasksperchild=maxtasks) as pool:
-                for s, e, out in pool.imap_unordered(_resvar_worker, chunks, chunksize=1):
-                    resvar[s:e] = out
-
-            # proactively return free heap pages to the OS (glibc)
-            try:
-                import ctypes
-                ctypes.CDLL("libc.so.6").malloc_trim(0)
-            except Exception:
-                pass
-        else:
-            # single-process fallback
-            for ch in chunks:
-                s, e, out = _resvar_worker(ch)
-                resvar[s:e] = out
-
-        # clear ctx references to allow GC
-        _RESVAR_CTX = {}
-
-        # epsilon floor
-        resvar = np.maximum(resvar, self.eps_var)
-        self.log._log("Finished precomputing residual variances.")
-        return resvar
+        return inv
 
     # ------------------ Phase 1 worker: build X_k z ------------------
     def _compute_Xz_blk(self, task):
-        """
-        Phase 1: build X_k z for a genotype block.
-        Expects: task = (j, blk_start, blk_end)
-        - Standardize geno in raw space
-        - Right-normalize by inv_sqrt_resvar and sqrt(annotation)
-        - Generate random Z in tiles of size self.vchunk
-        - Accumulate into shared _g_Xz2d[:, k*self.nvecs : (k+1)*self.nvecs]
-        """
         j, blk_start, blk_end = task
         L = blk_end - blk_start
         row_sel = self.row_sel if self.row_sel is not None else slice(None)
 
         # ---- read & standardize genotype block ----
         geno = self.G.read(index=np.s_[row_sel, blk_start:blk_end], dtype=self.dtype)
+        geno = np.array(geno, dtype=self.dtype, order='F', copy=True)
+
         means = np.nanmean(geno, axis=0, dtype=self.dtype)
         stds  = np.nanstd(geno, axis=0, dtype=self.dtype, ddof=self.ddof)
         stds[stds == 0] = 1.0
-        geno  = (geno - means) / stds
+
+        np.subtract(geno, means, out=geno)      # in place
+        np.divide(geno, stds,  out=geno)        # in place
         np.nan_to_num(geno, copy=False)
-        geno  = np.asarray(geno, dtype=self.dtype, order='F')  # (N × L)
 
         inv_sqrt = self.inv_sqrt_resvar_all[blk_start:blk_end]  # (L,)
-        ann_blk  = self.annot[blk_start:blk_end]                # (L × nbins), float64 ok
+        ann_blk  = self.annot[blk_start:blk_end]                # (L × nbins)
 
-        # ---- indices per bin (columns with nonzero weights) ----
-        # idxs[k] is np.ndarray of row indices within [0..L)
-        idxs = [np.nonzero(ann_blk[:, k])[0] for k in range(self.nbins)]
-
-        # ---- precompute A (N × K) per bin with right-side scaling ----
-        bin_As = [None] * self.nbins
-        bin_idx = [None] * self.nbins
+        # ---- indices & per-bin scale precompute (no upcasts, small memory) ----
+        idxs, scales = [], []
+        Kmax = 0
         for k in range(self.nbins):
-            bi = idxs[k]
-            if bi.size == 0:
-                continue
-            bi = bi.astype(np.int64, copy=False)
-            A  = np.asfortranarray(geno[:, bi], dtype=self.dtype)  # (N × K)
+            bi = np.nonzero(ann_blk[:, k])[0]
+            idxs.append(bi)
+            if bi.size:
+                Kmax = max(Kmax, int(bi.size))
+                sk = np.empty(bi.size, dtype=self.dtype)
+                np.take(inv_sqrt, bi, out=sk)                 # sk = inv_sqrt[bi]
+                tmp = np.empty_like(sk)
+                np.take(ann_blk[:, k], bi, out=tmp)           # tmp = a_{i,k}
+                np.sqrt(tmp, out=tmp)                         # sqrt(a_{i,k})
+                sk *= tmp                                     # inv_sqrt * sqrt(a)
+                scales.append(sk)
+            else:
+                scales.append(None)
+        if self.nbins == 0:
+            return 1
 
-            # scale columns by 1/sqrt(Var(M x_i)) * sqrt(a_{i,k})
-            w = ann_blk[bi, k].astype(self.dtype, copy=False)
-            sqrtw = np.sqrt(w, dtype=np.float64).astype(self.dtype, copy=False)
-            scale = (inv_sqrt[bi] * sqrtw).astype(self.dtype, copy=False)
-            A *= scale[None, :]
-
-            bin_As[k]  = A
-            bin_idx[k] = bi
-
-        # ---- RNG & V-chunking ----
-        gemm   = fblas.sgemm if self.dtype is np.float32 else fblas.dgemm
+        # ---- fixed workspaces ----
+        N = geno.shape[0]
         vchunk = int(getattr(self, "v_chunk_xz", 0) or self.nvecs)
         vchunk = max(1, min(vchunk, self.nvecs))
 
+        A_buf = np.empty((N, Kmax), dtype=self.dtype, order='F')
+        B_buf = np.empty((Kmax, vchunk), dtype=self.dtype, order='F')
+
+        gemm = fblas.sgemm if self.dtype is np.float32 else fblas.dgemm
+
+        # ---- RNG per (block j, tile v0) ----
         for v0 in range(0, self.nvecs, vchunk):
             v1 = min(self.nvecs, v0 + vchunk)
             Vt = v1 - v0
 
-            # Generate Z tile once per (block j, tile v0)
-            rng = (np.random.default_rng(None) if self.root_seed is None else np.random.default_rng([int(self.root_seed), int(j), int(v0)]))
-            if self.rand_dist == "normal":
-                Z = rng.standard_normal(size=(L, Vt))
+            rng = (np.random.default_rng(None) if self.root_seed is None
+                else np.random.default_rng([int(self.root_seed), int(j), int(v0)]))
+
+            # Generate Z directly in self.dtype, normalize in-place when needed
+            if self.rand_dist == "normal" or self.rand_dist == "spherical":
+                Z = rng.standard_normal((L, Vt), dtype=self.dtype)
             elif self.rand_dist == "rademacher":
-                Z = rng.integers(0, 2, size=(L, Vt)) * 2 - 1
-            elif self.rand_dist == "spherical":
-                Z = rng.standard_normal(size=(L, Vt))
+                Zi = rng.integers(0, 2, size=(L, Vt), dtype=np.int8)
+                Zi *= 2; Zi -= 1
+                Z = Zi.astype(self.dtype, copy=False); del Zi
+            else:
+                Z = rng.standard_normal((L, Vt), dtype=self.dtype)
+
+            if self.rand_dist == "spherical":
                 norms = np.linalg.norm(Z, axis=0)
                 norms[norms == 0] = 1.0
-                Z = Z / norms[None, :] * np.sqrt(L)
-            else:
-                Z = rng.standard_normal(size=(L, Vt))
-            Z = np.asarray(Z, dtype=self.dtype, order='F')
+                Z /= norms
+                Z *= np.sqrt(L)
 
-            # Accumulate for each bin
+            # Ensure Fortran layout without copying when possible
+            if not Z.flags['F_CONTIGUOUS']:
+                Z = np.asfortranarray(Z, dtype=self.dtype)
+
+            # --- per-bin accumulation using fixed workspaces, no fancy-index temps ---
             for k in range(self.nbins):
-                A = bin_As[k]
-                bi = bin_idx[k]
-                if A is None:
+                bi = idxs[k]
+                K  = int(bi.size)
+                if K == 0:
                     continue
-                B = np.asfortranarray(Z[bi, :], dtype=self.dtype)  # (K × Vt)
-                c_view = _g_Xz2d[:, k*self.nvecs + v0 : k*self.nvecs + v1]  # (N × Vt)
-                with _g_xz_locks[k]:
-                    gemm(1.0, A, B, c=c_view, beta=1.0, overwrite_c=1)
 
-        # help GC
-        for k in range(self.nbins):
-            bin_As[k] = None
-            bin_idx[k] = None
+                A_view = A_buf[:, :K]
+                # np.take avoids allocating N×K temp for geno[:, bi]
+                np.take(geno, bi, axis=1, out=A_view)
+                # in-place column scaling by precomputed scale vector
+                A_view *= scales[k]
+
+                B_view = B_buf[:K, :Vt]
+                # np.take avoids allocating K×Vt temp for Z[bi, :]
+                np.take(Z, bi, axis=0, out=B_view)
+
+                c_view = _g_Xz2d[:, k*self.nvecs + v0 : k*self.nvecs + v1]
+                with _g_xz_locks[k]:
+                    gemm(1.0, A_view, B_view, c=c_view, beta=1.0, overwrite_c=1)
+
+            # Optional: mitigate allocator ballooning
+            # try:
+            #     import ctypes, gc
+            #     gc.collect()
+            #     ctypes.CDLL("libc.so.6").malloc_trim(0)
+            # except Exception:
+            #     pass
+
         return 1
+
+
     
     # ------------------ Phase 2 worker: multiply (MG)^T (MB) ------------------
     def _compute_XtXz_blk(self, blk_idx):
@@ -605,8 +603,6 @@ class GenomewideLDScore:
             N_denom = float(self.nsamp)
 
         # Left normalization to partial correlations
-        #resvar_block = _np.sum(Y * Y, axis=0, dtype=self.dtype) / float(N_denom - 1)  # (L,)
-        #inv_sqrt_left = (1.0 / _np.sqrt(_np.maximum(resvar_block, self.eps_var))).astype(self.dtype, copy=False)
         inv_sqrt_left = self.inv_sqrt_resvar_all[blk_start:blk_end]
 
         # Allocate an accumulator for this block & per-bin mean-of-squares across V
@@ -636,7 +632,6 @@ class GenomewideLDScore:
 
             # write mean across V
             _g_meansq[blk_start:blk_end, k] = (acc / float(self.nvecs)).astype(_g_meansq.dtype, copy=False)
-
         return 1
 
 
@@ -779,8 +774,7 @@ class GenomewideLDScore:
         self.log._log(f"Using V-chunk sizes: Phase1 (Xz)={self.v_chunk_xz}, Phase2 (XtXz)={self.v_chunk_xtxz}")
 
         # ---- Phase 0: per-SNP residual variances and inverse sqrt (right side) ----
-        self.resvar_all = self._precompute_residual_variances()
-        self.inv_sqrt_resvar_all = (1.0 / np.sqrt(self.resvar_all)).astype(self.dtype, copy=False)
+        self.inv_sqrt_resvar_all = self._precompute_residual_variances()
 
         self.nblks = len(np.arange(self.nsnps)[::self.step_size])
         self._print_expected_mem('Xz')
@@ -867,7 +861,7 @@ class GenomewideLDScore:
             self.log._log("Calculation of XtXz (for each partition) completed. Runtime: "+format(self.XtXz_time - self.Xz_time, '.3f')+" s")
 
             # ---- Baseline subtraction: classic correlation null M_k / N_eff ----
-            N_denom = float(self.N_eff if self.C is not None else self.nsamp-self.ddof)
+            N_denom = float(self.N_eff-1.0 if self.C is not None else self.nsamp-self.ddof)
             self.log._log("Applying correlation null: subtracting M_k / N_denom per bin.")
             self.meansq -= (self.nsnps_bin / N_denom).astype(self.meansq.dtype, copy=False)[None, :]
 
