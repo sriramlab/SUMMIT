@@ -59,35 +59,31 @@ def _bytes_human(n):
     return f"{n:,.2f} EB"
 
 def _rss_snapshot(label, logger=None, include_children=True):
-    rss = None
-    total = None
-    num_children = 0
+    import os, psutil
+    rss = pss = None
     try:
-        import psutil
-        p = psutil.Process()
-        rss = p.memory_info().rss
-        total = rss
-        if include_children:
-            kids = p.children(recursive=True)
-            num_children = len(kids)
-            total += sum(c.memory_info().rss for c in kids if c.is_running())
+        pid = os.getpid()
+        with open(f"/proc/{pid}/smaps_rollup", "r") as f:
+            for line in f:
+                if line.startswith("Pss:"):
+                    # kB → bytes
+                    pss = int(line.split()[1]) * 1024
+                elif line.startswith("Rss:"):
+                    rss = int(line.split()[1]) * 1024
     except Exception:
         try:
-            import resource
-            r = resource.getrusage(resource.RUSAGE_SELF)
-            ru = r.ru_maxrss
-            rss = ru * 1024 if ru < 10**9 else ru
-            total = rss
+            p = psutil.Process()
+            rss = p.memory_info().rss
         except Exception:
             pass
 
-    msg = (f"[mem] {label}: parent RSS={_bytes_human(rss)}; "
-           f"parent+children≈{_bytes_human(total)}; children={num_children}")
+    msg = f"[mem] {label}: RSS={_bytes_human(rss)}; PSS≈{_bytes_human(pss)}"
     if logger:
         try: logger._log(msg)
         except Exception: print(msg, file=sys.stderr, flush=True)
     else:
         print(msg, file=sys.stderr, flush=True)
+
 
 def _resvar_worker_thread(span,
                           bed_prefix: str,
@@ -452,6 +448,13 @@ class GenomewideLDScore:
 
     # ------------------ Phase 1 worker: build X_k z ------------------
     def _compute_Xz_blk(self, task):
+        """
+        Phase 1 worker (block j):
+        - reads/standardizes geno block (N × L)
+        - builds Xz for all bins in this block, in v-chunks
+        - uses chunk-invariant RNG so results are independent of vchunk
+        - accumulates into global _g_Xz2d via local scratch to avoid double-add
+        """
         j, blk_start, blk_end = task
         L = blk_end - blk_start
         row_sel = self.row_sel if self.row_sel is not None else slice(None)
@@ -465,13 +468,13 @@ class GenomewideLDScore:
         stds[stds == 0] = 1.0
 
         np.subtract(geno, means, out=geno)      # in place
-        np.divide(geno, stds,  out=geno)        # in place
+        np.divide(  geno, stds,  out=geno)      # in place
         np.nan_to_num(geno, copy=False)
 
         inv_sqrt = self.inv_sqrt_resvar_all[blk_start:blk_end]  # (L,)
         ann_blk  = self.annot[blk_start:blk_end]                # (L × nbins)
 
-        # ---- indices & per-bin scale precompute (no upcasts, small memory) ----
+        # ---- indices & per-bin scale precompute ----
         idxs, scales = [], []
         Kmax = 0
         for k in range(self.nbins):
@@ -501,65 +504,64 @@ class GenomewideLDScore:
 
         gemm = fblas.sgemm if self.dtype is np.float32 else fblas.dgemm
 
-        # ---- RNG per (block j, tile v0) ----
+        # ---- RNG + accumulation per v-chunk ----
+        # NOTE: each Z column is generated from a seed keyed by its GLOBAL index (vglob),
+        #       so results are invariant to how we split v into chunks.
         for v0 in range(0, self.nvecs, vchunk):
             v1 = min(self.nvecs, v0 + vchunk)
             Vt = v1 - v0
 
-            rng = (np.random.default_rng(None) if self.root_seed is None
-                else np.random.default_rng([int(self.root_seed), int(j), int(v0)]))
-
-            # Generate Z directly in self.dtype, normalize in-place when needed
-            if self.rand_dist == "normal" or self.rand_dist == "spherical":
-                Z = rng.standard_normal((L, Vt), dtype=self.dtype)
-            elif self.rand_dist == "rademacher":
-                Zi = rng.integers(0, 2, size=(L, Vt), dtype=np.int8)
-                Zi *= 2; Zi -= 1
-                Z = Zi.astype(self.dtype, copy=False); del Zi
+            # Build Z (L × Vt) in Fortran order, column-by-column with global-index seeds
+            Z = np.empty((L, Vt), dtype=self.dtype, order='F')
+            if self.root_seed is None:
+                # Unseeded: still make it chunk-invariant by drawing per-column
+                for t, vglob in enumerate(range(v0, v1)):
+                    rng = np.random.default_rng(None)
+                    Z[:, t] = rng.standard_normal(L).astype(self.dtype, copy=False)
             else:
-                Z = rng.standard_normal((L, Vt), dtype=self.dtype)
+                rseed = int(self.root_seed)
+                jj    = int(j)
+                for t, vglob in enumerate(range(v0, v1)):
+                    rng = np.random.default_rng([rseed, jj, int(vglob)])
+                    if self.rand_dist == "rademacher":
+                        Zi = rng.integers(0, 2, size=L, dtype=np.int8)
+                        Zi *= 2; Zi -= 1
+                        Z[:, t] = Zi.astype(self.dtype, copy=False)
+                    else:
+                        Z[:, t] = rng.standard_normal(L).astype(self.dtype, copy=False)
 
+            # Optional spherical normalization (column-wise)
             if self.rand_dist == "spherical":
                 norms = np.linalg.norm(Z, axis=0)
                 norms[norms == 0] = 1.0
                 Z /= norms
-                Z *= np.sqrt(L)
+                Z *= np.sqrt(L).astype(self.dtype)
 
-            # Ensure Fortran layout without copying when possible
-            if not Z.flags['F_CONTIGUOUS']:
-                Z = np.asfortranarray(Z, dtype=self.dtype)
-
-            # --- per-bin accumulation using fixed workspaces, no fancy-index temps ---
+            # --- per-bin accumulation using fixed workspaces (local scratch → add once) ---
             for k in range(self.nbins):
                 bi = idxs[k]
                 K  = int(bi.size)
                 if K == 0:
                     continue
 
+                # A_view: (N × K), gather and scale in-place
                 A_view = A_buf[:, :K]
-                # np.take avoids allocating N×K temp for geno[:, bi]
                 np.take(geno, bi, axis=1, out=A_view)
-                # in-place column scaling by precomputed scale vector
                 A_view *= scales[k]
 
+                # B_view: (K × Vt), gather Z rows
                 B_view = B_buf[:K, :Vt]
-                # np.take avoids allocating K×Vt temp for Z[bi, :]
                 np.take(Z, bi, axis=0, out=B_view)
 
-                c_view = _g_Xz2d[:, k*self.nvecs + v0 : k*self.nvecs + v1]
-                with _g_xz_locks[k]:
-                    gemm(1.0, A_view, B_view, c=c_view, beta=1.0, overwrite_c=1)
+                # Local scratch for this (k, v0:v1): compute with beta=0, then add once under lock
+                c_view = _g_Xz2d[:, k*self.nvecs + v0 : k*self.nvecs + v1]   # (N × Vt)
+                C_loc  = np.empty_like(c_view, order='F')
+                gemm(1.0, A_view, B_view, c=C_loc, beta=0.0, overwrite_c=1)
 
-            # Optional: mitigate allocator ballooning
-            # try:
-            #     import ctypes, gc
-            #     gc.collect()
-            #     ctypes.CDLL("libc.so.6").malloc_trim(0)
-            # except Exception:
-            #     pass
+                with _g_xz_locks[k]:
+                    c_view += C_loc
 
         return 1
-
 
     
     # ------------------ Phase 2 worker: multiply (MG)^T (MB) ------------------
@@ -810,7 +812,7 @@ class GenomewideLDScore:
 
             # ---- Phase 1: build Xz ----
             self._print_expected_mem('Xz')
-            with mp.Pool(self.nworkers, maxtasksperchild=8,
+            with mp.Pool(self.nworkers, maxtasksperchild=4,
                         initializer=_init_shared,
                         initargs=(shm_xz.name, xz_shape2d, None, None,
                                 np.dtype(self.dtype).str, xz_locks)) as pool:
@@ -843,7 +845,7 @@ class GenomewideLDScore:
 
             # ---- Phase 2: fill meansq ----
             self._print_expected_mem('XtXz')
-            with mp.Pool(self.nworkers, maxtasksperchild=8,
+            with mp.Pool(self.nworkers, maxtasksperchild=4,
                         initializer=_init_shared,
                         initargs=(shm_xz.name, xz_shape2d, shm_ms.name, ms_shape,
                                 np.dtype(self.dtype).str, xz_locks)) as pool:
