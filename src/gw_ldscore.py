@@ -16,6 +16,11 @@ import os
 import ctypes
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
+import gwldcore
+
+
+
 _THREAD_LOCAL = threading.local()
 
 os.environ.setdefault("MALLOC_ARENA_MAX", "2")           # limit per-process arenas
@@ -271,7 +276,6 @@ class GenomewideLDScore:
                 rand_dist,
                 covar_path=None,
                 num_vecs=10,
-                num_workers=4,
                 step_size=1000,
                 seed=None,
                 verbose=False,
@@ -283,6 +287,10 @@ class GenomewideLDScore:
         # Cap BLAS threads before any Pools spawn
         self.num_threads = int(num_threads)
         try:
+            gwldcore.set_num_threads(int(self.num_threads))
+        except Exception:
+            pass
+        try:
             limit_blas_threads(self.num_threads)
         except NameError:
             pass  # if helper isn't defined here
@@ -292,7 +300,6 @@ class GenomewideLDScore:
         self.G = open_bed(bed_path + ".bed")
         self.nsamp, self.nsnps = self.G.shape
         self.nvecs = num_vecs
-        self.nworkers = num_workers
         self.step_size = step_size
         self.log = log
         self.verbose = verbose
@@ -383,7 +390,6 @@ class GenomewideLDScore:
         B   = int(self.nbins)
         V   = int(self.nvecs)
         S   = int(min(self.step_size, self.nsnps))
-        W   = max(1, int(self.nworkers))
 
         # Parent SHM footprint we already committed (or will commit): N*(V*B) + M*B
         parent_bytes = (N * (V * B) + M * B) * b
@@ -394,10 +400,9 @@ class GenomewideLDScore:
         except Exception:
             avail = 8 * (1024 ** 3)  # 8 GB fallback
 
-        # Guard: do not assume we can use all available memory.
-        # Reserve at least the parent footprint and only use a small slice of the rest.
+
         remain = max(0, avail - parent_bytes)
-        budget_per_worker = max(64 * (1024 ** 2), int(0.20 * remain / W))  # 20% of the remainder
+        budget_per_worker = max(64 * (1024 ** 2), int(0.20 * remain))
 
         geno_blk = N * S * b
         extra = budget_per_worker - geno_blk
@@ -445,197 +450,6 @@ class GenomewideLDScore:
             inv[s:e] = (1.0 / np.sqrt(np.maximum(var, self.eps_var))).astype(self.dtype, copy=False)
 
         return inv
-
-    # ------------------ Phase 1 worker: build X_k z ------------------
-    def _compute_Xz_blk(self, task):
-        """
-        Phase 1 worker (block j):
-        - reads/standardizes geno block (N × L)
-        - builds Xz for all bins in this block, in v-chunks
-        - uses chunk-invariant RNG so results are independent of vchunk
-        - accumulates into global _g_Xz2d via local scratch to avoid double-add
-        """
-        j, blk_start, blk_end = task
-        L = blk_end - blk_start
-        row_sel = self.row_sel if self.row_sel is not None else slice(None)
-
-        # ---- read & standardize genotype block ----
-        geno = self.G.read(index=np.s_[row_sel, blk_start:blk_end], dtype=self.dtype)
-        geno = np.array(geno, dtype=self.dtype, order='F', copy=True)
-
-        means = np.nanmean(geno, axis=0, dtype=self.dtype)
-        stds  = np.nanstd(geno, axis=0, dtype=self.dtype, ddof=self.ddof)
-        stds[stds == 0] = 1.0
-
-        np.subtract(geno, means, out=geno)      # in place
-        np.divide(  geno, stds,  out=geno)      # in place
-        np.nan_to_num(geno, copy=False)
-
-        inv_sqrt = self.inv_sqrt_resvar_all[blk_start:blk_end]  # (L,)
-        ann_blk  = self.annot[blk_start:blk_end]                # (L × nbins)
-
-        # ---- indices & per-bin scale precompute ----
-        idxs, scales = [], []
-        Kmax = 0
-        for k in range(self.nbins):
-            bi = np.nonzero(ann_blk[:, k])[0]
-            idxs.append(bi)
-            if bi.size:
-                Kmax = max(Kmax, int(bi.size))
-                sk = np.empty(bi.size, dtype=self.dtype)
-                np.take(inv_sqrt, bi, out=sk)                 # sk = inv_sqrt[bi]
-                tmp = np.empty_like(sk)
-                np.take(ann_blk[:, k], bi, out=tmp)           # tmp = a_{i,k}
-                np.sqrt(tmp, out=tmp)                         # sqrt(a_{i,k})
-                sk *= tmp                                     # inv_sqrt * sqrt(a)
-                scales.append(sk)
-            else:
-                scales.append(None)
-        if self.nbins == 0:
-            return 1
-
-        # ---- fixed workspaces ----
-        N = geno.shape[0]
-        vchunk = int(getattr(self, "v_chunk_xz", 0) or self.nvecs)
-        vchunk = max(1, min(vchunk, self.nvecs))
-
-        A_buf = np.empty((N, Kmax), dtype=self.dtype, order='F')
-        B_buf = np.empty((Kmax, vchunk), dtype=self.dtype, order='F')
-
-        gemm = fblas.sgemm if self.dtype is np.float32 else fblas.dgemm
-
-        # ---- RNG + accumulation per v-chunk ----
-        # NOTE: each Z column is generated from a seed keyed by its GLOBAL index (vglob),
-        #       so results are invariant to how we split v into chunks.
-        for v0 in range(0, self.nvecs, vchunk):
-            v1 = min(self.nvecs, v0 + vchunk)
-            Vt = v1 - v0
-
-            # Build Z (L × Vt) in Fortran order, column-by-column with global-index seeds
-            Z = np.empty((L, Vt), dtype=self.dtype, order='F')
-            if self.root_seed is None:
-                # Unseeded: still make it chunk-invariant by drawing per-column
-                for t, vglob in enumerate(range(v0, v1)):
-                    rng = np.random.default_rng(None)
-                    Z[:, t] = rng.standard_normal(L).astype(self.dtype, copy=False)
-            else:
-                rseed = int(self.root_seed)
-                jj    = int(j)
-                for t, vglob in enumerate(range(v0, v1)):
-                    rng = np.random.default_rng([rseed, jj, int(vglob)])
-                    if self.rand_dist == "rademacher":
-                        Zi = rng.integers(0, 2, size=L, dtype=np.int8)
-                        Zi *= 2; Zi -= 1
-                        Z[:, t] = Zi.astype(self.dtype, copy=False)
-                    else:
-                        Z[:, t] = rng.standard_normal(L).astype(self.dtype, copy=False)
-
-            # Optional spherical normalization (column-wise)
-            if self.rand_dist == "spherical":
-                norms = np.linalg.norm(Z, axis=0)
-                norms[norms == 0] = 1.0
-                Z /= norms
-                Z *= np.sqrt(L).astype(self.dtype)
-
-            # --- per-bin accumulation using fixed workspaces (local scratch → add once) ---
-            for k in range(self.nbins):
-                bi = idxs[k]
-                K  = int(bi.size)
-                if K == 0:
-                    continue
-
-                # A_view: (N × K), gather and scale in-place
-                A_view = A_buf[:, :K]
-                np.take(geno, bi, axis=1, out=A_view)
-                A_view *= scales[k]
-
-                # B_view: (K × Vt), gather Z rows
-                B_view = B_buf[:K, :Vt]
-                np.take(Z, bi, axis=0, out=B_view)
-
-                # Local scratch for this (k, v0:v1): compute with beta=0, then add once under lock
-                c_view = _g_Xz2d[:, k*self.nvecs + v0 : k*self.nvecs + v1]   # (N × Vt)
-                C_loc  = np.empty_like(c_view, order='F')
-                gemm(1.0, A_view, B_view, c=C_loc, beta=0.0, overwrite_c=1)
-
-                with _g_xz_locks[k]:
-                    c_view += C_loc
-
-        return 1
-
-    
-    # ------------------ Phase 2 worker: multiply (MG)^T (MB) ------------------
-    def _compute_XtXz_blk(self, blk_idx):
-        """
-        Phase 2 (chunked V): Y = M·G (or G); left-normalize to partial correlations,
-        then for each bin accumulate sum_j ( (Y^T @ MB_k)_j^2 ) across V **in chunks**.
-        Writes mean-of-squares into shared _g_meansq[blk_start:blk_end, k].
-        """
-        import numpy as _np
-        from scipy.linalg import blas as _blas
-
-        blk_start, blk_end = blk_idx
-        L = blk_end - blk_start
-        if L <= 0:
-            return 1
-
-        vchunk = getattr(self, "v_chunk_xtxz", None)
-        if not vchunk:
-            vchunk = self._auto_vchunk('XtXz')
-
-        row_sel = self.row_sel if self.row_sel is not None else slice(None)
-        gemm = _blas.sgemm if self.dtype is _np.float32 else _blas.dgemm
-
-        # Read & standardize (raw-space)
-        geno = self.G.read(index=_np.s_[row_sel, blk_start:blk_end], dtype=self.dtype)
-        means = _np.nanmean(geno, axis=0, dtype=self.dtype)
-        stds  = _np.nanstd(geno, axis=0, dtype=self.dtype, ddof=self.ddof)
-        stds[stds == 0] = 1.0
-        geno  = (geno - means) / stds
-        _np.nan_to_num(geno, copy=False)
-        geno  = _np.asarray(geno, dtype=self.dtype, order='F')  # (N × L)
-
-        # Project: Y = (I - C R) G  (C = Q, R = Q^T)
-        if self.C is not None:
-            tmpG = self.cov_R @ geno       # (p × L)
-            Y    = geno - (self.C @ tmpG)  # (N × L)
-            N_denom = float(self.N_eff)
-        else:
-            Y = geno
-            N_denom = float(self.nsamp)
-
-        # Left normalization to partial correlations
-        inv_sqrt_left = self.inv_sqrt_resvar_all[blk_start:blk_end]
-
-        # Allocate an accumulator for this block & per-bin mean-of-squares across V
-        # We'll accumulate sum over V of squared entries, then divide by V once.
-        # Layout note: acc is (L,), we'll reuse for each bin.
-        work = _np.empty((L, vchunk), dtype=self.dtype, order='F')  # reused
-        scale_cols = np.array(1.0 / float(N_denom - 1), dtype=self.dtype).item()
-
-        for k in range(self.nbins):
-            acc = _np.zeros(L, dtype=self.dtype, order='F')  # sum of squares across V
-
-            # Process V in chunks so work stays (L × vchunk)
-            for c0 in range(0, self.nvecs, vchunk):
-                c1 = min(self.nvecs, c0 + vchunk)
-                v  = c1 - c0
-
-                MB_k = _g_Xz2d[:, k*self.nvecs + c0 : k*self.nvecs + c1]  # (N × v), already right-normalized & projected
-
-                # work = Y^T @ MB_k  → (L × v)
-                gemm(1.0, Y, MB_k, c=work[:, :v], beta=0.0, trans_a=True, overwrite_c=1)
-                # left normalization + divide by N_eff-1
-                work[:, :v] *= inv_sqrt_left[:, None]
-                work[:, :v] *= scale_cols
-
-                # accumulate squared values along V
-                acc += _np.sum(work[:, :v] * work[:, :v], axis=1, dtype=self.dtype)
-
-            # write mean across V
-            _g_meansq[blk_start:blk_end, k] = (acc / float(self.nvecs)).astype(_g_meansq.dtype, copy=False)
-        return 1
-
 
     # ------------------ I/O helpers ------------------
     def _read_annot(self, annot_path):
@@ -753,117 +567,144 @@ class GenomewideLDScore:
     def _partition_index(self, snpidx, annot) -> list[np.ndarray]:
         return [snpidx[(annot[:, c] != 0)] for c in range(self.nbins)]
 
+
     # ------------------ main compute ------------------
     def _compute_ldscore(self):
         """
         Phase 0: precompute Var(M x_m) for all SNPs (or ones if no covariates) and cache 1/sqrt.
-        Phase 1: build X_k z from raw-standardized genotypes, scaling right columns by 1/sqrt(Var(M x_m)).
-                Parent then projects: Xz2d ← (I - QQ^T) Xz2d in-place (if covariates).
-        Phase 2: for each block, Y = M·G; scale left rows by 1/sqrt(Var(M g_j));
-                compute Y^T @ (MB_k), divide by N_eff, square, and average across V.
-        Baseline: subtract M_k / N_eff per bin (correlation null).
+        Phase 1: build X_k z from raw-standardized genotypes (C++), scaling right columns by 1/sqrt(Var(M x_m)).
+                Parent then (optionally) projects: Xz2d ← (I - QQ^T) Xz2d in-place (if covariates).
+        Phase 2: for each block (C++), Y = M·G; scale left rows by 1/sqrt(Var(M g_j));
+                compute Y^T @ (MB_k), divide by N_eff-1, square, and average across V.
+        Baseline: subtract M_k / N_denom per bin (correlation null).
         """
-        self.log._log(f"num_vecs: {self.nvecs}, num_workers: {self.nworkers}, step_size: {self.step_size}, seed: {self.root_seed}")
+        self.log._log(f"num_vecs: {self.nvecs}, step_size: {self.step_size}, seed: {self.root_seed}")
         self.log._log(f"Using {self.rand_dist} random vectors.")
         if self.C is not None:
             self.log._log(f"Covariate-adjusted partial correlations (N_eff={self.N_eff}, p={self.p_eff}).")
         else:
             self.log._log("No covariates: standard LD scores (squared correlations).")
-        
-        # Pick chunk sizes (you can also make them CLI flags)
+
+        # Pick chunk sizes
         self.v_chunk_xz   = self._auto_vchunk('Xz')
         self.v_chunk_xtxz = self._auto_vchunk('XtXz')
         self.log._log(f"Using V-chunk sizes: Phase1 (Xz)={self.v_chunk_xz}, Phase2 (XtXz)={self.v_chunk_xtxz}")
 
-        # ---- Phase 0: per-SNP residual variances and inverse sqrt (right side) ----
+        # Phase 0: per-SNP residual variances and inverse sqrt (right side)
         self.inv_sqrt_resvar_all = self._precompute_residual_variances()
 
         self.nblks = len(np.arange(self.nsnps)[::self.step_size])
         self._print_expected_mem('Xz')
         _rss_snapshot("pre-alloc", self.log)
 
-        Xz_input = []
-        XtXz_input = []
+        # Build block ranges
+        blocks = []
         for j in range(self.nblks):
-            idx_start = self.step_size*j
-            idx_end = self.nsnps if j==self.nblks-1 else self.step_size*(j+1)
-            annot_blk = self.annot[idx_start:idx_end]
-            Xz_input.append((j, idx_start, idx_end))
-            XtXz_input.append((idx_start, idx_end))
+            s = self.step_size * j
+            e = self.nsnps if j == self.nblks - 1 else self.step_size * (j + 1)
+            blocks.append((s, e))
 
         shm_xz = shm_ms = None
         try:
             # ---- allocate shared arrays ----
             itemsize = np.dtype(self.dtype).itemsize
-            xz_shape2d = (self.nsamp, self.nvecs * self.nbins)
-            ms_shape   = (self.nsnps, self.nbins)
+            xz_shape2d = (self.nsamp, self.nvecs * self.nbins)   # expects Fortran layout
+            ms_shape   = (self.nsnps, self.nbins)                 # C-layout is fine
 
+            # Xz2d: Fortran-contiguous; with SHM, we create then reshape with order='F'
             shm_xz = shared_memory.SharedMemory(create=True, size=int(np.prod(xz_shape2d)) * itemsize)
-            self.Xz2d = np.frombuffer(shm_xz.buf, dtype=self.dtype,
-                                    count=xz_shape2d[0]*xz_shape2d[1]).reshape(xz_shape2d, order='F')
+            Xz_buf = np.ndarray((np.prod(xz_shape2d),), dtype=self.dtype, buffer=shm_xz.buf)
+            self.Xz2d = Xz_buf.reshape(xz_shape2d, order='F')
             self.Xz2d.fill(0)
 
             shm_ms = shared_memory.SharedMemory(create=True, size=int(np.prod(ms_shape)) * itemsize)
-            self.meansq = np.ndarray(ms_shape, dtype=self.dtype, buffer=shm_ms.buf)
+            self.meansq = np.ndarray(ms_shape, dtype=self.dtype, buffer=shm_ms.buf)  # C-contig
             self.meansq.fill(0)
 
-            xz_locks = [mp.Lock() for _ in range(self.nbins)]
             _rss_snapshot("after SHM alloc", self.log)
 
-            # ---- Phase 1: build Xz ----
-            self._print_expected_mem('Xz')
-            with mp.Pool(self.nworkers, maxtasksperchild=4,
-                        initializer=_init_shared,
-                        initargs=(shm_xz.name, xz_shape2d, None, None,
-                                np.dtype(self.dtype).str, xz_locks)) as pool:
-                with tqdm(total=self.nblks, desc='Calculating Xz') as pbar:
-                    for _ in pool.imap_unordered(self._compute_Xz_blk, Xz_input):
-                        pbar.update()
-            
-            try:
-                ctypes.CDLL("libc.so.6").malloc_trim(0)
-            except Exception:
-                pass
+            bed_prefix = getattr(self.G, "filename", None)
+            if bed_prefix is None:
+                bed_prefix = getattr(self.G, "filepath", None)
+            if bed_prefix is None:
+                bed_prefix = getattr(self, "bed_prefix", None)
+            if bed_prefix is None:
+                # fallbacks: config fields or the object itself
+                bed_prefix = getattr(self, "geno", None) or getattr(self, "bfile", None) or self.G
 
-            _rss_snapshot("after Xz", self.log)
+            # Normalize to Path and strip optional ".bed"
+            p = Path(str(bed_prefix))
+            if p.suffix == ".bed":
+                p = p.with_suffix("")            # remove ".bed"
+
+            bed_prefix = str(p)                  # e.g., "/path/to/file" (no extension)
+            fam_path   = str(p.with_suffix(".fam"))
+
+            row_sel = self.row_sel if self.row_sel is not None else None
+            ddof    = int(self.ddof)
+
+            # ---- Phase 1: build Xz (C++) ----
+            for (s, e) in blocks:
+                annot_blk = np.ascontiguousarray(self.annot[s:e].astype(self.dtype, copy=False))
+                inv_right = np.ascontiguousarray(self.inv_sqrt_resvar_all[s:e].astype(self.dtype, copy=False))
+
+                gwldcore.phase1_compute_Xz_bed(
+                    bed_prefix=bed_prefix,
+                    fam_path=fam_path,
+                    blk_start=int(s), blk_end=int(e),
+                    row_sel=row_sel,
+                    ddof=ddof,
+                    annot_blk=annot_blk,              # (L x B), C-contig
+                    inv_right=inv_right,              # (L,),    C-contig
+                    nvecs=int(self.nvecs),
+                    vchunk=int(self.v_chunk_xz),
+                    rand_dist=self.rand_dist,
+                    seed=self.root_seed,              # <-- correct kw name
+                    Xz2d=self.Xz2d,                   # (N x B*V), F-contig
+                    project_right=False,
+                    C=(self.C if self.C is not None else None),
+                    R=(self.cov_R if self.C is not None else None)
+                )
+
             self.Xz_time = utils._get_time()
-            self.log._log("Calculation of Xz (for each partition) completed. Runtime: "+format(self.Xz_time - self.start_time, '.3f')+" s")
+            _rss_snapshot("after Xz", self.log)
+            self.log._log("Calculation of Xz (for each partition) completed. Runtime: " +
+                        format(self.Xz_time - self.start_time, '.3f') + " s")
 
-            # ---- project right: Xz2d ← (I - QQ^T) Xz2d ----
-            if self.C is not None:
-                self.log._log("Projecting Xz onto covariate-orthogonal space: Xz ← (I - QQ^T) Xz (in-place)")
-                chunk_bins = 4
-                for b0 in range(0, self.nbins, chunk_bins):
-                    b1 = min(self.nbins, b0 + chunk_bins)
-                    c0 = b0 * self.nvecs
-                    c1 = b1 * self.nvecs
-                    X = self.Xz2d[:, c0:c1]           # (N × chunk)
-                    tmp = self.cov_R @ X              # (p × chunk)
-                    X  -= self.C @ tmp                # in-place
-                    del tmp, X
-                _rss_snapshot("after in-place projection of Xz", self.log)
-
-            # ---- Phase 2: fill meansq ----
+            # ---- Phase 2: XtXz (C++) ----
             self._print_expected_mem('XtXz')
-            with mp.Pool(self.nworkers, maxtasksperchild=4,
-                        initializer=_init_shared,
-                        initargs=(shm_xz.name, xz_shape2d, shm_ms.name, ms_shape,
-                                np.dtype(self.dtype).str, xz_locks)) as pool:
-                with tqdm(total=self.nblks, desc='Calculating XtXz') as pbar:
-                    for _ in pool.imap_unordered(self._compute_XtXz_blk, XtXz_input):
-                        pbar.update()
+            for (s, e) in blocks:
+                inv_left = np.ascontiguousarray(self.inv_sqrt_resvar_all[s:e].astype(self.dtype, copy=False))
+                N_denom  = float(self.N_eff if self.C is not None else self.nsamp)
+
+                gwldcore.phase2_compute_XtXz_bed(
+                    bed_prefix=bed_prefix,
+                    fam_path=fam_path,
+                    blk_start=int(s), blk_end=int(e),
+                    row_sel=row_sel,
+                    ddof=ddof,
+                    inv_left=inv_left,                 # (L,), C-contig
+                    nvecs=int(self.nvecs),
+                    vchunk=int(self.v_chunk_xtxz),
+                    Xz2d=self.Xz2d,                    # (N x B*V), F-contig
+                    meansq=self.meansq,                # (M x B),   C-contig
+                    C=(self.C if self.C is not None else None),
+                    R=(self.cov_R if self.C is not None else None),
+                    N_denom=int(N_denom)
+                )
+
             try:
                 ctypes.CDLL("libc.so.6").malloc_trim(0)
             except Exception:
                 pass
-
 
             _rss_snapshot("after XtXz", self.log)
             self.XtXz_time = utils._get_time()
-            self.log._log("Calculation of XtXz (for each partition) completed. Runtime: "+format(self.XtXz_time - self.Xz_time, '.3f')+" s")
+            self.log._log("Calculation of XtXz (for each partition) completed. Runtime: " +
+                        format(self.XtXz_time - self.Xz_time, '.3f') + " s")
 
-            # ---- Baseline subtraction: classic correlation null M_k / N_eff ----
-            N_denom = float(self.N_eff-1.0 if self.C is not None else self.nsamp-self.ddof)
+            # ---- Baseline subtraction: classic correlation null M_k / N_denom ----
+            N_denom = float(self.N_eff - 1.0 if self.C is not None else self.nsamp - self.ddof)
             self.log._log("Applying correlation null: subtracting M_k / N_denom per bin.")
             self.meansq -= (self.nsnps_bin / N_denom).astype(self.meansq.dtype, copy=False)[None, :]
 
@@ -876,14 +717,13 @@ class GenomewideLDScore:
             else:
                 self.snpdf = self.snplist[['CHR','SNP','BP']].copy()
                 self.snpdf.columns = snpcols
-            
+
             scores_df = pd.DataFrame(self.gwldscore, columns=self.l2cols)
             out_df = pd.concat([self.snpdf, scores_df], axis=1)
             out_df.to_csv(f'{self.outpath}.gw.ldscore.gz', index=False, compression='gzip', sep='\t', float_format='%.6f')
 
             # ---- Post-run stats ----
             try:
-                # Per-bin summaries
                 desc = scores_df.describe(percentiles=[0.25, 0.5, 0.75]).loc[['count','mean','std','min','25%','50%','75%','max']]
                 self.log._log("Per-bin LD score summary (count/mean/std/min/25%/50%/75%/max):")
                 with pd.option_context('display.width', 140, 'display.max_columns', None, 'display.float_format', '{:.6f}'.format):
@@ -908,38 +748,33 @@ class GenomewideLDScore:
 
             except Exception as e:
                 self.log._log(f"[warn] Failed to compute summary stats / correlation: {e}")
-            
-        # -------------------------------------------------------------------
 
             self.end_time = utils._get_time()
             self.log._log(f"Calculation of genome-wide LD score ended at "+utils._get_timestr(self.end_time))
-            self.runtime=self.end_time - self.start_time
-            self.log._log("Runtime: "+format(self.runtime, '.3f')+f" s ({self.runtime//3600} hr {(self.runtime%3600)//60} m {(self.runtime%60):.3f} s)")
+            self.runtime = self.end_time - self.start_time
+            self.log._log("Runtime: "+format(self.runtime, '.3f')+
+                        f" s ({self.runtime//3600} hr {(self.runtime%3600)//60} m {(self.runtime%60):.3f} s)")
             self.log._save_log(self.outpath+".gw.log")
+
         except KeyboardInterrupt:
-            self.log._log("KeyboardInterrupt received — terminating workers and cleaning shared memory.")
+            self.log._log("KeyboardInterrupt received — terminating and cleaning shared memory.")
             raise
         finally:
-            # ensure NO numpy views remain before closing SHM
             try:
                 self.Xz2d = None
                 self.meansq = None
                 gc.collect()
             finally:
                 if shm_xz is not None:
-                    try:
-                        shm_xz.close()
-                    except BufferError as e:
-                        self.log._log(f"[warn] shm_xz.close BufferError: {e}. Unlinking anyway.")
+                    try: shm_xz.close()
+                    except BufferError as e: self.log._log(f"[warn] shm_xz.close BufferError: {e}. Unlinking anyway.")
                     finally:
                         try: shm_xz.unlink()
                         except FileNotFoundError: pass
                         except Exception as e: self.log._log(f"[warn] shm_xz.unlink: {e}")
                 if shm_ms is not None:
-                    try:
-                        shm_ms.close()
-                    except BufferError as e:
-                        self.log._log(f"[warn] shm_ms.close BufferError: {e}. Unlinking anyway.")
+                    try: shm_ms.close()
+                    except BufferError as e: self.log._log(f"[warn] shm_ms.close BufferError: {e}. Unlinking anyway.")
                     finally:
                         try: shm_ms.unlink()
                         except FileNotFoundError: pass
@@ -948,7 +783,7 @@ class GenomewideLDScore:
     
     def _print_expected_mem(self, phase, block_len=None, k_max=None):
         b = np.dtype(self.dtype).itemsize
-        B, N, M, V, S, W = self.nbins, self.nsamp, self.nsnps, self.nvecs, self.step_size, self.nworkers
+        B, N, M, V, S = self.nbins, self.nsamp, self.nsnps, self.nvecs, self.step_size
         L = min(S, M)
 
         xz_bytes = N * (V * B) * b
@@ -959,9 +794,9 @@ class GenomewideLDScore:
         geno_blk = N * L * b
         per_worker = geno_blk + (L * min(vchunk, V) * b)  # chunked temp
 
-        total_est = xz_bytes + ms_bytes + W * per_worker
+        total_est = xz_bytes + ms_bytes
         self.log._log(
-            f"[expected {phase}] dtype={self.dtype}, B={B}, N={N}, M={M}, V={V}, S={S}, W={W} "
+            f"[expected {phase}] dtype={self.dtype}, B={B}, N={N}, M={M}, V={V}, S={S} "
             f"→ parent(Xz2d+meansq)≈{_bytes_human(xz_bytes + ms_bytes)}, "
             f"per-worker temps≈{_bytes_human(per_worker)}, "
             f"total≈{_bytes_human(total_est)}"

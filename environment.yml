@@ -1,13 +1,21 @@
 name: summit
 channels:
-  - defaults
   - conda-forge
 dependencies:
-  - python>=3.9
-  - numpy>=1.19.0
+  # runtime
+  - python=3.12
+  - numpy>=1.22
   - pandas>=1.5
   - scipy>=1.9
   - tqdm>=4.64
+  - bed-reader>=1.0    # conda package, prebuilt
+
+  # build toolchain for the C++ extension
+  - cmake>=3.24
+  - ninja
+  - pybind11>=2.12
+  - scikit-build-core>=0.5
+  - libopenblas
+  - pkg-config
+
   - pip
-  - pip:
-    - bed-reader>=1.0

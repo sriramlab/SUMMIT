@@ -151,7 +151,7 @@ if __name__ == '__main__':
 
     if (args.geno is not None):
         gwld = GenomewideLDScore(bed_path=args.geno, annot_path=args.annot, out_path=args.out, covar_path=args.covar, rand_dist=args.rand_dist,\
-            log=log, num_vecs=args.nvecs, num_workers=args.nworkers, step_size=args.step_size, seed=args.seed, verbose=args.verbose, \
+            log=log, num_vecs=args.nvecs, step_size=args.step_size, seed=args.seed, verbose=args.verbose, \
                 dtype = args.dtype, num_threads=args.num_threads, rand_samp=args.rand_samp)
         gwld._compute_ldscore()
     elif (args.h2 is not None):
