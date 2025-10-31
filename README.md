@@ -7,49 +7,52 @@
 2. heritability of phenotypes from summary statistics
 3. genetic correlation from summary statistics
 
-## How to get started
-You may set up ```summit``` using Conda (Anaconda3 or Miniconda) or virtual environment and pip (Miniconda or Python3)
+## Quick Start (Conda recommended)
 
-### Using Conda (Anaconda3 or Miniconda)
-1. Clone the repository
+### 0. Requirements
+- Linux or macOS
+- Anaconda3 / Miniconda
+- C++17 compiler (e.g., `g++` on Linux; Xcode CLT on macOS)
+
+### 1. Clone the repository
 ```bash
 git clone https://github.com/bronsonj98/SUMMIT.git
-cd SUMMIT
+cd summit
 ```
 
-2. Create the conda environment
+### 2. Create a virtual environment
 ```bash
 conda env create -f environment.yml
-```
-
-3. Activate the conda environment
-```bash
 conda activate summit
+python -m pip install -U pip
 ```
 
-### Using Virtual Environment and Pip (Miniconda or Python3)
-1. Clone the repository
+### 3. Locate OpenBLAS and tell CMake where it is
+Find the OpenBLAS shared library inside the env (one of these patterns will match):
 ```bash
-git clone https://github.com/bronsonj98/SUMMIT.git
-cd SUMMIT
+ls $CONDA_PREFIX/lib/libopenblasp-*.so      # Linux (conda-forge)
+ls $CONDA_PREFIX/lib/libopenblas*.so        # Linux (fallback)
+# macOS:
+ls $CONDA_PREFIX/lib/libopenblasp-*.dylib
+```
+Export an env var to that exact file:
+```bash
+# Linux example:
+export OBLAS_SO="$CONDA_PREFIX/lib/libopenblasp-r0.3.30.so"
+# macOS example:
+# export OBLAS_SO="$CONDA_PREFIX/lib/libopenblasp-r0.3.30.dylib"
 ```
 
-2. Create a virtual environment
+### 4. Build & install
 ```bash
-python -m venv summit
+pip install -v . --no-build-isolation \
+  --config-settings=cmake.define.PYBIND11_FINDPYTHON=ON \
+  --config-settings=cmake.define.USER_BLAS_LIB=$OBLAS_SO
 ```
 
-3. Activate the virtual environment
+You can check whether the ```gwldcore``` module has been successfully built or not by running:
 ```bash
-# on Windows
-summit\Scripts\activate
-# on macOS/Linux
-source summit/bin/activate
-```
-
-4. Install dependencies
-```bash
-pip install -r requirements.txt
+python -c "import gwldcore, numpy; print('gwldcore OK; numpy', numpy.__version__)"
 ```
 
 ## How to use ```summit```
