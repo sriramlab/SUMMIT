@@ -12,6 +12,7 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
+#include <omp.h>
 
 namespace py = pybind11;
 
@@ -209,40 +210,48 @@ static std::vector<int> parse_row_sel(py::object row_sel_obj, int64_t N_total) {
 }
 
 // -------------------------- Phase 1: compute_Xz ------------------------------
-
 template <typename T>
-void phase1_compute_Xz_bed_impl(const std::string &bed_prefix,
-                                const std::string &fam_path,
-                                int blk_start, int blk_end,
-                                py::object row_sel_obj,
-                                int ddof,
-                                py::array_t<T, py::array::c_style | py::array::forcecast> annot_blk, // (L x B)
-                                py::array_t<T, py::array::c_style | py::array::forcecast> inv_right, // (L,)
-                                int nvecs,
-                                int vchunk,
-                                const std::string &rand_dist,
-                                py::object seed_obj, // None or int
-                                py::array_t<T, py::array::f_style | py::array::forcecast> Xz2d, // (N x (B*V))
-                                bool /*project_right*/,
-                                py::object /*C_opt*/, py::object /*R_opt*/) {
+void phase1_compute_Xz_bed_chunk_impl(const std::string &bed_prefix,
+                                      const std::string &fam_path,
+                                      int blk_start, int blk_end,
+                                      py::object row_sel_obj,
+                                      int ddof,
+                                      py::array_t<T, py::array::c_style | py::array::forcecast> annot_blk, // (L x B)
+                                      py::array_t<T, py::array::c_style | py::array::forcecast> inv_right,  // (L,)
+                                      int v_start,            // global V offset
+                                      int v_count,            // V cols in this chunk
+                                      int kmax_hint,          // ALWAYS trusted
+                                      const std::string &rand_dist,
+                                      py::object seed_obj,    // None or int
+                                      py::array_t<T, py::array::f_style | py::array::forcecast> Xz2d_chunk, // (N x (B*v_count))
+                                      bool /*project_right*/ = false,
+                                      py::object /*C_opt*/ = py::none(),
+                                      py::object /*R_opt*/ = py::none()) {
+    // If Kmax==0 for this block, nothing contributes; leave Xz2d_chunk unchanged.
+    if (kmax_hint == 0) return;
+
     const std::string bed_path = bed_prefix + ".bed";
     const std::string bim_path = bed_prefix + ".bim";
     const int64_t N_total = count_lines(fam_path);
     const int64_t M_total = count_lines(bim_path);
     if (blk_end > M_total) throw std::runtime_error("blk_end exceeds #SNPs in BIM");
 
+    if (kmax_hint < 0) throw std::runtime_error("kmax_hint must be >= 0");
+
+    // Selected rows (individuals)
     std::vector<int> rows = parse_row_sel(row_sel_obj, N_total);
+
+    // Read & standardize block -> Geno (N x L), col-major
     int N = 0, L = 0;
-    std::vector<T> Geno; // N x L, col-major
+    std::vector<T> Geno; // (N x L)
     read_block_standardized<T>(bed_path, fam_path, blk_start, blk_end, rows, ddof, Geno, N, L);
     if (L == 0) return;
 
-    // annot_blk: (L x B)
+    // annot_blk: (L x B), row-major; inv_right: (L,)
     auto Ainfo = annot_blk.request();
     auto Iinfo = inv_right.request();
     if (Ainfo.ndim != 2) throw std::runtime_error("annot_blk must be 2D (L x B)");
     if (Iinfo.ndim != 1) throw std::runtime_error("inv_right must be 1D (L,)");
-
     const int B = (int)Ainfo.shape[1];
     if ((int)Ainfo.shape[0] != L) throw std::runtime_error("annot_blk.shape[0] != L");
     if ((int)Iinfo.shape[0] != L) throw std::runtime_error("inv_right.shape[0] != L");
@@ -250,117 +259,143 @@ void phase1_compute_Xz_bed_impl(const std::string &bed_prefix,
     const T *ann = static_cast<const T*>(Ainfo.ptr);
     const T *inv = static_cast<const T*>(Iinfo.ptr);
 
-    // Build per-bin indices and scales
-    std::vector<std::vector<int>> idxs(B);
-    std::vector<std::vector<T>>   scales(B);
-    for (int k = 0; k < B; ++k) {
-        // collect indices with nonzero annotation
-        for (int i = 0; i < L; ++i) {
-            T ak = ann[(size_t)i * (size_t)B + (size_t)k];
-            if (ak != T(0)) {
-                idxs[k].push_back(i);
-            }
-        }
-        auto &bi = idxs[k];
-        auto &sk = scales[k];
-        sk.resize(bi.size());
-        for (size_t c = 0; c < bi.size(); ++c) {
-            int i = bi[c];
-            T ak = ann[(size_t)i * (size_t)B + (size_t)k];
-            sk[c] = inv[i] * std::sqrt(ak);
-        }
-    }
-
-    // Xz2d: (N x (B*V)), Fortran (col-major)
-    auto Xinfo = Xz2d.request();
-    if (Xinfo.ndim != 2) throw std::runtime_error("Xz2d must be 2D");
-    if ((int)Xinfo.shape[0] != N || (int)Xinfo.shape[1] != B * nvecs)
-        throw std::runtime_error("Xz2d shape mismatch");
+    // Xz2d_chunk: (N x (B*v_count)), Fortran (col-major), accumulated across SNP blocks by caller
+    auto Xinfo = Xz2d_chunk.request();
+    if (Xinfo.ndim != 2) throw std::runtime_error("Xz2d_chunk must be 2D");
+    if ((int)Xinfo.shape[0] != N || (int)Xinfo.shape[1] != B * v_count)
+        throw std::runtime_error("Xz2d_chunk shape must be (N, B*v_count)");
     T *Xptr = static_cast<T*>(Xinfo.ptr);
-    const int ldc = N;
+    const int ldc = N;  // leading dimension of C is full N
 
-    // RNG seeding per (block, v0)
+    // RNG seeded by (root, block_start, v_start) → chunk-size invariance
     const bool have_root = !seed_obj.is_none();
     uint64_t root_seed = have_root ? seed_obj.cast<uint64_t>() : std::random_device{}();
-
-    // Generate Z for each V-chunk (L x Vt), then slice rows for each bin
-    std::vector<T> Z; Z.reserve((size_t)L * std::min(vchunk, nvecs)); // col-major
-    std::mt19937_64 rng;
+    std::mt19937_64 rng(make_seed(root_seed, /*block=*/blk_start, /*v0=*/v_start));
     std::normal_distribution<T> gN(0, (T)1);
 
     const bool is_rademacher = (rand_dist == "rademacher");
     const bool is_normal     = (rand_dist == "normal");
     const bool is_spherical  = (rand_dist == "spherical");
 
-    for (int v0 = 0; v0 < nvecs; v0 += vchunk) {
-        int Vt = std::min(vchunk, nvecs - v0);
+    // --------- Reusable buffers ----------
+    // Per-bin working buffers (size L; we use the first K entries)
+    std::vector<int> idx_buf((size_t)L);
+    std::vector<T>   scale_buf((size_t)L);
 
-        // seed
-        rng.seed(make_seed(root_seed, /*block=*/blk_start, v0));
-
-        // Z: (L x Vt), col-major
-        Z.assign((size_t)L * Vt, T(0));
-        for (int c = 0; c < Vt; ++c) {
-            if (is_rademacher) {
+    // Z: (L x v_count), col-major (same for all bins)
+    std::vector<T> Z((size_t)L * (size_t)v_count, T(0));
+    for (int c = 0; c < v_count; ++c) {
+        if (is_rademacher) {
+            for (int r = 0; r < L; ++r) {
+                int s = (rng() & 1) ? +1 : -1;
+                Z[(size_t)r + (size_t)c * (size_t)L] = (T)s;
+            }
+        } else {
+            long double ss = 0.0L;
+            for (int r = 0; r < L; ++r) {
+                T z = gN(rng);
+                Z[(size_t)r + (size_t)c * (size_t)L] = z;
+                if (is_spherical) ss += (long double)z * (long double)z;
+            }
+            if (is_spherical) {
+                T scale = (ss > 0.0L) ? static_cast<T>(std::sqrt((long double)L / ss)) : T(1);
                 for (int r = 0; r < L; ++r) {
-                    int s = (rng() & 1) ? +1 : -1;
-                    Z[(size_t)r + (size_t)c * (size_t)L] = (T)s;
-                }
-            } else {
-                // normal for both 'normal' and 'spherical'
-                long double ss = 0.0L;
-                for (int r = 0; r < L; ++r) {
-                    T z = gN(rng);
-                    Z[(size_t)r + (size_t)c * (size_t)L] = z;
-                    if (is_spherical) { ss += (long double)z * (long double)z; }
-                }
-                if (is_spherical) {
-                    T scale = (ss > 0.0L) ? static_cast<T>(std::sqrt((long double)L / ss)) : T(1);
-                    for (int r = 0; r < L; ++r) {
-                        Z[(size_t)r + (size_t)c * (size_t)L] *= scale;
-                    }
+                    Z[(size_t)r + (size_t)c * (size_t)L] *= scale;
                 }
             }
-        }
-
-        // Work buffers per bin:
-        for (int k = 0; k < B; ++k) {
-            const auto &bi = idxs[k];
-            int K = (int)bi.size();
-            if (K == 0) continue;
-
-            // Acol: (N x K), col-major; copy Geno[:, bi] with scaling
-            std::vector<T> Acol((size_t)N * K);
-            for (int c = 0; c < K; ++c) {
-                int snp = bi[c];
-                T s = scales[k][(size_t)c];
-                const T *colG = Geno.data() + (size_t)snp * (size_t)N;
-                T *dst = Acol.data() + (size_t)c * (size_t)N;
-                for (int r = 0; r < N; ++r) dst[r] = colG[r] * s;
-            }
-
-            // Bcol: (K x Vt), col-major; copy rows bi from Z
-            std::vector<T> Bcol((size_t)K * Vt);
-            for (int c = 0; c < Vt; ++c) {
-                const T *zc = Z.data() + (size_t)c * (size_t)L;
-                T *dst = Bcol.data() + (size_t)c * (size_t)K;
-                for (int r = 0; r < K; ++r) {
-                    dst[r] = zc[bi[r]];
-                }
-            }
-
-            // C points into Xz2d at columns [k*nvecs + v0 : ... + Vt)
-            T *C = Xptr + (size_t)(k * nvecs + v0) * (size_t)N;
-
-            const int lda = N, ldb = K;
-            const T alpha = T(1), beta = T(1);
-            gemm_col_major_nn<T>(/*m=*/N, /*n=*/Vt, /*k=*/K,
-                                 Acol.data(), lda,
-                                 Bcol.data(), ldb,
-                                 C, /*ldc=*/ldc,
-                                 alpha, beta);
         }
     }
+
+    // N-tiling size by precision
+    const int N_TILE = std::is_same_v<T,float> ? 128 : 64;
+
+    // Pre-allocate buffers based on trusted Kmax (no per-bin realloc)
+    const int Kmax = kmax_hint;
+    std::vector<T> Bcol((size_t)Kmax * (size_t)v_count); // we'll pack tight K×v_count into the front
+
+    for (int k = 0; k < B; ++k) {
+        // Build idx_buf & scale_buf for this bin
+        int K = 0;
+        for (int i = 0; i < L; ++i) {
+            T ak = ann[(std::size_t)i * (std::size_t)B + (std::size_t)k];
+            if (ak != T(0)) {
+                idx_buf[(size_t)K]   = i;
+                scale_buf[(size_t)K] = inv[i] * std::sqrt(ak);
+                ++K;
+            }
+        }
+        if (K == 0) continue; // nothing to do for this bin
+
+        // Pack Bcol tightly as (K x v_count) into the FRONT of the reusable buffer
+        for (int c = 0; c < v_count; ++c) {
+            const T *zc = Z.data() + (std::size_t)c * (std::size_t)L;
+            T *dst_col  = Bcol.data() + (std::size_t)c * (std::size_t)K;  // tight stride K (not Kmax)
+            for (int r = 0; r < K; ++r) {
+                dst_col[r] = zc[idx_buf[(size_t)r]];
+            }
+        }
+
+        // Base pointer for C columns of this bin
+        T *C_base = Xptr + (std::size_t)(k * v_count) * (std::size_t)N;
+
+        // ---------------- N-tiling with OpenMP over row tiles ----------------
+        #ifdef _OPENMP
+        #pragma omp parallel
+        {
+            // Per-thread scratch for A_tile; capacity Nt*Kmax (Nt<=N_TILE)
+            std::vector<T> A_tile((size_t)N_TILE * (size_t)Kmax);
+
+            #pragma omp for schedule(static)
+            for (int n0 = 0; n0 < N; n0 += N_TILE) {
+                const int Nt = std::min(N - n0, N_TILE);
+
+                // Pack A_tile: (Nt x K), col-major, tight
+                for (int c = 0; c < K; ++c) {
+                    const int snp = idx_buf[(size_t)c];
+                    const T   s   = scale_buf[(size_t)c];
+                    const T *src  = Geno.data() + (std::size_t)snp * (std::size_t)N + (std::size_t)n0;
+                    T *dst       = A_tile.data() + (std::size_t)c   * (std::size_t)Nt;
+                    for (int r = 0; r < Nt; ++r) dst[r] = src[r] * s;
+                }
+
+                // GEMM on this row tile
+                T *C_tile = C_base + (std::size_t)n0;
+                const int lda = Nt;   // A_tile leading dimension
+                const int ldb = K;    // Bcol packed tightly
+                const int ldc_tile = N;
+                const T alpha = T(1), beta = T(1);
+                gemm_col_major_nn<T>(/*m=*/Nt, /*n=*/v_count, /*k=*/K,
+                                     /*A=*/A_tile.data(), /*lda=*/lda,
+                                     /*B=*/Bcol.data(),   /*ldb=*/ldb,
+                                     /*C=*/C_tile,        /*ldc=*/ldc_tile,
+                                     alpha, beta);
+            } // n0
+        } // parallel
+        #else
+        // Fallback: single-threaded N-tiling
+        {
+            std::vector<T> A_tile((size_t)N_TILE * (size_t)Kmax);
+            for (int n0 = 0; n0 < N; n0 += N_TILE) {
+                const int Nt = std::min(N - n0, N_TILE);
+                for (int c = 0; c < K; ++c) {
+                    const int snp = idx_buf[(size_t)c];
+                    const T   s   = scale_buf[(size_t)c];
+                    const T *src  = Geno.data() + (std::size_t)snp * (std::size_t)N + (std::size_t)n0;
+                    T *dst       = A_tile.data() + (std::size_t)c   * (std::size_t)Nt;
+                    for (int r = 0; r < Nt; ++r) dst[r] = src[r] * s;
+                }
+                T *C_tile = C_base + (std::size_t)n0;
+                const int lda = Nt, ldb = K, ldc_tile = N;
+                const T alpha = T(1), beta = T(1);
+                gemm_col_major_nn<T>(Nt, v_count, K,
+                                     A_tile.data(), lda,
+                                     Bcol.data(),   ldb,
+                                     C_tile,        ldc_tile,
+                                     alpha, beta);
+            }
+        }
+        #endif
+    } // bins
 }
 
 // -------------------------- Phase 2: compute_XtXz ----------------------------
@@ -384,15 +419,17 @@ void phase2_compute_XtXz_bed_impl(const std::string &bed_prefix,
     const int64_t M_total = count_lines(bim_path);
     if (blk_end > M_total) throw std::runtime_error("blk_end exceeds #SNPs in BIM");
 
+    // Parse rows to keep
     std::vector<int> rows = parse_row_sel(row_sel_obj, N_total);
 
+    // Read & standardize [blk_start:blk_end) → Geno (N x L), col-major
     int N = 0, L = 0;
-    std::vector<T> Geno; // (N x L) col-major, standardized raw
+    std::vector<T> Geno; // (N x L)
     read_block_standardized<T>(bed_path, fam_path, blk_start, blk_end, rows, ddof, Geno, N, L);
     if (L == 0) return;
 
-    // Possibly project: Y = Geno - C @ (R @ Geno), with C (N x p), R (p x N)
-    std::vector<T> Y = Geno; // start as Geno
+    // Optional projection: Y = Geno - C @ (R @ Geno)
+    std::vector<T> Y = Geno; // start from Geno
     if (!C_opt.is_none() && !R_opt.is_none()) {
         py::array_t<T, py::array::f_style | py::array::forcecast> C = C_opt.cast<py::array_t<T, py::array::f_style | py::array::forcecast>>();
         py::array_t<T, py::array::f_style | py::array::forcecast> R = R_opt.cast<py::array_t<T, py::array::f_style | py::array::forcecast>>();
@@ -406,17 +443,17 @@ void phase2_compute_XtXz_bed_impl(const std::string &bed_prefix,
         const T *Cptr = static_cast<const T*>(Ci.ptr);
         const T *Rptr = static_cast<const T*>(Ri.ptr);
 
-        // tmpG = R @ Geno   → (p x L)
-        std::vector<T> tmpG((size_t)p * L, T(0));
+        // tmpG = R @ Geno   (p x L)
+        std::vector<T> tmpG((size_t)p * (size_t)L, T(0));
         gemm_col_major_nn<T>(/*m=*/p, /*n=*/L, /*k=*/N,
-                             /*A=R*/ Rptr, /*lda=*/p,
+                             /*A=*/Rptr, /*lda=*/p,
                              /*B=*/Geno.data(), /*ldb=*/N,
                              /*C=*/tmpG.data(), /*ldc=*/p,
                              /*alpha=*/T(1), /*beta=*/T(0));
-        // Y = Geno - C @ tmpG
-        // We do: Y ← (-1)*C@tmpG + (1)*Y
+
+        // Y ← Geno - C @ tmpG
         gemm_col_major_nn<T>(/*m=*/N, /*n=*/L, /*k=*/p,
-                             /*A=C*/ Cptr, /*lda=*/N,
+                             /*A=*/Cptr, /*lda=*/N,
                              /*B=*/tmpG.data(), /*ldb=*/p,
                              /*C=*/Y.data(), /*ldc=*/N,
                              /*alpha=*/T(-1), /*beta=*/T(1));
@@ -430,62 +467,132 @@ void phase2_compute_XtXz_bed_impl(const std::string &bed_prefix,
     // Xz2d: (N x (B*V)), F-contiguous
     auto Xi = Xz2d.request();
     if (Xi.ndim != 2) throw std::runtime_error("Xz2d must be 2D");
+    if ((int)Xi.shape[0] != N) throw std::runtime_error("Xz2d row count must equal N");
     T *Xptr = static_cast<T*>(Xi.ptr);
     const int BV = (int)Xi.shape[1];
-    if ((int)Xi.shape[0] != N || (BV % nvecs) != 0)
-        throw std::runtime_error("Xz2d shape mismatch for N and V");
+    if ((BV % nvecs) != 0) throw std::runtime_error("Xz2d column count must be a multiple of nvecs");
     const int B = BV / nvecs;
 
-    // meansq: (M x B), C-contiguous
+    // meansq: (M x B), C-contiguous, we will write rows [blk_start:blk_end)
     auto Mi = meansq.request();
     if (Mi.ndim != 2) throw std::runtime_error("meansq must be 2D");
     if ((int)Mi.shape[1] != B) throw std::runtime_error("meansq.shape[1] != nbins");
     T *Mptr = static_cast<T*>(Mi.ptr);
     const int M = (int)Mi.shape[0];
     if (blk_end > M) throw std::runtime_error("meansq rows smaller than SNP count");
-    const T scale_cols = T(1) / T(N_denom - 1);
 
-    // For each bin, accumulate over V in chunks: Work = Y^T @ MB_k  (L x v)
+    // -------- Pre-scale Y columns once: s[i] = inv_left[i] / (N_denom - 1) --------
+    T denom = T(N_denom) - T(1);
+    if (denom <= T(0)) denom = T(1); // safeguard
+    for (int i = 0; i < L; ++i) {
+        const T s = inv[i] / denom;
+        T *col = Y.data() + (size_t)i * (size_t)N;
+        for (int r = 0; r < N; ++r) col[r] *= s;
+    }
+
+    // -------- N-tiling & per-thread reductions setup --------
+    const int N_TILE = std::is_same_v<T,float> ? 128 : 64;    // row tile
+    const int V_COL_TILE = std::is_same_v<T,float> ? 64 : 32; // per-thread column tile to bound scratch
+
+    // For each bin, accumulate across all V in chunks of vchunk
     for (int k = 0; k < B; ++k) {
+        // Per-bin accumulator over i=0..L-1
         std::vector<T> acc((size_t)L, T(0));
 
         for (int c0 = 0; c0 < nvecs; c0 += vchunk) {
             const int v = std::min(vchunk, nvecs - c0);
+            if (v <= 0) break;
 
-            // MB_k points to Xz2d columns [k*nvecs + c0 : ... + v)
-            const T *MB = Xptr + (size_t)(k * nvecs + c0) * (size_t)N;
-            const int ldb = N;
+            // Parallelize over column tiles; each thread keeps its own local accumulators
+            #ifdef _OPENMP
+            #pragma omp parallel
+            {
+                std::vector<T> acc_thr((size_t)L, T(0));                        // per-thread row accumulator
+                std::vector<T> Work_local((size_t)L * (size_t)V_COL_TILE, T(0)); // per-thread (L x vt) scratch
 
-            // Work (L x v), col-major
-            std::vector<T> Work((size_t)L * v);
+                #pragma omp for schedule(static)
+                for (int jc = 0; jc < v; jc += V_COL_TILE) {
+                    const int vt = std::min(V_COL_TILE, v - jc);
 
-            // Work = Y^T @ MB_k
-            gemm_col_major_tn<T>(/*m=*/L, /*n=*/v, /*k=*/N,
-                                 /*A=Y*/ Y.data(), /*lda=*/N,
-                                 /*B=*/MB, /*ldb=*/ldb,
-                                 /*C=*/Work.data(), /*ldc=*/L,
-                                 /*alpha=*/T(1), /*beta=*/T(0));
+                    // zero the active portion of Work_local
+                    std::fill(Work_local.begin(), Work_local.begin() + (size_t)L * (size_t)vt, T(0));
 
-            // Left normalization & divide by (N_denom - 1), then accumulate squares
-            for (int col = 0; col < v; ++col) {
-                T *wcol = Work.data() + (size_t)col * (size_t)L;
-                for (int i = 0; i < L; ++i) {
-                    T z = wcol[i] * inv[i] * scale_cols;
-                    wcol[i] = z;
+                    // Sum across N tiles: Work_local = Y^T_tile_sum @ MB_tile
+                    for (int n0 = 0; n0 < N; n0 += N_TILE) {
+                        const int Nt = std::min(N - n0, N_TILE);
+
+                        // A = Y_tile (Nt x L), used with Transpose → (L x Nt); lda = N
+                        const T *A_ptr = Y.data() + (size_t)n0;
+
+                        // B = MB_tile (Nt x vt), NoTrans; ldb = N
+                        const T *B_ptr = Xptr
+                                       + (size_t)((k * nvecs) + (c0 + jc)) * (size_t)N
+                                       + (size_t)n0;
+
+                        // C = Work_local (L x vt), ldc = L
+                        gemm_col_major_tn<T>(/*m=*/L, /*n=*/vt, /*k=*/Nt,
+                                             /*A=*/A_ptr, /*lda=*/N,
+                                             /*B=*/B_ptr, /*ldb=*/N,
+                                             /*C=*/Work_local.data(), /*ldc=*/L,
+                                             /*alpha=*/T(1), /*beta=*/T(1));
+                    }
+
+                    // Accumulate squares into acc_thr
+                    for (int col = 0; col < vt; ++col) {
+                        const T *wcol = Work_local.data() + (size_t)col * (size_t)L;
+                        for (int i = 0; i < L; ++i) {
+                            const T z = wcol[i];
+                            acc_thr[(size_t)i] += z * z;
+                        }
+                    }
+                } // jc
+
+                // Reduce per-thread rows into bin accumulator
+                #pragma omp critical
+                {
+                    for (int i = 0; i < L; ++i) acc[(size_t)i] += acc_thr[(size_t)i];
                 }
-                for (int i = 0; i < L; ++i) {
-                    T z = wcol[i];
-                    acc[i] += z * z;
+            } // parallel
+            #else
+            // Single-thread fallback
+            {
+                std::vector<T> acc_thr((size_t)L, T(0));
+                std::vector<T> Work_local((size_t)L * (size_t)V_COL_TILE, T(0));
+                for (int jc = 0; jc < v; jc += V_COL_TILE) {
+                    const int vt = std::min(V_COL_TILE, v - jc);
+                    std::fill(Work_local.begin(), Work_local.begin() + (size_t)L * (size_t)vt, T(0));
+                    for (int n0 = 0; n0 < N; n0 += N_TILE) {
+                        const int Nt = std::min(N - n0, N_TILE);
+                        const T *A_ptr = Y.data() + (size_t)n0;
+                        const T *B_ptr = Xptr
+                                       + (size_t)((k * nvecs) + (c0 + jc)) * (size_t)N
+                                       + (size_t)n0;
+                        gemm_col_major_tn<T>(L, vt, Nt,
+                                             A_ptr, N,
+                                             B_ptr, N,
+                                             Work_local.data(), L,
+                                             T(1), T(1));
+                    }
+                    for (int col = 0; col < vt; ++col) {
+                        const T *wcol = Work_local.data() + (size_t)col * (size_t)L;
+                        for (int i = 0; i < L; ++i) {
+                            const T z = wcol[i];
+                            acc_thr[(size_t)i] += z * z;
+                        }
+                    }
                 }
+                for (int i = 0; i < L; ++i) acc[(size_t)i] += acc_thr[(size_t)i];
             }
-        }
+            #endif
+        } // c0 over vchunk
 
-        // Write mean over V into meansq rows [blk_start:blk_end), column k
+        // Write means over nvecs into meansq rows [blk_start:blk_end), column k
+        const T invV = T(1) / T(nvecs);
         for (int i = 0; i < L; ++i) {
             const std::size_t row = (std::size_t)blk_start + (std::size_t)i;
-            Mptr[row * (std::size_t)B + (std::size_t)k] = acc[i] / T(nvecs);
+            Mptr[row * (std::size_t)B + (std::size_t)k] = acc[(size_t)i] * invV;
         }
-    }
+    } // bins
 }
 
 // ------------------------------- PyBind module -------------------------------
@@ -493,43 +600,46 @@ void phase2_compute_XtXz_bed_impl(const std::string &bed_prefix,
 PYBIND11_MODULE(gwldcore, m) {
     m.doc() = "C++ core for SUMMIT GW LD score (bed parser + BLAS-safe GEMMs)";
 
-    // float32
-    m.def("phase1_compute_Xz_bed",
-          &phase1_compute_Xz_bed_impl<float>,
-          py::arg("bed_prefix"),
-          py::arg("fam_path"),
-          py::arg("blk_start"), py::arg("blk_end"),
-          py::arg("row_sel") = py::none(),
-          py::arg("ddof") = 1,
-          py::arg("annot_blk"),
-          py::arg("inv_right"),
-          py::arg("nvecs"),
-          py::arg("vchunk"),
-          py::arg("rand_dist") = "rademacher",
-          py::arg("seed") = py::none(),
-          py::arg("Xz2d"),
-          py::arg("project_right") = false,
-          py::arg("C") = py::none(),
-          py::arg("R") = py::none());
+    // Phase 1 (chunked) float32
+    m.def("phase1_compute_Xz_bed_chunk",
+        &phase1_compute_Xz_bed_chunk_impl<float>,
+        py::arg("bed_prefix"),
+        py::arg("fam_path"),
+        py::arg("blk_start"), py::arg("blk_end"),
+        py::arg("row_sel") = py::none(),
+        py::arg("ddof") = 1,
+        py::arg("annot_blk"),
+        py::arg("inv_right"),
+        py::arg("v_start"),
+        py::arg("v_count"),
+        py::arg("kmax_hint"),                     // NEW
+        py::arg("rand_dist") = "rademacher",
+        py::arg("seed") = py::none(),
+        py::arg("Xz2d_chunk"),
+        py::arg("project_right") = false,
+        py::arg("C") = py::none(),
+        py::arg("R") = py::none());
 
-    // float64
-    m.def("phase1_compute_Xz_bed",
-          &phase1_compute_Xz_bed_impl<double>,
-          py::arg("bed_prefix"),
-          py::arg("fam_path"),
-          py::arg("blk_start"), py::arg("blk_end"),
-          py::arg("row_sel") = py::none(),
-          py::arg("ddof") = 1,
-          py::arg("annot_blk"),
-          py::arg("inv_right"),
-          py::arg("nvecs"),
-          py::arg("vchunk"),
-          py::arg("rand_dist") = "rademacher",
-          py::arg("seed") = py::none(),
-          py::arg("Xz2d"),
-          py::arg("project_right") = false,
-          py::arg("C") = py::none(),
-          py::arg("R") = py::none());
+    // Phase 1 (chunked) float64
+    m.def("phase1_compute_Xz_bed_chunk",
+        &phase1_compute_Xz_bed_chunk_impl<double>,
+        py::arg("bed_prefix"),
+        py::arg("fam_path"),
+        py::arg("blk_start"), py::arg("blk_end"),
+        py::arg("row_sel") = py::none(),
+        py::arg("ddof") = 1,
+        py::arg("annot_blk"),
+        py::arg("inv_right"),
+        py::arg("v_start"),
+        py::arg("v_count"),
+        py::arg("kmax_hint"),                     // NEW
+        py::arg("rand_dist") = "rademacher",
+        py::arg("seed") = py::none(),
+        py::arg("Xz2d_chunk"),
+        py::arg("project_right") = false,
+        py::arg("C") = py::none(),
+        py::arg("R") = py::none());
+
 
     // Phase 2 float32
     m.def("phase2_compute_XtXz_bed",

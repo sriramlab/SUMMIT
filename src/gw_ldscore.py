@@ -19,8 +19,6 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 import gwldcore
 
-
-
 _THREAD_LOCAL = threading.local()
 
 os.environ.setdefault("MALLOC_ARENA_MAX", "2")           # limit per-process arenas
@@ -137,57 +135,6 @@ def _resvar_worker_thread(span,
     resvar = np.sum(Y * Y, axis=0, dtype=dtype) / float(N_eff - 1)
     inv_sqrt_resvar = (1.0 / np.sqrt(np.maximum(resvar, eps))).astype(dtype, copy=False)
     return (s, e, inv_sqrt_resvar)
-
-# -------------------- shared-memory worker globals --------------------
-_g_Xz2d = None           # (N × V*B), holds either Xz or M·Xz depending on phase
-_g_meansq = None         # (M × B)
-_g_xz_locks = None
-_g_shm_xz = None
-_g_shm_ms = None
-
-def _worker_cleanup():
-    global _g_Xz2d, _g_meansq, _g_shm_xz, _g_shm_ms
-    _g_Xz2d = None
-    _g_meansq = None
-    try:
-        if _g_shm_xz is not None:
-            _g_shm_xz.close()
-    except Exception:
-        pass
-    try:
-        if _g_shm_ms is not None:
-            _g_shm_ms.close()
-    except Exception:
-        pass
-    _g_shm_xz = None
-    _g_shm_ms = None
-
-def _init_shared(xz_name, xz_shape2d, meansq_name, meansq_shape, dtype_str, xz_locks):
-    import numpy as _np
-    from multiprocessing import shared_memory as _sm
-    global _g_Xz2d, _g_meansq, _g_xz_locks, _g_shm_xz, _g_shm_ms
-
-    dt = _np.dtype(dtype_str)
-
-    if xz_name is not None:
-        _g_shm_xz = _sm.SharedMemory(name=xz_name)
-        nrows, ncols = xz_shape2d
-        _g_Xz2d = _np.frombuffer(_g_shm_xz.buf, dtype=dt, count=nrows*ncols)\
-                  .reshape((nrows, ncols), order='F')
-    else:
-        _g_shm_xz = None
-        _g_Xz2d = None
-
-    if meansq_name is not None:
-        _g_shm_ms = _sm.SharedMemory(name=meansq_name)
-        M, B = meansq_shape
-        _g_meansq = _np.ndarray((M, B), dtype=dt, buffer=_g_shm_ms.buf)
-    else:
-        _g_shm_ms = None
-        _g_meansq = None
-
-    _g_xz_locks = xz_locks
-    atexit.register(_worker_cleanup)
 
 # -------------------- covariate reader → orthonormal Q --------------------
 def read_cov(
@@ -414,6 +361,7 @@ class GenomewideLDScore:
         v_chunk = max(64, min(V, v_chunk))
         # round up to multiple of 64 for nicer GEMM kernels
         v_chunk = min(V, ((v_chunk + 63) // 64) * 64)
+        #v_chunk = 64
         return v_chunk
     
     def _precompute_residual_variances(self):
@@ -571,12 +519,14 @@ class GenomewideLDScore:
     # ------------------ main compute ------------------
     def _compute_ldscore(self):
         """
-        Phase 0: precompute Var(M x_m) for all SNPs (or ones if no covariates) and cache 1/sqrt.
-        Phase 1: build X_k z from raw-standardized genotypes (C++), scaling right columns by 1/sqrt(Var(M x_m)).
-                Parent then (optionally) projects: Xz2d ← (I - QQ^T) Xz2d in-place (if covariates).
-        Phase 2: for each block (C++), Y = M·G; scale left rows by 1/sqrt(Var(M g_j));
-                compute Y^T @ (MB_k), divide by N_eff-1, square, and average across V.
-        Baseline: subtract M_k / N_denom per bin (correlation null).
+        Streamed V-chunk pipeline with per-block Kmax precomputed in Python:
+        - Phase 0: per-SNP inv sqrt residual variances (right side)
+        - Build blocks and precompute kmax per block from annot != 0
+        - For each v-chunk:
+            Phase 1 (chunked): build Xz_chunk (N × B·Vt) across all blocks (pass kmax_hint)
+            Phase 2: compute means over this chunk across all blocks
+            Accumulate weighted sum
+        - Finalize: divide by V, subtract baseline, save.
         """
         self.log._log(f"num_vecs: {self.nvecs}, step_size: {self.step_size}, seed: {self.root_seed}")
         self.log._log(f"Using {self.rand_dist} random vectors.")
@@ -585,94 +535,92 @@ class GenomewideLDScore:
         else:
             self.log._log("No covariates: standard LD scores (squared correlations).")
 
-        # Pick chunk sizes
-        self.v_chunk_xz   = self._auto_vchunk('Xz')
-        self.v_chunk_xtxz = self._auto_vchunk('XtXz')
-        self.log._log(f"Using V-chunk sizes: Phase1 (Xz)={self.v_chunk_xz}, Phase2 (XtXz)={self.v_chunk_xtxz}")
+        # Chunk size along V
+        vchunk = self._auto_vchunk('stream')
+        vchunk = max(64, min(self.nvecs, vchunk))
+        vchunk = min(self.nvecs, ((vchunk + 63) // 64) * 64)
+        self.log._log(f"Streaming with V-chunk size = {vchunk} (total V = {self.nvecs})")
 
-        # Phase 0: per-SNP residual variances and inverse sqrt (right side)
+        # Phase 0: per-SNP residual variances
         self.inv_sqrt_resvar_all = self._precompute_residual_variances()
 
-        self.nblks = len(np.arange(self.nsnps)[::self.step_size])
-        self._print_expected_mem('Xz')
-        _rss_snapshot("pre-alloc", self.log)
-
-        # Build block ranges
+        # Build blocks
         blocks = []
-        for j in range(self.nblks):
-            s = self.step_size * j
-            e = self.nsnps if j == self.nblks - 1 else self.step_size * (j + 1)
+        for j in range(0, self.nsnps, self.step_size):
+            s = j
+            e = min(self.nsnps, j + self.step_size)
             blocks.append((s, e))
+        self.nblks = len(blocks)
 
-        shm_xz = shm_ms = None
-        try:
-            # ---- allocate shared arrays ----
-            itemsize = np.dtype(self.dtype).itemsize
-            xz_shape2d = (self.nsamp, self.nvecs * self.nbins)   # expects Fortran layout
-            ms_shape   = (self.nsnps, self.nbins)                 # C-layout is fine
+        # --- NEW: precompute Kmax per block from annotation (counts of nonzeros per bin) ---
+        kmax_per_block: list[int] = []
+        for (s, e) in blocks:
+            blk = self.annot[s:e]                     # (L x B), float64
+            # count nonzeros per bin, then take max
+            # Note: continuous annotations are treated as nonzero if value != 0
+            Kmax = int((blk != 0).sum(axis=0).max())
+            kmax_per_block.append(max(1, Kmax))
+        self.log._log(f"Precomputed Kmax per block (min/median/max): "
+                    f"{min(kmax_per_block)}/{int(np.median(kmax_per_block))}/{max(kmax_per_block)}")
 
-            # Xz2d: Fortran-contiguous; with SHM, we create then reshape with order='F'
-            shm_xz = shared_memory.SharedMemory(create=True, size=int(np.prod(xz_shape2d)) * itemsize)
-            Xz_buf = np.ndarray((np.prod(xz_shape2d),), dtype=self.dtype, buffer=shm_xz.buf)
-            self.Xz2d = Xz_buf.reshape(xz_shape2d, order='F')
-            self.Xz2d.fill(0)
+        # Paths / common args
+        bed_prefix = getattr(self.G, "filename", None) or getattr(self.G, "filepath", None) or getattr(self, "bed_prefix", None) or self.G
+        p = Path(str(bed_prefix))
+        if p.suffix == ".bed": p = p.with_suffix("")
+        bed_prefix = str(p)
+        fam_path   = str(p.with_suffix(".fam"))
+        row_sel = self.row_sel if self.row_sel is not None else None
+        ddof    = int(self.ddof)
 
-            shm_ms = shared_memory.SharedMemory(create=True, size=int(np.prod(ms_shape)) * itemsize)
-            self.meansq = np.ndarray(ms_shape, dtype=self.dtype, buffer=shm_ms.buf)  # C-contig
-            self.meansq.fill(0)
+        # Accumulators
+        meansq_accum = np.zeros((self.nsnps, self.nbins), dtype=self.dtype, order='C')
+        meansq_chunk = np.zeros_like(meansq_accum, dtype=self.dtype, order='C')
 
-            _rss_snapshot("after SHM alloc", self.log)
+        # Scratch Xz for current V-chunk (F-contiguous)
+        Xz_chunk = None
 
-            bed_prefix = getattr(self.G, "filename", None)
-            if bed_prefix is None:
-                bed_prefix = getattr(self.G, "filepath", None)
-            if bed_prefix is None:
-                bed_prefix = getattr(self, "bed_prefix", None)
-            if bed_prefix is None:
-                # fallbacks: config fields or the object itself
-                bed_prefix = getattr(self, "geno", None) or getattr(self, "bfile", None) or self.G
+        # --- Main V-chunk loop ---
+        for v_start in range(0, self.nvecs, vchunk):
+            Vt = min(vchunk, self.nvecs - v_start)
+            self.log._log(f"[chunk] v_start={v_start}, v_count={Vt}")
 
-            # Normalize to Path and strip optional ".bed"
-            p = Path(str(bed_prefix))
-            if p.suffix == ".bed":
-                p = p.with_suffix("")            # remove ".bed"
+            # allocate / resize scratch
+            need_cols = self.nbins * Vt
+            if (Xz_chunk is None) or (Xz_chunk.shape[1] != need_cols):
+                Xz_chunk = np.zeros((self.nsamp, need_cols), dtype=self.dtype, order='F')
+            else:
+                Xz_chunk.fill(0)
 
-            bed_prefix = str(p)                  # e.g., "/path/to/file" (no extension)
-            fam_path   = str(p.with_suffix(".fam"))
-
-            row_sel = self.row_sel if self.row_sel is not None else None
-            ddof    = int(self.ddof)
-
-            # ---- Phase 1: build Xz (C++) ----
-            for (s, e) in blocks:
+            # ---------------------- Phase 1 (chunked) ----------------------
+            xz_t0 = utils._get_time()
+            for blk_idx, (s, e) in enumerate(blocks):
                 annot_blk = np.ascontiguousarray(self.annot[s:e].astype(self.dtype, copy=False))
                 inv_right = np.ascontiguousarray(self.inv_sqrt_resvar_all[s:e].astype(self.dtype, copy=False))
 
-                gwldcore.phase1_compute_Xz_bed(
+                gwldcore.phase1_compute_Xz_bed_chunk(
                     bed_prefix=bed_prefix,
                     fam_path=fam_path,
                     blk_start=int(s), blk_end=int(e),
                     row_sel=row_sel,
                     ddof=ddof,
-                    annot_blk=annot_blk,              # (L x B), C-contig
-                    inv_right=inv_right,              # (L,),    C-contig
-                    nvecs=int(self.nvecs),
-                    vchunk=int(self.v_chunk_xz),
+                    annot_blk=annot_blk,              # (L x B)
+                    inv_right=inv_right,              # (L,)
+                    v_start=int(v_start),             # seed offset
+                    v_count=int(Vt),
+                    kmax_hint=int(kmax_per_block[blk_idx]),  # NEW: pass per-block Kmax
                     rand_dist=self.rand_dist,
-                    seed=self.root_seed,              # <-- correct kw name
-                    Xz2d=self.Xz2d,                   # (N x B*V), F-contig
+                    seed=self.root_seed,
+                    Xz2d_chunk=Xz_chunk,              # (N x (B*Vt)), accumulates over blocks
                     project_right=False,
                     C=(self.C if self.C is not None else None),
                     R=(self.cov_R if self.C is not None else None)
                 )
+            xz_t1 = utils._get_time()
+            self.log._log(f"[chunk] Phase1 built Xz_chunk in {xz_t1 - xz_t0:.3f}s")
 
-            self.Xz_time = utils._get_time()
-            _rss_snapshot("after Xz", self.log)
-            self.log._log("Calculation of Xz (for each partition) completed. Runtime: " +
-                        format(self.Xz_time - self.start_time, '.3f') + " s")
-
-            # ---- Phase 2: XtXz (C++) ----
-            self._print_expected_mem('XtXz')
+            # ---------------------- Phase 2 ----------------------
+            meansq_chunk.fill(0)
+            xtxz_t0 = utils._get_time()
             for (s, e) in blocks:
                 inv_left = np.ascontiguousarray(self.inv_sqrt_resvar_all[s:e].astype(self.dtype, copy=False))
                 N_denom  = float(self.N_eff if self.C is not None else self.nsamp)
@@ -683,103 +631,81 @@ class GenomewideLDScore:
                     blk_start=int(s), blk_end=int(e),
                     row_sel=row_sel,
                     ddof=ddof,
-                    inv_left=inv_left,                 # (L,), C-contig
-                    nvecs=int(self.nvecs),
-                    vchunk=int(self.v_chunk_xtxz),
-                    Xz2d=self.Xz2d,                    # (N x B*V), F-contig
-                    meansq=self.meansq,                # (M x B),   C-contig
+                    inv_left=inv_left,            # (L,)
+                    nvecs=int(Vt),                # mean over THIS chunk only
+                    vchunk=int(Vt),
+                    Xz2d=Xz_chunk,                # (N x (B*Vt))
+                    meansq=meansq_chunk,          # (M x B), per-block rows overwritten
                     C=(self.C if self.C is not None else None),
                     R=(self.cov_R if self.C is not None else None),
                     N_denom=int(N_denom)
                 )
+            xtxz_t1 = utils._get_time()
+            self.log._log(f"[chunk] Phase2 finished in {xtxz_t1 - xtxz_t0:.3f}s")
+
+            # Weighted combine across chunks
+            meansq_accum += (meansq_chunk * Vt)
 
             try:
                 ctypes.CDLL("libc.so.6").malloc_trim(0)
             except Exception:
                 pass
+            _rss_snapshot(f"after chunk v[{v_start}:{v_start+Vt})", self.log)
 
-            _rss_snapshot("after XtXz", self.log)
-            self.XtXz_time = utils._get_time()
-            self.log._log("Calculation of XtXz (for each partition) completed. Runtime: " +
-                        format(self.XtXz_time - self.Xz_time, '.3f') + " s")
+        # ---------------------- Finalize & save ----------------------
+        meansq = (meansq_accum / float(self.nvecs)).astype(self.dtype, copy=False)
 
-            # ---- Baseline subtraction: classic correlation null M_k / N_denom ----
-            N_denom = float(self.N_eff - 1.0 if self.C is not None else self.nsamp - self.ddof)
-            self.log._log("Applying correlation null: subtracting M_k / N_denom per bin.")
-            self.meansq -= (self.nsnps_bin / N_denom).astype(self.meansq.dtype, copy=False)[None, :]
+        N_denom = float(self.N_eff - 1.0 if self.C is not None else self.nsamp - self.ddof)
+        self.log._log("Applying correlation null: subtracting M_k / N_denom per bin.")
+        meansq -= (self.nsnps_bin / N_denom).astype(meansq.dtype, copy=False)[None, :]
 
-            # ---- Save outputs ----
-            self.gwldscore = self.meansq.astype(np.float64, copy=False)
-            self.log._log(f"Saving the genome-wide (partitioned) LD scores into: {self.outpath}.gw.ldscore.gz")
-            snpcols = ['CHR', 'SNP', 'BP']
-            if (self.snplist is None):
-                self.snpdf = pd.DataFrame(np.nan*np.ones((self.nsnps, 3)), columns=snpcols)
-            else:
-                self.snpdf = self.snplist[['CHR','SNP','BP']].copy()
-                self.snpdf.columns = snpcols
+        self.gwldscore = meansq.astype(np.float64, copy=False)
 
-            scores_df = pd.DataFrame(self.gwldscore, columns=self.l2cols)
-            out_df = pd.concat([self.snpdf, scores_df], axis=1)
-            out_df.to_csv(f'{self.outpath}.gw.ldscore.gz', index=False, compression='gzip', sep='\t', float_format='%.6f')
+        self.log._log(f"Saving the genome-wide (partitioned) LD scores into: {self.outpath}.gw.ldscore.gz")
+        snpcols = ['CHR','SNP','BP']
+        if self.snplist is None:
+            self.snpdf = pd.DataFrame(np.nan*np.ones((self.nsnps, 3)), columns=snpcols)
+        else:
+            self.snpdf = self.snplist[['CHR','SNP','BP']].copy()
+            self.snpdf.columns = snpcols
 
-            # ---- Post-run stats ----
-            try:
-                desc = scores_df.describe(percentiles=[0.25, 0.5, 0.75]).loc[['count','mean','std','min','25%','50%','75%','max']]
-                self.log._log("Per-bin LD score summary (count/mean/std/min/25%/50%/75%/max):")
-                with pd.option_context('display.width', 140, 'display.max_columns', None, 'display.float_format', '{:.6f}'.format):
-                    self.log._log(desc.to_string() + "\n")
+        scores_df = pd.DataFrame(self.gwldscore, columns=self.l2cols)
+        out_df = pd.concat([self.snpdf, scores_df], axis=1)
+        out_df.to_csv(f'{self.outpath}.gw.ldscore.gz', index=False, compression='gzip', sep='\t', float_format='%.6f')
 
-                corr = scores_df.corr(method='pearson')
-                self.log._log("Correlation matrix across bins (Pearson):")
-                with pd.option_context('display.width', 140, 'display.max_columns', None, 'display.float_format', '{:.4f}'.format):
-                    self.log._log("\n" + corr.to_string())
+        try:
+            desc = scores_df.describe(percentiles=[0.25,0.5,0.75]).loc[['count','mean','std','min','25%','50%','75%','max']]
+            self.log._log("Per-bin LD score summary (count/mean/std/min/25%/50%/75%/max):")
+            with pd.option_context('display.width', 140, 'display.max_columns', None, 'display.float_format', '{:.6f}'.format):
+                self.log._log(desc.to_string() + "\n")
 
-                col_sums = pd.Series(self.nsnps_bin, index=self.l2cols)
-                lines = ["Annotation Column Sums"] + [f"{k:<35} {v:.6f}" for k, v in col_sums.items()]
-                self.log._log("\n" + "\n".join(lines))
+            corr = scores_df.corr(method='pearson')
+            self.log._log("Correlation matrix across bins (Pearson):")
+            with pd.option_context('display.width', 140, 'display.max_columns', None, 'display.float_format', '{:.4f}'.format):
+                self.log._log("\n" + corr.to_string())
 
-                row_sums = self.annot.sum(axis=1, dtype=np.float64)
-                desc = pd.Series(row_sums).describe(percentiles=[0.25, 0.5, 0.75])
-                self.log._log("\nSummary of Annotation Matrix Row Sums")
-                with pd.option_context('display.float_format', '{:.4f}'.format):
-                    ordered = ['count','mean','std','min','25%','50%','75%','max']
-                    lines = [f"{k:<6} {desc[k]:.4f}" for k in ordered]
-                    self.log._log("\n".join(lines))
+            col_sums = pd.Series(self.nsnps_bin, index=self.l2cols)
+            lines = ["Annotation Column Sums"] + [f"{k:<35} {v:.6f}" for k, v in col_sums.items()]
+            self.log._log("\n" + "\n".join(lines))
 
-            except Exception as e:
-                self.log._log(f"[warn] Failed to compute summary stats / correlation: {e}")
+            row_sums = self.annot.sum(axis=1, dtype=np.float64)
+            desc = pd.Series(row_sums).describe(percentiles=[0.25, 0.5, 0.75])
+            self.log._log("\nSummary of Annotation Matrix Row Sums")
+            with pd.option_context('display.float_format', '{:.4f}'.format):
+                ordered = ['count','mean','std','min','25%','50%','75%','max']
+                lines = [f"{k:<6} {desc[k]:.4f}" for k in ordered]
+                self.log._log("\n".join(lines))
+        except Exception as e:
+            self.log._log(f"[warn] Failed to compute summary stats / correlation: {e}")
 
-            self.end_time = utils._get_time()
-            self.log._log(f"Calculation of genome-wide LD score ended at "+utils._get_timestr(self.end_time))
-            self.runtime = self.end_time - self.start_time
-            self.log._log("Runtime: "+format(self.runtime, '.3f')+
-                        f" s ({self.runtime//3600} hr {(self.runtime%3600)//60} m {(self.runtime%60):.3f} s)")
-            self.log._save_log(self.outpath+".gw.log")
+        self.end_time = utils._get_time()
+        self.log._log(f"Calculation of genome-wide LD score ended at "+utils._get_timestr(self.end_time))
+        self.runtime = self.end_time - self.start_time
+        self.log._log("Runtime: "+format(self.runtime, '.3f')+
+                    f" s ({self.runtime//3600} hr {(self.runtime%3600)//60} m {(self.runtime%60):.3f} s)")
+        self.log._save_log(self.outpath+".gw.log")
 
-        except KeyboardInterrupt:
-            self.log._log("KeyboardInterrupt received — terminating and cleaning shared memory.")
-            raise
-        finally:
-            try:
-                self.Xz2d = None
-                self.meansq = None
-                gc.collect()
-            finally:
-                if shm_xz is not None:
-                    try: shm_xz.close()
-                    except BufferError as e: self.log._log(f"[warn] shm_xz.close BufferError: {e}. Unlinking anyway.")
-                    finally:
-                        try: shm_xz.unlink()
-                        except FileNotFoundError: pass
-                        except Exception as e: self.log._log(f"[warn] shm_xz.unlink: {e}")
-                if shm_ms is not None:
-                    try: shm_ms.close()
-                    except BufferError as e: self.log._log(f"[warn] shm_ms.close BufferError: {e}. Unlinking anyway.")
-                    finally:
-                        try: shm_ms.unlink()
-                        except FileNotFoundError: pass
-                        except Exception as e: self.log._log(f"[warn] shm_ms.unlink: {e}")
-            _rss_snapshot("post-cleanup", self.log)
+
     
     def _print_expected_mem(self, phase, block_len=None, k_max=None):
         b = np.dtype(self.dtype).itemsize
