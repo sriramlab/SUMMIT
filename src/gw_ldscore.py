@@ -17,6 +17,7 @@ import ctypes
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
+import time
 import gwldcore
 
 _THREAD_LOCAL = threading.local()
@@ -519,14 +520,16 @@ class GenomewideLDScore:
     # ------------------ main compute ------------------
     def _compute_ldscore(self):
         """
-        Streamed V-chunk pipeline with per-block Kmax precomputed in Python:
-        - Phase 0: per-SNP inv sqrt residual variances (right side)
-        - Build blocks and precompute kmax per block from annot != 0
-        - For each v-chunk:
-            Phase 1 (chunked): build Xz_chunk (N × B·Vt) across all blocks (pass kmax_hint)
-            Phase 2: compute means over this chunk across all blocks
-            Accumulate weighted sum
-        - Finalize: divide by V, subtract baseline, save.
+        Streamed V-chunk pipeline with a single progress bar over (vtiles × blocks).
+
+        Steps:
+        0) Precompute per-SNP inv sqrt residual variances (right side).
+        1) Build SNP blocks; precompute Kmax per block from annotation (count of nonzeros per bin).
+        2) For each V-tile:
+            Phase 1 (chunked): build Xz_chunk (N × B·Vt) across all blocks (pass kmax_hint; skip if 0)
+            Phase 2: consume Xz_chunk across all blocks (skip if Kmax==0)
+            Accumulate weighted sum (by Vt)
+        3) Finalize: divide by total V, subtract baseline, save; print summaries.
         """
         self.log._log(f"num_vecs: {self.nvecs}, step_size: {self.step_size}, seed: {self.root_seed}")
         self.log._log(f"Using {self.rand_dist} random vectors.")
@@ -535,16 +538,16 @@ class GenomewideLDScore:
         else:
             self.log._log("No covariates: standard LD scores (squared correlations).")
 
-        # Chunk size along V
+        # -------------------- Pick V-chunk size --------------------
         vchunk = self._auto_vchunk('stream')
         vchunk = max(64, min(self.nvecs, vchunk))
         vchunk = min(self.nvecs, ((vchunk + 63) // 64) * 64)
         self.log._log(f"Streaming with V-chunk size = {vchunk} (total V = {self.nvecs})")
 
-        # Phase 0: per-SNP residual variances
+        # -------------------- Phase 0: per-SNP residual variances --------------------
         self.inv_sqrt_resvar_all = self._precompute_residual_variances()
 
-        # Build blocks
+        # -------------------- Build SNP blocks --------------------
         blocks = []
         for j in range(0, self.nsnps, self.step_size):
             s = j
@@ -552,109 +555,157 @@ class GenomewideLDScore:
             blocks.append((s, e))
         self.nblks = len(blocks)
 
-        # --- NEW: precompute Kmax per block from annotation (counts of nonzeros per bin) ---
+        # -------------------- Precompute Kmax per block (trust hints) --------------------
+        # Count nonzeros per bin within each block; take the max across bins.
         kmax_per_block: list[int] = []
         for (s, e) in blocks:
-            blk = self.annot[s:e]                     # (L x B), float64
-            # count nonzeros per bin, then take max
-            # Note: continuous annotations are treated as nonzero if value != 0
+            blk = self.annot[s:e]  # (L x B) float64
+            # Treat continuous annotation as nonzero if value != 0.
             Kmax = int((blk != 0).sum(axis=0).max())
-            kmax_per_block.append(max(1, Kmax))
-        self.log._log(f"Precomputed Kmax per block (min/median/max): "
-                    f"{min(kmax_per_block)}/{int(np.median(kmax_per_block))}/{max(kmax_per_block)}")
+            # Trust zero: means this block has no annotated SNPs in any bin (rare but allowed).
+            kmax_per_block.append(Kmax)
+        if any(k == 0 for k in kmax_per_block):
+            zc = sum(1 for k in kmax_per_block if k == 0)
+            self.log._log(f"[info] {zc} block(s) have Kmax=0 (will be skipped).")
+        if kmax_per_block:
+            self.log._log(f"Kmax per block (min/median/max): "
+                        f"{min(kmax_per_block)}/{int(np.median(kmax_per_block))}/{max(kmax_per_block)}")
 
-        # Paths / common args
+        # -------------------- Paths / common args --------------------
         bed_prefix = getattr(self.G, "filename", None) or getattr(self.G, "filepath", None) or getattr(self, "bed_prefix", None) or self.G
         p = Path(str(bed_prefix))
-        if p.suffix == ".bed": p = p.with_suffix("")
+        if p.suffix == ".bed":
+            p = p.with_suffix("")
         bed_prefix = str(p)
         fam_path   = str(p.with_suffix(".fam"))
         row_sel = self.row_sel if self.row_sel is not None else None
         ddof    = int(self.ddof)
 
-        # Accumulators
+        # -------------------- Accumulators & scratch --------------------
         meansq_accum = np.zeros((self.nsnps, self.nbins), dtype=self.dtype, order='C')
         meansq_chunk = np.zeros_like(meansq_accum, dtype=self.dtype, order='C')
+        Xz_chunk = None  # F-contiguous scratch (N x (B*Vt))
 
-        # Scratch Xz for current V-chunk (F-contiguous)
-        Xz_chunk = None
+        # Build V-tiles list (start, count)
+        vtiles = [(v0, min(vchunk, self.nvecs - v0)) for v0 in range(0, self.nvecs, vchunk)]
+        n_blocks = len(blocks)
+        n_vtiles = len(vtiles)
 
-        # --- Main V-chunk loop ---
-        for v_start in range(0, self.nvecs, vchunk):
-            Vt = min(vchunk, self.nvecs - v_start)
-            self.log._log(f"[chunk] v_start={v_start}, v_count={Vt}")
+        # -------------------- Single progress bar over vtiles × blocks --------------------
+        total_units = n_vtiles * n_blocks
+        bar = tqdm(total=total_units, desc="GW-LD progress", unit="task", smoothing=0.2, miniters=1)
 
-            # allocate / resize scratch
-            need_cols = self.nbins * Vt
-            if (Xz_chunk is None) or (Xz_chunk.shape[1] != need_cols):
-                Xz_chunk = np.zeros((self.nsamp, need_cols), dtype=self.dtype, order='F')
-            else:
-                Xz_chunk.fill(0)
+        # EMA for phase weight (fraction assigned to Phase-1 updates)
+        ema_p1 = 0.0
+        ema_p2 = 0.0
+        w1 = 0.5  # start neutral; adapt after the first tile
 
-            # ---------------------- Phase 1 (chunked) ----------------------
-            xz_t0 = utils._get_time()
-            for blk_idx, (s, e) in enumerate(blocks):
-                annot_blk = np.ascontiguousarray(self.annot[s:e].astype(self.dtype, copy=False))
-                inv_right = np.ascontiguousarray(self.inv_sqrt_resvar_all[s:e].astype(self.dtype, copy=False))
+        try:
+            for vt_idx, (v_start, Vt) in enumerate(vtiles):
+                # Allocate / zero Xz_chunk for this tile
+                need_cols = self.nbins * Vt
+                if (Xz_chunk is None) or (Xz_chunk.shape[1] != need_cols):
+                    Xz_chunk = np.zeros((self.nsamp, need_cols), dtype=self.dtype, order='F')
+                else:
+                    Xz_chunk.fill(0)
 
-                gwldcore.phase1_compute_Xz_bed_chunk(
-                    bed_prefix=bed_prefix,
-                    fam_path=fam_path,
-                    blk_start=int(s), blk_end=int(e),
-                    row_sel=row_sel,
-                    ddof=ddof,
-                    annot_blk=annot_blk,              # (L x B)
-                    inv_right=inv_right,              # (L,)
-                    v_start=int(v_start),             # seed offset
-                    v_count=int(Vt),
-                    kmax_hint=int(kmax_per_block[blk_idx]),  # NEW: pass per-block Kmax
-                    rand_dist=self.rand_dist,
-                    seed=self.root_seed,
-                    Xz2d_chunk=Xz_chunk,              # (N x (B*Vt)), accumulates over blocks
-                    project_right=False,
-                    C=(self.C if self.C is not None else None),
-                    R=(self.cov_R if self.C is not None else None)
-                )
-            xz_t1 = utils._get_time()
-            self.log._log(f"[chunk] Phase1 built Xz_chunk in {xz_t1 - xz_t0:.3f}s")
+                # ---------------------- Phase 1 (chunked) ----------------------
+                t1_total = 0.0
+                for blk_idx, (s, e) in enumerate(blocks):
+                    kmax_hint = int(kmax_per_block[blk_idx])
 
-            # ---------------------- Phase 2 ----------------------
-            meansq_chunk.fill(0)
-            xtxz_t0 = utils._get_time()
-            for (s, e) in blocks:
-                inv_left = np.ascontiguousarray(self.inv_sqrt_resvar_all[s:e].astype(self.dtype, copy=False))
-                N_denom  = float(self.N_eff if self.C is not None else self.nsamp)
+                    # Skip entire (vtile, block) if Kmax==0; still advance the bar by a full unit.
+                    if kmax_hint == 0:
+                        bar.update(1.0)  # count this (vtile, block) as done
+                        continue
 
-                gwldcore.phase2_compute_XtXz_bed(
-                    bed_prefix=bed_prefix,
-                    fam_path=fam_path,
-                    blk_start=int(s), blk_end=int(e),
-                    row_sel=row_sel,
-                    ddof=ddof,
-                    inv_left=inv_left,            # (L,)
-                    nvecs=int(Vt),                # mean over THIS chunk only
-                    vchunk=int(Vt),
-                    Xz2d=Xz_chunk,                # (N x (B*Vt))
-                    meansq=meansq_chunk,          # (M x B), per-block rows overwritten
-                    C=(self.C if self.C is not None else None),
-                    R=(self.cov_R if self.C is not None else None),
-                    N_denom=int(N_denom)
-                )
-            xtxz_t1 = utils._get_time()
-            self.log._log(f"[chunk] Phase2 finished in {xtxz_t1 - xtxz_t0:.3f}s")
+                    annot_blk = np.ascontiguousarray(self.annot[s:e].astype(self.dtype, copy=False))
+                    inv_right = np.ascontiguousarray(self.inv_sqrt_resvar_all[s:e].astype(self.dtype, copy=False))
 
-            # Weighted combine across chunks
-            meansq_accum += (meansq_chunk * Vt)
+                    t0 = time.perf_counter()
+                    gwldcore.phase1_compute_Xz_bed_chunk(
+                        bed_prefix=bed_prefix,
+                        fam_path=fam_path,
+                        blk_start=int(s), blk_end=int(e),
+                        row_sel=row_sel,
+                        ddof=ddof,
+                        annot_blk=annot_blk,              # (L x B)
+                        inv_right=inv_right,              # (L,)
+                        v_start=int(v_start),             # seed offset
+                        v_count=int(Vt),
+                        kmax_hint=kmax_hint,              # TRUST: may be zero (already handled)
+                        rand_dist=self.rand_dist,
+                        seed=self.root_seed,
+                        Xz2d_chunk=Xz_chunk,              # (N x (B*Vt)), accumulates over bins
+                        project_right=False,
+                        C=(self.C if self.C is not None else None),
+                        R=(self.cov_R if self.C is not None else None)
+                    )
+                    t1_total += (time.perf_counter() - t0)
 
+                    # Fractional progress for Phase-1 portion
+                    bar.update(w1)
+
+                # ---------------------- Phase 2 ----------------------
+                meansq_chunk.fill(0)
+                t2_total = 0.0
+
+                for blk_idx, (s, e) in enumerate(blocks):
+                    kmax_hint = int(kmax_per_block[blk_idx])
+
+                    # If Kmax==0, nothing to do for this block in this tile (already fully counted above).
+                    if kmax_hint == 0:
+                        continue
+
+                    inv_left = np.ascontiguousarray(self.inv_sqrt_resvar_all[s:e].astype(self.dtype, copy=False))
+                    N_denom  = float(self.N_eff if self.C is not None else self.nsamp)
+
+                    t0 = time.perf_counter()
+                    gwldcore.phase2_compute_XtXz_bed(
+                        bed_prefix=bed_prefix,
+                        fam_path=fam_path,
+                        blk_start=int(s), blk_end=int(e),
+                        row_sel=row_sel,
+                        ddof=ddof,
+                        inv_left=inv_left,            # (L,)
+                        nvecs=int(Vt),                # mean over THIS tile only
+                        vchunk=int(Vt),
+                        Xz2d=Xz_chunk,                # (N x (B*Vt))
+                        meansq=meansq_chunk,          # (M x B), per-block rows overwritten
+                        C=(self.C if self.C is not None else None),
+                        R=(self.cov_R if self.C is not None else None),
+                        N_denom=int(N_denom)
+                    )
+                    t2_total += (time.perf_counter() - t0)
+
+                    # Finish the unit for this (vtile, block) with Phase-2 fraction
+                    bar.update(1.0 - w1)
+
+                # Weighted combine across tiles
+                meansq_accum += (meansq_chunk * Vt)
+
+                # Adapt phase weight for smoother ETA (EMA)
+                ema_p1 = 0.85 * ema_p1 + 0.15 * max(t1_total, 1e-9)
+                ema_p2 = 0.85 * ema_p2 + 0.15 * max(t2_total, 1e-9)
+                w1 = float(ema_p1 / (ema_p1 + ema_p2))
+                bar.set_postfix_str(f"tile {vt_idx+1}/{n_vtiles} | w1={w1:.2f} | P1={t1_total:.1f}s P2={t2_total:.1f}s")
+
+                # Housekeeping
+                try:
+                    ctypes.CDLL("libc.so.6").malloc_trim(0)
+                except Exception:
+                    pass
+
+        finally:
             try:
-                ctypes.CDLL("libc.so.6").malloc_trim(0)
+                bar.close()
             except Exception:
                 pass
-            _rss_snapshot(f"after chunk v[{v_start}:{v_start+Vt})", self.log)
 
         # ---------------------- Finalize & save ----------------------
         meansq = (meansq_accum / float(self.nvecs)).astype(self.dtype, copy=False)
 
+        # Baseline subtraction: classic correlation null M_k / N_denom
         N_denom = float(self.N_eff - 1.0 if self.C is not None else self.nsamp - self.ddof)
         self.log._log("Applying correlation null: subtracting M_k / N_denom per bin.")
         meansq -= (self.nsnps_bin / N_denom).astype(meansq.dtype, copy=False)[None, :]
@@ -673,6 +724,7 @@ class GenomewideLDScore:
         out_df = pd.concat([self.snpdf, scores_df], axis=1)
         out_df.to_csv(f'{self.outpath}.gw.ldscore.gz', index=False, compression='gzip', sep='\t', float_format='%.6f')
 
+        # Summaries (best-effort)
         try:
             desc = scores_df.describe(percentiles=[0.25,0.5,0.75]).loc[['count','mean','std','min','25%','50%','75%','max']]
             self.log._log("Per-bin LD score summary (count/mean/std/min/25%/50%/75%/max):")
@@ -689,11 +741,11 @@ class GenomewideLDScore:
             self.log._log("\n" + "\n".join(lines))
 
             row_sums = self.annot.sum(axis=1, dtype=np.float64)
-            desc = pd.Series(row_sums).describe(percentiles=[0.25, 0.5, 0.75])
+            desc2 = pd.Series(row_sums).describe(percentiles=[0.25, 0.5, 0.75])
             self.log._log("\nSummary of Annotation Matrix Row Sums")
             with pd.option_context('display.float_format', '{:.4f}'.format):
                 ordered = ['count','mean','std','min','25%','50%','75%','max']
-                lines = [f"{k:<6} {desc[k]:.4f}" for k in ordered]
+                lines = [f"{k:<6} {desc2[k]:.4f}" for k in ordered]
                 self.log._log("\n".join(lines))
         except Exception as e:
             self.log._log(f"[warn] Failed to compute summary stats / correlation: {e}")
@@ -704,6 +756,7 @@ class GenomewideLDScore:
         self.log._log("Runtime: "+format(self.runtime, '.3f')+
                     f" s ({self.runtime//3600} hr {(self.runtime%3600)//60} m {(self.runtime%60):.3f} s)")
         self.log._save_log(self.outpath+".gw.log")
+
 
 
     
