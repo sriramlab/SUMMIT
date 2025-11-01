@@ -88,6 +88,15 @@ def _rss_snapshot(label, logger=None, include_children=True):
     else:
         print(msg, file=sys.stderr, flush=True)
 
+def _canonical_bfile_prefix(x: str) -> str:
+    """Return PLINK bfile prefix: strip only trailing .bed/.bim/.fam if present; otherwise leave as-is."""
+    s = str(x)
+    for ext in (".bed", ".bim", ".fam"):
+        if s.endswith(ext):
+            return s[: -len(ext)]
+    return s
+
+
 
 def _resvar_worker_thread(span,
                           bed_prefix: str,
@@ -244,8 +253,12 @@ class GenomewideLDScore:
             pass  # if helper isn't defined here
 
         self.eps_var = float(eps_var)
+        prefix = _canonical_bfile_prefix(bed_path)
+        self.bed_prefix = os.path.abspath(prefix)     # optional: make absolute for stability
+        self.fam_path   = self.bed_prefix + ".fam"
+        self.bim_path   = self.bed_prefix + ".bim"
 
-        self.G = open_bed(bed_path + ".bed")
+        self.G = open_bed(self.bed_prefix + ".bed")
         self.nsamp, self.nsnps = self.G.shape
         self.nvecs = num_vecs
         self.step_size = step_size
@@ -277,7 +290,7 @@ class GenomewideLDScore:
             self.log._log(f"Randomly subsampling individuals: {k}/{self.nsamp} ({k/self.nsamp:.1%})")
 
         # read .bim and annotation
-        self._read_bim(bed_path + ".bim")
+        self._read_bim(self.bim_path)
         if annot_path is not None:
             self._read_annot(annot_path)
         else:
@@ -285,10 +298,9 @@ class GenomewideLDScore:
 
         # covariates → orthonormal Q (C) and Q^T (cov_R); drop NA rows
         if covar_path is not None:
-            fam_file = bed_path + ".fam"
             C, R, keep_idx_global = read_cov(
                 cov_filename=covar_path,
-                fam_filename=fam_file,
+                fam_filename=self.fam_path,
                 std=True,
                 cov_impute_method="ignore",
                 one_hot_conversion=False,
@@ -368,37 +380,135 @@ class GenomewideLDScore:
     def _precompute_residual_variances(self):
         """
         Precompute inv sqrt residual variances per SNP, consistent with XtXz.
-        Handles: standardization (ddof), nan->0 imputation, and optional projection.
+        Parallelized over SNP chunks using a thread pool. Each worker:
+        - Opens its own .bed handle (thread-local)
+        - Reads & standardizes the block
+        - Optionally projects with covariates
+        - Returns 1/sqrt(Var) for [s:e)
+
+        We also cap BLAS threads to 1 within the parallel region to avoid
+        oversubscription (NumPy GEMMs in the worker), and choose the number
+        of workers conservatively based on available memory.
         """
+
         row_sel = self.row_sel if self.row_sel is not None else slice(None)
         inv = np.empty(self.nsnps, dtype=self.dtype)
 
+        # Form SNP blocks
         chunks = [(s, min(self.nsnps, s + self.step_size))
                 for s in range(0, self.nsnps, self.step_size)]
         if not chunks:
             self.log._log("[warn] No SNP chunks formed; returning zeros.")
             return np.zeros(self.nsnps, dtype=self.dtype)
 
-        for s, e in chunks:
-            G = self.G.read(index=np.s_[row_sel, s:e], dtype=self.dtype)  # (N × L)
-            means = np.nanmean(G, axis=0, dtype=self.dtype)
-            stds  = np.nanstd( G, axis=0, dtype=self.dtype, ddof=self.ddof)
-            stds[stds == 0] = 1.0
-            G = (G - means) / stds
-            np.nan_to_num(G, copy=False)  # mean-imputation at 0 after centering
+        # Canonicalized bed/fam prefix (set in __init__)
+        bed_prefix = getattr(self, "bed_prefix", None)
+        if bed_prefix is None:
+            # Fallback (shouldn't happen if __init__ set it)
+            bp = Path(str(getattr(self.G, "filename", None)
+                        or getattr(self.G, "filepath", None) or ""))
+            if bp.suffix == ".bed":
+                bp = bp.with_suffix("")
+            bed_prefix = str(bp)
 
-            if self.C is not None:
-                tmp = self.cov_R @ G
-                G   = G - (self.C @ tmp)
-                del tmp
-                N_denom = float(self.N_eff)
+        # Worker args (read-only)
+        dtype = self.dtype
+        ddof  = int(self.ddof)
+        C     = self.C if self.C is not None else None
+        R     = self.cov_R if self.C is not None else None
+        N_eff = float(self.N_eff if self.C is not None else self.nsamp)
+        eps   = float(self.eps_var)
+
+        # Choose number of workers conservatively to avoid RAM spikes
+        # Rough per-chunk footprint ≈ N * L * itemsize * 3 (G, tmp/proj, Y)
+        try:
+            import psutil
+            avail = int(psutil.virtual_memory().available)
+        except Exception:
+            avail = None
+
+        b = int(np.dtype(dtype).itemsize)
+        L = int(min(self.step_size, self.nsnps))
+        est_per_chunk = max(1, self.nsamp * L * b * 3)
+        nominal = max(1, int(self.num_threads))
+        if avail is not None:
+            max_by_mem = max(1, int(avail // est_per_chunk))
+        else:
+            max_by_mem = nominal
+        n_workers = max(1, min(nominal, max_by_mem, os.cpu_count() or 1))
+        # Be extra safe: don't spin more workers than chunks
+        n_workers = min(n_workers, len(chunks))
+
+        self.log._log(f"[resvar] Using {n_workers} workers "
+                    f"(~{_bytes_human(est_per_chunk)} per task; avail={_bytes_human(avail)})")
+
+        # Limit BLAS threads inside the pool to 1 to avoid oversubscription
+        # (NumPy/MKL/OpenBLAS will otherwise multi-thread inside each worker)
+        limiter = None
+        try:
+            from threadpoolctl import threadpool_limits  # type: ignore
+            limiter = threadpool_limits(limits=1)
+        except Exception:
+            limiter = None  # OK if unavailable
+
+        # Execute in parallel
+        try:
+            if limiter is None:
+                # simple context manager that does nothing
+                from contextlib import contextmanager
+                @contextmanager
+                def _nullctx():
+                    yield
+                ctx = _nullctx()
             else:
-                N_denom = float(self.nsamp)
+                ctx = limiter
 
-            var = np.sum(G * G, axis=0, dtype=self.dtype) / max(N_denom - 1.0, 1.0)
-            inv[s:e] = (1.0 / np.sqrt(np.maximum(var, self.eps_var))).astype(self.dtype, copy=False)
+            with ctx:
+                with ThreadPoolExecutor(max_workers=n_workers) as ex:
+                    futures = [
+                        ex.submit(
+                            _resvar_worker_thread,
+                            span,            # (s, e)
+                            bed_prefix,
+                            row_sel,
+                            dtype,
+                            ddof,
+                            C, R,
+                            N_eff,
+                            eps
+                        )
+                        for span in chunks
+                    ]
+
+                    # Fill results as workers complete
+                    for fut in as_completed(futures):
+                        s, e, inv_part = fut.result()
+                        inv[s:e] = inv_part
+
+        except Exception as e:
+            # Fallback to serial path on any failure
+            self.log._log(f"[resvar] Parallel precompute failed ({e}); falling back to serial.")
+            for s, e in chunks:
+                G = self.G.read(index=np.s_[row_sel, s:e], dtype=dtype)  # (N × L)
+                means = np.nanmean(G, axis=0, dtype=dtype)
+                stds  = np.nanstd( G, axis=0, dtype=dtype, ddof=ddof)
+                stds[stds == 0] = 1.0
+                G = (G - means) / stds
+                np.nan_to_num(G, copy=False)
+
+                if C is not None and R is not None:
+                    tmp = R @ G
+                    G   = G - (C @ tmp)
+                    del tmp
+                    denom = float(self.N_eff)
+                else:
+                    denom = float(self.nsamp)
+
+                var = np.sum(G * G, axis=0, dtype=dtype) / max(denom - 1.0, 1.0)
+                inv[s:e] = (1.0 / np.sqrt(np.maximum(var, self.eps_var))).astype(dtype, copy=False)
 
         return inv
+
 
     # ------------------ I/O helpers ------------------
     def _read_annot(self, annot_path):
@@ -572,12 +682,8 @@ class GenomewideLDScore:
                         f"{min(kmax_per_block)}/{int(np.median(kmax_per_block))}/{max(kmax_per_block)}")
 
         # -------------------- Paths / common args --------------------
-        bed_prefix = getattr(self.G, "filename", None) or getattr(self.G, "filepath", None) or getattr(self, "bed_prefix", None) or self.G
-        p = Path(str(bed_prefix))
-        if p.suffix == ".bed":
-            p = p.with_suffix("")
-        bed_prefix = str(p)
-        fam_path   = str(p.with_suffix(".fam"))
+        bed_prefix = self.bed_prefix
+        fam_path   = self.fam_path
         row_sel = self.row_sel if self.row_sel is not None else None
         ddof    = int(self.ddof)
 
