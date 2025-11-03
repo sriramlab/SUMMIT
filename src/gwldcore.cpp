@@ -19,6 +19,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <memory>
+#include <set>
 #include <immintrin.h>
 
 #include <unordered_map>
@@ -30,6 +31,7 @@
   #include <sys/stat.h>
   #include <fcntl.h>
   #include <unistd.h>
+  #include <sched.h>
 #endif
 
 
@@ -62,10 +64,73 @@ struct AlignedBuffer {
     ~AlignedBuffer() { free(); }
 };
 
-// better tiling
+
+// Return the list of CPUs this process is allowed to run on.
+// Falls back to 1..(omp_get_max_threads) if affinity is unavailable.
+static inline std::vector<int> active_cpus() {
+    std::vector<int> cpus;
+#ifdef __linux__
+    long nconf = sysconf(_SC_NPROCESSORS_CONF);
+    if (nconf < 1) nconf = 1;
+    cpu_set_t mask;
+    CPU_ZERO(&mask);
+    if (sched_getaffinity(0, sizeof(mask), &mask) == 0) {
+        for (int i = 0; i < nconf; ++i) {
+            if (CPU_ISSET(i, &mask)) cpus.push_back(i);
+        }
+        if (!cpus.empty()) return cpus;
+    }
+#endif
+#ifdef _OPENMP
+    int n = std::max(1, omp_get_max_threads());
+#else
+    int n = 1;
+#endif
+    for (int i = 0; i < n; ++i) cpus.push_back(i);
+    return cpus;
+}
+
+// Read L3 size for a given CPU’s index3 (heuristic, may differ per CCD on AMD).
+static inline size_t read_l3_bytes_for_cpu(int cpu) {
+#ifdef __linux__
+    std::ostringstream p;
+    p << "/sys/devices/system/cpu/cpu" << cpu << "/cache/index3/size";
+    std::ifstream f(p.str());
+    if (f) {
+        std::string s; f >> s;
+        if (!s.empty()) {
+            char unit = s.back();
+            size_t val = std::stoul(s);
+            if (unit == 'K' || unit == 'k') return val * 1024ULL;
+            if (unit == 'M' || unit == 'm') return val * 1024ULL * 1024ULL;
+            return val;
+        }
+    }
+#endif
+    return 0;
+}
+
+// Count sockets by unique physical_package_id among active CPUs.
+static inline int detect_num_sockets() {
+#ifdef __linux__
+    std::set<int> sockets;
+    for (int cpu : active_cpus()) {
+        std::ostringstream path;
+        path << "/sys/devices/system/cpu/cpu" << cpu << "/topology/physical_package_id";
+        std::ifstream f(path.str());
+        if (f) {
+            int sid = -1; f >> sid;
+            if (sid >= 0) sockets.insert(sid);
+        }
+    }
+    if (!sockets.empty()) return (int)sockets.size();
+#endif
+    return 0; // unknown
+}
+
+struct TilePlan { int VPANEL; int CTILE; };
+
 static inline size_t read_l3_per_socket_bytes() {
-    // Try cpu0/index3/size as a proxy; robust enough for a heuristic.
-    // Parses "32768K" or "48M" etc.
     const char* path = "/sys/devices/system/cpu/cpu0/cache/index3/size";
     std::ifstream f(path);
     if (!f) return 0;
@@ -89,65 +154,106 @@ static inline double getenv_double(const char* k, double defv) {
     try { return std::max(0.0, std::stod(v)); } catch (...) { return defv; }
 }
 
-struct TilePlan { int VPANEL; int CTILE; };
-
 template <typename T>
 static inline TilePlan choose_tiles_auto(int N, int L, int B, int nvecs) {
-    // Env overrides
-    int env_ctile = getenv_int("SUMMIT_CTILE", -1);
-    int env_ctile_mb = getenv_int("SUMMIT_CTILE_MB", -1); // in MiB
-    double env_l3_pct = getenv_double("SUMMIT_CTILE_L3PCT", 0.65); // 65%
+    // ----------------- Env overrides -----------------
+    const int    env_ctile     = getenv_int("SUMMIT_CTILE",    -1);      // columns
+    const int    env_ctile_mb  = getenv_int("SUMMIT_CTILE_MB", -1);      // MiB
+    const double env_l3_pct    = getenv_double("SUMMIT_CTILE_L3PCT", 0.60);
 
     const size_t bytes = sizeof(T);
+    auto round64 = [](int x){ return ((x + 63) / 64) * 64; };
+    auto clamp   = [](int x, int lo, int hi){ return std::max(lo, std::min(hi, x)); };
 
-    // 1) If SUMMIT_CTILE is set, use it directly.
+    auto make_plan = [&](int CTILE) -> TilePlan {
+        CTILE = round64(std::max(64, CTILE));
+        // VPANEL ≈ CTILE/B, rounded to 64; at least 64, at most nvecs
+        int vguess = (B > 0) ? (CTILE / B) : CTILE;
+        int VPANEL = round64(std::max(64, std::min(nvecs, vguess)));
+        if (VPANEL > nvecs) VPANEL = nvecs;
+        if (VPANEL < 64)    VPANEL = std::min(64, std::max(1, nvecs)); // nvecs could be <64
+        return {VPANEL, CTILE};
+    };
+
+    // 1) Explicit CTILE override
     if (env_ctile > 0) {
-        int CTILE = ((env_ctile + 63)/64)*64;
-        int VPANEL = std::max(64, std::min(nvecs, ((CTILE / std::max(1,B)) + 63)/64*64));
-        return {VPANEL, CTILE};
+        return make_plan(env_ctile);
     }
 
-    // 2) If SUMMIT_CTILE_MB is set, compute CTILE from that memory budget
+    // 2) Memory-budget override (MiB)
     if (env_ctile_mb > 0) {
-        size_t target_bytes = (size_t)env_ctile_mb << 20; // MiB → bytes
-        size_t denom = (size_t)(N + L) * bytes;
-        int CTILE = (denom ? (int)(target_bytes / denom) : 2048);
-        CTILE = std::max(512, std::min(16384, ((CTILE + 63)/64)*64));
-        int VPANEL = std::max(64, std::min(nvecs, ((CTILE / std::max(1,B)) + 63)/64*64));
-        return {VPANEL, CTILE};
+        const size_t target_bytes = (size_t)env_ctile_mb << 20; // MiB→bytes
+        const size_t denom = (size_t)(N + L) * bytes;           // (rhs + lhs) footprint per column
+        int CTILE = denom ? (int)(target_bytes / denom) : 2048;
+        // Conservative clamps by dtype
+        if (bytes == 4) CTILE = clamp(round64(CTILE), 4096, 16384);
+        else            CTILE = clamp(round64(CTILE), 2048,  8192);
+        return make_plan(CTILE);
     }
 
-    // 3) L3-aware auto: ~60% of per-thread L3 share (heuristic)
-    size_t l3 = read_l3_per_socket_bytes();
-    int threads = 1;
-#ifdef _OPENMP
-    threads = std::max(1, omp_get_max_threads());
-#endif
-    // Assume dual-socket if we can’t probe. This is just a heuristic:
-    int sockets = std::max(1, getenv_int("SUMMIT_SOCKETS", 2));
-    // crude per-socket threads:
-    double threads_per_socket = std::max(1.0, (double)threads / (double)sockets);
-    size_t target_bytes = (l3 ? (size_t)(env_l3_pct * (double)l3 / threads_per_socket) : 0);
+    // ----------------- Auto (L3-aware) -----------------
+    // L3 per active CPU (heuristic: read from the first CPU in our affinity)
+    size_t l3_bytes = 0;
+    {
+        auto cpus = active_cpus();
+        int probe = cpus.empty() ? 0 : cpus.front();
+        l3_bytes = read_l3_bytes_for_cpu(probe); // may be 0 if not available
+    }
 
+    // Sockets: env override → topology detection → default=2
+    int sockets = getenv_int("SUMMIT_SOCKETS", 0);
+    if (sockets <= 0) {
+        sockets = detect_num_sockets();
+        if (sockets <= 0) sockets = 2;
+    }
+
+    // Parallel width: prefer affinity size over omp_get_max_threads()
+    int threads_total = 1;
+#ifdef _OPENMP
+    threads_total = std::max(1, omp_get_max_threads());
+#endif
+    {
+        int aff = (int)active_cpus().size();
+        if (aff > 0) threads_total = aff;
+    }
+    const double t_per_socket = std::max(1.0, (double)threads_total / (double)sockets);
+
+    // Target L3 per thread share
+    size_t target_bytes = 0;
+    if (l3_bytes > 0) {
+        target_bytes = (size_t)(env_l3_pct * (double)l3_bytes / t_per_socket);
+    }
+
+    // Convert target bytes → CTILE columns
     int CTILE;
     if (target_bytes > 0) {
-        size_t denom = (size_t)(N + L) * bytes;
-        CTILE = (denom ? (int)(target_bytes / denom) : 2048);
+        const size_t denom = (size_t)(N + L) * bytes;
+        CTILE = denom ? (int)(target_bytes / denom) : 2048;
     } else {
-        // Fallback conservative default
+        // Fallback defaults when topology info is missing
         CTILE = (bytes == 4) ? 8192 : 4096;
     }
 
-    // Round & clamp
-    if (bytes == 4) CTILE = std::max(4096, std::min(16384, ((CTILE + 63)/64)*64));
-    else            CTILE = std::max(2048, std::min( 8192, ((CTILE + 63)/64)*64));
+    // Clamp & round (dtype-aware)
+    if (bytes == 4) CTILE = clamp(round64(CTILE), 4096, 16384);
+    else            CTILE = clamp(round64(CTILE), 2048,  8192);
 
-    int VPANEL = std::max(64, std::min(nvecs, ((CTILE / std::max(1,B)) + 63)/64*64));
-    return {VPANEL, CTILE};
+    return make_plan(CTILE);
 }
 
-
 // --- timers ------------------------------------------------------------------
+struct P1Timers {
+    double t_packZ_ms = 0.0;   // pack Z→Bcol (per-bin)
+    double t_packA_ms = 0.0;   // pack Geno→A_tile (per N-tile)
+    double t_gemm_ms  = 0.0;   // GEMM time
+    double t_scatt_ms = 0.0;   // scatter-add C_tile → Xz
+
+    void dump(int blk_start, int blk_end, int B, int vcount) const {
+        std::fprintf(stderr,
+          "[phase1] block [%d:%d) B=%d V=%d  packZ=%.2f ms  packA=%.2f ms  gemm=%.2f ms  scatter=%.2f ms\n",
+          blk_start, blk_end, B, vcount, t_packZ_ms, t_packA_ms, t_gemm_ms, t_scatt_ms);
+    }
+};
 struct BlockTimers {
     double t_pack_ms = 0.0;
     double t_gemm_ms = 0.0;
@@ -545,6 +651,9 @@ void phase1_compute_Xz_bed_chunk_impl(const std::string &bed_prefix,
     const int N_TILE = std::is_same_v<T,float> ? 128 : 64;
     const int Kmax   = kmax_hint;
 
+    // timer
+    P1Timers t1;
+
     // Reusable per-bin buffers
     std::vector<int> idx_buf((size_t)L);
     std::vector<T>   scale_buf((size_t)L);
@@ -568,11 +677,14 @@ void phase1_compute_Xz_bed_chunk_impl(const std::string &bed_prefix,
         if (K == 0) continue;
 
         // Pack Bcol once per bin: (K x v_count)
+        auto z0 = std::chrono::high_resolution_clock::now();
         for (int c = 0; c < v_count; ++c) {
             const T *zc = Z.data() + (size_t)c * (size_t)L;
             T *dst      = Bcol.data() + (size_t)c * (size_t)K;
             for (int r = 0; r < K; ++r) dst[r] = zc[idx_buf[(size_t)r]];
         }
+        auto z1 = std::chrono::high_resolution_clock::now();
+        t1.t_packZ_ms += std::chrono::duration<double,std::milli>(z1 - z0).count();
 
         // N-tiling: one fat GEMM (Nt x v_count) per tile, then scatter-add into V-major dest
         #ifdef _OPENMP
@@ -582,6 +694,9 @@ void phase1_compute_Xz_bed_chunk_impl(const std::string &bed_prefix,
             AlignedBuffer<T> A_tile((size_t)N_TILE * (size_t)Kmax);           // (Nt x K)
             AlignedBuffer<T> C_tile((size_t)N_TILE * (size_t)v_count);        // (Nt x v_count)
 
+            // thread-local timers
+            double packA_ms = 0.0, gemm_ms = 0.0, scatt_ms = 0.0;
+
             #ifdef _OPENMP
             #pragma omp for schedule(static)
             #endif
@@ -589,6 +704,7 @@ void phase1_compute_Xz_bed_chunk_impl(const std::string &bed_prefix,
                 const int Nt = std::min(N - n0, N_TILE);
 
                 // Pack A_tile (Nt x K)
+                auto a0 = std::chrono::high_resolution_clock::now();
                 for (int c = 0; c < K; ++c) {
                     const int snp = idx_buf[(size_t)c];
                     const T   s   = scale_buf[(size_t)c];
@@ -603,24 +719,47 @@ void phase1_compute_Xz_bed_chunk_impl(const std::string &bed_prefix,
                     #pragma omp simd
                     for (int r = 0; r < Nt; ++r) dst[r] = src[r] * s;
                 }
+                auto a1 = std::chrono::high_resolution_clock::now();
+                packA_ms += std::chrono::duration<double,std::milli>(a1 - a0).count();
 
                 // GEMM: C_tile = A_tile (Nt x K) * Bcol (K x v_count); beta=0 → no need to clear
+                auto g0 = std::chrono::high_resolution_clock::now();
                 gemm_col_major_nn<T>(Nt, v_count, K,
                                     A_tile.ptr, Nt,
                                     Bcol.data(), K,
                                     C_tile.ptr, Nt,
                                     T(1), T(0));
 
+                auto g1 = std::chrono::high_resolution_clock::now();
+                gemm_ms += std::chrono::duration<double,std::milli>(g1 - g0).count();
+
                 // Scatter-add into V-major destination
+                auto s0 = std::chrono::high_resolution_clock::now();
                 for (int c = 0; c < v_count; ++c) {
                     const T *src_col = C_tile.ptr + (size_t)c * (size_t)Nt;
                     T *dst_col = Xptr + ((size_t)c * (size_t)B + (size_t)k) * (size_t)ldc + (size_t)n0;
                     #pragma omp simd
                     for (int r = 0; r < Nt; ++r) dst_col[r] += src_col[r];
                 }
+                auto s1 = std::chrono::high_resolution_clock::now();
+                scatt_ms += std::chrono::duration<double,std::milli>(s1 - s0).count();
             }
+            #ifdef _OPENMP
+            #pragma omp atomic
+            t1.t_packA_ms += packA_ms;
+            #pragma omp atomic
+            t1.t_gemm_ms  += gemm_ms;
+            #pragma omp atomic
+            t1.t_scatt_ms += scatt_ms;
+            #else
+            t1.t_packA_ms += packA_ms;
+            t1.t_gemm_ms  += gemm_ms;
+            t1.t_scatt_ms += scatt_ms;
+            #endif
         } // parallel
     } // bins
+    t1.dump(blk_start, blk_end, /*B=*/(int)Ainfo.shape[1], /*vcount=*/v_count);
+
 }
 
 // -------------------------- Phase 2: compute_XtXz (float/double) -------------

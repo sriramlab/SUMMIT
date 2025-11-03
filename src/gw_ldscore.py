@@ -5,13 +5,9 @@ import utils
 import numpy as np
 import pandas as pd
 from bed_reader import open_bed
-import multiprocessing as mp
 from tqdm import tqdm
-from scipy.linalg import blas as fblas
 import sys
 import gc
-from multiprocessing import shared_memory
-import atexit
 import os
 import ctypes
 import threading
@@ -20,37 +16,137 @@ from pathlib import Path
 import time
 import gwldcore
 
+from contextlib import contextmanager
+
 _THREAD_LOCAL = threading.local()
 
-os.environ.setdefault("MALLOC_ARENA_MAX", "2")           # limit per-process arenas
-os.environ.setdefault("MALLOC_TRIM_THRESHOLD_", "131072")  # bytes; encourage trims
-os.environ.setdefault("MALLOC_MMAP_THRESHOLD_", "131072")  # bytes; mmap large blocks
+def apply_env(cfg: dict) -> int:
+    """
+    Apply low-level environment knobs from a plain dict and enforce BLAS/OMP threads.
 
-def limit_blas_threads(n: int = 4):
+    Recognized keys (all optional):
+      - num_threads: int               # single knob used for BOTH OMP and BLAS
+      - ctile: int                     # direct CTILE override (cols)
+      - ctile_mb: int                  # CTILE memory budget (MiB)
+      - ctile_l3pct: float             # 0.0–1.0 fraction of per-socket L3 cache
+      - malloc_arena_max: int          # glibc arena hygiene (default is 2)
+      - malloc_trim_threshold: int     # trim threshold bytes (default is 131072)
+      - malloc_mmap_threshold: int     # mmap threshold bytes (default is 131072)
+
+    Returns:
+      actual_blas_threads (int): detected BLAS threads after enforcement.
     """
-    Cap BLAS/OpenMP thread teams so mp.Pool workers don't oversubscribe the CPU.
-    Call this BEFORE spawning any Pools.
-    """
-    import os
-    n = max(1, int(n))
-    os.environ["OMP_NUM_THREADS"] = str(n)
-    os.environ["MKL_NUM_THREADS"] = str(n)
-    os.environ["OPENBLAS_NUM_THREADS"] = str(n)
-    os.environ["BLIS_NUM_THREADS"] = str(n)
-    os.environ["VECLIB_MAXIMUM_THREADS"] = str(n)
-    os.environ["NUMEXPR_NUM_THREADS"] = str(n)
-    os.environ["MKL_DYNAMIC"] = "FALSE"
+
+    def _cpu_count_affinity() -> int:
+        try:
+            return len(os.sched_getaffinity(0))  # respects cgroup/pin
+        except Exception:
+            return os.cpu_count() or 1
+
+    # Probe BLAS threads after we set things, using threadpoolctl if available.
+    def _detect_blas_threads_fallback() -> int:
+        for k in ("OPENBLAS_NUM_THREADS","MKL_NUM_THREADS","BLIS_NUM_THREADS","VECLIB_MAXIMUM_THREADS"):
+            v = os.environ.get(k)
+            if v and v.isdigit():
+                return max(1, int(v))
+        return _cpu_count_affinity()
+
+    def _detect_blas_threads() -> int:
+        try:
+            from threadpoolctl import threadpool_info  # type: ignore
+            tot = 0
+            for lib in threadpool_info():
+                api = str(lib.get("internal_api", "")).lower()
+                path = str(lib.get("filepath", "")).lower()
+                if any(k in api for k in ("openblas","mkl","blis","accelerate")) or \
+                   any(k in path for k in ("openblas","mkl","blis","veclib","accelerate")):
+                    tot += int(lib.get("num_threads", 0))
+            return tot if tot > 0 else _detect_blas_threads_fallback()
+        except Exception:
+            return _detect_blas_threads_fallback()
+
+    # -------- 1) Threads (single knob for both OMP & BLAS) --------
+    n_threads = cfg.get("num_threads")
+    if n_threads is None or int(n_threads) <= 0:
+        n_threads = _cpu_count_affinity()
+    n_threads = max(1, int(n_threads))
+
+    # OpenMP (phase 1) & BLAS (phase 2) will be re-tuned around calls,
+    # but we set sane process-wide defaults here:
+    os.environ["OMP_NUM_THREADS"] = str(n_threads)
     os.environ["OMP_DYNAMIC"] = "FALSE"
+    # BLAS vendors
+    os.environ["OPENBLAS_NUM_THREADS"] = str(n_threads)
+    os.environ["OPENBLAS_DYNAMIC"] = "0"
+    os.environ["MKL_NUM_THREADS"] = str(n_threads)
+    os.environ["MKL_DYNAMIC"] = "FALSE"
+    os.environ["BLIS_NUM_THREADS"] = str(n_threads)
+    os.environ["VECLIB_MAXIMUM_THREADS"] = str(n_threads)
+
+    # Also try to enforce into already loaded libraries
     try:
         import mkl  # type: ignore
-        mkl.set_num_threads(n)
+        mkl.set_num_threads(n_threads)
     except Exception:
         pass
+    # OpenBLAS direct calls (attempt several sonames/symbols)
+    try:
+        import ctypes
+        for soname in ("libopenblas.so", "libopenblas.so.0", "libopenblas64_.so", "libopenblas64_.so.0"):
+            try:
+                lib = ctypes.CDLL(soname)
+                for sym in ("openblas_set_num_threads", "openblas_set_num_threads64_"):
+                    try:
+                        getattr(lib, sym)(int(n_threads))
+                        break
+                    except AttributeError:
+                        continue
+                break
+            except OSError:
+                continue
+    except Exception:
+        pass
+    # threadpoolctl as a final clamp
+    tpctx = None
     try:
         from threadpoolctl import threadpool_limits  # type: ignore
-        threadpool_limits(limits=n)
+        tpctx = threadpool_limits(limits=n_threads, user_api="blas")
     except Exception:
-        pass
+        tpctx = None
+        
+    actual = _detect_blas_threads()
+    os.environ["SUMMIT_BLAS_THREADS"] = str(actual)
+
+    # -------- 2) C++ tiler/env knobs --------
+    if cfg.get("ctile") is not None:
+        os.environ["SUMMIT_CTILE"] = str(int(cfg["ctile"]))
+    else:
+        os.environ.pop("SUMMIT_CTILE", None)
+
+    if cfg.get("ctile_mb") is not None:
+        os.environ["SUMMIT_CTILE_MB"] = str(int(cfg["ctile_mb"]))
+    else:
+        os.environ.pop("SUMMIT_CTILE_MB", None)
+
+    if cfg.get("ctile_l3pct") is not None:
+        os.environ["SUMMIT_CTILE_L3PCT"] = f"{float(cfg['ctile_l3pct']):.3f}"
+    else:
+        os.environ.pop("SUMMIT_CTILE_L3PCT", None)
+
+    sockets = cfg.get("sockets")
+    if sockets is not None:
+        os.environ["SUMMIT_SOCKETS"] = str(int(sockets))
+    
+    # -------- 3) Malloc hygiene (optional) --------
+    if cfg.get("malloc_arena_max") is not None:
+        os.environ["MALLOC_ARENA_MAX"] = str(int(cfg["malloc_arena_max"]))
+    if cfg.get("malloc_trim_threshold") is not None:
+        os.environ["MALLOC_TRIM_THRESHOLD_"] = str(int(cfg["malloc_trim_threshold"]))
+    if cfg.get("malloc_mmap_threshold") is not None:
+        os.environ["MALLOC_MMAP_THRESHOLD_"] = str(int(cfg["malloc_mmap_threshold"]))
+
+    return actual
+
 
 def set_parallelism(omp_threads: int | None = None, blas_threads: int | None = None):
     """
@@ -86,7 +182,55 @@ def set_parallelism(omp_threads: int | None = None, blas_threads: int | None = N
         except Exception:
             pass
 
+def _round_up_to(x, gran):
+    return int(((x + gran - 1) // gran) * gran)
 
+def _build_balanced_vtiles(V, vmax, gran=64, max_tiles=4):
+    """
+    Split V vectors into ~equal tiles, each ≤ vmax, rounded to `gran` (e.g., 64),
+    minimizing the worst tail. Returns list of (v_start, v_count).
+    """
+    vmax = max(gran, (vmax // gran) * gran)
+    if vmax >= V:
+        return [(0, V)]
+    # minimal number of tiles that respects vmax
+    tiles = int(math.ceil(V / vmax))
+    tiles = min(max_tiles, max(2, tiles))  # cap to avoid too many passes
+
+    # base and remainder for balanced split
+    q, r = divmod(V, tiles)
+    # round each tile to granularity, but never exceed vmax
+    sizes = []
+    for t in range(tiles):
+        sz = q + (1 if t < r else 0)
+        sz = min(vmax, _round_up_to(sz, gran))
+        sizes.append(sz)
+
+    # adjust if rounding up overshot total by a lot
+    total = sum(sizes)
+    # if total > V, bleed off the excess from the last tiles
+    over = total - V
+    t = len(sizes) - 1
+    while over > 0 and t >= 0:
+        bleed = min(over, sizes[t] - max(gran, q))  # don't shrink below ~base
+        bleed = (bleed // gran) * gran
+        if bleed > 0:
+            sizes[t] -= bleed
+            over -= bleed
+        t -= 1
+
+    # build (start,count)
+    vtiles, v0 = [], 0
+    for sz in sizes:
+        if sz <= 0: continue
+        if v0 + sz > V: sz = V - v0
+        if sz <= 0: break
+        vtiles.append((v0, sz))
+        v0 += sz
+    # final guard
+    if v0 < V:
+        vtiles.append((v0, V - v0))
+    return vtiles
 
 def _bytes_human(n):
     if n is None: return "n/a"
@@ -130,7 +274,6 @@ def _canonical_bfile_prefix(x: str) -> str:
         if s.endswith(ext):
             return s[: -len(ext)]
     return s
-
 
 
 def _resvar_worker_thread(span,
@@ -266,6 +409,7 @@ class GenomewideLDScore:
                 out_path,
                 log,
                 rand_dist,
+                low_level,
                 covar_path=None,
                 num_vecs=10,
                 step_size=1000,
@@ -276,16 +420,11 @@ class GenomewideLDScore:
                 eps_var: float = 1e-10,
                 rand_samp=None, # float in (0,1] or int in [100, N]
                 ddof = 1):
+        
+        self.tune = apply_env(low_level)
+        
         # Cap BLAS threads before any Pools spawn
         self.num_threads = int(num_threads)
-        try:
-            gwldcore.set_num_threads(int(self.num_threads))
-        except Exception:
-            pass
-        try:
-            limit_blas_threads(self.num_threads)
-        except NameError:
-            pass  # if helper isn't defined here
 
         self.eps_var = float(eps_var)
         prefix = _canonical_bfile_prefix(bed_path)
@@ -371,86 +510,6 @@ class GenomewideLDScore:
 
         # storage used by correlation mode
         self.inv_sqrt_resvar_all = None # (M,) 1/sqrt(Var(M x_m)+eps)
-
-    def _auto_vchunk(self, phase: str) -> int:
-        """
-        Throughput-oriented V-chunk sizing:
-        - Aim for a modest Xz_chunk to keep NUMA/THP behavior stable.
-        - Prefer physical socket count over NUMA-node count.
-        - Default ~8 GiB per socket unless overridden by env:
-            SUMMIT_VCHUNK_GB              (total GiB)
-            SUMMIT_VCHUNK_PER_SOCKET_GB   (GiB per physical socket)
-        """
-        import subprocess, shlex
-
-        b = int(np.dtype(self.dtype).itemsize)
-        N, B, V = int(self.nsamp), int(self.nbins), int(self.nvecs)
-
-        # --- determine "sockets" (prefer physical sockets over NUMA nodes) ---
-        sockets = 1
-        try:
-            # Try lscpu "Socket(s):"
-            out = subprocess.check_output(shlex.split("lscpu"), text=True, stderr=subprocess.DEVNULL)
-            for line in out.splitlines():
-                if "Socket(s):" in line:
-                    sockets = max(1, int(line.split()[-1]))
-                    break
-        except Exception:
-            pass
-        if sockets == 1:
-            # Fallback: count NUMA nodes if no lscpu or weird env
-            try:
-                nodes = [p for p in Path("/sys/devices/system/node").glob("node[0-9]*") if p.is_dir()]
-                if nodes:
-                    sockets = max(1, len(nodes))
-            except Exception:
-                pass
-
-        # --- env overrides (GiB) ---
-        def _env_gb(name):
-            try:
-                v = os.environ.get(name, "").strip()
-                return float(v) if v else None
-            except Exception:
-                return None
-
-        total_gb = _env_gb("SUMMIT_VCHUNK_GB")
-        per_socket_gb = _env_gb("SUMMIT_VCHUNK_PER_SOCKET_GB")
-
-        if total_gb is not None:
-            target_bytes = int(total_gb * (1024**3))
-        else:
-            if per_socket_gb is None:
-                per_socket_gb = 8.0  # conservative default
-            target_bytes = int(per_socket_gb * sockets * (1024**3))
-
-        # compute v_chunk from target bytes; keep >=64 and <=V, multiple of 64
-        denom = N * B * b
-        if denom <= 0:
-            return min(V, 64)
-
-        # ensure the target can at least hold 64 columns
-        min_bytes = denom * 64
-        if target_bytes < min_bytes:
-            target_bytes = min_bytes
-
-        v_chunk = target_bytes // denom
-        v_chunk = int(max(64, min(V, v_chunk)))
-        v_chunk = int(min(V, ((v_chunk + 63) // 64) * 64))
-
-        # log
-        try:
-            xz_gib = (N * (B * v_chunk) * b) / (1024**3)
-            self.log._log(
-                f"[auto_vchunk] sockets={sockets}, dtype={self.dtype}, "
-                f"target≈{target_bytes/(1024**3):.1f} GiB, v_chunk={v_chunk} → Xz≈{xz_gib:.1f} GiB"
-            )
-        except Exception:
-            pass
-
-        return v_chunk
-
-
     
     def _precompute_residual_variances(self):
         """
@@ -609,8 +668,8 @@ class GenomewideLDScore:
         try:
             df = pd.read_csv(annot_path, sep=r'\s+', compression='infer',
                             dtype={'CHR':str, 'BP':np.int64, 'SNP':str, 'CM':float})
-            base_cols = ['CHR', 'BP', 'SNP', 'CM']
-            if all(c in df.columns[:4].tolist() for c in base_cols) and 'SNP' in df.columns:
+            base_cols = {'CHR', 'BP', 'SNP', 'CM'}
+            if base_cols.issubset(set(df.columns)) and 'SNP' in df.columns:
                 annot_cols = [c for c in df.columns if c not in base_cols]
                 if len(annot_cols) == 0:
                     raise ValueError("No annotation columns found after [CHR,BP,SNP,CM].")
@@ -705,29 +764,27 @@ class GenomewideLDScore:
     # ------------------ main compute ------------------
     def _compute_ldscore(self):
         """
-        Streamed V-chunk pipeline with a single progress bar over (vtiles × blocks).
+        Streamed, balanced V-tiling pipeline with a single progress bar over (vtiles × blocks).
 
         Steps:
         0) Precompute per-SNP inv sqrt residual variances (right side).
-        1) Build SNP blocks; precompute Kmax per block from annotation (count of nonzeros per bin).
-        2) For each V-tile:
-            Phase 1 (chunked): build Xz_chunk (N × B·Vt) across all blocks (skip if Kmax==0)
+        1) Build SNP blocks; precompute Kmax per block from annotation.
+        2) Choose an initial V-tile from a memory budget, then BALANCE tiles evenly.
+        3) For each balanced V-tile:
+            Phase 1: build Xz_chunk (N × B·Vt) across all blocks (skip if Kmax==0)
             Phase 2: consume Xz_chunk across all blocks (skip if Kmax==0)
-            Accumulate weighted sum (by Vt)
-        3) Finalize: divide by total V, subtract baseline, save; print summaries.
+            Accumulate weighted by Vt
+        4) Finalize: divide by total V, subtract baseline, save; print summaries.
         """
+        import os, time, ctypes, numpy as np, pandas as pd
+        from tqdm import tqdm
+
         self.log._log(f"num_vecs: {self.nvecs}, step_size: {self.step_size}, seed: {self.root_seed}")
         self.log._log(f"Using {self.rand_dist} random vectors.")
         if self.C is not None:
             self.log._log(f"Covariate-adjusted partial correlations (N_eff={self.N_eff}, p={self.p_eff}).")
         else:
             self.log._log("No covariates: standard LD scores (squared correlations).")
-
-        # -------------------- Pick V-chunk size --------------------
-        vchunk = self._auto_vchunk('stream')
-        vchunk = max(64, min(self.nvecs, vchunk))
-        vchunk = min(self.nvecs, ((vchunk + 63) // 64) * 64)
-        self.log._log(f"Streaming with V-chunk size = {vchunk} (total V = {self.nvecs})")
 
         # -------------------- Phase 0: per-SNP residual variances --------------------
         set_parallelism(omp_threads=self.num_threads, blas_threads=1)
@@ -741,7 +798,7 @@ class GenomewideLDScore:
             blocks.append((s, e))
         self.nblks = len(blocks)
 
-        # -------------------- Precompute Kmax per block (trust hints) --------------------
+        # -------------------- Precompute Kmax per block (trust hints) ----------------
         kmax_per_block: list[int] = []
         for (s, e) in blocks:
             blk = self.annot[s:e]  # (L x B)
@@ -754,48 +811,83 @@ class GenomewideLDScore:
             self.log._log(f"Kmax per block (min/median/max): "
                         f"{min(kmax_per_block)}/{int(np.median(kmax_per_block))}/{max(kmax_per_block)}")
 
+        # -------------------- Choose initial V-chunk by memory budget ----------------
+        # Target memory for Xz panel (N x (B*Vt)) in GiB; you can set self.target_xz_gib
+        target_gib = float(getattr(self, "target_xz_gib", 16.0)) ## TODO: make an argparse option for this
+        itemsize = np.dtype(self.dtype).itemsize
+        denom = max(1, int(self.nsamp) * int(self.nbins) * itemsize)
+        vtile_guess = int((target_gib * (1024**3)) // denom)
+        # Clamp to [min, nvecs]; keep it reasonable for big runs
+        vtile_guess = max(256, min(self.nvecs, vtile_guess))
+        # If guess is too small/large, fall back to something sane
+        if vtile_guess <= 0:
+            vtile_guess = min(self.nvecs, 4096)
+
+        # BALANCED TILING: number of tiles then even split
+        ntiles = int(np.ceil(self.nvecs / vtile_guess))
+        ntiles = max(1, ntiles)
+        base = (self.nvecs // ntiles)
+        rem  = (self.nvecs %  ntiles)
+        vtiles = [((base + (1 if i < rem else 0) + 63)//64)*64 for i in range(ntiles)]
+        # fix last tile to hit sum(V)
+        vtiles[-1] = self.nvecs - sum(vtiles[:-1])
+        vtiles = [v for v in vtiles if v > 0]
+        assert sum(vtiles) == self.nvecs
+
+        if len(vtiles) == 1:
+            self.log._log(
+                f"[auto_vchunk] dtype={self.dtype} target≈{target_gib:.1f} GiB, "
+                f"v_tiles=[{vtiles[0]}] → Xz≈{(self.nsamp*self.nbins*vtiles[0]*itemsize)/(1024**3):.2f} GiB"
+            )
+        else:
+            self.log._log(
+                f"[auto_vchunk] dtype={self.dtype} target≈{target_gib:.1f} GiB, "
+                f"v_tiles={vtiles[0]}×{(len(vtiles)-1)}+{vtiles[-1]} → Xz≈{(self.nsamp*self.nbins*vtiles[0]*itemsize)/(1024**3):.2f} GiB"
+            )
+        self.log._log(f"Streaming with BALANCED V-tiles: {vtiles} (total V = {self.nvecs})")
+
         # -------------------- Paths / common args --------------------
         bed_prefix = self.bed_prefix
         fam_path   = self.fam_path
-        row_sel    = self.row_sel if self.row_sel is not None else None
-        ddof       = int(self.ddof)
-        B          = int(self.nbins)
+        row_sel = self.row_sel if self.row_sel is not None else None
+        ddof    = int(self.ddof)
+        B       = int(self.nbins)
 
         # -------------------- Accumulators & scratch --------------------
         meansq_accum = np.zeros((self.nsnps, self.nbins), dtype=self.dtype, order='C')
+
+        # Preallocate Xz_chunk once at max tile width = B * max(vtiles)
+        Vmax      = max(vtiles) if vtiles else 0
+        Xz_chunk  = np.zeros((self.nsamp, int(self.nbins) * int(Vmax)),
+                            dtype=self.dtype, order='F')
         meansq_chunk = np.zeros_like(meansq_accum, dtype=self.dtype, order='C')
 
-        # Preallocate Xz_chunk once at max width = B * vchunk (Fortran for BLAS-friendly column access)
-        Xz_chunk = np.zeros((self.nsamp, B * vchunk), dtype=self.dtype, order='F')
-
-        # Build V-tiles list (start, count)
-        vtiles = [(v0, min(vchunk, self.nvecs - v0)) for v0 in range(0, self.nvecs, vchunk)]
-        n_blocks = len(blocks)
-        n_vtiles = len(vtiles)
-
-        # -------------------- Single progress bar over vtiles × blocks --------------------
-        total_units = n_vtiles * n_blocks
+        # -------------------- Progress bar over vtiles × blocks ----------------------
+        total_units = len(vtiles) * len(blocks)
         bar = tqdm(total=total_units, desc="GW-LD progress", unit="task", smoothing=0.2, miniters=1)
 
-        # EMA for phase weight (fraction assigned to Phase-1 updates)
+        # EMA for phase weight (fraction for Phase-1)
         ema_p1 = 0.0
         ema_p2 = 0.0
-        w1 = 0.5  # start neutral; adapt after the first tile
+        w1 = 0.5  # neutral start
 
         try:
-            for vt_idx, (v_start, Vt) in enumerate(vtiles):
-                # Fortran-contiguous view of active columns only
+            v_start = 0
+            for vt_idx, Vt in enumerate(vtiles):
                 used_cols = B * Vt
                 Xz_view = Xz_chunk[:, :used_cols]
                 Xz_view.fill(0)
 
                 # ---------------------- Phase 1 (chunked) ----------------------
+                # OMP = many; BLAS = 1
                 set_parallelism(omp_threads=self.num_threads, blas_threads=1)
                 t1_total = 0.0
+                
                 for blk_idx, (s, e) in enumerate(blocks):
                     kmax_hint = int(kmax_per_block[blk_idx])
+
                     if kmax_hint == 0:
-                        bar.update(1.0)  # still count this (vtile, block)
+                        bar.update(1.0)
                         continue
 
                     annot_blk = np.ascontiguousarray(self.annot[s:e].astype(self.dtype, copy=False))
@@ -815,28 +907,31 @@ class GenomewideLDScore:
                         kmax_hint=kmax_hint,              # TRUST
                         rand_dist=self.rand_dist,
                         seed=self.root_seed,
-                        Xz2d_chunk=Xz_view,               # (N x (B*Vt))
+                        Xz2d_chunk=Xz_view,               # (N x (B*Vt)) Fortran, V-major
                         project_right=False,
                         C=(self.C if self.C is not None else None),
                         R=(self.cov_R if self.C is not None else None)
                     )
                     t1_total += (time.perf_counter() - t0)
 
-                    # Fractional progress for Phase-1 portion
                     bar.update(w1)
 
                 # ---------------------- Phase 2 ----------------------
-                set_parallelism(omp_threads=1, blas_threads=self.num_threads)
                 meansq_chunk.fill(0)
                 t2_total = 0.0
 
+                # OMP = 1; BLAS = many
+                set_parallelism(omp_threads=1, blas_threads=self.num_threads)
                 for blk_idx, (s, e) in enumerate(blocks):
                     kmax_hint = int(kmax_per_block[blk_idx])
                     if kmax_hint == 0:
                         continue
 
                     inv_left = np.ascontiguousarray(self.inv_sqrt_resvar_all[s:e].astype(self.dtype, copy=False))
-                    N_denom  = float(self.N_eff if self.C is not None else self.nsamp)
+                    if self.C is not None:
+                        N_denom = int(self.N_eff)             # C++ uses N_eff - 1 inside
+                    else:
+                        N_denom = int(self.nsamp - self.ddof + 1)
 
                     t0 = time.perf_counter()
                     gwldcore.phase2_compute_XtXz_bed(
@@ -847,7 +942,7 @@ class GenomewideLDScore:
                         ddof=ddof,
                         inv_left=inv_left,            # (L,)
                         nvecs=int(Vt),                # mean over THIS tile only
-                        vchunk=int(Vt),
+                        vchunk=int(Vt),               # (unused in C++; keep for signature)
                         Xz2d=Xz_view,                 # (N x (B*Vt))
                         meansq=meansq_chunk,          # (M x B), per-block rows overwritten
                         C=(self.C if self.C is not None else None),
@@ -856,23 +951,24 @@ class GenomewideLDScore:
                     )
                     t2_total += (time.perf_counter() - t0)
 
-                    # Finish the unit for this (vtile, block) with Phase-2 fraction
                     bar.update(1.0 - w1)
 
                 # Weighted combine across tiles
                 meansq_accum += (meansq_chunk * Vt)
 
-                # Adapt phase weight for smoother ETA (EMA)
+                # Adapt phase weight (EMA)
                 ema_p1 = 0.85 * ema_p1 + 0.15 * max(t1_total, 1e-9)
                 ema_p2 = 0.85 * ema_p2 + 0.15 * max(t2_total, 1e-9)
                 w1 = float(ema_p1 / (ema_p1 + ema_p2))
-                bar.set_postfix_str(f"tile {vt_idx+1}/{n_vtiles} | w1={w1:.2f} | P1={t1_total:.1f}s P2={t2_total:.1f}s")
+                bar.set_postfix_str(f"tile {vt_idx+1}/{len(vtiles)} | w1={w1:.2f} | P1={t1_total:.1f}s P2={t2_total:.1f}s")
 
                 # Housekeeping
                 try:
                     ctypes.CDLL("libc.so.6").malloc_trim(0)
                 except Exception:
                     pass
+
+                v_start += Vt  # advance seed offset
 
         finally:
             try:
@@ -883,7 +979,7 @@ class GenomewideLDScore:
         # ---------------------- Finalize & save ----------------------
         meansq = (meansq_accum / float(self.nvecs)).astype(self.dtype, copy=False)
 
-        # Baseline subtraction: classic correlation null M_k / N_denom
+        # Baseline subtraction: classic correlation null M_k / N_denom (ddof-aware)
         N_denom = float(self.N_eff - 1.0 if self.C is not None else self.nsamp - self.ddof)
         self.log._log("Applying correlation null: subtracting M_k / N_denom per bin.")
         meansq -= (self.nsnps_bin / N_denom).astype(meansq.dtype, copy=False)[None, :]
@@ -901,6 +997,7 @@ class GenomewideLDScore:
         scores_df = pd.DataFrame(self.gwldscore, columns=self.l2cols)
         out_df = pd.concat([self.snpdf, scores_df], axis=1)
         out_df.to_csv(f'{self.outpath}.gw.ldscore.gz', index=False, compression='gzip', sep='\t', float_format='%.6f')
+
 
         # Summaries (best-effort)
         try:
@@ -934,28 +1031,3 @@ class GenomewideLDScore:
         self.log._log("Runtime: "+format(self.runtime, '.3f')+
                     f" s ({self.runtime//3600} hr {(self.runtime%3600)//60} m {(self.runtime%60):.3f} s)")
         self.log._save_log(self.outpath+".gw.log")
-
-
-
-    
-    def _print_expected_mem(self, phase, block_len=None, k_max=None):
-        b = np.dtype(self.dtype).itemsize
-        B, N, M, V, S = self.nbins, self.nsamp, self.nsnps, self.nvecs, self.step_size
-        L = min(S, M)
-
-        xz_bytes = N * (V * B) * b
-        ms_bytes = M * B * b
-
-        vchunk = (self.v_chunk_xz if phase == 'Xz'
-                else getattr(self, 'v_chunk_xtxz', self.nvecs))
-        geno_blk = N * L * b
-        per_worker = geno_blk + (L * min(vchunk, V) * b)  # chunked temp
-
-        total_est = xz_bytes + ms_bytes
-        self.log._log(
-            f"[expected {phase}] dtype={self.dtype}, B={B}, N={N}, M={M}, V={V}, S={S} "
-            f"→ parent(Xz2d+meansq)≈{_bytes_human(xz_bytes + ms_bytes)}, "
-            f"per-worker temps≈{_bytes_human(per_worker)}, "
-            f"total≈{_bytes_human(total_est)}"
-        )
-

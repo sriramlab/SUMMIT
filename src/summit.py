@@ -40,10 +40,6 @@ parser.add_argument("--thin-annot", action='store_true', default=False, \
                     help='Use thin annotation (annotation matrix only) instead of full annotation file')
 parser.add_argument("--geno", default=None, type=str, \
                     help='Path of the genotype file to calculate the genome-wide LD scores. Calculates partitioned scores if --annot is also specified.')
-parser.add_argument("--nworkers", default=4, type=int, \
-                    help='Number of workers for multiprocessing to calculate stochastic genome-wide LD scores. Default is 4.')
-parser.add_argument("--num-threads", default=4, type=int, \
-                    help='Cap the number of threads for BLAS to limit CPU usage. Default is 4.')
 parser.add_argument("--nvecs", default=1000, type=int, \
                     help='Number of random vectors to use for estimating stochastic genome-wide LD scores. Default is 1000.')
 parser.add_argument("--step_size", default=1000, type=int, \
@@ -71,6 +67,33 @@ parser.add_argument("--rand-samp", default=None, type=float, \
                     help="Select a random subset of the samples for LD score calculation. Pass a value between (0, 1] for a ratio, and an integer greater than 100 for the number of samples.)")
 parser.add_argument("--ddof", default=1, type=int, \
                     help="Specify the delta degrees of freedom (ddof) for estimating genome-wide LD scores. Default is 1 (empirical SD).")
+parser.add_argument("--num-threads", default=4, type=int, \
+                    help='Cap the number of threads for BLAS to limit CPU usage. Default is 4.')
+
+
+# Low-level performance knobs
+parser.add_argument("--ctile", type=int, default=None,
+                    help="Manual CTILE override (columns in the RHS tile). Rounded up to a multiple of 64. If set, overrides --ctile-mib and --ctile-l3pct.")
+parser.add_argument("--ctile-mb", type=int, default=None,
+                    help="Memory-budget-driven CTILE (MiB). If set, overrides --ctile-l3pct. Mutually exclusive with --ctile.")
+parser.add_argument("--ctile-l3pct", type=float, default=0.80,
+                    help="Fraction of per-socket L3 cache to target per BLAS thread for CTILE auto-sizing. Ignored if --ctile or --ctile-mib is provided. Default: 0.60")
+parser.add_argument("--target-xz-gib", type=float, default=16.0,
+                    help="Memory budget (GiB) for the Phase-1 Xz panel (N × B × Vt). Used to pick the initial V-tile before balancing. Default: 16.0")
+parser.add_argument("--sockets", type=int, default=None,
+                    help="Override the number of CPU sockets for CTILE heuristics. By default it is auto-detected from CPU topology.")
+parser.add_argument("--malloc-arena-max", type=int, default=2)
+parser.add_argument("--malloc-trim-threshold", type=int, default=131072)
+parser.add_argument("--malloc-mmap-threshold", type=int, default=131072)
+
+# Optional overrides for V-tiling (balanced split logic still applies)
+parser.add_argument("--vchunk", type=int, default=None,
+                    help="Fixed V-chunk size. If set, disables auto memory-based guess.")
+parser.add_argument("--vtiles", type=int, default=None,
+                    help="Force number of V-tiles; the code will split V evenly into this many tiles.")
+
+
+
 
 
 def _check_outdir(path_str: str, create: bool = True, log=None):
@@ -113,8 +136,6 @@ def _check_outdir(path_str: str, create: bool = True, log=None):
         else:
             print(f"!!! Cannot write to output directory '{parent}': {e} !!!", file=sys.stderr)
         sys.exit(1)
-
-
 
 
 if __name__ == '__main__':
@@ -170,11 +191,23 @@ if __name__ == '__main__':
     
     log.install_excepthook()
     log.attach_file(args.out + (".gw.log" if args.geno else ".log"))
+    
+    ## low-level config params that most people won't need
+    low_level = {
+        "ctile":         args.ctile,
+        "ctile_mb":      args.ctile_mb,
+        "ctile_l3pct":   args.ctile_l3pct,
+        "sockets":       args.sockets,
+        "malloc_arena_max":        args.malloc_arena_max,
+        "malloc_trim_threshold":   args.malloc_trim_threshold,
+        "malloc_mmap_threshold":   args.malloc_mmap_threshold,
+    }
 
     if (args.geno is not None):
+        # set 
         gwld = GenomewideLDScore(bed_path=args.geno, annot_path=args.annot, out_path=args.out, covar_path=args.covar, rand_dist=args.rand_dist,\
             log=log, num_vecs=args.nvecs, step_size=args.step_size, seed=args.seed, verbose=args.verbose, \
-                dtype = args.dtype, num_threads=args.num_threads, rand_samp=args.rand_samp)
+                dtype = args.dtype, num_threads=args.num_threads, rand_samp=args.rand_samp, low_level=low_level)
         gwld._compute_ldscore()
     elif (args.h2 is not None):
         if (args.trace is None) and (args.ldscores is None):
