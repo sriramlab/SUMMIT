@@ -52,6 +52,41 @@ def limit_blas_threads(n: int = 4):
     except Exception:
         pass
 
+def set_parallelism(omp_threads: int | None = None, blas_threads: int | None = None):
+    """
+    Set OpenMP and BLAS vendor threads independently.
+    Call early (before spawning Pools) and around phases to avoid nested teams.
+    """
+    import os
+    if omp_threads is not None:
+        os.environ["OMP_NUM_THREADS"] = str(max(1, int(omp_threads)))
+        os.environ["OMP_DYNAMIC"] = "FALSE"
+
+    if blas_threads is not None:
+        n = max(1, int(blas_threads))
+        os.environ["MKL_DYNAMIC"] = "FALSE"
+        os.environ["MKL_NUM_THREADS"] = str(n)
+        os.environ["OPENBLAS_NUM_THREADS"] = str(n)
+        os.environ["BLIS_NUM_THREADS"] = str(n)
+        os.environ["VECLIB_MAXIMUM_THREADS"] = str(n)
+        try:
+            import mkl  # type: ignore
+            mkl.set_num_threads(n)
+        except Exception:
+            pass
+        try:
+            # OpenBLAS (if accessible)
+            import ctypes
+            for so in ("libopenblas.so", "libopenblas64_.so"):
+                try:
+                    ctypes.CDLL(so).openblas_set_num_threads(n)
+                    break
+                except OSError:
+                    continue
+        except Exception:
+            pass
+
+
 
 def _bytes_human(n):
     if n is None: return "n/a"
@@ -237,7 +272,7 @@ class GenomewideLDScore:
                 seed=None,
                 verbose=False,
                 dtype='float32',
-                num_threads: int = 1,
+                num_threads: int = 4,
                 eps_var: float = 1e-10,
                 rand_samp=None, # float in (0,1] or int in [100, N]
                 ddof = 1):
@@ -339,43 +374,83 @@ class GenomewideLDScore:
 
     def _auto_vchunk(self, phase: str) -> int:
         """
-        Conservative V-chunk sizing.
-        Reserve headroom for the parent shared arrays (Xz2d + meansq),
-        then give each worker ~20% of the remaining available memory.
-        Floor at 64 and round up to a multiple of 64 for BLAS.
+        Throughput-oriented V-chunk sizing:
+        - Aim for a modest Xz_chunk to keep NUMA/THP behavior stable.
+        - Prefer physical socket count over NUMA-node count.
+        - Default ~8 GiB per socket unless overridden by env:
+            SUMMIT_VCHUNK_GB              (total GiB)
+            SUMMIT_VCHUNK_PER_SOCKET_GB   (GiB per physical socket)
         """
-        b = np.dtype(self.dtype).itemsize
-        N   = int(self.nsamp)
-        M   = int(self.nsnps)
-        B   = int(self.nbins)
-        V   = int(self.nvecs)
-        S   = int(min(self.step_size, self.nsnps))
+        import subprocess, shlex
 
-        # Parent SHM footprint we already committed (or will commit): N*(V*B) + M*B
-        parent_bytes = (N * (V * B) + M * B) * b
+        b = int(np.dtype(self.dtype).itemsize)
+        N, B, V = int(self.nsamp), int(self.nbins), int(self.nvecs)
 
+        # --- determine "sockets" (prefer physical sockets over NUMA nodes) ---
+        sockets = 1
         try:
-            import psutil
-            avail = int(psutil.virtual_memory().available)
+            # Try lscpu "Socket(s):"
+            out = subprocess.check_output(shlex.split("lscpu"), text=True, stderr=subprocess.DEVNULL)
+            for line in out.splitlines():
+                if "Socket(s):" in line:
+                    sockets = max(1, int(line.split()[-1]))
+                    break
         except Exception:
-            avail = 8 * (1024 ** 3)  # 8 GB fallback
+            pass
+        if sockets == 1:
+            # Fallback: count NUMA nodes if no lscpu or weird env
+            try:
+                nodes = [p for p in Path("/sys/devices/system/node").glob("node[0-9]*") if p.is_dir()]
+                if nodes:
+                    sockets = max(1, len(nodes))
+            except Exception:
+                pass
 
+        # --- env overrides (GiB) ---
+        def _env_gb(name):
+            try:
+                v = os.environ.get(name, "").strip()
+                return float(v) if v else None
+            except Exception:
+                return None
 
-        remain = max(0, avail - parent_bytes)
-        budget_per_worker = max(64 * (1024 ** 2), int(0.20 * remain))
+        total_gb = _env_gb("SUMMIT_VCHUNK_GB")
+        per_socket_gb = _env_gb("SUMMIT_VCHUNK_PER_SOCKET_GB")
 
-        geno_blk = N * S * b
-        extra = budget_per_worker - geno_blk
-        if extra <= 0:
-            return min(V, 64)  # bare minimum
+        if total_gb is not None:
+            target_bytes = int(total_gb * (1024**3))
+        else:
+            if per_socket_gb is None:
+                per_socket_gb = 8.0  # conservative default
+            target_bytes = int(per_socket_gb * sockets * (1024**3))
 
-        bytes_per_v = S * b  # one (L×1) column
-        v_chunk = int(extra // bytes_per_v)
-        v_chunk = max(64, min(V, v_chunk))
-        # round up to multiple of 64 for nicer GEMM kernels
-        v_chunk = min(V, ((v_chunk + 63) // 64) * 64)
-        #v_chunk = 64
+        # compute v_chunk from target bytes; keep >=64 and <=V, multiple of 64
+        denom = N * B * b
+        if denom <= 0:
+            return min(V, 64)
+
+        # ensure the target can at least hold 64 columns
+        min_bytes = denom * 64
+        if target_bytes < min_bytes:
+            target_bytes = min_bytes
+
+        v_chunk = target_bytes // denom
+        v_chunk = int(max(64, min(V, v_chunk)))
+        v_chunk = int(min(V, ((v_chunk + 63) // 64) * 64))
+
+        # log
+        try:
+            xz_gib = (N * (B * v_chunk) * b) / (1024**3)
+            self.log._log(
+                f"[auto_vchunk] sockets={sockets}, dtype={self.dtype}, "
+                f"target≈{target_bytes/(1024**3):.1f} GiB, v_chunk={v_chunk} → Xz≈{xz_gib:.1f} GiB"
+            )
+        except Exception:
+            pass
+
         return v_chunk
+
+
     
     def _precompute_residual_variances(self):
         """
@@ -636,7 +711,7 @@ class GenomewideLDScore:
         0) Precompute per-SNP inv sqrt residual variances (right side).
         1) Build SNP blocks; precompute Kmax per block from annotation (count of nonzeros per bin).
         2) For each V-tile:
-            Phase 1 (chunked): build Xz_chunk (N × B·Vt) across all blocks (pass kmax_hint; skip if 0)
+            Phase 1 (chunked): build Xz_chunk (N × B·Vt) across all blocks (skip if Kmax==0)
             Phase 2: consume Xz_chunk across all blocks (skip if Kmax==0)
             Accumulate weighted sum (by Vt)
         3) Finalize: divide by total V, subtract baseline, save; print summaries.
@@ -655,6 +730,7 @@ class GenomewideLDScore:
         self.log._log(f"Streaming with V-chunk size = {vchunk} (total V = {self.nvecs})")
 
         # -------------------- Phase 0: per-SNP residual variances --------------------
+        set_parallelism(omp_threads=self.num_threads, blas_threads=1)
         self.inv_sqrt_resvar_all = self._precompute_residual_variances()
 
         # -------------------- Build SNP blocks --------------------
@@ -666,13 +742,10 @@ class GenomewideLDScore:
         self.nblks = len(blocks)
 
         # -------------------- Precompute Kmax per block (trust hints) --------------------
-        # Count nonzeros per bin within each block; take the max across bins.
         kmax_per_block: list[int] = []
         for (s, e) in blocks:
-            blk = self.annot[s:e]  # (L x B) float64
-            # Treat continuous annotation as nonzero if value != 0.
+            blk = self.annot[s:e]  # (L x B)
             Kmax = int((blk != 0).sum(axis=0).max())
-            # Trust zero: means this block has no annotated SNPs in any bin (rare but allowed).
             kmax_per_block.append(Kmax)
         if any(k == 0 for k in kmax_per_block):
             zc = sum(1 for k in kmax_per_block if k == 0)
@@ -684,13 +757,16 @@ class GenomewideLDScore:
         # -------------------- Paths / common args --------------------
         bed_prefix = self.bed_prefix
         fam_path   = self.fam_path
-        row_sel = self.row_sel if self.row_sel is not None else None
-        ddof    = int(self.ddof)
+        row_sel    = self.row_sel if self.row_sel is not None else None
+        ddof       = int(self.ddof)
+        B          = int(self.nbins)
 
         # -------------------- Accumulators & scratch --------------------
         meansq_accum = np.zeros((self.nsnps, self.nbins), dtype=self.dtype, order='C')
         meansq_chunk = np.zeros_like(meansq_accum, dtype=self.dtype, order='C')
-        Xz_chunk = None  # F-contiguous scratch (N x (B*Vt))
+
+        # Preallocate Xz_chunk once at max width = B * vchunk (Fortran for BLAS-friendly column access)
+        Xz_chunk = np.zeros((self.nsamp, B * vchunk), dtype=self.dtype, order='F')
 
         # Build V-tiles list (start, count)
         vtiles = [(v0, min(vchunk, self.nvecs - v0)) for v0 in range(0, self.nvecs, vchunk)]
@@ -708,21 +784,18 @@ class GenomewideLDScore:
 
         try:
             for vt_idx, (v_start, Vt) in enumerate(vtiles):
-                # Allocate / zero Xz_chunk for this tile
-                need_cols = self.nbins * Vt
-                if (Xz_chunk is None) or (Xz_chunk.shape[1] != need_cols):
-                    Xz_chunk = np.zeros((self.nsamp, need_cols), dtype=self.dtype, order='F')
-                else:
-                    Xz_chunk.fill(0)
+                # Fortran-contiguous view of active columns only
+                used_cols = B * Vt
+                Xz_view = Xz_chunk[:, :used_cols]
+                Xz_view.fill(0)
 
                 # ---------------------- Phase 1 (chunked) ----------------------
+                set_parallelism(omp_threads=self.num_threads, blas_threads=1)
                 t1_total = 0.0
                 for blk_idx, (s, e) in enumerate(blocks):
                     kmax_hint = int(kmax_per_block[blk_idx])
-
-                    # Skip entire (vtile, block) if Kmax==0; still advance the bar by a full unit.
                     if kmax_hint == 0:
-                        bar.update(1.0)  # count this (vtile, block) as done
+                        bar.update(1.0)  # still count this (vtile, block)
                         continue
 
                     annot_blk = np.ascontiguousarray(self.annot[s:e].astype(self.dtype, copy=False))
@@ -739,10 +812,10 @@ class GenomewideLDScore:
                         inv_right=inv_right,              # (L,)
                         v_start=int(v_start),             # seed offset
                         v_count=int(Vt),
-                        kmax_hint=kmax_hint,              # TRUST: may be zero (already handled)
+                        kmax_hint=kmax_hint,              # TRUST
                         rand_dist=self.rand_dist,
                         seed=self.root_seed,
-                        Xz2d_chunk=Xz_chunk,              # (N x (B*Vt)), accumulates over bins
+                        Xz2d_chunk=Xz_view,               # (N x (B*Vt))
                         project_right=False,
                         C=(self.C if self.C is not None else None),
                         R=(self.cov_R if self.C is not None else None)
@@ -753,13 +826,12 @@ class GenomewideLDScore:
                     bar.update(w1)
 
                 # ---------------------- Phase 2 ----------------------
+                set_parallelism(omp_threads=1, blas_threads=self.num_threads)
                 meansq_chunk.fill(0)
                 t2_total = 0.0
 
                 for blk_idx, (s, e) in enumerate(blocks):
                     kmax_hint = int(kmax_per_block[blk_idx])
-
-                    # If Kmax==0, nothing to do for this block in this tile (already fully counted above).
                     if kmax_hint == 0:
                         continue
 
@@ -776,7 +848,7 @@ class GenomewideLDScore:
                         inv_left=inv_left,            # (L,)
                         nvecs=int(Vt),                # mean over THIS tile only
                         vchunk=int(Vt),
-                        Xz2d=Xz_chunk,                # (N x (B*Vt))
+                        Xz2d=Xz_view,                 # (N x (B*Vt))
                         meansq=meansq_chunk,          # (M x B), per-block rows overwritten
                         C=(self.C if self.C is not None else None),
                         R=(self.cov_R if self.C is not None else None),

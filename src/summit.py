@@ -119,25 +119,47 @@ def _check_outdir(path_str: str, create: bool = True, log=None):
 
 if __name__ == '__main__':
     args = parser.parse_args()
-    log = Logger(suppress = args.suppress)
+    log  = Logger(suppress=args.suppress)
+
     log._log(">>> SUMMIT arguments")
-    log._log("python3 summit.py", end=" ")
-    arg = sys.argv[1:]
+
+    tokens = sys.argv[1:]
+
+    opts_take_value = set()
+    for a in parser._actions:
+        if not a.option_strings:
+            continue
+        if a.nargs == 0:
+            continue
+        for s in a.option_strings:
+            opts_take_value.add(s)
+
     i = 0
-    while i < len(arg):
-        if arg[i].startswith('-'):
-            if (i == 0):
-                log._log("\t"+arg[i]+" "+arg[i + 1] if i + 1 < len(arg) and not arg[i+1].startswith('-') else "")
+    while i < len(tokens):
+        t = tokens[i]
+        if t.startswith("--") and "=" in t:
+            log._log("\t" + t)
+            i += 1
+            continue
+
+        if t in opts_take_value:
+            if i + 1 < len(tokens) and not tokens[i + 1].startswith("-"):
+                log._log(f"\t{t} {tokens[i + 1]}")
+                i += 2
+            else:
+                log._log(f"\t{t}")
                 i += 1
-            elif (i + 1 < len(arg)):
-                if arg[i+1].startswith('-'):
-                    log._log("\t"+arg[i])
-                else:
-                    log._log("\t"+arg[i]+" "+arg[i + 1])
-                    i += 1
+        elif t.startswith("-"):
+            log._log("\t" + t)
+            i += 1
         else:
-            log._log(arg[i] if i==0 else '\t\t'+arg[i])
-        i += 1
+            log._log("\t" + t)
+            i += 1
+
+    if (args.verbose):
+        log._log(">>> Effective options")
+        for k, v in sorted(vars(args).items()):
+            log._log(f"  {k} = {v!r}")
     log._log("==========================================================================")
 
     if (args.out is None):
