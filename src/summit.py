@@ -70,14 +70,13 @@ parser.add_argument("--ddof", default=1, type=int, \
 parser.add_argument("--num-threads", default=4, type=int, \
                     help='Cap the number of threads for BLAS to limit CPU usage. Default is 4.')
 
-
 # Low-level performance knobs
 parser.add_argument("--ctile", type=int, default=None,
                     help="Manual CTILE override (columns in the RHS tile). Rounded up to a multiple of 64. If set, overrides --ctile-mib and --ctile-l3pct.")
 parser.add_argument("--ctile-mb", type=int, default=None,
                     help="Memory-budget-driven CTILE (MiB). If set, overrides --ctile-l3pct. Mutually exclusive with --ctile.")
 parser.add_argument("--ctile-l3pct", type=float, default=0.80,
-                    help="Fraction of per-socket L3 cache to target per BLAS thread for CTILE auto-sizing. Ignored if --ctile or --ctile-mib is provided. Default: 0.60")
+                    help="Fraction of per-socket L3 cache to target per BLAS thread for CTILE auto-sizing. Ignored if --ctile or --ctile-mib is provided. Default: 0.80")
 parser.add_argument("--target-xz-gib", type=float, default=16.0,
                     help="Memory budget (GiB) for the Phase-1 Xz panel (N × B × Vt). Used to pick the initial V-tile before balancing. Default: 16.0")
 parser.add_argument("--sockets", type=int, default=None,
@@ -85,6 +84,8 @@ parser.add_argument("--sockets", type=int, default=None,
 parser.add_argument("--malloc-arena-max", type=int, default=2)
 parser.add_argument("--malloc-trim-threshold", type=int, default=131072)
 parser.add_argument("--malloc-mmap-threshold", type=int, default=131072)
+parser.add_argument("--numa-mode", default="interleave", choices=['interleave', 'membind', 'cpunodebind', 'preferred'])
+parser.add_argument("--numa-nodes", default="all")
 
 # Optional overrides for V-tiling (balanced split logic still applies)
 parser.add_argument("--vchunk", type=int, default=None,
@@ -140,6 +141,21 @@ def _check_outdir(path_str: str, create: bool = True, log=None):
 
 if __name__ == '__main__':
     args = parser.parse_args()
+    ## low-level config params that most people won't need
+    low_level = {
+        "numa_mode": args.numa_mode,
+        "numa_nodes": args.numa_nodes,
+        "ctile":         args.ctile,
+        "ctile_mb":      args.ctile_mb,
+        "ctile_l3pct":   args.ctile_l3pct,
+        "sockets":       args.sockets,
+        "malloc_arena_max":        args.malloc_arena_max,
+        "malloc_trim_threshold":   args.malloc_trim_threshold,
+        "malloc_mmap_threshold":   args.malloc_mmap_threshold,
+    }
+    from gw_ldscore import apply_env
+    apply_env(low_level)
+    
     log  = Logger(suppress=args.suppress)
 
     log._log(">>> SUMMIT arguments")
@@ -192,17 +208,6 @@ if __name__ == '__main__':
     log.install_excepthook()
     log.attach_file(args.out + (".gw.log" if args.geno else ".log"))
     
-    ## low-level config params that most people won't need
-    low_level = {
-        "ctile":         args.ctile,
-        "ctile_mb":      args.ctile_mb,
-        "ctile_l3pct":   args.ctile_l3pct,
-        "sockets":       args.sockets,
-        "malloc_arena_max":        args.malloc_arena_max,
-        "malloc_trim_threshold":   args.malloc_trim_threshold,
-        "malloc_mmap_threshold":   args.malloc_mmap_threshold,
-    }
-
     if (args.geno is not None):
         # set 
         gwld = GenomewideLDScore(bed_path=args.geno, annot_path=args.annot, out_path=args.out, covar_path=args.covar, rand_dist=args.rand_dist,\

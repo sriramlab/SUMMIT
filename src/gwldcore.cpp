@@ -633,7 +633,7 @@ void phase1_compute_Xz_bed_chunk_impl(const std::string &bed_prefix,
     const bool is_rademacher = (rand_dist == "rademacher");
     const bool is_spherical  = (rand_dist == "spherical");
 
-    // Z panel: (L x v_count), col-major
+    // Z panel: (L x v_count), col-major (generate once)
     std::vector<T> Z((size_t)L * (size_t)v_count, T(0));
     for (int c = 0; c < v_count; ++c) {
         long double ss = 0.0L;
@@ -648,18 +648,25 @@ void phase1_compute_Xz_bed_chunk_impl(const std::string &bed_prefix,
         }
     }
 
-    const int N_TILE = std::is_same_v<T,float> ? 128 : 64;
-    const int Kmax   = kmax_hint;
+    // N-tile (env override allowed)
+    const int nt_override = getenv_int("SUMMIT_P1_NTILE", 0);
+    const int N_TILE = (nt_override > 0)
+        ? nt_override
+        : (std::is_same_v<T,double> ? 128 : 256); // benchmark 96/128/192/256 for fp64
 
-    // timer
+    const int Kmax = kmax_hint;
+
+    // timers
     P1Timers t1;
 
     // Reusable per-bin buffers
     std::vector<int> idx_buf((size_t)L);
     std::vector<T>   scale_buf((size_t)L);
-    std::vector<T>   Bcol((size_t)Kmax * (size_t)v_count); // (K x v_count), tight
 
     py::gil_scoped_release nogil;
+
+    // stride between consecutive V columns in V-major layout
+    const size_t vmajor_stride = (size_t)B * (size_t)ldc;
 
     for (int k = 0; k < B; ++k) {
         check_for_interrupt();
@@ -676,8 +683,9 @@ void phase1_compute_Xz_bed_chunk_impl(const std::string &bed_prefix,
         }
         if (K == 0) continue;
 
-        // Pack Bcol once per bin: (K x v_count)
+        // Pack Bcol ONCE per bin: (K x v_count)
         auto z0 = std::chrono::high_resolution_clock::now();
+        std::vector<T> Bcol((size_t)K * (size_t)v_count);
         for (int c = 0; c < v_count; ++c) {
             const T *zc = Z.data() + (size_t)c * (size_t)L;
             T *dst      = Bcol.data() + (size_t)c * (size_t)K;
@@ -686,13 +694,15 @@ void phase1_compute_Xz_bed_chunk_impl(const std::string &bed_prefix,
         auto z1 = std::chrono::high_resolution_clock::now();
         t1.t_packZ_ms += std::chrono::duration<double,std::milli>(z1 - z0).count();
 
-        // N-tiling: one fat GEMM (Nt x v_count) per tile, then scatter-add into V-major dest
+        // Base pointer for this bin (helps address arithmetic below)
+        T * __restrict base_k = Xptr + (size_t)k * (size_t)ldc;
+
         #ifdef _OPENMP
         #pragma omp parallel
         #endif
         {
             AlignedBuffer<T> A_tile((size_t)N_TILE * (size_t)Kmax);           // (Nt x K)
-            AlignedBuffer<T> C_tile((size_t)N_TILE * (size_t)v_count);        // (Nt x v_count)
+            AlignedBuffer<T> C_tile((size_t)N_TILE * (size_t)v_count, 64);    // (Nt x V)
 
             // thread-local timers
             double packA_ms = 0.0, gemm_ms = 0.0, scatt_ms = 0.0;
@@ -703,7 +713,7 @@ void phase1_compute_Xz_bed_chunk_impl(const std::string &bed_prefix,
             for (int n0 = 0; n0 < N; n0 += N_TILE) {
                 const int Nt = std::min(N - n0, N_TILE);
 
-                // Pack A_tile (Nt x K)
+                // Pack A_tile (Nt x K) ONCE per N-tile
                 auto a0 = std::chrono::high_resolution_clock::now();
                 for (int c = 0; c < K; ++c) {
                     const int snp = idx_buf[(size_t)c];
@@ -711,7 +721,6 @@ void phase1_compute_Xz_bed_chunk_impl(const std::string &bed_prefix,
                     const T *src  = Geno.data() + (size_t)snp * (size_t)N + (size_t)n0;
                     T *dst        = A_tile.ptr  + (size_t)c * (size_t)Nt;
 
-                    // prefetch next column (best-effort)
                     if (c+1 < K) {
                         const int snp_next = idx_buf[(size_t)(c+1)];
                         __builtin_prefetch(Geno.data() + (size_t)snp_next * (size_t)N + (size_t)n0, 0, 1);
@@ -722,28 +731,32 @@ void phase1_compute_Xz_bed_chunk_impl(const std::string &bed_prefix,
                 auto a1 = std::chrono::high_resolution_clock::now();
                 packA_ms += std::chrono::duration<double,std::milli>(a1 - a0).count();
 
-                // GEMM: C_tile = A_tile (Nt x K) * Bcol (K x v_count); beta=0 → no need to clear
+                // GEMM: C_tile( Nt x V ) = A_tile( Nt x K ) * Bcol( K x V )
                 auto g0 = std::chrono::high_resolution_clock::now();
-                gemm_col_major_nn<T>(Nt, v_count, K,
-                                    A_tile.ptr, Nt,
-                                    Bcol.data(), K,
-                                    C_tile.ptr, Nt,
-                                    T(1), T(0));
-
+                gemm_col_major_nn<T>(/*m=*/Nt, /*n=*/v_count, /*k=*/K,
+                                     /*A=*/A_tile.ptr, /*lda=*/Nt,
+                                     /*B=*/Bcol.data(), /*ldb=*/K,
+                                     /*C=*/C_tile.ptr, /*ldc=*/Nt,
+                                     /*alpha=*/T(1), /*beta=*/T(0));
                 auto g1 = std::chrono::high_resolution_clock::now();
                 gemm_ms += std::chrono::duration<double,std::milli>(g1 - g0).count();
 
-                // Scatter-add into V-major destination
+                // Scatter-add the Nt×V tile into V-major destination using BLAS AXPY
                 auto s0 = std::chrono::high_resolution_clock::now();
                 for (int c = 0; c < v_count; ++c) {
-                    const T *src_col = C_tile.ptr + (size_t)c * (size_t)Nt;
-                    T *dst_col = Xptr + ((size_t)c * (size_t)B + (size_t)k) * (size_t)ldc + (size_t)n0;
-                    #pragma omp simd
-                    for (int r = 0; r < Nt; ++r) dst_col[r] += src_col[r];
+                    const T * __restrict src_col = C_tile.ptr + (size_t)c * (size_t)Nt;
+                    T * __restrict dst_col = base_k + (size_t)c * vmajor_stride + (size_t)n0;
+
+                    if constexpr (std::is_same_v<T,double>) {
+                        cblas_daxpy(Nt, 1.0, src_col, 1, dst_col, 1);
+                    } else {
+                        cblas_saxpy(Nt, 1.0f, src_col, 1, dst_col, 1);
+                    }
                 }
                 auto s1 = std::chrono::high_resolution_clock::now();
                 scatt_ms += std::chrono::duration<double,std::milli>(s1 - s0).count();
-            }
+            } // n0
+
             #ifdef _OPENMP
             #pragma omp atomic
             t1.t_packA_ms += packA_ms;
@@ -758,8 +771,8 @@ void phase1_compute_Xz_bed_chunk_impl(const std::string &bed_prefix,
             #endif
         } // parallel
     } // bins
-    t1.dump(blk_start, blk_end, /*B=*/(int)Ainfo.shape[1], /*vcount=*/v_count);
 
+    t1.dump(blk_start, blk_end, /*B=*/(int)Ainfo.shape[1], /*vcount=*/v_count);
 }
 
 // -------------------------- Phase 2: compute_XtXz (float/double) -------------

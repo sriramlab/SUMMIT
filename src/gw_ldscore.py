@@ -6,9 +6,9 @@ import numpy as np
 import pandas as pd
 from bed_reader import open_bed
 from tqdm import tqdm
-import sys
+import sys, shutil
 import gc
-import os
+import os, psutil
 import ctypes
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -36,6 +36,36 @@ def apply_env(cfg: dict) -> int:
     Returns:
       actual_blas_threads (int): detected BLAS threads after enforcement.
     """
+    
+    def maybe_wrap_with_numactl(mode: str | None, nodes: str = "all") -> None:
+        """
+        Re-exec the current process under numactl with the requested policy.
+
+        mode: one of {"interleave", "membind", "cpunodebind", "preferred"} or None
+        nodes: e.g. "all", "0", "1,2", "0-1", etc.
+        """
+        if not mode or os.name != "posix":
+            return
+        if os.environ.get("SUMMIT_NUMACTL_WRAPPED") == "1":
+            return  # already wrapped
+
+        exe = shutil.which("numactl")
+        if not exe:
+            return  # numactl not found in this env; silently skip
+
+        flag = {
+            "interleave":  "--interleave",
+            "membind":     "--membind",
+            "cpunodebind": "--cpunodebind",
+            "preferred":   "--preferred",
+        }.get(mode.lower())
+        if not flag:
+            return
+
+        # Re-exec under numactl
+        os.environ["SUMMIT_NUMACTL_WRAPPED"] = "1"
+        args = [exe, f"{flag}={nodes}", sys.executable, *sys.argv]
+        os.execv(exe, args)
 
     def _cpu_count_affinity() -> int:
         try:
@@ -64,6 +94,12 @@ def apply_env(cfg: dict) -> int:
             return tot if tot > 0 else _detect_blas_threads_fallback()
         except Exception:
             return _detect_blas_threads_fallback()
+    
+    # -------- 0) NUMA config --------
+    maybe_wrap_with_numactl(
+        mode = cfg.get("numa_mode"),
+        nodes = str(cfg.get("numa_nodes", "all"))
+    )
 
     # -------- 1) Threads (single knob for both OMP & BLAS) --------
     n_threads = cfg.get("num_threads")
@@ -91,7 +127,6 @@ def apply_env(cfg: dict) -> int:
         pass
     # OpenBLAS direct calls (attempt several sonames/symbols)
     try:
-        import ctypes
         for soname in ("libopenblas.so", "libopenblas.so.0", "libopenblas64_.so", "libopenblas64_.so.0"):
             try:
                 lib = ctypes.CDLL(soname)
@@ -144,6 +179,12 @@ def apply_env(cfg: dict) -> int:
         os.environ["MALLOC_TRIM_THRESHOLD_"] = str(int(cfg["malloc_trim_threshold"]))
     if cfg.get("malloc_mmap_threshold") is not None:
         os.environ["MALLOC_MMAP_THRESHOLD_"] = str(int(cfg["malloc_mmap_threshold"]))
+    
+    # Helpful affinity / runtime hints
+    os.environ.setdefault("OMP_PROC_BIND", str(cfg.get("omp_proc_bind", "close")))   # or "spread"
+    os.environ.setdefault("OMP_PLACES",    str(cfg.get("omp_places", "cores")))     # "cores" is a good default
+    os.environ.setdefault("KMP_BLOCKTIME", str(cfg.get("kmp_blocktime", 0)))        # reduce oversubscription
+    os.environ.setdefault("KMP_AFFINITY",  str(cfg.get("kmp_affinity", "granularity=fine,compact,1,0")))
 
     return actual
 
@@ -153,7 +194,6 @@ def set_parallelism(omp_threads: int | None = None, blas_threads: int | None = N
     Set OpenMP and BLAS vendor threads independently.
     Call early (before spawning Pools) and around phases to avoid nested teams.
     """
-    import os
     if omp_threads is not None:
         os.environ["OMP_NUM_THREADS"] = str(max(1, int(omp_threads)))
         os.environ["OMP_DYNAMIC"] = "FALSE"
@@ -172,7 +212,6 @@ def set_parallelism(omp_threads: int | None = None, blas_threads: int | None = N
             pass
         try:
             # OpenBLAS (if accessible)
-            import ctypes
             for so in ("libopenblas.so", "libopenblas64_.so"):
                 try:
                     ctypes.CDLL(so).openblas_set_num_threads(n)
@@ -242,7 +281,6 @@ def _bytes_human(n):
     return f"{n:,.2f} EB"
 
 def _rss_snapshot(label, logger=None, include_children=True):
-    import os, psutil
     rss = pss = None
     try:
         pid = os.getpid()
@@ -556,7 +594,6 @@ class GenomewideLDScore:
         # Choose number of workers conservatively to avoid RAM spikes
         # Rough per-chunk footprint ≈ N * L * itemsize * 3 (G, tmp/proj, Y)
         try:
-            import psutil
             avail = int(psutil.virtual_memory().available)
         except Exception:
             avail = None
@@ -588,8 +625,6 @@ class GenomewideLDScore:
         # Execute in parallel
         try:
             if limiter is None:
-                # simple context manager that does nothing
-                from contextlib import contextmanager
                 @contextmanager
                 def _nullctx():
                     yield
@@ -776,9 +811,6 @@ class GenomewideLDScore:
             Accumulate weighted by Vt
         4) Finalize: divide by total V, subtract baseline, save; print summaries.
         """
-        import os, time, ctypes, numpy as np, pandas as pd
-        from tqdm import tqdm
-
         self.log._log(f"num_vecs: {self.nvecs}, step_size: {self.step_size}, seed: {self.root_seed}")
         self.log._log(f"Using {self.rand_dist} random vectors.")
         if self.C is not None:
@@ -861,6 +893,10 @@ class GenomewideLDScore:
         Xz_chunk  = np.zeros((self.nsamp, int(self.nbins) * int(Vmax)),
                             dtype=self.dtype, order='F')
         meansq_chunk = np.zeros_like(meansq_accum, dtype=self.dtype, order='C')
+        
+        ann_blocks = [np.ascontiguousarray(self.annot[s:e].astype(self.dtype, copy=False)) for (s,e) in blocks]
+        inv_blocks = [np.ascontiguousarray(self.inv_sqrt_resvar_all[s:e].astype(self.dtype, copy=False)) for (s,e) in blocks]
+
 
         # -------------------- Progress bar over vtiles × blocks ----------------------
         total_units = len(vtiles) * len(blocks)
@@ -890,8 +926,8 @@ class GenomewideLDScore:
                         bar.update(1.0)
                         continue
 
-                    annot_blk = np.ascontiguousarray(self.annot[s:e].astype(self.dtype, copy=False))
-                    inv_right = np.ascontiguousarray(self.inv_sqrt_resvar_all[s:e].astype(self.dtype, copy=False))
+                    annot_blk = ann_blocks[blk_idx]
+                    inv_right = inv_blocks[blk_idx]
 
                     t0 = time.perf_counter()
                     gwldcore.phase1_compute_Xz_bed_chunk(
@@ -927,7 +963,7 @@ class GenomewideLDScore:
                     if kmax_hint == 0:
                         continue
 
-                    inv_left = np.ascontiguousarray(self.inv_sqrt_resvar_all[s:e].astype(self.dtype, copy=False))
+                    inv_left  = inv_blocks[blk_idx]
                     if self.C is not None:
                         N_denom = int(self.N_eff)             # C++ uses N_eff - 1 inside
                     else:
