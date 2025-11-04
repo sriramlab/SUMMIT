@@ -17,5 +17,6 @@ dependencies:
   - scikit-build-core>=0.5
   - libopenblas
   - pkg-config
+  - numactl
 
   - pip
