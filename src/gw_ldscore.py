@@ -118,6 +118,10 @@ def apply_env(cfg: dict) -> int:
     os.environ["MKL_DYNAMIC"] = "FALSE"
     os.environ["BLIS_NUM_THREADS"] = str(n_threads)
     os.environ["VECLIB_MAXIMUM_THREADS"] = str(n_threads)
+    
+    os.environ["OMP_PROC_BIND"] = "true"
+    os.environ["KMP_AFFINITY"] = "granularity=fine,compact,1,0"
+    os.environ["MKL_ENABLE_INSTRUCTIONS"] = "AVX512"
 
     # Also try to enforce into already loaded libraries
     try:
@@ -457,7 +461,8 @@ class GenomewideLDScore:
                 num_threads: int = 4,
                 eps_var: float = 1e-10,
                 rand_samp=None, # float in (0,1] or int in [100, N]
-                ddof = 1):
+                ddof = 1,
+                target_xz_mem = 16.0):
         
         self.tune = apply_env(low_level)
         
@@ -481,6 +486,7 @@ class GenomewideLDScore:
         self.root_seed = seed
         rng = np.random.default_rng(self.root_seed)
         self.ddof = ddof
+        self.target_xz_mem = target_xz_mem
         
         self.start_time = utils._get_time()
         self.log._log("Genome-wide LD score calculation started at: "+utils._get_timestr(self.start_time))
@@ -845,7 +851,7 @@ class GenomewideLDScore:
 
         # -------------------- Choose initial V-chunk by memory budget ----------------
         # Target memory for Xz panel (N x (B*Vt)) in GiB; you can set self.target_xz_gib
-        target_gib = float(getattr(self, "target_xz_gib", 16.0)) ## TODO: make an argparse option for this
+        target_gib = float(getattr(self, "target_xz_mem", 16.0)) ## TODO: make an argparse option for this
         itemsize = np.dtype(self.dtype).itemsize
         denom = max(1, int(self.nsamp) * int(self.nbins) * itemsize)
         vtile_guess = int((target_gib * (1024**3)) // denom)

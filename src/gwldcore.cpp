@@ -573,7 +573,10 @@ static std::vector<int> parse_row_sel(py::object row_sel_obj, int64_t N_total) {
     return rows;
 }
 
-// -------------------------- Phase 1: compute_Xz (float/double, V-major, fast) ---------------
+inline void cblas_taxpy(int n, float  a, const float*  x, int incx, float*  y, int incy){ cblas_saxpy(n,a,x,incx,y,incy); }
+inline void cblas_taxpy(int n, double a, const double* x, int incx, double* y, int incy){ cblas_daxpy(n,a,x,incx,y,incy); }
+
+// -------------------------- Phase 1: compute_Xz (K-major) --------------------------
 template <typename T>
 void phase1_compute_Xz_bed_chunk_impl(const std::string &bed_prefix,
                                       const std::string &fam_path,
@@ -583,57 +586,55 @@ void phase1_compute_Xz_bed_chunk_impl(const std::string &bed_prefix,
                                       py::array_t<T, py::array::c_style | py::array::forcecast> annot_blk, // (L x B)
                                       py::array_t<T, py::array::c_style | py::array::forcecast> inv_right,  // (L,)
                                       int v_start,            // global V offset
-                                      int v_count,            // V cols in this chunk
-                                      int kmax_hint,          // ALWAYS trusted
+                                      int v_count,            // V cols in THIS tile
+                                      int /*kmax_hint*/,      // unused with CSR
                                       const std::string &rand_dist,
                                       py::object seed_obj,    // None or int
-                                      py::array_t<T, py::array::f_style | py::array::forcecast> Xz2d_chunk, // (N x (B*v_count)), Fortran, V-major
+                                      py::array_t<T, py::array::f_style | py::array::forcecast> Xz2d_chunk, // (N x (B*v_count)), Fortran, **K-major**
                                       bool /*project_right*/ = false,
                                       py::object /*C_opt*/ = py::none(),
                                       py::object /*R_opt*/ = py::none())
 {
-    if (kmax_hint == 0) return;
-
     const std::string bed_path = bed_prefix + ".bed";
     const std::string bim_path = bed_prefix + ".bim";
+
     const int64_t N_total = count_lines_cached(fam_path);
     const int64_t M_total = count_lines_cached(bim_path);
     if (blk_end > M_total) throw std::runtime_error("blk_end exceeds #SNPs in BIM");
 
-    // rows
+    // ---- rows & block genotype ----
     std::vector<int> rows = parse_row_sel(row_sel_obj, N_total);
 
-    // read+standardize block -> Geno (N x L), col-major
     int N = 0, L = 0;
-    std::vector<T> Geno;
+    std::vector<T> Geno;                       // (N x L), column-major
     read_block_standardized<T>(bed_path, fam_path, blk_start, blk_end, rows, ddof, Geno, N, L);
     if (L == 0) return;
 
-    // inputs
+    // ---- annot & inv ----
     auto Ainfo = annot_blk.request();
     auto Iinfo = inv_right.request();
-    if (Ainfo.ndim != 2 || Iinfo.ndim != 1) throw std::runtime_error("annot/ inv shapes");
+    if (Ainfo.ndim != 2 || Iinfo.ndim != 1) throw std::runtime_error("annot/inv shapes");
     const int B = (int)Ainfo.shape[1];
     if ((int)Ainfo.shape[0] != L || (int)Iinfo.shape[0] != L) throw std::runtime_error("L mismatch");
-    const T *ann = static_cast<const T*>(Ainfo.ptr);
-    const T *inv = static_cast<const T*>(Iinfo.ptr);
+    const T* ann = static_cast<const T*>(Ainfo.ptr);
+    const T* inv = static_cast<const T*>(Iinfo.ptr);
 
-    // destination (N x (B*v_count)), Fortran (V-major: column c is at (c*B + k))
+    // ---- destination: K-major ----
     auto Xinfo = Xz2d_chunk.request();
     if (Xinfo.ndim != 2 || (int)Xinfo.shape[0] != N || (int)Xinfo.shape[1] != B * v_count)
         throw std::runtime_error("Xz2d_chunk shape must be (N, B*v_count)");
-    T *Xptr = static_cast<T*>(Xinfo.ptr);
+    T*  Xptr = static_cast<T*>(Xinfo.ptr);
     const int ldc = N;
 
-    // RNG seed
+    // ---- RNG per block (strict independence) ----
     const bool have_root = !seed_obj.is_none();
-    uint64_t root_seed = have_root ? seed_obj.cast<uint64_t>() : std::random_device{}();
+    const uint64_t root_seed = have_root ? seed_obj.cast<uint64_t>() : std::random_device{}();
     std::mt19937_64 rng(make_seed(root_seed, /*block=*/blk_start, /*v0=*/v_start));
     std::normal_distribution<T> gN(0, (T)1);
     const bool is_rademacher = (rand_dist == "rademacher");
     const bool is_spherical  = (rand_dist == "spherical");
 
-    // Z panel: (L x v_count), col-major (generate once)
+    // ---- Z panel: (L x v_count), column-major ----
     std::vector<T> Z((size_t)L * (size_t)v_count, T(0));
     for (int c = 0; c < v_count; ++c) {
         long double ss = 0.0L;
@@ -648,110 +649,130 @@ void phase1_compute_Xz_bed_chunk_impl(const std::string &bed_prefix,
         }
     }
 
-    // N-tile (env override allowed)
-    const int nt_override = getenv_int("SUMMIT_P1_NTILE", 0);
-    const int N_TILE = (nt_override > 0)
-        ? nt_override
-        : (std::is_same_v<T,double> ? 128 : 256); // benchmark 96/128/192/256 for fp64
+    // ---- CSR compression of annotation (by columns=bins) ----
+    // colptr[B+1], rowind[nnz], scale[nnz] with scale = inv[i] * sqrt(a_ik)
+    std::vector<int> colptr(B + 1, 0);
+    {
+        // Count nnz in each bin
+        for (int k = 0; k < B; ++k) {
+            int cnt = 0;
+            const T* colk = ann + (size_t)k; // column k viewed in row-major indexing i*B + k
+            for (int i = 0; i < L; ++i) {
+                T a = colk[(size_t)i * (size_t)B];
+                if (a != T(0)) ++cnt;
+            }
+            colptr[(size_t)k + 1] = cnt;
+        }
+        // prefix sum
+        for (int k = 0; k < B; ++k) colptr[(size_t)k + 1] += colptr[(size_t)k];
+    }
+    const int nnz = colptr[(size_t)B];
+    AlignedBuffer<int> rowind_buf((size_t)nnz, 64);
+    AlignedBuffer<T>   scale_buf((size_t)nnz, 64);
+    {
+        std::vector<int> fill(B, 0);
+        for (int k = 0; k < B; ++k) {
+            int base = colptr[(size_t)k];
+            int& f   = fill[(size_t)k];
+            const T* colk = ann + (size_t)k;
+            for (int i = 0; i < L; ++i) {
+                T a = colk[(size_t)i * (size_t)B];
+                if (a != T(0)) {
+                    const int pos = base + f++;
+                    rowind_buf.ptr[(size_t)pos] = i;
+                    scale_buf.ptr [(size_t)pos] = inv[i] * std::sqrt(a);
+                }
+            }
+        }
+    }
 
-    const int Kmax = kmax_hint;
+    // ---- First-touch Xz2d (only once at start-of-tile) ----
+    if (blk_start == 0) {
+        const size_t Q = (size_t)B * (size_t)v_count;
+        const size_t elems_per_page = (size_t)(4096 / sizeof(T) ? 4096 / sizeof(T) : 512);
+        #pragma omp parallel for schedule(static)
+        for (ptrdiff_t g = 0; g < (ptrdiff_t)Q; ++g) {
+            T* col = Xptr + (size_t)g * (size_t)ldc;
+            for (size_t r = 0; r < (size_t)N; r += elems_per_page) {
+                col[r] += T(0); // write to establish page ownership
+            }
+        }
+    }
 
-    // timers
+    // ---- constants / timers ----
+    const int NTILE = std::is_same_v<T,double> ? 256 : 512;
     P1Timers t1;
 
-    // Reusable per-bin buffers
-    std::vector<int> idx_buf((size_t)L);
-    std::vector<T>   scale_buf((size_t)L);
-
-    py::gil_scoped_release nogil;
-
-    // stride between consecutive V columns in V-major layout
-    const size_t vmajor_stride = (size_t)B * (size_t)ldc;
-
+    // ---- Outer loop over bins; packZ once per bin, then OMP over N-tiles ----
     for (int k = 0; k < B; ++k) {
         check_for_interrupt();
 
-        // Build idx/scale; determine tight K
-        int K = 0;
-        for (int i = 0; i < L; ++i) {
-            T ak = ann[(size_t)i * (size_t)B + (size_t)k];
-            if (ak != T(0)) {
-                idx_buf[(size_t)K]   = i;
-                scale_buf[(size_t)K] = inv[i] * std::sqrt(ak);
-                ++K;
-            }
-        }
+        const int k0 = colptr[(size_t)k];
+        const int k1 = colptr[(size_t)k + 1];
+        const int K  = k1 - k0;
         if (K == 0) continue;
 
-        // Pack Bcol ONCE per bin: (K x v_count)
+        // Pack Bcol (K x v_count) once per bin; gather rows from Z
+        AlignedBuffer<T> Bcol((size_t)K * (size_t)v_count, 64);
         auto z0 = std::chrono::high_resolution_clock::now();
-        std::vector<T> Bcol((size_t)K * (size_t)v_count);
         for (int c = 0; c < v_count; ++c) {
-            const T *zc = Z.data() + (size_t)c * (size_t)L;
-            T *dst      = Bcol.data() + (size_t)c * (size_t)K;
-            for (int r = 0; r < K; ++r) dst[r] = zc[idx_buf[(size_t)r]];
+            const T* zc = Z.data() + (size_t)c * (size_t)L;
+            T*       dst = Bcol.ptr  + (size_t)c * (size_t)K;
+            for (int r = 0; r < K; ++r) {
+                const int snp = rowind_buf.ptr[(size_t)k0 + (size_t)r];
+                dst[(size_t)r] = zc[(size_t)snp];
+            }
         }
         auto z1 = std::chrono::high_resolution_clock::now();
         t1.t_packZ_ms += std::chrono::duration<double,std::milli>(z1 - z0).count();
 
-        // Base pointer for this bin (helps address arithmetic below)
-        T * __restrict base_k = Xptr + (size_t)k * (size_t)ldc;
-
+        // OMP over N-tiles; packA → GEMM → K-major scatter via AXPY
         #ifdef _OPENMP
         #pragma omp parallel
         #endif
         {
-            AlignedBuffer<T> A_tile((size_t)N_TILE * (size_t)Kmax);           // (Nt x K)
-            AlignedBuffer<T> C_tile((size_t)N_TILE * (size_t)v_count, 64);    // (Nt x V)
+            AlignedBuffer<T> A_tile((size_t)NTILE * (size_t)K, 64);           // (Nt x K)
+            AlignedBuffer<T> C_tile((size_t)NTILE * (size_t)v_count, 64);     // (Nt x v_count)
 
-            // thread-local timers
             double packA_ms = 0.0, gemm_ms = 0.0, scatt_ms = 0.0;
 
             #ifdef _OPENMP
             #pragma omp for schedule(static)
             #endif
-            for (int n0 = 0; n0 < N; n0 += N_TILE) {
-                const int Nt = std::min(N - n0, N_TILE);
+            for (int n0 = 0; n0 < N; n0 += NTILE) {
+                const int Nt = std::min(N - n0, NTILE);
 
-                // Pack A_tile (Nt x K) ONCE per N-tile
+                // packA: A_tile(:, c) = Geno(:, snp_c)[n0:n0+Nt) * scale_c
                 auto a0 = std::chrono::high_resolution_clock::now();
                 for (int c = 0; c < K; ++c) {
-                    const int snp = idx_buf[(size_t)c];
-                    const T   s   = scale_buf[(size_t)c];
-                    const T *src  = Geno.data() + (size_t)snp * (size_t)N + (size_t)n0;
-                    T *dst        = A_tile.ptr  + (size_t)c * (size_t)Nt;
-
-                    if (c+1 < K) {
-                        const int snp_next = idx_buf[(size_t)(c+1)];
-                        __builtin_prefetch(Geno.data() + (size_t)snp_next * (size_t)N + (size_t)n0, 0, 1);
-                    }
+                    const int snp = rowind_buf.ptr[(size_t)k0 + (size_t)c];
+                    const T   s   = scale_buf.ptr [(size_t)k0 + (size_t)c];
+                    const T* src  = Geno.data() + (size_t)snp * (size_t)N + (size_t)n0;
+                    T*       dst  = A_tile.ptr  + (size_t)c   * (size_t)Nt;
                     #pragma omp simd
                     for (int r = 0; r < Nt; ++r) dst[r] = src[r] * s;
                 }
                 auto a1 = std::chrono::high_resolution_clock::now();
                 packA_ms += std::chrono::duration<double,std::milli>(a1 - a0).count();
 
-                // GEMM: C_tile( Nt x V ) = A_tile( Nt x K ) * Bcol( K x V )
+                // GEMM: C_tile(Nt x v_count) = A_tile(Nt x K) * Bcol(K x v_count)
                 auto g0 = std::chrono::high_resolution_clock::now();
                 gemm_col_major_nn<T>(/*m=*/Nt, /*n=*/v_count, /*k=*/K,
                                      /*A=*/A_tile.ptr, /*lda=*/Nt,
-                                     /*B=*/Bcol.data(), /*ldb=*/K,
+                                     /*B=*/Bcol.ptr,   /*ldb=*/K,
                                      /*C=*/C_tile.ptr, /*ldc=*/Nt,
                                      /*alpha=*/T(1), /*beta=*/T(0));
                 auto g1 = std::chrono::high_resolution_clock::now();
                 gemm_ms += std::chrono::duration<double,std::milli>(g1 - g0).count();
 
-                // Scatter-add the Nt×V tile into V-major destination using BLAS AXPY
+                // K-major scatter: columns [k*v_count .. k*v_count+v_count-1]
                 auto s0 = std::chrono::high_resolution_clock::now();
+                const size_t base_col = (size_t)k * (size_t)v_count;
                 for (int c = 0; c < v_count; ++c) {
-                    const T * __restrict src_col = C_tile.ptr + (size_t)c * (size_t)Nt;
-                    T * __restrict dst_col = base_k + (size_t)c * vmajor_stride + (size_t)n0;
-
-                    if constexpr (std::is_same_v<T,double>) {
-                        cblas_daxpy(Nt, 1.0, src_col, 1, dst_col, 1);
-                    } else {
-                        cblas_saxpy(Nt, 1.0f, src_col, 1, dst_col, 1);
-                    }
+                    const T* __restrict src_col = C_tile.ptr + (size_t)c * (size_t)Nt;
+                    T* __restrict dst_col = Xptr + ((base_col + (size_t)c) * (size_t)ldc) + (size_t)n0;
+                    // BLAS AXPY length Nt
+                    cblas_taxpy(Nt, T(1), src_col, 1, dst_col, 1);
                 }
                 auto s1 = std::chrono::high_resolution_clock::now();
                 scatt_ms += std::chrono::duration<double,std::milli>(s1 - s0).count();
@@ -772,10 +793,10 @@ void phase1_compute_Xz_bed_chunk_impl(const std::string &bed_prefix,
         } // parallel
     } // bins
 
-    t1.dump(blk_start, blk_end, /*B=*/(int)Ainfo.shape[1], /*vcount=*/v_count);
+    t1.dump(blk_start, blk_end, /*B=*/B, /*vcount=*/v_count);
 }
 
-// -------------------------- Phase 2: compute_XtXz (float/double) -------------
+// -------------------------- Phase 2: XtXz (K-major) --------------------------
 template <typename T>
 void phase2_compute_XtXz_bed_impl(const std::string &bed_prefix,
                                   const std::string &fam_path,
@@ -785,118 +806,139 @@ void phase2_compute_XtXz_bed_impl(const std::string &bed_prefix,
                                   py::array_t<T, py::array::c_style | py::array::forcecast> inv_left, // (L,)
                                   int nvecs,
                                   int /*vchunk*/,  // unused
-                                  py::array_t<T, py::array::f_style | py::array::forcecast> Xz2d,      // (N x (B*V)), V-major
+                                  py::array_t<T, py::array::f_style | py::array::forcecast> Xz2d,      // (N x (B*V)), **K-major**
                                   py::array_t<T, py::array::c_style | py::array::forcecast> meansq,    // (M x B)
                                   py::object C_opt, py::object R_opt,
-                                  int N_denom) {
+                                  int N_denom)
+{
     const std::string bed_path = bed_prefix + ".bed";
     const std::string bim_path = bed_prefix + ".bim";
+
     const int64_t N_total = count_lines_cached(fam_path);
     const int64_t M_total = count_lines_cached(bim_path);
     if (blk_end > M_total) throw std::runtime_error("blk_end exceeds #SNPs in BIM");
 
     std::vector<int> rows = parse_row_sel(row_sel_obj, N_total);
 
+    // Read & standardize geno block -> Geno (N x L), col-major
     int N = 0, L = 0;
     std::vector<T> Geno;
     read_block_standardized<T>(bed_path, fam_path, blk_start, blk_end, rows, ddof, Geno, N, L);
     if (L == 0) return;
 
-    std::vector<T> Y = Geno;
+    // Optional projection: Y = (I - C R) * Geno, done **in-place** in Geno
     if (!C_opt.is_none() && !R_opt.is_none()) {
         py::array_t<T, py::array::f_style | py::array::forcecast> C = C_opt.cast<py::array_t<T, py::array::f_style | py::array::forcecast>>();
         py::array_t<T, py::array::f_style | py::array::forcecast> R = R_opt.cast<py::array_t<T, py::array::f_style | py::array::forcecast>>();
         auto Ci = C.request(); auto Ri = R.request();
-        int p = (int)Ci.shape[1];
+        const int p = (int)Ci.shape[1];
         if ((int)Ci.shape[0] != N || (int)Ri.shape[0] != p || (int)Ri.shape[1] != N)
             throw std::runtime_error("C/R shape mismatch");
-        const T *Cptr = static_cast<const T*>(Ci.ptr);
-        const T *Rptr = static_cast<const T*>(Ri.ptr);
-        std::vector<T> tmpG((size_t)p * (size_t)L, T(0));
-        gemm_col_major_nn<T>(p, L, N, Rptr, p, Geno.data(), N, tmpG.data(), p, T(1), T(0));
-        gemm_col_major_nn<T>(N, L, p, Cptr, N, tmpG.data(), p, Y.data(), N, T(-1), T(1));
+
+        const T* Cptr = static_cast<const T*>(Ci.ptr);
+        const T* Rptr = static_cast<const T*>(Ri.ptr);
+
+        // tmpG = R * Geno (p x L)
+        AlignedBuffer<T> tmpG((size_t)p * (size_t)L, 64);
+        gemm_col_major_nn<T>(/*m=*/p, /*n=*/L, /*k=*/N,
+                             /*A=*/Rptr, /*lda=*/p,
+                             /*B=*/Geno.data(), /*ldb=*/N,
+                             /*C=*/tmpG.ptr, /*ldc=*/p,
+                             /*alpha=*/T(1), /*beta=*/T(0));
+        // Geno = Geno - C * tmpG  (in-place)
+        gemm_col_major_nn<T>(/*m=*/N, /*n=*/L, /*k=*/p,
+                             /*A=*/Cptr, /*lda=*/N,
+                             /*B=*/tmpG.ptr, /*ldb=*/p,
+                             /*C=*/Geno.data(), /*ldc=*/N,
+                             /*alpha=*/T(-1), /*beta=*/T(1));
     }
 
+    // inv_left (L,)
     auto Ii = inv_left.request();
     if (Ii.ndim != 1 || (int)Ii.shape[0] != L) throw std::runtime_error("inv_left shape mismatch");
-    const T *inv = static_cast<const T*>(Ii.ptr);
+    const T* inv = static_cast<const T*>(Ii.ptr);
 
+    // Xz: (N x (B*V)), **K-major** (column g = k*V + v)
     auto Xi = Xz2d.request();
     if (Xi.ndim != 2 || (int)Xi.shape[0] != N) throw std::runtime_error("Xz2d shape mismatch");
-    T *Xptr = static_cast<T*>(Xi.ptr);
+    T* Xptr = static_cast<T*>(Xi.ptr);
     const int BV = (int)Xi.shape[1];
-    if ((BV % nvecs) != 0) throw std::runtime_error("Xz2d col count must be multiple of nvecs");
-    const int B = BV / nvecs;               // V-major: columns grouped by v
+    if (nvecs <= 0 || (BV % nvecs) != 0) throw std::runtime_error("Xz2d col count must be multiple of nvecs");
+    const int B = BV / nvecs;
 
+    // meansq: (M x B)
     auto Mi = meansq.request();
     if (Mi.ndim != 2 || (int)Mi.shape[1] != B) throw std::runtime_error("meansq shape mismatch");
-    T *Mptr = static_cast<T*>(Mi.ptr);
+    T* Mptr = static_cast<T*>(Mi.ptr);
     const int M = (int)Mi.shape[0];
     if (blk_end > M) throw std::runtime_error("meansq rows smaller than SNP count");
 
-    // scale Y by inv_left / (N_denom-1)
+    // Scale Geno columns by inv_left / (N_denom - 1)  (in-place)
     T denom = T(N_denom) - T(1);
     if (denom <= T(0)) denom = T(1);
     for (int i = 0; i < L; ++i) {
         const T s = inv[i] / denom;
-        T *col = Y.data() + (size_t)i * (size_t)N;
+        T* col = Geno.data() + (size_t)i * (size_t)N;  // col-major
+        #pragma omp simd
         for (int r = 0; r < N; ++r) col[r] *= s;
     }
 
-    // Tiles (no RHS pack; rhs_pack=false)
-    const TilePlan plan = choose_tiles_auto<T>(N, L, B, nvecs);
-    const int VPANEL = plan.VPANEL;
-    const int CTILE  = plan.CTILE;
+    // Tile planning over Q = B*V (columns contiguous in K-major)
+    const int Q = BV;
+    int QPANEL = getenv_int("SUMMIT_P2_QP", 12288);
+    if (QPANEL <= 0) QPANEL = 8192;
+    if (QPANEL > Q) QPANEL = Q;
+    QPANEL = ((QPANEL + 63) / 64) * 64;
+    if (QPANEL > Q) QPANEL = Q;
+    if (QPANEL < 64) QPANEL = std::min(Q, 64);
 
-    AlignedBuffer<T> Work_tile((size_t)L * (size_t)CTILE);
+    // Workspace for one Q panel: (L x QPANEL), col-major
+    AlignedBuffer<T> Work_panel((size_t)L * (size_t)QPANEL, 64);
+
     const T invV = T(1) / T(nvecs);
 
     BlockTimers t;
     py::gil_scoped_release nogil;
 
-    for (int jc = 0; jc < nvecs; jc += VPANEL) {
+    for (int q0 = 0; q0 < Q; q0 += QPANEL) {
         check_for_interrupt();
-        const int vp = std::min(VPANEL, nvecs - jc);
-        const int total_cols = B * vp;
+        const int q = std::min(QPANEL, Q - q0);
 
-        for (int ct0 = 0; ct0 < total_cols; ct0 += CTILE) {
-            check_for_interrupt();
-            const int ct = std::min(CTILE, total_cols - ct0);
+        // GEMM: Work_panel(L x q) = (Geno^T)(L x N) * Xz_panel(N x q)
+        const T* rhs = Xptr + (size_t)q0 * (size_t)N; // K-major: advance q0 columns with ld N
+        auto t2 = std::chrono::high_resolution_clock::now();
+        gemm_col_major_tn<T>(/*m=*/L, /*n=*/q, /*k=*/N,
+                             /*A=*/Geno.data(), /*lda=*/N,  // A^T is LxN
+                             /*B=*/rhs,        /*ldb=*/N,  // N x q
+                             /*C=*/Work_panel.ptr, /*ldc=*/L,
+                             /*alpha=*/T(1), /*beta=*/T(0));
+        auto t3 = std::chrono::high_resolution_clock::now();
+        t.add_gemm(std::chrono::duration<double,std::milli>(t3 - t2).count());
 
-            auto t2 = std::chrono::high_resolution_clock::now();
-            const T* rhs = Xptr + ((size_t)(jc * B + ct0) * (size_t)N); // V-major
-            gemm_col_major_tn<T>(L, ct, N,
-                                Y.data(), N,
-                                rhs,      N,
-                                Work_tile.ptr, L,
-                                T(1), T(0));
-            auto t3 = std::chrono::high_resolution_clock::now();
-            t.add_gemm(std::chrono::duration<double,std::milli>(t3 - t2).count());
+        // Reduce: meansq[blk_start:blk_end, k] += (wcol^2)/V
+        auto t4 = std::chrono::high_resolution_clock::now();
+        for (int tcol = 0; tcol < q; ++tcol) {
+            const int g = q0 + tcol;            // global column within [0, B*V)
+            const int k = g / nvecs;           // **K-major** bin index
+            const T* __restrict wcol = Work_panel.ptr + (size_t)tcol * (size_t)L;
 
-            auto t4 = std::chrono::high_resolution_clock::now();
-            // Reduce straight into meansq rows [blk_start : blk_end)
-            for (int tcol = 0; tcol < ct; ++tcol) {
-                const int g = ct0 + tcol;
-                const int k = g % B; // V-major
-                const T* __restrict wcol = Work_tile.ptr + (size_t)tcol * (size_t)L;
+            // base pointer for this bin's column in global meansq
+            T* __restrict out = Mptr + ((size_t)blk_start * (size_t)B + (size_t)k);
 
-                // base pointer for this bin's column in global meansq
-                T* __restrict out = Mptr + ((size_t)blk_start * (size_t)B + (size_t)k);
-
-                #pragma omp simd
-                for (int i = 0; i < L; ++i) {
-                    const T z2 = wcol[i] * wcol[i] * invV;
-                    out[(size_t)i * (size_t)B] += z2; // stride by B across rows
-                }
+            #pragma omp simd
+            for (int i = 0; i < L; ++i) {
+                const T z2 = wcol[i] * wcol[i] * invV;
+                out[(size_t)i * (size_t)B] += z2; // stride by B across rows
             }
-            auto t5 = std::chrono::high_resolution_clock::now();
-            t.add_reduce(std::chrono::duration<double,std::milli>(t5 - t4).count());
         }
+        auto t5 = std::chrono::high_resolution_clock::now();
+        t.add_reduce(std::chrono::duration<double,std::milli>(t5 - t4).count());
     }
 
     t.dump(blk_start, blk_end, B, nvecs);
-
 }
+
+
 
 // ------------------------------- PyBind module -------------------------------
 

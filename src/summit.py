@@ -69,6 +69,8 @@ parser.add_argument("--ddof", default=1, type=int, \
                     help="Specify the delta degrees of freedom (ddof) for estimating genome-wide LD scores. Default is 1 (empirical SD).")
 parser.add_argument("--num-threads", default=4, type=int, \
                     help='Cap the number of threads for BLAS to limit CPU usage. Default is 4.')
+parser.add_argument("--target-xz-mem", type=float, default=16.0,
+                    help="Memory budget (GB) for the Phase-1 Xz panel (N × B × Vt). Used to pick the initial V-tile before balancing. Default: 16.0")
 
 # Low-level performance knobs
 parser.add_argument("--ctile", type=int, default=None,
@@ -77,8 +79,6 @@ parser.add_argument("--ctile-mb", type=int, default=None,
                     help="Memory-budget-driven CTILE (MiB). If set, overrides --ctile-l3pct. Mutually exclusive with --ctile.")
 parser.add_argument("--ctile-l3pct", type=float, default=0.80,
                     help="Fraction of per-socket L3 cache to target per BLAS thread for CTILE auto-sizing. Ignored if --ctile or --ctile-mib is provided. Default: 0.80")
-parser.add_argument("--target-xz-gib", type=float, default=16.0,
-                    help="Memory budget (GiB) for the Phase-1 Xz panel (N × B × Vt). Used to pick the initial V-tile before balancing. Default: 16.0")
 parser.add_argument("--sockets", type=int, default=None,
                     help="Override the number of CPU sockets for CTILE heuristics. By default it is auto-detected from CPU topology.")
 parser.add_argument("--malloc-arena-max", type=int, default=2)
@@ -212,7 +212,7 @@ if __name__ == '__main__':
         # set 
         gwld = GenomewideLDScore(bed_path=args.geno, annot_path=args.annot, out_path=args.out, covar_path=args.covar, rand_dist=args.rand_dist,\
             log=log, num_vecs=args.nvecs, step_size=args.step_size, seed=args.seed, verbose=args.verbose, \
-                dtype = args.dtype, num_threads=args.num_threads, rand_samp=args.rand_samp, low_level=low_level)
+                dtype = args.dtype, num_threads=args.num_threads, rand_samp=args.rand_samp, low_level=low_level, target_xz_mem=args.target_xz_mem)
         gwld._compute_ldscore()
     elif (args.h2 is not None):
         if (args.trace is None) and (args.ldscores is None):
