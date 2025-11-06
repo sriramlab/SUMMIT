@@ -885,8 +885,8 @@ void phase2_compute_XtXz_bed_impl(const std::string &bed_prefix,
 
     // Tile planning over Q = B*V (columns contiguous in K-major)
     const int Q = BV;
-    int QPANEL = getenv_int("SUMMIT_P2_QP", 12288);
-    if (QPANEL <= 0) QPANEL = 8192;
+    int QPANEL = getenv_int("SUMMIT_P2_QP", 16384);
+    if (QPANEL <= 0) QPANEL = 16384;
     if (QPANEL > Q) QPANEL = Q;
     QPANEL = ((QPANEL + 63) / 64) * 64;
     if (QPANEL > Q) QPANEL = Q;
