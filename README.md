@@ -27,27 +27,9 @@ conda activate summit
 python -m pip install -U pip
 ```
 
-### 3. Locate OpenBLAS and tell CMake where it is
-Find the OpenBLAS shared library inside the env (one of these patterns will match):
+### 3. Build & install
 ```bash
-ls $CONDA_PREFIX/lib/libopenblasp-*.so      # Linux (conda-forge)
-ls $CONDA_PREFIX/lib/libopenblas*.so        # Linux (fallback)
-# macOS:
-ls $CONDA_PREFIX/lib/libopenblasp-*.dylib
-```
-Export an env var to that exact file:
-```bash
-# Linux example:
-export OBLAS_SO="$CONDA_PREFIX/lib/libopenblasp-r0.3.30.so"
-# macOS example:
-# export OBLAS_SO="$CONDA_PREFIX/lib/libopenblasp-r0.3.30.dylib"
-```
-
-### 4. Build & install
-```bash
-pip install -v . --no-build-isolation \
-  --config-settings=cmake.define.PYBIND11_FINDPYTHON=ON \
-  --config-settings=cmake.define.USER_BLAS_LIB=$OBLAS_SO
+pip install -v .
 ```
 
 You can check whether the ```gwldcore``` module has been successfully built or not by running:
@@ -97,7 +79,7 @@ python3 ../src/summit.py --geno ./small \
                   --covar ./small.cov \
                   --out ./small.2bins \
                   --nvecs 100 \
-                  --nworkers 8 \
+                  --num-threads 8 \
                   --step-size 1000
 ```
 This script should run within a few seconds and create a gzip file named ```small.2bins.gw.ldscore.gz``` and ```small.2bins.gw.log```. The file format of ```small.2bins.gw.ldscore.gz``` is identical to the traditional LDSC LD scores, where the first three columns are metadata ('CHR', 'SNP', 'BP'), and the remaining columns the (partitioned) LD scores.
@@ -116,7 +98,6 @@ This script should run within a few seconds and create a gzip file named ```smal
 --njack : Number of jackknife blocks (only if using LD scores as input). Default is 100
 --annot : Path of the annotation file (if using partitioned heritability). You may either use the "thin annot" (annotation matrix only) or the LDSC-style annotation files (.annot.gz).
 --geno : Path of the genotype file to calculate the genome-wide LD scores. Calculates partitioned scores if --annot is also specified.
---nworkers : Number of workers for multiprocessing to calculate stochastic genome-wide LD scores. Default is 4.
 --num-threads: Cap the number of threads for BLAS to limit CPU usage. Default is 4.
 --nvecs : Number of random vectors to use for estimating stochastic genome-wide LD scores. Default is 10000.
 --step-size : Number of SNPs to process in each step of estimating stochastic genome-wide LD scores. Default is 1000.
