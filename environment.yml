@@ -9,6 +9,7 @@ dependencies:
   - scipy>=1.9
   - tqdm>=4.64
   - bed-reader>=1.0    # conda package, prebuilt
+  - psutil
 
   # build toolchain for the C++ extension
   - cmake>=3.24

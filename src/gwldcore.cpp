@@ -3,7 +3,6 @@
 #include <pybind11/numpy.h>
 #include <pybind11/stl.h>
 
-#include <cblas.h>
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
@@ -24,6 +23,8 @@
 
 #include <unordered_map>
 #include <mutex>
+
+#include "blas_compat.hpp"
 
 
 #if defined(__linux__)
