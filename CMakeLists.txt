@@ -4,6 +4,15 @@ project(gwldcore LANGUAGES CXX)
 cmake_minimum_required(VERSION 3.21)
 project(gwldcore LANGUAGES CXX)
 
+# Require GCC >= 12.0
+if (CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+  if (CMAKE_CXX_COMPILER_VERSION VERSION_LESS 12.0)
+    message(FATAL_ERROR
+      "ERROR: GCC >= 12.0 is required (found ${CMAKE_CXX_COMPILER_VERSION}). "
+      "Install or load a newer GCC (e.g., module load gcc/12.5.0) and retry.")
+  endif()
+endif()
+
 # Silence pybind11 legacy finder warning and use modern FindPython
 set(PYBIND11_FINDPYTHON ON)
 find_package(pybind11 REQUIRED)
