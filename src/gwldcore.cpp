@@ -19,12 +19,12 @@
 #include <cstring>
 #include <memory>
 #include <set>
-#include <immintrin.h>
 
 #include <unordered_map>
 #include <mutex>
 
 #include "blas_compat.hpp"
+#include "arch_compat.hpp"
 
 
 #if defined(__linux__)
