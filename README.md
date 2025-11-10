@@ -13,6 +13,8 @@
 - Linux or macOS
 - Anaconda3 / Miniconda
 - C++17 compiler (e.g., `g++` on Linux; Xcode CLT on macOS)
+- On Linux Intel machines, you need MKL set up. On the UCLA Hoffman2 Cluster, use ```module load intel/2023.1.0```
+- On Linux AMD machines, the code will use OpenBLAS instead (no additional action required)
 
 ### 1. Clone the repository
 ```bash
@@ -21,9 +23,19 @@ cd SUMMIT
 ```
 
 ### 2. Create a virtual environment
+#### MacOS:
 ```bash
 conda env create -f environment.yml
 conda activate summit
+conda install -n summit -c conda-forge llvm-openmp
+python -m pip install -U pip
+```
+
+#### Linux:
+```bash
+conda env create -f environment.yml
+conda activate summit
+conda install -n summit -c conda-forge numactl
 python -m pip install -U pip
 ```
 
