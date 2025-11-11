@@ -7,13 +7,13 @@
 2. heritability of phenotypes from summary statistics
 3. genetic correlation from summary statistics
 
-## Quick Start (Conda recommended)
+## Quick Start
 
 ### 0. Requirements
 - Linux or macOS
 - Anaconda3 / Miniconda
 - C++17 compiler (e.g., `g++` on Linux; Xcode CLT on macOS)
-- On Linux Intel machines, you need MKL set up. On the UCLA Hoffman2 Cluster, use ```module load intel/2023.1.0```
+- On Linux Intel machines, you need Intel MKL set up. On the UCLA Hoffman2 Cluster, use ```module load intel/2023.1.0```
 - On Linux AMD machines, the code will use OpenBLAS instead (no additional action required)
 
 ### 1. Clone the repository
@@ -28,7 +28,6 @@ cd SUMMIT
 conda env create -f environment.yml
 conda activate summit
 conda install -n summit -c conda-forge llvm-openmp
-python -m pip install -U pip
 ```
 
 #### Linux:
@@ -36,7 +35,6 @@ python -m pip install -U pip
 conda env create -f environment.yml
 conda activate summit
 conda install -n summit -c conda-forge numactl
-python -m pip install -U pip
 ```
 
 ### 3. Build & install
@@ -50,7 +48,23 @@ python -c "import gwldcore, numpy; print('gwldcore OK; numpy', numpy.__version__
 ```
 
 ## How to use ```summit```
-### 1. Estimating partitioned heritability from summary statistics
+### 1. Estimating genome-wide LD scores
+
+Other methods use sliding fixed-sized windows (typically < 2Mb) to estimate the LD scores of the SNPs. This results in under-estimation of LD scores, as the long-range LD (> 2Mb) is not captured. Often times, this results in upward-biased estimates of heritability. One of the advantages of Randomized Haseman-Elston regression is that it can efficiently estimate genome-wide correlations between SNPs through random projection. In the original RHE papers, this is used to estimate the trace of squared kinship matrix. ```summit``` extends this idea further by estimating the genome-wide (partitioned) LD scores.
+
+Here is an example run command (```estimate_gwldscore.sh``` in the [example](example) directory):
+```
+python3 ../src/summit.py --geno ./small \
+                  --annot ./small.2bins_annot.txt \
+                  --covar ./small.cov \
+                  --out ./small.2bins \
+                  --nvecs 100 \
+                  --num-threads 8 \
+                  --step-size 1000
+```
+This script should run within a few seconds and create a gzip file named ```small.2bins.gw.ldscore.gz``` and ```small.2bins.gw.log```. The file format of ```small.2bins.gw.ldscore.gz``` is identical to the traditional LDSC LD scores, where the first three columns are metadata ('CHR', 'SNP', 'BP'), and the remaining columns the (partitioned) LD scores.
+
+### 2. Estimating partitioned heritability from summary statistics
 
 ```summit``` can accurately (i.e., comparable to methods that use individual-level data) estimate heritability from summary-level data.
 To estimate (partitioned) heritability, you need the following: 
@@ -80,21 +94,6 @@ You should get an heritability estimate of 0.26851 and ```SE``` of 0.01512. Note
 If you'd like to create your own trace summaries, please refer to the ```PyRHE``` program from our lab: https://github.com/sriramlab/PyRHE. You may also use the C++ version of ```GENIE```.
 You would need your own individual-level genotype for this (running with ```-tr``` option will save the trace summaries). While less flexible than using SNP-level LD scores, the trace summaries are directly estimated with ```GENIE``` or ```pyRHE```, and the files are a lot smaller in size (less than 0.1 MB).
 
-### 2. Estimating genome-wide LD scores
-
-Other methods use sliding fixed-sized windows (typically < 2Mb) to estimate the LD scores of the SNPs. This results in under-estimation of LD scores, as the long-range LD (> 2Mb) is not captured. Often times, this results in upward-biased estimates of heritability. One of the advantages of Randomized Haseman-Elston regression is that it can efficiently estimate genome-wide correlations between SNPs through random projection. In the original RHE papers, this is used to estimate the trace of squared kinship matrix. ```summit``` extends this idea further by estimating the genome-wide (partitioned) LD scores.
-
-Here is an example run command (```estimate_gwldscore.sh``` in the [example](example) directory):
-```
-python3 ../src/summit.py --geno ./small \
-                  --annot ./small.2bins_annot.txt \
-                  --covar ./small.cov \
-                  --out ./small.2bins \
-                  --nvecs 100 \
-                  --num-threads 8 \
-                  --step-size 1000
-```
-This script should run within a few seconds and create a gzip file named ```small.2bins.gw.ldscore.gz``` and ```small.2bins.gw.log```. The file format of ```small.2bins.gw.ldscore.gz``` is identical to the traditional LDSC LD scores, where the first three columns are metadata ('CHR', 'SNP', 'BP'), and the remaining columns the (partitioned) LD scores.
 
 ## Parameters
 
@@ -125,8 +124,6 @@ This script should run within a few seconds and create a gzip file named ```smal
 
 ## TODO's
 ✅ genetic correlation
-
-✅ both-side filtering of outlier SNPs
 
 ☑️ partitioned genetic correlation
 
