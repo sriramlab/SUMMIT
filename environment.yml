@@ -9,18 +9,17 @@ dependencies:
   - tqdm>=4.64
   - bed-reader>=1.0
   - psutil
+  - threadpoolctl>=3.2
   - pip
 
-  # build toolchain for the C++ extension
+  # build toolchain
   - cmake>=3.26
   - ninja
   - pybind11>=2.12
   - scikit-build-core>=0.5
-  - libopenblas>=0.3
-  - threadpoolctl>=3.2
   - pkg-config
 
-  # os-specific libraries
-  # - numactl   # linux
-  # - llvm-openmp   # macOS
-
+  # BLAS/LAPACK -> force OpenBLAS provider and install headers too
+  - openblas>=0.3
+  - libblas=*=*openblas
+  - liblapack=*=*openblas

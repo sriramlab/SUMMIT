@@ -8,40 +8,69 @@ find_package(pybind11 REQUIRED)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-# ---- BLAS selection heuristics (overridable) ----
-# User can force a specific vendor with: -DBLA_VENDOR=...
-# Common values: Intel10_64lp, OpenBLAS, Generic (on mac this resolves to vecLib/Accelerate)
+# =====================================================================================
+# BLAS vendor selection (overridable with -DBLA_VENDOR=...)
+#   macOS              -> Generic (Accelerate)
+#   MKL available      -> Intel10_64lp
+#   otherwise (Linux)  -> OpenBLAS (explicit, prefer conda)
+# =====================================================================================
 if(NOT DEFINED BLA_VENDOR)
   if(APPLE)
-    set(BLA_VENDOR Generic CACHE STRING "" FORCE)  # system BLAS -> Accelerate
+    set(BLA_VENDOR Generic CACHE STRING "" FORCE)  # Accelerate
   else()
-    if(DEFINED ENV{MKLROOT})
+    if(DEFINED ENV{MKLROOT} OR EXISTS "$ENV{CONDA_PREFIX}/lib/libmkl_rt.so")
       set(BLA_VENDOR Intel10_64lp CACHE STRING "" FORCE)
-    elseif(EXISTS "$ENV{CONDA_PREFIX}/lib/libopenblas.so" OR
-           EXISTS "/usr/lib/x86_64-linux-gnu/libopenblas.so")
-      set(BLA_VENDOR OpenBLAS CACHE STRING "" FORCE)
     else()
-      set(BLA_VENDOR Generic CACHE STRING "" FORCE)
+      set(BLA_VENDOR OpenBLAS CACHE STRING "" FORCE)
     endif()
   endif()
 endif()
 message(STATUS "Using BLA_VENDOR=${BLA_VENDOR}")
 
-find_package(BLAS REQUIRED)  # honors BLA_VENDOR
+# First try CMake's FindBLAS, honoring BLA_VENDOR
+set(BLA_STATIC OFF CACHE BOOL "" FORCE)
+find_package(BLAS)
+
+# If we're insisting on OpenBLAS and FindBLAS failed, wire it manually (prefer conda)
+if(NOT BLAS_FOUND AND BLA_VENDOR STREQUAL "OpenBLAS")
+  message(STATUS "FindBLAS didn't locate OpenBLAS; trying manual OpenBLAS wiring")
+  # Library
+  find_library(OPENBLAS_LIB
+    NAMES openblas openblas64_ libopenblas
+    HINTS "$ENV{CONDA_PREFIX}/lib" "/usr/local/lib" "/usr/lib" "/usr/lib/x86_64-linux-gnu")
+  # Header
+  find_path(CBLAS_INCLUDE_DIR cblas.h
+    HINTS "$ENV{CONDA_PREFIX}/include" "/usr/local/include" "/usr/include")
+
+  if(OPENBLAS_LIB)
+    add_library(BLAS::BLAS UNKNOWN IMPORTED)
+    set_target_properties(BLAS::BLAS PROPERTIES IMPORTED_LOCATION "${OPENBLAS_LIB}")
+    set(BLAS_FOUND TRUE)
+    set(BLAS_LIBRARIES "${OPENBLAS_LIB}")
+    if(CBLAS_INCLUDE_DIR)
+      set(OPENBLAS_INCLUDE_DIR "${CBLAS_INCLUDE_DIR}")
+    endif()
+    message(STATUS "Manually wired OpenBLAS: ${OPENBLAS_LIB}")
+  else()
+    message(FATAL_ERROR
+      "OpenBLAS not found. Please install it in your env (e.g., `conda install openblas`).")
+  endif()
+endif()
+
+if(NOT BLAS_FOUND)
+  message(FATAL_ERROR "BLAS not found (BLA_VENDOR=${BLA_VENDOR}). "
+                      "Try setting -DBLA_VENDOR=OpenBLAS or installing MKL/OpenBLAS.")
+endif()
 
 # ---- Extension target ----
 pybind11_add_module(gwldcore src/gwldcore.cpp)
 target_compile_features(gwldcore PUBLIC cxx_std_17)
-
-# Some compilers like having this; harmless elsewhere
 target_compile_options(gwldcore PRIVATE -O3 -march=native)
 
-# ---- Tell your shim which header to use ----
+# ---- Tell your shim which header to use + link BLAS ----
 if(APPLE)
-  # We’re using Accelerate; prefer new LAPACK interface to avoid deprecations
+  # Accelerate (vecLib)
   target_compile_definitions(gwldcore PRIVATE GWLDCORE_USE_ACCELERATE ACCELERATE_NEW_LAPACK)
-
-  # Link either the imported BLAS target or the framework directly as fallback
   if(TARGET BLAS::BLAS)
     target_link_libraries(gwldcore PRIVATE BLAS::BLAS)
   else()
@@ -49,6 +78,7 @@ if(APPLE)
   endif()
 
 elseif(BLA_VENDOR MATCHES "Intel")
+  # MKL
   target_compile_definitions(gwldcore PRIVATE GWLDCORE_USE_MKL_CBLAS)
   if(DEFINED ENV{MKLROOT})
     target_include_directories(gwldcore PRIVATE "$ENV{MKLROOT}/include")
@@ -56,12 +86,17 @@ elseif(BLA_VENDOR MATCHES "Intel")
   target_link_libraries(gwldcore PRIVATE BLAS::BLAS)
 
 else()
+  # OpenBLAS
   target_compile_definitions(gwldcore PRIVATE GWLDCORE_USE_GENERIC_CBLAS)
-  # Try to help CBLAS header discovery when using Conda OpenBLAS
-  find_path(CBLAS_INCLUDE_DIR cblas.h
-    HINTS "$ENV{CONDA_PREFIX}/include" "/usr/include" "/usr/local/include")
-  if(CBLAS_INCLUDE_DIR)
-    target_include_directories(gwldcore PRIVATE "${CBLAS_INCLUDE_DIR}")
+  if(DEFINED OPENBLAS_INCLUDE_DIR)
+    target_include_directories(gwldcore PRIVATE "${OPENBLAS_INCLUDE_DIR}")
+  else()
+    # Help CBLAS header discovery (Conda/system)
+    find_path(CBLAS_INCLUDE_DIR cblas.h
+      HINTS "$ENV{CONDA_PREFIX}/include" "/usr/include" "/usr/local/include")
+    if(CBLAS_INCLUDE_DIR)
+      target_include_directories(gwldcore PRIVATE "${CBLAS_INCLUDE_DIR}")
+    endif()
   endif()
   target_link_libraries(gwldcore PRIVATE BLAS::BLAS)
 endif()
@@ -79,5 +114,5 @@ endif()
 # ---- Install into wheel root ----
 install(TARGETS gwldcore
   LIBRARY DESTINATION .
-  RUNTIME  DESTINATION .
+  RUNTIME DESTINATION .
   ARCHIVE DESTINATION .)

@@ -22,6 +22,7 @@
 
 #include <unordered_map>
 #include <mutex>
+#include <atomic>
 
 #include "blas_compat.hpp"
 #include "arch_compat.hpp"
@@ -242,19 +243,34 @@ static inline TilePlan choose_tiles_auto(int N, int L, int B, int nvecs) {
     return make_plan(CTILE);
 }
 
+// --- verbosity gate --------------------------------------------
+static std::atomic<bool> g_verbose{false};
+
+static inline bool verbose_enabled() {
+    return g_verbose.load(std::memory_order_relaxed);
+}
+
+// setter used from Python
+static inline void set_verbose(bool v) {
+    g_verbose.store(v, std::memory_order_relaxed);
+}
+
+
 // --- timers ------------------------------------------------------------------
 struct P1Timers {
-    double t_packZ_ms = 0.0;   // pack Z→Bcol (per-bin)
-    double t_packA_ms = 0.0;   // pack Geno→A_tile (per N-tile)
-    double t_gemm_ms  = 0.0;   // GEMM time
-    double t_scatt_ms = 0.0;   // scatter-add C_tile → Xz
+    double t_packZ_ms = 0.0;
+    double t_packA_ms = 0.0;
+    double t_gemm_ms  = 0.0;
+    double t_scatt_ms = 0.0;
 
     void dump(int blk_start, int blk_end, int B, int vcount) const {
+        if (!verbose_enabled()) return;  // only print in verbose mode
         std::fprintf(stderr,
           "[phase1] block [%d:%d) B=%d V=%d  packZ=%.2f ms  packA=%.2f ms  gemm=%.2f ms  scatter=%.2f ms\n",
           blk_start, blk_end, B, vcount, t_packZ_ms, t_packA_ms, t_gemm_ms, t_scatt_ms);
     }
 };
+
 struct BlockTimers {
     double t_pack_ms = 0.0;
     double t_gemm_ms = 0.0;
@@ -262,12 +278,15 @@ struct BlockTimers {
     void add_pack(double ms){ t_pack_ms += ms; }
     void add_gemm(double ms){ t_gemm_ms += ms; }
     void add_reduce(double ms){ t_reduce_ms += ms; }
+
     void dump(int blk_start, int blk_end, int B, int nvecs) const {
+        if (!verbose_enabled()) return;  // only print in verbose mode
         std::fprintf(stderr,
             "[phase2] block [%d:%d) B=%d V=%d  pack=%.2f ms  gemm=%.2f ms  reduce=%.2f ms\n",
             blk_start, blk_end, B, nvecs, t_pack_ms, t_gemm_ms, t_reduce_ms);
     }
 };
+
 
 // ------------------------------- Small helpers -------------------------------
 
@@ -945,6 +964,9 @@ void phase2_compute_XtXz_bed_impl(const std::string &bed_prefix,
 
 PYBIND11_MODULE(gwldcore, m) {
     m.doc() = "C++ core for SUMMIT GW LD score (bed parser + BLAS-safe GEMMs)";
+
+    m.def("set_verbose", &set_verbose, py::arg("enabled"),
+      "Enable/disable verbose timing prints");
 
     // Phase 1 (chunked) float32
     m.def("phase1_compute_Xz_bed_chunk",
