@@ -67,12 +67,17 @@ parser.add_argument("--rand-samp", default=None, type=float, \
                     help="Select a random subset of the samples for LD score calculation. Pass a value between (0, 1] for a ratio, and an integer greater than 100 for the number of samples.)")
 parser.add_argument("--ddof", default=1, type=int, \
                     help="Specify the delta degrees of freedom (ddof) for estimating genome-wide LD scores. Default is 1 (empirical SD).")
+parser.add_argument("--allow-neg-enr", action="store_true", default=False,\
+                    help='Allow negative enrichment estimates. Default is False.')
+
 parser.add_argument("--num-threads", default=4, type=int, \
                     help='Cap the number of threads for BLAS to limit CPU usage. Default is 4.')
 parser.add_argument("--target-xz-mem", type=float, default=16.0,
                     help="Memory budget (GB) for the Phase-1 Xz panel (N × B × Vt). Used to pick the initial V-tile before balancing. Default: 16.0")
-parser.add_argument("--allow-neg-enr", action="store_true", default=False,\
-                    help='Allow negative enrichment estimates. Default is False.')
+parser.add_argument("--device", type=str, default='cpu',
+                    help="Which device to use for GWLD computation. Default is cpu; to use GPU, specify cuda number (applied only for phase 2)")
+parser.add_argument("--use-tp32", action="store_true", default=False,\
+                    help='Use tp32 for GPU. Default is False.')
 
 # Low-level performance knobs
 parser.add_argument("--ctile", type=int, default=None,
@@ -214,7 +219,8 @@ if __name__ == '__main__':
         # set 
         gwld = GenomewideLDScore(bed_path=args.geno, annot_path=args.annot, out_path=args.out, covar_path=args.covar, rand_dist=args.rand_dist,\
             log=log, num_vecs=args.nvecs, step_size=args.step_size, seed=args.seed, verbose=args.verbose, \
-                dtype = args.dtype, num_threads=args.num_threads, rand_samp=args.rand_samp, low_level=low_level, target_xz_mem=args.target_xz_mem)
+            dtype = args.dtype, num_threads=args.num_threads, rand_samp=args.rand_samp, low_level=low_level, target_xz_mem=args.target_xz_mem,\
+            device = args.device, use_tp32 = args.use_tp32)
         gwld._compute_ldscore()
     elif (args.h2 is not None):
         if (args.trace is None) and (args.ldscores is None):

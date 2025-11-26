@@ -21,6 +21,31 @@ from threadpoolctl import threadpool_limits
 
 _THREAD_LOCAL = threading.local()
 
+
+## Device helpers
+def _parse_device_str(s: str) -> tuple[str, int | None]:
+    s = (s or "cpu").strip().lower()
+    if s == "cpu":
+        return "cpu", None
+    if s.startswith("cuda"):
+        if ":" in s:
+            try:
+                return "cuda", int(s.split(":", 1)[1])
+            except ValueError:
+                return "cuda", None
+        return "cuda", None
+    return "cpu", None
+
+
+def _pick_cuda_index_auto(gcu):
+    gpus = gcu.list_gpus()
+    if not gpus:
+        raise RuntimeError("CUDA requested but no GPUs are visible.")
+    # pick by max free bytes
+    best = max(gpus, key=lambda d: int(d["free_bytes"]))
+    return int(best["id"]), int(best["free_bytes"]), int(best["total_bytes"])
+
+
 def apply_env(cfg: dict) -> int:
     """
     Apply low-level environment knobs from a plain dict and enforce BLAS/OMP threads.
@@ -450,7 +475,9 @@ class GenomewideLDScore:
                 eps_var: float = 1e-10,
                 rand_samp=None, # float in (0,1] or int in [100, N]
                 ddof = 1,
-                target_xz_mem = 16.0):
+                target_xz_mem = 16.0,
+                device='cpu',
+                use_tp32 = False):
         
         self.tune = apply_env(low_level)
         
@@ -470,12 +497,48 @@ class GenomewideLDScore:
         self.log = log
         self.verbose = verbose
         gwldcore.set_verbose(bool(self.verbose))
-        self.dtype = np.float32 if dtype in (np.float32, 'float32', 'f4') else np.float64
         self.rand_dist = rand_dist
         self.root_seed = seed
         rng = np.random.default_rng(self.root_seed)
         self.ddof = ddof
         self.target_xz_mem = target_xz_mem
+        
+        # ---------- device / precision policy ----------
+        self.device_raw = device
+        self.device_kind, self.device_index = _parse_device_str(device)
+        
+        self.dtype = np.float32 if dtype in (np.float32, 'float32', 'f4') else np.float64
+        self.use_tp32 = bool(use_tp32)
+        if self.use_tp32 and self.dtype is np.float64:
+            self.log._log("[warn] --use-tp32 only affects float32; ignored for float64.")
+            self.use_tp32 = False
+
+        # Resolve CUDA now so compute() can just consume a canonical string
+        if self.device_kind == "cuda":
+            try:
+                import gwldcore_cuda as _gcu  # will fail cleanly if not built
+                gpus = _gcu.list_gpus()
+                if not gpus:
+                    raise RuntimeError("CUDA requested but no GPUs are visible.")
+                if self.device_index is None:
+                    # pick the GPU with the most free memory
+                    self.device_index = int(max(gpus, key=lambda d: int(d["free_bytes"]))["id"])
+                else:
+                    ids = {int(d["id"]) for d in gpus}
+                    if self.device_index not in ids:
+                        raise RuntimeError(f"Requested cuda:{self.device_index} not visible; available: {sorted(ids)}")
+                self.use_cuda = True
+                self.log._log(f"GPU backend enabled on cuda:{self.device_index} (TP32={'on' if self.use_tp32 else 'off'})")
+            except Exception as e:
+                self.use_cuda = False
+                self.device_kind = "cpu"
+                self.device_index = None
+                self.log._log(f"[GPU] disabled: {e} (falling back to CPU)")
+        else:
+            self.use_cuda = False
+
+        # Canonical device string consumed by _compute_ldscore()
+        self.device = "cpu" if self.device_kind == "cpu" else f"cuda:{self.device_index}"
         
         self.start_time = utils._get_time()
         self.log._log("Genome-wide LD score calculation started at: "+utils._get_timestr(self.start_time))
@@ -950,38 +1013,98 @@ class GenomewideLDScore:
                 meansq_chunk.fill(0)
                 t2_total = 0.0
 
-                # OMP = 1; BLAS = many
-                with set_parallelism(omp_threads=1, blas_threads=self.num_threads):
-                    for blk_idx, (s, e) in enumerate(blocks):
-                        kmax_hint = int(kmax_per_block[blk_idx])
-                        if kmax_hint == 0:
-                            continue
+                dev_kind, dev_idx_req = _parse_device_str(getattr(self, "device", "cpu"))
+                use_tf32 = bool(getattr(self, "use_tp32", False))
 
-                        inv_left  = inv_blocks[blk_idx]
-                        if self.C is not None:
-                            N_denom = int(self.N_eff)             # C++ uses N_eff - 1 inside
+                use_cuda_backend = False
+                gcu = None
+                if dev_kind == "cuda":
+                    try:
+                        import gwldcore_cuda as gcu
+                        # choose device: explicit index wins; otherwise auto by free mem
+                        if dev_idx_req is None:
+                            dev_idx, free_b, tot_b = _pick_cuda_index_auto(gcu)
                         else:
-                            N_denom = int(self.nsamp - self.ddof + 1)
+                            # sanity check via list_gpus()
+                            gl = gcu.list_gpus()
+                            ids = {int(g["id"]) for g in gl}
+                            if dev_idx_req not in ids:
+                                raise RuntimeError(f"Requested cuda:{dev_idx_req} not visible among {sorted(ids)}")
+                            dev_idx = dev_idx_req
+                        if self.verbose:
+                            self.log._log(f"[GPU] Using cuda:{dev_idx} (TF32={'on' if use_tf32 else 'off'})")
+                        use_cuda_backend = True
+                    except Exception as e:
+                        self.log._log(f"[GPU] Falling back to CPU: {e}")
+                        use_cuda_backend = False
 
-                        t0 = time.perf_counter()
-                        gwldcore.phase2_compute_XtXz_bed(
-                            bed_prefix=bed_prefix,
-                            fam_path=fam_path,
-                            blk_start=int(s), blk_end=int(e),
-                            row_sel=row_sel,
-                            ddof=ddof,
-                            inv_left=inv_left,            # (L,)
-                            nvecs=int(Vt),                # mean over THIS tile only
-                            vchunk=int(Vt),               # (unused in C++; keep for signature)
-                            Xz2d=Xz_view,                 # (N x (B*Vt))
-                            meansq=meansq_chunk,          # (M x B), per-block rows overwritten
-                            C=(self.C if self.C is not None else None),
-                            R=(self.cov_R if self.C is not None else None),
-                            N_denom=int(N_denom)
-                        )
-                        t2_total += (time.perf_counter() - t0)
+                # OMP/BLAS threads: GPU path wants no host BLAS
+                if use_cuda_backend:
+                    # OMP=1, BLAS=1 to avoid stealing cores while the GPU runs
+                    with set_parallelism(omp_threads=1, blas_threads=1):
+                        for blk_idx, (s, e) in enumerate(blocks):
+                            kmax_hint = int(kmax_per_block[blk_idx])
+                            if kmax_hint == 0:
+                                continue
 
-                        bar.update(1.0 - w1)
+                            inv_left  = inv_blocks[blk_idx]
+                            if self.C is not None:
+                                N_denom = int(self.N_eff)
+                            else:
+                                N_denom = int(self.nsamp - self.ddof + 1)
+
+                            t0 = time.perf_counter()
+                            gcu.phase2_compute_XtXz_bed(
+                                bed_prefix=bed_prefix,
+                                fam_path=fam_path,
+                                blk_start=int(s), blk_end=int(e),
+                                row_sel=row_sel,
+                                ddof=ddof,
+                                inv_left=inv_left,
+                                nvecs=int(Vt),
+                                vchunk=int(Vt),
+                                Xz2d=Xz_view,
+                                meansq=meansq_chunk,
+                                C=(self.C if self.C is not None else None),
+                                R=(self.cov_R if self.C is not None else None),
+                                N_denom=int(N_denom),
+                                use_tf32=use_tf32,
+                                device_index=int(dev_idx),
+                            )
+                            t2_total += (time.perf_counter() - t0)
+                            bar.update(1.0 - w1)
+                else:
+                    # CPU path (unchanged)
+                    with set_parallelism(omp_threads=1, blas_threads=self.num_threads):
+                        for blk_idx, (s, e) in enumerate(blocks):
+                            kmax_hint = int(kmax_per_block[blk_idx])
+                            if kmax_hint == 0:
+                                continue
+
+                            inv_left  = inv_blocks[blk_idx]
+                            if self.C is not None:
+                                N_denom = int(self.N_eff)
+                            else:
+                                N_denom = int(self.nsamp - self.ddof + 1)
+
+                            t0 = time.perf_counter()
+                            gwldcore.phase2_compute_XtXz_bed(
+                                bed_prefix=bed_prefix,
+                                fam_path=fam_path,
+                                blk_start=int(s), blk_end=int(e),
+                                row_sel=row_sel,
+                                ddof=ddof,
+                                inv_left=inv_left,
+                                nvecs=int(Vt),
+                                vchunk=int(Vt),
+                                Xz2d=Xz_view,
+                                meansq=meansq_chunk,
+                                C=(self.C if self.C is not None else None),
+                                R=(self.cov_R if self.C is not None else None),
+                                N_denom=int(N_denom),
+                            )
+                            t2_total += (time.perf_counter() - t0)
+                            bar.update(1.0 - w1)
 
                 # Weighted combine across tiles
                 meansq_accum += (meansq_chunk * Vt)
