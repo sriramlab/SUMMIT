@@ -16,7 +16,8 @@ from pathlib import Path
 import time
 import gwldcore
 
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
+from threadpoolctl import threadpool_limits
 
 _THREAD_LOCAL = threading.local()
 
@@ -111,16 +112,16 @@ def apply_env(cfg: dict) -> int:
     # but we set sane process-wide defaults here:
     os.environ["OMP_NUM_THREADS"] = str(n_threads)
     os.environ["OMP_DYNAMIC"] = "FALSE"
+
     # BLAS vendors
-    os.environ["OPENBLAS_NUM_THREADS"] = str(n_threads)
+    os.environ["OPENBLAS_NUM_THREADS"] = "1"
     os.environ["OPENBLAS_DYNAMIC"] = "0"
-    os.environ["MKL_NUM_THREADS"] = str(n_threads)
+    os.environ["MKL_NUM_THREADS"] = "1"
     os.environ["MKL_DYNAMIC"] = "FALSE"
-    os.environ["BLIS_NUM_THREADS"] = str(n_threads)
-    os.environ["VECLIB_MAXIMUM_THREADS"] = str(n_threads)
+    os.environ["BLIS_NUM_THREADS"] = "1"
+    os.environ["VECLIB_MAXIMUM_THREADS"] = "1"
     
     os.environ["OMP_PROC_BIND"] = "true"
-    os.environ["KMP_AFFINITY"] = "granularity=fine,compact,1,0"
     os.environ["MKL_ENABLE_INSTRUCTIONS"] = "AVX512"
 
     # Also try to enforce into already loaded libraries
@@ -188,42 +189,29 @@ def apply_env(cfg: dict) -> int:
     os.environ.setdefault("OMP_PROC_BIND", str(cfg.get("omp_proc_bind", "close")))   # or "spread"
     os.environ.setdefault("OMP_PLACES",    str(cfg.get("omp_places", "cores")))     # "cores" is a good default
     os.environ.setdefault("KMP_BLOCKTIME", str(cfg.get("kmp_blocktime", 0)))        # reduce oversubscription
-    os.environ.setdefault("KMP_AFFINITY",  str(cfg.get("kmp_affinity", "granularity=fine,compact,1,0")))
+    #os.environ.setdefault("KMP_AFFINITY",  str(cfg.get("kmp_affinity", "granularity=fine,compact,1,0")))
 
     return actual
 
-
 def set_parallelism(omp_threads: int | None = None, blas_threads: int | None = None):
-    """
-    Set OpenMP and BLAS vendor threads independently.
-    Call early (before spawning Pools) and around phases to avoid nested teams.
-    """
     if omp_threads is not None:
         os.environ["OMP_NUM_THREADS"] = str(max(1, int(omp_threads)))
         os.environ["OMP_DYNAMIC"] = "FALSE"
+        os.environ["OMP_MAX_ACTIVE_LEVELS"] = "1"
 
-    if blas_threads is not None:
-        n = max(1, int(blas_threads))
-        os.environ["MKL_DYNAMIC"] = "FALSE"
-        os.environ["MKL_NUM_THREADS"] = str(n)
-        os.environ["OPENBLAS_NUM_THREADS"] = str(n)
-        os.environ["BLIS_NUM_THREADS"] = str(n)
-        os.environ["VECLIB_MAXIMUM_THREADS"] = str(n)
-        try:
-            import mkl  # type: ignore
-            mkl.set_num_threads(n)
-        except Exception:
-            pass
-        try:
-            # OpenBLAS (if accessible)
-            for so in ("libopenblas.so", "libopenblas64_.so"):
-                try:
-                    ctypes.CDLL(so).openblas_set_num_threads(n)
-                    break
-                except OSError:
-                    continue
-        except Exception:
-            pass
+    if blas_threads is None or threadpool_limits is None:
+        if blas_threads is not None:
+            b = max(1, int(blas_threads))
+            os.environ["OPENBLAS_NUM_THREADS"] = str(b)
+            os.environ["OPENBLAS_DYNAMIC"] = "0"
+            os.environ["MKL_NUM_THREADS"] = str(b)
+            os.environ["MKL_DYNAMIC"] = "FALSE"
+            os.environ["BLIS_NUM_THREADS"] = str(b)
+            os.environ["VECLIB_MAXIMUM_THREADS"] = str(b)
+        return nullcontext()
+    else:
+        return threadpool_limits(limits=int(blas_threads), user_api="blas")
+
 
 def _round_up_to(x, gran):
     return int(((x + gran - 1) // gran) * gran)
@@ -481,6 +469,7 @@ class GenomewideLDScore:
         self.step_size = step_size
         self.log = log
         self.verbose = verbose
+        gwldcore.set_verbose(bool(self.verbose))
         self.dtype = np.float32 if dtype in (np.float32, 'float32', 'f4') else np.float64
         self.rand_dist = rand_dist
         self.root_seed = seed
@@ -922,78 +911,77 @@ class GenomewideLDScore:
 
                 # ---------------------- Phase 1 (chunked) ----------------------
                 # OMP = many; BLAS = 1
-                set_parallelism(omp_threads=self.num_threads, blas_threads=1)
                 t1_total = 0.0
-                
-                for blk_idx, (s, e) in enumerate(blocks):
-                    kmax_hint = int(kmax_per_block[blk_idx])
+                with set_parallelism(omp_threads=self.num_threads, blas_threads=1):
+                    for blk_idx, (s, e) in enumerate(blocks):
+                        kmax_hint = int(kmax_per_block[blk_idx])
 
-                    if kmax_hint == 0:
-                        bar.update(1.0)
-                        continue
+                        if kmax_hint == 0:
+                            bar.update(1.0)
+                            continue
 
-                    annot_blk = ann_blocks[blk_idx]
-                    inv_right = inv_blocks[blk_idx]
+                        annot_blk = ann_blocks[blk_idx]
+                        inv_right = inv_blocks[blk_idx]
 
-                    t0 = time.perf_counter()
-                    gwldcore.phase1_compute_Xz_bed_chunk(
-                        bed_prefix=bed_prefix,
-                        fam_path=fam_path,
-                        blk_start=int(s), blk_end=int(e),
-                        row_sel=row_sel,
-                        ddof=ddof,
-                        annot_blk=annot_blk,              # (L x B)
-                        inv_right=inv_right,              # (L,)
-                        v_start=int(v_start),             # seed offset
-                        v_count=int(Vt),
-                        kmax_hint=kmax_hint,              # TRUST
-                        rand_dist=self.rand_dist,
-                        seed=self.root_seed,
-                        Xz2d_chunk=Xz_view,               # (N x (B*Vt)) Fortran, V-major
-                        project_right=False,
-                        C=(self.C if self.C is not None else None),
-                        R=(self.cov_R if self.C is not None else None)
-                    )
-                    t1_total += (time.perf_counter() - t0)
+                        t0 = time.perf_counter()
+                        gwldcore.phase1_compute_Xz_bed_chunk(
+                            bed_prefix=bed_prefix,
+                            fam_path=fam_path,
+                            blk_start=int(s), blk_end=int(e),
+                            row_sel=row_sel,
+                            ddof=ddof,
+                            annot_blk=annot_blk,              # (L x B)
+                            inv_right=inv_right,              # (L,)
+                            v_start=int(v_start),             # seed offset
+                            v_count=int(Vt),
+                            kmax_hint=kmax_hint,              # TRUST
+                            rand_dist=self.rand_dist,
+                            seed=self.root_seed,
+                            Xz2d_chunk=Xz_view,               # (N x (B*Vt)) Fortran, V-major
+                            project_right=False,
+                            C=(self.C if self.C is not None else None),
+                            R=(self.cov_R if self.C is not None else None)
+                        )
+                        t1_total += (time.perf_counter() - t0)
 
-                    bar.update(w1)
+                        bar.update(w1)
 
                 # ---------------------- Phase 2 ----------------------
                 meansq_chunk.fill(0)
                 t2_total = 0.0
 
                 # OMP = 1; BLAS = many
-                set_parallelism(omp_threads=1, blas_threads=self.num_threads)
-                for blk_idx, (s, e) in enumerate(blocks):
-                    kmax_hint = int(kmax_per_block[blk_idx])
-                    if kmax_hint == 0:
-                        continue
+                with set_parallelism(omp_threads=1, blas_threads=self.num_threads):
+                    for blk_idx, (s, e) in enumerate(blocks):
+                        kmax_hint = int(kmax_per_block[blk_idx])
+                        if kmax_hint == 0:
+                            continue
 
-                    inv_left  = inv_blocks[blk_idx]
-                    if self.C is not None:
-                        N_denom = int(self.N_eff)             # C++ uses N_eff - 1 inside
-                    else:
-                        N_denom = int(self.nsamp - self.ddof + 1)
+                        inv_left  = inv_blocks[blk_idx]
+                        if self.C is not None:
+                            N_denom = int(self.N_eff)             # C++ uses N_eff - 1 inside
+                        else:
+                            N_denom = int(self.nsamp - self.ddof + 1)
 
-                    t0 = time.perf_counter()
-                    gwldcore.phase2_compute_XtXz_bed(
-                        bed_prefix=bed_prefix,
-                        fam_path=fam_path,
-                        blk_start=int(s), blk_end=int(e),
-                        row_sel=row_sel,
-                        ddof=ddof,
-                        inv_left=inv_left,            # (L,)
-                        nvecs=int(Vt),                # mean over THIS tile only
-                        vchunk=int(Vt),               # (unused in C++; keep for signature)
-                        Xz2d=Xz_view,                 # (N x (B*Vt))
-                        meansq=meansq_chunk,          # (M x B), per-block rows overwritten
-                        C=(self.C if self.C is not None else None),
-                        R=(self.cov_R if self.C is not None else None),
-                        N_denom=int(N_denom)
-                    )
-                    t2_total += (time.perf_counter() - t0)
+                        t0 = time.perf_counter()
+                        gwldcore.phase2_compute_XtXz_bed(
+                            bed_prefix=bed_prefix,
+                            fam_path=fam_path,
+                            blk_start=int(s), blk_end=int(e),
+                            row_sel=row_sel,
+                            ddof=ddof,
+                            inv_left=inv_left,            # (L,)
+                            nvecs=int(Vt),                # mean over THIS tile only
+                            vchunk=int(Vt),               # (unused in C++; keep for signature)
+                            Xz2d=Xz_view,                 # (N x (B*Vt))
+                            meansq=meansq_chunk,          # (M x B), per-block rows overwritten
+                            C=(self.C if self.C is not None else None),
+                            R=(self.cov_R if self.C is not None else None),
+                            N_denom=int(N_denom)
+                        )
+                        t2_total += (time.perf_counter() - t0)
 
-                    bar.update(1.0 - w1)
+                        bar.update(1.0 - w1)
 
                 # Weighted combine across tiles
                 meansq_accum += (meansq_chunk * Vt)

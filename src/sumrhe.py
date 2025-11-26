@@ -8,7 +8,8 @@ import sys
 
 class Sumrhe:
     def __init__(self, bim_path=None, sum_path=None, save_path=None, h2_path=None, out=None, chisq_threshold=0, \
-            log=None, mem=False, verbose=False, ldscores=None, njack=None, annot=None, report_tau: bool = True):
+            log=None, mem=False, verbose=False, ldscores=None, njack=None, annot=None,
+            report_tau: bool = True, allow_neg_enr: bool = False):
         self.mem = mem
         self.log = log
         self.start_time = utils._get_time()
@@ -40,13 +41,15 @@ class Sumrhe:
 
         self.out = out
         self.verbose = verbose
-        self.report_tau = bool(report_tau) 
+        self.report_tau = bool(report_tau)
+        self.allow_neg_enr = bool(allow_neg_enr)  # <--- NEW FLAG
         
         if self.report_tau:
             self.tau         = np.zeros((self.npheno, self.nblks+1, self.nbins), dtype=np.float64)
             self.tau_star    = np.zeros((self.npheno, self.nblks+1, self.nbins), dtype=np.float64)
             self.tau_sums    = np.zeros((self.npheno, self.nbins, 2), dtype=np.float64)  # [point, SE]
             self.tau_star_sums = np.zeros((self.npheno, self.nbins, 2), dtype=np.float64)
+
 
     def _calc_sigmas(self, idx):
         rhs = self.sums.rhs                              # (nblks+1, p)
@@ -170,8 +173,14 @@ class Sumrhe:
         with np.errstate(divide='ignore', invalid='ignore'):
             prop = M_bin / M_tot[:, None]                 # (B+1, K)
             enr  = (h2_cat / h2_tot[:, None]) / prop
-            # mark invalid as NaN; we’ll handle them in jackknife
-            invalid = (~np.isfinite(enr)) | (prop <= 0.0) | (h2_tot[:, None] <= 0.0)
+
+            # base invalid mask (NaN/inf, zero/negative prop)
+            invalid = (~np.isfinite(enr)) | (prop <= 0.0)
+
+            # only treat h2_tot <= 0 as invalid when NOT allowing negative enrichment
+            if not self.allow_neg_enr:
+                invalid |= (h2_tot[:, None] <= 0.0)
+
             enr[invalid] = np.nan
 
         self.enrich[idx] = enr

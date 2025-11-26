@@ -71,6 +71,8 @@ parser.add_argument("--num-threads", default=4, type=int, \
                     help='Cap the number of threads for BLAS to limit CPU usage. Default is 4.')
 parser.add_argument("--target-xz-mem", type=float, default=16.0,
                     help="Memory budget (GB) for the Phase-1 Xz panel (N × B × Vt). Used to pick the initial V-tile before balancing. Default: 16.0")
+parser.add_argument("--allow-neg-enr", action="store_true", default=False,\
+                    help='Allow negative enrichment estimates. Default is False.')
 
 # Low-level performance knobs
 parser.add_argument("--ctile", type=int, default=None,
@@ -227,7 +229,7 @@ if __name__ == '__main__':
                 sys.exit(1)
         sums = Sumrhe(bim_path=args.bim, sum_path=args.trace, save_path = args.save_trace, h2_path=args.h2,\
             chisq_threshold=args.max_chisq, log=log, out=args.out, verbose=args.verbose, ldscores=args.ldscores,\
-            njack=args.njack, annot=args.annot)
+            njack=args.njack, annot=args.annot, allow_neg_enr=args.allow_neg_enr)
         sums._run()
         sums._logoff()
     elif (args.rg is not None):
