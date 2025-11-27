@@ -9,7 +9,7 @@ import sys
 class Sumrhe:
     def __init__(self, bim_path=None, sum_path=None, save_path=None, h2_path=None, out=None, chisq_threshold=0, \
             log=None, mem=False, verbose=False, ldscores=None, njack=None, annot=None,
-            report_tau: bool = True, allow_neg_enr: bool = False):
+            report_tau: bool = True, allow_neg_enr: bool = False, clip_nonfinite_vals: bool = False):
         self.mem = mem
         self.log = log
         self.start_time = utils._get_time()
@@ -42,7 +42,8 @@ class Sumrhe:
         self.out = out
         self.verbose = verbose
         self.report_tau = bool(report_tau)
-        self.allow_neg_enr = bool(allow_neg_enr)  # <--- NEW FLAG
+        self.allow_neg_enr = bool(allow_neg_enr)
+        self.clip_nonfinite_vals = clip_nonfinite_vals
         
         if self.report_tau:
             self.tau         = np.zeros((self.npheno, self.nblks+1, self.nbins), dtype=np.float64)
@@ -78,6 +79,10 @@ class Sumrhe:
         M, K = A.shape
         B = self.nblks
 
+        # Flag: if True, clip non-finite values to 0.0 (legacy behavior).
+        # If False, leave them as NaN so jackknife can ignore those replicates.
+        clip_nonfinite = bool(getattr(self, "clip_nonfinite_vals", False))
+
         # ----- One-time per-phenotype precompute (after filtering) -----
         # Use float32 to leverage fast sgemm; cast once.
         A32 = np.asarray(A, dtype=np.float32, order='C')
@@ -91,7 +96,6 @@ class Sumrhe:
         counts_blk  = np.empty((B, K),     dtype=np.float32)
 
         # Vectorized block boundaries
-        # (equal-sized except possibly the last in your current setup; filtering may unbalance counts but the slices are still valid)
         bs = self.tr.blk_size
         starts = bs * np.arange(B)
         ends   = starts + bs
@@ -112,22 +116,34 @@ class Sumrhe:
             ratio_minus = overlap_minus / counts_minus[:, None, :] # (B, K, K)
 
         # ----- Batched contraction to get all LOO h2 per category -----
-        # sigma_g (LOO) per block/category
         sigma_g_minus = self.sigmas[idx, :B, :K]                   # (B, K)
         # h2_cat_minus[b, c] = sum_k ratio_minus[b, c, k] * sigma_g_minus[b, k]
         h2_cat_minus  = np.einsum('bck,bk->bc', ratio_minus, sigma_g_minus, optimize=True)
-        h2_cat_minus[~np.isfinite(h2_cat_minus)] = 0.0
+
+        bad_minus = ~np.isfinite(h2_cat_minus)
+        if clip_nonfinite:
+            h2_cat_minus[bad_minus] = 0.0
+        # else: keep NaNs so jackknife can ignore those replicates
+
         self.herits[idx, :B, :K] = h2_cat_minus
 
         # ----- Point estimate (full) -----
         with np.errstate(divide='ignore', invalid='ignore'):
             ratio_full   = overlap_full / counts_full[None, :]      # (K, K)
             h2_cat_full  = ratio_full @ self.sigmas[idx, B, :K]     # (K, )
-            h2_cat_full[~np.isfinite(h2_cat_full)] = 0.0
+
+        bad_full = ~np.isfinite(h2_cat_full)
+        if clip_nonfinite:
+            h2_cat_full[bad_full] = 0.0
+        # If not clipping, we leave NaN in the full estimate; this is rare but
+        # will propagate as NaN in outputs, while jackknife SEs will still be
+        # computed from finite LOO replicates.
+
         self.herits[idx, B, :K] = h2_cat_full
 
         # Total h2 across categories is just the sum of sigma_g^2
         self.herits[idx, :, -1] = self.sigmas[idx, :, :K].sum(axis=1)
+
 
     
     def _calc_enrich(self, idx):
@@ -196,6 +212,8 @@ class Sumrhe:
         M_full, K = A.shape
         B = self.nblks
 
+        clip_nonfinite = bool(getattr(self, "clip_nonfinite_vals", False))
+
         # Per-column sums and sums of squares (full)
         Ak_full   = A.sum(axis=0)                         # ∑ a_{j,k}
         Ak2_full  = (A*A).sum(axis=0)                     # ∑ a_{j,k}^2
@@ -231,13 +249,16 @@ class Sumrhe:
         sigma_g_rep = self.sigmas[idx, :, :K]            # (B+1, K)
         h2_tot_rep  = self.herits[idx, :, -1]            # (B+1,)
 
-        # τ: safe divide (0 where Ak==0 or not finite)
+        # τ: safe divide
         with np.errstate(divide='ignore', invalid='ignore'):
             tau = sigma_g_rep / Ak_rep
-            tau[~np.isfinite(tau)] = 0.0
+
+        bad_tau = ~np.isfinite(tau)
+        if clip_nonfinite:
+            tau[bad_tau] = 0.0
+        # else: keep NaN so jackknife can ignore bad LOO replicates
 
         # sd(a_k) per replicate from sums and sums of squares (population-style sd)
-        # var = E[a^2] - (E[a])^2, with E[…] over replicate SNPs
         with np.errstate(divide='ignore', invalid='ignore'):
             meanA   = Ak_rep / M_rep[:, None]
             meanA2  = Ak2_rep / M_rep[:, None]
@@ -246,7 +267,11 @@ class Sumrhe:
 
             denom   = h2_tot_rep / M_rep                   # (B+1,)
             tau_star = tau * (sdA / denom[:, None])
-            tau_star[~np.isfinite(tau_star)] = 0.0
+
+        bad_tau_star = ~np.isfinite(tau_star)
+        if clip_nonfinite:
+            tau_star[bad_tau_star] = 0.0
+        # else: keep NaNs here as well
 
         self.tau[idx]      = tau
         self.tau_star[idx] = tau_star
@@ -254,28 +279,41 @@ class Sumrhe:
 
 
     def _run_jackknife(self, idx):
-        ''' run snp-level block jackknife '''
-        self.sigsums[idx, :, 0] = self.sigmas[idx, self.nblks]
-        self.sigsums[idx, :, 1] = utils._calc_jackknife_se(self.sigmas[idx])[1]
-        
-        self.hersums[idx, :, 0] = self.herits[idx, self.nblks]
-        self.hersums[idx, :, 1] = utils._calc_jackknife_se(self.herits[idx])[1]
-    
-        self.enrich_sums[idx, :, 0] = self.enrich[idx, self.nblks]
-        self.enrich_sums[idx, :, 1] = utils._calc_jackknife_se(self.enrich[idx])[1]
-        
-        if self.report_tau:
-            self.tau_sums[idx, :, 0]      = self.tau[idx, self.nblks]
-            self.tau_sums[idx, :, 1]      = utils._calc_jackknife_se(self.tau[idx])[1]
-            self.tau_star_sums[idx, :, 0] = self.tau_star[idx, self.nblks]
-            self.tau_star_sums[idx, :, 1] = utils._calc_jackknife_se(self.tau_star[idx])[1]
+        """Run SNP-level block jackknife for this phenotype."""
+        clip_nonfinite = bool(getattr(self, "clip_nonfinite_vals", False))
+        nan_policy = 'propagate' if clip_nonfinite else 'omit'
 
-        if (self.verbose):
-            self.log._log("Sigma solution & jackknife SE:\n"+np.array2string(self.sigsums, precision=5, separator=', '))
-            self.log._log("Heritability (category) & jackknife SE:\n"+np.array2string(self.hersums, precision=5, separator=', '))
-            self.log._log("Enrichment & jackknife SE:\n"+np.array2string(self.enrich_sums, precision=5, separator=', '))
+        # Sigma components
+        est_full, se_jk = utils._calc_jackknife_se(self.sigmas[idx], axis=0, center='full', nan_policy=nan_policy)
+        self.sigsums[idx, :, 0] = est_full
+        self.sigsums[idx, :, 1] = se_jk
+
+        # Heritabilities (per bin + total)
+        est_full_h2, se_jk_h2 = utils._calc_jackknife_se(self.herits[idx], axis=0, center='full', nan_policy=nan_policy)
+        self.hersums[idx, :, 0] = est_full_h2
+        self.hersums[idx, :, 1] = se_jk_h2
+
+        # Enrichment
+        est_full_enr, se_jk_enr = utils._calc_jackknife_se(self.enrich[idx], axis=0, center='full', nan_policy=nan_policy)
+        self.enrich_sums[idx, :, 0] = est_full_enr
+        self.enrich_sums[idx, :, 1] = se_jk_enr
+
+        # τ / τ* if requested
+        if self.report_tau:
+            est_full_tau, se_jk_tau = utils._calc_jackknife_se(self.tau[idx], axis=0, center='full', nan_policy=nan_policy)
+            self.tau_sums[idx, :, 0] = est_full_tau
+            self.tau_sums[idx, :, 1] = se_jk_tau
+
+            est_full_ts, se_jk_ts = utils._calc_jackknife_se(self.tau_star[idx], axis=0, center='full', nan_policy=nan_policy)
+            self.tau_star_sums[idx, :, 0] = est_full_ts
+            self.tau_star_sums[idx, :, 1] = se_jk_ts
+
+        if self.verbose:
+            self.log._log("Sigma solution & jackknife SE:\n"+ np.array2string(self.sigsums[idx], precision=5, separator=', '))
+            self.log._log("Heritability (category) & jackknife SE:\n"+ np.array2string(self.hersums[idx], precision=5, separator=', '))
+            self.log._log("Enrichment & jackknife SE:\n"+ np.array2string(self.enrich_sums[idx], precision=5, separator=', '))
             if self.report_tau:
-                self.log._log("Tau & Tau* (point, SE):\n" + np.array2string(np.stack([self.tau_sums[idx,:,0], self.tau_sums[idx,:,1]], axis=1), precision=5, separator=', '))
+                self.log._log("Tau & Tau* (point, SE):\n"+ np.array2string(np.stack([self.tau_sums[idx,:,0], self.tau_sums[idx,:,1]], axis=1), precision=5, separator=', '))
 
     def _run(self):
         for i in range(self.npheno):

@@ -69,6 +69,8 @@ parser.add_argument("--ddof", default=1, type=int, \
                     help="Specify the delta degrees of freedom (ddof) for estimating genome-wide LD scores. Default is 1 (empirical SD).")
 parser.add_argument("--allow-neg-enr", action="store_true", default=False,\
                     help='Allow negative enrichment estimates. Default is False.')
+parser.add_argument("--clip-nonfinite-vals", action="store_true", default=False,\
+                    help='Clip nonfinite estimates of h2 and tau to 0.0. Default is False.')
 
 parser.add_argument("--num-threads", default=4, type=int, \
                     help='Cap the number of threads for BLAS to limit CPU usage. Default is 4.')
@@ -235,7 +237,7 @@ if __name__ == '__main__':
                 sys.exit(1)
         sums = Sumrhe(bim_path=args.bim, sum_path=args.trace, save_path = args.save_trace, h2_path=args.h2,\
             chisq_threshold=args.max_chisq, log=log, out=args.out, verbose=args.verbose, ldscores=args.ldscores,\
-            njack=args.njack, annot=args.annot, allow_neg_enr=args.allow_neg_enr)
+            njack=args.njack, annot=args.annot, allow_neg_enr=args.allow_neg_enr, clip_nonfinite_vals=args.clip_nonfinite_vals)
         sums._run()
         sums._logoff()
     elif (args.rg is not None):
