@@ -51,7 +51,6 @@ def apply_env(cfg: dict) -> int:
     Apply low-level environment knobs from a plain dict and enforce BLAS/OMP threads.
 
     Recognized keys (all optional):
-      - num_threads: int               # single knob used for BOTH OMP and BLAS
       - ctile: int                     # direct CTILE override (cols)
       - ctile_mb: int                  # CTILE memory budget (MiB)
       - ctile_l3pct: float             # 0.0–1.0 fraction of per-socket L3 cache
@@ -126,25 +125,18 @@ def apply_env(cfg: dict) -> int:
         mode = cfg.get("numa_mode"),
         nodes = str(cfg.get("numa_nodes", "all"))
     )
-
-    # -------- 1) Threads (single knob for both OMP & BLAS) --------
-    n_threads = cfg.get("num_threads")
-    if n_threads is None or int(n_threads) <= 0:
-        n_threads = _cpu_count_affinity()
-    n_threads = max(1, int(n_threads))
-
+    n_threads = _cpu_count_affinity()
     # OpenMP (phase 1) & BLAS (phase 2) will be re-tuned around calls,
     # but we set sane process-wide defaults here:
     os.environ["OMP_NUM_THREADS"] = str(n_threads)
     os.environ["OMP_DYNAMIC"] = "FALSE"
 
     # BLAS vendors
-    os.environ["OPENBLAS_NUM_THREADS"] = "1"
+    for var in ("OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS",
+                "BLIS_NUM_THREADS", "VECLIB_MAXIMUM_THREADS"):
+        os.environ[var] = str(n_threads)
     os.environ["OPENBLAS_DYNAMIC"] = "0"
-    os.environ["MKL_NUM_THREADS"] = "1"
     os.environ["MKL_DYNAMIC"] = "FALSE"
-    os.environ["BLIS_NUM_THREADS"] = "1"
-    os.environ["VECLIB_MAXIMUM_THREADS"] = "1"
     
     os.environ["OMP_PROC_BIND"] = "true"
     os.environ["MKL_ENABLE_INSTRUCTIONS"] = "AVX512"
@@ -171,13 +163,6 @@ def apply_env(cfg: dict) -> int:
                 continue
     except Exception:
         pass
-    # threadpoolctl as a final clamp
-    tpctx = None
-    try:
-        from threadpoolctl import threadpool_limits  # type: ignore
-        tpctx = threadpool_limits(limits=n_threads, user_api="blas")
-    except Exception:
-        tpctx = None
         
     actual = _detect_blas_threads()
     os.environ["SUMMIT_BLAS_THREADS"] = str(actual)
@@ -211,7 +196,7 @@ def apply_env(cfg: dict) -> int:
         os.environ["MALLOC_MMAP_THRESHOLD_"] = str(int(cfg["malloc_mmap_threshold"]))
     
     # Helpful affinity / runtime hints
-    os.environ.setdefault("OMP_PROC_BIND", str(cfg.get("omp_proc_bind", "close")))   # or "spread"
+    os.environ.setdefault("OMP_PROC_BIND", str(cfg.get("omp_proc_bind", "spread")))   # or "close"
     os.environ.setdefault("OMP_PLACES",    str(cfg.get("omp_places", "cores")))     # "cores" is a good default
     os.environ.setdefault("KMP_BLOCKTIME", str(cfg.get("kmp_blocktime", 0)))        # reduce oversubscription
     #os.environ.setdefault("KMP_AFFINITY",  str(cfg.get("kmp_affinity", "granularity=fine,compact,1,0")))
@@ -222,20 +207,30 @@ def set_parallelism(omp_threads: int | None = None, blas_threads: int | None = N
     if omp_threads is not None:
         os.environ["OMP_NUM_THREADS"] = str(max(1, int(omp_threads)))
         os.environ["OMP_DYNAMIC"] = "FALSE"
-        os.environ["OMP_MAX_ACTIVE_LEVELS"] = "1"
 
-    if blas_threads is None or threadpool_limits is None:
-        if blas_threads is not None:
-            b = max(1, int(blas_threads))
-            os.environ["OPENBLAS_NUM_THREADS"] = str(b)
-            os.environ["OPENBLAS_DYNAMIC"] = "0"
-            os.environ["MKL_NUM_THREADS"] = str(b)
-            os.environ["MKL_DYNAMIC"] = "FALSE"
-            os.environ["BLIS_NUM_THREADS"] = str(b)
-            os.environ["VECLIB_MAXIMUM_THREADS"] = str(b)
-        return nullcontext()
+    b = None
+    if blas_threads is not None:
+        b = max(1, int(blas_threads))
+        # env knobs for BLAS
+        os.environ["OPENBLAS_NUM_THREADS"] = str(b)
+        os.environ["OPENBLAS_DYNAMIC"] = "0"
+        os.environ["MKL_NUM_THREADS"] = str(b)
+        os.environ["MKL_DYNAMIC"] = "FALSE"
+        os.environ["BLIS_NUM_THREADS"] = str(b)
+        os.environ["VECLIB_MAXIMUM_THREADS"] = str(b)
+        # optional: vendor API again
+        try:
+            import mkl
+            mkl.set_num_threads(b)
+        except Exception:
+            pass
+
+    # If threadpoolctl is available, use it as a context
+    if b is not None and threadpool_limits is not None:
+        return threadpool_limits(limits=b, user_api="blas")
     else:
-        return threadpool_limits(limits=int(blas_threads), user_api="blas")
+        return nullcontext()
+
 
 
 def _round_up_to(x, gran):
@@ -471,7 +466,7 @@ class GenomewideLDScore:
                 seed=None,
                 verbose=False,
                 dtype='float32',
-                num_threads: int = 4,
+                num_threads: int | None = None,
                 eps_var: float = 1e-10,
                 rand_samp=None, # float in (0,1] or int in [100, N]
                 ddof = 1,
@@ -479,11 +474,7 @@ class GenomewideLDScore:
                 device='cpu',
                 use_tp32 = False):
         
-        self.tune = apply_env(low_level)
-        
-        # Cap BLAS threads before any Pools spawn
-        self.num_threads = int(num_threads)
-
+        # ----------- input path ------------ #
         self.eps_var = float(eps_var)
         prefix = _canonical_bfile_prefix(bed_path)
         self.bed_prefix = os.path.abspath(prefix)     # optional: make absolute for stability
@@ -502,6 +493,24 @@ class GenomewideLDScore:
         rng = np.random.default_rng(self.root_seed)
         self.ddof = ddof
         self.target_xz_mem = target_xz_mem
+        
+        # If num_threads was explicitly passed, it overrides low_level['num_threads'].
+        explicit_threads = num_threads is not None and int(num_threads) > 0
+        if explicit_threads:
+            low_level["num_threads"] = int(num_threads)
+        
+        actual_blas_threads = apply_env(low_level)
+        
+        if explicit_threads:
+            self.num_threads = int(num_threads)
+        else:
+            self.num_threads = max(1, int(actual_blas_threads))
+        
+        try:
+            gwldcore.set_num_threads(self.num_threads)
+            self.log._log(f"[gwldcore] OpenMP threads set to {self.num_threads}")
+        except Exception as e:
+            self.log._log(f"[gwldcore] set_num_threads failed (non-fatal): {e}")
         
         # ---------- device / precision policy ----------
         self.device_raw = device
@@ -666,36 +675,20 @@ class GenomewideLDScore:
             max_by_mem = nominal
         n_workers = max(1, min(nominal, max_by_mem, os.cpu_count() or 1))
         # Be extra safe: don't spin more workers than chunks
-        n_workers = min(n_workers, len(chunks))
+        n_workers = min(min(n_workers, len(chunks)), 16)
+        
 
         self.log._log(f"[resvar] Using {n_workers} workers "
                     f"(~{_bytes_human(est_per_chunk)} per task; avail={_bytes_human(avail)})")
 
-        # Limit BLAS threads inside the pool to 1 to avoid oversubscription
-        # (NumPy/MKL/OpenBLAS will otherwise multi-thread inside each worker)
-        limiter = None
-        try:
-            from threadpoolctl import threadpool_limits  # type: ignore
-            limiter = threadpool_limits(limits=1)
-        except Exception:
-            limiter = None  # OK if unavailable
-
         # Execute in parallel
         try:
-            if limiter is None:
-                @contextmanager
-                def _nullctx():
-                    yield
-                ctx = _nullctx()
-            else:
-                ctx = limiter
-
-            with ctx:
+            with set_parallelism(omp_threads=1, blas_threads=1):
                 with ThreadPoolExecutor(max_workers=n_workers) as ex:
                     futures = [
                         ex.submit(
                             _resvar_worker_thread,
-                            span,            # (s, e)
+                            span,
                             bed_prefix,
                             row_sel,
                             dtype,
@@ -707,7 +700,6 @@ class GenomewideLDScore:
                         for span in chunks
                     ]
 
-                    # Fill results as workers complete
                     for fut in as_completed(futures):
                         s, e, inv_part = fut.result()
                         inv[s:e] = inv_part
@@ -735,6 +727,213 @@ class GenomewideLDScore:
                 inv[s:e] = (1.0 / np.sqrt(np.maximum(var, self.eps_var))).astype(dtype, copy=False)
 
         return inv
+    
+    def _estimate_mu22_bins(self, blocks):
+        """
+        Estimate bin-by-bin averaged 4th moments μ̄_{22,ab} in a streaming way.
+
+        For each individual n and bin b, we accumulate
+            S_{n,b} = sum_j annot[j,b] * X_{nj}^2,
+        where X is the *same* standardized/residualized/scaled genotype used
+        for LD correlations:
+
+            1) read geno block from .bed using row_sel
+            2) standardize by column (mean 0, var 1 with ddof=self.ddof)
+            3) project out covariates (if any): Y = (I - C R) * geno
+            4) rescale by inv_sqrt_resvar_all to get unit-var residuals: X = Y * inv_right
+
+        Then:
+            μ̄_{22,ab}
+            = (1 / (N * M_a * M_b)) * sum_n S_{n,a} * S_{n,b},
+
+        where M_a = nsnps_bin[a] is the total annotation mass for bin a
+        (for binary, non-overlapping annotation this is #SNPs in that bin).
+        """
+        N = int(self.nsamp)
+        B = int(self.nbins)
+        if N <= 0 or B <= 0:
+            raise RuntimeError("Invalid N or nbins for μ22 estimation.")
+
+        row_sel = self.row_sel if self.row_sel is not None else slice(None)
+
+        # S_mat[n, b] = sum_j a_{j,b} * X_{nj}^2
+        S_mat = np.zeros((N, B), dtype=np.float64)
+
+        self.log._log("[mu22] Estimating bin-by-bin 4th moments μ̄_{22,ab} via streaming over genotype.")
+        for (s, e) in tqdm(blocks, desc="mu22 blocks", unit="blk", smoothing=0.2, miniters=1):
+            L = e - s
+            if L <= 0:
+                continue
+
+            # 1) read genotype block: (N × L)
+            Gblk = self.G.read(index=np.s_[row_sel, s:e], dtype=self.dtype)
+            # 2) standardize within block
+            means = np.nanmean(Gblk, axis=0, dtype=self.dtype)
+            stds  = np.nanstd( Gblk, axis=0, dtype=self.dtype, ddof=int(self.ddof))
+            stds[stds == 0] = 1.0
+            np.subtract(Gblk, means, out=Gblk)
+            np.divide(  Gblk, stds,  out=Gblk)
+            np.nan_to_num(Gblk, copy=False)
+
+            # 3) project out covariates if present
+            if self.C is not None and self.cov_R is not None:
+                # self.C: (N × p), self.cov_R: (p × N)
+                tmp = self.cov_R @ Gblk         # (p × L)
+                Y   = Gblk - (self.C @ tmp)     # (N × L)
+                del tmp
+            else:
+                Y = Gblk
+
+            # 4) rescale by inv sqrt residual variance (per SNP column)
+            inv_slice = self.inv_sqrt_resvar_all[s:e].astype(self.dtype, copy=False)  # (L,)
+            # broadcast along rows
+            Y *= inv_slice
+
+            # X^2 in float64 for stability
+            X2 = np.asarray(Y, dtype=np.float64)**2    # (N × L)
+
+            # local annotation block (L × B), cast to float64 to match X2
+            ann_blk = np.asarray(self.annot[s:e], dtype=np.float64)  # (L × B)
+
+            # update S_mat: (N × B) += (N × L) @ (L × B)
+            # => S_mat[n,b] accumulates sum_j a_{j,b} X_{nj}^2 across blocks
+            S_mat += X2 @ ann_blk
+
+            # free temporaries
+            del Gblk, Y, X2, ann_blk
+            try:
+                ctypes.CDLL("libc.so.6").malloc_trim(0)
+            except Exception:
+                pass
+
+        # Now S_mat is full; compute S_sum[a,b] = sum_n S_{n,a} S_{n,b}
+        S_sum = S_mat.T @ S_mat          # (B × B), float64
+
+        # M_a = total annotation weight per bin (for binary, = #SNPs in bin a)
+        M = np.asarray(self.nsnps_bin, dtype=np.float64)  # (B,)
+
+        # avoid division by zero for empty bins
+        M_outer = M[:, None] * M[None, :]  # (B × B)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            mu22 = S_sum / (float(N) * M_outer)
+            mu22[~np.isfinite(mu22)] = 0.0  # any 0/0 or inf → 0
+
+        self.log._log("[mu22] Finished μ̄_{22,ab} estimation.")
+        return mu22
+
+    def _compute_block_corrections(self, meansq_raw, mu22, bin_idx):
+        """
+        Given:
+          - meansq_raw[j, b] ≈ sum_{k in bin b} r_{jk}^2   (pre-baseline LD scores),
+          - mu22[a, b]  ≈ μ̄_{22,ab} = (1 / (N M_a M_b)) sum_n S_{n,a} S_{n,b},
+
+        and letting:
+          - N       = self.nsamp  (actual #rows after any filtering),
+          - d       = correlation denominator used in XtXz (approx):
+                        d = N - ddof  (no covariates),
+                        d = N_eff    (with covariates),
+          - M_a     = size of bin a (from bin_idx, assuming binary non-overlapping),
+          - S_ab    = sum_{j in bin a} meansq_raw[j, b]
+                    = sum_{j in a, k in b} r_{jk}^2,
+
+        we use the exact finite-sample identity:
+
+            E[r_{jk}^2] = (1/d^2) * (N * μ_{22,jk} + N(N-1) * ρ_{jk}^2),
+
+        to derive block-averaged quantities for each bin pair (a,b):
+
+            R2_ab   = (1 / (M_a M_b)) sum_{j in a, k in b} r_{jk}^2
+                    = S_ab / (M_a M_b),
+
+            ρ2_ab   = average population LD^2:
+                      = (d^2 * R2_ab - N * μ̄_{22,ab}) / (N (N-1)),
+
+        and total finite-sample bias:
+
+            B_ab    = sum_{j in a, k in b} (r_{jk}^2 - ρ_{jk}^2)
+                    = S_ab - M_a M_b * ρ2_ab.
+
+        We also define the block-level δ:
+
+            δ̄_{ab} = μ̄_{22,ab} - (1 + 2 ρ2_ab),
+
+        and store:
+            self.r2_block, self.rho2_block, self.bias_block, self.mu22_block, self.delta_block
+        """
+        B = int(self.nbins)
+        N = float(self.nsamp)
+
+        if self.C is not None:
+            d = float(self.N_eff)
+        else:
+            d = float(self.nsamp - self.ddof)
+
+        mu22_block = np.asarray(mu22, dtype=np.float64)
+        # M_a: #SNPs in each bin (assuming binary annotation)
+        M_a = np.array([len(idx) for idx in bin_idx], dtype=np.float64)
+
+        R2_block   = np.zeros((B, B), dtype=np.float64)
+        rho2_block = np.zeros((B, B), dtype=np.float64)
+        bias_block = np.zeros((B, B), dtype=np.float64)
+
+        for a in range(B):
+            Ma = M_a[a]
+            if Ma <= 0:
+                continue
+            idx_a = bin_idx[a]
+            for b in range(B):
+                Mb = M_a[b]
+                if Mb <= 0:
+                    continue
+
+                # S_ab = sum_{j in bin a, k in bin b} r_{jk}^2
+                # approximated as sum_{j in bin a} meansq_raw[j, b]
+                S_ab = float(np.sum(meansq_raw[idx_a, b], dtype=np.float64))
+                if S_ab == 0.0:
+                    continue
+
+                R2_ab = S_ab / (Ma * Mb)
+                mu_ab = float(mu22_block[a, b])
+
+                # ρ2_ab per bin-pair (exact in expectation for given N, d)
+                # E[r^2] = (1/d^2)(N μ22 + N(N-1) ρ^2)  ⇒
+                # ρ^2 = (d^2 R2_ab - N μ̄22_ab) / (N(N-1))
+                rho2_ab = (d**2 * R2_ab - N * mu_ab) / (N * (N - 1.0))
+
+                R2_block[a, b]   = R2_ab
+                rho2_block[a, b] = rho2_ab
+
+                sum_rho2 = Ma * Mb * rho2_ab
+                bias_block[a, b] = S_ab - sum_rho2
+
+        # Store core block-level objects
+        self.r2_block   = R2_block
+        self.rho2_block = rho2_block
+        self.bias_block = bias_block
+        self.mu22_block = mu22_block
+
+        # ---- Compute and log δ̄_{ab} = μ̄_{22,ab} - (1 + 2 ρ2_ab) ----
+        delta_block = mu22_block - (1.0 + 2.0 * rho2_block)
+        self.delta_block = delta_block
+
+        self.log._log("[fs-corr] Estimated block-level R2, ρ2, bias, μ22 and δ (μ̄22 - (1 + 2ρ²)).")
+
+        try:
+            import pandas as pd
+            df_delta = pd.DataFrame(
+                delta_block,
+                index=self.l2cols,
+                columns=self.l2cols,
+            )
+            with pd.option_context('display.width', 140,
+                                   'display.max_columns', None,
+                                   'display.float_format', '{:.6e}'.format):
+                self.log._log("[fs-corr] Block-level δ matrix (rows/cols = annotation bins):")
+                self.log._log("\n" + df_delta.to_string())
+        except Exception as e:
+            # Fallback: plain numpy print
+            self.log._log(f"[fs-corr] Failed to pretty-print δ matrix via pandas ({e}); using numpy.")
+            self.log._log(repr(delta_block))
 
 
     # ------------------ I/O helpers ------------------
@@ -875,10 +1074,14 @@ class GenomewideLDScore:
             self.log._log(f"Covariate-adjusted partial correlations (N_eff={self.N_eff}, p={self.p_eff}).")
         else:
             self.log._log("No covariates: standard LD scores (squared correlations).")
+        
+        H = self.num_threads   # after affinity-aware pick
+        t_blas1 = min(4, max(1, H // 4))  # e.g. 2–4
+        t_omp1 = max(1, H // t_blas1)
 
         # -------------------- Phase 0: per-SNP residual variances --------------------
-        set_parallelism(omp_threads=self.num_threads, blas_threads=1)
-        self.inv_sqrt_resvar_all = self._precompute_residual_variances()
+        with set_parallelism(omp_threads=min(self.num_threads, 16), blas_threads=t_blas1):
+            self.inv_sqrt_resvar_all = self._precompute_residual_variances()
 
         # -------------------- Build SNP blocks --------------------
         blocks = []
@@ -975,7 +1178,7 @@ class GenomewideLDScore:
                 # ---------------------- Phase 1 (chunked) ----------------------
                 # OMP = many; BLAS = 1
                 t1_total = 0.0
-                with set_parallelism(omp_threads=self.num_threads, blas_threads=1):
+                with set_parallelism(omp_threads=t_omp1, blas_threads=t_blas1):
                     for blk_idx, (s, e) in enumerate(blocks):
                         kmax_hint = int(kmax_per_block[blk_idx])
 
@@ -1130,14 +1333,51 @@ class GenomewideLDScore:
                 pass
 
         # ---------------------- Finalize & save ----------------------
+        # meansq = (meansq_accum / float(self.nvecs)).astype(self.dtype, copy=False)
+
+        # # Baseline subtraction: classic correlation null M_k / N_denom (ddof-aware)
+        # N_denom = float(self.N_eff - 1.0 if self.C is not None else self.nsamp - self.ddof)
+        # self.log._log("Applying correlation null: subtracting M_k / N_denom per bin.")
+        # meansq -= (self.nsnps_bin / N_denom).astype(meansq.dtype, copy=False)[None, :]
+
+        # self.gwldscore = meansq.astype(np.float64, copy=False)
+        
+        # ---------------------- Finalize ----------------------
         meansq = (meansq_accum / float(self.nvecs)).astype(self.dtype, copy=False)
 
-        # Baseline subtraction: classic correlation null M_k / N_denom (ddof-aware)
+        # Keep a copy of the *raw* sample-based LDscore panel before any baseline
+        # subtraction: meansq_raw[j, b] ≈ sum_{k in bin b} r_{jk}^2.
+        meansq_raw = np.asarray(meansq, dtype=np.float64, order="C")
+
+        # -------- Optional: 4th-moment-based finite-sample correction (block level) --------
+        try:
+            # Estimate μ̄_{22,ab} from the raw genotypes (streaming).
+            mu22 = self._estimate_mu22_bins(blocks)
+
+            # For binary, non-overlapping annotations we can form explicit bin indices
+            # and compute block-level corrections (R2, ρ2, bias).
+            if not getattr(self, "is_continuous", False):
+                snpidx = np.arange(self.nsnps, dtype=int)
+                bin_idx = self._partition_index(snpidx, self.annot)
+                self._compute_block_corrections(meansq_raw, mu22, bin_idx)
+            else:
+                self.mu22_block = mu22
+                self.log._log("[fs-corr] Continuous / overlapping annotations detected; "
+                              "stored μ22_block but skipped block-level bias correction.")
+        except Exception as e:
+            self.log._log(f"[fs-corr] Failed to compute 4th-moment-based corrections: {e}")
+
+        # -------- Classic LDSC-style baseline subtraction (unchanged for now) --------
+        # You can later replace/augment this using self.bias_block if you want the
+        # LDscore output itself to be population-LD calibrated. For now we keep the
+        # original behavior so downstream code remains unchanged, while exposing the
+        # extra correction info via class attributes.
         N_denom = float(self.N_eff - 1.0 if self.C is not None else self.nsamp - self.ddof)
         self.log._log("Applying correlation null: subtracting M_k / N_denom per bin.")
         meansq -= (self.nsnps_bin / N_denom).astype(meansq.dtype, copy=False)[None, :]
 
         self.gwldscore = meansq.astype(np.float64, copy=False)
+
 
         self.log._log(f"Saving the genome-wide (partitioned) LD scores into: {self.outpath}.gw.ldscore.gz")
         snpcols = ['CHR','SNP','BP']
@@ -1150,6 +1390,23 @@ class GenomewideLDScore:
         scores_df = pd.DataFrame(self.gwldscore, columns=self.l2cols)
         out_df = pd.concat([self.snpdf, scores_df], axis=1)
         out_df.to_csv(f'{self.outpath}.gw.ldscore.gz', index=False, compression='gzip', sep='\t', float_format='%.6f')
+        
+        # -------- Save block-level δ̄_{ab} to <outpath>.gw.delta --------
+        try:
+            if hasattr(self, "delta_block"):
+                delta_df = pd.DataFrame(
+                    self.delta_block,
+                    index=self.l2cols,
+                    columns=self.l2cols,
+                )
+                delta_out = f"{self.outpath}.gw.delta"
+                delta_df.to_csv(delta_out, sep='\t', float_format='%.8e')
+                self.log._log(f"[fs-corr] Saved block-level δ matrix to: {delta_out}")
+            else:
+                self.log._log("[fs-corr] delta_block not available; skipping .gw.delta write.")
+        except Exception as e:
+            self.log._log(f"[fs-corr] Failed to save δ matrix (.gw.delta): {e}")
+
 
 
         # Summaries (best-effort)

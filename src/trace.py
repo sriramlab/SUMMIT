@@ -15,7 +15,7 @@ import sys
 
 class Trace:
     def __init__(self, bimpath=None, sumpath=None, savepath=None, log=None,
-                 ldscores=None, nblks=100, annot=None, verbose=False):
+                 ldscores=None, nblks=100, annot=None, verbose=False, adjust_delta: bool=False):
         self.log = log
         self.sumpath = sumpath
         self.savepath = savepath
@@ -29,10 +29,11 @@ class Trace:
         self.nsamp = []                # number of samples used for trace summaries (can vary)
         self.nsnps = 0                 # total SNPs
         self.nsnps_blk = None          # (B+1, K): LOO bin counts
-        self.nsnps_bin = None          # (K,)
+        self.nsnps_bin = None          # (K,)   : full bin counts (from annot)
         self.verbose = verbose
         self.nbins = None
         self.effective_K = None
+        self.adjust_delta = adjust_delta
 
         # Optional: read BIM for SNP names
         if (bimpath is None) or (bimpath == ""):
@@ -55,6 +56,25 @@ class Trace:
 
         # Read annotations (thin or full .annot)
         self._read_annot(annot)
+        
+        # Base SNP universe (for fast filtering); annot_df is kept as base by design
+        self._base_snps = self.annot_df['SNP'].astype(str).to_numpy()
+        self.snp_index = pd.Index(self._base_snps)  # exposed for other modules too
+
+        # Base arrays (no copy; these are the "unfiltered" aligned arrays)
+        self._annot_base = np.asarray(self.annot)
+        if self.ldscores is not None:
+            self._ldscores_base = np.asarray(self.ldscores)
+        else:
+            self._ldscores_base = None
+        if self._ldscores_base is not None:
+            if not hasattr(self, "chr") or not hasattr(self, "bp"):
+                raise RuntimeError("Trace: expected chr/bp to be available when using LD-scores.")
+            self._chr_base = np.asarray(self.chr)
+            self._bp_base  = np.asarray(self.bp)
+        else:
+            self._chr_base = None
+            self._bp_base  = None
 
         # Precompute block starts/ends if we already know nsnps/nblks
         if (self.nsnps > 0) and (self.nblks > 0) and not hasattr(self, "blk_size"):
@@ -69,12 +89,19 @@ class Trace:
             return
         B = self.nblks
         self.blk_size = max(getattr(self, "blk_size", self.nsnps // B), 1)
+
         starts = self.blk_size * np.arange(B, dtype=np.int64)
         ends = starts + self.blk_size
         if B > 0:
             ends[-1] = self.nsnps  # last block reaches the end
         self._blk_starts = starts
         self._blk_ends = ends
+
+        blk_idx = (np.arange(self.nsnps, dtype=np.int64) // self.blk_size)
+        blk_idx[blk_idx >= B] = B - 1
+        self.blk_idx = blk_idx
+
+
 
     def _read_annot(self, annot_path):
         # single-bin fallback
@@ -87,6 +114,8 @@ class Trace:
             self.annot_df = annot_df
             self.annot = self.annot_df[self.annot_header].values
             self.nbins = 1
+            # full-bin counts from annotation
+            self.nsnps_bin = self.annot.sum(axis=0, dtype=np.float64)
             self.log._log("Running with single component annotation...")
             return
 
@@ -133,12 +162,26 @@ class Trace:
             self.nbins = len(annot_cols)
             self.log._log("Read full annotation of shape " + str(self.annot.shape))
 
-            # prune LD-scores if present (unchanged)
+            # full-bin counts from annotation
+            self.nsnps_bin = self.annot.sum(axis=0, dtype=np.float64)
+
+            # prune LD-scores if present (fixed start index)
             if getattr(self, 'ldscores', None) is not None:
                 ld_df = (self.ldscores_df.set_index('SNP').loc[self.snplist].reset_index())
                 self.ldscores_df = ld_df
-                self.ldscores = ld_df.iloc[:, 3:].to_numpy()
+
+                start_idx = getattr(self, "_ldscore_start_idx", None)
+                if start_idx is None:
+                    ldcols = self.ldscores_df.columns.tolist()
+                    first4 = ldcols[:4]
+                    start_idx = 4 if ('CM' in first4) else 3
+                    self._ldscore_start_idx = start_idx
+
+                self.ldscores = ld_df.iloc[:, start_idx:].to_numpy()
+                self.chr = self.ldscores_df["CHR"].to_numpy(dtype=np.int32, copy=False)
+                self.bp = self.ldscores_df["BP"].to_numpy(dtype=np.int64, copy=False)
                 self.log._log(f"Pruned LD-score to {self.nsnps} SNPs that match the annotation file.")
+
 
         except ValueError:
             # thin annotation (unchanged)
@@ -158,6 +201,9 @@ class Trace:
             self.nsnps = self.annot.shape[0]
             self.nbins = self.annot.shape[1]
             self.log._log("Read thin annotation matrix of shape " + str(self.annot.shape))
+
+            # full-bin counts from annotation
+            self.nsnps_bin = self.annot.sum(axis=0, dtype=np.float64)
 
         if (self.nbins is None) or (self.nsnps is None):
             self.log._log("!!! number of components or SNP count unresolved !!!")
@@ -246,54 +292,88 @@ class Trace:
 
     def _read_ldscores(self):
         """
-        Read the LD-score matrix instead of trace summaries. Works with either the (truncated) LDSC LD scores (.l2.ldscore.gz) or
-        the genome-wide LD scores (.gw.ldscore.gz)
+        Read the LD-score matrix instead of trace summaries.
+        Supports either CHR,BP,SNP,(optional CM), then LD-score columns.
         """
         self.ldscores_df = pd.read_csv(self.ldscorespath, compression='gzip', sep=r'\s+', index_col=False)
+
         ldcols = self.ldscores_df.columns.tolist()
         first4 = ldcols[:4]
         must = {'CHR', 'BP', 'SNP'}
         if not must.issubset(set(first4)):
-            raise ValueError("!!! Input LD score file is not in correct format: "
-                             "first columns must include CHR,BP,SNP (and optional CM) !!!")
+            raise ValueError(
+                "!!! Input LD score file is not in correct format: "
+                "first columns must include CHR,BP,SNP (and optional CM) !!!"
+            )
+
         start_idx = 4 if ('CM' in first4) else 3
-        self.ldscores = self.ldscores_df.iloc[:, start_idx:].to_numpy()
-        self.snplist = self.ldscores_df['SNP'].to_numpy().tolist()
+        self._ldscore_start_idx = start_idx
+
+        snps = self.ldscores_df['SNP'].astype(str).to_numpy()
+        L = self.ldscores_df.iloc[:, start_idx:].to_numpy(dtype=np.float64, copy=False)
+
+        # Drop non-finite LD-score rows
+        finite_row = np.isfinite(L).all(axis=1)
+        keep = finite_row
+        n_drop = int((~keep).sum())
+        if n_drop > 0:
+            self.log._log(
+                f"Dropping {n_drop} SNPs from LD-scores due to non-finite LD values "
+                f"or non-positive total LD score."
+            )
+            self.ldscores_df = self.ldscores_df.loc[keep].reset_index(drop=True)
+            snps = snps[keep]
+            L = L[keep, :]
+
+        self.ldscores = L
+        self.snplist = snps.tolist()
         self.nsnps = self.ldscores.shape[0]
         self.nbins = self.ldscores.shape[1]
-        self.log._log("Loaded the LD score matrix with " + str(self.nsnps) + " SNPs and " + str(self.nbins) + " bins")
+        self.chr = self.ldscores_df["CHR"].to_numpy(dtype=np.int32, copy=False)
+        self.bp = self.ldscores_df["BP"].to_numpy(dtype=np.int64, copy=False)
+
+        self.log._log(
+            f"Loaded the LD score matrix with {self.nsnps} SNPs and {self.nbins} bins "
+            f"(dropped={n_drop})."
+        )
 
     # ---------------------------- public API ---------------------------- #
 
     def _calc_trace(self, nsample: float):
-        self.log._log("Calculating trace...")
+        if self.verbose:
+            self.log._log("Calculating trace...")
         if (self.ldscores is not None):
             return self._calc_trace_from_ldscores(nsample)
         else:
             return self._calc_trace_from_sums(nsample)
+
 
     # ---------------------------- vectorized core ---------------------------- #
 
     def _calc_trace_from_sums(self, N: float):
         """
         Vectorized trace when pre-aggregated trace summaries are provided.
-        Replaces triple loops with a batched conversion.
         """
         K = self.nbins
         B = self.nblks
-        sums = np.asarray(self.sums, dtype=np.float64)                     # (B+1, K, K)
+        sums = np.asarray(self.sums, dtype=np.float64)  # (B+1, K, K)
         if self.nsnps_blk is None:
             raise RuntimeError("nsnps_blk must be available when using trace summaries.")
-        M_k = self.nsnps_blk.astype(np.float64)[:, :, None]                # (B+1, K, 1)
-        M_l = self.nsnps_blk.astype(np.float64)[:, None, :]                # (B+1, 1, K)
+        M_k = self.nsnps_blk.astype(np.float64)[:, :, None]  # (B+1, K, 1)
+        M_l = self.nsnps_blk.astype(np.float64)[:, None, :]  # (B+1, 1, K)
 
-        # Convert (LD sums) -> trace blocks (KxK), batched over jackknife rows
-        trace_KK = utils._calc_trace_from_ld_batch(sums, N, M_k, M_l)      # (B+1, K, K)
+        trace_KK = utils._calc_trace_from_ld_batch(sums, N, M_k, M_l)  # (B+1, K, K)
+        trace_KK = utils.symmetrize_trace_with_jackknife(trace_KK, logger=self.log, verbose=self.verbose)
 
-        # Assemble (K+1)x(K+1): fill noise row/col with N
         out = np.full((B + 1, K + 1, K + 1), float(N), dtype=np.float64)
         out[:, :K, :K] = trace_KK
+
+        # IMPORTANT: match RHS convention (nsamp - 1) for the noise term
+        out[:, K, K] = float(N - 1)
+
         return out
+
+
 
     def _calc_trace_from_ldscores(self, N: float):
         """
@@ -331,7 +411,6 @@ class Trace:
 
         # LOO bin counts for each (j, k) and (j, l)
         if self.nsnps_blk is None:
-            # build default counts from annotation if not present (rare when using LD-scores path)
             counts_full = A.sum(axis=0, dtype=np.float64)                        # (K,)
             counts_blk = np.empty((B, K), dtype=np.float64)
             for j in range(B):
@@ -347,107 +426,146 @@ class Trace:
         M_l = nsnps_blk[:, None, :]    # (B+1, 1, K)
 
         # Convert (LD sums) -> trace blocks (KxK), batched over jackknife rows
-        trace_KK = utils._calc_trace_from_ld_batch(ld_sum_all, N, M_k, M_l)
+        trace_KK = utils._calc_trace_from_ld_batch(ld_sum_all, N, M_k, M_l)  # (B+1, K, K)
+        var1, var2, cov12, w_opt = utils.estimate_offdiag_variances_from_jackknife(trace_KK)
+
+        # Symmetrize off-diagonals using jackknife-based optimal weights
+        trace_KK = utils.symmetrize_trace_with_jackknife(trace_KK, logger=self.log)
 
         # Assemble (K+1)x(K+1): fill noise row/col with N
         out = np.full((B + 1, K + 1, K + 1), float(N), dtype=np.float64)
         out[:, :K, :K] = trace_KK
-        out[:, K, K] = float(N-1)
+        out[:, K, K] = float(N - 1)
         return out
 
-    # ------------------------- (optional) rg path ------------------------- #
-
-    def _calc_trace_rg(self, nsample1: float, nsample2: float, noverlap: float | None):
-        """
-        Vectorized trace for genetic correlation. Uses LD-scores path.
-        If noverlap is not None, adds it to each (k,l) entry (constrained path),
-        and expands the matrix to (K+1)x(K+1) with the last row/col set to noverlap.
-        """
-        if self.ldscores is None:
-            raise NotImplementedError("rg path currently expects LD-scores input.")
-
-        if not hasattr(self, "_blk_starts"):
-            self._refresh_block_bounds()
-
-        A = np.asarray(self.annot, dtype=np.float32, order='C')     # (M, K)
-        L = np.asarray(self.ldscores, dtype=np.float32, order='C')  # (M, K)
-        K = self.nbins
-        B = self.nblks
-
-        # Full and per-block LD sums
-        full_ld = A.T @ L
-        blk_ld = np.empty((B, K, K), dtype=np.float32)
-        for j in range(B):
-            sl = slice(self._blk_starts[j], self._blk_ends[j])
-            Aj = A[sl, :]
-            Lj = L[sl, :]
-            blk_ld[j] = Aj.T @ Lj
-
-        ld_sum_all = np.empty((B + 1, K, K), dtype=np.float64)
-        ld_sum_all[:B] = (full_ld[None, :, :] - blk_ld)
-        ld_sum_all[B] = full_ld
-
-        # LOO bin-counts
-        counts_full = A.sum(axis=0, dtype=np.float64)
-        counts_blk = np.empty((B, K), dtype=np.float64)
-        for j in range(B):
-            sl = slice(self._blk_starts[j], self._blk_ends[j])
-            counts_blk[j] = A[sl, :].sum(axis=0, dtype=np.float64)
-
-        nsnps_blk = np.empty((B + 1, K), dtype=np.float64)
-        nsnps_blk[:B] = counts_full[None, :] - counts_blk
-        nsnps_blk[B] = counts_full
-
-        M_k = nsnps_blk[:, :, None]
-        M_l = nsnps_blk[:, None, :]
-
-        # Convert (LD sums) -> rg trace blocks (KxK)
-        rg_KK = utils._calc_rg_trace_from_ld_batch(ld_sum_all, nsample1, nsample2, M_k, M_l)
-
-        if noverlap is None:
-            # Unconstrained: return KxK padded to (K)x(K) (no extra row/col)
-            return rg_KK
-        else:
-            # Constrained: add noverlap to each (k,l)
-            rg_KK = rg_KK + float(noverlap)
-
-            # Assemble (K+1)x(K+1) with the last row/col set to noverlap
-            out = np.full((B + 1, K + 1, K + 1), float(noverlap), dtype=np.float64)
-            out[:, :K, :K] = rg_KK
-            return out
-
     # ---------------------------- filtering ---------------------------- #
-
-    def _filter_snps(self, removesnps):
-        """
-        Remove the SNPs in the removesnps from trace calculation. Only possible when LD scores are used as input.
-        """
-        if self.ldscores is None:
+    def _apply_keep_mask(self, keep_mask: np.ndarray):
+        """Apply keep-mask to base arrays; updates working annot/ldscores and cached counts."""
+        if self._ldscores_base is None:
             return
 
-        mask = ~self.annot_df['SNP'].isin(removesnps)
+        keep_mask = np.asarray(keep_mask, dtype=bool)
+        if keep_mask.ndim != 1 or keep_mask.size != self._base_snps.size:
+            raise ValueError("keep_mask must be a 1D boolean mask over base SNPs.")
 
-        new_snps = self.annot_df.loc[mask, 'SNP'].tolist()
-        self.nsnps = len(new_snps)
+        self.nsnps = int(keep_mask.sum())
+        self.snplist = self._base_snps[keep_mask].tolist()
 
-        self.annot = self.annot_df.loc[mask, list(self.annot_header)].to_numpy()
-        self.ldscores = self.ldscores_df.loc[mask, self.ldscores_df.columns[3:]].to_numpy()
+        # slice base arrays (fast, no pandas)
+        self.annot = self._annot_base[keep_mask, :]
+        self.ldscores = self._ldscores_base[keep_mask, :]
+        if self._chr_base is not None:
+            self.chr = self._chr_base[keep_mask]
+            self.bp  = self._bp_base[keep_mask]
 
         self.blk_size = max(self.nsnps // self.nblks, 1)
         self.nsnps_bin = self.annot.sum(axis=0, dtype=np.float64)
 
-        # Build LOO bin counts: row j is counts after dropping block j; last row is full counts
-        self.nsnps_blk = np.full((self.nblks + 1, self.nbins), self.nsnps_bin, dtype=np.float64)
-        for j in range(self.nblks):
-            start = self.blk_size * j
-            end = self.blk_size * (j + 1) if (j < self.nblks - 1) else self.nsnps
-            self.nsnps_blk[j] = self.nsnps_bin - self.annot[start:end].sum(axis=0, dtype=np.float64)
+        # LOO bin counts
+        B = self.nblks
+        K = self.nbins
+        self.nsnps_blk = np.empty((B + 1, K), dtype=np.float64)
+        self.nsnps_blk[B] = self.nsnps_bin
 
-        n_removed = int(len(self.annot_df) - mask.sum())
-        self.log._log(f"Filtered {n_removed} SNPs from the Trace module. Shape of final annotation used for analysis: {self.annot.shape}")
+        # block bounds in the filtered SNP order
+        starts = self.blk_size * np.arange(B, dtype=np.int64)
+        ends = starts + self.blk_size
+        if B > 0:
+            ends[-1] = self.nsnps
+
+        csum = np.cumsum(self.annot, axis=0, dtype=np.float64)  # (M, K)
+
+        for j in range(B):
+            s = int(starts[j]); e = int(ends[j])
+            if e <= s:
+                blk_sum = np.zeros(K, dtype=np.float64)
+            elif s == 0:
+                blk_sum = csum[e - 1]
+            else:
+                blk_sum = csum[e - 1] - csum[s - 1]
+            self.nsnps_blk[j] = self.nsnps_bin - blk_sum
+
+        self._refresh_block_bounds()
+
+
+    def _filter_snps(self, removesnps):
+        """
+        Remove SNPs in removesnps from trace calculation (LD-scores input only).
+        Faster implementation: uses precomputed SNP indexer + base arrays.
+        """
+        if self.ldscores is None:
+            return
+
+        if removesnps is None or len(removesnps) == 0:
+            keep_mask = np.ones(self._base_snps.size, dtype=bool)
+            self._apply_keep_mask(keep_mask)
+            return
+
+        rm = np.asarray(removesnps, dtype=str)
+        idx = self.snp_index.get_indexer(rm)
+        idx = idx[idx >= 0]
+        keep_mask = np.ones(self._base_snps.size, dtype=bool)
+        keep_mask[idx] = False
+
+        n_removed = int((~keep_mask).sum())
+        self._apply_keep_mask(keep_mask)
+
+        self.log._log(
+            f"Filtered {n_removed} SNPs from the Trace module. "
+            f"Shape of final annotation used for analysis: {self.annot.shape}"
+        )
         if (n_removed / len(self.annot_df) > 0.01):
             self.log._log("[WARNING: Removing too many Trace SNPs will result in under-estimated heritability!]\n"
-                          "[We recommend using a better curated reference LD score panel with a more similar SNP set to the summary statistics SNPs.]")
+                        "[We recommend using a better curated reference LD score panel with a more similar SNP set to the summary statistics SNPs.]")
 
-        # refresh cached block bounds for the new nsnps
-        self._refresh_block_bounds()
+    def _filter_keep_snps(self, keep_snps):
+        """ Keep only SNPs listed in keep_snps (LD-scores input only)."""
+        if self.ldscores is None:
+            return
+        ks = np.asarray(keep_snps, dtype=str)
+        idx = self.snp_index.get_indexer(ks)
+        idx = idx[idx >= 0]
+        keep_mask = np.zeros(self._base_snps.size, dtype=bool)
+        keep_mask[idx] = True
+        self._apply_keep_mask(keep_mask)
+        
+    def get_ldsum_all(self, use_cache: bool = True):
+        """
+        Return ld_sum_all with shape (B+1, K, K) where:
+        ld_sum_all[b] = A_{-b}^T L_{-b}  for b=0..B-1 (LOO),
+        ld_sum_all[B] = A^T L            (full).
+
+        Here A is annotation (M,K), L is LD-score matrix (M,K) aligned to SNP order.
+        """
+        if self.ldscores is None:
+            raise RuntimeError("Trace.get_ldsum_all requires LD-scores input.")
+
+        if use_cache and hasattr(self, "_ldsum_all_cache"):
+            cached = self._ldsum_all_cache
+            # very light sanity: cache should match current dims
+            if cached.shape == (self.nblks + 1, self.nbins, self.nbins):
+                return cached
+
+        if not hasattr(self, "_blk_starts"):
+            self._refresh_block_bounds()
+
+        A = np.asarray(self.annot, dtype=np.float32, order="C")     # (M, K)
+        L = np.asarray(self.ldscores, dtype=np.float32, order="C")  # (M, K)
+        B = self.nblks
+        K = self.nbins
+
+        full_ld = A.T @ L  # (K, K)
+
+        blk_ld = np.empty((B, K, K), dtype=np.float32)
+        for b in range(B):
+            sl = slice(self._blk_starts[b], self._blk_ends[b])
+            blk_ld[b] = A[sl, :].T @ L[sl, :]
+
+        ld_sum_all = np.empty((B + 1, K, K), dtype=np.float64)
+        ld_sum_all[:B] = full_ld[None, :, :] - blk_ld
+        ld_sum_all[B] = full_ld
+
+        if use_cache:
+            self._ldsum_all_cache = ld_sum_all
+
+        return ld_sum_all

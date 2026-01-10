@@ -9,12 +9,12 @@ import sys
 class Sumrhe:
     def __init__(self, bim_path=None, sum_path=None, save_path=None, h2_path=None, out=None, chisq_threshold=0, \
             log=None, mem=False, verbose=False, ldscores=None, njack=None, annot=None,
-            report_tau: bool = True, allow_neg_enr: bool = False, clip_nonfinite_vals: bool = False):
+            report_tau: bool = True, allow_neg_enr: bool = False, clip_nonfinite_vals: bool = False, adjust_delta: bool = False):
         self.mem = mem
         self.log = log
         self.start_time = utils._get_time()
         self.log._log("Analysis started at: "+utils._get_timestr(self.start_time))
-        self.tr = Trace(bimpath=bim_path, sumpath=sum_path, savepath=save_path, ldscores=ldscores, log=self.log, nblks=njack, annot=annot, verbose=verbose)
+        self.tr = Trace(bimpath=bim_path, sumpath=sum_path, savepath=save_path, ldscores=ldscores, log=self.log, nblks=njack, annot=annot, verbose=verbose, adjust_delta=adjust_delta)
         self.nblks = self.tr.nblks
         self.annot_header = self.tr.annot_header
         self.nbins = self.tr.nbins
@@ -44,6 +44,7 @@ class Sumrhe:
         self.report_tau = bool(report_tau)
         self.allow_neg_enr = bool(allow_neg_enr)
         self.clip_nonfinite_vals = clip_nonfinite_vals
+        self.adjust_delta = adjust_delta
         
         if self.report_tau:
             self.tau         = np.zeros((self.npheno, self.nblks+1, self.nbins), dtype=np.float64)

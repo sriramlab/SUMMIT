@@ -177,9 +177,9 @@ void phase1_compute_Xz_bed_chunk_impl(const std::string &bed_prefix,
                                       const std::string &rand_dist,
                                       py::object seed_obj,    // None or int
                                       py::array_t<T, py::array::f_style | py::array::forcecast> Xz2d_chunk, // (N x (B*v_count)), Fortran, **K-major**
-                                      bool /*project_right*/ = false,
-                                      py::object /*C_opt*/ = py::none(),
-                                      py::object /*R_opt*/ = py::none())
+                                      bool project_right = false,
+                                      py::object C_opt = py::none(),
+                                      py::object R_opt = py::none())
 {
     const std::string bed_path = bed_prefix + ".bed";
     const std::string bim_path = bed_prefix + ".bim";
@@ -195,6 +195,33 @@ void phase1_compute_Xz_bed_chunk_impl(const std::string &bed_prefix,
     std::vector<T> Geno; // (N x L), column-major
     read_block_standardized<T>(bed_path, fam_path, blk_start, blk_end, rows, ddof, Geno, N, L);
     if (L == 0) return;
+
+    if (project_right && !C_opt.is_none() && !R_opt.is_none()) {
+    py::array_t<T, py::array::f_style | py::array::forcecast> C = C_opt.cast<py::array_t<T>>();
+    py::array_t<T, py::array::f_style | py::array::forcecast> R = R_opt.cast<py::array_t<T>>();
+    auto Ci = C.request();
+    auto Ri = R.request();
+    const int p = (int)Ci.shape[1];
+    if ((int)Ci.shape[0] != N || (int)Ri.shape[0] != p || (int)Ri.shape[1] != N)
+        throw std::runtime_error("C/R shape mismatch in phase1");
+
+    const T* Cptr = static_cast<const T*>(Ci.ptr);
+    const T* Rptr = static_cast<const T*>(Ri.ptr);
+
+    // tmpG = R * Geno (p x L)
+    AlignedBuffer<T> tmpG((size_t)p * (size_t)L, 64);
+    gemm_col_major_nn<T>(/*m=*/p, /*n=*/L, /*k=*/N,
+                         /*A=*/Rptr, /*lda=*/p,
+                         /*B=*/Geno.data(), /*ldb=*/N,
+                         /*C=*/tmpG.ptr, /*ldc=*/p,
+                         /*alpha=*/T(1), /*beta=*/T(0));
+    // Geno = Geno - C * tmpG  (in-place)
+    gemm_col_major_nn<T>(/*m=*/N, /*n=*/L, /*k=*/p,
+                         /*A=*/Cptr, /*lda=*/N,
+                         /*B=*/tmpG.ptr, /*ldb=*/p,
+                         /*C=*/Geno.data(), /*ldc=*/N,
+                         /*alpha=*/T(-1), /*beta=*/T(1));
+    }
 
     // ---- annot & inv ----
     auto Ainfo = annot_blk.request();
@@ -527,12 +554,21 @@ void phase2_compute_XtXz_bed_impl(const std::string &bed_prefix,
     t.dump(blk_start, blk_end, B, nvecs);
 }
 
+void set_num_threads(int n) {
+    if (n > 0) {
+        omp_set_num_threads(n);
+    }
+}
+
 // ------------------------------- PyBind module -------------------------------
 PYBIND11_MODULE(gwldcore, m) {
     m.doc() = "C++ core for SUMMIT GW LD score (bed parser + BLAS-safe GEMMs)";
 
     m.def("set_verbose", &set_verbose, py::arg("enabled"),
       "Enable/disable verbose timing prints");
+
+    m.def("set_num_threads", &set_num_threads, py::arg("n"),
+      "Set the number of OpenMP threads used inside gwldcore.");
 
     // Phase 1 (chunked) float32
     m.def("phase1_compute_Xz_bed_chunk",
