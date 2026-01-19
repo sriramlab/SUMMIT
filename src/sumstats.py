@@ -20,8 +20,6 @@ class Sumstats:
         self.snpids = len(annot_df)
         self.annot = None
         self.zscores = None
-        self.zscores_bin = []
-        self.zscores_blk = []
         self.rhs = None
         self.nsamp = 0
         self.nsnps = 0
@@ -32,7 +30,7 @@ class Sumstats:
         self.name = None
         self.removesnps = []
 
-        # ---- caches for fast matching (NEW) ----
+        # ---- caches for fast matching ----
         self._ann_cols = None
         self._annot_snps = None
         self._annot_ann = None
@@ -51,13 +49,26 @@ class Sumstats:
             self._set_annot_df(annot_df)
 
     def _set_annot_df(self, annot_df: pd.DataFrame):
-        """(NEW) Cache annotation SNP order + annotation matrix for fast rematching."""
+        """Cache annotation SNP order + annotation matrix for fast rematching."""
         self.annot_df = annot_df
         self._ann_cols = [c for c in annot_df.columns if c != 'SNP']
+
         # ensure string SNP ids once
         self._annot_snps = annot_df['SNP'].astype(str).to_numpy()
-        self._annot_ann = annot_df[self._ann_cols].to_numpy()
+
+        # keep numeric matrix; works for binary/overlapping/continuous
+        self._annot_ann = annot_df[self._ann_cols].to_numpy(dtype=np.float64, copy=False)
+
+        # basic sanity (fail fast if annotation has NaNs / inf)
+        if not np.isfinite(self._annot_ann).all():
+            bad = np.flatnonzero(~np.isfinite(self._annot_ann).any(axis=1))[:10]
+            raise ValueError(
+                "Annotation contains non-finite values (NaN/inf). "
+                f"First bad row indices (in annot_df order): {bad.tolist()}"
+            )
+
         self._annot_has_dups = pd.Index(self._annot_snps).has_duplicates
+
 
     def _read_sumstats(self, path, name):
         self.name = name
@@ -83,7 +94,7 @@ class Sumstats:
         sumdf['N'] = pd.to_numeric(sumdf['N'], errors='coerce')
         sumdf['Z'] = pd.to_numeric(sumdf['Z'], errors='coerce')
 
-        # drop non-finite N/Z rows (defensive)
+        # drop non-finite N/Z rows
         bad = (~np.isfinite(sumdf['N'].to_numpy())) | (~np.isfinite(sumdf['Z'].to_numpy()))
         if bad.any():
             bad_snps = sumdf.loc[bad, 'SNP'].tolist()
@@ -173,23 +184,30 @@ class Sumstats:
 
     def _match_snps(self, printlog=True):
         """
-        Match SNPs between sumstats and annot_df.
-        IMPORTANT: preserve annot_df order (blocks match Trace ordering).
+        Match SNPs between sumstats and annot_df while preserving annot_df order (blocks match Trace ordering).
+
+        Supports:
+        - non-overlapping binary annotations
+        - overlapping binary annotations
+        - continuous (nonnegative) annotations
+
+        For continuous/overlapping, we compute weighted sufficient statistics:
+            M_k   = sum_j a_{j,k}
+            S_k   = sum_j a_{j,k} * z_j^2
+        and their in-block counterparts for jackknife.
         """
         if self.annot_df is None:
             raise RuntimeError("Sumstats.annot_df is None; cannot match SNPs.")
         if self._annot_snps is None or (self._annot_ann is None):
             self._set_annot_df(self.annot_df)
 
-        # chi^2 filter (unchanged logic, just applied once)
+        # chi^2 filter
         self._apply_chisq_filter_once()
 
-        matched_zscores = []
-        nsnps_blk = np.zeros((self.nblks, self.nbins), dtype=np.float64)
-
-        # If duplicates exist, fall back to merge to preserve legacy semantics
+        # ----------------------------
+        # SNP matching
+        # ----------------------------
         if self._sum_has_dups or self._annot_has_dups:
-            # ---- legacy merge path (exactly your old behavior) ----
             df = self.annot_df.merge(self.sumdf, how='inner', on='SNP', sort=False)
 
             matched_set = pd.Index(df['SNP'].astype(str))
@@ -210,20 +228,18 @@ class Sumstats:
             self.a2 = df['A2'].astype(str).str.upper().to_numpy()
 
             ann_cols = [c for c in self.annot_df.columns if c != 'SNP']
-            all_ann = df[ann_cols].to_numpy()
+            all_ann = df[ann_cols].to_numpy(dtype=np.float64, copy=False)
 
         else:
-            # ---- fast indexer path (NEW) ----
+            # fast indexer path (preserve annot_df order)
             annot_snps = self._annot_snps
             indexer = self._sum_index.get_indexer(annot_snps)  # position in sumstats arrays, -1 if missing
             keep_mask = indexer >= 0
 
-            # record missing for Trace filtering
             missing_n = int((~keep_mask).sum())
             if missing_n:
                 self.removesnps.extend(annot_snps[~keep_mask].tolist())
 
-            # aligned in annot_df order
             pos = indexer[keep_mask]  # positions into sumstats arrays
             self.matched_snps = annot_snps[keep_mask]
             if printlog:
@@ -240,64 +256,131 @@ class Sumstats:
 
             all_ann = self._annot_ann[keep_mask, :]
 
-        # ---- blocks & bins (unchanged) ----
-        total = len(all_z)
-        blk_size = max(total // self.nblks, 1)
+        # ----------------------------
+        # Weighted sufficient statistics for RHS
+        # ----------------------------
+        all_z = np.asarray(all_z, dtype=np.float64)
+        if not np.isfinite(all_z).all():
+            raise RuntimeError("Non-finite z-scores encountered after matching; drop upstream.")
 
-        for i in range(self.nblks):
-            start = blk_size * i
-            end = blk_size * (i + 1) if (i < self.nblks - 1) else total
+        A = np.asarray(all_ann, dtype=np.float64, order="C")
+        if A.ndim != 2 or A.shape[1] != self.nbins:
+            raise RuntimeError(f"Annotation matrix shape mismatch: got {A.shape}, expected (*,{self.nbins}).")
+        if not np.isfinite(A).all():
+            bad = np.flatnonzero(~np.isfinite(A).any(axis=1))[:10]
+            raise RuntimeError(f"Non-finite annotation values encountered after matching. First bad rows: {bad.tolist()}")
 
-            blk_zscores = all_z[start:end]
-            blk_annot = all_ann[start:end]
+        M = int(all_z.size)
+        self.nsnps = M  # matched SNP count
 
-            partition, nsnps_partition = utils._partition_bin_overlapping(
-                blk_zscores, blk_annot, self.nbins
+        # block partition (must match Trace convention: blk_size = M//B, last block takes remainder)
+        blk_size = max(M // self.nblks, 1)
+        blk_idx = (np.arange(M, dtype=np.int64) // blk_size)
+        blk_idx[blk_idx >= self.nblks] = self.nblks - 1
+        self.blk_idx = blk_idx  # optional, but handy for debugging
+
+        z2 = all_z * all_z  # (M,)
+
+        # Full sums: M_k = sum a_{jk}; S_k = sum a_{jk} z_j^2
+        Ak_full = A.sum(axis=0, dtype=np.float64)          # (K,)
+        Az2_full = (A.T @ z2).astype(np.float64, copy=False)  # (K,)
+
+        # In-block contributions for jackknife
+        B = self.nblks
+        K = self.nbins
+        Ak_blk = np.zeros((B, K), dtype=np.float64)
+        Az2_blk = np.zeros((B, K), dtype=np.float64)
+
+        tmp = np.empty(M, dtype=np.float64)
+        for k in range(K):
+            col = A[:, k]
+            # M_k^{(b)} = sum_{j in block b} a_{jk}
+            tmp[:] = col
+            Ak_blk[:, k] = np.bincount(blk_idx, weights=tmp, minlength=B).astype(np.float64, copy=False)
+            # S_k^{(b)} = sum_{j in block b} a_{jk} z_j^2
+            tmp[:] = col * z2
+            Az2_blk[:, k] = np.bincount(blk_idx, weights=tmp, minlength=B).astype(np.float64, copy=False)
+
+        # expose the "bin sizes" using the same names as before (now = sum of weights)
+        self.nsnps_bin = Ak_full
+        self.nsnps_blk = Ak_blk
+
+        # store sufficient stats for RHS computation
+        self._Ak_full = Ak_full
+        self._Az2_full = Az2_full
+        self._Ak_blk = Ak_blk
+        self._Az2_blk = Az2_blk
+
+        # sanity: bins must have positive total weight (for binary, this is count>0)
+        bad_bins = np.flatnonzero(~np.isfinite(Ak_full) | (Ak_full <= 0.0))
+        if bad_bins.size:
+            self.log._log(
+                "!!! One or more annotation bins have non-positive total weight after matching. "
+                f"Bad bins: {bad_bins.tolist()} (Ak_full={Ak_full[bad_bins].tolist()}) !!!"
             )
-            matched_zscores.append(partition)
-            nsnps_blk[i] = nsnps_partition
+            sys.exit(1)
 
-        self.zscores_bin, self.nsnps_bin = utils._partition_bin_overlapping(all_z, all_ann, self.nbins)
-
-        for b in range(self.nbins):
-            if self.nsnps_bin[b] == 0:
-                self.log._log(
-                    f"!!! Bin {b} contains zero SNPs after matching. "
-                    f"Please check your annotation and SNP lists. !!!"
-                )
-                sys.exit(1)
-
-        self.nsnps_blk = nsnps_blk
-        self.zscores_blk = matched_zscores
 
     def _calc_rhs_h2(self):
-        self.rhs = np.full((self.nblks + 1, self.nbins + 1), self.nsamp - 1)
+        """
+        Build RHS for univariate normal equations.
 
-        for i in range(self.nbins):
-            total_zTz = float(np.dot(self.zscores_bin[i], self.zscores_bin[i]))
+        For each bin k:
+        M_k     = sum_j a_{j,k}
+        S_k     = sum_j a_{j,k} z_j^2
+        M_k^b   = sum_{j in block b} a_{j,k}
+        S_k^b   = sum_{j in block b} a_{j,k} z_j^2
+
+        Full:
+        rhs[B,k] = (S_k * N) / M_k
+        LOO:
+        rhs[b,k] = ((S_k - S_k^b) * N) / (M_k - M_k^b)
+
+        Noise term:
+        rhs[:,K] = N - 1
+        """
+        if not hasattr(self, "_Ak_full") or self._Ak_full is None:
+            raise RuntimeError("Missing cached annotation-weight sums. Did you call _match_snps()?")
+
+        B = self.nblks
+        K = self.nbins
+        N = float(self.nsamp)
+
+        Ak_full = np.asarray(self._Ak_full, dtype=np.float64)       # (K,)
+        Az2_full = np.asarray(self._Az2_full, dtype=np.float64)     # (K,)
+        Ak_blk = np.asarray(self._Ak_blk, dtype=np.float64)         # (B,K) in-block
+        Az2_blk = np.asarray(self._Az2_blk, dtype=np.float64)       # (B,K) in-block
+
+        self.rhs = np.full((B + 1, K + 1), N - 1.0, dtype=np.float64)
+
+        warned = np.zeros(K, dtype=bool)
+
+        for k in range(K):
+            denom_full = float(Ak_full[k])
+            if not (np.isfinite(denom_full) and denom_full > 0.0):
+                raise RuntimeError(f"Bin {k} has non-positive total weight (Ak_full={denom_full}).")
 
             # full row
-            if self.nsnps_bin[i] <= 0:
-                raise RuntimeError(f"Bin {i} has zero SNPs (nsnps_bin=0) after matching.")
-            self.rhs[self.nblks, i] = total_zTz * self.nsamp / float(self.nsnps_bin[i])
+            self.rhs[B, k] = float(Az2_full[k]) * N / denom_full
 
             # LOO rows
-            for j in range(self.nblks):
-                blk_zTz = float(np.dot(self.zscores_blk[j][i], self.zscores_blk[j][i]))
-                denom = float(self.nsnps_bin[i] - self.nsnps_blk[j][i])
-
-                if denom <= 0:
-                    # LOO set is empty for this bin; mark as NaN (jackknife will omit if configured)
-                    self.rhs[j, i] = np.nan
-                    if j == 0:
+            for b in range(B):
+                denom = float(Ak_full[k] - Ak_blk[b, k])
+                if not (np.isfinite(denom) and denom > 0.0):
+                    self.rhs[b, k] = np.nan
+                    if not warned[k]:
+                        warned[k] = True
                         self.log._log(
-                            f"[WARNING] Bin {i} becomes empty in some LOO replicates "
-                            f"(denom<=0). Consider fewer blocks or coarser bins."
+                            f"[WARNING] Bin {k} has non-positive total weight in some LOO replicates "
+                            f"(denom<=0). Consider fewer blocks or coarser/less sparse annotations."
                         )
-                else:
-                    self.rhs[j, i] = (total_zTz - blk_zTz) * self.nsamp / denom
+                    continue
+
+                num = float(Az2_full[k] - Az2_blk[b, k])
+                self.rhs[b, k] = num * N / denom
 
         self.log._log(f"Calculated the RHS for phenotype [{self.name}]")
+
 
 
     def _process(self, path, name):
@@ -321,12 +404,19 @@ class Sumstats:
         then recompute RHS. No file I/O.
         """
         self._set_annot_df(annot_df)
+
         self.matched_snps = None
         self.zscores = None
         self.zscores_bin = []
         self.zscores_blk = []
         self.nsnps_blk = None
         self.nsnps_bin = None
+
+        # reset weighted caches
+        self._Ak_full = None
+        self._Az2_full = None
+        self._Ak_blk = None
+        self._Az2_blk = None
 
         self._match_snps(printlog=False)
         self._calc_rhs_h2()

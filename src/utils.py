@@ -29,35 +29,59 @@ def _partition_bin_non_overlapping(jn_values: np.ndarray, jn_annot: np.ndarray, 
 
 def _partition_bin_overlapping(jn_values: np.ndarray, jn_annot: np.ndarray, nbins: int):
     """
-    Partition the 1D array `jn_values` into `nbins` lists using the 2D
-    indicator/weight matrix `jn_annot` (shape: [num_snps, nbins]).
-    A SNP belongs to bin b if jn_annot[i, b] != 0.
-    """
-    import numpy as np
+    Partition the 1D array `jn_values` into `nbins` lists using an overlapping /
+    continuous annotation matrix `jn_annot` (shape: [num_snps, nbins]).
 
+    Continuous/overlap-correct semantics:
+      - A SNP contributes to bin b with weight w = jn_annot[i,b].
+      - Returned partition list contains weighted values: w * jn_values[i]
+        (and includes only SNPs with w != 0).
+      - Returned "snp_cnts" is actually BIN MASS: sum_i w_i (not nnz count).
+
+    This matches the general pattern used in SUMRHE continuous refactors:
+      sums use A-weights (A^T y) and "counts" are sum(A).
+
+    Returns:
+      partitions: list of length nbins; each is list of weighted values (None -> 0)
+      snp_cnts:  list of length nbins; each is sum of weights in that bin
+    """
     jn_values = np.asarray(jn_values)
     jn_annot  = np.asarray(jn_annot)
+
+    if jn_values.ndim != 1:
+        jn_values = jn_values.ravel()
 
     # Handle single-bin edge case: allow 1D annot
     if jn_annot.ndim == 1:
         jn_annot = jn_annot.reshape(-1, 1)
 
-    if jn_annot.shape[0] != jn_values.shape[0]:
+    if jn_annot.ndim != 2:
+        raise ValueError("jn_annot must be 2D (M, nbins).")
+    M, K = jn_annot.shape
+    if K != nbins:
+        raise ValueError(f"jn_annot has K={K} columns but nbins={nbins}.")
+    if jn_values.shape[0] != M:
         raise ValueError("jn_values and jn_annot must have the same number of rows (SNPs).")
 
-    partitions = {i: [] for i in range(nbins)}
+    if not np.all(np.isfinite(jn_annot)):
+        raise ValueError("jn_annot contains non-finite values.")
 
-    # Vectorized selection per bin; treat any non-zero as membership
+    partitions = {b: [] for b in range(nbins)}
+    snp_mass = np.zeros(nbins, dtype=np.float64)
+
+    # Weighted partition per bin
     for b in range(nbins):
-        col = jn_annot[:, b]
-        mask = (col != 0)  # works for bool or numeric (binary/continuous)
-        partitions[b] = jn_values[mask].tolist()
+        w = jn_annot[:, b].astype(np.float64, copy=False)
+        mask = (w != 0.0)
+        if np.any(mask):
+            partitions[b] = (jn_values[mask] * w[mask]).tolist()
+            snp_mass[b] = float(w[mask].sum())
+        else:
+            partitions[b] = []
+            snp_mass[b] = 0.0
 
-    # Count SNPs per bin (you never append None, so no need to subtract)
-    snp_cnts = [len(partitions[i]) for i in range(nbins)]
+    return [_replace_None(partitions[i]) for i in range(nbins)], snp_mass.tolist()
 
-    # Preserve your existing return shape and None-handling helper
-    return [_replace_None(partitions[i]) for i in range(nbins)], snp_cnts
 
 
 def _calc_lsum(tr, n, m1, m2):
@@ -341,7 +365,6 @@ def symmetrize_trace_with_jackknife(trace_KK, logger=None, verbose=False):
     return sym
 
 
-
 # ----------------------- Jackknife helpers ----------------------- #
 
 def _calc_jn_subsample(alist):
@@ -433,17 +456,6 @@ def _read_with_optional_header(file_path):
         data = np.loadtxt(file_path)
         return None, data
 
-def _map_idx(snpid, npartition):
-    '''
-    create a mapping of SNP id -> idx
-    '''
-    mapping = {}
-    partition = _partition(snpid, npartition)
-    for idx, part in enumerate(partition):
-        for snp in part:
-            mapping[snp] = idx
-    return mapping
-
 def _find_matching_files(regex, prefix):
     '''
     regex file matching. returns a list of matches (with specified path prefix)
@@ -507,7 +519,6 @@ def _parse_rgdir(rg):
 
     return validated
 
-
     
 def _parse_column(df, letters, min_index=3):
     '''
@@ -562,7 +573,6 @@ def _solve_linear_equation(X, y, method='auto'):
         # Fall back to generic solver (still batched)
         return np.linalg.solve(X, y)
 
-
 def bivariate_regression_partitioned_jn(
     l2_bins,
     y,
@@ -570,46 +580,31 @@ def bivariate_regression_partitioned_jn(
     n1,
     n2,
     nsnps_blk,
-    smooth_window=100,
-    segment_ids=None,
     blk_idx=None,
-    # NEW:
-    positions_bp=None,
-    smooth_bp_window=None,
-    weight_floor=None,   # e.g. 1e-8 to avoid hard failure
+    weight_floor=None,
+    weight_cap_quantile=None,
+    chisq1=None,
+    chisq2=None,
+    chisq_threshold=None,
+    chisq_mode="either",  # "either" (default), "both", "max"
 ):
     """
-    Leave-one-(macro)-block-out per-SNP WLS for partitioned SUMCORE,
-    with smoothed weights.
+    Leave-one-block-out WLS regression of y = z1*z2 on partitioned LD scores + intercept.
 
-    Model:
-        E[y_j] = c + sum_k beta_k * l2_{j,k},   where y_j = z1_j * z2_j
+    If chisq_threshold is not None, we *temporarily* exclude SNPs with large chi^2
+    (typically > 30) from THIS regression only by setting their weights to 0.
+    This keeps the full SNP indexing and jackknife block structure unchanged.
 
-    Weights (variance proxy):
-        ltot_j = sum_k l2_{j,k}
-        ltot_smooth_j = smoothing(ltot_j) either:
-          - SNP-count moving average within segment (default), or
-          - physical bp-window within segment (if smooth_bp_window provided)
-        w_j = 1 / ltot_smooth_j
-
-    Jackknife blocks:
-        If blk_idx is provided, it MUST match Trace exactly (recommended).
-        Otherwise falls back to legacy M//nblks block construction.
-
-    New smoothing options:
-      - segment_ids: e.g., chromosome per SNP. Smoothing will NOT cross segment boundaries.
-      - positions_bp + smooth_bp_window: physical window smoothing.
-          smooth_bp_window is TOTAL window length in base-pairs (centered window, +/- smooth_bp_window/2).
+    Recommended setting (LDSC-style for rg intercept step):
+    chisq_mode="either", chisq_threshold=30, chisq1=z1^2, chisq2=z2^2
     """
-    import numpy as np
-
-    l2_bins = np.asarray(l2_bins, dtype=np.float64)
+    L = np.asarray(l2_bins, dtype=np.float64, order="C")
     y = np.asarray(y, dtype=np.float64).ravel()
     nsnps_blk = np.asarray(nsnps_blk, dtype=np.float64)
 
-    if l2_bins.ndim != 2:
+    if L.ndim != 2:
         raise ValueError("l2_bins must be 2-D (M, K)")
-    M, K = l2_bins.shape
+    M, K = L.shape
     if y.size != M:
         raise ValueError(f"y must have shape (M,), got {y.shape}, expected M={M}")
 
@@ -622,154 +617,12 @@ def bivariate_regression_partitioned_jn(
     n1 = float(n1); n2 = float(n2)
     if not (np.isfinite(n1) and np.isfinite(n2) and n1 > 0 and n2 > 0):
         raise ValueError("n1 and n2 must be positive finite")
-
-    if not np.all(np.isfinite(y)):
-        bad = int((~np.isfinite(y)).sum())
-        raise ValueError(f"Found {bad} non-finite entries in y; drop these SNPs upstream.")
-    if not np.all(np.isfinite(l2_bins)):
-        bad = int((~np.isfinite(l2_bins)).sum())
-        raise ValueError(f"Found {bad} non-finite entries in l2_bins; drop/fix these SNPs upstream.")
-
-    smooth_window = int(smooth_window) if smooth_window is not None else None
-    if smooth_window is not None and smooth_window <= 0:
-        raise ValueError("smooth_window must be positive or None")
-
-    if smooth_bp_window is not None:
-        smooth_bp_window = int(smooth_bp_window)
-        if smooth_bp_window <= 0:
-            raise ValueError("smooth_bp_window must be positive")
+    sN = np.sqrt(n1 * n2)
 
     # ----------------------------
-    # Helpers: smoothing
-    # ----------------------------
-    def _moving_average_1d_count(x, win):
-        x = np.asarray(x, dtype=np.float64)
-        n = x.size
-        if win is None or win <= 1 or n == 0:
-            return x.copy()
-        half = win // 2
-        cs = np.empty(n + 1, dtype=np.float64)
-        cs[0] = 0.0
-        np.cumsum(x, out=cs[1:])
-
-        idx = np.arange(n, dtype=np.int64)
-        start = np.maximum(idx - half, 0)
-        end = np.minimum(idx + half + 1, n)
-        sums = cs[end] - cs[start]
-        lens = (end - start).astype(np.float64)
-        return sums / lens
-
-    def _moving_average_1d_bp(x, bp, win_bp):
-        """
-        Centered window smoothing by bp distance: includes SNPs within +/- win_bp/2.
-        Requires bp to be nondecreasing in this slice.
-        O(n) two-pointer with prefix sums.
-        """
-        x = np.asarray(x, dtype=np.float64)
-        bp = np.asarray(bp, dtype=np.int64)
-        n = x.size
-        if n == 0:
-            return x.copy()
-        if n == 1:
-            return x.copy()
-        if np.any(bp[1:] < bp[:-1]):
-            raise ValueError("positions_bp must be nondecreasing within each segment/run for bp-window smoothing.")
-
-        half = win_bp // 2
-        cs = np.empty(n + 1, dtype=np.float64)
-        cs[0] = 0.0
-        np.cumsum(x, out=cs[1:])
-
-        out = np.empty(n, dtype=np.float64)
-        left = 0
-        right = 0
-        for i in range(n):
-            # move left up until bp[i] - bp[left] <= half
-            while left < n and (bp[i] - bp[left] > half):
-                left += 1
-            # move right up until bp[right] - bp[i] > half (right is exclusive)
-            if right < i:
-                right = i
-            while right < n and (bp[right] - bp[i] <= half):
-                right += 1
-            s = cs[right] - cs[left]
-            m = right - left
-            out[i] = s / float(m) if m > 0 else x[i]
-        return out
-
-    def _iter_runs(seg):
-        """Yield contiguous [start,end) runs where seg is constant."""
-        n = seg.size
-        if n == 0:
-            return
-        s = 0
-        for i in range(1, n):
-            if seg[i] != seg[i - 1]:
-                yield s, i
-                s = i
-        yield s, n
-
-    # ----------------------------
-    # Compute smoothed total-LD for weights
-    # ----------------------------
-    ltot = l2_bins.sum(axis=1)
-
-    # Choose smoothing mode
-    use_bp = (smooth_bp_window is not None)
-    if use_bp:
-        if segment_ids is None or positions_bp is None:
-            raise ValueError("bp-window smoothing requires segment_ids (e.g., chr) and positions_bp.")
-        seg = np.asarray(segment_ids)
-        bp = np.asarray(positions_bp, dtype=np.int64)
-        if seg.shape[0] != M or bp.shape[0] != M:
-            raise ValueError("segment_ids and positions_bp must both have length M.")
-        ltot_smooth = np.empty(M, dtype=np.float64)
-        for s, e in _iter_runs(seg):
-            ltot_smooth[s:e] = _moving_average_1d_bp(ltot[s:e], bp[s:e], smooth_bp_window)
-    else:
-        # SNP-count smoothing (default)
-        if segment_ids is None:
-            ltot_smooth = _moving_average_1d_count(ltot, smooth_window)
-        else:
-            seg = np.asarray(segment_ids)
-            if seg.shape[0] != M:
-                raise ValueError(f"segment_ids must have length M={M}, got {seg.shape[0]}")
-            ltot_smooth = np.empty(M, dtype=np.float64)
-            for s, e in _iter_runs(seg):
-                ltot_smooth[s:e] = _moving_average_1d_count(ltot[s:e], smooth_window)
-
-    # Enforce positivity for weights
-    bad = (~np.isfinite(ltot_smooth)) | (ltot_smooth <= 0.0)
-    if np.any(bad):
-        if weight_floor is None:
-            nb = int(bad.sum())
-            mn = float(np.nanmin(ltot_smooth))
-            idx_bad = np.flatnonzero(bad)[:10]
-            raise ValueError(
-                f"Smoothed total LD (ltot_smooth) must be finite and > 0 for weights w=1/ltot_smooth.\n"
-                f"Found {nb}/{M} SNPs with ltot_smooth <= 0 or non-finite (min={mn}).\n"
-                f"Try: larger smooth_window, and/or smooth_bp_window with segment_ids+positions_bp.\n"
-                f"First bad indices: {idx_bad.tolist()}"
-            )
-        else:
-            eps = float(weight_floor)
-            ltot_smooth = np.where(np.isfinite(ltot_smooth), ltot_smooth, eps)
-            ltot_smooth = np.maximum(ltot_smooth, eps)
-
-    w = 1.0 / ltot_smooth
-
-    # ----------------------------
-    # Per-SNP design matrix
-    # ----------------------------
-    X = np.empty((M, K + 1), dtype=np.float64)
-    X[:, 0] = 1.0
-    X[:, 1:] = l2_bins
-
-    # ----------------------------
-    # Macro-block jackknife (MUST match Trace)
+    # block index
     # ----------------------------
     if blk_idx is None:
-        # legacy fallback
         blk_size = M // nblks
         if blk_size == 0:
             raise ValueError("Too many jackknife blocks (nblks > M).")
@@ -783,60 +636,198 @@ def bivariate_regression_partitioned_jn(
         if blk_idx.min() < 0 or blk_idx.max() >= nblks:
             raise ValueError(f"blk_idx values must be in [0, nblks-1]=[0,{nblks-1}]")
 
+    # Derive contiguous block bounds once (assumes piecewise-constant blk_idx)
+    change = np.flatnonzero(blk_idx[1:] != blk_idx[:-1]) + 1
+    starts = np.concatenate(([0], change))
+    ends   = np.concatenate((change, [M]))
+    run_blk = blk_idx[starts]
+
+    blk_starts = np.zeros(nblks, dtype=np.int64)
+    blk_ends   = np.zeros(nblks, dtype=np.int64)
+    for r, b in enumerate(run_blk):
+        blk_starts[int(b)] = int(starts[r])
+        blk_ends[int(b)]   = int(ends[r])
+
     # ----------------------------
-    # Normal equations totals
+    # chisq-based keep mask for intercept regression
     # ----------------------------
-    WX = w[:, None] * X
-    SXX_tot = WX.T @ X
-    SXY_tot = WX.T @ y
+    keep = np.ones(M, dtype=bool)
+    if chisq_threshold is not None:
+        thr = float(chisq_threshold)
+        if not (np.isfinite(thr) and thr > 0):
+            raise ValueError("chisq_threshold must be positive finite")
 
-    # Per-block contributions via bincount
-    SXX_blk = np.zeros((nblks, K + 1, K + 1), dtype=np.float64)
-    SXY_blk = np.zeros((nblks, K + 1), dtype=np.float64)
-    tmp = np.empty(M, dtype=np.float64)
+        if chisq1 is None or chisq2 is None:
+            raise ValueError("chisq1 and chisq2 must be provided when chisq_threshold is set")
 
-    for c in range(K + 1):
-        Xc = X[:, c]
-        for d in range(c, K + 1):
-            tmp[:] = w * Xc * X[:, d]
-            S = np.bincount(blk_idx, weights=tmp, minlength=nblks).astype(np.float64, copy=False)
-            SXX_blk[:, c, d] = S
-            if d != c:
-                SXX_blk[:, d, c] = S
+        c1 = np.asarray(chisq1, dtype=np.float64).ravel()
+        c2 = np.asarray(chisq2, dtype=np.float64).ravel()
+        if c1.size != M or c2.size != M:
+            raise ValueError(f"chisq1/chisq2 must have length M={M}")
 
-        tmp[:] = w * Xc * y
-        SXY_blk[:, c] = np.bincount(blk_idx, weights=tmp, minlength=nblks).astype(np.float64, copy=False)
+        # require finite chisq for kept SNPs
+        finite = np.isfinite(c1) & np.isfinite(c2)
+        keep &= finite
 
-    # LOO totals
-    SXX = SXX_tot[None, :, :] - SXX_blk
-    SXY = SXY_tot[None, :] - SXY_blk
+        mode = str(chisq_mode).lower()
+        if mode == "either":
+            keep &= (c1 <= thr) & (c2 <= thr)  # drop if either > thr
+        elif mode == "both":
+            keep &= ~((c1 > thr) & (c2 > thr))  # drop only if both > thr
+        elif mode == "max":
+            keep &= (np.maximum(c1, c2) <= thr)
+        else:
+            raise ValueError("chisq_mode must be one of {'either','both','max'}")
 
-    # Solve
-    try:
-        beta_j = np.linalg.solve(SXX, SXY[..., None])[..., 0]
-    except np.linalg.LinAlgError:
-        beta_j = np.vstack([np.linalg.lstsq(SXX[b], SXY[b], rcond=None)[0] for b in range(nblks)])
+    # ----------------------------
+    # base weights w = 1 / sum_k l2_{j,k}, with optional floor/cap
+    # and then set w=0 for excluded SNPs.
+    # ----------------------------
+    ltot = L.sum(axis=1)
 
+    if weight_floor is None:
+        bad = keep & ((~np.isfinite(ltot)) | (ltot <= 0.0))
+        if np.any(bad):
+            nb = int(bad.sum())
+            mn = float(np.nanmin(ltot))
+            idx_bad = np.flatnonzero(bad)[:10]
+            raise ValueError(
+                f"Total LD (ltot) must be finite and > 0 for weights w=1/ltot on KEPT SNPs.\n"
+                f"Found {nb}/{M} kept SNPs with ltot <= 0 or non-finite (min={mn}).\n"
+                f"Pass weight_floor to clamp.\n"
+                f"First bad kept indices: {idx_bad.tolist()}"
+            )
+        # for dropped SNPs, ltot value doesn't matter (we'll set w=0); keep it safe anyway
+        ltot_safe = np.where(keep, ltot, 1.0)
+    else:
+        eps = float(weight_floor)
+        if not (np.isfinite(eps) and eps > 0):
+            raise ValueError("weight_floor must be positive finite")
+        ltot_safe = np.where(np.isfinite(ltot), ltot, eps)
+        ltot_safe = np.maximum(ltot_safe, eps)
+        ltot_safe = np.where(keep, ltot_safe, 1.0)
+
+    w = 1.0 / ltot_safe
+    w[~keep] = 0.0
+
+    # Optional cap (apply only to positive weights, otherwise zeros distort quantile)
+    if weight_cap_quantile is not None:
+        q = float(weight_cap_quantile)
+        if not (0.0 < q < 1.0):
+            raise ValueError("weight_cap_quantile must be in (0,1)")
+        wpos = w[w > 0]
+        if wpos.size > 0:
+            cap = float(np.quantile(wpos, q))
+            if np.isfinite(cap) and cap > 0:
+                w = np.minimum(w, cap)
+
+    # Sanity: need enough kept weight mass to fit (K+1) params
+    if w.sum() <= 0:
+        raise ValueError("After chisq filtering + weighting, no SNPs remain for intercept regression (sum(w)=0).")
+    # not a strict requirement, but helps catch pathological filtering
+    if int((w > 0).sum()) < (K + 5):
+        raise ValueError(
+            f"Too few SNPs after chisq filtering for stable regression: kept={(w>0).sum()} < K+5={K+5}. "
+            "Relax chisq_threshold or check inputs."
+        )
+
+    wy = w * y
+
+    # ----------------------------
+    # total normal equations (p = K+1)
+    # ----------------------------
+    S00_tot = float(w.sum())
+    S0_tot = L.T @ w
+    LW = L * w[:, None]
+    SLL_tot = LW.T @ L
+    S0y_tot = float(wy.sum())
+    SLy_tot = L.T @ wy
+
+    p = K + 1
+    SXX_tot = np.empty((p, p), dtype=np.float64)
+    SXY_tot = np.empty((p,), dtype=np.float64)
+
+    SXX_tot[0, 0] = S00_tot
+    SXX_tot[0, 1:] = S0_tot
+    SXX_tot[1:, 0] = S0_tot
+    SXX_tot[1:, 1:] = SLL_tot
+
+    SXY_tot[0] = S0y_tot
+    SXY_tot[1:] = SLy_tot
+
+    # ----------------------------
+    # per-block contributions
+    # ----------------------------
+    SXX_blk = np.zeros((nblks, p, p), dtype=np.float64)
+    SXY_blk = np.zeros((nblks, p), dtype=np.float64)
+
+    for b in range(nblks):
+        s = int(blk_starts[b]); e = int(blk_ends[b])
+        if e <= s:
+            continue
+        Lb = L[s:e, :]
+        wb = w[s:e]
+        if wb.sum() <= 0:
+            continue
+        wyb = wy[s:e]
+
+        S00 = float(wb.sum())
+        S0  = Lb.T @ wb
+        SLy = Lb.T @ wyb
+        S0y = float(wyb.sum())
+        SLL = (Lb * wb[:, None]).T @ Lb
+
+        Sb = SXX_blk[b]
+        Sb[0, 0] = S00
+        Sb[0, 1:] = S0
+        Sb[1:, 0] = S0
+        Sb[1:, 1:] = SLL
+
+        tb = SXY_blk[b]
+        tb[0] = S0y
+        tb[1:] = SLy
+
+    # LOO systems
+    SXX = SXX_tot[None, :, :] - SXX_blk          # (B, p, p)
+    SXY = SXY_tot[None, :]    - SXY_blk          # (B, p)
+
+    # Some LOO replicates could end up with (almost) no weight if the dropped SNPs cluster.
+    # Solve only the valid ones; others -> NaN.
+    beta_j = np.full((nblks, p), np.nan, dtype=np.float64)
+    valid = SXX[:, 0, 0] > 0  # intercept weight mass in LOO replicate
+    if np.any(valid):
+        Sv = SXX[valid]
+        tv = SXY[valid]
+        try:
+            beta_j[valid] = np.linalg.solve(Sv, tv[..., None])[..., 0]
+        except np.linalg.LinAlgError:
+            # per-replicate fallback
+            for ii, b in enumerate(np.flatnonzero(valid)):
+                try:
+                    beta_j[b] = np.linalg.solve(SXX[b], SXY[b])
+                except np.linalg.LinAlgError:
+                    beta_j[b] = np.linalg.lstsq(SXX[b], SXY[b], rcond=None)[0]
+
+    # Full solve
     try:
         beta_full = np.linalg.solve(SXX_tot, SXY_tot)
     except np.linalg.LinAlgError:
         beta_full = np.linalg.lstsq(SXX_tot, SXY_tot, rcond=None)[0]
 
-    beta_all = np.vstack([beta_j, beta_full[None, :]])  # (B+1, K+1)
+    beta_all = np.vstack([beta_j, beta_full[None, :]])         # (B+1, p)
 
     # Scale slopes -> gamma
-    scale = nsnps_blk / np.sqrt(n1 * n2)                # (B+1, K)
-    gamma_all = scale * beta_all[:, 1:]                 # (B+1, K)
-    c_all = beta_all[:, 0]                              # (B+1,)
+    scale = nsnps_blk / sN                                      # (B+1, K)
+    gamma_all = scale * beta_all[:, 1:]                         # (B+1, K)
+    c_all = beta_all[:, 0]                                      # (B+1,)
     return gamma_all, c_all
 
 def compute_t1_all_jn(annot, y, blk_idx, nblks):
     """
-    Compute T1_all (B+1, K) where:
-      T1_all[b,k] = sum_{j not in block b} A[j,k] * y[j]   for b=0..B-1
-      T1_all[B,k] = sum_{j} A[j,k] * y[j]                 (full)
-
-    annot: (M,K), y: (M,), blk_idx: (M,)
+    Same math, faster:
+      T1_full = A^T y
+      T1_blk[b] = (A_b)^T y_b   for contiguous blocks
+      T1_LOO = full - blk
     """
     A = np.asarray(annot, dtype=np.float64, order="C")
     y = np.asarray(y, dtype=np.float64).ravel()
@@ -849,20 +840,32 @@ def compute_t1_all_jn(annot, y, blk_idx, nblks):
         raise ValueError("y length mismatch with annot")
     if blk_idx.size != M:
         raise ValueError("blk_idx length mismatch with annot")
-    if blk_idx.min() < 0 or blk_idx.max() >= nblks:
-        raise ValueError("blk_idx out of range")
 
-    # full T1
+    # Full: A^T y (BLAS)
     T1_full = A.T @ y  # (K,)
 
-    # per-block contribution: sum_{j in block b} A[j,k]*y[j]
-    T1_blk = np.zeros((nblks, K), dtype=np.float64)
-    tmp = np.empty(M, dtype=np.float64)
-    for k in range(K):
-        tmp[:] = A[:, k] * y
-        T1_blk[:, k] = np.bincount(blk_idx, weights=tmp, minlength=nblks).astype(np.float64, copy=False)
+    # Derive contiguous block bounds once
+    change = np.flatnonzero(blk_idx[1:] != blk_idx[:-1]) + 1
+    starts = np.concatenate(([0], change))
+    ends   = np.concatenate((change, [M]))
+    run_blk = blk_idx[starts]
 
-    # LOO = full - blk, plus full row at end
+    blk_starts = np.zeros(nblks, dtype=np.int64)
+    blk_ends   = np.zeros(nblks, dtype=np.int64)
+    for b in range(nblks):
+        blk_starts[b] = 0
+        blk_ends[b] = 0
+    for r, b in enumerate(run_blk):
+        blk_starts[b] = starts[r]
+        blk_ends[b] = ends[r]
+
+    T1_blk = np.zeros((nblks, K), dtype=np.float64)
+    for b in range(nblks):
+        s = int(blk_starts[b]); e = int(blk_ends[b])
+        if e <= s:
+            continue
+        T1_blk[b] = A[s:e, :].T @ y[s:e]   # gemv
+
     T1_all = np.empty((nblks + 1, K), dtype=np.float64)
     T1_all[:nblks] = T1_full[None, :] - T1_blk
     T1_all[nblks] = T1_full
@@ -870,24 +873,13 @@ def compute_t1_all_jn(annot, y, blk_idx, nblks):
 
 
 def solve_score_gamma_from_intercept_jn(
-    ld_sum_all,    # (B+1, K, K) = A^T L (LOO + full)
-    t1_all,        # (B+1, K)    = A^T y (LOO + full)
-    nsnps_blk,     # (B+1, K)    = M_k (LOO + full)
-    c_all,         # (B+1,)      = intercept estimates
+    ld_sum_all,
+    t1_all,
+    nsnps_blk,
+    c_all,
     n1, n2,
     ridge_rel=1e-12,
 ):
-    """
-    Two-step SUMCORE/SCORE plug-in solve for partitioned gamma using intercept c_all.
-
-    For each replicate b:
-      rhs = (t1_all[b] - nsnps_blk[b]*c_all[b]) / sqrt(n1*n2)
-      Solve: ld_sum_all[b] @ g = rhs,  where g = gamma / M (elementwise over columns)
-      Then:  gamma = M * g  (elementwise)
-
-    Returns:
-      gamma_all: (B+1, K)
-    """
     ld_sum_all = np.asarray(ld_sum_all, dtype=np.float64)
     t1_all = np.asarray(t1_all, dtype=np.float64)
     nsnps_blk = np.asarray(nsnps_blk, dtype=np.float64)
@@ -903,38 +895,44 @@ def solve_score_gamma_from_intercept_jn(
     if c_all.size != Bp1:
         raise ValueError("c_all must be (B+1,)")
 
-    n1 = float(n1); n2 = float(n2)
-    sN = np.sqrt(n1 * n2)
-
-    gamma_all = np.full((Bp1, K), np.nan, dtype=np.float64)
-
+    sN = np.sqrt(float(n1) * float(n2))
     I = np.eye(K, dtype=np.float64)
 
-    for b in range(Bp1):
-        Mvec = nsnps_blk[b].copy()  # (K,)
-        # rows with M=0 are meaningless; keep them NaN
-        badM = ~(np.isfinite(Mvec) & (Mvec > 0))
-        if np.all(badM):
-            continue
+    # rhs_all: (B+1, K)
+    rhs_all = (t1_all - nsnps_blk * c_all[:, None]) / sN
 
-        rhs = (t1_all[b] - Mvec * c_all[b]) / sN
-        rhs[badM] = np.nan
+    # If any empty/invalid bins exist, do the safe slow loop (preserves semantics).
+    badM = ~(np.isfinite(nsnps_blk) & (nsnps_blk > 0))
+    if np.any(badM):
+        gamma_all = np.full((Bp1, K), np.nan, dtype=np.float64)
+        for b in range(Bp1):
+            Mvec = nsnps_blk[b]
+            good = ~badM[b]
+            if not np.any(good):
+                continue
+            A = ld_sum_all[b][np.ix_(good, good)]
+            rhs = rhs_all[b][good]
 
-        A = ld_sum_all[b].copy()
+            tr = float(np.trace(A))
+            lam = ridge_rel * (tr / A.shape[0] if np.isfinite(tr) and tr != 0.0 else 1.0)
+            A_reg = A + lam * np.eye(A.shape[0], dtype=np.float64)
 
-        # ridge for stability (scaled to matrix magnitude)
-        tr = float(np.trace(A))
-        lam = ridge_rel * (tr / K if np.isfinite(tr) and tr != 0.0 else 1.0)
-        A_reg = A + lam * I
+            try:
+                g = np.linalg.solve(A_reg, rhs)
+            except np.linalg.LinAlgError:
+                g = np.linalg.lstsq(A_reg, rhs, rcond=None)[0]
 
-        # solve for g = gamma / M (column-wise scaling happens later)
-        try:
-            g = np.linalg.solve(A_reg, rhs)
-        except np.linalg.LinAlgError:
-            g = np.linalg.lstsq(A_reg, rhs, rcond=None)[0]
+            out = np.full(K, np.nan, dtype=np.float64)
+            out[good] = Mvec[good] * g
+            gamma_all[b] = out
+        return gamma_all
 
-        gamma = Mvec * g
-        gamma[badM] = np.nan
-        gamma_all[b] = gamma
+    # ---- fast stacked solve (no empty bins) ----
+    tr = np.trace(ld_sum_all, axis1=1, axis2=2)                  # (B+1,)
+    tr_eff = np.where(np.isfinite(tr) & (tr != 0.0), tr / K, 1.0)
+    lam = ridge_rel * tr_eff                                     # (B+1,)
+    A_reg = ld_sum_all + lam[:, None, None] * I[None, :, :]      # (B+1,K,K)
 
+    g_all = np.linalg.solve(A_reg, rhs_all[..., None])[..., 0]   # (B+1,K)
+    gamma_all = nsnps_blk * g_all                                 # (B+1,K)
     return gamma_all

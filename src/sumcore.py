@@ -16,6 +16,7 @@ class Sumcore:
         save_path=None,
         rg=None,
         ldscores=None,
+        ldscores_reg=None,   # LD scores used for regression (e.g., windowed LD scores)
         log=None,
         verbose=False,
         chisq_threshold=0,
@@ -23,8 +24,9 @@ class Sumcore:
         njack=None,
         out=None,
         # allele alignment
-        align_alleles=True,
+        align_alleles=False,
         drop_ambiguous=True,
+        collapse_reg_ld=False,
     ):
         self.log = log
         self.verbose = verbose
@@ -48,12 +50,13 @@ class Sumcore:
 
         self.phen_names = [os.path.basename(p)[:-8] for p in self.phen_dir]
 
-        # Trace (must be LD-score input)
+        # Trace (LD-score input)
         self.tr = Trace(
             bimpath=bim_path,
             sumpath=None,
             savepath=save_path,
             ldscores=ldscores,
+            ldscores_reg=ldscores_reg,
             log=self.log,
             nblks=njack,
             annot=annot,
@@ -61,6 +64,11 @@ class Sumcore:
         )
         if self.tr.ldscores is None:
             raise RuntimeError("SUM-CORE requires LD-score input (Trace.ldscores is None).")
+
+        if getattr(self.tr, "ldscores_reg", None) is not None:
+            self.log._log("[rg] Using ldscores_reg for intercept regression; using ldscores for SCORE normal equation.")
+        else:
+            self.log._log("[rg] ldscores_reg not provided; using ldscores for both intercept regression and SCORE solve.")
 
         self.nblks = self.tr.nblks
         self.nbins = self.tr.nbins
@@ -78,11 +86,12 @@ class Sumcore:
         self.rg = np.full((B + 1, K), np.nan, dtype=np.float64)
         self.rg_se = np.full((K,), np.nan, dtype=np.float64)
 
-        # univariate h2 outputs (NEW)
+        # univariate h2 outputs
         self.h2 = np.full((2, B + 1, K), np.nan, dtype=np.float64)
         self.h2_se = np.full((2, K), np.nan, dtype=np.float64)
         self.h2_total = np.full((2, B + 1), np.nan, dtype=np.float64)
         self.h2_total_se = np.full((2,), np.nan, dtype=np.float64)
+
 
     def _make_sumstats(self, annot_df):
         return Sumstats(
@@ -248,7 +257,7 @@ class Sumcore:
                 "(should be identical in annotation order)."
             )
 
-        # 5) Rematch sumstats to annot_df_final using cached arrays (NO reread), then compute RHS
+        # 5) Rematch sumstats to annot_df_final using cached arrays (w/o reread), then compute RHS
         ss0.rematch_and_recompute(annot_df_final)
         ss1.rematch_and_recompute(annot_df_final)
 
@@ -303,86 +312,113 @@ class Sumcore:
 
     def _precompute_h2_overlap_terms(self):
         """
-        Precompute overlap/count terms needed by SUMRHE-style h2 calculation.
-        In SUMCORE, Trace has already been filtered to the final shared SNP set,
-        so these terms are shared by both phenotypes.
+        Precompute overlap/mass terms needed by SUMRHE-style h2 calculation.
+        For continuous/overlapping annotations, "counts" here are bin masses:
+            A_k = sum_j a_{j,k}
+        not necessarily integer SNP counts.
         """
         A = np.asarray(self.tr.annot, dtype=np.float32, order="C")  # (M, K)
         M, K = A.shape
         B = self.nblks
 
-        # Full overlaps and counts
+        # Full overlaps and bin masses
         overlap_full = A.T @ A              # (K, K)
-        counts_full = A.sum(axis=0)         # (K,)
+        mass_full = A.sum(axis=0)           # (K,)
 
-        # Block boundaries in the *filtered* SNP order
-        bs = self.tr.blk_size
-        starts = bs * np.arange(B, dtype=np.int64)
-        ends = starts + bs
-        if B > 0:
-            ends[-1] = self.tr.nsnps
+        # Prefer Trace's own block bounds if present
+        if hasattr(self.tr, "_blk_starts") and hasattr(self.tr, "_blk_ends"):
+            starts = np.asarray(self.tr._blk_starts, dtype=np.int64)
+            ends   = np.asarray(self.tr._blk_ends,   dtype=np.int64)
+            if starts.size != B or ends.size != B:
+                raise RuntimeError("Trace._blk_starts/_blk_ends shape mismatch with nblks.")
+        else:
+            # Derive contiguous bounds from blk_idx (recommended)
+            blk_idx = np.asarray(self.tr.blk_idx, dtype=np.int64).ravel()
+            if blk_idx.size != M:
+                raise RuntimeError("Trace.blk_idx length mismatch with Trace.annot.")
+            if blk_idx.min() < 0 or blk_idx.max() >= B:
+                raise RuntimeError("Trace.blk_idx out of range [0, nblks-1].")
+
+            # Check contiguity: blk_idx should be nondecreasing if blocks are contiguous slices
+            if np.any(blk_idx[1:] < blk_idx[:-1]):
+                raise RuntimeError("Trace.blk_idx is not nondecreasing; cannot form contiguous block slices safely.")
+
+            # starts/ends per block id
+            starts = np.full(B, -1, dtype=np.int64)
+            ends   = np.full(B, -1, dtype=np.int64)
+            # first occurrence
+            changes = np.flatnonzero(np.r_[True, blk_idx[1:] != blk_idx[:-1]])
+            for i, s in enumerate(changes):
+                b = blk_idx[s]
+                if starts[b] != -1:
+                    raise RuntimeError(f"Block id {b} appears in multiple segments; blk_idx is not contiguous.")
+                starts[b] = s
+                # end is next change or M
+                e = changes[i + 1] if (i + 1) < changes.size else M
+                ends[b] = e
+
+            if np.any(starts < 0) or np.any(ends < 0):
+                raise RuntimeError("Some jackknife blocks are empty or missing in blk_idx.")
 
         overlap_blk = np.empty((B, K, K), dtype=np.float32)
-        counts_blk = np.empty((B, K), dtype=np.float32)
+        mass_blk    = np.empty((B, K),     dtype=np.float32)
 
-        for j in range(B):
-            ab = A[starts[j]:ends[j], :]
-            overlap_blk[j] = ab.T @ ab
-            counts_blk[j] = ab.sum(axis=0)
+        for b in range(B):
+            ab = A[int(starts[b]):int(ends[b]), :]
+            overlap_blk[b] = ab.T @ ab
+            mass_blk[b]    = ab.sum(axis=0)
 
         self._h2_overlap_full = overlap_full
-        self._h2_counts_full = counts_full
-        self._h2_overlap_blk = overlap_blk
-        self._h2_counts_blk = counts_blk
+        self._h2_mass_full    = mass_full
+        self._h2_overlap_blk  = overlap_blk
+        self._h2_mass_blk     = mass_blk
+
 
     def _estimate_univariate_h2(self):
         """
-        SUMRHE-identical h2 calculation:
-        - per-category h2 uses overlap-aware mapping (A^T A / counts) @ sigma_g
-        - total h2 is sum_k sigma_gk (no sigma_e normalization)
-        - SEs computed via jackknife on (B+1, K+1) matrix
+        SUMRHE category h2 calculation using overlap/mass mapping:
+
+        h2_cat = ( (A^T A) / (sum_j a_{j,k}) ) @ sigma_g
+
+        Works for overlapping and continuous annotations as long as annotation weights are
+        nonnegative and Trace has been filtered to the final SNP set.
         """
         if not hasattr(self, "_h2_overlap_full"):
             self._precompute_h2_overlap_terms()
 
         overlap_full = self._h2_overlap_full      # (K, K)
-        counts_full = self._h2_counts_full        # (K,)
-        overlap_blk = self._h2_overlap_blk        # (B, K, K)
-        counts_blk = self._h2_counts_blk          # (B, K)
+        mass_full    = self._h2_mass_full         # (K,)
+        overlap_blk  = self._h2_overlap_blk       # (B, K, K)
+        mass_blk     = self._h2_mass_blk          # (B, K)
 
         B = self.nblks
         K = self.nbins
 
-        # allocate like SUMRHE: (trait, B+1, K+1) where last column is total h2
         if not hasattr(self, "herits"):
-            self.herits = np.full((2, B + 1, K + 1), np.nan, dtype=np.float64)
+            self.herits  = np.full((2, B + 1, K + 1), np.nan, dtype=np.float64)
             self.hersums = np.full((2, K + 1, 2), np.nan, dtype=np.float64)  # [point, SE]
 
-        # match SUMRHE nan_policy logic
         clip_nonfinite = bool(getattr(self, "clip_nonfinite_vals", False))
         nan_policy = "propagate" if clip_nonfinite else "omit"
 
-        # LOO overlaps/counts
+        # LOO overlaps/masses
         overlap_minus = overlap_full[None, :, :] - overlap_blk          # (B, K, K)
-        counts_minus = counts_full[None, :] - counts_blk                # (B, K)
+        mass_minus    = mass_full[None, :]       - mass_blk             # (B, K)
 
         with np.errstate(divide="ignore", invalid="ignore"):
-            ratio_minus = overlap_minus / counts_minus[:, None, :]      # (B, K, K)
-            ratio_full = overlap_full / counts_full[None, :]            # (K, K)
+            ratio_minus = overlap_minus / mass_minus[:, None, :]        # (B, K, K)
+            ratio_full  = overlap_full  / mass_full[None, :]            # (K, K)
 
         for t in range(2):
-            # LOO category h2: einsum over k
             sigma_g_minus = self.sigmas[t, :B, :K]                      # (B, K)
             h2_cat_minus = np.einsum("bck,bk->bc", ratio_minus, sigma_g_minus, optimize=True)
 
             bad_minus = ~np.isfinite(h2_cat_minus)
             if clip_nonfinite:
-                h2_cat_minus[bad_minus] = 0.0  # SUMRHE legacy option
-            # else: keep NaNs; jackknife will omit
+                h2_cat_minus[bad_minus] = 0.0
 
             self.herits[t, :B, :K] = h2_cat_minus
 
-            # Full category h2
             h2_cat_full = ratio_full @ self.sigmas[t, B, :K]            # (K,)
             bad_full = ~np.isfinite(h2_cat_full)
             if clip_nonfinite:
@@ -390,13 +426,15 @@ class Sumcore:
 
             self.herits[t, B, :K] = h2_cat_full
 
-            # Total h2 = sum sigma_g
+            # total h2 in your convention = sum sigma_g
             self.herits[t, :, -1] = self.sigmas[t, :, :K].sum(axis=1)
 
-            # Jackknife summaries (point + SE), identical to SUMRHE
-            est_full, se_jk = utils._calc_jackknife_se(self.herits[t], axis=0, center="full", nan_policy=nan_policy)
+            est_full, se_jk = utils._calc_jackknife_se(
+                self.herits[t], axis=0, center="full", nan_policy=nan_policy
+            )
             self.hersums[t, :, 0] = est_full
             self.hersums[t, :, 1] = se_jk
+
 
 
     def _estimate_gamma_and_rg(self):
@@ -404,40 +442,103 @@ class Sumcore:
         z2 = self.sums[1].zscores
         y = z1 * z2
 
-        l2_bins = self.tr.ldscores          # (M, K)
-        nsnps_blk = self.tr.nsnps_blk       # (B+1, K)
+        # Estimation LD scores (must match annotation bins)
+        l2_bins_score = np.asarray(self.tr.ldscores, dtype=np.float64, order="C")  # (M, K_est)
+        nsnps_blk_est = np.asarray(self.tr.nsnps_blk, dtype=np.float64)            # (B+1, K_est)
 
-        # Step 1: robust intercept via smoothed-weight regression (ignore slopes)
+        M, K_est = l2_bins_score.shape
+        if y.size != M:
+            raise RuntimeError(f"Internal mismatch: y has {y.size} SNPs but Trace has M={M}.")
+
+        # ----------------------------
+        # 1D LD regressor for intercept regression
+        # ----------------------------
+        Lreg = getattr(self.tr, "ldscores_reg", None)
+
+        if Lreg is None:
+            # If user didn't provide ldscores_reg, only allow intercept regression if primary is already 1D
+            if K_est == 1:
+                L1 = l2_bins_score  # (M,1)
+                self.log._log("[rg] ldscores_reg not provided; using primary ldscores (already 1D) for intercept regression.")
+            else:
+                raise RuntimeError(
+                    "Intercept regression requires 1D --ldscores-reg by default.\n"
+                    "You provided no --ldscores-reg and primary ldscores has multiple columns.\n"
+                    "Provide a 1D ldscores_reg (recommended) OR pass --collapse-reg-ld to collapse ldscores_reg/primary to 1D."
+                )
+        else:
+            Lreg = np.asarray(Lreg, dtype=np.float64, order="C")
+            if Lreg.ndim == 1:
+                if Lreg.shape[0] != M:
+                    raise RuntimeError(f"ldscores_reg length {Lreg.shape[0]} != M={M}")
+                L1 = Lreg.reshape(M, 1)
+                self.log._log("[rg] Using provided 1D ldscores_reg for intercept regression.")
+            elif Lreg.ndim == 2:
+                if Lreg.shape[0] != M:
+                    raise RuntimeError(f"ldscores_reg has M={Lreg.shape[0]} SNPs but Trace has M={M}")
+                K_reg = Lreg.shape[1]
+                if K_reg == 1:
+                    L1 = Lreg
+                    self.log._log("[rg] Using provided 1-column ldscores_reg for intercept regression.")
+                else:
+                    if not self.collapse_reg_ld:
+                        raise RuntimeError(
+                            f"--ldscores-reg must be 1D by default, but got {K_reg} columns.\n"
+                            "If you really want to collapse multi-column regression LD scores to 1D total LD, pass --collapse-reg-ld."
+                        )
+                    # "Stable" collapse: sum in float64, keep shape (M,1)
+                    L1 = np.sum(Lreg, axis=1, dtype=np.float64, keepdims=True)
+                    self.log._log(
+                        f"[rg] Collapsing ldscores_reg from {K_reg} columns to 1D total LD for intercept regression (--collapse-reg-ld)."
+                    )
+            else:
+                raise RuntimeError("ldscores_reg must be a vector (M,) or matrix (M,K).")
+
+        # nsnps_blk for regression step is only needed for shape scaling (gamma output ignored).
+        # Use total SNP mass per block as a (B+1,1) placeholder.
+        nsnps_blk_reg = np.sum(nsnps_blk_est, axis=1, keepdims=True)  # (B+1,1)
+
+        # chisq filter only for intercept regression
+        intercept_chisq_thr = getattr(self, "intercept_chisq_threshold", 30.0)
+        if intercept_chisq_thr is not None:
+            chisq1 = z1 * z1
+            chisq2 = z2 * z2
+        else:
+            chisq1 = None
+            chisq2 = None
+
+        # Step 1: estimate intercept (LOO), using 1D LD regressor
         _, c_all = utils.bivariate_regression_partitioned_jn(
-            l2_bins=l2_bins,
+            l2_bins=L1,                     # (M,1)
             y=y,
             nblks=self.nblks,
             n1=self.nsamp[0],
             n2=self.nsamp[1],
-            nsnps_blk=nsnps_blk,
+            nsnps_blk=nsnps_blk_reg,        # (B+1,1)
             blk_idx=self.tr.blk_idx,
-            segment_ids=getattr(self.tr, "chr", None),          # smooth within chr if available
-            positions_bp=getattr(self.tr, "bp", None),          # bp window smoothing if available
-            smooth_bp_window=getattr(self, "smooth_bp_window", None),  # set on Sumcore if you want
-            smooth_window=getattr(self, "smooth_window", 501),         # fallback
             weight_floor=getattr(self, "weight_floor", None),
+            weight_cap_quantile=getattr(self, "weight_cap_quantile", None),
+            chisq1=chisq1,
+            chisq2=chisq2,
+            chisq_threshold=intercept_chisq_thr,
+            chisq_mode="either",
         )
         self.c_opt = c_all
 
-        # Step 2: plug intercept into SCORE normal equations (partitioned)
-        ld_sum_all = self.tr.get_ldsum_all(use_cache=True)  # (B+1, K, K)
+        # Step 2: SCORE normal equations (ALL SNPs) with summary stats, using estimation bins
+        ld_sum_all = self.tr.get_ldsum_all(use_cache=True)  # from self.tr.ldscores (B+1, K_est, K_est)
 
         t1_all = utils.compute_t1_all_jn(
-            annot=self.tr.annot,          # (M, K)
+            annot=self.tr.annot,          # (M, K_est)
             y=y,                          # (M,)
-            blk_idx=self.tr.blk_idx,      # exact Trace blocks
+            blk_idx=self.tr.blk_idx,
             nblks=self.nblks,
-        )                                 # (B+1, K)
+        )                                 # (B+1, K_est)
 
         self.gamma_g = utils.solve_score_gamma_from_intercept_jn(
             ld_sum_all=ld_sum_all,
             t1_all=t1_all,
-            nsnps_blk=nsnps_blk,
+            nsnps_blk=nsnps_blk_est,      # (B+1, K_est)
             c_all=c_all,
             n1=self.nsamp[0],
             n2=self.nsamp[1],
@@ -448,62 +549,54 @@ class Sumcore:
         _, se = utils._calc_jackknife_se(self.gamma_g, axis=0, center="full", nan_policy="propagate")
         self.gamma_se = se
 
-        # rg per bin (same as your current normalization)
-        K = self.nbins
-        v1 = self.sigmas[0, :, :K]
-        v2 = self.sigmas[1, :, :K]
-        denom = v1 * v2
+        # rg per bin
+        v1 = self.sigmas[0, :, :K_est]
+        v2 = self.sigmas[1, :, :K_est]
         with np.errstate(divide="ignore", invalid="ignore"):
-            self.rg = self.gamma_g / np.sqrt(denom)
+            self.rg = self.gamma_g / np.sqrt(v1 * v2)
         self.rg[~np.isfinite(self.rg)] = np.nan
 
         _, se_rg = utils._calc_jackknife_se(self.rg, axis=0, center="full", nan_policy="omit")
         self.rg_se = se_rg
+
 
     # ---------------------------- run / logging ---------------------------- #
 
     def _run(self):
         self._prepare_final_snpset_and_filter_trace()
         self._estimate_univariate_sigmas()
-        self._estimate_univariate_h2()      # NEW
+        self._estimate_univariate_h2()
         self._estimate_gamma_and_rg()
         self._log_results()
 
     def _log_results(self):
         K = self.nbins
+        M = float(self.tr.nsnps)
 
-        # ---------- enrichment denominator: SNP proportions (from Trace) ----------
-        Mbin = np.asarray(getattr(self.tr, "nsnps_bin", None), dtype=np.float64)
-        if Mbin is None or Mbin.shape[0] != K:
-            # fallback: use full row of nsnps_blk if needed
-            Mbin = np.asarray(self.tr.nsnps_blk[-1], dtype=np.float64)
-        Mtot = float(np.nansum(Mbin))
+        # Bin mass Ak (sum of annotation weights) for full sample
+        Ak = np.asarray(self.tr.annot, dtype=np.float64).sum(axis=0)  # (K,)
 
         def _enrichment(h2_cat, h2_tot):
             with np.errstate(divide="ignore", invalid="ignore"):
                 prop_h2 = h2_cat / h2_tot
-                prop_m = Mbin / Mtot
+                prop_m  = Ak / M
                 enr = prop_h2 / prop_m
-            enr[~np.isfinite(enr)] = np.nan
+            enr[(~np.isfinite(enr)) | (prop_m <= 0.0)] = np.nan
             return enr
 
-        # ---------- sigma_g^2 SEs from jackknife ----------
-        # sigmas[t] has shape (B+1, K+2); genetic bins are [:,:K]
+        # sigma_g^2 SEs from jackknife
         sigma_se = np.full((2, K), np.nan, dtype=np.float64)
         for t in range(2):
             _, se = utils._calc_jackknife_se(self.sigmas[t, :, :K], axis=0, center="full", nan_policy="propagate")
             sigma_se[t] = se
 
-        # ---------- print per-trait blocks (SUMRHE style) ----------
+        # per-trait blocks
         for t in range(2):
-            phen_name = self.phen_names[t]
-
-            # per-bin point estimates
             sigma_full = self.sigmas[t, -1, :K]
-            h2_full = self.hersums[t, :K, 0]
-            h2_se = self.hersums[t, :K, 1]
-            h2_tot = float(self.hersums[t, -1, 0])
-            h2_tot_se = float(self.hersums[t, -1, 1])
+            h2_full    = self.hersums[t, :K, 0]
+            h2_se      = self.hersums[t, :K, 1]
+            h2_tot     = float(self.hersums[t, -1, 0])
+            h2_tot_se  = float(self.hersums[t, -1, 1])
 
             enr = _enrichment(h2_full, h2_tot)
 
@@ -519,8 +612,7 @@ class Sumcore:
                 f"^^^ Phenotype [{self.names[t]}] Total SNP heritability (h^2): {h2_tot:.6g} SE: {h2_tot_se:.6g}"
             )
 
-        # ---------- cross-trait block ----------
-        # intercept c + SE
+        # cross-trait
         c_full, c_se = utils._calc_jackknife_se(self.c_opt, axis=0, center="full", nan_policy="propagate")
         self.log._log(
             f"^^^ Phenotype [{self.names[0]}] & [{self.names[1]}] Intercept (c): {float(c_full):.6g} (SE: {float(c_se):.6g})"
@@ -533,11 +625,10 @@ class Sumcore:
                 f"rg: {self.rg[-1, j]:.6g} (SE: {self.rg_se[j]:.6g})"
             )
 
-        # Optional totals (nice in practice)
+        # Totals
         gamma_tot = np.nansum(self.gamma_g, axis=1)  # (B+1,)
         g_full, g_se = utils._calc_jackknife_se(gamma_tot, axis=0, center="full", nan_policy="propagate")
 
-        # total h2 per replicate (we already store per-rep total h2 in herits)
         h2_0 = np.asarray(self.herits[0, :, -1], dtype=np.float64)
         h2_1 = np.asarray(self.herits[1, :, -1], dtype=np.float64)
         with np.errstate(divide="ignore", invalid="ignore"):

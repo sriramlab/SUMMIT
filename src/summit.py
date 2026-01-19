@@ -12,7 +12,9 @@ from pathlib import Path
 import tempfile
 import os
 
-parser = argparse.ArgumentParser(description='SUMMIT: integrated tool for heritability & genetic correlation')
+parser = argparse.ArgumentParser(description='SUMMIT: Summary-stats-based Unified Method for Multivariate Inference of Traits')
+
+# Trace/LHS arguments
 parser.add_argument("--trace", default=None, type=str, \
                     help='File path for trace summary statistics (.tr) and corresponding metadata (.MN).'
                      ' If the path is a directory, all trace summaires (ending with .tr) will be used by aggregating them.')
@@ -20,24 +22,56 @@ parser.add_argument("--save-trace", default=None, type=str, \
                     help='File path for saving (aggregated) trace summaries (.tr) and corresponding metadata (.MN)')
 parser.add_argument("--bim", default=None, type=str, \
                     help='File path for the reference .bim file used for trace calculation (required for trace summaries).')
-parser.add_argument("--max-chisq", action='store', default=None, type=float, \
-                    help='Filter out SNPs with chi-sq statistic above the threshold.'
-                    ' This can be done either only on the yKy or on both sides (use --filter-both-sides);'
-                    ' with many non-polygenic SNPs, one-sided filtering might not be accurate')
 parser.add_argument("--ldscores", default=None, type=str, \
                     help='File path for LD scores of the reference SNPs. You may use either the traditional (truncated) LD scores (.l2.ldscore.gz) or genome-wide stochastic LD scores (.gw.ldscore.gz)')
+parser.add_argument("--ldscores-reg", default=None, type=str, \
+                    help='File path for LD scores of the reference SNPs used for regression (optional). This is in case the primary ld scores are noisy (stochastic) and may not work for genetic correlation regression.')
+parser.add_argument("--collapse-reg-ld", action="store_true", default=False,\
+                    help='Collapse partitioned LD scores used for bivariate regression (step 1 of SUMCORE) into 1D for stability. We recommend using a native 1D (unpartitioned) LD scores for --ldscores-reg for better results.')
+
+# Sumstats/RHS arguments
+parser.add_argument("--h2", default=None, type=str, \
+                   help='File path for phenotype-specific summary statistics (.sumstat[.gz]) to estimate heritability.'
+                    ' If the path is a directory, all summary statistics (ending with .sumstat[.gz]) will be used.')
+parser.add_argument("--rg", default=None, type=str, \
+                   help='Comma-separated file path for a pair of phenotype-specific summary statistics (.sumstat[.gz]) to estimate genetic correlation (rg).')
+parser.add_argument("--max-chisq", action='store', default=None, type=float, \
+                    help='Filter out SNPs with chi-sq statistic above the threshold. This can be done either only on the yKy or on both sides (use --filter-both-sides); with many non-polygenic SNPs, one-sided filtering might not be accurate')
+
+# Additional input arguments
+parser.add_argument("--annot", default=None, type=str, \
+                    help='Path of the annotation file (only if using partitioned heritability)')
+parser.add_argument("--thin-annot", action='store_true', default=False, \
+                    help='Use thin annotation (annotation matrix only) instead of full annotation file')
+
+# Output arguments
 parser.add_argument("--out", default=None, type=str, \
                     help='Output file path to save the analysis log and result (.log) or the genome-wide LD scores (.gw.ldscore.gz)')
 parser.add_argument("--verbose", action="store_true", default=False,\
                     help='Verbose mode: print out the normal equations')
 parser.add_argument("--suppress", action="store_true", default=False,\
                     help='Suppress mode: do not print out the outputs to stdout (log file only)')
+parser.add_argument("--allow-neg-enr", action="store_true", default=False,\
+                    help='Allow negative enrichment estimates. Default is False.')
+parser.add_argument("--clip-nonfinite-vals", action="store_true", default=False,\
+                    help='Clip nonfinite estimates of h2 and tau to 0.0. Default is False.')
+
+# SE arguments
 parser.add_argument("--njack", default=100, type=int, \
-                    help='Number of jackknife blocks (only if using LD scores as input)')
-parser.add_argument("--annot", default=None, type=str, \
-                    help='Path of the annotation file (only if using partitioned heritability)')
-parser.add_argument("--thin-annot", action='store_true', default=False, \
-                    help='Use thin annotation (annotation matrix only) instead of full annotation file')
+                    help='Number of jackknife blocks (only if using LD scores as input). Default is 100.')
+parser.add_argument("--adjust-delta", action="store_true", default=False, \
+                    help='Adjust for higher-moment deviations in LD scores due to non-normality. Default if False.')
+
+# Genetic correlation arguments
+# parser.add_argument("--intercept-rg", action='store', default=None, type=float, \
+#                     help="Constrain the intercept (LDSC-style) for genetic correlation calculation. This is equivalent to N*rho_e / sqrt(N1*N2); note we ask for covariance of environmental factor, not the correlation!")
+                    #TODO: in our framework, it might be better to provide N*rho_e instead of N*gamma_e, since our estimates of \sigma^2_e are a lot more accurate?
+# parser.add_argument("--pheno-rg", default=None, type=str, \
+#                     help="Comma-separated file path for a pair of (overlapping) individual-level phenotypes used in the pair of summary statistics (--rg). "
+#                     "This option may yield more accurate estimates (alternative to --intercept-rg).")
+
+
+# Genome-wide & windowed LD score arguments
 parser.add_argument("--geno", default=None, type=str, \
                     help='Path of the genotype file to calculate the genome-wide LD scores. Calculates partitioned scores if --annot is also specified.')
 parser.add_argument("--nvecs", default=1000, type=int, \
@@ -46,19 +80,8 @@ parser.add_argument("--step_size", default=1000, type=int, \
                     help='Number of SNPs to process in each step of estimating stochastic genome-wide LD scores. Default is 1000.')
 parser.add_argument("--seed", default=None, type=int, \
                     help='Seed for estimating stochastic genome-wide LD scores. If not specified, the default numpy (pseudo) random number generator will be used.')
-parser.add_argument("--h2", default=None, type=str, \
-                   help='File path for phenotype-specific summary statistics (.sumstat[.gz]) to estimate heritability.'
-                    ' If the path is a directory, all summary statistics (ending with .sumstat[.gz]) will be used.')
-parser.add_argument("--rg", default=None, type=str, \
-                   help='Comma-separated file path for a pair of phenotype-specific summary statistics (.sumstat[.gz]) to estimate genetic correlation (rg).')
 parser.add_argument("--covar", default=None, type=str, \
                     help='Path of the covariate file to adjust for when calculating the genome-wide LD scores. If not specified, no covariates adjustments are made.')
-parser.add_argument("--intercept-rg", action='store', default=None, type=float, \
-                    help="Constrain the intercept (LDSC-style) for genetic correlation calculation. This is equivalent to N*rho_e / sqrt(N1*N2); note we ask for covariance of environmental factor, not the correlation!")
-                    #TODO: in our framework, it might be better to provide N*rho_e instead of N*gamma_e, since our estimates of \sigma^2_e are a lot more accurate?
-parser.add_argument("--pheno-rg", default=None, type=str, \
-                    help="Comma-separated file path for a pair of (overlapping) individual-level phenotypes used in the pair of summary statistics (--rg). "
-                    "This option may yield more accurate estimates (alternative to --intercept-rg).")
 parser.add_argument("--rand-dist", default='spherical', type=str, \
                     help="Specify which distribution to use to generate random vectors ('normal', 'rademacher', 'spherical'). Default is spherical distribution.")
 parser.add_argument("--dtype", default='float32', type=str, \
@@ -67,13 +90,8 @@ parser.add_argument("--rand-samp", default=None, type=float, \
                     help="Select a random subset of the samples for LD score calculation. Pass a value between (0, 1] for a ratio, and an integer greater than 100 for the number of samples.)")
 parser.add_argument("--ddof", default=1, type=int, \
                     help="Specify the delta degrees of freedom (ddof) for estimating genome-wide LD scores. Default is 1 (empirical SD).")
-parser.add_argument("--allow-neg-enr", action="store_true", default=False,\
-                    help='Allow negative enrichment estimates. Default is False.')
-parser.add_argument("--clip-nonfinite-vals", action="store_true", default=False,\
-                    help='Clip nonfinite estimates of h2 and tau to 0.0. Default is False.')
-parser.add_argument("--adjust-delta", action="store_true", default=False, \
-                    help='Adjust for higher-moment deviations in LD scores due to non-normality. Default if False.')
 
+# LD score resource allocation arguments
 parser.add_argument("--num-threads", default=None, type=int, \
                     help='Cap the number of threads for BLAS to limit CPU usage. By default it will use all available ones.')
 parser.add_argument("--target-xz-mem", type=float, default=16.0,
@@ -82,6 +100,11 @@ parser.add_argument("--device", type=str, default='cpu',
                     help="Which device to use for GWLD computation. Default is cpu; to use GPU, specify cuda number (applied only for phase 2)")
 parser.add_argument("--use-tp32", action="store_true", default=False,\
                     help='Use tp32 for GPU. Default is False.')
+# Optional overrides for V-tiling
+parser.add_argument("--vchunk", type=int, default=None,
+                    help="Fixed V-chunk size. If set, disables auto memory-based guess.")
+parser.add_argument("--vtiles", type=int, default=None,
+                    help="Force number of V-tiles; the code will split V evenly into this many tiles.")
 
 # Low-level performance knobs
 parser.add_argument("--ctile", type=int, default=None,
@@ -97,15 +120,6 @@ parser.add_argument("--malloc-trim-threshold", type=int, default=131072)
 parser.add_argument("--malloc-mmap-threshold", type=int, default=131072)
 parser.add_argument("--numa-mode", default="interleave", choices=['interleave', 'membind', 'cpunodebind', 'preferred'])
 parser.add_argument("--numa-nodes", default="all")
-
-# Optional overrides for V-tiling (balanced split logic still applies)
-parser.add_argument("--vchunk", type=int, default=None,
-                    help="Fixed V-chunk size. If set, disables auto memory-based guess.")
-parser.add_argument("--vtiles", type=int, default=None,
-                    help="Force number of V-tiles; the code will split V evenly into this many tiles.")
-
-
-
 
 
 def _check_outdir(path_str: str, create: bool = True, log=None):
@@ -247,12 +261,12 @@ if __name__ == '__main__':
         if (args.ldscores is None):
             log._log("!!! LD score (truncated or genome-wide) must be provided for estimation of genetic correlation !!!")
             sys.exit(1)
-        if (args.intercept_rg is not None and args.pheno_rg is not None):
-            log._log("!!! --intercept-rg and --pheno-rg cannot be used together; please use one of the two options !!!")
-            sys.exit(1)
+        # if (args.intercept_rg is not None and args.pheno_rg is not None):
+        #     log._log("!!! --intercept-rg and --pheno-rg cannot be used together; please use one of the two options !!!")
+        #     sys.exit(1)
         rg = Sumcore(bim_path=args.bim, save_path=args.save_trace, rg=args.rg,\
             chisq_threshold=args.max_chisq, log=log, verbose=args.verbose, out=args.out, \
-            ldscores=args.ldscores, njack=args.njack, annot=args.annot)
+            ldscores=args.ldscores, ldscores_reg=args.ldscores_reg, njack=args.njack, annot=args.annot)
          
             #intercept=args.intercept_rg, phenos=args.pheno_rg
         rg._run()

@@ -15,21 +15,36 @@ import sys
 
 class Trace:
     def __init__(self, bimpath=None, sumpath=None, savepath=None, log=None,
-                 ldscores=None, nblks=100, annot=None, verbose=False, adjust_delta: bool=False):
+                 ldscores=None, ldscores_reg=None, nblks=100, annot=None,
+                 verbose=False, adjust_delta: bool=False):
         self.log = log
         self.sumpath = sumpath
         self.savepath = savepath
+
+        # Primary (stochastic, used for SUMCORE / trace)
         self.ldscorespath = ldscores
         self.ldscores = None
+        self.ldscores_df = None
+        self._ldscore_start_idx = None
+
+        # Secondary (windowed, used for regression / intercept)
+        self.ldscores_reg_path = ldscores_reg
+        self.ldscores_reg = None
+        self.ldscores_reg_df = None
+        self._ldscore_reg_start_idx = None
+        self.nbins_reg = None
+        self.chr_reg = None
+        self.bp_reg = None
+
         self.sums = []
-        self.nblks = nblks  # nblks specified only if using ld proj; otherwise overwritten by trace summaries.
+        self.nblks = nblks
         self.ntrace = 0
         self.K = []
         self.snplist = []
-        self.nsamp = []                # number of samples used for trace summaries (can vary)
-        self.nsnps = 0                 # total SNPs
-        self.nsnps_blk = None          # (B+1, K): LOO bin counts
-        self.nsnps_bin = None          # (K,)   : full bin counts (from annot)
+        self.nsamp = []
+        self.nsnps = 0
+        self.nsnps_blk = None
+        self.nsnps_bin = None
         self.verbose = verbose
         self.nbins = None
         self.effective_K = None
@@ -51,22 +66,106 @@ class Trace:
             self._read_all_trace()
             if (savepath is not None):
                 self._save_trace()
+
         elif (ldscores is not None):
-            self._read_ldscores()
+            # --- read primary LD-scores (SUMCORE) ---
+            self._read_ldscores(path=self.ldscorespath, which="main")
 
-        # Read annotations (thin or full .annot)
+            # --- optionally read regression LD-scores (windowed) and align to main order ---
+            if self.ldscores_reg_path is not None:
+                self._read_ldscores(path=self.ldscores_reg_path, which="reg")
+
+                # Align reg LD scores to main snp order; drop SNPs missing in reg from BOTH
+                snps_main = np.asarray(self.snplist, dtype=str)
+                reg_index = pd.Index(self.ldscores_reg_df["SNP"].astype(str).to_numpy())
+                idx = reg_index.get_indexer(snps_main)
+                keep = idx >= 0
+                n_drop = int((~keep).sum())
+                if n_drop > 0:
+                    self.log._log(
+                        f"Dropping {n_drop} SNPs from primary LD-scores because they are missing in ldscores_reg."
+                    )
+                    # filter main to SNPs that exist in reg
+                    snps_keep = snps_main[keep]
+                    main_aligned = self.ldscores_df.set_index("SNP").loc[snps_keep].reset_index()
+                    self.ldscores_df = main_aligned
+
+                    # recompute main arrays
+                    sidx = self._ldscore_start_idx
+                    self.ldscores = main_aligned.iloc[:, sidx:].to_numpy(dtype=np.float64, copy=False)
+                    self.chr = main_aligned["CHR"].to_numpy(dtype=np.int32, copy=False)
+                    self.bp  = main_aligned["BP"].to_numpy(dtype=np.int64, copy=False)
+                    self.snplist = snps_keep.tolist()
+                    self.nsnps = int(self.ldscores.shape[0])
+
+                # reorder reg to match (possibly reduced) main order
+                snps_main2 = np.asarray(self.snplist, dtype=str)
+                reg_aligned = self.ldscores_reg_df.set_index("SNP").loc[snps_main2].reset_index()
+                self.ldscores_reg_df = reg_aligned
+
+                sidxr = self._ldscore_reg_start_idx
+                self.ldscores_reg = reg_aligned.iloc[:, sidxr:].to_numpy(dtype=np.float64, copy=False)
+                self.chr_reg = reg_aligned["CHR"].to_numpy(dtype=np.int32, copy=False)
+                self.bp_reg  = reg_aligned["BP"].to_numpy(dtype=np.int64, copy=False)
+                self.nbins_reg = int(self.ldscores_reg.shape[1])
+
+                self.log._log(
+                    f"Loaded ldscores_reg with {self.ldscores_reg.shape[0]} SNPs and {self.ldscores_reg.shape[1]} bins "
+                    f"(aligned to primary SNP order)."
+                )
+
+        # Read annotations
         self._read_annot(annot)
-        
-        # Base SNP universe (for fast filtering); annot_df is kept as base by design
-        self._base_snps = self.annot_df['SNP'].astype(str).to_numpy()
-        self.snp_index = pd.Index(self._base_snps)  # exposed for other modules too
 
-        # Base arrays (no copy; these are the "unfiltered" aligned arrays)
+        # If regression LD is present, prune it to match annotation-filtered SNP list
+        # (annotation can drop SNPs; we must keep ldscores_reg aligned)
+        if (self.ldscores_reg_df is not None) and (self.snplist is not None) and (len(self.snplist) > 0):
+            snps_now = np.asarray(self.snplist, dtype=str)
+            reg_index_now = self.ldscores_reg_df.set_index("SNP")
+            missing = ~pd.Index(snps_now).isin(reg_index_now.index)
+            if missing.any():
+                # This *should* be rare; safest is to drop these SNPs from everything.
+                miss_snps = snps_now[missing].tolist()
+                self.log._log(
+                    f"Dropping {len(miss_snps)} SNPs because they are missing in ldscores_reg after annotation pruning."
+                )
+                # Use _filter_snps on these SNPs once base arrays exist; for now do a direct keep mask
+                keep_mask_tmp = ~missing
+                # apply keep to annot/snplist and primary LD immediately
+                self.snplist = snps_now[keep_mask_tmp].tolist()
+                self.annot = np.asarray(self.annot)[keep_mask_tmp, :]
+                self.nsnps = int(len(self.snplist))
+                if self.ldscores is not None:
+                    self.ldscores = np.asarray(self.ldscores)[keep_mask_tmp, :]
+                    self.chr = np.asarray(self.chr)[keep_mask_tmp]
+                    self.bp  = np.asarray(self.bp)[keep_mask_tmp]
+                # and reg LD
+                reg_aligned2 = reg_index_now.loc[self.snplist].reset_index()
+                self.ldscores_reg_df = reg_aligned2
+                sidxr = self._ldscore_reg_start_idx
+                self.ldscores_reg = reg_aligned2.iloc[:, sidxr:].to_numpy(dtype=np.float64, copy=False)
+                self.chr_reg = reg_aligned2["CHR"].to_numpy(dtype=np.int32, copy=False)
+                self.bp_reg  = reg_aligned2["BP"].to_numpy(dtype=np.int64, copy=False)
+                self.nbins_reg = int(self.ldscores_reg.shape[1])
+
+        # Base SNP universe (for fast filtering)
+        self._base_snps = self.annot_df['SNP'].astype(str).to_numpy()
+        self.snp_index = pd.Index(self._base_snps)
+
+        # Base arrays (no copy; unfiltered aligned arrays)
         self._annot_base = np.asarray(self.annot)
         if self.ldscores is not None:
             self._ldscores_base = np.asarray(self.ldscores)
         else:
             self._ldscores_base = None
+
+        # Also cache reg LD as base if present
+        if self.ldscores_reg is not None:
+            self._ldscores_reg_base = np.asarray(self.ldscores_reg)
+        else:
+            self._ldscores_reg_base = None
+
+        # chr/bp bases
         if self._ldscores_base is not None:
             if not hasattr(self, "chr") or not hasattr(self, "bp"):
                 raise RuntimeError("Trace: expected chr/bp to be available when using LD-scores.")
@@ -76,10 +175,20 @@ class Trace:
             self._chr_base = None
             self._bp_base  = None
 
-        # Precompute block starts/ends if we already know nsnps/nblks
+        if self._ldscores_reg_base is not None:
+            if (self.chr_reg is None) or (self.bp_reg is None):
+                raise RuntimeError("Trace: expected chr_reg/bp_reg to be available when using ldscores_reg.")
+            self._chr_reg_base = np.asarray(self.chr_reg)
+            self._bp_reg_base  = np.asarray(self.bp_reg)
+        else:
+            self._chr_reg_base = None
+            self._bp_reg_base  = None
+
+        # Precompute block bounds
         if (self.nsnps > 0) and (self.nblks > 0) and not hasattr(self, "blk_size"):
             self.blk_size = max(self.nsnps // self.nblks, 1)
         self._refresh_block_bounds()
+
 
     # ---------------------------- I/O & setup ---------------------------- #
 
@@ -184,7 +293,7 @@ class Trace:
 
 
         except ValueError:
-            # thin annotation (unchanged)
+            # thin annotation
             if (not self.snplist):
                 raise ValueError("!!! Thin annotation requires a BIM/snplist when using trace-summaries !!!")
             self.annot_header, self.annot = utils._read_with_optional_header(annot_path)
@@ -290,14 +399,23 @@ class Trace:
         self.sums = np.average(self.sums, axis=0, weights=self.nsamp)
         self.nsamp = float(np.mean(self.nsamp))
 
-    def _read_ldscores(self):
+    def _read_ldscores(self, path: str | None = None, which: str = "main"):
         """
-        Read the LD-score matrix instead of trace summaries.
+        Read an LD-score matrix.
         Supports either CHR,BP,SNP,(optional CM), then LD-score columns.
-        """
-        self.ldscores_df = pd.read_csv(self.ldscorespath, compression='gzip', sep=r'\s+', index_col=False)
 
-        ldcols = self.ldscores_df.columns.tolist()
+        which="main": populates self.ldscores / self.ldscores_df / self.snplist / self.chr,bp / self.nsnps,self.nbins
+        which="reg" : populates self.ldscores_reg / self.ldscores_reg_df / self.chr_reg,bp_reg / self.nbins_reg
+                      (does NOT override snplist order)
+        """
+        if path is None:
+            path = self.ldscorespath if which == "main" else self.ldscores_reg_path
+        if path is None:
+            raise ValueError("Trace._read_ldscores: path is None")
+
+        df = pd.read_csv(path, compression='infer', sep=r'\s+', index_col=False)
+
+        ldcols = df.columns.tolist()
         first4 = ldcols[:4]
         must = {'CHR', 'BP', 'SNP'}
         if not must.issubset(set(first4)):
@@ -307,35 +425,60 @@ class Trace:
             )
 
         start_idx = 4 if ('CM' in first4) else 3
-        self._ldscore_start_idx = start_idx
 
-        snps = self.ldscores_df['SNP'].astype(str).to_numpy()
-        L = self.ldscores_df.iloc[:, start_idx:].to_numpy(dtype=np.float64, copy=False)
+        snps = df['SNP'].astype(str).to_numpy()
+        L = df.iloc[:, start_idx:].to_numpy(dtype=np.float64, copy=False)
 
         # Drop non-finite LD-score rows
         finite_row = np.isfinite(L).all(axis=1)
-        keep = finite_row
+        if (which == "reg"):
+            # Drop rows with non-positive total LD score
+            ltot = L.sum(axis=1)
+            good_ltot = np.isfinite(ltot) & (ltot > 0.1)
+            keep = finite_row & good_ltot
+        else:
+            keep = finite_row
+        
         n_drop = int((~keep).sum())
         if n_drop > 0:
             self.log._log(
-                f"Dropping {n_drop} SNPs from LD-scores due to non-finite LD values "
+                f"Dropping {n_drop} SNPs from LD-scores ({which}) due to non-finite LD values "
                 f"or non-positive total LD score."
             )
-            self.ldscores_df = self.ldscores_df.loc[keep].reset_index(drop=True)
+            df = df.loc[keep].reset_index(drop=True)
             snps = snps[keep]
             L = L[keep, :]
 
-        self.ldscores = L
-        self.snplist = snps.tolist()
-        self.nsnps = self.ldscores.shape[0]
-        self.nbins = self.ldscores.shape[1]
-        self.chr = self.ldscores_df["CHR"].to_numpy(dtype=np.int32, copy=False)
-        self.bp = self.ldscores_df["BP"].to_numpy(dtype=np.int64, copy=False)
+        chr_ = df["CHR"].to_numpy(dtype=np.int32, copy=False)
+        bp_  = df["BP"].to_numpy(dtype=np.int64, copy=False)
 
-        self.log._log(
-            f"Loaded the LD score matrix with {self.nsnps} SNPs and {self.nbins} bins "
-            f"(dropped={n_drop})."
-        )
+        if which == "main":
+            self.ldscores_df = df
+            self.ldscores = L
+            self.snplist = snps.tolist()
+            self.nsnps = int(L.shape[0])
+            self.nbins = int(L.shape[1])
+            self.chr = chr_
+            self.bp = bp_
+            self._ldscore_start_idx = start_idx
+            self.log._log(
+                f"Loaded the LD score matrix with {self.nsnps} SNPs and {self.nbins} bins "
+                f"(dropped {n_drop})."
+            )
+        elif which == "reg":
+            self.ldscores_reg_df = df
+            self.ldscores_reg = L
+            self.nbins_reg = int(L.shape[1])
+            self.chr_reg = chr_
+            self.bp_reg = bp_
+            self._ldscore_reg_start_idx = start_idx
+            self.log._log(
+                f"Loaded the regression LD score matrix (ldscores_reg) with {L.shape[0]} SNPs and {L.shape[1]} bins "
+                f"(dropped {n_drop})."
+            )
+        else:
+            raise ValueError("which must be 'main' or 'reg'")
+
 
     # ---------------------------- public API ---------------------------- #
 
@@ -372,8 +515,6 @@ class Trace:
         out[:, K, K] = float(N - 1)
 
         return out
-
-
 
     def _calc_trace_from_ldscores(self, N: float):
         """
@@ -440,7 +581,7 @@ class Trace:
 
     # ---------------------------- filtering ---------------------------- #
     def _apply_keep_mask(self, keep_mask: np.ndarray):
-        """Apply keep-mask to base arrays; updates working annot/ldscores and cached counts."""
+        """Apply keep-mask to base arrays; updates working annot/ldscores (+ ldscores_reg) and cached counts."""
         if self._ldscores_base is None:
             return
 
@@ -448,20 +589,34 @@ class Trace:
         if keep_mask.ndim != 1 or keep_mask.size != self._base_snps.size:
             raise ValueError("keep_mask must be a 1D boolean mask over base SNPs.")
 
+        # ---- invalidate caches that depend on SNP-level arrays ----
+        if hasattr(self, "_ldsum_all_cache"):
+            delattr(self, "_ldsum_all_cache")
+
         self.nsnps = int(keep_mask.sum())
         self.snplist = self._base_snps[keep_mask].tolist()
 
-        # slice base arrays (fast, no pandas)
+        # slice base arrays
         self.annot = self._annot_base[keep_mask, :]
         self.ldscores = self._ldscores_base[keep_mask, :]
+
         if self._chr_base is not None:
             self.chr = self._chr_base[keep_mask]
             self.bp  = self._bp_base[keep_mask]
 
+        # also slice regression LD-scores if present
+        if getattr(self, "_ldscores_reg_base", None) is not None:
+            self.ldscores_reg = self._ldscores_reg_base[keep_mask, :]
+            if getattr(self, "_chr_reg_base", None) is not None:
+                self.chr_reg = self._chr_reg_base[keep_mask]
+                self.bp_reg  = self._bp_reg_base[keep_mask]
+
         self.blk_size = max(self.nsnps // self.nblks, 1)
+
+        # NOTE: for continuous/overlap this is "bin mass" sum(A[:,k]), not SNP counts
         self.nsnps_bin = self.annot.sum(axis=0, dtype=np.float64)
 
-        # LOO bin counts
+        # LOO bin masses
         B = self.nblks
         K = self.nbins
         self.nsnps_blk = np.empty((B + 1, K), dtype=np.float64)
@@ -473,7 +628,7 @@ class Trace:
         if B > 0:
             ends[-1] = self.nsnps
 
-        csum = np.cumsum(self.annot, axis=0, dtype=np.float64)  # (M, K)
+        csum = np.cumsum(self.annot, axis=0, dtype=np.float64)
 
         for j in range(B):
             s = int(starts[j]); e = int(ends[j])
