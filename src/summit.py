@@ -96,6 +96,8 @@ parser.add_argument("--num-threads", default=None, type=int, \
                     help='Cap the number of threads for BLAS to limit CPU usage. By default it will use all available ones.')
 parser.add_argument("--target-xz-mem", type=float, default=16.0,
                     help="Memory budget (GB) for the Phase-1 Xz panel (N × B × Vt). Used to pick the initial V-tile before balancing. Default: 16.0")
+parser.add_argument("--target-mem", type=float, default=None,
+                    help="Memory budget (GB) for LD score estimation (overrides --target-xz-mem if both set). If not set, then use all available.")
 parser.add_argument("--device", type=str, default='cpu',
                     help="Which device to use for GWLD computation. Default is cpu; to use GPU, specify cuda number (applied only for phase 2)")
 parser.add_argument("--use-tp32", action="store_true", default=False,\
@@ -238,7 +240,7 @@ if __name__ == '__main__':
         gwld = GenomewideLDScore(bed_path=args.geno, annot_path=args.annot, out_path=args.out, covar_path=args.covar, rand_dist=args.rand_dist,\
             log=log, num_vecs=args.nvecs, step_size=args.step_size, seed=args.seed, verbose=args.verbose, \
             dtype = args.dtype, num_threads=args.num_threads, rand_samp=args.rand_samp, low_level=low_level, target_xz_mem=args.target_xz_mem,\
-            device = args.device, use_tp32 = args.use_tp32)
+            target_mem=args.target_mem, device = args.device, use_tp32 = args.use_tp32)
         gwld._compute_ldscore()
     elif (args.h2 is not None):
         if (args.trace is None) and (args.ldscores is None):

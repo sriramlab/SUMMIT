@@ -471,6 +471,7 @@ class GenomewideLDScore:
                 rand_samp=None, # float in (0,1] or int in [100, N]
                 ddof = 1,
                 target_xz_mem = 16.0,
+                target_mem = None,
                 device='cpu',
                 use_tp32 = False):
         
@@ -492,7 +493,9 @@ class GenomewideLDScore:
         self.root_seed = seed
         rng = np.random.default_rng(self.root_seed)
         self.ddof = ddof
-        self.target_xz_mem = target_xz_mem
+        self.target_mem = target_mem
+        self.target_xz_mem = target_xz_mem if target_mem is None else target_mem
+
         
         # If num_threads was explicitly passed, it overrides low_level['num_threads'].
         explicit_threads = num_threads is not None and int(num_threads) > 0
@@ -661,7 +664,7 @@ class GenomewideLDScore:
         # Choose number of workers conservatively to avoid RAM spikes
         # Rough per-chunk footprint ≈ N * L * itemsize * 3 (G, tmp/proj, Y)
         try:
-            avail = int(psutil.virtual_memory().available)
+            avail = int(psutil.virtual_memory().available) if self.target_mem is None else int((self.target_mem * (1024**3)))
         except Exception:
             avail = None
 
@@ -1106,7 +1109,7 @@ class GenomewideLDScore:
 
         # -------------------- Choose initial V-chunk by memory budget ----------------
         # Target memory for Xz panel (N x (B*Vt)) in GiB; you can set self.target_xz_gib
-        target_gib = float(getattr(self, "target_xz_mem", 16.0)) ## TODO: make an argparse option for this
+        target_gib = float(getattr(self, "target_xz_mem", 16.0))
         itemsize = np.dtype(self.dtype).itemsize
         denom = max(1, int(self.nsamp) * int(self.nbins) * itemsize)
         vtile_guess = int((target_gib * (1024**3)) // denom)
