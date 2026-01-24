@@ -1,5 +1,6 @@
 from logger import Logger
 from gw_ldscore import GenomewideLDScore
+from cov_ldscore import WindowedLDScore
 from sumrhe import Sumrhe
 from sumcore import Sumcore
 import utils
@@ -86,10 +87,14 @@ parser.add_argument("--rand-dist", default='spherical', type=str, \
                     help="Specify which distribution to use to generate random vectors ('normal', 'rademacher', 'spherical'). Default is spherical distribution.")
 parser.add_argument("--dtype", default='float32', type=str, \
                     help="Specify the dtype to use for calculations (either float32 or float64). Default is float32.")
-parser.add_argument("--rand-samp", default=None, type=float, \
+parser.add_argument("--rand-samp", default=None, type=str, \
                     help="Select a random subset of the samples for LD score calculation. Pass a value between (0, 1] for a ratio, and an integer greater than 100 for the number of samples.)")
 parser.add_argument("--ddof", default=1, type=int, \
                     help="Specify the delta degrees of freedom (ddof) for estimating genome-wide LD scores. Default is 1 (empirical SD).")
+parser.add_argument("--ld-wind-kb", default=None, type=float,
+                    help="If set, compute (covariate-adjusted) *windowed* LD scores with window size in kb "
+                         "(switches LD-score mode from genome-wide stochastic to windowed).")
+
 
 # LD score resource allocation arguments
 parser.add_argument("--num-threads", default=None, type=int, \
@@ -165,6 +170,18 @@ def _check_outdir(path_str: str, create: bool = True, log=None):
             print(f"!!! Cannot write to output directory '{parent}': {e} !!!", file=sys.stderr)
         sys.exit(1)
 
+def _parse_rand_samp(x):
+    if x is None:
+        return None
+    s = str(x).strip()
+    if s == "":
+        return None
+    # float if it looks like a float; otherwise int
+    if any(ch in s for ch in [".", "e", "E"]):
+        v = float(s)
+        return v
+    return int(s)
+
 
 if __name__ == '__main__':
     args = parser.parse_args()
@@ -233,15 +250,82 @@ if __name__ == '__main__':
         _check_outdir(args.out, create=True, log=log)
     
     log.install_excepthook()
-    log.attach_file(args.out + (".gw.log" if args.geno else ".log"))
+    if args.geno:
+        log_suffix = ".win.log" if (args.ld_wind_kb is not None) else ".gw.log"
+    else:
+        log_suffix = ".log"
+    log.attach_file(args.out + log_suffix)
+    
+    args.rand_samp = _parse_rand_samp(args.rand_samp)
     
     if (args.geno is not None):
-        # set 
-        gwld = GenomewideLDScore(bed_path=args.geno, annot_path=args.annot, out_path=args.out, covar_path=args.covar, rand_dist=args.rand_dist,\
-            log=log, num_vecs=args.nvecs, step_size=args.step_size, seed=args.seed, verbose=args.verbose, \
-            dtype = args.dtype, num_threads=args.num_threads, rand_samp=args.rand_samp, low_level=low_level, target_xz_mem=args.target_xz_mem,\
-            target_mem=args.target_mem, device = args.device, use_tp32 = args.use_tp32)
-        gwld._compute_ldscore()
+        # Detect flags explicitly provided by the user (not defaults)
+        _argv = sys.argv[1:]
+
+        def _flag_was_passed(flag: str) -> bool:
+            # supports: --foo 3  OR  --foo=3
+            return (flag in _argv) or any(a.startswith(flag + "=") for a in _argv)
+
+        if args.ld_wind_kb is not None:
+            if args.ld_wind_kb <= 0:
+                log._log("!!! --ld-wind-kb must be a positive integer !!!")
+                sys.exit(1)
+
+            log._log(f">>> LD score mode: windowed (covariate-adjusted), --ld-wind-kb {args.ld_wind_kb}")
+
+            # Warn only for GW-specific knobs that the user explicitly passed
+            GW_ONLY_FLAGS = [
+                "--nvecs",
+                "--rand-dist",
+                "--target-xz-mem",
+                "--target-mem",
+                "--device",
+                "--use-tp32",
+                "--vchunk",
+                "--vtiles",
+                "--ctile",
+                "--ctile-mb",
+                "--ctile-l3pct",
+                "--sockets",
+                "--malloc-arena-max",
+                "--malloc-trim-threshold",
+                "--malloc-mmap-threshold",
+                "--numa-mode",
+                "--numa-nodes",
+            ]
+            passed = [f for f in GW_ONLY_FLAGS if _flag_was_passed(f)]
+            if passed:
+                log._log(">>> NOTE: Windowed LD score mode ignores the following genome-wide stochastic options you passed:")
+                for f in passed:
+                    log._log(f"    * {f}")
+
+            winld = WindowedLDScore(
+                bed_path=args.geno,
+                annot_path=args.annot,
+                out_path=args.out,
+                covar_path=args.covar,
+                ld_wind_kb=args.ld_wind_kb,
+                log=log,
+                seed=args.seed,
+                step_size=args.step_size,
+                verbose=args.verbose,
+                dtype=args.dtype,
+                rand_samp=args.rand_samp,
+                ddof=args.ddof,
+                num_threads=args.num_threads,
+            )
+            winld._compute_ldscore()
+
+        else:
+            # genome-wide stochastic LD score (existing behavior)
+            gwld = GenomewideLDScore(
+                bed_path=args.geno, annot_path=args.annot, out_path=args.out, covar_path=args.covar, rand_dist=args.rand_dist,
+                log=log, num_vecs=args.nvecs, step_size=args.step_size, seed=args.seed, verbose=args.verbose,
+                dtype=args.dtype, num_threads=args.num_threads, rand_samp=args.rand_samp, low_level=low_level, target_xz_mem=args.target_xz_mem,
+                target_mem=args.target_mem, device=args.device, use_tp32=args.use_tp32
+            )
+            gwld._compute_ldscore()
+
     elif (args.h2 is not None):
         if (args.trace is None) and (args.ldscores is None):
             log._log("!!! Either trace summary or LD score (truncated or genome-wide) must be provided !!!")
