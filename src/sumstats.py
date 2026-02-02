@@ -173,13 +173,17 @@ class Sumstats:
         - print detailed tail + top outliers only if warning triggers
 
         Verbose behavior:
-        - print detailed 'used' stats
-        - optionally also print 'read' stats (pre-matching) for debugging
+        - print active chi^2 filter status once
+        - print 'read' first (optional)
+        - print 'used' second
+        - expanded details for both stages
         """
         name = getattr(self, "name", "UNKNOWN")
         nmax = float(getattr(self, "nsamp", np.nan))
 
-        # helper: decide whether to expand details
+        thr_user = float(getattr(self, "chisq_threshold", 0.0) or 0.0)
+        removed_user = int(getattr(self, "_chisq_filter_removed", 0))
+
         def _should_expand(summ: dict) -> bool:
             if not summ:
                 return False
@@ -191,15 +195,7 @@ class Sumstats:
             if not summ:
                 return
 
-            thr_user = float(getattr(self, "chisq_threshold", 0.0) or 0.0)
-            if stage == "used":
-                if thr_user > 0:
-                    self.log._log(
-                        f"[chisq] [{name}] active chi^2 filter: threshold={thr_user:.3f}; removed={int(getattr(self, '_chisq_filter_removed', 0))} SNPs."
-                    )
-                else:
-                    self.log._log(f"[chisq] [{name}] no active chi^2 filter.")
-
+            # always: one-line summary
             if "mean" in summ:
                 self.log._log(
                     f"[chisq] [{name}] {stage}  "
@@ -213,46 +209,56 @@ class Sumstats:
                     f"M={summ.get('M', 0)} (finite={summ.get('M_finite', 0)})"
                 )
 
-            # expanded details (verbose or warning-triggered)
-            if expand and ("mean" in summ):
-                thr = float(summ.get("suggested_chisq_max", np.nan))
-                if np.isfinite(thr):
-                    self.log._log(
-                        f"[chisq] [{name}] suggested chi^2 cap = max(80, 0.001*Nmax) with Nmax={nmax:.1f}: {thr:.3f}"
-                    )
-                    self.log._log(
-                        f"[chisq] [{name}] SNPs with chi^2 > {thr:.3f}: "
-                        f"{int(summ.get('n_gt_suggested', 0))} ({float(summ.get('frac_gt_suggested', 0.0)):.3e})"
-                    )
+            if not expand or ("mean" not in summ):
+                return
 
+            thr = float(summ.get("suggested_chisq_max", np.nan))
+            if np.isfinite(thr):
                 self.log._log(
-                    f"[chisq] [{name}] tail: "
-                    f"p99={summ.get('p99', float('nan')):.2f} "
-                    f"p99.9={summ.get('p99.9', float('nan')):.2f} "
-                    f"p99.99={summ.get('p99.99', float('nan')):.2f} "
-                    f"p99.999={summ.get('p99.999', float('nan')):.2f}"
+                    f"[chisq] [{name}] suggested chi^2 cap = max(80, 0.001*Nmax) with Nmax={nmax:.1f}: {thr:.3f}"
+                )
+                self.log._log(
+                    f"[chisq] [{name}] SNPs with chi^2 > {thr:.3f}: "
+                    f"{int(summ.get('n_gt_suggested', 0))} ({float(summ.get('frac_gt_suggested', 0.0)):.3e})"
                 )
 
-                if _should_expand(summ):
-                    self.log._log(
-                        f"[WARNING] [{name}] many extremely large chi^2 SNPs detected. "
-                        f"This can violate MoM / variance-component assumptions and destabilize estimates."
-                    )
-                    if top_rows:
-                        self.log._log(f"[chisq] [{name}] top outliers (SNP A1 A2 chi2):")
-                        for r, (snp, aa1, aa2, chi2) in enumerate(top_rows, start=1):
-                            self.log._log(f"[chisq] [{name}]  {r:2d}. {snp}\t{aa1}\t{aa2}\t{chi2:.3f}")
+            self.log._log(
+                f"[chisq] [{name}] tail: "
+                f"p99={summ.get('p99', float('nan')):.2f} "
+                f"p99.9={summ.get('p99.9', float('nan')):.2f} "
+                f"p99.99={summ.get('p99.99', float('nan')):.2f} "
+                f"p99.999={summ.get('p99.999', float('nan')):.2f}"
+            )
 
+            if _should_expand(summ):
+                self.log._log(
+                    f"[WARNING] [{name}] many extremely large chi^2 SNPs detected. "
+                    f"This can violate MoM / variance-component assumptions and destabilize estimates."
+                )
+                if top_rows:
+                    self.log._log(f"[chisq] [{name}] top outliers (SNP A1 A2 chi2):")
+                    for r, (snp, aa1, aa2, chi2) in enumerate(top_rows, start=1):
+                        self.log._log(f"[chisq] [{name}]  {r:2d}. {snp}\t{aa1}\t{aa2}\t{chi2:.3f}")
+
+        # ---- Print active user filter status ONCE at the top (verbose only) ----
+        if verbose:
+            if thr_user > 0 and np.isfinite(thr_user):
+                self.log._log(
+                    f"[chisq] [{name}] active chi^2 filter: threshold={thr_user:.3f}; removed={removed_user} SNPs."
+                )
+            else:
+                self.log._log(f"[chisq] [{name}] no active chi^2 filter.")
+
+        # ---- Ordering: verbose prints read first, then used ----
+        if verbose and include_read_when_verbose:
+            _log_stage("read", self._chisq_diag_read, self._chisq_top_read, expand=True)
+
+        # Always report "used" once (concise unless verbose or warning-triggered)
         used_summ = self._chisq_diag_used
         used_top = self._chisq_top_used
         expand_used = bool(verbose) or _should_expand(used_summ)
         _log_stage("used", used_summ, used_top, expand=expand_used)
 
-        # --- Optionally include "read" stage only in verbose mode ---
-        if verbose and include_read_when_verbose:
-            read_summ = self._chisq_diag_read
-            read_top = self._chisq_top_read
-            _log_stage("read", read_summ, read_top, expand=True)
 
 
 
