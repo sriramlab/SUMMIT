@@ -352,17 +352,30 @@ class Sumrhe:
 
     def _run(self):
         for i in range(self.npheno):
-            h2_path=self.h2_dir[i]
+            h2_path = self.h2_dir[i]
             removesnps = self.sums._process(h2_path, self.phen_names[i])
-            self.tr._filter_snps(removesnps) # always try to filter both sides
+
+            # report chi^2 distribution diagnostics (report-only; no estimator changes)
+            if hasattr(self.sums, "log_chisq_diagnostics"):
+                self.sums.log_chisq_diagnostics(
+                    topk=10,
+                    warn_min_count=10,
+                    warn_min_frac=1e-5,
+                    verbose=bool(self.verbose),
+                    include_read_when_verbose=True,
+                )
+
+
+            self.tr._filter_snps(removesnps)  # always try to filter both sides
             self.nsamp.append(self.sums.nsamp)
 
             self._calc_sigmas(i)
             self._calc_h2(i)
             if self.report_tau:
-                self._calc_tau(i) 
+                self._calc_tau(i)
             self._calc_enrich(i)
             self._run_jackknife(i)
+
     
     def _logoff(self):
         for i in range(self.npheno):

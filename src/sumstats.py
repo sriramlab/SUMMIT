@@ -11,6 +11,8 @@ import pandas as pd
 from os import listdir
 import sys
 
+_CHI2_MEDIAN_1DF = 0.454936423119572
+
 class Sumstats:
     def __init__(self, nblks=100, chisq_threshold=0, log=None, both_side=False, annot_df=None, nbins=1):
         self.log = log
@@ -44,9 +46,19 @@ class Sumstats:
         self._sum_has_dups = False
 
         self._chisq_applied = False
+        self._chisq_filter_removed = 0
+
+        # --- chi^2 diagnostics caches (per phenotype) ---
+        # "read": after parsing + scaling Z, before matching to annotations
+        # "used": after matching to annotation SNPs (and after any active chi^2 filter)
+        self._chisq_diag_read = None
+        self._chisq_diag_used = None
+        self._chisq_top_read = None
+        self._chisq_top_used = None
 
         if annot_df is not None:
             self._set_annot_df(annot_df)
+
 
     def _set_annot_df(self, annot_df: pd.DataFrame):
         """Cache annotation SNP order + annotation matrix for fast rematching."""
@@ -68,6 +80,180 @@ class Sumstats:
             )
 
         self._annot_has_dups = pd.Index(self._annot_snps).has_duplicates
+    
+    def _suggested_chisq_max(self, nmax: float) -> float:
+        """
+        A commonly used cap for extreme chi^2 outliers:
+            chi2_max = max(80, 0.001 * Nmax)
+        This function is report-only unless you explicitly set chisq_threshold.
+        """
+        if not np.isfinite(nmax) or nmax <= 0:
+            return 80.0
+        return float(max(80.0, 0.001 * nmax))
+
+
+    def _chisq_summary(self, chisq: np.ndarray) -> dict:
+        chisq = np.asarray(chisq, dtype=np.float64)
+        finite = np.isfinite(chisq)
+        x = chisq[finite]
+        out = {
+            "M": int(chisq.size),
+            "M_finite": int(x.size),
+            "M_nonfinite": int(chisq.size - x.size),
+        }
+        if x.size == 0:
+            return out
+
+        out["mean"] = float(np.mean(x))
+        out["median"] = float(np.median(x))
+        out["max"] = float(np.max(x))
+        out["lambda_gc"] = float(out["median"] / _CHI2_MEDIAN_1DF)
+
+        for q in [90, 95, 99, 99.9, 99.99, 99.999]:
+            out[f"p{q}"] = float(np.percentile(x, q))
+
+        return out
+
+
+    def _top_chisq_rows(self, snps, a1, a2, chisq, topk: int = 10):
+        """Return [(SNP, A1, A2, chi2), ...] for the largest chi2 values."""
+        if topk <= 0:
+            return []
+        chisq = np.asarray(chisq, dtype=np.float64)
+        finite = np.isfinite(chisq)
+        if not finite.any():
+            return []
+
+        idx = np.where(finite)[0]
+        x = chisq[finite]
+        k = min(topk, x.size)
+
+        part = np.argpartition(-x, kth=k - 1)[:k]
+        best = part[np.argsort(-x[part])]
+
+        rows = []
+        for t in best:
+            j = int(idx[t])
+            rows.append((str(snps[j]), str(a1[j]), str(a2[j]), float(chisq[j])))
+        return rows
+
+
+    def _compute_chisq_diag(self, z, snps, a1, a2, nmax: float, topk: int = 10) -> tuple[dict, list]:
+        z = np.asarray(z, dtype=np.float64)
+        chisq = z * z
+        summ = self._chisq_summary(chisq)
+
+        thr = self._suggested_chisq_max(float(nmax))
+        finite = np.isfinite(chisq)
+        n_hi = int(np.sum(chisq[finite] > thr))
+        frac_hi = float(n_hi / max(int(np.sum(finite)), 1))
+
+        summ["suggested_chisq_max"] = float(thr)
+        summ["n_gt_suggested"] = int(n_hi)
+        summ["frac_gt_suggested"] = float(frac_hi)
+
+        top = self._top_chisq_rows(snps, a1, a2, chisq, topk=topk)
+        return summ, top
+
+
+    def log_chisq_diagnostics(
+        self,
+        topk: int = 10,
+        warn_min_count: int = 10,
+        warn_min_frac: float = 1e-5,
+        verbose: bool = False,
+        include_read_when_verbose: bool = True,
+    ):
+        """
+        Report chi^2 diagnostics for the most recently processed phenotype.
+
+        Default behavior (non-verbose):
+        - report ONLY the 'used' stage once (matched/filtered set)
+        - print a concise summary line
+        - print detailed tail + top outliers only if warning triggers
+
+        Verbose behavior:
+        - print detailed 'used' stats
+        - optionally also print 'read' stats (pre-matching) for debugging
+        """
+        name = getattr(self, "name", "UNKNOWN")
+        nmax = float(getattr(self, "nsamp", np.nan))
+
+        # helper: decide whether to expand details
+        def _should_expand(summ: dict) -> bool:
+            if not summ:
+                return False
+            n_hi = int(summ.get("n_gt_suggested", 0))
+            frac_hi = float(summ.get("frac_gt_suggested", 0.0))
+            return (n_hi >= warn_min_count) or (frac_hi >= warn_min_frac)
+
+        def _log_stage(stage: str, summ: dict, top_rows: list, expand: bool):
+            if not summ:
+                return
+
+            thr_user = float(getattr(self, "chisq_threshold", 0.0) or 0.0)
+            if stage == "used":
+                if thr_user > 0:
+                    self.log._log(
+                        f"[chisq] [{name}] active chi^2 filter: threshold={thr_user:.3f}; removed={int(getattr(self, '_chisq_filter_removed', 0))} SNPs."
+                    )
+                else:
+                    self.log._log(f"[chisq] [{name}] no active chi^2 filter.")
+
+            if "mean" in summ:
+                self.log._log(
+                    f"[chisq] [{name}] {stage}  "
+                    f"M={summ.get('M', 0)} (finite={summ.get('M_finite', 0)})  "
+                    f"lambda_gc={summ['lambda_gc']:.4f}  mean={summ['mean']:.4f}  "
+                    f"p99.9={summ.get('p99.9', float('nan')):.2f}  max={summ['max']:.2f}"
+                )
+            else:
+                self.log._log(
+                    f"[chisq] [{name}] {stage}  "
+                    f"M={summ.get('M', 0)} (finite={summ.get('M_finite', 0)})"
+                )
+
+            # expanded details (verbose or warning-triggered)
+            if expand and ("mean" in summ):
+                thr = float(summ.get("suggested_chisq_max", np.nan))
+                if np.isfinite(thr):
+                    self.log._log(
+                        f"[chisq] [{name}] suggested chi^2 cap = max(80, 0.001*Nmax) with Nmax={nmax:.1f}: {thr:.3f}"
+                    )
+                    self.log._log(
+                        f"[chisq] [{name}] SNPs with chi^2 > {thr:.3f}: "
+                        f"{int(summ.get('n_gt_suggested', 0))} ({float(summ.get('frac_gt_suggested', 0.0)):.3e})"
+                    )
+
+                self.log._log(
+                    f"[chisq] [{name}] tail: "
+                    f"p99={summ.get('p99', float('nan')):.2f} "
+                    f"p99.9={summ.get('p99.9', float('nan')):.2f} "
+                    f"p99.99={summ.get('p99.99', float('nan')):.2f} "
+                    f"p99.999={summ.get('p99.999', float('nan')):.2f}"
+                )
+
+                if _should_expand(summ):
+                    self.log._log(
+                        f"[WARNING] [{name}] many extremely large chi^2 SNPs detected. "
+                        f"This can violate MoM / variance-component assumptions and destabilize estimates."
+                    )
+                    if top_rows:
+                        self.log._log(f"[chisq] [{name}] top outliers (SNP A1 A2 chi2):")
+                        for r, (snp, aa1, aa2, chi2) in enumerate(top_rows, start=1):
+                            self.log._log(f"[chisq] [{name}]  {r:2d}. {snp}\t{aa1}\t{aa2}\t{chi2:.3f}")
+
+        used_summ = self._chisq_diag_used
+        used_top = self._chisq_top_used
+        expand_used = bool(verbose) or _should_expand(used_summ)
+        _log_stage("used", used_summ, used_top, expand=expand_used)
+
+        # --- Optionally include "read" stage only in verbose mode ---
+        if verbose and include_read_when_verbose:
+            read_summ = self._chisq_diag_read
+            read_top = self._chisq_top_read
+            _log_stage("read", read_summ, read_top, expand=True)
+
 
 
     def _read_sumstats(self, path, name):
@@ -117,9 +303,8 @@ class Sumstats:
         # set nsamp
         self.nsamp = float(nmax)
 
-        # deduplicate SNPs (recommended for correctness + stable indexing)
+        # deduplicate SNPs
         if sumdf['SNP'].duplicated().any():
-            # keep max-N row per SNP; ties resolved by earliest in file
             sumdf['_row'] = np.arange(sumdf.shape[0], dtype=np.int64)
             sumdf = (
                 sumdf.sort_values(['SNP', 'N', '_row'], ascending=[True, False, True])
@@ -138,20 +323,34 @@ class Sumstats:
         self._sum_a2 = self.sumdf['A2'].to_numpy(dtype=str, copy=False)
 
         self._sum_index = pd.Index(self._sum_snps)
-        self._sum_has_dups = self._sum_index.has_duplicates  # should now be False
+        self._sum_has_dups = self._sum_index.has_duplicates
         self._chisq_applied = False
+        self._chisq_filter_removed = 0
+
+        # diagnostics on the read/scaled set (before matching)
+        self._chisq_diag_read, self._chisq_top_read = self._compute_chisq_diag(
+            z=self._sum_z, snps=self._sum_snps, a1=self._sum_a1, a2=self._sum_a2, nmax=self.nsamp, topk=10
+        )
+        self._chisq_diag_used = None
+        self._chisq_top_used = None
 
 
     def _apply_chisq_filter_once(self):
-        """Apply chi^2 filter at most once per Sumstats object, updating BOTH caches and self.sumdf."""
+        """Apply chi^2 filter at most once per Sumstats object; updates caches and self.sumdf."""
         if self._chisq_applied:
             return
         self._chisq_applied = True
+        self._chisq_filter_removed = 0
 
         if self.chisq_threshold is None:
             return
 
         thr = float(self.chisq_threshold)
+
+        # Convention: <=0 means "disabled"
+        if not np.isfinite(thr) or thr <= 0.0:
+            return
+
         self.log._log(f"Filtering SNPs with chi-sq greater than {thr}")
 
         chisq = self._sum_z ** 2
@@ -162,6 +361,7 @@ class Sumstats:
 
         chisq_snps = self._sum_snps[~keep].tolist()
         self.removesnps += chisq_snps
+        self._chisq_filter_removed = int(len(chisq_snps))
 
         # filter cached arrays
         self._sum_snps = self._sum_snps[keep]
@@ -182,26 +382,24 @@ class Sumstats:
         )
 
 
+
     def _match_snps(self, printlog=True):
         """
         Match SNPs between sumstats and annot_df while preserving annot_df order (blocks match Trace ordering).
 
-        Supports:
-        - non-overlapping binary annotations
-        - overlapping binary annotations
-        - continuous (nonnegative) annotations
+        Supports binary/overlapping/continuous annotations.
 
-        For continuous/overlapping, we compute weighted sufficient statistics:
+        For overlapping/continuous, we compute weighted sufficient stats:
             M_k   = sum_j a_{j,k}
             S_k   = sum_j a_{j,k} * z_j^2
-        and their in-block counterparts for jackknife.
+        and their in-block counterparts.
         """
         if self.annot_df is None:
             raise RuntimeError("Sumstats.annot_df is None; cannot match SNPs.")
         if self._annot_snps is None or (self._annot_ann is None):
             self._set_annot_df(self.annot_df)
 
-        # chi^2 filter
+        # optional chi^2 filter
         self._apply_chisq_filter_once()
 
         # ----------------------------
@@ -231,16 +429,15 @@ class Sumstats:
             all_ann = df[ann_cols].to_numpy(dtype=np.float64, copy=False)
 
         else:
-            # fast indexer path (preserve annot_df order)
             annot_snps = self._annot_snps
-            indexer = self._sum_index.get_indexer(annot_snps)  # position in sumstats arrays, -1 if missing
+            indexer = self._sum_index.get_indexer(annot_snps)
             keep_mask = indexer >= 0
 
             missing_n = int((~keep_mask).sum())
             if missing_n:
                 self.removesnps.extend(annot_snps[~keep_mask].tolist())
 
-            pos = indexer[keep_mask]  # positions into sumstats arrays
+            pos = indexer[keep_mask]
             self.matched_snps = annot_snps[keep_mask]
             if printlog:
                 self.log._log(
@@ -250,11 +447,14 @@ class Sumstats:
 
             all_z = self._sum_z[pos]
             self.zscores = all_z
-
             self.a1 = self._sum_a1[pos]
             self.a2 = self._sum_a2[pos]
-
             all_ann = self._annot_ann[keep_mask, :]
+
+        # diagnostics on the matched set (what the method actually used)
+        self._chisq_diag_used, self._chisq_top_used = self._compute_chisq_diag(
+            z=all_z, snps=self.matched_snps, a1=self.a1, a2=self.a2, nmax=self.nsamp, topk=10
+        )
 
         # ----------------------------
         # Weighted sufficient statistics for RHS
@@ -271,21 +471,18 @@ class Sumstats:
             raise RuntimeError(f"Non-finite annotation values encountered after matching. First bad rows: {bad.tolist()}")
 
         M = int(all_z.size)
-        self.nsnps = M  # matched SNP count
+        self.nsnps = M
 
-        # block partition (must match Trace convention: blk_size = M//B, last block takes remainder)
         blk_size = max(M // self.nblks, 1)
         blk_idx = (np.arange(M, dtype=np.int64) // blk_size)
         blk_idx[blk_idx >= self.nblks] = self.nblks - 1
-        self.blk_idx = blk_idx  # optional, but handy for debugging
+        self.blk_idx = blk_idx
 
-        z2 = all_z * all_z  # (M,)
+        z2 = all_z * all_z
 
-        # Full sums: M_k = sum a_{jk}; S_k = sum a_{jk} z_j^2
-        Ak_full = A.sum(axis=0, dtype=np.float64)          # (K,)
-        Az2_full = (A.T @ z2).astype(np.float64, copy=False)  # (K,)
+        Ak_full = A.sum(axis=0, dtype=np.float64)
+        Az2_full = (A.T @ z2).astype(np.float64, copy=False)
 
-        # In-block contributions for jackknife
         B = self.nblks
         K = self.nbins
         Ak_blk = np.zeros((B, K), dtype=np.float64)
@@ -294,24 +491,19 @@ class Sumstats:
         tmp = np.empty(M, dtype=np.float64)
         for k in range(K):
             col = A[:, k]
-            # M_k^{(b)} = sum_{j in block b} a_{jk}
             tmp[:] = col
             Ak_blk[:, k] = np.bincount(blk_idx, weights=tmp, minlength=B).astype(np.float64, copy=False)
-            # S_k^{(b)} = sum_{j in block b} a_{jk} z_j^2
             tmp[:] = col * z2
             Az2_blk[:, k] = np.bincount(blk_idx, weights=tmp, minlength=B).astype(np.float64, copy=False)
 
-        # expose the "bin sizes" using the same names as before (now = sum of weights)
         self.nsnps_bin = Ak_full
         self.nsnps_blk = Ak_blk
 
-        # store sufficient stats for RHS computation
         self._Ak_full = Ak_full
         self._Az2_full = Az2_full
         self._Ak_blk = Ak_blk
         self._Az2_blk = Az2_blk
 
-        # sanity: bins must have positive total weight (for binary, this is count>0)
         bad_bins = np.flatnonzero(~np.isfinite(Ak_full) | (Ak_full <= 0.0))
         if bad_bins.size:
             self.log._log(
@@ -319,6 +511,7 @@ class Sumstats:
                 f"Bad bins: {bad_bins.tolist()} (Ak_full={Ak_full[bad_bins].tolist()}) !!!"
             )
             sys.exit(1)
+
 
 
     def _calc_rhs_h2(self):
