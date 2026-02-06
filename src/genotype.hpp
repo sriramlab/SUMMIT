@@ -4,6 +4,12 @@
 #include <cstdint>
 #include <type_traits>
 
+void prefetch_bed_block(const std::string& bed_path,
+                        const std::string& fam_path,
+                        int blk_start, int blk_end,
+                        int ahead_blocks = 1);
+                        
+
 // Exported helper (external linkage)
 int64_t count_lines_cached(const std::string& path);
 

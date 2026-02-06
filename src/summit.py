@@ -127,6 +127,9 @@ parser.add_argument("--malloc-trim-threshold", type=int, default=131072)
 parser.add_argument("--malloc-mmap-threshold", type=int, default=131072)
 parser.add_argument("--numa-mode", default="interleave", choices=['interleave', 'membind', 'cpunodebind', 'preferred'])
 parser.add_argument("--numa-nodes", default="all")
+parser.add_argument("--force_affinity_all", default=True)
+parser.add_argument("--decode_threads_cap", default=32)
+
 
 
 def _check_outdir(path_str: str, create: bool = True, log=None):
@@ -196,6 +199,8 @@ if __name__ == '__main__':
         "malloc_arena_max":        args.malloc_arena_max,
         "malloc_trim_threshold":   args.malloc_trim_threshold,
         "malloc_mmap_threshold":   args.malloc_mmap_threshold,
+        "force_affinity_all":      args.force_affinity_all,
+        "decode_threads_cap":      args.decode_threads_cap,
     }
     from gw_ldscore import apply_env
     apply_env(low_level)

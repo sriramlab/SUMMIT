@@ -92,6 +92,20 @@ struct BlockTimers {
 };
 
 // ------------------------------- Small helpers -------------------------------
+static void prefetch_bed_block_py(const std::string& bed_prefix,
+                                  const std::string& fam_path,
+                                  int blk_start, int blk_end,
+                                  int ahead_blocks)
+{
+#if defined(__linux__)
+    py::gil_scoped_release nogil;
+    const std::string bed_path = bed_prefix + ".bed";
+    prefetch_bed_block(bed_path, fam_path, blk_start, blk_end, ahead_blocks);
+#else
+    (void)bed_prefix; (void)fam_path; (void)blk_start; (void)blk_end; (void)ahead_blocks;
+#endif
+}
+
 static inline uint64_t mix64(uint64_t x) {
     // splitmix64
     x += 0x9e3779b97f4a7c15ULL;
@@ -141,26 +155,47 @@ inline void gemm_col_major_tn(int m, int n, int k,
 inline void cblas_taxpy(int n, float  a, const float*  x, int incx, float*  y, int incy){ cblas_saxpy(n,a,x,incx,y,incy); }
 inline void cblas_taxpy(int n, double a, const double* x, int incx, double* y, int incy){ cblas_daxpy(n,a,x,incx,y,incy); }
 
-// Parse optional row_sel (indices of individuals to keep)
-static std::vector<int> parse_row_sel(py::object row_sel_obj, int64_t N_total) {
-    if (row_sel_obj.is_none()) {
-        std::vector<int> rows((size_t)N_total);
-        for (int64_t i = 0; i < N_total; ++i) rows[(size_t)i] = (int)i;
-        return rows;
+// Parse optional row_sel (indices of individuals to keep), cached per-thread.
+// This avoids rebuilding the same rows vector every block call.
+static const std::vector<int>& parse_row_sel(py::object row_sel_obj, int64_t N_total) {
+    struct Cache {
+        PyObject* key = nullptr;  // row_sel_obj.ptr() or nullptr for None
+        int64_t   N_total = -1;
+        std::vector<int> rows;
+    };
+    static thread_local Cache C;
+
+    PyObject* k = row_sel_obj.is_none() ? nullptr : row_sel_obj.ptr();
+
+    if (C.key == k && C.N_total == N_total && !C.rows.empty()) {
+        return C.rows;
     }
+
+    C.key = k;
+    C.N_total = N_total;
+    C.rows.clear();
+    C.rows.shrink_to_fit(); // optional; you can remove if you prefer keeping capacity
+
+    if (row_sel_obj.is_none()) {
+        C.rows.resize((size_t)N_total);
+        for (int64_t i = 0; i < N_total; ++i) C.rows[(size_t)i] = (int)i;
+        return C.rows;
+    }
+
     py::array idx = row_sel_obj.cast<py::array>();
     py::buffer_info bi = idx.request();
-    std::vector<int> rows((size_t)bi.shape[0]);
-    // accept int32/int64
+    C.rows.resize((size_t)bi.shape[0]);
+
     if (bi.format == py::format_descriptor<int32_t>::format()) {
         auto p = static_cast<const int32_t*>(bi.ptr);
-        for (ssize_t i = 0; i < bi.shape[0]; ++i) rows[(size_t)i] = (int)p[i];
+        for (ssize_t i = 0; i < bi.shape[0]; ++i) C.rows[(size_t)i] = (int)p[i];
     } else {
         auto p = static_cast<const int64_t*>(bi.ptr);
-        for (ssize_t i = 0; i < bi.shape[0]; ++i) rows[(size_t)i] = (int)p[i];
+        for (ssize_t i = 0; i < bi.shape[0]; ++i) C.rows[(size_t)i] = (int)p[i];
     }
-    return rows;
+    return C.rows;
 }
+
 
 // -------------------------- Phase 1: compute_Xz (K-major) --------------------------
 template <typename T>
@@ -189,7 +224,7 @@ void phase1_compute_Xz_bed_chunk_impl(const std::string &bed_prefix,
     if (blk_end > M_total) throw std::runtime_error("blk_end exceeds #SNPs in BIM");
 
     // ---- rows & block genotype ----
-    std::vector<int> rows = parse_row_sel(row_sel_obj, N_total);
+    const std::vector<int>& rows = parse_row_sel(row_sel_obj, N_total);
 
     int N = 0, L = 0;
     std::vector<T> Geno; // (N x L), column-major
@@ -431,7 +466,7 @@ void phase2_compute_XtXz_bed_impl(const std::string &bed_prefix,
     const int64_t M_total = count_lines_cached(bim_path);
     if (blk_end > M_total) throw std::runtime_error("blk_end exceeds #SNPs in BIM");
 
-    std::vector<int> rows = parse_row_sel(row_sel_obj, N_total);
+    const std::vector<int>& rows = parse_row_sel(row_sel_obj, N_total);
 
     // Read & standardize geno block -> Geno (N x L), col-major
     int N = 0, L = 0;
@@ -489,16 +524,20 @@ void phase2_compute_XtXz_bed_impl(const std::string &bed_prefix,
     // Scale Geno columns by inv_left / (N_denom - 1)  (in-place)
     T denom = T(N_denom) - T(1);
     if (denom <= T(0)) denom = T(1);
+
+    #ifdef _OPENMP
+    #pragma omp parallel for schedule(static)
+    #endif
     for (int i = 0; i < L; ++i) {
         const T s = inv[i] / denom;
-        T* col = Geno.data() + (size_t)i * (size_t)N;  // col-major
+        T* col = Geno.data() + (size_t)i * (size_t)N;
         #pragma omp simd
         for (int r = 0; r < N; ++r) col[r] *= s;
     }
 
     // Tile planning over Q = B*V (columns contiguous in K-major)
     const int Q = BV;
-    int QPANEL = 16384;
+    int QPANEL = 4096;
     if (const char* qp = std::getenv("SUMMIT_P2_QP")) {
         int val = std::atoi(qp);
         if (val > 0) QPANEL = val;
@@ -508,8 +547,14 @@ void phase2_compute_XtXz_bed_impl(const std::string &bed_prefix,
     if (QPANEL > Q) QPANEL = Q;
     if (QPANEL < 64) QPANEL = std::min(Q, 64);
 
-    // Workspace for one Q panel: (L x QPANEL), col-major
-    AlignedBuffer<T> Work_panel((size_t)L * (size_t)QPANEL, 64);
+    // Workspace for one Q panel: (L x QPANEL), col-major; thread-local version
+    static thread_local AlignedBuffer<T> Work_panel_tls;
+    const size_t needW = (size_t)L * (size_t)QPANEL;
+    if (Work_panel_tls.n < needW) {
+        Work_panel_tls.allocate(needW, 64);
+    }
+    T* Work = Work_panel_tls.ptr;
+
 
     const T invV = T(1) / T(nvecs);
 
@@ -526,27 +571,40 @@ void phase2_compute_XtXz_bed_impl(const std::string &bed_prefix,
         gemm_col_major_tn<T>(/*m=*/L, /*n=*/q, /*k=*/N,
                              /*A=*/Geno.data(), /*lda=*/N,  // A^T is LxN
                              /*B=*/rhs,        /*ldb=*/N,  // N x q
-                             /*C=*/Work_panel.ptr, /*ldc=*/L,
+                             /*C=*/Work, /*ldc=*/L,
                              /*alpha=*/T(1), /*beta=*/T(0));
         auto t3 = std::chrono::high_resolution_clock::now();
         t.add_gemm(std::chrono::duration<double,std::milli>(t3 - t2).count());
 
         // Reduce: meansq[blk_start:blk_end, k] += (wcol^2)/V
         auto t4 = std::chrono::high_resolution_clock::now();
-        for (int tcol = 0; tcol < q; ++tcol) {
-            const int g = q0 + tcol;            // global column within [0, B*V)
-            const int k = g / nvecs;            // **K-major** bin index
-            const T* __restrict wcol = Work_panel.ptr + (size_t)tcol * (size_t)L;
+        // Reduce: meansq[blk_start:blk_end, k] += (sum over v in this panel segment of w^2)/V
+        // K-major implies columns are ordered by k then v; within a q-panel, each bin k appears
+        // as contiguous segments of length <= nvecs.
+        const int k0 = q0 / nvecs;
+        const int k1 = (q0 + q - 1) / nvecs;
 
-            // base pointer for this bin's column in global meansq
-            T* __restrict out = Mptr + ((size_t)blk_start * (size_t)B + (size_t)k);
+        #pragma omp parallel for collapse(2) schedule(static)
+        for (int k = k0; k <= k1; ++k) {
+        for (int i = 0; i < L; ++i) {
+            const int g0 = std::max(q0, k * nvecs);
+            const int g1 = std::min(q0 + q, (k + 1) * nvecs);
+            const int seg_len = g1 - g0;
+            const int tcol0 = g0 - q0;
 
-            #pragma omp simd
-            for (int i = 0; i < L; ++i) {
-                const T z2 = wcol[i] * wcol[i] * invV;
-                out[(size_t)i * (size_t)B] += z2; // stride by B across rows
+            long double acc = 0.0L;
+            const T* base = Work + (size_t)tcol0 * (size_t)L + (size_t)i;
+            for (int c = 0; c < seg_len; ++c) {
+            T w = base[(size_t)c * (size_t)L];
+            acc += (long double)w * (long double)w;
             }
+
+            T* out = Mptr + ((size_t)blk_start * (size_t)B + (size_t)k);
+            out[(size_t)i * (size_t)B] += (T)(acc * (long double)invV);
         }
+        }
+
+
         auto t5 = std::chrono::high_resolution_clock::now();
         t.add_reduce(std::chrono::duration<double,std::milli>(t5 - t4).count());
     }
@@ -569,6 +627,15 @@ PYBIND11_MODULE(gwldcore, m) {
 
     m.def("set_num_threads", &set_num_threads, py::arg("n"),
       "Set the number of OpenMP threads used inside gwldcore.");
+    
+    m.def("prefetch_bed_block",
+      &prefetch_bed_block_py,
+      py::arg("bed_prefix"),
+      py::arg("fam_path"),
+      py::arg("blk_start"),
+      py::arg("blk_end"),
+      py::arg("ahead_blocks") = 1,
+      "Prefetch .bed bytes for [blk_start, blk_end) and optionally ahead blocks (Linux mmap+madvise).");
 
     // Phase 1 (chunked) float32
     m.def("phase1_compute_Xz_bed_chunk",

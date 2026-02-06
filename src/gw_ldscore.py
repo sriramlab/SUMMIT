@@ -50,57 +50,99 @@ def apply_env(cfg: dict) -> int:
     """
     Apply low-level environment knobs from a plain dict and enforce BLAS/OMP threads.
 
+    Additions:
+      - optional affinity expansion to all *allowed* CPUs (cfg["force_affinity_all"]=True)
+      - set SUMMIT_DECODE_THREADS (cfg["decode_threads"] or auto)
+      - avoid clobbering OMP_PROC_BIND twice
+
     Recognized keys (all optional):
-      - ctile: int                     # direct CTILE override (cols)
-      - ctile_mb: int                  # CTILE memory budget (MiB)
-      - ctile_l3pct: float             # 0.0–1.0 fraction of per-socket L3 cache
-      - malloc_arena_max: int          # glibc arena hygiene (default is 2)
-      - malloc_trim_threshold: int     # trim threshold bytes (default is 131072)
-      - malloc_mmap_threshold: int     # mmap threshold bytes (default is 131072)
+      - force_affinity_all: bool       # try to expand to all allowed CPUs
+      - decode_threads: int            # set SUMMIT_DECODE_THREADS explicitly
+      - decode_threads_cap: int        # cap auto decode threads (default 16)
+      - decode_mem_cap_mb: int         # cap decode tmpN total footprint (default 512 MiB)
+      - numa_mode / numa_nodes         # as before
+      - num_threads                    # if you pass this in cfg, we use it as the "intent" for n_threads
+      - omp_proc_bind / omp_places / kmp_blocktime  # as before
+      - ctile / ctile_mb / ctile_l3pct / sockets    # as before
+      - malloc_* knobs                 # as before
 
     Returns:
       actual_blas_threads (int): detected BLAS threads after enforcement.
     """
-    
-    def maybe_wrap_with_numactl(mode: str | None, nodes: str = "all") -> None:
-        """
-        Re-exec the current process under numactl with the requested policy.
+    import os, sys, shutil, ctypes
 
-        mode: one of {"interleave", "membind", "cpunodebind", "preferred"} or None
-        nodes: e.g. "all", "0", "1,2", "0-1", etc.
-        """
+    def maybe_wrap_with_numactl(mode: str | None, nodes: str = "all") -> None:
         if not mode or os.name != "posix":
             return
         if os.environ.get("SUMMIT_NUMACTL_WRAPPED") == "1":
-            return  # already wrapped
-
+            return
         exe = shutil.which("numactl")
         if not exe:
-            return  # numactl not found in this env; silently skip
-
+            return
         flag = {
             "interleave":  "--interleave",
             "membind":     "--membind",
             "cpunodebind": "--cpunodebind",
             "preferred":   "--preferred",
-        }.get(mode.lower())
+        }.get(str(mode).lower())
         if not flag:
             return
-
-        # Re-exec under numactl
         os.environ["SUMMIT_NUMACTL_WRAPPED"] = "1"
         args = [exe, f"{flag}={nodes}", sys.executable, *sys.argv]
         os.execv(exe, args)
 
-    def _cpu_count_affinity() -> int:
+    # ---- affinity helpers ----
+    def _cpu_set_allowed():
+        """Return the current allowed CPU set for this process (Linux cpuset/taskset aware)."""
         try:
-            return len(os.sched_getaffinity(0))  # respects cgroup/pin
+            return set(os.sched_getaffinity(0))
         except Exception:
-            return os.cpu_count() or 1
+            # fallback: assume [0..os.cpu_count)
+            return set(range(os.cpu_count() or 1))
 
-    # Probe BLAS threads after we set things, using threadpoolctl if available.
+    def _expand_affinity_to_all_allowed():
+        """
+        Try to expand to all CPUs that *could* be available on this machine.
+        If we're inside a cpuset/cgroup, the kernel will clip.
+        """
+        if os.name != "posix" or not hasattr(os, "sched_setaffinity"):
+            return
+        # if user didn't request it, don't touch
+        if not bool(cfg.get("force_affinity_all", False)):
+            return
+
+        # Build "online CPUs" from sysfs (Linux) as the maximal target.
+        target = None
+        try:
+            with open("/sys/devices/system/cpu/online", "r") as f:
+                s = f.read().strip()
+            cpus = set()
+            for part in s.split(","):
+                part = part.strip()
+                if not part:
+                    continue
+                if "-" in part:
+                    a, b = part.split("-", 1)
+                    a, b = int(a), int(b)
+                    cpus.update(range(a, b + 1))
+                else:
+                    cpus.add(int(part))
+            target = cpus
+        except Exception:
+            target = set(range(os.cpu_count() or 1))
+
+        try:
+            os.sched_setaffinity(0, target)
+        except Exception:
+            # non-fatal (common when cpuset disallows it)
+            pass
+
+    def _cpu_count_affinity() -> int:
+        return len(_cpu_set_allowed())
+
+    # ---- BLAS threads probing ----
     def _detect_blas_threads_fallback() -> int:
-        for k in ("OPENBLAS_NUM_THREADS","MKL_NUM_THREADS","BLIS_NUM_THREADS","VECLIB_MAXIMUM_THREADS"):
+        for k in ("OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS", "BLIS_NUM_THREADS", "VECLIB_MAXIMUM_THREADS"):
             v = os.environ.get(k)
             if v and v.isdigit():
                 return max(1, int(v))
@@ -113,33 +155,65 @@ def apply_env(cfg: dict) -> int:
             for lib in threadpool_info():
                 api = str(lib.get("internal_api", "")).lower()
                 path = str(lib.get("filepath", "")).lower()
-                if any(k in api for k in ("openblas","mkl","blis","accelerate")) or \
-                   any(k in path for k in ("openblas","mkl","blis","veclib","accelerate")):
+                if any(k in api for k in ("openblas", "mkl", "blis", "accelerate")) or \
+                   any(k in path for k in ("openblas", "mkl", "blis", "veclib", "accelerate")):
                     tot += int(lib.get("num_threads", 0))
             return tot if tot > 0 else _detect_blas_threads_fallback()
         except Exception:
             return _detect_blas_threads_fallback()
-    
+
     # -------- 0) NUMA config --------
-    maybe_wrap_with_numactl(
-        mode = cfg.get("numa_mode"),
-        nodes = str(cfg.get("numa_nodes", "all"))
-    )
-    n_threads = _cpu_count_affinity()
-    # OpenMP (phase 1) & BLAS (phase 2) will be re-tuned around calls,
-    # but we set sane process-wide defaults here:
+    maybe_wrap_with_numactl(mode=cfg.get("numa_mode"), nodes=str(cfg.get("numa_nodes", "all")))
+
+    # Optionally expand affinity (THIS is what will fix your “Cpus_allowed_list: 0-63”)
+    _expand_affinity_to_all_allowed()
+
+    # Decide "n_threads" default:
+    # - if cfg explicitly provides num_threads, respect it (but still clipped by affinity)
+    # - else use affinity size
+    n_aff = _cpu_count_affinity()
+    if cfg.get("num_threads") is not None:
+        n_threads = max(1, min(int(cfg["num_threads"]), n_aff))
+    else:
+        n_threads = max(1, n_aff)
+
+    # ---- Set decode threads env for genotype.cpp ----
+    # If user provided cfg["decode_threads"], use it. Else auto = min(cap, n_aff).
+    if "decode_threads" in cfg and cfg["decode_threads"] is not None:
+        dec = int(cfg["decode_threads"])
+        dec = max(1, min(dec, n_aff))
+    else:
+        cap = int(cfg.get("decode_threads_cap", 16))
+        cap = max(1, cap)
+        dec = min(cap, n_aff)
+
+    # Optional memory cap guidance: genotype.cpp already self-caps by SUMMIT_DECODE_THREADS,
+    # but we can pass the intended cap too (it uses an internal 512 MiB default).
+    # We'll expose this as env for you if you later want genotype.cpp to read it.
+    decode_mem_cap_mb = int(cfg.get("decode_mem_cap_mb", 512))
+    if decode_mem_cap_mb < 64:
+        decode_mem_cap_mb = 64
+    os.environ["SUMMIT_DECODE_THREADS"] = str(dec)
+    os.environ["SUMMIT_DECODE_MEM_CAP_MB"] = str(decode_mem_cap_mb)  # optional future hook
+
+    # ---- OpenMP defaults ----
     os.environ["OMP_NUM_THREADS"] = str(n_threads)
     os.environ["OMP_DYNAMIC"] = "FALSE"
 
-    # BLAS vendors
-    for var in ("OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS",
-                "BLIS_NUM_THREADS", "VECLIB_MAXIMUM_THREADS"):
+    # Helpful affinity / runtime hints (do NOT clobber twice)
+    # Keep your defaults, but now they actually apply.
+    os.environ.setdefault("OMP_PROC_BIND", str(cfg.get("omp_proc_bind", "spread")))  # or "close"
+    os.environ.setdefault("OMP_PLACES",    str(cfg.get("omp_places", "threads")))      # consider "threads" if you want SMT; "cores" otherwise.
+    os.environ.setdefault("KMP_BLOCKTIME", str(cfg.get("kmp_blocktime", 0)))
+
+    # Vendor-specific (safe defaults)
+    os.environ.setdefault("MKL_ENABLE_INSTRUCTIONS", "AVX512")
+
+    # ---- BLAS vendors default threads ----
+    for var in ("OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS", "BLIS_NUM_THREADS", "VECLIB_MAXIMUM_THREADS"):
         os.environ[var] = str(n_threads)
     os.environ["OPENBLAS_DYNAMIC"] = "0"
     os.environ["MKL_DYNAMIC"] = "FALSE"
-    
-    os.environ["OMP_PROC_BIND"] = "true"
-    os.environ["MKL_ENABLE_INSTRUCTIONS"] = "AVX512"
 
     # Also try to enforce into already loaded libraries
     try:
@@ -147,7 +221,7 @@ def apply_env(cfg: dict) -> int:
         mkl.set_num_threads(n_threads)
     except Exception:
         pass
-    # OpenBLAS direct calls (attempt several sonames/symbols)
+
     try:
         for soname in ("libopenblas.so", "libopenblas.so.0", "libopenblas64_.so", "libopenblas64_.so.0"):
             try:
@@ -163,7 +237,7 @@ def apply_env(cfg: dict) -> int:
                 continue
     except Exception:
         pass
-        
+
     actual = _detect_blas_threads()
     os.environ["SUMMIT_BLAS_THREADS"] = str(actual)
 
@@ -186,7 +260,7 @@ def apply_env(cfg: dict) -> int:
     sockets = cfg.get("sockets")
     if sockets is not None:
         os.environ["SUMMIT_SOCKETS"] = str(int(sockets))
-    
+
     # -------- 3) Malloc hygiene (optional) --------
     if cfg.get("malloc_arena_max") is not None:
         os.environ["MALLOC_ARENA_MAX"] = str(int(cfg["malloc_arena_max"]))
@@ -194,14 +268,9 @@ def apply_env(cfg: dict) -> int:
         os.environ["MALLOC_TRIM_THRESHOLD_"] = str(int(cfg["malloc_trim_threshold"]))
     if cfg.get("malloc_mmap_threshold") is not None:
         os.environ["MALLOC_MMAP_THRESHOLD_"] = str(int(cfg["malloc_mmap_threshold"]))
-    
-    # Helpful affinity / runtime hints
-    os.environ.setdefault("OMP_PROC_BIND", str(cfg.get("omp_proc_bind", "spread")))   # or "close"
-    os.environ.setdefault("OMP_PLACES",    str(cfg.get("omp_places", "cores")))     # "cores" is a good default
-    os.environ.setdefault("KMP_BLOCKTIME", str(cfg.get("kmp_blocktime", 0)))        # reduce oversubscription
-    #os.environ.setdefault("KMP_AFFINITY",  str(cfg.get("kmp_affinity", "granularity=fine,compact,1,0")))
 
     return actual
+
 
 def set_parallelism(omp_threads: int | None = None, blas_threads: int | None = None):
     if omp_threads is not None:
@@ -1216,6 +1285,9 @@ class GenomewideLDScore:
                         bar.update(w1)
 
                 # ---------------------- Phase 2 ----------------------
+                pref_ex = ThreadPoolExecutor(max_workers=1)
+                pref_fut = None
+                        
                 meansq_chunk.fill(0)
                 t2_total = 0.0
 
@@ -1286,12 +1358,22 @@ class GenomewideLDScore:
                             kmax_hint = int(kmax_per_block[blk_idx])
                             if kmax_hint == 0:
                                 continue
-
                             inv_left  = inv_blocks[blk_idx]
                             if self.C is not None:
                                 N_denom = int(self.N_eff)
                             else:
                                 N_denom = int(self.nsamp - self.ddof + 1)
+                            
+                            # schedule prefetch for NEXT block while we compute current
+                            if blk_idx + 1 < len(blocks):
+                                s2, e2 = blocks[blk_idx + 1]
+                                # fire-and-forget; if previous prefetch still running, let it finish (single worker queue)
+                                pref_fut = pref_ex.submit(
+                                    gwldcore.prefetch_bed_block,
+                                    bed_prefix, fam_path,
+                                    int(s2), int(e2),
+                                    1,  # ahead_blocks
+                                )
 
                             t0 = time.perf_counter()
                             gwldcore.phase2_compute_XtXz_bed(
@@ -1311,6 +1393,9 @@ class GenomewideLDScore:
                             )
                             t2_total += (time.perf_counter() - t0)
                             bar.update(1.0 - w1)
+
+                # end prefetch
+                pref_ex.shutdown(wait=True)
 
                 # Weighted combine across tiles
                 meansq_accum += (meansq_chunk * Vt)
