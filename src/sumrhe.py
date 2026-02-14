@@ -8,8 +8,8 @@ import sys
 
 class Sumrhe:
     def __init__(self, bim_path=None, sum_path=None, save_path=None, h2_path=None, out=None, chisq_threshold=0, \
-            log=None, mem=False, verbose=False, ldscores=None, njack=None, annot=None,
-            report_tau: bool = True, allow_neg_enr: bool = False, clip_nonfinite_vals: bool = False, adjust_delta: bool = False):
+            log=None, mem=False, verbose=False, ldscores=None, njack=None, annot=None, chisq_action='drop',
+            report_tau: bool = True, allow_neg_enr: bool = False, clip_nonfinite_vals: bool = False, adjust_delta: bool = False, enrich_mode: str = "auto"):
         self.mem = mem
         self.log = log
         self.start_time = utils._get_time()
@@ -18,7 +18,7 @@ class Sumrhe:
         self.nblks = self.tr.nblks
         self.annot_header = self.tr.annot_header
         self.nbins = self.tr.nbins
-        self.sums = Sumstats(nblks=self.nblks, chisq_threshold=chisq_threshold, log=self.log, annot_df=self.tr.annot_df, nbins=self.nbins)
+        self.sums = Sumstats(nblks=self.nblks, chisq_threshold=chisq_threshold, log=self.log, annot_df=self.tr.annot_df, nbins=self.nbins, chisq_action=chisq_action)
         
         try:
             self.h2_dir = utils._parse_sumdir(h2_path)
@@ -36,8 +36,25 @@ class Sumrhe:
         self.herits  = np.zeros((self.npheno, self.nblks+1, self.nbins+1)) # jackknife subsampled h2
         self.hersums = np.zeros((self.npheno, self.nbins+1, 2)) # total h2 + se
         
-        self.enrich = np.zeros((self.npheno, self.nblks+1, self.nbins))
-        self.enrich_sums = np.zeros((self.npheno, self.nbins, 2))
+        self.enrich_mode = self._normalize_enrich_mode(enrich_mode)
+        self._enrich_mode_used = [""] * self.npheno  # resolved mode used for self.enrich per phenotype
+
+        # Primary enrichment arrays (backwards-compatible)
+        self.enrich = np.zeros((self.npheno, self.nblks+1, self.nbins), dtype=np.float64)
+        self.enrich_sums = np.zeros((self.npheno, self.nbins, 2), dtype=np.float64)
+
+        # Optional: store both enrichments when requested
+        self.enrich_overlap = None
+        self.enrich_overlap_sums = None
+        self.enrich_nonoverlap = None
+        self.enrich_nonoverlap_sums = None
+
+        if self.enrich_mode == "both":
+            self.enrich_overlap = np.zeros((self.npheno, self.nblks+1, self.nbins), dtype=np.float64)
+            self.enrich_overlap_sums = np.zeros((self.npheno, self.nbins, 2), dtype=np.float64)
+            self.enrich_nonoverlap = np.zeros((self.npheno, self.nblks+1, self.nbins), dtype=np.float64)
+            self.enrich_nonoverlap_sums = np.zeros((self.npheno, self.nbins, 2), dtype=np.float64)
+
 
         self.out = out
         self.verbose = verbose
@@ -51,6 +68,31 @@ class Sumrhe:
             self.tau_star    = np.zeros((self.npheno, self.nblks+1, self.nbins), dtype=np.float64)
             self.tau_sums    = np.zeros((self.npheno, self.nbins, 2), dtype=np.float64)  # [point, SE]
             self.tau_star_sums = np.zeros((self.npheno, self.nbins, 2), dtype=np.float64)
+    
+    @staticmethod
+    def _normalize_enrich_mode(mode: str) -> str:
+        if mode is None:
+            return "auto"
+        m = str(mode).strip().lower().replace("_", "-").replace(" ", "-")
+        if m in ("auto",):
+            return "auto"
+        if m in ("overlap", "overlapping"):
+            return "overlap"
+        if m in ("non-overlap", "nonoverlap", "nonoverlapping", "component", "components"):
+            return "non-overlap"
+        if m in ("both", "all"):
+            return "both"
+        raise ValueError(f"Invalid enrich_mode={mode!r}. Choose from: auto, overlap, non-overlap, both.")
+
+    @staticmethod
+    def _has_overlapping_annotations(A: np.ndarray) -> bool:
+        """
+        Returns True if any SNP has >1 nonzero annotation entry.
+        Works for binary or continuous weights. Exact-zero based.
+        """
+        # np.count_nonzero is C-optimized and avoids a big Python loop.
+        return bool(np.any(np.count_nonzero(A, axis=1) > 1))
+
 
 
     def _calc_sigmas(self, idx):
@@ -158,12 +200,16 @@ class Sumrhe:
         """
         Enrichment = (h2_cat / h2_tot) / prop
 
-        For continuous/overlapping annotations:
-        Ak_rep[k] = sum_j a_{j,k}  (sum of weights in replicate)
-        prop[k]   = Ak_rep[k] / M_rep, where M_rep is #SNPs in replicate (not sum_k Ak).
+        prop is computed as:
+            prop[k] = Ak_rep[k] / M_rep
+        where Ak_rep[k] is sum of weights (or SNP count if binary) in replicate,
+        and M_rep is the number of SNPs in replicate.
 
-        This matches your previous overlapping convention and generalizes to continuous
-        as "relative to mean weight per SNP".
+        Enrichment modes:
+          - "overlap": uses overlap/SNP-set h2_cat (your self.herits[..., :K])
+          - "non-overlap": uses component h2_cat from variance components (sigma_g)
+          - "auto": picks "non-overlap" if annotations are non-overlapping, else "overlap"
+          - "both": computes both and stores in self.enrich_overlap/nonoverlap (and also sets self.enrich to auto-picked one)
         """
         A = np.asarray(self.tr.annot, dtype=np.float64, order='C')  # (M, K)
         M_full, K = A.shape
@@ -203,21 +249,67 @@ class Sumrhe:
         M_rep[:B] = float(M_full) - m_blk
         M_rep[B]  = float(M_full)
 
-        h2_cat = self.herits[idx, :, :K]   # (B+1, K)
-        h2_tot = self.herits[idx, :, -1]   # (B+1,)
-
+        # prop (relative to mean weight per SNP)
         with np.errstate(divide='ignore', invalid='ignore'):
-            prop = Ak_rep / M_rep[:, None]                    # (B+1, K)
-            enr  = (h2_cat / h2_tot[:, None]) / prop
+            prop = Ak_rep / M_rep[:, None]  # (B+1, K)
 
-            invalid = (~np.isfinite(enr)) | (~np.isfinite(prop)) | (prop <= 0.0)
+        # Total SNP h2 (your convention: sum of sigma_g)
+        # Keep consistent with your herits[:, -1] = sum sigma_g.
+        h2_tot = self.herits[idx, :, -1].astype(np.float64, copy=False)  # (B+1,)
 
-            if not self.allow_neg_enr:
-                invalid |= (h2_tot[:, None] <= 0.0)
+        # Decide which mode(s) to compute
+        requested = self.enrich_mode
+        has_ov = self._has_overlapping_annotations(A)
 
-            enr[invalid] = np.nan
+        if requested == "auto":
+            mode_used = "overlap" if has_ov else "non-overlap"
+            modes_to_compute = (mode_used,)
+        elif requested == "both":
+            # compute both; choose what to put in self.enrich using the auto rule
+            mode_used = "overlap" if has_ov else "non-overlap"
+            modes_to_compute = ("non-overlap", "overlap")
+        else:
+            mode_used = requested
+            modes_to_compute = (requested,)
 
-        self.enrich[idx] = enr
+        self._enrich_mode_used[idx] = mode_used
+        if self.verbose and requested in ("auto", "both"):
+            self.log._log(f"[enrichment] phenotype={idx} enrich_mode={requested} resolved={mode_used} has_overlap={has_ov}")
+
+        def _compute_enr_from_h2cat(h2_cat: np.ndarray) -> np.ndarray:
+            # h2_cat: (B+1, K)
+            with np.errstate(divide='ignore', invalid='ignore'):
+                enr = (h2_cat / h2_tot[:, None]) / prop
+
+                invalid = (~np.isfinite(enr)) | (~np.isfinite(prop)) | (prop <= 0.0)
+                if not self.allow_neg_enr:
+                    invalid |= (h2_tot[:, None] <= 0.0)
+
+                enr[invalid] = np.nan
+            return enr
+
+        enr_ov = None
+        enr_no = None
+
+        if "overlap" in modes_to_compute:
+            # overlap/SNP-set enrichment (paper's "overlapping enrichment" notion)
+            h2_cat_ov = self.herits[idx, :, :K].astype(np.float64, copy=False)  # (B+1, K)
+            enr_ov = _compute_enr_from_h2cat(h2_cat_ov)
+
+        if "non-overlap" in modes_to_compute:
+            # component enrichment (variance-component share)
+            h2_cat_no = self.sigmas[idx, :, :K].astype(np.float64, copy=False)  # (B+1, K) == sigma_g,k
+            enr_no = _compute_enr_from_h2cat(h2_cat_no)
+
+        # Store results
+        if requested == "both":
+            self.enrich_overlap[idx] = enr_ov
+            self.enrich_nonoverlap[idx] = enr_no
+            # keep backward-compatible self.enrich as the auto-resolved one
+            self.enrich[idx] = enr_ov if mode_used == "overlap" else enr_no
+        else:
+            self.enrich[idx] = enr_ov if mode_used == "overlap" else enr_no
+
 
         
     def _calc_tau(self, idx):
@@ -333,6 +425,18 @@ class Sumrhe:
         self.enrich_sums[idx, :, 0] = est_full_enr
         self.enrich_sums[idx, :, 1] = se_jk_enr
 
+        # Optional enrichment outputs (both-mode)
+        if self.enrich_overlap is not None:
+            est_full_eov, se_jk_eov = utils._calc_jackknife_se(self.enrich_overlap[idx], axis=0, center='full', nan_policy=nan_policy)
+            self.enrich_overlap_sums[idx, :, 0] = est_full_eov
+            self.enrich_overlap_sums[idx, :, 1] = se_jk_eov
+
+        if self.enrich_nonoverlap is not None:
+            est_full_eno, se_jk_eno = utils._calc_jackknife_se(self.enrich_nonoverlap[idx], axis=0, center='full', nan_policy=nan_policy)
+            self.enrich_nonoverlap_sums[idx, :, 0] = est_full_eno
+            self.enrich_nonoverlap_sums[idx, :, 1] = se_jk_eno
+
+
         # τ / τ* if requested
         if self.report_tau:
             est_full_tau, se_jk_tau = utils._calc_jackknife_se(self.tau[idx], axis=0, center='full', nan_policy=nan_policy)
@@ -379,6 +483,9 @@ class Sumrhe:
     
     def _logoff(self):
         for i in range(self.npheno):
+            if self._enrich_mode_used[i]:
+                self.log._log(f"^^^ Phenotype {i} enrichment_mode_used: {self._enrich_mode_used[i]}")
+
             if (self.nbins > 1):
                 for j in range(self.nbins):
                     sig   = self.sigsums[i, j, 0]
@@ -388,10 +495,25 @@ class Sumrhe:
                     enr   = self.enrich_sums[i, j, 0]
                     ense  = self.enrich_sums[i, j, 1]
 
+                    # If both-mode was requested, report both enrichments explicitly
+                    enr_ov = ense_ov = None
+                    enr_no = ense_no = None
+                    if self.enrich_overlap_sums is not None:
+                        enr_ov  = self.enrich_overlap_sums[i, j, 0]
+                        ense_ov = self.enrich_overlap_sums[i, j, 1]
+                    if self.enrich_nonoverlap_sums is not None:
+                        enr_no  = self.enrich_nonoverlap_sums[i, j, 0]
+                        ense_no = self.enrich_nonoverlap_sums[i, j, 1]
+
                     line = (f"^^^ Phenotype {i} Bin [{self.annot_header[j]}] "
                             f"sigma_g^2: {sig:.5f} (SE: {sigse:.5f}) "
                             f"h^2_cat: {h2:.5f} (SE: {h2se:.5f}) "
                             f"Enrichment: {enr:.5f} (SE: {ense:.5f})")
+
+                    if (enr_no is not None) and (enr_ov is not None):
+                        line += (f" Enrichment_nonoverlap: {enr_no:.5f} (SE: {ense_no:.5f})"
+                                 f" Enrichment_overlap: {enr_ov:.5f} (SE: {ense_ov:.5f})")
+
                     if self.report_tau:
                         t    = self.tau_sums[i, j, 0]
                         tse  = self.tau_sums[i, j, 1]

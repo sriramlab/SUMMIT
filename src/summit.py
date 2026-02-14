@@ -36,8 +36,10 @@ parser.add_argument("--h2", default=None, type=str, \
                     ' If the path is a directory, all summary statistics (ending with .sumstat[.gz]) will be used.')
 parser.add_argument("--rg", default=None, type=str, \
                    help='Comma-separated file path for a pair of phenotype-specific summary statistics (.sumstat[.gz]) to estimate genetic correlation (rg).')
-parser.add_argument("--max-chisq", action='store', default=None, type=float, \
-                    help='Filter out SNPs with chi-sq statistic above the threshold. This can be done either only on the yKy or on both sides (use --filter-both-sides); with many non-polygenic SNPs, one-sided filtering might not be accurate')
+parser.add_argument("--max-chisq", action='store', default=None, type=str, \
+                    help='Filter out SNPs with chi-sq statistic above the threshold. If set to auto, it will automatically determine a sensible outlier threshold.')
+parser.add_argument("--chisq-action", default='drop', type=str, \
+                    help='Specify what to do with outlier SNPs (high chi-sq values).')
 
 # Additional input arguments
 parser.add_argument("--annot", default=None, type=str, \
@@ -56,6 +58,7 @@ parser.add_argument("--allow-neg-enr", action="store_true", default=False,\
                     help='Allow negative enrichment estimates. Default is False.')
 parser.add_argument("--clip-nonfinite-vals", action="store_true", default=False,\
                     help='Clip nonfinite estimates of h2 and tau to 0.0. Default is False.')
+parser.add_argument("--enrich-mode", choices=["auto", "overlap", "non-overlap", "both"], default="auto")
 
 # SE arguments
 parser.add_argument("--njack", default=100, type=int, \
@@ -94,6 +97,7 @@ parser.add_argument("--ddof", default=1, type=int, \
 parser.add_argument("--ld-wind-kb", default=None, type=float,
                     help="If set, compute (covariate-adjusted) *windowed* LD scores with window size in kb "
                          "(switches LD-score mode from genome-wide stochastic to windowed).")
+parser.add_argument("--correct-skew", action="store_true", help="Enable optional 4th-moment (mu22) finite-sample skew correction diagnostics; writes .gw.delta")
 
 
 # LD score resource allocation arguments
@@ -114,14 +118,14 @@ parser.add_argument("--vtiles", type=int, default=None,
                     help="Force number of V-tiles; the code will split V evenly into this many tiles.")
 
 # Low-level performance knobs
-parser.add_argument("--ctile", type=int, default=None,
-                    help="Manual CTILE override (columns in the RHS tile). Rounded up to a multiple of 64. If set, overrides --ctile-mib and --ctile-l3pct.")
-parser.add_argument("--ctile-mb", type=int, default=None,
-                    help="Memory-budget-driven CTILE (MiB). If set, overrides --ctile-l3pct. Mutually exclusive with --ctile.")
-parser.add_argument("--ctile-l3pct", type=float, default=0.80,
-                    help="Fraction of per-socket L3 cache to target per BLAS thread for CTILE auto-sizing. Ignored if --ctile or --ctile-mib is provided. Default: 0.80")
-parser.add_argument("--sockets", type=int, default=None,
-                    help="Override the number of CPU sockets for CTILE heuristics. By default it is auto-detected from CPU topology.")
+parser.add_argument("--q-panel", type=int, default=None,
+                    help="Specify the size of QPANEL used for the GEMM step of phase 2; rounded to multiples of 64. Default is 32768.")
+parser.add_argument("--reduce-blk", type=int, default=None,
+                    help="Specify the size of IBLK used for the reduction step of phase 2; rounded to multiples of 64. Default is 2048.")
+parser.add_argument("--reduce-threads", type=int, default=None,
+                    help="Number of threads to use for parallelizing the reduction step fo phase 2; capped at number of slabs (step_size/reduce_blk). Default is 1.")
+# parser.add_argument("--sockets", type=int, default=None,
+#                     help="Override the number of CPU sockets for CTILE heuristics. By default it is auto-detected from CPU topology.")
 parser.add_argument("--malloc-arena-max", type=int, default=2)
 parser.add_argument("--malloc-trim-threshold", type=int, default=131072)
 parser.add_argument("--malloc-mmap-threshold", type=int, default=131072)
@@ -192,10 +196,9 @@ if __name__ == '__main__':
     low_level = {
         "numa_mode": args.numa_mode,
         "numa_nodes": args.numa_nodes,
-        "ctile":         args.ctile,
-        "ctile_mb":      args.ctile_mb,
-        "ctile_l3pct":   args.ctile_l3pct,
-        "sockets":       args.sockets,
+        "q_panel":         args.q_panel,
+        "reduce_blk":      args.reduce_blk,
+        "reduce_threads":   args.reduce_threads,
         "malloc_arena_max":        args.malloc_arena_max,
         "malloc_trim_threshold":   args.malloc_trim_threshold,
         "malloc_mmap_threshold":   args.malloc_mmap_threshold,
@@ -327,7 +330,7 @@ if __name__ == '__main__':
                 bed_path=args.geno, annot_path=args.annot, out_path=args.out, covar_path=args.covar, rand_dist=args.rand_dist,
                 log=log, num_vecs=args.nvecs, step_size=args.step_size, seed=args.seed, verbose=args.verbose,
                 dtype=args.dtype, num_threads=args.num_threads, rand_samp=args.rand_samp, low_level=low_level, target_xz_mem=args.target_xz_mem,
-                target_mem=args.target_mem, device=args.device, use_tp32=args.use_tp32
+                target_mem=args.target_mem, device=args.device, use_tp32=args.use_tp32, correct_skew=args.correct_skew
             )
             gwld._compute_ldscore()
 
@@ -338,14 +341,10 @@ if __name__ == '__main__':
                 log._log("!!! .bim file used for trace summary calculation must also be provided !!!")
                 sys.exit(1)
             sys.exit(1)
-        if (args.max_chisq is not None):
-            if (args.max_chisq <= .0):
-                log._log("!!! max-chisq must be a positive value !!!")
-                sys.exit(1)
         sums = Sumrhe(bim_path=args.bim, sum_path=args.trace, save_path = args.save_trace, h2_path=args.h2,\
             chisq_threshold=args.max_chisq, log=log, out=args.out, verbose=args.verbose, ldscores=args.ldscores,\
             njack=args.njack, annot=args.annot, allow_neg_enr=args.allow_neg_enr, clip_nonfinite_vals=args.clip_nonfinite_vals,\
-            adjust_delta=args.adjust_delta)
+            adjust_delta=args.adjust_delta, enrich_mode=args.enrich_mode)
         sums._run()
         sums._logoff()
     elif (args.rg is not None):
@@ -357,7 +356,7 @@ if __name__ == '__main__':
         #     sys.exit(1)
         rg = Sumcore(bim_path=args.bim, save_path=args.save_trace, rg=args.rg,\
             chisq_threshold=args.max_chisq, log=log, verbose=args.verbose, out=args.out, \
-            ldscores=args.ldscores, ldscores_reg=args.ldscores_reg, njack=args.njack, annot=args.annot)
+            ldscores=args.ldscores, ldscores_reg=args.ldscores_reg, njack=args.njack, annot=args.annot, enrich_mode=args.enrich_mode)
          
             #intercept=args.intercept_rg, phenos=args.pheno_rg
         rg._run()

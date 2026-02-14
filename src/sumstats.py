@@ -14,7 +14,7 @@ import sys
 _CHI2_MEDIAN_1DF = 0.454936423119572
 
 class Sumstats:
-    def __init__(self, nblks=100, chisq_threshold=0, log=None, both_side=False, annot_df=None, nbins=1):
+    def __init__(self, nblks=100, chisq_threshold=0, chisq_action='drop', log=None, both_side=False, annot_df=None, nbins=1):
         self.log = log
         self.nblks = nblks
         self.nbins = nbins
@@ -27,6 +27,10 @@ class Sumstats:
         self.nsnps = 0
         self.nsnps_blk = None
         self.nsnps_bin = None
+        # NOTE: chisq_threshold can be:
+        #   - 'auto' (string): use default cap max(80, 0.001 * Nmax)
+        #   - None: no filtering
+        #   - number: legacy behavior
         self.chisq_threshold = chisq_threshold
         self.matched_snps = None
         self.name = None
@@ -47,6 +51,7 @@ class Sumstats:
 
         self._chisq_applied = False
         self._chisq_filter_removed = 0
+        self._chisq_action = chisq_action
 
         # --- chi^2 diagnostics caches (per phenotype) ---
         # "read": after parsing + scaling Z, before matching to annotations
@@ -80,7 +85,7 @@ class Sumstats:
             )
 
         self._annot_has_dups = pd.Index(self._annot_snps).has_duplicates
-    
+
     def _suggested_chisq_max(self, nmax: float) -> float:
         """
         A commonly used cap for extreme chi^2 outliers:
@@ -90,6 +95,40 @@ class Sumstats:
         if not np.isfinite(nmax) or nmax <= 0:
             return 80.0
         return float(max(80.0, 0.001 * nmax))
+
+    def _resolve_chisq_threshold(self):
+        """
+        Resolve chisq_threshold into an effective numeric threshold.
+
+        Returns:
+            (thr: float|None, mode: str)
+              mode in {'none','auto','manual'}.
+
+        Semantics:
+          - chisq_threshold is None -> (None, 'none')  [no filtering]
+          - chisq_threshold == 'auto' (case-insensitive) -> (max(80, 0.001*Nmax), 'auto')
+          - otherwise -> float(value) if possible -> ('manual')
+        """
+        raw = getattr(self, "chisq_threshold", None)
+        if raw is None:
+            return None, "none"
+
+        if isinstance(raw, str):
+            s = raw.strip().lower()
+            if s == "auto":
+                nmax = float(getattr(self, "nsamp", np.nan))
+                return float(self._suggested_chisq_max(nmax)), "auto"
+            if s in ("none", "null"):
+                return None, "none"
+            try:
+                return float(s), "manual"
+            except Exception as e:
+                raise ValueError(f"Invalid chisq_threshold string value: {raw!r}") from e
+
+        try:
+            return float(raw), "manual"
+        except Exception as e:
+            raise ValueError(f"Invalid chisq_threshold value: {raw!r}") from e
 
 
     def _chisq_summary(self, chisq: np.ndarray) -> dict:
@@ -181,8 +220,10 @@ class Sumstats:
         name = getattr(self, "name", "UNKNOWN")
         nmax = float(getattr(self, "nsamp", np.nan))
 
-        thr_user = float(getattr(self, "chisq_threshold", 0.0) or 0.0)
+        thr_eff, thr_mode = self._resolve_chisq_threshold()
         removed_user = int(getattr(self, "_chisq_filter_removed", 0))
+
+        thr_user = float(thr_eff) if thr_eff is not None else 0.0
 
         def _should_expand(summ: dict) -> bool:
             if not summ:
@@ -242,9 +283,10 @@ class Sumstats:
 
         # ---- Print active user filter status ONCE at the top (verbose only) ----
         if verbose:
-            if thr_user > 0 and np.isfinite(thr_user):
+            if (thr_user > 0) and np.isfinite(thr_user):
+                mode_tag = " (auto)" if thr_mode == "auto" else ""
                 self.log._log(
-                    f"[chisq] [{name}] active chi^2 filter: threshold={thr_user:.3f}; removed={removed_user} SNPs."
+                    f"[chisq] [{name}] active chi^2 filter: threshold={thr_user:.3f}{mode_tag}; removed={removed_user} SNPs."
                 )
             else:
                 self.log._log(f"[chisq] [{name}] no active chi^2 filter.")
@@ -342,22 +384,46 @@ class Sumstats:
 
 
     def _apply_chisq_filter_once(self):
-        """Apply chi^2 filter at most once per Sumstats object; updates caches and self.sumdf."""
+        """
+        Apply chi^2 handling at most once per Sumstats object.
+
+        Modes (set via self.chisq_action; default='drop'):
+        - 'drop': remove SNPs with chi^2 > threshold from sumstats caches (current behavior)
+        - 'clip': do NOT drop here (clipping happens later on the matched set)
+        - 'warn'/'none': do nothing here
+
+        Convention: chisq_threshold <= 0 or non-finite => disabled.
+        Special:
+          - chisq_threshold == 'auto' => threshold = max(80, 0.001*Nmax)
+          - chisq_threshold is None => no filtering
+        """
         if self._chisq_applied:
             return
         self._chisq_applied = True
         self._chisq_filter_removed = 0
 
-        if self.chisq_threshold is None:
+        action = str(getattr(self, "_chisq_action", "drop")).strip().lower()
+        if action not in ("drop", "clip", "warn", "none"):
+            # fail-safe: preserve legacy behavior
+            self.log._log(f"[chisq] Unrecognized chisq_action='{action}', defaulting to 'drop'.")
+            action = "drop"
+        self._chisq_action_used = action
+
+        thr, _thr_mode = self._resolve_chisq_threshold()
+        if thr is None:
             return
 
-        thr = float(self.chisq_threshold)
+        thr = float(thr)
 
         # Convention: <=0 means "disabled"
-        if not np.isfinite(thr) or thr <= 0.0:
+        if (not np.isfinite(thr)) or (thr <= 0.0):
             return
 
-        self.log._log(f"Filtering SNPs with chi-sq greater than {thr}")
+        # Only 'drop' modifies caches here. 'clip' is handled post-matching.
+        if action != "drop":
+            return
+
+        self.log._log(f"[chisq] Dropping SNPs with chi^2 greater than {thr}")
 
         chisq = self._sum_z ** 2
         keep = (chisq <= thr) & np.isfinite(chisq)
@@ -383,15 +449,16 @@ class Sumstats:
         self._sum_has_dups = self._sum_index.has_duplicates
 
         self.log._log(
-            f"Removed {len(chisq_snps)} SNPs with chi-sq above the threshold "
-            f"{thr} ({self._sum_snps.size} SNPs remaining)"
+            f"[chisq] Removed {len(chisq_snps)} SNPs with chi^2 above {thr} "
+            f"({self._sum_snps.size} SNPs remaining)"
         )
+
 
 
 
     def _match_snps(self, printlog=True):
         """
-        Match SNPs between sumstats and annot_df while preserving annot_df order (blocks match Trace ordering).
+        Match SNPs between sumstats and annot_df while preserving annot_df order.
 
         Supports binary/overlapping/continuous annotations.
 
@@ -399,14 +466,28 @@ class Sumstats:
             M_k   = sum_j a_{j,k}
             S_k   = sum_j a_{j,k} * z_j^2
         and their in-block counterparts.
+
+        Robust chi^2 handling (self.chisq_action; default='drop'):
+        - 'drop': SNPs were already removed pre-matching by _apply_chisq_filter_once()
+        - 'clip': after matching, cap z_j^2 at threshold (winsorization) when building RHS
+        - 'warn'/'none': no modification; only diagnostics
         """
         if self.annot_df is None:
             raise RuntimeError("Sumstats.annot_df is None; cannot match SNPs.")
         if self._annot_snps is None or (self._annot_ann is None):
             self._set_annot_df(self.annot_df)
 
-        # optional chi^2 filter
+        # optional pre-match handling (only active for action='drop')
         self._apply_chisq_filter_once()
+
+        action = str(getattr(self, "chisq_action", "drop")).strip().lower()
+        if action not in ("drop", "clip", "warn", "none"):
+            self.log._log(f"[chisq] Unrecognized chisq_action='{action}', defaulting to 'drop'.")
+            action = "drop"
+
+        thr, _thr_mode = self._resolve_chisq_threshold()
+        thr_enabled = (thr is not None) and np.isfinite(float(thr)) and (float(thr) > 0.0)
+        thr = float(thr) if thr is not None else None
 
         # ----------------------------
         # SNP matching
@@ -457,7 +538,7 @@ class Sumstats:
             self.a2 = self._sum_a2[pos]
             all_ann = self._annot_ann[keep_mask, :]
 
-        # diagnostics on the matched set (what the method actually used)
+        # diagnostics on the matched set (raw; before any clipping)
         self._chisq_diag_used, self._chisq_top_used = self._compute_chisq_diag(
             z=all_z, snps=self.matched_snps, a1=self.a1, a2=self.a2, nmax=self.nsamp, topk=10
         )
@@ -484,8 +565,31 @@ class Sumstats:
         blk_idx[blk_idx >= self.nblks] = self.nblks - 1
         self.blk_idx = blk_idx
 
+        # chi^2 = z^2
         z2 = all_z * all_z
+        if not np.isfinite(z2).all():
+            # extremely rare (overflow). Treat as outliers only if clipping is enabled;
+            # otherwise refuse to proceed because moments are undefined.
+            if action == "clip" and thr_enabled:
+                bad = ~np.isfinite(z2)
+                z2[bad] = thr
+            else:
+                raise RuntimeError("Non-finite chi^2 encountered after squaring z-scores.")
 
+        # Robustification: winsorize chi^2 on matched set (RHS only)
+        self._chisq_clip_applied = False
+        self._chisq_clip_count = 0
+        self._chisq_clip_threshold = float(thr) if thr_enabled else 0.0
+
+        if action == "clip" and thr_enabled:
+            # count how many would have been clipped
+            clip_mask = (z2 > thr) & np.isfinite(z2)
+            self._chisq_clip_count = int(np.sum(clip_mask))
+            if self._chisq_clip_count > 0:
+                np.minimum(z2, thr, out=z2)  # in-place winsorization
+                self._chisq_clip_applied = True
+
+        # Full sums: M_k = sum a_{jk}; S_k = sum a_{jk} z_j^2 (robust if clip applied)
         Ak_full = A.sum(axis=0, dtype=np.float64)
         Az2_full = (A.T @ z2).astype(np.float64, copy=False)
 
@@ -517,6 +621,12 @@ class Sumstats:
                 f"Bad bins: {bad_bins.tolist()} (Ak_full={Ak_full[bad_bins].tolist()}) !!!"
             )
             sys.exit(1)
+
+        # optional: in 'warn' mode, just log that threshold exists but nothing was applied
+        if action == "warn" and thr_enabled and printlog:
+            # keep it short (full tail/top already available via your diagnostics)
+            self.log._log(f"[chisq] [{self.name}] warning-only threshold set at {thr:.3f}; no dropping/clipping applied.")
+
 
 
 
@@ -587,7 +697,7 @@ class Sumstats:
         self._match_snps()
         self._calc_rhs_h2()
         return self.removesnps
-    
+
     def read_only(self, path: str, name: str):
         """
         Read + cache sumstats once (including chi^2 filtering).
@@ -620,3 +730,4 @@ class Sumstats:
         self._match_snps(printlog=False)
         self._calc_rhs_h2()
         return
+

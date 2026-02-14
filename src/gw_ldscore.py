@@ -242,20 +242,36 @@ def apply_env(cfg: dict) -> int:
     os.environ["SUMMIT_BLAS_THREADS"] = str(actual)
 
     # -------- 2) C++ tiler/env knobs --------
-    if cfg.get("ctile") is not None:
-        os.environ["SUMMIT_CTILE"] = str(int(cfg["ctile"]))
+    if cfg.get("q_panel") is not None:
+        os.environ["SUMMIT_P2_QPANEL"] = str(int(cfg["q_panel"]))
     else:
-        os.environ.pop("SUMMIT_CTILE", None)
+        os.environ.pop("SUMMIT_P2_QPANEL", None)
+    
+    if cfg.get("reduce_blk") is not None:
+        os.environ["SUMMIT_P2_IBLK"] = str(int(cfg["reduce_blk"]))
+    else:
+        os.environ.pop("SUMMIT_P2_IBLK", None)
+    
+    if cfg.get("reduce_threads") is not None:
+        os.environ["SUMMIT_P2_REDUCE_THREADS"] = str(int(cfg["reduce_threads"]))
+    else:
+        os.environ.pop("SUMMIT_P2_REDUCE_THREADS", None)
 
-    if cfg.get("ctile_mb") is not None:
-        os.environ["SUMMIT_CTILE_MB"] = str(int(cfg["ctile_mb"]))
-    else:
-        os.environ.pop("SUMMIT_CTILE_MB", None)
+# probably obsolete now
+    # if cfg.get("ctile") is not None:
+    #     os.environ["SUMMIT_CTILE"] = str(int(cfg["ctile"]))
+    # else:
+    #     os.environ.pop("SUMMIT_CTILE", None)
 
-    if cfg.get("ctile_l3pct") is not None:
-        os.environ["SUMMIT_CTILE_L3PCT"] = f"{float(cfg['ctile_l3pct']):.3f}"
-    else:
-        os.environ.pop("SUMMIT_CTILE_L3PCT", None)
+    # if cfg.get("ctile_mb") is not None:
+    #     os.environ["SUMMIT_CTILE_MB"] = str(int(cfg["ctile_mb"]))
+    # else:
+    #     os.environ.pop("SUMMIT_CTILE_MB", None)
+
+    # if cfg.get("ctile_l3pct") is not None:
+    #     os.environ["SUMMIT_CTILE_L3PCT"] = f"{float(cfg['ctile_l3pct']):.3f}"
+    # else:
+    #     os.environ.pop("SUMMIT_CTILE_L3PCT", None)
 
     sockets = cfg.get("sockets")
     if sockets is not None:
@@ -542,7 +558,8 @@ class GenomewideLDScore:
                 target_xz_mem = 16.0,
                 target_mem = None,
                 device='cpu',
-                use_tp32 = False):
+                use_tp32 = False,
+                correct_skew: bool = False):
         
         # ----------- input path ------------ #
         self.eps_var = float(eps_var)
@@ -564,6 +581,10 @@ class GenomewideLDScore:
         self.ddof = ddof
         self.target_mem = target_mem
         self.target_xz_mem = target_xz_mem if target_mem is None else target_mem
+        
+        self.correct_skew = bool(correct_skew) # fourth moment finite-sample corrections
+        if self.correct_skew:
+            self.log._log(f"[fs-corr] Fourth-moment correction enabled: {self.correct_skew}")
 
         
         # If num_threads was explicitly passed, it overrides low_level['num_threads'].
@@ -1420,52 +1441,51 @@ class GenomewideLDScore:
             except Exception:
                 pass
 
-        # ---------------------- Finalize & save ----------------------
-        # meansq = (meansq_accum / float(self.nvecs)).astype(self.dtype, copy=False)
-
-        # # Baseline subtraction: classic correlation null M_k / N_denom (ddof-aware)
-        # N_denom = float(self.N_eff - 1.0 if self.C is not None else self.nsamp - self.ddof)
-        # self.log._log("Applying correlation null: subtracting M_k / N_denom per bin.")
-        # meansq -= (self.nsnps_bin / N_denom).astype(meansq.dtype, copy=False)[None, :]
-
-        # self.gwldscore = meansq.astype(np.float64, copy=False)
-        
-        # ---------------------- Finalize ----------------------
+         # ---------------------- Finalize ----------------------
         meansq = (meansq_accum / float(self.nvecs)).astype(self.dtype, copy=False)
 
-        # Keep a copy of the *raw* sample-based LDscore panel before any baseline
-        # subtraction: meansq_raw[j, b] ≈ sum_{k in bin b} r_{jk}^2.
-        meansq_raw = np.asarray(meansq, dtype=np.float64, order="C")
+        # -------- Optional: 4th-moment-based finite-sample correction diagnostics --------
+        # Default behavior: SKIP mu22/delta work entirely & avoid saving .gw.delta unless enabled.
+        if not self.correct_skew:
+            # Ensure these attrs don't accidentally exist from a prior run in the same process
+            self.mu22_block = None
+            self.delta_block = None
+            self.r2_block = None
+            self.rho2_block = None
+            self.bias_block = None
+        else:
+            # Keep a copy of the *raw* sample-based LDscore panel before any baseline subtraction:
+            # meansq_raw[j, b] ≈ sum_{k in bin b} r_{jk}^2.
+            meansq_raw = np.asarray(meansq, dtype=np.float64, order="C")
+            try:
+                mu22 = self._estimate_mu22_bins(blocks)
 
-        # -------- Optional: 4th-moment-based finite-sample correction (block level) --------
-        try:
-            # Estimate μ̄_{22,ab} from the raw genotypes (streaming).
-            mu22 = self._estimate_mu22_bins(blocks)
+                if not getattr(self, "is_continuous", False):
+                    snpidx = np.arange(self.nsnps, dtype=int)
+                    bin_idx = self._partition_index(snpidx, self.annot)
+                    self._compute_block_corrections(meansq_raw, mu22, bin_idx)
+                else:
+                    self.mu22_block = mu22
+                    self.log._log(
+                        "[fs-corr] Continuous / overlapping annotations detected; "
+                        "stored μ22_block but skipped block-level bias correction."
+                    )
+            except Exception as e:
+                self.log._log(f"[fs-corr] Failed to compute 4th-moment-based corrections: {e}")
+                # keep these clean if partial failure
+                self.mu22_block = None
+                self.delta_block = None
+                self.r2_block = None
+                self.rho2_block = None
+                self.bias_block = None
 
-            # For binary, non-overlapping annotations we can form explicit bin indices
-            # and compute block-level corrections (R2, ρ2, bias).
-            if not getattr(self, "is_continuous", False):
-                snpidx = np.arange(self.nsnps, dtype=int)
-                bin_idx = self._partition_index(snpidx, self.annot)
-                self._compute_block_corrections(meansq_raw, mu22, bin_idx)
-            else:
-                self.mu22_block = mu22
-                self.log._log("[fs-corr] Continuous / overlapping annotations detected; "
-                              "stored μ22_block but skipped block-level bias correction.")
-        except Exception as e:
-            self.log._log(f"[fs-corr] Failed to compute 4th-moment-based corrections: {e}")
-
-        # -------- Classic LDSC-style baseline subtraction (unchanged for now) --------
-        # You can later replace/augment this using self.bias_block if you want the
-        # LDscore output itself to be population-LD calibrated. For now we keep the
-        # original behavior so downstream code remains unchanged, while exposing the
-        # extra correction info via class attributes.
+        # -------- Default finite-sample correction (always) --------
+        # Classic LDSC-style baseline subtraction
         N_denom = float(self.N_eff - 1.0 if self.C is not None else self.nsamp - self.ddof)
         self.log._log("Applying correlation null: subtracting M_k / N_denom per bin.")
         meansq -= (self.nsnps_bin / N_denom).astype(meansq.dtype, copy=False)[None, :]
 
         self.gwldscore = meansq.astype(np.float64, copy=False)
-
 
         self.log._log(f"Saving the genome-wide (partitioned) LD scores into: {self.outpath}.gw.ldscore.gz")
         snpcols = ['CHR','SNP','BP']
@@ -1479,21 +1499,23 @@ class GenomewideLDScore:
         out_df = pd.concat([self.snpdf, scores_df], axis=1)
         out_df.to_csv(f'{self.outpath}.gw.ldscore.gz', index=False, compression='gzip', sep='\t', float_format='%.6f')
         
-        # -------- Save block-level δ̄_{ab} to <outpath>.gw.delta --------
-        try:
-            if hasattr(self, "delta_block"):
-                delta_df = pd.DataFrame(
-                    self.delta_block,
-                    index=self.l2cols,
-                    columns=self.l2cols,
-                )
-                delta_out = f"{self.outpath}.gw.delta"
-                delta_df.to_csv(delta_out, sep='\t', float_format='%.8e')
-                self.log._log(f"[fs-corr] Saved block-level δ matrix to: {delta_out}")
-            else:
-                self.log._log("[fs-corr] delta_block not available; skipping .gw.delta write.")
-        except Exception as e:
-            self.log._log(f"[fs-corr] Failed to save δ matrix (.gw.delta): {e}")
+        # -------- Optional: Save block-level δ̄_{ab} to <outpath>.gw.delta --------
+        if self.correct_skew:
+            try:
+                if getattr(self, "delta_block", None) is not None:
+                    delta_df = pd.DataFrame(
+                        self.delta_block,
+                        index=self.l2cols,
+                        columns=self.l2cols,
+                    )
+                    delta_out = f"{self.outpath}.gw.delta"
+                    delta_df.to_csv(delta_out, sep='\t', float_format='%.8e')
+                    self.log._log(f"[fs-corr] Saved block-level δ matrix to: {delta_out}")
+                else:
+                    self.log._log("[fs-corr] delta_block not available; skipping .gw.delta write.")
+            except Exception as e:
+                self.log._log(f"[fs-corr] Failed to save δ matrix (.gw.delta): {e}")
+
 
 
 

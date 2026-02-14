@@ -27,12 +27,16 @@ class Sumcore:
         align_alleles=False,
         drop_ambiguous=True,
         collapse_reg_ld=False,
+        enrich_mode: str = "auto"
     ):
         self.log = log
         self.verbose = verbose
         self.out = out
         self.align_alleles = bool(align_alleles)
         self.drop_ambiguous = bool(drop_ambiguous)
+        self.enrich_mode = self._normalize_enrich_mode(enrich_mode)
+        self._enrich_mode_used = ["", ""]  # resolved mode per trait in logs
+
 
         self.chisq_threshold = chisq_threshold
         self.start_time = utils._get_time()
@@ -101,6 +105,30 @@ class Sumcore:
             annot_df=annot_df,
             nbins=self.nbins,
         )
+
+    @staticmethod
+    def _normalize_enrich_mode(mode: str) -> str:
+        if mode is None:
+            return "auto"
+        m = str(mode).strip().lower().replace("_", "-").replace(" ", "-")
+        if m == "auto":
+            return "auto"
+        if m in ("overlap", "overlapping"):
+            return "overlap"
+        if m in ("non-overlap", "nonoverlap", "nonoverlapping", "component", "components"):
+            return "non-overlap"
+        if m in ("both", "all"):
+            return "both"
+        raise ValueError(f"Invalid enrich_mode={mode!r}. Choose from: auto, overlap, non-overlap, both.")
+
+    @staticmethod
+    def _has_overlapping_annotations(A: np.ndarray) -> bool:
+        """
+        True if any SNP has >1 nonzero annotation entry.
+        Works for binary or continuous weights (exact-zero test).
+        """
+        return bool(np.any(np.count_nonzero(A, axis=1) > 1))
+
 
     @staticmethod
     def _alleles_to_int(a):
@@ -359,6 +387,13 @@ class Sumcore:
 
             if np.any(starts < 0) or np.any(ends < 0):
                 raise RuntimeError("Some jackknife blocks are empty or missing in blk_idx.")
+            
+        # Cache JK block slicing so enrichment can compute replicate proportions fast
+        self._jk_starts = starts.copy()
+        self._jk_ends   = ends.copy()
+        self._jk_m_blk  = (ends - starts).astype(np.int64, copy=False)
+        self._jk_M_full = int(M)
+           
 
         overlap_blk = np.empty((B, K, K), dtype=np.float32)
         mass_blk    = np.empty((B, K),     dtype=np.float32)
@@ -434,6 +469,81 @@ class Sumcore:
             )
             self.hersums[t, :, 0] = est_full
             self.hersums[t, :, 1] = se_jk
+
+    def _get_prop_rep(self) -> np.ndarray:
+        """
+        prop_rep[r, k] = Ak_rep[r, k] / M_rep[r]
+        where Ak_rep is bin mass (sum of annotation weights) and M_rep is SNP count,
+        for r=0..B-1 leave-one-block-out, and r=B full.
+        Cached since it's the same for both traits.
+        """
+        if hasattr(self, "_prop_rep") and (self._prop_rep is not None):
+            return self._prop_rep
+
+        if not hasattr(self, "_h2_mass_full"):
+            self._precompute_h2_overlap_terms()
+
+        mass_full = np.asarray(self._h2_mass_full, dtype=np.float64)      # (K,)
+        mass_blk  = np.asarray(self._h2_mass_blk,  dtype=np.float64)      # (B,K)
+
+        B = self.nblks
+        K = self.nbins
+
+        if not hasattr(self, "_jk_m_blk") or not hasattr(self, "_jk_M_full"):
+            raise RuntimeError("Missing cached JK block sizes; _precompute_h2_overlap_terms must run first.")
+
+        m_blk = np.asarray(self._jk_m_blk, dtype=np.float64)              # (B,)
+        M_full = float(self._jk_M_full)
+
+        Ak_rep = np.empty((B + 1, K), dtype=np.float64)
+        Ak_rep[:B, :] = mass_full[None, :] - mass_blk
+        Ak_rep[B,  :] = mass_full
+
+        M_rep = np.empty((B + 1,), dtype=np.float64)
+        M_rep[:B] = M_full - m_blk
+        M_rep[B]  = M_full
+
+        with np.errstate(divide="ignore", invalid="ignore"):
+            prop = Ak_rep / M_rep[:, None]
+
+        self._prop_rep = prop
+        return prop
+
+
+    def _compute_enrich_reps_and_se(self, t: int, mode: str):
+        """
+        Compute enrichment across all jackknife replicates and return (enr_full, enr_se).
+        mode:
+          - "overlap": uses SUMRHE-style SNP-set h2 (self.herits[t,:, :K])
+          - "non-overlap": uses component share (self.sigmas[t,:, :K])
+        """
+        mode = self._normalize_enrich_mode(mode)
+        if mode not in ("overlap", "non-overlap"):
+            raise ValueError("mode must be 'overlap' or 'non-overlap'.")
+
+        K = self.nbins
+        prop = self._get_prop_rep()                                   # (B+1, K)
+
+        # totals consistent with your convention (sum sigma_g)
+        h2_tot = np.asarray(self.herits[t, :, -1], dtype=np.float64)  # (B+1,)
+
+        if mode == "overlap":
+            h2_cat = np.asarray(self.herits[t, :, :K], dtype=np.float64)   # (B+1,K)
+        else:
+            h2_cat = np.asarray(self.sigmas[t, :, :K], dtype=np.float64)   # (B+1,K)
+
+        with np.errstate(divide="ignore", invalid="ignore"):
+            enr = (h2_cat / h2_tot[:, None]) / prop
+
+            invalid = (~np.isfinite(enr)) | (~np.isfinite(prop)) | (prop <= 0.0) | (h2_tot[:, None] <= 0.0)
+            enr[invalid] = np.nan
+
+        clip_nonfinite = bool(getattr(self, "clip_nonfinite_vals", False))
+        nan_policy = "propagate" if clip_nonfinite else "omit"
+
+        enr_full, enr_se = utils._calc_jackknife_se(enr, axis=0, center="full", nan_policy=nan_policy)
+        return enr_full, enr_se
+
 
 
 
@@ -573,16 +683,25 @@ class Sumcore:
         K = self.nbins
         M = float(self.tr.nsnps)
 
-        # Bin mass Ak (sum of annotation weights) for full sample
-        Ak = np.asarray(self.tr.annot, dtype=np.float64).sum(axis=0)  # (K,)
+        A = np.asarray(self.tr.annot, dtype=np.float64, order="C")
+        has_ov = self._has_overlapping_annotations(A)
 
-        def _enrichment(h2_cat, h2_tot):
-            with np.errstate(divide="ignore", invalid="ignore"):
-                prop_h2 = h2_cat / h2_tot
-                prop_m  = Ak / M
-                enr = prop_h2 / prop_m
-            enr[(~np.isfinite(enr)) | (prop_m <= 0.0)] = np.nan
-            return enr
+        req = self.enrich_mode
+        if req == "auto":
+            mode_used = "overlap" if has_ov else "non-overlap"
+            modes_to_compute = (mode_used,)
+        elif req == "both":
+            mode_used = "overlap" if has_ov else "non-overlap"
+            modes_to_compute = ("non-overlap", "overlap")
+        else:
+            mode_used = req
+            modes_to_compute = (req,)
+        
+        self.log._log(f"^^^ Phenotype [{self.names[0]}] & [{self.names[1]}] enrichment_mode_used: {mode_used}")
+
+        if self.verbose and req in ("auto", "both"):
+            self.log._log(f"[enrichment] enrich_mode={req} resolved={mode_used} has_overlap={has_ov}")
+
 
         # sigma_g^2 SEs from jackknife
         sigma_se = np.full((2, K), np.nan, dtype=np.float64)
@@ -598,14 +717,27 @@ class Sumcore:
             h2_tot     = float(self.hersums[t, -1, 0])
             h2_tot_se  = float(self.hersums[t, -1, 1])
 
-            enr = _enrichment(h2_full, h2_tot)
+            # Enrichment(s) + SE(s) from jackknife replicates
+            enr_main_full, enr_main_se = self._compute_enrich_reps_and_se(t, mode_used)
+            self._enrich_mode_used[t] = mode_used
+
+            enr_no_full = enr_no_se = None
+            enr_ov_full = enr_ov_se = None
+            if req == "both":
+                if "non-overlap" in modes_to_compute:
+                    enr_no_full, enr_no_se = self._compute_enrich_reps_and_se(t, "non-overlap")
+                if "overlap" in modes_to_compute:
+                    enr_ov_full, enr_ov_se = self._compute_enrich_reps_and_se(t, "overlap")
 
             for j, header in enumerate(self.annot_header):
+                enr_str = f"Enrichment: {enr_main_full[j]:.6g} (SE: {enr_main_se[j]:.6g})"
+                if req == "both" and (enr_no_full is not None) and (enr_ov_full is not None):
+                    enr_str = f"Enrichment_nonoverlap: {enr_no_full[j]:.6g} (SE: {enr_no_se[j]:.6g}) " + \
+                                "& Enrichment_overlap: {enr_ov_full[j]:.6g} (SE: {enr_ov_se[j]:.6g})"
                 self.log._log(
                     f"^^^ Phenotype [{self.names[t]}] Bin [{header}] "
                     f"sigma_g^2: {sigma_full[j]:.6g} (SE: {sigma_se[t, j]:.6g}) "
-                    f"h^2_cat: {h2_full[j]:.6g} (SE: {h2_se[j]:.6g}) "
-                    f"Enrichment: {enr[j]:.6g}"
+                    f"h^2_cat: {h2_full[j]:.6g} (SE: {h2_se[j]:.6g}) "+ enr_str                    
                 )
 
             self.log._log(
