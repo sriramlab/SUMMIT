@@ -9,13 +9,15 @@ import sys
 class Sumrhe:
     def __init__(self, bim_path=None, sum_path=None, save_path=None, h2_path=None, out=None, chisq_threshold=0, \
             log=None, mem=False, verbose=False, ldscores=None, njack=None, annot=None, chisq_action='drop',
-            report_tau: bool = True, allow_neg_enr: bool = False, clip_nonfinite_vals: bool = False, adjust_delta: bool = False, enrich_mode: str = "auto"):
+            report_tau: bool = True, allow_neg_enr: bool = False, clip_nonfinite_vals: bool = False, adjust_delta: bool = False, enrich_mode: str = "auto", \
+            jack_mode: str = "median"):
         self.mem = mem
         self.log = log
         self.start_time = utils._get_time()
         self.log._log("Analysis started at: "+utils._get_timestr(self.start_time))
         self.tr = Trace(bimpath=bim_path, sumpath=sum_path, savepath=save_path, ldscores=ldscores, log=self.log, nblks=njack, annot=annot, verbose=verbose, adjust_delta=adjust_delta)
         self.nblks = self.tr.nblks
+        self.jack_mode = jack_mode
         self.annot_header = self.tr.annot_header
         self.nbins = self.tr.nbins
         self.sums = Sumstats(nblks=self.nblks, chisq_threshold=chisq_threshold, log=self.log, annot_df=self.tr.annot_df, nbins=self.nbins, chisq_action=chisq_action)
@@ -403,47 +405,45 @@ class Sumrhe:
         self.tau_star[idx] = tau_star
 
 
-
-
     def _run_jackknife(self, idx):
         """Run SNP-level block jackknife for this phenotype."""
         clip_nonfinite = bool(getattr(self, "clip_nonfinite_vals", False))
         nan_policy = 'propagate' if clip_nonfinite else 'omit'
 
         # Sigma components
-        est_full, se_jk = utils._calc_jackknife_se(self.sigmas[idx], axis=0, center='full', nan_policy=nan_policy)
+        est_full, se_jk = utils._calc_jackknife_se(self.sigmas[idx], axis=0, center=self.jack_mode, nan_policy=nan_policy)
         self.sigsums[idx, :, 0] = est_full
         self.sigsums[idx, :, 1] = se_jk
 
         # Heritabilities (per bin + total)
-        est_full_h2, se_jk_h2 = utils._calc_jackknife_se(self.herits[idx], axis=0, center='full', nan_policy=nan_policy)
+        est_full_h2, se_jk_h2 = utils._calc_jackknife_se(self.herits[idx], axis=0, center=self.jack_mode, nan_policy=nan_policy)
         self.hersums[idx, :, 0] = est_full_h2
         self.hersums[idx, :, 1] = se_jk_h2
 
         # Enrichment
-        est_full_enr, se_jk_enr = utils._calc_jackknife_se(self.enrich[idx], axis=0, center='full', nan_policy=nan_policy)
+        est_full_enr, se_jk_enr = utils._calc_jackknife_se(self.enrich[idx], axis=0, center=self.jack_mode, nan_policy=nan_policy)
         self.enrich_sums[idx, :, 0] = est_full_enr
         self.enrich_sums[idx, :, 1] = se_jk_enr
 
         # Optional enrichment outputs (both-mode)
         if self.enrich_overlap is not None:
-            est_full_eov, se_jk_eov = utils._calc_jackknife_se(self.enrich_overlap[idx], axis=0, center='full', nan_policy=nan_policy)
+            est_full_eov, se_jk_eov = utils._calc_jackknife_se(self.enrich_overlap[idx], axis=0, center=self.jack_mode, nan_policy=nan_policy)
             self.enrich_overlap_sums[idx, :, 0] = est_full_eov
             self.enrich_overlap_sums[idx, :, 1] = se_jk_eov
 
         if self.enrich_nonoverlap is not None:
-            est_full_eno, se_jk_eno = utils._calc_jackknife_se(self.enrich_nonoverlap[idx], axis=0, center='full', nan_policy=nan_policy)
+            est_full_eno, se_jk_eno = utils._calc_jackknife_se(self.enrich_nonoverlap[idx], axis=0, center=self.jack_mode, nan_policy=nan_policy)
             self.enrich_nonoverlap_sums[idx, :, 0] = est_full_eno
             self.enrich_nonoverlap_sums[idx, :, 1] = se_jk_eno
 
 
         # τ / τ* if requested
         if self.report_tau:
-            est_full_tau, se_jk_tau = utils._calc_jackknife_se(self.tau[idx], axis=0, center='full', nan_policy=nan_policy)
+            est_full_tau, se_jk_tau = utils._calc_jackknife_se(self.tau[idx], axis=0, center=self.jack_mode, nan_policy=nan_policy)
             self.tau_sums[idx, :, 0] = est_full_tau
             self.tau_sums[idx, :, 1] = se_jk_tau
 
-            est_full_ts, se_jk_ts = utils._calc_jackknife_se(self.tau_star[idx], axis=0, center='full', nan_policy=nan_policy)
+            est_full_ts, se_jk_ts = utils._calc_jackknife_se(self.tau_star[idx], axis=0, center=self.jack_mode, nan_policy=nan_policy)
             self.tau_star_sums[idx, :, 0] = est_full_ts
             self.tau_star_sums[idx, :, 1] = se_jk_ts
 

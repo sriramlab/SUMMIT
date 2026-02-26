@@ -188,9 +188,9 @@ def apply_env(cfg: dict) -> int:
         dec = min(cap, n_aff)
 
     # Optional memory cap guidance: genotype.cpp already self-caps by SUMMIT_DECODE_THREADS,
-    # but we can pass the intended cap too (it uses an internal 512 MiB default).
+    # but we can pass the intended cap too (it uses an internal 2048 MiB default).
     # We'll expose this as env for you if you later want genotype.cpp to read it.
-    decode_mem_cap_mb = int(cfg.get("decode_mem_cap_mb", 512))
+    decode_mem_cap_mb = int(cfg.get("decode_mem_cap_mb", 2048))
     if decode_mem_cap_mb < 64:
         decode_mem_cap_mb = 64
     os.environ["SUMMIT_DECODE_THREADS"] = str(dec)

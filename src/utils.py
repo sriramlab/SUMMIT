@@ -378,55 +378,60 @@ def _calc_jn_subsample(alist):
     return np.array(jn_sub)
 
 
-def _calc_jackknife_se(alist, axis=0, center='mean', nan_policy='propagate'):
+def _calc_jackknife_se(alist, axis=0, center="mean", nan_policy="propagate"):
     """
     Jackknife SE along `axis` for arrays shaped (B+1, ...), where the last slice
     is the full-sample estimate and the first B are LOO replicates.
 
-    Matches the legacy (slow) implementation by default:
-      center='full' and nan_policy='propagate'  ->  centers at full and propagates NaNs.
-
     Options:
-      center: 'full' (legacy) or 'mean' (standard jackknife center at LOO mean)
-      nan_policy: 'propagate' (legacy), or 'omit' (ignore NaNs per-coordinate)
+      center:
+        - 'full'   : center at the full-sample estimate (legacy behavior)
+        - 'mean'   : center at the mean of LOO replicates (standard jackknife)
+        - 'median' : center at the median of LOO replicates (robust-ish, often more conservative)
+      nan_policy:
+        - 'propagate' : propagate NaNs (legacy)
+        - 'omit'      : ignore NaNs per-coordinate (uses nanmean/nanmedian and effective m)
 
-    Returns: (est_full, se_jk) with est_full = last slice on `axis`.
+    Returns: (est_full, se_jk)
+      est_full = last slice on `axis`.
     """
     a = np.asarray(alist)
+
     # full-sample estimate (last slice on axis)
     est_full = np.take(a, indices=-1, axis=axis)
 
     # LOO replicates = all but last
     slicer = [slice(None)] * a.ndim
     slicer[axis] = slice(0, -1)
-    reps = a[tuple(slicer)]                   # shape: (n, ...)
+    reps = a[tuple(slicer)]  # shape: (n, ...)
 
-    # move jk axis to front
-    reps = np.moveaxis(reps, axis, 0)         # (n, ...)
+    # move jk axis to front -> (n, ...)
+    reps = np.moveaxis(reps, axis, 0)
+    n = reps.shape[0]
 
     # center choice
-    if center == 'full':
-        # broadcast est_full across replicate axis
+    if center == "full":
         center_arr = est_full
-    elif center == 'mean':
-        center_arr = np.nanmean(reps, axis=0) if nan_policy == 'omit' else reps.mean(axis=0)
+    elif center == "mean":
+        center_arr = np.nanmean(reps, axis=0) if nan_policy == "omit" else reps.mean(axis=0)
+    elif center == "median":
+        center_arr = np.nanmedian(reps, axis=0) if nan_policy == "omit" else np.median(reps, axis=0)
     else:
-        raise ValueError("center must be 'full' or 'mean'")
+        raise ValueError("center must be 'full', 'mean', or 'median'")
 
     diffs = reps - center_arr  # (n, ...)
 
-    if nan_policy == 'omit':
+    if nan_policy == "omit":
         finite = np.isfinite(diffs)
-        m = finite.sum(axis=0)                         # effective replicates per coordinate
+        m = finite.sum(axis=0)  # effective replicates per coordinate
         diffs = np.where(finite, diffs, 0.0)
         ss = (diffs * diffs).sum(axis=0)
-        with np.errstate(divide='ignore', invalid='ignore'):
+        with np.errstate(divide="ignore", invalid="ignore"):
             var_jk = (np.maximum(m - 1, 0) / np.maximum(m, 1)) * ss
             se_jk = np.sqrt(var_jk)
             se_jk = np.where(m < 1, np.nan, se_jk)
-    else:  # 'propagate' (legacy behavior)
+    else:  # 'propagate'
         ss = (diffs * diffs).sum(axis=0)
-        n = diffs.shape[0]
         se_jk = np.sqrt((n - 1) / n * ss)
 
     return est_full, se_jk
@@ -878,7 +883,7 @@ def solve_score_gamma_from_intercept_jn(
     nsnps_blk,
     c_all,
     n1, n2,
-    ridge_rel=1e-12,
+    ridge_rel=0,
 ):
     ld_sum_all = np.asarray(ld_sum_all, dtype=np.float64)
     t1_all = np.asarray(t1_all, dtype=np.float64)

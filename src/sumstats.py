@@ -628,8 +628,6 @@ class Sumstats:
             self.log._log(f"[chisq] [{self.name}] warning-only threshold set at {thr:.3f}; no dropping/clipping applied.")
 
 
-
-
     def _calc_rhs_h2(self):
         """
         Build RHS for univariate normal equations.
@@ -689,7 +687,6 @@ class Sumstats:
                 self.rhs[b, k] = num * N / denom
 
         self.log._log(f"Calculated the RHS for phenotype [{self.name}]")
-
 
 
     def _process(self, path, name):
