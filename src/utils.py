@@ -284,23 +284,33 @@ def estimate_offdiag_variances_from_jackknife(trace_KK):
     return var1, var2, cov12, w_opt
 
 
-def symmetrize_trace_with_jackknife(trace_KK, logger=None, verbose=False):
+def symmetrize_trace_with_jackknife(trace_KK, logger=None, verbose=False, jk_block_sizes=None):
     """
     Symmetrize a (B+1, K, K) trace tensor using jackknife-based optimal weights.
+
+    Supports unequal delete sizes (e.g., LOCO) via delete-m jackknife pseudovalues.
 
     Parameters
     ----------
     trace_KK : ndarray, shape (B+1, K, K)
         Jackknife + full-sample trace matrices.
+        Convention: rows 0..B-1 are LOO replicates, row B is full-sample.
+    jk_block_sizes : array-like, shape (B,), optional
+        Deleted block sizes m_b for each LOO replicate b (e.g., #SNPs in chromosome b).
+        If None, falls back to the legacy equal-weight estimator for w_opt.
     logger : object with a `_log(str)` method, optional
-        If provided, logs before/after asymmetry diagnostics.
+    verbose : bool
 
     Returns
     -------
     sym : ndarray, shape (B+1, K, K)
-        Symmetrized trace tensor (off-diagonals averaged with optimal weights).
+        Symmetrized trace tensor.
     """
+    import numpy as np
+
     trace_KK = np.asarray(trace_KK, dtype=np.float64)
+    if trace_KK.ndim != 3:
+        raise ValueError("trace_KK must have shape (B+1, K, K)")
     B_plus, K, K2 = trace_KK.shape
     if K != K2:
         raise ValueError("trace_KK last two dimensions must be equal (KxK)")
@@ -309,13 +319,10 @@ def symmetrize_trace_with_jackknife(trace_KK, logger=None, verbose=False):
     if B < 0:
         raise ValueError("trace_KK must have at least one row (full sample)")
 
-    # Estimate variances & optimal weights
-    _, _, _, w_opt = estimate_offdiag_variances_from_jackknife(trace_KK)
-
     sym = trace_KK.copy()
 
     if B == 0:
-        # No jackknife; at least symmetrize the full-sample row via simple average
+        # No jackknife; symmetrize the single (full) row by simple average
         full = sym[0]
         for k in range(K):
             for l in range(k + 1, K):
@@ -324,33 +331,153 @@ def symmetrize_trace_with_jackknife(trace_KK, logger=None, verbose=False):
         sym[0] = full
         return sym
 
-    # Before-symmetry diagnostics (full row only)
+    # ---- before symmetry diagnostics (full row only) ----
     if logger is not None:
         full_before = trace_KK[B]
         asym_before = np.abs(full_before - full_before.T)
         tri = np.triu_indices(K, k=1)
         max_asym_before = float(asym_before[tri].max(initial=0.0))
 
-    # Apply optimal weights to all jackknife rows and full row
+    # ---- compute optimal weights w_opt[k,l] ----
+    def _compute_w_opt_weighted(trace_KK, jk_block_sizes):
+        """
+        Weighted (delete-m) jackknife estimate of Var/Cov for off-diagonals via pseudovalues.
+        Returns w_opt (K,K) with w_opt[l,k] = 1 - w_opt[k,l], diag=0.5.
+        """
+        m = np.asarray(jk_block_sizes, dtype=np.float64).ravel()
+        if m.size != B:
+            raise ValueError(f"jk_block_sizes must have length B={B}, got {m.size}")
+
+        good = np.isfinite(m) & (m > 0)
+        if good.sum() <= 1:
+            return np.full((K, K), 0.5, dtype=np.float64)
+
+        m = m[good]
+        M = float(m.sum())
+        if not (np.isfinite(M) and M > 0):
+            return np.full((K, K), 0.5, dtype=np.float64)
+
+        w = m / M                          # (Bg,)
+        w2_sum = float(np.sum(w * w))
+        if not (np.isfinite(w2_sum) and w2_sum < 1.0):
+            return np.full((K, K), 0.5, dtype=np.float64)
+
+        # pull LOO rows for good blocks only
+        jack = trace_KK[:B][good, :, :]     # (Bg,K,K)
+        full = trace_KK[B]                  # (K,K)
+
+        w_opt = np.full((K, K), 0.5, dtype=np.float64)
+        for k in range(K):
+            w_opt[k, k] = 0.5
+
+        # For each off-diagonal pair (k,l), compute PVx/PVy and then var/cov
+        for k in range(K):
+            for l in range(k + 1, K):
+                x_full = float(full[k, l])
+                y_full = float(full[l, k])
+                if not (np.isfinite(x_full) and np.isfinite(y_full)):
+                    w_opt[k, l] = 0.5
+                    w_opt[l, k] = 0.5
+                    continue
+
+                x = jack[:, k, l]  # (Bg,)
+                y = jack[:, l, k]  # (Bg,)
+
+                # delete-m pseudovalues
+                # PV_b = (M*theta_full - (M-m_b)*theta_loo_b) / m_b
+                PVx = (M * x_full - (M - m) * x) / m
+                PVy = (M * y_full - (M - m) * y) / m
+
+                finite = np.isfinite(PVx) & np.isfinite(PVy)
+                if finite.sum() <= 1:
+                    w_opt[k, l] = 0.5
+                    w_opt[l, k] = 0.5
+                    continue
+
+                wf = w[finite]
+                # renormalize weights among finite reps for this (k,l)
+                wf_sum = float(np.sum(wf))
+                if not (np.isfinite(wf_sum) and wf_sum > 0):
+                    w_opt[k, l] = 0.5
+                    w_opt[l, k] = 0.5
+                    continue
+                wf = wf / wf_sum
+
+                PVx_f = PVx[finite]
+                PVy_f = PVy[finite]
+
+                mx = float(np.sum(wf * PVx_f))
+                my = float(np.sum(wf * PVy_f))
+
+                dx = PVx_f - mx
+                dy = PVy_f - my
+
+                # Correct weighted-mean variance/covariance:
+                # Var = sum w^2 * d^2 / (1 - sum w^2)
+                # Cov = sum w^2 * dx*dy / (1 - sum w^2)
+                w2 = float(np.sum(wf * wf))
+                denom = 1.0 - w2
+                if not (np.isfinite(denom) and denom > 0):
+                    w_opt[k, l] = 0.5
+                    w_opt[l, k] = 0.5
+                    continue
+
+                num1 = float(np.sum((wf * wf) * (dx * dx)))
+                num2 = float(np.sum((wf * wf) * (dy * dy)))
+                numc = float(np.sum((wf * wf) * (dx * dy)))
+
+                v1 = num1 / denom
+                v2 = num2 / denom
+                c12 = numc / denom
+
+                denom_w = v1 + v2 - 2.0 * c12
+                if denom_w <= 0.0 or not np.isfinite(denom_w):
+                    wstar = 0.5
+                else:
+                    wstar = (v2 - c12) / denom_w
+                    if not np.isfinite(wstar):
+                        wstar = 0.5
+                    else:
+                        wstar = 0.0 if wstar < 0.0 else (1.0 if wstar > 1.0 else wstar)
+
+                w_opt[k, l] = wstar
+                w_opt[l, k] = 1.0 - wstar
+
+        return w_opt
+
+    if jk_block_sizes is None:
+        # Legacy behavior (equal-weight blocks) — keeps backward compatibility
+        _, _, _, w_opt = estimate_offdiag_variances_from_jackknife(trace_KK)
+    else:
+        w_opt = _compute_w_opt_weighted(trace_KK, jk_block_sizes)
+        if logger is not None and verbose:
+            m = np.asarray(jk_block_sizes, dtype=np.float64).ravel()
+            good = np.isfinite(m) & (m > 0)
+            if good.any():
+                mm = m[good]
+                logger._log(
+                    f"[Trace] symmetrize: weighted LOCO blocks used "
+                    f"(B={B}, kept={int(good.sum())}, min={float(mm.min()):.0f}, max={float(mm.max()):.0f})."
+                )
+
+    # ---- apply weights to symmetrize each row (LOO rows + full row) ----
     for k in range(K):
         for l in range(k + 1, K):
-            w = w_opt[k, l]
+            w = float(w_opt[k, l])
 
-            # Jackknife rows 0..B-1
             x = trace_KK[:B, k, l]
             y = trace_KK[:B, l, k]
             v_jk = w * x + (1.0 - w) * y
             sym[:B, k, l] = v_jk
             sym[:B, l, k] = v_jk
 
-            # Full-sample row at index B
             x_full = trace_KK[B, k, l]
             y_full = trace_KK[B, l, k]
             v_full = w * x_full + (1.0 - w) * y_full
             sym[B, k, l] = v_full
             sym[B, l, k] = v_full
 
-    # After-symmetry diagnostics
+    # ---- after symmetry diagnostics ----
     if logger is not None:
         full_after = sym[B]
         asym_after = np.abs(full_after - full_after.T)
@@ -363,7 +490,6 @@ def symmetrize_trace_with_jackknife(trace_KK, logger=None, verbose=False):
             )
 
     return sym
-
 
 # ----------------------- Jackknife helpers ----------------------- #
 

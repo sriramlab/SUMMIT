@@ -63,7 +63,7 @@ parser.add_argument("--enrich-mode", choices=["auto", "overlap", "non-overlap", 
 # SE arguments
 parser.add_argument("--njack", default="chr", type=str, help="Number of jackknife blocks (LD-score input). "
                     "Use an integer (e.g., 1000) or 'chr' for LOCO (leave-one-chromosome-out). Default: chr.")
-parser.add_argument("--jack-mode", default="median", type=str, \
+parser.add_argument("--jack-mode", default="mean", type=str, \
                     help='Jackknife mode (median, mean or full). Default is median.')
 parser.add_argument("--adjust-delta", action="store_true", default=False, \
                     help='Adjust for higher-moment deviations in LD scores due to non-normality. Default if False.')

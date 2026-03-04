@@ -639,7 +639,8 @@ class Trace:
         M_l = self.nsnps_blk.astype(np.float64)[:, None, :]  # (B+1, 1, K)
 
         trace_KK = utils._calc_trace_from_ld_batch(sums, N, M_k, M_l)  # (B+1, K, K)
-        trace_KK = utils.symmetrize_trace_with_jackknife(trace_KK, logger=self.log, verbose=self.verbose)
+        trace_KK = utils.symmetrize_trace_with_jackknife(trace_KK, logger=self.log, verbose=self.verbose,
+            jk_block_sizes=(self._blk_ends - self._blk_starts))
 
         out = np.full((B + 1, K + 1, K + 1), float(N), dtype=np.float64)
         out[:, :K, :K] = trace_KK

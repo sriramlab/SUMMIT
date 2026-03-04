@@ -30,13 +30,14 @@ class Sumcore:
         enrich_mode: str = "auto",
         jack_mode: str = "median",
         clip_nonfinite_vals=False,
+        jackknife_weighted: bool = True,
     ):
         self.log = log
         self.verbose = verbose
         self.out = out
         self.align_alleles = bool(align_alleles)
         self.drop_ambiguous = bool(drop_ambiguous)
-        self.enrich_mode = self._normalize_enrich_mode(enrich_mode)
+        self.enrich_mode = utils._normalize_enrich_mode(enrich_mode)
         self._enrich_mode_used = ["", ""]  # resolved mode per trait in logs
         self.jack_mode = jack_mode
         self.collapse_reg_ld = bool(collapse_reg_ld)
@@ -44,6 +45,8 @@ class Sumcore:
         self.clip_nonfinite_vals = clip_nonfinite_vals
         self.nan_policy = "propagate" if self.clip_nonfinite_vals else "omit"
 
+        # NEW: SE weighting control
+        self._jackknife_weighted = bool(jackknife_weighted)
 
         self.chisq_threshold = chisq_threshold
         self.start_time = utils._get_time()
@@ -69,7 +72,7 @@ class Sumcore:
             ldscores=ldscores,
             ldscores_reg=ldscores_reg,
             log=self.log,
-            nblks=njack,
+            nblks=njack,                 # can be int-like or 'chr' now
             annot=annot,
             verbose=verbose,
         )
@@ -80,6 +83,10 @@ class Sumcore:
             self.log._log("[rg] Using ldscores_reg for intercept regression; using ldscores for SCORE normal equation.")
         else:
             self.log._log("[rg] ldscores_reg not provided; using ldscores for both intercept regression and SCORE solve.")
+
+        # NEW: propagate jackknife partitioning info to Sumstats
+        self._jackknife_partition_mode = getattr(self.tr, "jackknife_mode", "block")
+        self._jackknife_chrs = getattr(self.tr, "jackknife_chrs", None)
 
         self.nblks = self.tr.nblks
         self.nbins = self.tr.nbins
@@ -111,22 +118,31 @@ class Sumcore:
             log=self.log,
             annot_df=annot_df,
             nbins=self.nbins,
+            jackknife_mode=self._jackknife_partition_mode,   # NEW
+            jackknife_chrs=self._jackknife_chrs,             # NEW
         )
+        
+    def _get_jackknife_weights(self):
+        """
+        Returns (weights, use_pseudovalues) for utils._calc_jackknife_se.
 
-    @staticmethod
-    def _normalize_enrich_mode(mode: str) -> str:
-        if mode is None:
-            return "auto"
-        m = str(mode).strip().lower().replace("_", "-").replace(" ", "-")
-        if m == "auto":
-            return "auto"
-        if m in ("overlap", "overlapping"):
-            return "overlap"
-        if m in ("non-overlap", "nonoverlap", "nonoverlapping", "component", "components"):
-            return "non-overlap"
-        if m in ("both", "all"):
-            return "both"
-        raise ValueError(f"Invalid enrich_mode={mode!r}. Choose from: auto, overlap, non-overlap, both.")
+        weights are the *deleted* block sizes m_b (length B), derived from Trace's
+        cached block bounds. Works for both contiguous blocks and LOCO.
+        """
+        if not getattr(self, "_jackknife_weighted", False):
+            return None, False
+
+        if not (hasattr(self.tr, "_blk_starts") and hasattr(self.tr, "_blk_ends")):
+            return None, False
+
+        starts = np.asarray(self.tr._blk_starts, dtype=np.float64)
+        ends   = np.asarray(self.tr._blk_ends, dtype=np.float64)
+        if starts.size != self.nblks or ends.size != self.nblks:
+            return None, False
+
+        m = ends - starts
+        # allow zeros (empty blocks) — utils will drop them when using pseudovalues
+        return m, True
 
     @staticmethod
     def _has_overlapping_annotations(A: np.ndarray) -> bool:
@@ -419,37 +435,35 @@ class Sumcore:
     def _estimate_univariate_h2(self):
         """
         SUMRHE category h2 calculation using overlap/mass mapping:
-
         h2_cat = ( (A^T A) / (sum_j a_{j,k}) ) @ sigma_g
-
-        Works for overlapping and continuous annotations as long as annotation weights are
-        nonnegative and Trace has been filtered to the final SNP set.
         """
         if not hasattr(self, "_h2_overlap_full"):
             self._precompute_h2_overlap_terms()
 
-        overlap_full = self._h2_overlap_full      # (K, K)
-        mass_full    = self._h2_mass_full         # (K,)
-        overlap_blk  = self._h2_overlap_blk       # (B, K, K)
-        mass_blk     = self._h2_mass_blk          # (B, K)
+        overlap_full = self._h2_overlap_full
+        mass_full    = self._h2_mass_full
+        overlap_blk  = self._h2_overlap_blk
+        mass_blk     = self._h2_mass_blk
 
         B = self.nblks
         K = self.nbins
 
         if not hasattr(self, "herits"):
             self.herits  = np.full((2, B + 1, K + 1), np.nan, dtype=np.float64)
-            self.hersums = np.full((2, K + 1, 2), np.nan, dtype=np.float64)  # [point, SE]
+            self.hersums = np.full((2, K + 1, 2), np.nan, dtype=np.float64)
 
-        # LOO overlaps/masses
-        overlap_minus = overlap_full[None, :, :] - overlap_blk          # (B, K, K)
-        mass_minus    = mass_full[None, :]       - mass_blk             # (B, K)
+        overlap_minus = overlap_full[None, :, :] - overlap_blk
+        mass_minus    = mass_full[None, :]       - mass_blk
 
         with np.errstate(divide="ignore", invalid="ignore"):
-            ratio_minus = overlap_minus / mass_minus[:, None, :]        # (B, K, K)
-            ratio_full  = overlap_full  / mass_full[None, :]            # (K, K)
+            ratio_minus = overlap_minus / mass_minus[:, None, :]
+            ratio_full  = overlap_full  / mass_full[None, :]
+
+        # NEW: weighted pseudovalue JK
+        jk_w, jk_use_pv = self._get_jackknife_weights()
 
         for t in range(2):
-            sigma_g_minus = self.sigmas[t, :B, :K]                      # (B, K)
+            sigma_g_minus = self.sigmas[t, :B, :K]
             h2_cat_minus = np.einsum("bck,bk->bc", ratio_minus, sigma_g_minus, optimize=True)
 
             bad_minus = ~np.isfinite(h2_cat_minus)
@@ -458,22 +472,26 @@ class Sumcore:
 
             self.herits[t, :B, :K] = h2_cat_minus
 
-            h2_cat_full = ratio_full @ self.sigmas[t, B, :K]            # (K,)
+            h2_cat_full = ratio_full @ self.sigmas[t, B, :K]
             bad_full = ~np.isfinite(h2_cat_full)
             if self.clip_nonfinite_vals:
                 h2_cat_full[bad_full] = 0.0
 
             self.herits[t, B, :K] = h2_cat_full
-
-            # total h2 in your convention = sum sigma_g
             self.herits[t, :, -1] = self.sigmas[t, :, :K].sum(axis=1)
 
             est_full, se_jk = utils._calc_jackknife_se(
-                self.herits[t], axis=0, center=self.jack_mode, nan_policy=self.nan_policy
+                self.herits[t],
+                axis=0,
+                center=self.jack_mode,
+                nan_policy=self.nan_policy,
+                weights=jk_w,
+                use_pseudovalues=jk_use_pv,
             )
             self.hersums[t, :, 0] = est_full
             self.hersums[t, :, 1] = se_jk
-
+            
+            
     def _get_prop_rep(self) -> np.ndarray:
         """
         prop_rep[r, k] = Ak_rep[r, k] / M_rep[r]
@@ -518,34 +536,35 @@ class Sumcore:
         """
         Compute enrichment across all jackknife replicates and return (enr_full, enr_se).
         mode:
-          - "overlap": uses SUMRHE-style SNP-set h2 (self.herits[t,:, :K])
-          - "non-overlap": uses component share (self.sigmas[t,:, :K])
+        - "overlap": uses SUMRHE-style SNP-set h2 (self.herits[t,:, :K])
+        - "non-overlap": uses component share (self.sigmas[t,:, :K])
         """
-        mode = self._normalize_enrich_mode(mode)
-        if mode not in ("overlap", "non-overlap"):
-            raise ValueError("mode must be 'overlap' or 'non-overlap'.")
 
         K = self.nbins
-        prop = self._get_prop_rep()                                   # (B+1, K)
+        prop = self._get_prop_rep()  # (B+1, K)
 
-        # totals consistent with your convention (sum sigma_g)
         h2_tot = np.asarray(self.herits[t, :, -1], dtype=np.float64)  # (B+1,)
-
-        if mode == "overlap":
-            h2_cat = np.asarray(self.herits[t, :, :K], dtype=np.float64)   # (B+1,K)
+        if self.enrich_mode == "overlap":
+            h2_cat = np.asarray(self.herits[t, :, :K], dtype=np.float64)
         else:
-            h2_cat = np.asarray(self.sigmas[t, :, :K], dtype=np.float64)   # (B+1,K)
+            h2_cat = np.asarray(self.sigmas[t, :, :K], dtype=np.float64)
 
         with np.errstate(divide="ignore", invalid="ignore"):
             enr = (h2_cat / h2_tot[:, None]) / prop
-
             invalid = (~np.isfinite(enr)) | (~np.isfinite(prop)) | (prop <= 0.0) | (h2_tot[:, None] <= 0.0)
             enr[invalid] = np.nan
 
-        enr_full, enr_se = utils._calc_jackknife_se(enr, axis=0, center=self.jack_mode, nan_policy=self.nan_policy)
+        jk_w, jk_use_pv = self._get_jackknife_weights()  # uses Trace block sizes (LOCO or chunks)
+
+        enr_full, enr_se = utils._calc_jackknife_se(
+            enr,
+            axis=0,
+            center=self.jack_mode,
+            nan_policy=self.nan_policy,
+            weights=jk_w,
+            use_pseudovalues=jk_use_pv,
+        )
         return enr_full, enr_se
-
-
 
 
     def _estimate_gamma_and_rg(self):
@@ -553,23 +572,18 @@ class Sumcore:
         z2 = self.sums[1].zscores
         y = z1 * z2
 
-        # Estimation LD scores (must match annotation bins)
-        l2_bins_score = np.asarray(self.tr.ldscores, dtype=np.float64, order="C")  # (M, K_est)
-        nsnps_blk_est = np.asarray(self.tr.nsnps_blk, dtype=np.float64)            # (B+1, K_est)
+        l2_bins_score = np.asarray(self.tr.ldscores, dtype=np.float64, order="C")
+        nsnps_blk_est = np.asarray(self.tr.nsnps_blk, dtype=np.float64)
 
         M, K_est = l2_bins_score.shape
         if y.size != M:
             raise RuntimeError(f"Internal mismatch: y has {y.size} SNPs but Trace has M={M}.")
 
-        # ----------------------------
-        # 1D LD regressor for intercept regression
-        # ----------------------------
         Lreg = getattr(self.tr, "ldscores_reg", None)
 
         if Lreg is None:
-            # If user didn't provide ldscores_reg, only allow intercept regression if primary is already 1D
             if K_est == 1:
-                L1 = l2_bins_score  # (M,1)
+                L1 = l2_bins_score
                 self.log._log("[rg] ldscores_reg not provided; using primary ldscores (already 1D) for intercept regression.")
             else:
                 raise RuntimeError(
@@ -597,7 +611,6 @@ class Sumcore:
                             f"--ldscores-reg must be 1D by default, but got {K_reg} columns.\n"
                             "If you really want to collapse multi-column regression LD scores to 1D total LD, pass --collapse-reg-ld."
                         )
-                    # "Stable" collapse: sum in float64, keep shape (M,1)
                     L1 = np.sum(Lreg, axis=1, dtype=np.float64, keepdims=True)
                     self.log._log(
                         f"[rg] Collapsing ldscores_reg from {K_reg} columns to 1D total LD for intercept regression (--collapse-reg-ld)."
@@ -605,11 +618,8 @@ class Sumcore:
             else:
                 raise RuntimeError("ldscores_reg must be a vector (M,) or matrix (M,K).")
 
-        # nsnps_blk for regression step is only needed for shape scaling (gamma output ignored).
-        # Use total SNP mass per block as a (B+1,1) placeholder.
-        nsnps_blk_reg = np.sum(nsnps_blk_est, axis=1, keepdims=True)  # (B+1,1)
+        nsnps_blk_reg = np.sum(nsnps_blk_est, axis=1, keepdims=True)  # placeholder; gamma ignored here
 
-        # chisq filter only for intercept regression
         intercept_chisq_thr = getattr(self, "intercept_chisq_threshold", 30.0)
         if intercept_chisq_thr is not None:
             chisq1 = z1 * z1
@@ -618,14 +628,13 @@ class Sumcore:
             chisq1 = None
             chisq2 = None
 
-        # Step 1: estimate intercept (LOO), using 1D LD regressor
         _, c_all = utils.bivariate_regression_partitioned_jn(
-            l2_bins=L1,                     # (M,1)
+            l2_bins=L1,
             y=y,
             nblks=self.nblks,
             n1=self.nsamp[0],
             n2=self.nsamp[1],
-            nsnps_blk=nsnps_blk_reg,        # (B+1,1)
+            nsnps_blk=nsnps_blk_reg,
             blk_idx=self.tr.blk_idx,
             weight_floor=getattr(self, "weight_floor", None),
             weight_cap_quantile=getattr(self, "weight_cap_quantile", None),
@@ -636,38 +645,44 @@ class Sumcore:
         )
         self.c_opt = c_all
 
-        # Step 2: SCORE normal equations (ALL SNPs) with summary stats, using estimation bins
-        ld_sum_all = self.tr.get_ldsum_all(use_cache=True)  # from self.tr.ldscores (B+1, K_est, K_est)
+        ld_sum_all = self.tr.get_ldsum_all(use_cache=True)
 
         t1_all = utils.compute_t1_all_jn(
-            annot=self.tr.annot,          # (M, K_est)
-            y=y,                          # (M,)
+            annot=self.tr.annot,
+            y=y,
             blk_idx=self.tr.blk_idx,
             nblks=self.nblks,
-        )                                 # (B+1, K_est)
+        )
 
         self.gamma_g = utils.solve_score_gamma_from_intercept_jn(
             ld_sum_all=ld_sum_all,
             t1_all=t1_all,
-            nsnps_blk=nsnps_blk_est,      # (B+1, K_est)
+            nsnps_blk=nsnps_blk_est,
             c_all=c_all,
             n1=self.nsamp[0],
             n2=self.nsamp[1],
             ridge_rel=getattr(self, "ridge_rel", 0.0),
         )
 
-        # SE for gamma via jackknife
-        _, se = utils._calc_jackknife_se(self.gamma_g, axis=0, center=self.jack_mode, nan_policy=self.nan_policy)
+        # NEW: weighted pseudovalue JK
+        jk_w, jk_use_pv = self._get_jackknife_weights()
+
+        _, se = utils._calc_jackknife_se(
+            self.gamma_g, axis=0, center=self.jack_mode, nan_policy=self.nan_policy,
+            weights=jk_w, use_pseudovalues=jk_use_pv
+        )
         self.gamma_se = se
 
-        # rg per bin
         v1 = self.sigmas[0, :, :K_est]
         v2 = self.sigmas[1, :, :K_est]
         with np.errstate(divide="ignore", invalid="ignore"):
             self.rg = self.gamma_g / np.sqrt(v1 * v2)
         self.rg[~np.isfinite(self.rg)] = np.nan
 
-        _, se_rg = utils._calc_jackknife_se(self.rg, axis=0, center=self.jack_mode, nan_policy=self.nan_policy)
+        _, se_rg = utils._calc_jackknife_se(
+            self.rg, axis=0, center=self.jack_mode, nan_policy=self.nan_policy,
+            weights=jk_w, use_pseudovalues=jk_use_pv
+        )
         self.rg_se = se_rg
 
 
@@ -697,17 +712,22 @@ class Sumcore:
         else:
             mode_used = req
             modes_to_compute = (req,)
-        
+
         self.log._log(f"^^^ Phenotype [{self.names[0]}] & [{self.names[1]}] enrichment_mode_used: {mode_used}")
 
         if self.verbose and req in ("auto", "both"):
             self.log._log(f"[enrichment] enrich_mode={req} resolved={mode_used} has_overlap={has_ov}")
 
+        # NEW: weighted pseudovalue JK
+        jk_w, jk_use_pv = self._get_jackknife_weights()
 
         # sigma_g^2 SEs from jackknife
         sigma_se = np.full((2, K), np.nan, dtype=np.float64)
         for t in range(2):
-            _, se = utils._calc_jackknife_se(self.sigmas[t, :, :K], axis=0, center=self.jack_mode, nan_policy=self.nan_policy)
+            _, se = utils._calc_jackknife_se(
+                self.sigmas[t, :, :K], axis=0, center=self.jack_mode, nan_policy=self.nan_policy,
+                weights=jk_w, use_pseudovalues=jk_use_pv
+            )
             sigma_se[t] = se
 
         # per-trait blocks
@@ -718,7 +738,6 @@ class Sumcore:
             h2_tot     = float(self.hersums[t, -1, 0])
             h2_tot_se  = float(self.hersums[t, -1, 1])
 
-            # Enrichment(s) + SE(s) from jackknife replicates
             enr_main_full, enr_main_se = self._compute_enrich_reps_and_se(t, mode_used)
             self._enrich_mode_used[t] = mode_used
 
@@ -733,20 +752,25 @@ class Sumcore:
             for j, header in enumerate(self.annot_header):
                 enr_str = f"Enrichment: {enr_main_full[j]:.6g} (SE: {enr_main_se[j]:.6g})"
                 if req == "both" and (enr_no_full is not None) and (enr_ov_full is not None):
-                    enr_str = f"Enrichment_nonoverlap: {enr_no_full[j]:.6g} (SE: {enr_no_se[j]:.6g}) " + \
-                                "& Enrichment_overlap: {enr_ov_full[j]:.6g} (SE: {enr_ov_se[j]:.6g})"
+                    enr_str = (
+                        f"Enrichment_nonoverlap: {enr_no_full[j]:.6g} (SE: {enr_no_se[j]:.6g}) "
+                        f"& Enrichment_overlap: {enr_ov_full[j]:.6g} (SE: {enr_ov_se[j]:.6g})"
+                    )
                 self.log._log(
                     f"^^^ Phenotype [{self.names[t]}] Bin [{header}] "
                     f"sigma_g^2: {sigma_full[j]:.6g} (SE: {sigma_se[t, j]:.6g}) "
-                    f"h^2_cat: {h2_full[j]:.6g} (SE: {h2_se[j]:.6g}) "+ enr_str                    
+                    f"h^2_cat: {h2_full[j]:.6g} (SE: {h2_se[j]:.6g}) " + enr_str
                 )
 
             self.log._log(
                 f"^^^ Phenotype [{self.names[t]}] Total SNP heritability (h^2): {h2_tot:.6g} SE: {h2_tot_se:.6g}"
             )
 
-        # cross-trait
-        c_full, c_se = utils._calc_jackknife_se(self.c_opt, axis=0, center=self.jack_mode, nan_policy=self.nan_policy)
+        # cross-trait intercept
+        c_full, c_se = utils._calc_jackknife_se(
+            self.c_opt, axis=0, center=self.jack_mode, nan_policy=self.nan_policy,
+            weights=jk_w, use_pseudovalues=jk_use_pv
+        )
         self.log._log(
             f"^^^ Phenotype [{self.names[0]}] & [{self.names[1]}] Intercept (c): {float(c_full):.6g} (SE: {float(c_se):.6g})"
         )
@@ -760,14 +784,21 @@ class Sumcore:
 
         # Totals
         gamma_tot = np.nansum(self.gamma_g, axis=1)  # (B+1,)
-        g_full, g_se = utils._calc_jackknife_se(gamma_tot, axis=0, center=self.jack_mode, nan_policy=self.nan_policy)
+        g_full, g_se = utils._calc_jackknife_se(
+            gamma_tot, axis=0, center=self.jack_mode, nan_policy=self.nan_policy,
+            weights=jk_w, use_pseudovalues=jk_use_pv
+        )
 
         h2_0 = np.asarray(self.herits[0, :, -1], dtype=np.float64)
         h2_1 = np.asarray(self.herits[1, :, -1], dtype=np.float64)
         with np.errstate(divide="ignore", invalid="ignore"):
             rg_tot = gamma_tot / np.sqrt(h2_0 * h2_1)
         rg_tot[~np.isfinite(rg_tot)] = np.nan
-        r_full, r_se = utils._calc_jackknife_se(rg_tot, axis=0, center=self.jack_mode, nan_policy=self.nan_policy)
+
+        r_full, r_se = utils._calc_jackknife_se(
+            rg_tot, axis=0, center=self.jack_mode, nan_policy=self.nan_policy,
+            weights=jk_w, use_pseudovalues=jk_use_pv
+        )
 
         self.log._log(
             f"^^^ Phenotype [{self.names[0]}] & [{self.names[1]}] Total genetic covariance (gamma_g): {float(g_full):.6g} (SE: {float(g_se):.6g})"
