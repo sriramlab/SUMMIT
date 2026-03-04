@@ -61,12 +61,14 @@ parser.add_argument("--clip-nonfinite-vals", action="store_true", default=False,
 parser.add_argument("--enrich-mode", choices=["auto", "overlap", "non-overlap", "both"], default="auto")
 
 # SE arguments
-parser.add_argument("--njack", default=1000, type=int, \
-                    help='Number of jackknife blocks (only if using LD scores as input). Default is 1000.')
+parser.add_argument("--njack", default="chr", type=str, help="Number of jackknife blocks (LD-score input). "
+                    "Use an integer (e.g., 1000) or 'chr' for LOCO (leave-one-chromosome-out). Default: chr.")
 parser.add_argument("--jack-mode", default="median", type=str, \
                     help='Jackknife mode (median, mean or full). Default is median.')
 parser.add_argument("--adjust-delta", action="store_true", default=False, \
                     help='Adjust for higher-moment deviations in LD scores due to non-normality. Default if False.')
+parser.add_argument("--jackknife-unweighted", action="store_true", default=False, 
+                    help="Disable weighted delete-m pseudovalue jackknife (legacy equal-weight jackknife SE). Default: False.")
 
 # Genetic correlation arguments
 # parser.add_argument("--intercept-rg", action='store', default=None, type=float, \
@@ -346,7 +348,7 @@ if __name__ == '__main__':
         sums = Sumrhe(bim_path=args.bim, sum_path=args.trace, save_path = args.save_trace, h2_path=args.h2,\
             chisq_threshold=args.max_chisq, log=log, out=args.out, verbose=args.verbose, ldscores=args.ldscores,\
             njack=args.njack, annot=args.annot, allow_neg_enr=args.allow_neg_enr, clip_nonfinite_vals=args.clip_nonfinite_vals,\
-            adjust_delta=args.adjust_delta, enrich_mode=args.enrich_mode, jack_mode=args.jack_mode)
+            adjust_delta=args.adjust_delta, enrich_mode=args.enrich_mode, jack_mode=args.jack_mode, jackknife_weighted=(not args.jackknife_unweighted),)
         sums._run()
         sums._logoff()
     elif (args.rg is not None):
@@ -359,7 +361,7 @@ if __name__ == '__main__':
         rg = Sumcore(bim_path=args.bim, save_path=args.save_trace, rg=args.rg,\
             chisq_threshold=args.max_chisq, log=log, verbose=args.verbose, out=args.out, \
             ldscores=args.ldscores, ldscores_reg=args.ldscores_reg, njack=args.njack, annot=args.annot, enrich_mode=args.enrich_mode,
-            jack_mode=args.jack_mode, collapse_reg_ld=args.collapse_reg_ld)
+            jack_mode=args.jack_mode, collapse_reg_ld=args.collapse_reg_ld, clip_nonfinite_vals=args.clip_nonfinite_vals, jackknife_weighted=(not args.jackknife_unweighted),)
          
             #intercept=args.intercept_rg, phenos=args.pheno_rg
         rg._run()

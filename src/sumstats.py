@@ -14,12 +14,44 @@ import sys
 _CHI2_MEDIAN_1DF = 0.454936423119572
 
 class Sumstats:
-    def __init__(self, nblks=100, chisq_threshold=0, chisq_action='drop', log=None, both_side=False, annot_df=None, nbins=1):
+    def __init__(
+        self,
+        nblks=100,
+        chisq_threshold=0,
+        chisq_action='drop',
+        log=None,
+        both_side=False,
+        annot_df=None,
+        nbins=1,
+        jackknife_mode: str = "block",
+        jackknife_chrs=None,
+    ):
         self.log = log
-        self.nblks = nblks
-        self.nbins = nbins
+
+        # nblks always numeric inside Sumstats
+        if isinstance(nblks, str):
+            try:
+                self.nblks = int(float(nblks))
+            except Exception as e:
+                raise ValueError(f"Sumstats: invalid nblks={nblks!r}") from e
+        else:
+            self.nblks = int(nblks)
+
+        self.nbins = int(nbins)
         self.annot_df = annot_df
-        self.snpids = len(annot_df)
+        self.snpids = len(annot_df) if annot_df is not None else 0
+
+        # NEW: jackknife partitioning config (must match Trace)
+        jm = str(jackknife_mode).strip().lower()
+        if jm in ("block", "chunk", "contig"):
+            self.jackknife_mode = "block"
+        elif jm in ("chr", "chrom", "chromosome", "loco", "looc"):
+            self.jackknife_mode = "chr"
+        else:
+            raise ValueError(f"Invalid jackknife_mode={jackknife_mode!r}; expected 'block' or 'chr'.")
+
+        self.jackknife_chrs = None if jackknife_chrs is None else list(jackknife_chrs)
+
         self.annot = None
         self.zscores = None
         self.rhs = None
@@ -27,10 +59,7 @@ class Sumstats:
         self.nsnps = 0
         self.nsnps_blk = None
         self.nsnps_bin = None
-        # NOTE: chisq_threshold can be:
-        #   - 'auto' (string): use default cap max(80, 0.001 * Nmax)
-        #   - None: no filtering
-        #   - number: legacy behavior
+
         self.chisq_threshold = chisq_threshold
         self.matched_snps = None
         self.name = None
@@ -53,9 +82,6 @@ class Sumstats:
         self._chisq_filter_removed = 0
         self._chisq_action = chisq_action
 
-        # --- chi^2 diagnostics caches (per phenotype) ---
-        # "read": after parsing + scaling Z, before matching to annotations
-        # "used": after matching to annotation SNPs (and after any active chi^2 filter)
         self._chisq_diag_read = None
         self._chisq_diag_used = None
         self._chisq_top_read = None
@@ -65,18 +91,32 @@ class Sumstats:
             self._set_annot_df(annot_df)
 
 
-    def _set_annot_df(self, annot_df: pd.DataFrame):
+    def _set_annot_df(self, annot_df):
         """Cache annotation SNP order + annotation matrix for fast rematching."""
         self.annot_df = annot_df
-        self._ann_cols = [c for c in annot_df.columns if c != 'SNP']
 
-        # ensure string SNP ids once
+        meta = {"SNP", "CHR", "BP", "CM"}
+        # Only treat true annotation bins as columns; ignore metadata
+        self._ann_cols = [c for c in annot_df.columns if (c not in meta)]
+
+        if "SNP" not in annot_df.columns:
+            raise ValueError("annot_df must contain 'SNP' column.")
+
+        # ensure bins match nbins
+        if len(self._ann_cols) != int(self.nbins):
+            raise ValueError(
+                f"Annotation column count mismatch: nbins={self.nbins} but found {len(self._ann_cols)} "
+                f"non-meta columns in annot_df."
+            )
+
         self._annot_snps = annot_df['SNP'].astype(str).to_numpy()
-
-        # keep numeric matrix; works for binary/overlapping/continuous
         self._annot_ann = annot_df[self._ann_cols].to_numpy(dtype=np.float64, copy=False)
 
-        # basic sanity (fail fast if annotation has NaNs / inf)
+        # optional chr cache for LOCO
+        self._annot_chr = None
+        if "CHR" in annot_df.columns:
+            self._annot_chr = annot_df["CHR"].to_numpy(dtype=np.int32, copy=False)
+
         if not np.isfinite(self._annot_ann).all():
             bad = np.flatnonzero(~np.isfinite(self._annot_ann).any(axis=1))[:10]
             raise ValueError(
@@ -460,18 +500,13 @@ class Sumstats:
         """
         Match SNPs between sumstats and annot_df while preserving annot_df order.
 
-        Supports binary/overlapping/continuous annotations.
+        NEW:
+        - if jackknife_mode == 'chr', define jackknife blocks by chromosome (LOCO),
+            using annot_df['CHR'] and the provided jackknife_chrs list (must match Trace).
 
-        For overlapping/continuous, we compute weighted sufficient stats:
-            M_k   = sum_j a_{j,k}
-            S_k   = sum_j a_{j,k} * z_j^2
-        and their in-block counterparts.
-
-        Robust chi^2 handling (self.chisq_action; default='drop'):
-        - 'drop': SNPs were already removed pre-matching by _apply_chisq_filter_once()
-        - 'clip': after matching, cap z_j^2 at threshold (winsorization) when building RHS
-        - 'warn'/'none': no modification; only diagnostics
+        Everything else (RHS math) unchanged.
         """
+
         if self.annot_df is None:
             raise RuntimeError("Sumstats.annot_df is None; cannot match SNPs.")
         if self._annot_snps is None or (self._annot_ann is None):
@@ -492,6 +527,8 @@ class Sumstats:
         # ----------------------------
         # SNP matching
         # ----------------------------
+        chr_matched = None
+
         if self._sum_has_dups or self._annot_has_dups:
             df = self.annot_df.merge(self.sumdf, how='inner', on='SNP', sort=False)
 
@@ -512,8 +549,13 @@ class Sumstats:
             self.a1 = df['A1'].astype(str).str.upper().to_numpy()
             self.a2 = df['A2'].astype(str).str.upper().to_numpy()
 
-            ann_cols = [c for c in self.annot_df.columns if c != 'SNP']
+            ann_cols = [c for c in self.annot_df.columns if c not in ('SNP', 'CHR', 'BP', 'CM')]
             all_ann = df[ann_cols].to_numpy(dtype=np.float64, copy=False)
+
+            if self.jackknife_mode == "chr":
+                if "CHR" not in df.columns:
+                    raise RuntimeError("LOCO mode requires annot_df (and merged df) to contain CHR column.")
+                chr_matched = df["CHR"].to_numpy(dtype=np.int32, copy=False)
 
         else:
             annot_snps = self._annot_snps
@@ -538,13 +580,56 @@ class Sumstats:
             self.a2 = self._sum_a2[pos]
             all_ann = self._annot_ann[keep_mask, :]
 
-        # diagnostics on the matched set (raw; before any clipping)
+            if self.jackknife_mode == "chr":
+                if self._annot_chr is None:
+                    raise RuntimeError("LOCO mode requires annot_df to contain CHR column.")
+                chr_matched = self._annot_chr[keep_mask]
+
+        # diagnostics on matched set (raw; before clipping)
         self._chisq_diag_used, self._chisq_top_used = self._compute_chisq_diag(
             z=all_z, snps=self.matched_snps, a1=self.a1, a2=self.a2, nmax=self.nsamp, topk=10
         )
 
         # ----------------------------
-        # Weighted sufficient statistics for RHS
+        # Define jackknife block index
+        # ----------------------------
+        M = int(np.asarray(all_z).size)
+
+        if self.jackknife_mode == "chr":
+            if chr_matched is None:
+                raise RuntimeError("LOCO mode: chr_matched is None (unexpected).")
+            if self.jackknife_chrs is None:
+                # fallback: infer from matched set (should generally match Trace)
+                chrs = np.unique(np.asarray(chr_matched, dtype=np.int32))
+                chrs = chrs[np.isfinite(chrs)]
+                chrs = np.asarray(chrs, dtype=np.int32)
+                chrs.sort()
+                self.jackknife_chrs = chrs.tolist()
+
+            chrs = np.asarray(self.jackknife_chrs, dtype=np.int32).ravel()
+            B = int(chrs.size)
+            if self.nblks != B:
+                # enforce consistency with Trace / Sumrhe allocations
+                raise RuntimeError(f"LOCO mode: Sumstats.nblks={self.nblks} but jackknife_chrs has length {B}.")
+
+            idx = np.searchsorted(chrs, np.asarray(chr_matched, dtype=np.int32))
+            valid = (idx >= 0) & (idx < B) & (chrs[idx] == np.asarray(chr_matched, dtype=np.int32))
+            if not np.all(valid):
+                bad = np.flatnonzero(~valid)[:10].tolist()
+                raise RuntimeError(f"LOCO mode: found CHR values not in jackknife_chrs. First bad indices: {bad}")
+            blk_idx = idx.astype(np.int64)
+
+        else:
+            # contiguous blocks
+            blk_size = max(M // self.nblks, 1)
+            blk_idx = (np.arange(M, dtype=np.int64) // blk_size)
+            blk_idx[blk_idx >= self.nblks] = self.nblks - 1
+
+        self.blk_idx = blk_idx
+        self.nsnps = M
+
+        # ----------------------------
+        # Weighted sufficient statistics for RHS (unchanged)
         # ----------------------------
         all_z = np.asarray(all_z, dtype=np.float64)
         if not np.isfinite(all_z).all():
@@ -557,44 +642,32 @@ class Sumstats:
             bad = np.flatnonzero(~np.isfinite(A).any(axis=1))[:10]
             raise RuntimeError(f"Non-finite annotation values encountered after matching. First bad rows: {bad.tolist()}")
 
-        M = int(all_z.size)
-        self.nsnps = M
-
-        blk_size = max(M // self.nblks, 1)
-        blk_idx = (np.arange(M, dtype=np.int64) // blk_size)
-        blk_idx[blk_idx >= self.nblks] = self.nblks - 1
-        self.blk_idx = blk_idx
-
         # chi^2 = z^2
         z2 = all_z * all_z
         if not np.isfinite(z2).all():
-            # extremely rare (overflow). Treat as outliers only if clipping is enabled;
-            # otherwise refuse to proceed because moments are undefined.
             if action == "clip" and thr_enabled:
                 bad = ~np.isfinite(z2)
                 z2[bad] = thr
             else:
                 raise RuntimeError("Non-finite chi^2 encountered after squaring z-scores.")
 
-        # Robustification: winsorize chi^2 on matched set (RHS only)
+        # winsorize chi^2 on matched set (RHS only)
         self._chisq_clip_applied = False
         self._chisq_clip_count = 0
         self._chisq_clip_threshold = float(thr) if thr_enabled else 0.0
 
         if action == "clip" and thr_enabled:
-            # count how many would have been clipped
             clip_mask = (z2 > thr) & np.isfinite(z2)
             self._chisq_clip_count = int(np.sum(clip_mask))
             if self._chisq_clip_count > 0:
-                np.minimum(z2, thr, out=z2)  # in-place winsorization
+                np.minimum(z2, thr, out=z2)
                 self._chisq_clip_applied = True
 
-        # Full sums: M_k = sum a_{jk}; S_k = sum a_{jk} z_j^2 (robust if clip applied)
         Ak_full = A.sum(axis=0, dtype=np.float64)
         Az2_full = (A.T @ z2).astype(np.float64, copy=False)
 
-        B = self.nblks
-        K = self.nbins
+        B = int(self.nblks)
+        K = int(self.nbins)
         Ak_blk = np.zeros((B, K), dtype=np.float64)
         Az2_blk = np.zeros((B, K), dtype=np.float64)
 
@@ -622,11 +695,8 @@ class Sumstats:
             )
             sys.exit(1)
 
-        # optional: in 'warn' mode, just log that threshold exists but nothing was applied
         if action == "warn" and thr_enabled and printlog:
-            # keep it short (full tail/top already available via your diagnostics)
             self.log._log(f"[chisq] [{self.name}] warning-only threshold set at {thr:.3f}; no dropping/clipping applied.")
-
 
     def _calc_rhs_h2(self):
         """

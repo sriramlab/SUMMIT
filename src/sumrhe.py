@@ -7,21 +7,67 @@ import os
 import sys
 
 class Sumrhe:
-    def __init__(self, bim_path=None, sum_path=None, save_path=None, h2_path=None, out=None, chisq_threshold=0, \
-            log=None, mem=False, verbose=False, ldscores=None, njack=None, annot=None, chisq_action='drop',
-            report_tau: bool = True, allow_neg_enr: bool = False, clip_nonfinite_vals: bool = False, adjust_delta: bool = False, enrich_mode: str = "auto", \
-            jack_mode: str = "median"):
+    def __init__(
+        self,
+        bim_path=None,
+        sum_path=None,
+        save_path=None,
+        h2_path=None,
+        out=None,
+        chisq_threshold=0,
+        log=None,
+        mem=False,
+        verbose=False,
+        ldscores=None,
+        njack=None,
+        annot=None,
+        chisq_action='drop',
+        report_tau: bool = True,
+        allow_neg_enr: bool = False,
+        clip_nonfinite_vals: bool = False,
+        adjust_delta: bool = False,
+        enrich_mode: str = "auto",
+        jack_mode: str = "median",
+        jackknife_weighted: bool = True,   # NEW (default ON)
+    ):
         self.mem = mem
         self.log = log
         self.start_time = utils._get_time()
         self.log._log("Analysis started at: "+utils._get_timestr(self.start_time))
-        self.tr = Trace(bimpath=bim_path, sumpath=sum_path, savepath=save_path, ldscores=ldscores, log=self.log, nblks=njack, annot=annot, verbose=verbose, adjust_delta=adjust_delta)
+
+        self.tr = Trace(
+            bimpath=bim_path,
+            sumpath=sum_path,
+            savepath=save_path,
+            ldscores=ldscores,
+            log=self.log,
+            nblks=njack,                 # can be int or 'chr' now
+            annot=annot,
+            verbose=verbose,
+            adjust_delta=adjust_delta,
+        )
+
         self.nblks = self.tr.nblks
         self.jack_mode = jack_mode
         self.annot_header = self.tr.annot_header
         self.nbins = self.tr.nbins
-        self.sums = Sumstats(nblks=self.nblks, chisq_threshold=chisq_threshold, log=self.log, annot_df=self.tr.annot_df, nbins=self.nbins, chisq_action=chisq_action)
-        
+
+        # NEW: propagate jackknife partitioning so RHS blocks match LHS blocks
+        self._jackknife_weighted = bool(jackknife_weighted)
+        self._jackknife_partition_mode = getattr(self.tr, "jackknife_mode", "block")
+        self._jackknife_chrs = getattr(self.tr, "jackknife_chrs", None)
+
+        self.sums = Sumstats(
+            nblks=self.nblks,
+            chisq_threshold=chisq_threshold,
+            log=self.log,
+            annot_df=self.tr.annot_df,
+            nbins=self.nbins,
+            chisq_action=chisq_action,
+            jackknife_mode=self._jackknife_partition_mode,
+            jackknife_chrs=self._jackknife_chrs,
+        )
+
         try:
             self.h2_dir = utils._parse_sumdir(h2_path)
         except ValueError as e:
@@ -32,20 +78,18 @@ class Sumrhe:
         self.nsamp = []
         self.phen_names = [os.path.basename(name)[:-8] for name in self.h2_dir]
 
-        self.sigmas = np.zeros((self.npheno, self.nblks+1, self.nbins+2)) # jackknife subsampled variance components
-        self.sigsums = np.zeros((self.npheno, self.nbins+2, 2)) # variance components + total variance components
+        self.sigmas = np.zeros((self.npheno, self.nblks+1, self.nbins+2))
+        self.sigsums = np.zeros((self.npheno, self.nbins+2, 2))
 
-        self.herits  = np.zeros((self.npheno, self.nblks+1, self.nbins+1)) # jackknife subsampled h2
-        self.hersums = np.zeros((self.npheno, self.nbins+1, 2)) # total h2 + se
-        
-        self.enrich_mode = self._normalize_enrich_mode(enrich_mode)
-        self._enrich_mode_used = [""] * self.npheno  # resolved mode used for self.enrich per phenotype
+        self.herits  = np.zeros((self.npheno, self.nblks+1, self.nbins+1))
+        self.hersums = np.zeros((self.npheno, self.nbins+1, 2))
 
-        # Primary enrichment arrays (backwards-compatible)
+        self.enrich_mode = utils._normalize_enrich_mode(enrich_mode)
+        self._enrich_mode_used = [""] * self.npheno
+
         self.enrich = np.zeros((self.npheno, self.nblks+1, self.nbins), dtype=np.float64)
         self.enrich_sums = np.zeros((self.npheno, self.nbins, 2), dtype=np.float64)
 
-        # Optional: store both enrichments when requested
         self.enrich_overlap = None
         self.enrich_overlap_sums = None
         self.enrich_nonoverlap = None
@@ -57,45 +101,19 @@ class Sumrhe:
             self.enrich_nonoverlap = np.zeros((self.npheno, self.nblks+1, self.nbins), dtype=np.float64)
             self.enrich_nonoverlap_sums = np.zeros((self.npheno, self.nbins, 2), dtype=np.float64)
 
-
         self.out = out
         self.verbose = verbose
         self.report_tau = bool(report_tau)
         self.allow_neg_enr = bool(allow_neg_enr)
         self.clip_nonfinite_vals = clip_nonfinite_vals
+        self.nan_policy = "propagate" if self.clip_nonfinite_vals else "omit"
         self.adjust_delta = adjust_delta
-        
+
         if self.report_tau:
             self.tau         = np.zeros((self.npheno, self.nblks+1, self.nbins), dtype=np.float64)
             self.tau_star    = np.zeros((self.npheno, self.nblks+1, self.nbins), dtype=np.float64)
-            self.tau_sums    = np.zeros((self.npheno, self.nbins, 2), dtype=np.float64)  # [point, SE]
+            self.tau_sums    = np.zeros((self.npheno, self.nbins, 2), dtype=np.float64)
             self.tau_star_sums = np.zeros((self.npheno, self.nbins, 2), dtype=np.float64)
-    
-    @staticmethod
-    def _normalize_enrich_mode(mode: str) -> str:
-        if mode is None:
-            return "auto"
-        m = str(mode).strip().lower().replace("_", "-").replace(" ", "-")
-        if m in ("auto",):
-            return "auto"
-        if m in ("overlap", "overlapping"):
-            return "overlap"
-        if m in ("non-overlap", "nonoverlap", "nonoverlapping", "component", "components"):
-            return "non-overlap"
-        if m in ("both", "all"):
-            return "both"
-        raise ValueError(f"Invalid enrich_mode={mode!r}. Choose from: auto, overlap, non-overlap, both.")
-
-    @staticmethod
-    def _has_overlapping_annotations(A: np.ndarray) -> bool:
-        """
-        Returns True if any SNP has >1 nonzero annotation entry.
-        Works for binary or continuous weights. Exact-zero based.
-        """
-        # np.count_nonzero is C-optimized and avoids a big Python loop.
-        return bool(np.any(np.count_nonzero(A, axis=1) > 1))
-
-
 
     def _calc_sigmas(self, idx):
         rhs = self.sums.rhs                              # (nblks+1, p)
@@ -127,8 +145,6 @@ class Sumrhe:
         A = self.tr.annot                    # (M, K), can be 0/1, overlapping, or continuous >=0
         M, K = A.shape
         B = self.nblks
-
-        clip_nonfinite = bool(getattr(self, "clip_nonfinite_vals", False))
 
         # optional sanity: continuous annotations should usually be >=0
         if np.nanmin(A) < 0:
@@ -174,7 +190,7 @@ class Sumrhe:
 
         # invalidate bad replicates (Ak_minus <= 0 yields inf/nan)
         bad_minus = (~np.isfinite(h2_cat_minus))
-        if clip_nonfinite:
+        if self.clip_nonfinite_vals:
             h2_cat_minus[bad_minus] = 0.0
         else:
             h2_cat_minus[bad_minus] = np.nan
@@ -187,7 +203,7 @@ class Sumrhe:
             h2_cat_full = ratio_full @ self.sigmas[idx, B, :K]     # (K,)
 
         bad_full = ~np.isfinite(h2_cat_full)
-        if clip_nonfinite:
+        if self.clip_nonfinite_vals:
             h2_cat_full[bad_full] = 0.0
         else:
             h2_cat_full[bad_full] = np.nan
@@ -261,7 +277,7 @@ class Sumrhe:
 
         # Decide which mode(s) to compute
         requested = self.enrich_mode
-        has_ov = self._has_overlapping_annotations(A)
+        has_ov = utils._has_overlapping_annotations(A)
 
         if requested == "auto":
             mode_used = "overlap" if has_ov else "non-overlap"
@@ -311,9 +327,7 @@ class Sumrhe:
             self.enrich[idx] = enr_ov if mode_used == "overlap" else enr_no
         else:
             self.enrich[idx] = enr_ov if mode_used == "overlap" else enr_no
-
-
-        
+      
     def _calc_tau(self, idx):
         """
         Compute LDSC τ_k and τ*_k across all jackknife replicates (B LOO + full).
@@ -329,8 +343,6 @@ class Sumrhe:
         A = np.asarray(self.tr.annot, dtype=np.float64, order='C')  # (M, K)
         M_full, K = A.shape
         B = self.nblks
-
-        clip_nonfinite = bool(getattr(self, "clip_nonfinite_vals", False))
 
         if np.nanmin(A) < 0:
             self.log._log("[WARNING] Detected negative annotation weights; tau/tau* may be ill-defined.")
@@ -380,7 +392,7 @@ class Sumrhe:
             tau = sigma_g_rep / Ak_rep
 
         bad_tau = ~np.isfinite(tau)
-        if clip_nonfinite:
+        if self.clip_nonfinite_vals:
             tau[bad_tau] = 0.0
         else:
             tau[bad_tau] = np.nan
@@ -396,7 +408,7 @@ class Sumrhe:
             tau_star = tau * (sdA / denom[:, None])
 
         bad_ts = ~np.isfinite(tau_star)
-        if clip_nonfinite:
+        if self.clip_nonfinite_vals:
             tau_star[bad_ts] = 0.0
         else:
             tau_star[bad_ts] = np.nan
@@ -407,43 +419,96 @@ class Sumrhe:
 
     def _run_jackknife(self, idx):
         """Run SNP-level block jackknife for this phenotype."""
-        clip_nonfinite = bool(getattr(self, "clip_nonfinite_vals", False))
-        nan_policy = 'propagate' if clip_nonfinite else 'omit'
+        # Block sizes = number of SNPs deleted for replicate b (used as delete-m weights)
+        weights = None
+        use_pv = False
+        if self._jackknife_weighted and hasattr(self.tr, "_blk_starts") and hasattr(self.tr, "_blk_ends"):
+            m = (np.asarray(self.tr._blk_ends, dtype=np.float64) - np.asarray(self.tr._blk_starts, dtype=np.float64))
+            weights = m
+            use_pv = True
 
         # Sigma components
-        est_full, se_jk = utils._calc_jackknife_se(self.sigmas[idx], axis=0, center=self.jack_mode, nan_policy=nan_policy)
+        est_full, se_jk = utils._calc_jackknife_se(
+            self.sigmas[idx],
+            axis=0,
+            center=self.jack_mode,
+            nan_policy=self.nan_policy,
+            weights=weights,
+            use_pseudovalues=use_pv,
+        )
         self.sigsums[idx, :, 0] = est_full
         self.sigsums[idx, :, 1] = se_jk
 
         # Heritabilities (per bin + total)
-        est_full_h2, se_jk_h2 = utils._calc_jackknife_se(self.herits[idx], axis=0, center=self.jack_mode, nan_policy=nan_policy)
+        est_full_h2, se_jk_h2 = utils._calc_jackknife_se(
+            self.herits[idx],
+            axis=0,
+            center=self.jack_mode,
+            nan_policy=self.nan_policy,
+            weights=weights,
+            use_pseudovalues=use_pv,
+        )
         self.hersums[idx, :, 0] = est_full_h2
         self.hersums[idx, :, 1] = se_jk_h2
 
         # Enrichment
-        est_full_enr, se_jk_enr = utils._calc_jackknife_se(self.enrich[idx], axis=0, center=self.jack_mode, nan_policy=nan_policy)
+        est_full_enr, se_jk_enr = utils._calc_jackknife_se(
+            self.enrich[idx],
+            axis=0,
+            center=self.jack_mode,
+            nan_policy=self.nan_policy,
+            weights=weights,
+            use_pseudovalues=use_pv,
+        )
         self.enrich_sums[idx, :, 0] = est_full_enr
         self.enrich_sums[idx, :, 1] = se_jk_enr
 
         # Optional enrichment outputs (both-mode)
         if self.enrich_overlap is not None:
-            est_full_eov, se_jk_eov = utils._calc_jackknife_se(self.enrich_overlap[idx], axis=0, center=self.jack_mode, nan_policy=nan_policy)
+            est_full_eov, se_jk_eov = utils._calc_jackknife_se(
+                self.enrich_overlap[idx],
+                axis=0,
+                center=self.jack_mode,
+                nan_policy=self.nan_policy,
+                weights=weights,
+                use_pseudovalues=use_pv,
+            )
             self.enrich_overlap_sums[idx, :, 0] = est_full_eov
             self.enrich_overlap_sums[idx, :, 1] = se_jk_eov
 
         if self.enrich_nonoverlap is not None:
-            est_full_eno, se_jk_eno = utils._calc_jackknife_se(self.enrich_nonoverlap[idx], axis=0, center=self.jack_mode, nan_policy=nan_policy)
+            est_full_eno, se_jk_eno = utils._calc_jackknife_se(
+                self.enrich_nonoverlap[idx],
+                axis=0,
+                center=self.jack_mode,
+                nan_policy=self.nan_policy,
+                weights=weights,
+                use_pseudovalues=use_pv,
+            )
             self.enrich_nonoverlap_sums[idx, :, 0] = est_full_eno
             self.enrich_nonoverlap_sums[idx, :, 1] = se_jk_eno
 
-
         # τ / τ* if requested
         if self.report_tau:
-            est_full_tau, se_jk_tau = utils._calc_jackknife_se(self.tau[idx], axis=0, center=self.jack_mode, nan_policy=nan_policy)
+            est_full_tau, se_jk_tau = utils._calc_jackknife_se(
+                self.tau[idx],
+                axis=0,
+                center=self.jack_mode,
+                nan_policy=self.nan_policy,
+                weights=weights,
+                use_pseudovalues=use_pv,
+            )
             self.tau_sums[idx, :, 0] = est_full_tau
             self.tau_sums[idx, :, 1] = se_jk_tau
 
-            est_full_ts, se_jk_ts = utils._calc_jackknife_se(self.tau_star[idx], axis=0, center=self.jack_mode, nan_policy=nan_policy)
+            est_full_ts, se_jk_ts = utils._calc_jackknife_se(
+                self.tau_star[idx],
+                axis=0,
+                center=self.jack_mode,
+                nan_policy=self.nan_policy,
+                weights=weights,
+                use_pseudovalues=use_pv,
+            )
             self.tau_star_sums[idx, :, 0] = est_full_ts
             self.tau_star_sums[idx, :, 1] = se_jk_ts
 

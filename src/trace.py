@@ -21,6 +21,29 @@ class Trace:
         self.sumpath = sumpath
         self.savepath = savepath
 
+        # ----------------------------
+        # Jackknife config (NEW)
+        # ----------------------------
+        self.jackknife_mode = "block"
+        self.jackknife_chrs = None  # np.ndarray of chr labels (len = nblks) when mode=='chr'
+        _raw_nblks = nblks
+        if isinstance(_raw_nblks, str):
+            s = _raw_nblks.strip().lower()
+            if s in ("chr", "chrom", "chromosome", "loco", "looc"):
+                self.jackknife_mode = "chr"
+                # placeholder; will finalize once chr array is known
+                self.nblks = 0
+            else:
+                try:
+                    self.nblks = int(float(s))
+                except Exception as e:
+                    raise ValueError(f"Invalid nblks={nblks!r}. Expected int or 'chr'.") from e
+        else:
+            self.nblks = int(_raw_nblks)
+
+        if self.jackknife_mode == "block" and self.nblks <= 0:
+            raise ValueError(f"nblks must be positive; got {self.nblks}")
+
         # Primary (stochastic, used for SUMCORE / trace)
         self.ldscorespath = ldscores
         self.ldscores = None
@@ -37,7 +60,6 @@ class Trace:
         self.bp_reg = None
 
         self.sums = []
-        self.nblks = nblks
         self.ntrace = 0
         self.K = []
         self.snplist = []
@@ -63,6 +85,9 @@ class Trace:
 
         # Read trace summaries or LD-scores
         if (sumpath is not None):
+            # LOCO doesn't make sense for pre-aggregated trace summaries unless they were generated LOCO.
+            if self.jackknife_mode == "chr":
+                raise ValueError("njack='chr' (LOCO) is only supported when using per-SNP LD-scores, not trace summaries (.tr).")
             self._read_all_trace()
             if (savepath is not None):
                 self._save_trace()
@@ -118,20 +143,16 @@ class Trace:
         self._read_annot(annot)
 
         # If regression LD is present, prune it to match annotation-filtered SNP list
-        # (annotation can drop SNPs; we must keep ldscores_reg aligned)
         if (self.ldscores_reg_df is not None) and (self.snplist is not None) and (len(self.snplist) > 0):
             snps_now = np.asarray(self.snplist, dtype=str)
             reg_index_now = self.ldscores_reg_df.set_index("SNP")
             missing = ~pd.Index(snps_now).isin(reg_index_now.index)
             if missing.any():
-                # This *should* be rare; safest is to drop these SNPs from everything.
                 miss_snps = snps_now[missing].tolist()
                 self.log._log(
                     f"Dropping {len(miss_snps)} SNPs because they are missing in ldscores_reg after annotation pruning."
                 )
-                # Use _filter_snps on these SNPs once base arrays exist; for now do a direct keep mask
                 keep_mask_tmp = ~missing
-                # apply keep to annot/snplist and primary LD immediately
                 self.snplist = snps_now[keep_mask_tmp].tolist()
                 self.annot = np.asarray(self.annot)[keep_mask_tmp, :]
                 self.nsnps = int(len(self.snplist))
@@ -139,7 +160,8 @@ class Trace:
                     self.ldscores = np.asarray(self.ldscores)[keep_mask_tmp, :]
                     self.chr = np.asarray(self.chr)[keep_mask_tmp]
                     self.bp  = np.asarray(self.bp)[keep_mask_tmp]
-                # and reg LD
+                    self.ldscores_df = self.ldscores_df.loc[keep_mask_tmp].reset_index(drop=True)
+
                 reg_aligned2 = reg_index_now.loc[self.snplist].reset_index()
                 self.ldscores_reg_df = reg_aligned2
                 sidxr = self._ldscore_reg_start_idx
@@ -147,6 +169,67 @@ class Trace:
                 self.chr_reg = reg_aligned2["CHR"].to_numpy(dtype=np.int32, copy=False)
                 self.bp_reg  = reg_aligned2["BP"].to_numpy(dtype=np.int64, copy=False)
                 self.nbins_reg = int(self.ldscores_reg.shape[1])
+
+        # ----------------------------
+        # Finalize LOCO (NEW)
+        # ----------------------------
+        if self.jackknife_mode == "chr":
+            if self.ldscores is None or not hasattr(self, "chr"):
+                raise ValueError("njack='chr' (LOCO) requires per-SNP LD-scores with CHR available.")
+
+            chr_arr = np.asarray(self.chr, dtype=np.int32).ravel()
+            chrs = np.unique(chr_arr)
+            chrs = chrs[np.isfinite(chrs)]
+            chrs = np.asarray(chrs, dtype=np.int32)
+            chrs.sort()
+
+            self.jackknife_chrs = chrs
+            self.nblks = int(chrs.size)
+            if self.nblks <= 0:
+                raise RuntimeError("LOCO jackknife: no chromosomes found.")
+            if self.nblks == 1:
+                self.log._log("[WARNING] LOCO jackknife has only 1 chromosome block; SE will be undefined.")
+
+            # Ensure genomic contiguity by sorting by (CHR,BP,SNP) once.
+            bp_arr = np.asarray(self.bp, dtype=np.int64).ravel()
+            snp_arr = np.asarray(self.snplist, dtype=str)
+            order = np.lexsort((snp_arr, bp_arr, chr_arr))
+            if not np.array_equal(order, np.arange(order.size)):
+                self.log._log("[Trace] LOCO mode: sorting SNPs by (CHR,BP,SNP) to ensure chromosome-contiguous blocks.")
+                self.snplist = snp_arr[order].tolist()
+                self.annot = np.asarray(self.annot)[order, :]
+                self.nsnps = int(self.annot.shape[0])
+
+                self.ldscores = np.asarray(self.ldscores)[order, :]
+                self.chr = chr_arr[order]
+                self.bp  = bp_arr[order]
+                if self.ldscores_df is not None:
+                    self.ldscores_df = self.ldscores_df.iloc[order].reset_index(drop=True)
+
+                if self.ldscores_reg is not None:
+                    self.ldscores_reg = np.asarray(self.ldscores_reg)[order, :]
+                    if self.ldscores_reg_df is not None:
+                        self.ldscores_reg_df = self.ldscores_reg_df.iloc[order].reset_index(drop=True)
+                    if self.chr_reg is not None:
+                        self.chr_reg = np.asarray(self.chr_reg)[order]
+                    if self.bp_reg is not None:
+                        self.bp_reg = np.asarray(self.bp_reg)[order]
+
+                # Keep annot_df aligned with the sorted SNP order
+                if self.annot_df is not None:
+                    # annot_df index is aligned to snplist; easiest is rebuild from current snplist + annot
+                    # preserve existing annot_header
+                    adf = pd.DataFrame(self.annot, columns=self.annot_header)
+                    adf.insert(0, "SNP", self.snplist)
+                    self.annot_df = adf
+
+            # Attach CHR/BP to annot_df for Sumstats LOCO matching (do NOT change math)
+            if self.annot_df is not None:
+                if "CHR" not in self.annot_df.columns:
+                    self.annot_df.insert(0, "CHR", np.asarray(self.chr, dtype=np.int32))
+                if "BP" not in self.annot_df.columns:
+                    # after inserting CHR at 0, BP should be at 1
+                    self.annot_df.insert(1, "BP", np.asarray(self.bp, dtype=np.int64))
 
         # Base SNP universe (for fast filtering)
         self._base_snps = self.annot_df['SNP'].astype(str).to_numpy()
@@ -196,13 +279,63 @@ class Trace:
         """Compute and cache per-block slice bounds (after any filtering)."""
         if (self.nsnps <= 0) or (self.nblks <= 0):
             return
-        B = self.nblks
+
+        B = int(self.nblks)
+
+        if getattr(self, "jackknife_mode", "block") == "chr":
+            if self.jackknife_chrs is None:
+                if not hasattr(self, "chr") or self.chr is None:
+                    raise RuntimeError("LOCO jackknife requires self.chr.")
+                chrs = np.unique(np.asarray(self.chr, dtype=np.int32))
+                chrs = chrs[np.isfinite(chrs)]
+                chrs = np.asarray(chrs, dtype=np.int32)
+                chrs.sort()
+                self.jackknife_chrs = chrs
+                self.nblks = int(chrs.size)
+                B = int(self.nblks)
+
+            chrs = np.asarray(self.jackknife_chrs, dtype=np.int32).ravel()
+            if chrs.size != B:
+                raise RuntimeError(f"jackknife_chrs length {chrs.size} != nblks {B}")
+
+            chr_arr = np.asarray(self.chr, dtype=np.int32).ravel()
+            if chr_arr.size != self.nsnps:
+                raise RuntimeError("chr array length mismatch with nsnps")
+
+            # requires non-decreasing chr order for searchsorted bounds
+            if np.any(chr_arr[1:] < chr_arr[:-1]):
+                raise RuntimeError(
+                    "LOCO mode requires SNPs sorted by CHR (and BP). "
+                    "Trace.__init__ should sort to genomic order."
+                )
+
+            starts = np.searchsorted(chr_arr, chrs, side="left").astype(np.int64)
+            ends   = np.searchsorted(chr_arr, chrs, side="right").astype(np.int64)
+
+            self._blk_starts = starts
+            self._blk_ends = ends
+
+            # blk_idx: map each SNP chr -> block index (0..B-1)
+            blk_idx = np.searchsorted(chrs, chr_arr).astype(np.int64)
+            valid = (blk_idx >= 0) & (blk_idx < B) & (chrs[blk_idx] == chr_arr)
+            if not np.all(valid):
+                bad = np.flatnonzero(~valid)[:10].tolist()
+                raise RuntimeError(
+                    f"Found SNPs with chromosomes not in jackknife_chrs. "
+                    f"First bad indices: {bad}"
+                )
+            self.blk_idx = blk_idx
+
+            # keep blk_size for compatibility (not used for LOCO bounds)
+            self.blk_size = max(self.nsnps // B, 1)
+            return
+
+        # -------- default: contiguous equal-size blocks --------
         self.blk_size = max(getattr(self, "blk_size", self.nsnps // B), 1)
 
         starts = self.blk_size * np.arange(B, dtype=np.int64)
         ends = starts + self.blk_size
-        if B > 0:
-            ends[-1] = self.nsnps  # last block reaches the end
+        ends[-1] = self.nsnps
         self._blk_starts = starts
         self._blk_ends = ends
 
@@ -611,36 +744,32 @@ class Trace:
                 self.chr_reg = self._chr_reg_base[keep_mask]
                 self.bp_reg  = self._bp_reg_base[keep_mask]
 
-        self.blk_size = max(self.nsnps // self.nblks, 1)
-
         # NOTE: for continuous/overlap this is "bin mass" sum(A[:,k]), not SNP counts
         self.nsnps_bin = self.annot.sum(axis=0, dtype=np.float64)
 
-        # LOO bin masses
-        B = self.nblks
-        K = self.nbins
+        # Refresh bounds under the current jackknife mode
+        self._refresh_block_bounds()
+
+        B = int(self.nblks)
+        K = int(self.nbins)
+
+        # LOO bin masses (Trace convention: exclude block b)
         self.nsnps_blk = np.empty((B + 1, K), dtype=np.float64)
         self.nsnps_blk[B] = self.nsnps_bin
 
-        # block bounds in the filtered SNP order
-        starts = self.blk_size * np.arange(B, dtype=np.int64)
-        ends = starts + self.blk_size
-        if B > 0:
-            ends[-1] = self.nsnps
-
         csum = np.cumsum(self.annot, axis=0, dtype=np.float64)
-
-        for j in range(B):
-            s = int(starts[j]); e = int(ends[j])
+        for b in range(B):
+            s = int(self._blk_starts[b]); e = int(self._blk_ends[b])
             if e <= s:
                 blk_sum = np.zeros(K, dtype=np.float64)
             elif s == 0:
                 blk_sum = csum[e - 1]
             else:
                 blk_sum = csum[e - 1] - csum[s - 1]
-            self.nsnps_blk[j] = self.nsnps_bin - blk_sum
+            self.nsnps_blk[b] = self.nsnps_bin - blk_sum
 
-        self._refresh_block_bounds()
+        # keep blk_size for any legacy code paths
+        self.blk_size = max(self.nsnps // max(B, 1), 1)
 
 
     def _filter_snps(self, removesnps):
@@ -704,14 +833,14 @@ class Trace:
         if not hasattr(self, "_blk_starts"):
             self._refresh_block_bounds()
 
-        A = np.asarray(self.annot, dtype=np.float32, order="C")     # (M, K)
-        L = np.asarray(self.ldscores, dtype=np.float32, order="C")  # (M, K)
+        A = np.asarray(self.annot, dtype=np.float64, order="C")     # (M, K)
+        L = np.asarray(self.ldscores, dtype=np.float64, order="C")  # (M, K)
         B = self.nblks
         K = self.nbins
 
         full_ld = A.T @ L  # (K, K)
 
-        blk_ld = np.empty((B, K, K), dtype=np.float32)
+        blk_ld = np.empty((B, K, K), dtype=np.float64)
         for b in range(B):
             sl = slice(self._blk_starts[b], self._blk_ends[b])
             blk_ld[b] = A[sl, :].T @ L[sl, :]

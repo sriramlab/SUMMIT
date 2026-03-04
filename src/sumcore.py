@@ -29,6 +29,7 @@ class Sumcore:
         collapse_reg_ld=False,
         enrich_mode: str = "auto",
         jack_mode: str = "median",
+        clip_nonfinite_vals=False,
     ):
         self.log = log
         self.verbose = verbose
@@ -39,6 +40,9 @@ class Sumcore:
         self._enrich_mode_used = ["", ""]  # resolved mode per trait in logs
         self.jack_mode = jack_mode
         self.collapse_reg_ld = bool(collapse_reg_ld)
+
+        self.clip_nonfinite_vals = clip_nonfinite_vals
+        self.nan_policy = "propagate" if self.clip_nonfinite_vals else "omit"
 
 
         self.chisq_threshold = chisq_threshold
@@ -436,9 +440,6 @@ class Sumcore:
             self.herits  = np.full((2, B + 1, K + 1), np.nan, dtype=np.float64)
             self.hersums = np.full((2, K + 1, 2), np.nan, dtype=np.float64)  # [point, SE]
 
-        clip_nonfinite = bool(getattr(self, "clip_nonfinite_vals", False))
-        nan_policy = "propagate" if clip_nonfinite else "omit"
-
         # LOO overlaps/masses
         overlap_minus = overlap_full[None, :, :] - overlap_blk          # (B, K, K)
         mass_minus    = mass_full[None, :]       - mass_blk             # (B, K)
@@ -452,14 +453,14 @@ class Sumcore:
             h2_cat_minus = np.einsum("bck,bk->bc", ratio_minus, sigma_g_minus, optimize=True)
 
             bad_minus = ~np.isfinite(h2_cat_minus)
-            if clip_nonfinite:
+            if self.clip_nonfinite_vals:
                 h2_cat_minus[bad_minus] = 0.0
 
             self.herits[t, :B, :K] = h2_cat_minus
 
             h2_cat_full = ratio_full @ self.sigmas[t, B, :K]            # (K,)
             bad_full = ~np.isfinite(h2_cat_full)
-            if clip_nonfinite:
+            if self.clip_nonfinite_vals:
                 h2_cat_full[bad_full] = 0.0
 
             self.herits[t, B, :K] = h2_cat_full
@@ -468,7 +469,7 @@ class Sumcore:
             self.herits[t, :, -1] = self.sigmas[t, :, :K].sum(axis=1)
 
             est_full, se_jk = utils._calc_jackknife_se(
-                self.herits[t], axis=0, center=self.jack_mode, nan_policy=nan_policy
+                self.herits[t], axis=0, center=self.jack_mode, nan_policy=self.nan_policy
             )
             self.hersums[t, :, 0] = est_full
             self.hersums[t, :, 1] = se_jk
@@ -541,10 +542,7 @@ class Sumcore:
             invalid = (~np.isfinite(enr)) | (~np.isfinite(prop)) | (prop <= 0.0) | (h2_tot[:, None] <= 0.0)
             enr[invalid] = np.nan
 
-        clip_nonfinite = bool(getattr(self, "clip_nonfinite_vals", False))
-        nan_policy = "propagate" if clip_nonfinite else "omit"
-
-        enr_full, enr_se = utils._calc_jackknife_se(enr, axis=0, center=self.jack_mode, nan_policy=nan_policy)
+        enr_full, enr_se = utils._calc_jackknife_se(enr, axis=0, center=self.jack_mode, nan_policy=self.nan_policy)
         return enr_full, enr_se
 
 
@@ -659,7 +657,7 @@ class Sumcore:
         )
 
         # SE for gamma via jackknife
-        _, se = utils._calc_jackknife_se(self.gamma_g, axis=0, center=self.jack_mode, nan_policy="propagate")
+        _, se = utils._calc_jackknife_se(self.gamma_g, axis=0, center=self.jack_mode, nan_policy=self.nan_policy)
         self.gamma_se = se
 
         # rg per bin
@@ -669,7 +667,7 @@ class Sumcore:
             self.rg = self.gamma_g / np.sqrt(v1 * v2)
         self.rg[~np.isfinite(self.rg)] = np.nan
 
-        _, se_rg = utils._calc_jackknife_se(self.rg, axis=0, center=self.jack_mode, nan_policy="propagate")
+        _, se_rg = utils._calc_jackknife_se(self.rg, axis=0, center=self.jack_mode, nan_policy=self.nan_policy)
         self.rg_se = se_rg
 
 
@@ -709,7 +707,7 @@ class Sumcore:
         # sigma_g^2 SEs from jackknife
         sigma_se = np.full((2, K), np.nan, dtype=np.float64)
         for t in range(2):
-            _, se = utils._calc_jackknife_se(self.sigmas[t, :, :K], axis=0, center=self.jack_mode, nan_policy="propagate")
+            _, se = utils._calc_jackknife_se(self.sigmas[t, :, :K], axis=0, center=self.jack_mode, nan_policy=self.nan_policy)
             sigma_se[t] = se
 
         # per-trait blocks
@@ -748,7 +746,7 @@ class Sumcore:
             )
 
         # cross-trait
-        c_full, c_se = utils._calc_jackknife_se(self.c_opt, axis=0, center=self.jack_mode, nan_policy="propagate")
+        c_full, c_se = utils._calc_jackknife_se(self.c_opt, axis=0, center=self.jack_mode, nan_policy=self.nan_policy)
         self.log._log(
             f"^^^ Phenotype [{self.names[0]}] & [{self.names[1]}] Intercept (c): {float(c_full):.6g} (SE: {float(c_se):.6g})"
         )
@@ -762,14 +760,14 @@ class Sumcore:
 
         # Totals
         gamma_tot = np.nansum(self.gamma_g, axis=1)  # (B+1,)
-        g_full, g_se = utils._calc_jackknife_se(gamma_tot, axis=0, center=self.jack_mode, nan_policy="propagate")
+        g_full, g_se = utils._calc_jackknife_se(gamma_tot, axis=0, center=self.jack_mode, nan_policy=self.nan_policy)
 
         h2_0 = np.asarray(self.herits[0, :, -1], dtype=np.float64)
         h2_1 = np.asarray(self.herits[1, :, -1], dtype=np.float64)
         with np.errstate(divide="ignore", invalid="ignore"):
             rg_tot = gamma_tot / np.sqrt(h2_0 * h2_1)
         rg_tot[~np.isfinite(rg_tot)] = np.nan
-        r_full, r_se = utils._calc_jackknife_se(rg_tot, axis=0, center=self.jack_mode, nan_policy="propagate")
+        r_full, r_se = utils._calc_jackknife_se(rg_tot, axis=0, center=self.jack_mode, nan_policy=self.nan_policy)
 
         self.log._log(
             f"^^^ Phenotype [{self.names[0]}] & [{self.names[1]}] Total genetic covariance (gamma_g): {float(g_full):.6g} (SE: {float(g_se):.6g})"
