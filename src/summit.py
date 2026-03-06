@@ -38,6 +38,8 @@ parser.add_argument("--rg", default=None, type=str, \
                    help='Comma-separated file path for a pair of phenotype-specific summary statistics (.sumstat[.gz]) to estimate genetic correlation (rg).')
 parser.add_argument("--max-chisq", action='store', default=None, type=str, \
                     help='Filter out SNPs with chi-sq statistic above the threshold. If set to auto, it will automatically determine a sensible outlier threshold.')
+parser.add_argument("--intercept-chisq-thr", action='store', default=None, type=str, \
+                    help='Threshold for chi-sq statistic in intercept regression. If set to auto, it will automatically determine a sensible outlier threshold.')
 parser.add_argument("--chisq-action", default='drop', type=str, \
                     help='Specify what to do with outlier SNPs (high chi-sq values).')
 
@@ -61,10 +63,20 @@ parser.add_argument("--clip-nonfinite-vals", action="store_true", default=False,
 parser.add_argument("--enrich-mode", choices=["auto", "overlap", "non-overlap", "both"], default="auto")
 
 # SE arguments
-parser.add_argument("--njack", default="chr", type=str, help="Number of jackknife blocks (LD-score input). "
-                    "Use an integer (e.g., 1000) or 'chr' for LOCO (leave-one-chromosome-out). Default: chr.")
+parser.add_argument("--njack", default="chr", type=str, help=(
+        "Jackknife scheme for LD-score input.\n"
+        "  * integer (e.g., 1000): contiguous SNP blocks (leave-one-block-out)\n"
+        "  * 'chr'               : LOCO delete-1 (leave-one-chromosome-out)\n"
+        "  * 'chr:d'             : delete-d LOCO over chromosomes (all C(U,d) replicates)\n"
+        "  * 'chr:d:R'           : delete-d LOCO using random R replicate deletions\n"
+        "  * 'chr:d:R:seed'      : random R replicates with fixed RNG seed\n"
+        "Examples: --njack chr:2   ;   --njack chr:2:100:0\n"
+    ),
+)
 parser.add_argument("--jack-mode", default="mean", type=str, \
                     help='Jackknife mode (median, mean or full). Default is median.')
+parser.add_argument("--rg-se-method", default="jackknife", type=str, \
+                    help='Method for estimating SE of genetic correlation. Options are "jackknife" (default) or "delta".')
 parser.add_argument("--adjust-delta", action="store_true", default=False, \
                     help='Adjust for higher-moment deviations in LD scores due to non-normality. Default if False.')
 parser.add_argument("--jackknife-unweighted", action="store_true", default=False, 
@@ -359,9 +371,11 @@ if __name__ == '__main__':
         #     log._log("!!! --intercept-rg and --pheno-rg cannot be used together; please use one of the two options !!!")
         #     sys.exit(1)
         rg = Sumcore(bim_path=args.bim, save_path=args.save_trace, rg=args.rg,\
-            chisq_threshold=args.max_chisq, log=log, verbose=args.verbose, out=args.out, \
+            chisq_threshold=args.max_chisq, intercept_chisq_thr=args.intercept_chisq_thr, log=log, verbose=args.verbose, out=args.out, \
             ldscores=args.ldscores, ldscores_reg=args.ldscores_reg, njack=args.njack, annot=args.annot, enrich_mode=args.enrich_mode,
-            jack_mode=args.jack_mode, collapse_reg_ld=args.collapse_reg_ld, clip_nonfinite_vals=args.clip_nonfinite_vals, jackknife_weighted=(not args.jackknife_unweighted),)
+            jack_mode=args.jack_mode, collapse_reg_ld=args.collapse_reg_ld, clip_nonfinite_vals=args.clip_nonfinite_vals, \
+            jackknife_weighted=(not args.jackknife_unweighted), rg_se_method=args.rg_se_method,
+            )
          
             #intercept=args.intercept_rg, phenos=args.pheno_rg
         rg._run()

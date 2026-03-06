@@ -24,39 +24,65 @@ class Sumstats:
         annot_df=None,
         nbins=1,
         jackknife_mode: str = "block",
-        jackknife_chrs=None,
+        jackknife_chrs=None,             # (U,) chromosome labels for chr-mode
+        jackknife_delete: int = 1,       # d
+        jackknife_delete_sets=None,      # (R,d) unit indices for chr-mode
+        jackknife_seed: int | None = None,
     ):
+
         self.log = log
-
-        # nblks always numeric inside Sumstats
-        if isinstance(nblks, str):
-            try:
-                self.nblks = int(float(nblks))
-            except Exception as e:
-                raise ValueError(f"Sumstats: invalid nblks={nblks!r}") from e
-        else:
-            self.nblks = int(nblks)
-
+        self.nblks = int(nblks)   # replicate count R in chr-mode
         self.nbins = int(nbins)
-        self.annot_df = annot_df
-        self.snpids = len(annot_df) if annot_df is not None else 0
 
-        # NEW: jackknife partitioning config (must match Trace)
         jm = str(jackknife_mode).strip().lower()
         if jm in ("block", "chunk", "contig"):
             self.jackknife_mode = "block"
-        elif jm in ("chr", "chrom", "chromosome", "loco", "looc"):
+        elif jm in ("chr", "chrom", "chromosome", "loco"):
             self.jackknife_mode = "chr"
         else:
-            raise ValueError(f"Invalid jackknife_mode={jackknife_mode!r}; expected 'block' or 'chr'.")
+            raise ValueError(f"Invalid jackknife_mode={jackknife_mode!r}")
 
-        self.jackknife_chrs = None if jackknife_chrs is None else list(jackknife_chrs)
+        self.jackknife_delete = int(jackknife_delete)
+        self.jackknife_chrs = None if jackknife_chrs is None else np.asarray(jackknife_chrs, dtype=np.int32)
+        self.jackknife_units = int(self.jackknife_chrs.size) if (self.jackknife_chrs is not None) else 0
+
+        self.jackknife_delete_sets = None
+        self._rep_del_mat = None
+        if self.jackknife_mode == "chr":
+            if self.jackknife_chrs is None:
+                raise ValueError("chr-mode requires jackknife_chrs.")
+            if jackknife_delete_sets is None:
+                raise ValueError("chr-mode requires jackknife_delete_sets.")
+            ds = np.asarray(jackknife_delete_sets, dtype=np.int16)
+            if ds.ndim != 2 or ds.shape[0] != self.nblks:
+                raise ValueError(f"jackknife_delete_sets must be (R,d) with R=nblks={self.nblks}. Got {ds.shape}.")
+            if ds.shape[1] != self.jackknife_delete:
+                raise ValueError(f"delete_sets d mismatch: expected {self.jackknife_delete}, got {ds.shape[1]}.")
+            if ds.min() < 0 or ds.max() >= self.jackknife_units:
+                raise ValueError("delete_sets contain out-of-range unit indices.")
+            self.jackknife_delete_sets = ds
+
+            # build deletion incidence matrix D: (R,U)
+            R = int(self.nblks)
+            U = int(self.jackknife_units)
+            D = np.zeros((R, U), dtype=np.float32)
+            rr = np.arange(R, dtype=np.int64)[:, None]
+            D[rr, ds.astype(np.int64)] = 1.0
+            self._rep_del_mat = D
+
+        self.annot_df = annot_df
+        self.snpids = len(annot_df) if annot_df is not None else 0
 
         self.annot = None
         self.zscores = None
         self.rhs = None
         self.nsamp = 0
         self.nsnps = 0
+
+        # per-unit sufficient stats (chr-mode)
+        self._Ak_unit = None   # (U,K)
+        self._Az2_unit = None  # (U,K)
+
         self.nsnps_blk = None
         self.nsnps_bin = None
 
@@ -65,10 +91,10 @@ class Sumstats:
         self.name = None
         self.removesnps = []
 
-        # ---- caches for fast matching ----
         self._ann_cols = None
         self._annot_snps = None
         self._annot_ann = None
+        self._annot_chr = None
         self._annot_has_dups = False
 
         self._sum_snps = None
@@ -126,51 +152,6 @@ class Sumstats:
 
         self._annot_has_dups = pd.Index(self._annot_snps).has_duplicates
 
-    def _suggested_chisq_max(self, nmax: float) -> float:
-        """
-        A commonly used cap for extreme chi^2 outliers:
-            chi2_max = max(80, 0.001 * Nmax)
-        This function is report-only unless you explicitly set chisq_threshold.
-        """
-        if not np.isfinite(nmax) or nmax <= 0:
-            return 80.0
-        return float(max(80.0, 0.001 * nmax))
-
-    def _resolve_chisq_threshold(self):
-        """
-        Resolve chisq_threshold into an effective numeric threshold.
-
-        Returns:
-            (thr: float|None, mode: str)
-              mode in {'none','auto','manual'}.
-
-        Semantics:
-          - chisq_threshold is None -> (None, 'none')  [no filtering]
-          - chisq_threshold == 'auto' (case-insensitive) -> (max(80, 0.001*Nmax), 'auto')
-          - otherwise -> float(value) if possible -> ('manual')
-        """
-        raw = getattr(self, "chisq_threshold", None)
-        if raw is None:
-            return None, "none"
-
-        if isinstance(raw, str):
-            s = raw.strip().lower()
-            if s == "auto":
-                nmax = float(getattr(self, "nsamp", np.nan))
-                return float(self._suggested_chisq_max(nmax)), "auto"
-            if s in ("none", "null"):
-                return None, "none"
-            try:
-                return float(s), "manual"
-            except Exception as e:
-                raise ValueError(f"Invalid chisq_threshold string value: {raw!r}") from e
-
-        try:
-            return float(raw), "manual"
-        except Exception as e:
-            raise ValueError(f"Invalid chisq_threshold value: {raw!r}") from e
-
-
     def _chisq_summary(self, chisq: np.ndarray) -> dict:
         chisq = np.asarray(chisq, dtype=np.float64)
         finite = np.isfinite(chisq)
@@ -222,7 +203,7 @@ class Sumstats:
         chisq = z * z
         summ = self._chisq_summary(chisq)
 
-        thr = self._suggested_chisq_max(float(nmax))
+        thr = utils._suggested_chisq_max(float(nmax))
         finite = np.isfinite(chisq)
         n_hi = int(np.sum(chisq[finite] > thr))
         frac_hi = float(n_hi / max(int(np.sum(finite)), 1))
@@ -260,7 +241,7 @@ class Sumstats:
         name = getattr(self, "name", "UNKNOWN")
         nmax = float(getattr(self, "nsamp", np.nan))
 
-        thr_eff, thr_mode = self._resolve_chisq_threshold()
+        thr_eff, thr_mode = utils._resolve_chisq_threshold(nmax, self.chisq_threshold)
         removed_user = int(getattr(self, "_chisq_filter_removed", 0))
 
         thr_user = float(thr_eff) if thr_eff is not None else 0.0
@@ -449,7 +430,7 @@ class Sumstats:
             action = "drop"
         self._chisq_action_used = action
 
-        thr, _thr_mode = self._resolve_chisq_threshold()
+        thr, _thr_mode = utils._resolve_chisq_threshold(self.nsamp, self.chisq_threshold)
         if thr is None:
             return
 
@@ -497,38 +478,25 @@ class Sumstats:
 
 
     def _match_snps(self, printlog=True):
-        """
-        Match SNPs between sumstats and annot_df while preserving annot_df order.
-
-        NEW:
-        - if jackknife_mode == 'chr', define jackknife blocks by chromosome (LOCO),
-            using annot_df['CHR'] and the provided jackknife_chrs list (must match Trace).
-
-        Everything else (RHS math) unchanged.
-        """
-
         if self.annot_df is None:
             raise RuntimeError("Sumstats.annot_df is None; cannot match SNPs.")
         if self._annot_snps is None or (self._annot_ann is None):
             self._set_annot_df(self.annot_df)
 
-        # optional pre-match handling (only active for action='drop')
         self._apply_chisq_filter_once()
 
-        action = str(getattr(self, "chisq_action", "drop")).strip().lower()
+        action = str(getattr(self, "_chisq_action", "drop")).strip().lower()
         if action not in ("drop", "clip", "warn", "none"):
             self.log._log(f"[chisq] Unrecognized chisq_action='{action}', defaulting to 'drop'.")
             action = "drop"
 
-        thr, _thr_mode = self._resolve_chisq_threshold()
+        thr, _thr_mode = utils._resolve_chisq_threshold(self.nsamp, self.chisq_threshold)
         thr_enabled = (thr is not None) and np.isfinite(float(thr)) and (float(thr) > 0.0)
         thr = float(thr) if thr is not None else None
 
-        # ----------------------------
-        # SNP matching
-        # ----------------------------
         chr_matched = None
 
+        # --- SNP matching ---
         if self._sum_has_dups or self._annot_has_dups:
             df = self.annot_df.merge(self.sumdf, how='inner', on='SNP', sort=False)
 
@@ -554,7 +522,7 @@ class Sumstats:
 
             if self.jackknife_mode == "chr":
                 if "CHR" not in df.columns:
-                    raise RuntimeError("LOCO mode requires annot_df (and merged df) to contain CHR column.")
+                    raise RuntimeError("chr-mode requires annot_df to contain CHR column.")
                 chr_matched = df["CHR"].to_numpy(dtype=np.int32, copy=False)
 
         else:
@@ -582,7 +550,7 @@ class Sumstats:
 
             if self.jackknife_mode == "chr":
                 if self._annot_chr is None:
-                    raise RuntimeError("LOCO mode requires annot_df to contain CHR column.")
+                    raise RuntimeError("chr-mode requires annot_df to contain CHR column.")
                 chr_matched = self._annot_chr[keep_mask]
 
         # diagnostics on matched set (raw; before clipping)
@@ -590,47 +558,6 @@ class Sumstats:
             z=all_z, snps=self.matched_snps, a1=self.a1, a2=self.a2, nmax=self.nsamp, topk=10
         )
 
-        # ----------------------------
-        # Define jackknife block index
-        # ----------------------------
-        M = int(np.asarray(all_z).size)
-
-        if self.jackknife_mode == "chr":
-            if chr_matched is None:
-                raise RuntimeError("LOCO mode: chr_matched is None (unexpected).")
-            if self.jackknife_chrs is None:
-                # fallback: infer from matched set (should generally match Trace)
-                chrs = np.unique(np.asarray(chr_matched, dtype=np.int32))
-                chrs = chrs[np.isfinite(chrs)]
-                chrs = np.asarray(chrs, dtype=np.int32)
-                chrs.sort()
-                self.jackknife_chrs = chrs.tolist()
-
-            chrs = np.asarray(self.jackknife_chrs, dtype=np.int32).ravel()
-            B = int(chrs.size)
-            if self.nblks != B:
-                # enforce consistency with Trace / Sumrhe allocations
-                raise RuntimeError(f"LOCO mode: Sumstats.nblks={self.nblks} but jackknife_chrs has length {B}.")
-
-            idx = np.searchsorted(chrs, np.asarray(chr_matched, dtype=np.int32))
-            valid = (idx >= 0) & (idx < B) & (chrs[idx] == np.asarray(chr_matched, dtype=np.int32))
-            if not np.all(valid):
-                bad = np.flatnonzero(~valid)[:10].tolist()
-                raise RuntimeError(f"LOCO mode: found CHR values not in jackknife_chrs. First bad indices: {bad}")
-            blk_idx = idx.astype(np.int64)
-
-        else:
-            # contiguous blocks
-            blk_size = max(M // self.nblks, 1)
-            blk_idx = (np.arange(M, dtype=np.int64) // blk_size)
-            blk_idx[blk_idx >= self.nblks] = self.nblks - 1
-
-        self.blk_idx = blk_idx
-        self.nsnps = M
-
-        # ----------------------------
-        # Weighted sufficient statistics for RHS (unchanged)
-        # ----------------------------
         all_z = np.asarray(all_z, dtype=np.float64)
         if not np.isfinite(all_z).all():
             raise RuntimeError("Non-finite z-scores encountered after matching; drop upstream.")
@@ -642,7 +569,9 @@ class Sumstats:
             bad = np.flatnonzero(~np.isfinite(A).any(axis=1))[:10]
             raise RuntimeError(f"Non-finite annotation values encountered after matching. First bad rows: {bad.tolist()}")
 
-        # chi^2 = z^2
+        M = int(all_z.size)
+        self.nsnps = M
+
         z2 = all_z * all_z
         if not np.isfinite(z2).all():
             if action == "clip" and thr_enabled:
@@ -651,11 +580,9 @@ class Sumstats:
             else:
                 raise RuntimeError("Non-finite chi^2 encountered after squaring z-scores.")
 
-        # winsorize chi^2 on matched set (RHS only)
         self._chisq_clip_applied = False
         self._chisq_clip_count = 0
         self._chisq_clip_threshold = float(thr) if thr_enabled else 0.0
-
         if action == "clip" and thr_enabled:
             clip_mask = (z2 > thr) & np.isfinite(z2)
             self._chisq_clip_count = int(np.sum(clip_mask))
@@ -663,11 +590,71 @@ class Sumstats:
                 np.minimum(z2, thr, out=z2)
                 self._chisq_clip_applied = True
 
+        # ---------------- chr-mode: per-chrom unit sufficient stats ----------------
+        if self.jackknife_mode == "chr":
+            if chr_matched is None:
+                raise RuntimeError("chr-mode: chr_matched is None.")
+
+            chrs = np.asarray(self.jackknife_chrs, dtype=np.int32).ravel()
+            U = int(self.jackknife_units)
+
+            # require nondecreasing chr order to use searchsorted bounds
+            chr_arr = np.asarray(chr_matched, dtype=np.int32).ravel()
+            if chr_arr.size > 1 and np.any(chr_arr[1:] < chr_arr[:-1]):
+                raise RuntimeError("chr-mode requires matched SNPs in nondecreasing CHR order (Trace should sort).")
+
+            starts = np.searchsorted(chr_arr, chrs, side="left").astype(np.int64)
+            ends   = np.searchsorted(chr_arr, chrs, side="right").astype(np.int64)
+
+            K = int(self.nbins)
+            Ak_unit = np.zeros((U, K), dtype=np.float64)
+            Az2_unit = np.zeros((U, K), dtype=np.float64)
+
+            # compute per-unit sums with BLAS-friendly ops
+            for u in range(U):
+                s = int(starts[u]); e = int(ends[u])
+                if e <= s:
+                    continue
+                Au = A[s:e, :]
+                z2u = z2[s:e]
+                Ak_unit[u, :] = Au.sum(axis=0, dtype=np.float64)
+                Az2_unit[u, :] = (Au.T @ z2u).astype(np.float64, copy=False)
+
+            Ak_full = Ak_unit.sum(axis=0)
+            Az2_full = Az2_unit.sum(axis=0)
+
+            self._Ak_unit = Ak_unit
+            self._Az2_unit = Az2_unit
+            self._Ak_full = Ak_full
+            self._Az2_full = Az2_full
+
+            self.nsnps_bin = Ak_full
+            self.nsnps_blk = Ak_unit  # (U,K) unit-level, not replicate-level
+
+            bad_bins = np.flatnonzero(~np.isfinite(Ak_full) | (Ak_full <= 0.0))
+            if bad_bins.size:
+                self.log._log(
+                    "!!! One or more annotation bins have non-positive total weight after matching. "
+                    f"Bad bins: {bad_bins.tolist()} (Ak_full={Ak_full[bad_bins].tolist()}) !!!"
+                )
+                sys.exit(1)
+
+            if action == "warn" and thr_enabled and printlog:
+                self.log._log(f"[chisq] [{self.name}] warning-only threshold set at {thr:.3f}; no dropping/clipping applied.")
+
+            return
+
+        # ---------------- block-mode legacy sufficient stats ----------------
+        blk_size = max(M // self.nblks, 1)
+        blk_idx = (np.arange(M, dtype=np.int64) // blk_size)
+        blk_idx[blk_idx >= self.nblks] = self.nblks - 1
+        self.blk_idx = blk_idx
+
         Ak_full = A.sum(axis=0, dtype=np.float64)
         Az2_full = (A.T @ z2).astype(np.float64, copy=False)
 
-        B = int(self.nblks)
-        K = int(self.nbins)
+        B = self.nblks
+        K = self.nbins
         Ak_blk = np.zeros((B, K), dtype=np.float64)
         Az2_blk = np.zeros((B, K), dtype=np.float64)
 
@@ -698,63 +685,74 @@ class Sumstats:
         if action == "warn" and thr_enabled and printlog:
             self.log._log(f"[chisq] [{self.name}] warning-only threshold set at {thr:.3f}; no dropping/clipping applied.")
 
+
     def _calc_rhs_h2(self):
-        """
-        Build RHS for univariate normal equations.
-
-        For each bin k:
-        M_k     = sum_j a_{j,k}
-        S_k     = sum_j a_{j,k} z_j^2
-        M_k^b   = sum_{j in block b} a_{j,k}
-        S_k^b   = sum_{j in block b} a_{j,k} z_j^2
-
-        Full:
-        rhs[B,k] = (S_k * N) / M_k
-        LOO:
-        rhs[b,k] = ((S_k - S_k^b) * N) / (M_k - M_k^b)
-
-        Noise term:
-        rhs[:,K] = N - 1
-        """
-        if not hasattr(self, "_Ak_full") or self._Ak_full is None:
-            raise RuntimeError("Missing cached annotation-weight sums. Did you call _match_snps()?")
-
-        B = self.nblks
-        K = self.nbins
+        R = int(self.nblks)
+        K = int(self.nbins)
         N = float(self.nsamp)
 
-        Ak_full = np.asarray(self._Ak_full, dtype=np.float64)       # (K,)
-        Az2_full = np.asarray(self._Az2_full, dtype=np.float64)     # (K,)
-        Ak_blk = np.asarray(self._Ak_blk, dtype=np.float64)         # (B,K) in-block
-        Az2_blk = np.asarray(self._Az2_blk, dtype=np.float64)       # (B,K) in-block
+        self.rhs = np.full((R + 1, K + 1), N - 1.0, dtype=np.float64)
 
-        self.rhs = np.full((B + 1, K + 1), N - 1.0, dtype=np.float64)
+        if self.jackknife_mode != "chr":
+            # legacy path (unchanged)
+            Ak_full = np.asarray(self._Ak_full, dtype=np.float64)
+            Az2_full = np.asarray(self._Az2_full, dtype=np.float64)
+            Ak_blk = np.asarray(self._Ak_blk, dtype=np.float64)
+            Az2_blk = np.asarray(self._Az2_blk, dtype=np.float64)
 
-        warned = np.zeros(K, dtype=bool)
+            warned = np.zeros(K, dtype=bool)
+            for k in range(K):
+                denom_full = float(Ak_full[k])
+                if not (np.isfinite(denom_full) and denom_full > 0.0):
+                    raise RuntimeError(f"Bin {k} has non-positive total weight (Ak_full={denom_full}).")
 
-        for k in range(K):
-            denom_full = float(Ak_full[k])
-            if not (np.isfinite(denom_full) and denom_full > 0.0):
-                raise RuntimeError(f"Bin {k} has non-positive total weight (Ak_full={denom_full}).")
+                self.rhs[R, k] = float(Az2_full[k]) * N / denom_full
 
-            # full row
-            self.rhs[B, k] = float(Az2_full[k]) * N / denom_full
+                for b in range(R):
+                    denom = float(Ak_full[k] - Ak_blk[b, k])
+                    if not (np.isfinite(denom) and denom > 0.0):
+                        self.rhs[b, k] = np.nan
+                        if not warned[k]:
+                            warned[k] = True
+                            self.log._log(
+                                f"[WARNING] Bin {k} has non-positive total weight in some LOO replicates (denom<=0)."
+                            )
+                        continue
+                    num = float(Az2_full[k] - Az2_blk[b, k])
+                    self.rhs[b, k] = num * N / denom
 
-            # LOO rows
-            for b in range(B):
-                denom = float(Ak_full[k] - Ak_blk[b, k])
-                if not (np.isfinite(denom) and denom > 0.0):
-                    self.rhs[b, k] = np.nan
-                    if not warned[k]:
-                        warned[k] = True
-                        self.log._log(
-                            f"[WARNING] Bin {k} has non-positive total weight in some LOO replicates "
-                            f"(denom<=0). Consider fewer blocks or coarser/less sparse annotations."
-                        )
-                    continue
+            self.log._log(f"Calculated the RHS for phenotype [{self.name}]")
+            return
 
-                num = float(Az2_full[k] - Az2_blk[b, k])
-                self.rhs[b, k] = num * N / denom
+        # ---------------- chr delete-d RHS ----------------
+        Ak_full = np.asarray(self._Ak_full, dtype=np.float64)        # (K,)
+        Az2_full = np.asarray(self._Az2_full, dtype=np.float64)      # (K,)
+        Ak_unit = np.asarray(self._Ak_unit, dtype=np.float64)        # (U,K)
+        Az2_unit = np.asarray(self._Az2_unit, dtype=np.float64)      # (U,K)
+
+        D = np.asarray(self._rep_del_mat, dtype=np.float64)          # (R,U)
+
+        del_Ak = D @ Ak_unit                                         # (R,K)
+        del_Az2 = D @ Az2_unit                                       # (R,K)
+
+        Ak_rep = Ak_full[None, :] - del_Ak                           # (R,K)
+        Az2_rep = Az2_full[None, :] - del_Az2                        # (R,K)
+
+        with np.errstate(divide="ignore", invalid="ignore"):
+            self.rhs[:R, :K] = (Az2_rep * N) / Ak_rep
+
+        # full row
+        self.rhs[R, :K] = (Az2_full * N) / Ak_full
+
+        # invalidate denom<=0
+        bad = (~np.isfinite(self.rhs[:R, :K])) | (~np.isfinite(Ak_rep)) | (Ak_rep <= 0.0)
+        if np.any(bad):
+            self.rhs[:R, :K][bad] = np.nan
+            # one concise warning
+            self.log._log(
+                f"[WARNING] [{self.name}] Some delete-{self.jackknife_delete} replicates have non-positive bin mass "
+                f"(Ak_rep<=0) in at least one bin; setting those replicate/bin RHS entries to NaN."
+            )
 
         self.log._log(f"Calculated the RHS for phenotype [{self.name}]")
 
