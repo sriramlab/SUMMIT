@@ -197,6 +197,7 @@ def prepare_rg(
     z2 = np.asarray(matched2.z, dtype=np.float64)
     y = z1 * z2
 
+    unit_sizes = np.zeros(U, dtype=np.float64)  # active SNP counts per unit
     Ak_unit = np.zeros((U, K), dtype=np.float64)
     Ay_unit = np.zeros((U, K), dtype=np.float64)
     AL_unit = np.zeros((U, K, K), dtype=np.float64)
@@ -206,17 +207,20 @@ def prepare_rg(
         e = int(jackknife.ends[u])
         if e <= s:
             continue
+
         mu = active_mask[s:e]
         if not np.any(mu):
             continue
+
         Au = A[s:e, :][mu, :]
         Lu = L[s:e, :][mu, :]
         yu = y[s:e][mu]
+
+        unit_sizes[u] = float(Au.shape[0])  # IMPORTANT: SNP counts, not annotation mass
         Ak_unit[u] = Au.sum(axis=0, dtype=np.float64)
         Ay_unit[u] = Au.T @ yu
         AL_unit[u] = Au.T @ Lu
 
-    unit_sizes = jackknife.unit_sizes(active_mask=active_mask, dtype=np.float64)
     Ak_rep = _stack_delete_replicates(Ak_unit.sum(axis=0), Ak_unit, jackknife.D)
     Ay_rep = _stack_delete_replicates(Ay_unit.sum(axis=0), Ay_unit, jackknife.D)
     AL_rep = _stack_delete_replicates(AL_unit.sum(axis=0), AL_unit, jackknife.D)
@@ -230,24 +234,37 @@ def prepare_rg(
 
     M_k = Ak_rep[:, :, None]
     M_l = Ak_rep[:, None, :]
-    lhs = utils._calc_rg_trace_from_ld_batch(AL_rep, matched1.nsamp, matched2.nsamp, M_k, M_l)
+    lhs = utils._calc_rg_trace_from_ld_batch(
+        AL_rep,
+        matched1.nsamp,
+        matched2.nsamp,
+        M_k,
+        M_l,
+    )
 
+    # ------------------------------------------------------------------
+    # NEW: symmetrization must use the same unit-size logic as the SE code
+    # ------------------------------------------------------------------
     if jackknife.mode == "block":
-        jk_sizes = jackknife.unit_sizes(dtype=np.float64)
         lhs = utils.symmetrize_trace_with_jackknife(
             lhs,
             logger=None,
             verbose=False,
-            jk_block_sizes=jk_sizes,
-            jk_delete_d=1,
+            jk_block_sizes=unit_sizes,   # active-subset block sizes
+            center="mean",
+            nan_policy="omit",
         )
     else:
         lhs = utils.symmetrize_trace_with_jackknife(
             lhs,
             logger=None,
             verbose=False,
-            jk_n_units=jackknife.nunit,
+            jk_delete_matrix=jackknife.D,   # REQUIRED for delete-set designs
+            jk_unit_sizes=unit_sizes,       # active-subset unit sizes
+            jk_n_units=jackknife.nunit,     # optional sanity check
             jk_delete_d=jackknife.delete,
+            center="mean",
+            nan_policy="omit",
         )
 
     return RGPrepared(
@@ -509,7 +526,7 @@ def _solve_constrained_intercept_scalar_from_sums(
     Sxx,
     Sy,
     Sxy,
-    denom_floor=0.0,
+    denom_floor=None,
 ):
     m_fit = np.asarray(m_fit, dtype=np.float64)
     l1 = np.asarray(l1, dtype=np.float64)
@@ -628,6 +645,7 @@ def fit_intercept(
     intercept_chisq_threshold=None,
     collapse_reg_ld: bool = False,
     chisq_mode: str = "either",
+    intercept_weight_mode: str = "ldsc",
     irwls_iters: int = 2,
     intercept_hsq1: float = 1.0,
     intercept_hsq2: float = 1.0,
@@ -640,6 +658,10 @@ def fit_intercept(
 ) -> InterceptFit:
     _validate_common_axis(trace_view, matched1, matched2, jackknife)
 
+    mode = str(intercept_weight_mode).strip().lower()
+    if mode not in {"ldsc", "score"}:
+        raise ValueError("intercept_weight_mode must be one of {'ldsc','score'}")
+
     L1, ld_source = _select_intercept_regression_ld(
         trace_view,
         collapse_reg_ld=collapse_reg_ld,
@@ -647,6 +669,7 @@ def fit_intercept(
     )
     if L1.shape[1] != 1:
         raise RuntimeError("Intercept regression currently requires 1D LD after any collapsing.")
+
     x = np.asarray(L1[:, 0], dtype=np.float64)
     z1 = np.asarray(matched1.z, dtype=np.float64)
     z2 = np.asarray(matched2.z, dtype=np.float64)
@@ -662,6 +685,7 @@ def fit_intercept(
         chisq_mode=chisq_mode,
     )
     info["ld_source"] = ld_source
+    info["weight_mode"] = mode
 
     if info["n_kept"] <= 1:
         raise RuntimeError("Intercept regression has <=1 SNP after filtering.")
@@ -703,13 +727,46 @@ def fit_intercept(
             f"M_fit={m_fit_full}, L1={l1_full}, T1={t1_full}."
         )
 
-    w_init = _build_simple_intercept_weights(x, keep)
-    wx = w_init * x
-    W0 = float(np.sum(w_init))
-    Sx0 = float(np.sum(wx))
-    Sxx0 = float(np.sum(wx * x))
-    Sy0 = float(np.sum(w_init * y))
-    Sxy0 = float(np.sum(wx * y))
+    def _weighted_scalar_summaries(w: np.ndarray):
+        w = np.asarray(w, dtype=np.float64).ravel()
+        if w.size != x.size:
+            raise ValueError("Intercept weights length mismatch with LD axis.")
+        wx = w * x
+        W = float(np.sum(w))
+        Sx = float(np.sum(wx))
+        Sxx = float(np.sum(wx * x))
+        Sy = float(np.sum(w * y))
+        Sxy = float(np.sum(wx * y))
+        return W, Sx, Sxx, Sy, Sxy
+
+    def _weighted_unit_summaries(w: np.ndarray):
+        w = np.asarray(w, dtype=np.float64).ravel()
+        if w.size != x.size:
+            raise ValueError("Intercept weights length mismatch with LD axis.")
+        wx = w * x
+        wxx = wx * x
+        wy = w * y
+        wxy = wx * y
+
+        W_u = np.zeros(U, dtype=np.float64)
+        Sx_u = np.zeros(U, dtype=np.float64)
+        Sxx_u = np.zeros(U, dtype=np.float64)
+        Sy_u = np.zeros(U, dtype=np.float64)
+        Sxy_u = np.zeros(U, dtype=np.float64)
+        for u in range(U):
+            s = int(starts[u])
+            e = int(ends[u])
+            if e <= s:
+                continue
+            W_u[u] = float(np.sum(w[s:e]))
+            Sx_u[u] = float(np.sum(wx[s:e]))
+            Sxx_u[u] = float(np.sum(wxx[s:e]))
+            Sy_u[u] = float(np.sum(wy[s:e]))
+            Sxy_u[u] = float(np.sum(wxy[s:e]))
+        return W_u, Sx_u, Sxx_u, Sy_u, Sxy_u
+
+    w_score = _build_simple_intercept_weights(x, keep)
+    W0, Sx0, Sxx0, Sy0, Sxy0 = _weighted_scalar_summaries(w_score)
 
     c0, b0, ok0 = _solve_constrained_intercept_scalar_from_sums(
         np.array([m_fit_full], dtype=np.float64),
@@ -727,98 +784,74 @@ def fit_intercept(
 
     c_cur = float(c0[0])
     b_cur = float(b0[0])
-    n1_scalar = float(matched1.nsamp)
-    n2_scalar = float(matched2.nsamp)
-    sqrt_n1n2_scalar = float(np.sqrt(n1_scalar * n2_scalar))
-    m_tot_weight = float(trace_view.nsnps)
+    w_final = w_score
 
-    h1 = float(h2_fit1.h2[-1, 0]) if np.isfinite(h2_fit1.h2[-1, 0]) else 0.0
-    h2 = float(h2_fit2.h2[-1, 0]) if np.isfinite(h2_fit2.h2[-1, 0]) else 0.0
-    h1 = float(np.clip(h1, 0.0, 1.0))
-    h2 = float(np.clip(h2, 0.0, 1.0))
+    if mode == "ldsc":
+        n_iter = int(irwls_iters)
+        if n_iter < 0:
+            raise ValueError("irwls_iters must be >= 0.")
 
-    for _ in range(int(irwls_iters)):
-        rho_cur = float((m_tot_weight / sqrt_n1n2_scalar) * b_cur)
-        w_cur = _ldsc_gencov_weights_1d(
-            ld=x,
-            w_ld=x,
-            n1=np.full(x.size, n1_scalar, dtype=np.float64),
-            n2=np.full(x.size, n2_scalar, dtype=np.float64),
-            m_tot=m_tot_weight,
-            h1=h1,
-            h2=h2,
-            rho_g=rho_cur,
-            intercept_gencov=c_cur,
-            intercept_hsq1=intercept_hsq1,
-            intercept_hsq2=intercept_hsq2,
-            intercept_hsq_floor=intercept_hsq_floor,
-            weight_floor=intercept_weight_floor,
-        )
-        w_cur = np.where(keep, w_cur, 0.0)
+        n1_scalar = float(matched1.nsamp)
+        n2_scalar = float(matched2.nsamp)
+        if not (
+            np.isfinite(n1_scalar) and np.isfinite(n2_scalar) and n1_scalar > 0.0 and n2_scalar > 0.0
+        ):
+            raise RuntimeError(
+                f"Invalid sample sizes for intercept IRWLS: n1={n1_scalar}, n2={n2_scalar}."
+            )
 
-        wx = w_cur * x
-        W = float(np.sum(w_cur))
-        Sx = float(np.sum(wx))
-        Sxx = float(np.sum(wx * x))
-        Sy = float(np.sum(w_cur * y))
-        Sxy = float(np.sum(wx * y))
+        sqrt_n1n2_scalar = float(np.sqrt(n1_scalar * n2_scalar))
+        m_tot_weight = float(trace_view.nsnps)
+        h1 = float(h2_fit1.h2[-1, 0]) if np.isfinite(h2_fit1.h2[-1, 0]) else 0.0
+        h2 = float(h2_fit2.h2[-1, 0]) if np.isfinite(h2_fit2.h2[-1, 0]) else 0.0
+        h1 = float(np.clip(h1, 0.0, 1.0))
+        h2 = float(np.clip(h2, 0.0, 1.0))
 
-        c_new, b_new, ok = _solve_constrained_intercept_scalar_from_sums(
-            np.array([m_fit_full], dtype=np.float64),
-            np.array([l1_full], dtype=np.float64),
-            np.array([t1_full], dtype=np.float64),
-            np.array([W], dtype=np.float64),
-            np.array([Sx], dtype=np.float64),
-            np.array([Sxx], dtype=np.float64),
-            np.array([Sy], dtype=np.float64),
-            np.array([Sxy], dtype=np.float64),
-            denom_floor=0.0,
-        )
-        if not bool(ok[0]):
-            raise RuntimeError("LDSC-IRWLS intercept update failed on the full sample.")
+        for _ in range(n_iter):
+            rho_cur = float((m_tot_weight / sqrt_n1n2_scalar) * b_cur)
+            w_cur = _ldsc_gencov_weights_1d(
+                ld=x,
+                w_ld=x,
+                n1=np.full(x.size, n1_scalar, dtype=np.float64),
+                n2=np.full(x.size, n2_scalar, dtype=np.float64),
+                m_tot=m_tot_weight,
+                h1=h1,
+                h2=h2,
+                rho_g=rho_cur,
+                intercept_gencov=c_cur,
+                intercept_hsq1=intercept_hsq1,
+                intercept_hsq2=intercept_hsq2,
+                intercept_hsq_floor=intercept_hsq_floor,
+                weight_floor=intercept_weight_floor,
+            )
+            w_cur = np.where(keep, w_cur, 0.0)
 
-        c_cur = float(c_new[0])
-        b_cur = float(b_new[0])
+            W, Sx, Sxx, Sy, Sxy = _weighted_scalar_summaries(w_cur)
+            c_new, b_new, ok = _solve_constrained_intercept_scalar_from_sums(
+                np.array([m_fit_full], dtype=np.float64),
+                np.array([l1_full], dtype=np.float64),
+                np.array([t1_full], dtype=np.float64),
+                np.array([W], dtype=np.float64),
+                np.array([Sx], dtype=np.float64),
+                np.array([Sxx], dtype=np.float64),
+                np.array([Sy], dtype=np.float64),
+                np.array([Sxy], dtype=np.float64),
+                denom_floor=0.0,
+            )
+            if not bool(ok[0]):
+                raise RuntimeError("LDSC-IRWLS intercept update failed on the full sample.")
 
-    rho_cur = float((m_tot_weight / sqrt_n1n2_scalar) * b_cur)
-    w_final = _ldsc_gencov_weights_1d(
-        ld=x,
-        w_ld=x,
-        n1=np.full(x.size, n1_scalar, dtype=np.float64),
-        n2=np.full(x.size, n2_scalar, dtype=np.float64),
-        m_tot=m_tot_weight,
-        h1=h1,
-        h2=h2,
-        rho_g=rho_cur,
-        intercept_gencov=c_cur,
-        intercept_hsq1=intercept_hsq1,
-        intercept_hsq2=intercept_hsq2,
-        intercept_hsq_floor=intercept_hsq_floor,
-        weight_floor=intercept_weight_floor,
-    )
-    w_final = np.where(keep, w_final, 0.0)
+            c_cur = float(c_new[0])
+            b_cur = float(b_new[0])
+            w_final = w_cur
 
-    wx = w_final * x
-    wxx = wx * x
-    wy = w_final * y
-    wxy = wx * y
+        info["h1_plugin"] = h1
+        info["h2_plugin"] = h2
+        info["irwls_iters"] = n_iter
+    else:
+        info["irwls_iters"] = 0
 
-    W_u = np.zeros(U, dtype=np.float64)
-    Sx_u = np.zeros(U, dtype=np.float64)
-    Sxx_u = np.zeros(U, dtype=np.float64)
-    Sy_u = np.zeros(U, dtype=np.float64)
-    Sxy_u = np.zeros(U, dtype=np.float64)
-    for u in range(U):
-        s = int(starts[u])
-        e = int(ends[u])
-        if e <= s:
-            continue
-        W_u[u] = float(np.sum(w_final[s:e]))
-        Sx_u[u] = float(np.sum(wx[s:e]))
-        Sxx_u[u] = float(np.sum(wxx[s:e]))
-        Sy_u[u] = float(np.sum(wy[s:e]))
-        Sxy_u[u] = float(np.sum(wxy[s:e]))
-
+    W_u, Sx_u, Sxx_u, Sy_u, Sxy_u = _weighted_unit_summaries(w_final)
     W_full = float(np.sum(W_u))
     Sx_full = float(np.sum(Sx_u))
     Sxx_full = float(np.sum(Sxx_u))
@@ -828,6 +861,7 @@ def fit_intercept(
     alpha_full = t1_full / l1_full
     beta_full = m_fit_full / l1_full
     den_full = W_full - 2.0 * beta_full * Sx_full + (beta_full * beta_full) * Sxx_full
+
     floor_rel = float(denom_floor_rel)
     if not (np.isfinite(floor_rel) and floor_rel >= 0.0):
         floor_rel = 1e-12
@@ -852,7 +886,7 @@ def fit_intercept(
     Sxy_rep = Sxy_full - del_Sxy
 
     c_rep, _, _ = _solve_constrained_intercept_scalar_from_sums(
-        m_fit_rep := m_rep,
+        m_rep,
         l1_rep,
         t1_rep,
         W_rep,
@@ -892,10 +926,18 @@ def fit_intercept(
 
     if log is not None:
         n_bad = int(np.sum(~np.isfinite(c_rep)))
-        log._log(
-            f"[rg:c] constrained LDSC-IRWLS: h1={h1:.6g}, h2={h2:.6g}, "
-            f"final_c={c[0]:.6g}, bad_reps={n_bad}/{jackknife.nrep}, iters={int(irwls_iters)}"
-        )
+        if mode == "ldsc":
+            log._log(
+                f"[rg:c] constrained intercept fit: weight_mode=ldsc, "
+                f"h1={info['h1_plugin']:.6g}, h2={info['h2_plugin']:.6g}, "
+                f"final_c={c[0]:.6g}, bad_reps={n_bad}/{jackknife.nrep}, "
+                f"iters={info['irwls_iters']}"
+            )
+        else:
+            log._log(
+                f"[rg:c] constrained intercept fit: weight_mode=score (w_j=1/x_j), "
+                f"final_c={c[0]:.6g}, bad_reps={n_bad}/{jackknife.nrep}"
+            )
 
     return InterceptFit(
         trace_view=trace_view,

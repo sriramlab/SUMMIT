@@ -22,6 +22,7 @@
   #include <fcntl.h>
   #include <unistd.h>
   #include <climits>
+  #include <sched.h>   // sched_getaffinity
 #endif
 
 #ifdef _OPENMP
@@ -61,6 +62,29 @@ int64_t count_lines_cached(const std::string &path) {
     return n;
 }
 
+static inline int env_int(const char* k, int defv) {
+    const char* s = std::getenv(k);
+    if (!s || !*s) return defv;
+    return std::atoi(s);
+}
+
+// Prefer affinity-aware thread cap (cpuset / taskset / cgroups pinning).
+static inline int affinity_thread_cap() {
+#if defined(__linux__)
+    cpu_set_t set;
+    CPU_ZERO(&set);
+    if (sched_getaffinity(0, sizeof(set), &set) == 0) {
+        int cnt = 0;
+        for (int i = 0; i < CPU_SETSIZE; ++i) if (CPU_ISSET(i, &set)) ++cnt;
+        if (cnt > 0) return cnt;
+    }
+    long n = sysconf(_SC_NPROCESSORS_ONLN);
+    return (n > 0) ? (int)n : 1;
+#else
+    return 1;
+#endif
+}
+
 #if defined(__linux__)
 // ---------------- mmap cache for .bed ----------------
 struct BedMapping {
@@ -97,14 +121,14 @@ static inline void madvise_willneed_range(unsigned char* base, size_t file_size,
 
 static std::shared_ptr<BedMapping> get_bed_mapping_cached(const std::string& bed_path) {
     static std::mutex m;
-    static std::unordered_map<std::string, std::weak_ptr<BedMapping>> cache;
+    // IMPORTANT: use shared_ptr, NOT weak_ptr; otherwise the mapping dies after each call.
+    static std::unordered_map<std::string, std::shared_ptr<BedMapping>> cache;
 
-    // Fast path: existing mapping
+    // Fast path: existing mapping kept alive by shared_ptr in the map
     {
         std::lock_guard<std::mutex> lk(m);
-        if (auto it = cache.find(bed_path); it != cache.end()) {
-            if (auto sp = it->second.lock()) return sp;
-        }
+        auto it = cache.find(bed_path);
+        if (it != cache.end() && it->second) return it->second;
     }
 
     // Build mapping outside the lock (avoid blocking other threads)
@@ -138,9 +162,8 @@ static std::shared_ptr<BedMapping> get_bed_mapping_cached(const std::string& bed
     // Insert (or reuse if someone beat us)
     {
         std::lock_guard<std::mutex> lk(m);
-        if (auto it = cache.find(bed_path); it != cache.end()) {
-            if (auto sp = it->second.lock()) return sp;
-        }
+        auto it = cache.find(bed_path);
+        if (it != cache.end() && it->second) return it->second;
         cache[bed_path] = mm;
     }
     return mm;
@@ -185,26 +208,16 @@ void prefetch_bed_block(const std::string& bed_path,
 }
 
 // ---------------- decode: selected rows only + integer-moment stats ----------------
-//
-// Works best when `rows` is sorted ascending (true for your pipelines).
-// If rows is not sorted, we fall back to a simple idx_of vector.
-//
-template <typename T>
-static void decode_rows_and_counts_sorted(const unsigned char* bytes,
-                                         int N_total,
-                                         const std::vector<int>& rows, // selected global row indices
-                                         std::vector<T>& bufN,         // size N=rows.size()
-                                         long long& nobs,
-                                         long long& sum,
-                                         long long& sumsq)
-{
-    static const T lut_val[4] = {
-        T(0),
-        std::numeric_limits<T>::quiet_NaN(), // missing
-        T(1),
-        T(2)
-    };
+// rows is ALWAYS sorted ascending.
 
+static inline void decode_rows_codes_dense_sorted_into(const unsigned char* bytes,
+                                                       int N_total,
+                                                       const std::vector<int>& rows,
+                                                       uint8_t* __restrict codeN, // size N (preallocated)
+                                                       long long& nobs,
+                                                       long long& sum,
+                                                       long long& sumsq)
+{
     const int nbytes = (int)ceil_div((std::size_t)N_total, (std::size_t)4);
     nobs = 0; sum = 0; sumsq = 0;
 
@@ -216,13 +229,12 @@ static void decode_rows_and_counts_sorted(const unsigned char* bytes,
     int next = rows[0];
 
     for (int b = 0; b < nbytes; ++b) {
-        unsigned char c = bytes[b];
+        const unsigned char c = bytes[b];
         for (int t = 0; t < 4 && gidx < N_total; ++t, ++gidx) {
             if (gidx != next) continue;
 
-            const int bits = (c >> (2 * t)) & 0x3;
-            const T val = lut_val[bits];
-            bufN[(size_t)j] = val;
+            const uint8_t bits = (uint8_t)((c >> (2 * t)) & 0x3);
+            codeN[j] = bits;
 
             if (bits != 1) { // not missing
                 ++nobs;
@@ -237,44 +249,32 @@ static void decode_rows_and_counts_sorted(const unsigned char* bytes,
     }
 }
 
-template <typename T>
-static void decode_rows_and_counts_idxof(const unsigned char* bytes,
-                                        int N_total,
-                                        const std::vector<int>& idx_of, // size N_total, -1 if not selected
-                                        std::vector<T>& bufN,           // size N selected
-                                        long long& nobs,
-                                        long long& sum,
-                                        long long& sumsq)
+static inline void decode_rows_codes_sparse_sorted_into(const unsigned char* bytes,
+                                                        const std::vector<int>& rows,
+                                                        uint8_t* __restrict codeN, // size N (preallocated)
+                                                        long long& nobs,
+                                                        long long& sum,
+                                                        long long& sumsq)
 {
-    static const T lut_val[4] = {
-        T(0),
-        std::numeric_limits<T>::quiet_NaN(), // missing
-        T(1),
-        T(2)
-    };
-
-    const int nbytes = (int)ceil_div((std::size_t)N_total, (std::size_t)4);
     nobs = 0; sum = 0; sumsq = 0;
+    const int N = (int)rows.size();
+    if (N == 0) return;
 
-    int gidx = 0;
-    for (int b = 0; b < nbytes; ++b) {
-        unsigned char c = bytes[b];
-        for (int t = 0; t < 4 && gidx < N_total; ++t, ++gidx) {
-            const int pos = idx_of[(size_t)gidx];
-            if (pos < 0) continue;
+    for (int j = 0; j < N; ++j) {
+        const int r = rows[(size_t)j];
+        const unsigned char c = bytes[(size_t)r >> 2];
+        const int sh = (r & 3) * 2;
+        const uint8_t bits = (uint8_t)((c >> sh) & 0x3);
+        codeN[j] = bits;
 
-            const int bits = (c >> (2 * t)) & 0x3;
-            const T val = lut_val[bits];
-            bufN[(size_t)pos] = val;
-
-            if (bits != 1) { // not missing
-                ++nobs;
-                if (bits == 2) { sum += 1; sumsq += 1; }
-                else if (bits == 3) { sum += 2; sumsq += 4; }
-            }
+        if (bits != 1) {
+            ++nobs;
+            if (bits == 2) { sum += 1; sumsq += 1; }
+            else if (bits == 3) { sum += 2; sumsq += 4; }
         }
     }
 }
+
 
 // ---------------- core implementation (templated, TU-local) ----------------
 template <typename T>
@@ -293,82 +293,81 @@ static void read_block_standardized_impl(const std::string &bed_path,
     if (blk_end <= blk_start) {
         N = (int)rows.size();
         L = 0;
-        Geno.clear();
         return;
     }
 
     L = blk_end - blk_start;
     N = (int)rows.size();
-    if (N <= 0 || L <= 0) {
-        Geno.clear();
-        return;
-    }
+    if (N <= 0 || L <= 0) return;
 
     const int nbytes_per_snp = (int)ceil_div((std::size_t)N_total, (std::size_t)4);
     const size_t per_snp_bytes = (size_t)nbytes_per_snp;
-
     const size_t need = (size_t)N * (size_t)L;
-    Geno.assign(need, T(0)); // ensure clean fill (safe if decode leaves some entries unwritten)
 
-    // Determine decode threading (independent from outer OMP/BLAS)
+    // Only GROW, never shrink (lets callers reuse capacity cheaply if Geno is reused).
+    if (Geno.size() < need) Geno.resize(need);
+
+    // --- choose decode threads ---
     int decode_threads = 0;
     if (const char* s = std::getenv("SUMMIT_DECODE_THREADS")) decode_threads = std::atoi(s);
 
     int hw = 1;
 #ifdef _OPENMP
-    hw = omp_get_num_procs();
+    hw = affinity_thread_cap();
     if (hw <= 0) hw = 1;
 #endif
 
     if (decode_threads <= 0) {
-        // Conservative default: helps on big boxes without tmpN explosion
-        decode_threads = std::min(16, hw);
+        const int cap_env = env_int("SUMMIT_DECODE_THREADS_CAP", 16);
+        int cap = std::min(cap_env, hw);
+        cap = std::min(cap, std::max(1, L));
+
+        const uint64_t work_elems = (uint64_t)N * (uint64_t)L;
+        uint64_t target = std::is_same_v<T,double> ? 4ULL*1000*1000 : 8ULL*1000*1000;
+        if (const char* s = std::getenv("SUMMIT_DECODE_TARGET_ELEMS_PER_THR")) {
+            long long v = std::atoll(s);
+            if (v > 0) target = (uint64_t)v;
+        }
+
+        int by_work = 1;
+        if (target > 0) {
+            by_work = (int)((work_elems + target - 1) / target);
+            if (by_work < 1) by_work = 1;
+        }
+
+        decode_threads = std::min(cap, by_work);
+
+        // avoid OMP overhead on small blocks
+        if (work_elems < 2ULL*1000*1000) decode_threads = 1;
+        else if (work_elems < 16ULL*1000*1000) decode_threads = std::min(decode_threads, 2);
+        else if (work_elems < 64ULL*1000*1000) decode_threads = std::min(decode_threads, 4);
+
         if (decode_threads < 1) decode_threads = 1;
     }
+    
+    decode_threads = std::min(decode_threads, std::max(1, L));
 
-    // Cap by tmpN memory (default cap ~512 MiB total across decode threads)
-    {
-        const size_t cap_bytes = (size_t)512 * 1024 * 1024;
-        const size_t per_thr = (size_t)N * sizeof(T);
-        if (per_thr > 0) {
-            int max_by_mem = (int)std::max<size_t>(1, cap_bytes / per_thr);
-            if (decode_threads > max_by_mem) decode_threads = max_by_mem;
-        }
-        if (decode_threads < 1) decode_threads = 1;
+    // --- sparse vs dense ---
+    double sparse_thresh = 0.60;
+    if (const char* s = std::getenv("SUMMIT_DECODE_SPARSE_THRESHOLD")) {
+        const double v = std::atof(s);
+        if (v > 0.0 && v < 1.0) sparse_thresh = v;
     }
-
-    // Check if rows are sorted (expected true)
-    bool rows_sorted = true;
-    for (int i = 1; i < N; ++i) {
-        if (rows[(size_t)i] < rows[(size_t)(i - 1)]) { rows_sorted = false; break; }
-    }
-
-    // If not sorted: build idx_of (size N_total). (Expected rare.)
-    std::vector<int> idx_of;
-    if (!rows_sorted) {
-        idx_of.assign((size_t)N_total, -1);
-        for (int i = 0; i < N; ++i) {
-            const int g = rows[(size_t)i];
-            if (g >= 0 && g < N_total) idx_of[(size_t)g] = i;
-        }
-    }
+    const double density = (N_total > 0) ? ((double)N / (double)N_total) : 1.0;
+    const bool use_sparse = (density < sparse_thresh);
 
 #if defined(__linux__)
     auto mm = get_bed_mapping_cached(bed_path);
 
-    // Ensure file is large enough for [0..blk_end)
     const size_t need_bytes = (size_t)3 + (size_t)blk_end * per_snp_bytes;
     if (!mm || !mm->base || need_bytes > mm->size) {
         throw std::runtime_error("BED file too small for requested block: " + bed_path);
     }
 
-    // Optional prefetch (WILLNEED) for current and ahead
-    int ahead = 1;
-    if (const char* s = std::getenv("SUMMIT_PREFETCH_AHEAD_BLKS")) {
-        int v = std::atoi(s);
-        if (v >= 0) ahead = v;
-    }
-    {
+    if (std::getenv("SUMMIT_INTERNAL_PREFETCH") != nullptr) {
+        int ahead = env_int("SUMMIT_PREFETCH_AHEAD_BLKS", 1);
+        if (ahead < 0) ahead = 0;
+
         const size_t off0 = (size_t)3 + (size_t)blk_start * per_snp_bytes;
         const size_t len0 = (size_t)L * per_snp_bytes;
         madvise_willneed_range(mm->base, mm->size, off0, len0);
@@ -382,55 +381,73 @@ static void read_block_standardized_impl(const std::string &bed_path,
 
     const unsigned char* snp0 = mm->base + 3 + (size_t)blk_start * per_snp_bytes;
 
+    auto worker = [&](int col, uint8_t* __restrict codes) {
+        const unsigned char* bytes = snp0 + (size_t)col * per_snp_bytes;
+
+        long long nobs = 0, sum = 0, sumsq = 0;
+        if (use_sparse) decode_rows_codes_sparse_sorted_into(bytes, rows, codes, nobs, sum, sumsq);
+        else            decode_rows_codes_dense_sorted_into (bytes, N_total, rows, codes, nobs, sum, sumsq);
+
+        // Use double: plenty accurate here and faster than long double
+        const double dnobs = (double)nobs;
+        const long long denom_ll = nobs - (long long)ddof;
+
+        const double mu = (nobs > 0) ? ((double)sum / dnobs) : 0.0;
+        double M2 = 0.0;
+        if (nobs > 0) {
+            M2 = (double)sumsq - ((double)sum * (double)sum) / dnobs;
+            if (M2 < 0.0) M2 = 0.0;
+        }
+
+        double inv_sd = 1.0;
+        if (denom_ll > 0 && M2 > 0.0) {
+            const double var = M2 / (double)denom_ll;
+            if (var > 0.0) inv_sd = 1.0 / std::sqrt(var);
+        }
+
+        // Precompute standardized values for codes 0/2/3; code 1 (missing) => 0
+        const double vstd[4] = {
+            (0.0 - mu) * inv_sd,
+            0.0,
+            (1.0 - mu) * inv_sd,
+            (2.0 - mu) * inv_sd
+        };
+
+        T* dst = Geno.data() + (size_t)col * (size_t)N;
+
+#ifdef _OPENMP
+        #pragma omp simd
+#endif
+        for (int i = 0; i < N; ++i) {
+            dst[(size_t)i] = (T)vstd[codes[i]];
+        }
+    };
+
+    if (decode_threads <= 1) {
+        static thread_local std::vector<uint8_t> codes_local;
+        if ((int)codes_local.size() < N) codes_local.resize((size_t)N);
+        worker(0, codes_local.data()); // warm? not required
+        for (int col = 0; col < L; ++col) worker(col, codes_local.data());
+        return;
+    }
+
 #ifdef _OPENMP
     #pragma omp parallel num_threads(decode_threads)
 #endif
     {
-        std::vector<T> tmpN_local((size_t)N);
+        static thread_local std::vector<uint8_t> codes_local;
+        if ((int)codes_local.size() < N) codes_local.resize((size_t)N);
 
 #ifdef _OPENMP
         #pragma omp for schedule(static)
 #endif
         for (int col = 0; col < L; ++col) {
-            const unsigned char* bytes = snp0 + (size_t)col * per_snp_bytes;
-
-            long long nobs = 0, sum = 0, sumsq = 0;
-            if (rows_sorted) {
-                decode_rows_and_counts_sorted<T>(bytes, N_total, rows, tmpN_local, nobs, sum, sumsq);
-            } else {
-                decode_rows_and_counts_idxof<T>(bytes, N_total, idx_of, tmpN_local, nobs, sum, sumsq);
-            }
-
-            // mean / sd using ddof
-            const long long denom_ll = nobs - (long long)ddof;
-            const long double mu = (nobs > 0) ? ((long double)sum / (long double)nobs) : 0.0L;
-
-            long double M2 = 0.0L;
-            if (nobs > 0) {
-                // M2 = sumsq - sum^2 / nobs
-                M2 = (long double)sumsq - ((long double)sum * (long double)sum) / (long double)nobs;
-                if (M2 < 0.0L) M2 = 0.0L; // numerical guard
-            }
-
-            T sd = (denom_ll > 0 && M2 > 0.0L) ? (T)std::sqrt(M2 / (long double)denom_ll) : T(1);
-            if (sd == T(0)) sd = T(1);
-            const T inv_sd = T(1) / sd;
-            const T mu_t   = (T)mu;
-
-            // Write standardized column (col-major: Geno[col*N + i])
-            T* dst = Geno.data() + (size_t)col * (size_t)N;
-#ifdef _OPENMP
-            #pragma omp simd
-#endif
-            for (int i = 0; i < N; ++i) {
-                const T x = tmpN_local[(size_t)i];
-                dst[(size_t)i] = std::isnan(x) ? T(0) : (x - mu_t) * inv_sd;
-            }
+            worker(col, codes_local.data());
         }
     }
 
 #else
-    // ---------------- non-Linux fallback: streaming I/O + header check ----------------
+    // non-linux path unchanged (keep your existing streaming fallback if needed)
     std::ifstream bed(bed_path, std::ios::binary);
     if (!bed) throw std::runtime_error("Failed to open bed: " + bed_path);
 
@@ -448,41 +465,44 @@ static void read_block_standardized_impl(const std::string &bed_path,
     if (!bed) throw std::runtime_error("BED seekg failed: " + bed_path);
 
     std::vector<unsigned char> line((size_t)nbytes_per_snp);
-    std::vector<T> tmpN((size_t)N);
+    std::vector<uint8_t> codes_local((size_t)N);
 
     for (int col = 0; col < L; ++col) {
         bed.read(reinterpret_cast<char*>(line.data()), nbytes_per_snp);
         if (!bed) throw std::runtime_error("BED read failed at SNP " + std::to_string(blk_start + col));
 
         long long nobs = 0, sum = 0, sumsq = 0;
-        if (rows_sorted) {
-            decode_rows_and_counts_sorted<T>(line.data(), N_total, rows, tmpN, nobs, sum, sumsq);
-        } else {
-            decode_rows_and_counts_idxof<T>(line.data(), N_total, idx_of, tmpN, nobs, sum, sumsq);
-        }
+        decode_rows_codes_dense_sorted_into(line.data(), N_total, rows, codes_local.data(), nobs, sum, sumsq);
 
+        const double dnobs = (double)nobs;
         const long long denom_ll = nobs - (long long)ddof;
-        const long double mu = (nobs > 0) ? ((long double)sum / (long double)nobs) : 0.0L;
+        const double mu = (nobs > 0) ? ((double)sum / dnobs) : 0.0;
 
-        long double M2 = 0.0L;
+        double M2 = 0.0;
         if (nobs > 0) {
-            M2 = (long double)sumsq - ((long double)sum * (long double)sum) / (long double)nobs;
-            if (M2 < 0.0L) M2 = 0.0L;
+            M2 = (double)sumsq - ((double)sum * (double)sum) / dnobs;
+            if (M2 < 0.0) M2 = 0.0;
         }
 
-        T sd = (denom_ll > 0 && M2 > 0.0L) ? (T)std::sqrt(M2 / (long double)denom_ll) : T(1);
-        if (sd == T(0)) sd = T(1);
-        const T inv_sd = T(1) / sd;
-        const T mu_t   = (T)mu;
+        double inv_sd = 1.0;
+        if (denom_ll > 0 && M2 > 0.0) {
+            const double var = M2 / (double)denom_ll;
+            if (var > 0.0) inv_sd = 1.0 / std::sqrt(var);
+        }
+
+        const double vstd[4] = {
+            (0.0 - mu) * inv_sd,
+            0.0,
+            (1.0 - mu) * inv_sd,
+            (2.0 - mu) * inv_sd
+        };
 
         T* dst = Geno.data() + (size_t)col * (size_t)N;
-        for (int i = 0; i < N; ++i) {
-            const T x = tmpN[(size_t)i];
-            dst[(size_t)i] = std::isnan(x) ? T(0) : (x - mu_t) * inv_sd;
-        }
+        for (int i = 0; i < N; ++i) dst[(size_t)i] = (T)vstd[codes_local[(size_t)i]];
     }
 #endif
 }
+
 
 // ---------------- exported concrete wrappers ----------------
 void read_block_standardized_float(const std::string& bed_path,
@@ -506,4 +526,3 @@ void read_block_standardized_double(const std::string& bed_path,
 {
     read_block_standardized_impl<double>(bed_path, fam_path, blk_start, blk_end, rows, ddof, Geno, N, L);
 }
-

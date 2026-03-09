@@ -47,6 +47,7 @@ class Sumcore:
         clip_nonfinite_vals=False,
         rg_se_method: str = "jackknife",
         intercept_chisq_thr=None,
+        intercept_weight_mode: str = "ldsc",
         chisq_action: str = "drop",
         report_tau: bool = True,
         allow_neg_enr: bool = False,
@@ -81,6 +82,7 @@ class Sumcore:
         self.collapse_reg_ld = bool(collapse_reg_ld)
         self.chisq_threshold = chisq_threshold
         self.intercept_chisq_thr = intercept_chisq_thr
+        self.intercept_weight_mode = str(intercept_weight_mode).strip().lower()
         self.chisq_action = str(chisq_action).strip().lower()
         self.enrich_mode = enrich_mode
         self.jack_mode = jack_mode
@@ -94,6 +96,9 @@ class Sumcore:
             raise ValueError("rg_se_method must be one of {'jackknife','delta'}")
         if self.chisq_action not in ("drop", "clip", "warn", "none"):
             raise ValueError("chisq_action must be one of {'drop','clip','warn','none'}")
+        if self.intercept_weight_mode not in {"ldsc", "score"}:
+            raise ValueError("intercept_weight_mode must be one of {'ldsc','score'}")
+
 
         self.out = out
         self.result = None
@@ -174,6 +179,7 @@ class Sumcore:
             h2_fit1,
             h2_fit2,
             intercept_chisq_threshold=self.intercept_chisq_thr,
+            intercept_weight_mode=self.intercept_weight_mode,
             collapse_reg_ld=self.collapse_reg_ld,
             log=self.log,
             jack_mode=self.jack_mode,

@@ -20,6 +20,23 @@ def _get_timestr(current_time):
 
 # ----------------------- I/O & parsing helpers ----------------------- #
 
+def _read_with_optional_header(file_path):
+    with open(file_path, 'r') as fd:
+        line = fd.readline().strip()
+        try:
+            vals = [float(x) for x in line.split()]
+            is_header = False
+        except ValueError:
+            is_header = True
+    if is_header:
+        header = line.split()
+        data = np.loadtxt(file_path, skiprows=1)
+        return header, data
+    else:
+        data = np.loadtxt(file_path)
+        return None, data
+
+
 def _parse_column_name(df_hdr, names, default_pos):
     cols = list(df_hdr.columns)
     cols_lower = {c.lower(): c for c in cols}
@@ -154,7 +171,515 @@ def _calc_rg_trace_from_ld_batch(ldsum, n1, n2, m1, m2):
     return out
 
 
-def estimate_offdiag_variances_from_jackknife(trace_KK):
+def _sym_clip_weight(v1, v2, c12):
+    denom_w = float(v1 + v2 - 2.0 * c12)
+    if (not np.isfinite(denom_w)) or (denom_w <= 0.0):
+        return 0.5
+
+    w = float((v2 - c12) / denom_w)
+    if not np.isfinite(w):
+        return 0.5
+    if w < 0.0:
+        return 0.0
+    if w > 1.0:
+        return 1.0
+    return w
+
+
+def _sym_center_1d(vals, center="mean", full_value=None, weights=None):
+    vals = np.asarray(vals, dtype=np.float64).ravel()
+
+    if center == "full":
+        fv = float(full_value)
+        return fv if np.isfinite(fv) else np.nan
+
+    if vals.size == 0:
+        return np.nan
+
+    if center == "mean":
+        if weights is None:
+            return float(np.mean(vals))
+        w = np.asarray(weights, dtype=np.float64).ravel()
+        if w.size != vals.size:
+            raise ValueError("weights/vals length mismatch in _sym_center_1d.")
+        sw = float(np.sum(w))
+        if not (np.isfinite(sw) and sw > 0.0):
+            return np.nan
+        return float(np.sum(w * vals) / sw)
+
+    if center == "median":
+        return float(np.median(vals))
+
+    raise ValueError("center must be one of {'full','mean','median'}")
+
+
+def _equal_weight_pair_moments(x_rep, y_rep, x_full, y_full, center="mean", nan_policy="omit"):
+    x_rep = np.asarray(x_rep, dtype=np.float64).ravel()
+    y_rep = np.asarray(y_rep, dtype=np.float64).ravel()
+
+    if x_rep.size != y_rep.size:
+        raise ValueError("x_rep/y_rep length mismatch.")
+
+    if nan_policy not in {"omit", "propagate"}:
+        raise ValueError("nan_policy must be one of {'omit','propagate'}")
+
+    if nan_policy == "propagate":
+        if (not np.isfinite(x_full)) or (not np.isfinite(y_full)):
+            return np.nan, np.nan, np.nan
+        if (not np.isfinite(x_rep).all()) or (not np.isfinite(y_rep).all()):
+            return np.nan, np.nan, np.nan
+        xv = x_rep
+        yv = y_rep
+    else:
+        valid = np.isfinite(x_rep) & np.isfinite(y_rep)
+        if valid.sum() <= 1:
+            return np.nan, np.nan, np.nan
+        xv = x_rep[valid]
+        yv = y_rep[valid]
+
+    cx = _sym_center_1d(xv, center=center, full_value=x_full, weights=None)
+    cy = _sym_center_1d(yv, center=center, full_value=y_full, weights=None)
+    if (not np.isfinite(cx)) or (not np.isfinite(cy)):
+        return np.nan, np.nan, np.nan
+
+    n = int(xv.size)
+    if n <= 1:
+        return np.nan, np.nan, np.nan
+
+    dx = xv - cx
+    dy = yv - cy
+
+    # exact covariance analogue of the equal-weight jackknife SE branch:
+    # Var = ((n-1)/n) * sum(diff^2)
+    fac = float(n - 1) / float(n)
+    v1 = fac * float(np.sum(dx * dx))
+    v2 = fac * float(np.sum(dy * dy))
+    c12 = fac * float(np.sum(dx * dy))
+    return v1, v2, c12
+
+
+def _weighted_delete1_pair_moments(
+    x_rep,
+    y_rep,
+    x_full,
+    y_full,
+    block_sizes,
+    center="mean",
+    nan_policy="omit",
+):
+    """
+    Exact covariance analogue of the weighted delete-1 pseudovalue branch used in
+    _calc_jackknife_se(..., use_pseudovalues=True).
+
+    IMPORTANT:
+    This assumes delete-1 over a true partition with sum(m_b)=M.
+    """
+    x_rep = np.asarray(x_rep, dtype=np.float64).ravel()
+    y_rep = np.asarray(y_rep, dtype=np.float64).ravel()
+    m = np.asarray(block_sizes, dtype=np.float64).ravel()
+
+    if x_rep.size != y_rep.size:
+        raise ValueError("x_rep/y_rep length mismatch.")
+    if m.size != x_rep.size:
+        raise ValueError("block_sizes length mismatch.")
+
+    if nan_policy not in {"omit", "propagate"}:
+        raise ValueError("nan_policy must be one of {'omit','propagate'}")
+
+    good = np.isfinite(m) & (m > 0.0)
+    if good.sum() <= 1:
+        return np.nan, np.nan, np.nan
+
+    x = x_rep[good]
+    y = y_rep[good]
+    m = m[good]
+
+    M = float(np.sum(m))
+    if not (np.isfinite(M) and M > 0.0):
+        return np.nan, np.nan, np.nan
+
+    w = m / M  # sums to 1 on the retained partition blocks
+
+    PVx = (M * float(x_full) - (M - m) * x) / m
+    PVy = (M * float(y_full) - (M - m) * y) / m
+
+    if nan_policy == "propagate":
+        if (not np.isfinite(x_full)) or (not np.isfinite(y_full)):
+            return np.nan, np.nan, np.nan
+        if (not np.isfinite(PVx).all()) or (not np.isfinite(PVy).all()):
+            return np.nan, np.nan, np.nan
+
+        pvx = PVx
+        pvy = PVy
+        ww = w  # already sums to 1
+    else:
+        valid = np.isfinite(PVx) & np.isfinite(PVy)
+        if valid.sum() <= 1:
+            return np.nan, np.nan, np.nan
+
+        pvx = PVx[valid]
+        pvy = PVy[valid]
+        ww = w[valid]
+
+        sw = float(np.sum(ww))
+        if not (np.isfinite(sw) and sw > 0.0):
+            return np.nan, np.nan, np.nan
+        ww = ww / sw  # exact mirror of _calc_jackknife_se(..., nan_policy='omit')
+
+    cx = _sym_center_1d(pvx, center=center, full_value=x_full, weights=(ww if center == "mean" else None))
+    cy = _sym_center_1d(pvy, center=center, full_value=y_full, weights=(ww if center == "mean" else None))
+    if (not np.isfinite(cx)) or (not np.isfinite(cy)):
+        return np.nan, np.nan, np.nan
+
+    dx = pvx - cx
+    dy = pvy - cy
+
+    denom = 1.0 - ww
+    if np.any((~np.isfinite(denom)) | (denom <= 0.0)):
+        return np.nan, np.nan, np.nan
+
+    # exact covariance analogue of the SE formula:
+    # Var = sum( w^2/(1-w) * diff^2 )
+    alpha = (ww * ww) / denom
+    if not np.isfinite(alpha).all():
+        return np.nan, np.nan, np.nan
+
+    # same effective-dof guard as the SE logic
+    w2 = float(np.sum(ww * ww))
+    n_eff = (1.0 / w2) if (w2 > 0.0 and np.isfinite(w2)) else 0.0
+    if not (n_eff > 1.0):
+        return np.nan, np.nan, np.nan
+
+    v1 = float(np.sum(alpha * (dx * dx)))
+    v2 = float(np.sum(alpha * (dy * dy)))
+    c12 = float(np.sum(alpha * (dx * dy)))
+
+    if (not np.isfinite(v1)) or (not np.isfinite(v2)) or (not np.isfinite(c12)):
+        return np.nan, np.nan, np.nan
+    return v1, v2, c12
+
+
+def _unit_pseudovalue_pair_moments(
+    pvx_all,
+    pvy_all,
+    x_full,
+    y_full,
+    unit_sizes,
+    M,
+    good_u_base,
+    center="mean",
+    nan_policy="omit",
+):
+    """
+    Exact covariance analogue of the unit-level unequal-size delete-1 formula used
+    after reconstructing unit pseudovalues in _calc_jackknife_se_from_delete_sets.
+    """
+    pvx_all = np.asarray(pvx_all, dtype=np.float64).ravel()
+    pvy_all = np.asarray(pvy_all, dtype=np.float64).ravel()
+    unit_sizes = np.asarray(unit_sizes, dtype=np.float64).ravel()
+    good_u_base = np.asarray(good_u_base, dtype=bool).ravel()
+
+    if not (pvx_all.size == pvy_all.size == unit_sizes.size == good_u_base.size):
+        raise ValueError("length mismatch in _unit_pseudovalue_pair_moments.")
+
+    if nan_policy not in {"omit", "propagate"}:
+        raise ValueError("nan_policy must be one of {'omit','propagate'}")
+
+    if nan_policy == "propagate":
+        if (not np.isfinite(x_full)) or (not np.isfinite(y_full)):
+            return np.nan, np.nan, np.nan
+        if not (np.isfinite(pvx_all[good_u_base]).all() and np.isfinite(pvy_all[good_u_base]).all()):
+            return np.nan, np.nan, np.nan
+
+        valid = good_u_base
+        pvx = pvx_all[valid]
+        pvy = pvy_all[valid]
+        ww = unit_sizes[valid] / float(M)  # sums to 1 on the valid partition
+    else:
+        valid = good_u_base & np.isfinite(pvx_all) & np.isfinite(pvy_all)
+        if valid.sum() <= 1:
+            return np.nan, np.nan, np.nan
+
+        pvx = pvx_all[valid]
+        pvy = pvy_all[valid]
+        ww = unit_sizes[valid] / float(M)
+
+        sw = float(np.sum(ww))
+        if not (np.isfinite(sw) and sw > 0.0):
+            return np.nan, np.nan, np.nan
+        ww = ww / sw  # exact mirror of omit behavior in the SE code
+
+    cx = _sym_center_1d(pvx, center=center, full_value=x_full, weights=(ww if center == "mean" else None))
+    cy = _sym_center_1d(pvy, center=center, full_value=y_full, weights=(ww if center == "mean" else None))
+    if (not np.isfinite(cx)) or (not np.isfinite(cy)):
+        return np.nan, np.nan, np.nan
+
+    dx = pvx - cx
+    dy = pvy - cy
+
+    denom = 1.0 - ww
+    if np.any((~np.isfinite(denom)) | (denom <= 0.0)):
+        return np.nan, np.nan, np.nan
+
+    alpha = (ww * ww) / denom
+    if not np.isfinite(alpha).all():
+        return np.nan, np.nan, np.nan
+
+    w2 = float(np.sum(ww * ww))
+    n_eff = (1.0 / w2) if (w2 > 0.0 and np.isfinite(w2)) else 0.0
+    if not (n_eff > 1.0):
+        return np.nan, np.nan, np.nan
+
+    v1 = float(np.sum(alpha * (dx * dx)))
+    v2 = float(np.sum(alpha * (dy * dy)))
+    c12 = float(np.sum(alpha * (dx * dy)))
+
+    if (not np.isfinite(v1)) or (not np.isfinite(v2)) or (not np.isfinite(c12)):
+        return np.nan, np.nan, np.nan
+    return v1, v2, c12
+
+
+def _direct_delete_d_pair_moments(
+    x_rep,
+    y_rep,
+    x_full,
+    y_full,
+    m_del,
+    M,
+    good_rep_base,
+    center="mean",
+    nan_policy="omit",
+):
+    """
+    Exact covariance analogue of the direct delete-d fallback used in
+    _calc_jackknife_se_from_delete_sets when the delete-set design is underidentified.
+    """
+    x_rep = np.asarray(x_rep, dtype=np.float64).ravel()
+    y_rep = np.asarray(y_rep, dtype=np.float64).ravel()
+    m_del = np.asarray(m_del, dtype=np.float64).ravel()
+    good_rep_base = np.asarray(good_rep_base, dtype=bool).ravel()
+
+    if not (x_rep.size == y_rep.size == m_del.size == good_rep_base.size):
+        raise ValueError("length mismatch in _direct_delete_d_pair_moments.")
+
+    if nan_policy not in {"omit", "propagate"}:
+        raise ValueError("nan_policy must be one of {'omit','propagate'}")
+
+    finite_xy = np.isfinite(x_rep) & np.isfinite(y_rep)
+
+    if nan_policy == "propagate":
+        if (not np.isfinite(x_full)) or (not np.isfinite(y_full)):
+            return np.nan, np.nan, np.nan
+        if not np.all((~good_rep_base) | finite_xy):
+            return np.nan, np.nan, np.nan
+        valid = good_rep_base
+    else:
+        valid = good_rep_base & finite_xy
+        if valid.sum() <= 1:
+            return np.nan, np.nan, np.nan
+
+    xv = x_rep[valid]
+    yv = y_rep[valid]
+    sc = ((float(M) - m_del[valid]) / m_del[valid]).astype(np.float64)
+
+    if (not np.isfinite(sc).all()) or np.any(sc <= 0.0):
+        return np.nan, np.nan, np.nan
+
+    cx = _sym_center_1d(xv, center=center, full_value=x_full, weights=None)
+    cy = _sym_center_1d(yv, center=center, full_value=y_full, weights=None)
+    if (not np.isfinite(cx)) or (not np.isfinite(cy)):
+        return np.nan, np.nan, np.nan
+
+    dx = xv - cx
+    dy = yv - cy
+
+    # exact covariance analogue of the fallback SE formula:
+    # Var = mean( sc * diff^2 )
+    v1 = float(np.mean(sc * (dx * dx)))
+    v2 = float(np.mean(sc * (dy * dy)))
+    c12 = float(np.mean(sc * (dx * dy)))
+
+    if (not np.isfinite(v1)) or (not np.isfinite(v2)) or (not np.isfinite(c12)):
+        return np.nan, np.nan, np.nan
+    return v1, v2, c12
+
+
+def _delete_sets_pair_moments(
+    x_rep,
+    y_rep,
+    x_full,
+    y_full,
+    D,
+    unit_sizes,
+    center="mean",
+    nan_policy="omit",
+):
+    """
+    Exact covariance analogue of _calc_jackknife_se_from_delete_sets, specialized to
+    one off-diagonal pair (x = theta_{k,l}, y = theta_{l,k}).
+
+    This is used for:
+      - exact LOCO delete-1
+      - sampled delete-1
+      - general delete-d
+    """
+    x_rep = np.asarray(x_rep, dtype=np.float64).ravel()
+    y_rep = np.asarray(y_rep, dtype=np.float64).ravel()
+    D = np.asarray(D, dtype=np.float64, order="C")
+    unit_sizes = np.asarray(unit_sizes, dtype=np.float64).ravel()
+
+    if D.ndim != 2:
+        raise ValueError("D must be 2D (R, U).")
+    R, U = D.shape
+
+    if x_rep.size != R or y_rep.size != R:
+        raise ValueError("replicate length mismatch with D.")
+    if unit_sizes.size != U:
+        raise ValueError("unit_sizes length mismatch with D.")
+
+    if nan_policy not in {"omit", "propagate"}:
+        raise ValueError("nan_policy must be one of {'omit','propagate'}")
+
+    M = float(np.sum(unit_sizes))
+    if not (np.isfinite(M) and M > 0.0):
+        return np.nan, np.nan, np.nan
+
+    good_u_base = np.isfinite(unit_sizes) & (unit_sizes > 0.0) & (unit_sizes < M)
+    use_u = np.flatnonzero(good_u_base)
+    if use_u.size <= 1:
+        return np.nan, np.nan, np.nan
+
+    m_del = D @ unit_sizes
+    good_rep_base = np.isfinite(m_del) & (m_del > 0.0) & (m_del < M)
+    if not np.any(good_rep_base):
+        return np.nan, np.nan, np.nan
+
+    mask = D > 0.5
+    exact_loco = (
+        R == U
+        and np.all(mask.sum(axis=1) == 1)
+        and np.all(mask.sum(axis=0) == 1)
+    )
+
+    # ------------------------------------------------------------
+    # Case A: exact delete-1 LOCO full set
+    # ------------------------------------------------------------
+    if exact_loco:
+        if nan_policy == "propagate":
+            if (not np.isfinite(x_full)) or (not np.isfinite(y_full)):
+                return np.nan, np.nan, np.nan
+            if (not np.isfinite(x_rep).all()) or (not np.isfinite(y_rep).all()):
+                return np.nan, np.nan, np.nan
+
+        unit_of_rep = mask.argmax(axis=1)
+        rep_for_unit = np.empty(U, dtype=np.int64)
+        rep_for_unit[unit_of_rep] = np.arange(R, dtype=np.int64)
+
+        pvx_all = np.full(U, np.nan, dtype=np.float64)
+        pvy_all = np.full(U, np.nan, dtype=np.float64)
+
+        for u in use_u:
+            r = int(rep_for_unit[u])
+            thx = float(x_rep[r])
+            thy = float(y_rep[r])
+            if np.isfinite(thx):
+                mu = float(unit_sizes[u])
+                pvx_all[u] = (M * float(x_full) - (M - mu) * thx) / mu
+            if np.isfinite(thy):
+                mu = float(unit_sizes[u])
+                pvy_all[u] = (M * float(y_full) - (M - mu) * thy) / mu
+
+        return _unit_pseudovalue_pair_moments(
+            pvx_all=pvx_all,
+            pvy_all=pvy_all,
+            x_full=x_full,
+            y_full=y_full,
+            unit_sizes=unit_sizes,
+            M=M,
+            good_u_base=good_u_base,
+            center=center,
+            nan_policy=nan_policy,
+        )
+
+    # ------------------------------------------------------------
+    # Case B: general delete-d / sampled delete-1
+    # ------------------------------------------------------------
+    finite_xy = np.isfinite(x_rep) & np.isfinite(y_rep)
+    if nan_policy == "propagate":
+        if (not np.isfinite(x_full)) or (not np.isfinite(y_full)):
+            return np.nan, np.nan, np.nan
+        if not np.all((~good_rep_base) | finite_xy):
+            return np.nan, np.nan, np.nan
+        valid_rep = good_rep_base
+    else:
+        valid_rep = good_rep_base & finite_xy
+        if valid_rep.sum() <= 1:
+            return np.nan, np.nan, np.nan
+
+    D_use = D[:, use_u]
+    Dv = D_use[valid_rep, :]
+    U_use = int(Dv.shape[1])
+
+    # If underidentified, use the exact covariance analogue of the fallback
+    if (Dv.shape[0] < U_use) or (np.linalg.matrix_rank(Dv) < U_use):
+        return _direct_delete_d_pair_moments(
+            x_rep=x_rep,
+            y_rep=y_rep,
+            x_full=x_full,
+            y_full=y_full,
+            m_del=m_del,
+            M=M,
+            good_rep_base=good_rep_base,
+            center=center,
+            nan_policy=nan_policy,
+        )
+
+    m_u = unit_sizes[use_u]
+    yx = M * float(x_full) - (M - m_del[valid_rep]) * x_rep[valid_rep]
+    yy = M * float(y_full) - (M - m_del[valid_rep]) * y_rep[valid_rep]
+
+    RHS = np.column_stack([yx, yy])  # (Rv, 2)
+    AtA = Dv.T @ Dv
+    AtY = Dv.T @ RHS
+
+    try:
+        G = np.linalg.solve(AtA, AtY)
+    except np.linalg.LinAlgError:
+        tr = float(np.trace(AtA))
+        lam = 1e-10 * (tr / U_use if (np.isfinite(tr) and tr > 0.0) else 1.0)
+        try:
+            G = np.linalg.solve(AtA + lam * np.eye(U_use, dtype=np.float64), AtY)
+        except np.linalg.LinAlgError:
+            G = np.linalg.lstsq(Dv, RHS, rcond=None)[0]
+
+    pvx_use = G[:, 0] / m_u
+    pvy_use = G[:, 1] / m_u
+
+    pvx_all = np.full(U, np.nan, dtype=np.float64)
+    pvy_all = np.full(U, np.nan, dtype=np.float64)
+    pvx_all[use_u] = pvx_use
+    pvy_all[use_u] = pvy_use
+
+    return _unit_pseudovalue_pair_moments(
+        pvx_all=pvx_all,
+        pvy_all=pvy_all,
+        x_full=x_full,
+        y_full=y_full,
+        unit_sizes=unit_sizes,
+        M=M,
+        good_u_base=good_u_base,
+        center=center,
+        nan_policy=nan_policy,
+    )
+
+
+def estimate_offdiag_variances_from_jackknife(trace_KK, center="mean", nan_policy="omit"):
+    """
+    Legacy equal-weight off-diagonal symmetrization weights.
+
+    This now mirrors the exact covariance analogue of the equal-weight branch of
+    _calc_jackknife_se(..., use_pseudovalues=False), with consistent nan handling.
+    """
     trace_KK = np.asarray(trace_KK, dtype=np.float64)
     if trace_KK.ndim != 3:
         raise ValueError("trace_KK must have shape (B+1, K, K)")
@@ -163,65 +688,51 @@ def estimate_offdiag_variances_from_jackknife(trace_KK):
     if K != K2:
         raise ValueError("trace_KK last two dimensions must be equal (KxK)")
 
+    if center not in {"full", "mean", "median"}:
+        raise ValueError("center must be one of {'full','mean','median'}")
+    if nan_policy not in {"omit", "propagate"}:
+        raise ValueError("nan_policy must be one of {'omit','propagate'}")
+
     B = B_plus - 1
-
-    # If we don't have enough jackknife blocks, just fall back to 0.5 weights.
-    if B <= 1:
-        var1 = np.zeros((K, K), dtype=np.float64)
-        var2 = np.zeros((K, K), dtype=np.float64)
-        cov12 = np.zeros((K, K), dtype=np.float64)
-        w_opt = np.full((K, K), 0.5, dtype=np.float64)
-        return var1, var2, cov12, w_opt
-
-    jack = trace_KK[:B]  # (B, K, K)
 
     var1 = np.zeros((K, K), dtype=np.float64)
     var2 = np.zeros((K, K), dtype=np.float64)
     cov12 = np.zeros((K, K), dtype=np.float64)
     w_opt = np.full((K, K), 0.5, dtype=np.float64)
 
-    denom = float(B - 1)
+    if B <= 1:
+        return var1, var2, cov12, w_opt
+
+    jack = trace_KK[:B]
+    full = trace_KK[B]
 
     for k in range(K):
-        for l in range(K):
-            if k == l:
-                continue
-
+        for l in range(k + 1, K):
             x = jack[:, k, l]
             y = jack[:, l, k]
-            mx = x.mean()
-            my = y.mean()
-            dx = x - mx
-            dy = y - my
+            x_full = float(full[k, l])
+            y_full = float(full[l, k])
 
-            v1 = np.dot(dx, dx) / denom
-            v2 = np.dot(dy, dy) / denom
-            c12 = np.dot(dx, dy) / denom
+            v1, v2, c12 = _equal_weight_pair_moments(
+                x_rep=x,
+                y_rep=y,
+                x_full=x_full,
+                y_full=y_full,
+                center=center,
+                nan_policy=nan_policy,
+            )
 
-            var1[k, l] = v1
-            var2[k, l] = v2
-            cov12[k, l] = c12
-
-            # Optimal linear weight:
-            # w* = (sigma2^2 - cov12) / (sigma1^2 + sigma2^2 - 2*cov12)
-            denom_w = v1 + v2 - 2.0 * c12
-            if denom_w <= 0.0 or not np.isfinite(denom_w):
-                w = 0.5
+            if np.isfinite(v1) and np.isfinite(v2) and np.isfinite(c12):
+                var1[k, l] = var1[l, k] = v1
+                var2[k, l] = var2[l, k] = v2
+                cov12[k, l] = cov12[l, k] = c12
+                w = _sym_clip_weight(v1, v2, c12)
             else:
-                w = (v2 - c12) / denom_w
-                if not np.isfinite(w):
-                    w = 0.5
-                else:
-                    # Clamp to [0, 1] to avoid crazy weights from noise
-                    if w < 0.0:
-                        w = 0.0
-                    elif w > 1.0:
-                        w = 1.0
+                w = 0.5
 
             w_opt[k, l] = w
             w_opt[l, k] = 1.0 - w
 
-    # Diagonals: trivial, no off-diagonal ambiguity
     for k in range(K):
         var1[k, k] = 0.0
         var2[k, k] = 0.0
@@ -235,11 +746,39 @@ def symmetrize_trace_with_jackknife(
     trace_KK,
     logger=None,
     verbose=False,
-    jk_block_sizes=None,  # only meaningful for delete-1 partition blocks
-    jk_n_units=None,      # required for delete-d
-    jk_delete_d: int = 1, # d
+    jk_block_sizes=None,      # delete-1 partition blocks
+    jk_delete_matrix=None,    # (R, U) delete incidence matrix for delete-set designs
+    jk_unit_sizes=None,       # (U,) unit sizes for delete-set designs
+    jk_n_units=None,          # optional sanity/logging only
+    jk_delete_d: int = 1,
+    center: str = "mean",
     nan_policy: str = "omit",
 ):
+    """
+    Symmetrize off-diagonal trace entries using pair-specific jackknife-optimal weights.
+
+    Branches
+    --------
+    1) delete-set branch (preferred when jk_delete_matrix + jk_unit_sizes are provided):
+       Mirrors the covariance analogue of _calc_jackknife_se_from_delete_sets.
+       This handles:
+         - exact LOCO delete-1
+         - sampled delete-1
+         - general delete-d
+
+    2) weighted delete-1 partition branch (jk_block_sizes provided):
+       Mirrors the covariance analogue of the weighted pseudovalue branch in
+       _calc_jackknife_se(..., use_pseudovalues=True).
+
+    3) legacy equal-weight branch:
+       Mirrors the covariance analogue of the equal-weight jackknife SE branch.
+
+    IMPORTANT
+    ---------
+    For sampled delete-1 / delete-d designs, do NOT rely on jk_n_units alone.
+    Pass jk_delete_matrix and jk_unit_sizes explicitly, otherwise this function
+    raises instead of silently falling back to equal-weight logic.
+    """
     trace_KK = np.asarray(trace_KK, dtype=np.float64)
     if trace_KK.ndim != 3:
         raise ValueError("trace_KK must have shape (B+1, K, K)")
@@ -248,10 +787,14 @@ def symmetrize_trace_with_jackknife(
     if K != K2:
         raise ValueError("trace_KK last two dimensions must be equal (KxK)")
 
+    if center not in {"full", "mean", "median"}:
+        raise ValueError("center must be one of {'full','mean','median'}")
+    if nan_policy not in {"omit", "propagate"}:
+        raise ValueError("nan_policy must be one of {'omit','propagate'}")
+
     B = B_plus - 1
 
     if B <= 0:
-        # no replicates: just average full row
         sym = trace_KK.copy()
         full = sym[-1]
         for k in range(K):
@@ -263,177 +806,127 @@ def symmetrize_trace_with_jackknife(
 
     sym = trace_KK.copy()
 
-    # diagnostics (full row)
     if logger is not None:
         full_before = trace_KK[B]
         tri = np.triu_indices(K, k=1)
         max_asym_before = float(np.abs(full_before - full_before.T)[tri].max(initial=0.0))
 
     # ----------------------------
-    # w_opt estimators
+    # choose weight-estimation mode
     # ----------------------------
-    def _w_opt_delete_d(trace_KK, n_units: int, delete_d: int):
-        jack = trace_KK[:B]  # (B,K,K)
+    has_delete_set = (jk_delete_matrix is not None) or (jk_unit_sizes is not None)
+    if has_delete_set:
+        if (jk_delete_matrix is None) or (jk_unit_sizes is None):
+            raise ValueError("Provide both jk_delete_matrix and jk_unit_sizes together.")
+
+        D = np.asarray(jk_delete_matrix, dtype=np.float64, order="C")
+        unit_sizes = np.asarray(jk_unit_sizes, dtype=np.float64).ravel()
+
+        if D.ndim != 2:
+            raise ValueError("jk_delete_matrix must be 2D (R, U).")
+        if D.shape[0] != B:
+            raise ValueError(f"jk_delete_matrix must have R={B} rows; got {D.shape[0]}.")
+        if unit_sizes.size != D.shape[1]:
+            raise ValueError(
+                f"jk_unit_sizes must have length U={D.shape[1]}; got {unit_sizes.size}."
+            )
+        if jk_n_units is not None and int(jk_n_units) != int(D.shape[1]):
+            raise ValueError(
+                f"jk_n_units={jk_n_units} inconsistent with delete matrix U={D.shape[1]}."
+            )
+
         w_opt = np.full((K, K), 0.5, dtype=np.float64)
-        for k in range(K):
-            w_opt[k, k] = 0.5
-
-        U = int(n_units)
-        d = int(delete_d)
-        if not (1 <= d < U):
-            return w_opt
-
-        # factor cancels in w*, but keep for clarity
-        factor = float(U - d) / float(d)
-
-        for k in range(K):
-            for l in range(k + 1, K):
-                x = jack[:, k, l]
-                y = jack[:, l, k]
-
-                mask = np.isfinite(x) & np.isfinite(y)
-                if mask.sum() <= 1:
-                    continue
-
-                xf = x[mask]
-                yf = y[mask]
-
-                if nan_policy == "omit":
-                    mx = float(np.mean(xf))
-                    my = float(np.mean(yf))
-                else:
-                    # propagate
-                    if not (np.isfinite(xf).all() and np.isfinite(yf).all()):
-                        continue
-                    mx = float(xf.mean())
-                    my = float(yf.mean())
-
-                dx = xf - mx
-                dy = yf - my
-
-                v1 = factor * float(np.mean(dx * dx))
-                v2 = factor * float(np.mean(dy * dy))
-                c12 = factor * float(np.mean(dx * dy))
-
-                denom_w = v1 + v2 - 2.0 * c12
-                if denom_w <= 0.0 or not np.isfinite(denom_w):
-                    wstar = 0.5
-                else:
-                    wstar = (v2 - c12) / denom_w
-                    if not np.isfinite(wstar):
-                        wstar = 0.5
-                    else:
-                        wstar = 0.0 if wstar < 0.0 else (1.0 if wstar > 1.0 else wstar)
-
-                w_opt[k, l] = wstar
-                w_opt[l, k] = 1.0 - wstar
-
-        return w_opt
-
-    def _w_opt_delete1_weighted(trace_KK, jk_block_sizes):
-        """
-        Your existing delete-1 delete-m pseudovalue approach.
-
-        IMPORTANT:
-        This assumes blocks form a PARTITION and sum(m_b)=M_total.
-        """
-        m = np.asarray(jk_block_sizes, dtype=np.float64).ravel()
-        if m.size != B:
-            raise ValueError(f"jk_block_sizes must have length B={B}, got {m.size}")
-
-        good = np.isfinite(m) & (m > 0)
-        if good.sum() <= 1:
-            return np.full((K, K), 0.5, dtype=np.float64)
-
-        m = m[good]
-        M = float(m.sum())
-        if not (np.isfinite(M) and M > 0):
-            return np.full((K, K), 0.5, dtype=np.float64)
-
-        w = m / M
-        jack = trace_KK[:B][good, :, :]
         full = trace_KK[B]
+        jack = trace_KK[:B]
 
-        w_opt = np.full((K, K), 0.5, dtype=np.float64)
         for k in range(K):
             w_opt[k, k] = 0.5
 
         for k in range(K):
             for l in range(k + 1, K):
-                x_full = float(full[k, l])
-                y_full = float(full[l, k])
+                v1, v2, c12 = _delete_sets_pair_moments(
+                    x_rep=jack[:, k, l],
+                    y_rep=jack[:, l, k],
+                    x_full=float(full[k, l]),
+                    y_full=float(full[l, k]),
+                    D=D,
+                    unit_sizes=unit_sizes,
+                    center=center,
+                    nan_policy=nan_policy,
+                )
+                w = _sym_clip_weight(v1, v2, c12) if (
+                    np.isfinite(v1) and np.isfinite(v2) and np.isfinite(c12)
+                ) else 0.5
 
-                x = jack[:, k, l]
-                y = jack[:, l, k]
+                w_opt[k, l] = w
+                w_opt[l, k] = 1.0 - w
 
-                PVx = (M * x_full - (M - m) * x) / m
-                PVy = (M * y_full - (M - m) * y) / m
-
-                finite = np.isfinite(PVx) & np.isfinite(PVy)
-                if finite.sum() <= 1:
-                    continue
-
-                wf = w[finite]
-                wf_sum = float(wf.sum())
-                if not (np.isfinite(wf_sum) and wf_sum > 0):
-                    continue
-                wf = wf / wf_sum
-
-                PVx_f = PVx[finite]
-                PVy_f = PVy[finite]
-
-                mx = float(np.sum(wf * PVx_f))
-                my = float(np.sum(wf * PVy_f))
-                dx = PVx_f - mx
-                dy = PVy_f - my
-
-                w2 = float(np.sum(wf * wf))
-                denom = 1.0 - w2
-                if not (np.isfinite(denom) and denom > 0):
-                    continue
-
-                num1 = float(np.sum((wf * wf) * (dx * dx)))
-                num2 = float(np.sum((wf * wf) * (dy * dy)))
-                numc = float(np.sum((wf * wf) * (dx * dy)))
-
-                v1 = num1 / denom
-                v2 = num2 / denom
-                c12 = numc / denom
-
-                denom_w = v1 + v2 - 2.0 * c12
-                if denom_w <= 0.0 or not np.isfinite(denom_w):
-                    wstar = 0.5
-                else:
-                    wstar = (v2 - c12) / denom_w
-                    if not np.isfinite(wstar):
-                        wstar = 0.5
-                    else:
-                        wstar = 0.0 if wstar < 0.0 else (1.0 if wstar > 1.0 else wstar)
-
-                w_opt[k, l] = wstar
-                w_opt[l, k] = 1.0 - wstar
-
-        return w_opt
-
-    # Choose w_opt
-    if int(jk_delete_d) > 1:
-        if jk_n_units is None:
-            raise ValueError("delete-d symmetrization requires jk_n_units (e.g. 22 chromosomes).")
-        w_opt = _w_opt_delete_d(trace_KK, int(jk_n_units), int(jk_delete_d))
         if logger is not None and verbose:
             logger._log(
-                f"[Trace] symmetrize: delete-d mode used "
-                f"(U={int(jk_n_units)}, d={int(jk_delete_d)}, R={B})."
+                f"[Trace] symmetrize: delete-set mode used "
+                f"(U={D.shape[1]}, d={int(jk_delete_d)}, R={B}, center={center}, nan_policy={nan_policy})."
             )
-    elif jk_block_sizes is not None:
-        w_opt = _w_opt_delete1_weighted(trace_KK, jk_block_sizes)
-        if logger is not None and verbose:
-            logger._log(f"[Trace] symmetrize: delete-1 weighted blocks used (B={B}).")
-    else:
-        # legacy equal-weight estimate
-        _, _, _, w_opt = estimate_offdiag_variances_from_jackknife(trace_KK)
 
-    # Apply weights to symmetrize all replicate rows and full row
+    else:
+        # If the caller claims a delete-set design but did not pass D / unit sizes,
+        # do not silently fall back.
+        if (jk_n_units is not None) or (int(jk_delete_d) > 1):
+            raise ValueError(
+                "Delete-set symmetrization now requires jk_delete_matrix and jk_unit_sizes. "
+                "Do not rely on jk_n_units / jk_delete_d alone."
+            )
+
+        if jk_block_sizes is not None:
+            m = np.asarray(jk_block_sizes, dtype=np.float64).ravel()
+            if m.size != B:
+                raise ValueError(f"jk_block_sizes must have length B={B}, got {m.size}")
+
+            w_opt = np.full((K, K), 0.5, dtype=np.float64)
+            full = trace_KK[B]
+            jack = trace_KK[:B]
+
+            for k in range(K):
+                w_opt[k, k] = 0.5
+
+            for k in range(K):
+                for l in range(k + 1, K):
+                    v1, v2, c12 = _weighted_delete1_pair_moments(
+                        x_rep=jack[:, k, l],
+                        y_rep=jack[:, l, k],
+                        x_full=float(full[k, l]),
+                        y_full=float(full[l, k]),
+                        block_sizes=m,
+                        center=center,
+                        nan_policy=nan_policy,
+                    )
+                    w = _sym_clip_weight(v1, v2, c12) if (
+                        np.isfinite(v1) and np.isfinite(v2) and np.isfinite(c12)
+                    ) else 0.5
+
+                    w_opt[k, l] = w
+                    w_opt[l, k] = 1.0 - w
+
+            if logger is not None and verbose:
+                logger._log(
+                    f"[Trace] symmetrize: delete-1 weighted partition used "
+                    f"(B={B}, center={center}, nan_policy={nan_policy})."
+                )
+        else:
+            # legacy equal-weight branch
+            _, _, _, w_opt = estimate_offdiag_variances_from_jackknife(
+                trace_KK,
+                center=center,
+                nan_policy=nan_policy,
+            )
+            if logger is not None and verbose:
+                logger._log(
+                    f"[Trace] symmetrize: legacy equal-weight branch used "
+                    f"(B={B}, center={center}, nan_policy={nan_policy})."
+                )
+
+    # ----------------------------
+    # apply pairwise weights
+    # ----------------------------
     for k in range(K):
         for l in range(k + 1, K):
             w = float(w_opt[k, l])

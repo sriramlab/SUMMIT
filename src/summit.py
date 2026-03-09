@@ -41,6 +41,9 @@ def build_parser() -> argparse.ArgumentParser:
                         help="Main chi^2 threshold. Use 'auto' for max(80, 0.001*Nmax).")
     parser.add_argument("--intercept-chisq-thr", default=None, type=str,
                         help="Chi^2 threshold used only for the cross-trait intercept regression. Use 'auto' for max(80, 0.001*Nmax).")
+    parser.add_argument("--intercept-weight-mode", default="ldsc", type=str,
+                        choices=["ldsc", "score"],
+                        help="Weighting scheme for the constrained cross-trait intercept fit: 'ldsc' for LDSC-style IRWLS weights, or 'score' for fixed w_j = 1/x_j.")
     parser.add_argument("--chisq-action", default="drop", type=str,
                         choices=["drop", "clip", "warn", "none"],
                         help="What to do with high-chi^2 SNPs on the main analysis axis.")
@@ -48,8 +51,6 @@ def build_parser() -> argparse.ArgumentParser:
     # Additional input
     parser.add_argument("--annot", default=None, type=str,
                         help="Path to the annotation file.")
-    parser.add_argument("--thin-annot", action="store_true", default=False,
-                        help="Compatibility flag; the refactored Trace auto-detects thin/full annotation.")
 
     # Output / behavior
     parser.add_argument("--out", default=None, type=str,

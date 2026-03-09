@@ -586,6 +586,29 @@ class GenomewideLDScore:
             self.log._log(f"Randomly subsampling individuals: {k}/{self.nsamp} ({k/self.nsamp:.1%})")
 
         self._read_bim(self.bim_path)
+        if self.hybrid:
+            if self.snplist is None:
+                raise ValueError("--hybrid requires a .bim file with CHR/BP columns.")
+            chr_codes, _ = pd.factorize(self.snplist["CHR"].astype(str), sort=False)
+            self.hybrid_chr_codes = np.ascontiguousarray(chr_codes.astype(np.int32, copy=False))
+            self.hybrid_bp = np.ascontiguousarray(
+                self.snplist["BP"].to_numpy(dtype=np.int64, copy=True)
+            )
+
+            # Validate within-chromosome monotonicity
+            p = 0
+            while p < self.nsnps:
+                c = self.hybrid_chr_codes[p]
+                q = p + 1
+                while q < self.nsnps and self.hybrid_chr_codes[q] == c:
+                    q += 1
+                if q - p > 1 and np.any(np.diff(self.hybrid_bp[p:q]) < 0):
+                    raise ValueError(
+                        f"Hybrid mode requires nondecreasing BP within chromosome; "
+                        f"failed on CHR={self.snplist.loc[p, 'CHR']}"
+                    )
+                p = q
+                
         if annot_path is not None:
             self._read_annot(annot_path)
         else:
@@ -849,6 +872,8 @@ class GenomewideLDScore:
             self.nbins = 1
             self.l2cols = [f"L2_{i}" for i in range(self.nbins)]
             self.nsnps_bin = self.annot.sum(axis=0, dtype=np.float64)
+            # Keep annotation in the compute dtype/contiguity so pybind does not create
+            # a hidden temporary copy on every hybrid call.
             self.annot = np.ascontiguousarray(self.annot.astype(self.dtype, copy=False))
             self.log._log("Calculating genome-wide (non-partitioned) LD score")
             self.log._log(f"Number of samples: {self.nsamp}")
@@ -1044,7 +1069,8 @@ class GenomewideLDScore:
         else:
             self.log._log("No covariates: standard LD scores (squared correlations).")
         if self.hybrid:
-            self.log._log(f"[hybrid] exact-local + randomized-global-minus-local with window {self.hybrid_window_kb:.3f} kb")
+            self.log._log(f"[hybrid] using optimized banded local pass "
+                f"(window={self.hybrid_window_kb:.3f} kb)")
 
         H = self.num_threads
         t_blas1 = min(4, max(1, H // 4))
@@ -1059,6 +1085,8 @@ class GenomewideLDScore:
             e = min(self.nsnps, j + self.step_size)
             blocks.append((s, e))
         self.nblks = len(blocks)
+        block_starts = np.asarray([s for (s, _) in blocks], dtype=np.int32)
+        block_ends   = np.asarray([e for (_, e) in blocks], dtype=np.int32)
 
         kmax_per_block = []
         for (s, e) in blocks:
@@ -1125,7 +1153,7 @@ class GenomewideLDScore:
         ann_blocks = [np.ascontiguousarray(self.annot[s:e]) for (s, e) in blocks]
         inv_blocks = [np.ascontiguousarray(self.inv_sqrt_resvar_all[s:e]) for (s, e) in blocks]
 
-        total_units = len(vtiles) * (len(blocks) + (len(self._hyb_tgt_blocks) if self.hybrid else 0))
+        total_units = len(vtiles) * (len(blocks) + (1 if self.hybrid else 0))
         bar = tqdm(total=total_units, desc="GW-LD progress", unit="task", smoothing=0.2, miniters=1)
 
         ema_p1 = 0.0
@@ -1269,56 +1297,36 @@ class GenomewideLDScore:
 
                 pref_ex.shutdown(wait=True)
                 meansq_accum += (meansq_chunk * Vt)
-
+                # ---------------------- Hybrid local pass (one C++ banded sweep per tile) ----------------------
                 if self.hybrid:
-                    # Hybrid local correction lives on CPU and is additive/subtractive to the existing accumulator.
                     with set_parallelism(omp_threads=1, blas_threads=self.num_threads):
-                        for hb_idx, (hs, he) in enumerate(self._hyb_tgt_blocks):
-                            Lh = he - hs
-                            loc_view = hyb_local_buf[:Lh, :]
-                            loc_view.fill(0)
+                        gwldcore.phase2_compute_local_hybrid_banded_bed(
+                            bed_prefix=bed_prefix,
+                            fam_path=fam_path,
+                            block_starts=block_starts,
+                            block_ends=block_ends,
+                            row_sel=row_sel,
+                            ddof=ddof,
+                            inv_all=self.inv_sqrt_resvar_all,
+                            annot_all=self.annot,
+                            chr_code_all=self.hybrid_chr_codes,
+                            bp_all=self.hybrid_bp,
+                            window_bp=int(self.hybrid_window_bp),
+                            v_start=int(v_start),
+                            v_count=int(Vt),
+                            rand_dist=self.rand_dist,
+                            seed=self.root_seed,
+                            meansq_accum=meansq_accum,
+                            rp_scale=float(-Vt),                     # weighted the same way as meansq_chunk * Vt
+                            add_exact=bool(vt_idx == 0),            # add exact local only once
+                            exact_scale=float(self.nvecs),          # so final divide by nvecs yields + exact_local
+                            C=(self.C if self.C is not None else None),
+                            R=(self.cov_R if self.C is not None else None),
+                            N_denom=int(N_denom),
+                        )
+                    bar.update(1.0)
 
-                            if vt_idx == 0:
-                                ex_view = hyb_exact_buf[:Lh, :]
-                                ex_view.fill(0)
-                            else:
-                                ex_view = None
-
-                            src_starts = self._hyb_src_starts_by_tgt[hb_idx]
-                            src_ends = self._hyb_src_ends_by_tgt[hb_idx]
-
-                            if len(src_starts) > 0:
-                                gwldcore.phase2_compute_local_hybrid_bed(
-                                    bed_prefix=bed_prefix,
-                                    fam_path=fam_path,
-                                    tgt_start=int(hs),
-                                    tgt_end=int(he),
-                                    row_sel=row_sel,
-                                    ddof=ddof,
-                                    inv_all=self.inv_sqrt_resvar_all,
-                                    annot_all=self.annot,
-                                    chr_code_all=self._hyb_chr,
-                                    bp_all=self._hyb_bp,
-                                    src_starts=src_starts,
-                                    src_ends=src_ends,
-                                    window_bp=int(self.hybrid_window_bp),
-                                    v_start=int(v_start),
-                                    v_count=int(Vt),
-                                    rand_dist=self.rand_dist,
-                                    seed=self.root_seed,
-                                    localrp_out=loc_view,
-                                    exact_out=(ex_view if vt_idx == 0 else None),
-                                    C=(self.C if self.C is not None else None),
-                                    R=(self.cov_R if self.C is not None else None),
-                                    N_denom=int(N_denom),
-                                )
-
-                                meansq_accum[hs:he, :] -= (loc_view * Vt)
-                                if vt_idx == 0:
-                                    meansq_accum[hs:he, :] += (ex_view * self.nvecs)
-
-                            bar.update(1.0)
-
+                
                 ema_p1 = 0.85 * ema_p1 + 0.15 * max(t1_total, 1e-9)
                 ema_p2 = 0.85 * ema_p2 + 0.15 * max(t2_total, 1e-9)
                 w1 = float(ema_p1 / (ema_p1 + ema_p2))
