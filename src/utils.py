@@ -5,152 +5,94 @@ import re
 import time
 import datetime
 import glob
+from pathlib import Path
 
-# ----------------------- I/O & parsing helpers ----------------------- #
-def _read_multiple_lines(file_path, num_lines, sep=','):
-    '''
-    Processes a input file (num_lines) lines at a time
-    '''
-    values = pd.read_csv(file_path, chunksize=num_lines)
-    for val in values:
-        yield val.to_numpy()
-
-def _read_with_optional_header(file_path):
-    with open(file_path, 'r') as fd:
-        line = fd.readline().strip()
-        try:
-            vals = [float(x) for x in line.split()]
-            is_header = False
-        except ValueError:
-            is_header = True
-    if is_header:
-        header = line.split()
-        data = np.loadtxt(file_path, skiprows=1)
-        return header, data
-    else:
-        data = np.loadtxt(file_path)
-        return None, data
-
-def _find_matching_files(regex, prefix):
-    '''
-    regex file matching. returns a list of matches (with specified path prefix)
-    '''
-    pattern = re.compile(regex)
-    files = os.listdir(prefix)
-    return [prefix+file for file in files if pattern.match(file)]
-
+# ----------------------- Time helpers ----------------------- #
 def _get_time():
     current_time = time.time()
     return current_time
+
 
 def _get_timestr(current_time):
     timezone = datetime.datetime.now(datetime.timezone.utc).astimezone().tzinfo
     timestr = str(time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(current_time)))+" "+str(timezone)
     return timestr
 
-def _parse_sumdir(path):
-    '''
-    check whether the path for sumstats is a directory or a file (or even regex).
-    TODO: allow regex matching for file names
-    '''
-    if not os.path.exists(path):
-        raise ValueError(f"--h2 path '{path}' does not exist")
-    # if dir, glob for anything with “.sumstat” in the name
-    if os.path.isdir(path):
-        pattern = os.path.join(path.rstrip("/"), "*.sumstat*")
-        sum_files = sorted(glob.glob(pattern))
-        if not sum_files:
-            raise ValueError(f"--h2 path '{path}' contains no '*.sumstat*' files")
-        return sum_files
+# ----------------------- I/O & parsing helpers ----------------------- #
 
-    # if file, only accept if it has “.sumstat” in the basename
-    if os.path.isfile(path):
-        name = os.path.basename(path)
-        if ".sumstat" in name:
-            return [path]
-        else:
-            raise ValueError(f"--h2 file '{path}' is not a '*.sumstat*' file")
-    raise ValueError(f"--h2 path '{path}' is invalid")
+def _parse_column_name(df_hdr, names, default_pos):
+    cols = list(df_hdr.columns)
+    cols_lower = {c.lower(): c for c in cols}
+    for n in names:
+        if n.lower() in cols_lower:
+            return cols_lower[n.lower()]
+    if default_pos >= len(cols):
+        raise ValueError(f"Could not infer column {names}; header too short.")
+    return cols[default_pos]
 
-def _parse_rgdir(rg):
-    """
-    Parse an --rg argument string into exactly two sumstat file paths.
-    Accepts any filename containing '.sumstat' (e.g. .sumstat, .sumstat.gz, etc.)
-    """
+
+def _parse_sumdir(h2_path):
+    if h2_path is None:
+        raise ValueError("h2_path must be provided.")
+    p = Path(h2_path)
+    if p.is_dir():
+        out = sorted(
+            [str(x) for x in p.iterdir() if x.is_file() and not x.name.startswith(".")]
+        )
+        if not out:
+            raise ValueError(f"No files found in h2_path directory: {h2_path}")
+        return out
+    if p.is_file():
+        return [str(p)]
+    raise ValueError(f"Could not resolve h2_path: {h2_path}")
+
+
+def _parse_rg_pair(rg):
     if rg is None:
-        raise ValueError("--rg must be provided for genetic correlation.")
-
-    paths = rg.split(",")
-    if len(paths) != 2:
-        raise ValueError("--rg must be exactly two comma-separated '*.sumstat*' files.")
-
-    validated = []
-    for p in paths:
-        if not os.path.isfile(p):
-            raise ValueError(f"--rg path '{p}' does not exist or is not a file.")
-        if ".sumstat" not in os.path.basename(p):
-            raise ValueError(f"--rg file '{p}' is not a valid '*.sumstat*' file.")
-        validated.append(p)
-
-    return validated
-
-def _parse_column_name(df, letters, min_index=3):
-    '''
-    select only the column names that include certain letters & after certain column index
-    '''
-    matching_columns = [col for col in df.columns[min_index:] if any(letter in col for letter in letters)]
-
-    if len(matching_columns) == 0:
-        raise ValueError(f"No column containing any of the letters {letters} found starting from column {min_index}.")
-    elif len(matching_columns) > 1:
-        raise ValueError(f"Multiple columns containing the letters {letters} found: {matching_columns}. Expected only one.")
-    else:
-        return matching_columns[0]
-
-def _normalize_enrich_mode(mode: str) -> str:
-    if mode is None:
-        return "auto"
-    m = str(mode).strip().lower().replace("_", "-").replace(" ", "-")
-    if m in ("auto",):
-        return "auto"
-    if m in ("overlap", "overlapping"):
-        return "overlap"
-    if m in ("non-overlap", "nonoverlap", "nonoverlapping", "component", "components"):
-        return "non-overlap"
-    if m in ("both", "all"):
-        return "both"
-    raise ValueError(f"Invalid enrich_mode={mode!r}. Choose from: auto, overlap, non-overlap, both.")
-
-def _has_overlapping_annotations(A: np.ndarray) -> bool:
-    """
-    Returns True if any SNP has >1 nonzero annotation entry.
-    Works for binary or continuous weights. Exact-zero based.
-    """
-    # np.count_nonzero is C-optimized and avoids a big Python loop.
-    return bool(np.any(np.count_nonzero(A, axis=1) > 1))
+        raise ValueError("--rg must be provided.")
+    parts = [x.strip() for x in str(rg).split(",") if x.strip()]
+    if len(parts) != 2:
+        raise ValueError("--rg must be exactly two comma-separated sumstats paths.")
+    for p in parts:
+        if not Path(p).is_file():
+            raise ValueError(f"Could not find sumstats file: {p}")
+    return parts
 
 
-def _suggested_chisq_max(nmax: float) -> float:
-    if not np.isfinite(nmax) or nmax <= 0:
-        return 80.0
-    return float(max(80.0, 0.001 * nmax))
+def _phen_name_from_path(path: str) -> str:
+    name = os.path.basename(path)
+    for suf in (".sumstats.gz", ".sumstats", ".txt.gz", ".txt", ".tsv.gz", ".tsv", ".gz"):
+        if name.endswith(suf):
+            return name[: -len(suf)]
+    return Path(name).stem
+
+
+def _parse_verbose(verbose) -> int:
+    if isinstance(verbose, str):
+        s = verbose.strip().lower()
+        if s in ("0", "false", "none", "off"):
+            return 0
+        if s in ("1", "true", "yes", "on"):
+            return 1
+        if s == "max":
+            return 2
+        return 1
+    return 1 if bool(verbose) else 0
 
 
 def _resolve_chisq_threshold(nmax: float, raw=None):
     if raw is None:
         return None, "none"
-
     if isinstance(raw, str):
         s = raw.strip().lower()
         if s == "auto":
-            return float(_suggested_chisq_max(nmax)), "auto"
+            return float(max(80.0, 0.001 * float(nmax))), "auto"
         if s in ("none", "null"):
             return None, "none"
         try:
             return float(s), "manual"
         except Exception as e:
             raise ValueError(f"Invalid chisq_threshold string value: {raw!r}") from e
-
     try:
         return float(raw), "manual"
     except Exception as e:
@@ -160,7 +102,6 @@ def _resolve_chisq_threshold(nmax: float, raw=None):
 # -----------------------
 # Batched vectorized trace estimators
 # -----------------------
-
 
 def _calc_trace_from_ld_batch(ldsum, n, m1, m2, delta=None):
     ldsum = np.asarray(ldsum, dtype=np.float64)
@@ -525,179 +466,6 @@ def symmetrize_trace_with_jackknife(
 # Jackknife helpers
 # -----------------------
 
-
-def _calc_jackknife_se(
-    alist,
-    axis=0,
-    center="mean",
-    nan_policy="omit",
-    weights=None,
-    use_pseudovalues=False,
-):
-    """
-    Jackknife SE along axis for arrays shaped (B+1, ...), where the last slice
-    is the full-sample estimate and the first B are jackknife replicates.
-
-    - If use_pseudovalues=False OR weights is None:
-      Standard equal-weight jackknife:
-        Var = (B-1)/B * sum_b (theta_b - center)^2
-      with optional NaN omission.
-
-    - If use_pseudovalues=True AND weights provided:
-      Delete-m (unequal block sizes) via pseudovalues:
-        PV_b = (M*theta_full - (M-m_b)*theta_{-b}) / m_b
-      and variance computed using the unequal-weight delete-1 formula:
-        Var = sum_b [ w_b^2/(1-w_b) * (PV_b - PV_center)^2 ],
-      where w_b = m_b / M.
-
-    Returns
-    -------
-    est_full, se
-    """
-    a = np.asarray(alist)
-    est_full = np.take(a, indices=-1, axis=axis)
-
-    # LOO replicates = all but last along axis
-    slicer = [slice(None)] * a.ndim
-    slicer[axis] = slice(0, -1)
-    reps = a[tuple(slicer)]
-    reps = np.moveaxis(reps, axis, 0)  # (B, ...)
-    B = reps.shape[0]
-
-    if B <= 0:
-        return est_full, np.full_like(est_full, np.nan, dtype=np.float64)
-
-    # ----------------------------
-    # Branch 1: legacy equal-weight jackknife
-    # ----------------------------
-    if (not use_pseudovalues) or (weights is None):
-        if center == "full":
-            center_arr = est_full
-        elif center == "mean":
-            center_arr = np.nanmean(reps, axis=0) if nan_policy == "omit" else np.mean(reps, axis=0)
-        elif center == "median":
-            center_arr = np.nanmedian(reps, axis=0) if nan_policy == "omit" else np.median(reps, axis=0)
-        else:
-            raise ValueError("center must be one of {'full','mean','median'}")
-
-        diffs = np.asarray(reps, dtype=np.float64) - np.asarray(center_arr, dtype=np.float64)
-
-        if nan_policy == "omit":
-            finite = np.isfinite(diffs)
-            m_eff = finite.sum(axis=0).astype(np.float64)  # per-coordinate effective replicate count
-            diffs = np.where(finite, diffs, 0.0)
-            ss = np.sum(diffs * diffs, axis=0)
-            with np.errstate(divide="ignore", invalid="ignore"):
-                var = (np.maximum(m_eff - 1.0, 0.0) / np.maximum(m_eff, 1.0)) * ss
-            se = np.sqrt(var)
-            se = np.where(m_eff >= 1.0, se, np.nan)
-        else:
-            # propagate
-            ss = np.sum(diffs * diffs, axis=0)
-            var = ((B - 1.0) / B) * ss
-            se = np.sqrt(var)
-
-        return est_full, np.asarray(se, dtype=np.float64).reshape(est_full.shape)
-
-    # ----------------------------
-    # Branch 2: weighted delete-m via pseudovalues (delete-1 partition scheme)
-    # ----------------------------
-    m = np.asarray(weights, dtype=np.float64).ravel()
-    if m.size != B:
-        raise ValueError(f"weights must have length B={B}, got {m.size}")
-
-    good = np.isfinite(m) & (m > 0.0)
-    if not np.any(good):
-        return est_full, np.full_like(est_full, np.nan, dtype=np.float64)
-
-    reps = np.asarray(reps, dtype=np.float64)[good, ...]
-    m = m[good]
-    B2 = reps.shape[0]
-    M = float(np.sum(m))
-
-    if B2 <= 0 or (not np.isfinite(M)) or M <= 0.0:
-        return est_full, np.full_like(est_full, np.nan, dtype=np.float64)
-
-    w = (m / M).astype(np.float64)  # (B2,)
-
-    # avoid pathological w==1
-    goodw = np.isfinite(w) & (w > 0.0) & (w < 1.0)
-    if not np.any(goodw):
-        return est_full, np.full_like(est_full, np.nan, dtype=np.float64)
-
-    reps = reps[goodw, ...]
-    m = m[goodw]
-    w = w[goodw]
-    B2 = reps.shape[0]
-
-    # Broadcast shapes
-    reshape = (B2,) + (1,) * (reps.ndim - 1)
-    m_b = m.reshape(reshape)
-    w_b = w.reshape(reshape)
-
-    # Pseudovalues
-    est_full_f = np.asarray(est_full, dtype=np.float64)
-    PV = (M * est_full_f - (M - m_b) * reps) / m_b  # (B2, ...)
-
-    # Center on PV scale
-    if center == "full":
-        center_arr = est_full_f
-    elif center == "median":
-        center_arr = np.nanmedian(PV, axis=0) if nan_policy == "omit" else np.median(PV, axis=0)
-    elif center == "mean":
-        if nan_policy == "propagate":
-            if not np.isfinite(PV).all():
-                return est_full, np.full_like(est_full, np.nan, dtype=np.float64)
-            center_arr = np.sum(w_b * PV, axis=0)  # weights sum to 1
-        else:
-            finite = np.isfinite(PV)
-            w_eff = w_b * finite
-            sw = np.sum(w_eff, axis=0)
-            with np.errstate(divide="ignore", invalid="ignore"):
-                w_norm = np.where(sw > 0, w_eff / sw, 0.0)
-            center_arr = np.sum(w_norm * PV, axis=0)
-    else:
-        raise ValueError("center must be one of {'full','mean','median'}")
-
-    diffs = PV - center_arr
-
-    # Var = Σ w^2/(1-w) * diffs^2 (delete-1 unequal-size)
-    if nan_policy == "propagate":
-        if not np.isfinite(diffs).all():
-            return est_full, np.full_like(est_full, np.nan, dtype=np.float64)
-        denom = 1.0 - w_b
-        with np.errstate(divide="ignore", invalid="ignore"):
-            term = (w_b * w_b / denom) * (diffs * diffs)
-        var = np.sum(term, axis=0)
-        var = np.where(np.isfinite(var), var, np.nan)
-        se = np.sqrt(var)
-        return est_full, np.asarray(se, dtype=np.float64).reshape(est_full.shape)
-
-    # omit NaNs per-coordinate
-    finite = np.isfinite(diffs)
-    w_eff = w_b * finite
-    sw = np.sum(w_eff, axis=0)
-    with np.errstate(divide="ignore", invalid="ignore"):
-        w_norm = np.where(sw > 0, w_eff / sw, 0.0)
-
-    denom = 1.0 - w_norm
-
-    # effective dof guard
-    w2 = np.sum(w_norm * w_norm, axis=0)
-    with np.errstate(divide="ignore", invalid="ignore"):
-        n_eff = np.where(w2 > 0, 1.0 / w2, 0.0)
-
-    with np.errstate(divide="ignore", invalid="ignore"):
-        term = (w_norm * w_norm / denom) * (diffs * diffs)
-    term = np.where(np.isfinite(term), term, 0.0)
-
-    var = np.sum(term, axis=0)
-    var = np.where((sw > 0) & (n_eff > 1.0) & np.isfinite(var), var, np.nan)
-    se = np.sqrt(var)
-
-    return est_full, np.asarray(se, dtype=np.float64).reshape(est_full.shape)
-
-
 def _calc_jackknife_se_from_delete_sets(
     alist,
     D,
@@ -989,425 +757,3 @@ def _calc_jackknife_se_from_delete_sets(
 
     return est_full, se_flat.reshape(est_full.shape)
 
-
-# -----------------------
-# rg helpers
-# -----------------------
-
-
-def _solve_linear_equation(X, y, method="auto"):
-    """
-    Solve A x = b.
-
-    Supports batched solves:
-      X shape: (..., p, p)
-      y shape: (..., p) or (..., p, k)
-
-    For SPD matrices, Cholesky is fastest and most stable.
-    """
-    X = np.asarray(X)
-    y = np.asarray(y)
-
-    if method == "lstsq":
-        # Keep original behavior if explicitly requested
-        return np.linalg.lstsq(X, y, rcond=None)[0]
-
-    # Try Cholesky (fast path)
-    try:
-        L = np.linalg.cholesky(X)  # (..., p, p)
-
-        # forward solve L z = y
-        z = np.linalg.solve(L, y[..., None]).squeeze(-1)  # (..., p) or (..., p, k)
-
-        # backward solve L.T x = z
-        x = np.linalg.solve(np.swapaxes(L, -1, -2), z[..., None]).squeeze(-1)
-        return x
-
-    except np.linalg.LinAlgError:
-        # Fall back to generic solver (still batched)
-        return np.linalg.solve(X, y)
-
-
-def bivariate_regression_partitioned_jn(
-    l2_bins,
-    y,
-    nblks,
-    n1,
-    n2,
-    nsnps_blk,
-    blk_idx=None,
-    weight_floor=None,
-    weight_cap_quantile=None,
-    chisq1=None,
-    chisq2=None,
-    chisq_threshold=None,
-    chisq_mode="either",  # "either" (default), "both", "max"
-):
-    """
-    Leave-one-block-out WLS regression of y = z1*z2 on partitioned LD scores + intercept.
-
-    If chisq_threshold is not None, we *temporarily* exclude SNPs with large chi^2
-    (typically > 30) from THIS regression only by setting their weights to 0.
-    This keeps the full SNP indexing and jackknife block structure unchanged.
-
-    Recommended setting (LDSC-style for rg intercept step):
-        chisq_mode="either", chisq_threshold=30, chisq1=z1^2, chisq2=z2^2
-    """
-    L = np.asarray(l2_bins, dtype=np.float64, order="C")
-    y = np.asarray(y, dtype=np.float64).ravel()
-    nsnps_blk = np.asarray(nsnps_blk, dtype=np.float64)
-
-    if L.ndim != 2:
-        raise ValueError("l2_bins must be 2-D (M, K)")
-
-    M, K = L.shape
-    if y.size != M:
-        raise ValueError(f"y must have shape (M,), got {y.shape}, expected M={M}")
-
-    nblks = int(nblks)
-    if nblks <= 0:
-        raise ValueError("nblks must be positive")
-
-    if nsnps_blk.shape != (nblks + 1, K):
-        raise ValueError(f"nsnps_blk must be (nblks+1, K)=({nblks+1},{K}), got {nsnps_blk.shape}")
-
-    n1 = float(n1)
-    n2 = float(n2)
-    if not (np.isfinite(n1) and np.isfinite(n2) and n1 > 0 and n2 > 0):
-        raise ValueError("n1 and n2 must be positive finite")
-
-    sN = np.sqrt(n1 * n2)
-
-    # ----------------------------
-    # block index
-    # ----------------------------
-    if blk_idx is None:
-        blk_size = M // nblks
-        if blk_size == 0:
-            raise ValueError("Too many jackknife blocks (nblks > M).")
-
-        blk_idx = np.repeat(np.arange(nblks, dtype=np.int64), blk_size)
-        if blk_idx.size < M:
-            blk_idx = np.concatenate(
-                [blk_idx, np.full(M - blk_idx.size, nblks - 1, dtype=np.int64)]
-            )
-    else:
-        blk_idx = np.asarray(blk_idx, dtype=np.int64).ravel()
-        if blk_idx.size != M:
-            raise ValueError(f"blk_idx must have length M={M}, got {blk_idx.size}")
-        if blk_idx.min() < 0 or blk_idx.max() >= nblks:
-            raise ValueError(f"blk_idx values must be in [0, nblks-1]=[0,{nblks-1}]")
-
-    # Derive contiguous block bounds once (assumes piecewise-constant blk_idx)
-    change = np.flatnonzero(blk_idx[1:] != blk_idx[:-1]) + 1
-    starts = np.concatenate(([0], change))
-    ends = np.concatenate((change, [M]))
-    run_blk = blk_idx[starts]
-
-    blk_starts = np.zeros(nblks, dtype=np.int64)
-    blk_ends = np.zeros(nblks, dtype=np.int64)
-    for r, b in enumerate(run_blk):
-        blk_starts[int(b)] = int(starts[r])
-        blk_ends[int(b)] = int(ends[r])
-
-    # ----------------------------
-    # chisq-based keep mask for intercept regression
-    # ----------------------------
-    keep = np.ones(M, dtype=bool)
-    if chisq_threshold is not None:
-        thr = float(chisq_threshold)
-        if not (np.isfinite(thr) and thr > 0):
-            raise ValueError("chisq_threshold must be positive finite")
-        if chisq1 is None or chisq2 is None:
-            raise ValueError("chisq1 and chisq2 must be provided when chisq_threshold is set")
-
-        c1 = np.asarray(chisq1, dtype=np.float64).ravel()
-        c2 = np.asarray(chisq2, dtype=np.float64).ravel()
-        if c1.size != M or c2.size != M:
-            raise ValueError(f"chisq1/chisq2 must have length M={M}")
-
-        # require finite chisq for kept SNPs
-        finite = np.isfinite(c1) & np.isfinite(c2)
-        keep &= finite
-
-        mode = str(chisq_mode).lower()
-        if mode == "either":
-            keep &= (c1 <= thr) & (c2 <= thr)  # drop if either > thr
-        elif mode == "both":
-            keep &= ~((c1 > thr) & (c2 > thr))  # drop only if both > thr
-        elif mode == "max":
-            keep &= (np.maximum(c1, c2) <= thr)
-        else:
-            raise ValueError("chisq_mode must be one of {'either','both','max'}")
-
-    # ----------------------------
-    # base weights w = 1 / sum_k l2_{j,k}, with optional floor/cap
-    # and then set w=0 for excluded SNPs.
-    # ----------------------------
-    ltot = L.sum(axis=1)
-
-    if weight_floor is None:
-        bad = keep & ((~np.isfinite(ltot)) | (ltot <= 0.0))
-        if np.any(bad):
-            nb = int(bad.sum())
-            mn = float(np.nanmin(ltot))
-            idx_bad = np.flatnonzero(bad)[:10]
-            raise ValueError(
-                "Total LD (ltot) must be finite and > 0 for weights w=1/ltot on KEPT SNPs.\n"
-                f"Found {nb}/{M} kept SNPs with ltot <= 0 or non-finite (min={mn}).\n"
-                "Pass weight_floor to clamp.\n"
-                f"First bad kept indices: {idx_bad.tolist()}"
-            )
-
-        # for dropped SNPs, ltot value doesn't matter (we'll set w=0); keep it safe anyway
-        ltot_safe = np.where(keep, ltot, 1.0)
-    else:
-        eps = float(weight_floor)
-        if not (np.isfinite(eps) and eps > 0):
-            raise ValueError("weight_floor must be positive finite")
-
-        ltot_safe = np.where(np.isfinite(ltot), ltot, eps)
-        ltot_safe = np.maximum(ltot_safe, eps)
-        ltot_safe = np.where(keep, ltot_safe, 1.0)
-
-    w = 1.0 / ltot_safe
-    w[~keep] = 0.0
-
-    # Optional cap (apply only to positive weights, otherwise zeros distort quantile)
-    if weight_cap_quantile is not None:
-        q = float(weight_cap_quantile)
-        if not (0.0 < q < 1.0):
-            raise ValueError("weight_cap_quantile must be in (0,1)")
-
-        wpos = w[w > 0]
-        if wpos.size > 0:
-            cap = float(np.quantile(wpos, q))
-            if np.isfinite(cap) and cap > 0:
-                w = np.minimum(w, cap)
-
-    # Sanity: need enough kept weight mass to fit (K+1) params
-    if w.sum() <= 0:
-        raise ValueError(
-            "After chisq filtering + weighting, no SNPs remain for intercept regression (sum(w)=0)."
-        )
-
-    # not a strict requirement, but helps catch pathological filtering
-    if int((w > 0).sum()) < (K + 5):
-        raise ValueError(
-            f"Too few SNPs after chisq filtering for stable regression: kept={(w > 0).sum()} < K+5={K+5}. "
-            "Relax chisq_threshold or check inputs."
-        )
-
-    wy = w * y
-
-    # ----------------------------
-    # total normal equations (p = K+1)
-    # ----------------------------
-    S00_tot = float(w.sum())
-    S0_tot = L.T @ w
-    LW = L * w[:, None]
-    SLL_tot = LW.T @ L
-    S0y_tot = float(wy.sum())
-    SLy_tot = L.T @ wy
-
-    p = K + 1
-    SXX_tot = np.empty((p, p), dtype=np.float64)
-    SXY_tot = np.empty((p,), dtype=np.float64)
-
-    SXX_tot[0, 0] = S00_tot
-    SXX_tot[0, 1:] = S0_tot
-    SXX_tot[1:, 0] = S0_tot
-    SXX_tot[1:, 1:] = SLL_tot
-
-    SXY_tot[0] = S0y_tot
-    SXY_tot[1:] = SLy_tot
-
-    # ----------------------------
-    # per-block contributions
-    # ----------------------------
-    SXX_blk = np.zeros((nblks, p, p), dtype=np.float64)
-    SXY_blk = np.zeros((nblks, p), dtype=np.float64)
-
-    for b in range(nblks):
-        s = int(blk_starts[b])
-        e = int(blk_ends[b])
-        if e <= s:
-            continue
-
-        Lb = L[s:e, :]
-        wb = w[s:e]
-        if wb.sum() <= 0:
-            continue
-
-        wyb = wy[s:e]
-
-        S00 = float(wb.sum())
-        S0 = Lb.T @ wb
-        SLy = Lb.T @ wyb
-        S0y = float(wyb.sum())
-        SLL = (Lb * wb[:, None]).T @ Lb
-
-        Sb = SXX_blk[b]
-        Sb[0, 0] = S00
-        Sb[0, 1:] = S0
-        Sb[1:, 0] = S0
-        Sb[1:, 1:] = SLL
-
-        tb = SXY_blk[b]
-        tb[0] = S0y
-        tb[1:] = SLy
-
-    # LOO systems
-    SXX = SXX_tot[None, :, :] - SXX_blk  # (B, p, p)
-    SXY = SXY_tot[None, :] - SXY_blk     # (B, p)
-
-    # Some LOO replicates could end up with (almost) no weight if the dropped SNPs cluster.
-    # Solve only the valid ones; others -> NaN.
-    beta_j = np.full((nblks, p), np.nan, dtype=np.float64)
-    valid = SXX[:, 0, 0] > 0  # intercept weight mass in LOO replicate
-
-    if np.any(valid):
-        Sv = SXX[valid]
-        tv = SXY[valid]
-        try:
-            beta_j[valid] = np.linalg.solve(Sv, tv[..., None])[..., 0]
-        except np.linalg.LinAlgError:
-            # per-replicate fallback
-            for ii, b in enumerate(np.flatnonzero(valid)):
-                try:
-                    beta_j[b] = np.linalg.solve(SXX[b], SXY[b])
-                except np.linalg.LinAlgError:
-                    beta_j[b] = np.linalg.lstsq(SXX[b], SXY[b], rcond=None)[0]
-
-    # Full solve
-    try:
-        beta_full = np.linalg.solve(SXX_tot, SXY_tot)
-    except np.linalg.LinAlgError:
-        beta_full = np.linalg.lstsq(SXX_tot, SXY_tot, rcond=None)[0]
-
-    beta_all = np.vstack([beta_j, beta_full[None, :]])  # (B+1, p)
-
-    # Scale slopes -> gamma
-    scale = nsnps_blk / sN  # (B+1, K)
-    gamma_all = scale * beta_all[:, 1:]  # (B+1, K)
-    c_all = beta_all[:, 0]               # (B+1,)
-
-    return gamma_all, c_all
-
-
-def compute_t1_all_jn(annot, y, blk_idx, nblks):
-    """
-    Same math as before, but robust if a block appears in multiple segments:
-
-      T1_full   = A^T y
-      T1_blk[b] = sum over all segments belonging to block b of (A_seg^T y_seg)
-      T1_LOO    = full - blk
-    """
-    A = np.asarray(annot, dtype=np.float64, order="C")
-    y = np.asarray(y, dtype=np.float64).ravel()
-    blk_idx = np.asarray(blk_idx, dtype=np.int64).ravel()
-
-    if A.ndim != 2:
-        raise ValueError("annot must be 2D (M,K)")
-
-    M, K = A.shape
-    if y.size != M:
-        raise ValueError("y length mismatch with annot")
-    if blk_idx.size != M:
-        raise ValueError("blk_idx length mismatch with annot")
-
-    nblks = int(nblks)
-    if blk_idx.min(initial=0) < 0 or blk_idx.max(initial=0) >= nblks:
-        raise ValueError(f"blk_idx values must be in [0, nblks-1]=[0,{nblks-1}]")
-
-    T1_full = A.T @ y  # (K,)
-
-    # segments
-    change = np.flatnonzero(blk_idx[1:] != blk_idx[:-1]) + 1
-    starts = np.concatenate(([0], change))
-    ends = np.concatenate((change, [M]))
-    seg_blk = blk_idx[starts]
-
-    T1_blk = np.zeros((nblks, K), dtype=np.float64)
-    for r in range(starts.size):
-        b = int(seg_blk[r])
-        s = int(starts[r])
-        e = int(ends[r])
-        if e <= s:
-            continue
-        T1_blk[b] += A[s:e, :].T @ y[s:e]
-
-    T1_all = np.empty((nblks + 1, K), dtype=np.float64)
-    T1_all[:nblks] = T1_full[None, :] - T1_blk
-    T1_all[nblks] = T1_full
-    return T1_all
-
-
-def solve_score_gamma_from_intercept_jn(
-    ld_sum_all,
-    t1_all,
-    nsnps_blk,
-    c_all,
-    n1,
-    n2,
-    ridge_rel=0,
-):
-    ld_sum_all = np.asarray(ld_sum_all, dtype=np.float64)
-    t1_all = np.asarray(t1_all, dtype=np.float64)
-    nsnps_blk = np.asarray(nsnps_blk, dtype=np.float64)
-    c_all = np.asarray(c_all, dtype=np.float64).ravel()
-
-    Bp1, K, K2 = ld_sum_all.shape
-    if K2 != K:
-        raise ValueError("ld_sum_all must be (B+1, K, K)")
-    if t1_all.shape != (Bp1, K):
-        raise ValueError("t1_all must be (B+1, K)")
-    if nsnps_blk.shape != (Bp1, K):
-        raise ValueError("nsnps_blk must be (B+1, K)")
-    if c_all.size != Bp1:
-        raise ValueError("c_all must be (B+1,)")
-
-    sN = np.sqrt(float(n1) * float(n2))
-    I = np.eye(K, dtype=np.float64)
-
-    # rhs_all: (B+1, K)
-    rhs_all = (t1_all - nsnps_blk * c_all[:, None]) / sN
-
-    # If any empty/invalid bins exist, do the safe slow loop (preserves semantics).
-    badM = ~(np.isfinite(nsnps_blk) & (nsnps_blk > 0))
-    if np.any(badM):
-        gamma_all = np.full((Bp1, K), np.nan, dtype=np.float64)
-        for b in range(Bp1):
-            Mvec = nsnps_blk[b]
-            good = ~badM[b]
-            if not np.any(good):
-                continue
-
-            A = ld_sum_all[b][np.ix_(good, good)]
-            rhs = rhs_all[b][good]
-
-            tr = float(np.trace(A))
-            lam = ridge_rel * (tr / A.shape[0] if np.isfinite(tr) and tr != 0.0 else 1.0)
-            A_reg = A + lam * np.eye(A.shape[0], dtype=np.float64)
-
-            try:
-                g = np.linalg.solve(A_reg, rhs)
-            except np.linalg.LinAlgError:
-                g = np.linalg.lstsq(A_reg, rhs, rcond=None)[0]
-
-            out = np.full(K, np.nan, dtype=np.float64)
-            out[good] = Mvec[good] * g
-            gamma_all[b] = out
-
-        return gamma_all
-
-    # ---- fast stacked solve (no empty bins) ----
-    tr = np.trace(ld_sum_all, axis1=1, axis2=2)  # (B+1,)
-    tr_eff = np.where(np.isfinite(tr) & (tr != 0.0), tr / K, 1.0)
-    lam = ridge_rel * tr_eff  # (B+1,)
-
-    A_reg = ld_sum_all + lam[:, None, None] * I[None, :, :]  # (B+1,K,K)
-    g_all = np.linalg.solve(A_reg, rhs_all[..., None])[..., 0]  # (B+1,K)
-    gamma_all = nsnps_blk * g_all  # (B+1,K)
-
-    return gamma_all

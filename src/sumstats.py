@@ -1,798 +1,369 @@
-'''
-Read the phenotype-specific summary statistics (generally PLINK)
-The standard LDSC summary statistics format (.sumstat) works.
-Format should be:
-    SNPID, NMISS (or OBS_CT), Z
-'''
-import utils
+from __future__ import annotations
+
+from dataclasses import dataclass
 
 import numpy as np
 import pandas as pd
-from os import listdir
-import sys
+import utils
+
 
 _CHI2_MEDIAN_1DF = 0.454936423119572
 
-class Sumstats:
-    def __init__(
-        self,
-        nblks=100,
-        chisq_threshold=0,
-        chisq_action='drop',
-        log=None,
-        both_side=False,
-        annot_df=None,
-        nbins=1,
-        jackknife_mode: str = "block",
-        jackknife_chrs=None,             # (U,) chromosome labels for chr-mode
-        jackknife_delete: int = 1,       # d
-        jackknife_delete_sets=None,      # (R,d) unit indices for chr-mode
-        jackknife_seed: int | None = None,
-    ):
-
-        self.log = log
-        self.nblks = int(nblks)   # replicate count R in chr-mode
-        self.nbins = int(nbins)
-
-        jm = str(jackknife_mode).strip().lower()
-        if jm in ("block", "chunk", "contig"):
-            self.jackknife_mode = "block"
-        elif jm in ("chr", "chrom", "chromosome", "loco"):
-            self.jackknife_mode = "chr"
-        else:
-            raise ValueError(f"Invalid jackknife_mode={jackknife_mode!r}")
-
-        self.jackknife_delete = int(jackknife_delete)
-        self.jackknife_chrs = None if jackknife_chrs is None else np.asarray(jackknife_chrs, dtype=np.int32)
-        self.jackknife_units = int(self.jackknife_chrs.size) if (self.jackknife_chrs is not None) else 0
-
-        self.jackknife_delete_sets = None
-        self._rep_del_mat = None
-        if self.jackknife_mode == "chr":
-            if self.jackknife_chrs is None:
-                raise ValueError("chr-mode requires jackknife_chrs.")
-            if jackknife_delete_sets is None:
-                raise ValueError("chr-mode requires jackknife_delete_sets.")
-            ds = np.asarray(jackknife_delete_sets, dtype=np.int16)
-            if ds.ndim != 2 or ds.shape[0] != self.nblks:
-                raise ValueError(f"jackknife_delete_sets must be (R,d) with R=nblks={self.nblks}. Got {ds.shape}.")
-            if ds.shape[1] != self.jackknife_delete:
-                raise ValueError(f"delete_sets d mismatch: expected {self.jackknife_delete}, got {ds.shape[1]}.")
-            if ds.min() < 0 or ds.max() >= self.jackknife_units:
-                raise ValueError("delete_sets contain out-of-range unit indices.")
-            self.jackknife_delete_sets = ds
-
-            # build deletion incidence matrix D: (R,U)
-            R = int(self.nblks)
-            U = int(self.jackknife_units)
-            D = np.zeros((R, U), dtype=np.float32)
-            rr = np.arange(R, dtype=np.int64)[:, None]
-            D[rr, ds.astype(np.int64)] = 1.0
-            self._rep_del_mat = D
-
-        self.annot_df = annot_df
-        self.snpids = len(annot_df) if annot_df is not None else 0
-
-        self.annot = None
-        self.zscores = None
-        self.rhs = None
-        self.nsamp = 0
-        self.nsnps = 0
-
-        # per-unit sufficient stats (chr-mode)
-        self._Ak_unit = None   # (U,K)
-        self._Az2_unit = None  # (U,K)
-
-        self.nsnps_blk = None
-        self.nsnps_bin = None
-
-        self.chisq_threshold = chisq_threshold
-        self.matched_snps = None
-        self.name = None
-        self.removesnps = []
-
-        self._ann_cols = None
-        self._annot_snps = None
-        self._annot_ann = None
-        self._annot_chr = None
-        self._annot_has_dups = False
-
-        self._sum_snps = None
-        self._sum_z = None
-        self._sum_a1 = None
-        self._sum_a2 = None
-        self._sum_index = None
-        self._sum_has_dups = False
-
-        self._chisq_applied = False
-        self._chisq_filter_removed = 0
-        self._chisq_action = chisq_action
-
-        self._chisq_diag_read = None
-        self._chisq_diag_used = None
-        self._chisq_top_read = None
-        self._chisq_top_used = None
-
-        if annot_df is not None:
-            self._set_annot_df(annot_df)
+def _chisq_summary(chisq: np.ndarray) -> dict:
+    chisq = np.asarray(chisq, dtype=np.float64)
+    finite = np.isfinite(chisq)
+    x = chisq[finite]
+    out = {
+        "M": int(chisq.size),
+        "M_finite": int(x.size),
+        "M_nonfinite": int(chisq.size - x.size),
+    }
+    if x.size == 0:
+        return out
+    out["mean"] = float(np.mean(x))
+    out["median"] = float(np.median(x))
+    out["max"] = float(np.max(x))
+    out["lambda_gc"] = float(out["median"] / _CHI2_MEDIAN_1DF)
+    for q in [90, 95, 99, 99.9, 99.99, 99.999]:
+        out[f"p{q}"] = float(np.percentile(x, q))
+    return out
 
 
-    def _set_annot_df(self, annot_df):
-        """Cache annotation SNP order + annotation matrix for fast rematching."""
-        self.annot_df = annot_df
+def _top_chisq_rows(snps, a1, a2, chisq, topk: int = 10):
+    if topk <= 0:
+        return []
+    chisq = np.asarray(chisq, dtype=np.float64)
+    finite = np.isfinite(chisq)
+    if not finite.any():
+        return []
+    idx = np.where(finite)[0]
+    x = chisq[finite]
+    k = min(topk, x.size)
+    part = np.argpartition(-x, kth=k - 1)[:k]
+    best = part[np.argsort(-x[part])]
+    rows = []
+    for t in best:
+        j = int(idx[t])
+        rows.append((str(snps[j]), str(a1[j]), str(a2[j]), float(chisq[j])))
+    return rows
 
-        meta = {"SNP", "CHR", "BP", "CM"}
-        # Only treat true annotation bins as columns; ignore metadata
-        self._ann_cols = [c for c in annot_df.columns if (c not in meta)]
 
-        if "SNP" not in annot_df.columns:
-            raise ValueError("annot_df must contain 'SNP' column.")
+@dataclass(frozen=True)
+class MatchedSumstats:
+    snps: np.ndarray
+    z: np.ndarray
+    chi2: np.ndarray
+    a1: np.ndarray
+    a2: np.ndarray
+    nsamp: float
+    name: str
+    used_summary: dict | None = None
+    used_top: list | None = None
+    clip_count: int = 0
+    clip_threshold: float | None = None
 
-        # ensure bins match nbins
-        if len(self._ann_cols) != int(self.nbins):
+    @property
+    def nsnps(self) -> int:
+        return int(self.snps.size)
+
+    def subset(self, keep_mask) -> "MatchedSumstats":
+        keep_mask = np.asarray(keep_mask, dtype=bool)
+        if keep_mask.ndim != 1 or keep_mask.size != self.nsnps:
             raise ValueError(
-                f"Annotation column count mismatch: nbins={self.nbins} but found {len(self._ann_cols)} "
-                f"non-meta columns in annot_df."
+                f"keep_mask must be length {self.nsnps}; got {keep_mask.shape}."
             )
+        return MatchedSumstats(
+            snps=self.snps[keep_mask],
+            z=self.z[keep_mask],
+            chi2=self.chi2[keep_mask],
+            a1=self.a1[keep_mask],
+            a2=self.a2[keep_mask],
+            nsamp=self.nsamp,
+            name=self.name,
+            used_summary=self.used_summary,
+            used_top=self.used_top,
+            clip_count=self.clip_count,
+            clip_threshold=self.clip_threshold,
+        )
 
-        self._annot_snps = annot_df['SNP'].astype(str).to_numpy()
-        self._annot_ann = annot_df[self._ann_cols].to_numpy(dtype=np.float64, copy=False)
 
-        # optional chr cache for LOCO
-        self._annot_chr = None
-        if "CHR" in annot_df.columns:
-            self._annot_chr = annot_df["CHR"].to_numpy(dtype=np.int32, copy=False)
+@dataclass(frozen=True)
+class AlignedSumstats:
+    trace: object
+    sumstats: "Sumstats"
+    pos_on_trace: np.ndarray    # len(trace.snps), -1 if absent
 
-        if not np.isfinite(self._annot_ann).all():
-            bad = np.flatnonzero(~np.isfinite(self._annot_ann).any(axis=1))[:10]
-            raise ValueError(
-                "Annotation contains non-finite values (NaN/inf). "
-                f"First bad row indices (in annot_df order): {bad.tolist()}"
-            )
+    def matched_mask(self) -> np.ndarray:
+        return self.pos_on_trace >= 0
 
-        self._annot_has_dups = pd.Index(self._annot_snps).has_duplicates
+    def keep_mask(self, *, chisq_threshold=None, chisq_action="drop") -> np.ndarray:
+        mask = self.matched_mask()
+        action = str(chisq_action).strip().lower()
+        if action not in ("drop", "clip", "warn", "none"):
+            raise ValueError(f"Invalid chisq_action={chisq_action!r}")
 
-    def _chisq_summary(self, chisq: np.ndarray) -> dict:
-        chisq = np.asarray(chisq, dtype=np.float64)
-        finite = np.isfinite(chisq)
-        x = chisq[finite]
-        out = {
-            "M": int(chisq.size),
-            "M_finite": int(x.size),
-            "M_nonfinite": int(chisq.size - x.size),
-        }
-        if x.size == 0:
-            return out
+        thr, _ = utils._resolve_chisq_threshold(self.sumstats.nsamp, chisq_threshold)
+        if action != "drop" or thr is None or (not np.isfinite(float(thr))) or float(thr) <= 0.0:
+            return mask
 
-        out["mean"] = float(np.mean(x))
-        out["median"] = float(np.median(x))
-        out["max"] = float(np.max(x))
-        out["lambda_gc"] = float(out["median"] / _CHI2_MEDIAN_1DF)
-
-        for q in [90, 95, 99, 99.9, 99.99, 99.999]:
-            out[f"p{q}"] = float(np.percentile(x, q))
-
+        thr = float(thr)
+        out = mask.copy()
+        pos = self.pos_on_trace[mask]
+        out[mask] = np.isfinite(self.sumstats.chi2[pos]) & (self.sumstats.chi2[pos] <= thr)
         return out
 
+    def materialize(self, keep_mask, *, chisq_threshold=None, chisq_action="drop") -> MatchedSumstats:
+        keep_mask = np.asarray(keep_mask, dtype=bool)
+        if keep_mask.ndim != 1 or keep_mask.size != self.trace.nsnps:
+            raise ValueError(
+                f"keep_mask must be length {self.trace.nsnps}; got {keep_mask.shape}."
+            )
 
-    def _top_chisq_rows(self, snps, a1, a2, chisq, topk: int = 10):
-        """Return [(SNP, A1, A2, chi2), ...] for the largest chi2 values."""
-        if topk <= 0:
-            return []
-        chisq = np.asarray(chisq, dtype=np.float64)
-        finite = np.isfinite(chisq)
-        if not finite.any():
-            return []
+        action = str(chisq_action).strip().lower()
+        if action not in ("drop", "clip", "warn", "none"):
+            raise ValueError(f"Invalid chisq_action={chisq_action!r}")
 
-        idx = np.where(finite)[0]
-        x = chisq[finite]
-        k = min(topk, x.size)
+        allowed = self.keep_mask(chisq_threshold=chisq_threshold, chisq_action=chisq_action)
+        if np.any(keep_mask & ~allowed):
+            bad = int(np.sum(keep_mask & ~allowed))
+            raise ValueError(
+                f"keep_mask contains {bad} SNPs that are unavailable under the requested "
+                f"chi^2 policy ({action})."
+            )
 
-        part = np.argpartition(-x, kth=k - 1)[:k]
-        best = part[np.argsort(-x[part])]
+        pos = self.pos_on_trace[keep_mask]
+        snps = self.trace.snps[keep_mask]
+        z = self.sumstats.z[pos].astype(np.float64, copy=False)
+        chi2 = self.sumstats.chi2[pos].astype(np.float64, copy=True)
+        a1 = self.sumstats.a1[pos]
+        a2 = self.sumstats.a2[pos]
 
-        rows = []
-        for t in best:
-            j = int(idx[t])
-            rows.append((str(snps[j]), str(a1[j]), str(a2[j]), float(chisq[j])))
-        return rows
+        thr, _ = utils._resolve_chisq_threshold(self.sumstats.nsamp, chisq_threshold)
+        clip_count = 0
+        clip_threshold = None
+        if action == "clip" and thr is not None and np.isfinite(float(thr)) and float(thr) > 0.0:
+            thr = float(thr)
+            clip_threshold = thr
+            clip_mask = np.isfinite(chi2) & (chi2 > thr)
+            clip_count = int(np.sum(clip_mask))
+            if clip_count > 0:
+                np.minimum(chi2, thr, out=chi2)
+
+        used_summary = _chisq_summary(chi2)
+        used_top = _top_chisq_rows(snps, a1, a2, chi2, topk=10)
+
+        return MatchedSumstats(
+            snps=snps,
+            z=z,
+            chi2=chi2,
+            a1=a1,
+            a2=a2,
+            nsamp=float(self.sumstats.nsamp),
+            name=self.sumstats.name,
+            used_summary=used_summary,
+            used_top=used_top,
+            clip_count=clip_count,
+            clip_threshold=clip_threshold,
+        )
 
 
-    def _compute_chisq_diag(self, z, snps, a1, a2, nmax: float, topk: int = 10) -> tuple[dict, list]:
-        z = np.asarray(z, dtype=np.float64)
-        chisq = z * z
-        summ = self._chisq_summary(chisq)
+class Sumstats:
+    """
+    Immutable phenotype-level summary statistics after intrinsic QC.
 
-        thr = utils._suggested_chisq_max(float(nmax))
-        finite = np.isfinite(chisq)
-        n_hi = int(np.sum(chisq[finite] > thr))
-        frac_hi = float(n_hi / max(int(np.sum(finite)), 1))
+    Read-time QC only:
+      - parse SNP / Z / N / A1 / A2
+      - drop non-finite N or Z
+      - rescale Z by sqrt(N / Nmax)
+      - deduplicate SNP IDs
 
-        summ["suggested_chisq_max"] = float(thr)
-        summ["n_gt_suggested"] = int(n_hi)
-        summ["frac_gt_suggested"] = float(frac_hi)
+    No trace-specific matching or chi^2 thresholding happens here.
+    """
 
-        top = self._top_chisq_rows(snps, a1, a2, chisq, topk=topk)
-        return summ, top
+    def __init__(
+        self,
+        *,
+        snps,
+        z,
+        nsamp,
+        a1,
+        a2,
+        name,
+        log=None,
+        removed_snps=None,
+        read_summary=None,
+        read_top=None,
+    ):
+        self.snps = np.asarray(snps, dtype=str)
+        self.z = np.asarray(z, dtype=np.float64)
+        self.chi2 = self.z * self.z
+        self.a1 = np.asarray(a1, dtype=str)
+        self.a2 = np.asarray(a2, dtype=str)
+        self.nsamp = float(nsamp)
+        self.name = str(name)
+        self.log = log
+        self.removed_snps = [] if removed_snps is None else list(removed_snps)
+        self.read_summary = read_summary
+        self.read_top = read_top
 
+        self.index = pd.Index(self.snps)
+        if self.index.has_duplicates:
+            raise RuntimeError("Sumstats unexpectedly contains duplicate SNP IDs after deduplication.")
+
+    @property
+    def nsnps(self) -> int:
+        return int(self.snps.size)
+
+    @classmethod
+    def from_file(cls, path, *, name=None, log=None) -> "Sumstats":
+        hdr = pd.read_csv(path, sep=r"\s+", compression="infer", nrows=0)
+        ncol = utils._parse_column_name(hdr, ["N", "n"], default_pos=3)
+        zcol = utils._parse_column_name(hdr, ["Z", "z"], default_pos=3)
+        idcol = utils._parse_column_name(hdr, ["ID", "id", "snp", "SNP"], default_pos=0)
+        a1col = utils._parse_column_name(hdr, ["A1", "ALT"], default_pos=1)
+        a2col = utils._parse_column_name(hdr, ["A2", "REF"], default_pos=1)
+
+        usecols = [idcol, zcol, ncol, a1col, a2col]
+        df = pd.read_csv(
+            path,
+            sep=r"\s+",
+            compression="infer",
+            usecols=usecols,
+            dtype={idcol: str, a1col: str, a2col: str},
+        )
+        df = df.rename(columns={idcol: "SNP", zcol: "Z", ncol: "N", a1col: "A1", a2col: "A2"})
+        df["SNP"] = df["SNP"].astype(str)
+        df["A1"] = df["A1"].astype(str).str.upper()
+        df["A2"] = df["A2"].astype(str).str.upper()
+        df["N"] = pd.to_numeric(df["N"], errors="coerce")
+        df["Z"] = pd.to_numeric(df["Z"], errors="coerce")
+
+        n_arr = df["N"].to_numpy(dtype=np.float64, copy=False)
+        z_arr = df["Z"].to_numpy(dtype=np.float64, copy=False)
+        bad = (~np.isfinite(n_arr)) | (~np.isfinite(z_arr))
+        removed = []
+        if bad.any():
+            removed = df.loc[bad, "SNP"].dropna().astype(str).tolist()
+            if log is not None:
+                log._log(
+                    f"Dropping {len(removed)} SNPs with NA/non-finite N or Z values [{name or path}]."
+                )
+            df = df.loc[~bad].copy()
+        else:
+            if log is not None:
+                log._log(f"Dropping 0 SNPs with NA/non-finite N or Z values [{name or path}].")
+
+        if df.shape[0] == 0:
+            raise RuntimeError(f"No valid SNPs remain after basic filtering for phenotype [{name or path}].")
+
+        n_arr = df["N"].to_numpy(dtype=np.float64, copy=False)
+        z_arr = df["Z"].to_numpy(dtype=np.float64, copy=False)
+        nmax = float(np.max(n_arr))
+        z_scaled = z_arr * np.sqrt(n_arr / nmax)
+        badz = ~np.isfinite(z_scaled)
+        if badz.any():
+            removed2 = df.loc[badz, "SNP"].astype(str).tolist()
+            removed.extend(removed2)
+            df = df.loc[~badz].copy()
+            z_scaled = z_scaled[~badz]
+            if log is not None:
+                log._log(
+                    f"Dropping {len(removed2)} SNPs with non-finite scaled Z values [{name or path}]."
+                )
+        df["Z"] = z_scaled
+
+        if df["SNP"].duplicated().any():
+            df["_row"] = np.arange(df.shape[0], dtype=np.int64)
+            df = (
+                df.sort_values(["SNP", "N", "_row"], ascending=[True, False, True])
+                .drop_duplicates(subset="SNP", keep="first")
+                .sort_values("_row")
+                .drop(columns=["_row"])
+                .reset_index(drop=True)
+            )
+            if log is not None:
+                log._log(
+                    f"Detected duplicate SNP IDs; kept 1 row per SNP (remaining={df.shape[0]})."
+                )
+        else:
+            df = df.reset_index(drop=True)
+
+        read_summary = _chisq_summary(df["Z"].to_numpy(dtype=np.float64, copy=False) ** 2)
+        read_top = _top_chisq_rows(
+            df["SNP"].astype(str).to_numpy(),
+            df["A1"].astype(str).to_numpy(),
+            df["A2"].astype(str).to_numpy(),
+            df["Z"].to_numpy(dtype=np.float64, copy=False) ** 2,
+            topk=10,
+        )
+
+        return cls(
+            snps=df["SNP"].astype(str).to_numpy(),
+            z=df["Z"].to_numpy(dtype=np.float64, copy=False),
+            nsamp=nmax,
+            a1=df["A1"].astype(str).to_numpy(),
+            a2=df["A2"].astype(str).to_numpy(),
+            name=(name or path),
+            log=log,
+            removed_snps=removed,
+            read_summary=read_summary,
+            read_top=read_top,
+        )
+
+    def align_to_trace(self, trace) -> AlignedSumstats:
+        pos = self.index.get_indexer(trace.snps)
+        return AlignedSumstats(trace=trace, sumstats=self, pos_on_trace=pos)
 
     def log_chisq_diagnostics(
         self,
+        matched: MatchedSumstats | None = None,
+        *,
+        chisq_threshold=None,
         topk: int = 10,
         warn_min_count: int = 10,
         warn_min_frac: float = 1e-5,
-        verbose: bool = False,
-        include_read_when_verbose: bool = True,
+        verbose=False,
     ):
-        """
-        Report chi^2 diagnostics for the most recently processed phenotype.
-
-        Default behavior (non-verbose):
-        - report ONLY the 'used' stage once (matched/filtered set)
-        - print a concise summary line
-        - print detailed tail + top outliers only if warning triggers
-
-        Verbose behavior:
-        - print active chi^2 filter status once
-        - print 'read' first (optional)
-        - print 'used' second
-        - expanded details for both stages
-        """
-        name = getattr(self, "name", "UNKNOWN")
-        nmax = float(getattr(self, "nsamp", np.nan))
-
-        thr_eff, thr_mode = utils._resolve_chisq_threshold(nmax, self.chisq_threshold)
-        removed_user = int(getattr(self, "_chisq_filter_removed", 0))
-
-        thr_user = float(thr_eff) if thr_eff is not None else 0.0
+        if self.log is None:
+            return
 
         def _should_expand(summ: dict) -> bool:
-            if not summ:
+            if not summ or ("M_finite" not in summ):
                 return False
-            n_hi = int(summ.get("n_gt_suggested", 0))
-            frac_hi = float(summ.get("frac_gt_suggested", 0.0))
-            return (n_hi >= warn_min_count) or (frac_hi >= warn_min_frac)
+            nmax = float(self.nsamp)
+            thr = max(80.0, 0.001 * nmax)
+            chisq = np.asarray([], dtype=np.float64)
+            n_hi = int(summ.get("n_gt_suggested", 0)) if "n_gt_suggested" in summ else None
+            if n_hi is None:
+                # approximate from summary only unavailable, so just use warn on max.
+                return float(summ.get("max", 0.0)) > thr
+            frac = float(summ.get("frac_gt_suggested", 0.0))
+            return (n_hi >= warn_min_count) or (frac >= warn_min_frac)
 
-        def _log_stage(stage: str, summ: dict, top_rows: list, expand: bool):
+        def _log_stage(label: str, summ: dict, top_rows: list, expand: bool):
             if not summ:
                 return
-
-            # always: one-line summary
             if "mean" in summ:
                 self.log._log(
-                    f"[chisq] [{name}] {stage}  "
-                    f"M={summ.get('M', 0)} (finite={summ.get('M_finite', 0)})  "
+                    f"[chisq] [{self.name}] {label}  M={summ['M']} (finite={summ['M_finite']})  "
                     f"lambda_gc={summ['lambda_gc']:.4f}  mean={summ['mean']:.4f}  "
                     f"p99.9={summ.get('p99.9', float('nan')):.2f}  max={summ['max']:.2f}"
                 )
             else:
-                self.log._log(
-                    f"[chisq] [{name}] {stage}  "
-                    f"M={summ.get('M', 0)} (finite={summ.get('M_finite', 0)})"
-                )
+                self.log._log(f"[chisq] [{self.name}] {label}  M={summ.get('M', 0)}")
+            if expand and top_rows:
+                self.log._log(f"[chisq] [{self.name}] top outliers (SNP A1 A2 chi2):")
+                for i, (snp, aa1, aa2, chi2) in enumerate(top_rows[:topk], start=1):
+                    self.log._log(f"[chisq] [{self.name}]  {i:2d}. {snp}\t{aa1}\t{aa2}\t{chi2:.3f}")
 
-            if not expand or ("mean" not in summ):
-                return
-
-            thr = float(summ.get("suggested_chisq_max", np.nan))
-            if np.isfinite(thr):
-                self.log._log(
-                    f"[chisq] [{name}] suggested chi^2 cap = max(80, 0.001*Nmax) with Nmax={nmax:.1f}: {thr:.3f}"
-                )
-                self.log._log(
-                    f"[chisq] [{name}] SNPs with chi^2 > {thr:.3f}: "
-                    f"{int(summ.get('n_gt_suggested', 0))} ({float(summ.get('frac_gt_suggested', 0.0)):.3e})"
-                )
-
-            self.log._log(
-                f"[chisq] [{name}] tail: "
-                f"p99={summ.get('p99', float('nan')):.2f} "
-                f"p99.9={summ.get('p99.9', float('nan')):.2f} "
-                f"p99.99={summ.get('p99.99', float('nan')):.2f} "
-                f"p99.999={summ.get('p99.999', float('nan')):.2f}"
-            )
-
-            if _should_expand(summ):
-                self.log._log(
-                    f"[WARNING] [{name}] many extremely large chi^2 SNPs detected. "
-                    f"This can violate MoM / variance-component assumptions and destabilize estimates."
-                )
-                if top_rows:
-                    self.log._log(f"[chisq] [{name}] top outliers (SNP A1 A2 chi2):")
-                    for r, (snp, aa1, aa2, chi2) in enumerate(top_rows, start=1):
-                        self.log._log(f"[chisq] [{name}]  {r:2d}. {snp}\t{aa1}\t{aa2}\t{chi2:.3f}")
-
-        # ---- Print active user filter status ONCE at the top (verbose only) ----
         if verbose:
-            if (thr_user > 0) and np.isfinite(thr_user):
-                mode_tag = " (auto)" if thr_mode == "auto" else ""
-                self.log._log(
-                    f"[chisq] [{name}] active chi^2 filter: threshold={thr_user:.3f}{mode_tag}; removed={removed_user} SNPs."
-                )
+            thr, mode = utils._resolve_chisq_threshold(self.nsamp, chisq_threshold)
+            if thr is None or not np.isfinite(float(thr)) or float(thr) <= 0.0:
+                self.log._log(f"[chisq] [{self.name}] no active chi^2 filter.")
             else:
-                self.log._log(f"[chisq] [{name}] no active chi^2 filter.")
-
-        # ---- Ordering: verbose prints read first, then used ----
-        if verbose and include_read_when_verbose:
-            _log_stage("read", self._chisq_diag_read, self._chisq_top_read, expand=True)
-
-        # Always report "used" once (concise unless verbose or warning-triggered)
-        used_summ = self._chisq_diag_used
-        used_top = self._chisq_top_used
-        expand_used = bool(verbose) or _should_expand(used_summ)
-        _log_stage("used", used_summ, used_top, expand=expand_used)
-
-
-
-
-    def _read_sumstats(self, path, name):
-        self.name = name
-        sumdf = pd.read_csv(path, sep=r'\s+', compression='infer')
-
-        ncol = utils._parse_column_name(sumdf, ['N', 'n'], 3)
-        zcol = utils._parse_column_name(sumdf, ['Z', 'z'], 3)
-        idcol = utils._parse_column_name(sumdf, ['ID', 'id', 'snp', 'SNP'], 0)
-        a1col = utils._parse_column_name(sumdf, ['A1', 'ALT'], 1)
-        a2col = utils._parse_column_name(sumdf, ['A2', 'REF'], 1)
-
-        drop_mask = sumdf[ncol].isna() | sumdf[zcol].isna()
-        self.removesnps = sumdf.loc[drop_mask, idcol].dropna().astype(str).tolist()
-        self.log._log(f"Dropping {len(self.removesnps)} SNPs with NA values [{self.name}].")
-
-        sumdf = sumdf.loc[~drop_mask].copy()
-        sumdf = sumdf.rename(columns={idcol: 'SNP', zcol: 'Z', ncol: 'N', a1col: 'A1', a2col: 'A2'})
-
-        # ensure types
-        sumdf['SNP'] = sumdf['SNP'].astype(str)
-        sumdf['A1'] = sumdf['A1'].astype(str).str.upper()
-        sumdf['A2'] = sumdf['A2'].astype(str).str.upper()
-        sumdf['N'] = pd.to_numeric(sumdf['N'], errors='coerce')
-        sumdf['Z'] = pd.to_numeric(sumdf['Z'], errors='coerce')
-
-        # drop non-finite N/Z rows
-        bad = (~np.isfinite(sumdf['N'].to_numpy())) | (~np.isfinite(sumdf['Z'].to_numpy()))
-        if bad.any():
-            bad_snps = sumdf.loc[bad, 'SNP'].tolist()
-            self.removesnps += bad_snps
-            sumdf = sumdf.loc[~bad].copy()
-            self.log._log(f"Dropping {len(bad_snps)} SNPs with non-finite N/Z values.")
-
-        # scale Z by sqrt(N / Nmax)
-        nmax = float(sumdf['N'].max())
-        sumdf['Z'] = sumdf['Z'] * np.sqrt(sumdf['N'] / nmax)
-
-        # drop non-finite Z after scaling
-        badz = ~np.isfinite(sumdf['Z'].to_numpy())
-        if badz.any():
-            bad_snps = sumdf.loc[badz, 'SNP'].tolist()
-            self.removesnps += bad_snps
-            sumdf = sumdf.loc[~badz].copy()
-            self.log._log(f"Dropping {len(bad_snps)} SNPs with non-finite Z after scaling.")
-
-        # set nsamp
-        self.nsamp = float(nmax)
-
-        # deduplicate SNPs
-        if sumdf['SNP'].duplicated().any():
-            sumdf['_row'] = np.arange(sumdf.shape[0], dtype=np.int64)
-            sumdf = (
-                sumdf.sort_values(['SNP', 'N', '_row'], ascending=[True, False, True])
-                    .drop_duplicates(subset='SNP', keep='first')
-                    .sort_values('_row')
-                    .drop(columns=['_row'])
-            )
-            self.log._log(f"Detected duplicate SNP IDs; kept 1 row per SNP (remaining={sumdf.shape[0]}).")
-
-        self.sumdf = sumdf[['SNP', 'Z', 'A1', 'A2']].copy()
-
-        # cached arrays + index
-        self._sum_snps = self.sumdf['SNP'].to_numpy(dtype=str, copy=False)
-        self._sum_z = self.sumdf['Z'].to_numpy(dtype=np.float64, copy=False)
-        self._sum_a1 = self.sumdf['A1'].to_numpy(dtype=str, copy=False)
-        self._sum_a2 = self.sumdf['A2'].to_numpy(dtype=str, copy=False)
-
-        self._sum_index = pd.Index(self._sum_snps)
-        self._sum_has_dups = self._sum_index.has_duplicates
-        self._chisq_applied = False
-        self._chisq_filter_removed = 0
-
-        # diagnostics on the read/scaled set (before matching)
-        self._chisq_diag_read, self._chisq_top_read = self._compute_chisq_diag(
-            z=self._sum_z, snps=self._sum_snps, a1=self._sum_a1, a2=self._sum_a2, nmax=self.nsamp, topk=10
-        )
-        self._chisq_diag_used = None
-        self._chisq_top_used = None
-
-
-    def _apply_chisq_filter_once(self):
-        """
-        Apply chi^2 handling at most once per Sumstats object.
-
-        Modes (set via self.chisq_action; default='drop'):
-        - 'drop': remove SNPs with chi^2 > threshold from sumstats caches (current behavior)
-        - 'clip': do NOT drop here (clipping happens later on the matched set)
-        - 'warn'/'none': do nothing here
-
-        Convention: chisq_threshold <= 0 or non-finite => disabled.
-        Special:
-          - chisq_threshold == 'auto' => threshold = max(80, 0.001*Nmax)
-          - chisq_threshold is None => no filtering
-        """
-        if self._chisq_applied:
-            return
-        self._chisq_applied = True
-        self._chisq_filter_removed = 0
-
-        action = str(getattr(self, "_chisq_action", "drop")).strip().lower()
-        if action not in ("drop", "clip", "warn", "none"):
-            # fail-safe: preserve legacy behavior
-            self.log._log(f"[chisq] Unrecognized chisq_action='{action}', defaulting to 'drop'.")
-            action = "drop"
-        self._chisq_action_used = action
-
-        thr, _thr_mode = utils._resolve_chisq_threshold(self.nsamp, self.chisq_threshold)
-        if thr is None:
-            return
-
-        thr = float(thr)
-
-        # Convention: <=0 means "disabled"
-        if (not np.isfinite(thr)) or (thr <= 0.0):
-            return
-
-        # Only 'drop' modifies caches here. 'clip' is handled post-matching.
-        if action != "drop":
-            return
-
-        self.log._log(f"[chisq] Dropping SNPs with chi^2 greater than {thr}")
-
-        chisq = self._sum_z ** 2
-        keep = (chisq <= thr) & np.isfinite(chisq)
-
-        if np.all(keep):
-            return
-
-        chisq_snps = self._sum_snps[~keep].tolist()
-        self.removesnps += chisq_snps
-        self._chisq_filter_removed = int(len(chisq_snps))
-
-        # filter cached arrays
-        self._sum_snps = self._sum_snps[keep]
-        self._sum_z = self._sum_z[keep]
-        self._sum_a1 = self._sum_a1[keep]
-        self._sum_a2 = self._sum_a2[keep]
-
-        # filter dataframe (same row order as caches)
-        self.sumdf = self.sumdf.loc[keep].reset_index(drop=True)
-
-        # rebuild index
-        self._sum_index = pd.Index(self._sum_snps)
-        self._sum_has_dups = self._sum_index.has_duplicates
-
-        self.log._log(
-            f"[chisq] Removed {len(chisq_snps)} SNPs with chi^2 above {thr} "
-            f"({self._sum_snps.size} SNPs remaining)"
-        )
-
-
-
-
-    def _match_snps(self, printlog=True):
-        if self.annot_df is None:
-            raise RuntimeError("Sumstats.annot_df is None; cannot match SNPs.")
-        if self._annot_snps is None or (self._annot_ann is None):
-            self._set_annot_df(self.annot_df)
-
-        self._apply_chisq_filter_once()
-
-        action = str(getattr(self, "_chisq_action", "drop")).strip().lower()
-        if action not in ("drop", "clip", "warn", "none"):
-            self.log._log(f"[chisq] Unrecognized chisq_action='{action}', defaulting to 'drop'.")
-            action = "drop"
-
-        thr, _thr_mode = utils._resolve_chisq_threshold(self.nsamp, self.chisq_threshold)
-        thr_enabled = (thr is not None) and np.isfinite(float(thr)) and (float(thr) > 0.0)
-        thr = float(thr) if thr is not None else None
-
-        chr_matched = None
-
-        # --- SNP matching ---
-        if self._sum_has_dups or self._annot_has_dups:
-            df = self.annot_df.merge(self.sumdf, how='inner', on='SNP', sort=False)
-
-            matched_set = pd.Index(df['SNP'].astype(str))
-            missing_mask = ~self.annot_df['SNP'].astype(str).isin(matched_set)
-            if missing_mask.any():
-                self.removesnps.extend(self.annot_df.loc[missing_mask, 'SNP'].astype(str).tolist())
-
-            self.matched_snps = df['SNP'].astype(str).to_numpy()
-            if printlog:
-                self.log._log(
-                    f"Matched {len(df)} SNPs in phenotype {self.name} out of {len(self.annot_df)} "
-                    f"annotated SNPs ({int(missing_mask.sum())} missing or filtered)"
-                )
-
-            all_z = df['Z'].to_numpy(dtype=np.float64, copy=False)
-            self.zscores = all_z
-            self.a1 = df['A1'].astype(str).str.upper().to_numpy()
-            self.a2 = df['A2'].astype(str).str.upper().to_numpy()
-
-            ann_cols = [c for c in self.annot_df.columns if c not in ('SNP', 'CHR', 'BP', 'CM')]
-            all_ann = df[ann_cols].to_numpy(dtype=np.float64, copy=False)
-
-            if self.jackknife_mode == "chr":
-                if "CHR" not in df.columns:
-                    raise RuntimeError("chr-mode requires annot_df to contain CHR column.")
-                chr_matched = df["CHR"].to_numpy(dtype=np.int32, copy=False)
-
-        else:
-            annot_snps = self._annot_snps
-            indexer = self._sum_index.get_indexer(annot_snps)
-            keep_mask = indexer >= 0
-
-            missing_n = int((~keep_mask).sum())
-            if missing_n:
-                self.removesnps.extend(annot_snps[~keep_mask].tolist())
-
-            pos = indexer[keep_mask]
-            self.matched_snps = annot_snps[keep_mask]
-            if printlog:
-                self.log._log(
-                    f"Matched {pos.size} SNPs in phenotype {self.name} out of {annot_snps.size} "
-                    f"annotated SNPs ({missing_n} missing or filtered)"
-                )
-
-            all_z = self._sum_z[pos]
-            self.zscores = all_z
-            self.a1 = self._sum_a1[pos]
-            self.a2 = self._sum_a2[pos]
-            all_ann = self._annot_ann[keep_mask, :]
-
-            if self.jackknife_mode == "chr":
-                if self._annot_chr is None:
-                    raise RuntimeError("chr-mode requires annot_df to contain CHR column.")
-                chr_matched = self._annot_chr[keep_mask]
-
-        # diagnostics on matched set (raw; before clipping)
-        self._chisq_diag_used, self._chisq_top_used = self._compute_chisq_diag(
-            z=all_z, snps=self.matched_snps, a1=self.a1, a2=self.a2, nmax=self.nsamp, topk=10
-        )
-
-        all_z = np.asarray(all_z, dtype=np.float64)
-        if not np.isfinite(all_z).all():
-            raise RuntimeError("Non-finite z-scores encountered after matching; drop upstream.")
-
-        A = np.asarray(all_ann, dtype=np.float64, order="C")
-        if A.ndim != 2 or A.shape[1] != self.nbins:
-            raise RuntimeError(f"Annotation matrix shape mismatch: got {A.shape}, expected (*,{self.nbins}).")
-        if not np.isfinite(A).all():
-            bad = np.flatnonzero(~np.isfinite(A).any(axis=1))[:10]
-            raise RuntimeError(f"Non-finite annotation values encountered after matching. First bad rows: {bad.tolist()}")
-
-        M = int(all_z.size)
-        self.nsnps = M
-
-        z2 = all_z * all_z
-        if not np.isfinite(z2).all():
-            if action == "clip" and thr_enabled:
-                bad = ~np.isfinite(z2)
-                z2[bad] = thr
-            else:
-                raise RuntimeError("Non-finite chi^2 encountered after squaring z-scores.")
-
-        self._chisq_clip_applied = False
-        self._chisq_clip_count = 0
-        self._chisq_clip_threshold = float(thr) if thr_enabled else 0.0
-        if action == "clip" and thr_enabled:
-            clip_mask = (z2 > thr) & np.isfinite(z2)
-            self._chisq_clip_count = int(np.sum(clip_mask))
-            if self._chisq_clip_count > 0:
-                np.minimum(z2, thr, out=z2)
-                self._chisq_clip_applied = True
-
-        # ---------------- chr-mode: per-chrom unit sufficient stats ----------------
-        if self.jackknife_mode == "chr":
-            if chr_matched is None:
-                raise RuntimeError("chr-mode: chr_matched is None.")
-
-            chrs = np.asarray(self.jackknife_chrs, dtype=np.int32).ravel()
-            U = int(self.jackknife_units)
-
-            # require nondecreasing chr order to use searchsorted bounds
-            chr_arr = np.asarray(chr_matched, dtype=np.int32).ravel()
-            if chr_arr.size > 1 and np.any(chr_arr[1:] < chr_arr[:-1]):
-                raise RuntimeError("chr-mode requires matched SNPs in nondecreasing CHR order (Trace should sort).")
-
-            starts = np.searchsorted(chr_arr, chrs, side="left").astype(np.int64)
-            ends   = np.searchsorted(chr_arr, chrs, side="right").astype(np.int64)
-
-            K = int(self.nbins)
-            Ak_unit = np.zeros((U, K), dtype=np.float64)
-            Az2_unit = np.zeros((U, K), dtype=np.float64)
-
-            # compute per-unit sums with BLAS-friendly ops
-            for u in range(U):
-                s = int(starts[u]); e = int(ends[u])
-                if e <= s:
-                    continue
-                Au = A[s:e, :]
-                z2u = z2[s:e]
-                Ak_unit[u, :] = Au.sum(axis=0, dtype=np.float64)
-                Az2_unit[u, :] = (Au.T @ z2u).astype(np.float64, copy=False)
-
-            Ak_full = Ak_unit.sum(axis=0)
-            Az2_full = Az2_unit.sum(axis=0)
-
-            self._Ak_unit = Ak_unit
-            self._Az2_unit = Az2_unit
-            self._Ak_full = Ak_full
-            self._Az2_full = Az2_full
-
-            self.nsnps_bin = Ak_full
-            self.nsnps_blk = Ak_unit  # (U,K) unit-level, not replicate-level
-
-            bad_bins = np.flatnonzero(~np.isfinite(Ak_full) | (Ak_full <= 0.0))
-            if bad_bins.size:
-                self.log._log(
-                    "!!! One or more annotation bins have non-positive total weight after matching. "
-                    f"Bad bins: {bad_bins.tolist()} (Ak_full={Ak_full[bad_bins].tolist()}) !!!"
-                )
-                sys.exit(1)
-
-            if action == "warn" and thr_enabled and printlog:
-                self.log._log(f"[chisq] [{self.name}] warning-only threshold set at {thr:.3f}; no dropping/clipping applied.")
-
-            return
-
-        # ---------------- block-mode legacy sufficient stats ----------------
-        blk_size = max(M // self.nblks, 1)
-        blk_idx = (np.arange(M, dtype=np.int64) // blk_size)
-        blk_idx[blk_idx >= self.nblks] = self.nblks - 1
-        self.blk_idx = blk_idx
-
-        Ak_full = A.sum(axis=0, dtype=np.float64)
-        Az2_full = (A.T @ z2).astype(np.float64, copy=False)
-
-        B = self.nblks
-        K = self.nbins
-        Ak_blk = np.zeros((B, K), dtype=np.float64)
-        Az2_blk = np.zeros((B, K), dtype=np.float64)
-
-        tmp = np.empty(M, dtype=np.float64)
-        for k in range(K):
-            col = A[:, k]
-            tmp[:] = col
-            Ak_blk[:, k] = np.bincount(blk_idx, weights=tmp, minlength=B).astype(np.float64, copy=False)
-            tmp[:] = col * z2
-            Az2_blk[:, k] = np.bincount(blk_idx, weights=tmp, minlength=B).astype(np.float64, copy=False)
-
-        self.nsnps_bin = Ak_full
-        self.nsnps_blk = Ak_blk
-
-        self._Ak_full = Ak_full
-        self._Az2_full = Az2_full
-        self._Ak_blk = Ak_blk
-        self._Az2_blk = Az2_blk
-
-        bad_bins = np.flatnonzero(~np.isfinite(Ak_full) | (Ak_full <= 0.0))
-        if bad_bins.size:
-            self.log._log(
-                "!!! One or more annotation bins have non-positive total weight after matching. "
-                f"Bad bins: {bad_bins.tolist()} (Ak_full={Ak_full[bad_bins].tolist()}) !!!"
-            )
-            sys.exit(1)
-
-        if action == "warn" and thr_enabled and printlog:
-            self.log._log(f"[chisq] [{self.name}] warning-only threshold set at {thr:.3f}; no dropping/clipping applied.")
-
-
-    def _calc_rhs_h2(self):
-        R = int(self.nblks)
-        K = int(self.nbins)
-        N = float(self.nsamp)
-
-        self.rhs = np.full((R + 1, K + 1), N - 1.0, dtype=np.float64)
-
-        if self.jackknife_mode != "chr":
-            # legacy path (unchanged)
-            Ak_full = np.asarray(self._Ak_full, dtype=np.float64)
-            Az2_full = np.asarray(self._Az2_full, dtype=np.float64)
-            Ak_blk = np.asarray(self._Ak_blk, dtype=np.float64)
-            Az2_blk = np.asarray(self._Az2_blk, dtype=np.float64)
-
-            warned = np.zeros(K, dtype=bool)
-            for k in range(K):
-                denom_full = float(Ak_full[k])
-                if not (np.isfinite(denom_full) and denom_full > 0.0):
-                    raise RuntimeError(f"Bin {k} has non-positive total weight (Ak_full={denom_full}).")
-
-                self.rhs[R, k] = float(Az2_full[k]) * N / denom_full
-
-                for b in range(R):
-                    denom = float(Ak_full[k] - Ak_blk[b, k])
-                    if not (np.isfinite(denom) and denom > 0.0):
-                        self.rhs[b, k] = np.nan
-                        if not warned[k]:
-                            warned[k] = True
-                            self.log._log(
-                                f"[WARNING] Bin {k} has non-positive total weight in some LOO replicates (denom<=0)."
-                            )
-                        continue
-                    num = float(Az2_full[k] - Az2_blk[b, k])
-                    self.rhs[b, k] = num * N / denom
-
-            self.log._log(f"Calculated the RHS for phenotype [{self.name}]")
-            return
-
-        # ---------------- chr delete-d RHS ----------------
-        Ak_full = np.asarray(self._Ak_full, dtype=np.float64)        # (K,)
-        Az2_full = np.asarray(self._Az2_full, dtype=np.float64)      # (K,)
-        Ak_unit = np.asarray(self._Ak_unit, dtype=np.float64)        # (U,K)
-        Az2_unit = np.asarray(self._Az2_unit, dtype=np.float64)      # (U,K)
-
-        D = np.asarray(self._rep_del_mat, dtype=np.float64)          # (R,U)
-
-        del_Ak = D @ Ak_unit                                         # (R,K)
-        del_Az2 = D @ Az2_unit                                       # (R,K)
-
-        Ak_rep = Ak_full[None, :] - del_Ak                           # (R,K)
-        Az2_rep = Az2_full[None, :] - del_Az2                        # (R,K)
-
-        with np.errstate(divide="ignore", invalid="ignore"):
-            self.rhs[:R, :K] = (Az2_rep * N) / Ak_rep
-
-        # full row
-        self.rhs[R, :K] = (Az2_full * N) / Ak_full
-
-        # invalidate denom<=0
-        bad = (~np.isfinite(self.rhs[:R, :K])) | (~np.isfinite(Ak_rep)) | (Ak_rep <= 0.0)
-        if np.any(bad):
-            self.rhs[:R, :K][bad] = np.nan
-            # one concise warning
-            self.log._log(
-                f"[WARNING] [{self.name}] Some delete-{self.jackknife_delete} replicates have non-positive bin mass "
-                f"(Ak_rep<=0) in at least one bin; setting those replicate/bin RHS entries to NaN."
-            )
-
-        self.log._log(f"Calculated the RHS for phenotype [{self.name}]")
-
-
-    def _process(self, path, name):
-        self._read_sumstats(path, name)
-        self._match_snps()
-        self._calc_rhs_h2()
-        return self.removesnps
-
-    def read_only(self, path: str, name: str):
-        """
-        Read + cache sumstats once (including chi^2 filtering).
-        Does NOT match to annotation or compute RHS.
-        """
-        self._read_sumstats(path, name)
-        self._apply_chisq_filter_once()
-        return
-
-    def rematch_and_recompute(self, annot_df: pd.DataFrame):
-        """
-        Rematch to a (possibly new) annot_df using cached sumstats arrays,
-        then recompute RHS. No file I/O.
-        """
-        self._set_annot_df(annot_df)
-
-        self.matched_snps = None
-        self.zscores = None
-        self.zscores_bin = []
-        self.zscores_blk = []
-        self.nsnps_blk = None
-        self.nsnps_bin = None
-
-        # reset weighted caches
-        self._Ak_full = None
-        self._Az2_full = None
-        self._Ak_blk = None
-        self._Az2_blk = None
-
-        self._match_snps(printlog=False)
-        self._calc_rhs_h2()
-        return
-
+                tag = " (auto)" if mode == "auto" else ""
+                self.log._log(f"[chisq] [{self.name}] active chi^2 filter: threshold={float(thr):.3f}{tag}")
+            _log_stage("read", self.read_summary, self.read_top, expand=True)
+
+        if matched is not None:
+            _log_stage("used", matched.used_summary, matched.used_top, expand=(verbose or _should_expand(matched.used_summary)))

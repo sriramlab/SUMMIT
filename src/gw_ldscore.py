@@ -2,6 +2,7 @@
 Stochastically estimate (partitioned) genome-wide LD scores. Some part of the code is modified from Eric Liu's script
 """
 import utils
+import math
 import numpy as np
 import pandas as pd
 from bed_reader import open_bed
@@ -41,34 +42,11 @@ def _pick_cuda_index_auto(gcu):
     gpus = gcu.list_gpus()
     if not gpus:
         raise RuntimeError("CUDA requested but no GPUs are visible.")
-    # pick by max free bytes
     best = max(gpus, key=lambda d: int(d["free_bytes"]))
     return int(best["id"]), int(best["free_bytes"]), int(best["total_bytes"])
 
 
 def apply_env(cfg: dict) -> int:
-    """
-    Apply low-level environment knobs from a plain dict and enforce BLAS/OMP threads.
-
-    Additions:
-      - optional affinity expansion to all *allowed* CPUs (cfg["force_affinity_all"]=True)
-      - set SUMMIT_DECODE_THREADS (cfg["decode_threads"] or auto)
-      - avoid clobbering OMP_PROC_BIND twice
-
-    Recognized keys (all optional):
-      - force_affinity_all: bool       # try to expand to all allowed CPUs
-      - decode_threads: int            # set SUMMIT_DECODE_THREADS explicitly
-      - decode_threads_cap: int        # cap auto decode threads (default 16)
-      - decode_mem_cap_mb: int         # cap decode tmpN total footprint (default 512 MiB)
-      - numa_mode / numa_nodes         # as before
-      - num_threads                    # if you pass this in cfg, we use it as the "intent" for n_threads
-      - omp_proc_bind / omp_places / kmp_blocktime  # as before
-      - ctile / ctile_mb / ctile_l3pct / sockets    # as before
-      - malloc_* knobs                 # as before
-
-    Returns:
-      actual_blas_threads (int): detected BLAS threads after enforcement.
-    """
     import os, sys, shutil, ctypes
 
     def maybe_wrap_with_numactl(mode: str | None, nodes: str = "all") -> None:
@@ -91,27 +69,18 @@ def apply_env(cfg: dict) -> int:
         args = [exe, f"{flag}={nodes}", sys.executable, *sys.argv]
         os.execv(exe, args)
 
-    # ---- affinity helpers ----
     def _cpu_set_allowed():
-        """Return the current allowed CPU set for this process (Linux cpuset/taskset aware)."""
         try:
             return set(os.sched_getaffinity(0))
         except Exception:
-            # fallback: assume [0..os.cpu_count)
             return set(range(os.cpu_count() or 1))
 
     def _expand_affinity_to_all_allowed():
-        """
-        Try to expand to all CPUs that *could* be available on this machine.
-        If we're inside a cpuset/cgroup, the kernel will clip.
-        """
         if os.name != "posix" or not hasattr(os, "sched_setaffinity"):
             return
-        # if user didn't request it, don't touch
         if not bool(cfg.get("force_affinity_all", False)):
             return
 
-        # Build "online CPUs" from sysfs (Linux) as the maximal target.
         target = None
         try:
             with open("/sys/devices/system/cpu/online", "r") as f:
@@ -134,13 +103,11 @@ def apply_env(cfg: dict) -> int:
         try:
             os.sched_setaffinity(0, target)
         except Exception:
-            # non-fatal (common when cpuset disallows it)
             pass
 
     def _cpu_count_affinity() -> int:
         return len(_cpu_set_allowed())
 
-    # ---- BLAS threads probing ----
     def _detect_blas_threads_fallback() -> int:
         for k in ("OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS", "BLIS_NUM_THREADS", "VECLIB_MAXIMUM_THREADS"):
             v = os.environ.get(k)
@@ -162,23 +129,15 @@ def apply_env(cfg: dict) -> int:
         except Exception:
             return _detect_blas_threads_fallback()
 
-    # -------- 0) NUMA config --------
     maybe_wrap_with_numactl(mode=cfg.get("numa_mode"), nodes=str(cfg.get("numa_nodes", "all")))
-
-    # Optionally expand affinity (THIS is what will fix your “Cpus_allowed_list: 0-63”)
     _expand_affinity_to_all_allowed()
 
-    # Decide "n_threads" default:
-    # - if cfg explicitly provides num_threads, respect it (but still clipped by affinity)
-    # - else use affinity size
     n_aff = _cpu_count_affinity()
     if cfg.get("num_threads") is not None:
         n_threads = max(1, min(int(cfg["num_threads"]), n_aff))
     else:
         n_threads = max(1, n_aff)
 
-    # ---- Set decode threads env for genotype.cpp ----
-    # If user provided cfg["decode_threads"], use it. Else auto = min(cap, n_aff).
     if "decode_threads" in cfg and cfg["decode_threads"] is not None:
         dec = int(cfg["decode_threads"])
         dec = max(1, min(dec, n_aff))
@@ -187,35 +146,24 @@ def apply_env(cfg: dict) -> int:
         cap = max(1, cap)
         dec = min(cap, n_aff)
 
-    # Optional memory cap guidance: genotype.cpp already self-caps by SUMMIT_DECODE_THREADS,
-    # but we can pass the intended cap too (it uses an internal 2048 MiB default).
-    # We'll expose this as env for you if you later want genotype.cpp to read it.
     decode_mem_cap_mb = int(cfg.get("decode_mem_cap_mb", 2048))
     if decode_mem_cap_mb < 64:
         decode_mem_cap_mb = 64
     os.environ["SUMMIT_DECODE_THREADS"] = str(dec)
-    os.environ["SUMMIT_DECODE_MEM_CAP_MB"] = str(decode_mem_cap_mb)  # optional future hook
+    os.environ["SUMMIT_DECODE_MEM_CAP_MB"] = str(decode_mem_cap_mb)
 
-    # ---- OpenMP defaults ----
     os.environ["OMP_NUM_THREADS"] = str(n_threads)
     os.environ["OMP_DYNAMIC"] = "FALSE"
-
-    # Helpful affinity / runtime hints (do NOT clobber twice)
-    # Keep your defaults, but now they actually apply.
-    os.environ.setdefault("OMP_PROC_BIND", str(cfg.get("omp_proc_bind", "spread")))  # or "close"
-    os.environ.setdefault("OMP_PLACES",    str(cfg.get("omp_places", "threads")))      # consider "threads" if you want SMT; "cores" otherwise.
+    os.environ.setdefault("OMP_PROC_BIND", str(cfg.get("omp_proc_bind", "spread")))
+    os.environ.setdefault("OMP_PLACES",    str(cfg.get("omp_places", "threads")))
     os.environ.setdefault("KMP_BLOCKTIME", str(cfg.get("kmp_blocktime", 0)))
-
-    # Vendor-specific (safe defaults)
     os.environ.setdefault("MKL_ENABLE_INSTRUCTIONS", "AVX512")
 
-    # ---- BLAS vendors default threads ----
     for var in ("OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS", "BLIS_NUM_THREADS", "VECLIB_MAXIMUM_THREADS"):
         os.environ[var] = str(n_threads)
     os.environ["OPENBLAS_DYNAMIC"] = "0"
     os.environ["MKL_DYNAMIC"] = "FALSE"
 
-    # Also try to enforce into already loaded libraries
     try:
         import mkl  # type: ignore
         mkl.set_num_threads(n_threads)
@@ -241,43 +189,25 @@ def apply_env(cfg: dict) -> int:
     actual = _detect_blas_threads()
     os.environ["SUMMIT_BLAS_THREADS"] = str(actual)
 
-    # -------- 2) C++ tiler/env knobs --------
     if cfg.get("q_panel") is not None:
         os.environ["SUMMIT_P2_QPANEL"] = str(int(cfg["q_panel"]))
     else:
         os.environ.pop("SUMMIT_P2_QPANEL", None)
-    
+
     if cfg.get("reduce_blk") is not None:
         os.environ["SUMMIT_P2_IBLK"] = str(int(cfg["reduce_blk"]))
     else:
         os.environ.pop("SUMMIT_P2_IBLK", None)
-    
+
     if cfg.get("reduce_threads") is not None:
         os.environ["SUMMIT_P2_REDUCE_THREADS"] = str(int(cfg["reduce_threads"]))
     else:
         os.environ.pop("SUMMIT_P2_REDUCE_THREADS", None)
 
-# probably obsolete now
-    # if cfg.get("ctile") is not None:
-    #     os.environ["SUMMIT_CTILE"] = str(int(cfg["ctile"]))
-    # else:
-    #     os.environ.pop("SUMMIT_CTILE", None)
-
-    # if cfg.get("ctile_mb") is not None:
-    #     os.environ["SUMMIT_CTILE_MB"] = str(int(cfg["ctile_mb"]))
-    # else:
-    #     os.environ.pop("SUMMIT_CTILE_MB", None)
-
-    # if cfg.get("ctile_l3pct") is not None:
-    #     os.environ["SUMMIT_CTILE_L3PCT"] = f"{float(cfg['ctile_l3pct']):.3f}"
-    # else:
-    #     os.environ.pop("SUMMIT_CTILE_L3PCT", None)
-
     sockets = cfg.get("sockets")
     if sockets is not None:
         os.environ["SUMMIT_SOCKETS"] = str(int(sockets))
 
-    # -------- 3) Malloc hygiene (optional) --------
     if cfg.get("malloc_arena_max") is not None:
         os.environ["MALLOC_ARENA_MAX"] = str(int(cfg["malloc_arena_max"]))
     if cfg.get("malloc_trim_threshold") is not None:
@@ -296,82 +226,71 @@ def set_parallelism(omp_threads: int | None = None, blas_threads: int | None = N
     b = None
     if blas_threads is not None:
         b = max(1, int(blas_threads))
-        # env knobs for BLAS
         os.environ["OPENBLAS_NUM_THREADS"] = str(b)
         os.environ["OPENBLAS_DYNAMIC"] = "0"
         os.environ["MKL_NUM_THREADS"] = str(b)
         os.environ["MKL_DYNAMIC"] = "FALSE"
         os.environ["BLIS_NUM_THREADS"] = str(b)
         os.environ["VECLIB_MAXIMUM_THREADS"] = str(b)
-        # optional: vendor API again
         try:
             import mkl
             mkl.set_num_threads(b)
         except Exception:
             pass
 
-    # If threadpoolctl is available, use it as a context
     if b is not None and threadpool_limits is not None:
         return threadpool_limits(limits=b, user_api="blas")
     else:
         return nullcontext()
 
 
-
 def _round_up_to(x, gran):
     return int(((x + gran - 1) // gran) * gran)
 
 def _build_balanced_vtiles(V, vmax, gran=64, max_tiles=4):
-    """
-    Split V vectors into ~equal tiles, each ≤ vmax, rounded to `gran` (e.g., 64),
-    minimizing the worst tail. Returns list of (v_start, v_count).
-    """
     vmax = max(gran, (vmax // gran) * gran)
     if vmax >= V:
         return [(0, V)]
-    # minimal number of tiles that respects vmax
     tiles = int(math.ceil(V / vmax))
-    tiles = min(max_tiles, max(2, tiles))  # cap to avoid too many passes
-
-    # base and remainder for balanced split
+    tiles = min(max_tiles, max(2, tiles))
     q, r = divmod(V, tiles)
-    # round each tile to granularity, but never exceed vmax
     sizes = []
     for t in range(tiles):
         sz = q + (1 if t < r else 0)
         sz = min(vmax, _round_up_to(sz, gran))
         sizes.append(sz)
 
-    # adjust if rounding up overshot total by a lot
     total = sum(sizes)
-    # if total > V, bleed off the excess from the last tiles
     over = total - V
     t = len(sizes) - 1
     while over > 0 and t >= 0:
-        bleed = min(over, sizes[t] - max(gran, q))  # don't shrink below ~base
+        bleed = min(over, sizes[t] - max(gran, q))
         bleed = (bleed // gran) * gran
         if bleed > 0:
             sizes[t] -= bleed
             over -= bleed
         t -= 1
 
-    # build (start,count)
     vtiles, v0 = [], 0
     for sz in sizes:
-        if sz <= 0: continue
-        if v0 + sz > V: sz = V - v0
-        if sz <= 0: break
+        if sz <= 0:
+            continue
+        if v0 + sz > V:
+            sz = V - v0
+        if sz <= 0:
+            break
         vtiles.append((v0, sz))
         v0 += sz
-    # final guard
     if v0 < V:
         vtiles.append((v0, V - v0))
     return vtiles
 
 def _bytes_human(n):
-    if n is None: return "n/a"
-    if n < 1024: return f"{n} B"
-    for unit in ["KB","MB","GB","TB","PB"]:
+    if n is None:
+        return "n/a"
+    if n < 1024:
+        return f"{n} B"
+    for unit in ["KB", "MB", "GB", "TB", "PB"]:
         n /= 1024.0
         if n < 1024.0:
             return f"{n:,.2f} {unit}"
@@ -384,7 +303,6 @@ def _rss_snapshot(label, logger=None, include_children=True):
         with open(f"/proc/{pid}/smaps_rollup", "r") as f:
             for line in f:
                 if line.startswith("Pss:"):
-                    # kB → bytes
                     pss = int(line.split()[1]) * 1024
                 elif line.startswith("Rss:"):
                     rss = int(line.split()[1]) * 1024
@@ -397,13 +315,14 @@ def _rss_snapshot(label, logger=None, include_children=True):
 
     msg = f"[mem] {label}: RSS={_bytes_human(rss)}; PSS≈{_bytes_human(pss)}"
     if logger:
-        try: logger._log(msg)
-        except Exception: print(msg, file=sys.stderr, flush=True)
+        try:
+            logger._log(msg)
+        except Exception:
+            print(msg, file=sys.stderr, flush=True)
     else:
         print(msg, file=sys.stderr, flush=True)
 
 def _canonical_bfile_prefix(x: str) -> str:
-    """Return PLINK bfile prefix: strip only trailing .bed/.bim/.fam if present; otherwise leave as-is."""
     s = str(x)
     for ext in (".bed", ".bim", ".fam"):
         if s.endswith(ext):
@@ -420,12 +339,8 @@ def _resvar_worker_thread(span,
                           R: np.ndarray | None,
                           N_eff: float,
                           eps: float):
-    """
-    Worker for Var(M x_m) on SNP columns [s:e], using threads
-    """
     s, e = span
 
-    # Thread-local bed handle (avoid cross-thread sharing of a single handle)
     G = getattr(_THREAD_LOCAL, "G", None)
     Gid = getattr(_THREAD_LOCAL, "bed_prefix", None)
     if (G is None) or (Gid != bed_prefix):
@@ -433,28 +348,24 @@ def _resvar_worker_thread(span,
         _THREAD_LOCAL.G = G
         _THREAD_LOCAL.bed_prefix = bed_prefix
 
-    # Row selection
     rows = row_sel if row_sel is not None else slice(None)
 
-    # 1) Read & standardize in raw space
-    geno = G.read(index=np.s_[rows, s:e], dtype=dtype)          # (N × L)
+    geno = G.read(index=np.s_[rows, s:e], dtype=dtype)
     means = np.nanmean(geno, axis=0, dtype=dtype)
-    stds  = np.nanstd( geno, axis=0, dtype=dtype, ddof=ddof)
+    stds  = np.nanstd(geno, axis=0, dtype=dtype, ddof=ddof)
     stds[stds == 0] = 1.0
     np.subtract(geno, means, out=geno)
-    np.divide(  geno, stds,  out=geno)
+    np.divide(geno, stds, out=geno)
     np.nan_to_num(geno, copy=False)
     geno = np.asfortranarray(geno, dtype=dtype)
 
-    # 2) Project: Y = (I - C R) * geno  (C: N×p with orthonormal cols; R = C^T in same dtype)
     if C is not None and R is not None:
-        tmp = R @ geno              # (p × L)
-        Y   = geno - (C @ tmp)      # (N × L)
+        tmp = R @ geno
+        Y   = geno - (C @ tmp)
         del tmp
     else:
         Y = geno
 
-    # 3) Variance with denominator (N_eff - 1), all in dtype
     resvar = np.sum(Y * Y, axis=0, dtype=dtype) / float(N_eff - 1)
     inv_sqrt_resvar = (1.0 / np.sqrt(np.maximum(resvar, eps))).astype(dtype, copy=False)
     return (s, e, inv_sqrt_resvar)
@@ -464,13 +375,13 @@ def read_cov(
     cov_filename: str,
     fam_filename: str,
     std: bool = True,
-    cov_impute_method: str = "ignore",   # drop rows with any NA
+    cov_impute_method: str = "ignore",
     one_hot_conversion: bool = False,
     categorical_threshold: int = 100,
     logger=None,
     verbose=False,
     sample_idx=None,
-    ddof = 1
+    ddof=1
 ):
     fam = pd.read_csv(fam_filename, sep=r'\s+', header=None, usecols=[0,1], names=['FID','IID'])
     cov = pd.read_csv(cov_filename, sep=r'\s+')
@@ -480,7 +391,7 @@ def read_cov(
     if n_missing_in_cov:
         raise ValueError(f"{n_missing_in_cov} .fam samples not found in covariate file (FID/IID mismatch).")
     merged.drop(columns=['_merge'], inplace=True)
-    
+
     if sample_idx is not None:
         sample_idx = np.asarray(sample_idx, dtype=int)
         merged = merged.iloc[sample_idx].reset_index(drop=True)
@@ -497,7 +408,8 @@ def read_cov(
     if cov_impute_method == "ignore":
         keep_mask = ~df.isna().any(axis=1)
         dropped = (~keep_mask).sum()
-        if logger: logger._log(f"Dropping {dropped} samples due to missing covariates.")
+        if logger:
+            logger._log(f"Dropping {dropped} samples due to missing covariates.")
         df = df.loc[keep_mask].reset_index(drop=True)
     else:
         df = df.apply(lambda s: s.fillna(s.mean()), axis=0)
@@ -506,21 +418,23 @@ def read_cov(
     zvc = df.std(ddof=0) == 0
     if zvc.any():
         drop_cols = zvc.index[zvc].tolist()
-        if logger: logger._log(f"Dropping {len(drop_cols)} constant covariates: {drop_cols[:10]}{'...' if len(drop_cols)>10 else ''}")
+        if logger:
+            logger._log(f"Dropping {len(drop_cols)} constant covariates: {drop_cols[:10]}{'...' if len(drop_cols)>10 else ''}")
         df.drop(columns=drop_cols, inplace=True)
 
     if std and not df.empty:
         df = (df - df.mean()) / df.std(ddof=ddof)
         bad_cols = [c for c in df.columns if df[c].isna().all()]
         if bad_cols:
-            if logger: logger._log(f"Dropping malformed covariate columns after standardization: {bad_cols}")
+            if logger:
+                logger._log(f"Dropping malformed covariate columns after standardization: {bad_cols}")
             df.drop(columns=bad_cols, inplace=True)
 
     if df.empty:
         raise ValueError("After cleaning, no usable covariates remain.")
 
     C64 = df.to_numpy(dtype=np.float64)
-    Q, _ = np.linalg.qr(C64, mode='reduced')     # Q: (N_kept × p_eff)
+    Q, _ = np.linalg.qr(C64, mode='reduced')
     C = np.asfortranarray(Q)
     R = np.asfortranarray(Q.T)
 
@@ -529,14 +443,14 @@ def read_cov(
         keep_idx_global = np.asarray(sample_idx, dtype=int)[km]
     else:
         keep_idx_global = km
-        
+
     if logger:
         logger._log(f"Read {cov_filename}: kept {C.shape[0]} samples, {C.shape[1]} effective covariates. "
                     f"C shape={C.shape}, R shape=({R.shape[0]},{R.shape[1]}).")
 
     return C, R, keep_idx_global
 
-# -------------------- main class --------------------
+
 class GenomewideLDScore:
     def __init__(self,
                 bed_path,
@@ -553,77 +467,89 @@ class GenomewideLDScore:
                 dtype='float32',
                 num_threads: int | None = None,
                 eps_var: float = 1e-10,
-                rand_samp=None, # float in (0,1] or int in [100, N]
-                ddof = 1,
-                target_xz_mem = 16.0,
-                target_mem = None,
+                rand_samp=None,
+                ddof=1,
+                target_xz_mem=16.0,
+                target_mem=None,
                 device='cpu',
-                use_tp32 = False,
-                correct_skew: bool = False):
-        
-        # ----------- input path ------------ #
+                use_tp32=False,
+                correct_skew: bool = False,
+                hybrid: bool = False,
+                hybrid_window_kb: float = 20000.0):
+
         self.eps_var = float(eps_var)
         prefix = _canonical_bfile_prefix(bed_path)
-        self.bed_prefix = os.path.abspath(prefix)     # optional: make absolute for stability
+        self.bed_prefix = os.path.abspath(prefix)
         self.fam_path   = self.bed_prefix + ".fam"
         self.bim_path   = self.bed_prefix + ".bim"
 
         self.G = open_bed(self.bed_prefix + ".bed")
         self.nsamp, self.nsnps = self.G.shape
-        self.nvecs = num_vecs
-        self.step_size = step_size
+        self.nvecs = int(num_vecs)
+        self.step_size = int(step_size)
         self.log = log
         self.verbose = verbose
         gwldcore.set_verbose(bool(self.verbose))
         self.rand_dist = rand_dist
-        self.root_seed = seed
-        rng = np.random.default_rng(self.root_seed)
-        self.ddof = ddof
+        self.ddof = int(ddof)
         self.target_mem = target_mem
         self.target_xz_mem = target_xz_mem if target_mem is None else target_mem
-        
-        self.correct_skew = bool(correct_skew) # fourth moment finite-sample corrections
+
+        # Hybrid controls
+        self.hybrid = bool(hybrid)
+        self.hybrid_window_kb = float(hybrid_window_kb)
+        self.hybrid_window_bp = int(round(1000.0 * self.hybrid_window_kb))
+        if self.hybrid:
+            if self.hybrid_window_bp <= 0:
+                raise ValueError("--hybrid-window-kb must be > 0 when --hybrid is enabled.")
+            self.log._log(f"[hybrid] enabled with exact local window = {self.hybrid_window_kb:.3f} kb")
+
+        self.correct_skew = bool(correct_skew)
         if self.correct_skew:
             self.log._log(f"[fs-corr] Fourth-moment correction enabled: {self.correct_skew}")
 
-        
-        # If num_threads was explicitly passed, it overrides low_level['num_threads'].
+        # Always resolve a concrete root seed so hybrid local-RP can reproduce the same probes.
+        if seed is None:
+            self.root_seed = int(np.random.SeedSequence().generate_state(1, dtype=np.uint64)[0])
+            self.log._log(f"[seed] No seed provided; using generated root seed {self.root_seed}")
+        else:
+            self.root_seed = int(seed)
+
+        rng = np.random.default_rng(self.root_seed)
+
         explicit_threads = num_threads is not None and int(num_threads) > 0
         if explicit_threads:
             low_level["num_threads"] = int(num_threads)
-        
+
         actual_blas_threads = apply_env(low_level)
-        
+
         if explicit_threads:
             self.num_threads = int(num_threads)
         else:
             self.num_threads = max(1, int(actual_blas_threads))
-        
+
         try:
             gwldcore.set_num_threads(self.num_threads)
             self.log._log(f"[gwldcore] OpenMP threads set to {self.num_threads}")
         except Exception as e:
             self.log._log(f"[gwldcore] set_num_threads failed (non-fatal): {e}")
-        
-        # ---------- device / precision policy ----------
+
         self.device_raw = device
         self.device_kind, self.device_index = _parse_device_str(device)
-        
+
         self.dtype = np.float32 if dtype in (np.float32, 'float32', 'f4') else np.float64
         self.use_tp32 = bool(use_tp32)
         if self.use_tp32 and self.dtype is np.float64:
             self.log._log("[warn] --use-tp32 only affects float32; ignored for float64.")
             self.use_tp32 = False
 
-        # Resolve CUDA now so compute() can just consume a canonical string
         if self.device_kind == "cuda":
             try:
-                import gwldcore_cuda as _gcu  # will fail cleanly if not built
+                import gwldcore_cuda as _gcu
                 gpus = _gcu.list_gpus()
                 if not gpus:
                     raise RuntimeError("CUDA requested but no GPUs are visible.")
                 if self.device_index is None:
-                    # pick the GPU with the most free memory
                     self.device_index = int(max(gpus, key=lambda d: int(d["free_bytes"]))["id"])
                 else:
                     ids = {int(d["id"]) for d in gpus}
@@ -639,13 +565,11 @@ class GenomewideLDScore:
         else:
             self.use_cuda = False
 
-        # Canonical device string consumed by _compute_ldscore()
         self.device = "cpu" if self.device_kind == "cpu" else f"cuda:{self.device_index}"
-        
+
         self.start_time = utils._get_time()
-        self.log._log("Genome-wide LD score calculation started at: "+utils._get_timestr(self.start_time))
-        
-        # -------- resolve random subsample of individuals --------
+        self.log._log("Genome-wide LD score calculation started at: " + utils._get_timestr(self.start_time))
+
         base_idx = np.arange(self.nsamp, dtype=int)
         sel_idx = None
         if rand_samp is not None:
@@ -661,14 +585,12 @@ class GenomewideLDScore:
             sel_idx = np.sort(rng.choice(base_idx, size=k, replace=False))
             self.log._log(f"Randomly subsampling individuals: {k}/{self.nsamp} ({k/self.nsamp:.1%})")
 
-        # read .bim and annotation
         self._read_bim(self.bim_path)
         if annot_path is not None:
             self._read_annot(annot_path)
         else:
             self._read_annot(None)
 
-        # covariates → orthonormal Q (C) and Q^T (cov_R); drop NA rows
         if covar_path is not None:
             C, R, keep_idx_global = read_cov(
                 cov_filename=covar_path,
@@ -680,16 +602,14 @@ class GenomewideLDScore:
                 logger=self.log,
                 verbose=self.verbose,
                 sample_idx=sel_idx if sel_idx is not None else None,
-                ddof = self.ddof
+                ddof=self.ddof
             )
-            # Final selected rows are those covariate-kept (already global indices)
             self.row_sel = np.asarray(keep_idx_global, dtype=int)
             self.C = np.asarray(C, dtype=self.dtype, order='F')
             self.cov_R = np.asarray(R, dtype=self.dtype, order='F')
             self.nsamp = self.C.shape[0]
             self.log._log(f"Final sample count after covariate filtering/subsample: {self.nsamp}")
         else:
-            # No covariates: just use the random subsample or all rows
             self.row_sel = sel_idx if sel_idx is not None else None
             self.C = None
             self.cov_R = None
@@ -703,47 +623,37 @@ class GenomewideLDScore:
         self.N_eff = self.nsamp - self.p_eff
         if self.N_eff <= 1:
             raise ValueError(f"N_eff={self.N_eff} is too small after projection.")
-        
+
         self.outpath = out_path
+        self.inv_sqrt_resvar_all = None
 
-        # storage used by correlation mode
-        self.inv_sqrt_resvar_all = None # (M,) 1/sqrt(Var(M x_m)+eps)
-    
+        # Hybrid metadata populated lazily in _compute_ldscore()
+        self._hyb_chr = None
+        self._hyb_bp = None
+        self._hyb_src_starts = None
+        self._hyb_src_ends = None
+        self._hyb_tgt_blocks = None
+        self._hyb_src_starts_by_tgt = None
+        self._hyb_src_ends_by_tgt = None
+
     def _precompute_residual_variances(self):
-        """
-        Precompute inv sqrt residual variances per SNP, consistent with XtXz.
-        Parallelized over SNP chunks using a thread pool. Each worker:
-        - Opens its own .bed handle (thread-local)
-        - Reads & standardizes the block
-        - Optionally projects with covariates
-        - Returns 1/sqrt(Var) for [s:e)
-
-        We also cap BLAS threads to 1 within the parallel region to avoid
-        oversubscription (NumPy GEMMs in the worker), and choose the number
-        of workers conservatively based on available memory.
-        """
-
         row_sel = self.row_sel if self.row_sel is not None else slice(None)
         inv = np.empty(self.nsnps, dtype=self.dtype)
 
-        # Form SNP blocks
         chunks = [(s, min(self.nsnps, s + self.step_size))
-                for s in range(0, self.nsnps, self.step_size)]
+                  for s in range(0, self.nsnps, self.step_size)]
         if not chunks:
             self.log._log("[warn] No SNP chunks formed; returning zeros.")
             return np.zeros(self.nsnps, dtype=self.dtype)
 
-        # Canonicalized bed/fam prefix (set in __init__)
         bed_prefix = getattr(self, "bed_prefix", None)
         if bed_prefix is None:
-            # Fallback (shouldn't happen if __init__ set it)
             bp = Path(str(getattr(self.G, "filename", None)
-                        or getattr(self.G, "filepath", None) or ""))
+                          or getattr(self.G, "filepath", None) or ""))
             if bp.suffix == ".bed":
                 bp = bp.with_suffix("")
             bed_prefix = str(bp)
 
-        # Worker args (read-only)
         dtype = self.dtype
         ddof  = int(self.ddof)
         C     = self.C if self.C is not None else None
@@ -751,8 +661,6 @@ class GenomewideLDScore:
         N_eff = float(self.N_eff if self.C is not None else self.nsamp)
         eps   = float(self.eps_var)
 
-        # Choose number of workers conservatively to avoid RAM spikes
-        # Rough per-chunk footprint ≈ N * L * itemsize * 3 (G, tmp/proj, Y)
         try:
             avail = int(psutil.virtual_memory().available) if self.target_mem is None else int((self.target_mem * (1024**3)))
         except Exception:
@@ -767,14 +675,11 @@ class GenomewideLDScore:
         else:
             max_by_mem = nominal
         n_workers = max(1, min(nominal, max_by_mem, os.cpu_count() or 1))
-        # Be extra safe: don't spin more workers than chunks
         n_workers = min(min(n_workers, len(chunks)), 16)
-        
 
         self.log._log(f"[resvar] Using {n_workers} workers "
-                    f"(~{_bytes_human(est_per_chunk)} per task; avail={_bytes_human(avail)})")
+                      f"(~{_bytes_human(est_per_chunk)} per task; avail={_bytes_human(avail)})")
 
-        # Execute in parallel
         try:
             with set_parallelism(omp_threads=1, blas_threads=1):
                 with ThreadPoolExecutor(max_workers=n_workers) as ex:
@@ -798,12 +703,11 @@ class GenomewideLDScore:
                         inv[s:e] = inv_part
 
         except Exception as e:
-            # Fallback to serial path on any failure
             self.log._log(f"[resvar] Parallel precompute failed ({e}); falling back to serial.")
             for s, e in chunks:
-                G = self.G.read(index=np.s_[row_sel, s:e], dtype=dtype)  # (N × L)
+                G = self.G.read(index=np.s_[row_sel, s:e], dtype=dtype)
                 means = np.nanmean(G, axis=0, dtype=dtype)
-                stds  = np.nanstd( G, axis=0, dtype=dtype, ddof=ddof)
+                stds  = np.nanstd(G, axis=0, dtype=dtype, ddof=ddof)
                 stds[stds == 0] = 1.0
                 G = (G - means) / stds
                 np.nan_to_num(G, copy=False)
@@ -820,36 +724,14 @@ class GenomewideLDScore:
                 inv[s:e] = (1.0 / np.sqrt(np.maximum(var, self.eps_var))).astype(dtype, copy=False)
 
         return inv
-    
+
     def _estimate_mu22_bins(self, blocks):
-        """
-        Estimate bin-by-bin averaged 4th moments μ̄_{22,ab} in a streaming way.
-
-        For each individual n and bin b, we accumulate
-            S_{n,b} = sum_j annot[j,b] * X_{nj}^2,
-        where X is the *same* standardized/residualized/scaled genotype used
-        for LD correlations:
-
-            1) read geno block from .bed using row_sel
-            2) standardize by column (mean 0, var 1 with ddof=self.ddof)
-            3) project out covariates (if any): Y = (I - C R) * geno
-            4) rescale by inv_sqrt_resvar_all to get unit-var residuals: X = Y * inv_right
-
-        Then:
-            μ̄_{22,ab}
-            = (1 / (N * M_a * M_b)) * sum_n S_{n,a} * S_{n,b},
-
-        where M_a = nsnps_bin[a] is the total annotation mass for bin a
-        (for binary, non-overlapping annotation this is #SNPs in that bin).
-        """
         N = int(self.nsamp)
         B = int(self.nbins)
         if N <= 0 or B <= 0:
             raise RuntimeError("Invalid N or nbins for μ22 estimation.")
 
         row_sel = self.row_sel if self.row_sel is not None else slice(None)
-
-        # S_mat[n, b] = sum_j a_{j,b} * X_{nj}^2
         S_mat = np.zeros((N, B), dtype=np.float64)
 
         self.log._log("[mu22] Estimating bin-by-bin 4th moments μ̄_{22,ab} via streaming over genotype.")
@@ -858,101 +740,45 @@ class GenomewideLDScore:
             if L <= 0:
                 continue
 
-            # 1) read genotype block: (N × L)
             Gblk = self.G.read(index=np.s_[row_sel, s:e], dtype=self.dtype)
-            # 2) standardize within block
             means = np.nanmean(Gblk, axis=0, dtype=self.dtype)
-            stds  = np.nanstd( Gblk, axis=0, dtype=self.dtype, ddof=int(self.ddof))
+            stds  = np.nanstd(Gblk, axis=0, dtype=self.dtype, ddof=int(self.ddof))
             stds[stds == 0] = 1.0
             np.subtract(Gblk, means, out=Gblk)
-            np.divide(  Gblk, stds,  out=Gblk)
+            np.divide(Gblk, stds, out=Gblk)
             np.nan_to_num(Gblk, copy=False)
 
-            # 3) project out covariates if present
             if self.C is not None and self.cov_R is not None:
-                # self.C: (N × p), self.cov_R: (p × N)
-                tmp = self.cov_R @ Gblk         # (p × L)
-                Y   = Gblk - (self.C @ tmp)     # (N × L)
+                tmp = self.cov_R @ Gblk
+                Y   = Gblk - (self.C @ tmp)
                 del tmp
             else:
                 Y = Gblk
 
-            # 4) rescale by inv sqrt residual variance (per SNP column)
-            inv_slice = self.inv_sqrt_resvar_all[s:e].astype(self.dtype, copy=False)  # (L,)
-            # broadcast along rows
+            inv_slice = self.inv_sqrt_resvar_all[s:e].astype(self.dtype, copy=False)
             Y *= inv_slice
 
-            # X^2 in float64 for stability
-            X2 = np.asarray(Y, dtype=np.float64)**2    # (N × L)
-
-            # local annotation block (L × B), cast to float64 to match X2
-            ann_blk = np.asarray(self.annot[s:e], dtype=np.float64)  # (L × B)
-
-            # update S_mat: (N × B) += (N × L) @ (L × B)
-            # => S_mat[n,b] accumulates sum_j a_{j,b} X_{nj}^2 across blocks
+            X2 = np.asarray(Y, dtype=np.float64)**2
+            ann_blk = np.asarray(self.annot[s:e], dtype=np.float64)
             S_mat += X2 @ ann_blk
 
-            # free temporaries
             del Gblk, Y, X2, ann_blk
             try:
                 ctypes.CDLL("libc.so.6").malloc_trim(0)
             except Exception:
                 pass
 
-        # Now S_mat is full; compute S_sum[a,b] = sum_n S_{n,a} S_{n,b}
-        S_sum = S_mat.T @ S_mat          # (B × B), float64
-
-        # M_a = total annotation weight per bin (for binary, = #SNPs in bin a)
-        M = np.asarray(self.nsnps_bin, dtype=np.float64)  # (B,)
-
-        # avoid division by zero for empty bins
-        M_outer = M[:, None] * M[None, :]  # (B × B)
+        S_sum = S_mat.T @ S_mat
+        M = np.asarray(self.nsnps_bin, dtype=np.float64)
+        M_outer = M[:, None] * M[None, :]
         with np.errstate(divide="ignore", invalid="ignore"):
             mu22 = S_sum / (float(N) * M_outer)
-            mu22[~np.isfinite(mu22)] = 0.0  # any 0/0 or inf → 0
+            mu22[~np.isfinite(mu22)] = 0.0
 
         self.log._log("[mu22] Finished μ̄_{22,ab} estimation.")
         return mu22
 
     def _compute_block_corrections(self, meansq_raw, mu22, bin_idx):
-        """
-        Given:
-          - meansq_raw[j, b] ≈ sum_{k in bin b} r_{jk}^2   (pre-baseline LD scores),
-          - mu22[a, b]  ≈ μ̄_{22,ab} = (1 / (N M_a M_b)) sum_n S_{n,a} S_{n,b},
-
-        and letting:
-          - N       = self.nsamp  (actual #rows after any filtering),
-          - d       = correlation denominator used in XtXz (approx):
-                        d = N - ddof  (no covariates),
-                        d = N_eff    (with covariates),
-          - M_a     = size of bin a (from bin_idx, assuming binary non-overlapping),
-          - S_ab    = sum_{j in bin a} meansq_raw[j, b]
-                    = sum_{j in a, k in b} r_{jk}^2,
-
-        we use the exact finite-sample identity:
-
-            E[r_{jk}^2] = (1/d^2) * (N * μ_{22,jk} + N(N-1) * ρ_{jk}^2),
-
-        to derive block-averaged quantities for each bin pair (a,b):
-
-            R2_ab   = (1 / (M_a M_b)) sum_{j in a, k in b} r_{jk}^2
-                    = S_ab / (M_a M_b),
-
-            ρ2_ab   = average population LD^2:
-                      = (d^2 * R2_ab - N * μ̄_{22,ab}) / (N (N-1)),
-
-        and total finite-sample bias:
-
-            B_ab    = sum_{j in a, k in b} (r_{jk}^2 - ρ_{jk}^2)
-                    = S_ab - M_a M_b * ρ2_ab.
-
-        We also define the block-level δ:
-
-            δ̄_{ab} = μ̄_{22,ab} - (1 + 2 ρ2_ab),
-
-        and store:
-            self.r2_block, self.rho2_block, self.bias_block, self.mu22_block, self.delta_block
-        """
         B = int(self.nbins)
         N = float(self.nsamp)
 
@@ -962,7 +788,6 @@ class GenomewideLDScore:
             d = float(self.nsamp - self.ddof)
 
         mu22_block = np.asarray(mu22, dtype=np.float64)
-        # M_a: #SNPs in each bin (assuming binary annotation)
         M_a = np.array([len(idx) for idx in bin_idx], dtype=np.float64)
 
         R2_block   = np.zeros((B, B), dtype=np.float64)
@@ -979,40 +804,30 @@ class GenomewideLDScore:
                 if Mb <= 0:
                     continue
 
-                # S_ab = sum_{j in bin a, k in bin b} r_{jk}^2
-                # approximated as sum_{j in bin a} meansq_raw[j, b]
                 S_ab = float(np.sum(meansq_raw[idx_a, b], dtype=np.float64))
                 if S_ab == 0.0:
                     continue
 
                 R2_ab = S_ab / (Ma * Mb)
                 mu_ab = float(mu22_block[a, b])
-
-                # ρ2_ab per bin-pair (exact in expectation for given N, d)
-                # E[r^2] = (1/d^2)(N μ22 + N(N-1) ρ^2)  ⇒
-                # ρ^2 = (d^2 R2_ab - N μ̄22_ab) / (N(N-1))
                 rho2_ab = (d**2 * R2_ab - N * mu_ab) / (N * (N - 1.0))
 
                 R2_block[a, b]   = R2_ab
                 rho2_block[a, b] = rho2_ab
-
                 sum_rho2 = Ma * Mb * rho2_ab
                 bias_block[a, b] = S_ab - sum_rho2
 
-        # Store core block-level objects
         self.r2_block   = R2_block
         self.rho2_block = rho2_block
         self.bias_block = bias_block
         self.mu22_block = mu22_block
 
-        # ---- Compute and log δ̄_{ab} = μ̄_{22,ab} - (1 + 2 ρ2_ab) ----
         delta_block = mu22_block - (1.0 + 2.0 * rho2_block)
         self.delta_block = delta_block
 
         self.log._log("[fs-corr] Estimated block-level R2, ρ2, bias, μ22 and δ (μ̄22 - (1 + 2ρ²)).")
 
         try:
-            import pandas as pd
             df_delta = pd.DataFrame(
                 delta_block,
                 index=self.l2cols,
@@ -1024,27 +839,18 @@ class GenomewideLDScore:
                 self.log._log("[fs-corr] Block-level δ matrix (rows/cols = annotation bins):")
                 self.log._log("\n" + df_delta.to_string())
         except Exception as e:
-            # Fallback: plain numpy print
             self.log._log(f"[fs-corr] Failed to pretty-print δ matrix via pandas ({e}); using numpy.")
             self.log._log(repr(delta_block))
 
-
-    # ------------------ I/O helpers ------------------
     def _read_annot(self, annot_path):
-        """
-        Read annotation for gw_ldscore:
-        • LDSC-style full .annot(.gz): columns [CHR, BP, SNP, CM, <bins...>]
-        • or 'thin' matrix (no base cols), via utils._read_with_optional_header.
-        Supports binary OR continuous annotations. Values must be >= 0.
-        Final row order MUST match .bim SNP order and length (no dropping).
-        """
         if annot_path is None:
             self.l2cols = None
             self.annot = np.ones((self.nsnps, 1), dtype=np.float64)
             self.nbins = 1
-            self.nsnps_bin = self.annot.sum(axis=0, dtype=np.float64)  # ∑ weights (here = M)
-            self.log._log("Calculating genome-wide (non-partitioned) LD score")
             self.l2cols = [f"L2_{i}" for i in range(self.nbins)]
+            self.nsnps_bin = self.annot.sum(axis=0, dtype=np.float64)
+            self.annot = np.ascontiguousarray(self.annot.astype(self.dtype, copy=False))
+            self.log._log("Calculating genome-wide (non-partitioned) LD score")
             self.log._log(f"Number of samples: {self.nsamp}")
             self.log._log(f"Number of total SNPs: {self.nsnps}, annotation shape: {self.annot.shape}")
             return
@@ -1052,7 +858,7 @@ class GenomewideLDScore:
         parsed_ldsc = False
         try:
             df = pd.read_csv(annot_path, sep=r'\s+', compression='infer',
-                            dtype={'CHR':str, 'BP':np.int64, 'SNP':str, 'CM':float})
+                             dtype={'CHR': str, 'BP': np.int64, 'SNP': str, 'CM': float})
             base_cols = {'CHR', 'BP', 'SNP', 'CM'}
             if base_cols.issubset(set(df.columns)) and 'SNP' in df.columns:
                 annot_cols = [c for c in df.columns if c not in base_cols]
@@ -1065,9 +871,10 @@ class GenomewideLDScore:
                 if ann_snps == bim_snps:
                     ann_mat = df[annot_cols].to_numpy(dtype=np.float64, copy=False)
                 else:
-                    ann_set = set(ann_snps); bim_set = set(bim_snps)
+                    ann_set = set(ann_snps)
+                    bim_set = set(bim_snps)
                     missing_in_annot = len(bim_set - ann_set)
-                    extra_in_annot   = len(ann_set - bim_set)
+                    extra_in_annot = len(ann_set - bim_set)
                     if missing_in_annot > 0:
                         raise ValueError(
                             f"Annotation SNP set is missing {missing_in_annot} BIM SNP(s); "
@@ -1075,11 +882,10 @@ class GenomewideLDScore:
                         )
                     if extra_in_annot > 0:
                         self.log._log(f"[info] Annotation contains {extra_in_annot} extra SNP(s) not in BIM; "
-                                    f"keeping BIM SNPs only and reordering to BIM.")
+                                      f"keeping BIM SNPs only and reordering to BIM.")
                     ann_mat = df.set_index('SNP').loc[bim_snps, annot_cols].to_numpy(dtype=np.float64, copy=False)
 
-                # --- sanitize & flag continuous ---
-                np.nan_to_num(ann_mat, copy=False)  # replace NaN/±inf with finite values (0 by default)
+                np.nan_to_num(ann_mat, copy=False)
                 if (ann_mat < 0).any():
                     self.log._log("[warn] Negative annotation values found; clipping to 0.")
                     ann_mat[ann_mat < 0] = 0.0
@@ -1119,64 +925,134 @@ class GenomewideLDScore:
 
         if self.annot.shape[0] != self.nsnps:
             self.log._log(f"!!! number of SNPs in annotation ({self.annot.shape[0]}) "
-                        f"does not match the input genotype file ({self.nsnps}) !!!")
+                          f"does not match the input genotype file ({self.nsnps}) !!!")
             sys.exit(1)
 
-        # For continuous: this is ∑_j a_{j,k}; for binary: #SNPs in bin.
         self.nsnps_bin = self.annot.sum(axis=0, dtype=np.float64)
+        self.annot = np.ascontiguousarray(self.annot.astype(self.dtype, copy=False))
 
         self.log._log(f"Number of samples: {self.nsamp}")
         self.log._log(f"Number of total SNPs: {self.nsnps}, annotation shape: {self.annot.shape}")
         self.log._log(f"Nbins: {self.nbins}")
 
-
     def _read_bim(self, bim_path):
-        if (bim_path is None):
+        if bim_path is None:
             self.log._log("No .bim file is provided; all (anonymous) SNPs will be used")
             self.snplist = None
         else:
             self.log._log(f"Reading {bim_path} for SNPs")
             self.snplist = pd.read_csv(bim_path, header=None, sep=r'\s+')
             self.snplist.columns = ['CHR', 'SNP', 'CM', 'BP', 'A1', 'A2']
-        if (len(self.snplist) != self.nsnps):
+        if len(self.snplist) != self.nsnps:
             self.log._log(f"!!! The number of SNPs in the .bed file ({self.nsnps}) does not match the .bim file ({len(self.snplist)}) !!!")
             sys.exit(1)
-    
+
     def _partition_index(self, snpidx, annot) -> list[np.ndarray]:
         return [snpidx[(annot[:, c] != 0)] for c in range(self.nbins)]
 
+    def _prepare_hybrid_plan(self, src_blocks):
+        if not self.hybrid:
+            return
+        if self.snplist is None:
+            raise ValueError("Hybrid mode requires a .bim file with CHR/BP columns.")
 
-    # ------------------ main compute ------------------
+        chr_codes, _ = pd.factorize(self.snplist["CHR"].astype(str), sort=False)
+        chr_codes = np.asarray(chr_codes, dtype=np.int32)
+        bp = self.snplist["BP"].to_numpy(dtype=np.int64, copy=True)
+
+        # Validate monotone BP within chromosome.
+        p = 0
+        while p < self.nsnps:
+            c = chr_codes[p]
+            q = p + 1
+            while q < self.nsnps and chr_codes[q] == c:
+                q += 1
+            if q - p > 1:
+                if np.any(np.diff(bp[p:q]) < 0):
+                    raise ValueError(f"Hybrid mode requires nondecreasing BP within chromosome block; failed on CHR={self.snplist.loc[p, 'CHR']}.")
+            p = q
+
+        src_starts = np.asarray([s for s, _ in src_blocks], dtype=np.int32)
+        src_ends   = np.asarray([e for _, e in src_blocks], dtype=np.int32)
+
+        src_first_chr = chr_codes[src_starts]
+        src_last_chr  = chr_codes[src_ends - 1]
+        src_single_chr = (src_first_chr == src_last_chr)
+        src_min_bp = bp[src_starts]
+        src_max_bp = bp[src_ends - 1]
+
+        src_by_chr = {}
+        for bi in range(len(src_blocks)):
+            c0 = int(src_first_chr[bi])
+            c1 = int(src_last_chr[bi])
+            src_by_chr.setdefault(c0, []).append(bi)
+            if c1 != c0:
+                src_by_chr.setdefault(c1, []).append(bi)
+
+        W = int(self.hybrid_window_bp)
+        tgt_blocks = []
+        src_starts_by_tgt = []
+        src_ends_by_tgt = []
+
+        p = 0
+        while p < self.nsnps:
+            c = int(chr_codes[p])
+            q = p + 1
+            while q < self.nsnps and chr_codes[q] == c:
+                q += 1
+
+            for s in range(p, q, self.step_size):
+                e = min(q, s + self.step_size)
+                tgt_blocks.append((s, e))
+                tmin = int(bp[s])
+                tmax = int(bp[e - 1])
+
+                cand = []
+                for bi in src_by_chr.get(c, []):
+                    if src_single_chr[bi]:
+                        if src_max_bp[bi] < (tmin - W):
+                            continue
+                        if src_min_bp[bi] > (tmax + W):
+                            continue
+                    cand.append(bi)
+
+                src_starts_by_tgt.append(np.ascontiguousarray(src_starts[np.asarray(cand, dtype=np.int32)], dtype=np.int32))
+                src_ends_by_tgt.append(np.ascontiguousarray(src_ends[np.asarray(cand, dtype=np.int32)], dtype=np.int32))
+
+            p = q
+
+        self._hyb_chr = np.ascontiguousarray(chr_codes, dtype=np.int32)
+        self._hyb_bp = np.ascontiguousarray(bp, dtype=np.int64)
+        self._hyb_src_starts = src_starts
+        self._hyb_src_ends = src_ends
+        self._hyb_tgt_blocks = tgt_blocks
+        self._hyb_src_starts_by_tgt = src_starts_by_tgt
+        self._hyb_src_ends_by_tgt = src_ends_by_tgt
+
+        nn = np.asarray([len(x) for x in src_starts_by_tgt], dtype=np.int32)
+        self.log._log(
+            f"[hybrid] prepared {len(tgt_blocks)} target block(s); "
+            f"candidate source blocks per target min/median/max = "
+            f"{int(nn.min()) if len(nn) else 0}/{int(np.median(nn)) if len(nn) else 0}/{int(nn.max()) if len(nn) else 0}"
+        )
+
     def _compute_ldscore(self):
-        """
-        Streamed, balanced V-tiling pipeline with a single progress bar over (vtiles × blocks).
-
-        Steps:
-        0) Precompute per-SNP inv sqrt residual variances (right side).
-        1) Build SNP blocks; precompute Kmax per block from annotation.
-        2) Choose an initial V-tile from a memory budget, then BALANCE tiles evenly.
-        3) For each balanced V-tile:
-            Phase 1: build Xz_chunk (N × B·Vt) across all blocks (skip if Kmax==0)
-            Phase 2: consume Xz_chunk across all blocks (skip if Kmax==0)
-            Accumulate weighted by Vt
-        4) Finalize: divide by total V, subtract baseline, save; print summaries.
-        """
         self.log._log(f"num_vecs: {self.nvecs}, step_size: {self.step_size}, seed: {self.root_seed}")
         self.log._log(f"Using {self.rand_dist} random vectors.")
         if self.C is not None:
             self.log._log(f"Covariate-adjusted partial correlations (N_eff={self.N_eff}, p={self.p_eff}).")
         else:
             self.log._log("No covariates: standard LD scores (squared correlations).")
-        
-        H = self.num_threads   # after affinity-aware pick
-        t_blas1 = min(4, max(1, H // 4))  # e.g. 2–4
+        if self.hybrid:
+            self.log._log(f"[hybrid] exact-local + randomized-global-minus-local with window {self.hybrid_window_kb:.3f} kb")
+
+        H = self.num_threads
+        t_blas1 = min(4, max(1, H // 4))
         t_omp1 = max(1, H // t_blas1)
 
-        # -------------------- Phase 0: per-SNP residual variances --------------------
         with set_parallelism(omp_threads=min(self.num_threads, 16), blas_threads=t_blas1):
-            self.inv_sqrt_resvar_all = self._precompute_residual_variances()
+            self.inv_sqrt_resvar_all = np.ascontiguousarray(self._precompute_residual_variances().astype(self.dtype, copy=False))
 
-        # -------------------- Build SNP blocks --------------------
         blocks = []
         for j in range(0, self.nsnps, self.step_size):
             s = j
@@ -1184,10 +1060,9 @@ class GenomewideLDScore:
             blocks.append((s, e))
         self.nblks = len(blocks)
 
-        # -------------------- Precompute Kmax per block (trust hints) ----------------
-        kmax_per_block: list[int] = []
+        kmax_per_block = []
         for (s, e) in blocks:
-            blk = self.annot[s:e]  # (L x B)
+            blk = self.annot[s:e]
             Kmax = int((blk != 0).sum(axis=0).max())
             kmax_per_block.append(Kmax)
         if any(k == 0 for k in kmax_per_block):
@@ -1195,27 +1070,30 @@ class GenomewideLDScore:
             self.log._log(f"[info] {zc} block(s) have Kmax=0 (will be skipped).")
         if kmax_per_block:
             self.log._log(f"Kmax per block (min/median/max): "
-                        f"{min(kmax_per_block)}/{int(np.median(kmax_per_block))}/{max(kmax_per_block)}")
+                          f"{min(kmax_per_block)}/{int(np.median(kmax_per_block))}/{max(kmax_per_block)}")
 
-        # -------------------- Choose initial V-chunk by memory budget ----------------
-        # Target memory for Xz panel (N x (B*Vt)) in GiB; you can set self.target_xz_gib
+        if self.hybrid:
+            self._prepare_hybrid_plan(blocks)
+            hyb_maxL = max(e - s for (s, e) in self._hyb_tgt_blocks) if self._hyb_tgt_blocks else 0
+            hyb_local_buf = np.zeros((hyb_maxL, self.nbins), dtype=self.dtype, order='C')
+            hyb_exact_buf = np.zeros((hyb_maxL, self.nbins), dtype=self.dtype, order='C')
+        else:
+            hyb_local_buf = None
+            hyb_exact_buf = None
+
         target_gib = float(getattr(self, "target_xz_mem", 16.0))
         itemsize = np.dtype(self.dtype).itemsize
         denom = max(1, int(self.nsamp) * int(self.nbins) * itemsize)
         vtile_guess = int((target_gib * (1024**3)) // denom)
-        # Clamp to [min, nvecs]; keep it reasonable for big runs
         vtile_guess = max(256, min(self.nvecs, vtile_guess))
-        # If guess is too small/large, fall back to something sane
         if vtile_guess <= 0:
             vtile_guess = min(self.nvecs, 4096)
 
-        # BALANCED TILING: number of tiles then even split
         ntiles = int(np.ceil(self.nvecs / vtile_guess))
         ntiles = max(1, ntiles)
         base = (self.nvecs // ntiles)
-        rem  = (self.nvecs %  ntiles)
+        rem  = (self.nvecs % ntiles)
         vtiles = [((base + (1 if i < rem else 0) + 63)//64)*64 for i in range(ntiles)]
-        # fix last tile to hit sum(V)
         vtiles[-1] = self.nvecs - sum(vtiles[:-1])
         vtiles = [v for v in vtiles if v > 0]
         assert sum(vtiles) == self.nvecs
@@ -1232,34 +1110,27 @@ class GenomewideLDScore:
             )
         self.log._log(f"Streaming with BALANCED V-tiles: {vtiles} (total V = {self.nvecs})")
 
-        # -------------------- Paths / common args --------------------
         bed_prefix = self.bed_prefix
         fam_path   = self.fam_path
         row_sel = self.row_sel if self.row_sel is not None else None
         ddof    = int(self.ddof)
         B       = int(self.nbins)
 
-        # -------------------- Accumulators & scratch --------------------
         meansq_accum = np.zeros((self.nsnps, self.nbins), dtype=self.dtype, order='C')
-
-        # Preallocate Xz_chunk once at max tile width = B * max(vtiles)
-        Vmax      = max(vtiles) if vtiles else 0
-        Xz_chunk  = np.zeros((self.nsamp, int(self.nbins) * int(Vmax)),
+        Vmax = max(vtiles) if vtiles else 0
+        Xz_chunk = np.zeros((self.nsamp, int(self.nbins) * int(Vmax)),
                             dtype=self.dtype, order='F')
         meansq_chunk = np.zeros_like(meansq_accum, dtype=self.dtype, order='C')
-        
-        ann_blocks = [np.ascontiguousarray(self.annot[s:e].astype(self.dtype, copy=False)) for (s,e) in blocks]
-        inv_blocks = [np.ascontiguousarray(self.inv_sqrt_resvar_all[s:e].astype(self.dtype, copy=False)) for (s,e) in blocks]
 
+        ann_blocks = [np.ascontiguousarray(self.annot[s:e]) for (s, e) in blocks]
+        inv_blocks = [np.ascontiguousarray(self.inv_sqrt_resvar_all[s:e]) for (s, e) in blocks]
 
-        # -------------------- Progress bar over vtiles × blocks ----------------------
-        total_units = len(vtiles) * len(blocks)
+        total_units = len(vtiles) * (len(blocks) + (len(self._hyb_tgt_blocks) if self.hybrid else 0))
         bar = tqdm(total=total_units, desc="GW-LD progress", unit="task", smoothing=0.2, miniters=1)
 
-        # EMA for phase weight (fraction for Phase-1)
         ema_p1 = 0.0
         ema_p2 = 0.0
-        w1 = 0.5  # neutral start
+        w1 = 0.5
 
         try:
             v_start = 0
@@ -1268,13 +1139,10 @@ class GenomewideLDScore:
                 Xz_view = Xz_chunk[:, :used_cols]
                 Xz_view.fill(0)
 
-                # ---------------------- Phase 1 (chunked) ----------------------
-                # OMP = many; BLAS = 1
                 t1_total = 0.0
                 with set_parallelism(omp_threads=t_omp1, blas_threads=t_blas1):
                     for blk_idx, (s, e) in enumerate(blocks):
                         kmax_hint = int(kmax_per_block[blk_idx])
-
                         if kmax_hint == 0:
                             bar.update(1.0)
                             continue
@@ -1289,42 +1157,35 @@ class GenomewideLDScore:
                             blk_start=int(s), blk_end=int(e),
                             row_sel=row_sel,
                             ddof=ddof,
-                            annot_blk=annot_blk,              # (L x B)
-                            inv_right=inv_right,              # (L,)
-                            v_start=int(v_start),             # seed offset
+                            annot_blk=annot_blk,
+                            inv_right=inv_right,
+                            v_start=int(v_start),
                             v_count=int(Vt),
-                            kmax_hint=kmax_hint,              # TRUST
+                            kmax_hint=kmax_hint,
                             rand_dist=self.rand_dist,
                             seed=self.root_seed,
-                            Xz2d_chunk=Xz_view,               # (N x (B*Vt)) Fortran, V-major
+                            Xz2d_chunk=Xz_view,
                             project_right=False,
                             C=(self.C if self.C is not None else None),
                             R=(self.cov_R if self.C is not None else None)
                         )
                         t1_total += (time.perf_counter() - t0)
-
                         bar.update(w1)
 
-                # ---------------------- Phase 2 ----------------------
                 pref_ex = ThreadPoolExecutor(max_workers=1)
-                pref_fut = None
-                        
                 meansq_chunk.fill(0)
                 t2_total = 0.0
 
                 dev_kind, dev_idx_req = _parse_device_str(getattr(self, "device", "cpu"))
                 use_tf32 = bool(getattr(self, "use_tp32", False))
-
                 use_cuda_backend = False
                 gcu = None
                 if dev_kind == "cuda":
                     try:
                         import gwldcore_cuda as gcu
-                        # choose device: explicit index wins; otherwise auto by free mem
                         if dev_idx_req is None:
                             dev_idx, free_b, tot_b = _pick_cuda_index_auto(gcu)
                         else:
-                            # sanity check via list_gpus()
                             gl = gcu.list_gpus()
                             ids = {int(g["id"]) for g in gl}
                             if dev_idx_req not in ids:
@@ -1337,21 +1198,19 @@ class GenomewideLDScore:
                         self.log._log(f"[GPU] Falling back to CPU: {e}")
                         use_cuda_backend = False
 
-                # OMP/BLAS threads: GPU path wants no host BLAS
+                if self.C is not None:
+                    N_denom = int(self.N_eff)
+                else:
+                    N_denom = int(self.nsamp - self.ddof + 1)
+
                 if use_cuda_backend:
-                    # OMP=1, BLAS=1 to avoid stealing cores while the GPU runs
                     with set_parallelism(omp_threads=1, blas_threads=1):
                         for blk_idx, (s, e) in enumerate(blocks):
                             kmax_hint = int(kmax_per_block[blk_idx])
                             if kmax_hint == 0:
                                 continue
 
-                            inv_left  = inv_blocks[blk_idx]
-                            if self.C is not None:
-                                N_denom = int(self.N_eff)
-                            else:
-                                N_denom = int(self.nsamp - self.ddof + 1)
-
+                            inv_left = inv_blocks[blk_idx]
                             t0 = time.perf_counter()
                             gcu.phase2_compute_XtXz_bed(
                                 bed_prefix=bed_prefix,
@@ -1373,27 +1232,20 @@ class GenomewideLDScore:
                             t2_total += (time.perf_counter() - t0)
                             bar.update(1.0 - w1)
                 else:
-                    # CPU path (unchanged)
                     with set_parallelism(omp_threads=1, blas_threads=self.num_threads):
                         for blk_idx, (s, e) in enumerate(blocks):
                             kmax_hint = int(kmax_per_block[blk_idx])
                             if kmax_hint == 0:
                                 continue
-                            inv_left  = inv_blocks[blk_idx]
-                            if self.C is not None:
-                                N_denom = int(self.N_eff)
-                            else:
-                                N_denom = int(self.nsamp - self.ddof + 1)
-                            
-                            # schedule prefetch for NEXT block while we compute current
+                            inv_left = inv_blocks[blk_idx]
+
                             if blk_idx + 1 < len(blocks):
                                 s2, e2 = blocks[blk_idx + 1]
-                                # fire-and-forget; if previous prefetch still running, let it finish (single worker queue)
-                                pref_fut = pref_ex.submit(
+                                pref_ex.submit(
                                     gwldcore.prefetch_bed_block,
                                     bed_prefix, fam_path,
                                     int(s2), int(e2),
-                                    1,  # ahead_blocks
+                                    1,
                                 )
 
                             t0 = time.perf_counter()
@@ -1415,25 +1267,69 @@ class GenomewideLDScore:
                             t2_total += (time.perf_counter() - t0)
                             bar.update(1.0 - w1)
 
-                # end prefetch
                 pref_ex.shutdown(wait=True)
-
-                # Weighted combine across tiles
                 meansq_accum += (meansq_chunk * Vt)
 
-                # Adapt phase weight (EMA)
+                if self.hybrid:
+                    # Hybrid local correction lives on CPU and is additive/subtractive to the existing accumulator.
+                    with set_parallelism(omp_threads=1, blas_threads=self.num_threads):
+                        for hb_idx, (hs, he) in enumerate(self._hyb_tgt_blocks):
+                            Lh = he - hs
+                            loc_view = hyb_local_buf[:Lh, :]
+                            loc_view.fill(0)
+
+                            if vt_idx == 0:
+                                ex_view = hyb_exact_buf[:Lh, :]
+                                ex_view.fill(0)
+                            else:
+                                ex_view = None
+
+                            src_starts = self._hyb_src_starts_by_tgt[hb_idx]
+                            src_ends = self._hyb_src_ends_by_tgt[hb_idx]
+
+                            if len(src_starts) > 0:
+                                gwldcore.phase2_compute_local_hybrid_bed(
+                                    bed_prefix=bed_prefix,
+                                    fam_path=fam_path,
+                                    tgt_start=int(hs),
+                                    tgt_end=int(he),
+                                    row_sel=row_sel,
+                                    ddof=ddof,
+                                    inv_all=self.inv_sqrt_resvar_all,
+                                    annot_all=self.annot,
+                                    chr_code_all=self._hyb_chr,
+                                    bp_all=self._hyb_bp,
+                                    src_starts=src_starts,
+                                    src_ends=src_ends,
+                                    window_bp=int(self.hybrid_window_bp),
+                                    v_start=int(v_start),
+                                    v_count=int(Vt),
+                                    rand_dist=self.rand_dist,
+                                    seed=self.root_seed,
+                                    localrp_out=loc_view,
+                                    exact_out=(ex_view if vt_idx == 0 else None),
+                                    C=(self.C if self.C is not None else None),
+                                    R=(self.cov_R if self.C is not None else None),
+                                    N_denom=int(N_denom),
+                                )
+
+                                meansq_accum[hs:he, :] -= (loc_view * Vt)
+                                if vt_idx == 0:
+                                    meansq_accum[hs:he, :] += (ex_view * self.nvecs)
+
+                            bar.update(1.0)
+
                 ema_p1 = 0.85 * ema_p1 + 0.15 * max(t1_total, 1e-9)
                 ema_p2 = 0.85 * ema_p2 + 0.15 * max(t2_total, 1e-9)
                 w1 = float(ema_p1 / (ema_p1 + ema_p2))
                 bar.set_postfix_str(f"tile {vt_idx+1}/{len(vtiles)} | w1={w1:.2f} | P1={t1_total:.1f}s P2={t2_total:.1f}s")
 
-                # Housekeeping
                 try:
                     ctypes.CDLL("libc.so.6").malloc_trim(0)
                 except Exception:
                     pass
 
-                v_start += Vt  # advance seed offset
+                v_start += Vt
 
         finally:
             try:
@@ -1441,21 +1337,15 @@ class GenomewideLDScore:
             except Exception:
                 pass
 
-         # ---------------------- Finalize ----------------------
         meansq = (meansq_accum / float(self.nvecs)).astype(self.dtype, copy=False)
 
-        # -------- Optional: 4th-moment-based finite-sample correction diagnostics --------
-        # Default behavior: SKIP mu22/delta work entirely & avoid saving .gw.delta unless enabled.
         if not self.correct_skew:
-            # Ensure these attrs don't accidentally exist from a prior run in the same process
             self.mu22_block = None
             self.delta_block = None
             self.r2_block = None
             self.rho2_block = None
             self.bias_block = None
         else:
-            # Keep a copy of the *raw* sample-based LDscore panel before any baseline subtraction:
-            # meansq_raw[j, b] ≈ sum_{k in bin b} r_{jk}^2.
             meansq_raw = np.asarray(meansq, dtype=np.float64, order="C")
             try:
                 mu22 = self._estimate_mu22_bins(blocks)
@@ -1472,15 +1362,12 @@ class GenomewideLDScore:
                     )
             except Exception as e:
                 self.log._log(f"[fs-corr] Failed to compute 4th-moment-based corrections: {e}")
-                # keep these clean if partial failure
                 self.mu22_block = None
                 self.delta_block = None
                 self.r2_block = None
                 self.rho2_block = None
                 self.bias_block = None
 
-        # -------- Default finite-sample correction (always) --------
-        # Classic LDSC-style baseline subtraction
         N_denom = float(self.N_eff - 1.0 if self.C is not None else self.nsamp - self.ddof)
         self.log._log("Applying correlation null: subtracting M_k / N_denom per bin.")
         meansq -= (self.nsnps_bin / N_denom).astype(meansq.dtype, copy=False)[None, :]
@@ -1488,18 +1375,17 @@ class GenomewideLDScore:
         self.gwldscore = meansq.astype(np.float64, copy=False)
 
         self.log._log(f"Saving the genome-wide (partitioned) LD scores into: {self.outpath}.gw.ldscore.gz")
-        snpcols = ['CHR','SNP','BP']
+        snpcols = ['CHR', 'SNP', 'BP']
         if self.snplist is None:
-            self.snpdf = pd.DataFrame(np.nan*np.ones((self.nsnps, 3)), columns=snpcols)
+            self.snpdf = pd.DataFrame(np.nan * np.ones((self.nsnps, 3)), columns=snpcols)
         else:
-            self.snpdf = self.snplist[['CHR','SNP','BP']].copy()
+            self.snpdf = self.snplist[['CHR', 'SNP', 'BP']].copy()
             self.snpdf.columns = snpcols
 
         scores_df = pd.DataFrame(self.gwldscore, columns=self.l2cols)
         out_df = pd.concat([self.snpdf, scores_df], axis=1)
         out_df.to_csv(f'{self.outpath}.gw.ldscore.gz', index=False, compression='gzip', sep='\t', float_format='%.6f')
-        
-        # -------- Optional: Save block-level δ̄_{ab} to <outpath>.gw.delta --------
+
         if self.correct_skew:
             try:
                 if getattr(self, "delta_block", None) is not None:
@@ -1516,10 +1402,6 @@ class GenomewideLDScore:
             except Exception as e:
                 self.log._log(f"[fs-corr] Failed to save δ matrix (.gw.delta): {e}")
 
-
-
-
-        # Summaries (best-effort)
         try:
             desc = scores_df.describe(percentiles=[0.25,0.5,0.75]).loc[['count','mean','std','min','25%','50%','75%','max']]
             self.log._log("Per-bin LD score summary (count/mean/std/min/25%/50%/75%/max):")
@@ -1546,8 +1428,8 @@ class GenomewideLDScore:
             self.log._log(f"[warn] Failed to compute summary stats / correlation: {e}")
 
         self.end_time = utils._get_time()
-        self.log._log(f"Calculation of genome-wide LD score ended at "+utils._get_timestr(self.end_time))
+        self.log._log(f"Calculation of genome-wide LD score ended at " + utils._get_timestr(self.end_time))
         self.runtime = self.end_time - self.start_time
-        self.log._log("Runtime: "+format(self.runtime, '.3f')+
-                    f" s ({self.runtime//3600} hr {(self.runtime%3600)//60} m {(self.runtime%60):.3f} s)")
-        self.log._save_log(self.outpath+".gw.log")
+        self.log._log("Runtime: " + format(self.runtime, '.3f') +
+                      f" s ({self.runtime//3600} hr {(self.runtime%3600)//60} m {(self.runtime%60):.3f} s)")
+        self.log._save_log(self.outpath + ".gw.log")
