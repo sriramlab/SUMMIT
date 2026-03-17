@@ -20,11 +20,34 @@ class JackknifeSpec:
     delete: int = 1
     nrep: int | None = None
     seed: int | None = None
+    block_balance: str = "snp"      # snp | ldscore | ldtrace
+    min_block_snps: int = 1
 
     @classmethod
-    def parse(cls, njack) -> "JackknifeSpec":
+    def parse(
+        cls,
+        njack,
+        *,
+        block_balance: str = "snp",
+        min_block_snps: int = 1,
+    ) -> "JackknifeSpec":
+        block_balance = str(block_balance).strip().lower()
+        if block_balance not in {"snp", "ldscore", "ldtrace"}:
+            raise ValueError(
+                f"block_balance must be one of {{'snp','ldscore','ldtrace'}}, got {block_balance!r}"
+            )
+
+        min_block_snps = int(min_block_snps)
+        if min_block_snps <= 0:
+            raise ValueError("min_block_snps must be >= 1")
+
         if njack is None:
-            return cls(mode="block", nblocks=100)
+            return cls(
+                mode="block",
+                nblocks=100,
+                block_balance=block_balance,
+                min_block_snps=min_block_snps,
+            )
 
         if isinstance(njack, str):
             s = njack.strip().lower()
@@ -65,12 +88,126 @@ class JackknifeSpec:
             nblocks = int(float(s))
             if nblocks <= 0:
                 raise ValueError(f"njack must be positive; got {njack!r}")
-            return cls(mode="block", nblocks=nblocks)
+            return cls(
+                mode="block",
+                nblocks=nblocks,
+                block_balance=block_balance,
+                min_block_snps=min_block_snps,
+            )
 
         nblocks = int(njack)
         if nblocks <= 0:
             raise ValueError(f"njack must be positive; got {njack!r}")
-        return cls(mode="block", nblocks=nblocks)
+        return cls(
+            mode="block",
+            nblocks=nblocks,
+            block_balance=block_balance,
+            min_block_snps=min_block_snps,
+        )
+
+
+def _equal_count_block_boundaries(M: int, B: int):
+    if not (1 <= B <= M):
+        raise ValueError(f"Need 1 <= nblocks <= nsnps, got B={B}, M={M}")
+    edges = np.floor(np.linspace(0, M, B + 1)).astype(np.int64)
+    edges[-1] = M
+    starts = edges[:-1].copy()
+    ends = edges[1:].copy()
+    if np.any(ends <= starts):
+        raise RuntimeError("Equal-count partition produced an empty block.")
+    return starts, ends
+
+
+def _per_snp_block_mass(trace_view, metric: str) -> np.ndarray:
+    metric = str(metric).strip().lower()
+
+    if metric == "ldscore":
+        L = np.asarray(trace_view.ldscores, dtype=np.float64, order="C")
+        if L.ndim != 2:
+            raise ValueError("trace_view.ldscores must be 2D")
+        q = np.sum(L, axis=1, dtype=np.float64)
+
+    elif metric == "ldtrace":
+        A = np.asarray(trace_view.annot, dtype=np.float64, order="C")
+        L = np.asarray(trace_view.ldscores, dtype=np.float64, order="C")
+
+        if A.ndim != 2 or L.ndim != 2 or A.shape != L.shape:
+            raise ValueError(
+                f"ldtrace balancing requires annot and ldscores with identical 2D shape; "
+                f"got A.shape={A.shape}, L.shape={L.shape}"
+            )
+
+        Ak = np.sum(A, axis=0, dtype=np.float64)
+        invAk = np.zeros_like(Ak, dtype=np.float64)
+        good = np.isfinite(Ak) & (Ak > 0.0)
+        invAk[good] = 1.0 / Ak[good]
+
+        # q_j = (a_j / Ak).sum() * (l_j / Ak).sum()
+        q = (A @ invAk) * (L @ invAk)
+
+    else:
+        raise ValueError(f"Unsupported block balance metric {metric!r}")
+
+    q = np.asarray(q, dtype=np.float64).ravel()
+    q = np.where(np.isfinite(q) & (q > 0.0), q, 0.0)
+    return q
+
+
+def _weighted_contiguous_block_boundaries(
+    mass: np.ndarray,
+    B: int,
+    *,
+    min_snps: int = 1,
+):
+    mass = np.asarray(mass, dtype=np.float64).ravel()
+    M = int(mass.size)
+
+    if not (1 <= B <= M):
+        raise ValueError(f"Need 1 <= nblocks <= nsnps, got B={B}, M={M}")
+
+    min_snps = int(min_snps)
+    if min_snps <= 0:
+        raise ValueError("min_snps must be >= 1")
+    if min_snps * B > M:
+        raise ValueError(
+            f"min_snps * nblocks exceeds nsnps: {min_snps} * {B} > {M}"
+        )
+
+    mass = np.where(np.isfinite(mass) & (mass > 0.0), mass, 0.0)
+    total = float(np.sum(mass))
+    if not (np.isfinite(total) and total > 0.0):
+        return _equal_count_block_boundaries(M, B)
+
+    cs = np.cumsum(mass, dtype=np.float64)
+    starts = np.empty(B, dtype=np.int64)
+    ends = np.empty(B, dtype=np.int64)
+
+    s = 0
+    for b in range(B):
+        starts[b] = s
+        rem = B - b - 1
+
+        if rem == 0:
+            e = M
+        else:
+            low = s + min_snps
+            high = M - rem * min_snps
+
+            # global weighted-quantile target
+            target = (b + 1) * total / B
+            e = int(np.searchsorted(cs, target, side="left") + 1)
+
+            if e < low:
+                e = low
+            if e > high:
+                e = high
+
+        ends[b] = e
+        s = e
+
+    if starts[0] != 0 or ends[-1] != M or np.any(ends <= starts):
+        raise RuntimeError("Weighted contiguous partition produced invalid block boundaries.")
+    return starts, ends
 
 
 @dataclass(frozen=True)
@@ -104,17 +241,47 @@ class JackknifeDesign:
             B = int(spec.nblocks)
             if B <= 0:
                 raise ValueError("block jackknife requires nblocks > 0")
+            if B > M:
+                raise ValueError(f"nblocks cannot exceed nsnps; got B={B}, M={M}")
 
-            blk_size = max(M // B, 1)
-            starts = blk_size * np.arange(B, dtype=np.int64)
-            ends = starts + blk_size
-            ends[-1] = M
+            balance = str(spec.block_balance).strip().lower()
 
-            unit_id = np.arange(M, dtype=np.int64) // blk_size
-            unit_id[unit_id >= B] = B - 1
+            if balance == "snp":
+                starts, ends = _equal_count_block_boundaries(M, B)
+                mass = None
+            else:
+                mass = _per_snp_block_mass(trace_view, balance)
+                starts, ends = _weighted_contiguous_block_boundaries(
+                    mass,
+                    B,
+                    min_snps=int(spec.min_block_snps),
+                )
+
+            unit_id = np.empty(M, dtype=np.int64)
+            for u, (s, e) in enumerate(zip(starts, ends)):
+                unit_id[s:e] = u
+
             unit_labels = np.arange(B, dtype=np.int64)
             delete_sets = np.arange(B, dtype=np.int16)[:, None]
             D = np.eye(B, dtype=np.float64)
+
+            if log is not None:
+                n_per = (ends - starts).astype(np.float64)
+                msg = (
+                    f"[jackknife] block mode with {B} contiguous blocks; "
+                    f"balance={balance}, "
+                    f"SNP-count mean={n_per.mean():.2f}, "
+                    f"min={int(n_per.min())}, max={int(n_per.max())}"
+                )
+                if mass is not None:
+                    q_per = np.array(
+                        [mass[s:e].sum(dtype=np.float64) for s, e in zip(starts, ends)],
+                        dtype=np.float64,
+                    )
+                    cv_q = float(np.std(q_per) / np.mean(q_per)) if np.mean(q_per) > 0 else np.nan
+                    cv_n = float(np.std(n_per) / np.mean(n_per)) if np.mean(n_per) > 0 else np.nan
+                    msg += f", block-mass CV={cv_q:.4f}, SNP-count CV={cv_n:.4f}"
+                log._log(msg)
 
             return cls(
                 spec=spec,

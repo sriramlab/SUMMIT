@@ -47,12 +47,24 @@ def _top_chisq_rows(snps, a1, a2, chisq, topk: int = 10):
         rows.append((str(snps[j]), str(a1[j]), str(a2[j]), float(chisq[j])))
     return rows
 
+def _maybe_find_column(columns, candidates):
+    cols = list(columns)
+    lower_to_name = {str(c).lower(): c for c in cols}
+    for cand in candidates:
+        hit = lower_to_name.get(str(cand).lower())
+        if hit is not None:
+            return hit
+    return None
+
 
 @dataclass(frozen=True)
 class MatchedSumstats:
     snps: np.ndarray
     z: np.ndarray
     chi2: np.ndarray
+    beta: np.ndarray
+    se: np.ndarray
+    n: np.ndarray
     a1: np.ndarray
     a2: np.ndarray
     nsamp: float
@@ -76,6 +88,9 @@ class MatchedSumstats:
             snps=self.snps[keep_mask],
             z=self.z[keep_mask],
             chi2=self.chi2[keep_mask],
+            beta=self.beta[keep_mask],
+            se=self.se[keep_mask],
+            n=self.n[keep_mask],
             a1=self.a1[keep_mask],
             a2=self.a2[keep_mask],
             nsamp=self.nsamp,
@@ -135,6 +150,9 @@ class AlignedSumstats:
         snps = self.trace.snps[keep_mask]
         z = self.sumstats.z[pos].astype(np.float64, copy=False)
         chi2 = self.sumstats.chi2[pos].astype(np.float64, copy=True)
+        beta = self.sumstats.beta[pos].astype(np.float64, copy=False)
+        se = self.sumstats.se[pos].astype(np.float64, copy=False)
+        n = self.sumstats.n[pos].astype(np.float64, copy=False)
         a1 = self.sumstats.a1[pos]
         a2 = self.sumstats.a2[pos]
 
@@ -154,6 +172,9 @@ class AlignedSumstats:
 
         return MatchedSumstats(
             snps=snps,
+            beta=beta,
+            se=se,
+            n=n,
             z=z,
             chi2=chi2,
             a1=a1,
@@ -185,6 +206,9 @@ class Sumstats:
         *,
         snps,
         z,
+        beta,
+        se,
+        n,
         nsamp,
         a1,
         a2,
@@ -196,6 +220,9 @@ class Sumstats:
     ):
         self.snps = np.asarray(snps, dtype=str)
         self.z = np.asarray(z, dtype=np.float64)
+        self.beta = np.asarray(beta, dtype=np.float64)
+        self.se = np.asarray(se, dtype=np.float64)
+        self.n = np.asarray(n, dtype=np.float64)
         self.chi2 = self.z * self.z
         self.a1 = np.asarray(a1, dtype=str)
         self.a2 = np.asarray(a2, dtype=str)
@@ -205,6 +232,12 @@ class Sumstats:
         self.removed_snps = [] if removed_snps is None else list(removed_snps)
         self.read_summary = read_summary
         self.read_top = read_top
+
+        if not (
+            self.snps.shape == self.z.shape == self.beta.shape == self.se.shape
+            == self.n.shape == self.a1.shape == self.a2.shape
+        ):
+            raise RuntimeError("Sumstats arrays do not all have the same length.")
 
         self.index = pd.Index(self.snps)
         if self.index.has_duplicates:
@@ -217,13 +250,28 @@ class Sumstats:
     @classmethod
     def from_file(cls, path, *, name=None, log=None) -> "Sumstats":
         hdr = pd.read_csv(path, sep=r"\s+", compression="infer", nrows=0)
-        ncol = utils._parse_column_name(hdr, ["N", "n"], default_pos=3)
-        zcol = utils._parse_column_name(hdr, ["Z", "z"], default_pos=3)
+        cols = list(hdr.columns)
+
+        ncol = _maybe_find_column(cols, ["OBS_CT", "N", "n"])
+        if ncol is None:
+            raise RuntimeError(f"Phenotype [{name or path}] must contain OBS_CT or N.")
         idcol = utils._parse_column_name(hdr, ["ID", "id", "snp", "SNP"], default_pos=0)
         a1col = utils._parse_column_name(hdr, ["A1", "ALT"], default_pos=1)
-        a2col = utils._parse_column_name(hdr, ["A2", "REF"], default_pos=1)
+        a2col = utils._parse_column_name(hdr, ["A2", "REF"], default_pos=2)
 
-        usecols = [idcol, zcol, ncol, a1col, a2col]
+        betacol = _maybe_find_column(cols, ["BETA", "beta"])
+        secol = _maybe_find_column(cols, ["SE", "se", "STDERR", "stderr"])
+        zcol = _maybe_find_column(cols, ["Z", "z"])
+
+        if betacol is None or secol is None:
+            raise RuntimeError(
+                f"Phenotype [{name or path}] must contain BETA and SE columns for covariate-adjusted rg reconstruction."
+            )
+
+        usecols = list(dict.fromkeys(
+            [idcol, a1col, a2col, ncol, betacol, secol] + ([] if zcol is None else [zcol])
+        ))
+
         df = pd.read_csv(
             path,
             sep=r"\s+",
@@ -231,27 +279,55 @@ class Sumstats:
             usecols=usecols,
             dtype={idcol: str, a1col: str, a2col: str},
         )
-        df = df.rename(columns={idcol: "SNP", zcol: "Z", ncol: "N", a1col: "A1", a2col: "A2"})
+
+        rename_map = {
+            idcol: "SNP",
+            a1col: "A1",
+            a2col: "A2",
+            ncol: "N",
+            betacol: "BETA",
+            secol: "SE",
+        }
+        if zcol is not None:
+            rename_map[zcol] = "Z"
+        df = df.rename(columns=rename_map)
+
         df["SNP"] = df["SNP"].astype(str)
         df["A1"] = df["A1"].astype(str).str.upper()
         df["A2"] = df["A2"].astype(str).str.upper()
         df["N"] = pd.to_numeric(df["N"], errors="coerce")
-        df["Z"] = pd.to_numeric(df["Z"], errors="coerce")
+        df["BETA"] = pd.to_numeric(df["BETA"], errors="coerce")
+        df["SE"] = pd.to_numeric(df["SE"], errors="coerce")
+
+        if zcol is None:
+            with np.errstate(divide="ignore", invalid="ignore"):
+                df["Z"] = df["BETA"] / df["SE"]
+        else:
+            df["Z"] = pd.to_numeric(df["Z"], errors="coerce")
 
         n_arr = df["N"].to_numpy(dtype=np.float64, copy=False)
+        beta_arr = df["BETA"].to_numpy(dtype=np.float64, copy=False)
+        se_arr = df["SE"].to_numpy(dtype=np.float64, copy=False)
         z_arr = df["Z"].to_numpy(dtype=np.float64, copy=False)
-        bad = (~np.isfinite(n_arr)) | (~np.isfinite(z_arr))
+
+        bad = (
+            (~np.isfinite(n_arr)) | (n_arr <= 0.0) |
+            (~np.isfinite(beta_arr)) |
+            (~np.isfinite(se_arr)) | (se_arr <= 0.0) |
+            (~np.isfinite(z_arr))
+        )
+
         removed = []
         if bad.any():
             removed = df.loc[bad, "SNP"].dropna().astype(str).tolist()
             if log is not None:
                 log._log(
-                    f"Dropping {len(removed)} SNPs with NA/non-finite N or Z values [{name or path}]."
+                    f"Dropping {len(removed)} SNPs with NA/non-finite N/BETA/SE/Z values [{name or path}]."
                 )
             df = df.loc[~bad].copy()
         else:
             if log is not None:
-                log._log(f"Dropping 0 SNPs with NA/non-finite N or Z values [{name or path}].")
+                log._log(f"Dropping 0 SNPs with NA/non-finite N/BETA/SE/Z values [{name or path}].")
 
         if df.shape[0] == 0:
             raise RuntimeError(f"No valid SNPs remain after basic filtering for phenotype [{name or path}].")
@@ -260,6 +336,7 @@ class Sumstats:
         z_arr = df["Z"].to_numpy(dtype=np.float64, copy=False)
         nmax = float(np.max(n_arr))
         z_scaled = z_arr * np.sqrt(n_arr / nmax)
+
         badz = ~np.isfinite(z_scaled)
         if badz.any():
             removed2 = df.loc[badz, "SNP"].astype(str).tolist()
@@ -270,6 +347,7 @@ class Sumstats:
                 log._log(
                     f"Dropping {len(removed2)} SNPs with non-finite scaled Z values [{name or path}]."
                 )
+
         df["Z"] = z_scaled
 
         if df["SNP"].duplicated().any():
@@ -300,6 +378,9 @@ class Sumstats:
         return cls(
             snps=df["SNP"].astype(str).to_numpy(),
             z=df["Z"].to_numpy(dtype=np.float64, copy=False),
+            beta=df["BETA"].to_numpy(dtype=np.float64, copy=False),
+            se=df["SE"].to_numpy(dtype=np.float64, copy=False),
+            n=df["N"].to_numpy(dtype=np.float64, copy=False),
             nsamp=nmax,
             a1=df["A1"].astype(str).to_numpy(),
             a2=df["A2"].astype(str).to_numpy(),

@@ -25,7 +25,6 @@ class Sumrhe:
         self,
         bim_path=None,
         sum_path=None,
-        save_path=None,
         h2_path=None,
         out=None,
         chisq_threshold=0,
@@ -43,7 +42,6 @@ class Sumrhe:
         jack_mode: str = "mean",
         delta=None,
     ):
-        del save_path  # not used in this refactor path
 
         self.log = log
         self.verbose = verbose

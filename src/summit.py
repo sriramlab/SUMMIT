@@ -48,6 +48,50 @@ def build_parser() -> argparse.ArgumentParser:
                         choices=["drop", "clip", "warn", "none"],
                         help="What to do with high-chi^2 SNPs on the main analysis axis.")
 
+    parser.add_argument("--intercept-rg", default=None, type=float, help=("Fix the SUMCORE nuisance offset c for rg estimation. "
+                        "This must be c = y_overlap^T y_overlap / sqrt(N1*N2) = N_overlap * rho_y,overlap / sqrt(N1*N2). "),)
+    parser.add_argument("--pheno-rg", default=None, type=str, help=("Comma-separated pair of phenotype files for the traits in --rg. "
+                        "Each file should contain sample ID column(s) followed by the phenotype in the last column. "
+                        "SUMCORE standardizes each phenotype on its own study sample, intersects overlapping IDs, "
+                        "and computes c = y_overlap^T y_overlap / sqrt(N1*N2). "
+                        "Mutually exclusive with --intercept-rg."),)
+
+    parser.add_argument(
+        "--pheno-rg-cov",
+        default=None,
+        type=str,
+        help=(
+            "Comma-separated pair of covariate files aligned with --pheno-rg. "
+            "Files must be whitespace-delimited with headers; first two columns must be FID and IID; "
+            "all remaining columns are used as covariates. "
+            "SUMCORE residualizes each phenotype on its trait-specific covariates before computing c."
+        ),
+    )
+    parser.add_argument(
+        "--pheno-rg-missing-values",
+        #default="-9,NA,NaN,nan,.,None,NONE,null,NULL",
+        default="-9",
+        type=str,
+        help=(
+            "Comma-separated tokens treated as missing in --pheno-rg phenotype files. "
+            "Applies to the phenotype column only. "
+            "For whitespace-delimited files, blank/omitted fields are not reliably detectable; "
+            "use an explicit token such as -9 or NA."
+        ),
+    )
+    parser.add_argument(
+        "--pheno-rg-cov-missing-values",
+        default="-9,NA,NaN,nan,.,None,NONE,null,NULL",
+        type=str,
+        help=(
+            "Comma-separated tokens treated as missing in --pheno-rg-cov files. "
+            "Rows with any missing covariate are dropped before residualization. "
+            "For whitespace-delimited files, blank/omitted fields are not reliably detectable; "
+            "use an explicit token such as -9 or NA."
+        ),
+    )
+
+
     # Additional input
     parser.add_argument("--annot", default=None, type=str,
                         help="Path to the annotation file.")
@@ -312,7 +356,6 @@ def _dispatch_h2(args, log):
     sums = Sumrhe(
         bim_path=args.bim,
         sum_path=None,
-        save_path=args.save_trace,
         h2_path=args.h2,
         out=args.out,
         chisq_threshold=args.max_chisq,
@@ -345,6 +388,12 @@ def _dispatch_rg(args, log):
         rg=args.rg,
         chisq_threshold=args.max_chisq,
         intercept_chisq_thr=args.intercept_chisq_thr,
+        intercept_rg=args.intercept_rg,
+        pheno_rg=args.pheno_rg,
+        pheno_rg_cov=args.pheno_rg_cov,
+        pheno_rg_missing_values=args.pheno_rg_missing_values,
+        pheno_rg_cov_missing_values=args.pheno_rg_cov_missing_values,
+        intercept_weight_mode=args.intercept_weight_mode,
         chisq_action=args.chisq_action,
         log=log,
         verbose=args.verbose,

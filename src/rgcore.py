@@ -5,6 +5,7 @@ from dataclasses import dataclass
 import numpy as np
 
 import utils
+import json
 
 @dataclass(frozen=True)
 class RGPrepared:
@@ -82,6 +83,129 @@ class RGResultWriter:
                 vals += [rg_tot[r]]
                 fd.write(label + "\t" + "\t".join(f"{x:.10g}" for x in vals) + "\n")
 
+    @staticmethod
+    def _jsonify_numeric(x):
+        arr = np.asarray(x, dtype=np.float64)
+        if arr.ndim == 0:
+            v = float(arr)
+            return v if np.isfinite(v) else None
+        return [RGResultWriter._jsonify_numeric(v) for v in arr]
+
+    @staticmethod
+    def save_score_normal_equations_json(fit: RGFit, path: str):
+        """
+        Dump the explicit full SCORE normal equations implied by the current
+        reduced rg solve.
+
+        Requires known overlap N, which is available when rg was run with
+        --pheno-rg (and optionally --pheno-rg-cov).
+
+        For K annotation components, this restores the (K+1)x(K+1) full system:
+            [ T_red + N_overlap * 11^T    N_overlap * 1 ]
+            [ N_overlap * 1^T             N_overlap     ]
+        with RHS
+            [ sqrt(N1*N2) * Ay/Ak ]
+            [ c * sqrt(N1*N2)    ]
+        and solves for
+            sigma = [gamma_g_0, ..., gamma_g_{K-1}, gamma_e].
+        """
+        info = fit.intercept.info if isinstance(fit.intercept.info, dict) else {}
+        n_overlap = info.get("n_overlap", None)
+        if n_overlap is None:
+            raise ValueError(
+                "Full SCORE normal-equation dump requires known overlap N; "
+                "run rg with --pheno-rg (and optionally --pheno-rg-cov)."
+            )
+
+        n_overlap = float(n_overlap)
+        if not (np.isfinite(n_overlap) and n_overlap > 0.0):
+            raise ValueError(f"Invalid overlap size for SCORE dump: {n_overlap}")
+
+        p = fit.prepared
+        K = int(p.trace_view.nbins)
+        R = int(p.jackknife.nrep)
+
+        lhs_red = np.asarray(p.lhs, dtype=np.float64)
+        Ak = np.asarray(p.Ak_rep, dtype=np.float64)
+        Ay = np.asarray(p.Ay_rep, dtype=np.float64)
+        c_reps = np.asarray(fit.intercept.c_reps, dtype=np.float64)
+
+        if lhs_red.shape != (R + 1, K, K):
+            raise ValueError(f"Unexpected lhs shape: {lhs_red.shape}, expected {(R + 1, K, K)}")
+        if Ak.shape != (R + 1, K):
+            raise ValueError(f"Unexpected Ak_rep shape: {Ak.shape}, expected {(R + 1, K)}")
+        if Ay.shape != (R + 1, K):
+            raise ValueError(f"Unexpected Ay_rep shape: {Ay.shape}, expected {(R + 1, K)}")
+        if c_reps.shape != (R + 1,):
+            raise ValueError(f"Unexpected c_reps shape: {c_reps.shape}, expected {(R + 1,)}")
+
+        n1 = float(p.matched1.nsamp)
+        n2 = float(p.matched2.nsamp)
+        sqrt_n1n2 = float(np.sqrt(n1 * n2))
+
+        # Restore the full SCORE matrix from the reduced system used in fit_rg.
+        T = np.full((R + 1, K + 1, K + 1), np.nan, dtype=np.float64)
+        T[:, :K, :K] = lhs_red + n_overlap
+        T[:, :K, K] = n_overlap
+        T[:, K, :K] = n_overlap
+        T[:, K, K] = n_overlap
+
+        # Restore the full RHS.
+        q = np.full((R + 1, K + 1), np.nan, dtype=np.float64)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            q[:, :K] = (Ay * sqrt_n1n2) / Ak
+        bad_q = (~np.isfinite(Ay)) | (~np.isfinite(Ak)) | (Ak <= 0.0)
+        q[:, :K] = np.where(bad_q, np.nan, q[:, :K])
+
+        q[:, K] = c_reps * sqrt_n1n2
+        q[:, K] = np.where(np.isfinite(q[:, K]), q[:, K], np.nan)
+
+        # Solve the explicit full system.
+        sigma = _solve_linear_batch(T, q)
+
+        headers = getattr(p.trace_view, "annot_header", None)
+        if headers is None or len(headers) != K:
+            headers = [f"bin_{k}" for k in range(K)]
+        else:
+            headers = [str(h) for h in headers]
+
+        payload = {
+            "system": "cross",
+            "meta": {
+                "equation_type": "score_full",
+                "kernel_name": "score",
+                "multi_component": bool(K > 1),
+                "partial_overlap": bool(n_overlap < (min(n1, n2) - 0.5)),
+                "n_overlap": n_overlap,
+                "n1_summary": n1,
+                "n2_summary": n2,
+                "nrep": R,
+                "fixed_intercept_source": str(info.get("source", "")),
+                "cov_adjusted": bool(info.get("cov_adjusted", False)),
+                "annot_headers": headers,
+            },
+            "sigma_names": [f"gamma_g_{k}" for k in range(K)] + ["gamma_e"],
+            "moment_names": [f"score_row_{k}" for k in range(K)] + ["overlap_row"],
+            "full": {
+                "replicate": "full",
+                "T": RGResultWriter._jsonify_numeric(T[R]),
+                "q": RGResultWriter._jsonify_numeric(q[R]),
+                "sigma": RGResultWriter._jsonify_numeric(sigma[R]),
+            },
+            "jackknife": [
+                {
+                    "replicate": int(r),
+                    "T": RGResultWriter._jsonify_numeric(T[r]),
+                    "q": RGResultWriter._jsonify_numeric(q[r]),
+                    "sigma": RGResultWriter._jsonify_numeric(sigma[r]),
+                }
+                for r in range(R)
+            ],
+        }
+
+        with open(path, "w") as fd:
+            json.dump(payload, fd, indent=2, allow_nan=False)
+
 
 # -----------------------------------------------------------------------------
 # low-level helpers
@@ -110,6 +234,42 @@ def _solve_linear_batch(lhs: np.ndarray, rhs: np.ndarray) -> np.ndarray:
             except np.linalg.LinAlgError:
                 continue
     return out
+
+
+def _symmetrize_with_design(trace_KK: np.ndarray, jackknife, unit_sizes: np.ndarray) -> np.ndarray:
+    """
+    Symmetrize replicate trace matrices using the current jackknife design.
+
+    Prefer the newer utils API that takes the explicit delete-incidence matrix and
+    per-unit active sizes. Fall back to the older shorthand API for backward
+    compatibility.
+    """
+    unit_sizes = np.asarray(unit_sizes, dtype=np.float64)
+    try:
+        return utils.symmetrize_trace_with_jackknife(
+            trace_KK,
+            logger=None,
+            verbose=False,
+            jk_delete_matrix=np.asarray(jackknife.D, dtype=np.float64, order="C"),
+            jk_unit_sizes=unit_sizes,
+            jk_delete_d=int(jackknife.delete),
+        )
+    except TypeError:
+        if jackknife.mode == "block":
+            return utils.symmetrize_trace_with_jackknife(
+                trace_KK,
+                logger=None,
+                verbose=False,
+                jk_block_sizes=unit_sizes,
+                jk_delete_d=1,
+            )
+        return utils.symmetrize_trace_with_jackknife(
+            trace_KK,
+            logger=None,
+            verbose=False,
+            jk_n_units=int(jackknife.nunit),
+            jk_delete_d=int(jackknife.delete),
+        )
 
 
 def _stack_delete_replicates(full: np.ndarray, unit: np.ndarray, D: np.ndarray) -> np.ndarray:
@@ -168,6 +328,97 @@ def _validate_common_axis(trace_view, matched1, matched2, jackknife):
 # main rg preparation / fit
 # -----------------------------------------------------------------------------
 
+def _trait_cov_rank_from_info(intercept_info, trait_idx: int) -> int:
+    """
+    Return rank(C_a), including the intercept column.
+
+    We reuse the existing info key name 'rhs_trait{idx}_p_design', but it must now
+    store the ACTUAL rank, not merely the column count.
+    """
+    info = {} if intercept_info is None else dict(intercept_info)
+    key = f"rhs_trait{trait_idx}_p_design"
+
+    if key not in info:
+        # Exact only for no-extra-covariate GWAS.
+        # In your current workflow this key should be present via --pheno-rg-cov.
+        return 1
+
+    q = int(info[key])
+    if q < 1:
+        raise ValueError(f"{key} must be >= 1; got {q}")
+    return q
+
+
+def _trait_exact_z_equiv(matched, q_design: int) -> np.ndarray:
+    """
+    Exact covariate-adjusted z-equivalent on the SAME scale as the old z_j.
+
+    Formula:
+        z*_j = sqrt(N_scale) * beta_j / sqrt(beta_j^2 + nu_j * se_j^2)
+        nu_j = n_obs_j - rank(C) - 1
+
+    Notes:
+      - N_scale is the study-level normalization used by the LHS / intercept scale,
+        i.e. matched.nsamp.
+      - n_obs_j is the per-SNP regression sample count (PLINK OBS_CT or its copy).
+      - rank(C) includes the intercept.
+    """
+    beta = np.asarray(matched.beta, dtype=np.float64)
+    se = np.asarray(matched.se, dtype=np.float64)
+    n_obs = np.asarray(matched.n, dtype=np.float64)
+    N_scale = float(matched.nsamp)
+
+    out = np.full(beta.shape, np.nan, dtype=np.float64)
+    if not (np.isfinite(N_scale) and N_scale > 0.0):
+        return out
+
+    nu = n_obs - float(q_design) - 1.0
+    den = beta * beta + nu * se * se
+
+    good = (
+        np.isfinite(beta) &
+        np.isfinite(se) & (se > 0.0) &
+        np.isfinite(n_obs) & (n_obs > 0.0) &
+        np.isfinite(nu) & (nu > 0.0) &
+        np.isfinite(den) & (den > 0.0)
+    )
+    out[good] = np.sqrt(N_scale) * beta[good] / np.sqrt(den[good])
+    return out
+
+
+def build_rg_summary_moment(matched1, matched2, *, intercept_info=None):
+    """
+    Exact SNP-wise replacement for z1 * z2 in the covariate-adjusted rg RHS.
+
+    Returns
+    -------
+    y : (M,) array
+        y_j = z1*_j * z2*_j
+    info : dict
+    """
+    if not (
+        hasattr(matched1, "beta") and hasattr(matched1, "se") and hasattr(matched1, "n") and
+        hasattr(matched2, "beta") and hasattr(matched2, "se") and hasattr(matched2, "n")
+    ):
+        raise RuntimeError("SUMCORE rg RHS requires per-SNP beta, se, and n/OBS_CT.")
+
+    q1 = _trait_cov_rank_from_info(intercept_info, 1)
+    q2 = _trait_cov_rank_from_info(intercept_info, 2)
+
+    z1_star = _trait_exact_z_equiv(matched1, q1)
+    z2_star = _trait_exact_z_equiv(matched2, q2)
+
+    y = z1_star * z2_star
+    y[~np.isfinite(y)] = np.nan
+
+    return y, {
+        "mode": "beta_se_exact",
+        "trait1_q_design": int(q1),
+        "trait2_q_design": int(q2),
+        "n_nonfinite": int(np.sum(~np.isfinite(y))),
+    }
+
+
 
 def prepare_rg(
     trace_view,
@@ -176,6 +427,8 @@ def prepare_rg(
     jackknife,
     *,
     active_mask=None,
+    summary_y=None,
+    summary_y_info=None,
     adjust_delta: bool = False,
 ):
     _validate_common_axis(trace_view, matched1, matched2, jackknife)
@@ -185,19 +438,28 @@ def prepare_rg(
     R = jackknife.nrep
     U = jackknife.nunit
 
+    if summary_y is None:
+        summary_y, summary_y_info = build_rg_summary_moment(matched1, matched2)
+
+    y = np.asarray(summary_y, dtype=np.float64)
+    if y.ndim != 1 or y.size != M:
+        raise ValueError(f"summary_y must have shape ({M},), got {y.shape}")
+
+    good_y = np.isfinite(y)
     if active_mask is None:
-        active_mask = np.ones(M, dtype=bool)
-    active_mask = np.asarray(active_mask, dtype=bool)
-    if active_mask.ndim != 1 or active_mask.size != M:
-        raise ValueError(f"active_mask must be length {M}; got {active_mask.shape}")
+        active_mask = good_y.copy()
+    else:
+        active_mask = np.asarray(active_mask, dtype=bool)
+        if active_mask.ndim != 1 or active_mask.size != M:
+            raise ValueError(f"active_mask must be length {M}; got {active_mask.shape}")
+        active_mask = active_mask & good_y
+
+    if not np.any(active_mask):
+        raise ValueError("No SNPs remain after filtering non-finite rg summary moments.")
 
     A = np.asarray(trace_view.annot, dtype=np.float64, order="C")
     L = np.asarray(trace_view.ldscores, dtype=np.float64, order="C")
-    z1 = np.asarray(matched1.z, dtype=np.float64)
-    z2 = np.asarray(matched2.z, dtype=np.float64)
-    y = z1 * z2
 
-    unit_sizes = np.zeros(U, dtype=np.float64)  # active SNP counts per unit
     Ak_unit = np.zeros((U, K), dtype=np.float64)
     Ay_unit = np.zeros((U, K), dtype=np.float64)
     AL_unit = np.zeros((U, K, K), dtype=np.float64)
@@ -207,20 +469,17 @@ def prepare_rg(
         e = int(jackknife.ends[u])
         if e <= s:
             continue
-
         mu = active_mask[s:e]
         if not np.any(mu):
             continue
-
         Au = A[s:e, :][mu, :]
         Lu = L[s:e, :][mu, :]
         yu = y[s:e][mu]
-
-        unit_sizes[u] = float(Au.shape[0])  # IMPORTANT: SNP counts, not annotation mass
         Ak_unit[u] = Au.sum(axis=0, dtype=np.float64)
         Ay_unit[u] = Au.T @ yu
         AL_unit[u] = Au.T @ Lu
 
+    unit_sizes = jackknife.unit_sizes(active_mask=active_mask, dtype=np.float64)
     Ak_rep = _stack_delete_replicates(Ak_unit.sum(axis=0), Ak_unit, jackknife.D)
     Ay_rep = _stack_delete_replicates(Ay_unit.sum(axis=0), Ay_unit, jackknife.D)
     AL_rep = _stack_delete_replicates(AL_unit.sum(axis=0), AL_unit, jackknife.D)
@@ -232,40 +491,18 @@ def prepare_rg(
         AL_rep = AL_rep.copy()
         AL_rep[:R] -= _pair_correction_from_deleted_mass(rep_Ak, del_Ak, delta)
 
-    M_k = Ak_rep[:, :, None]
-    M_l = Ak_rep[:, None, :]
-    lhs = utils._calc_rg_trace_from_ld_batch(
-        AL_rep,
-        matched1.nsamp,
-        matched2.nsamp,
-        M_k,
-        M_l,
-    )
+    Ak_full = np.asarray(Ak_rep[-1], dtype=np.float64)
+    src_mass = np.broadcast_to(Ak_full[None, :], Ak_rep.shape).copy()
+    if jackknife.mode == "chr" and adjust_delta and getattr(trace_view, "delta", None) is not None:
+        # After explicit deleted-source correction, replicate numerators approximate
+        # A_keep^T L_keep, so the source-side normalizer should also be the kept mass.
+        src_mass[:R] = Ak_rep[:R]
 
-    # ------------------------------------------------------------------
-    # NEW: symmetrization must use the same unit-size logic as the SE code
-    # ------------------------------------------------------------------
-    if jackknife.mode == "block":
-        lhs = utils.symmetrize_trace_with_jackknife(
-            lhs,
-            logger=None,
-            verbose=False,
-            jk_block_sizes=unit_sizes,   # active-subset block sizes
-            center="mean",
-            nan_policy="omit",
-        )
-    else:
-        lhs = utils.symmetrize_trace_with_jackknife(
-            lhs,
-            logger=None,
-            verbose=False,
-            jk_delete_matrix=jackknife.D,   # REQUIRED for delete-set designs
-            jk_unit_sizes=unit_sizes,       # active-subset unit sizes
-            jk_n_units=jackknife.nunit,     # optional sanity check
-            jk_delete_d=jackknife.delete,
-            center="mean",
-            nan_policy="omit",
-        )
+    M_k = Ak_rep[:, :, None]
+    M_l = src_mass[:, None, :]
+    lhs = utils._calc_rg_trace_from_ld_batch(AL_rep, matched1.nsamp, matched2.nsamp, M_k, M_l)
+
+    lhs = _symmetrize_with_design(lhs, jackknife, unit_sizes)
 
     return RGPrepared(
         trace_view=trace_view,
@@ -311,6 +548,86 @@ def _estimate_total_rg_delta_se(gamma_tot, h2_tot1, h2_tot2, jackknife, *, unit_
         nan_policy=nan_policy,
     )
     return np.array([float(est), float(se)], dtype=np.float64)
+
+
+def _combine_se_rss(a, b):
+    a = np.asarray(a, dtype=np.float64)
+    b = np.asarray(b, dtype=np.float64)
+    a, b = np.broadcast_arrays(a, b)
+
+    out = np.full(a.shape, np.nan, dtype=np.float64)
+    ga = np.isfinite(a)
+    gb = np.isfinite(b)
+
+    out[ga & ~gb] = np.abs(a[ga & ~gb])
+    out[~ga & gb] = np.abs(b[~ga & gb])
+
+    both = ga & gb
+    out[both] = np.sqrt(a[both] * a[both] + b[both] * b[both])
+    return out
+
+
+def _external_c_sensitivity_se(prepared: RGPrepared, h2_fit1, h2_fit2, intercept_fit: InterceptFit):
+    """
+    Propagate an externally estimated c-SE into gamma/rg CONDITIONAL on the summary data.
+
+    This is exact conditional on the fixed summary-data sufficient statistics because, for
+    the reconstructed SCORE system on the full SNP axis,
+
+        rhs(c) = rhs(c_hat) - (c - c_hat) * sqrt(N1*N2) * 1_K,
+
+    so gamma(c) is affine in c:
+        gamma(c) = gamma(c_hat) - (c - c_hat) * A^{-1}[sqrt(N1*N2) * 1_K].
+
+    We then combine this extra c-driven SE in quadrature with the SNP-side jackknife SE.
+    The omitted term is the cross-covariance between c-hat and the GWAS summary statistics;
+    that would require sample-deleted recomputation of the GWAS z-scores.
+    """
+    info = intercept_fit.info if isinstance(intercept_fit.info, dict) else {}
+    if str(info.get("source", "")).lower() != "pheno":
+        return None
+
+    c_se = info.get("external_c_se", None)
+    try:
+        c_se = float(c_se)
+    except Exception:
+        return None
+
+    if not (np.isfinite(c_se) and c_se > 0.0):
+        return None
+
+    p = prepared
+    K = p.trace_view.nbins
+    sqrt_n1n2 = float(np.sqrt(float(p.matched1.nsamp) * float(p.matched2.nsamp)))
+
+    lhs_full = np.asarray(p.lhs[-1], dtype=np.float64)
+    rhs_sens = np.full((1, K), sqrt_n1n2, dtype=np.float64)
+    sens = _solve_linear_batch(lhs_full[None, :, :], rhs_sens)[0]
+    if sens.shape != (K,) or not np.isfinite(sens).all():
+        return None
+
+    # gamma(c) = gamma(c_hat) - (c - c_hat) * sens
+    dc_gamma = -sens
+    gamma_se_ext = np.abs(dc_gamma) * c_se
+    gamma_total_se_ext = float(np.abs(np.sum(dc_gamma)) * c_se)
+
+    v1_full = np.asarray(h2_fit1.sigma_reps[-1, :K], dtype=np.float64)
+    v2_full = np.asarray(h2_fit2.sigma_reps[-1, :K], dtype=np.float64)
+    rg_se_ext = np.full(K, np.nan, dtype=np.float64)
+    valid_bin = np.isfinite(v1_full) & np.isfinite(v2_full) & (v1_full > 0.0) & (v2_full > 0.0)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        rg_se_ext[valid_bin] = (
+            np.abs(dc_gamma[valid_bin]) * c_se / np.sqrt(v1_full[valid_bin] * v2_full[valid_bin])
+        )
+
+    h1_tot = float(h2_fit1.h2_reps[-1, -1])
+    h2_tot = float(h2_fit2.h2_reps[-1, -1])
+    if np.isfinite(h1_tot) and np.isfinite(h2_tot) and h1_tot > 0.0 and h2_tot > 0.0:
+        rg_total_se_ext = float(np.abs(np.sum(dc_gamma)) * c_se / np.sqrt(h1_tot * h2_tot))
+    else:
+        rg_total_se_ext = np.nan
+
+    return gamma_se_ext, rg_se_ext, gamma_total_se_ext, rg_total_se_ext
 
 
 def fit_rg(
@@ -405,6 +722,26 @@ def fit_rg(
             nan_policy=nan_policy,
         )
         rg_total = np.array([float(est), float(se)], dtype=np.float64)
+
+    # ------------------------------------------------------------------
+    # Extra SE contribution from externally estimated c via --pheno-rg.
+    #
+    # We DO NOT random-sample c into the SNP jackknife replicates.
+    # Instead, conditional on the summary-data sufficient statistics, gamma(c)
+    # is affine in c, so the c-driven SE contribution is exact and cheap.
+    # ------------------------------------------------------------------
+    # extra = _external_c_sensitivity_se(p, h2_fit1, h2_fit2, intercept_fit)
+    # if extra is not None:
+    #     gamma_se_ext, rg_se_ext, gamma_total_se_ext, rg_total_se_ext = extra
+
+    #     gamma[:, 1] = _combine_se_rss(gamma[:, 1], gamma_se_ext)
+    #     rg[:, 1] = _combine_se_rss(rg[:, 1], rg_se_ext)
+    #     gamma_total[1] = float(_combine_se_rss(gamma_total[1], gamma_total_se_ext))
+    #     rg_total[1] = float(_combine_se_rss(rg_total[1], rg_total_se_ext))
+
+    #     if K == 1:
+    #         gamma[0, 1] = gamma_total[1]
+    #         rg[0, 1] = rg_total[1]
 
     return RGFit(
         prepared=prepared,
@@ -526,7 +863,7 @@ def _solve_constrained_intercept_scalar_from_sums(
     Sxx,
     Sy,
     Sxy,
-    denom_floor=None,
+    denom_floor=0.0,
 ):
     m_fit = np.asarray(m_fit, dtype=np.float64)
     l1 = np.asarray(l1, dtype=np.float64)
@@ -634,6 +971,76 @@ def _ldsc_gencov_weights_1d(
     return w
 
 
+def _make_fixed_intercept_fit(
+    trace_view,
+    matched1,
+    matched2,
+    jackknife,
+    fixed_c,
+    *,
+    summary_y=None,
+    summary_y_info=None,
+    info=None,
+    log=None,
+):
+    fixed_c = float(fixed_c)
+    if not np.isfinite(fixed_c):
+        raise ValueError("fixed_c must be finite.")
+
+    meta = {} if info is None else dict(info)
+    source = str(meta.get("source", "external"))
+
+    c_se = meta.get("external_c_se", 0.0)
+    try:
+        c_se = float(c_se)
+    except Exception:
+        c_se = 0.0
+    if not np.isfinite(c_se) or c_se < 0.0:
+        c_se = 0.0
+
+    if summary_y is None:
+        y = np.asarray(matched1.z, dtype=np.float64) * np.asarray(matched2.z, dtype=np.float64)
+    else:
+        y = np.asarray(summary_y, dtype=np.float64)
+
+    active_mask = np.isfinite(y)
+    unit_sizes = jackknife.unit_sizes(active_mask=active_mask, dtype=np.float64)
+
+    c_reps = np.full(jackknife.nrep + 1, fixed_c, dtype=np.float64)
+    c = np.array([fixed_c, c_se], dtype=np.float64)
+
+    meta["fixed"] = True
+    meta.setdefault("source", source)
+    if summary_y_info is not None:
+        meta["summary_y_mode"] = str(summary_y_info.get("mode", "unknown"))
+
+    if log is not None:
+        if c_se > 0.0:
+            log._log(
+                f"[rg:c] using fixed external c={fixed_c:.6g} (SE: {c_se:.6g}) "
+                f"(source={source}); intercept regression skipped."
+            )
+        else:
+            log._log(
+                f"[rg:c] using fixed external c={fixed_c:.6g} "
+                f"(source={source}); intercept regression skipped."
+            )
+
+    return InterceptFit(
+        trace_view=trace_view,
+        matched1=matched1,
+        matched2=matched2,
+        jackknife=jackknife,
+        active_mask=active_mask,
+        unit_sizes=unit_sizes,
+        ld=np.zeros(trace_view.nsnps, dtype=np.float64),
+        y=y,
+        c_reps=c_reps,
+        c=c,
+        info=meta,
+    )
+
+
 def fit_intercept(
     trace_view,
     matched1,
@@ -642,6 +1049,10 @@ def fit_intercept(
     h2_fit1,
     h2_fit2,
     *,
+    summary_y=None,
+    summary_y_info=None,
+    fixed_c=None,
+    fixed_info=None,
     intercept_chisq_threshold=None,
     collapse_reg_ld: bool = False,
     chisq_mode: str = "either",
@@ -657,10 +1068,21 @@ def fit_intercept(
     nan_policy: str = "omit",
 ) -> InterceptFit:
     _validate_common_axis(trace_view, matched1, matched2, jackknife)
+    if fixed_c is not None:
+        return _make_fixed_intercept_fit(
+            trace_view,
+            matched1,
+            matched2,
+            jackknife,
+            fixed_c,
+            summary_y=summary_y,
+            summary_y_info=summary_y_info,
+            info=fixed_info,
+            log=log,
+        )
 
-    mode = str(intercept_weight_mode).strip().lower()
-    if mode not in {"ldsc", "score"}:
-        raise ValueError("intercept_weight_mode must be one of {'ldsc','score'}")
+    if summary_y is None:
+        summary_y, summary_y_info = build_rg_summary_moment(matched1, matched2)
 
     L1, ld_source = _select_intercept_regression_ld(
         trace_view,
@@ -673,7 +1095,9 @@ def fit_intercept(
     x = np.asarray(L1[:, 0], dtype=np.float64)
     z1 = np.asarray(matched1.z, dtype=np.float64)
     z2 = np.asarray(matched2.z, dtype=np.float64)
-    y = z1 * z2
+    y = np.asarray(summary_y, dtype=np.float64)
+    if y.ndim != 1 or y.size != x.size:
+        raise ValueError(f"summary_y must have shape ({x.size},), got {y.shape}")
 
     nsamp_max = max(float(matched1.nsamp), float(matched2.nsamp))
     keep, info = _make_intercept_keep_mask(
@@ -684,8 +1108,12 @@ def fit_intercept(
         threshold=intercept_chisq_threshold,
         chisq_mode=chisq_mode,
     )
+    keep &= np.isfinite(y)
+
     info["ld_source"] = ld_source
-    info["weight_mode"] = mode
+    info["weight_mode"] = intercept_weight_mode
+    info["summary_y_mode"] = None if summary_y_info is None else str(summary_y_info.get("mode", "unknown"))
+    info["n_removed_nonfinite_summary_y"] = int(np.sum(~np.isfinite(y)))
 
     if info["n_kept"] <= 1:
         raise RuntimeError("Intercept regression has <=1 SNP after filtering.")
@@ -765,6 +1193,7 @@ def fit_intercept(
             Sxy_u[u] = float(np.sum(wxy[s:e]))
         return W_u, Sx_u, Sxx_u, Sy_u, Sxy_u
 
+    # SCORE-style initialization (and final path if mode == "score")
     w_score = _build_simple_intercept_weights(x, keep)
     W0, Sx0, Sxx0, Sy0, Sxy0 = _weighted_scalar_summaries(w_score)
 
@@ -802,6 +1231,7 @@ def fit_intercept(
 
         sqrt_n1n2_scalar = float(np.sqrt(n1_scalar * n2_scalar))
         m_tot_weight = float(trace_view.nsnps)
+
         h1 = float(h2_fit1.h2[-1, 0]) if np.isfinite(h2_fit1.h2[-1, 0]) else 0.0
         h2 = float(h2_fit2.h2[-1, 0]) if np.isfinite(h2_fit2.h2[-1, 0]) else 0.0
         h1 = float(np.clip(h1, 0.0, 1.0))
@@ -861,7 +1291,6 @@ def fit_intercept(
     alpha_full = t1_full / l1_full
     beta_full = m_fit_full / l1_full
     den_full = W_full - 2.0 * beta_full * Sx_full + (beta_full * beta_full) * Sxx_full
-
     floor_rel = float(denom_floor_rel)
     if not (np.isfinite(floor_rel) and floor_rel >= 0.0):
         floor_rel = 1e-12
@@ -928,14 +1357,12 @@ def fit_intercept(
         n_bad = int(np.sum(~np.isfinite(c_rep)))
         if mode == "ldsc":
             log._log(
-                f"[rg:c] constrained intercept fit: weight_mode=ldsc, "
-                f"h1={info['h1_plugin']:.6g}, h2={info['h2_plugin']:.6g}, "
-                f"final_c={c[0]:.6g}, bad_reps={n_bad}/{jackknife.nrep}, "
-                f"iters={info['irwls_iters']}"
+                f"[rg:c] constrained LDSC-IRWLS: h1={info['h1_plugin']:.6g}, h2={info['h2_plugin']:.6g}, "
+                f"final_c={c[0]:.6g}, bad_reps={n_bad}/{jackknife.nrep}, iters={info['irwls_iters']}"
             )
         else:
             log._log(
-                f"[rg:c] constrained intercept fit: weight_mode=score (w_j=1/x_j), "
+                f"[rg:c] constrained SCORE-weight intercept: "
                 f"final_c={c[0]:.6g}, bad_reps={n_bad}/{jackknife.nrep}"
             )
 

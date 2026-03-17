@@ -864,6 +864,31 @@ class GenomewideLDScore:
         except Exception as e:
             self.log._log(f"[fs-corr] Failed to pretty-print δ matrix via pandas ({e}); using numpy.")
             self.log._log(repr(delta_block))
+            
+    def _make_compute_blocks(self):
+        """
+        For hybrid mode, split compute blocks at chromosome boundaries so that:
+        1) the global RP pass and the local RP correction use the exact same block partition
+        2) every local block is single-chromosome, which makes the local sliding-window math exact
+            and much cheaper in C++ (full-core + edge-boundary handling only)
+        """
+        if (not self.hybrid) or (self.snplist is None):
+            return [
+                (s, min(self.nsnps, s + self.step_size))
+                for s in range(0, self.nsnps, self.step_size)
+            ]
+
+        chr_arr = self.snplist["CHR"].astype(str).to_numpy()
+        blocks = []
+        p = 0
+        while p < self.nsnps:
+            q = p + 1
+            while q < self.nsnps and chr_arr[q] == chr_arr[p]:
+                q += 1
+            for s in range(p, q, self.step_size):
+                blocks.append((s, min(q, s + self.step_size)))
+            p = q
+        return blocks
 
     def _read_annot(self, annot_path):
         if annot_path is None:
@@ -1079,11 +1104,12 @@ class GenomewideLDScore:
         with set_parallelism(omp_threads=min(self.num_threads, 16), blas_threads=t_blas1):
             self.inv_sqrt_resvar_all = np.ascontiguousarray(self._precompute_residual_variances().astype(self.dtype, copy=False))
 
-        blocks = []
-        for j in range(0, self.nsnps, self.step_size):
-            s = j
-            e = min(self.nsnps, j + self.step_size)
-            blocks.append((s, e))
+        blocks = self._make_compute_blocks()
+        if self.hybrid:
+            self.log._log(
+                "[hybrid] using chromosome-split compute blocks so the global pass "
+                "and the local-RP correction share identical per-block probe draws."
+            )
         self.nblks = len(blocks)
         block_starts = np.asarray([s for (s, _) in blocks], dtype=np.int32)
         block_ends   = np.asarray([e for (_, e) in blocks], dtype=np.int32)
@@ -1297,10 +1323,10 @@ class GenomewideLDScore:
 
                 pref_ex.shutdown(wait=True)
                 meansq_accum += (meansq_chunk * Vt)
-                # ---------------------- Hybrid local pass (one C++ banded sweep per tile) ----------------------
+                # ---------------------- Hybrid local pass ----------------------
                 if self.hybrid:
                     with set_parallelism(omp_threads=1, blas_threads=self.num_threads):
-                        gwldcore.phase2_compute_local_hybrid_banded_bed(
+                        gwldcore.phase2_compute_local_hybrid_sliding_bed(
                             bed_prefix=bed_prefix,
                             fam_path=fam_path,
                             block_starts=block_starts,
@@ -1317,15 +1343,13 @@ class GenomewideLDScore:
                             rand_dist=self.rand_dist,
                             seed=self.root_seed,
                             meansq_accum=meansq_accum,
-                            rp_scale=float(-Vt),                     # weighted the same way as meansq_chunk * Vt
-                            add_exact=bool(vt_idx == 0),            # add exact local only once
-                            exact_scale=float(self.nvecs),          # so final divide by nvecs yields + exact_local
+                            rp_scale=float(-Vt),          # subtract local RP on the same weighted scale
+                            add_exact=bool(vt_idx == 0),  # add exact local only once
+                            exact_scale=float(self.nvecs),
                             C=(self.C if self.C is not None else None),
                             R=(self.cov_R if self.C is not None else None),
                             N_denom=int(N_denom),
                         )
-                    bar.update(1.0)
-
                 
                 ema_p1 = 0.85 * ema_p1 + 0.15 * max(t1_total, 1e-9)
                 ema_p2 = 0.85 * ema_p2 + 0.15 * max(t2_total, 1e-9)

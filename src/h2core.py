@@ -113,6 +113,42 @@ def _solve_linear_batch(lhs: np.ndarray, rhs: np.ndarray) -> np.ndarray:
     return out
 
 
+def _symmetrize_with_design(trace_KK: np.ndarray, jackknife, unit_sizes: np.ndarray) -> np.ndarray:
+    """
+    Symmetrize replicate trace matrices using the current jackknife design.
+
+    Prefer the newer utils API that takes the explicit delete-incidence matrix and
+    per-unit active sizes. Fall back to the older shorthand API for backward
+    compatibility.
+    """
+    unit_sizes = np.asarray(unit_sizes, dtype=np.float64)
+    try:
+        return utils.symmetrize_trace_with_jackknife(
+            trace_KK,
+            logger=None,
+            verbose=False,
+            jk_delete_matrix=np.asarray(jackknife.D, dtype=np.float64, order="C"),
+            jk_unit_sizes=unit_sizes,
+            jk_delete_d=int(jackknife.delete),
+        )
+    except TypeError:
+        if jackknife.mode == "block":
+            return utils.symmetrize_trace_with_jackknife(
+                trace_KK,
+                logger=None,
+                verbose=False,
+                jk_block_sizes=unit_sizes,
+                jk_delete_d=1,
+            )
+        return utils.symmetrize_trace_with_jackknife(
+            trace_KK,
+            logger=None,
+            verbose=False,
+            jk_n_units=int(jackknife.nunit),
+            jk_delete_d=int(jackknife.delete),
+        )
+
+
 def _stack_delete_replicates(full: np.ndarray, unit: np.ndarray, D: np.ndarray) -> np.ndarray:
     full = np.asarray(full, dtype=np.float64)
     unit = np.asarray(unit, dtype=np.float64)
@@ -204,7 +240,7 @@ def prepare_h2(
     if chi2.shape != (M,):
         raise ValueError(f"matched.chi2 must have shape ({M},), got {chi2.shape}")
 
-    m_unit = np.zeros(U, dtype=np.float64)       # active SNP counts per unit
+    m_unit = np.zeros(U, dtype=np.float64)
     Ak_unit = np.zeros((U, K), dtype=np.float64)
     Az2_unit = np.zeros((U, K), dtype=np.float64)
     Ak2_unit = np.zeros((U, K), dtype=np.float64)
@@ -216,34 +252,27 @@ def prepare_h2(
         e = int(jackknife.ends[u])
         if e <= s:
             continue
-
         mu = active_mask[s:e]
         if not np.any(mu):
             continue
-
         Au = A[s:e, :][mu, :]
         Lu = L[s:e, :][mu, :]
         chi2u = chi2[s:e][mu]
 
-        m_unit[u] = float(Au.shape[0])  # IMPORTANT: SNP counts, not annotation mass
+        m_unit[u] = float(Au.shape[0])
         Ak_unit[u] = Au.sum(axis=0, dtype=np.float64)
         Az2_unit[u] = Au.T @ chi2u
         Ak2_unit[u] = (Au * Au).sum(axis=0, dtype=np.float64)
         AA_unit[u] = Au.T @ Au
         AL_unit[u] = Au.T @ Lu
 
-    # Use the exact same active-subset unit counts for jackknife symmetrization
-    unit_sizes = m_unit.copy()
-
     has_overlap = _has_overlapping_annotations(A[active_mask, :])
 
-    M_full = float(unit_sizes.sum())
+    M_full = float(m_unit.sum())
     if not (np.isfinite(M_full) and M_full > 0.0):
         raise RuntimeError("No active SNPs remain for H2 preparation.")
 
-    M_rep = _stack_delete_replicates(
-        np.array(M_full, dtype=np.float64), unit_sizes, jackknife.D
-    ).reshape(R + 1)
+    M_rep = _stack_delete_replicates(np.array(M_full, dtype=np.float64), m_unit, jackknife.D).reshape(R + 1)
     Ak_rep = _stack_delete_replicates(Ak_unit.sum(axis=0), Ak_unit, jackknife.D)
     Az2_rep = _stack_delete_replicates(Az2_unit.sum(axis=0), Az2_unit, jackknife.D)
     Ak2_rep = _stack_delete_replicates(Ak2_unit.sum(axis=0), Ak2_unit, jackknife.D)
@@ -257,47 +286,19 @@ def prepare_h2(
         AL_rep = AL_rep.copy()
         AL_rep[:R] -= _pair_correction_from_deleted_mass(rep_Ak, del_Ak, delta)
 
+    Ak_full = np.asarray(Ak_rep[-1], dtype=np.float64)
+    src_mass = np.broadcast_to(Ak_full[None, :], Ak_rep.shape).copy()
+    if jackknife.mode == "chr" and adjust_delta and getattr(trace_view, "delta", None) is not None:
+        # After explicit deleted-source correction, replicate numerators approximate
+        # A_keep^T L_keep, so the source-side normalizer should also be the kept mass.
+        src_mass[:R] = Ak_rep[:R]
+
     M_k = Ak_rep[:, :, None]
-    M_l = Ak_rep[:, None, :]
+    M_l = src_mass[:, None, :]
+    delta = np.asarray(trace_view.delta, dtype=np.float64) if (adjust_delta and getattr(trace_view, "delta", None) is not None) else None
+    trace_KK = utils._calc_trace_from_ld_batch(AL_rep, matched.nsamp, M_k, M_l, delta=delta)
 
-    delta = (
-        np.asarray(trace_view.delta, dtype=np.float64)
-        if (adjust_delta and getattr(trace_view, "delta", None) is not None)
-        else None
-    )
-
-    trace_KK = utils._calc_trace_from_ld_batch(
-        AL_rep,
-        matched.nsamp,
-        M_k,
-        M_l,
-        delta=delta,
-    )
-
-    # ------------------------------------------------------------------
-    # NEW: symmetrization must use the same unit-size logic as the SE code
-    # ------------------------------------------------------------------
-    if jackknife.mode == "block":
-        trace_KK = utils.symmetrize_trace_with_jackknife(
-            trace_KK,
-            logger=None,
-            verbose=False,
-            jk_block_sizes=unit_sizes,   # active-subset block sizes
-            center="mean",
-            nan_policy="omit",
-        )
-    else:
-        trace_KK = utils.symmetrize_trace_with_jackknife(
-            trace_KK,
-            logger=None,
-            verbose=False,
-            jk_delete_matrix=jackknife.D,   # REQUIRED for delete-set designs
-            jk_unit_sizes=unit_sizes,       # active-subset unit sizes
-            jk_n_units=jackknife.nunit,     # optional sanity check
-            jk_delete_d=jackknife.delete,
-            center="mean",
-            nan_policy="omit",
-        )
+    trace_KK = _symmetrize_with_design(trace_KK, jackknife, m_unit)
 
     lhs = np.full((R + 1, K + 1, K + 1), float(matched.nsamp), dtype=np.float64)
     lhs[:, :K, :K] = trace_KK
@@ -322,7 +323,7 @@ def prepare_h2(
         jackknife=jackknife,
         active_mask=active_mask,
         has_overlap=has_overlap,
-        unit_sizes=unit_sizes,
+        unit_sizes=m_unit,
         m_unit=m_unit,
         Ak_unit=Ak_unit,
         Az2_unit=Az2_unit,
