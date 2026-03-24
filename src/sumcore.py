@@ -11,7 +11,8 @@ from jackknife import JackknifeSpec, JackknifeDesign
 from trace import Trace
 from sumstats import Sumstats, MatchedSumstats
 from h2core import prepare_h2, fit_h2
-from rgcore import prepare_rg, build_rg_summary_moment, fit_intercept, fit_rg, RGResultWriter
+from rgcore import prepare_rg, fit_intercept, fit_rg, RGResultWriter
+from moments import build_rg_summary_moment
 
 
 class Sumcore:
@@ -41,7 +42,7 @@ class Sumcore:
         njack=None,
         out=None,
         align_alleles=False,
-        drop_ambiguous=False,
+        drop_ambiguous=True,
         collapse_reg_ld=False,
         enrich_mode: str = "auto",
         jack_mode: str = "mean",
@@ -58,6 +59,7 @@ class Sumcore:
         report_tau: bool = True,
         allow_neg_enr: bool = False,
         adjust_delta: bool = False,
+        cov_rank=None,
     ):
 
         self.log = log
@@ -98,13 +100,13 @@ class Sumcore:
         self.adjust_delta = bool(adjust_delta)
         self.nan_policy = "propagate" if self.clip_nonfinite_vals else "omit"
         self.rg_se_method = str(rg_se_method).strip().lower()
-        if self.rg_se_method not in {"jackknife", "delta"}:
-            raise ValueError("rg_se_method must be one of {'jackknife','delta'}")
+        if self.rg_se_method not in {"jackknife", "delta", "robust", "kmoments"}:
+            raise ValueError("rg_se_method must be one of {'jackknife','delta','robust','kmoments'}")
         if self.chisq_action not in ("drop", "clip", "warn", "none"):
             raise ValueError("chisq_action must be one of {'drop','clip','warn','none'}")
         if self.intercept_weight_mode not in {"ldsc", "score"}:
             raise ValueError("intercept_weight_mode must be one of {'ldsc','score'}")
-    
+
         self.intercept_rg = None if intercept_rg is None else float(intercept_rg)
         self.pheno_rg_paths = None if pheno_rg is None else utils._parse_rg_pair(pheno_rg)
         self.pheno_rg_cov_paths = None if pheno_rg_cov is None else utils._parse_rg_pair(pheno_rg_cov)
@@ -122,7 +124,7 @@ class Sumcore:
 
         self.pheno_rg_missing_values = self._parse_missing_tokens(pheno_rg_missing_values)
         self.pheno_rg_cov_missing_values = self._parse_missing_tokens(pheno_rg_cov_missing_values)
-
+        self.cov_rank_values = self._parse_cov_rank_values(cov_rank, expected=2)
 
         self.out = out
         self.result = None
@@ -132,8 +134,32 @@ class Sumcore:
         self.matched2 = None
 
     def _run(self):
-        ss1 = Sumstats.from_file(self.phen_paths[0], name=self.phen_names[0], log=self.log)
-        ss2 = Sumstats.from_file(self.phen_paths[1], name=self.phen_names[1], log=self.log)
+        pheno_cov_rank_override = self._derive_cov_rank_overrides_from_pheno()
+
+        if pheno_cov_rank_override is not None:
+            cov_rank1, cov_rank2 = pheno_cov_rank_override
+            cov_rank_source1 = "pheno-rg-cov"
+            cov_rank_source2 = "pheno-rg-cov"
+        else:
+            cov_rank1, cov_rank2 = self.cov_rank_values
+            cov_rank_source1 = "cli" if cov_rank1 is not None else None
+            cov_rank_source2 = "cli" if cov_rank2 is not None else None
+
+        ss1 = Sumstats.from_file(
+            self.phen_paths[0],
+            name=self.phen_names[0],
+            log=self.log,
+            cov_rank=cov_rank1,
+            cov_rank_source=cov_rank_source1,
+        )
+        ss2 = Sumstats.from_file(
+            self.phen_paths[1],
+            name=self.phen_names[1],
+            log=self.log,
+            cov_rank=cov_rank2,
+            cov_rank_source=cov_rank_source2,
+        )
+
         aligned1 = ss1.align_to_trace(self.trace)
         aligned2 = ss2.align_to_trace(self.trace)
 
@@ -197,17 +223,17 @@ class Sumcore:
 
         fixed_c, fixed_info = self._resolve_external_intercept(matched1, matched2)
 
-        summary_y, summary_y_info = build_rg_summary_moment(
-            matched1,
-            matched2,
-            intercept_info=fixed_info,
-        )
+        summary_y, summary_y_info = build_rg_summary_moment(matched1, matched2)
         if self.log is not None:
-            mode = "unknown" if summary_y_info is None else str(summary_y_info.get("mode", "unknown"))
-            n_bad = 0 if summary_y_info is None else int(summary_y_info.get("n_nonfinite", 0))
             self.log._log(
-                f"[rg:rhs] summary moment mode={mode}; "
-                f"nonfinite_reconstructed_snps={n_bad}"
+                f"[rg:rhs] summary moment mode={summary_y_info.get('mode', 'unknown')}; "
+                f"trait1_cov_rank={summary_y_info.get('trait1_cov_rank', 'NA')} "
+                f"({summary_y_info.get('trait1_cov_rank_source', 'NA')}), "
+                f"trait2_cov_rank={summary_y_info.get('trait2_cov_rank', 'NA')} "
+                f"({summary_y_info.get('trait2_cov_rank_source', 'NA')}), "
+                f"trait1_n_scale={summary_y_info.get('trait1_n_scale', np.nan):.6g}, "
+                f"trait2_n_scale={summary_y_info.get('trait2_n_scale', np.nan):.6g}, "
+                f"nonfinite_reconstructed_snps={summary_y_info.get('n_nonfinite', 0)}"
             )
 
         intercept = fit_intercept(
@@ -229,18 +255,16 @@ class Sumcore:
             nan_policy=self.nan_policy,
         )
 
-        rg_prepared = prepare_rg(
-            tv,
-            matched1,
-            matched2,
-            jk,
-            summary_y=summary_y,
-            summary_y_info=summary_y_info,
-            adjust_delta=self.adjust_delta,
-        )
-
         rg_fit = fit_rg(
-            rg_prepared,
+            prepare_rg(
+                tv,
+                matched1,
+                matched2,
+                jk,
+                summary_y=summary_y,
+                summary_y_info=summary_y_info,
+                adjust_delta=self.adjust_delta,
+            ),
             h2_fit1,
             h2_fit2,
             intercept,
@@ -275,9 +299,7 @@ class Sumcore:
             )
 
         if self.verbose_level >= 2 and self.out is not None:
-            pair_tag = f"{self.phen_names[0]}__{self.phen_names[1]}"
-
-            jack_path = f"{self.out}.{pair_tag}.rg.jack"
+            jack_path = f"{self.out}.rg.jack"
             RGResultWriter.save_jackknife_text(rg_fit, jack_path)
             if self.log is not None:
                 self.log._log(f"Saved rg jackknife replicate dump to {jack_path}")
@@ -285,7 +307,7 @@ class Sumcore:
             info = intercept.info if isinstance(intercept.info, dict) else {}
             n_overlap = info.get("n_overlap", None)
             if n_overlap is not None:
-                eq_path = f"{self.out}.{pair_tag}.rg.scoreeq.json"
+                eq_path = f"{self.out}.rg.scoreeq.json"
                 RGResultWriter.save_score_normal_equations_json(rg_fit, eq_path)
                 if self.log is not None:
                     self.log._log(f"Saved explicit full SCORE normal-equation dump to {eq_path}")
@@ -300,6 +322,17 @@ class Sumcore:
         h2_fit2 = self.result["h2_fit2"]
         intercept = self.result["intercept"]
         rg_fit = self.result["rg_fit"]
+        km_info = getattr(rg_fit, "kmoment_info", None)
+        if km_info is not None:
+            self.log._log(
+                "[rg:kmom] "
+                f"single-component model-based SE used; "
+                f"moment_source={km_info.get('moment_source', 'NA')}, "
+                f"alpha_probe={km_info.get('alpha_probe', np.nan):.6g}, "
+                f"alpha_probe_err={km_info.get('alpha_probe_err', np.nan):.3e}, "
+                f"delta_reff={km_info.get('delta_reff', np.nan):.6g}, "
+                f"var_gamma={km_info.get('var_gamma', np.nan):.6g}"
+            )
         fits = [h2_fit1, h2_fit2]
 
         for t, fit in enumerate(fits):
@@ -343,7 +376,7 @@ class Sumcore:
 
         self.log._log(
             f"^^^ Phenotype [{self.phen_names[0]}] & [{self.phen_names[1]}] "
-            f"Intercept (c): {intercept.c[0]:.6g} (SE: {intercept.c[1]:.6g})"
+            f"Intercept (c): {intercept.c[0]:.9g} (SE: {intercept.c[1]:.6g})"
         )
 
         for j, header in enumerate(self.trace.annot_header):
@@ -502,6 +535,68 @@ class Sumcore:
             "n_used": int(df.shape[0]),
         }
 
+
+    def _prepare_trait_table_for_external_intercept(self, pheno_path: str, cov_path: str | None):
+        pheno_df, pheno_info = self._read_overlap_phenotype_file(
+            pheno_path,
+            self.pheno_rg_missing_values,
+        )
+
+        if self.log is not None:
+            self.log._log(
+                f"[rg:c] pheno file '{pheno_path}': "
+                f"raw={pheno_info['n_raw']}, "
+                f"dropped_missing_pheno={pheno_info['n_missing_pheno']}, "
+                f"kept={pheno_info['n_used']}"
+            )
+
+        if cov_path is None:
+            return pheno_df, {
+                "pheno_path": pheno_path,
+                "cov_path": None,
+                "n_pheno_used": pheno_info["n_used"],
+                "n_final": int(pheno_df.shape[0]),
+                "n_cov": 0,
+            }
+
+        cov_df, cov_info = self._read_overlap_covariate_file(
+            cov_path,
+            self.pheno_rg_cov_missing_values,
+        )
+
+        if self.log is not None:
+            self.log._log(
+                f"[rg:c] cov file '{cov_path}': "
+                f"raw={cov_info['n_raw']}, "
+                f"dropped_rows_with_missing_cov={cov_info['n_missing_cov_rows']}, "
+                f"kept={cov_info['n_used']}, "
+                f"n_cov={cov_info['n_cov']}"
+            )
+
+        merged = pheno_df.merge(cov_df, on=["FID", "IID"], how="inner")
+        if merged.shape[0] == 0:
+            raise RuntimeError(
+                f"No overlapping FID/IID rows remained after merging phenotype and covariate files:\n"
+                f"  phenotype: {pheno_path}\n"
+                f"  covariates: {cov_path}"
+            )
+        if merged.duplicated(subset=["FID", "IID"]).any():
+            raise RuntimeError("Duplicate FID/IID rows after phenotype/covariate merge.")
+
+        if self.log is not None:
+            self.log._log(
+                f"[rg:c] merged external table for '{pheno_path}': kept={merged.shape[0]}"
+            )
+
+        return merged, {
+            "pheno_path": pheno_path,
+            "cov_path": cov_path,
+            "n_pheno_used": pheno_info["n_used"],
+            "n_cov_used": cov_info["n_used"],
+            "n_final": int(merged.shape[0]),
+            "n_cov": cov_info["n_cov"],
+        }
+    
     @staticmethod
     def _read_overlap_covariate_file(path: str, missing_tokens):
         """
@@ -573,67 +668,6 @@ class Sumcore:
             "n_cov": int(cov.shape[1]),
         }
 
-    def _prepare_trait_table_for_external_intercept(self, pheno_path: str, cov_path: str | None):
-        pheno_df, pheno_info = self._read_overlap_phenotype_file(
-            pheno_path,
-            self.pheno_rg_missing_values,
-        )
-
-        if self.log is not None:
-            self.log._log(
-                f"[rg:c] pheno file '{pheno_path}': "
-                f"raw={pheno_info['n_raw']}, "
-                f"dropped_missing_pheno={pheno_info['n_missing_pheno']}, "
-                f"kept={pheno_info['n_used']}"
-            )
-
-        if cov_path is None:
-            return pheno_df, {
-                "pheno_path": pheno_path,
-                "cov_path": None,
-                "n_pheno_used": pheno_info["n_used"],
-                "n_final": int(pheno_df.shape[0]),
-                "n_cov": 0,
-            }
-
-        cov_df, cov_info = self._read_overlap_covariate_file(
-            cov_path,
-            self.pheno_rg_cov_missing_values,
-        )
-
-        if self.log is not None:
-            self.log._log(
-                f"[rg:c] cov file '{cov_path}': "
-                f"raw={cov_info['n_raw']}, "
-                f"dropped_rows_with_missing_cov={cov_info['n_missing_cov_rows']}, "
-                f"kept={cov_info['n_used']}, "
-                f"n_cov={cov_info['n_cov']}"
-            )
-
-        merged = pheno_df.merge(cov_df, on=["FID", "IID"], how="inner")
-        if merged.shape[0] == 0:
-            raise RuntimeError(
-                f"No overlapping FID/IID rows remained after merging phenotype and covariate files:\n"
-                f"  phenotype: {pheno_path}\n"
-                f"  covariates: {cov_path}"
-            )
-        if merged.duplicated(subset=["FID", "IID"]).any():
-            raise RuntimeError("Duplicate FID/IID rows after phenotype/covariate merge.")
-
-        if self.log is not None:
-            self.log._log(
-                f"[rg:c] merged external table for '{pheno_path}': kept={merged.shape[0]}"
-            )
-
-        return merged, {
-            "pheno_path": pheno_path,
-            "cov_path": cov_path,
-            "n_pheno_used": pheno_info["n_used"],
-            "n_cov_used": cov_info["n_used"],
-            "n_final": int(merged.shape[0]),
-            "n_cov": cov_info["n_cov"],
-        }
-
     @staticmethod
     def _design_from_trait_table(df: pd.DataFrame):
         y = df["_y_raw"].to_numpy(dtype=np.float64, copy=False)
@@ -674,37 +708,24 @@ class Sumcore:
         A1,
         b1,
         yy1,
-        n1_std,
-        n1_scale,
         A2,
         b2,
         yy2,
-        n2_std,
-        n2_scale,
         A12,
         b1y2,
         b2y1,
         y12,
     ) -> float:
         """
-        Compute
-            c = <r1_std_overlap, r2_std_overlap> / sqrt(N1_scale * N2_scale)
-        where each r_a is the OLS residual after projecting phenotype y_a onto [1, covariates_a],
-        standardized by sqrt(RSS_a / N_a_std).
+        Compute the exact score-scale intercept
+
+            c = <r1, r2> / sqrt(RSS1 * RSS2)
+
+        where r_a is the phenotype residual after projecting y_a onto [1, covariates_a].
+
+        This is the correct intercept scale for the exact score moments used in
+        build_rg_summary_moment(), and is independent of n_scale.
         """
-        n1_std = float(n1_std)
-        n2_std = float(n2_std)
-        n1_scale = float(n1_scale)
-        n2_scale = float(n2_scale)
-
-        if not (
-            np.isfinite(n1_std) and np.isfinite(n2_std) and
-            np.isfinite(n1_scale) and np.isfinite(n2_scale) and
-            n1_std > 1.0 and n2_std > 1.0 and
-            n1_scale > 0.0 and n2_scale > 0.0
-        ):
-            return np.nan
-
         try:
             alpha1 = cls._solve_small_linear(A1, b1)
             alpha2 = cls._solve_small_linear(A2, b2)
@@ -713,14 +734,9 @@ class Sumcore:
 
         rss1 = float(yy1 - np.dot(b1, alpha1))
         rss2 = float(yy2 - np.dot(b2, alpha2))
-
-        # Guard against tiny negative numerical noise.
         rss1 = max(rss1, 0.0)
         rss2 = max(rss2, 0.0)
-
-        var1 = rss1 / n1_std
-        var2 = rss2 / n2_std
-        if not (np.isfinite(var1) and np.isfinite(var2) and var1 > 0.0 and var2 > 0.0):
+        if not (np.isfinite(rss1) and np.isfinite(rss2) and rss1 > 0.0 and rss2 > 0.0):
             return np.nan
 
         cross = float(
@@ -730,11 +746,236 @@ class Sumcore:
             + np.dot(alpha1, A12 @ alpha2)
         )
 
-        den = float(np.sqrt(var1 * var2 * n1_scale * n2_scale))
+        den = float(np.sqrt(rss1 * rss2))
         if not (np.isfinite(den) and den > 0.0):
             return np.nan
 
         return float(cross / den)
+
+    def _compute_fixed_intercept_from_pheno(self, matched1, matched2):
+        if self.pheno_rg_paths is None or len(self.pheno_rg_paths) != 2:
+            raise ValueError("--pheno-rg must contain exactly two comma-separated phenotype files.")
+
+        cov_paths = (None, None) if self.pheno_rg_cov_paths is None else tuple(self.pheno_rg_cov_paths)
+
+        trait1_df, trait1_info = self._prepare_trait_table_for_external_intercept(
+            self.pheno_rg_paths[0],
+            cov_paths[0],
+        )
+        trait2_df, trait2_info = self._prepare_trait_table_for_external_intercept(
+            self.pheno_rg_paths[1],
+            cov_paths[1],
+        )
+
+        y1_full, C1_full, cov1_cols = self._design_from_trait_table(trait1_df)
+        y2_full, C2_full, cov2_cols = self._design_from_trait_table(trait2_df)
+
+        cov_rank1_ext = int(np.linalg.matrix_rank(C1_full) - 1)
+        cov_rank2_ext = int(np.linalg.matrix_rank(C2_full) - 1)
+        if cov_rank1_ext < 0 or cov_rank2_ext < 0:
+            raise RuntimeError("Derived negative cov_rank from external phenotype/covariate design.")
+
+        if self.log is not None:
+            if int(matched1.cov_rank) != cov_rank1_ext:
+                self.log._log(
+                    f"[rg:c] WARNING: trait1 matched cov_rank={matched1.cov_rank} "
+                    f"but external design implies cov_rank={cov_rank1_ext}."
+                )
+            if int(matched2.cov_rank) != cov_rank2_ext:
+                self.log._log(
+                    f"[rg:c] WARNING: trait2 matched cov_rank={matched2.cov_rank} "
+                    f"but external design implies cov_rank={cov_rank2_ext}."
+                )
+
+        overlap_df = trait1_df.merge(
+            trait2_df,
+            on=["FID", "IID"],
+            how="inner",
+            suffixes=("_1", "_2"),
+        )
+        n_overlap = int(overlap_df.shape[0])
+        if n_overlap <= 0:
+            raise RuntimeError("No overlapping individuals were found across the two --pheno-rg files.")
+
+        overlap_df = overlap_df.sort_values(["FID", "IID"], kind="mergesort").reset_index(drop=True)
+
+        y1_ov = overlap_df["_y_raw_1"].to_numpy(dtype=np.float64, copy=False)
+        y2_ov = overlap_df["_y_raw_2"].to_numpy(dtype=np.float64, copy=False)
+
+        C1_ov = np.empty((n_overlap, C1_full.shape[1]), dtype=np.float64)
+        C1_ov[:, 0] = 1.0
+        if cov1_cols:
+            C1_ov[:, 1:] = overlap_df[[f"{c}_1" for c in cov1_cols]].to_numpy(dtype=np.float64, copy=False)
+
+        C2_ov = np.empty((n_overlap, C2_full.shape[1]), dtype=np.float64)
+        C2_ov[:, 0] = 1.0
+        if cov2_cols:
+            C2_ov[:, 1:] = overlap_df[[f"{c}_2" for c in cov2_cols]].to_numpy(dtype=np.float64, copy=False)
+
+        A1_full = C1_full.T @ C1_full
+        b1_full = C1_full.T @ y1_full
+        yy1_full = float(np.dot(y1_full, y1_full))
+
+        A2_full = C2_full.T @ C2_full
+        b2_full = C2_full.T @ y2_full
+        yy2_full = float(np.dot(y2_full, y2_full))
+
+        A12_full = C1_ov.T @ C2_ov
+        b1y2_full = C1_ov.T @ y2_ov
+        b2y1_full = C2_ov.T @ y1_ov
+        y12_full = float(np.dot(y1_ov, y2_ov))
+
+        c_full = self._compute_external_c_from_summaries(
+            A1_full,
+            b1_full,
+            yy1_full,
+            A2_full,
+            b2_full,
+            yy2_full,
+            A12_full,
+            b1y2_full,
+            b2y1_full,
+            y12_full,
+        )
+        if not np.isfinite(c_full):
+            raise RuntimeError("Computed non-finite fixed intercept from --pheno-rg / --pheno-rg-cov.")
+
+        c_se = 0.0
+        nblocks = self._choose_pheno_nblocks(n_overlap)
+        if nblocks >= 2:
+            jk_ph = self._make_block_jackknife_from_length(n_overlap, nblocks)
+            B = jk_ph.nunit
+            p1 = C1_full.shape[1]
+            p2 = C2_full.shape[1]
+
+            A1_del = np.zeros((B, p1, p1), dtype=np.float64)
+            b1_del = np.zeros((B, p1), dtype=np.float64)
+            yy1_del = np.zeros(B, dtype=np.float64)
+
+            A2_del = np.zeros((B, p2, p2), dtype=np.float64)
+            b2_del = np.zeros((B, p2), dtype=np.float64)
+            yy2_del = np.zeros(B, dtype=np.float64)
+
+            A12_del = np.zeros((B, p1, p2), dtype=np.float64)
+            b1y2_del = np.zeros((B, p1), dtype=np.float64)
+            b2y1_del = np.zeros((B, p2), dtype=np.float64)
+            y12_del = np.zeros(B, dtype=np.float64)
+
+            for u in range(B):
+                s = int(jk_ph.starts[u])
+                e = int(jk_ph.ends[u])
+                if e <= s:
+                    continue
+
+                C1u = C1_ov[s:e]
+                C2u = C2_ov[s:e]
+                y1u = y1_ov[s:e]
+                y2u = y2_ov[s:e]
+
+                A1_del[u] = C1u.T @ C1u
+                b1_del[u] = C1u.T @ y1u
+                yy1_del[u] = float(np.dot(y1u, y1u))
+
+                A2_del[u] = C2u.T @ C2u
+                b2_del[u] = C2u.T @ y2u
+                yy2_del[u] = float(np.dot(y2u, y2u))
+
+                A12_del[u] = C1u.T @ C2u
+                b1y2_del[u] = C1u.T @ y2u
+                b2y1_del[u] = C2u.T @ y1u
+                y12_del[u] = float(np.dot(y1u, y2u))
+
+            c_rep = np.full(B, np.nan, dtype=np.float64)
+            for u in range(B):
+                c_rep[u] = self._compute_external_c_from_summaries(
+                    A1_full - A1_del[u],
+                    b1_full - b1_del[u],
+                    yy1_full - yy1_del[u],
+                    A2_full - A2_del[u],
+                    b2_full - b2_del[u],
+                    yy2_full - yy2_del[u],
+                    A12_full - A12_del[u],
+                    b1y2_full - b1y2_del[u],
+                    b2y1_full - b2y1_del[u],
+                    y12_full - y12_del[u],
+                )
+
+            c_reps = np.concatenate([c_rep, np.array([c_full], dtype=np.float64)], axis=0)
+            try:
+                _, c_se_raw = jk_ph.summarize(
+                    c_reps,
+                    unit_sizes=jk_ph.unit_sizes(dtype=np.float64),
+                    axis=0,
+                    center=self.jack_mode,
+                    nan_policy=self.nan_policy,
+                )
+                c_se = float(c_se_raw)
+            except Exception:
+                c_se = np.nan
+
+            if not np.isfinite(c_se) or c_se < 0.0:
+                if self.log is not None:
+                    self.log._log(
+                        "[rg:c] WARNING: phenotype-side jackknife SE for --pheno-rg "
+                        "was non-finite; falling back to SE=0 for the extra c-uncertainty component."
+                    )
+                c_se = 0.0
+
+        if self.log is not None:
+            if abs(float(trait1_df.shape[0]) - float(matched1.nsamp)) > 0.5 or abs(float(trait2_df.shape[0]) - float(matched2.nsamp)) > 0.5:
+                self.log._log(
+                    "[rg:c] WARNING: external phenotype/covariate rows differ from summary-stat sample sizes."
+                )
+
+        cov_adjusted = self.pheno_rg_cov_paths is not None
+        info = {
+            "source": "pheno",
+            "cov_adjusted": bool(cov_adjusted),
+            "pheno_paths": tuple(self.pheno_rg_paths),
+            "cov_paths": None if self.pheno_rg_cov_paths is None else tuple(self.pheno_rg_cov_paths),
+            "n1_summary": float(matched1.nsamp),
+            "n2_summary": float(matched2.nsamp),
+            "n1_scale": float(matched1.n_scale),
+            "n2_scale": float(matched2.n_scale),
+            "n1_trait_table": int(trait1_df.shape[0]),
+            "n2_trait_table": int(trait2_df.shape[0]),
+            "n_overlap": n_overlap,
+            "external_c_se": float(c_se),
+            "external_c_se_method": "sample_block_jackknife",
+            "pheno_nblocks": int(nblocks),
+            "trait1_cov_rank": int(cov_rank1_ext),
+            "trait2_cov_rank": int(cov_rank2_ext),
+            "n_cov_trait1": int(cov_rank1_ext),
+            "n_cov_trait2": int(cov_rank2_ext),
+        }
+
+        if self.log is not None:
+            if cov_adjusted:
+                self.log._log(
+                    f"[rg:c] --pheno-rg-cov => fixed covariate-adjusted c={c_full:.6g} "
+                    f"(SE: {c_se:.6g}) from {n_overlap} overlapping samples "
+                    f"with {nblocks} sample jackknife blocks; "
+                    f"trait1_cov_rank={cov_rank1_ext}, trait2_cov_rank={cov_rank2_ext}."
+                )
+            else:
+                self.log._log(
+                    f"[rg:c] --pheno-rg => fixed c={c_full:.6g} "
+                    f"(SE: {c_se:.6g}) from {n_overlap} overlapping samples "
+                    f"with {nblocks} sample jackknife blocks."
+                )
+
+        return c_full, info
+
+    def _resolve_external_intercept(self, matched1, matched2):
+        if self.intercept_rg is not None:
+            if not np.isfinite(self.intercept_rg):
+                raise ValueError("--intercept-rg must be finite.")
+            return float(self.intercept_rg), {"source": "cli"}
+
+        if self.pheno_rg_paths is not None:
+            return self._compute_fixed_intercept_from_pheno(matched1, matched2)
+
+        return None, None
 
     def _choose_pheno_nblocks(self, n_overlap: int) -> int:
         if n_overlap <= 1:
@@ -779,242 +1020,32 @@ class Sumcore:
             ends=ends,
             nsnps=nobs,
         )
+    
+    @staticmethod
+    def _parse_cov_rank_values(raw, expected: int):
+        expected = int(expected)
+        if raw is None:
+            return [None] * expected
 
-    def _compute_fixed_intercept_from_pheno(self, matched1, matched2):
-        if self.pheno_rg_paths is None or len(self.pheno_rg_paths) != 2:
-            raise ValueError("--pheno-rg must contain exactly two comma-separated phenotype files.")
+        vals = []
+        for tok in str(raw).split(","):
+            tok = tok.strip()
+            if tok == "":
+                continue
+            v = int(tok)
+            if v < 0:
+                raise ValueError(f"--cov-rank values must be non-negative; got {v}")
+            vals.append(v)
 
-        cov_paths = (None, None) if self.pheno_rg_cov_paths is None else tuple(self.pheno_rg_cov_paths)
+        if len(vals) == 1:
+            vals = vals * expected
 
-        trait1_df, trait1_info = self._prepare_trait_table_for_external_intercept(
-            self.pheno_rg_paths[0],
-            cov_paths[0],
-        )
-        trait2_df, trait2_info = self._prepare_trait_table_for_external_intercept(
-            self.pheno_rg_paths[1],
-            cov_paths[1],
-        )
-
-        y1_full, C1_full, cov1_cols = self._design_from_trait_table(trait1_df)
-        y2_full, C2_full, cov2_cols = self._design_from_trait_table(trait2_df)
-        
-        rank1_full = int(np.linalg.matrix_rank(C1_full))
-        rank2_full = int(np.linalg.matrix_rank(C2_full))
-
-        overlap_df = trait1_df.merge(
-            trait2_df,
-            on=["FID", "IID"],
-            how="inner",
-            suffixes=("_1", "_2"),
-        )
-        n_overlap = int(overlap_df.shape[0])
-        if n_overlap <= 0:
-            raise RuntimeError("No overlapping individuals were found across the two --pheno-rg files.")
-
-        overlap_df = overlap_df.sort_values(["FID", "IID"], kind="mergesort").reset_index(drop=True)
-
-        y1_ov = overlap_df["_y_raw_1"].to_numpy(dtype=np.float64, copy=False)
-        y2_ov = overlap_df["_y_raw_2"].to_numpy(dtype=np.float64, copy=False)
-
-        C1_ov = np.empty((n_overlap, C1_full.shape[1]), dtype=np.float64)
-        C1_ov[:, 0] = 1.0
-        if cov1_cols:
-            C1_ov[:, 1:] = overlap_df[[f"{c}_1" for c in cov1_cols]].to_numpy(dtype=np.float64, copy=False)
-
-        C2_ov = np.empty((n_overlap, C2_full.shape[1]), dtype=np.float64)
-        C2_ov[:, 0] = 1.0
-        if cov2_cols:
-            C2_ov[:, 1:] = overlap_df[[f"{c}_2" for c in cov2_cols]].to_numpy(dtype=np.float64, copy=False)
-
-        n1_std_full = float(y1_full.size)
-        n2_std_full = float(y2_full.size)
-        n1_scale_full = float(matched1.nsamp)
-        n2_scale_full = float(matched2.nsamp)
-
-        if not (
-            np.isfinite(n1_scale_full) and np.isfinite(n2_scale_full)
-            and n1_scale_full > 0.0 and n2_scale_full > 0.0
-        ):
-            raise RuntimeError(
-                f"Invalid rg sample sizes from summary stats: n1={n1_scale_full}, n2={n2_scale_full}."
+        elif len(vals) != expected:
+            raise ValueError(
+                f"--cov-rank must contain exactly {expected} value(s) for --rg; got {len(vals)}"
             )
+        return vals
 
-        # Full-sample sufficient statistics for the two trait-specific residualizations.
-        A1_full = C1_full.T @ C1_full
-        b1_full = C1_full.T @ y1_full
-        yy1_full = float(np.dot(y1_full, y1_full))
-
-        A2_full = C2_full.T @ C2_full
-        b2_full = C2_full.T @ y2_full
-        yy2_full = float(np.dot(y2_full, y2_full))
-
-        alpha1_full = self._solve_small_linear(A1_full, b1_full)
-        alpha2_full = self._solve_small_linear(A2_full, b2_full)
-
-        rss1_full = max(float(yy1_full - np.dot(b1_full, alpha1_full)), 0.0)
-        rss2_full = max(float(yy2_full - np.dot(b2_full, alpha2_full)), 0.0)
-
-        # Overlap-side sufficient statistics for the residual cross-moment.
-        A12_full = C1_ov.T @ C2_ov
-        b1y2_full = C1_ov.T @ y2_ov
-        b2y1_full = C2_ov.T @ y1_ov
-        y12_full = float(np.dot(y1_ov, y2_ov))
-
-        c_full = self._compute_external_c_from_summaries(
-            A1_full, b1_full, yy1_full, n1_std_full, n1_scale_full,
-            A2_full, b2_full, yy2_full, n2_std_full, n2_scale_full,
-            A12_full, b1y2_full, b2y1_full, y12_full,
-        )
-        if not np.isfinite(c_full):
-            raise RuntimeError("Computed non-finite fixed intercept from --pheno-rg / --pheno-rg-cov.")
-
-        # Sample-side block jackknife over overlapping individuals.
-        c_se = 0.0
-        nblocks = self._choose_pheno_nblocks(n_overlap)
-        if nblocks >= 2:
-            jk_ph = self._make_block_jackknife_from_length(n_overlap, nblocks)
-            m_u = jk_ph.unit_sizes(dtype=np.float64)
-
-            B = jk_ph.nunit
-            p1 = C1_full.shape[1]
-            p2 = C2_full.shape[1]
-
-            A1_del = np.zeros((B, p1, p1), dtype=np.float64)
-            b1_del = np.zeros((B, p1), dtype=np.float64)
-            yy1_del = np.zeros(B, dtype=np.float64)
-
-            A2_del = np.zeros((B, p2, p2), dtype=np.float64)
-            b2_del = np.zeros((B, p2), dtype=np.float64)
-            yy2_del = np.zeros(B, dtype=np.float64)
-
-            A12_del = np.zeros((B, p1, p2), dtype=np.float64)
-            b1y2_del = np.zeros((B, p1), dtype=np.float64)
-            b2y1_del = np.zeros((B, p2), dtype=np.float64)
-            y12_del = np.zeros(B, dtype=np.float64)
-
-            for u in range(B):
-                s = int(jk_ph.starts[u])
-                e = int(jk_ph.ends[u])
-                if e <= s:
-                    continue
-
-                C1u = C1_ov[s:e]
-                C2u = C2_ov[s:e]
-                y1u = y1_ov[s:e]
-                y2u = y2_ov[s:e]
-
-                A1_del[u] = C1u.T @ C1u
-                b1_del[u] = C1u.T @ y1u
-                yy1_del[u] = float(np.dot(y1u, y1u))
-
-                A2_del[u] = C2u.T @ C2u
-                b2_del[u] = C2u.T @ y2u
-                yy2_del[u] = float(np.dot(y2u, y2u))
-
-                A12_del[u] = C1u.T @ C2u
-                b1y2_del[u] = C1u.T @ y2u
-                b2y1_del[u] = C2u.T @ y1u
-                y12_del[u] = float(np.dot(y1u, y2u))
-
-            c_rep = np.full(B, np.nan, dtype=np.float64)
-            for u in range(B):
-                mdel = float(m_u[u])
-
-                c_rep[u] = self._compute_external_c_from_summaries(
-                    A1_full - A1_del[u],
-                    b1_full - b1_del[u],
-                    yy1_full - yy1_del[u],
-                    n1_std_full - mdel,
-                    n1_scale_full - mdel,
-                    A2_full - A2_del[u],
-                    b2_full - b2_del[u],
-                    yy2_full - yy2_del[u],
-                    n2_std_full - mdel,
-                    n2_scale_full - mdel,
-                    A12_full - A12_del[u],
-                    b1y2_full - b1y2_del[u],
-                    b2y1_full - b2y1_del[u],
-                    y12_full - y12_del[u],
-                )
-
-            c_reps = np.concatenate([c_rep, np.array([c_full], dtype=np.float64)], axis=0)
-            try:
-                _, c_se_raw = jk_ph.summarize(
-                    c_reps,
-                    unit_sizes=m_u,
-                    axis=0,
-                    center=self.jack_mode,
-                    nan_policy=self.nan_policy,
-                )
-                c_se = float(c_se_raw)
-            except Exception:
-                c_se = np.nan
-
-            if not np.isfinite(c_se) or c_se < 0.0:
-                if self.log is not None:
-                    self.log._log(
-                        "[rg:c] WARNING: phenotype-side jackknife SE for --pheno-rg "
-                        "was non-finite; falling back to SE=0 for the extra c-uncertainty component."
-                    )
-                c_se = 0.0
-
-        cov_adjusted = self.pheno_rg_cov_paths is not None
-        info = {
-            "source": "pheno",
-            "cov_adjusted": bool(cov_adjusted),
-            "pheno_paths": tuple(self.pheno_rg_paths),
-            "cov_paths": None if self.pheno_rg_cov_paths is None else tuple(self.pheno_rg_cov_paths),
-            "n1_summary": n1_scale_full,
-            "n2_summary": n2_scale_full,
-            "n1_trait_table": int(trait1_df.shape[0]),
-            "n2_trait_table": int(trait2_df.shape[0]),
-            "n_overlap": n_overlap,
-            "external_c_se": float(c_se),
-            "external_c_se_method": "sample_block_jackknife",
-            "pheno_nblocks": int(nblocks),
-            "n_cov_trait1": int(C1_full.shape[1] - 1),
-            "n_cov_trait2": int(C2_full.shape[1] - 1),
-            "rhs_trait1_rss_raw": rss1_full,
-            "rhs_trait2_rss_raw": rss2_full,
-            "rhs_trait1_n_std": float(n1_std_full),
-            "rhs_trait2_n_std": float(n2_std_full),
-            "rhs_trait1_p_design": rank1_full,
-            "rhs_trait2_p_design": rank2_full,
-        }
-
-        if self.log is not None:
-            if abs(float(trait1_df.shape[0]) - n1_scale_full) > 0.5 or abs(float(trait2_df.shape[0]) - n2_scale_full) > 0.5:
-                self.log._log(
-                    "[rg:c] WARNING: external phenotype/covariate rows differ from summary-stat sample sizes; "
-                    "using the external files for residualization and the summary N values in the outer c denominator."
-                )
-
-            if cov_adjusted:
-                self.log._log(
-                    f"[rg:c] --pheno-rg-cov => fixed covariate-adjusted c={c_full:.6g} "
-                    f"(SE: {c_se:.6g}) from {n_overlap} overlapping samples "
-                    f"with {nblocks} sample jackknife blocks; "
-                    f"n_cov_trait1={C1_full.shape[1] - 1}, n_cov_trait2={C2_full.shape[1] - 1}."
-                )
-            else:
-                self.log._log(
-                    f"[rg:c] --pheno-rg => fixed c={c_full:.6g} "
-                    f"(SE: {c_se:.6g}) from {n_overlap} overlapping samples "
-                    f"with {nblocks} sample jackknife blocks."
-                )
-
-        return c_full, info
-
-    def _resolve_external_intercept(self, matched1, matched2):
-        if self.intercept_rg is not None:
-            if not np.isfinite(self.intercept_rg):
-                raise ValueError("--intercept-rg must be finite.")
-            return float(self.intercept_rg), {"source": "cli"}
-
-        if self.pheno_rg_paths is not None:
-            return self._compute_fixed_intercept_from_pheno(matched1, matched2)
-
-        return None, None
 
     @staticmethod
     def _alleles_to_int(a):
@@ -1100,3 +1131,43 @@ class Sumcore:
         a1[flip_mask] = a2[flip_mask]
         a2[flip_mask] = tmp
         return replace(matched, z=z, beta=beta, a1=a1, a2=a2)
+
+    def _derive_cov_rank_overrides_from_pheno(self):
+        """
+        If --pheno-rg and --pheno-rg-cov are both provided, derive cov_rank
+        (non-intercept df) from the external covariate designs and use those
+        to override any CLI/file defaults for BOTH h2 and rg estimation.
+        """
+        if self.pheno_rg_paths is None or self.pheno_rg_cov_paths is None:
+            return None
+
+        out = []
+        for pheno_path, cov_path in zip(self.pheno_rg_paths, self.pheno_rg_cov_paths):
+            trait_df, _ = self._prepare_trait_table_for_external_intercept(pheno_path, cov_path)
+            _, C, _ = self._design_from_trait_table(trait_df)
+            cov_rank = int(np.linalg.matrix_rank(C) - 1)
+            if cov_rank < 0:
+                raise RuntimeError(
+                    f"Derived a negative cov_rank from external design for phenotype file '{pheno_path}'."
+                )
+            out.append(cov_rank)
+
+        out = tuple(int(v) for v in out)
+
+        if self.log is not None:
+            if any(
+                (cli is not None) and (int(cli) != int(ext))
+                for cli, ext in zip(self.cov_rank_values, out)
+            ):
+                self.log._log(
+                    f"[cov-rank] overriding --cov-rank with values derived from "
+                    f"--pheno-rg-cov: {out[0]}, {out[1]}."
+                )
+            else:
+                self.log._log(
+                    f"[cov-rank] using cov_rank derived from --pheno-rg-cov: "
+                    f"{out[0]}, {out[1]}."
+                )
+
+        return out
+

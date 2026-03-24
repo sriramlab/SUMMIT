@@ -9,6 +9,7 @@ from jackknife import JackknifeSpec, JackknifeDesign
 from trace import Trace
 from sumstats import Sumstats
 from h2core import prepare_h2, fit_h2
+from moments import build_h2_summary_moment
 
 
 class Sumrhe:
@@ -41,6 +42,7 @@ class Sumrhe:
         enrich_mode: str = "auto",
         jack_mode: str = "mean",
         delta=None,
+        cov_rank=None,
     ):
 
         self.log = log
@@ -81,6 +83,8 @@ class Sumrhe:
         self.h2_paths = utils._parse_sumdir(h2_path)
         self.phen_names = [utils._phen_name_from_path(p) for p in self.h2_paths]
         self.npheno = len(self.h2_paths)
+        self.cov_rank_values = self._parse_cov_rank_values(cov_rank, self.npheno)
+
         self.results = []
         self.nsamp = []
 
@@ -92,15 +96,25 @@ class Sumrhe:
         self.results = []
         self.nsamp = []
 
-        for path, phen_name in zip(self.h2_paths, self.phen_names):
-            fit = self._fit_one(path, phen_name)
+        for path, phen_name, cov_rank_value in zip(
+            self.h2_paths,
+            self.phen_names,
+            self.cov_rank_values,
+        ):
+            fit = self._fit_one(path, phen_name, cov_rank_value)
             self.results.append(fit)
             self.nsamp.append(float(fit.prepared.matched.nsamp))
 
         return self.results
 
-    def _fit_one(self, path: str, phen_name: str):
-        ss = Sumstats.from_file(path, name=phen_name, log=self.log)
+    def _fit_one(self, path: str, phen_name: str, cov_rank_value):
+        ss = Sumstats.from_file(
+            path,
+            name=phen_name,
+            log=self.log,
+            cov_rank=cov_rank_value,
+            cov_rank_source=("cli" if cov_rank_value is not None else None),
+        )
         aligned = ss.align_to_trace(self.trace)
         keep_mask = aligned.keep_mask(
             chisq_threshold=self.chisq_threshold,
@@ -222,4 +236,25 @@ class Sumrhe:
         return
 
 
+    @staticmethod
+    def _parse_cov_rank_values(raw, expected: int):
+        expected = int(expected)
+        if raw is None:
+            return [None] * expected
+
+        vals = []
+        for tok in str(raw).split(","):
+            tok = tok.strip()
+            if tok == "":
+                continue
+            v = int(tok)
+            if v < 0:
+                raise ValueError(f"--cov-rank values must be non-negative; got {v}")
+            vals.append(v)
+
+        if len(vals) != expected:
+            raise ValueError(
+                f"--cov-rank must contain exactly {expected} value(s) for --h2; got {len(vals)}"
+            )
+        return vals
 

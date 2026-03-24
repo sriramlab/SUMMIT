@@ -6,6 +6,8 @@ import numpy as np
 import pandas as pd
 import utils
 
+from moments import resolve_cov_rank, effective_n_scale, derived_wald_z
+
 
 _CHI2_MEDIAN_1DF = 0.454936423119572
 
@@ -68,6 +70,9 @@ class MatchedSumstats:
     a1: np.ndarray
     a2: np.ndarray
     nsamp: float
+    n_scale: float
+    cov_rank: int
+    cov_rank_source: str
     name: str
     used_summary: dict | None = None
     used_top: list | None = None
@@ -94,6 +99,9 @@ class MatchedSumstats:
             a1=self.a1[keep_mask],
             a2=self.a2[keep_mask],
             nsamp=self.nsamp,
+            n_scale=self.n_scale,
+            cov_rank=self.cov_rank,
+            cov_rank_source=self.cov_rank_source,
             name=self.name,
             used_summary=self.used_summary,
             used_top=self.used_top,
@@ -117,7 +125,7 @@ class AlignedSumstats:
         if action not in ("drop", "clip", "warn", "none"):
             raise ValueError(f"Invalid chisq_action={chisq_action!r}")
 
-        thr, _ = utils._resolve_chisq_threshold(self.sumstats.nsamp, chisq_threshold)
+        thr, _ = utils._resolve_chisq_threshold(self.sumstats.n_scale, chisq_threshold)
         if action != "drop" or thr is None or (not np.isfinite(float(thr))) or float(thr) <= 0.0:
             return mask
 
@@ -156,7 +164,7 @@ class AlignedSumstats:
         a1 = self.sumstats.a1[pos]
         a2 = self.sumstats.a2[pos]
 
-        thr, _ = utils._resolve_chisq_threshold(self.sumstats.nsamp, chisq_threshold)
+        thr, _ = utils._resolve_chisq_threshold(self.sumstats.n_scale, chisq_threshold)
         clip_count = 0
         clip_threshold = None
         if action == "clip" and thr is not None and np.isfinite(float(thr)) and float(thr) > 0.0:
@@ -172,14 +180,17 @@ class AlignedSumstats:
 
         return MatchedSumstats(
             snps=snps,
+            z=z,
+            chi2=chi2,
             beta=beta,
             se=se,
             n=n,
-            z=z,
-            chi2=chi2,
             a1=a1,
             a2=a2,
             nsamp=float(self.sumstats.nsamp),
+            n_scale=float(self.sumstats.n_scale),
+            cov_rank=int(self.sumstats.cov_rank),
+            cov_rank_source=str(self.sumstats.cov_rank_source),
             name=self.sumstats.name,
             used_summary=used_summary,
             used_top=used_top,
@@ -210,6 +221,9 @@ class Sumstats:
         se,
         n,
         nsamp,
+        n_scale,
+        cov_rank,
+        cov_rank_source,
         a1,
         a2,
         name,
@@ -227,6 +241,9 @@ class Sumstats:
         self.a1 = np.asarray(a1, dtype=str)
         self.a2 = np.asarray(a2, dtype=str)
         self.nsamp = float(nsamp)
+        self.n_scale = float(n_scale)
+        self.cov_rank = int(cov_rank)
+        self.cov_rank_source = str(cov_rank_source)
         self.name = str(name)
         self.log = log
         self.removed_snps = [] if removed_snps is None else list(removed_snps)
@@ -248,29 +265,39 @@ class Sumstats:
         return int(self.snps.size)
 
     @classmethod
-    def from_file(cls, path, *, name=None, log=None) -> "Sumstats":
+    def from_file(
+        cls,
+        path,
+        *,
+        name=None,
+        log=None,
+        cov_rank=None,
+        cov_rank_source=None,
+    ) -> "Sumstats":
         hdr = pd.read_csv(path, sep=r"\s+", compression="infer", nrows=0)
         cols = list(hdr.columns)
 
-        ncol = _maybe_find_column(cols, ["OBS_CT", "N", "n"])
-        if ncol is None:
-            raise RuntimeError(f"Phenotype [{name or path}] must contain OBS_CT or N.")
         idcol = utils._parse_column_name(hdr, ["ID", "id", "snp", "SNP"], default_pos=0)
         a1col = utils._parse_column_name(hdr, ["A1", "ALT"], default_pos=1)
         a2col = utils._parse_column_name(hdr, ["A2", "REF"], default_pos=2)
 
+        ncol = _maybe_find_column(cols, ["OBS_CT", "obs_ct", "N", "n"])
+        if ncol is None:
+            ncol = utils._parse_column_name(hdr, ["N", "n"], default_pos=3)
+
         betacol = _maybe_find_column(cols, ["BETA", "beta"])
         secol = _maybe_find_column(cols, ["SE", "se", "STDERR", "stderr"])
-        zcol = _maybe_find_column(cols, ["Z", "z"])
-
         if betacol is None or secol is None:
             raise RuntimeError(
-                f"Phenotype [{name or path}] must contain BETA and SE columns for covariate-adjusted rg reconstruction."
+                f"Phenotype [{name or path}] must contain BETA and SE columns."
             )
 
-        usecols = list(dict.fromkeys(
-            [idcol, a1col, a2col, ncol, betacol, secol] + ([] if zcol is None else [zcol])
-        ))
+        covrankcol = _maybe_find_column(cols, ["COV_RANK", "cov_rank", "P_EFF", "p_eff"])
+
+        usecols = [idcol, a1col, a2col, ncol, betacol, secol]
+        if covrankcol is not None:
+            usecols.append(covrankcol)
+        usecols = list(dict.fromkeys(usecols))
 
         df = pd.read_csv(
             path,
@@ -288,10 +315,10 @@ class Sumstats:
             betacol: "BETA",
             secol: "SE",
         }
-        if zcol is not None:
-            rename_map[zcol] = "Z"
-        df = df.rename(columns=rename_map)
+        if covrankcol is not None:
+            rename_map[covrankcol] = "COV_RANK"
 
+        df = df.rename(columns=rename_map)
         df["SNP"] = df["SNP"].astype(str)
         df["A1"] = df["A1"].astype(str).str.upper()
         df["A2"] = df["A2"].astype(str).str.upper()
@@ -299,22 +326,43 @@ class Sumstats:
         df["BETA"] = pd.to_numeric(df["BETA"], errors="coerce")
         df["SE"] = pd.to_numeric(df["SE"], errors="coerce")
 
-        if zcol is None:
-            with np.errstate(divide="ignore", invalid="ignore"):
-                df["Z"] = df["BETA"] / df["SE"]
-        else:
-            df["Z"] = pd.to_numeric(df["Z"], errors="coerce")
+        file_cov_rank = None
+        if "COV_RANK" in df.columns:
+            cr = pd.to_numeric(df["COV_RANK"], errors="coerce").to_numpy(dtype=np.float64, copy=False)
+            cr = cr[np.isfinite(cr)]
+            if cr.size > 0:
+                rcr = np.rint(cr)
+                if np.any(np.abs(cr - rcr) > 1e-8):
+                    raise RuntimeError(
+                        f"Phenotype [{name or path}] has non-integer COV_RANK / P_EFF values."
+                    )
+                uniq = np.unique(rcr.astype(np.int64))
+                if uniq.size != 1:
+                    raise RuntimeError(
+                        f"Phenotype [{name or path}] has non-constant COV_RANK / P_EFF values."
+                    )
+                file_cov_rank = int(uniq[0])
+                if file_cov_rank < 0:
+                    raise RuntimeError(
+                        f"Phenotype [{name or path}] has negative COV_RANK / P_EFF={file_cov_rank}."
+                    )
+
+        if (cov_rank is not None) and (file_cov_rank is not None) and (int(cov_rank) != int(file_cov_rank)):
+            if log is not None:
+                log._log(
+                    f"[sumstats] [{name or path}] overriding file cov_rank={int(file_cov_rank)} "
+                    f"with explicit cov_rank={int(cov_rank)} "
+                    f"(source={cov_rank_source or 'explicit'})."
+                )
 
         n_arr = df["N"].to_numpy(dtype=np.float64, copy=False)
         beta_arr = df["BETA"].to_numpy(dtype=np.float64, copy=False)
         se_arr = df["SE"].to_numpy(dtype=np.float64, copy=False)
-        z_arr = df["Z"].to_numpy(dtype=np.float64, copy=False)
 
         bad = (
             (~np.isfinite(n_arr)) | (n_arr <= 0.0) |
             (~np.isfinite(beta_arr)) |
-            (~np.isfinite(se_arr)) | (se_arr <= 0.0) |
-            (~np.isfinite(z_arr))
+            (~np.isfinite(se_arr)) | (se_arr <= 0.0)
         )
 
         removed = []
@@ -322,21 +370,36 @@ class Sumstats:
             removed = df.loc[bad, "SNP"].dropna().astype(str).tolist()
             if log is not None:
                 log._log(
-                    f"Dropping {len(removed)} SNPs with NA/non-finite N/BETA/SE/Z values [{name or path}]."
+                    f"Dropping {len(removed)} SNPs with NA/non-finite N/BETA/SE values [{name or path}]."
                 )
             df = df.loc[~bad].copy()
         else:
             if log is not None:
-                log._log(f"Dropping 0 SNPs with NA/non-finite N/BETA/SE/Z values [{name or path}].")
+                log._log(f"Dropping 0 SNPs with NA/non-finite N/BETA/SE values [{name or path}].")
 
         if df.shape[0] == 0:
             raise RuntimeError(f"No valid SNPs remain after basic filtering for phenotype [{name or path}].")
 
         n_arr = df["N"].to_numpy(dtype=np.float64, copy=False)
-        z_arr = df["Z"].to_numpy(dtype=np.float64, copy=False)
-        nmax = float(np.max(n_arr))
-        z_scaled = z_arr * np.sqrt(n_arr / nmax)
+        beta_arr = df["BETA"].to_numpy(dtype=np.float64, copy=False)
+        se_arr = df["SE"].to_numpy(dtype=np.float64, copy=False)
 
+        nmax = float(np.max(n_arr))
+        resolved_cov_rank, resolved_source = resolve_cov_rank(
+            explicit=cov_rank,
+            explicit_source=cov_rank_source,
+            sumstats_value=file_cov_rank,
+            sumstats_source="file",
+        )
+        n_scale = float(effective_n_scale(nmax, resolved_cov_rank))
+
+        if log is not None:
+            log._log(
+                f"[sumstats] [{name or path}] using cov_rank={resolved_cov_rank} "
+                f"(source={resolved_source}), n_scale={n_scale:.6g}."
+            )
+
+        z_scaled = derived_wald_z(beta_arr, se_arr, n_arr, n_scale)
         badz = ~np.isfinite(z_scaled)
         if badz.any():
             removed2 = df.loc[badz, "SNP"].astype(str).tolist()
@@ -345,7 +408,7 @@ class Sumstats:
             z_scaled = z_scaled[~badz]
             if log is not None:
                 log._log(
-                    f"Dropping {len(removed2)} SNPs with non-finite scaled Z values [{name or path}]."
+                    f"Dropping {len(removed2)} SNPs with non-finite derived Z values [{name or path}]."
                 )
 
         df["Z"] = z_scaled
@@ -382,6 +445,9 @@ class Sumstats:
             se=df["SE"].to_numpy(dtype=np.float64, copy=False),
             n=df["N"].to_numpy(dtype=np.float64, copy=False),
             nsamp=nmax,
+            n_scale=n_scale,
+            cov_rank=resolved_cov_rank,
+            cov_rank_source=resolved_source,
             a1=df["A1"].astype(str).to_numpy(),
             a2=df["A2"].astype(str).to_numpy(),
             name=(name or path),
@@ -411,12 +477,10 @@ class Sumstats:
         def _should_expand(summ: dict) -> bool:
             if not summ or ("M_finite" not in summ):
                 return False
-            nmax = float(self.nsamp)
-            thr = max(80.0, 0.001 * nmax)
-            chisq = np.asarray([], dtype=np.float64)
+            nscale = float(self.n_scale)
+            thr = max(80.0, 0.001 * nscale)
             n_hi = int(summ.get("n_gt_suggested", 0)) if "n_gt_suggested" in summ else None
             if n_hi is None:
-                # approximate from summary only unavailable, so just use warn on max.
                 return float(summ.get("max", 0.0)) > thr
             frac = float(summ.get("frac_gt_suggested", 0.0))
             return (n_hi >= warn_min_count) or (frac >= warn_min_frac)
@@ -437,14 +501,22 @@ class Sumstats:
                 for i, (snp, aa1, aa2, chi2) in enumerate(top_rows[:topk], start=1):
                     self.log._log(f"[chisq] [{self.name}]  {i:2d}. {snp}\t{aa1}\t{aa2}\t{chi2:.3f}")
 
-        if verbose:
-            thr, mode = utils._resolve_chisq_threshold(self.nsamp, chisq_threshold)
-            if thr is None or not np.isfinite(float(thr)) or float(thr) <= 0.0:
-                self.log._log(f"[chisq] [{self.name}] no active chi^2 filter.")
-            else:
+        thr, mode = utils._resolve_chisq_threshold(self.n_scale, chisq_threshold)
+        filter_active = thr is not None and np.isfinite(float(thr)) and float(thr) > 0.0
+
+        if verbose or filter_active:
+            if filter_active:
                 tag = " (auto)" if mode == "auto" else ""
-                self.log._log(f"[chisq] [{self.name}] active chi^2 filter: threshold={float(thr):.3f}{tag}")
+                self.log._log(
+                    f"[chisq] [{self.name}] active chi^2 filter: threshold={float(thr):.3f}{tag}; "
+                    f"cov_rank={self.cov_rank} ({self.cov_rank_source}), n_scale={self.n_scale:.6g}"
+                )
             _log_stage("read", self.read_summary, self.read_top, expand=True)
 
         if matched is not None:
-            _log_stage("used", matched.used_summary, matched.used_top, expand=(verbose or _should_expand(matched.used_summary)))
+            _log_stage(
+                "used",
+                matched.used_summary,
+                matched.used_top,
+                expand=(verbose or _should_expand(matched.used_summary)),
+            )

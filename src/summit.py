@@ -91,6 +91,9 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
 
+    parser.add_argument("--cov-rank", default=None, type=str,
+                        help="Specify the rank of the covariate matrix (comma-separated). Must be a non-negative value. Default is 0.")
+
 
     # Additional input
     parser.add_argument("--annot", default=None, type=str,
@@ -122,7 +125,7 @@ def build_parser() -> argparse.ArgumentParser:
                         choices=["mean", "median", "full"],
                         help="Center used in jackknife SE calculation.")
     parser.add_argument("--rg-se-method", default="jackknife", type=str,
-                        choices=["jackknife", "delta"],
+                        choices=["jackknife", "delta", "robust", "kmoments"],
                         help="SE method for total rg.")
     parser.add_argument("--adjust-delta", action="store_true", default=False,
                         help="Apply delta-based deleted-source correction when Trace.delta is available.")
@@ -412,6 +415,7 @@ def _dispatch_rg(args, log):
         allow_neg_enr=args.allow_neg_enr,
         report_tau=True,
         adjust_delta=args.adjust_delta,
+        cov_rank=args.cov_rank,
     )
     rg._run()
     rg._logoff()

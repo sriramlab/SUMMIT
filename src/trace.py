@@ -20,6 +20,9 @@ class TraceView:
     ldscores: np.ndarray
     ldscores_reg: np.ndarray | None = None
     delta: np.ndarray | None = None
+    kmoments: dict | None = None
+    kmoments_path: str | None = None
+    kmoments_valid: bool = False
 
     @property
     def nsnps(self) -> int:
@@ -35,6 +38,7 @@ class TraceView:
             raise ValueError(
                 f"keep_mask must be length {self.nsnps}; got {keep_mask.shape}."
             )
+        full_keep = bool(np.all(keep_mask))
         return TraceView(
             snps=self.snps[keep_mask],
             chr=None if self.chr is None else self.chr[keep_mask],
@@ -44,6 +48,9 @@ class TraceView:
             ldscores=self.ldscores[keep_mask, :],
             ldscores_reg=None if self.ldscores_reg is None else self.ldscores_reg[keep_mask, :],
             delta=self.delta,
+            kmoments=self.kmoments,
+            kmoments_path=self.kmoments_path,
+            kmoments_valid=bool(self.kmoments is not None and self.kmoments_valid and full_keep),
         )
 
 
@@ -94,6 +101,22 @@ class Trace:
 
         self._ldscore_start_idx = int(main_start)
         self._ldscore_reg_start_idx = None if reg_start is None else int(reg_start)
+
+        main_df, main_L, main_start = self._read_ldscores_file(ldscores, which="main")
+        main_ld_nsnps_raw = int(main_df.shape[0])
+
+        self.kmoments = None
+        self.kmoments_path = None
+        km_path = self._infer_kmoments_path(ldscores)
+        if km_path is not None:
+            try:
+                self.kmoments = self._read_kmoments_file(km_path)
+                self.kmoments_path = km_path
+            except Exception as e:
+                if self.log is not None:
+                    self.log._log(f"[kmom] failed to read {km_path}: {e}; ignoring.")
+                self.kmoments = None
+                self.kmoments_path = None
 
         # Align optional regression LD to main SNP order first.
         if reg_df is not None:
@@ -148,6 +171,35 @@ class Trace:
         self.nbins = int(self.annot.shape[1])
         self.index = pd.Index(self.snps)
 
+        if self.kmoments is not None:
+            km_nsnps = int(round(float(self.kmoments.get("nsnps", np.nan))))
+
+            if km_nsnps != main_ld_nsnps_raw:
+                if self.log is not None:
+                    self.log._log(
+                        f"[kmom] ignoring {self.kmoments_path}: "
+                        f"kmoments nsnps={km_nsnps} but main LD-score file has {main_ld_nsnps_raw} SNPs."
+                    )
+                self.kmoments = None
+                self.kmoments_path = None
+
+            elif self.nsnps != main_ld_nsnps_raw:
+                if self.log is not None:
+                    self.log._log(
+                        f"[kmom] ignoring {self.kmoments_path}: "
+                        f"the final Trace SNP axis ({self.nsnps}) differs from the raw main LD-score axis "
+                        f"({main_ld_nsnps_raw}) after annotation / regression-LD alignment."
+                    )
+                self.kmoments = None
+                self.kmoments_path = None
+
+            elif self.log is not None:
+                alpha_probe = float(self.kmoments.get("alpha_probe", np.nan))
+                self.log._log(
+                    f"[kmom] loaded {self.kmoments_path} for {km_nsnps} SNPs "
+                    f"(alpha_probe={alpha_probe:.6g}); valid only when rg keeps the full Trace SNP axis."
+                )
+
         if self.log is not None:
             self.log._log(
                 f"Loaded Trace with {self.nsnps} SNPs, {self.nbins} annotation bins, "
@@ -162,6 +214,9 @@ class Trace:
             raise ValueError(
                 f"keep_mask must be length {self.nsnps}; got {keep_mask.shape}."
             )
+
+        full_keep = bool(np.all(keep_mask))
+
         return TraceView(
             snps=self.snps[keep_mask],
             chr=self.chr[keep_mask],
@@ -171,6 +226,9 @@ class Trace:
             ldscores=self.ldscores[keep_mask, :],
             ldscores_reg=None if self.ldscores_reg is None else self.ldscores_reg[keep_mask, :],
             delta=self.delta,
+            kmoments=self.kmoments,
+            kmoments_path=self.kmoments_path,
+            kmoments_valid=bool(self.kmoments is not None and full_keep),
         )
 
     def _read_ldscores_file(self, path, *, which: str):
@@ -340,3 +398,51 @@ class Trace:
             if body.ndim == 1:
                 body = body.reshape(-1, 1)
             return None, body
+
+    @staticmethod
+    def _infer_kmoments_path(ldscores_path):
+        if ldscores_path is None:
+            return None
+
+        s = str(ldscores_path)
+        candidates = []
+
+        if s.endswith(".gw.ldscore.gz"):
+            candidates.append(s[: -len(".gw.ldscore.gz")] + ".gw.kmoments")
+        if s.endswith(".ldscore.gz"):
+            candidates.append(s[: -len(".ldscore.gz")] + ".kmoments")
+
+        seen = set()
+        for c in candidates:
+            if c in seen:
+                continue
+            seen.add(c)
+            if Path(c).exists():
+                return c
+        return None
+
+    @staticmethod
+    def _read_kmoments_file(path):
+        df = pd.read_csv(path, sep=r"\s+", compression="infer")
+        if df.shape[0] != 1:
+            raise ValueError(f"Expected exactly one row in kmoments file '{path}', got {df.shape[0]}.")
+
+        row = df.iloc[0].to_dict()
+        out = {}
+        for k, v in row.items():
+            try:
+                out[k] = float(v)
+            except Exception:
+                out[k] = v
+
+        required = {"nsnps", "proj_rank", "t0_rank", "t1_rank", "t2_rank"}
+        missing = [k for k in required if k not in out]
+        if missing:
+            raise ValueError(f"kmoments file '{path}' is missing required columns: {missing}")
+
+        for k in required:
+            val = float(out[k])
+            if not np.isfinite(val):
+                raise ValueError(f"kmoments file '{path}' has non-finite value for '{k}': {val}")
+
+        return out

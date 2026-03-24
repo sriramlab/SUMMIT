@@ -6,6 +6,7 @@ import numpy as np
 
 import utils
 import json
+from moments import build_rg_summary_moment
 
 @dataclass(frozen=True)
 class RGPrepared:
@@ -16,6 +17,9 @@ class RGPrepared:
     active_mask: np.ndarray
     unit_sizes: np.ndarray
     y: np.ndarray                  # (M,)
+    n1_scale: float
+    n2_scale: float
+    summary_y_info: dict | None
     Ak_unit: np.ndarray            # (U,K)
     Ay_unit: np.ndarray            # (U,K)
     AL_unit: np.ndarray            # (U,K,K)
@@ -53,6 +57,7 @@ class RGFit:
     gamma_total: np.ndarray        # (2,)
     rg_total: np.ndarray           # (2,)
     rg_se_method: str
+    kmoment_info: dict | None = None
 
 
 class RGResultWriter:
@@ -93,22 +98,8 @@ class RGResultWriter:
 
     @staticmethod
     def save_score_normal_equations_json(fit: RGFit, path: str):
-        """
-        Dump the explicit full SCORE normal equations implied by the current
-        reduced rg solve.
+        from h2core import H2ResultWriter
 
-        Requires known overlap N, which is available when rg was run with
-        --pheno-rg (and optionally --pheno-rg-cov).
-
-        For K annotation components, this restores the (K+1)x(K+1) full system:
-            [ T_red + N_overlap * 11^T    N_overlap * 1 ]
-            [ N_overlap * 1^T             N_overlap     ]
-        with RHS
-            [ sqrt(N1*N2) * Ay/Ak ]
-            [ c * sqrt(N1*N2)    ]
-        and solves for
-            sigma = [gamma_g_0, ..., gamma_g_{K-1}, gamma_e].
-        """
         info = fit.intercept.info if isinstance(fit.intercept.info, dict) else {}
         n_overlap = info.get("n_overlap", None)
         if n_overlap is None:
@@ -139,18 +130,18 @@ class RGResultWriter:
         if c_reps.shape != (R + 1,):
             raise ValueError(f"Unexpected c_reps shape: {c_reps.shape}, expected {(R + 1,)}")
 
-        n1 = float(p.matched1.nsamp)
-        n2 = float(p.matched2.nsamp)
-        sqrt_n1n2 = float(np.sqrt(n1 * n2))
+        n1_raw = float(p.matched1.nsamp)
+        n2_raw = float(p.matched2.nsamp)
+        n1_scale = float(p.n1_scale)
+        n2_scale = float(p.n2_scale)
+        sqrt_n1n2 = float(np.sqrt(n1_scale * n2_scale))
 
-        # Restore the full SCORE matrix from the reduced system used in fit_rg.
         T = np.full((R + 1, K + 1, K + 1), np.nan, dtype=np.float64)
         T[:, :K, :K] = lhs_red + n_overlap
         T[:, :K, K] = n_overlap
         T[:, K, :K] = n_overlap
         T[:, K, K] = n_overlap
 
-        # Restore the full RHS.
         q = np.full((R + 1, K + 1), np.nan, dtype=np.float64)
         with np.errstate(divide="ignore", invalid="ignore"):
             q[:, :K] = (Ay * sqrt_n1n2) / Ak
@@ -160,7 +151,6 @@ class RGResultWriter:
         q[:, K] = c_reps * sqrt_n1n2
         q[:, K] = np.where(np.isfinite(q[:, K]), q[:, K], np.nan)
 
-        # Solve the explicit full system.
         sigma = _solve_linear_batch(T, q)
 
         headers = getattr(p.trace_view, "annot_header", None)
@@ -169,20 +159,34 @@ class RGResultWriter:
         else:
             headers = [str(h) for h in headers]
 
+        trait1_name = getattr(p.matched1, "name", None)
+        if trait1_name is None or str(trait1_name).strip() == "":
+            trait1_name = "trait1"
+        trait1_name = str(trait1_name)
+
+        trait2_name = getattr(p.matched2, "name", None)
+        if trait2_name is None or str(trait2_name).strip() == "":
+            trait2_name = "trait2"
+        trait2_name = str(trait2_name)
+
         payload = {
             "system": "cross",
             "meta": {
                 "equation_type": "score_full",
                 "kernel_name": "score",
                 "multi_component": bool(K > 1),
-                "partial_overlap": bool(n_overlap < (min(n1, n2) - 0.5)),
+                "partial_overlap": bool(n_overlap < (min(n1_raw, n2_raw) - 0.5)),
                 "n_overlap": n_overlap,
-                "n1_summary": n1,
-                "n2_summary": n2,
+                "n1_summary_raw": n1_raw,
+                "n2_summary_raw": n2_raw,
+                "n1_scale": n1_scale,
+                "n2_scale": n2_scale,
                 "nrep": R,
                 "fixed_intercept_source": str(info.get("source", "")),
                 "cov_adjusted": bool(info.get("cov_adjusted", False)),
                 "annot_headers": headers,
+                "trait1_system": trait1_name,
+                "trait2_system": trait2_name,
             },
             "sigma_names": [f"gamma_g_{k}" for k in range(K)] + ["gamma_e"],
             "moment_names": [f"score_row_{k}" for k in range(K)] + ["overlap_row"],
@@ -201,6 +205,14 @@ class RGResultWriter:
                 }
                 for r in range(R)
             ],
+            "trait1_h2": H2ResultWriter.build_score_normal_equations_payload(
+                fit.h2_fit1,
+                system=trait1_name,
+            ),
+            "trait2_h2": H2ResultWriter.build_score_normal_equations_payload(
+                fit.h2_fit2,
+                system=trait2_name,
+            ),
         }
 
         with open(path, "w") as fd:
@@ -328,98 +340,6 @@ def _validate_common_axis(trace_view, matched1, matched2, jackknife):
 # main rg preparation / fit
 # -----------------------------------------------------------------------------
 
-def _trait_cov_rank_from_info(intercept_info, trait_idx: int) -> int:
-    """
-    Return rank(C_a), including the intercept column.
-
-    We reuse the existing info key name 'rhs_trait{idx}_p_design', but it must now
-    store the ACTUAL rank, not merely the column count.
-    """
-    info = {} if intercept_info is None else dict(intercept_info)
-    key = f"rhs_trait{trait_idx}_p_design"
-
-    if key not in info:
-        # Exact only for no-extra-covariate GWAS.
-        # In your current workflow this key should be present via --pheno-rg-cov.
-        return 1
-
-    q = int(info[key])
-    if q < 1:
-        raise ValueError(f"{key} must be >= 1; got {q}")
-    return q
-
-
-def _trait_exact_z_equiv(matched, q_design: int) -> np.ndarray:
-    """
-    Exact covariate-adjusted z-equivalent on the SAME scale as the old z_j.
-
-    Formula:
-        z*_j = sqrt(N_scale) * beta_j / sqrt(beta_j^2 + nu_j * se_j^2)
-        nu_j = n_obs_j - rank(C) - 1
-
-    Notes:
-      - N_scale is the study-level normalization used by the LHS / intercept scale,
-        i.e. matched.nsamp.
-      - n_obs_j is the per-SNP regression sample count (PLINK OBS_CT or its copy).
-      - rank(C) includes the intercept.
-    """
-    beta = np.asarray(matched.beta, dtype=np.float64)
-    se = np.asarray(matched.se, dtype=np.float64)
-    n_obs = np.asarray(matched.n, dtype=np.float64)
-    N_scale = float(matched.nsamp)
-
-    out = np.full(beta.shape, np.nan, dtype=np.float64)
-    if not (np.isfinite(N_scale) and N_scale > 0.0):
-        return out
-
-    nu = n_obs - float(q_design) - 1.0
-    den = beta * beta + nu * se * se
-
-    good = (
-        np.isfinite(beta) &
-        np.isfinite(se) & (se > 0.0) &
-        np.isfinite(n_obs) & (n_obs > 0.0) &
-        np.isfinite(nu) & (nu > 0.0) &
-        np.isfinite(den) & (den > 0.0)
-    )
-    out[good] = np.sqrt(N_scale) * beta[good] / np.sqrt(den[good])
-    return out
-
-
-def build_rg_summary_moment(matched1, matched2, *, intercept_info=None):
-    """
-    Exact SNP-wise replacement for z1 * z2 in the covariate-adjusted rg RHS.
-
-    Returns
-    -------
-    y : (M,) array
-        y_j = z1*_j * z2*_j
-    info : dict
-    """
-    if not (
-        hasattr(matched1, "beta") and hasattr(matched1, "se") and hasattr(matched1, "n") and
-        hasattr(matched2, "beta") and hasattr(matched2, "se") and hasattr(matched2, "n")
-    ):
-        raise RuntimeError("SUMCORE rg RHS requires per-SNP beta, se, and n/OBS_CT.")
-
-    q1 = _trait_cov_rank_from_info(intercept_info, 1)
-    q2 = _trait_cov_rank_from_info(intercept_info, 2)
-
-    z1_star = _trait_exact_z_equiv(matched1, q1)
-    z2_star = _trait_exact_z_equiv(matched2, q2)
-
-    y = z1_star * z2_star
-    y[~np.isfinite(y)] = np.nan
-
-    return y, {
-        "mode": "beta_se_exact",
-        "trait1_q_design": int(q1),
-        "trait2_q_design": int(q2),
-        "n_nonfinite": int(np.sum(~np.isfinite(y))),
-    }
-
-
-
 def prepare_rg(
     trace_view,
     matched1,
@@ -445,14 +365,22 @@ def prepare_rg(
     if y.ndim != 1 or y.size != M:
         raise ValueError(f"summary_y must have shape ({M},), got {y.shape}")
 
-    good_y = np.isfinite(y)
-    if active_mask is None:
-        active_mask = good_y.copy()
+    if summary_y_info is not None:
+        n1_scale = float(summary_y_info.get("trait1_n_scale", getattr(matched1, "n_scale", matched1.nsamp)))
+        n2_scale = float(summary_y_info.get("trait2_n_scale", getattr(matched2, "n_scale", matched2.nsamp)))
     else:
-        active_mask = np.asarray(active_mask, dtype=bool)
-        if active_mask.ndim != 1 or active_mask.size != M:
-            raise ValueError(f"active_mask must be length {M}; got {active_mask.shape}")
-        active_mask = active_mask & good_y
+        n1_scale = float(getattr(matched1, "n_scale", matched1.nsamp))
+        n2_scale = float(getattr(matched2, "n_scale", matched2.nsamp))
+
+    if not (np.isfinite(n1_scale) and n1_scale > 0.0 and np.isfinite(n2_scale) and n2_scale > 0.0):
+        raise RuntimeError(f"Invalid rg n_scale pair: n1_scale={n1_scale}, n2_scale={n2_scale}")
+
+    if active_mask is None:
+        active_mask = np.isfinite(y)
+    active_mask = np.asarray(active_mask, dtype=bool)
+    if active_mask.ndim != 1 or active_mask.size != M:
+        raise ValueError(f"active_mask must be length {M}; got {active_mask.shape}")
+    active_mask = active_mask & np.isfinite(y)
 
     if not np.any(active_mask):
         raise ValueError("No SNPs remain after filtering non-finite rg summary moments.")
@@ -494,13 +422,11 @@ def prepare_rg(
     Ak_full = np.asarray(Ak_rep[-1], dtype=np.float64)
     src_mass = np.broadcast_to(Ak_full[None, :], Ak_rep.shape).copy()
     if jackknife.mode == "chr" and adjust_delta and getattr(trace_view, "delta", None) is not None:
-        # After explicit deleted-source correction, replicate numerators approximate
-        # A_keep^T L_keep, so the source-side normalizer should also be the kept mass.
         src_mass[:R] = Ak_rep[:R]
 
     M_k = Ak_rep[:, :, None]
     M_l = src_mass[:, None, :]
-    lhs = utils._calc_rg_trace_from_ld_batch(AL_rep, matched1.nsamp, matched2.nsamp, M_k, M_l)
+    lhs = utils._calc_rg_trace_from_ld_batch(AL_rep, n1_scale, n2_scale, M_k, M_l)
 
     lhs = _symmetrize_with_design(lhs, jackknife, unit_sizes)
 
@@ -512,6 +438,9 @@ def prepare_rg(
         active_mask=active_mask,
         unit_sizes=unit_sizes,
         y=y,
+        n1_scale=n1_scale,
+        n2_scale=n2_scale,
+        summary_y_info=summary_y_info,
         Ak_unit=Ak_unit,
         Ay_unit=Ay_unit,
         AL_unit=AL_unit,
@@ -567,67 +496,548 @@ def _combine_se_rss(a, b):
     return out
 
 
-def _external_c_sensitivity_se(prepared: RGPrepared, h2_fit1, h2_fit2, intercept_fit: InterceptFit):
+def _estimate_fixedc_cluster_robust_se_single_component(
+    prepared: RGPrepared,
+    intercept_fit: InterceptFit,
+    h2_fit1,
+    h2_fit2,
+    *,
+    gamma_full: float,
+    rg_full_bin: float,
+    rg_full_total: float,
+    robust_kind: str = "cr2",   # one of {'cr0','cr1','cr2'}
+    add_external_c_se: bool = False,
+    jack_mode: str = "mean",
+    nan_policy: str = "omit",
+):
     """
-    Propagate an externally estimated c-SE into gamma/rg CONDITIONAL on the summary data.
+    Robust SE for the SINGLE-COMPONENT constrained rg estimator with FIXED external intercept.
 
-    This is exact conditional on the fixed summary-data sufficient statistics because, for
-    the reconstructed SCORE system on the full SNP axis,
+    This is the correct sandwich target for the estimator actually reported by
+    the constrained pipeline:
+        gamma_hat(c0 fixed) solves sum_u m_u(gamma; c0) = 0
 
-        rhs(c) = rhs(c_hat) - (c - c_hat) * sqrt(N1*N2) * 1_K,
+    It does NOT profile a free nuisance regression. That earlier approach targets
+    a different estimator and tends to reproduce summary-only SEs.
 
-    so gamma(c) is affine in c:
-        gamma(c) = gamma(c_hat) - (c - c_hat) * A^{-1}[sqrt(N1*N2) * 1_K].
-
-    We then combine this extra c-driven SE in quadrature with the SNP-side jackknife SE.
-    The omitted term is the cross-covariance between c-hat and the GWAS summary statistics;
-    that would require sample-deleted recomputation of the GWAS z-scores.
+    Parameters
+    ----------
+    prepared
+        RGPrepared from prepare_rg(...), must have K == 1.
+    intercept_fit
+        InterceptFit. Must correspond to a FIXED external intercept (info['fixed']=True).
+    h2_fit1, h2_fit2
+        H2 fits, used only to convert robust gamma SE into rg SE via a delta correction
+        for denominator uncertainty.
+    gamma_full
+        Full-sample gamma estimate, i.e. gamma_reps[-1, 0].
+    rg_full_bin
+        Full-sample per-bin rg estimate, i.e. rg_reps[-1, 0].
+    rg_full_total
+        Full-sample total rg estimate from gamma_tot_reps[-1] / sqrt(h2_tot1[-1] * h2_tot2[-1]).
+    robust_kind
+        'cr0' = plain sandwich,
+        'cr1' = sandwich * U/(U-1),
+        'cr2' = leverage-corrected sandwich with CR1 prefactor.
+    add_external_c_se
+        If True, and intercept_fit.c[1] > 0, add an independent delta-method variance
+        contribution from the external intercept:
+            Var_gamma += (d gamma / d c)^2 Var(c)
+        This is OFF by default because independence is often not justified.
     """
-    info = intercept_fit.info if isinstance(intercept_fit.info, dict) else {}
-    if str(info.get("source", "")).lower() != "pheno":
-        return None
-
-    c_se = info.get("external_c_se", None)
-    try:
-        c_se = float(c_se)
-    except Exception:
-        return None
-
-    if not (np.isfinite(c_se) and c_se > 0.0):
-        return None
-
     p = prepared
-    K = p.trace_view.nbins
-    sqrt_n1n2 = float(np.sqrt(float(p.matched1.nsamp) * float(p.matched2.nsamp)))
+    if int(p.trace_view.nbins) != 1:
+        raise ValueError("Fixed-c robust SE is implemented only for K == 1.")
 
-    lhs_full = np.asarray(p.lhs[-1], dtype=np.float64)
-    rhs_sens = np.full((1, K), sqrt_n1n2, dtype=np.float64)
-    sens = _solve_linear_batch(lhs_full[None, :, :], rhs_sens)[0]
-    if sens.shape != (K,) or not np.isfinite(sens).all():
-        return None
-
-    # gamma(c) = gamma(c_hat) - (c - c_hat) * sens
-    dc_gamma = -sens
-    gamma_se_ext = np.abs(dc_gamma) * c_se
-    gamma_total_se_ext = float(np.abs(np.sum(dc_gamma)) * c_se)
-
-    v1_full = np.asarray(h2_fit1.sigma_reps[-1, :K], dtype=np.float64)
-    v2_full = np.asarray(h2_fit2.sigma_reps[-1, :K], dtype=np.float64)
-    rg_se_ext = np.full(K, np.nan, dtype=np.float64)
-    valid_bin = np.isfinite(v1_full) & np.isfinite(v2_full) & (v1_full > 0.0) & (v2_full > 0.0)
-    with np.errstate(divide="ignore", invalid="ignore"):
-        rg_se_ext[valid_bin] = (
-            np.abs(dc_gamma[valid_bin]) * c_se / np.sqrt(v1_full[valid_bin] * v2_full[valid_bin])
+    info = intercept_fit.info if isinstance(intercept_fit.info, dict) else {}
+    if not bool(info.get("fixed", False)):
+        raise ValueError(
+            "rg_se_method='robust' currently requires a FIXED external intercept "
+            "(intercept_fit.info['fixed'] == True)."
         )
 
-    h1_tot = float(h2_fit1.h2_reps[-1, -1])
-    h2_tot = float(h2_fit2.h2_reps[-1, -1])
-    if np.isfinite(h1_tot) and np.isfinite(h2_tot) and h1_tot > 0.0 and h2_tot > 0.0:
-        rg_total_se_ext = float(np.abs(np.sum(dc_gamma)) * c_se / np.sqrt(h1_tot * h2_tot))
-    else:
-        rg_total_se_ext = np.nan
+    robust_kind = str(robust_kind).strip().lower()
+    if robust_kind not in {"cr0", "cr1", "cr2"}:
+        raise ValueError("robust_kind must be one of {'cr0','cr1','cr2'}")
 
-    return gamma_se_ext, rg_se_ext, gamma_total_se_ext, rg_total_se_ext
+    c0 = float(np.asarray(intercept_fit.c_reps[-1], dtype=np.float64))
+    if not np.isfinite(c0):
+        raise RuntimeError(f"Non-finite fixed intercept c0={c0}")
+
+    # Block-level quantities from RGPrepared
+    a_u = np.asarray(p.Ak_unit[:, 0], dtype=np.float64)       # (U,)
+    s_u = np.asarray(p.Ay_unit[:, 0], dtype=np.float64)       # (U,)
+    l_u = np.asarray(p.AL_unit[:, 0, 0], dtype=np.float64)    # (U,)
+
+    U_all = int(a_u.size)
+    if s_u.size != U_all or l_u.size != U_all:
+        raise RuntimeError("Unit-level rg arrays have inconsistent lengths.")
+
+    A_full = float(np.sum(a_u))
+    L_full = float(np.sum(l_u))
+    T_full = float(np.asarray(p.lhs[-1, 0, 0], dtype=np.float64))
+    sqrt_n1n2 = float(np.sqrt(float(p.n1_scale) * float(p.n2_scale)))
+
+    if not (np.isfinite(A_full) and A_full > 0.0):
+        raise RuntimeError(f"Invalid full annotation mass A_full={A_full}")
+    if not (np.isfinite(L_full) and L_full > 0.0):
+        raise RuntimeError(f"Invalid full AL mass L_full={L_full}")
+    if not (np.isfinite(T_full) and T_full > 0.0):
+        raise RuntimeError(f"Invalid full reduced trace T_full={T_full}")
+    if not np.isfinite(gamma_full):
+        raise RuntimeError(f"Invalid gamma_full={gamma_full}")
+
+    # Exact blockwise trace contributions for K=1 up to the full-sample scaling.
+    # Since T_full is linear in the full AL sum for K=1, apportion by l_u / L_full.
+    t_u = T_full * (l_u / L_full)
+
+    # Block score evaluated at the FULL-SAMPLE constrained estimator:
+    #   m_u = r_u - t_u * gamma_hat
+    # with
+    #   r_u = sqrt(n1*n2)/A * (s_u - c0 * a_u)
+    r_u = (sqrt_n1n2 / A_full) * (s_u - c0 * a_u)
+    psi_u = r_u - t_u * float(gamma_full)
+
+    valid = (
+        np.isfinite(a_u) & np.isfinite(s_u) & np.isfinite(l_u) &
+        np.isfinite(t_u) & np.isfinite(r_u) & np.isfinite(psi_u) &
+        np.isfinite(T_full) & (T_full > 0.0)
+    )
+    if not np.any(valid):
+        raise RuntimeError("No valid jackknife units for fixed-c robust gamma SE.")
+
+    psi_v = psi_u[valid].astype(np.float64, copy=False)
+    t_v = t_u[valid].astype(np.float64, copy=False)
+    U_eff = int(psi_v.size)
+    if U_eff <= 1:
+        raise RuntimeError(f"Need at least 2 valid units for robust SE; got U_eff={U_eff}")
+
+    # Optional leverage correction
+    if robust_kind == "cr2":
+        h_v = np.clip(t_v / T_full, 0.0, 1.0 - 1e-12)
+        psi_adj = psi_v / np.sqrt(1.0 - h_v)
+        small_sample_factor = float(U_eff) / float(U_eff - 1) if U_eff > 1 else np.nan
+    elif robust_kind == "cr1":
+        psi_adj = psi_v
+        small_sample_factor = float(U_eff) / float(U_eff - 1) if U_eff > 1 else np.nan
+    else:  # cr0
+        psi_adj = psi_v
+        small_sample_factor = 1.0
+
+    meat = float(np.sum(psi_adj * psi_adj))
+    var_gamma = small_sample_factor * meat / float(T_full * T_full)
+
+    if add_external_c_se:
+        c_se = float(np.asarray(intercept_fit.c[1], dtype=np.float64))
+        if np.isfinite(c_se) and c_se > 0.0:
+            # d gamma / d c = -sqrt(n1*n2) / T
+            var_gamma += (sqrt_n1n2 / T_full) ** 2 * (c_se ** 2)
+
+    if not (np.isfinite(var_gamma) and var_gamma >= 0.0):
+        raise RuntimeError(f"Invalid robust gamma variance: {var_gamma}")
+
+    se_gamma = float(np.sqrt(var_gamma))
+
+    # --- Convert robust gamma SE into rg SE ---
+    # We keep denominator uncertainty from the existing h2 jackknife path
+    # and combine it with the robust numerator SE via delta + RSS.
+    # This is most appropriate in the null / near-null regime, which is your use case.
+
+    def _delta_rg_se_from_h2_only(rg_full, v1_full, v2_full, v1_reps, v2_reps):
+        rg_full = float(rg_full)
+        v1_full = float(v1_full)
+        v2_full = float(v2_full)
+        v1_reps = np.asarray(v1_reps, dtype=np.float64)
+        v2_reps = np.asarray(v2_reps, dtype=np.float64)
+
+        if not (np.isfinite(rg_full) and np.isfinite(v1_full) and np.isfinite(v2_full) and v1_full > 0.0 and v2_full > 0.0):
+            return np.nan
+
+        d_v1 = -0.5 * rg_full / v1_full
+        d_v2 = -0.5 * rg_full / v2_full
+        lin_rg = (rg_full + d_v1 * (v1_reps - v1_full) + d_v2 * (v2_reps - v2_full)).astype(np.float64, copy=False)
+        lin_rg[-1] = rg_full
+
+        _, se_den = p.jackknife.summarize(
+            lin_rg,
+            unit_sizes=p.unit_sizes,
+            axis=0,
+            center=jack_mode,
+            nan_policy=nan_policy,
+        )
+        return float(se_den)
+
+    # Per-bin rg (K=1)
+    v1_bin_full = float(np.asarray(h2_fit1.sigma_reps[-1, 0], dtype=np.float64))
+    v2_bin_full = float(np.asarray(h2_fit2.sigma_reps[-1, 0], dtype=np.float64))
+    d_gamma_bin = np.nan
+    if np.isfinite(v1_bin_full) and v1_bin_full > 0.0 and np.isfinite(v2_bin_full) and v2_bin_full > 0.0:
+        d_gamma_bin = 1.0 / np.sqrt(v1_bin_full * v2_bin_full)
+    se_den_bin = _delta_rg_se_from_h2_only(
+        rg_full=float(rg_full_bin),
+        v1_full=v1_bin_full,
+        v2_full=v2_bin_full,
+        v1_reps=np.asarray(h2_fit1.sigma_reps[:, 0], dtype=np.float64),
+        v2_reps=np.asarray(h2_fit2.sigma_reps[:, 0], dtype=np.float64),
+    )
+    if np.isfinite(d_gamma_bin) and np.isfinite(se_den_bin):
+        se_rg_bin = float(np.sqrt((d_gamma_bin * se_gamma) ** 2 + se_den_bin ** 2))
+    else:
+        se_rg_bin = np.nan
+
+    # Total rg
+    v1_tot_full = float(np.asarray(h2_fit1.h2_reps[-1, -1], dtype=np.float64))
+    v2_tot_full = float(np.asarray(h2_fit2.h2_reps[-1, -1], dtype=np.float64))
+    d_gamma_tot = np.nan
+    if np.isfinite(v1_tot_full) and v1_tot_full > 0.0 and np.isfinite(v2_tot_full) and v2_tot_full > 0.0:
+        d_gamma_tot = 1.0 / np.sqrt(v1_tot_full * v2_tot_full)
+    se_den_tot = _delta_rg_se_from_h2_only(
+        rg_full=float(rg_full_total),
+        v1_full=v1_tot_full,
+        v2_full=v2_tot_full,
+        v1_reps=np.asarray(h2_fit1.h2_reps[:, -1], dtype=np.float64),
+        v2_reps=np.asarray(h2_fit2.h2_reps[:, -1], dtype=np.float64),
+    )
+    if np.isfinite(d_gamma_tot) and np.isfinite(se_den_tot):
+        se_rg_total = float(np.sqrt((d_gamma_tot * se_gamma) ** 2 + se_den_tot ** 2))
+    else:
+        se_rg_total = np.nan
+
+    return {
+        "se_gamma": se_gamma,
+        "se_rg_bin": se_rg_bin,
+        "se_rg_total": se_rg_total,
+        "U_eff": int(U_eff),
+        "T_full": float(T_full),
+        "A_full": float(A_full),
+        "L_full": float(L_full),
+        "fixed_c": float(c0),
+        "robust_kind": robust_kind,
+        "small_sample_factor": float(small_sample_factor),
+        "max_leverage": float(np.max(np.clip(t_v / T_full, 0.0, 1.0))) if U_eff > 0 else np.nan,
+        "score_mean_abs": float(np.mean(np.abs(psi_v))) if U_eff > 0 else np.nan,
+    }
+
+
+def _estimate_kmoment_model_se_single_component(
+    prepared: RGPrepared,
+    intercept_fit: InterceptFit,
+    h2_fit1,
+    h2_fit2,
+    *,
+    gamma_full: float,
+    alpha_tol: float = 5e-3,
+    drop_tol: float = 0.01,
+    sample_warn_tol: float = 0.01,
+    sample_hard_tol: float = 0.02,
+    jack_mode: str = "mean",
+    nan_policy: str = "omit",
+):
+    """
+    Model-based SE for the SINGLE-COMPONENT constrained rg estimator using
+    precomputed K-moments.
+
+    Exact target:
+      - K == 1
+      - fixed external intercept
+      - common projected sample space
+
+    Practical relaxed mode:
+      - allows small projected-scale mismatch across traits / overlap
+      - reuses full-panel moments when SNP loss is small
+    """
+    p = prepared
+    if int(p.trace_view.nbins) != 1:
+        raise ValueError("rg_se_method='moments' is implemented only for the single-component case (K == 1).")
+
+    info = intercept_fit.info if isinstance(intercept_fit.info, dict) else {}
+    if not bool(info.get("fixed", False)):
+        raise ValueError(
+            "rg_se_method='moments' currently requires a FIXED external intercept "
+            "(--pheno-rg/--pheno-rg-cov or --intercept-rg)."
+        )
+
+    tv = p.trace_view
+    km = getattr(tv, "kmoments", None)
+    if km is None:
+        raise ValueError(
+            "rg_se_method='moments' requested, but no .gw.kmoments file was found "
+            "next to the main LD-score file."
+        )
+
+    def _kget(name, default=np.nan):
+        try:
+            return float(km.get(name, default))
+        except Exception:
+            return float(default)
+
+    def _rel_gap(a, b):
+        a = float(a)
+        b = float(b)
+        if not (np.isfinite(a) and np.isfinite(b) and a > 0.0 and b > 0.0):
+            return np.nan
+        return abs(a - b) / max(np.sqrt(a * b), 1.0)
+
+    # ------------------------------------------------------------------
+    # 1) Reuse of full-panel moments after SNP filtering: allow only when
+    #    the dropped SNP fraction is a small perturbation of the full panel.
+    # ------------------------------------------------------------------
+    M_full = int(round(_kget("nsnps")))
+    if M_full <= 0:
+        raise ValueError("kmoments file is missing a valid full-panel SNP count.")
+
+    keep_frac_view = float(tv.nsnps) / float(M_full)
+    keep_frac_active = (
+        float(np.mean(np.asarray(p.active_mask, dtype=np.float64)))
+        if getattr(p, "active_mask", None) is not None and p.active_mask.size
+        else 0.0
+    )
+    keep_frac_total = keep_frac_view * keep_frac_active
+    drop_frac_total = 1.0 - keep_frac_total
+
+    if not (drop_frac_total <= float(drop_tol)):
+        raise ValueError(
+            "rg_se_method='moments' can only reuse full-panel kmoments when SNP loss is small. "
+            f"full_panel_M={M_full}, trace_view_M={tv.nsnps}, active_keep={keep_frac_active:.6f}, "
+            f"total_drop={drop_frac_total:.3%} > tol={float(drop_tol):.3%}."
+        )
+
+    approximate_moments = bool(drop_frac_total > 0.0)
+
+    # ------------------------------------------------------------------
+    # 2) Check whether the projected sample spaces are close enough that
+    #    the common-space derivation is a small-perturbation approximation.
+    # ------------------------------------------------------------------
+    syi = p.summary_y_info if isinstance(p.summary_y_info, dict) else {}
+
+    # Same covariate rank is still the safest regime. If ranks differ, the
+    # projected spaces are genuinely different, not just slightly different.
+    cr1 = syi.get("trait1_cov_rank", None)
+    cr2 = syi.get("trait2_cov_rank", None)
+    if cr1 is not None and cr2 is not None and int(cr1) != int(cr2):
+        raise ValueError(
+            "rg_se_method='moments' currently requires the same covariate rank for both traits "
+            f"(got trait1_cov_rank={cr1}, trait2_cov_rank={cr2})."
+        )
+
+    r1 = float(p.n1_scale)
+    r2 = float(p.n2_scale)
+    if not (np.isfinite(r1) and np.isfinite(r2) and r1 > 0.0 and r2 > 0.0):
+        raise ValueError(
+            f"Invalid projected sample scales for rg_se_method='moments': n1_scale={r1}, n2_scale={r2}."
+        )
+
+    scale_rel_gap = _rel_gap(r1, r2)
+
+    # Infer the effective overlap scale on the SAME convention as n_scale,
+    # without hard-coding whether n_scale = n-q or n-q-1.
+    # We do this by estimating the raw->scale offset from the matched sumstats.
+    n1_raw = float(getattr(p.matched1, "nsamp", np.nan))
+    n2_raw = float(getattr(p.matched2, "nsamp", np.nan))
+    n_overlap = info.get("n_overlap", None)
+
+    overlap_check = "unverified"
+    overlap_scale = np.nan
+    overlap_rel_gap = np.nan
+
+    if np.isfinite(n1_raw) and np.isfinite(n2_raw):
+        off1 = n1_raw - r1
+        off2 = n2_raw - r2
+        off_bar = 0.5 * (off1 + off2)
+
+        if n_overlap is not None:
+            n_overlap = float(n_overlap)
+            if np.isfinite(n_overlap) and n_overlap > 0.0:
+                overlap_scale = n_overlap - off_bar
+                if np.isfinite(overlap_scale) and overlap_scale > 0.0:
+                    overlap_rel_gap = max(_rel_gap(overlap_scale, r1), _rel_gap(overlap_scale, r2))
+                    overlap_check = "effective_overlap_from_raw_n"
+                else:
+                    overlap_check = "invalid_effective_overlap"
+            else:
+                overlap_check = "invalid_raw_overlap"
+        else:
+            overlap_check = "missing_overlap"
+    else:
+        overlap_check = "missing_raw_nsamp"
+
+    sample_rel_gap = scale_rel_gap
+    if np.isfinite(overlap_rel_gap):
+        sample_rel_gap = max(sample_rel_gap, overlap_rel_gap)
+
+    if not np.isfinite(sample_rel_gap):
+        raise ValueError(
+            "Could not construct a valid projected-sample mismatch diagnostic for rg_se_method='moments'."
+        )
+
+    if sample_rel_gap > float(sample_hard_tol):
+        raise ValueError(
+            "rg_se_method='moments' requires near-complete agreement of the projected sample scales. "
+            f"scale_rel_gap={scale_rel_gap:.3%}, overlap_rel_gap={overlap_rel_gap:.3%}, "
+            f"max_gap={sample_rel_gap:.3%} > hard_tol={float(sample_hard_tol):.3%}."
+        )
+
+    approximate_sample_match = bool(sample_rel_gap > 0.0)
+    sample_warning = bool(sample_rel_gap > float(sample_warn_tol))
+
+    # ------------------------------------------------------------------
+    # 3) Fixed intercept and plug-in point estimates
+    # ------------------------------------------------------------------
+    c0 = float(np.asarray(intercept_fit.c_reps[-1], dtype=np.float64))
+    gamma_full = float(gamma_full)
+
+    if not np.isfinite(c0):
+        raise RuntimeError(f"Non-finite fixed intercept in rg_se_method='moments': c={c0}")
+    if not np.isfinite(gamma_full):
+        raise RuntimeError(f"Non-finite gamma_full in rg_se_method='moments': gamma={gamma_full}")
+
+    # Single-component h2 plug-ins actually used by the variance formula.
+    h1 = float(np.clip(np.asarray(h2_fit1.sigma_reps[-1, 0], dtype=np.float64), 0.0, 1.0))
+    h2 = float(np.clip(np.asarray(h2_fit2.sigma_reps[-1, 0], dtype=np.float64), 0.0, 1.0))
+    e1 = 1.0 - h1
+    e2 = 1.0 - h2
+
+    # ------------------------------------------------------------------
+    # 4) Choose moment source
+    # ------------------------------------------------------------------
+    alpha_probe = _kget("alpha_probe")
+    alpha_probe_err = abs(alpha_probe - 1.0) if np.isfinite(alpha_probe) else np.nan
+
+    use_probealpha = (
+        np.isfinite(alpha_probe_err)
+        and alpha_probe_err > float(alpha_tol)
+        and np.isfinite(_kget("t0_probealpha"))
+        and np.isfinite(_kget("t1_probealpha"))
+        and np.isfinite(_kget("t2_probealpha"))
+        and (_kget("t0_probealpha") > 0.0)
+    )
+
+    if use_probealpha:
+        t0 = _kget("t0_probealpha")
+        t1 = _kget("t1_probealpha")
+        t2 = _kget("t2_probealpha")
+        moment_source = "probealpha"
+    else:
+        t0 = _kget("t0_rank")
+        t1 = _kget("t1_rank")
+        t2 = _kget("t2_rank")
+        moment_source = "rank"
+
+    if not (np.isfinite(t0) and np.isfinite(t1) and np.isfinite(t2) and t0 > 0.0):
+        raise RuntimeError(
+            f"Invalid moments selected for model-based SE: t0={t0}, t1={t1}, t2={t2}"
+        )
+
+    s4 = t2 - 2.0 * t1 + t0
+    delta_reff = (t0 * t0 / s4) if (np.isfinite(s4) and s4 > 0.0) else np.nan
+
+    # Optional Monte Carlo sanity diagnostic
+    trace_k2_from_ldscore = _kget("trace_K2_from_ldscore")
+    trace_k2_probe = _kget("trace_K2_probe")
+    if np.isfinite(trace_k2_from_ldscore) and trace_k2_from_ldscore > 0.0 and np.isfinite(trace_k2_probe):
+        k2_probe_relerr = abs(trace_k2_probe - trace_k2_from_ldscore) / trace_k2_from_ldscore
+    else:
+        k2_probe_relerr = np.nan
+
+    # ------------------------------------------------------------------
+    # 5) Model-based variance of gamma
+    # ------------------------------------------------------------------
+    num = (
+        (h1 * h2 + gamma_full * gamma_full) * t2
+        + (h1 * e2 + h2 * e1 + 2.0 * gamma_full * c0) * t1
+        + (e1 * e2 + c0 * c0) * t0
+    )
+    var_gamma = num / (t0 * t0)
+
+    tol = 1e-12 * max(1.0, abs(num) / max(t0 * t0, 1.0))
+    if np.isfinite(var_gamma) and var_gamma < 0.0 and abs(var_gamma) <= tol:
+        var_gamma = 0.0
+
+    if not (np.isfinite(var_gamma) and var_gamma >= 0.0):
+        raise RuntimeError(
+            f"Invalid model-based gamma variance: var_gamma={var_gamma}, "
+            f"num={num}, t0={t0}, t1={t1}, t2={t2}, h1={h1}, h2={h2}, c={c0}, gamma={gamma_full}"
+        )
+
+    se_gamma = float(np.sqrt(var_gamma))
+
+    # ------------------------------------------------------------------
+    # 6) Convert to rg SE.
+    # For K == 1, bin rg and total rg are the same quantity.
+    # ------------------------------------------------------------------
+    def _delta_rg_se_from_h2_only(rg_full, v1_full, v2_full, v1_reps, v2_reps):
+        rg_full = float(rg_full)
+        v1_full = float(v1_full)
+        v2_full = float(v2_full)
+        v1_reps = np.asarray(v1_reps, dtype=np.float64)
+        v2_reps = np.asarray(v2_reps, dtype=np.float64)
+
+        if not (
+            np.isfinite(rg_full)
+            and np.isfinite(v1_full) and v1_full > 0.0
+            and np.isfinite(v2_full) and v2_full > 0.0
+        ):
+            return np.nan
+
+        d_v1 = -0.5 * rg_full / v1_full
+        d_v2 = -0.5 * rg_full / v2_full
+        lin_rg = (rg_full + d_v1 * (v1_reps - v1_full) + d_v2 * (v2_reps - v2_full)).astype(np.float64, copy=False)
+        lin_rg[-1] = rg_full
+
+        _, se_den = p.jackknife.summarize(
+            lin_rg,
+            unit_sizes=p.unit_sizes,
+            axis=0,
+            center=jack_mode,
+            nan_policy=nan_policy,
+        )
+        return float(se_den)
+
+    h1_reps = np.asarray(h2_fit1.sigma_reps[:, 0], dtype=np.float64)
+    h2_reps = np.asarray(h2_fit2.sigma_reps[:, 0], dtype=np.float64)
+    h1_full = float(h1_reps[-1])
+    h2_full = float(h2_reps[-1])
+
+    if np.isfinite(h1_full) and h1_full > 0.0 and np.isfinite(h2_full) and h2_full > 0.0:
+        rg_full = float(gamma_full / np.sqrt(h1_full * h2_full))
+        d_gamma = 1.0 / np.sqrt(h1_full * h2_full)
+    else:
+        rg_full = np.nan
+        d_gamma = np.nan
+
+    se_den = _delta_rg_se_from_h2_only(
+        rg_full=rg_full,
+        v1_full=h1_full,
+        v2_full=h2_full,
+        v1_reps=h1_reps,
+        v2_reps=h2_reps,
+    )
+
+    if np.isfinite(d_gamma) and np.isfinite(se_den):
+        se_rg = float(np.sqrt((d_gamma * se_gamma) ** 2 + se_den ** 2))
+    elif np.isfinite(d_gamma):
+        se_rg = float(abs(d_gamma) * se_gamma)
+    else:
+        se_rg = np.nan
+
+    return {
+        "se_gamma": se_gamma,
+        "se_rg": se_rg,
+        "var_gamma": float(var_gamma),
+        "moment_source": moment_source,
+        "alpha_probe": alpha_probe,
+        "alpha_probe_err": alpha_probe_err,
+        "delta_reff": delta_reff,
+        "k2_probe_relerr": k2_probe_relerr,
+        "approximate_moments": approximate_moments,
+        "drop_frac_total": float(drop_frac_total),
+        "approximate_sample_match": approximate_sample_match,
+        "sample_warning": sample_warning,
+        "scale_rel_gap": float(scale_rel_gap),
+        "overlap_rel_gap": float(overlap_rel_gap) if np.isfinite(overlap_rel_gap) else np.nan,
+        "sample_rel_gap": float(sample_rel_gap),
+        "overlap_check": overlap_check,
+    }
 
 
 def fit_rg(
@@ -648,7 +1058,7 @@ def fit_rg(
         raise ValueError("intercept_fit.c_reps shape mismatch with RGPrepared replicates.")
 
     c_reps = np.asarray(intercept_fit.c_reps, dtype=np.float64)
-    sqrt_n1n2 = float(np.sqrt(float(p.matched1.nsamp) * float(p.matched2.nsamp)))
+    sqrt_n1n2 = float(np.sqrt(float(p.n1_scale) * float(p.n2_scale)))
 
     rhs = np.full((R + 1, K), np.nan, dtype=np.float64)
     with np.errstate(divide="ignore", invalid="ignore"):
@@ -693,12 +1103,27 @@ def fit_rg(
 
     h2_tot1 = np.asarray(h2_fit1.h2_reps[:, -1], dtype=np.float64)
     h2_tot2 = np.asarray(h2_fit2.h2_reps[:, -1], dtype=np.float64)
+
+    with np.errstate(divide="ignore", invalid="ignore"):
+        rg_tot_reps = gamma_tot_reps / np.sqrt(h2_tot1 * h2_tot2)
+    rg_tot_reps[~np.isfinite(rg_tot_reps)] = np.nan
+    est, se = p.jackknife.summarize(
+        rg_tot_reps,
+        unit_sizes=p.unit_sizes,
+        axis=0,
+        center=jack_mode,
+        nan_policy=nan_policy,
+    )
+    rg_total = np.array([float(est), float(se)], dtype=np.float64)
+
     rg_se_method = str(rg_se_method).strip().lower()
-    if rg_se_method not in {"jackknife", "delta"}:
-        raise ValueError("rg_se_method must be one of {'jackknife','delta'}")
+    if rg_se_method not in {"jackknife", "delta", "robust", "kmoments"}:
+        raise ValueError("rg_se_method must be one of {'jackknife','delta','robust','kmoments'}")
+
+    kmoment_info = None
 
     if rg_se_method == "delta":
-        rg_total = _estimate_total_rg_delta_se(
+        rg_total_delta = _estimate_total_rg_delta_se(
             gamma_tot_reps,
             h2_tot1,
             h2_tot2,
@@ -707,41 +1132,73 @@ def fit_rg(
             center=jack_mode,
             nan_policy=nan_policy,
         )
+        rg_total = rg_total_delta
         if K == 1 and np.isfinite(rg_total[0]):
             rg[0, 0] = rg_total[0]
             rg[0, 1] = rg_total[1]
-    else:
-        with np.errstate(divide="ignore", invalid="ignore"):
-            rg_tot_reps = gamma_tot_reps / np.sqrt(h2_tot1 * h2_tot2)
-        rg_tot_reps[~np.isfinite(rg_tot_reps)] = np.nan
-        est, se = p.jackknife.summarize(
-            rg_tot_reps,
-            unit_sizes=p.unit_sizes,
-            axis=0,
-            center=jack_mode,
+
+    elif rg_se_method == "robust":
+        if K != 1:
+            raise ValueError(
+                "rg_se_method='robust' is currently implemented only for the single-component case (K == 1)."
+            )
+
+        gamma_full = float(np.asarray(gamma_reps[-1, 0], dtype=np.float64))
+        rg_full_bin = float(np.asarray(rg_reps[-1, 0], dtype=np.float64))
+        rg_full_total = float(rg_tot_reps[-1]) if np.isfinite(rg_tot_reps[-1]) else np.nan
+
+        rob = _estimate_fixedc_cluster_robust_se_single_component(
+            p,
+            intercept_fit,
+            h2_fit1,
+            h2_fit2,
+            gamma_full=gamma_full,
+            rg_full_bin=rg_full_bin,
+            rg_full_total=rg_full_total,
+            robust_kind="cr2",
+            add_external_c_se=False,
+            jack_mode=jack_mode,
             nan_policy=nan_policy,
         )
-        rg_total = np.array([float(est), float(se)], dtype=np.float64)
 
-    # ------------------------------------------------------------------
-    # Extra SE contribution from externally estimated c via --pheno-rg.
-    #
-    # We DO NOT random-sample c into the SNP jackknife replicates.
-    # Instead, conditional on the summary-data sufficient statistics, gamma(c)
-    # is affine in c, so the c-driven SE contribution is exact and cheap.
-    # ------------------------------------------------------------------
-    # extra = _external_c_sensitivity_se(p, h2_fit1, h2_fit2, intercept_fit)
-    # if extra is not None:
-    #     gamma_se_ext, rg_se_ext, gamma_total_se_ext, rg_total_se_ext = extra
+        gamma[0, 1] = float(rob["se_gamma"])
+        gamma_total[1] = float(rob["se_gamma"])
 
-    #     gamma[:, 1] = _combine_se_rss(gamma[:, 1], gamma_se_ext)
-    #     rg[:, 1] = _combine_se_rss(rg[:, 1], rg_se_ext)
-    #     gamma_total[1] = float(_combine_se_rss(gamma_total[1], gamma_total_se_ext))
-    #     rg_total[1] = float(_combine_se_rss(rg_total[1], rg_total_se_ext))
+        if np.isfinite(rob["se_rg_bin"]):
+            rg[0, 1] = float(rob["se_rg_bin"])
 
-    #     if K == 1:
-    #         gamma[0, 1] = gamma_total[1]
-    #         rg[0, 1] = rg_total[1]
+        if np.isfinite(rob["se_rg_total"]):
+            rg_total[1] = float(rob["se_rg_total"])
+
+    elif rg_se_method == "kmoments":
+        if K != 1:
+            raise ValueError(
+                "rg_se_method='kmoments' is currently implemented only for the single-component case (K == 1)."
+            )
+
+        gamma_full = float(np.asarray(gamma_reps[-1, 0], dtype=np.float64))
+        rg_full_bin = float(np.asarray(rg_reps[-1, 0], dtype=np.float64))
+        rg_full_total = float(rg_tot_reps[-1]) if np.isfinite(rg_tot_reps[-1]) else np.nan
+
+        km = _estimate_kmoment_model_se_single_component(
+            p,
+            intercept_fit,
+            h2_fit1,
+            h2_fit2,
+            gamma_full=gamma_full,
+            alpha_tol=5e-3,
+            jack_mode=jack_mode,
+            nan_policy=nan_policy,
+        )
+
+        gamma[0, 1] = float(km["se_gamma"])
+        gamma_total[1] = float(km["se_gamma"])
+
+        if np.isfinite(km["se_rg"]):
+            rg[0, 1] = float(km["se_rg"])
+            rg_total[1] = float(km["se_rg"])
+
+        kmoment_info = km
 
     return RGFit(
         prepared=prepared,
@@ -755,8 +1212,8 @@ def fit_rg(
         gamma_total=gamma_total,
         rg_total=rg_total,
         rg_se_method=rg_se_method,
+        kmoment_info=kmoment_info,
     )
-
 
 # -----------------------------------------------------------------------------
 # intercept estimation
@@ -999,10 +1456,9 @@ def _make_fixed_intercept_fit(
         c_se = 0.0
 
     if summary_y is None:
-        y = np.asarray(matched1.z, dtype=np.float64) * np.asarray(matched2.z, dtype=np.float64)
-    else:
-        y = np.asarray(summary_y, dtype=np.float64)
+        summary_y, summary_y_info = build_rg_summary_moment(matched1, matched2)
 
+    y = np.asarray(summary_y, dtype=np.float64)
     active_mask = np.isfinite(y)
     unit_sizes = jackknife.unit_sizes(active_mask=active_mask, dtype=np.float64)
 
@@ -1013,6 +1469,8 @@ def _make_fixed_intercept_fit(
     meta.setdefault("source", source)
     if summary_y_info is not None:
         meta["summary_y_mode"] = str(summary_y_info.get("mode", "unknown"))
+        meta["trait1_n_scale"] = float(summary_y_info.get("trait1_n_scale", getattr(matched1, "n_scale", matched1.nsamp)))
+        meta["trait2_n_scale"] = float(summary_y_info.get("trait2_n_scale", getattr(matched2, "n_scale", matched2.nsamp)))
 
     if log is not None:
         if c_se > 0.0:
@@ -1081,6 +1539,10 @@ def fit_intercept(
             log=log,
         )
 
+    mode = str(intercept_weight_mode).strip().lower()
+    if mode not in {"ldsc", "score"}:
+        raise ValueError("intercept_weight_mode must be one of {'ldsc','score'}")
+
     if summary_y is None:
         summary_y, summary_y_info = build_rg_summary_moment(matched1, matched2)
 
@@ -1099,7 +1561,16 @@ def fit_intercept(
     if y.ndim != 1 or y.size != x.size:
         raise ValueError(f"summary_y must have shape ({x.size},), got {y.shape}")
 
-    nsamp_max = max(float(matched1.nsamp), float(matched2.nsamp))
+    n1_scalar = float(
+        summary_y_info.get("trait1_n_scale", getattr(matched1, "n_scale", matched1.nsamp))
+        if summary_y_info is not None else getattr(matched1, "n_scale", matched1.nsamp)
+    )
+    n2_scalar = float(
+        summary_y_info.get("trait2_n_scale", getattr(matched2, "n_scale", matched2.nsamp))
+        if summary_y_info is not None else getattr(matched2, "n_scale", matched2.nsamp)
+    )
+    nsamp_max = max(n1_scalar, n2_scalar)
+
     keep, info = _make_intercept_keep_mask(
         z1,
         z2,
@@ -1111,9 +1582,20 @@ def fit_intercept(
     keep &= np.isfinite(y)
 
     info["ld_source"] = ld_source
-    info["weight_mode"] = intercept_weight_mode
+    info["weight_mode"] = mode
     info["summary_y_mode"] = None if summary_y_info is None else str(summary_y_info.get("mode", "unknown"))
     info["n_removed_nonfinite_summary_y"] = int(np.sum(~np.isfinite(y)))
+    info["trait1_n_scale"] = n1_scalar
+    info["trait2_n_scale"] = n2_scalar
+    if summary_y_info is not None:
+        for key in (
+            "trait1_cov_rank",
+            "trait1_cov_rank_source",
+            "trait2_cov_rank",
+            "trait2_cov_rank_source",
+        ):
+            if key in summary_y_info:
+                info[key] = summary_y_info[key]
 
     if info["n_kept"] <= 1:
         raise RuntimeError("Intercept regression has <=1 SNP after filtering.")
@@ -1193,7 +1675,6 @@ def fit_intercept(
             Sxy_u[u] = float(np.sum(wxy[s:e]))
         return W_u, Sx_u, Sxx_u, Sy_u, Sxy_u
 
-    # SCORE-style initialization (and final path if mode == "score")
     w_score = _build_simple_intercept_weights(x, keep)
     W0, Sx0, Sxx0, Sy0, Sxy0 = _weighted_scalar_summaries(w_score)
 
@@ -1220,13 +1701,11 @@ def fit_intercept(
         if n_iter < 0:
             raise ValueError("irwls_iters must be >= 0.")
 
-        n1_scalar = float(matched1.nsamp)
-        n2_scalar = float(matched2.nsamp)
         if not (
             np.isfinite(n1_scalar) and np.isfinite(n2_scalar) and n1_scalar > 0.0 and n2_scalar > 0.0
         ):
             raise RuntimeError(
-                f"Invalid sample sizes for intercept IRWLS: n1={n1_scalar}, n2={n2_scalar}."
+                f"Invalid n_scale values for intercept IRWLS: n1={n1_scalar}, n2={n2_scalar}."
             )
 
         sqrt_n1n2_scalar = float(np.sqrt(n1_scalar * n2_scalar))
@@ -1379,3 +1858,51 @@ def fit_intercept(
         c=c,
         info=info,
     )
+
+
+
+def _external_c_sensitivity_se(prepared: RGPrepared, h2_fit1, h2_fit2, intercept_fit: InterceptFit):
+    info = intercept_fit.info if isinstance(intercept_fit.info, dict) else {}
+    if str(info.get("source", "")).lower() != "pheno":
+        return None
+
+    c_se = info.get("external_c_se", None)
+    try:
+        c_se = float(c_se)
+    except Exception:
+        return None
+
+    if not (np.isfinite(c_se) and c_se > 0.0):
+        return None
+
+    p = prepared
+    K = p.trace_view.nbins
+    sqrt_n1n2 = float(np.sqrt(float(p.n1_scale) * float(p.n2_scale)))
+
+    lhs_full = np.asarray(p.lhs[-1], dtype=np.float64)
+    rhs_sens = np.full((1, K), sqrt_n1n2, dtype=np.float64)
+    sens = _solve_linear_batch(lhs_full[None, :, :], rhs_sens)[0]
+    if sens.shape != (K,) or not np.isfinite(sens).all():
+        return None
+
+    dc_gamma = -sens
+    gamma_se_ext = np.abs(dc_gamma) * c_se
+    gamma_total_se_ext = float(np.abs(np.sum(dc_gamma)) * c_se)
+
+    v1_full = np.asarray(h2_fit1.sigma_reps[-1, :K], dtype=np.float64)
+    v2_full = np.asarray(h2_fit2.sigma_reps[-1, :K], dtype=np.float64)
+    rg_se_ext = np.full(K, np.nan, dtype=np.float64)
+    valid_bin = np.isfinite(v1_full) & np.isfinite(v2_full) & (v1_full > 0.0) & (v2_full > 0.0)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        rg_se_ext[valid_bin] = (
+            np.abs(dc_gamma[valid_bin]) * c_se / np.sqrt(v1_full[valid_bin] * v2_full[valid_bin])
+        )
+
+    h1_tot = float(h2_fit1.h2_reps[-1, -1])
+    h2_tot = float(h2_fit2.h2_reps[-1, -1])
+    if np.isfinite(h1_tot) and np.isfinite(h2_tot) and h1_tot > 0.0 and h2_tot > 0.0:
+        rg_total_se_ext = float(np.abs(np.sum(dc_gamma)) * c_se / np.sqrt(h1_tot * h2_tot))
+    else:
+        rg_total_se_ext = np.nan
+
+    return gamma_se_ext, rg_se_ext, gamma_total_se_ext, rg_total_se_ext
