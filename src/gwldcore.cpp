@@ -215,6 +215,385 @@ static const std::vector<int>& parse_row_sel(py::object row_sel_obj, int64_t N_t
     return C.rows;
 }
 
+struct Phase1CSRKey {
+    const void* ann_ptr = nullptr;
+    const void* inv_ptr = nullptr;
+    int L = 0;
+    int B = 0;
+    uint8_t itemsize = 0;
+
+    bool operator==(const Phase1CSRKey& o) const {
+        return ann_ptr == o.ann_ptr &&
+               inv_ptr == o.inv_ptr &&
+               L == o.L &&
+               B == o.B &&
+               itemsize == o.itemsize;
+    }
+};
+
+struct Phase1CSRKeyHash {
+    std::size_t operator()(const Phase1CSRKey& k) const noexcept {
+        std::size_t h = std::hash<const void*>{}(k.ann_ptr);
+        h ^= std::hash<const void*>{}(k.inv_ptr) + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
+        h ^= std::hash<int>{}(k.L) + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
+        h ^= std::hash<int>{}(k.B) + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
+        h ^= std::hash<int>{}((int)k.itemsize) + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
+        return h;
+    }
+};
+
+template <typename T>
+struct Phase1CSRData {
+    std::vector<int> colptr;
+    AlignedBuffer<int> rowind;
+    AlignedBuffer<T> scale;
+    std::size_t bytes = 0;
+    uint64_t age = 0;
+};
+
+template <typename T>
+struct Phase1CSRStore {
+    std::unordered_map<Phase1CSRKey,
+                       std::shared_ptr<Phase1CSRData<T>>,
+                       Phase1CSRKeyHash> map;
+    std::size_t bytes = 0;
+    uint64_t clock = 0;
+};
+
+template <typename T>
+static Phase1CSRStore<T>& phase1_csr_store() {
+    static thread_local Phase1CSRStore<T> store;
+    return store;
+}
+
+static std::size_t phase1_csr_cache_cap_bytes() {
+    const char* s = std::getenv("SUMMIT_P1_CSR_CACHE_MB");
+    if (!s || !*s) return 256ULL * 1024ULL * 1024ULL;  // default 256 MB
+    long long mb = std::atoll(s);
+    if (mb <= 0) return 0;
+    return (std::size_t)mb * 1024ULL * 1024ULL;
+}
+
+template <typename T>
+static std::shared_ptr<Phase1CSRData<T>>
+build_phase1_csr(const T* ann, const T* inv, int L, int B)
+{
+    auto out = std::make_shared<Phase1CSRData<T>>();
+    out->colptr.assign((size_t)B + 1, 0);
+
+    for (int k = 0; k < B; ++k) {
+        int cnt = 0;
+        const T* colk = ann + (size_t)k; // row-major view: a[i*B + k]
+        for (int i = 0; i < L; ++i) {
+            const T a = colk[(size_t)i * (size_t)B];
+            if (a == T(0)) continue;
+
+            const double ad = (double)a;
+            if (!(ad > 0.0) || !std::isfinite(ad)) continue;
+
+            const double invd = (double)inv[(size_t)i];
+            if (!std::isfinite(invd) || invd <= 0.0) continue;
+
+            const double sc = invd * std::sqrt(ad);
+            if (!std::isfinite(sc)) continue;
+
+            if constexpr (std::is_same_v<T, float>) {
+                if (sc > (double)std::numeric_limits<float>::max()) continue;
+            }
+
+            ++cnt;
+        }
+        out->colptr[(size_t)k + 1] = cnt;
+    }
+
+    for (int k = 0; k < B; ++k) {
+        out->colptr[(size_t)k + 1] += out->colptr[(size_t)k];
+    }
+
+    const int nnz = out->colptr[(size_t)B];
+    out->rowind.allocate((size_t)nnz, 64);
+    out->scale.allocate((size_t)nnz, 64);
+
+    std::vector<int> fill((size_t)B, 0);
+    for (int k = 0; k < B; ++k) {
+        const int base = out->colptr[(size_t)k];
+        int& f = fill[(size_t)k];
+        const T* colk = ann + (size_t)k;
+
+        for (int i = 0; i < L; ++i) {
+            const T a = colk[(size_t)i * (size_t)B];
+            if (a == T(0)) continue;
+
+            const double ad = (double)a;
+            if (!(ad > 0.0) || !std::isfinite(ad)) continue;
+
+            const double invd = (double)inv[(size_t)i];
+            if (!std::isfinite(invd) || invd <= 0.0) continue;
+
+            const double sc = invd * std::sqrt(ad);
+            if (!std::isfinite(sc)) continue;
+
+            if constexpr (std::is_same_v<T, float>) {
+                if (sc > (double)std::numeric_limits<float>::max()) continue;
+            }
+
+            const int pos = base + f++;
+            out->rowind.ptr[(size_t)pos] = i;
+            out->scale.ptr[(size_t)pos] = (T)sc;
+        }
+    }
+
+    out->bytes =
+        out->colptr.size() * sizeof(int) +
+        (std::size_t)nnz * (sizeof(int) + sizeof(T));
+
+    return out;
+}
+
+template <typename T>
+static std::shared_ptr<Phase1CSRData<T>>
+get_or_build_phase1_csr(const T* ann, const T* inv, int L, int B)
+{
+    const std::size_t cap = phase1_csr_cache_cap_bytes();
+
+    Phase1CSRKey key;
+    key.ann_ptr = ann;
+    key.inv_ptr = inv;
+    key.L = L;
+    key.B = B;
+    key.itemsize = (uint8_t)sizeof(T);
+
+    if (cap > 0) {
+        auto& store = phase1_csr_store<T>();
+        auto it = store.map.find(key);
+        if (it != store.map.end()) {
+            it->second->age = ++store.clock;
+            return it->second;
+        }
+
+        auto built = build_phase1_csr<T>(ann, inv, L, B);
+        built->age = ++store.clock;
+
+        if (built->bytes > cap) {
+            return built; // too large to cache, but still use this instance
+        }
+
+        while (store.bytes + built->bytes > cap && !store.map.empty()) {
+            auto victim = store.map.begin();
+            for (auto it2 = store.map.begin(); it2 != store.map.end(); ++it2) {
+                if (it2->second->age < victim->second->age) victim = it2;
+            }
+            store.bytes -= victim->second->bytes;
+            store.map.erase(victim);
+        }
+
+        store.bytes += built->bytes;
+        store.map.emplace(key, built);
+        return built;
+    }
+
+    return build_phase1_csr<T>(ann, inv, L, B);
+}
+
+static void clear_phase1_csr_cache() {
+    {
+        auto& s = phase1_csr_store<float>();
+        s.map.clear();
+        s.bytes = 0;
+        s.clock = 0;
+    }
+    {
+        auto& s = phase1_csr_store<double>();
+        s.map.clear();
+        s.bytes = 0;
+        s.clock = 0;
+    }
+}
+
+template <typename T>
+static void project_panel_inplace(T* X, int N, int Q,
+                                  const T* Cptr, const T* Rptr, int p,
+                                  AlignedBuffer<T>& tmp_buf)
+{
+    if (p <= 0 || N <= 0 || Q <= 0) return;
+
+    const size_t need = (size_t)p * (size_t)Q;
+    if (tmp_buf.n < need) {
+        tmp_buf.allocate(need, 64);
+    }
+    T* tmp = tmp_buf.ptr;
+
+    // tmp = R * X   (p x Q)
+    gemm_col_major_nn<T>(p, Q, N,
+                         Rptr, p,
+                         X,    N,
+                         tmp,  p,
+                         T(1), T(0));
+
+    // X = X - C * tmp   (N x Q)
+    gemm_col_major_nn<T>(N, Q, p,
+                         Cptr, N,
+                         tmp,  p,
+                         X,    N,
+                         T(-1), T(1));
+}
+
+template <typename T>
+void apply_grm_bed_panel_impl(
+    const std::string& bed_prefix,
+    const std::string& fam_path,
+    int nsnps,
+    int step_size,
+    py::object row_sel_obj,
+    int ddof,
+    py::array_t<T, py::array::c_style | py::array::forcecast> inv_all,     // (M,)
+    py::array_t<T, py::array::f_style | py::array::forcecast> panel_in,    // (N x Q), sample-space probes
+    py::array_t<T, py::array::f_style | py::array::forcecast> panel_out,   // (N x Q), output K * panel_in
+    py::object C_opt,
+    py::object R_opt)
+{
+    const std::string bed_path = bed_prefix + ".bed";
+    const std::string bim_path = bed_prefix + ".bim";
+
+    const int64_t N_total = count_lines_cached(fam_path);
+    const int64_t M_total = count_lines_cached(bim_path);
+
+    if (nsnps < 0 || nsnps > (int)M_total) {
+        throw std::runtime_error("nsnps is out of range in apply_grm_bed_panel");
+    }
+    if (step_size <= 0) {
+        throw std::runtime_error("step_size must be > 0 in apply_grm_bed_panel");
+    }
+
+    const std::vector<int>& rows = parse_row_sel(row_sel_obj, N_total);
+    const int N_rows = (int)rows.size();
+    if (N_rows <= 0) {
+        throw std::runtime_error("No rows selected in apply_grm_bed_panel");
+    }
+
+    auto Iinfo = inv_all.request();
+    if (Iinfo.ndim != 1 || (int)Iinfo.shape[0] < nsnps) {
+        throw std::runtime_error("inv_all shape mismatch in apply_grm_bed_panel");
+    }
+    const T* invp = static_cast<const T*>(Iinfo.ptr);
+
+    auto Xin = panel_in.request();
+    auto Xout = panel_out.request();
+
+    if (Xin.ndim != 2 || Xout.ndim != 2) {
+        throw std::runtime_error("panel_in/panel_out must be 2D in apply_grm_bed_panel");
+    }
+    if ((int)Xin.shape[0] != N_rows || (int)Xout.shape[0] != N_rows) {
+        throw std::runtime_error("panel_in/panel_out row dimension mismatch in apply_grm_bed_panel");
+    }
+    if ((int)Xin.shape[1] != (int)Xout.shape[1]) {
+        throw std::runtime_error("panel_in/panel_out column dimension mismatch in apply_grm_bed_panel");
+    }
+
+    const int Q = (int)Xin.shape[1];
+    const T* inptr = static_cast<const T*>(Xin.ptr);
+    T* outptr = static_cast<T*>(Xout.ptr);
+
+    bool have_proj = (!C_opt.is_none() && !R_opt.is_none());
+    const T* Cptr = nullptr;
+    const T* Rptr = nullptr;
+    int p = 0;
+
+    py::array_t<T, py::array::f_style | py::array::forcecast> Carr;
+    py::array_t<T, py::array::f_style | py::array::forcecast> Rarr;
+
+    if (have_proj) {
+        Carr = C_opt.cast<py::array_t<T, py::array::f_style | py::array::forcecast>>();
+        Rarr = R_opt.cast<py::array_t<T, py::array::f_style | py::array::forcecast>>();
+
+        auto Cinfo = Carr.request();
+        auto Rinfo = Rarr.request();
+
+        p = (int)Cinfo.shape[1];
+        if ((int)Cinfo.shape[0] != N_rows ||
+            (int)Rinfo.shape[0] != p ||
+            (int)Rinfo.shape[1] != N_rows) {
+            throw std::runtime_error("C/R shape mismatch in apply_grm_bed_panel");
+        }
+
+        Cptr = static_cast<const T*>(Cinfo.ptr);
+        Rptr = static_cast<const T*>(Rinfo.ptr);
+    }
+
+    AlignedBuffer<T> Vin((size_t)N_rows * (size_t)Q, 64);
+    std::memcpy(Vin.ptr, inptr, sizeof(T) * (size_t)N_rows * (size_t)Q);
+
+    std::fill(outptr, outptr + (size_t)N_rows * (size_t)Q, T(0));
+
+    AlignedBuffer<T> proj_tmp(have_proj ? (size_t)p * (size_t)Q : 0, 64);
+    AlignedBuffer<T> coef_buf((size_t)std::min(step_size, nsnps) * (size_t)Q, 64);
+
+    py::gil_scoped_release nogil;
+
+    // Right-side projection: because the BED-standardized SNPs are already mean-zero,
+    // only the explicit covariate projection is needed here.
+    if (have_proj) {
+        project_panel_inplace<T>(Vin.ptr, N_rows, Q, Cptr, Rptr, p, proj_tmp);
+    }
+
+    const double invM = 1.0 / (double)nsnps;
+
+    for (int s = 0; s < nsnps; s += step_size) {
+        check_for_interrupt();
+
+        const int e = std::min(nsnps, s + step_size);
+        const int L = e - s;
+        if (L <= 0) continue;
+
+        int N_blk = 0, L_blk = 0;
+        std::vector<T> Geno;
+        read_block_standardized<T>(bed_path, fam_path, s, e, rows, ddof, Geno, N_blk, L_blk);
+
+        if (N_blk != N_rows || L_blk != L) {
+            throw std::runtime_error("Unexpected block dimensions in apply_grm_bed_panel");
+        }
+
+        T* coef = coef_buf.ptr;
+
+        // coef = G^T * Vin   (L x Q)
+        gemm_col_major_tn<T>(L, Q, N_rows,
+                             Geno.data(), N_rows,
+                             Vin.ptr,     N_rows,
+                             coef,        L,
+                             T(1), T(0));
+
+        // Scale each SNP-row by inv_j^2 / M.
+        std::vector<T> row_scale((size_t)L, T(0));
+        for (int j = 0; j < L; ++j) {
+            const double invj = (double)invp[(size_t)(s + j)];
+            double w = invj * invj * invM;
+            if (!std::isfinite(w) || w <= 0.0) w = 0.0;
+            row_scale[(size_t)j] = (T)w;
+        }
+
+#ifdef _OPENMP
+        #pragma omp parallel for schedule(static)
+#endif
+        for (int q = 0; q < Q; ++q) {
+            T* ccol = coef + (size_t)q * (size_t)L;
+            for (int j = 0; j < L; ++j) {
+                ccol[(size_t)j] *= row_scale[(size_t)j];
+            }
+        }
+
+        // out += G * coef   (N x Q)
+        gemm_col_major_nn<T>(N_rows, Q, L,
+                             Geno.data(), N_rows,
+                             coef,        L,
+                             outptr,      N_rows,
+                             T(1), T(1));
+    }
+
+    // Left-side projection to obtain K * v = (1/M) P G D^2 G^T P v.
+    if (have_proj) {
+        project_panel_inplace<T>(outptr, N_rows, Q, Cptr, Rptr, p, proj_tmp);
+    }
+}
 
 // -------------------------- Phase 1: compute_Xz (K-major) --------------------------
 template <typename T>
@@ -225,12 +604,12 @@ void phase1_compute_Xz_bed_chunk_impl(const std::string &bed_prefix,
                                       int ddof,
                                       py::array_t<T, py::array::c_style | py::array::forcecast> annot_blk, // (L x B)
                                       py::array_t<T, py::array::c_style | py::array::forcecast> inv_right,  // (L,)
-                                      int v_start,            // global V offset
-                                      int v_count,            // V cols in THIS tile
-                                      int /*kmax_hint*/,      // unused with CSR
+                                      int v_start,
+                                      int v_count,
+                                      int /*kmax_hint*/,
                                       const std::string &rand_dist,
-                                      py::object seed_obj,    // None or int
-                                      py::array_t<T, py::array::f_style | py::array::forcecast> Xz2d_chunk, // (N x (B*v_count)), Fortran, **K-major**
+                                      py::object seed_obj,
+                                      py::array_t<T, py::array::f_style | py::array::forcecast> Xz2d_chunk, // (N x (B*v_count)), Fortran
                                       bool project_right = false,
                                       py::object C_opt = py::none(),
                                       py::object R_opt = py::none())
@@ -242,66 +621,52 @@ void phase1_compute_Xz_bed_chunk_impl(const std::string &bed_prefix,
     const int64_t M_total = count_lines_cached(bim_path);
     if (blk_end > M_total) throw std::runtime_error("blk_end exceeds #SNPs in BIM");
 
-    // ---- rows & block genotype ----
     const std::vector<int>& rows = parse_row_sel(row_sel_obj, N_total);
 
     int N = 0, L = 0;
-    std::vector<T> Geno; // (N x L), column-major
+    std::vector<T> Geno;
     read_block_standardized<T>(bed_path, fam_path, blk_start, blk_end, rows, ddof, Geno, N, L);
     if (L == 0) return;
 
     if (project_right && !C_opt.is_none() && !R_opt.is_none()) {
-    py::array_t<T, py::array::f_style | py::array::forcecast> C = C_opt.cast<py::array_t<T>>();
-    py::array_t<T, py::array::f_style | py::array::forcecast> R = R_opt.cast<py::array_t<T>>();
-    auto Ci = C.request();
-    auto Ri = R.request();
-    const int p = (int)Ci.shape[1];
-    if ((int)Ci.shape[0] != N || (int)Ri.shape[0] != p || (int)Ri.shape[1] != N)
-        throw std::runtime_error("C/R shape mismatch in phase1");
+        py::array_t<T, py::array::f_style | py::array::forcecast> C = C_opt.cast<py::array_t<T>>();
+        py::array_t<T, py::array::f_style | py::array::forcecast> R = R_opt.cast<py::array_t<T>>();
+        auto Ci = C.request();
+        auto Ri = R.request();
+        const int p = (int)Ci.shape[1];
+        if ((int)Ci.shape[0] != N || (int)Ri.shape[0] != p || (int)Ri.shape[1] != N)
+            throw std::runtime_error("C/R shape mismatch in phase1");
 
-    const T* Cptr = static_cast<const T*>(Ci.ptr);
-    const T* Rptr = static_cast<const T*>(Ri.ptr);
+        const T* Cptr = static_cast<const T*>(Ci.ptr);
+        const T* Rptr = static_cast<const T*>(Ri.ptr);
 
-    // tmpG = R * Geno (p x L)
-    AlignedBuffer<T> tmpG((size_t)p * (size_t)L, 64);
-    gemm_col_major_nn<T>(/*m=*/p, /*n=*/L, /*k=*/N,
-                         /*A=*/Rptr, /*lda=*/p,
-                         /*B=*/Geno.data(), /*ldb=*/N,
-                         /*C=*/tmpG.ptr, /*ldc=*/p,
-                         /*alpha=*/T(1), /*beta=*/T(0));
-    // Geno = Geno - C * tmpG  (in-place)
-    gemm_col_major_nn<T>(/*m=*/N, /*n=*/L, /*k=*/p,
-                         /*A=*/Cptr, /*lda=*/N,
-                         /*B=*/tmpG.ptr, /*ldb=*/p,
-                         /*C=*/Geno.data(), /*ldc=*/N,
-                         /*alpha=*/T(-1), /*beta=*/T(1));
+        AlignedBuffer<T> tmpG((size_t)p * (size_t)L, 64);
+        gemm_col_major_nn<T>(p, L, N, Rptr, p, Geno.data(), N, tmpG.ptr, p, T(1), T(0));
+        gemm_col_major_nn<T>(N, L, p, Cptr, N, tmpG.ptr, p, Geno.data(), N, T(-1), T(1));
     }
 
-    // ---- annot & inv ----
     auto Ainfo = annot_blk.request();
     auto Iinfo = inv_right.request();
     if (Ainfo.ndim != 2 || Iinfo.ndim != 1) throw std::runtime_error("annot/inv shapes");
     const int B = (int)Ainfo.shape[1];
     if ((int)Ainfo.shape[0] != L || (int)Iinfo.shape[0] != L) throw std::runtime_error("L mismatch");
+
     const T* ann = static_cast<const T*>(Ainfo.ptr);
     const T* inv = static_cast<const T*>(Iinfo.ptr);
 
-    // ---- destination: K-major ----
     auto Xinfo = Xz2d_chunk.request();
     if (Xinfo.ndim != 2 || (int)Xinfo.shape[0] != N || (int)Xinfo.shape[1] != B * v_count)
         throw std::runtime_error("Xz2d_chunk shape must be (N, B*v_count)");
-    T*  Xptr = static_cast<T*>(Xinfo.ptr);
+    T* Xptr = static_cast<T*>(Xinfo.ptr);
     const int ldc = N;
 
-    // ---- RNG per block (strict independence) ----
     const bool have_root = !seed_obj.is_none();
     const uint64_t root_seed = have_root ? seed_obj.cast<uint64_t>() : std::random_device{}();
-    std::mt19937_64 rng(make_seed(root_seed, /*block=*/blk_start, /*v0=*/v_start));
+    std::mt19937_64 rng(make_seed(root_seed, blk_start, v_start));
     std::normal_distribution<T> gN(0, (T)1);
     const bool is_rademacher = (rand_dist == "rademacher");
     const bool is_spherical  = (rand_dist == "spherical");
 
-    // ---- Z panel: (L x v_count), column-major ----
     std::vector<T> Z((size_t)L * (size_t)v_count, T(0));
     for (int c = 0; c < v_count; ++c) {
         long double ss = 0.0L;
@@ -312,76 +677,17 @@ void phase1_compute_Xz_bed_chunk_impl(const std::string &bed_prefix,
         }
         if (is_spherical) {
             T scale = ss > 0.0L ? (T)std::sqrt((long double)L / ss) : T(1);
-            for (int r = 0; r < L; ++r) Z[(size_t)r + (size_t)c * (size_t)L] *= scale;
-        }
-    }
-
-    // ---- CSR compression of annotation (by columns=bins) ----
-    // colptr[B+1], rowind[nnz], scale[nnz] with scale = inv[i] * sqrt(a_ik)
-    std::vector<int> colptr(B + 1, 0);
-    {
-        // Count nnz in each bin
-        for (int k = 0; k < B; ++k) {
-            int cnt = 0;
-            const T* colk = ann + (size_t)k; // column k viewed in row-major indexing i*B + k
-            for (int i = 0; i < L; ++i) {
-                T a = colk[(size_t)i * (size_t)B];
-                if (a == T(0)) continue;
-
-                const double ad = (double)a;
-                if (!(ad > 0.0) || !std::isfinite(ad)) continue;
-
-                const double invd = (double)inv[i];
-                if (!std::isfinite(invd) || invd <= 0.0) continue;
-
-                const double sc = invd * std::sqrt(ad);
-                if (!std::isfinite(sc)) continue;
-
-                if constexpr (std::is_same_v<T, float>) {
-                    if (sc > (double)std::numeric_limits<float>::max()) continue;
-                }
-
-                ++cnt;
-            }
-            colptr[(size_t)k + 1] = cnt;
-        }
-        // prefix sum
-        for (int k = 0; k < B; ++k) colptr[(size_t)k + 1] += colptr[(size_t)k];
-    }
-    const int nnz = colptr[(size_t)B];
-    AlignedBuffer<int> rowind_buf((size_t)nnz, 64);
-    AlignedBuffer<T>   scale_buf((size_t)nnz, 64);
-    {
-        std::vector<int> fill(B, 0);
-        for (int k = 0; k < B; ++k) {
-            int base = colptr[(size_t)k];
-            int& f   = fill[(size_t)k];
-            const T* colk = ann + (size_t)k;
-            for (int i = 0; i < L; ++i) {
-                T a = colk[(size_t)i * (size_t)B];
-                if (a == T(0)) continue;
-
-                const double ad = (double)a;
-                if (!(ad > 0.0) || !std::isfinite(ad)) continue;
-
-                const double invd = (double)inv[i];
-                if (!std::isfinite(invd) || invd <= 0.0) continue;
-
-                const double sc = invd * std::sqrt(ad);
-                if (!std::isfinite(sc)) continue;
-
-                if constexpr (std::is_same_v<T, float>) {
-                    if (sc > (double)std::numeric_limits<float>::max()) continue;
-                }
-
-                const int pos = base + f++;
-                rowind_buf.ptr[(size_t)pos] = i;
-                scale_buf.ptr [(size_t)pos] = (T)sc;
+            for (int r = 0; r < L; ++r) {
+                Z[(size_t)r + (size_t)c * (size_t)L] *= scale;
             }
         }
     }
 
-    // ---- First-touch Xz2d (only once at start-of-tile) ----
+    auto csr = get_or_build_phase1_csr<T>(ann, inv, L, B);
+    const std::vector<int>& colptr = csr->colptr;
+    const int* rowind = csr->rowind.ptr;
+    const T* scale = csr->scale.ptr;
+
     if (blk_start == 0) {
         const size_t Q = (size_t)B * (size_t)v_count;
         const size_t elems_per_page = (size_t)((4096 / sizeof(T)) ? (4096 / sizeof(T)) : 512);
@@ -389,17 +695,15 @@ void phase1_compute_Xz_bed_chunk_impl(const std::string &bed_prefix,
         for (ptrdiff_t g = 0; g < (ptrdiff_t)Q; ++g) {
             T* col = Xptr + (size_t)g * (size_t)ldc;
             for (size_t r = 0; r < (size_t)N; r += elems_per_page) {
-                col[r] += T(0); // write to establish page ownership
+                col[r] += T(0);
             }
         }
     }
 
-    // ---- constants / timers ----
     const char* s = std::getenv("SUMMIT_P1_NTILE");
     int NTILE = s ? std::max(64, std::atoi(s)) : (std::is_same_v<T,double> ? 256 : 512);
     P1Timers t1;
 
-    // ---- Outer loop over bins; packZ once per bin, then OMP over N-tiles ----
     for (int k = 0; k < B; ++k) {
         check_for_interrupt();
 
@@ -408,60 +712,60 @@ void phase1_compute_Xz_bed_chunk_impl(const std::string &bed_prefix,
         const int K  = k1 - k0;
         if (K == 0) continue;
 
-        // Pack Bcol (K x v_count) once per bin; gather rows from Z
         AlignedBuffer<T> Bcol((size_t)K * (size_t)v_count, 64);
+
         auto z0 = std::chrono::high_resolution_clock::now();
         for (int c = 0; c < v_count; ++c) {
             const T* zc = Z.data() + (size_t)c * (size_t)L;
-            T*       dst = Bcol.ptr  + (size_t)c * (size_t)K;
+            T* dst = Bcol.ptr + (size_t)c * (size_t)K;
             for (int r = 0; r < K; ++r) {
-                const int snp = rowind_buf.ptr[(size_t)k0 + (size_t)r];
+                const int snp = rowind[(size_t)k0 + (size_t)r];
                 dst[(size_t)r] = zc[(size_t)snp];
             }
         }
         auto z1 = std::chrono::high_resolution_clock::now();
-        t1.t_packZ_ms += std::chrono::duration<double,std::milli>(z1 - z0).count();
+        t1.t_packZ_ms += std::chrono::duration<double, std::milli>(z1 - z0).count();
 
-        // OMP over N-tiles; packA → GEMM → K-major scatter via AXPY
-        #ifdef _OPENMP
+#ifdef _OPENMP
         #pragma omp parallel
-        #endif
+#endif
         {
-            AlignedBuffer<T> A_tile((size_t)NTILE * (size_t)K, 64);           // (Nt x K)
-            AlignedBuffer<T> C_tile((size_t)NTILE * (size_t)v_count, 64);     // (Nt x v_count)
+            AlignedBuffer<T> A_tile((size_t)NTILE * (size_t)K, 64);
+            AlignedBuffer<T> C_tile((size_t)NTILE * (size_t)v_count, 64);
 
             double packA_ms = 0.0, gemm_ms = 0.0, scatt_ms = 0.0;
 
-            #ifdef _OPENMP
+#ifdef _OPENMP
             #pragma omp for schedule(static)
-            #endif
+#endif
             for (int n0 = 0; n0 < N; n0 += NTILE) {
                 const int Nt = std::min(N - n0, NTILE);
 
-                // packA: A_tile(:, c) = Geno(:, snp_c)[n0:n0+Nt) * scale_c
                 auto a0 = std::chrono::high_resolution_clock::now();
                 for (int c = 0; c < K; ++c) {
-                    const int snp = rowind_buf.ptr[(size_t)k0 + (size_t)c];
-                    const T   ssc = scale_buf.ptr [(size_t)k0 + (size_t)c];
-                    const T* src  = Geno.data() + (size_t)snp * (size_t)N + (size_t)n0;
-                    T*       dst  = A_tile.ptr  + (size_t)c   * (size_t)Nt;
-                    #pragma omp simd
-                    for (int r = 0; r < Nt; ++r) dst[r] = src[r] * ssc;
+                    const int snp = rowind[(size_t)k0 + (size_t)c];
+                    const T ssc = scale[(size_t)k0 + (size_t)c];
+                    const T* src = Geno.data() + (size_t)snp * (size_t)N + (size_t)n0;
+                    T* dst = A_tile.ptr + (size_t)c * (size_t)Nt;
+#pragma omp simd
+                    for (int r = 0; r < Nt; ++r) {
+                        dst[r] = src[r] * ssc;
+                    }
                 }
                 auto a1 = std::chrono::high_resolution_clock::now();
-                packA_ms += std::chrono::duration<double,std::milli>(a1 - a0).count();
+                packA_ms += std::chrono::duration<double, std::milli>(a1 - a0).count();
 
-                // GEMM: C_tile(Nt x v_count) = A_tile(Nt x K) * Bcol(K x v_count)
                 auto g0 = std::chrono::high_resolution_clock::now();
-                gemm_col_major_nn<T>(/*m=*/Nt, /*n=*/v_count, /*k=*/K,
-                                     /*A=*/A_tile.ptr, /*lda=*/Nt,
-                                     /*B=*/Bcol.ptr,   /*ldb=*/K,
-                                     /*C=*/C_tile.ptr, /*ldc=*/Nt,
-                                     /*alpha=*/T(1), /*beta=*/T(0));
+                gemm_col_major_nn<T>(
+                    Nt, v_count, K,
+                    A_tile.ptr, Nt,
+                    Bcol.ptr, K,
+                    C_tile.ptr, Nt,
+                    T(1), T(0)
+                );
                 auto g1 = std::chrono::high_resolution_clock::now();
-                gemm_ms += std::chrono::duration<double,std::milli>(g1 - g0).count();
+                gemm_ms += std::chrono::duration<double, std::milli>(g1 - g0).count();
 
-                // K-major scatter: columns [k*v_count .. k*v_count+v_count-1]
                 auto s0 = std::chrono::high_resolution_clock::now();
                 const size_t base_col = (size_t)k * (size_t)v_count;
                 for (int c = 0; c < v_count; ++c) {
@@ -470,25 +774,25 @@ void phase1_compute_Xz_bed_chunk_impl(const std::string &bed_prefix,
                     cblas_taxpy(Nt, T(1), src_col, 1, dst_col, 1);
                 }
                 auto s1 = std::chrono::high_resolution_clock::now();
-                scatt_ms += std::chrono::duration<double,std::milli>(s1 - s0).count();
-            } // n0
+                scatt_ms += std::chrono::duration<double, std::milli>(s1 - s0).count();
+            }
 
-            #ifdef _OPENMP
+#ifdef _OPENMP
             #pragma omp atomic
+#endif
             t1.t_packA_ms += packA_ms;
+#ifdef _OPENMP
             #pragma omp atomic
-            t1.t_gemm_ms  += gemm_ms;
+#endif
+            t1.t_gemm_ms += gemm_ms;
+#ifdef _OPENMP
             #pragma omp atomic
+#endif
             t1.t_scatt_ms += scatt_ms;
-            #else
-            t1.t_packA_ms += packA_ms;
-            t1.t_gemm_ms  += gemm_ms;
-            t1.t_scatt_ms += scatt_ms;
-            #endif
-        } // parallel
-    } // bins
+        }
+    }
 
-    t1.dump(blk_start, blk_end, /*B=*/B, /*vcount=*/v_count);
+    t1.dump(blk_start, blk_end, B, v_count);
 }
 
 // -------------------------- Phase 2: XtXz (K-major) --------------------------
@@ -741,95 +1045,329 @@ void phase2_compute_XtXz_bed_impl(const std::string &bed_prefix,
     t.dump(blk_start, blk_end, B, nvecs);
 }
 
-static inline int64_t llabs_i64(int64_t x) { return x >= 0 ? x : -x; }
-
 template <typename T>
-static void fill_random_probes_same_as_phase1(int L,
-                                              int v_start,
-                                              int v_count,
-                                              const std::string& rand_dist,
-                                              py::object seed_obj,
-                                              int block_start,
-                                              std::vector<T>& Z)
+void phase2_accum_XtXz_bed_impl(const std::string &bed_prefix,
+                                const std::string &fam_path,
+                                int blk_start, int blk_end,
+                                py::object row_sel_obj,
+                                int ddof,
+                                py::array_t<T, py::array::c_style | py::array::forcecast> inv_left, // (L,)
+                                int tile_nvecs,
+                                py::array_t<T, py::array::f_style | py::array::forcecast> Xz2d,      // (N x (B*Vtile)), K-major
+                                py::array_t<T, py::array::c_style | py::array::forcecast> meansq_accum, // (M x B), row-major
+                                py::object C_opt,
+                                py::object R_opt,
+                                int N_denom)
 {
-    const bool have_root = !seed_obj.is_none();
-    const uint64_t root_seed = have_root ? seed_obj.cast<uint64_t>() : std::random_device{}();
+    auto round_down = [](int x, int m) { return (m > 0) ? (x / m) * m : x; };
 
-    std::mt19937_64 rng(make_seed(root_seed, /*block=*/block_start, /*v0=*/v_start));
-    std::normal_distribution<T> gN(0, (T)1);
-    const bool is_rademacher = (rand_dist == "rademacher");
-    const bool is_spherical  = (rand_dist == "spherical");
+    const std::string bed_path = bed_prefix + ".bed";
+    const std::string bim_path = bed_prefix + ".bim";
 
-    Z.assign((size_t)L * (size_t)v_count, T(0));
-    for (int c = 0; c < v_count; ++c) {
-        long double ss = 0.0L;
-        for (int r = 0; r < L; ++r) {
-            T z = is_rademacher ? ((rng() & 1) ? T(+1) : T(-1)) : gN(rng);
-            Z[(size_t)r + (size_t)c * (size_t)L] = z;
-            if (is_spherical) ss += (long double)z * (long double)z;
-        }
-        if (is_spherical) {
-            T scale = ss > 0.0L ? (T)std::sqrt((long double)L / ss) : T(1);
-            for (int r = 0; r < L; ++r) Z[(size_t)r + (size_t)c * (size_t)L] *= scale;
+    const int64_t N_total = count_lines_cached(fam_path);
+    const int64_t M_total = count_lines_cached(bim_path);
+    if (blk_end > M_total) throw std::runtime_error("blk_end exceeds #SNPs in BIM");
+
+    const std::vector<int>& rows = parse_row_sel(row_sel_obj, N_total);
+
+    int N = 0, L = 0;
+    std::vector<T> Geno;
+    read_block_standardized<T>(bed_path, fam_path, blk_start, blk_end, rows, ddof, Geno, N, L);
+    if (L == 0) return;
+
+    if (!C_opt.is_none() && !R_opt.is_none()) {
+        py::array_t<T, py::array::f_style | py::array::forcecast> C =
+            C_opt.cast<py::array_t<T, py::array::f_style | py::array::forcecast>>();
+        py::array_t<T, py::array::f_style | py::array::forcecast> R =
+            R_opt.cast<py::array_t<T, py::array::f_style | py::array::forcecast>>();
+        auto Ci = C.request();
+        auto Ri = R.request();
+        const int p = (int)Ci.shape[1];
+        if ((int)Ci.shape[0] != N || (int)Ri.shape[0] != p || (int)Ri.shape[1] != N)
+            throw std::runtime_error("C/R shape mismatch in phase2_accum_XtXz_bed");
+
+        const T* Cptr = static_cast<const T*>(Ci.ptr);
+        const T* Rptr = static_cast<const T*>(Ri.ptr);
+
+        AlignedBuffer<T> tmpG((size_t)p * (size_t)L, 64);
+        gemm_col_major_nn<T>(p, L, N, Rptr, p, Geno.data(), N, tmpG.ptr, p, T(1), T(0));
+        gemm_col_major_nn<T>(N, L, p, Cptr, N, tmpG.ptr, p, Geno.data(), N, T(-1), T(1));
+    }
+
+    auto Ii = inv_left.request();
+    if (Ii.ndim != 1 || (int)Ii.shape[0] != L)
+        throw std::runtime_error("inv_left shape mismatch in phase2_accum_XtXz_bed");
+    const T* inv = static_cast<const T*>(Ii.ptr);
+
+    auto Xi = Xz2d.request();
+    if (Xi.ndim != 2 || (int)Xi.shape[0] != N)
+        throw std::runtime_error("Xz2d shape mismatch in phase2_accum_XtXz_bed");
+    T* Xptr = static_cast<T*>(Xi.ptr);
+
+    const int Q = (int)Xi.shape[1];
+    if (tile_nvecs <= 0 || (Q % tile_nvecs) != 0)
+        throw std::runtime_error("Xz2d col count must be a multiple of tile_nvecs");
+    const int B = Q / tile_nvecs;
+
+    auto Mi = meansq_accum.request();
+    if (Mi.ndim != 2 || (int)Mi.shape[1] != B)
+        throw std::runtime_error("meansq_accum shape mismatch in phase2_accum_XtXz_bed");
+    if (blk_end > (int)Mi.shape[0])
+        throw std::runtime_error("meansq_accum rows smaller than SNP count");
+    T* Mptr = static_cast<T*>(Mi.ptr);
+
+    double denom = (double)N_denom - 1.0;
+    if (denom <= 0.0) denom = 1.0;
+    const double inv_denom2 = 1.0 / (denom * denom);
+
+    std::vector<double> left_scale((size_t)L, 0.0);
+#ifdef _OPENMP
+    #pragma omp parallel for schedule(static)
+#endif
+    for (int i = 0; i < L; ++i) {
+        const double inv_i = (double)inv[(size_t)i];
+        if (std::isfinite(inv_i) && inv_i > 0.0) {
+            left_scale[(size_t)i] = inv_i * inv_i * inv_denom2;
         }
     }
-}
 
-template <typename T>
-static void fill_random_probes_same_as_phase1(int L,
-                                              int v_start,
-                                              int v_count,
-                                              const std::string& rand_dist,
-                                              uint64_t root_seed,
-                                              int block_start,
-                                              std::vector<T>& Z)
-{
-    std::mt19937_64 rng(make_seed(root_seed, /*block=*/block_start, /*v0=*/v_start));
-    std::normal_distribution<T> gN(0, (T)1);
-    const bool is_rademacher = (rand_dist == "rademacher");
-    const bool is_spherical  = (rand_dist == "spherical");
+    int QPANEL = 32768;
+    if (const char* s = std::getenv("SUMMIT_P2_QPANEL")) {
+        QPANEL = std::atoi(s);
+    }
+    if (QPANEL <= 0) QPANEL = Q;
+    QPANEL = std::min(QPANEL, Q);
+    QPANEL = round_down(QPANEL, 64);
+    if (QPANEL < 64) QPANEL = std::min(Q, 64);
 
-    Z.assign((size_t)L * (size_t)v_count, T(0));
-    for (int c = 0; c < v_count; ++c) {
-        long double ss = 0.0L;
-        for (int r = 0; r < L; ++r) {
-            T z = is_rademacher ? ((rng() & 1) ? T(+1) : T(-1)) : gN(rng);
-            Z[(size_t)r + (size_t)c * (size_t)L] = z;
-            if (is_spherical) ss += (long double)z * (long double)z;
-        }
-        if (is_spherical) {
-            T scale = ss > 0.0L ? (T)std::sqrt((long double)L / ss) : T(1);
-            for (int r = 0; r < L; ++r) {
-                Z[(size_t)r + (size_t)c * (size_t)L] *= scale;
+    static thread_local AlignedBuffer<T> Work_panel_tls;
+    const size_t needW = (size_t)L * (size_t)QPANEL;
+    if (Work_panel_tls.n < needW) Work_panel_tls.allocate(needW, 64);
+    T* Work = Work_panel_tls.ptr;
+
+    int IBLK = 2048;
+    if (const char* s = std::getenv("SUMMIT_P2_IBLK")) {
+        IBLK = std::atoi(s);
+    }
+    IBLK = clampi(IBLK, 512, 16384);
+    IBLK = round_up(IBLK, 512);
+
+    int REDUCE_THREADS = 1;
+    if (const char* s = std::getenv("SUMMIT_P2_REDUCE_THREADS")) {
+        REDUCE_THREADS = std::atoi(s);
+    }
+#ifdef _OPENMP
+    if (REDUCE_THREADS <= 0) REDUCE_THREADS = omp_get_max_threads();
+#else
+    if (REDUCE_THREADS <= 0) REDUCE_THREADS = 1;
+#endif
+
+    const int nslabs = ceil_div_i(L, IBLK);
+    REDUCE_THREADS = clampi(REDUCE_THREADS, 1, std::max(1, nslabs));
+
+    BlockTimers t;
+    py::gil_scoped_release nogil;
+
+    for (int q0 = 0; q0 < Q; q0 += QPANEL) {
+        check_for_interrupt();
+
+        const int q = std::min(QPANEL, Q - q0);
+        const T* rhs = Xptr + (size_t)q0 * (size_t)N;
+
+        auto t2 = std::chrono::high_resolution_clock::now();
+        gemm_col_major_tn<T>(L, q, N,
+                             Geno.data(), N,
+                             rhs,        N,
+                             Work,       L,
+                             T(1), T(0));
+        auto t3 = std::chrono::high_resolution_clock::now();
+        t.add_gemm(std::chrono::duration<double, std::milli>(t3 - t2).count());
+
+        std::vector<int> seg_k;
+        std::vector<int> seg_tcol0;
+        std::vector<int> seg_len;
+        seg_k.reserve((size_t)B + 1);
+        seg_tcol0.reserve((size_t)B + 1);
+        seg_len.reserve((size_t)B + 1);
+
+        {
+            int g = q0;
+            const int g_end = q0 + q;
+            while (g < g_end) {
+                const int k = g / tile_nvecs;
+                const int v_in = g - k * tile_nvecs;
+                const int len = std::min(g_end - g, tile_nvecs - v_in);
+                seg_k.push_back(k);
+                seg_tcol0.push_back(g - q0);
+                seg_len.push_back(len);
+                g += len;
             }
         }
+
+        auto t4 = std::chrono::high_resolution_clock::now();
+
+#ifdef _OPENMP
+        #pragma omp parallel for schedule(static) num_threads(REDUCE_THREADS)
+#endif
+        for (int i0 = 0; i0 < L; i0 += IBLK) {
+            const int ib = std::min(IBLK, L - i0);
+
+            static thread_local AlignedBuffer<double> acc_tls;
+            if (acc_tls.n < (size_t)IBLK) acc_tls.allocate((size_t)IBLK, 64);
+            double* acc = acc_tls.ptr;
+
+            for (std::size_t sidx = 0; sidx < seg_k.size(); ++sidx) {
+                const int k    = seg_k[sidx];
+                const int tcol = seg_tcol0[sidx];
+                const int len  = seg_len[sidx];
+
+                std::fill(acc, acc + ib, 0.0);
+
+                for (int c = 0; c < len; ++c) {
+                    const T* __restrict wcol =
+                        Work + (size_t)(tcol + c) * (size_t)L + (size_t)i0;
+#ifdef _OPENMP
+                    #pragma omp simd
+#endif
+                    for (int ii = 0; ii < ib; ++ii) {
+                        const double w = (double)wcol[ii];
+                        acc[ii] += w * w;
+                    }
+                }
+
+                T* __restrict out =
+                    Mptr + ((size_t)(blk_start + i0) * (size_t)B + (size_t)k);
+
+#ifdef _OPENMP
+                #pragma omp simd
+#endif
+                for (int ii = 0; ii < ib; ++ii) {
+                    double upd = acc[ii] * left_scale[(size_t)(i0 + ii)];
+
+                    if (!std::isfinite(upd)) continue;
+                    if constexpr (std::is_same_v<T, float>) {
+                        const double fmax = (double)std::numeric_limits<float>::max();
+                        if (upd > fmax) continue;
+                    }
+                    if (upd < 0.0) upd = 0.0;
+
+                    out[(size_t)ii * (size_t)B] += (T)upd;
+                }
+            }
+        }
+
+        auto t5 = std::chrono::high_resolution_clock::now();
+        t.add_reduce(std::chrono::duration<double, std::milli>(t5 - t4).count());
+    }
+
+    t.dump(blk_start, blk_end, B, tile_nvecs);
+}
+
+template <typename T>
+static void project_target_block_inplace(std::vector<T>& G, int N, int L,
+                                         const T* Cptr, const T* Rptr, int p,
+                                         AlignedBuffer<T>& tmp_buf) {
+    if (p <= 0) return;
+    if (tmp_buf.n < (size_t)p * (size_t)L) {
+        tmp_buf.allocate((size_t)p * (size_t)L, 64);
+    }
+    T* tmp = tmp_buf.ptr;
+
+    gemm_col_major_nn<T>(/*m=*/p, /*n=*/L, /*k=*/N,
+                         /*A=*/Rptr, /*lda=*/p,
+                         /*B=*/G.data(), /*ldb=*/N,
+                         /*C=*/tmp, /*ldc=*/p,
+                         /*alpha=*/T(1), /*beta=*/T(0));
+
+    gemm_col_major_nn<T>(/*m=*/N, /*n=*/L, /*k=*/p,
+                         /*A=*/Cptr, /*lda=*/N,
+                         /*B=*/tmp, /*ldb=*/p,
+                         /*C=*/G.data(), /*ldc=*/N,
+                         /*alpha=*/T(-1), /*beta=*/T(1));
+}
+
+template <typename T>
+static void compute_raw_sd_block_from_bed(
+    std::ifstream& fin,
+    int64_t N_total,
+    const std::vector<int>& row_byte,
+    const std::vector<unsigned char>& row_shift,
+    int blk_start,
+    int blk_end,
+    int ddof,
+    T* out_raw_sd,
+    std::vector<unsigned char>& io_buf
+) {
+    const int L = blk_end - blk_start;
+    if (L <= 0) return;
+
+    const int bytes_per_snp = (int)((N_total + 3) >> 2);
+    const size_t need = (size_t)L * (size_t)bytes_per_snp;
+    io_buf.resize(need);
+
+    fin.clear();
+    fin.seekg(std::streamoff(3) + std::streamoff(blk_start) * (std::streamoff)bytes_per_snp, std::ios::beg);
+    fin.read(reinterpret_cast<char*>(io_buf.data()), (std::streamsize)need);
+    if (!fin) {
+        throw std::runtime_error("Failed reading BED bytes for raw SD calculation");
+    }
+
+    const T qnan = std::numeric_limits<T>::quiet_NaN();
+
+    for (int j = 0; j < L; ++j) {
+        const unsigned char* snp = io_buf.data() + (size_t)j * (size_t)bytes_per_snp;
+
+        double sum = 0.0;
+        double sumsq = 0.0;
+        int cnt = 0;
+
+        for (size_t r = 0; r < row_byte.size(); ++r) {
+            const unsigned char code =
+                (unsigned char)((snp[(size_t)row_byte[r]] >> row_shift[r]) & 0x03u);
+
+            double x = 0.0;
+            switch (code) {
+                case 0u: x = 0.0; break; // homozygous major
+                case 2u: x = 1.0; break; // heterozygous
+                case 3u: x = 2.0; break; // homozygous minor
+                case 1u: default: continue; // missing
+            }
+
+            sum += x;
+            sumsq += x * x;
+            ++cnt;
+        }
+
+        if (cnt == 0 || cnt <= ddof) {
+            out_raw_sd[(size_t)j] = qnan;
+            continue;
+        }
+
+        double num = sumsq - (sum * sum) / (double)cnt;
+        if (num < 0.0 && num > -1e-12) num = 0.0;
+
+        if (num < 0.0 || !std::isfinite(num)) {
+            out_raw_sd[(size_t)j] = qnan;
+            continue;
+        }
+
+        out_raw_sd[(size_t)j] = (T)std::sqrt(num / (double)(cnt - ddof));
     }
 }
 
 template <typename T>
-void phase2_compute_local_hybrid_banded_bed_impl(
-    const std::string &bed_prefix,
-    const std::string &fam_path,
-    py::array_t<int32_t, py::array::c_style | py::array::forcecast> block_starts, // (nb,)
-    py::array_t<int32_t, py::array::c_style | py::array::forcecast> block_ends,   // (nb,)
+py::tuple precompute_residual_variances_bed_impl(
+    const std::string& bed_prefix,
+    const std::string& fam_path,
+    int nsnps,
+    int step_size,
     py::object row_sel_obj,
     int ddof,
-    py::array_t<T, py::array::c_style | py::array::forcecast> inv_all,             // (M,)
-    py::array_t<T, py::array::c_style | py::array::forcecast> annot_all,           // (M x B), row-major
-    py::array_t<int32_t, py::array::c_style | py::array::forcecast> chr_code_all,  // (M,)
-    py::array_t<int64_t, py::array::c_style | py::array::forcecast> bp_all,        // (M,)
-    int64_t window_bp,
-    int v_start,
-    int v_count,
-    const std::string &rand_dist,
-    py::object seed_obj,
-    py::array_t<T, py::array::c_style | py::array::forcecast> meansq_accum,        // (M x B), row-major
-    double rp_scale,
-    bool add_exact,
-    double exact_scale,
+    double eps,
+    bool compute_mu22,
+    py::object annot_all_obj,
     py::object C_opt,
-    py::object R_opt,
-    int N_denom)
+    py::object R_opt)
 {
     const std::string bed_path = bed_prefix + ".bed";
     const std::string bim_path = bed_prefix + ".bim";
@@ -837,515 +1375,333 @@ void phase2_compute_local_hybrid_banded_bed_impl(
     const int64_t N_total = count_lines_cached(fam_path);
     const int64_t M_total = count_lines_cached(bim_path);
 
-    // Parse Python buffers while GIL is held
-    auto BSi = block_starts.request();
-    auto BEi = block_ends.request();
-    if (BSi.ndim != 1 || BEi.ndim != 1 || BSi.shape[0] != BEi.shape[0]) {
-        throw std::runtime_error("block_starts / block_ends shape mismatch");
+    if (nsnps < 0 || nsnps > (int)M_total) {
+        throw std::runtime_error("nsnps is out of range in precompute_residual_variances_bed");
     }
-    const int nb = (int)BSi.shape[0];
-    const int32_t* blk_s = static_cast<const int32_t*>(BSi.ptr);
-    const int32_t* blk_e = static_cast<const int32_t*>(BEi.ptr);
-
-    auto Ii = inv_all.request();
-    auto Ai = annot_all.request();
-    auto Ci = chr_code_all.request();
-    auto Bi = bp_all.request();
-    auto Mi = meansq_accum.request();
-
-    if (Ii.ndim != 1 || (int64_t)Ii.shape[0] != M_total)
-        throw std::runtime_error("inv_all shape mismatch");
-    if (Ai.ndim != 2 || (int64_t)Ai.shape[0] != M_total)
-        throw std::runtime_error("annot_all shape mismatch");
-    if (Ci.ndim != 1 || (int64_t)Ci.shape[0] != M_total)
-        throw std::runtime_error("chr_code_all shape mismatch");
-    if (Bi.ndim != 1 || (int64_t)Bi.shape[0] != M_total)
-        throw std::runtime_error("bp_all shape mismatch");
-    if (Mi.ndim != 2 || (int64_t)Mi.shape[0] != M_total)
-        throw std::runtime_error("meansq_accum shape mismatch");
-
-    const T* invp = static_cast<const T*>(Ii.ptr);
-    const T* annp = static_cast<const T*>(Ai.ptr);
-    const int B = (int)Ai.shape[1];
-    const int32_t* chrp = static_cast<const int32_t*>(Ci.ptr);
-    const int64_t* bpp = static_cast<const int64_t*>(Bi.ptr);
-    T* Mptr = static_cast<T*>(Mi.ptr);
-
-    if ((int)Mi.shape[1] != B) {
-        throw std::runtime_error("meansq_accum second dimension must match annot_all second dimension");
+    if (step_size <= 0) {
+        throw std::runtime_error("step_size must be > 0 in precompute_residual_variances_bed");
     }
 
     const std::vector<int>& rows = parse_row_sel(row_sel_obj, N_total);
+    const int N_rows = (int)rows.size();
+    if (N_rows <= 1) {
+        throw std::runtime_error("Too few rows in precompute_residual_variances_bed");
+    }
 
-    // Optional projection matrices
     bool have_proj = (!C_opt.is_none() && !R_opt.is_none());
+    py::array_t<T, py::array::f_style | py::array::forcecast> Carr;
+    py::array_t<T, py::array::f_style | py::array::forcecast> Rarr;
     const T* Cptr = nullptr;
     const T* Rptr = nullptr;
     int p = 0;
+
     if (have_proj) {
-        py::array_t<T, py::array::f_style | py::array::forcecast> C =
-            C_opt.cast<py::array_t<T, py::array::f_style | py::array::forcecast>>();
-        py::array_t<T, py::array::f_style | py::array::forcecast> R =
-            R_opt.cast<py::array_t<T, py::array::f_style | py::array::forcecast>>();
-        auto Cinfo = C.request();
-        auto Rinfo = R.request();
+        Carr = C_opt.cast<py::array_t<T, py::array::f_style | py::array::forcecast>>();
+        Rarr = R_opt.cast<py::array_t<T, py::array::f_style | py::array::forcecast>>();
+        auto Cinfo = Carr.request();
+        auto Rinfo = Rarr.request();
+
         p = (int)Cinfo.shape[1];
-        if ((int)Cinfo.shape[0] != (int)rows.size() || (int)Rinfo.shape[0] != p || (int)Rinfo.shape[1] != (int)rows.size()) {
-            throw std::runtime_error("C/R shape mismatch in phase2_compute_local_hybrid_banded_bed");
+        if ((int)Cinfo.shape[0] != N_rows ||
+            (int)Rinfo.shape[0] != p ||
+            (int)Rinfo.shape[1] != N_rows) {
+            throw std::runtime_error("C/R shape mismatch in precompute_residual_variances_bed");
         }
+        if (N_rows - p <= 1) {
+            throw std::runtime_error("N_eff must be > 1 in precompute_residual_variances_bed");
+        }
+
         Cptr = static_cast<const T*>(Cinfo.ptr);
         Rptr = static_cast<const T*>(Rinfo.ptr);
     }
 
-    const uint64_t root_seed =
-        seed_obj.is_none() ? uint64_t(std::random_device{}()) : seed_obj.cast<uint64_t>();
-
-    // Per-block metadata
-    std::vector<int32_t> first_chr((size_t)nb), last_chr((size_t)nb);
-    std::vector<int64_t> start_bp((size_t)nb), end_bp((size_t)nb);
-    int maxL = 0;
-    for (int bi = 0; bi < nb; ++bi) {
-        const int s = blk_s[bi];
-        const int e = blk_e[bi];
-        if (s < 0 || e < s || e > M_total) {
-            throw std::runtime_error("Invalid block_starts / block_ends");
-        }
-        first_chr[(size_t)bi] = chrp[s];
-        last_chr[(size_t)bi]  = chrp[e - 1];
-        start_bp[(size_t)bi]  = bpp[s];
-        end_bp[(size_t)bi]    = bpp[e - 1];
-        maxL = std::max(maxL, e - s);
+    const double proj_df = have_proj ? (double)(N_rows - p - 1) : (double)(N_rows - 1);
+    if (proj_df <= 0.0) {
+        throw std::runtime_error("Projected residual df must be > 0 in precompute_residual_variances_bed");
     }
-    if (nb == 0 || maxL <= 0) return;
 
-    double denom = (double)N_denom - 1.0;
-    if (denom <= 0.0) denom = 1.0;
-    const double inv_denom2 = 1.0 / (denom * denom);
-    const double rp_pref = (v_count > 0) ? (rp_scale / (double)v_count) : 0.0;
+    py::array_t<T> inv_out(nsnps);
+    auto Iinfo = inv_out.request();
+    T* invp = static_cast<T*>(Iinfo.ptr);
 
-    // Scratch buffers
-    AlignedBuffer<T> CrossBuf((size_t)maxL * (size_t)maxL, 64);                       // (Li x Lj), col-major
-    AlignedBuffer<T> BcolBuf((size_t)maxL * (size_t)std::max(v_count, 1), 64);        // (Ls x V)
-    AlignedBuffer<T> YBuf((size_t)maxL * (size_t)std::max(v_count, 1), 64);           // (Lt x V)
-    AlignedBuffer<T> EtmpBuf((size_t)maxL * (size_t)B, 64);                           // (Lt x B)
-    AlignedBuffer<T> ProjTmpBuf(have_proj ? (size_t)p * (size_t)maxL : 0, 64);        // (p x L)
+    int B = 0;
+    py::array_t<T, py::array::c_style | py::array::forcecast> Aarr;
+    const T* annp = nullptr;
 
-    std::vector<int> row_lo((size_t)maxL, 0), row_hi((size_t)maxL, 0);
-    std::vector<double> ytmp((size_t)std::max(v_count, 1), 0.0);
+    AlignedBuffer<double> S_mat;
+    AlignedBuffer<double> X2_panel;
+    AlignedBuffer<double> W_panel;
+    AlignedBuffer<double> S_sum;
+    std::vector<double> Msum;
 
-    auto add_cell = [&](T* cell, double upd) {
-        if (!std::isfinite(upd)) return;
-        if constexpr (std::is_same_v<T, float>) {
-            const double fmax = (double)std::numeric_limits<float>::max();
-            if (std::fabs(upd) > fmax) return;
+    int JPANEL = 32;
+    if (const char* s = std::getenv("SUMMIT_RESVAR_MU22_JPANEL")) {
+        const int v = std::atoi(s);
+        if (v > 0) JPANEL = v;
+    }
+
+    if (compute_mu22) {
+        if (annot_all_obj.is_none()) {
+            throw std::runtime_error("annot_all must be provided when compute_mu22=True");
         }
-        *cell += (T)upd;
-    };
 
-    auto project_inplace = [&](std::vector<T>& G, int N, int L) {
-        if (!have_proj) return;
-        T* tmp = ProjTmpBuf.ptr;
-        gemm_col_major_nn<T>(/*m=*/p, /*n=*/L, /*k=*/N,
-                             /*A=*/Rptr, /*lda=*/p,
-                             /*B=*/G.data(), /*ldb=*/N,
-                             /*C=*/tmp, /*ldc=*/p,
-                             /*alpha=*/T(1), /*beta=*/T(0));
-        gemm_col_major_nn<T>(/*m=*/N, /*n=*/L, /*k=*/p,
-                             /*A=*/Cptr, /*lda=*/N,
-                             /*B=*/tmp, /*ldb=*/p,
-                             /*C=*/G.data(), /*ldc=*/N,
-                             /*alpha=*/T(-1), /*beta=*/T(1));
-    };
-
-    auto build_left_scale = [&](int s, int L, std::vector<double>& left_scale) {
-        left_scale.resize((size_t)L);
-        for (int i = 0; i < L; ++i) {
-            const double invl = (double)invp[(size_t)s + (size_t)i];
-            left_scale[(size_t)i] = (std::isfinite(invl) && invl > 0.0) ? (invl * invl * inv_denom2) : 0.0;
+        Aarr = annot_all_obj.cast<py::array_t<T, py::array::c_style | py::array::forcecast>>();
+        auto Ainfo = Aarr.request();
+        if (Ainfo.ndim != 2 || (int)Ainfo.shape[0] != nsnps) {
+            throw std::runtime_error("annot_all shape mismatch in precompute_residual_variances_bed");
         }
-    };
 
-    auto build_source_weights = [&](int s, int L,
-                                    std::vector<T>& S_rp,           // (L x B), col-major: inv * sqrt(a)
-                                    std::vector<T>* W_exact) -> bool // optional (L x B), col-major: inv^2 * a
+        annp = static_cast<const T*>(Ainfo.ptr);
+        B = (int)Ainfo.shape[1];
+        if (B <= 0) {
+            throw std::runtime_error("annot_all must have at least one column");
+        }
+
+        S_mat.allocate((size_t)N_rows * (size_t)B, 64);
+        std::fill(S_mat.ptr, S_mat.ptr + S_mat.n, 0.0);
+
+        JPANEL = std::max(1, std::min(JPANEL, std::max(1, step_size)));
+        X2_panel.allocate((size_t)N_rows * (size_t)JPANEL, 64);
+        W_panel.allocate((size_t)JPANEL * (size_t)B, 64);
+        S_sum.allocate((size_t)B * (size_t)B, 64);
+        Msum.assign((size_t)B, 0.0);
+    }
+
+    AlignedBuffer<T> proj_tmp(have_proj ? (size_t)p * (size_t)std::min(step_size, nsnps) : 0, 64);
+
     {
-        S_rp.assign((size_t)L * (size_t)B, T(0));
-        if (W_exact) W_exact->assign((size_t)L * (size_t)B, T(0));
-        bool any_nonzero = false;
+        py::gil_scoped_release nogil;
 
-        for (int k = 0; k < B; ++k) {
-            T* scol = S_rp.data() + (size_t)k * (size_t)L;
-            T* wcol = W_exact ? (W_exact->data() + (size_t)k * (size_t)L) : nullptr;
+        for (int s = 0; s < nsnps; s += step_size) {
+            check_for_interrupt();
 
+            const int e = std::min(nsnps, s + step_size);
+            const int L = e - s;
+            if (L <= 0) continue;
+
+            int N_blk = 0, L_blk = 0;
+            std::vector<T> Geno;
+            read_block_standardized<T>(bed_path, fam_path, s, e, rows, ddof, Geno, N_blk, L_blk);
+
+            if (N_blk != N_rows || L_blk != L) {
+                throw std::runtime_error("Unexpected block dimensions in precompute_residual_variances_bed");
+            }
+
+            if (have_proj) {
+                project_target_block_inplace<T>(Geno, N_blk, L_blk, Cptr, Rptr, p, proj_tmp);
+            }
+
+            std::vector<double> inv2_local((size_t)L, 0.0);
+
+#ifdef _OPENMP
+            #pragma omp parallel for schedule(static)
+#endif
             for (int j = 0; j < L; ++j) {
-                const double a = (double)annp[((size_t)(s + j) * (size_t)B) + (size_t)k];
-                const double invj = (double)invp[(size_t)(s + j)];
+                const T* col = Geno.data() + (size_t)j * (size_t)N_blk;
 
-                if (!(a > 0.0) || !std::isfinite(a) || !std::isfinite(invj) || invj <= 0.0) {
-                    scol[(size_t)j] = T(0);
-                    if (wcol) wcol[(size_t)j] = T(0);
-                    continue;
+                double ss = 0.0;
+                for (int i = 0; i < N_blk; ++i) {
+                    const double x = (double)col[(size_t)i];
+                    ss += x * x;
                 }
 
-                const double srp = invj * std::sqrt(a);
-                const double wex = invj * invj * a;
-
-                if (!std::isfinite(srp) || !std::isfinite(wex)) {
-                    scol[(size_t)j] = T(0);
-                    if (wcol) wcol[(size_t)j] = T(0);
-                    continue;
-                }
-
-                scol[(size_t)j] = (T)srp;
-                if (wcol) wcol[(size_t)j] = (T)wex;
-                if (srp != 0.0 || wex != 0.0) any_nonzero = true;
-            }
-        }
-        return any_nonzero;
-    };
-
-    struct Seg {
-        int32_t chr;
-        int lo;
-        int hi;
-    };
-
-    auto build_segments = [&](int s, int e, std::vector<Seg>& segs) {
-        segs.clear();
-        int off = 0;
-        while (s + off < e) {
-            const int32_t c = chrp[s + off];
-            int q = off + 1;
-            while (s + q < e && chrp[s + q] == c) ++q;
-            segs.push_back(Seg{c, off, q});
-            off = q;
-        }
-    };
-
-    auto build_ranges = [&](int tgt_start, int Lt,
-                            int src_start, int Ls,
-                            const std::vector<Seg>& src_segs) {
-        const int64_t* tgt_bp = bpp + tgt_start;
-        const int32_t* tgt_chr = chrp + tgt_start;
-        const int64_t* src_bp = bpp + src_start;
-
-        for (int ti = 0; ti < Lt; ++ti) {
-            const int32_t ct = tgt_chr[ti];
-            const int64_t left = tgt_bp[ti] - window_bp;
-            const int64_t right = tgt_bp[ti] + window_bp;
-
-            int lo = 0, hi = 0;
-            bool found = false;
-            for (const auto& seg : src_segs) {
-                if (seg.chr != ct) continue;
-                const int64_t* p0 = src_bp + seg.lo;
-                const int64_t* p1 = src_bp + seg.hi;
-                auto it_lo = std::lower_bound(p0, p1, left);
-                auto it_hi = std::upper_bound(p0, p1, right);
-                lo = (int)(it_lo - src_bp);
-                hi = (int)(it_hi - src_bp);
-                found = true;
-                break;
-            }
-            row_lo[(size_t)ti] = found ? lo : 0;
-            row_hi[(size_t)ti] = found ? hi : 0;
-        }
-    };
-
-    auto accum_full_from_cross = [&](const T* Cross,
-                                     int rows, int cols,
-                                     bool trans,                 // false: Cross, true: Cross^T
-                                     int target_start,
-                                     const std::vector<double>& left_scale_target,
-                                     const std::vector<T>& Ssrc_rp,
-                                     const std::vector<T>* Wsrc_exact,
-                                     const std::vector<T>& Zsrc)
-    {
-        const int target_len = trans ? cols : rows;
-        const int source_len = trans ? rows : cols;
-        const int lda = rows;
-
-        // Local RP: target <- source
-        if (v_count > 0 && rp_scale != 0.0) {
-            for (int k = 0; k < B; ++k) {
-                const T* scol = Ssrc_rp.data() + (size_t)k * (size_t)source_len;
-                bool any = false;
-
-                for (int c = 0; c < v_count; ++c) {
-                    const T* zc = Zsrc.data() + (size_t)c * (size_t)source_len;
-                    T* dst = BcolBuf.ptr + (size_t)c * (size_t)source_len;
-                    for (int j = 0; j < source_len; ++j) {
-                        const T val = zc[(size_t)j] * scol[(size_t)j];
-                        dst[(size_t)j] = val;
-                        any = any || (val != T(0));
-                    }
-                }
-                if (!any) continue;
-
-                if (!trans) {
-                    gemm_col_major_nn<T>(/*m=*/target_len, /*n=*/v_count, /*k=*/source_len,
-                                         /*A=*/Cross, /*lda=*/lda,
-                                         /*B=*/BcolBuf.ptr, /*ldb=*/source_len,
-                                         /*C=*/YBuf.ptr, /*ldc=*/target_len,
-                                         /*alpha=*/T(1), /*beta=*/T(0));
+                const double var = ss / proj_df;
+                double safe = 0.0;
+                if (std::isnan(var)) {
+                    safe = std::numeric_limits<double>::quiet_NaN();
                 } else {
-                    gemm_col_major_tn<T>(/*m=*/target_len, /*n=*/v_count, /*k=*/source_len,
-                                         /*A=*/Cross, /*lda=*/lda,
-                                         /*B=*/BcolBuf.ptr, /*ldb=*/source_len,
-                                         /*C=*/YBuf.ptr, /*ldc=*/target_len,
-                                         /*alpha=*/T(1), /*beta=*/T(0));
+                    safe = (var > eps ? var : eps);
                 }
 
-                for (int i = 0; i < target_len; ++i) {
-                    double acc = 0.0;
-                    for (int c = 0; c < v_count; ++c) {
-                        const double v = (double)YBuf.ptr[(size_t)i + (size_t)c * (size_t)target_len];
-                        acc += v * v;
+                const double invj = 1.0 / std::sqrt(safe);
+                invp[(size_t)(s + j)] = (T)invj;
+                inv2_local[(size_t)j] = invj * invj;
+            }
+
+            if (compute_mu22) {
+                const T* ann_blk = annp + (size_t)s * (size_t)B;
+
+                for (int j = 0; j < L; ++j) {
+                    const T* arow = ann_blk + (size_t)j * (size_t)B;
+                    for (int k = 0; k < B; ++k) {
+                        Msum[(size_t)k] += (double)arow[(size_t)k];
                     }
-                    const double upd = rp_pref * acc * left_scale_target[(size_t)i];
-                    add_cell(Mptr + ((size_t)(target_start + i) * (size_t)B + (size_t)k), upd);
                 }
-            }
-        }
 
-        // Exact local: target <- source
-        if (add_exact && Wsrc_exact) {
-            // square Cross in place on the used part
-            for (int j = 0; j < cols; ++j) {
-                T* col = const_cast<T*>(Cross) + (size_t)j * (size_t)rows;
-                for (int i = 0; i < rows; ++i) {
-                    const T x = col[(size_t)i];
-                    col[(size_t)i] = x * x;
-                }
-            }
+                for (int j0 = 0; j0 < L; j0 += JPANEL) {
+                    const int jb = std::min(JPANEL, L - j0);
 
-            if (!trans) {
-                gemm_col_major_nn<T>(/*m=*/target_len, /*n=*/B, /*k=*/source_len,
-                                     /*A=*/Cross, /*lda=*/lda,
-                                     /*B=*/Wsrc_exact->data(), /*ldb=*/source_len,
-                                     /*C=*/EtmpBuf.ptr, /*ldc=*/target_len,
-                                     /*alpha=*/T(1), /*beta=*/T(0));
-            } else {
-                gemm_col_major_tn<T>(/*m=*/target_len, /*n=*/B, /*k=*/source_len,
-                                     /*A=*/Cross, /*lda=*/lda,
-                                     /*B=*/Wsrc_exact->data(), /*ldb=*/source_len,
-                                     /*C=*/EtmpBuf.ptr, /*ldc=*/target_len,
-                                     /*alpha=*/T(1), /*beta=*/T(0));
-            }
+                    for (int jj = 0; jj < jb; ++jj) {
+                        const int j = j0 + jj;
+                        const T* gcol = Geno.data() + (size_t)j * (size_t)N_blk;
+                        double* xcol = X2_panel.ptr + (size_t)jj * (size_t)N_blk;
 
-            for (int i = 0; i < target_len; ++i) {
-                for (int k = 0; k < B; ++k) {
-                    const double acc = (double)EtmpBuf.ptr[(size_t)i + (size_t)k * (size_t)target_len];
-                    const double upd = exact_scale * acc * left_scale_target[(size_t)i];
-                    add_cell(Mptr + ((size_t)(target_start + i) * (size_t)B + (size_t)k), upd);
-                }
-            }
-        }
-    };
-
-    auto accum_partial_from_cross = [&](const T* Cross,
-                                        int rows, int cols,
-                                        bool trans,                  // false: Cross, true: Cross^T
-                                        int target_start,
-                                        const std::vector<double>& left_scale_target,
-                                        const std::vector<T>& Ssrc_rp,
-                                        const std::vector<T>* Wsrc_exact,
-                                        const std::vector<T>& Zsrc,
-                                        int target_len,
-                                        int source_len)
-    {
-        auto getc = [&](int ti, int sj) -> double {
-            return trans
-                ? (double)Cross[(size_t)sj + (size_t)ti * (size_t)rows]
-                : (double)Cross[(size_t)ti + (size_t)sj * (size_t)rows];
-        };
-
-        for (int ti = 0; ti < target_len; ++ti) {
-            const int lo = row_lo[(size_t)ti];
-            const int hi = row_hi[(size_t)ti];
-            if (lo >= hi) continue;
-
-            T* outrow = Mptr + ((size_t)(target_start + ti) * (size_t)B);
-
-            if (v_count > 0 && rp_scale != 0.0) {
-                for (int k = 0; k < B; ++k) {
-                    const T* scol = Ssrc_rp.data() + (size_t)k * (size_t)source_len;
-                    std::fill(ytmp.begin(), ytmp.begin() + v_count, 0.0);
-
-                    for (int sj = lo; sj < hi; ++sj) {
-                        const double c = getc(ti, sj);
-                        const double alpha = c * (double)scol[(size_t)sj];
-                        if (!std::isfinite(alpha) || alpha == 0.0) continue;
-
-                        const T* zrow = Zsrc.data() + (size_t)sj;
-                        for (int vv = 0; vv < v_count; ++vv) {
-                            ytmp[(size_t)vv] += alpha * (double)zrow[(size_t)vv * (size_t)source_len];
+                        for (int i = 0; i < N_blk; ++i) {
+                            const double y = (double)gcol[(size_t)i];
+                            xcol[(size_t)i] = y * y;
                         }
                     }
 
-                    double acc = 0.0;
-                    for (int vv = 0; vv < v_count; ++vv) {
-                        acc += ytmp[(size_t)vv] * ytmp[(size_t)vv];
+                    for (int k = 0; k < B; ++k) {
+                        double* wcol = W_panel.ptr + (size_t)k * (size_t)jb;
+                        for (int jj = 0; jj < jb; ++jj) {
+                            const int j = j0 + jj;
+                            const double a = (double)ann_blk[(size_t)j * (size_t)B + (size_t)k];
+                            wcol[(size_t)jj] = a * inv2_local[(size_t)j];
+                        }
                     }
-                    const double upd = rp_pref * acc * left_scale_target[(size_t)ti];
-                    add_cell(outrow + (size_t)k, upd);
-                }
-            }
 
-            if (add_exact && Wsrc_exact) {
-                for (int k = 0; k < B; ++k) {
-                    const T* wcol = Wsrc_exact->data() + (size_t)k * (size_t)source_len;
-                    double acc = 0.0;
-                    for (int sj = lo; sj < hi; ++sj) {
-                        const double c = getc(ti, sj);
-                        acc += c * c * (double)wcol[(size_t)sj];
-                    }
-                    const double upd = exact_scale * acc * left_scale_target[(size_t)ti];
-                    add_cell(outrow + (size_t)k, upd);
+                    gemm_col_major_nn<double>(
+                        /*m=*/N_blk, /*n=*/B, /*k=*/jb,
+                        /*A=*/X2_panel.ptr, /*lda=*/N_blk,
+                        /*B=*/W_panel.ptr,  /*ldb=*/jb,
+                        /*C=*/S_mat.ptr,    /*ldc=*/N_blk,
+                        /*alpha=*/1.0, /*beta=*/1.0
+                    );
                 }
             }
         }
-    };
 
-    py::gil_scoped_release nogil;
-
-    std::vector<Seg> segs_i, segs_j;
-    std::vector<double> left_i, left_j;
-    std::vector<T> Si_rp, Wi_ex;
-    std::vector<T> Sj_rp, Wj_ex;
-    std::vector<T> Zi, Zj;
-
-    for (int bi = 0; bi < nb; ++bi) {
-        check_for_interrupt();
-
-        const int si = blk_s[bi];
-        const int ei = blk_e[bi];
-        const int Li = ei - si;
-        if (Li <= 0) continue;
-
-        // Candidate scheduling
-        const int32_t ci_first = first_chr[(size_t)bi];
-        const int32_t ci_last  = last_chr[(size_t)bi];
-        const int64_t i_end_bp_last = end_bp[(size_t)bi];
-
-        int N = 0, Ltmp = 0;
-        std::vector<T> Xi_raw;
-        read_block_standardized<T>(bed_path, fam_path, si, ei, rows, ddof, Xi_raw, N, Ltmp);
-        if (Ltmp != Li) throw std::runtime_error("Unexpected Li mismatch");
-        std::vector<T> Xi_proj = Xi_raw;
-        project_inplace(Xi_proj, N, Li);
-
-        build_left_scale(si, Li, left_i);
-        build_source_weights(si, Li, Si_rp, add_exact ? &Wi_ex : nullptr);
-        if (v_count > 0) {
-            fill_random_probes_same_as_phase1<T>(Li, v_start, v_count, rand_dist, root_seed, si, Zi);
+        if (compute_mu22) {
+            gemm_col_major_tn<double>(
+                /*m=*/B, /*n=*/B, /*k=*/N_rows,
+                /*A=*/S_mat.ptr, /*lda=*/N_rows,
+                /*B=*/S_mat.ptr, /*ldb=*/N_rows,
+                /*C=*/S_sum.ptr, /*ldc=*/B,
+                /*alpha=*/1.0, /*beta=*/0.0
+            );
         }
-        build_segments(si, ei, segs_i);
+    }
 
-        for (int bj = bi; bj < nb; ++bj) {
-            const int sj = blk_s[bj];
-            const int ej = blk_e[bj];
-            const int Lj = ej - sj;
-            if (Lj <= 0) continue;
+    if (!compute_mu22) {
+        return py::make_tuple(inv_out, py::none());
+    }
 
-            const int32_t cj_first = first_chr[(size_t)bj];
-            if (cj_first > ci_last) break;
-            if (cj_first == ci_last && start_bp[(size_t)bj] > i_end_bp_last + window_bp) break;
-            if (ci_first == ci_last && cj_first != ci_first) break;
+    py::array_t<double> mu22_out({B, B});
+    auto Mout = mu22_out.request();
+    double* out = static_cast<double*>(Mout.ptr);
 
-            const bool same_block = (bi == bj);
-
-            std::vector<T> Xj_raw;
-            if (same_block) {
-                Xj_raw = Xi_raw;
-            } else {
-                int Nj = 0, Lj2 = 0;
-                read_block_standardized<T>(bed_path, fam_path, sj, ej, rows, ddof, Xj_raw, Nj, Lj2);
-                if (Nj != N || Lj2 != Lj) throw std::runtime_error("Unexpected Xj dimensions");
+    for (int a = 0; a < B; ++a) {
+        for (int b = 0; b < B; ++b) {
+            const double denom = (double)N_rows * Msum[(size_t)a] * Msum[(size_t)b];
+            double v = 0.0;
+            if (denom != 0.0) {
+                v = S_sum.ptr[(size_t)a + (size_t)b * (size_t)B] / denom;
+                if (!std::isfinite(v)) v = 0.0;
             }
+            out[(size_t)a * (size_t)B + (size_t)b] = v;
+        }
+    }
 
-            build_segments(sj, ej, segs_j);
+    return py::make_tuple(inv_out, mu22_out);
+}
 
-            build_left_scale(sj, Lj, left_j);
-            build_source_weights(sj, Lj, Sj_rp, add_exact ? &Wj_ex : nullptr);
-            if (v_count > 0) {
-                fill_random_probes_same_as_phase1<T>(Lj, v_start, v_count, rand_dist, root_seed, sj, Zj);
-            }
 
-            T* Cross = CrossBuf.ptr;
-            gemm_col_major_tn<T>(/*m=*/Li, /*n=*/Lj, /*k=*/N,
-                                 /*A=*/Xi_proj.data(), /*lda=*/N,
-                                 /*B=*/Xj_raw.data(), /*ldb=*/N,
-                                 /*C=*/Cross, /*ldc=*/Li,
-                                 /*alpha=*/T(1), /*beta=*/T(0));
+template <typename Tann>
+py::tuple compute_block_corrections_binary_impl(
+    py::array_t<double, py::array::c_style | py::array::forcecast> meansq_raw,
+    py::array_t<double, py::array::c_style | py::array::forcecast> mu22,
+    py::array_t<Tann,   py::array::c_style | py::array::forcecast> annot_all,
+    int N,
+    double d)
+{
+    auto Minfo = meansq_raw.request();
+    auto Uinfo = mu22.request();
+    auto Ainfo = annot_all.request();
 
-            const bool i_single = (first_chr[(size_t)bi] == last_chr[(size_t)bi]);
-            const bool j_single = (first_chr[(size_t)bj] == last_chr[(size_t)bj]);
-            const bool same_single_chr = i_single && j_single && (first_chr[(size_t)bi] == first_chr[(size_t)bj]);
-            const bool full_pair = same_single_chr && ((end_bp[(size_t)bj] - start_bp[(size_t)bi]) <= window_bp);
+    if (Minfo.ndim != 2) {
+        throw std::runtime_error("meansq_raw must be 2D in compute_block_corrections_binary");
+    }
+    if (Uinfo.ndim != 2) {
+        throw std::runtime_error("mu22 must be 2D in compute_block_corrections_binary");
+    }
+    if (Ainfo.ndim != 2) {
+        throw std::runtime_error("annot_all must be 2D in compute_block_corrections_binary");
+    }
 
-            if (full_pair) {
-                // Forward: i <- j
-                accum_full_from_cross(Cross, Li, Lj, /*trans=*/false,
-                                      /*target_start=*/si,
-                                      left_i,
-                                      Sj_rp,
-                                      add_exact ? &Wj_ex : nullptr,
-                                      Zj);
+    const int M = (int)Minfo.shape[0];
+    const int B = (int)Minfo.shape[1];
 
-                // Reverse: j <- i (skip if diagonal)
-                if (!same_block) {
-                    // Need original Cross values for reverse RP, so recompute Cross if exact was already applied.
-                    // We only square Cross in place inside accum_full_from_cross when add_exact is true.
-                    if (add_exact) {
-                        gemm_col_major_tn<T>(/*m=*/Li, /*n=*/Lj, /*k=*/N,
-                                             /*A=*/Xi_proj.data(), /*lda=*/N,
-                                             /*B=*/Xj_raw.data(), /*ldb=*/N,
-                                             /*C=*/Cross, /*ldc=*/Li,
-                                             /*alpha=*/T(1), /*beta=*/T(0));
-                    }
+    if ((int)Uinfo.shape[0] != B || (int)Uinfo.shape[1] != B) {
+        throw std::runtime_error("mu22 shape mismatch in compute_block_corrections_binary");
+    }
+    if ((int)Ainfo.shape[0] != M || (int)Ainfo.shape[1] != B) {
+        throw std::runtime_error("annot_all shape mismatch in compute_block_corrections_binary");
+    }
+    if (N <= 1) {
+        throw std::runtime_error("N must be > 1 in compute_block_corrections_binary");
+    }
 
-                    accum_full_from_cross(Cross, Li, Lj, /*trans=*/true,
-                                          /*target_start=*/sj,
-                                          left_j,
-                                          Si_rp,
-                                          add_exact ? &Wi_ex : nullptr,
-                                          Zi);
-                }
-            } else {
-                // Partial / edge / boundary case: build exact row-specific local ranges by CHR/BP
-                // Forward: i <- j
-                build_ranges(/*tgt_start=*/si, /*Lt=*/Li,
-                             /*src_start=*/sj, /*Ls=*/Lj,
-                             segs_j);
+    const double* mptr = static_cast<const double*>(Minfo.ptr);
+    const double* uptr = static_cast<const double*>(Uinfo.ptr);
+    const Tann* aptr   = static_cast<const Tann*>(Ainfo.ptr);
 
-                accum_partial_from_cross(Cross, Li, Lj, /*trans=*/false,
-                                         /*target_start=*/si,
-                                         left_i,
-                                         Sj_rp,
-                                         add_exact ? &Wj_ex : nullptr,
-                                         Zj,
-                                         /*target_len=*/Li,
-                                         /*source_len=*/Lj);
+    std::vector<double> M_a((size_t)B, 0.0);
+    std::vector<double> S((size_t)B * (size_t)B, 0.0);
 
-                // Reverse: j <- i (skip if diagonal)
-                if (!same_block) {
-                    build_ranges(/*tgt_start=*/sj, /*Lt=*/Lj,
-                                 /*src_start=*/si, /*Ls=*/Li,
-                                 segs_i);
+    for (int i = 0; i < M; ++i) {
+        const Tann* arow = aptr + (size_t)i * (size_t)B;
+        const double* mrow = mptr + (size_t)i * (size_t)B;
 
-                    accum_partial_from_cross(Cross, Li, Lj, /*trans=*/true,
-                                             /*target_start=*/sj,
-                                             left_j,
-                                             Si_rp,
-                                             add_exact ? &Wi_ex : nullptr,
-                                             Zi,
-                                             /*target_len=*/Lj,
-                                             /*source_len=*/Li);
-                }
+        for (int a = 0; a < B; ++a) {
+            if (arow[(size_t)a] == (Tann)0) continue;
+
+            M_a[(size_t)a] += 1.0;
+            double* Srow = S.data() + (size_t)a * (size_t)B;
+            for (int b = 0; b < B; ++b) {
+                Srow[(size_t)b] += mrow[(size_t)b];
             }
         }
     }
+
+    py::array_t<double> R2_out({B, B});
+    py::array_t<double> rho2_out({B, B});
+    py::array_t<double> bias_out({B, B});
+    py::array_t<double> delta_out({B, B});
+
+    auto R2i = R2_out.request();
+    auto Ri  = rho2_out.request();
+    auto Bi  = bias_out.request();
+    auto Di  = delta_out.request();
+
+    double* R2p = static_cast<double*>(R2i.ptr);
+    double* Rp  = static_cast<double*>(Ri.ptr);
+    double* Bp  = static_cast<double*>(Bi.ptr);
+    double* Dp  = static_cast<double*>(Di.ptr);
+
+    std::fill(R2p, R2p + (size_t)B * (size_t)B, 0.0);
+    std::fill(Rp,  Rp  + (size_t)B * (size_t)B, 0.0);
+    std::fill(Bp,  Bp  + (size_t)B * (size_t)B, 0.0);
+    std::fill(Dp,  Dp  + (size_t)B * (size_t)B, 0.0);
+
+    const double Nf = (double)N;
+    const double denom_rho = Nf * (Nf - 1.0);
+
+    for (int a = 0; a < B; ++a) {
+        const double Ma = M_a[(size_t)a];
+        if (Ma <= 0.0) continue;
+
+        for (int b = 0; b < B; ++b) {
+            const double Mb = M_a[(size_t)b];
+            if (Mb <= 0.0) continue;
+
+            const double S_ab = S[(size_t)a * (size_t)B + (size_t)b];
+            if (S_ab == 0.0) continue;
+
+            const double R2_ab = S_ab / (Ma * Mb);
+            const double mu_ab = uptr[(size_t)a * (size_t)B + (size_t)b];
+            const double rho2_ab = (d * d * R2_ab - Nf * mu_ab) / denom_rho;
+            const double bias_ab = S_ab - (Ma * Mb * rho2_ab);
+            const double delta_ab = mu_ab - (1.0 + 2.0 * rho2_ab);
+
+            R2p[(size_t)a * (size_t)B + (size_t)b] = R2_ab;
+            Rp [(size_t)a * (size_t)B + (size_t)b] = rho2_ab;
+            Bp [(size_t)a * (size_t)B + (size_t)b] = bias_ab;
+            Dp [(size_t)a * (size_t)B + (size_t)b] = delta_ab;
+        }
+    }
+
+    return py::make_tuple(R2_out, rho2_out, bias_out, delta_out);
 }
 
 void set_num_threads(int n) {
@@ -1447,54 +1803,112 @@ PYBIND11_MODULE(gwldcore, m) {
           py::arg("R") = py::none(),
           py::arg("N_denom") = 0);
 
-    m.def("phase2_compute_local_hybrid_banded_bed",
-          &phase2_compute_local_hybrid_banded_bed_impl<float>,
+    m.def("clear_phase1_csr_cache",
+          &clear_phase1_csr_cache,
+          "Clear the thread-local phase1 CSR cache.");
+
+    m.def("precompute_residual_variances_bed",
+        &precompute_residual_variances_bed_impl<float>,
+        py::arg("bed_prefix"),
+        py::arg("fam_path"),
+        py::arg("nsnps"),
+        py::arg("step_size"),
+        py::arg("row_sel") = py::none(),
+        py::arg("ddof") = 1,
+        py::arg("eps") = 1e-10,
+        py::arg("compute_mu22") = false,
+        py::arg("annot_all") = py::none(),
+        py::arg("C") = py::none(),
+        py::arg("R") = py::none());
+
+    m.def("precompute_residual_variances_bed",
+        &precompute_residual_variances_bed_impl<double>,
+        py::arg("bed_prefix"),
+        py::arg("fam_path"),
+        py::arg("nsnps"),
+        py::arg("step_size"),
+        py::arg("row_sel") = py::none(),
+        py::arg("ddof") = 1,
+        py::arg("eps") = 1e-10,
+        py::arg("compute_mu22") = false,
+        py::arg("annot_all") = py::none(),
+        py::arg("C") = py::none(),
+        py::arg("R") = py::none());
+
+    m.def("phase2_accum_XtXz_bed",
+          &phase2_accum_XtXz_bed_impl<float>,
           py::arg("bed_prefix"),
           py::arg("fam_path"),
-          py::arg("block_starts"),
-          py::arg("block_ends"),
+          py::arg("blk_start"),
+          py::arg("blk_end"),
           py::arg("row_sel") = py::none(),
           py::arg("ddof") = 1,
-          py::arg("inv_all"),
-          py::arg("annot_all"),
-          py::arg("chr_code_all"),
-          py::arg("bp_all"),
-          py::arg("window_bp"),
-          py::arg("v_start"),
-          py::arg("v_count"),
-          py::arg("rand_dist") = "rademacher",
-          py::arg("seed") = py::none(),
+          py::arg("inv_left"),
+          py::arg("tile_nvecs"),
+          py::arg("Xz2d"),
           py::arg("meansq_accum"),
-          py::arg("rp_scale"),
-          py::arg("add_exact"),
-          py::arg("exact_scale"),
           py::arg("C") = py::none(),
           py::arg("R") = py::none(),
           py::arg("N_denom") = 0);
 
-    m.def("phase2_compute_local_hybrid_banded_bed",
-          &phase2_compute_local_hybrid_banded_bed_impl<double>,
+    m.def("phase2_accum_XtXz_bed",
+          &phase2_accum_XtXz_bed_impl<double>,
           py::arg("bed_prefix"),
           py::arg("fam_path"),
-          py::arg("block_starts"),
-          py::arg("block_ends"),
+          py::arg("blk_start"),
+          py::arg("blk_end"),
           py::arg("row_sel") = py::none(),
           py::arg("ddof") = 1,
-          py::arg("inv_all"),
-          py::arg("annot_all"),
-          py::arg("chr_code_all"),
-          py::arg("bp_all"),
-          py::arg("window_bp"),
-          py::arg("v_start"),
-          py::arg("v_count"),
-          py::arg("rand_dist") = "rademacher",
-          py::arg("seed") = py::none(),
+          py::arg("inv_left"),
+          py::arg("tile_nvecs"),
+          py::arg("Xz2d"),
           py::arg("meansq_accum"),
-          py::arg("rp_scale"),
-          py::arg("add_exact"),
-          py::arg("exact_scale"),
           py::arg("C") = py::none(),
           py::arg("R") = py::none(),
           py::arg("N_denom") = 0);
+
+    m.def("compute_block_corrections_binary",
+        &compute_block_corrections_binary_impl<float>,
+        py::arg("meansq_raw"),
+        py::arg("mu22"),
+        py::arg("annot_all"),
+        py::arg("N"),
+        py::arg("d"));
+
+    m.def("compute_block_corrections_binary",
+        &compute_block_corrections_binary_impl<double>,
+        py::arg("meansq_raw"),
+        py::arg("mu22"),
+        py::arg("annot_all"),
+        py::arg("N"),
+        py::arg("d"));
+
+    m.def("apply_grm_bed_panel",
+          &apply_grm_bed_panel_impl<float>,
+          py::arg("bed_prefix"),
+          py::arg("fam_path"),
+          py::arg("nsnps"),
+          py::arg("step_size"),
+          py::arg("row_sel") = py::none(),
+          py::arg("ddof") = 1,
+          py::arg("inv_all"),
+          py::arg("panel_in"),
+          py::arg("panel_out"),
+          py::arg("C") = py::none(),
+          py::arg("R") = py::none());
+
+    m.def("apply_grm_bed_panel",
+          &apply_grm_bed_panel_impl<double>,
+          py::arg("bed_prefix"),
+          py::arg("fam_path"),
+          py::arg("nsnps"),
+          py::arg("step_size"),
+          py::arg("row_sel") = py::none(),
+          py::arg("ddof") = 1,
+          py::arg("inv_all"),
+          py::arg("panel_in"),
+          py::arg("panel_out"),
+          py::arg("C") = py::none(),
+          py::arg("R") = py::none());
 
 }
