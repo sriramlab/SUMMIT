@@ -3,8 +3,10 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import numpy as np
+import json
 
 import utils
+from moments import build_h2_summary_moment
 
 
 @dataclass(frozen=True)
@@ -15,21 +17,23 @@ class H2Prepared:
     active_mask: np.ndarray
     has_overlap: bool
     unit_sizes: np.ndarray
-    m_unit: np.ndarray                 # (U,)
-    Ak_unit: np.ndarray                # (U,K)
-    Az2_unit: np.ndarray               # (U,K)
-    Ak2_unit: np.ndarray               # (U,K)
-    AA_unit: np.ndarray                # (U,K,K)
-    AL_unit: np.ndarray                # (U,K,K)
-    M_rep: np.ndarray                  # (R+1,)
-    Ak_rep: np.ndarray                 # (R+1,K)
-    Az2_rep: np.ndarray                # (R+1,K)
-    Ak2_rep: np.ndarray                # (R+1,K)
-    AA_rep: np.ndarray                 # (R+1,K,K)
-    AL_rep: np.ndarray                 # (R+1,K,K)
-    lhs: np.ndarray                    # (R+1,K+1,K+1)
-    rhs: np.ndarray                    # (R+1,K+1)
-
+    n_scale: float
+    summary_y_info: dict | None
+    y: np.ndarray                  # (M,)
+    m_unit: np.ndarray             # (U,)
+    Ak_unit: np.ndarray            # (U,K)
+    Ay_unit: np.ndarray            # (U,K)
+    Ak2_unit: np.ndarray           # (U,K)
+    AA_unit: np.ndarray            # (U,K,K)
+    AL_unit: np.ndarray            # (U,K,K)
+    M_rep: np.ndarray              # (R+1,)
+    Ak_rep: np.ndarray             # (R+1,K)
+    Ay_rep: np.ndarray             # (R+1,K)
+    Ak2_rep: np.ndarray            # (R+1,K)
+    AA_rep: np.ndarray             # (R+1,K,K)
+    AL_rep: np.ndarray             # (R+1,K,K)
+    lhs: np.ndarray                # (R+1,K+1,K+1)
+    rhs: np.ndarray                # (R+1,K+1)
 
 @dataclass(frozen=True)
 class H2Fit:
@@ -66,6 +70,118 @@ class H2ResultWriter:
                 rep_label = "full" if r == R else str(r)
                 vals = np.concatenate([fit.sigma_reps[r], fit.h2_reps[r]])
                 fd.write(rep_label + "\t" + "\t".join(f"{x:.10g}" for x in vals) + "\n")
+
+    @staticmethod
+    def _jsonify_numeric(x):
+        arr = np.asarray(x, dtype=np.float64)
+        if arr.ndim == 0:
+            v = float(arr)
+            return v if np.isfinite(v) else None
+        return [H2ResultWriter._jsonify_numeric(v) for v in arr]
+
+    @staticmethod
+    def build_score_normal_equations_payload(
+        fit: H2Fit,
+        *,
+        system: str | None = None,
+    ) -> dict:
+        p = fit.prepared
+        K = int(p.trace_view.nbins)
+        R = int(p.jackknife.nrep)
+
+        T = np.asarray(p.lhs, dtype=np.float64)
+        q = np.asarray(p.rhs, dtype=np.float64)
+        sigma = np.asarray(fit.sigma_reps[:, : K + 1], dtype=np.float64)
+
+        if T.shape != (R + 1, K + 1, K + 1):
+            raise ValueError(f"Unexpected lhs shape: {T.shape}, expected {(R + 1, K + 1, K + 1)}")
+        if q.shape != (R + 1, K + 1):
+            raise ValueError(f"Unexpected rhs shape: {q.shape}, expected {(R + 1, K + 1)}")
+        if sigma.shape != (R + 1, K + 1):
+            raise ValueError(f"Unexpected sigma shape: {sigma.shape}, expected {(R + 1, K + 1)}")
+
+        headers = getattr(p.trace_view, "annot_header", None)
+        if headers is None or len(headers) != K:
+            headers = [f"bin_{k}" for k in range(K)]
+        else:
+            headers = [str(h) for h in headers]
+
+        matched = p.matched
+        info = p.summary_y_info if isinstance(p.summary_y_info, dict) else {}
+
+        system_name = system
+        if system_name is None:
+            system_name = getattr(matched, "name", None)
+        if system_name is None or str(system_name).strip() == "":
+            system_name = "trait"
+        system_name = str(system_name)
+
+        meta = {
+            "equation_type": "score_full",
+            "kernel_name": "h2g",
+            "multi_component": bool(K > 1),
+            "partial_overlap": False,
+            "n_summary_raw": float(matched.nsamp),
+            "n_scale": float(p.n_scale),
+            "nrep": R,
+            "n_trace_snps": int(p.trace_view.nsnps),
+            "n_active_snps": int(np.sum(p.active_mask)),
+            "has_overlapping_annotations": bool(p.has_overlap),
+            "annot_headers": headers,
+        }
+
+        if "mode" in info:
+            meta["summary_y_mode"] = str(info.get("mode"))
+        if "n_nonfinite" in info:
+            try:
+                meta["n_nonfinite_summary_y"] = int(info.get("n_nonfinite"))
+            except Exception:
+                pass
+
+        cov_rank = getattr(matched, "cov_rank", None)
+        if cov_rank is not None:
+            try:
+                meta["cov_rank"] = int(cov_rank)
+            except Exception:
+                pass
+
+        cov_rank_source = getattr(matched, "cov_rank_source", None)
+        if cov_rank_source is not None:
+            meta["cov_rank_source"] = str(cov_rank_source)
+
+        payload = {
+            "system": system_name,
+            "meta": meta,
+            "sigma_names": [f"sigma_g_{k}" for k in range(K)] + ["sigma_e"],
+            "moment_names": [f"score_row_{k}" for k in range(K)] + ["variance_row"],
+            "full": {
+                "replicate": "full",
+                "T": H2ResultWriter._jsonify_numeric(T[R]),
+                "q": H2ResultWriter._jsonify_numeric(q[R]),
+                "sigma": H2ResultWriter._jsonify_numeric(sigma[R]),
+            },
+            "jackknife": [
+                {
+                    "replicate": int(r),
+                    "T": H2ResultWriter._jsonify_numeric(T[r]),
+                    "q": H2ResultWriter._jsonify_numeric(q[r]),
+                    "sigma": H2ResultWriter._jsonify_numeric(sigma[r]),
+                }
+                for r in range(R)
+            ],
+        }
+        return payload
+
+    @staticmethod
+    def save_score_normal_equations_json(
+        fit: H2Fit,
+        path: str,
+        *,
+        system: str | None = None,
+    ):
+        payload = H2ResultWriter.build_score_normal_equations_payload(fit, system=system)
+        with open(path, "w") as fd:
+            json.dump(payload, fd, indent=2, allow_nan=False)
 
 
 # -----------------------------------------------------------------------------
@@ -190,13 +306,14 @@ def _pair_correction_from_deleted_mass(A_keep, A_del, delta):
 # preparation
 # -----------------------------------------------------------------------------
 
-
 def prepare_h2(
     trace_view,
     matched,
     jackknife,
     *,
     active_mask=None,
+    summary_y=None,
+    summary_y_info=None,
     ld_kind: str = "main",
     adjust_delta: bool = False,
 ):
@@ -215,11 +332,28 @@ def prepare_h2(
     R = jackknife.nrep
     U = jackknife.nunit
 
+    if summary_y is None:
+        summary_y, summary_y_info = build_h2_summary_moment(matched)
+
+    y = np.asarray(summary_y, dtype=np.float64)
+    if y.shape != (M,):
+        raise ValueError(f"summary_y must have shape ({M},), got {y.shape}")
+
+    if summary_y_info is not None:
+        n_scale = float(summary_y_info.get("n_scale", getattr(matched, "n_scale", matched.nsamp)))
+    else:
+        n_scale = float(getattr(matched, "n_scale", matched.nsamp))
+
+    if not (np.isfinite(n_scale) and n_scale > 0.0):
+        raise RuntimeError(f"Invalid univariate n_scale={n_scale}")
+
     if active_mask is None:
-        active_mask = np.ones(M, dtype=bool)
-    active_mask = np.asarray(active_mask, dtype=bool)
-    if active_mask.ndim != 1 or active_mask.size != M:
-        raise ValueError(f"active_mask must be length {M}; got {active_mask.shape}")
+        active_mask = np.isfinite(y)
+    else:
+        active_mask = np.asarray(active_mask, dtype=bool)
+        if active_mask.ndim != 1 or active_mask.size != M:
+            raise ValueError(f"active_mask must be length {M}; got {active_mask.shape}")
+        active_mask = active_mask & np.isfinite(y)
 
     A = np.asarray(trace_view.annot, dtype=np.float64, order="C")
     if ld_kind == "main":
@@ -236,13 +370,9 @@ def prepare_h2(
     else:
         raise ValueError("ld_kind must be 'main' or 'reg'")
 
-    chi2 = np.asarray(matched.chi2, dtype=np.float64)
-    if chi2.shape != (M,):
-        raise ValueError(f"matched.chi2 must have shape ({M},), got {chi2.shape}")
-
     m_unit = np.zeros(U, dtype=np.float64)
     Ak_unit = np.zeros((U, K), dtype=np.float64)
-    Az2_unit = np.zeros((U, K), dtype=np.float64)
+    Ay_unit = np.zeros((U, K), dtype=np.float64)
     Ak2_unit = np.zeros((U, K), dtype=np.float64)
     AA_unit = np.zeros((U, K, K), dtype=np.float64)
     AL_unit = np.zeros((U, K, K), dtype=np.float64)
@@ -257,11 +387,11 @@ def prepare_h2(
             continue
         Au = A[s:e, :][mu, :]
         Lu = L[s:e, :][mu, :]
-        chi2u = chi2[s:e][mu]
+        yu = y[s:e][mu]
 
         m_unit[u] = float(Au.shape[0])
         Ak_unit[u] = Au.sum(axis=0, dtype=np.float64)
-        Az2_unit[u] = Au.T @ chi2u
+        Ay_unit[u] = Au.T @ yu
         Ak2_unit[u] = (Au * Au).sum(axis=0, dtype=np.float64)
         AA_unit[u] = Au.T @ Au
         AL_unit[u] = Au.T @ Lu
@@ -272,9 +402,11 @@ def prepare_h2(
     if not (np.isfinite(M_full) and M_full > 0.0):
         raise RuntimeError("No active SNPs remain for H2 preparation.")
 
+    unit_sizes = jackknife.unit_sizes(active_mask=active_mask, dtype=np.float64)
+
     M_rep = _stack_delete_replicates(np.array(M_full, dtype=np.float64), m_unit, jackknife.D).reshape(R + 1)
     Ak_rep = _stack_delete_replicates(Ak_unit.sum(axis=0), Ak_unit, jackknife.D)
-    Az2_rep = _stack_delete_replicates(Az2_unit.sum(axis=0), Az2_unit, jackknife.D)
+    Ay_rep = _stack_delete_replicates(Ay_unit.sum(axis=0), Ay_unit, jackknife.D)
     Ak2_rep = _stack_delete_replicates(Ak2_unit.sum(axis=0), Ak2_unit, jackknife.D)
     AA_rep = _stack_delete_replicates(AA_unit.sum(axis=0), AA_unit, jackknife.D)
     AL_rep = _stack_delete_replicates(AL_unit.sum(axis=0), AL_unit, jackknife.D)
@@ -289,24 +421,22 @@ def prepare_h2(
     Ak_full = np.asarray(Ak_rep[-1], dtype=np.float64)
     src_mass = np.broadcast_to(Ak_full[None, :], Ak_rep.shape).copy()
     if jackknife.mode == "chr" and adjust_delta and getattr(trace_view, "delta", None) is not None:
-        # After explicit deleted-source correction, replicate numerators approximate
-        # A_keep^T L_keep, so the source-side normalizer should also be the kept mass.
         src_mass[:R] = Ak_rep[:R]
 
     M_k = Ak_rep[:, :, None]
     M_l = src_mass[:, None, :]
     delta = np.asarray(trace_view.delta, dtype=np.float64) if (adjust_delta and getattr(trace_view, "delta", None) is not None) else None
-    trace_KK = utils._calc_trace_from_ld_batch(AL_rep, matched.nsamp, M_k, M_l, delta=delta)
+    trace_KK = utils._calc_trace_from_ld_batch(AL_rep, n_scale, M_k, M_l, delta=delta)
 
-    trace_KK = _symmetrize_with_design(trace_KK, jackknife, m_unit)
+    trace_KK = _symmetrize_with_design(trace_KK, jackknife, unit_sizes)
 
-    lhs = np.full((R + 1, K + 1, K + 1), float(matched.nsamp), dtype=np.float64)
+    lhs = np.full((R + 1, K + 1, K + 1), n_scale, dtype=np.float64)
     lhs[:, :K, :K] = trace_KK
-    lhs[:, K, K] = float(matched.nsamp - 1.0)
+    lhs[:, K, K] = n_scale
 
-    rhs = np.full((R + 1, K + 1), float(matched.nsamp - 1.0), dtype=np.float64)
+    rhs = np.full((R + 1, K + 1), n_scale, dtype=np.float64)
     with np.errstate(divide="ignore", invalid="ignore"):
-        rhs[:, :K] = (Az2_rep * float(matched.nsamp)) / Ak_rep
+        rhs[:, :K] = (Ay_rep * n_scale) / Ak_rep
     bad_rhs = (~np.isfinite(rhs[:, :K])) | (~np.isfinite(Ak_rep)) | (Ak_rep <= 0.0)
     rhs[:, :K][bad_rhs] = np.nan
 
@@ -323,16 +453,19 @@ def prepare_h2(
         jackknife=jackknife,
         active_mask=active_mask,
         has_overlap=has_overlap,
-        unit_sizes=m_unit,
+        unit_sizes=unit_sizes,
+        n_scale=n_scale,
+        summary_y_info=summary_y_info,
+        y=y,
         m_unit=m_unit,
         Ak_unit=Ak_unit,
-        Az2_unit=Az2_unit,
+        Ay_unit=Ay_unit,
         Ak2_unit=Ak2_unit,
         AA_unit=AA_unit,
         AL_unit=AL_unit,
         M_rep=M_rep,
         Ak_rep=Ak_rep,
-        Az2_rep=Az2_rep,
+        Ay_rep=Ay_rep,
         Ak2_rep=Ak2_rep,
         AA_rep=AA_rep,
         AL_rep=AL_rep,

@@ -1,6 +1,3 @@
-"""
-Stochastically estimate (partitioned) genome-wide LD scores. Some part of the code is modified from Eric Liu's script
-"""
 import utils
 import math
 import numpy as np
@@ -19,7 +16,7 @@ import gwldcore
 from contextlib import contextmanager, nullcontext
 from threadpoolctl import threadpool_limits
 
-## Device helpers
+
 def _parse_device_str(s: str) -> tuple[str, int | None]:
     s = (s or "cpu").strip().lower()
     if s == "cpu":
@@ -243,6 +240,7 @@ def set_parallelism(omp_threads: int | None = None, blas_threads: int | None = N
 def _round_up_to(x, gran):
     return int(((x + gran - 1) // gran) * gran)
 
+
 def _build_balanced_vtiles(V, vmax, gran=64, max_tiles=4):
     vmax = max(gran, (vmax // gran) * gran)
     if vmax >= V:
@@ -281,6 +279,7 @@ def _build_balanced_vtiles(V, vmax, gran=64, max_tiles=4):
         vtiles.append((v0, V - v0))
     return vtiles
 
+
 def _bytes_human(n):
     if n is None:
         return "n/a"
@@ -291,6 +290,7 @@ def _bytes_human(n):
         if n < 1024.0:
             return f"{n:,.2f} {unit}"
     return f"{n:,.2f} EB"
+
 
 def _rss_snapshot(label, logger=None, include_children=True):
     rss = pss = None
@@ -318,6 +318,7 @@ def _rss_snapshot(label, logger=None, include_children=True):
     else:
         print(msg, file=sys.stderr, flush=True)
 
+
 def _canonical_bfile_prefix(x: str) -> str:
     s = str(x)
     for ext in (".bed", ".bim", ".fam"):
@@ -326,8 +327,6 @@ def _canonical_bfile_prefix(x: str) -> str:
     return s
 
 
-
-# -------------------- covariate reader → orthonormal Q --------------------
 def read_cov(
     cov_filename: str,
     fam_filename: str,
@@ -402,8 +401,7 @@ def read_cov(
         keep_idx_global = km
 
     if logger:
-        logger._log(f"Read {cov_filename}: kept {C.shape[0]} samples, {C.shape[1]} effective covariates. "
-                    f"C shape={C.shape}, R shape=({R.shape[0]},{R.shape[1]}).")
+        logger._log(f"Read {cov_filename}: kept {C.shape[0]} samples, {C.shape[1]} effective covariates. C shape={C.shape}, R shape=({R.shape[0]},{R.shape[1]}).")
 
     return C, R, keep_idx_global
 
@@ -432,7 +430,9 @@ class GenomewideLDScore:
                 use_tp32=False,
                 correct_skew: bool = False,
                 hybrid: bool = False,
-                hybrid_window_kb: float = 20000.0):
+                hybrid_window_kb: float = 20000.0,
+                use_mailman: bool = True,
+                impute_method: str = 'hwe'):
 
         self.eps_var = float(eps_var)
         prefix = _canonical_bfile_prefix(bed_path)
@@ -451,10 +451,9 @@ class GenomewideLDScore:
         self.ddof = int(ddof)
         self.target_mem = target_mem
         self.target_xz_mem = target_xz_mem if target_mem is None else target_mem
-        
+
         self._mu22_precomputed = None
 
-        # Hybrid controls
         self.hybrid = bool(hybrid)
         self.hybrid_window_kb = float(hybrid_window_kb)
         self.hybrid_window_bp = int(round(1000.0 * self.hybrid_window_kb))
@@ -467,12 +466,21 @@ class GenomewideLDScore:
         if self.correct_skew:
             self.log._log(f"[fs-corr] Fourth-moment correction enabled: {self.correct_skew}")
 
-        # Always resolve a concrete root seed so hybrid local-RP can reproduce the same probes.
         if seed is None:
             self.root_seed = int(np.random.SeedSequence().generate_state(1, dtype=np.uint64)[0])
             self.log._log(f"[seed] No seed provided; using generated root seed {self.root_seed}")
         else:
             self.root_seed = int(seed)
+
+        self.impute_method = str(impute_method).strip().lower()
+        if self.impute_method not in ("hwe", "mean"):
+            raise ValueError("impute_method must be 'hwe' or 'mean'.")
+        self.use_mailman = bool(use_mailman)
+        self.impute_seed = int((np.uint64(self.root_seed) ^ np.uint64(0xA24BAED4963EE407)) & np.uint64(0xFFFFFFFFFFFFFFFF))
+        if self.impute_method != "hwe" and self.use_mailman:
+            self.log._log("[mailman] Disabled because Mailman requires discrete HWE-imputed hard calls.")
+            self.use_mailman = False
+        self.log._log(f"[impute] method={self.impute_method} (seed={self.impute_seed})")
 
         rng = np.random.default_rng(self.root_seed)
 
@@ -481,7 +489,6 @@ class GenomewideLDScore:
             low_level["num_threads"] = int(num_threads)
 
         actual_blas_threads = apply_env(low_level)
-
         if explicit_threads:
             self.num_threads = int(num_threads)
         else:
@@ -495,7 +502,6 @@ class GenomewideLDScore:
 
         self.device_raw = device
         self.device_kind, self.device_index = _parse_device_str(device)
-
         self.dtype = np.float32 if dtype in (np.float32, 'float32', 'f4') else np.float64
         self.use_tp32 = bool(use_tp32)
         if self.use_tp32 and self.dtype is np.float64:
@@ -524,6 +530,12 @@ class GenomewideLDScore:
         else:
             self.use_cuda = False
 
+        if self.use_cuda and (self.impute_method == "hwe" or self.use_mailman):
+            self.log._log("[GPU] HWE-imputation / Mailman path is CPU-only; falling back to CPU.")
+            self.use_cuda = False
+            self.device_kind = "cpu"
+            self.device_index = None
+
         self.device = "cpu" if self.device_kind == "cpu" else f"cuda:{self.device_index}"
 
         self.start_time = utils._get_time()
@@ -544,7 +556,7 @@ class GenomewideLDScore:
             sel_idx = np.sort(rng.choice(base_idx, size=k, replace=False))
             self.log._log(f"Randomly subsampling individuals: {k}/{self.nsamp} ({k/self.nsamp:.1%})")
 
-        self._read_bim(self.bim_path)                
+        self._read_bim(self.bim_path)
         if annot_path is not None:
             self._read_annot(annot_path)
         else:
@@ -604,6 +616,8 @@ class GenomewideLDScore:
             annot_all=(self.annot if self.correct_skew else None),
             C=(self.C if self.C is not None else None),
             R=(self.cov_R if self.C is not None else None),
+            impute_mode=self.impute_method,
+            impute_seed=int(self.impute_seed),
         )
 
         self._mu22_precomputed = None if mu22 is None else np.asarray(mu22, dtype=np.float64, order="C")
@@ -619,11 +633,7 @@ class GenomewideLDScore:
     def _compute_block_corrections(self, meansq_raw, mu22, bin_idx=None):
         B = int(self.nbins)
         N = int(self.nsamp)
-
-        if self.C is not None:
-            d = float(self.N_eff)
-        else:
-            d = float(self.nsamp - self.ddof)
+        d = float(self.N_eff) if self.C is not None else float(self.nsamp - self.ddof)
 
         (R2_block,
          rho2_block,
@@ -645,16 +655,8 @@ class GenomewideLDScore:
         self.log._log("[fs-corr] Estimated block-level R2, ρ2, bias, μ22 and δ (μ̄22 - (1 + 2ρ²)).")
 
         try:
-            df_delta = pd.DataFrame(
-                self.delta_block,
-                index=self.l2cols,
-                columns=self.l2cols,
-            )
-            with pd.option_context(
-                'display.width', 140,
-                'display.max_columns', None,
-                'display.float_format', '{:.6e}'.format,
-            ):
+            df_delta = pd.DataFrame(self.delta_block, index=self.l2cols, columns=self.l2cols)
+            with pd.option_context('display.width', 140, 'display.max_columns', None, 'display.float_format', '{:.6e}'.format):
                 self.log._log("[fs-corr] Block-level δ matrix (rows/cols = annotation bins):")
                 self.log._log("\n" + df_delta.to_string())
         except Exception as e:
@@ -662,10 +664,7 @@ class GenomewideLDScore:
             self.log._log(repr(self.delta_block))
 
     def _make_compute_blocks(self):
-        return [
-            (s, min(self.nsnps, s + self.step_size))
-            for s in range(0, self.nsnps, self.step_size)
-        ]
+        return [(s, min(self.nsnps, s + self.step_size)) for s in range(0, self.nsnps, self.step_size)]
 
     def _read_annot(self, annot_path):
         if annot_path is None:
@@ -674,8 +673,6 @@ class GenomewideLDScore:
             self.nbins = 1
             self.l2cols = [f"L2_{i}" for i in range(self.nbins)]
             self.nsnps_bin = self.annot.sum(axis=0, dtype=np.float64)
-            # Keep annotation in the compute dtype/contiguity so pybind does not create
-            # a hidden temporary copy.
             self.annot = np.ascontiguousarray(self.annot.astype(self.dtype, copy=False))
             self.log._log("Calculating genome-wide (non-partitioned) LD score")
             self.log._log(f"Number of samples: {self.nsamp}")
@@ -684,8 +681,7 @@ class GenomewideLDScore:
 
         parsed_ldsc = False
         try:
-            df = pd.read_csv(annot_path, sep=r'\s+', compression='infer',
-                             dtype={'CHR': str, 'BP': np.int64, 'SNP': str, 'CM': float})
+            df = pd.read_csv(annot_path, sep=r'\s+', compression='infer', dtype={'CHR': str, 'BP': np.int64, 'SNP': str, 'CM': float})
             base_cols = {'CHR', 'BP', 'SNP', 'CM'}
             if base_cols.issubset(set(df.columns)) and 'SNP' in df.columns:
                 annot_cols = [c for c in df.columns if c not in base_cols]
@@ -704,12 +700,10 @@ class GenomewideLDScore:
                     extra_in_annot = len(ann_set - bim_set)
                     if missing_in_annot > 0:
                         raise ValueError(
-                            f"Annotation SNP set is missing {missing_in_annot} BIM SNP(s); "
-                            f"prepare a matching .annot or regenerate it to the .bim."
+                            f"Annotation SNP set is missing {missing_in_annot} BIM SNP(s); prepare a matching .annot or regenerate it to the .bim."
                         )
                     if extra_in_annot > 0:
-                        self.log._log(f"[info] Annotation contains {extra_in_annot} extra SNP(s) not in BIM; "
-                                      f"keeping BIM SNPs only and reordering to BIM.")
+                        self.log._log(f"[info] Annotation contains {extra_in_annot} extra SNP(s) not in BIM; keeping BIM SNPs only and reordering to BIM.")
                     ann_mat = df.set_index('SNP').loc[bim_snps, annot_cols].to_numpy(dtype=np.float64, copy=False)
 
                 np.nan_to_num(ann_mat, copy=False)
@@ -719,10 +713,7 @@ class GenomewideLDScore:
                 uniq = np.unique(ann_mat)
                 is_binary = np.all(np.isin(uniq, [0.0, 1.0]))
                 self.is_continuous = (not is_binary)
-                if self.is_continuous:
-                    self.log._log("[info] Detected continuous annotations (non 0/1 values).")
-                else:
-                    self.log._log("[info] Detected binary annotations (0/1).")
+                self.log._log("[info] Detected continuous annotations (non 0/1 values)." if self.is_continuous else "[info] Detected binary annotations (0/1).")
 
                 self.annot = ann_mat
                 self.nbins = self.annot.shape[1]
@@ -751,13 +742,11 @@ class GenomewideLDScore:
             self.log._log(f"Read thin annotation matrix with shape {self.annot.shape}")
 
         if self.annot.shape[0] != self.nsnps:
-            self.log._log(f"!!! number of SNPs in annotation ({self.annot.shape[0]}) "
-                          f"does not match the input genotype file ({self.nsnps}) !!!")
+            self.log._log(f"!!! number of SNPs in annotation ({self.annot.shape[0]}) does not match the input genotype file ({self.nsnps}) !!!")
             sys.exit(1)
 
         self.nsnps_bin = self.annot.sum(axis=0, dtype=np.float64)
         self.annot = np.ascontiguousarray(self.annot.astype(self.dtype, copy=False))
-
         self.log._log(f"Number of samples: {self.nsamp}")
         self.log._log(f"Number of total SNPs: {self.nsnps}, annotation shape: {self.annot.shape}")
         self.log._log(f"Nbins: {self.nbins}")
@@ -777,6 +766,7 @@ class GenomewideLDScore:
     def _compute_ldscore(self):
         self.log._log(f"num_vecs: {self.nvecs}, step_size: {self.step_size}, seed: {self.root_seed}")
         self.log._log(f"Using {self.rand_dist} random vectors.")
+        self.log._log(f"[backend] Mailman={'on' if self.use_mailman else 'off'} ; impute={self.impute_method}")
         if self.C is not None:
             self.log._log(f"Covariate-adjusted partial correlations (N_eff={self.N_eff}, p={self.p_eff}).")
         else:
@@ -806,10 +796,7 @@ class GenomewideLDScore:
             zc = sum(1 for k in kmax_per_block if k == 0)
             self.log._log(f"[info] {zc} block(s) have Kmax=0 (phase-1 only skip).")
         if kmax_per_block:
-            self.log._log(
-                f"Kmax per block (min/median/max): "
-                f"{min(kmax_per_block)}/{int(np.median(kmax_per_block))}/{max(kmax_per_block)}"
-            )
+            self.log._log(f"Kmax per block (min/median/max): {min(kmax_per_block)}/{int(np.median(kmax_per_block))}/{max(kmax_per_block)}")
 
         target_gib = float(getattr(self, "target_xz_mem", 16.0))
         itemsize = np.dtype(self.dtype).itemsize
@@ -829,16 +816,9 @@ class GenomewideLDScore:
         assert sum(vtiles) == self.nvecs
 
         if len(vtiles) == 1:
-            self.log._log(
-                f"[auto_vchunk] dtype={self.dtype} target≈{target_gib:.1f} GiB, "
-                f"v_tiles=[{vtiles[0]}] → Xz≈{(self.nsamp * self.nbins * vtiles[0] * itemsize) / (1024**3):.2f} GiB"
-            )
+            self.log._log(f"[auto_vchunk] dtype={self.dtype} target≈{target_gib:.1f} GiB, v_tiles=[{vtiles[0]}] → Xz≈{(self.nsamp * self.nbins * vtiles[0] * itemsize) / (1024**3):.2f} GiB")
         else:
-            self.log._log(
-                f"[auto_vchunk] dtype={self.dtype} target≈{target_gib:.1f} GiB, "
-                f"v_tiles={vtiles[0]}×{(len(vtiles) - 1)}+{vtiles[-1]} → "
-                f"Xz≈{(self.nsamp * self.nbins * vtiles[0] * itemsize) / (1024**3):.2f} GiB"
-            )
+            self.log._log(f"[auto_vchunk] dtype={self.dtype} target≈{target_gib:.1f} GiB, v_tiles={vtiles[0]}×{(len(vtiles) - 1)}+{vtiles[-1]} → Xz≈{(self.nsamp * self.nbins * vtiles[0] * itemsize) / (1024**3):.2f} GiB")
         self.log._log(f"Streaming with BALANCED V-tiles: {vtiles} (total V = {self.nvecs})")
 
         bed_prefix = self.bed_prefix
@@ -849,11 +829,10 @@ class GenomewideLDScore:
 
         meansq_accum = np.zeros((self.nsnps, self.nbins), dtype=self.dtype, order='C')
         Vmax = max(vtiles) if vtiles else 0
-        Xz_chunk = np.zeros((self.nsamp, int(self.nbins) * int(Vmax)),
-                            dtype=self.dtype, order='F')
+        Xz_chunk = None
 
-        ann_blocks = [np.ascontiguousarray(self.annot[s:e]) for (s, e) in blocks]
-        inv_blocks = [np.ascontiguousarray(self.inv_sqrt_resvar_all[s:e]) for (s, e) in blocks]
+        ann_blocks = [self.annot[s:e] for (s, e) in blocks]
+        inv_blocks = [self.inv_sqrt_resvar_all[s:e] for (s, e) in blocks]
 
         dev_kind, dev_idx_req = _parse_device_str(getattr(self, "device", "cpu"))
         use_tf32 = bool(getattr(self, "use_tp32", False))
@@ -879,6 +858,9 @@ class GenomewideLDScore:
                 use_cuda_backend = False
 
         meansq_chunk = np.zeros_like(meansq_accum, dtype=self.dtype, order='C') if use_cuda_backend else None
+        use_mailman_backend = bool((not use_cuda_backend) and self.use_mailman and self.impute_method == "hwe")
+        if not use_mailman_backend:
+            Xz_chunk = np.zeros((self.nsamp, int(self.nbins) * int(Vmax)), dtype=self.dtype, order='F')
 
         if self.C is not None:
             N_denom = int(self.N_eff)
@@ -887,6 +869,7 @@ class GenomewideLDScore:
 
         total_units = len(vtiles) * len(blocks)
         bar = tqdm(total=total_units, desc="GW-LD progress", unit="task", smoothing=0.2, miniters=1)
+        trim_period = int(os.environ.get("SUMMIT_TRIM_PERIOD", "0") or "0")
 
         ema_p1 = 0.0
         ema_p2 = 0.0
@@ -896,8 +879,11 @@ class GenomewideLDScore:
             v_start = 0
             for vt_idx, Vt in enumerate(vtiles):
                 used_cols = B * Vt
-                Xz_view = Xz_chunk[:, :used_cols]
-                Xz_view.fill(0)
+                if use_mailman_backend:
+                    Xz_view = np.zeros((self.nsamp, used_cols), dtype=self.dtype, order='C')
+                else:
+                    Xz_view = Xz_chunk[:, :used_cols]
+                    Xz_view.fill(0)
 
                 t1_total = 0.0
                 with set_parallelism(omp_threads=t_omp1, blas_threads=t_blas1):
@@ -906,32 +892,60 @@ class GenomewideLDScore:
                         if kmax_hint == 0:
                             bar.update(w1)
                             continue
-
                         annot_blk = ann_blocks[blk_idx]
                         inv_right = inv_blocks[blk_idx]
-
                         t0 = time.perf_counter()
-                        gwldcore.phase1_compute_Xz_bed_chunk(
-                            bed_prefix=bed_prefix,
-                            fam_path=fam_path,
-                            blk_start=int(s), blk_end=int(e),
-                            row_sel=row_sel,
-                            ddof=ddof,
-                            annot_blk=annot_blk,
-                            inv_right=inv_right,
-                            v_start=int(v_start),
-                            v_count=int(Vt),
-                            kmax_hint=kmax_hint,
-                            rand_dist=self.rand_dist,
-                            seed=self.root_seed,
-                            Xz2d_chunk=Xz_view,
-                            project_right=False,
-                        )
+                        if use_mailman_backend:
+                            gwldcore.phase1_compute_Xz_bed_chunk_rowmajor(
+                                bed_prefix=bed_prefix,
+                                fam_path=fam_path,
+                                blk_start=int(s), blk_end=int(e),
+                                row_sel=row_sel,
+                                ddof=ddof,
+                                annot_blk=annot_blk,
+                                inv_right=inv_right,
+                                v_start=int(v_start),
+                                v_count=int(Vt),
+                                kmax_hint=kmax_hint,
+                                rand_dist=self.rand_dist,
+                                seed=self.root_seed,
+                                Xz2d_chunk=Xz_view,
+                                project_right=False,
+                                impute_mode=self.impute_method,
+                                impute_seed=int(self.impute_seed),
+                            )
+                        else:
+                            gwldcore.phase1_compute_Xz_bed_chunk(
+                                bed_prefix=bed_prefix,
+                                fam_path=fam_path,
+                                blk_start=int(s), blk_end=int(e),
+                                row_sel=row_sel,
+                                ddof=ddof,
+                                annot_blk=annot_blk,
+                                inv_right=inv_right,
+                                v_start=int(v_start),
+                                v_count=int(Vt),
+                                kmax_hint=kmax_hint,
+                                rand_dist=self.rand_dist,
+                                seed=self.root_seed,
+                                Xz2d_chunk=Xz_view,
+                                project_right=False,
+                                impute_mode=self.impute_method,
+                                impute_seed=int(self.impute_seed),
+                            )
                         t1_total += (time.perf_counter() - t0)
                         bar.update(w1)
 
-                t2_total = 0.0
+                if use_mailman_backend:
+                    with set_parallelism(omp_threads=self.num_threads, blas_threads=1):
+                        if self.C is not None:
+                            sum_Xz_view = gwldcore.project_rowmajor_inplace_and_col_sums(Xz_view, self.C, self.cov_R)
+                        else:
+                            sum_Xz_view = gwldcore.compute_col_sums_rowmajor(Xz_view)
+                else:
+                    sum_Xz_view = None
 
+                t2_total = 0.0
                 if use_cuda_backend:
                     meansq_chunk.fill(0)
                     with set_parallelism(omp_threads=1, blas_threads=1):
@@ -957,60 +971,81 @@ class GenomewideLDScore:
                             )
                             t2_total += (time.perf_counter() - t0)
                             bar.update(1.0 - w1)
-
                     meansq_accum += (meansq_chunk * Vt)
-
                 else:
-                    pref_ex = ThreadPoolExecutor(max_workers=1)
-                    try:
-                        with set_parallelism(omp_threads=1, blas_threads=self.num_threads):
-                            for blk_idx, (s, e) in enumerate(blocks):
-                                inv_left = inv_blocks[blk_idx]
-
-                                if blk_idx + 1 < len(blocks):
-                                    s2, e2 = blocks[blk_idx + 1]
-                                    pref_ex.submit(
-                                        gwldcore.prefetch_bed_block,
-                                        bed_prefix, fam_path,
-                                        int(s2), int(e2),
-                                        1,
+                    if use_mailman_backend:
+                        pref_ex = ThreadPoolExecutor(max_workers=1)
+                        try:
+                            with set_parallelism(omp_threads=self.num_threads, blas_threads=1):
+                                for blk_idx, (s, e) in enumerate(blocks):
+                                    inv_left = inv_blocks[blk_idx]
+                                    if blk_idx + 1 < len(blocks):
+                                        s2, e2 = blocks[blk_idx + 1]
+                                        pref_ex.submit(gwldcore.prefetch_bed_block, bed_prefix, fam_path, int(s2), int(e2), 1)
+                                    t0 = time.perf_counter()
+                                    gwldcore.phase2_accum_XtXz_bed_mailman_rowmajor(
+                                        bed_prefix=bed_prefix,
+                                        fam_path=fam_path,
+                                        blk_start=int(s),
+                                        blk_end=int(e),
+                                        row_sel=row_sel,
+                                        ddof=ddof,
+                                        inv_left=inv_left,
+                                        tile_nvecs=int(Vt),
+                                        Xz2d=Xz_view,
+                                        meansq_accum=meansq_accum,
+                                        sum_Xz=sum_Xz_view,
+                                        N_denom=int(N_denom),
+                                        impute_seed=int(self.impute_seed),
                                     )
+                                    t2_total += (time.perf_counter() - t0)
+                                    bar.update(1.0 - w1)
+                        finally:
+                            pref_ex.shutdown(wait=True)
+                    else:
+                        pref_ex = ThreadPoolExecutor(max_workers=1)
+                        try:
+                            with set_parallelism(omp_threads=1, blas_threads=self.num_threads):
+                                for blk_idx, (s, e) in enumerate(blocks):
+                                    inv_left = inv_blocks[blk_idx]
+                                    if blk_idx + 1 < len(blocks):
+                                        s2, e2 = blocks[blk_idx + 1]
+                                        pref_ex.submit(gwldcore.prefetch_bed_block, bed_prefix, fam_path, int(s2), int(e2), 1)
 
-                                t0 = time.perf_counter()
-                                gwldcore.phase2_accum_XtXz_bed(
-                                    bed_prefix=bed_prefix,
-                                    fam_path=fam_path,
-                                    blk_start=int(s), blk_end=int(e),
-                                    row_sel=row_sel,
-                                    ddof=ddof,
-                                    inv_left=inv_left,
-                                    tile_nvecs=int(Vt),
-                                    Xz2d=Xz_view,
-                                    meansq_accum=meansq_accum,
-                                    C=(self.C if self.C is not None else None),
-                                    R=(self.cov_R if self.C is not None else None),
-                                    N_denom=int(N_denom),
-                                )
-                                t2_total += (time.perf_counter() - t0)
-                                bar.update(1.0 - w1)
-                    finally:
-                        pref_ex.shutdown(wait=True)
+                                    t0 = time.perf_counter()
+                                    gwldcore.phase2_accum_XtXz_bed(
+                                        bed_prefix=bed_prefix,
+                                        fam_path=fam_path,
+                                        blk_start=int(s),
+                                        blk_end=int(e),
+                                        row_sel=row_sel,
+                                        ddof=ddof,
+                                        inv_left=inv_left,
+                                        tile_nvecs=int(Vt),
+                                        Xz2d=Xz_view,
+                                        meansq_accum=meansq_accum,
+                                        C=(self.C if self.C is not None else None),
+                                        R=(self.cov_R if self.C is not None else None),
+                                        N_denom=int(N_denom),
+                                        impute_mode=self.impute_method,
+                                        impute_seed=int(self.impute_seed),
+                                    )
+                                    t2_total += (time.perf_counter() - t0)
+                                    bar.update(1.0 - w1)
+                        finally:
+                            pref_ex.shutdown(wait=True)
 
                 ema_p1 = 0.85 * ema_p1 + 0.15 * max(t1_total, 1e-9)
                 ema_p2 = 0.85 * ema_p2 + 0.15 * max(t2_total, 1e-9)
                 w1 = float(ema_p1 / (ema_p1 + ema_p2))
-                bar.set_postfix_str(
-                    f"tile {vt_idx+1}/{len(vtiles)} | w1={w1:.2f} | "
-                    f"P1={t1_total:.1f}s P2={t2_total:.1f}s"
-                )
+                bar.set_postfix_str(f"tile {vt_idx+1}/{len(vtiles)} | w1={w1:.2f} | P1={t1_total:.1f}s P2={t2_total:.1f}s")
 
-                try:
-                    ctypes.CDLL("libc.so.6").malloc_trim(0)
-                except Exception:
-                    pass
-
+                if trim_period > 0 and ((vt_idx + 1) % trim_period == 0):
+                    try:
+                        ctypes.CDLL("libc.so.6").malloc_trim(0)
+                    except Exception:
+                        pass
                 v_start += Vt
-
         finally:
             try:
                 bar.close()
@@ -1027,43 +1062,26 @@ class GenomewideLDScore:
         is_unpartitioned = (self.nbins == 1 and np.isclose(float(self.nsnps_bin[0]), float(self.nsnps)))
         if is_unpartitioned:
             proj_rank = float(self.N_eff - 1.0)
-            trace_k2_from_ldscore = (
-                (proj_rank * proj_rank)
-                * float(meansq[:, 0].sum(dtype=np.float64))
-                / float(self.nsnps * self.nsnps)
-            )
+            trace_k2_from_ldscore = (proj_rank * proj_rank) * float(meansq[:, 0].sum(dtype=np.float64)) / float(self.nsnps * self.nsnps)
 
         if not self.correct_skew:
-            self.mu22_block = None
-            self.delta_block = None
-            self.r2_block = None
-            self.rho2_block = None
-            self.bias_block = None
+            self.mu22_block = self.delta_block = self.r2_block = self.rho2_block = self.bias_block = None
         else:
             meansq_raw = np.asarray(meansq, dtype=np.float64, order="C")
             try:
                 mu22 = self._estimate_mu22_bins(None)
-
                 if not getattr(self, "is_continuous", False):
                     self._compute_block_corrections(meansq_raw, mu22, None)
                 else:
                     self.mu22_block = mu22
-                    self.log._log(
-                        "[fs-corr] Continuous / overlapping annotations detected; "
-                        "stored μ22_block but skipped block-level bias correction."
-                    )
+                    self.log._log("[fs-corr] Continuous / overlapping annotations detected; stored μ22_block but skipped block-level bias correction.")
             except Exception as e:
                 self.log._log(f"[fs-corr] Failed to compute 4th-moment-based corrections: {e}")
-                self.mu22_block = None
-                self.delta_block = None
-                self.r2_block = None
-                self.rho2_block = None
-                self.bias_block = None
+                self.mu22_block = self.delta_block = self.r2_block = self.rho2_block = self.bias_block = None
 
         N_denom = float(self.N_eff - 1.0 if self.C is not None else self.nsamp - self.ddof)
         self.log._log("Applying correlation null: subtracting M_k / N_denom per bin.")
         meansq -= (self.nsnps_bin / N_denom).astype(meansq.dtype, copy=False)[None, :]
-
         self.gwldscore = meansq.astype(np.float64, copy=False)
 
         self.log._log(f"Saving the genome-wide (partitioned) LD scores into: {self.outpath}.gw.ldscore.gz")
@@ -1076,28 +1094,15 @@ class GenomewideLDScore:
 
         scores_df = pd.DataFrame(self.gwldscore, columns=self.l2cols)
         out_df = pd.concat([self.snpdf, scores_df], axis=1)
-        out_df.to_csv(
-            f'{self.outpath}.gw.ldscore.gz',
-            index=False,
-            compression='gzip',
-            sep='\t',
-            float_format='%.6f',
-        )
+        out_df.to_csv(f'{self.outpath}.gw.ldscore.gz', index=False, compression='gzip', sep='\t', float_format='%.6f')
 
         if trace_k2_from_ldscore is not None:
-            self._estimate_unpartitioned_kmoments(
-                trace_k2_from_ldscore=trace_k2_from_ldscore,
-                num_probes=256,
-            )
+            self._estimate_unpartitioned_kmoments(trace_k2_from_ldscore=trace_k2_from_ldscore, num_probes=256)
 
         if self.correct_skew:
             try:
                 if getattr(self, "delta_block", None) is not None:
-                    delta_df = pd.DataFrame(
-                        self.delta_block,
-                        index=self.l2cols,
-                        columns=self.l2cols,
-                    )
+                    delta_df = pd.DataFrame(self.delta_block, index=self.l2cols, columns=self.l2cols)
                     delta_out = f"{self.outpath}.gw.delta"
                     delta_df.to_csv(delta_out, sep='\t', float_format='%.8e')
                     self.log._log(f"[fs-corr] Saved block-level δ matrix to: {delta_out}")
@@ -1107,24 +1112,14 @@ class GenomewideLDScore:
                 self.log._log(f"[fs-corr] Failed to save δ matrix (.gw.delta): {e}")
 
         try:
-            desc = scores_df.describe(percentiles=[0.25, 0.5, 0.75]).loc[
-                ['count', 'mean', 'std', 'min', '25%', '50%', '75%', 'max']
-            ]
+            desc = scores_df.describe(percentiles=[0.25, 0.5, 0.75]).loc[['count', 'mean', 'std', 'min', '25%', '50%', '75%', 'max']]
             self.log._log("Per-bin LD score summary (count/mean/std/min/25%/50%/75%/max):")
-            with pd.option_context(
-                'display.width', 140,
-                'display.max_columns', None,
-                'display.float_format', '{:.6f}'.format,
-            ):
+            with pd.option_context('display.width', 140, 'display.max_columns', None, 'display.float_format', '{:.6f}'.format):
                 self.log._log(desc.to_string() + "\n")
 
             corr = scores_df.corr(method='pearson')
             self.log._log("Correlation matrix across bins (Pearson):")
-            with pd.option_context(
-                'display.width', 140,
-                'display.max_columns', None,
-                'display.float_format', '{:.4f}'.format,
-            ):
+            with pd.option_context('display.width', 140, 'display.max_columns', None, 'display.float_format', '{:.4f}'.format):
                 self.log._log("\n" + corr.to_string())
 
             col_sums = pd.Series(self.nsnps_bin, index=self.l2cols)
@@ -1144,34 +1139,10 @@ class GenomewideLDScore:
         self.end_time = utils._get_time()
         self.log._log(f"Calculation of genome-wide LD score ended at " + utils._get_timestr(self.end_time))
         self.runtime = self.end_time - self.start_time
-        self.log._log(
-            "Runtime: " + format(self.runtime, '.3f') +
-            f" s ({self.runtime // 3600} hr {(self.runtime % 3600) // 60} m {(self.runtime % 60):.3f} s)"
-        )
+        self.log._log("Runtime: " + format(self.runtime, '.3f') + f" s ({self.runtime // 3600} hr {(self.runtime % 3600) // 60} m {(self.runtime % 60):.3f} s)")
         self.log._save_log(self.outpath + ".gw.log")
-    
-
 
     def _estimate_unpartitioned_kmoments(self, trace_k2_from_ldscore, num_probes: int = 128):
-        """
-        Estimate higher-order moments of the unpartitioned single-component projected GRM.
-
-        We reuse the existing raw single-component LD-score output for tr(K^2), and
-        estimate tr(K), tr(K^3), tr(K^4) with sample-space Hutchinson probes.
-
-        The operator is the same one already used implicitly by the current LD-score code:
-            K = (1/M) X X^T,
-        where X is the projected, re-standardized genotype matrix.
-
-        Parameters
-        ----------
-        trace_k2_from_ldscore : float
-            tr(K^2) computed from the raw unpartitioned LD scores before null subtraction:
-                tr(K^2) = (r^2 / M^2) * sum_j l_j^raw,
-            with r = N_eff - 1.
-        num_probes : int
-            Number of sample-space Hutchinson probes.
-        """
         if trace_k2_from_ldscore is None:
             raise ValueError("trace_k2_from_ldscore must be provided for K-moment estimation.")
         if not np.isfinite(trace_k2_from_ldscore):
@@ -1188,10 +1159,7 @@ class GenomewideLDScore:
         N = int(self.nsamp)
         mom_dtype = np.float64
 
-        probe_seed = int(
-            (np.uint64(self.root_seed) ^ np.uint64(0xD1B54A32D192ED03))
-            & np.uint64(0xFFFFFFFFFFFFFFFF)
-        )
+        probe_seed = int((np.uint64(self.root_seed) ^ np.uint64(0xD1B54A32D192ED03)) & np.uint64(0xFFFFFFFFFFFFFFFF))
         rng = np.random.default_rng(probe_seed)
 
         if self.rand_dist == "rademacher":
@@ -1214,38 +1182,70 @@ class GenomewideLDScore:
         C_mom = None if self.C is None else np.asfortranarray(self.C.astype(mom_dtype, copy=False))
         R_mom = None if self.cov_R is None else np.asfortranarray(self.cov_R.astype(mom_dtype, copy=False))
 
-        self.log._log(
-            f"[kmom] Estimating unpartitioned GRM moments with {q} sample-space probes "
-            f"(CPU, dtype=float64, seed={probe_seed}, dist={self.rand_dist})."
-        )
+        self.log._log(f"[kmom] Estimating unpartitioned GRM moments with {q} sample-space probes (CPU, dtype=float64, seed={probe_seed}, dist={self.rand_dist}).")
 
-        with set_parallelism(omp_threads=1, blas_threads=self.num_threads):
-            gwldcore.apply_grm_bed_panel(
-                bed_prefix=self.bed_prefix,
-                fam_path=self.fam_path,
-                nsnps=int(self.nsnps),
-                step_size=int(self.step_size),
-                row_sel=(self.row_sel if self.row_sel is not None else None),
-                ddof=int(self.ddof),
-                inv_all=inv_all,
-                panel_in=Z,
-                panel_out=Y1,
-                C=(C_mom if C_mom is not None else None),
-                R=(R_mom if R_mom is not None else None),
-            )
-            gwldcore.apply_grm_bed_panel(
-                bed_prefix=self.bed_prefix,
-                fam_path=self.fam_path,
-                nsnps=int(self.nsnps),
-                step_size=int(self.step_size),
-                row_sel=(self.row_sel if self.row_sel is not None else None),
-                ddof=int(self.ddof),
-                inv_all=inv_all,
-                panel_in=Y1,
-                panel_out=Y2,
-                C=(C_mom if C_mom is not None else None),
-                R=(R_mom if R_mom is not None else None),
-            )
+        with set_parallelism(omp_threads=(self.num_threads if (self.use_mailman and self.impute_method == "hwe") else 1),
+                             blas_threads=(1 if (self.use_mailman and self.impute_method == "hwe") else self.num_threads)):
+            if self.use_mailman and self.impute_method == "hwe":
+                gwldcore.apply_grm_bed_panel_mailman(
+                    bed_prefix=self.bed_prefix,
+                    fam_path=self.fam_path,
+                    nsnps=int(self.nsnps),
+                    step_size=int(self.step_size),
+                    row_sel=(self.row_sel if self.row_sel is not None else None),
+                    ddof=int(self.ddof),
+                    inv_all=inv_all,
+                    panel_in=Z,
+                    panel_out=Y1,
+                    C=(C_mom if C_mom is not None else None),
+                    R=(R_mom if R_mom is not None else None),
+                    impute_seed=int(self.impute_seed),
+                )
+                gwldcore.apply_grm_bed_panel_mailman(
+                    bed_prefix=self.bed_prefix,
+                    fam_path=self.fam_path,
+                    nsnps=int(self.nsnps),
+                    step_size=int(self.step_size),
+                    row_sel=(self.row_sel if self.row_sel is not None else None),
+                    ddof=int(self.ddof),
+                    inv_all=inv_all,
+                    panel_in=Y1,
+                    panel_out=Y2,
+                    C=(C_mom if C_mom is not None else None),
+                    R=(R_mom if R_mom is not None else None),
+                    impute_seed=int(self.impute_seed),
+                )
+            else:
+                gwldcore.apply_grm_bed_panel(
+                    bed_prefix=self.bed_prefix,
+                    fam_path=self.fam_path,
+                    nsnps=int(self.nsnps),
+                    step_size=int(self.step_size),
+                    row_sel=(self.row_sel if self.row_sel is not None else None),
+                    ddof=int(self.ddof),
+                    inv_all=inv_all,
+                    panel_in=Z,
+                    panel_out=Y1,
+                    C=(C_mom if C_mom is not None else None),
+                    R=(R_mom if R_mom is not None else None),
+                    impute_mode=self.impute_method,
+                    impute_seed=int(self.impute_seed),
+                )
+                gwldcore.apply_grm_bed_panel(
+                    bed_prefix=self.bed_prefix,
+                    fam_path=self.fam_path,
+                    nsnps=int(self.nsnps),
+                    step_size=int(self.step_size),
+                    row_sel=(self.row_sel if self.row_sel is not None else None),
+                    ddof=int(self.ddof),
+                    inv_all=inv_all,
+                    panel_in=Y1,
+                    panel_out=Y2,
+                    C=(C_mom if C_mom is not None else None),
+                    R=(R_mom if R_mom is not None else None),
+                    impute_mode=self.impute_method,
+                    impute_seed=int(self.impute_seed),
+                )
 
         k1_each = np.sum(Z * Y1, axis=0, dtype=np.float64)
         k2_each = np.sum(Y1 * Y1, axis=0, dtype=np.float64)
@@ -1263,100 +1263,43 @@ class GenomewideLDScore:
         trace_K4_probe_se = float(k4_each.std(ddof=1) / np.sqrt(q)) if q > 1 else 0.0
 
         trace_K2_used = float(trace_k2_from_ldscore)
-
-        # Primary moments for downstream use:
-        # with the current normalization, tr(K)=rank(P)=proj_rank and alpha=1.
         t0_rank = float(trace_K2_used - proj_rank)
         t1_rank = float(trace_K3_probe - 2.0 * trace_K2_used + proj_rank)
         t2_rank = float(trace_K4_probe - 2.0 * trace_K3_probe + trace_K2_used)
 
-        # Diagnostic version using the probe estimate of tr(K), useful only as a guardrail
-        # if alpha deviates materially from 1 because of explicit variance clamping.
         alpha_probe = float(trace_K_probe / proj_rank)
         t0_probealpha = float(trace_K2_used - (trace_K_probe * trace_K_probe) / proj_rank)
-        t1_probealpha = float(
-            trace_K3_probe
-            - 2.0 * alpha_probe * trace_K2_used
-            + (alpha_probe * alpha_probe) * trace_K_probe
-        )
-        t2_probealpha = float(
-            trace_K4_probe
-            - 2.0 * alpha_probe * trace_K3_probe
-            + (alpha_probe * alpha_probe) * trace_K2_used
-        )
-        
-                # --- quick, dimensionless diagnostics ---
+        t1_probealpha = float(trace_K3_probe - 2.0 * alpha_probe * trace_K2_used + (alpha_probe * alpha_probe) * trace_K_probe)
+        t2_probealpha = float(trace_K4_probe - 2.0 * alpha_probe * trace_K3_probe + (alpha_probe * alpha_probe) * trace_K2_used)
+
         alpha_probe_err = float(abs(alpha_probe - 1.0))
-
-        k2_probe_relerr = float(
-            abs(trace_K2_probe - trace_K2_used) / max(abs(trace_K2_used), 1e-12)
-        )
-
+        k2_probe_relerr = float(abs(trace_K2_probe - trace_K2_used) / max(abs(trace_K2_used), 1e-12))
         s4_rank = float(t2_rank - 2.0 * t1_rank + t0_rank)
-        delta_reff_rank = (
-            float((t0_rank * t0_rank) / s4_rank)
-            if np.isfinite(s4_rank) and s4_rank > 0.0
-            else np.nan
-        )
+        delta_reff_rank = float((t0_rank * t0_rank) / s4_rank) if np.isfinite(s4_rank) and s4_rank > 0.0 else np.nan
 
-        if alpha_probe_err <= 5e-3:
-            alpha_flag = "OK"
-        elif alpha_probe_err <= 1e-2:
-            alpha_flag = "WARN"
-        else:
-            alpha_flag = "BAD"
-
-        if k2_probe_relerr <= 5e-2:
-            mc_flag = "OK"
-        elif k2_probe_relerr <= 1e-1:
-            mc_flag = "WARN"
-        else:
-            mc_flag = "BAD"
-
+        alpha_flag = "OK" if alpha_probe_err <= 5e-3 else ("WARN" if alpha_probe_err <= 1e-2 else "BAD")
+        mc_flag = "OK" if k2_probe_relerr <= 5e-2 else ("WARN" if k2_probe_relerr <= 1e-1 else "BAD")
         if np.isfinite(delta_reff_rank):
-            if delta_reff_rank < 50.0:
-                spike_flag = "LOW_EFFECTIVE_RANK"
-            elif delta_reff_rank < 200.0:
-                spike_flag = "MODERATE"
-            else:
-                spike_flag = "DIFFUSE"
+            spike_flag = "LOW_EFFECTIVE_RANK" if delta_reff_rank < 50.0 else ("MODERATE" if delta_reff_rank < 200.0 else "DIFFUSE")
         else:
             spike_flag = "NA"
 
         out_df = pd.DataFrame([{
-            "nsnps": int(self.nsnps),
-            "proj_rank": proj_rank,
-            "num_probes": q,
-            "probe_seed": probe_seed,
-            "trace_K_probe": trace_K_probe,
-            "trace_K_probe_se": trace_K_probe_se,
-            "trace_K_target_rank": proj_rank,
-            "trace_K2_from_ldscore": trace_K2_used,
-            "trace_K2_probe": trace_K2_probe,
-            "trace_K2_probe_se": trace_K2_probe_se,
-            "trace_K3_probe": trace_K3_probe,
-            "trace_K3_probe_se": trace_K3_probe_se,
-            "trace_K4_probe": trace_K4_probe,
-            "trace_K4_probe_se": trace_K4_probe_se,
-            "alpha_rank": 1.0,
-            "alpha_probe": alpha_probe,
-            "t0_rank": t0_rank,
-            "t1_rank": t1_rank,
-            "t2_rank": t2_rank,
-            "t0_probealpha": t0_probealpha,
-            "t1_probealpha": t1_probealpha,
-            "t2_probealpha": t2_probealpha,
-            "alpha_probe_err": alpha_probe_err,
-            "k2_probe_relerr": k2_probe_relerr,
-            "delta_reff_rank": delta_reff_rank,
-            "alpha_flag": alpha_flag,
-            "mc_flag": mc_flag,
-            "spike_flag": spike_flag,
+            "nsnps": int(self.nsnps), "proj_rank": proj_rank, "num_probes": q, "probe_seed": probe_seed,
+            "trace_K_probe": trace_K_probe, "trace_K_probe_se": trace_K_probe_se,
+            "trace_K_target_rank": proj_rank, "trace_K2_from_ldscore": trace_K2_used,
+            "trace_K2_probe": trace_K2_probe, "trace_K2_probe_se": trace_K2_probe_se,
+            "trace_K3_probe": trace_K3_probe, "trace_K3_probe_se": trace_K3_probe_se,
+            "trace_K4_probe": trace_K4_probe, "trace_K4_probe_se": trace_K4_probe_se,
+            "alpha_rank": 1.0, "alpha_probe": alpha_probe,
+            "t0_rank": t0_rank, "t1_rank": t1_rank, "t2_rank": t2_rank,
+            "t0_probealpha": t0_probealpha, "t1_probealpha": t1_probealpha, "t2_probealpha": t2_probealpha,
+            "alpha_probe_err": alpha_probe_err, "k2_probe_relerr": k2_probe_relerr,
+            "delta_reff_rank": delta_reff_rank, "alpha_flag": alpha_flag, "mc_flag": mc_flag, "spike_flag": spike_flag,
         }])
 
         kmom_out = f"{self.outpath}.gw.kmoments"
         out_df.to_csv(kmom_out, sep="\t", index=False, float_format="%.10e")
-
         row = out_df.iloc[0]
         self.log._log(f"[kmom] Saved higher-order GRM moments to: {kmom_out}")
         self.log._log(
@@ -1372,9 +1315,7 @@ class GenomewideLDScore:
             "[kmom] "
             f"alpha_rank=1.00000000e+00, alpha_probe={row['alpha_probe']:.8e}, "
             f"t0_rank={row['t0_rank']:.8e}, t1_rank={row['t1_rank']:.8e}, t2_rank={row['t2_rank']:.8e}, "
-            f"t0_probealpha={row['t0_probealpha']:.8e}, "
-            f"t1_probealpha={row['t1_probealpha']:.8e}, "
-            f"t2_probealpha={row['t2_probealpha']:.8e}"
+            f"t0_probealpha={row['t0_probealpha']:.8e}, t1_probealpha={row['t1_probealpha']:.8e}, t2_probealpha={row['t2_probealpha']:.8e}"
         )
         self.log._log(
             "[kmom:diag] "

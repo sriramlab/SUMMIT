@@ -35,6 +35,7 @@ class Sumcore:
         rg=None,
         ldscores=None,
         ldscores_reg=None,
+        ldscores_reg_w=None,
         log=None,
         verbose=False,
         chisq_threshold=0,
@@ -60,29 +61,60 @@ class Sumcore:
         allow_neg_enr: bool = False,
         adjust_delta: bool = False,
         cov_rank=None,
+        trace_obj=None,
+        sumstats_pair=None,
+        phen_names=None,
+        **_unused_kwargs,
     ):
 
         self.log = log
         self.verbose = verbose
         self.verbose_level = utils._parse_verbose(verbose)
+        self.verbose_write_jack, self.verbose_write_normeq = utils._parse_verbose_outputs(verbose)
         self.start_time = utils._get_time()
         if self.log is not None:
             self.log._log("Analysis started at: " + utils._get_timestr(self.start_time))
 
-        self.phen_paths = utils._parse_rg_pair(rg)
-        self.phen_names = [utils._phen_name_from_path(p) for p in self.phen_paths]
+        self._preloaded_sumstats = None if sumstats_pair is None else tuple(sumstats_pair)
+        if self._preloaded_sumstats is not None:
+            if len(self._preloaded_sumstats) != 2:
+                raise ValueError("sumstats_pair must contain exactly two Sumstats objects.")
+            self.phen_paths = [None, None]
+            if phen_names is not None:
+                if len(phen_names) != 2:
+                    raise ValueError("phen_names must contain exactly two names when provided.")
+                self.phen_names = [str(phen_names[0]), str(phen_names[1])]
+            else:
+                self.phen_names = [
+                    str(getattr(self._preloaded_sumstats[0], "name", "trait1")),
+                    str(getattr(self._preloaded_sumstats[1], "name", "trait2")),
+                ]
+        else:
+            self.phen_paths = utils._parse_rg_pair(rg)
+            if phen_names is not None:
+                if len(phen_names) != 2:
+                    raise ValueError("phen_names must contain exactly two names when provided.")
+                self.phen_names = [str(phen_names[0]), str(phen_names[1])]
+            else:
+                self.phen_names = [utils._phen_name_from_path(p) for p in self.phen_paths]
 
-        self.trace = Trace(
-            bimpath=bim_path,
-            sumpath=None,
-            savepath=None,
-            log=self.log,
-            ldscores=ldscores,
-            ldscores_reg=ldscores_reg,
-            annot=annot,
-            verbose=bool(self.verbose_level),
-            delta=None,
-        )
+        if trace_obj is None:
+            self.trace = Trace(
+                bimpath=bim_path,
+                sumpath=None,
+                savepath=None,
+                log=self.log,
+                ldscores=ldscores,
+                ldscores_reg=ldscores_reg,
+                ldscores_reg_w=ldscores_reg_w,
+                annot=annot,
+                verbose=bool(self.verbose_level),
+                delta=None,
+            )
+        else:
+            self.trace = trace_obj
+            if hasattr(self.trace, "log"):
+                self.trace.log = self.log
 
         self.jackknife_spec = JackknifeSpec.parse(njack)
         self.align_alleles = bool(align_alleles)
@@ -134,31 +166,38 @@ class Sumcore:
         self.matched2 = None
 
     def _run(self):
-        pheno_cov_rank_override = self._derive_cov_rank_overrides_from_pheno()
-
-        if pheno_cov_rank_override is not None:
-            cov_rank1, cov_rank2 = pheno_cov_rank_override
-            cov_rank_source1 = "pheno-rg-cov"
-            cov_rank_source2 = "pheno-rg-cov"
+        if self._preloaded_sumstats is not None:
+            ss1, ss2 = self._preloaded_sumstats
+            if hasattr(ss1, "log"):
+                ss1.log = self.log
+            if hasattr(ss2, "log"):
+                ss2.log = self.log
         else:
-            cov_rank1, cov_rank2 = self.cov_rank_values
-            cov_rank_source1 = "cli" if cov_rank1 is not None else None
-            cov_rank_source2 = "cli" if cov_rank2 is not None else None
+            pheno_cov_rank_override = self._derive_cov_rank_overrides_from_pheno()
 
-        ss1 = Sumstats.from_file(
-            self.phen_paths[0],
-            name=self.phen_names[0],
-            log=self.log,
-            cov_rank=cov_rank1,
-            cov_rank_source=cov_rank_source1,
-        )
-        ss2 = Sumstats.from_file(
-            self.phen_paths[1],
-            name=self.phen_names[1],
-            log=self.log,
-            cov_rank=cov_rank2,
-            cov_rank_source=cov_rank_source2,
-        )
+            if pheno_cov_rank_override is not None:
+                cov_rank1, cov_rank2 = pheno_cov_rank_override
+                cov_rank_source1 = "pheno-rg-cov"
+                cov_rank_source2 = "pheno-rg-cov"
+            else:
+                cov_rank1, cov_rank2 = self.cov_rank_values
+                cov_rank_source1 = "cli" if cov_rank1 is not None else None
+                cov_rank_source2 = "cli" if cov_rank2 is not None else None
+
+            ss1 = Sumstats.from_file(
+                self.phen_paths[0],
+                name=self.phen_names[0],
+                log=self.log,
+                cov_rank=cov_rank1,
+                cov_rank_source=cov_rank_source1,
+            )
+            ss2 = Sumstats.from_file(
+                self.phen_paths[1],
+                name=self.phen_names[1],
+                log=self.log,
+                cov_rank=cov_rank2,
+                cov_rank_source=cov_rank_source2,
+            )
 
         aligned1 = ss1.align_to_trace(self.trace)
         aligned2 = ss2.align_to_trace(self.trace)
@@ -236,6 +275,16 @@ class Sumcore:
                 f"nonfinite_reconstructed_snps={summary_y_info.get('n_nonfinite', 0)}"
             )
 
+        rg_prepared = prepare_rg(
+            tv,
+            matched1,
+            matched2,
+            jk,
+            summary_y=summary_y,
+            summary_y_info=summary_y_info,
+            adjust_delta=self.adjust_delta,
+        )
+
         intercept = fit_intercept(
             tv,
             matched1,
@@ -250,21 +299,14 @@ class Sumcore:
             intercept_chisq_threshold=self.intercept_chisq_thr,
             intercept_weight_mode=self.intercept_weight_mode,
             collapse_reg_ld=self.collapse_reg_ld,
+            score_prepared=rg_prepared,
             log=self.log,
             jack_mode=self.jack_mode,
             nan_policy=self.nan_policy,
         )
 
         rg_fit = fit_rg(
-            prepare_rg(
-                tv,
-                matched1,
-                matched2,
-                jk,
-                summary_y=summary_y,
-                summary_y_info=summary_y_info,
-                adjust_delta=self.adjust_delta,
-            ),
+            rg_prepared,
             h2_fit1,
             h2_fit2,
             intercept,
@@ -298,12 +340,13 @@ class Sumcore:
                 verbose=(self.verbose_level >= 1),
             )
 
-        if self.verbose_level >= 2 and self.out is not None:
+        if self.out is not None and self.verbose_write_jack:
             jack_path = f"{self.out}.rg.jack"
             RGResultWriter.save_jackknife_text(rg_fit, jack_path)
             if self.log is not None:
                 self.log._log(f"Saved rg jackknife replicate dump to {jack_path}")
 
+        if self.out is not None and self.verbose_write_normeq:
             info = intercept.info if isinstance(intercept.info, dict) else {}
             n_overlap = info.get("n_overlap", None)
             if n_overlap is not None:
@@ -1135,8 +1178,9 @@ class Sumcore:
     def _derive_cov_rank_overrides_from_pheno(self):
         """
         If --pheno-rg and --pheno-rg-cov are both provided, derive cov_rank
-        (non-intercept df) from the external covariate designs and use those
-        to override any CLI/file defaults for BOTH h2 and rg estimation.
+        (non-intercept df) from the external covariate designs and attach those
+        values to the rg summary-moment path. h2 summary mode still forces
+        cov_rank=0 inside moments.build_h2_summary_moment().
         """
         if self.pheno_rg_paths is None or self.pheno_rg_cov_paths is None:
             return None
@@ -1170,4 +1214,3 @@ class Sumcore:
                 )
 
         return out
-

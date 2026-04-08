@@ -1219,154 +1219,509 @@ def fit_rg(
 # intercept estimation
 # -----------------------------------------------------------------------------
 
+@dataclass(frozen=True)
+class InterceptRegressionSystem:
+    x: np.ndarray          # (M,P) regression LD design used in the fitted mean
+    a: np.ndarray          # (M,P) score-side mass design used in beta(c)=solve(A^T X, A^T(y-c))
+    total_ld: np.ndarray   # (M,)
+    full_mass: np.ndarray  # (P,) masses on the FULL trace axis for beta -> gamma_total conversion
+    source: str
+    mode: str
 
-def _select_intercept_regression_ld(trace_view, *, collapse_reg_ld=False, log=None):
-    Lreg = trace_view.ldscores_reg
-    if Lreg is None:
-        Lmain = np.asarray(trace_view.ldscores, dtype=np.float64, order="C")
-        if Lmain.ndim == 1:
-            return Lmain.reshape(-1, 1), "main"
-        if Lmain.ndim != 2:
-            raise RuntimeError("Primary ldscores must be 1D or 2D.")
-        if Lmain.shape[1] == 1:
-            return Lmain, "main"
-        if not collapse_reg_ld:
-            raise RuntimeError(
-                "Intercept regression requires 1D LD by default. Provide --ldscores-reg "
-                "or pass --collapse-reg-ld to collapse the primary LD scores."
-            )
+
+def _as_2d_float_array(x, *, name: str) -> np.ndarray:
+    x = np.asarray(x, dtype=np.float64, order="C")
+    if x.ndim == 1:
+        return x.reshape(-1, 1)
+    if x.ndim != 2:
+        raise RuntimeError(f"{name} must be 1D or 2D.")
+    return x
+
+
+def _select_intercept_regression_system(trace_view, *, collapse_reg_ld=False, log=None):
+    A_main = _as_2d_float_array(trace_view.annot, name="annotation design")
+    L_main = _as_2d_float_array(trace_view.ldscores, name="primary ldscores")
+    if A_main.shape[0] != L_main.shape[0]:
+        raise RuntimeError("Annotation design and primary ldscores must share the same SNP axis.")
+
+    K = int(A_main.shape[1])
+    M = int(A_main.shape[0])
+
+    source = "main"
+    X_raw = L_main
+    if getattr(trace_view, "ldscores_reg", None) is not None:
+        X_raw = _as_2d_float_array(trace_view.ldscores_reg, name="ldscores_reg")
+        if X_raw.shape[0] != M:
+            raise RuntimeError("ldscores_reg and annotation design must share the same SNP axis.")
+        source = "reg"
+
+    P = int(X_raw.shape[1])
+
+    if P > 1 and P == K and not collapse_reg_ld:
         if log is not None:
             log._log(
-                f"[rg] Collapsing {Lmain.shape[1]}-column primary ldscores to total LD for intercept regression."
+                f"[rg:c] using {P}-column {source} LD design for exact partitioned intercept regression."
             )
-        return np.sum(Lmain, axis=1, dtype=np.float64, keepdims=True), "main-collapsed"
+        total_ld = np.sum(X_raw, axis=1, dtype=np.float64)
+        full_mass = np.sum(A_main, axis=0, dtype=np.float64)
+        return InterceptRegressionSystem(
+            x=np.asarray(X_raw, dtype=np.float64, order="C"),
+            a=np.asarray(A_main, dtype=np.float64, order="C"),
+            total_ld=np.asarray(total_ld, dtype=np.float64, order="C"),
+            full_mass=np.asarray(full_mass, dtype=np.float64),
+            source=source,
+            mode=f"{source}-partitioned",
+        )
 
-    Lreg = np.asarray(Lreg, dtype=np.float64, order="C")
-    if Lreg.ndim == 1:
-        return Lreg.reshape(-1, 1), "reg"
-    if Lreg.ndim != 2:
-        raise RuntimeError("ldscores_reg must be 1D or 2D.")
-    if Lreg.shape[1] == 1:
-        return Lreg, "reg"
-    if not collapse_reg_ld:
+    if P == 1 and K == 1 and not collapse_reg_ld:
+        return InterceptRegressionSystem(
+            x=np.asarray(X_raw, dtype=np.float64, order="C"),
+            a=np.ones((M, 1), dtype=np.float64),
+            total_ld=np.asarray(X_raw[:, 0], dtype=np.float64, order="C"),
+            full_mass=np.array([float(trace_view.nsnps)], dtype=np.float64),
+            source=source,
+            mode=source,
+        )
+
+    if collapse_reg_ld:
+        if X_raw.shape[1] > 1 and log is not None:
+            label = "primary ldscores" if source == "main" else "ldscores_reg"
+            log._log(
+                f"[rg] Collapsing {X_raw.shape[1]}-column {label} to total LD for intercept regression."
+            )
+        X = np.sum(X_raw, axis=1, dtype=np.float64, keepdims=True)
+        return InterceptRegressionSystem(
+            x=np.asarray(X, dtype=np.float64, order="C"),
+            a=np.ones((M, 1), dtype=np.float64),
+            total_ld=np.asarray(X[:, 0], dtype=np.float64, order="C"),
+            full_mass=np.array([float(trace_view.nsnps)], dtype=np.float64),
+            source=source,
+            mode=f"{source}-collapsed",
+        )
+
+    if K > 1 and P == 1:
         raise RuntimeError(
-            f"ldscores_reg has {Lreg.shape[1]} columns; provide native 1D regression LD "
-            "or pass --collapse-reg-ld."
+            "Partitioned summary-only intercept regression requires a multi-column LD design "
+            "matching trace_view.nbins. Provide matching --ldscores-reg, omit --ldscores-reg "
+            "to use the main partitioned LD scores, or pass --collapse-reg-ld to intentionally "
+            "collapse to total LD."
         )
-    if log is not None:
-        log._log(
-            f"[rg] Collapsing {Lreg.shape[1]}-column ldscores_reg to total LD for intercept regression."
-        )
-    return np.sum(Lreg, axis=1, dtype=np.float64, keepdims=True), "reg-collapsed"
+
+    raise RuntimeError(
+        f"Intercept regression design has {P} columns but trace_view.nbins={K}; "
+        "exact partitioned summary-only intercept regression requires matching columns "
+        "or --collapse-reg-ld."
+    )
 
 
-def _make_intercept_keep_mask(z1, z2, x, *, nsamp_max, threshold=None, chisq_mode="either"):
+def _select_intercept_weight_ld(trace_view, regsys: InterceptRegressionSystem, *, mode: str, weight_ld_override=None, log=None):
+    mode = str(mode).strip().lower()
+    if mode not in {"ldsc", "score"}:
+        raise ValueError("mode must be one of {'ldsc','score'}")
+
+    P = int(regsys.x.shape[1])
+
+    if mode == "score" and P == 1:
+        if weight_ld_override is not None and log is not None:
+            log._log(
+                "[rg:c] ignoring ldscores_reg_w in scalar SCORE-weight mode; "
+                "the legacy exact single-component estimator uses the regression LD itself."
+            )
+        return np.asarray(regsys.total_ld, dtype=np.float64, order="C"), "score-legacy-total-ld"
+
+    raw = weight_ld_override
+    source = None
+    if raw is None and getattr(trace_view, "ldscores_reg_w", None) is not None:
+        raw = getattr(trace_view, "ldscores_reg_w")
+        source = "trace-view-reg-w"
+    elif raw is not None:
+        source = "override-reg-w"
+
+    if raw is not None:
+        w = np.asarray(raw, dtype=np.float64, order="C")
+        if w.ndim == 2:
+            if w.shape[1] != 1:
+                raise RuntimeError("ldscores_reg_w must be 1D or single-column.")
+            w = w[:, 0]
+        elif w.ndim != 1:
+            raise RuntimeError("ldscores_reg_w must be 1D or single-column.")
+        if w.size != int(trace_view.nsnps):
+            raise RuntimeError(
+                f"ldscores_reg_w length mismatch with TraceView SNP axis: {w.size} vs {trace_view.nsnps}."
+            )
+        if log is not None:
+            log._log("[rg:c] using explicit 1D regression-weight LD (ldscores_reg_w) for intercept weights.")
+        return np.asarray(w, dtype=np.float64, order="C"), str(source or "reg-w")
+
+    if P == 1:
+        if log is not None and mode == "ldsc":
+            log._log(
+                "[rg:c] no ldscores_reg_w provided; scalar LDSC-weighted intercept regression "
+                "falls back to the legacy total regression LD weights."
+            )
+        return np.asarray(regsys.total_ld, dtype=np.float64, order="C"), "fallback-total-ld"
+
+    raise RuntimeError(
+        "Partitioned summary-only intercept regression requires a separate 1D regression-weight LD score "
+        "(ldscores_reg_w / --ldscores-reg-w)."
+    )
+
+
+def _make_intercept_keep_mask(
+    z1,
+    z2,
+    total_ld,
+    y=None,
+    *,
+    weight_ld=None,
+    nsamp_max,
+    chisq_threshold=None,
+    chisq_mode="either",
+):
     z1 = np.asarray(z1, dtype=np.float64).ravel()
     z2 = np.asarray(z2, dtype=np.float64).ravel()
-    x = np.asarray(x, dtype=np.float64).ravel()
-    if not (z1.size == z2.size == x.size):
-        raise ValueError("z1/z2/x length mismatch in intercept keep-mask construction.")
+    total_ld = np.asarray(total_ld, dtype=np.float64).ravel()
+    if not (z1.size == z2.size == total_ld.size):
+        raise ValueError("z1/z2/total_ld length mismatch in intercept keep-mask construction.")
 
-    keep = np.isfinite(z1) & np.isfinite(z2) & np.isfinite(x) & (x > 0.0)
-    thr, thr_mode = utils._resolve_chisq_threshold(float(nsamp_max), threshold)
+    if y is None:
+        finite_y = np.ones(total_ld.size, dtype=bool)
+    else:
+        y = np.asarray(y, dtype=np.float64).ravel()
+        if y.size != total_ld.size:
+            raise ValueError("y length mismatch in intercept keep-mask construction.")
+        finite_y = np.isfinite(y)
+
+    if weight_ld is None:
+        finite_wld = np.ones(total_ld.size, dtype=bool)
+    else:
+        weight_ld = np.asarray(weight_ld, dtype=np.float64).ravel()
+        if weight_ld.size != total_ld.size:
+            raise ValueError("weight_ld length mismatch in intercept keep-mask construction.")
+        finite_wld = np.isfinite(weight_ld) & (weight_ld > 0.0)
+
+    finite_z = np.isfinite(z1) & np.isfinite(z2)
+    finite_total_ld = np.isfinite(total_ld) & (total_ld > 0.0)
+    base = finite_z & finite_total_ld & finite_wld & finite_y
+
     mode = str(chisq_mode).strip().lower()
-    thr_used = None
+    chisq_keep = np.ones(total_ld.size, dtype=bool)
+    chisq_thr, chisq_thr_mode = utils._resolve_chisq_threshold(float(nsamp_max), chisq_threshold)
+    chisq_thr_used = None
 
-    if thr is not None:
-        thr = float(thr)
-        if np.isfinite(thr) and thr > 0.0:
+    if chisq_thr is not None:
+        chisq_thr = float(chisq_thr)
+        if np.isfinite(chisq_thr) and chisq_thr > 0.0:
             c1 = z1 * z1
             c2 = z2 * z2
+            c3 = np.abs(z1 * z2)
             if mode in ("either", "max"):
-                keep &= (c1 <= thr) & (c2 <= thr)
+                chisq_keep = (c1 <= chisq_thr) & (c2 <= chisq_thr) & (c3 <= chisq_thr)
             elif mode == "both":
-                keep &= ~((c1 > thr) & (c2 > thr))
+                chisq_keep = ~((c1 > chisq_thr) & (c2 > chisq_thr))
             else:
                 raise ValueError("chisq_mode must be one of {'either','both','max'}")
-            thr_used = thr
+            chisq_thr_used = chisq_thr
+
+    keep = base & chisq_keep
 
     info = {
-        "threshold": thr_used,
-        "threshold_mode": thr_mode,
+        "threshold": chisq_thr_used,
+        "threshold_mode": chisq_thr_mode,
         "chisq_mode": mode,
-        "n_total": int(z1.size),
+        "n_total": int(total_ld.size),
+        "n_base": int(np.sum(base)),
         "n_kept": int(np.sum(keep)),
         "n_removed": int(np.sum(~keep)),
-        "n_removed_nonfinite_or_nonpositive_ld": int(np.sum((~np.isfinite(x)) | (x <= 0.0))),
+        "n_removed_nonfinite_z": int(np.sum(~finite_z)),
+        "n_removed_nonfinite_or_nonpositive_total_ld": int(np.sum(~finite_total_ld)),
+        "n_removed_nonfinite_or_nonpositive_weight_ld": int(np.sum(~finite_wld)),
+        "n_removed_nonfinite_summary_y": int(np.sum(~finite_y)) if y is not None else 0,
+        "n_removed_chisq": int(np.sum(base & (~chisq_keep))),
     }
     return keep, info
 
 
-def _build_simple_intercept_weights(x, keep):
-    x = np.asarray(x, dtype=np.float64).ravel()
+def _build_simple_intercept_weights(weight_ld, keep):
+    weight_ld = np.asarray(weight_ld, dtype=np.float64).ravel()
     keep = np.asarray(keep, dtype=bool).ravel()
-    if x.size != keep.size:
-        raise ValueError("x/keep length mismatch.")
-    if np.any(keep & ((~np.isfinite(x)) | (x <= 0.0))):
-        raise ValueError("Total LD must be finite and >0 for kept SNPs in the intercept regression.")
-    w = np.zeros(x.size, dtype=np.float64)
-    w[keep] = 1.0 / x[keep]
+    if weight_ld.size != keep.size:
+        raise ValueError("weight_ld/keep length mismatch.")
+    if np.any(keep & ((~np.isfinite(weight_ld)) | (weight_ld <= 0.0))):
+        raise ValueError("Regression-weight LD must be finite and >0 for kept SNPs in the intercept regression.")
+    w = np.zeros(weight_ld.size, dtype=np.float64)
+    w[keep] = 1.0 / weight_ld[keep]
     if not np.isfinite(w).all() or np.sum(w) <= 0.0:
         raise ValueError("Invalid intercept regression weights.")
     return w
 
 
-def _solve_constrained_intercept_scalar_from_sums(
+def _compute_intercept_unit_summaries(jackknife, a, x, y, keep):
+    a = np.asarray(a, dtype=np.float64, order="C")
+    x = np.asarray(x, dtype=np.float64, order="C")
+    y = np.asarray(y, dtype=np.float64).ravel()
+    keep = np.asarray(keep, dtype=bool).ravel()
+
+    if a.ndim != 2 or x.ndim != 2:
+        raise ValueError("a and x must be 2D arrays.")
+    if a.shape != x.shape:
+        raise ValueError("a and x must have the same shape.")
+    if y.size != a.shape[0] or keep.size != a.shape[0]:
+        raise ValueError("Axis length mismatch in intercept unit summaries.")
+
+    U = int(jackknife.nunit)
+    P = int(x.shape[1])
+
+    m_u = np.zeros((U, P), dtype=np.float64)
+    t_u = np.zeros((U, P), dtype=np.float64)
+    S_u = np.zeros((U, P, P), dtype=np.float64)
+
+    for u in range(U):
+        s = int(jackknife.starts[u])
+        e = int(jackknife.ends[u])
+        if e <= s:
+            continue
+        mu = keep[s:e]
+        if not np.any(mu):
+            continue
+        au = a[s:e, :][mu, :]
+        xu = x[s:e, :][mu, :]
+        yu = y[s:e][mu]
+        m_u[u] = au.sum(axis=0, dtype=np.float64)
+        t_u[u] = au.T @ yu
+        S_u[u] = au.T @ xu
+
+    return m_u, t_u, S_u
+
+
+def _compute_weighted_intercept_unit_summaries(jackknife, x, y, w):
+    x = np.asarray(x, dtype=np.float64, order="C")
+    y = np.asarray(y, dtype=np.float64).ravel()
+    w = np.asarray(w, dtype=np.float64).ravel()
+
+    if x.ndim != 2:
+        raise ValueError("x must be a 2D array.")
+    if y.size != x.shape[0] or w.size != x.shape[0]:
+        raise ValueError("Axis length mismatch in weighted intercept unit summaries.")
+
+    U = int(jackknife.nunit)
+    P = int(x.shape[1])
+
+    W_u = np.zeros(U, dtype=np.float64)
+    XW_u = np.zeros((U, P), dtype=np.float64)
+    XXW_u = np.zeros((U, P, P), dtype=np.float64)
+    Sy_u = np.zeros(U, dtype=np.float64)
+    XWy_u = np.zeros((U, P), dtype=np.float64)
+
+    for u in range(U):
+        s = int(jackknife.starts[u])
+        e = int(jackknife.ends[u])
+        if e <= s:
+            continue
+        wu = w[s:e]
+        if not np.any(wu != 0.0):
+            continue
+        xu = x[s:e, :]
+        yu = y[s:e]
+        wyu = wu * yu
+        W_u[u] = float(np.sum(wu))
+        XW_u[u] = np.einsum("ni,n->i", xu, wu, optimize=True)
+        XXW_u[u] = np.einsum("ni,n,nj->ij", xu, wu, xu, optimize=True)
+        Sy_u[u] = float(np.dot(wu, yu))
+        XWy_u[u] = np.einsum("ni,n->i", xu, wyu, optimize=True)
+
+    return W_u, XW_u, XXW_u, Sy_u, XWy_u
+
+
+def _compute_weighted_intercept_summaries(x, y, w):
+    x = np.asarray(x, dtype=np.float64, order="C")
+    y = np.asarray(y, dtype=np.float64).ravel()
+    w = np.asarray(w, dtype=np.float64).ravel()
+    if x.ndim != 2:
+        raise ValueError("x must be a 2D array.")
+    if y.size != x.shape[0] or w.size != x.shape[0]:
+        raise ValueError("Axis length mismatch in weighted intercept summaries.")
+    wy = w * y
+    W = float(np.sum(w))
+    XW = np.einsum("ni,n->i", x, w, optimize=True)
+    XXW = np.einsum("ni,n,nj->ij", x, w, x, optimize=True)
+    Sy = float(np.dot(w, y))
+    XWy = np.einsum("ni,n->i", x, wy, optimize=True)
+    return W, XW, XXW, Sy, XWy
+
+
+def _solve_constrained_intercept_from_sums(
     m_fit,
-    l1,
-    t1,
+    S_fit,
+    t_fit,
     W,
-    Sx,
-    Sxx,
+    XW,
+    XXW,
     Sy,
-    Sxy,
+    XWy,
+    *,
     denom_floor=0.0,
 ):
-    m_fit = np.asarray(m_fit, dtype=np.float64)
-    l1 = np.asarray(l1, dtype=np.float64)
-    t1 = np.asarray(t1, dtype=np.float64)
-    W = np.asarray(W, dtype=np.float64)
-    Sx = np.asarray(Sx, dtype=np.float64)
-    Sxx = np.asarray(Sxx, dtype=np.float64)
-    Sy = np.asarray(Sy, dtype=np.float64)
-    Sxy = np.asarray(Sxy, dtype=np.float64)
+    S_fit = np.asarray(S_fit, dtype=np.float64)
+    squeeze = False
+    if S_fit.ndim == 2:
+        squeeze = True
+        S_fit = S_fit[None, :, :]
+        m_fit = np.asarray(m_fit, dtype=np.float64).reshape(1, -1)
+        t_fit = np.asarray(t_fit, dtype=np.float64).reshape(1, -1)
+        W = np.asarray([W], dtype=np.float64)
+        XW = np.asarray(XW, dtype=np.float64).reshape(1, -1)
+        XXW = np.asarray(XXW, dtype=np.float64).reshape(1, S_fit.shape[1], S_fit.shape[2])
+        Sy = np.asarray([Sy], dtype=np.float64)
+        XWy = np.asarray(XWy, dtype=np.float64).reshape(1, -1)
+    elif S_fit.ndim == 3:
+        m_fit = np.asarray(m_fit, dtype=np.float64)
+        t_fit = np.asarray(t_fit, dtype=np.float64)
+        W = np.asarray(W, dtype=np.float64).ravel()
+        XW = np.asarray(XW, dtype=np.float64)
+        XXW = np.asarray(XXW, dtype=np.float64)
+        Sy = np.asarray(Sy, dtype=np.float64).ravel()
+        XWy = np.asarray(XWy, dtype=np.float64)
+    else:
+        raise ValueError("S_fit must be 2D or 3D.")
 
-    m_fit, l1, t1, W, Sx, Sxx, Sy, Sxy = np.broadcast_arrays(m_fit, l1, t1, W, Sx, Sxx, Sy, Sxy)
-    c = np.full(m_fit.shape, np.nan, dtype=np.float64)
-    b = np.full(m_fit.shape, np.nan, dtype=np.float64)
+    R, P, P2 = S_fit.shape
+    if P != P2:
+        raise ValueError("S_fit must have square trailing dimensions.")
+    if m_fit.shape != (R, P) or t_fit.shape != (R, P):
+        raise ValueError("m_fit and t_fit must have shape (R,P).")
+    if W.shape != (R,) or Sy.shape != (R,):
+        raise ValueError("W and Sy must have shape (R,).")
+    if XW.shape != (R, P) or XWy.shape != (R, P):
+        raise ValueError("XW and XWy must have shape (R,P).")
+    if XXW.shape != (R, P, P):
+        raise ValueError("XXW must have shape (R,P,P).")
 
-    base_good = (
-        np.isfinite(m_fit) & np.isfinite(l1) & np.isfinite(t1) & np.isfinite(W) &
-        np.isfinite(Sx) & np.isfinite(Sxx) & np.isfinite(Sy) & np.isfinite(Sxy) &
-        (m_fit > 0.0) & (l1 > 0.0) & (W > 0.0)
+    alpha = _solve_linear_batch(S_fit, t_fit)
+    delta = _solve_linear_batch(S_fit, m_fit)
+
+    c = np.full(R, np.nan, dtype=np.float64)
+    beta = np.full((R, P), np.nan, dtype=np.float64)
+
+    good = (
+        np.isfinite(W) & (W > 0.0) & np.isfinite(Sy) &
+        np.isfinite(S_fit).all(axis=(1, 2)) &
+        np.isfinite(m_fit).all(axis=1) &
+        np.isfinite(t_fit).all(axis=1) &
+        np.isfinite(XW).all(axis=1) &
+        np.isfinite(XXW).all(axis=(1, 2)) &
+        np.isfinite(XWy).all(axis=1) &
+        np.isfinite(alpha).all(axis=1) &
+        np.isfinite(delta).all(axis=1)
     )
-    if not np.any(base_good):
-        return c, b, base_good
 
-    alpha = np.full(m_fit.shape, np.nan, dtype=np.float64)
-    beta = np.full(m_fit.shape, np.nan, dtype=np.float64)
-    alpha[base_good] = t1[base_good] / l1[base_good]
-    beta[base_good] = m_fit[base_good] / l1[base_good]
+    if np.any(good):
+        num = (
+            Sy
+            - np.einsum("ri,ri->r", delta, XWy)
+            - np.einsum("ri,ri->r", alpha, XW)
+            + np.einsum("ri,rij,rj->r", alpha, XXW, delta)
+        )
+        den = (
+            W
+            - 2.0 * np.einsum("ri,ri->r", delta, XW)
+            + np.einsum("ri,rij,rj->r", delta, XXW, delta)
+        )
 
-    num = Sy - alpha * Sx - beta * Sxy + (alpha * beta) * Sxx
-    den = W - 2.0 * beta * Sx + (beta * beta) * Sxx
+        if denom_floor is not None:
+            denom_floor = float(denom_floor)
+            if np.isfinite(denom_floor) and denom_floor > 0.0:
+                den = np.where(np.isfinite(den) & (den > 0.0), np.maximum(den, denom_floor), den)
 
-    if denom_floor is not None:
-        denom_floor = float(denom_floor)
-        if np.isfinite(denom_floor) and denom_floor > 0.0:
-            den = np.where(np.isfinite(den) & (den > 0.0), np.maximum(den, denom_floor), den)
+        good = good & np.isfinite(num) & np.isfinite(den) & (den > 0.0)
+        if np.any(good):
+            c[good] = num[good] / den[good]
+            beta[good] = alpha[good] - c[good, None] * delta[good]
+            good = good & np.isfinite(c) & np.isfinite(beta).all(axis=1)
+            c[~good] = np.nan
+            beta[~good] = np.nan
 
-    good = base_good & np.isfinite(num) & np.isfinite(den) & (den > 0.0)
-    if not np.any(good):
-        return c, b, good
+    if squeeze:
+        return float(c[0]), beta[0], bool(good[0])
+    return c, beta, good
 
-    c[good] = num[good] / den[good]
-    b[good] = (t1[good] - m_fit[good] * c[good]) / l1[good]
 
-    good = good & np.isfinite(c) & np.isfinite(b)
-    c[~good] = np.nan
-    b[~good] = np.nan
-    return c, b, good
+def _full_intercept_denominator(m_fit, S_fit, W, XW, XXW):
+    S_fit = np.asarray(S_fit, dtype=np.float64)
+    if S_fit.ndim != 2:
+        raise ValueError("S_fit must be 2D for the full-sample denominator.")
+    delta = _solve_linear_batch(S_fit[None, :, :], np.asarray(m_fit, dtype=np.float64).reshape(1, -1))[0]
+    if not np.isfinite(delta).all():
+        return np.nan
+    den = (
+        float(W)
+        - 2.0 * float(np.dot(delta, np.asarray(XW, dtype=np.float64)))
+        + float(delta @ np.asarray(XXW, dtype=np.float64) @ delta)
+    )
+    return float(den) if np.isfinite(den) else np.nan
+
+
+def _intercept_gamma_total_from_beta(beta, mass, sqrt_n1n2):
+    beta = np.asarray(beta, dtype=np.float64)
+    mass = np.asarray(mass, dtype=np.float64)
+    if beta.ndim == 1:
+        beta = beta[None, :]
+    if beta.ndim != 2:
+        raise ValueError("beta must be 1D or 2D.")
+
+    if mass.ndim == 1:
+        mass = np.broadcast_to(mass.reshape(1, -1), beta.shape)
+    elif mass.ndim == 2:
+        if mass.shape != beta.shape:
+            raise ValueError("beta/mass dimension mismatch.")
+    else:
+        raise ValueError("mass must be 1D or 2D.")
+
+    s = float(sqrt_n1n2)
+    if not (np.isfinite(s) and s > 0.0):
+        raise ValueError("sqrt_n1n2 must be positive and finite.")
+    return np.einsum("rp,rp->r", beta, mass, optimize=True) / s
+
+
+def _score_gamma_total_from_c(prepared: RGPrepared, c, *, rep_index: int):
+    rep_index = int(rep_index)
+    if rep_index < 0:
+        rep_index += prepared.jackknife.nrep + 1
+    if rep_index < 0 or rep_index > int(prepared.jackknife.nrep):
+        raise IndexError(f"rep_index out of range: {rep_index}")
+
+    c = float(c)
+    if not np.isfinite(c):
+        return np.nan
+
+    Ak = np.asarray(prepared.Ak_rep[rep_index], dtype=np.float64).reshape(1, -1)
+    Ay = np.asarray(prepared.Ay_rep[rep_index], dtype=np.float64).reshape(1, -1)
+    lhs = np.asarray(prepared.lhs[rep_index], dtype=np.float64).reshape(1, prepared.trace_view.nbins, prepared.trace_view.nbins)
+    sqrt_n1n2 = float(np.sqrt(float(prepared.n1_scale) * float(prepared.n2_scale)))
+
+    with np.errstate(divide="ignore", invalid="ignore"):
+        rhs = ((Ay - c * Ak) * sqrt_n1n2) / Ak
+    bad = (~np.isfinite(rhs)) | (~np.isfinite(Ak)) | (Ak <= 0.0)
+    rhs[bad] = np.nan
+
+    gamma = _solve_linear_batch(lhs, rhs)[0]
+    if gamma.ndim != 1 or gamma.size != prepared.trace_view.nbins:
+        return np.nan
+    if not np.isfinite(gamma).any():
+        return np.nan
+    return float(np.nansum(gamma))
+
+
+def _replicate_active_mask(jackknife, keep, rep_index: int) -> np.ndarray:
+    keep = np.asarray(keep, dtype=bool)
+    rep_index = int(rep_index)
+    if rep_index == int(jackknife.nrep):
+        return keep
+    unit_id = np.asarray(jackknife.unit_id, dtype=np.int64)
+    D = np.asarray(jackknife.D, dtype=np.float64)
+    if D.shape[0] != int(jackknife.nrep) or unit_id.size != keep.size:
+        raise ValueError("Jackknife replicate mask shape mismatch.")
+    return keep & (D[rep_index, unit_id] < 0.5)
 
 
 def _ldsc_gencov_weights_1d(
@@ -1396,12 +1751,19 @@ def _ldsc_gencov_weights_1d(
     if not (np.isfinite(m_tot) and m_tot > 0.0):
         raise ValueError("m_tot must be positive and finite.")
 
-    h1 = float(np.clip(h1, 0.0, 1.0))
-    h2 = float(np.clip(h2, 0.0, 1.0))
-    rho_g = float(np.clip(rho_g, -1.0, 1.0))
-    intercept_gencov = 0.0 if intercept_gencov is None else float(intercept_gencov)
-    intercept_hsq1 = 1.0 if intercept_hsq1 is None else float(intercept_hsq1)
-    intercept_hsq2 = 1.0 if intercept_hsq2 is None else float(intercept_hsq2)
+    if intercept_gencov is None:
+        intercept_gencov = 0.0
+    if intercept_hsq1 is None:
+        intercept_hsq1 = 1.0
+    if intercept_hsq2 is None:
+        intercept_hsq2 = 1.0
+
+    h1 = min(max(float(h1), 0.0), 1.0)
+    h2 = min(max(float(h2), 0.0), 1.0)
+    rho_g = min(max(float(rho_g), -1.0), 1.0)
+    intercept_gencov = float(intercept_gencov)
+    intercept_hsq1 = float(intercept_hsq1)
+    intercept_hsq2 = float(intercept_hsq2)
 
     int_floor = float(intercept_hsq_floor)
     if not (np.isfinite(int_floor) and int_floor > 0.0):
@@ -1409,17 +1771,17 @@ def _ldsc_gencov_weights_1d(
     intercept_hsq1 = max(intercept_hsq1, int_floor)
     intercept_hsq2 = max(intercept_hsq2, int_floor)
 
-    ld_eff = np.fmax(np.where(np.isfinite(ld), ld, 1.0), 1.0)
-    w_ld_eff = np.fmax(np.where(np.isfinite(w_ld), w_ld, 1.0), 1.0)
+    ld_eff = np.fmax(ld, 1.0)
+    w_ld_eff = np.fmax(w_ld, 1.0)
 
     a = (n1 * (h1 * ld_eff) / m_tot) + intercept_hsq1
     b = (n2 * (h2 * ld_eff) / m_tot) + intercept_hsq2
     c = (np.sqrt(n1 * n2) * (rho_g * ld_eff) / m_tot) + intercept_gencov
-    den = a * b + c * c
 
     eps = float(weight_floor)
     if not (np.isfinite(eps) and eps > 0.0):
         eps = 1e-12
+    den = a * b + c * c
     den = np.where(np.isfinite(den), den, np.inf)
     den = np.maximum(den, eps)
     w = 1.0 / (w_ld_eff * den)
@@ -1521,9 +1883,12 @@ def fit_intercept(
     intercept_hsq_floor: float = 1e-8,
     intercept_weight_floor: float = 1e-12,
     denom_floor_rel: float = 1e-12,
+    weight_ld_override=None,
+    score_prepared: RGPrepared | None = None,
     log=None,
     jack_mode: str = "mean",
     nan_policy: str = "omit",
+    **_unused_kwargs,
 ) -> InterceptFit:
     _validate_common_axis(trace_view, matched1, matched2, jackknife)
     if fixed_c is not None:
@@ -1546,20 +1911,50 @@ def fit_intercept(
     if summary_y is None:
         summary_y, summary_y_info = build_rg_summary_moment(matched1, matched2)
 
-    L1, ld_source = _select_intercept_regression_ld(
+    score_prepared_local = score_prepared
+    if mode == "ldsc" and score_prepared_local is None:
+        score_prepared_local = prepare_rg(
+            trace_view,
+            matched1,
+            matched2,
+            jackknife,
+            summary_y=summary_y,
+            summary_y_info=summary_y_info,
+            adjust_delta=False,
+        )
+
+    regsys = _select_intercept_regression_system(
         trace_view,
         collapse_reg_ld=collapse_reg_ld,
         log=log,
     )
-    if L1.shape[1] != 1:
-        raise RuntimeError("Intercept regression currently requires 1D LD after any collapsing.")
 
-    x = np.asarray(L1[:, 0], dtype=np.float64)
+    x = np.asarray(regsys.x, dtype=np.float64, order="C")
+    a = np.asarray(regsys.a, dtype=np.float64, order="C")
+    total_ld = np.asarray(regsys.total_ld, dtype=np.float64).ravel()
+    full_mass = np.asarray(regsys.full_mass, dtype=np.float64).ravel()
+
+    if x.shape != a.shape:
+        raise RuntimeError("Intercept regression design and score-side mass design must have the same shape.")
+    if x.shape[0] != trace_view.nsnps or total_ld.size != trace_view.nsnps:
+        raise RuntimeError("Intercept regression design was not built on the main SNP axis.")
+
+    P = int(x.shape[1])
+    R = int(jackknife.nrep)
+
     z1 = np.asarray(matched1.z, dtype=np.float64)
     z2 = np.asarray(matched2.z, dtype=np.float64)
     y = np.asarray(summary_y, dtype=np.float64)
-    if y.ndim != 1 or y.size != x.size:
-        raise ValueError(f"summary_y must have shape ({x.size},), got {y.shape}")
+    if y.ndim != 1 or y.size != total_ld.size:
+        raise ValueError(f"summary_y must have shape ({total_ld.size},), got {y.shape}")
+
+    weight_ld, weight_ld_source = _select_intercept_weight_ld(
+        trace_view,
+        regsys,
+        mode=mode,
+        weight_ld_override=weight_ld_override,
+        log=log,
+    )
 
     n1_scalar = float(
         summary_y_info.get("trait1_n_scale", getattr(matched1, "n_scale", matched1.nsamp))
@@ -1574,17 +1969,20 @@ def fit_intercept(
     keep, info = _make_intercept_keep_mask(
         z1,
         z2,
-        x,
+        total_ld,
+        y=y,
+        weight_ld=weight_ld,
         nsamp_max=nsamp_max,
-        threshold=intercept_chisq_threshold,
+        chisq_threshold=intercept_chisq_threshold,
         chisq_mode=chisq_mode,
     )
-    keep &= np.isfinite(y)
 
-    info["ld_source"] = ld_source
+    info["ld_source"] = regsys.source
+    info["weight_ld_source"] = weight_ld_source
+    info["regression_design_mode"] = regsys.mode
+    info["regression_ncoef"] = P
     info["weight_mode"] = mode
     info["summary_y_mode"] = None if summary_y_info is None else str(summary_y_info.get("mode", "unknown"))
-    info["n_removed_nonfinite_summary_y"] = int(np.sum(~np.isfinite(y)))
     info["trait1_n_scale"] = n1_scalar
     info["trait2_n_scale"] = n2_scalar
     if summary_y_info is not None:
@@ -1604,103 +2002,75 @@ def fit_intercept(
         tag = " (auto)" if info.get("threshold_mode") == "auto" else ""
         log._log(
             f"[rg:c] intercept chi^2 filter: threshold={info['threshold']:.3f}{tag}, "
-            f"mode={info['chisq_mode']}, removed={info['n_removed']} SNPs, kept={info['n_kept']}."
+            f"mode={info['chisq_mode']}, removed={info['n_removed_chisq']} SNPs, "
+            f"kept_after_all={info['n_kept']}."
         )
 
-    U = jackknife.nunit
-    starts = np.asarray(jackknife.starts, dtype=np.int64)
-    ends = np.asarray(jackknife.ends, dtype=np.int64)
     D = np.asarray(jackknife.D, dtype=np.float64, order="C")
-
-    keep_f = keep.astype(np.float64, copy=False)
-    x_fit = np.where(keep, x, 0.0)
-    y_fit = np.where(keep, y, 0.0)
-
-    m_u = np.zeros(U, dtype=np.float64)
-    l1_u = np.zeros(U, dtype=np.float64)
-    t1_u = np.zeros(U, dtype=np.float64)
-    for u in range(U):
-        s = int(starts[u])
-        e = int(ends[u])
-        if e <= s:
-            continue
-        m_u[u] = float(np.sum(keep_f[s:e]))
-        l1_u[u] = float(np.sum(x_fit[s:e]))
-        t1_u[u] = float(np.sum(y_fit[s:e]))
-
-    m_fit_full = float(np.sum(m_u))
-    l1_full = float(np.sum(l1_u))
-    t1_full = float(np.sum(t1_u))
-    if not (m_fit_full > 1.0 and np.isfinite(l1_full) and l1_full > 0.0 and np.isfinite(t1_full)):
+    unit_sizes = jackknife.unit_sizes(active_mask=keep, dtype=np.float64)
+    sqrt_n1n2 = float(np.sqrt(n1_scalar * n2_scalar))
+    if score_prepared_local is not None:
+        m_tot_weight = float(np.sum(np.asarray(score_prepared_local.Ak_rep[-1], dtype=np.float64)))
+    else:
+        m_tot_weight = float(np.sum(full_mass))
+    if not (np.isfinite(sqrt_n1n2) and sqrt_n1n2 > 0.0 and np.isfinite(m_tot_weight) and m_tot_weight > 0.0):
         raise RuntimeError(
-            "Intercept regression became ill-posed after filtering: "
-            f"M_fit={m_fit_full}, L1={l1_full}, T1={t1_full}."
+            f"Invalid scales for intercept regression: sqrt_n1n2={sqrt_n1n2}, m_tot={m_tot_weight}."
         )
 
-    def _weighted_scalar_summaries(w: np.ndarray):
-        w = np.asarray(w, dtype=np.float64).ravel()
-        if w.size != x.size:
-            raise ValueError("Intercept weights length mismatch with LD axis.")
-        wx = w * x
-        W = float(np.sum(w))
-        Sx = float(np.sum(wx))
-        Sxx = float(np.sum(wx * x))
-        Sy = float(np.sum(w * y))
-        Sxy = float(np.sum(wx * y))
-        return W, Sx, Sxx, Sy, Sxy
+    m_u, t_u, S_u = _compute_intercept_unit_summaries(jackknife, a, x, y, keep)
+    m_full = np.sum(m_u, axis=0, dtype=np.float64)
+    t_full = np.sum(t_u, axis=0, dtype=np.float64)
+    S_full = np.sum(S_u, axis=0, dtype=np.float64)
 
-    def _weighted_unit_summaries(w: np.ndarray):
-        w = np.asarray(w, dtype=np.float64).ravel()
-        if w.size != x.size:
-            raise ValueError("Intercept weights length mismatch with LD axis.")
-        wx = w * x
-        wxx = wx * x
-        wy = w * y
-        wxy = wx * y
+    m_rep = _stack_delete_replicates(m_full, m_u, D)
+    t_rep = _stack_delete_replicates(t_full, t_u, D)
+    S_rep = _stack_delete_replicates(S_full, S_u, D)
 
-        W_u = np.zeros(U, dtype=np.float64)
-        Sx_u = np.zeros(U, dtype=np.float64)
-        Sxx_u = np.zeros(U, dtype=np.float64)
-        Sy_u = np.zeros(U, dtype=np.float64)
-        Sxy_u = np.zeros(U, dtype=np.float64)
-        for u in range(U):
-            s = int(starts[u])
-            e = int(ends[u])
-            if e <= s:
-                continue
-            W_u[u] = float(np.sum(w[s:e]))
-            Sx_u[u] = float(np.sum(wx[s:e]))
-            Sxx_u[u] = float(np.sum(wxx[s:e]))
-            Sy_u[u] = float(np.sum(wy[s:e]))
-            Sxy_u[u] = float(np.sum(wxy[s:e]))
-        return W_u, Sx_u, Sxx_u, Sy_u, Sxy_u
+    if not (np.isfinite(m_full).all() and np.isfinite(t_full).all() and np.isfinite(S_full).all()):
+        raise RuntimeError("Intercept regression summaries contain non-finite values.")
+    if not np.any(m_full > 0.0):
+        raise RuntimeError("Intercept regression retained zero score-side mass after filtering.")
 
-    w_score = _build_simple_intercept_weights(x, keep)
-    W0, Sx0, Sxx0, Sy0, Sxy0 = _weighted_scalar_summaries(w_score)
-
-    c0, b0, ok0 = _solve_constrained_intercept_scalar_from_sums(
-        np.array([m_fit_full], dtype=np.float64),
-        np.array([l1_full], dtype=np.float64),
-        np.array([t1_full], dtype=np.float64),
-        np.array([W0], dtype=np.float64),
-        np.array([Sx0], dtype=np.float64),
-        np.array([Sxx0], dtype=np.float64),
-        np.array([Sy0], dtype=np.float64),
-        np.array([Sxy0], dtype=np.float64),
-        denom_floor=0.0,
+    w_score = _build_simple_intercept_weights(weight_ld, keep)
+    W_u0, XW_u0, XXW_u0, Sy_u0, XWy_u0 = _compute_weighted_intercept_unit_summaries(
+        jackknife,
+        x,
+        y,
+        w_score,
     )
-    if not bool(ok0[0]):
+    W_rep0 = _stack_delete_replicates(np.sum(W_u0, dtype=np.float64), W_u0, D)
+    XW_rep0 = _stack_delete_replicates(np.sum(XW_u0, axis=0, dtype=np.float64), XW_u0, D)
+    XXW_rep0 = _stack_delete_replicates(np.sum(XXW_u0, axis=0, dtype=np.float64), XXW_u0, D)
+    Sy_rep0 = _stack_delete_replicates(np.sum(Sy_u0, dtype=np.float64), Sy_u0, D)
+    XWy_rep0 = _stack_delete_replicates(np.sum(XWy_u0, axis=0, dtype=np.float64), XWy_u0, D)
+
+    den0 = _full_intercept_denominator(m_full, S_full, W_rep0[-1], XW_rep0[-1], XXW_rep0[-1])
+    floor_rel = float(denom_floor_rel)
+    if not (np.isfinite(floor_rel) and floor_rel >= 0.0):
+        floor_rel = 1e-12
+    denom_floor0 = 0.0 if not np.isfinite(den0) else max(floor_rel * max(float(den0), 1.0), 0.0)
+
+    c_reps, beta_reps, good0 = _solve_constrained_intercept_from_sums(
+        m_rep,
+        S_rep,
+        t_rep,
+        W_rep0,
+        XW_rep0,
+        XXW_rep0,
+        Sy_rep0,
+        XWy_rep0,
+        denom_floor=denom_floor0,
+    )
+    if not bool(good0[-1]):
         raise RuntimeError("Failed to initialize constrained intercept fit.")
 
-    c_cur = float(c0[0])
-    b_cur = float(b0[0])
-    w_final = w_score
+    w_final_full = w_score
 
     if mode == "ldsc":
         n_iter = int(irwls_iters)
         if n_iter < 0:
             raise ValueError("irwls_iters must be >= 0.")
-
         if not (
             np.isfinite(n1_scalar) and np.isfinite(n2_scalar) and n1_scalar > 0.0 and n2_scalar > 0.0
         ):
@@ -1708,121 +2078,168 @@ def fit_intercept(
                 f"Invalid n_scale values for intercept IRWLS: n1={n1_scalar}, n2={n2_scalar}."
             )
 
-        sqrt_n1n2_scalar = float(np.sqrt(n1_scalar * n2_scalar))
-        m_tot_weight = float(trace_view.nsnps)
+        h1_tot_reps = np.asarray(h2_fit1.h2_reps[:, -1], dtype=np.float64)
+        h2_tot_reps = np.asarray(h2_fit2.h2_reps[:, -1], dtype=np.float64)
+        if h1_tot_reps.shape != (R + 1,) or h2_tot_reps.shape != (R + 1,):
+            raise ValueError("h2 jackknife replicate shape mismatch with rg intercept replicates.")
 
-        h1 = float(h2_fit1.h2[-1, 0]) if np.isfinite(h2_fit1.h2[-1, 0]) else 0.0
-        h2 = float(h2_fit2.h2[-1, 0]) if np.isfinite(h2_fit2.h2[-1, 0]) else 0.0
-        h1 = float(np.clip(h1, 0.0, 1.0))
-        h2 = float(np.clip(h2, 0.0, 1.0))
+        n1_vec = np.full(total_ld.size, n1_scalar, dtype=np.float64)
+        n2_vec = np.full(total_ld.size, n2_scalar, dtype=np.float64)
+
+        c_full = float(c_reps[-1])
+        beta_full = np.asarray(beta_reps[-1], dtype=np.float64).copy()
+        h1_plugin = float(np.clip(h1_tot_reps[-1], 0.0, 1.0))
+        h2_plugin = float(np.clip(h2_tot_reps[-1], 0.0, 1.0))
 
         for _ in range(n_iter):
-            rho_cur = float((m_tot_weight / sqrt_n1n2_scalar) * b_cur)
+            rho_full = _score_gamma_total_from_c(score_prepared_local, c_full, rep_index=R)
+            if not np.isfinite(rho_full):
+                raise RuntimeError("Failed to obtain a finite full-sample SCORE plug-in gamma_g for LDSC-IRWLS intercept weighting.")
             w_cur = _ldsc_gencov_weights_1d(
-                ld=x,
-                w_ld=x,
-                n1=np.full(x.size, n1_scalar, dtype=np.float64),
-                n2=np.full(x.size, n2_scalar, dtype=np.float64),
+                ld=total_ld,
+                w_ld=weight_ld,
+                n1=n1_vec,
+                n2=n2_vec,
                 m_tot=m_tot_weight,
-                h1=h1,
-                h2=h2,
-                rho_g=rho_cur,
-                intercept_gencov=c_cur,
+                h1=h1_plugin,
+                h2=h2_plugin,
+                rho_g=rho_full,
+                intercept_gencov=c_full,
                 intercept_hsq1=intercept_hsq1,
                 intercept_hsq2=intercept_hsq2,
                 intercept_hsq_floor=intercept_hsq_floor,
                 weight_floor=intercept_weight_floor,
             )
             w_cur = np.where(keep, w_cur, 0.0)
-
-            W, Sx, Sxx, Sy, Sxy = _weighted_scalar_summaries(w_cur)
-            c_new, b_new, ok = _solve_constrained_intercept_scalar_from_sums(
-                np.array([m_fit_full], dtype=np.float64),
-                np.array([l1_full], dtype=np.float64),
-                np.array([t1_full], dtype=np.float64),
-                np.array([W], dtype=np.float64),
-                np.array([Sx], dtype=np.float64),
-                np.array([Sxx], dtype=np.float64),
-                np.array([Sy], dtype=np.float64),
-                np.array([Sxy], dtype=np.float64),
+            Wf, XWf, XXWf, Syf, XWyf = _compute_weighted_intercept_summaries(x, y, w_cur)
+            c_new, beta_new, ok = _solve_constrained_intercept_from_sums(
+                m_full,
+                S_full,
+                t_full,
+                Wf,
+                XWf,
+                XXWf,
+                Syf,
+                XWyf,
                 denom_floor=0.0,
             )
-            if not bool(ok[0]):
+            if not ok:
                 raise RuntimeError("LDSC-IRWLS intercept update failed on the full sample.")
+            c_full = float(c_new)
+            beta_full = np.asarray(beta_new, dtype=np.float64)
+            w_final_full = w_cur
 
-            c_cur = float(c_new[0])
-            b_cur = float(b_new[0])
-            w_final = w_cur
+        den_full = _full_intercept_denominator(m_full, S_full, Wf, XWf, XXWf)
+        denom_floor_full = 0.0 if not np.isfinite(den_full) else max(floor_rel * max(float(den_full), 1.0), 0.0)
+        c_fin, beta_fin, ok = _solve_constrained_intercept_from_sums(
+            m_full,
+            S_full,
+            t_full,
+            Wf,
+            XWf,
+            XXWf,
+            Syf,
+            XWyf,
+            denom_floor=denom_floor_full,
+        )
+        if not ok:
+            raise RuntimeError("Final constrained full-sample intercept solve failed.")
+        c_reps[-1] = float(c_fin)
+        beta_reps[-1] = np.asarray(beta_fin, dtype=np.float64)
 
-        info["h1_plugin"] = h1
-        info["h2_plugin"] = h2
+        for r in range(R):
+            active = _replicate_active_mask(jackknife, keep, r)
+            if int(np.sum(active)) <= 1:
+                c_reps[r] = np.nan
+                beta_reps[r] = np.nan
+                continue
+
+            h1_r = float(np.clip(h1_tot_reps[r], 0.0, 1.0))
+            h2_r = float(np.clip(h2_tot_reps[r], 0.0, 1.0))
+            if not (np.isfinite(h1_r) and np.isfinite(h2_r)):
+                c_reps[r] = np.nan
+                beta_reps[r] = np.nan
+                continue
+
+            c_r = float(c_reps[r]) if np.isfinite(c_reps[r]) else float(c_reps[-1])
+            beta_r = np.asarray(beta_reps[r], dtype=np.float64)
+            if beta_r.shape != (P,) or not np.isfinite(beta_r).all():
+                beta_r = np.asarray(beta_reps[-1], dtype=np.float64).copy()
+
+            W_last = XW_last = XXW_last = Sy_last = XWy_last = None
+            for _ in range(n_iter):
+                rho_r = _score_gamma_total_from_c(score_prepared_local, c_r, rep_index=r)
+                if not np.isfinite(rho_r):
+                    c_r = np.nan
+                    beta_r[:] = np.nan
+                    W_last = None
+                    break
+                w_r = _ldsc_gencov_weights_1d(
+                    ld=total_ld,
+                    w_ld=weight_ld,
+                    n1=n1_vec,
+                    n2=n2_vec,
+                    m_tot=m_tot_weight,
+                    h1=h1_r,
+                    h2=h2_r,
+                    rho_g=rho_r,
+                    intercept_gencov=c_r,
+                    intercept_hsq1=intercept_hsq1,
+                    intercept_hsq2=intercept_hsq2,
+                    intercept_hsq_floor=intercept_hsq_floor,
+                    weight_floor=intercept_weight_floor,
+                )
+                w_r = np.where(active, w_r, 0.0)
+                W_last, XW_last, XXW_last, Sy_last, XWy_last = _compute_weighted_intercept_summaries(x, y, w_r)
+                c_new, beta_new, ok = _solve_constrained_intercept_from_sums(
+                    m_rep[r],
+                    S_rep[r],
+                    t_rep[r],
+                    W_last,
+                    XW_last,
+                    XXW_last,
+                    Sy_last,
+                    XWy_last,
+                    denom_floor=0.0,
+                )
+                if not ok:
+                    c_r = np.nan
+                    beta_r[:] = np.nan
+                    W_last = None
+                    break
+                c_r = float(c_new)
+                beta_r = np.asarray(beta_new, dtype=np.float64)
+
+            if W_last is not None and np.isfinite(c_r) and np.isfinite(beta_r).all():
+                den_r = _full_intercept_denominator(m_rep[r], S_rep[r], W_last, XW_last, XXW_last)
+                denom_floor_r = 0.0 if not np.isfinite(den_r) else max(floor_rel * max(float(den_r), 1.0), 0.0)
+                c_fin, beta_fin, ok = _solve_constrained_intercept_from_sums(
+                    m_rep[r],
+                    S_rep[r],
+                    t_rep[r],
+                    W_last,
+                    XW_last,
+                    XXW_last,
+                    Sy_last,
+                    XWy_last,
+                    denom_floor=denom_floor_r,
+                )
+                if ok:
+                    c_r = float(c_fin)
+                    beta_r = np.asarray(beta_fin, dtype=np.float64)
+                else:
+                    c_r = np.nan
+                    beta_r[:] = np.nan
+
+            c_reps[r] = c_r
+            beta_reps[r] = beta_r
+
+        info["h1_plugin"] = h1_plugin
+        info["h2_plugin"] = h2_plugin
         info["irwls_iters"] = n_iter
     else:
         info["irwls_iters"] = 0
 
-    W_u, Sx_u, Sxx_u, Sy_u, Sxy_u = _weighted_unit_summaries(w_final)
-    W_full = float(np.sum(W_u))
-    Sx_full = float(np.sum(Sx_u))
-    Sxx_full = float(np.sum(Sxx_u))
-    Sy_full = float(np.sum(Sy_u))
-    Sxy_full = float(np.sum(Sxy_u))
-
-    alpha_full = t1_full / l1_full
-    beta_full = m_fit_full / l1_full
-    den_full = W_full - 2.0 * beta_full * Sx_full + (beta_full * beta_full) * Sxx_full
-    floor_rel = float(denom_floor_rel)
-    if not (np.isfinite(floor_rel) and floor_rel >= 0.0):
-        floor_rel = 1e-12
-    denom_floor = max(floor_rel * max(float(den_full), 1.0), 0.0)
-
-    del_m = D @ m_u
-    del_l1 = D @ l1_u
-    del_t1 = D @ t1_u
-    del_W = D @ W_u
-    del_Sx = D @ Sx_u
-    del_Sxx = D @ Sxx_u
-    del_Sy = D @ Sy_u
-    del_Sxy = D @ Sxy_u
-
-    m_rep = m_fit_full - del_m
-    l1_rep = l1_full - del_l1
-    t1_rep = t1_full - del_t1
-    W_rep = W_full - del_W
-    Sx_rep = Sx_full - del_Sx
-    Sxx_rep = Sxx_full - del_Sxx
-    Sy_rep = Sy_full - del_Sy
-    Sxy_rep = Sxy_full - del_Sxy
-
-    c_rep, _, _ = _solve_constrained_intercept_scalar_from_sums(
-        m_rep,
-        l1_rep,
-        t1_rep,
-        W_rep,
-        Sx_rep,
-        Sxx_rep,
-        Sy_rep,
-        Sxy_rep,
-        denom_floor=denom_floor,
-    )
-    c_full, _, good_full = _solve_constrained_intercept_scalar_from_sums(
-        np.array([m_fit_full], dtype=np.float64),
-        np.array([l1_full], dtype=np.float64),
-        np.array([t1_full], dtype=np.float64),
-        np.array([W_full], dtype=np.float64),
-        np.array([Sx_full], dtype=np.float64),
-        np.array([Sxx_full], dtype=np.float64),
-        np.array([Sy_full], dtype=np.float64),
-        np.array([Sxy_full], dtype=np.float64),
-        denom_floor=denom_floor,
-    )
-    if not bool(good_full[0]):
-        raise RuntimeError("Final constrained full-sample intercept solve failed.")
-
-    c_reps = np.empty(jackknife.nrep + 1, dtype=np.float64)
-    c_reps[:jackknife.nrep] = c_rep
-    c_reps[jackknife.nrep] = float(c_full[0])
-
-    unit_sizes = jackknife.unit_sizes(active_mask=keep, dtype=np.float64)
     est, se = jackknife.summarize(
         c_reps,
         unit_sizes=unit_sizes,
@@ -1832,17 +2249,97 @@ def fit_intercept(
     )
     c = np.array([float(est), float(se)], dtype=np.float64)
 
-    if log is not None:
-        n_bad = int(np.sum(~np.isfinite(c_rep)))
-        if mode == "ldsc":
+    beta_est, beta_se = jackknife.summarize(
+        beta_reps,
+        unit_sizes=unit_sizes,
+        axis=0,
+        center=jack_mode,
+        nan_policy=nan_policy,
+    )
+    beta_est = np.asarray(beta_est, dtype=np.float64)
+    beta_se = np.asarray(beta_se, dtype=np.float64)
+
+    gamma_reg_reps = _intercept_gamma_total_from_beta(beta_reps, m_rep, sqrt_n1n2)
+    gamma_reg_est, gamma_reg_se = jackknife.summarize(
+        gamma_reg_reps,
+        unit_sizes=unit_sizes,
+        axis=0,
+        center=jack_mode,
+        nan_policy=nan_policy,
+    )
+
+    h2_tot1_reps = np.asarray(h2_fit1.h2_reps[:, -1], dtype=np.float64)
+    h2_tot2_reps = np.asarray(h2_fit2.h2_reps[:, -1], dtype=np.float64)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        rg_reg_reps = gamma_reg_reps / np.sqrt(h2_tot1_reps * h2_tot2_reps)
+    rg_reg_reps[~np.isfinite(rg_reg_reps)] = np.nan
+
+    rg_reg_est, rg_reg_se = jackknife.summarize(
+        rg_reg_reps,
+        unit_sizes=unit_sizes,
+        axis=0,
+        center=jack_mode,
+        nan_policy=nan_policy,
+    )
+
+    info["regression_gamma_g_total_full"] = float(gamma_reg_reps[-1])
+    info["regression_gamma_g_total"] = float(gamma_reg_est)
+    info["regression_gamma_g_total_se"] = float(gamma_reg_se)
+    info["regression_rg_total_full"] = float(rg_reg_reps[-1]) if np.isfinite(rg_reg_reps[-1]) else np.nan
+    info["regression_rg_total"] = float(rg_reg_est)
+    info["regression_rg_total_se"] = float(rg_reg_se)
+
+    if P == 1:
+        b_reps = np.asarray(beta_reps[:, 0], dtype=np.float64)
+        b_est, b_se = jackknife.summarize(
+            b_reps,
+            unit_sizes=unit_sizes,
+            axis=0,
+            center=jack_mode,
+            nan_policy=nan_policy,
+        )
+        info["regression_slope_full"] = float(b_reps[-1])
+        info["regression_slope"] = float(b_est)
+        info["regression_slope_se"] = float(b_se)
+    else:
+        info["regression_beta_full"] = [float(v) if np.isfinite(v) else np.nan for v in np.asarray(beta_reps[-1], dtype=np.float64)]
+        info["regression_beta"] = [float(v) if np.isfinite(v) else np.nan for v in beta_est]
+        info["regression_beta_se"] = [float(v) if np.isfinite(v) else np.nan for v in beta_se]
+
+    if log is not None and np.isfinite(info.get("regression_rg_total", np.nan)):
+        if P == 1:
             log._log(
-                f"[rg:c] constrained LDSC-IRWLS: h1={info['h1_plugin']:.6g}, h2={info['h2_plugin']:.6g}, "
-                f"final_c={c[0]:.6g}, bad_reps={n_bad}/{jackknife.nrep}, iters={info['irwls_iters']}"
+                f"[rg:c] constrained bivariate-regression totals: "
+                f"slope={info['regression_slope']:.6g} (SE: {info['regression_slope_se']:.6g}), "
+                f"gamma_g_reg={info['regression_gamma_g_total']:.6g} "
+                f"(SE: {info['regression_gamma_g_total_se']:.6g}), "
+                f"rg_reg={info['regression_rg_total']:.6g} "
+                f"(SE: {info['regression_rg_total_se']:.6g})"
             )
         else:
             log._log(
-                f"[rg:c] constrained SCORE-weight intercept: "
-                f"final_c={c[0]:.6g}, bad_reps={n_bad}/{jackknife.nrep}"
+                f"[rg:c] constrained partitioned bivariate-regression totals: "
+                f"gamma_g_reg={info['regression_gamma_g_total']:.6g} "
+                f"(SE: {info['regression_gamma_g_total_se']:.6g}), "
+                f"rg_reg={info['regression_rg_total']:.6g} "
+                f"(SE: {info['regression_rg_total_se']:.6g}), "
+                f"ncoef={P}"
+            )
+
+    if log is not None:
+        n_bad = int(np.sum(~np.isfinite(c_reps[:R])))
+        if mode == "ldsc":
+            tag = "partitioned" if P > 1 else "scalar"
+            log._log(
+                f"[rg:c] constrained LDSC-IRWLS ({tag}): h1={info['h1_plugin']:.6g}, "
+                f"h2={info['h2_plugin']:.6g}, final_c={c[0]:.6g}, "
+                f"bad_reps={n_bad}/{R}, iters={info['irwls_iters']}"
+            )
+        else:
+            tag = "partitioned" if P > 1 else "scalar"
+            log._log(
+                f"[rg:c] constrained SCORE-weight intercept ({tag}): "
+                f"final_c={c[0]:.6g}, bad_reps={n_bad}/{R}"
             )
 
     return InterceptFit(
@@ -1852,7 +2349,7 @@ def fit_intercept(
         jackknife=jackknife,
         active_mask=keep,
         unit_sizes=unit_sizes,
-        ld=x,
+        ld=total_ld,
         y=y,
         c_reps=c_reps,
         c=c,

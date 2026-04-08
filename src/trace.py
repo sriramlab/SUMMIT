@@ -6,6 +6,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+import utils
 
 _META_COLS = {"CHR", "BP", "SNP", "CM"}
 
@@ -19,6 +20,7 @@ class TraceView:
     annot_header: np.ndarray
     ldscores: np.ndarray
     ldscores_reg: np.ndarray | None = None
+    ldscores_reg_w: np.ndarray | None = None
     delta: np.ndarray | None = None
     kmoments: dict | None = None
     kmoments_path: str | None = None
@@ -47,6 +49,7 @@ class TraceView:
             annot_header=self.annot_header,
             ldscores=self.ldscores[keep_mask, :],
             ldscores_reg=None if self.ldscores_reg is None else self.ldscores_reg[keep_mask, :],
+            ldscores_reg_w=None if self.ldscores_reg_w is None else self.ldscores_reg_w[keep_mask, :],
             delta=self.delta,
             kmoments=self.kmoments,
             kmoments_path=self.kmoments_path,
@@ -74,6 +77,7 @@ class Trace:
         ldscores=None,
         ldscores_reg=None,
         annot=None,
+        ldscores_reg_w=None,
         verbose=False,
         delta=None,
     ):
@@ -99,10 +103,16 @@ class Trace:
         if ldscores_reg is not None:
             reg_df, reg_L, reg_start = self._read_ldscores_file(ldscores_reg, which="reg")
 
+        regw_df = None
+        regw_L = None
+        regw_start = None
+        if ldscores_reg_w is not None:
+            regw_df, regw_L, regw_start = self._read_ldscores_file(ldscores_reg_w, which="reg_w")
+
         self._ldscore_start_idx = int(main_start)
         self._ldscore_reg_start_idx = None if reg_start is None else int(reg_start)
+        self._ldscore_reg_w_start_idx = None if regw_start is None else int(regw_start)
 
-        main_df, main_L, main_start = self._read_ldscores_file(ldscores, which="main")
         main_ld_nsnps_raw = int(main_df.shape[0])
 
         self.kmoments = None
@@ -118,7 +128,7 @@ class Trace:
                 self.kmoments = None
                 self.kmoments_path = None
 
-        # Align optional regression LD to main SNP order first.
+        # Align optional regression LD inputs to the main SNP order first.
         if reg_df is not None:
             reg_index = pd.Index(reg_df["SNP"].astype(str).to_numpy())
             idx = reg_index.get_indexer(main_df["SNP"].astype(str).to_numpy())
@@ -133,6 +143,22 @@ class Trace:
             reg_df = reg_df.set_index("SNP").loc[main_df["SNP"].astype(str).to_numpy()].reset_index()
             reg_L = reg_df.iloc[:, reg_start:].to_numpy(dtype=np.float64, copy=False)
 
+        if regw_df is not None:
+            regw_index = pd.Index(regw_df["SNP"].astype(str).to_numpy())
+            idx = regw_index.get_indexer(main_df["SNP"].astype(str).to_numpy())
+            keep = idx >= 0
+            n_drop = int((~keep).sum())
+            if n_drop > 0 and self.log is not None:
+                self.log._log(
+                    f"Dropping {n_drop} SNPs from primary LD-scores because they are missing in ldscores_reg_w."
+                )
+            main_df = main_df.loc[keep].reset_index(drop=True)
+            main_L = main_L[keep, :]
+            if reg_df is not None:
+                reg_df = reg_df.set_index("SNP").loc[main_df["SNP"].astype(str).to_numpy()].reset_index()
+                reg_L = reg_df.iloc[:, reg_start:].to_numpy(dtype=np.float64, copy=False)
+            regw_df = regw_df.set_index("SNP").loc[main_df["SNP"].astype(str).to_numpy()].reset_index()
+            regw_L = regw_df.iloc[:, regw_start:].to_numpy(dtype=np.float64, copy=False)
         annot_df, annot_header, annot_matrix = self._read_annotation(
             annot_path=annot,
             bimpath=bimpath,
@@ -150,6 +176,9 @@ class Trace:
             reg_df = reg_df.set_index("SNP").loc[annot_df["SNP"].astype(str).to_numpy()].reset_index()
             reg_L = reg_df.iloc[:, reg_start:].to_numpy(dtype=np.float64, copy=False)
 
+        if regw_df is not None:
+            regw_df = regw_df.set_index("SNP").loc[annot_df["SNP"].astype(str).to_numpy()].reset_index()
+            regw_L = regw_df.iloc[:, regw_start:].to_numpy(dtype=np.float64, copy=False)
         # Sort once to stable genomic order. This keeps block jackknife contiguous on the genome
         # and makes chr jackknife valid without any further mutation.
         chr_arr = main_df["CHR"].to_numpy(dtype=np.int32, copy=False)
@@ -165,6 +194,7 @@ class Trace:
         self.annot = np.asarray(annot_matrix, dtype=np.float64, order="C")[order, :]
         self.annot_header = np.asarray(annot_header)
         self.ldscores = np.asarray(main_L, dtype=np.float64, order="C")[order, :]
+        self.ldscores_reg_w = None if regw_L is None else np.asarray(regw_L, dtype=np.float64, order="C")[order, :]
         self.ldscores_reg = None if reg_L is None else np.asarray(reg_L, dtype=np.float64, order="C")[order, :]
 
         self.nsnps = int(self.annot.shape[0])
@@ -201,9 +231,11 @@ class Trace:
                 )
 
         if self.log is not None:
+            reg_bins = 'no' if self.ldscores_reg is None else self.ldscores_reg.shape[1]
+            regw_bins = 'no' if self.ldscores_reg_w is None else self.ldscores_reg_w.shape[1]
             self.log._log(
                 f"Loaded Trace with {self.nsnps} SNPs, {self.nbins} annotation bins, "
-                f"and {'no' if self.ldscores_reg is None else self.ldscores_reg.shape[1]} regression LD bins."
+                f"{reg_bins} regression LD bins, and {regw_bins} regression-weight LD bins."
             )
 
     def materialize_view(self, keep_mask=None) -> TraceView:
@@ -225,6 +257,7 @@ class Trace:
             annot_header=self.annot_header,
             ldscores=self.ldscores[keep_mask, :],
             ldscores_reg=None if self.ldscores_reg is None else self.ldscores_reg[keep_mask, :],
+            ldscores_reg_w=None if self.ldscores_reg_w is None else self.ldscores_reg_w[keep_mask, :],
             delta=self.delta,
             kmoments=self.kmoments,
             kmoments_path=self.kmoments_path,
@@ -245,10 +278,15 @@ class Trace:
         L = df.iloc[:, start_idx:].to_numpy(dtype=np.float64, copy=False)
         snps = df["SNP"].astype(str).to_numpy()
 
+        if which == "reg_w" and L.ndim == 2 and L.shape[1] != 1:
+            raise ValueError(
+                f"Regression-weight LD file '{path}' must contain exactly one LD-score column; got {L.shape[1]}."
+            )
+
         finite = np.isfinite(L).all(axis=1)
-        if which == "reg":
+        if which in {"reg", "reg_w"}:
             ltot = L.sum(axis=1)
-            finite &= np.isfinite(ltot) & (ltot > 0.1)
+            finite &= np.isfinite(ltot) & (ltot > 0.0)
 
         n_drop = int((~finite).sum())
         if n_drop > 0 and self.log is not None:
@@ -380,24 +418,7 @@ class Trace:
 
     @staticmethod
     def _read_with_optional_header(path):
-        arr = np.genfromtxt(path, dtype=None, encoding=None, comments=None)
-        if arr.ndim == 1:
-            arr = arr.reshape(-1, 1)
-
-        # Try header parse via first row string-ness.
-        try:
-            header = np.genfromtxt(path, max_rows=1, dtype=str)
-            body = np.genfromtxt(path, skip_header=1, dtype=float)
-            if body.ndim == 1:
-                body = body.reshape(-1, 1)
-            if header.ndim == 0:
-                header = np.array([header.item()])
-            return header, body
-        except Exception:
-            body = np.genfromtxt(path, dtype=float)
-            if body.ndim == 1:
-                body = body.reshape(-1, 1)
-            return None, body
+        return utils._read_with_optional_header(path)
 
     @staticmethod
     def _infer_kmoments_path(ldscores_path):

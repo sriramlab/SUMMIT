@@ -1,3 +1,4 @@
+import gzip
 import numpy as np
 import pandas as pd
 import os
@@ -20,21 +21,31 @@ def _get_timestr(current_time):
 
 # ----------------------- I/O & parsing helpers ----------------------- #
 
+def _open_text_maybe_gzip(file_path, mode="rt"):
+    path = str(file_path)
+    if path.endswith(".gz"):
+        return gzip.open(path, mode)
+    return open(path, mode)
+
+
 def _read_with_optional_header(file_path):
-    with open(file_path, 'r') as fd:
+    with _open_text_maybe_gzip(file_path, "rt") as fd:
         line = fd.readline().strip()
         try:
-            vals = [float(x) for x in line.split()]
+            [float(x) for x in line.split()]
             is_header = False
         except ValueError:
             is_header = True
+
     if is_header:
         header = line.split()
-        data = np.loadtxt(file_path, skiprows=1)
+        with _open_text_maybe_gzip(file_path, "rt") as fd:
+            data = np.loadtxt(fd, skiprows=1)
         return header, data
-    else:
-        data = np.loadtxt(file_path)
-        return None, data
+
+    with _open_text_maybe_gzip(file_path, "rt") as fd:
+        data = np.loadtxt(fd)
+    return None, data
 
 
 def _parse_column_name(df_hdr, names, default_pos):
@@ -84,6 +95,26 @@ def _phen_name_from_path(path: str) -> str:
     return Path(name).stem
 
 
+def _is_rg_manifest_arg(raw) -> bool:
+    if raw is None:
+        return False
+    s = str(raw).strip()
+    return ("," not in s) and Path(s).is_file()
+
+
+def _sanitize_output_component(text: str, *, default: str = "trait") -> str:
+    s = str(text).strip()
+    if s == "":
+        return default
+    s = re.sub(r"[^A-Za-z0-9._-]+", "_", s)
+    s = re.sub(r"_+", "_", s).strip("._")
+    return s or default
+
+
+def _pair_output_stem(phen1: str, phen2: str) -> str:
+    return f"{_sanitize_output_component(phen1)}.{_sanitize_output_component(phen2)}"
+
+
 def _parse_verbose(verbose) -> int:
     if isinstance(verbose, str):
         s = verbose.strip().lower()
@@ -91,10 +122,30 @@ def _parse_verbose(verbose) -> int:
             return 0
         if s in ("1", "true", "yes", "on"):
             return 1
-        if s == "max":
+        if s in ("2", "all", "both", "max", "jack", "normeq"):
             return 2
         return 1
-    return 1 if bool(verbose) else 0
+    try:
+        return 2 if int(verbose) >= 2 else (1 if int(verbose) == 1 else 0)
+    except Exception:
+        return 1 if bool(verbose) else 0
+
+
+def _parse_verbose_outputs(verbose):
+    if isinstance(verbose, str):
+        s = verbose.strip().lower()
+        if s == "jack":
+            return True, False
+        if s == "normeq":
+            return False, True
+        if s in ("2", "all", "both", "max"):
+            return True, True
+        return False, False
+
+    try:
+        return (True, True) if int(verbose) >= 2 else (False, False)
+    except Exception:
+        return False, False
 
 
 def _resolve_chisq_threshold(nmax: float, raw=None):
@@ -1249,4 +1300,3 @@ def _calc_jackknife_se_from_delete_sets(
         se_flat[p] = _se_from_unit_pseudovalues(pv_all, full_p)
 
     return est_full, se_flat.reshape(est_full.shape)
-
