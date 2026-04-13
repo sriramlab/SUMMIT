@@ -100,28 +100,6 @@ def exact_score_z_from_arrays(beta, se, n_obs, nsamp, cov_rank):
     )
     out[good] = np.sqrt(n_star) * beta[good] / np.sqrt(den[good])
     return out
-    # beta = np.asarray(beta, dtype=np.float64)
-    # se = np.asarray(se, dtype=np.float64)
-    # n_obs = np.asarray(n_obs, dtype=np.float64)
-    # N_scale = float(nsamp)
-
-    # out = np.full(beta.shape, np.nan, dtype=np.float64)
-    # if not (np.isfinite(N_scale) and N_scale > 0.0):
-    #     return out
-
-    # nu = n_obs - float(cov_rank) - 1.0
-    # den = beta * beta + nu * se * se
-
-    # good = (
-    #     np.isfinite(beta) &
-    #     np.isfinite(se) & (se > 0.0) &
-    #     np.isfinite(n_obs) & (n_obs > 0.0) &
-    #     np.isfinite(nu) & (nu > 0.0) &
-    #     np.isfinite(den) & (den > 0.0)
-    # )
-    # out[good] = np.sqrt(N_scale) * beta[good] / np.sqrt(den[good])
-    # return out
-
 
 def build_h2_summary_moment(
     matched,

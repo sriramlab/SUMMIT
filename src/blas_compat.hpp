@@ -1,4 +1,3 @@
-// src/blas_compat.hpp
 #pragma once
 
 extern "C" {

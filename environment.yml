@@ -15,11 +15,11 @@ dependencies:
   # build toolchain
   - cmake>=3.26
   - ninja
-  - pybind11>=2.12
+  - nanobind>=2.2
   - scikit-build-core>=0.5
   - pkg-config
 
   # BLAS/LAPACK -> force OpenBLAS provider and install headers too
-  - openblas>=0.3
+  - openblas>=0.3.26
   - libblas=*=*openblas
   - liblapack=*=*openblas

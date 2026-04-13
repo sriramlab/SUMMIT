@@ -1125,3 +1125,157 @@ void read_block_standardized_double(const std::string& bed_path,
                                          rows, ddof, impute_mode, impute_seed,
                                          Geno, N, L);
 }
+
+void compute_maf_block(const std::string& bed_path,
+                       const std::string& fam_path,
+                       int blk_start,
+                       int blk_end,
+                       const std::vector<int>& rows,
+                       std::vector<double>& maf)
+{
+    const int64_t N_total64 = count_lines_cached(fam_path);
+    if (N_total64 <= 0) throw std::runtime_error("FAM has zero rows: " + fam_path);
+    const int N_total = (int)N_total64;
+
+    const int N = (int)rows.size();
+    const int L = std::max(0, blk_end - blk_start);
+    maf.assign((size_t)L, 0.0);
+    if (N <= 0 || L <= 0) return;
+
+    const int nbytes_per_snp = (int)ceil_div((std::size_t)N_total, (std::size_t)4);
+    const size_t per_snp_bytes = (size_t)nbytes_per_snp;
+    const RowDecodePlan& plan = get_row_decode_plan(rows, N_total);
+
+    int decode_threads = 0;
+    if (const char* s = std::getenv("SUMMIT_DECODE_THREADS")) decode_threads = std::atoi(s);
+
+    int hw = 1;
+#ifdef _OPENMP
+    hw = affinity_thread_cap();
+    if (hw <= 0) hw = 1;
+#endif
+    if (decode_threads <= 0) {
+        const int cap_env = env_int("SUMMIT_DECODE_THREADS_CAP", 16);
+        int cap = std::min(cap_env, hw);
+        cap = std::min(cap, std::max(1, L));
+
+        const uint64_t work_elems = (uint64_t)N * (uint64_t)L;
+        uint64_t target = 8ULL * 1000 * 1000;
+        if (const char* s = std::getenv("SUMMIT_DECODE_TARGET_ELEMS_PER_THR")) {
+            long long v = std::atoll(s);
+            if (v > 0) target = (uint64_t)v;
+        }
+
+        int by_work = 1;
+        if (target > 0) {
+            by_work = (int)((work_elems + target - 1) / target);
+            if (by_work < 1) by_work = 1;
+        }
+
+        decode_threads = std::min(cap, by_work);
+        if (work_elems < 2ULL * 1000 * 1000) decode_threads = 1;
+        else if (work_elems < 16ULL * 1000 * 1000) decode_threads = std::min(decode_threads, 2);
+        else if (work_elems < 64ULL * 1000 * 1000) decode_threads = std::min(decode_threads, 4);
+        if (decode_threads < 1) decode_threads = 1;
+    }
+    decode_threads = std::min(decode_threads, std::max(1, L));
+
+#if defined(__linux__)
+    auto mm = get_bed_mapping_cached(bed_path);
+    const size_t need_bytes = (size_t)3 + (size_t)blk_end * per_snp_bytes;
+    if (!mm || !mm->base || need_bytes > mm->size) {
+        throw std::runtime_error("BED file too small for requested block: " + bed_path);
+    }
+    const unsigned char* snp0 = mm->base + 3 + (size_t)blk_start * per_snp_bytes;
+
+    auto worker = [&](int col, uint8_t* __restrict codes) {
+        const unsigned char* bytes = snp0 + (size_t)col * per_snp_bytes;
+        long long nobs = 0, sum = 0, sumsq = 0;
+        if (plan.full_range) {
+            decode_all_rows_codes_into(bytes, N_total, codes, nobs, sum, sumsq, nullptr);
+        } else if (plan.use_sparse) {
+            decode_rows_codes_sparse_precomp_into(bytes,
+                                                  plan.row_byte.data(),
+                                                  plan.row_shift.data(),
+                                                  N,
+                                                  codes,
+                                                  nobs, sum, sumsq,
+                                                  nullptr);
+        } else {
+            decode_rows_codes_dense_sorted_into(bytes, N_total, rows, codes, nobs, sum, sumsq, nullptr);
+        }
+
+        double p = 0.0;
+        if (nobs > 0) {
+            p = (double)sum / (2.0 * (double)nobs);
+            if (p < 0.0) p = 0.0;
+            if (p > 1.0) p = 1.0;
+        }
+        maf[(size_t)col] = std::min(p, 1.0 - p);
+    };
+
+    if (decode_threads <= 1) {
+        static thread_local std::vector<uint8_t> codes_local;
+        if ((int)codes_local.size() < N) codes_local.resize((size_t)N);
+        for (int col = 0; col < L; ++col) worker(col, codes_local.data());
+        return;
+    }
+
+#ifdef _OPENMP
+    #pragma omp parallel num_threads(decode_threads)
+#endif
+    {
+        static thread_local std::vector<uint8_t> codes_local;
+        if ((int)codes_local.size() < N) codes_local.resize((size_t)N);
+#ifdef _OPENMP
+        #pragma omp for schedule(static)
+#endif
+        for (int col = 0; col < L; ++col) worker(col, codes_local.data());
+    }
+#else
+    std::ifstream bed(bed_path, std::ios::binary);
+    if (!bed) throw std::runtime_error("Failed to open bed: " + bed_path);
+
+    unsigned char magic[3];
+    bed.read(reinterpret_cast<char*>(magic), 3);
+    if (!bed) throw std::runtime_error("BED header read failed: " + bed_path);
+    if (magic[0] != 0x6c || magic[1] != 0x1b)
+        throw std::runtime_error("BED magic bytes mismatch (expected 0x6c 0x1b): " + bed_path);
+    if (magic[2] != 0x01)
+        throw std::runtime_error("BED file is not SNP-major (third byte != 0x01): " + bed_path);
+
+    std::vector<unsigned char> line((size_t)nbytes_per_snp);
+    std::vector<uint8_t> codes_local((size_t)N);
+    for (int col = 0; col < L; ++col) {
+        const std::streamoff offset = 3 + (std::streamoff)(blk_start + col) * (std::streamoff)per_snp_bytes;
+        bed.clear();
+        bed.seekg(offset, std::ios::beg);
+        if (!bed) throw std::runtime_error("BED seekg failed: " + bed_path);
+        bed.read(reinterpret_cast<char*>(line.data()), nbytes_per_snp);
+        if (!bed) throw std::runtime_error("BED read failed at SNP " + std::to_string(blk_start + col));
+
+        long long nobs = 0, sum = 0, sumsq = 0;
+        if (plan.full_range) {
+            decode_all_rows_codes_into(line.data(), N_total, codes_local.data(), nobs, sum, sumsq, nullptr);
+        } else if (plan.use_sparse) {
+            decode_rows_codes_sparse_precomp_into(line.data(),
+                                                  plan.row_byte.data(),
+                                                  plan.row_shift.data(),
+                                                  N,
+                                                  codes_local.data(),
+                                                  nobs, sum, sumsq,
+                                                  nullptr);
+        } else {
+            decode_rows_codes_dense_sorted_into(line.data(), N_total, rows, codes_local.data(), nobs, sum, sumsq, nullptr);
+        }
+
+        double p = 0.0;
+        if (nobs > 0) {
+            p = (double)sum / (2.0 * (double)nobs);
+            if (p < 0.0) p = 0.0;
+            if (p > 1.0) p = 1.0;
+        }
+        maf[(size_t)col] = std::min(p, 1.0 - p);
+    }
+#endif
+}

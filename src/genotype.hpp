@@ -64,6 +64,14 @@ void read_block_mailman_hwe(
     uint64_t impute_seed,
     MailmanPackedBlock& out);
 
+void compute_maf_block(
+    const std::string& bed_path,
+    const std::string& fam_path,
+    int blk_start,
+    int blk_end,
+    const std::vector<int>& rows,
+    std::vector<double>& maf);
+
 template <typename T>
 inline void read_block_standardized(
     const std::string& bed_path,
