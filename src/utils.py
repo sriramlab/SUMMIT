@@ -118,11 +118,11 @@ def _pair_output_stem(phen1: str, phen2: str) -> str:
 def _parse_verbose(verbose) -> int:
     if isinstance(verbose, str):
         s = verbose.strip().lower()
-        if s in ("0", "false", "none", "off"):
+        if s in ("0", "false", "none", "off", "jack", "normeq"):
             return 0
         if s in ("1", "true", "yes", "on"):
             return 1
-        if s in ("2", "all", "both", "max", "jack", "normeq"):
+        if s in ("2", "all", "both", "max"):
             return 2
         return 1
     try:

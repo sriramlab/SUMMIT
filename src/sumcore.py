@@ -63,22 +63,42 @@ class Sumcore:
         cov_rank=None,
         trace_obj=None,
         sumstats_pair=None,
+        aligned_pair=None,
+        keep_masks=None,
         phen_names=None,
+        write_jack: bool = False,
+        write_normeq: bool = False,
         **_unused_kwargs,
     ):
 
         self.log = log
         self.verbose = verbose
         self.verbose_level = utils._parse_verbose(verbose)
-        self.verbose_write_jack, self.verbose_write_normeq = utils._parse_verbose_outputs(verbose)
+        parsed_write_jack, parsed_write_normeq = utils._parse_verbose_outputs(verbose)
+        self.verbose_write_jack = bool(write_jack) or bool(parsed_write_jack)
+        self.verbose_write_normeq = bool(write_normeq) or bool(parsed_write_normeq)
+        self.collect_diagnostics = bool(self.verbose_level >= 1)
         self.start_time = utils._get_time()
         if self.log is not None:
             self.log._log("Analysis started at: " + utils._get_timestr(self.start_time))
 
         self._preloaded_sumstats = None if sumstats_pair is None else tuple(sumstats_pair)
+        if self._preloaded_sumstats is not None and len(self._preloaded_sumstats) != 2:
+            raise ValueError("sumstats_pair must contain exactly two Sumstats objects.")
+
+        self._prealigned_pair = None if aligned_pair is None else tuple(aligned_pair)
+        if self._prealigned_pair is not None and len(self._prealigned_pair) != 2:
+            raise ValueError("aligned_pair must contain exactly two aligned Sumstats objects.")
+
+        if keep_masks is None:
+            self._precomputed_keep_masks = None
+        else:
+            masks = tuple(np.asarray(mask, dtype=bool) for mask in keep_masks)
+            if len(masks) != 2:
+                raise ValueError("keep_masks must contain exactly two boolean masks.")
+            self._precomputed_keep_masks = masks
+
         if self._preloaded_sumstats is not None:
-            if len(self._preloaded_sumstats) != 2:
-                raise ValueError("sumstats_pair must contain exactly two Sumstats objects.")
             self.phen_paths = [None, None]
             if phen_names is not None:
                 if len(phen_names) != 2:
@@ -88,6 +108,17 @@ class Sumcore:
                 self.phen_names = [
                     str(getattr(self._preloaded_sumstats[0], "name", "trait1")),
                     str(getattr(self._preloaded_sumstats[1], "name", "trait2")),
+                ]
+        elif self._prealigned_pair is not None:
+            self.phen_paths = [None, None]
+            if phen_names is not None:
+                if len(phen_names) != 2:
+                    raise ValueError("phen_names must contain exactly two names when provided.")
+                self.phen_names = [str(phen_names[0]), str(phen_names[1])]
+            else:
+                self.phen_names = [
+                    str(getattr(self._prealigned_pair[0].sumstats, "name", "trait1")),
+                    str(getattr(self._prealigned_pair[1].sumstats, "name", "trait2")),
                 ]
         else:
             self.phen_paths = utils._parse_rg_pair(rg)
@@ -115,6 +146,20 @@ class Sumcore:
             self.trace = trace_obj
             if hasattr(self.trace, "log"):
                 self.trace.log = self.log
+
+        if self._prealigned_pair is not None:
+            for aligned in self._prealigned_pair:
+                if getattr(aligned, "trace", None) is not self.trace:
+                    raise ValueError(
+                        "aligned_pair must be built on the same Trace object passed via trace_obj."
+                    )
+
+        if self._precomputed_keep_masks is not None:
+            for keep_mask in self._precomputed_keep_masks:
+                if keep_mask.ndim != 1 or keep_mask.size != self.trace.nsnps:
+                    raise ValueError(
+                        f"Each keep mask must be length {self.trace.nsnps}; got {keep_mask.shape}."
+                    )
 
         self.jackknife_spec = JackknifeSpec.parse(njack)
         self.align_alleles = bool(align_alleles)
@@ -166,12 +211,32 @@ class Sumcore:
         self.matched2 = None
 
     def _run(self):
-        if self._preloaded_sumstats is not None:
+        stage_times = {}
+
+        def _stage_start():
+            return utils._get_time()
+
+        def _stage_stop(name: str, started_at: float):
+            stage_times[name] = stage_times.get(name, 0.0) + (utils._get_time() - started_at)
+
+        t_stage = _stage_start()
+
+        if self._prealigned_pair is not None:
+            aligned1, aligned2 = self._prealigned_pair
+            ss1 = aligned1.sumstats
+            ss2 = aligned2.sumstats
+            if hasattr(ss1, "log"):
+                ss1.log = self.log
+            if hasattr(ss2, "log"):
+                ss2.log = self.log
+        elif self._preloaded_sumstats is not None:
             ss1, ss2 = self._preloaded_sumstats
             if hasattr(ss1, "log"):
                 ss1.log = self.log
             if hasattr(ss2, "log"):
                 ss2.log = self.log
+            aligned1 = ss1.align_to_trace(self.trace)
+            aligned2 = ss2.align_to_trace(self.trace)
         else:
             pheno_cov_rank_override = self._derive_cov_rank_overrides_from_pheno()
 
@@ -190,6 +255,7 @@ class Sumcore:
                 log=self.log,
                 cov_rank=cov_rank1,
                 cov_rank_source=cov_rank_source1,
+                compute_diagnostics=self.collect_diagnostics,
             )
             ss2 = Sumstats.from_file(
                 self.phen_paths[1],
@@ -197,21 +263,30 @@ class Sumcore:
                 log=self.log,
                 cov_rank=cov_rank2,
                 cov_rank_source=cov_rank_source2,
+                compute_diagnostics=self.collect_diagnostics,
             )
 
-        aligned1 = ss1.align_to_trace(self.trace)
-        aligned2 = ss2.align_to_trace(self.trace)
+            aligned1 = ss1.align_to_trace(self.trace)
+            aligned2 = ss2.align_to_trace(self.trace)
 
-        keep1 = aligned1.keep_mask(
-            chisq_threshold=self.chisq_threshold,
-            chisq_action=self.chisq_action,
-        )
-        keep2 = aligned2.keep_mask(
-            chisq_threshold=self.chisq_threshold,
-            chisq_action=self.chisq_action,
-        )
+        if self._precomputed_keep_masks is not None:
+            keep1, keep2 = self._precomputed_keep_masks
+        else:
+            keep1 = aligned1.keep_mask(
+                chisq_threshold=self.chisq_threshold,
+                chisq_action=self.chisq_action,
+            )
+            keep2 = aligned2.keep_mask(
+                chisq_threshold=self.chisq_threshold,
+                chisq_action=self.chisq_action,
+            )
+
+        keep1 = np.asarray(keep1, dtype=bool)
+        keep2 = np.asarray(keep2, dtype=bool)
         main_mask = keep1 & keep2
+        _stage_stop("load_align_filter", t_stage)
 
+        t_stage = _stage_start()
         flip_keep = None
         if self.align_alleles:
             main_mask, flip_keep = self._apply_allele_alignment_filter(aligned1, aligned2, main_mask)
@@ -230,17 +305,23 @@ class Sumcore:
             main_mask,
             chisq_threshold=self.chisq_threshold,
             chisq_action=self.chisq_action,
+            allowed_mask=keep1,
+            compute_diagnostics=self.collect_diagnostics,
         )
         matched2 = aligned2.materialize(
             main_mask,
             chisq_threshold=self.chisq_threshold,
             chisq_action=self.chisq_action,
+            allowed_mask=keep2,
+            compute_diagnostics=self.collect_diagnostics,
         )
         if flip_keep is not None:
             matched2 = self._flip_matched_sumstats(matched2, flip_keep)
 
         jk = JackknifeDesign.from_trace_view(tv, self.jackknife_spec, log=self.log)
+        _stage_stop("materialize_jackknife", t_stage)
 
+        t_stage = _stage_start()
         h2_fit1 = fit_h2(
             prepare_h2(tv, matched1, jk, adjust_delta=self.adjust_delta),
             enrich_mode=self.enrich_mode,
@@ -250,6 +331,9 @@ class Sumcore:
             jack_mode=self.jack_mode,
             nan_policy=self.nan_policy,
         )
+        _stage_stop("h2_trait1", t_stage)
+
+        t_stage = _stage_start()
         h2_fit2 = fit_h2(
             prepare_h2(tv, matched2, jk, adjust_delta=self.adjust_delta),
             enrich_mode=self.enrich_mode,
@@ -259,9 +343,13 @@ class Sumcore:
             jack_mode=self.jack_mode,
             nan_policy=self.nan_policy,
         )
+        _stage_stop("h2_trait2", t_stage)
 
+        t_stage = _stage_start()
         fixed_c, fixed_info = self._resolve_external_intercept(matched1, matched2)
+        _stage_stop("external_intercept", t_stage)
 
+        t_stage = _stage_start()
         summary_y, summary_y_info = build_rg_summary_moment(matched1, matched2)
         if self.log is not None:
             self.log._log(
@@ -284,7 +372,9 @@ class Sumcore:
             summary_y_info=summary_y_info,
             adjust_delta=self.adjust_delta,
         )
+        _stage_stop("prepare_rg", t_stage)
 
+        t_stage = _stage_start()
         intercept = fit_intercept(
             tv,
             matched1,
@@ -304,7 +394,9 @@ class Sumcore:
             jack_mode=self.jack_mode,
             nan_policy=self.nan_policy,
         )
+        _stage_stop("fit_intercept", t_stage)
 
+        t_stage = _stage_start()
         rg_fit = fit_rg(
             rg_prepared,
             h2_fit1,
@@ -314,6 +406,7 @@ class Sumcore:
             jack_mode=self.jack_mode,
             nan_policy=self.nan_policy,
         )
+        _stage_stop("fit_rg", t_stage)
 
         self.trace_view = tv
         self.jackknife = jk
@@ -328,7 +421,7 @@ class Sumcore:
             "sumstats2": ss2,
         }
 
-        if hasattr(ss1, "log_chisq_diagnostics"):
+        if self.collect_diagnostics and hasattr(ss1, "log_chisq_diagnostics"):
             ss1.log_chisq_diagnostics(
                 matched1,
                 chisq_threshold=self.chisq_threshold,
@@ -354,6 +447,25 @@ class Sumcore:
                 RGResultWriter.save_score_normal_equations_json(rg_fit, eq_path)
                 if self.log is not None:
                     self.log._log(f"Saved explicit full SCORE normal-equation dump to {eq_path}")
+
+        if self.log is not None and self.verbose_level >= 1:
+            ordered = [
+                "load_align_filter",
+                "materialize_jackknife",
+                "h2_trait1",
+                "h2_trait2",
+                "external_intercept",
+                "prepare_rg",
+                "fit_intercept",
+                "fit_rg",
+            ]
+            parts = [
+                f"{name}={stage_times[name]:.3f}s"
+                for name in ordered
+                if name in stage_times
+            ]
+            if parts:
+                self.log._log("[perf] " + ", ".join(parts))
 
         return self.result
 

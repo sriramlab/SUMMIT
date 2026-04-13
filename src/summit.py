@@ -4,8 +4,58 @@ import argparse
 import os
 import sys
 import tempfile
+from dataclasses import dataclass
 from pathlib import Path
 
+
+def _preparse_num_threads_from_argv(argv):
+    tokens = list(argv)
+    for i, tok in enumerate(tokens):
+        if tok == "--num-threads":
+            if i + 1 < len(tokens):
+                try:
+                    return int(tokens[i + 1])
+                except Exception:
+                    return None
+            return None
+        if tok.startswith("--num-threads="):
+            try:
+                return int(tok.split("=", 1)[1].strip())
+            except Exception:
+                return None
+    return None
+
+
+def _set_thread_env_vars(num_threads):
+    if num_threads is None:
+        return
+    try:
+        n = int(num_threads)
+    except Exception:
+        return
+    if n <= 0:
+        return
+
+    for key in (
+        "OMP_NUM_THREADS",
+        "OMP_THREAD_LIMIT",
+        "OPENBLAS_NUM_THREADS",
+        "MKL_NUM_THREADS",
+        "BLIS_NUM_THREADS",
+        "VECLIB_MAXIMUM_THREADS",
+        "NUMEXPR_NUM_THREADS",
+    ):
+        os.environ[key] = str(n)
+
+    os.environ["OMP_DYNAMIC"] = "FALSE"
+    os.environ["MKL_DYNAMIC"] = "FALSE"
+
+
+_PREPARSED_NUM_THREADS = _preparse_num_threads_from_argv(sys.argv[1:])
+if _PREPARSED_NUM_THREADS is not None:
+    _set_thread_env_vars(_PREPARSED_NUM_THREADS)
+
+import numpy as np
 import pandas as pd
 
 import utils
@@ -17,6 +67,50 @@ from sumcore import Sumcore
 from trace import Trace
 from sumstats import Sumstats
 from rg_manifest_builder import build_rg_manifest
+
+
+_THREADPOOL_LIMITER = None
+
+
+def _apply_runtime_thread_cap(num_threads, log=None):
+    if num_threads is None:
+        return
+
+    try:
+        n = int(num_threads)
+    except Exception:
+        raise SystemExit("!!! --num-threads must be an integer. !!!")
+
+    if n <= 0:
+        raise SystemExit("!!! --num-threads must be positive. !!!")
+
+    _set_thread_env_vars(n)
+
+    global _THREADPOOL_LIMITER
+    try:
+        from threadpoolctl import threadpool_limits
+
+        _THREADPOOL_LIMITER = threadpool_limits(limits=n)
+        if log is not None:
+            log._log(f"[threads] capped BLAS/OpenMP thread pools to {n} thread(s).")
+    except Exception as e:
+        if log is not None:
+            log._log(
+                f"[threads] requested --num-threads {n}; set common thread-count environment variables. "
+                f"Runtime threadpool cap unavailable ({e.__class__.__name__}: {e})."
+            )
+
+
+
+def str2bool(v):
+    if isinstance(v, bool):
+        return v
+    if v.lower() in ('yes', 'true', 't', 'y', '1'):
+        return True
+    elif v.lower() in ('no', 'false', 'f', 'n', '0'):
+        return False
+    else:
+        raise argparse.ArgumentTypeError('Boolean value expected.')
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -141,7 +235,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--out", default=None, type=str,
                         help="Output prefix for single-run modes. In rg manifest mode, this must be an output directory.")
     parser.add_argument("--verbose", nargs="?", const="1", default="0", type=str,
-                        help="Verbosity / extra-output mode: 0, 1, 2, 'max', 'jack', or 'normeq'. Passing --verbose with no value implies 1.")
+                        help=("Verbosity level: 0, 1, 2, or 'max'. "
+                              "Legacy values 'jack' and 'normeq' request extra output files without enabling verbose diagnostics. "
+                              "Passing --verbose with no value implies 1."))
+    parser.add_argument("--write-jack", action="store_true", default=False,
+                        help="Write rg jackknife replicate dumps to <out>.rg.jack without enabling verbose diagnostics.")
+    parser.add_argument("--write-normeq", action="store_true", default=False,
+                        help="Write the SCORE normal-equation JSON dump to <out>.rg.scoreeq.json without enabling verbose diagnostics.")
     parser.add_argument("--suppress", action="store_true", default=False,
                         help="Suppress stdout logging; still write to the log file(s).")
     parser.add_argument("--allow-neg-enr", action="store_true", default=False,
@@ -185,7 +285,7 @@ def build_parser() -> argparse.ArgumentParser:
                         help="Random seed.")
     parser.add_argument("--covar", default=None, type=str,
                         help="Covariate file for LD-score estimation.")
-    parser.add_argument("--rand-dist", default="spherical", type=str,
+    parser.add_argument("--rand-dist", default="spherical", type=str, choices=["spherical", "gaussian", "normal", "rademacher"],
                         help="Distribution for randomized LD-score estimation.")
     parser.add_argument("--dtype", default="float32", type=str,
                         help="dtype for LD-score computation.")
@@ -197,6 +297,8 @@ def build_parser() -> argparse.ArgumentParser:
                         help="If set, compute windowed LD scores with the given kb window.")
     parser.add_argument("--correct-skew", action="store_true",
                         help="Enable optional finite-sample skew diagnostics in genome-wide LD-score estimation.")
+    parser.add_argument("--use-mailman", default=False, type=str2bool,
+                        help="Enable mailman in LD-score estimation.")
 
     # Resource / performance knobs
     parser.add_argument("--num-threads", default=None, type=int,
@@ -386,6 +488,7 @@ def _dispatch_ldscore(args, log, verbose_on, low_level):
         device=args.device,
         use_tp32=args.use_tp32,
         correct_skew=args.correct_skew,
+        use_mailman=args.use_mailman,
     )
     gwld._compute_ldscore()
 
@@ -459,6 +562,8 @@ def _dispatch_rg(args, log):
         report_tau=True,
         adjust_delta=args.adjust_delta,
         cov_rank=args.cov_rank,
+        write_jack=args.write_jack,
+        write_normeq=args.write_normeq,
     )
     rg._run()
     rg._logoff()
@@ -606,6 +711,150 @@ def _normalize_rg_manifest(path: str, log=None):
     return df, trait_meta
 
 
+
+@dataclass
+class _ManifestTraitCacheEntry:
+    path: str
+    phen: str
+    cov_rank: int | None
+    sumstats: Sumstats
+    aligned: object
+    keep_mask: np.ndarray
+
+
+def _manifest_row_traits(row) -> tuple[str, ...]:
+    if row.sumstats1 == row.sumstats2:
+        return (row.sumstats1,)
+    return (row.sumstats1, row.sumstats2)
+
+
+def _build_manifest_trait_use_counts(manifest_df: pd.DataFrame) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for row in manifest_df.itertuples(index=False):
+        for spath in _manifest_row_traits(row):
+            counts[spath] = counts.get(spath, 0) + 1
+    return counts
+
+
+def _plan_rg_manifest_order(manifest_df: pd.DataFrame, log=None) -> list[int]:
+    nrows = int(manifest_df.shape[0])
+    if nrows <= 1:
+        return list(range(nrows))
+
+    rows = list(manifest_df.itertuples(index=False))
+    row_traits = [_manifest_row_traits(row) for row in rows]
+    remaining = _build_manifest_trait_use_counts(manifest_df)
+
+    resident: set[str] = set()
+    unprocessed = set(range(nrows))
+    plan: list[int] = []
+    peak_resident = 0
+
+    while unprocessed:
+        best_idx = None
+        best_key = None
+
+        for idx in unprocessed:
+            traits = row_traits[idx]
+            overlap = sum(1 for t in traits if t in resident)
+            remaining_score = sum(int(remaining.get(t, 0)) for t in traits)
+            post_score = sum(max(int(remaining.get(t, 0)) - 1, 0) for t in traits)
+            new_traits = sum(1 for t in traits if t not in resident)
+            row_id = int(rows[idx].row_id)
+
+            key = (
+                overlap,
+                remaining_score,
+                post_score,
+                -new_traits,
+                -row_id,
+            )
+            if best_key is None or key > best_key:
+                best_key = key
+                best_idx = idx
+
+        assert best_idx is not None
+        plan.append(best_idx)
+        unprocessed.remove(best_idx)
+
+        for trait_path in row_traits[best_idx]:
+            resident.add(trait_path)
+        peak_resident = max(peak_resident, len(resident))
+
+        for trait_path in row_traits[best_idx]:
+            remaining[trait_path] = int(remaining.get(trait_path, 0)) - 1
+            if remaining[trait_path] <= 0:
+                resident.discard(trait_path)
+
+    if log is not None:
+        if plan != list(range(nrows)):
+            preview = ", ".join(str(int(rows[i].row_id)) for i in plan[: min(10, len(plan))])
+            log._log(
+                f"[rg:manifest] optimized pair order for trait reuse; "
+                f"peak resident traits in plan={peak_resident}; "
+                f"first manifest row ids in execution plan: {preview}"
+            )
+        else:
+            log._log("[rg:manifest] manifest order already near-optimal; keeping input order.")
+
+    return plan
+
+
+def _load_manifest_trait_entry(
+    *,
+    spath: str,
+    meta: dict,
+    shared_trace,
+    args,
+    cache: dict[str, _ManifestTraitCacheEntry],
+    log,
+    verbose_level: int,
+) -> _ManifestTraitCacheEntry:
+    cached = cache.get(spath)
+    if cached is not None:
+        return cached
+
+    cov_rank = meta.get("cov_rank", None)
+    phen = meta.get("phen", utils._phen_name_from_path(spath))
+    t0 = utils._get_time()
+
+    ss = Sumstats.from_file(
+        spath,
+        name=phen,
+        log=log,
+        cov_rank=cov_rank,
+        cov_rank_source=("manifest" if cov_rank is not None else None),
+        compute_diagnostics=(verbose_level >= 1),
+    )
+    aligned = ss.align_to_trace(shared_trace)
+    keep_mask = aligned.keep_mask(
+        chisq_threshold=args.max_chisq,
+        chisq_action=args.chisq_action,
+    )
+
+    entry = _ManifestTraitCacheEntry(
+        path=spath,
+        phen=phen,
+        cov_rank=cov_rank,
+        sumstats=ss,
+        aligned=aligned,
+        keep_mask=np.asarray(keep_mask, dtype=bool),
+    )
+    cache[spath] = entry
+
+    if log is not None and verbose_level >= 1:
+        matched_n = int(np.sum(aligned.matched_mask()))
+        keep_n = int(np.sum(entry.keep_mask))
+        dt = utils._get_time() - t0
+        log._log(
+            f"[rg:manifest] cached trait '{phen}' from '{spath}' in {dt:.3f}s; "
+            f"matched={matched_n}/{shared_trace.nsnps}, kept={keep_n}."
+        )
+
+    return entry
+
+
+
 def _dispatch_rg_manifest(args, log):
     if args.trace is not None:
         log._log("!!! Trace summaries are not supported in the refactored rg path yet. Use --ldscores. !!!")
@@ -620,7 +869,10 @@ def _dispatch_rg_manifest(args, log):
         log._log("!!! In rg manifest mode, provide trait-specific cov_rank via optional manifest columns cov_rank1 / cov_rank2 or via the sumstats files. Global --cov-rank is not allowed. !!!")
         raise SystemExit(1)
 
+    verbose_level = _verbose_to_level(args.verbose)
     manifest_df, trait_meta = _normalize_rg_manifest(args.rg, log=log)
+    execution_plan = _plan_rg_manifest_order(manifest_df, log=log)
+    remaining_uses = _build_manifest_trait_use_counts(manifest_df)
 
     shared_trace = Trace(
         bimpath=args.bim,
@@ -631,36 +883,45 @@ def _dispatch_rg_manifest(args, log):
         ldscores_reg=args.ldscores_reg,
         ldscores_reg_w=args.ldscores_reg_w,
         annot=args.annot,
-        verbose=bool(_verbose_to_level(args.verbose)),
+        verbose=bool(verbose_level),
         delta=None,
     )
 
-    sumstats_cache = {}
-    for spath, meta in trait_meta.items():
-        cov_rank = meta.get("cov_rank", None)
-        sumstats_cache[spath] = Sumstats.from_file(
-            spath,
-            name=meta.get("phen", utils._phen_name_from_path(spath)),
-            log=log,
-            cov_rank=cov_rank,
-            cov_rank_source=("manifest" if cov_rank is not None else None),
-        )
-
+    trait_cache: dict[str, _ManifestTraitCacheEntry] = {}
     results_rows = []
     outdir = Path(args.out)
 
-    for i, row in enumerate(manifest_df.itertuples(index=False), start=1):
+    for exec_pos, row_idx in enumerate(execution_plan, start=1):
+        row = manifest_df.iloc[int(row_idx)]
         pair_prefix = str(outdir / row.out_stem)
+
         pair_log = Logger(suppress=args.suppress)
         pair_log._log(
-            f"[rg:manifest] running pair {i}/{manifest_df.shape[0]}: "
-            f"{row.phen1} vs {row.phen2}"
+            f"[rg:manifest] running pair {exec_pos}/{manifest_df.shape[0]} "
+            f"(manifest_row={int(row.row_id)}): {row.phen1} vs {row.phen2}"
         )
 
-        ss1 = sumstats_cache[row.sumstats1]
-        ss2 = sumstats_cache[row.sumstats2]
-        ss1.log = pair_log
-        ss2.log = pair_log
+        entry1 = _load_manifest_trait_entry(
+            spath=row.sumstats1,
+            meta=trait_meta[row.sumstats1],
+            shared_trace=shared_trace,
+            args=args,
+            cache=trait_cache,
+            log=log,
+            verbose_level=verbose_level,
+        )
+        entry2 = _load_manifest_trait_entry(
+            spath=row.sumstats2,
+            meta=trait_meta[row.sumstats2],
+            shared_trace=shared_trace,
+            args=args,
+            cache=trait_cache,
+            log=log,
+            verbose_level=verbose_level,
+        )
+
+        entry1.sumstats.log = pair_log
+        entry2.sumstats.log = pair_log
 
         rg = Sumcore(
             bim_path=args.bim,
@@ -690,8 +951,12 @@ def _dispatch_rg_manifest(args, log):
             adjust_delta=args.adjust_delta,
             cov_rank=None,
             trace_obj=shared_trace,
-            sumstats_pair=(ss1, ss2),
+            sumstats_pair=(entry1.sumstats, entry2.sumstats),
+            aligned_pair=(entry1.aligned, entry2.aligned),
+            keep_masks=(entry1.keep_mask, entry2.keep_mask),
             phen_names=(row.phen1, row.phen2),
+            write_jack=args.write_jack,
+            write_normeq=args.write_normeq,
         )
 
         try:
@@ -710,6 +975,7 @@ def _dispatch_rg_manifest(args, log):
         rg_fit = res["rg_fit"]
 
         results_rows.append({
+            "_row_id": int(row.row_id),
             "phen1": row.phen1,
             "phen2": row.phen2,
             "sumstats1": row.sumstats1,
@@ -731,15 +997,24 @@ def _dispatch_rg_manifest(args, log):
         })
 
         log._log(
-            f"[rg:manifest] completed pair {i}/{manifest_df.shape[0]}: "
-            f"{row.phen1} vs {row.phen2}; rg={float(rg_fit.rg_total[0]):.6g} "
-            f"(SE: {float(rg_fit.rg_total[1]):.6g})"
+            f"[rg:manifest] completed pair {exec_pos}/{manifest_df.shape[0]} "
+            f"(manifest_row={int(row.row_id)}): {row.phen1} vs {row.phen2}; "
+            f"rg={float(rg_fit.rg_total[0]):.6g} (SE: {float(rg_fit.rg_total[1]):.6g})"
         )
 
-    summary_path = outdir / "manifest.results.tsv"
-    pd.DataFrame(results_rows).to_csv(summary_path, sep="\t", index=False)
-    log._log(f"[rg:manifest] saved batch summary to {summary_path}")
+        for trait_path in _manifest_row_traits(row):
+            remaining_uses[trait_path] = int(remaining_uses.get(trait_path, 0)) - 1
+            if remaining_uses[trait_path] <= 0:
+                evicted = trait_cache.pop(trait_path, None)
+                if evicted is not None and verbose_level >= 1:
+                    log._log(
+                        f"[rg:manifest] evicted trait '{evicted.phen}' from cache after its final pair."
+                    )
 
+    summary_path = outdir / "manifest.results.tsv"
+    results_df = pd.DataFrame(results_rows).sort_values("_row_id", kind="mergesort").drop(columns=["_row_id"])
+    results_df.to_csv(summary_path, sep="\t", index=False)
+    log._log(f"[rg:manifest] saved batch summary to {summary_path}")
 
 def _dispatch_make_rg_manifest(args, log):
     if args.phen_dir is None:
@@ -785,11 +1060,7 @@ def main():
     rg_manifest_mode = utils._is_rg_manifest_arg(args.rg) if args.rg is not None else False
     build_manifest_mode = args.make_rg_manifest is not None
 
-    low_level = _make_low_level_env(args)
-    apply_env(low_level)
-
     log = Logger(suppress=args.suppress)
-    _log_cli_args(parser, args, log)
 
     if args.out is None:
         log._log("!!! --out must be provided. !!!")
@@ -806,6 +1077,13 @@ def main():
     else:
         log_suffix = ".win.log" if (args.geno and args.ld_wind_kb is not None) else (".gw.log" if args.geno else ".log")
         log.attach_file(args.out + log_suffix)
+
+    _apply_runtime_thread_cap(args.num_threads, log=log)
+
+    low_level = _make_low_level_env(args)
+    apply_env(low_level)
+
+    _log_cli_args(parser, args, log)
 
     modes = int(args.geno is not None) + int(args.h2 is not None) + int(args.rg is not None) + int(build_manifest_mode)
     if modes != 1:

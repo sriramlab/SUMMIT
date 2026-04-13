@@ -135,7 +135,15 @@ class AlignedSumstats:
         out[mask] = np.isfinite(self.sumstats.chi2[pos]) & (self.sumstats.chi2[pos] <= thr)
         return out
 
-    def materialize(self, keep_mask, *, chisq_threshold=None, chisq_action="drop") -> MatchedSumstats:
+    def materialize(
+        self,
+        keep_mask,
+        *,
+        chisq_threshold=None,
+        chisq_action="drop",
+        allowed_mask=None,
+        compute_diagnostics: bool = True,
+    ) -> MatchedSumstats:
         keep_mask = np.asarray(keep_mask, dtype=bool)
         if keep_mask.ndim != 1 or keep_mask.size != self.trace.nsnps:
             raise ValueError(
@@ -146,7 +154,15 @@ class AlignedSumstats:
         if action not in ("drop", "clip", "warn", "none"):
             raise ValueError(f"Invalid chisq_action={chisq_action!r}")
 
-        allowed = self.keep_mask(chisq_threshold=chisq_threshold, chisq_action=chisq_action)
+        if allowed_mask is None:
+            allowed = self.keep_mask(chisq_threshold=chisq_threshold, chisq_action=chisq_action)
+        else:
+            allowed = np.asarray(allowed_mask, dtype=bool)
+            if allowed.ndim != 1 or allowed.size != self.trace.nsnps:
+                raise ValueError(
+                    f"allowed_mask must be length {self.trace.nsnps}; got {allowed.shape}."
+                )
+
         if np.any(keep_mask & ~allowed):
             bad = int(np.sum(keep_mask & ~allowed))
             raise ValueError(
@@ -175,8 +191,12 @@ class AlignedSumstats:
             if clip_count > 0:
                 np.minimum(chi2, thr, out=chi2)
 
-        used_summary = _chisq_summary(chi2)
-        used_top = _top_chisq_rows(snps, a1, a2, chi2, topk=10)
+        if compute_diagnostics:
+            used_summary = _chisq_summary(chi2)
+            used_top = _top_chisq_rows(snps, a1, a2, chi2, topk=10)
+        else:
+            used_summary = None
+            used_top = None
 
         return MatchedSumstats(
             snps=snps,
@@ -273,6 +293,7 @@ class Sumstats:
         log=None,
         cov_rank=None,
         cov_rank_source=None,
+        compute_diagnostics: bool = True,
     ) -> "Sumstats":
         hdr = pd.read_csv(path, sep=r"\s+", compression="infer", nrows=0)
         cols = list(hdr.columns)
@@ -429,14 +450,18 @@ class Sumstats:
         else:
             df = df.reset_index(drop=True)
 
-        read_summary = _chisq_summary(df["Z"].to_numpy(dtype=np.float64, copy=False) ** 2)
-        read_top = _top_chisq_rows(
-            df["SNP"].astype(str).to_numpy(),
-            df["A1"].astype(str).to_numpy(),
-            df["A2"].astype(str).to_numpy(),
-            df["Z"].to_numpy(dtype=np.float64, copy=False) ** 2,
-            topk=10,
-        )
+        if compute_diagnostics:
+            read_summary = _chisq_summary(df["Z"].to_numpy(dtype=np.float64, copy=False) ** 2)
+            read_top = _top_chisq_rows(
+                df["SNP"].astype(str).to_numpy(),
+                df["A1"].astype(str).to_numpy(),
+                df["A2"].astype(str).to_numpy(),
+                df["Z"].to_numpy(dtype=np.float64, copy=False) ** 2,
+                topk=10,
+            )
+        else:
+            read_summary = None
+            read_top = None
 
         return cls(
             snps=df["SNP"].astype(str).to_numpy(),
