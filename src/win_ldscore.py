@@ -4,7 +4,8 @@ import os
 import sys
 import time
 import ctypes
-from contextlib import nullcontext
+import threading
+from contextlib import contextmanager, nullcontext
 from typing import Optional, Tuple, List
 
 import numpy as np
@@ -28,6 +29,7 @@ except Exception as e:  # pragma: no cover
 
 # -------------------- env / perf helpers --------------------
 
+
 def _canonical_bfile_prefix(x: str) -> str:
     """Return PLINK bfile prefix: strip trailing .bed/.bim/.fam if present; otherwise leave as-is."""
     s = str(x)
@@ -37,6 +39,7 @@ def _canonical_bfile_prefix(x: str) -> str:
     return s
 
 
+
 def _trim_malloc_best_effort():
     try:
         ctypes.CDLL("libc.so.6").malloc_trim(0)
@@ -44,23 +47,117 @@ def _trim_malloc_best_effort():
         pass
 
 
-def _set_parallelism(blas_threads: Optional[int]):
-    """
-    Cap BLAS threads for C++ BLAS calls.
-    Returns a context manager if threadpoolctl is available; otherwise no-op.
-    """
-    if blas_threads is None:
-        return nullcontext()
 
-    b = max(1, int(blas_threads))
-    for var in ("OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS", "BLIS_NUM_THREADS", "VECLIB_MAXIMUM_THREADS"):
-        os.environ[var] = str(b)
+def _set_openmp_threads_runtime(n: int) -> None:
+    n = max(1, int(n))
+    os.environ["OMP_NUM_THREADS"] = str(n)
+    os.environ["OMP_DYNAMIC"] = "FALSE"
+    try:
+        winldcore.set_num_threads(n)
+    except Exception:
+        pass
+
+
+
+def _get_openmp_threads_runtime() -> Optional[int]:
+    try:
+        return int(winldcore.get_max_threads())
+    except Exception:
+        v = os.environ.get("OMP_NUM_THREADS")
+        return int(v) if (v and v.isdigit()) else None
+
+
+
+def _set_blas_env_vars(n: int) -> None:
+    n = max(1, int(n))
+    os.environ["OPENBLAS_NUM_THREADS"] = str(n)
     os.environ["OPENBLAS_DYNAMIC"] = "0"
+    os.environ["MKL_NUM_THREADS"] = str(n)
     os.environ["MKL_DYNAMIC"] = "FALSE"
+    os.environ["BLIS_NUM_THREADS"] = str(n)
+    os.environ["VECLIB_MAXIMUM_THREADS"] = str(n)
 
-    if threadpool_limits is not None:
-        return threadpool_limits(limits=b, user_api="blas")
-    return nullcontext()
+
+
+def _set_blas_threads_runtime(n: int) -> None:
+    n = max(1, int(n))
+    _set_blas_env_vars(n)
+    try:
+        import mkl  # type: ignore
+        mkl.set_num_threads(n)
+    except Exception:
+        pass
+    try:
+        for soname in ("libopenblas.so", "libopenblas.so.0", "libopenblas64_.so", "libopenblas64_.so.0"):
+            try:
+                lib = ctypes.CDLL(soname)
+                for sym in ("openblas_set_num_threads", "openblas_set_num_threads64_"):
+                    try:
+                        getattr(lib, sym)(int(n))
+                        break
+                    except AttributeError:
+                        continue
+                break
+            except OSError:
+                continue
+    except Exception:
+        pass
+
+
+@contextmanager
+def _set_parallelism(
+    omp_threads: Optional[int] = None,
+    blas_threads: Optional[int] = None,
+    decode_threads_cap: Optional[int] = None,
+):
+    """
+    Coordinate OpenMP, BLAS, and decoder thread caps for the C++ backend.
+
+    BLAS threads are controlled via threadpoolctl when available. OpenMP is driven
+    explicitly through winldcore.set_num_threads(...) so phase-level changes take
+    effect reliably at runtime.
+    """
+    prev_env = {}
+    for key in (
+        "OMP_NUM_THREADS",
+        "OMP_DYNAMIC",
+        "OPENBLAS_NUM_THREADS",
+        "OPENBLAS_DYNAMIC",
+        "MKL_NUM_THREADS",
+        "MKL_DYNAMIC",
+        "BLIS_NUM_THREADS",
+        "VECLIB_MAXIMUM_THREADS",
+        "SUMMIT_DECODE_THREADS_CAP",
+    ):
+        prev_env[key] = os.environ.get(key)
+
+    prev_omp = _get_openmp_threads_runtime() if omp_threads is not None else None
+    if omp_threads is not None:
+        _set_openmp_threads_runtime(int(omp_threads))
+
+    if decode_threads_cap is not None:
+        os.environ["SUMMIT_DECODE_THREADS_CAP"] = str(max(1, int(decode_threads_cap)))
+
+    b = None
+    if blas_threads is not None:
+        b = max(1, int(blas_threads))
+        _set_blas_env_vars(b)
+        if threadpool_limits is None:
+            _set_blas_threads_runtime(b)
+
+    ctl = threadpool_limits(limits=b, user_api="blas") if (b is not None and threadpool_limits is not None) else nullcontext()
+    try:
+        with ctl:
+            yield
+    finally:
+        if prev_omp is not None and omp_threads is not None:
+            _set_openmp_threads_runtime(prev_omp)
+        for key, val in prev_env.items():
+            if val is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = val
+
 
 
 def _parse_rand_samp(rand_samp, n: int, rng: np.random.Generator) -> Optional[np.ndarray]:
@@ -89,6 +186,7 @@ def _parse_rand_samp(rand_samp, n: int, rng: np.random.Generator) -> Optional[np
 
 
 # -------------------- covariates (QR projection) --------------------
+
 
 def _read_cov_qr(
     cov_path: str,
@@ -314,9 +412,11 @@ class WindowedLDScore:
                 self.log._log(f"[win][warn] Failed to set C++ verbosity / threads: {e}")
 
         if self.verbose:
+            cache_msg = "auto" if self.cache_mb < 0 else str(self.cache_mb)
+            panel_msg = "auto" if self.panel_cols <= 0 else str(self.panel_cols)
             self.log._log(
                 f"[win] ld_wind_kb={self.ld_wind_kb}, chunk_size={self.chunk_size}, "
-                f"panel_cols={self.panel_cols or 'auto'}, cache_mb={self.cache_mb}, threads={self.num_threads}"
+                f"panel_cols={panel_msg}, cache_mb={cache_msg}, threads={self.num_threads}"
             )
 
         self.win_ldscore: Optional[np.ndarray] = None
@@ -421,7 +521,7 @@ class WindowedLDScore:
     def _compute_maf(self) -> np.ndarray:
         self.log._log("[win] Computing MAF for .win.M_5_50 via C++ core.")
         step = int(max(1024, min(self.nsnps, self.chunk_size)))
-        with _set_parallelism(blas_threads=1):
+        with _set_parallelism(omp_threads=self.num_threads, blas_threads=1, decode_threads_cap=self.num_threads):
             maf = winldcore.compute_maf_bed(
                 bed_prefix=self.bed_prefix,
                 fam_path=self.fam_path,
@@ -431,30 +531,66 @@ class WindowedLDScore:
             )
         return np.asarray(maf, dtype=np.float64, order="C")
 
-    def _compute_chrom_ldscores(self, s: int, e: int) -> np.ndarray:
+    def _compute_chrom_ldscores(self, s: int, e: int, pbar=None) -> np.ndarray:
         bp = self.snplist["BP"].to_numpy(dtype=np.int64, copy=False)[s:e]
         ann_chr = np.asfortranarray(self.annot[s:e, :], dtype=np.float64)
 
-        with _set_parallelism(blas_threads=self.num_threads):
-            ld_chr = winldcore.compute_windowed_ld_chr(
-                bed_prefix=self.bed_prefix,
-                fam_path=self.fam_path,
-                chr_start=int(s),
-                chr_end=int(e),
-                bp=bp,
-                annot_chr=ann_chr,
-                ld_wind_kb=float(self.ld_wind_kb),
-                chunk_size=int(self.chunk_size),
-                row_sel=(self.row_sel if self.row_sel is not None else None),
-                C=(self.C if self.C is not None else None),
-                R=(self.cov_R if self.cov_R is not None else None),
-                impute_mode=self.impute_method,
-                impute_seed=int(self.impute_seed),
-                panel_cols=int(self.panel_cols),
-                cache_mb=int(self.cache_mb),
-            )
+        result = {}
+        error = {}
+        done_evt = threading.Event()
+
+        def _worker():
+            try:
+                result["ld_chr"] = winldcore.compute_windowed_ld_chr(
+                    bed_prefix=self.bed_prefix,
+                    fam_path=self.fam_path,
+                    chr_start=int(s),
+                    chr_end=int(e),
+                    bp=bp,
+                    annot_chr=ann_chr,
+                    ld_wind_kb=float(self.ld_wind_kb),
+                    chunk_size=int(self.chunk_size),
+                    row_sel=(self.row_sel if self.row_sel is not None else None),
+                    C=(self.C if self.C is not None else None),
+                    R=(self.cov_R if self.cov_R is not None else None),
+                    impute_mode=self.impute_method,
+                    impute_seed=int(self.impute_seed),
+                    panel_cols=int(self.panel_cols),
+                    cache_mb=int(self.cache_mb),
+                )
+            except BaseException as ex:
+                error["ex"] = ex
+            finally:
+                done_evt.set()
+
+        with _set_parallelism(omp_threads=self.num_threads, blas_threads=self.num_threads, decode_threads_cap=self.num_threads):
+            t = threading.Thread(target=_worker, daemon=True)
+            t.start()
+
+            last_done = 0
+            while not done_evt.wait(0.10):
+                if pbar is not None:
+                    done = int(winldcore.get_progress_done())
+                    total = int(pbar.total) if pbar.total is not None else done
+                    done = min(done, total)
+                    if done > last_done:
+                        pbar.update(done - last_done)
+                        last_done = done
+
+            t.join()
+
+            if pbar is not None:
+                done = int(winldcore.get_progress_done())
+                total = int(pbar.total) if pbar.total is not None else done
+                done = min(done, total)
+                if done > last_done:
+                    pbar.update(done - last_done)
+
+        if "ex" in error:
+            raise error["ex"]
+
         _trim_malloc_best_effort()
-        return np.asarray(ld_chr, dtype=np.float64, order="C")
+        return np.asarray(result["ld_chr"], dtype=np.float64, order="C")
 
     # ------------------ public entrypoint ------------------
 
@@ -477,26 +613,30 @@ class WindowedLDScore:
 
         ld_all = np.zeros((self.nsnps, self.nbins), dtype=np.float64)
 
-        pbar = tqdm(
-            blocks,
-            total=len(blocks),
-            desc="WIN-LD progress",
-            unit="chr",
-            file=sys.stderr,
-            dynamic_ncols=True,
-        )
+        for chrom, s, e in blocks:
+            n_chunks = max(1, (int(e) - int(s) + self.chunk_size - 1) // self.chunk_size)
+            pbar = tqdm(
+                total=n_chunks,
+                desc=f"chr {chrom}",
+                unit="chunk",
+                file=sys.stderr,
+                dynamic_ncols=True,
+                leave=True,
+            )
 
-        for chrom, s, e in pbar:
-            t0 = time.time()
-            ld_chr = self._compute_chrom_ldscores(s, e)
-            ld_all[s:e, :] = ld_chr
+            try:
+                t0 = time.time()
+                ld_chr = self._compute_chrom_ldscores(s, e, pbar=pbar)
+                ld_all[s:e, :] = ld_chr
+                pbar.set_postfix_str("done")
 
-            if self.verbose:
-                bp0 = int(self.snplist["BP"].iloc[s])
-                bp1 = int(self.snplist["BP"].iloc[e - 1])
-                dt = time.time() - t0
-                self.log._log(f"[win] chr {chrom}: m={e - s}, BP=[{bp0},{bp1}], runtime={dt:.2f}s")
-            pbar.set_postfix_str(f"chr {chrom}")
+                if self.verbose:
+                    bp0 = int(self.snplist["BP"].iloc[s])
+                    bp1 = int(self.snplist["BP"].iloc[e - 1])
+                    dt = time.time() - t0
+                    self.log._log(f"[win] chr {chrom}: m={e - s}, BP=[{bp0},{bp1}], runtime={dt:.2f}s")
+            finally:
+                pbar.close()
 
         self.win_ldscore = ld_all
 

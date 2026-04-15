@@ -1,3 +1,4 @@
+// gwldcore.cpp
 #include "nb_utils.hpp"
 
 #include <algorithm>
@@ -35,6 +36,10 @@
 
 // --- Interrupt handling (Ctrl-C) --------------------------------------------
 static inline void check_for_interrupt() { nb_check_for_interrupt(); }
+static inline bool interrupt_pending_noexcept() {
+    nb::gil_scoped_acquire gil;
+    return PyErr_CheckSignals() != 0;
+}
 
 // --- aligned new/delete ------------------------------------------------------
 template <typename T>
@@ -910,7 +915,8 @@ void apply_grm_bed_panel_impl(
             continue;
 
         int N_blk = 0, L_blk = 0;
-        std::vector<T> Geno;
+        static thread_local std::vector<T> Geno_tls;
+        std::vector<T>& Geno = Geno_tls;
         read_block_standardized<T>(bed_path, fam_path, s, e, rows, ddof,
                                    impute_mode, impute_seed,
                                    Geno, N_blk, L_blk);
@@ -921,7 +927,9 @@ void apply_grm_bed_panel_impl(
         gemm_col_major_tn<T>(L, Q, N_rows, Geno.data(), N_rows,
                              Vin.ptr, N_rows, coef, L, T(1), T(0));
 
-        std::vector<T> row_scale((size_t) L, T(0));
+        static thread_local std::vector<T> row_scale_tls;
+        if (row_scale_tls.size() < (size_t) L) row_scale_tls.resize((size_t) L);
+        T* row_scale = row_scale_tls.data();
         for (int j = 0; j < L; ++j) {
             const double invj = (double) invp[(size_t) (s + j)];
             double w = invj * invj * invM;
@@ -1189,10 +1197,11 @@ void phase1_compute_Xz_bed_chunk_impl(const std::string &bed_prefix,
                                       nb_vec1_ro<T> inv_right,
                                       int v_start,
                                       int v_count,
-                                      int,
+                                      int kmax_hint,
                                       const std::string &rand_dist,
                                       nb::object seed_obj,
                                       nb_mat2f_rw<T> Xz2d_chunk,
+                                      nb::object bin_init_mask_obj,
                                       bool project_right,
                                       nb::object C_opt,
                                       nb::object R_opt,
@@ -1213,7 +1222,8 @@ void phase1_compute_Xz_bed_chunk_impl(const std::string &bed_prefix,
     const std::vector<int>& rows = parse_row_sel(row_sel_obj, N_total);
 
     int N = 0, L = 0;
-    std::vector<T> Geno;
+    static thread_local std::vector<T> Geno_tls;
+    std::vector<T>& Geno = Geno_tls;
     read_block_standardized<T>(bed_path, fam_path, blk_start, blk_end, rows, ddof,
                                impute_mode, impute_seed,
                                Geno, N, L);
@@ -1228,9 +1238,11 @@ void phase1_compute_Xz_bed_chunk_impl(const std::string &bed_prefix,
             throw std::runtime_error("C/R shape mismatch in phase1");
         const T* Cptr = C.data();
         const T* Rptr = R.data();
-        AlignedBuffer<T> tmpG((size_t) p * (size_t) L, 64);
-        gemm_col_major_nn<T>(p, L, N, Rptr, p, Geno.data(), N, tmpG.ptr, p, T(1), T(0));
-        gemm_col_major_nn<T>(N, L, p, Cptr, N, tmpG.ptr, p, Geno.data(), N, T(-1), T(1));
+        static thread_local AlignedBuffer<T> tmpG_tls;
+        const size_t need_tmp = (size_t) p * (size_t) L;
+        if (tmpG_tls.n < need_tmp) tmpG_tls.allocate(need_tmp, 64);
+        gemm_col_major_nn<T>(p, L, N, Rptr, p, Geno.data(), N, tmpG_tls.ptr, p, T(1), T(0));
+        gemm_col_major_nn<T>(N, L, p, Cptr, N, tmpG_tls.ptr, p, Geno.data(), N, T(-1), T(1));
     }
 
     const int B = (int) annot_blk.shape(1);
@@ -1244,6 +1256,15 @@ void phase1_compute_Xz_bed_chunk_impl(const std::string &bed_prefix,
     T* Xptr = Xz2d_chunk.data();
     const int ldc = N;
 
+    uint8_t* bin_init = nullptr;
+    nb_vec1_rw<uint8_t> bin_init_mask;
+    if (!bin_init_mask_obj.is_none()) {
+        bin_init_mask = nb::cast<nb_vec1_rw<uint8_t>>(bin_init_mask_obj);
+        if ((int) bin_init_mask.shape(0) != B)
+            throw std::runtime_error("bin_init_mask shape mismatch in phase1");
+        bin_init = bin_init_mask.data();
+    }
+
     const bool have_root = !seed_obj.is_none();
     const uint64_t root_seed = have_root ? nb::cast<uint64_t>(seed_obj) : std::random_device{}();
     std::mt19937_64 rng(make_seed(root_seed, blk_start, v_start));
@@ -1251,19 +1272,23 @@ void phase1_compute_Xz_bed_chunk_impl(const std::string &bed_prefix,
     const bool is_rademacher = (rand_dist == "rademacher");
     const bool is_spherical = (rand_dist == "spherical");
 
-    std::vector<T> Z((size_t) L * (size_t) v_count, T(0));
+    static thread_local AlignedBuffer<T> Z_tls;
+    const size_t needZ = (size_t) L * (size_t) v_count;
+    if (Z_tls.n < needZ) Z_tls.allocate(needZ, 64);
+    T* Zptr = Z_tls.ptr;
     for (int c = 0; c < v_count; ++c) {
         long double ss = 0.0L;
+        T* zc = Zptr + (size_t) c * (size_t) L;
         for (int r = 0; r < L; ++r) {
             T z = is_rademacher ? ((rng() & 1) ? T(+1) : T(-1)) : gN(rng);
-            Z[(size_t) r + (size_t) c * (size_t) L] = z;
+            zc[(size_t) r] = z;
             if (is_spherical)
                 ss += (long double) z * (long double) z;
         }
         if (is_spherical) {
-            T scale = ss > 0.0L ? (T) std::sqrt((long double) L / ss) : T(1);
+            const T zscale = ss > 0.0L ? (T) std::sqrt((long double) L / ss) : T(1);
             for (int r = 0; r < L; ++r)
-                Z[(size_t) r + (size_t) c * (size_t) L] *= scale;
+                zc[(size_t) r] *= zscale;
         }
     }
 
@@ -1272,99 +1297,142 @@ void phase1_compute_Xz_bed_chunk_impl(const std::string &bed_prefix,
     const int* rowind = csr->rowind.ptr;
     const T* scale = csr->scale.ptr;
 
-    if (blk_start == 0) {
-        const size_t Q = (size_t) B * (size_t) v_count;
-        const size_t elems_per_page = (size_t) ((4096 / sizeof(T)) ? (4096 / sizeof(T)) : 512);
-#ifdef _OPENMP
-        #pragma omp parallel for schedule(static)
-#endif
-        for (ptrdiff_t g = 0; g < (ptrdiff_t) Q; ++g) {
-            T* col = Xptr + (size_t) g * (size_t) ldc;
-            for (size_t r = 0; r < (size_t) N; r += elems_per_page)
-                col[r] += T(0);
-        }
-    }
+    int Kcap = std::max(1, kmax_hint);
+    for (int k = 0; k < B; ++k)
+        Kcap = std::max(Kcap, colptr[(size_t) k + 1] - colptr[(size_t) k]);
 
     const char* s = std::getenv("SUMMIT_P1_NTILE");
     int NTILE = s ? std::max(64, std::atoi(s)) : (std::is_same_v<T, double> ? 256 : 512);
+    const bool do_timing = verbose_enabled();
+    using Clock = std::chrono::high_resolution_clock;
     P1Timers t1;
 
-    for (int k = 0; k < B; ++k) {
-        check_for_interrupt();
-        const int k0 = colptr[(size_t) k];
-        const int k1 = colptr[(size_t) k + 1];
-        const int K = k1 - k0;
-        if (K == 0)
-            continue;
+    static thread_local AlignedBuffer<T> Bcol_shared_tls;
+    const size_t needB = (size_t) Kcap * (size_t) v_count;
+    if (Bcol_shared_tls.n < needB) Bcol_shared_tls.allocate(needB, 64);
+    T* Bcol_shared = Bcol_shared_tls.ptr;
 
-        AlignedBuffer<T> Bcol((size_t) K * (size_t) v_count, 64);
+    int shared_k0 = 0;
+    int sharedK = 0;
+    size_t shared_base_col = 0;
+    T shared_beta = T(1);
+    bool interrupted = false;
 
-        auto z0 = std::chrono::high_resolution_clock::now();
-        for (int c = 0; c < v_count; ++c) {
-            const T* zc = Z.data() + (size_t) c * (size_t) L;
-            T* dst = Bcol.ptr + (size_t) c * (size_t) K;
-            for (int r = 0; r < K; ++r) {
-                const int snp = rowind[(size_t) k0 + (size_t) r];
-                dst[(size_t) r] = zc[(size_t) snp];
-            }
-        }
-        auto z1 = std::chrono::high_resolution_clock::now();
-        t1.t_packZ_ms += std::chrono::duration<double, std::milli>(z1 - z0).count();
+    check_for_interrupt();
 
+    {
+        nb::gil_scoped_release nogil;
 #ifdef _OPENMP
         #pragma omp parallel
 #endif
         {
-            AlignedBuffer<T> A_tile((size_t) NTILE * (size_t) K, 64);
-            AlignedBuffer<T> C_tile((size_t) NTILE * (size_t) v_count, 64);
-            double packA_ms = 0.0, gemm_ms = 0.0, scatt_ms = 0.0;
+            static thread_local AlignedBuffer<T> A_tile_tls;
+            const size_t needA = (size_t) NTILE * (size_t) Kcap;
+            if (A_tile_tls.n < needA) A_tile_tls.allocate(needA, 64);
+            T* A_tile = A_tile_tls.ptr;
+            double packZ_ms = 0.0;
+            double packA_ms = 0.0;
+            double gemm_ms = 0.0;
+
+            for (int k = 0; k < B; ++k) {
 #ifdef _OPENMP
-            #pragma omp for schedule(static)
+                #pragma omp master
 #endif
-            for (int n0 = 0; n0 < N; n0 += NTILE) {
-                const int Nt = std::min(N - n0, NTILE);
-                auto a0 = std::chrono::high_resolution_clock::now();
-                for (int c = 0; c < K; ++c) {
-                    const int snp = rowind[(size_t) k0 + (size_t) c];
-                    const T ssc = scale[(size_t) k0 + (size_t) c];
-                    const T* src = Geno.data() + (size_t) snp * (size_t) N + (size_t) n0;
-                    T* dst = A_tile.ptr + (size_t) c * (size_t) Nt;
-#pragma omp simd
-                    for (int r = 0; r < Nt; ++r)
-                        dst[r] = src[r] * ssc;
+                {
+                    if (!interrupted && interrupt_pending_noexcept()) {
+                        interrupted = true;
+                        sharedK = 0;
+                    }
+                    if (!interrupted) {
+                        shared_k0 = colptr[(size_t) k];
+                        const int k1 = colptr[(size_t) k + 1];
+                        sharedK = k1 - shared_k0;
+                        shared_base_col = (size_t) k * (size_t) v_count;
+                        shared_beta = T(1);
+                        if (sharedK > 0 && bin_init) {
+                            shared_beta = bin_init[(size_t) k] ? T(1) : T(0);
+                            bin_init[(size_t) k] = 1u;
+                        }
+                    }
                 }
-                auto a1 = std::chrono::high_resolution_clock::now();
-                packA_ms += std::chrono::duration<double, std::milli>(a1 - a0).count();
-
-                auto g0 = std::chrono::high_resolution_clock::now();
-                gemm_col_major_nn<T>(Nt, v_count, K, A_tile.ptr, Nt, Bcol.ptr, K, C_tile.ptr, Nt, T(1), T(0));
-                auto g1 = std::chrono::high_resolution_clock::now();
-                gemm_ms += std::chrono::duration<double, std::milli>(g1 - g0).count();
-
-                auto s0 = std::chrono::high_resolution_clock::now();
-                const size_t base_col = (size_t) k * (size_t) v_count;
-                for (int c = 0; c < v_count; ++c) {
-                    const T* src_col = C_tile.ptr + (size_t) c * (size_t) Nt;
-                    T* dst_col = Xptr + ((base_col + (size_t) c) * (size_t) ldc) + (size_t) n0;
-                    cblas_taxpy(Nt, T(1), src_col, 1, dst_col, 1);
+#ifdef _OPENMP
+                #pragma omp barrier
+#endif
+                if (!interrupted && sharedK > 0) {
+                    const auto z0 = do_timing ? Clock::now() : Clock::time_point{};
+#ifdef _OPENMP
+                    #pragma omp for schedule(static)
+#endif
+                    for (int c = 0; c < v_count; ++c) {
+                        const T* zc = Zptr + (size_t) c * (size_t) L;
+                        T* dst = Bcol_shared + (size_t) c * (size_t) sharedK;
+                        for (int r = 0; r < sharedK; ++r) {
+                            const size_t idx = (size_t) shared_k0 + (size_t) r;
+                            dst[(size_t) r] = zc[(size_t) rowind[idx]] * scale[idx];
+                        }
+                    }
+                    if (do_timing) {
+                        const auto z1 = Clock::now();
+                        packZ_ms += std::chrono::duration<double, std::milli>(z1 - z0).count();
+                    }
                 }
-                auto s1 = std::chrono::high_resolution_clock::now();
-                scatt_ms += std::chrono::duration<double, std::milli>(s1 - s0).count();
+#ifdef _OPENMP
+                #pragma omp barrier
+#endif
+                if (!interrupted && sharedK > 0) {
+#ifdef _OPENMP
+                    #pragma omp for schedule(static)
+#endif
+                    for (int n0 = 0; n0 < N; n0 += NTILE) {
+                        const int Nt = std::min(N - n0, NTILE);
+                        const auto a0 = do_timing ? Clock::now() : Clock::time_point{};
+                        for (int c = 0; c < sharedK; ++c) {
+                            const int snp = rowind[(size_t) shared_k0 + (size_t) c];
+                            const T* src = Geno.data() + (size_t) snp * (size_t) N + (size_t) n0;
+                            T* dst = A_tile + (size_t) c * (size_t) Nt;
+                            std::memcpy(dst, src, (size_t) Nt * sizeof(T));
+                        }
+                        if (do_timing) {
+                            const auto a1 = Clock::now();
+                            packA_ms += std::chrono::duration<double, std::milli>(a1 - a0).count();
+                        }
+
+                        const auto g0 = do_timing ? Clock::now() : Clock::time_point{};
+                        T* Cdst = Xptr + shared_base_col * (size_t) ldc + (size_t) n0;
+                        gemm_col_major_nn<T>(Nt, v_count, sharedK,
+                                             A_tile, Nt,
+                                             Bcol_shared, sharedK,
+                                             Cdst, ldc,
+                                             T(1), shared_beta);
+                        if (do_timing) {
+                            const auto g1 = Clock::now();
+                            gemm_ms += std::chrono::duration<double, std::milli>(g1 - g0).count();
+                        }
+                    }
+                }
+#ifdef _OPENMP
+                #pragma omp barrier
+#endif
             }
+            if (do_timing) {
 #ifdef _OPENMP
-            #pragma omp atomic
+                #pragma omp atomic
 #endif
-            t1.t_packA_ms += packA_ms;
+                t1.t_packZ_ms += packZ_ms;
 #ifdef _OPENMP
-            #pragma omp atomic
+                #pragma omp atomic
 #endif
-            t1.t_gemm_ms += gemm_ms;
+                t1.t_packA_ms += packA_ms;
 #ifdef _OPENMP
-            #pragma omp atomic
+                #pragma omp atomic
 #endif
-            t1.t_scatt_ms += scatt_ms;
+                t1.t_gemm_ms += gemm_ms;
+            }
         }
     }
+
+    if (interrupted)
+        throw nb::python_error();
 
     t1.dump(blk_start, blk_end, B, v_count);
 }
@@ -1403,7 +1471,8 @@ void phase1_compute_Xz_bed_chunk_rowmajor_impl(const std::string &bed_prefix,
     const std::vector<int>& rows = parse_row_sel(row_sel_obj, N_total);
 
     int N = 0, L = 0;
-    std::vector<T> Geno;
+    static thread_local std::vector<T> Geno_tls;
+    std::vector<T>& Geno = Geno_tls;
     read_block_standardized<T>(bed_path, fam_path, blk_start, blk_end, rows, ddof,
                                impute_mode, impute_seed,
                                Geno, N, L);
@@ -1418,9 +1487,11 @@ void phase1_compute_Xz_bed_chunk_rowmajor_impl(const std::string &bed_prefix,
             throw std::runtime_error("C/R shape mismatch in phase1 rowmajor");
         const T* Cptr = C.data();
         const T* Rptr = R.data();
-        AlignedBuffer<T> tmpG((size_t) p * (size_t) L, 64);
-        gemm_col_major_nn<T>(p, L, N, Rptr, p, Geno.data(), N, tmpG.ptr, p, T(1), T(0));
-        gemm_col_major_nn<T>(N, L, p, Cptr, N, tmpG.ptr, p, Geno.data(), N, T(-1), T(1));
+        static thread_local AlignedBuffer<T> tmpG_tls;
+        const size_t need_tmp = (size_t) p * (size_t) L;
+        if (tmpG_tls.n < need_tmp) tmpG_tls.allocate(need_tmp, 64);
+        gemm_col_major_nn<T>(p, L, N, Rptr, p, Geno.data(), N, tmpG_tls.ptr, p, T(1), T(0));
+        gemm_col_major_nn<T>(N, L, p, Cptr, N, tmpG_tls.ptr, p, Geno.data(), N, T(-1), T(1));
     }
 
     const int B = (int) annot_blk.shape(1);
@@ -1577,7 +1648,8 @@ void phase2_compute_XtXz_bed_impl(const std::string &bed_prefix,
     const std::vector<int>& rows = parse_row_sel(row_sel_obj, N_total);
 
     int N = 0, L = 0;
-    std::vector<T> Geno;
+    static thread_local std::vector<T> Geno_tls;
+    std::vector<T>& Geno = Geno_tls;
     read_block_standardized<T>(bed_path, fam_path, blk_start, blk_end, rows, ddof,
                                impute_mode, impute_seed,
                                Geno, N, L);
@@ -1592,9 +1664,11 @@ void phase2_compute_XtXz_bed_impl(const std::string &bed_prefix,
             throw std::runtime_error("C/R shape mismatch");
         const T* Cptr = C.data();
         const T* Rptr = R.data();
-        AlignedBuffer<T> tmpG((size_t) p * (size_t) L, 64);
-        gemm_col_major_nn<T>(p, L, N, Rptr, p, Geno.data(), N, tmpG.ptr, p, T(1), T(0));
-        gemm_col_major_nn<T>(N, L, p, Cptr, N, tmpG.ptr, p, Geno.data(), N, T(-1), T(1));
+        static thread_local AlignedBuffer<T> tmpG_tls;
+        const size_t need_tmp = (size_t) p * (size_t) L;
+        if (tmpG_tls.n < need_tmp) tmpG_tls.allocate(need_tmp, 64);
+        gemm_col_major_nn<T>(p, L, N, Rptr, p, Geno.data(), N, tmpG_tls.ptr, p, T(1), T(0));
+        gemm_col_major_nn<T>(N, L, p, Cptr, N, tmpG_tls.ptr, p, Geno.data(), N, T(-1), T(1));
     }
 
     if ((int) inv_left.shape(0) != L)
@@ -1752,7 +1826,8 @@ void phase2_accum_XtXz_bed_impl(const std::string &bed_prefix,
     const std::vector<int>& rows = parse_row_sel(row_sel_obj, N_total);
 
     int N = 0, L = 0;
-    std::vector<T> Geno;
+    static thread_local std::vector<T> Geno_tls;
+    std::vector<T>& Geno = Geno_tls;
     read_block_standardized<T>(bed_path, fam_path, blk_start, blk_end, rows, ddof,
                                impute_mode, impute_seed,
                                Geno, N, L);
@@ -1767,9 +1842,11 @@ void phase2_accum_XtXz_bed_impl(const std::string &bed_prefix,
             throw std::runtime_error("C/R shape mismatch in phase2_accum_XtXz_bed");
         const T* Cptr = C.data();
         const T* Rptr = R.data();
-        AlignedBuffer<T> tmpG((size_t) p * (size_t) L, 64);
-        gemm_col_major_nn<T>(p, L, N, Rptr, p, Geno.data(), N, tmpG.ptr, p, T(1), T(0));
-        gemm_col_major_nn<T>(N, L, p, Cptr, N, tmpG.ptr, p, Geno.data(), N, T(-1), T(1));
+        static thread_local AlignedBuffer<T> tmpG_tls;
+        const size_t need_tmp = (size_t) p * (size_t) L;
+        if (tmpG_tls.n < need_tmp) tmpG_tls.allocate(need_tmp, 64);
+        gemm_col_major_nn<T>(p, L, N, Rptr, p, Geno.data(), N, tmpG_tls.ptr, p, T(1), T(0));
+        gemm_col_major_nn<T>(N, L, p, Cptr, N, tmpG_tls.ptr, p, Geno.data(), N, T(-1), T(1));
     }
 
     if ((int) inv_left.shape(0) != L)
@@ -1795,14 +1872,16 @@ void phase2_accum_XtXz_bed_impl(const std::string &bed_prefix,
         denom = 1.0;
     const double inv_denom2 = 1.0 / (denom * denom);
 
-    std::vector<double> left_scale((size_t) L, 0.0);
+    static thread_local std::vector<double> left_scale_tls;
+    if (left_scale_tls.size() < (size_t) L)
+        left_scale_tls.resize((size_t) L);
+    double* left_scale = left_scale_tls.data();
 #ifdef _OPENMP
     #pragma omp parallel for schedule(static)
 #endif
     for (int i = 0; i < L; ++i) {
         const double inv_i = (double) inv[(size_t) i];
-        if (std::isfinite(inv_i) && inv_i > 0.0)
-            left_scale[(size_t) i] = inv_i * inv_i * inv_denom2;
+        left_scale[(size_t) i] = (std::isfinite(inv_i) && inv_i > 0.0) ? (inv_i * inv_i * inv_denom2) : 0.0;
     }
 
     int QPANEL = 32768;
@@ -1832,6 +1911,8 @@ void phase2_accum_XtXz_bed_impl(const std::string &bed_prefix,
     const int nslabs = ceil_div_i(L, IBLK);
     REDUCE_THREADS = clampi(REDUCE_THREADS, 1, std::max(1, nslabs));
 
+    const bool do_timing = verbose_enabled();
+    using Clock = std::chrono::high_resolution_clock;
     BlockTimers t;
     nb::gil_scoped_release nogil;
 
@@ -1839,27 +1920,29 @@ void phase2_accum_XtXz_bed_impl(const std::string &bed_prefix,
         check_for_interrupt();
         const int q = std::min(QPANEL, Q - q0);
         const T* rhs = Xptr + (size_t) q0 * (size_t) N;
-        auto t2 = std::chrono::high_resolution_clock::now();
+        const auto t2 = do_timing ? Clock::now() : Clock::time_point{};
         gemm_col_major_tn<T>(L, q, N, Geno.data(), N, rhs, N, Work, L, T(1), T(0));
-        auto t3 = std::chrono::high_resolution_clock::now();
-        t.add_gemm(std::chrono::duration<double, std::milli>(t3 - t2).count());
+        if (do_timing) {
+            const auto t3 = Clock::now();
+            t.add_gemm(std::chrono::duration<double, std::milli>(t3 - t2).count());
+        }
 
-        std::vector<int> seg_k, seg_tcol0, seg_len;
-        seg_k.reserve((size_t) B + 1);
-        seg_tcol0.reserve((size_t) B + 1);
-        seg_len.reserve((size_t) B + 1);
+        if (B > 512)
+            throw std::runtime_error("B too large for fixed seg buffers in phase2_accum_XtXz_bed");
+        int seg_k[512], seg_tcol0[512], seg_len[512], segments = 0;
         int g = q0, g_end = q0 + q;
         while (g < g_end) {
             const int k = g / tile_nvecs;
             const int v_in = g - k * tile_nvecs;
             const int len = std::min(g_end - g, tile_nvecs - v_in);
-            seg_k.push_back(k);
-            seg_tcol0.push_back(g - q0);
-            seg_len.push_back(len);
+            seg_k[segments] = k;
+            seg_tcol0[segments] = g - q0;
+            seg_len[segments] = len;
+            ++segments;
             g += len;
         }
 
-        auto t4 = std::chrono::high_resolution_clock::now();
+        const auto t4 = do_timing ? Clock::now() : Clock::time_point{};
 #ifdef _OPENMP
         #pragma omp parallel for schedule(static) num_threads(REDUCE_THREADS)
 #endif
@@ -1868,7 +1951,7 @@ void phase2_accum_XtXz_bed_impl(const std::string &bed_prefix,
             static thread_local AlignedBuffer<double> acc_tls;
             if (acc_tls.n < (size_t) IBLK) acc_tls.allocate((size_t) IBLK, 64);
             double* acc = acc_tls.ptr;
-            for (std::size_t sidx = 0; sidx < seg_k.size(); ++sidx) {
+            for (int sidx = 0; sidx < segments; ++sidx) {
                 const int k = seg_k[sidx], tcol = seg_tcol0[sidx], len = seg_len[sidx];
                 std::fill(acc, acc + ib, 0.0);
                 for (int c = 0; c < len; ++c) {
@@ -1897,8 +1980,10 @@ void phase2_accum_XtXz_bed_impl(const std::string &bed_prefix,
                 }
             }
         }
-        auto t5 = std::chrono::high_resolution_clock::now();
-        t.add_reduce(std::chrono::duration<double, std::milli>(t5 - t4).count());
+        if (do_timing) {
+            const auto t5 = Clock::now();
+            t.add_reduce(std::chrono::duration<double, std::milli>(t5 - t4).count());
+        }
     }
     t.dump(blk_start, blk_end, B, tile_nvecs);
 }
@@ -2298,6 +2383,43 @@ nb_numpy_vec1<double> project_rowmajor_inplace_and_col_sums_impl(nb_mat2c_rw<T> 
 }
 
 template <typename T>
+void project_colmajor_inplace_impl(nb_mat2f_rw<T> Xz2d,
+                                   nb::object C_opt,
+                                   nb::object R_opt)
+{
+    const int N = (int) Xz2d.shape(0);
+    const int Q = (int) Xz2d.shape(1);
+    if (N <= 0 || Q <= 0)
+        return;
+
+    const T* Cptr = nullptr;
+    const T* Rptr = nullptr;
+    int p = 0;
+    nb_mat2f_ro<T> Carr;
+    nb_mat2f_ro<T> Rarr;
+    if (!C_opt.is_none() && !R_opt.is_none()) {
+        Carr = nb::cast<nb_mat2f_ro<T>>(C_opt);
+        Rarr = nb::cast<nb_mat2f_ro<T>>(R_opt);
+        p = (int) Carr.shape(1);
+        if ((int) Carr.shape(0) != N || (int) Rarr.shape(0) != p || (int) Rarr.shape(1) != N)
+            throw std::runtime_error("C/R shape mismatch in project_colmajor_inplace");
+        Cptr = Carr.data();
+        Rptr = Rarr.data();
+    } else {
+        return;
+    }
+
+    T* Xptr = Xz2d.data();
+    static thread_local AlignedBuffer<T> proj_tmp_tls;
+    const size_t need = (size_t) p * (size_t) Q;
+    if (proj_tmp_tls.n < need)
+        proj_tmp_tls.allocate(need, 64);
+
+    nb::gil_scoped_release nogil;
+    project_panel_inplace<T>(Xptr, N, Q, Cptr, Rptr, p, proj_tmp_tls);
+}
+
+template <typename T>
 static void project_target_block_inplace(std::vector<T>& G, int N, int L,
                                          const T* Cptr, const T* Rptr, int p,
                                          AlignedBuffer<T>& tmp_buf) {
@@ -2413,7 +2535,8 @@ nb::tuple precompute_residual_variances_bed_impl(
                 continue;
 
             int N_blk = 0, L_blk = 0;
-            std::vector<T> Geno;
+            static thread_local std::vector<T> Geno_tls;
+            std::vector<T>& Geno = Geno_tls;
             read_block_standardized<T>(bed_path, fam_path, s, e, rows, ddof,
                                        impute_mode, impute_seed,
                                        Geno, N_blk, L_blk);
@@ -2423,7 +2546,13 @@ nb::tuple precompute_residual_variances_bed_impl(
             if (have_proj)
                 project_target_block_inplace<T>(Geno, N_blk, L_blk, Cptr, Rptr, p, proj_tmp);
 
-            std::vector<double> inv2_local((size_t) L, 0.0);
+            double* inv2_local = nullptr;
+            static thread_local std::vector<double> inv2_local_tls;
+            if (compute_mu22) {
+                if (inv2_local_tls.size() < (size_t) L)
+                    inv2_local_tls.resize((size_t) L);
+                inv2_local = inv2_local_tls.data();
+            }
 #ifdef _OPENMP
             #pragma omp parallel for schedule(static)
 #endif
@@ -2440,7 +2569,8 @@ nb::tuple precompute_residual_variances_bed_impl(
                 else safe = (var > eps ? var : eps);
                 const double invj = 1.0 / std::sqrt(safe);
                 invp[(size_t) (s + j)] = (T) invj;
-                inv2_local[(size_t) j] = invj * invj;
+                if (inv2_local)
+                    inv2_local[(size_t) j] = invj * invj;
             }
 
             if (compute_mu22) {
@@ -2577,11 +2707,20 @@ void set_num_threads(int n) {
 #endif
 }
 
+int get_max_threads() {
+#ifdef _OPENMP
+    return omp_get_max_threads();
+#else
+    return 1;
+#endif
+}
+
 NB_MODULE(gwldcore, m) {
     m.doc() = "C++ core for SUMMIT GW LD score (bed parser + BLAS-safe GEMMs + Mailman)";
 
     m.def("set_verbose", &set_verbose, nb::arg("enabled"));
     m.def("set_num_threads", &set_num_threads, nb::arg("n"));
+    m.def("get_max_threads", &get_max_threads);
     m.def("prefetch_bed_block", &prefetch_bed_block_py,
           nb::arg("bed_prefix"), nb::arg("fam_path"), nb::arg("blk_start"), nb::arg("blk_end"), nb::arg("ahead_blocks") = 1);
 
@@ -2589,13 +2728,13 @@ NB_MODULE(gwldcore, m) {
           nb::arg("bed_prefix"), nb::arg("fam_path"), nb::arg("blk_start"), nb::arg("blk_end"),
           nb::arg("row_sel") = nb::none(), nb::arg("ddof") = 1, nb::arg("annot_blk"), nb::arg("inv_right"),
           nb::arg("v_start"), nb::arg("v_count"), nb::arg("kmax_hint"), nb::arg("rand_dist") = "rademacher",
-          nb::arg("seed") = nb::none(), nb::arg("Xz2d_chunk"), nb::arg("project_right") = false,
+          nb::arg("seed") = nb::none(), nb::arg("Xz2d_chunk"), nb::arg("bin_init_mask") = nb::none(), nb::arg("project_right") = false,
           nb::arg("C") = nb::none(), nb::arg("R") = nb::none(), nb::arg("impute_mode") = "hwe", nb::arg("impute_seed") = nb::none());
     m.def("phase1_compute_Xz_bed_chunk", &phase1_compute_Xz_bed_chunk_impl<double>,
           nb::arg("bed_prefix"), nb::arg("fam_path"), nb::arg("blk_start"), nb::arg("blk_end"),
           nb::arg("row_sel") = nb::none(), nb::arg("ddof") = 1, nb::arg("annot_blk"), nb::arg("inv_right"),
           nb::arg("v_start"), nb::arg("v_count"), nb::arg("kmax_hint"), nb::arg("rand_dist") = "rademacher",
-          nb::arg("seed") = nb::none(), nb::arg("Xz2d_chunk"), nb::arg("project_right") = false,
+          nb::arg("seed") = nb::none(), nb::arg("Xz2d_chunk"), nb::arg("bin_init_mask") = nb::none(), nb::arg("project_right") = false,
           nb::arg("C") = nb::none(), nb::arg("R") = nb::none(), nb::arg("impute_mode") = "hwe", nb::arg("impute_seed") = nb::none());
 
     m.def("phase1_compute_Xz_bed_chunk_rowmajor", &phase1_compute_Xz_bed_chunk_rowmajor_impl<float>,
@@ -2616,6 +2755,10 @@ NB_MODULE(gwldcore, m) {
     m.def("project_rowmajor_inplace_and_col_sums", &project_rowmajor_inplace_and_col_sums_impl<float>,
           nb::arg("Xz2d"), nb::arg("C") = nb::none(), nb::arg("R") = nb::none());
     m.def("project_rowmajor_inplace_and_col_sums", &project_rowmajor_inplace_and_col_sums_impl<double>,
+          nb::arg("Xz2d"), nb::arg("C") = nb::none(), nb::arg("R") = nb::none());
+    m.def("project_colmajor_inplace", &project_colmajor_inplace_impl<float>,
+          nb::arg("Xz2d"), nb::arg("C") = nb::none(), nb::arg("R") = nb::none());
+    m.def("project_colmajor_inplace", &project_colmajor_inplace_impl<double>,
           nb::arg("Xz2d"), nb::arg("C") = nb::none(), nb::arg("R") = nb::none());
 
     m.def("phase2_compute_XtXz_bed", &phase2_compute_XtXz_bed_impl<float>,

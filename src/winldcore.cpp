@@ -1,4 +1,3 @@
-
 #include "nb_utils.hpp"
 
 #include <algorithm>
@@ -9,6 +8,7 @@
 #include <cstring>
 #include <cstdlib>
 #include <list>
+#include <limits>
 #include <memory>
 #include <random>
 #include <stdexcept>
@@ -19,6 +19,10 @@
 
 #ifdef _OPENMP
   #include <omp.h>
+#endif
+
+#if defined(__linux__)
+  #include <unistd.h>
 #endif
 
 #include "blas_compat.hpp"
@@ -54,12 +58,75 @@ static std::atomic<bool> g_verbose{false};
 static inline bool verbose_enabled() { return g_verbose.load(std::memory_order_relaxed); }
 static inline void set_verbose(bool v) { g_verbose.store(v, std::memory_order_relaxed); }
 
+static std::atomic<int> g_progress_total{0};
+static std::atomic<int> g_progress_done{0};
+static std::atomic<bool> g_progress_active{false};
+
+static inline void progress_begin(int total) {
+    g_progress_total.store(std::max(0, total), std::memory_order_relaxed);
+    g_progress_done.store(0, std::memory_order_relaxed);
+    g_progress_active.store(true, std::memory_order_relaxed);
+}
+
+static inline void progress_step() {
+    g_progress_done.fetch_add(1, std::memory_order_relaxed);
+}
+
+static inline void progress_end(bool completed) {
+    if (completed) {
+        g_progress_done.store(g_progress_total.load(std::memory_order_relaxed),
+                              std::memory_order_relaxed);
+    }
+    g_progress_active.store(false, std::memory_order_relaxed);
+}
+
+static inline int get_progress_total() {
+    return g_progress_total.load(std::memory_order_relaxed);
+}
+
+static inline int get_progress_done() {
+    return g_progress_done.load(std::memory_order_relaxed);
+}
+
+static inline bool progress_active() {
+    return g_progress_active.load(std::memory_order_relaxed);
+}
+
+struct ProgressScope {
+    bool completed = false;
+    explicit ProgressScope(int total) { progress_begin(total); }
+    ~ProgressScope() { progress_end(completed); }
+};
+
 static inline int clampi(int x, int lo, int hi) {
     return std::max(lo, std::min(hi, x));
 }
 
 static inline int ceil_div_i(int a, int b) {
     return (a + b - 1) / b;
+}
+
+static int get_max_threads() {
+#ifdef _OPENMP
+    return omp_get_max_threads();
+#else
+    return 1;
+#endif
+}
+
+static size_t available_memory_bytes() {
+#if defined(__linux__)
+    const long pages = ::sysconf(_SC_AVPHYS_PAGES);
+    const long page_sz = ::sysconf(_SC_PAGESIZE);
+    if (pages > 0 && page_sz > 0) {
+        const long double v = (long double) pages * (long double) page_sz;
+        if (v > 0.0L) {
+            const long double cap = (long double) std::numeric_limits<size_t>::max();
+            return (size_t) std::min(v, cap);
+        }
+    }
+#endif
+    return 0;
 }
 
 template <typename T>
@@ -244,11 +311,8 @@ private:
             project_block_inplace(panel->X, N, L, Cptr_, Rptr_, p_, proj_tmp_);
             restandardize_cols_inplace(panel->X, N, L);
         } else if (impute_mode_ == ImputeMode::Mean) {
-            // read_block_standardized(Mean) scales by the observed-sample SD and writes
-            // missing entries as zero after mean imputation. The legacy Python windowed
-            // path instead mean-imputes first and then standardizes across *all* selected
-            // rows. Re-standardizing here recovers that exact no-covariate behavior while
-            // still reusing the shared genotype decoder.
+            // Mean-imputation path must match the legacy windowed estimator,
+            // which standardizes after imputation across all selected rows.
             restandardize_cols_inplace(panel->X, N, L);
         }
         return panel;
@@ -378,15 +442,24 @@ static std::vector<int> compute_block_left(const int64_t* bp, int m, double ld_w
     return left;
 }
 
-static int auto_panel_cols(int N_rows, int chunk_size, int panel_cols)
+static int auto_panel_cols(int N_rows, int chunk_size, int panel_cols, size_t cache_bytes)
 {
     if (panel_cols > 0) return std::max(1, std::min(panel_cols, chunk_size));
-    long long target_mb = 64;
+
+    size_t target_bytes = 0;
     if (const char* s = std::getenv("SUMMIT_WIN_PANEL_MB")) {
-        const long long v = std::atoll(s);
-        if (v > 0) target_mb = v;
+        const long long mb = std::atoll(s);
+        if (mb > 0) target_bytes = (size_t)mb * 1024ULL * 1024ULL;
     }
-    const size_t target_bytes = (size_t)target_mb * 1024ULL * 1024ULL;
+    if (target_bytes == 0) {
+        const size_t min_target = 256ULL * 1024ULL * 1024ULL;
+        const size_t max_target = 1024ULL * 1024ULL * 1024ULL;
+        if (cache_bytes > 0) target_bytes = cache_bytes / 16ULL;
+        else target_bytes = 512ULL * 1024ULL * 1024ULL;
+        if (target_bytes < min_target) target_bytes = min_target;
+        if (target_bytes > max_target) target_bytes = max_target;
+    }
+
     const size_t bytes_per_col = (size_t)std::max(1, N_rows) * sizeof(double);
     int cols = (int)(target_bytes / bytes_per_col);
     cols = std::min(cols, chunk_size);
@@ -403,13 +476,25 @@ static int auto_panel_cols(int N_rows, int chunk_size, int panel_cols)
 static size_t auto_cache_bytes(int cache_mb)
 {
     if (cache_mb < 0) {
-        long long mb = 512;
         if (const char* s = std::getenv("SUMMIT_WIN_CACHE_MB")) {
             const long long v = std::atoll(s);
-            if (v >= 0) mb = v;
+            if (v <= 0) return 0;
+            return (size_t)v * 1024ULL * 1024ULL;
         }
-        if (mb <= 0) return 0;
-        return (size_t)mb * 1024ULL * 1024ULL;
+
+        const size_t avail = available_memory_bytes();
+        if (avail == 0) {
+            return 4ULL * 1024ULL * 1024ULL * 1024ULL;
+        }
+
+        const size_t one_gib = 1024ULL * 1024ULL * 1024ULL;
+        const size_t thirty_two_gib = 32ULL * one_gib;
+        const size_t half_avail = avail / 2ULL;
+        size_t target = avail / 4ULL;
+        if (target < one_gib) target = one_gib;
+        if (target > thirty_two_gib) target = thirty_two_gib;
+        if (target > half_avail && half_avail > 0) target = half_avail;
+        return target;
     }
     if (cache_mb == 0) return 0;
     return (size_t)cache_mb * 1024ULL * 1024ULL;
@@ -428,14 +513,24 @@ static void accum_logic_tile_self(PreparedPanelCache& cache,
                                   int N_rows,
                                   AlignedBuffer<double>& cross)
 {
-    for (int rp0 = local_start; rp0 < local_end; rp0 += panel_cols) {
-        check_for_interrupt();
+    int rp_idx = 0;
+    for (int rp0 = local_start; rp0 < local_end; rp0 += panel_cols, ++rp_idx) {
+        if ((rp_idx & 7) == 0) check_for_interrupt();
         const int rp1 = std::min(local_end, rp0 + panel_cols);
         auto right = cache.get(chr_global_start + rp0, chr_global_start + rp1);
-        for (int lp0 = local_start; lp0 < local_end; lp0 += panel_cols) {
+
+        // Diagonal block: one pass updates this panel from itself.
+        accum_left_from_right_panel(chr_global_start, *right, *right,
+                                    annot_ptr, annot_ld, ld_ptr, ld_ld,
+                                    B, N_rows, cross);
+
+        // Strictly lower-triangular off-diagonal blocks: compute once and update both sides.
+        for (int lp0 = local_start; lp0 < rp0; lp0 += panel_cols) {
             const int lp1 = std::min(local_end, lp0 + panel_cols);
             auto left = cache.get(chr_global_start + lp0, chr_global_start + lp1);
-            accum_left_from_right_panel(chr_global_start, *left, *right, annot_ptr, annot_ld, ld_ptr, ld_ld, B, N_rows, cross);
+            accum_cross_panels(chr_global_start, *left, *right,
+                               annot_ptr, annot_ld, ld_ptr, ld_ld,
+                               B, N_rows, cross);
         }
     }
 }
@@ -455,14 +550,18 @@ static void accum_logic_tile_cross(PreparedPanelCache& cache,
                                    int N_rows,
                                    AlignedBuffer<double>& cross)
 {
-    for (int rp0 = right_local_start; rp0 < right_local_end; rp0 += panel_cols) {
-        check_for_interrupt();
+    if (left_local_start >= left_local_end || right_local_start >= right_local_end) return;
+    int rp_idx = 0;
+    for (int rp0 = right_local_start; rp0 < right_local_end; rp0 += panel_cols, ++rp_idx) {
+        if ((rp_idx & 7) == 0) check_for_interrupt();
         const int rp1 = std::min(right_local_end, rp0 + panel_cols);
         auto right = cache.get(chr_global_start + rp0, chr_global_start + rp1);
         for (int lp0 = left_local_start; lp0 < left_local_end; lp0 += panel_cols) {
             const int lp1 = std::min(left_local_end, lp0 + panel_cols);
             auto left = cache.get(chr_global_start + lp0, chr_global_start + lp1);
-            accum_cross_panels(chr_global_start, *left, *right, annot_ptr, annot_ld, ld_ptr, ld_ld, B, N_rows, cross);
+            accum_cross_panels(chr_global_start, *left, *right,
+                               annot_ptr, annot_ld, ld_ptr, ld_ld,
+                               B, N_rows, cross);
         }
     }
 }
@@ -496,6 +595,7 @@ static void accum_all_pairs_interval(PreparedPanelCache& cache,
                                    panel_cols,
                                    annot_ptr, annot_ld, ld_ptr, ld_ld, B, N_rows, cross);
         }
+        progress_step();
     }
 }
 
@@ -523,6 +623,10 @@ static nb_numpy_mat2f<double> compute_windowed_ld_chr_impl(
         throw std::runtime_error("Chromosome slice is empty");
     if (chunk_size <= 0)
         throw std::runtime_error("chunk_size must be > 0");
+
+    const int ntiles = ceil_div_i(m, chunk_size);
+    ProgressScope progress(ntiles);
+
     if ((int) bp.shape(0) != m)
         throw std::runtime_error("bp length mismatch in compute_windowed_ld_chr");
     const int64_t* bp_ptr = bp.data();
@@ -563,8 +667,8 @@ static nb_numpy_mat2f<double> compute_windowed_ld_chr_impl(
         Rptr = Rarr.data();
     }
 
-    panel_cols = auto_panel_cols(N_rows, chunk_size, panel_cols);
     const size_t cache_bytes = auto_cache_bytes(cache_mb);
+    panel_cols = auto_panel_cols(N_rows, chunk_size, panel_cols, cache_bytes);
 
     double* ld_ptr = nullptr;
     auto ld_out = make_owned_numpy_mat2f<double>((size_t) m, (size_t) B, &ld_ptr);
@@ -592,28 +696,24 @@ static nb_numpy_mat2f<double> compute_windowed_ld_chr_impl(
 
     nb::gil_scoped_release nogil;
 
-    if (b0 >= m) {
-        if (verbose_enabled()) {
-            std::fprintf(stderr,
-                         "[winldcore] chr [%d:%d) handled as exact all-pairs (m=%d, chunk=%d, panel=%d)\n",
-                         chr_start, chr_end, m, chunk_size, panel_cols);
-        }
-        accum_all_pairs_interval(cache, chr_start, m, chunk_size, panel_cols,
-                                 annot_ptr, m, ld_ptr, m, B, N_rows);
-        return ld_out;
+    if (verbose_enabled()) {
+        const double cache_gib = (double)cache_bytes / (1024.0 * 1024.0 * 1024.0);
+        std::fprintf(stderr,
+                     "[winldcore] chr [%d:%d) m=%d chunk=%d panel=%d cache=%.2f GiB prefix=%d\n",
+                     chr_start, chr_end, m, chunk_size, panel_cols, cache_gib, b0);
     }
 
-    if (verbose_enabled()) {
-        std::fprintf(stderr,
-                     "[winldcore] chr [%d:%d) prefix=%d, chunk=%d, panel=%d\n",
-                     chr_start, chr_end, b0, chunk_size, panel_cols);
+    if (b0 >= m) {
+        accum_all_pairs_interval(cache, chr_start, m, chunk_size, panel_cols,
+                                 annot_ptr, m, ld_ptr, m, B, N_rows);
+        progress.completed = true;
+        return ld_out;
     }
 
     accum_all_pairs_interval(cache, chr_start, b0, chunk_size, panel_cols,
                              annot_ptr, m, ld_ptr, m, B, N_rows);
 
     const int prefix_tiles = b0 / chunk_size;
-    const int ntiles = ceil_div_i(m, chunk_size);
     AlignedBuffer<double> cross;
     for (int t = prefix_tiles; t < ntiles; ++t) {
         check_for_interrupt();
@@ -634,8 +734,10 @@ static nb_numpy_mat2f<double> compute_windowed_ld_chr_impl(
                               t0, t1,
                               panel_cols,
                               annot_ptr, m, ld_ptr, m, B, N_rows, cross);
+        progress_step();
     }
 
+    progress.completed = true;
     return ld_out;
 }
 
@@ -674,6 +776,10 @@ NB_MODULE(winldcore, m) {
     m.doc() = "C++ core for deterministic windowed LD scores";
     m.def("set_verbose", &set_verbose, nb::arg("enabled"));
     m.def("set_num_threads", &set_num_threads, nb::arg("n"));
+    m.def("get_max_threads", &get_max_threads);
+    m.def("get_progress_total", &get_progress_total);
+    m.def("get_progress_done", &get_progress_done);
+    m.def("progress_active", &progress_active);
     m.def("compute_windowed_ld_chr", &compute_windowed_ld_chr_impl,
           nb::arg("bed_prefix"),
           nb::arg("fam_path"),

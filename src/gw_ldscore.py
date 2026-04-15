@@ -1,3 +1,4 @@
+# gw_ldscore.py
 import utils
 import math
 import numpy as np
@@ -211,30 +212,92 @@ def apply_env(cfg: dict) -> int:
     return actual
 
 
-def set_parallelism(omp_threads: int | None = None, blas_threads: int | None = None):
-    if omp_threads is not None:
-        os.environ["OMP_NUM_THREADS"] = str(max(1, int(omp_threads)))
-        os.environ["OMP_DYNAMIC"] = "FALSE"
+def _set_openmp_threads_runtime(n: int) -> None:
+    n = max(1, int(n))
+    os.environ["OMP_NUM_THREADS"] = str(n)
+    os.environ["OMP_DYNAMIC"] = "FALSE"
+    try:
+        gwldcore.set_num_threads(n)
+    except Exception:
+        pass
 
+
+def _get_openmp_threads_runtime() -> int | None:
+    try:
+        return int(gwldcore.get_max_threads())
+    except Exception:
+        v = os.environ.get("OMP_NUM_THREADS")
+        return int(v) if (v and v.isdigit()) else None
+
+
+def _set_blas_env_vars(n: int) -> None:
+    n = max(1, int(n))
+    os.environ["OPENBLAS_NUM_THREADS"] = str(n)
+    os.environ["OPENBLAS_DYNAMIC"] = "0"
+    os.environ["MKL_NUM_THREADS"] = str(n)
+    os.environ["MKL_DYNAMIC"] = "FALSE"
+    os.environ["BLIS_NUM_THREADS"] = str(n)
+    os.environ["VECLIB_MAXIMUM_THREADS"] = str(n)
+
+
+def _set_blas_threads_runtime(n: int) -> None:
+    n = max(1, int(n))
+    _set_blas_env_vars(n)
+    try:
+        import mkl  # type: ignore
+        mkl.set_num_threads(n)
+    except Exception:
+        pass
+    try:
+        for soname in ("libopenblas.so", "libopenblas.so.0", "libopenblas64_.so", "libopenblas64_.so.0"):
+            try:
+                lib = ctypes.CDLL(soname)
+                for sym in ("openblas_set_num_threads", "openblas_set_num_threads64_"):
+                    try:
+                        getattr(lib, sym)(int(n))
+                        break
+                    except AttributeError:
+                        continue
+                break
+            except OSError:
+                continue
+    except Exception:
+        pass
+
+
+@contextmanager
+def set_parallelism(omp_threads: int | None = None, blas_threads: int | None = None):
+    prev_env = {}
+    for key in (
+        "OMP_NUM_THREADS", "OMP_DYNAMIC",
+        "OPENBLAS_NUM_THREADS", "OPENBLAS_DYNAMIC",
+        "MKL_NUM_THREADS", "MKL_DYNAMIC",
+        "BLIS_NUM_THREADS", "VECLIB_MAXIMUM_THREADS",
+    ):
+        prev_env[key] = os.environ.get(key)
+
+    prev_omp = _get_openmp_threads_runtime() if omp_threads is not None else None
     b = None
+    if omp_threads is not None:
+        _set_openmp_threads_runtime(int(omp_threads))
     if blas_threads is not None:
         b = max(1, int(blas_threads))
-        os.environ["OPENBLAS_NUM_THREADS"] = str(b)
-        os.environ["OPENBLAS_DYNAMIC"] = "0"
-        os.environ["MKL_NUM_THREADS"] = str(b)
-        os.environ["MKL_DYNAMIC"] = "FALSE"
-        os.environ["BLIS_NUM_THREADS"] = str(b)
-        os.environ["VECLIB_MAXIMUM_THREADS"] = str(b)
-        try:
-            import mkl
-            mkl.set_num_threads(b)
-        except Exception:
-            pass
+        _set_blas_env_vars(b)
+        if threadpool_limits is None:
+            _set_blas_threads_runtime(b)
 
-    if b is not None and threadpool_limits is not None:
-        return threadpool_limits(limits=b, user_api="blas")
-    else:
-        return nullcontext()
+    ctl = threadpool_limits(limits=b, user_api="blas") if (b is not None and threadpool_limits is not None) else nullcontext()
+    try:
+        with ctl:
+            yield
+    finally:
+        if prev_omp is not None and omp_threads is not None:
+            _set_openmp_threads_runtime(prev_omp)
+        for key, val in prev_env.items():
+            if val is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = val
 
 
 def _round_up_to(x, gran):
@@ -278,6 +341,21 @@ def _build_balanced_vtiles(V, vmax, gran=64, max_tiles=4):
     if v0 < V:
         vtiles.append((v0, V - v0))
     return vtiles
+
+
+def _zero_colmajor_bin_runs(X: np.ndarray, zero_bins: np.ndarray, vcount: int) -> None:
+    zero_bins = np.asarray(zero_bins, dtype=np.int64)
+    if zero_bins.size == 0 or vcount <= 0:
+        return
+    start = prev = int(zero_bins[0])
+    for k in zero_bins[1:]:
+        k = int(k)
+        if k == prev + 1:
+            prev = k
+            continue
+        X[:, start * vcount:(prev + 1) * vcount].fill(0)
+        start = prev = k
+    X[:, start * vcount:(prev + 1) * vcount].fill(0)
 
 
 def _bytes_human(n):
@@ -429,8 +507,6 @@ class GenomewideLDScore:
                 device='cpu',
                 use_tp32=False,
                 correct_skew: bool = False,
-                hybrid: bool = False,
-                hybrid_window_kb: float = 20000.0,
                 use_mailman: bool = True,
                 impute_method: str = 'hwe'):
 
@@ -453,14 +529,6 @@ class GenomewideLDScore:
         self.target_xz_mem = target_xz_mem if target_mem is None else target_mem
 
         self._mu22_precomputed = None
-
-        self.hybrid = bool(hybrid)
-        self.hybrid_window_kb = float(hybrid_window_kb)
-        self.hybrid_window_bp = int(round(1000.0 * self.hybrid_window_kb))
-        if self.hybrid:
-            if self.hybrid_window_bp <= 0:
-                raise ValueError("--hybrid-window-kb must be > 0 when --hybrid is enabled.")
-            self.log._log(f"[hybrid] enabled with exact local window = {self.hybrid_window_kb:.3f} kb")
 
         self.correct_skew = bool(correct_skew)
         if self.correct_skew:
@@ -859,8 +927,10 @@ class GenomewideLDScore:
 
         meansq_chunk = np.zeros_like(meansq_accum, dtype=self.dtype, order='C') if use_cuda_backend else None
         use_mailman_backend = bool((not use_cuda_backend) and self.use_mailman and self.impute_method == "hwe")
+        phase1_init = None
         if not use_mailman_backend:
-            Xz_chunk = np.zeros((self.nsamp, int(self.nbins) * int(Vmax)), dtype=self.dtype, order='F')
+            Xz_chunk = np.empty((self.nsamp, int(self.nbins) * int(Vmax)), dtype=self.dtype, order='F')
+            phase1_init = np.empty(B, dtype=np.uint8)
 
         if self.C is not None:
             N_denom = int(self.N_eff)
@@ -883,58 +953,66 @@ class GenomewideLDScore:
                     Xz_view = np.zeros((self.nsamp, used_cols), dtype=self.dtype, order='C')
                 else:
                     Xz_view = Xz_chunk[:, :used_cols]
-                    Xz_view.fill(0)
+                    phase1_init.fill(0)
 
                 t1_total = 0.0
-                with set_parallelism(omp_threads=t_omp1, blas_threads=t_blas1):
-                    for blk_idx, (s, e) in enumerate(blocks):
-                        kmax_hint = int(kmax_per_block[blk_idx])
-                        if kmax_hint == 0:
+                phase1_pref_ex = ThreadPoolExecutor(max_workers=1)
+                try:
+                    with set_parallelism(omp_threads=t_omp1, blas_threads=t_blas1):
+                        for blk_idx, (s, e) in enumerate(blocks):
+                            if blk_idx + 1 < len(blocks):
+                                s2, e2 = blocks[blk_idx + 1]
+                                phase1_pref_ex.submit(gwldcore.prefetch_bed_block, bed_prefix, fam_path, int(s2), int(e2), 1)
+                            kmax_hint = int(kmax_per_block[blk_idx])
+                            if kmax_hint == 0:
+                                bar.update(w1)
+                                continue
+                            annot_blk = ann_blocks[blk_idx]
+                            inv_right = inv_blocks[blk_idx]
+                            t0 = time.perf_counter()
+                            if use_mailman_backend:
+                                gwldcore.phase1_compute_Xz_bed_chunk_rowmajor(
+                                    bed_prefix=bed_prefix,
+                                    fam_path=fam_path,
+                                    blk_start=int(s), blk_end=int(e),
+                                    row_sel=row_sel,
+                                    ddof=ddof,
+                                    annot_blk=annot_blk,
+                                    inv_right=inv_right,
+                                    v_start=int(v_start),
+                                    v_count=int(Vt),
+                                    kmax_hint=kmax_hint,
+                                    rand_dist=self.rand_dist,
+                                    seed=self.root_seed,
+                                    Xz2d_chunk=Xz_view,
+                                    project_right=False,
+                                    impute_mode=self.impute_method,
+                                    impute_seed=int(self.impute_seed),
+                                )
+                            else:
+                                gwldcore.phase1_compute_Xz_bed_chunk(
+                                    bed_prefix=bed_prefix,
+                                    fam_path=fam_path,
+                                    blk_start=int(s), blk_end=int(e),
+                                    row_sel=row_sel,
+                                    ddof=ddof,
+                                    annot_blk=annot_blk,
+                                    inv_right=inv_right,
+                                    v_start=int(v_start),
+                                    v_count=int(Vt),
+                                    kmax_hint=kmax_hint,
+                                    rand_dist=self.rand_dist,
+                                    seed=self.root_seed,
+                                    Xz2d_chunk=Xz_view,
+                                    bin_init_mask=phase1_init,
+                                    project_right=False,
+                                    impute_mode=self.impute_method,
+                                    impute_seed=int(self.impute_seed),
+                                )
+                            t1_total += (time.perf_counter() - t0)
                             bar.update(w1)
-                            continue
-                        annot_blk = ann_blocks[blk_idx]
-                        inv_right = inv_blocks[blk_idx]
-                        t0 = time.perf_counter()
-                        if use_mailman_backend:
-                            gwldcore.phase1_compute_Xz_bed_chunk_rowmajor(
-                                bed_prefix=bed_prefix,
-                                fam_path=fam_path,
-                                blk_start=int(s), blk_end=int(e),
-                                row_sel=row_sel,
-                                ddof=ddof,
-                                annot_blk=annot_blk,
-                                inv_right=inv_right,
-                                v_start=int(v_start),
-                                v_count=int(Vt),
-                                kmax_hint=kmax_hint,
-                                rand_dist=self.rand_dist,
-                                seed=self.root_seed,
-                                Xz2d_chunk=Xz_view,
-                                project_right=False,
-                                impute_mode=self.impute_method,
-                                impute_seed=int(self.impute_seed),
-                            )
-                        else:
-                            gwldcore.phase1_compute_Xz_bed_chunk(
-                                bed_prefix=bed_prefix,
-                                fam_path=fam_path,
-                                blk_start=int(s), blk_end=int(e),
-                                row_sel=row_sel,
-                                ddof=ddof,
-                                annot_blk=annot_blk,
-                                inv_right=inv_right,
-                                v_start=int(v_start),
-                                v_count=int(Vt),
-                                kmax_hint=kmax_hint,
-                                rand_dist=self.rand_dist,
-                                seed=self.root_seed,
-                                Xz2d_chunk=Xz_view,
-                                project_right=False,
-                                impute_mode=self.impute_method,
-                                impute_seed=int(self.impute_seed),
-                            )
-                        t1_total += (time.perf_counter() - t0)
-                        bar.update(w1)
+                finally:
+                    phase1_pref_ex.shutdown(wait=True)
 
                 if use_mailman_backend:
                     with set_parallelism(omp_threads=self.num_threads, blas_threads=1):
@@ -943,7 +1021,13 @@ class GenomewideLDScore:
                         else:
                             sum_Xz_view = gwldcore.compute_col_sums_rowmajor(Xz_view)
                 else:
+                    zero_bins = np.flatnonzero(phase1_init == 0)
+                    if zero_bins.size:
+                        _zero_colmajor_bin_runs(Xz_view, zero_bins, int(Vt))
                     sum_Xz_view = None
+                    if self.C is not None:
+                        with set_parallelism(omp_threads=1, blas_threads=self.num_threads):
+                            gwldcore.project_colmajor_inplace(Xz_view, self.C, self.cov_R)
 
                 t2_total = 0.0
                 if use_cuda_backend:
@@ -963,8 +1047,8 @@ class GenomewideLDScore:
                                 vchunk=int(Vt),
                                 Xz2d=Xz_view,
                                 meansq=meansq_chunk,
-                                C=(self.C if self.C is not None else None),
-                                R=(self.cov_R if self.C is not None else None),
+                                C=None,
+                                R=None,
                                 N_denom=int(N_denom),
                                 use_tf32=use_tf32,
                                 device_index=int(dev_idx),
@@ -1024,8 +1108,8 @@ class GenomewideLDScore:
                                         tile_nvecs=int(Vt),
                                         Xz2d=Xz_view,
                                         meansq_accum=meansq_accum,
-                                        C=(self.C if self.C is not None else None),
-                                        R=(self.cov_R if self.C is not None else None),
+                                        C=None,
+                                        R=None,
                                         N_denom=int(N_denom),
                                         impute_mode=self.impute_method,
                                         impute_seed=int(self.impute_seed),
