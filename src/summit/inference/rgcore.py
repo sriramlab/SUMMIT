@@ -4,9 +4,9 @@ from dataclasses import dataclass
 
 import numpy as np
 
-import utils
 import json
-from moments import build_rg_summary_moment
+from .. import utils
+from ..sumstats.moments import build_rg_summary_moment
 
 @dataclass(frozen=True)
 class RGPrepared:
@@ -217,6 +217,55 @@ class RGResultWriter:
 
         with open(path, "w") as fd:
             json.dump(payload, fd, indent=2, allow_nan=False)
+
+
+def build_manifest_summary_row(
+    *,
+    phen1: str,
+    phen2: str,
+    sumstats1: str,
+    sumstats2: str,
+    cov_rank1,
+    cov_rank2,
+    intercept_rg_input,
+    out_prefix: str,
+    n_snps: int | None,
+    annot_header,
+    h2_fit1,
+    h2_fit2,
+    intercept: InterceptFit,
+    rg_fit: RGFit,
+) -> dict:
+    row = {
+        "phen1": phen1,
+        "phen2": phen2,
+        "sumstats1": sumstats1,
+        "sumstats2": sumstats2,
+        "cov_rank1": cov_rank1,
+        "cov_rank2": cov_rank2,
+        "intercept_rg_input": intercept_rg_input,
+        "out_prefix": out_prefix,
+        "n_snps": (int(n_snps) if n_snps is not None else None),
+        "h2_trait1": float(h2_fit1.h2[-1, 0]),
+        "h2_trait1_se": float(h2_fit1.h2[-1, 1]),
+        "h2_trait2": float(h2_fit2.h2[-1, 0]),
+        "h2_trait2_se": float(h2_fit2.h2[-1, 1]),
+        "intercept_c": float(intercept.c[0]),
+        "intercept_c_se": float(intercept.c[1]),
+        "gamma_g_total": float(rg_fit.gamma_total[0]),
+        "gamma_g_total_se": float(rg_fit.gamma_total[1]),
+        "rg_total": float(rg_fit.rg_total[0]),
+        "rg_total_se": float(rg_fit.rg_total[1]),
+    }
+
+    for j, header in enumerate(annot_header):
+        token = str(header)
+        row[f"gamma_g__{token}"] = float(rg_fit.gamma[j, 0])
+        row[f"gamma_g__{token}_se"] = float(rg_fit.gamma[j, 1])
+        row[f"rg__{token}"] = float(rg_fit.rg[j, 0])
+        row[f"rg__{token}_se"] = float(rg_fit.rg[j, 1])
+
+    return row
 
 
 # -----------------------------------------------------------------------------

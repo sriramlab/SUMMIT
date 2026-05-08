@@ -11,6 +11,9 @@ version = "0.1.0"
 requires-python = ">=3.9"
 description = "Nanobind-backed genome-wide and windowed LD score native extensions"
 
+[project.scripts]
+summit = "summit.cli:main"
+
 [tool.scikit-build]
 minimum-version = "0.5"
 build-dir = "build/{wheel_tag}"

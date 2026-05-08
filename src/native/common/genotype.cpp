@@ -569,15 +569,16 @@ static inline void write_mean_imputed_standardized(const uint8_t* __restrict cod
 
 // ---------------- core implementation (templated, TU-local) ----------------
 template <typename T>
-static void read_block_standardized_impl(const std::string &bed_path,
-                                         const std::string &fam_path,
-                                         int blk_start, int blk_end,
-                                         const std::vector<int> &rows,
-                                         int ddof,
-                                         ImputeMode impute_mode,
-                                         uint64_t impute_seed,
-                                         std::vector<T> &Geno,
-                                         int &N, int &L)
+static void read_block_standardized_into_impl(const std::string &bed_path,
+                                              const std::string &fam_path,
+                                              int blk_start, int blk_end,
+                                              const std::vector<int> &rows,
+                                              int ddof,
+                                              ImputeMode impute_mode,
+                                              uint64_t impute_seed,
+                                              T* Geno,
+                                              std::size_t Geno_elems,
+                                              int &N, int &L)
 {
     const int64_t N_total64 = count_lines_cached(fam_path);
     if (N_total64 <= 0) throw std::runtime_error("FAM has zero rows: " + fam_path);
@@ -596,8 +597,10 @@ static void read_block_standardized_impl(const std::string &bed_path,
     const int nbytes_per_snp = (int)ceil_div((std::size_t)N_total, (std::size_t)4);
     const size_t per_snp_bytes = (size_t)nbytes_per_snp;
     const size_t need = (size_t)N * (size_t)L;
-
-    if (Geno.size() < need) Geno.resize(need);
+    if (!Geno)
+        throw std::runtime_error("Null genotype output buffer in read_block_standardized_into_impl");
+    if (Geno_elems < need)
+        throw std::runtime_error("Output buffer too small in read_block_standardized_into_impl");
 
     int decode_threads = 0;
     if (const char* s = std::getenv("SUMMIT_DECODE_THREADS")) decode_threads = std::atoi(s);
@@ -685,7 +688,7 @@ static void read_block_standardized_impl(const std::string &bed_path,
             decode_rows_codes_dense_sorted_into(bytes, N_total, rows, codes, nobs, sum, sumsq, miss_ptr);
         }
 
-        T* dst = Geno.data() + (size_t)col * (size_t)N;
+        T* dst = Geno + (size_t)col * (size_t)N;
         if (impute_mode == ImputeMode::Hwe) {
             if (nobs == (long long)N) {
                 double mean = 0.0, inv_std = 1.0;
@@ -784,7 +787,7 @@ static void read_block_standardized_impl(const std::string &bed_path,
             decode_rows_codes_dense_sorted_into(line.data(), N_total, rows, codes_local.data(), nobs, sum, sumsq, miss_ptr);
         }
 
-        T* dst = Geno.data() + (size_t)col * (size_t)N;
+        T* dst = Geno + (size_t)col * (size_t)N;
         if (impute_mode == ImputeMode::Hwe) {
             if (nobs == (long long)N) {
                 double mean = 0.0, inv_std = 1.0;
@@ -811,6 +814,28 @@ static void read_block_standardized_impl(const std::string &bed_path,
         }
     }
 #endif
+}
+
+template <typename T>
+static void read_block_standardized_impl(const std::string &bed_path,
+                                         const std::string &fam_path,
+                                         int blk_start, int blk_end,
+                                         const std::vector<int> &rows,
+                                         int ddof,
+                                         ImputeMode impute_mode,
+                                         uint64_t impute_seed,
+                                         std::vector<T> &Geno,
+                                         int &N, int &L)
+{
+    const int needN = (int)rows.size();
+    const int needL = std::max(0, blk_end - blk_start);
+    const size_t need = (size_t)std::max(0, needN) * (size_t)std::max(0, needL);
+    if (Geno.size() < need) Geno.resize(need);
+    read_block_standardized_into_impl<T>(bed_path, fam_path,
+                                         blk_start, blk_end,
+                                         rows, ddof, impute_mode, impute_seed,
+                                         Geno.data(), Geno.size(),
+                                         N, L);
 }
 
 void read_block_mailman_hwe(const std::string& bed_path,
@@ -1125,6 +1150,38 @@ void read_block_standardized_double(const std::string& bed_path,
     read_block_standardized_impl<double>(bed_path, fam_path, blk_start, blk_end,
                                          rows, ddof, impute_mode, impute_seed,
                                          Geno, N, L);
+}
+
+void read_block_standardized_float_into(const std::string& bed_path,
+                                        const std::string& fam_path,
+                                        int blk_start, int blk_end,
+                                        const std::vector<int>& rows,
+                                        int ddof,
+                                        ImputeMode impute_mode,
+                                        uint64_t impute_seed,
+                                        float* Geno,
+                                        std::size_t Geno_elems,
+                                        int& N, int& L)
+{
+    read_block_standardized_into_impl<float>(bed_path, fam_path, blk_start, blk_end,
+                                             rows, ddof, impute_mode, impute_seed,
+                                             Geno, Geno_elems, N, L);
+}
+
+void read_block_standardized_double_into(const std::string& bed_path,
+                                         const std::string& fam_path,
+                                         int blk_start, int blk_end,
+                                         const std::vector<int>& rows,
+                                         int ddof,
+                                         ImputeMode impute_mode,
+                                         uint64_t impute_seed,
+                                         double* Geno,
+                                         std::size_t Geno_elems,
+                                         int& N, int& L)
+{
+    read_block_standardized_into_impl<double>(bed_path, fam_path, blk_start, blk_end,
+                                              rows, ddof, impute_mode, impute_seed,
+                                              Geno, Geno_elems, N, L);
 }
 
 void compute_maf_block(const std::string& bed_path,

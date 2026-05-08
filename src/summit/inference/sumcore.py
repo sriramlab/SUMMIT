@@ -6,13 +6,13 @@ import os
 import numpy as np
 import pandas as pd
 
-import utils
-from jackknife import JackknifeSpec, JackknifeDesign
-from trace import Trace
-from sumstats import Sumstats, MatchedSumstats
-from h2core import prepare_h2, fit_h2
-from rgcore import prepare_rg, fit_intercept, fit_rg, RGResultWriter
-from moments import build_rg_summary_moment
+from .. import utils
+from .jackknife import JackknifeSpec, JackknifeDesign
+from .trace import Trace
+from ..sumstats.sumstats import Sumstats, MatchedSumstats
+from .h2core import prepare_h2, fit_h2
+from .rgcore import prepare_rg, fit_intercept, fit_rg, RGResultWriter
+from ..sumstats.moments import build_rg_summary_moment
 
 
 class Sumcore:
@@ -22,8 +22,9 @@ class Sumcore:
     Pipeline:
         Trace (immutable base) -> Sumstats x 2 (immutable read-QC)
         -> final main keep mask on the trace base axis
-        -> TraceView + MatchedSumstats x 2 on the SAME SNP axis
-        -> one JackknifeDesign built on that final main SNP axis
+        -> TraceView + MatchedSumstats x 2 on the SAME compact active SNP axis
+        -> JackknifeDesign on that axis for contiguous block jackknife, or a
+           subsetted chromosome JackknifeDesign from the full Trace axis
         -> h2 fits for trait 1 / trait 2 on that same axis
         -> intercept fit on a stricter subset mask of that same axis
         -> gamma_g / rg fit on the same axis / same replicate ordering
@@ -318,7 +319,12 @@ class Sumcore:
         if flip_keep is not None:
             matched2 = self._flip_matched_sumstats(matched2, flip_keep)
 
-        jk = JackknifeDesign.from_trace_view(tv, self.jackknife_spec, log=self.log)
+        if self.jackknife_spec.mode == "chr":
+            full_tv = self.trace.materialize_view()
+            full_jk = JackknifeDesign.from_trace_view(full_tv, self.jackknife_spec, log=self.log)
+            jk = full_jk.subset(main_mask, log=self.log)
+        else:
+            jk = JackknifeDesign.from_trace_view(tv, self.jackknife_spec, log=self.log)
         _stage_stop("materialize_jackknife", t_stage)
 
         t_stage = _stage_start()

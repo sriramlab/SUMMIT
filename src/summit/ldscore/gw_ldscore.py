@@ -1,5 +1,5 @@
 # gw_ldscore.py
-import utils
+from .. import utils
 import math
 import numpy as np
 import pandas as pd
@@ -12,7 +12,10 @@ import ctypes
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 import time
-import gwldcore
+try:
+    from .. import gwldcore
+except Exception:
+    import gwldcore
 
 from contextlib import contextmanager, nullcontext
 from threadpoolctl import threadpool_limits
@@ -508,7 +511,7 @@ class GenomewideLDScore:
                 use_tp32=False,
                 correct_skew: bool = False,
                 use_mailman: bool = True,
-                impute_method: str = 'hwe'):
+                impute_method: str = 'mean'):
 
         self.eps_var = float(eps_var)
         prefix = _canonical_bfile_prefix(bed_path)

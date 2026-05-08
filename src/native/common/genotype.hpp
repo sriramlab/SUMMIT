@@ -2,6 +2,7 @@
 #include <string>
 #include <vector>
 #include <cstdint>
+#include <cstddef>
 #include <type_traits>
 
 void prefetch_bed_block(const std::string& bed_path,
@@ -54,6 +55,30 @@ void read_block_standardized_double(
     std::vector<double>& Geno,
     int& N, int& L);
 
+void read_block_standardized_float_into(
+    const std::string& bed_path,
+    const std::string& fam_path,
+    int blk_start, int blk_end,
+    const std::vector<int>& rows,
+    int ddof,
+    ImputeMode impute_mode,
+    uint64_t impute_seed,
+    float* Geno,
+    std::size_t Geno_elems,
+    int& N, int& L);
+
+void read_block_standardized_double_into(
+    const std::string& bed_path,
+    const std::string& fam_path,
+    int blk_start, int blk_end,
+    const std::vector<int>& rows,
+    int ddof,
+    ImputeMode impute_mode,
+    uint64_t impute_seed,
+    double* Geno,
+    std::size_t Geno_elems,
+    int& N, int& L);
+
 void read_block_mailman_hwe(
     const std::string& bed_path,
     const std::string& fam_path,
@@ -92,5 +117,29 @@ inline void read_block_standardized(
         read_block_standardized_double(bed_path, fam_path, blk_start, blk_end,
                                        rows, ddof, impute_mode, impute_seed,
                                        Geno, N, L);
+    }
+}
+
+template <typename T>
+inline void read_block_standardized_into(
+    const std::string& bed_path,
+    const std::string& fam_path,
+    int blk_start, int blk_end,
+    const std::vector<int>& rows,
+    int ddof,
+    ImputeMode impute_mode,
+    uint64_t impute_seed,
+    T* Geno,
+    std::size_t Geno_elems,
+    int& N, int& L)
+{
+    if constexpr (std::is_same_v<T,float>) {
+        read_block_standardized_float_into(bed_path, fam_path, blk_start, blk_end,
+                                           rows, ddof, impute_mode, impute_seed,
+                                           Geno, Geno_elems, N, L);
+    } else {
+        read_block_standardized_double_into(bed_path, fam_path, blk_start, blk_end,
+                                            rows, ddof, impute_mode, impute_seed,
+                                            Geno, Geno_elems, N, L);
     }
 }

@@ -1,15 +1,22 @@
 from __future__ import annotations
 
+import gc
 import os
 
 import numpy as np
 
-import utils
-from jackknife import JackknifeSpec, JackknifeDesign
-from trace import Trace
-from sumstats import Sumstats
-from h2core import prepare_h2, fit_h2
-from moments import build_h2_summary_moment
+from .. import utils
+from .jackknife import JackknifeSpec, JackknifeDesign
+from .trace import Trace
+from ..sumstats.sumstats import Sumstats
+from .h2core import (
+    H2MatchedMetadata,
+    compute_h2_structural_unit_stats,
+    prepare_h2,
+    prepare_h2_reference_axis,
+    fit_h2,
+)
+from ..sumstats.moments import exact_score_z_from_arrays, effective_n_scale
 
 
 class Sumrhe:
@@ -18,7 +25,10 @@ class Sumrhe:
 
     Data flow per phenotype:
         Trace (immutable base) -> Sumstats (immutable read-QC) -> AlignedSumstats
-        -> final keep mask -> TraceView + MatchedSumstats -> JackknifeDesign
+        -> final keep mask
+        -> compact TraceView + MatchedSumstats + JackknifeDesign for contiguous
+           block jackknife, or reference-axis preparation for chromosome
+           jackknife
         -> H2Prepared -> H2Fit
     """
 
@@ -43,11 +53,14 @@ class Sumrhe:
         jack_mode: str = "mean",
         delta=None,
         cov_rank=None,
+        write_jack: bool = False,
     ):
 
         self.log = log
         self.verbose = verbose
         self.verbose_level = utils._parse_verbose(verbose)
+        parsed_write_jack, _ = utils._parse_verbose_outputs(verbose)
+        self.verbose_write_jack = bool(write_jack) or bool(parsed_write_jack)
         self.start_time = utils._get_time()
         if self.log is not None:
             self.log._log("Analysis started at: " + utils._get_timestr(self.start_time))
@@ -70,6 +83,17 @@ class Sumrhe:
         )
 
         self.jackknife_spec = JackknifeSpec.parse(njack)
+        if self.jackknife_spec.mode == "chr":
+            self.full_trace_view = self.trace.materialize_view()
+            self.full_jackknife = JackknifeDesign.from_trace_view(
+                self.full_trace_view,
+                self.jackknife_spec,
+                log=self.log,
+            )
+        else:
+            self.full_trace_view = None
+            self.full_jackknife = None
+        self.full_struct = None
         self.chisq_threshold = chisq_threshold
         self.chisq_action = str(chisq_action).strip().lower()
         self.report_tau = bool(report_tau)
@@ -96,16 +120,49 @@ class Sumrhe:
         self.results = []
         self.nsamp = []
 
-        for path, phen_name, cov_rank_value in zip(
+        self._ensure_reference_precompute()
+
+        for i, (path, phen_name, cov_rank_value) in enumerate(zip(
             self.h2_paths,
             self.phen_names,
             self.cov_rank_values,
-        ):
+        )):
             fit = self._fit_one(path, phen_name, cov_rank_value)
-            self.results.append(fit)
             self.nsamp.append(float(fit.prepared.matched.nsamp))
+            if self.npheno > 1:
+                # Directory/batch h2 mode should stream phenotypes. H2Fit.prepared
+                # holds the heavy per-SNP TraceView/MatchedSumstats/H2Prepared
+                # arrays for the completed phenotype; keeping it would make RSS
+                # grow roughly linearly with the number of traits.
+                object.__setattr__(fit, "prepared", None)
+            self.results.append(fit)
+            if self.log is not None:
+                self.log._log(
+                    f"[h2] completed phenotype {i + 1}/{self.npheno} {phen_name}: "
+                    f"h2={fit.h2[-1, 0]:.6g} SE={fit.h2[-1, 1]:.6g}"
+                )
+            self._write_results_table()
+            if self.npheno > 1:
+                gc.collect()
 
         return self.results
+
+    def _ensure_reference_precompute(self):
+        if self.jackknife_spec.mode != "chr":
+            return
+        if self.full_struct is not None:
+            return
+        t0 = utils._get_time()
+        self.full_struct = compute_h2_structural_unit_stats(
+            self.full_trace_view,
+            self.full_jackknife,
+            ld_kind="main",
+        )
+        if self.log is not None:
+            self.log._log(
+                f"[h2] precomputed full reference-axis structural stats in "
+                f"{utils._get_time() - t0:.3f}s."
+            )
 
     def _fit_one(self, path: str, phen_name: str, cov_rank_value):
         ss = Sumstats.from_file(
@@ -128,22 +185,41 @@ class Sumrhe:
                 f"Matched {n_keep} SNPs in phenotype {phen_name} out of {n_base} Trace SNPs."
             )
 
-        tv = self.trace.materialize_view(keep_mask)
-        matched = aligned.materialize(
-            keep_mask,
-            chisq_threshold=self.chisq_threshold,
-            chisq_action=self.chisq_action,
-        )
-        jk = JackknifeDesign.from_trace_view(tv, self.jackknife_spec, log=self.log)
+        if self.jackknife_spec.mode == "chr":
+            self._ensure_reference_precompute()
+            summary_y, summary_y_info = self._build_full_axis_h2_summary_y(
+                ss,
+                aligned,
+                keep_mask,
+            )
+            matched = self._build_h2_matched_metadata(ss, aligned, keep_mask)
 
-        prepared = prepare_h2(
-            tv,
-            matched,
-            jk,
-            active_mask=None,
-            ld_kind="main",
-            adjust_delta=self.adjust_delta,
-        )
+            prepared = prepare_h2_reference_axis(
+                self.full_trace_view,
+                matched,
+                self.full_jackknife,
+                keep_mask,
+                summary_y=summary_y,
+                summary_y_info=summary_y_info,
+                full_struct=self.full_struct,
+                adjust_delta=self.adjust_delta,
+            )
+        else:
+            tv = self.trace.materialize_view(keep_mask)
+            matched = aligned.materialize(
+                keep_mask,
+                chisq_threshold=self.chisq_threshold,
+                chisq_action=self.chisq_action,
+                allowed_mask=keep_mask,
+                compute_diagnostics=True,
+            )
+            jk = JackknifeDesign.from_trace_view(tv, self.jackknife_spec, log=self.log)
+            prepared = prepare_h2(
+                tv,
+                matched,
+                jk,
+                adjust_delta=self.adjust_delta,
+            )
         fit = fit_h2(
             prepared,
             enrich_mode=self.enrich_mode,
@@ -161,7 +237,7 @@ class Sumrhe:
                 verbose=(self.verbose_level >= 1),
             )
 
-        if self.verbose_level >= 2 and self.out is not None:
+        if self.verbose_write_jack and self.out is not None:
             jack_path = f"{self.out}.{phen_name}.jack"
             from h2core import H2ResultWriter
             H2ResultWriter.save_jackknife_text(fit, jack_path)
@@ -169,6 +245,90 @@ class Sumrhe:
                 self.log._log(f"Saved jackknife replicate dump to {jack_path}")
 
         return fit
+
+    def _build_full_axis_h2_summary_y(self, ss, aligned, keep_mask):
+        keep_mask = np.asarray(keep_mask, dtype=bool)
+        M = int(self.trace.nsnps)
+        if keep_mask.ndim != 1 or keep_mask.size != M:
+            raise ValueError(f"keep_mask must be length {M}; got {keep_mask.shape}")
+
+        pos = np.asarray(aligned.pos_on_trace[keep_mask], dtype=np.int64)
+        if np.any(pos < 0):
+            raise ValueError("keep_mask includes SNPs that are absent from the sumstats.")
+
+        z_star = exact_score_z_from_arrays(
+            beta=ss.beta[pos],
+            se=ss.se[pos],
+            n_obs=ss.n[pos],
+            nsamp=float(ss.nsamp),
+            cov_rank=0,
+        )
+        y_used = z_star * z_star
+        y_used[~np.isfinite(y_used)] = np.nan
+
+        y = np.full(M, np.nan, dtype=np.float64)
+        y[keep_mask] = y_used
+
+        info = {
+            "mode": "beta_se_exact",
+            "cov_rank": 0,
+            "cov_rank_source": "forced0_no_covrank_h2",
+            "n_scale": float(effective_n_scale(ss.nsamp, 0)),
+            "n_nonfinite": int(np.sum(~np.isfinite(y_used))),
+        }
+        return y, info
+
+    def _build_h2_matched_metadata(self, ss, aligned, keep_mask):
+        used_summary, used_top, clip_count, clip_threshold = aligned.diagnostics_for_keep(
+            keep_mask,
+            chisq_threshold=self.chisq_threshold,
+            chisq_action=self.chisq_action,
+            compute_diagnostics=True,
+        )
+        return H2MatchedMetadata(
+            nsnps=int(np.sum(keep_mask)),
+            nsamp=float(ss.nsamp),
+            n_scale=float(ss.n_scale),
+            cov_rank=int(ss.cov_rank),
+            cov_rank_source=str(ss.cov_rank_source),
+            name=str(ss.name),
+            used_summary=used_summary,
+            used_top=used_top,
+            clip_count=clip_count,
+            clip_threshold=clip_threshold,
+        )
+
+    def _write_results_table(self):
+        if self.out is None or not self.results:
+            return
+
+        path = f"{self.out}.results.tsv"
+        tmp = f"{path}.{os.getpid()}.tmp"
+        k = int(self.nbins)
+
+        header = ["phen_index", "phen", "num_bins", "h2", "h2_se"]
+        header.extend([f"h2bin_{j}" for j in range(k)])
+        header.extend([f"h2bin_se_{j}" for j in range(k)])
+
+        with open(tmp, "w") as fout:
+            fout.write("\t".join(header) + "\n")
+            for i, fit in enumerate(self.results):
+                h2tot = fit.h2[-1, 0]
+                h2totse = fit.h2[-1, 1]
+                row = [
+                    str(i),
+                    str(self.phen_names[i] if i < len(self.phen_names) else i),
+                    str(k),
+                    format(float(h2tot), ".12g"),
+                    format(float(h2totse), ".12g"),
+                ]
+                row.extend(format(float(fit.h2[j, 0]), ".12g") for j in range(k))
+                row.extend(format(float(fit.h2[j, 1]), ".12g") for j in range(k))
+                fout.write("\t".join(row) + "\n")
+
+        os.replace(tmp, path)
+        if self.log is not None:
+            self.log._log(f"Saved h2 results table in {path}")
 
     def _logoff(self):
         for i, fit in enumerate(self.results):
@@ -227,6 +387,8 @@ class Sumrhe:
                 + format(h2totse, ".5f")
             )
 
+        self._write_results_table()
+
         self.end_time = utils._get_time()
         self.log._log("Analysis ended at: " + utils._get_timestr(self.end_time))
         self.log._log("run time: " + format(self.end_time - self.start_time, ".3f") + " s")
@@ -257,4 +419,3 @@ class Sumrhe:
                 f"--cov-rank must contain exactly {expected} value(s) for --h2; got {len(vals)}"
             )
         return vals
-

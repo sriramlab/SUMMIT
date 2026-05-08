@@ -1,27 +1,38 @@
-# LDSC-style covariate-adjusted, windowed LD score estimation (no random projection).
-# - Outputs: <out>.win.ldscore.gz, <out>.win.M, <out>.win.M_5_50, <out>.win.log
 from __future__ import annotations
 
 import os
 import sys
 import time
 import ctypes
-from contextlib import nullcontext
+import threading
+from contextlib import contextmanager, nullcontext
 from typing import Optional, Tuple, List
 
 import numpy as np
 import pandas as pd
 from bed_reader import open_bed
 
-import utils
+from .. import utils
 
 try:
     from threadpoolctl import threadpool_limits
 except Exception:
     threadpool_limits = None
 
+try:
+    from .. import winldcore
+    _WINLDCORE_IMPORT_ERROR = None
+except Exception as package_error:  # pragma: no cover
+    try:
+        import winldcore
+        _WINLDCORE_IMPORT_ERROR = None
+    except Exception as e:  # pragma: no cover
+        winldcore = None
+        _WINLDCORE_IMPORT_ERROR = e
+
 
 # -------------------- env / perf helpers --------------------
+
 
 def _canonical_bfile_prefix(x: str) -> str:
     """Return PLINK bfile prefix: strip trailing .bed/.bim/.fam if present; otherwise leave as-is."""
@@ -32,6 +43,7 @@ def _canonical_bfile_prefix(x: str) -> str:
     return s
 
 
+
 def _trim_malloc_best_effort():
     try:
         ctypes.CDLL("libc.so.6").malloc_trim(0)
@@ -39,26 +51,117 @@ def _trim_malloc_best_effort():
         pass
 
 
-def _set_parallelism(blas_threads: Optional[int]):
-    """
-    Cap BLAS threads for NumPy dot() calls.
-    Returns a context manager if threadpoolctl is available; otherwise no-op.
 
-    NOTE: summit.py already calls apply_env() for low-level knobs. This just provides an
-    additional per-call cap to avoid surprise oversubscription.
-    """
-    if blas_threads is None:
-        return nullcontext()
+def _set_openmp_threads_runtime(n: int) -> None:
+    n = max(1, int(n))
+    os.environ["OMP_NUM_THREADS"] = str(n)
+    os.environ["OMP_DYNAMIC"] = "FALSE"
+    try:
+        winldcore.set_num_threads(n)
+    except Exception:
+        pass
 
-    b = max(1, int(blas_threads))
-    for var in ("OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS", "BLIS_NUM_THREADS", "VECLIB_MAXIMUM_THREADS"):
-        os.environ[var] = str(b)
+
+
+def _get_openmp_threads_runtime() -> Optional[int]:
+    try:
+        return int(winldcore.get_max_threads())
+    except Exception:
+        v = os.environ.get("OMP_NUM_THREADS")
+        return int(v) if (v and v.isdigit()) else None
+
+
+
+def _set_blas_env_vars(n: int) -> None:
+    n = max(1, int(n))
+    os.environ["OPENBLAS_NUM_THREADS"] = str(n)
     os.environ["OPENBLAS_DYNAMIC"] = "0"
+    os.environ["MKL_NUM_THREADS"] = str(n)
     os.environ["MKL_DYNAMIC"] = "FALSE"
+    os.environ["BLIS_NUM_THREADS"] = str(n)
+    os.environ["VECLIB_MAXIMUM_THREADS"] = str(n)
 
-    if threadpool_limits is not None:
-        return threadpool_limits(limits=b, user_api="blas")
-    return nullcontext()
+
+
+def _set_blas_threads_runtime(n: int) -> None:
+    n = max(1, int(n))
+    _set_blas_env_vars(n)
+    try:
+        import mkl  # type: ignore
+        mkl.set_num_threads(n)
+    except Exception:
+        pass
+    try:
+        for soname in ("libopenblas.so", "libopenblas.so.0", "libopenblas64_.so", "libopenblas64_.so.0"):
+            try:
+                lib = ctypes.CDLL(soname)
+                for sym in ("openblas_set_num_threads", "openblas_set_num_threads64_"):
+                    try:
+                        getattr(lib, sym)(int(n))
+                        break
+                    except AttributeError:
+                        continue
+                break
+            except OSError:
+                continue
+    except Exception:
+        pass
+
+
+@contextmanager
+def _set_parallelism(
+    omp_threads: Optional[int] = None,
+    blas_threads: Optional[int] = None,
+    decode_threads_cap: Optional[int] = None,
+):
+    """
+    Coordinate OpenMP, BLAS, and decoder thread caps for the C++ backend.
+
+    BLAS threads are controlled via threadpoolctl when available. OpenMP is driven
+    explicitly through winldcore.set_num_threads(...) so phase-level changes take
+    effect reliably at runtime.
+    """
+    prev_env = {}
+    for key in (
+        "OMP_NUM_THREADS",
+        "OMP_DYNAMIC",
+        "OPENBLAS_NUM_THREADS",
+        "OPENBLAS_DYNAMIC",
+        "MKL_NUM_THREADS",
+        "MKL_DYNAMIC",
+        "BLIS_NUM_THREADS",
+        "VECLIB_MAXIMUM_THREADS",
+        "SUMMIT_DECODE_THREADS_CAP",
+    ):
+        prev_env[key] = os.environ.get(key)
+
+    prev_omp = _get_openmp_threads_runtime() if omp_threads is not None else None
+    if omp_threads is not None:
+        _set_openmp_threads_runtime(int(omp_threads))
+
+    if decode_threads_cap is not None:
+        os.environ["SUMMIT_DECODE_THREADS_CAP"] = str(max(1, int(decode_threads_cap)))
+
+    b = None
+    if blas_threads is not None:
+        b = max(1, int(blas_threads))
+        _set_blas_env_vars(b)
+        if threadpool_limits is None:
+            _set_blas_threads_runtime(b)
+
+    ctl = threadpool_limits(limits=b, user_api="blas") if (b is not None and threadpool_limits is not None) else nullcontext()
+    try:
+        with ctl:
+            yield
+    finally:
+        if prev_omp is not None and omp_threads is not None:
+            _set_openmp_threads_runtime(prev_omp)
+        for key, val in prev_env.items():
+            if val is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = val
+
 
 
 def _parse_rand_samp(rand_samp, n: int, rng: np.random.Generator) -> Optional[np.ndarray]:
@@ -87,6 +190,7 @@ def _parse_rand_samp(rand_samp, n: int, rng: np.random.Generator) -> Optional[np
 
 
 # -------------------- covariates (QR projection) --------------------
+
 
 def _read_cov_qr(
     cov_path: str,
@@ -133,7 +237,6 @@ def _read_cov_qr(
     if df.shape[1] == 0:
         raise ValueError("After parsing covariates, no covariate columns remain.")
 
-    # Drop constant covariates (rank stability)
     zvc = (df.std(ddof=0) == 0)
     if zvc.any():
         drop_cols = zvc.index[zvc].tolist()
@@ -147,7 +250,7 @@ def _read_cov_qr(
     if add_intercept:
         X = np.column_stack([np.ones((X.shape[0], 1), dtype=np.float64), X])
 
-    Q, _ = np.linalg.qr(X, mode="reduced")  # (N_kept × p_eff)
+    Q, _ = np.linalg.qr(X, mode="reduced")
     C = np.asfortranarray(Q, dtype=np.float64)
     R = np.asfortranarray(Q.T, dtype=np.float64)
 
@@ -161,142 +264,16 @@ def _read_cov_qr(
     return C, R, keep_idx_global
 
 
-# -------------------- window + LDSC unbiased r^2 --------------------
-
-def _block_lefts_sorted(coords_kb: np.ndarray, max_dist_kb: float) -> np.ndarray:
-    """
-    Two-pointer left boundary for sorted coords.
-    left[i] = smallest j such that coords[i] - coords[j] <= max_dist.
-    """
-    M = int(coords_kb.shape[0])
-    left = np.zeros(M, dtype=np.int64)
-    j = 0
-    for i in range(M):
-        ci = coords_kb[i]
-        while j < i and (ci - coords_kb[j]) > max_dist_kb:
-            j += 1
-        left[i] = j
-    return left
-
-
-def _unbiased_r2_from_r(r: np.ndarray, n: int, use_unbiased: bool = True) -> np.ndarray:
-    """
-    LDSC's unbiased L2 estimator (or plain r^2 if use_unbiased=False):
-        r2_unb = r^2 - (1 - r^2)/(n - 2)
-    """
-    r2 = r * r
-    if not use_unbiased:
-        return r2
-    denom = (n - 2) if n > 2 else float(n)
-    return r2 - (1.0 - r2) / denom
-
-
-def _ldscore_block_sum(
-    m: int,
-    n: int,
-    block_left: np.ndarray,
-    snp_getter,
-    annot: np.ndarray,
-    chunk_size: int,
-    use_unbiased: bool = True,
-) -> np.ndarray:
-    """
-    LDSC-style block algorithm (kept verbatim in math; only renamed).
-    Returns cor_sum: (m, nbins) where each entry is sum_j (unbiased r_ij^2) * annot_jk
-    within the sliding BP window defined by block_left.
-    """
-    block_left = block_left.astype(int, copy=False)
-    c = int(chunk_size)
-
-    block_sizes = np.arange(m, dtype=np.int64) - block_left
-    block_sizes = ((block_sizes + (c - 1)) // c) * c  # ceil to multiple of c
-
-    if annot is None:
-        annot = np.ones((m, 1), dtype=np.float64)
-    else:
-        if annot.shape[0] != m:
-            raise ValueError("Incorrect number of SNPs in annot (chrom slice mismatch).")
-
-    nbins = int(annot.shape[1])
-    cor_sum = np.zeros((m, nbins), dtype=np.float64)
-
-    b_idx = np.nonzero(block_left > 0)[0]
-    b = int(np.ceil((int(b_idx[0]) if b_idx.size else m) / float(c)) * c)
-    if b > m:
-        c = 1
-        b = m
-
-    l_A = 0
-    A = snp_getter(b)  # (n, b)
-
-    rAB = np.zeros((b, c), dtype=np.float64)
-    rBB = np.zeros((c, c), dtype=np.float64)
-
-    # within initial A
-    for l_B in range(0, b, c):
-        B = A[:, l_B:l_B + c]
-        np.dot(A.T, B, out=rAB)
-        rAB /= float(n)
-        rAB = _unbiased_r2_from_r(rAB, n, use_unbiased=use_unbiased)
-        cor_sum[l_A:l_A + b, :] += np.dot(rAB, annot[l_B:l_B + c, :])
-
-    b0 = b
-    md = int(c * np.floor(m / float(c)))
-    end = md + 1 if md != m else md
-
-    for l_B in range(b0, end, c):
-        old_b = b
-        b = int(block_sizes[l_B])
-
-        if l_B > b0 and b > 0:
-            A = np.hstack((A[:, old_b - b + c:old_b], B))
-            l_A += old_b - b + c
-        elif l_B == b0 and b > 0:
-            A = A[:, b0 - b:b0]
-            l_A = b0 - b
-        elif b == 0:
-            A = np.zeros((n, 0), dtype=np.float64)
-            l_A = l_B
-
-        if l_B == md:
-            c = m - md
-            rAB = np.zeros((b, c), dtype=np.float64)
-            rBB = np.zeros((c, c), dtype=np.float64)
-        if b != old_b:
-            rAB = np.zeros((b, c), dtype=np.float64)
-
-        B = snp_getter(c)
-
-        p1 = (b == 0) or np.all(annot[l_A:l_A + b, :] == 0)
-        p2 = np.all(annot[l_B:l_B + c, :] == 0)
-        if p1 and p2:
-            continue
-
-        if b > 0:
-            np.dot(A.T, B, out=rAB)
-            rAB /= float(n)
-            rAB = _unbiased_r2_from_r(rAB, n, use_unbiased=use_unbiased)
-            cor_sum[l_A:l_A + b, :] += np.dot(rAB, annot[l_B:l_B + c, :])
-            cor_sum[l_B:l_B + c, :] += np.dot(annot[l_A:l_A + b, :].T, rAB).T
-
-        np.dot(B.T, B, out=rBB)
-        rBB /= float(n)
-        rBB = _unbiased_r2_from_r(rBB, n, use_unbiased=use_unbiased)
-        cor_sum[l_B:l_B + c, :] += np.dot(rBB, annot[l_B:l_B + c, :])
-
-    return cor_sum
-
-
-# -------------------- main class (imported by summit.py) --------------------
-
 class WindowedLDScore:
     """
-    Windowed LD score computation used by summit.py when --ld-wind-kb is set.
+    Windowed LD score computation for the deterministic sliding-window path.
 
-    Important:
-      - This implementation is the "sanity-check math" (LDSC/cov-LDSC-like).
-      - It is structured to look/feel like SUMMIT modules: no CLI, uses log._log,
-        uses utils timing, and writes <out>.win.* files.
+    Heavy computation is delegated to the C++ winldcore module:
+      - PLINK BED decoding and imputation (mean / HWE)
+      - optional QR-covariate projection
+      - post-projection re-standardization
+      - deterministic tile/window LD-score accumulation
+      - MAF pass for .win.M_5_50
     """
 
     def __init__(
@@ -308,16 +285,22 @@ class WindowedLDScore:
         ld_wind_kb: float = 20000.0,
         log=None,
         verbose: bool = False,
-        dtype: str = "float32",
+        dtype: str = "float64",
         rand_samp=None,
-        ddof: int = 1,  # kept for summit API compatibility; math here uses ddof=0 (LDSC)
+        ddof: int = 1,
         num_threads: Optional[int] = None,
         seed: Optional[int] = None,
-        # unused but accepted for signature compatibility with older codepaths
-        step_size: Optional[int] = None,  # mapped to chunk_size below if provided
+        step_size: Optional[int] = None,
+        impute_method: str = "mean",
+        panel_cols: Optional[int] = None,
+        cache_mb: int = -1,
     ):
         if log is None:
             raise ValueError("WindowedLDScore requires a Logger instance (log=...).")
+        if winldcore is None:
+            raise ImportError(
+                "winldcore could not be imported. Build the C++ extension before running the windowed LD path."
+            ) from _WINLDCORE_IMPORT_ERROR
 
         self.log = log
         self.verbose = bool(verbose)
@@ -348,48 +331,58 @@ class WindowedLDScore:
         if self.ld_wind_kb <= 0:
             raise ValueError("--ld-wind-kb must be positive.")
 
-        # read dtype; computations happen in float64 (stable)
-        self.read_dtype = np.float32 if dtype in (np.float32, "float32", "f4") else np.float64
+        self.dtype = str(dtype)
+        if self.dtype not in ("float32", "float64", "f4", "f8") and verbose:
+            self.log._log(f"[win][note] Unrecognized dtype='{self.dtype}'. The C++ backend computes in float64.")
+        elif self.dtype not in ("float64", "f8") and verbose:
+            self.log._log(f"[win][note] dtype={self.dtype} requested, but the C++ backend computes in float64 for exactness.")
 
-        # LDSC-mimic math uses ddof=0 for genotype standardization; keep ddof arg for summit compat
         self.ddof = int(ddof)
         if self.ddof != 0 and self.verbose:
             self.log._log(f"[win][note] ddof={self.ddof} passed, but windowed LD uses ddof=0 for genotype standardization.")
 
-        # internal block chunk size (the internal c in LDSC); use step_size if provided for integration
         self.chunk_size = int(step_size) if step_size is not None else 10000
         if self.chunk_size <= 0:
             raise ValueError("Internal chunk_size must be positive.")
 
-        # threads
         if num_threads is None or int(num_threads) <= 0:
             self.num_threads = max(1, os.cpu_count() or 1)
         else:
             self.num_threads = int(num_threads)
 
         self.outpath = out_path
+        self.panel_cols = 0 if panel_cols is None else int(panel_cols)
+        self.cache_mb = int(cache_mb)
+
+        self.impute_method = str(impute_method).strip().lower()
+        if self.impute_method not in ("mean", "hwe"):
+            raise ValueError("impute_method must be 'mean' or 'hwe'.")
+
+        if seed is None:
+            self.root_seed = int(np.random.SeedSequence().generate_state(1, dtype=np.uint64)[0])
+            if self.verbose:
+                self.log._log(f"[seed] No seed provided; using generated root seed {self.root_seed}")
+        else:
+            self.root_seed = int(seed)
+        self.impute_seed = int((np.uint64(self.root_seed) ^ np.uint64(0xA24BAED4963EE407)) & np.uint64(0xFFFFFFFFFFFFFFFF))
 
         self.start_time = utils._get_time()
         self.log._log("Windowed LD score calculation started at: " + utils._get_timestr(self.start_time))
+        self.log._log(f"[win][backend] C++ core enabled (impute={self.impute_method}, impute_seed={self.impute_seed})")
 
-        rng = np.random.default_rng(seed)
-
-        # optional sample subsampling (SUMMIT semantics)
+        rng = np.random.default_rng(self.root_seed)
         self.row_sel = _parse_rand_samp(rand_samp, self.nsamp0, rng)
         if self.row_sel is not None:
             k = int(len(self.row_sel))
             self.log._log(f"Randomly subsampling individuals: {k}/{self.nsamp0} ({k/self.nsamp0:.1%})")
 
-        # BIM + annotation (prints in gw-like format inside _read_bim/_read_annot)
         self._read_bim(self.bim_path)
         self._read_annot(annot_path)
 
-        # gw-like recap lines
-        self.log._log(f"Number of samples: {self.nsamp0}")
+        self.log._log(f"Number of samples (pre-filter): {self.nsamp0}")
         self.log._log(f"Number of total SNPs: {self.nsnps}, annotation shape: {tuple(self.annot.shape)}")
         self.log._log(f"Nbins: {self.nbins}")
 
-        # covariates
         self.C = None
         self.cov_R = None
         self.p_eff = 0
@@ -404,22 +397,33 @@ class WindowedLDScore:
             )
             self.C = C
             self.cov_R = R
-            self.row_sel = np.asarray(keep_idx_global, dtype=int)  # overwrite with post-drop kept rows
+            self.row_sel = np.asarray(keep_idx_global, dtype=int)
             self.p_eff = int(self.C.shape[1])
             self.nsamp = int(self.C.shape[0])
             self.log._log(f"Final sample count after covariate filtering/subsample: {self.nsamp}")
-            self.log._log(f"Covariate-adjusted partial correlations (N_eff={self.nsamp - self.p_eff}, p={self.p_eff}).")
+            self.log._log(f"Covariate-adjusted partial correlations (N_rows={self.nsamp}, p={self.p_eff}).")
         else:
             self.nsamp = int(len(self.row_sel)) if self.row_sel is not None else int(self.nsamp0)
 
         if self.nsamp <= 2:
             raise ValueError(f"[win] Too few samples (n={self.nsamp}) for windowed LD score computation.")
 
+        try:
+            winldcore.set_verbose(bool(self.verbose))
+            winldcore.set_num_threads(int(self.num_threads))
+        except Exception as e:
+            if self.verbose:
+                self.log._log(f"[win][warn] Failed to set C++ verbosity / threads: {e}")
+
         if self.verbose:
-            self.log._log(f"[win] ld_wind_kb={self.ld_wind_kb}, chunk_size={self.chunk_size}, read_dtype={self.read_dtype}, blas_threads={self.num_threads}")
+            cache_msg = "auto" if self.cache_mb < 0 else str(self.cache_mb)
+            panel_msg = "auto" if self.panel_cols <= 0 else str(self.panel_cols)
+            self.log._log(
+                f"[win] ld_wind_kb={self.ld_wind_kb}, chunk_size={self.chunk_size}, "
+                f"panel_cols={panel_msg}, cache_mb={cache_msg}, threads={self.num_threads}"
+            )
 
         self.win_ldscore: Optional[np.ndarray] = None
-
 
     # ------------------ BIM / annotation ------------------
 
@@ -430,6 +434,7 @@ class WindowedLDScore:
         if len(snplist) != self.nsnps:
             raise ValueError(f"[win] .bed SNPs ({self.nsnps}) != .bim rows ({len(snplist)})")
         self.snplist = snplist
+        self.bp_all = self.snplist["BP"].to_numpy(dtype=np.int64, copy=False)
 
     def _read_annot(self, annot_path: Optional[str]):
         if annot_path is None:
@@ -512,120 +517,95 @@ class WindowedLDScore:
                 f"[win] #SNPs in annotation ({self.annot.shape[0]}) != #SNPs in genotype ({self.nsnps})"
             )
 
-        self.log._log(f"[win] nsamp={self.nsamp}, nsnps={self.nsnps}, nbins={self.nbins}, continuous={bool(self.is_continuous)}")
+        self.log._log(
+            f"[win] nsamp0={self.nsamp0}, nsnps={self.nsnps}, nbins={self.nbins}, continuous={bool(self.is_continuous)}"
+        )
 
-    # ------------------ MAF for .win.M_5_50 ------------------
+    # ------------------ C++ core wrappers ------------------
 
     def _compute_maf(self) -> np.ndarray:
-        """
-        Compute MAF for each SNP on selected individuals (rows).
-        Used only for writing .win.M_5_50.
-        """
-        self.log._log("[win] Computing MAF for .win.M_5_50.")
-        rows = self.row_sel if self.row_sel is not None else slice(None)
-
-        maf = np.empty(self.nsnps, dtype=np.float64)
-        step = int(max(1000, min(self.nsnps, self.chunk_size)))
-
-        with _set_parallelism(blas_threads=1):
-            for s in range(0, self.nsnps, step):
-                e = min(self.nsnps, s + step)
-                G = self.G.read(index=np.s_[rows, s:e], dtype=np.float64)  # raw 0/1/2 with NaN
-                allele_sums = np.nansum(G, axis=0)
-                n_nonmiss = np.sum(~np.isnan(G), axis=0)
-                with np.errstate(divide="ignore", invalid="ignore"):
-                    freqs = np.divide(
-                        allele_sums,
-                        2.0 * n_nonmiss,
-                        out=np.zeros_like(allele_sums),
-                        where=n_nonmiss > 0,
-                    )
-                maf[s:e] = np.minimum(freqs, 1.0 - freqs)
-                del G
-        return maf
-
-    # ------------------ per-chrom compute (core math) ------------------
-
-    def _compute_chrom_ldscores(self, s: int, e: int) -> np.ndarray:
-        """
-        Compute LD scores for one chromosome block [s:e) using the verified LDSC-mimic math.
-        """
-        rows = self.row_sel if self.row_sel is not None else slice(None)
-
-        # read this chromosome into memory (sanity / correctness mode)
-        G = self.G.read(index=np.s_[rows, s:e], dtype=np.float64)  # (n × m)
-        n, m = G.shape
-
-        # mean-impute missing
-        if np.isnan(G).any():
-            col_means = np.nanmean(G, axis=0)
-            ii = np.where(np.isnan(G))
-            G[ii] = col_means[ii[1]]
-
-        # covariate projection: G <- G - C(C^T G)
-        if self.C is not None and self.cov_R is not None:
-            tmp = self.cov_R @ G
-            G = G - (self.C @ tmp)
-            del tmp
-
-        # standardize (ddof=0)
-        mu = G.mean(axis=0, keepdims=True)
-        G -= mu
-        sd = G.std(axis=0, ddof=0, keepdims=True)
-        sd[sd == 0.0] = 1.0
-        X = np.asfortranarray(G / sd, dtype=np.float64)
-
-        # coords within this chromosome block
-        bp = self.snplist["BP"].to_numpy(dtype=np.float64)[s:e]
-        coords_kb = bp / 1000.0
-        if np.any(np.diff(coords_kb) < 0):
-            raise ValueError("[win] BP not sorted within chromosome block. Sort your .bim by CHR+BP.")
-
-        left = _block_lefts_sorted(coords_kb, self.ld_wind_kb)
-        ann_chr = np.ascontiguousarray(self.annot[s:e, :], dtype=np.float64)
-
-        # streamer that matches LDSC block algorithm calling pattern
-        pos = {"i": 0}
-
-        def snp_getter(b: int) -> np.ndarray:
-            b = int(b)
-            i0 = int(pos["i"])
-            i1 = i0 + b
-            if i1 > m:
-                raise ValueError(f"[win] snp_getter({b}) out of range: {i0}:{i1} > {m}")
-            blk = X[:, i0:i1]
-            pos["i"] = i1
-            return blk
-
-        with _set_parallelism(blas_threads=self.num_threads):
-            ld_chr = _ldscore_block_sum(
-                m=m,
-                n=n,  # correlations use dot/n
-                block_left=left,
-                snp_getter=snp_getter,
-                annot=ann_chr,
-                chunk_size=self.chunk_size,
-                use_unbiased=True,
+        self.log._log("[win] Computing MAF for .win.M_5_50 via C++ core.")
+        step = int(max(1024, min(self.nsnps, self.chunk_size)))
+        with _set_parallelism(omp_threads=self.num_threads, blas_threads=1, decode_threads_cap=self.num_threads):
+            maf = winldcore.compute_maf_bed(
+                bed_prefix=self.bed_prefix,
+                fam_path=self.fam_path,
+                nsnps=int(self.nsnps),
+                step_size=step,
+                row_sel=(self.row_sel if self.row_sel is not None else None),
             )
+        return np.asarray(maf, dtype=np.float64, order="C")
 
-        if pos["i"] != m:
-            raise RuntimeError(f"[win] snp_getter did not consume all SNPs (pos={pos['i']} of m={m}).")
+    def _compute_chrom_ldscores(self, s: int, e: int, pbar=None) -> np.ndarray:
+        bp = self.bp_all[s:e]
+        ann_chr = np.asfortranarray(self.annot[s:e, :], dtype=np.float64)
 
-        _trim_malloc_best_effort()
-        return ld_chr
+        result = {}
+        error = {}
+        done_evt = threading.Event()
+
+        def _worker():
+            try:
+                result["ld_chr"] = winldcore.compute_windowed_ld_chr(
+                    bed_prefix=self.bed_prefix,
+                    fam_path=self.fam_path,
+                    chr_start=int(s),
+                    chr_end=int(e),
+                    bp=bp,
+                    annot_chr=ann_chr,
+                    ld_wind_kb=float(self.ld_wind_kb),
+                    chunk_size=int(self.chunk_size),
+                    row_sel=(self.row_sel if self.row_sel is not None else None),
+                    C=(self.C if self.C is not None else None),
+                    R=(self.cov_R if self.cov_R is not None else None),
+                    impute_mode=self.impute_method,
+                    impute_seed=int(self.impute_seed),
+                    panel_cols=int(self.panel_cols),
+                    cache_mb=int(self.cache_mb),
+                )
+            except BaseException as ex:
+                error["ex"] = ex
+            finally:
+                done_evt.set()
+
+        with _set_parallelism(omp_threads=self.num_threads, blas_threads=self.num_threads, decode_threads_cap=self.num_threads):
+            t = threading.Thread(target=_worker, daemon=True)
+            t.start()
+
+            last_done = 0
+            while not done_evt.wait(0.10):
+                if pbar is not None:
+                    done = int(winldcore.get_progress_done())
+                    total = int(pbar.total) if pbar.total is not None else done
+                    done = min(done, total)
+                    if done > last_done:
+                        pbar.update(done - last_done)
+                        last_done = done
+
+            t.join()
+
+            if pbar is not None:
+                done = int(winldcore.get_progress_done())
+                total = int(pbar.total) if pbar.total is not None else done
+                done = min(done, total)
+                if done > last_done:
+                    pbar.update(done - last_done)
+
+        if "ex" in error:
+            raise error["ex"]
+
+        if os.environ.get("SUMMIT_TRIM_AFTER_CHR", "0") not in ("", "0", "false", "False", "FALSE"):
+            _trim_malloc_best_effort()
+        return np.asarray(result["ld_chr"], dtype=np.float64, order="C")
 
     # ------------------ public entrypoint ------------------
 
     def _compute_ldscore(self):
-        """
-        Compute windowed LD score panel and write outputs with .win suffix.
-        """
         try:
             from tqdm import tqdm
-        except ImportError:
+        except ImportError:  # pragma: no cover
             raise ImportError("tqdm is required for progress display. Install with `pip install tqdm`.")
 
-        # chromosome blocks in BIM order (require contiguity per chromosome)
         chr_arr = self.snplist["CHR"].astype(str).to_numpy()
         blocks: List[Tuple[str, int, int]] = []
         i = 0
@@ -637,35 +617,35 @@ class WindowedLDScore:
             blocks.append((c, i, j))
             i = j
 
-        # compute per-chrom and fill global array
         ld_all = np.zeros((self.nsnps, self.nbins), dtype=np.float64)
 
-        pbar = tqdm(
-            blocks,
-            total=len(blocks),
-            desc="WIN-LD progress",
-            unit="chr",
-            file=sys.stderr,
-            dynamic_ncols=True,
-        )
+        for chrom, s, e in blocks:
+            n_chunks = max(1, (int(e) - int(s) + self.chunk_size - 1) // self.chunk_size)
+            pbar = tqdm(
+                total=n_chunks,
+                desc=f"chr {chrom}",
+                unit="chunk",
+                file=sys.stderr,
+                dynamic_ncols=True,
+                leave=True,
+            )
 
-        for chrom, s, e in pbar:
-            t0 = time.time()
-            ld_chr = self._compute_chrom_ldscores(s, e)
-            ld_all[s:e, :] = ld_chr
+            try:
+                t0 = time.time()
+                ld_chr = self._compute_chrom_ldscores(s, e, pbar=pbar)
+                ld_all[s:e, :] = ld_chr
+                pbar.set_postfix_str("done")
 
-            if self.verbose:
-                bp0 = int(self.snplist["BP"].iloc[s])
-                bp1 = int(self.snplist["BP"].iloc[e - 1])
-                dt = time.time() - t0
-                self.log._log(f"[win] chr {chrom}: m={e - s}, BP=[{bp0},{bp1}], runtime={dt:.2f}s")
-
-            # keep postfix lightweight (always)
-            pbar.set_postfix_str(f"chr {chrom}")
+                if self.verbose:
+                    bp0 = int(self.snplist["BP"].iloc[s])
+                    bp1 = int(self.snplist["BP"].iloc[e - 1])
+                    dt = time.time() - t0
+                    self.log._log(f"[win] chr {chrom}: m={e - s}, BP=[{bp0},{bp1}], runtime={dt:.2f}s")
+            finally:
+                pbar.close()
 
         self.win_ldscore = ld_all
 
-        # write <out>.win.ldscore.gz
         out_ld = f"{self.outpath}.win.ldscore.gz"
         if self.nbins > 1:
             self.log._log(f"Saving the windowed (partitioned) LD scores into: {out_ld}")
@@ -676,10 +656,9 @@ class WindowedLDScore:
         scores_df = pd.DataFrame(self.win_ldscore, columns=self.l2cols)
         out_df = pd.concat([snpdf, scores_df], axis=1)
         out_df.to_csv(out_ld, index=False, compression="gzip", sep="\t", float_format="%.6f")
-        
+
         self._log_basic_stats(scores_df)
 
-        # write <out>.win.M and <out>.win.M_5_50
         annot64 = np.ascontiguousarray(self.annot, dtype=np.float64)
         M = annot64.sum(axis=0, dtype=np.float64)
 
@@ -697,7 +676,6 @@ class WindowedLDScore:
         with open(out_M5, "w") as f:
             f.write("\t".join(f"{x:.6f}" for x in M_5) + "\n")
 
-        # finish + save dedicated win log (mirror gw behavior)
         end_time = utils._get_time()
         runtime = end_time - self.start_time
         self.log._log("Calculation of windowed LD score ended at " + utils._get_timestr(end_time))
@@ -710,17 +688,9 @@ class WindowedLDScore:
             self.log._save_log(self.outpath + ".win.log")
         except Exception:
             pass
-    
+
     def _log_basic_stats(self, scores_df: pd.DataFrame):
-        """
-        Mirror gw_ldscore.py terminal summaries:
-        - Per-bin LD score summary
-        - Correlation matrix across bins (Pearson)
-        - Annotation Column Sums
-        - Summary of Annotation Matrix Row Sums
-        """
         try:
-            # Per-bin LD score summary
             desc = scores_df.describe(percentiles=[0.25, 0.5, 0.75]).loc[
                 ["count", "mean", "std", "min", "25%", "50%", "75%", "max"]
             ]
@@ -732,7 +702,6 @@ class WindowedLDScore:
             ):
                 self.log._log(desc.to_string() + "\n")
 
-            # Correlation matrix across bins (Pearson)
             if scores_df.shape[1] >= 2:
                 corr = scores_df.corr(method="pearson")
                 self.log._log("Correlation matrix across bins (Pearson):\n")
@@ -743,18 +712,14 @@ class WindowedLDScore:
                 ):
                     self.log._log(corr.to_string() + "\n")
 
-            # Annotation Column Sums
-            # (for binary annot, these are SNP counts; for continuous, sum of weights)
             self.log._log("Annotation Column Sums")
             col_sums = self.annot.sum(axis=0, dtype=np.float64)
             for name, val in zip(self.l2cols, col_sums):
                 self.log._log(f"{name:<35} {val:.6f}")
             self.log._log("")
 
-            # Summary of Annotation Matrix Row Sums
             row_sums = np.asarray(self.annot, dtype=np.float64).sum(axis=1)
             rs = pd.Series(row_sums).describe(percentiles=[0.25, 0.5, 0.75])
-            # match gw style keys/order
             rs = rs.loc[["count", "mean", "std", "min", "25%", "50%", "75%", "max"]]
             self.log._log("Summary of Annotation Matrix Row Sums")
             with pd.option_context("display.float_format", "{:.4f}".format):

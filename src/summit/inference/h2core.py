@@ -5,8 +5,8 @@ from dataclasses import dataclass
 import numpy as np
 import json
 
-import utils
-from moments import build_h2_summary_moment
+from .. import utils
+from ..sumstats.moments import build_h2_summary_moment
 
 
 @dataclass(frozen=True)
@@ -54,6 +54,40 @@ class H2Fit:
     tau_star: np.ndarray | None
     enrich_mode_requested: str
     enrich_mode_used: str
+
+
+@dataclass(frozen=True)
+class H2TraceMetadata:
+    nsnps: int
+    nbins: int
+    annot_header: object
+    delta: np.ndarray | None = None
+    kmoments: dict | None = None
+    kmoments_path: str | None = None
+    kmoments_valid: bool = False
+
+
+@dataclass(frozen=True)
+class H2MatchedMetadata:
+    nsnps: int
+    nsamp: float
+    n_scale: float
+    cov_rank: int
+    cov_rank_source: str
+    name: str
+    used_summary: dict | None = None
+    used_top: list | None = None
+    clip_count: int = 0
+    clip_threshold: float | None = None
+
+
+@dataclass(frozen=True)
+class H2StructuralUnitStats:
+    m: np.ndarray                 # (U,)
+    Ak: np.ndarray                # (U,K)
+    Ak2: np.ndarray               # (U,K)
+    AA: np.ndarray                # (U,K,K)
+    AL: np.ndarray                # (U,K,K)
 
 
 class H2ResultWriter:
@@ -198,11 +232,252 @@ def _normalize_enrich_mode(mode: str | None) -> str:
     raise ValueError("enrich_mode must be one of {'auto','overlap','non-overlap','both'}")
 
 
-def _has_overlapping_annotations(A: np.ndarray) -> bool:
+def _has_overlapping_annotations(
+    A: np.ndarray,
+    active_mask: np.ndarray | None = None,
+    *,
+    chunk_size: int = 250_000,
+) -> bool:
     A = np.asarray(A, dtype=np.float64)
     if A.ndim != 2 or A.shape[1] <= 1:
         return False
-    return bool(np.any(np.sum(np.abs(A) > 0.0, axis=1) > 1))
+
+    if active_mask is not None:
+        active_mask = np.asarray(active_mask, dtype=bool)
+        if active_mask.ndim != 1 or active_mask.size != A.shape[0]:
+            raise ValueError(
+                f"active_mask must be length {A.shape[0]}; got {active_mask.shape}"
+            )
+
+    chunk_size = int(chunk_size)
+    if chunk_size <= 0:
+        raise ValueError("chunk_size must be positive")
+
+    M = int(A.shape[0])
+    for s in range(0, M, chunk_size):
+        e = min(s + chunk_size, M)
+        block = A[s:e, :]
+        if active_mask is not None:
+            mu = active_mask[s:e]
+            if not np.any(mu):
+                continue
+            if not np.all(mu):
+                block = block[mu, :]
+        if bool(np.any(np.sum(np.abs(block) > 0.0, axis=1) > 1)):
+            return True
+    return False
+
+
+def _make_h2_trace_metadata(trace_view) -> H2TraceMetadata:
+    return H2TraceMetadata(
+        nsnps=int(trace_view.nsnps),
+        nbins=int(trace_view.nbins),
+        annot_header=getattr(trace_view, "annot_header", None),
+        delta=getattr(trace_view, "delta", None),
+        kmoments=getattr(trace_view, "kmoments", None),
+        kmoments_path=getattr(trace_view, "kmoments_path", None),
+        kmoments_valid=bool(getattr(trace_view, "kmoments_valid", False)),
+    )
+
+
+def _select_h2_matrices(trace_view, ld_kind: str):
+    A = np.asarray(trace_view.annot, dtype=np.float64, order="C")
+    if A.ndim != 2:
+        raise ValueError(f"trace_view.annot must be 2D; got {A.shape}")
+
+    if ld_kind == "main":
+        L = np.asarray(trace_view.ldscores, dtype=np.float64, order="C")
+    elif ld_kind == "reg":
+        if getattr(trace_view, "ldscores_reg", None) is None:
+            raise ValueError("ld_kind='reg' requested but TraceView has no ldscores_reg")
+        L = np.asarray(trace_view.ldscores_reg, dtype=np.float64, order="C")
+    else:
+        raise ValueError("ld_kind must be 'main' or 'reg'")
+
+    if L.ndim != 2:
+        raise ValueError(f"LD-score matrix must be 2D; got {L.shape}")
+    if L.shape != A.shape:
+        raise ValueError(
+            f"For h2, annotation and LD-score matrices must have identical shape; "
+            f"got A.shape={A.shape}, L.shape={L.shape}."
+        )
+    return A, L
+
+
+def _empty_h2_structural_stats(U: int, K: int) -> H2StructuralUnitStats:
+    U = int(U)
+    K = int(K)
+    return H2StructuralUnitStats(
+        m=np.zeros(U, dtype=np.float64),
+        Ak=np.zeros((U, K), dtype=np.float64),
+        Ak2=np.zeros((U, K), dtype=np.float64),
+        AA=np.zeros((U, K, K), dtype=np.float64),
+        AL=np.zeros((U, K, K), dtype=np.float64),
+    )
+
+
+def _validate_h2_structural_stats(stats: H2StructuralUnitStats, U: int, K: int, *, label: str):
+    shapes = {
+        "m": (U,),
+        "Ak": (U, K),
+        "Ak2": (U, K),
+        "AA": (U, K, K),
+        "AL": (U, K, K),
+    }
+    for name, expected in shapes.items():
+        arr = np.asarray(getattr(stats, name), dtype=np.float64)
+        if arr.shape != expected:
+            raise ValueError(
+                f"{label}.{name} has shape {arr.shape}; expected {expected}."
+            )
+
+
+def _subtract_h2_structural_stats(
+    left: H2StructuralUnitStats,
+    right: H2StructuralUnitStats,
+) -> H2StructuralUnitStats:
+    return H2StructuralUnitStats(
+        m=np.asarray(left.m, dtype=np.float64) - np.asarray(right.m, dtype=np.float64),
+        Ak=np.asarray(left.Ak, dtype=np.float64) - np.asarray(right.Ak, dtype=np.float64),
+        Ak2=np.asarray(left.Ak2, dtype=np.float64) - np.asarray(right.Ak2, dtype=np.float64),
+        AA=np.asarray(left.AA, dtype=np.float64) - np.asarray(right.AA, dtype=np.float64),
+        AL=np.asarray(left.AL, dtype=np.float64) - np.asarray(right.AL, dtype=np.float64),
+    )
+
+
+def _compute_h2_structural_from_rows(
+    A: np.ndarray,
+    L: np.ndarray,
+    jackknife,
+    idx: np.ndarray,
+) -> H2StructuralUnitStats:
+    A = np.asarray(A, dtype=np.float64, order="C")
+    L = np.asarray(L, dtype=np.float64, order="C")
+    if A.shape != L.shape:
+        raise ValueError(f"A/L shape mismatch: {A.shape} vs {L.shape}")
+
+    U = int(jackknife.nunit)
+    K = int(A.shape[1])
+    out = _empty_h2_structural_stats(U, K)
+
+    idx = np.asarray(idx, dtype=np.int64).ravel()
+    if idx.size == 0:
+        return out
+    if np.any((idx < 0) | (idx >= A.shape[0])):
+        bad = idx[(idx < 0) | (idx >= A.shape[0])][:10].tolist()
+        raise ValueError(f"row index out of range; first bad indices: {bad}")
+
+    unit_id = np.asarray(jackknife.unit_id, dtype=np.int64)
+    if unit_id.shape != (A.shape[0],):
+        raise ValueError(
+            f"jackknife.unit_id must have length {A.shape[0]}; got {unit_id.shape}"
+        )
+
+    uids = unit_id[idx]
+    for u in np.unique(uids):
+        rows = idx[uids == u]
+        if rows.size == 0:
+            continue
+        Au = A[rows, :]
+        Lu = L[rows, :]
+        out.m[u] = float(rows.size)
+        out.Ak[u] = Au.sum(axis=0, dtype=np.float64)
+        out.Ak2[u] = (Au * Au).sum(axis=0, dtype=np.float64)
+        out.AA[u] = Au.T @ Au
+        out.AL[u] = Au.T @ Lu
+    return out
+
+
+def compute_h2_structural_unit_stats(
+    trace_view,
+    jackknife,
+    *,
+    active_mask: np.ndarray | None = None,
+    ld_kind: str = "main",
+) -> H2StructuralUnitStats:
+    if jackknife.nsnps != int(trace_view.nsnps):
+        raise ValueError(
+            "JackknifeDesign was not built on this trace axis. "
+            f"Expected {trace_view.nsnps}, got {jackknife.nsnps}."
+        )
+
+    A, L = _select_h2_matrices(trace_view, ld_kind)
+    M = int(A.shape[0])
+    U = int(jackknife.nunit)
+    K = int(A.shape[1])
+
+    if active_mask is not None:
+        active_mask = np.asarray(active_mask, dtype=bool)
+        if active_mask.ndim != 1 or active_mask.size != M:
+            raise ValueError(f"active_mask must be length {M}; got {active_mask.shape}")
+
+    out = _empty_h2_structural_stats(U, K)
+    for u in range(U):
+        s = int(jackknife.starts[u])
+        e = int(jackknife.ends[u])
+        if e <= s:
+            continue
+
+        if active_mask is None:
+            Au = A[s:e, :]
+            Lu = L[s:e, :]
+        else:
+            mu = active_mask[s:e]
+            if not np.any(mu):
+                continue
+            if np.all(mu):
+                Au = A[s:e, :]
+                Lu = L[s:e, :]
+            else:
+                rows = s + np.flatnonzero(mu)
+                Au = A[rows, :]
+                Lu = L[rows, :]
+
+        out.m[u] = float(Au.shape[0])
+        out.Ak[u] = Au.sum(axis=0, dtype=np.float64)
+        out.Ak2[u] = (Au * Au).sum(axis=0, dtype=np.float64)
+        out.AA[u] = Au.T @ Au
+        out.AL[u] = Au.T @ Lu
+    return out
+
+
+def _compute_h2_ay_unit(
+    A: np.ndarray,
+    jackknife,
+    y: np.ndarray,
+    active_mask: np.ndarray,
+) -> np.ndarray:
+    A = np.asarray(A, dtype=np.float64, order="C")
+    y = np.asarray(y, dtype=np.float64)
+    active_mask = np.asarray(active_mask, dtype=bool)
+
+    if y.shape != (A.shape[0],):
+        raise ValueError(f"y must have shape ({A.shape[0]},); got {y.shape}")
+    if active_mask.shape != (A.shape[0],):
+        raise ValueError(
+            f"active_mask must have shape ({A.shape[0]},); got {active_mask.shape}"
+        )
+
+    U = int(jackknife.nunit)
+    K = int(A.shape[1])
+    Ay = np.zeros((U, K), dtype=np.float64)
+
+    for u in range(U):
+        s = int(jackknife.starts[u])
+        e = int(jackknife.ends[u])
+        if e <= s:
+            continue
+        mu = active_mask[s:e]
+        if not np.any(mu):
+            continue
+        yu = y[s:e]
+        if np.all(mu):
+            Ay[u] = A[s:e, :].T @ yu
+        else:
+            y_work = np.zeros(e - s, dtype=np.float64)
+            y_work[mu] = yu[mu]
+            Ay[u] = A[s:e, :].T @ y_work
+    return Ay
 
 
 def _solve_linear_batch(lhs: np.ndarray, rhs: np.ndarray) -> np.ndarray:
@@ -306,97 +581,36 @@ def _pair_correction_from_deleted_mass(A_keep, A_del, delta):
 # preparation
 # -----------------------------------------------------------------------------
 
-def prepare_h2(
+
+def _finish_prepare_h2(
+    *,
     trace_view,
     matched,
     jackknife,
-    *,
-    active_mask=None,
-    summary_y=None,
-    summary_y_info=None,
-    ld_kind: str = "main",
-    adjust_delta: bool = False,
-):
-    if trace_view.nsnps != matched.nsnps:
-        raise ValueError("TraceView and MatchedSumstats must have the same number of SNPs.")
-    if not np.array_equal(trace_view.snps, matched.snps):
-        raise ValueError("TraceView and MatchedSumstats SNP order mismatch.")
-    if jackknife.nsnps != trace_view.nsnps:
-        raise ValueError(
-            "JackknifeDesign was not built on this TraceView SNP axis. "
-            f"Expected {jackknife.nsnps}, got {trace_view.nsnps}."
-        )
+    active_mask: np.ndarray,
+    y: np.ndarray,
+    struct: H2StructuralUnitStats,
+    Ay_unit: np.ndarray,
+    n_scale: float,
+    summary_y_info: dict | None,
+    has_overlap: bool,
+    adjust_delta: bool,
+    store_y: bool = True,
+) -> H2Prepared:
+    K = int(trace_view.nbins)
+    R = int(jackknife.nrep)
+    U = int(jackknife.nunit)
 
-    M = trace_view.nsnps
-    K = trace_view.nbins
-    R = jackknife.nrep
-    U = jackknife.nunit
+    _validate_h2_structural_stats(struct, U, K, label="struct")
+    Ay_unit = np.asarray(Ay_unit, dtype=np.float64)
+    if Ay_unit.shape != (U, K):
+        raise ValueError(f"Ay_unit has shape {Ay_unit.shape}; expected {(U, K)}")
 
-    if summary_y is None:
-        summary_y, summary_y_info = build_h2_summary_moment(matched)
-
-    y = np.asarray(summary_y, dtype=np.float64)
-    if y.shape != (M,):
-        raise ValueError(f"summary_y must have shape ({M},), got {y.shape}")
-
-    if summary_y_info is not None:
-        n_scale = float(summary_y_info.get("n_scale", getattr(matched, "n_scale", matched.nsamp)))
-    else:
-        n_scale = float(getattr(matched, "n_scale", matched.nsamp))
-
-    if not (np.isfinite(n_scale) and n_scale > 0.0):
-        raise RuntimeError(f"Invalid univariate n_scale={n_scale}")
-
-    if active_mask is None:
-        active_mask = np.isfinite(y)
-    else:
-        active_mask = np.asarray(active_mask, dtype=bool)
-        if active_mask.ndim != 1 or active_mask.size != M:
-            raise ValueError(f"active_mask must be length {M}; got {active_mask.shape}")
-        active_mask = active_mask & np.isfinite(y)
-
-    A = np.asarray(trace_view.annot, dtype=np.float64, order="C")
-    if ld_kind == "main":
-        L = np.asarray(trace_view.ldscores, dtype=np.float64, order="C")
-    elif ld_kind == "reg":
-        if trace_view.ldscores_reg is None:
-            raise ValueError("ld_kind='reg' requested but TraceView has no ldscores_reg")
-        L = np.asarray(trace_view.ldscores_reg, dtype=np.float64, order="C")
-        if L.shape[1] != K:
-            raise ValueError(
-                f"For univariate prepare_h2, regression LD bins must match annotation bins. "
-                f"Got L.shape[1]={L.shape[1]}, K={K}."
-            )
-    else:
-        raise ValueError("ld_kind must be 'main' or 'reg'")
-
-    m_unit = np.zeros(U, dtype=np.float64)
-    Ak_unit = np.zeros((U, K), dtype=np.float64)
-    Ay_unit = np.zeros((U, K), dtype=np.float64)
-    Ak2_unit = np.zeros((U, K), dtype=np.float64)
-    AA_unit = np.zeros((U, K, K), dtype=np.float64)
-    AL_unit = np.zeros((U, K, K), dtype=np.float64)
-
-    for u in range(U):
-        s = int(jackknife.starts[u])
-        e = int(jackknife.ends[u])
-        if e <= s:
-            continue
-        mu = active_mask[s:e]
-        if not np.any(mu):
-            continue
-        Au = A[s:e, :][mu, :]
-        Lu = L[s:e, :][mu, :]
-        yu = y[s:e][mu]
-
-        m_unit[u] = float(Au.shape[0])
-        Ak_unit[u] = Au.sum(axis=0, dtype=np.float64)
-        Ay_unit[u] = Au.T @ yu
-        Ak2_unit[u] = (Au * Au).sum(axis=0, dtype=np.float64)
-        AA_unit[u] = Au.T @ Au
-        AL_unit[u] = Au.T @ Lu
-
-    has_overlap = _has_overlapping_annotations(A[active_mask, :])
+    m_unit = np.asarray(struct.m, dtype=np.float64)
+    Ak_unit = np.asarray(struct.Ak, dtype=np.float64)
+    Ak2_unit = np.asarray(struct.Ak2, dtype=np.float64)
+    AA_unit = np.asarray(struct.AA, dtype=np.float64)
+    AL_unit = np.asarray(struct.AL, dtype=np.float64)
 
     M_full = float(m_unit.sum())
     if not (np.isfinite(M_full) and M_full > 0.0):
@@ -447,6 +661,8 @@ def prepare_h2(
             f"Bad bins: {bad_bins.tolist()}"
         )
 
+    y_store = np.asarray(y, dtype=np.float64) if store_y else np.empty(0, dtype=np.float64)
+
     return H2Prepared(
         trace_view=trace_view,
         matched=matched,
@@ -456,7 +672,7 @@ def prepare_h2(
         unit_sizes=unit_sizes,
         n_scale=n_scale,
         summary_y_info=summary_y_info,
-        y=y,
+        y=y_store,
         m_unit=m_unit,
         Ak_unit=Ak_unit,
         Ay_unit=Ay_unit,
@@ -471,6 +687,182 @@ def prepare_h2(
         AL_rep=AL_rep,
         lhs=lhs,
         rhs=rhs,
+    )
+
+
+def prepare_h2(
+    trace_view,
+    matched,
+    jackknife,
+    *,
+    active_mask=None,
+    summary_y=None,
+    summary_y_info=None,
+    ld_kind: str = "main",
+    adjust_delta: bool = False,
+):
+    if trace_view.nsnps != matched.nsnps:
+        raise ValueError("TraceView and MatchedSumstats must have the same number of SNPs.")
+    if not np.array_equal(trace_view.snps, matched.snps):
+        raise ValueError("TraceView and MatchedSumstats SNP order mismatch.")
+    if jackknife.nsnps != trace_view.nsnps:
+        raise ValueError(
+            "JackknifeDesign was not built on this TraceView SNP axis. "
+            f"Expected {jackknife.nsnps}, got {trace_view.nsnps}."
+        )
+
+    M = trace_view.nsnps
+    K = trace_view.nbins
+    R = jackknife.nrep
+    U = jackknife.nunit
+
+    if summary_y is None:
+        summary_y, summary_y_info = build_h2_summary_moment(matched)
+
+    y = np.asarray(summary_y, dtype=np.float64)
+    if y.shape != (M,):
+        raise ValueError(f"summary_y must have shape ({M},), got {y.shape}")
+
+    if summary_y_info is not None:
+        n_scale = float(summary_y_info.get("n_scale", getattr(matched, "n_scale", matched.nsamp)))
+    else:
+        n_scale = float(getattr(matched, "n_scale", matched.nsamp))
+
+    if not (np.isfinite(n_scale) and n_scale > 0.0):
+        raise RuntimeError(f"Invalid univariate n_scale={n_scale}")
+
+    if active_mask is None:
+        active_mask = np.isfinite(y)
+    else:
+        active_mask = np.asarray(active_mask, dtype=bool)
+        if active_mask.ndim != 1 or active_mask.size != M:
+            raise ValueError(f"active_mask must be length {M}; got {active_mask.shape}")
+        active_mask = active_mask & np.isfinite(y)
+
+    A, _ = _select_h2_matrices(trace_view, ld_kind)
+    struct = compute_h2_structural_unit_stats(
+        trace_view,
+        jackknife,
+        active_mask=active_mask,
+        ld_kind=ld_kind,
+    )
+    Ay_unit = _compute_h2_ay_unit(A, jackknife, y, active_mask)
+    has_overlap = _has_overlapping_annotations(A, active_mask=active_mask)
+
+    return _finish_prepare_h2(
+        trace_view=trace_view,
+        matched=matched,
+        jackknife=jackknife,
+        active_mask=active_mask,
+        y=y,
+        struct=struct,
+        Ay_unit=Ay_unit,
+        n_scale=n_scale,
+        summary_y_info=summary_y_info,
+        has_overlap=has_overlap,
+        adjust_delta=adjust_delta,
+        store_y=True,
+    )
+
+
+def prepare_h2_reference_axis(
+    trace_view,
+    matched,
+    jackknife,
+    keep_mask,
+    *,
+    summary_y,
+    summary_y_info=None,
+    full_struct: H2StructuralUnitStats | None = None,
+    ld_kind: str = "main",
+    adjust_delta: bool = False,
+    prefer_drop_correction: bool = True,
+):
+    """
+    Prepare h2 normal equations on the immutable reference SNP axis.
+
+    This is algebraically equivalent to materializing a compact TraceView on
+    keep_mask and then aggregating, but it avoids copying the dense annotation
+    and LD-score matrices.  Jackknife units are those in the supplied reference
+    jackknife design, and unit weights are counted after the trait-specific drop.
+    """
+    M = int(trace_view.nsnps)
+    K = int(trace_view.nbins)
+    U = int(jackknife.nunit)
+
+    if jackknife.nsnps != M:
+        raise ValueError(
+            "JackknifeDesign was not built on this reference trace axis. "
+            f"Expected {M}, got {jackknife.nsnps}."
+        )
+
+    keep_mask = np.asarray(keep_mask, dtype=bool)
+    if keep_mask.ndim != 1 or keep_mask.size != M:
+        raise ValueError(f"keep_mask must be length {M}; got {keep_mask.shape}")
+
+    y = np.asarray(summary_y, dtype=np.float64)
+    if y.shape != (M,):
+        raise ValueError(f"summary_y must have shape ({M},), got {y.shape}")
+
+    if summary_y_info is not None:
+        n_scale = float(summary_y_info.get("n_scale", getattr(matched, "n_scale", matched.nsamp)))
+    else:
+        n_scale = float(getattr(matched, "n_scale", matched.nsamp))
+
+    if not (np.isfinite(n_scale) and n_scale > 0.0):
+        raise RuntimeError(f"Invalid univariate n_scale={n_scale}")
+
+    active_mask = keep_mask & np.isfinite(y)
+    active_n = int(np.sum(active_mask))
+    if active_n <= 0:
+        raise RuntimeError("No active SNPs remain for H2 preparation.")
+
+    A, L = _select_h2_matrices(trace_view, ld_kind)
+    if A.shape != (M, K):
+        raise RuntimeError(f"Unexpected annotation shape {A.shape}; expected {(M, K)}")
+
+    if full_struct is not None:
+        _validate_h2_structural_stats(full_struct, U, K, label="full_struct")
+
+    use_drop_correction = False
+    if prefer_drop_correction and full_struct is not None:
+        n_drop = M - active_n
+        use_drop_correction = n_drop <= active_n
+
+    if use_drop_correction:
+        n_drop = M - active_n
+        if n_drop == 0:
+            struct = full_struct
+        else:
+            drop_idx = np.flatnonzero(~active_mask).astype(np.int64, copy=False)
+            corr = _compute_h2_structural_from_rows(A, L, jackknife, drop_idx)
+            struct = _subtract_h2_structural_stats(full_struct, corr)
+    else:
+        struct = compute_h2_structural_unit_stats(
+            trace_view,
+            jackknife,
+            active_mask=active_mask,
+            ld_kind=ld_kind,
+        )
+
+    Ay_unit = _compute_h2_ay_unit(A, jackknife, y, active_mask)
+    has_overlap = _has_overlapping_annotations(A, active_mask=active_mask)
+
+    trace_meta = _make_h2_trace_metadata(trace_view)
+
+    return _finish_prepare_h2(
+        trace_view=trace_meta,
+        matched=matched,
+        jackknife=jackknife,
+        active_mask=active_mask,
+        y=y,
+        struct=struct,
+        Ay_unit=Ay_unit,
+        n_scale=n_scale,
+        summary_y_info=summary_y_info,
+        has_overlap=has_overlap,
+        adjust_delta=adjust_delta,
+        store_y=False,
     )
 
 

@@ -36,6 +36,22 @@ struct AlignedBuffer {
     size_t n = 0;
     AlignedBuffer() = default;
     explicit AlignedBuffer(size_t count, size_t align = 64) { allocate(count, align); }
+    AlignedBuffer(const AlignedBuffer&) = delete;
+    AlignedBuffer& operator=(const AlignedBuffer&) = delete;
+    AlignedBuffer(AlignedBuffer&& o) noexcept : ptr(o.ptr), n(o.n) {
+        o.ptr = nullptr;
+        o.n = 0;
+    }
+    AlignedBuffer& operator=(AlignedBuffer&& o) noexcept {
+        if (this != &o) {
+            free();
+            ptr = o.ptr;
+            n = o.n;
+            o.ptr = nullptr;
+            o.n = 0;
+        }
+        return *this;
+    }
     void allocate(size_t count, size_t align = 64) {
         free();
         if (count == 0) return;
@@ -181,7 +197,7 @@ static inline size_t cache_key(int start, int end) {
     return ((uint64_t)(uint32_t)start << 32) ^ (uint64_t)(uint32_t)end;
 }
 
-static void project_block_inplace(std::vector<double>& G,
+static void project_block_inplace(double* G,
                                   int N,
                                   int L,
                                   const double* Cptr,
@@ -189,30 +205,58 @@ static void project_block_inplace(std::vector<double>& G,
                                   int p,
                                   AlignedBuffer<double>& tmp)
 {
-    if (p <= 0 || N <= 0 || L <= 0) return;
+    if (!G || p <= 0 || N <= 0 || L <= 0) return;
     const size_t need = (size_t)p * (size_t)L;
     if (tmp.n < need) tmp.allocate(need, 64);
-    gemm_col_major_nn<double>(p, L, N, Rptr, p, G.data(), N, tmp.ptr, p, 1.0, 0.0);
-    gemm_col_major_nn<double>(N, L, p, Cptr, N, tmp.ptr, p, G.data(), N, -1.0, 1.0);
+    gemm_col_major_nn<double>(p, L, N, Rptr, p, G, N, tmp.ptr, p, 1.0, 0.0);
+    gemm_col_major_nn<double>(N, L, p, Cptr, N, tmp.ptr, p, G, N, -1.0, 1.0);
 }
 
-static void restandardize_cols_inplace(std::vector<double>& G, int N, int L)
+static void restandardize_cols_inplace(double* G, int N, int L)
 {
-    if (N <= 0 || L <= 0) return;
-#ifdef _OPENMP
-    #pragma omp parallel for schedule(static)
-#endif
-    for (int j = 0; j < L; ++j) {
-        double* col = G.data() + (size_t)j * (size_t)N;
-        double sum = 0.0;
-        for (int i = 0; i < N; ++i) sum += col[(size_t)i];
-        const double mean = sum / (double)N;
+    if (!G || N <= 0 || L <= 0) return;
 
-        double ss = 0.0;
-        for (int i = 0; i < N; ++i) {
-            const double d = col[(size_t)i] - mean;
-            ss += d * d;
+    const int64_t work = (int64_t)N * (int64_t)L;
+    const bool use_omp = work >= (1LL << 22) && L >= 16;
+
+#if defined(_OPENMP)
+    if (use_omp) {
+        #pragma omp parallel for schedule(static)
+        for (int j = 0; j < L; ++j) {
+            double* col = G + (size_t)j * (size_t)N;
+            double sum = 0.0;
+            double sumsq = 0.0;
+            for (int i = 0; i < N; ++i) {
+                const double x = col[(size_t)i];
+                sum += x;
+                sumsq += x * x;
+            }
+            const double mean = sum / (double)N;
+            double ss = sumsq - (sum * sum) / (double)N;
+            if (ss < 0.0 && ss > -1e-12) ss = 0.0;
+            double inv_sd = 1.0;
+            if (ss > 0.0 && std::isfinite(ss)) {
+                const double var = ss / (double)N;
+                if (var > 0.0 && std::isfinite(var)) inv_sd = 1.0 / std::sqrt(var);
+            }
+            for (int i = 0; i < N; ++i) col[(size_t)i] = (col[(size_t)i] - mean) * inv_sd;
         }
+        return;
+    }
+#endif
+
+    for (int j = 0; j < L; ++j) {
+        double* col = G + (size_t)j * (size_t)N;
+        double sum = 0.0;
+        double sumsq = 0.0;
+        for (int i = 0; i < N; ++i) {
+            const double x = col[(size_t)i];
+            sum += x;
+            sumsq += x * x;
+        }
+        const double mean = sum / (double)N;
+        double ss = sumsq - (sum * sum) / (double)N;
+        if (ss < 0.0 && ss > -1e-12) ss = 0.0;
         double inv_sd = 1.0;
         if (ss > 0.0 && std::isfinite(ss)) {
             const double var = ss / (double)N;
@@ -226,8 +270,8 @@ struct PreparedPanel {
     int start = 0;   // global SNP index (genome-wide, BIM order)
     int end = 0;     // exclusive
     int N = 0;
-    std::vector<double> X; // column-major N x L
-    size_t bytes() const { return X.size() * sizeof(double); }
+    AlignedBuffer<double> X; // column-major N x L
+    size_t bytes() const { return X.n * sizeof(double); }
     int L() const { return end - start; }
 };
 
@@ -300,20 +344,29 @@ private:
         panel->start = start;
         panel->end = end;
         prefetch_bed_block(bed_path_, fam_path_, start, end, 1);
+
+        const int N_guess = (int) rows_.size();
+        const int L_guess = end - start;
+        if (N_guess <= 0 || L_guess <= 0)
+            throw std::runtime_error("Invalid panel dimensions in PreparedPanelCache::load_panel");
+        panel->X.allocate((size_t)N_guess * (size_t)L_guess, 64);
+
         int N = 0, L = 0;
-        read_block_standardized<double>(bed_path_, fam_path_, start, end,
-                                        rows_, 0,
-                                        impute_mode_, impute_seed_,
-                                        panel->X, N, L);
+        read_block_standardized_into<double>(bed_path_, fam_path_, start, end,
+                                             rows_, 0,
+                                             impute_mode_, impute_seed_,
+                                             panel->X.ptr, panel->X.n,
+                                             N, L);
+        if (N != N_guess) throw std::runtime_error("Prepared panel row count mismatch");
         if (L != (end - start)) throw std::runtime_error("Prepared panel length mismatch");
         panel->N = N;
         if (have_proj_) {
-            project_block_inplace(panel->X, N, L, Cptr_, Rptr_, p_, proj_tmp_);
-            restandardize_cols_inplace(panel->X, N, L);
+            project_block_inplace(panel->X.ptr, N, L, Cptr_, Rptr_, p_, proj_tmp_);
+            restandardize_cols_inplace(panel->X.ptr, N, L);
         } else if (impute_mode_ == ImputeMode::Mean) {
             // Mean-imputation path must match the legacy windowed estimator,
             // which standardizes after imputation across all selected rows.
-            restandardize_cols_inplace(panel->X, N, L);
+            restandardize_cols_inplace(panel->X.ptr, N, L);
         }
         return panel;
     }
@@ -340,17 +393,41 @@ private:
     AlignedBuffer<double> proj_tmp_;
 };
 
+static inline void syrk_col_major_upper(int n,
+                                        int k,
+                                        const double* A,
+                                        int lda,
+                                        double* C,
+                                        int ldc,
+                                        double alpha = 1.0,
+                                        double beta = 0.0)
+{
+    cblas_dsyrk(CblasColMajor, CblasUpper, CblasTrans,
+                n, k, alpha, A, lda, beta, C, ldc);
+}
+
 static inline void unbiased_r2_inplace(double* buf, size_t n, int N_rows)
 {
     const double denom = (N_rows > 2) ? (double)(N_rows - 2) : (double)std::max(1, N_rows);
-#ifdef _OPENMP
-    #pragma omp parallel for schedule(static)
-#endif
     for (ptrdiff_t i = 0; i < (ptrdiff_t)n; ++i) {
         const double r = buf[(size_t)i];
         double r2 = r * r;
         r2 -= (1.0 - r2) / denom;
         buf[(size_t)i] = r2;
+    }
+}
+
+static inline void unbiased_r2_upper_inplace(double* buf, int L, int N_rows)
+{
+    const double denom = (N_rows > 2) ? (double)(N_rows - 2) : (double)std::max(1, N_rows);
+    for (int j = 0; j < L; ++j) {
+        double* col = buf + (size_t)j * (size_t)L;
+        for (int i = 0; i <= j; ++i) {
+            const double r = col[(size_t)i];
+            double r2 = r * r;
+            r2 -= (1.0 - r2) / denom;
+            col[(size_t)i] = r2;
+        }
     }
 }
 
@@ -375,8 +452,8 @@ static void accum_cross_panels(int chr_global_start,
     if (cross.n < need) cross.allocate(need, 64);
 
     gemm_col_major_tn<double>(Ll, Lr, N_rows,
-                              left.X.data(), N_rows,
-                              right.X.data(), N_rows,
+                              left.X.ptr, N_rows,
+                              right.X.ptr, N_rows,
                               cross.ptr, Ll,
                               1.0 / (double)N_rows,
                               0.0);
@@ -395,39 +472,85 @@ static void accum_cross_panels(int chr_global_start,
                               1.0, 1.0);
 }
 
-static void accum_left_from_right_panel(int chr_global_start,
-                                        const PreparedPanel& left,
-                                        const PreparedPanel& right,
-                                        const double* annot_ptr,
-                                        int annot_ld,
-                                        double* ld_ptr,
-                                        int ld_ld,
-                                        int B,
-                                        int N_rows,
-                                        AlignedBuffer<double>& cross)
+static void accum_self_panel(int chr_global_start,
+                             const PreparedPanel& panel,
+                             const double* annot_ptr,
+                             int annot_ld,
+                             double* ld_ptr,
+                             int ld_ld,
+                             int B,
+                             int N_rows,
+                             AlignedBuffer<double>& cross)
 {
-    const int Ll = left.L();
-    const int Lr = right.L();
-    if (Ll <= 0 || Lr <= 0) return;
+    const int L = panel.L();
+    if (L <= 0) return;
 
-    const int left_local = left.start - chr_global_start;
-    const int right_local = right.start - chr_global_start;
-    const size_t need = (size_t)Ll * (size_t)Lr;
+    const int local = panel.start - chr_global_start;
+    const size_t need = (size_t)L * (size_t)L;
     if (cross.n < need) cross.allocate(need, 64);
 
-    gemm_col_major_tn<double>(Ll, Lr, N_rows,
-                              left.X.data(), N_rows,
-                              right.X.data(), N_rows,
-                              cross.ptr, Ll,
-                              1.0 / (double)N_rows,
-                              0.0);
-    unbiased_r2_inplace(cross.ptr, need, N_rows);
+    syrk_col_major_upper(L, N_rows,
+                         panel.X.ptr, N_rows,
+                         cross.ptr, L,
+                         1.0 / (double)N_rows,
+                         0.0);
+    unbiased_r2_upper_inplace(cross.ptr, L, N_rows);
 
-    gemm_col_major_nn<double>(Ll, B, Lr,
-                              cross.ptr, Ll,
-                              annot_ptr + (size_t)right_local, annot_ld,
-                              ld_ptr + (size_t)left_local, ld_ld,
-                              1.0, 1.0);
+    static thread_local AlignedBuffer<double> sumj_tls;
+    if (sumj_tls.n < (size_t)B) sumj_tls.allocate((size_t)B, 64);
+
+    for (int j = 0; j < L; ++j) {
+        const double* aj = annot_ptr + (size_t)(local + j);
+        double* outj = ld_ptr + (size_t)(local + j);
+        double* sumj = sumj_tls.ptr;
+        std::fill(sumj, sumj + B, 0.0);
+
+        const double d = cross.ptr[(size_t)j + (size_t)j * (size_t)L];
+#ifdef _OPENMP
+        #pragma omp simd
+#endif
+        for (int b = 0; b < B; ++b) {
+            sumj[(size_t)b] += d * aj[(size_t)b * (size_t)annot_ld];
+        }
+
+        for (int i = 0; i < j; ++i) {
+            const double w = cross.ptr[(size_t)i + (size_t)j * (size_t)L];
+            const double* ai = annot_ptr + (size_t)(local + i);
+            double* outi = ld_ptr + (size_t)(local + i);
+#ifdef _OPENMP
+            #pragma omp simd
+#endif
+            for (int b = 0; b < B; ++b) {
+                const size_t offa = (size_t)b * (size_t)annot_ld;
+                const size_t offl = (size_t)b * (size_t)ld_ld;
+                outi[offl] += w * aj[offa];
+                sumj[(size_t)b] += w * ai[offa];
+            }
+        }
+
+#ifdef _OPENMP
+        #pragma omp simd
+#endif
+        for (int b = 0; b < B; ++b) {
+            outj[(size_t)b * (size_t)ld_ld] += sumj[(size_t)b];
+        }
+    }
+}
+
+static std::vector<std::shared_ptr<PreparedPanel>> load_interval_panels(PreparedPanelCache& cache,
+                                                                        int chr_global_start,
+                                                                        int local_start,
+                                                                        int local_end,
+                                                                        int panel_cols)
+{
+    std::vector<std::shared_ptr<PreparedPanel>> panels;
+    const int npanels = ceil_div_i(std::max(0, local_end - local_start), panel_cols);
+    panels.reserve((size_t)std::max(0, npanels));
+    for (int p0 = local_start; p0 < local_end; p0 += panel_cols) {
+        const int p1 = std::min(local_end, p0 + panel_cols);
+        panels.push_back(cache.get(chr_global_start + p0, chr_global_start + p1));
+    }
+    return panels;
 }
 
 static std::vector<int> compute_block_left(const int64_t* bp, int m, double ld_wind_kb)
@@ -453,17 +576,30 @@ static int auto_panel_cols(int N_rows, int chunk_size, int panel_cols, size_t ca
     }
     if (target_bytes == 0) {
         const size_t min_target = 256ULL * 1024ULL * 1024ULL;
-        const size_t max_target = 1024ULL * 1024ULL * 1024ULL;
-        if (cache_bytes > 0) target_bytes = cache_bytes / 16ULL;
-        else target_bytes = 512ULL * 1024ULL * 1024ULL;
-        if (target_bytes < min_target) target_bytes = min_target;
+        const size_t max_target = 2ULL * 1024ULL * 1024ULL * 1024ULL;
+        const size_t floor_target = 64ULL * 1024ULL * 1024ULL;
+        if (cache_bytes > 0) {
+            target_bytes = cache_bytes / 8ULL;
+            const size_t cache_cap = std::max(floor_target, (size_t)(cache_bytes / 2ULL));
+            if (target_bytes < floor_target) target_bytes = floor_target;
+            if (target_bytes < min_target && cache_cap >= min_target) target_bytes = min_target;
+            if (target_bytes > cache_cap) target_bytes = cache_cap;
+        } else {
+            target_bytes = 512ULL * 1024ULL * 1024ULL;
+            if (target_bytes < min_target) target_bytes = min_target;
+        }
         if (target_bytes > max_target) target_bytes = max_target;
     }
 
     const size_t bytes_per_col = (size_t)std::max(1, N_rows) * sizeof(double);
     int cols = (int)(target_bytes / bytes_per_col);
     cols = std::min(cols, chunk_size);
-    cols = std::min(cols, 2048);
+    cols = std::min(cols, 4096);
+    const size_t cross_cap_bytes = 1024ULL * 1024ULL * 1024ULL;
+    if (cols > 0) {
+        const int cross_cap = (int)std::sqrt((double)cross_cap_bytes / sizeof(double));
+        cols = std::min(cols, std::max(64, cross_cap));
+    }
     if (cols >= 32) {
         cols = (cols / 32) * 32;
         if (cols < 32) cols = 32;
@@ -500,66 +636,47 @@ static size_t auto_cache_bytes(int cache_mb)
     return (size_t)cache_mb * 1024ULL * 1024ULL;
 }
 
-static void accum_logic_tile_self(PreparedPanelCache& cache,
-                                  int chr_global_start,
-                                  int local_start,
-                                  int local_end,
-                                  int panel_cols,
-                                  const double* annot_ptr,
-                                  int annot_ld,
-                                  double* ld_ptr,
-                                  int ld_ld,
-                                  int B,
-                                  int N_rows,
-                                  AlignedBuffer<double>& cross)
+static void accum_logic_tile_self_panels(int chr_global_start,
+                                         const std::vector<std::shared_ptr<PreparedPanel>>& panels,
+                                         const double* annot_ptr,
+                                         int annot_ld,
+                                         double* ld_ptr,
+                                         int ld_ld,
+                                         int B,
+                                         int N_rows,
+                                         AlignedBuffer<double>& cross)
 {
-    int rp_idx = 0;
-    for (int rp0 = local_start; rp0 < local_end; rp0 += panel_cols, ++rp_idx) {
-        if ((rp_idx & 7) == 0) check_for_interrupt();
-        const int rp1 = std::min(local_end, rp0 + panel_cols);
-        auto right = cache.get(chr_global_start + rp0, chr_global_start + rp1);
-
-        // Diagonal block: one pass updates this panel from itself.
-        accum_left_from_right_panel(chr_global_start, *right, *right,
-                                    annot_ptr, annot_ld, ld_ptr, ld_ld,
-                                    B, N_rows, cross);
-
-        // Strictly lower-triangular off-diagonal blocks: compute once and update both sides.
-        for (int lp0 = local_start; lp0 < rp0; lp0 += panel_cols) {
-            const int lp1 = std::min(local_end, lp0 + panel_cols);
-            auto left = cache.get(chr_global_start + lp0, chr_global_start + lp1);
-            accum_cross_panels(chr_global_start, *left, *right,
+    const int np = (int)panels.size();
+    for (int rp = 0; rp < np; ++rp) {
+        const auto& right = *panels[(size_t)rp];
+        accum_self_panel(chr_global_start, right,
+                         annot_ptr, annot_ld, ld_ptr, ld_ld,
+                         B, N_rows, cross);
+        for (int lp = 0; lp < rp; ++lp) {
+            const auto& left = *panels[(size_t)lp];
+            accum_cross_panels(chr_global_start, left, right,
                                annot_ptr, annot_ld, ld_ptr, ld_ld,
                                B, N_rows, cross);
         }
     }
 }
 
-static void accum_logic_tile_cross(PreparedPanelCache& cache,
-                                   int chr_global_start,
-                                   int left_local_start,
-                                   int left_local_end,
-                                   int right_local_start,
-                                   int right_local_end,
-                                   int panel_cols,
-                                   const double* annot_ptr,
-                                   int annot_ld,
-                                   double* ld_ptr,
-                                   int ld_ld,
-                                   int B,
-                                   int N_rows,
-                                   AlignedBuffer<double>& cross)
+static void accum_logic_tile_cross_panels(int chr_global_start,
+                                          const std::vector<std::shared_ptr<PreparedPanel>>& left_panels,
+                                          const std::vector<std::shared_ptr<PreparedPanel>>& right_panels,
+                                          const double* annot_ptr,
+                                          int annot_ld,
+                                          double* ld_ptr,
+                                          int ld_ld,
+                                          int B,
+                                          int N_rows,
+                                          AlignedBuffer<double>& cross)
 {
-    if (left_local_start >= left_local_end || right_local_start >= right_local_end) return;
-    int rp_idx = 0;
-    for (int rp0 = right_local_start; rp0 < right_local_end; rp0 += panel_cols, ++rp_idx) {
-        if ((rp_idx & 7) == 0) check_for_interrupt();
-        const int rp1 = std::min(right_local_end, rp0 + panel_cols);
-        auto right = cache.get(chr_global_start + rp0, chr_global_start + rp1);
-        for (int lp0 = left_local_start; lp0 < left_local_end; lp0 += panel_cols) {
-            const int lp1 = std::min(left_local_end, lp0 + panel_cols);
-            auto left = cache.get(chr_global_start + lp0, chr_global_start + lp1);
-            accum_cross_panels(chr_global_start, *left, *right,
+    for (const auto& right_sp : right_panels) {
+        const auto& right = *right_sp;
+        for (const auto& left_sp : left_panels) {
+            const auto& left = *left_sp;
+            accum_cross_panels(chr_global_start, left, right,
                                annot_ptr, annot_ld, ld_ptr, ld_ld,
                                B, N_rows, cross);
         }
@@ -584,16 +701,16 @@ static void accum_all_pairs_interval(PreparedPanelCache& cache,
         check_for_interrupt();
         const int t0 = t * logic_chunk_size;
         const int t1 = std::min(interval_len, t0 + logic_chunk_size);
-        accum_logic_tile_self(cache, chr_global_start, t0, t1, panel_cols,
-                              annot_ptr, annot_ld, ld_ptr, ld_ld, B, N_rows, cross);
+        auto t_panels = load_interval_panels(cache, chr_global_start, t0, t1, panel_cols);
+        accum_logic_tile_self_panels(chr_global_start, t_panels,
+                                     annot_ptr, annot_ld, ld_ptr, ld_ld, B, N_rows, cross);
         for (int a = 0; a < t; ++a) {
             const int a0 = a * logic_chunk_size;
             const int a1 = std::min(interval_len, a0 + logic_chunk_size);
-            accum_logic_tile_cross(cache, chr_global_start,
-                                   a0, a1,
-                                   t0, t1,
-                                   panel_cols,
-                                   annot_ptr, annot_ld, ld_ptr, ld_ld, B, N_rows, cross);
+            auto a_panels = load_interval_panels(cache, chr_global_start, a0, a1, panel_cols);
+            accum_logic_tile_cross_panels(chr_global_start,
+                                          a_panels, t_panels,
+                                          annot_ptr, annot_ld, ld_ptr, ld_ld, B, N_rows, cross);
         }
         progress_step();
     }
@@ -719,21 +836,19 @@ static nb_numpy_mat2f<double> compute_windowed_ld_chr_impl(
         check_for_interrupt();
         const int t0 = t * chunk_size;
         const int t1 = std::min(m, t0 + chunk_size);
+        auto t_panels = load_interval_panels(cache, chr_start, t0, t1, panel_cols);
         const int left_tiles = block_sizes[(size_t) t0] / chunk_size;
         const int a_start_tile = std::max(0, t - left_tiles);
         for (int a = a_start_tile; a < t; ++a) {
             const int a0 = a * chunk_size;
             const int a1 = std::min(m, a0 + chunk_size);
-            accum_logic_tile_cross(cache, chr_start,
-                                   a0, a1,
-                                   t0, t1,
-                                   panel_cols,
-                                   annot_ptr, m, ld_ptr, m, B, N_rows, cross);
+            auto a_panels = load_interval_panels(cache, chr_start, a0, a1, panel_cols);
+            accum_logic_tile_cross_panels(chr_start,
+                                          a_panels, t_panels,
+                                          annot_ptr, m, ld_ptr, m, B, N_rows, cross);
         }
-        accum_logic_tile_self(cache, chr_start,
-                              t0, t1,
-                              panel_cols,
-                              annot_ptr, m, ld_ptr, m, B, N_rows, cross);
+        accum_logic_tile_self_panels(chr_start, t_panels,
+                                     annot_ptr, m, ld_ptr, m, B, N_rows, cross);
         progress_step();
     }
 

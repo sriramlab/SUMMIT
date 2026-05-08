@@ -1,0 +1,735 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+from pathlib import Path
+import time
+
+import numpy as np
+import pandas as pd
+
+from .. import utils
+from ..inference.h2core import (
+    H2Prepared,
+    fit_h2,
+    _has_overlapping_annotations,
+    _stack_delete_replicates as _stack_h2,
+    _symmetrize_with_design as _sym_h2,
+)
+from ..inference.jackknife import JackknifeDesign, JackknifeSpec
+from ..sumstats.moments import exact_score_z_from_arrays, effective_n_scale
+from ..inference.rgcore import (
+    RGPrepared,
+    InterceptFit,
+    RGResultWriter,
+    build_manifest_summary_row,
+    fit_rg,
+    _stack_delete_replicates as _stack_rg,
+    _symmetrize_with_design as _sym_rg,
+)
+from ..sumstats.sumstats import MatchedSumstats, Sumstats
+from ..inference.trace import Trace
+
+
+@dataclass
+class _FastTrait:
+    phen: str
+    spath: str
+    sumstats: Sumstats
+    keep: np.ndarray
+    drop_idx: np.ndarray
+    z_h2: np.ndarray
+    z_rg: np.ndarray
+    h2_ay_unit: np.ndarray
+    matched_stub: MatchedSumstats
+
+
+@dataclass
+class _StructUnitStats:
+    m: np.ndarray
+    Ak: np.ndarray
+    Ak2: np.ndarray
+    AA: np.ndarray
+    AL: np.ndarray
+
+
+class _FastTraceView:
+    def __init__(self, *, nsnps: int, nbins: int, annot_header):
+        self._nsnps = int(nsnps)
+        self._nbins = int(nbins)
+        self.annot_header = annot_header
+        self.kmoments = None
+        self.kmoments_valid = False
+
+    @property
+    def nsnps(self) -> int:
+        return self._nsnps
+
+    @property
+    def nbins(self) -> int:
+        return self._nbins
+
+
+def _log(log, msg: str):
+    if log is not None:
+        log._log(msg)
+
+
+def _write_fast_pair_log(
+    pair_prefix: str,
+    *,
+    phen1: str,
+    phen2: str,
+    annot_header,
+    h2_fit1,
+    h2_fit2,
+    intercept,
+    rg_fit,
+    runtime_s: float,
+):
+    lines: list[str] = []
+
+    def add(msg: str):
+        lines.append(msg)
+
+    add(f"[rg:manifest:fast] pair: {phen1} vs {phen2}")
+
+    km_info = getattr(rg_fit, "kmoment_info", None)
+    if km_info is not None:
+        add(
+            "[rg:kmom] "
+            f"single-component model-based SE used; "
+            f"moment_source={km_info.get('moment_source', 'NA')}, "
+            f"alpha_probe={km_info.get('alpha_probe', np.nan):.6g}, "
+            f"alpha_probe_err={km_info.get('alpha_probe_err', np.nan):.3e}, "
+            f"delta_reff={km_info.get('delta_reff', np.nan):.6g}, "
+            f"var_gamma={km_info.get('var_gamma', np.nan):.6g}"
+        )
+
+    for name, fit in ((phen1, h2_fit1), (phen2, h2_fit2)):
+        if fit.enrich_mode_used:
+            add(f"^^^ Phenotype [{name}] enrichment_mode_used: {fit.enrich_mode_used}")
+
+        if len(annot_header) > 1:
+            for j, header in enumerate(annot_header):
+                line = (
+                    f"^^^ Phenotype [{name}] Bin [{header}] "
+                    f"sigma_g^2: {fit.sigmas[j, 0]:.6g} (SE: {fit.sigmas[j, 1]:.6g}) "
+                    f"h^2_cat: {fit.h2[j, 0]:.6g} (SE: {fit.h2[j, 1]:.6g}) "
+                    f"Enrichment: {fit.enrich[j, 0]:.6g} (SE: {fit.enrich[j, 1]:.6g})"
+                )
+                if fit.enrich_nonoverlap is not None and fit.enrich_overlap is not None:
+                    line += (
+                        f" Enrichment_nonoverlap: {fit.enrich_nonoverlap[j, 0]:.6g} "
+                        f"(SE: {fit.enrich_nonoverlap[j, 1]:.6g})"
+                        f" Enrichment_overlap: {fit.enrich_overlap[j, 0]:.6g} "
+                        f"(SE: {fit.enrich_overlap[j, 1]:.6g})"
+                    )
+                if fit.tau is not None and fit.tau_star is not None:
+                    line += (
+                        f" tau: {fit.tau[j, 0]:.6g} (SE: {fit.tau[j, 1]:.6g})"
+                        f" tau_*: {fit.tau_star[j, 0]:.6g} (SE: {fit.tau_star[j, 1]:.6g})"
+                    )
+                add(line)
+
+        add(
+            f"^^^ Phenotype [{name}] Total SNP heritability (h^2): "
+            f"{fit.h2[-1, 0]:.6g} SE: {fit.h2[-1, 1]:.6g}"
+        )
+
+    add(
+        f"^^^ Phenotype [{phen1}] & [{phen2}] "
+        f"Intercept (c): {intercept.c[0]:.9g} (SE: {intercept.c[1]:.6g})"
+    )
+
+    for j, header in enumerate(annot_header):
+        add(
+            f"^^^ Phenotype [{phen1}] & [{phen2}] Bin [{header}] "
+            f"gamma_g: {rg_fit.gamma[j, 0]:.6g} (SE: {rg_fit.gamma[j, 1]:.6g}) "
+            f"rg: {rg_fit.rg[j, 0]:.6g} (SE: {rg_fit.rg[j, 1]:.6g})"
+        )
+
+    add(
+        f"^^^ Phenotype [{phen1}] & [{phen2}] "
+        f"Total genetic covariance (gamma_g): {rg_fit.gamma_total[0]:.6g} "
+        f"(SE: {rg_fit.gamma_total[1]:.6g})"
+    )
+    add(
+        f"^^^ Phenotype [{phen1}] & [{phen2}] "
+        f"Total genetic correlation (rg): {rg_fit.rg_total[0]:.6g} "
+        f"(SE: {rg_fit.rg_total[1]:.6g})"
+    )
+
+    end_time = utils._get_time()
+    add("Analysis ended at: " + utils._get_timestr(end_time))
+    add("run time: " + format(float(runtime_s), ".3f") + " s")
+    add("Saved log in " + pair_prefix + ".log")
+
+    with open(pair_prefix + ".log", "w") as fd:
+        for line in lines:
+            fd.write(line + "\n")
+
+
+def _full_axis_sumstats_arrays(entry, trace) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    aligned = entry.aligned
+    ss = entry.sumstats
+    pos = np.asarray(aligned.pos_on_trace, dtype=np.int64)
+    M = int(trace.nsnps)
+
+    beta = np.full(M, np.nan, dtype=np.float64)
+    se = np.full(M, np.nan, dtype=np.float64)
+    n = np.full(M, np.nan, dtype=np.float64)
+
+    matched = pos >= 0
+    if np.any(matched):
+        p = pos[matched]
+        beta[matched] = ss.beta[p]
+        se[matched] = ss.se[p]
+        n[matched] = ss.n[p]
+
+    return beta, se, n
+
+
+def _make_matched_stub(trace, trait: Sumstats, keep: np.ndarray) -> MatchedSumstats:
+    # The fast path constructs prepared normal equations directly.  The fitters
+    # only need matched metadata, but keep a coherent active SNP stub for writers.
+    return MatchedSumstats(
+        snps=trace.snps[keep],
+        z=np.zeros(int(np.sum(keep)), dtype=np.float64),
+        chi2=np.zeros(int(np.sum(keep)), dtype=np.float64),
+        beta=np.zeros(int(np.sum(keep)), dtype=np.float64),
+        se=np.ones(int(np.sum(keep)), dtype=np.float64),
+        n=np.full(int(np.sum(keep)), float(trait.nsamp), dtype=np.float64),
+        a1=np.full(int(np.sum(keep)), "", dtype=str),
+        a2=np.full(int(np.sum(keep)), "", dtype=str),
+        nsamp=float(trait.nsamp),
+        n_scale=float(trait.n_scale),
+        cov_rank=int(trait.cov_rank),
+        cov_rank_source=str(trait.cov_rank_source),
+        name=str(trait.name),
+        used_summary=None,
+        used_top=None,
+    )
+
+
+def _compute_struct_unit_stats(A: np.ndarray, L: np.ndarray, jk: JackknifeDesign, *, log=None) -> _StructUnitStats:
+    U = int(jk.nunit)
+    K = int(A.shape[1])
+    m = np.zeros(U, dtype=np.float64)
+    Ak = np.zeros((U, K), dtype=np.float64)
+    Ak2 = np.zeros((U, K), dtype=np.float64)
+    AA = np.zeros((U, K, K), dtype=np.float64)
+    AL = np.zeros((U, K, K), dtype=np.float64)
+
+    t0 = time.time()
+    for u, (s, e) in enumerate(zip(jk.starts, jk.ends)):
+        s = int(s)
+        e = int(e)
+        if e <= s:
+            continue
+        Au = A[s:e, :]
+        Lu = L[s:e, :]
+        m[u] = float(e - s)
+        Ak[u] = Au.sum(axis=0, dtype=np.float64)
+        Ak2[u] = (Au * Au).sum(axis=0, dtype=np.float64)
+        AA[u] = Au.T @ Au
+        AL[u] = Au.T @ Lu
+    _log(log, f"[rg:manifest:fast] precomputed full block structural stats in {time.time() - t0:.3f}s.")
+    return _StructUnitStats(m=m, Ak=Ak, Ak2=Ak2, AA=AA, AL=AL)
+
+
+def _row_struct_correction(A: np.ndarray, L: np.ndarray, idx: np.ndarray, unit_id: np.ndarray, U: int, K: int) -> _StructUnitStats:
+    m = np.zeros(U, dtype=np.float64)
+    Ak = np.zeros((U, K), dtype=np.float64)
+    Ak2 = np.zeros((U, K), dtype=np.float64)
+    AA = np.zeros((U, K, K), dtype=np.float64)
+    AL = np.zeros((U, K, K), dtype=np.float64)
+    idx = np.asarray(idx, dtype=np.int64)
+    if idx.size == 0:
+        return _StructUnitStats(m=m, Ak=Ak, Ak2=Ak2, AA=AA, AL=AL)
+
+    uids = np.asarray(unit_id[idx], dtype=np.int64)
+    for u in np.unique(uids):
+        rows = idx[uids == u]
+        Au = A[rows, :]
+        Lu = L[rows, :]
+        m[u] = float(rows.size)
+        Ak[u] = Au.sum(axis=0, dtype=np.float64)
+        Ak2[u] = (Au * Au).sum(axis=0, dtype=np.float64)
+        AA[u] = Au.T @ Au
+        AL[u] = Au.T @ Lu
+    return _StructUnitStats(m=m, Ak=Ak, Ak2=Ak2, AA=AA, AL=AL)
+
+
+def _row_ay_correction(A: np.ndarray, y: np.ndarray, idx: np.ndarray, unit_id: np.ndarray, U: int, K: int) -> np.ndarray:
+    out = np.zeros((U, K), dtype=np.float64)
+    idx = np.asarray(idx, dtype=np.int64)
+    if idx.size == 0:
+        return out
+    uids = np.asarray(unit_id[idx], dtype=np.int64)
+    for u in np.unique(uids):
+        rows = idx[uids == u]
+        out[u] = A[rows, :].T @ y[rows]
+    return out
+
+
+def _stack_h2_prepared(
+    *,
+    fast_tv,
+    matched,
+    jk,
+    active_mask,
+    has_overlap,
+    struct: _StructUnitStats,
+    Ay_unit: np.ndarray,
+    n_scale: float,
+    summary_y_info: dict,
+    y: np.ndarray,
+    enrich_mode: str,
+    report_tau: bool,
+    allow_neg_enr: bool,
+    clip_nonfinite_vals: bool,
+    jack_mode: str,
+) :
+    R = int(jk.nrep)
+    K = int(fast_tv.nbins)
+
+    M_full = float(struct.m.sum())
+    M_rep = _stack_h2(np.array(M_full, dtype=np.float64), struct.m, jk.D).reshape(R + 1)
+    Ak_rep = _stack_h2(struct.Ak.sum(axis=0), struct.Ak, jk.D)
+    Ay_rep = _stack_h2(Ay_unit.sum(axis=0), Ay_unit, jk.D)
+    Ak2_rep = _stack_h2(struct.Ak2.sum(axis=0), struct.Ak2, jk.D)
+    AA_rep = _stack_h2(struct.AA.sum(axis=0), struct.AA, jk.D)
+    AL_rep = _stack_h2(struct.AL.sum(axis=0), struct.AL, jk.D)
+
+    Ak_full = np.asarray(Ak_rep[-1], dtype=np.float64)
+    M_k = Ak_rep[:, :, None]
+    M_l = np.broadcast_to(Ak_full[None, :], Ak_rep.shape)[:, None, :]
+    trace_KK = utils._calc_trace_from_ld_batch(AL_rep, n_scale, M_k, M_l, delta=None)
+    unit_sizes = jk.unit_sizes(active_mask=active_mask, dtype=np.float64)
+    trace_KK = _sym_h2(trace_KK, jk, unit_sizes)
+
+    lhs = np.full((R + 1, K + 1, K + 1), n_scale, dtype=np.float64)
+    lhs[:, :K, :K] = trace_KK
+    lhs[:, K, K] = n_scale
+
+    rhs = np.full((R + 1, K + 1), n_scale, dtype=np.float64)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        rhs[:, :K] = (Ay_rep * n_scale) / Ak_rep
+    bad_rhs = (~np.isfinite(rhs[:, :K])) | (~np.isfinite(Ak_rep)) | (Ak_rep <= 0.0)
+    rhs[:, :K][bad_rhs] = np.nan
+
+    prepared = H2Prepared(
+        trace_view=fast_tv,
+        matched=matched,
+        jackknife=jk,
+        active_mask=active_mask,
+        has_overlap=has_overlap,
+        unit_sizes=unit_sizes,
+        n_scale=float(n_scale),
+        summary_y_info=summary_y_info,
+        y=y,
+        m_unit=struct.m,
+        Ak_unit=struct.Ak,
+        Ay_unit=Ay_unit,
+        Ak2_unit=struct.Ak2,
+        AA_unit=struct.AA,
+        AL_unit=struct.AL,
+        M_rep=M_rep,
+        Ak_rep=Ak_rep,
+        Ay_rep=Ay_rep,
+        Ak2_rep=Ak2_rep,
+        AA_rep=AA_rep,
+        AL_rep=AL_rep,
+        lhs=lhs,
+        rhs=rhs,
+    )
+    return fit_h2(
+        prepared,
+        enrich_mode=enrich_mode,
+        report_tau=report_tau,
+        allow_neg_enr=allow_neg_enr,
+        clip_nonfinite_vals=clip_nonfinite_vals,
+        jack_mode=jack_mode,
+        nan_policy=("propagate" if clip_nonfinite_vals else "omit"),
+    )
+
+
+def _stack_rg_prepared(
+    *,
+    fast_tv,
+    matched1,
+    matched2,
+    jk,
+    active_mask,
+    struct: _StructUnitStats,
+    Ay_unit: np.ndarray,
+    n1_scale: float,
+    n2_scale: float,
+    summary_y_info: dict,
+    y: np.ndarray,
+):
+    R = int(jk.nrep)
+    Ak_rep = _stack_rg(struct.Ak.sum(axis=0), struct.Ak, jk.D)
+    Ay_rep = _stack_rg(Ay_unit.sum(axis=0), Ay_unit, jk.D)
+    AL_rep = _stack_rg(struct.AL.sum(axis=0), struct.AL, jk.D)
+
+    Ak_full = np.asarray(Ak_rep[-1], dtype=np.float64)
+    M_k = Ak_rep[:, :, None]
+    M_l = np.broadcast_to(Ak_full[None, :], Ak_rep.shape)[:, None, :]
+    lhs = utils._calc_rg_trace_from_ld_batch(AL_rep, n1_scale, n2_scale, M_k, M_l)
+    unit_sizes = jk.unit_sizes(active_mask=active_mask, dtype=np.float64)
+    lhs = _sym_rg(lhs, jk, unit_sizes)
+
+    return RGPrepared(
+        trace_view=fast_tv,
+        matched1=matched1,
+        matched2=matched2,
+        jackknife=jk,
+        active_mask=active_mask,
+        unit_sizes=unit_sizes,
+        y=y,
+        n1_scale=float(n1_scale),
+        n2_scale=float(n2_scale),
+        summary_y_info=summary_y_info,
+        Ak_unit=struct.Ak,
+        Ay_unit=Ay_unit,
+        AL_unit=struct.AL,
+        Ak_rep=Ak_rep,
+        Ay_rep=Ay_rep,
+        AL_rep=AL_rep,
+        lhs=lhs,
+    )
+
+
+def _build_fast_traits(
+    trait_meta,
+    shared_trace,
+    full_tv,
+    jk: JackknifeDesign,
+    A: np.ndarray,
+    args,
+    log,
+    verbose_level: int,
+) -> dict[str, _FastTrait]:
+    M = int(shared_trace.nsnps)
+    U = int(jk.nunit)
+    K = int(full_tv.nbins)
+
+    traits = {}
+    paths = sorted(trait_meta.keys())
+    t0_all = time.time()
+    for spath in paths:
+        meta = trait_meta[spath]
+        cov_rank = meta.get("cov_rank", None)
+        phen = meta.get("phen", utils._phen_name_from_path(spath))
+        t0 = time.time()
+        ss = Sumstats.from_file(
+            spath,
+            name=phen,
+            log=log,
+            cov_rank=cov_rank,
+            cov_rank_source=("manifest" if cov_rank is not None else None),
+            compute_diagnostics=(verbose_level >= 1),
+        )
+        aligned = ss.align_to_trace(shared_trace)
+        keep = aligned.keep_mask(
+            chisq_threshold=args.max_chisq,
+            chisq_action=args.chisq_action,
+        )
+        keep = np.asarray(keep, dtype=bool)
+        beta, se, n = _full_axis_sumstats_arrays(type("Entry", (), {"aligned": aligned, "sumstats": ss}), shared_trace)
+        z_h2 = exact_score_z_from_arrays(beta, se, n, nsamp=float(ss.nsamp), cov_rank=0)
+        z_rg = exact_score_z_from_arrays(beta, se, n, nsamp=float(ss.nsamp), cov_rank=int(ss.cov_rank))
+        z_h2[~keep] = 0.0
+        z_rg[~keep] = 0.0
+        z_h2[~np.isfinite(z_h2)] = 0.0
+        z_rg[~np.isfinite(z_rg)] = 0.0
+
+        y_h2 = z_h2 * z_h2
+        h2_ay_unit = np.zeros((U, K), dtype=np.float64)
+        for u, (s, e) in enumerate(zip(jk.starts, jk.ends)):
+            s = int(s)
+            e = int(e)
+            if e <= s:
+                continue
+            h2_ay_unit[u] = A[s:e, :].T @ y_h2[s:e]
+
+        traits[spath] = _FastTrait(
+            phen=str(phen),
+            spath=str(spath),
+            sumstats=ss,
+            keep=keep,
+            drop_idx=np.flatnonzero(~keep).astype(np.int64),
+            z_h2=z_h2,
+            z_rg=z_rg,
+            h2_ay_unit=h2_ay_unit,
+            matched_stub=_make_matched_stub(shared_trace, ss, keep),
+        )
+        _log(
+            log,
+            f"[rg:manifest:fast] cached trait '{phen}' in {time.time() - t0:.3f}s; "
+            f"kept={int(np.sum(keep))}/{M}, dropped={int(np.sum(~keep))}."
+        )
+    _log(log, f"[rg:manifest:fast] cached {len(traits)} trait(s) in {time.time() - t0_all:.3f}s.")
+    return traits
+
+
+def dispatch_rg_manifest_fast(args, log, manifest_df, trait_meta, verbose_level: int):
+    if args.align_alleles:
+        raise ValueError("--rg-manifest-fast currently does not support --align-alleles.")
+    if str(args.rg_se_method).strip().lower() != "jackknife":
+        raise ValueError("--rg-manifest-fast currently supports --rg-se-method jackknife only.")
+    if args.adjust_delta:
+        raise ValueError("--rg-manifest-fast currently does not support --adjust-delta.")
+    parsed_write_jack, parsed_write_normeq = utils._parse_verbose_outputs(args.verbose)
+    write_jack = bool(args.write_jack) or bool(parsed_write_jack)
+    write_normeq = bool(args.write_normeq) or bool(parsed_write_normeq)
+    if write_normeq:
+        raise ValueError("--rg-manifest-fast currently does not support normeq dumps.")
+
+    outdir = Path(args.out)
+    outdir.mkdir(parents=True, exist_ok=True)
+    jk_spec = JackknifeSpec.parse(args.njack)
+
+    if jk_spec.mode == "block":
+        # TODO: Replace this warning-only path with an exact post-drop contiguous
+        # jackknife implementation for fast manifest rg without discarding the
+        # current shared-cache amortization.
+        _log(
+            log,
+            "[rg:manifest:fast] WARNING: contiguous block jackknife in fast manifest mode "
+            "currently uses pre-drop blocks on the shared Trace axis for efficiency. "
+            "This can inflate SE estimates relative to exact post-drop blocking. "
+            "Recommended: use --njack chr (or chr:d) for fast manifest rg.",
+        )
+
+    shared_trace = Trace(
+        bimpath=args.bim,
+        sumpath=None,
+        savepath=None,
+        log=log,
+        ldscores=args.ldscores,
+        ldscores_reg=args.ldscores_reg,
+        ldscores_reg_w=args.ldscores_reg_w,
+        annot=args.annot,
+        verbose=bool(verbose_level),
+        delta=None,
+    )
+    full_tv = shared_trace.materialize_view()
+    fast_tv = _FastTraceView(
+        nsnps=int(full_tv.nsnps),
+        nbins=int(full_tv.nbins),
+        annot_header=full_tv.annot_header,
+    )
+    jk = JackknifeDesign.from_trace_view(full_tv, jk_spec, log=log)
+    A = np.asarray(full_tv.annot, dtype=np.float64, order="C")
+    L = np.asarray(full_tv.ldscores, dtype=np.float64, order="C")
+    U = int(jk.nunit)
+    K = int(full_tv.nbins)
+    unit_id = np.asarray(jk.unit_id, dtype=np.int64)
+    has_overlap = _has_overlapping_annotations(A)
+
+    traits = _build_fast_traits(
+        trait_meta,
+        shared_trace,
+        full_tv,
+        jk,
+        A,
+        args,
+        log,
+        verbose_level,
+    )
+    full_struct = _compute_struct_unit_stats(A, L, jk, log=log)
+
+    rows_by_anchor = {}
+    for pos, row in enumerate(manifest_df.itertuples(index=False)):
+        rows_by_anchor.setdefault(row.sumstats1, []).append((pos, row))
+
+    results = [None] * int(manifest_df.shape[0])
+    t0_all = time.time()
+    completed = 0
+    for anchor_path, row_items in rows_by_anchor.items():
+        anchor = traits[anchor_path]
+        partner_paths = [row.sumstats2 for _, row in row_items]
+        partners = [traits[p] for p in partner_paths]
+        P = len(partners)
+        _log(log, f"[rg:manifest:fast] processing anchor '{anchor.phen}' with {P} partner pair(s).")
+
+        ay_rg = np.zeros((U, K, P), dtype=np.float64)
+        for u, (s, e) in enumerate(zip(jk.starts, jk.ends)):
+            s = int(s)
+            e = int(e)
+            if e <= s:
+                continue
+            Zi = anchor.z_rg[s:e]
+            Zp = np.column_stack([p.z_rg[s:e] for p in partners])
+            Y = Zi[:, None] * Zp
+            ay_rg[u] = A[s:e, :].T @ Y
+
+        for pidx, (row_pos, row) in enumerate(row_items):
+            t0_pair = time.time()
+            tr1 = anchor
+            tr2 = partners[pidx]
+            pair_keep = tr1.keep & tr2.keep
+            pair_drop = np.flatnonzero(~pair_keep).astype(np.int64)
+            active_n = int(np.sum(pair_keep))
+            if active_n <= 0:
+                raise RuntimeError(f"No SNPs remain for pair {row.phen1} vs {row.phen2}.")
+
+            corr = _row_struct_correction(A, L, pair_drop, unit_id, U, K)
+            struct = _StructUnitStats(
+                m=full_struct.m - corr.m,
+                Ak=full_struct.Ak - corr.Ak,
+                Ak2=full_struct.Ak2 - corr.Ak2,
+                AA=full_struct.AA - corr.AA,
+                AL=full_struct.AL - corr.AL,
+            )
+
+            drop2_for_1 = np.flatnonzero(tr1.keep & ~tr2.keep).astype(np.int64)
+            ay1 = tr1.h2_ay_unit - _row_ay_correction(A, tr1.z_h2 * tr1.z_h2, drop2_for_1, unit_id, U, K)
+            drop1_for_2 = np.flatnonzero(tr2.keep & ~tr1.keep).astype(np.int64)
+            ay2 = tr2.h2_ay_unit - _row_ay_correction(A, tr2.z_h2 * tr2.z_h2, drop1_for_2, unit_id, U, K)
+
+            h2_info1 = {
+                "mode": "beta_se_exact",
+                "cov_rank": 0,
+                "cov_rank_source": "forced0_no_covrank_h2",
+                "n_scale": float(effective_n_scale(tr1.sumstats.nsamp, 0)),
+                "n_nonfinite": 0,
+            }
+            h2_info2 = {
+                "mode": "beta_se_exact",
+                "cov_rank": 0,
+                "cov_rank_source": "forced0_no_covrank_h2",
+                "n_scale": float(effective_n_scale(tr2.sumstats.nsamp, 0)),
+                "n_nonfinite": 0,
+            }
+            h2_fit1 = _stack_h2_prepared(
+                fast_tv=fast_tv,
+                matched=tr1.matched_stub,
+                jk=jk,
+                active_mask=pair_keep,
+                has_overlap=has_overlap,
+                struct=struct,
+                Ay_unit=ay1,
+                n_scale=h2_info1["n_scale"],
+                summary_y_info=h2_info1,
+                y=np.array([], dtype=np.float64),
+                enrich_mode=args.enrich_mode,
+                report_tau=True,
+                allow_neg_enr=args.allow_neg_enr,
+                clip_nonfinite_vals=args.clip_nonfinite_vals,
+                jack_mode=args.jack_mode,
+            )
+            h2_fit2 = _stack_h2_prepared(
+                fast_tv=fast_tv,
+                matched=tr2.matched_stub,
+                jk=jk,
+                active_mask=pair_keep,
+                has_overlap=has_overlap,
+                struct=struct,
+                Ay_unit=ay2,
+                n_scale=h2_info2["n_scale"],
+                summary_y_info=h2_info2,
+                y=np.array([], dtype=np.float64),
+                enrich_mode=args.enrich_mode,
+                report_tau=True,
+                allow_neg_enr=args.allow_neg_enr,
+                clip_nonfinite_vals=args.clip_nonfinite_vals,
+                jack_mode=args.jack_mode,
+            )
+
+            rg_info = {
+                "mode": "beta_se_exact",
+                "trait1_cov_rank": int(tr1.sumstats.cov_rank),
+                "trait1_cov_rank_source": str(tr1.sumstats.cov_rank_source),
+                "trait1_n_scale": float(tr1.sumstats.n_scale),
+                "trait2_cov_rank": int(tr2.sumstats.cov_rank),
+                "trait2_cov_rank_source": str(tr2.sumstats.cov_rank_source),
+                "trait2_n_scale": float(tr2.sumstats.n_scale),
+                "n_nonfinite": 0,
+            }
+            rg_prepared = _stack_rg_prepared(
+                fast_tv=fast_tv,
+                matched1=tr1.matched_stub,
+                matched2=tr2.matched_stub,
+                jk=jk,
+                active_mask=pair_keep,
+                struct=struct,
+                Ay_unit=ay_rg[:, :, pidx],
+                n1_scale=float(tr1.sumstats.n_scale),
+                n2_scale=float(tr2.sumstats.n_scale),
+                summary_y_info=rg_info,
+                y=np.array([], dtype=np.float64),
+            )
+
+            c = float(row.intercept_rg)
+            intercept = InterceptFit(
+                trace_view=fast_tv,
+                matched1=tr1.matched_stub,
+                matched2=tr2.matched_stub,
+                jackknife=jk,
+                active_mask=pair_keep,
+                unit_sizes=jk.unit_sizes(active_mask=pair_keep, dtype=np.float64),
+                ld=np.array([], dtype=np.float64),
+                y=np.array([], dtype=np.float64),
+                c_reps=np.full(jk.nrep + 1, c, dtype=np.float64),
+                c=np.array([c, 0.0], dtype=np.float64),
+                info={"fixed": True, "source": "manifest", "summary_y_mode": "beta_se_exact"},
+            )
+            rg_fit = fit_rg(
+                rg_prepared,
+                h2_fit1,
+                h2_fit2,
+                intercept,
+                rg_se_method=args.rg_se_method,
+                jack_mode=args.jack_mode,
+                nan_policy=("propagate" if args.clip_nonfinite_vals else "omit"),
+            )
+
+            pair_prefix = str(outdir / row.out_stem)
+            _write_fast_pair_log(
+                pair_prefix,
+                phen1=row.phen1,
+                phen2=row.phen2,
+                annot_header=fast_tv.annot_header,
+                h2_fit1=h2_fit1,
+                h2_fit2=h2_fit2,
+                intercept=intercept,
+                rg_fit=rg_fit,
+                runtime_s=(time.time() - t0_pair),
+            )
+            if write_jack:
+                jack_path = pair_prefix + ".rg.jack"
+                RGResultWriter.save_jackknife_text(rg_fit, jack_path)
+                _log(log, f"[rg:manifest:fast] saved rg jackknife replicate dump to {jack_path}")
+            results[row_pos] = build_manifest_summary_row(
+                phen1=row.phen1,
+                phen2=row.phen2,
+                sumstats1=row.sumstats1,
+                sumstats2=row.sumstats2,
+                cov_rank1=row.cov_rank1,
+                cov_rank2=row.cov_rank2,
+                intercept_rg_input=row.intercept_rg,
+                out_prefix=pair_prefix,
+                n_snps=active_n,
+                annot_header=fast_tv.annot_header,
+                h2_fit1=h2_fit1,
+                h2_fit2=h2_fit2,
+                intercept=intercept,
+                rg_fit=rg_fit,
+            )
+            completed += 1
+            if completed == 1 or completed % 25 == 0 or completed == int(manifest_df.shape[0]):
+                _log(
+                    log,
+                    f"[rg:manifest:fast] completed {completed}/{manifest_df.shape[0]} pair(s); "
+                    f"latest {row.phen1} vs {row.phen2}: rg={float(rg_fit.rg_total[0]):.6g} "
+                    f"(SE {float(rg_fit.rg_total[1]):.6g})."
+                )
+
+    out = pd.DataFrame(results)
+    summary_path = outdir / "manifest.results.tsv"
+    out.to_csv(summary_path, sep="\t", index=False)
+    _log(log, f"[rg:manifest:fast] saved batch summary to {summary_path}")
+    _log(log, f"[rg:manifest:fast] total fast manifest runtime after Trace load: {time.time() - t0_all:.3f}s.")

@@ -4,9 +4,9 @@ from dataclasses import dataclass
 
 import numpy as np
 import pandas as pd
-import utils
+from .. import utils
 
-from moments import resolve_cov_rank, effective_n_scale, derived_wald_z
+from .moments import resolve_cov_rank, effective_n_scale, derived_wald_z
 
 
 _CHI2_MEDIAN_1DF = 0.454936423119572
@@ -218,6 +218,66 @@ class AlignedSumstats:
             clip_threshold=clip_threshold,
         )
 
+    def diagnostics_for_keep(
+        self,
+        keep_mask,
+        *,
+        chisq_threshold=None,
+        chisq_action="drop",
+        compute_diagnostics: bool = True,
+        topk: int = 10,
+    ):
+        keep_mask = np.asarray(keep_mask, dtype=bool)
+        if keep_mask.ndim != 1 or keep_mask.size != self.trace.nsnps:
+            raise ValueError(
+                f"keep_mask must be length {self.trace.nsnps}; got {keep_mask.shape}."
+            )
+
+        pos = self.pos_on_trace[keep_mask]
+        if np.any(pos < 0):
+            raise ValueError("keep_mask includes SNPs that are absent from the sumstats.")
+
+        action = str(chisq_action).strip().lower()
+        if action not in ("drop", "clip", "warn", "none"):
+            raise ValueError(f"Invalid chisq_action={chisq_action!r}")
+
+        chi2 = self.sumstats.chi2[pos].astype(np.float64, copy=True)
+        thr, _ = utils._resolve_chisq_threshold(self.sumstats.n_scale, chisq_threshold)
+        clip_count = 0
+        clip_threshold = None
+        if action == "clip" and thr is not None and np.isfinite(float(thr)) and float(thr) > 0.0:
+            thr = float(thr)
+            clip_threshold = thr
+            clip_mask = np.isfinite(chi2) & (chi2 > thr)
+            clip_count = int(np.sum(clip_mask))
+            if clip_count > 0:
+                np.minimum(chi2, thr, out=chi2)
+
+        if not compute_diagnostics:
+            return None, None, clip_count, clip_threshold
+
+        used_summary = _chisq_summary(chi2)
+
+        used_top = []
+        finite = np.isfinite(chi2)
+        if topk > 0 and finite.any():
+            idx = np.where(finite)[0]
+            x = chi2[finite]
+            k = min(int(topk), x.size)
+            part = np.argpartition(-x, kth=k - 1)[:k]
+            best = part[np.argsort(-x[part])]
+            for t in best:
+                j = int(idx[t])
+                p = int(pos[j])
+                used_top.append((
+                    str(self.sumstats.snps[p]),
+                    str(self.sumstats.a1[p]),
+                    str(self.sumstats.a2[p]),
+                    float(chi2[j]),
+                ))
+
+        return used_summary, used_top, clip_count, clip_threshold
+
 
 class Sumstats:
     """
@@ -295,7 +355,16 @@ class Sumstats:
         cov_rank_source=None,
         compute_diagnostics: bool = True,
     ) -> "Sumstats":
-        hdr = pd.read_csv(path, sep=r"\s+", compression="infer", nrows=0)
+        if log is not None and utils._is_chr_split_spec(path):
+            paths = utils._resolve_chr_split_paths(path, require=True)
+            log._log(
+                f"[sumstats] [{name or path}] reading chromosome-split sumstats from "
+                f"{len(paths)} file(s): {utils._normalize_path_spec(path)}"
+            )
+
+        hdr = utils._read_csv_maybe_chr_split(
+            path, sep=r"\s+", compression="infer", nrows=0
+        )
         cols = list(hdr.columns)
 
         idcol = utils._parse_column_name(hdr, ["ID", "id", "snp", "SNP"], default_pos=0)
@@ -320,7 +389,7 @@ class Sumstats:
             usecols.append(covrankcol)
         usecols = list(dict.fromkeys(usecols))
 
-        df = pd.read_csv(
+        df = utils._read_csv_maybe_chr_split(
             path,
             sep=r"\s+",
             compression="infer",

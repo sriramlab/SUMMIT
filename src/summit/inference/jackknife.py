@@ -7,7 +7,7 @@ from typing import Literal
 
 import numpy as np
 
-import utils
+from .. import utils
 
 
 JackknifeMode = Literal["block", "chr"]
@@ -365,6 +365,70 @@ class JackknifeDesign:
             unit_labels=unit_labels,
             delete_sets=delete_sets,
             D=D,
+            starts=starts,
+            ends=ends,
+            nsnps=M,
+        )
+
+    def subset(self, keep_mask, log=None) -> "JackknifeDesign":
+        """
+        Restrict an existing reference-axis jackknife design to an active SNP set.
+
+        Unit labels and delete sets are preserved, so block membership is defined
+        before trait-specific SNP drops.  The returned design lives on the compact
+        active SNP axis used by the downstream h2/rg routines, with unit sizes
+        reflecting only active SNPs.
+        """
+        keep_mask = np.asarray(keep_mask, dtype=bool)
+        if keep_mask.ndim != 1 or keep_mask.size != self.nsnps:
+            raise ValueError(
+                f"keep_mask must be 1D with length {self.nsnps}; got {keep_mask.shape}."
+            )
+
+        active_unit_id = np.asarray(self.unit_id[keep_mask], dtype=np.int64)
+        M = int(active_unit_id.size)
+        if M <= 0:
+            raise ValueError("Cannot subset JackknifeDesign to an empty active SNP set.")
+
+        counts = np.bincount(active_unit_id, minlength=self.nunit).astype(np.int64, copy=False)
+        starts = np.empty(self.nunit, dtype=np.int64)
+        ends = np.empty(self.nunit, dtype=np.int64)
+        starts[0] = 0
+        if self.nunit > 1:
+            starts[1:] = np.cumsum(counts[:-1], dtype=np.int64)
+        ends[:] = np.cumsum(counts, dtype=np.int64)
+
+        # keep_mask preserves genomic order, so all active SNPs from each original
+        # contiguous unit remain contiguous on the compact active axis.
+        if active_unit_id.size > 1 and np.any(active_unit_id[1:] < active_unit_id[:-1]):
+            raise RuntimeError("Active jackknife unit ids are not sorted after subsetting.")
+
+        if log is not None:
+            nz = counts[counts > 0]
+            empty = int(np.sum(counts == 0))
+            if nz.size == 0:
+                raise RuntimeError("No non-empty jackknife units after subsetting.")
+            if self.mode == "block":
+                log._log(
+                    f"[jackknife] using {self.nunit} pre-drop contiguous block(s); "
+                    f"active SNP-count mean={nz.mean():.2f}, min={int(nz.min())}, "
+                    f"max={int(nz.max())}, empty={empty}"
+                )
+            else:
+                log._log(
+                    f"[jackknife] using pre-drop chromosome unit(s); "
+                    f"active SNP-count mean={nz.mean():.2f}, min={int(nz.min())}, "
+                    f"max={int(nz.max())}, empty={empty}"
+                )
+
+        return JackknifeDesign(
+            spec=self.spec,
+            nrep=self.nrep,
+            nunit=self.nunit,
+            unit_id=active_unit_id,
+            unit_labels=self.unit_labels,
+            delete_sets=self.delete_sets,
+            D=self.D,
             starts=starts,
             ends=ends,
             nsnps=M,

@@ -6,7 +6,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-import utils
+from .. import utils
 
 _META_COLS = {"CHR", "BP", "SNP", "CM"}
 
@@ -249,15 +249,32 @@ class Trace:
 
         full_keep = bool(np.all(keep_mask))
 
+        if full_keep:
+            snps = self.snps
+            chr_arr = self.chr
+            bp = self.bp
+            annot = self.annot
+            ldscores = self.ldscores
+            ldscores_reg = self.ldscores_reg
+            ldscores_reg_w = self.ldscores_reg_w
+        else:
+            snps = self.snps[keep_mask]
+            chr_arr = self.chr[keep_mask]
+            bp = self.bp[keep_mask]
+            annot = self.annot[keep_mask, :]
+            ldscores = self.ldscores[keep_mask, :]
+            ldscores_reg = None if self.ldscores_reg is None else self.ldscores_reg[keep_mask, :]
+            ldscores_reg_w = None if self.ldscores_reg_w is None else self.ldscores_reg_w[keep_mask, :]
+
         return TraceView(
-            snps=self.snps[keep_mask],
-            chr=self.chr[keep_mask],
-            bp=self.bp[keep_mask],
-            annot=self.annot[keep_mask, :],
+            snps=snps,
+            chr=chr_arr,
+            bp=bp,
+            annot=annot,
             annot_header=self.annot_header,
-            ldscores=self.ldscores[keep_mask, :],
-            ldscores_reg=None if self.ldscores_reg is None else self.ldscores_reg[keep_mask, :],
-            ldscores_reg_w=None if self.ldscores_reg_w is None else self.ldscores_reg_w[keep_mask, :],
+            ldscores=ldscores,
+            ldscores_reg=ldscores_reg,
+            ldscores_reg_w=ldscores_reg_w,
             delta=self.delta,
             kmoments=self.kmoments,
             kmoments_path=self.kmoments_path,
@@ -265,7 +282,15 @@ class Trace:
         )
 
     def _read_ldscores_file(self, path, *, which: str):
-        df = pd.read_csv(path, compression="infer", sep=r"\s+", index_col=False)
+        if self.log is not None and utils._is_chr_split_spec(path):
+            paths = utils._resolve_chr_split_paths(path, require=True)
+            self.log._log(
+                f"[Trace] reading chromosome-split LD-scores ({which}) from "
+                f"{len(paths)} file(s): {utils._normalize_path_spec(path)}"
+            )
+        df = utils._read_csv_maybe_chr_split(
+            path, compression="infer", sep=r"\s+", index_col=False
+        )
         cols = df.columns.tolist()
         first4 = cols[:4]
         required = {"CHR", "BP", "SNP"}
@@ -317,7 +342,15 @@ class Trace:
 
         # Try full annotation first.
         try:
-            df = pd.read_csv(annot_path, sep=r"\s+", compression="infer")
+            if self.log is not None and utils._is_chr_split_spec(annot_path):
+                paths = utils._resolve_chr_split_paths(annot_path, require=True)
+                self.log._log(
+                    f"[Trace] reading chromosome-split annotation from "
+                    f"{len(paths)} file(s): {utils._normalize_path_spec(annot_path)}"
+                )
+            df = utils._read_csv_maybe_chr_split(
+                annot_path, sep=r"\s+", compression="infer"
+            )
             if "SNP" not in df.columns:
                 raise ValueError("No SNP column found in annotation file.")
 
@@ -426,6 +459,8 @@ class Trace:
             return None
 
         s = str(ldscores_path)
+        if utils._is_chr_split_spec(s):
+            return None
         candidates = []
 
         if s.endswith(".gw.ldscore.gz"):

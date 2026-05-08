@@ -62,6 +62,27 @@ struct AlignedBuffer {
     ~AlignedBuffer() { free(); }
 };
 
+template <typename T>
+static T* read_block_standardized_aligned(const std::string& bed_path,
+                                          const std::string& fam_path,
+                                          int blk_start, int blk_end,
+                                          const std::vector<int>& rows,
+                                          int ddof,
+                                          ImputeMode impute_mode,
+                                          uint64_t impute_seed,
+                                          AlignedBuffer<T>& Geno,
+                                          int& N, int& L)
+{
+    const int needN = (int)rows.size();
+    const int needL = std::max(0, blk_end - blk_start);
+    const size_t need = (size_t)std::max(0, needN) * (size_t)std::max(0, needL);
+    if (Geno.n < need) Geno.allocate(need, 64);
+    read_block_standardized_into<T>(bed_path, fam_path, blk_start, blk_end,
+                                    rows, ddof, impute_mode, impute_seed,
+                                    Geno.ptr, Geno.n, N, L);
+    return Geno.ptr;
+}
+
 // --- verbosity gate --------------------------------------------
 static std::atomic<bool> g_verbose{false};
 static inline bool verbose_enabled() { return g_verbose.load(std::memory_order_relaxed); }
@@ -915,16 +936,16 @@ void apply_grm_bed_panel_impl(
             continue;
 
         int N_blk = 0, L_blk = 0;
-        static thread_local std::vector<T> Geno_tls;
-        std::vector<T>& Geno = Geno_tls;
-        read_block_standardized<T>(bed_path, fam_path, s, e, rows, ddof,
-                                   impute_mode, impute_seed,
-                                   Geno, N_blk, L_blk);
+        static thread_local AlignedBuffer<T> Geno_tls;
+        T* Geno = read_block_standardized_aligned<T>(bed_path, fam_path, s, e,
+                                                     rows, ddof,
+                                                     impute_mode, impute_seed,
+                                                     Geno_tls, N_blk, L_blk);
         if (N_blk != N_rows || L_blk != L)
             throw std::runtime_error("Unexpected block dimensions in apply_grm_bed_panel");
 
         T* coef = coef_buf.ptr;
-        gemm_col_major_tn<T>(L, Q, N_rows, Geno.data(), N_rows,
+        gemm_col_major_tn<T>(L, Q, N_rows, Geno, N_rows,
                              Vin.ptr, N_rows, coef, L, T(1), T(0));
 
         static thread_local std::vector<T> row_scale_tls;
@@ -946,7 +967,7 @@ void apply_grm_bed_panel_impl(
                 ccol[(size_t) j] *= row_scale[(size_t) j];
         }
 
-        gemm_col_major_nn<T>(N_rows, Q, L, Geno.data(), N_rows,
+        gemm_col_major_nn<T>(N_rows, Q, L, Geno, N_rows,
                              coef, L, outptr, N_rows, T(1), T(1));
     }
 
@@ -1222,11 +1243,11 @@ void phase1_compute_Xz_bed_chunk_impl(const std::string &bed_prefix,
     const std::vector<int>& rows = parse_row_sel(row_sel_obj, N_total);
 
     int N = 0, L = 0;
-    static thread_local std::vector<T> Geno_tls;
-    std::vector<T>& Geno = Geno_tls;
-    read_block_standardized<T>(bed_path, fam_path, blk_start, blk_end, rows, ddof,
-                               impute_mode, impute_seed,
-                               Geno, N, L);
+    static thread_local AlignedBuffer<T> Geno_tls;
+    T* Geno = read_block_standardized_aligned<T>(bed_path, fam_path, blk_start, blk_end,
+                                                 rows, ddof,
+                                                 impute_mode, impute_seed,
+                                                 Geno_tls, N, L);
     if (L == 0)
         return;
 
@@ -1241,8 +1262,8 @@ void phase1_compute_Xz_bed_chunk_impl(const std::string &bed_prefix,
         static thread_local AlignedBuffer<T> tmpG_tls;
         const size_t need_tmp = (size_t) p * (size_t) L;
         if (tmpG_tls.n < need_tmp) tmpG_tls.allocate(need_tmp, 64);
-        gemm_col_major_nn<T>(p, L, N, Rptr, p, Geno.data(), N, tmpG_tls.ptr, p, T(1), T(0));
-        gemm_col_major_nn<T>(N, L, p, Cptr, N, tmpG_tls.ptr, p, Geno.data(), N, T(-1), T(1));
+        gemm_col_major_nn<T>(p, L, N, Rptr, p, Geno, N, tmpG_tls.ptr, p, T(1), T(0));
+        gemm_col_major_nn<T>(N, L, p, Cptr, N, tmpG_tls.ptr, p, Geno, N, T(-1), T(1));
     }
 
     const int B = (int) annot_blk.shape(1);
@@ -1388,7 +1409,7 @@ void phase1_compute_Xz_bed_chunk_impl(const std::string &bed_prefix,
                         const auto a0 = do_timing ? Clock::now() : Clock::time_point{};
                         for (int c = 0; c < sharedK; ++c) {
                             const int snp = rowind[(size_t) shared_k0 + (size_t) c];
-                            const T* src = Geno.data() + (size_t) snp * (size_t) N + (size_t) n0;
+                            const T* src = Geno + (size_t) snp * (size_t) N + (size_t) n0;
                             T* dst = A_tile + (size_t) c * (size_t) Nt;
                             std::memcpy(dst, src, (size_t) Nt * sizeof(T));
                         }
@@ -1471,11 +1492,11 @@ void phase1_compute_Xz_bed_chunk_rowmajor_impl(const std::string &bed_prefix,
     const std::vector<int>& rows = parse_row_sel(row_sel_obj, N_total);
 
     int N = 0, L = 0;
-    static thread_local std::vector<T> Geno_tls;
-    std::vector<T>& Geno = Geno_tls;
-    read_block_standardized<T>(bed_path, fam_path, blk_start, blk_end, rows, ddof,
-                               impute_mode, impute_seed,
-                               Geno, N, L);
+    static thread_local AlignedBuffer<T> Geno_tls;
+    T* Geno = read_block_standardized_aligned<T>(bed_path, fam_path, blk_start, blk_end,
+                                                 rows, ddof,
+                                                 impute_mode, impute_seed,
+                                                 Geno_tls, N, L);
     if (L == 0)
         return;
 
@@ -1490,8 +1511,8 @@ void phase1_compute_Xz_bed_chunk_rowmajor_impl(const std::string &bed_prefix,
         static thread_local AlignedBuffer<T> tmpG_tls;
         const size_t need_tmp = (size_t) p * (size_t) L;
         if (tmpG_tls.n < need_tmp) tmpG_tls.allocate(need_tmp, 64);
-        gemm_col_major_nn<T>(p, L, N, Rptr, p, Geno.data(), N, tmpG_tls.ptr, p, T(1), T(0));
-        gemm_col_major_nn<T>(N, L, p, Cptr, N, tmpG_tls.ptr, p, Geno.data(), N, T(-1), T(1));
+        gemm_col_major_nn<T>(p, L, N, Rptr, p, Geno, N, tmpG_tls.ptr, p, T(1), T(0));
+        gemm_col_major_nn<T>(N, L, p, Cptr, N, tmpG_tls.ptr, p, Geno, N, T(-1), T(1));
     }
 
     const int B = (int) annot_blk.shape(1);
@@ -1575,7 +1596,7 @@ void phase1_compute_Xz_bed_chunk_rowmajor_impl(const std::string &bed_prefix,
                 for (int c = 0; c < K; ++c) {
                     const int snp = rowind[(size_t) k0 + (size_t) c];
                     const T ssc = scale[(size_t) k0 + (size_t) c];
-                    const T* src = Geno.data() + (size_t) snp * (size_t) N + (size_t) n0;
+                    const T* src = Geno + (size_t) snp * (size_t) N + (size_t) n0;
                     T* dst = A_tile.ptr + (size_t) c * (size_t) Nt;
 #pragma omp simd
                     for (int r = 0; r < Nt; ++r)
@@ -1648,11 +1669,11 @@ void phase2_compute_XtXz_bed_impl(const std::string &bed_prefix,
     const std::vector<int>& rows = parse_row_sel(row_sel_obj, N_total);
 
     int N = 0, L = 0;
-    static thread_local std::vector<T> Geno_tls;
-    std::vector<T>& Geno = Geno_tls;
-    read_block_standardized<T>(bed_path, fam_path, blk_start, blk_end, rows, ddof,
-                               impute_mode, impute_seed,
-                               Geno, N, L);
+    static thread_local AlignedBuffer<T> Geno_tls;
+    T* Geno = read_block_standardized_aligned<T>(bed_path, fam_path, blk_start, blk_end,
+                                                 rows, ddof,
+                                                 impute_mode, impute_seed,
+                                                 Geno_tls, N, L);
     if (L == 0)
         return;
 
@@ -1667,8 +1688,8 @@ void phase2_compute_XtXz_bed_impl(const std::string &bed_prefix,
         static thread_local AlignedBuffer<T> tmpG_tls;
         const size_t need_tmp = (size_t) p * (size_t) L;
         if (tmpG_tls.n < need_tmp) tmpG_tls.allocate(need_tmp, 64);
-        gemm_col_major_nn<T>(p, L, N, Rptr, p, Geno.data(), N, tmpG_tls.ptr, p, T(1), T(0));
-        gemm_col_major_nn<T>(N, L, p, Cptr, N, tmpG_tls.ptr, p, Geno.data(), N, T(-1), T(1));
+        gemm_col_major_nn<T>(p, L, N, Rptr, p, Geno, N, tmpG_tls.ptr, p, T(1), T(0));
+        gemm_col_major_nn<T>(N, L, p, Cptr, N, tmpG_tls.ptr, p, Geno, N, T(-1), T(1));
     }
 
     if ((int) inv_left.shape(0) != L)
@@ -1732,7 +1753,7 @@ void phase2_compute_XtXz_bed_impl(const std::string &bed_prefix,
         const int q = std::min(QPANEL, Q - q0);
         const T* rhs = Xptr + (size_t) q0 * (size_t) N;
         auto t2 = std::chrono::high_resolution_clock::now();
-        gemm_col_major_tn<T>(L, q, N, Geno.data(), N, rhs, N, Work, L, T(1), T(0));
+        gemm_col_major_tn<T>(L, q, N, Geno, N, rhs, N, Work, L, T(1), T(0));
         auto t3 = std::chrono::high_resolution_clock::now();
         t.add_gemm(std::chrono::duration<double, std::milli>(t3 - t2).count());
 
@@ -1826,11 +1847,11 @@ void phase2_accum_XtXz_bed_impl(const std::string &bed_prefix,
     const std::vector<int>& rows = parse_row_sel(row_sel_obj, N_total);
 
     int N = 0, L = 0;
-    static thread_local std::vector<T> Geno_tls;
-    std::vector<T>& Geno = Geno_tls;
-    read_block_standardized<T>(bed_path, fam_path, blk_start, blk_end, rows, ddof,
-                               impute_mode, impute_seed,
-                               Geno, N, L);
+    static thread_local AlignedBuffer<T> Geno_tls;
+    T* Geno = read_block_standardized_aligned<T>(bed_path, fam_path, blk_start, blk_end,
+                                                 rows, ddof,
+                                                 impute_mode, impute_seed,
+                                                 Geno_tls, N, L);
     if (L == 0)
         return;
 
@@ -1845,8 +1866,8 @@ void phase2_accum_XtXz_bed_impl(const std::string &bed_prefix,
         static thread_local AlignedBuffer<T> tmpG_tls;
         const size_t need_tmp = (size_t) p * (size_t) L;
         if (tmpG_tls.n < need_tmp) tmpG_tls.allocate(need_tmp, 64);
-        gemm_col_major_nn<T>(p, L, N, Rptr, p, Geno.data(), N, tmpG_tls.ptr, p, T(1), T(0));
-        gemm_col_major_nn<T>(N, L, p, Cptr, N, tmpG_tls.ptr, p, Geno.data(), N, T(-1), T(1));
+        gemm_col_major_nn<T>(p, L, N, Rptr, p, Geno, N, tmpG_tls.ptr, p, T(1), T(0));
+        gemm_col_major_nn<T>(N, L, p, Cptr, N, tmpG_tls.ptr, p, Geno, N, T(-1), T(1));
     }
 
     if ((int) inv_left.shape(0) != L)
@@ -1921,7 +1942,7 @@ void phase2_accum_XtXz_bed_impl(const std::string &bed_prefix,
         const int q = std::min(QPANEL, Q - q0);
         const T* rhs = Xptr + (size_t) q0 * (size_t) N;
         const auto t2 = do_timing ? Clock::now() : Clock::time_point{};
-        gemm_col_major_tn<T>(L, q, N, Geno.data(), N, rhs, N, Work, L, T(1), T(0));
+        gemm_col_major_tn<T>(L, q, N, Geno, N, rhs, N, Work, L, T(1), T(0));
         if (do_timing) {
             const auto t3 = Clock::now();
             t.add_gemm(std::chrono::duration<double, std::milli>(t3 - t2).count());
@@ -2420,14 +2441,14 @@ void project_colmajor_inplace_impl(nb_mat2f_rw<T> Xz2d,
 }
 
 template <typename T>
-static void project_target_block_inplace(std::vector<T>& G, int N, int L,
+static void project_target_block_inplace(T* G, int N, int L,
                                          const T* Cptr, const T* Rptr, int p,
                                          AlignedBuffer<T>& tmp_buf) {
-    if (p <= 0) return;
+    if (!G || p <= 0) return;
     if (tmp_buf.n < (size_t)p * (size_t)L) tmp_buf.allocate((size_t)p * (size_t)L, 64);
     T* tmp = tmp_buf.ptr;
-    gemm_col_major_nn<T>(p, L, N, Rptr, p, G.data(), N, tmp, p, T(1), T(0));
-    gemm_col_major_nn<T>(N, L, p, Cptr, N, tmp, p, G.data(), N, T(-1), T(1));
+    gemm_col_major_nn<T>(p, L, N, Rptr, p, G, N, tmp, p, T(1), T(0));
+    gemm_col_major_nn<T>(N, L, p, Cptr, N, tmp, p, G, N, T(-1), T(1));
 }
 
 template <typename T>
@@ -2535,11 +2556,11 @@ nb::tuple precompute_residual_variances_bed_impl(
                 continue;
 
             int N_blk = 0, L_blk = 0;
-            static thread_local std::vector<T> Geno_tls;
-            std::vector<T>& Geno = Geno_tls;
-            read_block_standardized<T>(bed_path, fam_path, s, e, rows, ddof,
-                                       impute_mode, impute_seed,
-                                       Geno, N_blk, L_blk);
+            static thread_local AlignedBuffer<T> Geno_tls;
+            T* Geno = read_block_standardized_aligned<T>(bed_path, fam_path, s, e,
+                                                         rows, ddof,
+                                                         impute_mode, impute_seed,
+                                                         Geno_tls, N_blk, L_blk);
             if (N_blk != N_rows || L_blk != L)
                 throw std::runtime_error("Unexpected block dimensions in precompute_residual_variances_bed");
 
@@ -2557,7 +2578,7 @@ nb::tuple precompute_residual_variances_bed_impl(
             #pragma omp parallel for schedule(static)
 #endif
             for (int j = 0; j < L; ++j) {
-                const T* col = Geno.data() + (size_t) j * (size_t) N_blk;
+                const T* col = Geno + (size_t) j * (size_t) N_blk;
                 double ss = 0.0;
                 for (int i = 0; i < N_blk; ++i) {
                     const double x = (double) col[(size_t) i];
@@ -2584,7 +2605,7 @@ nb::tuple precompute_residual_variances_bed_impl(
                     const int jb = std::min(JPANEL, L - j0);
                     for (int jj = 0; jj < jb; ++jj) {
                         const int j = j0 + jj;
-                        const T* gcol = Geno.data() + (size_t) j * (size_t) N_blk;
+                        const T* gcol = Geno + (size_t) j * (size_t) N_blk;
                         double* xcol = X2_panel.ptr + (size_t) jj * (size_t) N_blk;
                         for (int i = 0; i < N_blk; ++i) {
                             const double y = (double) gcol[(size_t) i];

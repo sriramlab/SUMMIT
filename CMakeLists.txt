@@ -92,14 +92,18 @@ endif()
 # =====================================================================================
 option(GWLDCORE_ENABLE_NATIVE_OPT "Enable -march=native / architecture-specific local tuning" ON)
 
+set(SUMMIT_PYTHON_PACKAGE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/src/summit")
+set(SUMMIT_NATIVE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/src/native")
+set(SUMMIT_NATIVE_COMMON_DIR "${SUMMIT_NATIVE_DIR}/common")
+
 # =====================================================================================
 # Shared genotype / BED decoding core
 # =====================================================================================
 add_library(gwldcore_core STATIC
-  src/genotype.cpp
+  ${SUMMIT_NATIVE_COMMON_DIR}/genotype.cpp
 )
 set_target_properties(gwldcore_core PROPERTIES POSITION_INDEPENDENT_CODE ON)
-target_include_directories(gwldcore_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_include_directories(gwldcore_core PUBLIC ${SUMMIT_NATIVE_COMMON_DIR})
 target_compile_features(gwldcore_core PUBLIC cxx_std_17)
 if (MSVC)
   target_compile_options(gwldcore_core PRIVATE /O2)
@@ -112,7 +116,7 @@ endif()
 
 function(gwldcore_configure_module target_name)
   target_compile_features(${target_name} PRIVATE cxx_std_17)
-  target_include_directories(${target_name} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  target_include_directories(${target_name} PRIVATE ${SUMMIT_NATIVE_COMMON_DIR})
   target_link_libraries(${target_name} PRIVATE gwldcore_core)
 
   if (MSVC)
@@ -168,20 +172,22 @@ endfunction()
 # =====================================================================================
 # Use NOMINSIZE because these modules execute substantial compute-heavy code directly
 # and should be optimized for throughput rather than binary size.
-nanobind_add_module(gwldcore NOMINSIZE src/gwldcore.cpp)
+nanobind_add_module(gwldcore NOMINSIZE ${SUMMIT_NATIVE_DIR}/gwldcore.cpp)
 gwldcore_configure_module(gwldcore)
 
-nanobind_add_module(winldcore NOMINSIZE src/winldcore.cpp)
+nanobind_add_module(winldcore NOMINSIZE ${SUMMIT_NATIVE_DIR}/winldcore.cpp)
 gwldcore_configure_module(winldcore)
 
 install(TARGETS gwldcore winldcore
-  LIBRARY DESTINATION .
-  RUNTIME DESTINATION .
-  ARCHIVE DESTINATION .)
+  LIBRARY DESTINATION summit
+  RUNTIME DESTINATION summit
+  ARCHIVE DESTINATION summit)
 
-# Install the thin Python orchestration layers when present
-foreach(py_file gw_ldscore.py win_ldscore.py utils.py)
-  if (EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/${py_file}")
-    install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/${py_file}" DESTINATION .)
-  endif()
-endforeach()
+# Install the Python package and source-tree compatibility launcher.
+install(DIRECTORY "${SUMMIT_PYTHON_PACKAGE_DIR}"
+  DESTINATION .
+  FILES_MATCHING
+    PATTERN "*.py"
+    PATTERN "__pycache__" EXCLUDE
+    PATTERN "tmp" EXCLUDE)
+install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/src/summit.py" DESTINATION .)

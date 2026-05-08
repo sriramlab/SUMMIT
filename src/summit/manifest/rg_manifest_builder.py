@@ -9,8 +9,8 @@ import math
 import numpy as np
 import pandas as pd
 
-import utils
-from sumcore import Sumcore
+from .. import utils
+from ..inference.sumcore import Sumcore
 
 
 _DEFAULT_PHENO_SUFFIXES = (
@@ -160,9 +160,9 @@ def _read_sumstats_mapping(path: str) -> dict[str, str]:
         spath_raw = str(row[sum_col]).strip() if not pd.isna(row[sum_col]) else ""
         if phen == "" or spath_raw == "":
             continue
-        spath = str(Path(spath_raw).expanduser().resolve())
-        if not Path(spath).is_file():
-            raise ValueError(f"Sumstats mapping row {idx + 1}: file not found '{spath_raw}'.")
+        spath = utils._normalize_path_spec(spath_raw)
+        if not utils._path_spec_exists(spath):
+            raise ValueError(f"Sumstats mapping row {idx + 1}: file/spec not found '{spath_raw}'.")
         prev = out.get(phen)
         if prev is not None and prev != spath:
             raise ValueError(

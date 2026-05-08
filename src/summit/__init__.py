@@ -1,0 +1,1 @@
+"""SUMMIT Python package."""

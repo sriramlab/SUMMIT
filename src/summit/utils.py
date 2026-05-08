@@ -29,6 +29,167 @@ def _open_text_maybe_gzip(file_path, mode="rt"):
 
 
 def _read_with_optional_header(file_path):
+    paths = _resolve_chr_split_paths(file_path, require=True)
+    if len(paths) == 1 and not _is_chr_split_spec(file_path):
+        return _read_with_optional_header_one(paths[0])
+
+    header = None
+    arrays = []
+    for p in paths:
+        h, arr = _read_with_optional_header_one(p)
+        if header is None:
+            header = h
+        elif h != header:
+            raise ValueError(
+                f"Chromosome-split files for '{file_path}' have inconsistent headers; "
+                f"first header={header}, file '{p}' header={h}."
+            )
+        arrays.append(np.asarray(arr))
+
+    if not arrays:
+        raise ValueError(f"No files resolved for chromosome-split path spec: {file_path}")
+    if arrays[0].ndim == 1:
+        data = np.concatenate([np.asarray(a).reshape(-1) for a in arrays], axis=0)
+    else:
+        data = np.vstack(arrays)
+    return header, data
+
+
+def _parse_column_name(df_hdr, names, default_pos):
+    cols = list(df_hdr.columns)
+    cols_lower = {c.lower(): c for c in cols}
+    for n in names:
+        if n.lower() in cols_lower:
+            return cols_lower[n.lower()]
+    if default_pos >= len(cols):
+        raise ValueError(f"Could not infer column {names}; header too short.")
+    return cols[default_pos]
+
+
+def _normalize_path_spec(path) -> str:
+    """Expand user/env vars while preserving chromosome placeholders."""
+    s = os.path.expanduser(os.path.expandvars(str(path)))
+    return str(Path(s).resolve(strict=False))
+
+
+def _is_chr_split_spec(path) -> bool:
+    return "@" in str(path)
+
+
+def _chr_path_candidates(path_spec: str, chrom: int) -> list[str]:
+    chrom = int(chrom)
+    repls = [str(chrom), f"{chrom:02d}"]
+    out = []
+    for repl in repls:
+        p = path_spec.replace("@", repl)
+        if p not in out:
+            out.append(p)
+    return out
+
+
+def _resolve_chr_split_paths(path_spec, *, n_chr: int = 22, require: bool = True) -> list[str]:
+    """
+    Resolve a chromosome-split path spec.
+
+    The placeholder '@' is replaced by chromosome numbers 1..n_chr. For convenience
+    we try both unpadded and zero-padded chromosome strings, so one spec can match
+    paths like chr_1 and chr01. Only files that exist are returned, in chromosome
+    order. Non-split paths are returned as a one-element list.
+    """
+    spec = _normalize_path_spec(path_spec)
+    if not _is_chr_split_spec(spec):
+        if require and not Path(spec).is_file():
+            raise ValueError(f"Could not find file: {path_spec}")
+        return [spec]
+
+    out = []
+    for chrom in range(1, int(n_chr) + 1):
+        hit = None
+        for cand in _chr_path_candidates(spec, chrom):
+            if Path(cand).is_file():
+                hit = cand
+                break
+        if hit is not None:
+            out.append(hit)
+
+    if require and not out:
+        raise ValueError(
+            f"Could not resolve chromosome-split path spec '{path_spec}'. "
+            "Use '@' where the chromosome number should be inserted."
+        )
+    return out
+
+
+def _resolve_chr_split_dirs(path_spec, *, n_chr: int = 22, require: bool = True) -> list[str]:
+    """
+    Resolve a chromosome-split directory spec.
+
+    This is the directory analogue of _resolve_chr_split_paths. It supports h2
+    batch layouts such as /path/to/sums/chr@, where each resolved chr directory
+    contains the same set of per-trait sumstats files.
+    """
+    spec = _normalize_path_spec(path_spec)
+    if not _is_chr_split_spec(spec):
+        if require and not Path(spec).is_dir():
+            raise ValueError(f"Could not find directory: {path_spec}")
+        return [spec]
+
+    out = []
+    for chrom in range(1, int(n_chr) + 1):
+        hit = None
+        for cand in _chr_path_candidates(spec, chrom):
+            if Path(cand).is_dir():
+                hit = cand
+                break
+        if hit is not None:
+            out.append(hit)
+
+    if require and not out:
+        raise ValueError(
+            f"Could not resolve chromosome-split directory spec '{path_spec}'. "
+            "Use '@' where the chromosome number should be inserted."
+        )
+    return out
+
+
+def _path_spec_exists(path_spec) -> bool:
+    try:
+        return len(_resolve_chr_split_paths(path_spec, require=True)) > 0
+    except Exception:
+        return False
+
+
+def _read_csv_maybe_chr_split(path_spec, **kwargs):
+    paths = _resolve_chr_split_paths(path_spec, require=True)
+    if len(paths) == 1 and not _is_chr_split_spec(path_spec):
+        return pd.read_csv(paths[0], **kwargs)
+
+    frames = []
+    columns = None
+    for p in paths:
+        df = pd.read_csv(p, **kwargs)
+        if columns is None:
+            columns = list(df.columns)
+        elif list(df.columns) != columns:
+            raise ValueError(
+                f"Chromosome-split files for '{path_spec}' have inconsistent columns; "
+                f"first columns={columns}, file '{p}' columns={list(df.columns)}."
+            )
+        frames.append(df)
+
+    if not frames:
+        raise ValueError(f"No files resolved for chromosome-split path spec: {path_spec}")
+    return pd.concat(frames, axis=0, ignore_index=True, copy=False)
+
+
+def _check_file_or_chr_split_spec(path_spec, *, label: str = "file"):
+    try:
+        _resolve_chr_split_paths(path_spec, require=True)
+    except Exception as e:
+        raise ValueError(f"Could not find {label}: {path_spec}") from e
+
+
+def _read_with_optional_header_one(file_path):
     with _open_text_maybe_gzip(file_path, "rt") as fd:
         line = fd.readline().strip()
         try:
@@ -48,20 +209,44 @@ def _read_with_optional_header(file_path):
     return None, data
 
 
-def _parse_column_name(df_hdr, names, default_pos):
-    cols = list(df_hdr.columns)
-    cols_lower = {c.lower(): c for c in cols}
-    for n in names:
-        if n.lower() in cols_lower:
-            return cols_lower[n.lower()]
-    if default_pos >= len(cols):
-        raise ValueError(f"Could not infer column {names}; header too short.")
-    return cols[default_pos]
-
-
 def _parse_sumdir(h2_path):
     if h2_path is None:
         raise ValueError("h2_path must be provided.")
+    if _is_chr_split_spec(h2_path):
+        split_files = _resolve_chr_split_paths(h2_path, require=False)
+        if split_files:
+            return [_normalize_path_spec(h2_path)]
+
+        split_dirs = _resolve_chr_split_dirs(h2_path, require=False)
+        if split_dirs:
+            file_sets = []
+            for d in split_dirs:
+                names = {
+                    x.name
+                    for x in Path(d).iterdir()
+                    if x.is_file() and not x.name.startswith(".")
+                }
+                file_sets.append(names)
+            common = set.intersection(*file_sets) if file_sets else set()
+            union = set.union(*file_sets) if file_sets else set()
+            if not common:
+                raise ValueError(f"No common files found in h2_path chromosome-split directories: {h2_path}")
+            if common != union:
+                missing_by_dir = []
+                for d, names in zip(split_dirs, file_sets):
+                    missing = sorted(union - names)
+                    if missing:
+                        missing_by_dir.append(f"{d}: missing {missing[:5]}")
+                detail = "; ".join(missing_by_dir[:5])
+                raise ValueError(
+                    f"h2_path chromosome-split directories do not contain the same files: {h2_path}. "
+                    f"{detail}"
+                )
+            base = _normalize_path_spec(h2_path).rstrip("/")
+            return [f"{base}/{name}" for name in sorted(common)]
+
+        _check_file_or_chr_split_spec(h2_path, label="h2 chromosome-split sumstats")
+        return [_normalize_path_spec(h2_path)]
     p = Path(h2_path)
     if p.is_dir():
         out = sorted(
@@ -82,8 +267,7 @@ def _parse_rg_pair(rg):
     if len(parts) != 2:
         raise ValueError("--rg must be exactly two comma-separated sumstats paths.")
     for p in parts:
-        if not Path(p).is_file():
-            raise ValueError(f"Could not find sumstats file: {p}")
+        _check_file_or_chr_split_spec(p, label="sumstats file")
     return parts
 
 
