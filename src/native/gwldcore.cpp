@@ -129,6 +129,48 @@ static inline int ceil_div_i(int a, int b) {
     return (a + b - 1) / b;
 }
 
+static inline double env_double_or_default(const char* key, double defv) {
+    const char* s = std::getenv(key);
+    if (!s || !*s) return defv;
+    char* end = nullptr;
+    const double v = std::strtod(s, &end);
+    if (end == s || !std::isfinite(v)) return defv;
+    return v;
+}
+
+static inline double phase2_upd_rel_factor() {
+    static const double v = env_double_or_default("SUMMIT_P2_UPD_REL_FACTOR", 1000.0);
+    return v;
+}
+
+static inline double phase2_upd_mean_floor_ld() {
+    static const double v = env_double_or_default("SUMMIT_P2_UPD_MEAN_FLOOR_LD", 10.0);
+    return std::max(0.0, v);
+}
+
+static inline double phase2_upd_running_limit(double accepted_sum,
+                                              unsigned long long accepted_count,
+                                              double mean_floor_update,
+                                              double rel_factor) {
+    if (!(rel_factor > 0.0)) return std::numeric_limits<double>::infinity();
+    double ref = mean_floor_update;
+    if (accepted_count > 0) {
+        const double mean = accepted_sum / (double) accepted_count;
+        if (std::isfinite(mean) && mean > ref) ref = mean;
+    }
+    return rel_factor * ref;
+}
+
+template <typename T>
+static inline bool phase2_reject_update(double upd, double running_limit) {
+    if (!std::isfinite(upd)) return true;
+    if constexpr (std::is_same_v<T, float>) {
+        const double fmax = (double) std::numeric_limits<float>::max();
+        if (upd > fmax) return true;
+    }
+    return (std::isfinite(running_limit) && upd > running_limit);
+}
+
 // ------------------------------- Small helpers -------------------------------
 static void prefetch_bed_block_py(const std::string& bed_prefix,
                                   const std::string& fam_path,
@@ -493,7 +535,10 @@ static inline void mailman_pre_accum_groups_rowmajor(const CodeT* packed,
                                                      int B,
                                                      T* meansq_accum,
                                                      Tacc* work_table,
-                                                     Tacc* row_buf)
+                                                     Tacc* row_buf,
+                                                     double upd_rel_factor,
+                                                     double upd_mean_floor_ld,
+                                                     std::atomic<unsigned long long>* dropped_updates)
 {
     const int64_t table_size = compute_mailman_table_size(segment_size_actual);
     for (int i = 0; i < N; ++i) {
@@ -538,11 +583,15 @@ static inline void mailman_pre_accum_groups_rowmajor(const CodeT* packed,
         const double beta = -2.0 * mean * alpha;
         const double gamma = mean * mean * alpha;
         T* out = meansq_accum + ((size_t)(blk_start + j) * (size_t)B);
+        double accepted_sum = 0.0;
+        unsigned long long accepted_count = 0;
+        unsigned long long local_dropped = 0;
 
         for (int g = 0; g < n_groups; ++g) {
             const int k = grp_k[g];
             const int tcol = grp_tcol0[g];
             const int len = grp_len[g];
+            const double mean_floor_update = upd_mean_floor_ld * (double) len;
             const Tacc* src = row_buf + (size_t)tcol;
             const double* svec = sum_rhs + (size_t)tcol;
             double sq = 0.0;
@@ -556,14 +605,19 @@ static inline void mailman_pre_accum_groups_rowmajor(const CodeT* packed,
                 dot += w * svec[(size_t)c];
             }
             double upd = alpha * sq + beta * dot + gamma * grp_sumsq[g];
-            if (!std::isfinite(upd)) continue;
-            if constexpr (std::is_same_v<T, float>) {
-                const double fmax = (double)std::numeric_limits<float>::max();
-                if (upd > fmax) continue;
+            const double running_limit = phase2_upd_running_limit(
+                accepted_sum, accepted_count, mean_floor_update, upd_rel_factor);
+            if (phase2_reject_update<T>(upd, running_limit)) {
+                ++local_dropped;
+                continue;
             }
             if (upd < 0.0) upd = 0.0;
             out[(size_t)k] += (T)upd;
+            accepted_sum += upd;
+            ++accepted_count;
         }
+        if (local_dropped && dropped_updates)
+            dropped_updates->fetch_add(local_dropped, std::memory_order_relaxed);
     }
 
 #ifdef _OPENMP
@@ -1209,13 +1263,24 @@ void apply_grm_bed_panel_mailman_impl(
 }
 
 template <typename T>
+static void compute_inv_resvar_from_geno_block(
+    const T* Geno,
+    int N,
+    int L,
+    double eps,
+    nb::object C_opt,
+    nb::object R_opt,
+    nb::object gram_opt,
+    T* inv_out);
+
+template <typename T>
 void phase1_compute_Xz_bed_chunk_impl(const std::string &bed_prefix,
                                       const std::string &fam_path,
                                       int blk_start, int blk_end,
                                       nb::object row_sel_obj,
                                       int ddof,
                                       nb_mat2c_ro<T> annot_blk,
-                                      nb_vec1_ro<T> inv_right,
+                                      nb::object inv_right_obj,
                                       int v_start,
                                       int v_count,
                                       int kmax_hint,
@@ -1227,7 +1292,10 @@ void phase1_compute_Xz_bed_chunk_impl(const std::string &bed_prefix,
                                       nb::object C_opt,
                                       nb::object R_opt,
                                       const std::string& impute_mode_str,
-                                      nb::object impute_seed_obj)
+                                      nb::object impute_seed_obj,
+                                      nb::object resvar_gram_obj,
+                                      nb::object inv_out_obj,
+                                      double resvar_eps)
 {
     const ImputeMode impute_mode = parse_impute_mode(impute_mode_str);
     const uint64_t impute_seed = impute_seed_obj.is_none() ? 0ULL : nb::cast<uint64_t>(impute_seed_obj);
@@ -1252,6 +1320,8 @@ void phase1_compute_Xz_bed_chunk_impl(const std::string &bed_prefix,
         return;
 
     if (project_right && !C_opt.is_none() && !R_opt.is_none()) {
+        if (!inv_out_obj.is_none())
+            throw std::runtime_error("Fused residual variance is incompatible with project_right=True");
         auto C = nb::cast<nb_mat2f_ro<T>>(C_opt);
         auto R = nb::cast<nb_mat2f_ro<T>>(R_opt);
         const int p = (int) C.shape(1);
@@ -1267,10 +1337,29 @@ void phase1_compute_Xz_bed_chunk_impl(const std::string &bed_prefix,
     }
 
     const int B = (int) annot_blk.shape(1);
-    if ((int) annot_blk.shape(0) != L || (int) inv_right.shape(0) != L)
+    if ((int) annot_blk.shape(0) != L)
         throw std::runtime_error("L mismatch");
     const T* ann = annot_blk.data();
-    const T* inv = inv_right.data();
+
+    nb_vec1_ro<T> inv_right;
+    nb_vec1_rw<T> inv_out;
+    const T* inv = nullptr;
+    if (!inv_out_obj.is_none()) {
+        inv_out = nb::cast<nb_vec1_rw<T>>(inv_out_obj);
+        if ((int) inv_out.shape(0) != L)
+            throw std::runtime_error("inv_out shape mismatch in phase1 fused residual variance");
+        compute_inv_resvar_from_geno_block<T>(
+            Geno, N, L, resvar_eps,
+            C_opt, R_opt, resvar_gram_obj,
+            inv_out.data()
+        );
+        inv = inv_out.data();
+    } else {
+        inv_right = nb::cast<nb_vec1_ro<T>>(inv_right_obj);
+        if ((int) inv_right.shape(0) != L)
+            throw std::runtime_error("inv_right shape mismatch in phase1");
+        inv = inv_right.data();
+    }
 
     if ((int) Xz2d_chunk.shape(0) != N || (int) Xz2d_chunk.shape(1) != B * v_count)
         throw std::runtime_error("Xz2d_chunk shape must be (N, B*v_count)");
@@ -1465,7 +1554,7 @@ void phase1_compute_Xz_bed_chunk_rowmajor_impl(const std::string &bed_prefix,
                                                nb::object row_sel_obj,
                                                int ddof,
                                                nb_mat2c_ro<T> annot_blk,
-                                               nb_vec1_ro<T> inv_right,
+                                               nb::object inv_right_obj,
                                                int v_start,
                                                int v_count,
                                                int,
@@ -1476,7 +1565,10 @@ void phase1_compute_Xz_bed_chunk_rowmajor_impl(const std::string &bed_prefix,
                                                nb::object C_opt,
                                                nb::object R_opt,
                                                const std::string& impute_mode_str,
-                                               nb::object impute_seed_obj)
+                                               nb::object impute_seed_obj,
+                                               nb::object resvar_gram_obj,
+                                               nb::object inv_out_obj,
+                                               double resvar_eps)
 {
     const ImputeMode impute_mode = parse_impute_mode(impute_mode_str);
     const uint64_t impute_seed = impute_seed_obj.is_none() ? 0ULL : nb::cast<uint64_t>(impute_seed_obj);
@@ -1501,6 +1593,8 @@ void phase1_compute_Xz_bed_chunk_rowmajor_impl(const std::string &bed_prefix,
         return;
 
     if (project_right && !C_opt.is_none() && !R_opt.is_none()) {
+        if (!inv_out_obj.is_none())
+            throw std::runtime_error("Fused residual variance is incompatible with project_right=True");
         auto C = nb::cast<nb_mat2f_ro<T>>(C_opt);
         auto R = nb::cast<nb_mat2f_ro<T>>(R_opt);
         const int p = (int) C.shape(1);
@@ -1516,10 +1610,29 @@ void phase1_compute_Xz_bed_chunk_rowmajor_impl(const std::string &bed_prefix,
     }
 
     const int B = (int) annot_blk.shape(1);
-    if ((int) annot_blk.shape(0) != L || (int) inv_right.shape(0) != L)
+    if ((int) annot_blk.shape(0) != L)
         throw std::runtime_error("L mismatch");
     const T* ann = annot_blk.data();
-    const T* inv = inv_right.data();
+
+    nb_vec1_ro<T> inv_right;
+    nb_vec1_rw<T> inv_out;
+    const T* inv = nullptr;
+    if (!inv_out_obj.is_none()) {
+        inv_out = nb::cast<nb_vec1_rw<T>>(inv_out_obj);
+        if ((int) inv_out.shape(0) != L)
+            throw std::runtime_error("inv_out shape mismatch in rowmajor phase1 fused residual variance");
+        compute_inv_resvar_from_geno_block<T>(
+            Geno, N, L, resvar_eps,
+            C_opt, R_opt, resvar_gram_obj,
+            inv_out.data()
+        );
+        inv = inv_out.data();
+    } else {
+        inv_right = nb::cast<nb_vec1_ro<T>>(inv_right_obj);
+        if ((int) inv_right.shape(0) != L)
+            throw std::runtime_error("inv_right shape mismatch in rowmajor phase1");
+        inv = inv_right.data();
+    }
 
     if ((int) Xz2d_chunk.shape(0) != N || (int) Xz2d_chunk.shape(1) != B * v_count)
         throw std::runtime_error("Xz2d_chunk shape must be (N, B*v_count) in rowmajor phase1");
@@ -1746,6 +1859,9 @@ void phase2_compute_XtXz_bed_impl(const std::string &bed_prefix,
     REDUCE_THREADS = clampi(REDUCE_THREADS, 1, std::max(1, nslabs));
 
     BlockTimers t;
+    const double upd_rel_factor = phase2_upd_rel_factor();
+    const double upd_mean_floor_ld = phase2_upd_mean_floor_ld();
+    std::atomic<unsigned long long> dropped_updates{0};
     nb::gil_scoped_release nogil;
 
     for (int q0 = 0; q0 < Q; q0 += QPANEL) {
@@ -1781,8 +1897,12 @@ void phase2_compute_XtXz_bed_impl(const std::string &bed_prefix,
             static thread_local AlignedBuffer<double> acc_tls;
             if (acc_tls.n < (size_t) IBLK) acc_tls.allocate((size_t) IBLK, 64);
             double* acc = acc_tls.ptr;
+            unsigned long long local_dropped = 0;
             for (int sidx = 0; sidx < segments; ++sidx) {
                 const int k = seg_k[sidx], tcol = seg_tcol0[sidx], len = seg_len[sidx];
+                const double mean_floor_update = upd_mean_floor_ld * ((double) len * invV);
+                double accepted_sum = 0.0;
+                unsigned long long accepted_count = 0;
                 std::fill(acc, acc + ib, 0.0);
                 for (int c = 0; c < len; ++c) {
                     const T* wcol = Work + (size_t) (tcol + c) * (size_t) L + (size_t) i0;
@@ -1795,25 +1915,34 @@ void phase2_compute_XtXz_bed_impl(const std::string &bed_prefix,
                     }
                 }
                 T* out = Mptr + ((size_t) (blk_start + i0) * (size_t) B + (size_t) k);
-#ifdef _OPENMP
-                #pragma omp simd
-#endif
                 for (int ii = 0; ii < ib; ++ii) {
                     const double inv_i = (double) inv[i0 + ii];
                     const double inv2 = inv_i * inv_i * inv_denom2;
                     double upd = acc[ii] * invV * inv2;
-                    if (!std::isfinite(upd)) continue;
-                    if constexpr (std::is_same_v<T, float>) {
-                        const double fmax = (double) std::numeric_limits<float>::max();
-                        if (upd > fmax) continue;
+                    const double running_limit = phase2_upd_running_limit(
+                        accepted_sum, accepted_count, mean_floor_update, upd_rel_factor);
+                    if (phase2_reject_update<T>(upd, running_limit)) {
+                        ++local_dropped;
+                        continue;
                     }
                     if (upd < 0.0) upd = 0.0;
                     out[(size_t) ii * (size_t) B] += (T) upd;
+                    accepted_sum += upd;
+                    ++accepted_count;
                 }
             }
+            if (local_dropped)
+                dropped_updates.fetch_add(local_dropped, std::memory_order_relaxed);
         }
         auto t5 = std::chrono::high_resolution_clock::now();
         t.add_reduce(std::chrono::duration<double, std::milli>(t5 - t4).count());
+    }
+    const unsigned long long ndrop = dropped_updates.load(std::memory_order_relaxed);
+    if (ndrop > 0) {
+        std::fprintf(stderr,
+            "[phase2-warn] dropped %llu oversized/non-finite updates in block [%d:%d) "
+            "(rel_factor=%.6g, mean_floor_ld=%.6g)\n",
+            ndrop, blk_start, blk_end, upd_rel_factor, upd_mean_floor_ld);
     }
     t.dump(blk_start, blk_end, B, nvecs);
 }
@@ -1935,6 +2064,9 @@ void phase2_accum_XtXz_bed_impl(const std::string &bed_prefix,
     const bool do_timing = verbose_enabled();
     using Clock = std::chrono::high_resolution_clock;
     BlockTimers t;
+    const double upd_rel_factor = phase2_upd_rel_factor();
+    const double upd_mean_floor_ld = phase2_upd_mean_floor_ld();
+    std::atomic<unsigned long long> dropped_updates{0};
     nb::gil_scoped_release nogil;
 
     for (int q0 = 0; q0 < Q; q0 += QPANEL) {
@@ -1972,8 +2104,12 @@ void phase2_accum_XtXz_bed_impl(const std::string &bed_prefix,
             static thread_local AlignedBuffer<double> acc_tls;
             if (acc_tls.n < (size_t) IBLK) acc_tls.allocate((size_t) IBLK, 64);
             double* acc = acc_tls.ptr;
+            unsigned long long local_dropped = 0;
             for (int sidx = 0; sidx < segments; ++sidx) {
                 const int k = seg_k[sidx], tcol = seg_tcol0[sidx], len = seg_len[sidx];
+                const double mean_floor_update = upd_mean_floor_ld * (double) len;
+                double accepted_sum = 0.0;
+                unsigned long long accepted_count = 0;
                 std::fill(acc, acc + ib, 0.0);
                 for (int c = 0; c < len; ++c) {
                     const T* wcol = Work + (size_t) (tcol + c) * (size_t) L + (size_t) i0;
@@ -1986,25 +2122,34 @@ void phase2_accum_XtXz_bed_impl(const std::string &bed_prefix,
                     }
                 }
                 T* out = Mptr + ((size_t) (blk_start + i0) * (size_t) B + (size_t) k);
-#ifdef _OPENMP
-                #pragma omp simd
-#endif
                 for (int ii = 0; ii < ib; ++ii) {
                     double upd = acc[ii] * left_scale[(size_t) (i0 + ii)];
-                    if (!std::isfinite(upd)) continue;
-                    if constexpr (std::is_same_v<T, float>) {
-                        const double fmax = (double) std::numeric_limits<float>::max();
-                        if (upd > fmax) continue;
+                    const double running_limit = phase2_upd_running_limit(
+                        accepted_sum, accepted_count, mean_floor_update, upd_rel_factor);
+                    if (phase2_reject_update<T>(upd, running_limit)) {
+                        ++local_dropped;
+                        continue;
                     }
                     if (upd < 0.0) upd = 0.0;
                     out[(size_t) ii * (size_t) B] += (T) upd;
+                    accepted_sum += upd;
+                    ++accepted_count;
                 }
             }
+            if (local_dropped)
+                dropped_updates.fetch_add(local_dropped, std::memory_order_relaxed);
         }
         if (do_timing) {
             const auto t5 = Clock::now();
             t.add_reduce(std::chrono::duration<double, std::milli>(t5 - t4).count());
         }
+    }
+    const unsigned long long ndrop = dropped_updates.load(std::memory_order_relaxed);
+    if (ndrop > 0) {
+        std::fprintf(stderr,
+            "[phase2-warn] dropped %llu oversized/non-finite updates in block [%d:%d) "
+            "(rel_factor=%.6g, mean_floor_ld=%.6g)\n",
+            ndrop, blk_start, blk_end, upd_rel_factor, upd_mean_floor_ld);
     }
     t.dump(blk_start, blk_end, B, tile_nvecs);
 }
@@ -2095,6 +2240,9 @@ void phase2_accum_XtXz_bed_mailman_impl(const std::string &bed_prefix,
     AlignedBuffer<T> rhs_panel_row;
     AlignedBuffer<T> proj_tmp(have_proj ? (size_t) p * (size_t) std::max(1, qpanel) : 0, 64);
     std::vector<double> sum_rhs_panel;
+    const double upd_rel_factor = phase2_upd_rel_factor();
+    const double upd_mean_floor_ld = phase2_upd_mean_floor_ld();
+    std::atomic<unsigned long long> dropped_updates{0};
 
     nb::gil_scoped_release nogil;
 
@@ -2154,6 +2302,7 @@ void phase2_accum_XtXz_bed_mailman_impl(const std::string &bed_prefix,
             #pragma omp for schedule(static)
 #endif
             for (int64_t seg = 0; seg < pack.n_segments; ++seg) {
+                unsigned long long local_dropped = 0;
                 const int base = (int) (seg * (int64_t) pack.segment_size);
                 const int actual = std::min(pack.segment_size, L - base);
                 if (pack.use_u16) {
@@ -2173,10 +2322,13 @@ void phase2_accum_XtXz_bed_mailman_impl(const std::string &bed_prefix,
                     const double mean2 = mean * mean;
                     T* out = Mptr + ((size_t) (blk_start + j) * (size_t) B);
                     const Tacc* src = raw_seg + (size_t) r * (size_t) q;
+                    double accepted_sum = 0.0;
+                    unsigned long long accepted_count = 0;
                     for (std::size_t sidx = 0; sidx < seg_k.size(); ++sidx) {
                         const int k = seg_k[sidx];
                         const int tcol = seg_tcol0[sidx];
                         const int len = seg_len[sidx];
+                        const double mean_floor_update = upd_mean_floor_ld * (double) len;
                         const double* sum_seg = sum_rhs + (size_t) tcol;
                         double sq = 0.0;
                         double dot = 0.0;
@@ -2189,17 +2341,29 @@ void phase2_accum_XtXz_bed_mailman_impl(const std::string &bed_prefix,
                             dot += w * sum_seg[(size_t) c];
                         }
                         double upd = (sq - 2.0 * mean * dot + mean2 * seg_sumsq[sidx]) * row_scale;
-                        if (!std::isfinite(upd)) continue;
-                        if constexpr (std::is_same_v<T, float>) {
-                            const double fmax = (double) std::numeric_limits<float>::max();
-                            if (upd > fmax) continue;
+                        const double running_limit = phase2_upd_running_limit(
+                            accepted_sum, accepted_count, mean_floor_update, upd_rel_factor);
+                        if (phase2_reject_update<T>(upd, running_limit)) {
+                            ++local_dropped;
+                            continue;
                         }
                         if (upd < 0.0) upd = 0.0;
                         out[(size_t) k] += (T) upd;
+                        accepted_sum += upd;
+                        ++accepted_count;
                     }
                 }
+                if (local_dropped)
+                    dropped_updates.fetch_add(local_dropped, std::memory_order_relaxed);
             }
         }
+    }
+    const unsigned long long ndrop = dropped_updates.load(std::memory_order_relaxed);
+    if (ndrop > 0) {
+        std::fprintf(stderr,
+            "[phase2-warn] dropped %llu oversized/non-finite mailman updates in block [%d:%d) "
+            "(rel_factor=%.6g, mean_floor_ld=%.6g)\n",
+            ndrop, blk_start, blk_end, upd_rel_factor, upd_mean_floor_ld);
     }
 }
 
@@ -2272,6 +2436,9 @@ void phase2_accum_XtXz_bed_mailman_rm_impl(const std::string &bed_prefix,
     }
 
     const int qpanel = compute_mailman_qpanel_table<Tacc>(pack.table_size, Q, pack.segment_size);
+    const double upd_rel_factor = phase2_upd_rel_factor();
+    const double upd_mean_floor_ld = phase2_upd_mean_floor_ld();
+    std::atomic<unsigned long long> dropped_updates{0};
 
     nb::gil_scoped_release nogil;
 
@@ -2337,7 +2504,8 @@ void phase2_accum_XtXz_bed_mailman_rm_impl(const std::string &bed_prefix,
                                                                          grp_k.data(), grp_tcol0.data(), grp_len.data(), grp_sumsq.data(), (int) grp_k.size(),
                                                                          left_scale.data(), pack.mean.data(),
                                                                          base, blk_start, B, Mptr,
-                                                                         work_table, row_buf);
+                                                                         work_table, row_buf,
+                                                                         upd_rel_factor, upd_mean_floor_ld, &dropped_updates);
                 } else {
                     mailman_pre_accum_groups_rowmajor<uint32_t, T, Tacc>(pack.packed32.data() + (size_t) seg * (size_t) N,
                                                                          actual, N, q, rhs, Q,
@@ -2345,10 +2513,18 @@ void phase2_accum_XtXz_bed_mailman_rm_impl(const std::string &bed_prefix,
                                                                          grp_k.data(), grp_tcol0.data(), grp_len.data(), grp_sumsq.data(), (int) grp_k.size(),
                                                                          left_scale.data(), pack.mean.data(),
                                                                          base, blk_start, B, Mptr,
-                                                                         work_table, row_buf);
+                                                                         work_table, row_buf,
+                                                                         upd_rel_factor, upd_mean_floor_ld, &dropped_updates);
                 }
             }
         }
+    }
+    const unsigned long long ndrop = dropped_updates.load(std::memory_order_relaxed);
+    if (ndrop > 0) {
+        std::fprintf(stderr,
+            "[phase2-warn] dropped %llu oversized/non-finite mailman rowmajor updates in block [%d:%d) "
+            "(rel_factor=%.6g, mean_floor_ld=%.6g)\n",
+            ndrop, blk_start, blk_end, upd_rel_factor, upd_mean_floor_ld);
     }
 }
 
@@ -2449,6 +2625,121 @@ static void project_target_block_inplace(T* G, int N, int L,
     T* tmp = tmp_buf.ptr;
     gemm_col_major_nn<T>(p, L, N, Rptr, p, G, N, tmp, p, T(1), T(0));
     gemm_col_major_nn<T>(N, L, p, Cptr, N, tmp, p, G, N, T(-1), T(1));
+}
+
+template <typename T>
+static void compute_inv_resvar_from_geno_block(
+    const T* Geno,
+    int N,
+    int L,
+    double eps,
+    nb::object C_opt,
+    nb::object R_opt,
+    nb::object gram_opt,
+    T* inv_out)
+{
+    if (!Geno || !inv_out)
+        throw std::runtime_error("Null buffer in compute_inv_resvar_from_geno_block");
+    if (N <= 1 || L < 0)
+        throw std::runtime_error("Invalid block dimensions in compute_inv_resvar_from_geno_block");
+
+    const bool c_missing = C_opt.is_none();
+    const bool r_missing = R_opt.is_none();
+    if (c_missing != r_missing)
+        throw std::runtime_error("C and R must be provided together for fused residual variances");
+
+    const bool have_proj = !c_missing;
+    int p = 0;
+    const T* Rptr = nullptr;
+    nb_mat2f_ro<T> Carr;
+    nb_mat2f_ro<T> Rarr;
+    nb_mat2c_ro<T> Garr;
+    const T* Gptr = nullptr;
+    if (have_proj) {
+        Carr = nb::cast<nb_mat2f_ro<T>>(C_opt);
+        Rarr = nb::cast<nb_mat2f_ro<T>>(R_opt);
+        p = (int) Carr.shape(1);
+        if ((int) Carr.shape(0) != N || (int) Rarr.shape(0) != p || (int) Rarr.shape(1) != N)
+            throw std::runtime_error("C/R shape mismatch in fused residual variances");
+        if (N - p <= 1)
+            throw std::runtime_error("N_eff must be > 1 in fused residual variances");
+        Rptr = Rarr.data();
+        if (!gram_opt.is_none()) {
+            Garr = nb::cast<nb_mat2c_ro<T>>(gram_opt);
+            if ((int) Garr.shape(0) != p || (int) Garr.shape(1) != p)
+                throw std::runtime_error("covariate Gram shape mismatch in fused residual variances");
+            Gptr = Garr.data();
+        }
+    }
+
+    const double proj_df = have_proj ? (double) (N - p - 1) : (double) (N - 1);
+    if (proj_df <= 0.0)
+        throw std::runtime_error("Projected residual df must be > 0 in fused residual variances");
+
+    nb::gil_scoped_release nogil;
+
+    static thread_local std::vector<double> ss_tls;
+    if (ss_tls.size() < (size_t) L)
+        ss_tls.resize((size_t) L);
+    double* ss = ss_tls.data();
+
+#ifdef _OPENMP
+    #pragma omp parallel for schedule(static)
+#endif
+    for (int j = 0; j < L; ++j) {
+        const T* col = Geno + (size_t) j * (size_t) N;
+        double acc = 0.0;
+        for (int i = 0; i < N; ++i) {
+            const double x = (double) col[(size_t) i];
+            acc += x * x;
+        }
+        ss[(size_t) j] = acc;
+    }
+
+    if (have_proj && p > 0) {
+        static thread_local AlignedBuffer<T> proj_tls;
+        const size_t need = (size_t) p * (size_t) L;
+        if (proj_tls.n < need)
+            proj_tls.allocate(need, 64);
+        T* proj = proj_tls.ptr;
+        gemm_col_major_nn<T>(p, L, N, Rptr, p, Geno, N, proj, p, T(1), T(0));
+
+#ifdef _OPENMP
+        #pragma omp parallel for schedule(static)
+#endif
+        for (int j = 0; j < L; ++j) {
+            const T* tcol = proj + (size_t) j * (size_t) p;
+            double h = 0.0;
+            for (int k = 0; k < p; ++k) {
+                const double v = (double) tcol[(size_t) k];
+                h += v * v;
+            }
+            double q = h;
+            if (Gptr) {
+                q = 0.0;
+                for (int a = 0; a < p; ++a) {
+                    const double ya = (double) tcol[(size_t) a];
+                    double gy = 0.0;
+                    const T* grow = Gptr + (size_t) a * (size_t) p;
+                    for (int b = 0; b < p; ++b)
+                        gy += (double) grow[(size_t) b] * (double) tcol[(size_t) b];
+                    q += ya * gy;
+                }
+            }
+            ss[(size_t) j] += q - 2.0 * h;
+        }
+    }
+
+#ifdef _OPENMP
+    #pragma omp parallel for schedule(static)
+#endif
+    for (int j = 0; j < L; ++j) {
+        const double var = ss[(size_t) j] / proj_df;
+        double safe = 0.0;
+        if (std::isnan(var)) safe = std::numeric_limits<double>::quiet_NaN();
+        else safe = (var > eps ? var : eps);
+        inv_out[(size_t) j] = (T) (1.0 / std::sqrt(safe));
+    }
 }
 
 template <typename T>
@@ -2750,26 +3041,34 @@ NB_MODULE(gwldcore, m) {
           nb::arg("row_sel") = nb::none(), nb::arg("ddof") = 1, nb::arg("annot_blk"), nb::arg("inv_right"),
           nb::arg("v_start"), nb::arg("v_count"), nb::arg("kmax_hint"), nb::arg("rand_dist") = "rademacher",
           nb::arg("seed") = nb::none(), nb::arg("Xz2d_chunk"), nb::arg("bin_init_mask") = nb::none(), nb::arg("project_right") = false,
-          nb::arg("C") = nb::none(), nb::arg("R") = nb::none(), nb::arg("impute_mode") = "hwe", nb::arg("impute_seed") = nb::none());
+          nb::arg("C") = nb::none(), nb::arg("R") = nb::none(), nb::arg("impute_mode") = "hwe", nb::arg("impute_seed") = nb::none(),
+          nb::arg("resvar_gram") = nb::none(),
+          nb::arg("inv_out") = nb::none(), nb::arg("resvar_eps") = 1e-10);
     m.def("phase1_compute_Xz_bed_chunk", &phase1_compute_Xz_bed_chunk_impl<double>,
           nb::arg("bed_prefix"), nb::arg("fam_path"), nb::arg("blk_start"), nb::arg("blk_end"),
           nb::arg("row_sel") = nb::none(), nb::arg("ddof") = 1, nb::arg("annot_blk"), nb::arg("inv_right"),
           nb::arg("v_start"), nb::arg("v_count"), nb::arg("kmax_hint"), nb::arg("rand_dist") = "rademacher",
           nb::arg("seed") = nb::none(), nb::arg("Xz2d_chunk"), nb::arg("bin_init_mask") = nb::none(), nb::arg("project_right") = false,
-          nb::arg("C") = nb::none(), nb::arg("R") = nb::none(), nb::arg("impute_mode") = "hwe", nb::arg("impute_seed") = nb::none());
+          nb::arg("C") = nb::none(), nb::arg("R") = nb::none(), nb::arg("impute_mode") = "hwe", nb::arg("impute_seed") = nb::none(),
+          nb::arg("resvar_gram") = nb::none(),
+          nb::arg("inv_out") = nb::none(), nb::arg("resvar_eps") = 1e-10);
 
     m.def("phase1_compute_Xz_bed_chunk_rowmajor", &phase1_compute_Xz_bed_chunk_rowmajor_impl<float>,
           nb::arg("bed_prefix"), nb::arg("fam_path"), nb::arg("blk_start"), nb::arg("blk_end"),
           nb::arg("row_sel") = nb::none(), nb::arg("ddof") = 1, nb::arg("annot_blk"), nb::arg("inv_right"),
           nb::arg("v_start"), nb::arg("v_count"), nb::arg("kmax_hint"), nb::arg("rand_dist") = "rademacher",
           nb::arg("seed") = nb::none(), nb::arg("Xz2d_chunk"), nb::arg("project_right") = false,
-          nb::arg("C") = nb::none(), nb::arg("R") = nb::none(), nb::arg("impute_mode") = "hwe", nb::arg("impute_seed") = nb::none());
+          nb::arg("C") = nb::none(), nb::arg("R") = nb::none(), nb::arg("impute_mode") = "hwe", nb::arg("impute_seed") = nb::none(),
+          nb::arg("resvar_gram") = nb::none(),
+          nb::arg("inv_out") = nb::none(), nb::arg("resvar_eps") = 1e-10);
     m.def("phase1_compute_Xz_bed_chunk_rowmajor", &phase1_compute_Xz_bed_chunk_rowmajor_impl<double>,
           nb::arg("bed_prefix"), nb::arg("fam_path"), nb::arg("blk_start"), nb::arg("blk_end"),
           nb::arg("row_sel") = nb::none(), nb::arg("ddof") = 1, nb::arg("annot_blk"), nb::arg("inv_right"),
           nb::arg("v_start"), nb::arg("v_count"), nb::arg("kmax_hint"), nb::arg("rand_dist") = "rademacher",
           nb::arg("seed") = nb::none(), nb::arg("Xz2d_chunk"), nb::arg("project_right") = false,
-          nb::arg("C") = nb::none(), nb::arg("R") = nb::none(), nb::arg("impute_mode") = "hwe", nb::arg("impute_seed") = nb::none());
+          nb::arg("C") = nb::none(), nb::arg("R") = nb::none(), nb::arg("impute_mode") = "hwe", nb::arg("impute_seed") = nb::none(),
+          nb::arg("resvar_gram") = nb::none(),
+          nb::arg("inv_out") = nb::none(), nb::arg("resvar_eps") = 1e-10);
 
     m.def("compute_col_sums_rowmajor", &compute_col_sums_rowmajor_impl<float>, nb::arg("Xz2d"));
     m.def("compute_col_sums_rowmajor", &compute_col_sums_rowmajor_impl<double>, nb::arg("Xz2d"));

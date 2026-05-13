@@ -51,7 +51,7 @@ class Sumcore:
         clip_nonfinite_vals=False,
         rg_se_method: str = "jackknife",
         intercept_chisq_thr=None,
-        intercept_weight_mode: str = "ldsc",
+        intercept_weight_mode: str = "score",
         intercept_rg=None,
         pheno_rg=None,
         pheno_rg_cov=None,

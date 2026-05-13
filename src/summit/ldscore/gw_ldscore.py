@@ -510,6 +510,8 @@ class GenomewideLDScore:
                 device='cpu',
                 use_tp32=False,
                 correct_skew: bool = False,
+                write_kmoments: bool = False,
+                skip_kmoments=None,
                 use_mailman: bool = True,
                 impute_method: str = 'mean'):
 
@@ -534,8 +536,15 @@ class GenomewideLDScore:
         self._mu22_precomputed = None
 
         self.correct_skew = bool(correct_skew)
+        if skip_kmoments is not None:
+            write_kmoments = bool(write_kmoments) and not bool(skip_kmoments)
+        self.write_kmoments = bool(write_kmoments)
         if self.correct_skew:
             self.log._log(f"[fs-corr] Fourth-moment correction enabled: {self.correct_skew}")
+        if self.write_kmoments:
+            self.log._log("[kmom] Higher-order GRM moment estimation enabled.")
+        else:
+            self.log._log("[kmom] Higher-order GRM moment estimation disabled.")
 
         if seed is None:
             self.root_seed = int(np.random.SeedSequence().generate_state(1, dtype=np.uint64)[0])
@@ -649,12 +658,16 @@ class GenomewideLDScore:
             self.row_sel = np.asarray(keep_idx_global, dtype=int)
             self.C = np.asarray(C, dtype=self.dtype, order='F')
             self.cov_R = np.asarray(R, dtype=self.dtype, order='F')
+            self.cov_gram = np.ascontiguousarray(
+                (np.asarray(self.C, dtype=np.float64).T @ np.asarray(self.C, dtype=np.float64)).astype(self.dtype, copy=False)
+            )
             self.nsamp = self.C.shape[0]
             self.log._log(f"Final sample count after covariate filtering/subsample: {self.nsamp}")
         else:
             self.row_sel = sel_idx if sel_idx is not None else None
             self.C = None
             self.cov_R = None
+            self.cov_gram = None
             if self.row_sel is not None:
                 self.nsamp = len(self.row_sel)
                 self.log._log(f"No covariates. Using random subsample: {self.nsamp} individuals.")
@@ -850,9 +863,17 @@ class GenomewideLDScore:
         self._mu22_precomputed = None
         gwldcore.clear_phase1_csr_cache()
 
-        with set_parallelism(omp_threads=min(self.num_threads, 16), blas_threads=t_blas1):
-            inv_all = self._precompute_residual_variances()
-            self.inv_sqrt_resvar_all = np.ascontiguousarray(inv_all.astype(self.dtype, copy=False))
+        fuse_resvar = (
+            not self.correct_skew
+            and str(os.environ.get("SUMMIT_FUSE_RESVAR", "1")).strip().lower() not in {"0", "false", "no", "off"}
+        )
+        if fuse_resvar:
+            self.log._log("[resvar] Fusing residual-variance estimation into the first phase-1 genotype pass.")
+            self.inv_sqrt_resvar_all = np.empty(int(self.nsnps), dtype=self.dtype, order="C")
+        else:
+            with set_parallelism(omp_threads=min(self.num_threads, 16), blas_threads=t_blas1):
+                inv_all = self._precompute_residual_variances()
+                self.inv_sqrt_resvar_all = np.ascontiguousarray(inv_all.astype(self.dtype, copy=False))
 
         blocks = self._make_compute_blocks()
         self.nblks = len(blocks)
@@ -951,6 +972,7 @@ class GenomewideLDScore:
         try:
             v_start = 0
             for vt_idx, Vt in enumerate(vtiles):
+                fuse_resvar_tile = bool(fuse_resvar and vt_idx == 0)
                 used_cols = B * Vt
                 if use_mailman_backend:
                     Xz_view = np.zeros((self.nsamp, used_cols), dtype=self.dtype, order='C')
@@ -967,11 +989,15 @@ class GenomewideLDScore:
                                 s2, e2 = blocks[blk_idx + 1]
                                 phase1_pref_ex.submit(gwldcore.prefetch_bed_block, bed_prefix, fam_path, int(s2), int(e2), 1)
                             kmax_hint = int(kmax_per_block[blk_idx])
-                            if kmax_hint == 0:
+                            if kmax_hint == 0 and not fuse_resvar_tile:
                                 bar.update(w1)
                                 continue
                             annot_blk = ann_blocks[blk_idx]
                             inv_right = inv_blocks[blk_idx]
+                            inv_out = inv_right if fuse_resvar_tile else None
+                            resvar_C = self.C if (fuse_resvar_tile and self.C is not None) else None
+                            resvar_R = self.cov_R if (fuse_resvar_tile and self.C is not None) else None
+                            resvar_gram = self.cov_gram if (fuse_resvar_tile and self.C is not None) else None
                             t0 = time.perf_counter()
                             if use_mailman_backend:
                                 gwldcore.phase1_compute_Xz_bed_chunk_rowmajor(
@@ -989,8 +1015,13 @@ class GenomewideLDScore:
                                     seed=self.root_seed,
                                     Xz2d_chunk=Xz_view,
                                     project_right=False,
+                                    C=resvar_C,
+                                    R=resvar_R,
                                     impute_mode=self.impute_method,
                                     impute_seed=int(self.impute_seed),
+                                    resvar_gram=resvar_gram,
+                                    inv_out=inv_out,
+                                    resvar_eps=float(self.eps_var),
                                 )
                             else:
                                 gwldcore.phase1_compute_Xz_bed_chunk(
@@ -1009,8 +1040,13 @@ class GenomewideLDScore:
                                     Xz2d_chunk=Xz_view,
                                     bin_init_mask=phase1_init,
                                     project_right=False,
+                                    C=resvar_C,
+                                    R=resvar_R,
                                     impute_mode=self.impute_method,
                                     impute_seed=int(self.impute_seed),
+                                    resvar_gram=resvar_gram,
+                                    inv_out=inv_out,
+                                    resvar_eps=float(self.eps_var),
                                 )
                             t1_total += (time.perf_counter() - t0)
                             bar.update(w1)
@@ -1183,7 +1219,7 @@ class GenomewideLDScore:
         out_df = pd.concat([self.snpdf, scores_df], axis=1)
         out_df.to_csv(f'{self.outpath}.gw.ldscore.gz', index=False, compression='gzip', sep='\t', float_format='%.6f')
 
-        if trace_k2_from_ldscore is not None:
+        if trace_k2_from_ldscore is not None and self.write_kmoments:
             self._estimate_unpartitioned_kmoments(trace_k2_from_ldscore=trace_k2_from_ldscore, num_probes=256)
 
         if self.correct_skew:

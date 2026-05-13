@@ -156,7 +156,7 @@ def build_parser() -> argparse.ArgumentParser:
                             "Build an rg manifest TSV from raw phenotype/covariate input and write it to this path. "
                             "Use together with --phen-dir, --sum-dir, and either --pair-list or (--phen-list --all-pairwise)."
                         ))
-
+    
     parser.add_argument("--compact", action="store_true", help="Write a compact rg manifest with only the core columns needed downstream.",)
     parser.add_argument("--rg-manifest-fast", action="store_true", default=False,
                         help=(
@@ -190,7 +190,7 @@ def build_parser() -> argparse.ArgumentParser:
                         help="Main chi^2 threshold. Use 'auto' for max(80, 0.001*Nmax).")
     parser.add_argument("--intercept-chisq-thr", default=None, type=str,
                         help="Chi^2 threshold used only for the cross-trait intercept regression. Use 'auto' for max(80, 0.001*Nmax).")
-    parser.add_argument("--intercept-weight-mode", default="ldsc", type=str,
+    parser.add_argument("--intercept-weight-mode", default="score", type=str,
                         choices=["ldsc", "score"],
                         help="Weighting scheme for the constrained cross-trait intercept fit: 'ldsc' for LDSC-style IRWLS weights, or 'score' for fixed w_j = 1 / w_ld,j.")
     parser.add_argument("--chisq-action", default="drop", type=str,
@@ -316,6 +316,9 @@ def build_parser() -> argparse.ArgumentParser:
                         help="If set, compute windowed LD scores with the given kb window.")
     parser.add_argument("--correct-skew", action="store_true",
                         help="Enable optional finite-sample skew diagnostics in genome-wide LD-score estimation.")
+    parser.add_argument("--write-kmoments", action="store_true",
+                        help="Write .gw.kmoments for unpartitioned genome-wide LD-score estimation.")
+    parser.add_argument("--skip-kmoments", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--use-mailman", default=False, type=str2bool,
                         help="Enable mailman in LD-score estimation.")
     parser.add_argument("--impute-method", default='mean', type=str, choices=['mean', 'hwe'],
@@ -538,6 +541,7 @@ def _dispatch_ldscore(args, log, verbose_on, low_level):
         device=args.device,
         use_tp32=args.use_tp32,
         correct_skew=args.correct_skew,
+        write_kmoments=(args.write_kmoments and not args.skip_kmoments),
         use_mailman=args.use_mailman,
         impute_method=args.impute_method,
     )
