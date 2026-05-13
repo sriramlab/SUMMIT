@@ -132,8 +132,6 @@ def build_parser() -> argparse.ArgumentParser:
                         help="Path to the primary LD-score file. Use '@' as a chromosome placeholder for split files.")
     parser.add_argument("--ldscores-reg", default=None, type=str,
                         help="Optional LD-score file used only for the bivariate intercept regression. Supports '@' chromosome split specs.")
-    parser.add_argument("--ldscores-reg-w", default=None, type=str,
-                        help="Optional 1D LD-score weight file used only for the bivariate intercept regression. Supports '@' chromosome split specs.")
     parser.add_argument("--collapse-reg-ld", action="store_true", default=False,
                         help="Collapse multi-column regression LD to 1D total LD for the bivariate intercept fit.")
 
@@ -148,20 +146,20 @@ def build_parser() -> argparse.ArgumentParser:
                         help=(
                             "Either a comma-separated pair of summary-statistics files for bivariate rg estimation, "
                             "where each file may be a chromosome-split '@' spec, "
-                            "or a manifest file path for batch rg. Manifest mode currently requires per-row phen1, phen2, "
-                            "sumstats1, sumstats2, and intercept_rg columns."
+                            "or a manifest file path for batch rg. Manifest mode requires per-row phen1, phen2, "
+                            "and sumstats1, sumstats2 columns; non-fast manifest mode also requires intercept_rg."
                         ))
     parser.add_argument("--make-rg-manifest", default=None, type=str,
                         help=(
                             "Build an rg manifest TSV from raw phenotype/covariate input and write it to this path. "
                             "Use together with --phen-dir, --sum-dir, and either --pair-list or (--phen-list --all-pairwise)."
                         ))
-    
+
     parser.add_argument("--compact", action="store_true", help="Write a compact rg manifest with only the core columns needed downstream.",)
     parser.add_argument("--rg-manifest-fast", action="store_true", default=False,
                         help=(
-                            "Use the experimental exact fast path for rg manifest mode. "
-                            "This keeps fixed pre-drop jackknife units, uses pair-specific masks via drop correction, "
+                            "Use the exact fast path for rg manifest mode. "
+                            "This reuses cached sumstats and constructs pair-specific jackknife/moment summaries, "
                             "writes manifest.results.tsv with total and per-bin rg/gamma columns, "
                             "and also emits per-pair .log files."
                         ))
@@ -604,7 +602,7 @@ def _dispatch_rg(args, log):
         out=args.out,
         ldscores=args.ldscores,
         ldscores_reg=args.ldscores_reg,
-        ldscores_reg_w=args.ldscores_reg_w,
+        ldscores_reg_w=None,
         njack=args.njack,
         annot=args.annot,
         enrich_mode=args.enrich_mode,
@@ -654,10 +652,12 @@ def _coerce_optional_cov_rank(val, *, row_label: str, col_name: str):
     return iv
 
 
-def _normalize_rg_manifest(path: str, log=None):
+def _normalize_rg_manifest(path: str, log=None, *, require_intercept: bool = True):
     raw = _read_rg_manifest(path)
 
-    required = ["phen1", "phen2", "sumstats1", "sumstats2", "intercept_rg"]
+    required = ["phen1", "phen2", "sumstats1", "sumstats2"]
+    if require_intercept:
+        required.append("intercept_rg")
     cols = {}
     for name in required:
         hit = _manifest_column(raw, name)
@@ -665,6 +665,7 @@ def _normalize_rg_manifest(path: str, log=None):
             raise ValueError(f"RG manifest '{path}' is missing required column '{name}'.")
         cols[name] = hit
 
+    intercept_col = _manifest_column(raw, "intercept_rg")
     opt_cov1 = _manifest_column(raw, "cov_rank1")
     opt_cov2 = _manifest_column(raw, "cov_rank2")
 
@@ -687,10 +688,16 @@ def _normalize_rg_manifest(path: str, log=None):
         if not utils._path_spec_exists(sumstats2):
             raise ValueError(f"Manifest row {row_id}: could not find sumstats2 file/spec '{sumstats2_raw}'.")
 
-        intercept_rg = pd.to_numeric(pd.Series([row[cols["intercept_rg"]]]), errors="coerce").iloc[0]
-        if not pd.notna(intercept_rg):
-            raise ValueError(f"Manifest row {row_id}: intercept_rg must be finite.")
-        intercept_rg = float(intercept_rg)
+        if intercept_col is None:
+            intercept_rg = np.nan
+        else:
+            intercept_rg = pd.to_numeric(pd.Series([row[intercept_col]]), errors="coerce").iloc[0]
+            if not pd.notna(intercept_rg):
+                if require_intercept:
+                    raise ValueError(f"Manifest row {row_id}: intercept_rg must be finite.")
+                intercept_rg = np.nan
+            else:
+                intercept_rg = float(intercept_rg)
 
         cov_rank1 = _coerce_optional_cov_rank(row[opt_cov1], row_label=str(row_id), col_name="cov_rank1") if opt_cov1 is not None else None
         cov_rank2 = _coerce_optional_cov_rank(row[opt_cov2], row_label=str(row_id), col_name="cov_rank2") if opt_cov2 is not None else None
@@ -926,10 +933,15 @@ def _dispatch_rg_manifest(args, log):
         raise SystemExit(1)
 
     verbose_level = _verbose_to_level(args.verbose)
-    manifest_df, trait_meta = _normalize_rg_manifest(args.rg, log=log)
+    manifest_df, trait_meta = _normalize_rg_manifest(
+        args.rg,
+        log=log,
+        require_intercept=(not bool(getattr(args, "rg_manifest_fast", False))),
+    )
 
     if bool(getattr(args, "rg_manifest_fast", False)):
-        dispatch_rg_manifest_fast(args, log, manifest_df, trait_meta, verbose_level)
+        execution_plan = _plan_rg_manifest_order(manifest_df, log=log)
+        dispatch_rg_manifest_fast(args, log, manifest_df, trait_meta, verbose_level, execution_plan=execution_plan)
         return
 
     execution_plan = _plan_rg_manifest_order(manifest_df, log=log)
@@ -942,7 +954,7 @@ def _dispatch_rg_manifest(args, log):
         log=log,
         ldscores=args.ldscores,
         ldscores_reg=args.ldscores_reg,
-        ldscores_reg_w=args.ldscores_reg_w,
+        ldscores_reg_w=None,
         annot=args.annot,
         verbose=bool(verbose_level),
         delta=None,

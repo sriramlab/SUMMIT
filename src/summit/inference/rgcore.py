@@ -1412,7 +1412,7 @@ def _select_intercept_weight_ld(trace_view, regsys: InterceptRegressionSystem, *
 
     raise RuntimeError(
         "Partitioned summary-only intercept regression requires a separate 1D regression-weight LD score "
-        "(ldscores_reg_w / --ldscores-reg-w)."
+        "(ldscores_reg_w)."
     )
 
 
