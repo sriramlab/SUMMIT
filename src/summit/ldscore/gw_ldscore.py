@@ -310,6 +310,27 @@ def _clear_phase1_native_scratch() -> None:
         pass
 
 
+def _clear_phase2_native_scratch() -> None:
+    try:
+        gwldcore.clear_phase2_native_scratch()
+    except AttributeError:
+        pass
+
+
+def _clear_gwld_native_scratch() -> None:
+    try:
+        gwldcore.clear_gwld_native_scratch()
+        return
+    except AttributeError:
+        pass
+    _clear_phase1_native_scratch()
+    _clear_phase2_native_scratch()
+    try:
+        gwldcore.clear_gwld_genotype_scratch()
+    except AttributeError:
+        pass
+
+
 def _round_up_to(x, gran):
     return int(((x + gran - 1) // gran) * gran)
 
@@ -909,9 +930,13 @@ class GenomewideLDScore:
             self.log._log("[resvar] Fusing residual-variance estimation into the first phase-1 genotype pass.")
             self.inv_sqrt_resvar_all = np.empty(int(self.nsnps), dtype=self.dtype, order="C")
         else:
-            with set_parallelism(omp_threads=min(self.num_threads, 16), blas_threads=t_blas1):
-                inv_all = self._precompute_residual_variances()
-                self.inv_sqrt_resvar_all = np.ascontiguousarray(inv_all.astype(self.dtype, copy=False))
+            try:
+                with set_parallelism(omp_threads=min(self.num_threads, 16), blas_threads=t_blas1):
+                    inv_all = self._precompute_residual_variances()
+                    self.inv_sqrt_resvar_all = np.ascontiguousarray(inv_all.astype(self.dtype, copy=False))
+            except Exception:
+                _clear_gwld_native_scratch()
+                raise
 
         blocks = self._make_compute_blocks()
         self.nblks = len(blocks)
@@ -1199,6 +1224,8 @@ class GenomewideLDScore:
                         finally:
                             pref_ex.shutdown(wait=True)
 
+                _clear_phase2_native_scratch()
+
                 ema_p1 = 0.85 * ema_p1 + 0.15 * max(t1_total, 1e-9)
                 ema_p2 = 0.85 * ema_p2 + 0.15 * max(t2_total, 1e-9)
                 w1 = float(ema_p1 / (ema_p1 + ema_p2))
@@ -1219,6 +1246,7 @@ class GenomewideLDScore:
                 gwldcore.clear_phase1_csr_cache()
             except Exception:
                 pass
+            _clear_gwld_native_scratch()
 
         meansq = (meansq_accum / float(self.nvecs)).astype(self.dtype, copy=False)
 
@@ -1348,68 +1376,71 @@ class GenomewideLDScore:
 
         self.log._log(f"[kmom] Estimating unpartitioned GRM moments with {q} sample-space probes (CPU, dtype=float64, seed={probe_seed}, dist={self.rand_dist}).")
 
-        with set_parallelism(omp_threads=(self.num_threads if (self.use_mailman and self.impute_method == "hwe") else 1),
-                             blas_threads=(1 if (self.use_mailman and self.impute_method == "hwe") else self.num_threads)):
-            if self.use_mailman and self.impute_method == "hwe":
-                gwldcore.apply_grm_bed_panel_mailman(
-                    bed_prefix=self.bed_prefix,
-                    fam_path=self.fam_path,
-                    nsnps=int(self.nsnps),
-                    step_size=int(self.step_size),
-                    row_sel=(self.row_sel if self.row_sel is not None else None),
-                    ddof=int(self.ddof),
-                    inv_all=inv_all,
-                    panel_in=Z,
-                    panel_out=Y1,
-                    C=(C_mom if C_mom is not None else None),
-                    R=(R_mom if R_mom is not None else None),
-                    impute_seed=int(self.impute_seed),
-                )
-                gwldcore.apply_grm_bed_panel_mailman(
-                    bed_prefix=self.bed_prefix,
-                    fam_path=self.fam_path,
-                    nsnps=int(self.nsnps),
-                    step_size=int(self.step_size),
-                    row_sel=(self.row_sel if self.row_sel is not None else None),
-                    ddof=int(self.ddof),
-                    inv_all=inv_all,
-                    panel_in=Y1,
-                    panel_out=Y2,
-                    C=(C_mom if C_mom is not None else None),
-                    R=(R_mom if R_mom is not None else None),
-                    impute_seed=int(self.impute_seed),
-                )
-            else:
-                gwldcore.apply_grm_bed_panel(
-                    bed_prefix=self.bed_prefix,
-                    fam_path=self.fam_path,
-                    nsnps=int(self.nsnps),
-                    step_size=int(self.step_size),
-                    row_sel=(self.row_sel if self.row_sel is not None else None),
-                    ddof=int(self.ddof),
-                    inv_all=inv_all,
-                    panel_in=Z,
-                    panel_out=Y1,
-                    C=(C_mom if C_mom is not None else None),
-                    R=(R_mom if R_mom is not None else None),
-                    impute_mode=self.impute_method,
-                    impute_seed=int(self.impute_seed),
-                )
-                gwldcore.apply_grm_bed_panel(
-                    bed_prefix=self.bed_prefix,
-                    fam_path=self.fam_path,
-                    nsnps=int(self.nsnps),
-                    step_size=int(self.step_size),
-                    row_sel=(self.row_sel if self.row_sel is not None else None),
-                    ddof=int(self.ddof),
-                    inv_all=inv_all,
-                    panel_in=Y1,
-                    panel_out=Y2,
-                    C=(C_mom if C_mom is not None else None),
-                    R=(R_mom if R_mom is not None else None),
-                    impute_mode=self.impute_method,
-                    impute_seed=int(self.impute_seed),
-                )
+        try:
+            with set_parallelism(omp_threads=(self.num_threads if (self.use_mailman and self.impute_method == "hwe") else 1),
+                                 blas_threads=(1 if (self.use_mailman and self.impute_method == "hwe") else self.num_threads)):
+                if self.use_mailman and self.impute_method == "hwe":
+                    gwldcore.apply_grm_bed_panel_mailman(
+                        bed_prefix=self.bed_prefix,
+                        fam_path=self.fam_path,
+                        nsnps=int(self.nsnps),
+                        step_size=int(self.step_size),
+                        row_sel=(self.row_sel if self.row_sel is not None else None),
+                        ddof=int(self.ddof),
+                        inv_all=inv_all,
+                        panel_in=Z,
+                        panel_out=Y1,
+                        C=(C_mom if C_mom is not None else None),
+                        R=(R_mom if R_mom is not None else None),
+                        impute_seed=int(self.impute_seed),
+                    )
+                    gwldcore.apply_grm_bed_panel_mailman(
+                        bed_prefix=self.bed_prefix,
+                        fam_path=self.fam_path,
+                        nsnps=int(self.nsnps),
+                        step_size=int(self.step_size),
+                        row_sel=(self.row_sel if self.row_sel is not None else None),
+                        ddof=int(self.ddof),
+                        inv_all=inv_all,
+                        panel_in=Y1,
+                        panel_out=Y2,
+                        C=(C_mom if C_mom is not None else None),
+                        R=(R_mom if R_mom is not None else None),
+                        impute_seed=int(self.impute_seed),
+                    )
+                else:
+                    gwldcore.apply_grm_bed_panel(
+                        bed_prefix=self.bed_prefix,
+                        fam_path=self.fam_path,
+                        nsnps=int(self.nsnps),
+                        step_size=int(self.step_size),
+                        row_sel=(self.row_sel if self.row_sel is not None else None),
+                        ddof=int(self.ddof),
+                        inv_all=inv_all,
+                        panel_in=Z,
+                        panel_out=Y1,
+                        C=(C_mom if C_mom is not None else None),
+                        R=(R_mom if R_mom is not None else None),
+                        impute_mode=self.impute_method,
+                        impute_seed=int(self.impute_seed),
+                    )
+                    gwldcore.apply_grm_bed_panel(
+                        bed_prefix=self.bed_prefix,
+                        fam_path=self.fam_path,
+                        nsnps=int(self.nsnps),
+                        step_size=int(self.step_size),
+                        row_sel=(self.row_sel if self.row_sel is not None else None),
+                        ddof=int(self.ddof),
+                        inv_all=inv_all,
+                        panel_in=Y1,
+                        panel_out=Y2,
+                        C=(C_mom if C_mom is not None else None),
+                        R=(R_mom if R_mom is not None else None),
+                        impute_mode=self.impute_method,
+                        impute_seed=int(self.impute_seed),
+                    )
+        finally:
+            _clear_gwld_native_scratch()
 
         k1_each = np.sum(Z * Y1, axis=0, dtype=np.float64)
         k2_each = np.sum(Y1 * Y1, axis=0, dtype=np.float64)

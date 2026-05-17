@@ -64,7 +64,6 @@ struct AlignedBuffer {
 
 template <typename T>
 struct Phase1ColmajorScratch {
-    AlignedBuffer<T> Geno;
     AlignedBuffer<T> tmpG;
     AlignedBuffer<T> Z;
     AlignedBuffer<T> Bcol_shared;
@@ -72,9 +71,20 @@ struct Phase1ColmajorScratch {
 
 template <typename T>
 struct Phase1RowmajorScratch {
-    AlignedBuffer<T> Geno;
     AlignedBuffer<T> tmpG;
 };
+
+template <typename T>
+struct Phase2BedScratch {
+    AlignedBuffer<T> tmpG;
+    AlignedBuffer<T> Work_panel;
+};
+
+template <typename T>
+static AlignedBuffer<T>& gwld_genotype_scratch() {
+    static thread_local AlignedBuffer<T> scratch;
+    return scratch;
+}
 
 template <typename T>
 static Phase1ColmajorScratch<T>& phase1_colmajor_scratch() {
@@ -95,18 +105,40 @@ static AlignedBuffer<T>& phase1_atile_scratch() {
 }
 
 template <typename T>
+static Phase2BedScratch<T>& phase2_bed_scratch() {
+    static thread_local Phase2BedScratch<T> scratch;
+    return scratch;
+}
+
+static AlignedBuffer<double>& phase2_acc_scratch() {
+    static thread_local AlignedBuffer<double> scratch;
+    return scratch;
+}
+
+template <typename T>
 static void clear_phase1_native_scratch_for_current_thread() {
     auto& col = phase1_colmajor_scratch<T>();
-    col.Geno.free();
     col.tmpG.free();
     col.Z.free();
     col.Bcol_shared.free();
 
     auto& row = phase1_rowmajor_scratch<T>();
-    row.Geno.free();
     row.tmpG.free();
 
     phase1_atile_scratch<T>().free();
+}
+
+template <typename T>
+static void clear_phase2_native_scratch_for_current_thread() {
+    auto& bed = phase2_bed_scratch<T>();
+    bed.tmpG.free();
+    bed.Work_panel.free();
+    phase2_acc_scratch().free();
+}
+
+template <typename T>
+static void clear_gwld_genotype_scratch_for_current_thread() {
+    gwld_genotype_scratch<T>().free();
 }
 
 static void clear_phase1_native_scratch_impl() {
@@ -121,9 +153,50 @@ static void clear_phase1_native_scratch_impl() {
 #endif
 }
 
+static void clear_phase2_native_scratch_impl() {
+    clear_phase2_native_scratch_for_current_thread<float>();
+    clear_phase2_native_scratch_for_current_thread<double>();
+#ifdef _OPENMP
+    #pragma omp parallel
+    {
+        clear_phase2_native_scratch_for_current_thread<float>();
+        clear_phase2_native_scratch_for_current_thread<double>();
+    }
+#endif
+}
+
+static void clear_gwld_genotype_scratch_impl() {
+    clear_gwld_genotype_scratch_for_current_thread<float>();
+    clear_gwld_genotype_scratch_for_current_thread<double>();
+#ifdef _OPENMP
+    #pragma omp parallel
+    {
+        clear_gwld_genotype_scratch_for_current_thread<float>();
+        clear_gwld_genotype_scratch_for_current_thread<double>();
+    }
+#endif
+}
+
 static void clear_phase1_native_scratch_py() {
     nb::gil_scoped_release nogil;
     clear_phase1_native_scratch_impl();
+}
+
+static void clear_phase2_native_scratch_py() {
+    nb::gil_scoped_release nogil;
+    clear_phase2_native_scratch_impl();
+}
+
+static void clear_gwld_genotype_scratch_py() {
+    nb::gil_scoped_release nogil;
+    clear_gwld_genotype_scratch_impl();
+}
+
+static void clear_gwld_native_scratch_py() {
+    nb::gil_scoped_release nogil;
+    clear_phase1_native_scratch_impl();
+    clear_phase2_native_scratch_impl();
+    clear_gwld_genotype_scratch_impl();
 }
 
 template <typename T>
@@ -1165,7 +1238,7 @@ void apply_grm_bed_panel_impl(
             continue;
 
         int N_blk = 0, L_blk = 0;
-        static thread_local AlignedBuffer<T> Geno_tls;
+        AlignedBuffer<T>& Geno_tls = gwld_genotype_scratch<T>();
         T* Geno = read_block_standardized_aligned<T>(bed_path, fam_path, s, e,
                                                      rows, ddof,
                                                      impute_mode, impute_seed,
@@ -1487,7 +1560,7 @@ void phase1_compute_Xz_bed_chunk_impl(const std::string &bed_prefix,
 
     int N = 0, L = 0;
     auto& scratch = phase1_colmajor_scratch<T>();
-    AlignedBuffer<T>& Geno_tls = scratch.Geno;
+    AlignedBuffer<T>& Geno_tls = gwld_genotype_scratch<T>();
     T* Geno = read_block_standardized_aligned<T>(bed_path, fam_path, blk_start, blk_end,
                                                  rows, ddof,
                                                  impute_mode, impute_seed,
@@ -1761,7 +1834,7 @@ void phase1_compute_Xz_bed_chunk_rowmajor_impl(const std::string &bed_prefix,
 
     int N = 0, L = 0;
     auto& scratch = phase1_rowmajor_scratch<T>();
-    AlignedBuffer<T>& Geno_tls = scratch.Geno;
+    AlignedBuffer<T>& Geno_tls = gwld_genotype_scratch<T>();
     T* Geno = read_block_standardized_aligned<T>(bed_path, fam_path, blk_start, blk_end,
                                                  rows, ddof,
                                                  impute_mode, impute_seed,
@@ -1959,7 +2032,8 @@ void phase2_compute_XtXz_bed_impl(const std::string &bed_prefix,
     const std::vector<int>& rows = parse_row_sel(row_sel_obj, N_total);
 
     int N = 0, L = 0;
-    static thread_local AlignedBuffer<T> Geno_tls;
+    auto& scratch = phase2_bed_scratch<T>();
+    AlignedBuffer<T>& Geno_tls = gwld_genotype_scratch<T>();
     T* Geno = read_block_standardized_aligned<T>(bed_path, fam_path, blk_start, blk_end,
                                                  rows, ddof,
                                                  impute_mode, impute_seed,
@@ -1975,7 +2049,7 @@ void phase2_compute_XtXz_bed_impl(const std::string &bed_prefix,
             throw std::runtime_error("C/R shape mismatch");
         const T* Cptr = C.data();
         const T* Rptr = R.data();
-        static thread_local AlignedBuffer<T> tmpG_tls;
+        AlignedBuffer<T>& tmpG_tls = scratch.tmpG;
         const size_t need_tmp = (size_t) p * (size_t) L;
         if (tmpG_tls.n < need_tmp) tmpG_tls.allocate(need_tmp, 64);
         gemm_col_major_nn<T>(p, L, N, Rptr, p, Geno, N, tmpG_tls.ptr, p, T(1), T(0));
@@ -2015,7 +2089,7 @@ void phase2_compute_XtXz_bed_impl(const std::string &bed_prefix,
     QPANEL = round_down(QPANEL, 64);
     if (QPANEL < 64) QPANEL = std::min(Q, 64);
 
-    static thread_local AlignedBuffer<T> Work_panel_tls;
+    AlignedBuffer<T>& Work_panel_tls = scratch.Work_panel;
     const size_t needW = (size_t) L * (size_t) QPANEL;
     if (Work_panel_tls.n < needW) Work_panel_tls.allocate(needW, 64);
     T* Work = Work_panel_tls.ptr;
@@ -2074,7 +2148,7 @@ void phase2_compute_XtXz_bed_impl(const std::string &bed_prefix,
 #endif
         for (int i0 = 0; i0 < L; i0 += IBLK) {
             const int ib = std::min(IBLK, L - i0);
-            static thread_local AlignedBuffer<double> acc_tls;
+            AlignedBuffer<double>& acc_tls = phase2_acc_scratch();
             if (acc_tls.n < (size_t) IBLK) acc_tls.allocate((size_t) IBLK, 64);
             double* acc = acc_tls.ptr;
             unsigned long long local_nonfinite = 0;
@@ -2155,7 +2229,8 @@ void phase2_accum_XtXz_bed_impl(const std::string &bed_prefix,
     const std::vector<int>& rows = parse_row_sel(row_sel_obj, N_total);
 
     int N = 0, L = 0;
-    static thread_local AlignedBuffer<T> Geno_tls;
+    auto& scratch = phase2_bed_scratch<T>();
+    AlignedBuffer<T>& Geno_tls = gwld_genotype_scratch<T>();
     T* Geno = read_block_standardized_aligned<T>(bed_path, fam_path, blk_start, blk_end,
                                                  rows, ddof,
                                                  impute_mode, impute_seed,
@@ -2171,7 +2246,7 @@ void phase2_accum_XtXz_bed_impl(const std::string &bed_prefix,
             throw std::runtime_error("C/R shape mismatch in phase2_accum_XtXz_bed");
         const T* Cptr = C.data();
         const T* Rptr = R.data();
-        static thread_local AlignedBuffer<T> tmpG_tls;
+        AlignedBuffer<T>& tmpG_tls = scratch.tmpG;
         const size_t need_tmp = (size_t) p * (size_t) L;
         if (tmpG_tls.n < need_tmp) tmpG_tls.allocate(need_tmp, 64);
         gemm_col_major_nn<T>(p, L, N, Rptr, p, Geno, N, tmpG_tls.ptr, p, T(1), T(0));
@@ -2220,7 +2295,7 @@ void phase2_accum_XtXz_bed_impl(const std::string &bed_prefix,
     QPANEL = round_down(QPANEL, 64);
     if (QPANEL < 64) QPANEL = std::min(Q, 64);
 
-    static thread_local AlignedBuffer<T> Work_panel_tls;
+    AlignedBuffer<T>& Work_panel_tls = scratch.Work_panel;
     const size_t needW = (size_t) L * (size_t) QPANEL;
     if (Work_panel_tls.n < needW) Work_panel_tls.allocate(needW, 64);
     T* Work = Work_panel_tls.ptr;
@@ -2283,7 +2358,7 @@ void phase2_accum_XtXz_bed_impl(const std::string &bed_prefix,
 #endif
         for (int i0 = 0; i0 < L; i0 += IBLK) {
             const int ib = std::min(IBLK, L - i0);
-            static thread_local AlignedBuffer<double> acc_tls;
+            AlignedBuffer<double>& acc_tls = phase2_acc_scratch();
             if (acc_tls.n < (size_t) IBLK) acc_tls.allocate((size_t) IBLK, 64);
             double* acc = acc_tls.ptr;
             unsigned long long local_nonfinite = 0;
@@ -3035,7 +3110,7 @@ nb::tuple precompute_residual_variances_bed_impl(
                 continue;
 
             int N_blk = 0, L_blk = 0;
-            static thread_local AlignedBuffer<T> Geno_tls;
+            AlignedBuffer<T>& Geno_tls = gwld_genotype_scratch<T>();
             T* Geno = read_block_standardized_aligned<T>(bed_path, fam_path, s, e,
                                                          rows, ddof,
                                                          impute_mode, impute_seed,
@@ -3281,6 +3356,9 @@ NB_MODULE(gwldcore, m) {
           nb::arg("impute_mode") = "hwe", nb::arg("impute_seed") = nb::none());
 
     m.def("clear_phase1_native_scratch", &clear_phase1_native_scratch_py);
+    m.def("clear_phase2_native_scratch", &clear_phase2_native_scratch_py);
+    m.def("clear_gwld_genotype_scratch", &clear_gwld_genotype_scratch_py);
+    m.def("clear_gwld_native_scratch", &clear_gwld_native_scratch_py);
     m.def("clear_phase1_csr_cache", &clear_phase1_csr_cache);
 
     m.def("precompute_residual_variances_bed", &precompute_residual_variances_bed_impl<float>,
