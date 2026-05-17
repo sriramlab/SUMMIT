@@ -303,6 +303,13 @@ def set_parallelism(omp_threads: int | None = None, blas_threads: int | None = N
                 os.environ[key] = val
 
 
+def _clear_phase1_native_scratch() -> None:
+    try:
+        gwldcore.clear_phase1_native_scratch()
+    except AttributeError:
+        pass
+
+
 def _round_up_to(x, gran):
     return int(((x + gran - 1) // gran) * gran)
 
@@ -359,6 +366,33 @@ def _zero_colmajor_bin_runs(X: np.ndarray, zero_bins: np.ndarray, vcount: int) -
         X[:, start * vcount:(prev + 1) * vcount].fill(0)
         start = prev = k
     X[:, start * vcount:(prev + 1) * vcount].fill(0)
+
+
+def _orthonormal_covariate_basis(C64: np.ndarray):
+    C64 = np.asarray(C64, dtype=np.float64)
+    if C64.ndim != 2 or C64.shape[0] == 0 or C64.shape[1] == 0:
+        raise ValueError("Covariate matrix must be non-empty.")
+
+    gram = C64.T @ C64
+    gram = (gram + gram.T) * 0.5
+    evals, evecs = np.linalg.eigh(gram)
+    if evals.size == 0:
+        raise ValueError("Covariate matrix must contain at least one column.")
+
+    lam_max = float(max(evals[-1], 0.0))
+    tol = float(max(C64.shape) * np.finfo(np.float64).eps * lam_max) if lam_max > 0.0 else 0.0
+    keep = evals > tol
+    rank = int(np.count_nonzero(keep))
+    if rank == 0:
+        raise ValueError("After cleaning, covariates have numerical rank zero.")
+
+    basis = evecs[:, keep] / np.sqrt(evals[keep])[None, :]
+    Q = C64 @ basis
+
+    # Remove roundoff from the Gram eigensolve without changing the selected
+    # covariate column space.
+    Q, _ = np.linalg.qr(Q, mode='reduced')
+    return np.asfortranarray(Q), rank, tol, float(evals[0]), lam_max
 
 
 def _bytes_human(n):
@@ -471,9 +505,8 @@ def read_cov(
         raise ValueError("After cleaning, no usable covariates remain.")
 
     C64 = df.to_numpy(dtype=np.float64)
-    Q, _ = np.linalg.qr(C64, mode='reduced')
-    C = np.asfortranarray(Q)
-    R = np.asfortranarray(Q.T)
+    C, cov_rank, rank_tol, min_eval, max_eval = _orthonormal_covariate_basis(C64)
+    R = np.asfortranarray(C.T)
 
     km = np.flatnonzero(keep_mask.values) if isinstance(keep_mask, pd.Series) else np.flatnonzero(keep_mask)
     if sample_idx is not None:
@@ -482,6 +515,11 @@ def read_cov(
         keep_idx_global = km
 
     if logger:
+        if cov_rank < C64.shape[1]:
+            logger._log(
+                f"Dropped {C64.shape[1] - cov_rank} linearly dependent covariate direction(s) "
+                f"by Gram eigendecomposition (tol={rank_tol:.6e}, min_eval={min_eval:.6e}, max_eval={max_eval:.6e})."
+            )
         logger._log(f"Read {cov_filename}: kept {C.shape[0]} samples, {C.shape[1]} effective covariates. C shape={C.shape}, R shape=({R.shape[0]},{R.shape[1]}).")
 
     return C, R, keep_idx_global
@@ -984,72 +1022,75 @@ class GenomewideLDScore:
                 phase1_pref_ex = ThreadPoolExecutor(max_workers=1)
                 try:
                     with set_parallelism(omp_threads=t_omp1, blas_threads=t_blas1):
-                        for blk_idx, (s, e) in enumerate(blocks):
-                            if blk_idx + 1 < len(blocks):
-                                s2, e2 = blocks[blk_idx + 1]
-                                phase1_pref_ex.submit(gwldcore.prefetch_bed_block, bed_prefix, fam_path, int(s2), int(e2), 1)
-                            kmax_hint = int(kmax_per_block[blk_idx])
-                            if kmax_hint == 0 and not fuse_resvar_tile:
+                        try:
+                            for blk_idx, (s, e) in enumerate(blocks):
+                                if blk_idx + 1 < len(blocks):
+                                    s2, e2 = blocks[blk_idx + 1]
+                                    phase1_pref_ex.submit(gwldcore.prefetch_bed_block, bed_prefix, fam_path, int(s2), int(e2), 1)
+                                kmax_hint = int(kmax_per_block[blk_idx])
+                                if kmax_hint == 0 and not fuse_resvar_tile:
+                                    bar.update(w1)
+                                    continue
+                                annot_blk = ann_blocks[blk_idx]
+                                inv_right = inv_blocks[blk_idx]
+                                inv_out = inv_right if fuse_resvar_tile else None
+                                resvar_C = self.C if (fuse_resvar_tile and self.C is not None) else None
+                                resvar_R = self.cov_R if (fuse_resvar_tile and self.C is not None) else None
+                                resvar_gram = self.cov_gram if (fuse_resvar_tile and self.C is not None) else None
+                                t0 = time.perf_counter()
+                                if use_mailman_backend:
+                                    gwldcore.phase1_compute_Xz_bed_chunk_rowmajor(
+                                        bed_prefix=bed_prefix,
+                                        fam_path=fam_path,
+                                        blk_start=int(s), blk_end=int(e),
+                                        row_sel=row_sel,
+                                        ddof=ddof,
+                                        annot_blk=annot_blk,
+                                        inv_right=inv_right,
+                                        v_start=int(v_start),
+                                        v_count=int(Vt),
+                                        kmax_hint=kmax_hint,
+                                        rand_dist=self.rand_dist,
+                                        seed=self.root_seed,
+                                        Xz2d_chunk=Xz_view,
+                                        project_right=False,
+                                        C=resvar_C,
+                                        R=resvar_R,
+                                        impute_mode=self.impute_method,
+                                        impute_seed=int(self.impute_seed),
+                                        resvar_gram=resvar_gram,
+                                        inv_out=inv_out,
+                                        resvar_eps=float(self.eps_var),
+                                    )
+                                else:
+                                    gwldcore.phase1_compute_Xz_bed_chunk(
+                                        bed_prefix=bed_prefix,
+                                        fam_path=fam_path,
+                                        blk_start=int(s), blk_end=int(e),
+                                        row_sel=row_sel,
+                                        ddof=ddof,
+                                        annot_blk=annot_blk,
+                                        inv_right=inv_right,
+                                        v_start=int(v_start),
+                                        v_count=int(Vt),
+                                        kmax_hint=kmax_hint,
+                                        rand_dist=self.rand_dist,
+                                        seed=self.root_seed,
+                                        Xz2d_chunk=Xz_view,
+                                        bin_init_mask=phase1_init,
+                                        project_right=False,
+                                        C=resvar_C,
+                                        R=resvar_R,
+                                        impute_mode=self.impute_method,
+                                        impute_seed=int(self.impute_seed),
+                                        resvar_gram=resvar_gram,
+                                        inv_out=inv_out,
+                                        resvar_eps=float(self.eps_var),
+                                    )
+                                t1_total += (time.perf_counter() - t0)
                                 bar.update(w1)
-                                continue
-                            annot_blk = ann_blocks[blk_idx]
-                            inv_right = inv_blocks[blk_idx]
-                            inv_out = inv_right if fuse_resvar_tile else None
-                            resvar_C = self.C if (fuse_resvar_tile and self.C is not None) else None
-                            resvar_R = self.cov_R if (fuse_resvar_tile and self.C is not None) else None
-                            resvar_gram = self.cov_gram if (fuse_resvar_tile and self.C is not None) else None
-                            t0 = time.perf_counter()
-                            if use_mailman_backend:
-                                gwldcore.phase1_compute_Xz_bed_chunk_rowmajor(
-                                    bed_prefix=bed_prefix,
-                                    fam_path=fam_path,
-                                    blk_start=int(s), blk_end=int(e),
-                                    row_sel=row_sel,
-                                    ddof=ddof,
-                                    annot_blk=annot_blk,
-                                    inv_right=inv_right,
-                                    v_start=int(v_start),
-                                    v_count=int(Vt),
-                                    kmax_hint=kmax_hint,
-                                    rand_dist=self.rand_dist,
-                                    seed=self.root_seed,
-                                    Xz2d_chunk=Xz_view,
-                                    project_right=False,
-                                    C=resvar_C,
-                                    R=resvar_R,
-                                    impute_mode=self.impute_method,
-                                    impute_seed=int(self.impute_seed),
-                                    resvar_gram=resvar_gram,
-                                    inv_out=inv_out,
-                                    resvar_eps=float(self.eps_var),
-                                )
-                            else:
-                                gwldcore.phase1_compute_Xz_bed_chunk(
-                                    bed_prefix=bed_prefix,
-                                    fam_path=fam_path,
-                                    blk_start=int(s), blk_end=int(e),
-                                    row_sel=row_sel,
-                                    ddof=ddof,
-                                    annot_blk=annot_blk,
-                                    inv_right=inv_right,
-                                    v_start=int(v_start),
-                                    v_count=int(Vt),
-                                    kmax_hint=kmax_hint,
-                                    rand_dist=self.rand_dist,
-                                    seed=self.root_seed,
-                                    Xz2d_chunk=Xz_view,
-                                    bin_init_mask=phase1_init,
-                                    project_right=False,
-                                    C=resvar_C,
-                                    R=resvar_R,
-                                    impute_mode=self.impute_method,
-                                    impute_seed=int(self.impute_seed),
-                                    resvar_gram=resvar_gram,
-                                    inv_out=inv_out,
-                                    resvar_eps=float(self.eps_var),
-                                )
-                            t1_total += (time.perf_counter() - t0)
-                            bar.update(w1)
+                        finally:
+                            _clear_phase1_native_scratch()
                 finally:
                     phase1_pref_ex.shutdown(wait=True)
 

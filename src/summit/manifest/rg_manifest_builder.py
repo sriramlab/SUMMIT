@@ -501,6 +501,17 @@ def _build_design_matrix_from_cov(cov_df: pd.DataFrame | None, nrows: int) -> tu
     return X, cov_cols
 
 
+def _design_matrix_rank(X: np.ndarray) -> int:
+    X = np.asarray(X, dtype=np.float64)
+    if X.ndim != 2:
+        raise ValueError(f"Design matrix must be 2D; got shape {X.shape}")
+    if X.shape[0] == 0 or X.shape[1] == 0:
+        return 0
+    gram = X.T @ X
+    gram = 0.5 * (gram + gram.T)
+    return int(np.linalg.matrix_rank(gram, hermitian=True))
+
+
 # -----------------------------------------------------------------------------
 # Trait residual preparation
 # -----------------------------------------------------------------------------
@@ -523,7 +534,7 @@ def _prepare_trait_residual_general(
     R, rss = _fit_residuals(X, y)
     resid = np.asarray(R[:, 0], dtype=np.float64, order="C")
     rss_scalar = float(rss[0])
-    cov_rank = int(np.linalg.matrix_rank(X) - 1)
+    cov_rank = int(_design_matrix_rank(X) - 1)
     if cov_rank < 0:
         raise RuntimeError(f"Derived negative cov_rank for phenotype '{phen}'.")
 
@@ -663,7 +674,7 @@ def _prepare_trait_residuals_wide_shared(
         Xg = X_base[rows, :]
         Yg = Y[rows[:, None], np.asarray(cols_group, dtype=np.int64)]
         Rg, rss_g = _fit_residuals(Xg, Yg)
-        cov_rank_g = int(np.linalg.matrix_rank(Xg) - 1)
+        cov_rank_g = int(_design_matrix_rank(Xg) - 1)
         if cov_rank_g < 0:
             raise RuntimeError("Derived negative cov_rank in wide/shared residualization.")
 
