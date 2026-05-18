@@ -158,8 +158,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--compact", action="store_true", help="Write a compact rg manifest with only the core columns needed downstream.",)
     parser.add_argument("--rg-manifest-fast", action="store_true", default=False,
                         help=(
-                            "Use the exact fast path for rg manifest mode. "
-                            "This reuses cached sumstats and constructs pair-specific jackknife/moment summaries, "
+                            "Use the sparse-drop fast path for fixed-intercept rg manifest mode. "
+                            "This reuses cached sumstats and shared unit-level moment summaries, "
                             "writes manifest.results.tsv with total and per-bin rg/gamma columns, "
                             "and also emits per-pair .log files."
                         ))
