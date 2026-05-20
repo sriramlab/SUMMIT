@@ -239,7 +239,7 @@ class Sumrhe:
 
         if self.verbose_write_jack and self.out is not None:
             jack_path = f"{self.out}.{phen_name}.jack"
-            from h2core import H2ResultWriter
+            from .h2core import H2ResultWriter
             H2ResultWriter.save_jackknife_text(fit, jack_path)
             if self.log is not None:
                 self.log._log(f"Saved jackknife replicate dump to {jack_path}")

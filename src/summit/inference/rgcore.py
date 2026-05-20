@@ -98,7 +98,7 @@ class RGResultWriter:
 
     @staticmethod
     def save_score_normal_equations_json(fit: RGFit, path: str):
-        from h2core import H2ResultWriter
+        from .h2core import H2ResultWriter
 
         info = fit.intercept.info if isinstance(fit.intercept.info, dict) else {}
         n_overlap = info.get("n_overlap", None)
