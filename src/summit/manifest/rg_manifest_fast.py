@@ -32,6 +32,7 @@ from ..inference.rgcore import (
     _solve_constrained_intercept_from_sums,
     _full_intercept_denominator,
     _intercept_gamma_total_from_beta,
+    _component_rg,
 )
 from ..sumstats.sumstats import Sumstats
 from ..inference.trace import Trace
@@ -719,9 +720,7 @@ def _fit_score_intercept_scalar_fast(
 
     h2_tot1 = np.asarray(h2_fit1.h2_reps[:, -1], dtype=np.float64)
     h2_tot2 = np.asarray(h2_fit2.h2_reps[:, -1], dtype=np.float64)
-    with np.errstate(divide="ignore", invalid="ignore"):
-        rg_reg_reps = gamma_reg_reps / np.sqrt(h2_tot1 * h2_tot2)
-    rg_reg_reps[~np.isfinite(rg_reg_reps)] = np.nan
+    rg_reg_reps = _component_rg(gamma_reg_reps, h2_tot1, h2_tot2)
     rg_reg_est, rg_reg_se = jk.summarize(
         rg_reg_reps,
         unit_sizes=unit_sizes,

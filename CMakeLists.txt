@@ -183,11 +183,11 @@ install(TARGETS gwldcore winldcore
   RUNTIME DESTINATION summit
   ARCHIVE DESTINATION summit)
 
-# Install the Python package and source-tree compatibility launcher.
+# Install the Python package. The source-tree compatibility launcher
+# src/summit.py must not be installed because it shadows the summit package.
 install(DIRECTORY "${SUMMIT_PYTHON_PACKAGE_DIR}"
   DESTINATION .
   FILES_MATCHING
     PATTERN "*.py"
     PATTERN "__pycache__" EXCLUDE
     PATTERN "tmp" EXCLUDE)
-install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/src/summit.py" DESTINATION .)

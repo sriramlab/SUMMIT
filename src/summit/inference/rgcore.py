@@ -60,6 +60,18 @@ class RGFit:
     kmoment_info: dict | None = None
 
 
+def _component_rg(gamma, v1, v2):
+    gamma_arr, v1_arr, v2_arr = np.broadcast_arrays(
+        np.asarray(gamma, dtype=np.float64),
+        np.asarray(v1, dtype=np.float64),
+        np.asarray(v2, dtype=np.float64),
+    )
+    out = np.full(gamma_arr.shape, np.nan, dtype=np.float64)
+    valid = np.isfinite(gamma_arr) & np.isfinite(v1_arr) & np.isfinite(v2_arr) & (v1_arr > 0.0) & (v2_arr > 0.0)
+    out[valid] = gamma_arr[valid] / np.sqrt(v1_arr[valid] * v2_arr[valid])
+    return out
+
+
 class RGResultWriter:
     @staticmethod
     def save_jackknife_text(fit: RGFit, path: str):
@@ -70,8 +82,7 @@ class RGResultWriter:
         rg_tot = np.full(R + 1, np.nan, dtype=np.float64)
         h1_tot = np.asarray(fit.h2_fit1.h2_reps[:, -1], dtype=np.float64)
         h2_tot = np.asarray(fit.h2_fit2.h2_reps[:, -1], dtype=np.float64)
-        with np.errstate(divide="ignore", invalid="ignore"):
-            rg_tot = gamma_tot / np.sqrt(h1_tot * h2_tot)
+        rg_tot = _component_rg(gamma_tot, h1_tot, h2_tot)
         with open(path, "w") as fd:
             header = ["replicate", "intercept_c"]
             header += [f"gamma_g_{k}" for k in range(K)]
@@ -1127,9 +1138,7 @@ def fit_rg(
 
     v1 = np.asarray(h2_fit1.sigma_reps[:, :K], dtype=np.float64)
     v2 = np.asarray(h2_fit2.sigma_reps[:, :K], dtype=np.float64)
-    with np.errstate(divide="ignore", invalid="ignore"):
-        rg_reps = gamma_reps / np.sqrt(v1 * v2)
-    rg_reps[~np.isfinite(rg_reps)] = np.nan
+    rg_reps = _component_rg(gamma_reps, v1, v2)
 
     est, se = p.jackknife.summarize(
         rg_reps,
@@ -1153,9 +1162,7 @@ def fit_rg(
     h2_tot1 = np.asarray(h2_fit1.h2_reps[:, -1], dtype=np.float64)
     h2_tot2 = np.asarray(h2_fit2.h2_reps[:, -1], dtype=np.float64)
 
-    with np.errstate(divide="ignore", invalid="ignore"):
-        rg_tot_reps = gamma_tot_reps / np.sqrt(h2_tot1 * h2_tot2)
-    rg_tot_reps[~np.isfinite(rg_tot_reps)] = np.nan
+    rg_tot_reps = _component_rg(gamma_tot_reps, h2_tot1, h2_tot2)
     est, se = p.jackknife.summarize(
         rg_tot_reps,
         unit_sizes=p.unit_sizes,
@@ -2319,9 +2326,7 @@ def fit_intercept(
 
     h2_tot1_reps = np.asarray(h2_fit1.h2_reps[:, -1], dtype=np.float64)
     h2_tot2_reps = np.asarray(h2_fit2.h2_reps[:, -1], dtype=np.float64)
-    with np.errstate(divide="ignore", invalid="ignore"):
-        rg_reg_reps = gamma_reg_reps / np.sqrt(h2_tot1_reps * h2_tot2_reps)
-    rg_reg_reps[~np.isfinite(rg_reg_reps)] = np.nan
+    rg_reg_reps = _component_rg(gamma_reg_reps, h2_tot1_reps, h2_tot2_reps)
 
     rg_reg_est, rg_reg_se = jackknife.summarize(
         rg_reg_reps,
