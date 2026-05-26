@@ -1300,7 +1300,6 @@ def _select_intercept_regression_system(trace_view, *, collapse_reg_ld=False, lo
     if A_main.shape[0] != L_main.shape[0]:
         raise RuntimeError("Annotation design and primary ldscores must share the same SNP axis.")
 
-    K = int(A_main.shape[1])
     M = int(A_main.shape[0])
 
     source = "main"
@@ -1313,23 +1312,12 @@ def _select_intercept_regression_system(trace_view, *, collapse_reg_ld=False, lo
 
     P = int(X_raw.shape[1])
 
-    if P > 1 and P == K and not collapse_reg_ld:
-        if log is not None:
+    if P == 1:
+        if collapse_reg_ld and log is not None:
             log._log(
-                f"[rg:c] using {P}-column {source} LD design for exact partitioned intercept regression."
+                "WARNING: --collapse-reg-ld was set, but the intercept regression LD "
+                "score is already 1D; no collapse was applied."
             )
-        total_ld = np.sum(X_raw, axis=1, dtype=np.float64)
-        full_mass = np.sum(A_main, axis=0, dtype=np.float64)
-        return InterceptRegressionSystem(
-            x=np.asarray(X_raw, dtype=np.float64, order="C"),
-            a=np.asarray(A_main, dtype=np.float64, order="C"),
-            total_ld=np.asarray(total_ld, dtype=np.float64, order="C"),
-            full_mass=np.asarray(full_mass, dtype=np.float64),
-            source=source,
-            mode=f"{source}-partitioned",
-        )
-
-    if P == 1 and K == 1 and not collapse_reg_ld:
         return InterceptRegressionSystem(
             x=np.asarray(X_raw, dtype=np.float64, order="C"),
             a=np.ones((M, 1), dtype=np.float64),
@@ -1339,34 +1327,37 @@ def _select_intercept_regression_system(trace_view, *, collapse_reg_ld=False, lo
             mode=source,
         )
 
-    if collapse_reg_ld:
-        if X_raw.shape[1] > 1 and log is not None:
-            label = "primary ldscores" if source == "main" else "ldscores_reg"
-            log._log(
-                f"[rg] Collapsing {X_raw.shape[1]}-column {label} to total LD for intercept regression."
+    if not collapse_reg_ld:
+        if source == "reg":
+            raise RuntimeError(
+                "--ldscores-reg must contain exactly one LD-score column for unconstrained "
+                "rg intercept estimation. If the regression LD scores come from non-overlapping "
+                "annotations, pre-collapse them to total LD before passing --ldscores-reg, or pass "
+                "--collapse-reg-ld explicitly. Do not collapse overlapping annotations."
             )
-        X = np.sum(X_raw, axis=1, dtype=np.float64, keepdims=True)
-        return InterceptRegressionSystem(
-            x=np.asarray(X, dtype=np.float64, order="C"),
-            a=np.ones((M, 1), dtype=np.float64),
-            total_ld=np.asarray(X[:, 0], dtype=np.float64, order="C"),
-            full_mass=np.array([float(trace_view.nsnps)], dtype=np.float64),
-            source=source,
-            mode=f"{source}-collapsed",
-        )
-
-    if K > 1 and P == 1:
         raise RuntimeError(
-            "Partitioned summary-only intercept regression requires a multi-column LD design "
-            "matching trace_view.nbins. Provide matching --ldscores-reg, omit --ldscores-reg "
-            "to use the main partitioned LD scores, or pass --collapse-reg-ld to intentionally "
-            "collapse to total LD."
+            "Unconstrained rg intercept estimation requires a 1D regression LD score. "
+            "The primary --ldscores file has multiple LD-score columns and no 1D "
+            "--ldscores-reg was provided. Provide a pre-collapsed --ldscores-reg file, "
+            "or pass --collapse-reg-ld explicitly if the primary LD-score columns are "
+            "non-overlapping and can be safely summed."
         )
 
-    raise RuntimeError(
-        f"Intercept regression design has {P} columns but trace_view.nbins={K}; "
-        "exact partitioned summary-only intercept regression requires matching columns "
-        "or --collapse-reg-ld."
+    if log is not None:
+        label = "primary --ldscores" if source == "main" else "--ldscores-reg"
+        log._log(
+            f"WARNING: --collapse-reg-ld is a compatibility option. Collapsing "
+            f"{P}-column {label} to total LD for scalar intercept regression. "
+            "This is only valid when the LD-score columns are non-overlapping."
+        )
+    X = np.sum(X_raw, axis=1, dtype=np.float64, keepdims=True)
+    return InterceptRegressionSystem(
+        x=np.asarray(X, dtype=np.float64, order="C"),
+        a=np.ones((M, 1), dtype=np.float64),
+        total_ld=np.asarray(X[:, 0], dtype=np.float64, order="C"),
+        full_mass=np.array([float(trace_view.nsnps)], dtype=np.float64),
+        source=source,
+        mode=f"{source}-collapsed",
     )
 
 
@@ -1376,8 +1367,10 @@ def _select_intercept_weight_ld(trace_view, regsys: InterceptRegressionSystem, *
         raise ValueError("mode must be one of {'ldsc','score'}")
 
     P = int(regsys.x.shape[1])
+    if P != 1:
+        raise RuntimeError("Internal error: unconstrained rg intercept regression must use a 1D LD score.")
 
-    if mode == "score" and P == 1:
+    if mode == "score":
         if weight_ld_override is not None and log is not None:
             log._log(
                 "[rg:c] ignoring ldscores_reg_w in scalar SCORE-weight mode; "
@@ -1409,18 +1402,12 @@ def _select_intercept_weight_ld(trace_view, regsys: InterceptRegressionSystem, *
             log._log("[rg:c] using explicit 1D regression-weight LD (ldscores_reg_w) for intercept weights.")
         return np.asarray(w, dtype=np.float64, order="C"), str(source or "reg-w")
 
-    if P == 1:
-        if log is not None and mode == "ldsc":
-            log._log(
-                "[rg:c] no ldscores_reg_w provided; scalar LDSC-weighted intercept regression "
-                "falls back to the legacy total regression LD weights."
-            )
-        return np.asarray(regsys.total_ld, dtype=np.float64, order="C"), "fallback-total-ld"
-
-    raise RuntimeError(
-        "Partitioned summary-only intercept regression requires a separate 1D regression-weight LD score "
-        "(ldscores_reg_w)."
-    )
+    if log is not None and mode == "ldsc":
+        log._log(
+            "[rg:c] no ldscores_reg_w provided; scalar LDSC-weighted intercept regression "
+            "falls back to the legacy total regression LD weights."
+        )
+    return np.asarray(regsys.total_ld, dtype=np.float64, order="C"), "fallback-total-ld"
 
 
 def _make_intercept_keep_mask(

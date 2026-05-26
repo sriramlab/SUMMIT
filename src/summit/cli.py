@@ -131,9 +131,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--ldscores", default=None, type=str,
                         help="Path to the primary LD-score file. Use '@' as a chromosome placeholder for split files.")
     parser.add_argument("--ldscores-reg", default=None, type=str,
-                        help="Optional LD-score file used only for the bivariate intercept regression. Supports '@' chromosome split specs.")
+                        help="Optional 1D LD-score file used only for the bivariate intercept regression. Supports '@' chromosome split specs.")
     parser.add_argument("--collapse-reg-ld", action="store_true", default=False,
-                        help="Collapse multi-column regression LD to 1D total LD for the bivariate intercept fit.")
+                        help="Compatibility option: collapse multi-column intercept-regression LD to 1D total LD. Only valid for non-overlapping LD-score columns.")
 
     # Sumstats / regression mode
     parser.add_argument("--h2", default=None, type=str,
