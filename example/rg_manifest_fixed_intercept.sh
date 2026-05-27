@@ -11,9 +11,10 @@ else
 fi
 
 "${SUMMIT[@]}" \
-  --h2 ./out/sim_50k_h2_0.25_p_0.01.beta_se.sumstat \
+  --rg ./out/rg_manifest.fixed1.tsv \
+  --rg-manifest-fast \
   --ldscores ./double_uniform_10k_stoc_k100.gw.ldscore.gz \
   --annot ./double_uniform_0.2.annot.txt \
-  --out ./out/h2_ldscore \
+  --out ./out/rg_manifest_fixed_intercept \
   --njack 100 \
   --num-threads 2

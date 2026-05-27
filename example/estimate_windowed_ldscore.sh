@@ -12,11 +12,10 @@ fi
 
 "${SUMMIT[@]}" \
   --geno ./small.bed \
-  --out ./out/small.single \
-  --nvecs 100 \
-  --step_size 10000 \
-  --seed 1 \
-  --dtype float64 \
-  --rand-samp 0.5 \
+  --annot ./small.2bins_annot.txt \
   --covar ./small.cov \
+  --ld-wind-kb 20000 \
+  --out ./out/small.2bins.20mb \
+  --rand-samp 0.5 \
+  --seed 1 \
   --num-threads 2

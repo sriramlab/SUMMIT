@@ -1,0 +1,8 @@
+build/
+*.egg-info/
+__pycache__/
+*.py[cod]
+
+# Generated example outputs.
+example/out/
+example/output.log

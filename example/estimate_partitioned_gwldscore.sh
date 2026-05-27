@@ -12,7 +12,8 @@ fi
 
 "${SUMMIT[@]}" \
   --geno ./small.bed \
-  --out ./out/small.single \
+  --annot ./small.2bins_annot.txt \
+  --out ./out/small.2bins \
   --nvecs 100 \
   --step_size 10000 \
   --seed 1 \

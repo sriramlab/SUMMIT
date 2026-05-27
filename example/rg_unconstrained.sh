@@ -11,9 +11,11 @@ else
 fi
 
 "${SUMMIT[@]}" \
-  --h2 ./out/sim_50k_h2_0.25_p_0.01.beta_se.sumstat \
+  --rg ./out/trait_a.sumstats,./out/trait_b.sumstats \
   --ldscores ./double_uniform_10k_stoc_k100.gw.ldscore.gz \
   --annot ./double_uniform_0.2.annot.txt \
-  --out ./out/h2_ldscore \
+  --align-alleles \
+  --collapse-reg-ld \
+  --out ./out/rg_unconstrained \
   --njack 100 \
   --num-threads 2
