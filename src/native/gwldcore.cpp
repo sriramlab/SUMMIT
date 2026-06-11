@@ -301,7 +301,7 @@ static inline double phase2_extreme_ld_warn() {
 }
 
 static inline bool phase2_drop_extreme_updates() {
-    static const bool v = env_bool_or_default("SUMMIT_P2_DROP_EXTREME", false);
+    static const bool v = env_bool_or_default("SUMMIT_P2_DROP_EXTREME", true);
     return v;
 }
 
