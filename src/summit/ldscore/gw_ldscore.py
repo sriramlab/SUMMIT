@@ -62,6 +62,12 @@ def apply_env(cfg: dict) -> int:
         }.get(str(mode).lower())
         if not flag:
             return
+        if sys.argv and sys.argv[0] == "-c":
+            # The Python code string used by `python -c` is not present in
+            # sys.argv. Re-execing as `python -c <first CLI flag>` corrupts
+            # the command line, so leave this process unwrapped.
+            os.environ["SUMMIT_NUMACTL_WRAPPED"] = "1"
+            return
         os.environ["SUMMIT_NUMACTL_WRAPPED"] = "1"
         args = [exe, f"{flag}={nodes}", sys.executable, *sys.argv]
         os.execv(exe, args)
