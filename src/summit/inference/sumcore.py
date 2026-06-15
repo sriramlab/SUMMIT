@@ -45,7 +45,7 @@ class Sumcore:
         out=None,
         align_alleles=False,
         drop_ambiguous=True,
-        collapse_reg_ld=False,
+        collapse_reg_ld=True,
         enrich_mode: str = "auto",
         jack_mode: str = "mean",
         clip_nonfinite_vals=False,

@@ -211,11 +211,12 @@ summit \
   --njack chr
 ```
 
-`--collapse-reg-ld` is kept only as a compatibility option. It sums a multi-column
-regression LD file before the intercept fit and prints a warning. This is valid
-only when the LD-score columns are non-overlapping, such as a disjoint MAF-LD
-partition. For overlapping annotations, precompute or provide a genuine scalar
-regression LD score instead.
+SUMMIT uses a scalar LD score for the unconstrained rg intercept fit. A 1D
+`--ldscores-reg` file is preferred. If a multi-column regression LD file is
+provided, SUMMIT collapses it to total LD by default; this is valid only when
+the LD-score columns are non-overlapping, such as a disjoint MAF-LD partition.
+For overlapping annotations, precompute or provide a genuine scalar regression
+LD score instead.
 
 ### Batch rg Manifests
 

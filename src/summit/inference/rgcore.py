@@ -1294,7 +1294,7 @@ def _as_2d_float_array(x, *, name: str) -> np.ndarray:
     return x
 
 
-def _select_intercept_regression_system(trace_view, *, collapse_reg_ld=False, log=None):
+def _select_intercept_regression_system(trace_view, *, collapse_reg_ld=True, log=None):
     A_main = _as_2d_float_array(trace_view.annot, name="annotation design")
     L_main = _as_2d_float_array(trace_view.ldscores, name="primary ldscores")
     if A_main.shape[0] != L_main.shape[0]:
@@ -1313,11 +1313,6 @@ def _select_intercept_regression_system(trace_view, *, collapse_reg_ld=False, lo
     P = int(X_raw.shape[1])
 
     if P == 1:
-        if collapse_reg_ld and log is not None:
-            log._log(
-                "WARNING: --collapse-reg-ld was set, but the intercept regression LD "
-                "score is already 1D; no collapse was applied."
-            )
         return InterceptRegressionSystem(
             x=np.asarray(X_raw, dtype=np.float64, order="C"),
             a=np.ones((M, 1), dtype=np.float64),
@@ -1332,23 +1327,21 @@ def _select_intercept_regression_system(trace_view, *, collapse_reg_ld=False, lo
             raise RuntimeError(
                 "--ldscores-reg must contain exactly one LD-score column for unconstrained "
                 "rg intercept estimation. If the regression LD scores come from non-overlapping "
-                "annotations, pre-collapse them to total LD before passing --ldscores-reg, or pass "
-                "--collapse-reg-ld explicitly. Do not collapse overlapping annotations."
+                "annotations, pre-collapse them to total LD before passing --ldscores-reg. "
+                "Do not collapse overlapping annotations."
             )
         raise RuntimeError(
             "Unconstrained rg intercept estimation requires a 1D regression LD score. "
             "The primary --ldscores file has multiple LD-score columns and no 1D "
-            "--ldscores-reg was provided. Provide a pre-collapsed --ldscores-reg file, "
-            "or pass --collapse-reg-ld explicitly if the primary LD-score columns are "
-            "non-overlapping and can be safely summed."
+            "--ldscores-reg was provided. Provide a pre-collapsed --ldscores-reg file."
         )
 
     if log is not None:
         label = "primary --ldscores" if source == "main" else "--ldscores-reg"
         log._log(
-            f"WARNING: --collapse-reg-ld is a compatibility option. Collapsing "
+            f"[rg:c] collapsing "
             f"{P}-column {label} to total LD for scalar intercept regression. "
-            "This is only valid when the LD-score columns are non-overlapping."
+            "A 1D total-LD regression score is preferred; multi-column inputs must be non-overlapping."
         )
     X = np.sum(X_raw, axis=1, dtype=np.float64, keepdims=True)
     return InterceptRegressionSystem(
@@ -1917,7 +1910,7 @@ def fit_intercept(
     fixed_c=None,
     fixed_info=None,
     intercept_chisq_threshold=None,
-    collapse_reg_ld: bool = False,
+    collapse_reg_ld: bool = True,
     chisq_mode: str = "either",
     intercept_weight_mode: str = "ldsc",
     irwls_iters: int = 2,
