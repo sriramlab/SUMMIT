@@ -64,6 +64,7 @@ from .ldscore.gw_ldscore import GenomewideLDScore, apply_env
 from .ldscore.gwe_ldscore import GenomewideEnvLDScore
 from .ldscore.win_ldscore import WindowedLDScore
 from .inference.sumrhe import Sumrhe
+from .inference.h2_batch_fast import dispatch_h2_batch_fast
 from .inference.sumcore import Sumcore
 from .inference.trace import Trace
 from .sumstats.sumstats import Sumstats
@@ -149,6 +150,36 @@ def build_parser() -> argparse.ArgumentParser:
                             "a directory of files, or a chromosome-split directory spec such as "
                             "'.../chr@' for batched univariate h2 estimation."
                         ))
+    parser.add_argument("--h2-batch-fast", action="store_true", default=False,
+                        help=(
+                            "Use the exact chromosome-jackknife fast path for batched h2. "
+                            "Summary statistics are loaded concurrently in bounded batches, "
+                            "while one shared Trace and vectorized sufficient statistics are reused."
+                        ))
+    parser.add_argument("--h2-batch-size", default=4, type=int,
+                        help="Number of traits held in each bounded fast-h2 batch (default: 4).")
+    parser.add_argument("--h2-workers", default=4, type=int,
+                        help="Concurrent sumstat loaders used by --h2-batch-fast (default: 4).")
+    parser.add_argument("--h2-fast-reader", default="stream", type=str,
+                        choices=["stream", "pandas"],
+                        help=(
+                            "Sumstat reader for fast h2: chromosome-streamed compact buffers or "
+                            "the legacy all-file pandas reader (default: stream)."
+                        ))
+    parser.add_argument("--h2-checkpoint-every", default=64, type=int,
+                        help="Rewrite the atomic fast-h2 results checkpoint every N traits (default: 64).")
+    parser.add_argument("--h2-cache-dir", default=None, type=str,
+                        help=(
+                            "Optional reusable fast-h2 cache directory. Entries contain exact float64 "
+                            "h2 moments and packed active masks keyed to the source files and Trace SNP axis."
+                        ))
+    parser.add_argument("--h2-cache-mode", default="readwrite", type=str,
+                        choices=["read", "readwrite", "refresh"],
+                        help="Fast-h2 cache policy when --h2-cache-dir is provided (default: readwrite).")
+    parser.add_argument("--h2-cache-only", action="store_true", default=False,
+                        help="Build/validate fast-h2 cache entries without fitting h2.")
+    parser.add_argument("--h2-cache-verify-checksum", action="store_true", default=False,
+                        help="Verify cached array SHA-256 checksums on every read (slower).")
     parser.add_argument("--rg", default=None, type=str,
                         help=(
                             "Either a comma-separated pair of summary-statistics files for bivariate rg estimation, "
@@ -560,6 +591,13 @@ def _dispatch_h2(args, log):
     if args.ldscores is None:
         log._log("!!! --ldscores must be provided for refactored h2 estimation. !!!")
         raise SystemExit(1)
+
+    if (args.h2_cache_dir is not None or args.h2_cache_only) and not args.h2_batch_fast:
+        raise ValueError("--h2-cache-dir/--h2-cache-only require --h2-batch-fast.")
+
+    if args.h2_batch_fast:
+        dispatch_h2_batch_fast(args, log)
+        return
 
     sums = Sumrhe(
         bim_path=args.bim,

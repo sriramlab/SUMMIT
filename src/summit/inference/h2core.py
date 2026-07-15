@@ -866,6 +866,105 @@ def prepare_h2_reference_axis(
     )
 
 
+def prepare_h2_reference_axis_from_sufficient_stats(
+    trace_view,
+    matched,
+    jackknife,
+    active_mask,
+    *,
+    Ay_unit,
+    n_scale: float,
+    summary_y_info=None,
+    full_struct: H2StructuralUnitStats | None = None,
+    ld_kind: str = "main",
+    adjust_delta: bool = False,
+    prefer_drop_correction: bool = True,
+    has_overlap: bool | None = None,
+):
+    """Prepare h2 from exact full-axis sufficient statistics.
+
+    This is the batch-oriented counterpart of :func:`prepare_h2_reference_axis`.
+    ``Ay_unit`` must equal the per-jackknife-unit sums of ``A.T @ y`` on
+    ``active_mask``.  The structural terms are computed here using the same
+    sparse-drop correction as the regular reference-axis path, and the same
+    normal-equation builder and fitter are used downstream.
+
+    The function intentionally accepts no approximate or compacted LD input.
+    Callers are responsible for constructing ``Ay_unit`` in float64 on the
+    immutable Trace SNP axis.
+    """
+    M = int(trace_view.nsnps)
+    K = int(trace_view.nbins)
+    U = int(jackknife.nunit)
+
+    if jackknife.nsnps != M:
+        raise ValueError(
+            "JackknifeDesign was not built on this reference trace axis. "
+            f"Expected {M}, got {jackknife.nsnps}."
+        )
+
+    active_mask = np.asarray(active_mask, dtype=bool)
+    if active_mask.ndim != 1 or active_mask.size != M:
+        raise ValueError(f"active_mask must be length {M}; got {active_mask.shape}")
+    active_n = int(np.sum(active_mask))
+    if active_n <= 0:
+        raise RuntimeError("No active SNPs remain for H2 preparation.")
+
+    Ay_unit = np.asarray(Ay_unit, dtype=np.float64)
+    if Ay_unit.shape != (U, K):
+        raise ValueError(f"Ay_unit has shape {Ay_unit.shape}; expected {(U, K)}")
+
+    n_scale = float(n_scale)
+    if not (np.isfinite(n_scale) and n_scale > 0.0):
+        raise RuntimeError(f"Invalid univariate n_scale={n_scale}")
+
+    A, L = _select_h2_matrices(trace_view, ld_kind)
+    if A.shape != (M, K):
+        raise RuntimeError(f"Unexpected annotation shape {A.shape}; expected {(M, K)}")
+
+    if full_struct is not None:
+        _validate_h2_structural_stats(full_struct, U, K, label="full_struct")
+
+    use_drop_correction = False
+    if prefer_drop_correction and full_struct is not None:
+        n_drop = M - active_n
+        use_drop_correction = n_drop <= active_n
+
+    if use_drop_correction:
+        n_drop = M - active_n
+        if n_drop == 0:
+            struct = full_struct
+        else:
+            drop_idx = np.flatnonzero(~active_mask).astype(np.int64, copy=False)
+            corr = _compute_h2_structural_from_rows(A, L, jackknife, drop_idx)
+            struct = _subtract_h2_structural_stats(full_struct, corr)
+    else:
+        struct = compute_h2_structural_unit_stats(
+            trace_view,
+            jackknife,
+            active_mask=active_mask,
+            ld_kind=ld_kind,
+        )
+
+    if has_overlap is None:
+        has_overlap = _has_overlapping_annotations(A, active_mask=active_mask)
+
+    return _finish_prepare_h2(
+        trace_view=_make_h2_trace_metadata(trace_view),
+        matched=matched,
+        jackknife=jackknife,
+        active_mask=active_mask,
+        y=np.empty(0, dtype=np.float64),
+        struct=struct,
+        Ay_unit=Ay_unit,
+        n_scale=n_scale,
+        summary_y_info=summary_y_info,
+        has_overlap=bool(has_overlap),
+        adjust_delta=adjust_delta,
+        store_y=False,
+    )
+
+
 # -----------------------------------------------------------------------------
 # fitting
 # -----------------------------------------------------------------------------
