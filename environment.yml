@@ -9,8 +9,11 @@ dependencies:
   - tqdm>=4.64
   - bed-reader>=1.0
   - psutil
+  - pytest>=7
   - threadpoolctl>=3.2
   - pip
+  - pip:
+      - pgenlib==0.94.1
 
   # build toolchain
   - cmake>=3.26

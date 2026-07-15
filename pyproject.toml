@@ -8,8 +8,18 @@ build-backend = "scikit_build_core.build"
 [project]
 name = "gwldcore"
 version = "0.1.0"
-requires-python = ">=3.9"
+requires-python = ">=3.10"
 description = "Nanobind-backed genome-wide and windowed LD score native extensions"
+dependencies = [
+  "numpy>=1.25",
+  "pandas>=2.0",
+  "scipy>=1.11",
+  "tqdm>=4.64",
+  "bed-reader>=1.0",
+  "psutil",
+  "threadpoolctl>=3.2",
+  "pgenlib>=0.94,<1",
+]
 
 [project.scripts]
 summit = "summit.cli:main"

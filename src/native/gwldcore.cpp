@@ -1522,49 +1522,127 @@ static void compute_inv_resvar_from_geno_block(
     T* inv_out);
 
 template <typename T>
-void phase1_compute_Xz_bed_chunk_impl(const std::string &bed_prefix,
-                                      const std::string &fam_path,
-                                      int blk_start, int blk_end,
-                                      nb::object row_sel_obj,
-                                      int ddof,
-                                      nb_mat2c_ro<T> annot_blk,
-                                      nb::object inv_right_obj,
-                                      int v_start,
-                                      int v_count,
-                                      int kmax_hint,
-                                      const std::string &rand_dist,
-                                      nb::object seed_obj,
-                                      nb_mat2f_rw<T> Xz2d_chunk,
-                                      nb::object bin_init_mask_obj,
-                                      bool project_right,
-                                      nb::object C_opt,
-                                      nb::object R_opt,
-                                      const std::string& impute_mode_str,
-                                      nb::object impute_seed_obj,
-                                      nb::object resvar_gram_obj,
-                                      nb::object inv_out_obj,
-                                      double resvar_eps)
+int64_t standardize_dosage_inplace_impl(nb_mat2f_rw<T> Geno,
+                                        int ddof,
+                                        double missing_value,
+                                        int num_threads)
 {
-    const ImputeMode impute_mode = parse_impute_mode(impute_mode_str);
-    const uint64_t impute_seed = impute_seed_obj.is_none() ? 0ULL : nb::cast<uint64_t>(impute_seed_obj);
+    const int N = (int) Geno.shape(0);
+    const int L = (int) Geno.shape(1);
+    if (N <= 0)
+        throw std::runtime_error("Dosage matrix must have at least one sample");
+    if (L < 0)
+        throw std::runtime_error("Invalid dosage matrix column count");
 
-    const std::string bed_path = bed_prefix + ".bed";
-    const std::string bim_path = bed_prefix + ".bim";
+    T* G = Geno.data();
+    int64_t missing_total = 0;
+    int64_t invalid_total = 0;
+    {
+        nb::gil_scoped_release nogil;
+#ifdef _OPENMP
+        const int threads = num_threads > 0 ? num_threads : omp_get_max_threads();
+        #pragma omp parallel for schedule(static) num_threads(threads) reduction(+:missing_total,invalid_total)
+#endif
+        for (int j = 0; j < L; ++j) {
+            T* col = G + (size_t) j * (size_t) N;
+            int64_t nobs = 0;
+            int64_t nmissing = 0;
+            double sum = 0.0;
+            double sumsq = 0.0;
+            for (int i = 0; i < N; ++i) {
+                const double x = (double) col[(size_t) i];
+                if (x == missing_value) {
+                    ++nmissing;
+                    continue;
+                }
+                if (!std::isfinite(x) || x < 0.0 || x > 2.0) {
+                    ++invalid_total;
+                    continue;
+                }
+                ++nobs;
+                sum += x;
+                sumsq += x * x;
+            }
 
-    const int64_t N_total = count_lines_cached(fam_path);
-    const int64_t M_total = count_lines_cached(bim_path);
-    if (blk_end > M_total)
-        throw std::runtime_error("blk_end exceeds #SNPs in BIM");
+            missing_total += nmissing;
+            const double mu = nobs > 0 ? sum / (double) nobs : 0.0;
+            double m2 = nobs > 0 ? sumsq - sum * sum / (double) nobs : 0.0;
+            if (m2 < 0.0 && m2 > -1e-12)
+                m2 = 0.0;
+            const int64_t denom = nobs - (int64_t) ddof;
+            double inv_sd = 1.0;
+            if (denom > 0 && m2 > 0.0) {
+                const double var = m2 / (double) denom;
+                if (std::isfinite(var) && var > 0.0)
+                    inv_sd = 1.0 / std::sqrt(var);
+            }
 
-    const std::vector<int>& rows = parse_row_sel(row_sel_obj, N_total);
+#ifdef _OPENMP
+            #pragma omp simd
+#endif
+            for (int i = 0; i < N; ++i) {
+                const double x = (double) col[(size_t) i];
+                col[(size_t) i] = (x == missing_value || !std::isfinite(x) || x < 0.0 || x > 2.0)
+                    ? T(0)
+                    : (T) ((x - mu) * inv_sd);
+            }
+        }
+    }
+    if (invalid_total != 0)
+        throw std::runtime_error("Dosage matrix contains nonfinite or out-of-range nonmissing values");
+    return missing_total;
+}
 
-    int N = 0, L = 0;
+template <typename T>
+static void phase1_compute_Xz_chunk_impl(const std::string &bed_prefix,
+                                         const std::string &fam_path,
+                                         int blk_start, int blk_end,
+                                         nb::object row_sel_obj,
+                                         int ddof,
+                                         nb_mat2c_ro<T> annot_blk,
+                                         nb::object inv_right_obj,
+                                         int v_start,
+                                         int v_count,
+                                         int kmax_hint,
+                                         const std::string &rand_dist,
+                                         nb::object seed_obj,
+                                         nb_mat2f_rw<T> Xz2d_chunk,
+                                         nb::object bin_init_mask_obj,
+                                         bool project_right,
+                                         nb::object C_opt,
+                                         nb::object R_opt,
+                                         const std::string& impute_mode_str,
+                                         nb::object impute_seed_obj,
+                                         nb::object resvar_gram_obj,
+                                         nb::object inv_out_obj,
+                                         double resvar_eps,
+                                         T* external_geno,
+                                         int external_N,
+                                         int external_L)
+{
     auto& scratch = phase1_colmajor_scratch<T>();
-    AlignedBuffer<T>& Geno_tls = gwld_genotype_scratch<T>();
-    T* Geno = read_block_standardized_aligned<T>(bed_path, fam_path, blk_start, blk_end,
-                                                 rows, ddof,
-                                                 impute_mode, impute_seed,
-                                                 Geno_tls, N, L);
+    int N = external_N;
+    int L = external_L;
+    T* Geno = external_geno;
+    if (Geno) {
+        if (N <= 0 || L < 0 || L != blk_end - blk_start)
+            throw std::runtime_error("Invalid external genotype block dimensions in phase1");
+    } else {
+        const ImputeMode impute_mode = parse_impute_mode(impute_mode_str);
+        const uint64_t impute_seed = impute_seed_obj.is_none() ? 0ULL : nb::cast<uint64_t>(impute_seed_obj);
+        const std::string bed_path = bed_prefix + ".bed";
+        const std::string bim_path = bed_prefix + ".bim";
+        const int64_t N_total = count_lines_cached(fam_path);
+        const int64_t M_total = count_lines_cached(bim_path);
+        if (blk_end > M_total)
+            throw std::runtime_error("blk_end exceeds #SNPs in BIM");
+        const std::vector<int>& rows = parse_row_sel(row_sel_obj, N_total);
+        AlignedBuffer<T>& Geno_tls = gwld_genotype_scratch<T>();
+        Geno = read_block_standardized_aligned<T>(bed_path, fam_path, blk_start, blk_end,
+                                                  rows, ddof,
+                                                  impute_mode, impute_seed,
+                                                  Geno_tls, N, L);
+    }
     if (L == 0)
         return;
 
@@ -1794,6 +1872,68 @@ void phase1_compute_Xz_bed_chunk_impl(const std::string &bed_prefix,
         throw nb::python_error();
 
     t1.dump(blk_start, blk_end, B, v_count);
+}
+
+template <typename T>
+void phase1_compute_Xz_bed_chunk_impl(const std::string &bed_prefix,
+                                      const std::string &fam_path,
+                                      int blk_start, int blk_end,
+                                      nb::object row_sel_obj,
+                                      int ddof,
+                                      nb_mat2c_ro<T> annot_blk,
+                                      nb::object inv_right_obj,
+                                      int v_start,
+                                      int v_count,
+                                      int kmax_hint,
+                                      const std::string &rand_dist,
+                                      nb::object seed_obj,
+                                      nb_mat2f_rw<T> Xz2d_chunk,
+                                      nb::object bin_init_mask_obj,
+                                      bool project_right,
+                                      nb::object C_opt,
+                                      nb::object R_opt,
+                                      const std::string& impute_mode_str,
+                                      nb::object impute_seed_obj,
+                                      nb::object resvar_gram_obj,
+                                      nb::object inv_out_obj,
+                                      double resvar_eps)
+{
+    phase1_compute_Xz_chunk_impl<T>(
+        bed_prefix, fam_path, blk_start, blk_end, row_sel_obj, ddof,
+        annot_blk, inv_right_obj, v_start, v_count, kmax_hint, rand_dist,
+        seed_obj, Xz2d_chunk, bin_init_mask_obj, project_right, C_opt, R_opt,
+        impute_mode_str, impute_seed_obj, resvar_gram_obj, inv_out_obj,
+        resvar_eps, nullptr, 0, 0
+    );
+}
+
+template <typename T>
+void phase1_compute_Xz_geno_chunk_impl(nb_mat2f_rw<T> Geno,
+                                       int blk_start,
+                                       nb_mat2c_ro<T> annot_blk,
+                                       nb::object inv_right_obj,
+                                       int v_start,
+                                       int v_count,
+                                       int kmax_hint,
+                                       const std::string &rand_dist,
+                                       nb::object seed_obj,
+                                       nb_mat2f_rw<T> Xz2d_chunk,
+                                       nb::object bin_init_mask_obj,
+                                       nb::object C_opt,
+                                       nb::object R_opt,
+                                       nb::object resvar_gram_obj,
+                                       nb::object inv_out_obj,
+                                       double resvar_eps)
+{
+    const int N = (int) Geno.shape(0);
+    const int L = (int) Geno.shape(1);
+    phase1_compute_Xz_chunk_impl<T>(
+        "", "", blk_start, blk_start + L, nb::none(), 1,
+        annot_blk, inv_right_obj, v_start, v_count, kmax_hint, rand_dist,
+        seed_obj, Xz2d_chunk, bin_init_mask_obj, false, C_opt, R_opt,
+        "mean", nb::none(), resvar_gram_obj, inv_out_obj,
+        resvar_eps, Geno.data(), N, L
+    );
 }
 
 template <typename T>
@@ -2201,40 +2341,48 @@ void phase2_compute_XtXz_bed_impl(const std::string &bed_prefix,
 }
 
 template <typename T>
-void phase2_accum_XtXz_bed_impl(const std::string &bed_prefix,
-                                const std::string &fam_path,
-                                int blk_start, int blk_end,
-                                nb::object row_sel_obj,
-                                int ddof,
-                                nb_vec1_ro<T> inv_left,
-                                int tile_nvecs,
-                                nb_mat2f_ro<T> Xz2d,
-                                nb_mat2c_rw<T> meansq_accum,
-                                nb::object C_opt,
-                                nb::object R_opt,
-                                int N_denom,
-                                const std::string& impute_mode_str,
-                                nb::object impute_seed_obj)
+static void phase2_accum_XtXz_chunk_impl(const std::string &bed_prefix,
+                                         const std::string &fam_path,
+                                         int blk_start, int blk_end,
+                                         nb::object row_sel_obj,
+                                         int ddof,
+                                         nb_vec1_ro<T> inv_left,
+                                         int tile_nvecs,
+                                         nb_mat2f_ro<T> Xz2d,
+                                         nb_mat2c_rw<T> meansq_accum,
+                                         nb::object C_opt,
+                                         nb::object R_opt,
+                                         int N_denom,
+                                         const std::string& impute_mode_str,
+                                         nb::object impute_seed_obj,
+                                         T* external_geno,
+                                         int external_N,
+                                         int external_L)
 {
-    const ImputeMode impute_mode = parse_impute_mode(impute_mode_str);
-    const uint64_t impute_seed = impute_seed_obj.is_none() ? 0ULL : nb::cast<uint64_t>(impute_seed_obj);
-
     auto round_down = [](int x, int m) { return (m > 0) ? (x / m) * m : x; };
-    const std::string bed_path = bed_prefix + ".bed";
-    const std::string bim_path = bed_prefix + ".bim";
-    const int64_t N_total = count_lines_cached(fam_path);
-    const int64_t M_total = count_lines_cached(bim_path);
-    if (blk_end > M_total)
-        throw std::runtime_error("blk_end exceeds #SNPs in BIM");
-    const std::vector<int>& rows = parse_row_sel(row_sel_obj, N_total);
-
-    int N = 0, L = 0;
     auto& scratch = phase2_bed_scratch<T>();
-    AlignedBuffer<T>& Geno_tls = gwld_genotype_scratch<T>();
-    T* Geno = read_block_standardized_aligned<T>(bed_path, fam_path, blk_start, blk_end,
-                                                 rows, ddof,
-                                                 impute_mode, impute_seed,
-                                                 Geno_tls, N, L);
+    int N = external_N;
+    int L = external_L;
+    T* Geno = external_geno;
+    if (Geno) {
+        if (N <= 0 || L < 0 || L != blk_end - blk_start)
+            throw std::runtime_error("Invalid external genotype block dimensions in phase2");
+    } else {
+        const ImputeMode impute_mode = parse_impute_mode(impute_mode_str);
+        const uint64_t impute_seed = impute_seed_obj.is_none() ? 0ULL : nb::cast<uint64_t>(impute_seed_obj);
+        const std::string bed_path = bed_prefix + ".bed";
+        const std::string bim_path = bed_prefix + ".bim";
+        const int64_t N_total = count_lines_cached(fam_path);
+        const int64_t M_total = count_lines_cached(bim_path);
+        if (blk_end > M_total)
+            throw std::runtime_error("blk_end exceeds #SNPs in BIM");
+        const std::vector<int>& rows = parse_row_sel(row_sel_obj, N_total);
+        AlignedBuffer<T>& Geno_tls = gwld_genotype_scratch<T>();
+        Geno = read_block_standardized_aligned<T>(bed_path, fam_path, blk_start, blk_end,
+                                                  rows, ddof,
+                                                  impute_mode, impute_seed,
+                                                  Geno_tls, N, L);
+    }
     if (L == 0)
         return;
 
@@ -2408,6 +2556,49 @@ void phase2_accum_XtXz_bed_impl(const std::string &bed_prefix,
                             extreme_updates.load(std::memory_order_relaxed),
                             max_extreme_ld);
     t.dump(blk_start, blk_end, B, tile_nvecs);
+}
+
+template <typename T>
+void phase2_accum_XtXz_bed_impl(const std::string &bed_prefix,
+                                const std::string &fam_path,
+                                int blk_start, int blk_end,
+                                nb::object row_sel_obj,
+                                int ddof,
+                                nb_vec1_ro<T> inv_left,
+                                int tile_nvecs,
+                                nb_mat2f_ro<T> Xz2d,
+                                nb_mat2c_rw<T> meansq_accum,
+                                nb::object C_opt,
+                                nb::object R_opt,
+                                int N_denom,
+                                const std::string& impute_mode_str,
+                                nb::object impute_seed_obj)
+{
+    phase2_accum_XtXz_chunk_impl<T>(
+        bed_prefix, fam_path, blk_start, blk_end, row_sel_obj, ddof,
+        inv_left, tile_nvecs, Xz2d, meansq_accum, C_opt, R_opt, N_denom,
+        impute_mode_str, impute_seed_obj, nullptr, 0, 0
+    );
+}
+
+template <typename T>
+void phase2_accum_XtXz_geno_impl(nb_mat2f_rw<T> Geno,
+                                 int blk_start,
+                                 nb_vec1_ro<T> inv_left,
+                                 int tile_nvecs,
+                                 nb_mat2f_ro<T> Xz2d,
+                                 nb_mat2c_rw<T> meansq_accum,
+                                 nb::object C_opt,
+                                 nb::object R_opt,
+                                 int N_denom)
+{
+    const int N = (int) Geno.shape(0);
+    const int L = (int) Geno.shape(1);
+    phase2_accum_XtXz_chunk_impl<T>(
+        "", "", blk_start, blk_start + L, nb::none(), 1,
+        inv_left, tile_nvecs, Xz2d, meansq_accum, C_opt, R_opt, N_denom,
+        "mean", nb::none(), Geno.data(), N, L
+    );
 }
 
 template <typename T>
@@ -3298,6 +3489,12 @@ NB_MODULE(gwldcore, m) {
     m.def("get_max_threads", &get_max_threads);
     m.def("prefetch_bed_block", &prefetch_bed_block_py,
           nb::arg("bed_prefix"), nb::arg("fam_path"), nb::arg("blk_start"), nb::arg("blk_end"), nb::arg("ahead_blocks") = 1);
+    m.def("standardize_dosage_inplace", &standardize_dosage_inplace_impl<float>,
+          nb::arg("Geno"), nb::arg("ddof") = 1, nb::arg("missing_value") = -9.0,
+          nb::arg("num_threads") = 0);
+    m.def("standardize_dosage_inplace", &standardize_dosage_inplace_impl<double>,
+          nb::arg("Geno"), nb::arg("ddof") = 1, nb::arg("missing_value") = -9.0,
+          nb::arg("num_threads") = 0);
 
     m.def("phase1_compute_Xz_bed_chunk", &phase1_compute_Xz_bed_chunk_impl<float>,
           nb::arg("bed_prefix"), nb::arg("fam_path"), nb::arg("blk_start"), nb::arg("blk_end"),
@@ -3314,6 +3511,19 @@ NB_MODULE(gwldcore, m) {
           nb::arg("seed") = nb::none(), nb::arg("Xz2d_chunk"), nb::arg("bin_init_mask") = nb::none(), nb::arg("project_right") = false,
           nb::arg("C") = nb::none(), nb::arg("R") = nb::none(), nb::arg("impute_mode") = "hwe", nb::arg("impute_seed") = nb::none(),
           nb::arg("resvar_gram") = nb::none(),
+          nb::arg("inv_out") = nb::none(), nb::arg("resvar_eps") = 1e-10);
+
+    m.def("phase1_compute_Xz_geno_chunk", &phase1_compute_Xz_geno_chunk_impl<float>,
+          nb::arg("Geno"), nb::arg("blk_start"), nb::arg("annot_blk"), nb::arg("inv_right"),
+          nb::arg("v_start"), nb::arg("v_count"), nb::arg("kmax_hint"), nb::arg("rand_dist") = "rademacher",
+          nb::arg("seed") = nb::none(), nb::arg("Xz2d_chunk"), nb::arg("bin_init_mask") = nb::none(),
+          nb::arg("C") = nb::none(), nb::arg("R") = nb::none(), nb::arg("resvar_gram") = nb::none(),
+          nb::arg("inv_out") = nb::none(), nb::arg("resvar_eps") = 1e-10);
+    m.def("phase1_compute_Xz_geno_chunk", &phase1_compute_Xz_geno_chunk_impl<double>,
+          nb::arg("Geno"), nb::arg("blk_start"), nb::arg("annot_blk"), nb::arg("inv_right"),
+          nb::arg("v_start"), nb::arg("v_count"), nb::arg("kmax_hint"), nb::arg("rand_dist") = "rademacher",
+          nb::arg("seed") = nb::none(), nb::arg("Xz2d_chunk"), nb::arg("bin_init_mask") = nb::none(),
+          nb::arg("C") = nb::none(), nb::arg("R") = nb::none(), nb::arg("resvar_gram") = nb::none(),
           nb::arg("inv_out") = nb::none(), nb::arg("resvar_eps") = 1e-10);
 
     m.def("phase1_compute_Xz_bed_chunk_rowmajor", &phase1_compute_Xz_bed_chunk_rowmajor_impl<float>,
@@ -3380,6 +3590,15 @@ NB_MODULE(gwldcore, m) {
           nb::arg("ddof") = 1, nb::arg("inv_left"), nb::arg("tile_nvecs"), nb::arg("Xz2d"), nb::arg("meansq_accum"),
           nb::arg("C") = nb::none(), nb::arg("R") = nb::none(), nb::arg("N_denom") = 0,
           nb::arg("impute_mode") = "hwe", nb::arg("impute_seed") = nb::none());
+
+    m.def("phase2_accum_XtXz_geno", &phase2_accum_XtXz_geno_impl<float>,
+          nb::arg("Geno"), nb::arg("blk_start"), nb::arg("inv_left"), nb::arg("tile_nvecs"),
+          nb::arg("Xz2d"), nb::arg("meansq_accum"), nb::arg("C") = nb::none(), nb::arg("R") = nb::none(),
+          nb::arg("N_denom") = 0);
+    m.def("phase2_accum_XtXz_geno", &phase2_accum_XtXz_geno_impl<double>,
+          nb::arg("Geno"), nb::arg("blk_start"), nb::arg("inv_left"), nb::arg("tile_nvecs"),
+          nb::arg("Xz2d"), nb::arg("meansq_accum"), nb::arg("C") = nb::none(), nb::arg("R") = nb::none(),
+          nb::arg("N_denom") = 0);
 
     m.def("phase2_accum_XtXz_bed_mailman", &phase2_accum_XtXz_bed_mailman_impl<float>,
           nb::arg("bed_prefix"), nb::arg("fam_path"), nb::arg("blk_start"), nb::arg("blk_end"), nb::arg("row_sel") = nb::none(),

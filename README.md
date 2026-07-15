@@ -9,7 +9,8 @@ moments.
 
 ## Main Features
 
-- Genome-wide randomized LD scores from PLINK bed/bim/fam reference genotypes.
+- Genome-wide randomized LD scores from PLINK 1 BED/BIM/FAM hard calls or
+  biallelic diploid PLINK 2 PGEN/PVAR/PSAM dosages.
 - Covariate-adjusted and annotation-partitioned LD scores.
 - Optional fixed-window LD scores with `--ld-wind-kb`.
 - Optional GxE LD scores with `--env`; SUMMIT writes both additive-interaction
@@ -30,6 +31,7 @@ refactored h2/rg path; use per-SNP LD scores.
 ### Requirements
 
 - Linux or macOS
+- Python 3.10 or newer
 - Conda or Miniconda
 - C++17 compiler
 - BLAS/LAPACK and OpenMP support
@@ -100,6 +102,34 @@ annotations can be:
 - Thin annotation matrices with one row per BIM/LD-score SNP. If a header is
   present, column names are used as annotation names.
 
+### Reference Genotypes
+
+`--geno` accepts an explicit `.bed` or `.pgen` path, or a prefix with exactly
+one complete genotype trio:
+
+- PLINK 1 `.bed/.bim/.fam` input supports genome-wide, windowed, and GxE LD
+  scores, including the existing hard-call-specific options.
+- PLINK 2 `.pgen/.pvar/.psam` input supports the standard randomized
+  genome-wide estimator for biallelic diploid variants. The PVAR must be plain
+  text rather than `.pvar.zst`.
+
+For PGEN input, SUMMIT bulk-decodes stored REF-allele dosages into one reusable
+variant-block buffer, mean-imputes missing dosage values, and standardizes each
+variant over the retained samples. Thus the target is LD in the decoded dosage
+matrix. A hard-call PGEN estimates the same matrix quantity as BED; an imputed
+dosage PGEN need not give exactly the same finite-sample LD scores as hard
+calls.
+
+The initial PGEN path is CPU-only and requires `--impute-method mean` (the
+default for PGEN), `--ddof 1`, and the dense kernels. It does not yet support
+`--device cuda`, Mailman, HWE imputation, `--correct-skew`, `--write-kmoments`,
+`--ld-wind-kb`, or `--env`. Multiallelic and non-diploid variants are also out
+of scope. If BED and PGEN trios share a prefix, pass the desired `.bed` or
+`.pgen` filename explicitly.
+
+See [PGEN genome-wide LD estimation](docs/pgen_gwld.md) for the estimand,
+normalization, implementation details, and validation design.
+
 ## Common Commands
 
 All examples below assume SUMMIT is installed and available as `summit`.
@@ -120,6 +150,21 @@ summit \
 This writes `outs/ref.mafld.gw.ldscore.gz` and `outs/ref.mafld.gw.log`.
 Add `--write-kmoments` for single-component LD scores when you want the
 model-based `--rg-se-method kmoments` path.
+
+For a PGEN dosage panel, use the same command with an explicit PGEN path and
+mean imputation:
+
+```bash
+summit \
+  --geno ref_panel.pgen \
+  --annot mafld.annot.gz \
+  --covar covariates.txt \
+  --out outs/ref.mafld.pgen \
+  --nvecs 1000 \
+  --step_size 1000 \
+  --impute-method mean \
+  --num-threads 8
+```
 
 ### Windowed LD scores
 
@@ -275,7 +320,8 @@ The scripts prefer the installed `summit` executable and fall back to
 
 ### Analysis modes
 
-- `--geno`: compute LD scores from PLINK bed/bim/fam input.
+- `--geno`: compute LD scores from a PLINK 1 BED/BIM/FAM or PLINK 2
+  PGEN/PVAR/PSAM path or prefix. PGEN is currently genome-wide-only.
 - `--h2`: estimate heritability for one file, a directory, or split-file spec.
 - `--rg`: estimate rg for a comma-separated pair or a manifest TSV.
 - `--make-rg-manifest`: build an rg manifest.
@@ -304,7 +350,8 @@ Exactly one of these modes must be specified.
 ### LD-score options
 
 - `--nvecs`: random vectors for stochastic genome-wide LD scores.
-- `--step_size`: SNP block size for LD-score computation.
+- `--step_size`: SNP block size for LD-score computation; for PGEN this also
+  controls the reusable dosage decode buffer.
 - `--covar`: covariate file with `FID IID` and covariate columns.
 - `--env`: one-column environment file for GxE LD scores.
 - `--ld-wind-kb`: compute fixed-window LD scores instead of randomized

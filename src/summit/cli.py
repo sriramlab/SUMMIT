@@ -61,6 +61,7 @@ import pandas as pd
 from . import utils
 from .logger import Logger
 from .ldscore.gw_ldscore import GenomewideLDScore, apply_env
+from .ldscore.genotype_source import resolve_genotype_input
 from .ldscore.gwe_ldscore import GenomewideEnvLDScore
 from .ldscore.win_ldscore import WindowedLDScore
 from .inference.sumrhe import Sumrhe
@@ -327,7 +328,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     # LD-score generation mode
     parser.add_argument("--geno", default=None, type=str,
-                        help="Path to the genotype file for LD-score calculation.")
+                        help=(
+                            "BED/BIM/FAM or PGEN/PVAR/PSAM path/prefix for LD-score calculation. "
+                            "Pass an explicit .bed or .pgen path when both trios share a prefix."
+                        ))
     parser.add_argument("--nvecs", default=1000, type=int,
                         help="Number of random vectors for stochastic genome-wide LD scores.")
     parser.add_argument("--step_size", default=1000, type=int,
@@ -505,7 +509,11 @@ def _make_low_level_env(args):
 
 
 def _dispatch_ldscore(args, log, verbose_on, low_level):
+    genotype_format = resolve_genotype_input(args.geno).format
     if args.env is not None:
+        if genotype_format != "bed":
+            log._log("!!! PGEN input is not yet supported for genome-wide GxE LD scores. !!!")
+            raise SystemExit(1)
         if args.ld_wind_kb is not None:
             log._log("!!! --env is currently supported only for genome-wide LD scores (not --ld-wind-kb). !!!")
             raise SystemExit(1)
@@ -535,6 +543,9 @@ def _dispatch_ldscore(args, log, verbose_on, low_level):
         return
 
     if args.ld_wind_kb is not None:
+        if genotype_format != "bed":
+            log._log("!!! PGEN input is not yet supported for windowed LD scores. !!!")
+            raise SystemExit(1)
         if args.ld_wind_kb <= 0:
             log._log("!!! --ld-wind-kb must be positive !!!")
             raise SystemExit(1)
@@ -580,8 +591,12 @@ def _dispatch_ldscore(args, log, verbose_on, low_level):
         write_kmoments=(args.write_kmoments and not args.skip_kmoments),
         use_mailman=args.use_mailman,
         impute_method=args.impute_method,
+        ddof=args.ddof,
     )
-    gwld._compute_ldscore()
+    try:
+        gwld._compute_ldscore()
+    finally:
+        gwld.close()
 
 
 def _dispatch_h2(args, log):

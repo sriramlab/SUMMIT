@@ -20,6 +20,14 @@ except Exception:
 from contextlib import contextmanager, nullcontext
 from threadpoolctl import threadpool_limits
 
+from .genotype_source import (
+    PgenBlockReader,
+    read_fam_sample_ids,
+    read_psam_sample_ids,
+    read_pvar_variants,
+    resolve_genotype_input,
+)
+
 
 def _parse_device_str(s: str) -> tuple[str, int | None]:
     s = (s or "cpu").strip().lower()
@@ -471,7 +479,7 @@ def _canonical_bfile_prefix(x: str) -> str:
 
 def read_cov(
     cov_filename: str,
-    fam_filename: str,
+    fam_filename: str | None,
     std: bool = True,
     cov_impute_method: str = "ignore",
     one_hot_conversion: bool = False,
@@ -479,15 +487,33 @@ def read_cov(
     logger=None,
     verbose=False,
     sample_idx=None,
-    ddof=1
+    ddof=1,
+    sample_ids=None,
 ):
-    fam = pd.read_csv(fam_filename, sep=r'\s+', header=None, usecols=[0,1], names=['FID','IID'])
-    cov = pd.read_csv(cov_filename, sep=r'\s+')
+    if sample_ids is None:
+        if fam_filename is None:
+            raise ValueError("fam_filename or sample_ids must be provided.")
+        fam = read_fam_sample_ids(fam_filename)
+    else:
+        fam = pd.DataFrame(sample_ids)[['FID', 'IID']].copy()
+        fam[['FID', 'IID']] = fam[['FID', 'IID']].astype(str)
+    cov = pd.read_csv(
+        cov_filename,
+        sep=r'\s+',
+        dtype={'FID': str, 'IID': str},
+        keep_default_na=False,
+    )
+    if not {'FID', 'IID'}.issubset(cov.columns):
+        raise ValueError("Covariate file must contain FID and IID columns.")
+    cov[['FID', 'IID']] = cov[['FID', 'IID']].astype(str)
 
     merged = fam.merge(cov, on=['FID','IID'], how='left', indicator=True)
     n_missing_in_cov = (merged['_merge'] != 'both').sum()
     if n_missing_in_cov:
-        raise ValueError(f"{n_missing_in_cov} .fam samples not found in covariate file (FID/IID mismatch).")
+        raise ValueError(
+            f"{n_missing_in_cov} genotype samples not found in covariate file "
+            "(FID/IID mismatch)."
+        )
     merged.drop(columns=['_merge'], inplace=True)
 
     if sample_idx is not None:
@@ -581,20 +607,45 @@ class GenomewideLDScore:
                 impute_method: str = 'mean'):
 
         self.eps_var = float(eps_var)
-        prefix = _canonical_bfile_prefix(bed_path)
-        self.bed_prefix = os.path.abspath(prefix)
-        self.fam_path   = self.bed_prefix + ".fam"
-        self.bim_path   = self.bed_prefix + ".bim"
+        self.genotype_input = resolve_genotype_input(bed_path)
+        self.genotype_format = self.genotype_input.format
+        self.genotype_prefix = self.genotype_input.prefix
+        self.bed_prefix = self.genotype_prefix if self.genotype_format == "bed" else None
+        self.fam_path = self.genotype_input.sample_path if self.genotype_format == "bed" else None
+        self.bim_path = self.genotype_input.variant_path if self.genotype_format == "bed" else None
+        self.pgen_path = self.genotype_input.genotype_path if self.genotype_format == "pgen" else None
+        self.pvar_path = self.genotype_input.variant_path if self.genotype_format == "pgen" else None
+        self.psam_path = self.genotype_input.sample_path if self.genotype_format == "pgen" else None
+        self._pgen_reader = None
 
-        self.G = open_bed(self.bed_prefix + ".bed")
-        self.nsamp, self.nsnps = self.G.shape
+        if self.genotype_format == "bed":
+            self.G = open_bed(self.genotype_input.genotype_path)
+            self.nsamp, self.nsnps = self.G.shape
+            self.sample_ids = read_fam_sample_ids(self.fam_path)
+        else:
+            self.G = None
+            self.sample_ids = read_psam_sample_ids(self.psam_path)
+            self.snplist = read_pvar_variants(self.pvar_path)
+            self.nsamp = int(len(self.sample_ids))
+            self.nsnps = int(len(self.snplist))
+        self.raw_nsamp = int(self.nsamp)
         self.nvecs = int(num_vecs)
         self.step_size = int(step_size)
+        if self.nvecs <= 0:
+            raise ValueError("num_vecs must be positive.")
+        if self.step_size <= 0:
+            raise ValueError("step_size must be positive.")
         self.log = log
         self.verbose = verbose
         gwldcore.set_verbose(bool(self.verbose))
         self.rand_dist = rand_dist
         self.ddof = int(ddof)
+        if self.ddof != 1:
+            raise ValueError(
+                "Genome-wide LD estimation currently requires ddof=1. "
+                "Its residual normalization, phase-2 scaling, and null subtraction "
+                "are defined on N-1 (or N-p-1 after covariate projection)."
+            )
         self.target_mem = target_mem
         self.target_xz_mem = target_xz_mem if target_mem is None else target_mem
 
@@ -604,6 +655,21 @@ class GenomewideLDScore:
         if skip_kmoments is not None:
             write_kmoments = bool(write_kmoments) and not bool(skip_kmoments)
         self.write_kmoments = bool(write_kmoments)
+        if self.genotype_format == "pgen":
+            unsupported = []
+            if str(impute_method).strip().lower() != "mean":
+                unsupported.append("HWE imputation")
+            if _parse_device_str(device)[0] != "cpu":
+                unsupported.append("CUDA")
+            if self.correct_skew:
+                unsupported.append("finite-sample skew correction")
+            if self.write_kmoments:
+                unsupported.append("K-moment output")
+            if unsupported:
+                raise ValueError(
+                    "PGEN dosage input currently supports dense CPU mean-imputation only; "
+                    "unsupported option(s): " + ", ".join(unsupported) + "."
+                )
         if self.correct_skew:
             self.log._log(f"[fs-corr] Fourth-moment correction enabled: {self.correct_skew}")
         if self.write_kmoments:
@@ -701,7 +767,12 @@ class GenomewideLDScore:
             sel_idx = np.sort(rng.choice(base_idx, size=k, replace=False))
             self.log._log(f"Randomly subsampling individuals: {k}/{self.nsamp} ({k/self.nsamp:.1%})")
 
-        self._read_bim(self.bim_path)
+        if self.genotype_format == "bed":
+            self._read_bim(self.bim_path)
+        else:
+            self.log._log(f"Reading {self.pvar_path} for variants")
+            if len(self.snplist) != self.nsnps:
+                raise ValueError("PGEN/PVAR variant count mismatch.")
         if annot_path is not None:
             self._read_annot(annot_path)
         else:
@@ -718,7 +789,8 @@ class GenomewideLDScore:
                 logger=self.log,
                 verbose=self.verbose,
                 sample_idx=sel_idx if sel_idx is not None else None,
-                ddof=self.ddof
+                ddof=self.ddof,
+                sample_ids=self.sample_ids,
             )
             self.row_sel = np.asarray(keep_idx_global, dtype=int)
             self.C = np.asarray(C, dtype=self.dtype, order='F')
@@ -746,8 +818,39 @@ class GenomewideLDScore:
 
         self.outpath = out_path
         self.inv_sqrt_resvar_all = None
+        if self.genotype_format == "pgen":
+            self._pgen_reader = PgenBlockReader(
+                pgen_path=self.pgen_path,
+                raw_sample_ct=self.raw_nsamp,
+                variant_ct=self.nsnps,
+                sample_subset=self.row_sel,
+                step_size=self.step_size,
+                dtype=self.dtype,
+                ddof=self.ddof,
+                standardize_threads=int(os.environ.get("SUMMIT_DECODE_THREADS", self.num_threads)),
+            )
+            if self._pgen_reader.sample_ct != self.nsamp:
+                self._pgen_reader.close()
+                self._pgen_reader = None
+                raise ValueError("Selected PGEN sample count does not match estimator sample count.")
+            buffer_mib = (
+                self._pgen_reader.block_capacity * self.nsamp * np.dtype(self.dtype).itemsize
+            ) / (1024 ** 2)
+            self.log._log(
+                f"[pgen] Persistent dosage reader ready: allele=REF (allele_idx=0), "
+                f"buffer={self._pgen_reader.block_capacity}x{self.nsamp} "
+                f"({buffer_mib:.2f} MiB), dtype={np.dtype(self.dtype).name}."
+            )
+
+    def close(self):
+        reader = getattr(self, "_pgen_reader", None)
+        if reader is not None:
+            reader.close()
+            self._pgen_reader = None
 
     def _precompute_residual_variances(self):
+        if self.genotype_format != "bed":
+            raise RuntimeError("The standalone residual-variance pass is BED-only.")
         self.log._log(
             "[resvar] Using fused gwldcore C++ kernel for projected residual variances"
             + (" + μ22." if self.correct_skew else ".")
@@ -831,6 +934,10 @@ class GenomewideLDScore:
         parsed_ldsc = False
         try:
             df = pd.read_csv(annot_path, sep=r'\s+', compression='infer', dtype={'CHR': str, 'BP': np.int64, 'SNP': str, 'CM': float})
+        except Exception:
+            df = None
+
+        if df is not None:
             base_cols = {'CHR', 'BP', 'SNP', 'CM'}
             if base_cols.issubset(set(df.columns)) and 'SNP' in df.columns:
                 annot_cols = [c for c in df.columns if c not in base_cols]
@@ -843,16 +950,25 @@ class GenomewideLDScore:
                 if ann_snps == bim_snps:
                     ann_mat = df[annot_cols].to_numpy(dtype=np.float64, copy=False)
                 else:
+                    if pd.Index(bim_snps).has_duplicates or pd.Index(ann_snps).has_duplicates:
+                        raise ValueError(
+                            "Cannot reorder annotations by SNP ID when genotype or annotation "
+                            "IDs are duplicated; provide annotation rows in exact genotype order."
+                        )
                     ann_set = set(ann_snps)
                     bim_set = set(bim_snps)
                     missing_in_annot = len(bim_set - ann_set)
                     extra_in_annot = len(ann_set - bim_set)
                     if missing_in_annot > 0:
                         raise ValueError(
-                            f"Annotation SNP set is missing {missing_in_annot} BIM SNP(s); prepare a matching .annot or regenerate it to the .bim."
+                            f"Annotation SNP set is missing {missing_in_annot} genotype SNP(s); "
+                            "prepare matching annotation metadata."
                         )
                     if extra_in_annot > 0:
-                        self.log._log(f"[info] Annotation contains {extra_in_annot} extra SNP(s) not in BIM; keeping BIM SNPs only and reordering to BIM.")
+                        self.log._log(
+                            f"[info] Annotation contains {extra_in_annot} extra SNP(s) not in "
+                            "the genotype metadata; keeping genotype SNPs only and reordering."
+                        )
                     ann_mat = df.set_index('SNP').loc[bim_snps, annot_cols].to_numpy(dtype=np.float64, copy=False)
 
                 np.nan_to_num(ann_mat, copy=False)
@@ -869,8 +985,6 @@ class GenomewideLDScore:
                 self.l2cols = annot_cols
                 parsed_ldsc = True
                 self.log._log(f"Read LDSC-style annotation with shape {self.annot.shape}")
-        except Exception:
-            parsed_ldsc = False
 
         if not parsed_ldsc:
             self.l2cols, arr = utils._read_with_optional_header(annot_path)
@@ -915,7 +1029,10 @@ class GenomewideLDScore:
     def _compute_ldscore(self):
         self.log._log(f"num_vecs: {self.nvecs}, step_size: {self.step_size}, seed: {self.root_seed}")
         self.log._log(f"Using {self.rand_dist} random vectors.")
-        self.log._log(f"[backend] Mailman={'on' if self.use_mailman else 'off'} ; impute={self.impute_method}")
+        self.log._log(
+            f"[backend] genotype={self.genotype_format.upper()} ; "
+            f"Mailman={'on' if self.use_mailman else 'off'} ; impute={self.impute_method}"
+        )
         if self.C is not None:
             self.log._log(f"Covariate-adjusted partial correlations (N_eff={self.N_eff}, p={self.p_eff}).")
         else:
@@ -932,6 +1049,8 @@ class GenomewideLDScore:
             not self.correct_skew
             and str(os.environ.get("SUMMIT_FUSE_RESVAR", "1")).strip().lower() not in {"0", "false", "no", "off"}
         )
+        if self.genotype_format == "pgen":
+            fuse_resvar = True
         if fuse_resvar:
             self.log._log("[resvar] Fusing residual-variance estimation into the first phase-1 genotype pass.")
             self.inv_sqrt_resvar_all = np.empty(int(self.nsnps), dtype=self.dtype, order="C")
@@ -1055,7 +1174,7 @@ class GenomewideLDScore:
                     with set_parallelism(omp_threads=t_omp1, blas_threads=t_blas1):
                         try:
                             for blk_idx, (s, e) in enumerate(blocks):
-                                if blk_idx + 1 < len(blocks):
+                                if self.genotype_format == "bed" and blk_idx + 1 < len(blocks):
                                     s2, e2 = blocks[blk_idx + 1]
                                     phase1_pref_ex.submit(gwldcore.prefetch_bed_block, bed_prefix, fam_path, int(s2), int(e2), 1)
                                 kmax_hint = int(kmax_per_block[blk_idx])
@@ -1093,7 +1212,7 @@ class GenomewideLDScore:
                                         inv_out=inv_out,
                                         resvar_eps=float(self.eps_var),
                                     )
-                                else:
+                                elif self.genotype_format == "bed":
                                     gwldcore.phase1_compute_Xz_bed_chunk(
                                         bed_prefix=bed_prefix,
                                         fam_path=fam_path,
@@ -1114,6 +1233,26 @@ class GenomewideLDScore:
                                         R=resvar_R,
                                         impute_mode=self.impute_method,
                                         impute_seed=int(self.impute_seed),
+                                        resvar_gram=resvar_gram,
+                                        inv_out=inv_out,
+                                        resvar_eps=float(self.eps_var),
+                                    )
+                                else:
+                                    Geno = self._pgen_reader.read_standardized_block(s, e)
+                                    gwldcore.phase1_compute_Xz_geno_chunk(
+                                        Geno=Geno,
+                                        blk_start=int(s),
+                                        annot_blk=annot_blk,
+                                        inv_right=inv_right,
+                                        v_start=int(v_start),
+                                        v_count=int(Vt),
+                                        kmax_hint=kmax_hint,
+                                        rand_dist=self.rand_dist,
+                                        seed=self.root_seed,
+                                        Xz2d_chunk=Xz_view,
+                                        bin_init_mask=phase1_init,
+                                        C=resvar_C,
+                                        R=resvar_R,
                                         resvar_gram=resvar_gram,
                                         inv_out=inv_out,
                                         resvar_eps=float(self.eps_var),
@@ -1203,28 +1342,42 @@ class GenomewideLDScore:
                             with set_parallelism(omp_threads=1, blas_threads=self.num_threads):
                                 for blk_idx, (s, e) in enumerate(blocks):
                                     inv_left = inv_blocks[blk_idx]
-                                    if blk_idx + 1 < len(blocks):
+                                    if self.genotype_format == "bed" and blk_idx + 1 < len(blocks):
                                         s2, e2 = blocks[blk_idx + 1]
                                         pref_ex.submit(gwldcore.prefetch_bed_block, bed_prefix, fam_path, int(s2), int(e2), 1)
 
                                     t0 = time.perf_counter()
-                                    gwldcore.phase2_accum_XtXz_bed(
-                                        bed_prefix=bed_prefix,
-                                        fam_path=fam_path,
-                                        blk_start=int(s),
-                                        blk_end=int(e),
-                                        row_sel=row_sel,
-                                        ddof=ddof,
-                                        inv_left=inv_left,
-                                        tile_nvecs=int(Vt),
-                                        Xz2d=Xz_view,
-                                        meansq_accum=meansq_accum,
-                                        C=None,
-                                        R=None,
-                                        N_denom=int(N_denom),
-                                        impute_mode=self.impute_method,
-                                        impute_seed=int(self.impute_seed),
-                                    )
+                                    if self.genotype_format == "bed":
+                                        gwldcore.phase2_accum_XtXz_bed(
+                                            bed_prefix=bed_prefix,
+                                            fam_path=fam_path,
+                                            blk_start=int(s),
+                                            blk_end=int(e),
+                                            row_sel=row_sel,
+                                            ddof=ddof,
+                                            inv_left=inv_left,
+                                            tile_nvecs=int(Vt),
+                                            Xz2d=Xz_view,
+                                            meansq_accum=meansq_accum,
+                                            C=None,
+                                            R=None,
+                                            N_denom=int(N_denom),
+                                            impute_mode=self.impute_method,
+                                            impute_seed=int(self.impute_seed),
+                                        )
+                                    else:
+                                        Geno = self._pgen_reader.read_standardized_block(s, e)
+                                        gwldcore.phase2_accum_XtXz_geno(
+                                            Geno=Geno,
+                                            blk_start=int(s),
+                                            inv_left=inv_left,
+                                            tile_nvecs=int(Vt),
+                                            Xz2d=Xz_view,
+                                            meansq_accum=meansq_accum,
+                                            C=None,
+                                            R=None,
+                                            N_denom=int(N_denom),
+                                        )
                                     t2_total += (time.perf_counter() - t0)
                                     bar.update(1.0 - w1)
                         finally:
@@ -1253,6 +1406,19 @@ class GenomewideLDScore:
             except Exception:
                 pass
             _clear_gwld_native_scratch()
+
+        if self.genotype_format == "pgen":
+            decode_seconds = float(self._pgen_reader.decode_seconds)
+            rate = (
+                self._pgen_reader.variants_read / decode_seconds
+                if decode_seconds > 0.0 else float("inf")
+            )
+            self.log._log(
+                f"[pgen] Decode/standardize totals: blocks={self._pgen_reader.blocks_read}, "
+                f"variant-records={self._pgen_reader.variants_read}, "
+                f"missing-values-across-scans={self._pgen_reader.missing_values}, "
+                f"time={decode_seconds:.3f}s, rate={rate:.1f} variants/s."
+            )
 
         meansq = (meansq_accum / float(self.nvecs)).astype(self.dtype, copy=False)
 
