@@ -307,6 +307,10 @@ def test_hardcall_pgen_and_bed_have_identical_end_to_end_scores_with_covariates(
     )
     np.testing.assert_array_equal(pgen_rows, bed_rows)
     np.testing.assert_array_equal(pgen_scores, bed_scores)
+    np.testing.assert_array_equal(
+        np.atleast_1d(np.loadtxt(tmp_path / "pgen_out.gw.M")),
+        np.asarray([alt.shape[0]], dtype=np.float64),
+    )
 
 
 def test_fractional_pgen_estimator_targets_exact_dosage_matrix_ld(tmp_path):

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import gc
 import os
+from dataclasses import replace
 
 import numpy as np
 
@@ -15,6 +16,12 @@ from .h2core import (
     prepare_h2,
     prepare_h2_reference_axis,
     fit_h2,
+)
+from .ldsc_h2 import (
+    prepare_h2_ldsc,
+    read_ldsc_m,
+    read_ldsc_weight_ld_aligned,
+    resolve_ldsc_reference_moments,
 )
 from ..sumstats.moments import exact_score_z_from_arrays, effective_n_scale
 
@@ -42,6 +49,7 @@ class Sumrhe:
         log=None,
         verbose=False,
         ldscores=None,
+        ldscores_w=None,
         njack=None,
         annot=None,
         chisq_action="drop",
@@ -54,6 +62,10 @@ class Sumrhe:
         delta=None,
         cov_rank=None,
         write_jack: bool = False,
+        weight_mode: str = "he",
+        ldsc_m=None,
+        ldsc_irwls_iters: int = 3,
+        ldsc_irwls_tol: float = 0.0,
     ):
 
         self.log = log
@@ -71,19 +83,69 @@ class Sumrhe:
                 "Use per-SNP LD-scores."
             )
 
+        self.weight_mode = str(weight_mode).strip().lower().replace("-", "_")
+        if self.weight_mode in {"summit", "score", "he_regression"}:
+            self.weight_mode = "he"
+        if self.weight_mode not in {"he", "ldsc"}:
+            raise ValueError("weight_mode must be one of {'he','ldsc'}")
+        if self.weight_mode == "he" and (ldscores_w is not None or ldsc_m is not None):
+            raise ValueError("--ldscores-w and --ldsc-m require --weight-mode ldsc.")
+
         self.trace = Trace(
             bimpath=bim_path,
             sumpath=None,
             savepath=None,
             log=self.log,
             ldscores=ldscores,
+            ldscores_reg_w=None,
             annot=annot,
             verbose=bool(self.verbose_level),
             delta=delta,
         )
 
         self.jackknife_spec = JackknifeSpec.parse(njack)
-        if self.jackknife_spec.mode == "chr":
+        self.ldsc_irwls_iters = int(ldsc_irwls_iters)
+        self.ldsc_irwls_tol = float(ldsc_irwls_tol)
+        if self.ldsc_irwls_iters < 1:
+            raise ValueError("ldsc_irwls_iters must be at least 1")
+        if not (np.isfinite(self.ldsc_irwls_tol) and self.ldsc_irwls_tol >= 0.0):
+            raise ValueError("ldsc_irwls_tol must be non-negative and finite")
+
+        self.ldsc_weight_ld = None
+        self.ldsc_weight_present = None
+        self.ldsc_m_annot = None
+        self.ldsc_overlap_matrix = None
+        self.ldsc_source_nsnps = None
+        self.ldsc_m_source = None
+        if self.weight_mode == "ldsc":
+            m_override = (
+                None
+                if ldsc_m is None
+                else read_ldsc_m(ldsc_m, nbins=self.trace.nbins)
+            )
+            reference = resolve_ldsc_reference_moments(
+                annot_path=annot,
+                trace_annot=self.trace.annot,
+                trace_header=self.trace.annot_header,
+                m_override=m_override,
+            )
+            self.ldsc_m_annot = reference.m_annot
+            self.ldsc_overlap_matrix = reference.overlap_matrix
+            self.ldsc_source_nsnps = reference.source_nsnps
+            self.ldsc_m_source = reference.source if ldsc_m is None else f"{ldsc_m} ({reference.source})"
+            if ldscores_w is not None:
+                self.ldsc_weight_ld, self.ldsc_weight_present = read_ldsc_weight_ld_aligned(
+                    ldscores_w,
+                    self.trace.snps,
+                )
+                n_missing = int(np.sum(~self.ldsc_weight_present))
+                if self.log is not None:
+                    self.log._log(
+                        f"[h2:ldsc] aligned scalar weight LD to the primary Trace; "
+                        f"{n_missing} SNP(s) will be excluded from the regression axis."
+                    )
+
+        if self.jackknife_spec.mode == "chr" and self.weight_mode == "he":
             self.full_trace_view = self.trace.materialize_view()
             self.full_jackknife = JackknifeDesign.from_trace_view(
                 self.full_trace_view,
@@ -148,7 +210,7 @@ class Sumrhe:
         return self.results
 
     def _ensure_reference_precompute(self):
-        if self.jackknife_spec.mode != "chr":
+        if self.jackknife_spec.mode != "chr" or self.weight_mode != "he":
             return
         if self.full_struct is not None:
             return
@@ -177,6 +239,8 @@ class Sumrhe:
             chisq_threshold=self.chisq_threshold,
             chisq_action=self.chisq_action,
         )
+        if self.ldsc_weight_present is not None:
+            keep_mask &= self.ldsc_weight_present
 
         n_keep = int(np.sum(keep_mask))
         n_base = int(self.trace.nsnps)
@@ -185,7 +249,7 @@ class Sumrhe:
                 f"Matched {n_keep} SNPs in phenotype {phen_name} out of {n_base} Trace SNPs."
             )
 
-        if self.jackknife_spec.mode == "chr":
+        if self.jackknife_spec.mode == "chr" and self.weight_mode == "he":
             self._ensure_reference_precompute()
             summary_y, summary_y_info = self._build_full_axis_h2_summary_y(
                 ss,
@@ -206,6 +270,15 @@ class Sumrhe:
             )
         else:
             tv = self.trace.materialize_view(keep_mask)
+            if self.ldsc_weight_ld is not None:
+                tv = replace(
+                    tv,
+                    ldscores_reg_w=np.asarray(
+                        self.ldsc_weight_ld[keep_mask, :],
+                        dtype=np.float64,
+                        order="C",
+                    ),
+                )
             matched = aligned.materialize(
                 keep_mask,
                 chisq_threshold=self.chisq_threshold,
@@ -214,12 +287,15 @@ class Sumrhe:
                 compute_diagnostics=True,
             )
             jk = JackknifeDesign.from_trace_view(tv, self.jackknife_spec, log=self.log)
-            prepared = prepare_h2(
-                tv,
-                matched,
-                jk,
-                adjust_delta=self.adjust_delta,
-            )
+            if self.weight_mode == "ldsc":
+                prepared = prepare_h2_ldsc(tv, matched, jk)
+            else:
+                prepared = prepare_h2(
+                    tv,
+                    matched,
+                    jk,
+                    adjust_delta=self.adjust_delta,
+                )
         fit = fit_h2(
             prepared,
             enrich_mode=self.enrich_mode,
@@ -228,7 +304,21 @@ class Sumrhe:
             clip_nonfinite_vals=self.clip_nonfinite_vals,
             jack_mode=self.jack_mode,
             nan_policy=self.nan_policy,
+            weight_mode=self.weight_mode,
+            ldsc_m_annot=self.ldsc_m_annot,
+            ldsc_overlap_matrix=self.ldsc_overlap_matrix,
+            ldsc_source_nsnps=self.ldsc_source_nsnps,
+            ldsc_irwls_iters=self.ldsc_irwls_iters,
+            ldsc_irwls_tol=self.ldsc_irwls_tol,
         )
+
+        if self.log is not None and self.weight_mode == "ldsc":
+            info = fit.weight_info or {}
+            self.log._log(
+                f"[h2:ldsc] constrained IRWLS using M source '{self.ldsc_m_source}', "
+                f"weight LD source '{info.get('weight_ld_source', 'unknown')}', "
+                f"iterations={info.get('irwls_iters', 'NA')}."
+            )
 
         if hasattr(ss, "log_chisq_diagnostics"):
             ss.log_chisq_diagnostics(

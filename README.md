@@ -16,6 +16,8 @@ moments.
 - Optional GxE LD scores with `--env`; SUMMIT writes both additive-interaction
   cross-LD and interaction-interaction LD scores.
 - Heritability estimation from `BETA`/`SE` summary statistics.
+- Optional score-scale constrained LDSC-style IRWLS for univariate h2 via
+  `--weight-mode ldsc`; the default remains SUMMIT/HE.
 - Genetic correlation estimation with either a fixed overlap intercept or a
   summary-estimated intercept.
 - Batch genetic-correlation manifests, including a sparse fast path for
@@ -75,11 +77,13 @@ SUMMIT expects whitespace-delimited summary statistics with these columns:
 | effect estimate | `BETA`, `beta` |
 | standard error | `SE`, `STDERR`, `se`, `stderr` |
 
-Optional `COV_RANK` or `P_EFF` gives the number of non-intercept covariates used
-in the GWAS. If it is absent, SUMMIT uses `cov_rank=0`; an explicit `--cov-rank`
-overrides the file. Z-only summary statistics are no longer a supported analysis
-input because SUMMIT reconstructs exact SCORE-scale moments from `BETA`, `SE`,
-`N`, and `cov_rank`.
+Optional `COV_RANK` or `P_EFF` records the number of non-intercept covariates
+used in the GWAS, and `--cov-rank` overrides that metadata. The current h2 path
+intentionally reconstructs its SCORE-scale moment with `cov_rank=0`; this is an
+experimental convention even when covariate metadata are present. The rg path
+uses the resolved covariate rank. Z-only summary statistics are no longer a
+supported analysis input because SUMMIT reconstructs moments from `BETA`, `SE`,
+and `N`.
 
 ### LD Scores
 
@@ -147,7 +151,8 @@ summit \
   --num-threads 8
 ```
 
-This writes `outs/ref.mafld.gw.ldscore.gz` and `outs/ref.mafld.gw.log`.
+This writes `outs/ref.mafld.gw.ldscore.gz`, `outs/ref.mafld.gw.M`, and
+`outs/ref.mafld.gw.log`.
 Add `--write-kmoments` for single-component LD scores when you want the
 model-based `--rg-se-method kmoments` path.
 
@@ -210,6 +215,27 @@ summit \
 
 `--h2` can also be a directory of summary-statistic files or a chromosome-split
 path spec. Results are written to `<out>.results.tsv` and `<out>.log`.
+
+To replace the default HE estimating instrument with score-scale constrained
+LDSC-style IRWLS:
+
+```bash
+summit \
+  --h2 trait.sumstats.gz \
+  --ldscores ref.mafld.gw.ldscore.gz \
+  --ldscores-w ref.regression.l2.ldscore.gz \
+  --ldsc-m ref.mafld.gw.M \
+  --annot mafld.annot.gz \
+  --weight-mode ldsc \
+  --out outs/trait.mafld.ldsc \
+  --njack chr
+```
+
+The one-column `--ldscores-w` file is recommended, especially for overlapping
+annotations. If it is omitted, SUMMIT uses the row sum of the primary LD-score
+columns. LDSC mode reruns IRWLS inside every delete block and is currently
+available only for ordinary univariate `--h2`, not fast cached h2 or rg. See
+[Score-scale constrained LDSC weighting](docs/ldsc_weight_mode.md).
 
 ### Genetic Correlation With a Fixed Intercept
 
@@ -333,6 +359,10 @@ Exactly one of these modes must be specified.
 - `--ldscores`: primary LD-score file or chromosome-split spec.
 - `--ldscores-reg`: optional scalar LD-score file for unconstrained rg intercept
   regression.
+- `--weight-mode`: `he` (default) or univariate score-scale `ldsc` IRWLS.
+- `--ldscores-w`: optional scalar regression-SNP LD score used in LDSC weights.
+- `--ldsc-m`: fixed reference annotation masses; split files with `@` are summed.
+- `--ldsc-irwls-iters`, `--ldsc-irwls-tol`: LDSC update controls.
 - `--annot`: annotation file or split-file spec; omitted means single component.
 - `--max-chisq`: main chi-square filter; use `auto` for `max(80, 0.001*Nmax)`.
 - `--intercept-chisq-thr`: chi-square filter used only for intercept regression.
@@ -366,8 +396,8 @@ Exactly one of these modes must be specified.
 
 ## Output Files
 
-- Genome-wide LD scores: `<out>.gw.ldscore.gz`, `<out>.gw.log`, optionally
-  `<out>.gw.kmoments`.
+- Genome-wide LD scores: `<out>.gw.ldscore.gz`, `<out>.gw.M`, `<out>.gw.log`,
+  optionally `<out>.gw.kmoments`.
 - Windowed LD scores: `<out>.win.ldscore.gz`, `<out>.win.M`,
   `<out>.win.M_5_50`, `<out>.win.log`.
 - GxE LD scores: `<out>.gxe.ldscore.gz`, `<out>.gee.ldscore.gz`,

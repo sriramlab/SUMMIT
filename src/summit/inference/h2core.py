@@ -54,6 +54,8 @@ class H2Fit:
     tau_star: np.ndarray | None
     enrich_mode_requested: str
     enrich_mode_used: str
+    weight_mode: str = "he"
+    weight_info: dict | None = None
 
 
 @dataclass(frozen=True)
@@ -119,6 +121,11 @@ class H2ResultWriter:
         *,
         system: str | None = None,
     ) -> dict:
+        if str(getattr(fit, "weight_mode", "he")) != "he":
+            raise ValueError(
+                "HE/SCORE normal-equation export is unavailable for --weight-mode ldsc; "
+                "those matrices are not the constrained LDSC estimating equations."
+            )
         p = fit.prepared
         K = int(p.trace_view.nbins)
         R = int(p.jackknife.nrep)
@@ -162,6 +169,7 @@ class H2ResultWriter:
             "n_active_snps": int(np.sum(p.active_mask)),
             "has_overlapping_annotations": bool(p.has_overlap),
             "annot_headers": headers,
+            "weight_mode": str(getattr(fit, "weight_mode", "he")),
         }
 
         if "mode" in info:
@@ -979,7 +987,41 @@ def fit_h2(
     clip_nonfinite_vals: bool = False,
     jack_mode: str = "mean",
     nan_policy: str = "omit",
+    weight_mode: str = "he",
+    ldsc_m_annot=None,
+    ldsc_overlap_matrix=None,
+    ldsc_source_nsnps: int | None = None,
+    ldsc_irwls_iters: int = 3,
+    ldsc_irwls_tol: float = 0.0,
 ) -> H2Fit:
+    weight_mode = str(weight_mode).strip().lower().replace("-", "_")
+    if weight_mode in {"summit", "score", "he_regression"}:
+        weight_mode = "he"
+    if weight_mode not in {"he", "ldsc"}:
+        raise ValueError("weight_mode must be one of {'he','ldsc'}")
+    if weight_mode == "ldsc":
+        if ldsc_m_annot is None or ldsc_overlap_matrix is None or ldsc_source_nsnps is None:
+            raise ValueError(
+                "LDSC weighting requires fixed reference annotation masses, overlap moments, "
+                "and source SNP count."
+            )
+        from .ldsc_h2 import fit_h2_ldsc
+
+        return fit_h2_ldsc(
+            prepared,
+            m_annot=ldsc_m_annot,
+            overlap_matrix=ldsc_overlap_matrix,
+            source_nsnps=ldsc_source_nsnps,
+            enrich_mode=enrich_mode,
+            report_tau=report_tau,
+            allow_neg_enr=allow_neg_enr,
+            clip_nonfinite_vals=clip_nonfinite_vals,
+            jack_mode=jack_mode,
+            nan_policy=nan_policy,
+            irwls_iters=ldsc_irwls_iters,
+            irwls_tol=ldsc_irwls_tol,
+        )
+
     enrich_mode = _normalize_enrich_mode(enrich_mode)
 
     p = prepared
@@ -1152,4 +1194,6 @@ def fit_h2(
         tau_star=tau_star,
         enrich_mode_requested=requested,
         enrich_mode_used=enrich_mode_used,
+        weight_mode="he",
+        weight_info=None,
     )

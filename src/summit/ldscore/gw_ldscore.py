@@ -1459,6 +1459,10 @@ class GenomewideLDScore:
         scores_df = pd.DataFrame(self.gwldscore, columns=self.l2cols)
         out_df = pd.concat([self.snpdf, scores_df], axis=1)
         out_df.to_csv(f'{self.outpath}.gw.ldscore.gz', index=False, compression='gzip', sep='\t', float_format='%.6f')
+        out_M = f"{self.outpath}.gw.M"
+        with open(out_M, "w") as fout:
+            fout.write("\t".join(f"{float(x):.10g}" for x in self.nsnps_bin) + "\n")
+        self.log._log(f"Saved fixed reference annotation masses to: {out_M}")
 
         if trace_k2_from_ldscore is not None and self.write_kmoments:
             self._estimate_unpartitioned_kmoments(trace_k2_from_ldscore=trace_k2_from_ldscore, num_probes=256)

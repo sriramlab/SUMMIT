@@ -138,6 +138,11 @@ def build_parser() -> argparse.ArgumentParser:
                             "A 1D total-LD file is preferred; multi-column files are collapsed to "
                             "total LD by default and must be non-overlapping."
                         ))
+    parser.add_argument("--ldscores-w", default=None, type=str,
+                        help=(
+                            "Optional one-column LD-score file for the LDSC overcounting weight. "
+                            "Used only with --weight-mode ldsc; when omitted, total primary LD is used."
+                        ))
     parser.add_argument("--collapse-reg-ld", action="store_true", default=True,
                         help=(
                             "Deprecated no-op: multi-column intercept-regression LD is collapsed "
@@ -230,6 +235,27 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--intercept-weight-mode", default="score", type=str,
                         choices=["ldsc", "score"],
                         help="Weighting scheme for the constrained cross-trait intercept fit: 'ldsc' for LDSC-style IRWLS weights, or 'score' for fixed w_j = 1 / w_ld,j.")
+    parser.add_argument("--weight-mode", default="he", type=str,
+                        choices=["he", "ldsc"],
+                        help=(
+                            "Main h2 estimating equation: 'he' keeps the SUMMIT/HE score moments "
+                            "(default); 'ldsc' fits score-scale constrained LDSC-style WLS by "
+                            "closed-form IRWLS. It retains SUMMIT's exact-score response and scalar "
+                            "effective sample-size convention, so it is not literal ldsc.py when "
+                            "per-SNP sample sizes vary. "
+                            "The LDSC mode is currently univariate-only."
+                        ))
+    parser.add_argument("--ldsc-m", default=None, type=str,
+                        help=(
+                            "Optional LDSC .l2.M file for --weight-mode ldsc. Use '@' for "
+                            "chromosome-split files, which are summed. It must describe the same "
+                            "effect-SNP universe as --annot. The default is the fixed full-reference "
+                            "annotation mass."
+                        ))
+    parser.add_argument("--ldsc-irwls-iters", default=3, type=int,
+                        help="Number of closed-form LDSC IRWLS updates (default: 3).")
+    parser.add_argument("--ldsc-irwls-tol", default=0.0, type=float,
+                        help="Optional relative LDSC IRWLS stopping tolerance; zero disables early stopping.")
     parser.add_argument("--chisq-action", default="drop", type=str,
                         choices=["drop", "clip", "warn", "none"],
                         help="What to do with high-chi^2 SNPs on the main analysis axis.")
@@ -611,6 +637,11 @@ def _dispatch_h2(args, log):
         raise ValueError("--h2-cache-dir/--h2-cache-only require --h2-batch-fast.")
 
     if args.h2_batch_fast:
+        if args.weight_mode != "he":
+            raise ValueError(
+                "--weight-mode ldsc is not implemented in --h2-batch-fast yet; use the regular "
+                "--h2 path for exact per-block IRWLS refits."
+            )
         dispatch_h2_batch_fast(args, log)
         return
 
@@ -623,6 +654,7 @@ def _dispatch_h2(args, log):
         log=log,
         verbose=args.verbose,
         ldscores=args.ldscores,
+        ldscores_w=args.ldscores_w,
         njack=args.njack,
         annot=args.annot,
         chisq_action=args.chisq_action,
@@ -632,6 +664,10 @@ def _dispatch_h2(args, log):
         enrich_mode=args.enrich_mode,
         jack_mode=args.jack_mode,
         write_jack=args.write_jack,
+        weight_mode=args.weight_mode,
+        ldsc_m=args.ldsc_m,
+        ldsc_irwls_iters=args.ldsc_irwls_iters,
+        ldsc_irwls_tol=args.ldsc_irwls_tol,
     )
     sums._run()
     sums._logoff()
@@ -1223,6 +1259,15 @@ def main():
     if modes != 1:
         log._log("!!! Exactly one of --geno / --h2 / --rg / --make-rg-manifest must be specified. !!!")
         raise SystemExit(1)
+
+    if args.rg is not None and args.weight_mode != "he":
+        raise ValueError(
+            "--weight-mode ldsc currently supports univariate --h2 only. The existing "
+            "--intercept-weight-mode ldsc changes only the cross-trait nuisance-intercept fit; "
+            "a main genetic-covariance LDSC path requires a separate bivariate estimator."
+        )
+    if args.geno is not None and args.weight_mode != "he":
+        raise ValueError("--weight-mode applies to --h2 inference, not LD-score estimation with --geno.")
 
     if build_manifest_mode:
         _dispatch_make_rg_manifest(args, log)
