@@ -9,6 +9,8 @@ import numpy as np
 from summit.manifest.rg_manifest_fast import (
     _StructUnitStats,
     _load_fast_model_specs,
+    _row_struct_correction,
+    _row_struct_correction_selected,
     _select_struct_columns,
 )
 
@@ -71,6 +73,31 @@ class FastModelManifestTest(unittest.TestCase):
         np.testing.assert_array_equal(
             selected.AL, stats.AL[:, indices, :][:, :, indices]
         )
+
+    def test_selected_sparse_correction_matches_contiguous_model(self):
+        rng = np.random.default_rng(20260717)
+        A = rng.normal(size=(31, 7))
+        L = rng.normal(size=(31, 7))
+        indices = np.array([5, 0, 3, 2])
+        rows = np.array([1, 2, 8, 9, 10, 22, 30])
+        unit_id = np.repeat(np.arange(4), [8, 8, 8, 7])
+
+        expected = _row_struct_correction(
+            np.ascontiguousarray(A[:, indices]),
+            np.ascontiguousarray(L[:, indices]),
+            rows,
+            unit_id,
+            4,
+            len(indices),
+        )
+        observed = _row_struct_correction_selected(
+            A, L, rows, indices, unit_id, 4
+        )
+
+        for field in ("m", "Ak", "Ak2", "AA", "AL"):
+            np.testing.assert_array_equal(
+                getattr(observed, field), getattr(expected, field)
+            )
 
 
 if __name__ == "__main__":

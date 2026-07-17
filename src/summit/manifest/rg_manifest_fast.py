@@ -52,7 +52,7 @@ class _FastTrait:
     drop_idx: np.ndarray
     z_h2: np.ndarray
     z_rg: np.ndarray
-    h2_ay_unit: np.ndarray
+    h2_ay_unit: np.ndarray | None
     matched_stub: object
 
 
@@ -407,6 +407,40 @@ def _row_struct_correction(
     return _StructUnitStats(m=m, Ak=Ak, Ak2=Ak2, AA=AA, AL=AL)
 
 
+def _row_struct_correction_selected(
+    A: np.ndarray,
+    L: np.ndarray,
+    idx: np.ndarray,
+    indices: np.ndarray,
+    unit_id: np.ndarray,
+    U: int,
+) -> _StructUnitStats:
+    indices = np.asarray(indices, dtype=np.int64)
+    K = int(indices.size)
+    out = _StructUnitStats(
+        m=np.zeros(U, dtype=np.float64),
+        Ak=np.zeros((U, K), dtype=np.float64),
+        Ak2=np.zeros((U, K), dtype=np.float64),
+        AA=np.zeros((U, K, K), dtype=np.float64),
+        AL=np.zeros((U, K, K), dtype=np.float64),
+    )
+    idx = np.asarray(idx, dtype=np.int64)
+    if idx.size == 0:
+        return out
+
+    uids = np.asarray(unit_id[idx], dtype=np.int64)
+    for u in np.unique(uids):
+        rows = idx[uids == u]
+        Au = np.ascontiguousarray(A[np.ix_(rows, indices)], dtype=np.float64)
+        Lu = np.ascontiguousarray(L[np.ix_(rows, indices)], dtype=np.float64)
+        out.m[u] = float(rows.size)
+        out.Ak[u] = Au.sum(axis=0, dtype=np.float64)
+        out.Ak2[u] = (Au * Au).sum(axis=0, dtype=np.float64)
+        out.AA[u] = Au.T @ Au
+        out.AL[u] = Au.T @ Lu
+    return out
+
+
 def _row_ay_correction(
     A: np.ndarray,
     y: np.ndarray,
@@ -426,6 +460,22 @@ def _row_ay_correction(
     return out
 
 
+def _compute_full_ay_unit(
+    A: np.ndarray,
+    y: np.ndarray,
+    jk: JackknifeDesign,
+) -> np.ndarray:
+    U = int(jk.nunit)
+    K = int(A.shape[1])
+    out = np.zeros((U, K), dtype=np.float64)
+    for u, (s, e) in enumerate(zip(jk.starts, jk.ends)):
+        s = int(s)
+        e = int(e)
+        if e > s:
+            out[u] = A[s:e, :].T @ y[s:e]
+    return out
+
+
 def _build_fast_traits(
     trait_meta,
     shared_trace,
@@ -435,6 +485,8 @@ def _build_fast_traits(
     args,
     log,
     verbose_level: int,
+    *,
+    compute_h2_ay: bool = True,
 ) -> dict[str, _FastTrait]:
     M = int(shared_trace.nsnps)
     U = int(jk.nunit)
@@ -477,14 +529,11 @@ def _build_fast_traits(
         z_h2[~np.isfinite(z_h2)] = 0.0
         z_rg[~np.isfinite(z_rg)] = 0.0
 
-        y_h2 = z_h2 * z_h2
-        h2_ay_unit = np.zeros((U, K), dtype=np.float64)
-        for u, (s, e) in enumerate(zip(jk.starts, jk.ends)):
-            s = int(s)
-            e = int(e)
-            if e <= s:
-                continue
-            h2_ay_unit[u] = A[s:e, :].T @ y_h2[s:e]
+        h2_ay_unit = (
+            _compute_full_ay_unit(A, z_h2 * z_h2, jk)
+            if compute_h2_ay
+            else None
+        )
 
         trait = _FastTrait(
             phen=str(phen),
@@ -976,10 +1025,6 @@ def dispatch_rg_manifest_fast(args, log, manifest_df, trait_meta, verbose_level:
     U = int(jk.nunit)
     K = int(full_tv.nbins)
     unit_id = np.asarray(jk.unit_id, dtype=np.int64)
-    model_has_overlap = {
-        model.name: _has_overlapping_annotations(A[:, model.indices])
-        for model in model_specs
-    }
     if L.shape != (int(full_tv.nsnps), K):
         raise RuntimeError(f"Unexpected LD-score shape {L.shape}; expected {(int(full_tv.nsnps), K)}.")
 
@@ -992,14 +1037,33 @@ def dispatch_rg_manifest_fast(args, log, manifest_df, trait_meta, verbose_level:
         args,
         log,
         verbose_level,
+        compute_h2_ay=not multi_model,
     )
-    full_struct = _compute_struct_unit_stats(A, L, jk, log=log)
-    model_full_structs = {
-        model.name: (
-            _select_struct_columns(full_struct, model.indices)
-            if multi_model
-            else full_struct
-        )
+    model_matrices: dict[str, np.ndarray] = {}
+    model_full_structs: dict[str, _StructUnitStats] = {}
+    model_h2_ay: dict[str, dict[str, np.ndarray]] = {}
+    if multi_model:
+        for model in model_specs:
+            model_A = np.ascontiguousarray(A[:, model.indices], dtype=np.float64)
+            model_L = np.ascontiguousarray(L[:, model.indices], dtype=np.float64)
+            model_matrices[model.name] = model_A
+            model_full_structs[model.name] = _compute_struct_unit_stats(
+                model_A, model_L, jk, log=log
+            )
+            model_h2_ay[model.name] = {
+                spath: _compute_full_ay_unit(model_A, tr.z_h2 * tr.z_h2, jk)
+                for spath, tr in traits.items()
+            }
+            del model_L
+    else:
+        model = model_specs[0]
+        model_matrices[model.name] = A
+        model_full_structs[model.name] = _compute_struct_unit_stats(A, L, jk, log=log)
+        model_h2_ay[model.name] = {
+            spath: tr.h2_ay_unit for spath, tr in traits.items()
+        }
+    model_has_overlap = {
+        model.name: _has_overlapping_annotations(model_matrices[model.name])
         for model in model_specs
     }
 
@@ -1073,7 +1137,12 @@ def dispatch_rg_manifest_fast(args, log, manifest_df, trait_meta, verbose_level:
         P = len(partners)
         _log(log, f"[rg:manifest:fast] processing anchor '{anchor.phen}' with {P} partner pair(s).")
 
-        ay_rg = np.zeros((U, K, P), dtype=np.float64)
+        ay_rg_by_model = {
+            model.name: np.zeros(
+                (U, int(model.indices.size), P), dtype=np.float64
+            )
+            for model in model_specs
+        }
         for u, (s, e) in enumerate(zip(jk.starts, jk.ends)):
             s = int(s)
             e = int(e)
@@ -1082,7 +1151,10 @@ def dispatch_rg_manifest_fast(args, log, manifest_df, trait_meta, verbose_level:
             Zi = anchor.z_rg[s:e]
             Zp = np.column_stack([p.z_rg[s:e] for p in partners])
             Y = Zi[:, None] * Zp
-            ay_rg[u] = A[s:e, :].T @ Y
+            for model in model_specs:
+                ay_rg_by_model[model.name][u] = (
+                    model_matrices[model.name][s:e, :].T @ Y
+                )
 
         for pidx, (row_pos, row) in enumerate(row_items):
             t0_pair = time.time()
@@ -1094,42 +1166,45 @@ def dispatch_rg_manifest_fast(args, log, manifest_df, trait_meta, verbose_level:
                 raise RuntimeError(f"No SNPs remain for pair {row.phen1} vs {row.phen2}.")
 
             pair_drop = np.flatnonzero(~pair_keep).astype(np.int64)
-            if pair_drop.size == 0:
-                union_struct = full_struct
-            else:
-                corr = _row_struct_correction(A, L, pair_drop, unit_id, U, K)
-                union_struct = _StructUnitStats(
-                    m=full_struct.m - corr.m,
-                    Ak=full_struct.Ak - corr.Ak,
-                    Ak2=full_struct.Ak2 - corr.Ak2,
-                    AA=full_struct.AA - corr.AA,
-                    AL=full_struct.AL - corr.AL,
-                )
-
             drop2_for_1 = np.flatnonzero(tr1.keep & ~tr2.keep).astype(np.int64)
-            if drop2_for_1.size == 0:
-                ay1_union = tr1.h2_ay_unit
-            else:
-                ay1_union = tr1.h2_ay_unit - _row_ay_correction(
-                    A,
-                    tr1.z_h2 * tr1.z_h2,
-                    drop2_for_1,
-                    unit_id,
-                    U,
-                    K,
-                )
             drop1_for_2 = np.flatnonzero(tr2.keep & ~tr1.keep).astype(np.int64)
-            if drop1_for_2.size == 0:
-                ay2_union = tr2.h2_ay_unit
-            else:
-                ay2_union = tr2.h2_ay_unit - _row_ay_correction(
-                    A,
-                    tr2.z_h2 * tr2.z_h2,
-                    drop1_for_2,
-                    unit_id,
-                    U,
-                    K,
-                )
+
+            union_struct = None
+            ay1_union = None
+            ay2_union = None
+            if not multi_model:
+                full_struct = model_full_structs[model_specs[0].name]
+                if pair_drop.size == 0:
+                    union_struct = full_struct
+                else:
+                    corr = _row_struct_correction(A, L, pair_drop, unit_id, U, K)
+                    union_struct = _StructUnitStats(
+                        m=full_struct.m - corr.m,
+                        Ak=full_struct.Ak - corr.Ak,
+                        Ak2=full_struct.Ak2 - corr.Ak2,
+                        AA=full_struct.AA - corr.AA,
+                        AL=full_struct.AL - corr.AL,
+                    )
+                ay1_union = model_h2_ay[model_specs[0].name][tr1.spath]
+                if drop2_for_1.size:
+                    ay1_union = ay1_union - _row_ay_correction(
+                        A,
+                        tr1.z_h2 * tr1.z_h2,
+                        drop2_for_1,
+                        unit_id,
+                        U,
+                        K,
+                    )
+                ay2_union = model_h2_ay[model_specs[0].name][tr2.spath]
+                if drop1_for_2.size:
+                    ay2_union = ay2_union - _row_ay_correction(
+                        A,
+                        tr2.z_h2 * tr2.z_h2,
+                        drop1_for_2,
+                        unit_id,
+                        U,
+                        K,
+                    )
 
             for model_index, model in enumerate(model_specs):
                 model_view = model_views[model.name]
@@ -1137,16 +1212,49 @@ def dispatch_rg_manifest_fast(args, log, manifest_df, trait_meta, verbose_level:
                     struct = union_struct
                     ay1 = ay1_union
                     ay2 = ay2_union
-                    ay_pair = ay_rg[:, :, pidx]
+                    ay_pair = ay_rg_by_model[model.name][:, :, pidx]
                 else:
-                    struct = (
-                        model_full_structs[model.name]
-                        if pair_drop.size == 0
-                        else _select_struct_columns(union_struct, model.indices)
-                    )
-                    ay1 = ay1_union[:, model.indices]
-                    ay2 = ay2_union[:, model.indices]
-                    ay_pair = ay_rg[:, model.indices, pidx]
+                    model_A = model_matrices[model.name]
+                    full_struct = model_full_structs[model.name]
+                    if pair_drop.size == 0:
+                        struct = full_struct
+                    else:
+                        corr = _row_struct_correction_selected(
+                            A,
+                            L,
+                            pair_drop,
+                            model.indices,
+                            unit_id,
+                            U,
+                        )
+                        struct = _StructUnitStats(
+                            m=full_struct.m - corr.m,
+                            Ak=full_struct.Ak - corr.Ak,
+                            Ak2=full_struct.Ak2 - corr.Ak2,
+                            AA=full_struct.AA - corr.AA,
+                            AL=full_struct.AL - corr.AL,
+                        )
+                    ay1 = model_h2_ay[model.name][tr1.spath]
+                    if drop2_for_1.size:
+                        ay1 = ay1 - _row_ay_correction(
+                            model_A,
+                            tr1.z_h2 * tr1.z_h2,
+                            drop2_for_1,
+                            unit_id,
+                            U,
+                            int(model.indices.size),
+                        )
+                    ay2 = model_h2_ay[model.name][tr2.spath]
+                    if drop1_for_2.size:
+                        ay2 = ay2 - _row_ay_correction(
+                            model_A,
+                            tr2.z_h2 * tr2.z_h2,
+                            drop1_for_2,
+                            unit_id,
+                            U,
+                            int(model.indices.size),
+                        )
+                    ay_pair = ay_rg_by_model[model.name][:, :, pidx]
 
                 h2_fit1 = h2_fit_for_pair(
                     model, tr1, struct, ay1, pair_keep, drop2_for_1
