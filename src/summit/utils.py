@@ -908,6 +908,80 @@ def _delete_sets_pair_moments(
     )
 
 
+def _exact_loco_sym_weights_finite(trace_KK, D, unit_sizes, center="mean"):
+    """Optimized exact-LOCO weights for the finite, fully active case."""
+    trace_KK = np.asarray(trace_KK, dtype=np.float64)
+    D = np.asarray(D, dtype=np.float64, order="C")
+    unit_sizes = np.asarray(unit_sizes, dtype=np.float64).ravel()
+
+    B = int(trace_KK.shape[0] - 1)
+    K = int(trace_KK.shape[1])
+    U = int(unit_sizes.size)
+    mask = D > 0.5
+    if (
+        B != U
+        or D.shape != (B, U)
+        or not np.all(mask.sum(axis=1) == 1)
+        or not np.all(mask.sum(axis=0) == 1)
+        or not np.isfinite(trace_KK).all()
+    ):
+        return None
+
+    M = float(np.sum(unit_sizes))
+    if (
+        not np.isfinite(M)
+        or M <= 0.0
+        or not np.isfinite(unit_sizes).all()
+        or np.any(unit_sizes <= 0.0)
+        or np.any(unit_sizes >= M)
+    ):
+        return None
+
+    unit_of_rep = mask.argmax(axis=1)
+    rep_for_unit = np.empty(U, dtype=np.int64)
+    rep_for_unit[unit_of_rep] = np.arange(B, dtype=np.int64)
+
+    full = trace_KK[B]
+    jack_by_unit = trace_KK[:B][rep_for_unit]
+    ww = unit_sizes / M
+    ww = ww / float(np.sum(ww))
+    alpha = (ww * ww) / (1.0 - ww)
+    w2 = float(np.sum(ww * ww))
+    n_eff = (1.0 / w2) if (w2 > 0.0 and np.isfinite(w2)) else 0.0
+    if not (n_eff > 1.0):
+        return np.full((K, K), 0.5, dtype=np.float64)
+
+    weights = np.full((K, K), 0.5, dtype=np.float64)
+    remaining = M - unit_sizes
+    center_weight_sum = float(np.sum(ww)) if center == "mean" else None
+    for k in range(K):
+        for l in range(k + 1, K):
+            x_full = float(full[k, l])
+            y_full = float(full[l, k])
+            pvx = (M * x_full - remaining * jack_by_unit[:, k, l]) / unit_sizes
+            pvy = (M * y_full - remaining * jack_by_unit[:, l, k]) / unit_sizes
+            if center == "mean":
+                cx = float(np.sum(ww * pvx) / center_weight_sum)
+                cy = float(np.sum(ww * pvy) / center_weight_sum)
+            elif center == "full":
+                cx = x_full
+                cy = y_full
+            elif center == "median":
+                cx = float(np.median(pvx))
+                cy = float(np.median(pvy))
+            else:
+                raise ValueError("center must be one of {'full','mean','median'}")
+            dx = pvx - cx
+            dy = pvy - cy
+            v1 = float(np.sum(alpha * (dx * dx)))
+            v2 = float(np.sum(alpha * (dy * dy)))
+            c12 = float(np.sum(alpha * (dx * dy)))
+            weight = _sym_clip_weight(v1, v2, c12)
+            weights[k, l] = weight
+            weights[l, k] = 1.0 - weight
+    return weights
+
+
 def estimate_offdiag_variances_from_jackknife(trace_KK, center="mean", nan_policy="omit"):
     """
     Legacy equal-weight off-diagonal symmetrization weights.
@@ -988,6 +1062,7 @@ def symmetrize_trace_with_jackknife(
     jk_delete_d: int = 1,
     center: str = "mean",
     nan_policy: str = "omit",
+    exact_loco_fast: bool = False,
 ):
     """
     Symmetrize off-diagonal trace entries using pair-specific jackknife-optimal weights.
@@ -1070,31 +1145,42 @@ def symmetrize_trace_with_jackknife(
                 f"jk_n_units={jk_n_units} inconsistent with delete matrix U={D.shape[1]}."
             )
 
-        w_opt = np.full((K, K), 0.5, dtype=np.float64)
+        w_opt = None
+        if exact_loco_fast:
+            w_opt = _exact_loco_sym_weights_finite(
+                trace_KK,
+                D,
+                unit_sizes,
+                center=center,
+            )
+        fast_exact_loco = w_opt is not None
+        if w_opt is None:
+            w_opt = np.full((K, K), 0.5, dtype=np.float64)
         full = trace_KK[B]
         jack = trace_KK[:B]
 
-        for k in range(K):
-            w_opt[k, k] = 0.5
+        if not fast_exact_loco:
+            for k in range(K):
+                w_opt[k, k] = 0.5
 
-        for k in range(K):
-            for l in range(k + 1, K):
-                v1, v2, c12 = _delete_sets_pair_moments(
-                    x_rep=jack[:, k, l],
-                    y_rep=jack[:, l, k],
-                    x_full=float(full[k, l]),
-                    y_full=float(full[l, k]),
-                    D=D,
-                    unit_sizes=unit_sizes,
-                    center=center,
-                    nan_policy=nan_policy,
-                )
-                w = _sym_clip_weight(v1, v2, c12) if (
-                    np.isfinite(v1) and np.isfinite(v2) and np.isfinite(c12)
-                ) else 0.5
+            for k in range(K):
+                for l in range(k + 1, K):
+                    v1, v2, c12 = _delete_sets_pair_moments(
+                        x_rep=jack[:, k, l],
+                        y_rep=jack[:, l, k],
+                        x_full=float(full[k, l]),
+                        y_full=float(full[l, k]),
+                        D=D,
+                        unit_sizes=unit_sizes,
+                        center=center,
+                        nan_policy=nan_policy,
+                    )
+                    w = _sym_clip_weight(v1, v2, c12) if (
+                        np.isfinite(v1) and np.isfinite(v2) and np.isfinite(c12)
+                    ) else 0.5
 
-                w_opt[k, l] = w
-                w_opt[l, k] = 1.0 - w
+                    w_opt[k, l] = w
+                    w_opt[l, k] = 1.0 - w
 
         if logger is not None and verbose:
             logger._log(

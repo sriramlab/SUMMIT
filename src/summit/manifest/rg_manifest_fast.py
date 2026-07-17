@@ -625,7 +625,7 @@ def _stack_h2_prepared(
     M_l = np.broadcast_to(Ak_full[None, :], Ak_rep.shape)[:, None, :]
     trace_KK = utils._calc_trace_from_ld_batch(AL_rep, n_scale, M_k, M_l, delta=None)
     unit_sizes = jk.unit_sizes(active_mask=active_mask, dtype=np.float64)
-    trace_KK = _sym_h2(trace_KK, jk, unit_sizes)
+    trace_KK = _sym_h2(trace_KK, jk, unit_sizes, exact_loco_fast=True)
 
     lhs = np.full((R + 1, K + 1, K + 1), n_scale, dtype=np.float64)
     lhs[:, :K, :K] = trace_KK
@@ -697,7 +697,7 @@ def _stack_rg_prepared(
     M_l = np.broadcast_to(Ak_full[None, :], Ak_rep.shape)[:, None, :]
     lhs = utils._calc_rg_trace_from_ld_batch(AL_rep, n1_scale, n2_scale, M_k, M_l)
     unit_sizes = jk.unit_sizes(active_mask=active_mask, dtype=np.float64)
-    lhs = _sym_rg(lhs, jk, unit_sizes)
+    lhs = _sym_rg(lhs, jk, unit_sizes, exact_loco_fast=True)
 
     return RGPrepared(
         trace_view=fast_tv,

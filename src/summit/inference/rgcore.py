@@ -308,7 +308,13 @@ def _solve_linear_batch(lhs: np.ndarray, rhs: np.ndarray) -> np.ndarray:
     return out
 
 
-def _symmetrize_with_design(trace_KK: np.ndarray, jackknife, unit_sizes: np.ndarray) -> np.ndarray:
+def _symmetrize_with_design(
+    trace_KK: np.ndarray,
+    jackknife,
+    unit_sizes: np.ndarray,
+    *,
+    exact_loco_fast: bool = False,
+) -> np.ndarray:
     """
     Symmetrize replicate trace matrices using the current jackknife design.
 
@@ -325,6 +331,7 @@ def _symmetrize_with_design(trace_KK: np.ndarray, jackknife, unit_sizes: np.ndar
             jk_delete_matrix=np.asarray(jackknife.D, dtype=np.float64, order="C"),
             jk_unit_sizes=unit_sizes,
             jk_delete_d=int(jackknife.delete),
+            exact_loco_fast=exact_loco_fast,
         )
     except TypeError:
         if jackknife.mode == "block":
