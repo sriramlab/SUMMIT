@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import json
 from pathlib import Path
+import re
 import time
 
 import numpy as np
@@ -71,6 +73,109 @@ class _StructUnitStats:
     Ak2: np.ndarray
     AA: np.ndarray
     AL: np.ndarray
+
+
+@dataclass(frozen=True)
+class _FastModelSpec:
+    name: str
+    slug: str
+    indices: np.ndarray
+    bins: tuple[str, ...]
+    aliases: tuple[str, ...]
+
+
+def _sanitize_model_name(value: str) -> str:
+    return re.sub(r"[^A-Za-z0-9_.+-]+", "_", str(value)).strip("_") or "model"
+
+
+def _parse_model_columns(value, *, field: str, model: str) -> tuple[str, ...]:
+    text = str(value).strip()
+    if not text:
+        raise ValueError(f"Model '{model}' has an empty {field} field.")
+    if text.startswith("["):
+        try:
+            parsed = json.loads(text)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"Model '{model}' has invalid JSON in {field}: {exc}") from exc
+        if not isinstance(parsed, list) or not all(isinstance(item, str) for item in parsed):
+            raise ValueError(f"Model '{model}' {field} JSON must be a list of strings.")
+        items = tuple(item.strip() for item in parsed)
+    else:
+        items = tuple(item.strip() for item in text.split(","))
+    if not items or any(not item for item in items):
+        raise ValueError(f"Model '{model}' has an empty entry in {field}.")
+    if len(set(items)) != len(items):
+        raise ValueError(f"Model '{model}' has duplicate entries in {field}: {items}.")
+    return items
+
+
+def _load_fast_model_specs(path, annot_header) -> list[_FastModelSpec]:
+    table = pd.read_csv(path, sep="\t", dtype=str, keep_default_na=False)
+    required = {"model", "bins"}
+    missing = required.difference(table.columns)
+    if missing:
+        raise ValueError(
+            f"RG model manifest '{path}' is missing required column(s): {sorted(missing)}."
+        )
+    if table.empty:
+        raise ValueError(f"RG model manifest '{path}' contains no models.")
+
+    headers = tuple(str(item) for item in np.asarray(annot_header).tolist())
+    if len(set(headers)) != len(headers):
+        raise ValueError("Union annotation headers must be unique for multi-model RG.")
+    header_index = {header: index for index, header in enumerate(headers)}
+
+    specs: list[_FastModelSpec] = []
+    names: set[str] = set()
+    slugs: set[str] = set()
+    common_aliases: tuple[str, ...] | None = None
+    for row in table.itertuples(index=False):
+        model = str(row.model).strip()
+        if not model:
+            raise ValueError("RG model manifest contains an empty model name.")
+        if model in names:
+            raise ValueError(f"RG model manifest contains duplicate model '{model}'.")
+        names.add(model)
+        slug = _sanitize_model_name(model)
+        if slug in slugs:
+            raise ValueError(
+                f"RG model names are not unique after path sanitization; duplicate slug '{slug}'."
+            )
+        slugs.add(slug)
+
+        bins = _parse_model_columns(row.bins, field="bins", model=model)
+        alias_value = getattr(row, "aliases", "")
+        aliases = (
+            bins
+            if not str(alias_value).strip()
+            else _parse_model_columns(alias_value, field="aliases", model=model)
+        )
+        if len(aliases) != len(bins):
+            raise ValueError(
+                f"Model '{model}' has {len(bins)} bins but {len(aliases)} aliases."
+            )
+        unknown = [item for item in bins if item not in header_index]
+        if unknown:
+            raise ValueError(
+                f"Model '{model}' requests annotation bins absent from the union trace: {unknown}."
+            )
+        if common_aliases is None:
+            common_aliases = aliases
+        elif aliases != common_aliases:
+            raise ValueError(
+                "All RG models must use the same ordered aliases so manifest.results.tsv "
+                "has a compact, stable schema."
+            )
+        specs.append(
+            _FastModelSpec(
+                name=model,
+                slug=slug,
+                indices=np.asarray([header_index[item] for item in bins], dtype=np.int64),
+                bins=bins,
+                aliases=aliases,
+            )
+        )
+    return specs
 
 
 class _FastTraceView:
@@ -259,6 +364,17 @@ def _compute_struct_unit_stats(A: np.ndarray, L: np.ndarray, jk: JackknifeDesign
         AL[u] = Au.T @ Lu
     _log(log, f"[rg:manifest:fast] precomputed full unit structural stats in {time.time() - t0:.3f}s.")
     return _StructUnitStats(m=m, Ak=Ak, Ak2=Ak2, AA=AA, AL=AL)
+
+
+def _select_struct_columns(struct: _StructUnitStats, indices: np.ndarray) -> _StructUnitStats:
+    indices = np.asarray(indices, dtype=np.int64)
+    return _StructUnitStats(
+        m=struct.m,
+        Ak=struct.Ak[:, indices],
+        Ak2=struct.Ak2[:, indices],
+        AA=struct.AA[:, indices, :][:, :, indices],
+        AL=struct.AL[:, indices, :][:, :, indices],
+    )
 
 
 def _row_struct_correction(
@@ -826,18 +942,44 @@ def dispatch_rg_manifest_fast(args, log, manifest_df, trait_meta, verbose_level:
         delta=None,
     )
     full_tv = shared_trace.materialize_view()
-    fast_tv = _FastTraceView(
-        nsnps=int(full_tv.nsnps),
-        nbins=int(full_tv.nbins),
-        annot_header=full_tv.annot_header,
-    )
+    model_manifest = getattr(args, "rg_model_manifest", None)
+    multi_model = bool(model_manifest)
+    if multi_model:
+        model_specs = _load_fast_model_specs(model_manifest, full_tv.annot_header)
+        _log(
+            log,
+            f"[rg:manifest:fast] loaded {len(model_specs)} model(s) from {model_manifest}; "
+            f"union bins={int(full_tv.nbins)}, per-model bins={len(model_specs[0].indices)}.",
+        )
+    else:
+        headers = tuple(str(item) for item in np.asarray(full_tv.annot_header).tolist())
+        model_specs = [
+            _FastModelSpec(
+                name="default",
+                slug="default",
+                indices=np.arange(int(full_tv.nbins), dtype=np.int64),
+                bins=headers,
+                aliases=headers,
+            )
+        ]
+    model_views = {
+        model.name: _FastTraceView(
+            nsnps=int(full_tv.nsnps),
+            nbins=int(model.indices.size),
+            annot_header=np.asarray(model.aliases, dtype=object),
+        )
+        for model in model_specs
+    }
     jk = JackknifeDesign.from_trace_view(full_tv, jk_spec, log=log)
     A = np.asarray(full_tv.annot, dtype=np.float64, order="C")
     L = np.asarray(full_tv.ldscores, dtype=np.float64, order="C")
     U = int(jk.nunit)
     K = int(full_tv.nbins)
     unit_id = np.asarray(jk.unit_id, dtype=np.int64)
-    has_overlap = _has_overlapping_annotations(A)
+    model_has_overlap = {
+        model.name: _has_overlapping_annotations(A[:, model.indices])
+        for model in model_specs
+    }
     if L.shape != (int(full_tv.nsnps), K):
         raise RuntimeError(f"Unexpected LD-score shape {L.shape}; expected {(int(full_tv.nsnps), K)}.")
 
@@ -852,6 +994,14 @@ def dispatch_rg_manifest_fast(args, log, manifest_df, trait_meta, verbose_level:
         verbose_level,
     )
     full_struct = _compute_struct_unit_stats(A, L, jk, log=log)
+    model_full_structs = {
+        model.name: (
+            _select_struct_columns(full_struct, model.indices)
+            if multi_model
+            else full_struct
+        )
+        for model in model_specs
+    }
 
     order = (
         list(range(int(manifest_df.shape[0])))
@@ -867,13 +1017,23 @@ def dispatch_rg_manifest_fast(args, log, manifest_df, trait_meta, verbose_level:
             anchor_order.append(row.sumstats1)
         rows_by_anchor[row.sumstats1].append((int(row_pos), row))
 
-    results = [None] * int(manifest_df.shape[0])
+    n_pairs = int(manifest_df.shape[0])
+    n_models = len(model_specs)
+    total_fits = n_pairs * n_models
+    results = [None] * total_fits
     h2_no_extra_drop_cache = {}
     t0_all = time.time()
     completed = 0
 
-    def h2_fit_for_pair(tr: _FastTrait, struct: _StructUnitStats, ay: np.ndarray, pair_keep: np.ndarray, extra_drop: np.ndarray):
-        cache_key = tr.spath if int(extra_drop.size) == 0 else None
+    def h2_fit_for_pair(
+        model: _FastModelSpec,
+        tr: _FastTrait,
+        struct: _StructUnitStats,
+        ay: np.ndarray,
+        pair_keep: np.ndarray,
+        extra_drop: np.ndarray,
+    ):
+        cache_key = (model.name, tr.spath) if int(extra_drop.size) == 0 else None
         if cache_key is not None and cache_key in h2_no_extra_drop_cache:
             return h2_no_extra_drop_cache[cache_key]
 
@@ -885,11 +1045,11 @@ def dispatch_rg_manifest_fast(args, log, manifest_df, trait_meta, verbose_level:
             "n_nonfinite": 0,
         }
         fit = _stack_h2_prepared(
-            fast_tv=fast_tv,
+            fast_tv=model_views[model.name],
             matched=tr.matched_stub,
             jk=jk,
             active_mask=pair_keep,
-            has_overlap=has_overlap,
+            has_overlap=model_has_overlap[model.name],
             struct=struct,
             Ay_unit=ay,
             n_scale=h2_info["n_scale"],
@@ -934,133 +1094,177 @@ def dispatch_rg_manifest_fast(args, log, manifest_df, trait_meta, verbose_level:
                 raise RuntimeError(f"No SNPs remain for pair {row.phen1} vs {row.phen2}.")
 
             pair_drop = np.flatnonzero(~pair_keep).astype(np.int64)
-            corr = _row_struct_correction(A, L, pair_drop, unit_id, U, K)
-            struct = _StructUnitStats(
-                m=full_struct.m - corr.m,
-                Ak=full_struct.Ak - corr.Ak,
-                Ak2=full_struct.Ak2 - corr.Ak2,
-                AA=full_struct.AA - corr.AA,
-                AL=full_struct.AL - corr.AL,
-            )
+            if pair_drop.size == 0:
+                union_struct = full_struct
+            else:
+                corr = _row_struct_correction(A, L, pair_drop, unit_id, U, K)
+                union_struct = _StructUnitStats(
+                    m=full_struct.m - corr.m,
+                    Ak=full_struct.Ak - corr.Ak,
+                    Ak2=full_struct.Ak2 - corr.Ak2,
+                    AA=full_struct.AA - corr.AA,
+                    AL=full_struct.AL - corr.AL,
+                )
 
             drop2_for_1 = np.flatnonzero(tr1.keep & ~tr2.keep).astype(np.int64)
-            ay1 = tr1.h2_ay_unit - _row_ay_correction(
-                A,
-                tr1.z_h2 * tr1.z_h2,
-                drop2_for_1,
-                unit_id,
-                U,
-                K,
-            )
+            if drop2_for_1.size == 0:
+                ay1_union = tr1.h2_ay_unit
+            else:
+                ay1_union = tr1.h2_ay_unit - _row_ay_correction(
+                    A,
+                    tr1.z_h2 * tr1.z_h2,
+                    drop2_for_1,
+                    unit_id,
+                    U,
+                    K,
+                )
             drop1_for_2 = np.flatnonzero(tr2.keep & ~tr1.keep).astype(np.int64)
-            ay2 = tr2.h2_ay_unit - _row_ay_correction(
-                A,
-                tr2.z_h2 * tr2.z_h2,
-                drop1_for_2,
-                unit_id,
-                U,
-                K,
-            )
+            if drop1_for_2.size == 0:
+                ay2_union = tr2.h2_ay_unit
+            else:
+                ay2_union = tr2.h2_ay_unit - _row_ay_correction(
+                    A,
+                    tr2.z_h2 * tr2.z_h2,
+                    drop1_for_2,
+                    unit_id,
+                    U,
+                    K,
+                )
 
-            h2_fit1 = h2_fit_for_pair(tr1, struct, ay1, pair_keep, drop2_for_1)
-            h2_fit2 = h2_fit_for_pair(tr2, struct, ay2, pair_keep, drop1_for_2)
+            for model_index, model in enumerate(model_specs):
+                model_view = model_views[model.name]
+                if not multi_model:
+                    struct = union_struct
+                    ay1 = ay1_union
+                    ay2 = ay2_union
+                    ay_pair = ay_rg[:, :, pidx]
+                else:
+                    struct = (
+                        model_full_structs[model.name]
+                        if pair_drop.size == 0
+                        else _select_struct_columns(union_struct, model.indices)
+                    )
+                    ay1 = ay1_union[:, model.indices]
+                    ay2 = ay2_union[:, model.indices]
+                    ay_pair = ay_rg[:, model.indices, pidx]
 
-            rg_info = {
-                "mode": "beta_se_exact_sparse_drop",
-                "trait1_cov_rank": int(tr1.cov_rank),
-                "trait1_cov_rank_source": str(tr1.cov_rank_source),
-                "trait1_n_scale": float(tr1.n_scale),
-                "trait2_cov_rank": int(tr2.cov_rank),
-                "trait2_cov_rank_source": str(tr2.cov_rank_source),
-                "trait2_n_scale": float(tr2.n_scale),
-                "n_nonfinite": 0,
-            }
-            rg_prepared = _stack_rg_prepared(
-                fast_tv=fast_tv,
-                matched1=tr1.matched_stub,
-                matched2=tr2.matched_stub,
-                jk=jk,
-                active_mask=pair_keep,
-                struct=struct,
-                Ay_unit=ay_rg[:, :, pidx],
-                n1_scale=float(tr1.n_scale),
-                n2_scale=float(tr2.n_scale),
-                summary_y_info=rg_info,
-                y=np.array([], dtype=np.float64),
-            )
+                h2_fit1 = h2_fit_for_pair(
+                    model, tr1, struct, ay1, pair_keep, drop2_for_1
+                )
+                h2_fit2 = h2_fit_for_pair(
+                    model, tr2, struct, ay2, pair_keep, drop1_for_2
+                )
 
-            row_intercept = float(row.intercept_rg)
-            intercept = InterceptFit(
-                trace_view=fast_tv,
-                matched1=tr1.matched_stub,
-                matched2=tr2.matched_stub,
-                jackknife=jk,
-                active_mask=pair_keep,
-                unit_sizes=jk.unit_sizes(active_mask=pair_keep, dtype=np.float64),
-                ld=np.array([], dtype=np.float64),
-                y=np.array([], dtype=np.float64),
-                c_reps=np.full(jk.nrep + 1, row_intercept, dtype=np.float64),
-                c=np.array([row_intercept, 0.0], dtype=np.float64),
-                info={
-                    "fixed": True,
-                    "source": "manifest",
-                    "summary_y_mode": "beta_se_exact_sparse_drop",
+                rg_info = {
+                    "mode": "beta_se_exact_sparse_drop",
+                    "trait1_cov_rank": int(tr1.cov_rank),
+                    "trait1_cov_rank_source": str(tr1.cov_rank_source),
                     "trait1_n_scale": float(tr1.n_scale),
+                    "trait2_cov_rank": int(tr2.cov_rank),
+                    "trait2_cov_rank_source": str(tr2.cov_rank_source),
                     "trait2_n_scale": float(tr2.n_scale),
-                },
-            )
-            rg_fit = fit_rg(
-                rg_prepared,
-                h2_fit1,
-                h2_fit2,
-                intercept,
-                rg_se_method=args.rg_se_method,
-                jack_mode=args.jack_mode,
-                nan_policy=("propagate" if args.clip_nonfinite_vals else "omit"),
-            )
+                    "n_nonfinite": 0,
+                    "model": model.name,
+                    "model_bins": list(model.bins),
+                }
+                rg_prepared = _stack_rg_prepared(
+                    fast_tv=model_view,
+                    matched1=tr1.matched_stub,
+                    matched2=tr2.matched_stub,
+                    jk=jk,
+                    active_mask=pair_keep,
+                    struct=struct,
+                    Ay_unit=ay_pair,
+                    n1_scale=float(tr1.n_scale),
+                    n2_scale=float(tr2.n_scale),
+                    summary_y_info=rg_info,
+                    y=np.array([], dtype=np.float64),
+                )
 
-            pair_prefix = str(outdir / row.out_stem)
-            if write_pair_logs:
-                _write_fast_pair_log(
-                    pair_prefix,
+                row_intercept = float(row.intercept_rg)
+                intercept = InterceptFit(
+                    trace_view=model_view,
+                    matched1=tr1.matched_stub,
+                    matched2=tr2.matched_stub,
+                    jackknife=jk,
+                    active_mask=pair_keep,
+                    unit_sizes=jk.unit_sizes(active_mask=pair_keep, dtype=np.float64),
+                    ld=np.array([], dtype=np.float64),
+                    y=np.array([], dtype=np.float64),
+                    c_reps=np.full(jk.nrep + 1, row_intercept, dtype=np.float64),
+                    c=np.array([row_intercept, 0.0], dtype=np.float64),
+                    info={
+                        "fixed": True,
+                        "source": "manifest",
+                        "summary_y_mode": "beta_se_exact_sparse_drop",
+                        "trait1_n_scale": float(tr1.n_scale),
+                        "trait2_n_scale": float(tr2.n_scale),
+                        "model": model.name,
+                    },
+                )
+                rg_fit = fit_rg(
+                    rg_prepared,
+                    h2_fit1,
+                    h2_fit2,
+                    intercept,
+                    rg_se_method=args.rg_se_method,
+                    jack_mode=args.jack_mode,
+                    nan_policy=("propagate" if args.clip_nonfinite_vals else "omit"),
+                )
+
+                pair_prefix = (
+                    str(outdir / model.slug / row.out_stem)
+                    if multi_model
+                    else str(outdir / row.out_stem)
+                )
+                if write_pair_logs or write_jack:
+                    Path(pair_prefix).parent.mkdir(parents=True, exist_ok=True)
+                if write_pair_logs:
+                    _write_fast_pair_log(
+                        pair_prefix,
+                        phen1=row.phen1,
+                        phen2=row.phen2,
+                        annot_header=model_view.annot_header,
+                        h2_fit1=h2_fit1,
+                        h2_fit2=h2_fit2,
+                        intercept=intercept,
+                        rg_fit=rg_fit,
+                        runtime_s=(time.time() - t0_pair),
+                    )
+                if write_jack:
+                    jack_path = pair_prefix + ".rg.jack"
+                    RGResultWriter.save_jackknife_text(rg_fit, jack_path)
+                    _log(log, f"[rg:manifest:fast] saved rg jackknife replicate dump to {jack_path}")
+
+                result = build_manifest_summary_row(
                     phen1=row.phen1,
                     phen2=row.phen2,
-                    annot_header=fast_tv.annot_header,
+                    sumstats1=row.sumstats1,
+                    sumstats2=row.sumstats2,
+                    cov_rank1=row.cov_rank1,
+                    cov_rank2=row.cov_rank2,
+                    intercept_rg_input=row.intercept_rg,
+                    out_prefix=pair_prefix,
+                    n_snps=active_n,
+                    annot_header=model_view.annot_header,
                     h2_fit1=h2_fit1,
                     h2_fit2=h2_fit2,
                     intercept=intercept,
                     rg_fit=rg_fit,
-                    runtime_s=(time.time() - t0_pair),
                 )
-            if write_jack:
-                jack_path = pair_prefix + ".rg.jack"
-                RGResultWriter.save_jackknife_text(rg_fit, jack_path)
-                _log(log, f"[rg:manifest:fast] saved rg jackknife replicate dump to {jack_path}")
-
-            results[int(row_pos)] = build_manifest_summary_row(
-                phen1=row.phen1,
-                phen2=row.phen2,
-                sumstats1=row.sumstats1,
-                sumstats2=row.sumstats2,
-                cov_rank1=row.cov_rank1,
-                cov_rank2=row.cov_rank2,
-                intercept_rg_input=row.intercept_rg,
-                out_prefix=pair_prefix,
-                n_snps=active_n,
-                annot_header=fast_tv.annot_header,
-                h2_fit1=h2_fit1,
-                h2_fit2=h2_fit2,
-                intercept=intercept,
-                rg_fit=rg_fit,
-            )
-            completed += 1
-            if completed == 1 or completed % 25 == 0 or completed == int(manifest_df.shape[0]):
-                _log(
-                    log,
-                    f"[rg:manifest:fast] completed {completed}/{manifest_df.shape[0]} pair(s); "
-                    f"latest {row.phen1} vs {row.phen2}: rg={float(rg_fit.rg_total[0]):.6g} "
-                    f"(SE {float(rg_fit.rg_total[1]):.6g})."
-                )
+                if multi_model:
+                    result = {"model": model.name, **result}
+                result_index = model_index * n_pairs + int(row_pos)
+                results[result_index] = result
+                completed += 1
+                if completed == 1 or completed % 25 == 0 or completed == total_fits:
+                    model_msg = f" model={model.name}" if multi_model else ""
+                    _log(
+                        log,
+                        f"[rg:manifest:fast] completed {completed}/{total_fits} fit(s);{model_msg} "
+                        f"latest {row.phen1} vs {row.phen2}: rg={float(rg_fit.rg_total[0]):.6g} "
+                        f"(SE {float(rg_fit.rg_total[1]):.6g})."
+                    )
 
     out = pd.DataFrame(results)
     summary_path = outdir / "manifest.results.tsv"

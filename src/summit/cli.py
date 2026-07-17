@@ -175,6 +175,13 @@ def build_parser() -> argparse.ArgumentParser:
                             "With --rg-manifest-fast, omit per-pair .log files and retain the "
                             "batch log plus manifest.results.tsv. Intended for very large batches."
                         ))
+    parser.add_argument("--rg-model-manifest", default=None, type=str,
+                        help=(
+                            "Optional multi-model specification for --rg-manifest-fast. The TSV must "
+                            "contain model and bins columns, with optional aliases. Each row selects an "
+                            "ordered subset of bins from the union --annot/--ldscores inputs. Shared "
+                            "phenotypes and union sufficient statistics are computed once across models."
+                        ))
     parser.add_argument("--phen-dir", default=None, type=str,
                         help=(
                             "Phenotype source for --make-rg-manifest. Either a directory of per-trait phenotype files "
@@ -947,6 +954,11 @@ def _dispatch_rg_manifest(args, log):
         getattr(args, "rg_manifest_fast", False)
     ):
         log._log("!!! --rg-fast-no-pair-logs requires --rg-manifest-fast. !!!")
+        raise SystemExit(1)
+    if getattr(args, "rg_model_manifest", None) and not bool(
+        getattr(args, "rg_manifest_fast", False)
+    ):
+        log._log("!!! --rg-model-manifest requires --rg-manifest-fast. !!!")
         raise SystemExit(1)
 
     verbose_level = _verbose_to_level(args.verbose)
