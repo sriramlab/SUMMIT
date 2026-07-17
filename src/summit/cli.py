@@ -170,6 +170,11 @@ def build_parser() -> argparse.ArgumentParser:
                             "writes manifest.results.tsv with total and per-bin rg/gamma columns, "
                             "and also emits per-pair .log files."
                         ))
+    parser.add_argument("--rg-fast-no-pair-logs", action="store_true", default=False,
+                        help=(
+                            "With --rg-manifest-fast, omit per-pair .log files and retain the "
+                            "batch log plus manifest.results.tsv. Intended for very large batches."
+                        ))
     parser.add_argument("--phen-dir", default=None, type=str,
                         help=(
                             "Phenotype source for --make-rg-manifest. Either a directory of per-trait phenotype files "
@@ -937,6 +942,11 @@ def _dispatch_rg_manifest(args, log):
         raise SystemExit(1)
     if args.cov_rank is not None:
         log._log("!!! In rg manifest mode, provide trait-specific cov_rank via optional manifest columns cov_rank1 / cov_rank2 or via the sumstats files. Global --cov-rank is not allowed. !!!")
+        raise SystemExit(1)
+    if bool(getattr(args, "rg_fast_no_pair_logs", False)) and not bool(
+        getattr(args, "rg_manifest_fast", False)
+    ):
+        log._log("!!! --rg-fast-no-pair-logs requires --rg-manifest-fast. !!!")
         raise SystemExit(1)
 
     verbose_level = _verbose_to_level(args.verbose)

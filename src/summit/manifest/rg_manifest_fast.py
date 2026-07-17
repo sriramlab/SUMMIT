@@ -788,6 +788,13 @@ def dispatch_rg_manifest_fast(args, log, manifest_df, trait_meta, verbose_level:
     if bool(parsed_write_normeq):
         _log(log, "[rg:manifest:fast] verbose requested normal-equation dumps; fast mode ignores that unsupported dump.")
 
+    write_pair_logs = not bool(getattr(args, "rg_fast_no_pair_logs", False))
+    if not write_pair_logs:
+        _log(
+            log,
+            "[rg:manifest:fast] per-pair logs disabled; retaining batch.log and manifest.results.tsv.",
+        )
+
     outdir = Path(args.out)
     outdir.mkdir(parents=True, exist_ok=True)
     jk_spec = JackknifeSpec.parse(args.njack)
@@ -1013,17 +1020,18 @@ def dispatch_rg_manifest_fast(args, log, manifest_df, trait_meta, verbose_level:
             )
 
             pair_prefix = str(outdir / row.out_stem)
-            _write_fast_pair_log(
-                pair_prefix,
-                phen1=row.phen1,
-                phen2=row.phen2,
-                annot_header=fast_tv.annot_header,
-                h2_fit1=h2_fit1,
-                h2_fit2=h2_fit2,
-                intercept=intercept,
-                rg_fit=rg_fit,
-                runtime_s=(time.time() - t0_pair),
-            )
+            if write_pair_logs:
+                _write_fast_pair_log(
+                    pair_prefix,
+                    phen1=row.phen1,
+                    phen2=row.phen2,
+                    annot_header=fast_tv.annot_header,
+                    h2_fit1=h2_fit1,
+                    h2_fit2=h2_fit2,
+                    intercept=intercept,
+                    rg_fit=rg_fit,
+                    runtime_s=(time.time() - t0_pair),
+                )
             if write_jack:
                 jack_path = pair_prefix + ".rg.jack"
                 RGResultWriter.save_jackknife_text(rg_fit, jack_path)
