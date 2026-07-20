@@ -5,6 +5,7 @@ import sys
 import time
 import ctypes
 import threading
+from collections import OrderedDict
 from contextlib import contextmanager, nullcontext
 from typing import Optional, Tuple, List
 
@@ -13,6 +14,15 @@ import pandas as pd
 from bed_reader import open_bed
 
 from .. import utils
+from .genotype_source import (
+    PgenBlockReader,
+    read_aligned_annotations,
+    read_fam_sample_ids,
+    read_psam_sample_ids,
+    read_pvar_variants,
+    resolve_genotype_input,
+    validate_variant_metadata,
+)
 
 try:
     from threadpoolctl import threadpool_limits
@@ -194,10 +204,11 @@ def _parse_rand_samp(rand_samp, n: int, rng: np.random.Generator) -> Optional[np
 
 def _read_cov_qr(
     cov_path: str,
-    fam_path: str,
+    fam_path: Optional[str],
     log,
     sample_idx: Optional[np.ndarray] = None,
     add_intercept: bool = True,
+    sample_ids: Optional[pd.DataFrame] = None,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
     Read covariates aligned to .fam order, optional subselect rows, drop rows with any NA,
@@ -209,11 +220,24 @@ def _read_cov_qr(
     R : (p_eff, N_kept) float64  # Q^T
     keep_idx_global : (N_kept,) int64 indices into original .fam/.bed rows
     """
-    fam = pd.read_csv(fam_path, sep=r"\s+", header=None, usecols=[0, 1], names=["FID", "IID"])
-    cov = pd.read_csv(cov_path, sep=r"\s+")
+    if sample_ids is None:
+        if fam_path is None:
+            raise ValueError("fam_path or sample_ids must be provided.")
+        fam = read_fam_sample_ids(fam_path)
+    else:
+        fam = pd.DataFrame(sample_ids)[["FID", "IID"]].copy()
+    fam[["FID", "IID"]] = fam[["FID", "IID"]].astype(str)
+    cov = pd.read_csv(
+        cov_path,
+        sep=r"\s+",
+        dtype={"FID": str, "IID": str},
+        keep_default_na=False,
+    )
 
     if ("FID" not in cov.columns) or ("IID" not in cov.columns):
         raise ValueError("Covariate file must contain 'FID' and 'IID' columns.")
+    if cov.duplicated(subset=["FID", "IID"]).any():
+        raise ValueError("Covariate file contains duplicate FID/IID rows.")
 
     merged = fam.merge(cov, on=["FID", "IID"], how="left", indicator=True)
     miss = int((merged["_merge"] != "both").sum())
@@ -264,11 +288,118 @@ def _read_cov_qr(
     return C, R, keep_idx_global
 
 
+def _window_cache_bytes(cache_mb: int, target_mem_gb: Optional[float] = None) -> int:
+    if int(cache_mb) == 0:
+        return 0
+    if int(cache_mb) > 0:
+        return int(cache_mb) * 1024 * 1024
+    env_cache_mb = os.environ.get("SUMMIT_WIN_CACHE_MB")
+    if env_cache_mb is not None:
+        try:
+            value = int(env_cache_mb)
+        except ValueError as exc:
+            raise ValueError("SUMMIT_WIN_CACHE_MB must be an integer number of MiB.") from exc
+        return max(0, value) * 1024 * 1024
+    if target_mem_gb is not None:
+        target_mem_gb = float(target_mem_gb)
+        if not np.isfinite(target_mem_gb) or target_mem_gb <= 0.0:
+            raise ValueError("target_mem must be finite and positive when specified.")
+    try:
+        import psutil
+
+        available = int(psutil.virtual_memory().available)
+    except Exception:  # pragma: no cover - conservative platform fallback
+        available = 8 * 1024**3
+    one_gib = 1024**3
+    cap = min(4 * one_gib, max(0, available // 8))
+    if target_mem_gb is not None:
+        cap = min(cap, int(target_mem_gb * one_gib) // 4)
+    return max(0, cap)
+
+
+def _window_panel_cols(n_rows: int, chunk_size: int, panel_cols: int, cache_bytes: int) -> int:
+    if int(panel_cols) > 0:
+        return max(1, min(int(panel_cols), int(chunk_size)))
+    if cache_bytes > 0:
+        target = max(64 * 1024**2, min(2 * 1024**3, cache_bytes // 8))
+    else:
+        target = 512 * 1024**2
+    cols = max(1, min(int(chunk_size), 4096, target // max(8, 8 * int(n_rows))))
+    cross_cap = int(np.sqrt((1024**3) / 8.0))
+    cols = min(cols, max(64, cross_cap))
+    if cols >= 32:
+        cols = max(32, (cols // 32) * 32)
+    return max(1, min(cols, int(chunk_size)))
+
+
+class _PgenPreparedPanelCache:
+    """Bounded cache of projected, unit-variance PGEN dosage panels."""
+
+    def __init__(
+        self,
+        reader: PgenBlockReader,
+        n_rows: int,
+        C: Optional[np.ndarray],
+        R: Optional[np.ndarray],
+        capacity_bytes: int,
+    ) -> None:
+        self.reader = reader
+        self.n_rows = int(n_rows)
+        self.C = None if C is None else np.asarray(C, dtype=np.float64, order="F")
+        self.R = None if R is None else np.asarray(R, dtype=np.float64, order="F")
+        self.capacity_bytes = max(0, int(capacity_bytes))
+        self.current_bytes = 0
+        self._items: OrderedDict[tuple[int, int], np.ndarray] = OrderedDict()
+
+    def _prepare(self, start: int, end: int) -> np.ndarray:
+        # The reader returns a reusable view, so every cached panel needs one
+        # owned copy. float64 matches the established deterministic BED path.
+        G = np.array(
+            self.reader.read_standardized_block(start, end),
+            dtype=np.float64,
+            order="F",
+            copy=True,
+        )
+        if self.C is not None and self.R is not None and self.C.shape[1] > 0:
+            G -= self.C @ (self.R @ G)
+
+        # PGEN standardization is over observed dosages. Re-standardizing after
+        # zero/mean imputation and projection puts every nonconstant column on
+        # the exact N-row correlation scale used by winldcore's BED path.
+        G -= G.mean(axis=0, keepdims=True)
+        ss = np.einsum("ij,ij->j", G, G, dtype=np.float64)
+        good = np.isfinite(ss) & (ss > 0.0)
+        if np.any(good):
+            G[:, good] *= np.sqrt(float(self.n_rows) / ss[good]).reshape(1, -1)
+        if np.any(~good):
+            G[:, ~good] = 0.0
+        return np.asfortranarray(G)
+
+    def get(self, start: int, end: int) -> np.ndarray:
+        key = (int(start), int(end))
+        cached = self._items.pop(key, None)
+        if cached is not None:
+            self._items[key] = cached
+            return cached
+
+        panel = self._prepare(*key)
+        need = int(panel.nbytes)
+        if self.capacity_bytes <= 0 or need > self.capacity_bytes:
+            return panel
+        while self._items and self.current_bytes + need > self.capacity_bytes:
+            _, old = self._items.popitem(last=False)
+            self.current_bytes -= int(old.nbytes)
+        self._items[key] = panel
+        self.current_bytes += need
+        return panel
+
+
 class WindowedLDScore:
     """
     Windowed LD score computation for the deterministic sliding-window path.
 
-    Heavy computation is delegated to the C++ winldcore module:
+    BED computation is delegated to the C++ winldcore module; PGEN dosage
+    panels use the same mathematical preparation and accumulation in NumPy:
       - PLINK BED decoding and imputation (mean / HWE)
       - optional QR-covariate projection
       - post-projection re-standardization
@@ -294,6 +425,7 @@ class WindowedLDScore:
         impute_method: str = "mean",
         panel_cols: Optional[int] = None,
         cache_mb: int = -1,
+        target_mem: Optional[float] = None,
     ):
         if log is None:
             raise ValueError("WindowedLDScore requires a Logger instance (log=...).")
@@ -305,31 +437,42 @@ class WindowedLDScore:
         self.log = log
         self.verbose = bool(verbose)
 
-        prefix = _canonical_bfile_prefix(bed_path)
-        if "@" in prefix:
+        raw_genotype_path = str(bed_path)
+        if "@" in raw_genotype_path:
             raise ValueError(
-                "WindowedLDScore expects a single genome-wide PLINK prefix (no '@'). "
-                "Use genome-wide PLINK files for SUMMIT windowed LD scores."
+                "WindowedLDScore expects a single genome-wide genotype prefix (no '@')."
             )
+        self.genotype_input = resolve_genotype_input(raw_genotype_path)
+        self.genotype_format = self.genotype_input.format
+        self.genotype_prefix = self.genotype_input.prefix
+        self.bed_prefix = self.genotype_prefix if self.genotype_format == "bed" else None
+        self.fam_path = self.genotype_input.sample_path if self.genotype_format == "bed" else None
+        self.bim_path = self.genotype_input.variant_path if self.genotype_format == "bed" else None
+        self.pgen_path = self.genotype_input.genotype_path if self.genotype_format == "pgen" else None
+        self.pvar_path = self.genotype_input.variant_path if self.genotype_format == "pgen" else None
+        self.psam_path = self.genotype_input.sample_path if self.genotype_format == "pgen" else None
+        self._pgen_reader = None
 
-        self.bed_prefix = os.path.abspath(prefix)
-        self.fam_path = self.bed_prefix + ".fam"
-        self.bim_path = self.bed_prefix + ".bim"
-        self.bed_file = self.bed_prefix + ".bed"
-
-        if not os.path.exists(self.bed_file):
-            raise FileNotFoundError(f"Missing .bed: {self.bed_file}")
-        if not os.path.exists(self.bim_path):
-            raise FileNotFoundError(f"Missing .bim: {self.bim_path}")
-        if not os.path.exists(self.fam_path):
-            raise FileNotFoundError(f"Missing .fam: {self.fam_path}")
-
-        self.G = open_bed(self.bed_file)
-        self.nsamp0, self.nsnps = self.G.shape
+        if self.genotype_format == "bed":
+            self.bed_file = self.genotype_input.genotype_path
+            self.G = open_bed(self.bed_file)
+            self.nsamp0, self.nsnps = self.G.shape
+            self.sample_ids = read_fam_sample_ids(self.fam_path)
+            self.snplist = None
+        else:
+            self.bed_file = None
+            self.G = None
+            self.sample_ids = read_psam_sample_ids(self.psam_path)
+            self.snplist = validate_variant_metadata(
+                read_pvar_variants(self.pvar_path), source=f"PVAR '{self.pvar_path}'"
+            )
+            self.nsamp0 = int(len(self.sample_ids))
+            self.nsnps = int(len(self.snplist))
+            self.bp_all = self.snplist["BP"].to_numpy(dtype=np.int64, copy=False)
 
         self.ld_wind_kb = float(ld_wind_kb)
-        if self.ld_wind_kb <= 0:
-            raise ValueError("--ld-wind-kb must be positive.")
+        if not np.isfinite(self.ld_wind_kb) or self.ld_wind_kb <= 0:
+            raise ValueError("--ld-wind-kb must be finite and positive.")
 
         self.dtype = str(dtype)
         if self.dtype not in ("float32", "float64", "f4", "f8") and verbose:
@@ -353,10 +496,22 @@ class WindowedLDScore:
         self.outpath = out_path
         self.panel_cols = 0 if panel_cols is None else int(panel_cols)
         self.cache_mb = int(cache_mb)
+        if self.panel_cols < 0:
+            raise ValueError("panel_cols must be positive when specified.")
+        if self.cache_mb < -1:
+            raise ValueError("cache_mb must be -1 (automatic), 0, or a positive MiB value.")
+        self.target_mem = None if target_mem is None else float(target_mem)
+        self.cache_bytes = _window_cache_bytes(self.cache_mb, self.target_mem)
+        # Always pass an explicit bounded value to the native backend so its
+        # cache does not infer node-wide free memory inside a scheduler job.
+        self.effective_cache_mb = int(self.cache_bytes // (1024 * 1024))
+        self._pgen_io_config_logged = False
 
         self.impute_method = str(impute_method).strip().lower()
         if self.impute_method not in ("mean", "hwe"):
             raise ValueError("impute_method must be 'mean' or 'hwe'.")
+        if self.genotype_format == "pgen" and self.impute_method != "mean":
+            raise ValueError("PGEN windowed LD scores support dosage mean imputation only.")
 
         if seed is None:
             self.root_seed = int(np.random.SeedSequence().generate_state(1, dtype=np.uint64)[0])
@@ -376,7 +531,11 @@ class WindowedLDScore:
             k = int(len(self.row_sel))
             self.log._log(f"Randomly subsampling individuals: {k}/{self.nsamp0} ({k/self.nsamp0:.1%})")
 
-        self._read_bim(self.bim_path)
+        if self.genotype_format == "bed":
+            self._read_bim(self.bim_path)
+        else:
+            self.log._log(f"[win] Reading PVAR metadata: {self.pvar_path}")
+        self._validate_variant_order()
         self._read_annot(annot_path)
 
         self.log._log(f"Number of samples (pre-filter): {self.nsamp0}")
@@ -394,6 +553,7 @@ class WindowedLDScore:
                 log=self.log,
                 sample_idx=self.row_sel,
                 add_intercept=True,
+                sample_ids=self.sample_ids,
             )
             self.C = C
             self.cov_R = R
@@ -405,8 +565,24 @@ class WindowedLDScore:
         else:
             self.nsamp = int(len(self.row_sel)) if self.row_sel is not None else int(self.nsamp0)
 
-        if self.nsamp <= 2:
-            raise ValueError(f"[win] Too few samples (n={self.nsamp}) for windowed LD score computation.")
+        # Genotypes are centered even without an explicit covariate matrix.  If
+        # C is present, it already includes the intercept.  Thus correlations
+        # live in an N-p dimensional residual subspace (N-1 without C), and the
+        # finite-sample r^2 correction denominator is corr_dim - 1.
+        self.corr_dim = self.nsamp - (self.p_eff if self.C is not None else 1)
+
+        if self.genotype_format == "pgen":
+            # Panel sizing is finalized lazily from the selected sample count.
+            self.log._log(
+                "[win][pgen] Using streamed REF-dosage panels with bounded LRU caching; "
+                "no chromosome-wide genotype matrix will be materialized."
+            )
+
+        if self.corr_dim <= 1:
+            raise ValueError(
+                f"[win] Too few residual dimensions for windowed LD scores: "
+                f"n={self.nsamp}, p_eff={self.p_eff}, corr_dim={self.corr_dim}."
+            )
 
         try:
             winldcore.set_verbose(bool(self.verbose))
@@ -416,7 +592,10 @@ class WindowedLDScore:
                 self.log._log(f"[win][warn] Failed to set C++ verbosity / threads: {e}")
 
         if self.verbose:
-            cache_msg = "auto" if self.cache_mb < 0 else str(self.cache_mb)
+            cache_msg = (
+                f"auto->{self.effective_cache_mb}"
+                if self.cache_mb < 0 else str(self.cache_mb)
+            )
             panel_msg = "auto" if self.panel_cols <= 0 else str(self.panel_cols)
             self.log._log(
                 f"[win] ld_wind_kb={self.ld_wind_kb}, chunk_size={self.chunk_size}, "
@@ -424,6 +603,18 @@ class WindowedLDScore:
             )
 
         self.win_ldscore: Optional[np.ndarray] = None
+
+    def close(self) -> None:
+        reader = getattr(self, "_pgen_reader", None)
+        if reader is not None:
+            reader.close()
+            self._pgen_reader = None
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except Exception:
+            pass
 
     # ------------------ BIM / annotation ------------------
 
@@ -433,8 +624,31 @@ class WindowedLDScore:
         snplist.columns = ["CHR", "SNP", "CM", "BP", "A1", "A2"]
         if len(snplist) != self.nsnps:
             raise ValueError(f"[win] .bed SNPs ({self.nsnps}) != .bim rows ({len(snplist)})")
-        self.snplist = snplist
+        self.snplist = validate_variant_metadata(snplist, source=f"BIM '{bim_path}'")
         self.bp_all = self.snplist["BP"].to_numpy(dtype=np.int64, copy=False)
+
+    def _validate_variant_order(self) -> None:
+        chrom = self.snplist["CHR"].to_numpy(dtype=str, copy=False)
+        bp = self.snplist["BP"].to_numpy(dtype=np.int64, copy=False)
+        seen: set[str] = set()
+        start = 0
+        while start < len(chrom):
+            label = str(chrom[start])
+            if label in seen:
+                raise ValueError(
+                    f"Chromosome {label!r} occurs in multiple noncontiguous blocks; "
+                    "sort genotype variants by chromosome and position."
+                )
+            seen.add(label)
+            end = start + 1
+            while end < len(chrom) and chrom[end] == label:
+                end += 1
+            if np.any(bp[start + 1:end] < bp[start:end - 1]):
+                raise ValueError(
+                    f"BP is not sorted within chromosome {label!r}; "
+                    "sort genotype variants by chromosome and position."
+                )
+            start = end
 
     def _read_annot(self, annot_path: Optional[str]):
         if annot_path is None:
@@ -445,77 +659,14 @@ class WindowedLDScore:
             self.log._log("[win] No annotation: using single-bin (all SNPs).")
             return
 
-        parsed_ldsc = False
-        try:
-            df = pd.read_csv(
-                annot_path,
-                sep=r"\s+",
-                compression="infer",
-                dtype={"CHR": str, "BP": np.int64, "SNP": str, "CM": float},
-            )
-            base_cols = {"CHR", "BP", "SNP", "CM"}
-            if base_cols.issubset(set(df.columns)) and "SNP" in df.columns:
-                annot_cols = [c for c in df.columns if c not in base_cols]
-                if len(annot_cols) == 0:
-                    raise ValueError("No annotation columns found after [CHR,BP,SNP,CM].")
-
-                bim_snps = self.snplist["SNP"].astype(str).tolist()
-                ann_snps = df["SNP"].astype(str).tolist()
-
-                if ann_snps == bim_snps:
-                    ann_mat = df[annot_cols].to_numpy(dtype=np.float64, copy=False)
-                else:
-                    ann_set = set(ann_snps)
-                    bim_set = set(bim_snps)
-                    missing_in_annot = len(bim_set - ann_set)
-                    if missing_in_annot > 0:
-                        raise ValueError(
-                            f"Annotation SNP set is missing {missing_in_annot} BIM SNP(s); "
-                            "regenerate the annotation to match the .bim."
-                        )
-                    ann_mat = df.set_index("SNP").loc[bim_snps, annot_cols].to_numpy(dtype=np.float64, copy=False)
-
-                np.nan_to_num(ann_mat, copy=False)
-                if (ann_mat < 0).any():
-                    self.log._log("[win][warn] Negative annotation values found; clipping to 0.")
-                    ann_mat[ann_mat < 0] = 0.0
-
-                uniq = np.unique(ann_mat)
-                is_binary = np.all(np.isin(uniq, [0.0, 1.0]))
-                self.is_continuous = (not is_binary)
-
-                self.annot = ann_mat
-                self.nbins = int(self.annot.shape[1])
-                self.l2cols = annot_cols
-                parsed_ldsc = True
-                self.log._log(f"[win] Read LDSC-style annotation: shape={self.annot.shape}")
-        except Exception:
-            parsed_ldsc = False
-
-        if not parsed_ldsc:
-            self.l2cols, arr = utils._read_with_optional_header(annot_path)
-            if arr.ndim == 1:
-                arr = arr.reshape(-1, 1)
-            arr = arr.astype(np.float64, copy=False)
-            np.nan_to_num(arr, copy=False)
-            if (arr < 0).any():
-                self.log._log("[win][warn] Negative annotation values found; clipping to 0.")
-                arr[arr < 0] = 0.0
-
-            uniq = np.unique(arr)
-            is_binary = np.all(np.isin(uniq, [0.0, 1.0]))
-            self.is_continuous = (not is_binary)
-
-            self.annot = arr
-            if self.l2cols is None:
-                self.l2cols = [f"L2_{i}" for i in range(self.annot.shape[1])]
-            self.nbins = int(self.annot.shape[1])
-            self.log._log(f"[win] Read thin annotation matrix: shape={self.annot.shape}")
-
-        if self.annot.shape[0] != self.nsnps:
-            raise ValueError(
-                f"[win] #SNPs in annotation ({self.annot.shape[0]}) != #SNPs in genotype ({self.nsnps})"
-            )
+        self.l2cols, self.annot, self.is_continuous = read_aligned_annotations(
+            annot_path,
+            self.snplist,
+            log=self.log,
+            source_label=("BIM" if self.genotype_format == "bed" else "PVAR"),
+        )
+        self.nbins = int(self.annot.shape[1])
+        self.log._log(f"[win] Read aligned annotation matrix: shape={self.annot.shape}")
 
         self.log._log(
             f"[win] nsamp0={self.nsamp0}, nsnps={self.nsnps}, nbins={self.nbins}, continuous={bool(self.is_continuous)}"
@@ -523,7 +674,52 @@ class WindowedLDScore:
 
     # ------------------ C++ core wrappers ------------------
 
+    def _ensure_pgen_reader(self, panel_cols: int) -> PgenBlockReader:
+        if self.genotype_format != "pgen":
+            raise RuntimeError("PGEN reader requested for non-PGEN input.")
+        required_capacity = min(int(panel_cols), int(self.nsnps))
+        reader = self._pgen_reader
+        if reader is None:
+            reader = PgenBlockReader(
+                pgen_path=self.pgen_path,
+                raw_sample_ct=int(self.nsamp0),
+                variant_ct=int(self.nsnps),
+                sample_subset=self.row_sel,
+                step_size=max(1, required_capacity),
+                dtype=np.float64,
+                ddof=0,
+                standardize_threads=self.num_threads,
+            )
+            self._pgen_reader = reader
+        elif reader.block_capacity < required_capacity:
+            raise RuntimeError("Existing PGEN decode buffer is smaller than the requested panel.")
+        return reader
+
     def _compute_maf(self) -> np.ndarray:
+        if self.genotype_format == "pgen":
+            self.log._log("[win][pgen] Computing dosage MAF for .win.M_5_50.")
+            cache_bytes = self.cache_bytes
+            panel_cols = _window_panel_cols(
+                self.nsamp, self.chunk_size, self.panel_cols, cache_bytes
+            )
+            reader = self._ensure_pgen_reader(panel_cols)
+            maf = np.zeros(self.nsnps, dtype=np.float64)
+            for s in range(0, self.nsnps, panel_cols):
+                e = min(self.nsnps, s + panel_cols)
+                dosage = reader.read_dosage_block(s, e)
+                valid = np.isfinite(dosage) & (dosage >= 0.0) & (dosage <= 2.0)
+                nobs = valid.sum(axis=0, dtype=np.int64)
+                sums = np.where(valid, dosage, 0.0).sum(axis=0, dtype=np.float64)
+                freq = np.divide(
+                    sums,
+                    2.0 * nobs,
+                    out=np.zeros(e - s, dtype=np.float64),
+                    where=nobs > 0,
+                )
+                np.clip(freq, 0.0, 1.0, out=freq)
+                maf[s:e] = np.minimum(freq, 1.0 - freq)
+            return maf
+
         self.log._log("[win] Computing MAF for .win.M_5_50 via C++ core.")
         step = int(max(1024, min(self.nsnps, self.chunk_size)))
         with _set_parallelism(omp_threads=self.num_threads, blas_threads=1, decode_threads_cap=self.num_threads):
@@ -536,7 +732,178 @@ class WindowedLDScore:
             )
         return np.asarray(maf, dtype=np.float64, order="C")
 
+    @staticmethod
+    def _accumulate_pgen_self(
+        X: np.ndarray,
+        annot: np.ndarray,
+        out: np.ndarray,
+        n_rows: int,
+        corr_dim: int,
+        bp: np.ndarray,
+        window_bp: float,
+    ) -> None:
+        corr = (X.T @ X) / float(n_rows)
+        r2 = corr * corr
+        r2 -= (1.0 - r2) / float(corr_dim - 1)
+        bp = np.asarray(bp, dtype=np.int64)
+        for j, right_bp in enumerate(bp):
+            outside = np.abs(bp - int(right_bp)) > float(window_bp)
+            r2[outside, j] = 0.0
+        out += r2 @ annot
+
+    @staticmethod
+    def _accumulate_pgen_cross(
+        X_left: np.ndarray,
+        X_right: np.ndarray,
+        annot_left: np.ndarray,
+        annot_right: np.ndarray,
+        out_left: np.ndarray,
+        out_right: np.ndarray,
+        n_rows: int,
+        corr_dim: int,
+        bp_left: np.ndarray,
+        bp_right: np.ndarray,
+        window_bp: float,
+    ) -> None:
+        corr = (X_left.T @ X_right) / float(n_rows)
+        r2 = corr * corr
+        r2 -= (1.0 - r2) / float(corr_dim - 1)
+        bp_left = np.asarray(bp_left, dtype=np.int64)
+        bp_right = np.asarray(bp_right, dtype=np.int64)
+        for j, right_bp in enumerate(bp_right):
+            outside = np.abs(bp_left - int(right_bp)) > float(window_bp)
+            r2[outside, j] = 0.0
+        out_left += r2 @ annot_right
+        out_right += r2.T @ annot_left
+
+    def _compute_chrom_ldscores_pgen(self, s: int, e: int, pbar=None) -> np.ndarray:
+        bp = self.bp_all[s:e]
+        if np.any(bp[1:] < bp[:-1]):
+            raise ValueError("BP not sorted within chromosome block. Sort the PVAR by CHR+POS.")
+        m = int(e - s)
+        cache_bytes = self.cache_bytes
+        panel_cols = _window_panel_cols(
+            self.nsamp, self.chunk_size, self.panel_cols, cache_bytes
+        )
+        reader = self._ensure_pgen_reader(panel_cols)
+        cache = _PgenPreparedPanelCache(
+            reader=reader,
+            n_rows=self.nsamp,
+            C=self.C,
+            R=self.cov_R,
+            capacity_bytes=cache_bytes,
+        )
+        if not self._pgen_io_config_logged:
+            self.log._log(
+                f"[win][pgen] Effective panel_cols={panel_cols}; prepared-panel cache="
+                f"{cache_bytes / 1024**2:.0f} MiB; corr_dim={self.corr_dim}."
+            )
+            self._pgen_io_config_logged = True
+        annot = np.asarray(self.annot[s:e, :], dtype=np.float64, order="C")
+        out = np.zeros((m, self.nbins), dtype=np.float64)
+        ntiles = (m + self.chunk_size - 1) // self.chunk_size
+
+        # Select a chunk-rounded candidate superset for efficient panel GEMMs.
+        # Each panel product is then masked by the exact BP distance, so
+        # step_size and panel boundaries cannot change the mathematical window.
+        window_bp = float(self.ld_wind_kb) * 1000.0
+        left = np.searchsorted(bp, bp.astype(np.float64) - window_bp, side="left")
+        shifted = np.flatnonzero(left > 0)
+        first_pos = int(shifted[0]) if shifted.size else -1
+        b0 = ((first_pos if first_pos >= 0 else m) + self.chunk_size - 1) // self.chunk_size
+        b0 *= self.chunk_size
+        prefix_tiles = b0 // self.chunk_size
+
+        def panels(local_start: int, local_end: int):
+            return [
+                (p0, min(local_end, p0 + panel_cols))
+                for p0 in range(local_start, local_end, panel_cols)
+            ]
+
+        with _set_parallelism(
+            omp_threads=self.num_threads,
+            blas_threads=self.num_threads,
+            decode_threads_cap=self.num_threads,
+        ):
+            for t in range(ntiles):
+                t0 = t * self.chunk_size
+                t1 = min(m, t0 + self.chunk_size)
+                target_panels = panels(t0, t1)
+                # Keep the target tile alive throughout all crossings.  This
+                # bounds active memory by the two tiles being multiplied and
+                # prevents a small LRU cache from repeatedly decoding targets.
+                target_loaded = [
+                    (p0, p1, cache.get(s + p0, s + p1))
+                    for p0, p1 in target_panels
+                ]
+
+                if t < prefix_tiles:
+                    a_start = 0
+                else:
+                    span = int(t0 - left[t0])
+                    left_tiles = (span + self.chunk_size - 1) // self.chunk_size
+                    a_start = max(0, t - left_tiles)
+
+                for a in range(a_start, t):
+                    a0 = a * self.chunk_size
+                    a1 = min(m, a0 + self.chunk_size)
+                    left_loaded = [
+                        (p0, p1, cache.get(s + p0, s + p1))
+                        for p0, p1 in panels(a0, a1)
+                    ]
+                    for lp0, lp1, X_left in left_loaded:
+                        for rp0, rp1, X_right in target_loaded:
+                            self._accumulate_pgen_cross(
+                                X_left,
+                                X_right,
+                                annot[lp0:lp1],
+                                annot[rp0:rp1],
+                                out[lp0:lp1],
+                                out[rp0:rp1],
+                                self.nsamp,
+                                self.corr_dim,
+                                bp[lp0:lp1],
+                                bp[rp0:rp1],
+                                window_bp,
+                            )
+
+                for rp, (rp0, rp1, X_right) in enumerate(target_loaded):
+                    self._accumulate_pgen_self(
+                        X_right,
+                        annot[rp0:rp1],
+                        out[rp0:rp1],
+                        self.nsamp,
+                        self.corr_dim,
+                        bp[rp0:rp1],
+                        window_bp,
+                    )
+                    for lp0, lp1, X_left in target_loaded[:rp]:
+                        self._accumulate_pgen_cross(
+                            X_left,
+                            X_right,
+                            annot[lp0:lp1],
+                            annot[rp0:rp1],
+                            out[lp0:lp1],
+                            out[rp0:rp1],
+                            self.nsamp,
+                            self.corr_dim,
+                            bp[lp0:lp1],
+                            bp[rp0:rp1],
+                            window_bp,
+                        )
+                if pbar is not None:
+                    pbar.update(1)
+
+        if self.verbose:
+            self.log._log(
+                f"[win][pgen] chr panel_cols={panel_cols}, cache={cache_bytes / 1024**3:.2f} GiB, "
+                f"cumulative decoded blocks={reader.blocks_read}."
+            )
+        return out
+
     def _compute_chrom_ldscores(self, s: int, e: int, pbar=None) -> np.ndarray:
+        if self.genotype_format == "pgen":
+            return self._compute_chrom_ldscores_pgen(s, e, pbar=pbar)
         bp = self.bp_all[s:e]
         ann_chr = np.asfortranarray(self.annot[s:e, :], dtype=np.float64)
 
@@ -561,7 +928,7 @@ class WindowedLDScore:
                     impute_mode=self.impute_method,
                     impute_seed=int(self.impute_seed),
                     panel_cols=int(self.panel_cols),
-                    cache_mb=int(self.cache_mb),
+                    cache_mb=int(self.effective_cache_mb),
                 )
             except BaseException as ex:
                 error["ex"] = ex
@@ -675,6 +1042,17 @@ class WindowedLDScore:
             f.write("\t".join(f"{x:.6f}" for x in M) + "\n")
         with open(out_M5, "w") as f:
             f.write("\t".join(f"{x:.6f}" for x in M_5) + "\n")
+
+        if self.genotype_format == "pgen" and self._pgen_reader is not None:
+            seconds = float(self._pgen_reader.decode_seconds)
+            rate = self._pgen_reader.variants_read / seconds if seconds > 0.0 else float("nan")
+            self.log._log(
+                f"[win][pgen] Decode/standardize totals (including MAF pass): "
+                f"blocks={self._pgen_reader.blocks_read}, "
+                f"variant-records={self._pgen_reader.variants_read}, "
+                f"missing-values={self._pgen_reader.missing_values}, seconds={seconds:.3f}, "
+                f"rate={rate:.1f} variant-records/s."
+            )
 
         end_time = utils._get_time()
         runtime = end_time - self.start_time

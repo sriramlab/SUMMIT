@@ -108,7 +108,13 @@ def read_ldsc_m(path_spec, *, nbins: int) -> np.ndarray:
     return total
 
 
-def read_ldsc_weight_ld_aligned(path_spec, target_snps) -> tuple[np.ndarray, np.ndarray]:
+def read_ldsc_weight_ld_aligned(
+    path_spec,
+    target_snps,
+    *,
+    target_chr=None,
+    target_bp=None,
+) -> tuple[np.ndarray, np.ndarray]:
     """Read one scalar weight-LD column without discarding values below one."""
     df = utils._read_csv_maybe_chr_split(
         path_spec,
@@ -122,13 +128,20 @@ def read_ldsc_weight_ld_aligned(path_spec, target_snps) -> tuple[np.ndarray, np.
         raise ValueError(
             "LDSC weight-LD input must have CHR, BP, SNP in its first columns."
         )
+    if "CM" in cols and (len(first4) < 4 or first4[3] != "CM"):
+        raise ValueError(
+            "Malformed LDSC weight-LD metadata: CM, when present, must be the 4th column."
+        )
     start = 4 if "CM" in first4 else 3
     value_cols = cols[start:]
     if len(value_cols) != 1:
         raise ValueError(
             f"LDSC weight-LD input must have exactly one score column; got {len(value_cols)}."
         )
-    snps = df["SNP"].astype(str)
+    raw_snps = df["SNP"]
+    snps = raw_snps.astype(str).str.strip()
+    if raw_snps.isna().any() or (snps == "").any():
+        raise ValueError("LDSC weight-LD input contains missing/empty SNP IDs.")
     if snps.duplicated().any():
         first = snps[snps.duplicated(keep=False)].iloc[0]
         raise ValueError(f"LDSC weight-LD input contains duplicate SNP ID {first!r}.")
@@ -143,6 +156,48 @@ def read_ldsc_weight_ld_aligned(path_spec, target_snps) -> tuple[np.ndarray, np.
         out[present, 0] = values[finite][pos[present]]
     if not np.any(present):
         raise ValueError("No primary LD-score SNPs overlap the LDSC weight-LD input.")
+
+    if (target_chr is None) != (target_bp is None):
+        raise ValueError("target_chr and target_bp must be supplied together.")
+    if target_chr is not None:
+        target_chr = np.asarray(target_chr).reshape(-1)
+        target_bp = np.asarray(target_bp).reshape(-1)
+        if target_chr.shape != target.shape or target_bp.shape != target.shape:
+            raise ValueError("Target SNP and coordinate arrays must have the same shape.")
+        chr_values = pd.to_numeric(df["CHR"], errors="coerce").to_numpy(dtype=np.float64)
+        bp_values = pd.to_numeric(df["BP"], errors="coerce").to_numpy(dtype=np.float64)
+        coord_ok = (
+            np.isfinite(chr_values)
+            & np.isfinite(bp_values)
+            & (chr_values == np.rint(chr_values))
+            & (bp_values == np.rint(bp_values))
+            & (bp_values >= 0.0)
+        )
+        if not np.all(coord_ok):
+            rows = np.flatnonzero(~coord_ok)[:10].tolist()
+            raise ValueError(
+                "LDSC weight-LD input contains invalid CHR/BP coordinates; "
+                f"first bad rows: {rows}."
+            )
+        src_chr = np.rint(chr_values[finite]).astype(np.int64, copy=False)
+        src_bp = np.rint(bp_values[finite]).astype(np.int64, copy=False)
+        aligned_chr = src_chr[pos[present]]
+        aligned_bp = src_bp[pos[present]]
+        exp_chr = np.asarray(target_chr[present], dtype=np.int64)
+        exp_bp = np.asarray(target_bp[present], dtype=np.int64)
+        mismatch = (aligned_chr != exp_chr) | (aligned_bp != exp_bp)
+        if np.any(mismatch):
+            mismatch_idx = np.flatnonzero(mismatch)[:10]
+            target_rows = np.flatnonzero(present)[mismatch_idx]
+            details = [
+                f"{target[i]}:primary={int(target_chr[i])}:{int(target_bp[i])},"
+                f"weight={int(aligned_chr[j])}:{int(aligned_bp[j])}"
+                for j, i in zip(mismatch_idx, target_rows)
+            ]
+            raise ValueError(
+                "CHR/BP mismatch between primary and LDSC weight LD for "
+                f"{int(np.sum(mismatch))} shared SNP(s). First mismatches: {details}."
+            )
     return out, present
 
 
@@ -152,6 +207,7 @@ def resolve_ldsc_reference_moments(
     trace_annot,
     trace_header,
     m_override=None,
+    unpartitioned_source_nsnps=None,
 ) -> LDSCReferenceMoments:
     """Resolve fixed effect-reference moments, before GWAS/weight-LD filtering.
 
@@ -166,6 +222,25 @@ def resolve_ldsc_reference_moments(
         raise ValueError("Trace annotation matrix/header mismatch.")
 
     source = "full_aligned_trace_annotation"
+    if (
+        annot_path is None
+        and m_override is None
+        and unpartitioned_source_nsnps is not None
+    ):
+        if k != 1:
+            raise ValueError(
+                "An annotation-free reference-size override is valid only for one LD-score column."
+            )
+        source_nsnps = int(unpartitioned_source_nsnps)
+        if source_nsnps <= 0:
+            raise ValueError("The primary LD-score reference SNP count must be positive.")
+        mass = np.asarray([float(source_nsnps)], dtype=np.float64)
+        return LDSCReferenceMoments(
+            m_annot=mass,
+            overlap_matrix=mass.reshape(1, 1),
+            source_nsnps=source_nsnps,
+            source="full_primary_ld_universe",
+        )
     if annot_path is None:
         A_ref = trace_annot
     else:
@@ -179,6 +254,11 @@ def resolve_ldsc_reference_moments(
         first4 = cols[:4]
         is_full = {"CHR", "BP", "SNP"}.issubset(set(first4))
         if is_full:
+            if "CM" in cols and (len(first4) < 4 or first4[3] != "CM"):
+                raise ValueError(
+                    "Malformed reference annotation metadata: CM, when present, "
+                    "must be the 4th column."
+                )
             if df["SNP"].astype(str).duplicated().any():
                 raise ValueError("Reference annotation file contains duplicate SNP IDs.")
             start = 4 if "CM" in first4 else 3

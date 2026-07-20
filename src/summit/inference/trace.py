@@ -11,6 +11,78 @@ from .. import utils
 _META_COLS = {"CHR", "BP", "SNP", "CM"}
 
 
+def _normalize_variant_keys(df: pd.DataFrame, *, source: str) -> pd.DataFrame:
+    """Validate and normalize the variant key used by all Trace joins."""
+    # Normalize the three metadata columns in place; copying every LD/annotation
+    # column here can transiently double memory for whole-genome partitioned files.
+    out = df
+    raw_snp = out["SNP"]
+    snp = raw_snp.astype("string").str.strip()
+    bad_snp = raw_snp.isna() | snp.isna() | (snp == "")
+    if bool(bad_snp.any()):
+        rows = np.flatnonzero(bad_snp.to_numpy())[:10].tolist()
+        raise ValueError(f"{source} contains missing/empty SNP IDs; first bad rows: {rows}.")
+    out["SNP"] = snp.astype(str)
+
+    dup = out["SNP"].duplicated(keep=False)
+    if bool(dup.any()):
+        examples = out.loc[dup, "SNP"].drop_duplicates().head(10).tolist()
+        raise ValueError(
+            f"{source} contains duplicate SNP IDs; joins would be ambiguous. "
+            f"First duplicates: {examples}."
+        )
+
+    for col in ("CHR", "BP"):
+        numeric = pd.to_numeric(out[col], errors="coerce").to_numpy(copy=False)
+        if np.issubdtype(numeric.dtype, np.integer):
+            good = np.ones(numeric.shape, dtype=bool)
+            if col == "BP":
+                good &= numeric >= 0
+            normalized = numeric.astype(np.int64, copy=False)
+        else:
+            numeric = np.asarray(numeric, dtype=np.float64)
+            good = np.isfinite(numeric) & (numeric == np.rint(numeric))
+            if col == "BP":
+                good &= numeric >= 0.0
+            normalized = None
+        if not bool(np.all(good)):
+            rows = np.flatnonzero(~good)[:10].tolist()
+            raise ValueError(
+                f"{source} contains invalid {col} values; expected finite integer coordinates. "
+                f"First bad rows: {rows}."
+            )
+        if normalized is None:
+            normalized = np.rint(numeric).astype(np.int64)
+        out[col] = normalized
+    return out
+
+
+def _assert_matching_coordinates(
+    primary: pd.DataFrame,
+    other: pd.DataFrame,
+    *,
+    other_source: str,
+) -> None:
+    """Require CHR/BP agreement for two already SNP-aligned data frames."""
+    if primary.shape[0] != other.shape[0]:
+        raise RuntimeError("Internal error: coordinate comparison axes differ in length.")
+    chr1 = primary["CHR"].to_numpy(dtype=np.int64, copy=False)
+    bp1 = primary["BP"].to_numpy(dtype=np.int64, copy=False)
+    chr2 = other["CHR"].to_numpy(dtype=np.int64, copy=False)
+    bp2 = other["BP"].to_numpy(dtype=np.int64, copy=False)
+    bad = (chr1 != chr2) | (bp1 != bp2)
+    if bool(np.any(bad)):
+        rows = np.flatnonzero(bad)[:10]
+        details = [
+            f"{primary['SNP'].iloc[i]}:primary={chr1[i]}:{bp1[i]},other={chr2[i]}:{bp2[i]}"
+            for i in rows
+        ]
+        raise ValueError(
+            f"CHR/BP mismatch between primary LD scores and {other_source} for "
+            f"{int(np.sum(bad))} shared SNP(s). First mismatches: {details}."
+        )
+
+
 @dataclass(frozen=True)
 class TraceView:
     snps: np.ndarray
@@ -114,6 +186,10 @@ class Trace:
         self._ldscore_reg_w_start_idx = None if regw_start is None else int(regw_start)
 
         main_ld_nsnps_raw = int(main_df.shape[0])
+        # Preserve the effect-reference universe before optional regression-LD
+        # intersections. Constrained LDSC keeps this mass fixed across all
+        # downstream SNP filtering and delete refits.
+        self.source_nsnps = main_ld_nsnps_raw
 
         self.kmoments = None
         self.kmoments_path = None
@@ -130,8 +206,8 @@ class Trace:
 
         # Align optional regression LD inputs to the main SNP order first.
         if reg_df is not None:
-            reg_index = pd.Index(reg_df["SNP"].astype(str).to_numpy())
-            idx = reg_index.get_indexer(main_df["SNP"].astype(str).to_numpy())
+            reg_index = pd.Index(reg_df["SNP"].to_numpy())
+            idx = reg_index.get_indexer(main_df["SNP"].to_numpy())
             keep = idx >= 0
             n_drop = int((~keep).sum())
             if n_drop > 0 and self.log is not None:
@@ -140,12 +216,13 @@ class Trace:
                 )
             main_df = main_df.loc[keep].reset_index(drop=True)
             main_L = main_L[keep, :]
-            reg_df = reg_df.set_index("SNP").loc[main_df["SNP"].astype(str).to_numpy()].reset_index()
+            reg_df = reg_df.iloc[idx[keep]].reset_index(drop=True)
+            _assert_matching_coordinates(main_df, reg_df, other_source="regression LD scores")
             reg_L = reg_df.iloc[:, reg_start:].to_numpy(dtype=np.float64, copy=False)
 
         if regw_df is not None:
-            regw_index = pd.Index(regw_df["SNP"].astype(str).to_numpy())
-            idx = regw_index.get_indexer(main_df["SNP"].astype(str).to_numpy())
+            regw_index = pd.Index(regw_df["SNP"].to_numpy())
+            idx = regw_index.get_indexer(main_df["SNP"].to_numpy())
             keep = idx >= 0
             n_drop = int((~keep).sum())
             if n_drop > 0 and self.log is not None:
@@ -155,9 +232,10 @@ class Trace:
             main_df = main_df.loc[keep].reset_index(drop=True)
             main_L = main_L[keep, :]
             if reg_df is not None:
-                reg_df = reg_df.set_index("SNP").loc[main_df["SNP"].astype(str).to_numpy()].reset_index()
+                reg_df = reg_df.loc[keep].reset_index(drop=True)
                 reg_L = reg_df.iloc[:, reg_start:].to_numpy(dtype=np.float64, copy=False)
-            regw_df = regw_df.set_index("SNP").loc[main_df["SNP"].astype(str).to_numpy()].reset_index()
+            regw_df = regw_df.iloc[idx[keep]].reset_index(drop=True)
+            _assert_matching_coordinates(main_df, regw_df, other_source="weight LD scores")
             regw_L = regw_df.iloc[:, regw_start:].to_numpy(dtype=np.float64, copy=False)
         annot_df, annot_header, annot_matrix = self._read_annotation(
             annot_path=annot,
@@ -299,9 +377,13 @@ class Trace:
                 "Input LD score file must have CHR, BP, SNP in the first columns "
                 "(and optional CM as the 4th column)."
             )
+        if "CM" in cols and (len(first4) < 4 or first4[3] != "CM"):
+            raise ValueError(
+                "Malformed LD-score metadata: CM, when present, must be the 4th column."
+            )
         start_idx = 4 if ("CM" in first4) else 3
+        df = _normalize_variant_keys(df, source=f"LD-score input ({which}) '{path}'")
         L = df.iloc[:, start_idx:].to_numpy(dtype=np.float64, copy=False)
-        snps = df["SNP"].astype(str).to_numpy()
 
         if which == "reg_w" and L.ndim == 2 and L.shape[1] != 1:
             raise ValueError(
@@ -322,8 +404,6 @@ class Trace:
 
         df = df.loc[finite].reset_index(drop=True)
         L = L[finite, :]
-        snps = snps[finite]
-        df["SNP"] = snps
         return df, L, start_idx
 
     def _read_annotation(self, *, annot_path, bimpath, snps_main, chr_main, bp_main):
@@ -340,50 +420,53 @@ class Trace:
                 self.log._log("Running with single-component annotation.")
             return annot_df, annot_header, annot
 
-        # Try full annotation first.
-        try:
-            if self.log is not None and utils._is_chr_split_spec(annot_path):
-                paths = utils._resolve_chr_split_paths(annot_path, require=True)
-                self.log._log(
-                    f"[Trace] reading chromosome-split annotation from "
-                    f"{len(paths)} file(s): {utils._normalize_path_spec(annot_path)}"
-                )
-            df = utils._read_csv_maybe_chr_split(
-                annot_path, sep=r"\s+", compression="infer"
+        if self.log is not None and utils._is_chr_split_spec(annot_path):
+            paths = utils._resolve_chr_split_paths(annot_path, require=True)
+            self.log._log(
+                f"[Trace] reading chromosome-split annotation from "
+                f"{len(paths)} file(s): {utils._normalize_path_spec(annot_path)}"
             )
-            if "SNP" not in df.columns:
-                raise ValueError("No SNP column found in annotation file.")
+        df = utils._read_csv_maybe_chr_split(
+            annot_path, sep=r"\s+", compression="infer"
+        )
+        cols = df.columns.tolist()
+        first4 = cols[:4]
+        required = {"CHR", "BP", "SNP"}
+        is_full = required.issubset(set(first4))
+        if (not is_full) and required.intersection(set(cols)):
+            raise ValueError(
+                "Malformed annotation metadata: a full annotation must contain CHR, BP, SNP "
+                "in its first columns (and optional CM as the 4th column)."
+            )
+        if "CM" in cols and (len(first4) < 4 or first4[3] != "CM"):
+            raise ValueError(
+                "Malformed annotation metadata: CM, when present, must be the 4th column."
+            )
 
-            cols = df.columns.tolist()
-            first4 = cols[:4]
-            required = {"CHR", "BP", "SNP"}
-            if not required.issubset(set(first4)):
-                raise ValueError("Not a full annotation file.")
-
+        if is_full:
             start_idx = 4 if ("CM" in first4) else 3
             annot_cols = cols[start_idx:]
             if len(annot_cols) == 0:
                 raise ValueError("Annotation file contains no annotation columns.")
 
             ann = df[["CHR", "BP", "SNP"] + annot_cols].copy()
-            ann["SNP"] = ann["SNP"].astype(str)
-            ann = ann.drop_duplicates(subset="SNP", keep="first").reset_index(drop=True)
-
-            aligned = ann.set_index("SNP").reindex(snps_main)
-            missing = aligned[annot_cols].isna().all(axis=1)
-            n_missing = int(missing.sum())
+            ann = _normalize_variant_keys(ann, source=f"annotation input '{annot_path}'")
+            pos = pd.Index(ann["SNP"]).get_indexer(snps_main)
+            keep = pos >= 0
+            n_missing = int(np.sum(~keep))
             if n_missing > 0 and self.log is not None:
                 self.log._log(
                     f"Dropping {n_missing} SNPs because they are missing in the annotation file."
                 )
-            aligned = aligned.loc[~missing].reset_index().rename(columns={"index": "SNP"})
-
-            # Replace CHR/BP with the main LD-based values to ensure a single source of truth.
-            keep_mask = pd.Index(snps_main).isin(aligned["SNP"].astype(str).to_numpy())
-            chr_keep = np.asarray(chr_main)[keep_mask]
-            bp_keep = np.asarray(bp_main)[keep_mask]
-            aligned["CHR"] = chr_keep
-            aligned["BP"] = bp_keep
+            primary = pd.DataFrame(
+                {
+                    "CHR": np.asarray(chr_main)[keep],
+                    "BP": np.asarray(bp_main)[keep],
+                    "SNP": snps_main[keep],
+                }
+            )
+            aligned = ann.iloc[pos[keep]].reset_index(drop=True)
+            _assert_matching_coordinates(primary, aligned, other_source="annotation")
 
             annot_header = np.asarray(annot_cols)
             annot = aligned[annot_cols].to_numpy(dtype=np.float64, copy=False)
@@ -396,8 +479,9 @@ class Trace:
                 self.log._log(f"Read full annotation of shape {annot.shape}.")
             return aligned[["CHR", "BP", "SNP"] + annot_cols], annot_header, annot
 
-        except Exception:
-            # Thin annotation path.
+        else:
+            # Thin annotations have no SNP/coordinate metadata; their row order is
+            # explicitly defined by BIM (when supplied) or by the primary LD file.
             if bimpath is not None and Path(str(bimpath)).suffix == ".bim":
                 bim_snps = []
                 with open(bimpath, "r") as fd:
@@ -406,6 +490,12 @@ class Trace:
                 bim_snps = np.asarray(bim_snps, dtype=str)
             else:
                 bim_snps = snps_main
+            bim_index = pd.Index(bim_snps)
+            if bim_index.has_duplicates:
+                examples = bim_index[bim_index.duplicated(keep=False)].unique()[:10].tolist()
+                raise ValueError(
+                    f"Thin annotation SNP axis contains duplicate SNP IDs; first duplicates: {examples}."
+                )
 
             header, annot = self._read_with_optional_header(annot_path)
             annot = np.asarray(annot, dtype=np.float64)
@@ -422,7 +512,6 @@ class Trace:
 
             ann_df = pd.DataFrame(annot, columns=header)
             ann_df.insert(0, "SNP", bim_snps)
-            ann_df = ann_df.drop_duplicates(subset="SNP", keep="first").reset_index(drop=True)
 
             aligned = ann_df.set_index("SNP").reindex(snps_main)
             missing = aligned[header.tolist()].isna().all(axis=1)

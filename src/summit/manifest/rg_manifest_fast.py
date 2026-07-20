@@ -34,7 +34,7 @@ from ..inference.rgcore import (
     _intercept_gamma_total_from_beta,
     _component_rg,
 )
-from ..sumstats.sumstats import Sumstats
+from ..sumstats.sumstats import Sumstats, harmonize_allele_codes
 from ..inference.trace import Trace
 
 
@@ -50,6 +50,8 @@ class _FastTrait:
     drop_idx: np.ndarray
     z_h2: np.ndarray
     z_rg: np.ndarray
+    a1_code: np.ndarray
+    a2_code: np.ndarray
     h2_ay_unit: np.ndarray
     matched_stub: object
 
@@ -220,6 +222,19 @@ def _full_axis_z_array(aligned, trace) -> np.ndarray:
     return out
 
 
+def _full_axis_allele_codes(aligned, trace) -> tuple[np.ndarray, np.ndarray]:
+    ss = aligned.sumstats
+    pos = np.asarray(aligned.pos_on_trace, dtype=np.int64)
+    a1 = np.full(int(trace.nsnps), -1, dtype=np.int8)
+    a2 = np.full(int(trace.nsnps), -1, dtype=np.int8)
+    matched = pos >= 0
+    if np.any(matched):
+        p = pos[matched]
+        a1[matched] = ss.a1_code[p]
+        a2[matched] = ss.a2_code[p]
+    return a1, a2
+
+
 def _make_matched_stub(trace, trait: Sumstats) -> _FastMatchedMetadata:
     # The sparse fast path constructs the normal-equation summaries directly on
     # the shared trace axis.  Downstream fitters and writers only need metadata;
@@ -340,8 +355,10 @@ def _build_fast_traits(
             cov_rank=cov_rank,
             cov_rank_source=("manifest" if cov_rank is not None else None),
             compute_diagnostics=(verbose_level >= 1),
+            require_alleles=bool(args.align_alleles),
         )
         aligned = ss.align_to_trace(shared_trace)
+        a1_code, a2_code = _full_axis_allele_codes(aligned, shared_trace)
         keep = np.asarray(
             aligned.keep_mask(chisq_threshold=args.max_chisq, chisq_action=args.chisq_action),
             dtype=bool,
@@ -381,6 +398,8 @@ def _build_fast_traits(
             drop_idx=np.flatnonzero(~keep).astype(np.int64),
             z_h2=z_h2,
             z_rg=z_rg,
+            a1_code=a1_code,
+            a2_code=a2_code,
             h2_ay_unit=h2_ay_unit,
             matched_stub=_make_matched_stub(shared_trace, ss),
         )
@@ -774,8 +793,6 @@ def _fit_score_intercept_scalar_fast(
 
 
 def dispatch_rg_manifest_fast(args, log, manifest_df, trait_meta, verbose_level: int, *, execution_plan=None):
-    if args.align_alleles:
-        raise ValueError("--rg-manifest-fast currently does not support --align-alleles.")
     if str(args.rg_se_method).strip().lower() != "jackknife":
         raise ValueError("--rg-manifest-fast currently supports --rg-se-method jackknife only.")
     if args.adjust_delta:
@@ -905,6 +922,8 @@ def dispatch_rg_manifest_fast(args, log, manifest_df, trait_meta, verbose_level:
         partners = [traits[p] for p in partner_paths]
         P = len(partners)
         _log(log, f"[rg:manifest:fast] processing anchor '{anchor.phen}' with {P} partner pair(s).")
+        align_alleles = bool(args.align_alleles)
+        drop_ambiguous = not bool(getattr(args, "keep_ambiguous", False))
 
         ay_rg = np.zeros((U, K, P), dtype=np.float64)
         for u, (s, e) in enumerate(zip(jk.starts, jk.ends)):
@@ -913,7 +932,26 @@ def dispatch_rg_manifest_fast(args, log, manifest_df, trait_meta, verbose_level:
             if e <= s:
                 continue
             Zi = anchor.z_rg[s:e]
-            Zp = np.column_stack([p.z_rg[s:e] for p in partners])
+            if align_alleles:
+                zcols = []
+                for p in partners:
+                    allele_keep_u, allele_flip_u = harmonize_allele_codes(
+                        anchor.a1_code[s:e],
+                        anchor.a2_code[s:e],
+                        p.a1_code[s:e],
+                        p.a2_code[s:e],
+                        drop_ambiguous=drop_ambiguous,
+                    )
+                    zcols.append(
+                        np.where(
+                            allele_keep_u,
+                            np.where(allele_flip_u, -p.z_rg[s:e], p.z_rg[s:e]),
+                            0.0,
+                        )
+                    )
+                Zp = np.column_stack(zcols)
+            else:
+                Zp = np.column_stack([p.z_rg[s:e] for p in partners])
             Y = Zi[:, None] * Zp
             ay_rg[u] = A[s:e, :].T @ Y
 
@@ -921,7 +959,23 @@ def dispatch_rg_manifest_fast(args, log, manifest_df, trait_meta, verbose_level:
             t0_pair = time.time()
             tr1 = anchor
             tr2 = partners[pidx]
-            pair_keep = np.asarray(tr1.keep & tr2.keep, dtype=bool)
+            if align_alleles:
+                allele_keep, allele_flip = harmonize_allele_codes(
+                    tr1.a1_code,
+                    tr1.a2_code,
+                    tr2.a1_code,
+                    tr2.a2_code,
+                    drop_ambiguous=drop_ambiguous,
+                )
+            else:
+                allele_keep = None
+                allele_flip = None
+            pair_keep = np.asarray(
+                tr1.keep & tr2.keep
+                if allele_keep is None
+                else tr1.keep & tr2.keep & allele_keep,
+                dtype=bool,
+            )
             active_n = int(np.sum(pair_keep))
             if active_n <= 0:
                 raise RuntimeError(f"No SNPs remain for pair {row.phen1} vs {row.phen2}.")
@@ -936,7 +990,7 @@ def dispatch_rg_manifest_fast(args, log, manifest_df, trait_meta, verbose_level:
                 AL=full_struct.AL - corr.AL,
             )
 
-            drop2_for_1 = np.flatnonzero(tr1.keep & ~tr2.keep).astype(np.int64)
+            drop2_for_1 = np.flatnonzero(tr1.keep & ~pair_keep).astype(np.int64)
             ay1 = tr1.h2_ay_unit - _row_ay_correction(
                 A,
                 tr1.z_h2 * tr1.z_h2,
@@ -945,7 +999,7 @@ def dispatch_rg_manifest_fast(args, log, manifest_df, trait_meta, verbose_level:
                 U,
                 K,
             )
-            drop1_for_2 = np.flatnonzero(tr2.keep & ~tr1.keep).astype(np.int64)
+            drop1_for_2 = np.flatnonzero(tr2.keep & ~pair_keep).astype(np.int64)
             ay2 = tr2.h2_ay_unit - _row_ay_correction(
                 A,
                 tr2.z_h2 * tr2.z_h2,
@@ -1011,6 +1065,15 @@ def dispatch_rg_manifest_fast(args, log, manifest_df, trait_meta, verbose_level:
                 jack_mode=args.jack_mode,
                 nan_policy=("propagate" if args.clip_nonfinite_vals else "omit"),
             )
+
+            if align_alleles:
+                _log(
+                    log,
+                    f"[rg:manifest:fast] alleles {row.phen1} vs {row.phen2}: "
+                    f"dropped={int(np.sum((tr1.keep & tr2.keep) & ~allele_keep))}, "
+                    f"flipped={int(np.sum(pair_keep & allele_flip))}, "
+                    f"drop_ambiguous={drop_ambiguous}.",
+                )
 
             pair_prefix = str(outdir / row.out_stem)
             _write_fast_pair_log(

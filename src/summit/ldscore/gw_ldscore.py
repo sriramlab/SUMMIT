@@ -7,6 +7,7 @@ from bed_reader import open_bed
 from tqdm import tqdm
 import sys, shutil
 import gc
+import gzip
 import os, psutil
 import ctypes
 from concurrent.futures import ThreadPoolExecutor
@@ -25,7 +26,9 @@ from .genotype_source import (
     read_fam_sample_ids,
     read_psam_sample_ids,
     read_pvar_variants,
+    read_aligned_annotations,
     resolve_genotype_input,
+    validate_variant_metadata,
 )
 
 
@@ -403,6 +406,143 @@ def _zero_colmajor_bin_runs(X: np.ndarray, zero_bins: np.ndarray, vcount: int) -
     X[:, start * vcount:(prev + 1) * vcount].fill(0)
 
 
+def _mc_variance_from_probe_sums(
+    probe_sum: np.ndarray,
+    probe_sumsq: np.ndarray,
+    nvecs: int,
+    *,
+    chunk_rows: int = 65536,
+    return_info: bool = False,
+    out: np.ndarray | None = None,
+) -> np.ndarray | tuple[np.ndarray, dict]:
+    """Estimate the MC variance of a probe mean from first/second sums.
+
+    ``probe_sum`` and ``probe_sumsq`` contain ``sum_v Y_v`` and
+    ``sum_v Y_v**2`` along their implicit probe dimension.  The returned
+    quantity is ``sample_var(Y_v) / nvecs``.  Rows are reduced in chunks so an
+    optional per-SNP diagnostic does not create additional full-size products.
+    When ``out`` is supplied, it may alias ``probe_sumsq`` so the second-moment
+    sufficient-statistic array is converted to variances in place.
+    """
+    first = np.asarray(probe_sum)
+    second = np.asarray(probe_sumsq)
+    if first.shape != second.shape:
+        raise ValueError("probe_sum and probe_sumsq must have identical shapes")
+    if first.ndim != 2:
+        raise ValueError("probe_sum and probe_sumsq must be two-dimensional")
+    v = int(nvecs)
+    if v < 2:
+        result = np.full(first.shape, np.nan, dtype=np.float64)
+        info = {
+            "n_roundoff_clipped": np.zeros(first.shape[1], dtype=np.int64),
+            "n_numerical_failures": np.full(first.shape[1], first.shape[0], dtype=np.int64),
+        }
+        return (result, info) if return_info else result
+
+    chunk_rows = max(1, int(chunk_rows))
+    first_eps = (
+        np.finfo(first.dtype).eps
+        if np.issubdtype(first.dtype, np.floating)
+        else np.finfo(np.float64).eps
+    )
+    if out is None:
+        result = np.empty(first.shape, dtype=np.float64)
+    else:
+        result = np.asarray(out)
+        if result.shape != first.shape or result.dtype != np.float64:
+            raise ValueError("out must be a float64 array with the input shape")
+        if not result.flags.writeable:
+            raise ValueError("out must be writeable")
+    n_roundoff = np.zeros(first.shape[1], dtype=np.int64)
+    n_fail = np.zeros(first.shape[1], dtype=np.int64)
+    denom = float(v * (v - 1))
+    for start in range(0, first.shape[0], chunk_rows):
+        end = min(first.shape[0], start + chunk_rows)
+        f = np.asarray(first[start:end], dtype=np.float64)
+        s = np.asarray(second[start:end], dtype=np.float64)
+        correction = (f * f) / float(v)
+        centered = s - correction
+        scale = np.maximum.reduce([np.abs(s), np.abs(correction), np.ones_like(s)])
+        tolerance = 512.0 * first_eps * scale
+        finite = np.isfinite(centered) & np.isfinite(tolerance)
+        tiny = finite & (centered < 0.0) & (centered >= -tolerance)
+        bad = (~finite) | (centered < -tolerance)
+        n_roundoff += np.count_nonzero(tiny, axis=0)
+        n_fail += np.count_nonzero(bad, axis=0)
+        centered[tiny] = 0.0
+        centered[bad] = np.nan
+        result[start:end] = centered / denom
+    info = {
+        "n_roundoff_clipped": n_roundoff,
+        "n_numerical_failures": n_fail,
+    }
+    return (result, info) if return_info else result
+
+
+def _integrated_mc_variance_from_probe_sums(
+    per_snp_probe_sum: np.ndarray,
+    aggregate_probe_sumsq: np.ndarray,
+    nvecs: int,
+    *,
+    chunk_rows: int = 65536,
+    return_info: bool = False,
+) -> np.ndarray | tuple[np.ndarray, dict]:
+    """Sum the per-SNP MC variances without storing per-SNP second sums."""
+    first = np.asarray(per_snp_probe_sum)
+    second = np.asarray(aggregate_probe_sumsq, dtype=np.float64)
+    if first.ndim != 2 or second.shape != (first.shape[1],):
+        raise ValueError("aggregate MC sufficient-statistic shapes are inconsistent")
+    v = int(nvecs)
+    if v < 2:
+        result = np.full(second.shape, np.nan, dtype=np.float64)
+        info = {
+            "n_roundoff_clipped": np.zeros(second.shape, dtype=np.int64),
+            "n_numerical_failures": np.ones(second.shape, dtype=np.int64),
+        }
+        return (result, info) if return_info else result
+    chunk_rows = max(1, int(chunk_rows))
+    first_sq_sum = np.zeros(first.shape[1], dtype=np.float64)
+    for start in range(0, first.shape[0], chunk_rows):
+        block = np.asarray(
+            first[start:min(first.shape[0], start + chunk_rows)], dtype=np.float64
+        )
+        first_sq_sum += np.einsum("ij,ij->j", block, block, dtype=np.float64)
+    centered_ss = second - first_sq_sum / float(v)
+    scale = np.maximum.reduce(
+        [np.abs(second), np.abs(first_sq_sum / float(v)), np.ones_like(second)]
+    )
+    first_eps = (
+        np.finfo(first.dtype).eps
+        if np.issubdtype(first.dtype, np.floating)
+        else np.finfo(np.float64).eps
+    )
+    roundoff = 512.0 * first_eps * scale
+    finite = np.isfinite(centered_ss) & np.isfinite(roundoff)
+    tiny = finite & (centered_ss < 0.0) & (centered_ss >= -roundoff)
+    bad = (~finite) | (centered_ss < -roundoff)
+    centered_ss[tiny] = 0.0
+    centered_ss[bad] = np.nan
+    result = centered_ss / float(v * (v - 1))
+    info = {
+        "n_roundoff_clipped": tiny.astype(np.int64),
+        "n_numerical_failures": bad.astype(np.int64),
+    }
+    return (result, info) if return_info else result
+
+
+def _column_rms_chunked(values: np.ndarray, chunk_rows: int = 65536) -> np.ndarray:
+    values = np.asarray(values)
+    if values.ndim != 2:
+        raise ValueError("values must be two-dimensional")
+    sumsq = np.zeros(values.shape[1], dtype=np.float64)
+    for start in range(0, values.shape[0], max(1, int(chunk_rows))):
+        block = np.asarray(
+            values[start:min(values.shape[0], start + chunk_rows)], dtype=np.float64
+        )
+        sumsq += np.einsum("ij,ij->j", block, block, dtype=np.float64)
+    return np.sqrt(sumsq / float(values.shape[0]))
+
+
 def _orthonormal_covariate_basis(C64: np.ndarray):
     C64 = np.asarray(C64, dtype=np.float64)
     if C64.ndim != 2 or C64.shape[0] == 0 or C64.shape[1] == 0:
@@ -603,6 +743,8 @@ class GenomewideLDScore:
                 correct_skew: bool = False,
                 write_kmoments: bool = False,
                 skip_kmoments=None,
+                estimate_mc_noise: bool = True,
+                write_ld_mc_var: bool = False,
                 use_mailman: bool = True,
                 impute_method: str = 'mean'):
 
@@ -625,7 +767,9 @@ class GenomewideLDScore:
         else:
             self.G = None
             self.sample_ids = read_psam_sample_ids(self.psam_path)
-            self.snplist = read_pvar_variants(self.pvar_path)
+            self.snplist = validate_variant_metadata(
+                read_pvar_variants(self.pvar_path), source=f"PVAR '{self.pvar_path}'"
+            )
             self.nsamp = int(len(self.sample_ids))
             self.nsnps = int(len(self.snplist))
         self.raw_nsamp = int(self.nsamp)
@@ -655,6 +799,21 @@ class GenomewideLDScore:
         if skip_kmoments is not None:
             write_kmoments = bool(write_kmoments) and not bool(skip_kmoments)
         self.write_kmoments = bool(write_kmoments)
+        self.write_ld_mc_var = bool(write_ld_mc_var)
+        self.estimate_mc_noise = bool(estimate_mc_noise) or self.write_ld_mc_var
+        self.ld_mc_variance = None
+        self.ld_mc_diagnostic = None
+        self._ld_mc_numerical_info = None
+        if self.nvecs < 2 and self.write_ld_mc_var:
+            raise ValueError(
+                "Per-SNP LD-score MC variance/CI requires at least two random vectors."
+            )
+        if self.nvecs < 2 and self.estimate_mc_noise:
+            self.log._log(
+                "[mc][warn] A Monte Carlo variance cannot be estimated from one "
+                "random vector; omitting the default MC diagnostic."
+            )
+            self.estimate_mc_noise = False
         if self.genotype_format == "pgen":
             unsupported = []
             if str(impute_method).strip().lower() != "mean":
@@ -676,6 +835,13 @@ class GenomewideLDScore:
             self.log._log("[kmom] Higher-order GRM moment estimation enabled.")
         else:
             self.log._log("[kmom] Higher-order GRM moment estimation disabled.")
+        if self.estimate_mc_noise:
+            self.log._log(
+                "[mc] Annotation-level integrated LD-score MC noise diagnostic enabled"
+                + ("; per-SNP MC variances will also be written." if self.write_ld_mc_var else ".")
+            )
+        else:
+            self.log._log("[mc] LD-score MC noise diagnostic disabled by request.")
 
         if seed is None:
             self.root_seed = int(np.random.SeedSequence().generate_state(1, dtype=np.uint64)[0])
@@ -931,82 +1097,14 @@ class GenomewideLDScore:
             self.log._log(f"Number of total SNPs: {self.nsnps}, annotation shape: {self.annot.shape}")
             return
 
-        parsed_ldsc = False
-        try:
-            df = pd.read_csv(annot_path, sep=r'\s+', compression='infer', dtype={'CHR': str, 'BP': np.int64, 'SNP': str, 'CM': float})
-        except Exception:
-            df = None
-
-        if df is not None:
-            base_cols = {'CHR', 'BP', 'SNP', 'CM'}
-            if base_cols.issubset(set(df.columns)) and 'SNP' in df.columns:
-                annot_cols = [c for c in df.columns if c not in base_cols]
-                if len(annot_cols) == 0:
-                    raise ValueError("No annotation columns found after [CHR,BP,SNP,CM].")
-
-                bim_snps = self.snplist.iloc[:, 1].astype(str).tolist()
-                ann_snps = df['SNP'].astype(str).tolist()
-
-                if ann_snps == bim_snps:
-                    ann_mat = df[annot_cols].to_numpy(dtype=np.float64, copy=False)
-                else:
-                    if pd.Index(bim_snps).has_duplicates or pd.Index(ann_snps).has_duplicates:
-                        raise ValueError(
-                            "Cannot reorder annotations by SNP ID when genotype or annotation "
-                            "IDs are duplicated; provide annotation rows in exact genotype order."
-                        )
-                    ann_set = set(ann_snps)
-                    bim_set = set(bim_snps)
-                    missing_in_annot = len(bim_set - ann_set)
-                    extra_in_annot = len(ann_set - bim_set)
-                    if missing_in_annot > 0:
-                        raise ValueError(
-                            f"Annotation SNP set is missing {missing_in_annot} genotype SNP(s); "
-                            "prepare matching annotation metadata."
-                        )
-                    if extra_in_annot > 0:
-                        self.log._log(
-                            f"[info] Annotation contains {extra_in_annot} extra SNP(s) not in "
-                            "the genotype metadata; keeping genotype SNPs only and reordering."
-                        )
-                    ann_mat = df.set_index('SNP').loc[bim_snps, annot_cols].to_numpy(dtype=np.float64, copy=False)
-
-                np.nan_to_num(ann_mat, copy=False)
-                if (ann_mat < 0).any():
-                    self.log._log("[warn] Negative annotation values found; clipping to 0.")
-                    ann_mat[ann_mat < 0] = 0.0
-                uniq = np.unique(ann_mat)
-                is_binary = np.all(np.isin(uniq, [0.0, 1.0]))
-                self.is_continuous = (not is_binary)
-                self.log._log("[info] Detected continuous annotations (non 0/1 values)." if self.is_continuous else "[info] Detected binary annotations (0/1).")
-
-                self.annot = ann_mat
-                self.nbins = self.annot.shape[1]
-                self.l2cols = annot_cols
-                parsed_ldsc = True
-                self.log._log(f"Read LDSC-style annotation with shape {self.annot.shape}")
-
-        if not parsed_ldsc:
-            self.l2cols, arr = utils._read_with_optional_header(annot_path)
-            if arr.ndim == 1:
-                arr = arr.reshape(-1, 1)
-            arr = arr.astype(np.float64, copy=False)
-            np.nan_to_num(arr, copy=False)
-            if (arr < 0).any():
-                self.log._log("[warn] Negative annotation values found; clipping to 0.")
-                arr[arr < 0] = 0.0
-            uniq = np.unique(arr)
-            is_binary = np.all(np.isin(uniq, [0.0, 1.0]))
-            self.is_continuous = (not is_binary)
-            self.annot = arr
-            if self.l2cols is None:
-                self.l2cols = [f"L2_{i}" for i in range(self.annot.shape[1])]
-            self.nbins = self.annot.shape[1]
-            self.log._log(f"Read thin annotation matrix with shape {self.annot.shape}")
-
-        if self.annot.shape[0] != self.nsnps:
-            self.log._log(f"!!! number of SNPs in annotation ({self.annot.shape[0]}) does not match the input genotype file ({self.nsnps}) !!!")
-            sys.exit(1)
+        self.l2cols, self.annot, self.is_continuous = read_aligned_annotations(
+            annot_path,
+            self.snplist,
+            log=self.log,
+            source_label=("BIM" if self.genotype_format == "bed" else "PVAR"),
+        )
+        self.nbins = int(self.annot.shape[1])
+        self.log._log(f"Read aligned annotation matrix with shape {self.annot.shape}")
 
         self.nsnps_bin = self.annot.sum(axis=0, dtype=np.float64)
         self.annot = np.ascontiguousarray(self.annot.astype(self.dtype, copy=False))
@@ -1022,6 +1120,9 @@ class GenomewideLDScore:
             self.log._log(f"Reading {bim_path} for SNPs")
             self.snplist = pd.read_csv(bim_path, header=None, sep=r'\s+')
             self.snplist.columns = ['CHR', 'SNP', 'CM', 'BP', 'A1', 'A2']
+            self.snplist = validate_variant_metadata(
+                self.snplist, source=f"BIM '{bim_path}'"
+            )
         if len(self.snplist) != self.nsnps:
             self.log._log(f"!!! The number of SNPs in the .bed file ({self.nsnps}) does not match the .bim file ({len(self.snplist)}) !!!")
             sys.exit(1)
@@ -1108,6 +1209,14 @@ class GenomewideLDScore:
         B          = int(self.nbins)
 
         meansq_accum = np.zeros((self.nsnps, self.nbins), dtype=self.dtype, order='C')
+        mc_aggregate_sumsq = (
+            np.zeros(self.nbins, dtype=np.float64)
+            if self.estimate_mc_noise else None
+        )
+        mc_per_snp_sumsq = (
+            np.zeros((self.nsnps, self.nbins), dtype=np.float64, order='C')
+            if self.write_ld_mc_var else None
+        )
         Vmax = max(vtiles) if vtiles else 0
         Xz_chunk = None
 
@@ -1136,6 +1245,13 @@ class GenomewideLDScore:
             except Exception as e:
                 self.log._log(f"[GPU] Falling back to CPU: {e}")
                 use_cuda_backend = False
+
+        if use_cuda_backend and self.estimate_mc_noise:
+            self.log._log(
+                "[mc] CUDA phase 2 does not yet expose probe fourth-moment accumulators; "
+                "using a CPU phase-2 backend so the requested MC diagnostic is not omitted."
+            )
+            use_cuda_backend = False
 
         meansq_chunk = np.zeros_like(meansq_accum, dtype=self.dtype, order='C') if use_cuda_backend else None
         use_mailman_backend = bool((not use_cuda_backend) and self.use_mailman and self.impute_method == "hwe")
@@ -1328,6 +1444,8 @@ class GenomewideLDScore:
                                         tile_nvecs=int(Vt),
                                         Xz2d=Xz_view,
                                         meansq_accum=meansq_accum,
+                                        mc_aggregate_sumsq=mc_aggregate_sumsq,
+                                        mc_per_snp_sumsq=mc_per_snp_sumsq,
                                         sum_Xz=sum_Xz_view,
                                         N_denom=int(N_denom),
                                         impute_seed=int(self.impute_seed),
@@ -1359,6 +1477,8 @@ class GenomewideLDScore:
                                             tile_nvecs=int(Vt),
                                             Xz2d=Xz_view,
                                             meansq_accum=meansq_accum,
+                                            mc_aggregate_sumsq=mc_aggregate_sumsq,
+                                            mc_per_snp_sumsq=mc_per_snp_sumsq,
                                             C=None,
                                             R=None,
                                             N_denom=int(N_denom),
@@ -1374,6 +1494,8 @@ class GenomewideLDScore:
                                             tile_nvecs=int(Vt),
                                             Xz2d=Xz_view,
                                             meansq_accum=meansq_accum,
+                                            mc_aggregate_sumsq=mc_aggregate_sumsq,
+                                            mc_per_snp_sumsq=mc_per_snp_sumsq,
                                             C=None,
                                             R=None,
                                             N_denom=int(N_denom),
@@ -1420,6 +1542,31 @@ class GenomewideLDScore:
                 f"time={decode_seconds:.3f}s, rate={rate:.1f} variants/s."
             )
 
+        if self.estimate_mc_noise:
+            integrated_var, aggregate_info = _integrated_mc_variance_from_probe_sums(
+                meansq_accum,
+                mc_aggregate_sumsq,
+                self.nvecs,
+                return_info=True,
+            )
+            per_snp_info = None
+            if self.write_ld_mc_var:
+                self.ld_mc_variance, per_snp_info = _mc_variance_from_probe_sums(
+                    meansq_accum,
+                    mc_per_snp_sumsq,
+                    self.nvecs,
+                    return_info=True,
+                    out=mc_per_snp_sumsq,
+                )
+            self._ld_mc_integrated_variance = np.asarray(integrated_var, dtype=np.float64)
+            self._ld_mc_numerical_info = {
+                "aggregate": aggregate_info,
+                "per_snp": per_snp_info,
+            }
+        else:
+            self._ld_mc_integrated_variance = None
+            self._ld_mc_numerical_info = None
+
         meansq = (meansq_accum / float(self.nvecs)).astype(self.dtype, copy=False)
 
         trace_k2_from_ldscore = None
@@ -1447,6 +1594,8 @@ class GenomewideLDScore:
         self.log._log("Applying correlation null: subtracting M_k / N_denom per bin.")
         meansq -= (self.nsnps_bin / N_denom).astype(meansq.dtype, copy=False)[None, :]
         self.gwldscore = meansq.astype(np.float64, copy=False)
+        if self.gwldscore is not meansq_accum:
+            del meansq_accum
 
         self.log._log(f"Saving the genome-wide (partitioned) LD scores into: {self.outpath}.gw.ldscore.gz")
         snpcols = ['CHR', 'SNP', 'BP']
@@ -1459,6 +1608,102 @@ class GenomewideLDScore:
         scores_df = pd.DataFrame(self.gwldscore, columns=self.l2cols)
         out_df = pd.concat([self.snpdf, scores_df], axis=1)
         out_df.to_csv(f'{self.outpath}.gw.ldscore.gz', index=False, compression='gzip', sep='\t', float_format='%.6f')
+
+        if self.estimate_mc_noise:
+            integrated_var = self._ld_mc_integrated_variance
+            rms_mcse = np.sqrt(np.maximum(integrated_var, 0.0) / float(self.nsnps))
+            ld_rms = _column_rms_chunked(self.gwldscore)
+            relative_rms = rms_mcse / np.maximum(ld_rms, np.finfo(np.float64).tiny)
+            aggregate_info = self._ld_mc_numerical_info["aggregate"]
+            roundoff_count = np.asarray(
+                aggregate_info["n_roundoff_clipped"], dtype=np.int64
+            )
+            failure_count = np.asarray(
+                aggregate_info["n_numerical_failures"], dtype=np.int64
+            )
+            per_snp_info = self._ld_mc_numerical_info["per_snp"]
+            if per_snp_info is None:
+                per_roundoff_count = np.zeros(self.nbins, dtype=np.int64)
+                per_failure_count = np.zeros(self.nbins, dtype=np.int64)
+                per_status = np.full(self.nbins, "not_requested", dtype=object)
+            else:
+                per_roundoff_count = np.asarray(
+                    per_snp_info["n_roundoff_clipped"], dtype=np.int64
+                )
+                per_failure_count = np.asarray(
+                    per_snp_info["n_numerical_failures"], dtype=np.int64
+                )
+                per_status = np.full(self.nbins, "ok", dtype=object)
+                per_status[per_roundoff_count > 0] = "roundoff_clipped"
+                per_status[per_failure_count > 0] = "numerical_failure"
+            status = np.full(self.nbins, "ok", dtype=object)
+            status[(roundoff_count > 0) | (per_roundoff_count > 0)] = "roundoff_clipped"
+            status[(failure_count > 0) | (per_failure_count > 0)] = "numerical_failure"
+            self.ld_mc_diagnostic = pd.DataFrame({
+                "annotation": self.l2cols,
+                "annotation_mass": self.nsnps_bin,
+                "nvecs": int(self.nvecs),
+                "nsnps": int(self.nsnps),
+                "seed": int(self.root_seed),
+                "probe_distribution": str(self.rand_dist),
+                "dtype": np.dtype(self.dtype).name,
+                "residual_correlation_denom": float(N_denom),
+                "integrated_mc_variance": integrated_var,
+                "rms_mc_se": rms_mcse,
+                "ldscore_rms": ld_rms,
+                "relative_rms_mc_se": relative_rms,
+                "numerical_status": status,
+                "roundoff_clipped_terms": roundoff_count,
+                "numerical_failure_terms": failure_count,
+                "per_snp_numerical_status": per_status,
+                "per_snp_roundoff_clipped_terms": per_roundoff_count,
+                "per_snp_numerical_failure_terms": per_failure_count,
+            })
+            mc_out = f"{self.outpath}.gw.mc.tsv"
+            self.ld_mc_diagnostic.to_csv(mc_out, sep='\t', index=False, float_format='%.10e')
+            self.log._log(f"[mc] Saved annotation-level integrated MC noise diagnostic to: {mc_out}")
+            for row in self.ld_mc_diagnostic.itertuples(index=False):
+                self.log._log(
+                    f"[mc] {row.annotation}: integrated_var={row.integrated_mc_variance:.6e}, "
+                    f"RMS_MCSE={row.rms_mc_se:.6e}, LD_RMS={row.ldscore_rms:.6e}, "
+                    f"relative_RMS={row.relative_rms_mc_se:.3%}, "
+                    f"status={row.numerical_status}"
+                )
+            if self.write_ld_mc_var:
+                mc_var_out = f"{self.outpath}.gw.mcvar.gz"
+                z95 = 1.959963984540054
+                # Keep the temporary wide-frame payload bounded as annotation
+                # count grows.  The optional persistent cost remains one
+                # float64 M-by-K sufficient-statistic/variance array.
+                bytes_per_row = max(1, 8 * (6 * self.nbins + 3))
+                writer_rows = max(1, min(65536, (64 * 1024**2) // bytes_per_row))
+                with gzip.open(mc_var_out, "wt", encoding="utf-8") as handle:
+                    for start in range(0, self.nsnps, writer_rows):
+                        end = min(self.nsnps, start + writer_rows)
+                        payload = self.snpdf.iloc[start:end].reset_index(drop=True)
+                        var = np.asarray(self.ld_mc_variance[start:end], dtype=np.float64)
+                        score = np.asarray(self.gwldscore[start:end], dtype=np.float64)
+                        se = np.sqrt(var)
+                        columns = {}
+                        for k, name in enumerate(self.l2cols):
+                            columns[f"{name}_MC_VAR"] = var[:, k]
+                            columns[f"{name}_MC_SE"] = se[:, k]
+                            columns[f"{name}_MC_CI95_LO"] = score[:, k] - z95 * se[:, k]
+                            columns[f"{name}_MC_CI95_HI"] = score[:, k] + z95 * se[:, k]
+                        payload = pd.concat(
+                            [payload, pd.DataFrame(columns)], axis=1
+                        )
+                        payload.to_csv(
+                            handle,
+                            index=False,
+                            header=(start == 0),
+                            sep='\t',
+                            float_format='%.10e',
+                        )
+                self.log._log(
+                    f"[mc] Saved optional per-SNP MC variances, SEs, and "
+                    f"pointwise 95% conditional MC intervals to: {mc_var_out}"
+                )
         out_M = f"{self.outpath}.gw.M"
         with open(out_M, "w") as fout:
             fout.write("\t".join(f"{float(x):.10g}" for x in self.nsnps_bin) + "\n")

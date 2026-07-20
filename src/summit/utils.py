@@ -34,11 +34,13 @@ def _read_with_optional_header(file_path):
         return _read_with_optional_header_one(paths[0])
 
     header = None
+    saw_first = False
     arrays = []
     for p in paths:
         h, arr = _read_with_optional_header_one(p)
-        if header is None:
+        if not saw_first:
             header = h
+            saw_first = True
         elif h != header:
             raise ValueError(
                 f"Chromosome-split files for '{file_path}' have inconsistent headers; "
@@ -201,11 +203,11 @@ def _read_with_optional_header_one(file_path):
     if is_header:
         header = line.split()
         with _open_text_maybe_gzip(file_path, "rt") as fd:
-            data = np.loadtxt(fd, skiprows=1)
+            data = np.loadtxt(fd, skiprows=1, ndmin=2)
         return header, data
 
     with _open_text_maybe_gzip(file_path, "rt") as fd:
-        data = np.loadtxt(fd)
+        data = np.loadtxt(fd, ndmin=2)
     return None, data
 
 

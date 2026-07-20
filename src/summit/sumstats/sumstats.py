@@ -11,6 +11,65 @@ from .moments import resolve_cov_rank, effective_n_scale, derived_wald_z
 
 _CHI2_MEDIAN_1DF = 0.454936423119572
 
+
+def encode_dna_alleles(alleles) -> np.ndarray:
+    """Encode A/C/G/T as 0/1/2/3 and all other labels as -1."""
+    a = np.asarray(alleles, dtype=str)
+    out = np.full(a.shape, -1, dtype=np.int8)
+    out[(a == "A") | (a == "a")] = 0
+    out[(a == "C") | (a == "c")] = 1
+    out[(a == "G") | (a == "g")] = 2
+    out[(a == "T") | (a == "t")] = 3
+    return out
+
+
+def harmonize_allele_codes(
+    ref_a1,
+    ref_a2,
+    other_a1,
+    other_a2,
+    *,
+    drop_ambiguous: bool = True,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return compatible and effect-sign-flip masks for encoded alleles.
+
+    Exact label matches take precedence over strand-complement interpretations.
+    This only matters when the caller explicitly retains strand-ambiguous A/T or
+    C/G SNPs; their strand cannot be inferred from allele labels alone.
+    """
+    a1r = np.asarray(ref_a1, dtype=np.int8)
+    a2r = np.asarray(ref_a2, dtype=np.int8)
+    a1 = np.asarray(other_a1, dtype=np.int8)
+    a2 = np.asarray(other_a2, dtype=np.int8)
+    if not (a1r.shape == a2r.shape == a1.shape == a2.shape):
+        raise ValueError("Allele-code arrays must have the same shape.")
+
+    valid = (
+        (a1r >= 0) & (a2r >= 0) & (a1 >= 0) & (a2 >= 0)
+        & (a1r != a2r) & (a1 != a2)
+    )
+    ambiguous = (
+        ((a1r == 0) & (a2r == 3))
+        | ((a1r == 3) & (a2r == 0))
+        | ((a1r == 1) & (a2r == 2))
+        | ((a1r == 2) & (a2r == 1))
+    )
+
+    comp_a1 = 3 - a1
+    comp_a2 = 3 - a2
+    direct = (a1r == a1) & (a2r == a2)
+    swapped = (a1r == a2) & (a2r == a1)
+    strand = (a1r == comp_a1) & (a2r == comp_a2)
+    swapped_strand = (a1r == comp_a2) & (a2r == comp_a1)
+    keep = valid & (direct | swapped | strand | swapped_strand)
+    if drop_ambiguous:
+        keep &= ~ambiguous
+
+    # For retained ambiguous variants, prefer the literal allele labels:
+    # direct A1/A2 is unflipped and literal A1/A2 swapping is flipped.
+    flip = keep & (swapped | (swapped_strand & ~direct))
+    return keep, flip
+
 def _chisq_summary(chisq: np.ndarray) -> dict:
     chisq = np.asarray(chisq, dtype=np.float64)
     finite = np.isfinite(chisq)
@@ -143,6 +202,7 @@ class AlignedSumstats:
         chisq_action="drop",
         allowed_mask=None,
         compute_diagnostics: bool = True,
+        allele_flip_mask=None,
     ) -> MatchedSumstats:
         keep_mask = np.asarray(keep_mask, dtype=bool)
         if keep_mask.ndim != 1 or keep_mask.size != self.trace.nsnps:
@@ -179,6 +239,21 @@ class AlignedSumstats:
         n = self.sumstats.n[pos].astype(np.float64, copy=False)
         a1 = self.sumstats.a1[pos]
         a2 = self.sumstats.a2[pos]
+
+        if allele_flip_mask is not None:
+            flip = np.asarray(allele_flip_mask, dtype=bool)
+            if flip.ndim != 1 or flip.size != pos.size:
+                raise ValueError(
+                    f"allele_flip_mask must be length {pos.size}; got {flip.shape}."
+                )
+            if bool(np.any(flip)):
+                # Advanced indexing above already materialized these arrays; orient
+                # them in place instead of allocating a second full matched copy.
+                z[flip] *= -1.0
+                beta[flip] *= -1.0
+                tmp = a1[flip].copy()
+                a1[flip] = a2[flip]
+                a2[flip] = tmp
 
         thr, _ = utils._resolve_chisq_threshold(self.sumstats.n_scale, chisq_threshold)
         clip_count = 0
@@ -320,6 +395,10 @@ class Sumstats:
         self.chi2 = self.z * self.z
         self.a1 = np.asarray(a1, dtype=str)
         self.a2 = np.asarray(a2, dtype=str)
+        # Cache compact codes once. Batch rg can reuse these across every pair
+        # instead of repeatedly uppercasing and comparing Python strings.
+        self.a1_code = encode_dna_alleles(self.a1)
+        self.a2_code = encode_dna_alleles(self.a2)
         self.nsamp = float(nsamp)
         self.n_scale = float(n_scale)
         self.cov_rank = int(cov_rank)
@@ -354,6 +433,7 @@ class Sumstats:
         cov_rank=None,
         cov_rank_source=None,
         compute_diagnostics: bool = True,
+        require_alleles: bool = False,
     ) -> "Sumstats":
         if log is not None and utils._is_chr_split_spec(path):
             paths = utils._resolve_chr_split_paths(path, require=True)
@@ -368,8 +448,18 @@ class Sumstats:
         cols = list(hdr.columns)
 
         idcol = utils._parse_column_name(hdr, ["ID", "id", "snp", "SNP"], default_pos=0)
-        a1col = utils._parse_column_name(hdr, ["A1", "ALT"], default_pos=1)
-        a2col = utils._parse_column_name(hdr, ["A2", "REF"], default_pos=2)
+        if require_alleles:
+            a1col = _maybe_find_column(cols, ["A1", "ALT"])
+            a2col = _maybe_find_column(cols, ["A2", "REF"])
+            if a1col is None or a2col is None or a1col == a2col:
+                raise RuntimeError(
+                    f"Phenotype [{name or path}] needs named A1/A2 (or ALT/REF) columns "
+                    "for safe allele harmonization. Use the explicit no-harmonization mode "
+                    "only when inputs are already oriented identically."
+                )
+        else:
+            a1col = utils._parse_column_name(hdr, ["A1", "ALT"], default_pos=1)
+            a2col = utils._parse_column_name(hdr, ["A2", "REF"], default_pos=2)
 
         ncol = _maybe_find_column(cols, ["OBS_CT", "obs_ct", "N", "n"])
         if ncol is None:

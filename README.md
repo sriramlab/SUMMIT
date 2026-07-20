@@ -9,21 +9,23 @@ moments.
 
 ## Main Features
 
-- Genome-wide randomized LD scores from PLINK 1 BED/BIM/FAM hard calls or
-  biallelic diploid PLINK 2 PGEN/PVAR/PSAM dosages.
+- Genome-wide randomized, fixed-window, and GxE LD scores from PLINK 1
+  BED/BIM/FAM hard calls or biallelic diploid PLINK 2 PGEN/PVAR/PSAM dosages.
 - Covariate-adjusted and annotation-partitioned LD scores.
 - Optional fixed-window LD scores with `--ld-wind-kb`.
 - Optional GxE LD scores with `--env`; SUMMIT writes both additive-interaction
   cross-LD and interaction-interaction LD scores.
 - Heritability estimation from `BETA`/`SE` summary statistics.
-- Optional score-scale constrained LDSC-style IRWLS for univariate h2 via
-  `--weight-mode ldsc`; the default remains SUMMIT/HE.
+- Optional score-scale constrained LDSC-style IRWLS for h2 and bivariate
+  genetic covariance/rg via `--weight-mode ldsc`; the default remains
+  SUMMIT/HE.
 - Genetic correlation estimation with either a fixed overlap intercept or a
   summary-estimated intercept.
 - Batch genetic-correlation manifests, including a sparse fast path for
   fixed-intercept analyses.
-- Allele alignment for rg (`--align-alleles`) with strand-ambiguous SNPs
-  dropped by default.
+- Integrated allele validation/alignment for rg (enabled by default), with
+  strand-ambiguous SNPs dropped by default and `--no-align-alleles` as an
+  explicit escape hatch for pre-harmonized inputs.
 
 Trace-summary (`.tr/.MN`) input is intentionally not supported in the current
 refactored h2/rg path; use per-SNP LD scores.
@@ -113,9 +115,9 @@ one complete genotype trio:
 
 - PLINK 1 `.bed/.bim/.fam` input supports genome-wide, windowed, and GxE LD
   scores, including the existing hard-call-specific options.
-- PLINK 2 `.pgen/.pvar/.psam` input supports the standard randomized
-  genome-wide estimator for biallelic diploid variants. The PVAR must be plain
-  text rather than `.pvar.zst`.
+- PLINK 2 `.pgen/.pvar/.psam` input supports randomized genome-wide,
+  deterministic windowed, and GxE estimators for biallelic diploid variants.
+  The PVAR must be plain text rather than `.pvar.zst`.
 
 For PGEN input, SUMMIT bulk-decodes stored REF-allele dosages into one reusable
 variant-block buffer, mean-imputes missing dosage values, and standardizes each
@@ -124,14 +126,16 @@ matrix. A hard-call PGEN estimates the same matrix quantity as BED; an imputed
 dosage PGEN need not give exactly the same finite-sample LD scores as hard
 calls.
 
-The initial PGEN path is CPU-only and requires `--impute-method mean` (the
-default for PGEN), `--ddof 1`, and the dense kernels. It does not yet support
-`--device cuda`, Mailman, HWE imputation, `--correct-skew`, `--write-kmoments`,
-`--ld-wind-kb`, or `--env`. Multiallelic and non-diploid variants are also out
-of scope. If BED and PGEN trios share a prefix, pass the desired `.bed` or
+The PGEN paths are CPU-only and require `--impute-method mean` (the default).
+The randomized genome-wide path additionally requires `--ddof 1` and the dense
+kernels; it does not support `--device cuda`, Mailman, HWE imputation,
+`--correct-skew`, or `--write-kmoments`. Windowed PGEN uses bounded streamed
+panels and supports `--win-panel-cols` and `--win-cache-mb`; GxE PGEN uses a
+persistent streamed dosage reader. Multiallelic and non-diploid variants are
+out of scope. If BED and PGEN trios share a prefix, pass the desired `.bed` or
 `.pgen` filename explicitly.
 
-See [PGEN genome-wide LD estimation](docs/pgen_gwld.md) for the estimand,
+See [PGEN LD-score estimation](docs/pgen_gwld.md) for the estimand,
 normalization, implementation details, and validation design.
 
 ## Common Commands
@@ -151,10 +155,17 @@ summit \
   --num-threads 8
 ```
 
-This writes `outs/ref.mafld.gw.ldscore.gz`, `outs/ref.mafld.gw.M`, and
-`outs/ref.mafld.gw.log`.
+This writes `outs/ref.mafld.gw.ldscore.gz`, `outs/ref.mafld.gw.M`,
+`outs/ref.mafld.gw.mc.tsv`, and `outs/ref.mafld.gw.log`. The MC file reports
+the default annotation-level integrated random-probe noise diagnostic. Add
+`--write-ld-mc-var` (or `--write-ld-mc-ci`) to write optional per-SNP MC
+variances, standard errors, and approximate pointwise 95% conditional MC
+intervals.
 Add `--write-kmoments` for single-component LD scores when you want the
 model-based `--rg-se-method kmoments` path.
+
+See [Genome-wide LD-score Monte Carlo noise](docs/gwld_mc_noise.md) for the
+estimand and sufficient-statistic calculation.
 
 For a PGEN dosage panel, use the same command with an explicit PGEN path and
 mean imputation:
@@ -234,7 +245,8 @@ summit \
 The one-column `--ldscores-w` file is recommended, especially for overlapping
 annotations. If it is omitted, SUMMIT uses the row sum of the primary LD-score
 columns. LDSC mode reruns IRWLS inside every delete block and is currently
-available only for ordinary univariate `--h2`, not fast cached h2 or rg. See
+available for ordinary `--h2` and single-pair/regular-manifest `--rg`, but not
+fast cached h2 or fast rg manifests. See
 [Score-scale constrained LDSC weighting](docs/ldsc_weight_mode.md).
 
 ### Genetic Correlation With a Fixed Intercept
@@ -346,8 +358,8 @@ The scripts prefer the installed `summit` executable and fall back to
 
 ### Analysis modes
 
-- `--geno`: compute LD scores from a PLINK 1 BED/BIM/FAM or PLINK 2
-  PGEN/PVAR/PSAM path or prefix. PGEN is currently genome-wide-only.
+- `--geno`: compute genome-wide, windowed, or GxE LD scores from a PLINK 1
+  BED/BIM/FAM or PLINK 2 PGEN/PVAR/PSAM path or prefix.
 - `--h2`: estimate heritability for one file, a directory, or split-file spec.
 - `--rg`: estimate rg for a comma-separated pair or a manifest TSV.
 - `--make-rg-manifest`: build an rg manifest.
@@ -359,7 +371,8 @@ Exactly one of these modes must be specified.
 - `--ldscores`: primary LD-score file or chromosome-split spec.
 - `--ldscores-reg`: optional scalar LD-score file for unconstrained rg intercept
   regression.
-- `--weight-mode`: `he` (default) or univariate score-scale `ldsc` IRWLS.
+- `--weight-mode`: `he` (default) or score-scale constrained `ldsc` IRWLS for
+  h2 and bivariate genetic covariance/rg.
 - `--ldscores-w`: optional scalar regression-SNP LD score used in LDSC weights.
 - `--ldsc-m`: fixed reference annotation masses; split files with `@` are summed.
 - `--ldsc-irwls-iters`, `--ldsc-irwls-tol`: LDSC update controls.
@@ -370,7 +383,10 @@ Exactly one of these modes must be specified.
 - `--intercept-rg`: fixed rg intercept on SUMMIT's SCORE scale.
 - `--pheno-rg`, `--pheno-rg-cov`: compute fixed intercept from overlapping
   phenotype/covariate files.
-- `--align-alleles`: align the second summary-statistic file to the first.
+- `--align-alleles`: validate and align the second summary-statistic file to
+  the first (default).
+- `--no-align-alleles`: explicitly skip allele validation/alignment for inputs
+  already guaranteed to have identical orientation.
 - `--keep-ambiguous`: keep strand-ambiguous SNPs during allele alignment.
 - `--njack`: integer SNP blocks, `chr`, `chr:d`, `chr:d:R`, or `chr:d:R:seed`.
 - `--rg-se-method`: `jackknife`, `delta`, `robust`, or `kmoments`.
@@ -380,8 +396,15 @@ Exactly one of these modes must be specified.
 ### LD-score options
 
 - `--nvecs`: random vectors for stochastic genome-wide LD scores.
+- `--write-ld-mc-var` / `--write-ld-mc-ci`: additionally write per-SNP,
+  per-annotation MC variances, SEs, and approximate pointwise 95% conditional
+  MC intervals; the compact annotation-level diagnostic is written by default.
+- `--skip-ld-mc`: disable the default MC diagnostic.
 - `--step_size`: SNP block size for LD-score computation; for PGEN this also
   controls the reusable dosage decode buffer.
+- `--win-panel-cols`, `--win-cache-mb`: decoded panel width and bounded
+  prepared-panel cache for PGEN windowed LD. Automatic caching is capped and
+  also respects `--target-mem` when supplied.
 - `--covar`: covariate file with `FID IID` and covariate columns.
 - `--env`: one-column environment file for GxE LD scores.
 - `--ld-wind-kb`: compute fixed-window LD scores instead of randomized
@@ -396,8 +419,9 @@ Exactly one of these modes must be specified.
 
 ## Output Files
 
-- Genome-wide LD scores: `<out>.gw.ldscore.gz`, `<out>.gw.M`, `<out>.gw.log`,
-  optionally `<out>.gw.kmoments`.
+- Genome-wide LD scores: `<out>.gw.ldscore.gz`, `<out>.gw.M`,
+  `<out>.gw.mc.tsv`, `<out>.gw.log`, optionally `<out>.gw.mcvar.gz` and
+  `<out>.gw.kmoments`.
 - Windowed LD scores: `<out>.win.ldscore.gz`, `<out>.win.M`,
   `<out>.win.M_5_50`, `<out>.win.log`.
 - GxE LD scores: `<out>.gxe.ldscore.gz`, `<out>.gee.ldscore.gz`,

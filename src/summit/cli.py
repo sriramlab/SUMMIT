@@ -61,7 +61,6 @@ import pandas as pd
 from . import utils
 from .logger import Logger
 from .ldscore.gw_ldscore import GenomewideLDScore, apply_env
-from .ldscore.genotype_source import resolve_genotype_input
 from .ldscore.gwe_ldscore import GenomewideEnvLDScore
 from .ldscore.win_ldscore import WindowedLDScore
 from .inference.sumrhe import Sumrhe
@@ -238,12 +237,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--weight-mode", default="he", type=str,
                         choices=["he", "ldsc"],
                         help=(
-                            "Main h2 estimating equation: 'he' keeps the SUMMIT/HE score moments "
-                            "(default); 'ldsc' fits score-scale constrained LDSC-style WLS by "
-                            "closed-form IRWLS. It retains SUMMIT's exact-score response and scalar "
-                            "effective sample-size convention, so it is not literal ldsc.py when "
-                            "per-SNP sample sizes vary. "
-                            "The LDSC mode is currently univariate-only."
+                            "Main h2/genetic-covariance estimating equation: 'he' keeps the "
+                            "SUMMIT/HE score moments (default); 'ldsc' fits score-scale constrained "
+                            "LDSC-style WLS by closed-form IRWLS. It retains SUMMIT's exact-score "
+                            "response, scalar effective-sample-size convention, and nuisance-intercept "
+                            "refit semantics, so it is not literal ldsc.py when per-SNP sample sizes vary."
                         ))
     parser.add_argument("--ldsc-m", default=None, type=str,
                         help=(
@@ -347,10 +345,15 @@ def build_parser() -> argparse.ArgumentParser:
                         help="Apply delta-based deleted-source correction when Trace.delta is available.")
 
     # Allele alignment for rg
-    parser.add_argument("--align-alleles", action="store_true", default=False,
-                        help="Align the second trait to the first trait by allele labels before rg estimation.")
+    allele_group = parser.add_mutually_exclusive_group()
+    allele_group.add_argument("--align-alleles", dest="align_alleles", action="store_true",
+                              help="Align the second trait to the first trait by allele labels (the default).")
+    allele_group.add_argument("--no-align-alleles", dest="align_alleles", action="store_false",
+                              help="Assume both rg inputs are already identically oriented; skip allele validation/alignment.")
+    parser.set_defaults(align_alleles=True)
     parser.add_argument("--keep-ambiguous", action="store_true", default=False,
-                        help="Keep strand-ambiguous SNPs during allele alignment.")
+                        help=("Keep strand-ambiguous A/T and C/G SNPs during allele alignment. "
+                              "Their orientation then follows literal A1/A2 labels because strand is unresolved."))
 
     # LD-score generation mode
     parser.add_argument("--geno", default=None, type=str,
@@ -380,10 +383,26 @@ def build_parser() -> argparse.ArgumentParser:
                         help="ddof used in LD-score estimation.")
     parser.add_argument("--ld-wind-kb", default=None, type=float,
                         help="If set, compute windowed LD scores with the given kb window.")
+    parser.add_argument("--win-panel-cols", default=None, type=int,
+                        help=("PGEN windowed-LD dosage columns decoded per panel. "
+                              "By default this is chosen from sample count, chunk size, and cache size."))
+    parser.add_argument("--win-cache-mb", default=-1, type=int,
+                        help=("PGEN/BED windowed-LD prepared-panel cache in MiB; -1 selects automatically "
+                              "(bounded by available/target memory and honoring SUMMIT_WIN_CACHE_MB), "
+                              "while 0 disables caching."))
     parser.add_argument("--correct-skew", action="store_true",
                         help="Enable optional finite-sample skew diagnostics in genome-wide LD-score estimation.")
     parser.add_argument("--write-kmoments", action="store_true",
                         help="Write .gw.kmoments for unpartitioned genome-wide LD-score estimation.")
+    mc_group = parser.add_mutually_exclusive_group()
+    mc_group.add_argument(
+        "--write-ld-mc-var", "--write-ld-mc-ci", dest="write_ld_mc_var",
+        action="store_true",
+        help=("Write optional per-SNP Monte Carlo variances, SEs, and pointwise "
+              "95%% conditional MC intervals for genome-wide LD scores."),
+    )
+    mc_group.add_argument("--skip-ld-mc", action="store_true",
+                          help="Disable the default annotation-level genome-wide LD-score MC noise diagnostic.")
     parser.add_argument("--skip-kmoments", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--use-mailman", default=False, type=str2bool,
                         help="Enable mailman in LD-score estimation.")
@@ -535,11 +554,12 @@ def _make_low_level_env(args):
 
 
 def _dispatch_ldscore(args, log, verbose_on, low_level):
-    genotype_format = resolve_genotype_input(args.geno).format
     if args.env is not None:
-        if genotype_format != "bed":
-            log._log("!!! PGEN input is not yet supported for genome-wide GxE LD scores. !!!")
-            raise SystemExit(1)
+        if args.write_ld_mc_var or args.skip_ld_mc:
+            raise ValueError(
+                "Genome-wide GxE LD scores do not yet support the --write-ld-mc-var/"
+                "--write-ld-mc-ci diagnostic; --skip-ld-mc is specific to standard GWLD."
+            )
         if args.ld_wind_kb is not None:
             log._log("!!! --env is currently supported only for genome-wide LD scores (not --ld-wind-kb). !!!")
             raise SystemExit(1)
@@ -564,16 +584,22 @@ def _dispatch_ldscore(args, log, verbose_on, low_level):
             target_xz_mem=args.target_xz_mem,
             target_mem=args.target_mem,
             device=args.device,
+            impute_method=args.impute_method,
         )
-        gwe._compute_ldscore()
+        try:
+            gwe._compute_ldscore()
+        finally:
+            gwe.close()
         return
 
     if args.ld_wind_kb is not None:
-        if genotype_format != "bed":
-            log._log("!!! PGEN input is not yet supported for windowed LD scores. !!!")
-            raise SystemExit(1)
-        if args.ld_wind_kb <= 0:
-            log._log("!!! --ld-wind-kb must be positive !!!")
+        if args.write_ld_mc_var or args.skip_ld_mc:
+            raise ValueError(
+                "Windowed LD scores are deterministic and do not use the genome-wide "
+                "random-probe MC diagnostic flags."
+            )
+        if not np.isfinite(args.ld_wind_kb) or args.ld_wind_kb <= 0:
+            log._log("!!! --ld-wind-kb must be finite and positive !!!")
             raise SystemExit(1)
         log._log(f">>> LD score mode: windowed, --ld-wind-kb {args.ld_wind_kb}")
         winld = WindowedLDScore(
@@ -590,8 +616,15 @@ def _dispatch_ldscore(args, log, verbose_on, low_level):
             rand_samp=args.rand_samp,
             ddof=args.ddof,
             num_threads=args.num_threads,
+            impute_method=args.impute_method,
+            panel_cols=args.win_panel_cols,
+            cache_mb=args.win_cache_mb,
+            target_mem=args.target_mem,
         )
-        winld._compute_ldscore()
+        try:
+            winld._compute_ldscore()
+        finally:
+            winld.close()
         return
 
     gwld = GenomewideLDScore(
@@ -615,6 +648,8 @@ def _dispatch_ldscore(args, log, verbose_on, low_level):
         use_tp32=args.use_tp32,
         correct_skew=args.correct_skew,
         write_kmoments=(args.write_kmoments and not args.skip_kmoments),
+        estimate_mc_noise=(not args.skip_ld_mc),
+        write_ld_mc_var=args.write_ld_mc_var,
         use_mailman=args.use_mailman,
         impute_method=args.impute_method,
         ddof=args.ddof,
@@ -699,6 +734,7 @@ def _dispatch_rg(args, log):
         ldscores=args.ldscores,
         ldscores_reg=args.ldscores_reg,
         ldscores_reg_w=None,
+        ldscores_w=args.ldscores_w,
         njack=args.njack,
         annot=args.annot,
         enrich_mode=args.enrich_mode,
@@ -714,6 +750,10 @@ def _dispatch_rg(args, log):
         cov_rank=args.cov_rank,
         write_jack=args.write_jack,
         write_normeq=args.write_normeq,
+        weight_mode=args.weight_mode,
+        ldsc_m=args.ldsc_m,
+        ldsc_irwls_iters=args.ldsc_irwls_iters,
+        ldsc_irwls_tol=args.ldsc_irwls_tol,
     )
     rg._run()
     rg._logoff()
@@ -984,6 +1024,7 @@ def _load_manifest_trait_entry(
         cov_rank=cov_rank,
         cov_rank_source=("manifest" if cov_rank is not None else None),
         compute_diagnostics=(verbose_level >= 1),
+        require_alleles=bool(args.align_alleles),
     )
     aligned = ss.align_to_trace(shared_trace)
     keep_mask = aligned.keep_mask(
@@ -1036,6 +1077,11 @@ def _dispatch_rg_manifest(args, log):
     )
 
     if bool(getattr(args, "rg_manifest_fast", False)):
+        if args.weight_mode != "he":
+            raise ValueError(
+                "--rg-manifest-fast does not retain the per-SNP covariance response required "
+                "by --weight-mode ldsc; use regular rg manifest mode."
+            )
         execution_plan = _plan_rg_manifest_order(manifest_df, log=log)
         dispatch_rg_manifest_fast(args, log, manifest_df, trait_meta, verbose_level, execution_plan=execution_plan)
         return
@@ -1098,6 +1144,7 @@ def _dispatch_rg_manifest(args, log):
             ldscores=None,
             ldscores_reg=None,
             ldscores_reg_w=None,
+            ldscores_w=args.ldscores_w,
             log=pair_log,
             verbose=args.verbose,
             chisq_threshold=args.max_chisq,
@@ -1126,6 +1173,10 @@ def _dispatch_rg_manifest(args, log):
             phen_names=(row.phen1, row.phen2),
             write_jack=args.write_jack,
             write_normeq=args.write_normeq,
+            weight_mode=args.weight_mode,
+            ldsc_m=args.ldsc_m,
+            ldsc_irwls_iters=args.ldsc_irwls_iters,
+            ldsc_irwls_tol=args.ldsc_irwls_tol,
         )
 
         try:
@@ -1260,14 +1311,11 @@ def main():
         log._log("!!! Exactly one of --geno / --h2 / --rg / --make-rg-manifest must be specified. !!!")
         raise SystemExit(1)
 
-    if args.rg is not None and args.weight_mode != "he":
-        raise ValueError(
-            "--weight-mode ldsc currently supports univariate --h2 only. The existing "
-            "--intercept-weight-mode ldsc changes only the cross-trait nuisance-intercept fit; "
-            "a main genetic-covariance LDSC path requires a separate bivariate estimator."
-        )
     if args.geno is not None and args.weight_mode != "he":
-        raise ValueError("--weight-mode applies to --h2 inference, not LD-score estimation with --geno.")
+        raise ValueError(
+            "--weight-mode applies to --h2/--rg inference, not LD-score "
+            "estimation with --geno."
+        )
 
     if build_manifest_mode:
         _dispatch_make_rg_manifest(args, log)

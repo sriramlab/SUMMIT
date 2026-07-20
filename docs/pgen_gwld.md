@@ -1,4 +1,4 @@
-# PGEN genome-wide LD estimation
+# PGEN LD-score estimation
 
 ## Mathematical conclusion
 
@@ -145,6 +145,11 @@ PGEN once in phase 1 and once in phase 2 per random-vector tile. Residual
 variance computation is fused into the first phase-1 scan, avoiding a third
 PGEN pass.
 
+The default random-probe noise diagnostic also avoids a probe-by-SNP array.
+Phase 2 accumulates one fourth-moment sufficient statistic per annotation;
+see [Genome-wide LD-score Monte Carlo noise](gwld_mc_noise.md). The optional
+`--write-ld-mc-var` output uses one additional `M x K` float64 array.
+
 This design follows the official
 [pgenlib Python API](https://github.com/chrchang/plink-ng/blob/master/2.0/Python/python_api.txt),
 which specifies variant-major dosage range reads, sorted `uint32` sample
@@ -152,17 +157,81 @@ subsets, REF dosage at `allele_idx=0`, and `-9` as the missing-dosage sentinel.
 
 ## Supported scope
 
-The initial implementation intentionally supports plain-text PVAR metadata and
-biallelic diploid PGEN data in the dense CPU genome-wide estimator with mean
-imputation and `ddof=1`. It auto-disables Mailman when mean imputation is in
-use, and rejects multiallelic variants, nondefault `ddof`, HWE imputation,
-CUDA, finite-sample skew correction, K-moment output, windowed LD scores, and
-GxE LD scores. Non-diploid and multiallelic behavior is not inferred from the
-diploid biallelic implementation.
+SUMMIT supports plain-text PVAR metadata and biallelic diploid PGEN data in all
+three LD-score modes:
+
+- The randomized genome-wide estimator uses the dense CPU kernels, dosage mean
+  imputation, and `ddof=1`. It supports the default annotation-level random-
+  probe noise diagnostic and optional per-SNP MC intervals.
+- The deterministic windowed estimator streams standardized dosage panels into
+  a NumPy implementation of the same prepared-panel matrix expression used by
+  the native BED path. It supports
+  annotations, sample subsets, and covariate residualization, and uses the
+  established windowed-LD `ddof=0` genotype-standardization convention.
+- The randomized GxE estimator streams standardized dosage blocks through its
+  additive-interaction and interaction-interaction calculations. It supports
+  annotations, sample subsets, environments, and covariates.
+
+PGEN input is currently CPU-only and uses dosage mean imputation. Genome-wide
+PGEN rejects HWE imputation, CUDA, finite-sample skew correction, and K-moment
+output; the windowed and GxE paths likewise do not add hard-call-only HWE
+behavior. Multiallelic and non-diploid variants remain explicitly out of scope.
+Compressed `.pvar.zst` metadata are not yet read; provide a plain-text `.pvar`.
 
 Genome-wide `ddof != 1` is rejected for BED as well as PGEN: the estimator's
 residual normalization, phase-2 divisor, and final null are all defined with
 `d = N - 1` or `N - p - 1`.
+
+### Windowed PGEN I/O
+
+The windowed path keeps one persistent `PgenReader`, decodes consecutive
+variant panels, and retains prepared panels in a bounded least-recently-used
+cache. It never materializes the full sample-by-variant matrix. The defaults
+choose a panel width and cache budget from the sample count, chunk size, and
+available memory. Automatic caching is capped at 4 GiB and one eighth of
+available memory; when `--target-mem` is set, it is also capped at one quarter
+of that budget. `--win-panel-cols` overrides the decoded panel width and
+`--win-cache-mb` sets the cache budget (`0` disables caching, `-1` selects the
+automatic value). The `SUMMIT_WIN_CACHE_MB` environment variable can also set
+the automatic cache budget.
+
+This panel/cache design avoids repeatedly decoding a left panel when a physical
+window crosses several panel boundaries. Candidate panel pairs are selected
+coarsely for efficient matrix multiplication, then every corrected squared
+correlation outside the exact inclusive base-pair window is masked to zero.
+Thus panel width and chunk boundaries affect I/O and memory use, not which
+variant pairs contribute. A PGEN and BED matrix decoded to identical values
+therefore use the same deterministic matrix expression.
+
+### Metadata validation
+
+PVAR/BIM variant IDs and PSAM/FAM sample IDs must be unique. Full annotation
+files are aligned by SNP ID and then required to have exactly matching
+canonical chromosome and integer base-pair coordinates; thin annotation files
+must have exactly one row per genotype variant. Variant order must be
+chromosome-contiguous, and windowed LD additionally requires nondecreasing BP
+within each chromosome. These checks catch ordering and coordinate mismatches,
+but SUMMIT cannot infer a named genome build from CHR/BP alone. Users must
+supply genotype, annotations, and LD scores from the same build.
+
+## Command examples
+
+An explicit `.pgen` path is recommended when BED and PGEN trios share a prefix.
+For example:
+
+```bash
+# Randomized genome-wide dosage LD
+summit --geno ref.pgen --annot annot.gz --nvecs 1000 \
+  --impute-method mean --out ref.dosage
+
+# Deterministic 20 Mb windowed dosage LD
+summit --geno ref.pgen --annot annot.gz --ld-wind-kb 20000 \
+  --impute-method mean --out ref.dosage.20mb
+
+# Genome-wide dosage GxE LD
+summit --geno ref.pgen --annot annot.gz --env environment.txt \
+  --impute-method mean --nvecs 1000 --out ref.dosage.env
+```
 
 ## Validation requirements
 

@@ -9,9 +9,15 @@ import pandas as pd
 from .. import utils
 from .jackknife import JackknifeSpec, JackknifeDesign
 from .trace import Trace
-from ..sumstats.sumstats import Sumstats, MatchedSumstats
+from ..sumstats.sumstats import Sumstats, MatchedSumstats, harmonize_allele_codes
 from .h2core import prepare_h2, fit_h2
 from .rgcore import prepare_rg, fit_intercept, fit_rg, RGResultWriter
+from .ldsc_h2 import (
+    prepare_h2_ldsc,
+    read_ldsc_m,
+    read_ldsc_weight_ld_aligned,
+    resolve_ldsc_reference_moments,
+)
 from ..sumstats.moments import build_rg_summary_moment
 
 
@@ -37,6 +43,7 @@ class Sumcore:
         ldscores=None,
         ldscores_reg=None,
         ldscores_reg_w=None,
+        ldscores_w=None,
         log=None,
         verbose=False,
         chisq_threshold=0,
@@ -69,6 +76,10 @@ class Sumcore:
         phen_names=None,
         write_jack: bool = False,
         write_normeq: bool = False,
+        weight_mode: str = "he",
+        ldsc_m=None,
+        ldsc_irwls_iters: int = 3,
+        ldsc_irwls_tol: float = 0.0,
         **_unused_kwargs,
     ):
 
@@ -82,6 +93,24 @@ class Sumcore:
         self.start_time = utils._get_time()
         if self.log is not None:
             self.log._log("Analysis started at: " + utils._get_timestr(self.start_time))
+
+        self.weight_mode = str(weight_mode).strip().lower().replace("-", "_")
+        if self.weight_mode in {"summit", "score", "he_regression"}:
+            self.weight_mode = "he"
+        if self.weight_mode not in {"he", "ldsc"}:
+            raise ValueError("weight_mode must be one of {'he','ldsc'}")
+        if self.weight_mode == "he" and (ldscores_w is not None or ldsc_m is not None):
+            raise ValueError("--ldscores-w and --ldsc-m require --weight-mode ldsc.")
+        if self.weight_mode == "ldsc" and self.verbose_write_normeq:
+            raise ValueError(
+                "--write-normeq is unavailable for --weight-mode ldsc because "
+                "IRWLS uses replicate-specific normal equations."
+            )
+        if ldscores_w is not None and ldscores_reg_w is not None:
+            raise ValueError(
+                "Provide at most one main --ldscores-w input and legacy "
+                "ldscores_reg_w input."
+            )
 
         self._preloaded_sumstats = None if sumstats_pair is None else tuple(sumstats_pair)
         if self._preloaded_sumstats is not None and len(self._preloaded_sumstats) != 2:
@@ -148,6 +177,56 @@ class Sumcore:
             if hasattr(self.trace, "log"):
                 self.trace.log = self.log
 
+        self.ldsc_irwls_iters = int(ldsc_irwls_iters)
+        self.ldsc_irwls_tol = float(ldsc_irwls_tol)
+        if self.ldsc_irwls_iters < 1:
+            raise ValueError("ldsc_irwls_iters must be at least 1")
+        if not (np.isfinite(self.ldsc_irwls_tol) and self.ldsc_irwls_tol >= 0.0):
+            raise ValueError("ldsc_irwls_tol must be non-negative and finite")
+
+        self.ldsc_weight_ld = None
+        self.ldsc_weight_present = None
+        self.ldsc_m_annot = None
+        self.ldsc_overlap_matrix = None
+        self.ldsc_source_nsnps = None
+        self.ldsc_m_source = None
+        if self.weight_mode == "ldsc":
+            m_override = (
+                None
+                if ldsc_m is None
+                else read_ldsc_m(ldsc_m, nbins=self.trace.nbins)
+            )
+            reference = resolve_ldsc_reference_moments(
+                annot_path=annot,
+                trace_annot=self.trace.annot,
+                trace_header=self.trace.annot_header,
+                m_override=m_override,
+                unpartitioned_source_nsnps=getattr(self.trace, "source_nsnps", None),
+            )
+            self.ldsc_m_annot = reference.m_annot
+            self.ldsc_overlap_matrix = reference.overlap_matrix
+            self.ldsc_source_nsnps = reference.source_nsnps
+            self.ldsc_m_source = (
+                reference.source
+                if ldsc_m is None
+                else f"{ldsc_m} ({reference.source})"
+            )
+            if ldscores_w is not None:
+                self.ldsc_weight_ld, self.ldsc_weight_present = (
+                    read_ldsc_weight_ld_aligned(
+                        ldscores_w,
+                        self.trace.snps,
+                        target_chr=self.trace.chr,
+                        target_bp=self.trace.bp,
+                    )
+                )
+                n_missing = int(np.sum(~self.ldsc_weight_present))
+                if self.log is not None:
+                    self.log._log(
+                        "[rg:ldsc] aligned scalar weight LD to the primary Trace; "
+                        f"{n_missing} SNP(s) will be excluded from the common regression axis."
+                    )
+
         if self._prealigned_pair is not None:
             for aligned in self._prealigned_pair:
                 if getattr(aligned, "trace", None) is not self.trace:
@@ -180,6 +259,15 @@ class Sumcore:
         self.rg_se_method = str(rg_se_method).strip().lower()
         if self.rg_se_method not in {"jackknife", "delta", "robust", "kmoments"}:
             raise ValueError("rg_se_method must be one of {'jackknife','delta','robust','kmoments'}")
+        if self.weight_mode == "ldsc" and self.rg_se_method != "jackknife":
+            raise ValueError(
+                "--weight-mode ldsc currently supports --rg-se-method jackknife only."
+            )
+        if self.weight_mode == "ldsc" and self.adjust_delta:
+            raise ValueError(
+                "--adjust-delta is an HE trace correction and is incompatible with "
+                "--weight-mode ldsc."
+            )
         if self.chisq_action not in ("drop", "clip", "warn", "none"):
             raise ValueError("chisq_action must be one of {'drop','clip','warn','none'}")
         if self.intercept_weight_mode not in {"ldsc", "score"}:
@@ -257,6 +345,7 @@ class Sumcore:
                 cov_rank=cov_rank1,
                 cov_rank_source=cov_rank_source1,
                 compute_diagnostics=self.collect_diagnostics,
+                require_alleles=self.align_alleles,
             )
             ss2 = Sumstats.from_file(
                 self.phen_paths[1],
@@ -265,6 +354,7 @@ class Sumcore:
                 cov_rank=cov_rank2,
                 cov_rank_source=cov_rank_source2,
                 compute_diagnostics=self.collect_diagnostics,
+                require_alleles=self.align_alleles,
             )
 
             aligned1 = ss1.align_to_trace(self.trace)
@@ -285,6 +375,8 @@ class Sumcore:
         keep1 = np.asarray(keep1, dtype=bool)
         keep2 = np.asarray(keep2, dtype=bool)
         main_mask = keep1 & keep2
+        if self.ldsc_weight_present is not None:
+            main_mask &= self.ldsc_weight_present
         _stage_stop("load_align_filter", t_stage)
 
         t_stage = _stage_start()
@@ -302,6 +394,15 @@ class Sumcore:
             )
 
         tv = self.trace.materialize_view(main_mask)
+        if self.ldsc_weight_ld is not None:
+            tv = replace(
+                tv,
+                ldscores_reg_w=np.asarray(
+                    self.ldsc_weight_ld[main_mask, :],
+                    dtype=np.float64,
+                    order="C",
+                ),
+            )
         matched1 = aligned1.materialize(
             main_mask,
             chisq_threshold=self.chisq_threshold,
@@ -315,9 +416,8 @@ class Sumcore:
             chisq_action=self.chisq_action,
             allowed_mask=keep2,
             compute_diagnostics=self.collect_diagnostics,
+            allele_flip_mask=flip_keep,
         )
-        if flip_keep is not None:
-            matched2 = self._flip_matched_sumstats(matched2, flip_keep)
 
         if self.jackknife_spec.mode == "chr":
             full_tv = self.trace.materialize_view()
@@ -328,26 +428,48 @@ class Sumcore:
         _stage_stop("materialize_jackknife", t_stage)
 
         t_stage = _stage_start()
+        h2_prepared1 = (
+            prepare_h2_ldsc(tv, matched1, jk)
+            if self.weight_mode == "ldsc"
+            else prepare_h2(tv, matched1, jk, adjust_delta=self.adjust_delta)
+        )
         h2_fit1 = fit_h2(
-            prepare_h2(tv, matched1, jk, adjust_delta=self.adjust_delta),
+            h2_prepared1,
             enrich_mode=self.enrich_mode,
             report_tau=self.report_tau,
             allow_neg_enr=self.allow_neg_enr,
             clip_nonfinite_vals=self.clip_nonfinite_vals,
             jack_mode=self.jack_mode,
             nan_policy=self.nan_policy,
+            weight_mode=self.weight_mode,
+            ldsc_m_annot=self.ldsc_m_annot,
+            ldsc_overlap_matrix=self.ldsc_overlap_matrix,
+            ldsc_source_nsnps=self.ldsc_source_nsnps,
+            ldsc_irwls_iters=self.ldsc_irwls_iters,
+            ldsc_irwls_tol=self.ldsc_irwls_tol,
         )
         _stage_stop("h2_trait1", t_stage)
 
         t_stage = _stage_start()
+        h2_prepared2 = (
+            prepare_h2_ldsc(tv, matched2, jk)
+            if self.weight_mode == "ldsc"
+            else prepare_h2(tv, matched2, jk, adjust_delta=self.adjust_delta)
+        )
         h2_fit2 = fit_h2(
-            prepare_h2(tv, matched2, jk, adjust_delta=self.adjust_delta),
+            h2_prepared2,
             enrich_mode=self.enrich_mode,
             report_tau=self.report_tau,
             allow_neg_enr=self.allow_neg_enr,
             clip_nonfinite_vals=self.clip_nonfinite_vals,
             jack_mode=self.jack_mode,
             nan_policy=self.nan_policy,
+            weight_mode=self.weight_mode,
+            ldsc_m_annot=self.ldsc_m_annot,
+            ldsc_overlap_matrix=self.ldsc_overlap_matrix,
+            ldsc_source_nsnps=self.ldsc_source_nsnps,
+            ldsc_irwls_iters=self.ldsc_irwls_iters,
+            ldsc_irwls_tol=self.ldsc_irwls_tol,
         )
         _stage_stop("h2_trait2", t_stage)
 
@@ -411,7 +533,20 @@ class Sumcore:
             rg_se_method=self.rg_se_method,
             jack_mode=self.jack_mode,
             nan_policy=self.nan_policy,
+            weight_mode=self.weight_mode,
+            ldsc_m_annot=self.ldsc_m_annot,
+            ldsc_irwls_iters=self.ldsc_irwls_iters,
+            ldsc_irwls_tol=self.ldsc_irwls_tol,
         )
+        if self.log is not None and self.weight_mode == "ldsc":
+            info = rg_fit.weight_info or {}
+            self.log._log(
+                f"[rg:ldsc] constrained covariance IRWLS using M source "
+                f"'{self.ldsc_m_source}', weight LD source "
+                f"'{info.get('weight_ld_source', 'unknown')}', intercept source "
+                f"'{info.get('intercept_source', 'unknown')}', "
+                f"iterations={info.get('irwls_iters', 'NA')}."
+            )
         _stage_stop("fit_rg", t_stage)
 
         self.trace_view = tv
@@ -1208,47 +1343,6 @@ class Sumcore:
         return vals
 
 
-    @staticmethod
-    def _alleles_to_int(a):
-        a = np.asarray(a, dtype=str)
-        a = np.char.upper(a)
-        out = np.full(a.shape, -1, dtype=np.int8)
-        out[a == "A"] = 0
-        out[a == "C"] = 1
-        out[a == "G"] = 2
-        out[a == "T"] = 3
-        return out
-
-    def _allele_masks(self, a1_ref, a2_ref, a1, a2):
-        a1r = self._alleles_to_int(a1_ref)
-        a2r = self._alleles_to_int(a2_ref)
-        a1 = self._alleles_to_int(a1)
-        a2 = self._alleles_to_int(a2)
-
-        valid = (a1r >= 0) & (a2r >= 0) & (a1 >= 0) & (a2 >= 0)
-        amb = (
-            ((a1r == 0) & (a2r == 3)) |
-            ((a1r == 3) & (a2r == 0)) |
-            ((a1r == 1) & (a2r == 2)) |
-            ((a1r == 2) & (a2r == 1))
-        )
-
-        comp_map = np.array([3, 2, 1, 0], dtype=np.int8)
-        comp_a1 = np.where(a1 >= 0, comp_map[a1], -1)
-        comp_a2 = np.where(a2 >= 0, comp_map[a2], -1)
-
-        direct = (a1r == a1) & (a2r == a2)
-        strand = (a1r == comp_a1) & (a2r == comp_a2)
-        swapped = (a1r == a2) & (a2r == a1)
-        swapped_strand = (a1r == comp_a2) & (a2r == comp_a1)
-
-        flip = swapped | swapped_strand
-        match = direct | strand | swapped | swapped_strand
-        keep = valid & match
-        if self.drop_ambiguous:
-            keep = keep & (~amb)
-        return keep, flip
-
     def _apply_allele_alignment_filter(self, aligned1, aligned2, base_keep_mask):
         base_keep_mask = np.asarray(base_keep_mask, dtype=bool)
         idx = np.flatnonzero(base_keep_mask)
@@ -1257,11 +1351,12 @@ class Sumcore:
 
         pos1 = aligned1.pos_on_trace[idx]
         pos2 = aligned2.pos_on_trace[idx]
-        keep2, flip2 = self._allele_masks(
-            aligned1.sumstats.a1[pos1],
-            aligned1.sumstats.a2[pos1],
-            aligned2.sumstats.a1[pos2],
-            aligned2.sumstats.a2[pos2],
+        keep2, flip2 = harmonize_allele_codes(
+            aligned1.sumstats.a1_code[pos1],
+            aligned1.sumstats.a2_code[pos1],
+            aligned2.sumstats.a1_code[pos2],
+            aligned2.sumstats.a2_code[pos2],
+            drop_ambiguous=self.drop_ambiguous,
         )
         out = base_keep_mask.copy()
         out[idx] = keep2
@@ -1270,28 +1365,12 @@ class Sumcore:
         if self.log is not None:
             n_drop = int(np.sum(~keep2))
             n_flip = int(np.sum(flip_keep))
-            if n_drop > 0 or n_flip > 0:
-                self.log._log(
-                    f"Allele alignment: dropping {n_drop} SNPs (drop_ambiguous={self.drop_ambiguous}); "
-                    f"flipping trait 2 z for {n_flip} kept SNPs."
-                )
+            self.log._log(
+                f"Allele alignment: checked {idx.size} shared SNPs; dropping {n_drop} "
+                f"(drop_ambiguous={self.drop_ambiguous}); flipping trait 2 z/beta for "
+                f"{n_flip} kept SNPs."
+            )
         return out, flip_keep
-
-    @staticmethod
-    def _flip_matched_sumstats(matched: MatchedSumstats, flip_mask) -> MatchedSumstats:
-        flip_mask = np.asarray(flip_mask, dtype=bool)
-        if flip_mask.ndim != 1 or flip_mask.size != matched.nsnps:
-            raise ValueError("flip_mask length mismatch with MatchedSumstats.")
-        z = matched.z.copy()
-        z[flip_mask] *= -1.0
-        beta = matched.beta.copy()
-        beta[flip_mask] *= -1.0
-        a1 = matched.a1.copy()
-        a2 = matched.a2.copy()
-        tmp = a1[flip_mask].copy()
-        a1[flip_mask] = a2[flip_mask]
-        a2[flip_mask] = tmp
-        return replace(matched, z=z, beta=beta, a1=a1, a2=a2)
 
     def _derive_cov_rank_overrides_from_pheno(self):
         """

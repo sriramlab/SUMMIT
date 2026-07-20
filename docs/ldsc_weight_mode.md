@@ -2,14 +2,16 @@
 
 ## Scope
 
-`--weight-mode ldsc` changes the univariate h2 estimating instrument while
-retaining SUMMIT's summary-statistic moment. It is currently supported only by
-the ordinary `--h2` path. The default `--weight-mode he` is unchanged.
+`--weight-mode ldsc` changes the h2 and bivariate genetic-covariance estimating
+instruments while retaining SUMMIT's summary-statistic moments and nuisance-
+intercept semantics. It is supported by the ordinary `--h2` and single-pair
+`--rg` paths. The default `--weight-mode he` is unchanged.
 
-This mode does not change the rg/genetic-covariance estimator. In particular,
-`--intercept-weight-mode ldsc` controls only the bivariate nuisance-intercept
-fit and is not a main covariance-LDSC estimator. Fast cached h2 is also not yet
-wired to the LDSC path.
+`--intercept-weight-mode` remains a separate option: it controls how SUMMIT
+fits an unknown bivariate nuisance intercept, while `--weight-mode ldsc`
+controls the h2 and main genetic-covariance equations after that intercept has
+been resolved. Fast cached h2 and fast rg manifests are not yet wired to the
+LDSC path.
 
 ## Mean model and weighted estimating equation
 
@@ -48,6 +50,68 @@ columns as instruments, schematically
 
 whereas LDSC mode uses `W D` as the instrument. It therefore cannot be
 implemented by changing a scalar weight inside the existing HE normal equations.
+
+## Genetic covariance and rg
+
+For a pair of traits, let `z1*_j` and `z2*_j` be SUMMIT's score-scale
+statistics and let `c` be the nuisance intercept resolved by the existing
+SUMMIT intercept step. Define
+
+```text
+q12_j = z1*_j z2*_j - c,
+D12_jk = sqrt(n1* n2*) L_jk / M_k.
+```
+
+At each update the component genetic-covariance vector is
+
+```text
+gamma = (D12' W12 D12)^(-1) D12' W12 q12.
+```
+
+This solve also uses least squares on `sqrt(W12) D12`, with a full-rank SVD.
+Write `h1+`, `h2+`, and `gamma+` for the total h2 and covariance plug-ins from
+the current matching replicate, and define
+
+```text
+a_j = 1 + clip(h1+, 0, 1) n1* max(L_j+, 1) / M_+,
+b_j = 1 + clip(h2+, 0, 1) n2* max(L_j+, 1) / M_+,
+c_j = c + clip(gamma+, -1, 1) sqrt(n1* n2*) max(L_j+, 1) / M_+,
+w12_j = 1 / {max(Lw_j, 1) [a_j b_j + c_j^2]}.
+```
+
+The working variance `a_j b_j + c_j^2` is the Gaussian variance of the cross
+product `z1*_j z2*_j`. As for h2, flooring affects only the weight model, not
+the covariance design.
+
+SUMMIT deliberately does not refit `c` jointly with `gamma`. If `c` came from
+`--intercept-rg` or `--pheno-rg`, the established SUMMIT contract holds it
+fixed in every SNP jackknife replicate. If SUMMIT estimated `c` from summary
+statistics, covariance replicate `r` uses the corresponding intercept
+delete-refit `c_r`. Each covariance delete refit also uses the matching LDSC
+h2 delete estimates for both traits, then repeats covariance initialization
+and every IRWLS update. Thus the intercept is resolved exactly as in the
+default SUMMIT estimator; only the main h2 and covariance instruments change.
+
+Component and total genetic correlations are computed from the matched
+replicate estimates:
+
+```text
+rg_k     = gamma_k / sqrt(h1_k h2_k),
+rg_total = sum_k gamma_k / sqrt(h1_total h2_total).
+```
+
+For overlapping annotations, these per-column quantities retain SUMMIT's
+existing coefficient-component semantics: `gamma_k = M_k tau12_k`, and the
+component `rg_k` denominator uses the corresponding raw h2 coefficient
+components. They are not covariance or rg restricted to the SNP set carrying
+annotation `k`. A set-restricted covariance would instead require applying the
+full reference annotation-overlap matrix to `tau12`. The total covariance and
+total rg are unaffected by this distinction, and the output schema is kept
+consistent with SUMMIT's default HE estimator.
+
+Only jackknife SEs are currently supported. HE-specific robust, delta, and
+K-moment SE formulas are rejected rather than applied to a different
+estimating equation.
 
 ## IRWLS weights
 
@@ -90,6 +154,10 @@ multivariate least-squares estimate. This matches SUMMIT's experimental
 closed-form IRWLS implementation. It intentionally differs from historical
 `ldsc.py`, which freezes its initial weights for partitioned regression instead
 of continuing multivariate IRWLS.
+
+The covariance fit uses the analogous aggregate one-component initializer,
+with `n*` replaced by `sqrt(n1* n2*)` and `q` by `q12`. Its multicomponent
+initializer is likewise unweighted least squares.
 
 ## Fixed reference moments
 
@@ -146,4 +214,3 @@ the scalar `n*` used by the HE estimator. The two conventions coincide only in
 special cases, such as effectively constant sample size with equivalent score
 and Wald statistics. This mode should therefore be described as constrained
 score-scale LDSC-style IRWLS, not as package-identical LDSC.
-

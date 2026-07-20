@@ -58,6 +58,8 @@ class RGFit:
     rg_total: np.ndarray           # (2,)
     rg_se_method: str
     kmoment_info: dict | None = None
+    weight_mode: str = "he"
+    weight_info: dict | None = None
 
 
 def _component_rg(gamma, v1, v2):
@@ -110,6 +112,12 @@ class RGResultWriter:
     @staticmethod
     def save_score_normal_equations_json(fit: RGFit, path: str):
         from .h2core import H2ResultWriter
+
+        if str(getattr(fit, "weight_mode", "he")) != "he":
+            raise ValueError(
+                "HE/SCORE normal-equation export is unavailable for --weight-mode ldsc; "
+                "the LDSC covariance fit uses replicate-specific IRWLS weights."
+            )
 
         info = fit.intercept.info if isinstance(fit.intercept.info, dict) else {}
         n_overlap = info.get("n_overlap", None)
@@ -1109,7 +1117,38 @@ def fit_rg(
     rg_se_method: str = "jackknife",
     jack_mode: str = "mean",
     nan_policy: str = "omit",
+    weight_mode: str = "he",
+    ldsc_m_annot=None,
+    ldsc_irwls_iters: int = 3,
+    ldsc_irwls_tol: float = 0.0,
 ) -> RGFit:
+    weight_mode = str(weight_mode).strip().lower().replace("-", "_")
+    if weight_mode in {"summit", "score", "he_regression"}:
+        weight_mode = "he"
+    if weight_mode not in {"he", "ldsc"}:
+        raise ValueError("weight_mode must be one of {'he','ldsc'}")
+    if weight_mode == "ldsc":
+        if ldsc_m_annot is None:
+            raise ValueError("LDSC rg requires fixed full-reference annotation masses.")
+        if str(rg_se_method).strip().lower() != "jackknife":
+            raise ValueError(
+                "--weight-mode ldsc currently supports --rg-se-method jackknife only. "
+                "The HE robust, delta, and K-moment formulas do not apply to IRWLS."
+            )
+        from .ldsc_rg import fit_rg_ldsc
+
+        return fit_rg_ldsc(
+            prepared,
+            h2_fit1,
+            h2_fit2,
+            intercept_fit,
+            m_annot=ldsc_m_annot,
+            jack_mode=jack_mode,
+            nan_policy=nan_policy,
+            irwls_iters=ldsc_irwls_iters,
+            irwls_tol=ldsc_irwls_tol,
+        )
+
     p = prepared
     K = p.trace_view.nbins
     R = p.jackknife.nrep
@@ -1269,6 +1308,8 @@ def fit_rg(
         rg_total=rg_total,
         rg_se_method=rg_se_method,
         kmoment_info=kmoment_info,
+        weight_mode="he",
+        weight_info=None,
     )
 
 # -----------------------------------------------------------------------------

@@ -453,6 +453,26 @@ def test_weight_ld_alignment_retains_finite_values_below_one(tmp_path):
     assert values[2, 0] == pytest.approx(-0.4)
 
 
+def test_weight_ld_alignment_rejects_coordinate_mismatch(tmp_path):
+    frame = pd.DataFrame(
+        {
+            "CHR": [1, 2],
+            "SNP": ["rs1", "rs2"],
+            "BP": [100, 999],
+            "L2": [1.2, 1.4],
+        }
+    )
+    path = tmp_path / "bad_coordinates.ldscore.tsv"
+    frame.to_csv(path, sep="\t", index=False)
+    with pytest.raises(ValueError, match="CHR/BP mismatch"):
+        read_ldsc_weight_ld_aligned(
+            path,
+            ["rs1", "rs2"],
+            target_chr=[1, 2],
+            target_bp=[100, 200],
+        )
+
+
 def test_reference_moments_use_full_annotation_and_validate_m(tmp_path):
     annot = pd.DataFrame(
         {

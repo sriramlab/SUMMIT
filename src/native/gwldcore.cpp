@@ -778,6 +778,8 @@ static inline void mailman_pre_accum_groups_rowmajor(const CodeT* packed,
                                                      int blk_start,
                                                      int B,
                                                      T* meansq_accum,
+                                                     double* mc_aggregate_sumsq_local,
+                                                     double* mc_per_snp_sumsq,
                                                      Tacc* work_table,
                                                      Tacc* row_buf,
                                                      double extreme_ld_warn,
@@ -842,13 +844,25 @@ static inline void mailman_pre_accum_groups_rowmajor(const CodeT* packed,
             const double* svec = sum_rhs + (size_t)tcol;
             double sq = 0.0;
             double dot = 0.0;
+            double centered_fourth_sum = 0.0;
 #ifdef _OPENMP
             #pragma omp simd reduction(+:sq,dot)
 #endif
             for (int c = 0; c < len; ++c) {
                 const double w = (double)src[(size_t)c];
+                const double s = svec[(size_t)c];
                 sq += w * w;
-                dot += w * svec[(size_t)c];
+                dot += w * s;
+            }
+            if (mc_aggregate_sumsq_local || mc_per_snp_sumsq) {
+#ifdef _OPENMP
+                #pragma omp simd reduction(+:centered_fourth_sum)
+#endif
+                for (int c = 0; c < len; ++c) {
+                    const double centered = (double) src[(size_t)c] - mean * svec[(size_t)c];
+                    const double centered2 = centered * centered;
+                    centered_fourth_sum += centered2 * centered2;
+                }
             }
             double upd = alpha * sq + beta * dot + gamma * grp_sumsq[g];
             const Phase2GuardReason guard = phase2_guard_update(upd, (double) len, extreme_ld_warn);
@@ -859,6 +873,13 @@ static inline void mailman_pre_accum_groups_rowmajor(const CodeT* packed,
             }
             if (upd < 0.0) upd = 0.0;
             out[(size_t)k] += (T)upd;
+            if (mc_aggregate_sumsq_local || mc_per_snp_sumsq) {
+                const double sumsq = alpha * alpha * centered_fourth_sum;
+                if (mc_aggregate_sumsq_local)
+                    mc_aggregate_sumsq_local[(size_t) k] += sumsq;
+                if (mc_per_snp_sumsq)
+                    mc_per_snp_sumsq[(size_t) (blk_start + j) * (size_t) B + (size_t) k] += sumsq;
+            }
         }
     }
     if (local_nonfinite && nonfinite_updates)
@@ -2350,6 +2371,8 @@ static void phase2_accum_XtXz_chunk_impl(const std::string &bed_prefix,
                                          int tile_nvecs,
                                          nb_mat2f_ro<T> Xz2d,
                                          nb_mat2c_rw<T> meansq_accum,
+                                         nb::object mc_aggregate_sumsq_obj,
+                                         nb::object mc_per_snp_sumsq_obj,
                                          nb::object C_opt,
                                          nb::object R_opt,
                                          int N_denom,
@@ -2418,6 +2441,26 @@ static void phase2_accum_XtXz_chunk_impl(const std::string &bed_prefix,
     if (blk_end > (int) meansq_accum.shape(0))
         throw std::runtime_error("meansq_accum rows smaller than SNP count");
     T* Mptr = meansq_accum.data();
+
+    double* mc_aggregate_sumsq = nullptr;
+    nb_vec1_rw<double> mc_aggregate_sumsq_arr;
+    if (!mc_aggregate_sumsq_obj.is_none()) {
+        mc_aggregate_sumsq_arr = nb::cast<nb_vec1_rw<double>>(mc_aggregate_sumsq_obj);
+        if ((int) mc_aggregate_sumsq_arr.shape(0) != B)
+            throw std::runtime_error("mc_aggregate_sumsq length must equal the annotation count");
+        mc_aggregate_sumsq = mc_aggregate_sumsq_arr.data();
+    }
+
+    double* mc_per_snp_sumsq = nullptr;
+    nb_mat2c_rw<double> mc_per_snp_sumsq_arr;
+    if (!mc_per_snp_sumsq_obj.is_none()) {
+        mc_per_snp_sumsq_arr = nb::cast<nb_mat2c_rw<double>>(mc_per_snp_sumsq_obj);
+        if ((int) mc_per_snp_sumsq_arr.shape(0) != (int) meansq_accum.shape(0) ||
+            (int) mc_per_snp_sumsq_arr.shape(1) != B)
+            throw std::runtime_error("mc_per_snp_sumsq shape must match meansq_accum");
+        mc_per_snp_sumsq = mc_per_snp_sumsq_arr.data();
+    }
+    const bool compute_mc_sumsq = mc_aggregate_sumsq || mc_per_snp_sumsq;
 
     double denom = (double) N_denom - 1.0;
     if (denom <= 0.0)
@@ -2507,8 +2550,10 @@ static void phase2_accum_XtXz_chunk_impl(const std::string &bed_prefix,
         for (int i0 = 0; i0 < L; i0 += IBLK) {
             const int ib = std::min(IBLK, L - i0);
             AlignedBuffer<double>& acc_tls = phase2_acc_scratch();
-            if (acc_tls.n < (size_t) IBLK) acc_tls.allocate((size_t) IBLK, 64);
+            const size_t acc_need = compute_mc_sumsq ? (size_t) 2 * (size_t) IBLK : (size_t) IBLK;
+            if (acc_tls.n < acc_need) acc_tls.allocate(acc_need, 64);
             double* acc = acc_tls.ptr;
+            double* acc2 = compute_mc_sumsq ? (acc_tls.ptr + IBLK) : nullptr;
             unsigned long long local_nonfinite = 0;
             unsigned long long local_extreme = 0;
             double local_max_extreme_ld = -std::numeric_limits<double>::infinity();
@@ -2516,6 +2561,7 @@ static void phase2_accum_XtXz_chunk_impl(const std::string &bed_prefix,
                 const int k = seg_k[sidx], tcol = seg_tcol0[sidx], len = seg_len[sidx];
                 const double segment_scale = (double) len;
                 std::fill(acc, acc + ib, 0.0);
+                if (compute_mc_sumsq) std::fill(acc2, acc2 + ib, 0.0);
                 for (int c = 0; c < len; ++c) {
                     const T* wcol = Work + (size_t) (tcol + c) * (size_t) L + (size_t) i0;
 #ifdef _OPENMP
@@ -2526,9 +2572,24 @@ static void phase2_accum_XtXz_chunk_impl(const std::string &bed_prefix,
                         acc[ii] += w * w;
                     }
                 }
+                if (compute_mc_sumsq) {
+                    for (int c = 0; c < len; ++c) {
+                        const T* wcol = Work + (size_t) (tcol + c) * (size_t) L + (size_t) i0;
+#ifdef _OPENMP
+                        #pragma omp simd
+#endif
+                        for (int ii = 0; ii < ib; ++ii) {
+                            const double w = (double) wcol[ii];
+                            const double w2 = w * w;
+                            acc2[ii] += w2 * w2;
+                        }
+                    }
+                }
                 T* out = Mptr + ((size_t) (blk_start + i0) * (size_t) B + (size_t) k);
+                double aggregate_sumsq_update = 0.0;
                 for (int ii = 0; ii < ib; ++ii) {
-                    double upd = acc[ii] * left_scale[(size_t) (i0 + ii)];
+                    const double scale = left_scale[(size_t) (i0 + ii)];
+                    double upd = acc[ii] * scale;
                     const Phase2GuardReason guard = phase2_guard_update(upd, segment_scale, extreme_ld_warn);
                     if (guard != Phase2GuardReason::Keep) {
                         phase2_count_guard(guard, local_nonfinite, local_extreme,
@@ -2537,6 +2598,21 @@ static void phase2_accum_XtXz_chunk_impl(const std::string &bed_prefix,
                     }
                     if (upd < 0.0) upd = 0.0;
                     out[(size_t) ii * (size_t) B] += (T) upd;
+                    if (compute_mc_sumsq) {
+                        const double sumsq = acc2[ii] * scale * scale;
+                        aggregate_sumsq_update += sumsq;
+                        if (mc_per_snp_sumsq) {
+                            mc_per_snp_sumsq[
+                                (size_t) (blk_start + i0 + ii) * (size_t) B + (size_t) k
+                            ] += sumsq;
+                        }
+                    }
+                }
+                if (mc_aggregate_sumsq) {
+#ifdef _OPENMP
+                    #pragma omp atomic update
+#endif
+                    mc_aggregate_sumsq[(size_t) k] += aggregate_sumsq_update;
                 }
             }
             if (local_nonfinite)
@@ -2572,11 +2648,14 @@ void phase2_accum_XtXz_bed_impl(const std::string &bed_prefix,
                                 nb::object R_opt,
                                 int N_denom,
                                 const std::string& impute_mode_str,
-                                nb::object impute_seed_obj)
+                                nb::object impute_seed_obj,
+                                nb::object mc_aggregate_sumsq_obj,
+                                nb::object mc_per_snp_sumsq_obj)
 {
     phase2_accum_XtXz_chunk_impl<T>(
         bed_prefix, fam_path, blk_start, blk_end, row_sel_obj, ddof,
-        inv_left, tile_nvecs, Xz2d, meansq_accum, C_opt, R_opt, N_denom,
+        inv_left, tile_nvecs, Xz2d, meansq_accum,
+        mc_aggregate_sumsq_obj, mc_per_snp_sumsq_obj, C_opt, R_opt, N_denom,
         impute_mode_str, impute_seed_obj, nullptr, 0, 0
     );
 }
@@ -2590,13 +2669,16 @@ void phase2_accum_XtXz_geno_impl(nb_mat2f_rw<T> Geno,
                                  nb_mat2c_rw<T> meansq_accum,
                                  nb::object C_opt,
                                  nb::object R_opt,
-                                 int N_denom)
+                                 int N_denom,
+                                 nb::object mc_aggregate_sumsq_obj,
+                                 nb::object mc_per_snp_sumsq_obj)
 {
     const int N = (int) Geno.shape(0);
     const int L = (int) Geno.shape(1);
     phase2_accum_XtXz_chunk_impl<T>(
         "", "", blk_start, blk_start + L, nb::none(), 1,
-        inv_left, tile_nvecs, Xz2d, meansq_accum, C_opt, R_opt, N_denom,
+        inv_left, tile_nvecs, Xz2d, meansq_accum,
+        mc_aggregate_sumsq_obj, mc_per_snp_sumsq_obj, C_opt, R_opt, N_denom,
         "mean", nb::none(), Geno.data(), N, L
     );
 }
@@ -2614,7 +2696,9 @@ void phase2_accum_XtXz_bed_mailman_impl(const std::string &bed_prefix,
                                         nb::object C_opt,
                                         nb::object R_opt,
                                         int N_denom,
-                                        nb::object impute_seed_obj)
+                                        nb::object impute_seed_obj,
+                                        nb::object mc_aggregate_sumsq_obj,
+                                        nb::object mc_per_snp_sumsq_obj)
 {
     using Tacc = std::conditional_t<std::is_same_v<T, double>, double, float>;
 
@@ -2667,6 +2751,24 @@ void phase2_accum_XtXz_bed_mailman_impl(const std::string &bed_prefix,
     if (blk_end > (int) meansq_accum.shape(0))
         throw std::runtime_error("meansq_accum rows smaller than SNP count");
     T* Mptr = meansq_accum.data();
+
+    double* mc_aggregate_sumsq = nullptr;
+    nb_vec1_rw<double> mc_aggregate_sumsq_arr;
+    if (!mc_aggregate_sumsq_obj.is_none()) {
+        mc_aggregate_sumsq_arr = nb::cast<nb_vec1_rw<double>>(mc_aggregate_sumsq_obj);
+        if ((int) mc_aggregate_sumsq_arr.shape(0) != B)
+            throw std::runtime_error("mc_aggregate_sumsq length must equal the annotation count");
+        mc_aggregate_sumsq = mc_aggregate_sumsq_arr.data();
+    }
+    double* mc_per_snp_sumsq = nullptr;
+    nb_mat2c_rw<double> mc_per_snp_sumsq_arr;
+    if (!mc_per_snp_sumsq_obj.is_none()) {
+        mc_per_snp_sumsq_arr = nb::cast<nb_mat2c_rw<double>>(mc_per_snp_sumsq_obj);
+        if ((int) mc_per_snp_sumsq_arr.shape(0) != (int) meansq_accum.shape(0) ||
+            (int) mc_per_snp_sumsq_arr.shape(1) != B)
+            throw std::runtime_error("mc_per_snp_sumsq shape must match meansq_accum");
+        mc_per_snp_sumsq = mc_per_snp_sumsq_arr.data();
+    }
 
     double denom = (double) N_denom - 1.0;
     if (denom <= 0.0)
@@ -2747,6 +2849,9 @@ void phase2_accum_XtXz_bed_mailman_impl(const std::string &bed_prefix,
             if (raw_seg_tls.n < need_raw) raw_seg_tls.allocate(need_raw, 64);
             Tacc* work_table = work_table_tls.ptr;
             Tacc* raw_seg = raw_seg_tls.ptr;
+            std::vector<double> local_mc_aggregate(
+                mc_aggregate_sumsq ? (size_t) B : 0, 0.0
+            );
 
 #ifdef _OPENMP
             #pragma omp for schedule(static)
@@ -2782,6 +2887,7 @@ void phase2_accum_XtXz_bed_mailman_impl(const std::string &bed_prefix,
                         const double* sum_seg = sum_rhs + (size_t) tcol;
                         double sq = 0.0;
                         double dot = 0.0;
+                        double centered_fourth_sum = 0.0;
 #ifdef _OPENMP
                         #pragma omp simd reduction(+:sq,dot)
 #endif
@@ -2789,6 +2895,17 @@ void phase2_accum_XtXz_bed_mailman_impl(const std::string &bed_prefix,
                             const double w = (double) src[(size_t) (tcol + c)];
                             sq += w * w;
                             dot += w * sum_seg[(size_t) c];
+                        }
+                        if (mc_aggregate_sumsq || mc_per_snp_sumsq) {
+#ifdef _OPENMP
+                            #pragma omp simd reduction(+:centered_fourth_sum)
+#endif
+                            for (int c = 0; c < len; ++c) {
+                                const double centered =
+                                    (double) src[(size_t) (tcol + c)] - mean * sum_seg[(size_t) c];
+                                const double centered2 = centered * centered;
+                                centered_fourth_sum += centered2 * centered2;
+                            }
                         }
                         double upd = (sq - 2.0 * mean * dot + mean2 * seg_sumsq[sidx]) * row_scale;
                         const Phase2GuardReason guard = phase2_guard_update(upd, segment_scale, extreme_ld_warn);
@@ -2799,6 +2916,15 @@ void phase2_accum_XtXz_bed_mailman_impl(const std::string &bed_prefix,
                         }
                         if (upd < 0.0) upd = 0.0;
                         out[(size_t) k] += (T) upd;
+                        if (mc_aggregate_sumsq || mc_per_snp_sumsq) {
+                            const double sumsq = row_scale * row_scale * centered_fourth_sum;
+                            if (mc_aggregate_sumsq)
+                                local_mc_aggregate[(size_t) k] += sumsq;
+                            if (mc_per_snp_sumsq)
+                                mc_per_snp_sumsq[
+                                    (size_t) (blk_start + j) * (size_t) B + (size_t) k
+                                ] += sumsq;
+                        }
                     }
                 }
                 if (local_nonfinite)
@@ -2806,6 +2932,15 @@ void phase2_accum_XtXz_bed_mailman_impl(const std::string &bed_prefix,
                 if (local_extreme)
                     extreme_updates.fetch_add(local_extreme, std::memory_order_relaxed);
                 phase2_commit_max_extreme(local_max_extreme_ld, max_extreme_ld, max_extreme_mutex);
+            }
+            if (mc_aggregate_sumsq) {
+#ifdef _OPENMP
+                #pragma omp critical(gwld_mc_aggregate_reduce)
+#endif
+                {
+                    for (int k = 0; k < B; ++k)
+                        mc_aggregate_sumsq[(size_t) k] += local_mc_aggregate[(size_t) k];
+                }
             }
         }
     }
@@ -2828,7 +2963,9 @@ void phase2_accum_XtXz_bed_mailman_rm_impl(const std::string &bed_prefix,
                                            nb_mat2c_rw<T> meansq_accum,
                                            nb_vec1_ro<double> sum_Xz,
                                            int N_denom,
-                                           nb::object impute_seed_obj)
+                                           nb::object impute_seed_obj,
+                                           nb::object mc_aggregate_sumsq_obj,
+                                           nb::object mc_per_snp_sumsq_obj)
 {
     using Tacc = std::conditional_t<std::is_same_v<T, double>, double, float>;
 
@@ -2869,6 +3006,24 @@ void phase2_accum_XtXz_bed_mailman_rm_impl(const std::string &bed_prefix,
     if (blk_end > (int) meansq_accum.shape(0))
         throw std::runtime_error("meansq_accum rows smaller than SNP count");
     T* Mptr = meansq_accum.data();
+
+    double* mc_aggregate_sumsq = nullptr;
+    nb_vec1_rw<double> mc_aggregate_sumsq_arr;
+    if (!mc_aggregate_sumsq_obj.is_none()) {
+        mc_aggregate_sumsq_arr = nb::cast<nb_vec1_rw<double>>(mc_aggregate_sumsq_obj);
+        if ((int) mc_aggregate_sumsq_arr.shape(0) != B)
+            throw std::runtime_error("mc_aggregate_sumsq length must equal the annotation count");
+        mc_aggregate_sumsq = mc_aggregate_sumsq_arr.data();
+    }
+    double* mc_per_snp_sumsq = nullptr;
+    nb_mat2c_rw<double> mc_per_snp_sumsq_arr;
+    if (!mc_per_snp_sumsq_obj.is_none()) {
+        mc_per_snp_sumsq_arr = nb::cast<nb_mat2c_rw<double>>(mc_per_snp_sumsq_obj);
+        if ((int) mc_per_snp_sumsq_arr.shape(0) != (int) meansq_accum.shape(0) ||
+            (int) mc_per_snp_sumsq_arr.shape(1) != B)
+            throw std::runtime_error("mc_per_snp_sumsq shape must match meansq_accum");
+        mc_per_snp_sumsq = mc_per_snp_sumsq_arr.data();
+    }
 
     double denom = (double) N_denom - 1.0;
     if (denom <= 0.0)
@@ -2942,6 +3097,9 @@ void phase2_accum_XtXz_bed_mailman_rm_impl(const std::string &bed_prefix,
             if (row_buf_tls.n < need_row) row_buf_tls.allocate(need_row, 64);
             Tacc* work_table = work_table_tls.ptr;
             Tacc* row_buf = row_buf_tls.ptr;
+            std::vector<double> local_mc_aggregate(
+                mc_aggregate_sumsq ? (size_t) B : 0, 0.0
+            );
 
 #ifdef _OPENMP
             #pragma omp for schedule(static)
@@ -2956,6 +3114,8 @@ void phase2_accum_XtXz_bed_mailman_rm_impl(const std::string &bed_prefix,
                                                                          grp_k.data(), grp_tcol0.data(), grp_len.data(), grp_sumsq.data(), (int) grp_k.size(),
                                                                          left_scale.data(), pack.mean.data(),
                                                                          base, blk_start, B, Mptr,
+                                                                         (mc_aggregate_sumsq ? local_mc_aggregate.data() : nullptr),
+                                                                         mc_per_snp_sumsq,
                                                                          work_table, row_buf,
                                                                          extreme_ld_warn, drop_extreme_updates,
                                                                          &nonfinite_updates, &extreme_updates,
@@ -2967,10 +3127,21 @@ void phase2_accum_XtXz_bed_mailman_rm_impl(const std::string &bed_prefix,
                                                                          grp_k.data(), grp_tcol0.data(), grp_len.data(), grp_sumsq.data(), (int) grp_k.size(),
                                                                          left_scale.data(), pack.mean.data(),
                                                                          base, blk_start, B, Mptr,
+                                                                         (mc_aggregate_sumsq ? local_mc_aggregate.data() : nullptr),
+                                                                         mc_per_snp_sumsq,
                                                                          work_table, row_buf,
                                                                          extreme_ld_warn, drop_extreme_updates,
                                                                          &nonfinite_updates, &extreme_updates,
                                                                          &max_extreme_ld, &max_extreme_mutex);
+                }
+            }
+            if (mc_aggregate_sumsq) {
+#ifdef _OPENMP
+                #pragma omp critical(gwld_mc_aggregate_reduce)
+#endif
+                {
+                    for (int k = 0; k < B; ++k)
+                        mc_aggregate_sumsq[(size_t) k] += local_mc_aggregate[(size_t) k];
                 }
             }
         }
@@ -3584,39 +3755,49 @@ NB_MODULE(gwldcore, m) {
           nb::arg("bed_prefix"), nb::arg("fam_path"), nb::arg("blk_start"), nb::arg("blk_end"), nb::arg("row_sel") = nb::none(),
           nb::arg("ddof") = 1, nb::arg("inv_left"), nb::arg("tile_nvecs"), nb::arg("Xz2d"), nb::arg("meansq_accum"),
           nb::arg("C") = nb::none(), nb::arg("R") = nb::none(), nb::arg("N_denom") = 0,
-          nb::arg("impute_mode") = "hwe", nb::arg("impute_seed") = nb::none());
+          nb::arg("impute_mode") = "hwe", nb::arg("impute_seed") = nb::none(),
+          nb::arg("mc_aggregate_sumsq") = nb::none(), nb::arg("mc_per_snp_sumsq") = nb::none());
     m.def("phase2_accum_XtXz_bed", &phase2_accum_XtXz_bed_impl<double>,
           nb::arg("bed_prefix"), nb::arg("fam_path"), nb::arg("blk_start"), nb::arg("blk_end"), nb::arg("row_sel") = nb::none(),
           nb::arg("ddof") = 1, nb::arg("inv_left"), nb::arg("tile_nvecs"), nb::arg("Xz2d"), nb::arg("meansq_accum"),
           nb::arg("C") = nb::none(), nb::arg("R") = nb::none(), nb::arg("N_denom") = 0,
-          nb::arg("impute_mode") = "hwe", nb::arg("impute_seed") = nb::none());
+          nb::arg("impute_mode") = "hwe", nb::arg("impute_seed") = nb::none(),
+          nb::arg("mc_aggregate_sumsq") = nb::none(), nb::arg("mc_per_snp_sumsq") = nb::none());
 
     m.def("phase2_accum_XtXz_geno", &phase2_accum_XtXz_geno_impl<float>,
           nb::arg("Geno"), nb::arg("blk_start"), nb::arg("inv_left"), nb::arg("tile_nvecs"),
-          nb::arg("Xz2d"), nb::arg("meansq_accum"), nb::arg("C") = nb::none(), nb::arg("R") = nb::none(),
-          nb::arg("N_denom") = 0);
+          nb::arg("Xz2d"), nb::arg("meansq_accum"),
+          nb::arg("C") = nb::none(), nb::arg("R") = nb::none(),
+          nb::arg("N_denom") = 0,
+          nb::arg("mc_aggregate_sumsq") = nb::none(), nb::arg("mc_per_snp_sumsq") = nb::none());
     m.def("phase2_accum_XtXz_geno", &phase2_accum_XtXz_geno_impl<double>,
           nb::arg("Geno"), nb::arg("blk_start"), nb::arg("inv_left"), nb::arg("tile_nvecs"),
-          nb::arg("Xz2d"), nb::arg("meansq_accum"), nb::arg("C") = nb::none(), nb::arg("R") = nb::none(),
-          nb::arg("N_denom") = 0);
+          nb::arg("Xz2d"), nb::arg("meansq_accum"),
+          nb::arg("C") = nb::none(), nb::arg("R") = nb::none(),
+          nb::arg("N_denom") = 0,
+          nb::arg("mc_aggregate_sumsq") = nb::none(), nb::arg("mc_per_snp_sumsq") = nb::none());
 
     m.def("phase2_accum_XtXz_bed_mailman", &phase2_accum_XtXz_bed_mailman_impl<float>,
           nb::arg("bed_prefix"), nb::arg("fam_path"), nb::arg("blk_start"), nb::arg("blk_end"), nb::arg("row_sel") = nb::none(),
           nb::arg("ddof") = 1, nb::arg("inv_left"), nb::arg("tile_nvecs"), nb::arg("Xz2d"), nb::arg("meansq_accum"),
-          nb::arg("C") = nb::none(), nb::arg("R") = nb::none(), nb::arg("N_denom") = 0, nb::arg("impute_seed") = nb::none());
+          nb::arg("C") = nb::none(), nb::arg("R") = nb::none(), nb::arg("N_denom") = 0, nb::arg("impute_seed") = nb::none(),
+          nb::arg("mc_aggregate_sumsq") = nb::none(), nb::arg("mc_per_snp_sumsq") = nb::none());
     m.def("phase2_accum_XtXz_bed_mailman", &phase2_accum_XtXz_bed_mailman_impl<double>,
           nb::arg("bed_prefix"), nb::arg("fam_path"), nb::arg("blk_start"), nb::arg("blk_end"), nb::arg("row_sel") = nb::none(),
           nb::arg("ddof") = 1, nb::arg("inv_left"), nb::arg("tile_nvecs"), nb::arg("Xz2d"), nb::arg("meansq_accum"),
-          nb::arg("C") = nb::none(), nb::arg("R") = nb::none(), nb::arg("N_denom") = 0, nb::arg("impute_seed") = nb::none());
+          nb::arg("C") = nb::none(), nb::arg("R") = nb::none(), nb::arg("N_denom") = 0, nb::arg("impute_seed") = nb::none(),
+          nb::arg("mc_aggregate_sumsq") = nb::none(), nb::arg("mc_per_snp_sumsq") = nb::none());
 
     m.def("phase2_accum_XtXz_bed_mailman_rowmajor", &phase2_accum_XtXz_bed_mailman_rm_impl<float>,
           nb::arg("bed_prefix"), nb::arg("fam_path"), nb::arg("blk_start"), nb::arg("blk_end"), nb::arg("row_sel") = nb::none(),
           nb::arg("ddof") = 1, nb::arg("inv_left"), nb::arg("tile_nvecs"), nb::arg("Xz2d"), nb::arg("meansq_accum"),
-          nb::arg("sum_Xz"), nb::arg("N_denom") = 0, nb::arg("impute_seed") = nb::none());
+          nb::arg("sum_Xz"), nb::arg("N_denom") = 0, nb::arg("impute_seed") = nb::none(),
+          nb::arg("mc_aggregate_sumsq") = nb::none(), nb::arg("mc_per_snp_sumsq") = nb::none());
     m.def("phase2_accum_XtXz_bed_mailman_rowmajor", &phase2_accum_XtXz_bed_mailman_rm_impl<double>,
           nb::arg("bed_prefix"), nb::arg("fam_path"), nb::arg("blk_start"), nb::arg("blk_end"), nb::arg("row_sel") = nb::none(),
           nb::arg("ddof") = 1, nb::arg("inv_left"), nb::arg("tile_nvecs"), nb::arg("Xz2d"), nb::arg("meansq_accum"),
-          nb::arg("sum_Xz"), nb::arg("N_denom") = 0, nb::arg("impute_seed") = nb::none());
+          nb::arg("sum_Xz"), nb::arg("N_denom") = 0, nb::arg("impute_seed") = nb::none(),
+          nb::arg("mc_aggregate_sumsq") = nb::none(), nb::arg("mc_per_snp_sumsq") = nb::none());
 
     m.def("compute_block_corrections_binary", &compute_block_corrections_binary_impl<float>,
           nb::arg("meansq_raw"), nb::arg("mu22"), nb::arg("annot_all"), nb::arg("N"), nb::arg("d"));

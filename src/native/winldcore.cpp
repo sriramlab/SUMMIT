@@ -406,9 +406,9 @@ static inline void syrk_col_major_upper(int n,
                 n, k, alpha, A, lda, beta, C, ldc);
 }
 
-static inline void unbiased_r2_inplace(double* buf, size_t n, int N_rows)
+static inline void unbiased_r2_inplace(double* buf, size_t n, int corr_dim)
 {
-    const double denom = (N_rows > 2) ? (double)(N_rows - 2) : (double)std::max(1, N_rows);
+    const double denom = (double)(corr_dim - 1);
     for (ptrdiff_t i = 0; i < (ptrdiff_t)n; ++i) {
         const double r = buf[(size_t)i];
         double r2 = r * r;
@@ -417,9 +417,9 @@ static inline void unbiased_r2_inplace(double* buf, size_t n, int N_rows)
     }
 }
 
-static inline void unbiased_r2_upper_inplace(double* buf, int L, int N_rows)
+static inline void unbiased_r2_upper_inplace(double* buf, int L, int corr_dim)
 {
-    const double denom = (N_rows > 2) ? (double)(N_rows - 2) : (double)std::max(1, N_rows);
+    const double denom = (double)(corr_dim - 1);
     for (int j = 0; j < L; ++j) {
         double* col = buf + (size_t)j * (size_t)L;
         for (int i = 0; i <= j; ++i) {
@@ -427,6 +427,52 @@ static inline void unbiased_r2_upper_inplace(double* buf, int L, int N_rows)
             double r2 = r * r;
             r2 -= (1.0 - r2) / denom;
             col[(size_t)i] = r2;
+        }
+    }
+}
+
+static inline bool outside_bp_window(int64_t bp1, int64_t bp2, double window_bp)
+{
+    const long double delta = std::fabs(
+        (long double)bp1 - (long double)bp2
+    );
+    return delta > (long double)window_bp;
+}
+
+static inline void mask_cross_window_inplace(double* buf,
+                                             int Ll,
+                                             int Lr,
+                                             const int64_t* bp,
+                                             int left_local,
+                                             int right_local,
+                                             double window_bp)
+{
+    for (int j = 0; j < Lr; ++j) {
+        double* col = buf + (size_t)j * (size_t)Ll;
+        const int64_t bp_right = bp[(size_t)(right_local + j)];
+        for (int i = 0; i < Ll; ++i) {
+            if (outside_bp_window(
+                    bp[(size_t)(left_local + i)], bp_right, window_bp)) {
+                col[(size_t)i] = 0.0;
+            }
+        }
+    }
+}
+
+static inline void mask_upper_window_inplace(double* buf,
+                                             int L,
+                                             const int64_t* bp,
+                                             int local,
+                                             double window_bp)
+{
+    for (int j = 0; j < L; ++j) {
+        double* col = buf + (size_t)j * (size_t)L;
+        const int64_t bp_right = bp[(size_t)(local + j)];
+        for (int i = 0; i <= j; ++i) {
+            if (outside_bp_window(
+                    bp[(size_t)(local + i)], bp_right, window_bp)) {
+                col[(size_t)i] = 0.0;
+            }
         }
     }
 }
@@ -440,6 +486,9 @@ static void accum_cross_panels(int chr_global_start,
                                int ld_ld,
                                int B,
                                int N_rows,
+                               int corr_dim,
+                               const int64_t* bp,
+                               double window_bp,
                                AlignedBuffer<double>& cross)
 {
     const int Ll = left.L();
@@ -457,7 +506,10 @@ static void accum_cross_panels(int chr_global_start,
                               cross.ptr, Ll,
                               1.0 / (double)N_rows,
                               0.0);
-    unbiased_r2_inplace(cross.ptr, need, N_rows);
+    unbiased_r2_inplace(cross.ptr, need, corr_dim);
+    mask_cross_window_inplace(
+        cross.ptr, Ll, Lr, bp, left_local, right_local, window_bp
+    );
 
     gemm_col_major_nn<double>(Ll, B, Lr,
                               cross.ptr, Ll,
@@ -480,6 +532,9 @@ static void accum_self_panel(int chr_global_start,
                              int ld_ld,
                              int B,
                              int N_rows,
+                             int corr_dim,
+                             const int64_t* bp,
+                             double window_bp,
                              AlignedBuffer<double>& cross)
 {
     const int L = panel.L();
@@ -494,7 +549,8 @@ static void accum_self_panel(int chr_global_start,
                          cross.ptr, L,
                          1.0 / (double)N_rows,
                          0.0);
-    unbiased_r2_upper_inplace(cross.ptr, L, N_rows);
+    unbiased_r2_upper_inplace(cross.ptr, L, corr_dim);
+    mask_upper_window_inplace(cross.ptr, L, bp, local, window_bp);
 
     static thread_local AlignedBuffer<double> sumj_tls;
     if (sumj_tls.n < (size_t)B) sumj_tls.allocate((size_t)B, 64);
@@ -553,13 +609,13 @@ static std::vector<std::shared_ptr<PreparedPanel>> load_interval_panels(Prepared
     return panels;
 }
 
-static std::vector<int> compute_block_left(const int64_t* bp, int m, double ld_wind_kb)
+static std::vector<int> compute_block_left(const int64_t* bp, int m, double window_bp)
 {
     std::vector<int> left((size_t)m, 0);
     int j = 0;
     for (int i = 0; i < m; ++i) {
-        const double ci = (double)bp[(size_t)i] / 1000.0;
-        while (j < i && (ci - (double)bp[(size_t)j] / 1000.0) > ld_wind_kb) ++j;
+        while (j < i && outside_bp_window(
+                bp[(size_t)i], bp[(size_t)j], window_bp)) ++j;
         left[(size_t)i] = j;
     }
     return left;
@@ -620,16 +676,13 @@ static size_t auto_cache_bytes(int cache_mb)
 
         const size_t avail = available_memory_bytes();
         if (avail == 0) {
-            return 4ULL * 1024ULL * 1024ULL * 1024ULL;
+            return 1ULL * 1024ULL * 1024ULL * 1024ULL;
         }
 
         const size_t one_gib = 1024ULL * 1024ULL * 1024ULL;
-        const size_t thirty_two_gib = 32ULL * one_gib;
-        const size_t half_avail = avail / 2ULL;
-        size_t target = avail / 4ULL;
-        if (target < one_gib) target = one_gib;
-        if (target > thirty_two_gib) target = thirty_two_gib;
-        if (target > half_avail && half_avail > 0) target = half_avail;
+        const size_t four_gib = 4ULL * one_gib;
+        size_t target = avail / 8ULL;
+        if (target > four_gib) target = four_gib;
         return target;
     }
     if (cache_mb == 0) return 0;
@@ -644,6 +697,9 @@ static void accum_logic_tile_self_panels(int chr_global_start,
                                          int ld_ld,
                                          int B,
                                          int N_rows,
+                                         int corr_dim,
+                                         const int64_t* bp,
+                                         double window_bp,
                                          AlignedBuffer<double>& cross)
 {
     const int np = (int)panels.size();
@@ -651,12 +707,12 @@ static void accum_logic_tile_self_panels(int chr_global_start,
         const auto& right = *panels[(size_t)rp];
         accum_self_panel(chr_global_start, right,
                          annot_ptr, annot_ld, ld_ptr, ld_ld,
-                         B, N_rows, cross);
+                         B, N_rows, corr_dim, bp, window_bp, cross);
         for (int lp = 0; lp < rp; ++lp) {
             const auto& left = *panels[(size_t)lp];
             accum_cross_panels(chr_global_start, left, right,
                                annot_ptr, annot_ld, ld_ptr, ld_ld,
-                               B, N_rows, cross);
+                               B, N_rows, corr_dim, bp, window_bp, cross);
         }
     }
 }
@@ -670,6 +726,9 @@ static void accum_logic_tile_cross_panels(int chr_global_start,
                                           int ld_ld,
                                           int B,
                                           int N_rows,
+                                          int corr_dim,
+                                          const int64_t* bp,
+                                          double window_bp,
                                           AlignedBuffer<double>& cross)
 {
     for (const auto& right_sp : right_panels) {
@@ -678,7 +737,7 @@ static void accum_logic_tile_cross_panels(int chr_global_start,
             const auto& left = *left_sp;
             accum_cross_panels(chr_global_start, left, right,
                                annot_ptr, annot_ld, ld_ptr, ld_ld,
-                               B, N_rows, cross);
+                               B, N_rows, corr_dim, bp, window_bp, cross);
         }
     }
 }
@@ -693,7 +752,10 @@ static void accum_all_pairs_interval(PreparedPanelCache& cache,
                                      double* ld_ptr,
                                      int ld_ld,
                                      int B,
-                                     int N_rows)
+                                     int N_rows,
+                                     int corr_dim,
+                                     const int64_t* bp,
+                                     double window_bp)
 {
     const int ntiles = ceil_div_i(interval_len, logic_chunk_size);
     AlignedBuffer<double> cross;
@@ -703,14 +765,16 @@ static void accum_all_pairs_interval(PreparedPanelCache& cache,
         const int t1 = std::min(interval_len, t0 + logic_chunk_size);
         auto t_panels = load_interval_panels(cache, chr_global_start, t0, t1, panel_cols);
         accum_logic_tile_self_panels(chr_global_start, t_panels,
-                                     annot_ptr, annot_ld, ld_ptr, ld_ld, B, N_rows, cross);
+                                     annot_ptr, annot_ld, ld_ptr, ld_ld, B, N_rows, corr_dim,
+                                     bp, window_bp, cross);
         for (int a = 0; a < t; ++a) {
             const int a0 = a * logic_chunk_size;
             const int a1 = std::min(interval_len, a0 + logic_chunk_size);
             auto a_panels = load_interval_panels(cache, chr_global_start, a0, a1, panel_cols);
             accum_logic_tile_cross_panels(chr_global_start,
                                           a_panels, t_panels,
-                                          annot_ptr, annot_ld, ld_ptr, ld_ld, B, N_rows, cross);
+                                          annot_ptr, annot_ld, ld_ptr, ld_ld, B, N_rows, corr_dim,
+                                          bp, window_bp, cross);
         }
         progress_step();
     }
@@ -740,6 +804,9 @@ static nb_numpy_mat2f<double> compute_windowed_ld_chr_impl(
         throw std::runtime_error("Chromosome slice is empty");
     if (chunk_size <= 0)
         throw std::runtime_error("chunk_size must be > 0");
+    const double window_bp = ld_wind_kb * 1000.0;
+    if (!std::isfinite(window_bp) || window_bp <= 0.0)
+        throw std::runtime_error("ld_wind_kb must define a finite positive BP window");
 
     const int ntiles = ceil_div_i(m, chunk_size);
     ProgressScope progress(ntiles);
@@ -783,6 +850,9 @@ static nb_numpy_mat2f<double> compute_windowed_ld_chr_impl(
         Cptr = Carr.data();
         Rptr = Rarr.data();
     }
+    const int corr_dim = N_rows - ((p > 0) ? p : 1);
+    if (corr_dim <= 1)
+        throw std::runtime_error("Too few residual dimensions for unbiased windowed r^2 correction");
 
     const size_t cache_bytes = auto_cache_bytes(cache_mb);
     panel_cols = auto_panel_cols(N_rows, chunk_size, panel_cols, cache_bytes);
@@ -791,7 +861,7 @@ static nb_numpy_mat2f<double> compute_windowed_ld_chr_impl(
     auto ld_out = make_owned_numpy_mat2f<double>((size_t) m, (size_t) B, &ld_ptr);
     std::fill(ld_ptr, ld_ptr + (size_t) m * (size_t) B, 0.0);
 
-    const std::vector<int> left = compute_block_left(bp_ptr, m, ld_wind_kb);
+    const std::vector<int> left = compute_block_left(bp_ptr, m, window_bp);
     int first_pos = -1;
     for (int i = 0; i < m; ++i) {
         if (left[(size_t) i] > 0) {
@@ -822,13 +892,15 @@ static nb_numpy_mat2f<double> compute_windowed_ld_chr_impl(
 
     if (b0 >= m) {
         accum_all_pairs_interval(cache, chr_start, m, chunk_size, panel_cols,
-                                 annot_ptr, m, ld_ptr, m, B, N_rows);
+                                 annot_ptr, m, ld_ptr, m, B, N_rows, corr_dim,
+                                 bp_ptr, window_bp);
         progress.completed = true;
         return ld_out;
     }
 
     accum_all_pairs_interval(cache, chr_start, b0, chunk_size, panel_cols,
-                             annot_ptr, m, ld_ptr, m, B, N_rows);
+                             annot_ptr, m, ld_ptr, m, B, N_rows, corr_dim,
+                             bp_ptr, window_bp);
 
     const int prefix_tiles = b0 / chunk_size;
     AlignedBuffer<double> cross;
@@ -845,10 +917,12 @@ static nb_numpy_mat2f<double> compute_windowed_ld_chr_impl(
             auto a_panels = load_interval_panels(cache, chr_start, a0, a1, panel_cols);
             accum_logic_tile_cross_panels(chr_start,
                                           a_panels, t_panels,
-                                          annot_ptr, m, ld_ptr, m, B, N_rows, cross);
+                                          annot_ptr, m, ld_ptr, m, B, N_rows, corr_dim,
+                                          bp_ptr, window_bp, cross);
         }
         accum_logic_tile_self_panels(chr_start, t_panels,
-                                     annot_ptr, m, ld_ptr, m, B, N_rows, cross);
+                                     annot_ptr, m, ld_ptr, m, B, N_rows, corr_dim,
+                                     bp_ptr, window_bp, cross);
         progress_step();
     }
 

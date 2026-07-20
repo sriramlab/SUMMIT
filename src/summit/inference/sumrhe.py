@@ -128,6 +128,7 @@ class Sumrhe:
                 trace_annot=self.trace.annot,
                 trace_header=self.trace.annot_header,
                 m_override=m_override,
+                unpartitioned_source_nsnps=getattr(self.trace, "source_nsnps", None),
             )
             self.ldsc_m_annot = reference.m_annot
             self.ldsc_overlap_matrix = reference.overlap_matrix
@@ -137,6 +138,8 @@ class Sumrhe:
                 self.ldsc_weight_ld, self.ldsc_weight_present = read_ldsc_weight_ld_aligned(
                     ldscores_w,
                     self.trace.snps,
+                    target_chr=self.trace.chr,
+                    target_bp=self.trace.bp,
                 )
                 n_missing = int(np.sum(~self.ldsc_weight_present))
                 if self.log is not None:

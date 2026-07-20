@@ -13,6 +13,15 @@ from tqdm import tqdm
 
 from .. import utils
 from .gw_ldscore import apply_env
+from .genotype_source import (
+    PgenBlockReader,
+    read_aligned_annotations,
+    read_fam_sample_ids,
+    read_psam_sample_ids,
+    read_pvar_variants,
+    resolve_genotype_input,
+    validate_variant_metadata,
+)
 
 
 
@@ -111,7 +120,7 @@ def _orthonormalize_columns(X: np.ndarray, tol: float = 1e-10) -> np.ndarray:
 
 def read_env_and_cov(
     env_filename: str,
-    fam_filename: str,
+    fam_filename: str | None,
     cov_filename: str | None = None,
     std: bool = True,
     cov_impute_method: str = "ignore",
@@ -119,13 +128,25 @@ def read_env_and_cov(
     verbose: bool = False,
     sample_idx=None,
     ddof: int = 1,
+    sample_ids: pd.DataFrame | None = None,
 ):
-    fam = pd.read_csv(fam_filename, sep=r"\s+", header=None, usecols=[0, 1], names=["FID", "IID"])
+    if sample_ids is None:
+        if fam_filename is None:
+            raise ValueError("fam_filename or sample_ids must be provided.")
+        fam = read_fam_sample_ids(fam_filename)
+    else:
+        fam = pd.DataFrame(sample_ids)[["FID", "IID"]].copy()
+    fam[["FID", "IID"]] = fam[["FID", "IID"]].astype(str)
     if sample_idx is not None:
         sample_idx = np.asarray(sample_idx, dtype=int)
         fam = fam.iloc[sample_idx].reset_index(drop=True)
 
-    env = pd.read_csv(env_filename, sep=r"\s+")
+    env = pd.read_csv(
+        env_filename,
+        sep=r"\s+",
+        dtype={"FID": str, "IID": str},
+        keep_default_na=False,
+    )
     if "FID" not in env.columns or "IID" not in env.columns:
         raise ValueError("Environment file must contain FID and IID columns.")
     if env.duplicated(subset=["FID", "IID"]).any():
@@ -146,7 +167,12 @@ def read_env_and_cov(
 
     cov_cols: list[str] = []
     if cov_filename is not None:
-        cov = pd.read_csv(cov_filename, sep=r"\s+")
+        cov = pd.read_csv(
+            cov_filename,
+            sep=r"\s+",
+            dtype={"FID": str, "IID": str},
+            keep_default_na=False,
+        )
         if "FID" not in cov.columns or "IID" not in cov.columns:
             raise ValueError("Covariate file must contain FID and IID columns.")
         if cov.duplicated(subset=["FID", "IID"]).any():
@@ -281,17 +307,38 @@ class GenomewideEnvLDScore:
         impute_method: str = "mean",
     ):
         self.eps_var = float(eps_var)
-        prefix = _canonical_bfile_prefix(bed_path)
-        self.bed_prefix = os.path.abspath(prefix)
-        self.fam_path = self.bed_prefix + ".fam"
-        self.bim_path = self.bed_prefix + ".bim"
+        self.genotype_input = resolve_genotype_input(bed_path)
+        self.genotype_format = self.genotype_input.format
+        self.genotype_prefix = self.genotype_input.prefix
+        self.bed_prefix = self.genotype_prefix if self.genotype_format == "bed" else None
+        self.fam_path = self.genotype_input.sample_path if self.genotype_format == "bed" else None
+        self.bim_path = self.genotype_input.variant_path if self.genotype_format == "bed" else None
+        self.pgen_path = self.genotype_input.genotype_path if self.genotype_format == "pgen" else None
+        self.pvar_path = self.genotype_input.variant_path if self.genotype_format == "pgen" else None
+        self.psam_path = self.genotype_input.sample_path if self.genotype_format == "pgen" else None
+        self._pgen_reader = None
         self.env_path = str(env_path)
         self.covar_path = covar_path
 
-        self.G = open_bed(self.bed_prefix + ".bed")
-        self.nsamp_total, self.nsnps = self.G.shape
+        if self.genotype_format == "bed":
+            self.G = open_bed(self.genotype_input.genotype_path)
+            self.nsamp_total, self.nsnps = self.G.shape
+            self.sample_ids = read_fam_sample_ids(self.fam_path)
+            self.snplist = None
+        else:
+            self.G = None
+            self.sample_ids = read_psam_sample_ids(self.psam_path)
+            self.snplist = validate_variant_metadata(
+                read_pvar_variants(self.pvar_path), source=f"PVAR '{self.pvar_path}'"
+            )
+            self.nsamp_total = int(len(self.sample_ids))
+            self.nsnps = int(len(self.snplist))
         self.nvecs = int(num_vecs)
         self.step_size = int(step_size)
+        if self.nvecs <= 0:
+            raise ValueError("num_vecs must be positive.")
+        if self.step_size <= 0:
+            raise ValueError("step_size must be positive.")
         self.log = log
         self.verbose = bool(verbose)
         self.rand_dist = str(rand_dist).strip().lower()
@@ -301,7 +348,7 @@ class GenomewideEnvLDScore:
         self.device = str(device).strip().lower()
         self.impute_method = str(impute_method).strip().lower()
         if self.impute_method != "mean":
-            raise ValueError("The current Python GxE LD-score implementation supports only impute_method='mean'.")
+            raise ValueError("GxE LD-score estimation supports only impute_method='mean'.")
         if self.device != "cpu":
             self.log._log(f"[gxe] device='{device}' requested, but this Python implementation is CPU-only. Falling back to CPU.")
             self.device = "cpu"
@@ -347,7 +394,10 @@ class GenomewideEnvLDScore:
             sel_idx = np.sort(self.rng.choice(base_idx, size=k, replace=False))
             self.log._log(f"Randomly subsampling individuals: {k}/{self.nsamp_total} ({k / self.nsamp_total:.1%})")
 
-        self._read_bim(self.bim_path)
+        if self.genotype_format == "bed":
+            self._read_bim(self.bim_path)
+        else:
+            self.log._log(f"Reading {self.pvar_path} for variants")
         self._read_annot(annot_path)
 
         env_vec, env_name, C_int, cov_R_int, keep_idx_global, cov_cols = read_env_and_cov(
@@ -360,6 +410,7 @@ class GenomewideEnvLDScore:
             verbose=self.verbose,
             sample_idx=sel_idx if sel_idx is not None else None,
             ddof=self.ddof,
+            sample_ids=self.sample_ids,
         )
         self.row_sel = np.asarray(keep_idx_global, dtype=int)
         self.env = np.asarray(env_vec, dtype=np.float64)
@@ -392,6 +443,22 @@ class GenomewideEnvLDScore:
                 f"[env] Included {len(self.cov_cols)} user covariate column(s) together with the environment main effect in the projection."
             )
 
+        if self.genotype_format == "pgen":
+            self._pgen_reader = PgenBlockReader(
+                pgen_path=self.pgen_path,
+                raw_sample_ct=self.nsamp_total,
+                variant_ct=self.nsnps,
+                sample_subset=self.row_sel,
+                step_size=self.step_size,
+                dtype=np.float64,
+                ddof=self.ddof,
+                standardize_threads=self.num_threads,
+            )
+            self.log._log(
+                f"[gxe][pgen] Persistent streamed REF-dosage reader ready: "
+                f"buffer={self._pgen_reader.block_capacity}x{self.nsamp}."
+            )
+
     def _read_bim(self, bim_path):
         if bim_path is None:
             self.log._log("No .bim file is provided; all (anonymous) SNPs will be used")
@@ -401,8 +468,13 @@ class GenomewideEnvLDScore:
         self.snplist = pd.read_csv(bim_path, header=None, sep=r"\s+")
         self.snplist.columns = ["CHR", "SNP", "CM", "BP", "A1", "A2"]
         if len(self.snplist) != self.nsnps:
-            self.log._log(f"!!! The number of SNPs in the .bed file ({self.nsnps}) does not match the .bim file ({len(self.snplist)}) !!!")
-            sys.exit(1)
+            raise ValueError(
+                f"The number of SNPs in the .bed file ({self.nsnps}) does not match "
+                f"the .bim file ({len(self.snplist)})."
+            )
+        self.snplist = validate_variant_metadata(
+            self.snplist, source=f"BIM '{bim_path}'"
+        )
 
     def _read_annot(self, annot_path):
         if annot_path is None:
@@ -416,64 +488,14 @@ class GenomewideEnvLDScore:
             self.log._log(f"Number of total SNPs: {self.nsnps}, annotation shape: {self.annot.shape}")
             return
 
-        parsed_ldsc = False
-        try:
-            df = pd.read_csv(annot_path, sep=r"\s+", compression="infer", dtype={"CHR": str, "BP": np.int64, "SNP": str, "CM": float})
-            base_cols = {"CHR", "BP", "SNP", "CM"}
-            if base_cols.issubset(set(df.columns)) and "SNP" in df.columns:
-                annot_cols = [c for c in df.columns if c not in base_cols]
-                if len(annot_cols) == 0:
-                    raise ValueError("No annotation columns found after [CHR,BP,SNP,CM].")
-                bim_snps = self.snplist.iloc[:, 1].astype(str).tolist()
-                ann_snps = df["SNP"].astype(str).tolist()
-                if ann_snps == bim_snps:
-                    ann_mat = df[annot_cols].to_numpy(dtype=np.float64, copy=False)
-                else:
-                    ann_set = set(ann_snps)
-                    bim_set = set(bim_snps)
-                    missing_in_annot = len(bim_set - ann_set)
-                    extra_in_annot = len(ann_set - bim_set)
-                    if missing_in_annot > 0:
-                        raise ValueError(
-                            f"Annotation SNP set is missing {missing_in_annot} BIM SNP(s); prepare a matching .annot or regenerate it to the .bim."
-                        )
-                    if extra_in_annot > 0:
-                        self.log._log(f"[info] Annotation contains {extra_in_annot} extra SNP(s) not in BIM; keeping BIM SNPs only and reordering to BIM.")
-                    ann_mat = df.set_index("SNP").loc[bim_snps, annot_cols].to_numpy(dtype=np.float64, copy=False)
-                np.nan_to_num(ann_mat, copy=False)
-                if (ann_mat < 0).any():
-                    self.log._log("[warn] Negative annotation values found; clipping to 0.")
-                    ann_mat[ann_mat < 0] = 0.0
-                uniq = np.unique(ann_mat)
-                self.is_continuous = not np.all(np.isin(uniq, [0.0, 1.0]))
-                self.annot = ann_mat
-                self.nbins = self.annot.shape[1]
-                self.l2cols = annot_cols
-                parsed_ldsc = True
-                self.log._log(f"Read LDSC-style annotation with shape {self.annot.shape}")
-        except Exception:
-            parsed_ldsc = False
-
-        if not parsed_ldsc:
-            self.l2cols, arr = utils._read_with_optional_header(annot_path)
-            if arr.ndim == 1:
-                arr = arr.reshape(-1, 1)
-            arr = arr.astype(np.float64, copy=False)
-            np.nan_to_num(arr, copy=False)
-            if (arr < 0).any():
-                self.log._log("[warn] Negative annotation values found; clipping to 0.")
-                arr[arr < 0] = 0.0
-            uniq = np.unique(arr)
-            self.is_continuous = not np.all(np.isin(uniq, [0.0, 1.0]))
-            self.annot = arr
-            if self.l2cols is None:
-                self.l2cols = [f"L2_{i}" for i in range(self.annot.shape[1])]
-            self.nbins = self.annot.shape[1]
-            self.log._log(f"Read thin annotation matrix with shape {self.annot.shape}")
-
-        if self.annot.shape[0] != self.nsnps:
-            self.log._log(f"!!! number of SNPs in annotation ({self.annot.shape[0]}) does not match the input genotype file ({self.nsnps}) !!!")
-            sys.exit(1)
+        self.l2cols, self.annot, self.is_continuous = read_aligned_annotations(
+            annot_path,
+            self.snplist,
+            log=self.log,
+            source_label=("BIM" if self.genotype_format == "bed" else "PVAR"),
+        )
+        self.nbins = int(self.annot.shape[1])
+        self.log._log(f"Read aligned annotation matrix with shape {self.annot.shape}")
 
         self.nsnps_bin = self.annot.sum(axis=0, dtype=np.float64)
         self.annot = np.ascontiguousarray(self.annot.astype(self.dtype, copy=False))
@@ -484,29 +506,37 @@ class GenomewideEnvLDScore:
         return [(s, min(self.nsnps, s + self.step_size)) for s in range(0, self.nsnps, self.step_size)]
 
     def _read_genotype_block(self, blk_start: int, blk_end: int) -> np.ndarray:
-        indexer = np.s_[self.row_sel, blk_start:blk_end]
-        try:
-            G = self.G.read(index=indexer, dtype=np.float64)
-        except TypeError:
+        if self.genotype_format == "pgen":
+            if self._pgen_reader is None:
+                raise RuntimeError("PGEN reader is closed.")
+            G = self._pgen_reader.read_standardized_block(blk_start, blk_end)
+        else:
+            indexer = np.s_[self.row_sel, blk_start:blk_end]
             try:
-                G = self.G.read(index=indexer)
+                G = self.G.read(index=indexer, dtype=np.float64)
             except TypeError:
-                G = self.G.read(indexer)
-            G = np.asarray(G, dtype=np.float64)
+                try:
+                    G = self.G.read(index=indexer)
+                except TypeError:
+                    G = self.G.read(indexer)
 
         G = np.asarray(G, dtype=np.float64)
         if G.shape == (blk_end - blk_start, self.nsamp):
             G = G.T
         if G.shape != (self.nsamp, blk_end - blk_start):
             raise RuntimeError(
-                f"Unexpected bed-reader block shape {G.shape} for block [{blk_start}:{blk_end}); expected ({self.nsamp}, {blk_end - blk_start})."
+                f"Unexpected genotype block shape {G.shape} for block [{blk_start}:{blk_end}); "
+                f"expected ({self.nsamp}, {blk_end - blk_start})."
             )
 
-        col_means = np.nanmean(G, axis=0)
-        bad_means = ~np.isfinite(col_means)
-        if np.any(bad_means):
-            col_means[bad_means] = 0.0
         mask = np.isnan(G)
+        nobs = G.shape[0] - mask.sum(axis=0, dtype=np.int64)
+        col_means = np.divide(
+            np.nansum(G, axis=0, dtype=np.float64),
+            nobs,
+            out=np.zeros(G.shape[1], dtype=np.float64),
+            where=nobs > 0,
+        )
         if mask.any():
             rr, cc = np.where(mask)
             G[rr, cc] = col_means[cc]
@@ -518,6 +548,18 @@ class GenomewideEnvLDScore:
         if np.any(~good):
             G[:, ~good] = 0.0
         return np.asarray(G, dtype=np.float64, order="F")
+
+    def close(self) -> None:
+        reader = getattr(self, "_pgen_reader", None)
+        if reader is not None:
+            reader.close()
+            self._pgen_reader = None
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except Exception:
+            pass
 
     def _project_and_center_inplace(self, M: np.ndarray) -> np.ndarray:
         if self.p_eff > 0:
@@ -616,7 +658,11 @@ class GenomewideEnvLDScore:
 
     def _accumulate_sketch_block(self, U_chunk: np.ndarray, W: np.ndarray, Z: np.ndarray, annot_blk: np.ndarray) -> None:
         if self.nbins == 1:
-            U_chunk[:, : Z.shape[1]] += W @ Z
+            wk = np.sqrt(np.maximum(annot_blk[:, 0], 0.0))
+            if np.all(wk == 1.0):
+                U_chunk[:, : Z.shape[1]] += W @ Z
+            elif np.any(wk):
+                U_chunk[:, : Z.shape[1]] += (W * wk.reshape(1, -1)) @ Z
             return
         sqrt_annot = np.sqrt(np.maximum(annot_blk, 0))
         for k in range(self.nbins):
@@ -717,9 +763,14 @@ class GenomewideEnvLDScore:
         meansq_xw = meansq_xw_accum / float(self.nvecs)
         meansq_ww = meansq_ww_accum / float(self.nvecs)
 
-        # Match the current GW-LD implementation style: subtract the correlation null M_k / N_eff.
-        null_corr = self.nsnps_bin.reshape(1, -1) / float(self.N_eff)
-        self.log._log(f"Applying correlation null subtraction M_k / N_eff with N_eff={self.N_eff} to both XW and WW sketches.")
+        # X and W are normalized so X'X = W'W = df_corr. For independent
+        # isotropic residual directions in that d-dimensional space,
+        # E[r^2] = 1/d; use the same divisor as the correlations themselves.
+        null_corr = self.nsnps_bin.reshape(1, -1) / float(self.df_corr)
+        self.log._log(
+            f"Applying correlation null subtraction M_k / df_corr with "
+            f"df_corr={self.df_corr} to both XW and WW sketches."
+        )
         meansq_xw -= null_corr
         meansq_ww -= null_corr
 
@@ -735,6 +786,15 @@ class GenomewideEnvLDScore:
 
         self._log_score_summary("XW / .gxe LD scores", self.gxe_ldscore)
         self._log_score_summary("WW / .gee LD scores", self.gee_ldscore)
+
+        if self.genotype_format == "pgen" and self._pgen_reader is not None:
+            seconds = float(self._pgen_reader.decode_seconds)
+            rate = self._pgen_reader.variants_read / seconds if seconds > 0.0 else float("nan")
+            self.log._log(
+                f"[gxe][pgen] Decode/standardize totals: blocks={self._pgen_reader.blocks_read}, "
+                f"variant-records={self._pgen_reader.variants_read}, seconds={seconds:.3f}, "
+                f"rate={rate:.1f} variant-records/s."
+            )
 
         try:
             col_sums = pd.Series(self.nsnps_bin, index=self.l2cols)
