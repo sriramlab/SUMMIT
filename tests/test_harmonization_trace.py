@@ -223,7 +223,8 @@ def test_trace_indexed_joins_preserve_values_when_coordinates_agree(tmp_path):
     np.testing.assert_allclose(trace.annot[:, 0], [1.0, 2.0])
 
 
-def test_fast_manifest_harmonization_matches_prealigned_effects(tmp_path):
+@pytest.mark.parametrize("multi_model", [False, True])
+def test_fast_manifest_harmonization_matches_prealigned_effects(tmp_path, multi_model):
     m = 60
     chrom = np.repeat([1, 2, 3], m // 3)
     bp = np.arange(1, m + 1) * 100
@@ -276,6 +277,16 @@ def test_fast_manifest_harmonization_matches_prealigned_effects(tmp_path):
         trait2: {"phen": "t2", "cov_rank": None},
         swapped: {"phen": "t2_swapped", "cov_rank": None},
     }
+    model_manifest = None
+    if multi_model:
+        model_manifest = _write_table(
+            tmp_path / "models.tsv",
+            {
+                "model": ["m1", "m2"],
+                "bins": ["base", "base"],
+                "aliases": ["base", "base"],
+            },
+        )
     args = SimpleNamespace(
         adjust_delta=False,
         align_alleles=True,
@@ -293,6 +304,8 @@ def test_fast_manifest_harmonization_matches_prealigned_effects(tmp_path):
         njack="chr",
         out=str(tmp_path / "fast_out"),
         rg_se_method="jackknife",
+        rg_model_manifest=model_manifest,
+        rg_fast_no_pair_logs=multi_model,
         verbose=False,
         write_jack=False,
         write_normeq=False,
@@ -304,10 +317,13 @@ def test_fast_manifest_harmonization_matches_prealigned_effects(tmp_path):
         "n_snps", "h2_trait1", "h2_trait1_se", "h2_trait2", "h2_trait2_se",
         "gamma_g_total", "gamma_g_total_se", "rg_total", "rg_total_se",
     ]
-    np.testing.assert_allclose(
-        result.loc[0, cols].to_numpy(dtype=float),
-        result.loc[1, cols].to_numpy(dtype=float),
-        rtol=0.0,
-        atol=1e-12,
-        equal_nan=True,
-    )
+    groups = result.groupby("model", sort=False) if multi_model else [("default", result)]
+    for _model, group in groups:
+        group = group.reset_index(drop=True)
+        np.testing.assert_allclose(
+            group.loc[0, cols].to_numpy(dtype=float),
+            group.loc[1, cols].to_numpy(dtype=float),
+            rtol=0.0,
+            atol=1e-12,
+            equal_nan=True,
+        )

@@ -523,7 +523,11 @@ class WindowedLDScore:
 
         self.start_time = utils._get_time()
         self.log._log("Windowed LD score calculation started at: " + utils._get_timestr(self.start_time))
-        self.log._log(f"[win][backend] C++ core enabled (impute={self.impute_method}, impute_seed={self.impute_seed})")
+        backend = "native C++ BED" if self.genotype_format == "bed" else "streamed PGEN/NumPy"
+        self.log._log(
+            f"[win][backend] {backend} (impute={self.impute_method}, "
+            f"impute_seed={self.impute_seed})"
+        )
 
         rng = np.random.default_rng(self.root_seed)
         self.row_sel = _parse_rand_samp(rand_samp, self.nsamp0, rng)

@@ -331,6 +331,38 @@ The fast path requires finite `intercept_rg` values in the manifest and currentl
 supports jackknife SEs only. Omit `--rg-manifest-fast` when you need the regular
 per-pair path or summary-estimated intercepts.
 
+For many models that share annotation columns, such as baseline plus one focal
+cell-type annotation, place every unique column in one union annotation/LD-score
+pair and provide a model manifest:
+
+```text
+model  bins                                    aliases
+ct_001 ["base","Coding","CT001_H3K4me1"]    ["base","Coding","focal"]
+ct_002 ["base","Coding","CT002_H3K4me1"]    ["base","Coding","focal"]
+```
+
+Then run all models in one process:
+
+```bash
+summit \
+  --rg outs/rg_manifest.tsv \
+  --rg-manifest-fast \
+  --rg-model-manifest models.tsv \
+  --ldscores baseline_celltypes.union.gw.ldscore.gz \
+  --annot baseline_celltypes.union.annot.gz \
+  --out outs/rg_celltypes \
+  --njack chr
+```
+
+`bins` and `aliases` accept JSON string lists or comma-separated names. Every
+model must have the same ordered aliases so the combined output has a stable
+schema; the output includes a `model` column. SUMMIT loads and aligns traits
+once, computes union SNP sufficient statistics once, and then fits each selected
+model independently. The selected columns and their order therefore define the
+same estimator as separate invocations on each model. When consolidating
+existing per-cell-type traces, verify that their shared baseline annotation and
+LD-score columns are identical before retaining one shared copy.
+
 ## Example Scripts
 
 The `example/` directory contains small, runnable scripts. The bundled summary
