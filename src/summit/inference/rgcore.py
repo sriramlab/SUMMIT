@@ -275,6 +275,7 @@ def build_manifest_summary_row(
         "gamma_g_total_se": float(rg_fit.gamma_total[1]),
         "rg_total": float(rg_fit.rg_total[0]),
         "rg_total_se": float(rg_fit.rg_total[1]),
+        "estimator": str((rg_fit.weight_info or {}).get("estimator", "he")),
     }
 
     for j, header in enumerate(annot_header):
@@ -2066,6 +2067,8 @@ def fit_intercept(
     info["regression_design_mode"] = regsys.mode
     info["regression_ncoef"] = P
     info["weight_mode"] = mode
+    info["fixed"] = False
+    info["source"] = "summit_intercept_regression"
     info["summary_y_mode"] = None if summary_y_info is None else str(summary_y_info.get("mode", "unknown"))
     info["trait1_n_scale"] = n1_scalar
     info["trait2_n_scale"] = n2_scalar

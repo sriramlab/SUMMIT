@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 from dataclasses import replace
+import os
 from types import SimpleNamespace
 
 import numpy as np
 import pandas as pd
 import pytest
 
+from summit import cli as summit_cli
+from summit.cli import _normalize_rg_manifest
 from summit.inference.jackknife import JackknifeDesign, JackknifeSpec
 from summit.inference.ldsc_rg import fit_constrained_cov_ldsc_irwls
 from summit.inference.rgcore import InterceptFit, fit_rg
@@ -566,6 +569,157 @@ def _write_sumcore_ldsc_fixture(tmp_path):
         sign=-1.0,
     )
     return ld_path, annot_path, weight_path, trait1, trait2, trait2_negative
+
+
+def test_regular_rg_manifest_allows_mixed_fixed_and_estimated_intercepts(tmp_path):
+    paths = {}
+    for name in ("trait1", "trait2", "trait3"):
+        path = tmp_path / f"{name}.tsv"
+        path.write_text("SNP\nrs1\n", encoding="utf-8")
+        paths[name] = path
+
+    manifest = tmp_path / "mixed_manifest.tsv"
+    pd.DataFrame(
+        [
+            {
+                "phen1": "trait1",
+                "phen2": "trait2",
+                "sumstats1": paths["trait1"],
+                "sumstats2": paths["trait2"],
+                "intercept_rg": np.nan,
+            },
+            {
+                "phen1": "trait1",
+                "phen2": "trait3",
+                "sumstats1": paths["trait1"],
+                "sumstats2": paths["trait3"],
+                "intercept_rg": 0.125,
+            },
+        ]
+    ).to_csv(manifest, sep="\t", index=False)
+
+    normalized, _ = _normalize_rg_manifest(
+        str(manifest), require_intercept=False
+    )
+    assert np.isnan(normalized.loc[0, "intercept_rg"])
+    assert normalized.loc[1, "intercept_rg"] == pytest.approx(0.125)
+
+    with pytest.raises(ValueError, match="intercept_rg must be finite"):
+        _normalize_rg_manifest(str(manifest), require_intercept=True)
+
+
+@pytest.mark.parametrize("bad_intercept", ["not-a-number", "inf", "-inf"])
+def test_rg_manifest_rejects_invalid_present_intercept(tmp_path, bad_intercept):
+    trait1 = tmp_path / "trait1.tsv"
+    trait2 = tmp_path / "trait2.tsv"
+    trait1.write_text("SNP\nrs1\n", encoding="utf-8")
+    trait2.write_text("SNP\nrs1\n", encoding="utf-8")
+    manifest = tmp_path / "bad_manifest.tsv"
+    pd.DataFrame(
+        [
+            {
+                "phen1": "trait1",
+                "phen2": "trait2",
+                "sumstats1": trait1,
+                "sumstats2": trait2,
+                "intercept_rg": bad_intercept,
+            }
+        ]
+    ).to_csv(manifest, sep="\t", index=False)
+
+    with pytest.raises(ValueError, match="intercept_rg must be"):
+        _normalize_rg_manifest(str(manifest), require_intercept=False)
+
+
+def test_regular_manifest_cov_ldsc_estimates_intercept_and_harmonizes_alleles(
+    tmp_path, monkeypatch
+):
+    ld_path, annot_path, weight_path, trait1, trait2, _ = (
+        _write_sumcore_ldsc_fixture(tmp_path)
+    )
+
+    trait2_swapped = tmp_path / "trait2_swapped.tsv"
+    swapped = pd.read_csv(trait2, sep="\t")
+    swapped[["A1", "A2"]] = swapped[["A2", "A1"]].to_numpy()
+    swapped["BETA"] = -swapped["BETA"]
+    swapped.to_csv(trait2_swapped, sep="\t", index=False)
+
+    manifest = tmp_path / "rg_manifest.tsv"
+    pd.DataFrame(
+        [
+            {
+                "phen1": "trait1",
+                "phen2": "trait2_swapped",
+                "sumstats1": trait1,
+                "sumstats2": trait2_swapped,
+            }
+        ]
+    ).to_csv(manifest, sep="\t", index=False)
+
+    direct = Sumcore(
+        rg=f"{trait1},{trait2}",
+        ldscores=str(ld_path),
+        ldscores_w=str(weight_path),
+        annot=str(annot_path),
+        njack="chr",
+        chisq_threshold=None,
+        intercept_chisq_thr=None,
+        align_alleles=True,
+        weight_mode="ldsc",
+        ldsc_irwls_iters=3,
+    )._run()
+
+    outdir = tmp_path / "manifest_out"
+    monkeypatch.setenv("SUMMIT_NUMACTL_WRAPPED", "1")
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "summit",
+            "--rg",
+            str(manifest),
+            "--ldscores",
+            str(ld_path),
+            "--ldscores-w",
+            str(weight_path),
+            "--annot",
+            str(annot_path),
+            "--weight-mode",
+            "ldsc",
+            "--njack",
+            "chr",
+            "--align-alleles",
+            "--write-jack",
+            "--out",
+            str(outdir),
+            "--suppress",
+        ],
+    )
+    summit_cli.main()
+
+    observed = pd.read_csv(outdir / "manifest.results.tsv", sep="\t").iloc[0]
+    assert pd.isna(observed["intercept_rg_input"])
+    assert observed["estimator"] == "constrained_cov_ldsc_irwls"
+    expected = {
+        "h2_trait1": direct["h2_fit1"].h2[-1, 0],
+        "h2_trait1_se": direct["h2_fit1"].h2[-1, 1],
+        "h2_trait2": direct["h2_fit2"].h2[-1, 0],
+        "h2_trait2_se": direct["h2_fit2"].h2[-1, 1],
+        "intercept_c": direct["intercept"].c[0],
+        "intercept_c_se": direct["intercept"].c[1],
+        "gamma_g_total": direct["rg_fit"].gamma_total[0],
+        "gamma_g_total_se": direct["rg_fit"].gamma_total[1],
+        "rg_total": direct["rg_fit"].rg_total[0],
+        "rg_total_se": direct["rg_fit"].rg_total[1],
+    }
+    for column, value in expected.items():
+        np.testing.assert_allclose(observed[column], value, rtol=2e-12, atol=2e-12)
+
+    pair_prefix = str(observed["out_prefix"])
+    assert os.path.exists(pair_prefix + ".rg.jack")
+    with open(pair_prefix + ".log", encoding="utf-8") as handle:
+        pair_log = handle.read()
+    assert "constrained score-scale cov-LDSC IRWLS" in pair_log
+    assert "intercept source 'summit_intercept_regression'" in pair_log
 
 
 def test_sumcore_ldsc_rg_uses_fitted_summit_intercept_delete_refits(tmp_path):

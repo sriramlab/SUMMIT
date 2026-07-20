@@ -6,6 +6,10 @@
 univariate h2 analyses that share one LD-score/annotation model. It does not
 change the default h2, rg, manifest-rg, or LD-score-generation paths.
 
+Fast h2 currently supports the default HE/SUMMIT estimator only. Use regular
+`--h2` for constrained score-scale LDSC (`--weight-mode ldsc`). Fast mode also
+rejects `--chisq-action clip`; use `drop`, `warn`, or `none`.
+
 Fast mode currently requires chromosome jackknife (`--njack chr[:...]`). A
 contiguous block jackknife is deliberately rejected because the legacy mode
 rebuilds block boundaries after trait-specific SNP filtering. Reusing fixed

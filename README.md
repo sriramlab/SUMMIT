@@ -16,9 +16,11 @@ moments.
 - Optional GxE LD scores with `--env`; SUMMIT writes both additive-interaction
   cross-LD and interaction-interaction LD scores.
 - Heritability estimation from `BETA`/`SE` summary statistics.
-- Optional score-scale constrained LDSC-style IRWLS for h2 and bivariate
-  genetic covariance/rg via `--weight-mode ldsc`; the default remains
-  SUMMIT/HE.
+- Exact chromosome-jackknife batched h2 with an optional reusable binary cache.
+- `--weight-mode ldsc` fits constrained score-scale LDSC-style IRWLS for h2
+  and constrained score-scale cov-LDSC IRWLS for genetic covariance; rg is
+  formed from matched covariance and h2 refits. These modes retain SUMMIT's
+  intercept semantics and are not literal `ldsc.py`; the default remains HE.
 - Genetic correlation estimation with either a fixed overlap intercept or a
   summary-estimated intercept.
 - Batch genetic-correlation manifests, including a sparse fast path for
@@ -119,6 +121,9 @@ one complete genotype trio:
   deterministic windowed, and GxE estimators for biallelic diploid variants.
   The PVAR must be plain text rather than `.pvar.zst`.
 
+SUMMIT does not read BGEN directly. Convert BGEN input to a biallelic diploid
+PGEN/PVAR/PSAM trio first.
+
 For PGEN input, SUMMIT bulk-decodes stored REF-allele dosages into one reusable
 variant-block buffer, mean-imputes missing dosage values, and standardizes each
 variant over the retained samples. Thus the target is LD in the decoded dosage
@@ -195,6 +200,7 @@ summit \
 ```
 
 This writes `*.win.ldscore.gz`, `*.win.M`, and `*.win.M_5_50`.
+An explicit `.pgen` can replace `.bed`; PGEN uses mean-imputed dosages.
 
 ### GxE LD scores
 
@@ -211,6 +217,7 @@ summit \
 
 The environment file must contain `FID`, `IID`, and exactly one environment
 column. SUMMIT writes `*.gxe.ldscore.gz` and `*.gee.ldscore.gz`.
+An explicit `.pgen` can replace `.bed`; PGEN uses mean-imputed dosages.
 
 ### Heritability
 
@@ -227,7 +234,13 @@ summit \
 `--h2` can also be a directory of summary-statistic files or a chromosome-split
 path spec. Results are written to `<out>.results.tsv` and `<out>.log`.
 
-To replace the default HE estimating instrument with score-scale constrained
+For large trait collections sharing one LD-score/annotation model,
+`--h2-batch-fast` reuses exact chromosome-unit sufficient statistics and can
+reuse cached score moments via `--h2-cache-dir`. This path is HE-only, requires
+`--njack chr[:...]`, and rejects `--chisq-action clip`; see
+[Fast batched h2](docs/fast_h2_batch.md).
+
+To replace the default HE estimating instrument with constrained score-scale
 LDSC-style IRWLS:
 
 ```bash
@@ -244,10 +257,13 @@ summit \
 
 The one-column `--ldscores-w` file is recommended, especially for overlapping
 annotations. If it is omitted, SUMMIT uses the row sum of the primary LD-score
-columns. LDSC mode reruns IRWLS inside every delete block and is currently
-available for ordinary `--h2` and single-pair/regular-manifest `--rg`, but not
-fast cached h2 or fast rg manifests. See
-[Score-scale constrained LDSC weighting](docs/ldsc_weight_mode.md).
+columns. In rg analyses the same flag fits both h2 denominator models and the
+constrained cov-LDSC covariance numerator. `--intercept-weight-mode` controls
+only the separate summary-estimated `c` fit; it does not enable cov-LDSC.
+IRWLS is rerun inside every delete block. This mode is available for ordinary
+`--h2` and single-pair/regular-manifest `--rg`, but not fast cached h2 or fast
+rg manifests. See
+[Constrained score-scale LDSC and cov-LDSC](docs/ldsc_weight_mode.md).
 
 ### Genetic Correlation With a Fixed Intercept
 
@@ -276,8 +292,8 @@ column. Covariate files must have `FID IID` followed by covariates.
 ### Genetic Correlation With a Summary-Estimated Intercept
 
 When `--intercept-rg` and `--pheno-rg` are omitted, SUMMIT estimates the
-cross-trait intercept from summary statistics first, then plugs it into the
-SCORE normal equations.
+cross-trait intercept from summary statistics first, then passes it to the
+selected main covariance equation: HE/SCORE or constrained cov-LDSC.
 
 The intercept regression LD scores must be one-dimensional. If the primary
 analysis uses partitioned LD scores, provide a separate scalar `--ldscores-reg`
@@ -290,16 +306,56 @@ summit \
   --ldscores-reg ref.total.gw.ldscore.gz \
   --annot mafld.annot.gz \
   --align-alleles \
-  --out outs/trait1.trait2.unconstrained \
+  --out outs/trait1.trait2.summary_intercept \
   --njack chr
 ```
 
-SUMMIT uses a scalar LD score for the unconstrained rg intercept fit. A 1D
+SUMMIT uses a scalar LD score for the summary-estimated intercept fit. A 1D
 `--ldscores-reg` file is preferred. If a multi-column regression LD file is
 provided, SUMMIT collapses it to total LD by default; this is valid only when
 the LD-score columns are non-overlapping, such as a disjoint MAF-LD partition.
 For overlapping annotations, precompute or provide a genuine scalar regression
 LD score instead.
+
+### Constrained cov-LDSC Genetic Covariance and rg
+
+Use `--weight-mode ldsc` to fit constrained score-scale LDSC for both trait h2
+models and constrained score-scale cov-LDSC for genetic covariance. For
+example, with a fixed zero cross-trait intercept:
+
+```bash
+summit \
+  --rg trait1.sumstats.gz,trait2.sumstats.gz \
+  --intercept-rg 0 \
+  --ldscores ref.mafld.gw.ldscore.gz \
+  --ldscores-w ref.regression.l2.ldscore.gz \
+  --ldsc-m ref.mafld.gw.M \
+  --annot mafld.annot.gz \
+  --weight-mode ldsc \
+  --out outs/trait1.trait2.cov_ldsc \
+  --njack chr
+```
+
+“Constrained” refers to the intercept: the h2 null intercept is fixed at one,
+and bivariate `c` is fixed or estimated by SUMMIT before the main covariance
+fit rather than jointly with its coefficients. It does not constrain h2 or
+covariance coefficients to be nonnegative. rg is calculated from the matched
+covariance and h2 full/delete estimates, not fitted by a separate regression.
+
+### rg Allele Harmonization
+
+Allele validation and alignment are enabled by default in single-pair,
+regular-manifest, fast-manifest, and multi-model rg. Named `A1/A2` or `ALT/REF`
+columns are required. Direct, swapped, strand-complement, and swapped-
+complement orientations are handled vectorially, with trait-2 effects flipped
+only when needed.
+
+Harmonization currently accepts A/C/G/T alleles. Invalid labels, equal alleles,
+incompatible pairs, and strand-ambiguous A/T or C/G SNPs are dropped by
+default. `--keep-ambiguous` uses literal allele-label orientation and does not
+infer strand from allele frequency; EAF-assisted resolution is not implemented.
+Use `--no-align-alleles` only for inputs already guaranteed to have identical
+orientation.
 
 ### Batch rg Manifests
 
@@ -327,9 +383,16 @@ summit \
   --njack chr
 ```
 
-The fast path requires finite `intercept_rg` values in the manifest and currently
-supports jackknife SEs only. Omit `--rg-manifest-fast` when you need the regular
-per-pair path or summary-estimated intercepts.
+Regular manifests may mix finite fixed `intercept_rg` values with omitted
+values; omitted values use SUMMIT's summary-estimated intercept and matching
+delete refits. The fast path requires a finite fixed `intercept_rg` in every
+row, uses HE weighting and jackknife SEs only, and does not support
+`--adjust-delta` or normal-equation dumps. With chromosome jackknife its fixed-
+unit sparse corrections reproduce the regular fixed-intercept estimator.
+Integer block mode instead uses pre-drop blocks and therefore differs from the
+regular post-filter block jackknife. Omit `--rg-manifest-fast` for constrained
+cov-LDSC or summary-estimated intercepts. Add `--rg-fast-no-pair-logs` for large
+batches to retain only `batch.log` and `manifest.results.tsv`.
 
 For many models that share annotation columns, such as baseline plus one focal
 cell-type annotation, place every unique column in one union annotation/LD-score
@@ -401,10 +464,13 @@ Exactly one of these modes must be specified.
 ### h2/rg options
 
 - `--ldscores`: primary LD-score file or chromosome-split spec.
-- `--ldscores-reg`: optional scalar LD-score file for unconstrained rg intercept
+- `--ldscores-reg`: optional scalar LD-score file for summary-estimated rg intercept
   regression.
-- `--weight-mode`: `he` (default) or score-scale constrained `ldsc` IRWLS for
-  h2 and bivariate genetic covariance/rg.
+- `--weight-mode`: `he` (default), or constrained score-scale LDSC for h2 and
+  constrained score-scale cov-LDSC for genetic covariance; rg is their matched
+  ratio.
+- `--intercept-weight-mode`: `score` (default) or `ldsc` weighting for the
+  separate summary-estimated cross-trait intercept.
 - `--ldscores-w`: optional scalar regression-SNP LD score used in LDSC weights.
 - `--ldsc-m`: fixed reference annotation masses; split files with `@` are summed.
 - `--ldsc-irwls-iters`, `--ldsc-irwls-tol`: LDSC update controls.
@@ -424,13 +490,20 @@ Exactly one of these modes must be specified.
 - `--rg-se-method`: `jackknife`, `delta`, `robust`, or `kmoments`.
 - `--write-jack`: save jackknife replicate dumps.
 - `--write-normeq`: save explicit SCORE normal-equation JSON for eligible rg runs.
+- `--h2-batch-fast`, `--h2-cache-dir`: exact chromosome-jackknife HE batching
+  and optional reusable trait-moment cache.
+- `--rg-manifest-fast`, `--rg-model-manifest`: fixed-intercept HE batching and
+  optional multi-model column selection.
+- `--rg-fast-no-pair-logs`: omit fast-mode per-pair logs while retaining the
+  batch log and combined result table.
 
 ### LD-score options
 
 - `--nvecs`: random vectors for stochastic genome-wide LD scores.
 - `--write-ld-mc-var` / `--write-ld-mc-ci`: additionally write per-SNP,
   per-annotation MC variances, SEs, and approximate pointwise 95% conditional
-  MC intervals; the compact annotation-level diagnostic is written by default.
+  MC intervals; the compact annotation-level diagnostic is written by default
+  when `nvecs >= 2` unless skipped.
 - `--skip-ld-mc`: disable the default MC diagnostic.
 - `--step_size`: SNP block size for LD-score computation; for PGEN this also
   controls the reusable dosage decode buffer.
@@ -451,18 +524,21 @@ Exactly one of these modes must be specified.
 
 ## Output Files
 
-- Genome-wide LD scores: `<out>.gw.ldscore.gz`, `<out>.gw.M`,
-  `<out>.gw.mc.tsv`, `<out>.gw.log`, optionally `<out>.gw.mcvar.gz` and
-  `<out>.gw.kmoments`.
+- Genome-wide LD scores: `<out>.gw.ldscore.gz`, `<out>.gw.M`, and
+  `<out>.gw.log`; `<out>.gw.mc.tsv` is written by default when `nvecs >= 2`
+  unless `--skip-ld-mc`; `<out>.gw.mcvar.gz` and `<out>.gw.kmoments` are
+  optional.
 - Windowed LD scores: `<out>.win.ldscore.gz`, `<out>.win.M`,
   `<out>.win.M_5_50`, `<out>.win.log`.
 - GxE LD scores: `<out>.gxe.ldscore.gz`, `<out>.gee.ldscore.gz`,
   `<out>.gxe.log`.
-- h2: `<out>.results.tsv`, `<out>.log`, optionally `<out>.<trait>.jack`.
+- h2: `<out>.results.tsv`, `<out>.log`, optionally `<out>.<trait>.jack`; the
+  result table records `estimator` (`he` or `constrained_ldsc_irwls`).
 - rg: `<out>.log`, optionally `<out>.rg.jack` and
   `<out>.rg.scoreeq.json`.
 - rg manifest: `<out>/batch.log`, `<out>/manifest.results.tsv`, and per-pair
-  logs/results where applicable.
+  logs/results where applicable; the combined table records `estimator` (`he`
+  or `constrained_cov_ldsc_irwls`).
 
 ## Citation
 

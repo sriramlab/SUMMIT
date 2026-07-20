@@ -157,9 +157,10 @@ def build_parser() -> argparse.ArgumentParser:
                         ))
     parser.add_argument("--h2-batch-fast", action="store_true", default=False,
                         help=(
-                            "Use the exact chromosome-jackknife fast path for batched h2. "
+                            "Use the exact chromosome-jackknife HE fast path for batched h2. "
                             "Summary statistics are loaded concurrently in bounded batches, "
-                            "while one shared Trace and vectorized sufficient statistics are reused."
+                            "while one shared Trace and vectorized sufficient statistics are reused. "
+                            "Constrained LDSC and --chisq-action clip require regular h2."
                         ))
     parser.add_argument("--h2-batch-size", default=4, type=int,
                         help="Number of traits held in each bounded fast-h2 batch (default: 4).")
@@ -190,7 +191,9 @@ def build_parser() -> argparse.ArgumentParser:
                             "Either a comma-separated pair of summary-statistics files for bivariate rg estimation, "
                             "where each file may be a chromosome-split '@' spec, "
                             "or a manifest file path for batch rg. Manifest mode requires per-row phen1, phen2, "
-                            "and sumstats1, sumstats2 columns; non-fast manifest mode also requires intercept_rg."
+                            "and sumstats1, sumstats2 columns. A finite per-row intercept_rg is required in fast "
+                            "manifest mode and optional in regular mode; omitted regular values use SUMMIT's "
+                            "summary-estimated intercept with delete refits."
                         ))
     parser.add_argument("--make-rg-manifest", default=None, type=str,
                         help=(
@@ -201,10 +204,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--compact", action="store_true", help="Write a compact rg manifest with only the core columns needed downstream.",)
     parser.add_argument("--rg-manifest-fast", action="store_true", default=False,
                         help=(
-                            "Use the sparse-drop fast path for fixed-intercept rg manifest mode. "
+                            "Use the HE/jackknife sparse-drop fast path for fixed-intercept rg manifest mode. "
                             "This reuses cached sumstats and shared unit-level moment summaries, "
                             "writes manifest.results.tsv with total and per-bin rg/gamma columns, "
-                            "and also emits per-pair .log files."
+                            "and also emits per-pair .log files. Every row requires a finite intercept_rg; "
+                            "constrained cov-LDSC and summary-estimated intercepts require regular mode."
                         ))
     parser.add_argument("--rg-fast-no-pair-logs", action="store_true", default=False,
                         help=(
@@ -250,8 +254,10 @@ def build_parser() -> argparse.ArgumentParser:
                         choices=["he", "ldsc"],
                         help=(
                             "Main h2/genetic-covariance estimating equation: 'he' keeps the "
-                            "SUMMIT/HE score moments (default); 'ldsc' fits score-scale constrained "
-                            "LDSC-style WLS by closed-form IRWLS. It retains SUMMIT's exact-score "
+                            "SUMMIT/HE score moments (default); 'ldsc' fits constrained score-scale "
+                            "LDSC for h2 and constrained score-scale cov-LDSC for genetic covariance "
+                            "by closed-form IRWLS. rg is formed from covariance and h2 refits. It retains "
+                            "SUMMIT's exact-score "
                             "response, scalar effective-sample-size convention, and nuisance-intercept "
                             "refit semantics, so it is not literal ldsc.py when per-SNP sample sizes vary."
                         ))
@@ -836,16 +842,22 @@ def _normalize_rg_manifest(path: str, log=None, *, require_intercept: bool = Tru
         if not utils._path_spec_exists(sumstats2):
             raise ValueError(f"Manifest row {row_id}: could not find sumstats2 file/spec '{sumstats2_raw}'.")
 
-        if intercept_col is None:
+        raw_intercept = None if intercept_col is None else row[intercept_col]
+        intercept_missing = pd.isna(raw_intercept) or str(raw_intercept).strip() == ""
+        if intercept_missing:
+            if require_intercept:
+                raise ValueError(f"Manifest row {row_id}: intercept_rg must be finite.")
             intercept_rg = np.nan
         else:
-            intercept_rg = pd.to_numeric(pd.Series([row[intercept_col]]), errors="coerce").iloc[0]
-            if not pd.notna(intercept_rg):
-                if require_intercept:
-                    raise ValueError(f"Manifest row {row_id}: intercept_rg must be finite.")
-                intercept_rg = np.nan
-            else:
-                intercept_rg = float(intercept_rg)
+            try:
+                intercept_rg = float(raw_intercept)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"Manifest row {row_id}: intercept_rg must be a finite numeric value "
+                    "or omitted in regular manifest mode."
+                ) from exc
+            if not np.isfinite(intercept_rg):
+                raise ValueError(f"Manifest row {row_id}: intercept_rg must be finite.")
 
         cov_rank1 = _coerce_optional_cov_rank(row[opt_cov1], row_label=str(row_id), col_name="cov_rank1") if opt_cov1 is not None else None
         cov_rank2 = _coerce_optional_cov_rank(row[opt_cov2], row_label=str(row_id), col_name="cov_rank2") if opt_cov2 is not None else None
@@ -1075,7 +1087,7 @@ def _dispatch_rg_manifest(args, log):
         log._log("!!! --ldscores must be provided for rg estimation. !!!")
         raise SystemExit(1)
     if args.intercept_rg is not None or args.pheno_rg is not None or args.pheno_rg_cov is not None:
-        log._log("!!! In rg manifest mode, use per-row intercept_rg in the manifest. Global --intercept-rg / --pheno-rg / --pheno-rg-cov are not allowed. !!!")
+        log._log("!!! In rg manifest mode, use optional per-row intercept_rg values; omit them in regular mode for summary estimation. Global --intercept-rg / --pheno-rg / --pheno-rg-cov are not allowed. !!!")
         raise SystemExit(1)
     if args.cov_rank is not None:
         log._log("!!! In rg manifest mode, provide trait-specific cov_rank via optional manifest columns cov_rank1 / cov_rank2 or via the sumstats files. Global --cov-rank is not allowed. !!!")
@@ -1095,7 +1107,7 @@ def _dispatch_rg_manifest(args, log):
     manifest_df, trait_meta = _normalize_rg_manifest(
         args.rg,
         log=log,
-        require_intercept=(not bool(getattr(args, "rg_manifest_fast", False))),
+        require_intercept=False,
     )
 
     if bool(getattr(args, "rg_manifest_fast", False)):
@@ -1160,6 +1172,9 @@ def _dispatch_rg_manifest(args, log):
         entry1.sumstats.log = pair_log
         entry2.sumstats.log = pair_log
 
+        row_intercept = (
+            None if pd.isna(row.intercept_rg) else float(row.intercept_rg)
+        )
         rg = Sumcore(
             bim_path=args.bim,
             rg=None,
@@ -1182,7 +1197,8 @@ def _dispatch_rg_manifest(args, log):
             rg_se_method=args.rg_se_method,
             intercept_chisq_thr=args.intercept_chisq_thr,
             intercept_weight_mode=args.intercept_weight_mode,
-            intercept_rg=row.intercept_rg,
+            intercept_rg=row_intercept,
+            intercept_rg_source="manifest",
             chisq_action=args.chisq_action,
             report_tau=True,
             allow_neg_enr=args.allow_neg_enr,

@@ -73,14 +73,26 @@ def apply_env(cfg: dict) -> int:
         }.get(str(mode).lower())
         if not flag:
             return
-        if sys.argv and sys.argv[0] == "-c":
-            # The Python code string used by `python -c` is not present in
-            # sys.argv. Re-execing as `python -c <first CLI flag>` corrupts
-            # the command line, so leave this process unwrapped.
+        if sys.argv and sys.argv[0] in {"-c", "-"}:
+            # The code supplied to `python -c` or standard input is not
+            # present in sys.argv, so its invocation cannot be reconstructed.
             os.environ["SUMMIT_NUMACTL_WRAPPED"] = "1"
             return
+
+        # With `python -m package.module`, sys.argv[0] is the resolved module
+        # filename rather than the original `-m package.module` invocation.
+        # Executing that file directly breaks package-relative imports.  The
+        # running __main__ spec retains the module name, so reconstruct the
+        # module invocation when one is available.
+        main_spec = getattr(sys.modules.get("__main__"), "__spec__", None)
+        main_module = getattr(main_spec, "name", None)
+        if isinstance(main_module, str) and main_module:
+            python_args = [sys.executable, "-m", main_module, *sys.argv[1:]]
+        else:
+            python_args = [sys.executable, *sys.argv]
+
         os.environ["SUMMIT_NUMACTL_WRAPPED"] = "1"
-        args = [exe, f"{flag}={nodes}", sys.executable, *sys.argv]
+        args = [exe, f"{flag}={nodes}", *python_args]
         os.execv(exe, args)
 
     def _cpu_set_allowed():

@@ -60,6 +60,7 @@ class Sumcore:
         intercept_chisq_thr=None,
         intercept_weight_mode: str = "score",
         intercept_rg=None,
+        intercept_rg_source: str = "cli",
         pheno_rg=None,
         pheno_rg_cov=None,
         pheno_rg_missing_values=None,
@@ -274,6 +275,7 @@ class Sumcore:
             raise ValueError("intercept_weight_mode must be one of {'ldsc','score'}")
 
         self.intercept_rg = None if intercept_rg is None else float(intercept_rg)
+        self.intercept_rg_source = str(intercept_rg_source).strip() or "cli"
         self.pheno_rg_paths = None if pheno_rg is None else utils._parse_rg_pair(pheno_rg)
         self.pheno_rg_cov_paths = None if pheno_rg_cov is None else utils._parse_rg_pair(pheno_rg_cov)
 
@@ -541,7 +543,7 @@ class Sumcore:
         if self.log is not None and self.weight_mode == "ldsc":
             info = rg_fit.weight_info or {}
             self.log._log(
-                f"[rg:ldsc] constrained covariance IRWLS using M source "
+                f"[rg:ldsc] constrained score-scale cov-LDSC IRWLS using M source "
                 f"'{self.ldsc_m_source}', weight LD source "
                 f"'{info.get('weight_ld_source', 'unknown')}', intercept source "
                 f"'{info.get('intercept_source', 'unknown')}', "
@@ -1266,7 +1268,7 @@ class Sumcore:
         if self.intercept_rg is not None:
             if not np.isfinite(self.intercept_rg):
                 raise ValueError("--intercept-rg must be finite.")
-            return float(self.intercept_rg), {"source": "cli"}
+            return float(self.intercept_rg), {"source": self.intercept_rg_source}
 
         if self.pheno_rg_paths is not None:
             return self._compute_fixed_intercept_from_pheno(matched1, matched2)

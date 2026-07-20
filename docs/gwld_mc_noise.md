@@ -60,7 +60,7 @@ The output `<out>.gw.mc.tsv` contains one row per annotation, including:
 - `nvecs`, `nsnps`, `seed`, `probe_distribution`, `dtype`, and
   `residual_correlation_denom`, which record the run defining the diagnostic;
 - `integrated_mc_variance`: `S_k`;
-- `rms_mc_se`: `sqrt(S_k / M)`, the root-mean-square per-SNP MC standard
+- `rms_mc_se`: `sqrt(S_k / nsnps)`, the root-mean-square per-SNP MC standard
   error;
 - `ldscore_rms`: the root-mean-square reported LD score in the annotation;
 - `relative_rms_mc_se`: `rms_mc_se / ldscore_rms`; and

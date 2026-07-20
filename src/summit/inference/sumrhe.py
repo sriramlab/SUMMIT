@@ -318,7 +318,8 @@ class Sumrhe:
         if self.log is not None and self.weight_mode == "ldsc":
             info = fit.weight_info or {}
             self.log._log(
-                f"[h2:ldsc] constrained IRWLS using M source '{self.ldsc_m_source}', "
+                f"[h2:ldsc] constrained score-scale LDSC IRWLS using M source "
+                f"'{self.ldsc_m_source}', "
                 f"weight LD source '{info.get('weight_ld_source', 'unknown')}', "
                 f"iterations={info.get('irwls_iters', 'NA')}."
             )
@@ -402,6 +403,7 @@ class Sumrhe:
         header = ["phen_index", "phen", "num_bins", "h2", "h2_se"]
         header.extend([f"h2bin_{j}" for j in range(k)])
         header.extend([f"h2bin_se_{j}" for j in range(k)])
+        header.append("estimator")
 
         with open(tmp, "w") as fout:
             fout.write("\t".join(header) + "\n")
@@ -417,6 +419,7 @@ class Sumrhe:
                 ]
                 row.extend(format(float(fit.h2[j, 0]), ".12g") for j in range(k))
                 row.extend(format(float(fit.h2[j, 1]), ".12g") for j in range(k))
+                row.append(str((fit.weight_info or {}).get("estimator", "he")))
                 fout.write("\t".join(row) + "\n")
 
         os.replace(tmp, path)

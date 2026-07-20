@@ -1,17 +1,26 @@
-# Score-scale constrained LDSC weighting
+# Constrained score-scale LDSC and cov-LDSC
 
 ## Scope
 
-`--weight-mode ldsc` changes the h2 and bivariate genetic-covariance estimating
-instruments while retaining SUMMIT's summary-statistic moments and nuisance-
-intercept semantics. It is supported by the ordinary `--h2` and single-pair
-`--rg` paths. The default `--weight-mode he` is unchanged.
+`--weight-mode ldsc` fits constrained score-scale LDSC-style IRWLS for h2 and
+constrained score-scale cov-LDSC IRWLS for bivariate genetic covariance. rg is
+not directly regressed: every full or delete estimate is the corresponding
+covariance estimate divided by its two matched h2 estimates. The mode is
+supported by ordinary `--h2`, single-pair `--rg`, and regular rg manifests. The
+default `--weight-mode he` is unchanged.
+
+Here *constrained* means that the univariate null intercept is fixed at one, or
+that the bivariate nuisance intercept `c` is resolved by SUMMIT before the main
+covariance regression and is not jointly estimated with the covariance
+coefficients. It does not impose non-negativity or boundedness constraints on
+h2 or covariance coefficients. Clipping is used only in the working-variance
+weights. These definitions retain SUMMIT's score-scale moments and intercept/
+delete-refit semantics; they are not literal `ldsc.py` fits.
 
 `--intercept-weight-mode` remains a separate option: it controls how SUMMIT
 fits an unknown bivariate nuisance intercept, while `--weight-mode ldsc`
-controls the h2 and main genetic-covariance equations after that intercept has
-been resolved. Fast cached h2 and fast rg manifests are not yet wired to the
-LDSC path.
+controls the two h2 equations and main cov-LDSC equation after that intercept
+has been resolved. Fast cached h2 and fast rg manifests remain HE-only.
 
 ## Mean model and weighted estimating equation
 
@@ -51,11 +60,13 @@ columns as instruments, schematically
 whereas LDSC mode uses `W D` as the instrument. It therefore cannot be
 implemented by changing a scalar weight inside the existing HE normal equations.
 
-## Genetic covariance and rg
+## Constrained cov-LDSC genetic covariance and rg
 
-For a pair of traits, let `z1*_j` and `z2*_j` be SUMMIT's score-scale
-statistics and let `c` be the nuisance intercept resolved by the existing
-SUMMIT intercept step. Define
+For trait `t`, let `n_t* = N_t,max - cov_rank_t - 1`, using the covariate-rank
+metadata resolved by the rg path. (The h2 denominator fits retain SUMMIT's
+current forced `cov_rank=0` h2 convention.) Let `z1*_j` and `z2*_j` be the
+score-scale statistics and let `c` be the nuisance intercept resolved by the
+existing SUMMIT intercept step. Define
 
 ```text
 q12_j = z1*_j z2*_j - c,
@@ -195,8 +206,8 @@ the reported category h2 values.
 ## Jackknife semantics and cost
 
 Every delete-block replicate repeats initialization and all IRWLS updates with
-the same fixed reference moments. This is the exact refit semantics of the
-experimental estimator. It differs from historical `ldsc.py`, which freezes
+the same fixed reference moments. This is the implemented exact-refit
+semantics. It differs from historical `ldsc.py`, which freezes
 the full-data final weights when constructing delete values.
 
 The implementation retains only the coefficient vector for each replicate and
@@ -210,7 +221,11 @@ SUMMIT does not silently compute an SE from a partial set.
 
 Literal univariate LDSC ordinarily regresses a Wald `Z_j^2-1` response with
 per-SNP sample size `N_j`. SUMMIT instead retains its exact score response and
-the scalar `n*` used by the HE estimator. The two conventions coincide only in
-special cases, such as effectively constant sample size with equivalent score
-and Wald statistics. This mode should therefore be described as constrained
-score-scale LDSC-style IRWLS, not as package-identical LDSC.
+the scalar `n*` used by the HE estimator. In the bivariate path, SUMMIT first
+resolves `c` under its existing fixed-or-summary intercept contract, performs
+matched h2 and covariance delete refits, and then forms rg as their ratio.
+These conventions coincide with package LDSC only in special cases, such as
+effectively constant sample size with equivalent score and Wald statistics.
+The implemented modes should therefore be called constrained score-scale
+LDSC-style IRWLS and constrained score-scale cov-LDSC IRWLS, not
+package-identical LDSC.

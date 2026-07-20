@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
+import subprocess
+import sys
 
 import numpy as np
 import pandas as pd
@@ -146,6 +149,87 @@ def _hardcalls() -> np.ndarray:
         ],
         dtype=np.int8,
     )
+
+
+@pytest.mark.parametrize(
+    ("mode", "expected_suffixes"),
+    [
+        ("genomewide", (".gw.ldscore.gz",)),
+        ("windowed", (".win.ldscore.gz",)),
+        ("gxe", (".gxe.ldscore.gz", ".gee.ldscore.gz")),
+    ],
+)
+def test_pgen_cli_dispatch_smoke(tmp_path, mode, expected_suffixes):
+    alt = _hardcalls()
+    prefix = tmp_path / f"cli_{mode}"
+    _write_hardcall_pgen(prefix, alt)
+    out = tmp_path / f"cli_{mode}_out"
+
+    command = [
+        sys.executable,
+        "-m",
+        "summit",
+        "--geno",
+        str(prefix.with_suffix(".pgen")),
+        "--out",
+        str(out),
+        "--step_size",
+        "3",
+        "--seed",
+        "811",
+        "--dtype",
+        "float64",
+        "--num-threads",
+        "1",
+        "--impute-method",
+        "mean",
+        "--suppress",
+    ]
+    if mode == "genomewide":
+        command.extend(["--nvecs", "8", "--rand-dist", "rademacher", "--skip-ld-mc"])
+    elif mode == "windowed":
+        command.extend(
+            [
+                "--ld-wind-kb",
+                "1",
+                "--win-panel-cols",
+                "2",
+                "--win-cache-mb",
+                "0",
+            ]
+        )
+    else:
+        env_path = tmp_path / "cli_gxe.env"
+        pd.DataFrame(
+            {
+                "FID": [f"f{i}" for i in range(alt.shape[1])],
+                "IID": [f"i{i}" for i in range(alt.shape[1])],
+                "environment": np.asarray([-1.2, 0.4, 1.1, -0.7, 0.2, 1.5] * 2),
+            }
+        ).to_csv(env_path, sep="\t", index=False)
+        command.extend(
+            [
+                "--env",
+                str(env_path),
+                "--nvecs",
+                "8",
+                "--rand-dist",
+                "rademacher",
+            ]
+        )
+
+    env = os.environ.copy()
+    env["SUMMIT_NUMACTL_WRAPPED"] = "1"
+    subprocess.run(command, check=True, env=env)
+
+    for suffix in expected_suffixes:
+        score_path = Path(f"{out}{suffix}")
+        assert score_path.is_file()
+        score_table = pd.read_csv(score_path, sep="\t")
+        assert score_table.columns[:3].tolist() == ["CHR", "SNP", "BP"]
+        scores = score_table.iloc[:, 3:].to_numpy(dtype=np.float64)
+        assert scores.shape == (alt.shape[0], 1)
+        assert np.isfinite(scores).all()
 
 
 def _numpy_standardize(raw: np.ndarray, ddof: int = 1) -> np.ndarray:

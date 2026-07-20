@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from types import SimpleNamespace
 import subprocess
 import sys
@@ -153,6 +154,7 @@ def test_fast_batch_matches_legacy_with_sparse_drops(tmp_path):
         rtol=2e-11,
         atol=2e-11,
     )
+    assert set(fast_table["estimator"]) == {"he"}
 
 
 def test_fast_batch_rejects_post_drop_block_jackknife(tmp_path):
@@ -309,14 +311,28 @@ def test_chromosome_split_directory_streaming_matches_legacy(tmp_path):
         np.testing.assert_allclose(observed.sigmas, expected.sigmas, rtol=2e-11, atol=2e-11)
 
 
-def test_fast_batch_cli_dispatch(tmp_path):
+@pytest.mark.parametrize("module", ["summit", "summit.cli"])
+def test_fast_batch_cli_dispatch(tmp_path, module):
     ld_path, annot_path, sums = _write_fixture(tmp_path, n_traits=2)
     out = tmp_path / "cli_fast"
+
+    # Ensure the test exercises SUMMIT's NUMA re-exec even on hosts without
+    # numactl.  The shim removes the memory-policy argument and executes the
+    # reconstructed Python command.
+    fake_bin = tmp_path / "fake_bin"
+    fake_bin.mkdir()
+    fake_numactl = fake_bin / "numactl"
+    fake_numactl.write_text("#!/bin/sh\nshift\nexec \"$@\"\n", encoding="utf-8")
+    fake_numactl.chmod(0o755)
+    env = os.environ.copy()
+    env["PATH"] = os.pathsep.join([str(fake_bin), env.get("PATH", "")])
+    env.pop("SUMMIT_NUMACTL_WRAPPED", None)
+
     subprocess.run(
         [
             sys.executable,
             "-m",
-            "summit.cli",
+            module,
             "--h2",
             str(sums),
             "--h2-batch-fast",
@@ -339,6 +355,7 @@ def test_fast_batch_cli_dispatch(tmp_path):
             "--suppress",
         ],
         check=True,
+        env=env,
     )
     table = pd.read_csv(str(out) + ".results.tsv", sep="\t")
     assert table.shape[0] == 2

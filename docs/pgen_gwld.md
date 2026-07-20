@@ -160,6 +160,9 @@ subsets, REF dosage at `allele_idx=0`, and `-9` as the missing-dosage sentinel.
 SUMMIT supports plain-text PVAR metadata and biallelic diploid PGEN data in all
 three LD-score modes:
 
+SUMMIT does not read BGEN directly. Convert BGEN input to a biallelic diploid
+PGEN/PVAR/PSAM trio before running these estimators.
+
 - The randomized genome-wide estimator uses the dense CPU kernels, dosage mean
   imputation, and `ddof=1`. It supports the default annotation-level random-
   probe noise diagnostic and optional per-SNP MC intervals.
