@@ -181,7 +181,7 @@ def _read_csv_maybe_chr_split(path_spec, **kwargs):
 
     if not frames:
         raise ValueError(f"No files resolved for chromosome-split path spec: {path_spec}")
-    return pd.concat(frames, axis=0, ignore_index=True, copy=False)
+    return pd.concat(frames, axis=0, ignore_index=True)
 
 
 def _check_file_or_chr_split_spec(path_spec, *, label: str = "file"):
