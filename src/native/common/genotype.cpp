@@ -269,6 +269,30 @@ static inline void madvise_willneed_range(unsigned char* base, size_t file_size,
     (void)::madvise((void*)p0, plen, MADV_WILLNEED);
 }
 
+// Remove fully consumed pages from this process's resident mmap. This leaves
+// the file unchanged and allows later phases to fault pages back without
+// retaining every previously decoded BED page in process RSS.
+static inline void madvise_dontneed_consumed_range(unsigned char* base,
+                                                  size_t file_size,
+                                                  size_t off,
+                                                  size_t len) {
+    if (!base || len == 0 || off >= file_size) return;
+    size_t end = off + len;
+    if (end > file_size) end = file_size;
+    if (end <= off) return;
+
+    const long ps = ::sysconf(_SC_PAGESIZE);
+    const size_t pagesz = (ps > 0) ? (size_t)ps : 4096;
+
+    const uintptr_t a0 = (uintptr_t)(base + off);
+    const uintptr_t a1 = (uintptr_t)(base + end);
+    const uintptr_t p0 = (a0 + pagesz - 1) & ~(uintptr_t)(pagesz - 1);
+    const uintptr_t p1 = a1 & ~(uintptr_t)(pagesz - 1);
+    if (p1 <= p0) return;
+
+    (void)::madvise((void*)p0, (size_t)(p1 - p0), MADV_DONTNEED);
+}
+
 static std::shared_ptr<BedMapping> get_bed_mapping_cached(const std::string& bed_path) {
     static std::mutex m;
     static std::unordered_map<std::string, std::shared_ptr<BedMapping>> cache;
@@ -666,6 +690,10 @@ static void read_block_standardized_into_impl(const std::string &bed_path,
     }
 
     const unsigned char* snp0 = mm->base + 3 + (size_t)blk_start * per_snp_bytes;
+    const size_t consumed_off = (size_t)3 + (size_t)blk_start * per_snp_bytes;
+    const size_t consumed_len = (size_t)L * per_snp_bytes;
+    const bool drop_consumed_pages =
+        env_int("SUMMIT_DROP_CONSUMED_BED_PAGES", 1) != 0;
 
     auto worker = [&](int col, uint8_t* __restrict codes, std::vector<int>& miss_idx) {
         const unsigned char* bytes = snp0 + (size_t)col * per_snp_bytes;
@@ -725,6 +753,11 @@ static void read_block_standardized_into_impl(const std::string &bed_path,
         for (int col = 0; col < L; ++col) {
             worker(col, codes_local.data(), miss_local);
         }
+        if (drop_consumed_pages) {
+            madvise_dontneed_consumed_range(
+                mm->base, mm->size, consumed_off, consumed_len
+            );
+        }
         return;
     }
 
@@ -742,6 +775,11 @@ static void read_block_standardized_into_impl(const std::string &bed_path,
         for (int col = 0; col < L; ++col) {
             worker(col, codes_local.data(), miss_local);
         }
+    }
+    if (drop_consumed_pages) {
+        madvise_dontneed_consumed_range(
+            mm->base, mm->size, consumed_off, consumed_len
+        );
     }
 
 #else
