@@ -365,6 +365,38 @@ def _validate_resource(task: str, config: dict) -> dict:
     return resource
 
 
+def _production_shard_count(estimator: dict) -> int:
+    if not isinstance(estimator, dict):
+        raise ValueError("Deployment config lacks an estimator contract.")
+    production_probes = estimator.get("production_probes")
+    probes_per_shard = estimator.get("probes_per_shard")
+    if any(
+        not isinstance(value, int) or isinstance(value, bool) or value <= 0
+        for value in (production_probes, probes_per_shard)
+    ):
+        raise ValueError("Production probe counts must be positive integers.")
+    if production_probes % probes_per_shard:
+        raise ValueError(
+            "production_probes must be exactly divisible by probes_per_shard."
+        )
+    return production_probes // probes_per_shard
+
+
+def _production_probe_interval(index: Any, estimator: dict) -> tuple[int, int]:
+    shard_count = _production_shard_count(estimator)
+    if (
+        not isinstance(index, int)
+        or isinstance(index, bool)
+        or not 0 <= index < shard_count
+    ):
+        raise ValueError(
+            f"shard_index must be an integer from 0 through {shard_count - 1}."
+        )
+    probes_per_shard = estimator["probes_per_shard"]
+    start = index * probes_per_shard
+    return start, start + probes_per_shard
+
+
 def _validate_numa_launch(config: dict, *, verify_executable: bool) -> dict:
     launch = config.get("numa_launch")
     expected_keys = {
@@ -422,6 +454,7 @@ def _load_config(path_value: str, expected_sha: str | None) -> tuple[Path, dict,
     for task in TASKS:
         _validate_resource(task, payload)
     _validate_resource("shard_benchmark", payload)
+    _production_shard_count(payload.get("estimator"))
     _validate_numa_launch(payload, verify_executable=False)
     return path, payload, observed_sha
 
@@ -646,9 +679,7 @@ def _validate_frozen(
             raise ValueError(
                 f"Frozen panel/deployment estimator contract differs for {key!r}."
             )
-    if production.get("probe_shards") != estimator.get(
-        "production_probes"
-    ) // estimator.get("probes_per_shard"):
+    if production.get("probe_shards") != _production_shard_count(estimator):
         raise ValueError("Frozen panel/deployment shard-count contract differs.")
 
     manifest_path, manifest_record = _verify_record(
@@ -2117,12 +2148,9 @@ def _prepare_task(
             )
             index = args.get("shard_index")
             role = args.get("role", "production")
-            if (
-                not isinstance(index, int)
-                or isinstance(index, bool)
-                or not 0 <= index <= 9
-            ):
-                raise ValueError("shard_index must be an integer from 0 through 9.")
+            probe_start, probe_stop = _production_probe_interval(
+                index, config["estimator"]
+            )
             if role not in ("production", "benchmark") or (
                 role == "benchmark" and index != 0
             ):
@@ -2161,9 +2189,9 @@ def _prepare_task(
                 str(cache_path),
                 "--gxe-reference-shard",
                 "--gxe-probe-offset",
-                str(index * config["estimator"]["probes_per_shard"]),
+                str(probe_start),
                 "--nvecs",
-                str(config["estimator"]["probes_per_shard"]),
+                str(probe_stop - probe_start),
                 "--out",
                 str(prefix),
             ]
@@ -2189,8 +2217,15 @@ def _prepare_task(
             )
             cache = _validate_cache_file(cache_path, config)
             shard_records = args.get("shards")
-            if not isinstance(shard_records, list) or not 1 <= len(shard_records) <= 10:
-                raise ValueError("Merge requires one through ten shard records.")
+            production_shards = _production_shard_count(config["estimator"])
+            if (
+                not isinstance(shard_records, list)
+                or not 1 <= len(shard_records) <= production_shards
+            ):
+                raise ValueError(
+                    "Merge requires one through "
+                    f"{production_shards} production shard records."
+                )
             dependencies = _validate_qacct_dependencies(
                 spec, scratch_root, task, expected_count=len(shard_records)
             )

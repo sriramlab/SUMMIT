@@ -34,8 +34,8 @@
     "genotype_scale": "sample",
     "num_probes": 100,
     "jackknife_blocks": 100,
-    "probe_shards": 10,
-    "probes_per_shard": 10,
+    "probe_shards": 2,
+    "probes_per_shard": 50,
     "random_distribution": "rademacher",
     "seed_family": 20260808,
     "dtype": "float32",
@@ -107,10 +107,17 @@
     }
   },
   "uge": {
-    "cache_or_b10": {
+    "cache": {
       "slots": 4,
       "h_data_per_slot": "6G",
       "total_memory": "24G",
+      "h_rt": "48:00:00",
+      "highp": true
+    },
+    "production_b50_shard": {
+      "slots": 4,
+      "h_data_per_slot": "8G",
+      "total_memory": "32G",
       "h_rt": "48:00:00",
       "highp": true
     },

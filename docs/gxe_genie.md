@@ -145,9 +145,9 @@ The exact two-sided jackknife source sketches are spilled by SNP-deletion block
 to private temporary storage. This avoids rereading every genotype block for
 every deletion block: production uses a norm pass plus one source and one
 combined target pass, while keeping only the global and current-block sketches
-resident. Ten disjoint B10 jobs can therefore reproduce a monolithic B100
-reference (within floating-point reduction tolerance) without invalid
-chromosome sharding.
+resident. The sealed Hoffman production contract uses two disjoint B50 jobs to
+reproduce a monolithic B100 reference (within floating-point reduction
+tolerance) without invalid chromosome sharding.
 
 ## Input contract and safety checks
 
@@ -168,7 +168,7 @@ chromosome sharding.
   Phenotype moments record their generating reference and bind the exact
   feature-cache SHA-256. This prevents mixing genotype content, samples,
   covariates, modes, scales, annotations, or SNP axes, while deliberately
-  allowing the same marginal scores to be reused across B10/B100 trace
+  allowing the same marginal scores to be reused across B50/B100 trace
   checkpoints produced from that cache.
 - Variants with zero/invalid additive or interaction projected variance are an
   error. They must be QC-filtered before regenerating the entire bundle; they

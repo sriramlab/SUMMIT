@@ -226,7 +226,7 @@ cross-product of projected `G*E` with projected phenotype. SUMMIT's generated
 files declare `SCORE_MODE=marginal_cross_product` and the loader rejects other
 declared modes. Every score/reference artifact is SHA-256-bound. Phenotype
 summaries are also bound to the exact feature cache, so the same scores can be
-reused across B10/B100 trace checkpoints from that cache without another
+reused across B50/B100 trace checkpoints from that cache without another
 genotype pass.
 
 Generation and fitting refuse an existing output prefix unless

@@ -15,6 +15,7 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 DEPLOY_PATH = ROOT / "scripts" / "gxe" / "hoffman" / "hoffman_deploy.py"
 CONFIG_PATH = ROOT / "scripts" / "gxe" / "hoffman" / "deployment_config.json"
+PANEL_PATH = ROOT / "scripts" / "gxe" / "hoffman" / "panel_config.json"
 
 
 def _load_deploy():
@@ -50,6 +51,7 @@ def _config_for_scratch(scratch: Path) -> dict:
 
 def test_deployment_config_and_wrappers_are_fail_closed():
     config = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+    panel = json.loads(PANEL_PATH.read_text(encoding="utf-8"))
     assert config["schema_version"] == DEPLOY.DEPLOYMENT_CONFIG_SCHEMA_VERSION == 2
     assert DEPLOY.FROZEN_CODE_MANIFEST_SCHEMA_VERSION == 2
     numa = DEPLOY._validate_numa_launch(config, verify_executable=False)
@@ -63,6 +65,19 @@ def test_deployment_config_and_wrappers_are_fail_closed():
     assert estimator["reference_schema_version"] == 3
     assert estimator["kernel_mode"] == "standardized"
     assert estimator["genotype_scale"] == "sample"
+    assert estimator["production_probes"] == 100
+    assert estimator["probes_per_shard"] == 50
+    assert DEPLOY._production_shard_count(estimator) == 2
+    assert config["panel_config_sha256"] == DEPLOY._sha256(PANEL_PATH)
+    assert panel["production_estimator"]["probe_shards"] == 2
+    assert panel["production_estimator"]["probes_per_shard"] == 50
+    assert panel["uge"]["production_b50_shard"] == {
+        "slots": 4,
+        "h_data_per_slot": "8G",
+        "total_memory": "32G",
+        "h_rt": "48:00:00",
+        "highp": True,
+    }
     assert config["monitor_interval_hours"] == 6
     for task in DEPLOY.TASKS:
         resource = DEPLOY._validate_resource(task, config)
@@ -80,6 +95,25 @@ def test_deployment_config_and_wrappers_are_fail_closed():
     assert benchmark["slots"] == 8
     assert benchmark["h_data_gib_per_slot"] == 4
     assert benchmark["total_memory_gib"] == 32
+    production_shard = DEPLOY._validate_resource("shard", config)
+    assert production_shard["slots"] == 4
+    assert production_shard["h_data_gib_per_slot"] == 8
+    assert production_shard["total_memory_gib"] == 32
+    assert production_shard["h_rt"] == "48:00:00"
+
+
+def test_b50_production_probe_intervals_and_dynamic_index_limit():
+    estimator = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))["estimator"]
+    assert DEPLOY._production_probe_interval(0, estimator) == (0, 50)
+    assert DEPLOY._production_probe_interval(1, estimator) == (50, 100)
+    with pytest.raises(ValueError, match="0 through 1"):
+        DEPLOY._production_probe_interval(2, estimator)
+    with pytest.raises(ValueError, match="0 through 1"):
+        DEPLOY._production_probe_interval(True, estimator)
+
+    malformed = {**estimator, "probes_per_shard": 60}
+    with pytest.raises(ValueError, match="exactly divisible"):
+        DEPLOY._production_shard_count(malformed)
 
 
 def test_generation_args_are_exact_and_annotation_free(tmp_path: Path):
@@ -345,7 +379,7 @@ def test_merge_plan_enforces_contiguous_prefix_and_low_probe_policy(
     job = _private_dir(scratch / "job")
     cache_path = _private_file(scratch / "cache.npz")
     cache_record = DEPLOY._record(cache_path)
-    shard_paths = [_private_file(scratch / f"shard{i}.json") for i in range(10)]
+    shard_paths = [_private_file(scratch / f"shard{i}.json") for i in range(2)]
     shard_records = [DEPLOY._record(path) for path in shard_paths]
     config = _config_for_scratch(scratch)
     common = {
@@ -363,8 +397,8 @@ def test_merge_plan_enforces_contiguous_prefix_and_low_probe_policy(
             shard_paths[index],
             {
                 "randomization": {
-                    "probe_offset": 10 * index,
-                    "probe_stop": 10 * (index + 1),
+                    "probe_offset": 50 * index,
+                    "probe_stop": 50 * (index + 1),
                 }
             },
             {},
@@ -372,7 +406,7 @@ def test_merge_plan_enforces_contiguous_prefix_and_low_probe_policy(
 
     monkeypatch.setattr(DEPLOY, "_validate_shard_record", validate_shard)
 
-    for count in (1, 10):
+    for count in (1, 2):
         records = shard_records[:count]
         dependencies = [
             {
@@ -391,8 +425,25 @@ def test_merge_plan_enforces_contiguous_prefix_and_low_probe_policy(
             "task_args": {"cache": cache_record, "shards": records},
         }
         plan = DEPLOY._prepare_task(spec, common, config, artifacts_ready=False)
-        assert plan["details"]["probes"] == count * 10
-        assert ("--allow-low-probe-gxe-jackknife" in plan["command"]) is (count < 10)
+        assert plan["details"]["probes"] == count * 50
+        assert ("--allow-low-probe-gxe-jackknife" in plan["command"]) is (count == 1)
+        assert any(
+            path.name == f"B{count * 50:03d}.gxe.ref.json" for path in plan["outputs"]
+        )
+
+    with pytest.raises(ValueError, match="one through 2"):
+        DEPLOY._prepare_task(
+            {
+                "task": "merge",
+                "task_args": {
+                    "cache": cache_record,
+                    "shards": [*shard_records, shard_records[0]],
+                },
+            },
+            common,
+            config,
+            artifacts_ready=False,
+        )
 
 
 def test_qacct_parser_requires_one_record():

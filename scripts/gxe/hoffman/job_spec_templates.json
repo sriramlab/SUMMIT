@@ -72,7 +72,7 @@
       "kind": "summit.gxe.hoffman_job",
       "schema_version": 1,
       "task": "merge",
-      "job_name": "gxe_age_bp_B010",
+      "job_name": "gxe_age_bp_B050",
       "job_root": "/u/scratch/b/bronsonj/summit_gxe_full_20260808/jobs/<NEW_MERGE_JOB>",
       "frozen": "<COPY_FROZEN_CONTRACT_AND_TASK_WRAPPER_SHA>",
       "qacct_dependencies": ["<ONE_COMPLETED_PRODUCTION_SHARD_QACCT_RECORD_PER_SHARD>"],
