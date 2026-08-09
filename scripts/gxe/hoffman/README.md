@@ -19,7 +19,7 @@ fixed-design references. `age_bp` retains the medication-adjusted DBP/SBP
 design, and `sex_whr` retains WHR's BMI adjustment. The common-covariate
 `age_assay` and `sex_assay` groups include the strongest published comparison
 traits plus ApoB, total bilirubin, and (for sex) total protein, which are absent
-from the published GENIE 53-trait result table. Their full-cohort intersections
+from the published GENIE 52-trait result table. Their full-cohort intersections
 retain 273,532 and 223,433 samples, respectively.
 
 All generated data, logs, job scripts, verification reports, caches, partials,
