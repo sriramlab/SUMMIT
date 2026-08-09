@@ -2,10 +2,10 @@
 
 This directory contains preparation/verification code and an explicit runbook;
 it does not submit jobs. The cache, wide-score, probe-shard, and shard-merge
-APIs are implemented, and the current-source GxE suite is green (238/238 tests
-at the deployment-layer freeze point). The remaining production gates are an
-independent test run from the checksummed frozen snapshot and the staged 50k
-calibration described below.
+APIs are implemented. At the final local pre-deployment validation, all 126
+focused GxE tests and all 260 repository tests passed. The remaining production
+gates are an independent test run from the checksummed frozen snapshot and the
+staged 50k calibration described below.
 
 ## Fixed analysis contract
 
