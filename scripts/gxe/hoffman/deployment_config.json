@@ -1,9 +1,15 @@
 {
   "kind": "summit.gxe.hoffman_deployment",
-  "schema_version": 1,
+  "schema_version": 2,
   "scratch_root": "/u/scratch/b/bronsonj/summit_gxe_full_20260808",
   "allowed_frozen_root": "/u/project/sriram/bronsonj",
   "python_executable": "/u/home/b/bronsonj/.conda/envs/summit/bin/python",
+  "numa_launch": {
+    "executable": "/usr/bin/numactl",
+    "sha256": "ceb1c432dd5e8747bec51e7fe283b57b806c95bb68122557cb59e212d1015b5e",
+    "arguments": ["--interleave=all"],
+    "environment_sentinel": "SUMMIT_NUMACTL_WRAPPED"
+  },
   "panel_config_sha256": "d5b4caee0a3c14d6531ff5bea10c86a4c4f8999eb0fe26c6024ebe341ecbb6cd",
   "estimator": {
     "annotation": null,

@@ -1,9 +1,34 @@
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 
 import pytest
+
+
+def test_outer_numactl_sentinel_prevents_nested_cli_reexec(monkeypatch):
+    from summit.ldscore import gw_ldscore
+
+    monkeypatch.setenv("SUMMIT_NUMACTL_WRAPPED", "1")
+    monkeypatch.setattr(gw_ldscore.shutil, "which", lambda name: "/usr/bin/numactl")
+
+    def forbidden_exec(*_):
+        raise AssertionError("sealed outer NUMA launch attempted a nested re-exec")
+
+    monkeypatch.setattr(gw_ldscore.os, "execv", forbidden_exec)
+    threads = gw_ldscore.apply_env(
+        {
+            "numa_mode": "interleave",
+            "numa_nodes": "all",
+            "force_affinity_all": False,
+            "num_threads": 1,
+            "decode_threads_cap": 1,
+        }
+    )
+    assert isinstance(threads, int) and threads >= 1
+    assert os.environ["OMP_NUM_THREADS"] == "1"
+    assert os.environ["SUMMIT_NUMACTL_WRAPPED"] == "1"
 
 
 def test_gxe_cli_creates_new_log_then_refuses_existing_prefix(tmp_path, monkeypatch):

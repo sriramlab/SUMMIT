@@ -34,7 +34,9 @@ TASKS = ("stage_verify", "cache", "shard", "merge", "score", "fit")
 WRAPPERS = {task: f"uge_{task}.sh" for task in TASKS}
 SAFE_NAME = re.compile(r"^[A-Za-z][A-Za-z0-9_.-]{0,127}$")
 SHA256 = re.compile(r"^[0-9a-f]{64}$")
+DEPLOYMENT_CONFIG_SCHEMA_VERSION = 2
 FROZEN_CODE_MANIFEST_SCHEMA_VERSION = 2
+NUMACTL_SENTINEL = "SUMMIT_NUMACTL_WRAPPED"
 REQUIRED_DISTRIBUTIONS = (
     "bed-reader",
     "charset-normalizer",
@@ -363,6 +365,46 @@ def _validate_resource(task: str, config: dict) -> dict:
     return resource
 
 
+def _validate_numa_launch(config: dict, *, verify_executable: bool) -> dict:
+    launch = config.get("numa_launch")
+    expected_keys = {
+        "executable",
+        "sha256",
+        "arguments",
+        "environment_sentinel",
+    }
+    if not isinstance(launch, dict) or set(launch) != expected_keys:
+        raise ValueError("Deployment config has an invalid NUMA-launch contract.")
+    executable = _absolute(launch.get("executable", ""))
+    if not executable.is_absolute() or str(executable) != launch.get("executable"):
+        raise ValueError("NUMA launcher must use one canonical absolute path.")
+    expected_sha = launch.get("sha256")
+    if not isinstance(expected_sha, str) or SHA256.fullmatch(expected_sha) is None:
+        raise ValueError("NUMA launcher requires a lowercase SHA256.")
+    arguments = launch.get("arguments")
+    if arguments != ["--interleave=all"]:
+        raise ValueError(
+            "Hoffman deployment requires NUMA interleave across all nodes."
+        )
+    if launch.get("environment_sentinel") != NUMACTL_SENTINEL:
+        raise ValueError("NUMA launcher uses an unexpected recursion sentinel.")
+    executable_record = {"path": str(executable), "sha256": expected_sha}
+    if verify_executable:
+        _require_file(executable, "NUMA launcher", private=False)
+        if not os.access(executable, os.X_OK):
+            raise PermissionError(f"NUMA launcher is not executable: {executable}")
+        observed = _record(executable)
+        if observed["sha256"] != expected_sha:
+            raise ValueError("NUMA launcher SHA256 differs from deployment config.")
+        executable_record = observed
+    return {
+        "executable": executable,
+        "executable_record": executable_record,
+        "arguments": tuple(arguments),
+        "environment_sentinel": NUMACTL_SENTINEL,
+    }
+
+
 def _load_config(path_value: str, expected_sha: str | None) -> tuple[Path, dict, str]:
     path = _absolute(path_value)
     payload, observed_sha, _ = _read_json(path, "deployment config", private=False)
@@ -372,7 +414,7 @@ def _load_config(path_value: str, expected_sha: str | None) -> tuple[Path, dict,
         )
     if (
         payload.get("kind") != "summit.gxe.hoffman_deployment"
-        or payload.get("schema_version") != 1
+        or payload.get("schema_version") != DEPLOYMENT_CONFIG_SCHEMA_VERSION
     ):
         raise ValueError("Unsupported Hoffman deployment config.")
     scratch_root = _absolute(payload.get("scratch_root", ""))
@@ -380,6 +422,7 @@ def _load_config(path_value: str, expected_sha: str | None) -> tuple[Path, dict,
     for task in TASKS:
         _validate_resource(task, payload)
     _validate_resource("shard_benchmark", payload)
+    _validate_numa_launch(payload, verify_executable=False)
     return path, payload, observed_sha
 
 
@@ -873,6 +916,7 @@ def _validate_common(
     ):
         resource_profile = "shard_benchmark"
     resource = _validate_resource(resource_profile, config)
+    numa_launch = _validate_numa_launch(config, verify_executable=True)
     return {
         "scratch_root": scratch_root,
         "job_root": job_root,
@@ -880,6 +924,7 @@ def _validate_common(
         "frozen": frozen,
         "resource": resource,
         "resource_profile": resource_profile,
+        "numa_launch": numa_launch,
         "receipt": job_root / "process_receipt.json",
         "qacct": job_root / "completed_qacct.json",
         "attempt_lock": job_root / "attempt.lock",
@@ -2714,6 +2759,7 @@ def _bootstrap_environment(common: dict) -> dict[str, str]:
         "PATH": f"{environment_root / 'bin'}:/usr/bin:/bin",
         "LD_LIBRARY_PATH": str(environment_root / "lib"),
         "TMPDIR": str(common["tmp"]),
+        NUMACTL_SENTINEL: "1",
         **{name: str(common["resource"]["slots"]) for name in THREAD_ENVIRONMENT},
     }
 
@@ -2757,7 +2803,31 @@ def _runtime_uge_environment(common: dict) -> dict:
             "hash_randomization": int(sys.flags.hash_randomization),
         },
         "bootstrap_environment": expected_bootstrap,
+        "numa_launch": {
+            "executable": common["numa_launch"]["executable_record"],
+            "arguments": list(common["numa_launch"]["arguments"]),
+        },
     }
+
+
+def _invoke_summit_cli(cli, command: list[str]) -> None:
+    """Run the frozen CLI in-process after the sealed outer NUMA launch."""
+    previous_argv = sys.argv
+    try:
+        sys.argv = ["summit", *command]
+        try:
+            result = cli.main()
+        except SystemExit as error:
+            code = error.code
+            if code not in (None, 0):
+                raise RuntimeError(
+                    f"SUMMIT CLI exited unsuccessfully with status {code}."
+                ) from error
+        else:
+            if result not in (None, 0):
+                raise RuntimeError(f"SUMMIT CLI returned unexpected status {result!r}.")
+    finally:
+        sys.argv = previous_argv
 
 
 def _rendered_job_script(
@@ -2794,6 +2864,11 @@ def _rendered_job_script(
         "--expected-job-spec-sha256",
         spec_sha,
     ]
+    outer_command = [
+        str(common["numa_launch"]["executable"]),
+        *common["numa_launch"]["arguments"],
+        *wrapper_command,
+    ]
     script = "\n".join(
         [
             "#!/bin/bash",
@@ -2812,7 +2887,7 @@ def _rendered_job_script(
             "  exit 73",
             "fi",
             *exports,
-            f"exec {shlex.join(wrapper_command)}",
+            f"exec {shlex.join(outer_command)}",
             "",
         ]
     )
@@ -2914,25 +2989,7 @@ def _run_task(args: argparse.Namespace) -> None:
     if plan["mode"] == "subprocess":
         subprocess.run(command, check=True, env=os.environ.copy())
     elif plan["mode"] == "summit":
-        cli = runtime["cli_module"]
-        previous_argv = sys.argv
-        try:
-            sys.argv = ["summit", *command]
-            try:
-                result = cli.main()
-            except SystemExit as error:
-                code = error.code
-                if code not in (None, 0):
-                    raise RuntimeError(
-                        f"SUMMIT CLI exited unsuccessfully with status {code}."
-                    ) from error
-            else:
-                if result not in (None, 0):
-                    raise RuntimeError(
-                        f"SUMMIT CLI returned unexpected status {result!r}."
-                    )
-        finally:
-            sys.argv = previous_argv
+        _invoke_summit_cli(runtime["cli_module"], command)
     else:  # pragma: no cover - plan construction owns this enum
         raise RuntimeError(f"Unsupported execution mode: {plan['mode']!r}")
 

@@ -50,7 +50,11 @@ def _config_for_scratch(scratch: Path) -> dict:
 
 def test_deployment_config_and_wrappers_are_fail_closed():
     config = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+    assert config["schema_version"] == DEPLOY.DEPLOYMENT_CONFIG_SCHEMA_VERSION == 2
     assert DEPLOY.FROZEN_CODE_MANIFEST_SCHEMA_VERSION == 2
+    numa = DEPLOY._validate_numa_launch(config, verify_executable=False)
+    assert str(numa["executable"]) == "/usr/bin/numactl"
+    assert numa["arguments"] == ("--interleave=all",)
     estimator = config["estimator"]
     assert estimator["annotation"] is None
     assert estimator["annotation_contract"] == "all_variants_unit_weight"
@@ -149,6 +153,10 @@ def test_uge_environment_rejects_arrays_and_slot_mismatch(
         "resource": {"slots": 4},
         "frozen": {"python": tmp_path / "env" / "bin" / "python"},
         "tmp": tmp_path / "scratch" / "tmp",
+        "numa_launch": {
+            "executable_record": {"path": "/usr/bin/numactl"},
+            "arguments": ("--interleave=all",),
+        },
     }
     monkeypatch.setattr(
         DEPLOY,
@@ -167,6 +175,10 @@ def test_uge_environment_rejects_arrays_and_slot_mismatch(
     for name, value in DEPLOY._bootstrap_environment(common).items():
         monkeypatch.setenv(name, value)
     assert DEPLOY._runtime_uge_environment(common)["job_id"] == 1234
+    monkeypatch.delenv("SUMMIT_NUMACTL_WRAPPED")
+    with pytest.raises(RuntimeError, match="sealed job bootstrap"):
+        DEPLOY._runtime_uge_environment(common)
+    monkeypatch.setenv("SUMMIT_NUMACTL_WRAPPED", "1")
     monkeypatch.setenv("SGE_TASK_ID", "7")
     with pytest.raises(RuntimeError, match="array"):
         DEPLOY._runtime_uge_environment(common)
@@ -184,6 +196,10 @@ def test_uge_environment_requires_isolated_no_bytecode_python(
         "resource": {"slots": 1},
         "frozen": {"python": tmp_path / "env" / "bin" / "python"},
         "tmp": tmp_path / "scratch" / "tmp",
+        "numa_launch": {
+            "executable_record": {"path": "/usr/bin/numactl"},
+            "arguments": ("--interleave=all",),
+        },
     }
     monkeypatch.setenv("JOB_ID", "1234")
     monkeypatch.setenv("NSLOTS", "1")
@@ -204,6 +220,31 @@ def test_uge_environment_requires_isolated_no_bytecode_python(
         )
         with pytest.raises(RuntimeError, match="-I -B"):
             DEPLOY._runtime_uge_environment(common)
+
+
+def test_embedded_cli_suppresses_numactl_reexec_and_restores_process_state(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    original_argv = ["deployment-runner", "--sealed"]
+    monkeypatch.setattr(DEPLOY.sys, "argv", original_argv)
+    monkeypatch.setenv("SUMMIT_NUMACTL_WRAPPED", "1")
+    observed = {}
+
+    class FakeCli:
+        @staticmethod
+        def main():
+            observed["argv"] = list(DEPLOY.sys.argv)
+            observed["sentinel"] = os.environ.get("SUMMIT_NUMACTL_WRAPPED")
+            if observed["sentinel"] != "1":
+                raise AssertionError("embedded CLI would re-exec through numactl")
+
+    DEPLOY._invoke_summit_cli(FakeCli, ["--gxe-build-cache", "--out", "x"])
+    assert observed == {
+        "argv": ["summit", "--gxe-build-cache", "--out", "x"],
+        "sentinel": "1",
+    }
+    assert DEPLOY.sys.argv is original_argv
+    assert os.environ["SUMMIT_NUMACTL_WRAPPED"] == "1"
 
 
 def test_distribution_fingerprint_binds_recorded_file_bytes(
@@ -243,6 +284,9 @@ def test_renderer_emits_private_nonarray_per_slot_job(
     wrapper = tmp_path / "uge_cache.sh"
     wrapper.write_text("#!/bin/bash\n", encoding="utf-8")
     wrapper.chmod(0o755)
+    numactl = tmp_path / "numactl"
+    numactl.write_text("#!/bin/bash\n", encoding="utf-8")
+    numactl.chmod(0o755)
     python = Path(os.environ.get("PYTHON", os.sys.executable))
     config = _config_for_scratch(scratch)
     spec = {
@@ -259,6 +303,12 @@ def test_renderer_emits_private_nonarray_per_slot_job(
         "scratch_root": scratch,
         "artifacts": job_root / "artifacts",
         "tmp": job_root / "tmp",
+        "numa_launch": {
+            "executable": numactl,
+            "executable_record": DEPLOY._record(numactl),
+            "arguments": ("--interleave=all",),
+            "environment_sentinel": "SUMMIT_NUMACTL_WRAPPED",
+        },
     }
     monkeypatch.setattr(
         DEPLOY, "_load_config", lambda *unused: (config_path, config, "a" * 64)
@@ -279,6 +329,8 @@ def test_renderer_emits_private_nonarray_per_slot_job(
     assert "#$ -l h_data=6G,h_rt=48:00:00,highp" in script
     assert "-tc" not in script and "SGE_TASK_ID" not in script
     assert "export OMP_NUM_THREADS=4" in script
+    assert "export SUMMIT_NUMACTL_WRAPPED=1" in script
+    assert f"exec {numactl} --interleave=all {wrapper}" in script
     assert f"export TMPDIR={job_root / 'tmp'}" in script
     assert stat.S_IMODE((job_root / "job.sh").stat().st_mode) == 0o700
     assert stat.S_IMODE((job_root / "stdout.log").stat().st_mode) == 0o600

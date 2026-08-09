@@ -2,10 +2,10 @@
 
 This directory contains preparation/verification code and an explicit runbook;
 it does not submit jobs. The cache, wide-score, probe-shard, and shard-merge
-APIs are implemented. At the final local pre-deployment validation, all 128
-focused GxE tests and all 262 repository tests passed. The remaining production
-gates are an independent test run from the checksummed frozen snapshot and the
-staged 50k calibration described below.
+APIs are implemented. All 130 focused GxE/deployment tests passed in the final
+local pre-deployment tree. The exact deployable commit tracks this focused
+suite and must repeat it from the checksummed frozen snapshot before sealing;
+the staged 50k calibration described below is the next production gate.
 
 ## Fixed analysis contract
 
@@ -422,6 +422,10 @@ do not depend on Python's process hash. The renderer uses a minimal
 exact imported module path, sealed interpreter/distribution hashes,
 code/config/cache hashes, command, UGE job ID, package versions, and thread
 variables before computation.
+The rendered job applies the hash-bound `/usr/bin/numactl --interleave=all`
+policy once at its outer launch boundary and exports the recursion sentinel
+before the runner calls SUMMIT in-process. A nested launcher would corrupt the
+embedded command line and invalidate the sealed invocation provenance.
 
 Monitor with `qstat -j <JOB_ID>` immediately after submission and after startup,
 then no more frequently than about every six hours for long jobs. Inspect only
