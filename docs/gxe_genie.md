@@ -141,6 +141,15 @@ interval to the panel and jackknife hashes; duplicate numerical contributions
 are rejected even if manifests are relabelled. Input files are parsed from
 owner-only snapshots of the exact bytes that passed their hash checks.
 
+After wide scoring, `--gxe-fit-batch` accepts a strict
+`summit.gxe.fit_batch` manifest and validates the reference/cache/panels once
+for all listed traits. Every phenotype moments/GWAS/GWIS triplet is still
+independently snapshotted, hashed, parsed, and checked against the reference
+SNP axis. Full and delete-block reference contractions are preaggregated once,
+so per-trait jackknife work depends on compact annotation/block sufficient
+statistics rather than rescanning all SNPs for every deletion block. The
+single-trait `--gxe-fit` path uses the same equations.
+
 The exact two-sided jackknife source sketches are spilled by SNP-deletion block
 to private temporary storage. This avoids rereading every genotype block for
 every deletion block: production uses a norm pass plus one source and one

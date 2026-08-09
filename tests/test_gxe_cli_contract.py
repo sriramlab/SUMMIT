@@ -118,6 +118,7 @@ def test_failed_gxe_cli_attempt_can_retry_with_existing_log(tmp_path, monkeypatc
             ],
             "_dispatch_gxe_merge",
         ),
+        (["--gxe-fit-batch", "batch.json"], "_dispatch_gxe_fit_batch"),
     ],
 )
 def test_gxe_reusable_workflow_modes_dispatch_once(
@@ -127,7 +128,12 @@ def test_gxe_reusable_workflow_modes_dispatch_once(
 
     calls = []
     monkeypatch.setattr(cli, "apply_env", lambda _: None)
-    for name in ("_dispatch_gxe_cache", "_dispatch_gxe_score", "_dispatch_gxe_merge"):
+    for name in (
+        "_dispatch_gxe_cache",
+        "_dispatch_gxe_score",
+        "_dispatch_gxe_merge",
+        "_dispatch_gxe_fit_batch",
+    ):
         monkeypatch.setattr(
             cli,
             name,
@@ -218,6 +224,17 @@ def test_gxe_reusable_mode_validation_rejects_ambiguous_or_unsafe_calls(tmp_path
             "--geno", "geno", "--env", "env", "--gxe-pheno", "traits.tsv",
             "--gxe-score-reference", "reference.json", "--gxe-overwrite",
         ],
+        ["--gxe-fit", "reference.json", "--gxe-fit-batch", "batch.json"],
+        ["--gxe-fit-batch", "batch.json", "--gxe-moments", "moments.json"],
+        ["--gxe-fit-batch", "batch.json", "--gxe-feature-cache", "cache.npz"],
+        ["--gxe-fit-batch", "batch.json", "--covar", "covariates.tsv"],
+        ["--gxe-fit-batch", "batch.json", "--annot", "annotations.tsv"],
+        ["--gxe-fit-batch", "batch.json", "--gxe-kernel-mode", "genie"],
+        ["--gxe-fit-batch=batch.json", "--gxe-kernel-mode=standardized"],
+        ["--gxe-fit-batch", "batch.json", "--gxe-feature-c", "cache.npz"],
+        ["--gxe-fit-batch", "batch.json", "--gxe-kernel-m", "genie"],
+        ["--gxe-fit-batch", "batch.json", "--ann", "annotations.tsv"],
+        ["--gxe-fit-batch", "batch.json", "--gxe-overwrite"],
     ]
     for index, extra in enumerate(cases):
         monkeypatch.setattr(

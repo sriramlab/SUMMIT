@@ -55,6 +55,66 @@ _PREPARSED_NUM_THREADS = _preparse_num_threads_from_argv(sys.argv[1:])
 if _PREPARSED_NUM_THREADS is not None:
     _set_thread_env_vars(_PREPARSED_NUM_THREADS)
 
+
+_GXE_BATCH_REFERENCE_OPTIONS = frozenset(
+    {
+        "--geno",
+        "--env",
+        "--covar",
+        "--annot",
+        "--gxe-feature-cache",
+        "--gxe-reference-shard",
+        "--gxe-probe-offset",
+        "--gxe-pheno",
+        "--gxe-pheno-col",
+        "--gxe-pheno-cols",
+        "--gxe-missing-values",
+        "--gxe-kernel-mode",
+        "--gxe-genotype-scale",
+        "--write-gxe-jackknife",
+        "--allow-low-probe-gxe-jackknife",
+        "--njack",
+        "--nvecs",
+        "--step_size",
+        "--seed",
+        "--rand-dist",
+        "--dtype",
+        "--rand-samp",
+        "--ddof",
+        "--impute-method",
+        "--target-xz-mem",
+        "--target-mem",
+        "--device",
+    }
+)
+
+
+def _provided_long_options(argv, *, parser=None):
+    """Return canonical explicit long options, including accepted abbreviations."""
+    observed = {
+        token.split("=", 1)[0]
+        for token in argv
+        if isinstance(token, str) and token.startswith("--")
+    }
+    if parser is None:
+        return observed
+    available = tuple(
+        option
+        for option in parser._option_string_actions
+        if option.startswith("--")
+    )
+    canonical = set()
+    for option in observed:
+        if option in available:
+            canonical.add(option)
+            continue
+        matches = [candidate for candidate in available if candidate.startswith(option)]
+        if len(matches) == 1:
+            canonical.add(matches[0])
+        else:
+            canonical.add(option)
+    return canonical
+
 import numpy as np
 import pandas as pd
 
@@ -70,7 +130,13 @@ from .inference.sumcore import Sumcore
 from .inference.trace import Trace
 from .sumstats.sumstats import Sumstats
 from .inference.rgcore import build_manifest_summary_row
-from .inference.gxe import fit_from_files as fit_gxe_from_files, write_fit as write_gxe_fit
+from .inference.gxe import (
+    fit_from_files as fit_gxe_from_files,
+    fit_many_from_files as fit_many_gxe_from_files,
+    load_fit_batch_manifest as load_gxe_fit_batch_manifest,
+    write_fit as write_gxe_fit,
+    write_fits as write_gxe_fits,
+)
 from .manifest.rg_manifest_builder import build_rg_manifest
 from .manifest.rg_manifest_fast import dispatch_rg_manifest_fast
 
@@ -169,6 +235,15 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         type=str,
         help="Fit the full G + GxE + NxE model from a SUMMIT GxE reference-manifest JSON.",
+    )
+    parser.add_argument(
+        "--gxe-fit-batch",
+        default=None,
+        type=str,
+        help=(
+            "Fit multiple hash-bound phenotype triplets against one GxE reference "
+            "using a strict summit.gxe.fit_batch JSON manifest."
+        ),
     )
     parser.add_argument("--gxe-gwas", default=None, type=str,
                         help="Marginal additive score file for --gxe-fit (direct SCORE contract).")
@@ -753,6 +828,41 @@ def _dispatch_h2(args, log):
     )
     sums._run()
     sums._logoff()
+
+
+def _dispatch_gxe_fit_batch(args, log):
+    reference, entries = load_gxe_fit_batch_manifest(
+        args.gxe_fit_batch,
+        scratch_dir=Path(args.out).expanduser().resolve().parent,
+    )
+    fitted = fit_many_gxe_from_files(
+        reference,
+        {entry.name: entry.phenotype_input for entry in entries},
+        allow_ill_conditioned=args.allow_ill_conditioned_gxe,
+        max_condition=args.gxe_max_condition,
+        scratch_dir=Path(args.out).expanduser().resolve().parent,
+    )
+    outputs = write_gxe_fits(
+        {
+            entry.name: (
+                entry.output_prefix,
+                fitted[entry.name][0],
+                fitted[entry.name][1],
+            )
+            for entry in entries
+        }
+    )
+    log._log(
+        f"[gxe] transactionally fitted and published {len(outputs)} phenotypes "
+        f"against one validated reference."
+    )
+    for entry in entries:
+        fit, _ = fitted[entry.name]
+        table_path, json_path = outputs[entry.name]
+        log._log(
+            f"[gxe] {entry.name}: rank={fit.rank}, condition={fit.condition_number:.6g}; "
+            f"results={table_path}; diagnostics={json_path}."
+        )
 
 
 def _dispatch_gxe_fit(args, log):
@@ -1373,6 +1483,7 @@ def main():
     gxe_score_mode = args.gxe_score_reference is not None
     gxe_merge_mode = args.gxe_merge_shards is not None
     gxe_fit_mode = args.gxe_fit is not None
+    gxe_fit_batch_mode = args.gxe_fit_batch is not None
     gxe_trace_mode = bool(
         args.geno is not None
         and args.env is not None
@@ -1380,16 +1491,28 @@ def main():
         and not gxe_score_mode
     )
     gxe_workflow_mode = bool(
-        gxe_cache_mode or gxe_score_mode or gxe_merge_mode or gxe_fit_mode or gxe_trace_mode
+        gxe_cache_mode
+        or gxe_score_mode
+        or gxe_merge_mode
+        or gxe_fit_mode
+        or gxe_fit_batch_mode
+        or gxe_trace_mode
     )
 
     special_gxe_modes = sum(
-        int(value) for value in (gxe_cache_mode, gxe_score_mode, gxe_merge_mode, gxe_fit_mode)
+        int(value)
+        for value in (
+            gxe_cache_mode,
+            gxe_score_mode,
+            gxe_merge_mode,
+            gxe_fit_mode,
+            gxe_fit_batch_mode,
+        )
     )
     if special_gxe_modes > 1:
         log._log(
             "!!! Choose only one of --gxe-build-cache, --gxe-score-reference, "
-            "--gxe-merge-shards, or --gxe-fit. !!!"
+            "--gxe-merge-shards, --gxe-fit, or --gxe-fit-batch. !!!"
         )
         raise SystemExit(1)
     if gxe_cache_mode:
@@ -1432,6 +1555,32 @@ def main():
                 "!!! GxE shard merging is transactionally no-overwrite; choose a fresh --out prefix. !!!"
             )
             raise SystemExit(1)
+    if gxe_fit_batch_mode:
+        if any(
+            value is not None
+            for value in (args.gxe_gwas, args.gwis, args.gxe_moments)
+        ):
+            log._log(
+                "!!! --gxe-fit-batch takes every phenotype triplet from its manifest; "
+                "do not also pass --gxe-gwas, --gwis, or --gxe-moments. !!!"
+            )
+            raise SystemExit(1)
+        conflicting_reference_options = sorted(
+            _provided_long_options(sys.argv[1:], parser=parser)
+            & _GXE_BATCH_REFERENCE_OPTIONS
+        )
+        if conflicting_reference_options:
+            log._log(
+                "!!! --gxe-fit-batch takes its reference and phenotype definitions "
+                "exclusively from the batch manifest and sealed artifacts; remove: "
+                f"{', '.join(conflicting_reference_options)}. !!!"
+            )
+            raise SystemExit(1)
+        if args.gxe_overwrite:
+            log._log(
+                "!!! Batch GxE fitting is transactionally no-overwrite; choose fresh output prefixes. !!!"
+            )
+            raise SystemExit(1)
     if args.gxe_reference_shard and not gxe_trace_mode:
         log._log("!!! --gxe-reference-shard requires the --geno/--env trace-generation mode. !!!")
         raise SystemExit(1)
@@ -1454,6 +1603,9 @@ def main():
                 ".gxe.diag.tsv.gz", ".gxe.ref.json",
             ]
             suffixes.append(".gxe.jackknife.npz")
+        elif gxe_fit_batch_mode:
+            # Trait-specific pairs are reserved transactionally by write_fits().
+            suffixes = []
         elif gxe_trace_mode:
             suffixes = [
                 ".gxx.ldscore.gz", ".gxe.ldscore.gz", ".exg.ldscore.gz", ".gee.ldscore.gz",
@@ -1510,6 +1662,7 @@ def main():
         + int(args.rg is not None)
         + int(build_manifest_mode)
         + int(args.gxe_fit is not None)
+        + int(args.gxe_fit_batch is not None)
     )
     if modes != 1:
         log._log(
@@ -1524,6 +1677,8 @@ def main():
         _dispatch_gxe_score(args, log)
     elif gxe_merge_mode:
         _dispatch_gxe_merge(args, log)
+    elif gxe_fit_batch_mode:
+        _dispatch_gxe_fit_batch(args, log)
     elif build_manifest_mode:
         _dispatch_make_rg_manifest(args, log)
     elif args.geno is not None:

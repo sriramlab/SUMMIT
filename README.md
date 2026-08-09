@@ -150,8 +150,10 @@ summit \
   --out outs/design
 ```
 
-Randomized traces can then be divided across disjoint probe identities. Ten
-jobs use offsets `0,10,...,90` with otherwise identical arguments:
+Randomized traces can then be divided across disjoint probe identities. The
+recommended B100 production layout uses two B50 jobs with offsets `0` and `50`;
+the probe-indexed RNG makes this equivalent to another tiling within declared
+floating-point tolerance:
 
 ```bash
 summit \
@@ -159,7 +161,7 @@ summit \
   --annot mafld.annot.gz \
   --gxe-feature-cache outs/design.gxe.cache.npz \
   --gxe-reference-shard --gxe-probe-offset 0 \
-  --nvecs 10 --seed 20260808 --rand-dist rademacher \
+  --nvecs 50 --seed 20260808 --rand-dist rademacher \
   --dtype float32 --step_size 500 \
   --gxe-kernel-mode standardized --gxe-genotype-scale sample \
   --write-gxe-jackknife --njack 100 \
@@ -194,7 +196,7 @@ The merged reference contains all four directional trace-score panels (`gxx`,
 `gxe`, `exg`, and `gee`), per-SNP projected norms/NxE diagonals, and exact
 two-sided deletion intersections. Each trait triplet contains direct marginal
 additive and interaction scores plus the indispensable scalar
-`y' diag(E^2) y`. Fit one trait with:
+`y' diag(E^2) y`.
 
 Exact jackknife generation requires at least 100 probes by default. Lower
 counts can strongly contaminate the delete-block SE through randomized
@@ -209,6 +211,35 @@ summit \
   --gxe-moments outs/scores.trait1.gxe.moments.json \
   --out outs/trait1
 ```
+
+For several traits sharing one reference, a strict batch manifest avoids
+reloading and reaggregating the reference for every fit while retaining full
+per-trait hash and SNP-axis validation:
+
+```json
+{
+  "kind": "summit.gxe.fit_batch",
+  "schema_version": 1,
+  "reference": "reference.B100.gxe.ref.json",
+  "traits": [
+    {
+      "name": "trait1",
+      "moments": "scores.trait1.gxe.moments.json",
+      "gwas": "scores.trait1.gxe.gwas.tsv.gz",
+      "gwis": "scores.trait1.gxe.gwis.tsv.gz",
+      "out": "fits/trait1"
+    }
+  ]
+}
+```
+
+```bash
+summit --gxe-fit-batch fit_batch.json --out outs/batch_fit
+```
+
+All trait result pairs are preflighted and published as one no-overwrite
+transaction. Downstream consumers should wait for successful command/job
+completion before reading a batch.
 
 The default `--gxe-kernel-mode standardized` uses SUMMIT's covariate-adjusted
 partial-correlation convention: form `P G` and `P[diag(E)G]`, then normalize
@@ -423,7 +454,9 @@ Exactly one of these modes must be specified.
   `<out>.gxe.shard.identity.json` and `<out>.gxe.shard.json`.
 - Batched GxE phenotype summaries: `<out>.<trait>.gxe.{gwas,gwis}.tsv.gz` and
   `<out>.<trait>.gxe.moments.json`.
-- GxE fit: `<out>.gxe.results.tsv`, `<out>.gxe.fit.json`, `<out>.gxe.log`.
+- GxE fit: `<out>.gxe.results.tsv`, `<out>.gxe.fit.json`, `<out>.gxe.log`;
+  batch fitting writes one result/JSON pair per manifest trait plus the global
+  batch log prefix.
 - h2: `<out>.results.tsv`, `<out>.log`, optionally `<out>.<trait>.jack`.
 - rg: `<out>.log`, optionally `<out>.rg.jack` and
   `<out>.rg.scoreeq.json`.

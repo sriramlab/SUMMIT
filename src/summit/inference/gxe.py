@@ -11,6 +11,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import stat
 import tempfile
 from dataclasses import dataclass, replace
@@ -32,6 +33,9 @@ _MOMENTS_KIND = "summit.gxe.phenotype_moments"
 _SCHEMA_VERSION = 3
 _SUPPORTED_SCHEMA_VERSIONS = frozenset({2, 3})
 _COPY_CHUNK_BYTES = 8 * 1024 * 1024
+_FIT_BATCH_KIND = "summit.gxe.fit_batch"
+_FIT_BATCH_SCHEMA_VERSION = 1
+_FIT_BATCH_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
 
 
 def _is_sha256(value: Any) -> bool:
@@ -124,6 +128,49 @@ class GxEFitResult:
                 ),
             }
         ).replace([np.inf, -np.inf], np.nan)
+
+
+@dataclass(frozen=True)
+class GxEPhenotypeInput:
+    """One hash-bound phenotype summary triplet for a reusable GxE reference."""
+
+    phenotype_moments: str | Path
+    gwas_scores: str | Path
+    gwis_scores: str | Path
+
+
+@dataclass(frozen=True)
+class GxEFitBatchEntry:
+    """Validated input/output record from a batch-fit manifest."""
+
+    name: str
+    phenotype_input: GxEPhenotypeInput
+    output_prefix: Path
+
+
+@dataclass(frozen=True)
+class _PreparedGxEReference:
+    """Validated in-memory reference sufficient statistics shared by traits."""
+
+    path: Path
+    payload: dict[str, Any]
+    manifest_sha256: str
+    schema_version: int
+    feature_cache_sha256: str | None
+    n_variants: int
+    variant_axis: dict[str, np.ndarray]
+    annotations: np.ndarray
+    annotation_masses: np.ndarray
+    annotation_names: tuple[str, ...]
+    residual_rank: int
+    component_names: tuple[str, ...]
+    normal_matrix: np.ndarray
+    traces: np.ndarray
+    block_values: np.ndarray | None
+    block_labels: tuple[str, ...]
+    block_masses: np.ndarray | None
+    deleted_matrices: np.ndarray | None
+    deleted_traces: np.ndarray | None
 
 
 def assemble_normal_equations(
@@ -490,6 +537,356 @@ def _assemble_deleted_normal_equations(
     return GxENormalEquations(0.5 * (lhs + lhs.T), rhs, traces, names)
 
 
+def _block_weighted_sums(
+    blocks: np.ndarray,
+    values: np.ndarray,
+    nblock: int,
+    *,
+    validate_blocks: bool = True,
+) -> np.ndarray:
+    """Sum one or more value columns by contiguous integer block ID.
+
+    The work is O(MC), where C is the number of value columns, rather than
+    O(JM).  ``np.bincount`` also handles valid non-contiguous SNP ordering
+    without allocating one Boolean mask per block.
+    """
+    block_ids = np.asarray(blocks, dtype=np.int64)
+    matrix = np.asarray(values, dtype=np.float64)
+    if matrix.ndim == 1:
+        matrix = matrix[:, None]
+    if matrix.ndim != 2 or matrix.shape[0] != block_ids.shape[0]:
+        raise ValueError("Block aggregation values are not aligned to block IDs.")
+    if nblock < 1 or (
+        validate_blocks
+        and set(np.unique(block_ids).tolist()) != set(range(nblock))
+    ):
+        raise ValueError("Block IDs must be contiguous integers starting at zero.")
+    if not np.all(np.isfinite(matrix)):
+        raise ValueError("Block aggregation values contain non-finite entries.")
+    result = np.empty((nblock, matrix.shape[1]), dtype=np.float64)
+    for column in range(matrix.shape[1]):
+        result[:, column] = np.bincount(
+            block_ids,
+            weights=matrix[:, column],
+            minlength=nblock,
+        )
+    return result
+
+
+def _annotation_vector_aggregates(
+    annotations: np.ndarray,
+    blocks: np.ndarray,
+    values: np.ndarray,
+    nblock: int,
+    *,
+    validate_blocks: bool = True,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return full and per-block annotation-weighted vector sums."""
+    annot = np.asarray(annotations, dtype=np.float64)
+    vector = np.asarray(values, dtype=np.float64)
+    if annot.ndim != 2 or vector.shape != (annot.shape[0],):
+        raise ValueError("Annotation/vector aggregates received inconsistent shapes.")
+    weighted = annot * vector[:, None]
+    full = np.asarray(
+        [np.dot(annot[:, column], vector) for column in range(annot.shape[1])],
+        dtype=np.float64,
+    )
+    return full, _block_weighted_sums(
+        blocks,
+        weighted,
+        nblock,
+        validate_blocks=validate_blocks,
+    )
+
+
+def _prepare_reference_sufficient_statistics(
+    *,
+    path: Path,
+    payload: dict[str, Any],
+    manifest_sha256: str,
+    schema_version: int,
+    feature_cache_sha256: str | None,
+    variants: pd.DataFrame,
+    annotations: np.ndarray,
+    annotation_names: Sequence[str],
+    panels: Mapping[str, np.ndarray],
+    norm_x: np.ndarray,
+    norm_w: np.ndarray,
+    diag_x: np.ndarray,
+    diag_w: np.ndarray,
+    equations: GxENormalEquations,
+    block_values: np.ndarray | None = None,
+    block_labels: Sequence[str] = (),
+    within: Mapping[str, np.ndarray] | None = None,
+    null_corrected: bool,
+) -> _PreparedGxEReference:
+    """Collapse a validated reference to reusable full/deletion templates."""
+    annot = np.asarray(annotations, dtype=np.float64)
+    m, k = annot.shape
+    masses = annot.sum(axis=0, dtype=np.float64)
+    r = float(payload["residual_rank"])
+    labels = tuple(str(value) for value in block_labels)
+
+    prepared_blocks: np.ndarray | None = None
+    block_masses: np.ndarray | None = None
+    deleted_matrices: np.ndarray | None = None
+    deleted_traces: np.ndarray | None = None
+    if block_values is not None or labels or within is not None:
+        if block_values is None or within is None or len(labels) < 2:
+            raise ValueError("Incomplete jackknife inputs for prepared GxE reference.")
+        prepared_blocks = np.asarray(block_values, dtype=np.int64)
+        if prepared_blocks.shape != (m,):
+            raise ValueError("Jackknife block IDs are not aligned to annotations.")
+        nblock = len(labels)
+        block_masses = _block_weighted_sums(prepared_blocks, annot, nblock)
+        remain = masses[None, :] - block_masses
+        if np.any(remain <= 0.0):
+            block_id, annotation = np.argwhere(remain <= 0.0)[0].tolist()
+            raise ValueError(
+                f"Deleting block {block_id} empties annotation column {annotation}."
+            )
+
+        vector_full: dict[str, np.ndarray] = {}
+        vector_block: dict[str, np.ndarray] = {}
+        for key, values in {
+            "norm_x": norm_x,
+            "norm_w": norm_w,
+            "diag_x": diag_x,
+            "diag_w": diag_w,
+        }.items():
+            vector_full[key], vector_block[key] = _annotation_vector_aggregates(
+                annot,
+                prepared_blocks,
+                np.asarray(values, dtype=np.float64),
+                nblock,
+                validate_blocks=False,
+            )
+
+        panel_full: dict[str, np.ndarray] = {}
+        panel_block: dict[str, np.ndarray] = {}
+        for key in ("xx", "xw", "wx", "ww"):
+            panel = np.asarray(panels[key], dtype=np.float64)
+            if panel.shape != (m, k):
+                raise ValueError(f"Reference panel {key!r} has inconsistent shape {panel.shape}.")
+            if null_corrected:
+                panel = panel + masses[None, :] / r
+            panel_full[key] = np.asarray(
+                [
+                    [np.dot(annot[:, left], panel[:, source]) for source in range(k)]
+                    for left in range(k)
+                ],
+                dtype=np.float64,
+            )
+            grouped = np.empty((nblock, k, k), dtype=np.float64)
+            for left in range(k):
+                grouped[:, left, :] = _block_weighted_sums(
+                    prepared_blocks,
+                    annot[:, left, None] * panel,
+                    nblock,
+                    validate_blocks=False,
+                )
+            panel_block[key] = grouped
+
+        p = 2 * k + 2
+        deleted_matrices = np.zeros((nblock, p, p), dtype=np.float64)
+        deleted_traces = np.zeros((nblock, p), dtype=np.float64)
+
+        def retained_directed(
+            block_id: int,
+            forward: str,
+            reverse: str,
+            left: int,
+            source: int,
+        ) -> float:
+            cross_sum = (
+                panel_full[forward][left, source]
+                - panel_block[forward][block_id, left, source]
+                - panel_block[reverse][block_id, source, left]
+                + float(within[forward][block_id, left, source])
+            )
+            return float(
+                r
+                * r
+                * cross_sum
+                / (remain[block_id, left] * remain[block_id, source])
+            )
+
+        for block_id in range(nblock):
+            lhs = deleted_matrices[block_id]
+            traces = deleted_traces[block_id]
+            for annotation in range(k):
+                mass = remain[block_id, annotation]
+                gi, wi = annotation, k + annotation
+                traces[gi] = (
+                    r
+                    * (vector_full["norm_x"][annotation] - vector_block["norm_x"][block_id, annotation])
+                    / mass
+                )
+                traces[wi] = (
+                    r
+                    * (vector_full["norm_w"][annotation] - vector_block["norm_w"][block_id, annotation])
+                    / mass
+                )
+                lhs[gi, 2 * k] = lhs[2 * k, gi] = (
+                    r
+                    * (vector_full["diag_x"][annotation] - vector_block["diag_x"][block_id, annotation])
+                    / mass
+                )
+                lhs[wi, 2 * k] = lhs[2 * k, wi] = (
+                    r
+                    * (vector_full["diag_w"][annotation] - vector_block["diag_w"][block_id, annotation])
+                    / mass
+                )
+                lhs[gi, 2 * k + 1] = lhs[2 * k + 1, gi] = traces[gi]
+                lhs[wi, 2 * k + 1] = lhs[2 * k + 1, wi] = traces[wi]
+
+            for left in range(k):
+                for source in range(k):
+                    lhs[left, source] = 0.5 * (
+                        retained_directed(block_id, "xx", "xx", left, source)
+                        + retained_directed(block_id, "xx", "xx", source, left)
+                    )
+                    lhs[k + left, k + source] = 0.5 * (
+                        retained_directed(block_id, "ww", "ww", left, source)
+                        + retained_directed(block_id, "ww", "ww", source, left)
+                    )
+                    cross = 0.5 * (
+                        retained_directed(block_id, "xw", "wx", left, source)
+                        + retained_directed(block_id, "wx", "xw", source, left)
+                    )
+                    lhs[left, k + source] = lhs[k + source, left] = cross
+
+            traces[2 * k] = float(payload["trace_nxe"])
+            traces[2 * k + 1] = r
+            lhs[2 * k, 2 * k] = float(payload["trace_nxe_sq"])
+            lhs[2 * k, 2 * k + 1] = lhs[2 * k + 1, 2 * k] = float(
+                payload["trace_nxe"]
+            )
+            lhs[2 * k + 1, 2 * k + 1] = r
+            lhs[:] = 0.5 * (lhs + lhs.T)
+
+    return _PreparedGxEReference(
+        path=path,
+        payload=dict(payload),
+        manifest_sha256=str(manifest_sha256),
+        schema_version=int(schema_version),
+        feature_cache_sha256=feature_cache_sha256,
+        n_variants=len(variants),
+        variant_axis={
+            column: variants[column].astype(str).to_numpy()
+            for column in ("CHR", "SNP", "BP", "A1", "A2")
+        },
+        annotations=np.array(annot, copy=True),
+        annotation_masses=np.array(masses, copy=True),
+        annotation_names=tuple(str(value) for value in annotation_names),
+        residual_rank=int(payload["residual_rank"]),
+        component_names=tuple(equations.component_names),
+        normal_matrix=np.array(equations.matrix, copy=True),
+        traces=np.array(equations.traces, copy=True),
+        block_values=(None if prepared_blocks is None else np.array(prepared_blocks, copy=True)),
+        block_labels=labels,
+        block_masses=(None if block_masses is None else np.array(block_masses, copy=True)),
+        deleted_matrices=(
+            None if deleted_matrices is None else np.array(deleted_matrices, copy=True)
+        ),
+        deleted_traces=(
+            None if deleted_traces is None else np.array(deleted_traces, copy=True)
+        ),
+    )
+
+
+def _equations_from_prepared_scores(
+    prepared: _PreparedGxEReference,
+    score_x: np.ndarray,
+    score_w: np.ndarray,
+    *,
+    q_nxe: float,
+    q_residual: float,
+) -> tuple[GxENormalEquations, tuple[GxENormalEquations, ...]]:
+    """Insert phenotype score moments into prepared reference templates."""
+    annot = prepared.annotations
+    m, k = annot.shape
+    sx = _as_float_array("score_x", score_x, ndim=1)
+    sw = _as_float_array("score_w", score_w, ndim=1)
+    _require_shape("score_x", sx, (m,))
+    _require_shape("score_w", sw, (m,))
+    r = float(prepared.residual_rank)
+    q_nxe = float(q_nxe)
+    q_residual = float(q_residual)
+    if not np.isfinite(q_nxe) or not np.isfinite(q_residual):
+        raise ValueError("NxE/residual phenotype moments must be finite.")
+    if q_nxe < 0.0 or q_residual <= 0.0:
+        raise ValueError("Phenotype quadratic moments require q_nxe >= 0 and q_residual > 0.")
+    if not np.isclose(q_residual, r, rtol=1.0e-10, atol=1.0e-8):
+        raise ValueError(
+            "q_residual is inconsistent with the declared normalized marginal-score scale: "
+            f"expected residual_rank={int(r)}, got {q_residual:.16g}."
+        )
+
+    score_full: dict[str, np.ndarray] = {}
+    score_block: dict[str, np.ndarray] = {}
+    for key, score in {"x": sx, "w": sw}.items():
+        squared = score * score
+        if not np.all(np.isfinite(squared)):
+            raise ValueError(f"score_{key} squared contains non-finite values.")
+        score_full[key] = np.asarray(
+            [np.dot(annot[:, column], squared) for column in range(k)],
+            dtype=np.float64,
+        )
+        if prepared.block_values is not None:
+            score_block[key] = _block_weighted_sums(
+                prepared.block_values,
+                annot * squared[:, None],
+                len(prepared.block_labels),
+                validate_blocks=False,
+            )
+
+    rhs = np.zeros(2 * k + 2, dtype=np.float64)
+    rhs[:k] = r * score_full["x"] / prepared.annotation_masses
+    rhs[k : 2 * k] = r * score_full["w"] / prepared.annotation_masses
+    rhs[2 * k] = q_nxe
+    rhs[2 * k + 1] = q_residual
+    full = GxENormalEquations(
+        np.array(prepared.normal_matrix, copy=True),
+        rhs,
+        np.array(prepared.traces, copy=True),
+        prepared.component_names,
+    )
+
+    deleted: list[GxENormalEquations] = []
+    if prepared.block_values is not None:
+        if (
+            prepared.block_masses is None
+            or prepared.deleted_matrices is None
+            or prepared.deleted_traces is None
+        ):
+            raise RuntimeError("Prepared jackknife reference is incomplete.")
+        remain = prepared.annotation_masses[None, :] - prepared.block_masses
+        for block_id in range(len(prepared.block_labels)):
+            deleted_rhs = np.zeros(2 * k + 2, dtype=np.float64)
+            deleted_rhs[:k] = (
+                r
+                * (score_full["x"] - score_block["x"][block_id])
+                / remain[block_id]
+            )
+            deleted_rhs[k : 2 * k] = (
+                r
+                * (score_full["w"] - score_block["w"][block_id])
+                / remain[block_id]
+            )
+            deleted_rhs[2 * k] = q_nxe
+            deleted_rhs[2 * k + 1] = q_residual
+            deleted.append(
+                GxENormalEquations(
+                    np.array(prepared.deleted_matrices[block_id], copy=True),
+                    deleted_rhs,
+                    np.array(prepared.deleted_traces[block_id], copy=True),
+                    prepared.component_names,
+                )
+            )
+    return full, tuple(deleted)
+
+
 def _load_json(path: str | Path) -> dict[str, Any]:
     with open(path, "rt", encoding="utf-8") as handle:
         obj = json.load(handle)
@@ -812,18 +1209,20 @@ def fit_from_files(
     scratch_dir: str | Path | None = None,
 ) -> tuple[GxEFitResult, GxENormalEquations]:
     """Load an immutable snapshot of a SUMMIT bundle and fit the full model."""
-    if scratch_dir is None:
-        scratch_dir = Path(phenotype_moments).expanduser().resolve().parent
-    with _InputSnapshotStore(scratch_dir) as snapshots:
-        return _fit_from_input_snapshots(
-            reference_manifest,
-            phenotype_moments,
-            gwas_scores,
-            gwis_scores,
-            snapshots=snapshots,
-            allow_ill_conditioned=allow_ill_conditioned,
-            max_condition=max_condition,
-        )
+    result = fit_many_from_files(
+        reference_manifest,
+        {
+            "phenotype": GxEPhenotypeInput(
+                phenotype_moments=phenotype_moments,
+                gwas_scores=gwas_scores,
+                gwis_scores=gwis_scores,
+            )
+        },
+        allow_ill_conditioned=allow_ill_conditioned,
+        max_condition=max_condition,
+        scratch_dir=scratch_dir,
+    )
+    return result["phenotype"]
 
 
 def _fit_from_input_snapshots(
@@ -835,6 +1234,7 @@ def _fit_from_input_snapshots(
     snapshots: _InputSnapshotStore,
     allow_ill_conditioned: bool,
     max_condition: float,
+    prepared_out: list[_PreparedGxEReference] | None = None,
 ) -> tuple[GxEFitResult, GxENormalEquations]:
     ref_path = Path(reference_manifest).resolve()
     mom_path = Path(phenotype_moments).resolve()
@@ -1204,6 +1604,10 @@ def _fit_from_input_snapshots(
             if not np.allclose(declared, observed, rtol=5.0e-10, atol=1.0e-8):
                 raise ValueError(f"Schema-v3 feature diagnostic {key!r} disagrees with the diagonal table.")
 
+    reference_variant_axis = {
+        column: variants[column].astype(str).to_numpy()
+        for column in ("CHR", "SNP", "BP", "A1", "A2")
+    }
     score_arrays = []
     for label, score_key, path in zip(
         ("GWAS", "GWIS"), ("gwas", "gwis"), supplied_score_paths
@@ -1229,7 +1633,9 @@ def _fit_from_input_snapshots(
         if len(table) != len(variants):
             raise ValueError(f"{label} score file has {len(table)} rows; expected {len(variants)}.")
         for col in ("CHR", "SNP", "BP", "A1", "A2"):
-            if not np.array_equal(table[col].astype(str).to_numpy(), variants[col].astype(str).to_numpy()):
+            if not np.array_equal(
+                table[col].astype(str).to_numpy(), reference_variant_axis[col]
+            ):
                 raise ValueError(f"{label} score file is not aligned to the reference ({col} mismatch).")
         modes = table["SCORE_MODE"].astype("string").str.lower()
         mode_values = set(modes.dropna().astype(str))
@@ -1290,6 +1696,7 @@ def _fit_from_input_snapshots(
             raise ValueError("Invalid phenotype_residual_variance_fraction in phenotype moments.")
         fit = replace(fit, phenotype_residual_variance_fraction=residual_fraction)
     jackknife_file = ref.get("files", {}).get("jackknife")
+    prepared: _PreparedGxEReference
     if jackknife_file is not None:
         if "BLOCK" not in diag.columns:
             raise ValueError("Reference manifest declares a jackknife file but diagonal table has no BLOCK column.")
@@ -1335,28 +1742,35 @@ def _fit_from_input_snapshots(
                     f"non-negative float64 {expected_shape}."
                 )
             value[value == 0.0] = 0.0
+        prepared = _prepare_reference_sufficient_statistics(
+            path=ref_path,
+            payload=ref,
+            manifest_sha256=observed_reference_hash,
+            schema_version=ref_version,
+            feature_cache_sha256=ref_cache_hash,
+            variants=variants,
+            annotations=annotations,
+            annotation_names=names,
+            panels=panels,
+            norm_x=diag["NORM_X"].to_numpy(dtype=np.float64),
+            norm_w=diag["NORM_W"].to_numpy(dtype=np.float64),
+            diag_x=diag["DNXE_X"].to_numpy(dtype=np.float64),
+            diag_w=diag["DNXE_W"].to_numpy(dtype=np.float64),
+            equations=eq,
+            block_values=block_values,
+            block_labels=labels,
+            within=within,
+            null_corrected=null_corrected,
+        )
+        _, deleted_equations = _equations_from_prepared_scores(
+            prepared,
+            score_arrays[0],
+            score_arrays[1],
+            q_nxe=float(moments["q_nxe"]),
+            q_residual=float(moments["q_residual"]),
+        )
         replicate_proportions = []
-        for block_id in range(nblock):
-            deleted = _assemble_deleted_normal_equations(
-                block_id=block_id,
-                annotations=annotations,
-                blocks=block_values,
-                score_x=score_arrays[0],
-                score_w=score_arrays[1],
-                panels=panels,
-                within=within,
-                norm_x=diag["NORM_X"].to_numpy(dtype=np.float64),
-                norm_w=diag["NORM_W"].to_numpy(dtype=np.float64),
-                diag_x=diag["DNXE_X"].to_numpy(dtype=np.float64),
-                diag_w=diag["DNXE_W"].to_numpy(dtype=np.float64),
-                residual_rank=int(ref["residual_rank"]),
-                q_nxe=float(moments["q_nxe"]),
-                q_residual=float(moments["q_residual"]),
-                trace_nxe=float(ref["trace_nxe"]),
-                trace_nxe_sq=float(ref["trace_nxe_sq"]),
-                annotation_names=names,
-                null_corrected=null_corrected,
-            )
+        for deleted in deleted_equations:
             deleted_fit = solve_normal_equations(
                 deleted,
                 allow_ill_conditioned=allow_ill_conditioned,
@@ -1372,7 +1786,432 @@ def _fit_from_input_snapshots(
             jackknife_estimates=replicate_array,
             jackknife_block_labels=labels,
         )
+    else:
+        prepared = _prepare_reference_sufficient_statistics(
+            path=ref_path,
+            payload=ref,
+            manifest_sha256=observed_reference_hash,
+            schema_version=ref_version,
+            feature_cache_sha256=ref_cache_hash,
+            variants=variants,
+            annotations=annotations,
+            annotation_names=names,
+            panels=panels,
+            norm_x=diag["NORM_X"].to_numpy(dtype=np.float64),
+            norm_w=diag["NORM_W"].to_numpy(dtype=np.float64),
+            diag_x=diag["DNXE_X"].to_numpy(dtype=np.float64),
+            diag_w=diag["DNXE_W"].to_numpy(dtype=np.float64),
+            equations=eq,
+            null_corrected=null_corrected,
+        )
+    if prepared_out is not None:
+        prepared_out.append(prepared)
     return fit, eq
+
+
+def _fit_prepared_from_input_snapshots(
+    prepared: _PreparedGxEReference,
+    phenotype_input: GxEPhenotypeInput,
+    *,
+    snapshots: _InputSnapshotStore,
+    validated_cache_hashes: set[str],
+    allow_ill_conditioned: bool,
+    max_condition: float,
+) -> tuple[GxEFitResult, GxENormalEquations]:
+    """Validate one phenotype triplet and fit it to an in-memory reference."""
+    ref = prepared.payload
+    mom_path = Path(phenotype_input.phenotype_moments).expanduser().resolve()
+    moments_snapshot = snapshots.capture(mom_path)
+    moments = _load_json(moments_snapshot.snapshot_path)
+    moments_version_raw = moments.get("schema_version")
+    if not isinstance(moments_version_raw, int) or isinstance(moments_version_raw, bool):
+        raise ValueError(f"Phenotype schema_version must be a JSON integer: {mom_path}.")
+    moments_version = int(moments_version_raw)
+    if (
+        moments.get("kind") != _MOMENTS_KIND
+        or moments_version not in _SUPPORTED_SCHEMA_VERSIONS
+    ):
+        raise ValueError(f"Unsupported GxE phenotype moments file: {mom_path}.")
+    if moments_version != prepared.schema_version:
+        raise ValueError(
+            "Reference and phenotype bundles use different schema versions: "
+            f"reference={prepared.schema_version}, moments={moments_version}."
+        )
+    for key in ("analysis_fingerprint", "variant_digest", "residual_rank"):
+        if str(ref.get(key)) != str(moments.get(key)):
+            raise ValueError(f"Reference and phenotype bundles disagree on {key}.")
+    if moments.get("score_definition") != (
+        "feature_transpose_residualized_y_over_sqrt_residual_rank"
+    ):
+        raise ValueError("Phenotype moments use an unsupported marginal-score scale.")
+
+    expected_reference_hash = moments.get("reference_manifest_sha256")
+    if not _is_sha256(expected_reference_hash):
+        raise ValueError("Phenotype moments do not bind the exact GxE reference manifest.")
+    ref_cache_hash = prepared.feature_cache_sha256
+    moments_cache_hash = moments.get("feature_cache_sha256")
+    if moments_cache_hash is not None and not _is_sha256(moments_cache_hash):
+        raise ValueError("Phenotype moments contain an invalid feature-cache SHA-256 binding.")
+    moments_cache = moments.get("feature_cache")
+    verified_moments_cache_hash = None
+    if moments_cache is not None:
+        if (
+            not isinstance(moments_cache, dict)
+            or not isinstance(moments_cache.get("path"), str)
+            or not moments_cache["path"]
+            or not _is_sha256(moments_cache.get("sha256"))
+        ):
+            raise ValueError("Phenotype moments have an invalid feature-cache binding.")
+        moments_cache_path = _resolve_path(mom_path, moments_cache["path"]).resolve()
+        verified_moments_cache_hash = str(moments_cache["sha256"])
+        cache_snapshot = snapshots.capture(moments_cache_path)
+        if cache_snapshot.sha256 != verified_moments_cache_hash:
+            raise ValueError("Phenotype-moment feature cache failed its SHA-256 check.")
+        if ref_cache_hash is not None and verified_moments_cache_hash != ref_cache_hash:
+            raise ValueError("Phenotype moments and reference point to different feature caches.")
+        if verified_moments_cache_hash not in validated_cache_hashes:
+            _, arrays = _load_feature_cache_bundle(cache_snapshot.snapshot_path)
+            arrays.clear()
+            validated_cache_hashes.add(verified_moments_cache_hash)
+        if (
+            moments_cache_hash is not None
+            and moments_cache_hash != verified_moments_cache_hash
+        ):
+            raise ValueError("Phenotype moments contain inconsistent feature-cache hashes.")
+    if prepared.manifest_sha256 != expected_reference_hash:
+        if (
+            ref_cache_hash is None
+            or verified_moments_cache_hash is None
+            or verified_moments_cache_hash != ref_cache_hash
+        ):
+            raise ValueError(
+                "Phenotype moments were generated for a different GxE reference/feature definition."
+            )
+    elif moments_cache_hash is not None and moments_cache_hash != ref_cache_hash:
+        raise ValueError("Phenotype moments and reference declare different feature caches.")
+
+    declared_score_files = moments.get("files")
+    if not isinstance(declared_score_files, dict) or not {"gwas", "gwis"}.issubset(
+        declared_score_files
+    ):
+        raise ValueError("Phenotype moments must declare the exact GWAS and GWIS score artifacts.")
+    supplied_score_paths = (
+        Path(phenotype_input.gwas_scores).expanduser().resolve(),
+        Path(phenotype_input.gwis_scores).expanduser().resolve(),
+    )
+    score_snapshots: dict[str, _InputSnapshot] = {}
+    for label, supplied in zip(("gwas", "gwis"), supplied_score_paths):
+        declared = _resolve_path(mom_path, str(declared_score_files[label])).resolve()
+        if supplied != declared:
+            raise ValueError(
+                f"Supplied {label.upper()} file {supplied} is not the phenotype-bound artifact {declared}."
+            )
+        score_hashes = moments.get("score_sha256")
+        if not isinstance(score_hashes, dict) or label not in score_hashes:
+            raise ValueError("Phenotype moments do not cryptographically bind both score artifacts.")
+        expected_hash = score_hashes[label]
+        if not _is_sha256(expected_hash):
+            raise ValueError(f"Phenotype moments contain an invalid {label.upper()} SHA-256.")
+        score_snapshot = snapshots.capture(supplied)
+        if score_snapshot.sha256 != str(expected_hash):
+            raise ValueError(f"{label.upper()} score file SHA-256 does not match phenotype moments.")
+        score_snapshots[label] = score_snapshot
+
+    score_arrays: list[np.ndarray] = []
+    for label, score_key, path in zip(
+        ("GWAS", "GWIS"), ("gwas", "gwis"), supplied_score_paths
+    ):
+        table = _read_table(score_snapshots[score_key].snapshot_path)
+        required = ["CHR", "SNP", "BP", "A1", "A2", "SCORE", "SCORE_MODE"]
+        if prepared.schema_version >= 3:
+            canonical_score_columns = [
+                "CHR",
+                "SNP",
+                "BP",
+                "A1",
+                "A2",
+                "N",
+                "DF",
+                "SCORE_MODE",
+                "SCORE",
+            ]
+            observed_score_columns = table.columns.astype(str).tolist()
+            if (
+                observed_score_columns != canonical_score_columns
+                or len(set(observed_score_columns)) != len(observed_score_columns)
+            ):
+                raise ValueError(
+                    f"{label} score file must contain exactly the canonical ordered columns "
+                    f"{canonical_score_columns}; observed {observed_score_columns}."
+                )
+        missing = [column for column in required if column not in table.columns]
+        if missing:
+            raise ValueError(f"{label} score file {path} is missing columns {missing}.")
+        if len(table) != prepared.n_variants:
+            raise ValueError(
+                f"{label} score file has {len(table)} rows; expected {prepared.n_variants}."
+            )
+        for column in ("CHR", "SNP", "BP", "A1", "A2"):
+            if not np.array_equal(
+                table[column].astype(str).to_numpy(),
+                prepared.variant_axis[column],
+            ):
+                raise ValueError(
+                    f"{label} score file is not aligned to the reference ({column} mismatch)."
+                )
+        modes = table["SCORE_MODE"].astype("string").str.lower()
+        mode_values = set(modes.dropna().astype(str))
+        if modes.isna().any() or not bool((modes == "marginal_cross_product").all()):
+            raise ValueError(
+                f"{label} uses unsupported SCORE_MODE={sorted(mode_values)}. "
+                "Conditional PLINK interaction statistics are not GENIE marginal scores."
+            )
+        n_values = (
+            pd.to_numeric(table["N"], errors="raise").to_numpy(dtype=np.float64)
+            if "N" in table
+            else None
+        )
+        df_values = (
+            pd.to_numeric(table["DF"], errors="raise").to_numpy(dtype=np.float64)
+            if "DF" in table
+            else None
+        )
+        if n_values is None or df_values is None:
+            raise ValueError(f"{label} score file must contain N and DF columns.")
+        if not np.all(n_values == float(ref["n_samples"])):
+            raise ValueError(f"{label} score file N does not match the reference sample count.")
+        if not np.all(df_values == float(prepared.residual_rank)):
+            raise ValueError(f"{label} score file DF does not match the reference residual rank.")
+        score_arrays.append(table["SCORE"].to_numpy(dtype=np.float64))
+
+    equations, deleted_equations = _equations_from_prepared_scores(
+        prepared,
+        score_arrays[0],
+        score_arrays[1],
+        q_nxe=float(moments["q_nxe"]),
+        q_residual=float(moments["q_residual"]),
+    )
+    fit = solve_normal_equations(
+        equations,
+        allow_ill_conditioned=allow_ill_conditioned,
+        max_condition=max_condition,
+    )
+    residual_fraction_raw = moments.get("phenotype_residual_variance_fraction")
+    if residual_fraction_raw is not None:
+        residual_fraction = float(residual_fraction_raw)
+        if not np.isfinite(residual_fraction) or not (
+            0.0 < residual_fraction <= 1.0 + 1.0e-8
+        ):
+            raise ValueError("Invalid phenotype_residual_variance_fraction in phenotype moments.")
+        fit = replace(fit, phenotype_residual_variance_fraction=residual_fraction)
+
+    if deleted_equations:
+        replicate_array = np.asarray(
+            [
+                solve_normal_equations(
+                    deleted,
+                    allow_ill_conditioned=allow_ill_conditioned,
+                    max_condition=max_condition,
+                ).proportions
+                for deleted in deleted_equations
+            ],
+            dtype=np.float64,
+        )
+        nblock = len(deleted_equations)
+        center = replicate_array.mean(axis=0)
+        se = np.sqrt(
+            (nblock - 1.0)
+            / nblock
+            * np.sum((replicate_array - center) ** 2, axis=0)
+        )
+        fit = replace(
+            fit,
+            standard_errors=se,
+            jackknife_estimates=replicate_array,
+            jackknife_block_labels=prepared.block_labels,
+        )
+    return fit, equations
+
+
+def fit_many_from_files(
+    reference_manifest: str | Path,
+    phenotype_inputs: Mapping[str, GxEPhenotypeInput],
+    *,
+    allow_ill_conditioned: bool = False,
+    max_condition: float = 1.0e12,
+    scratch_dir: str | Path | None = None,
+) -> dict[str, tuple[GxEFitResult, GxENormalEquations]]:
+    """Fit several phenotype triplets after validating their reference once."""
+    if not isinstance(phenotype_inputs, Mapping) or not phenotype_inputs:
+        raise ValueError("phenotype_inputs must be a non-empty mapping.")
+    normalized: list[tuple[str, GxEPhenotypeInput]] = []
+    for raw_name, phenotype_input in phenotype_inputs.items():
+        name = str(raw_name)
+        if not _FIT_BATCH_NAME.fullmatch(name):
+            raise ValueError(f"Invalid GxE batch phenotype name {name!r}.")
+        if not isinstance(phenotype_input, GxEPhenotypeInput):
+            raise TypeError(
+                "Every phenotype_inputs value must be a GxEPhenotypeInput instance."
+            )
+        normalized.append((name, phenotype_input))
+    if len({name for name, _ in normalized}) != len(normalized):
+        raise ValueError("GxE batch phenotype names must be unique.")
+    normalized_triplets = [
+        (
+            Path(value.phenotype_moments).expanduser().resolve(),
+            Path(value.gwas_scores).expanduser().resolve(),
+            Path(value.gwis_scores).expanduser().resolve(),
+        )
+        for _, value in normalized
+    ]
+    if len(set(normalized_triplets)) != len(normalized_triplets):
+        raise ValueError("GxE batch phenotype input triplets must be unique.")
+    if scratch_dir is None:
+        scratch_dir = (
+            Path(normalized[0][1].phenotype_moments).expanduser().resolve().parent
+        )
+
+    results: dict[str, tuple[GxEFitResult, GxENormalEquations]] = {}
+    with _InputSnapshotStore(scratch_dir) as snapshots:
+        # Capture every explicitly supplied file before parsing any manifest.
+        # Manifest-declared cache/reference artifacts are subsequently captured
+        # before their own validation and parsing, as in the singleton path.
+        snapshots.capture(reference_manifest)
+        for _, phenotype_input in normalized:
+            snapshots.capture(phenotype_input.phenotype_moments)
+            snapshots.capture(phenotype_input.gwas_scores)
+            snapshots.capture(phenotype_input.gwis_scores)
+
+        first_name, first_input = normalized[0]
+        prepared_out: list[_PreparedGxEReference] = []
+        results[first_name] = _fit_from_input_snapshots(
+            reference_manifest,
+            first_input.phenotype_moments,
+            first_input.gwas_scores,
+            first_input.gwis_scores,
+            snapshots=snapshots,
+            allow_ill_conditioned=allow_ill_conditioned,
+            max_condition=max_condition,
+            prepared_out=prepared_out,
+        )
+        if len(prepared_out) != 1:
+            raise RuntimeError("GxE reference preparation did not produce one reusable state.")
+        prepared = prepared_out[0]
+        validated_cache_hashes = (
+            {prepared.feature_cache_sha256}
+            if prepared.feature_cache_sha256 is not None
+            else set()
+        )
+        for name, phenotype_input in normalized[1:]:
+            results[name] = _fit_prepared_from_input_snapshots(
+                prepared,
+                phenotype_input,
+                snapshots=snapshots,
+                validated_cache_hashes=validated_cache_hashes,
+                allow_ill_conditioned=allow_ill_conditioned,
+                max_condition=max_condition,
+            )
+    return results
+
+
+def load_fit_batch_manifest(
+    manifest_path: str | Path,
+    *,
+    scratch_dir: str | Path | None = None,
+) -> tuple[Path, tuple[GxEFitBatchEntry, ...]]:
+    """Snapshot and validate a strict no-overwrite batch-fit manifest."""
+    path = Path(manifest_path).expanduser().resolve()
+    if scratch_dir is None:
+        scratch_dir = path.parent
+    with _InputSnapshotStore(scratch_dir) as snapshots:
+        snapshot = snapshots.capture(path)
+        payload = _load_json(snapshot.snapshot_path)
+    expected_root = {"kind", "schema_version", "reference", "traits"}
+    if set(payload) != expected_root:
+        raise ValueError(
+            f"GxE fit-batch manifest must contain exactly {sorted(expected_root)}."
+        )
+    if payload.get("kind") != _FIT_BATCH_KIND:
+        raise ValueError("Unsupported GxE fit-batch manifest kind.")
+    version = payload.get("schema_version")
+    if (
+        isinstance(version, bool)
+        or not isinstance(version, int)
+        or version != _FIT_BATCH_SCHEMA_VERSION
+    ):
+        raise ValueError("Unsupported GxE fit-batch manifest schema_version.")
+    reference_value = payload.get("reference")
+    if not isinstance(reference_value, str) or not reference_value:
+        raise ValueError("GxE fit-batch reference must be a non-empty path string.")
+    traits = payload.get("traits")
+    if not isinstance(traits, list) or not traits:
+        raise ValueError("GxE fit-batch traits must be a non-empty list.")
+
+    def resolve(value: str) -> Path:
+        candidate = Path(value).expanduser()
+        if not candidate.is_absolute():
+            candidate = path.parent / candidate
+        return candidate.resolve()
+
+    entries: list[GxEFitBatchEntry] = []
+    names: set[str] = set()
+    outputs: set[Path] = set()
+    inputs: set[tuple[Path, Path, Path]] = set()
+    expected_trait = {"name", "moments", "gwas", "gwis", "out"}
+    for index, record in enumerate(traits):
+        if not isinstance(record, dict) or set(record) != expected_trait:
+            raise ValueError(
+                f"GxE fit-batch trait {index} must contain exactly {sorted(expected_trait)}."
+            )
+        if any(not isinstance(record[key], str) or not record[key] for key in expected_trait):
+            raise ValueError(f"GxE fit-batch trait {index} values must be non-empty strings.")
+        name = record["name"]
+        if not _FIT_BATCH_NAME.fullmatch(name) or name in names:
+            raise ValueError(f"Invalid or duplicate GxE fit-batch trait name {name!r}.")
+        output = resolve(record["out"])
+        if output in outputs:
+            raise ValueError(f"Duplicate GxE fit-batch output prefix {output}.")
+        input_triplet = (
+            resolve(record["moments"]),
+            resolve(record["gwas"]),
+            resolve(record["gwis"]),
+        )
+        if input_triplet in inputs:
+            raise ValueError("Duplicate GxE fit-batch phenotype input triplet.")
+        names.add(name)
+        outputs.add(output)
+        inputs.add(input_triplet)
+        entries.append(
+            GxEFitBatchEntry(
+                name=name,
+                phenotype_input=GxEPhenotypeInput(
+                    phenotype_moments=input_triplet[0],
+                    gwas_scores=input_triplet[1],
+                    gwis_scores=input_triplet[2],
+                ),
+                output_prefix=output,
+            )
+        )
+    output_parents = {entry.output_prefix.parent for entry in entries}
+    if len(output_parents) != 1:
+        raise ValueError(
+            "All GxE fit-batch output prefixes must share one parent directory."
+        )
+    planned_outputs = sorted(
+        path
+        for entry in entries
+        for path in (
+            Path(str(entry.output_prefix) + ".gxe.results.tsv"),
+            Path(str(entry.output_prefix) + ".gxe.fit.json"),
+        )
+    )
+    existing = [path for path in planned_outputs if os.path.lexists(path)]
+    if existing:
+        raise FileExistsError(
+            "Refusing to overwrite existing GxE fit-batch output(s): "
+            + ", ".join(str(path) for path in existing)
+        )
+    return resolve(reference_value), tuple(entries)
 
 
 def write_fit(
@@ -1386,7 +2225,9 @@ def write_fit(
     table_path = Path(str(prefix) + ".gxe.results.tsv")
     json_path = Path(str(prefix) + ".gxe.fit.json")
     table_path.parent.mkdir(parents=True, exist_ok=True)
-    existing = [path for path in (table_path, json_path) if path.exists()]
+    existing = [
+        path for path in (table_path, json_path) if os.path.lexists(path)
+    ]
     if existing and not overwrite:
         raise FileExistsError(
             "Refusing to overwrite existing GxE fit output(s); choose a new --out prefix or pass "
@@ -1554,3 +2395,121 @@ def write_fit(
                         path.unlink(missing_ok=True)
             raise
     return table_path, json_path
+
+
+def write_fits(
+    outputs: Mapping[
+        str,
+        tuple[str | Path, GxEFitResult, GxENormalEquations],
+    ],
+) -> dict[str, tuple[Path, Path]]:
+    """Publish a complete multi-trait fit as one no-overwrite transaction."""
+    if not isinstance(outputs, Mapping) or not outputs:
+        raise ValueError("outputs must be a non-empty mapping.")
+    normalized: list[
+        tuple[str, Path, GxEFitResult, GxENormalEquations, Path, Path]
+    ] = []
+    final_paths: set[Path] = set()
+    parents: set[Path] = set()
+    for raw_name, value in outputs.items():
+        name = str(raw_name)
+        if not _FIT_BATCH_NAME.fullmatch(name):
+            raise ValueError(f"Invalid GxE batch phenotype name {name!r}.")
+        if not isinstance(value, tuple) or len(value) != 3:
+            raise TypeError("Every batch output must be (prefix, fit, equations).")
+        prefix_raw, fit, equations = value
+        if not isinstance(fit, GxEFitResult) or not isinstance(
+            equations, GxENormalEquations
+        ):
+            raise TypeError("Every batch output must contain GxEFitResult/GxENormalEquations.")
+        prefix = Path(prefix_raw).expanduser().resolve()
+        table = Path(str(prefix) + ".gxe.results.tsv")
+        manifest = Path(str(prefix) + ".gxe.fit.json")
+        if table in final_paths or manifest in final_paths:
+            raise ValueError("GxE batch output paths must be unique.")
+        final_paths.update((table, manifest))
+        parents.add(table.parent)
+        normalized.append((name, prefix, fit, equations, table, manifest))
+    if len(parents) != 1:
+        raise ValueError("All GxE batch output prefixes must share one parent directory.")
+    parent = next(iter(parents))
+    parent.mkdir(parents=True, exist_ok=True)
+    existing = sorted(path for path in final_paths if os.path.lexists(path))
+    if existing:
+        raise FileExistsError(
+            "Refusing to overwrite existing GxE batch fit output(s): "
+            + ", ".join(str(path) for path in existing)
+        )
+
+    published: list[tuple[Path, int, int]] = []
+    result: dict[str, tuple[Path, Path]] = {}
+    with tempfile.TemporaryDirectory(prefix=".gxe-fit-batch-stage-", dir=parent) as stage_name:
+        stage_dir = Path(stage_name)
+        os.chmod(stage_dir, 0o700)
+        staged_pairs: list[tuple[str, Path, Path, Path, Path]] = []
+        for index, (name, _, fit, equations, table, manifest) in enumerate(normalized):
+            staged_table, staged_manifest = write_fit(
+                stage_dir / f"{index:06d}",
+                fit,
+                equations,
+            )
+            staged_pairs.append(
+                (name, staged_table, staged_manifest, table, manifest)
+            )
+        expected_hashes = {
+            final: _sha256_file(staged)
+            for _, staged_table, staged_manifest, table, manifest in staged_pairs
+            for staged, final in (
+                (staged_table, table),
+                (staged_manifest, manifest),
+            )
+        }
+
+        def verify_published() -> None:
+            for path, device, inode in published:
+                try:
+                    observed = path.stat(follow_symlinks=False)
+                except FileNotFoundError as exc:
+                    raise RuntimeError(
+                        f"A published GxE batch output disappeared before commit: {path}."
+                    ) from exc
+                if observed.st_dev != device or observed.st_ino != inode:
+                    raise RuntimeError(
+                        f"A published GxE batch output was concurrently replaced: {path}."
+                    )
+                if _sha256_file(path) != expected_hashes[path]:
+                    raise RuntimeError(
+                        f"A published GxE batch output was modified in place: {path}."
+                    )
+
+        publication_order = [
+            (staged_table, table)
+            for _, staged_table, _, table, _ in staged_pairs
+        ] + [
+            (staged_manifest, manifest)
+            for _, _, staged_manifest, _, manifest in staged_pairs
+        ]
+        try:
+            for staged, final in publication_order:
+                verify_published()
+                staged_stat = staged.stat()
+                try:
+                    os.link(staged, final)
+                except FileExistsError as exc:
+                    raise FileExistsError(
+                        f"Refusing to overwrite concurrently created GxE batch output: {final}."
+                    ) from exc
+                published.append((final, staged_stat.st_dev, staged_stat.st_ino))
+            verify_published()
+        except Exception:
+            for path, device, inode in reversed(published):
+                try:
+                    observed = path.stat(follow_symlinks=False)
+                except FileNotFoundError:
+                    continue
+                if observed.st_dev == device and observed.st_ino == inode:
+                    path.unlink(missing_ok=True)
+            raise
+        for name, _, _, table, manifest in staged_pairs:
+            result[name] = (table, manifest)
+    return result

@@ -129,5 +129,52 @@ def test_cli_cache_shard_merge_wide_score_and_fit_roundtrip(tmp_path, monkeypatc
     fit_payload = json.loads(Path(f"{fit_prefix}.gxe.fit.json").read_text(encoding="utf-8"))
     assert fit_payload["component_names"] == ["G:L2_0", "GxE:L2_0", "NxE", "residual"]
     assert len(fit_payload["proportions"]) == 4
+
+    batch_manifest = tmp_path / "fit-batch.json"
+    batch_manifest.write_text(
+        json.dumps(
+            {
+                "kind": "summit.gxe.fit_batch",
+                "schema_version": 1,
+                "reference": reference.name,
+                "traits": [
+                    {
+                        "name": trait,
+                        "moments": f"{score_prefix.name}.{trait}.gxe.moments.json",
+                        "gwas": f"{score_prefix.name}.{trait}.gxe.gwas.tsv.gz",
+                        "gwis": f"{score_prefix.name}.{trait}.gxe.gwis.tsv.gz",
+                        "out": f"batch-{trait}",
+                    }
+                    for trait in ("Y1", "Y2")
+                ],
+            },
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    _run(
+        monkeypatch,
+        cli,
+        "--gxe-fit-batch", batch_manifest,
+        "--gxe-max-condition", "1e16",
+        "--allow-ill-conditioned-gxe",
+        "--out", tmp_path / "batch-job",
+    )
+    for trait in ("Y1", "Y2"):
+        batch_payload = json.loads(
+            (tmp_path / f"batch-{trait}.gxe.fit.json").read_text(encoding="utf-8")
+        )
+        assert batch_payload["component_names"] == fit_payload["component_names"]
+        assert len(batch_payload["proportions"]) == 4
+    np.testing.assert_allclose(
+        json.loads(
+            (tmp_path / "batch-Y1.gxe.fit.json").read_text(encoding="utf-8")
+        )["proportions"],
+        fit_payload["proportions"],
+        rtol=2e-12,
+        atol=2e-12,
+    )
     for path in tmp_path.glob("*.gxe.*"):
         assert (path.stat().st_mode & 0o777) == 0o600

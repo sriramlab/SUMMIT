@@ -2,17 +2,23 @@ from __future__ import annotations
 
 import json
 from dataclasses import replace
+from pathlib import Path
 
 import numpy as np
+import pandas as pd
 import pytest
 
 from summit.inference import gxe as gxe_module
 from summit.inference.gxe import (
     GxENormalEquations,
     _assemble_deleted_normal_equations,
+    _equations_from_prepared_scores,
+    _prepare_reference_sufficient_statistics,
     assemble_normal_equations,
+    load_fit_batch_manifest,
     solve_normal_equations,
     write_fit,
+    write_fits,
 )
 
 
@@ -334,3 +340,282 @@ def test_two_sided_block_deletion_matches_explicit_deleted_kernels():
         expected_rhs = np.asarray([y @ a @ y for a in kernels])
         np.testing.assert_allclose(deleted.matrix, expected_lhs, rtol=3e-13, atol=3e-13)
         np.testing.assert_allclose(deleted.rhs, expected_rhs, rtol=3e-13, atol=3e-13)
+
+
+@pytest.mark.parametrize("null_corrected", [False, True])
+def test_preaggregated_deletion_matches_legacy_for_overlapping_annotations(
+    null_corrected,
+):
+    rng = np.random.default_rng(947)
+    n, m, k, nblock = 31, 29, 3, 5
+    r = 27
+    x = rng.normal(size=(n, m))
+    w = rng.normal(size=(n, m))
+    y = rng.normal(size=n)
+    e = rng.normal(size=n)
+    annotations = 0.05 + rng.random((m, k))
+    # Deliberately interleave blocks; the optimization cannot assume slices.
+    blocks = (np.arange(m) * 7 + 3) % nblock
+    cross = {
+        "xx": (x.T @ x / r) ** 2,
+        "xw": (x.T @ w / r) ** 2,
+        "wx": (w.T @ x / r) ** 2,
+        "ww": (w.T @ w / r) ** 2,
+    }
+    raw_panels = {key: value @ annotations for key, value in cross.items()}
+    masses = annotations.sum(axis=0)
+    panels = {
+        key: value - masses[None, :] / r if null_corrected else value
+        for key, value in raw_panels.items()
+    }
+    within = {key: np.empty((nblock, k, k)) for key in panels}
+    for block_id in range(nblock):
+        take = blocks == block_id
+        for key, value in cross.items():
+            within[key][block_id] = (
+                annotations[take].T
+                @ value[np.ix_(take, take)]
+                @ annotations[take]
+            )
+    score_x = x.T @ y / np.sqrt(r)
+    score_w = w.T @ y / np.sqrt(r)
+    norm_x = np.sum(x * x, axis=0) / r
+    norm_w = np.sum(w * w, axis=0) / r
+    diag_x = np.sum((e[:, None] * x) ** 2, axis=0) / r
+    diag_w = np.sum((e[:, None] * w) ** 2, axis=0) / r
+    names = ("a", "b", "c")
+    full = assemble_normal_equations(
+        annotations=annotations,
+        score_x=score_x,
+        score_w=score_w,
+        ld_xx=panels["xx"],
+        ld_xw=panels["xw"],
+        ld_wx=panels["wx"],
+        ld_ww=panels["ww"],
+        norm_x=norm_x,
+        norm_w=norm_w,
+        diag_nxe_x=diag_x,
+        diag_nxe_w=diag_w,
+        residual_rank=r,
+        q_nxe=3.1,
+        q_residual=r,
+        trace_nxe=25.4,
+        trace_nxe_sq=30.2,
+        annotation_names=names,
+        null_corrected=null_corrected,
+    )
+    variants = pd.DataFrame(
+        {
+            "CHR": "1",
+            "SNP": [f"rs{index}" for index in range(m)],
+            "BP": np.arange(m),
+            "A1": "A",
+            "A2": "C",
+        }
+    )
+    prepared = _prepare_reference_sufficient_statistics(
+        path=Path("reference.json"),
+        payload={
+            "residual_rank": r,
+            "trace_nxe": 25.4,
+            "trace_nxe_sq": 30.2,
+        },
+        manifest_sha256="0" * 64,
+        schema_version=2,
+        feature_cache_sha256=None,
+        variants=variants,
+        annotations=annotations,
+        annotation_names=names,
+        panels=panels,
+        norm_x=norm_x,
+        norm_w=norm_w,
+        diag_x=diag_x,
+        diag_w=diag_w,
+        equations=full,
+        block_values=blocks,
+        block_labels=tuple(f"block:{index}" for index in range(nblock)),
+        within=within,
+        null_corrected=null_corrected,
+    )
+    prepared_full, prepared_deleted = _equations_from_prepared_scores(
+        prepared,
+        score_x,
+        score_w,
+        q_nxe=3.1,
+        q_residual=r,
+    )
+    np.testing.assert_allclose(prepared_full.matrix, full.matrix, rtol=0.0, atol=0.0)
+    np.testing.assert_allclose(prepared_full.rhs, full.rhs, rtol=3e-15, atol=3e-14)
+    for block_id, observed in enumerate(prepared_deleted):
+        expected = _assemble_deleted_normal_equations(
+            block_id=block_id,
+            annotations=annotations,
+            blocks=blocks,
+            score_x=score_x,
+            score_w=score_w,
+            panels=panels,
+            within=within,
+            norm_x=norm_x,
+            norm_w=norm_w,
+            diag_x=diag_x,
+            diag_w=diag_w,
+            residual_rank=r,
+            q_nxe=3.1,
+            q_residual=r,
+            trace_nxe=25.4,
+            trace_nxe_sq=30.2,
+            annotation_names=names,
+            null_corrected=null_corrected,
+        )
+        np.testing.assert_allclose(observed.matrix, expected.matrix, rtol=3e-15, atol=1e-12)
+        np.testing.assert_allclose(observed.rhs, expected.rhs, rtol=3e-15, atol=1e-12)
+        np.testing.assert_allclose(observed.traces, expected.traces, rtol=3e-15, atol=1e-12)
+
+
+def test_fit_batch_manifest_is_strict_and_resolves_relative_paths(tmp_path):
+    manifest = tmp_path / "batch.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "kind": "summit.gxe.fit_batch",
+                "schema_version": 1,
+                "reference": "reference.json",
+                "traits": [
+                    {
+                        "name": "Y1",
+                        "moments": "scores/Y1.moments.json",
+                        "gwas": "scores/Y1.gwas.gz",
+                        "gwis": "scores/Y1.gwis.gz",
+                        "out": "fits/Y1",
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    reference, entries = load_fit_batch_manifest(manifest)
+    assert reference == (tmp_path / "reference.json").resolve()
+    assert entries[0].phenotype_input.gwas_scores == (
+        tmp_path / "scores/Y1.gwas.gz"
+    ).resolve()
+    assert entries[0].output_prefix == (tmp_path / "fits/Y1").resolve()
+
+    payload = json.loads(manifest.read_text())
+    payload["schema_version"] = True
+    manifest.write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(ValueError, match="schema_version"):
+        load_fit_batch_manifest(manifest)
+
+    payload["schema_version"] = 1
+    payload["unexpected"] = "field"
+    manifest.write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(ValueError, match="exactly"):
+        load_fit_batch_manifest(manifest)
+
+    payload.pop("unexpected")
+    duplicate = dict(payload["traits"][0])
+    duplicate["name"] = "Y2"
+    duplicate["out"] = "fits/./Y1"
+    payload["traits"].append(duplicate)
+    manifest.write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(ValueError, match="Duplicate.*output prefix"):
+        load_fit_batch_manifest(manifest)
+
+    payload["traits"][1]["out"] = "other/Y2"
+    payload["traits"][1]["moments"] = "scores/Y2.moments.json"
+    payload["traits"][1]["gwas"] = "scores/Y2.gwas.gz"
+    payload["traits"][1]["gwis"] = "scores/Y2.gwis.gz"
+    manifest.write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(ValueError, match="share one parent"):
+        load_fit_batch_manifest(manifest)
+
+    payload["traits"] = payload["traits"][:1]
+    occupied = tmp_path / "fits/Y1.gxe.results.tsv"
+    occupied.parent.mkdir(parents=True)
+    occupied.write_text("existing\n", encoding="utf-8")
+    manifest.write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(FileExistsError, match="Refusing to overwrite"):
+        load_fit_batch_manifest(manifest)
+
+
+@pytest.mark.parametrize("nblock", [3, 101])
+def test_block_aggregation_scan_count_is_independent_of_jackknife_blocks(
+    monkeypatch, nblock
+):
+    actual = np.bincount
+    calls = 0
+
+    def counted(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return actual(*args, **kwargs)
+
+    monkeypatch.setattr(gxe_module.np, "bincount", counted)
+    blocks = np.arange(303, dtype=np.int64) % nblock
+    values = np.arange(303 * 4, dtype=np.float64).reshape(303, 4)
+    observed = gxe_module._block_weighted_sums(blocks, values, nblock)
+    assert observed.shape == (nblock, 4)
+    assert calls == values.shape[1]
+
+
+def test_batch_writer_preflights_and_publishes_all_traits_atomically(tmp_path):
+    equations, _, _, _ = _exact_fixture()
+    fitted = solve_normal_equations(equations, max_condition=1e16)
+    outputs = {
+        "Y1": (tmp_path / "Y1", fitted, equations),
+        "Y2": (tmp_path / "Y2", fitted, equations),
+    }
+    published = write_fits(outputs)
+    assert set(published) == {"Y1", "Y2"}
+    for pair in published.values():
+        assert all(path.is_file() for path in pair)
+        assert all((path.stat().st_mode & 0o777) == 0o600 for path in pair)
+
+    fresh = tmp_path / "fresh"
+    competing = tmp_path / "occupied.gxe.fit.json"
+    competing.write_text('{"writer":"competitor"}\n', encoding="utf-8")
+    with pytest.raises(FileExistsError, match="Refusing to overwrite"):
+        write_fits(
+            {
+                "fresh": (fresh, fitted, equations),
+                "occupied": (tmp_path / "occupied", fitted, equations),
+            }
+        )
+    assert not Path(str(fresh) + ".gxe.results.tsv").exists()
+    assert not Path(str(fresh) + ".gxe.fit.json").exists()
+    assert competing.read_text(encoding="utf-8") == '{"writer":"competitor"}\n'
+
+
+def test_batch_writer_rolls_back_only_its_inodes_on_publication_race(
+    tmp_path, monkeypatch
+):
+    equations, _, _, _ = _exact_fixture()
+    fitted = solve_normal_equations(equations, max_condition=1e16)
+    first = tmp_path / "first"
+    second = tmp_path / "second"
+    competing_path = Path(str(second) + ".gxe.results.tsv")
+    competing_bytes = b"competitor\n"
+    actual_link = gxe_module.os.link
+    calls = 0
+
+    def publish_then_compete(source, target):
+        nonlocal calls
+        result = actual_link(source, target)
+        calls += 1
+        if calls == 1:
+            competing_path.write_bytes(competing_bytes)
+        return result
+
+    monkeypatch.setattr(gxe_module.os, "link", publish_then_compete)
+    with pytest.raises(FileExistsError, match="concurrently created"):
+        write_fits(
+            {
+                "first": (first, fitted, equations),
+                "second": (second, fitted, equations),
+            }
+        )
+    assert not Path(str(first) + ".gxe.results.tsv").exists()
+    assert not Path(str(first) + ".gxe.fit.json").exists()
+    assert competing_path.read_bytes() == competing_bytes
+    assert not Path(str(second) + ".gxe.fit.json").exists()
+    assert not list(tmp_path.glob(".gxe-fit-batch-stage-*"))
