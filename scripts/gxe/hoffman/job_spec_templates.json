@@ -1,0 +1,120 @@
+{
+  "kind": "summit.gxe.hoffman_job_templates",
+  "schema_version": 1,
+  "record_contract": {
+    "path": "<ABSOLUTE_PATH>",
+    "bytes": "<NONNEGATIVE_INTEGER>",
+    "sha256": "<LOWERCASE_SHA256>"
+  },
+  "frozen_contract": {
+    "root": "/u/project/sriram/bronsonj/<FROZEN_SUMMIT_SNAPSHOT>",
+    "python": "/u/home/b/bronsonj/.conda/envs/summit/bin/python",
+    "native_build_dir": "/u/project/sriram/bronsonj/<FROZEN_SUMMIT_SNAPSHOT>/build/<WHEEL_TAG>",
+    "code_manifest": "<RECORD_FOR_FROZEN_CODE_MANIFEST>",
+    "deploy_sha256": "<SHA256_OF_HOFFMAN_DEPLOY_PY>",
+    "wrapper_sha256": "<SHA256_OF_TASK_SPECIFIC_WRAPPER>",
+    "cli_sha256": "<SHA256_OF_SRC_SUMMIT_CLI_PY>"
+  },
+  "templates": {
+    "stage_verify": {
+      "kind": "summit.gxe.hoffman_job",
+      "schema_version": 1,
+      "task": "stage_verify",
+      "job_name": "gxe_stage_full",
+      "job_root": "/u/scratch/b/bronsonj/summit_gxe_full_20260808/jobs/<NEW_STAGE_JOB>",
+      "frozen": "<COPY_FROZEN_CONTRACT_AND_TASK_WRAPPER_SHA>",
+      "qacct_dependencies": [],
+      "task_args": {
+        "dataset": "full",
+        "geno_prefix": "/u/scratch/b/bronsonj/summit_gxe_full_20260808/staged/full/<PLINK_PREFIX>",
+        "source_manifest": "<RECORD_FOR_PRIVATE_STAGED_SOURCE_MANIFEST>",
+        "staged_source_dir": "/u/scratch/b/bronsonj/summit_gxe_full_20260808/staged/phens",
+        "group_manifests": [
+          "<AGE_BP_GROUP_RECORD>",
+          "<AGE_ASSAY_GROUP_RECORD>",
+          "<SEX_WHR_GROUP_RECORD>",
+          "<SEX_ASSAY_GROUP_RECORD>"
+        ]
+      }
+    },
+    "cache": {
+      "kind": "summit.gxe.hoffman_job",
+      "schema_version": 1,
+      "task": "cache",
+      "job_name": "gxe_cache_age_bp",
+      "job_root": "/u/scratch/b/bronsonj/summit_gxe_full_20260808/jobs/<NEW_CACHE_JOB>",
+      "frozen": "<COPY_FROZEN_CONTRACT_AND_TASK_WRAPPER_SHA>",
+      "qacct_dependencies": ["<COMPLETED_STAGE_QACCT_RECORD>"],
+      "task_args": {
+        "geno_prefix": "<PRIVATE_STAGED_PLINK_PREFIX>",
+        "group_manifest": "<GROUP_MANIFEST_RECORD>",
+        "stage_verification": "<STAGE_VERIFICATION_REPORT_RECORD>"
+      }
+    },
+    "shard": {
+      "kind": "summit.gxe.hoffman_job",
+      "schema_version": 1,
+      "task": "shard",
+      "job_name": "gxe_age_bp_s00",
+      "job_root": "/u/scratch/b/bronsonj/summit_gxe_full_20260808/jobs/<NEW_SHARD_JOB>",
+      "frozen": "<COPY_FROZEN_CONTRACT_AND_TASK_WRAPPER_SHA>",
+      "qacct_dependencies": ["<COMPLETED_CACHE_QACCT_RECORD>"],
+      "task_args": {
+        "geno_prefix": "<PRIVATE_STAGED_PLINK_PREFIX>",
+        "group_manifest": "<GROUP_MANIFEST_RECORD>",
+        "stage_verification": "<STAGE_VERIFICATION_REPORT_RECORD>",
+        "cache": "<FEATURE_CACHE_RECORD>",
+        "shard_index": 0,
+        "role": "production"
+      }
+    },
+    "merge": {
+      "kind": "summit.gxe.hoffman_job",
+      "schema_version": 1,
+      "task": "merge",
+      "job_name": "gxe_age_bp_B010",
+      "job_root": "/u/scratch/b/bronsonj/summit_gxe_full_20260808/jobs/<NEW_MERGE_JOB>",
+      "frozen": "<COPY_FROZEN_CONTRACT_AND_TASK_WRAPPER_SHA>",
+      "qacct_dependencies": ["<ONE_COMPLETED_PRODUCTION_SHARD_QACCT_RECORD_PER_SHARD>"],
+      "task_args": {
+        "cache": "<FEATURE_CACHE_RECORD>",
+        "shards": ["<CONTIGUOUS_PRODUCTION_SHARD_MANIFEST_RECORDS_FROM_ZERO>"]
+      }
+    },
+    "score": {
+      "kind": "summit.gxe.hoffman_job",
+      "schema_version": 1,
+      "task": "score",
+      "job_name": "gxe_score_age_bp",
+      "job_root": "/u/scratch/b/bronsonj/summit_gxe_full_20260808/jobs/<NEW_SCORE_JOB>",
+      "frozen": "<COPY_FROZEN_CONTRACT_AND_TASK_WRAPPER_SHA>",
+      "qacct_dependencies": ["<COMPLETED_B100_MERGE_QACCT_RECORD>"],
+      "task_args": {
+        "geno_prefix": "<PRIVATE_STAGED_PLINK_PREFIX>",
+        "group_manifest": "<GROUP_MANIFEST_RECORD>",
+        "stage_verification": "<STAGE_VERIFICATION_REPORT_RECORD>",
+        "cache": "<FEATURE_CACHE_RECORD>",
+        "reference": "<B100_REFERENCE_MANIFEST_RECORD>",
+        "traits": ["<EXACT_CONFIGURED_TRAITS_IN_ORDER>"]
+      }
+    },
+    "fit": {
+      "kind": "summit.gxe.hoffman_job",
+      "schema_version": 1,
+      "task": "fit",
+      "job_name": "gxe_fit_age_bp_dbp",
+      "job_root": "/u/scratch/b/bronsonj/summit_gxe_full_20260808/jobs/<NEW_FIT_JOB>",
+      "frozen": "<COPY_FROZEN_CONTRACT_AND_TASK_WRAPPER_SHA>",
+      "qacct_dependencies": ["<COMPLETED_GROUP_SCORE_QACCT_RECORD>"],
+      "task_args": {
+        "group": "age_bp",
+        "trait": "bp_diastolic",
+        "cache": "<FEATURE_CACHE_RECORD>",
+        "reference": "<B100_REFERENCE_MANIFEST_RECORD>",
+        "moments": "<TRAIT_MOMENTS_RECORD>",
+        "gwas": "<TRAIT_GWAS_RECORD>",
+        "gwis": "<TRAIT_GWIS_RECORD>"
+      }
+    }
+  }
+}

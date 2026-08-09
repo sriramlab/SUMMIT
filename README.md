@@ -12,8 +12,8 @@ moments.
 - Genome-wide randomized LD scores from PLINK bed/bim/fam reference genotypes.
 - Covariate-adjusted and annotation-partitioned LD scores.
 - Optional fixed-window LD scores with `--ld-wind-kb`.
-- Optional GxE LD scores with `--env`; SUMMIT writes both additive-interaction
-  cross-LD and interaction-interaction LD scores.
+- Full one-environment GENIE-style G + GxE + NxE estimation from marginal
+  score summaries and an in-sample XX/XW/WX/WW trace bundle.
 - Heritability estimation from `BETA`/`SE` summary statistics.
 - Genetic correlation estimation with either a fixed overlap intercept or a
   summary-estimated intercept.
@@ -135,21 +135,104 @@ summit \
 
 This writes `*.win.ldscore.gz`, `*.win.M`, and `*.win.M_5_50`.
 
-### GxE LD scores
+### GxE, heterogeneous noise, and marginal GWIS scores
+
+Build the phenotype-independent feature cache once for a fixed cohort,
+environment, covariate design, SNP set, and annotation:
 
 ```bash
 summit \
-  --geno ref_panel.bed \
-  --env environment.txt \
-  --covar covariates.txt \
+  --gxe-build-cache \
+  --geno ref_panel --env environment.txt --covar covariates.txt \
   --annot mafld.annot.gz \
-  --out outs/ref.mafld.env \
-  --nvecs 1000 \
-  --num-threads 8
+  --gxe-kernel-mode standardized --gxe-genotype-scale sample \
+  --write-gxe-jackknife --njack 100 \
+  --out outs/design
+```
+
+Randomized traces can then be divided across disjoint probe identities. Ten
+jobs use offsets `0,10,...,90` with otherwise identical arguments:
+
+```bash
+summit \
+  --geno ref_panel --env environment.txt --covar covariates.txt \
+  --annot mafld.annot.gz \
+  --gxe-feature-cache outs/design.gxe.cache.npz \
+  --gxe-reference-shard --gxe-probe-offset 0 \
+  --nvecs 10 --seed 20260808 --rand-dist rademacher \
+  --dtype float32 --step_size 500 \
+  --gxe-kernel-mode standardized --gxe-genotype-scale sample \
+  --write-gxe-jackknife --njack 100 \
+  --out outs/shard.000
+```
+
+Merge only checked, disjoint shards, then score all selected traits in one
+genotype pass:
+
+```bash
+summit \
+  --gxe-merge-shards outs/shard.*.gxe.shard.json \
+  --gxe-feature-cache outs/design.gxe.cache.npz \
+  --out outs/reference.B100
+
+summit \
+  --gxe-score-reference outs/reference.B100.gxe.ref.json \
+  --geno ref_panel --env environment.txt --covar covariates.txt \
+  --gxe-pheno phenotypes.txt --gxe-pheno-cols trait1,trait2 \
+  --out outs/scores
 ```
 
 The environment file must contain `FID`, `IID`, and exactly one environment
-column. SUMMIT writes `*.gxe.ldscore.gz` and `*.gee.ldscore.gz`.
+column. Every selected phenotype must be finite on the cache's fixed cohort;
+build a common-cohort wide input first. The environment is standardized, and
+the intercept, environment, and supplied covariates are projected from the
+phenotype and both genetic feature panels. The projected phenotype is rescaled
+so `y'y = rank(P)`; the fitter verifies this contract rather than guessing a
+score scale.
+
+The merged reference contains all four directional trace-score panels (`gxx`,
+`gxe`, `exg`, and `gee`), per-SNP projected norms/NxE diagonals, and exact
+two-sided deletion intersections. Each trait triplet contains direct marginal
+additive and interaction scores plus the indispensable scalar
+`y' diag(E^2) y`. Fit one trait with:
+
+Exact jackknife generation requires at least 100 probes by default. Lower
+counts can strongly contaminate the delete-block SE through randomized
+within-block trace noise; the diagnostic-only override is
+`--allow-low-probe-gxe-jackknife`.
+
+```bash
+summit \
+  --gxe-fit outs/reference.B100.gxe.ref.json \
+  --gxe-gwas outs/scores.trait1.gxe.gwas.tsv.gz \
+  --gwis outs/scores.trait1.gxe.gwis.tsv.gz \
+  --gxe-moments outs/scores.trait1.gxe.moments.json \
+  --out outs/trait1
+```
+
+The default `--gxe-kernel-mode standardized` uses SUMMIT's covariate-adjusted
+partial-correlation convention: form `P G` and `P[diag(E)G]`, then normalize
+each valid projected column to squared norm `rank(P)`. This is the same
+post-projection convention used by SUMMIT's additive LD/score machinery and is
+invariant to nonsingular rescaling of a retained genotype column. The explicit
+`--gxe-kernel-mode genie --gxe-genotype-scale hwe` sensitivity mode instead
+keeps the natural norms of HWE-scaled projected columns to reproduce GENIE's
+kernel definition. These are different random-effect estimands, so their
+artifacts cannot be mixed; both choices are recorded and hash-bound.
+
+Do not pass a conventional PLINK 2 `--glm interaction` `ADDxE` Z statistic as
+`--gwis`: it is conditional on the SNP main effect. GENIE requires the marginal
+cross-product of projected `G*E` with projected phenotype. SUMMIT's generated
+files declare `SCORE_MODE=marginal_cross_product` and the loader rejects other
+declared modes. Every score/reference artifact is SHA-256-bound. Phenotype
+summaries are also bound to the exact feature cache, so the same scores can be
+reused across B10/B100 trace checkpoints from that cache without another
+genotype pass.
+
+Generation and fitting refuse an existing output prefix unless
+`--gxe-overwrite` is supplied explicitly; files are written atomically with
+owner-only permissions. See [docs/gxe_genie.md](docs/gxe_genie.md) for the equations,
+identifiability checks, file contract, and validation requirements.
 
 ### Heritability
 
@@ -306,7 +389,17 @@ Exactly one of these modes must be specified.
 - `--nvecs`: random vectors for stochastic genome-wide LD scores.
 - `--step_size`: SNP block size for LD-score computation.
 - `--covar`: covariate file with `FID IID` and covariate columns.
-- `--env`: one-column environment file for GxE LD scores.
+- `--env`: one-column environment file for the GxE reference/score bundle.
+- `--gxe-build-cache`: write `<out>.gxe.cache.npz` and stop.
+- `--gxe-feature-cache`, `--gxe-reference-shard`, `--gxe-probe-offset`: reuse
+  the exact feature definition and generate a disjoint, non-fit-able trace shard.
+- `--gxe-merge-shards`: validate and merge shard manifests into a fit-able reference.
+- `--gxe-score-reference`: produce marginal scores and NxE moments from a
+  sealed reference; `--gxe-pheno-cols` selects columns from `--gxe-pheno`.
+- `--write-gxe-jackknife`: write within-block intersections needed for
+  two-sided GENIE kernel-deletion SEs; block layout comes from `--njack`.
+- `--allow-low-probe-gxe-jackknife`: diagnostic override for fewer than 100
+  probes; resulting SEs are not production-calibrated.
 - `--ld-wind-kb`: compute fixed-window LD scores instead of randomized
   genome-wide LD scores.
 - `--rand-samp`: random subset of samples; a ratio in `(0,1]` or an integer
@@ -323,8 +416,14 @@ Exactly one of these modes must be specified.
   `<out>.gw.kmoments`.
 - Windowed LD scores: `<out>.win.ldscore.gz`, `<out>.win.M`,
   `<out>.win.M_5_50`, `<out>.win.log`.
-- GxE LD scores: `<out>.gxe.ldscore.gz`, `<out>.gee.ldscore.gz`,
-  `<out>.gxe.log`.
+- GxE reference: `<out>.{gxx,gxe,exg,gee}.ldscore.gz`,
+  `<out>.gxe.diag.tsv.gz`, `<out>.gxe.ref.json`, and optionally
+  `<out>.gxe.jackknife.npz`.
+- GxE cache/shard: `<out>.gxe.cache.npz` or directional panels plus
+  `<out>.gxe.shard.identity.json` and `<out>.gxe.shard.json`.
+- Batched GxE phenotype summaries: `<out>.<trait>.gxe.{gwas,gwis}.tsv.gz` and
+  `<out>.<trait>.gxe.moments.json`.
+- GxE fit: `<out>.gxe.results.tsv`, `<out>.gxe.fit.json`, `<out>.gxe.log`.
 - h2: `<out>.results.tsv`, `<out>.log`, optionally `<out>.<trait>.jack`.
 - rg: `<out>.log`, optionally `<out>.rg.jack` and
   `<out>.rg.scoreeq.json`.

@@ -1,0 +1,82 @@
+{
+  "kind": "summit.gxe.hoffman_deployment",
+  "schema_version": 1,
+  "scratch_root": "/u/scratch/b/bronsonj/summit_gxe_full_20260808",
+  "allowed_frozen_root": "/u/project/sriram/bronsonj",
+  "python_executable": "/u/home/b/bronsonj/.conda/envs/summit/bin/python",
+  "panel_config_sha256": "d5b4caee0a3c14d6531ff5bea10c86a4c4f8999eb0fe26c6024ebe341ecbb6cd",
+  "estimator": {
+    "annotation": null,
+    "annotation_contract": "all_variants_unit_weight",
+    "annotation_name": "L2_0",
+    "annotation_mass": 454207,
+    "feature_cache_schema_version": 2,
+    "reference_shard_schema_version": 2,
+    "reference_schema_version": 3,
+    "kernel_mode": "standardized",
+    "genotype_scale": "sample",
+    "jackknife_blocks": 100,
+    "probes_per_shard": 10,
+    "production_probes": 100,
+    "random_distribution": "rademacher",
+    "seed": 20260808,
+    "dtype": "float32",
+    "ddof": 1,
+    "missing_values": "-9,NA,NaN,nan,.,None,null",
+    "impute_method": "mean",
+    "step_size": 500,
+    "target_xz_mem_gib": 16
+  },
+  "resources": {
+    "stage_verify": {
+      "slots": 1,
+      "h_data_gib_per_slot": 4,
+      "total_memory_gib": 4,
+      "h_rt": "24:00:00",
+      "highp": true
+    },
+    "cache": {
+      "slots": 4,
+      "h_data_gib_per_slot": 6,
+      "total_memory_gib": 24,
+      "h_rt": "48:00:00",
+      "highp": true
+    },
+    "shard": {
+      "slots": 4,
+      "h_data_gib_per_slot": 6,
+      "total_memory_gib": 24,
+      "h_rt": "48:00:00",
+      "highp": true
+    },
+    "shard_benchmark": {
+      "slots": 8,
+      "h_data_gib_per_slot": 4,
+      "total_memory_gib": 32,
+      "h_rt": "24:00:00",
+      "highp": true
+    },
+    "merge": {
+      "slots": 1,
+      "h_data_gib_per_slot": 8,
+      "total_memory_gib": 8,
+      "h_rt": "08:00:00",
+      "highp": true
+    },
+    "score": {
+      "slots": 4,
+      "h_data_gib_per_slot": 6,
+      "total_memory_gib": 24,
+      "h_rt": "48:00:00",
+      "highp": true
+    },
+    "fit": {
+      "slots": 1,
+      "h_data_gib_per_slot": 4,
+      "total_memory_gib": 4,
+      "h_rt": "04:00:00",
+      "highp": true
+    }
+  },
+  "monitor_interval_hours": 6
+}
