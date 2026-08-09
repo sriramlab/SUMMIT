@@ -2,8 +2,8 @@
 
 This directory contains preparation/verification code and an explicit runbook;
 it does not submit jobs. The cache, wide-score, probe-shard, and shard-merge
-APIs are implemented. At the final local pre-deployment validation, all 126
-focused GxE tests and all 260 repository tests passed. The remaining production
+APIs are implemented. At the final local pre-deployment validation, all 128
+focused GxE tests and all 262 repository tests passed. The remaining production
 gates are an independent test run from the checksummed frozen snapshot and the
 staged 50k calibration described below.
 
@@ -141,14 +141,15 @@ non-frozen imports.
 
 After copying the final code snapshot below `/u/project/sriram/bronsonj`, make
 one new 0700 provenance directory inside that snapshot and seal the exact
-package Python files, deployment scripts/configs, interpreter, and native
-`gwldcore` extension. This command refuses an existing manifest:
+package Python files, deployment scripts/configs, interpreter bytes, every
+recorded file in the required Python distributions, and native `gwldcore`
+extension. This command refuses an existing manifest:
 
 ```bash
 GXE_FROZEN=/u/project/sriram/bronsonj/<FROZEN_SUMMIT_SNAPSHOT>
 GXE_PY=/u/home/b/bronsonj/.conda/envs/summit/bin/python
 install -d -m 0700 "${GXE_FROZEN}/private_provenance"
-"${GXE_PY}" -I "${GXE_FROZEN}/scripts/gxe/hoffman/hoffman_deploy.py" \
+"${GXE_PY}" -I -B "${GXE_FROZEN}/scripts/gxe/hoffman/hoffman_deploy.py" \
   seal-code-manifest \
   --config "${GXE_FROZEN}/scripts/gxe/hoffman/deployment_config.json" \
   --root "${GXE_FROZEN}" \
@@ -163,7 +164,7 @@ record object (`path`, byte count, and lowercase SHA256). Create its `job_root`
 once as an empty 0700 leaf. Render without submitting:
 
 ```bash
-"${GXE_PY}" -I "${GXE_FROZEN}/scripts/gxe/hoffman/hoffman_deploy.py" \
+"${GXE_PY}" -I -B "${GXE_FROZEN}/scripts/gxe/hoffman/hoffman_deploy.py" \
   render \
   --config "${GXE_FROZEN}/scripts/gxe/hoffman/deployment_config.json" \
   --job-spec <PRIVATE_MODE_0600_JOB_SPEC>
@@ -177,7 +178,7 @@ collector once (no polling loop), supplying the receipt values recorded after
 the job closed:
 
 ```bash
-"${GXE_PY}" -I "${GXE_FROZEN}/scripts/gxe/hoffman/hoffman_deploy.py" \
+"${GXE_PY}" -I -B "${GXE_FROZEN}/scripts/gxe/hoffman/hoffman_deploy.py" \
   record-qacct \
   --config "${GXE_FROZEN}/scripts/gxe/hoffman/deployment_config.json" \
   --expected-config-sha256 <FROZEN_DEPLOYMENT_CONFIG_SHA256> \
@@ -197,7 +198,12 @@ Every downstream spec must cite the completed qacct record, not merely the
 process receipt. Merge specs accept only completed production shard receipts;
 the separately named eight-slot shard-00 benchmark can never enter a merge.
 
-Set these task-specific variables inside each private job script:
+The renderer derives every task-specific path from the validated `task_args`
+records in the private job spec and writes a deterministic, hash-checked
+`job.sh`. Do not edit that script or inject shell variables into it. The
+following names are explanatory shorthand used only by the manual CLI
+templates below; production jobs use the equivalent concrete paths assembled
+by `hoffman_deploy.py`:
 
 ```bash
 GXE_SUMMIT=<FROZEN_CHECKSUMMED_SUMMIT_ENTRYPOINT>
@@ -406,11 +412,15 @@ run one group at a time in two waves of five four-slot probe jobs (20 requested
 slots per wave).
 
 All `-o`/`-e` logs, Python temporary files, and generated job scripts must be
-scratch paths. The renderer fixes `TMPDIR` to a private job subdirectory, sets
-`PYTHONNOUSERSITE=1` and `PYTHONDONTWRITEBYTECODE=1`, uses a minimal environment
+scratch paths. The renderer fixes `TMPDIR` to a private job subdirectory; the
+wrapper runs Python with `-I -B`, and the runtime verifies effective isolated,
+no-user-site, and no-bytecode flags. Python hash randomization remains enabled
+under `-I`; scientific probe identities use the explicit sealed Philox seed and
+do not depend on Python's process hash. The renderer uses a minimal
 `PATH`/`LD_LIBRARY_PATH`, caps BLAS/OpenMP threads to `NSLOTS`, and records the
-exact imported module path, code/config/cache hashes, command, UGE job ID,
-package versions, and thread variables before computation.
+exact imported module path, sealed interpreter/distribution hashes,
+code/config/cache hashes, command, UGE job ID, package versions, and thread
+variables before computation.
 
 Monitor with `qstat -j <JOB_ID>` immediately after submission and after startup,
 then no more frequently than about every six hours for long jobs. Inspect only

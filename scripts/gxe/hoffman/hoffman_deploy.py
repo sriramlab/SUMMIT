@@ -25,6 +25,7 @@ import subprocess
 import sys
 import tempfile
 from datetime import datetime, timezone
+from importlib import metadata as importlib_metadata
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -33,6 +34,23 @@ TASKS = ("stage_verify", "cache", "shard", "merge", "score", "fit")
 WRAPPERS = {task: f"uge_{task}.sh" for task in TASKS}
 SAFE_NAME = re.compile(r"^[A-Za-z][A-Za-z0-9_.-]{0,127}$")
 SHA256 = re.compile(r"^[0-9a-f]{64}$")
+REQUIRED_DISTRIBUTIONS = (
+    "bed-reader",
+    "charset-normalizer",
+    "numpy",
+    "packaging",
+    "pandas",
+    "platformdirs",
+    "pooch",
+    "psutil",
+    "python-dateutil",
+    "pytz",
+    "scipy",
+    "setuptools",
+    "six",
+    "threadpoolctl",
+    "tqdm",
+)
 CRITICAL_CODE_FILES = frozenset(
     {
         "pyproject.toml",
@@ -72,6 +90,65 @@ def _sha256(path: Path) -> str:
 
 def _sha256_bytes(value: bytes) -> str:
     return hashlib.sha256(value).hexdigest()
+
+
+def _distribution_fingerprint(name: str) -> dict:
+    """Hash every installed file recorded by one required distribution."""
+    distribution = importlib_metadata.distribution(name)
+    recorded = distribution.files
+    if recorded is None:
+        raise RuntimeError(f"Installed distribution {name!r} has no file manifest.")
+    digest = hashlib.sha256()
+    count = 0
+    total = 0
+    for relative in sorted(recorded, key=lambda value: str(value)):
+        relative_text = str(relative).replace(os.sep, "/")
+        path = Path(distribution.locate_file(relative))
+        try:
+            status = os.lstat(path)
+        except FileNotFoundError as error:
+            raise RuntimeError(
+                f"Installed distribution {name!r} is missing {relative_text!r}."
+            ) from error
+        if not stat.S_ISREG(status.st_mode):
+            raise RuntimeError(
+                f"Installed distribution {name!r} contains a non-regular recorded "
+                f"file: {relative_text!r}."
+            )
+        file_sha = _sha256(path)
+        digest.update(
+            json.dumps(
+                [relative_text, int(status.st_size), file_sha],
+                ensure_ascii=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        )
+        digest.update(b"\n")
+        count += 1
+        total += int(status.st_size)
+    if count == 0:
+        raise RuntimeError(
+            f"Installed distribution {name!r} has an empty file manifest."
+        )
+    return {
+        "version": distribution.version,
+        "file_count": count,
+        "bytes": total,
+        "content_sha256": digest.hexdigest(),
+    }
+
+
+def _environment_fingerprint(python_path: Path) -> dict:
+    if _absolute(sys.executable) != python_path:
+        raise RuntimeError(
+            "Deployment environment must be sealed and validated with the configured Python."
+        )
+    return {
+        "python": _record(python_path),
+        "distributions": {
+            name: _distribution_fingerprint(name) for name in REQUIRED_DISTRIBUTIONS
+        },
+    }
 
 
 def _absolute(value: str | Path) -> Path:
@@ -375,6 +452,13 @@ def _validate_code_manifest(
         raise ValueError("Frozen code manifest names a different snapshot root.")
     if _absolute(payload.get("python_executable", "")) != python_path:
         raise ValueError("Frozen code manifest names a different Python executable.")
+    environment = payload.get("environment")
+    observed_environment = _environment_fingerprint(python_path)
+    if environment != observed_environment:
+        raise ValueError(
+            "Configured Python or required distribution files differ from the "
+            "frozen environment manifest."
+        )
 
     files = payload.get("files")
     expected_files = _expected_code_files(frozen_root)
@@ -447,6 +531,7 @@ def _validate_code_manifest(
         "files": verified,
         "native": verified_native,
         "native_build": native_build,
+        "environment": observed_environment,
     }
 
 
@@ -1784,11 +1869,8 @@ def _assert_frozen_imports(frozen: dict) -> dict:
         )
 
     try:
-        from importlib import metadata as importlib_metadata
-
         package_versions = {
-            name: importlib_metadata.version(name)
-            for name in ("numpy", "pandas", "bed-reader", "scipy")
+            name: importlib_metadata.version(name) for name in REQUIRED_DISTRIBUTIONS
         }
     except Exception as error:  # pragma: no cover - environment-specific failure detail
         raise RuntimeError("Could not seal required package versions.") from error
@@ -1900,6 +1982,7 @@ def _prepare_task(
         command = [
             str(common["frozen"]["python"]),
             "-I",
+            "-B",
             str(verify_script),
             "--config",
             str(common["frozen"]["panel"]),
@@ -2627,7 +2710,6 @@ def _bootstrap_environment(common: dict) -> dict[str, str]:
     return {
         "PYTHONNOUSERSITE": "1",
         "PYTHONDONTWRITEBYTECODE": "1",
-        "PYTHONHASHSEED": "0",
         "PATH": f"{environment_root / 'bin'}:/usr/bin:/bin",
         "LD_LIBRARY_PATH": str(environment_root / "lib"),
         "TMPDIR": str(common["tmp"]),
@@ -2636,6 +2718,15 @@ def _bootstrap_environment(common: dict) -> dict[str, str]:
 
 
 def _runtime_uge_environment(common: dict) -> dict:
+    if (
+        not sys.flags.isolated
+        or not sys.flags.no_user_site
+        or not sys.flags.dont_write_bytecode
+    ):
+        raise RuntimeError(
+            "Hoffman jobs require Python -I -B so user-site imports are disabled and "
+            "frozen imports cannot write bytecode."
+        )
     resource = common["resource"]
     task_id = os.environ.get("SGE_TASK_ID")
     if task_id not in (None, "", "undefined"):
@@ -2658,6 +2749,12 @@ def _runtime_uge_environment(common: dict) -> dict:
         "task_id": task_id,
         "thread_environment": {name: os.environ[name] for name in THREAD_ENVIRONMENT},
         "python_no_user_site": os.environ["PYTHONNOUSERSITE"],
+        "python_flags": {
+            "isolated": int(sys.flags.isolated),
+            "no_user_site": int(sys.flags.no_user_site),
+            "dont_write_bytecode": int(sys.flags.dont_write_bytecode),
+            "hash_randomization": int(sys.flags.hash_randomization),
+        },
         "bootstrap_environment": expected_bootstrap,
     }
 
@@ -3184,6 +3281,7 @@ def _seal_code_manifest(args: argparse.Namespace) -> None:
         "schema_version": 1,
         "root": str(root),
         "python_executable": str(python_path),
+        "environment": _environment_fingerprint(python_path),
         "files": files,
         "native_module": {
             "path": native.relative_to(root).as_posix(),

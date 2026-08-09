@@ -6,6 +6,7 @@ import json
 import os
 import stat
 import subprocess
+import types
 from pathlib import Path
 
 import pytest
@@ -67,7 +68,7 @@ def test_deployment_config_and_wrappers_are_fail_closed():
         text = wrapper.read_text(encoding="utf-8")
         assert "set -euo pipefail" in text
         assert "umask 077" in text
-        assert " -I " in text
+        assert " -I -B " in text
         assert f"--task {task}" in text
         assert "-tc" not in text
     benchmark = DEPLOY._validate_resource("shard_benchmark", config)
@@ -148,6 +149,18 @@ def test_uge_environment_rejects_arrays_and_slot_mismatch(
         "frozen": {"python": tmp_path / "env" / "bin" / "python"},
         "tmp": tmp_path / "scratch" / "tmp",
     }
+    monkeypatch.setattr(
+        DEPLOY,
+        "sys",
+        types.SimpleNamespace(
+            flags=types.SimpleNamespace(
+                isolated=1,
+                no_user_site=1,
+                dont_write_bytecode=1,
+                hash_randomization=1,
+            )
+        ),
+    )
     monkeypatch.setenv("JOB_ID", "1234")
     monkeypatch.setenv("NSLOTS", "4")
     for name, value in DEPLOY._bootstrap_environment(common).items():
@@ -160,6 +173,63 @@ def test_uge_environment_rejects_arrays_and_slot_mismatch(
     monkeypatch.setenv("NSLOTS", "8")
     with pytest.raises(RuntimeError, match="NSLOTS"):
         DEPLOY._runtime_uge_environment(common)
+
+
+def test_uge_environment_requires_isolated_no_bytecode_python(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    common = {
+        "resource": {"slots": 1},
+        "frozen": {"python": tmp_path / "env" / "bin" / "python"},
+        "tmp": tmp_path / "scratch" / "tmp",
+    }
+    monkeypatch.setenv("JOB_ID", "1234")
+    monkeypatch.setenv("NSLOTS", "1")
+    for name, value in DEPLOY._bootstrap_environment(common).items():
+        monkeypatch.setenv(name, value)
+    for isolated, no_user_site, no_bytecode in ((0, 1, 1), (1, 0, 1), (1, 1, 0)):
+        monkeypatch.setattr(
+            DEPLOY,
+            "sys",
+            types.SimpleNamespace(
+                flags=types.SimpleNamespace(
+                    isolated=isolated,
+                    no_user_site=no_user_site,
+                    dont_write_bytecode=no_bytecode,
+                    hash_randomization=1,
+                )
+            ),
+        )
+        with pytest.raises(RuntimeError, match="-I -B"):
+            DEPLOY._runtime_uge_environment(common)
+
+
+def test_distribution_fingerprint_binds_recorded_file_bytes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    package_file = tmp_path / "module.py"
+    package_file.write_text("value = 1\n", encoding="utf-8")
+
+    class FakeDistribution:
+        version = "1.2.3"
+        files = [Path("module.py")]
+
+        @staticmethod
+        def locate_file(relative: Path) -> Path:
+            return tmp_path / relative
+
+    monkeypatch.setattr(
+        DEPLOY.importlib_metadata,
+        "distribution",
+        lambda unused_name: FakeDistribution(),
+    )
+    before = DEPLOY._distribution_fingerprint("example")
+    package_file.write_text("value = 2\n", encoding="utf-8")
+    after = DEPLOY._distribution_fingerprint("example")
+    assert before["version"] == after["version"] == "1.2.3"
+    assert before["content_sha256"] != after["content_sha256"]
 
 
 def test_renderer_emits_private_nonarray_per_slot_job(
