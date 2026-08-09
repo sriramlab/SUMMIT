@@ -213,6 +213,35 @@ def _require_close(name: str, observed, expected, *, rtol: float = 2e-12, atol: 
         raise ValueError(f"GxE feature cache has inconsistent {name}.")
 
 
+def _environment_transforms_equal(observed: Any, expected: Any) -> bool:
+    """Compare one fixed design exactly, allowing only floating reduction noise."""
+    if not isinstance(observed, Mapping) or not isinstance(expected, Mapping):
+        return False
+    if set(observed) != set(expected):
+        return False
+    exact_fields = (
+        "standardized", "ddof", "units", "fixed_effect_design_sha256",
+    )
+    if any(observed.get(name) != expected.get(name) for name in exact_fields):
+        return False
+    numeric_fields = (
+        "raw_mean", "raw_sd", "analysis_mean", "analysis_sum_squares",
+    )
+    try:
+        observed_values = np.asarray(
+            [observed[name] for name in numeric_fields], dtype=np.float64,
+        )
+        expected_values = np.asarray(
+            [expected[name] for name in numeric_fields], dtype=np.float64,
+        )
+    except (KeyError, TypeError, ValueError):
+        return False
+    return bool(np.allclose(
+        observed_values, expected_values, rtol=2e-12, atol=2e-10,
+        equal_nan=False,
+    ))
+
+
 def _feature_cache_variant_digest(arrays: Mapping[str, np.ndarray]) -> str:
     digest = hashlib.sha256()
     for values in zip(
@@ -585,12 +614,16 @@ def _validate_feature_cache_semantics(
     )
 
     if expected_identity is not None:
-        observed_identity = {key: metadata.get(key) for key in expected_identity}
-        if observed_identity != dict(expected_identity):
-            mismatches = [
-                key for key in expected_identity
-                if observed_identity.get(key) != expected_identity.get(key)
-            ]
+        mismatches = []
+        for key, expected_value in expected_identity.items():
+            observed_value = metadata.get(key)
+            if key == "environment_transform":
+                matches = _environment_transforms_equal(observed_value, expected_value)
+            else:
+                matches = observed_value == expected_value
+            if not matches:
+                mismatches.append(key)
+        if mismatches:
             raise ValueError(
                 "GxE feature cache does not match the current genotype/design/annotation/mode/jackknife "
                 f"configuration; mismatched fields: {mismatches}."
@@ -817,8 +850,14 @@ def read_env_and_cov(
         "raw_mean": env_mean,
         "raw_sd": env_std,
         "ddof": int(ddof),
-        "analysis_mean": float(env_vec.mean()),
-        "analysis_sum_squares": float(np.dot(env_vec, env_vec)),
+        # BLAS may reduce np.dot() in a thread-count-dependent order.  These
+        # provenance diagnostics must be deterministic across thread counts.
+        "analysis_mean": float(
+            math.fsum(float(value) for value in env_vec) / env_vec.size
+        ),
+        "analysis_sum_squares": float(
+            math.fsum(float(value) * float(value) for value in env_vec)
+        ),
         "units": "per_environment_sd" if std else "input_units",
     }
 

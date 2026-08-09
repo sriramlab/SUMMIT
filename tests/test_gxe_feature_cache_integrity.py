@@ -82,6 +82,12 @@ def test_schema_v2_cache_seals_exact_nxe_sufficient_statistics(tmp_path):
     metadata, arrays = _read_cache(cache)
 
     assert metadata["schema_version"] == 2
+    assert metadata["environment_transform"]["analysis_mean"] == (
+        math.fsum(float(value) for value in builder.env) / builder.env.size
+    )
+    assert metadata["environment_transform"]["analysis_sum_squares"] == math.fsum(
+        float(value) * float(value) for value in builder.env
+    )
     assert arrays["nxe_qdq"].shape == (builder.p_eff + 1, builder.p_eff + 1)
     assert arrays["nxe_trace_terms"].shape == (3,)
     _validate_feature_cache_semantics(metadata, arrays)
@@ -100,6 +106,35 @@ def test_schema_v2_cache_seals_exact_nxe_sufficient_statistics(tmp_path):
         arrays["nxe_trace_terms"],
         [d.sum(), np.dot(d, d), np.sum((d[:, None] * q_full) ** 2)],
     )
+
+
+def test_cache_identity_tolerates_only_environment_reduction_roundoff(tmp_path):
+    builder = _make_builder(tmp_path, "environment-roundoff")
+    cache = tmp_path / "environment-roundoff.gxe.cache.npz"
+    builder.write_feature_cache(cache)
+    metadata, arrays = _read_cache(cache)
+
+    transform = metadata["environment_transform"]
+    transform["analysis_sum_squares"] += (
+        1.0e-12 * abs(transform["analysis_sum_squares"])
+    )
+    _reseal_cache(cache, metadata, arrays)
+    builder._load_feature_cache(cache)
+
+    metadata, arrays = _read_cache(cache)
+    metadata["environment_transform"]["fixed_effect_design_sha256"] = "f" * 64
+    _reseal_cache(cache, metadata, arrays)
+    with pytest.raises(ValueError, match="environment_transform"):
+        builder._load_feature_cache(cache)
+
+    metadata, arrays = _read_cache(cache)
+    metadata["environment_transform"]["fixed_effect_design_sha256"] = (
+        builder.environment_transform["fixed_effect_design_sha256"]
+    )
+    metadata["environment_transform"]["analysis_sum_squares"] += 1.0
+    _reseal_cache(cache, metadata, arrays)
+    with pytest.raises(ValueError, match="environment sum of squares"):
+        builder._load_feature_cache(cache)
 
 
 @pytest.mark.parametrize("field", ["trace_nxe", "trace_nxe_sq"])
