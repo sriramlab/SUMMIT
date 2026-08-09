@@ -143,7 +143,8 @@ After copying the final code snapshot below `/u/project/sriram/bronsonj`, make
 one new 0700 provenance directory inside that snapshot and seal the exact
 package Python files, deployment scripts/configs, interpreter bytes, every
 recorded file in the required Python distributions, and native `gwldcore`
-extension. This command refuses an existing manifest:
+extension in a schema-v2 frozen manifest. This command refuses an existing
+manifest:
 
 ```bash
 GXE_FROZEN=/u/project/sriram/bronsonj/<FROZEN_SUMMIT_SNAPSHOT>

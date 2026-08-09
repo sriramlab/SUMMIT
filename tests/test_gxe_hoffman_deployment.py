@@ -50,6 +50,7 @@ def _config_for_scratch(scratch: Path) -> dict:
 
 def test_deployment_config_and_wrappers_are_fail_closed():
     config = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+    assert DEPLOY.FROZEN_CODE_MANIFEST_SCHEMA_VERSION == 2
     estimator = config["estimator"]
     assert estimator["annotation"] is None
     assert estimator["annotation_contract"] == "all_variants_unit_weight"

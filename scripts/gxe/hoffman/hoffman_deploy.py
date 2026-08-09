@@ -34,6 +34,7 @@ TASKS = ("stage_verify", "cache", "shard", "merge", "score", "fit")
 WRAPPERS = {task: f"uge_{task}.sh" for task in TASKS}
 SAFE_NAME = re.compile(r"^[A-Za-z][A-Za-z0-9_.-]{0,127}$")
 SHA256 = re.compile(r"^[0-9a-f]{64}$")
+FROZEN_CODE_MANIFEST_SCHEMA_VERSION = 2
 REQUIRED_DISTRIBUTIONS = (
     "bed-reader",
     "charset-normalizer",
@@ -445,7 +446,7 @@ def _validate_code_manifest(
     payload, _, _ = _read_json(manifest_path, "frozen code manifest", private=False)
     if (
         payload.get("kind") != "summit.gxe.frozen_code_manifest"
-        or payload.get("schema_version") != 1
+        or payload.get("schema_version") != FROZEN_CODE_MANIFEST_SCHEMA_VERSION
     ):
         raise ValueError("Unsupported frozen code manifest.")
     if _absolute(payload.get("root", "")) != frozen_root:
@@ -3278,7 +3279,7 @@ def _seal_code_manifest(args: argparse.Namespace) -> None:
         raise FileExistsError(f"Refusing existing frozen code manifest: {output}")
     payload = {
         "kind": "summit.gxe.frozen_code_manifest",
-        "schema_version": 1,
+        "schema_version": FROZEN_CODE_MANIFEST_SCHEMA_VERSION,
         "root": str(root),
         "python_executable": str(python_path),
         "environment": _environment_fingerprint(python_path),
