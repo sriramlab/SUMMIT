@@ -121,9 +121,10 @@ Use `--dataset subset_50k` and group manifests built against the staged valid
 
 ## Computation gate and exact CLI sequence
 
-The cache, reference-shard, shard-merge, wide-score, and fit APIs pass the
-current-source equivalence suite. Production remains gated on repeating those
-checks from the checksummed frozen snapshot and on the staged 50k calibration.
+The cache, reference-shard, shard-merge, wide-score, single-fit, and batch-fit
+APIs pass the current-source equivalence suite. Production remains gated on
+repeating those checks from the checksummed frozen snapshot and on the staged
+50k calibration.
 The commands below are exact CLI templates; substitute only new private
 staged/group/output paths. Every output prefix must be fresh. Never use
 `--gxe-overwrite` in this workflow.
@@ -131,7 +132,7 @@ staged/group/output paths. Every output prefix must be fresh. Never use
 ### Hash-bound UGE deployment layer
 
 `deployment_config.json`, `job_spec_templates.json`, `hoffman_deploy.py`, and
-the six `uge_*.sh` wrappers implement the production launch gates. They do not
+the seven `uge_*.sh` wrappers implement the production launch gates. They do not
 submit anything. A renderer validates all sealed inputs and writes one concrete
 script plus pre-created private stdout/stderr files in a fresh 0700 job leaf;
 it only prints the corresponding `qsub` command. The wrappers expose no free
@@ -351,8 +352,54 @@ For each trait, this writes `${GXE_SCORE_OUT}.<trait>.gxe.gwas.tsv.gz`,
 `${GXE_SCORE_OUT}.<trait>.gxe.gwis.tsv.gz`, and
 `${GXE_SCORE_OUT}.<trait>.gxe.moments.json`. These artifacts bind the
 feature-cache SHA and may be reused with any B checkpoint merged from that
-exact cache; do not rescore each checkpoint. Fit one trait at a time against
-the validated B100 reference:
+exact cache; do not rescore each checkpoint.
+
+For production, use one `fit_batch` Hoffman spec per configured group. Its
+`traits` entries must contain exactly `trait`, `moments`, `gwas`, and `gwis`,
+must list every group trait in `panel_config.json` order, and must use exact
+mode-0600 `path`/`bytes`/`sha256` records. The spec has exactly one dependency:
+the completed qacct record for that group's wide-score job. Rendering fails
+unless every triplet record is an exact member of the score receipt's outputs,
+the remaining score output is its single log, and the qacct group, trait order,
+cache SHA, and B100-reference SHA all match. In addition, the batch cache and
+reference records must exactly equal the `path`/`bytes`/`sha256` records in the
+qacct-bound score job spec's `task_args`; matching content hashes at different
+paths are deliberately insufficient.
+
+The renderer writes `fit_batch_manifest.json` as a deterministic mode-0600
+`summit.gxe.fit_batch` manifest inside the fresh job root. It chooses one fresh
+common output parent (`<JOB_ROOT>/artifacts`), creates one output prefix per
+trait, and launches one single-slot command equivalent to:
+
+```bash
+"${GXE_SUMMIT}" \
+  --gxe-fit-batch <JOB_ROOT>/fit_batch_manifest.json \
+  --gxe-max-condition 1e12 \
+  --out <JOB_ROOT>/artifacts/fit_batch
+```
+
+The job receipt binds the exact rendered manifest. Completion requires the
+single batch log and both result files for every configured trait, with no
+extra artifact, and postvalidates every fit's rank, conditioning, jackknife,
+four-component order, finite diagnostics, and JSON/TSV agreement. Publication
+is transactional in SUMMIT: an incomplete multi-trait result is not accepted
+as a completed Hoffman job. Because the strict CLI manifest schema contains
+paths rather than file records, Hoffman provenance separately records every
+cache, reference, moments, GWAS, and GWIS `path`/`bytes`/`sha256` triple in the
+task details, invocation, process receipt, and final qacct receipt. The runner
+rehashes all of them immediately before invoking SUMMIT, immediately after it
+returns, after output postvalidation, and again before qacct collection; any
+mutation permanently fails that fresh job leaf. Each per-trait fit JSON also
+records the canonical path, byte count, and SHA256 accumulated from the private
+SUMMIT input snapshots actually parsed for the reference manifest, feature
+cache, phenotype moments, GWAS, and GWIS. Postvalidation requires those five
+records to exactly equal the deployment records (with one shared
+reference/cache pair across the batch), closing even a change-read-restore
+mutation that leaves the live paths unchanged at the after-run rehash.
+
+The existing `fit` form remains available for a separately named one-trait
+diagnostic or sensitivity analysis. It fits one trait against the validated
+B100 reference:
 
 ```bash
 GXE_TRAIT=<ONE_CONFIGURED_TRAIT>
@@ -364,6 +411,15 @@ GXE_TRAIT=<ONE_CONFIGURED_TRAIT>
   --gxe-max-condition 1e12 \
   --out "${GXE_FIT_ROOT}/${GXE_TRAIT}"
 ```
+
+The single-trait Hoffman form uses the same five-record provenance gate as the
+batch form. Its cache and reference must exactly match the completed score job
+spec, its moments/GWAS/GWIS records must be exact score outputs, and its fit
+JSON's snapshot-derived consumed-input records must exactly match all five
+deployment records. The runner binds those records in task details, invocation,
+process receipt, and qacct receipt and rehashes them around execution and after
+postvalidation. Thus the diagnostic form does not weaken the path-alias or
+change-read-restore protections of the production batch form.
 
 Do not add `--allow-ill-conditioned-gxe` to primary fits. If a separately named
 sensitivity fit is later justified, preserve the primary failure/diagnostics.
@@ -387,7 +443,9 @@ Execution order:
 5. Run shard 01 over `[50,100)` as a separate nonarray job, then merge exactly
    shards 00 and 01 into the production B100 reference. Do not fit shard 01 by
    itself and do not use the low-probe override for B100.
-6. Batch-score each group once after B100, then fit every trait. Interpret sex
+6. Batch-score each group once after B100, then run one group-level batch-fit
+   job containing every configured trait in order. Use single-trait fit specs
+   only for separately named diagnostics. Interpret sex
    GxE, but not separate sex NxE/residual estimates; binary-environment
    identifiability remains intrinsic. Use age groups for heterogeneous-noise
    validation.
@@ -406,6 +464,7 @@ total is always checked as `slots × h_data-per-slot`:
 | merge checkpoint | 1 | 8G | 8 GiB | 08:00:00 |
 | wide score | 4 | 6G | 24 GiB | 48:00:00 |
 | per-trait fit | 1 | 4G | 4 GiB | 04:00:00 |
+| group batch fit | 1 | 4G | 4 GiB | 04:00:00 |
 
 The historical valid-50k age-BP B10 jobs used 4 slots/24 GiB and 8 slots/32 GiB.
 Their final qacct records reported 3,182.493 versus 2,924.209 seconds wall time

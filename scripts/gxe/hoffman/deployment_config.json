@@ -82,6 +82,13 @@
       "total_memory_gib": 4,
       "h_rt": "04:00:00",
       "highp": true
+    },
+    "fit_batch": {
+      "slots": 1,
+      "h_data_gib_per_slot": 4,
+      "total_memory_gib": 4,
+      "h_rt": "04:00:00",
+      "highp": true
     }
   },
   "monitor_interval_hours": 6

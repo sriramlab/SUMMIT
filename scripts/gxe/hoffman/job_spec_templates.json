@@ -109,11 +109,39 @@
       "task_args": {
         "group": "age_bp",
         "trait": "bp_diastolic",
-        "cache": "<FEATURE_CACHE_RECORD>",
-        "reference": "<B100_REFERENCE_MANIFEST_RECORD>",
-        "moments": "<TRAIT_MOMENTS_RECORD>",
-        "gwas": "<TRAIT_GWAS_RECORD>",
-        "gwis": "<TRAIT_GWIS_RECORD>"
+        "cache": "<EXACT_FEATURE_CACHE_RECORD_USED_BY_WIDE_SCORE>",
+        "reference": "<EXACT_B100_REFERENCE_MANIFEST_RECORD_USED_BY_WIDE_SCORE>",
+        "moments": "<EXACT_TRAIT_MOMENTS_RECORD_FROM_WIDE_SCORE_OUTPUTS>",
+        "gwas": "<EXACT_TRAIT_GWAS_RECORD_FROM_WIDE_SCORE_OUTPUTS>",
+        "gwis": "<EXACT_TRAIT_GWIS_RECORD_FROM_WIDE_SCORE_OUTPUTS>"
+      }
+    },
+    "fit_batch": {
+      "kind": "summit.gxe.hoffman_job",
+      "schema_version": 1,
+      "task": "fit_batch",
+      "job_name": "gxe_fit_batch_age_bp",
+      "job_root": "/u/scratch/b/bronsonj/summit_gxe_full_20260808/jobs/<NEW_GROUP_FIT_BATCH_JOB>",
+      "frozen": "<COPY_FROZEN_CONTRACT_AND_FIT_BATCH_WRAPPER_SHA>",
+      "qacct_dependencies": ["<EXACTLY_ONE_COMPLETED_GROUP_WIDE_SCORE_QACCT_RECORD>"],
+      "task_args": {
+        "group": "age_bp",
+        "cache": "<EXACT_FEATURE_CACHE_RECORD_USED_BY_WIDE_SCORE>",
+        "reference": "<EXACT_B100_REFERENCE_MANIFEST_RECORD_USED_BY_WIDE_SCORE>",
+        "traits": [
+          {
+            "trait": "bp_diastolic",
+            "moments": "<BP_DIASTOLIC_MOMENTS_RECORD_FROM_WIDE_SCORE_OUTPUTS>",
+            "gwas": "<BP_DIASTOLIC_GWAS_RECORD_FROM_WIDE_SCORE_OUTPUTS>",
+            "gwis": "<BP_DIASTOLIC_GWIS_RECORD_FROM_WIDE_SCORE_OUTPUTS>"
+          },
+          {
+            "trait": "bp_systolic",
+            "moments": "<BP_SYSTOLIC_MOMENTS_RECORD_FROM_WIDE_SCORE_OUTPUTS>",
+            "gwas": "<BP_SYSTOLIC_GWAS_RECORD_FROM_WIDE_SCORE_OUTPUTS>",
+            "gwis": "<BP_SYSTOLIC_GWIS_RECORD_FROM_WIDE_SCORE_OUTPUTS>"
+          }
+        ]
       }
     }
   }

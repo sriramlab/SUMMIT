@@ -760,6 +760,23 @@ def test_batch_fit_prepares_reference_once_and_matches_singletons(
     )
     assert aligned_calls == 4
     assert cache_loads == 1
+    provenance = {
+        name: value[0].consumed_input_provenance
+        for name, value in observed.items()
+    }
+    assert provenance["Y1"] is not None
+    assert provenance["Y2"] is not None
+    assert (
+        provenance["Y1"].reference_manifest
+        == provenance["Y2"].reference_manifest
+    )
+    assert provenance["Y1"].feature_cache == provenance["Y2"].feature_cache
+    assert provenance["Y1"].phenotype_moments.path == str(Path(moments).resolve())
+    assert provenance["Y2"].phenotype_moments.path == str(copied_moments_path.resolve())
+    assert provenance["Y1"].gwas.path == str(Path(scores["gwas"]).resolve())
+    assert provenance["Y2"].gwas.path == str(copied_gwas.resolve())
+    assert provenance["Y1"].gwis.path == str(Path(scores["gwis"]).resolve())
+    assert provenance["Y2"].gwis.path == str(copied_gwis.resolve())
     for name, expected in {"Y1": expected_first, "Y2": expected_second}.items():
         fit, equations = observed[name]
         expected_fit, expected_equations = expected
@@ -782,6 +799,90 @@ def test_batch_fit_prepares_reference_once_and_matches_singletons(
             max_condition=1e16,
             scratch_dir=tmp_path,
         )
+
+
+def test_fit_json_provenance_identifies_consumed_snapshot_across_aba_restore(
+    exact_bundle, tmp_path, monkeypatch
+):
+    reference, moments, scores, _ = _clone_fit_bundle_with_bound_cache(
+        exact_bundle, tmp_path
+    )
+    original_moments = Path(moments).read_bytes()
+    mutated_payload = json.loads(original_moments)
+    mutated_payload["aba_marker"] = "bytes consumed by core fit"
+    mutated_moments = (
+        json.dumps(mutated_payload, indent=2, sort_keys=True) + "\n"
+    ).encode()
+    assert mutated_moments != original_moments
+    Path(moments).write_bytes(mutated_moments)
+
+    original_load_json = gxe_module._load_json
+    restored = False
+
+    def restore_live_moments_after_snapshot_is_parsed(path):
+        nonlocal restored
+        payload = original_load_json(path)
+        if payload.get("aba_marker") == "bytes consumed by core fit":
+            Path(moments).write_bytes(original_moments)
+            restored = True
+        return payload
+
+    monkeypatch.setattr(
+        gxe_module,
+        "_load_json",
+        restore_live_moments_after_snapshot_is_parsed,
+    )
+    fit, equations = fit_from_files(
+        reference,
+        moments,
+        scores["gwas"],
+        scores["gwis"],
+        allow_ill_conditioned=True,
+        max_condition=1e16,
+        scratch_dir=tmp_path,
+    )
+    assert restored
+    assert Path(moments).read_bytes() == original_moments
+    _, fit_json = write_fit(tmp_path / "aba-fit", fit, equations)
+    observed = json.loads(fit_json.read_text(encoding="utf-8"))[
+        "consumed_input_provenance"
+    ]
+    assert set(observed) == {
+        "reference_manifest",
+        "feature_cache",
+        "phenotype_moments",
+        "gwas",
+        "gwis",
+    }
+
+    reference_payload = json.loads(Path(reference).read_text(encoding="utf-8"))
+    cache_path = (
+        Path(reference).parent / reference_payload["feature_cache"]["path"]
+    ).resolve()
+
+    def live_record(path):
+        canonical = Path(path).resolve()
+        content = canonical.read_bytes()
+        return {
+            "path": str(canonical),
+            "bytes": len(content),
+            "sha256": hashlib.sha256(content).hexdigest(),
+        }
+
+    assert observed == {
+        "reference_manifest": live_record(reference),
+        "feature_cache": live_record(cache_path),
+        "phenotype_moments": {
+            "path": str(Path(moments).resolve()),
+            "bytes": len(mutated_moments),
+            "sha256": hashlib.sha256(mutated_moments).hexdigest(),
+        },
+        "gwas": live_record(scores["gwas"]),
+        "gwis": live_record(scores["gwis"]),
+    }
+    assert observed["phenotype_moments"]["sha256"] != hashlib.sha256(
+        original_moments
+    ).hexdigest()
 
 
 def test_schema_v2_null_corrected_jackknife_batch_matches_singletons_and_dense(

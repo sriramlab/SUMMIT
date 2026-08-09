@@ -10,6 +10,8 @@ import pytest
 
 from summit.inference import gxe as gxe_module
 from summit.inference.gxe import (
+    GxEConsumedInputProvenance,
+    GxEInputProvenance,
     GxENormalEquations,
     _assemble_deleted_normal_equations,
     _equations_from_prepared_scores,
@@ -170,6 +172,27 @@ def test_solver_rejects_materially_non_psd_trace_matrix():
 def test_fit_json_serializes_nonfinite_diagnostics_as_null(tmp_path):
     equations, _, _, _ = _exact_fixture()
     fitted = solve_normal_equations(equations, max_condition=1e16)
+    _, direct_json = write_fit(tmp_path / "direct-fit", fitted, equations)
+    assert json.loads(direct_json.read_text())["consumed_input_provenance"] is None
+
+    record = GxEInputProvenance(
+        path=str((tmp_path / "input").resolve()),
+        bytes=1,
+        sha256="0" * 64,
+    )
+    malformed = replace(
+        fitted,
+        consumed_input_provenance=GxEConsumedInputProvenance(
+            reference_manifest=record,
+            feature_cache=record,
+            phenotype_moments=record,
+            gwas=replace(record, path="relative/path"),
+            gwis=record,
+        ),
+    )
+    with pytest.raises(ValueError, match="canonical absolute path"):
+        write_fit(tmp_path / "malformed-provenance", malformed, equations)
+
     altered = replace(
         fitted,
         condition_number=np.inf,
@@ -423,6 +446,10 @@ def test_preaggregated_deletion_matches_legacy_for_overlapping_annotations(
         manifest_sha256="0" * 64,
         schema_version=2,
         feature_cache_sha256=None,
+        reference_provenance=GxEInputProvenance(
+            path="/reference.json", bytes=1, sha256="0" * 64
+        ),
+        feature_cache_provenance=None,
         variants=variants,
         annotations=annotations,
         annotation_names=names,

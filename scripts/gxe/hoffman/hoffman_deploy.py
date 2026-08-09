@@ -30,13 +30,22 @@ from pathlib import Path
 from typing import Any, Sequence
 
 
-TASKS = ("stage_verify", "cache", "shard", "merge", "score", "fit")
+TASKS = (
+    "stage_verify",
+    "cache",
+    "shard",
+    "merge",
+    "score",
+    "fit",
+    "fit_batch",
+)
 WRAPPERS = {task: f"uge_{task}.sh" for task in TASKS}
 SAFE_NAME = re.compile(r"^[A-Za-z][A-Za-z0-9_.-]{0,127}$")
 SHA256 = re.compile(r"^[0-9a-f]{64}$")
 DEPLOYMENT_CONFIG_SCHEMA_VERSION = 2
 FROZEN_CODE_MANIFEST_SCHEMA_VERSION = 2
 NUMACTL_SENTINEL = "SUMMIT_NUMACTL_WRAPPED"
+FIT_BATCH_MANIFEST_NAME = "fit_batch_manifest.json"
 REQUIRED_DISTRIBUTIONS = (
     "bed-reader",
     "charset-normalizer",
@@ -336,6 +345,15 @@ def _atomic_text_noreplace(text: str, target: Path, mode: int) -> None:
 def _atomic_json_noreplace(payload: dict, target: Path) -> None:
     text = json.dumps(payload, indent=2, sort_keys=True) + "\n"
     _atomic_text_noreplace(text, target, 0o600)
+
+
+def _canonical_json_record(payload: dict, path: Path) -> dict:
+    raw = (json.dumps(payload, indent=2, sort_keys=True) + "\n").encode("utf-8")
+    return {
+        "path": str(path),
+        "bytes": len(raw),
+        "sha256": _sha256_bytes(raw),
+    }
 
 
 def _validate_resource(task: str, config: dict) -> dict:
@@ -732,6 +750,7 @@ def _validate_qacct_dependencies(
         "merge": "shard",
         "score": "merge",
         "fit": "score",
+        "fit_batch": "score",
     }[task]
     if required_task is None and records:
         raise ValueError(
@@ -924,6 +943,8 @@ def _validate_common(
             "tmp",
             "attempt.lock",
         }
+        if expected_task == "fit_batch":
+            expected_entries.add(FIT_BATCH_MANIFEST_NAME)
         observed_entries = {path.name for path in job_root.iterdir()}
         if observed_entries != expected_entries:
             raise ValueError(
@@ -935,6 +956,12 @@ def _validate_common(
         _require_file(job_root / "stdout.log", "UGE stdout log", private=True)
         _require_file(job_root / "stderr.log", "UGE stderr log", private=True)
         _require_file(job_root / "attempt.lock", "UGE attempt lock", private=True)
+        if expected_task == "fit_batch":
+            _require_file(
+                job_root / FIT_BATCH_MANIFEST_NAME,
+                "rendered fit-batch manifest",
+                private=True,
+            )
         _require_directory(job_root / "tmp", "UGE temporary directory", private=True)
         if any((job_root / "tmp").iterdir()):
             raise ValueError("UGE temporary directory is not empty at first job start.")
@@ -1772,6 +1799,352 @@ def _validate_score_triplet(
     return payload
 
 
+def _exact_record_key(record: Any, label: str) -> tuple[str, int, str]:
+    if not isinstance(record, dict) or set(record) != {"path", "bytes", "sha256"}:
+        raise ValueError(
+            f"{label} must be an exact path/bytes/sha256 record with no extra fields."
+        )
+    path = record.get("path")
+    size = record.get("bytes")
+    digest = record.get("sha256")
+    if (
+        not isinstance(path, str)
+        or not path
+        or not isinstance(size, int)
+        or isinstance(size, bool)
+        or size < 0
+        or not isinstance(digest, str)
+        or SHA256.fullmatch(digest) is None
+    ):
+        raise ValueError(f"{label} is not a valid sealed file record.")
+    return path, size, digest
+
+
+def _validate_fit_batch_score_dependency(
+    dependency: dict,
+    *,
+    scratch_root: Path,
+    group: str,
+    traits: Sequence[str],
+    cache_record: dict,
+    reference_record: dict,
+    triplets: Sequence[dict],
+) -> None:
+    score_spec_path, _ = _verify_record(
+        dependency.get("job_spec"),
+        "completed wide-score job spec",
+        scratch_root=scratch_root,
+        private=True,
+    )
+    score_spec, _, _ = _read_json(
+        score_spec_path, "completed wide-score job spec", private=True
+    )
+    if (
+        score_spec.get("kind") != "summit.gxe.hoffman_job"
+        or score_spec.get("schema_version") != 1
+        or score_spec.get("task") != "score"
+    ):
+        raise ValueError("Completed wide-score qacct binds an invalid score job spec.")
+    score_args = score_spec.get("task_args")
+    if not isinstance(score_args, dict):
+        raise ValueError("Completed wide-score job spec lacks task_args.")
+    for key, expected in (
+        ("cache", cache_record),
+        ("reference", reference_record),
+    ):
+        observed = score_args.get(key)
+        _exact_record_key(observed, f"completed wide-score {key}")
+        if observed != expected:
+            raise ValueError(
+                f"Fit-batch {key} record differs from the exact record in the "
+                "completed wide-score job spec."
+            )
+    if score_args.get("traits") != list(traits):
+        raise ValueError(
+            "Fit-batch trait order differs from the completed wide-score job spec."
+        )
+
+    details = dependency.get("task_details")
+    if not isinstance(details, dict):
+        raise ValueError("Completed wide-score qacct lacks task details.")
+    expected_details = {
+        "group": group,
+        "traits": list(traits),
+        "cache_sha256": cache_record["sha256"],
+        "reference_sha256": reference_record["sha256"],
+    }
+    mismatched = [
+        key for key, value in expected_details.items() if details.get(key) != value
+    ]
+    if mismatched:
+        raise ValueError(
+            "Fit-batch inputs differ from completed wide-score provenance for "
+            f"{mismatched}."
+        )
+
+    outputs = dependency.get("outputs")
+    if not isinstance(outputs, list):
+        raise ValueError("Completed wide-score qacct lacks an output list.")
+    output_keys = [
+        _exact_record_key(record, f"wide-score output {index}")
+        for index, record in enumerate(outputs)
+    ]
+    output_key_set = set(output_keys)
+    if len(output_keys) != len(output_key_set):
+        raise ValueError("Completed wide-score qacct repeats an output record.")
+
+    supplied_records = [
+        entry[key] for entry in triplets for key in ("moments", "gwas", "gwis")
+    ]
+    supplied_keys = [
+        _exact_record_key(record, f"fit-batch score input {index}")
+        for index, record in enumerate(supplied_records)
+    ]
+    supplied_key_set = set(supplied_keys)
+    if len(supplied_keys) != len(supplied_key_set):
+        raise ValueError("Fit-batch score records must be unique across all traits.")
+    missing = [key for key in supplied_keys if key not in output_key_set]
+    if missing:
+        raise ValueError(
+            "Every fit-batch moments/GWAS/GWIS record must be an exact output of "
+            "the completed wide-score job."
+        )
+    remainder = [key for key in output_keys if key not in supplied_key_set]
+    if len(outputs) != 3 * len(traits) + 1 or len(remainder) != 1:
+        raise ValueError(
+            "Completed wide-score qacct must contain exactly every configured "
+            "trait triplet and one batch log."
+        )
+    if not remainder[0][0].endswith(".gxe.log"):
+        raise ValueError("The only non-triplet wide-score output must be its GxE log.")
+
+
+def _validate_fit_score_dependency(
+    dependency: dict,
+    *,
+    scratch_root: Path,
+    group: str,
+    configured_traits: Sequence[str],
+    trait: str,
+    cache_record: dict,
+    reference_record: dict,
+    triplet: dict,
+) -> None:
+    score_spec_path, _ = _verify_record(
+        dependency.get("job_spec"),
+        "completed wide-score job spec",
+        scratch_root=scratch_root,
+        private=True,
+    )
+    score_spec, _, _ = _read_json(
+        score_spec_path, "completed wide-score job spec", private=True
+    )
+    if (
+        score_spec.get("kind") != "summit.gxe.hoffman_job"
+        or score_spec.get("schema_version") != 1
+        or score_spec.get("task") != "score"
+    ):
+        raise ValueError("Completed wide-score qacct binds an invalid score job spec.")
+    score_args = score_spec.get("task_args")
+    if not isinstance(score_args, dict):
+        raise ValueError("Completed wide-score job spec lacks task_args.")
+    for key, expected in (
+        ("cache", cache_record),
+        ("reference", reference_record),
+    ):
+        observed = score_args.get(key)
+        _exact_record_key(observed, f"completed wide-score {key}")
+        if observed != expected:
+            raise ValueError(
+                f"Fit {key} record differs from the exact record in the "
+                "completed wide-score job spec."
+            )
+    if score_args.get("traits") != list(configured_traits):
+        raise ValueError(
+            "Fit group trait order differs from the completed wide-score job spec."
+        )
+
+    details = dependency.get("task_details")
+    if not isinstance(details, dict):
+        raise ValueError("Completed wide-score qacct lacks task details.")
+    expected_details = {
+        "group": group,
+        "traits": list(configured_traits),
+        "cache_sha256": cache_record["sha256"],
+        "reference_sha256": reference_record["sha256"],
+    }
+    mismatched = [
+        key for key, value in expected_details.items() if details.get(key) != value
+    ]
+    if mismatched:
+        raise ValueError(
+            "Fit inputs differ from completed wide-score provenance for "
+            f"{mismatched}."
+        )
+
+    outputs = dependency.get("outputs")
+    if not isinstance(outputs, list):
+        raise ValueError("Completed wide-score qacct lacks an output list.")
+    output_keys = [
+        _exact_record_key(record, f"wide-score output {index}")
+        for index, record in enumerate(outputs)
+    ]
+    if len(output_keys) != len(set(output_keys)):
+        raise ValueError("Completed wide-score qacct repeats an output record.")
+    if len(outputs) != 3 * len(configured_traits) + 1:
+        raise ValueError(
+            "Completed wide-score qacct must contain exactly every configured "
+            "trait triplet and one batch log."
+        )
+    if sum(path.endswith(".gxe.log") for path, _, _ in output_keys) != 1:
+        raise ValueError("Completed wide-score qacct must contain exactly one GxE log.")
+
+    supplied = [triplet[key] for key in ("moments", "gwas", "gwis")]
+    supplied_keys = [
+        _exact_record_key(record, f"fit {trait} score input {index}")
+        for index, record in enumerate(supplied)
+    ]
+    if len(supplied_keys) != len(set(supplied_keys)):
+        raise ValueError("Fit moments/GWAS/GWIS records must be unique.")
+    if any(key not in set(output_keys) for key in supplied_keys):
+        raise ValueError(
+            "Every fit moments/GWAS/GWIS record must be an exact output of the "
+            "completed wide-score job."
+        )
+
+
+def _validate_fit_input_records(records: Any, scratch_root: Path) -> dict:
+    roles = {
+        "reference_manifest",
+        "feature_cache",
+        "phenotype_moments",
+        "gwas",
+        "gwis",
+    }
+    if not isinstance(records, dict) or set(records) != roles:
+        raise ValueError("Fit input records must contain the exact five input roles.")
+    verified = {}
+    for role in sorted(roles):
+        _exact_record_key(records[role], f"fit {role}")
+        _, verified[role] = _verify_record(
+            records[role],
+            f"fit {role}",
+            scratch_root=scratch_root,
+            private=True,
+        )
+    if verified != records:
+        raise ValueError("Fit inputs are not the exact canonical sealed records.")
+    return verified
+
+
+def _reverify_fit_plan_inputs(plan: dict, common: dict) -> None:
+    observed = _validate_fit_input_records(
+        plan.get("fit_input_records"), common["scratch_root"]
+    )
+    if observed != plan.get("fit_input_records"):
+        raise ValueError("Fit input records changed after preflight.")
+
+
+def _fit_batch_manifest_payload(
+    reference_path: Path,
+    triplets: Sequence[dict],
+    output_parent: Path,
+) -> dict:
+    return {
+        "kind": "summit.gxe.fit_batch",
+        "schema_version": 1,
+        "reference": str(reference_path),
+        "traits": [
+            {
+                "name": entry["trait"],
+                "moments": str(_absolute(entry["moments"]["path"])),
+                "gwas": str(_absolute(entry["gwas"]["path"])),
+                "gwis": str(_absolute(entry["gwis"]["path"])),
+                "out": str(output_parent / entry["trait"]),
+            }
+            for entry in triplets
+        ],
+    }
+
+
+def _validate_fit_batch_input_records(records: Any, scratch_root: Path) -> dict:
+    if not isinstance(records, dict) or set(records) != {
+        "cache",
+        "reference",
+        "traits",
+    }:
+        raise ValueError(
+            "Fit-batch input records must contain exactly cache, reference, and traits."
+        )
+    verified: dict[str, Any] = {}
+    for key in ("cache", "reference"):
+        _exact_record_key(records[key], f"fit-batch {key}")
+        _, verified[key] = _verify_record(
+            records[key],
+            f"fit-batch {key}",
+            scratch_root=scratch_root,
+            private=True,
+        )
+    traits = records["traits"]
+    if not isinstance(traits, list) or not traits:
+        raise ValueError("Fit-batch input trait records must be a nonempty list.")
+    verified_traits = []
+    names = []
+    for index, entry in enumerate(traits):
+        if not isinstance(entry, dict) or set(entry) != {
+            "trait",
+            "moments",
+            "gwas",
+            "gwis",
+        }:
+            raise ValueError(
+                f"Fit-batch input trait {index} has an invalid record structure."
+            )
+        trait = entry["trait"]
+        if not isinstance(trait, str) or SAFE_NAME.fullmatch(trait) is None:
+            raise ValueError(f"Fit-batch input trait {index} has an unsafe name.")
+        verified_entry = {"trait": trait}
+        for key in ("moments", "gwas", "gwis"):
+            _exact_record_key(entry[key], f"fit-batch {trait} {key}")
+            _, verified_entry[key] = _verify_record(
+                entry[key],
+                f"fit-batch {trait} {key}",
+                scratch_root=scratch_root,
+                private=True,
+            )
+        names.append(trait)
+        verified_traits.append(verified_entry)
+    if len(names) != len(set(names)):
+        raise ValueError("Fit-batch input trait names must be unique.")
+    verified["traits"] = verified_traits
+    if verified != records:
+        raise ValueError(
+            "Fit-batch input paths are not the exact canonical sealed records."
+        )
+    return verified
+
+
+def _reverify_fit_batch_plan_inputs(plan: dict, common: dict) -> None:
+    observed = _validate_fit_batch_input_records(
+        plan.get("fit_batch_input_records"), common["scratch_root"]
+    )
+    if observed != plan.get("fit_batch_input_records"):
+        raise ValueError("Fit-batch input records changed after preflight.")
+    manifest_path, manifest_record = _verify_record(
+        plan.get("batch_manifest_record"),
+        "rendered fit-batch manifest",
+        scratch_root=common["scratch_root"],
+        private=True,
+    )
+    manifest_payload, _, _ = _read_json(
+        manifest_path, "rendered fit-batch manifest", private=True
+    )
+    if manifest_record != plan.get(
+        "batch_manifest_record"
+    ) or manifest_payload != plan.get("batch_manifest_payload"):
+        raise ValueError("Rendered fit-batch manifest changed after preflight.")
+
+
 def _expected_cli_outputs(
     task: str, prefix: Path, *, traits: Sequence[str] = ()
 ) -> list[Path]:
@@ -1824,6 +2197,17 @@ def _expected_cli_outputs(
             Path(str(prefix) + ".gxe.fit.json"),
             Path(str(prefix) + ".gxe.log"),
         ]
+    if task == "fit_batch":
+        paths = [Path(str(prefix) + ".gxe.log")]
+        for trait in traits:
+            trait_prefix = prefix.parent / trait
+            paths.extend(
+                (
+                    Path(str(trait_prefix) + ".gxe.results.tsv"),
+                    Path(str(trait_prefix) + ".gxe.fit.json"),
+                )
+            )
+        return paths
     raise ValueError(f"No CLI outputs declared for task {task!r}.")
 
 
@@ -2375,15 +2759,34 @@ def _prepare_task(
                 "traits": traits,
             }
         elif task == "fit":
+            if set(args) != {
+                "group",
+                "trait",
+                "cache",
+                "reference",
+                "moments",
+                "gwas",
+                "gwis",
+            }:
+                raise ValueError(
+                    "Fit task_args must contain exactly group, trait, cache, "
+                    "reference, moments, gwas, and gwis."
+                )
             dependencies = _validate_qacct_dependencies(
                 spec, scratch_root, task, expected_count=1
             )
+            _exact_record_key(args.get("cache"), "fit feature cache")
+            _exact_record_key(args.get("reference"), "fit B100 reference")
             cache_path, cache_record = _verify_record(
                 args.get("cache"),
                 "feature cache",
                 scratch_root=scratch_root,
                 private=True,
             )
+            if args.get("cache") != cache_record:
+                raise ValueError(
+                    "Fit cache must use its exact canonical sealed record."
+                )
             cache = _validate_cache_file(cache_path, config)
             reference_path, reference_record = _verify_record(
                 args.get("reference"),
@@ -2391,6 +2794,10 @@ def _prepare_task(
                 scratch_root=scratch_root,
                 private=True,
             )
+            if args.get("reference") != reference_record:
+                raise ValueError(
+                    "Fit reference must use its exact canonical sealed record."
+                )
             reference_path, reference, _ = _validate_reference_record(
                 args.get("reference"),
                 scratch_root,
@@ -2401,31 +2808,54 @@ def _prepare_task(
             _validate_reference_cache_identity(reference, cache)
             group_label = args.get("group")
             trait = args.get("trait")
-            if trait not in panel.get("groups", {}).get(group_label, {}).get(
-                "phenotypes", []
+            configured_traits = (
+                panel.get("groups", {}).get(group_label, {}).get("phenotypes")
+            )
+            if (
+                not isinstance(configured_traits, list)
+                or trait not in configured_traits
             ):
                 raise ValueError("Fit trait is absent from its configured group.")
+            verified_triplet = {}
+            for key in ("moments", "gwas", "gwis"):
+                _exact_record_key(args.get(key), f"fit {trait} {key}")
+                _, verified_triplet[key] = _verify_record(
+                    args.get(key),
+                    f"fit {trait} {key}",
+                    scratch_root=scratch_root,
+                    private=True,
+                )
+                if args.get(key) != verified_triplet[key]:
+                    raise ValueError(
+                        f"Fit {trait} {key} must use its exact canonical sealed record."
+                    )
             _validate_score_triplet(
-                args.get("moments"),
-                args.get("gwas"),
-                args.get("gwis"),
+                verified_triplet["moments"],
+                verified_triplet["gwas"],
+                verified_triplet["gwis"],
                 scratch_root,
                 reference_sha=reference_record["sha256"],
                 cache_sha=cache_record["sha256"],
                 trait=trait,
             )
-            supplied_hashes = {
-                item.get("sha256")
-                for item in (args.get("moments"), args.get("gwas"), args.get("gwis"))
-                if isinstance(item, dict)
+            input_records = {
+                "reference_manifest": reference_record,
+                "feature_cache": cache_record,
+                "phenotype_moments": verified_triplet["moments"],
+                "gwas": verified_triplet["gwas"],
+                "gwis": verified_triplet["gwis"],
             }
-            dependency_hashes = {
-                output.get("sha256") for output in dependencies[0].get("outputs", [])
-            }
-            if not supplied_hashes.issubset(dependency_hashes):
-                raise ValueError(
-                    "Fit score triplet is not bound by completed score qacct provenance."
-                )
+            _validate_fit_input_records(input_records, scratch_root)
+            _validate_fit_score_dependency(
+                dependencies[0],
+                scratch_root=scratch_root,
+                group=group_label,
+                configured_traits=configured_traits,
+                trait=trait,
+                cache_record=cache_record,
+                reference_record=reference_record,
+                triplet=verified_triplet,
+            )
             prefix = artifacts / "fit"
             command = [
                 "--gxe-fit",
@@ -2450,9 +2880,190 @@ def _prepare_task(
                     "trait": trait,
                     "cache_sha256": cache_record["sha256"],
                     "reference_sha256": reference_record["sha256"],
-                    "score_sha256": sorted(supplied_hashes),
+                    "score_sha256": sorted(
+                        record["sha256"] for record in verified_triplet.values()
+                    ),
+                    "input_records": input_records,
                 },
                 "reference": reference,
+                "fit_input_records": input_records,
+            }
+        elif task == "fit_batch":
+            if set(args) != {"group", "cache", "reference", "traits"}:
+                raise ValueError(
+                    "Fit-batch task_args must contain exactly group, cache, "
+                    "reference, and traits."
+                )
+            dependencies = _validate_qacct_dependencies(
+                spec, scratch_root, task, expected_count=1
+            )
+            _exact_record_key(args.get("cache"), "fit-batch feature cache")
+            _exact_record_key(args.get("reference"), "fit-batch B100 reference")
+            cache_path, cache_record = _verify_record(
+                args.get("cache"),
+                "feature cache",
+                scratch_root=scratch_root,
+                private=True,
+            )
+            if args.get("cache") != cache_record:
+                raise ValueError(
+                    "Fit-batch cache must use its exact canonical sealed record."
+                )
+            cache = _validate_cache_file(cache_path, config)
+            reference_path, reference_record = _verify_record(
+                args.get("reference"),
+                "B100 reference",
+                scratch_root=scratch_root,
+                private=True,
+            )
+            if args.get("reference") != reference_record:
+                raise ValueError(
+                    "Fit-batch reference must use its exact canonical sealed record."
+                )
+            reference_path, reference, _ = _validate_reference_record(
+                args.get("reference"),
+                scratch_root,
+                config,
+                cache_record["sha256"],
+                expected_probes=config["estimator"]["production_probes"],
+            )
+            _validate_reference_cache_identity(reference, cache)
+
+            group_label = args.get("group")
+            configured_traits = (
+                panel.get("groups", {}).get(group_label, {}).get("phenotypes")
+            )
+            if not isinstance(configured_traits, list) or not configured_traits:
+                raise ValueError("Fit-batch group is absent from the frozen panel.")
+            triplets = args.get("traits")
+            if not isinstance(triplets, list):
+                raise ValueError("Fit-batch traits must be a list.")
+            expected_entry_keys = {"trait", "moments", "gwas", "gwis"}
+            for index, entry in enumerate(triplets):
+                if not isinstance(entry, dict) or set(entry) != expected_entry_keys:
+                    raise ValueError(
+                        f"Fit-batch trait {index} must contain exactly "
+                        "trait, moments, gwas, and gwis."
+                    )
+            trait_names = [entry["trait"] for entry in triplets]
+            if trait_names != configured_traits:
+                raise ValueError(
+                    "Fit-batch traits must exactly equal the configured group order."
+                )
+            if any(
+                not isinstance(trait, str) or SAFE_NAME.fullmatch(trait) is None
+                for trait in trait_names
+            ):
+                raise ValueError("Fit-batch contains an unsafe trait name.")
+            if len(set(trait_names)) != len(trait_names):
+                raise ValueError("Fit-batch configured trait names must be unique.")
+
+            verified_triplets = []
+            for entry in triplets:
+                verified_entry = {"trait": entry["trait"]}
+                for key in ("moments", "gwas", "gwis"):
+                    _exact_record_key(entry[key], f"fit-batch {entry['trait']} {key}")
+                    _, verified_entry[key] = _verify_record(
+                        entry[key],
+                        f"fit-batch {entry['trait']} {key}",
+                        scratch_root=scratch_root,
+                        private=True,
+                    )
+                    if entry[key] != verified_entry[key]:
+                        raise ValueError(
+                            f"Fit-batch {entry['trait']} {key} must use its exact "
+                            "canonical sealed record."
+                        )
+                _validate_score_triplet(
+                    verified_entry["moments"],
+                    verified_entry["gwas"],
+                    verified_entry["gwis"],
+                    scratch_root,
+                    reference_sha=reference_record["sha256"],
+                    cache_sha=cache_record["sha256"],
+                    trait=entry["trait"],
+                )
+                verified_triplets.append(verified_entry)
+            input_records = {
+                "cache": cache_record,
+                "reference": reference_record,
+                "traits": verified_triplets,
+            }
+            _validate_fit_batch_score_dependency(
+                dependencies[0],
+                scratch_root=scratch_root,
+                group=group_label,
+                traits=trait_names,
+                cache_record=cache_record,
+                reference_record=reference_record,
+                triplets=verified_triplets,
+            )
+
+            prefix = artifacts / "fit_batch"
+            manifest_path = common["job_root"] / FIT_BATCH_MANIFEST_NAME
+            manifest_payload = _fit_batch_manifest_payload(
+                reference_path, verified_triplets, artifacts
+            )
+            manifest_record = _canonical_json_record(manifest_payload, manifest_path)
+            if manifest_path.exists() or manifest_path.is_symlink():
+                _, observed_record = _verify_record(
+                    manifest_record,
+                    "rendered fit-batch manifest",
+                    scratch_root=scratch_root,
+                    private=True,
+                )
+                observed_payload, _, _ = _read_json(
+                    manifest_path, "rendered fit-batch manifest", private=True
+                )
+                if observed_payload != manifest_payload:
+                    raise ValueError(
+                        "Rendered fit-batch manifest differs from its job spec."
+                    )
+                manifest_record = observed_record
+            else:
+                _scratch_path(
+                    manifest_path,
+                    scratch_root,
+                    "rendered fit-batch manifest",
+                    kind="file",
+                    must_exist=False,
+                )
+            command = [
+                "--gxe-fit-batch",
+                str(manifest_path),
+                "--gxe-max-condition",
+                "1e12",
+                "--out",
+                str(prefix),
+            ]
+            score_hashes = [
+                {
+                    "trait": entry["trait"],
+                    "moments_sha256": entry["moments"]["sha256"],
+                    "gwas_sha256": entry["gwas"]["sha256"],
+                    "gwis_sha256": entry["gwis"]["sha256"],
+                }
+                for entry in verified_triplets
+            ]
+            plan = {
+                "mode": "summit",
+                "command": command,
+                "outputs": _expected_cli_outputs(task, prefix, traits=trait_names),
+                "details": {
+                    "group": group_label,
+                    "traits": trait_names,
+                    "cache_sha256": cache_record["sha256"],
+                    "reference_sha256": reference_record["sha256"],
+                    "score_triplets": score_hashes,
+                    "input_records": input_records,
+                    "fit_batch_manifest": manifest_record,
+                },
+                "reference": reference,
+                "traits": trait_names,
+                "fit_batch_input_records": input_records,
+                "batch_manifest": manifest_path,
+                "batch_manifest_payload": manifest_payload,
+                "batch_manifest_record": manifest_record,
             }
         else:
             raise RuntimeError(f"Unhandled task {task!r}.")
@@ -2531,7 +3142,12 @@ def _validate_score_table(
         )
 
 
-def _validate_fit_outputs(prefix: Path, config: dict) -> None:
+def _validate_fit_outputs(
+    prefix: Path,
+    config: dict,
+    *,
+    expected_input_provenance: dict | None = None,
+) -> None:
     import numpy as np
     import pandas as pd
 
@@ -2540,6 +3156,33 @@ def _validate_fit_outputs(prefix: Path, config: dict) -> None:
     payload, _, _ = _read_json(json_path, "GxE fit JSON", private=True)
     if payload.get("kind") != "summit.gxe.fit" or payload.get("schema_version") != 3:
         raise ValueError("Fit output kind/schema differs from production contract.")
+    provenance = payload.get("consumed_input_provenance")
+    provenance_keys = {
+        "reference_manifest",
+        "feature_cache",
+        "phenotype_moments",
+        "gwas",
+        "gwis",
+    }
+    if not isinstance(provenance, dict) or set(provenance) != provenance_keys:
+        raise ValueError("Fit JSON lacks the exact consumed-input provenance role set.")
+    for role in sorted(provenance_keys):
+        record = provenance[role]
+        _exact_record_key(record, f"fit consumed {role}")
+    if expected_input_provenance is not None:
+        if (
+            not isinstance(expected_input_provenance, dict)
+            or set(expected_input_provenance) != provenance_keys
+            or expected_input_provenance["feature_cache"] is None
+        ):
+            raise ValueError(
+                "Deployment expected-input provenance has an invalid production shape."
+            )
+        if provenance != expected_input_provenance:
+            raise ValueError(
+                "Fit JSON consumed-input provenance differs from the exact "
+                "deployment input records."
+            )
     names = ["G:L2_0", "GxE:L2_0", "NxE", "residual"]
     if payload.get("component_names") != names:
         raise ValueError(
@@ -2606,6 +3249,7 @@ def _validate_fit_outputs(prefix: Path, config: dict) -> None:
             raise ValueError(
                 f"Fit JSON {key!r} differs from its residual-scale conversion."
             )
+        vectors[key] = values
     for key, shape in (
         ("normal_matrix", (4, 4)),
         ("kernel_correlation_matrix", (4, 4)),
@@ -2637,6 +3281,8 @@ def _validate_fit_outputs(prefix: Path, config: dict) -> None:
         "variance_contribution": "variance_contributions",
         "proportion": "proportions",
         "proportion_se": "standard_errors",
+        "original_scale_proportion": "original_scale_proportions",
+        "original_scale_se": "original_scale_standard_errors",
     }
     for column, key in comparisons.items():
         observed = pd.to_numeric(frame[column], errors="coerce").to_numpy(
@@ -2646,6 +3292,29 @@ def _validate_fit_outputs(prefix: Path, config: dict) -> None:
             observed, vectors[key], rtol=5e-10, atol=5e-12
         ):
             raise ValueError(f"Fit TSV column {column!r} differs from fit JSON.")
+
+    try:
+        observed_z = pd.to_numeric(frame["z"], errors="raise").to_numpy(
+            dtype=np.float64
+        )
+    except (TypeError, ValueError) as error:
+        raise ValueError("Fit TSV column 'z' contains a nonnumeric value.") from error
+    with np.errstate(divide="ignore", invalid="ignore"):
+        expected_z = vectors["proportions"] / vectors["standard_errors"]
+    finite = np.isfinite(expected_z)
+    if (
+        not np.array_equal(np.isnan(observed_z), np.isnan(expected_z))
+        or not np.array_equal(np.isposinf(observed_z), np.isposinf(expected_z))
+        or not np.array_equal(np.isneginf(observed_z), np.isneginf(expected_z))
+        or not np.all(np.isfinite(observed_z[finite]))
+        or not np.allclose(
+            observed_z[finite], expected_z[finite], rtol=5e-10, atol=5e-12
+        )
+    ):
+        raise ValueError(
+            "Fit TSV column 'z' differs from proportion/proportion_se, including "
+            "the required zero-SE NaN/infinity behavior."
+        )
 
 
 def _postvalidate_task(
@@ -2770,7 +3439,31 @@ def _postvalidate_task(
             _validate_score_table(gwas_path, reference=reference, moments=moments)
             _validate_score_table(gwis_path, reference=reference, moments=moments)
     elif task == "fit":
-        _validate_fit_outputs(common["artifacts"] / "fit", config)
+        _validate_fit_outputs(
+            common["artifacts"] / "fit",
+            config,
+            expected_input_provenance=plan["fit_input_records"],
+        )
+    elif task == "fit_batch":
+        input_records = plan["fit_batch_input_records"]
+        by_trait = {entry["trait"]: entry for entry in input_records["traits"]}
+        if list(by_trait) != plan["traits"]:
+            raise ValueError(
+                "Fit-batch input provenance trait order changed before postvalidation."
+            )
+        for trait in plan["traits"]:
+            trait_records = by_trait[trait]
+            _validate_fit_outputs(
+                common["artifacts"] / trait,
+                config,
+                expected_input_provenance={
+                    "reference_manifest": input_records["reference"],
+                    "feature_cache": input_records["cache"],
+                    "phenotype_moments": trait_records["moments"],
+                    "gwas": trait_records["gwas"],
+                    "gwis": trait_records["gwis"],
+                },
+            )
     else:  # pragma: no cover - parser and preparation already constrain this
         raise RuntimeError(f"Unhandled postvalidation task {task!r}.")
     return [_record(path) for path in expected]
@@ -2863,6 +3556,24 @@ def _invoke_summit_cli(cli, command: list[str]) -> None:
                 raise RuntimeError(f"SUMMIT CLI returned unexpected status {result!r}.")
     finally:
         sys.argv = previous_argv
+
+
+def _execute_plan(plan: dict, runtime: dict, common: dict, task: str) -> None:
+    command = list(plan["command"])
+    if plan["mode"] == "subprocess":
+        subprocess.run(command, check=True, env=os.environ.copy())
+        return
+    if plan["mode"] != "summit":  # pragma: no cover - plan construction owns enum
+        raise RuntimeError(f"Unsupported execution mode: {plan['mode']!r}")
+    if task == "fit":
+        _reverify_fit_plan_inputs(plan, common)
+    elif task == "fit_batch":
+        _reverify_fit_batch_plan_inputs(plan, common)
+    _invoke_summit_cli(runtime["cli_module"], command)
+    if task == "fit":
+        _reverify_fit_plan_inputs(plan, common)
+    elif task == "fit_batch":
+        _reverify_fit_batch_plan_inputs(plan, common)
 
 
 def _rendered_job_script(
@@ -3019,16 +3730,20 @@ def _run_task(args: argparse.Namespace) -> None:
         },
         "task_details": plan["details"],
     }
+    if spec["task"] == "fit":
+        invocation["fit_input_records"] = plan["fit_input_records"]
+    elif spec["task"] == "fit_batch":
+        invocation["fit_batch_manifest"] = plan["batch_manifest_record"]
+        invocation["fit_batch_input_records"] = plan["fit_batch_input_records"]
     _atomic_json_noreplace(invocation, common["invocation"])
 
-    if plan["mode"] == "subprocess":
-        subprocess.run(command, check=True, env=os.environ.copy())
-    elif plan["mode"] == "summit":
-        _invoke_summit_cli(runtime["cli_module"], command)
-    else:  # pragma: no cover - plan construction owns this enum
-        raise RuntimeError(f"Unsupported execution mode: {plan['mode']!r}")
+    _execute_plan(plan, runtime, common, spec["task"])
 
     outputs = _postvalidate_task(spec, common, config, plan, runtime)
+    if spec["task"] == "fit":
+        _reverify_fit_plan_inputs(plan, common)
+    elif spec["task"] == "fit_batch":
+        _reverify_fit_batch_plan_inputs(plan, common)
     finished = datetime.now(timezone.utc)
     receipt = {
         "kind": "summit.gxe.hoffman_process_receipt",
@@ -3055,6 +3770,11 @@ def _run_task(args: argparse.Namespace) -> None:
         "outputs": outputs,
         "qacct_pending": True,
     }
+    if spec["task"] == "fit":
+        receipt["fit_input_records"] = plan["fit_input_records"]
+    elif spec["task"] == "fit_batch":
+        receipt["fit_batch_manifest"] = plan["batch_manifest_record"]
+        receipt["fit_batch_input_records"] = plan["fit_batch_input_records"]
     _atomic_json_noreplace(receipt, common["receipt"])
 
 
@@ -3072,7 +3792,19 @@ def _render_job(args: argparse.Namespace) -> None:
         expected_task=task,
         rendering=True,
     )
-    _prepare_task(spec, common, config, artifacts_ready=False)
+    plan = _prepare_task(spec, common, config, artifacts_ready=False)
+    if task == "fit_batch":
+        _atomic_json_noreplace(plan["batch_manifest_payload"], plan["batch_manifest"])
+        _, observed = _verify_record(
+            plan["batch_manifest_record"],
+            "rendered fit-batch manifest",
+            scratch_root=scratch_root,
+            private=True,
+        )
+        if observed != plan["batch_manifest_record"]:
+            raise RuntimeError(
+                "Rendered fit-batch manifest record is not deterministic."
+            )
     job_script = common["job_root"] / "job.sh"
     stdout_path = common["job_root"] / "stdout.log"
     stderr_path = common["job_root"] / "stderr.log"
@@ -3233,6 +3965,51 @@ def _record_qacct(args: argparse.Namespace) -> None:
         raise ValueError(
             "Invocation provenance is outside the process-receipt job root."
         )
+    invocation_payload, _, _ = _read_json(
+        invocation_path, "job invocation provenance", private=True
+    )
+    fit_input_records = None
+    fit_batch_manifest_record = None
+    fit_batch_input_records = None
+    if task == "fit":
+        fit_input_records = _validate_fit_input_records(
+            receipt.get("fit_input_records"), scratch_root
+        )
+        if (
+            invocation_payload.get("fit_input_records") != fit_input_records
+            or receipt.get("task_details", {}).get("input_records") != fit_input_records
+        ):
+            raise ValueError(
+                "Fit invocation and receipt do not bind the same exact inputs."
+            )
+    elif task == "fit_batch":
+        fit_batch_manifest_path, fit_batch_manifest_record = _verify_record(
+            receipt.get("fit_batch_manifest"),
+            "completed fit-batch manifest",
+            scratch_root=scratch_root,
+            private=True,
+        )
+        if fit_batch_manifest_path != job_root / FIT_BATCH_MANIFEST_NAME:
+            raise ValueError("Completed fit-batch manifest is outside its job root.")
+        if (
+            invocation_payload.get("fit_batch_manifest") != fit_batch_manifest_record
+            or receipt.get("task_details", {}).get("fit_batch_manifest")
+            != fit_batch_manifest_record
+        ):
+            raise ValueError(
+                "Fit-batch invocation and receipt do not bind the same manifest."
+            )
+        fit_batch_input_records = _validate_fit_batch_input_records(
+            receipt.get("fit_batch_input_records"), scratch_root
+        )
+        if (
+            invocation_payload.get("fit_batch_input_records") != fit_batch_input_records
+            or receipt.get("task_details", {}).get("input_records")
+            != fit_batch_input_records
+        ):
+            raise ValueError(
+                "Fit-batch invocation and receipt do not bind the same exact inputs."
+            )
     outputs = receipt.get("outputs")
     if not isinstance(outputs, list) or not outputs:
         raise ValueError("Process receipt lacks task outputs.")
@@ -3315,6 +4092,11 @@ def _record_qacct(args: argparse.Namespace) -> None:
         "qacct_stdout_sha256": raw_record["sha256"],
         "qacct_fields": account,
     }
+    if task == "fit":
+        payload["fit_input_records"] = fit_input_records
+    elif task == "fit_batch":
+        payload["fit_batch_manifest"] = fit_batch_manifest_record
+        payload["fit_batch_input_records"] = fit_batch_input_records
     _atomic_json_noreplace(payload, target)
     print(f"{target}\t{_sha256(target)}\t{target.stat().st_size}")
 

@@ -92,6 +92,26 @@ class GxENormalEquations:
 
 
 @dataclass(frozen=True)
+class GxEInputProvenance:
+    """Identity of one canonical input streamed into a private fit snapshot."""
+
+    path: str
+    bytes: int
+    sha256: str
+
+
+@dataclass(frozen=True)
+class GxEConsumedInputProvenance:
+    """Exact input snapshots consumed by one phenotype fit."""
+
+    reference_manifest: GxEInputProvenance
+    feature_cache: GxEInputProvenance | None
+    phenotype_moments: GxEInputProvenance
+    gwas: GxEInputProvenance
+    gwis: GxEInputProvenance
+
+
+@dataclass(frozen=True)
 class GxEFitResult:
     component_names: tuple[str, ...]
     coefficients: np.ndarray
@@ -108,6 +128,7 @@ class GxEFitResult:
     jackknife_estimates: np.ndarray | None = None
     jackknife_block_labels: tuple[str, ...] = ()
     phenotype_residual_variance_fraction: float | None = None
+    consumed_input_provenance: GxEConsumedInputProvenance | None = None
 
     def to_frame(self) -> pd.DataFrame:
         return pd.DataFrame(
@@ -171,6 +192,8 @@ class _PreparedGxEReference:
     block_masses: np.ndarray | None
     deleted_matrices: np.ndarray | None
     deleted_traces: np.ndarray | None
+    reference_provenance: GxEInputProvenance
+    feature_cache_provenance: GxEInputProvenance | None
 
 
 def assemble_normal_equations(
@@ -606,6 +629,8 @@ def _prepare_reference_sufficient_statistics(
     manifest_sha256: str,
     schema_version: int,
     feature_cache_sha256: str | None,
+    reference_provenance: GxEInputProvenance,
+    feature_cache_provenance: GxEInputProvenance | None,
     variants: pd.DataFrame,
     annotations: np.ndarray,
     annotation_names: Sequence[str],
@@ -792,6 +817,8 @@ def _prepare_reference_sufficient_statistics(
         deleted_traces=(
             None if deleted_traces is None else np.array(deleted_traces, copy=True)
         ),
+        reference_provenance=reference_provenance,
+        feature_cache_provenance=feature_cache_provenance,
     )
 
 
@@ -901,6 +928,91 @@ class _InputSnapshot:
     snapshot_path: Path
     sha256: str
     size: int
+
+
+def _snapshot_provenance(snapshot: _InputSnapshot) -> GxEInputProvenance:
+    """Freeze provenance from the snapshot copy operation, not the live path."""
+    return GxEInputProvenance(
+        path=str(snapshot.original_path),
+        bytes=int(snapshot.size),
+        sha256=str(snapshot.sha256),
+    )
+
+
+def _consumed_input_provenance(
+    *,
+    reference_manifest: _InputSnapshot,
+    feature_cache: _InputSnapshot | None,
+    phenotype_moments: _InputSnapshot,
+    gwas: _InputSnapshot,
+    gwis: _InputSnapshot,
+) -> GxEConsumedInputProvenance:
+    return GxEConsumedInputProvenance(
+        reference_manifest=_snapshot_provenance(reference_manifest),
+        feature_cache=(
+            None if feature_cache is None else _snapshot_provenance(feature_cache)
+        ),
+        phenotype_moments=_snapshot_provenance(phenotype_moments),
+        gwas=_snapshot_provenance(gwas),
+        gwis=_snapshot_provenance(gwis),
+    )
+
+
+def _serialize_consumed_input_provenance(
+    provenance: GxEConsumedInputProvenance | None,
+) -> dict[str, dict[str, Any] | None] | None:
+    """Emit null for in-memory fits; strictly validate every supplied record."""
+    if provenance is None:
+        return None
+    if not isinstance(provenance, GxEConsumedInputProvenance):
+        raise ValueError(
+            "Refusing to write malformed consumed-input provenance."
+        )
+
+    def serialize_record(
+        role: str, record: GxEInputProvenance | None, *, optional: bool = False
+    ) -> dict[str, Any] | None:
+        if record is None and optional:
+            return None
+        if not isinstance(record, GxEInputProvenance):
+            raise ValueError(f"Consumed-input provenance for {role} is incomplete.")
+        if (
+            not isinstance(record.path, str)
+            or not record.path
+            or "\x00" in record.path
+            or not Path(record.path).is_absolute()
+            or str(Path(record.path)) != record.path
+        ):
+            raise ValueError(
+                f"Consumed-input provenance for {role} lacks a canonical absolute path."
+            )
+        if (
+            not isinstance(record.bytes, int)
+            or isinstance(record.bytes, bool)
+            or record.bytes < 0
+        ):
+            raise ValueError(f"Consumed-input provenance for {role} has invalid bytes.")
+        if not _is_sha256(record.sha256) or record.sha256 != record.sha256.lower():
+            raise ValueError(f"Consumed-input provenance for {role} has invalid SHA-256.")
+        return {
+            "path": record.path,
+            "bytes": record.bytes,
+            "sha256": record.sha256,
+        }
+
+    return {
+        "reference_manifest": serialize_record(
+            "reference_manifest", provenance.reference_manifest
+        ),
+        "feature_cache": serialize_record(
+            "feature_cache", provenance.feature_cache, optional=True
+        ),
+        "phenotype_moments": serialize_record(
+            "phenotype_moments", provenance.phenotype_moments
+        ),
+        "gwas": serialize_record("gwas", provenance.gwas),
+        "gwis": serialize_record("gwis", provenance.gwis),
+    }
 
 
 class _InputSnapshotStore:
@@ -1296,6 +1408,7 @@ def _fit_from_input_snapshots(
     ref_cache_path = None
     ref_cache_metadata = None
     ref_cache_arrays = None
+    ref_cache_snapshot: _InputSnapshot | None = None
     validated_cache_by_hash: dict[
         str, tuple[dict[str, Any], dict[str, np.ndarray]]
     ] = {}
@@ -1324,6 +1437,7 @@ def _fit_from_input_snapshots(
         raise ValueError("Phenotype moments contain an invalid feature-cache SHA-256 binding.")
     moments_cache = moments.get("feature_cache")
     verified_moments_cache_hash = None
+    moments_cache_snapshot: _InputSnapshot | None = None
     if moments_cache is not None:
         if (
             not isinstance(moments_cache, dict)
@@ -1654,6 +1768,18 @@ def _fit_from_input_snapshots(
             raise ValueError(f"{label} score file DF does not match the reference residual rank.")
         score_arrays.append(table["SCORE"].to_numpy(dtype=np.float64))
 
+    shared_cache_snapshot = (
+        ref_cache_snapshot
+        if ref_cache_snapshot is not None
+        else moments_cache_snapshot
+    )
+    reference_provenance = _snapshot_provenance(ref_snapshot)
+    feature_cache_provenance = (
+        None
+        if shared_cache_snapshot is None
+        else _snapshot_provenance(shared_cache_snapshot)
+    )
+
     panels = {}
     for key in ("xx", "xw", "wx", "ww"):
         panels[key] = _aligned_panel(
@@ -1748,6 +1874,8 @@ def _fit_from_input_snapshots(
             manifest_sha256=observed_reference_hash,
             schema_version=ref_version,
             feature_cache_sha256=ref_cache_hash,
+            reference_provenance=reference_provenance,
+            feature_cache_provenance=feature_cache_provenance,
             variants=variants,
             annotations=annotations,
             annotation_names=names,
@@ -1793,6 +1921,8 @@ def _fit_from_input_snapshots(
             manifest_sha256=observed_reference_hash,
             schema_version=ref_version,
             feature_cache_sha256=ref_cache_hash,
+            reference_provenance=reference_provenance,
+            feature_cache_provenance=feature_cache_provenance,
             variants=variants,
             annotations=annotations,
             annotation_names=names,
@@ -1804,6 +1934,16 @@ def _fit_from_input_snapshots(
             equations=eq,
             null_corrected=null_corrected,
         )
+    fit = replace(
+        fit,
+        consumed_input_provenance=_consumed_input_provenance(
+            reference_manifest=ref_snapshot,
+            feature_cache=shared_cache_snapshot,
+            phenotype_moments=moments_snapshot,
+            gwas=score_snapshots["gwas"],
+            gwis=score_snapshots["gwis"],
+        ),
+    )
     if prepared_out is not None:
         prepared_out.append(prepared)
     return fit, eq
@@ -1854,6 +1994,7 @@ def _fit_prepared_from_input_snapshots(
         raise ValueError("Phenotype moments contain an invalid feature-cache SHA-256 binding.")
     moments_cache = moments.get("feature_cache")
     verified_moments_cache_hash = None
+    moments_cache_snapshot: _InputSnapshot | None = None
     if moments_cache is not None:
         if (
             not isinstance(moments_cache, dict)
@@ -1864,13 +2005,15 @@ def _fit_prepared_from_input_snapshots(
             raise ValueError("Phenotype moments have an invalid feature-cache binding.")
         moments_cache_path = _resolve_path(mom_path, moments_cache["path"]).resolve()
         verified_moments_cache_hash = str(moments_cache["sha256"])
-        cache_snapshot = snapshots.capture(moments_cache_path)
-        if cache_snapshot.sha256 != verified_moments_cache_hash:
+        moments_cache_snapshot = snapshots.capture(moments_cache_path)
+        if moments_cache_snapshot.sha256 != verified_moments_cache_hash:
             raise ValueError("Phenotype-moment feature cache failed its SHA-256 check.")
         if ref_cache_hash is not None and verified_moments_cache_hash != ref_cache_hash:
             raise ValueError("Phenotype moments and reference point to different feature caches.")
         if verified_moments_cache_hash not in validated_cache_hashes:
-            _, arrays = _load_feature_cache_bundle(cache_snapshot.snapshot_path)
+            _, arrays = _load_feature_cache_bundle(
+                moments_cache_snapshot.snapshot_path
+            )
             arrays.clear()
             validated_cache_hashes.add(verified_moments_cache_hash)
         if (
@@ -2030,6 +2173,22 @@ def _fit_prepared_from_input_snapshots(
             jackknife_estimates=replicate_array,
             jackknife_block_labels=prepared.block_labels,
         )
+    feature_cache_provenance = prepared.feature_cache_provenance
+    if (
+        prepared.feature_cache_sha256 is None
+        and moments_cache_snapshot is not None
+    ):
+        feature_cache_provenance = _snapshot_provenance(moments_cache_snapshot)
+    fit = replace(
+        fit,
+        consumed_input_provenance=GxEConsumedInputProvenance(
+            reference_manifest=prepared.reference_provenance,
+            feature_cache=feature_cache_provenance,
+            phenotype_moments=_snapshot_provenance(moments_snapshot),
+            gwas=_snapshot_provenance(score_snapshots["gwas"]),
+            gwis=_snapshot_provenance(score_snapshots["gwis"]),
+        ),
+    )
     return fit, equations
 
 
@@ -2221,6 +2380,9 @@ def write_fit(
     *,
     overwrite: bool = False,
 ) -> tuple[Path, Path]:
+    consumed_input_provenance = _serialize_consumed_input_provenance(
+        fit.consumed_input_provenance
+    )
     prefix = Path(prefix)
     table_path = Path(str(prefix) + ".gxe.results.tsv")
     json_path = Path(str(prefix) + ".gxe.fit.json")
@@ -2273,6 +2435,7 @@ def write_fit(
     payload: dict[str, Any] = {
         "kind": "summit.gxe.fit",
         "schema_version": _SCHEMA_VERSION,
+        "consumed_input_provenance": consumed_input_provenance,
         "component_names": list(fit.component_names),
         "rank": fit.rank,
         "condition_number": fit.condition_number,
