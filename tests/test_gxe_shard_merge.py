@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import importlib
+import importlib.util
 import math
 import os
 import types
@@ -17,6 +19,17 @@ from summit.ldscore.gwe_ldscore import GenomewideEnvLDScore
 from summit.ldscore.gxe_merge import merge_reference_shards
 from summit.ldscore.gxe_score import score_phenotype_from_reference
 from summit.logger import Logger
+
+
+ROOT = Path(__file__).resolve().parents[1]
+DEPLOY_PATH = ROOT / "scripts" / "gxe" / "hoffman" / "hoffman_deploy.py"
+DEPLOY_CONFIG_PATH = ROOT / "scripts" / "gxe" / "hoffman" / "deployment_config.json"
+_DEPLOY_SPEC = importlib.util.spec_from_file_location(
+    "summit_hoffman_merge_integration_test", DEPLOY_PATH
+)
+assert _DEPLOY_SPEC is not None and _DEPLOY_SPEC.loader is not None
+HOFFMAN_DEPLOY = importlib.util.module_from_spec(_DEPLOY_SPEC)
+_DEPLOY_SPEC.loader.exec_module(HOFFMAN_DEPLOY)
 
 
 def _toy_inputs(tmp_path: Path):
@@ -84,6 +97,146 @@ def _estimator(
     )
 
 
+def _deployment_shard_estimator(
+    inputs,
+    out: Path,
+    *,
+    probes: int,
+    offset: int = 0,
+    cache: Path | None = None,
+    shard: bool = False,
+):
+    prefix, env, cov, _, _, m = inputs
+    return GenomewideEnvLDScore(
+        bed_path=str(prefix),
+        env_path=str(env),
+        covar_path=str(cov),
+        annot_path=None,
+        out_path=str(out),
+        log=Logger(suppress=True),
+        rand_dist="rademacher",
+        low_level=None,
+        num_vecs=probes,
+        step_size=m,
+        seed=20260808,
+        dtype="float32",
+        num_threads=1,
+        kernel_mode="standardized",
+        genotype_scale="sample",
+        target_xz_mem=0.01,
+        write_jackknife=True,
+        jackknife_spec="3",
+        allow_low_probe_jackknife=False,
+        probe_offset=offset,
+        feature_cache_path=None if cache is None else str(cache),
+        shard_mode=shard,
+    )
+
+
+@pytest.fixture(scope="module")
+def deployment_b1024_shards(tmp_path_factory):
+    scratch = tmp_path_factory.mktemp("gxe-hoffman-merge-integration")
+    scratch.chmod(0o700)
+    inputs = _toy_inputs(scratch)
+    _, _, _, _, _, m = inputs
+    cache = scratch / "features.gxe.cache.npz"
+    builder = _deployment_shard_estimator(inputs, scratch / "builder", probes=128)
+    builder.write_feature_cache(cache)
+    shards = {}
+    for index in (0, 4, 5, 6, 7):
+        estimator = _deployment_shard_estimator(
+            inputs,
+            scratch / f"shard-{index}",
+            probes=128,
+            offset=index * 128,
+            cache=cache,
+            shard=True,
+        )
+        estimator._compute_ldscore()
+        shards[index] = scratch / f"shard-{index}.gxe.shard.json"
+    for path in scratch.rglob("*"):
+        path.chmod(0o700 if path.is_dir() else 0o600)
+    config = json.loads(DEPLOY_CONFIG_PATH.read_text(encoding="utf-8"))
+    config["scratch_root"] = str(scratch)
+    config["estimator"]["annotation_mass"] = m
+    config["estimator"]["jackknife_blocks"] = 3
+    config["estimator"]["step_size"] = m
+    return scratch, cache, shards, config
+
+
+@pytest.mark.parametrize(
+    ("task", "indices", "expected_probes", "expected_offset", "manifest_name"),
+    [
+        ("merge", (0,), 128, 0, "B128.gxe.ref.json"),
+        (
+            "merge_half",
+            (4, 5, 6, 7),
+            512,
+            512,
+            "B512_second_half.gxe.ref.json",
+        ),
+    ],
+)
+def test_hoffman_merge_plan_executes_and_postvalidates_without_low_probe_override(
+    deployment_b1024_shards,
+    monkeypatch: pytest.MonkeyPatch,
+    task: str,
+    indices: tuple[int, ...],
+    expected_probes: int,
+    expected_offset: int,
+    manifest_name: str,
+):
+    scratch, cache, shards, config = deployment_b1024_shards
+    job = scratch / f"job-{task}"
+    job.mkdir(mode=0o700)
+    artifacts = job / "artifacts"
+    cache_record = HOFFMAN_DEPLOY._record(cache)
+    shard_records = [HOFFMAN_DEPLOY._record(shards[index]) for index in indices]
+    dependencies = [
+        {
+            "outputs": [record],
+            "task_details": {"dataset": "full", "role": "production"},
+        }
+        for record in shard_records
+    ]
+    monkeypatch.setattr(
+        HOFFMAN_DEPLOY,
+        "_validate_qacct_dependencies",
+        lambda *unused, **unused_kwargs: dependencies,
+    )
+    spec = {
+        "task": task,
+        "task_args": {
+            "dataset": "full",
+            "cache": cache_record,
+            "shards": shard_records,
+        },
+    }
+    common = {
+        "scratch_root": scratch,
+        "job_root": job,
+        "artifacts": artifacts,
+        "deployment_config": HOFFMAN_DEPLOY._record(DEPLOY_CONFIG_PATH),
+        "frozen": {"panel_payload": {"groups": {}}},
+    }
+    plan = HOFFMAN_DEPLOY._prepare_task(spec, common, config, artifacts_ready=False)
+    assert "--allow-low-probe-gxe-jackknife" not in plan["command"]
+    artifacts.mkdir(mode=0o700)
+    HOFFMAN_DEPLOY._execute_plan(
+        plan,
+        {"cli_module": importlib.import_module("summit.cli")},
+        common,
+        task,
+    )
+    records = HOFFMAN_DEPLOY._postvalidate_task(spec, common, config, plan, runtime={})
+    manifest = artifacts / manifest_name
+    reference = json.loads(manifest.read_text(encoding="utf-8"))
+    assert reference["randomization"]["num_vectors"] == expected_probes
+    assert reference["randomization"]["probe_offset"] == expected_offset
+    assert reference["randomization"]["low_probe_jackknife_override"] is False
+    assert records == [HOFFMAN_DEPLOY._record(path) for path in plan["outputs"]]
+
+
 @pytest.fixture(scope="module")
 def merged_bundle(tmp_path_factory):
     root = tmp_path_factory.mktemp("gxe-shard-merge")
@@ -134,7 +287,10 @@ def test_probe_rng_is_tiling_and_offset_invariant(distribution):
     obj.dtype = np.float64
     full = obj._generate_random_block(19, 17, 23, 0)
     tiled = np.column_stack(
-        [obj._generate_random_block(19, 5, 23, 0), obj._generate_random_block(19, 12, 23, 5)]
+        [
+            obj._generate_random_block(19, 5, 23, 0),
+            obj._generate_random_block(19, 12, 23, 5),
+        ]
     )
     np.testing.assert_array_equal(full, tiled)
     obj.probe_offset = 12
@@ -143,10 +299,10 @@ def test_probe_rng_is_tiling_and_offset_invariant(distribution):
 
 
 @pytest.mark.parametrize("malformation", ["duplicate_reserved", "negative"])
-def test_panel_reader_rejects_ambiguous_or_negative_contributions(tmp_path, malformation):
-    variants = pd.DataFrame(
-        {"CHR": ["1", "1"], "SNP": ["rs1", "rs2"], "BP": [10, 20]}
-    )
+def test_panel_reader_rejects_ambiguous_or_negative_contributions(
+    tmp_path, malformation
+):
+    variants = pd.DataFrame({"CHR": ["1", "1"], "SNP": ["rs1", "rs2"], "BP": [10, 20]})
     panel = tmp_path / f"{malformation}.ldscore.gz"
     if malformation == "duplicate_reserved":
         frame = pd.DataFrame(
@@ -176,12 +332,17 @@ def test_cache_skip_shards_merge_and_fit_equal_monolithic(merged_bundle):
     for suffix in ("gxx", "gxe", "exg", "gee"):
         left = pd.read_csv(root / f"mono.{suffix}.ldscore.gz", sep=r"\s+")
         right = pd.read_csv(root / f"merged.{suffix}.ldscore.gz", sep=r"\s+")
-        pd.testing.assert_frame_equal(left, right, check_exact=False, rtol=2e-9, atol=2e-9)
+        pd.testing.assert_frame_equal(
+            left, right, check_exact=False, rtol=2e-9, atol=2e-9
+        )
     mono_jack = np.load(root / "mono.gxe.jackknife.npz")
     merged_jack = np.load(root / "merged.gxe.jackknife.npz")
     for key in ("xx", "xw", "wx", "ww"):
         np.testing.assert_allclose(
-            mono_jack[f"within_{key}"], merged_jack[f"within_{key}"], rtol=2e-13, atol=2e-13
+            mono_jack[f"within_{key}"],
+            merged_jack[f"within_{key}"],
+            rtol=2e-13,
+            atol=2e-13,
         )
 
     prefix, env, cov, pheno, _, _ = inputs
@@ -206,18 +367,33 @@ def test_cache_skip_shards_merge_and_fit_equal_monolithic(merged_bundle):
         step_size=13,
     )
     fit_mono, eq_mono = fit_from_files(
-        mono, mono_scores.moments, mono_scores.gwas, mono_scores.gwis, max_condition=1e16
+        mono,
+        mono_scores.moments,
+        mono_scores.gwas,
+        mono_scores.gwis,
+        max_condition=1e16,
     )
     fit_merged, eq_merged = fit_from_files(
-        merged, merged_scores.moments, merged_scores.gwas, merged_scores.gwis, max_condition=1e16
+        merged,
+        merged_scores.moments,
+        merged_scores.gwas,
+        merged_scores.gwis,
+        max_condition=1e16,
     )
     np.testing.assert_allclose(eq_mono.matrix, eq_merged.matrix, rtol=2e-9, atol=2e-9)
     np.testing.assert_allclose(eq_mono.rhs, eq_merged.rhs, rtol=2e-12, atol=2e-12)
-    np.testing.assert_allclose(fit_mono.proportions, fit_merged.proportions, rtol=2e-8, atol=2e-8)
     np.testing.assert_allclose(
-        fit_mono.jackknife_estimates, fit_merged.jackknife_estimates, rtol=3e-8, atol=3e-8
+        fit_mono.proportions, fit_merged.proportions, rtol=2e-8, atol=2e-8
     )
-    np.testing.assert_allclose(fit_mono.standard_errors, fit_merged.standard_errors, rtol=3e-8, atol=3e-8)
+    np.testing.assert_allclose(
+        fit_mono.jackknife_estimates,
+        fit_merged.jackknife_estimates,
+        rtol=3e-8,
+        atol=3e-8,
+    )
+    np.testing.assert_allclose(
+        fit_mono.standard_errors, fit_merged.standard_errors, rtol=3e-8, atol=3e-8
+    )
 
     # Marginal phenotype scores are feature-cache quantities, not randomized
     # trace quantities.  A second merge of the identical cache/probes has a
@@ -234,12 +410,19 @@ def test_cache_skip_shards_merge_and_fit_equal_monolithic(merged_bundle):
         merged_scores.gwis,
         max_condition=1e16,
     )
-    np.testing.assert_allclose(eq_alternate.matrix, eq_merged.matrix, rtol=0.0, atol=0.0)
-    np.testing.assert_allclose(fit_alternate.proportions, fit_merged.proportions, rtol=0.0, atol=0.0)
+    np.testing.assert_allclose(
+        eq_alternate.matrix, eq_merged.matrix, rtol=0.0, atol=0.0
+    )
+    np.testing.assert_allclose(
+        fit_alternate.proportions, fit_merged.proportions, rtol=0.0, atol=0.0
+    )
     moments_payload = json.loads(merged_scores.moments.read_text(encoding="utf-8"))
-    assert moments_payload["feature_cache_sha256"] == json.loads(
-        Path(merged).read_text(encoding="utf-8")
-    )["feature_cache"]["sha256"]
+    assert (
+        moments_payload["feature_cache_sha256"]
+        == json.loads(Path(merged).read_text(encoding="utf-8"))["feature_cache"][
+            "sha256"
+        ]
+    )
     nonexistent_cache_reference = root / "nonexistent-cache-reference.json"
     invalid_reference = json.loads(Path(alternate).read_text(encoding="utf-8"))
     invalid_reference["feature_cache"]["path"] = "does-not-exist.gxe.cache.npz"
@@ -420,7 +603,14 @@ def test_cache_skip_is_two_passes_versus_three(tmp_path):
     builder = _estimator(inputs, tmp_path / "builder", probes=100)
     builder.write_feature_cache(cache)
     with np.load(cache, allow_pickle=False) as bundle:
-        for name in ("scale_x", "scale_w", "norm_x", "norm_w", "diag_nxe_x", "diag_nxe_w"):
+        for name in (
+            "scale_x",
+            "scale_w",
+            "norm_x",
+            "norm_w",
+            "diag_nxe_x",
+            "diag_nxe_w",
+        ):
             assert bundle[name].dtype == np.float64
     incompatible = _estimator(inputs, tmp_path / "incompatible", probes=100)
     incompatible.kernel_mode = "genie"
@@ -443,7 +633,9 @@ def test_cache_skip_is_two_passes_versus_three(tmp_path):
     assert counts == [3, 2]
 
 
-def test_feature_cache_link_failure_does_not_leave_published_cache(tmp_path, monkeypatch):
+def test_feature_cache_link_failure_does_not_leave_published_cache(
+    tmp_path, monkeypatch
+):
     inputs = _toy_inputs(tmp_path)
     builder = _estimator(inputs, tmp_path / "builder", probes=10)
     target = tmp_path / "chmod-cache.npz"
@@ -465,9 +657,7 @@ def test_direct_generation_does_not_replace_concurrent_artifact(tmp_path):
     builder.write_feature_cache(cache)
 
     prefix = tmp_path / "race"
-    estimator = _estimator(
-        inputs, prefix, probes=10, cache=cache, shard=True
-    )
+    estimator = _estimator(inputs, prefix, probes=10, cache=cache, shard=True)
     competitor = Path(str(prefix) + ".gxx.ldscore.gz")
     competitor_bytes = b"competing writer\n"
     original_impl = estimator._compute_ldscore_impl
@@ -484,16 +674,16 @@ def test_direct_generation_does_not_replace_concurrent_artifact(tmp_path):
     assert not list(tmp_path.glob(".gxe-bundle-stage-*"))
 
 
-def test_direct_generation_rollback_preserves_competing_future_manifest(tmp_path, monkeypatch):
+def test_direct_generation_rollback_preserves_competing_future_manifest(
+    tmp_path, monkeypatch
+):
     inputs = _toy_inputs(tmp_path)
     cache = tmp_path / "future-cache.npz"
     builder = _estimator(inputs, tmp_path / "future-builder", probes=10)
     builder.write_feature_cache(cache)
 
     prefix = tmp_path / "future"
-    estimator = _estimator(
-        inputs, prefix, probes=10, cache=cache, shard=True
-    )
+    estimator = _estimator(inputs, prefix, probes=10, cache=cache, shard=True)
     competitor = Path(str(prefix) + ".gxe.shard.json")
     competitor_bytes = b'{"writer":"competitor"}\n'
     actual_link = gwe_ldscore.os.link
@@ -515,7 +705,9 @@ def test_direct_generation_rollback_preserves_competing_future_manifest(tmp_path
     assert not list(tmp_path.glob(".gxe-bundle-stage-*"))
 
 
-def test_merge_publication_failure_rolls_back_complete_bundle(merged_bundle, monkeypatch):
+def test_merge_publication_failure_rolls_back_complete_bundle(
+    merged_bundle, monkeypatch
+):
     root, _, cache, shards, _ = merged_bundle
     prefix = root / "publish-failure"
     actual_link = gxe_merge.os.link
@@ -588,5 +780,7 @@ def test_merge_does_not_path_chmod_published_artifact(merged_bundle, monkeypatch
         output_prefix=prefix,
     )
     assert result.is_file()
-    assert all((path.stat().st_mode & 0o777) == 0o600 for path in root.glob("chmod-failure.g*"))
+    assert all(
+        (path.stat().st_mode & 0o777) == 0o600 for path in root.glob("chmod-failure.g*")
+    )
     assert not list(root.glob(".gxe-merge-stage-*"))

@@ -32,10 +32,16 @@
     "annotation_contract": "all_variants_unit_weight",
     "kernel_mode": "standardized",
     "genotype_scale": "sample",
-    "num_probes": 100,
+    "num_probes": 1024,
     "jackknife_blocks": 100,
-    "probe_shards": 2,
-    "probes_per_shard": 50,
+    "probe_shards": 8,
+    "probes_per_shard": 128,
+    "checkpoint_probes": [
+      128,
+      256,
+      512,
+      1024
+    ],
     "random_distribution": "rademacher",
     "seed_family": 20260808,
     "dtype": "float32",
@@ -114,17 +120,17 @@
       "h_rt": "48:00:00",
       "highp": true
     },
-    "production_b50_shard": {
+    "production_b128_shard": {
       "slots": 4,
-      "h_data_per_slot": "8G",
-      "total_memory": "32G",
+      "h_data_per_slot": "12G",
+      "total_memory": "48G",
       "h_rt": "48:00:00",
       "highp": true
     },
     "eight_slot_benchmark": {
       "slots": 8,
-      "h_data_per_slot": "4G",
-      "total_memory": "32G",
+      "h_data_per_slot": "6G",
+      "total_memory": "48G",
       "h_rt": "24:00:00",
       "highp": true
     },

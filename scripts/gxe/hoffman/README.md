@@ -4,7 +4,8 @@ This directory contains preparation/verification code and an explicit runbook;
 it does not submit jobs. The cache, wide-score, probe-shard, and shard-merge
 APIs are implemented. The focused GxE/deployment suite must pass from the exact
 checksummed frozen snapshot before sealing. The production trace contract is
-two B50 shards forming one B100 reference; the earlier valid-50k B10 runs are
+eight contiguous B128 shards forming one B1024 reference, with sealed prefix
+checkpoints at B128, B256, B512, and B1024. Earlier B10/B50/B100 runs are
 historical calibration evidence, not inputs to this production tiling.
 
 ## Fixed analysis contract
@@ -132,7 +133,7 @@ staged/group/output paths. Every output prefix must be fresh. Never use
 ### Hash-bound UGE deployment layer
 
 `deployment_config.json`, `job_spec_templates.json`, `hoffman_deploy.py`, and
-the seven `uge_*.sh` wrappers implement the production launch gates. They do not
+the nine `uge_*.sh` wrappers implement the production launch gates. They do not
 submit anything. A renderer validates all sealed inputs and writes one concrete
 script plus pre-created private stdout/stderr files in a fresh 0700 job leaf;
 it only prints the corresponding `qsub` command. The wrappers expose no free
@@ -197,8 +198,37 @@ imports, or inputs; the shell creates a no-clobber `attempt.lock` even before
 Python starts. Any failed/partial leaf is therefore permanently
 quarantined and must not be retried in place.
 Every downstream spec must cite the completed qacct record, not merely the
-process receipt. Merge specs accept only completed production shard receipts;
-the separately named eight-slot shard-00 benchmark can never enter a merge.
+process receipt. Every dependency must bind the exact current deployment-config
+record. The sole cross-snapshot exception is dependency 1 of `cache_attest`: it
+must be a completed cache job under the explicitly allowlisted `0113342`
+deployment-config SHA. No other task or dependency index can use that exception.
+
+Every task spec also declares `task_args.dataset`, exactly `full` or
+`subset_50k`. Only `full` may use the `production` shard lineage and produce
+`production_prefix`, `production_score`, or `production_fit` receipts.
+`subset_50k` remains available for calibration, but must use the separately
+labeled `calibration`, `calibration_prefix`, `calibration_score`, and
+`calibration_fit` lineage. Dataset equality is checked at every stage, cache,
+attestation, shard, merge, score, and fit boundary. Thus a valid-50k B1024
+calibration cannot satisfy a full-cohort score or reporting dependency. The
+separately named eight-slot shard-00 benchmark can never enter either merge
+lineage.
+
+For the valid-50k B128 calibration gate, copy the relevant template but use
+these exact fields; do not reuse the full/production values:
+
+```json
+{"task":"shard","task_args":{"dataset":"subset_50k","role":"calibration","shard_index":0}}
+{"task":"merge","task_args":{"dataset":"subset_50k","shards":["<VALID_50K_SHARD_00_RECORD>"]}}
+```
+
+The shard receipt must consequently contain
+`{"dataset":"subset_50k","role":"calibration"}` and the B128 merge receipt
+must contain `{"dataset":"subset_50k","role":"calibration_prefix"}`. If the
+calibration continues to B1024, its score and fit specs must retain
+`dataset=subset_50k`; their dependencies and receipts must respectively carry
+`calibration_prefix`, `calibration_score`, and `calibration_fit`. None of these
+records is accepted by a `dataset=full` job.
 
 The renderer derives every task-specific path from the validated `task_args`
 records in the private job spec and writes a deterministic, hash-checked
@@ -251,7 +281,7 @@ Build one phenotype-free cache per dataset/group. `--write-gxe-jackknife` and
   --impute-method mean \
   --step_size 500 \
   --target-xz-mem 16 \
-  --nvecs 100 \
+  --nvecs 1024 \
   --num-threads "${NSLOTS}" \
   --out "${GXE_CACHE_OUT}"
 ```
@@ -260,13 +290,27 @@ This writes `${GXE_CACHE_OUT}.gxe.cache.npz`. Validate its mode, SHA256,
 genotype/design fingerprints, N/rank, one-bin annotation contract, J=100 block
 labels, finite feature scales, and diagnostics before any shard job.
 
-Each B50/J100 shard uses the same cache, seed, and estimator settings, with a
+A schema-v2 cache produced by the frozen `0113342` deployment may be reused
+only through `cache_attest`. Its dependencies are ordered: first a newly
+completed `stage_verify` job whose report binds the B1024 panel SHA, then the
+completed legacy cache qacct record. The task requires the exact allowlisted
+legacy deployment-config SHA and a deterministic fingerprint of every
+`src/summit/**/*.py` source recorded by the old frozen manifest, then reruns
+schema/array, genotype, group/design/rank, environment/covariate,
+analysis-fingerprint, annotation, and J-block validation. It also reads the
+qacct-bound legacy cache job spec and requires its exact genotype/group records
+and stage report to declare the same dataset as the new attestation. It writes
+a new dataset-bound attestation; an attested-cache shard must cite that exact
+artifact and its completed qacct record. Merely having schema version 2 is
+insufficient.
+
+Each B128/J100 shard uses the same cache, seed, and estimator settings, with a
 disjoint global probe interval. Run one new job for each
-`GXE_SHARD_INDEX=0,1`; do not use an array or a task-concurrency cap:
+`GXE_SHARD_INDEX=0,...,7`; do not use an array or a task-concurrency cap:
 
 ```bash
-GXE_SHARD_INDEX=<INTEGER_0_OR_1>
-GXE_PROBE_OFFSET=$((50 * GXE_SHARD_INDEX))
+GXE_SHARD_INDEX=<INTEGER_0_THROUGH_7>
+GXE_PROBE_OFFSET=$((128 * GXE_SHARD_INDEX))
 printf -v GXE_SHARD_TAG '%02d' "${GXE_SHARD_INDEX}"
 GXE_SHARD_OUT="${GXE_PARTIAL_ROOT}/shard_${GXE_SHARD_TAG}"
 
@@ -277,7 +321,7 @@ GXE_SHARD_OUT="${GXE_PARTIAL_ROOT}/shard_${GXE_SHARD_TAG}"
   --gxe-feature-cache "${GXE_CACHE}" \
   --gxe-reference-shard \
   --gxe-probe-offset "${GXE_PROBE_OFFSET}" \
-  --nvecs 50 \
+  --nvecs 128 \
   --gxe-kernel-mode standardized \
   --gxe-genotype-scale sample \
   --write-gxe-jackknife \
@@ -295,48 +339,62 @@ GXE_SHARD_OUT="${GXE_PARTIAL_ROOT}/shard_${GXE_SHARD_TAG}"
 ```
 
 The merge input is each `${GXE_SHARD_OUT}.gxe.shard.json`, not a directional
-panel or jackknife NPZ. Shard 00 covers `[0,50)` and shard 01 covers `[50,100)`.
-A one-shard B50 prefix merge is diagnostic and must carry the explicit
-low-probe override:
+panel or jackknife NPZ. Shards 00 through 07 cover `[0,128)` through
+`[896,1024)`. Full production `merge` specs accept only `dataset=full` shards
+with `role=production`; subset calibration merges analogously require only
+`dataset=subset_50k`, `role=calibration` shards. Both accept only the four exact
+contiguous prefixes ending at B128, B256, B512, and B1024. All checkpoints are
+at or above the merger's 100-probe fit-able threshold and therefore must not
+carry the low-probe override:
 
 ```bash
-GXE_B50_OUT="${GXE_MERGED_ROOT}/B050"
+GXE_B128_OUT="${GXE_MERGED_ROOT}/B128"
 "${GXE_SUMMIT}" \
   --gxe-merge-shards "${GXE_PARTIAL_ROOT}/shard_00.gxe.shard.json" \
   --gxe-feature-cache "${GXE_CACHE}" \
-  --allow-low-probe-gxe-jackknife \
-  --out "${GXE_B50_OUT}"
+  --out "${GXE_B128_OUT}"
 ```
 
-Shard 01 alone is an independent raw-contribution/resume unit, not a fit-able
-checkpoint: the sealed merger intentionally accepts only a contiguous prefix
-starting at probe zero. Do not try to merge shard 01 alone and do not weaken
-that guard. The production B100 merge lists exactly both shards and must not use
-the low-probe override:
+The production B1024 merge lists all eight shards and must not use the
+low-probe override:
 
 ```bash
 GXE_SHARDS=(
   "${GXE_PARTIAL_ROOT}/shard_00.gxe.shard.json"
   "${GXE_PARTIAL_ROOT}/shard_01.gxe.shard.json"
+  "${GXE_PARTIAL_ROOT}/shard_02.gxe.shard.json"
+  "${GXE_PARTIAL_ROOT}/shard_03.gxe.shard.json"
+  "${GXE_PARTIAL_ROOT}/shard_04.gxe.shard.json"
+  "${GXE_PARTIAL_ROOT}/shard_05.gxe.shard.json"
+  "${GXE_PARTIAL_ROOT}/shard_06.gxe.shard.json"
+  "${GXE_PARTIAL_ROOT}/shard_07.gxe.shard.json"
 )
-GXE_B100_OUT="${GXE_MERGED_ROOT}/B100"
+GXE_B1024_OUT="${GXE_MERGED_ROOT}/B1024"
 "${GXE_SUMMIT}" \
   --gxe-merge-shards "${GXE_SHARDS[@]}" \
   --gxe-feature-cache "${GXE_CACHE}" \
-  --out "${GXE_B100_OUT}"
+  --out "${GXE_B1024_OUT}"
 ```
+
+For an independent-half Monte Carlo diagnostic, use only the separately named
+`merge_half` task with shards 04--07. It emits `B512_second_half` and is marked
+`diagnostic_second_half`; a score task accepts qacct provenance only from the
+ordinary prefix-only `merge` task, so this non-prefix artifact cannot enter the
+production path. Never relax the ordinary merge prefix/checkpoint checks.
 
 The merger rejects mixed cache hashes, sample/variant/annotation/design
 fingerprints, J, kernel/genotype scales, randomization settings, or overlapping
 probe identities. Schema-v3 merged references retain raw realized-sample
 panels; no generic XX-like storage offset is applied to any direction.
 
-After validating the B100 reference, score every group phenotype in one BED
-pass. Production scoring can wait for B100:
+After validating the B1024 reference, score every group phenotype in one BED
+pass. Production scoring requires `dataset=full` and a completed
+`production_prefix` B1024 merge. A valid-50k calibration score must instead
+declare `dataset=subset_50k` and depend on a `calibration_prefix` B1024 merge:
 
 ```bash
 "${GXE_SUMMIT}" \
-  --gxe-score-reference "${GXE_B100_OUT}.gxe.ref.json" \
+  --gxe-score-reference "${GXE_B1024_OUT}.gxe.ref.json" \
   --geno "${GXE_GENO}" \
   --env "${GXE_ENV}" \
   --covar "${GXE_COVAR}" \
@@ -354,14 +412,17 @@ For each trait, this writes `${GXE_SCORE_OUT}.<trait>.gxe.gwas.tsv.gz`,
 feature-cache SHA and may be reused with any B checkpoint merged from that
 exact cache; do not rescore each checkpoint.
 
-For production, use one `fit_batch` Hoffman spec per configured group. Its
+For production, use one `fit_batch` Hoffman spec per configured group with
+`dataset=full`; its completed score dependency must be a same-dataset
+`production_score`. A separately labeled valid-50k calibration fit declares
+`dataset=subset_50k` and requires a `calibration_score`. Its
 `traits` entries must contain exactly `trait`, `moments`, `gwas`, and `gwis`,
 must list every group trait in `panel_config.json` order, and must use exact
 mode-0600 `path`/`bytes`/`sha256` records. The spec has exactly one dependency:
 the completed qacct record for that group's wide-score job. Rendering fails
 unless every triplet record is an exact member of the score receipt's outputs,
 the remaining score output is its single log, and the qacct group, trait order,
-cache SHA, and B100-reference SHA all match. In addition, the batch cache and
+cache SHA, and B1024-reference SHA all match. In addition, the batch cache and
 reference records must exactly equal the `path`/`bytes`/`sha256` records in the
 qacct-bound score job spec's `task_args`; matching content hashes at different
 paths are deliberately insufficient.
@@ -399,12 +460,12 @@ mutation that leaves the live paths unchanged at the after-run rehash.
 
 The existing `fit` form remains available for a separately named one-trait
 diagnostic or sensitivity analysis. It fits one trait against the validated
-B100 reference:
+B1024 reference:
 
 ```bash
 GXE_TRAIT=<ONE_CONFIGURED_TRAIT>
 "${GXE_SUMMIT}" \
-  --gxe-fit "${GXE_B100_OUT}.gxe.ref.json" \
+  --gxe-fit "${GXE_B1024_OUT}.gxe.ref.json" \
   --gxe-gwas "${GXE_SCORE_OUT}.${GXE_TRAIT}.gxe.gwas.tsv.gz" \
   --gwis "${GXE_SCORE_OUT}.${GXE_TRAIT}.gxe.gwis.tsv.gz" \
   --gxe-moments "${GXE_SCORE_OUT}.${GXE_TRAIT}.gxe.moments.json" \
@@ -428,22 +489,19 @@ Execution order:
 
 1. Freeze the now-green current source, then rerun the complete equivalence
    suite from that checksummed snapshot with user-site/editable imports disabled.
-2. Retain the sealed valid-50k B10 artifacts and qacct records as historical
-   calibration evidence. They selected four slots over eight, but their
-   `[0,10)` intervals cannot enter a B50/B100 merge under the new contract.
-3. Before any full-cohort B50 job, run valid-50k age-BP shard 00 over `[0,50)`
-   with the new sealed contract, make its diagnostic B50 merge, and validate
-   artifacts, matrix geometry, scratch use, and final qacct wall/CPU/maxvmem.
-   Run the complementary valid-50k shard 01 and B100 merge to verify the exact
-   two-shard production path. Other valid-50k groups need not repeat this
-   resource benchmark because their retained sample counts are no larger.
-4. On full N, build all four caches. For each group, run shard 00 over `[0,50)`
-   and make the B50 diagnostic prefix merge. Validate its artifacts and final
-   `qacct` wall/CPU/maxvmem before running shard 01.
-5. Run shard 01 over `[50,100)` as a separate nonarray job, then merge exactly
-   shards 00 and 01 into the production B100 reference. Do not fit shard 01 by
-   itself and do not use the low-probe override for B100.
-6. Batch-score each group once after B100, then run one group-level batch-fit
+2. Run a new stage-verification job so its report binds the new B1024 panel
+   SHA. Build new caches, or run the explicit `0113342` cache-attestation task;
+   never carry an old stage receipt into this panel.
+3. Gate B128 first on valid-50k age-BP, checking the rendered resource/free-space
+   arithmetic and final qacct wall/CPU/maxvmem. Historical B10/B50/B100 artifacts
+   cannot enter the new intervals.
+4. On full N, run each group's shard 00 over `[0,128)` and validate the B128
+   checkpoint before launching the remaining seven nonarray jobs. Merge only
+   the exact prefixes for B256, B512, and B1024.
+5. Optionally run the separately named second-half diagnostic over shards 04--07
+   after all shard qacct records are complete. It cannot satisfy a score
+   dependency and is not a production checkpoint.
+6. Batch-score each group once after B1024, then run one group-level batch-fit
    job containing every configured trait in order. Use single-trait fit specs
    only for separately named diagnostics. Interpret sex
    GxE, but not separate sex NxE/residual estimates; binary-environment
@@ -459,35 +517,31 @@ total is always checked as `slots × h_data-per-slot`:
 |---|---:|---:|---:|---:|
 | staged-input verification | 1 | 4G | 4 GiB | 24:00:00 |
 | cache | 4 | 6G | 24 GiB | 48:00:00 |
-| production B50 shard | 4 | 8G | 32 GiB | 48:00:00 |
-| optional shard-00 benchmark | 8 | 4G | 32 GiB | 24:00:00 |
+| legacy-cache attestation | 1 | 8G | 8 GiB | 08:00:00 |
+| production B128 shard | 4 | 12G | 48 GiB | 48:00:00 |
+| optional shard-00 benchmark | 8 | 6G | 48 GiB | 24:00:00 |
 | merge checkpoint | 1 | 8G | 8 GiB | 08:00:00 |
+| second-half diagnostic merge | 1 | 8G | 8 GiB | 08:00:00 |
 | wide score | 4 | 6G | 24 GiB | 48:00:00 |
 | per-trait fit | 1 | 4G | 4 GiB | 04:00:00 |
 | group batch fit | 1 | 4G | 4 GiB | 04:00:00 |
 
-The historical valid-50k age-BP B10 jobs used 4 slots/24 GiB and 8 slots/32 GiB.
-Their final qacct records reported 3,182.493 versus 2,924.209 seconds wall time
-and 2.623 versus 3.396 GiB maxvmem: doubling slots produced only a 1.088-fold
-speedup while consuming more CPU and memory. That evidence selects four slots.
-It does not measure B50 memory directly. The B50 request therefore raises the
-four-slot total to 32 GiB and retains a 48-hour limit because randomized-vector
-working storage grows with the 50-vector panel. At the conservative full-cohort
-N=291,273, K=1, and J=100, the private float32 deletion-sketch map is
-`2*J*N*K*50*4 = 10.851 GiB`; adding the modeled resident sketches and main
-projection workspace gives about 14.866 GiB before interpreter, allocator,
-decoder, and mapped-file overhead. The first valid-50k and full-N B50 qacct
-records are therefore mandatory gates rather than evidence-free extrapolation.
+At the largest sealed group (`N=290259`), B128, J=100, K=1, and float32, the
+preflight model is 27.681 GiB for the two deletion-sketch scratch maps, 0.554
+GiB for four resident sketches, and 3.785 GiB for the one-block decode/
+projection workspace: 32.020 GiB before unmodeled runtime overhead. The 48-GiB
+profile must also satisfy a configured 12-GiB modeled-memory reserve. Before
+rendering and again at job start, the scratch filesystem must have at least the
+27.681-GiB shard scratch allocation plus an 8-GiB free-space reserve. This is a
+per-job capacity gate; operators must still account for aggregate space before
+launching several shards concurrently.
 
-A cache-bound shard still makes two genotype passes regardless of whether it
-contains 10 or 50 probes. The two B50 jobs therefore reduce the production
-trace workload from 10 job startups and 20 genotype passes under the historical
-B10 tiling to 2 startups and 4 passes, without changing the seed-indexed probes,
-J=100 jackknife, estimator, or final B100 probe set. These are conservative
-requests, not measured full-cohort requirements; revise them only through a new
-checksummed config after inspecting qacct. Do not use `-tc` anywhere. Submit
-each group as two independent four-slot jobs, with shard 00 validated before
-shard 01 during the first full-cohort gate.
+B128 remains the production shard size because the explicit one-block model
+fits the 48-GiB request with reserve; no B64 fallback is needed. A cache-bound
+shard still makes two genotype passes, so eight B128 shards require 16 genotype
+passes per group. These are initial unmeasured full-cohort requests: inspect the
+first valid-50k and full-N B128 qacct records before broad launch, and change
+resources only in a newly checksummed/resealed snapshot. Do not use `-tc`.
 
 All `-o`/`-e` logs, Python temporary files, and generated job scripts must be
 scratch paths. The renderer fixes `TMPDIR` to a private job subdirectory; the

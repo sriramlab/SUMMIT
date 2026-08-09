@@ -17,6 +17,7 @@ import importlib
 import inspect
 import io
 import json
+import math
 import os
 import re
 import shlex
@@ -33,8 +34,10 @@ from typing import Any, Sequence
 TASKS = (
     "stage_verify",
     "cache",
+    "cache_attest",
     "shard",
     "merge",
+    "merge_half",
     "score",
     "fit",
     "fit_batch",
@@ -46,6 +49,12 @@ DEPLOYMENT_CONFIG_SCHEMA_VERSION = 2
 FROZEN_CODE_MANIFEST_SCHEMA_VERSION = 2
 NUMACTL_SENTINEL = "SUMMIT_NUMACTL_WRAPPED"
 FIT_BATCH_MANIFEST_NAME = "fit_batch_manifest.json"
+CACHE_ATTESTATION_NAME = "cache_attestation.json"
+GIB = 1024**3
+MIN_FITTABLE_GXE_JACKKNIFE_PROBES = 100
+DATASETS = frozenset({"full", "subset_50k"})
+PRODUCTION_DATASET = "full"
+CALIBRATION_DATASET = "subset_50k"
 REQUIRED_DISTRIBUTIONS = (
     "bed-reader",
     "charset-normalizer",
@@ -397,7 +406,112 @@ def _production_shard_count(estimator: dict) -> int:
         raise ValueError(
             "production_probes must be exactly divisible by probes_per_shard."
         )
-    return production_probes // probes_per_shard
+    shard_count = production_probes // probes_per_shard
+    checkpoints = estimator.get("checkpoint_probes")
+    expected_checkpoints = [
+        probes_per_shard,
+        2 * probes_per_shard,
+        4 * probes_per_shard,
+        production_probes,
+    ]
+    if shard_count != 8 or checkpoints != expected_checkpoints:
+        raise ValueError(
+            "Production requires eight contiguous shards and exact prefix checkpoints "
+            f"{expected_checkpoints}."
+        )
+    return shard_count
+
+
+def _shard_resource_estimate(config: dict, n_samples: Any) -> dict[str, int]:
+    """Return the explicit B-shard scratch/resident/workspace capacity model."""
+    if not isinstance(n_samples, int) or isinstance(n_samples, bool) or n_samples <= 0:
+        raise ValueError("Shard preflight requires a positive integer sample count.")
+    estimator = config.get("estimator", {})
+    model = estimator.get("shard_preflight")
+    required_keys = {
+        "dtype_bytes",
+        "annotation_bins",
+        "jackknife_scratch_arrays",
+        "resident_sketch_arrays",
+        "main_workspace_bytes_per_sample_variant",
+        "minimum_memory_headroom_gib",
+        "minimum_scratch_headroom_gib",
+    }
+    if not isinstance(model, dict) or set(model) != required_keys:
+        raise ValueError("Deployment config has an invalid shard-preflight model.")
+    if any(
+        not isinstance(model[key], int)
+        or isinstance(model[key], bool)
+        or model[key] <= 0
+        for key in required_keys
+    ):
+        raise ValueError("Shard-preflight model values must be positive integers.")
+    if estimator.get("dtype") != "float32" or model["dtype_bytes"] != 4:
+        raise ValueError("Shard-preflight dtype arithmetic differs from float32.")
+    if model["annotation_bins"] != 1:
+        raise ValueError("Shard-preflight arithmetic requires the one-bin panel.")
+    b = int(estimator["probes_per_shard"])
+    j = int(estimator["jackknife_blocks"])
+    step = int(estimator["step_size"])
+    itemsize = model["dtype_bytes"]
+    scratch_bytes = (
+        model["jackknife_scratch_arrays"]
+        * j
+        * n_samples
+        * model["annotation_bins"]
+        * b
+        * itemsize
+    )
+    resident_sketch_bytes = (
+        model["resident_sketch_arrays"]
+        * n_samples
+        * model["annotation_bins"]
+        * b
+        * itemsize
+    )
+    main_workspace_bytes = (
+        n_samples * step * model["main_workspace_bytes_per_sample_variant"]
+    )
+    modeled_memory_bytes = scratch_bytes + resident_sketch_bytes + main_workspace_bytes
+    return {
+        "n_samples": n_samples,
+        "probes_per_shard": b,
+        "scratch_bytes": scratch_bytes,
+        "resident_sketch_bytes": resident_sketch_bytes,
+        "main_workspace_bytes": main_workspace_bytes,
+        "modeled_memory_bytes": modeled_memory_bytes,
+        "required_memory_bytes": modeled_memory_bytes
+        + model["minimum_memory_headroom_gib"] * GIB,
+        "required_free_bytes": scratch_bytes
+        + model["minimum_scratch_headroom_gib"] * GIB,
+    }
+
+
+def _validate_shard_preflight(
+    config: dict,
+    group: dict,
+    resource: dict,
+    filesystem_path: Path,
+) -> dict[str, int]:
+    estimate = _shard_resource_estimate(config, group.get("n_selected_samples"))
+    available_memory_bytes = int(resource["total_memory_gib"]) * GIB
+    if available_memory_bytes < estimate["required_memory_bytes"]:
+        raise ValueError(
+            "Shard resource is below the modeled memory plus configured headroom: "
+            f"available={available_memory_bytes}, required={estimate['required_memory_bytes']}."
+        )
+    filesystem = os.statvfs(filesystem_path)
+    free_bytes = int(filesystem.f_bavail) * int(filesystem.f_frsize)
+    if free_bytes < estimate["required_free_bytes"]:
+        raise OSError(
+            "Shard scratch filesystem lacks required free space: "
+            f"available={free_bytes}, required={estimate['required_free_bytes']}."
+        )
+    return {
+        **estimate,
+        "available_memory_bytes": available_memory_bytes,
+        "available_free_bytes": free_bytes,
+    }
 
 
 def _production_probe_interval(index: Any, estimator: dict) -> tuple[int, int]:
@@ -473,6 +587,29 @@ def _load_config(path_value: str, expected_sha: str | None) -> tuple[Path, dict,
         _validate_resource(task, payload)
     _validate_resource("shard_benchmark", payload)
     _production_shard_count(payload.get("estimator"))
+    migration = payload.get("legacy_feature_cache_attestation")
+    if not isinstance(migration, dict) or set(migration) != {
+        "source_commit",
+        "cache_schema_version",
+        "deployment_config_sha256",
+        "summit_python_source_fingerprint",
+    }:
+        raise ValueError(
+            "Deployment config has an invalid legacy-cache attestation contract."
+        )
+    if (
+        re.fullmatch(r"[0-9a-f]{40}", str(migration.get("source_commit", ""))) is None
+        or migration.get("cache_schema_version")
+        != payload["estimator"]["feature_cache_schema_version"]
+        or any(
+            SHA256.fullmatch(str(migration.get(key, ""))) is None
+            for key in (
+                "deployment_config_sha256",
+                "summit_python_source_fingerprint",
+            )
+        )
+    ):
+        raise ValueError("Legacy-cache attestation hashes/schema are invalid.")
     _validate_numa_launch(payload, verify_executable=False)
     return path, payload, observed_sha
 
@@ -687,6 +824,7 @@ def _validate_frozen(
         "jackknife_blocks": "jackknife_blocks",
         "probes_per_shard": "probes_per_shard",
         "production_probes": "num_probes",
+        "checkpoint_probes": "checkpoint_probes",
         "random_distribution": "random_distribution",
         "seed": "seed_family",
         "dtype": "dtype",
@@ -699,6 +837,23 @@ def _validate_frozen(
             )
     if production.get("probe_shards") != _production_shard_count(estimator):
         raise ValueError("Frozen panel/deployment shard-count contract differs.")
+    full_sample_counts = [
+        group.get("expected_common_n_full")
+        for group in panel_payload.get("groups", {}).values()
+    ]
+    if not full_sample_counts or any(
+        not isinstance(value, int) or isinstance(value, bool) or value <= 0
+        for value in full_sample_counts
+    ):
+        raise ValueError("Frozen panel lacks full-cohort sample counts for preflight.")
+    maximum_estimate = _shard_resource_estimate(config, max(full_sample_counts))
+    for profile in ("shard", "shard_benchmark"):
+        resource_bytes = _validate_resource(profile, config)["total_memory_gib"] * GIB
+        if resource_bytes < maximum_estimate["required_memory_bytes"]:
+            raise ValueError(
+                f"Resource profile {profile!r} cannot satisfy the largest-group "
+                "B-shard memory contract."
+            )
 
     manifest_path, manifest_record = _verify_record(
         frozen.get("code_manifest"),
@@ -738,34 +893,59 @@ def _validate_qacct_dependencies(
     scratch_root: Path,
     task: str,
     *,
+    current_deployment_config: dict,
     expected_count: int | None = None,
+    legacy_cache_deployment_config_sha256: str | None = None,
 ) -> list[dict]:
     records = spec.get("qacct_dependencies", [])
     if not isinstance(records, list):
         raise ValueError("qacct_dependencies must be a list.")
-    required_task = {
+    required_task_rule: str | tuple[str, ...] | frozenset[str] | None = {
         "stage_verify": None,
         "cache": "stage_verify",
-        "shard": "cache",
+        "cache_attest": ("stage_verify", "cache"),
+        "shard": frozenset({"cache", "cache_attest"}),
         "merge": "shard",
+        "merge_half": "shard",
         "score": "merge",
         "fit": "score",
         "fit_batch": "score",
     }[task]
-    if required_task is None and records:
+    if required_task_rule is None and records:
         raise ValueError(
             "Stage verification must not declare upstream qacct dependencies."
         )
-    if required_task is not None and not records:
+    if required_task_rule is not None and not records:
         raise ValueError(f"Task {task!r} requires completed qacct provenance.")
     if expected_count is not None and len(records) != expected_count:
         raise ValueError(
             f"Task {task!r} requires exactly {expected_count} qacct record(s); got {len(records)}."
         )
+    if legacy_cache_deployment_config_sha256 is not None:
+        if (
+            task != "cache_attest"
+            or SHA256.fullmatch(legacy_cache_deployment_config_sha256) is None
+        ):
+            raise ValueError(
+                "Only cache_attest may allow one sealed legacy-cache deployment config."
+            )
 
     payloads: list[dict] = []
     seen_jobs: set[int] = set()
     for index, record in enumerate(records):
+        if isinstance(required_task_rule, tuple):
+            if len(records) != len(required_task_rule):
+                raise ValueError(
+                    f"Task {task!r} requires ordered dependencies "
+                    f"{list(required_task_rule)}."
+                )
+            accepted_tasks = frozenset({required_task_rule[index]})
+        elif isinstance(required_task_rule, frozenset):
+            accepted_tasks = required_task_rule
+        elif isinstance(required_task_rule, str):
+            accepted_tasks = frozenset({required_task_rule})
+        else:
+            accepted_tasks = frozenset()
         path, _ = _verify_record(
             record,
             f"qacct dependency {index}",
@@ -780,7 +960,8 @@ def _validate_qacct_dependencies(
             or payload.get("schema_version") != 1
         ):
             raise ValueError(f"Unsupported qacct dependency: {path}")
-        if payload.get("task") != required_task:
+        dependency_task = payload.get("task")
+        if dependency_task not in accepted_tasks:
             raise ValueError(
                 f"qacct dependency task {payload.get('task')!r} does not satisfy {task!r}."
             )
@@ -813,7 +994,7 @@ def _validate_qacct_dependencies(
             receipt_payload.get("kind") != "summit.gxe.hoffman_process_receipt"
             or receipt_payload.get("schema_version") != 1
             or receipt_payload.get("job_id") != job_id
-            or receipt_payload.get("task") != required_task
+            or receipt_payload.get("task") != dependency_task
             or receipt_payload.get("qacct_pending") is not True
         ):
             raise ValueError(f"qacct dependency and process receipt disagree: {path}")
@@ -895,6 +1076,22 @@ def _validate_qacct_dependencies(
             scratch_root=None,
             private=False,
         )
+        dependency_config = payload.get("deployment_config")
+        is_allowlisted_legacy_cache = (
+            task == "cache_attest"
+            and index == 1
+            and dependency_task == "cache"
+            and legacy_cache_deployment_config_sha256 is not None
+            and dependency_config.get("sha256") == legacy_cache_deployment_config_sha256
+        )
+        if (
+            dependency_config != current_deployment_config
+            and not is_allowlisted_legacy_cache
+        ):
+            raise ValueError(
+                f"qacct dependency {index} was not completed under the current "
+                "deployment config."
+            )
         _verify_record(
             payload.get("code_manifest"),
             f"qacct dependency code manifest {index}",
@@ -903,6 +1100,40 @@ def _validate_qacct_dependencies(
         )
         payloads.append({**payload, "record_sha256": observed_sha})
     return payloads
+
+
+def _validate_dataset(args: dict, task: str) -> str:
+    dataset = args.get("dataset")
+    if dataset not in DATASETS:
+        raise ValueError(f"{task} dataset must be exactly 'full' or 'subset_50k'.")
+    return dataset
+
+
+def _dataset_shard_role(dataset: str) -> str:
+    return "production" if dataset == PRODUCTION_DATASET else "calibration"
+
+
+def _dataset_prefix_role(dataset: str) -> str:
+    return (
+        "production_prefix" if dataset == PRODUCTION_DATASET else "calibration_prefix"
+    )
+
+
+def _dataset_score_role(dataset: str) -> str:
+    return "production_score" if dataset == PRODUCTION_DATASET else "calibration_score"
+
+
+def _dataset_fit_role(dataset: str) -> str:
+    return "production_fit" if dataset == PRODUCTION_DATASET else "calibration_fit"
+
+
+def _require_dependency_dataset(
+    dependency: dict, expected_dataset: str, label: str
+) -> dict:
+    details = dependency.get("task_details")
+    if not isinstance(details, dict) or details.get("dataset") != expected_dataset:
+        raise ValueError(f"{label} dataset differs from the consuming job dataset.")
+    return details
 
 
 def _validate_common(
@@ -976,6 +1207,7 @@ def _validate_common(
     resource = _validate_resource(resource_profile, config)
     numa_launch = _validate_numa_launch(config, verify_executable=True)
     return {
+        "deployment_config": _record(config_path),
         "scratch_root": scratch_root,
         "job_root": job_root,
         "job_name": job_name,
@@ -1062,6 +1294,7 @@ def _validate_stage_report(
     geno_prefix: Path,
     label: str,
     group_manifest_sha256: str,
+    expected_dataset: str,
 ) -> dict:
     path, _ = _verify_record(
         record, "stage verification report", scratch_root=scratch_root, private=True
@@ -1074,6 +1307,8 @@ def _validate_stage_report(
         raise ValueError(f"Unsupported stage verification report: {path}")
     if payload.get("config", {}).get("sha256") != panel_sha:
         raise ValueError("Stage report panel-config SHA256 differs from frozen config.")
+    if payload.get("dataset") != expected_dataset:
+        raise ValueError("Stage report dataset differs from the consuming job dataset.")
     if _absolute(payload.get("staged_genotype_prefix", "")) != geno_prefix:
         raise ValueError("Stage report genotype prefix differs from this job.")
     group_entries = payload.get("groups", [])
@@ -1101,6 +1336,247 @@ def _validate_cache_stage_genotype(cache: dict, stage_report: dict) -> None:
             raise ValueError(
                 f"Feature cache .{extension} digest differs from completed stage verification."
             )
+
+
+def _validate_cache_group_design(
+    cache: dict,
+    group: dict,
+    group_outputs: dict[str, Path],
+) -> None:
+    """Recompute the exact cache design identity from sealed group tables."""
+    import numpy as np
+    import pandas as pd
+
+    environment = pd.read_csv(
+        group_outputs["environment"], sep="\t", dtype={"FID": str, "IID": str}
+    )
+    covariates = pd.read_csv(
+        group_outputs["covariates"], sep="\t", dtype={"FID": str, "IID": str}
+    )
+    if (
+        list(environment.columns) != ["FID", "IID", "ENV"]
+        or list(covariates.columns[:2]) != ["FID", "IID"]
+        or not environment[["FID", "IID"]].equals(covariates[["FID", "IID"]])
+    ):
+        raise ValueError("Sealed group environment/covariate row identity is invalid.")
+    configured_covariates = group.get("covariate_columns")
+    if (
+        not isinstance(configured_covariates, list)
+        or list(covariates.columns[2:]) != configured_covariates
+    ):
+        raise ValueError("Sealed group covariate columns differ from its manifest.")
+    env_raw = pd.to_numeric(environment["ENV"], errors="coerce")
+    cov_raw = covariates[configured_covariates].apply(pd.to_numeric, errors="coerce")
+    selected = env_raw.notna() & ~cov_raw.isna().any(axis=1)
+    n = int(selected.sum())
+    if n != int(group.get("n_selected_samples", -1)):
+        raise ValueError(
+            "Sealed group design selection count differs from its manifest."
+        )
+    if _id_digest(environment, selected.to_numpy()) != group.get("selected_id_digest"):
+        raise ValueError(
+            "Sealed group selected sample order differs from its manifest."
+        )
+
+    ddof = int(group.get("environment", {}).get("ddof", -1))
+    if ddof != 1:
+        raise ValueError("Production group environment requires ddof=1.")
+    env_values = env_raw.loc[selected].to_numpy(dtype=np.float64)
+    raw_mean = float(env_values.mean())
+    raw_sd = float(env_values.std(ddof=ddof))
+    if not np.isfinite(raw_sd) or raw_sd <= 0:
+        raise ValueError("Sealed group environment has invalid variance.")
+    env_values = (env_values - raw_mean) / raw_sd
+
+    cov_selected = cov_raw.loc[selected].copy()
+    constant = cov_selected.std(ddof=0) == 0
+    cov_selected.drop(columns=constant.index[constant].tolist(), inplace=True)
+    kept = list(cov_selected.columns)
+    if kept != group.get("kept_nonconstant_covariates"):
+        raise ValueError("Sealed group retained covariates differ from its manifest.")
+    if not cov_selected.empty:
+        cov_selected = (cov_selected - cov_selected.mean()) / cov_selected.std(
+            ddof=ddof
+        )
+        if cov_selected.isna().any(axis=None):
+            raise ValueError("Sealed group standardized covariates are invalid.")
+        cov_values = cov_selected.to_numpy(dtype=np.float64, copy=False)
+    else:
+        cov_values = np.empty((n, 0), dtype=np.float64)
+    design = np.column_stack([cov_values, env_values.reshape(-1, 1)])
+    design_digest = hashlib.sha256()
+    for name in [*kept, "ENV"]:
+        design_digest.update(name.encode("utf-8"))
+        design_digest.update(b"\n")
+    design_digest.update(np.asarray(design, dtype="<f8", order="C").tobytes(order="C"))
+    design_sha = design_digest.hexdigest()
+
+    metadata = cache.get("metadata", {})
+    transform = metadata.get("environment_transform", {})
+    numeric_expectations = {
+        "raw_mean": raw_mean,
+        "raw_sd": raw_sd,
+        "analysis_mean": float(
+            math.fsum(float(value) for value in env_values) / env_values.size
+        ),
+        "analysis_sum_squares": float(
+            math.fsum(float(value) * float(value) for value in env_values)
+        ),
+    }
+    if (
+        metadata.get("environment") != "ENV"
+        or metadata.get("covariates") != kept
+        or transform.get("fixed_effect_design_sha256") != design_sha
+        or transform.get("ddof") != ddof
+        or transform.get("standardized") is not True
+        or transform.get("units") != "per_environment_sd"
+        or any(
+            not math.isclose(
+                float(transform.get(key, float("nan"))),
+                expected,
+                rel_tol=5e-13,
+                abs_tol=5e-13,
+            )
+            for key, expected in numeric_expectations.items()
+        )
+    ):
+        raise ValueError(
+            "Feature cache differs from the sealed group fixed-effect design."
+        )
+
+    analysis = hashlib.sha256()
+    selected_ids = environment.loc[selected, ["FID", "IID"]]
+    for fid, iid in selected_ids.itertuples(index=False, name=None):
+        analysis.update(str(fid).encode("utf-8"))
+        analysis.update(b"\x1f")
+        analysis.update(str(iid).encode("utf-8"))
+        analysis.update(b"\n")
+    analysis.update(np.asarray(env_values, dtype="<f8").tobytes(order="C"))
+    analysis.update(bytes.fromhex(design_sha))
+    analysis.update(
+        int(group["fixed_effect_rank_excluding_intercept"]).to_bytes(
+            8, byteorder="little", signed=False
+        )
+    )
+    if metadata.get("analysis_fingerprint") != analysis.hexdigest():
+        raise ValueError(
+            "Feature cache analysis fingerprint differs from sealed group design."
+        )
+
+
+def _cache_semantic_identity(cache: dict) -> dict:
+    metadata = cache.get("metadata", {})
+    fields = (
+        "schema_version",
+        "analysis_fingerprint",
+        "variant_digest",
+        "annotation_digest",
+        "jackknife_digest",
+        "n_samples",
+        "n_variants",
+        "fixed_effect_rank_excluding_intercept",
+        "residual_rank",
+        "kernel_mode",
+        "genotype_scale",
+        "ddof",
+        "eps_var",
+        "environment",
+        "environment_transform",
+        "covariates",
+        "genotype_files",
+        "annotation_names",
+        "annotation_masses",
+        "jackknife_labels",
+        "feature_diagnostics",
+        "trace_nxe",
+        "trace_nxe_sq",
+        "array_sha256",
+    )
+    missing = [field for field in fields if field not in metadata]
+    if missing:
+        raise ValueError(
+            f"Feature cache lacks attested semantic identity fields: {missing}."
+        )
+    return {field: metadata[field] for field in fields}
+
+
+def _manifest_python_source_fingerprint(manifest: dict) -> str:
+    if (
+        manifest.get("kind") != "summit.gxe.frozen_code_manifest"
+        or manifest.get("schema_version") != FROZEN_CODE_MANIFEST_SCHEMA_VERSION
+    ):
+        raise ValueError("Legacy cache qacct binds an unsupported code manifest.")
+    files = manifest.get("files")
+    if not isinstance(files, dict):
+        raise ValueError("Legacy cache code manifest lacks file records.")
+    paths = sorted(
+        path
+        for path in files
+        if path.startswith("src/summit/") and path.endswith(".py")
+    )
+    if not paths:
+        raise ValueError("Legacy cache code manifest lacks SUMMIT Python sources.")
+    digest = hashlib.sha256()
+    for path in paths:
+        record = files[path]
+        if (
+            not isinstance(record, dict)
+            or not isinstance(record.get("bytes"), int)
+            or isinstance(record.get("bytes"), bool)
+            or record["bytes"] < 0
+            or SHA256.fullmatch(str(record.get("sha256", ""))) is None
+        ):
+            raise ValueError(f"Legacy source record is invalid for {path!r}.")
+        digest.update(path.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(record["sha256"].encode("ascii"))
+        digest.update(b"\n")
+    return digest.hexdigest()
+
+
+def _validate_cache_attestation(
+    record: dict,
+    scratch_root: Path,
+    config: dict,
+    *,
+    cache_record: dict,
+    cache: dict,
+    stage_record: dict,
+    group_record: dict,
+    geno_prefix: Path,
+    current_deployment_config: dict,
+    expected_dataset: str,
+) -> tuple[Path, dict]:
+    path, canonical_record = _verify_record(
+        record, "feature-cache attestation", scratch_root=scratch_root, private=True
+    )
+    payload, _, _ = _read_json(path, "feature-cache attestation", private=True)
+    migration = config["legacy_feature_cache_attestation"]
+    expected = {
+        "kind": "summit.gxe.feature_cache_attestation",
+        "schema_version": 1,
+        "dataset": expected_dataset,
+        "source_commit": migration["source_commit"],
+        "panel_config_sha256": config["panel_config_sha256"],
+        "deployment_config": current_deployment_config,
+        "feature_cache": cache_record,
+        "stage_verification": stage_record,
+        "group_manifest": group_record,
+        "staged_genotype_prefix": str(geno_prefix),
+        "semantic_identity": _cache_semantic_identity(cache),
+    }
+    for key, value in expected.items():
+        if payload.get(key) != value:
+            raise ValueError(f"Feature-cache attestation differs for {key!r}.")
+    legacy = payload.get("legacy_provenance")
+    if not isinstance(legacy, dict) or (
+        legacy.get("deployment_config", {}).get("sha256")
+        != migration["deployment_config_sha256"]
+        or legacy.get("summit_python_source_fingerprint")
+        != migration["summit_python_source_fingerprint"]
+    ):
+        raise ValueError("Feature-cache attestation has invalid legacy provenance.")
+    return path, {**payload, "record": canonical_record}
 
 
 def _validate_reference_cache_identity(reference: dict, cache: dict) -> None:
@@ -1481,6 +1957,7 @@ def _validate_reference_record(
     cache_sha: str,
     *,
     expected_probes: int,
+    expected_probe_offset: int = 0,
 ) -> tuple[Path, dict, dict[str, dict]]:
     path, _ = _verify_record(
         record, "merged reference", scratch_root=scratch_root, private=True
@@ -1517,7 +1994,11 @@ def _validate_reference_record(
         raise ValueError("Merged reference probe count differs from checkpoint.")
     expected_ranges = [
         [start, start + estimator["probes_per_shard"]]
-        for start in range(0, expected_probes, estimator["probes_per_shard"])
+        for start in range(
+            expected_probe_offset,
+            expected_probe_offset + expected_probes,
+            estimator["probes_per_shard"],
+        )
     ]
     expected_randomization = {
         "distribution": estimator["random_distribution"],
@@ -1525,15 +2006,15 @@ def _validate_reference_record(
         "seed": estimator["seed"],
         "dtype": estimator["dtype"],
         "step_size": estimator["step_size"],
-        "probe_offset": 0,
-        "probe_stop": expected_probes,
+        "probe_offset": expected_probe_offset,
+        "probe_stop": expected_probe_offset + expected_probes,
         "probe_ranges": expected_ranges,
     }
     for key, value in expected_randomization.items():
         if randomization.get(key) != value:
             raise ValueError(f"Merged reference randomization differs for {key!r}.")
     override = bool(randomization.get("low_probe_jackknife_override", False))
-    if override != (expected_probes < estimator["production_probes"]):
+    if override != (expected_probes < MIN_FITTABLE_GXE_JACKKNIFE_PROBES):
         raise ValueError("Merged reference low-probe override policy is invalid.")
     required = {"xx", "xw", "wx", "ww", "diagonal", "jackknife"}
     artifacts = _resolve_manifest_artifacts(
@@ -1824,6 +2305,7 @@ def _validate_fit_batch_score_dependency(
     dependency: dict,
     *,
     scratch_root: Path,
+    dataset: str,
     group: str,
     traits: Sequence[str],
     cache_record: dict,
@@ -1848,6 +2330,10 @@ def _validate_fit_batch_score_dependency(
     score_args = score_spec.get("task_args")
     if not isinstance(score_args, dict):
         raise ValueError("Completed wide-score job spec lacks task_args.")
+    if score_args.get("dataset") != dataset:
+        raise ValueError(
+            "Fit-batch dataset differs from the completed wide-score job spec."
+        )
     for key, expected in (
         ("cache", cache_record),
         ("reference", reference_record),
@@ -1868,6 +2354,8 @@ def _validate_fit_batch_score_dependency(
     if not isinstance(details, dict):
         raise ValueError("Completed wide-score qacct lacks task details.")
     expected_details = {
+        "dataset": dataset,
+        "role": _dataset_score_role(dataset),
         "group": group,
         "traits": list(traits),
         "cache_sha256": cache_record["sha256"],
@@ -1923,6 +2411,7 @@ def _validate_fit_score_dependency(
     dependency: dict,
     *,
     scratch_root: Path,
+    dataset: str,
     group: str,
     configured_traits: Sequence[str],
     trait: str,
@@ -1948,6 +2437,8 @@ def _validate_fit_score_dependency(
     score_args = score_spec.get("task_args")
     if not isinstance(score_args, dict):
         raise ValueError("Completed wide-score job spec lacks task_args.")
+    if score_args.get("dataset") != dataset:
+        raise ValueError("Fit dataset differs from the completed wide-score job spec.")
     for key, expected in (
         ("cache", cache_record),
         ("reference", reference_record),
@@ -1968,6 +2459,8 @@ def _validate_fit_score_dependency(
     if not isinstance(details, dict):
         raise ValueError("Completed wide-score qacct lacks task details.")
     expected_details = {
+        "dataset": dataset,
+        "role": _dataset_score_role(dataset),
         "group": group,
         "traits": list(configured_traits),
         "cache_sha256": cache_record["sha256"],
@@ -2164,7 +2657,7 @@ def _expected_cli_outputs(
                 ".gxe.log",
             )
         ]
-    if task == "merge":
+    if task in {"merge", "merge_half"}:
         return [
             Path(str(prefix) + suffix)
             for suffix in (
@@ -2364,10 +2857,14 @@ def _prepare_task(
         _require_directory(artifacts, "fresh artifact directory", private=True)
 
     if task == "stage_verify":
-        _validate_qacct_dependencies(spec, scratch_root, task, expected_count=0)
-        dataset = args.get("dataset")
-        if dataset not in ("full", "subset_50k"):
-            raise ValueError("Stage dataset must be 'full' or 'subset_50k'.")
+        _validate_qacct_dependencies(
+            spec,
+            scratch_root,
+            task,
+            current_deployment_config=common["deployment_config"],
+            expected_count=0,
+        )
+        dataset = _validate_dataset(args, "Stage")
         geno = _validate_genotype_prefix(args.get("geno_prefix", ""), scratch_root)
         _, source_manifest, staged_records = _verify_staged_sources(
             args.get("source_manifest"),
@@ -2470,12 +2967,13 @@ def _prepare_task(
             "geno": geno,
         }
     else:
+        dataset = _validate_dataset(args, task.replace("_", "-").capitalize())
         group_path = None
         group = None
         group_outputs = None
         geno = None
         stage_report = None
-        if task in {"cache", "shard", "score"}:
+        if task in {"cache", "cache_attest", "shard", "score"}:
             group_path, group, group_outputs = _load_group(
                 args.get("group_manifest"), scratch_root, panel
             )
@@ -2487,11 +2985,23 @@ def _prepare_task(
                 geno,
                 str(group["label"]),
                 _sha256(group_path),
+                dataset,
             )
 
         if task == "cache":
             dependencies = _validate_qacct_dependencies(
-                spec, scratch_root, task, expected_count=1
+                spec,
+                scratch_root,
+                task,
+                current_deployment_config=common["deployment_config"],
+                expected_count=1,
+            )
+            if dependencies[0].get("deployment_config") != common["deployment_config"]:
+                raise ValueError(
+                    "Cache stage job was not completed under the current deployment config."
+                )
+            _require_dependency_dataset(
+                dependencies[0], dataset, "Cache stage dependency"
             )
             stage_record = args.get("stage_verification")
             if not isinstance(stage_record, dict) or stage_record.get("sha256") not in {
@@ -2519,6 +3029,7 @@ def _prepare_task(
                 "command": command,
                 "outputs": _expected_cli_outputs(task, prefix),
                 "details": {
+                    "dataset": dataset,
                     "group": group["label"],
                     "group_manifest_sha256": _sha256(group_path),
                     "stage_verification_sha256": stage_record["sha256"],
@@ -2526,19 +3037,180 @@ def _prepare_task(
                 "group_payload": group,
                 "stage_report": stage_report,
             }
+        elif task == "cache_attest":
+            dependencies = _validate_qacct_dependencies(
+                spec,
+                scratch_root,
+                task,
+                current_deployment_config=common["deployment_config"],
+                expected_count=2,
+                legacy_cache_deployment_config_sha256=config[
+                    "legacy_feature_cache_attestation"
+                ]["deployment_config_sha256"],
+            )
+            stage_dependency, legacy_cache_dependency = dependencies
+            if stage_dependency.get("deployment_config") != common["deployment_config"]:
+                raise ValueError(
+                    "Cache attestation stage job was not completed under the current deployment config."
+                )
+            _require_dependency_dataset(
+                stage_dependency, dataset, "Cache-attestation stage dependency"
+            )
+            stage_path, stage_record = _verify_record(
+                args.get("stage_verification"),
+                "stage verification report",
+                scratch_root=scratch_root,
+                private=True,
+            )
+            if stage_record not in stage_dependency.get("outputs", []):
+                raise ValueError(
+                    "Cache attestation stage report is not the exact output of its "
+                    "completed current-panel stage job."
+                )
+            cache_path, cache_record = _verify_record(
+                args.get("cache"),
+                "legacy feature cache",
+                scratch_root=scratch_root,
+                private=True,
+            )
+            if cache_record not in legacy_cache_dependency.get("outputs", []):
+                raise ValueError(
+                    "Attested cache is not the exact output of its completed legacy cache job."
+                )
+            cache = _validate_cache_file(cache_path, config, group)
+            _validate_cache_stage_genotype(cache, stage_report)
+            _validate_cache_group_design(cache, group, group_outputs)
+            migration = config["legacy_feature_cache_attestation"]
+            legacy_config_path, legacy_config_record = _verify_record(
+                legacy_cache_dependency.get("deployment_config"),
+                "legacy cache deployment config",
+                scratch_root=None,
+                private=False,
+            )
+            if legacy_config_record["sha256"] != migration["deployment_config_sha256"]:
+                raise ValueError(
+                    "Legacy cache deployment config is not the allowlisted 0113342 contract."
+                )
+            legacy_config, _, _ = _read_json(
+                legacy_config_path, "legacy cache deployment config", private=False
+            )
+            if (
+                legacy_config.get("estimator", {}).get("feature_cache_schema_version")
+                != migration["cache_schema_version"]
+            ):
+                raise ValueError("Legacy cache deployment config is not schema v2.")
+            manifest_path, manifest_record = _verify_record(
+                legacy_cache_dependency.get("code_manifest"),
+                "legacy cache code manifest",
+                scratch_root=None,
+                private=False,
+            )
+            manifest, _, _ = _read_json(
+                manifest_path, "legacy cache code manifest", private=False
+            )
+            source_fingerprint = _manifest_python_source_fingerprint(manifest)
+            if source_fingerprint != migration["summit_python_source_fingerprint"]:
+                raise ValueError(
+                    "Legacy cache SUMMIT sources do not match commit 0113342."
+                )
+            group_record = _record(group_path)
+            legacy_spec_path, _ = _verify_record(
+                legacy_cache_dependency.get("job_spec"),
+                "legacy cache job spec",
+                scratch_root=scratch_root,
+                private=True,
+            )
+            legacy_spec, _, _ = _read_json(
+                legacy_spec_path, "legacy cache job spec", private=True
+            )
+            legacy_args = legacy_spec.get("task_args")
+            if (
+                legacy_spec.get("kind") != "summit.gxe.hoffman_job"
+                or legacy_spec.get("schema_version") != 1
+                or legacy_spec.get("task") != "cache"
+                or not isinstance(legacy_args, dict)
+                or legacy_args.get("geno_prefix") != str(geno)
+                or legacy_args.get("group_manifest") != group_record
+            ):
+                raise ValueError(
+                    "Legacy cache job spec differs from the attested genotype/group contract."
+                )
+            _validate_stage_report(
+                legacy_args.get("stage_verification"),
+                scratch_root,
+                legacy_config.get("panel_config_sha256"),
+                geno,
+                str(group["label"]),
+                group_record["sha256"],
+                dataset,
+            )
+            legacy_details = legacy_cache_dependency.get("task_details", {})
+            if legacy_details.get("group") != group.get("label") or legacy_details.get(
+                "group_manifest_sha256"
+            ) != _sha256(group_path):
+                raise ValueError(
+                    "Legacy cache qacct group/design provenance differs from attestation inputs."
+                )
+            attestation = {
+                "kind": "summit.gxe.feature_cache_attestation",
+                "schema_version": 1,
+                "dataset": dataset,
+                "source_commit": migration["source_commit"],
+                "panel_config_sha256": panel_sha,
+                "deployment_config": common["deployment_config"],
+                "feature_cache": cache_record,
+                "stage_verification": stage_record,
+                "group_manifest": group_record,
+                "staged_genotype_prefix": str(geno),
+                "semantic_identity": _cache_semantic_identity(cache),
+                "legacy_provenance": {
+                    "cache_qacct": spec["qacct_dependencies"][1],
+                    "deployment_config": legacy_config_record,
+                    "code_manifest": manifest_record,
+                    "summit_python_source_fingerprint": source_fingerprint,
+                },
+            }
+            target = artifacts / CACHE_ATTESTATION_NAME
+            plan = {
+                "mode": "write_json",
+                "command": [],
+                "outputs": [target],
+                "payload": attestation,
+                "details": {
+                    "dataset": dataset,
+                    "group": group["label"],
+                    "group_manifest_sha256": group_record["sha256"],
+                    "cache_sha256": cache_record["sha256"],
+                    "stage_verification_sha256": stage_record["sha256"],
+                    "source_commit": migration["source_commit"],
+                },
+                "cache": cache,
+                "stage_report": stage_report,
+            }
         elif task == "shard":
             dependencies = _validate_qacct_dependencies(
-                spec, scratch_root, task, expected_count=1
+                spec,
+                scratch_root,
+                task,
+                current_deployment_config=common["deployment_config"],
+                expected_count=1,
             )
             index = args.get("shard_index")
-            role = args.get("role", "production")
+            role = args.get("role")
             probe_start, probe_stop = _production_probe_interval(
                 index, config["estimator"]
             )
-            if role not in ("production", "benchmark") or (
-                role == "benchmark" and index != 0
-            ):
-                raise ValueError("Only shard 0 may use the benchmark role.")
+            expected_role = _dataset_shard_role(dataset)
+            if role == "benchmark":
+                if index != 0:
+                    raise ValueError("Only shard 0 may use the benchmark role.")
+            elif role != expected_role:
+                raise ValueError(
+                    f"Dataset {dataset!r} requires shard role {expected_role!r}."
+                )
+            resource_preflight = _validate_shard_preflight(
+                config, group, common["resource"], common["job_root"]
+            )
             cache_path, cache_record = _verify_record(
                 args.get("cache"),
                 "feature cache",
@@ -2547,13 +3219,65 @@ def _prepare_task(
             )
             cache = _validate_cache_file(cache_path, config, group)
             _validate_cache_stage_genotype(cache, stage_report)
-            upstream_outputs = dependencies[0].get("outputs", [])
-            if cache_record["sha256"] not in {
-                item.get("sha256") for item in upstream_outputs
-            }:
-                raise ValueError(
-                    "Shard cache is not an output of its completed cache job."
+            _validate_cache_group_design(cache, group, group_outputs)
+            dependency = dependencies[0]
+            _require_dependency_dataset(dependency, dataset, "Shard cache dependency")
+            upstream_outputs = dependency.get("outputs", [])
+            dependency_task = dependency.get("task")
+            attestation_record = args.get("cache_attestation")
+            attestation_sha = None
+            if dependency_task == "cache":
+                if (
+                    dependency.get("deployment_config") != common["deployment_config"]
+                    or attestation_record is not None
+                    or cache_record not in upstream_outputs
+                ):
+                    raise ValueError(
+                        "Shard cache must be the exact output of a cache job completed "
+                        "under the current deployment config."
+                    )
+            elif dependency_task == "cache_attest":
+                if dependency.get("deployment_config") != common["deployment_config"]:
+                    raise ValueError(
+                        "Cache attestation was not completed under the current deployment config."
+                    )
+                if not isinstance(attestation_record, dict):
+                    raise ValueError(
+                        "A migrated feature cache requires its explicit attestation record."
+                    )
+                _, canonical_attestation = _verify_record(
+                    attestation_record,
+                    "feature-cache attestation",
+                    scratch_root=scratch_root,
+                    private=True,
                 )
+                if canonical_attestation not in upstream_outputs:
+                    raise ValueError(
+                        "Shard cache attestation is not the exact output of its completed attestation job."
+                    )
+                stage_record = _record(
+                    _scratch_path(
+                        args["stage_verification"]["path"],
+                        scratch_root,
+                        "stage verification report",
+                        kind="file",
+                    )
+                )
+                _validate_cache_attestation(
+                    canonical_attestation,
+                    scratch_root,
+                    config,
+                    cache_record=cache_record,
+                    cache=cache,
+                    stage_record=stage_record,
+                    group_record=_record(group_path),
+                    geno_prefix=geno,
+                    current_deployment_config=common["deployment_config"],
+                    expected_dataset=dataset,
+                )
+                attestation_sha = canonical_attestation["sha256"]
+            else:  # pragma: no cover - dependency validator constrains this
+                raise RuntimeError("Unsupported shard cache provenance task.")
             upstream_details = dependencies[0].get("task_details", {})
             if upstream_details.get("group") != group.get(
                 "label"
@@ -2584,15 +3308,18 @@ def _prepare_task(
                 "command": command,
                 "outputs": _expected_cli_outputs(task, prefix),
                 "details": {
+                    "dataset": dataset,
                     "group": group["label"],
                     "group_manifest_sha256": _sha256(group_path),
                     "cache_sha256": cache_record["sha256"],
                     "shard_index": index,
                     "role": role,
+                    "cache_attestation_sha256": attestation_sha,
+                    "resource_preflight": resource_preflight,
                 },
                 "cache": cache,
             }
-        elif task == "merge":
+        elif task in {"merge", "merge_half"}:
             cache_path, cache_record = _verify_record(
                 args.get("cache"),
                 "feature cache",
@@ -2602,16 +3329,37 @@ def _prepare_task(
             cache = _validate_cache_file(cache_path, config)
             shard_records = args.get("shards")
             production_shards = _production_shard_count(config["estimator"])
-            if (
-                not isinstance(shard_records, list)
-                or not 1 <= len(shard_records) <= production_shards
-            ):
-                raise ValueError(
-                    "Merge requires one through "
-                    f"{production_shards} production shard records."
-                )
+            checkpoint_probes = config["estimator"]["checkpoint_probes"]
+            checkpoint_counts = [
+                probes // config["estimator"]["probes_per_shard"]
+                for probes in checkpoint_probes
+            ]
+            if task == "merge":
+                if (
+                    not isinstance(shard_records, list)
+                    or len(shard_records) not in checkpoint_counts
+                ):
+                    raise ValueError(
+                        "Production merge requires exactly one of the sealed prefix "
+                        f"shard counts {checkpoint_counts}."
+                    )
+                expected_offset = 0
+            else:
+                half_count = production_shards // 2
+                if (
+                    not isinstance(shard_records, list)
+                    or len(shard_records) != half_count
+                ):
+                    raise ValueError(
+                        f"Independent-half diagnostic requires exactly {half_count} shard records."
+                    )
+                expected_offset = config["estimator"]["production_probes"] // 2
             dependencies = _validate_qacct_dependencies(
-                spec, scratch_root, task, expected_count=len(shard_records)
+                spec,
+                scratch_root,
+                task,
+                current_deployment_config=common["deployment_config"],
+                expected_count=len(shard_records),
             )
             shards = [
                 _validate_shard_record(
@@ -2633,14 +3381,16 @@ def _prepare_task(
             expected_intervals = [
                 (offset, offset + config["estimator"]["probes_per_shard"])
                 for offset in range(
-                    0,
-                    len(shards) * config["estimator"]["probes_per_shard"],
+                    expected_offset,
+                    expected_offset
+                    + len(shards) * config["estimator"]["probes_per_shard"],
                     config["estimator"]["probes_per_shard"],
                 )
             ]
             if intervals != expected_intervals:
+                label = "prefix" if task == "merge" else "second half"
                 raise ValueError(
-                    "Merge shards must be the exact contiguous prefix of production intervals."
+                    f"Merge shards must be the exact contiguous production {label} intervals."
                 )
             dependency_output_hashes = {
                 output.get("sha256")
@@ -2653,15 +3403,27 @@ def _prepare_task(
                 raise ValueError(
                     "A merge shard is not bound by its completed shard qacct provenance."
                 )
-            if any(
-                dependency.get("task_details", {}).get("role") != "production"
+            dependency_details = [
+                _require_dependency_dataset(
+                    dependency, dataset, "Merge shard dependency"
+                )
                 for dependency in dependencies
+            ]
+            expected_shard_role = _dataset_shard_role(dataset)
+            if any(
+                details.get("role") != expected_shard_role
+                for details in dependency_details
             ):
                 raise ValueError(
-                    "Benchmark shard receipts cannot enter production/checkpoint merges."
+                    f"Dataset {dataset!r} merge requires only "
+                    f"{expected_shard_role!r} shard receipts."
                 )
             probes = len(shards) * config["estimator"]["probes_per_shard"]
-            prefix = artifacts / f"B{probes:03d}"
+            prefix = (
+                artifacts / f"B{probes:03d}"
+                if task == "merge"
+                else artifacts / f"B{probes:03d}_second_half"
+            )
             command = [
                 "--gxe-merge-shards",
                 *[
@@ -2674,20 +3436,41 @@ def _prepare_task(
                 "--gxe-feature-cache",
                 str(cache_path),
             ]
-            if probes < config["estimator"]["production_probes"]:
+            if probes < MIN_FITTABLE_GXE_JACKKNIFE_PROBES:
                 command.append("--allow-low-probe-gxe-jackknife")
             command.extend(["--out", str(prefix)])
             plan = {
                 "mode": "summit",
                 "command": command,
                 "outputs": _expected_cli_outputs(task, prefix),
-                "details": {"probes": probes, "cache_sha256": cache_record["sha256"]},
+                "details": {
+                    "dataset": dataset,
+                    "probes": probes,
+                    "probe_offset": expected_offset,
+                    "cache_sha256": cache_record["sha256"],
+                    "role": _dataset_prefix_role(dataset)
+                    if task == "merge"
+                    else "diagnostic_second_half",
+                },
                 "cache": cache,
             }
         elif task == "score":
             dependencies = _validate_qacct_dependencies(
-                spec, scratch_root, task, expected_count=1
+                spec,
+                scratch_root,
+                task,
+                current_deployment_config=common["deployment_config"],
+                expected_count=1,
             )
+            merge_details = _require_dependency_dataset(
+                dependencies[0], dataset, "Score merge dependency"
+            )
+            expected_prefix_role = _dataset_prefix_role(dataset)
+            if merge_details.get("role") != expected_prefix_role:
+                raise ValueError(
+                    f"Dataset {dataset!r} score requires a completed "
+                    f"{expected_prefix_role!r} merge."
+                )
             cache_path, cache_record = _verify_record(
                 args.get("cache"),
                 "feature cache",
@@ -2696,9 +3479,10 @@ def _prepare_task(
             )
             cache = _validate_cache_file(cache_path, config, group)
             _validate_cache_stage_genotype(cache, stage_report)
+            _validate_cache_group_design(cache, group, group_outputs)
             reference_path, reference_record = _verify_record(
                 args.get("reference"),
-                "B100 reference",
+                "production reference",
                 scratch_root=scratch_root,
                 private=True,
             )
@@ -2714,7 +3498,7 @@ def _prepare_task(
                 output.get("sha256") for output in dependencies[0].get("outputs", [])
             }:
                 raise ValueError(
-                    "Score reference is not an output of completed B100 merge."
+                    "Score reference is not an output of the completed B1024 merge."
                 )
             traits = args.get("traits")
             if traits != group.get("phenotype_labels"):
@@ -2748,6 +3532,8 @@ def _prepare_task(
                 "command": command,
                 "outputs": _expected_cli_outputs(task, prefix, traits=traits),
                 "details": {
+                    "dataset": dataset,
+                    "role": _dataset_score_role(dataset),
                     "group": group["label"],
                     "group_manifest_sha256": _sha256(group_path),
                     "traits": traits,
@@ -2760,6 +3546,7 @@ def _prepare_task(
             }
         elif task == "fit":
             if set(args) != {
+                "dataset",
                 "group",
                 "trait",
                 "cache",
@@ -2769,14 +3556,18 @@ def _prepare_task(
                 "gwis",
             }:
                 raise ValueError(
-                    "Fit task_args must contain exactly group, trait, cache, "
-                    "reference, moments, gwas, and gwis."
+                    "Fit task_args must contain exactly dataset, group, trait, "
+                    "cache, reference, moments, gwas, and gwis."
                 )
             dependencies = _validate_qacct_dependencies(
-                spec, scratch_root, task, expected_count=1
+                spec,
+                scratch_root,
+                task,
+                current_deployment_config=common["deployment_config"],
+                expected_count=1,
             )
             _exact_record_key(args.get("cache"), "fit feature cache")
-            _exact_record_key(args.get("reference"), "fit B100 reference")
+            _exact_record_key(args.get("reference"), "fit production reference")
             cache_path, cache_record = _verify_record(
                 args.get("cache"),
                 "feature cache",
@@ -2790,7 +3581,7 @@ def _prepare_task(
             cache = _validate_cache_file(cache_path, config)
             reference_path, reference_record = _verify_record(
                 args.get("reference"),
-                "B100 reference",
+                "production reference",
                 scratch_root=scratch_root,
                 private=True,
             )
@@ -2849,6 +3640,7 @@ def _prepare_task(
             _validate_fit_score_dependency(
                 dependencies[0],
                 scratch_root=scratch_root,
+                dataset=dataset,
                 group=group_label,
                 configured_traits=configured_traits,
                 trait=trait,
@@ -2876,6 +3668,8 @@ def _prepare_task(
                 "command": command,
                 "outputs": _expected_cli_outputs(task, prefix),
                 "details": {
+                    "dataset": dataset,
+                    "role": _dataset_fit_role(dataset),
                     "group": group_label,
                     "trait": trait,
                     "cache_sha256": cache_record["sha256"],
@@ -2889,16 +3683,20 @@ def _prepare_task(
                 "fit_input_records": input_records,
             }
         elif task == "fit_batch":
-            if set(args) != {"group", "cache", "reference", "traits"}:
+            if set(args) != {"dataset", "group", "cache", "reference", "traits"}:
                 raise ValueError(
-                    "Fit-batch task_args must contain exactly group, cache, "
-                    "reference, and traits."
+                    "Fit-batch task_args must contain exactly dataset, group, "
+                    "cache, reference, and traits."
                 )
             dependencies = _validate_qacct_dependencies(
-                spec, scratch_root, task, expected_count=1
+                spec,
+                scratch_root,
+                task,
+                current_deployment_config=common["deployment_config"],
+                expected_count=1,
             )
             _exact_record_key(args.get("cache"), "fit-batch feature cache")
-            _exact_record_key(args.get("reference"), "fit-batch B100 reference")
+            _exact_record_key(args.get("reference"), "fit-batch production reference")
             cache_path, cache_record = _verify_record(
                 args.get("cache"),
                 "feature cache",
@@ -2912,7 +3710,7 @@ def _prepare_task(
             cache = _validate_cache_file(cache_path, config)
             reference_path, reference_record = _verify_record(
                 args.get("reference"),
-                "B100 reference",
+                "production reference",
                 scratch_root=scratch_root,
                 private=True,
             )
@@ -2992,6 +3790,7 @@ def _prepare_task(
             _validate_fit_batch_score_dependency(
                 dependencies[0],
                 scratch_root=scratch_root,
+                dataset=dataset,
                 group=group_label,
                 traits=trait_names,
                 cache_record=cache_record,
@@ -3050,6 +3849,8 @@ def _prepare_task(
                 "command": command,
                 "outputs": _expected_cli_outputs(task, prefix, traits=trait_names),
                 "details": {
+                    "dataset": dataset,
+                    "role": _dataset_fit_role(dataset),
                     "group": group_label,
                     "traits": trait_names,
                     "cache_sha256": cache_record["sha256"],
@@ -3364,6 +4165,18 @@ def _postvalidate_task(
         cache = _validate_cache_file(cache_path, config, plan["group_payload"])
         runtime["cache_semantic_validator"](cache["metadata"], cache["arrays"])
         _validate_cache_stage_genotype(cache, plan["stage_report"])
+    elif task == "cache_attest":
+        payload, _, _ = _read_json(
+            expected[0], "feature-cache attestation", private=True
+        )
+        if payload != plan["payload"]:
+            raise ValueError(
+                "Feature-cache attestation output differs from its sealed plan."
+            )
+        runtime["cache_semantic_validator"](
+            plan["cache"]["metadata"], plan["cache"]["arrays"]
+        )
+        _validate_cache_stage_genotype(plan["cache"], plan["stage_report"])
     elif task == "shard":
         manifest = Path(str(common["artifacts"] / "shard") + ".gxe.shard.json")
         _, cache_record = _verify_record(
@@ -3386,9 +4199,10 @@ def _postvalidate_task(
             raise ValueError(
                 "Shard output probe interval differs from the task contract."
             )
-    elif task == "merge":
+    elif task in {"merge", "merge_half"}:
         probes = int(plan["details"]["probes"])
-        manifest = common["artifacts"] / f"B{probes:03d}.gxe.ref.json"
+        suffix = "" if task == "merge" else "_second_half"
+        manifest = common["artifacts"] / f"B{probes:03d}{suffix}.gxe.ref.json"
         _, cache_record = _verify_record(
             args["cache"],
             "feature cache",
@@ -3401,6 +4215,7 @@ def _postvalidate_task(
             config,
             cache_record["sha256"],
             expected_probes=probes,
+            expected_probe_offset=int(plan["details"]["probe_offset"]),
         )
         _validate_reference_cache_identity(reference, plan["cache"])
     elif task == "score":
@@ -3434,7 +4249,7 @@ def _postvalidate_task(
                 or moments.get("residual_rank") != reference.get("residual_rank")
             ):
                 raise ValueError(
-                    "Phenotype moments differ from the B100 reference identity."
+                    "Phenotype moments differ from the B1024 reference identity."
                 )
             _validate_score_table(gwas_path, reference=reference, moments=moments)
             _validate_score_table(gwis_path, reference=reference, moments=moments)
@@ -3560,6 +4375,11 @@ def _invoke_summit_cli(cli, command: list[str]) -> None:
 
 def _execute_plan(plan: dict, runtime: dict, common: dict, task: str) -> None:
     command = list(plan["command"])
+    if plan["mode"] == "write_json":
+        if task != "cache_attest" or len(plan["outputs"]) != 1:
+            raise RuntimeError("Invalid write-json deployment plan.")
+        _atomic_json_noreplace(plan["payload"], plan["outputs"][0])
+        return
     if plan["mode"] == "subprocess":
         subprocess.run(command, check=True, env=os.environ.copy())
         return
@@ -3700,7 +4520,12 @@ def _run_task(args: argparse.Namespace) -> None:
     os.mkdir(common["artifacts"], mode=0o700)
     _require_directory(common["artifacts"], "fresh artifact directory", private=True)
     command = list(plan["command"])
-    recorded_command = command if plan["mode"] == "subprocess" else ["summit", *command]
+    if plan["mode"] == "subprocess":
+        recorded_command = command
+    elif plan["mode"] == "summit":
+        recorded_command = ["summit", *command]
+    else:
+        recorded_command = ["internal:cache_attest"]
     start = datetime.now(timezone.utc)
     config_record = _record(config_path)
     spec_record = _record(spec_path)

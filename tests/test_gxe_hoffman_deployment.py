@@ -49,6 +49,89 @@ def _config_for_scratch(scratch: Path) -> dict:
     return payload
 
 
+def _completed_dependency_record(
+    scratch: Path,
+    *,
+    task: str,
+    job_id: int,
+    deployment_config: dict,
+    task_details: dict,
+) -> dict:
+    """Create one internally consistent completed-qacct fixture."""
+    job = _private_dir(scratch / f"dependency-{job_id}")
+    output = _private_file(job / "output.dat")
+    stdout = _private_file(job / "stdout.log", "stdout\n")
+    stderr = _private_file(job / "stderr.log", "stderr\n")
+    raw = _private_file(job / "qacct.txt", f"jobnumber {job_id}\n")
+    job_spec = _private_file(
+        job / "job_spec.json",
+        json.dumps(
+            {
+                "kind": "summit.gxe.hoffman_job",
+                "schema_version": 1,
+                "task": task,
+                "task_args": {"dataset": task_details["dataset"]},
+            },
+            sort_keys=True,
+        )
+        + "\n",
+    )
+    job_script = _private_file(job / "job.sh", "#!/bin/bash\n")
+    job_script.chmod(0o700)
+    attempt_lock = _private_file(job / "attempt.lock", "")
+    attempt = _private_file(job / "attempt.json", "{}\n")
+    code_manifest = _private_file(job / "code_manifest.json", "{}\n")
+    resource = {"slots": 1}
+    shared = {
+        "outputs": [DEPLOY._record(output)],
+        "task_details": task_details,
+        "resource_profile": task,
+        "resource": resource,
+        "deployment_config": deployment_config,
+        "job_spec": DEPLOY._record(job_spec),
+        "job_script": DEPLOY._record(job_script),
+        "attempt_lock": DEPLOY._record(attempt_lock),
+        "attempt": DEPLOY._record(attempt),
+        "code_manifest": DEPLOY._record(code_manifest),
+    }
+    receipt_payload = {
+        "kind": "summit.gxe.hoffman_process_receipt",
+        "schema_version": 1,
+        "task": task,
+        "job_id": job_id,
+        **shared,
+        "qacct_pending": True,
+    }
+    receipt = _private_file(
+        job / "process_receipt.json",
+        json.dumps(receipt_payload, sort_keys=True) + "\n",
+    )
+    receipt_record = DEPLOY._record(receipt)
+    qacct_payload = {
+        "kind": "summit.gxe.hoffman_qacct",
+        "schema_version": 1,
+        "task": task,
+        "job_id": job_id,
+        "failed": 0,
+        "exit_status": 0,
+        "slots": 1,
+        **shared,
+        "receipt": receipt_record,
+        "receipt_sha256": receipt_record["sha256"],
+        "qacct_raw": DEPLOY._record(raw),
+        "qacct_stdout_sha256": DEPLOY._sha256(raw),
+        "uge_logs": {
+            "stdout": DEPLOY._record(stdout),
+            "stderr": DEPLOY._record(stderr),
+        },
+    }
+    qacct = _private_file(
+        job / "completed_qacct.json",
+        json.dumps(qacct_payload, sort_keys=True) + "\n",
+    )
+    return DEPLOY._record(qacct)
+
+
 def test_deployment_config_and_wrappers_are_fail_closed():
     config = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
     panel = json.loads(PANEL_PATH.read_text(encoding="utf-8"))
@@ -65,16 +148,23 @@ def test_deployment_config_and_wrappers_are_fail_closed():
     assert estimator["reference_schema_version"] == 3
     assert estimator["kernel_mode"] == "standardized"
     assert estimator["genotype_scale"] == "sample"
-    assert estimator["production_probes"] == 100
-    assert estimator["probes_per_shard"] == 50
-    assert DEPLOY._production_shard_count(estimator) == 2
+    assert estimator["production_probes"] == 1024
+    assert estimator["probes_per_shard"] == 128
+    assert estimator["checkpoint_probes"] == [128, 256, 512, 1024]
+    assert DEPLOY._production_shard_count(estimator) == 8
     assert config["panel_config_sha256"] == DEPLOY._sha256(PANEL_PATH)
-    assert panel["production_estimator"]["probe_shards"] == 2
-    assert panel["production_estimator"]["probes_per_shard"] == 50
-    assert panel["uge"]["production_b50_shard"] == {
+    assert panel["production_estimator"]["probe_shards"] == 8
+    assert panel["production_estimator"]["probes_per_shard"] == 128
+    assert panel["production_estimator"]["checkpoint_probes"] == [
+        128,
+        256,
+        512,
+        1024,
+    ]
+    assert panel["uge"]["production_b128_shard"] == {
         "slots": 4,
-        "h_data_per_slot": "8G",
-        "total_memory": "32G",
+        "h_data_per_slot": "12G",
+        "total_memory": "48G",
         "h_rt": "48:00:00",
         "highp": True,
     }
@@ -93,27 +183,495 @@ def test_deployment_config_and_wrappers_are_fail_closed():
         assert "-tc" not in text
     benchmark = DEPLOY._validate_resource("shard_benchmark", config)
     assert benchmark["slots"] == 8
-    assert benchmark["h_data_gib_per_slot"] == 4
-    assert benchmark["total_memory_gib"] == 32
+    assert benchmark["h_data_gib_per_slot"] == 6
+    assert benchmark["total_memory_gib"] == 48
     production_shard = DEPLOY._validate_resource("shard", config)
     assert production_shard["slots"] == 4
-    assert production_shard["h_data_gib_per_slot"] == 8
-    assert production_shard["total_memory_gib"] == 32
+    assert production_shard["h_data_gib_per_slot"] == 12
+    assert production_shard["total_memory_gib"] == 48
     assert production_shard["h_rt"] == "48:00:00"
 
 
-def test_b50_production_probe_intervals_and_dynamic_index_limit():
+def test_b128_production_probe_intervals_and_dynamic_index_limit():
     estimator = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))["estimator"]
-    assert DEPLOY._production_probe_interval(0, estimator) == (0, 50)
-    assert DEPLOY._production_probe_interval(1, estimator) == (50, 100)
-    with pytest.raises(ValueError, match="0 through 1"):
-        DEPLOY._production_probe_interval(2, estimator)
-    with pytest.raises(ValueError, match="0 through 1"):
+    assert DEPLOY._production_probe_interval(0, estimator) == (0, 128)
+    assert DEPLOY._production_probe_interval(7, estimator) == (896, 1024)
+    with pytest.raises(ValueError, match="0 through 7"):
+        DEPLOY._production_probe_interval(8, estimator)
+    with pytest.raises(ValueError, match="0 through 7"):
         DEPLOY._production_probe_interval(True, estimator)
 
-    malformed = {**estimator, "probes_per_shard": 60}
+    malformed = {**estimator, "probes_per_shard": 120}
     with pytest.raises(ValueError, match="exactly divisible"):
         DEPLOY._production_shard_count(malformed)
+
+
+def test_b128_resource_arithmetic_and_free_space_preflight(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    config = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+    estimate = DEPLOY._shard_resource_estimate(config, 290259)
+    assert estimate["scratch_bytes"] == 2 * 100 * 290259 * 128 * 4
+    assert estimate["resident_sketch_bytes"] == 4 * 290259 * 128 * 4
+    assert estimate["main_workspace_bytes"] == 290259 * 500 * 28
+    assert 32 * DEPLOY.GIB < estimate["required_memory_bytes"] < 48 * DEPLOY.GIB
+
+    class Filesystem:
+        f_bavail = estimate["required_free_bytes"]
+        f_frsize = 1
+
+    monkeypatch.setattr(DEPLOY.os, "statvfs", lambda unused: Filesystem())
+    observed = DEPLOY._validate_shard_preflight(
+        config,
+        {"n_selected_samples": 290259},
+        config["resources"]["shard"],
+        tmp_path,
+    )
+    assert observed["available_memory_bytes"] == 48 * DEPLOY.GIB
+    assert observed["available_free_bytes"] == estimate["required_free_bytes"]
+
+    undersized = {**config["resources"]["shard"], "total_memory_gib": 32}
+    with pytest.raises(ValueError, match="modeled memory"):
+        DEPLOY._validate_shard_preflight(
+            config,
+            {"n_selected_samples": 290259},
+            undersized,
+            tmp_path,
+        )
+
+    Filesystem.f_bavail = estimate["required_free_bytes"] - 1
+    with pytest.raises(OSError, match="free space"):
+        DEPLOY._validate_shard_preflight(
+            config,
+            {"n_selected_samples": 290259},
+            config["resources"]["shard"],
+            tmp_path,
+        )
+
+
+def test_stage_report_is_bound_to_new_b1024_panel_sha(tmp_path: Path):
+    scratch = _private_dir(tmp_path / "scratch")
+    report_path = scratch / "stage.json"
+    config = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+    geno = scratch / "geno"
+    payload = {
+        "kind": "summit.gxe.staged_input_verification",
+        "schema_version": 1,
+        "dataset": "full",
+        "config": {"sha256": config["panel_config_sha256"]},
+        "staged_genotype_prefix": str(geno),
+        "groups": [{"label": "age_bp", "manifest_sha256": "a" * 64}],
+    }
+    _private_file(report_path, json.dumps(payload, sort_keys=True) + "\n")
+    DEPLOY._validate_stage_report(
+        DEPLOY._record(report_path),
+        scratch,
+        config["panel_config_sha256"],
+        geno,
+        "age_bp",
+        "a" * 64,
+        "full",
+    )
+    payload["config"]["sha256"] = "0" * 64
+    report_path.write_text(json.dumps(payload, sort_keys=True) + "\n", encoding="utf-8")
+    report_path.chmod(0o600)
+    with pytest.raises(ValueError, match="panel-config SHA256"):
+        DEPLOY._validate_stage_report(
+            DEPLOY._record(report_path),
+            scratch,
+            config["panel_config_sha256"],
+            geno,
+            "age_bp",
+            "a" * 64,
+            "full",
+        )
+    payload["config"]["sha256"] = config["panel_config_sha256"]
+    payload["dataset"] = "subset_50k"
+    report_path.write_text(json.dumps(payload, sort_keys=True) + "\n", encoding="utf-8")
+    report_path.chmod(0o600)
+    with pytest.raises(ValueError, match="dataset"):
+        DEPLOY._validate_stage_report(
+            DEPLOY._record(report_path),
+            scratch,
+            config["panel_config_sha256"],
+            geno,
+            "age_bp",
+            "a" * 64,
+            "full",
+        )
+
+
+def test_legacy_cache_attestation_binds_source_and_semantic_identity(tmp_path: Path):
+    config = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+    migration = config["legacy_feature_cache_attestation"]
+    files = {}
+    for path in sorted((ROOT / "src" / "summit").rglob("*.py")):
+        files[path.relative_to(ROOT).as_posix()] = {
+            "bytes": path.stat().st_size,
+            "sha256": DEPLOY._sha256(path),
+        }
+    manifest = {
+        "kind": "summit.gxe.frozen_code_manifest",
+        "schema_version": DEPLOY.FROZEN_CODE_MANIFEST_SCHEMA_VERSION,
+        "files": files,
+    }
+    observed_fingerprint = DEPLOY._manifest_python_source_fingerprint(manifest)
+    assert observed_fingerprint != migration["summit_python_source_fingerprint"]
+    assert migration["summit_python_source_fingerprint"] == (
+        "a51969169f9564a0381a9d1822f21e7ca30c7cb5448d009b07d1146f4782650d"
+    )
+    first = next(iter(files.values()))
+    first["sha256"] = "0" * 64
+    assert DEPLOY._manifest_python_source_fingerprint(manifest) != observed_fingerprint
+
+    scratch = _private_dir(tmp_path / "scratch")
+    cache_record = DEPLOY._record(_private_file(scratch / "cache.npz"))
+    stage_record = DEPLOY._record(_private_file(scratch / "stage.json"))
+    group_record = DEPLOY._record(_private_file(scratch / "group.json"))
+    current_config_record = DEPLOY._record(CONFIG_PATH)
+    metadata = {
+        "schema_version": 2,
+        "analysis_fingerprint": "analysis",
+        "variant_digest": "variants",
+        "annotation_digest": "annotation",
+        "jackknife_digest": "jackknife",
+        "n_samples": 10,
+        "n_variants": 20,
+        "fixed_effect_rank_excluding_intercept": 2,
+        "residual_rank": 7,
+        "kernel_mode": "standardized",
+        "genotype_scale": "sample",
+        "ddof": 1,
+        "eps_var": 1e-12,
+        "environment": "ENV",
+        "environment_transform": {"kind": "sealed"},
+        "covariates": ["C1"],
+        "genotype_files": {".bed": {"sha256": "b" * 64}},
+        "annotation_names": ["L2_0"],
+        "annotation_masses": [20],
+        "jackknife_labels": ["J0"],
+        "feature_diagnostics": {"ok": True},
+        "trace_nxe": 9.0,
+        "trace_nxe_sq": 8.0,
+        "array_sha256": {"a": "c" * 64},
+    }
+    cache = {"metadata": metadata}
+    payload = {
+        "kind": "summit.gxe.feature_cache_attestation",
+        "schema_version": 1,
+        "dataset": "full",
+        "source_commit": migration["source_commit"],
+        "panel_config_sha256": config["panel_config_sha256"],
+        "deployment_config": current_config_record,
+        "feature_cache": cache_record,
+        "stage_verification": stage_record,
+        "group_manifest": group_record,
+        "staged_genotype_prefix": str(scratch / "geno"),
+        "semantic_identity": DEPLOY._cache_semantic_identity(cache),
+        "legacy_provenance": {
+            "deployment_config": {"sha256": migration["deployment_config_sha256"]},
+            "summit_python_source_fingerprint": migration[
+                "summit_python_source_fingerprint"
+            ],
+        },
+    }
+    attestation_path = _private_file(
+        scratch / DEPLOY.CACHE_ATTESTATION_NAME,
+        json.dumps(payload, sort_keys=True) + "\n",
+    )
+    DEPLOY._validate_cache_attestation(
+        DEPLOY._record(attestation_path),
+        scratch,
+        config,
+        cache_record=cache_record,
+        cache=cache,
+        stage_record=stage_record,
+        group_record=group_record,
+        geno_prefix=scratch / "geno",
+        current_deployment_config=current_config_record,
+        expected_dataset="full",
+    )
+    with pytest.raises(ValueError, match="dataset"):
+        DEPLOY._validate_cache_attestation(
+            DEPLOY._record(attestation_path),
+            scratch,
+            config,
+            cache_record=cache_record,
+            cache=cache,
+            stage_record=stage_record,
+            group_record=group_record,
+            geno_prefix=scratch / "geno",
+            current_deployment_config=current_config_record,
+            expected_dataset="subset_50k",
+        )
+    metadata["analysis_fingerprint"] = "changed"
+    with pytest.raises(ValueError, match="semantic_identity"):
+        DEPLOY._validate_cache_attestation(
+            DEPLOY._record(attestation_path),
+            scratch,
+            config,
+            cache_record=cache_record,
+            cache=cache,
+            stage_record=stage_record,
+            group_record=group_record,
+            geno_prefix=scratch / "geno",
+            current_deployment_config=current_config_record,
+            expected_dataset="full",
+        )
+
+
+def test_cache_design_attestation_recomputes_exact_analysis_fingerprint(
+    tmp_path: Path,
+):
+    import hashlib
+
+    import numpy as np
+    import pandas as pd
+
+    env_path = tmp_path / "env.tsv"
+    covar_path = tmp_path / "covar.tsv"
+    environment = pd.DataFrame(
+        {
+            "FID": ["f1", "f2", "f3", "f4"],
+            "IID": ["i1", "i2", "i3", "i4"],
+            "ENV": [1.0, 2.0, 4.0, np.nan],
+        }
+    )
+    covariates = pd.DataFrame(
+        {
+            "FID": environment["FID"],
+            "IID": environment["IID"],
+            "C1": [8.0, 3.0, 5.0, np.nan],
+        }
+    )
+    environment.to_csv(env_path, sep="\t", index=False)
+    covariates.to_csv(covar_path, sep="\t", index=False)
+    selected = environment["ENV"].notna().to_numpy()
+    raw_env = environment.loc[selected, "ENV"].to_numpy(dtype=np.float64)
+    standardized_env = (raw_env - raw_env.mean()) / raw_env.std(ddof=1)
+    raw_covar = covariates.loc[selected, ["C1"]]
+    standardized_covar = (
+        (raw_covar - raw_covar.mean()) / raw_covar.std(ddof=1)
+    ).to_numpy(dtype=np.float64)
+    design = np.column_stack([standardized_covar, standardized_env])
+    design_hash = hashlib.sha256()
+    design_hash.update(b"C1\nENV\n")
+    design_hash.update(np.asarray(design, dtype="<f8", order="C").tobytes(order="C"))
+    design_sha = design_hash.hexdigest()
+    analysis = hashlib.sha256()
+    for fid, iid in environment.loc[selected, ["FID", "IID"]].itertuples(
+        index=False, name=None
+    ):
+        analysis.update(fid.encode("utf-8"))
+        analysis.update(b"\x1f")
+        analysis.update(iid.encode("utf-8"))
+        analysis.update(b"\n")
+    analysis.update(np.asarray(standardized_env, dtype="<f8").tobytes(order="C"))
+    analysis.update(bytes.fromhex(design_sha))
+    analysis.update((2).to_bytes(8, byteorder="little", signed=False))
+    group = {
+        "n_selected_samples": 3,
+        "selected_id_digest": DEPLOY._id_digest(environment, selected),
+        "environment": {"ddof": 1},
+        "covariate_columns": ["C1"],
+        "kept_nonconstant_covariates": ["C1"],
+        "fixed_effect_rank_excluding_intercept": 2,
+    }
+    cache = {
+        "metadata": {
+            "environment": "ENV",
+            "covariates": ["C1"],
+            "analysis_fingerprint": analysis.hexdigest(),
+            "environment_transform": {
+                "standardized": True,
+                "raw_mean": float(raw_env.mean()),
+                "raw_sd": float(raw_env.std(ddof=1)),
+                "ddof": 1,
+                "analysis_mean": float(np.mean(standardized_env)),
+                "analysis_sum_squares": float(np.sum(standardized_env**2)),
+                "units": "per_environment_sd",
+                "fixed_effect_design_sha256": design_sha,
+            },
+        }
+    }
+    DEPLOY._validate_cache_group_design(
+        cache,
+        group,
+        {"environment": env_path, "covariates": covar_path},
+    )
+    cache["metadata"]["environment_transform"]["fixed_effect_design_sha256"] = "0" * 64
+    with pytest.raises(ValueError, match="fixed-effect design"):
+        DEPLOY._validate_cache_group_design(
+            cache,
+            group,
+            {"environment": env_path, "covariates": covar_path},
+        )
+
+
+def test_shard_rejects_unattested_cache_from_old_deployment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    scratch = _private_dir(tmp_path / "scratch")
+    job = _private_dir(scratch / "job")
+    group_path = _private_file(scratch / "group.json")
+    cache_path = _private_file(scratch / "cache.npz")
+    cache_record = DEPLOY._record(cache_path)
+    config = _config_for_scratch(scratch)
+    current_config = DEPLOY._record(CONFIG_PATH)
+    group = {"label": "age_bp", "n_selected_samples": 10}
+    dependency = {
+        "task": "cache",
+        "deployment_config": {**current_config, "sha256": "0" * 64},
+        "outputs": [cache_record],
+        "task_details": {
+            "dataset": "full",
+            "group": "age_bp",
+            "group_manifest_sha256": DEPLOY._sha256(group_path),
+        },
+    }
+    common = {
+        "scratch_root": scratch,
+        "job_root": job,
+        "artifacts": job / "artifacts",
+        "deployment_config": current_config,
+        "resource": config["resources"]["shard"],
+        "frozen": {"panel_payload": {"groups": {"age_bp": {}}}},
+    }
+    spec = {
+        "task": "shard",
+        "task_args": {
+            "dataset": "full",
+            "group_manifest": DEPLOY._record(group_path),
+            "geno_prefix": str(scratch / "geno"),
+            "stage_verification": {"path": str(scratch / "stage")},
+            "cache": cache_record,
+            "shard_index": 0,
+            "role": "production",
+        },
+    }
+    monkeypatch.setattr(
+        DEPLOY,
+        "_load_group",
+        lambda *unused: (
+            group_path,
+            group,
+            {"environment": scratch / "env", "covariates": scratch / "covar"},
+        ),
+    )
+    monkeypatch.setattr(
+        DEPLOY, "_validate_genotype_prefix", lambda *unused: scratch / "geno"
+    )
+    monkeypatch.setattr(DEPLOY, "_validate_stage_report", lambda *unused: {})
+    monkeypatch.setattr(
+        DEPLOY, "_validate_qacct_dependencies", lambda *unused, **kwargs: [dependency]
+    )
+    monkeypatch.setattr(DEPLOY, "_validate_cache_file", lambda *unused: {})
+    monkeypatch.setattr(DEPLOY, "_validate_cache_stage_genotype", lambda *unused: None)
+    monkeypatch.setattr(DEPLOY, "_validate_cache_group_design", lambda *unused: None)
+    monkeypatch.setattr(
+        DEPLOY, "_validate_shard_preflight", lambda *unused: {"validated": True}
+    )
+    with pytest.raises(ValueError, match="current deployment config"):
+        DEPLOY._prepare_task(spec, common, config, artifacts_ready=False)
+
+    dependency["deployment_config"] = current_config
+    dependency["task_details"]["dataset"] = "subset_50k"
+    with pytest.raises(ValueError, match="cache dependency dataset"):
+        DEPLOY._prepare_task(spec, common, config, artifacts_ready=False)
+
+    spec["task_args"]["dataset"] = "subset_50k"
+    with pytest.raises(ValueError, match="requires shard role 'calibration'"):
+        DEPLOY._prepare_task(spec, common, config, artifacts_ready=False)
+    spec["task_args"]["role"] = "calibration"
+    calibration = DEPLOY._prepare_task(spec, common, config, artifacts_ready=False)
+    assert calibration["details"]["dataset"] == "subset_50k"
+    assert calibration["details"]["role"] == "calibration"
+
+    spec["task_args"]["dataset"] = "full"
+    spec["task_args"]["role"] = "production"
+    dependency["task_details"]["dataset"] = "full"
+    plan = DEPLOY._prepare_task(spec, common, config, artifacts_ready=False)
+    assert plan["details"]["dataset"] == "full"
+    assert plan["details"]["cache_attestation_sha256"] is None
+    assert plan["command"][plan["command"].index("--nvecs") + 1] == "128"
+
+
+@pytest.mark.parametrize(
+    ("downstream_task", "upstream_task"),
+    [
+        ("merge", "shard"),
+        ("score", "merge"),
+        ("fit", "score"),
+        ("fit_batch", "score"),
+    ],
+)
+def test_qacct_dependency_rejects_stale_deployment_config_on_every_edge(
+    tmp_path: Path, downstream_task: str, upstream_task: str
+):
+    scratch = _private_dir(tmp_path / "scratch")
+    current_path = _private_file(tmp_path / "current.json", '{"snapshot": "current"}\n')
+    stale_path = _private_file(tmp_path / "stale.json", '{"snapshot": "stale"}\n')
+    current = DEPLOY._record(current_path)
+    stale = DEPLOY._record(stale_path)
+    dependency = _completed_dependency_record(
+        scratch,
+        task=upstream_task,
+        job_id=9001,
+        deployment_config=stale,
+        task_details={"dataset": "full"},
+    )
+    spec = {"qacct_dependencies": [dependency]}
+    with pytest.raises(ValueError, match="current deployment config"):
+        DEPLOY._validate_qacct_dependencies(
+            spec,
+            scratch,
+            downstream_task,
+            current_deployment_config=current,
+            expected_count=1,
+        )
+
+
+def test_qacct_dependency_legacy_exception_is_cache_attest_second_cache_only(
+    tmp_path: Path,
+):
+    scratch = _private_dir(tmp_path / "scratch")
+    current_path = _private_file(tmp_path / "current.json", '{"snapshot": "current"}\n')
+    legacy_path = _private_file(tmp_path / "legacy.json", '{"snapshot": "legacy"}\n')
+    current = DEPLOY._record(current_path)
+    legacy = DEPLOY._record(legacy_path)
+    stage = _completed_dependency_record(
+        scratch,
+        task="stage_verify",
+        job_id=9002,
+        deployment_config=current,
+        task_details={"dataset": "full"},
+    )
+    cache = _completed_dependency_record(
+        scratch,
+        task="cache",
+        job_id=9003,
+        deployment_config=legacy,
+        task_details={"dataset": "full"},
+    )
+    observed = DEPLOY._validate_qacct_dependencies(
+        {"qacct_dependencies": [stage, cache]},
+        scratch,
+        "cache_attest",
+        current_deployment_config=current,
+        expected_count=2,
+        legacy_cache_deployment_config_sha256=legacy["sha256"],
+    )
+    assert [item["task"] for item in observed] == ["stage_verify", "cache"]
+
+    with pytest.raises(ValueError, match="Only cache_attest"):
+        DEPLOY._validate_qacct_dependencies(
+            {"qacct_dependencies": [cache]},
+            scratch,
+            "shard",
+            current_deployment_config=current,
+            expected_count=1,
+            legacy_cache_deployment_config_sha256=legacy["sha256"],
+        )
 
 
 def test_generation_args_are_exact_and_annotation_free(tmp_path: Path):
@@ -170,6 +728,7 @@ def _fit_batch_plan_case(
                 "schema_version": 1,
                 "task": "score",
                 "task_args": {
+                    "dataset": "full",
                     "cache": cache_record,
                     "reference": reference_record,
                     "traits": traits,
@@ -182,6 +741,8 @@ def _fit_batch_plan_case(
     dependency = {
         "job_spec": DEPLOY._record(score_spec),
         "task_details": {
+            "dataset": "full",
+            "role": "production_score",
             "group": "age_bp",
             "traits": traits,
             "cache_sha256": cache_record["sha256"],
@@ -196,11 +757,13 @@ def _fit_batch_plan_case(
         "scratch_root": scratch,
         "job_root": job,
         "artifacts": job / "artifacts",
+        "deployment_config": DEPLOY._record(CONFIG_PATH),
         "frozen": {"panel_payload": {"groups": {"age_bp": {"phenotypes": traits}}}},
     }
     spec = {
         "task": "fit_batch",
         "task_args": {
+            "dataset": "full",
             "group": "age_bp",
             "cache": cache_record,
             "reference": reference_record,
@@ -239,6 +802,7 @@ def _fit_plan_case(
     spec = {
         "task": "fit",
         "task_args": {
+            "dataset": "full",
             "group": batch_spec["task_args"]["group"],
             "trait": selected["trait"],
             "cache": batch_spec["task_args"]["cache"],
@@ -277,6 +841,36 @@ def test_single_fit_plan_binds_exact_inputs_and_output_snapshot_provenance(
     monkeypatch.setattr(DEPLOY, "_validate_fit_outputs", validate)
     DEPLOY._postvalidate_task(spec, common, config, plan, runtime={})
     assert observed == [(common["artifacts"] / "fit", expected)]
+
+
+@pytest.mark.parametrize("fit_task", ["fit", "fit_batch"])
+def test_fit_rejects_cross_dataset_score_and_allows_labeled_calibration(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fit_task: str
+):
+    if fit_task == "fit":
+        spec, common, config, dependency, _ = _fit_plan_case(tmp_path, monkeypatch)
+    else:
+        spec, common, config, dependency, _ = _fit_batch_plan_case(
+            tmp_path, monkeypatch
+        )
+    score_spec_path = Path(dependency["job_spec"]["path"])
+    score_spec = json.loads(score_spec_path.read_text(encoding="utf-8"))
+    score_spec["task_args"]["dataset"] = "subset_50k"
+    score_spec_path.write_text(
+        json.dumps(score_spec, sort_keys=True) + "\n", encoding="utf-8"
+    )
+    score_spec_path.chmod(0o600)
+    dependency["job_spec"] = DEPLOY._record(score_spec_path)
+    dependency["task_details"]["dataset"] = "subset_50k"
+    dependency["task_details"]["role"] = "calibration_score"
+
+    with pytest.raises(ValueError, match="dataset differs"):
+        DEPLOY._prepare_task(spec, common, config, artifacts_ready=False)
+
+    spec["task_args"]["dataset"] = "subset_50k"
+    calibration = DEPLOY._prepare_task(spec, common, config, artifacts_ready=False)
+    assert calibration["details"]["dataset"] == "subset_50k"
+    assert calibration["details"]["role"] == "calibration_fit"
 
 
 @pytest.mark.parametrize("role", ["cache", "reference", "moments", "gwas", "gwis"])
@@ -387,7 +981,7 @@ def test_fit_batch_plan_is_complete_ordered_and_manifest_bound(
 @pytest.mark.parametrize(
     ("failure", "message"),
     [
-        ("extra_arg", "exactly group"),
+        ("extra_arg", "exactly dataset"),
         ("trait_order", "configured group order"),
         ("entry_shape", "must contain exactly"),
         ("record_shape", "exact path/bytes/sha256"),
@@ -1089,12 +1683,13 @@ def test_merge_plan_enforces_contiguous_prefix_and_low_probe_policy(
     job = _private_dir(scratch / "job")
     cache_path = _private_file(scratch / "cache.npz")
     cache_record = DEPLOY._record(cache_path)
-    shard_paths = [_private_file(scratch / f"shard{i}.json") for i in range(2)]
+    shard_paths = [_private_file(scratch / f"shard{i}.json") for i in range(8)]
     shard_records = [DEPLOY._record(path) for path in shard_paths]
     config = _config_for_scratch(scratch)
     common = {
         "scratch_root": scratch,
         "artifacts": job / "artifacts",
+        "deployment_config": DEPLOY._record(CONFIG_PATH),
         "frozen": {"panel_payload": {"groups": {}}},
     }
     monkeypatch.setattr(DEPLOY, "_validate_cache_file", lambda *unused: {})
@@ -1107,8 +1702,8 @@ def test_merge_plan_enforces_contiguous_prefix_and_low_probe_policy(
             shard_paths[index],
             {
                 "randomization": {
-                    "probe_offset": 50 * index,
-                    "probe_stop": 50 * (index + 1),
+                    "probe_offset": 128 * index,
+                    "probe_stop": 128 * (index + 1),
                 }
             },
             {},
@@ -1116,12 +1711,12 @@ def test_merge_plan_enforces_contiguous_prefix_and_low_probe_policy(
 
     monkeypatch.setattr(DEPLOY, "_validate_shard_record", validate_shard)
 
-    for count in (1, 2):
+    for count in (1, 2, 4, 8):
         records = shard_records[:count]
         dependencies = [
             {
                 "outputs": [record],
-                "task_details": {"role": "production"},
+                "task_details": {"dataset": "full", "role": "production"},
             }
             for record in records
         ]
@@ -1132,28 +1727,222 @@ def test_merge_plan_enforces_contiguous_prefix_and_low_probe_policy(
         )
         spec = {
             "task": "merge",
-            "task_args": {"cache": cache_record, "shards": records},
+            "task_args": {
+                "dataset": "full",
+                "cache": cache_record,
+                "shards": records,
+            },
         }
         plan = DEPLOY._prepare_task(spec, common, config, artifacts_ready=False)
-        assert plan["details"]["probes"] == count * 50
-        assert ("--allow-low-probe-gxe-jackknife" in plan["command"]) is (count == 1)
+        assert plan["details"]["probes"] == count * 128
+        assert "--allow-low-probe-gxe-jackknife" not in plan["command"]
         assert any(
-            path.name == f"B{count * 50:03d}.gxe.ref.json" for path in plan["outputs"]
+            path.name == f"B{count * 128:03d}.gxe.ref.json" for path in plan["outputs"]
         )
 
-    with pytest.raises(ValueError, match="one through 2"):
+    calibration_dependencies = [
+        {
+            "outputs": [shard_records[0]],
+            "task_details": {"dataset": "subset_50k", "role": "calibration"},
+        }
+    ]
+    monkeypatch.setattr(
+        DEPLOY,
+        "_validate_qacct_dependencies",
+        lambda *unused, **kwargs: calibration_dependencies,
+    )
+    with pytest.raises(ValueError, match="shard dependency dataset"):
         DEPLOY._prepare_task(
             {
                 "task": "merge",
                 "task_args": {
+                    "dataset": "full",
                     "cache": cache_record,
-                    "shards": [*shard_records, shard_records[0]],
+                    "shards": shard_records[:1],
                 },
             },
             common,
             config,
             artifacts_ready=False,
         )
+    calibration = DEPLOY._prepare_task(
+        {
+            "task": "merge",
+            "task_args": {
+                "dataset": "subset_50k",
+                "cache": cache_record,
+                "shards": shard_records[:1],
+            },
+        },
+        common,
+        config,
+        artifacts_ready=False,
+    )
+    assert calibration["details"]["dataset"] == "subset_50k"
+    assert calibration["details"]["role"] == "calibration_prefix"
+
+    with pytest.raises(ValueError, match="sealed prefix shard counts"):
+        DEPLOY._prepare_task(
+            {
+                "task": "merge",
+                "task_args": {
+                    "dataset": "full",
+                    "cache": cache_record,
+                    "shards": shard_records[:3],
+                },
+            },
+            common,
+            config,
+            artifacts_ready=False,
+        )
+
+    diagnostic_records = shard_records[4:]
+    dependencies = [
+        {
+            "outputs": [record],
+            "task_details": {"dataset": "full", "role": "production"},
+        }
+        for record in diagnostic_records
+    ]
+    monkeypatch.setattr(
+        DEPLOY,
+        "_validate_qacct_dependencies",
+        lambda *unused, expected_count=None, deps=dependencies, **kwargs: deps,
+    )
+    diagnostic = DEPLOY._prepare_task(
+        {
+            "task": "merge_half",
+            "task_args": {
+                "dataset": "full",
+                "cache": cache_record,
+                "shards": diagnostic_records,
+            },
+        },
+        common,
+        config,
+        artifacts_ready=False,
+    )
+    assert diagnostic["details"] == {
+        "dataset": "full",
+        "probes": 512,
+        "probe_offset": 512,
+        "cache_sha256": cache_record["sha256"],
+        "role": "diagnostic_second_half",
+    }
+    assert "--allow-low-probe-gxe-jackknife" not in diagnostic["command"]
+    assert any(
+        path.name == "B512_second_half.gxe.ref.json" for path in diagnostic["outputs"]
+    )
+
+    with pytest.raises(ValueError, match="second half"):
+        DEPLOY._prepare_task(
+            {
+                "task": "merge_half",
+                "task_args": {
+                    "dataset": "full",
+                    "cache": cache_record,
+                    "shards": shard_records[:4],
+                },
+            },
+            common,
+            config,
+            artifacts_ready=False,
+        )
+
+
+def test_score_rejects_cross_dataset_merge_and_preserves_calibration_lineage(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    scratch = _private_dir(tmp_path / "scratch")
+    job = _private_dir(scratch / "job")
+    group_path = _private_file(scratch / "group.json")
+    cache_path = _private_file(scratch / "cache.npz")
+    reference_path = _private_file(scratch / "B1024.gxe.ref.json")
+    cache_record = DEPLOY._record(cache_path)
+    reference_record = DEPLOY._record(reference_path)
+    group = {"label": "age_bp", "phenotype_labels": ["Y"]}
+    config = _config_for_scratch(scratch)
+    common = {
+        "scratch_root": scratch,
+        "job_root": job,
+        "artifacts": job / "artifacts",
+        "deployment_config": DEPLOY._record(CONFIG_PATH),
+        "frozen": {"panel_payload": {"groups": {"age_bp": {}}}},
+    }
+    dependency = {
+        "outputs": [reference_record],
+        "task_details": {
+            "dataset": "subset_50k",
+            "role": "calibration_prefix",
+        },
+    }
+    spec = {
+        "task": "score",
+        "task_args": {
+            "dataset": "full",
+            "geno_prefix": str(scratch / "geno"),
+            "group_manifest": DEPLOY._record(group_path),
+            "stage_verification": {"path": str(scratch / "stage")},
+            "cache": cache_record,
+            "reference": reference_record,
+            "traits": ["Y"],
+        },
+    }
+    monkeypatch.setattr(
+        DEPLOY,
+        "_load_group",
+        lambda *unused: (
+            group_path,
+            group,
+            {
+                "environment": scratch / "env",
+                "covariates": scratch / "covar",
+                "phenotypes": scratch / "pheno",
+            },
+        ),
+    )
+    monkeypatch.setattr(
+        DEPLOY, "_validate_genotype_prefix", lambda *unused: scratch / "geno"
+    )
+    monkeypatch.setattr(DEPLOY, "_validate_stage_report", lambda *unused: {})
+    monkeypatch.setattr(
+        DEPLOY, "_validate_qacct_dependencies", lambda *unused, **kwargs: [dependency]
+    )
+    monkeypatch.setattr(DEPLOY, "_validate_cache_file", lambda *unused: {})
+    monkeypatch.setattr(DEPLOY, "_validate_cache_stage_genotype", lambda *unused: None)
+    monkeypatch.setattr(DEPLOY, "_validate_cache_group_design", lambda *unused: None)
+    monkeypatch.setattr(
+        DEPLOY,
+        "_validate_reference_record",
+        lambda *unused, **kwargs: (reference_path, {}, {}),
+    )
+    monkeypatch.setattr(
+        DEPLOY, "_validate_reference_cache_identity", lambda *unused: None
+    )
+
+    with pytest.raises(ValueError, match="merge dependency dataset"):
+        DEPLOY._prepare_task(spec, common, config, artifacts_ready=False)
+
+    dependency["task_details"] = {
+        "dataset": "full",
+        "role": "calibration_prefix",
+    }
+    with pytest.raises(ValueError, match="production_prefix"):
+        DEPLOY._prepare_task(spec, common, config, artifacts_ready=False)
+
+    dependency["task_details"]["role"] = "production_prefix"
+    production = DEPLOY._prepare_task(spec, common, config, artifacts_ready=False)
+    assert production["details"]["dataset"] == "full"
+    assert production["details"]["role"] == "production_score"
+
+    spec["task_args"]["dataset"] = "subset_50k"
+    dependency["task_details"] = {
+        "dataset": "subset_50k",
+        "role": "calibration_prefix",
+    }
+    calibration = DEPLOY._prepare_task(spec, common, config, artifacts_ready=False)
+    assert calibration["details"]["dataset"] == "subset_50k"
+    assert calibration["details"]["role"] == "calibration_score"
 
 
 def test_qacct_parser_requires_one_record():
