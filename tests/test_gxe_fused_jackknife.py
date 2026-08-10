@@ -11,6 +11,8 @@ from bed_reader import to_bed
 
 from summit.ldscore.gwe_ldscore import (
     GenomewideEnvLDScore,
+    _JackknifeSketchStore,
+    _build_balanced_vtiles,
     _orthonormalize_columns,
     _secure_memmap,
 )
@@ -143,10 +145,95 @@ def test_jackknife_probe_tiling_accounts_for_global_and_block_workspace():
     obj.jackknife_ids = np.zeros(5, dtype=np.int32)
     obj.log = Logger(suppress=True)
     tiles = obj._auto_vtiles()
-    assert max(size for _, size in tiles) == 7
+    assert max(size for _, size in tiles) == 6
     assert sum(size for _, size in tiles) == 23
     resident = 4 * obj.nsamp * obj.nbins * max(size for _, size in tiles) * 4
     assert resident <= obj.target_xz_mem * (1024 ** 3)
+
+
+def test_production_shaped_jackknife_tiling_bounds_1024_probe_scratch():
+    obj = GenomewideEnvLDScore.__new__(GenomewideEnvLDScore)
+    obj.target_xz_mem = 32.0
+    obj.jackknife_scratch_gib = 64.0
+    obj.dtype = np.float64
+    obj.nsamp = 300_000
+    obj.nbins = 1
+    obj.nvecs = 1_024
+    obj.jackknife_ids = np.arange(100, dtype=np.int32)
+    obj.jackknife_labels = [f"block:{index}" for index in range(100)]
+    obj.log = Logger(suppress=True)
+
+    monolithic = 2 * 100 * obj.nsamp * obj.nvecs * 8
+    assert monolithic / (1024 ** 3) > 450.0
+    tiles = obj._auto_vtiles()
+    assert sum(size for _, size in tiles) == obj.nvecs
+    assert len(tiles) == 8
+    assert {size for _, size in tiles} == {128}
+    tiled_scratch = 2 * 100 * obj.nsamp * max(size for _, size in tiles) * 8
+    assert tiled_scratch <= obj.jackknife_scratch_gib * (1024 ** 3)
+    assert tiled_scratch == 61_440_000_000
+    assert tiled_scratch / (1024 ** 3) == pytest.approx(57.220458984375)
+
+
+def test_native_tiling_accounts_for_opaque_panel_preparation_peak():
+    obj = GenomewideEnvLDScore.__new__(GenomewideEnvLDScore)
+    obj.target_xz_mem = 10 * 101 * 3 * 7.5 * 8 / (1024 ** 3)
+    obj.jackknife_scratch_gib = 1.0
+    obj.dtype = np.float64
+    obj.nsamp = 101
+    obj.nbins = 3
+    obj.nvecs = 23
+    obj.jackknife_ids = np.zeros(5, dtype=np.int32)
+    obj.jackknife_labels = ["one"]
+    obj.native_backend = "direct"
+    obj.log = Logger(suppress=True)
+    tiles = obj._auto_vtiles()
+    assert max(size for _, size in tiles) == 6
+    assert sum(size for _, size in tiles) == 23
+    peak = 10 * obj.nsamp * obj.nbins * max(size for _, size in tiles) * 8
+    assert peak <= obj.target_xz_mem * 1024**3
+
+
+def test_balanced_probe_tiling_rejects_infeasible_max_tile_cap():
+    with pytest.raises(RuntimeError, match="exceeding max_tiles=8"):
+        _build_balanced_vtiles(1_024, vmax=127, gran=64, max_tiles=8)
+    tiles = _build_balanced_vtiles(1_024, vmax=128, gran=64, max_tiles=8)
+    assert tiles == [(start, 128) for start in range(0, 1_024, 128)]
+
+
+def test_jackknife_store_maps_one_reserved_block_at_a_time(tmp_path):
+    store = _JackknifeSketchStore(
+        tmp_path / "store",
+        nblocks=3,
+        columns=4,
+        samples=5,
+        dtype=np.float64,
+        max_total_bytes=3 * 4 * 5 * 8,
+    )
+    try:
+        assert store.total_bytes == 3 * 4 * 5 * 8
+        assert store.peak_mapped_bytes == 4 * 5 * 8
+        first = store.view(0)
+        first[:] = 2.0
+        del first
+        second = store.view(1)
+        second[:] = 3.0
+        del second
+        np.testing.assert_array_equal(store.view(0), np.full((5, 4), 2.0))
+        assert all((path.stat().st_mode & 0o777) == 0o600 for path in store._paths)
+    finally:
+        store.close()
+    assert not list((tmp_path / "store").glob("*.bin"))
+
+    with pytest.raises(RuntimeError, match="exceeds the configured tile limit"):
+        _JackknifeSketchStore(
+            tmp_path / "too-small",
+            nblocks=3,
+            columns=4,
+            samples=5,
+            dtype=np.float64,
+            max_total_bytes=3 * 4 * 5 * 8 - 1,
+        )
 
 
 def test_secure_memmap_and_bed_reader_thread_forwarding(tmp_path):

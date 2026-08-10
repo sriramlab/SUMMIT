@@ -28,7 +28,10 @@ def test_svd_projector_preserves_rank_deficient_design_span():
 
 def test_probe_tiles_never_exceed_memory_derived_cap():
     for total, cap in ((1000, 64), (2000, 64), (101, 17), (3, 8)):
-        tiles = _build_balanced_vtiles(total, cap)
+        required_tiles = (total + cap - 1) // cap
+        tiles = _build_balanced_vtiles(
+            total, cap, max_tiles=max(8, required_tiles)
+        )
         assert sum(size for _, size in tiles) == total
         assert max(size for _, size in tiles) <= cap
         assert [start for start, _ in tiles] == list(

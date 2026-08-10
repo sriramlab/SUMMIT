@@ -5,6 +5,7 @@ import hashlib
 import json
 import math
 import os
+import shutil
 import stat
 import tempfile
 import weakref
@@ -84,19 +85,163 @@ def _validate_jackknife_probe_count(nvecs: int, enabled: bool, allow_low: bool) 
         )
 
 
+def _checked_scratch_nbytes(shape: tuple[int, ...], dtype) -> int:
+    """Return a bounded scratch allocation size without platform-sized overflow."""
+    dtype = np.dtype(dtype)
+    if not shape or any(int(dimension) <= 0 for dimension in shape):
+        raise ValueError(f"Scratch shape must contain only positive dimensions; got {shape}.")
+    max_intp = int(np.iinfo(np.intp).max)
+    if any(int(dimension) > max_intp for dimension in shape):
+        raise OverflowError(f"Scratch dimension exceeds np.intp: shape={shape}.")
+    elements = int(math.prod(int(dimension) for dimension in shape))
+    nbytes = elements * int(dtype.itemsize)
+    if nbytes <= 0:
+        raise ValueError(f"Scratch memmap must have positive size; got shape={shape}.")
+    # np.memmap offsets and POSIX file sizes are signed on supported platforms.
+    if elements > max_intp or nbytes > min(max_intp, (1 << 63) - 1):
+        raise OverflowError(
+            f"Scratch allocation is not addressable on this platform: shape={shape}, bytes={nbytes}."
+        )
+    return nbytes
+
+
 def _secure_memmap(path: Path, shape: tuple[int, ...], dtype) -> np.memmap:
     """Create a new, owner-only, fixed-size scratch mapping."""
     dtype = np.dtype(dtype)
-    nbytes = int(math.prod(shape)) * int(dtype.itemsize)
-    if nbytes <= 0:
-        raise ValueError(f"Scratch memmap must have positive size; got shape={shape}.")
-    fd = os.open(str(path), os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o600)
+    nbytes = _checked_scratch_nbytes(shape, dtype)
+    flags = os.O_RDWR | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0)
+    fd = os.open(str(path), flags, 0o600)
     try:
         os.ftruncate(fd, nbytes)
         os.chmod(path, 0o600)
     finally:
         os.close(fd)
     return np.memmap(path, mode="r+", dtype=dtype, shape=shape, order="C")
+
+
+class _JackknifeSketchStore:
+    """Disk-backed exact block sketches with one block mapped at a time.
+
+    All files are reserved before computation begins so ENOSPC cannot appear
+    after an expensive source pass.  The configured limit bounds total bytes
+    for one probe tile; only ``columns * samples`` elements are ever mapped.
+    """
+
+    def __init__(
+        self,
+        directory: Path,
+        nblocks: int,
+        columns: int,
+        samples: int,
+        dtype,
+        *,
+        max_total_bytes: int,
+    ) -> None:
+        self.directory = Path(directory)
+        self.nblocks = int(nblocks)
+        self.columns = int(columns)
+        self.samples = int(samples)
+        self.dtype = np.dtype(dtype)
+        self.max_total_bytes = int(max_total_bytes)
+        if self.nblocks <= 0 or self.max_total_bytes <= 0:
+            raise ValueError("Jackknife scratch block count and byte limit must be positive.")
+        self.per_block_bytes = _checked_scratch_nbytes(
+            (self.columns, self.samples), self.dtype
+        )
+        self.total_bytes = self.per_block_bytes * self.nblocks
+        if self.total_bytes > min(int(np.iinfo(np.intp).max), (1 << 63) - 1):
+            raise OverflowError(
+                f"Jackknife scratch is not representable: {self.total_bytes} bytes."
+            )
+        if self.total_bytes > self.max_total_bytes:
+            raise RuntimeError(
+                "Exact jackknife scratch exceeds the configured tile limit: "
+                f"required={self.total_bytes} bytes, limit={self.max_total_bytes} bytes."
+            )
+        self.directory.mkdir(parents=False, exist_ok=False)
+        os.chmod(self.directory, 0o700)
+        free_bytes = int(shutil.disk_usage(self.directory.parent).free)
+        reserve_bytes = max(64 * 1024**2, math.ceil(0.05 * self.total_bytes))
+        if self.total_bytes + reserve_bytes > free_bytes:
+            self.directory.rmdir()
+            raise RuntimeError(
+                "Insufficient free disk for exact jackknife scratch preallocation: "
+                f"required={self.total_bytes} bytes plus reserve={reserve_bytes}, "
+                f"free={free_bytes} bytes in {self.directory.parent}."
+            )
+        self._paths: list[Path] = []
+        self._mapping: np.memmap | None = None
+        self._active_block: int | None = None
+        flags = os.O_RDWR | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0)
+        try:
+            if not hasattr(os, "posix_fallocate"):
+                raise RuntimeError(
+                    "Exact jackknife scratch requires os.posix_fallocate for up-front disk reservation."
+                )
+            for block_id in range(self.nblocks):
+                path = self.directory / f"block-{block_id:06d}.bin"
+                descriptor = os.open(path, flags, 0o600)
+                self._paths.append(path)
+                try:
+                    os.posix_fallocate(descriptor, 0, self.per_block_bytes)
+                    os.fchmod(descriptor, 0o600)
+                finally:
+                    os.close(descriptor)
+        except Exception:
+            self.close()
+            try:
+                self.directory.rmdir()
+            except OSError:
+                pass
+            raise
+
+    @property
+    def peak_mapped_bytes(self) -> int:
+        return self.per_block_bytes
+
+    def view(self, block_id: int) -> np.ndarray:
+        block_id = int(block_id)
+        if block_id < 0 or block_id >= self.nblocks:
+            raise IndexError(f"Jackknife block {block_id} is outside [0, {self.nblocks}).")
+        if self._active_block != block_id:
+            self._close_mapping()
+            self._mapping = np.memmap(
+                self._paths[block_id],
+                mode="r+",
+                dtype=self.dtype,
+                shape=(self.columns, self.samples),
+                order="C",
+            )
+            self._active_block = block_id
+        # The transpose is Fortran contiguous, matching the source/target APIs.
+        return self._mapping.T
+
+    def flush(self) -> None:
+        if self._mapping is not None:
+            self._mapping.flush()
+
+    def unmap(self) -> None:
+        """Release the active block after a native opaque snapshot is sealed."""
+        self._close_mapping()
+
+    def _close_mapping(self) -> None:
+        if self._mapping is None:
+            return
+        self._mapping.flush()
+        mmap_handle = getattr(self._mapping, "_mmap", None)
+        self._mapping = None
+        self._active_block = None
+        if mmap_handle is not None:
+            mmap_handle.close()
+
+    def close(self) -> None:
+        self._close_mapping()
+        for path in self._paths:
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                pass
+        self._paths.clear()
 
 
 def _ndarray_sha256(value: np.ndarray) -> str:
@@ -108,6 +253,154 @@ def _ndarray_sha256(value: np.ndarray) -> str:
     digest.update(b"\n")
     digest.update(array.tobytes(order="C"))
     return digest.hexdigest()
+
+
+_BACKEND_PROVENANCE_SCHEMA_VERSION = 2
+
+
+def _sha256_path(path: str | Path) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for block in iter(lambda: handle.read(8 * 1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _sha256_descriptor(descriptor: int) -> str:
+    digest = hashlib.sha256()
+    position = os.lseek(descriptor, 0, os.SEEK_CUR)
+    try:
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        while True:
+            block = os.read(descriptor, 8 * 1024 * 1024)
+            if not block:
+                break
+            digest.update(block)
+    finally:
+        os.lseek(descriptor, position, os.SEEK_SET)
+    return digest.hexdigest()
+
+
+def _loaded_native_binary_record(native_module) -> tuple[int, dict]:
+    """Bind the extension's mapped inode to a stable descriptor and exact bytes."""
+    module_path = Path(native_module.__file__).resolve(strict=True)
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor = os.open(module_path, flags)
+    try:
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode):
+            raise RuntimeError("The loaded GxE native extension is not a regular file.")
+        mapped = False
+        with open("/proc/self/maps", "r", encoding="utf-8") as handle:
+            for line in handle:
+                fields = line.split(None, 5)
+                if len(fields) < 5:
+                    continue
+                try:
+                    major_text, minor_text = fields[3].split(":", 1)
+                    device = os.makedev(int(major_text, 16), int(minor_text, 16))
+                    inode = int(fields[4])
+                except (ValueError, OSError):
+                    continue
+                if device == before.st_dev and inode == before.st_ino:
+                    mapped = True
+                    break
+        if not mapped:
+            raise RuntimeError(
+                "The GxE native extension pathname does not identify the inode loaded "
+                "into this process."
+            )
+        digest = _sha256_descriptor(descriptor)
+        after = os.fstat(descriptor)
+        identity = (
+            before.st_dev, before.st_ino, before.st_size,
+            before.st_mtime_ns, before.st_ctime_ns,
+        )
+        if identity != (
+            after.st_dev, after.st_ino, after.st_size,
+            after.st_mtime_ns, after.st_ctime_ns,
+        ):
+            raise RuntimeError("The loaded GxE native extension changed while hashing.")
+        return descriptor, {
+            "path": str(module_path),
+            "sha256": digest,
+            "bytes": int(before.st_size),
+            "identity": identity,
+        }
+    except Exception:
+        os.close(descriptor)
+        raise
+
+
+def _validate_backend_provenance(value: Mapping, *, expected_stage: str | None = None) -> None:
+    """Validate implementation provenance without making it scientific identity."""
+    if not isinstance(value, Mapping):
+        raise ValueError("GxE backend provenance must be a JSON object.")
+    required = {
+        "schema_version", "artifact_stage", "backend_name", "backend_version",
+        "source_commit", "source_tree_sha256", "native_binary_sha256", "compile_options",
+        "native_workspace_cap_bytes", "configured_target_panel_columns",
+        "actual_global_2b_source_columns", "actual_jackknife_4b_source_columns",
+        "actual_target_source_columns",
+    }
+    if set(value) != required:
+        raise ValueError("GxE backend provenance has unexpected or missing fields.")
+    if value.get("schema_version") != _BACKEND_PROVENANCE_SCHEMA_VERSION:
+        raise ValueError("Unsupported GxE backend-provenance schema.")
+    stage = value.get("artifact_stage")
+    if not isinstance(stage, str) or not stage or (
+        expected_stage is not None and stage != expected_stage
+    ):
+        raise ValueError("GxE backend provenance has an invalid artifact stage.")
+    for field in ("backend_name", "backend_version"):
+        if not isinstance(value.get(field), str) or not value[field]:
+            raise ValueError(f"GxE backend provenance field {field!r} is invalid.")
+    source_commit = value.get("source_commit")
+    if source_commit != "unknown" and not (
+        isinstance(source_commit, str)
+        and len(source_commit) == 40
+        and all(character in "0123456789abcdef" for character in source_commit)
+    ):
+        raise ValueError("GxE backend provenance source_commit is invalid.")
+    source_tree_sha256 = value.get("source_tree_sha256")
+    if source_tree_sha256 is not None and not _is_canonical_sha256(source_tree_sha256):
+        raise ValueError("GxE backend provenance source_tree_sha256 is invalid.")
+    native_hash = value.get("native_binary_sha256")
+    if native_hash is not None and not _is_canonical_sha256(native_hash):
+        raise ValueError("GxE backend provenance native binary SHA-256 is invalid.")
+    compile_options = value.get("compile_options")
+    if compile_options is not None and not isinstance(compile_options, Mapping):
+        raise ValueError("GxE backend provenance compile_options must be null or an object.")
+    integer_fields = (
+        "native_workspace_cap_bytes", "configured_target_panel_columns",
+        "actual_global_2b_source_columns", "actual_jackknife_4b_source_columns",
+        "actual_target_source_columns",
+    )
+    for field in integer_fields:
+        observed = value.get(field)
+        if isinstance(observed, bool) or not isinstance(observed, (int, np.integer)) or observed < 0:
+            raise ValueError(f"GxE backend provenance field {field!r} is invalid.")
+    global_width = int(value["actual_global_2b_source_columns"])
+    jackknife_width = int(value["actual_jackknife_4b_source_columns"])
+    target_width = int(value["actual_target_source_columns"])
+    if jackknife_width not in (0, 2 * global_width):
+        raise ValueError("GxE backend provenance has inconsistent 2B/4B widths.")
+    expected_target_width = jackknife_width if jackknife_width > 0 else global_width
+    if target_width != expected_target_width:
+        raise ValueError("GxE backend provenance has an inconsistent target width.")
+    if value["backend_name"] == "gxeldcore_direct":
+        if (
+            source_commit == "unknown"
+            or source_tree_sha256 is None
+            or
+            native_hash is None
+            or compile_options is None
+            or int(value["native_workspace_cap_bytes"]) <= 0
+            or int(value["configured_target_panel_columns"]) <= 0
+        ):
+            raise ValueError("Direct GxE backend provenance is incomplete.")
 
 
 _FEATURE_CACHE_SCHEMA_VERSION = 2
@@ -303,6 +596,10 @@ def _validate_feature_cache_semantics(
         raise ValueError(
             "Unsupported GxE feature-cache schema; regenerate a schema-v2 cache "
             "so NxE traces can be verified."
+        )
+    if "backend_provenance" in metadata:
+        _validate_backend_provenance(
+            metadata["backend_provenance"], expected_stage="feature_construction"
         )
     if not isinstance(arrays, Mapping):
         raise ValueError("GxE feature-cache arrays must be a mapping.")
@@ -641,14 +938,36 @@ def _round_up_to(x: int, gran: int) -> int:
 
 
 def _build_balanced_vtiles(V: int, vmax: int, gran: int = 64, max_tiles: int = 8) -> list[tuple[int, int]]:
+    V = int(V)
+    vmax = int(vmax)
+    gran = int(gran)
+    max_tiles = int(max_tiles)
     if V <= 0:
         return []
-    # A memory ceiling must be a ceiling.  The former balancing code could put
-    # all overflow into a final tile that was many times larger than ``vmax``.
-    vmax = max(1, int(vmax))
+    if vmax <= 0 or gran <= 0 or max_tiles <= 0:
+        raise ValueError("vmax, gran, and max_tiles must be positive integers.")
     if vmax >= V:
         return [(0, V)]
-    return [(start, min(vmax, V - start)) for start in range(0, V, vmax)]
+    tile_count = math.ceil(V / vmax)
+    if tile_count > max_tiles:
+        raise RuntimeError(
+            "The configured probe-memory/scratch ceilings require "
+            f"{tile_count} tiles, exceeding max_tiles={max_tiles}; "
+            "increase the relevant ceiling or reduce the probe count."
+        )
+
+    # Balance the required tile count to minimize peak memory.  Prefer a
+    # granularity-aligned width only when it remains within the hard ceiling;
+    # otherwise exact balancing still guarantees every tile is <= vmax.
+    balanced_width = math.ceil(V / tile_count)
+    aligned_width = _round_up_to(balanced_width, gran)
+    width = aligned_width if aligned_width <= vmax else balanced_width
+    tiles = [
+        (start, min(width, V - start)) for start in range(0, V, width)
+    ]
+    if len(tiles) > max_tiles or max(size for _, size in tiles) > vmax:
+        raise RuntimeError("Internal GxE probe tiling failed its hard resource caps.")
+    return tiles
 
 
 
@@ -984,7 +1303,7 @@ class GenomewideEnvLDScore:
         eps_var: float = 1e-10,
         rand_samp=None,
         ddof=1,
-        target_xz_mem=16.0,
+        target_xz_mem="auto",
         target_mem=None,
         device="cpu",
         impute_method: str = "mean",
@@ -1000,6 +1319,10 @@ class GenomewideEnvLDScore:
         probe_offset: int = 0,
         feature_cache_path: str | None = None,
         shard_mode: bool = False,
+        native_backend: str = "python",
+        native_workspace_gib: float = 16.0,
+        native_target_panel_columns: int = 64,
+        jackknife_scratch_gib: float = 64.0,
     ):
         self.eps_var = float(eps_var)
         if not np.isfinite(self.eps_var) or self.eps_var <= 0.0:
@@ -1078,11 +1401,14 @@ class GenomewideEnvLDScore:
         if self.ddof not in (0, 1):
             raise ValueError(f"GxE generation supports ddof 0 or 1; got {self.ddof}.")
         self.target_mem = target_mem
-        self.target_xz_mem = float(target_xz_mem if target_mem is None else target_mem)
-        if not np.isfinite(self.target_xz_mem) or self.target_xz_mem <= 0.0:
-            raise ValueError(
-                f"target_xz_mem/target_mem must be positive and finite; got {self.target_xz_mem!r}."
-            )
+        requested_memory = target_xz_mem if target_mem is None else target_mem
+        self.target_xz_mem, self.memory_budget = utils.resolve_memory_budget_gib(
+            requested_memory
+        )
+        self.log._log(
+            f"[memory] sketch budget={self.target_xz_mem:.3f} GiB "
+            f"(mode={self.memory_budget['mode']})."
+        )
         self.device = str(device).strip().lower()
         self.impute_method = str(impute_method).strip().lower()
         if self.impute_method != "mean":
@@ -1114,6 +1440,7 @@ class GenomewideEnvLDScore:
         )
         self.feature_cache_sha256: str | None = None
         self.feature_cache_metadata: dict | None = None
+        self.feature_backend_provenance: dict | None = None
         self.shard_mode = bool(shard_mode)
         if self.shard_mode and self.feature_cache_path is None:
             raise ValueError("GxE reference shards require a precomputed feature_cache_path.")
@@ -1251,6 +1578,133 @@ class GenomewideEnvLDScore:
         self.feature_diagnostics: dict[str, float | int | list[float]] = {}
         self.resource_estimates: dict[str, float | int] = {}
         self._vtiles_used: list[tuple[int, int]] | None = None
+        self.native_workspace_gib = float(native_workspace_gib)
+        if not np.isfinite(self.native_workspace_gib) or self.native_workspace_gib <= 0.0:
+            raise ValueError("native_workspace_gib must be positive and finite.")
+        self.native_target_panel_columns = int(native_target_panel_columns)
+        if self.native_target_panel_columns <= 0:
+            raise ValueError("native_target_panel_columns must be positive.")
+        self.jackknife_scratch_gib = float(jackknife_scratch_gib)
+        if not np.isfinite(self.jackknife_scratch_gib) or self.jackknife_scratch_gib <= 0.0:
+            raise ValueError("jackknife_scratch_gib must be positive and finite.")
+        self.native_backend = str(native_backend).strip().lower()
+        if self.native_backend not in ("python", "direct"):
+            raise ValueError("native_backend must be 'python' or 'direct'.")
+        self._native_context = None
+        self._native_binary_descriptor: int | None = None
+        self._native_binary_record: dict | None = None
+        self._native_build_info: dict | None = None
+        if self.native_backend != "python":
+            unsupported = []
+            if self.nbins != 1:
+                unsupported.append(f"K={self.nbins} annotations")
+            if self.kernel_mode != "standardized":
+                unsupported.append(f"kernel_mode={self.kernel_mode}")
+            if self.genotype_scale != "sample":
+                unsupported.append(f"genotype_scale={self.genotype_scale}")
+            if self.impute_method != "mean":
+                unsupported.append(f"impute_method={self.impute_method}")
+            if self.pheno is not None:
+                unsupported.append("phenotype-coupled construction")
+            if unsupported:
+                message = (
+                    "The bounded native GxE backend supports only phenotype-free K=1, "
+                    "standardized/sample, mean-imputed construction; got "
+                    + ", ".join(unsupported)
+                    + "."
+                )
+                raise ValueError(message)
+            else:
+                try:
+                    from .. import gxeldcore as _gxeldcore
+                except Exception as exc:
+                    raise RuntimeError(
+                        "The requested bounded native GxE extension is unavailable."
+                    ) from exc
+                else:
+                    native_descriptor, native_record = _loaded_native_binary_record(
+                        _gxeldcore
+                    )
+                    build_info = dict(_gxeldcore.build_info())
+                    source_commit = build_info.get("source_commit")
+                    source_tree_sha256 = build_info.get("source_tree_sha256")
+                    if not (
+                        isinstance(source_commit, str)
+                        and len(source_commit) == 40
+                        and all(
+                            character in "0123456789abcdef"
+                            for character in source_commit
+                        )
+                        and _is_canonical_sha256(source_tree_sha256)
+                    ):
+                        os.close(native_descriptor)
+                        raise RuntimeError(
+                            "The direct GxE extension was not built with exact source "
+                            "commit and source-snapshot provenance."
+                        )
+                    self._native_binary_descriptor = native_descriptor
+                    self._native_binary_record = native_record
+                    self._native_build_info = build_info
+                    self._native_binary_finalizer = weakref.finalize(
+                        self, _close_file_descriptors, (native_descriptor,)
+                    )
+                    intercept = np.ones((self.nsamp, 1), dtype=np.float64)
+                    q_basis = _orthonormalize_columns(
+                        np.column_stack([intercept, self.C_int])
+                    )
+                    expected_rank = self.p_eff + 1
+                    if q_basis.shape != (self.nsamp, expected_rank):
+                        raise RuntimeError(
+                            "Complete native GxE projection basis lost rank: "
+                            f"expected {(self.nsamp, expected_rank)}, got {q_basis.shape}."
+                        )
+                    q_basis = np.asfortranarray(q_basis, dtype=np.float64)
+                    native_row_sel = np.asarray(self.row_sel, dtype=np.int64)
+                    workspace_bytes = int(self.native_workspace_gib * (1024 ** 3))
+                    self._native_context = _gxeldcore.DirectContext(
+                        bed_descriptor=int(self._genotype_descriptors[".bed"]),
+                        bim_descriptor=int(self._genotype_descriptors[".bim"]),
+                        fam_descriptor=int(self._genotype_descriptors[".fam"]),
+                        row_sel=native_row_sel,
+                        ddof=int(self.ddof),
+                        env=np.asarray(self.env, dtype=np.float64),
+                        q_basis=q_basis,
+                        decode_threads=int(self.decode_threads),
+                        max_workspace_bytes=workspace_bytes,
+                        target_panel_columns=self.native_target_panel_columns,
+                    )
+                    context_info = self._native_context.info()
+                    if (
+                        int(context_info["n_total"]) != self.nsamp_total
+                        or int(context_info["m_total"]) != self.nsnps
+                        or int(context_info["n_selected"]) != self.nsamp
+                        or int(context_info["q_rank"]) != expected_rank
+                        or int(context_info["decode_threads"]) != self.decode_threads
+                    ):
+                        self._native_context.close()
+                        self._native_context = None
+                        raise RuntimeError(
+                            "The bounded native GxE context disagrees with validated Python dimensions/state."
+                        )
+                    if self.jackknife_ids is not None:
+                        group_counts = [
+                            int(np.unique(self.jackknife_ids[s:e]).size)
+                            for s, e in self._make_compute_blocks()
+                        ]
+                        if max(group_counts, default=1) > 4:
+                            self._native_context.close()
+                            self._native_context = None
+                            raise ValueError(
+                                "The native GxE source API supports at most four jackknife "
+                                "groups per compute block; reduce --step-size or use the "
+                                "Python backend."
+                            )
+                    self.native_backend = "direct"
+                    self.log._log(
+                        "[gxe:native] Enabled immutable descriptor-owned direct BED context "
+                        "(K=1, float64, standardized/sample, complete [1,E,C] projection; "
+                        f"decode_threads={self.decode_threads}, workspace={self.native_workspace_gib:.2f} GiB)."
+                    )
         self.log._log(
             f"[env] Using environment '{self.env_name}' with {self.nsamp} samples; "
             f"effective covariate rank={self.p_eff}; correlation df={self.df_corr}."
@@ -1258,6 +1712,10 @@ class GenomewideEnvLDScore:
 
     def close(self) -> None:
         try:
+            native_context = getattr(self, "_native_context", None)
+            if native_context is not None:
+                native_context.close()
+                self._native_context = None
             close_reader = getattr(self.G, "close", None)
             if close_reader is not None:
                 close_reader()
@@ -1265,6 +1723,10 @@ class GenomewideEnvLDScore:
             finalizer = getattr(self, "_descriptor_finalizer", None)
             if finalizer is not None and finalizer.alive:
                 finalizer()
+            native_finalizer = getattr(self, "_native_binary_finalizer", None)
+            if native_finalizer is not None and native_finalizer.alive:
+                native_finalizer()
+                self._native_binary_descriptor = None
         if self.covar_path is None:
             self.log._log("[env] No additional user covariates supplied; projecting on the environment main effect only.")
         else:
@@ -1519,6 +1981,102 @@ class GenomewideEnvLDScore:
         return np.asarray(W, dtype=(out_dtype or self.dtype), order="F")
 
     def _precompute_residual_variances(self) -> tuple[np.ndarray, np.ndarray]:
+        native_direct = getattr(self, "native_backend", "python") == "direct"
+        if native_direct:
+            return self._precompute_residual_variances_native()
+        return self._precompute_residual_variances_python()
+
+    def _precompute_residual_variances_native(self) -> tuple[np.ndarray, np.ndarray]:
+        if self._native_context is None:
+            raise RuntimeError("The bounded native GxE backend was not initialized.")
+        self.log._log(
+            "[gxe:native] Precomputing feature scales/diagonals algebraically without X/W blocks."
+        )
+        arrays = {
+            name: np.empty(self.nsnps, dtype=np.float64)
+            for name in (
+                "scale_x", "scale_w", "norm_x", "norm_w",
+                "diag_nxe_x", "diag_nxe_w", "corr_xw",
+            )
+        }
+        max_leak_x = 0.0
+        max_leak_w = 0.0
+        blocks = self._make_compute_blocks()
+        for s, e in tqdm(
+            blocks, desc="GxE native var", unit="block", disable=(not self.verbose)
+        ):
+            result = self._native_context.feature_block(
+                    blk_start=int(s),
+                    blk_end=int(e),
+                    eps_var=float(self.eps_var),
+                    require_missing_free=True,
+            )
+            for name in arrays:
+                arrays[name][s:e] = np.asarray(result[name], dtype=np.float64)
+            max_leak_x = max(
+                max_leak_x,
+                float(result["max_projection_leakage_additive"]),
+            )
+            max_leak_w = max(
+                max_leak_w,
+                float(result["max_projection_leakage_interaction"]),
+            )
+
+        self.inv_sqrt_resvar_x_all = arrays["scale_x"]
+        self.inv_sqrt_resvar_w_all = arrays["scale_w"]
+        self.norm_x_all = arrays["norm_x"]
+        self.norm_w_all = arrays["norm_w"]
+        self.diag_nxe_x_all = arrays["diag_nxe_x"]
+        self.diag_nxe_w_all = arrays["diag_nxe_w"]
+        self.corr_xw_all = arrays["corr_xw"]
+        self.score_x_all = None
+        self.score_w_all = None
+        trace_x = (
+            float(self.df_corr)
+            * (np.asarray(self.annot, dtype=np.float64).T @ self.norm_x_all)
+            / self.nsnps_bin
+        )
+        trace_w = (
+            float(self.df_corr)
+            * (np.asarray(self.annot, dtype=np.float64).T @ self.norm_w_all)
+            / self.nsnps_bin
+        )
+        max_norm_error_x = float(np.max(np.abs(self.norm_x_all - 1.0)))
+        max_norm_error_w = float(np.max(np.abs(self.norm_w_all - 1.0)))
+        if max(max_leak_x, max_leak_w) > 1.0e-9:
+            raise RuntimeError(
+                "Native projected GxE features leak into the fixed-effect span: "
+                f"X={max_leak_x:.6g}, W={max_leak_w:.6g}."
+            )
+        if max(max_norm_error_x, max_norm_error_w) > 1.0e-9:
+            raise RuntimeError(
+                "Native post-projection GxE normalization failed: "
+                f"X={max_norm_error_x:.6g}, W={max_norm_error_w:.6g}."
+            )
+        self.feature_diagnostics = {
+            "valid_additive_columns": int(self.nsnps),
+            "valid_interaction_columns": int(self.nsnps),
+            "max_projection_leakage_additive": max_leak_x,
+            "max_projection_leakage_interaction": max_leak_w,
+            "min_norm_additive_over_rank": float(np.min(self.norm_x_all)),
+            "max_norm_additive_over_rank": float(np.max(self.norm_x_all)),
+            "min_norm_interaction_over_rank": float(np.min(self.norm_w_all)),
+            "max_norm_interaction_over_rank": float(np.max(self.norm_w_all)),
+            "max_norm_error_additive": max_norm_error_x,
+            "max_norm_error_interaction": max_norm_error_w,
+            "kernel_traces_additive": trace_x.tolist(),
+            "kernel_traces_interaction": trace_w.tolist(),
+            "max_trace_error_additive": float(np.max(np.abs(trace_x - self.df_corr))),
+            "max_trace_error_interaction": float(np.max(np.abs(trace_w - self.df_corr))),
+        }
+        self.log._log(
+            "[gxe:native:invariants] max fixed-effect leakage "
+            f"X={max_leak_x:.3e}, W={max_leak_w:.3e}; "
+            f"max norm error X={max_norm_error_x:.3e}, W={max_norm_error_w:.3e}."
+        )
+        return self.inv_sqrt_resvar_x_all, self.inv_sqrt_resvar_w_all
+
+    def _precompute_residual_variances_python(self) -> tuple[np.ndarray, np.ndarray]:
         self.log._log("[gxe] Precomputing projected feature norms and NxE diagonals in a single pass.")
         inv_x = np.zeros(self.nsnps, dtype=np.float64)
         inv_w = np.zeros(self.nsnps, dtype=np.float64)
@@ -1703,21 +2261,107 @@ class GenomewideEnvLDScore:
 
     def _auto_vtiles(self) -> list[tuple[int, int]]:
         target_gib = float(self.target_xz_mem)
-        itemsize = np.dtype(self.dtype).itemsize
+        itemsize = int(np.dtype(self.dtype).itemsize)
+        native_direct = getattr(self, "native_backend", "python") == "direct"
         # Without jackknifing, the target pass holds the concatenated X/W
         # global sketch.  Exact two-sided deletion additionally holds one
         # concatenated block sketch in the same target buffer.
         resident_multiplier = 4 if self.jackknife_ids is not None else 2
-        denom = max(1, resident_multiplier * int(self.nsamp) * int(self.nbins) * itemsize)
-        vmax = int((target_gib * (1024 ** 3)) // denom)
-        vmax = max(1, min(self.nvecs, vmax))
+        if native_direct:
+            # Let U=N*K*B*8.  Each opaque panel owns S and e*S.  Preparing
+            # the global panel peaks at the input 2U plus its 4U snapshot;
+            # exact JK preparation additionally retains the global 4U while
+            # holding a 2U block input and constructing its 4U snapshot.
+            if itemsize == np.dtype(np.float64).itemsize:
+                peak_multiplier = 10 if self.jackknife_ids is not None else 6
+            else:
+                # A float32 stored sketch remains live while Python converts
+                # it to a 2U float64 call input and C++ constructs the 4U
+                # opaque S/eS snapshot: 7U globally and 11U with a retained
+                # global panel plus one block panel preparation.
+                peak_multiplier = 11 if self.jackknife_ids is not None else 7
+            denominator_itemsize = np.dtype(np.float64).itemsize
+        else:
+            peak_multiplier = resident_multiplier
+            denominator_itemsize = itemsize
+        denom = max(
+            1,
+            peak_multiplier
+            * int(self.nsamp)
+            * int(self.nbins)
+            * int(denominator_itemsize),
+        )
+        memory_vmax = int((target_gib * (1024 ** 3)) // denom)
+        if memory_vmax < 1:
+            raise RuntimeError(
+                "The configured target sketch-memory limit cannot hold one probe: "
+                f"required={denom} bytes, limit={int(target_gib * (1024 ** 3))} bytes."
+            )
+        vmax = min(self.nvecs, memory_vmax)
+        if self.jackknife_ids is not None:
+            labels = getattr(self, "jackknife_labels", None)
+            nblocks = (
+                len(labels)
+                if labels is not None
+                else int(np.max(self.jackknife_ids, initial=-1)) + 1
+            )
+            if nblocks <= 0:
+                raise RuntimeError("Exact jackknife tiling requires at least one block.")
+            scratch_per_probe = (
+                2 * int(nblocks) * int(self.nsamp) * int(self.nbins) * itemsize
+            )
+            scratch_limit = int(
+                float(getattr(self, "jackknife_scratch_gib", 64.0)) * (1024 ** 3)
+            )
+            scratch_vmax = scratch_limit // max(1, scratch_per_probe)
+            if scratch_vmax < 1:
+                raise RuntimeError(
+                    "The configured exact-jackknife scratch limit cannot hold one probe tile: "
+                    f"required={scratch_per_probe} bytes, limit={scratch_limit} bytes."
+                )
+            vmax = min(vmax, int(scratch_vmax))
         tiles = _build_balanced_vtiles(self.nvecs, vmax=vmax, gran=64, max_tiles=8)
         if not tiles:
             tiles = [(0, self.nvecs)]
         vdesc = ",".join(str(v) for _, v in tiles)
-        approx = (resident_multiplier * self.nsamp * self.nbins * max(v for _, v in tiles) * itemsize) / (1024 ** 3)
-        label = "global+block target sketches" if self.jackknife_ids is not None else "paired global sketches"
-        self.log._log(f"[gxe:auto_vchunk] dtype={self.dtype} target≈{target_gib:.1f} GiB, v_tiles=[{vdesc}] -> {label}≈{approx:.2f} GiB")
+        approx = (
+            peak_multiplier
+            * self.nsamp
+            * self.nbins
+            * max(v for _, v in tiles)
+            * denominator_itemsize
+        ) / (1024 ** 3)
+        label = (
+            "native opaque-panel preparation peak"
+            if native_direct
+            else (
+                "global+block target sketches"
+                if self.jackknife_ids is not None
+                else "paired global sketches"
+            )
+        )
+        scratch_message = ""
+        if self.jackknife_ids is not None:
+            labels = getattr(self, "jackknife_labels", None)
+            nblocks = (
+                len(labels)
+                if labels is not None
+                else int(np.max(self.jackknife_ids, initial=-1)) + 1
+            )
+            scratch_peak = (
+                2
+                * nblocks
+                * self.nsamp
+                * self.nbins
+                * max(v for _, v in tiles)
+                * itemsize
+                / (1024 ** 3)
+            )
+            scratch_message = f", exact scratch≈{scratch_peak:.2f} GiB"
+        self.log._log(
+            f"[gxe:auto_vchunk] dtype={self.dtype} target≈{target_gib:.1f} GiB, "
+            f"v_tiles=[{vdesc}] -> {label}≈{approx:.2f} GiB{scratch_message}"
+        )
         return tiles
 
     def _accumulate_sketch_block(
@@ -1770,6 +2414,115 @@ class GenomewideEnvLDScore:
             seg = Work[:, source_bin * Vt:(source_bin + 1) * Vt]
             row_sums = np.sum(seg * seg, axis=1, dtype=np.float64) * scale
             out[:, source_bin] += annot_left.T @ row_sums
+
+    def _native_source_block(
+        self,
+        blk_start: int,
+        blk_end: int,
+        probes: np.ndarray,
+        jackknife_ids: np.ndarray | None,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        if self._native_context is None:
+            raise RuntimeError("The bounded native GxE backend was not initialized.")
+        length = blk_end - blk_start
+        if jackknife_ids is None:
+            unique_ids = np.asarray([0], dtype=np.int32)
+            dense_ids = np.zeros(length, dtype=np.int32)
+        else:
+            unique_ids = np.unique(np.asarray(jackknife_ids, dtype=np.int32))
+            if unique_ids.size > 4:
+                raise RuntimeError(
+                    "A GxE compute block intersects more than four jackknife groups; "
+                    "reduce --step-size or use the Python backend."
+                )
+            dense_ids = np.searchsorted(unique_ids, jackknife_ids).astype(np.int32)
+        source_x, source_w, missing = self._native_context.source_block(
+            blk_start=int(blk_start),
+            blk_end=int(blk_end),
+            scale_x=np.asarray(
+                self.inv_sqrt_resvar_x_all[blk_start:blk_end], dtype=np.float64
+            ),
+            scale_w=np.asarray(
+                self.inv_sqrt_resvar_w_all[blk_start:blk_end], dtype=np.float64
+            ),
+            sqrt_annotation=np.sqrt(
+                np.maximum(
+                    np.asarray(self.annot[blk_start:blk_end, 0], dtype=np.float64),
+                    0.0,
+                )
+            ),
+            probes=np.asfortranarray(probes, dtype=np.float64),
+            group_ids=dense_ids,
+            num_groups=int(unique_ids.size),
+            require_missing_free=True,
+        )
+        if int(missing) != 0:
+            raise RuntimeError("Native GxE source unexpectedly consumed missing genotypes.")
+        return unique_ids, np.asarray(source_x), np.asarray(source_w)
+
+    def _native_target_block(
+        self,
+        blk_start: int,
+        blk_end: int,
+        sources,
+        second_sources=None,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        if self._native_context is None:
+            raise RuntimeError("The bounded native GxE backend was not initialized.")
+        arguments = {
+            "blk_start": int(blk_start),
+            "blk_end": int(blk_end),
+            "scale_x": np.asarray(
+                self.inv_sqrt_resvar_x_all[blk_start:blk_end], dtype=np.float64
+            ),
+            "scale_w": np.asarray(
+                self.inv_sqrt_resvar_w_all[blk_start:blk_end], dtype=np.float64
+            ),
+            "require_missing_free": True,
+        }
+        if second_sources is None:
+            work_x, work_w, missing, source_leakage = (
+                self._native_context.target_projected_block(
+                    sources=sources, **arguments
+                )
+            )
+        else:
+            work_x, work_w, missing, source_leakage = (
+                self._native_context.target_projected_pair_block(
+                    first=sources, second=second_sources, **arguments
+                )
+            )
+        if int(missing) != 0:
+            raise RuntimeError("Native GxE target unexpectedly consumed missing genotypes.")
+        if not np.isfinite(float(source_leakage)):
+            raise RuntimeError("Native GxE target returned a non-finite source leakage diagnostic.")
+        return np.asarray(work_x), np.asarray(work_w)
+
+    def _native_prepare_projected_sources(self, sources: np.ndarray):
+        if self._native_context is None:
+            raise RuntimeError("The bounded native GxE backend was not initialized.")
+        tolerance = 5.0e-6 if np.asarray(sources).dtype == np.float32 else 1.0e-9
+        panel = self._native_context.prepare_projected_sources(
+            sources=np.asfortranarray(sources, dtype=np.float64),
+            tolerance=tolerance,
+        )
+        leakage = float(panel.leakage)
+        if not np.isfinite(leakage):
+            raise RuntimeError("Native GxE projected-source validation was non-finite.")
+        return panel, leakage
+
+    def _native_validate_projected_sources(self, sources: np.ndarray) -> float:
+        if self._native_context is None:
+            raise RuntimeError("The bounded native GxE backend was not initialized.")
+        leakage = float(
+            self._native_context.validate_projected_sources(
+                sources=np.asfortranarray(sources, dtype=np.float64),
+                tolerance=1.0e-9,
+            )
+        )
+        if not np.isfinite(leakage):
+            raise RuntimeError("Native GxE projected-source validation was non-finite.")
+        return leakage
 
     def _compute_within_jackknife_scores(
         self,
@@ -2099,6 +2852,85 @@ class GenomewideEnvLDScore:
             "genotype_files": genotype_files,
         }
 
+    def _backend_provenance(self, artifact_stage: str) -> dict:
+        build_info = None
+        native_binary_sha256 = None
+        if self.native_backend == "direct":
+            build_info = self._native_build_info
+            descriptor = self._native_binary_descriptor
+            binary_record = self._native_binary_record
+            if build_info is None or descriptor is None or binary_record is None:
+                raise RuntimeError("Direct GxE backend build provenance is unavailable.")
+            observed = os.fstat(descriptor)
+            identity = (
+                observed.st_dev, observed.st_ino, observed.st_size,
+                observed.st_mtime_ns, observed.st_ctime_ns,
+            )
+            if identity != tuple(binary_record["identity"]):
+                raise RuntimeError(
+                    "The loaded GxE native extension inode changed after initialization."
+                )
+            native_binary_sha256 = _sha256_descriptor(descriptor)
+            if native_binary_sha256 != binary_record["sha256"]:
+                raise RuntimeError(
+                    "The loaded GxE native extension bytes changed after initialization."
+                )
+            backend_name = str(build_info.get("backend_name", "gxeldcore_direct"))
+            backend_version = str(build_info.get("backend_version", "unknown"))
+            compile_options = {
+                key: build_info.get(key)
+                for key in (
+                    "api_version", "compiler_id", "compiler_version", "build_type",
+                    "blas_vendor", "cxx_standard", "optimization",
+                    "architecture_tuning", "openmp_enabled",
+                    "native_optimization_enabled", "platform",
+                )
+            }
+            workspace_cap = int(self.native_workspace_gib * (1024 ** 3))
+            panel_columns = int(self.native_target_panel_columns)
+        else:
+            backend_name = "python_numpy"
+            backend_version = "gxe_python_v1"
+            compile_options = None
+            workspace_cap = 0
+            panel_columns = 0
+        source_commit = (
+            str(build_info.get("source_commit", "unknown"))
+            if build_info is not None
+            else "unknown"
+        )
+        source_tree_sha256 = (
+            str(build_info["source_tree_sha256"])
+            if build_info is not None
+            else None
+        )
+        global_width = int(
+            self.resource_estimates.get("actual_global_2b_source_columns", 0)
+        )
+        jackknife_width = int(
+            self.resource_estimates.get("actual_jackknife_4b_source_columns", 0)
+        )
+        target_width = int(self.resource_estimates.get("target_source_columns", 0))
+        if artifact_stage == "feature_construction":
+            global_width = jackknife_width = target_width = 0
+        provenance = {
+            "schema_version": _BACKEND_PROVENANCE_SCHEMA_VERSION,
+            "artifact_stage": str(artifact_stage),
+            "backend_name": backend_name,
+            "backend_version": backend_version,
+            "source_commit": source_commit,
+            "source_tree_sha256": source_tree_sha256,
+            "native_binary_sha256": native_binary_sha256,
+            "compile_options": compile_options,
+            "native_workspace_cap_bytes": workspace_cap,
+            "configured_target_panel_columns": panel_columns,
+            "actual_global_2b_source_columns": global_width,
+            "actual_jackknife_4b_source_columns": jackknife_width,
+            "actual_target_source_columns": target_width,
+        }
+        _validate_backend_provenance(provenance, expected_stage=str(artifact_stage))
+        return provenance
+
     def write_feature_cache(self, path: str | Path, *, overwrite: bool = False) -> Path:
         """Write exact phenotype-independent projected-feature metadata."""
         if self.pheno is not None or self.pheno_path is not None:
@@ -2139,6 +2971,9 @@ class GenomewideEnvLDScore:
             "feature_diagnostics": self.feature_diagnostics,
             "trace_nxe": trace_nxe,
             "trace_nxe_sq": trace_nxe_sq,
+            "backend_provenance": self._backend_provenance(
+                "feature_construction"
+            ),
         }
         variants = self.snplist[["CHR", "SNP", "BP", "A1", "A2"]]
         arrays = {
@@ -2220,6 +3055,7 @@ class GenomewideEnvLDScore:
             staged.unlink(missing_ok=True)
         self.feature_cache_sha256 = staged_sha256
         self.feature_cache_metadata = metadata
+        self.feature_backend_provenance = dict(metadata["backend_provenance"])
         return target
 
     def _load_feature_cache(self, path: str | Path) -> None:
@@ -2291,6 +3127,11 @@ class GenomewideEnvLDScore:
         self.score_w_all = None
         self.feature_cache_sha256 = cache_sha256
         self.feature_cache_metadata = metadata
+        self.feature_backend_provenance = (
+            None
+            if metadata.get("backend_provenance") is None
+            else dict(metadata["backend_provenance"])
+        )
         self.log._log(f"[gxe:cache] loaded exact projected-feature cache: {target}")
 
     def _write_bundle_metadata(
@@ -2363,6 +3204,8 @@ class GenomewideEnvLDScore:
             "annotation_masses": np.asarray(self.nsnps_bin, dtype=np.float64).tolist(),
             "feature_diagnostics": self.feature_diagnostics,
             "resource_estimates": self.resource_estimates,
+            "backend_provenance": self._backend_provenance("reference"),
+            "feature_backend_provenance": self.feature_backend_provenance,
             "trace_nxe": trace_nxe,
             "trace_nxe_sq": trace_nxe_sq,
             "randomization": {
@@ -2514,6 +3357,8 @@ class GenomewideEnvLDScore:
             "ld_scale": "cross_product_over_rank_squared",
             "annotation_names": list(self.l2cols),
             "feature_cache_sha256": self.feature_cache_sha256,
+            "backend_provenance": self._backend_provenance("reference_shard"),
+            "feature_backend_provenance": self.feature_backend_provenance,
             "randomization": {
                 key: randomization[key]
                 for key in (
@@ -2546,6 +3391,8 @@ class GenomewideEnvLDScore:
             "files": files,
             "artifact_sha256": artifact_sha256,
             "resource_estimates": self.resource_estimates,
+            "backend_provenance": identity["backend_provenance"],
+            "feature_backend_provenance": identity["feature_backend_provenance"],
         }
         if jackknife is not None:
             payload["jackknife"] = jackknife
@@ -2753,7 +3600,12 @@ class GenomewideEnvLDScore:
         )
         self.log._log(f"num_vecs: {self.nvecs}, step_size: {self.step_size}, seed: {self.root_seed}")
         self.log._log(f"Using {self.rand_dist} random vectors.")
-        self.log._log("[backend] Python / NumPy only (non-Mailman path).")
+        if self.native_backend == "direct":
+            self.log._log(
+                "[backend] Bounded native direct BED algebra; Python remains the oracle/fallback."
+            )
+        else:
+            self.log._log("[backend] Python / NumPy only (non-Mailman path).")
         self.log._log(
             "[target] Estimating the full XX/XW/WX/WW directional trace basis "
             f"for environment '{self.env_name}' (kernel_mode={self.kernel_mode})."
@@ -2761,6 +3613,9 @@ class GenomewideEnvLDScore:
 
         if self.feature_cache_path is None:
             self.inv_sqrt_resvar_x_all, self.inv_sqrt_resvar_w_all = self._precompute_residual_variances()
+            self.feature_backend_provenance = self._backend_provenance(
+                "feature_construction"
+            )
         else:
             self._load_feature_cache(self.feature_cache_path)
         blocks = self._make_compute_blocks()
@@ -2771,12 +3626,82 @@ class GenomewideEnvLDScore:
         itemsize = int(np.dtype(self.dtype).itemsize)
         max_block = min(self.step_size, self.nsnps)
         resident_multiplier = 4 if self.jackknife_ids is not None else 2
-        scratch_bytes = (
+        native_opaque_retained_multiplier = (
+            2 * resident_multiplier if self.native_backend == "direct" else 0
+        )
+        native_opaque_prepare_peak_multiplier = (
+            (
+                (10 if self.jackknife_ids is not None else 6)
+                if itemsize == np.dtype(np.float64).itemsize
+                else (11 if self.jackknife_ids is not None else 7)
+            )
+            if self.native_backend == "direct"
+            else 0
+        )
+        target_source_columns = resident_multiplier * self.nbins * max_vt
+        scratch_total_bytes = (
             0
             if self.jackknife_ids is None
             else 2 * len(self.jackknife_labels) * self.nsamp * self.nbins * max_vt * itemsize
         )
+        scratch_mapped_bytes = (
+            0
+            if self.jackknife_ids is None
+            else 2 * self.nsamp * self.nbins * max_vt * itemsize
+        )
+        if self.jackknife_ids is None:
+            max_source_groups = 1
+        else:
+            max_source_groups = max(
+                int(np.unique(self.jackknife_ids[s:e]).size) for s, e in blocks
+            )
+        source_columns = max_source_groups * self.nbins * max_vt
+        q_rank = self.p_eff + 1
+        target_panel_columns = min(self.native_target_panel_columns, target_source_columns)
+        global_source_columns = 2 * self.nbins * max_vt
+        jackknife_source_columns = (
+            4 * self.nbins * max_vt if self.jackknife_ids is not None else 0
+        )
+        native_feature_bytes = 8 * (
+            self.nsamp * max_block
+            + 4 * q_rank * max_block
+            + 11 * max_block
+        )
+        native_source_bytes = 8 * (
+            self.nsamp * max_block
+            + max_block * source_columns
+            + 2 * self.nsamp * source_columns
+            + q_rank * source_columns
+            + max_block * max_vt
+            + 4 * max_block
+        )
+        native_panel_prepare_bytes = 8 * (
+            2 * self.nsamp * global_source_columns
+            + q_rank * global_source_columns
+        )
+        native_target_bytes = 8 * (
+            self.nsamp * max_block
+            + 2 * max_block * target_source_columns
+            + 2 * max_block
+        )
+        native_workspace_cap_bytes = int(self.native_workspace_gib * (1024 ** 3))
+        native_call_max_bytes = max(
+            native_feature_bytes,
+            native_source_bytes,
+            native_panel_prepare_bytes,
+            native_target_bytes,
+        )
+        if (
+            self.native_backend == "direct"
+            and native_call_max_bytes > native_workspace_cap_bytes
+        ):
+            raise RuntimeError(
+                "The modeled native GxE call workspace exceeds the configured cap before "
+                f"the sketch pass: required={native_call_max_bytes} bytes, "
+                f"limit={native_workspace_cap_bytes} bytes."
+            )
         self.resource_estimates = {
+            "native_direct_backend": int(self.native_backend == "direct"),
             "decoded_genotype_block_gib": float(self.nsamp * max_block * 8 / (1024 ** 3)),
             "prepared_feature_pair_gib": float(2 * self.nsamp * max_block * itemsize / (1024 ** 3)),
             "projection_product_float64_gib": float(self.nsamp * max_block * 8 / (1024 ** 3)),
@@ -2789,23 +3714,53 @@ class GenomewideEnvLDScore:
             "resident_sketch_workspace_gib": float(
                 resident_multiplier * self.nsamp * self.nbins * max_vt * itemsize / (1024 ** 3)
             ),
+            "native_opaque_projected_panel_resident_gib": float(
+                native_opaque_retained_multiplier
+                * self.nsamp * self.nbins * max_vt * 8
+                / (1024 ** 3)
+            ),
+            "native_opaque_projected_panel_prepare_peak_gib": float(
+                native_opaque_prepare_peak_multiplier
+                * self.nsamp * self.nbins * max_vt * 8
+                / (1024 ** 3)
+            ),
             "source_contribution_gib": float(
                 self.nsamp * max_vt * itemsize / (1024 ** 3)
             ),
             "weighted_probe_gib": float(
-                max_block * max_vt * itemsize / (1024 ** 3)
+                max_block * source_columns * 8 / (1024 ** 3)
             ),
+            "source_columns": int(source_columns),
+            "actual_global_2b_source_columns": int(global_source_columns),
+            "actual_jackknife_4b_source_columns": int(jackknife_source_columns),
+            "target_source_columns": int(target_source_columns),
+            "native_workspace_cap_bytes": native_workspace_cap_bytes,
+            "native_modeled_max_call_workspace_gib": float(
+                native_call_max_bytes / (1024 ** 3)
+            ),
+            "native_feature_workspace_gib": float(native_feature_bytes / (1024 ** 3)),
+            "native_source_workspace_gib": float(native_source_bytes / (1024 ** 3)),
+            "native_projected_panel_prepare_workspace_gib": float(
+                native_panel_prepare_bytes / (1024 ** 3)
+            ),
+            "native_target_workspace_gib": float(native_target_bytes / (1024 ** 3)),
             "target_work_native_plus_float64_gib": float(
-                max_block * resident_multiplier * self.nbins * max_vt * (itemsize + 8) / (1024 ** 3)
+                2 * max_block * target_source_columns * 8 / (1024 ** 3)
             ),
-            "jackknife_scratch_peak_gib": float(scratch_bytes / (1024 ** 3)),
+            "jackknife_scratch_total_gib": float(scratch_total_bytes / (1024 ** 3)),
+            "jackknife_scratch_peak_mapped_gib": float(scratch_mapped_bytes / (1024 ** 3)),
+            # Retained for compatibility with the former monolithic store:
+            # this is peak disk consumption for one tile.
+            "jackknife_scratch_peak_gib": float(scratch_total_bytes / (1024 ** 3)),
             "blas_threads": int(self.num_threads),
             "bed_reader_threads": int(self.decode_threads),
         }
         self.log._log(
             "[gxe:resources] modeled resident sketch workspace="
             f"{self.resource_estimates['resident_sketch_workspace_gib']:.3f} GiB; "
-            f"jackknife scratch={self.resource_estimates['jackknife_scratch_peak_gib']:.3f} GiB; "
+            "jackknife scratch="
+            f"{self.resource_estimates['jackknife_scratch_total_gib']:.3f} GiB total/"
+            f"{self.resource_estimates['jackknife_scratch_peak_mapped_gib']:.3f} GiB mapped; "
             f"BLAS threads={self.num_threads}, bed-reader threads={self.decode_threads}."
         )
 
@@ -2819,6 +3774,7 @@ class GenomewideEnvLDScore:
         total_units = max(1, len(vtiles) * 2 * len(blocks))
         bar = tqdm(total=total_units, desc="GxE-LD progress", unit="task", smoothing=0.2, disable=(not self.verbose))
         within_jackknife = None
+        max_native_source_leakage = 0.0
         if self.jackknife_ids is not None:
             within_jackknife = {
                 key: np.zeros((len(self.jackknife_labels), self.nbins, self.nbins), dtype=np.float64)
@@ -2838,6 +3794,11 @@ class GenomewideEnvLDScore:
                 for tile_index, (v0, Vt) in enumerate(vtiles):
                     kt = self.nbins * Vt
                     target_multiplier = 4 if within_jackknife is not None else 2
+                    if self.native_backend == "direct":
+                        # Opaque native panels hold the global and (when used)
+                        # one block sketch separately; no mutable 4B array is
+                        # accepted by the projected fast path.
+                        target_multiplier = 2
                     sources = np.zeros(
                         (self.nsamp, target_multiplier * kt), dtype=self.dtype, order="F"
                     )
@@ -2845,86 +3806,133 @@ class GenomewideEnvLDScore:
                     global_w = sources[:, kt:2 * kt]
                     block_store = None
                     block_sources = None
-                    scratch_path = None
+                    global_panel = None
+                    block_panel = None
                     try:
                         if within_jackknife is not None:
-                            scratch_path = Path(scratch_name) / f"tile-{tile_index:04d}.sketches.bin"
-                            block_store = _secure_memmap(
-                                scratch_path,
-                                (len(self.jackknife_labels), 2 * kt, self.nsamp),
+                            block_store = _JackknifeSketchStore(
+                                Path(scratch_name) / f"tile-{tile_index:04d}",
+                                len(self.jackknife_labels),
+                                2 * kt,
+                                self.nsamp,
                                 self.dtype,
+                                max_total_bytes=int(self.jackknife_scratch_gib * (1024 ** 3)),
                             )
 
                         # Source pass: global U is the sum of the disjoint U_b.
                         # Each realized probe is generated once for the complete
                         # compute block, then sliced without changing its seed.
                         for s, e in blocks:
-                            G = self._read_genotype_block(s, e)
-                            X = self._prepare_additive_block(s, e, G=G, apply_scale=True, out_dtype=self.dtype)
-                            W = self._prepare_interaction_block(s, e, G=G, apply_scale=True, out_dtype=self.dtype)
                             Z = self._generate_random_block(L=(e - s), v_count=Vt, blk_start=s, v_start=v0)
-                            annot_blk = np.asarray(self.annot[s:e], dtype=self.dtype)
-                            if block_store is None:
-                                self._accumulate_sketch_block(global_x, X, Z, annot_blk)
-                                self._accumulate_sketch_block(global_w, W, Z, annot_blk)
+                            if self.native_backend == "direct":
+                                local_ids = (
+                                    None
+                                    if block_store is None
+                                    else np.asarray(self.jackknife_ids[s:e], dtype=np.int32)
+                                )
+                                unique_ids, source_x, source_w = self._native_source_block(
+                                    s, e, Z, local_ids
+                                )
+                                if block_store is None:
+                                    global_x += source_x[:, :Vt]
+                                    global_w += source_w[:, :Vt]
+                                else:
+                                    for group_index, block_id in enumerate(unique_ids):
+                                        segment = slice(group_index * Vt, (group_index + 1) * Vt)
+                                        block_sources = block_store.view(int(block_id))
+                                        global_x += source_x[:, segment]
+                                        global_w += source_w[:, segment]
+                                        block_sources[:, :kt] += source_x[:, segment]
+                                        block_sources[:, kt:2 * kt] += source_w[:, segment]
+                                        del block_sources
+                                        block_sources = None
+                                del source_x, source_w, unique_ids
                             else:
-                                local_ids = np.asarray(self.jackknife_ids[s:e], dtype=np.int32)
-                                for block_id in np.unique(local_ids):
-                                    local = np.flatnonzero(local_ids == block_id)
-                                    block_sources = block_store[int(block_id)].reshape(2 * kt, self.nsamp).T
-                                    x_local = np.asfortranarray(X[:, local])
-                                    w_local = np.asfortranarray(W[:, local])
-                                    z_local = np.asfortranarray(Z[local])
-                                    annot_local = np.asarray(annot_blk[local], dtype=self.dtype)
-                                    self._accumulate_sketch_block(
-                                        global_x, x_local, z_local, annot_local,
-                                        mirror_chunk=block_sources[:, :kt],
-                                    )
-                                    self._accumulate_sketch_block(
-                                        global_w, w_local, z_local, annot_local,
-                                        mirror_chunk=block_sources[:, kt:2 * kt],
-                                    )
-                                    del block_sources, x_local, w_local, z_local, annot_local
-                                    block_sources = None
-                            del G, X, W, Z, annot_blk
+                                G = self._read_genotype_block(s, e)
+                                X = self._prepare_additive_block(s, e, G=G, apply_scale=True, out_dtype=self.dtype)
+                                W = self._prepare_interaction_block(s, e, G=G, apply_scale=True, out_dtype=self.dtype)
+                                annot_blk = np.asarray(self.annot[s:e], dtype=self.dtype)
+                                if block_store is None:
+                                    self._accumulate_sketch_block(global_x, X, Z, annot_blk)
+                                    self._accumulate_sketch_block(global_w, W, Z, annot_blk)
+                                else:
+                                    local_ids = np.asarray(self.jackknife_ids[s:e], dtype=np.int32)
+                                    for block_id in np.unique(local_ids):
+                                        local = np.flatnonzero(local_ids == block_id)
+                                        block_sources = block_store.view(int(block_id))
+                                        x_local = np.asfortranarray(X[:, local])
+                                        w_local = np.asfortranarray(W[:, local])
+                                        z_local = np.asfortranarray(Z[local])
+                                        annot_local = np.asarray(annot_blk[local], dtype=self.dtype)
+                                        self._accumulate_sketch_block(
+                                            global_x, x_local, z_local, annot_local,
+                                            mirror_chunk=block_sources[:, :kt],
+                                        )
+                                        self._accumulate_sketch_block(
+                                            global_w, w_local, z_local, annot_local,
+                                            mirror_chunk=block_sources[:, kt:2 * kt],
+                                        )
+                                        del block_sources, x_local, w_local, z_local, annot_local
+                                        block_sources = None
+                                del G, X, W, annot_blk
+                            del Z
                             bar.update(1)
                         if block_store is not None:
                             block_store.flush()
+                        if self.native_backend == "direct":
+                            global_panel, leakage = self._native_prepare_projected_sources(
+                                sources[:, :2 * kt]
+                            )
+                            max_native_source_leakage = max(
+                                max_native_source_leakage, leakage
+                            )
+                            del global_x, global_w, sources
+                            global_x = global_w = sources = None
 
                         # Combined target pass.  The source matrix is laid out
                         # [global X, global W, block X, block W], so one X GEMM
                         # and one W GEMM yield all global and within directions.
                         loaded_block_id = None
                         for s, e in blocks:
-                            G = self._read_genotype_block(s, e)
-                            X = self._prepare_additive_block(s, e, G=G, apply_scale=True, out_dtype=self.dtype)
-                            W = self._prepare_interaction_block(s, e, G=G, apply_scale=True, out_dtype=self.dtype)
-                            if block_store is None:
-                                work_x = np.asarray(X.T @ sources, dtype=np.float64)
+                            if self.native_backend == "direct" and block_store is None:
+                                work_x, work_w = self._native_target_block(
+                                    s, e, global_panel
+                                )
                                 self._accumulate_left_scores(work_x[:, :kt], accum["xx"], s, e, Vt)
                                 self._accumulate_left_scores(work_x[:, kt:2 * kt], accum["xw"], s, e, Vt)
-                                del work_x
-                                work_w = np.asarray(W.T @ sources, dtype=np.float64)
                                 self._accumulate_left_scores(work_w[:, :kt], accum["wx"], s, e, Vt)
                                 self._accumulate_left_scores(work_w[:, kt:2 * kt], accum["ww"], s, e, Vt)
-                                del work_w
-                            else:
+                                del work_x, work_w
+                            elif self.native_backend == "direct":
                                 local_ids = np.asarray(self.jackknife_ids[s:e], dtype=np.int32)
-                                for block_id in np.unique(local_ids):
-                                    block_id = int(block_id)
-                                    local = np.flatnonzero(local_ids == block_id)
+                                boundaries = np.r_[
+                                    0,
+                                    np.flatnonzero(local_ids[1:] != local_ids[:-1]) + 1,
+                                    local_ids.size,
+                                ]
+                                for run_index in range(boundaries.size - 1):
+                                    local_start = int(boundaries[run_index])
+                                    local_end = int(boundaries[run_index + 1])
+                                    block_id = int(local_ids[local_start])
                                     if loaded_block_id != block_id:
-                                        block_sources = block_store[block_id].reshape(2 * kt, self.nsamp).T
-                                        np.copyto(sources[:, 2 * kt:4 * kt], block_sources)
+                                        block_sources = block_store.view(block_id)
+                                        block_panel, leakage = (
+                                            self._native_prepare_projected_sources(block_sources)
+                                        )
+                                        max_native_source_leakage = max(
+                                            max_native_source_leakage, leakage
+                                        )
                                         del block_sources
                                         block_sources = None
+                                        block_store.unmap()
                                         loaded_block_id = block_id
-                                    rows = s + local
+                                    run_start = s + local_start
+                                    run_end = s + local_end
+                                    rows = np.arange(run_start, run_end, dtype=np.int64)
                                     annot_left = np.asarray(self.annot[rows], dtype=np.float64)
-                                    x_local = np.asfortranarray(X[:, local])
-                                    w_local = np.asfortranarray(W[:, local])
-
-                                    work_x = np.asarray(x_local.T @ sources, dtype=np.float64)
+                                    work_x, work_w = self._native_target_block(
+                                        run_start, run_end, global_panel, block_panel
+                                    )
                                     self._accumulate_left_scores_rows(work_x[:, :kt], accum["xx"], rows, Vt)
                                     self._accumulate_left_scores_rows(work_x[:, kt:2 * kt], accum["xw"], rows, Vt)
                                     self._accumulate_annotation_pair_sums(
@@ -2935,9 +3943,6 @@ class GenomewideEnvLDScore:
                                         work_x[:, 3 * kt:4 * kt], annot_left,
                                         within_jackknife["xw"][block_id], Vt,
                                     )
-                                    del work_x
-
-                                    work_w = np.asarray(w_local.T @ sources, dtype=np.float64)
                                     self._accumulate_left_scores_rows(work_w[:, :kt], accum["wx"], rows, Vt)
                                     self._accumulate_left_scores_rows(work_w[:, kt:2 * kt], accum["ww"], rows, Vt)
                                     self._accumulate_annotation_pair_sums(
@@ -2948,30 +3953,77 @@ class GenomewideEnvLDScore:
                                         work_w[:, 3 * kt:4 * kt], annot_left,
                                         within_jackknife["ww"][block_id], Vt,
                                     )
-                                    del work_w, annot_left, x_local, w_local
-                            del G, X, W
+                                    del work_x, work_w, annot_left, rows
+                            else:
+                                G = self._read_genotype_block(s, e)
+                                X = self._prepare_additive_block(s, e, G=G, apply_scale=True, out_dtype=self.dtype)
+                                W = self._prepare_interaction_block(s, e, G=G, apply_scale=True, out_dtype=self.dtype)
+                                if block_store is None:
+                                    work_x = np.asarray(X.T @ sources, dtype=np.float64)
+                                    self._accumulate_left_scores(work_x[:, :kt], accum["xx"], s, e, Vt)
+                                    self._accumulate_left_scores(work_x[:, kt:2 * kt], accum["xw"], s, e, Vt)
+                                    del work_x
+                                    work_w = np.asarray(W.T @ sources, dtype=np.float64)
+                                    self._accumulate_left_scores(work_w[:, :kt], accum["wx"], s, e, Vt)
+                                    self._accumulate_left_scores(work_w[:, kt:2 * kt], accum["ww"], s, e, Vt)
+                                    del work_w
+                                else:
+                                    local_ids = np.asarray(self.jackknife_ids[s:e], dtype=np.int32)
+                                    for block_id in np.unique(local_ids):
+                                        block_id = int(block_id)
+                                        local = np.flatnonzero(local_ids == block_id)
+                                        if loaded_block_id != block_id:
+                                            block_sources = block_store.view(block_id)
+                                            np.copyto(sources[:, 2 * kt:4 * kt], block_sources)
+                                            del block_sources
+                                            block_sources = None
+                                            loaded_block_id = block_id
+                                        rows = s + local
+                                        annot_left = np.asarray(self.annot[rows], dtype=np.float64)
+                                        x_local = np.asfortranarray(X[:, local])
+                                        w_local = np.asfortranarray(W[:, local])
+                                        work_x = np.asarray(x_local.T @ sources, dtype=np.float64)
+                                        self._accumulate_left_scores_rows(work_x[:, :kt], accum["xx"], rows, Vt)
+                                        self._accumulate_left_scores_rows(work_x[:, kt:2 * kt], accum["xw"], rows, Vt)
+                                        self._accumulate_annotation_pair_sums(work_x[:, 2 * kt:3 * kt], annot_left, within_jackknife["xx"][block_id], Vt)
+                                        self._accumulate_annotation_pair_sums(work_x[:, 3 * kt:4 * kt], annot_left, within_jackknife["xw"][block_id], Vt)
+                                        del work_x
+                                        work_w = np.asarray(w_local.T @ sources, dtype=np.float64)
+                                        self._accumulate_left_scores_rows(work_w[:, :kt], accum["wx"], rows, Vt)
+                                        self._accumulate_left_scores_rows(work_w[:, kt:2 * kt], accum["ww"], rows, Vt)
+                                        self._accumulate_annotation_pair_sums(work_w[:, 2 * kt:3 * kt], annot_left, within_jackknife["wx"][block_id], Vt)
+                                        self._accumulate_annotation_pair_sums(work_w[:, 3 * kt:4 * kt], annot_left, within_jackknife["ww"][block_id], Vt)
+                                        del work_w, annot_left, x_local, w_local
+                                del G, X, W
                             bar.update(1)
                     finally:
                         if block_sources is not None:
                             del block_sources
+                        block_panel = None
+                        global_panel = None
                         if block_store is not None:
                             try:
-                                block_store.flush()
+                                block_store.close()
                             except Exception:
                                 pass
-                            mmap_handle = getattr(block_store, "_mmap", None)
                             del block_store
-                            if mmap_handle is not None:
-                                mmap_handle.close()
-                        if scratch_path is not None:
-                            scratch_path.unlink(missing_ok=True)
-                        del global_x, global_w, sources
+                        if global_x is not None:
+                            del global_x
+                        if global_w is not None:
+                            del global_w
+                        if sources is not None:
+                            del sources
                         gc.collect()
         finally:
             try:
                 bar.close()
             except Exception:
                 pass
+
+        if self.native_backend == "direct":
+            self.resource_estimates["max_native_source_projection_leakage"] = float(
+                max_native_source_leakage
+            )
 
         scores = {name: value / float(self.nvecs) for name, value in accum.items()}
         if within_jackknife is not None:

@@ -82,6 +82,11 @@ def test_schema_v2_cache_seals_exact_nxe_sufficient_statistics(tmp_path):
     metadata, arrays = _read_cache(cache)
 
     assert metadata["schema_version"] == 2
+    backend = metadata["backend_provenance"]
+    assert backend["artifact_stage"] == "feature_construction"
+    assert backend["backend_name"] == "python_numpy"
+    assert backend["actual_global_2b_source_columns"] == 0
+    assert backend["actual_jackknife_4b_source_columns"] == 0
     assert metadata["environment_transform"]["analysis_mean"] == (
         math.fsum(float(value) for value in builder.env) / builder.env.size
     )
@@ -106,6 +111,17 @@ def test_schema_v2_cache_seals_exact_nxe_sufficient_statistics(tmp_path):
         arrays["nxe_trace_terms"],
         [d.sum(), np.dot(d, d), np.sum((d[:, None] * q_full) ** 2)],
     )
+
+
+def test_feature_cache_backend_provenance_is_semantically_validated(tmp_path):
+    builder = _make_builder(tmp_path, "backend-provenance")
+    cache = tmp_path / "backend-provenance.gxe.cache.npz"
+    builder.write_feature_cache(cache)
+    metadata, arrays = _read_cache(cache)
+    metadata["backend_provenance"]["actual_global_2b_source_columns"] = 1
+    _reseal_cache(cache, metadata, arrays)
+    with pytest.raises(ValueError, match="inconsistent target width"):
+        _validate_feature_cache_semantics(metadata, arrays)
 
 
 def test_cache_identity_tolerates_only_environment_reduction_roundoff(tmp_path):

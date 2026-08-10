@@ -7,6 +7,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <list>
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -46,18 +47,51 @@ static inline int64_t count_lines_plain(const std::string &path) {
     return n;
 }
 
+#if defined(__linux__)
+static std::string file_identity_from_stat(const std::string& path,
+                                           const struct stat& observed) {
+    return path
+        + "#dev=" + std::to_string((unsigned long long)observed.st_dev)
+        + ":ino=" + std::to_string((unsigned long long)observed.st_ino)
+        + ":size=" + std::to_string((unsigned long long)observed.st_size)
+        + ":mtime=" + std::to_string((long long)observed.st_mtim.tv_sec)
+        + "." + std::to_string((long long)observed.st_mtim.tv_nsec)
+        + ":ctime=" + std::to_string((long long)observed.st_ctim.tv_sec)
+        + "." + std::to_string((long long)observed.st_ctim.tv_nsec);
+}
+#endif
+
+static std::string file_identity_cache_key(const std::string& path) {
+#if defined(__linux__)
+    struct stat observed{};
+    if (::stat(path.c_str(), &observed) != 0) {
+        throw std::runtime_error("Failed to stat input path: " + path);
+    }
+    return file_identity_from_stat(path, observed);
+#else
+    return path;
+#endif
+}
+
 int64_t count_lines_cached(const std::string &path) {
     static std::mutex m;
     static std::unordered_map<std::string, int64_t> cache;
+    const std::string key = file_identity_cache_key(path);
     {
         std::lock_guard<std::mutex> lk(m);
-        auto it = cache.find(path);
+        auto it = cache.find(key);
         if (it != cache.end()) return it->second;
     }
     int64_t n = count_lines_plain(path);
+    if (file_identity_cache_key(path) != key) {
+        throw std::runtime_error("Input file changed while counting rows: " + path);
+    }
     {
         std::lock_guard<std::mutex> lk(m);
-        cache[path] = n;
+        if (cache.size() >= 128 && cache.find(key) == cache.end()) {
+            cache.clear();
+        }
+        cache[key] = n;
     }
     return n;
 }
@@ -178,11 +212,11 @@ int64_t compute_mailman_table_size(int segment_size) {
 }
 
 struct RowDecodePlan {
-    const int* rows_ptr = nullptr;
     int N = -1;
     int N_total = -1;
     bool full_range = false;
     bool use_sparse = false;
+    std::vector<int> rows_snapshot;
     std::vector<uint32_t> row_byte;
     std::vector<uint8_t> row_shift;
 };
@@ -193,14 +227,13 @@ static const RowDecodePlan& get_row_decode_plan(const std::vector<int>& rows,
     static thread_local RowDecodePlan P;
 
     const int N = (int)rows.size();
-    const int* rows_ptr = rows.empty() ? nullptr : rows.data();
-    if (P.rows_ptr == rows_ptr && P.N == N && P.N_total == N_total) {
+    if (P.N == N && P.N_total == N_total && P.rows_snapshot == rows) {
         return P;
     }
 
-    P.rows_ptr = rows_ptr;
     P.N = N;
     P.N_total = N_total;
+    P.rows_snapshot = rows;
     P.row_byte.clear();
     P.row_shift.clear();
 
@@ -247,6 +280,27 @@ struct BedMapping {
     }
 };
 
+constexpr std::size_t kBedMappingCacheCapacity = 8;
+
+struct BedMappingCacheEntry {
+    std::shared_ptr<BedMapping> mapping;
+    std::list<std::string>::iterator lru_position;
+};
+
+struct BedMappingCacheState {
+    std::mutex mutex;
+    std::unordered_map<std::string, BedMappingCacheEntry> entries;
+    std::list<std::string> lru;
+    uint64_t hits = 0;
+    uint64_t misses = 0;
+    uint64_t evictions = 0;
+};
+
+static BedMappingCacheState& bed_mapping_cache_state() {
+    static BedMappingCacheState state;
+    return state;
+}
+
 // Align range to pages and madvise WILLNEED.
 static inline void madvise_willneed_range(unsigned char* base, size_t file_size,
                                          size_t off, size_t len) {
@@ -270,17 +324,22 @@ static inline void madvise_willneed_range(unsigned char* base, size_t file_size,
 }
 
 static std::shared_ptr<BedMapping> get_bed_mapping_cached(const std::string& bed_path) {
-    static std::mutex m;
-    static std::unordered_map<std::string, std::shared_ptr<BedMapping>> cache;
+    BedMappingCacheState& cache = bed_mapping_cache_state();
+    const std::string key = file_identity_cache_key(bed_path);
 
     {
-        std::lock_guard<std::mutex> lk(m);
-        auto it = cache.find(bed_path);
-        if (it != cache.end() && it->second) return it->second;
+        std::lock_guard<std::mutex> lock(cache.mutex);
+        auto found = cache.entries.find(key);
+        if (found != cache.entries.end()) {
+            cache.lru.splice(cache.lru.begin(), cache.lru, found->second.lru_position);
+            ++cache.hits;
+            return found->second.mapping;
+        }
+        ++cache.misses;
     }
 
     auto mm = std::make_shared<BedMapping>();
-    mm->fd = ::open(bed_path.c_str(), O_RDONLY);
+    mm->fd = ::open(bed_path.c_str(), O_RDONLY | O_CLOEXEC);
     if (mm->fd < 0) throw std::runtime_error("Failed to open bed: " + bed_path);
 
     struct stat st{};
@@ -288,8 +347,11 @@ static std::shared_ptr<BedMapping> get_bed_mapping_cached(const std::string& bed
         throw std::runtime_error("stat failed or BED too small: " + bed_path);
     }
     mm->size = (size_t)st.st_size;
+    if (file_identity_from_stat(bed_path, st) != key) {
+        throw std::runtime_error("BED input changed while opening: " + bed_path);
+    }
 
-    mm->base = (unsigned char*)::mmap(nullptr, mm->size, PROT_READ, MAP_SHARED, mm->fd, 0);
+    mm->base = (unsigned char*)::mmap(nullptr, mm->size, PROT_READ, MAP_PRIVATE, mm->fd, 0);
     if (mm->base == MAP_FAILED) {
         mm->base = nullptr;
         throw std::runtime_error("mmap failed for: " + bed_path);
@@ -305,14 +367,49 @@ static std::shared_ptr<BedMapping> get_bed_mapping_cached(const std::string& bed
     (void)::madvise(mm->base, mm->size, MADV_SEQUENTIAL);
 
     {
-        std::lock_guard<std::mutex> lk(m);
-        auto it = cache.find(bed_path);
-        if (it != cache.end() && it->second) return it->second;
-        cache[bed_path] = mm;
+        std::lock_guard<std::mutex> lock(cache.mutex);
+        auto found = cache.entries.find(key);
+        if (found != cache.entries.end()) {
+            cache.lru.splice(cache.lru.begin(), cache.lru, found->second.lru_position);
+            return found->second.mapping;
+        }
+        while (cache.entries.size() >= kBedMappingCacheCapacity) {
+            const std::string stale_key = cache.lru.back();
+            cache.lru.pop_back();
+            cache.entries.erase(stale_key);
+            ++cache.evictions;
+        }
+        cache.lru.push_front(key);
+        cache.entries.emplace(key, BedMappingCacheEntry{mm, cache.lru.begin()});
     }
     return mm;
 }
 #endif // __linux__
+
+BedMappingCacheInfo bed_mapping_cache_info() {
+#if defined(__linux__)
+    BedMappingCacheState& cache = bed_mapping_cache_state();
+    std::lock_guard<std::mutex> lock(cache.mutex);
+    return BedMappingCacheInfo{
+        cache.entries.size(), kBedMappingCacheCapacity,
+        cache.hits, cache.misses, cache.evictions,
+    };
+#else
+    return BedMappingCacheInfo{};
+#endif
+}
+
+void clear_bed_mapping_cache() {
+#if defined(__linux__)
+    BedMappingCacheState& cache = bed_mapping_cache_state();
+    std::lock_guard<std::mutex> lock(cache.mutex);
+    cache.entries.clear();
+    cache.lru.clear();
+    cache.hits = 0;
+    cache.misses = 0;
+    cache.evictions = 0;
+#endif
+}
 
 void prefetch_bed_block(const std::string& bed_path,
                         const std::string& fam_path,

@@ -51,6 +51,13 @@ def _set_thread_env_vars(num_threads):
     os.environ["MKL_DYNAMIC"] = "FALSE"
 
 
+def _parse_mailman_mode(value):
+    text = str(value).strip().lower()
+    if text == "auto":
+        return "auto"
+    return str2bool(text)
+
+
 _PREPARSED_NUM_THREADS = _preparse_num_threads_from_argv(sys.argv[1:])
 if _PREPARSED_NUM_THREADS is not None:
     _set_thread_env_vars(_PREPARSED_NUM_THREADS)
@@ -71,6 +78,10 @@ _GXE_BATCH_REFERENCE_OPTIONS = frozenset(
         "--gxe-missing-values",
         "--gxe-kernel-mode",
         "--gxe-genotype-scale",
+        "--gxe-native-backend",
+        "--gxe-native-workspace-gib",
+        "--gxe-native-target-panel-columns",
+        "--gxe-jackknife-scratch-gib",
         "--write-gxe-jackknife",
         "--allow-low-probe-gxe-jackknife",
         "--njack",
@@ -470,6 +481,23 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--gxe-genotype-scale", default=None, choices=["hwe", "sample"],
                         help=("Pre-projection genotype scaling. Defaults to sample scaling for standardized "
                               "SUMMIT kernels and HWE scaling for GENIE compatibility."))
+    parser.add_argument(
+        "--gxe-native-backend", default="python", choices=["python", "direct"],
+        help=("Opt-in direct C++ BED algebra for missing-free, phenotype-free, "
+              "K=1 standardized/sample GxE references. Python remains the default oracle."),
+    )
+    parser.add_argument(
+        "--gxe-native-workspace-gib", default=16.0, type=float,
+        help="Hard allocation ceiling in GiB for each direct native GxE call.",
+    )
+    parser.add_argument(
+        "--gxe-native-target-panel-columns", default=64, type=int,
+        help="Column panel width used by the direct native GxE target products.",
+    )
+    parser.add_argument(
+        "--gxe-jackknife-scratch-gib", default=64.0, type=float,
+        help="Hard total-disk ceiling in GiB for each exact GxE jackknife probe tile.",
+    )
     parser.add_argument("--write-gxe-jackknife", action="store_true", default=False,
                         help="Write compact within-block traces for exact two-sided GENIE SNP-deletion SEs; uses --njack blocks.")
     parser.add_argument("--allow-low-probe-gxe-jackknife", action="store_true", default=False,
@@ -491,18 +519,27 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--write-kmoments", action="store_true",
                         help="Write .gw.kmoments for unpartitioned genome-wide LD-score estimation.")
     parser.add_argument("--skip-kmoments", action="store_true", help=argparse.SUPPRESS)
-    parser.add_argument("--use-mailman", default=False, type=str2bool,
-                        help="Enable mailman in LD-score estimation.")
+    parser.add_argument(
+        "--use-mailman", default="auto", type=_parse_mailman_mode,
+        help=(
+            "Mailman mode: auto uses it for <=10 probes when HWE imputation "
+            "makes the existing implementation exact; true/false force the choice."
+        ),
+    )
     parser.add_argument("--impute-method", default='mean', type=str, choices=['mean', 'hwe'],
                         help="Method for imputing missing genotype.")
 
     # Resource / performance knobs
     parser.add_argument("--num-threads", default=None, type=int,
                         help="Cap BLAS / compute threads.")
-    parser.add_argument("--target-xz-mem", type=float, default=16.0,
-                        help="Memory budget (GB) for Phase-1 Xz panel.")
-    parser.add_argument("--target-mem", type=float, default=None,
-                        help="Overall memory budget (GB) for LD-score estimation.")
+    parser.add_argument(
+        "--target-xz-mem", type=utils.parse_memory_budget, default="auto",
+        help="Memory budget in GiB for sketch panels, or 'auto' (default).",
+    )
+    parser.add_argument(
+        "--target-mem", type=utils.parse_memory_budget, default=None,
+        help="Alias overriding --target-xz-mem with a GiB value or 'auto'.",
+    )
     parser.add_argument("--device", type=str, default="cpu",
                         help="Device for GWLD computation.")
     parser.add_argument("--use-tp32", action="store_true", default=False,
@@ -676,6 +713,10 @@ def _make_gxe_generator(args, log, verbose_on, low_level):
         probe_offset=args.gxe_probe_offset,
         feature_cache_path=args.gxe_feature_cache,
         shard_mode=args.gxe_reference_shard,
+        native_backend=args.gxe_native_backend,
+        native_workspace_gib=args.gxe_native_workspace_gib,
+        native_target_panel_columns=args.gxe_native_target_panel_columns,
+        jackknife_scratch_gib=args.gxe_jackknife_scratch_gib,
     )
 
 

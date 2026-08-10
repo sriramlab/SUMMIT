@@ -16,9 +16,11 @@ import pandas as pd
 from .gwe_ldscore import (
     _FEATURE_CACHE_ARRAY_DTYPES,
     _FEATURE_CACHE_SCHEMA_VERSION,
+    _BACKEND_PROVENANCE_SCHEMA_VERSION,
     _ndarray_sha256,
     _validate_gxe_annotation_names,
     _validate_feature_cache_semantics,
+    _validate_backend_provenance,
 )
 
 
@@ -286,6 +288,16 @@ def _merge_reference_shards_impl(
         cache_decl = shard.get("feature_cache")
         if not isinstance(cache_decl, dict) or cache_decl.get("sha256") != cache_hash:
             raise ValueError(f"Shard was generated from a different feature cache: {manifest_path}.")
+        backend_provenance = shard.get("backend_provenance")
+        _validate_backend_provenance(
+            backend_provenance, expected_stage="reference_shard"
+        )
+        feature_backend_provenance = shard.get("feature_backend_provenance")
+        cache_backend_provenance = metadata.get("backend_provenance")
+        if feature_backend_provenance != cache_backend_provenance:
+            raise ValueError(
+                f"Shard feature-backend provenance differs from its cache: {manifest_path}."
+            )
         config = {key: shard.get(key) for key in common_keys}
         randomization = shard.get("randomization")
         if not isinstance(randomization, dict):
@@ -339,6 +351,14 @@ def _merge_reference_shards_impl(
             raise ValueError(f"Shard identity configuration disagrees with its manifest: {manifest_path}.")
         if identity.get("feature_cache_sha256") != cache_hash:
             raise ValueError(f"Shard identity names a different feature cache: {manifest_path}.")
+        if (
+            identity.get("backend_provenance") != backend_provenance
+            or identity.get("feature_backend_provenance")
+            != feature_backend_provenance
+        ):
+            raise ValueError(
+                f"Shard identity backend provenance disagrees with its manifest: {manifest_path}."
+            )
         expected_identity_randomization = {
             key: randomization.get(key) for key in identity_random_keys
         }
@@ -354,6 +374,7 @@ def _merge_reference_shards_impl(
                 "manifest": shard,
                 "manifest_sha256": manifest_hash,
                 "count": count,
+                "backend_provenance": dict(backend_provenance),
             }
         )
 
@@ -631,6 +652,40 @@ def _merge_reference_shards_impl(
                     ]
                 },
             }
+            source_backends = [record["backend_provenance"] for record in loaded]
+            max_global_width = max(
+                int(value["actual_global_2b_source_columns"])
+                for value in source_backends
+            )
+            max_jackknife_width = max(
+                int(value["actual_jackknife_4b_source_columns"])
+                for value in source_backends
+            )
+            merged_backend = {
+                "schema_version": _BACKEND_PROVENANCE_SCHEMA_VERSION,
+                "artifact_stage": "reference",
+                "backend_name": "summit_shard_merge",
+                "backend_version": "gxe_merge_v1",
+                "source_commit": "unknown",
+                "source_tree_sha256": None,
+                "native_binary_sha256": None,
+                "compile_options": None,
+                "native_workspace_cap_bytes": 0,
+                "configured_target_panel_columns": 0,
+                "actual_global_2b_source_columns": max_global_width,
+                "actual_jackknife_4b_source_columns": max_jackknife_width,
+                "actual_target_source_columns": (
+                    max_jackknife_width or max_global_width
+                ),
+            }
+            _validate_backend_provenance(
+                merged_backend, expected_stage="reference"
+            )
+            payload["backend_provenance"] = merged_backend
+            payload["feature_backend_provenance"] = metadata.get(
+                "backend_provenance"
+            )
+            payload["shard_backend_provenance"] = source_backends
             if within is not None:
                 payload["jackknife"] = {
                     "method": "two_sided_snp_kernel_deletion",

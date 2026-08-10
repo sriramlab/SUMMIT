@@ -221,6 +221,41 @@ def apply_env(cfg: dict) -> int:
     return actual
 
 
+def _resolve_mailman_selection(use_mailman, *, nvecs: int, impute_method: str):
+    if isinstance(use_mailman, str):
+        requested = use_mailman.strip().lower()
+        if requested == "auto":
+            mode = "auto"
+            selected = int(nvecs) <= 10
+        elif requested in {"true", "1", "yes", "y", "on"}:
+            mode = "explicit"
+            selected = True
+        elif requested in {"false", "0", "no", "n", "off"}:
+            mode = "explicit"
+            selected = False
+        else:
+            raise ValueError("use_mailman must be true, false, or 'auto'.")
+    else:
+        mode = "explicit"
+        selected = bool(use_mailman)
+    if str(impute_method).strip().lower() != "hwe":
+        selected = False
+    return selected, mode
+
+
+def _bounded_vtile_sizes(nvecs: int, vmax: int, granularity: int = 64) -> list[int]:
+    """Partition probes without allowing alignment to exceed the memory ceiling."""
+    nvecs = int(nvecs)
+    vmax = int(vmax)
+    granularity = int(granularity)
+    if nvecs <= 0 or vmax <= 0 or granularity <= 0:
+        raise ValueError("nvecs, vmax, and granularity must be positive integers.")
+    width = min(nvecs, vmax)
+    if width >= granularity:
+        width = max(granularity, (width // granularity) * granularity)
+    return [min(width, nvecs - start) for start in range(0, nvecs, width)]
+
+
 def _set_openmp_threads_runtime(n: int) -> None:
     n = max(1, int(n))
     os.environ["OMP_NUM_THREADS"] = str(n)
@@ -570,14 +605,14 @@ class GenomewideLDScore:
                 eps_var: float = 1e-10,
                 rand_samp=None,
                 ddof=1,
-                target_xz_mem=16.0,
+                target_xz_mem="auto",
                 target_mem=None,
                 device='cpu',
                 use_tp32=False,
                 correct_skew: bool = False,
                 write_kmoments: bool = False,
                 skip_kmoments=None,
-                use_mailman: bool = True,
+                use_mailman: bool | str = "auto",
                 impute_method: str = 'mean'):
 
         self.eps_var = float(eps_var)
@@ -596,7 +631,14 @@ class GenomewideLDScore:
         self.rand_dist = rand_dist
         self.ddof = int(ddof)
         self.target_mem = target_mem
-        self.target_xz_mem = target_xz_mem if target_mem is None else target_mem
+        requested_memory = target_xz_mem if target_mem is None else target_mem
+        self.target_xz_mem, self.memory_budget = utils.resolve_memory_budget_gib(
+            requested_memory
+        )
+        self.log._log(
+            f"[memory] sketch budget={self.target_xz_mem:.3f} GiB "
+            f"(mode={self.memory_budget['mode']})."
+        )
 
         self._mu22_precomputed = None
 
@@ -620,11 +662,19 @@ class GenomewideLDScore:
         self.impute_method = str(impute_method).strip().lower()
         if self.impute_method not in ("hwe", "mean"):
             raise ValueError("impute_method must be 'hwe' or 'mean'.")
-        self.use_mailman = bool(use_mailman)
+        self.use_mailman, self.mailman_mode = _resolve_mailman_selection(
+            use_mailman, nvecs=self.nvecs, impute_method=self.impute_method
+        )
         self.impute_seed = int((np.uint64(self.root_seed) ^ np.uint64(0xA24BAED4963EE407)) & np.uint64(0xFFFFFFFFFFFFFFFF))
         if self.impute_method != "hwe" and self.use_mailman:
-            self.log._log("[mailman] Disabled because Mailman requires discrete HWE-imputed hard calls.")
-            self.use_mailman = False
+            self.log._log(
+                "[mailman] Disabled because the existing Mailman implementation "
+                "requires discrete HWE-imputed hard calls."
+            )
+        self.log._log(
+            f"[mailman] mode={self.mailman_mode}, probes={self.nvecs}, "
+            f"selected={'on' if self.use_mailman else 'off'}."
+        )
         self.log._log(f"[impute] method={self.impute_method} (seed={self.impute_seed})")
 
         rng = np.random.default_rng(self.root_seed)
@@ -963,17 +1013,12 @@ class GenomewideLDScore:
         itemsize = np.dtype(self.dtype).itemsize
         denom = max(1, int(self.nsamp) * int(self.nbins) * itemsize)
         vtile_guess = int((target_gib * (1024**3)) // denom)
-        vtile_guess = max(256, min(self.nvecs, vtile_guess))
-        if vtile_guess <= 0:
-            vtile_guess = min(self.nvecs, 4096)
-
-        ntiles = int(np.ceil(self.nvecs / vtile_guess))
-        ntiles = max(1, ntiles)
-        base = (self.nvecs // ntiles)
-        rem  = (self.nvecs % ntiles)
-        vtiles = [((base + (1 if i < rem else 0) + 63) // 64) * 64 for i in range(ntiles)]
-        vtiles[-1] = self.nvecs - sum(vtiles[:-1])
-        vtiles = [v for v in vtiles if v > 0]
+        if vtile_guess < 1:
+            raise RuntimeError(
+                "The configured sketch-memory limit cannot hold one probe: "
+                f"required={denom} bytes, limit={int(target_gib * (1024**3))} bytes."
+            )
+        vtiles = _bounded_vtile_sizes(self.nvecs, vtile_guess)
         assert sum(vtiles) == self.nvecs
 
         if len(vtiles) == 1:

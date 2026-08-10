@@ -151,7 +151,7 @@ summit \
 ```
 
 Randomized traces can then be divided across disjoint probe identities. The
-recommended B100 production layout uses two B50 jobs with offsets `0` and `50`;
+recommended low-Monte-Carlo-noise layout uses eight B128 jobs covering B1024;
 the probe-indexed RNG makes this equivalent to another tiling within declared
 floating-point tolerance:
 
@@ -161,7 +161,7 @@ summit \
   --annot mafld.annot.gz \
   --gxe-feature-cache outs/design.gxe.cache.npz \
   --gxe-reference-shard --gxe-probe-offset 0 \
-  --nvecs 50 --seed 20260808 --rand-dist rademacher \
+  --nvecs 128 --seed 20260808 --rand-dist rademacher \
   --dtype float32 --step_size 500 \
   --gxe-kernel-mode standardized --gxe-genotype-scale sample \
   --write-gxe-jackknife --njack 100 \
@@ -175,10 +175,10 @@ genotype pass:
 summit \
   --gxe-merge-shards outs/shard.*.gxe.shard.json \
   --gxe-feature-cache outs/design.gxe.cache.npz \
-  --out outs/reference.B100
+  --out outs/reference.B1024
 
 summit \
-  --gxe-score-reference outs/reference.B100.gxe.ref.json \
+  --gxe-score-reference outs/reference.B1024.gxe.ref.json \
   --geno ref_panel --env environment.txt --covar covariates.txt \
   --gxe-pheno phenotypes.txt --gxe-pheno-cols trait1,trait2 \
   --out outs/scores
@@ -437,9 +437,21 @@ Exactly one of these modes must be specified.
   sample count.
 - `--rand-dist`: `spherical`, `normal`/`gaussian`, or `rademacher`.
 - `--dtype`: `float32` or `float64`.
+- `--gxe-native-backend direct`: opt into the Linux C++ direct BED backend for
+  phenotype-free, one-annotation, `float32` or `float64`, standardized/sample-scaled GxE
+  references. It uses the same Philox probes and exact projected-feature
+  algebra as the Python oracle and seals the loaded native binary and source
+  snapshot in every artifact.
+- `--use-mailman auto` (default): for ordinary additive LD scores, use the
+  existing Mailman implementation only at `B<=10` and only with HWE
+  imputation. The existing Mailman kernel is not used for GxE because it does
+  not implement the required interaction-before-projection algebra.
 - `--device`: `cpu` or `cuda[:index]` for supported genome-wide LD-score runs.
 - `--num-threads`: cap BLAS/OpenMP thread pools.
-- `--target-xz-mem`, `--target-mem`: memory budgets in GB.
+- `--target-xz-mem`, `--target-mem`: sketch-panel budgets in GiB or `auto`
+  (default). Auto uses the tightest observable memory limit and retains both a
+  fixed reserve and a proportional margin; cluster workflows should keep an
+  explicit budget when the scheduler allocation is not visible to the process.
 
 ## Output Files
 

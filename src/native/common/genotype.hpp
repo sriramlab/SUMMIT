@@ -12,6 +12,17 @@ void prefetch_bed_block(const std::string& bed_path,
 
 int64_t count_lines_cached(const std::string& path);
 
+struct BedMappingCacheInfo {
+    std::size_t entries = 0;
+    std::size_t capacity = 0;
+    uint64_t hits = 0;
+    uint64_t misses = 0;
+    uint64_t evictions = 0;
+};
+
+BedMappingCacheInfo bed_mapping_cache_info();
+void clear_bed_mapping_cache();
+
 enum class ImputeMode : int {
     Mean = 0,
     Hwe  = 1,

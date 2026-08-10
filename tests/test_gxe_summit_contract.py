@@ -213,7 +213,25 @@ def test_library_default_is_summit_post_projection_standardized():
 def test_cli_default_is_summit_post_projection_standardized():
     from summit.cli import build_parser
 
-    assert build_parser().parse_args([]).gxe_kernel_mode == "standardized"
+    defaults = build_parser().parse_args([])
+    assert defaults.gxe_kernel_mode == "standardized"
+    assert defaults.gxe_native_backend == "python"
+    assert defaults.gxe_native_workspace_gib == 16.0
+    assert defaults.gxe_native_target_panel_columns == 64
+    assert defaults.gxe_jackknife_scratch_gib == 64.0
+
+    explicit = build_parser().parse_args(
+        [
+            "--gxe-native-backend", "direct",
+            "--gxe-native-workspace-gib", "2.5",
+            "--gxe-native-target-panel-columns", "32",
+            "--gxe-jackknife-scratch-gib", "8",
+        ]
+    )
+    assert explicit.gxe_native_backend == "direct"
+    assert explicit.gxe_native_workspace_gib == 2.5
+    assert explicit.gxe_native_target_panel_columns == 32
+    assert explicit.gxe_jackknife_scratch_gib == 8.0
 
 
 def test_production_post_projection_norms_and_fixed_effect_leakage(exact_bundle):

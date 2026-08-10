@@ -430,6 +430,17 @@ static void prefetch_bed_block_py(const std::string& bed_prefix,
 #endif
 }
 
+static nb::dict bed_mapping_cache_info_py() {
+    const BedMappingCacheInfo info = bed_mapping_cache_info();
+    nb::dict result;
+    result["entries"] = info.entries;
+    result["capacity"] = info.capacity;
+    result["hits"] = info.hits;
+    result["misses"] = info.misses;
+    result["evictions"] = info.evictions;
+    return result;
+}
+
 static inline uint64_t mix64(uint64_t x) {
     x += 0x9e3779b97f4a7c15ULL;
     x = (x ^ (x >> 30)) * 0xbf58476d1ce4e5b9ULL;
@@ -3298,6 +3309,8 @@ NB_MODULE(gwldcore, m) {
     m.def("get_max_threads", &get_max_threads);
     m.def("prefetch_bed_block", &prefetch_bed_block_py,
           nb::arg("bed_prefix"), nb::arg("fam_path"), nb::arg("blk_start"), nb::arg("blk_end"), nb::arg("ahead_blocks") = 1);
+    m.def("_bed_mapping_cache_info", &bed_mapping_cache_info_py);
+    m.def("_clear_bed_mapping_cache", &clear_bed_mapping_cache);
 
     m.def("phase1_compute_Xz_bed_chunk", &phase1_compute_Xz_bed_chunk_impl<float>,
           nb::arg("bed_prefix"), nb::arg("fam_path"), nb::arg("blk_start"), nb::arg("blk_end"),

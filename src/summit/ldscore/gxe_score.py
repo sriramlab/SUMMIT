@@ -34,6 +34,7 @@ from .gwe_ldscore import (
     _FEATURE_CACHE_ARRAY_DTYPES,
     _canonical_bfile_prefix,
     _validate_feature_cache_semantics,
+    _validate_backend_provenance,
     _validate_gxe_annotation_names,
     _validate_plink_bed_shape,
     read_env_and_cov,
@@ -257,6 +258,18 @@ def _validate_reference_manifest(
     payload, manifest_sha256 = _load_json_and_sha256(path)
     if payload.get("kind") != _REFERENCE_KIND or payload.get("schema_version") != _SCHEMA_VERSION:
         raise ValueError("Reusable phenotype scoring requires a schema-v3 SUMMIT GxE reference.")
+    if payload.get("backend_provenance") is not None:
+        _validate_backend_provenance(
+            payload["backend_provenance"], expected_stage="reference"
+        )
+    shard_backends = payload.get("shard_backend_provenance")
+    if shard_backends is not None:
+        if not isinstance(shard_backends, list) or not shard_backends:
+            raise ValueError("Merged reference has invalid shard backend provenance.")
+        for backend in shard_backends:
+            _validate_backend_provenance(
+                backend, expected_stage="reference_shard"
+            )
 
     kernel_mode = payload.get("kernel_mode")
     genotype_scale = payload.get("genotype_scale")

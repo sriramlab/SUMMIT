@@ -116,6 +116,32 @@ override because Monte Carlo error in the within-block intersections can
 materially distort the delete-block SE. Production analyses should additionally
 check stability across probe counts and independent seeds.
 
+The current low-noise production contract uses B1024 (eight disjoint B128
+shards). B128/B256/B512 prefix merges and the independent second B512 half are
+geometry/convergence checkpoints; only the complete B1024 prefix is the final
+reference. The Monte Carlo standard error scales approximately as
+`1/sqrt(B)`, so B1024 has about one tenth the stochastic error of B10.
+
+### Reference-construction backends
+
+The portable oracle materializes each genotype feature block in Python/NumPy,
+but its large matrix products already execute in native BLAS. On Linux,
+`--gxe-native-backend direct` instead uses a descriptor-owned C++ BED context
+that computes feature diagnostics and source/target products without
+materializing full X/W genotype-design blocks. It is currently restricted to
+phenotype-free, one-annotation, `float32` or `float64`, standardized/sample-scaled
+references whose selected genotype calls are missing-free. Python and C++ use the same Philox probe identities,
+and dense differential tests cover global and exact two-sided jackknife terms.
+Artifacts bind the exact loaded extension inode/bytes, source snapshot,
+compiler options, workspace limits, and actual 2B/4B widths.
+
+SUMMIT's older Mailman implementation is an additive-kernel optimization. It
+uses discrete HWE imputation and does not provide the interaction source and
+W-left products required here, so it is not silently reused for GxE. For
+ordinary additive LD scores, the default `--use-mailman auto` selects it only
+when B<=10 and HWE imputation is explicitly requested; larger B uses the direct
+BLAS path because measured setup/amortization no longer favors Mailman.
+
 ### Reusable and parallel reference construction
 
 `--gxe-build-cache` makes one phenotype-free, owner-only schema-v2 cache containing the

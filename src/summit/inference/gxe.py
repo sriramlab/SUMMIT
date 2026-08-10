@@ -23,6 +23,7 @@ import pandas as pd
 
 from ..ldscore.gwe_ldscore import (
     _FEATURE_CACHE_ARRAY_DTYPES,
+    _validate_backend_provenance,
     _validate_feature_cache_semantics,
     _validate_gxe_annotation_names,
 )
@@ -1143,6 +1144,13 @@ def _validate_reference_feature_cache_contract(
     mismatched = [
         field for field in exact_fields if reference.get(field) != metadata.get(field)
     ]
+    if (
+        reference.get("feature_backend_provenance") is not None
+        or metadata.get("backend_provenance") is not None
+    ) and reference.get("feature_backend_provenance") != metadata.get(
+        "backend_provenance"
+    ):
+        mismatched.append("feature_backend_provenance")
     if list(annotation_names) != metadata.get("annotation_names"):
         mismatched.append("annotation_names")
     if mismatched:
@@ -1364,6 +1372,18 @@ def _fit_from_input_snapshots(
     moments_version = int(moments_version_raw)
     if ref.get("kind") != _REFERENCE_KIND or ref_version not in _SUPPORTED_SCHEMA_VERSIONS:
         raise ValueError(f"Unsupported GxE reference manifest: {ref_path}.")
+    if ref.get("backend_provenance") is not None:
+        _validate_backend_provenance(
+            ref["backend_provenance"], expected_stage="reference"
+        )
+    shard_backends = ref.get("shard_backend_provenance")
+    if shard_backends is not None:
+        if not isinstance(shard_backends, list) or not shard_backends:
+            raise ValueError("Merged GxE reference has invalid shard backend provenance.")
+        for backend in shard_backends:
+            _validate_backend_provenance(
+                backend, expected_stage="reference_shard"
+            )
     if moments.get("kind") != _MOMENTS_KIND or moments_version not in _SUPPORTED_SCHEMA_VERSIONS:
         raise ValueError(f"Unsupported GxE phenotype moments file: {mom_path}.")
     if ref_version != moments_version:
