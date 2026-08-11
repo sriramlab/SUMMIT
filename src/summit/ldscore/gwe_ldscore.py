@@ -20,6 +20,14 @@ from bed_reader import open_bed
 from tqdm import tqdm
 
 from .. import utils
+from .genotype_source import (
+    PgenBlockReader,
+    read_fam_sample_ids,
+    read_psam_sample_ids,
+    read_pvar_variants,
+    resolve_genotype_input,
+    validate_variant_metadata,
+)
 
 
 
@@ -1007,7 +1015,7 @@ def _orthonormalize_columns(X: np.ndarray, tol: float = 1e-10) -> np.ndarray:
 
 def read_env_and_cov(
     env_filename: str,
-    fam_filename: str,
+    fam_filename: str | None,
     cov_filename: str | None = None,
     std: bool = True,
     cov_impute_method: str = "ignore",
@@ -1018,18 +1026,18 @@ def read_env_and_cov(
     pheno_filename: str | None = None,
     pheno_col: str | None = None,
     missing_values: Sequence[str] = ("-9", "NA", "NaN", "nan", ".", "None", "null"),
+    sample_ids: pd.DataFrame | None = None,
 ):
     id_types = {"FID": str, "IID": str}
-    fam = pd.read_csv(
-        fam_filename,
-        sep=r"\s+",
-        header=None,
-        usecols=[0, 1],
-        names=["FID", "IID"],
-        dtype={0: str, 1: str},
-    )
+    if sample_ids is None:
+        if fam_filename is None:
+            raise ValueError("fam_filename or sample_ids must be provided.")
+        fam = read_fam_sample_ids(fam_filename)
+    else:
+        fam = pd.DataFrame(sample_ids)[["FID", "IID"]].copy()
+        fam[["FID", "IID"]] = fam[["FID", "IID"]].astype(str)
     if fam.duplicated(subset=["FID", "IID"]).any():
-        raise ValueError("FAM file contains duplicate FID/IID pairs.")
+        raise ValueError("Genotype sample metadata contain duplicate FID/IID pairs.")
     if sample_idx is not None:
         sample_idx = np.asarray(sample_idx, dtype=int)
         fam = fam.iloc[sample_idx].reset_index(drop=True)
@@ -1327,19 +1335,34 @@ class GenomewideEnvLDScore:
         self.eps_var = float(eps_var)
         if not np.isfinite(self.eps_var) or self.eps_var <= 0.0:
             raise ValueError(f"eps_var must be positive and finite; got {self.eps_var!r}.")
-        prefix = _canonical_bfile_prefix(bed_path)
-        self.bed_prefix = os.path.abspath(prefix)
+        self.genotype_input = resolve_genotype_input(bed_path)
+        self.genotype_format = self.genotype_input.format
+        self.genotype_prefix = self.genotype_input.prefix
+        self.bed_prefix = self.genotype_prefix if self.genotype_format == "bed" else None
         self.env_path = str(env_path)
         self.covar_path = covar_path
+        self._pgen_reader: PgenBlockReader | None = None
         proc_fds = Path("/proc/self/fd")
         if not proc_fds.is_dir():
             raise RuntimeError(
                 "Stable zero-copy GxE genotype input requires Linux /proc/self/fd."
             )
+        if self.genotype_format == "bed":
+            source_paths = {
+                ".bed": self.genotype_input.genotype_path,
+                ".bim": self.genotype_input.variant_path,
+                ".fam": self.genotype_input.sample_path,
+            }
+        else:
+            source_paths = {
+                ".pgen": self.genotype_input.genotype_path,
+                ".pvar": self.genotype_input.variant_path,
+                ".psam": self.genotype_input.sample_path,
+            }
+        self._genotype_extensions = tuple(source_paths)
         genotype_descriptors: dict[str, int] = {}
         try:
-            for extension in (".bed", ".bim", ".fam"):
-                source = self.bed_prefix + extension
+            for extension, source in source_paths.items():
                 flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
                 if hasattr(os, "O_NOFOLLOW"):
                     flags |= os.O_NOFOLLOW
@@ -1364,26 +1387,55 @@ class GenomewideEnvLDScore:
             _close_file_descriptors,
             tuple(genotype_descriptors.values()),
         )
-        self.fam_path = str(self._stable_genotype_paths[".fam"])
-        self.bim_path = str(self._stable_genotype_paths[".bim"])
+        self.fam_path = (
+            str(self._stable_genotype_paths[".fam"])
+            if self.genotype_format == "bed" else None
+        )
+        self.bim_path = (
+            str(self._stable_genotype_paths[".bim"])
+            if self.genotype_format == "bed" else None
+        )
+        self.pgen_path = (
+            str(self._stable_genotype_paths[".pgen"])
+            if self.genotype_format == "pgen" else None
+        )
+        self.pvar_path = (
+            str(self._stable_genotype_paths[".pvar"])
+            if self.genotype_format == "pgen" else None
+        )
+        self.psam_path = (
+            str(self._stable_genotype_paths[".psam"])
+            if self.genotype_format == "pgen" else None
+        )
         self._construction_genotype_state = self._capture_genotype_file_state()
 
-        expected_n, expected_m = _validate_plink_file_paths(
-            self._stable_genotype_paths
-        )
         requested_reader_threads = int(num_threads) if num_threads is not None and int(num_threads) > 0 else None
-        self.G = open_bed(
-            str(self._stable_genotype_paths[".bed"]),
-            fam_filepath=str(self._stable_genotype_paths[".fam"]),
-            bim_filepath=str(self._stable_genotype_paths[".bim"]),
-            num_threads=requested_reader_threads,
-        )
-        self.nsamp_total, self.nsnps = self.G.shape
-        if (self.nsamp_total, self.nsnps) != (expected_n, expected_m):
-            raise RuntimeError(
-                "bed-reader dimensions disagree with validated FAM/BIM dimensions: "
-                f"reader={self.G.shape}, FAM/BIM={(expected_n, expected_m)}."
+        if self.genotype_format == "bed":
+            expected_n, expected_m = _validate_plink_file_paths(
+                self._stable_genotype_paths
             )
+            self.G = open_bed(
+                str(self._stable_genotype_paths[".bed"]),
+                fam_filepath=str(self._stable_genotype_paths[".fam"]),
+                bim_filepath=str(self._stable_genotype_paths[".bim"]),
+                num_threads=requested_reader_threads,
+            )
+            self.nsamp_total, self.nsnps = self.G.shape
+            if (self.nsamp_total, self.nsnps) != (expected_n, expected_m):
+                raise RuntimeError(
+                    "bed-reader dimensions disagree with validated FAM/BIM dimensions: "
+                    f"reader={self.G.shape}, FAM/BIM={(expected_n, expected_m)}."
+                )
+            self.sample_ids = read_fam_sample_ids(self.fam_path)
+            self.snplist = None
+        else:
+            self.G = None
+            self.sample_ids = read_psam_sample_ids(self.psam_path)
+            self.snplist = validate_variant_metadata(
+                read_pvar_variants(self.pvar_path), source=f"PVAR '{self.genotype_prefix}.pvar'"
+            )
+            self.nsamp_total = int(len(self.sample_ids))
+            self.nsnps = int(len(self.snplist))
         self.nvecs = int(num_vecs)
         self.step_size = int(step_size)
         if self.nvecs <= 0:
@@ -1448,6 +1500,24 @@ class GenomewideEnvLDScore:
             raise ValueError("GxE reference shards must be phenotype-free.")
         if self.feature_cache_path is not None and self.pheno_path is not None:
             raise ValueError("Feature-cache trace generation is phenotype-free; score phenotypes separately.")
+        requested_native_backend = str(native_backend).strip().lower()
+        if requested_native_backend not in ("python", "direct"):
+            raise ValueError("native_backend must be 'python' or 'direct'.")
+        if self.genotype_format == "pgen":
+            unsupported = []
+            if requested_native_backend != "python":
+                unsupported.append("native-direct execution")
+            if self.feature_cache_path is not None:
+                unsupported.append("feature-cache execution")
+            if self.shard_mode:
+                unsupported.append("reference shards")
+            if self.genotype_scale != "sample":
+                unsupported.append(f"genotype_scale={self.genotype_scale}")
+            if unsupported:
+                raise ValueError(
+                    "PGEN GxE input currently supports the ordinary Python monolithic "
+                    "sample-standardized path only; unsupported: " + ", ".join(unsupported) + "."
+                )
         if self.device != "cpu":
             self.log._log(f"[gxe] device='{device}' requested, but this Python implementation is CPU-only. Falling back to CPU.")
             self.device = "cpu"
@@ -1513,7 +1583,10 @@ class GenomewideEnvLDScore:
             sel_idx = np.sort(self.rng.choice(base_idx, size=k, replace=False))
             self.log._log(f"Randomly subsampling individuals: {k}/{self.nsamp_total} ({k / self.nsamp_total:.1%})")
 
-        self._read_bim(self.bim_path)
+        if self.genotype_format == "bed":
+            self._read_bim(self.bim_path)
+        else:
+            self.log._log(f"Reading {self.genotype_prefix}.pvar for variants")
         self._read_annot(annot_path)
         self.jackknife_ids, self.jackknife_labels = self._build_jackknife_blocks(
             self.jackknife_spec if self.write_jackknife else None
@@ -1543,6 +1616,7 @@ class GenomewideEnvLDScore:
             pheno_filename=self.pheno_path,
             pheno_col=self.pheno_col,
             missing_values=self.missing_values,
+            sample_ids=self.sample_ids,
         )
         self.row_sel = np.asarray(keep_idx_global, dtype=int)
         self.env = np.asarray(env_vec, dtype=np.float64)
@@ -1587,9 +1661,7 @@ class GenomewideEnvLDScore:
         self.jackknife_scratch_gib = float(jackknife_scratch_gib)
         if not np.isfinite(self.jackknife_scratch_gib) or self.jackknife_scratch_gib <= 0.0:
             raise ValueError("jackknife_scratch_gib must be positive and finite.")
-        self.native_backend = str(native_backend).strip().lower()
-        if self.native_backend not in ("python", "direct"):
-            raise ValueError("native_backend must be 'python' or 'direct'.")
+        self.native_backend = requested_native_backend
         self._native_context = None
         self._native_binary_descriptor: int | None = None
         self._native_binary_record: dict | None = None
@@ -1709,14 +1781,33 @@ class GenomewideEnvLDScore:
             f"[env] Using environment '{self.env_name}' with {self.nsamp} samples; "
             f"effective covariate rank={self.p_eff}; correlation df={self.df_corr}."
         )
+        if self.genotype_format == "pgen":
+            self._pgen_reader = PgenBlockReader(
+                pgen_path=self.pgen_path,
+                raw_sample_ct=self.nsamp_total,
+                variant_ct=self.nsnps,
+                sample_subset=self.row_sel,
+                step_size=self.step_size,
+                dtype=np.float64,
+                ddof=self.ddof,
+                standardize_threads=self.num_threads,
+            )
+            self.log._log(
+                "[gxe][pgen] Persistent streamed REF-dosage reader ready: "
+                f"buffer={self._pgen_reader.block_capacity}x{self.nsamp}."
+            )
 
     def close(self) -> None:
         try:
+            pgen_reader = getattr(self, "_pgen_reader", None)
+            if pgen_reader is not None:
+                pgen_reader.close()
+                self._pgen_reader = None
             native_context = getattr(self, "_native_context", None)
             if native_context is not None:
                 native_context.close()
                 self._native_context = None
-            close_reader = getattr(self.G, "close", None)
+            close_reader = getattr(getattr(self, "G", None), "close", None)
             if close_reader is not None:
                 close_reader()
         finally:
@@ -1913,17 +2004,22 @@ class GenomewideEnvLDScore:
         return block_ids, labels
 
     def _read_genotype_block(self, blk_start: int, blk_end: int) -> np.ndarray:
-        indexer = np.s_[self.row_sel, blk_start:blk_end]
-        try:
-            G = self.G.read(index=indexer, dtype=np.float64, num_threads=self.decode_threads)
-        except TypeError:
+        if getattr(self, "genotype_format", "bed") == "pgen":
+            if self._pgen_reader is None:
+                raise RuntimeError("PGEN reader is closed.")
+            G = self._pgen_reader.read_standardized_block(blk_start, blk_end)
+        else:
+            indexer = np.s_[self.row_sel, blk_start:blk_end]
             try:
-                G = self.G.read(index=indexer, dtype=np.float64)
+                G = self.G.read(index=indexer, dtype=np.float64, num_threads=self.decode_threads)
             except TypeError:
                 try:
-                    G = self.G.read(index=indexer)
+                    G = self.G.read(index=indexer, dtype=np.float64)
                 except TypeError:
-                    G = self.G.read(indexer)
+                    try:
+                        G = self.G.read(index=indexer)
+                    except TypeError:
+                        G = self.G.read(indexer)
 
         G = np.asarray(G, dtype=np.float64)
         if G.shape == (blk_end - blk_start, self.nsamp):
@@ -2685,14 +2781,7 @@ class GenomewideEnvLDScore:
         return digest.hexdigest()
 
     def _analysis_fingerprint(self) -> str:
-        fam = pd.read_csv(
-            self.fam_path,
-            sep=r"\s+",
-            header=None,
-            usecols=[0, 1],
-            dtype={0: str, 1: str},
-        )
-        selected = fam.iloc[self.row_sel]
+        selected = self.sample_ids.iloc[self.row_sel]
         digest = hashlib.sha256()
         for fid, iid in selected.itertuples(index=False, name=None):
             digest.update(str(fid).encode("utf-8"))
@@ -2776,14 +2865,14 @@ class GenomewideEnvLDScore:
                 "bytes": int(os.fstat(self._genotype_descriptors[ext]).st_size),
                 "sha256": self._file_sha256(str(self._stable_genotype_paths[ext])),
             }
-            for ext in (".bed", ".bim", ".fam")
+            for ext in self._genotype_extensions
         }
 
     def _capture_genotype_file_state(
         self,
     ) -> dict[str, tuple[int, int, int, int, int]]:
         state = {}
-        for extension in (".bed", ".bim", ".fam"):
+        for extension in self._genotype_extensions:
             observed = os.fstat(self._genotype_descriptors[extension])
             if not stat.S_ISREG(observed.st_mode):
                 raise ValueError(
@@ -2803,7 +2892,7 @@ class GenomewideEnvLDScore:
         if observed != self._construction_genotype_state:
             changed = [
                 extension
-                for extension in (".bed", ".bim", ".fam")
+                for extension in self._genotype_extensions
                 if observed.get(extension)
                 != self._construction_genotype_state.get(extension)
             ]
@@ -2820,7 +2909,7 @@ class GenomewideEnvLDScore:
         if observed != dict(expected):
             changed = [
                 extension
-                for extension in (".bed", ".bim", ".fam")
+                for extension in self._genotype_extensions
                 if observed.get(extension) != expected.get(extension)
             ]
             raise RuntimeError(
@@ -2939,6 +3028,8 @@ class GenomewideEnvLDScore:
 
     def write_feature_cache(self, path: str | Path, *, overwrite: bool = False) -> Path:
         """Write exact phenotype-independent projected-feature metadata."""
+        if self.genotype_format != "bed":
+            raise ValueError("Reusable GxE feature caches currently require BED/BIM/FAM input.")
         if self.pheno is not None or self.pheno_path is not None:
             raise ValueError("A reusable GxE feature cache must be phenotype-free.")
         target = Path(path).expanduser().resolve()
@@ -4111,5 +4202,7 @@ class GenomewideEnvLDScore:
             f" s ({self.runtime // 3600} hr {(self.runtime % 3600) // 60} m {(self.runtime % 60):.3f} s)"
         )
         self.log._save_log(self.outpath + ".gxe.log")
-        os.chmod(self.outpath + ".gxe.log", 0o600)
+        log_path = Path(self.outpath + ".gxe.log")
+        if log_path.is_file():
+            os.chmod(log_path, 0o600)
 GenomewideGxELDScore = GenomewideEnvLDScore

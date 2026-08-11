@@ -161,6 +161,12 @@ def _hardcalls() -> np.ndarray:
 )
 def test_pgen_cli_dispatch_smoke(tmp_path, mode, expected_suffixes):
     alt = _hardcalls()
+    if mode == "gxe":
+        # Summary GxE bundles require positive projected variance for every
+        # retained additive and interaction feature.  Keep the genomewide and
+        # windowed smoke cases' missing/monomorphic coverage, but exercise GxE
+        # dispatch on the variable subset.
+        alt = alt[[0, 1, 2, 6]]
     prefix = tmp_path / f"cli_{mode}"
     _write_hardcall_pgen(prefix, alt)
     out = tmp_path / f"cli_{mode}_out"
@@ -975,7 +981,7 @@ def test_windowed_large_bp_exact_boundary_matches_bed_pgen_and_oracle(tmp_path):
 
 
 def test_hardcall_pgen_and_bed_have_identical_gxe_scores(tmp_path):
-    alt = _hardcalls()
+    alt = _hardcalls()[[0, 1, 2, 6]]
     pgen_prefix = tmp_path / "gxe_pgen"
     bed_prefix = tmp_path / "gxe_bed"
     _write_hardcall_pgen(pgen_prefix, alt)
@@ -1003,6 +1009,24 @@ def test_hardcall_pgen_and_bed_have_identical_gxe_scores(tmp_path):
     np.testing.assert_array_equal(pgen_rows, bed_rows)
     np.testing.assert_allclose(pgen_xw, bed_xw, rtol=2e-12, atol=2e-12)
     np.testing.assert_allclose(pgen_ww, bed_ww, rtol=2e-12, atol=2e-12)
+
+
+def test_gxe_rejects_monomorphic_or_all_missing_pgen_variants(tmp_path):
+    alt = _hardcalls()
+    prefix = tmp_path / "gxe_invalid_pgen"
+    _write_hardcall_pgen(prefix, alt)
+    env_path = tmp_path / "gxe_invalid.env"
+    pd.DataFrame({
+        "FID": [f"f{i}" for i in range(alt.shape[1])],
+        "IID": [f"i{i}" for i in range(alt.shape[1])],
+        "environment": np.linspace(-1.0, 1.0, alt.shape[1]),
+    }).to_csv(env_path, sep="\t", index=False)
+
+    with pytest.raises(ValueError, match="zero or invalid projected variance"):
+        _run_gxe(
+            prefix.with_suffix(".pgen"), env_path,
+            tmp_path / "gxe_invalid_pgen_out",
+        )
 
 
 def test_fractional_pgen_gxe_matches_independent_oracle_with_shuffled_sample_files(tmp_path):
@@ -1122,9 +1146,11 @@ def test_fractional_pgen_gxe_matches_independent_oracle_with_shuffled_sample_fil
 
     r_xw = (X.T @ W) / float(df_corr)
     r_ww = (W.T @ W) / float(df_corr)
-    null = annot.sum(axis=0, keepdims=True) / float(df_corr)
-    expected_xw = (r_xw * r_xw) @ annot - null
-    expected_ww = (r_ww * r_ww) @ annot - null
+    # Summary GxE persists raw realized-sample directional Gram traces.  The
+    # XX-style M/r subtraction is not valid for XW/WX and is therefore not
+    # applied to any direction in a reusable reference bundle.
+    expected_xw = (r_xw * r_xw) @ annot
+    expected_ww = (r_ww * r_ww) @ annot
 
     def probe_se(corr):
         out = np.empty((variant_ct, annot.shape[1]), dtype=float)

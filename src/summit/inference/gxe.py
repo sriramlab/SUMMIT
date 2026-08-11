@@ -1637,9 +1637,16 @@ def _fit_from_input_snapshots(
         validated_cache_by_hash.clear()
     if ref_version >= 3:
         genotype_files = ref.get("genotype_files")
-        if not isinstance(genotype_files, dict) or not {".bed", ".bim", ".fam"}.issubset(genotype_files):
+        valid_genotype_trios = (
+            {".bed", ".bim", ".fam"},
+            {".pgen", ".pvar", ".psam"},
+        )
+        if (
+            not isinstance(genotype_files, dict)
+            or set(genotype_files) not in valid_genotype_trios
+        ):
             raise ValueError("Schema-v3 reference is missing genotype file provenance.")
-        for extension in (".bed", ".bim", ".fam"):
+        for extension in sorted(genotype_files):
             entry = genotype_files[extension]
             if (
                 not isinstance(entry, dict)
