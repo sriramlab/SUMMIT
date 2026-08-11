@@ -9,6 +9,7 @@
 
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <stdexcept>
 #include <vector>
 
@@ -92,27 +93,28 @@ inline nb_numpy_mat2f<T> make_owned_numpy_mat2f(std::size_t rows,
 
 inline const std::vector<int>& parse_row_sel_nb(nb::object row_sel_obj, int64_t N_total) {
     struct Cache {
-        PyObject* key = nullptr;
+        bool full_range = false;
         int64_t N_total = -1;
         std::vector<int> rows;
     };
     static thread_local Cache C;
 
-    PyObject* k = row_sel_obj.is_none() ? nullptr : row_sel_obj.ptr();
-    if (C.key == k && C.N_total == N_total && !C.rows.empty())
-        return C.rows;
-
-    C.key = k;
-    C.N_total = N_total;
-    C.rows.clear();
-
     if (row_sel_obj.is_none()) {
+        if (C.full_range && C.N_total == N_total && !C.rows.empty())
+            return C.rows;
+        C.full_range = true;
+        C.N_total = N_total;
         C.rows.resize((std::size_t) N_total);
         for (int64_t i = 0; i < N_total; ++i)
             C.rows[(std::size_t) i] = (int) i;
         return C.rows;
     }
 
+    // Array identity is not a content version: callers may mutate and reuse a
+    // selector, and Python may later recycle the same PyObject address. Parse
+    // explicit selectors on every call so decoders cannot consume stale rows.
+    C.full_range = false;
+    C.N_total = N_total;
     nb_any_array_ro idx = nb::cast<nb_any_array_ro>(row_sel_obj);
     if (idx.ndim() != 1)
         throw std::runtime_error("row_sel must be a 1D CPU array of int32 or int64 indices");
@@ -122,16 +124,26 @@ inline const std::vector<int>& parse_row_sel_nb(nb::object row_sel_obj, int64_t 
 
     if (idx.dtype() == nb::dtype<int32_t>()) {
         auto v = idx.view<const int32_t, nb::ndim<1>>();
-        for (std::size_t i = 0; i < n; ++i)
-            C.rows[i] = (int) v(i);
+        for (std::size_t i = 0; i < n; ++i) {
+            const int64_t value = static_cast<int64_t>(v(i));
+            if (value < 0 || value >= N_total) {
+                throw std::runtime_error("row_sel contains an out-of-range sample index");
+            }
+            C.rows[i] = static_cast<int>(value);
+        }
     } else if (idx.dtype() == nb::dtype<int64_t>()) {
         auto v = idx.view<const int64_t, nb::ndim<1>>();
-        for (std::size_t i = 0; i < n; ++i)
-            C.rows[i] = (int) v(i);
+        for (std::size_t i = 0; i < n; ++i) {
+            const int64_t value = v(i);
+            if (value < 0 || value >= N_total ||
+                value > static_cast<int64_t>(std::numeric_limits<int>::max())) {
+                throw std::runtime_error("row_sel contains an out-of-range sample index");
+            }
+            C.rows[i] = static_cast<int>(value);
+        }
     } else {
         throw std::runtime_error("row_sel must have dtype int32 or int64");
     }
 
     return C.rows;
 }
-

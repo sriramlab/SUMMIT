@@ -6,7 +6,121 @@ import re
 import time
 import datetime
 import glob
+import math
 from pathlib import Path
+
+import psutil
+
+try:
+    import resource
+except ImportError:  # pragma: no cover - unavailable on Windows
+    resource = None
+
+
+def parse_memory_budget(value):
+    """Parse a positive GiB budget or the literal ``auto``."""
+    if isinstance(value, str) and value.strip().lower() == "auto":
+        return "auto"
+    try:
+        observed = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Memory budget must be a positive GiB value or 'auto'.") from exc
+    if not math.isfinite(observed) or observed <= 0.0:
+        raise ValueError("Memory budget must be a positive GiB value or 'auto'.")
+    return observed
+
+
+def _read_positive_integer(path: Path):
+    try:
+        text = path.read_text(encoding="ascii").strip()
+    except (FileNotFoundError, OSError):
+        return None
+    if text == "max":
+        return None
+    try:
+        value = int(text)
+    except ValueError:
+        return None
+    return value if value > 0 else None
+
+
+def available_memory_bytes(*, environ=None, process=None) -> tuple[int, dict]:
+    """Return the tightest observable remaining memory limit and its evidence."""
+    environ = os.environ if environ is None else environ
+    process = psutil.Process() if process is None else process
+    candidates = {"host_available": int(psutil.virtual_memory().available)}
+
+    override = environ.get("SUMMIT_MEMORY_LIMIT_GIB")
+    if override is not None:
+        total = parse_memory_budget(override)
+        if total == "auto":
+            raise ValueError("SUMMIT_MEMORY_LIMIT_GIB must be a positive numeric GiB value.")
+        candidates["SUMMIT_MEMORY_LIMIT_GIB"] = max(
+            0, int(float(total) * (1024 ** 3)) - int(process.memory_info().rss)
+        )
+
+    cgroup_pairs = (
+        (Path("/sys/fs/cgroup/memory.max"), Path("/sys/fs/cgroup/memory.current")),
+        (
+            Path("/sys/fs/cgroup/memory/memory.limit_in_bytes"),
+            Path("/sys/fs/cgroup/memory/memory.usage_in_bytes"),
+        ),
+    )
+    for limit_path, used_path in cgroup_pairs:
+        limit = _read_positive_integer(limit_path)
+        used = _read_positive_integer(used_path)
+        if limit is not None and used is not None and limit < (1 << 60):
+            candidates[f"cgroup:{limit_path}"] = max(0, limit - used)
+
+    if resource is not None:
+        soft_as, _ = resource.getrlimit(resource.RLIMIT_AS)
+        if soft_as not in (resource.RLIM_INFINITY, -1) and soft_as > 0:
+            candidates["RLIMIT_AS"] = max(
+                0, int(soft_as) - int(process.memory_info().vms)
+            )
+
+    nonnegative = {key: value for key, value in candidates.items() if value >= 0}
+    if not nonnegative:
+        raise RuntimeError("Could not determine positive available memory for auto budgeting.")
+    limiting_source = min(nonnegative, key=nonnegative.get)
+    if nonnegative[limiting_source] <= 0:
+        raise RuntimeError(
+            f"No memory remains under the limiting source {limiting_source!r}."
+        )
+    return nonnegative[limiting_source], {
+        "limiting_source": limiting_source,
+        "candidates_bytes": nonnegative,
+    }
+
+
+def resolve_memory_budget_gib(
+    value,
+    *,
+    reserve_gib: float = 4.0,
+    usable_fraction: float = 0.65,
+) -> tuple[float, dict]:
+    """Resolve an explicit/automatic panel budget without consuming all available RAM."""
+    parsed = parse_memory_budget(value)
+    if parsed != "auto":
+        return float(parsed), {"mode": "explicit", "resolved_gib": float(parsed)}
+    available, evidence = available_memory_bytes()
+    reserve = int(float(reserve_gib) * (1024 ** 3))
+    budget = min(int(available * float(usable_fraction)), available - reserve)
+    minimum = 256 * 1024 ** 2
+    if budget < minimum:
+        raise RuntimeError(
+            "Auto memory budgeting found less than 0.25 GiB after safety margins; "
+            "free memory or provide a valid explicit allocation."
+        )
+    resolved = budget / float(1024 ** 3)
+    return resolved, {
+        "mode": "auto",
+        "resolved_gib": resolved,
+        "available_gib": available / float(1024 ** 3),
+        "reserve_gib": float(reserve_gib),
+        "usable_fraction": float(usable_fraction),
+        **evidence,
+    }
 
 # ----------------------- Time helpers ----------------------- #
 def _get_time():

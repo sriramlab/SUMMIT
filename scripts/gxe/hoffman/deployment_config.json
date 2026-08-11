@@ -1,0 +1,130 @@
+{
+  "kind": "summit.gxe.hoffman_deployment",
+  "schema_version": 2,
+  "scratch_root": "/u/scratch/b/bronsonj/summit_gxe_full_20260808",
+  "allowed_frozen_root": "/u/project/sriram/bronsonj",
+  "python_executable": "/u/home/b/bronsonj/.conda/envs/summit/bin/python",
+  "numa_launch": {
+    "executable": "/usr/bin/numactl",
+    "sha256": "ceb1c432dd5e8747bec51e7fe283b57b806c95bb68122557cb59e212d1015b5e",
+    "arguments": ["--interleave=all"],
+    "environment_sentinel": "SUMMIT_NUMACTL_WRAPPED"
+  },
+  "panel_config_sha256": "3d8e977c2c9b56b32e2675025fc915e249f5ed7a3670d60c674a6efac50f582e",
+  "estimator": {
+    "annotation": null,
+    "annotation_contract": "all_variants_unit_weight",
+    "annotation_name": "L2_0",
+    "annotation_mass": 454207,
+    "feature_cache_schema_version": 2,
+    "reference_shard_schema_version": 2,
+    "reference_schema_version": 3,
+    "kernel_mode": "standardized",
+    "genotype_scale": "sample",
+    "jackknife_blocks": 100,
+    "probes_per_shard": 128,
+    "production_probes": 1024,
+    "checkpoint_probes": [
+      128,
+      256,
+      512,
+      1024
+    ],
+    "random_distribution": "rademacher",
+    "seed": 20260808,
+    "dtype": "float32",
+    "ddof": 1,
+    "missing_values": "-9,NA,NaN,nan,.,None,null",
+    "impute_method": "mean",
+    "step_size": 500,
+    "target_xz_mem_gib": 16,
+    "shard_preflight": {
+      "dtype_bytes": 4,
+      "annotation_bins": 1,
+      "jackknife_scratch_arrays": 2,
+      "resident_sketch_arrays": 4,
+      "main_workspace_bytes_per_sample_variant": 28,
+      "minimum_memory_headroom_gib": 12,
+      "minimum_scratch_headroom_gib": 8
+    }
+  },
+  "legacy_feature_cache_attestation": {
+    "source_commit": "0113342960b00fd92a341be4c2fbed3da9fa19cb",
+    "cache_schema_version": 2,
+    "deployment_config_sha256": "8976ecde75b8289d73731f1ec6afa95f63b42f32c6a5226a13ad55038d318060",
+    "summit_python_source_fingerprint": "a51969169f9564a0381a9d1822f21e7ca30c7cb5448d009b07d1146f4782650d"
+  },
+  "resources": {
+    "stage_verify": {
+      "slots": 1,
+      "h_data_gib_per_slot": 4,
+      "total_memory_gib": 4,
+      "h_rt": "24:00:00",
+      "highp": true
+    },
+    "cache": {
+      "slots": 4,
+      "h_data_gib_per_slot": 6,
+      "total_memory_gib": 24,
+      "h_rt": "48:00:00",
+      "highp": true
+    },
+    "cache_attest": {
+      "slots": 1,
+      "h_data_gib_per_slot": 8,
+      "total_memory_gib": 8,
+      "h_rt": "08:00:00",
+      "highp": true
+    },
+    "shard": {
+      "slots": 4,
+      "h_data_gib_per_slot": 12,
+      "total_memory_gib": 48,
+      "h_rt": "48:00:00",
+      "highp": true
+    },
+    "shard_benchmark": {
+      "slots": 8,
+      "h_data_gib_per_slot": 6,
+      "total_memory_gib": 48,
+      "h_rt": "24:00:00",
+      "highp": true
+    },
+    "merge": {
+      "slots": 1,
+      "h_data_gib_per_slot": 8,
+      "total_memory_gib": 8,
+      "h_rt": "08:00:00",
+      "highp": true
+    },
+    "merge_half": {
+      "slots": 1,
+      "h_data_gib_per_slot": 8,
+      "total_memory_gib": 8,
+      "h_rt": "08:00:00",
+      "highp": true
+    },
+    "score": {
+      "slots": 4,
+      "h_data_gib_per_slot": 6,
+      "total_memory_gib": 24,
+      "h_rt": "48:00:00",
+      "highp": true
+    },
+    "fit": {
+      "slots": 1,
+      "h_data_gib_per_slot": 4,
+      "total_memory_gib": 4,
+      "h_rt": "04:00:00",
+      "highp": true
+    },
+    "fit_batch": {
+      "slots": 1,
+      "h_data_gib_per_slot": 4,
+      "total_memory_gib": 4,
+      "h_rt": "04:00:00",
+      "highp": true
+    }
+  },
+  "monitor_interval_hours": 6
+}

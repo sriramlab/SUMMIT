@@ -13,8 +13,8 @@ moments.
   BED/BIM/FAM hard calls or biallelic diploid PLINK 2 PGEN/PVAR/PSAM dosages.
 - Covariate-adjusted and annotation-partitioned LD scores.
 - Optional fixed-window LD scores with `--ld-wind-kb`.
-- Optional GxE LD scores with `--env`; SUMMIT writes both additive-interaction
-  cross-LD and interaction-interaction LD scores.
+- Full one-environment GENIE-style G + GxE + NxE estimation from marginal
+  score summaries and an in-sample XX/XW/WX/WW trace bundle.
 - Heritability estimation from `BETA`/`SE` summary statistics.
 - Exact chromosome-jackknife batched h2 with an optional reusable binary cache.
 - `--weight-mode ldsc` fits constrained score-scale LDSC-style IRWLS for h2
@@ -202,22 +202,113 @@ summit \
 This writes `*.win.ldscore.gz`, `*.win.M`, and `*.win.M_5_50`.
 An explicit `.pgen` can replace `.bed`; PGEN uses mean-imputed dosages.
 
-### GxE LD scores
+### GxE, heterogeneous noise, and marginal GWIS scores
+
+Generate one reusable phenotype-independent reference for a fixed cohort,
+environment, covariate design, SNP set, and annotation. Probe panels are tiled
+automatically within the requested memory budget:
 
 ```bash
 summit \
-  --geno ref_panel.bed \
-  --env environment.txt \
-  --covar covariates.txt \
+  --geno ref_panel --env environment.txt --covar covariates.txt \
   --annot mafld.annot.gz \
-  --out outs/ref.mafld.env \
-  --nvecs 1000 \
-  --num-threads 8
+  --gxe-kernel-mode standardized --gxe-genotype-scale sample \
+  --nvecs 1024 --seed 20260808 --rand-dist rademacher \
+  --target-mem 16 \
+  --write-gxe-jackknife --njack 100 \
+  --out outs/reference.B1024
+```
+
+Then score all selected traits in one genotype pass:
+
+```bash
+summit \
+  --gxe-score-reference outs/reference.B1024.gxe.ref.json \
+  --geno ref_panel --env environment.txt --covar covariates.txt \
+  --gxe-pheno phenotypes.txt --gxe-pheno-cols trait1,trait2 \
+  --out outs/scores
 ```
 
 The environment file must contain `FID`, `IID`, and exactly one environment
-column. SUMMIT writes `*.gxe.ldscore.gz` and `*.gee.ldscore.gz`.
-An explicit `.pgen` can replace `.bed`; PGEN uses mean-imputed dosages.
+column. Every selected phenotype must be finite on the reference's fixed cohort;
+build a common-cohort wide input first. The environment is standardized, and
+the intercept, environment, and supplied covariates are projected from the
+phenotype and both genetic feature panels. The projected phenotype is rescaled
+so `y'y = rank(P)`; the fitter verifies this contract rather than guessing a
+score scale.
+
+The reference contains all four directional trace-score panels (`gxx`,
+`gxe`, `exg`, and `gee`), per-SNP projected norms/NxE diagonals, and exact
+two-sided deletion intersections. Each trait triplet contains direct marginal
+additive and interaction scores plus the indispensable scalar
+`y' diag(E^2) y`.
+
+Exact jackknife generation requires at least 100 probes by default. Lower
+counts can strongly contaminate the delete-block SE through randomized
+within-block trace noise; the diagnostic-only override is
+`--allow-low-probe-gxe-jackknife`.
+
+```bash
+summit \
+  --gxe-fit outs/reference.B1024.gxe.ref.json \
+  --gxe-gwas outs/scores.trait1.gxe.gwas.tsv.gz \
+  --gwis outs/scores.trait1.gxe.gwis.tsv.gz \
+  --gxe-moments outs/scores.trait1.gxe.moments.json \
+  --out outs/trait1
+```
+
+For several traits sharing one reference, a strict batch manifest avoids
+reloading and reaggregating the reference for every fit while retaining full
+per-trait hash and SNP-axis validation:
+
+```json
+{
+  "kind": "summit.gxe.fit_batch",
+  "schema_version": 1,
+  "reference": "reference.B1024.gxe.ref.json",
+  "traits": [
+    {
+      "name": "trait1",
+      "moments": "scores.trait1.gxe.moments.json",
+      "gwas": "scores.trait1.gxe.gwas.tsv.gz",
+      "gwis": "scores.trait1.gxe.gwis.tsv.gz",
+      "out": "fits/trait1"
+    }
+  ]
+}
+```
+
+```bash
+summit --gxe-fit-batch fit_batch.json --out outs/batch_fit
+```
+
+All trait result pairs are preflighted and published as one no-overwrite
+transaction. Downstream consumers should wait for successful command/job
+completion before reading a batch.
+
+The default `--gxe-kernel-mode standardized` uses SUMMIT's covariate-adjusted
+partial-correlation convention: form `P G` and `P[diag(E)G]`, then normalize
+each valid projected column to squared norm `rank(P)`. This is the same
+post-projection convention used by SUMMIT's additive LD/score machinery and is
+invariant to nonsingular rescaling of a retained genotype column. The explicit
+`--gxe-kernel-mode genie --gxe-genotype-scale hwe` sensitivity mode instead
+keeps the natural norms of HWE-scaled projected columns to reproduce GENIE's
+kernel definition. These are different random-effect estimands, so their
+artifacts cannot be mixed; both choices are recorded and hash-bound.
+
+Do not pass a conventional PLINK 2 `--glm interaction` `ADDxE` Z statistic as
+`--gwis`: it is conditional on the SNP main effect. GENIE requires the marginal
+cross-product of projected `G*E` with projected phenotype. SUMMIT's generated
+files declare `SCORE_MODE=marginal_cross_product` and the loader rejects other
+declared modes. Every score/reference artifact is SHA-256-bound. Phenotype
+summaries are also bound to the exact reference manifest and design, so files
+from different cohorts, environments, variants, or kernel conventions cannot
+be mixed.
+
+Generation and fitting refuse an existing output prefix unless
+`--gxe-overwrite` is supplied explicitly; files are written atomically with
+owner-only permissions. See [docs/gxe_genie.md](docs/gxe_genie.md) for the equations,
+identifiability checks, file contract, and validation requirements.
 
 ### Heritability
 
@@ -511,16 +602,34 @@ Exactly one of these modes must be specified.
   prepared-panel cache for PGEN windowed LD. Automatic caching is capped and
   also respects `--target-mem` when supplied.
 - `--covar`: covariate file with `FID IID` and covariate columns.
-- `--env`: one-column environment file for GxE LD scores.
+- `--env`: one-column environment file for the GxE reference/score bundle.
+- `--gxe-score-reference`: produce marginal scores and NxE moments from a
+  sealed reference; `--gxe-pheno-cols` selects columns from `--gxe-pheno`.
+- `--write-gxe-jackknife`: write within-block intersections needed for
+  two-sided GENIE kernel-deletion SEs; block layout comes from `--njack`.
+- `--allow-low-probe-gxe-jackknife`: diagnostic override for fewer than 100
+  probes; resulting SEs are not production-calibrated.
 - `--ld-wind-kb`: compute fixed-window LD scores instead of randomized
   genome-wide LD scores.
 - `--rand-samp`: random subset of samples; a ratio in `(0,1]` or an integer
   sample count.
 - `--rand-dist`: `spherical`, `normal`/`gaussian`, or `rademacher`.
 - `--dtype`: `float32` or `float64`.
+- `--gxe-native-backend direct`: opt into the Linux C++ direct BED backend for
+  phenotype-free, one-annotation, `float32` or `float64`, standardized/sample-scaled GxE
+  references. It uses the same Philox probes and exact projected-feature
+  algebra as the Python oracle and seals the loaded native binary and source
+  snapshot in every artifact.
+- `--use-mailman auto` (default): for ordinary additive LD scores, use the
+  existing Mailman implementation only at `B<=10` and only with HWE
+  imputation. The existing Mailman kernel is not used for GxE because it does
+  not implement the required interaction-before-projection algebra.
 - `--device`: `cpu` or `cuda[:index]` for supported genome-wide LD-score runs.
 - `--num-threads`: cap BLAS/OpenMP thread pools.
-- `--target-xz-mem`, `--target-mem`: memory budgets in GB.
+- `--target-xz-mem`, `--target-mem`: sketch-panel budgets in GiB or `auto`
+  (default). Auto uses the tightest observable memory limit and retains both a
+  fixed reserve and a proportional margin; cluster workflows should keep an
+  explicit budget when the scheduler allocation is not visible to the process.
 
 ## Output Files
 
@@ -530,8 +639,14 @@ Exactly one of these modes must be specified.
   optional.
 - Windowed LD scores: `<out>.win.ldscore.gz`, `<out>.win.M`,
   `<out>.win.M_5_50`, `<out>.win.log`.
-- GxE LD scores: `<out>.gxe.ldscore.gz`, `<out>.gee.ldscore.gz`,
-  `<out>.gxe.log`.
+- GxE reference: `<out>.{gxx,gxe,exg,gee}.ldscore.gz`,
+  `<out>.gxe.diag.tsv.gz`, `<out>.gxe.ref.json`, and optionally
+  `<out>.gxe.jackknife.npz`.
+- Batched GxE phenotype summaries: `<out>.<trait>.gxe.{gwas,gwis}.tsv.gz` and
+  `<out>.<trait>.gxe.moments.json`.
+- GxE fit: `<out>.gxe.results.tsv`, `<out>.gxe.fit.json`, `<out>.gxe.log`;
+  batch fitting writes one result/JSON pair per manifest trait plus the global
+  batch log prefix.
 - h2: `<out>.results.tsv`, `<out>.log`, optionally `<out>.<trait>.jack`; the
   result table records `estimator` (`he` or `constrained_ldsc_irwls`).
 - rg: `<out>.log`, optionally `<out>.rg.jack` and

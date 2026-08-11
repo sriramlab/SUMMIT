@@ -1,0 +1,140 @@
+{
+  "kind": "summit.gxe.hoffman_panel",
+  "schema_version": 1,
+  "scratch_root": "/u/scratch/b/bronsonj/summit_gxe_full_20260808",
+  "local_source_layout": {
+    "root": "/home/bronsonj/UKBB/asha/phens",
+    "phenotype_path_template": "{trait}.pheno",
+    "phenotype_header": ["FID", "IID", "pheno"]
+  },
+  "datasets": {
+    "full": {
+      "source_prefix": "/u/project/sriram/bronsonj/UKBB/geno/EUR_300k/UKBB_EUR_300k_unrel_3rd.no_mhc_imp",
+      "expected_n_samples": 291273,
+      "expected_n_variants": 454207,
+      "expected_bed_bytes": 33074899536,
+      "expected_bed_magic": "6c1b01",
+      "expected_fam_sha256": "b9d7600b55080dcea5ee74bf75aa5665f5b057c51833a8f90c6dfa225a7ff6ba",
+      "expected_bim_sha256": "9c8591bd316662b7712ceddc973cb4c437175345ed2ae2a2264eb4355fe2b76d"
+    },
+    "subset_50k": {
+      "source_prefix": "/u/project/sriram/bronsonj/summaryRHE/300k/split_50k/geno/50k_split",
+      "expected_n_samples": 50112,
+      "expected_n_variants": 454207,
+      "expected_bed_bytes": 5690305299,
+      "expected_bed_magic": "6c1b01",
+      "expected_fam_sha256": "57428e75897fc01473eb1c32a6fed490dcca5fd463cdbc4264d1eef4969b1531",
+      "expected_bim_sha256": "321ae883a2fd1240ce3f2e34f17f94636357993cc60b9b0ed84a0e2db8dc3e97"
+    }
+  },
+  "production_estimator": {
+    "annotation": null,
+    "annotation_contract": "all_variants_unit_weight",
+    "kernel_mode": "standardized",
+    "genotype_scale": "sample",
+    "num_probes": 1024,
+    "jackknife_blocks": 100,
+    "probe_shards": 8,
+    "probes_per_shard": 128,
+    "checkpoint_probes": [
+      128,
+      256,
+      512,
+      1024
+    ],
+    "random_distribution": "rademacher",
+    "seed_family": 20260808,
+    "dtype": "float32",
+    "step_size": 500
+  },
+  "groups": {
+    "age_bp": {
+      "environment": "age",
+      "covariate_source_local": "/home/bronsonj/UKBB/asha/phens/bp_diastolic.covar",
+      "phenotypes": ["bp_diastolic", "bp_systolic"],
+      "expected_common_n_full": 272753,
+      "expected_rank_full": 27,
+      "expected_residual_rank_full": 272725
+    },
+    "age_assay": {
+      "environment": "age",
+      "covariate_source_local": "/home/bronsonj/UKBB/asha/phens/cholesterol.covar",
+      "phenotypes": [
+        "cholesterol",
+        "ldl",
+        "cystatin_c",
+        "alka_phos",
+        "ggt",
+        "ala_at",
+        "triglycerides",
+        "urea",
+        "creatinine",
+        "c_reactive_prot",
+        "apo_b",
+        "bilirubin_total"
+      ],
+      "expected_common_n_full": 273532,
+      "expected_rank_full": 22,
+      "expected_residual_rank_full": 273509
+    },
+    "sex_whr": {
+      "environment": "sex",
+      "covariate_source_local": "/home/bronsonj/UKBB/asha/phens/whr.covar",
+      "phenotypes": ["whr"],
+      "expected_common_n_full": 290259,
+      "expected_rank_full": 23,
+      "expected_residual_rank_full": 290235
+    },
+    "sex_assay": {
+      "environment": "sex",
+      "covariate_source_local": "/home/bronsonj/UKBB/asha/phens/testosterone.covar",
+      "phenotypes": [
+        "testosterone",
+        "igf1",
+        "shbg",
+        "creatinine",
+        "alka_phos",
+        "hdl",
+        "ggt",
+        "triglycerides",
+        "apo_a",
+        "bmi",
+        "c_reactive_prot",
+        "ala_at",
+        "cholesterol",
+        "urea",
+        "apo_b",
+        "bilirubin_total",
+        "total_prot"
+      ],
+      "expected_common_n_full": 223433,
+      "expected_rank_full": 22,
+      "expected_residual_rank_full": 223410
+    }
+  },
+  "uge": {
+    "cache": {
+      "slots": 4,
+      "h_data_per_slot": "6G",
+      "total_memory": "24G",
+      "h_rt": "48:00:00",
+      "highp": true
+    },
+    "production_b128_shard": {
+      "slots": 4,
+      "h_data_per_slot": "12G",
+      "total_memory": "48G",
+      "h_rt": "48:00:00",
+      "highp": true
+    },
+    "eight_slot_benchmark": {
+      "slots": 8,
+      "h_data_per_slot": "6G",
+      "total_memory": "48G",
+      "h_rt": "24:00:00",
+      "highp": true
+    },
+    "task_concurrency_flag_permitted": false,
+    "monitor_interval_hours": 6
+  }
+}
