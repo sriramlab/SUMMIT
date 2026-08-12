@@ -552,6 +552,11 @@ def test_native_context_rejects_mutation_bad_design_nonfinite_and_workspace(tmp_
 
 
 def test_native_pass_probe_tile_and_thread_determinism(tmp_path):
+    parallel_threads = min(4, len(os.sched_getaffinity(0)))
+    if parallel_threads < 2:
+        pytest.skip("thread-determinism test requires at least two affinity-visible CPUs")
+    tile_threads = min(3, parallel_threads)
+
     rng = np.random.default_rng(662)
     n, m, probes = 53, 19, 16
     raw = rng.binomial(2, rng.uniform(0.12, 0.43, size=m), size=(n, m)).astype(float)
@@ -577,7 +582,7 @@ def test_native_pass_probe_tile_and_thread_determinism(tmp_path):
             return result, feature
 
     (one_x, one_w), feature = source(0, m, slice(None), 1)
-    (four_x, four_w), _ = source(0, m, slice(None), 4)
+    (four_x, four_w), _ = source(0, m, slice(None), parallel_threads)
     assert np.array_equal(one_x, four_x)
     assert np.array_equal(one_w, four_w)
 
@@ -588,7 +593,7 @@ def test_native_pass_probe_tile_and_thread_determinism(tmp_path):
 
     tile_x, tile_w = [], []
     for start, stop in ((0, 5), (5, 11), (11, probes)):
-        (x, w), _ = source(0, m, slice(start, stop), 3)
+        (x, w), _ = source(0, m, slice(start, stop), tile_threads)
         tile_x.append(x)
         tile_w.append(w)
     np.testing.assert_allclose(np.column_stack(tile_x), one_x, rtol=2e-15, atol=2e-14)
@@ -596,7 +601,7 @@ def test_native_pass_probe_tile_and_thread_determinism(tmp_path):
 
     sources = np.asfortranarray(np.column_stack([one_x, one_w]))
     target_runs = []
-    for threads in (1, 4):
+    for threads in (1, parallel_threads):
         with _native_context(prefix, env, q, decode_threads=threads, target_panel_columns=5) as context:
             panel = context.prepare_projected_sources(sources, 1e-10)
             with threadpool_limits(limits=1):
