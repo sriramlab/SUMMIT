@@ -154,9 +154,10 @@ def _install_exact_probes(estimator: GenomewideEnvLDScore) -> None:
     m = estimator.nsnps
 
     def exact_probes(self, L, v_count, blk_start, v_start):
-        assert (L, v_count, blk_start, v_start) == (m, m, 0, 0)
+        assert (v_count, v_start) == (m, 0)
         return np.asfortranarray(
-            math.sqrt(m) * np.eye(m), dtype=np.dtype(self.dtype)
+            math.sqrt(m) * np.eye(m)[blk_start:blk_start + L],
+            dtype=np.dtype(self.dtype),
         )
 
     estimator._generate_random_block = types.MethodType(exact_probes, estimator)
@@ -218,20 +219,18 @@ def test_cli_default_is_summit_post_projection_standardized():
     assert defaults.gxe_native_backend == "python"
     assert defaults.gxe_native_workspace_gib == 16.0
     assert defaults.gxe_native_target_panel_columns == 64
-    assert defaults.gxe_jackknife_scratch_gib == 64.0
+    assert not hasattr(defaults, "gxe_jackknife_scratch_gib")
 
     explicit = build_parser().parse_args(
         [
             "--gxe-native-backend", "direct",
             "--gxe-native-workspace-gib", "2.5",
             "--gxe-native-target-panel-columns", "32",
-            "--gxe-jackknife-scratch-gib", "8",
         ]
     )
     assert explicit.gxe_native_backend == "direct"
     assert explicit.gxe_native_workspace_gib == 2.5
     assert explicit.gxe_native_target_panel_columns == 32
-    assert explicit.gxe_jackknife_scratch_gib == 8.0
 
 
 def test_production_post_projection_norms_and_fixed_effect_leakage(exact_bundle):

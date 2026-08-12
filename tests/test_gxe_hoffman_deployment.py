@@ -211,10 +211,10 @@ def test_b128_resource_arithmetic_and_free_space_preflight(
 ):
     config = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
     estimate = DEPLOY._shard_resource_estimate(config, 290259)
-    assert estimate["scratch_bytes"] == 2 * 100 * 290259 * 128 * 4
+    assert "scratch_bytes" not in estimate
     assert estimate["resident_sketch_bytes"] == 4 * 290259 * 128 * 4
     assert estimate["main_workspace_bytes"] == 290259 * 500 * 28
-    assert 32 * DEPLOY.GIB < estimate["required_memory_bytes"] < 48 * DEPLOY.GIB
+    assert 16 * DEPLOY.GIB < estimate["required_memory_bytes"] < 24 * DEPLOY.GIB
 
     class Filesystem:
         f_bavail = estimate["required_free_bytes"]
@@ -230,7 +230,7 @@ def test_b128_resource_arithmetic_and_free_space_preflight(
     assert observed["available_memory_bytes"] == 48 * DEPLOY.GIB
     assert observed["available_free_bytes"] == estimate["required_free_bytes"]
 
-    undersized = {**config["resources"]["shard"], "total_memory_gib": 32}
+    undersized = {**config["resources"]["shard"], "total_memory_gib": 16}
     with pytest.raises(ValueError, match="modeled memory"):
         DEPLOY._validate_shard_preflight(
             config,

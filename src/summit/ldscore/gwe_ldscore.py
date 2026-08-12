@@ -5,7 +5,6 @@ import hashlib
 import json
 import math
 import os
-import shutil
 import stat
 import tempfile
 import weakref
@@ -93,165 +92,6 @@ def _validate_jackknife_probe_count(nvecs: int, enabled: bool, allow_low: bool) 
         )
 
 
-def _checked_scratch_nbytes(shape: tuple[int, ...], dtype) -> int:
-    """Return a bounded scratch allocation size without platform-sized overflow."""
-    dtype = np.dtype(dtype)
-    if not shape or any(int(dimension) <= 0 for dimension in shape):
-        raise ValueError(f"Scratch shape must contain only positive dimensions; got {shape}.")
-    max_intp = int(np.iinfo(np.intp).max)
-    if any(int(dimension) > max_intp for dimension in shape):
-        raise OverflowError(f"Scratch dimension exceeds np.intp: shape={shape}.")
-    elements = int(math.prod(int(dimension) for dimension in shape))
-    nbytes = elements * int(dtype.itemsize)
-    if nbytes <= 0:
-        raise ValueError(f"Scratch memmap must have positive size; got shape={shape}.")
-    # np.memmap offsets and POSIX file sizes are signed on supported platforms.
-    if elements > max_intp or nbytes > min(max_intp, (1 << 63) - 1):
-        raise OverflowError(
-            f"Scratch allocation is not addressable on this platform: shape={shape}, bytes={nbytes}."
-        )
-    return nbytes
-
-
-def _secure_memmap(path: Path, shape: tuple[int, ...], dtype) -> np.memmap:
-    """Create a new, owner-only, fixed-size scratch mapping."""
-    dtype = np.dtype(dtype)
-    nbytes = _checked_scratch_nbytes(shape, dtype)
-    flags = os.O_RDWR | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0)
-    fd = os.open(str(path), flags, 0o600)
-    try:
-        os.ftruncate(fd, nbytes)
-        os.chmod(path, 0o600)
-    finally:
-        os.close(fd)
-    return np.memmap(path, mode="r+", dtype=dtype, shape=shape, order="C")
-
-
-class _JackknifeSketchStore:
-    """Disk-backed exact block sketches with one block mapped at a time.
-
-    All files are reserved before computation begins so ENOSPC cannot appear
-    after an expensive source pass.  The configured limit bounds total bytes
-    for one probe tile; only ``columns * samples`` elements are ever mapped.
-    """
-
-    def __init__(
-        self,
-        directory: Path,
-        nblocks: int,
-        columns: int,
-        samples: int,
-        dtype,
-        *,
-        max_total_bytes: int,
-    ) -> None:
-        self.directory = Path(directory)
-        self.nblocks = int(nblocks)
-        self.columns = int(columns)
-        self.samples = int(samples)
-        self.dtype = np.dtype(dtype)
-        self.max_total_bytes = int(max_total_bytes)
-        if self.nblocks <= 0 or self.max_total_bytes <= 0:
-            raise ValueError("Jackknife scratch block count and byte limit must be positive.")
-        self.per_block_bytes = _checked_scratch_nbytes(
-            (self.columns, self.samples), self.dtype
-        )
-        self.total_bytes = self.per_block_bytes * self.nblocks
-        if self.total_bytes > min(int(np.iinfo(np.intp).max), (1 << 63) - 1):
-            raise OverflowError(
-                f"Jackknife scratch is not representable: {self.total_bytes} bytes."
-            )
-        if self.total_bytes > self.max_total_bytes:
-            raise RuntimeError(
-                "Exact jackknife scratch exceeds the configured tile limit: "
-                f"required={self.total_bytes} bytes, limit={self.max_total_bytes} bytes."
-            )
-        self.directory.mkdir(parents=False, exist_ok=False)
-        os.chmod(self.directory, 0o700)
-        free_bytes = int(shutil.disk_usage(self.directory.parent).free)
-        reserve_bytes = max(64 * 1024**2, math.ceil(0.05 * self.total_bytes))
-        if self.total_bytes + reserve_bytes > free_bytes:
-            self.directory.rmdir()
-            raise RuntimeError(
-                "Insufficient free disk for exact jackknife scratch preallocation: "
-                f"required={self.total_bytes} bytes plus reserve={reserve_bytes}, "
-                f"free={free_bytes} bytes in {self.directory.parent}."
-            )
-        self._paths: list[Path] = []
-        self._mapping: np.memmap | None = None
-        self._active_block: int | None = None
-        flags = os.O_RDWR | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0)
-        try:
-            if not hasattr(os, "posix_fallocate"):
-                raise RuntimeError(
-                    "Exact jackknife scratch requires os.posix_fallocate for up-front disk reservation."
-                )
-            for block_id in range(self.nblocks):
-                path = self.directory / f"block-{block_id:06d}.bin"
-                descriptor = os.open(path, flags, 0o600)
-                self._paths.append(path)
-                try:
-                    os.posix_fallocate(descriptor, 0, self.per_block_bytes)
-                    os.fchmod(descriptor, 0o600)
-                finally:
-                    os.close(descriptor)
-        except Exception:
-            self.close()
-            try:
-                self.directory.rmdir()
-            except OSError:
-                pass
-            raise
-
-    @property
-    def peak_mapped_bytes(self) -> int:
-        return self.per_block_bytes
-
-    def view(self, block_id: int) -> np.ndarray:
-        block_id = int(block_id)
-        if block_id < 0 or block_id >= self.nblocks:
-            raise IndexError(f"Jackknife block {block_id} is outside [0, {self.nblocks}).")
-        if self._active_block != block_id:
-            self._close_mapping()
-            self._mapping = np.memmap(
-                self._paths[block_id],
-                mode="r+",
-                dtype=self.dtype,
-                shape=(self.columns, self.samples),
-                order="C",
-            )
-            self._active_block = block_id
-        # The transpose is Fortran contiguous, matching the source/target APIs.
-        return self._mapping.T
-
-    def flush(self) -> None:
-        if self._mapping is not None:
-            self._mapping.flush()
-
-    def unmap(self) -> None:
-        """Release the active block after a native opaque snapshot is sealed."""
-        self._close_mapping()
-
-    def _close_mapping(self) -> None:
-        if self._mapping is None:
-            return
-        self._mapping.flush()
-        mmap_handle = getattr(self._mapping, "_mmap", None)
-        self._mapping = None
-        self._active_block = None
-        if mmap_handle is not None:
-            mmap_handle.close()
-
-    def close(self) -> None:
-        self._close_mapping()
-        for path in self._paths:
-            try:
-                path.unlink()
-            except FileNotFoundError:
-                pass
-        self._paths.clear()
-
-
 def _ndarray_sha256(value: np.ndarray) -> str:
     array = np.ascontiguousarray(value)
     digest = hashlib.sha256()
@@ -263,7 +103,7 @@ def _ndarray_sha256(value: np.ndarray) -> str:
     return digest.hexdigest()
 
 
-_BACKEND_PROVENANCE_SCHEMA_VERSION = 2
+_BACKEND_PROVENANCE_SCHEMA_VERSION = 3
 
 
 def _sha256_path(path: str | Path) -> str:
@@ -350,7 +190,7 @@ def _validate_backend_provenance(value: Mapping, *, expected_stage: str | None =
         "schema_version", "artifact_stage", "backend_name", "backend_version",
         "source_commit", "source_tree_sha256", "native_binary_sha256", "compile_options",
         "native_workspace_cap_bytes", "configured_target_panel_columns",
-        "actual_global_2b_source_columns", "actual_jackknife_4b_source_columns",
+        "actual_global_2b_source_columns", "actual_jackknife_2b_source_columns",
         "actual_target_source_columns",
     }
     if set(value) != required:
@@ -383,7 +223,7 @@ def _validate_backend_provenance(value: Mapping, *, expected_stage: str | None =
         raise ValueError("GxE backend provenance compile_options must be null or an object.")
     integer_fields = (
         "native_workspace_cap_bytes", "configured_target_panel_columns",
-        "actual_global_2b_source_columns", "actual_jackknife_4b_source_columns",
+        "actual_global_2b_source_columns", "actual_jackknife_2b_source_columns",
         "actual_target_source_columns",
     )
     for field in integer_fields:
@@ -391,12 +231,11 @@ def _validate_backend_provenance(value: Mapping, *, expected_stage: str | None =
         if isinstance(observed, bool) or not isinstance(observed, (int, np.integer)) or observed < 0:
             raise ValueError(f"GxE backend provenance field {field!r} is invalid.")
     global_width = int(value["actual_global_2b_source_columns"])
-    jackknife_width = int(value["actual_jackknife_4b_source_columns"])
+    jackknife_width = int(value["actual_jackknife_2b_source_columns"])
     target_width = int(value["actual_target_source_columns"])
-    if jackknife_width not in (0, 2 * global_width):
-        raise ValueError("GxE backend provenance has inconsistent 2B/4B widths.")
-    expected_target_width = jackknife_width if jackknife_width > 0 else global_width
-    if target_width != expected_target_width:
+    if jackknife_width not in (0, global_width):
+        raise ValueError("GxE backend provenance has inconsistent global/block widths.")
+    if target_width != global_width:
         raise ValueError("GxE backend provenance has an inconsistent target width.")
     if value["backend_name"] == "gxeldcore_direct":
         if (
@@ -1330,7 +1169,6 @@ class GenomewideEnvLDScore:
         native_backend: str = "python",
         native_workspace_gib: float = 16.0,
         native_target_panel_columns: int = 64,
-        jackknife_scratch_gib: float = 64.0,
     ):
         self.eps_var = float(eps_var)
         if not np.isfinite(self.eps_var) or self.eps_var <= 0.0:
@@ -1658,9 +1496,6 @@ class GenomewideEnvLDScore:
         self.native_target_panel_columns = int(native_target_panel_columns)
         if self.native_target_panel_columns <= 0:
             raise ValueError("native_target_panel_columns must be positive.")
-        self.jackknife_scratch_gib = float(jackknife_scratch_gib)
-        if not np.isfinite(self.jackknife_scratch_gib) or self.jackknife_scratch_gib <= 0.0:
-            raise ValueError("jackknife_scratch_gib must be positive and finite.")
         self.native_backend = requested_native_backend
         self._native_context = None
         self._native_binary_descriptor: int | None = None
@@ -1955,6 +1790,35 @@ class GenomewideEnvLDScore:
 
     def _make_compute_blocks(self):
         return [(s, min(self.nsnps, s + self.step_size)) for s in range(0, self.nsnps, self.step_size)]
+
+    def _make_jackknife_compute_blocks(self) -> list[list[tuple[int, int]]]:
+        """Split every jackknife group into bounded contiguous genotype reads."""
+        if self.jackknife_ids is None:
+            return []
+        block_ids = np.asarray(self.jackknife_ids, dtype=np.int32)
+        nblocks = len(self.jackknife_labels)
+        if block_ids.shape != (self.nsnps,):
+            raise RuntimeError(
+                "GxE jackknife IDs must have one entry per variant; "
+                f"got {block_ids.shape} for {self.nsnps} variants."
+            )
+        if np.any(block_ids < 0) or np.any(block_ids >= nblocks):
+            raise RuntimeError("GxE jackknife IDs contain an out-of-range block index.")
+        grouped: list[list[tuple[int, int]]] = [[] for _ in range(nblocks)]
+        boundaries = np.r_[
+            0,
+            np.flatnonzero(block_ids[1:] != block_ids[:-1]) + 1,
+            self.nsnps,
+        ]
+        for run_index in range(boundaries.size - 1):
+            run_start = int(boundaries[run_index])
+            run_end = int(boundaries[run_index + 1])
+            block_id = int(block_ids[run_start])
+            for start in range(run_start, run_end, self.step_size):
+                grouped[block_id].append((start, min(run_end, start + self.step_size)))
+        if any(not chunks for chunks in grouped):
+            raise RuntimeError("GxE jackknife construction produced an empty block.")
+        return grouped
 
     def _build_jackknife_blocks(self, spec: str | None) -> tuple[np.ndarray | None, list[str]]:
         if spec is None:
@@ -2371,17 +2235,15 @@ class GenomewideEnvLDScore:
         resident_multiplier = 4 if self.jackknife_ids is not None else 2
         if native_direct:
             # Let U=N*K*B*8.  Each opaque panel owns S and e*S.  Preparing
-            # the global panel peaks at the input 2U plus its 4U snapshot;
-            # exact JK preparation additionally retains the global 4U while
-            # holding a 2U block input and constructing its 4U snapshot.
+            # a panel peaks at its 2U input plus a 4U snapshot. Exact JK keeps
+            # both 2B stored sketches during block preparation, but never keeps
+            # the global and block opaque panels together.
             if itemsize == np.dtype(np.float64).itemsize:
-                peak_multiplier = 10 if self.jackknife_ids is not None else 6
+                peak_multiplier = 8 if self.jackknife_ids is not None else 6
             else:
-                # A float32 stored sketch remains live while Python converts
-                # it to a 2U float64 call input and C++ constructs the 4U
-                # opaque S/eS snapshot: 7U globally and 11U with a retained
-                # global panel plus one block panel preparation.
-                peak_multiplier = 11 if self.jackknife_ids is not None else 7
+                # The two float32 stored sketches use 2U total. Python's 2U
+                # float64 call input and C++'s 4U opaque snapshot peak at 8U.
+                peak_multiplier = 8 if self.jackknife_ids is not None else 7
             denominator_itemsize = np.dtype(np.float64).itemsize
         else:
             peak_multiplier = resident_multiplier
@@ -2400,28 +2262,6 @@ class GenomewideEnvLDScore:
                 f"required={denom} bytes, limit={int(target_gib * (1024 ** 3))} bytes."
             )
         vmax = min(self.nvecs, memory_vmax)
-        if self.jackknife_ids is not None:
-            labels = getattr(self, "jackknife_labels", None)
-            nblocks = (
-                len(labels)
-                if labels is not None
-                else int(np.max(self.jackknife_ids, initial=-1)) + 1
-            )
-            if nblocks <= 0:
-                raise RuntimeError("Exact jackknife tiling requires at least one block.")
-            scratch_per_probe = (
-                2 * int(nblocks) * int(self.nsamp) * int(self.nbins) * itemsize
-            )
-            scratch_limit = int(
-                float(getattr(self, "jackknife_scratch_gib", 64.0)) * (1024 ** 3)
-            )
-            scratch_vmax = scratch_limit // max(1, scratch_per_probe)
-            if scratch_vmax < 1:
-                raise RuntimeError(
-                    "The configured exact-jackknife scratch limit cannot hold one probe tile: "
-                    f"required={scratch_per_probe} bytes, limit={scratch_limit} bytes."
-                )
-            vmax = min(vmax, int(scratch_vmax))
         tiles = _build_balanced_vtiles(self.nvecs, vmax=vmax, gran=64, max_tiles=8)
         if not tiles:
             tiles = [(0, self.nvecs)]
@@ -2437,32 +2277,14 @@ class GenomewideEnvLDScore:
             "native opaque-panel preparation peak"
             if native_direct
             else (
-                "global+block target sketches"
+                "global+one-block in-memory sketches"
                 if self.jackknife_ids is not None
                 else "paired global sketches"
             )
         )
-        scratch_message = ""
-        if self.jackknife_ids is not None:
-            labels = getattr(self, "jackknife_labels", None)
-            nblocks = (
-                len(labels)
-                if labels is not None
-                else int(np.max(self.jackknife_ids, initial=-1)) + 1
-            )
-            scratch_peak = (
-                2
-                * nblocks
-                * self.nsamp
-                * self.nbins
-                * max(v for _, v in tiles)
-                * itemsize
-                / (1024 ** 3)
-            )
-            scratch_message = f", exact scratch≈{scratch_peak:.2f} GiB"
         self.log._log(
             f"[gxe:auto_vchunk] dtype={self.dtype} target≈{target_gib:.1f} GiB, "
-            f"v_tiles=[{vdesc}] -> {label}≈{approx:.2f} GiB{scratch_message}"
+            f"v_tiles=[{vdesc}] -> {label}≈{approx:.2f} GiB"
         )
         return tiles
 
@@ -3003,7 +2825,7 @@ class GenomewideEnvLDScore:
             self.resource_estimates.get("actual_global_2b_source_columns", 0)
         )
         jackknife_width = int(
-            self.resource_estimates.get("actual_jackknife_4b_source_columns", 0)
+            self.resource_estimates.get("actual_jackknife_2b_source_columns", 0)
         )
         target_width = int(self.resource_estimates.get("target_source_columns", 0))
         if artifact_stage == "feature_construction":
@@ -3020,7 +2842,7 @@ class GenomewideEnvLDScore:
             "native_workspace_cap_bytes": workspace_cap,
             "configured_target_panel_columns": panel_columns,
             "actual_global_2b_source_columns": global_width,
-            "actual_jackknife_4b_source_columns": jackknife_width,
+            "actual_jackknife_2b_source_columns": jackknife_width,
             "actual_target_source_columns": target_width,
         }
         _validate_backend_provenance(provenance, expected_stage=str(artifact_stage))
@@ -3716,6 +3538,7 @@ class GenomewideEnvLDScore:
         else:
             self._load_feature_cache(self.feature_cache_path)
         blocks = self._make_compute_blocks()
+        jackknife_blocks = self._make_jackknife_compute_blocks()
         vtiles = self._auto_vtiles()
         self._vtiles_used = list(vtiles)
 
@@ -3723,41 +3546,29 @@ class GenomewideEnvLDScore:
         itemsize = int(np.dtype(self.dtype).itemsize)
         max_block = min(self.step_size, self.nsnps)
         resident_multiplier = 4 if self.jackknife_ids is not None else 2
-        native_opaque_retained_multiplier = (
-            2 * resident_multiplier if self.native_backend == "direct" else 0
-        )
+        # A native projected panel owns S and e*S for one 2B source sketch.
+        # Block and global panels are never retained at the same time.
+        native_opaque_retained_multiplier = 4 if self.native_backend == "direct" else 0
         native_opaque_prepare_peak_multiplier = (
             (
-                (10 if self.jackknife_ids is not None else 6)
+                (8 if self.jackknife_ids is not None else 6)
                 if itemsize == np.dtype(np.float64).itemsize
-                else (11 if self.jackknife_ids is not None else 7)
+                else (8 if self.jackknife_ids is not None else 7)
             )
             if self.native_backend == "direct"
             else 0
         )
-        target_source_columns = resident_multiplier * self.nbins * max_vt
-        scratch_total_bytes = (
-            0
-            if self.jackknife_ids is None
-            else 2 * len(self.jackknife_labels) * self.nsamp * self.nbins * max_vt * itemsize
+        target_source_columns = 2 * self.nbins * max_vt
+        source_columns = self.nbins * max_vt
+        q_rank = self.p_eff + 1
+        global_source_columns = 2 * self.nbins * max_vt
+        jackknife_source_columns = (
+            2 * self.nbins * max_vt if self.jackknife_ids is not None else 0
         )
-        scratch_mapped_bytes = (
+        jackknife_block_bytes = (
             0
             if self.jackknife_ids is None
             else 2 * self.nsamp * self.nbins * max_vt * itemsize
-        )
-        if self.jackknife_ids is None:
-            max_source_groups = 1
-        else:
-            max_source_groups = max(
-                int(np.unique(self.jackknife_ids[s:e]).size) for s, e in blocks
-            )
-        source_columns = max_source_groups * self.nbins * max_vt
-        q_rank = self.p_eff + 1
-        target_panel_columns = min(self.native_target_panel_columns, target_source_columns)
-        global_source_columns = 2 * self.nbins * max_vt
-        jackknife_source_columns = (
-            4 * self.nbins * max_vt if self.jackknife_ids is not None else 0
         )
         native_feature_bytes = 8 * (
             self.nsamp * max_block
@@ -3829,7 +3640,7 @@ class GenomewideEnvLDScore:
             ),
             "source_columns": int(source_columns),
             "actual_global_2b_source_columns": int(global_source_columns),
-            "actual_jackknife_4b_source_columns": int(jackknife_source_columns),
+            "actual_jackknife_2b_source_columns": int(jackknife_source_columns),
             "target_source_columns": int(target_source_columns),
             "native_workspace_cap_bytes": native_workspace_cap_bytes,
             "native_modeled_max_call_workspace_gib": float(
@@ -3844,20 +3655,17 @@ class GenomewideEnvLDScore:
             "target_work_native_plus_float64_gib": float(
                 2 * max_block * target_source_columns * 8 / (1024 ** 3)
             ),
-            "jackknife_scratch_total_gib": float(scratch_total_bytes / (1024 ** 3)),
-            "jackknife_scratch_peak_mapped_gib": float(scratch_mapped_bytes / (1024 ** 3)),
-            # Retained for compatibility with the former monolithic store:
-            # this is peak disk consumption for one tile.
-            "jackknife_scratch_peak_gib": float(scratch_total_bytes / (1024 ** 3)),
+            "jackknife_in_memory_block_sketch_gib": float(
+                jackknife_block_bytes / (1024 ** 3)
+            ),
             "blas_threads": int(self.num_threads),
             "bed_reader_threads": int(self.decode_threads),
         }
         self.log._log(
             "[gxe:resources] modeled resident sketch workspace="
             f"{self.resource_estimates['resident_sketch_workspace_gib']:.3f} GiB; "
-            "jackknife scratch="
-            f"{self.resource_estimates['jackknife_scratch_total_gib']:.3f} GiB total/"
-            f"{self.resource_estimates['jackknife_scratch_peak_mapped_gib']:.3f} GiB mapped; "
+            "jackknife block sketch in memory="
+            f"{self.resource_estimates['jackknife_in_memory_block_sketch_gib']:.3f} GiB; "
             f"BLAS threads={self.num_threads}, bed-reader threads={self.decode_threads}."
         )
 
@@ -3868,7 +3676,13 @@ class GenomewideEnvLDScore:
             "ww": np.zeros((self.nsnps, self.nbins), dtype=np.float64),
         }
 
-        total_units = max(1, len(vtiles) * 2 * len(blocks))
+        jackknife_units = sum(len(group) for group in jackknife_blocks)
+        units_per_tile = (
+            2 * len(blocks)
+            if self.jackknife_ids is None
+            else 2 * jackknife_units + len(blocks)
+        )
+        total_units = max(1, len(vtiles) * units_per_tile)
         bar = tqdm(total=total_units, desc="GxE-LD progress", unit="task", smoothing=0.2, disable=(not self.verbose))
         within_jackknife = None
         max_native_source_leakage = 0.0
@@ -3877,240 +3691,187 @@ class GenomewideEnvLDScore:
                 key: np.zeros((len(self.jackknife_labels), self.nbins, self.nbins), dtype=np.float64)
                 for key in ("xx", "xw", "wx", "ww")
             }
-            scratch_parent = Path(self.outpath).expanduser().resolve().parent
-            scratch_parent.mkdir(parents=True, exist_ok=True)
-            scratch_context = tempfile.TemporaryDirectory(
-                prefix=".gxe-jackknife-", dir=scratch_parent
-            )
-        else:
-            scratch_context = nullcontext(None)
         try:
-            with scratch_context as scratch_name:
-                if scratch_name is not None:
-                    os.chmod(scratch_name, 0o700)
-                for tile_index, (v0, Vt) in enumerate(vtiles):
-                    kt = self.nbins * Vt
-                    target_multiplier = 4 if within_jackknife is not None else 2
-                    if self.native_backend == "direct":
-                        # Opaque native panels hold the global and (when used)
-                        # one block sketch separately; no mutable 4B array is
-                        # accepted by the projected fast path.
-                        target_multiplier = 2
-                    sources = np.zeros(
-                        (self.nsamp, target_multiplier * kt), dtype=self.dtype, order="F"
-                    )
-                    global_x = sources[:, :kt]
-                    global_w = sources[:, kt:2 * kt]
-                    block_store = None
-                    block_sources = None
-                    global_panel = None
-                    block_panel = None
-                    try:
+            for v0, Vt in vtiles:
+                kt = self.nbins * Vt
+                sources = np.zeros(
+                    (self.nsamp, 2 * kt), dtype=self.dtype, order="F"
+                )
+                global_x = sources[:, :kt]
+                global_w = sources[:, kt:2 * kt]
+                block_sources = None
+                block_x = None
+                block_w = None
+                global_panel = None
+                block_panel = None
+                try:
+                    source_groups = jackknife_blocks if within_jackknife is not None else [blocks]
+                    for block_id, source_blocks in enumerate(source_groups):
                         if within_jackknife is not None:
-                            block_store = _JackknifeSketchStore(
-                                Path(scratch_name) / f"tile-{tile_index:04d}",
-                                len(self.jackknife_labels),
-                                2 * kt,
-                                self.nsamp,
-                                self.dtype,
-                                max_total_bytes=int(self.jackknife_scratch_gib * (1024 ** 3)),
+                            block_sources = np.zeros(
+                                (self.nsamp, 2 * kt), dtype=self.dtype, order="F"
                             )
+                            block_x = block_sources[:, :kt]
+                            block_w = block_sources[:, kt:2 * kt]
 
-                        # Source pass: global U is the sum of the disjoint U_b.
-                        # Each realized probe is generated once for the complete
-                        # compute block, then sliced without changing its seed.
-                        for s, e in blocks:
-                            Z = self._generate_random_block(L=(e - s), v_count=Vt, blk_start=s, v_start=v0)
+                        # Each variant contributes once to the global source;
+                        # exact jackknifing mirrors it into only the current
+                        # in-memory block source.
+                        for s, e in source_blocks:
+                            Z = self._generate_random_block(
+                                L=e - s, v_count=Vt, blk_start=s, v_start=v0
+                            )
                             if self.native_backend == "direct":
-                                local_ids = (
-                                    None
-                                    if block_store is None
-                                    else np.asarray(self.jackknife_ids[s:e], dtype=np.int32)
-                                )
                                 unique_ids, source_x, source_w = self._native_source_block(
-                                    s, e, Z, local_ids
+                                    s, e, Z, None
                                 )
-                                if block_store is None:
-                                    global_x += source_x[:, :Vt]
-                                    global_w += source_w[:, :Vt]
-                                else:
-                                    for group_index, block_id in enumerate(unique_ids):
-                                        segment = slice(group_index * Vt, (group_index + 1) * Vt)
-                                        block_sources = block_store.view(int(block_id))
-                                        global_x += source_x[:, segment]
-                                        global_w += source_w[:, segment]
-                                        block_sources[:, :kt] += source_x[:, segment]
-                                        block_sources[:, kt:2 * kt] += source_w[:, segment]
-                                        del block_sources
-                                        block_sources = None
-                                del source_x, source_w, unique_ids
+                                if unique_ids.tolist() != [0]:
+                                    raise RuntimeError(
+                                        "A single-group native GxE source call returned "
+                                        f"unexpected group IDs {unique_ids.tolist()}."
+                                    )
+                                global_x += source_x[:, :kt]
+                                global_w += source_w[:, :kt]
+                                if block_sources is not None:
+                                    block_x += source_x[:, :kt]
+                                    block_w += source_w[:, :kt]
+                                del unique_ids, source_x, source_w
                             else:
                                 G = self._read_genotype_block(s, e)
-                                X = self._prepare_additive_block(s, e, G=G, apply_scale=True, out_dtype=self.dtype)
-                                W = self._prepare_interaction_block(s, e, G=G, apply_scale=True, out_dtype=self.dtype)
+                                X = self._prepare_additive_block(
+                                    s, e, G=G, apply_scale=True, out_dtype=self.dtype
+                                )
+                                W = self._prepare_interaction_block(
+                                    s, e, G=G, apply_scale=True, out_dtype=self.dtype
+                                )
                                 annot_blk = np.asarray(self.annot[s:e], dtype=self.dtype)
-                                if block_store is None:
-                                    self._accumulate_sketch_block(global_x, X, Z, annot_blk)
-                                    self._accumulate_sketch_block(global_w, W, Z, annot_blk)
-                                else:
-                                    local_ids = np.asarray(self.jackknife_ids[s:e], dtype=np.int32)
-                                    for block_id in np.unique(local_ids):
-                                        local = np.flatnonzero(local_ids == block_id)
-                                        block_sources = block_store.view(int(block_id))
-                                        x_local = np.asfortranarray(X[:, local])
-                                        w_local = np.asfortranarray(W[:, local])
-                                        z_local = np.asfortranarray(Z[local])
-                                        annot_local = np.asarray(annot_blk[local], dtype=self.dtype)
-                                        self._accumulate_sketch_block(
-                                            global_x, x_local, z_local, annot_local,
-                                            mirror_chunk=block_sources[:, :kt],
-                                        )
-                                        self._accumulate_sketch_block(
-                                            global_w, w_local, z_local, annot_local,
-                                            mirror_chunk=block_sources[:, kt:2 * kt],
-                                        )
-                                        del block_sources, x_local, w_local, z_local, annot_local
-                                        block_sources = None
+                                self._accumulate_sketch_block(
+                                    global_x, X, Z, annot_blk, mirror_chunk=block_x
+                                )
+                                self._accumulate_sketch_block(
+                                    global_w, W, Z, annot_blk, mirror_chunk=block_w
+                                )
                                 del G, X, W, annot_blk
                             del Z
                             bar.update(1)
-                        if block_store is not None:
-                            block_store.flush()
+
+                        if within_jackknife is None:
+                            continue
+
+                        # Seal and evaluate this block before allocating the
+                        # next one. No block sketch is written to disk.
                         if self.native_backend == "direct":
-                            global_panel, leakage = self._native_prepare_projected_sources(
-                                sources[:, :2 * kt]
+                            block_panel, leakage = self._native_prepare_projected_sources(
+                                block_sources
                             )
                             max_native_source_leakage = max(
                                 max_native_source_leakage, leakage
                             )
-                            del global_x, global_w, sources
-                            global_x = global_w = sources = None
-
-                        # Combined target pass.  The source matrix is laid out
-                        # [global X, global W, block X, block W], so one X GEMM
-                        # and one W GEMM yield all global and within directions.
-                        loaded_block_id = None
-                        for s, e in blocks:
-                            if self.native_backend == "direct" and block_store is None:
+                            del block_x, block_w, block_sources
+                            block_x = block_w = block_sources = None
+                        for s, e in source_blocks:
+                            annot_left = np.asarray(self.annot[s:e], dtype=np.float64)
+                            if self.native_backend == "direct":
                                 work_x, work_w = self._native_target_block(
-                                    s, e, global_panel
+                                    s, e, block_panel
                                 )
-                                self._accumulate_left_scores(work_x[:, :kt], accum["xx"], s, e, Vt)
-                                self._accumulate_left_scores(work_x[:, kt:2 * kt], accum["xw"], s, e, Vt)
-                                self._accumulate_left_scores(work_w[:, :kt], accum["wx"], s, e, Vt)
-                                self._accumulate_left_scores(work_w[:, kt:2 * kt], accum["ww"], s, e, Vt)
-                                del work_x, work_w
-                            elif self.native_backend == "direct":
-                                local_ids = np.asarray(self.jackknife_ids[s:e], dtype=np.int32)
-                                boundaries = np.r_[
-                                    0,
-                                    np.flatnonzero(local_ids[1:] != local_ids[:-1]) + 1,
-                                    local_ids.size,
-                                ]
-                                for run_index in range(boundaries.size - 1):
-                                    local_start = int(boundaries[run_index])
-                                    local_end = int(boundaries[run_index + 1])
-                                    block_id = int(local_ids[local_start])
-                                    if loaded_block_id != block_id:
-                                        block_sources = block_store.view(block_id)
-                                        block_panel, leakage = (
-                                            self._native_prepare_projected_sources(block_sources)
-                                        )
-                                        max_native_source_leakage = max(
-                                            max_native_source_leakage, leakage
-                                        )
-                                        del block_sources
-                                        block_sources = None
-                                        block_store.unmap()
-                                        loaded_block_id = block_id
-                                    run_start = s + local_start
-                                    run_end = s + local_end
-                                    rows = np.arange(run_start, run_end, dtype=np.int64)
-                                    annot_left = np.asarray(self.annot[rows], dtype=np.float64)
-                                    work_x, work_w = self._native_target_block(
-                                        run_start, run_end, global_panel, block_panel
-                                    )
-                                    self._accumulate_left_scores_rows(work_x[:, :kt], accum["xx"], rows, Vt)
-                                    self._accumulate_left_scores_rows(work_x[:, kt:2 * kt], accum["xw"], rows, Vt)
-                                    self._accumulate_annotation_pair_sums(
-                                        work_x[:, 2 * kt:3 * kt], annot_left,
-                                        within_jackknife["xx"][block_id], Vt,
-                                    )
-                                    self._accumulate_annotation_pair_sums(
-                                        work_x[:, 3 * kt:4 * kt], annot_left,
-                                        within_jackknife["xw"][block_id], Vt,
-                                    )
-                                    self._accumulate_left_scores_rows(work_w[:, :kt], accum["wx"], rows, Vt)
-                                    self._accumulate_left_scores_rows(work_w[:, kt:2 * kt], accum["ww"], rows, Vt)
-                                    self._accumulate_annotation_pair_sums(
-                                        work_w[:, 2 * kt:3 * kt], annot_left,
-                                        within_jackknife["wx"][block_id], Vt,
-                                    )
-                                    self._accumulate_annotation_pair_sums(
-                                        work_w[:, 3 * kt:4 * kt], annot_left,
-                                        within_jackknife["ww"][block_id], Vt,
-                                    )
-                                    del work_x, work_w, annot_left, rows
                             else:
                                 G = self._read_genotype_block(s, e)
-                                X = self._prepare_additive_block(s, e, G=G, apply_scale=True, out_dtype=self.dtype)
-                                W = self._prepare_interaction_block(s, e, G=G, apply_scale=True, out_dtype=self.dtype)
-                                if block_store is None:
-                                    work_x = np.asarray(X.T @ sources, dtype=np.float64)
-                                    self._accumulate_left_scores(work_x[:, :kt], accum["xx"], s, e, Vt)
-                                    self._accumulate_left_scores(work_x[:, kt:2 * kt], accum["xw"], s, e, Vt)
-                                    del work_x
-                                    work_w = np.asarray(W.T @ sources, dtype=np.float64)
-                                    self._accumulate_left_scores(work_w[:, :kt], accum["wx"], s, e, Vt)
-                                    self._accumulate_left_scores(work_w[:, kt:2 * kt], accum["ww"], s, e, Vt)
-                                    del work_w
-                                else:
-                                    local_ids = np.asarray(self.jackknife_ids[s:e], dtype=np.int32)
-                                    for block_id in np.unique(local_ids):
-                                        block_id = int(block_id)
-                                        local = np.flatnonzero(local_ids == block_id)
-                                        if loaded_block_id != block_id:
-                                            block_sources = block_store.view(block_id)
-                                            np.copyto(sources[:, 2 * kt:4 * kt], block_sources)
-                                            del block_sources
-                                            block_sources = None
-                                            loaded_block_id = block_id
-                                        rows = s + local
-                                        annot_left = np.asarray(self.annot[rows], dtype=np.float64)
-                                        x_local = np.asfortranarray(X[:, local])
-                                        w_local = np.asfortranarray(W[:, local])
-                                        work_x = np.asarray(x_local.T @ sources, dtype=np.float64)
-                                        self._accumulate_left_scores_rows(work_x[:, :kt], accum["xx"], rows, Vt)
-                                        self._accumulate_left_scores_rows(work_x[:, kt:2 * kt], accum["xw"], rows, Vt)
-                                        self._accumulate_annotation_pair_sums(work_x[:, 2 * kt:3 * kt], annot_left, within_jackknife["xx"][block_id], Vt)
-                                        self._accumulate_annotation_pair_sums(work_x[:, 3 * kt:4 * kt], annot_left, within_jackknife["xw"][block_id], Vt)
-                                        del work_x
-                                        work_w = np.asarray(w_local.T @ sources, dtype=np.float64)
-                                        self._accumulate_left_scores_rows(work_w[:, :kt], accum["wx"], rows, Vt)
-                                        self._accumulate_left_scores_rows(work_w[:, kt:2 * kt], accum["ww"], rows, Vt)
-                                        self._accumulate_annotation_pair_sums(work_w[:, 2 * kt:3 * kt], annot_left, within_jackknife["wx"][block_id], Vt)
-                                        self._accumulate_annotation_pair_sums(work_w[:, 3 * kt:4 * kt], annot_left, within_jackknife["ww"][block_id], Vt)
-                                        del work_w, annot_left, x_local, w_local
+                                X = self._prepare_additive_block(
+                                    s, e, G=G, apply_scale=True, out_dtype=self.dtype
+                                )
+                                W = self._prepare_interaction_block(
+                                    s, e, G=G, apply_scale=True, out_dtype=self.dtype
+                                )
+                                work_x = np.asarray(X.T @ block_sources, dtype=np.float64)
+                                work_w = np.asarray(W.T @ block_sources, dtype=np.float64)
                                 del G, X, W
+                            self._accumulate_annotation_pair_sums(
+                                work_x[:, :kt], annot_left,
+                                within_jackknife["xx"][block_id], Vt,
+                            )
+                            self._accumulate_annotation_pair_sums(
+                                work_x[:, kt:2 * kt], annot_left,
+                                within_jackknife["xw"][block_id], Vt,
+                            )
+                            self._accumulate_annotation_pair_sums(
+                                work_w[:, :kt], annot_left,
+                                within_jackknife["wx"][block_id], Vt,
+                            )
+                            self._accumulate_annotation_pair_sums(
+                                work_w[:, kt:2 * kt], annot_left,
+                                within_jackknife["ww"][block_id], Vt,
+                            )
+                            del work_x, work_w, annot_left
                             bar.update(1)
-                    finally:
+                        block_panel = None
+                        if block_x is not None:
+                            del block_x
+                        if block_w is not None:
+                            del block_w
                         if block_sources is not None:
                             del block_sources
-                        block_panel = None
-                        global_panel = None
-                        if block_store is not None:
-                            try:
-                                block_store.close()
-                            except Exception:
-                                pass
-                            del block_store
-                        if global_x is not None:
-                            del global_x
-                        if global_w is not None:
-                            del global_w
-                        if sources is not None:
-                            del sources
+                        block_x = block_w = block_sources = None
                         gc.collect()
+
+                    # The global target pass is independent of jackknife block
+                    # count and uses the same bounded compute blocks as ordinary
+                    # genome-wide LD-score estimation.
+                    if self.native_backend == "direct":
+                        global_panel, leakage = self._native_prepare_projected_sources(
+                            sources
+                        )
+                        max_native_source_leakage = max(
+                            max_native_source_leakage, leakage
+                        )
+                        del global_x, global_w, sources
+                        global_x = global_w = sources = None
+                    for s, e in blocks:
+                        if self.native_backend == "direct":
+                            work_x, work_w = self._native_target_block(
+                                s, e, global_panel
+                            )
+                        else:
+                            G = self._read_genotype_block(s, e)
+                            X = self._prepare_additive_block(
+                                s, e, G=G, apply_scale=True, out_dtype=self.dtype
+                            )
+                            W = self._prepare_interaction_block(
+                                s, e, G=G, apply_scale=True, out_dtype=self.dtype
+                            )
+                            work_x = np.asarray(X.T @ sources, dtype=np.float64)
+                            work_w = np.asarray(W.T @ sources, dtype=np.float64)
+                            del G, X, W
+                        self._accumulate_left_scores(
+                            work_x[:, :kt], accum["xx"], s, e, Vt
+                        )
+                        self._accumulate_left_scores(
+                            work_x[:, kt:2 * kt], accum["xw"], s, e, Vt
+                        )
+                        self._accumulate_left_scores(
+                            work_w[:, :kt], accum["wx"], s, e, Vt
+                        )
+                        self._accumulate_left_scores(
+                            work_w[:, kt:2 * kt], accum["ww"], s, e, Vt
+                        )
+                        del work_x, work_w
+                        bar.update(1)
+                finally:
+                    block_panel = None
+                    global_panel = None
+                    if block_x is not None:
+                        del block_x
+                    if block_w is not None:
+                        del block_w
+                    if block_sources is not None:
+                        del block_sources
+                    if global_x is not None:
+                        del global_x
+                    if global_w is not None:
+                        del global_w
+                    if sources is not None:
+                        del sources
+                    gc.collect()
         finally:
             try:
                 bar.close()

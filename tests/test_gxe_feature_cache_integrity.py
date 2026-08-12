@@ -86,7 +86,7 @@ def test_schema_v2_cache_seals_exact_nxe_sufficient_statistics(tmp_path):
     assert backend["artifact_stage"] == "feature_construction"
     assert backend["backend_name"] == "python_numpy"
     assert backend["actual_global_2b_source_columns"] == 0
-    assert backend["actual_jackknife_4b_source_columns"] == 0
+    assert backend["actual_jackknife_2b_source_columns"] == 0
     assert metadata["environment_transform"]["analysis_mean"] == (
         math.fsum(float(value) for value in builder.env) / builder.env.size
     )

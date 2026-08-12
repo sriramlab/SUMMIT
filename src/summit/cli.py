@@ -81,7 +81,6 @@ _GXE_BATCH_REFERENCE_OPTIONS = frozenset(
         "--gxe-native-backend",
         "--gxe-native-workspace-gib",
         "--gxe-native-target-panel-columns",
-        "--gxe-jackknife-scratch-gib",
         "--write-gxe-jackknife",
         "--allow-low-probe-gxe-jackknife",
         "--njack",
@@ -572,10 +571,6 @@ def build_parser() -> argparse.ArgumentParser:
         "--gxe-native-target-panel-columns", default=64, type=int,
         help="Column panel width used by the direct native GxE target products.",
     )
-    parser.add_argument(
-        "--gxe-jackknife-scratch-gib", default=64.0, type=float,
-        help="Hard total-disk ceiling in GiB for each exact GxE jackknife probe tile.",
-    )
     parser.add_argument("--write-gxe-jackknife", action="store_true", default=False,
                         help="Write compact within-block traces for exact two-sided GENIE SNP-deletion SEs; uses --njack blocks.")
     parser.add_argument("--allow-low-probe-gxe-jackknife", action="store_true", default=False,
@@ -810,7 +805,6 @@ def _make_gxe_generator(args, log, verbose_on, low_level):
         native_backend=args.gxe_native_backend,
         native_workspace_gib=args.gxe_native_workspace_gib,
         native_target_panel_columns=args.gxe_native_target_panel_columns,
-        jackknife_scratch_gib=args.gxe_jackknife_scratch_gib,
     )
 
 

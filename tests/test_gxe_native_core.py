@@ -630,7 +630,7 @@ def test_opt_in_native_reference_matches_python_artifacts_with_jackknife(tmp_pat
             kernel_mode="standardized", genotype_scale="sample", impute_method="mean",
             target_xz_mem=0.01, write_jackknife=True, jackknife_spec="4",
             allow_low_probe_jackknife=True, native_backend=backend,
-            native_workspace_gib=0.25, jackknife_scratch_gib=0.25,
+            native_workspace_gib=0.25,
         )
 
     python_estimator = estimator("python", "python")
@@ -652,17 +652,14 @@ def test_opt_in_native_reference_matches_python_artifacts_with_jackknife(tmp_pat
                 getattr(native_estimator, name), getattr(python_estimator, name),
                 rtol=2e-11, atol=2e-11,
             )
-        assert native_estimator.resource_estimates["target_source_columns"] == 80
-        assert native_estimator.resource_estimates["jackknife_scratch_total_gib"] > 0.0
-        assert (
-            native_estimator.resource_estimates["jackknife_scratch_peak_mapped_gib"]
-            < native_estimator.resource_estimates["jackknife_scratch_total_gib"]
-        )
+        assert native_estimator.resource_estimates["target_source_columns"] == 40
+        assert native_estimator.resource_estimates["jackknife_in_memory_block_sketch_gib"] > 0.0
+        assert "jackknife_scratch_total_gib" not in native_estimator.resource_estimates
         manifest = json.loads(
             (tmp_path / "native.gxe.ref.json").read_text(encoding="utf-8")
         )
         backend = manifest["backend_provenance"]
-        assert backend["schema_version"] == 2
+        assert backend["schema_version"] == 3
         assert backend["backend_name"] == "gxeldcore_direct"
         assert backend["source_commit"] != "unknown"
         assert len(backend["source_tree_sha256"]) == 64
@@ -670,8 +667,8 @@ def test_opt_in_native_reference_matches_python_artifacts_with_jackknife(tmp_pat
         assert backend["compile_options"]["blas_vendor"] == "OpenBLAS"
         assert backend["native_workspace_cap_bytes"] == int(0.25 * 1024**3)
         assert backend["actual_global_2b_source_columns"] == 40
-        assert backend["actual_jackknife_4b_source_columns"] == 80
-        assert backend["actual_target_source_columns"] == 80
+        assert backend["actual_jackknife_2b_source_columns"] == 40
+        assert backend["actual_target_source_columns"] == 40
         assert (
             native_estimator.resource_estimates[
                 "native_opaque_projected_panel_prepare_peak_gib"

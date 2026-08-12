@@ -256,7 +256,7 @@ def merged_bundle(tmp_path_factory):
 
     monolithic._read_genotype_block = types.MethodType(counted, monolithic)
     monolithic._compute_ldscore()
-    assert reads == 2
+    assert reads == 7
 
     shards = []
     for index in range(10):
@@ -630,7 +630,7 @@ def test_cache_skip_is_two_passes_versus_three(tmp_path):
         estimator._read_genotype_block = types.MethodType(counted, estimator)
         estimator._compute_ldscore()
         counts.append(count)
-    assert counts == [3, 2]
+    assert counts == [8, 7]
 
 
 def test_feature_cache_link_failure_does_not_leave_published_cache(

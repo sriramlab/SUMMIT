@@ -41,11 +41,10 @@
     "shard_preflight": {
       "dtype_bytes": 4,
       "annotation_bins": 1,
-      "jackknife_scratch_arrays": 2,
       "resident_sketch_arrays": 4,
       "main_workspace_bytes_per_sample_variant": 28,
       "minimum_memory_headroom_gib": 12,
-      "minimum_scratch_headroom_gib": 8
+      "minimum_output_headroom_gib": 1
     }
   },
   "legacy_feature_cache_attestation": {

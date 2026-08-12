@@ -251,6 +251,7 @@ def test_gxe_reusable_mode_validation_rejects_ambiguous_or_unsafe_calls(tmp_path
     (
         "--gxe-build-cache",
         "--gxe-feature-cache",
+        "--gxe-jackknife-scratch-gib",
         "--gxe-reference-shard",
         "--gxe-probe-offset",
         "--gxe-merge-shards",

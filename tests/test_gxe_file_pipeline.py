@@ -88,8 +88,10 @@ def test_file_bundle_reconstructs_explicit_individual_level_fit(tmp_path):
     # exact: (1/V) ZZ' = I.  This is an independent file-level oracle, not a
     # tolerance-based Monte-Carlo test.
     def exact_probes(self, L, v_count, blk_start, v_start):
-        assert L == m and v_count == m and blk_start == 0 and v_start == 0
-        return np.asfortranarray(math.sqrt(m) * np.eye(m))
+        assert v_count == m and v_start == 0
+        return np.asfortranarray(
+            math.sqrt(m) * np.eye(m)[blk_start:blk_start + L]
+        )
 
     obj._generate_random_block = types.MethodType(exact_probes, obj)
     original_read = obj._read_genotype_block
@@ -102,8 +104,9 @@ def test_file_bundle_reconstructs_explicit_individual_level_fit(tmp_path):
 
     obj._read_genotype_block = types.MethodType(counted_read, obj)
     obj._compute_ldscore()
-    # One norm, one source, and one combined global/within target pass.
-    assert read_count == 3
+    # One norm/global-target read plus one source and target read for each of
+    # the three in-memory jackknife blocks.
+    assert read_count == 8
 
     fitted, _ = fit_from_files(
         str(out) + ".gxe.ref.json",

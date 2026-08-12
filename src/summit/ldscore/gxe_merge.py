@@ -658,7 +658,7 @@ def _merge_reference_shards_impl(
                 for value in source_backends
             )
             max_jackknife_width = max(
-                int(value["actual_jackknife_4b_source_columns"])
+                int(value["actual_jackknife_2b_source_columns"])
                 for value in source_backends
             )
             merged_backend = {
@@ -673,7 +673,7 @@ def _merge_reference_shards_impl(
                 "native_workspace_cap_bytes": 0,
                 "configured_target_panel_columns": 0,
                 "actual_global_2b_source_columns": max_global_width,
-                "actual_jackknife_4b_source_columns": max_jackknife_width,
+                "actual_jackknife_2b_source_columns": max_jackknife_width,
                 "actual_target_source_columns": (
                     max_jackknife_width or max_global_width
                 ),

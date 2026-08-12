@@ -423,7 +423,7 @@ def _production_shard_count(estimator: dict) -> int:
 
 
 def _shard_resource_estimate(config: dict, n_samples: Any) -> dict[str, int]:
-    """Return the explicit B-shard scratch/resident/workspace capacity model."""
+    """Return the explicit B-shard in-memory capacity model."""
     if not isinstance(n_samples, int) or isinstance(n_samples, bool) or n_samples <= 0:
         raise ValueError("Shard preflight requires a positive integer sample count.")
     estimator = config.get("estimator", {})
@@ -431,11 +431,10 @@ def _shard_resource_estimate(config: dict, n_samples: Any) -> dict[str, int]:
     required_keys = {
         "dtype_bytes",
         "annotation_bins",
-        "jackknife_scratch_arrays",
         "resident_sketch_arrays",
         "main_workspace_bytes_per_sample_variant",
         "minimum_memory_headroom_gib",
-        "minimum_scratch_headroom_gib",
+        "minimum_output_headroom_gib",
     }
     if not isinstance(model, dict) or set(model) != required_keys:
         raise ValueError("Deployment config has an invalid shard-preflight model.")
@@ -451,17 +450,8 @@ def _shard_resource_estimate(config: dict, n_samples: Any) -> dict[str, int]:
     if model["annotation_bins"] != 1:
         raise ValueError("Shard-preflight arithmetic requires the one-bin panel.")
     b = int(estimator["probes_per_shard"])
-    j = int(estimator["jackknife_blocks"])
     step = int(estimator["step_size"])
     itemsize = model["dtype_bytes"]
-    scratch_bytes = (
-        model["jackknife_scratch_arrays"]
-        * j
-        * n_samples
-        * model["annotation_bins"]
-        * b
-        * itemsize
-    )
     resident_sketch_bytes = (
         model["resident_sketch_arrays"]
         * n_samples
@@ -472,18 +462,16 @@ def _shard_resource_estimate(config: dict, n_samples: Any) -> dict[str, int]:
     main_workspace_bytes = (
         n_samples * step * model["main_workspace_bytes_per_sample_variant"]
     )
-    modeled_memory_bytes = scratch_bytes + resident_sketch_bytes + main_workspace_bytes
+    modeled_memory_bytes = resident_sketch_bytes + main_workspace_bytes
     return {
         "n_samples": n_samples,
         "probes_per_shard": b,
-        "scratch_bytes": scratch_bytes,
         "resident_sketch_bytes": resident_sketch_bytes,
         "main_workspace_bytes": main_workspace_bytes,
         "modeled_memory_bytes": modeled_memory_bytes,
         "required_memory_bytes": modeled_memory_bytes
         + model["minimum_memory_headroom_gib"] * GIB,
-        "required_free_bytes": scratch_bytes
-        + model["minimum_scratch_headroom_gib"] * GIB,
+        "required_free_bytes": model["minimum_output_headroom_gib"] * GIB,
     }
 
 
@@ -504,7 +492,7 @@ def _validate_shard_preflight(
     free_bytes = int(filesystem.f_bavail) * int(filesystem.f_frsize)
     if free_bytes < estimate["required_free_bytes"]:
         raise OSError(
-            "Shard scratch filesystem lacks required free space: "
+            "Shard output filesystem lacks required free space: "
             f"available={free_bytes}, required={estimate['required_free_bytes']}."
         )
     return {

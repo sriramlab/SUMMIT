@@ -142,27 +142,16 @@ ordinary additive LD scores, the default `--use-mailman auto` selects it only
 when B<=10 and HWE imputation is explicitly requested; larger B uses the direct
 BLAS path because measured setup/amortization no longer favors Mailman.
 
-### Reusable and parallel reference construction
+### Memory-bounded reference construction
 
 Ordinary reference generation computes projected-feature metadata internally
 and divides large probe counts into memory-bounded tiles. Users provide the
-cohort/design inputs and one output prefix; cache paths, probe intervals,
-partial references, and merging are not part of the public CLI.
-
-The deployment layer can distribute a reference across independent probe
-intervals. Internally it writes an owner-only schema-v2 feature cache containing
-the exact sample/design identity, genotype provenance, variant and annotation
-axes, jackknife blocks, projected feature scales/norms, and deterministic
-diagonal moments. Philox assigns stable global probe identities, and the merger
-requires disjoint contiguous intervals plus exact agreement in the cache hash,
-seed, distribution, dtype, kernel/scaling modes, annotations, variants, and
-jackknife layout. It averages raw panels and within-block intersections by
-probe count and publishes the complete reference transactionally. These
-artifacts remain strict implementation details so a stale or mismatched cache
-cannot silently alter a public analysis.
+cohort/design inputs and one output prefix. Exact jackknife generation retains
+only the global X/W sketch and one current deletion-block X/W sketch in memory;
+it does not create a disk-backed sketch cache.
 
 After wide scoring, `--gxe-fit-batch` accepts a strict
-`summit.gxe.fit_batch` manifest and validates the reference/cache/panels once
+`summit.gxe.fit_batch` manifest and validates the reference and score panels once
 for all listed traits. Every phenotype moments/GWAS/GWIS triplet is still
 independently snapshotted, hashed, parsed, and checked against the reference
 SNP axis. Full and delete-block reference contractions are preaggregated once,
@@ -170,13 +159,11 @@ so per-trait jackknife work depends on compact annotation/block sufficient
 statistics rather than rescanning all SNPs for every deletion block. The
 single-trait `--gxe-fit` path uses the same equations.
 
-The exact two-sided jackknife source sketches are spilled by SNP-deletion block
-to private temporary storage. This avoids rereading every genotype block for
-every deletion block: production uses a norm pass plus one source and one
-combined target pass, while keeping only the global and current-block sketches
-resident. The sealed Hoffman production contract uses eight disjoint B128 jobs
-to reproduce a monolithic B1024 reference (within floating-point reduction
-tolerance) without invalid chromosome sharding.
+For exact two-sided jackknifing, production uses a norm pass, one source pass,
+one within-block target pass, and one global target pass. Each genotype variant
+is visited once per pass, independent of the number of deletion blocks. This
+additional sequential read avoids both a disk spill and an all-block in-memory
+allocation while preserving the exact randomized trace estimator.
 
 ## Input contract and safety checks
 

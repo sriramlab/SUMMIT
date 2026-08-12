@@ -702,7 +702,7 @@ public:
                     std::to_string(leakage) + ", tolerance=" + std::to_string(tolerance)
                 );
             }
-            // Float32 scratch storage can reintroduce small fixed-effect
+            // Float32 sketch storage can reintroduce small fixed-effect
             // components after an exact source projection.  Seal the opaque
             // panel only after a float64 reprojection; target W-left products
             // use e*S and therefore require S itself to be projected.
