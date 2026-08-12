@@ -150,6 +150,16 @@ cohort/design inputs and one output prefix. Exact jackknife generation retains
 only the global X/W sketch and one current deletion-block X/W sketch in memory;
 it does not create a disk-backed sketch cache.
 
+For a wide environment table whose selected columns retain exactly the same
+complete-case cohort, `--gxe-env-cols E1,E2,...` shares each standardized
+genotype-block read across independent environment-specific references. The
+large sketch state remains memory-only and is tiled jointly against the stated
+sketch-memory budget. With `D` environments, one annotation, probe-tile width
+`V`, and `float32` sketches, exact jackknifing retains approximately
+`4 * D * N * V * 4` bytes for the global and current-block X/W sketches. The
+matrix algebra still grows linearly with `D`; the optimization removes repeated
+genotype decoding and input scans rather than changing the estimand.
+
 After wide scoring, `--gxe-fit-batch` accepts a strict
 `summit.gxe.fit_batch` manifest and validates the reference and score panels once
 for all listed traits. Every phenotype moments/GWAS/GWIS triplet is still

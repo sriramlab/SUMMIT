@@ -100,6 +100,29 @@ def test_failed_gxe_cli_attempt_can_retry_with_existing_log(tmp_path, monkeypatc
     assert calls == 2
 
 
+def test_common_cohort_multi_environment_cli_dispatches_once(tmp_path, monkeypatch):
+    from summit import cli
+
+    observed = []
+    monkeypatch.setattr(cli, "apply_env", lambda _: None)
+    monkeypatch.setattr(
+        cli,
+        "_dispatch_gxe_multi_reference",
+        lambda args, *_: observed.append(args.gxe_env_cols),
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "summit", "--geno", "geno", "--env", "wide.tsv",
+            "--gxe-env-cols", "age,bmi", "--out", str(tmp_path / "multi"),
+            "--suppress",
+        ],
+    )
+    cli.main()
+    assert observed == ["age,bmi"]
+
+
 @pytest.mark.parametrize(
     ("extra", "dispatch_name"),
     [

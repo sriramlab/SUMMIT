@@ -67,6 +67,7 @@ _GXE_BATCH_REFERENCE_OPTIONS = frozenset(
     {
         "--geno",
         "--env",
+        "--gxe-env-cols",
         "--covar",
         "--annot",
         "--_gxe-feature-cache",
@@ -132,6 +133,10 @@ from . import utils
 from .logger import Logger
 from .ldscore.gw_ldscore import GenomewideLDScore, apply_env
 from .ldscore.gwe_ldscore import GenomewideEnvLDScore
+from .ldscore.gxe_multi import (
+    generate_multi_environment_references,
+    safe_environment_suffix,
+)
 from .ldscore.gxe_merge import merge_reference_shards
 from .ldscore.gxe_score import score_phenotypes_from_reference
 from .ldscore.win_ldscore import WindowedLDScore
@@ -544,8 +549,15 @@ def build_parser() -> argparse.ArgumentParser:
                         help="Covariate file for LD-score estimation.")
     parser.add_argument("--env", default=None, type=str,
                         help=("Environment file for genome-wide GxE LD-score estimation. "
-                              "Must be used with --geno. File must contain FID, IID, and exactly one environment column. "
+                              "Must be used with --geno. File must contain FID, IID, and one environment column "
+                              "unless --gxe-env-cols selects a common-cohort multi-environment batch. "
                               "This mode writes the XX/XW/WX/WW GENIE trace bundle."))
+    parser.add_argument(
+        "--gxe-env-cols", default=None, type=str,
+        help=("Comma-separated columns in a wide --env file to process as independent "
+              "G+GxE+NxE+residual references while sharing streamed genotype reads. "
+              "All columns must retain exactly the same complete-case cohort."),
+    )
     parser.add_argument("--gxe-pheno", default=None, type=str,
                         help="Optional quantitative phenotype file; writes aligned marginal GWAS/GWIS scores and NxE moments.")
     parser.add_argument("--gxe-pheno-col", default=None, type=str,
@@ -768,12 +780,13 @@ def _make_low_level_env(args):
     }
 
 
-def _make_gxe_generator(args, log, verbose_on, low_level):
+def _make_gxe_generator(args, log, verbose_on, low_level, *, env_col=None, out_path=None,
+                        native_backend=None):
     return GenomewideEnvLDScore(
         bed_path=args.geno,
         env_path=args.env,
         annot_path=args.annot,
-        out_path=args.out,
+        out_path=args.out if out_path is None else out_path,
         covar_path=args.covar,
         rand_dist=args.rand_dist,
         log=log,
@@ -802,9 +815,10 @@ def _make_gxe_generator(args, log, verbose_on, low_level):
         probe_offset=args._gxe_probe_offset,
         feature_cache_path=args._gxe_feature_cache,
         shard_mode=args._gxe_reference_shard,
-        native_backend=args.gxe_native_backend,
+        native_backend=args.gxe_native_backend if native_backend is None else native_backend,
         native_workspace_gib=args.gxe_native_workspace_gib,
         native_target_panel_columns=args.gxe_native_target_panel_columns,
+        env_col=env_col,
     )
 
 
@@ -865,6 +879,51 @@ def _dispatch_gxe_merge(args, log):
     )
 
 
+def _dispatch_gxe_multi_reference(args, log, verbose_on, low_level):
+    raw_columns = str(args.gxe_env_cols).split(",")
+    if any(not column.strip() for column in raw_columns):
+        raise ValueError("--gxe-env-cols contains an empty column name.")
+    columns = tuple(column.strip() for column in raw_columns)
+    if len(columns) < 2 or len(set(columns)) != len(columns):
+        raise ValueError(
+            "--gxe-env-cols must contain at least two unique column names."
+        )
+    suffixes = tuple(safe_environment_suffix(column) for column in columns)
+    if len(set(suffixes)) != len(suffixes):
+        raise ValueError(
+            "--gxe-env-cols names collide after filename normalization."
+        )
+
+    estimators = []
+    try:
+        for column, suffix in zip(columns, suffixes, strict=True):
+            estimators.append(
+                _make_gxe_generator(
+                    args,
+                    log,
+                    verbose_on,
+                    low_level,
+                    env_col=column,
+                    out_path=f"{args.out}.{suffix}",
+                    # This executor shares a single decoded block and invokes
+                    # native BLAS on each environment sequentially.
+                    native_backend="python",
+                )
+            )
+        manifest = generate_multi_environment_references(
+            estimators,
+            batch_manifest=f"{args.out}.gxe.multi.json",
+            requested_backend=args.gxe_native_backend,
+        )
+        log._log(
+            f"[gxe:multi] wrote {len(estimators)} independent references and "
+            f"batch manifest {manifest}."
+        )
+    finally:
+        for estimator in estimators:
+            estimator.close()
+
+
 def _dispatch_ldscore(args, log, verbose_on, low_level):
     if args.env is not None:
         if args.write_ld_mc_var or args.skip_ld_mc:
@@ -875,6 +934,13 @@ def _dispatch_ldscore(args, log, verbose_on, low_level):
         if args.ld_wind_kb is not None:
             log._log("!!! --env is currently supported only for genome-wide LD scores (not --ld-wind-kb). !!!")
             raise SystemExit(1)
+        if args.gxe_env_cols is not None:
+            log._log(
+                ">>> LD score mode: common-cohort multi-environment GxE "
+                f"references, --gxe-env-cols {args.gxe_env_cols}"
+            )
+            _dispatch_gxe_multi_reference(args, log, verbose_on, low_level)
+            return
         log._log(f">>> LD score mode: genome-wide GxE cross/interaction LD scores, --env {args.env}")
         gwe = _make_gxe_generator(args, log, verbose_on, low_level)
         try:
@@ -1796,6 +1862,29 @@ def main():
     if args.gxe_pheno_cols is not None and not gxe_score_mode:
         log._log("!!! --gxe-pheno-cols is valid only with --gxe-score-reference. !!!")
         raise SystemExit(1)
+    if args.gxe_env_cols is not None:
+        if not gxe_trace_mode:
+            log._log(
+                "!!! --gxe-env-cols is valid only for --geno/--env reference generation. !!!"
+            )
+            raise SystemExit(1)
+        if args.gxe_pheno is not None:
+            log._log(
+                "!!! Multi-environment construction is phenotype-free; score traits "
+                "against each generated reference afterward. !!!"
+            )
+            raise SystemExit(1)
+        if args._gxe_feature_cache is not None or args._gxe_reference_shard:
+            log._log(
+                "!!! Multi-environment construction does not consume feature caches or shards. !!!"
+            )
+            raise SystemExit(1)
+        if args.gxe_overwrite:
+            log._log(
+                "!!! Multi-environment batches are transactionally no-overwrite; "
+                "choose a fresh --out prefix. !!!"
+            )
+            raise SystemExit(1)
 
     if gxe_workflow_mode and not args.gxe_overwrite:
         if gxe_cache_mode:

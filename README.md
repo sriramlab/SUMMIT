@@ -243,6 +243,25 @@ two-sided deletion intersections. Each trait triplet contains direct marginal
 additive and interaction scores plus the indispensable scalar
 `y' diag(E^2) y`.
 
+Several environments on an identical complete-case cohort can share every
+streamed genotype read while retaining independent four-component models:
+
+```bash
+summit \
+  --geno ref_panel --env environments.txt --covar covariates.txt \
+  --gxe-env-cols age,bmi,smoking \
+  --nvecs 1024 --seed 20260808 --rand-dist rademacher \
+  --target-xz-mem 16 --write-gxe-jackknife --njack 100 \
+  --out outs/reference.multi
+```
+
+This writes `reference.multi.<environment>.gxe.ref.json` plus a batch manifest
+at `reference.multi.gxe.multi.json`. The implementation holds each
+environment's global and current-block sketches in RAM and never spills them to
+disk. Environments with different missingness are rejected; intersect their
+sample rows explicitly or place them in separate batches. The resulting models
+are independent per environment, not a cross-environment covariance model.
+
 Exact jackknife generation requires at least 100 probes by default. Lower
 counts can strongly contaminate the delete-block SE through randomized
 within-block trace noise; the diagnostic-only override is

@@ -866,6 +866,7 @@ def read_env_and_cov(
     pheno_col: str | None = None,
     missing_values: Sequence[str] = ("-9", "NA", "NaN", "nan", ".", "None", "null"),
     sample_ids: pd.DataFrame | None = None,
+    env_col: str | None = None,
 ):
     id_types = {"FID": str, "IID": str}
     if sample_ids is None:
@@ -893,12 +894,20 @@ def read_env_and_cov(
     if env.duplicated(subset=["FID", "IID"]).any():
         raise ValueError("Environment file contains duplicate FID/IID rows.")
     env_cols = [c for c in env.columns if c not in ("FID", "IID")]
-    if len(env_cols) != 1:
+    if env_col is None and len(env_cols) != 1:
         raise ValueError(
             "Environment file must contain exactly one environment column in addition to FID and IID. "
             f"Found {len(env_cols)} column(s): {env_cols}."
         )
-    env_name = env_cols[0]
+    if env_col is None:
+        env_name = env_cols[0]
+    else:
+        env_name = str(env_col)
+        if env_name not in env_cols:
+            raise ValueError(
+                f"Environment column {env_name!r} is not present in {env_filename}; "
+                f"available columns are {env_cols}."
+            )
 
     merged = fam.merge(env[["FID", "IID", env_name]], on=["FID", "IID"], how="left", indicator=True)
     n_missing_env = int((merged["_merge"] != "both").sum())
@@ -1172,6 +1181,7 @@ class GenomewideEnvLDScore:
         native_backend: str = "python",
         native_workspace_gib: float = 16.0,
         native_target_panel_columns: int = 64,
+        env_col: str | None = None,
     ):
         self.eps_var = float(eps_var)
         if not np.isfinite(self.eps_var) or self.eps_var <= 0.0:
@@ -1458,6 +1468,7 @@ class GenomewideEnvLDScore:
             pheno_col=self.pheno_col,
             missing_values=self.missing_values,
             sample_ids=self.sample_ids,
+            env_col=env_col,
         )
         self.row_sel = np.asarray(keep_idx_global, dtype=int)
         self.env = np.asarray(env_vec, dtype=np.float64)
@@ -3358,7 +3369,20 @@ class GenomewideEnvLDScore:
         except Exception as e:
             self.log._log(f"[warn] Failed to compute summary stats / correlation for {label}: {e}")
 
-    def _compute_ldscore(self):
+    def _compute_ldscore(
+        self,
+        compute_callback=None,
+        expected_provenance=None,
+        *,
+        provenance_preverified: bool = False,
+    ):
+        if provenance_preverified and (
+            compute_callback is None or expected_provenance is None
+        ):
+            raise ValueError(
+                "Preverified genotype provenance is valid only when publishing "
+                "precomputed scores against an explicit provenance record."
+            )
         original_outpath = self.outpath
         final_prefix = Path(original_outpath).expanduser().resolve()
         lock_path = Path(f"{final_prefix}.gxe.bundle.lock")
@@ -3381,7 +3405,19 @@ class GenomewideEnvLDScore:
             # final re-hash below prevents publication of arrays computed from
             # a moving or mixed BED/BIM/FAM target.
             self._assert_construction_genotype_state()
-            initial_provenance = self._genotype_provenance()
+            initial_provenance = (
+                {key: dict(value) for key, value in expected_provenance.items()}
+                if provenance_preverified
+                else self._genotype_provenance()
+            )
+            if (
+                expected_provenance is not None
+                and initial_provenance != expected_provenance
+            ):
+                raise RuntimeError(
+                    "PLINK input provenance changed after shared multi-environment "
+                    "computation and before bundle publication."
+                )
             self._active_genotype_provenance = initial_provenance
             with tempfile.TemporaryDirectory(
                 prefix=".gxe-bundle-stage-", dir=final_prefix.parent
@@ -3398,7 +3434,11 @@ class GenomewideEnvLDScore:
                     except Exception:
                         blas_context = nullcontext()
                     with blas_context:
-                        result = self._compute_ldscore_impl()
+                        result = (
+                            self._compute_ldscore_impl()
+                            if compute_callback is None
+                            else compute_callback()
+                        )
 
                     # Output artifacts remain beside their manifest after
                     # publication, so their basename-relative paths are
@@ -3423,7 +3463,16 @@ class GenomewideEnvLDScore:
                             )
                             self._atomic_json(payload, str(manifest))
 
-                    self._assert_genotype_provenance_unchanged(initial_provenance)
+                    if provenance_preverified:
+                        # The multi-environment owner brackets publication with
+                        # shared full-file hashes. Avoid re-reading the same BED
+                        # twice for every environment while still catching
+                        # inode/size/timestamp changes before each bundle seal.
+                        self._assert_construction_genotype_state()
+                    else:
+                        self._assert_genotype_provenance_unchanged(
+                            initial_provenance
+                        )
 
                     staged_outputs = self._planned_output_paths()
                     expected_published_hashes = {
@@ -3912,6 +3961,53 @@ class GenomewideEnvLDScore:
             within_jackknife = {
                 name: value / float(self.nvecs) for name, value in within_jackknife.items()
             }
+
+        return self._finalize_ldscore_outputs(scores, within_jackknife)
+
+    def _finalize_ldscore_outputs(
+        self,
+        scores: Mapping[str, np.ndarray],
+        within_jackknife: Mapping[str, np.ndarray] | None,
+    ):
+        """Validate and write already-computed in-memory directional scores."""
+        self._assert_output_paths_available()
+        if set(scores) != {"xx", "xw", "wx", "ww"}:
+            raise ValueError("GxE directional score set must be exactly XX/XW/WX/WW.")
+        for name, value in scores.items():
+            array = np.asarray(value)
+            if array.shape != (self.nsnps, self.nbins):
+                raise ValueError(
+                    f"GxE {name.upper()} score shape {array.shape} does not match "
+                    f"({self.nsnps}, {self.nbins})."
+                )
+            if not np.all(np.isfinite(array)):
+                raise ValueError(f"GxE {name.upper()} scores contain NaN or infinity.")
+        if within_jackknife is not None:
+            if self.jackknife_ids is None:
+                raise ValueError(
+                    "In-memory jackknife traces were supplied without configured "
+                    "GxE jackknife blocks."
+                )
+            if set(within_jackknife) != {"xx", "xw", "wx", "ww"}:
+                raise ValueError(
+                    "GxE jackknife directional trace set must be exactly XX/XW/WX/WW."
+                )
+            expected_shape = (
+                len(self.jackknife_labels),
+                self.nbins,
+                self.nbins,
+            )
+            for name, value in within_jackknife.items():
+                array = np.asarray(value)
+                if array.shape != expected_shape:
+                    raise ValueError(
+                        f"GxE {name.upper()} jackknife trace shape {array.shape} "
+                        f"does not match {expected_shape}."
+                    )
+                if not np.all(np.isfinite(array)):
+                    raise ValueError(
+                        f"GxE {name.upper()} jackknife traces contain NaN or infinity."
+                    )
 
         # Persist the raw realized-sample directional scores.  A common XX-like
         # M/r subtraction is not a valid finite-sample correction for XW/WX,
