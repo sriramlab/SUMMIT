@@ -20,4 +20,6 @@ jobs:
           CMAKE_ARGS: -DBLA_VENDOR=OpenBLAS
         run: python -m pip install -e . pytest
       - name: Run unit and numerical-oracle tests
-        run: python -m pytest -q
+        env:
+          PYTHONFAULTHANDLER: "1"
+        run: python -X faulthandler -m pytest -vv -s
