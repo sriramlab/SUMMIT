@@ -2428,7 +2428,28 @@ class GenomewideEnvLDScore:
     def _native_prepare_projected_sources(self, sources: np.ndarray):
         if self._native_context is None:
             raise RuntimeError("The bounded native GxE backend was not initialized.")
-        tolerance = 5.0e-6 if np.asarray(sources).dtype == np.float32 else 1.0e-9
+        source_dtype = np.asarray(sources).dtype
+        if source_dtype == np.float32:
+            # A global sketch receives one rounded float32 update per genotype
+            # block.  The native panel is always reprojected in float64 before
+            # use, so this gate distinguishes bounded accumulation roundoff
+            # from a genuinely nonprojected source rather than requiring the
+            # pre-correction sketch to meet float64 orthogonality.  The 1e-3
+            # ceiling remains an absolute contract guard.
+            accumulation_blocks = max(
+                1, math.ceil(int(self.nsnps) / int(self.step_size))
+            )
+            tolerance = min(
+                1.0e-3,
+                max(
+                    5.0e-6,
+                    32.0
+                    * float(np.finfo(np.float32).eps)
+                    * math.sqrt(float(accumulation_blocks)),
+                ),
+            )
+        else:
+            tolerance = 1.0e-9
         panel = self._native_context.prepare_projected_sources(
             sources=np.asfortranarray(sources, dtype=np.float64),
             tolerance=tolerance,

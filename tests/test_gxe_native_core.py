@@ -738,6 +738,40 @@ def test_opt_in_native_backend_supports_float32_storage(tmp_path):
         native_estimator.close()
 
 
+def test_float32_panel_gate_allows_bounded_accumulation_roundoff():
+    class FakePanel:
+        leakage = 1.1e-5
+
+    class FakeContext:
+        def __init__(self):
+            self.tolerance = None
+            self.sources = None
+
+        def prepare_projected_sources(self, *, sources, tolerance):
+            self.sources = sources
+            self.tolerance = tolerance
+            return FakePanel()
+
+    estimator = GenomewideEnvLDScore.__new__(GenomewideEnvLDScore)
+    estimator._native_context = FakeContext()
+    estimator.nsnps = 454_207
+    estimator.step_size = 500
+    sources = np.zeros((3, 2), dtype=np.float32, order="F")
+
+    panel, leakage = estimator._native_prepare_projected_sources(sources)
+
+    expected = (
+        32.0
+        * np.finfo(np.float32).eps
+        * np.sqrt(np.ceil(estimator.nsnps / estimator.step_size))
+    )
+    assert panel is not None
+    assert leakage == 1.1e-5
+    assert estimator._native_context.tolerance == pytest.approx(expected)
+    assert 1.1e-5 < estimator._native_context.tolerance < 1.0e-3
+    assert estimator._native_context.sources.dtype == np.float64
+
+
 def test_checked_in_benchmark_records_4b_raw_timings_and_b128_scratch():
     args = benchmark_native._parser().parse_args(
         [
