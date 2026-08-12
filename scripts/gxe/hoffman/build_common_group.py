@@ -289,7 +289,9 @@ def build_group(args: argparse.Namespace) -> Path:
             }
         )
 
-    keep = environment.notna().to_numpy()
+    # pandas 3 may return a read-only view; the complete-case mask is refined
+    # in place below.
+    keep = environment.notna().to_numpy(copy=True)
     keep &= ~numeric_covariates.isna().any(axis=1).to_numpy()
     keep &= ~phenotypes.isna().any(axis=1).to_numpy()
     n_selected = int(keep.sum())

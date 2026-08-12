@@ -1309,7 +1309,9 @@ def _aligned_panel(
     for col in ("CHR", "SNP", "BP"):
         if not np.array_equal(panel[col].astype(str).to_numpy(), variants[col].astype(str).to_numpy()):
             raise ValueError(f"{path} is not in the reference variant order ({col} mismatch).")
-    values = panel.loc[:, list(value_columns)].to_numpy(dtype=np.float64)
+    values = panel.loc[:, list(value_columns)].to_numpy(
+        dtype=np.float64, copy=True
+    )
     if not np.all(np.isfinite(values)):
         raise ValueError(f"{path} contains a non-finite panel value.")
     if not allow_negative_storage and np.any(values < 0.0):

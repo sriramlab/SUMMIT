@@ -1069,7 +1069,10 @@ def read_env_and_cov(
     pheno_vec = None
     phenotype_residual_fraction = None
     if phenotype_name is not None:
-        pheno_vec = merged[phenotype_name].to_numpy(dtype=np.float64)
+        # pandas 3 may expose a read-only zero-copy array.  Projection and
+        # normalization below are intentionally in place, so request an
+        # explicitly writable buffer at this mutation boundary.
+        pheno_vec = merged[phenotype_name].to_numpy(dtype=np.float64, copy=True)
         raw_centered = pheno_vec - float(pheno_vec.mean())
         raw_ss = float(np.dot(raw_centered, raw_centered))
         if C.shape[1] > 0:

@@ -224,7 +224,7 @@ def _read_panel_file(
     for column in ("CHR", "SNP", "BP"):
         if not np.array_equal(frame[column].astype(str), variants[column].astype(str)):
             raise ValueError(f"Shard panel {path} is misaligned at {column}.")
-    values = frame[names].to_numpy(dtype=np.float64)
+    values = frame[names].to_numpy(dtype=np.float64, copy=True)
     if not np.all(np.isfinite(values)) or np.any(values < 0.0):
         raise ValueError(f"Shard panel contains a non-finite or negative value: {path}.")
     # Squares may serialize as signed zero.  Canonicalize it so numerical
