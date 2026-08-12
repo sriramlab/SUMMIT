@@ -222,6 +222,37 @@ int count_validated_rows_fd(int descriptor, const FileState& state, const char* 
     return static_cast<int>(rows);
 }
 
+// Release only complete pages from a decoded BED range. The underlying file is
+// unchanged, and a later source/target pass can fault the same pages back in.
+// This mirrors the bounded-residency policy used by the additive BED reader.
+void madvise_dontneed_consumed_range(unsigned char* base,
+                                     size_t file_size,
+                                     size_t offset,
+                                     size_t length) noexcept {
+    if (base == nullptr || length == 0 || offset >= file_size) return;
+    const size_t available = file_size - offset;
+    const size_t bounded_length = std::min(length, available);
+    const size_t end = offset + bounded_length;
+    if (end <= offset) return;
+
+    const long observed_page_size = ::sysconf(_SC_PAGESIZE);
+    const size_t page_size = observed_page_size > 0
+        ? static_cast<size_t>(observed_page_size)
+        : static_cast<size_t>(4096);
+    const uintptr_t first_address = reinterpret_cast<uintptr_t>(base + offset);
+    const uintptr_t end_address = reinterpret_cast<uintptr_t>(base + end);
+    const uintptr_t first_full_page =
+        (first_address + page_size - 1) & ~(static_cast<uintptr_t>(page_size) - 1U);
+    const uintptr_t after_last_full_page =
+        end_address & ~(static_cast<uintptr_t>(page_size) - 1U);
+    if (after_last_full_page <= first_full_page) return;
+    (void)::madvise(
+        reinterpret_cast<void*>(first_full_page),
+        static_cast<size_t>(after_last_full_page - first_full_page),
+        MADV_DONTNEED
+    );
+}
+
 #endif
 
 static uint64_t next_context_id() {
@@ -347,6 +378,7 @@ public:
                     std::string("Failed to mmap GxE native BED: ") + std::strerror(errno)
                 );
             }
+            (void)::madvise(bed_base_, bed_size_, MADV_SEQUENTIAL);
             if (bed_base_[0] != 0x6c || bed_base_[1] != 0x1b || bed_base_[2] != 0x01) {
                 throw std::runtime_error("GxE native input is not a SNP-major PLINK BED");
             }
@@ -1223,6 +1255,22 @@ private:
                 }
             }
         }
+#if defined(__linux__)
+        const size_t consumed_offset = checked_add(
+            3U,
+            checked_mul(
+                static_cast<size_t>(blk_start), bytes_per_snp_,
+                "decoded BED offset"
+            ),
+            "decoded BED offset"
+        );
+        const size_t consumed_length = checked_mul(
+            static_cast<size_t>(l), bytes_per_snp_, "decoded BED range"
+        );
+        madvise_dontneed_consumed_range(
+            bed_base_, bed_size_, consumed_offset, consumed_length
+        );
+#endif
         int64_t missing = 0;
         for (int count : observed) missing += static_cast<int64_t>(n_ - count);
         if (require_missing_free && missing != 0) {
