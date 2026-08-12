@@ -1565,7 +1565,7 @@ def test_embedded_cli_suppresses_numactl_reexec_and_restores_process_state(
 ):
     original_argv = ["deployment-runner", "--sealed"]
     monkeypatch.setattr(DEPLOY.sys, "argv", original_argv)
-    monkeypatch.setenv("SUMMIT_NUMACTL_WRAPPED", "1")
+    monkeypatch.delenv("SUMMIT_NUMACTL_WRAPPED", raising=False)
     observed = {}
 
     class FakeCli:
@@ -1582,7 +1582,7 @@ def test_embedded_cli_suppresses_numactl_reexec_and_restores_process_state(
         "sentinel": "1",
     }
     assert DEPLOY.sys.argv is original_argv
-    assert os.environ["SUMMIT_NUMACTL_WRAPPED"] == "1"
+    assert "SUMMIT_NUMACTL_WRAPPED" not in os.environ
 
 
 def test_distribution_fingerprint_binds_recorded_file_bytes(

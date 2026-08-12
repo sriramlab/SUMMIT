@@ -22,4 +22,4 @@ jobs:
       - name: Run unit and numerical-oracle tests
         env:
           PYTHONFAULTHANDLER: "1"
-        run: python -X faulthandler -m pytest -vv -s
+        run: python -X faulthandler -m pytest -q

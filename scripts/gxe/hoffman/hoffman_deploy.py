@@ -4344,7 +4344,9 @@ def _runtime_uge_environment(common: dict) -> dict:
 def _invoke_summit_cli(cli, command: list[str]) -> None:
     """Run the frozen CLI in-process after the sealed outer NUMA launch."""
     previous_argv = sys.argv
+    previous_numactl_sentinel = os.environ.get("SUMMIT_NUMACTL_WRAPPED")
     try:
+        os.environ["SUMMIT_NUMACTL_WRAPPED"] = "1"
         sys.argv = ["summit", *command]
         try:
             result = cli.main()
@@ -4359,6 +4361,10 @@ def _invoke_summit_cli(cli, command: list[str]) -> None:
                 raise RuntimeError(f"SUMMIT CLI returned unexpected status {result!r}.")
     finally:
         sys.argv = previous_argv
+        if previous_numactl_sentinel is None:
+            os.environ.pop("SUMMIT_NUMACTL_WRAPPED", None)
+        else:
+            os.environ["SUMMIT_NUMACTL_WRAPPED"] = previous_numactl_sentinel
 
 
 def _execute_plan(plan: dict, runtime: dict, common: dict, task: str) -> None:
