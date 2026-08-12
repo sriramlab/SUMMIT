@@ -636,10 +636,18 @@ public:
             dgemm_nn(n_, columns, l, geno.data(), n_, weighted.data(), l, source_x, n_);
             for (int j = 0; j < l; ++j) {
                 const int group = static_cast<int>(gp[j]);
-                const double ratio = swp[j] / sxp[j];
                 for (int c = 0; c < v; ++c) {
+                    const double probe = zp[
+                        static_cast<size_t>(c) * static_cast<size_t>(l) +
+                        static_cast<size_t>(j)
+                    ];
                     const size_t index = static_cast<size_t>(group * v + c) * static_cast<size_t>(l) + static_cast<size_t>(j);
-                    weighted[index] *= ratio;
+                    // Form the interaction weight directly.  Reusing the X
+                    // weight through ``*(scale_w / scale_x)`` is
+                    // algebraically unnecessary and can overflow at the
+                    // intermediate ratio even when this final product is
+                    // finite.
+                    weighted[index] = probe * ap[j] * swp[j];
                 }
             }
             dgemm_nn(n_, columns, l, geno.data(), n_, weighted.data(), l, source_w, n_);

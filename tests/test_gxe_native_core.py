@@ -222,6 +222,32 @@ def test_native_feature_source_target_match_dense_oracle(tmp_path):
         np.testing.assert_allclose(generic_w, expected["w"].T @ projected, rtol=4e-12, atol=4e-12)
 
 
+def test_native_source_forms_interaction_weights_without_scale_ratio_overflow(tmp_path):
+    rng = np.random.default_rng(731)
+    n, m = 37, 9
+    raw = rng.binomial(2, rng.uniform(0.15, 0.45, size=m), size=(n, m)).astype(float)
+    prefix = _write_plink(tmp_path, raw, "source_scale_ratio")
+    env, q = _design(n)
+    probes = np.asfortranarray(rng.choice([-1.0, 1.0], size=(m, 5)))
+
+    with _native_context(prefix, env, q) as context:
+        source_x, source_w, missing = context.source_block(
+            0,
+            m,
+            np.full(m, 1.0e-320, dtype=np.float64),
+            np.ones(m, dtype=np.float64),
+            np.ones(m, dtype=np.float64),
+            probes,
+            np.zeros(m, dtype=np.int32),
+            1,
+            True,
+        )
+
+    assert missing == 0
+    assert np.isfinite(source_x).all()
+    assert np.isfinite(source_w).all()
+
+
 def test_projected_panel_is_opaque_snapshot_bound_to_one_context(tmp_path):
     rng = np.random.default_rng(919)
     n, m = 31, 8
