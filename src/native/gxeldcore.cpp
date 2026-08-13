@@ -238,7 +238,8 @@ bool gemm_requires_integrity_checks(int m, int n, int k) {
 size_t gemm_integrity_workspace_elements(int m, int n, int k) {
     if (!gemm_requires_integrity_checks(m, n, k)) return 0;
     size_t dimensions = checked_add(
-        static_cast<size_t>(m), static_cast<size_t>(k),
+        static_cast<size_t>(m),
+        checked_mul(2U, static_cast<size_t>(k), "GEMM integrity workspace"),
         "GEMM integrity workspace"
     );
     dimensions = checked_add(
@@ -250,19 +251,7 @@ size_t gemm_integrity_workspace_elements(int m, int n, int k) {
         static_cast<size_t>(kGemmIntegrityChecks), dimensions,
         "GEMM integrity workspace"
     );
-    const size_t copied_a = checked_mul(
-        static_cast<size_t>(m), static_cast<size_t>(k),
-        "protected GEMM input A"
-    );
-    const size_t copied_b = checked_mul(
-        static_cast<size_t>(k), static_cast<size_t>(n),
-        "protected GEMM input B"
-    );
-    return checked_add(
-        checks,
-        checked_add(copied_a, copied_b, "protected GEMM inputs"),
-        "protected GEMM workspace"
-    );
+    return checks;
 }
 
 uint64_t splitmix64(uint64_t value) {
@@ -311,53 +300,11 @@ bool gemm_integrity_disagrees(double expected, double observed) {
         || std::abs(expected - observed) > tolerance;
 }
 
-void copy_col_major_matrix(int rows, int columns,
-                           const double* source, int source_ld,
-                           double* destination, int destination_ld,
-                           int requested_threads) {
-    const int threads = std::max(1, std::min(requested_threads, columns));
-    const size_t column_bytes = checked_mul(
-        static_cast<size_t>(rows), sizeof(double),
-        "protected GEMM input column"
-    );
-#ifdef _OPENMP
-    #pragma omp parallel for schedule(static) num_threads(threads)
-#endif
-    for (int column = 0; column < columns; ++column) {
-        std::memcpy(
-            destination
-                + static_cast<size_t>(column)
-                    * static_cast<size_t>(destination_ld),
-            source
-                + static_cast<size_t>(column)
-                    * static_cast<size_t>(source_ld),
-            column_bytes
-        );
-    }
-}
-
 int64_t dgemm_tn_checked(int m, int n, int k,
                          const double* a, int lda,
                          const double* b, int ldb,
                          double* c, int ldc,
                          int requested_threads) {
-    std::unique_ptr<double[]> primary_a(new double[
-        checked_mul(static_cast<size_t>(k), static_cast<size_t>(m),
-                    "protected TN input A")
-    ]);
-    std::unique_ptr<double[]> primary_b(new double[
-        checked_mul(static_cast<size_t>(k), static_cast<size_t>(n),
-                    "protected TN input B")
-    ]);
-    copy_col_major_matrix(
-        k, m, a, lda, primary_a.get(), k, requested_threads
-    );
-    copy_col_major_matrix(
-        k, n, b, ldb, primary_b.get(), k, requested_threads
-    );
-    dgemm_tn(
-        m, n, k, primary_a.get(), k, primary_b.get(), k, c, ldc
-    );
     std::vector<double> coefficients = gemm_integrity_coefficients(m);
     std::vector<double> projected(
         checked_mul(
@@ -383,6 +330,10 @@ int64_t dgemm_tn_checked(int m, int n, int k,
         projected.data(), k, b, ldb,
         expected.data(), kGemmIntegrityChecks, requested_threads
     );
+    // Build the expected fingerprints before entering vendor BLAS.  This
+    // removes the former O(mk + kn) protected-input snapshots while ensuring
+    // that a bad output cannot contaminate its own reference value.
+    dgemm_tn(m, n, k, a, lda, b, ldb, c, ldc);
     dgemm_tn_tiled(
         kGemmIntegrityChecks, n, m,
         coefficients.data(), m, c, ldc,
@@ -400,6 +351,35 @@ int64_t dgemm_tn_checked(int m, int n, int k,
         }
         return false;
     };
+    bool any_disagreement = false;
+    for (int column = 0; column < n; ++column) {
+        any_disagreement = any_disagreement || column_disagrees(column);
+    }
+    if (any_disagreement) {
+        // A repair is valid only if both inputs still reproduce their exact
+        // pre-call fingerprints.  These deterministic recalculations run only
+        // on the rare fault path; a mismatch fails closed instead of repairing
+        // from a potentially altered input.
+        std::vector<double> projected_after(projected.size());
+        dgemm_nn_tiled(
+            k, kGemmIntegrityChecks, m,
+            a, lda, coefficients.data(), m,
+            projected_after.data(), k, requested_threads
+        );
+        dgemm_tn_tiled(
+            kGemmIntegrityChecks, n, k,
+            projected_after.data(), k, b, ldb,
+            observed.data(), kGemmIntegrityChecks, requested_threads
+        );
+        if (std::memcmp(projected.data(), projected_after.data(),
+                        projected.size() * sizeof(double)) != 0 ||
+            std::memcmp(expected.data(), observed.data(),
+                        expected.size() * sizeof(double)) != 0) {
+            throw std::runtime_error(
+                "Vendor BLAS altered a protected TN GEMM input; refusing repair"
+            );
+        }
+    }
     // Threaded BLAS partition failures usually damage a contiguous output range.
     // Recompute each such range as one cache-tiled product; launching a full
     // reduction independently for every flagged column rereads A needlessly.
@@ -423,6 +403,20 @@ int64_t dgemm_tn_checked(int m, int n, int k,
             ldc, requested_threads
         );
     }
+    if (repaired > 0) {
+        dgemm_tn_tiled(
+            kGemmIntegrityChecks, n, m,
+            coefficients.data(), m, c, ldc,
+            observed.data(), kGemmIntegrityChecks, requested_threads
+        );
+        for (int column = 0; column < n; ++column) {
+            if (column_disagrees(column)) {
+                throw std::runtime_error(
+                    "Independent TN GEMM repair failed its integrity check"
+                );
+            }
+        }
+    }
     return repaired;
 }
 
@@ -431,23 +425,6 @@ int64_t dgemm_nn_checked(int m, int n, int k,
                          const double* b, int ldb,
                          double* c, int ldc,
                          int requested_threads) {
-    std::unique_ptr<double[]> primary_a(new double[
-        checked_mul(static_cast<size_t>(m), static_cast<size_t>(k),
-                    "protected NN input A")
-    ]);
-    std::unique_ptr<double[]> primary_b(new double[
-        checked_mul(static_cast<size_t>(k), static_cast<size_t>(n),
-                    "protected NN input B")
-    ]);
-    copy_col_major_matrix(
-        m, k, a, lda, primary_a.get(), m, requested_threads
-    );
-    copy_col_major_matrix(
-        k, n, b, ldb, primary_b.get(), k, requested_threads
-    );
-    dgemm_nn(
-        m, n, k, primary_a.get(), m, primary_b.get(), k, c, ldc
-    );
     std::vector<double> coefficients = gemm_integrity_coefficients(m);
     std::vector<double> projected(
         checked_mul(
@@ -473,6 +450,7 @@ int64_t dgemm_nn_checked(int m, int n, int k,
         projected.data(), k, b, ldb,
         expected.data(), kGemmIntegrityChecks, requested_threads
     );
+    dgemm_nn(m, n, k, a, lda, b, ldb, c, ldc);
     dgemm_tn_tiled(
         kGemmIntegrityChecks, n, m,
         coefficients.data(), m, c, ldc,
@@ -490,6 +468,31 @@ int64_t dgemm_nn_checked(int m, int n, int k,
         }
         return false;
     };
+    bool any_disagreement = false;
+    for (int column = 0; column < n; ++column) {
+        any_disagreement = any_disagreement || column_disagrees(column);
+    }
+    if (any_disagreement) {
+        std::vector<double> projected_after(projected.size());
+        dgemm_tn_tiled(
+            k, kGemmIntegrityChecks, m,
+            a, lda, coefficients.data(), m,
+            projected_after.data(), k, requested_threads
+        );
+        dgemm_tn_tiled(
+            kGemmIntegrityChecks, n, k,
+            projected_after.data(), k, b, ldb,
+            observed.data(), kGemmIntegrityChecks, requested_threads
+        );
+        if (std::memcmp(projected.data(), projected_after.data(),
+                        projected.size() * sizeof(double)) != 0 ||
+            std::memcmp(expected.data(), observed.data(),
+                        expected.size() * sizeof(double)) != 0) {
+            throw std::runtime_error(
+                "Vendor BLAS altered a protected NN GEMM input; refusing repair"
+            );
+        }
+    }
     int64_t repaired = 0;
     for (int column = 0; column < n;) {
         if (!column_disagrees(column)) {
@@ -509,6 +512,20 @@ int64_t dgemm_nn_checked(int m, int n, int k,
             c + static_cast<size_t>(first) * static_cast<size_t>(ldc),
             ldc, requested_threads
         );
+    }
+    if (repaired > 0) {
+        dgemm_tn_tiled(
+            kGemmIntegrityChecks, n, m,
+            coefficients.data(), m, c, ldc,
+            observed.data(), kGemmIntegrityChecks, requested_threads
+        );
+        for (int column = 0; column < n; ++column) {
+            if (column_disagrees(column)) {
+                throw std::runtime_error(
+                    "Independent NN GEMM repair failed its integrity check"
+                );
+            }
+        }
     }
     return repaired;
 }

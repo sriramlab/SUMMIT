@@ -215,7 +215,9 @@ def test_native_integrity_workspace_is_vendor_independent():
         {"blas_vendor": "Intel10_64_dyn"}, *dimensions
     )
     assert openblas == mkl
-    assert openblas > 0
+    assert openblas == 8 * (
+        dimensions[0] + 2 * dimensions[2] + 2 * dimensions[1]
+    )
     assert _native_gemm_integrity_workspace_elements(None, *dimensions) == 0
 
 

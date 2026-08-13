@@ -108,6 +108,7 @@ def _ndarray_sha256(value: np.ndarray) -> str:
 _BACKEND_PROVENANCE_SCHEMA_VERSION = 3
 _NATIVE_GEMM_INTEGRITY_CHECKS = 8
 _NATIVE_GEMM_CHECK_MINIMUM_FLOPS = 1_000_000_000
+_NATIVE_PREFERRED_CALL_WORKSPACE_BYTES = 4 * 1024**3
 
 
 def _native_gemm_integrity_workspace_elements(
@@ -122,10 +123,15 @@ def _native_gemm_integrity_workspace_elements(
     ):
         return 0
     checks = _NATIVE_GEMM_INTEGRITY_CHECKS * (
-        int(m) + int(k) + 2 * int(n)
+        int(m) + 2 * int(k) + 2 * int(n)
     )
-    protected_inputs = int(m) * int(k) + int(k) * int(n)
-    return checks + protected_inputs
+    return checks
+
+
+def _native_execution_workspace_bytes(native_workspace_gib: float) -> int:
+    """Use the configured workspace as a ceiling, not an allocation target."""
+    configured = int(float(native_workspace_gib) * (1024**3))
+    return min(configured, _NATIVE_PREFERRED_CALL_WORKSPACE_BYTES)
 
 
 def _sha256_path(path: str | Path) -> str:
@@ -1955,7 +1961,9 @@ class GenomewideEnvLDScore:
         moment_copies = 8 if self.native_strict_feature_moment_verification else 4
         q_rank = self.p_eff + 1
         elements_per_variant = self.nsamp + moment_copies * q_rank + 11
-        workspace_elements = int(self.native_workspace_gib * (1024 ** 3)) // 8
+        workspace_elements = _native_execution_workspace_bytes(
+            self.native_workspace_gib
+        ) // 8
         # ``step_size`` defines the reproducible probe blocks, not the native
         # GEMM width.  Use the full configured workspace for the latter: the
         # native call remains bounded by ``required`` below, while wider calls
@@ -3894,8 +3902,8 @@ class GenomewideEnvLDScore:
         max_vt = max(vt for _, vt in vtiles)
         itemsize = int(np.dtype(self.dtype).itemsize)
         if self.native_backend == "direct" and not exact_jackknife:
-            native_cap_elements = int(
-                self.native_workspace_gib * (1024 ** 3)
+            native_cap_elements = _native_execution_workspace_bytes(
+                self.native_workspace_gib
             ) // 8
             source_columns_for_cap = self.nbins * max_vt
             target_columns_for_cap = 2 * self.nbins * max_vt
@@ -4071,6 +4079,9 @@ class GenomewideEnvLDScore:
             + native_target_integrity_elements
         )
         native_workspace_cap_bytes = int(self.native_workspace_gib * (1024 ** 3))
+        native_execution_target_bytes = _native_execution_workspace_bytes(
+            self.native_workspace_gib
+        )
         native_call_max_bytes = max(
             native_feature_bytes,
             native_source_bytes,
@@ -4121,6 +4132,7 @@ class GenomewideEnvLDScore:
             "actual_jackknife_2b_source_columns": int(jackknife_source_columns),
             "target_source_columns": int(target_source_columns),
             "native_workspace_cap_bytes": native_workspace_cap_bytes,
+            "native_execution_target_bytes": native_execution_target_bytes,
             "native_modeled_max_call_workspace_gib": float(
                 native_call_max_bytes / (1024 ** 3)
             ),
