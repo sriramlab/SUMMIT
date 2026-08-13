@@ -6,6 +6,13 @@ and residual components. The estimator is a summary-artifact reformulation of
 GENIE's projected kernel equations; GENIE itself is an individual-level method,
 and this is not ordinary interaction LDSC.
 
+The environment is a finite numeric vector, not a binary indicator contract.
+Continuous exposures (including age and BMI) are supported directly and are
+centered and scaled to one sample standard deviation before the interaction is
+formed. Binary exposures use the same path. A multi-level categorical exposure
+must currently be represented by one explicit numeric contrast per reference,
+because this is a one-environment model.
+
 ## Model and exact summaries
 
 Let `C` contain the intercept, tested environment, and user covariates, and let
@@ -195,6 +202,13 @@ allocation while preserving the exact randomized trace estimator.
   covariates, modes, scales, annotations, or SNP axes, while deliberately
   allowing the same marginal scores to be reused across B128/B1024 trace
   checkpoints produced from that cache.
+- Schema-v3 reference and phenotype-score bundles currently use an exact
+  matched-cohort kernel contract. A larger environment-only LD panel cannot be
+  substituted merely by changing `N`: transferring its squared correlations to
+  a different study rank also requires finite-panel bias calibration and
+  study-specific NxE trace moments. Until that population-reference contract is
+  implemented and validated, SUMMIT fails closed on a reference/study cohort
+  mismatch.
 - Variants with zero/invalid additive or interaction projected variance are an
   error. They must be QC-filtered before regenerating the entire bundle; they
   are never silently retained in annotation denominators as zero columns.
