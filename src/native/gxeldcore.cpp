@@ -629,7 +629,10 @@ int64_t dgemm_nn_checked(int m, int n, int k,
 
 size_t partitioned_gemm_integrity_workspace_elements(int m, int n, int k) {
 #if defined(GWLDCORE_GEMM_INTEGRITY)
-    return gemm_integrity_workspace_elements(m, n, k);
+    // Large GxE products use the BLAS-independent tiled kernels below. They
+    // write disjoint output tiles and need no checksum or operand-copy scratch.
+    (void)m; (void)n; (void)k;
+    return 0;
 #else
     (void)m; (void)n; (void)k;
     return 0;
@@ -642,16 +645,10 @@ int64_t dgemm_tn_partitioned_columns(int m, int n, int k,
                                      double* c, int ldc,
                                      int requested_threads) {
 #if defined(GWLDCORE_GEMM_INTEGRITY)
-    if (gemm_requires_integrity_checks(m, n, k)) {
-        return dgemm_tn_checked(
-            m, n, k, a, lda, b, ldb, c, ldc, requested_threads
-        );
-    } else {
-        dgemm_tn_tiled(
-            m, n, k, a, lda, b, ldb, c, ldc, requested_threads
-        );
-        return 0;
-    }
+    dgemm_tn_tiled(
+        m, n, k, a, lda, b, ldb, c, ldc, requested_threads
+    );
+    return 0;
 #else
     (void) requested_threads;
     dgemm_tn(m, n, k, a, lda, b, ldb, c, ldc);
@@ -666,18 +663,11 @@ int64_t dgemm_nn_partitioned_rows(int m, int n, int k,
                                   int requested_threads,
                                   double alpha = 1.0, double beta = 0.0) {
 #if defined(GWLDCORE_GEMM_INTEGRITY)
-    if (alpha == 1.0 && beta == 0.0 &&
-        gemm_requires_integrity_checks(m, n, k)) {
-        return dgemm_nn_checked(
-            m, n, k, a, lda, b, ldb, c, ldc, requested_threads
-        );
-    } else {
-        dgemm_nn_tiled(
-            m, n, k, a, lda, b, ldb, c, ldc,
-            requested_threads, alpha, beta
-        );
-        return 0;
-    }
+    dgemm_nn_tiled(
+        m, n, k, a, lda, b, ldb, c, ldc,
+        requested_threads, alpha, beta
+    );
+    return 0;
 #else
     (void) requested_threads;
     dgemm_nn(m, n, k, a, lda, b, ldb, c, ldc, alpha, beta);
@@ -692,18 +682,11 @@ int64_t dgemm_tn_partitioned_rows(int m, int n, int k,
                                   int requested_threads,
                                   double alpha = 1.0, double beta = 0.0) {
 #if defined(GWLDCORE_GEMM_INTEGRITY)
-    if (alpha == 1.0 && beta == 0.0 &&
-        gemm_requires_integrity_checks(m, n, k)) {
-        return dgemm_tn_checked(
-            m, n, k, a, lda, b, ldb, c, ldc, requested_threads
-        );
-    } else {
-        dgemm_tn_tiled(
-            m, n, k, a, lda, b, ldb, c, ldc,
-            requested_threads, alpha, beta
-        );
-        return 0;
-    }
+    dgemm_tn_tiled(
+        m, n, k, a, lda, b, ldb, c, ldc,
+        requested_threads, alpha, beta
+    );
+    return 0;
 #else
     (void) requested_threads;
     dgemm_tn(m, n, k, a, lda, b, ldb, c, ldc, alpha, beta);
@@ -1038,7 +1021,7 @@ public:
         result["strict_feature_moment_verification"] = strict_feature_moment_verification_;
         result["feature_moment_integrity_mode"] = strict_feature_moment_verification_
             ? "strict_duplicate"
-            : "independent_continuous_eight_check_abft";
+            : "deterministic_disjoint_output_tiled_gemm";
         result["repaired_gemm_output_columns"] =
             repaired_gemm_output_columns_.load(std::memory_order_relaxed);
         result["environment_mean"] = environment_mean_;
@@ -1275,7 +1258,7 @@ public:
         result["strict_feature_moment_verification"] = strict_feature_moment_verification_;
         result["feature_moment_integrity_mode"] = strict_feature_moment_verification_
             ? "strict_duplicate"
-            : "independent_continuous_eight_check_abft";
+            : "deterministic_disjoint_output_tiled_gemm";
         result["missing_genotype_calls"] = missing;
         return result;
     }

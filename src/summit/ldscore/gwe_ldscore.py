@@ -5,7 +5,6 @@ import hashlib
 import json
 import math
 import os
-import re
 import stat
 import tempfile
 import time
@@ -107,27 +106,15 @@ def _ndarray_sha256(value: np.ndarray) -> str:
 
 
 _BACKEND_PROVENANCE_SCHEMA_VERSION = 3
-_NATIVE_GEMM_INTEGRITY_CHECKS = 8
-_NATIVE_GEMM_CHECK_MINIMUM_FLOPS = 1_000_000_000
-_NATIVE_PREFERRED_CALL_WORKSPACE_BYTES = 4 * 1024**3
+_NATIVE_PREFERRED_CALL_WORKSPACE_BYTES = 2 * 1024**3
 
 
 def _native_gemm_integrity_workspace_elements(
     build_info: Mapping | None, m: int, n: int, k: int
 ) -> int:
-    """Mirror the native direct-backend ABFT scratch allocation exactly."""
-    if (
-        build_info is None
-        or min(int(m), int(n), int(k)) <= 0
-        or 2 * int(m) * int(n) * int(k)
-        < _NATIVE_GEMM_CHECK_MINIMUM_FLOPS
-    ):
-        return 0
-    checks = _NATIVE_GEMM_INTEGRITY_CHECKS * (
-        int(m) + 2 * int(k) + 2 * int(n)
-    )
-    protected_operand = min(int(m) * int(k), int(k) * int(n))
-    return checks + protected_operand
+    """The disjoint-output tiled kernels require no integrity scratch."""
+    del build_info, m, n, k
+    return 0
 
 
 def _native_execution_workspace_bytes(native_workspace_gib: float) -> int:
@@ -226,19 +213,8 @@ def _native_strict_feature_moment_verification_policy(
     if override == "always":
         return True, "forced by SUMMIT_GXE_VERIFY_FEATURE_MOMENTS=always"
 
-    vendor = str(build_info.get("blas_vendor", "")).strip().lower()
-    config = str(build_info.get("blas_runtime_config") or "").strip()
-    if vendor == "openblas":
-        match = re.search(r"\bOpenBLAS\s+(\d+)\.(\d+)\.(\d+)\b", config)
-        rendered = (
-            ".".join(match.groups()) if match is not None else "unidentified"
-        )
-        return False, (
-            "independent continuous-weight eight-check ABFT with "
-            f"OpenBLAS {rendered}"
-        )
     return False, (
-        "independent continuous-weight eight-check ABFT with BLAS vendor "
+        "deterministic disjoint-output tiled GEMMs independent of "
         f"{build_info.get('blas_vendor')}"
     )
 
@@ -2283,7 +2259,7 @@ class GenomewideEnvLDScore:
             "feature_moment_integrity_mode": (
                 "strict_duplicate"
                 if self.native_strict_feature_moment_verification
-                else "independent_continuous_eight_check_abft"
+                else "deterministic_disjoint_output_tiled_gemm"
             ),
             "feature_moment_integrity_reason": (
                 self.native_feature_moment_integrity_reason

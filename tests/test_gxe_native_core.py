@@ -165,7 +165,7 @@ def test_native_feature_moment_verification_defaults_to_continuous_abft(monkeypa
         }
     )
     assert enabled is False
-    assert "continuous-weight eight-check ABFT" in reason
+    assert "deterministic disjoint-output tiled GEMMs" in reason
 
     enabled, reason = _native_strict_feature_moment_verification_policy(
         {
@@ -174,7 +174,7 @@ def test_native_feature_moment_verification_defaults_to_continuous_abft(monkeypa
         }
     )
     assert enabled is False
-    assert "continuous-weight eight-check ABFT" in reason
+    assert "deterministic disjoint-output tiled GEMMs" in reason
 
     enabled, reason = _native_strict_feature_moment_verification_policy(
         {
@@ -183,7 +183,7 @@ def test_native_feature_moment_verification_defaults_to_continuous_abft(monkeypa
         }
     )
     assert enabled is False
-    assert "continuous-weight eight-check ABFT" in reason
+    assert "deterministic disjoint-output tiled GEMMs" in reason
 
     enabled, reason = _native_strict_feature_moment_verification_policy(
         {
@@ -192,7 +192,7 @@ def test_native_feature_moment_verification_defaults_to_continuous_abft(monkeypa
         }
     )
     assert enabled is False
-    assert "continuous-weight eight-check ABFT" in reason
+    assert "deterministic disjoint-output tiled GEMMs" in reason
     assert "Intel10_64_dyn" in reason
 
     monkeypatch.setenv("SUMMIT_GXE_VERIFY_FEATURE_MOMENTS", "always")
@@ -215,12 +215,7 @@ def test_native_integrity_workspace_is_vendor_independent():
         {"blas_vendor": "Intel10_64_dyn"}, *dimensions
     )
     assert openblas == mkl
-    assert openblas == 8 * (
-        dimensions[0] + 2 * dimensions[2] + 2 * dimensions[1]
-    ) + min(
-        dimensions[0] * dimensions[2],
-        dimensions[2] * dimensions[1],
-    )
+    assert openblas == 0
     assert _native_gemm_integrity_workspace_elements(None, *dimensions) == 0
 
 
@@ -288,7 +283,7 @@ def test_native_feature_source_target_match_dense_oracle(
         assert info["feature_moment_integrity_mode"] == (
             "strict_duplicate"
             if strict_feature_moment_verification
-            else "independent_continuous_eight_check_abft"
+            else "deterministic_disjoint_output_tiled_gemm"
         )
         assert info["repaired_gemm_output_columns"] >= 0
         feature = _feature(context, m)

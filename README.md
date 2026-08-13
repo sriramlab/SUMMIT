@@ -44,12 +44,9 @@ refactored h2/rg path; use per-SNP LD scores.
 
 The supplied environment uses OpenBLAS 0.3.31 or newer from conda-forge; 0.3.30
 contained a parallel-GEMM race. SUMMIT does not rely on the BLAS vendor or
-version to make the large GxE products safe: every fast product is validated
-by eight deterministic continuous-weight, BLAS-independent checksum
-projections. Only a flagged contiguous output range is recomputed with
-SUMMIT's cache-tiled kernel. This avoids a disk cache and does not duplicate
-the full product. The vendor call uses transient input copies so a faulty call
-cannot alter the originals used by the checks or repair.
+version for the large GxE products: its OpenMP cache-tiled kernels assign
+disjoint output tiles and use a deterministic reduction order within each
+entry. This avoids disk caches, duplicate products, and integrity copies.
 Set `SUMMIT_GXE_VERIFY_FEATURE_MOMENTS=always` only for strict duplicate-product
 stress testing. If MKL is available through `MKLROOT` or the active conda
 environment, CMake may use MKL instead.
