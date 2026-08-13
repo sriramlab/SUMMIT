@@ -125,7 +125,8 @@ def _native_gemm_integrity_workspace_elements(
     checks = _NATIVE_GEMM_INTEGRITY_CHECKS * (
         int(m) + 2 * int(k) + 2 * int(n)
     )
-    return checks
+    protected_operand = min(int(m) * int(k), int(k) * int(n))
+    return checks + protected_operand
 
 
 def _native_execution_workspace_bytes(native_workspace_gib: float) -> int:

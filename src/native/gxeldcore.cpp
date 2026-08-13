@@ -251,7 +251,18 @@ size_t gemm_integrity_workspace_elements(int m, int n, int k) {
         static_cast<size_t>(kGemmIntegrityChecks), dimensions,
         "GEMM integrity workspace"
     );
-    return checks;
+    const size_t operand_a = checked_mul(
+        static_cast<size_t>(m), static_cast<size_t>(k),
+        "protected GEMM operand A"
+    );
+    const size_t operand_b = checked_mul(
+        static_cast<size_t>(k), static_cast<size_t>(n),
+        "protected GEMM operand B"
+    );
+    return checked_add(
+        checks, std::min(operand_a, operand_b),
+        "protected GEMM workspace"
+    );
 }
 
 uint64_t splitmix64(uint64_t value) {
@@ -300,6 +311,31 @@ bool gemm_integrity_disagrees(double expected, double observed) {
         || std::abs(expected - observed) > tolerance;
 }
 
+void copy_col_major_matrix(int rows, int columns,
+                           const double* source, int source_ld,
+                           double* destination, int destination_ld,
+                           int requested_threads) {
+    const int threads = std::max(1, std::min(requested_threads, columns));
+    const size_t column_bytes = checked_mul(
+        static_cast<size_t>(rows), sizeof(double),
+        "protected GEMM operand column"
+    );
+#ifdef _OPENMP
+    #pragma omp parallel for schedule(static) num_threads(threads)
+#endif
+    for (int column = 0; column < columns; ++column) {
+        std::memcpy(
+            destination
+                + static_cast<size_t>(column)
+                    * static_cast<size_t>(destination_ld),
+            source
+                + static_cast<size_t>(column)
+                    * static_cast<size_t>(source_ld),
+            column_bytes
+        );
+    }
+}
+
 int64_t dgemm_tn_checked(int m, int n, int k,
                          const double* a, int lda,
                          const double* b, int ldb,
@@ -330,10 +366,40 @@ int64_t dgemm_tn_checked(int m, int n, int k,
         projected.data(), k, b, ldb,
         expected.data(), kGemmIntegrityChecks, requested_threads
     );
-    // Build the expected fingerprints before entering vendor BLAS.  This
-    // removes the former O(mk + kn) protected-input snapshots while ensuring
-    // that a bad output cannot contaminate its own reference value.
-    dgemm_tn(m, n, k, a, lda, b, ldb, c, ldc);
+    const size_t operand_a = checked_mul(
+        static_cast<size_t>(k), static_cast<size_t>(m),
+        "protected TN operand A"
+    );
+    const size_t operand_b = checked_mul(
+        static_cast<size_t>(k), static_cast<size_t>(n),
+        "protected TN operand B"
+    );
+    std::unique_ptr<double[]> protected_operand(
+        new double[std::min(operand_a, operand_b)]
+    );
+    const double* vendor_a = a;
+    const double* vendor_b = b;
+    int vendor_lda = lda;
+    int vendor_ldb = ldb;
+    if (operand_a <= operand_b) {
+        copy_col_major_matrix(
+            k, m, a, lda, protected_operand.get(), k, requested_threads
+        );
+        vendor_a = protected_operand.get();
+        vendor_lda = k;
+    } else {
+        copy_col_major_matrix(
+            k, n, b, ldb, protected_operand.get(), k, requested_threads
+        );
+        vendor_b = protected_operand.get();
+        vendor_ldb = k;
+    }
+    // Expected fingerprints are complete before vendor BLAS starts, and only
+    // the smaller input is snapshotted.  Multi-GiB decoded genotype blocks are
+    // therefore never duplicated.
+    dgemm_tn(
+        m, n, k, vendor_a, vendor_lda, vendor_b, vendor_ldb, c, ldc
+    );
     dgemm_tn_tiled(
         kGemmIntegrityChecks, n, m,
         coefficients.data(), m, c, ldc,
@@ -450,7 +516,37 @@ int64_t dgemm_nn_checked(int m, int n, int k,
         projected.data(), k, b, ldb,
         expected.data(), kGemmIntegrityChecks, requested_threads
     );
-    dgemm_nn(m, n, k, a, lda, b, ldb, c, ldc);
+    const size_t operand_a = checked_mul(
+        static_cast<size_t>(m), static_cast<size_t>(k),
+        "protected NN operand A"
+    );
+    const size_t operand_b = checked_mul(
+        static_cast<size_t>(k), static_cast<size_t>(n),
+        "protected NN operand B"
+    );
+    std::unique_ptr<double[]> protected_operand(
+        new double[std::min(operand_a, operand_b)]
+    );
+    const double* vendor_a = a;
+    const double* vendor_b = b;
+    int vendor_lda = lda;
+    int vendor_ldb = ldb;
+    if (operand_a <= operand_b) {
+        copy_col_major_matrix(
+            m, k, a, lda, protected_operand.get(), m, requested_threads
+        );
+        vendor_a = protected_operand.get();
+        vendor_lda = m;
+    } else {
+        copy_col_major_matrix(
+            k, n, b, ldb, protected_operand.get(), k, requested_threads
+        );
+        vendor_b = protected_operand.get();
+        vendor_ldb = k;
+    }
+    dgemm_nn(
+        m, n, k, vendor_a, vendor_lda, vendor_b, vendor_ldb, c, ldc
+    );
     dgemm_tn_tiled(
         kGemmIntegrityChecks, n, m,
         coefficients.data(), m, c, ldc,
