@@ -812,6 +812,7 @@ def _compute_pairs_blockwise(
     pairs: list[PairSpec],
     *,
     axis_len: int,
+    allow_zero_overlap: bool = False,
     log=None,
 ) -> tuple[np.ndarray, np.ndarray]:
     if len(traits) == 0:
@@ -899,9 +900,19 @@ def _compute_pairs_blockwise(
     if np.any(~np.isfinite(intercepts)):
         bad = np.where(~np.isfinite(intercepts))[0].tolist()
         raise RuntimeError(f"Non-finite intercept estimates encountered for pair indices: {bad[:10]}")
-    if np.any(overlaps <= 0):
-        bad = np.where(overlaps <= 0)[0].tolist()
+    zero_overlap = overlaps == 0
+    if np.any(overlaps < 0) or (np.any(zero_overlap) and not allow_zero_overlap):
+        invalid = overlaps < 0 if allow_zero_overlap else overlaps <= 0
+        bad = np.where(invalid)[0].tolist()
         raise RuntimeError(f"Non-positive overlap counts encountered for pair indices: {bad[:10]}")
+    if np.any(zero_overlap):
+        # Disjoint study samples imply an exact overlap covariance of zero.
+        intercepts[zero_overlap] = 0.0
+        if log is not None:
+            log._log(
+                f"[make-rg-manifest] assigned intercept_rg=0 to "
+                f"{int(np.sum(zero_overlap))} zero-overlap pair(s)."
+            )
 
     return intercepts, overlaps
 
@@ -924,6 +935,7 @@ def build_rg_manifest(
     pheno_missing_values: list[str] | None = None,
     cov_missing_values: list[str] | None = None,
     compact: bool = False,
+    allow_zero_overlap: bool = False,
     log=None,
 ) -> pd.DataFrame:
     """
@@ -1040,7 +1052,13 @@ def build_rg_manifest(
         if pair.phen1 not in phen_set or pair.phen2 not in phen_set:
             raise ValueError(f"Requested pair uses an unknown phenotype: ({pair.phen1}, {pair.phen2})")
 
-    intercepts, overlaps = _compute_pairs_blockwise(traits, pairs, axis_len=axis_len, log=log)
+    intercepts, overlaps = _compute_pairs_blockwise(
+        traits,
+        pairs,
+        axis_len=axis_len,
+        allow_zero_overlap=allow_zero_overlap,
+        log=log,
+    )
 
     trait_map = {tr.phen: tr for tr in traits}
     rows = []
@@ -1051,7 +1069,7 @@ def build_rg_manifest(
         n_overlap = int(overlaps[ridx])
         if not np.isfinite(intercept_rg):
             raise RuntimeError(f"Computed non-finite intercept_rg for pair '{pair.phen1}' vs '{pair.phen2}'.")
-        if n_overlap <= 0:
+        if n_overlap < 0 or (n_overlap == 0 and not allow_zero_overlap):
             raise RuntimeError(f"No overlapping individuals for pair '{pair.phen1}' vs '{pair.phen2}'.")
 
         rows.append({

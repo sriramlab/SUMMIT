@@ -403,6 +403,11 @@ def build_parser() -> argparse.ArgumentParser:
                         help="Two-column phenotype pair list used by --make-rg-manifest.")
     parser.add_argument("--all-pairwise", action="store_true", default=False,
                         help="In --make-rg-manifest mode, build all unordered pairs from --phen-list.")
+    parser.add_argument("--allow-zero-rg-overlap", action="store_true", default=False,
+                        help=(
+                            "In --make-rg-manifest mode, retain phenotype pairs with no overlapping "
+                            "individuals and set their exact overlap covariance intercept to zero."
+                        ))
     parser.add_argument("--max-chisq", default=None, type=str,
                         help="Main chi^2 threshold. Use 'auto' for max(80, 0.001*Nmax).")
     parser.add_argument("--intercept-chisq-thr", default=None, type=str,
@@ -1724,6 +1729,7 @@ def _dispatch_make_rg_manifest(args, log):
         all_pairwise=bool(args.all_pairwise),
         pheno_missing_values=Sumcore._parse_missing_tokens(args.pheno_rg_missing_values),
         cov_missing_values=Sumcore._parse_missing_tokens(args.pheno_rg_cov_missing_values),
+        allow_zero_overlap=bool(args.allow_zero_rg_overlap),
         log=log,
     )
     log._log(
