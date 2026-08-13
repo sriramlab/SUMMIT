@@ -8,6 +8,7 @@
 #include <cstring>
 #include <fstream>
 #include <limits>
+#include <memory>
 #include <mutex>
 #include <stdexcept>
 #include <string>
@@ -26,6 +27,10 @@
 #endif
 
 #include "blas_compat.hpp"
+
+#ifdef GWLDCORE_USE_OPENBLAS
+extern "C" char* openblas_get_config(void);
+#endif
 
 namespace {
 
@@ -91,6 +96,506 @@ void dgemm_tn(int m, int n, int k,
               double alpha = 1.0, double beta = 0.0) {
     cblas_dgemm(CblasColMajor, CblasTrans, CblasNoTrans,
                 m, n, k, alpha, a, lda, b, ldb, beta, c, ldc);
+}
+
+// Internally threaded vendor GEMMs have produced rare corrupt output on the
+// large products used by the GxE path on the affected production host. These
+// cache-tiled kernels are deliberately BLAS-independent. OpenMP assigns
+// disjoint output tiles, every output entry is computed exactly once, and the
+// reduction order within an entry is deterministic.
+#if defined(GWLDCORE_GEMM_INTEGRITY)
+void dgemm_tn_tiled(int m, int n, int k,
+                    const double* a, int lda,
+                    const double* b, int ldb,
+                    double* c, int ldc,
+                    int requested_threads,
+                    double alpha = 1.0, double beta = 0.0) {
+    constexpr int kRowTile = 8;
+    constexpr int kColumnTile = 16;
+    constexpr int kReductionTile = 1024;
+    const int row_tiles = (m + kRowTile - 1) / kRowTile;
+    const int column_tiles = (n + kColumnTile - 1) / kColumnTile;
+    const int64_t tasks = static_cast<int64_t>(row_tiles) * column_tiles;
+    const int threads = static_cast<int>(std::max<int64_t>(
+        1, std::min<int64_t>(requested_threads, tasks)
+    ));
+#ifdef _OPENMP
+    #pragma omp parallel for schedule(static) num_threads(threads)
+#endif
+    for (int64_t task = 0; task < tasks; ++task) {
+        const int row0 = static_cast<int>(task / column_tiles) * kRowTile;
+        const int column0 = static_cast<int>(task % column_tiles) * kColumnTile;
+        const int rows = std::min(kRowTile, m - row0);
+        const int columns = std::min(kColumnTile, n - column0);
+        double sums[kRowTile * kColumnTile] = {};
+        for (int reduction0 = 0; reduction0 < k;
+             reduction0 += kReductionTile) {
+            const int reduction1 = std::min(k, reduction0 + kReductionTile);
+            for (int row = 0; row < rows; ++row) {
+                const double* a_column = a +
+                    static_cast<size_t>(row0 + row) *
+                        static_cast<size_t>(lda);
+                for (int column = 0; column < columns; ++column) {
+                    const double* b_column = b +
+                        static_cast<size_t>(column0 + column) *
+                            static_cast<size_t>(ldb);
+                    double partial = 0.0;
+#ifdef _OPENMP
+                    #pragma omp simd reduction(+:partial)
+#endif
+                    for (int reduction = reduction0;
+                         reduction < reduction1; ++reduction) {
+                        partial += a_column[reduction] * b_column[reduction];
+                    }
+                    sums[row * kColumnTile + column] += partial;
+                }
+            }
+        }
+        for (int column = 0; column < columns; ++column) {
+            double* c_column = c +
+                static_cast<size_t>(column0 + column) *
+                    static_cast<size_t>(ldc);
+            for (int row = 0; row < rows; ++row) {
+                const int output_row = row0 + row;
+                c_column[output_row] =
+                    alpha * sums[row * kColumnTile + column]
+                    + (beta == 0.0 ? 0.0 : beta * c_column[output_row]);
+            }
+        }
+    }
+}
+
+void dgemm_nn_tiled(int m, int n, int k,
+                    const double* a, int lda,
+                    const double* b, int ldb,
+                    double* c, int ldc,
+                    int requested_threads,
+                    double alpha = 1.0, double beta = 0.0) {
+    constexpr int kRowTile = 256;
+    constexpr int kColumnTile = 8;
+    const int row_tiles = (m + kRowTile - 1) / kRowTile;
+    const int column_tiles = (n + kColumnTile - 1) / kColumnTile;
+    const int64_t tasks = static_cast<int64_t>(row_tiles) * column_tiles;
+    const int threads = static_cast<int>(std::max<int64_t>(
+        1, std::min<int64_t>(requested_threads, tasks)
+    ));
+#ifdef _OPENMP
+    #pragma omp parallel for schedule(static) num_threads(threads)
+#endif
+    for (int64_t task = 0; task < tasks; ++task) {
+        const int row0 = static_cast<int>(task / column_tiles) * kRowTile;
+        const int column0 = static_cast<int>(task % column_tiles) * kColumnTile;
+        const int row1 = std::min(m, row0 + kRowTile);
+        const int column1 = std::min(n, column0 + kColumnTile);
+        for (int column = column0; column < column1; ++column) {
+            double* c_column = c +
+                static_cast<size_t>(column) * static_cast<size_t>(ldc);
+#ifdef _OPENMP
+            #pragma omp simd
+#endif
+            for (int row = row0; row < row1; ++row) {
+                c_column[row] =
+                    beta == 0.0 ? 0.0 : beta * c_column[row];
+            }
+        }
+        for (int reduction = 0; reduction < k; ++reduction) {
+            const double* a_column = a +
+                static_cast<size_t>(reduction) * static_cast<size_t>(lda);
+            for (int column = column0; column < column1; ++column) {
+                double* c_column = c +
+                    static_cast<size_t>(column) * static_cast<size_t>(ldc);
+                const double weight = alpha * b[
+                    static_cast<size_t>(column) * static_cast<size_t>(ldb)
+                    + static_cast<size_t>(reduction)
+                ];
+#ifdef _OPENMP
+                #pragma omp simd
+#endif
+                for (int row = row0; row < row1; ++row) {
+                    c_column[row] += a_column[row] * weight;
+                }
+            }
+        }
+    }
+}
+
+constexpr int kGemmIntegrityChecks = 8;
+constexpr double kGemmIntegrityTolerance = 2.0e-11;
+constexpr int64_t kCheckedGemmMinimumFlops = 1000000000LL;
+
+bool gemm_requires_integrity_checks(int m, int n, int k) {
+    if (m <= 0 || n <= 0 || k <= 0) return false;
+    constexpr uint64_t minimum_products =
+        (static_cast<uint64_t>(kCheckedGemmMinimumFlops) + 1U) / 2U;
+    const uint64_t mn =
+        static_cast<uint64_t>(m) * static_cast<uint64_t>(n);
+    const uint64_t required_mn =
+        (minimum_products + static_cast<uint64_t>(k) - 1U) /
+        static_cast<uint64_t>(k);
+    return mn >= required_mn;
+}
+
+size_t gemm_integrity_workspace_elements(int m, int n, int k) {
+    if (!gemm_requires_integrity_checks(m, n, k)) return 0;
+    size_t dimensions = checked_add(
+        static_cast<size_t>(m), static_cast<size_t>(k),
+        "GEMM integrity workspace"
+    );
+    dimensions = checked_add(
+        dimensions,
+        checked_mul(2U, static_cast<size_t>(n), "GEMM integrity workspace"),
+        "GEMM integrity workspace"
+    );
+    const size_t checks = checked_mul(
+        static_cast<size_t>(kGemmIntegrityChecks), dimensions,
+        "GEMM integrity workspace"
+    );
+    const size_t copied_a = checked_mul(
+        static_cast<size_t>(m), static_cast<size_t>(k),
+        "protected GEMM input A"
+    );
+    const size_t copied_b = checked_mul(
+        static_cast<size_t>(k), static_cast<size_t>(n),
+        "protected GEMM input B"
+    );
+    return checked_add(
+        checks,
+        checked_add(copied_a, copied_b, "protected GEMM inputs"),
+        "protected GEMM workspace"
+    );
+}
+
+uint64_t splitmix64(uint64_t value) {
+    value += 0x9e3779b97f4a7c15ULL;
+    value = (value ^ (value >> 30U)) * 0xbf58476d1ce4e5b9ULL;
+    value = (value ^ (value >> 27U)) * 0x94d049bb133111ebULL;
+    return value ^ (value >> 31U);
+}
+
+std::vector<double> gemm_integrity_coefficients(int rows) {
+    std::vector<double> coefficients(
+        checked_mul(
+            static_cast<size_t>(rows),
+            static_cast<size_t>(kGemmIntegrityChecks),
+            "GEMM integrity coefficients"
+        )
+    );
+    for (int check = 0; check < kGemmIntegrityChecks; ++check) {
+        for (int row = 0; row < rows; ++row) {
+            const uint64_t key =
+                (static_cast<uint64_t>(check + 1) << 32U)
+                ^ static_cast<uint64_t>(row + 1);
+            const uint64_t mixed = splitmix64(key);
+            // Continuous, bounded weights avoid the exact pairwise
+            // cancellation that can let a partition-swap error pass a
+            // Rademacher checksum. The upper 53 bits map exactly onto a
+            // binary64 fraction; the low bit supplies the sign.
+            constexpr double kInverseTwoTo53 =
+                1.0 / 9007199254740992.0;
+            const double magnitude = 0.5 +
+                static_cast<double>(mixed >> 11U) * kInverseTwoTo53;
+            coefficients[
+                static_cast<size_t>(check) * static_cast<size_t>(rows)
+                + static_cast<size_t>(row)
+            ] = (mixed & 1ULL) == 0ULL ? -magnitude : magnitude;
+        }
+    }
+    return coefficients;
+}
+
+bool gemm_integrity_disagrees(double expected, double observed) {
+    const double tolerance = kGemmIntegrityTolerance * std::max(
+        1.0, std::max(std::abs(expected), std::abs(observed))
+    );
+    return !std::isfinite(expected) || !std::isfinite(observed)
+        || std::abs(expected - observed) > tolerance;
+}
+
+void copy_col_major_matrix(int rows, int columns,
+                           const double* source, int source_ld,
+                           double* destination, int destination_ld,
+                           int requested_threads) {
+    const int threads = std::max(1, std::min(requested_threads, columns));
+    const size_t column_bytes = checked_mul(
+        static_cast<size_t>(rows), sizeof(double),
+        "protected GEMM input column"
+    );
+#ifdef _OPENMP
+    #pragma omp parallel for schedule(static) num_threads(threads)
+#endif
+    for (int column = 0; column < columns; ++column) {
+        std::memcpy(
+            destination
+                + static_cast<size_t>(column)
+                    * static_cast<size_t>(destination_ld),
+            source
+                + static_cast<size_t>(column)
+                    * static_cast<size_t>(source_ld),
+            column_bytes
+        );
+    }
+}
+
+int64_t dgemm_tn_checked(int m, int n, int k,
+                         const double* a, int lda,
+                         const double* b, int ldb,
+                         double* c, int ldc,
+                         int requested_threads) {
+    std::unique_ptr<double[]> primary_a(new double[
+        checked_mul(static_cast<size_t>(k), static_cast<size_t>(m),
+                    "protected TN input A")
+    ]);
+    std::unique_ptr<double[]> primary_b(new double[
+        checked_mul(static_cast<size_t>(k), static_cast<size_t>(n),
+                    "protected TN input B")
+    ]);
+    copy_col_major_matrix(
+        k, m, a, lda, primary_a.get(), k, requested_threads
+    );
+    copy_col_major_matrix(
+        k, n, b, ldb, primary_b.get(), k, requested_threads
+    );
+    dgemm_tn(
+        m, n, k, primary_a.get(), k, primary_b.get(), k, c, ldc
+    );
+    std::vector<double> coefficients = gemm_integrity_coefficients(m);
+    std::vector<double> projected(
+        checked_mul(
+            static_cast<size_t>(k),
+            static_cast<size_t>(kGemmIntegrityChecks),
+            "GEMM integrity projection"
+        )
+    );
+    const size_t check_elements = checked_mul(
+        static_cast<size_t>(kGemmIntegrityChecks),
+        static_cast<size_t>(n),
+        "GEMM integrity checks"
+    );
+    std::vector<double> expected(check_elements);
+    std::vector<double> observed(check_elements);
+    dgemm_nn_tiled(
+        k, kGemmIntegrityChecks, m,
+        a, lda, coefficients.data(), m,
+        projected.data(), k, requested_threads
+    );
+    dgemm_tn_tiled(
+        kGemmIntegrityChecks, n, k,
+        projected.data(), k, b, ldb,
+        expected.data(), kGemmIntegrityChecks, requested_threads
+    );
+    dgemm_tn_tiled(
+        kGemmIntegrityChecks, n, m,
+        coefficients.data(), m, c, ldc,
+        observed.data(), kGemmIntegrityChecks, requested_threads
+    );
+    const auto column_disagrees = [&](int column) {
+        for (int check = 0; check < kGemmIntegrityChecks; ++check) {
+            const size_t index =
+                static_cast<size_t>(column) *
+                    static_cast<size_t>(kGemmIntegrityChecks)
+                + static_cast<size_t>(check);
+            if (gemm_integrity_disagrees(expected[index], observed[index])) {
+                return true;
+            }
+        }
+        return false;
+    };
+    // Threaded BLAS partition failures usually damage a contiguous output range.
+    // Recompute each such range as one cache-tiled product; launching a full
+    // reduction independently for every flagged column rereads A needlessly.
+    int64_t repaired = 0;
+    for (int column = 0; column < n;) {
+        if (!column_disagrees(column)) {
+            ++column;
+            continue;
+        }
+        const int first = column;
+        do {
+            ++repaired;
+            ++column;
+        } while (column < n && column_disagrees(column));
+        const int count = column - first;
+        dgemm_tn_tiled(
+            m, count, k, a, lda,
+            b + static_cast<size_t>(first) * static_cast<size_t>(ldb),
+            ldb,
+            c + static_cast<size_t>(first) * static_cast<size_t>(ldc),
+            ldc, requested_threads
+        );
+    }
+    return repaired;
+}
+
+int64_t dgemm_nn_checked(int m, int n, int k,
+                         const double* a, int lda,
+                         const double* b, int ldb,
+                         double* c, int ldc,
+                         int requested_threads) {
+    std::unique_ptr<double[]> primary_a(new double[
+        checked_mul(static_cast<size_t>(m), static_cast<size_t>(k),
+                    "protected NN input A")
+    ]);
+    std::unique_ptr<double[]> primary_b(new double[
+        checked_mul(static_cast<size_t>(k), static_cast<size_t>(n),
+                    "protected NN input B")
+    ]);
+    copy_col_major_matrix(
+        m, k, a, lda, primary_a.get(), m, requested_threads
+    );
+    copy_col_major_matrix(
+        k, n, b, ldb, primary_b.get(), k, requested_threads
+    );
+    dgemm_nn(
+        m, n, k, primary_a.get(), m, primary_b.get(), k, c, ldc
+    );
+    std::vector<double> coefficients = gemm_integrity_coefficients(m);
+    std::vector<double> projected(
+        checked_mul(
+            static_cast<size_t>(k),
+            static_cast<size_t>(kGemmIntegrityChecks),
+            "GEMM integrity projection"
+        )
+    );
+    const size_t check_elements = checked_mul(
+        static_cast<size_t>(kGemmIntegrityChecks),
+        static_cast<size_t>(n),
+        "GEMM integrity checks"
+    );
+    std::vector<double> expected(check_elements);
+    std::vector<double> observed(check_elements);
+    dgemm_tn_tiled(
+        k, kGemmIntegrityChecks, m,
+        a, lda, coefficients.data(), m,
+        projected.data(), k, requested_threads
+    );
+    dgemm_tn_tiled(
+        kGemmIntegrityChecks, n, k,
+        projected.data(), k, b, ldb,
+        expected.data(), kGemmIntegrityChecks, requested_threads
+    );
+    dgemm_tn_tiled(
+        kGemmIntegrityChecks, n, m,
+        coefficients.data(), m, c, ldc,
+        observed.data(), kGemmIntegrityChecks, requested_threads
+    );
+    const auto column_disagrees = [&](int column) {
+        for (int check = 0; check < kGemmIntegrityChecks; ++check) {
+            const size_t index =
+                static_cast<size_t>(column) *
+                    static_cast<size_t>(kGemmIntegrityChecks)
+                + static_cast<size_t>(check);
+            if (gemm_integrity_disagrees(expected[index], observed[index])) {
+                return true;
+            }
+        }
+        return false;
+    };
+    int64_t repaired = 0;
+    for (int column = 0; column < n;) {
+        if (!column_disagrees(column)) {
+            ++column;
+            continue;
+        }
+        const int first = column;
+        do {
+            ++repaired;
+            ++column;
+        } while (column < n && column_disagrees(column));
+        const int count = column - first;
+        dgemm_nn_tiled(
+            m, count, k, a, lda,
+            b + static_cast<size_t>(first) * static_cast<size_t>(ldb),
+            ldb,
+            c + static_cast<size_t>(first) * static_cast<size_t>(ldc),
+            ldc, requested_threads
+        );
+    }
+    return repaired;
+}
+#endif
+
+size_t partitioned_gemm_integrity_workspace_elements(int m, int n, int k) {
+#if defined(GWLDCORE_GEMM_INTEGRITY)
+    return gemm_integrity_workspace_elements(m, n, k);
+#else
+    (void)m; (void)n; (void)k;
+    return 0;
+#endif
+}
+
+int64_t dgemm_tn_partitioned_columns(int m, int n, int k,
+                                     const double* a, int lda,
+                                     const double* b, int ldb,
+                                     double* c, int ldc,
+                                     int requested_threads) {
+#if defined(GWLDCORE_GEMM_INTEGRITY)
+    if (gemm_requires_integrity_checks(m, n, k)) {
+        return dgemm_tn_checked(
+            m, n, k, a, lda, b, ldb, c, ldc, requested_threads
+        );
+    } else {
+        dgemm_tn_tiled(
+            m, n, k, a, lda, b, ldb, c, ldc, requested_threads
+        );
+        return 0;
+    }
+#else
+    (void) requested_threads;
+    dgemm_tn(m, n, k, a, lda, b, ldb, c, ldc);
+    return 0;
+#endif
+}
+
+int64_t dgemm_nn_partitioned_rows(int m, int n, int k,
+                                  const double* a, int lda,
+                                  const double* b, int ldb,
+                                  double* c, int ldc,
+                                  int requested_threads,
+                                  double alpha = 1.0, double beta = 0.0) {
+#if defined(GWLDCORE_GEMM_INTEGRITY)
+    if (alpha == 1.0 && beta == 0.0 &&
+        gemm_requires_integrity_checks(m, n, k)) {
+        return dgemm_nn_checked(
+            m, n, k, a, lda, b, ldb, c, ldc, requested_threads
+        );
+    } else {
+        dgemm_nn_tiled(
+            m, n, k, a, lda, b, ldb, c, ldc,
+            requested_threads, alpha, beta
+        );
+        return 0;
+    }
+#else
+    (void) requested_threads;
+    dgemm_nn(m, n, k, a, lda, b, ldb, c, ldc, alpha, beta);
+    return 0;
+#endif
+}
+
+int64_t dgemm_tn_partitioned_rows(int m, int n, int k,
+                                  const double* a, int lda,
+                                  const double* b, int ldb,
+                                  double* c, int ldc,
+                                  int requested_threads,
+                                  double alpha = 1.0, double beta = 0.0) {
+#if defined(GWLDCORE_GEMM_INTEGRITY)
+    if (alpha == 1.0 && beta == 0.0 &&
+        gemm_requires_integrity_checks(m, n, k)) {
+        return dgemm_tn_checked(
+            m, n, k, a, lda, b, ldb, c, ldc, requested_threads
+        );
+    } else {
+        dgemm_tn_tiled(
+            m, n, k, a, lda, b, ldb, c, ldc,
+            requested_threads, alpha, beta
+        );
+        return 0;
+    }
+#else
+    (void) requested_threads;
+    dgemm_tn(m, n, k, a, lda, b, ldb, c, ldc, alpha, beta);
+    return 0;
+#endif
 }
 
 #if defined(__linux__)
@@ -281,18 +786,19 @@ private:
                    int rows,
                    int columns,
                    double leakage,
-                   std::vector<double>&& data,
-                   std::vector<double>&& environment_data)
+                   size_t elements,
+                   std::unique_ptr<double[]>&& data)
         : context_id_(context_id), rows_(rows), columns_(columns),
-          leakage_(leakage), data_(std::move(data)),
-          environment_data_(std::move(environment_data)) {}
+          leakage_(leakage), elements_(elements), data_(std::move(data)) {}
 
     uint64_t context_id_ = 0;
     int rows_ = 0;
     int columns_ = 0;
     double leakage_ = 0.0;
-    std::vector<double> data_;
-    std::vector<double> environment_data_;
+    size_t elements_ = 0;
+    // One column-major [S, E*S] allocation lets target work consume both
+    // left operators in one wide GEMM without copying the persistent panel.
+    std::unique_ptr<double[]> data_;
 };
 
 class DirectContext {
@@ -306,12 +812,14 @@ public:
                   nb_mat2f_ro<double> q_basis,
                   int decode_threads,
                   uint64_t max_workspace_bytes,
-                  int target_panel_columns)
+                  int target_panel_columns,
+                  bool strict_feature_moment_verification)
         : context_id_(next_context_id()),
           ddof_(ddof),
           decode_threads_(decode_threads),
           max_workspace_bytes_(max_workspace_bytes),
-          target_panel_columns_(target_panel_columns) {
+          target_panel_columns_(target_panel_columns),
+          strict_feature_moment_verification_(strict_feature_moment_verification) {
 #if !defined(__linux__)
         (void)bed_descriptor; (void)bim_descriptor; (void)fam_descriptor;
         (void)row_sel_obj; (void)env; (void)q_basis;
@@ -414,6 +922,12 @@ public:
         result["max_workspace_bytes"] = max_workspace_bytes_;
         result["target_panel_columns"] = target_panel_columns_;
         result["projected_target_full_width"] = true;
+        result["strict_feature_moment_verification"] = strict_feature_moment_verification_;
+        result["feature_moment_integrity_mode"] = strict_feature_moment_verification_
+            ? "strict_duplicate"
+            : "independent_continuous_eight_check_abft";
+        result["repaired_gemm_output_columns"] =
+            repaired_gemm_output_columns_.load(std::memory_order_relaxed);
         result["environment_mean"] = environment_mean_;
         result["environment_variance"] = environment_variance_;
         result["max_q_gram_error"] = max_q_gram_error_;
@@ -432,9 +946,16 @@ public:
         check_files_unchanged();
         const int l = blk_end - blk_start;
         const int rank = n_ - q_;
+        const int moment_rows = 4 * q_;
         size_t elements = checked_mul(static_cast<size_t>(n_), static_cast<size_t>(l), "feature genotype");
-        elements = checked_add(elements, checked_mul(5U, checked_mul(static_cast<size_t>(q_), static_cast<size_t>(l), "feature moments"), "feature moments"), "feature workspace");
+        const size_t moment_copies = strict_feature_moment_verification_ ? 8U : 4U;
+        elements = checked_add(elements, checked_mul(moment_copies, checked_mul(static_cast<size_t>(q_), static_cast<size_t>(l), "feature moments"), "feature moments"), "feature workspace");
         elements = checked_add(elements, checked_mul(11U, static_cast<size_t>(l), "feature vectors"), "feature workspace");
+        elements = checked_add(
+            elements,
+            partitioned_gemm_integrity_workspace_elements(moment_rows, l, n_),
+            "feature integrity workspace"
+        );
         ensure_workspace(elements, "feature block");
 
         double* scale_x = nullptr;
@@ -453,29 +974,39 @@ public:
         auto corr_xw_out = make_owned_numpy_vec1<double>(static_cast<size_t>(l), &corr_xw);
 
         int64_t missing = 0;
-        int64_t repaired_additive_moment_columns = 0;
+        int64_t repaired_feature_moment_columns = 0;
         double max_leak_x = 0.0;
         double max_leak_w = 0.0;
         {
             nb::gil_scoped_release release;
-            std::vector<double> geno;
+            std::unique_ptr<double[]> geno;
             std::vector<int> observed;
             missing = decode_block(blk_start, blk_end, require_missing_free, geno, observed);
             std::vector<double> moments(
                 checked_mul(4U, checked_mul(static_cast<size_t>(q_), static_cast<size_t>(l), "feature moments"), "feature moments"),
                 0.0
             );
-            std::vector<double> additive_moments_check(
-                checked_mul(static_cast<size_t>(q_), static_cast<size_t>(l), "feature moment verification"),
-                0.0
-            );
+            std::vector<double> moment_verification;
+            if (strict_feature_moment_verification_) {
+                moment_verification.assign(
+                    checked_mul(
+                        4U,
+                        checked_mul(static_cast<size_t>(q_), static_cast<size_t>(l), "feature moment verification"),
+                        "feature moment verification"
+                    ),
+                    0.0
+                );
+            }
             std::vector<double> scalar(4U * static_cast<size_t>(l), 0.0);
             double* s0 = scalar.data();
             double* s1 = s0 + l;
             double* s2 = s1 + l;
             double* s4 = s2 + l;
+#ifdef _OPENMP
+            #pragma omp parallel for schedule(static) num_threads(decode_threads_)
+#endif
             for (int j = 0; j < l; ++j) {
-                const double* column = geno.data() + static_cast<size_t>(j) * static_cast<size_t>(n_);
+                const double* column = geno.get() + static_cast<size_t>(j) * static_cast<size_t>(n_);
                 double a0 = 0.0, a1 = 0.0, a2 = 0.0, a4 = 0.0;
                 for (int i = 0; i < n_; ++i) {
                     const double e = env_[static_cast<size_t>(i)];
@@ -488,84 +1019,76 @@ public:
                 }
                 s0[j] = a0; s1[j] = a1; s2[j] = a2; s4[j] = a4;
             }
-            // The first BLAS call after an OpenMP BED decode has exhibited a
-            // rare, localized OpenBLAS corruption on large cohorts.  Repeat
-            // the additive moment product before mutating ``geno`` and verify
-            // it column by column.  Any disagreement is repaired by a direct
-            // long-double dot product, so feature metadata can never silently
-            // diverge from the later source/target passes.
-            double* u0_all = moments.data();
-            dgemm_tn(q_, l, n_, q_basis_.data(), n_, geno.data(), n_, u0_all, q_);
-            dgemm_tn(
-                q_, l, n_, q_basis_.data(), n_, geno.data(), n_,
-                additive_moments_check.data(), q_
+            // [Q, E Q, E^2 Q, E^3 Q]^T G yields every required projected
+            // moment in one cache-efficient GEMM instead of four skinny
+            // products and three full genotype rewrites.
+            const int64_t abft_repairs = dgemm_tn_partitioned_columns(
+                moment_rows, l, n_, feature_moment_basis_.data(), n_,
+                geno.get(), n_, moments.data(), moment_rows, decode_threads_
             );
+            repaired_feature_moment_columns += abft_repairs;
+            record_gemm_repairs(abft_repairs);
+            if (strict_feature_moment_verification_) {
+                // Strict mode repeats the full product. It is retained for
+                // stress testing and unusually conservative deployments.
+                dgemm_tn_tiled(
+                    moment_rows, l, n_, feature_moment_basis_.data(), n_,
+                    geno.get(), n_, moment_verification.data(), moment_rows,
+                    decode_threads_
+                );
+            }
             for (int j = 0; j < l; ++j) {
                 bool disagrees = false;
-                for (int a = 0; a < q_; ++a) {
-                    const size_t index =
-                        static_cast<size_t>(j) * static_cast<size_t>(q_) +
-                        static_cast<size_t>(a);
-                    const double first = u0_all[index];
-                    const double second = additive_moments_check[index];
-                    const double tolerance = 1.0e-12 * std::max(
-                        1.0, std::max(std::abs(first), std::abs(second))
-                    );
-                    if (!std::isfinite(first) || !std::isfinite(second) ||
-                        std::abs(first - second) > tolerance) {
-                        disagrees = true;
-                        break;
+                double* moment_column = moments.data() +
+                    static_cast<size_t>(j) * static_cast<size_t>(moment_rows);
+                if (strict_feature_moment_verification_) {
+                    const double* repeated = moment_verification.data() +
+                        static_cast<size_t>(j) * static_cast<size_t>(moment_rows);
+                    for (int row = 0; row < moment_rows; ++row) {
+                        const double first = moment_column[row];
+                        const double second = repeated[row];
+                        const double tolerance = 1.0e-12 * std::max(
+                            1.0, std::max(std::abs(first), std::abs(second))
+                        );
+                        if (!std::isfinite(first) || !std::isfinite(second) ||
+                            std::abs(first - second) > tolerance) {
+                            disagrees = true;
+                            break;
+                        }
+                    }
+                    if (!disagrees) {
+                        std::memcpy(
+                            moment_column, repeated,
+                            checked_mul(
+                                static_cast<size_t>(moment_rows), sizeof(double),
+                                "strictly verified feature moments"
+                            )
+                        );
                     }
                 }
                 if (disagrees) {
-                    ++repaired_additive_moment_columns;
-                    const double* genotype_column =
-                        geno.data() + static_cast<size_t>(j) * static_cast<size_t>(n_);
-                    for (int a = 0; a < q_; ++a) {
-                        const double* basis_column =
-                            q_basis_.data() + static_cast<size_t>(a) * static_cast<size_t>(n_);
+                    ++repaired_feature_moment_columns;
+                    record_gemm_repairs(1);
+                    const double* genotype_column = geno.get() +
+                        static_cast<size_t>(j) * static_cast<size_t>(n_);
+                    for (int row = 0; row < moment_rows; ++row) {
+                        const double* basis_column = feature_moment_basis_.data() +
+                            static_cast<size_t>(row) * static_cast<size_t>(n_);
                         long double dot = 0.0L;
                         for (int i = 0; i < n_; ++i) {
                             dot += static_cast<long double>(basis_column[i]) *
                                 static_cast<long double>(genotype_column[i]);
                         }
-                        u0_all[
-                            static_cast<size_t>(j) * static_cast<size_t>(q_) +
-                            static_cast<size_t>(a)
-                        ] = static_cast<double>(dot);
-                    }
-                } else {
-                    std::memcpy(
-                        u0_all + static_cast<size_t>(j) * static_cast<size_t>(q_),
-                        additive_moments_check.data() +
-                            static_cast<size_t>(j) * static_cast<size_t>(q_),
-                        checked_mul(
-                            static_cast<size_t>(q_), sizeof(double),
-                            "verified additive feature moment"
-                        )
-                    );
-                }
-            }
-            for (int power = 1; power < 4; ++power) {
-                for (int j = 0; j < l; ++j) {
-                    double* column = geno.data() + static_cast<size_t>(j) * static_cast<size_t>(n_);
-                    for (int i = 0; i < n_; ++i) {
-                        column[i] *= env_[static_cast<size_t>(i)];
+                        moment_column[row] = static_cast<double>(dot);
                     }
                 }
-                double* out = moments.data() +
-                    static_cast<size_t>(power) * static_cast<size_t>(q_) *
-                    static_cast<size_t>(l);
-                dgemm_tn(q_, l, n_, q_basis_.data(), n_, geno.data(), n_, out, q_);
             }
-            const double* u1_all = u0_all + static_cast<size_t>(q_) * static_cast<size_t>(l);
-            const double* u2_all = u1_all + static_cast<size_t>(q_) * static_cast<size_t>(l);
-            const double* u3_all = u2_all + static_cast<size_t>(q_) * static_cast<size_t>(l);
             for (int j = 0; j < l; ++j) {
-                const double* u0 = u0_all + static_cast<size_t>(j) * static_cast<size_t>(q_);
-                const double* u1 = u1_all + static_cast<size_t>(j) * static_cast<size_t>(q_);
-                const double* u2 = u2_all + static_cast<size_t>(j) * static_cast<size_t>(q_);
-                const double* u3 = u3_all + static_cast<size_t>(j) * static_cast<size_t>(q_);
+                const double* u0 = moments.data() +
+                    static_cast<size_t>(j) * 4U * static_cast<size_t>(q_);
+                const double* u1 = u0 + q_;
+                const double* u2 = u1 + q_;
+                const double* u3 = u2 + q_;
                 double u00 = 0.0, u11 = 0.0, u01 = 0.0;
                 double u0u2 = 0.0, u1u3 = 0.0;
                 double u0e2u0 = 0.0, u1e2u1 = 0.0;
@@ -634,7 +1157,12 @@ public:
         result["corr_xw"] = corr_xw_out;
         result["max_projection_leakage_additive"] = max_leak_x;
         result["max_projection_leakage_interaction"] = max_leak_w;
-        result["repaired_additive_moment_columns"] = repaired_additive_moment_columns;
+        result["repaired_feature_moment_columns"] = repaired_feature_moment_columns;
+        result["repaired_additive_moment_columns"] = repaired_feature_moment_columns;
+        result["strict_feature_moment_verification"] = strict_feature_moment_verification_;
+        result["feature_moment_integrity_mode"] = strict_feature_moment_verification_
+            ? "strict_duplicate"
+            : "independent_continuous_eight_check_abft";
         result["missing_genotype_calls"] = missing;
         return result;
     }
@@ -665,15 +1193,33 @@ public:
         }
         const size_t columns_size = checked_mul(static_cast<size_t>(num_groups), static_cast<size_t>(v), "source columns");
         const int columns = checked_blas_dim(columns_size, "source columns");
+        const size_t fused_columns_size = checked_mul(
+            2U, columns_size, "fused source columns"
+        );
+        const int fused_columns = checked_blas_dim(
+            fused_columns_size, "fused source columns"
+        );
         const size_t probe_elements = checked_mul(
             static_cast<size_t>(l), static_cast<size_t>(v), "source probe snapshot"
         );
         size_t elements = checked_mul(static_cast<size_t>(n_), static_cast<size_t>(l), "source genotype");
-        elements = checked_add(elements, checked_mul(static_cast<size_t>(l), columns_size, "source weights"), "source workspace");
+        elements = checked_add(elements, checked_mul(2U, checked_mul(static_cast<size_t>(l), columns_size, "source weights"), "source weights"), "source workspace");
         elements = checked_add(elements, checked_mul(2U, checked_mul(static_cast<size_t>(n_), columns_size, "source outputs"), "source outputs"), "source workspace");
-        elements = checked_add(elements, checked_mul(static_cast<size_t>(q_), columns_size, "source projection"), "source workspace");
+        elements = checked_add(elements, checked_mul(2U, checked_mul(static_cast<size_t>(q_), columns_size, "source projection"), "source projection"), "source workspace");
         elements = checked_add(elements, probe_elements, "source input snapshots");
         elements = checked_add(elements, checked_mul(4U, static_cast<size_t>(l), "source vector snapshots"), "source input snapshots");
+        elements = checked_add(
+            elements,
+            std::max(
+                partitioned_gemm_integrity_workspace_elements(
+                    n_, fused_columns, l
+                ),
+                partitioned_gemm_integrity_workspace_elements(
+                    q_, fused_columns, n_
+                )
+            ),
+            "source integrity workspace"
+        );
         ensure_workspace(elements, "source block");
 
         // Nanobind array views borrow caller memory.  Snapshot every input while
@@ -694,18 +1240,33 @@ public:
             group_ids.data(), group_ids.data() + static_cast<size_t>(l)
         );
 
-        double* source_x = nullptr;
-        double* source_w = nullptr;
-        auto source_x_out = make_owned_numpy_mat2f<double>(static_cast<size_t>(n_), columns_size, &source_x);
-        auto source_w_out = make_owned_numpy_mat2f<double>(static_cast<size_t>(n_), columns_size, &source_w);
+        double* fused_source = nullptr;
+        auto fused_source_out = make_owned_numpy_mat2f<double>(
+            static_cast<size_t>(n_), fused_columns_size, &fused_source
+        );
+        nb::object fused_source_owner = nb::cast(fused_source_out);
+        // Keep the established two-array API without allocating or copying
+        // the halves. Both returned views retain the one fused owner.
+        auto source_x_out = nb_numpy_mat2f<double>(
+            fused_source,
+            {static_cast<size_t>(n_), columns_size},
+            fused_source_owner
+        );
+        auto source_w_out = nb_numpy_mat2f<double>(
+            fused_source + checked_mul(
+                static_cast<size_t>(n_), columns_size, "source view offset"
+            ),
+            {static_cast<size_t>(n_), columns_size},
+            fused_source_owner
+        );
         int64_t missing = 0;
         {
             nb::gil_scoped_release release;
-            std::vector<double> geno;
+            std::unique_ptr<double[]> geno;
             std::vector<int> observed;
             missing = decode_block(blk_start, blk_end, require_missing_free, geno, observed);
             std::vector<double> weighted(
-                checked_mul(static_cast<size_t>(l), columns_size, "source weights"), 0.0
+                checked_mul(static_cast<size_t>(l), fused_columns_size, "source weights"), 0.0
             );
             const double* zp = probe_snapshot.data();
             const double* sxp = scale_x_snapshot.data();
@@ -729,34 +1290,34 @@ public:
                     }
                     const size_t index = static_cast<size_t>(group * v + c) * static_cast<size_t>(l) + static_cast<size_t>(j);
                     weighted[index] = probe * ap[j] * sxp[j];
-                }
-            }
-            dgemm_nn(n_, columns, l, geno.data(), n_, weighted.data(), l, source_x, n_);
-            for (int j = 0; j < l; ++j) {
-                const int group = static_cast<int>(gp[j]);
-                for (int c = 0; c < v; ++c) {
-                    const double probe = zp[
-                        static_cast<size_t>(c) * static_cast<size_t>(l) +
-                        static_cast<size_t>(j)
-                    ];
-                    const size_t index = static_cast<size_t>(group * v + c) * static_cast<size_t>(l) + static_cast<size_t>(j);
                     // Form the interaction weight directly.  Reusing the X
                     // weight through ``*(scale_w / scale_x)`` is
                     // algebraically unnecessary and can overflow at the
                     // intermediate ratio even when this final product is
                     // finite.
-                    weighted[index] = probe * ap[j] * swp[j];
+                    weighted[
+                        index + static_cast<size_t>(l) * columns_size
+                    ] = probe * ap[j] * swp[j];
                 }
             }
-            dgemm_nn(n_, columns, l, geno.data(), n_, weighted.data(), l, source_w, n_);
+            record_gemm_repairs(dgemm_nn_partitioned_rows(
+                n_, fused_columns, l, geno.get(), n_, weighted.data(), l,
+                fused_source, n_, decode_threads_
+            ));
+#ifdef _OPENMP
+            #pragma omp parallel for schedule(static) num_threads(decode_threads_)
+#endif
             for (int c = 0; c < columns; ++c) {
-                double* column = source_w + static_cast<size_t>(c) * static_cast<size_t>(n_);
+                double* column = fused_source +
+                    static_cast<size_t>(columns + c) * static_cast<size_t>(n_);
                 for (int i = 0; i < n_; ++i) column[i] *= env_[static_cast<size_t>(i)];
             }
-            project_panel_inplace(source_x, columns);
-            project_panel_inplace(source_w, columns);
-            validate_finite_output(source_x, checked_mul(static_cast<size_t>(n_), columns_size, "source output"), "source_x");
-            validate_finite_output(source_w, checked_mul(static_cast<size_t>(n_), columns_size, "source output"), "source_w");
+            project_panel_inplace(fused_source, fused_columns);
+            validate_finite_output(
+                fused_source,
+                checked_mul(static_cast<size_t>(n_), fused_columns_size, "source output"),
+                "fused source"
+            );
             check_files_unchanged();
         }
         return nb::make_tuple(source_x_out, source_w_out, missing);
@@ -783,17 +1344,41 @@ public:
         );
         ensure_workspace(
             checked_add(
-                checked_mul(2U, source_elements, "projected source snapshots"),
-                coefficient_elements, "projected source preparation"
+                checked_add(
+                    checked_mul(2U, source_elements, "projected source snapshots"),
+                    coefficient_elements, "projected source preparation"
+                ),
+                partitioned_gemm_integrity_workspace_elements(
+                    q_, columns, n_
+                ),
+                "projected source integrity workspace"
             ),
             "projected source preparation"
         );
-        std::vector<double> snapshot(sources.data(), sources.data() + source_elements);
-        std::vector<double> environment_snapshot(source_elements, 0.0);
+        const size_t snapshot_elements = checked_mul(
+            2U, source_elements, "projected source snapshots"
+        );
+        const size_t source_column_bytes = checked_mul(
+            static_cast<size_t>(n_), sizeof(double), "projected source column"
+        );
+        // Both halves are fully populated below. Leave the allocation
+        // untouched until parallel column loops write it so large panels are
+        // distributed across the decoder's NUMA nodes.
+        std::unique_ptr<double[]> snapshot(new double[snapshot_elements]);
+#ifdef _OPENMP
+        #pragma omp parallel for schedule(static) num_threads(decode_threads_)
+#endif
+        for (int column = 0; column < columns; ++column) {
+            std::memcpy(
+                snapshot.get() + static_cast<size_t>(column) * static_cast<size_t>(n_),
+                sources.data() + static_cast<size_t>(column) * static_cast<size_t>(n_),
+                source_column_bytes
+            );
+        }
         double leakage = 0.0;
         {
             nb::gil_scoped_release release;
-            leakage = projected_source_leakage(snapshot.data(), columns);
+            leakage = projected_source_leakage(snapshot.get(), columns);
             if (leakage > tolerance) {
                 throw std::runtime_error(
                     "GxE native source is not in the projected fixed-effect complement: leakage=" +
@@ -804,25 +1389,28 @@ public:
             // components after an exact source projection.  Seal the opaque
             // panel only after a float64 reprojection; target W-left products
             // use e*S and therefore require S itself to be projected.
-            project_panel_inplace(snapshot.data(), columns);
+            project_panel_inplace(snapshot.get(), columns);
+#ifdef _OPENMP
+            #pragma omp parallel for schedule(static) num_threads(decode_threads_)
+#endif
             for (int column = 0; column < columns; ++column) {
-                const double* source = snapshot.data() +
+                const double* source = snapshot.get() +
                     static_cast<size_t>(column) * static_cast<size_t>(n_);
-                double* weighted = environment_snapshot.data() +
+                double* weighted = snapshot.get() + source_elements +
                     static_cast<size_t>(column) * static_cast<size_t>(n_);
                 for (int row = 0; row < n_; ++row) {
                     weighted[row] = env_[static_cast<size_t>(row)] * source[row];
                 }
             }
             validate_finite_output(
-                environment_snapshot.data(), source_elements,
+                snapshot.get() + source_elements, source_elements,
                 "environment-weighted projected sources"
             );
             check_files_unchanged();
         }
         return ProjectedPanel(
-            context_id_, n_, columns, leakage,
-            std::move(snapshot), std::move(environment_snapshot)
+            context_id_, n_, columns, leakage, snapshot_elements,
+            std::move(snapshot)
         );
     }
 
@@ -857,6 +1445,18 @@ public:
         elements = checked_add(elements, checked_mul(2U, checked_mul(static_cast<size_t>(l), static_cast<size_t>(columns), "target outputs"), "target outputs"), "target workspace");
         elements = checked_add(elements, checked_mul(2U, checked_mul(static_cast<size_t>(n_), static_cast<size_t>(width), "target panels"), "target panels"), "target workspace");
         elements = checked_add(elements, checked_mul(static_cast<size_t>(q_), static_cast<size_t>(width), "target QTS"), "target workspace");
+        elements = checked_add(
+            elements,
+            std::max(
+                partitioned_gemm_integrity_workspace_elements(
+                    q_, width, n_
+                ),
+                partitioned_gemm_integrity_workspace_elements(
+                    l, width, n_
+                )
+            ),
+            "target integrity workspace"
+        );
         ensure_workspace(elements, "target block");
 
         const std::vector<double> scale_x_snapshot(
@@ -879,7 +1479,7 @@ public:
             nb::gil_scoped_release release;
             validate_scales(scale_x_snapshot, scale_w_snapshot);
             validate_finite_output(source_snapshot.data(), source_elements, "target sources");
-            std::vector<double> geno;
+            std::unique_ptr<double[]> geno;
             std::vector<int> observed;
             missing = decode_block(blk_start, blk_end, require_missing_free, geno, observed);
             std::vector<double> projected(
@@ -895,7 +1495,10 @@ public:
                 const size_t panel_elements = checked_mul(
                     static_cast<size_t>(n_), static_cast<size_t>(count), "target panel"
                 );
-                dgemm_tn(q_, count, n_, q_basis_.data(), n_, source_panel, n_, qts.data(), q_);
+                record_gemm_repairs(dgemm_tn_partitioned_columns(
+                    q_, count, n_, q_basis_.data(), n_, source_panel, n_,
+                    qts.data(), q_, decode_threads_
+                ));
                 max_source_leakage = std::max(
                     max_source_leakage,
                     projected_source_leakage_from_coefficients(
@@ -907,14 +1510,28 @@ public:
                     projected.data(), source_panel,
                     checked_mul(panel_elements, sizeof(double), "target panel copy")
                 );
-                dgemm_nn(n_, count, q_, q_basis_.data(), n_, qts.data(), q_, projected.data(), n_, -1.0, 1.0);
+                record_gemm_repairs(dgemm_nn_partitioned_rows(
+                    n_, count, q_, q_basis_.data(), n_, qts.data(), q_,
+                    projected.data(), n_, decode_threads_, -1.0, 1.0
+                ));
+#ifdef _OPENMP
+                #pragma omp parallel for schedule(static) num_threads(decode_threads_)
+#endif
                 for (int c = 0; c < count; ++c) {
                     const double* source = projected.data() + static_cast<size_t>(c) * static_cast<size_t>(n_);
                     double* weighted = env_projected.data() + static_cast<size_t>(c) * static_cast<size_t>(n_);
                     for (int i = 0; i < n_; ++i) weighted[i] = env_[static_cast<size_t>(i)] * source[i];
                 }
-                dgemm_tn(l, count, n_, geno.data(), n_, projected.data(), n_, work_x + static_cast<size_t>(c0) * static_cast<size_t>(l), l);
-                dgemm_tn(l, count, n_, geno.data(), n_, env_projected.data(), n_, work_w + static_cast<size_t>(c0) * static_cast<size_t>(l), l);
+                record_gemm_repairs(dgemm_tn_partitioned_rows(
+                    l, count, n_, geno.get(), n_, projected.data(), n_,
+                    work_x + static_cast<size_t>(c0) * static_cast<size_t>(l),
+                    l, decode_threads_
+                ));
+                record_gemm_repairs(dgemm_tn_partitioned_rows(
+                    l, count, n_, geno.get(), n_, env_projected.data(), n_,
+                    work_w + static_cast<size_t>(c0) * static_cast<size_t>(l),
+                    l, decode_threads_
+                ));
             }
             scale_target_outputs(work_x, work_w, l, columns, scale_x_snapshot, scale_w_snapshot);
             check_files_unchanged();
@@ -983,10 +1600,10 @@ private:
         );
         validate_finite_output(sources, source_elements, "projected sources");
         std::vector<double> coefficients(coefficient_elements, 0.0);
-        dgemm_tn(
+        record_gemm_repairs(dgemm_tn_partitioned_columns(
             q_, columns, n_, q_basis_.data(), n_, sources, n_,
-            coefficients.data(), q_
-        );
+            coefficients.data(), q_, decode_threads_
+        ));
         return projected_source_leakage_from_coefficients(
             sources, source_elements, coefficients.data(), coefficient_elements
         );
@@ -1011,6 +1628,9 @@ private:
                               int columns,
                               const std::vector<double>& scale_x,
                               const std::vector<double>& scale_w) const {
+#ifdef _OPENMP
+        #pragma omp parallel for schedule(static) num_threads(decode_threads_)
+#endif
         for (int column = 0; column < columns; ++column) {
             double* x = work_x + static_cast<size_t>(column) * static_cast<size_t>(rows);
             double* w = work_w + static_cast<size_t>(column) * static_cast<size_t>(rows);
@@ -1029,10 +1649,13 @@ private:
     void validate_projected_panel_handle(const ProjectedPanel& panel) const {
         if (panel.context_id_ != context_id_ || panel.rows_ != n_ ||
             panel.columns_ <= 0 ||
-            panel.data_.size() != checked_mul(
-                static_cast<size_t>(n_), static_cast<size_t>(panel.columns_),
+            panel.data_ == nullptr || panel.elements_ != checked_mul(
+                2U, checked_mul(
+                    static_cast<size_t>(n_), static_cast<size_t>(panel.columns_),
+                    "opaque projected panel"
+                ),
                 "opaque projected panel"
-            ) || panel.environment_data_.size() != panel.data_.size()) {
+            )) {
             throw std::runtime_error(
                 "GxE native projected panel does not belong to this context"
             );
@@ -1066,6 +1689,30 @@ private:
         size_t elements = checked_mul(static_cast<size_t>(n_), static_cast<size_t>(l), "target genotype");
         elements = checked_add(elements, checked_mul(2U, static_cast<size_t>(l), "target scale snapshots"), "target input snapshots");
         elements = checked_add(elements, checked_mul(2U, checked_mul(static_cast<size_t>(l), columns_size, "target outputs"), "target outputs"), "target workspace");
+        const size_t widest_panel = std::max(
+            static_cast<size_t>(first.columns_),
+            second == nullptr ? 0U : static_cast<size_t>(second->columns_)
+        );
+        const int widest_fused_columns = checked_blas_dim(
+            checked_mul(2U, widest_panel, "fused projected target columns"),
+            "fused projected target columns"
+        );
+        elements = checked_add(
+            elements,
+            checked_mul(
+                2U,
+                checked_mul(static_cast<size_t>(l), widest_panel, "fused target output"),
+                "fused target output"
+            ),
+            "target workspace"
+        );
+        elements = checked_add(
+            elements,
+            partitioned_gemm_integrity_workspace_elements(
+                l, widest_fused_columns, n_
+            ),
+            "projected target integrity workspace"
+        );
         ensure_workspace(elements, "projected target block");
 
         const std::vector<double> scale_x_snapshot(
@@ -1082,24 +1729,47 @@ private:
         {
             nb::gil_scoped_release release;
             validate_scales(scale_x_snapshot, scale_w_snapshot);
-            std::vector<double> geno;
+            std::unique_ptr<double[]> geno;
             std::vector<int> observed;
             missing = decode_block(blk_start, blk_end, require_missing_free, geno, observed);
+            const size_t fused_work_elements = checked_mul(
+                2U,
+                checked_mul(static_cast<size_t>(l), widest_panel, "fused target output"),
+                "fused target output"
+            );
+            std::unique_ptr<double[]> fused_work(
+                new double[fused_work_elements]
+            );
             size_t output_offset = 0;
             auto consume = [&](const ProjectedPanel& panel) {
-                // ProjectedPanel already owns immutable S and e*S arrays. Unlike
-                // target_block(), this path allocates no N-by-panel-width
-                // temporary, so slicing a wide panel only turns one efficient
-                // GEMM into many narrow calls without reducing peak memory.
-                dgemm_tn(
-                    l, panel.columns_, n_, geno.data(), n_,
-                    panel.data_.data(), n_,
-                    work_x + output_offset * static_cast<size_t>(l), l
+                const int fused_columns = checked_blas_dim(
+                    checked_mul(
+                        2U, static_cast<size_t>(panel.columns_),
+                        "fused projected target columns"
+                    ),
+                    "fused projected target columns"
                 );
-                dgemm_tn(
-                    l, panel.columns_, n_, geno.data(), n_,
-                    panel.environment_data_.data(), n_,
-                    work_w + output_offset * static_cast<size_t>(l), l
+                const size_t panel_output_elements = checked_mul(
+                    static_cast<size_t>(l), static_cast<size_t>(panel.columns_),
+                    "projected target output"
+                );
+                // ProjectedPanel owns one immutable [S, E*S] allocation.  A
+                // single wide product reuses the decoded G block for both X-
+                // and W-left work instead of packing/reading it twice.
+                record_gemm_repairs(dgemm_tn_partitioned_rows(
+                    l, fused_columns, n_, geno.get(), n_,
+                    panel.data_.get(), n_,
+                    fused_work.get(), l, decode_threads_
+                ));
+                std::memcpy(
+                    work_x + output_offset * static_cast<size_t>(l),
+                    fused_work.get(),
+                    checked_mul(panel_output_elements, sizeof(double), "work_x copy")
+                );
+                std::memcpy(
+                    work_w + output_offset * static_cast<size_t>(l),
+                    fused_work.get() + panel_output_elements,
+                    checked_mul(panel_output_elements, sizeof(double), "work_w copy")
                 );
                 output_offset += static_cast<size_t>(panel.columns_);
             };
@@ -1214,6 +1884,29 @@ private:
             std::abs(environment_variance_ - 1.0) > kStandardizedEnvTolerance) {
             throw std::runtime_error("GxE native environment must be nonconstant, centered, and standardized for the configured ddof");
         }
+        const int moment_rows = 4 * q_;
+        feature_moment_basis_.resize(
+            checked_mul(
+                static_cast<size_t>(n_), static_cast<size_t>(moment_rows),
+                "feature moment basis"
+            )
+        );
+        for (int a = 0; a < q_; ++a) {
+            const double* source = q_basis_.data() +
+                static_cast<size_t>(a) * static_cast<size_t>(n_);
+            for (int i = 0; i < n_; ++i) {
+                const double environment = env_[static_cast<size_t>(i)];
+                double multiplier = 1.0;
+                for (int power = 0; power < 4; ++power) {
+                    feature_moment_basis_[
+                        static_cast<size_t>(power * q_ + a) *
+                            static_cast<size_t>(n_) +
+                        static_cast<size_t>(i)
+                    ] = source[i] * multiplier;
+                    multiplier *= environment;
+                }
+            }
+        }
         q_gram_.assign(checked_mul(static_cast<size_t>(q_), static_cast<size_t>(q_), "Q Gram"), 0.0);
         q_e2_q_.assign(q_gram_.size(), 0.0);
         max_q_gram_error_ = 0.0;
@@ -1273,10 +1966,16 @@ private:
     int64_t decode_block(int blk_start,
                          int blk_end,
                          bool require_missing_free,
-                         std::vector<double>& geno,
+                         std::unique_ptr<double[]>& geno,
                          std::vector<int>& observed) const {
         const int l = blk_end - blk_start;
-        geno.assign(checked_mul(static_cast<size_t>(n_), static_cast<size_t>(l), "decoded genotype"), 0.0);
+        const size_t genotype_elements = checked_mul(
+            static_cast<size_t>(n_), static_cast<size_t>(l), "decoded genotype"
+        );
+        // Every cell is assigned in the parallel decode loop. An uninitialized
+        // allocation avoids a redundant serial write and gives correct NUMA
+        // first-touch placement for the subsequent BLAS read.
+        geno.reset(new double[genotype_elements]);
         observed.assign(static_cast<size_t>(l), 0);
 #ifdef _OPENMP
         #pragma omp parallel for schedule(static) num_threads(decode_threads_)
@@ -1284,6 +1983,8 @@ private:
         for (int j = 0; j < l; ++j) {
             const unsigned char* bytes = bed_base_ + 3 +
                 static_cast<size_t>(blk_start + j) * bytes_per_snp_;
+            double* column = geno.get() +
+                static_cast<size_t>(j) * static_cast<size_t>(n_);
             int nobs = 0;
             int64_t sum = 0;
             int64_t sumsq = 0;
@@ -1292,9 +1993,14 @@ private:
                 const uint8_t bits = static_cast<uint8_t>((bytes[static_cast<size_t>(row >> 2)] >> ((row & 3) << 1)) & 0x3U);
                 if (bits != 1U) {
                     const int value = (bits == 0U) ? 0 : (bits == 2U) ? 1 : 2;
+                    column[i] = static_cast<double>(value);
                     ++nobs;
                     sum += value;
                     sumsq += value * value;
+                } else {
+                    // Three is outside the valid 0/1/2 dosage range and keeps
+                    // missingness local to the already-written decode buffer.
+                    column[i] = 3.0;
                 }
             }
             observed[static_cast<size_t>(j)] = nobs;
@@ -1307,15 +2013,12 @@ private:
             const double inverse_sd = (denom > 0 && m2 > 0.0)
                 ? std::sqrt(static_cast<double>(denom) / m2)
                 : 1.0;
-            double* column = geno.data() + static_cast<size_t>(j) * static_cast<size_t>(n_);
             for (int i = 0; i < n_; ++i) {
-                const int row = rows_[static_cast<size_t>(i)];
-                const uint8_t bits = static_cast<uint8_t>((bytes[static_cast<size_t>(row >> 2)] >> ((row & 3) << 1)) & 0x3U);
-                if (bits == 1U) {
+                const double value = column[i];
+                if (value == 3.0) {
                     column[i] = 0.0;
                 } else {
-                    const int value = (bits == 0U) ? 0 : (bits == 2U) ? 1 : 2;
-                    column[i] = -(static_cast<double>(value) - mean) * inverse_sd;
+                    column[i] = (mean - value) * inverse_sd;
                 }
             }
         }
@@ -1348,15 +2051,36 @@ private:
         std::vector<double> coefficients(
             checked_mul(static_cast<size_t>(q_), static_cast<size_t>(columns), "projection coefficients"), 0.0
         );
-        dgemm_tn(q_, columns, n_, q_basis_.data(), n_, panel, n_, coefficients.data(), q_);
-        dgemm_nn(n_, columns, q_, q_basis_.data(), n_, coefficients.data(), q_, panel, n_, -1.0, 1.0);
+        record_gemm_repairs(dgemm_tn_partitioned_columns(
+            q_, columns, n_, q_basis_.data(), n_, panel, n_,
+            coefficients.data(), q_, decode_threads_
+        ));
+        record_gemm_repairs(dgemm_nn_partitioned_rows(
+            n_, columns, q_, q_basis_.data(), n_, coefficients.data(), q_,
+            panel, n_, decode_threads_, -1.0, 1.0
+        ));
     }
 
     void validate_finite_output(const double* values, size_t count, const char* label) const {
+        int invalid = 0;
+#ifdef _OPENMP
+        #pragma omp parallel for schedule(static) num_threads(decode_threads_) reduction(|:invalid)
+#endif
         for (size_t i = 0; i < count; ++i) {
-            if (!std::isfinite(values[i])) {
-                throw std::runtime_error(std::string("GxE native ") + label + " contains a non-finite value");
-            }
+            invalid |= !std::isfinite(values[i]);
+        }
+        if (invalid != 0) {
+            throw std::runtime_error(
+                std::string("GxE native ") + label + " contains a non-finite value"
+            );
+        }
+    }
+
+    void record_gemm_repairs(int64_t count) const {
+        if (count > 0) {
+            repaired_gemm_output_columns_.fetch_add(
+                count, std::memory_order_relaxed
+            );
         }
     }
 
@@ -1392,6 +2116,7 @@ private:
     int decode_threads_ = 1;
     uint64_t max_workspace_bytes_ = 0;
     int target_panel_columns_ = 64;
+    bool strict_feature_moment_verification_ = true;
     int n_total_ = 0;
     int m_total_ = 0;
     int n_ = 0;
@@ -1399,6 +2124,7 @@ private:
     std::vector<int> rows_;
     std::vector<double> env_;
     std::vector<double> q_basis_;
+    std::vector<double> feature_moment_basis_;
     std::vector<double> q_gram_;
     std::vector<double> q_e2_q_;
     double environment_mean_ = 0.0;
@@ -1406,6 +2132,7 @@ private:
     double max_q_gram_error_ = 0.0;
     bool closed_ = false;
     mutable std::mutex call_mutex_;
+    mutable std::atomic<int64_t> repaired_gemm_output_columns_{0};
 #if defined(__linux__)
     int bed_fd_ = -1;
     int bim_fd_ = -1;
@@ -1445,6 +2172,11 @@ NB_MODULE(gxeldcore, module) {
         result["openmp_enabled"] = bool(GWLDCORE_OPENMP_ENABLED);
         result["native_optimization_enabled"] = bool(GWLDCORE_NATIVE_OPT);
         result["platform"] = "linux";
+#ifdef GWLDCORE_USE_OPENBLAS
+        result["blas_runtime_config"] = std::string(openblas_get_config());
+#else
+        result["blas_runtime_config"] = nb::none();
+#endif
         return result;
     });
     nb::class_<ProjectedPanel>(module, "ProjectedPanel")
@@ -1452,11 +2184,12 @@ NB_MODULE(gxeldcore, module) {
         .def_prop_ro("leakage", &ProjectedPanel::leakage);
     nb::class_<DirectContext>(module, "DirectContext")
         .def(
-            nb::init<int, int, int, nb::object, int, nb_vec1_ro<double>, nb_mat2f_ro<double>, int, uint64_t, int>(),
+            nb::init<int, int, int, nb::object, int, nb_vec1_ro<double>, nb_mat2f_ro<double>, int, uint64_t, int, bool>(),
             nb::arg("bed_descriptor"), nb::arg("bim_descriptor"), nb::arg("fam_descriptor"),
             nb::arg("row_sel") = nb::none(), nb::arg("ddof") = 1,
             nb::arg("env"), nb::arg("q_basis"), nb::arg("decode_threads"),
-            nb::arg("max_workspace_bytes"), nb::arg("target_panel_columns") = 64
+            nb::arg("max_workspace_bytes"), nb::arg("target_panel_columns") = 64,
+            nb::arg("strict_feature_moment_verification") = true
         )
         .def("close", &DirectContext::close)
         .def("info", &DirectContext::info)

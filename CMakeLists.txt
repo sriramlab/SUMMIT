@@ -193,6 +193,9 @@ function(gwldcore_configure_module target_name)
     target_link_libraries(${target_name} PRIVATE BLAS::BLAS)
   else()
     target_compile_definitions(${target_name} PRIVATE GWLDCORE_USE_GENERIC_CBLAS)
+    if (BLA_VENDOR STREQUAL "OpenBLAS")
+      target_compile_definitions(${target_name} PRIVATE GWLDCORE_USE_OPENBLAS)
+    endif()
     if (DEFINED OPENBLAS_INCLUDE_DIR)
       target_include_directories(${target_name} PRIVATE "${OPENBLAS_INCLUDE_DIR}")
     else()
@@ -236,6 +239,10 @@ set(GWLDCORE_MODULE_TARGETS gwldcore winldcore)
 if (CMAKE_SYSTEM_NAME STREQUAL "Linux")
   nanobind_add_module(gxeldcore NOMINSIZE ${SUMMIT_NATIVE_DIR}/gxeldcore.cpp)
   gwldcore_configure_module(gxeldcore)
+  # Wide threaded GEMMs have produced rare, vendor-independent corruptions on
+  # production NUMA hosts. Keep the lightweight checksum/repair path enabled
+  # for the direct GxE backend regardless of the selected BLAS implementation.
+  target_compile_definitions(gxeldcore PRIVATE GWLDCORE_GEMM_INTEGRITY)
   target_compile_definitions(gxeldcore PRIVATE
     GWLDCORE_SOURCE_COMMIT="${GWLDCORE_SOURCE_COMMIT}"
     GWLDCORE_SOURCE_TREE_SHA256="${GWLDCORE_SOURCE_TREE_SHA256}"

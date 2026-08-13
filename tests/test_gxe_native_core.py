@@ -17,6 +17,8 @@ from summit.ldscore.gwe_ldscore import (
     GenomewideEnvLDScore,
     _loaded_native_binary_record,
     _make_seed,
+    _native_gemm_integrity_workspace_elements,
+    _native_strict_feature_moment_verification_policy,
     _orthonormalize_columns,
 )
 from summit.logger import Logger
@@ -59,6 +61,7 @@ def _native_context(
     decode_threads: int = 2,
     max_workspace_bytes: int = 1 << 30,
     target_panel_columns: int = 7,
+    strict_feature_moment_verification: bool = True,
 ):
     descriptors = _open_descriptors(prefix)
     context = None
@@ -74,6 +77,7 @@ def _native_context(
             decode_threads=decode_threads,
             max_workspace_bytes=max_workspace_bytes,
             target_panel_columns=target_panel_columns,
+            strict_feature_moment_verification=strict_feature_moment_verification,
         )
         yield context
     finally:
@@ -152,7 +156,110 @@ def _ordinary_residual_scales(
     return np.asarray(scales)
 
 
-def test_native_feature_source_target_match_dense_oracle(tmp_path):
+def test_native_feature_moment_verification_defaults_to_continuous_abft(monkeypatch):
+    monkeypatch.delenv("SUMMIT_GXE_VERIFY_FEATURE_MOMENTS", raising=False)
+    enabled, reason = _native_strict_feature_moment_verification_policy(
+        {
+            "blas_vendor": "OpenBLAS",
+            "blas_runtime_config": "OpenBLAS 0.3.30 DYNAMIC_ARCH Zen",
+        }
+    )
+    assert enabled is False
+    assert "continuous-weight eight-check ABFT" in reason
+
+    enabled, reason = _native_strict_feature_moment_verification_policy(
+        {
+            "blas_vendor": "OpenBLAS",
+            "blas_runtime_config": "OpenBLAS 0.3.33 DYNAMIC_ARCH USE_OPENMP Zen",
+        }
+    )
+    assert enabled is False
+    assert "continuous-weight eight-check ABFT" in reason
+
+    enabled, reason = _native_strict_feature_moment_verification_policy(
+        {
+            "blas_vendor": "OpenBLAS",
+            "blas_runtime_config": "OpenBLAS 0.3.33 DYNAMIC_ARCH Zen",
+        }
+    )
+    assert enabled is False
+    assert "continuous-weight eight-check ABFT" in reason
+
+    enabled, reason = _native_strict_feature_moment_verification_policy(
+        {
+            "blas_vendor": "Intel10_64_dyn",
+            "blas_runtime_config": None,
+        }
+    )
+    assert enabled is False
+    assert "continuous-weight eight-check ABFT" in reason
+    assert "Intel10_64_dyn" in reason
+
+    monkeypatch.setenv("SUMMIT_GXE_VERIFY_FEATURE_MOMENTS", "always")
+    enabled, reason = _native_strict_feature_moment_verification_policy(
+        {
+            "blas_vendor": "OpenBLAS",
+            "blas_runtime_config": "OpenBLAS 0.3.33 DYNAMIC_ARCH USE_OPENMP Zen",
+        }
+    )
+    assert enabled is True
+    assert "forced" in reason
+
+
+def test_native_integrity_workspace_is_vendor_independent():
+    dimensions = (10_000, 64, 1_000)
+    openblas = _native_gemm_integrity_workspace_elements(
+        {"blas_vendor": "OpenBLAS"}, *dimensions
+    )
+    mkl = _native_gemm_integrity_workspace_elements(
+        {"blas_vendor": "Intel10_64_dyn"}, *dimensions
+    )
+    assert openblas == mkl
+    assert openblas > 0
+    assert _native_gemm_integrity_workspace_elements(None, *dimensions) == 0
+
+
+def test_native_compute_block_coalescing_preserves_probe_streams():
+    blocks = [(0, 5), (5, 10), (10, 15), (15, 18)]
+    groups = GenomewideEnvLDScore._coalesce_contiguous_blocks(blocks, 10)
+    assert groups == [((0, 5), (5, 10)), ((10, 15), (15, 18))]
+
+    estimator = object.__new__(GenomewideEnvLDScore)
+    estimator.dtype = np.float32
+    estimator.root_seed = 4129
+    estimator.probe_offset = 0
+    estimator.rand_dist = "rademacher"
+    combined = estimator._generate_random_group(groups[0], v_count=7, v_start=3)
+    separate = np.asfortranarray(np.concatenate([
+        estimator._generate_random_block(5, 7, 0, 3),
+        estimator._generate_random_block(5, 7, 5, 3),
+    ]))
+    assert combined.flags.f_contiguous
+    np.testing.assert_array_equal(combined, separate)
+
+
+def test_native_feature_blocks_use_available_workspace_beyond_legacy_width():
+    estimator = object.__new__(GenomewideEnvLDScore)
+    estimator.native_strict_feature_moment_verification = False
+    estimator.p_eff = 2
+    estimator.nsamp = 1_000
+    estimator.nsnps = 10_000
+    estimator.step_size = 500
+    estimator.native_workspace_gib = 0.1
+    estimator._native_build_info = {"blas_vendor": "OpenBLAS"}
+    estimator.log = Logger(suppress=True)
+
+    blocks = estimator._make_native_feature_compute_blocks()
+
+    assert estimator.native_feature_step_size > 1_000
+    assert blocks[0] == (0, estimator.native_feature_step_size)
+    assert blocks[-1][1] == estimator.nsnps
+
+
+@pytest.mark.parametrize("strict_feature_moment_verification", [False, True])
+def test_native_feature_source_target_match_dense_oracle(
+    tmp_path, strict_feature_moment_verification
+):
     rng = np.random.default_rng(1123)
     n, m, probes = 43, 17, 13
     raw = rng.binomial(2, rng.uniform(0.15, 0.45, size=m), size=(n, m)).astype(float)
@@ -160,13 +267,27 @@ def test_native_feature_source_target_match_dense_oracle(tmp_path):
     env, q = _design(n)
     expected = _python_features(raw, env, q)
 
-    with _native_context(prefix, env, q, target_panel_columns=7) as context:
+    with _native_context(
+        prefix,
+        env,
+        q,
+        target_panel_columns=7,
+        strict_feature_moment_verification=strict_feature_moment_verification,
+    ) as context:
         info = context.info()
         assert (info["n_total"], info["m_total"], info["n_selected"]) == (n, m, n)
         assert info["decode_threads"] == 2
         assert info["target_panel_columns"] == 7
         assert info["projected_target_full_width"] is True
+        assert info["strict_feature_moment_verification"] is strict_feature_moment_verification
+        assert info["feature_moment_integrity_mode"] == (
+            "strict_duplicate"
+            if strict_feature_moment_verification
+            else "independent_continuous_eight_check_abft"
+        )
+        assert info["repaired_gemm_output_columns"] >= 0
         feature = _feature(context, m)
+        assert feature["strict_feature_moment_verification"] is strict_feature_moment_verification
         assert feature["repaired_additive_moment_columns"] >= 0
         for name in (
             "scale_x", "scale_w", "norm_x", "norm_w",
@@ -189,6 +310,7 @@ def test_native_feature_source_target_match_dense_oracle(tmp_path):
             annotation, z, group_ids, 3, True,
         )
         assert missing == 0
+        assert source_w.ctypes.data - source_x.ctypes.data == source_x.nbytes
         for group in range(3):
             keep = group_ids == group
             expected_x = expected["x"][:, keep] @ (annotation[keep, None] * z[keep])
@@ -672,7 +794,10 @@ def test_opt_in_native_reference_matches_python_artifacts_with_jackknife(tmp_pat
         assert backend["source_commit"] != "unknown"
         assert len(backend["source_tree_sha256"]) == 64
         assert len(backend["native_binary_sha256"]) == 64
-        assert backend["compile_options"]["blas_vendor"] == "OpenBLAS"
+        assert (
+            backend["compile_options"]["blas_vendor"]
+            == gxeldcore.build_info()["blas_vendor"]
+        )
         assert backend["native_workspace_cap_bytes"] == int(0.25 * 1024**3)
         assert backend["actual_global_2b_source_columns"] == 40
         assert backend["actual_jackknife_2b_source_columns"] == 0

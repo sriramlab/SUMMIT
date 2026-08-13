@@ -5,8 +5,10 @@ import hashlib
 import json
 import math
 import os
+import re
 import stat
 import tempfile
+import time
 import weakref
 from collections.abc import Mapping
 from contextlib import nullcontext
@@ -104,6 +106,26 @@ def _ndarray_sha256(value: np.ndarray) -> str:
 
 
 _BACKEND_PROVENANCE_SCHEMA_VERSION = 3
+_NATIVE_GEMM_INTEGRITY_CHECKS = 8
+_NATIVE_GEMM_CHECK_MINIMUM_FLOPS = 1_000_000_000
+
+
+def _native_gemm_integrity_workspace_elements(
+    build_info: Mapping | None, m: int, n: int, k: int
+) -> int:
+    """Mirror the native direct-backend ABFT scratch allocation exactly."""
+    if (
+        build_info is None
+        or min(int(m), int(n), int(k)) <= 0
+        or 2 * int(m) * int(n) * int(k)
+        < _NATIVE_GEMM_CHECK_MINIMUM_FLOPS
+    ):
+        return 0
+    checks = _NATIVE_GEMM_INTEGRITY_CHECKS * (
+        int(m) + int(k) + 2 * int(n)
+    )
+    protected_inputs = int(m) * int(k) + int(k) * int(n)
+    return checks + protected_inputs
 
 
 def _sha256_path(path: str | Path) -> str:
@@ -180,6 +202,37 @@ def _loaded_native_binary_record(native_module) -> tuple[int, dict]:
     except Exception:
         os.close(descriptor)
         raise
+
+
+def _native_strict_feature_moment_verification_policy(
+    build_info: Mapping,
+) -> tuple[bool, str]:
+    """Select the optional duplicate feature-moment diagnostic."""
+    override = os.environ.get(
+        "SUMMIT_GXE_VERIFY_FEATURE_MOMENTS", "auto"
+    ).strip().lower()
+    if override not in {"auto", "always"}:
+        raise ValueError(
+            "SUMMIT_GXE_VERIFY_FEATURE_MOMENTS must be 'auto' or 'always'."
+        )
+    if override == "always":
+        return True, "forced by SUMMIT_GXE_VERIFY_FEATURE_MOMENTS=always"
+
+    vendor = str(build_info.get("blas_vendor", "")).strip().lower()
+    config = str(build_info.get("blas_runtime_config") or "").strip()
+    if vendor == "openblas":
+        match = re.search(r"\bOpenBLAS\s+(\d+)\.(\d+)\.(\d+)\b", config)
+        rendered = (
+            ".".join(match.groups()) if match is not None else "unidentified"
+        )
+        return False, (
+            "independent continuous-weight eight-check ABFT with "
+            f"OpenBLAS {rendered}"
+        )
+    return False, (
+        "independent continuous-weight eight-check ABFT with BLAS vendor "
+        f"{build_info.get('blas_vendor')}"
+    )
 
 
 def _validate_backend_provenance(value: Mapping, *, expected_stage: str | None = None) -> None:
@@ -1549,6 +1602,9 @@ class GenomewideEnvLDScore:
         self._native_binary_descriptor: int | None = None
         self._native_binary_record: dict | None = None
         self._native_build_info: dict | None = None
+        self.native_strict_feature_moment_verification = False
+        self.native_feature_moment_integrity_reason = "Python backend"
+        self.native_phase_timings: dict[str, float] = {}
         if self.native_backend != "python":
             unsupported = []
             if self.nbins != 1:
@@ -1600,6 +1656,10 @@ class GenomewideEnvLDScore:
                     self._native_binary_descriptor = native_descriptor
                     self._native_binary_record = native_record
                     self._native_build_info = build_info
+                    (
+                        self.native_strict_feature_moment_verification,
+                        self.native_feature_moment_integrity_reason,
+                    ) = _native_strict_feature_moment_verification_policy(build_info)
                     self._native_binary_finalizer = weakref.finalize(
                         self, _close_file_descriptors, (native_descriptor,)
                     )
@@ -1627,6 +1687,9 @@ class GenomewideEnvLDScore:
                         decode_threads=int(self.decode_threads),
                         max_workspace_bytes=workspace_bytes,
                         target_panel_columns=self.native_target_panel_columns,
+                        strict_feature_moment_verification=(
+                            self.native_strict_feature_moment_verification
+                        ),
                     )
                     context_info = self._native_context.info()
                     if (
@@ -1635,6 +1698,8 @@ class GenomewideEnvLDScore:
                         or int(context_info["n_selected"]) != self.nsamp
                         or int(context_info["q_rank"]) != expected_rank
                         or int(context_info["decode_threads"]) != self.decode_threads
+                        or bool(context_info["strict_feature_moment_verification"])
+                        != self.native_strict_feature_moment_verification
                     ):
                         self._native_context.close()
                         self._native_context = None
@@ -1659,6 +1724,11 @@ class GenomewideEnvLDScore:
                         "[gxe:native] Enabled immutable descriptor-owned direct BED context "
                         "(K=1, float64, standardized/sample, complete [1,E,C] projection; "
                         f"decode_threads={self.decode_threads}, workspace={self.native_workspace_gib:.2f} GiB)."
+                    )
+                    self.log._log(
+                        "[gxe:native] Strict duplicate feature-moment verification "
+                        f"{'enabled' if self.native_strict_feature_moment_verification else 'disabled'}: "
+                        f"{self.native_feature_moment_integrity_reason}."
                     )
         self.log._log(
             f"[env] Using environment '{self.env_name}' with {self.nsamp} samples; "
@@ -1838,6 +1908,96 @@ class GenomewideEnvLDScore:
 
     def _make_compute_blocks(self):
         return [(s, min(self.nsnps, s + self.step_size)) for s in range(0, self.nsnps, self.step_size)]
+
+    @staticmethod
+    def _coalesce_contiguous_blocks(
+        blocks: Sequence[tuple[int, int]], maximum_variants: int
+    ) -> list[tuple[tuple[int, int], ...]]:
+        """Group adjacent blocks without changing their probe identities."""
+        groups: list[tuple[tuple[int, int], ...]] = []
+        current: list[tuple[int, int]] = []
+        for start, end in blocks:
+            block = (int(start), int(end))
+            if current and (
+                block[0] != current[-1][1]
+                or block[1] - current[0][0] > int(maximum_variants)
+            ):
+                groups.append(tuple(current))
+                current = []
+            current.append(block)
+        if current:
+            groups.append(tuple(current))
+        return groups
+
+    def _generate_random_group(
+        self,
+        blocks: Sequence[tuple[int, int]],
+        v_count: int,
+        v_start: int,
+    ) -> np.ndarray:
+        """Concatenate existing block-seeded probes into one native call."""
+        total = sum(int(end) - int(start) for start, end in blocks)
+        probes = np.empty((total, v_count), dtype=self.dtype, order="F")
+        offset = 0
+        for start, end in blocks:
+            length = int(end) - int(start)
+            probes[offset:offset + length, :] = self._generate_random_block(
+                L=length,
+                v_count=v_count,
+                blk_start=int(start),
+                v_start=v_start,
+            )
+            offset += length
+        return probes
+
+    def _make_native_feature_compute_blocks(self):
+        """Use sufficiently wide, workspace-bounded blocks for skinny Q products."""
+        moment_copies = 8 if self.native_strict_feature_moment_verification else 4
+        q_rank = self.p_eff + 1
+        elements_per_variant = self.nsamp + moment_copies * q_rank + 11
+        workspace_elements = int(self.native_workspace_gib * (1024 ** 3)) // 8
+        # ``step_size`` defines the reproducible probe blocks, not the native
+        # GEMM width.  Use the full configured workspace for the latter: the
+        # native call remains bounded by ``required`` below, while wider calls
+        # avoid repeating a genotype decode, protected-input snapshot, and
+        # checksum setup for every small probe block.
+        desired = int(self.nsnps)
+
+        def required(variants: int) -> int:
+            return (
+                int(variants) * elements_per_variant
+                + _native_gemm_integrity_workspace_elements(
+                    self._native_build_info,
+                    4 * q_rank,
+                    int(variants),
+                    self.nsamp,
+                )
+            )
+
+        low, high = 0, desired
+        while low < high:
+            middle = (low + high + 1) // 2
+            if required(middle) <= workspace_elements:
+                low = middle
+            else:
+                high = middle - 1
+        maximum = low
+        if maximum < 1:
+            raise RuntimeError(
+                "The native GxE workspace cannot hold one feature variant."
+            )
+        feature_step = int(maximum)
+        self.native_feature_step_size = feature_step
+        if feature_step != self.step_size:
+            self.log._log(
+                "[gxe:native] Coalesced feature blocks from "
+                f"{self.step_size} to {feature_step} variants for efficient "
+                "fixed-effect moment products."
+            )
+        return [
+            (start, min(self.nsnps, start + feature_step))
+            for start in range(0, self.nsnps, feature_step)
+        ]
 
     def _make_jackknife_compute_blocks(self) -> list[list[tuple[int, int]]]:
         """Split every jackknife group into bounded contiguous genotype reads."""
@@ -2020,8 +2180,8 @@ class GenomewideEnvLDScore:
         }
         max_leak_x = 0.0
         max_leak_w = 0.0
-        repaired_additive_moment_columns = 0
-        blocks = self._make_compute_blocks()
+        repaired_feature_moment_columns = 0
+        blocks = self._make_native_feature_compute_blocks()
         for s, e in tqdm(
             blocks, desc="GxE native var", unit="block", disable=(not self.verbose)
         ):
@@ -2041,8 +2201,11 @@ class GenomewideEnvLDScore:
                 max_leak_w,
                 float(result["max_projection_leakage_interaction"]),
             )
-            repaired_additive_moment_columns += int(
-                result["repaired_additive_moment_columns"]
+            repaired_feature_moment_columns += int(
+                result.get(
+                    "repaired_feature_moment_columns",
+                    result["repaired_additive_moment_columns"],
+                )
             )
 
         self.inv_sqrt_resvar_x_all = arrays["scale_x"]
@@ -2092,15 +2255,29 @@ class GenomewideEnvLDScore:
             "max_trace_error_additive": float(np.max(np.abs(trace_x - self.df_corr))),
             "max_trace_error_interaction": float(np.max(np.abs(trace_w - self.df_corr))),
             "repaired_additive_moment_columns": int(
-                repaired_additive_moment_columns
+                repaired_feature_moment_columns
+            ),
+            "repaired_feature_moment_columns": int(
+                repaired_feature_moment_columns
+            ),
+            "strict_feature_moment_verification": bool(
+                self.native_strict_feature_moment_verification
+            ),
+            "feature_moment_integrity_mode": (
+                "strict_duplicate"
+                if self.native_strict_feature_moment_verification
+                else "independent_continuous_eight_check_abft"
+            ),
+            "feature_moment_integrity_reason": (
+                self.native_feature_moment_integrity_reason
             ),
         }
         self.log._log(
             "[gxe:native:invariants] max fixed-effect leakage "
             f"X={max_leak_x:.3e}, W={max_leak_w:.3e}; "
             f"max norm error X={max_norm_error_x:.3e}, W={max_norm_error_w:.3e}; "
-            "verified/repaired additive moment columns="
-            f"{repaired_additive_moment_columns}."
+            "integrity-repaired feature-moment columns="
+            f"{repaired_feature_moment_columns}."
         )
         return self.inv_sqrt_resvar_x_all, self.inv_sqrt_resvar_w_all
 
@@ -2425,26 +2602,35 @@ class GenomewideEnvLDScore:
                     "reduce --step-size or use the Python backend."
                 )
             dense_ids = np.searchsorted(unique_ids, jackknife_ids).astype(np.int32)
-        source_x, source_w, missing = self._native_context.source_block(
-            blk_start=int(blk_start),
-            blk_end=int(blk_end),
-            scale_x=np.asarray(
-                self.inv_sqrt_resvar_x_all[blk_start:blk_end], dtype=np.float64
-            ),
-            scale_w=np.asarray(
-                self.inv_sqrt_resvar_w_all[blk_start:blk_end], dtype=np.float64
-            ),
-            sqrt_annotation=np.sqrt(
-                np.maximum(
-                    np.asarray(self.annot[blk_start:blk_end, 0], dtype=np.float64),
-                    0.0,
-                )
-            ),
-            probes=np.asfortranarray(probes, dtype=np.float64),
-            group_ids=dense_ids,
-            num_groups=int(unique_ids.size),
-            require_missing_free=True,
-        )
+        started = time.perf_counter()
+        try:
+            source_x, source_w, missing = self._native_context.source_block(
+                blk_start=int(blk_start),
+                blk_end=int(blk_end),
+                scale_x=np.asarray(
+                    self.inv_sqrt_resvar_x_all[blk_start:blk_end], dtype=np.float64
+                ),
+                scale_w=np.asarray(
+                    self.inv_sqrt_resvar_w_all[blk_start:blk_end], dtype=np.float64
+                ),
+                sqrt_annotation=np.sqrt(
+                    np.maximum(
+                        np.asarray(self.annot[blk_start:blk_end, 0], dtype=np.float64),
+                        0.0,
+                    )
+                ),
+                probes=np.asfortranarray(probes, dtype=np.float64),
+                group_ids=dense_ids,
+                num_groups=int(unique_ids.size),
+                require_missing_free=True,
+            )
+        finally:
+            if not hasattr(self, "native_phase_timings"):
+                self.native_phase_timings = {}
+            self.native_phase_timings["source_calls"] = (
+                self.native_phase_timings.get("source_calls", 0.0)
+                + time.perf_counter() - started
+            )
         if int(missing) != 0:
             raise RuntimeError("Native GxE source unexpectedly consumed missing genotypes.")
         return unique_ids, np.asarray(source_x), np.asarray(source_w)
@@ -2469,17 +2655,26 @@ class GenomewideEnvLDScore:
             ),
             "require_missing_free": True,
         }
-        if second_sources is None:
-            work_x, work_w, missing, source_leakage = (
-                self._native_context.target_projected_block(
-                    sources=sources, **arguments
+        started = time.perf_counter()
+        try:
+            if second_sources is None:
+                work_x, work_w, missing, source_leakage = (
+                    self._native_context.target_projected_block(
+                        sources=sources, **arguments
+                    )
                 )
-            )
-        else:
-            work_x, work_w, missing, source_leakage = (
-                self._native_context.target_projected_pair_block(
-                    first=sources, second=second_sources, **arguments
+            else:
+                work_x, work_w, missing, source_leakage = (
+                    self._native_context.target_projected_pair_block(
+                        first=sources, second=second_sources, **arguments
+                    )
                 )
+        finally:
+            if not hasattr(self, "native_phase_timings"):
+                self.native_phase_timings = {}
+            self.native_phase_timings["target_calls"] = (
+                self.native_phase_timings.get("target_calls", 0.0)
+                + time.perf_counter() - started
             )
         if int(missing) != 0:
             raise RuntimeError("Native GxE target unexpectedly consumed missing genotypes.")
@@ -2512,10 +2707,19 @@ class GenomewideEnvLDScore:
             )
         else:
             tolerance = 1.0e-9
-        panel = self._native_context.prepare_projected_sources(
-            sources=np.asfortranarray(sources, dtype=np.float64),
-            tolerance=tolerance,
-        )
+        started = time.perf_counter()
+        try:
+            panel = self._native_context.prepare_projected_sources(
+                sources=np.asfortranarray(sources, dtype=np.float64),
+                tolerance=tolerance,
+            )
+        finally:
+            if not hasattr(self, "native_phase_timings"):
+                self.native_phase_timings = {}
+            self.native_phase_timings["panel_preparation"] = (
+                self.native_phase_timings.get("panel_preparation", 0.0)
+                + time.perf_counter() - started
+            )
         leakage = float(panel.leakage)
         if not np.isfinite(leakage):
             raise RuntimeError("Native GxE projected-source validation was non-finite.")
@@ -2887,8 +3091,12 @@ class GenomewideEnvLDScore:
                     "blas_vendor", "cxx_standard", "optimization",
                     "architecture_tuning", "openmp_enabled",
                     "native_optimization_enabled", "platform",
+                    "blas_runtime_config",
                 )
             }
+            compile_options["strict_feature_moment_verification"] = bool(
+                self.native_strict_feature_moment_verification
+            )
             workspace_cap = int(self.native_workspace_gib * (1024 ** 3))
             panel_columns = int(self.native_target_panel_columns)
         else:
@@ -3661,13 +3869,20 @@ class GenomewideEnvLDScore:
             f"for environment '{self.env_name}' (kernel_mode={self.kernel_mode})."
         )
 
-        if self.feature_cache_path is None:
-            self.inv_sqrt_resvar_x_all, self.inv_sqrt_resvar_w_all = self._precompute_residual_variances()
-            self.feature_backend_provenance = self._backend_provenance(
-                "feature_construction"
+        self.native_phase_timings = {}
+        feature_started = time.perf_counter()
+        try:
+            if self.feature_cache_path is None:
+                self.inv_sqrt_resvar_x_all, self.inv_sqrt_resvar_w_all = self._precompute_residual_variances()
+                self.feature_backend_provenance = self._backend_provenance(
+                    "feature_construction"
+                )
+            else:
+                self._load_feature_cache(self.feature_cache_path)
+        finally:
+            self.native_phase_timings["feature_precompute"] = (
+                time.perf_counter() - feature_started
             )
-        else:
-            self._load_feature_cache(self.feature_cache_path)
         blocks = self._make_compute_blocks()
         exact_jackknife = self.jackknife_ids is not None and self.shard_mode
         jackknife_blocks = (
@@ -3678,7 +3893,91 @@ class GenomewideEnvLDScore:
 
         max_vt = max(vt for _, vt in vtiles)
         itemsize = int(np.dtype(self.dtype).itemsize)
-        max_block = min(self.step_size, self.nsnps)
+        if self.native_backend == "direct" and not exact_jackknife:
+            native_cap_elements = int(
+                self.native_workspace_gib * (1024 ** 3)
+            ) // 8
+            source_columns_for_cap = self.nbins * max_vt
+            target_columns_for_cap = 2 * self.nbins * max_vt
+            # Probe identities continue to be determined by ``blocks`` and
+            # ``_generate_random_group``.  The native execution width is an
+            # independent implementation detail, so coalesce as many adjacent
+            # probe blocks as the explicit workspace cap permits.
+            desired_native_width = int(self.nsnps)
+
+            def source_required(variants: int) -> int:
+                fused_columns = 2 * source_columns_for_cap
+                base = (
+                    2 * self.nsamp * source_columns_for_cap
+                    + 2 * (self.p_eff + 1) * source_columns_for_cap
+                    + int(variants)
+                    * (
+                        self.nsamp
+                        + 2 * source_columns_for_cap
+                        + max_vt
+                        + 4
+                    )
+                )
+                integrity = max(
+                    _native_gemm_integrity_workspace_elements(
+                        self._native_build_info,
+                        self.nsamp,
+                        fused_columns,
+                        int(variants),
+                    ),
+                    _native_gemm_integrity_workspace_elements(
+                        self._native_build_info,
+                        self.p_eff + 1,
+                        fused_columns,
+                        self.nsamp,
+                    ),
+                )
+                return base + integrity
+
+            def target_required(variants: int) -> int:
+                base = int(variants) * (
+                    self.nsamp + 2 + 4 * target_columns_for_cap
+                )
+                integrity = _native_gemm_integrity_workspace_elements(
+                    self._native_build_info,
+                    int(variants),
+                    2 * target_columns_for_cap,
+                    self.nsamp,
+                )
+                return base + integrity
+
+            low, high = 0, desired_native_width
+            while low < high:
+                middle = (low + high + 1) // 2
+                if max(source_required(middle), target_required(middle)) <= native_cap_elements:
+                    low = middle
+                else:
+                    high = middle - 1
+            maximum_native_width = int(low)
+            if maximum_native_width < min(int(self.step_size), int(self.nsnps)):
+                raise RuntimeError(
+                    "The native GxE workspace cannot hold one configured compute "
+                    f"block: block={min(int(self.step_size), int(self.nsnps))} variants, "
+                    f"capacity={maximum_native_width}."
+                )
+            execution_groups = self._coalesce_contiguous_blocks(
+                blocks, maximum_native_width
+            )
+        else:
+            execution_groups = [((int(start), int(end)),) for start, end in blocks]
+        max_block = max(
+            group[-1][1] - group[0][0] for group in execution_groups
+        )
+        if self.native_backend == "direct" and len(execution_groups) < len(blocks):
+            self.log._log(
+                "[gxe:native] Coalesced sketch compute blocks from "
+                f"{self.step_size} to at most {max_block} variants while "
+                "preserving the original per-block probe seeds."
+            )
+        max_feature_block = min(
+            int(getattr(self, "native_feature_step_size", self.step_size)),
+            self.nsnps,
+        )
         resident_multiplier = 4 if exact_jackknife else 2
         # A native projected panel owns S and e*S for one 2B source sketch.
         # Block and global panels are never retained at the same time.
@@ -3704,27 +4003,72 @@ class GenomewideEnvLDScore:
             if not exact_jackknife
             else 2 * self.nsamp * self.nbins * max_vt * itemsize
         )
+        native_feature_moment_copies = (
+            8 if self.native_strict_feature_moment_verification else 4
+        )
+        native_feature_integrity_elements = (
+            _native_gemm_integrity_workspace_elements(
+                self._native_build_info,
+                4 * q_rank,
+                max_feature_block,
+                self.nsamp,
+            )
+        )
         native_feature_bytes = 8 * (
-            self.nsamp * max_block
-            + 5 * q_rank * max_block
-            + 11 * max_block
+            self.nsamp * max_feature_block
+            + native_feature_moment_copies * q_rank * max_feature_block
+            + 11 * max_feature_block
+            + native_feature_integrity_elements
+        )
+        native_source_integrity_elements = max(
+            _native_gemm_integrity_workspace_elements(
+                self._native_build_info,
+                self.nsamp,
+                2 * source_columns,
+                max_block,
+            ),
+            _native_gemm_integrity_workspace_elements(
+                self._native_build_info,
+                q_rank,
+                2 * source_columns,
+                self.nsamp,
+            ),
         )
         native_source_bytes = 8 * (
             self.nsamp * max_block
-            + max_block * source_columns
+            + 2 * max_block * source_columns
             + 2 * self.nsamp * source_columns
-            + q_rank * source_columns
+            + 2 * q_rank * source_columns
             + max_block * max_vt
             + 4 * max_block
+            + native_source_integrity_elements
+        )
+        native_panel_prepare_integrity_elements = (
+            _native_gemm_integrity_workspace_elements(
+                self._native_build_info,
+                q_rank,
+                global_source_columns,
+                self.nsamp,
+            )
         )
         native_panel_prepare_bytes = 8 * (
             2 * self.nsamp * global_source_columns
             + q_rank * global_source_columns
+            + native_panel_prepare_integrity_elements
+        )
+        native_target_integrity_elements = (
+            _native_gemm_integrity_workspace_elements(
+                self._native_build_info,
+                max_block,
+                2 * target_source_columns,
+                self.nsamp,
+            )
         )
         native_target_bytes = 8 * (
             self.nsamp * max_block
-            + 2 * max_block * target_source_columns
+            + (6 if exact_jackknife else 4) * max_block * target_source_columns
             + 2 * max_block
+            + native_target_integrity_elements
         )
         native_workspace_cap_bytes = int(self.native_workspace_gib * (1024 ** 3))
         native_call_max_bytes = max(
@@ -3781,11 +4125,33 @@ class GenomewideEnvLDScore:
                 native_call_max_bytes / (1024 ** 3)
             ),
             "native_feature_workspace_gib": float(native_feature_bytes / (1024 ** 3)),
+            "native_feature_integrity_workspace_gib": float(
+                8 * native_feature_integrity_elements / (1024 ** 3)
+            ),
+            "native_feature_step_size": int(max_feature_block),
+            "native_compute_block_size": int(max_block),
+            "native_feature_basis_resident_gib": float(
+                (4 * self.nsamp * q_rank)
+                * 8
+                / (1024 ** 3)
+            ),
+            "native_strict_feature_moment_verification": int(
+                self.native_strict_feature_moment_verification
+            ),
             "native_source_workspace_gib": float(native_source_bytes / (1024 ** 3)),
+            "native_source_integrity_workspace_gib": float(
+                8 * native_source_integrity_elements / (1024 ** 3)
+            ),
             "native_projected_panel_prepare_workspace_gib": float(
                 native_panel_prepare_bytes / (1024 ** 3)
             ),
+            "native_projected_panel_integrity_workspace_gib": float(
+                8 * native_panel_prepare_integrity_elements / (1024 ** 3)
+            ),
             "native_target_workspace_gib": float(native_target_bytes / (1024 ** 3)),
+            "native_target_integrity_workspace_gib": float(
+                8 * native_target_integrity_elements / (1024 ** 3)
+            ),
             "target_work_native_plus_float64_gib": float(
                 2 * max_block * target_source_columns * 8 / (1024 ** 3)
             ),
@@ -3812,7 +4178,7 @@ class GenomewideEnvLDScore:
 
         jackknife_units = sum(len(group) for group in jackknife_blocks)
         units_per_tile = (
-            2 * len(blocks)
+            2 * len(execution_groups)
             if not exact_jackknife
             else 2 * jackknife_units + len(blocks)
         )
@@ -3839,7 +4205,14 @@ class GenomewideEnvLDScore:
                 global_panel = None
                 block_panel = None
                 try:
-                    source_groups = jackknife_blocks if within_jackknife is not None else [blocks]
+                    source_groups = (
+                        [
+                            [((int(start), int(end)),) for start, end in group]
+                            for group in jackknife_blocks
+                        ]
+                        if within_jackknife is not None
+                        else [execution_groups]
+                    )
                     for block_id, source_blocks in enumerate(source_groups):
                         if within_jackknife is not None:
                             block_sources = np.zeros(
@@ -3851,9 +4224,11 @@ class GenomewideEnvLDScore:
                         # Each variant contributes once to the global source;
                         # exact jackknifing mirrors it into only the current
                         # in-memory block source.
-                        for s, e in source_blocks:
-                            Z = self._generate_random_block(
-                                L=e - s, v_count=Vt, blk_start=s, v_start=v0
+                        for constituent_blocks in source_blocks:
+                            s = int(constituent_blocks[0][0])
+                            e = int(constituent_blocks[-1][1])
+                            Z = self._generate_random_group(
+                                constituent_blocks, v_count=Vt, v_start=v0
                             )
                             if self.native_backend == "direct":
                                 unique_ids, source_x, source_w = self._native_source_block(
@@ -3903,7 +4278,9 @@ class GenomewideEnvLDScore:
                             )
                             del block_x, block_w, block_sources
                             block_x = block_w = block_sources = None
-                        for s, e in source_blocks:
+                        for constituent_blocks in source_blocks:
+                            s = int(constituent_blocks[0][0])
+                            e = int(constituent_blocks[-1][1])
                             annot_left = np.asarray(self.annot[s:e], dtype=np.float64)
                             if self.native_backend == "direct":
                                 work_x, work_w = self._native_target_block(
@@ -3960,7 +4337,9 @@ class GenomewideEnvLDScore:
                         )
                         del global_x, global_w, sources
                         global_x = global_w = sources = None
-                    for s, e in blocks:
+                    for constituent_blocks in execution_groups:
+                        s = int(constituent_blocks[0][0])
+                        e = int(constituent_blocks[-1][1])
                         if self.native_backend == "direct":
                             work_x, work_w = self._native_target_block(
                                 s, e, global_panel
@@ -4015,6 +4394,27 @@ class GenomewideEnvLDScore:
         if self.native_backend == "direct":
             self.resource_estimates["max_native_source_projection_leakage"] = float(
                 max_native_source_leakage
+            )
+            native_info = dict(self._native_context.info())
+            repaired_gemm_columns = int(
+                native_info.get("repaired_gemm_output_columns", 0)
+            )
+            self.resource_estimates["native_repaired_gemm_output_columns"] = (
+                repaired_gemm_columns
+            )
+            for phase, elapsed in self.native_phase_timings.items():
+                self.resource_estimates[f"native_{phase}_seconds"] = float(elapsed)
+            self.log._log(
+                "[gxe:native:timing] feature="
+                f"{self.native_phase_timings.get('feature_precompute', 0.0):.3f}s, "
+                "source calls="
+                f"{self.native_phase_timings.get('source_calls', 0.0):.3f}s, "
+                "panel preparation="
+                f"{self.native_phase_timings.get('panel_preparation', 0.0):.3f}s, "
+                "target calls="
+                f"{self.native_phase_timings.get('target_calls', 0.0):.3f}s; "
+                "ABFT-repaired output columns="
+                f"{repaired_gemm_columns}."
             )
 
         scores = {name: value / float(self.nvecs) for name, value in accum.items()}

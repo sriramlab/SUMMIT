@@ -23,6 +23,9 @@ dependencies:
   - pkg-config
 
   # BLAS/LAPACK -> force OpenBLAS provider and install headers too
-  - openblas>=0.3.26
+  # 0.3.31 reverted a 0.3.30 parallel-GEMM partitioning race. SUMMIT also
+  # verifies large GxE products at runtime, but do not provision the known
+  # vulnerable release in new environments.
+  - openblas>=0.3.31
   - libblas=*=*openblas
   - liblapack=*=*openblas

@@ -42,8 +42,17 @@ refactored h2/rg path; use per-SNP LD scores.
 - C++17 compiler
 - BLAS/LAPACK and OpenMP support
 
-The supplied environment uses OpenBLAS from conda-forge. If MKL is available
-through `MKLROOT` or the active conda environment, CMake may use MKL instead.
+The supplied environment uses OpenBLAS 0.3.31 or newer from conda-forge; 0.3.30
+contained a parallel-GEMM race. SUMMIT does not rely on the BLAS vendor or
+version to make the large GxE products safe: every fast product is validated
+by eight deterministic continuous-weight, BLAS-independent checksum
+projections. Only a flagged contiguous output range is recomputed with
+SUMMIT's cache-tiled kernel. This avoids a disk cache and does not duplicate
+the full product. The vendor call uses transient input copies so a faulty call
+cannot alter the originals used by the checks or repair.
+Set `SUMMIT_GXE_VERIFY_FEATURE_MOMENTS=always` only for strict duplicate-product
+stress testing. If MKL is available through `MKLROOT` or the active conda
+environment, CMake may use MKL instead.
 
 ```bash
 git clone https://github.com/bronsonj98/SUMMIT.git
@@ -238,8 +247,8 @@ so `y'y = rank(P)`; the fitter verifies this contract rather than guessing a
 score scale.
 
 The reference contains all four directional trace-score panels (`gxx`,
-`gxe`, `exg`, and `gee`), per-SNP projected norms/NxE diagonals, and exact
-two-sided deletion intersections. Each trait triplet contains direct marginal
+`gxe`, `exg`, and `gee`), per-SNP projected norms/NxE diagonals, and
+block-local deletion metadata. Each trait triplet contains direct marginal
 additive and interaction scores plus the indispensable scalar
 `y' diag(E^2) y`.
 
@@ -262,7 +271,7 @@ disk. Environments with different missingness are rejected; intersect their
 sample rows explicitly or place them in separate batches. The resulting models
 are independent per environment, not a cross-environment covariance model.
 
-Exact jackknife generation requires at least 100 probes by default. Lower
+Jackknife-enabled generation requires at least 100 probes by default. Lower
 counts can strongly contaminate the delete-block SE through randomized
 within-block trace noise; the diagnostic-only override is
 `--allow-low-probe-gxe-jackknife`.
