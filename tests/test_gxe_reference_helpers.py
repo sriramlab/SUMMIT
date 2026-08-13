@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import math
+
 import numpy as np
 import pandas as pd
 import pytest
@@ -8,6 +10,7 @@ from summit.ldscore.gwe_ldscore import (
     GenomewideEnvLDScore,
     _build_balanced_vtiles,
     _orthonormalize_columns,
+    _stable_center_and_scale,
     _validate_jackknife_probe_count,
     read_env_and_cov,
 )
@@ -24,6 +27,24 @@ def test_svd_projector_preserves_rank_deficient_design_span():
     residual = design - q @ (q.T @ design)
     assert np.linalg.norm(residual) / np.linalg.norm(design) < 1e-13
     np.testing.assert_allclose(q.T @ q, np.eye(2), atol=2e-14)
+
+
+def test_fixed_effect_standardization_uses_deterministic_reductions():
+    values = np.asarray(
+        [1.0e8, -3.0, 2.0, 7.5, -1.0e8, 11.25, 4.0], dtype=np.float64
+    )
+    centered, mean, scale = _stable_center_and_scale(values, ddof=1)
+    # Use the implementation's explicit mathematical contract rather than a
+    # NumPy reduction whose order may vary across releases.
+    expected_mean = math.fsum(float(value) for value in values) / values.size
+    expected_centered = values - expected_mean
+    expected_scale = math.sqrt(
+        math.fsum(float(value) * float(value) for value in expected_centered)
+        / (values.size - 1)
+    )
+    assert mean == expected_mean
+    assert scale == expected_scale
+    np.testing.assert_array_equal(centered, expected_centered)
 
 
 def test_probe_tiles_never_exceed_memory_derived_cap():

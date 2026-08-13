@@ -851,6 +851,27 @@ def _orthonormalize_columns(X: np.ndarray, tol: float = 1e-10) -> np.ndarray:
     return np.asfortranarray(U[:, :rank])
 
 
+def _stable_center_and_scale(
+    values: np.ndarray, *, ddof: int
+) -> tuple[np.ndarray, float, float]:
+    """Center and scale one finite vector with deterministic reductions.
+
+    NumPy/pandas reduction order can change across versions and CPU builds.
+    The fixed-effect design is cryptographically sealed and must therefore be
+    byte-identical when the same text inputs are read on another machine.
+    ``math.fsum`` fixes the scalar reduction order; the elementwise subtract
+    and divide then have deterministic IEEE-754 results.
+    """
+    array = np.asarray(values, dtype=np.float64)
+    if array.ndim != 1 or array.size <= int(ddof) or not np.all(np.isfinite(array)):
+        raise ValueError("Stable standardization requires a finite non-empty vector.")
+    mean = math.fsum(float(value) for value in array) / array.size
+    centered = np.asarray(array - mean, dtype=np.float64)
+    sum_squares = math.fsum(float(value) * float(value) for value in centered)
+    scale = math.sqrt(sum_squares / (array.size - int(ddof)))
+    return centered, float(mean), float(scale)
+
+
 
 def read_env_and_cov(
     env_filename: str,
@@ -1001,7 +1022,12 @@ def read_env_and_cov(
             keep_mask &= merged[phenotype_name].notna()
     else:
         if cov_cols:
-            merged[cov_cols] = merged[cov_cols].apply(lambda s: s.fillna(s.mean()), axis=0)
+            for column in cov_cols:
+                observed = merged[column].dropna().to_numpy(dtype=np.float64)
+                if observed.size == 0:
+                    continue
+                fill_value = math.fsum(float(value) for value in observed) / observed.size
+                merged[column] = merged[column].fillna(fill_value)
         keep_mask = merged[env_name].notna()
 
     dropped = int((~keep_mask).sum())
@@ -1012,10 +1038,9 @@ def read_env_and_cov(
     if merged.shape[0] == 0:
         raise ValueError("After filtering, no samples remain for the environment-specific LD-score calculation.")
 
-    env_vec = merged[env_name].to_numpy(dtype=np.float64)
-    env_mean = float(env_vec.mean())
-    env_vec = env_vec - env_mean
-    env_std = float(env_vec.std(ddof=ddof))
+    env_vec, env_mean, env_std = _stable_center_and_scale(
+        merged[env_name].to_numpy(dtype=np.float64), ddof=ddof
+    )
     if not np.isfinite(env_std) or env_std <= 0.0:
         raise ValueError(f"Environment '{env_name}' has zero or invalid variance after filtering.")
     if std:
@@ -1040,9 +1065,17 @@ def read_env_and_cov(
     kept_cov_cols: list[str] = []
     if cov_cols:
         cov_df = merged[cov_cols].copy()
-        zvc = cov_df.std(ddof=0) == 0
-        if zvc.any():
-            drop_cols = zvc.index[zvc].tolist()
+        centered_covariates: dict[str, np.ndarray] = {}
+        drop_cols: list[str] = []
+        for column in cov_df.columns:
+            centered, _, scale = _stable_center_and_scale(
+                cov_df[column].to_numpy(dtype=np.float64), ddof=ddof
+            )
+            if not np.isfinite(scale) or scale <= 0.0:
+                drop_cols.append(str(column))
+            else:
+                centered_covariates[str(column)] = centered / scale
+        if drop_cols:
             if logger is not None:
                 logger._log(
                     f"[env] Dropping {len(drop_cols)} constant covariates: "
@@ -1050,12 +1083,13 @@ def read_env_and_cov(
                 )
             cov_df.drop(columns=drop_cols, inplace=True)
         if not cov_df.empty and std:
-            cov_df = (cov_df - cov_df.mean()) / cov_df.std(ddof=ddof)
-            bad_cols = [c for c in cov_df.columns if cov_df[c].isna().all()]
-            if bad_cols:
-                if logger is not None:
-                    logger._log(f"[env] Dropping malformed covariate columns after standardization: {bad_cols}")
-                cov_df.drop(columns=bad_cols, inplace=True)
+            cov_df = pd.DataFrame(
+                {
+                    str(column): centered_covariates[str(column)]
+                    for column in cov_df.columns
+                },
+                index=cov_df.index,
+            )
         if not cov_df.empty:
             kept_cov_cols = list(cov_df.columns)
             cov_base = cov_df.to_numpy(dtype=np.float64, copy=False)
