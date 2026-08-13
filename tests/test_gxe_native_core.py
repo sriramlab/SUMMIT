@@ -164,6 +164,8 @@ def test_native_feature_source_target_match_dense_oracle(tmp_path):
         info = context.info()
         assert (info["n_total"], info["m_total"], info["n_selected"]) == (n, m, n)
         assert info["decode_threads"] == 2
+        assert info["target_panel_columns"] == 7
+        assert info["projected_target_full_width"] is True
         feature = _feature(context, m)
         for name in (
             "scale_x", "scale_w", "norm_x", "norm_w",

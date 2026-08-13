@@ -581,7 +581,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--gxe-native-target-panel-columns", default=64, type=int,
-        help="Column panel width used by the direct native GxE target products.",
+        help=("Temporary panel width for the generic native raw-source target method. "
+              "The production opaque in-memory GxE target uses full-width GEMMs."),
     )
     parser.add_argument("--write-gxe-jackknife", action="store_true", default=False,
                         help="Write compact within-block traces for exact two-sided GENIE SNP-deletion SEs; uses --njack blocks.")

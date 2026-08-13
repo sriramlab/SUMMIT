@@ -413,6 +413,7 @@ public:
         result["decode_threads"] = decode_threads_;
         result["max_workspace_bytes"] = max_workspace_bytes_;
         result["target_panel_columns"] = target_panel_columns_;
+        result["projected_target_full_width"] = true;
         result["environment_mean"] = environment_mean_;
         result["environment_variance"] = environment_variance_;
         result["max_q_gram_error"] = max_q_gram_error_;
@@ -1021,22 +1022,20 @@ private:
             missing = decode_block(blk_start, blk_end, require_missing_free, geno, observed);
             size_t output_offset = 0;
             auto consume = [&](const ProjectedPanel& panel) {
-                for (int c0 = 0; c0 < panel.columns_; c0 += target_panel_columns_) {
-                    const int count = std::min(target_panel_columns_, panel.columns_ - c0);
-                    const size_t source_offset =
-                        static_cast<size_t>(c0) * static_cast<size_t>(n_);
-                    const size_t output_column = output_offset + static_cast<size_t>(c0);
-                    dgemm_tn(
-                        l, count, n_, geno.data(), n_,
-                        panel.data_.data() + source_offset, n_,
-                        work_x + output_column * static_cast<size_t>(l), l
-                    );
-                    dgemm_tn(
-                        l, count, n_, geno.data(), n_,
-                        panel.environment_data_.data() + source_offset, n_,
-                        work_w + output_column * static_cast<size_t>(l), l
-                    );
-                }
+                // ProjectedPanel already owns immutable S and e*S arrays. Unlike
+                // target_block(), this path allocates no N-by-panel-width
+                // temporary, so slicing a wide panel only turns one efficient
+                // GEMM into many narrow calls without reducing peak memory.
+                dgemm_tn(
+                    l, panel.columns_, n_, geno.data(), n_,
+                    panel.data_.data(), n_,
+                    work_x + output_offset * static_cast<size_t>(l), l
+                );
+                dgemm_tn(
+                    l, panel.columns_, n_, geno.data(), n_,
+                    panel.environment_data_.data(), n_,
+                    work_w + output_offset * static_cast<size_t>(l), l
+                );
                 output_offset += static_cast<size_t>(panel.columns_);
             };
             consume(first);
