@@ -660,7 +660,7 @@ def test_opt_in_native_reference_matches_python_artifacts_with_jackknife(tmp_pat
                 rtol=2e-11, atol=2e-11,
             )
         assert native_estimator.resource_estimates["target_source_columns"] == 40
-        assert native_estimator.resource_estimates["jackknife_in_memory_block_sketch_gib"] > 0.0
+        assert native_estimator.resource_estimates["jackknife_in_memory_block_sketch_gib"] == 0.0
         assert "jackknife_scratch_total_gib" not in native_estimator.resource_estimates
         manifest = json.loads(
             (tmp_path / "native.gxe.ref.json").read_text(encoding="utf-8")
@@ -674,7 +674,7 @@ def test_opt_in_native_reference_matches_python_artifacts_with_jackknife(tmp_pat
         assert backend["compile_options"]["blas_vendor"] == "OpenBLAS"
         assert backend["native_workspace_cap_bytes"] == int(0.25 * 1024**3)
         assert backend["actual_global_2b_source_columns"] == 40
-        assert backend["actual_jackknife_2b_source_columns"] == 40
+        assert backend["actual_jackknife_2b_source_columns"] == 0
         assert backend["actual_target_source_columns"] == 40
         assert (
             native_estimator.resource_estimates[
@@ -687,13 +687,9 @@ def test_opt_in_native_reference_matches_python_artifacts_with_jackknife(tmp_pat
         feature_backend = manifest["feature_backend_provenance"]
         assert feature_backend["artifact_stage"] == "feature_construction"
         assert feature_backend["backend_name"] == "gxeldcore_direct"
-        with np.load(tmp_path / "python.gxe.jackknife.npz") as expected, np.load(
-            tmp_path / "native.gxe.jackknife.npz"
-        ) as observed:
-            for name in ("within_xx", "within_xw", "within_wx", "within_ww"):
-                np.testing.assert_allclose(
-                    observed[name], expected[name], rtol=2e-11, atol=2e-11
-                )
+        assert manifest["jackknife"]["method"] == "block_local_ldscore_deletion"
+        assert not (tmp_path / "python.gxe.jackknife.npz").exists()
+        assert not (tmp_path / "native.gxe.jackknife.npz").exists()
     finally:
         python_estimator.close()
         native_estimator.close()

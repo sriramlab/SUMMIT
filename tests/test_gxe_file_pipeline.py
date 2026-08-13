@@ -104,9 +104,9 @@ def test_file_bundle_reconstructs_explicit_individual_level_fit(tmp_path):
 
     obj._read_genotype_block = types.MethodType(counted_read, obj)
     obj._compute_ldscore()
-    # One norm/global-target read plus one source and target read for each of
-    # the three in-memory jackknife blocks.
-    assert read_count == 8
+    # Feature diagnostics, one global source pass, and one global target pass.
+    # Block-local jackknife replicates require no additional genotype reads.
+    assert read_count == 3
 
     fitted, _ = fit_from_files(
         str(out) + ".gxe.ref.json",

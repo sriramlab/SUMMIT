@@ -27,6 +27,8 @@ from bed_reader import open_bed
 from threadpoolctl import threadpool_limits
 
 from ..inference.gxe import (
+    _BLOCK_LOCAL_JACKKNIFE_METHOD,
+    _EXACT_JACKKNIFE_METHOD,
     _validate_reference_feature_cache_contract,
     ordered_variant_digest,
 )
@@ -354,6 +356,35 @@ def _validate_reference_manifest(
     diagonal_path, diagonal = _validate_reference_artifacts(
         path, payload, scratch_dir=scratch_dir
     )
+    jackknife = payload.get("jackknife")
+    jackknife_file = payload.get("files", {}).get("jackknife")
+    jackknife_labels: list[str] | None = None
+    if jackknife is None:
+        if jackknife_file is not None:
+            raise ValueError("Reference declares a jackknife artifact without jackknife metadata.")
+    else:
+        if not isinstance(jackknife, dict):
+            raise ValueError("Reference jackknife declaration must be an object.")
+        method = jackknife.get("method")
+        if method not in {
+            _EXACT_JACKKNIFE_METHOD,
+            _BLOCK_LOCAL_JACKKNIFE_METHOD,
+        }:
+            raise ValueError(f"Reference has unsupported jackknife method {method!r}.")
+        if method == _EXACT_JACKKNIFE_METHOD and jackknife_file is None:
+            raise ValueError("Exact two-sided GxE jackknife is missing its trace bundle.")
+        if method == _BLOCK_LOCAL_JACKKNIFE_METHOD and jackknife_file is not None:
+            raise ValueError("Block-local GxE jackknife must not declare an exact trace bundle.")
+        labels = jackknife.get("block_labels")
+        if (
+            not isinstance(labels, list)
+            or len(labels) < 2
+            or any(not isinstance(label, str) or not label for label in labels)
+            or len(set(labels)) != len(labels)
+            or jackknife.get("num_blocks") != len(labels)
+        ):
+            raise ValueError("Reference jackknife block labels/count are invalid.")
+        jackknife_labels = labels
     weight_columns = [f"ANNOT_{idx}" for idx in range(len(names))]
     required_columns = [
         "CHR",
@@ -370,7 +401,7 @@ def _validate_reference_manifest(
         "CORR_XW",
         *weight_columns,
     ]
-    if "jackknife" in payload.get("files", {}):
+    if jackknife is not None:
         required_columns.append("BLOCK")
     observed_columns = diagonal.columns.astype(str).tolist()
     if observed_columns != required_columns or len(set(observed_columns)) != len(observed_columns):
@@ -380,6 +411,12 @@ def _validate_reference_manifest(
         )
     if diagonal["SNP"].duplicated().any():
         raise ValueError("Reference diagonal contains duplicate SNP identifiers.")
+    if jackknife_labels is not None:
+        block_values = pd.to_numeric(diagonal["BLOCK"], errors="raise").to_numpy(
+            dtype=np.int64
+        )
+        if set(np.unique(block_values).tolist()) != set(range(len(jackknife_labels))):
+            raise ValueError("Reference jackknife block IDs do not match its labels.")
     if ordered_variant_digest(diagonal) != payload["variant_digest"]:
         raise ValueError("Reference diagonal variant digest disagrees with its manifest.")
     m = len(diagonal)

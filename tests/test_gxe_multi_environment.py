@@ -114,13 +114,14 @@ def test_shared_multi_environment_matches_independent_references(tmp_path):
         for estimator in estimators:
             estimator.close()
 
-    # Norm, source, within-block target, and global target: four shared reads
-    # per bounded variant block, independent of environment count.
-    assert read_counts == [4 * math.ceil(variants / 5), 0]
+    # Norm, global source, and global target: three shared reads per bounded
+    # variant block, independent of environment count. Jackknife replicates
+    # are formed later from completed block-local LD-score rows.
+    assert read_counts == [3 * math.ceil(variants / 5), 0]
     payload = json.loads(batch.read_text(encoding="utf-8"))
     assert payload["kind"] == "summit.gxe.multi_environment_reference_batch"
     assert payload["num_environments"] == 2
-    assert payload["shared_genotype_passes"] == 4
+    assert payload["shared_genotype_passes"] == 3
     assert [item["environment"] for item in payload["references"]] == ["age", "bmi"]
 
     for column in ("age", "bmi"):
@@ -132,19 +133,16 @@ def test_shared_multi_environment_matches_independent_references(tmp_path):
                 rtol=2e-12,
                 atol=2e-12,
             )
-        with np.load(f"{observed}.gxe.jackknife.npz") as actual, np.load(
-            f"{independent[column]}.gxe.jackknife.npz"
-        ) as expected:
-            assert actual.files == expected.files
-            for name in actual.files:
-                np.testing.assert_array_equal(actual[name], expected[name])
+        assert not Path(f"{observed}.gxe.jackknife.npz").exists()
+        assert not Path(f"{independent[column]}.gxe.jackknife.npz").exists()
         manifest = json.loads(
             Path(f"{observed}.gxe.ref.json").read_text(encoding="utf-8")
         )
+        assert manifest["jackknife"]["method"] == "block_local_ldscore_deletion"
         resources = manifest["resource_estimates"]
         assert resources["multi_environment_shared_decode"] == 1
         assert resources["multi_environment_count"] == 2
-        assert resources["shared_genotype_passes"] == 4
+        assert resources["shared_genotype_passes"] == 3
 
 
 def test_multi_environment_rejects_different_complete_case_cohorts(tmp_path):

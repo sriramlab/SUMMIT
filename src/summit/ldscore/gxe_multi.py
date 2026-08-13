@@ -262,7 +262,10 @@ def _require_common_contract(estimators: Sequence[GenomewideEnvLDScore]) -> None
 def _shared_vtiles(estimators: Sequence[GenomewideEnvLDScore]) -> list[tuple[int, int]]:
     first = estimators[0]
     budget = min(float(estimator.target_xz_mem) for estimator in estimators)
-    multiplier = 4 if first.jackknife_ids is not None else 2
+    # Jackknife deletion is performed later from completed per-variant LD
+    # scores, exactly as in the additive path.  No environment retains a
+    # within-block sketch during reference construction.
+    multiplier = 2
     bytes_per_probe = (
         multiplier
         * len(estimators)
@@ -350,7 +353,6 @@ def generate_multi_environment_references(
     first._assert_construction_genotype_state()
     initial_provenance = first._genotype_provenance()
     blocks = first._make_compute_blocks()
-    jackknife_blocks = first._make_jackknife_compute_blocks()
     vtiles = _shared_vtiles(estimators)
     for estimator in estimators:
         estimator._vtiles_used = list(vtiles)
@@ -382,7 +384,7 @@ def generate_multi_environment_references(
 
     max_vt = max(size for _, size in vtiles)
     itemsize = np.dtype(first.dtype).itemsize
-    resident_multiplier = 4 if first.jackknife_ids is not None else 2
+    resident_multiplier = 2
     total_resident = (
         resident_multiplier
         * len(estimators)
@@ -392,7 +394,7 @@ def generate_multi_environment_references(
         * itemsize
     )
     max_block = min(first.step_size, first.nsnps)
-    passes_per_tile = 3 if first.jackknife_ids is not None else 2
+    passes_per_tile = 2
     passes = 1 + len(vtiles) * passes_per_tile
     for estimator in estimators:
         estimator.resource_estimates = {
@@ -413,21 +415,16 @@ def generate_multi_environment_references(
             "multi_environment_total_resident_sketch_workspace_gib": float(
                 total_resident / 1024**3
             ),
-            "jackknife_in_memory_block_sketch_gib": float(
-                (2 * first.nsamp * first.nbins * max_vt * itemsize / 1024**3)
-                if first.jackknife_ids is not None else 0.0
-            ),
+            "jackknife_in_memory_block_sketch_gib": 0.0,
             "source_columns": int(first.nbins * max_vt),
             "actual_global_2b_source_columns": int(2 * first.nbins * max_vt),
-            "actual_jackknife_2b_source_columns": int(
-                2 * first.nbins * max_vt if first.jackknife_ids is not None else 0
-            ),
+            "actual_jackknife_2b_source_columns": 0,
             "target_source_columns": int(2 * first.nbins * max_vt),
             "blas_threads": int(first.num_threads),
             "bed_reader_threads": int(first.decode_threads),
         }
     first.log._log(
-        "[gxe:multi:resources] modeled total resident global/current-block "
+        "[gxe:multi:resources] modeled total resident paired-global "
         f"sketch workspace={total_resident / 1024**3:.3f} GiB; "
         f"v_tiles={vtiles}."
     )
@@ -439,116 +436,41 @@ def generate_multi_environment_references(
         }
         for _ in estimators
     ]
-    within = [None for _ in estimators]
-    if first.jackknife_ids is not None:
-        within = [
-            {
-                name: np.zeros(
-                    (len(first.jackknife_labels), first.nbins, first.nbins),
-                    dtype=np.float64,
-                )
-                for name in _SCORE_NAMES
-            }
-            for _ in estimators
-        ]
-
     for probe_start, probe_count in vtiles:
         columns = first.nbins * probe_count
         global_sources = [
             np.zeros((first.nsamp, 2 * columns), dtype=first.dtype, order="F")
             for _ in estimators
         ]
-        source_groups = jackknife_blocks if first.jackknife_ids is not None else [blocks]
-        for block_id, source_blocks in enumerate(source_groups):
-            block_sources = (
-                [
-                    np.zeros(
-                        (first.nsamp, 2 * columns), dtype=first.dtype, order="F"
-                    )
-                    for _ in estimators
-                ]
-                if first.jackknife_ids is not None else None
+        for start, stop in blocks:
+            genotype = first._read_genotype_block(start, stop)
+            probes = first._generate_random_block(
+                L=stop - start,
+                v_count=probe_count,
+                blk_start=start,
+                v_start=probe_start,
             )
-            for start, stop in source_blocks:
-                genotype = first._read_genotype_block(start, stop)
-                probes = first._generate_random_block(
-                    L=stop - start,
-                    v_count=probe_count,
-                    blk_start=start,
-                    v_start=probe_start,
+            for index, estimator in enumerate(estimators):
+                x = estimator._prepare_additive_block(
+                    start, stop, G=genotype, apply_scale=True,
+                    out_dtype=estimator.dtype,
                 )
-                for index, estimator in enumerate(estimators):
-                    x = estimator._prepare_additive_block(
-                        start, stop, G=genotype, apply_scale=True,
-                        out_dtype=estimator.dtype,
-                    )
-                    w = estimator._prepare_interaction_block(
-                        start, stop, G=genotype, apply_scale=True,
-                        out_dtype=estimator.dtype,
-                    )
-                    annotation = np.asarray(
-                        estimator.annot[start:stop], dtype=estimator.dtype
-                    )
-                    estimator._accumulate_sketch_block(
-                        global_sources[index][:, :columns], x, probes, annotation,
-                        mirror_chunk=(
-                            None if block_sources is None
-                            else block_sources[index][:, :columns]
-                        ),
-                    )
-                    estimator._accumulate_sketch_block(
-                        global_sources[index][:, columns:2 * columns], w, probes,
-                        annotation,
-                        mirror_chunk=(
-                            None if block_sources is None
-                            else block_sources[index][:, columns:2 * columns]
-                        ),
-                    )
-                    del x, w, annotation
-                del genotype, probes
-
-            if block_sources is None:
-                continue
-            for start, stop in source_blocks:
-                genotype = first._read_genotype_block(start, stop)
-                for index, estimator in enumerate(estimators):
-                    annotation_left = np.asarray(
-                        estimator.annot[start:stop], dtype=np.float64
-                    )
-                    x = estimator._prepare_additive_block(
-                        start, stop, G=genotype, apply_scale=True,
-                        out_dtype=estimator.dtype,
-                    )
-                    w = estimator._prepare_interaction_block(
-                        start, stop, G=genotype, apply_scale=True,
-                        out_dtype=estimator.dtype,
-                    )
-                    work_x = np.asarray(
-                        x.T @ block_sources[index], dtype=np.float64
-                    )
-                    work_w = np.asarray(
-                        w.T @ block_sources[index], dtype=np.float64
-                    )
-                    estimator._accumulate_annotation_pair_sums(
-                        work_x[:, :columns], annotation_left,
-                        within[index]["xx"][block_id], probe_count,
-                    )
-                    estimator._accumulate_annotation_pair_sums(
-                        work_x[:, columns:2 * columns], annotation_left,
-                        within[index]["xw"][block_id], probe_count,
-                    )
-                    estimator._accumulate_annotation_pair_sums(
-                        work_w[:, :columns], annotation_left,
-                        within[index]["wx"][block_id], probe_count,
-                    )
-                    estimator._accumulate_annotation_pair_sums(
-                        work_w[:, columns:2 * columns], annotation_left,
-                        within[index]["ww"][block_id], probe_count,
-                    )
-                    del annotation_left, x, w, work_x, work_w
-                del genotype
-            del block_sources
-            gc.collect()
+                w = estimator._prepare_interaction_block(
+                    start, stop, G=genotype, apply_scale=True,
+                    out_dtype=estimator.dtype,
+                )
+                annotation = np.asarray(
+                    estimator.annot[start:stop], dtype=estimator.dtype
+                )
+                estimator._accumulate_sketch_block(
+                    global_sources[index][:, :columns], x, probes, annotation,
+                )
+                estimator._accumulate_sketch_block(
+                    global_sources[index][:, columns:2 * columns], w, probes,
+                    annotation,
+                )
+                del x, w, annotation
+            del genotype, probes
 
         for start, stop in blocks:
             genotype = first._read_genotype_block(start, stop)
@@ -593,17 +515,11 @@ def generate_multi_environment_references(
                 name: value / float(estimator.nvecs)
                 for name, value in accumulators[index].items()
             }
-            environment_within = within[index]
-            if environment_within is not None:
-                environment_within = {
-                    name: value / float(estimator.nvecs)
-                    for name, value in environment_within.items()
-                }
             estimator._compute_ldscore(
-                compute_callback=lambda estimator=estimator, scores=scores,
-                    environment_within=environment_within: estimator._finalize_ldscore_outputs(
-                        scores, environment_within
-                    ),
+                compute_callback=(
+                    lambda estimator=estimator, scores=scores:
+                    estimator._finalize_ldscore_outputs(scores, None)
+                ),
                 expected_provenance=initial_provenance,
                 provenance_preverified=True,
             )

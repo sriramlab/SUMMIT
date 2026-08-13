@@ -98,7 +98,7 @@ def _dense_panels(raw, env_raw, annot, block_ids):
     return scores, within
 
 
-def test_in_memory_four_pass_matches_dense_and_old_reread_oracle(tmp_path):
+def test_block_local_jackknife_uses_global_passes_and_matches_dense_scores(tmp_path):
     obj, raw, env_raw, annot = _make_toy(tmp_path, "fused")
     original_read = obj._read_genotype_block
     read_count = 0
@@ -110,45 +110,36 @@ def test_in_memory_four_pass_matches_dense_and_old_reread_oracle(tmp_path):
 
     obj._read_genotype_block = types.MethodType(counted_read, obj)
     obj._compute_ldscore()
-    assert read_count == 4 * math.ceil(raw.shape[1] / obj.step_size)
+    assert read_count == 3 * math.ceil(raw.shape[1] / obj.step_size)
     assert not list(tmp_path.glob(".gxe-jackknife-*"))
 
-    dense_scores, dense_within = _dense_panels(raw, env_raw, annot, obj.jackknife_ids)
+    dense_scores, _ = _dense_panels(raw, env_raw, annot, obj.jackknife_ids)
     suffix = {"xx": "gxx", "xw": "gxe", "wx": "exg", "ww": "gee"}
     for key, stem in suffix.items():
         observed = pd.read_csv(tmp_path / f"fused.{stem}.ldscore.gz", sep="\t")[["a", "b"]].to_numpy()
         # Text score bundles are intentionally written with %.10g.
         np.testing.assert_allclose(observed, dense_scores[key], rtol=1e-9, atol=1e-9)
-    saved = np.load(tmp_path / "fused.gxe.jackknife.npz")
-    for key in dense_within:
-        np.testing.assert_allclose(saved[f"within_{key}"], dense_within[key], rtol=3e-12, atol=3e-12)
-
-    old, _, _, _ = _make_toy(tmp_path, "old")
-    old._precompute_residual_variances()
-    old_within = old._compute_within_jackknife_scores(
-        old._make_compute_blocks(), [(0, raw.shape[1])]
-    )
-    for key in dense_within:
-        np.testing.assert_allclose(saved[f"within_{key}"], old_within[key], rtol=3e-12, atol=3e-12)
+    assert not (tmp_path / "fused.gxe.jackknife.npz").exists()
 
 
-def test_jackknife_probe_tiling_accounts_for_global_and_block_workspace():
+def test_block_local_jackknife_tiling_accounts_only_for_global_workspace():
     obj = GenomewideEnvLDScore.__new__(GenomewideEnvLDScore)
-    obj.target_xz_mem = 4 * 101 * 3 * 7.5 * 4 / (1024 ** 3)
+    obj.target_xz_mem = 2 * 101 * 3 * 7.5 * 4 / (1024 ** 3)
     obj.dtype = np.float32
     obj.nsamp = 101
     obj.nbins = 3
     obj.nvecs = 23
     obj.jackknife_ids = np.zeros(5, dtype=np.int32)
+    obj.shard_mode = False
     obj.log = Logger(suppress=True)
     tiles = obj._auto_vtiles()
     assert max(size for _, size in tiles) == 6
     assert sum(size for _, size in tiles) == 23
-    resident = 4 * obj.nsamp * obj.nbins * max(size for _, size in tiles) * 4
+    resident = 2 * obj.nsamp * obj.nbins * max(size for _, size in tiles) * 4
     assert resident <= obj.target_xz_mem * (1024 ** 3)
 
 
-def test_production_shaped_jackknife_keeps_only_one_block_in_memory():
+def test_production_shaped_block_local_jackknife_has_no_block_sketch():
     obj = GenomewideEnvLDScore.__new__(GenomewideEnvLDScore)
     obj.target_xz_mem = 32.0
     obj.dtype = np.float64
@@ -157,34 +148,52 @@ def test_production_shaped_jackknife_keeps_only_one_block_in_memory():
     obj.nvecs = 1_024
     obj.jackknife_ids = np.arange(100, dtype=np.int32)
     obj.jackknife_labels = [f"block:{index}" for index in range(100)]
+    obj.shard_mode = False
+    obj.log = Logger(suppress=True)
+
+    tiles = obj._auto_vtiles()
+    assert sum(size for _, size in tiles) == obj.nvecs
+    assert tiles == [(0, 1_024)]
+    paired_global = 2 * obj.nsamp * max(size for _, size in tiles) * 8
+    assert paired_global == 4_915_200_000
+    assert paired_global / (1024 ** 3) == pytest.approx(4.57763671875)
+
+
+def test_exact_shard_jackknife_keeps_only_one_block_in_memory():
+    obj = GenomewideEnvLDScore.__new__(GenomewideEnvLDScore)
+    obj.target_xz_mem = 32.0
+    obj.dtype = np.float64
+    obj.nsamp = 300_000
+    obj.nbins = 1
+    obj.nvecs = 1_024
+    obj.jackknife_ids = np.arange(100, dtype=np.int32)
+    obj.jackknife_labels = [f"block:{index}" for index in range(100)]
+    obj.shard_mode = True
     obj.log = Logger(suppress=True)
 
     all_blocks = 2 * 100 * obj.nsamp * obj.nvecs * 8
     assert all_blocks / (1024 ** 3) > 450.0
-    tiles = obj._auto_vtiles()
-    assert sum(size for _, size in tiles) == obj.nvecs
-    assert tiles == [(0, 1_024)]
-    one_block = 2 * obj.nsamp * max(size for _, size in tiles) * 8
-    assert one_block == 4_915_200_000
+    assert obj._auto_vtiles() == [(0, 1_024)]
+    one_block = 2 * obj.nsamp * obj.nvecs * 8
     assert one_block / (1024 ** 3) == pytest.approx(4.57763671875)
-    assert one_block * 100 == all_blocks
 
 
 def test_native_tiling_accounts_for_opaque_panel_preparation_peak():
     obj = GenomewideEnvLDScore.__new__(GenomewideEnvLDScore)
-    obj.target_xz_mem = 8 * 101 * 3 * 7.5 * 8 / (1024 ** 3)
+    obj.target_xz_mem = 6 * 101 * 3 * 7.5 * 8 / (1024 ** 3)
     obj.dtype = np.float64
     obj.nsamp = 101
     obj.nbins = 3
     obj.nvecs = 23
     obj.jackknife_ids = np.zeros(5, dtype=np.int32)
     obj.jackknife_labels = ["one"]
+    obj.shard_mode = False
     obj.native_backend = "direct"
     obj.log = Logger(suppress=True)
     tiles = obj._auto_vtiles()
     assert max(size for _, size in tiles) == 6
     assert sum(size for _, size in tiles) == 23
-    peak = 8 * obj.nsamp * obj.nbins * max(size for _, size in tiles) * 8
+    peak = 6 * obj.nsamp * obj.nbins * max(size for _, size in tiles) * 8
     assert peak <= obj.target_xz_mem * 1024**3
 
 

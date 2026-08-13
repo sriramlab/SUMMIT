@@ -498,6 +498,72 @@ def test_preaggregated_deletion_matches_legacy_for_overlapping_annotations(
         np.testing.assert_allclose(observed.rhs, expected.rhs, rtol=3e-15, atol=1e-12)
         np.testing.assert_allclose(observed.traces, expected.traces, rtol=3e-15, atol=1e-12)
 
+    block_local = _prepare_reference_sufficient_statistics(
+        path=Path("reference.json"),
+        payload={
+            "residual_rank": r,
+            "trace_nxe": 25.4,
+            "trace_nxe_sq": 30.2,
+        },
+        manifest_sha256="0" * 64,
+        schema_version=3,
+        feature_cache_sha256=None,
+        reference_provenance=GxEInputProvenance(
+            path="/reference.json", bytes=1, sha256="0" * 64
+        ),
+        feature_cache_provenance=None,
+        variants=variants,
+        annotations=annotations,
+        annotation_names=names,
+        panels=panels,
+        norm_x=norm_x,
+        norm_w=norm_w,
+        diag_x=diag_x,
+        diag_w=diag_w,
+        equations=full,
+        block_values=blocks,
+        block_labels=tuple(f"block:{index}" for index in range(nblock)),
+        within=None,
+        jackknife_method=gxe_module._BLOCK_LOCAL_JACKKNIFE_METHOD,
+        null_corrected=null_corrected,
+    )
+    _, local_deleted = _equations_from_prepared_scores(
+        block_local,
+        score_x,
+        score_w,
+        q_nxe=3.1,
+        q_residual=r,
+    )
+    for block_id, observed in enumerate(local_deleted):
+        keep = blocks != block_id
+        # This is the additive-style approximation: remove completed
+        # LD-score rows and all per-variant moments, then renormalize by the
+        # annotation mass that remains. Source-side LD from the deleted block
+        # is intentionally left in retained rows.
+        expected = assemble_normal_equations(
+            annotations=annotations[keep],
+            score_x=score_x[keep],
+            score_w=score_w[keep],
+            ld_xx=raw_panels["xx"][keep],
+            ld_xw=raw_panels["xw"][keep],
+            ld_wx=raw_panels["wx"][keep],
+            ld_ww=raw_panels["ww"][keep],
+            norm_x=norm_x[keep],
+            norm_w=norm_w[keep],
+            diag_nxe_x=diag_x[keep],
+            diag_nxe_w=diag_w[keep],
+            residual_rank=r,
+            q_nxe=3.1,
+            q_residual=r,
+            trace_nxe=25.4,
+            trace_nxe_sq=30.2,
+            annotation_names=names,
+            null_corrected=False,
+        )
+        np.testing.assert_allclose(observed.matrix, expected.matrix, rtol=3e-15, atol=1e-12)
+        np.testing.assert_allclose(observed.rhs, expected.rhs, rtol=3e-15, atol=1e-12)
+        np.testing.assert_allclose(observed.traces, expected.traces, rtol=3e-15, atol=1e-12)
+
 
 def test_fit_batch_manifest_is_strict_and_resolves_relative_paths(tmp_path):
     manifest = tmp_path / "batch.json"

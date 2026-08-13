@@ -96,25 +96,24 @@ Projected feature norms and `F_j' diag(e^2) F_j` supply the genetic-by-residual
 and genetic-by-NxE trace blocks. Two scalar traces supply NxE-by-NxE and
 NxE-by-residual.
 
-## Exact deletion jackknife
+## Block-local LD-score jackknife
 
-GENIE deletes a SNP block from both sides of each genetic kernel. Deleting only
-rows from a full-source LD-score file is not equivalent. With
-`--write-gxe-jackknife`, SUMMIT stores the within-block intersections needed for
+The default GxE jackknife follows SUMMIT's additive convention. It assumes
+directional LD across jackknife blocks is negligible and constructs each
+replicate by deleting that block's completed LD-score rows, phenotype-score
+moments, feature traces, and annotation mass. Under block-local LD this is the
+same two-sided kernel deletion because a deleted row's source contribution is
+also contained in the deleted block. This applies independently to XX, XW, WX,
+and WW. `--write-gxe-jackknife` therefore writes only block IDs in the diagonal
+table and a labeled manifest declaration; it writes no randomized block
+sketches. Use `--njack 100` to match the published GENIE block count, or
+`--njack chr` for a chromosome jackknife.
 
-```text
-S(-B) = S - rows(B) - columns(B) + intersection(B,B).
-```
-
-The fitter reconstructs each two-sided deleted trace matrix, deletes the same
-block from genetic phenotype moments and kernel denominators, solves every
-replicate, and reports the standard delete-block SE. Use `--njack 100` to match
-the published GENIE block count, or `--njack chr` for a chromosome jackknife.
-At least 100 trace probes are required by default when writing jackknife
-intersections. A lower count is available only through the explicit diagnostic
-override because Monte Carlo error in the within-block intersections can
-materially distort the delete-block SE. Production analyses should additionally
-check stability across probe counts and independent seeds.
+At least 100 trace probes remain the production default for jackknife-enabled
+references. A lower count is available through the explicit diagnostic override
+for smoke tests. Production analyses should check stability across probe counts
+and independent seeds. Exact two-sided legacy bundles remain readable, but
+ordinary reference construction does not generate their within-block traces.
 
 The current low-noise production contract uses B1024 (eight disjoint B128
 shards). B128/B256/B512 prefix merges and the independent second B512 half are
@@ -131,7 +130,7 @@ that computes feature diagnostics and source/target products without
 materializing full X/W genotype-design blocks. It is currently restricted to
 phenotype-free, one-annotation, `float32` or `float64`, standardized/sample-scaled
 references whose selected genotype calls are missing-free. Python and C++ use the same Philox probe identities,
-and dense differential tests cover global and exact two-sided jackknife terms.
+and dense differential tests cover global terms and block-local deletion.
 Artifacts bind the exact loaded extension inode/bytes, source snapshot,
 compiler options, workspace limits, and actual 2B/4B widths.
 

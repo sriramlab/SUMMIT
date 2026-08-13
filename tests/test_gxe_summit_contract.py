@@ -914,6 +914,10 @@ def test_schema_v2_null_corrected_jackknife_batch_matches_singletons_and_dense(
     )
     _install_exact_probes(estimator)
     estimator._compute_ldscore()
+    within = estimator._compute_within_jackknife_scores(
+        estimator._make_compute_blocks(), [(0, estimator.nvecs)]
+    )
+    assert within is not None
     estimator.close()
 
     ref_path = Path(str(out) + ".gxe.ref.json")
@@ -926,6 +930,29 @@ def test_schema_v2_null_corrected_jackknife_batch_matches_singletons_and_dense(
     masses = np.asarray(reference["annotation_masses"], dtype=np.float64)
     residual_rank = int(reference["residual_rank"])
     assert len(names) == 2
+
+    # Ordinary construction above deliberately produced the block-local
+    # default. Add a hand-built exact trace bundle so this remains a focused
+    # schema-v2 compatibility test for legacy/special exact references.
+    jackknife_path = Path(str(out) + ".gxe.jackknife.npz")
+    GenomewideEnvLDScore._atomic_npz(
+        str(jackknife_path),
+        block_labels=np.asarray(estimator.jackknife_labels, dtype=np.str_),
+        within_xx=within["xx"],
+        within_xw=within["xw"],
+        within_wx=within["wx"],
+        within_ww=within["ww"],
+    )
+    reference["files"]["jackknife"] = jackknife_path.name
+    reference["artifact_sha256"]["jackknife"] = hashlib.sha256(
+        jackknife_path.read_bytes()
+    ).hexdigest()
+    reference["jackknife"] = {
+        "method": "two_sided_snp_kernel_deletion",
+        "num_blocks": len(estimator.jackknife_labels),
+        "block_labels": list(estimator.jackknife_labels),
+        "within_scale": "cross_product_over_rank_squared",
+    }
     assert "jackknife" in reference["files"]
 
     # Schema v2 stored randomized panels after subtracting the analytic null

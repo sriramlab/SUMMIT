@@ -624,8 +624,9 @@ Exactly one of these modes must be specified.
 - `--env`: one-column environment file for the GxE reference/score bundle.
 - `--gxe-score-reference`: produce marginal scores and NxE moments from a
   sealed reference; `--gxe-pheno-cols` selects columns from `--gxe-pheno`.
-- `--write-gxe-jackknife`: write within-block intersections needed for
-  two-sided GENIE kernel-deletion SEs; block layout comes from `--njack`.
+- `--write-gxe-jackknife`: record block IDs for the default block-local
+  LD-score deletion jackknife; block layout comes from `--njack` and no
+  per-block sketches are written.
 - `--allow-low-probe-gxe-jackknife`: diagnostic override for fewer than 100
   probes; resulting SEs are not production-calibrated.
 - `--ld-wind-kb`: compute fixed-window LD scores instead of randomized
@@ -659,8 +660,9 @@ Exactly one of these modes must be specified.
 - Windowed LD scores: `<out>.win.ldscore.gz`, `<out>.win.M`,
   `<out>.win.M_5_50`, `<out>.win.log`.
 - GxE reference: `<out>.{gxx,gxe,exg,gee}.ldscore.gz`,
-  `<out>.gxe.diag.tsv.gz`, `<out>.gxe.ref.json`, and optionally
-  `<out>.gxe.jackknife.npz`.
+  `<out>.gxe.diag.tsv.gz`, and `<out>.gxe.ref.json`. The default block-local
+  jackknife adds block IDs to the diagonal table but no sketch artifact;
+  exact legacy/sharded references may also contain `<out>.gxe.jackknife.npz`.
 - Batched GxE phenotype summaries: `<out>.<trait>.gxe.{gwas,gwis}.tsv.gz` and
   `<out>.<trait>.gxe.moments.json`.
 - GxE fit: `<out>.gxe.results.tsv`, `<out>.gxe.fit.json`, `<out>.gxe.log`;

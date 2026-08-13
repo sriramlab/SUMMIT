@@ -245,7 +245,9 @@ def merged_bundle(tmp_path_factory):
     builder = _estimator(inputs, root / "builder", probes=100)
     builder.write_feature_cache(cache)
 
-    monolithic = _estimator(inputs, root / "mono", probes=100, cache=cache)
+    monolithic = _estimator(
+        inputs, root / "mono-contribution", probes=100, cache=cache, shard=True
+    )
     reads = 0
     original = monolithic._read_genotype_block
 
@@ -257,6 +259,11 @@ def merged_bundle(tmp_path_factory):
     monolithic._read_genotype_block = types.MethodType(counted, monolithic)
     monolithic._compute_ldscore()
     assert reads == 7
+    merge_reference_shards(
+        [root / "mono-contribution.gxe.shard.json"],
+        feature_cache_path=cache,
+        output_prefix=root / "mono",
+    )
 
     shards = []
     for index in range(10):
@@ -597,7 +604,7 @@ def test_merge_hashes_and_parses_each_panel_from_same_bytes(merged_bundle, monke
         os.chmod(panel, 0o600)
 
 
-def test_cache_skip_is_two_passes_versus_three(tmp_path):
+def test_cache_skip_removes_feature_pass_from_block_local_reference(tmp_path):
     inputs = _toy_inputs(tmp_path)
     cache = tmp_path / "features.npz"
     builder = _estimator(inputs, tmp_path / "builder", probes=100)
@@ -630,7 +637,7 @@ def test_cache_skip_is_two_passes_versus_three(tmp_path):
         estimator._read_genotype_block = types.MethodType(counted, estimator)
         estimator._compute_ldscore()
         counts.append(count)
-    assert counts == [8, 7]
+    assert counts == [3, 2]
 
 
 def test_feature_cache_link_failure_does_not_leave_published_cache(

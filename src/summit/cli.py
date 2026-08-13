@@ -585,7 +585,8 @@ def build_parser() -> argparse.ArgumentParser:
               "The production opaque in-memory GxE target uses full-width GEMMs."),
     )
     parser.add_argument("--write-gxe-jackknife", action="store_true", default=False,
-                        help="Write compact within-block traces for exact two-sided GENIE SNP-deletion SEs; uses --njack blocks.")
+                        help=("Write block IDs for additive-analogous, block-local GxE "
+                              "LD-score jackknife SEs; uses --njack blocks and writes no sketches."))
     parser.add_argument("--allow-low-probe-gxe-jackknife", action="store_true", default=False,
                         help="Permit fewer than 100 probes for a diagnostic GxE jackknife despite unreliable Monte Carlo SEs.")
     parser.add_argument("--gxe-overwrite", action="store_true", default=False,
@@ -1912,7 +1913,7 @@ def main():
                 suffixes.extend([".gxe.diag.tsv.gz", ".gxe.ref.json"])
                 if args.gxe_pheno is not None:
                     suffixes.extend([".gxe.gwas.tsv.gz", ".gxe.gwis.tsv.gz", ".gxe.moments.json"])
-            if args.write_gxe_jackknife:
+            if args.write_gxe_jackknife and args._gxe_reference_shard:
                 suffixes.append(".gxe.jackknife.npz")
         else:
             suffixes = [".gxe.results.tsv", ".gxe.fit.json"]

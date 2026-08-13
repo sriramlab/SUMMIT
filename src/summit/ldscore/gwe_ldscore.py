@@ -1875,8 +1875,13 @@ class GenomewideEnvLDScore:
                 f"block={labels[block_id]!r}, annotation={self.l2cols[annotation_id]!r}. "
                 "Choose blocks for which every annotation retains positive mass."
             )
+        method = (
+            "exact two-sided shard deletion"
+            if self.shard_mode
+            else "block-local LD-score deletion"
+        )
         self.log._log(
-            f"[gxe:jackknife] configured {len(labels)} two-sided SNP-deletion blocks "
+            f"[gxe:jackknife] configured {len(labels)} {method} blocks "
             f"({int(counts.min())}-{int(counts.max())} variants per block)."
         )
         return block_ids, labels
@@ -2243,21 +2248,24 @@ class GenomewideEnvLDScore:
         target_gib = float(self.target_xz_mem)
         itemsize = int(np.dtype(self.dtype).itemsize)
         native_direct = getattr(self, "native_backend", "python") == "direct"
-        # Without jackknifing, the target pass holds the concatenated X/W
-        # global sketch.  Exact two-sided deletion additionally holds one
-        # concatenated block sketch in the same target buffer.
-        resident_multiplier = 4 if self.jackknife_ids is not None else 2
+        # Ordinary references use additive-analogous block-local deletion from
+        # their completed LD-score rows.  Only legacy reference shards retain
+        # the exact two-sided within-block machinery.
+        exact_jackknife = self.jackknife_ids is not None and bool(
+            getattr(self, "shard_mode", False)
+        )
+        resident_multiplier = 4 if exact_jackknife else 2
         if native_direct:
             # Let U=N*K*B*8.  Each opaque panel owns S and e*S.  Preparing
             # a panel peaks at its 2U input plus a 4U snapshot. Exact JK keeps
             # both 2B stored sketches during block preparation, but never keeps
             # the global and block opaque panels together.
             if itemsize == np.dtype(np.float64).itemsize:
-                peak_multiplier = 8 if self.jackknife_ids is not None else 6
+                peak_multiplier = 8 if exact_jackknife else 6
             else:
                 # The two float32 stored sketches use 2U total. Python's 2U
                 # float64 call input and C++'s 4U opaque snapshot peak at 8U.
-                peak_multiplier = 8 if self.jackknife_ids is not None else 7
+                peak_multiplier = 8 if exact_jackknife else 7
             denominator_itemsize = np.dtype(np.float64).itemsize
         else:
             peak_multiplier = resident_multiplier
@@ -2292,7 +2300,7 @@ class GenomewideEnvLDScore:
             if native_direct
             else (
                 "global+one-block in-memory sketches"
-                if self.jackknife_ids is not None
+                if exact_jackknife
                 else "paired global sketches"
             )
         )
@@ -2613,7 +2621,7 @@ class GenomewideEnvLDScore:
             suffixes.extend([".gxe.diag.tsv.gz", ".gxe.ref.json"])
         if self.pheno is not None:
             suffixes.extend([".gxe.gwas.tsv.gz", ".gxe.gwis.tsv.gz", ".gxe.moments.json"])
-        if self.write_jackknife:
+        if self.write_jackknife and self.shard_mode:
             suffixes.append(".gxe.jackknife.npz")
         return [Path(f"{self.outpath}{suffix}") for suffix in suffixes]
 
@@ -3139,6 +3147,13 @@ class GenomewideEnvLDScore:
                 "block_labels": self.jackknife_labels,
                 "within_scale": "cross_product_over_rank_squared",
             }
+        elif self.jackknife_ids is not None:
+            jackknife_payload = {
+                "method": "block_local_ldscore_deletion",
+                "num_blocks": len(self.jackknife_labels),
+                "block_labels": self.jackknife_labels,
+                "assumption": "cross_block_directional_ld_is_negligible",
+            }
         payload = {
             "kind": "summit.gxe.reference",
             "schema_version": 3,
@@ -3611,22 +3626,25 @@ class GenomewideEnvLDScore:
         else:
             self._load_feature_cache(self.feature_cache_path)
         blocks = self._make_compute_blocks()
-        jackknife_blocks = self._make_jackknife_compute_blocks()
+        exact_jackknife = self.jackknife_ids is not None and self.shard_mode
+        jackknife_blocks = (
+            self._make_jackknife_compute_blocks() if exact_jackknife else []
+        )
         vtiles = self._auto_vtiles()
         self._vtiles_used = list(vtiles)
 
         max_vt = max(vt for _, vt in vtiles)
         itemsize = int(np.dtype(self.dtype).itemsize)
         max_block = min(self.step_size, self.nsnps)
-        resident_multiplier = 4 if self.jackknife_ids is not None else 2
+        resident_multiplier = 4 if exact_jackknife else 2
         # A native projected panel owns S and e*S for one 2B source sketch.
         # Block and global panels are never retained at the same time.
         native_opaque_retained_multiplier = 4 if self.native_backend == "direct" else 0
         native_opaque_prepare_peak_multiplier = (
             (
-                (8 if self.jackknife_ids is not None else 6)
+                (8 if exact_jackknife else 6)
                 if itemsize == np.dtype(np.float64).itemsize
-                else (8 if self.jackknife_ids is not None else 7)
+                else (8 if exact_jackknife else 7)
             )
             if self.native_backend == "direct"
             else 0
@@ -3636,11 +3654,11 @@ class GenomewideEnvLDScore:
         q_rank = self.p_eff + 1
         global_source_columns = 2 * self.nbins * max_vt
         jackknife_source_columns = (
-            2 * self.nbins * max_vt if self.jackknife_ids is not None else 0
+            2 * self.nbins * max_vt if exact_jackknife else 0
         )
         jackknife_block_bytes = (
             0
-            if self.jackknife_ids is None
+            if not exact_jackknife
             else 2 * self.nsamp * self.nbins * max_vt * itemsize
         )
         native_feature_bytes = 8 * (
@@ -3752,14 +3770,14 @@ class GenomewideEnvLDScore:
         jackknife_units = sum(len(group) for group in jackknife_blocks)
         units_per_tile = (
             2 * len(blocks)
-            if self.jackknife_ids is None
+            if not exact_jackknife
             else 2 * jackknife_units + len(blocks)
         )
         total_units = max(1, len(vtiles) * units_per_tile)
         bar = tqdm(total=total_units, desc="GxE-LD progress", unit="task", smoothing=0.2, disable=(not self.verbose))
         within_jackknife = None
         max_native_source_leakage = 0.0
-        if self.jackknife_ids is not None:
+        if exact_jackknife:
             within_jackknife = {
                 key: np.zeros((len(self.jackknife_labels), self.nbins, self.nbins), dtype=np.float64)
                 for key in ("xx", "xw", "wx", "ww")

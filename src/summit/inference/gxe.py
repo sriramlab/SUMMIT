@@ -37,6 +37,8 @@ _COPY_CHUNK_BYTES = 8 * 1024 * 1024
 _FIT_BATCH_KIND = "summit.gxe.fit_batch"
 _FIT_BATCH_SCHEMA_VERSION = 1
 _FIT_BATCH_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
+_EXACT_JACKKNIFE_METHOD = "two_sided_snp_kernel_deletion"
+_BLOCK_LOCAL_JACKKNIFE_METHOD = "block_local_ldscore_deletion"
 
 
 def _is_sha256(value: Any) -> bool:
@@ -644,6 +646,7 @@ def _prepare_reference_sufficient_statistics(
     block_values: np.ndarray | None = None,
     block_labels: Sequence[str] = (),
     within: Mapping[str, np.ndarray] | None = None,
+    jackknife_method: str | None = None,
     null_corrected: bool,
 ) -> _PreparedGxEReference:
     """Collapse a validated reference to reusable full/deletion templates."""
@@ -657,9 +660,28 @@ def _prepare_reference_sufficient_statistics(
     block_masses: np.ndarray | None = None
     deleted_matrices: np.ndarray | None = None
     deleted_traces: np.ndarray | None = None
-    if block_values is not None or labels or within is not None:
-        if block_values is None or within is None or len(labels) < 2:
+    if jackknife_method is None and within is not None:
+        jackknife_method = _EXACT_JACKKNIFE_METHOD
+    has_jackknife = (
+        block_values is not None
+        or bool(labels)
+        or within is not None
+        or jackknife_method is not None
+    )
+    if has_jackknife:
+        if block_values is None or len(labels) < 2:
             raise ValueError("Incomplete jackknife inputs for prepared GxE reference.")
+        if jackknife_method not in {
+            _EXACT_JACKKNIFE_METHOD,
+            _BLOCK_LOCAL_JACKKNIFE_METHOD,
+        }:
+            raise ValueError(f"Unsupported GxE jackknife method {jackknife_method!r}.")
+        if jackknife_method == _EXACT_JACKKNIFE_METHOD and within is None:
+            raise ValueError("Exact two-sided GxE deletion requires within-block traces.")
+        if jackknife_method == _BLOCK_LOCAL_JACKKNIFE_METHOD and within is not None:
+            raise ValueError(
+                "Block-local GxE deletion must not include exact within-block traces."
+            )
         prepared_blocks = np.asarray(block_values, dtype=np.int64)
         if prepared_blocks.shape != (m,):
             raise ValueError("Jackknife block IDs are not aligned to annotations.")
@@ -727,9 +749,13 @@ def _prepare_reference_sufficient_statistics(
             cross_sum = (
                 panel_full[forward][left, source]
                 - panel_block[forward][block_id, left, source]
-                - panel_block[reverse][block_id, source, left]
-                + float(within[forward][block_id, left, source])
             )
+            if jackknife_method == _EXACT_JACKKNIFE_METHOD:
+                assert within is not None
+                cross_sum += (
+                    -panel_block[reverse][block_id, source, left]
+                    + float(within[forward][block_id, left, source])
+                )
             return float(
                 r
                 * r
@@ -1539,6 +1565,7 @@ def _fit_from_input_snapshots(
     required_artifacts = {"xx", "xw", "wx", "ww", "diagonal"}
     if "jackknife" in ref.get("files", {}):
         required_artifacts.add("jackknife")
+    if ref.get("jackknife") is not None:
         randomization = ref.get("randomization")
         if not isinstance(randomization, dict) or "num_vectors" not in randomization:
             raise ValueError("Jackknife reference is missing its random-probe count.")
@@ -1587,7 +1614,7 @@ def _fit_from_input_snapshots(
             "SCALE_X", "SCALE_W", "DNXE_X", "DNXE_W", "CORR_XW",
             *weight_cols,
         ]
-        if "jackknife" in ref.get("files", {}):
+        if ref.get("jackknife") is not None:
             required_diag.append("BLOCK")
         observed_diag_columns = diag.columns.astype(str).tolist()
         if (
@@ -1851,29 +1878,49 @@ def _fit_from_input_snapshots(
             raise ValueError("Invalid phenotype_residual_variance_fraction in phenotype moments.")
         fit = replace(fit, phenotype_residual_variance_fraction=residual_fraction)
     jackknife_file = ref.get("files", {}).get("jackknife")
+    jackknife_declaration = ref.get("jackknife")
     prepared: _PreparedGxEReference
-    if jackknife_file is not None:
+    if jackknife_declaration is not None:
+        if not isinstance(jackknife_declaration, dict):
+            raise ValueError("Reference jackknife declaration must be an object.")
+        jackknife_method = jackknife_declaration.get("method")
+        if jackknife_method not in {
+            _EXACT_JACKKNIFE_METHOD,
+            _BLOCK_LOCAL_JACKKNIFE_METHOD,
+        }:
+            raise ValueError(f"Unsupported GxE jackknife method {jackknife_method!r}.")
         if "BLOCK" not in diag.columns:
-            raise ValueError("Reference manifest declares a jackknife file but diagonal table has no BLOCK column.")
+            raise ValueError("Reference declares a jackknife but its diagonal table has no BLOCK column.")
         block_values = pd.to_numeric(diag["BLOCK"], errors="raise").to_numpy(dtype=np.int64)
-        with np.load(artifact_snapshots["jackknife"].snapshot_path, allow_pickle=False) as bundle:
-            expected_members = {
-                "block_labels", "within_xx", "within_xw", "within_wx", "within_ww"
-            }
-            if len(bundle.files) != len(expected_members) or set(bundle.files) != expected_members:
-                raise ValueError(
-                    "Reference jackknife contains unexpected, duplicate, or missing arrays."
-                )
-            label_array = np.asarray(bundle["block_labels"])
-            if label_array.ndim != 1 or label_array.dtype.kind != "U":
-                raise ValueError("Reference jackknife block_labels must be a one-dimensional Unicode array.")
-            labels = tuple(label_array.tolist())
-            within = {}
-            for key in ("xx", "xw", "wx", "ww"):
-                raw = np.asarray(bundle[f"within_{key}"])
-                if raw.dtype != np.dtype(np.float64):
-                    raise ValueError(f"Reference jackknife within_{key} must use float64.")
-                within[key] = np.array(raw, copy=True)
+        declared_labels = jackknife_declaration.get("block_labels")
+        if not isinstance(declared_labels, list):
+            raise ValueError("Reference jackknife block_labels must be a JSON list.")
+        labels = tuple(str(value) for value in declared_labels)
+        within = None
+        if jackknife_method == _EXACT_JACKKNIFE_METHOD:
+            if jackknife_file is None:
+                raise ValueError("Exact two-sided GxE jackknife is missing its trace bundle.")
+            with np.load(artifact_snapshots["jackknife"].snapshot_path, allow_pickle=False) as bundle:
+                expected_members = {
+                    "block_labels", "within_xx", "within_xw", "within_wx", "within_ww"
+                }
+                if len(bundle.files) != len(expected_members) or set(bundle.files) != expected_members:
+                    raise ValueError(
+                        "Reference jackknife contains unexpected, duplicate, or missing arrays."
+                    )
+                label_array = np.asarray(bundle["block_labels"])
+                if label_array.ndim != 1 or label_array.dtype.kind != "U":
+                    raise ValueError("Reference jackknife block_labels must be a one-dimensional Unicode array.")
+                if tuple(label_array.tolist()) != labels:
+                    raise ValueError("Jackknife trace labels disagree with the reference manifest.")
+                within = {}
+                for key in ("xx", "xw", "wx", "ww"):
+                    raw = np.asarray(bundle[f"within_{key}"])
+                    if raw.dtype != np.dtype(np.float64):
+                        raise ValueError(f"Reference jackknife within_{key} must use float64.")
+                    within[key] = np.array(raw, copy=True)
+        elif jackknife_file is not None:
+            raise ValueError("Block-local GxE jackknife must not declare an exact trace bundle.")
         nblock = len(labels)
         if (
             nblock < 2
@@ -1882,21 +1929,21 @@ def _fit_from_input_snapshots(
             or set(np.unique(block_values).tolist()) != set(range(nblock))
         ):
             raise ValueError("Jackknife block IDs are not contiguous or do not match block_labels.")
-        declared_labels = ref.get("jackknife", {}).get("block_labels")
-        if declared_labels != list(labels):
-            raise ValueError("Jackknife block labels disagree with the reference manifest.")
-        expected_shape = (nblock, len(names), len(names))
-        for key, value in within.items():
-            if (
-                value.shape != expected_shape
-                or not np.all(np.isfinite(value))
-                or np.any(value < 0.0)
-            ):
-                raise ValueError(
-                    f"Jackknife within_{key} has shape {value.shape}; expected finite, "
-                    f"non-negative float64 {expected_shape}."
-                )
-            value[value == 0.0] = 0.0
+        if jackknife_declaration.get("num_blocks") != nblock:
+            raise ValueError("Jackknife block count disagrees with its labels.")
+        if within is not None:
+            expected_shape = (nblock, len(names), len(names))
+            for key, value in within.items():
+                if (
+                    value.shape != expected_shape
+                    or not np.all(np.isfinite(value))
+                    or np.any(value < 0.0)
+                ):
+                    raise ValueError(
+                        f"Jackknife within_{key} has shape {value.shape}; expected finite, "
+                        f"non-negative float64 {expected_shape}."
+                    )
+                value[value == 0.0] = 0.0
         prepared = _prepare_reference_sufficient_statistics(
             path=ref_path,
             payload=ref,
@@ -1917,6 +1964,7 @@ def _fit_from_input_snapshots(
             block_values=block_values,
             block_labels=labels,
             within=within,
+            jackknife_method=str(jackknife_method),
             null_corrected=null_corrected,
         )
         _, deleted_equations = _equations_from_prepared_scores(
@@ -1944,6 +1992,8 @@ def _fit_from_input_snapshots(
             jackknife_block_labels=labels,
         )
     else:
+        if jackknife_file is not None:
+            raise ValueError("Reference declares a jackknife artifact without jackknife metadata.")
         prepared = _prepare_reference_sufficient_statistics(
             path=ref_path,
             payload=ref,
