@@ -18,6 +18,7 @@ from typing import Sequence
 import numpy as np
 import pandas as pd
 from bed_reader import open_bed
+from threadpoolctl import threadpool_limits
 from tqdm import tqdm
 
 from .. import utils
@@ -901,7 +902,14 @@ def _orthonormalize_columns(X: np.ndarray, tol: float = 1e-10) -> np.ndarray:
         raise ValueError("X must be two-dimensional.")
     if X.shape[1] == 0:
         return np.empty((X.shape[0], 0), dtype=np.float64, order="F")
-    U, singular, _ = np.linalg.svd(np.asarray(X, dtype=np.float64), full_matrices=False)
+    # This is a tall-skinny fixed-effect problem (typically N x <30), not a
+    # throughput bottleneck.  Running its LAPACK reduction on one thread avoids
+    # exposing the analysis-defining basis to the rare wide threaded-BLAS
+    # corruption observed on tabla; large genotype GEMMs remain multithreaded.
+    with threadpool_limits(limits=1, user_api="blas"):
+        U, singular, _ = np.linalg.svd(
+            np.asarray(X, dtype=np.float64), full_matrices=False
+        )
     if singular.size == 0 or singular[0] <= 0.0:
         return np.empty((X.shape[0], 0), dtype=np.float64, order="F")
     rank_tol = max(float(tol), max(X.shape) * np.finfo(np.float64).eps * float(singular[0]))
