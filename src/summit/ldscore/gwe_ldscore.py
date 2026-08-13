@@ -2020,6 +2020,7 @@ class GenomewideEnvLDScore:
         }
         max_leak_x = 0.0
         max_leak_w = 0.0
+        repaired_additive_moment_columns = 0
         blocks = self._make_compute_blocks()
         for s, e in tqdm(
             blocks, desc="GxE native var", unit="block", disable=(not self.verbose)
@@ -2039,6 +2040,9 @@ class GenomewideEnvLDScore:
             max_leak_w = max(
                 max_leak_w,
                 float(result["max_projection_leakage_interaction"]),
+            )
+            repaired_additive_moment_columns += int(
+                result["repaired_additive_moment_columns"]
             )
 
         self.inv_sqrt_resvar_x_all = arrays["scale_x"]
@@ -2087,11 +2091,16 @@ class GenomewideEnvLDScore:
             "kernel_traces_interaction": trace_w.tolist(),
             "max_trace_error_additive": float(np.max(np.abs(trace_x - self.df_corr))),
             "max_trace_error_interaction": float(np.max(np.abs(trace_w - self.df_corr))),
+            "repaired_additive_moment_columns": int(
+                repaired_additive_moment_columns
+            ),
         }
         self.log._log(
             "[gxe:native:invariants] max fixed-effect leakage "
             f"X={max_leak_x:.3e}, W={max_leak_w:.3e}; "
-            f"max norm error X={max_norm_error_x:.3e}, W={max_norm_error_w:.3e}."
+            f"max norm error X={max_norm_error_x:.3e}, W={max_norm_error_w:.3e}; "
+            "verified/repaired additive moment columns="
+            f"{repaired_additive_moment_columns}."
         )
         return self.inv_sqrt_resvar_x_all, self.inv_sqrt_resvar_w_all
 
@@ -3697,7 +3706,7 @@ class GenomewideEnvLDScore:
         )
         native_feature_bytes = 8 * (
             self.nsamp * max_block
-            + 4 * q_rank * max_block
+            + 5 * q_rank * max_block
             + 11 * max_block
         )
         native_source_bytes = 8 * (

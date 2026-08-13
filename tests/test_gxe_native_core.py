@@ -167,6 +167,7 @@ def test_native_feature_source_target_match_dense_oracle(tmp_path):
         assert info["target_panel_columns"] == 7
         assert info["projected_target_full_width"] is True
         feature = _feature(context, m)
+        assert feature["repaired_additive_moment_columns"] >= 0
         for name in (
             "scale_x", "scale_w", "norm_x", "norm_w",
             "diag_nxe_x", "diag_nxe_w", "corr_xw",

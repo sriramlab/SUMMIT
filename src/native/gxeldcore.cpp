@@ -433,7 +433,7 @@ public:
         const int l = blk_end - blk_start;
         const int rank = n_ - q_;
         size_t elements = checked_mul(static_cast<size_t>(n_), static_cast<size_t>(l), "feature genotype");
-        elements = checked_add(elements, checked_mul(4U, checked_mul(static_cast<size_t>(q_), static_cast<size_t>(l), "feature moments"), "feature moments"), "feature workspace");
+        elements = checked_add(elements, checked_mul(5U, checked_mul(static_cast<size_t>(q_), static_cast<size_t>(l), "feature moments"), "feature moments"), "feature workspace");
         elements = checked_add(elements, checked_mul(11U, static_cast<size_t>(l), "feature vectors"), "feature workspace");
         ensure_workspace(elements, "feature block");
 
@@ -453,6 +453,7 @@ public:
         auto corr_xw_out = make_owned_numpy_vec1<double>(static_cast<size_t>(l), &corr_xw);
 
         int64_t missing = 0;
+        int64_t repaired_additive_moment_columns = 0;
         double max_leak_x = 0.0;
         double max_leak_w = 0.0;
         {
@@ -462,6 +463,10 @@ public:
             missing = decode_block(blk_start, blk_end, require_missing_free, geno, observed);
             std::vector<double> moments(
                 checked_mul(4U, checked_mul(static_cast<size_t>(q_), static_cast<size_t>(l), "feature moments"), "feature moments"),
+                0.0
+            );
+            std::vector<double> additive_moments_check(
+                checked_mul(static_cast<size_t>(q_), static_cast<size_t>(l), "feature moment verification"),
                 0.0
             );
             std::vector<double> scalar(4U * static_cast<size_t>(l), 0.0);
@@ -483,17 +488,76 @@ public:
                 }
                 s0[j] = a0; s1[j] = a1; s2[j] = a2; s4[j] = a4;
             }
-            for (int power = 0; power < 4; ++power) {
-                double* out = moments.data() + static_cast<size_t>(power) * static_cast<size_t>(q_) * static_cast<size_t>(l);
-                dgemm_tn(q_, l, n_, q_basis_.data(), n_, geno.data(), n_, out, q_);
-                if (power != 3) {
-                    for (int j = 0; j < l; ++j) {
-                        double* column = geno.data() + static_cast<size_t>(j) * static_cast<size_t>(n_);
-                        for (int i = 0; i < n_; ++i) column[i] *= env_[static_cast<size_t>(i)];
+            // The first BLAS call after an OpenMP BED decode has exhibited a
+            // rare, localized OpenBLAS corruption on large cohorts.  Repeat
+            // the additive moment product before mutating ``geno`` and verify
+            // it column by column.  Any disagreement is repaired by a direct
+            // long-double dot product, so feature metadata can never silently
+            // diverge from the later source/target passes.
+            double* u0_all = moments.data();
+            dgemm_tn(q_, l, n_, q_basis_.data(), n_, geno.data(), n_, u0_all, q_);
+            dgemm_tn(
+                q_, l, n_, q_basis_.data(), n_, geno.data(), n_,
+                additive_moments_check.data(), q_
+            );
+            for (int j = 0; j < l; ++j) {
+                bool disagrees = false;
+                for (int a = 0; a < q_; ++a) {
+                    const size_t index =
+                        static_cast<size_t>(j) * static_cast<size_t>(q_) +
+                        static_cast<size_t>(a);
+                    const double first = u0_all[index];
+                    const double second = additive_moments_check[index];
+                    const double tolerance = 1.0e-12 * std::max(
+                        1.0, std::max(std::abs(first), std::abs(second))
+                    );
+                    if (!std::isfinite(first) || !std::isfinite(second) ||
+                        std::abs(first - second) > tolerance) {
+                        disagrees = true;
+                        break;
                     }
                 }
+                if (disagrees) {
+                    ++repaired_additive_moment_columns;
+                    const double* genotype_column =
+                        geno.data() + static_cast<size_t>(j) * static_cast<size_t>(n_);
+                    for (int a = 0; a < q_; ++a) {
+                        const double* basis_column =
+                            q_basis_.data() + static_cast<size_t>(a) * static_cast<size_t>(n_);
+                        long double dot = 0.0L;
+                        for (int i = 0; i < n_; ++i) {
+                            dot += static_cast<long double>(basis_column[i]) *
+                                static_cast<long double>(genotype_column[i]);
+                        }
+                        u0_all[
+                            static_cast<size_t>(j) * static_cast<size_t>(q_) +
+                            static_cast<size_t>(a)
+                        ] = static_cast<double>(dot);
+                    }
+                } else {
+                    std::memcpy(
+                        u0_all + static_cast<size_t>(j) * static_cast<size_t>(q_),
+                        additive_moments_check.data() +
+                            static_cast<size_t>(j) * static_cast<size_t>(q_),
+                        checked_mul(
+                            static_cast<size_t>(q_), sizeof(double),
+                            "verified additive feature moment"
+                        )
+                    );
+                }
             }
-            const double* u0_all = moments.data();
+            for (int power = 1; power < 4; ++power) {
+                for (int j = 0; j < l; ++j) {
+                    double* column = geno.data() + static_cast<size_t>(j) * static_cast<size_t>(n_);
+                    for (int i = 0; i < n_; ++i) {
+                        column[i] *= env_[static_cast<size_t>(i)];
+                    }
+                }
+                double* out = moments.data() +
+                    static_cast<size_t>(power) * static_cast<size_t>(q_) *
+                    static_cast<size_t>(l);
+                dgemm_tn(q_, l, n_, q_basis_.data(), n_, geno.data(), n_, out, q_);
+            }
             const double* u1_all = u0_all + static_cast<size_t>(q_) * static_cast<size_t>(l);
             const double* u2_all = u1_all + static_cast<size_t>(q_) * static_cast<size_t>(l);
             const double* u3_all = u2_all + static_cast<size_t>(q_) * static_cast<size_t>(l);
@@ -570,6 +634,7 @@ public:
         result["corr_xw"] = corr_xw_out;
         result["max_projection_leakage_additive"] = max_leak_x;
         result["max_projection_leakage_interaction"] = max_leak_w;
+        result["repaired_additive_moment_columns"] = repaired_additive_moment_columns;
         result["missing_genotype_calls"] = missing;
         return result;
     }
