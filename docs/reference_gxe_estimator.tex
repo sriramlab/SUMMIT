@@ -88,11 +88,11 @@ For a continuous environment, SUMMIT first transforms the observed values in
 each retained cohort to
 \begin{equation}
  e_i=\frac{E_i-\bar E}{s_E},\qquad
- s_E^2=\frac{1}{N-d_E}\sum_i(E_i-\bar E)^2,qquad d_E\in\{0,1\}.
+ s_E^2=\frac{1}{N-d_E}\sum_i(E_i-\bar E)^2,\qquad d_E\in\{0,1\}.
  \label{eq:environmentscale}
 \end{equation}
-The default is $d_E=1$.  Thus the effect units are per environmental standard deviation.  The
-standardized $\be$ is then included in $\bC$ as a fixed main effect.  This
+The default is $d_E=1$, so the effect units are per environmental standard
+deviation.  The standardized $\be$ is then included in $\bC$ as a fixed main effect.  This
 transformation is performed separately in $R$ and $S$ because the reference
 and trait masks can differ; the manifest records the mean, standard deviation,
 degrees-of-freedom convention, and design digest.  Binary environments can be
