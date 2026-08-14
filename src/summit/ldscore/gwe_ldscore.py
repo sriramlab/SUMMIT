@@ -114,7 +114,7 @@ _NATIVE_PREFERRED_CALL_WORKSPACE_BYTES = 2 * 1024**3
 def _native_gemm_integrity_workspace_elements(
     build_info: Mapping | None, m: int, n: int, k: int
 ) -> int:
-    """Mirror the native checksum and smaller-operand snapshot allocation."""
+    """Mirror the native checksum and bounded operand-snapshot allocation."""
     if (
         build_info is None
         or min(int(m), int(n), int(k)) <= 0
@@ -125,7 +125,7 @@ def _native_gemm_integrity_workspace_elements(
     checks = _NATIVE_GEMM_INTEGRITY_CHECKS * (
         int(m) + 2 * int(k) + 2 * int(n)
     )
-    return checks + min(int(m) * int(k), int(k) * int(n))
+    return checks + int(m) * int(k) + int(k) * int(n)
 
 
 def _native_execution_workspace_bytes(native_workspace_gib: float) -> int:

@@ -49,7 +49,8 @@ each optimized GEMM single-threaded and uses OpenMP only across disjoint output
 tiles that it owns. Eight low-rank checks detect faulty output ranges, which
 are the only ranges recomputed with a deterministic cache-tiled kernel. Other
 BLAS vendors use the deterministic fallback directly. This avoids disk caches
-and duplicate full products.
+and duplicate full products. Bounded transient input snapshots prevent a faulty
+vendor call from modifying the authoritative decoded inputs used for repair.
 Set `SUMMIT_GXE_VERIFY_FEATURE_MOMENTS=always` only for strict duplicate-product
 stress testing. If MKL is available through `MKLROOT` or the active conda
 environment, CMake may use MKL instead.

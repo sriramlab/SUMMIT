@@ -268,7 +268,7 @@ size_t gemm_integrity_workspace_elements(int m, int n, int k) {
         "protected GEMM operand B"
     );
     return checked_add(
-        checks, std::min(operand_a, operand_b),
+        checks, checked_add(operand_a, operand_b, "protected GEMM operands"),
         "protected GEMM workspace"
     );
 }
@@ -436,37 +436,25 @@ int64_t dgemm_tn_checked(int m, int n, int k,
         static_cast<size_t>(k), static_cast<size_t>(n),
         "protected TN operand B"
     );
-    std::unique_ptr<double[]> protected_operand(
-        new double[std::min(operand_a, operand_b)]
+    std::unique_ptr<double[]> protected_a(new double[operand_a]);
+    std::unique_ptr<double[]> protected_b(new double[operand_b]);
+    copy_col_major_matrix(
+        k, m, a, lda, protected_a.get(), k, requested_threads
     );
-    const double* vendor_a = a;
-    const double* vendor_b = b;
-    int vendor_lda = lda;
-    int vendor_ldb = ldb;
-    if (operand_a <= operand_b) {
-        copy_col_major_matrix(
-            k, m, a, lda, protected_operand.get(), k, requested_threads
-        );
-        vendor_a = protected_operand.get();
-        vendor_lda = k;
-    } else {
-        copy_col_major_matrix(
-            k, n, b, ldb, protected_operand.get(), k, requested_threads
-        );
-        vendor_b = protected_operand.get();
-        vendor_ldb = k;
-    }
-    // Expected fingerprints are complete before vendor BLAS starts, and only
-    // the smaller input is snapshotted.  Multi-GiB decoded genotype blocks are
-    // therefore never duplicated.
+    copy_col_major_matrix(
+        k, n, b, ldb, protected_b.get(), k, requested_threads
+    );
+    // The affected vendor library can mutate a shared input during concurrent
+    // single-thread calls.  Both bounded call operands are therefore transient
+    // snapshots; the original inputs remain authoritative for sparse repair.
 #ifdef GWLDCORE_USE_OPENBLAS
     dgemm_tn_openblas_partitioned(
-        m, n, k, vendor_a, vendor_lda, vendor_b, vendor_ldb, c, ldc,
+        m, n, k, protected_a.get(), k, protected_b.get(), k, c, ldc,
         requested_threads
     );
 #else
     dgemm_tn(
-        m, n, k, vendor_a, vendor_lda, vendor_b, vendor_ldb, c, ldc
+        m, n, k, protected_a.get(), k, protected_b.get(), k, c, ldc
     );
 #endif
     dgemm_tn_tiled(
@@ -486,35 +474,6 @@ int64_t dgemm_tn_checked(int m, int n, int k,
         }
         return false;
     };
-    bool any_disagreement = false;
-    for (int column = 0; column < n; ++column) {
-        any_disagreement = any_disagreement || column_disagrees(column);
-    }
-    if (any_disagreement) {
-        // A repair is valid only if both inputs still reproduce their exact
-        // pre-call fingerprints.  These deterministic recalculations run only
-        // on the rare fault path; a mismatch fails closed instead of repairing
-        // from a potentially altered input.
-        std::vector<double> projected_after(projected.size());
-        dgemm_nn_tiled(
-            k, kGemmIntegrityChecks, m,
-            a, lda, coefficients.data(), m,
-            projected_after.data(), k, requested_threads
-        );
-        dgemm_tn_tiled(
-            kGemmIntegrityChecks, n, k,
-            projected_after.data(), k, b, ldb,
-            observed.data(), kGemmIntegrityChecks, requested_threads
-        );
-        if (std::memcmp(projected.data(), projected_after.data(),
-                        projected.size() * sizeof(double)) != 0 ||
-            std::memcmp(expected.data(), observed.data(),
-                        expected.size() * sizeof(double)) != 0) {
-            throw std::runtime_error(
-                "Vendor BLAS altered a protected TN GEMM input; refusing repair"
-            );
-        }
-    }
     // Threaded BLAS partition failures usually damage a contiguous output range.
     // Recompute each such range as one cache-tiled product; launching a full
     // reduction independently for every flagged column rereads A needlessly.
@@ -593,34 +552,22 @@ int64_t dgemm_nn_checked(int m, int n, int k,
         static_cast<size_t>(k), static_cast<size_t>(n),
         "protected NN operand B"
     );
-    std::unique_ptr<double[]> protected_operand(
-        new double[std::min(operand_a, operand_b)]
+    std::unique_ptr<double[]> protected_a(new double[operand_a]);
+    std::unique_ptr<double[]> protected_b(new double[operand_b]);
+    copy_col_major_matrix(
+        m, k, a, lda, protected_a.get(), m, requested_threads
     );
-    const double* vendor_a = a;
-    const double* vendor_b = b;
-    int vendor_lda = lda;
-    int vendor_ldb = ldb;
-    if (operand_a <= operand_b) {
-        copy_col_major_matrix(
-            m, k, a, lda, protected_operand.get(), m, requested_threads
-        );
-        vendor_a = protected_operand.get();
-        vendor_lda = m;
-    } else {
-        copy_col_major_matrix(
-            k, n, b, ldb, protected_operand.get(), k, requested_threads
-        );
-        vendor_b = protected_operand.get();
-        vendor_ldb = k;
-    }
+    copy_col_major_matrix(
+        k, n, b, ldb, protected_b.get(), k, requested_threads
+    );
 #ifdef GWLDCORE_USE_OPENBLAS
     dgemm_nn_openblas_partitioned(
-        m, n, k, vendor_a, vendor_lda, vendor_b, vendor_ldb, c, ldc,
+        m, n, k, protected_a.get(), m, protected_b.get(), k, c, ldc,
         requested_threads
     );
 #else
     dgemm_nn(
-        m, n, k, vendor_a, vendor_lda, vendor_b, vendor_ldb, c, ldc
+        m, n, k, protected_a.get(), m, protected_b.get(), k, c, ldc
     );
 #endif
     dgemm_tn_tiled(
@@ -640,31 +587,6 @@ int64_t dgemm_nn_checked(int m, int n, int k,
         }
         return false;
     };
-    bool any_disagreement = false;
-    for (int column = 0; column < n; ++column) {
-        any_disagreement = any_disagreement || column_disagrees(column);
-    }
-    if (any_disagreement) {
-        std::vector<double> projected_after(projected.size());
-        dgemm_tn_tiled(
-            k, kGemmIntegrityChecks, m,
-            a, lda, coefficients.data(), m,
-            projected_after.data(), k, requested_threads
-        );
-        dgemm_tn_tiled(
-            kGemmIntegrityChecks, n, k,
-            projected_after.data(), k, b, ldb,
-            observed.data(), kGemmIntegrityChecks, requested_threads
-        );
-        if (std::memcmp(projected.data(), projected_after.data(),
-                        projected.size() * sizeof(double)) != 0 ||
-            std::memcmp(expected.data(), observed.data(),
-                        expected.size() * sizeof(double)) != 0) {
-            throw std::runtime_error(
-                "Vendor BLAS altered a protected NN GEMM input; refusing repair"
-            );
-        }
-    }
     int64_t repaired = 0;
     for (int column = 0; column < n;) {
         if (!column_disagrees(column)) {
