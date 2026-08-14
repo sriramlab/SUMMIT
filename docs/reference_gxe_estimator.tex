@@ -474,12 +474,16 @@ A direct $B/32$ extrapolation is too pessimistic because the $B=32$ products
 are skinny.  In a dense-oracle benchmark with $N=100{,}000$ and $M=1{,}000$,
 increasing $B$ from 32 to 512 increased native source time from 0.319 to 1.267
 seconds (3.97-fold) and the relevant 2$B$ target time from 0.458 to 2.396
-seconds (5.23-fold), rather than 16-fold.  An affine fit to the measured
-$B=32,128,512$ phase timings, scaled by the sealed full-cohort $B=32$ phases,
-gives a point estimate near 2.2 hours at $B=1024$.  A conservative current
+seconds (5.23-fold), rather than 16-fold.  A subsequent direct $B=1024$ run
+measured 2.026 seconds for the source product, 4.485 seconds for the 2$B$
+target, and 8.453 seconds for the 4$B$ target.  Its maximum target error against
+the independent dense float64 oracle was $2.538\times10^{-7}$, with no repaired
+columns.  Scaling the sealed full-cohort $B=32$ phases by these measured
+$B=1024/B=32$ ratios gives approximately 2.1 hours.  A conservative current
 planning range is 2.2--2.8 hours to allow for repair and system-load variation.
-This remains an extrapolation, not a completed $B=1024$ production timing, and
-should be replaced by a measured value before a large production campaign.
+The $B=1024$ component times are measured, but the full 454,207-variant time is
+still a scaling estimate and should be replaced by an end-to-end measurement
+before a large production campaign.
 
 Probe tiling and block-width adaptation bound memory.  For one annotation, the
 float32 $[XZ,WZ]$ source sketch costs $8N_RB$ bytes.  The native opaque
