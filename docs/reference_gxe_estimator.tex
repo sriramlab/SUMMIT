@@ -542,6 +542,18 @@ operand.  The ABFT path checks wide GEMMs, repairs only discrepant output
 columns with a non-vendor cache-tiled kernel, and falls back to a deterministic
 fresh decode only if the reconstructable genotype input changes.
 
+A controlled microkernel experiment held the OpenBLAS 0.3.34 library, input,
+thread count, and 20-call stress sequence fixed, but forced dynamic dispatch
+from Zen to Haswell.  Repaired columns fell from 257 to 1 (99.6\%), while
+source, 2$B$ target, and 4$B$ target time increased by 29\%, 18\%, and 6\%,
+respectively.  This strongly localizes the residual failure to the Zen dispatch
+or microkernel path rather than genotype decoding, probe values, or float32
+storage.  Haswell is not yet safe enough to remove integrity checks, and the
+sealed full-cohort Zen run required only three repairs, so the faster Zen path
+with selective ABFT remains the production default.  A truly non-threaded
+OpenBLAS build or an independent BLAS implementation is the next clean test of
+the remaining vendor-runtime hypothesis.
+
 \section{Practical contract}
 
 The implemented external path is explicit.  A reference generated with at
