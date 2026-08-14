@@ -106,7 +106,7 @@ def _ndarray_sha256(value: np.ndarray) -> str:
 
 
 _BACKEND_PROVENANCE_SCHEMA_VERSION = 3
-_NATIVE_PREFERRED_CALL_WORKSPACE_BYTES = 2 * 1024**3
+_NATIVE_PREFERRED_CALL_WORKSPACE_BYTES = 3 * 512 * 1024**2
 
 
 def _native_gemm_integrity_workspace_elements(
@@ -213,6 +213,10 @@ def _native_strict_feature_moment_verification_policy(
     if override == "always":
         return True, "forced by SUMMIT_GXE_VERIFY_FEATURE_MOMENTS=always"
 
+    if str(build_info.get("blas_vendor", "")).strip().lower() == "openblas":
+        return False, (
+            "SUMMIT-partitioned single-thread OpenBLAS GEMMs with disjoint outputs"
+        )
     return False, (
         "deterministic disjoint-output tiled GEMMs independent of "
         f"{build_info.get('blas_vendor')}"
@@ -2259,7 +2263,13 @@ class GenomewideEnvLDScore:
             "feature_moment_integrity_mode": (
                 "strict_duplicate"
                 if self.native_strict_feature_moment_verification
-                else "deterministic_disjoint_output_tiled_gemm"
+                else (
+                    "openmp_partitioned_single_thread_openblas"
+                    if str(
+                        (self._native_build_info or {}).get("blas_vendor", "")
+                    ).strip().lower() == "openblas"
+                    else "deterministic_disjoint_output_tiled_gemm"
+                )
             ),
             "feature_moment_integrity_reason": (
                 self.native_feature_moment_integrity_reason

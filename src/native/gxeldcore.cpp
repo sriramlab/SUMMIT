@@ -30,6 +30,7 @@
 
 #ifdef GWLDCORE_USE_OPENBLAS
 extern "C" char* openblas_get_config(void);
+extern "C" void openblas_set_num_threads(int);
 #endif
 
 namespace {
@@ -58,6 +59,13 @@ namespace {
 
 constexpr double kOrthonormalTolerance = 1.0e-10;
 constexpr double kStandardizedEnvTolerance = 1.0e-8;
+#ifdef GWLDCORE_USE_OPENBLAS
+constexpr const char* kNativeGemmIntegrityMode =
+    "openmp_partitioned_single_thread_openblas";
+#else
+constexpr const char* kNativeGemmIntegrityMode =
+    "deterministic_disjoint_output_tiled_gemm";
+#endif
 
 size_t checked_add(size_t a, size_t b, const char* label) {
     if (b > std::numeric_limits<size_t>::max() - a) {
@@ -645,9 +653,33 @@ int64_t dgemm_tn_partitioned_columns(int m, int n, int k,
                                      double* c, int ldc,
                                      int requested_threads) {
 #if defined(GWLDCORE_GEMM_INTEGRITY)
+#ifdef GWLDCORE_USE_OPENBLAS
+    // OpenBLAS 0.3.30's internal threaded GEMM has corrupted large products on
+    // the production host. Keep each vendor call single-threaded and expose
+    // parallelism only across SUMMIT-owned, disjoint output-column ranges.
+    openblas_set_num_threads(1);
+    const int threads = std::max(1, std::min(requested_threads, n));
+#ifdef _OPENMP
+    #pragma omp parallel for schedule(static) num_threads(threads)
+#endif
+    for (int worker = 0; worker < threads; ++worker) {
+        const int first = static_cast<int>(
+            static_cast<int64_t>(n) * worker / threads
+        );
+        const int stop = static_cast<int>(
+            static_cast<int64_t>(n) * (worker + 1) / threads
+        );
+        dgemm_tn(
+            m, stop - first, k, a, lda,
+            b + static_cast<size_t>(first) * static_cast<size_t>(ldb), ldb,
+            c + static_cast<size_t>(first) * static_cast<size_t>(ldc), ldc
+        );
+    }
+#else
     dgemm_tn_tiled(
         m, n, k, a, lda, b, ldb, c, ldc, requested_threads
     );
+#endif
     return 0;
 #else
     (void) requested_threads;
@@ -663,10 +695,30 @@ int64_t dgemm_nn_partitioned_rows(int m, int n, int k,
                                   int requested_threads,
                                   double alpha = 1.0, double beta = 0.0) {
 #if defined(GWLDCORE_GEMM_INTEGRITY)
+#ifdef GWLDCORE_USE_OPENBLAS
+    openblas_set_num_threads(1);
+    const int threads = std::max(1, std::min(requested_threads, m));
+#ifdef _OPENMP
+    #pragma omp parallel for schedule(static) num_threads(threads)
+#endif
+    for (int worker = 0; worker < threads; ++worker) {
+        const int first = static_cast<int>(
+            static_cast<int64_t>(m) * worker / threads
+        );
+        const int stop = static_cast<int>(
+            static_cast<int64_t>(m) * (worker + 1) / threads
+        );
+        dgemm_nn(
+            stop - first, n, k, a + first, lda, b, ldb,
+            c + first, ldc, alpha, beta
+        );
+    }
+#else
     dgemm_nn_tiled(
         m, n, k, a, lda, b, ldb, c, ldc,
         requested_threads, alpha, beta
     );
+#endif
     return 0;
 #else
     (void) requested_threads;
@@ -682,10 +734,31 @@ int64_t dgemm_tn_partitioned_rows(int m, int n, int k,
                                   int requested_threads,
                                   double alpha = 1.0, double beta = 0.0) {
 #if defined(GWLDCORE_GEMM_INTEGRITY)
+#ifdef GWLDCORE_USE_OPENBLAS
+    openblas_set_num_threads(1);
+    const int threads = std::max(1, std::min(requested_threads, m));
+#ifdef _OPENMP
+    #pragma omp parallel for schedule(static) num_threads(threads)
+#endif
+    for (int worker = 0; worker < threads; ++worker) {
+        const int first = static_cast<int>(
+            static_cast<int64_t>(m) * worker / threads
+        );
+        const int stop = static_cast<int>(
+            static_cast<int64_t>(m) * (worker + 1) / threads
+        );
+        dgemm_tn(
+            stop - first, n, k,
+            a + static_cast<size_t>(first) * static_cast<size_t>(lda), lda,
+            b, ldb, c + first, ldc, alpha, beta
+        );
+    }
+#else
     dgemm_tn_tiled(
         m, n, k, a, lda, b, ldb, c, ldc,
         requested_threads, alpha, beta
     );
+#endif
     return 0;
 #else
     (void) requested_threads;
@@ -1021,7 +1094,7 @@ public:
         result["strict_feature_moment_verification"] = strict_feature_moment_verification_;
         result["feature_moment_integrity_mode"] = strict_feature_moment_verification_
             ? "strict_duplicate"
-            : "deterministic_disjoint_output_tiled_gemm";
+            : kNativeGemmIntegrityMode;
         result["repaired_gemm_output_columns"] =
             repaired_gemm_output_columns_.load(std::memory_order_relaxed);
         result["environment_mean"] = environment_mean_;
@@ -1258,7 +1331,7 @@ public:
         result["strict_feature_moment_verification"] = strict_feature_moment_verification_;
         result["feature_moment_integrity_mode"] = strict_feature_moment_verification_
             ? "strict_duplicate"
-            : "deterministic_disjoint_output_tiled_gemm";
+            : kNativeGemmIntegrityMode;
         result["missing_genotype_calls"] = missing;
         return result;
     }

@@ -44,9 +44,10 @@ refactored h2/rg path; use per-SNP LD scores.
 
 The supplied environment uses OpenBLAS 0.3.31 or newer from conda-forge; 0.3.30
 contained a parallel-GEMM race. SUMMIT does not rely on the BLAS vendor or
-version for the large GxE products: its OpenMP cache-tiled kernels assign
-disjoint output tiles and use a deterministic reduction order within each
-entry. This avoids disk caches, duplicate products, and integrity copies.
+version for internally threaded large GxE products. With OpenBLAS, SUMMIT keeps
+each optimized GEMM single-threaded and uses OpenMP only across disjoint output
+tiles that it owns. Other BLAS vendors use SUMMIT's deterministic cache-tiled
+fallback. This avoids disk caches, duplicate products, and integrity copies.
 Set `SUMMIT_GXE_VERIFY_FEATURE_MOMENTS=always` only for strict duplicate-product
 stress testing. If MKL is available through `MKLROOT` or the active conda
 environment, CMake may use MKL instead.
