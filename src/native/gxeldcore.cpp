@@ -228,7 +228,12 @@ void dgemm_nn_tiled(int m, int n, int k,
 }
 
 constexpr int kGemmIntegrityChecks = 8;
-constexpr double kGemmIntegrityTolerance = 2.0e-11;
+// The factored checksum and direct repaired dot product use different
+// accumulation orders over hundreds of thousands of terms.  Their ordinary
+// floating-point separation can reach O(1e-10) relative scale, whereas the
+// observed tabla faults are O(1e-4) or larger. Eight independent checks at
+// this tolerance retain a wide detection margin without rejecting a repair.
+constexpr double kGemmIntegrityTolerance = 1.0e-9;
 constexpr int64_t kCheckedGemmMinimumFlops = 1000000000LL;
 
 bool gemm_requires_integrity_checks(int m, int n, int k) {
