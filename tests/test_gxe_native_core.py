@@ -215,7 +215,12 @@ def test_native_integrity_workspace_is_vendor_independent():
         {"blas_vendor": "Intel10_64_dyn"}, *dimensions
     )
     assert openblas == mkl
-    assert openblas == 0
+    assert openblas == 8 * (
+        dimensions[0] + 2 * dimensions[2] + 2 * dimensions[1]
+    ) + min(
+        dimensions[0] * dimensions[2],
+        dimensions[2] * dimensions[1],
+    )
     assert _native_gemm_integrity_workspace_elements(None, *dimensions) == 0
 
 
@@ -283,7 +288,7 @@ def test_native_feature_source_target_match_dense_oracle(
         assert info["feature_moment_integrity_mode"] == (
             "strict_duplicate"
             if strict_feature_moment_verification
-            else "openmp_partitioned_single_thread_openblas"
+            else "openmp_partitioned_single_thread_openblas_eight_check_abft"
         )
         assert info["repaired_gemm_output_columns"] >= 0
         feature = _feature(context, m)

@@ -106,15 +106,26 @@ def _ndarray_sha256(value: np.ndarray) -> str:
 
 
 _BACKEND_PROVENANCE_SCHEMA_VERSION = 3
-_NATIVE_PREFERRED_CALL_WORKSPACE_BYTES = 3 * 512 * 1024**2
+_NATIVE_GEMM_INTEGRITY_CHECKS = 8
+_NATIVE_GEMM_CHECK_MINIMUM_FLOPS = 1_000_000_000
+_NATIVE_PREFERRED_CALL_WORKSPACE_BYTES = 2 * 1024**3
 
 
 def _native_gemm_integrity_workspace_elements(
     build_info: Mapping | None, m: int, n: int, k: int
 ) -> int:
-    """The disjoint-output tiled kernels require no integrity scratch."""
-    del build_info, m, n, k
-    return 0
+    """Mirror the native checksum and smaller-operand snapshot allocation."""
+    if (
+        build_info is None
+        or min(int(m), int(n), int(k)) <= 0
+        or 2 * int(m) * int(n) * int(k)
+        < _NATIVE_GEMM_CHECK_MINIMUM_FLOPS
+    ):
+        return 0
+    checks = _NATIVE_GEMM_INTEGRITY_CHECKS * (
+        int(m) + 2 * int(k) + 2 * int(n)
+    )
+    return checks + min(int(m) * int(k), int(k) * int(n))
 
 
 def _native_execution_workspace_bytes(native_workspace_gib: float) -> int:
@@ -215,7 +226,7 @@ def _native_strict_feature_moment_verification_policy(
 
     if str(build_info.get("blas_vendor", "")).strip().lower() == "openblas":
         return False, (
-            "SUMMIT-partitioned single-thread OpenBLAS GEMMs with disjoint outputs"
+            "eight-check ABFT over SUMMIT-partitioned single-thread OpenBLAS GEMMs"
         )
     return False, (
         "deterministic disjoint-output tiled GEMMs independent of "
@@ -2264,7 +2275,7 @@ class GenomewideEnvLDScore:
                 "strict_duplicate"
                 if self.native_strict_feature_moment_verification
                 else (
-                    "openmp_partitioned_single_thread_openblas"
+                    "openmp_partitioned_single_thread_openblas_eight_check_abft"
                     if str(
                         (self._native_build_info or {}).get("blas_vendor", "")
                     ).strip().lower() == "openblas"

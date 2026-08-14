@@ -46,8 +46,10 @@ The supplied environment uses OpenBLAS 0.3.31 or newer from conda-forge; 0.3.30
 contained a parallel-GEMM race. SUMMIT does not rely on the BLAS vendor or
 version for internally threaded large GxE products. With OpenBLAS, SUMMIT keeps
 each optimized GEMM single-threaded and uses OpenMP only across disjoint output
-tiles that it owns. Other BLAS vendors use SUMMIT's deterministic cache-tiled
-fallback. This avoids disk caches, duplicate products, and integrity copies.
+tiles that it owns. Eight low-rank checks detect faulty output ranges, which
+are the only ranges recomputed with a deterministic cache-tiled kernel. Other
+BLAS vendors use the deterministic fallback directly. This avoids disk caches
+and duplicate full products.
 Set `SUMMIT_GXE_VERIFY_FEATURE_MOMENTS=always` only for strict duplicate-product
 stress testing. If MKL is available through `MKLROOT` or the active conda
 environment, CMake may use MKL instead.
