@@ -109,6 +109,7 @@ _BACKEND_PROVENANCE_SCHEMA_VERSION = 3
 _NATIVE_GEMM_INTEGRITY_CHECKS = 8
 _NATIVE_GEMM_CHECK_MINIMUM_FLOPS = 1_000_000_000
 _NATIVE_PREFERRED_CALL_WORKSPACE_BYTES = 3 * 1024**3
+_NATIVE_PREFERRED_FEATURE_WORKSPACE_BYTES = 3 * 512 * 1024**2
 
 
 def _native_gemm_integrity_workspace_elements(
@@ -1962,8 +1963,9 @@ class GenomewideEnvLDScore:
         moment_copies = 8 if self.native_strict_feature_moment_verification else 4
         q_rank = self.p_eff + 1
         elements_per_variant = self.nsamp + moment_copies * q_rank + 11
-        workspace_elements = _native_execution_workspace_bytes(
-            self.native_workspace_gib
+        workspace_elements = min(
+            _native_execution_workspace_bytes(self.native_workspace_gib),
+            _NATIVE_PREFERRED_FEATURE_WORKSPACE_BYTES,
         ) // 8
         # ``step_size`` defines the reproducible probe blocks, not the native
         # GEMM width.  Use the full configured workspace for the latter: the
