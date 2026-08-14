@@ -166,6 +166,7 @@ def test_native_feature_moment_verification_defaults_to_partitioned_gemm(monkeyp
     )
     assert enabled is False
     assert "deterministic tiled feature GEMMs" in reason
+    assert "partitioned single-thread OpenBLAS" in reason
 
     enabled, reason = _native_strict_feature_moment_verification_policy(
         {

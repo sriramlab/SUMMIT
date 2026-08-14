@@ -1499,7 +1499,10 @@ public:
                 );
                 geno = std::move(fresh_geno);
                 observed = std::move(fresh_observed);
-                record_gemm_repairs(compute_source());
+                dgemm_nn_tiled(
+                    n_, fused_columns, l, geno.get(), n_,
+                    weighted.data(), l, fused_source, n_, decode_threads_
+                );
             }
 #ifdef _OPENMP
             #pragma omp parallel for schedule(static) num_threads(decode_threads_)
@@ -1740,7 +1743,10 @@ public:
                         );
                         geno = std::move(fresh_geno);
                         observed = std::move(fresh_observed);
-                        record_gemm_repairs(compute_target(right, output));
+                        dgemm_tn_tiled(
+                            l, count, n_, geno.get(), n_, right, n_,
+                            output, l, decode_threads_
+                        );
                     }
                 };
                 run_with_fresh_decode(
@@ -1994,7 +2000,11 @@ private:
                     );
                     geno = std::move(fresh_geno);
                     observed = std::move(fresh_observed);
-                    record_gemm_repairs(compute_target());
+                    dgemm_tn_tiled(
+                        l, fused_columns, n_, geno.get(), n_,
+                        panel.data_.get(), n_, fused_work.get(), l,
+                        decode_threads_
+                    );
                 }
                 std::memcpy(
                     work_x + output_offset * static_cast<size_t>(l),

@@ -231,7 +231,7 @@ def _native_strict_feature_moment_verification_policy(
     if str(build_info.get("blas_vendor", "")).strip().lower() == "openblas":
         return False, (
             "deterministic tiled feature GEMMs; eight-check ABFT over "
-            "partitioned single-thread OpenBLAS trace GEMMs"
+            "partitioned single-thread OpenBLAS trace GEMMs with fresh-decode fallback"
         )
     return False, (
         "deterministic disjoint-output tiled GEMMs independent of "
