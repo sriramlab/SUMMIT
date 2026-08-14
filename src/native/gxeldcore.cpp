@@ -644,8 +644,19 @@ int64_t dgemm_nn_partitioned_rows(int m, int n, int k,
                                   double alpha = 1.0, double beta = 0.0) {
 #if defined(GWLDCORE_GEMM_INTEGRITY)
 #ifdef GWLDCORE_USE_OPENBLAS
-    if (alpha == 1.0 && beta == 0.0 &&
-        gemm_requires_integrity_checks(m, n, k)) {
+    if (alpha != 1.0 || beta != 0.0) {
+        // Integrity verification below is formulated for an overwrite
+        // product.  Projection updates use C <- C - Q(Q^T C); routing that
+        // case through unchecked vendor BLAS defeats the protection and can
+        // corrupt an otherwise valid projected panel.  The reduction rank is
+        // only the fixed-effect rank, so the deterministic update is cheap.
+        dgemm_nn_tiled(
+            m, n, k, a, lda, b, ldb, c, ldc,
+            requested_threads, alpha, beta
+        );
+        return 0;
+    }
+    if (gemm_requires_integrity_checks(m, n, k)) {
         return dgemm_nn_checked(
             m, n, k, a, lda, b, ldb, c, ldc, requested_threads
         );
@@ -676,8 +687,14 @@ int64_t dgemm_tn_partitioned_rows(int m, int n, int k,
                                   double alpha = 1.0, double beta = 0.0) {
 #if defined(GWLDCORE_GEMM_INTEGRITY)
 #ifdef GWLDCORE_USE_OPENBLAS
-    if (alpha == 1.0 && beta == 0.0 &&
-        gemm_requires_integrity_checks(m, n, k)) {
+    if (alpha != 1.0 || beta != 0.0) {
+        dgemm_tn_tiled(
+            m, n, k, a, lda, b, ldb, c, ldc,
+            requested_threads, alpha, beta
+        );
+        return 0;
+    }
+    if (gemm_requires_integrity_checks(m, n, k)) {
         return dgemm_tn_checked(
             m, n, k, a, lda, b, ldb, c, ldc, requested_threads
         );
