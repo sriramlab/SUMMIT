@@ -257,18 +257,11 @@ size_t gemm_integrity_workspace_elements(int m, int n, int k) {
         static_cast<size_t>(kGemmIntegrityChecks), dimensions,
         "GEMM integrity workspace"
     );
-    const size_t operand_a = checked_mul(
-        static_cast<size_t>(m), static_cast<size_t>(k),
-        "protected GEMM operand A"
-    );
     const size_t operand_b = checked_mul(
         static_cast<size_t>(k), static_cast<size_t>(n),
         "protected GEMM operand B"
     );
-    return checked_add(
-        checks, checked_add(operand_a, operand_b, "protected GEMM operands"),
-        "protected GEMM workspace"
-    );
+    return checked_add(checks, operand_b, "protected GEMM workspace");
 }
 
 uint64_t splitmix64(uint64_t value) {
@@ -315,6 +308,62 @@ bool gemm_integrity_disagrees(double expected, double observed) {
     );
     return !std::isfinite(expected) || !std::isfinite(observed)
         || std::abs(expected - observed) > tolerance;
+}
+
+struct MatrixFingerprint {
+    uint64_t xor_hash = 0;
+    uint64_t sum_hash = 0;
+
+    bool operator==(const MatrixFingerprint& other) const noexcept {
+        return xor_hash == other.xor_hash && sum_hash == other.sum_hash;
+    }
+};
+
+class RetryableGemmInputMutation : public std::runtime_error {
+public:
+    RetryableGemmInputMutation()
+        : std::runtime_error(
+            "Vendor BLAS altered a reconstructable GxE GEMM input"
+        ) {}
+};
+
+MatrixFingerprint fingerprint_col_major_matrix(
+    int rows, int columns, const double* matrix, int leading_dimension,
+    int requested_threads
+) {
+    uint64_t xor_hash = 0;
+    uint64_t sum_hash = 0;
+    const int threads = std::max(1, std::min(requested_threads, columns));
+#ifdef _OPENMP
+    #pragma omp parallel for schedule(static) num_threads(threads) \
+        reduction(^:xor_hash) reduction(+:sum_hash)
+#endif
+    for (int column = 0; column < columns; ++column) {
+        const double* values = matrix +
+            static_cast<size_t>(column) *
+                static_cast<size_t>(leading_dimension);
+        for (int row = 0; row < rows; ++row) {
+            uint64_t bits = 0;
+            static_assert(sizeof(bits) == sizeof(values[row]));
+            std::memcpy(&bits, values + row, sizeof(bits));
+            const uint64_t index =
+                static_cast<uint64_t>(column) *
+                    static_cast<uint64_t>(rows)
+                + static_cast<uint64_t>(row);
+            const uint64_t keyed = bits ^ (
+                (index + 0x6a09e667f3bcc909ULL)
+                * 0x9e3779b97f4a7c15ULL
+            );
+            const uint64_t mixed = keyed * 0xbf58476d1ce4e5b9ULL;
+            const unsigned int shift = static_cast<unsigned int>(index & 63U);
+            const uint64_t rotated = shift == 0U
+                ? mixed
+                : (mixed << shift) | (mixed >> (64U - shift));
+            xor_hash ^= rotated;
+            sum_hash += (keyed ^ rotated) * 0x94d049bb133111ebULL;
+        }
+    }
+    return MatrixFingerprint{xor_hash, sum_hash};
 }
 
 void copy_col_major_matrix(int rows, int columns,
@@ -426,35 +475,34 @@ int64_t dgemm_tn_checked(int m, int n, int k,
         projected.data(), k, b, ldb,
         expected.data(), kGemmIntegrityChecks, requested_threads
     );
-    const size_t operand_a = checked_mul(
-        static_cast<size_t>(k), static_cast<size_t>(m),
-        "protected TN operand A"
-    );
     const size_t operand_b = checked_mul(
         static_cast<size_t>(k), static_cast<size_t>(n),
         "protected TN operand B"
     );
-    std::unique_ptr<double[]> protected_a(new double[operand_a]);
     std::unique_ptr<double[]> protected_b(new double[operand_b]);
-    copy_col_major_matrix(
-        k, m, a, lda, protected_a.get(), k, requested_threads
-    );
     copy_col_major_matrix(
         k, n, b, ldb, protected_b.get(), k, requested_threads
     );
-    // The affected vendor library can mutate a shared input during concurrent
-    // single-thread calls.  Both bounded call operands are therefore transient
-    // snapshots; the original inputs remain authoritative for sparse repair.
+    const MatrixFingerprint a_before = fingerprint_col_major_matrix(
+        k, m, a, lda, requested_threads
+    );
+    // The non-reconstructable right operand is snapshotted. The decoded left
+    // operand is protected by a bitwise 128-bit fingerprint; its caller can
+    // discard and re-decode the block on the rare affected-host mutation.
 #ifdef GWLDCORE_USE_OPENBLAS
     dgemm_tn_openblas_partitioned(
-        m, n, k, protected_a.get(), k, protected_b.get(), k, c, ldc,
+        m, n, k, a, lda, protected_b.get(), k, c, ldc,
         requested_threads
     );
 #else
     dgemm_tn(
-        m, n, k, protected_a.get(), k, protected_b.get(), k, c, ldc
+        m, n, k, a, lda, protected_b.get(), k, c, ldc
     );
 #endif
+    if (!(a_before == fingerprint_col_major_matrix(
+              k, m, a, lda, requested_threads))) {
+        throw RetryableGemmInputMutation();
+    }
     dgemm_tn_tiled(
         kGemmIntegrityChecks, n, m,
         coefficients.data(), m, c, ldc,
@@ -532,32 +580,31 @@ int64_t dgemm_nn_checked(int m, int n, int k,
         projected.data(), k, b, ldb,
         expected.data(), kGemmIntegrityChecks, requested_threads
     );
-    const size_t operand_a = checked_mul(
-        static_cast<size_t>(m), static_cast<size_t>(k),
-        "protected NN operand A"
-    );
     const size_t operand_b = checked_mul(
         static_cast<size_t>(k), static_cast<size_t>(n),
         "protected NN operand B"
     );
-    std::unique_ptr<double[]> protected_a(new double[operand_a]);
     std::unique_ptr<double[]> protected_b(new double[operand_b]);
-    copy_col_major_matrix(
-        m, k, a, lda, protected_a.get(), m, requested_threads
-    );
     copy_col_major_matrix(
         k, n, b, ldb, protected_b.get(), k, requested_threads
     );
+    const MatrixFingerprint a_before = fingerprint_col_major_matrix(
+        m, k, a, lda, requested_threads
+    );
 #ifdef GWLDCORE_USE_OPENBLAS
     dgemm_nn_openblas_partitioned(
-        m, n, k, protected_a.get(), m, protected_b.get(), k, c, ldc,
+        m, n, k, a, lda, protected_b.get(), k, c, ldc,
         requested_threads
     );
 #else
     dgemm_nn(
-        m, n, k, protected_a.get(), m, protected_b.get(), k, c, ldc
+        m, n, k, a, lda, protected_b.get(), k, c, ldc
     );
 #endif
+    if (!(a_before == fingerprint_col_major_matrix(
+              m, k, a, lda, requested_threads))) {
+        throw RetryableGemmInputMutation();
+    }
     dgemm_tn_tiled(
         kGemmIntegrityChecks, n, m,
         coefficients.data(), m, c, ldc,
@@ -615,6 +662,15 @@ int64_t dgemm_tn_partitioned_columns(int m, int n, int k,
                                      int requested_threads) {
 #if defined(GWLDCORE_GEMM_INTEGRITY)
 #ifdef GWLDCORE_USE_OPENBLAS
+    if (m <= 64) {
+        // Q^T S products have a persistent design basis and source panel on
+        // both sides. They are narrow enough to compute deterministically,
+        // even when a large probe count would cross the generic ABFT cutoff.
+        dgemm_tn_tiled(
+            m, n, k, a, lda, b, ldb, c, ldc, requested_threads
+        );
+        return 0;
+    }
     if (gemm_requires_integrity_checks(m, n, k)) {
         return dgemm_tn_checked(
             m, n, k, a, lda, b, ldb, c, ldc, requested_threads
@@ -1051,6 +1107,8 @@ public:
             : "deterministic_disjoint_output_tiled_gemm";
         result["repaired_gemm_output_columns"] =
             repaired_gemm_output_columns_.load(std::memory_order_relaxed);
+        result["retried_gemm_input_mutations"] =
+            retried_gemm_input_mutations_.load(std::memory_order_relaxed);
         result["environment_mean"] = environment_mean_;
         result["environment_variance"] = environment_variance_;
         result["max_q_gram_error"] = max_q_gram_error_;
@@ -1423,10 +1481,26 @@ public:
                     ] = probe * ap[j] * swp[j];
                 }
             }
-            record_gemm_repairs(dgemm_nn_partitioned_rows(
-                n_, fused_columns, l, geno.get(), n_, weighted.data(), l,
-                fused_source, n_, decode_threads_
-            ));
+            const auto compute_source = [&]() {
+                return dgemm_nn_partitioned_rows(
+                    n_, fused_columns, l, geno.get(), n_, weighted.data(), l,
+                    fused_source, n_, decode_threads_
+                );
+            };
+            try {
+                record_gemm_repairs(compute_source());
+            } catch (const RetryableGemmInputMutation&) {
+                record_gemm_input_retry();
+                std::unique_ptr<double[]> fresh_geno;
+                std::vector<int> fresh_observed;
+                missing = decode_block(
+                    blk_start, blk_end, require_missing_free,
+                    fresh_geno, fresh_observed
+                );
+                geno = std::move(fresh_geno);
+                observed = std::move(fresh_observed);
+                record_gemm_repairs(compute_source());
+            }
 #ifdef _OPENMP
             #pragma omp parallel for schedule(static) num_threads(decode_threads_)
 #endif
@@ -1645,16 +1719,38 @@ public:
                     double* weighted = env_projected.data() + static_cast<size_t>(c) * static_cast<size_t>(n_);
                     for (int i = 0; i < n_; ++i) weighted[i] = env_[static_cast<size_t>(i)] * source[i];
                 }
-                record_gemm_repairs(dgemm_tn_partitioned_rows(
-                    l, count, n_, geno.get(), n_, projected.data(), n_,
-                    work_x + static_cast<size_t>(c0) * static_cast<size_t>(l),
-                    l, decode_threads_
-                ));
-                record_gemm_repairs(dgemm_tn_partitioned_rows(
-                    l, count, n_, geno.get(), n_, env_projected.data(), n_,
-                    work_w + static_cast<size_t>(c0) * static_cast<size_t>(l),
-                    l, decode_threads_
-                ));
+                const auto compute_target = [&](const double* right,
+                                                double* output) {
+                    return dgemm_tn_partitioned_rows(
+                        l, count, n_, geno.get(), n_, right, n_,
+                        output, l, decode_threads_
+                    );
+                };
+                const auto run_with_fresh_decode = [&](const double* right,
+                                                       double* output) {
+                    try {
+                        record_gemm_repairs(compute_target(right, output));
+                    } catch (const RetryableGemmInputMutation&) {
+                        record_gemm_input_retry();
+                        std::unique_ptr<double[]> fresh_geno;
+                        std::vector<int> fresh_observed;
+                        missing = decode_block(
+                            blk_start, blk_end, require_missing_free,
+                            fresh_geno, fresh_observed
+                        );
+                        geno = std::move(fresh_geno);
+                        observed = std::move(fresh_observed);
+                        record_gemm_repairs(compute_target(right, output));
+                    }
+                };
+                run_with_fresh_decode(
+                    projected.data(),
+                    work_x + static_cast<size_t>(c0) * static_cast<size_t>(l)
+                );
+                run_with_fresh_decode(
+                    env_projected.data(),
+                    work_w + static_cast<size_t>(c0) * static_cast<size_t>(l)
+                );
             }
             scale_target_outputs(work_x, work_w, l, columns, scale_x_snapshot, scale_w_snapshot);
             check_files_unchanged();
@@ -1879,11 +1975,27 @@ private:
                 // ProjectedPanel owns one immutable [S, E*S] allocation.  A
                 // single wide product reuses the decoded G block for both X-
                 // and W-left work instead of packing/reading it twice.
-                record_gemm_repairs(dgemm_tn_partitioned_rows(
-                    l, fused_columns, n_, geno.get(), n_,
-                    panel.data_.get(), n_,
-                    fused_work.get(), l, decode_threads_
-                ));
+                const auto compute_target = [&]() {
+                    return dgemm_tn_partitioned_rows(
+                        l, fused_columns, n_, geno.get(), n_,
+                        panel.data_.get(), n_,
+                        fused_work.get(), l, decode_threads_
+                    );
+                };
+                try {
+                    record_gemm_repairs(compute_target());
+                } catch (const RetryableGemmInputMutation&) {
+                    record_gemm_input_retry();
+                    std::unique_ptr<double[]> fresh_geno;
+                    std::vector<int> fresh_observed;
+                    missing = decode_block(
+                        blk_start, blk_end, require_missing_free,
+                        fresh_geno, fresh_observed
+                    );
+                    geno = std::move(fresh_geno);
+                    observed = std::move(fresh_observed);
+                    record_gemm_repairs(compute_target());
+                }
                 std::memcpy(
                     work_x + output_offset * static_cast<size_t>(l),
                     fused_work.get(),
@@ -2207,6 +2319,12 @@ private:
         }
     }
 
+    void record_gemm_input_retry() const {
+        retried_gemm_input_mutations_.fetch_add(
+            1, std::memory_order_relaxed
+        );
+    }
+
     void check_files_unchanged() const {
 #if defined(__linux__)
         ensure_open();
@@ -2256,6 +2374,7 @@ private:
     bool closed_ = false;
     mutable std::mutex call_mutex_;
     mutable std::atomic<int64_t> repaired_gemm_output_columns_{0};
+    mutable std::atomic<int64_t> retried_gemm_input_mutations_{0};
 #if defined(__linux__)
     int bed_fd_ = -1;
     int bim_fd_ = -1;

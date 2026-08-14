@@ -115,7 +115,7 @@ _NATIVE_PREFERRED_FEATURE_WORKSPACE_BYTES = 3 * 512 * 1024**2
 def _native_gemm_integrity_workspace_elements(
     build_info: Mapping | None, m: int, n: int, k: int
 ) -> int:
-    """Mirror the native checksum and bounded operand-snapshot allocation."""
+    """Mirror native checksum and non-reconstructable operand protection."""
     if (
         build_info is None
         or min(int(m), int(n), int(k)) <= 0
@@ -126,7 +126,10 @@ def _native_gemm_integrity_workspace_elements(
     checks = _NATIVE_GEMM_INTEGRITY_CHECKS * (
         int(m) + 2 * int(k) + 2 * int(n)
     )
-    return checks + int(m) * int(k) + int(k) * int(n)
+    # The right operand is non-reconstructable and is snapshotted. The decoded
+    # left operand is fingerprinted and the native block is retried after a
+    # fresh decode if the affected host mutates it.
+    return checks + int(k) * int(n)
 
 
 def _native_execution_workspace_bytes(native_workspace_gib: float) -> int:
@@ -4402,6 +4405,12 @@ class GenomewideEnvLDScore:
             self.resource_estimates["native_repaired_gemm_output_columns"] = (
                 repaired_gemm_columns
             )
+            retried_input_mutations = int(
+                native_info.get("retried_gemm_input_mutations", 0)
+            )
+            self.resource_estimates["native_retried_gemm_input_mutations"] = (
+                retried_input_mutations
+            )
             for phase, elapsed in self.native_phase_timings.items():
                 self.resource_estimates[f"native_{phase}_seconds"] = float(elapsed)
             self.log._log(
@@ -4414,7 +4423,8 @@ class GenomewideEnvLDScore:
                 "target calls="
                 f"{self.native_phase_timings.get('target_calls', 0.0):.3f}s; "
                 "ABFT-repaired output columns="
-                f"{repaired_gemm_columns}."
+                f"{repaired_gemm_columns}; freshly decoded input retries="
+                f"{retried_input_mutations}."
             )
 
         scores = {name: value / float(self.nvecs) for name, value in accum.items()}
