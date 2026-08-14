@@ -460,24 +460,26 @@ The added Eq.~\eqref{eq:ustat} work is $O(N_RBK^2)$ but has a very small
 constant and no genotype decode or large matrix multiply; its persistent
 memory is $O(N_RK)$.
 
-On tabla, a full $N_R=291{,}273$, $M=454{,}207$, $B=32$ EUR age calculation
-completed its numerical work in 1,939.5 seconds and peaked at 4.05 GiB.  Its
-feature, source, panel-preparation, and target phases took 523.3, 347.8, 0.18,
-and 979.9 seconds.  The artifacts from this diagnostic were deliberately not
-sealed: the native extension file was rebuilt during the run, and SUMMIT's
-executable-inode guard rejected publication.  The timing and integrity counts
-were recorded before that publication failure, but this is not a completed
-scientific reference.
+On tabla, a sealed full $N_R=291{,}273$, $M=454{,}207$, $B=32$ EUR age
+reference completed its numerical work in 1,503.6 seconds; end-to-end measured
+elapsed time was 1,534.9 seconds (25.6 minutes), with 4.04 GiB peak RSS.  Its
+feature, source, panel-preparation, and target phases took 560.0, 368.6, 0.20,
+and 471.4 seconds.  The source tree, loaded native binary, and single OpenBLAS
+0.3.34 runtime are hash-bound in the published reference manifest.  Relative
+to the preceding internally threaded diagnostic, total elapsed time fell
+20.9\%, target time fell 51.9\%, and repaired output columns fell from 384 to
+3 without increasing memory.
 
 A direct $B/32$ extrapolation is too pessimistic because the $B=32$ products
 are skinny.  In a dense-oracle benchmark with $N=100{,}000$ and $M=1{,}000$,
 increasing $B$ from 32 to 512 increased native source time from 0.319 to 1.267
 seconds (3.97-fold) and the relevant 2$B$ target time from 0.458 to 2.396
 seconds (5.23-fold), rather than 16-fold.  An affine fit to the measured
-$B=32,128,512$ phase timings, scaled by the full-cohort $B=32$ phases, gives a
-current $B=1024$ planning range of approximately 3--3.5 hours.  This is still
-an extrapolation, not a completed $B=1024$ production timing.  It should be
-replaced by a measured value before a large production campaign.
+$B=32,128,512$ phase timings, scaled by the sealed full-cohort $B=32$ phases,
+gives a point estimate near 2.2 hours at $B=1024$.  A conservative current
+planning range is 2.2--2.8 hours to allow for repair and system-load variation.
+This remains an extrapolation, not a completed $B=1024$ production timing, and
+should be replaced by a measured value before a large production campaign.
 
 Probe tiling and block-width adaptation bound memory.  For one annotation, the
 float32 $[XZ,WZ]$ source sketch costs $8N_RB$ bytes.  The native opaque
