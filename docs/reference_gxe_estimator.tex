@@ -28,25 +28,47 @@
 \begin{abstract}
 GENIE estimates additive genetic (G), gene--environment (G$\times$E),
 noise--environment (N$\times$E), and residual variance components from one
-individual-level cohort.  Rewriting GENIE's right-hand side in terms of
-marginal GWAS and GWIS scores is exact when the kernel traces and the scores
-come from the same individuals.  It is not, by itself, a reusable reference
-method.  This report derives the additional moments needed when G and
-G$\times$E kernel quantities are estimated in an independent cohort containing
-all individuals with measured environment, while trait-specific marginal
-scores may use smaller and different samples.  The key is to transfer the
-same-individual and different-individual parts of each genetic kernel-product
-trace separately.  For G$\times$E, the same-individual term is a non-universal
-fourth moment and cannot be replaced by the additive-only constant.  It can be
-estimated during the existing randomized, in-memory reference pass with an
-order-two probe U-statistic and $O(N_RK)$ additional memory, independent of the
-number of probes.  Study-specific N$\times$E moments remain exact low-dimensional
-summaries.  We also audit covariate handling in the released GENIE code and
-distinguish two coherent feature definitions from the incoherent mixture of
-raw projected kernels and hard-coded traces.
+individual-level cohort.  This report first writes that estimator as one
+matrix normal equation.  Its trait-dependent right-hand side is exactly a
+function of marginal GWAS and GWIS cross-products, but that observation alone
+does not make the kernel Gram matrix reusable across samples.  We derive the
+additional reference moments needed when G and G$\times$E LD quantities are
+estimated in every individual with a measured environment, while each trait
+uses its own, potentially smaller cohort.  The essential step is to transfer
+the same-individual and different-individual pieces of every genetic
+kernel-product trace separately.  The G$\times$E same-individual piece is a
+non-universal fourth moment; SUMMIT estimates it during the randomized,
+in-memory reference pass with an order-two probe U-statistic and $O(N_RK)$
+memory independent of the number of probes.  N$\times$E entries are computed
+exactly in each trait cohort.  We state the estimand and scaling conventions,
+the sufficient summary-data contract, the limitations created by
+variant-specific missingness, and an audit of covariate handling in the
+released GENIE implementation.
 \end{abstract}
 
-\section{Notation and generative assumptions}
+\section{Estimator roadmap}
+
+The construction is easiest to follow as five operations.
+\begin{enumerate}
+ \item In each cohort, standardize the continuous environment, form one
+ fixed-effect projector, and use it consistently for phenotype, genotype,
+ and G$\times$E features.
+ \item Express GENIE as the normal equation $\bm T\bm\theta=\bm q$ for the
+ four kernel families G, G$\times$E, N$\times$E, and residual.
+ \item Obtain the genetic entries of $\bm q$ from trait-specific marginal
+ GWAS/GWIS cross-products and obtain the genetic block of $\bm T$ from
+ reference LD summaries.
+ \item Convert the reference genetic block from $N_R$ to the trait sample
+ size $N_S$ by transferring its same-person and different-person pieces
+ separately.  A single squared sample-size multiplier is generally wrong.
+ \item Compute the inexpensive N$\times$E entries in the trait cohort, solve
+ the assembled normal equation, and jackknife over variant blocks.
+\end{enumerate}
+The sections below derive each operation.  We first show one annotation so
+the matrix is visible, then give the general $K$-annotation notation used by
+the software.
+
+\section{Step 1: cohort transformation and generative model}
 
 We follow the notation of Kerin and Marchini~\cite{genie}.  Cohort $S$ is the
 trait study and cohort $R$ is the reusable reference.  They share an ordered
@@ -61,6 +83,37 @@ effects used by the trait analysis.  Define
 \end{equation}
 where $(\cdot)^+$ is the Moore--Penrose inverse.  The same definitions apply
 to $R$.
+
+For a continuous environment, SUMMIT first transforms the observed values in
+each retained cohort to
+\begin{equation}
+ e_i=\frac{E_i-\bar E}{s_E},\qquad
+ s_E^2=\frac{1}{N-d_E}\sum_i(E_i-\bar E)^2,qquad d_E\in\{0,1\}.
+ \label{eq:environmentscale}
+\end{equation}
+The default is $d_E=1$.  Thus the effect units are per environmental standard deviation.  The
+standardized $\be$ is then included in $\bC$ as a fixed main effect.  This
+transformation is performed separately in $R$ and $S$ because the reference
+and trait masks can differ; the manifest records the mean, standard deviation,
+degrees-of-freedom convention, and design digest.  Binary environments can be
+analyzed with the same algebra, although Eq.~\eqref{eq:environmentscale}
+changes their numerical contrast and can make N$\times$E inseparable from the
+residual component in special cases discussed below.
+
+Let $\widetilde{\by}_S$ denote the phenotype before fixed-effect adjustment.
+SUMMIT uses
+\begin{equation}
+ \by_S=\bP_S\widetilde{\by}_S
+ \sqrt{\frac{r_S}{\widetilde{\by}_S^\top\bP_S
+                         \widetilde{\by}_S}},
+ \qquad \by_S^\top\by_S=r_S.
+ \label{eq:phenotypescale}
+\end{equation}
+The primary variance proportions therefore describe variation remaining
+after the declared fixed effects.  Multiplying them by the recorded
+post-projection phenotype-variance fraction instead expresses their
+contribution relative to the preprojection phenotype variance; that is a
+different denominator, not a second estimator.
 
 Let $\bm G_S$ be a centered, pre-scaled genotype matrix and let $\be_S$ be a
 centered environment measured in standard-deviation units.  The default
@@ -128,7 +181,7 @@ the coefficients need not each be nonnegative.  Conditional on the design,
 \end{equation}
 No Gaussian assumption on the effects is required for the moment equations.
 
-\section{GENIE as an in-sample method-of-moments estimator}
+\section{Step 2: GENIE as one matrix normal equation}
 
 Index the $2K+2$ kernels in Eq.~\eqref{eq:covariance} by
 $\mathcal K_S=(\bK^G_{S1},\ldots,\bK^G_{SK},
@@ -152,6 +205,42 @@ Hutchinson random projection: for independent isotropic probes $\bm z_v$,
  =\E_v[(\mathcal K_a\bm z_v)^\top(\mathcal K_b\bm z_v)].
 \end{equation}
 
+For one annotation, define $G=\bK^G$, $I=\bK^I$, $D=\bD$, and $0=\bP$,
+and write $T_{ab}=\tr(\bK^a\bK^b)$ and
+$t_a=\tr(\bK^a)$.  Equation~\eqref{eq:normal} is the concrete $4\times4$
+system
+\begin{equation}
+\underbrace{\begin{bmatrix}
+ T_{GG}&T_{GI}&T_{GD}&t_G\\
+ T_{GI}&T_{II}&T_{ID}&t_I\\
+ T_{GD}&T_{ID}&T_{DD}&t_D\\
+ t_G&t_I&t_D&r_S
+\end{bmatrix}}_{\bm T_S}
+\begin{bmatrix}
+ \widehat\sigma_G^2\\ \widehat\sigma_I^2\\
+ \widehat\sigma_D^2\\ \widehat\sigma_0^2
+\end{bmatrix}
+=
+\underbrace{\begin{bmatrix}
+ q_G\\q_I\\q_D\\r_S
+\end{bmatrix}}_{\bm q_S}.
+\label{eq:matrixnormal}
+\end{equation}
+Post-projection standardization gives $t_G=t_I=r_S$; $t_D$, $T_{DD}$,
+$T_{GD}$, and $T_{ID}$ depend on the study environment and design.  The
+last row enforces
+\begin{equation}
+ \widehat\sigma_G^2t_G+\widehat\sigma_I^2t_I+
+ \widehat\sigma_D^2t_D+\widehat\sigma_0^2r_S=r_S
+ \label{eq:variancebalance}
+\end{equation}
+when the system is full rank.  A reported component proportion is therefore
+$\widehat\sigma_a^2t_a/r_S$, equivalently its predicted trace contribution
+divided by the sum of all predicted trace contributions.  With $K$
+annotations, the first two rows and columns of Eq.~\eqref{eq:matrixnormal}
+become $K$-by-$K$ G and interaction blocks; the N$\times$E and residual rows
+remain scalar.
+
 For a genetic family $F\in\{G,I\}$, define the marginal HE-scale score
 \begin{equation}
  s^F_{Sj}=\frac{\bm F_{S,:,j}^\top\by_S}{\sqrt{r_S}}.
@@ -162,6 +251,13 @@ It follows exactly that
  \by_S^\top\bK^F_{Sk}\by_S
  =\frac{r_S}{M_k}\sum_j A_{jk}(s^F_{Sj})^2.
  \label{eq:rhs}
+\end{equation}
+For one unweighted annotation this fills the first two entries in
+Eq.~\eqref{eq:matrixnormal} as
+\begin{equation}
+ q_G=\frac{r_S}{M}\sum_j(s^G_{Sj})^2,\qquad
+ q_I=\frac{r_S}{M}\sum_j(s^I_{Sj})^2.
+ \label{eq:twogeneticrhs}
 \end{equation}
 The required statistics are marginal cross-products after the common
 fixed-effect projection.  A usual conditional interaction Wald statistic is
@@ -186,7 +282,7 @@ an independently estimated $L_R$ into Eq.~\eqref{eq:exacttrace}: the
 finite-cohort trace has both same-person fourth moments and different-person
 LD moments, which scale differently with cohort size.
 
-\section{A genuinely reusable reference estimator}
+\section{Step 3: transfer the genetic normal-equation block}
 
 \subsection{Population transport assumptions}
 
@@ -242,9 +338,29 @@ and therefore
  \boxed{\widehat T^{S\mid R}_{ab}
  =\frac{N_S}{N_R}\widehat D^R_{ab}
  +\frac{N_S(N_S-1)}{N_R(N_R-1)}
-  (\widehat T^R_{ab}-\widehat D^R_{ab}).}
+ (\widehat T^R_{ab}-\widehat D^R_{ab}).}
  \label{eq:transfer}
 \end{equation}
+In matrix form, let $\bm T^{\rm gen}_R$ be the reference genetic trace block
+and let $\bm D^{\rm gen}_R$ be its same-person part.  Both are $2K$ by $2K$,
+ordered as $(G_1,\ldots,G_K,I_1,\ldots,I_K)$.  The block inserted into the
+trait normal equation is
+\begin{equation}
+ \boxed{\begin{aligned}
+ \widehat{\bm T}^{\rm gen}_{S\mid R}
+ &=\frac{N_S}{N_R}\widehat{\bm D}^{\rm gen}_R\\
+ &\quad+\frac{N_S(N_S-1)}{N_R(N_R-1)}
+  (\widehat{\bm T}^{\rm gen}_R-\widehat{\bm D}^{\rm gen}_R)
+ \end{aligned}}
+ \label{eq:matrixtransfer}
+\end{equation}
+Here $\widehat{\bm T}^{\rm gen}_R$ is the scaled trace obtained by aggregating
+the reference directional LD-score panels according to
+Eq.~\eqref{eq:exacttrace}; it is computed once and does not involve a trait.
+The only trait quantity in Eq.~\eqref{eq:matrixtransfer} is $N_S$.  The trait's
+GWAS/GWIS scores enter $\bm q_S$ through Eq.~\eqref{eq:rhs}, not the reference
+trace.  This separation is what permits one all-environment reference cohort
+to be combined with many differently masked phenotypes.
 When $N_S=N_R$, Eq.~\eqref{eq:transfer} returns the original reference trace
 exactly.  For additive standardized genotypes, $D^R$ is close to the familiar
 $N_R$-order baseline.  For G$\times$E, it contains quantities such as
@@ -280,6 +396,8 @@ running square sums and one $2K\times2K$ accumulator.  Temporary conversion is
 chunked over probes.  Memory is $16N_RK+O(K^2)$ bytes in float64 and is
 independent of $B$; at $N_R=291{,}273,K=1$ it is about 4.4 MiB.  No source
 sketch, block sketch, or cache is written to disk.
+
+\section{Step 4: complete the normal equation in the trait cohort}
 
 \subsection{N$\times$E and residual moments}
 
@@ -321,7 +439,9 @@ four classes $(G,G\times E,N\times E,\text{residual})$ using genotype/environmen
 moments from all eligible reference individuals and trait-specific marginal
 scores from the study cohort.
 
-\subsection{The summary-data boundary}
+\section{Step 5: trait summaries, solution, and uncertainty}
+
+\subsection{Sufficient summary data and fitting algorithm}
 
 The reusable reference object contains the ordered variant/allele and
 annotation definitions, $N_R,r_R$, the randomized genetic trace matrix
@@ -343,6 +463,57 @@ decode.  Once $\mathcal S_y$ is written, fitting uses no individual-level
 phenotype, genotype, or environment.  Thus trait missingness affects the cheap
 trait summary but does not force reconstruction of the all-E G$\times$E
 reference.
+
+For each phenotype, the complete fitting algorithm is therefore:
+\begin{enumerate}
+ \item retain individuals with phenotype, environment, and covariates;
+ standardize $E$, build $\bP_S$, and normalize $\by_S$ as in
+ Eq.~\eqref{eq:phenotypescale};
+ \item stream the genotype once to form $\bm s^G_S$, $\bm s^I_S$, and the
+ exact genetic--N$\times$E traces in Eq.~\eqref{eq:kd};
+ \item compute $q_D,q_0,t_D,T_{DD}$ from $\be_S,\by_S$, and the fixed-effect
+ basis;
+ \item transfer only the reference genetic block with
+ Eq.~\eqref{eq:matrixtransfer}, assemble Eq.~\eqref{eq:matrixnormal}, and
+ solve for $\widehat{\bm\theta}$;
+ \item report $\widehat\sigma_a^2t_a/r_S$ and obtain standard errors from
+ variant-block delete-one fits.
+\end{enumerate}
+
+\subsection{Missing genotypes and heterogeneous per-variant samples}
+
+The current production contract uses one analysis cohort for every retained
+variant.  In the trait-score pass, a missing genotype at variant $j$ is
+replaced by the observed mean of that variant within the retained trait
+cohort.  After centering, the imputed entry is zero.  The additive and
+interaction columns are then projected and restandardized exactly as in
+Eq.~\eqref{eq:features}.  Consequently all output rows carry the same
+$N_S$ and $r_S$ even if a small number of raw calls were missing.  This is a
+coherent mean-imputation approximation under ignorable, low-rate missingness;
+it is not a correction for genotype missingness associated with phenotype or
+environment.
+
+The bounded native reference builder is stricter: it requires the selected
+BED to be missing-free and aborts if it encounters a missing call.  Thus a
+production reference should use dosage-imputed or otherwise explicitly
+imputed genotypes, as in the EUR 300k analysis, or a missing-free hard-call
+set after quality control.  Reference and study features are always centered,
+projected, and restandardized within their own retained cohorts.
+
+Variant-specific summary sample sizes $N_j$ are not currently supported.
+The score reader verifies that every GWAS and GWIS row has the phenotype's
+common $N_S$ and $r_S$.  This is deliberate: if variants $j$ and $m$ are
+observed in different individuals, their contribution to
+$\tr(\bK_a\bK_b)$ depends on the pairwise overlap and on the two
+mask-specific projectors, not only on $N_j$ and $N_m$.  Standard summary
+statistics containing only per-variant $N_j$ do not identify those terms.
+Simply substituting $N_j$, an average $N$, or $\sqrt{N_jN_m}$ into
+Eqs.~\eqref{eq:rhs}--\eqref{eq:exacttrace} is therefore not exact.  A future
+mask-aware estimator would need at least overlap summaries (or a model for
+the missingness masks) and consistently defined mask-specific GWAS, GWIS, and
+LD moments.  Until then, variants with appreciable or differential
+missingness should be imputed and quality controlled before constructing the
+SUMMIT summaries.
 
 \subsection{Uncertainty and identifiability}
 
@@ -394,6 +565,20 @@ $\tr(K_kVK_\ell V)$, $\tr(VK_k)$, $\by^\top VK_kV\by$, and residual dimension
 $N-C$~\cite{geniesupp}.  The concerns below apply to the released code at
 commit \texttt{22bee9c}, not to that formal derivation.
 
+\paragraph{Continuous-environment scale and missing values.}
+The released GENIE reader copies finite environmental values directly into
+the design and interaction terms; it does not center or standardize a
+continuous environment internally~\cite{geniecodeenv}.  A GENIE analysis must
+therefore supply an environment already expressed in the intended units,
+normally mean zero and unit standard deviation.  SUMMIT instead applies
+Eq.~\eqref{eq:environmentscale} internally and records the transformation.
+This distinction is substantive because multiplying $E$ by $c$ multiplies
+the G$\times$E feature by $c$ and the N$\times$E kernel by $c^2$, thereby
+changing their coefficient scales.  The same GENIE reader masks the literal
+string \texttt{NA}, but its \texttt{-9} branch skips assignment without
+clearing the analysis mask~\cite{geniecodeenv}; unless the caller removes
+those rows, the zero-initialized value is treated as an observed environment.
+
 \paragraph{Ordinary inverse and column count.}
 The implementation computes \texttt{Q = WtW.inverse()} and sets the residual
 dimension to \texttt{Nindv\_mask - Ncov}~\cite{geniecodecov}.  This is correct
@@ -438,10 +623,14 @@ The default code standardizes the phenotype, projects covariates, and then
 standardizes the projected phenotype again using denominator
 $N_{\rm mask}-1$~\cite{geniecodepheno}, while the residual kernel dimension is
 declared $N_{\rm mask}-N_{\rm cov}$.  Because the code retains the realized
-$\by^\top\by$ in the normal equations, phenotype rescaling alone is not
-necessarily a bias.  It does, however, mean that reported components are not
-automatically on the $r$-normalized scale and should not be combined with
-hard-coded $r$ traces without an explicit scale conversion.
+$\by^\top\by$ in the normal equations, phenotype rescaling alone is not a
+bias.  GENIE's reported results under this default are residual-phenotype
+(conditional) proportions, so the closest SUMMIT comparison is SUMMIT's
+primary conditional proportion, not the optional value multiplied by the
+post-covariate variance fraction.  The remaining $N-1$ versus $r$ convention
+must still be propagated consistently through kernel traces; it is the
+combination with hard-coded trace conventions, rather than residualizing the
+phenotype itself, that is problematic.
 
 These issues can be small when covariates are full rank, missingness is mild,
 and HWE scaling nearly matches the retained sample variance.  They are not
@@ -554,51 +743,26 @@ with selective ABFT remains the production default.  A truly non-threaded
 OpenBLAS build or an independent BLAS implementation is the next clean test of
 the remaining vendor-runtime hypothesis.
 
-\section{EUR 300k scalar-trait validation}
+\section{Real-data validation status}
 
-The implemented population-reference path was checked on UK Biobank height
-with age as a continuous environment.  The reusable reference used all
-$N_R=291{,}273$ individuals with genotype, age, and covariates, whereas the
-trait-specific GWAS/GWIS used the $N_S=290{,}641$ individuals with nonmissing
-height.  This deliberately exercises the unequal-cohort transfer rather than
-reverting to a common complete-case mask.  The trait scoring job completed on
-Hoffman in 11,481 seconds with 6.46~GiB peak RSS.  The subsequent summary fit
-had rank four, condition number 20.39, and relative normal-equation residual
-$5.4\times10^{-16}$.
+The implemented unequal-cohort path has been exercised with height and age:
+the reference included every eligible individual with age and covariates,
+whereas the GWAS/GWIS and study-specific N$\times$E moments used all available
+height observations.  The fit was full rank and numerically solved its normal
+equation.  Its additive and interaction estimates were close to those from
+the earlier common-complete-case analysis, which is supportive of reference
+transport within this ancestry group.  It is not a controlled equivalence
+test, because both the reference size and the trait-score sample changed.
 
-\begin{table}[ht]
-\centering
-\small
-\begin{tabular}{lrrr}
-\toprule
-Component & SUMMIT conditional & SUMMIT original scale & GENIE reported \\
-\midrule
-G & $0.69738\;(0.03265)$ & $0.34133\;(0.01598)$ & $0.65243\;(0.02621)$ \\
-G$\times$E & $0.00082\;(0.00146)$ & $0.00040\;(0.00072)$ & $0.00207\;(0.00170)$ \\
-N$\times$E & $0.00211\;(0.00146)$ & $0.00103\;(0.00072)$ & $-0.07013\;(0.00198)$ \\
-Residual & $0.29969\;(0.03266)$ & $0.14668\;(0.01598)$ & $0.26119\;(0.01644)$ \\
-\bottomrule
-\end{tabular}
-\caption{Height variance-component estimates with jackknife standard errors in
-parentheses.  SUMMIT's conditional column uses a unit-variance projected
-phenotype; the original-scale column multiplies by the observed post-covariate
-variance fraction, 0.48945.  GENIE values are copied from
-\texttt{all.age.norm.txt} and are shown in their reported scale.}
-\label{tab:height}
-\end{table}
-
-The two SUMMIT columns are both reported because the covariates, particularly
-sex, explain a large fraction of raw height variance.  Comparing GENIE directly
-to the conditional column makes the additive estimates look similar, but this
-is not a scale-matched comparison.  Conversely, interpreting the GENIE output
-as original-phenotype proportions produces a large additive discrepancy.
-The N$\times$E discrepancy is large on either scale.  This single trait cannot
-identify which GENIE implementation detail causes the difference; it does
-show that the transported reference equations run on the intended larger
-reference cohort and return a well-conditioned fit without the strongly
-negative N$\times$E estimate.  Because both the reference and score calculation
-used only $B=32$ probes, these values are a software and transport validation,
-not final production estimates.
+A decisive empirical validation should hold the trait cohort fixed and compare
+(i) an in-sample genetic Gram matrix with (ii) the population-transferred
+reference matrix, using identical scores, feature definitions, variants,
+blocks, and probe precision.  Across many traits one should report component
+differences relative to their joint jackknife uncertainty, normal-equation
+conditioning, and sensitivity to reference size and probe count.  The present
+simulation/oracle tests establish the algebra and implementation; the
+single-trait result establishes end-to-end feasibility but does not replace
+that matched validation design.
 
 \section{Practical contract}
 
@@ -632,6 +796,11 @@ Methods ``Estimation of genome-wide LD scores'' and Supplementary Note
 \bibitem{geniecodecov}
 GENIE source, commit \texttt{22bee9c}, covariate inverse and projection.
 \href{https://github.com/sriramlab/GENIE/blob/22bee9cd53d61eabb2ffcec70acf3c5bb43ede01/src/ge_flexible.cpp#L2303-L2362}{\texttt{ge\_flexible.cpp}, lines 2303--2362}.
+
+\bibitem{geniecodeenv}
+GENIE source, commit \texttt{22bee9c}.
+\href{https://github.com/sriramlab/GENIE/blob/22bee9cd53d61eabb2ffcec70acf3c5bb43ede01/src/auxillary.cpp#L12-L51}{\texttt{auxillary.cpp}, lines 12--51},
+environment reader and missing-value handling.
 
 \bibitem{geniecodescale}
 GENIE source, commit \texttt{22bee9c}, genotype mean and HWE scale.
