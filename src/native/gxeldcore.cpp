@@ -510,8 +510,25 @@ int64_t dgemm_tn_checked(int m, int n, int k,
         );
         for (int column = 0; column < n; ++column) {
             if (column_disagrees(column)) {
+                int failed_check = 0;
+                for (; failed_check < kGemmIntegrityChecks; ++failed_check) {
+                    const size_t index =
+                        static_cast<size_t>(column) * kGemmIntegrityChecks
+                        + static_cast<size_t>(failed_check);
+                    if (gemm_integrity_disagrees(
+                            expected[index], observed[index])) break;
+                }
+                const size_t index =
+                    static_cast<size_t>(column) * kGemmIntegrityChecks
+                    + static_cast<size_t>(failed_check);
                 throw std::runtime_error(
-                    "Independent TN GEMM repair failed its integrity check"
+                    "Independent TN GEMM repair failed its integrity check: "
+                    "column=" + std::to_string(column)
+                    + ", check=" + std::to_string(failed_check)
+                    + ", expected=" + std::to_string(expected[index])
+                    + ", observed=" + std::to_string(observed[index])
+                    + ", difference="
+                    + std::to_string(observed[index] - expected[index])
                 );
             }
         }
