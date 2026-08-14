@@ -470,6 +470,16 @@ to the preceding internally threaded diagnostic, total elapsed time fell
 20.9\%, target time fell 51.9\%, and repaired output columns fell from 384 to
 3 without increasing memory.
 
+A cohort-matched additive-only $B=32$ run used the same $N=291{,}273$,
+$M=454{,}207$, covariates, probe distribution and seed, 32-core affinity, and
+16-GiB sketch budget.  It completed in 568.4 seconds end to end (565.4 seconds
+reported numerical runtime) with 1.39 GiB peak RSS.  The corresponding G$\times$E
+ratios are therefore 2.70-fold for elapsed time and 2.90-fold for peak RSS.
+The extra work is intrinsic to constructing the interaction features and
+estimating the four directional G/G$\times$E kernel products instead of the one
+additive product; it is not disk-cache I/O.  The comparison produced only a
+4.97-MB additive LD-score file in addition to its small log and receipt.
+
 A direct $B/32$ extrapolation is too pessimistic because the $B=32$ products
 are skinny.  In a dense-oracle benchmark with $N=100{,}000$ and $M=1{,}000$,
 increasing $B$ from 32 to 512 increased native source time from 0.319 to 1.267
