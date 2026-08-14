@@ -620,7 +620,11 @@ int64_t dgemm_tn_partitioned_columns(int m, int n, int k,
             m, n, k, a, lda, b, ldb, c, ldc, requested_threads
         );
     }
-    dgemm_tn_openblas_partitioned(
+    // Vendor microkernel selection can depend on how a small product is
+    // partitioned, producing last-bit differences across thread counts even
+    // though every output cell has a single owner.  Keep the reproducibility
+    // contract exact for these inexpensive products.
+    dgemm_tn_tiled(
         m, n, k, a, lda, b, ldb, c, ldc, requested_threads
     );
 #else
@@ -661,7 +665,7 @@ int64_t dgemm_nn_partitioned_rows(int m, int n, int k,
             m, n, k, a, lda, b, ldb, c, ldc, requested_threads
         );
     }
-    dgemm_nn_openblas_partitioned(
+    dgemm_nn_tiled(
         m, n, k, a, lda, b, ldb, c, ldc,
         requested_threads, alpha, beta
     );
@@ -699,7 +703,7 @@ int64_t dgemm_tn_partitioned_rows(int m, int n, int k,
             m, n, k, a, lda, b, ldb, c, ldc, requested_threads
         );
     }
-    dgemm_tn_openblas_partitioned(
+    dgemm_tn_tiled(
         m, n, k, a, lda, b, ldb, c, ldc,
         requested_threads, alpha, beta
     );
