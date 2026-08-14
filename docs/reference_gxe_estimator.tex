@@ -554,6 +554,52 @@ with selective ABFT remains the production default.  A truly non-threaded
 OpenBLAS build or an independent BLAS implementation is the next clean test of
 the remaining vendor-runtime hypothesis.
 
+\section{EUR 300k scalar-trait validation}
+
+The implemented population-reference path was checked on UK Biobank height
+with age as a continuous environment.  The reusable reference used all
+$N_R=291{,}273$ individuals with genotype, age, and covariates, whereas the
+trait-specific GWAS/GWIS used the $N_S=290{,}641$ individuals with nonmissing
+height.  This deliberately exercises the unequal-cohort transfer rather than
+reverting to a common complete-case mask.  The trait scoring job completed on
+Hoffman in 11,481 seconds with 6.46~GiB peak RSS.  The subsequent summary fit
+had rank four, condition number 20.39, and relative normal-equation residual
+$5.4\times10^{-16}$.
+
+\begin{table}[ht]
+\centering
+\small
+\begin{tabular}{lrrr}
+\toprule
+Component & SUMMIT conditional & SUMMIT original scale & GENIE reported \\
+\midrule
+G & $0.69738\;(0.03265)$ & $0.34133\;(0.01598)$ & $0.65243\;(0.02621)$ \\
+G$\times$E & $0.00082\;(0.00146)$ & $0.00040\;(0.00072)$ & $0.00207\;(0.00170)$ \\
+N$\times$E & $0.00211\;(0.00146)$ & $0.00103\;(0.00072)$ & $-0.07013\;(0.00198)$ \\
+Residual & $0.29969\;(0.03266)$ & $0.14668\;(0.01598)$ & $0.26119\;(0.01644)$ \\
+\bottomrule
+\end{tabular}
+\caption{Height variance-component estimates with jackknife standard errors in
+parentheses.  SUMMIT's conditional column uses a unit-variance projected
+phenotype; the original-scale column multiplies by the observed post-covariate
+variance fraction, 0.48945.  GENIE values are copied from
+\texttt{all.age.norm.txt} and are shown in their reported scale.}
+\label{tab:height}
+\end{table}
+
+The two SUMMIT columns are both reported because the covariates, particularly
+sex, explain a large fraction of raw height variance.  Comparing GENIE directly
+to the conditional column makes the additive estimates look similar, but this
+is not a scale-matched comparison.  Conversely, interpreting the GENIE output
+as original-phenotype proportions produces a large additive discrepancy.
+The N$\times$E discrepancy is large on either scale.  This single trait cannot
+identify which GENIE implementation detail causes the difference; it does
+show that the transported reference equations run on the intended larger
+reference cohort and return a well-conditioned fit without the strongly
+negative N$\times$E estimate.  Because both the reference and score calculation
+used only $B=32$ probes, these values are a software and transport validation,
+not final production estimates.
+
 \section{Practical contract}
 
 The implemented external path is explicit.  A reference generated with at
