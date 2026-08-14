@@ -398,35 +398,41 @@ void dgemm_tn_openblas_partitioned(int m, int n, int k,
                                    double* c, int ldc,
                                    int requested_threads,
                                    double alpha = 1.0, double beta = 0.0) {
-    // For a wide left/output dimension, splitting by output columns makes
-    // every application thread independently repack and stream the same A
-    // panel. One internally threaded GEMM reuses that packing and is much
-    // faster for the production-sized GxE target blocks. Skinny products keep
-    // the disjoint-call path, which benchmarks better at small m.
-    constexpr int kInternallyThreadedMinimumRows = 512;
-    if (m >= kInternallyThreadedMinimumRows) {
-        openblas_set_num_threads(std::max(1, requested_threads));
-        dgemm_tn(m, n, k, a, lda, b, ldb, c, ldc, alpha, beta);
-        return;
-    }
+    // The production host has returned sparse, grossly incorrect results from
+    // internally threaded OpenBLAS DGEMM at large k. Keep every vendor call
+    // single-threaded and expose parallelism only across SUMMIT-owned,
+    // disjoint output ranges. For the production target shape m >> n,
+    // row partitioning avoids repacking/streaming the complete A matrix once
+    // per narrow output-column slice. Skinny products retain column
+    // partitioning because it gives every worker a sufficiently wide reduction.
     openblas_set_num_threads(1);
-    const int threads = std::max(1, std::min(requested_threads, n));
+    const bool partition_rows = m >= n;
+    const int extent = partition_rows ? m : n;
+    const int threads = std::max(1, std::min(requested_threads, extent));
 #ifdef _OPENMP
     #pragma omp parallel for schedule(static) num_threads(threads)
 #endif
     for (int worker = 0; worker < threads; ++worker) {
         const int first = static_cast<int>(
-            static_cast<int64_t>(n) * worker / threads
+            static_cast<int64_t>(extent) * worker / threads
         );
         const int stop = static_cast<int>(
-            static_cast<int64_t>(n) * (worker + 1) / threads
+            static_cast<int64_t>(extent) * (worker + 1) / threads
         );
-        dgemm_tn(
-            m, stop - first, k, a, lda,
-            b + static_cast<size_t>(first) * static_cast<size_t>(ldb), ldb,
-            c + static_cast<size_t>(first) * static_cast<size_t>(ldc), ldc,
-            alpha, beta
-        );
+        if (partition_rows) {
+            dgemm_tn(
+                stop - first, n, k,
+                a + static_cast<size_t>(first) * static_cast<size_t>(lda), lda,
+                b, ldb, c + first, ldc, alpha, beta
+            );
+        } else {
+            dgemm_tn(
+                m, stop - first, k, a, lda,
+                b + static_cast<size_t>(first) * static_cast<size_t>(ldb), ldb,
+                c + static_cast<size_t>(first) * static_cast<size_t>(ldc), ldc,
+                alpha, beta
+            );
+        }
     }
 }
 

@@ -249,9 +249,30 @@ score scale.
 
 The reference contains all four directional trace-score panels (`gxx`,
 `gxe`, `exg`, and `gee`), per-SNP projected norms/NxE diagonals, and
-block-local deletion metadata. Each trait triplet contains direct marginal
-additive and interaction scores plus the indispensable scalar
-`y' diag(E^2) y`.
+block-local deletion metadata. With at least two probes it also records a
+compact same-person kernel-product statistic; no probe sketch is written to
+disk. Each trait triplet contains direct marginal additive and interaction
+scores plus the indispensable scalar `y' diag(E^2) y`.
+
+To reuse that reference with a different trait-specific cohort, score one
+trait at a time explicitly:
+
+```bash
+summit \
+  --gxe-score-reference outs/reference.B1024.gxe.ref.json \
+  --gxe-population-reference \
+  --geno trait_cohort --env trait_environment.txt --covar trait_covariates.txt \
+  --gxe-pheno trait.txt --gxe-pheno-col trait1 \
+  --out outs/trait1.population
+```
+
+This path requires standardized kernels, the same ordered variants/alleles,
+annotation and named environment/covariate convention, but permits a different
+sample count and trait missingness. It writes exact study NxE and
+genetic-by-NxE design moments alongside the marginal scores. Genetic
+kernel-product traces are transferred by separate same-person and
+different-person finite-cohort factors; this assumes the reference and study
+sample the same joint genotype/environment population.
 
 Several environments on an identical complete-case cohort can share every
 streamed genotype read while retaining independent four-component models:
@@ -266,8 +287,8 @@ summit \
 ```
 
 This writes `reference.multi.<environment>.gxe.ref.json` plus a batch manifest
-at `reference.multi.gxe.multi.json`. The implementation holds each
-environment's global and current-block sketches in RAM and never spills them to
+at `reference.multi.gxe.multi.json`. The implementation holds only each
+environment's current global source tile in RAM and never spills probe state to
 disk. Environments with different missingness are rejected; intersect their
 sample rows explicitly or place them in separate batches. The resulting models
 are independent per environment, not a cross-environment covariance model.
@@ -336,8 +357,10 @@ be mixed.
 
 Generation and fitting refuse an existing output prefix unless
 `--gxe-overwrite` is supplied explicitly; files are written atomically with
-owner-only permissions. See [docs/gxe_genie.md](docs/gxe_genie.md) for the equations,
-identifiability checks, file contract, and validation requirements.
+owner-only permissions. See [docs/gxe_genie.md](docs/gxe_genie.md) for the file
+contract and validation requirements, and the compiled
+[reference-estimator report](docs/reference_gxe_estimator.pdf) for the complete
+derivation and GENIE covariate audit.
 
 ### Heritability
 
@@ -634,9 +657,11 @@ Exactly one of these modes must be specified.
 - `--env`: one-column environment file for the GxE reference/score bundle.
 - `--gxe-score-reference`: produce marginal scores and NxE moments from a
   sealed reference; `--gxe-pheno-cols` selects columns from `--gxe-pheno`.
+- `--gxe-population-reference`: explicitly score one `--gxe-pheno-col` in a
+  different cohort using a standardized population reference.
 - `--write-gxe-jackknife`: record block IDs for the default block-local
   LD-score deletion jackknife; block layout comes from `--njack` and no
-  per-block sketches are written.
+  per-block probe state is written.
 - `--allow-low-probe-gxe-jackknife`: diagnostic override for fewer than 100
   probes; resulting SEs are not production-calibrated.
 - `--ld-wind-kb`: compute fixed-window LD scores instead of randomized
@@ -671,8 +696,7 @@ Exactly one of these modes must be specified.
   `<out>.win.M_5_50`, `<out>.win.log`.
 - GxE reference: `<out>.{gxx,gxe,exg,gee}.ldscore.gz`,
   `<out>.gxe.diag.tsv.gz`, and `<out>.gxe.ref.json`. The default block-local
-  jackknife adds block IDs to the diagonal table but no sketch artifact;
-  exact legacy/sharded references may also contain `<out>.gxe.jackknife.npz`.
+  jackknife adds block IDs to the diagonal table but no probe-state artifact.
 - Batched GxE phenotype summaries: `<out>.<trait>.gxe.{gwas,gwis}.tsv.gz` and
   `<out>.<trait>.gxe.moments.json`.
 - GxE fit: `<out>.gxe.results.tsv`, `<out>.gxe.fit.json`, `<out>.gxe.log`;

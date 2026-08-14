@@ -138,7 +138,10 @@ from .ldscore.gxe_multi import (
     safe_environment_suffix,
 )
 from .ldscore.gxe_merge import merge_reference_shards
-from .ldscore.gxe_score import score_phenotypes_from_reference
+from .ldscore.gxe_score import (
+    score_phenotype_from_reference,
+    score_phenotypes_from_reference,
+)
 from .ldscore.win_ldscore import WindowedLDScore
 from .inference.sumrhe import Sumrhe
 from .inference.h2_batch_fast import dispatch_h2_batch_fast
@@ -350,8 +353,10 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         type=str,
         help=(
-            "Score every selected quantitative trait in --gxe-pheno against this "
-            "sealed schema-v3 GxE reference in one genotype pass."
+            "Score quantitative traits in --gxe-pheno against this sealed "
+            "schema-v3 GxE reference. The default matched-cohort mode supports "
+            "wide one-pass scoring; --gxe-population-reference scores one "
+            "trait-specific cohort."
         ),
     )
     parser.add_argument(
@@ -359,6 +364,16 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         type=str,
         help="Comma-separated wide-phenotype columns for --gxe-score-reference; default is all value columns.",
+    )
+    parser.add_argument(
+        "--gxe-population-reference",
+        action="store_true",
+        default=False,
+        help=(
+            "Use GxE LD/kernel moments estimated in the full reference cohort with a "
+            "different trait-specific GWAS/GWIS cohort. Requires exactly one "
+            "--gxe-pheno-col per scoring command."
+        ),
     )
 
     parser.add_argument("--compact", action="store_true", help="Write a compact rg manifest with only the core columns needed downstream.",)
@@ -852,18 +867,33 @@ def _dispatch_gxe_score(args, log):
             raise SystemExit("!!! --gxe-pheno-cols must contain at least one column name. !!!")
     elif args.gxe_pheno_col is not None:
         columns = (args.gxe_pheno_col,)
-    artifacts = score_phenotypes_from_reference(
+    common = dict(
         reference_manifest=args.gxe_score_reference,
         bed_path=args.geno,
         env_path=args.env,
         covar_path=args.covar,
         pheno_path=args.gxe_pheno,
-        pheno_cols=columns,
         output_prefix=args.out,
         missing_values=tuple(x.strip() for x in args.gxe_missing_values.split(",") if x.strip()),
         step_size=args.step_size,
         num_threads=args.num_threads,
     )
+    if args.gxe_population_reference:
+        if args.gxe_pheno_cols is not None or args.gxe_pheno_col is None:
+            raise SystemExit(
+                "!!! --gxe-population-reference requires exactly one --gxe-pheno-col. !!!"
+            )
+        bundle = score_phenotype_from_reference(
+            **common,
+            pheno_col=columns[0],
+            population_transfer=True,
+        )
+        artifacts = {columns[0]: bundle}
+    else:
+        artifacts = score_phenotypes_from_reference(
+            **common,
+            pheno_cols=columns,
+        )
     log._log(
         f"[gxe:score] wrote {len(artifacts)} phenotype score/moment triplet(s) "
         "from one genotype pass."
@@ -1869,6 +1899,11 @@ def main():
         raise SystemExit(1)
     if args.gxe_pheno_cols is not None and not gxe_score_mode:
         log._log("!!! --gxe-pheno-cols is valid only with --gxe-score-reference. !!!")
+        raise SystemExit(1)
+    if args.gxe_population_reference and not gxe_score_mode:
+        log._log(
+            "!!! --gxe-population-reference is valid only with --gxe-score-reference. !!!"
+        )
         raise SystemExit(1)
     if args.gxe_env_cols is not None:
         if not gxe_trace_mode:

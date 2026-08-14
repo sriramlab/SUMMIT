@@ -122,11 +122,11 @@ for smoke tests. Production analyses should check stability across probe counts
 and independent seeds. Exact two-sided legacy bundles remain readable, but
 ordinary reference construction does not generate their within-block traces.
 
-The current low-noise production contract uses B1024 (eight disjoint B128
-shards). B128/B256/B512 prefix merges and the independent second B512 half are
-geometry/convergence checkpoints; only the complete B1024 prefix is the final
-reference. The Monte Carlo standard error scales approximately as
-`1/sqrt(B)`, so B1024 has about one tenth the stochastic error of B10.
+The low-noise production target is B1024 in one reference transaction. Probe
+tiles are processed sequentially in memory and accumulated into the final four
+LD-score panels; no shard or probe-state artifact is written. The Monte Carlo
+standard error scales approximately as `1/sqrt(B)`, so B1024 has about one
+tenth the stochastic error of B10.
 
 ### Reference-construction backends
 
@@ -152,19 +152,20 @@ BLAS path because measured setup/amortization no longer favors Mailman.
 
 Ordinary reference generation computes projected-feature metadata internally
 and divides large probe counts into memory-bounded tiles. Users provide the
-cohort/design inputs and one output prefix. Exact jackknife generation retains
-only the global X/W sketch and one current deletion-block X/W sketch in memory;
-it does not create a disk-backed sketch cache.
+cohort/design inputs and one output prefix. The default block-local jackknife
+retains only the current global X/W probe tile in memory and records block IDs
+with the completed LD-score rows; it does not create a disk-backed probe
+store.
 
 For a wide environment table whose selected columns retain exactly the same
 complete-case cohort, `--gxe-env-cols E1,E2,...` shares each standardized
 genotype-block read across independent environment-specific references. The
-large sketch state remains memory-only and is tiled jointly against the stated
-sketch-memory budget. With `D` environments, one annotation, probe-tile width
-`V`, and `float32` sketches, exact jackknifing retains approximately
-`4 * D * N * V * 4` bytes for the global and current-block X/W sketches. The
-matrix algebra still grows linearly with `D`; the optimization removes repeated
-genotype decoding and input scans rather than changing the estimand.
+large probe state remains memory-only and is tiled jointly against the stated
+memory budget. With `D` environments, one annotation, probe-tile width
+`V`, and `float32` source panels, the source panels require approximately
+`2 * D * N * V * 4` bytes. The matrix algebra still grows linearly with `D`;
+the optimization removes repeated genotype decoding and input scans rather
+than changing the estimand.
 
 After wide scoring, `--gxe-fit-batch` accepts a strict
 `summit.gxe.fit_batch` manifest and validates the reference and score panels once
@@ -175,11 +176,9 @@ so per-trait jackknife work depends on compact annotation/block sufficient
 statistics rather than rescanning all SNPs for every deletion block. The
 single-trait `--gxe-fit` path uses the same equations.
 
-For exact two-sided jackknifing, production uses a norm pass, one source pass,
-one within-block target pass, and one global target pass. Each genotype variant
-is visited once per pass, independent of the number of deletion blocks. This
-additional sequential read avoids both a disk spill and an all-block in-memory
-allocation while preserving the exact randomized trace estimator.
+Older sealed exact two-sided jackknife bundles remain readable. Ordinary
+generation uses the block-local approximation and does not construct or write
+their within-block randomized trace state.
 
 ## Input contract and safety checks
 
@@ -197,18 +196,17 @@ allocation while preserving the exact randomized trace estimator.
   Analysis/variant fingerprints and mandatory per-file SHA-256 hashes enforce
   this for SUMMIT-generated bundles. Replacing, relabeling, or mixing one score,
   LD panel, diagonal table, or jackknife file makes fitting fail closed.
-  Phenotype moments record their generating reference and bind the exact
-  feature-cache SHA-256. This prevents mixing genotype content, samples,
-  covariates, modes, scales, annotations, or SNP axes, while deliberately
-  allowing the same marginal scores to be reused across B128/B1024 trace
-  checkpoints produced from that cache.
-- Schema-v3 reference and phenotype-score bundles currently use an exact
-  matched-cohort kernel contract. A larger environment-only LD panel cannot be
-  substituted merely by changing `N`: transferring its squared correlations to
-  a different study rank also requires finite-panel bias calibration and
-  study-specific NxE trace moments. Until that population-reference contract is
-  implemented and validated, SUMMIT fails closed on a reference/study cohort
-  mismatch.
+  Phenotype moments record and bind their exact generating reference-manifest
+  SHA-256. This prevents mixing genotype content, samples, covariates, modes,
+  scales, annotations, or SNP axes.
+- Matched-cohort scoring remains the default. Explicit
+  `--gxe-population-reference` scoring permits a different trait-specific
+  cohort for standardized kernels. It transfers the reference genetic trace
+  block by separately scaling same-person and different-person moments with
+  the reference/study sample counts. The study score pass supplies exact NxE
+  traces and genetic-by-NxE cross-traces. The ordered variant/allele axis,
+  annotations, environment/covariate names, and feature convention must still
+  match, and the phenotype bundle binds the exact reference manifest.
 - Variants with zero/invalid additive or interaction projected variance are an
   error. They must be QC-filtered before regenerating the entire bundle; they
   are never silently retained in annotation denominators as zero columns.
@@ -230,8 +228,8 @@ allocation while preserving the exact randomized trace estimator.
 - The fitter snapshots every consumed summary artifact into a private directory
   beside the requested output (or beside the moments file for direct API calls),
   hashes and parses those same bytes, and removes the snapshots on exit. Allow
-  temporary disk approximately equal to the compressed cache, four panels,
-  diagonal, jackknife, and two score files; Hoffman fits therefore keep both
+  temporary disk approximately equal to the four panels, diagonal, optional
+  legacy jackknife, and two score files; Hoffman fits therefore keep both
   outputs and snapshot workspace under the designated scratch root rather than
   node-local `/tmp`.
 
@@ -259,11 +257,14 @@ sample outputs cannot be converted by a generic formula.
 
 ## Scope
 
-The current robust path is deliberately in-sample and environment-specific.
-Interaction traces depend on the joint genotype/environment distribution and
-on the fixed-effect projection; ordinary ancestry-matched LD alone is not
-enough. Using an external reference requires a separate fourth-moment/scaling
-derivation and calibration and is not silently enabled here.
+Both matched-cohort and explicit population-reference paths are supported for
+one environment. Interaction traces depend on the joint
+genotype/environment distribution and fixed-effect convention; ordinary
+ancestry-matched additive LD alone is not enough. Population transfer assumes
+the reference and trait cohorts sample the same joint genotype, environment,
+and covariate distribution. Without that assumption there is no exact
+external-cohort reconstruction and the estimator targets a reference-weighted
+pseudo-parameter.
 
 ## Reuse and computational boundary
 
@@ -289,10 +290,12 @@ portable, privacy-preserving summary operations and can reuse batched marginal
 scores without reloading the individual-level cohort. Conventional conditional
 `ADDxE` output does not remove the need for the matched marginal score contract.
 
-The implementation is for one quantitative environment and quantitative
-traits sharing one fixed complete-case cohort, with PLINK 1 BED input for the
-environment-specific reference/score generator. Wide traits are scored in one
-pass, but each variance-component fit remains univariate. Multi-environment
+The implementation is for one numeric environment and quantitative traits,
+with PLINK 1 BED input for the environment-specific reference/score generator.
+The default wide path requires one fixed complete-case cohort; the explicit
+population-reference scalar path permits trait-specific missingness. Wide
+traits are scored in one pass, but each variance-component fit remains
+univariate. Multi-environment
 covariance structures, PGEN streaming, and binary-trait estimators are future
 extensions.
 

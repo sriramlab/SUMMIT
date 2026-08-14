@@ -103,7 +103,7 @@ def cached_reference(tmp_path_factory) -> CachedReferenceFixture:
         low_level=None,
         covar_path=str(covariates),
         pheno_path=str(phenotype),
-        num_vecs=5,
+        num_vecs=32,
         step_size=m,
         seed=31,
         verbose=False,
@@ -210,6 +210,77 @@ def test_cached_scoring_matches_reference_generation_and_decodes_once(
         max_condition=1e16,
     )
     assert fitted.rhs.shape == equations.rhs.shape == (6,)
+
+
+def test_population_reference_scores_trait_specific_cohort_and_fits(
+    cached_reference, tmp_path
+):
+    phenotype = pd.read_csv(cached_reference.phenotype, sep=r"\s+")
+    phenotype.loc[0, "Y"] = np.nan
+    study_phenotype = tmp_path / "trait-specific.tsv"
+    phenotype.to_csv(study_phenotype, sep="\t", index=False, na_rep="NA")
+
+    artifacts = gxe_score.score_phenotype_from_reference(
+        reference_manifest=cached_reference.manifest,
+        bed_path=cached_reference.genotype_prefix,
+        env_path=cached_reference.environment,
+        covar_path=cached_reference.covariates,
+        pheno_path=study_phenotype,
+        pheno_col="Y",
+        output_prefix=tmp_path / "population-score",
+        population_transfer=True,
+        step_size=4,
+        num_threads=1,
+    )
+    moments = json.loads(artifacts.moments.read_text())
+    assert moments["reference_mode"] == "population"
+    assert moments["n_samples"] == cached_reference.n_samples - 1
+    assert moments["residual_rank"] < json.loads(
+        cached_reference.manifest.read_text()
+    )["residual_rank"]
+    assert moments["trace_nxe"] > 0.0
+    assert moments["trace_nxe_sq"] > 0.0
+    assert moments["fixed_effect_rank_excluding_intercept"] >= 1
+    population_design = moments["population_design"]
+    assert population_design["method"] == "exact_projected_feature_nxe_v1"
+    assert population_design["feature_order"] == ["G:a", "G:b", "GxE:a", "GxE:b"]
+    assert np.all(np.asarray(population_design["genetic_nxe_traces"]) > 0.0)
+
+    fitted, equations = fit_from_files(
+        cached_reference.manifest,
+        artifacts.moments,
+        artifacts.gwas,
+        artifacts.gwis,
+        allow_ill_conditioned=True,
+        max_condition=1e16,
+    )
+    assert fitted.rhs.shape == equations.rhs.shape == (6,)
+    assert np.all(np.isfinite(equations.matrix))
+
+
+def test_nxe_traces_match_explicit_projected_kernel():
+    rng = np.random.default_rng(20260814)
+    n = 31
+    intercept = np.full((n, 1), 1.0 / math.sqrt(float(n)))
+    covariates = rng.normal(size=(n, 3))
+    covariates -= covariates.mean(axis=0, keepdims=True)
+    fixed_basis, _ = np.linalg.qr(covariates, mode="reduced")
+    environment = rng.normal(size=n)
+    environment = (environment - environment.mean()) / environment.std(ddof=1)
+
+    q_basis = np.column_stack([intercept, fixed_basis])
+    projector = np.eye(n) - q_basis @ q_basis.T
+    nxe_kernel = projector @ np.diag(environment * environment) @ projector
+    observed_trace, observed_trace_sq = gxe_score._nxe_traces(
+        environment, fixed_basis
+    )
+
+    np.testing.assert_allclose(observed_trace, np.trace(nxe_kernel), rtol=2e-14)
+    np.testing.assert_allclose(
+        observed_trace_sq,
+        np.trace(nxe_kernel @ nxe_kernel),
+        rtol=2e-14,
+    )
 
 
 def test_cached_scoring_refuses_overwrite_without_changing_outputs(

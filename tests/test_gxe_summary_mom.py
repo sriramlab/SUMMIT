@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pandas as pd
@@ -19,9 +20,11 @@ from summit.inference.gxe import (
     assemble_normal_equations,
     load_fit_batch_manifest,
     solve_normal_equations,
+    transfer_reference_normal_equations,
     write_fit,
     write_fits,
 )
+from summit.ldscore.gwe_ldscore import GenomewideEnvLDScore
 
 
 def _projector(design: np.ndarray) -> tuple[np.ndarray, int]:
@@ -104,6 +107,115 @@ def test_summary_equations_equal_explicit_genie_kernels():
     direct = np.linalg.solve(lhs, rhs)
     fitted = solve_normal_equations(equations, max_condition=1e16)
     np.testing.assert_allclose(fitted.coefficients, direct, rtol=2e-12, atol=2e-12)
+
+
+def test_population_trace_transfer_is_identity_at_the_reference_rank():
+    equations, lhs, _, _ = _exact_fixture()
+    genetic_count = lhs.shape[0] - 2
+    reference_traces = np.array(equations.traces, copy=True)
+    reference_traces[:genetic_count] = 37.0
+    equations = replace(equations, traces=reference_traces)
+    same = np.diag(np.diag(lhs[:genetic_count, :genetic_count]))
+    transferred = transfer_reference_normal_equations(
+        equations,
+        reference_n_samples=41,
+        study_n_samples=41,
+        reference_residual_rank=37,
+        study_residual_rank=37,
+        same_individual_products=same,
+        genetic_nxe_traces=lhs[:genetic_count, genetic_count],
+        q_nxe=4.0,
+        q_residual=37.0,
+        trace_nxe=8.0,
+        trace_nxe_sq=11.0,
+    )
+    np.testing.assert_allclose(
+        transferred.matrix[:genetic_count, :genetic_count],
+        equations.matrix[:genetic_count, :genetic_count],
+        rtol=0.0,
+        atol=2e-13,
+    )
+    np.testing.assert_allclose(
+        transferred.traces[:genetic_count],
+        equations.traces[:genetic_count],
+        rtol=0.0,
+        atol=0.0,
+    )
+    assert transferred.matrix[-2, -2] == 11.0
+    assert transferred.matrix[-2, -1] == 8.0
+    assert transferred.matrix[-1, -1] == 37.0
+
+
+def test_population_trace_transfer_scales_same_and_different_person_terms():
+    equations, lhs, _, _ = _exact_fixture()
+    genetic_count = lhs.shape[0] - 2
+    reference_traces = np.array(equations.traces, copy=True)
+    reference_traces[:genetic_count] = 20.0
+    equations = replace(equations, traces=reference_traces)
+    same = 0.35 * lhs[:genetic_count, :genetic_count]
+    genetic_nxe = np.linspace(4.0, 7.0, genetic_count)
+    transferred = transfer_reference_normal_equations(
+        equations,
+        reference_n_samples=30,
+        study_n_samples=70,
+        reference_residual_rank=20,
+        study_residual_rank=50,
+        same_individual_products=same,
+        genetic_nxe_traces=genetic_nxe,
+        q_nxe=7.0,
+        q_residual=50.0,
+        trace_nxe=12.0,
+        trace_nxe_sq=18.0,
+    )
+    expected = (
+        (70.0 / 30.0) * same
+        + (70.0 * 69.0 / (30.0 * 29.0))
+        * (lhs[:genetic_count, :genetic_count] - same)
+    )
+    np.testing.assert_allclose(
+        transferred.matrix[:genetic_count, :genetic_count], expected
+    )
+    np.testing.assert_allclose(
+        transferred.matrix[:genetic_count, genetic_count], genetic_nxe
+    )
+
+
+def test_population_same_person_probe_u_statistic_matches_dense_target():
+    rng = np.random.default_rng(481)
+    n, m, probes = 25, 12, 4096
+    x = rng.normal(size=(n, m))
+    w = rng.normal(size=(n, m))
+    z = rng.choice(np.array([-1.0, 1.0]), size=(m, probes))
+    sources = np.asfortranarray(np.column_stack([x @ z, w @ z]))
+    square_sums = np.zeros((n, 2), dtype=np.float64)
+    same_probe = np.zeros((2, 2), dtype=np.float64)
+    estimator = SimpleNamespace(
+        nsamp=n,
+        nbins=1,
+        nvecs=probes,
+        nsnps_bin=np.array([m], dtype=np.float64),
+    )
+    GenomewideEnvLDScore._accumulate_population_diagonal_moments(
+        estimator,
+        sources,
+        probes,
+        square_sums,
+        same_probe,
+    )
+    observed = GenomewideEnvLDScore._finalize_population_diagonal_moments(
+        estimator,
+        square_sums,
+        same_probe,
+    )
+    diagonal_x = np.sum(x * x, axis=1) / m
+    diagonal_w = np.sum(w * w, axis=1) / m
+    expected = np.array(
+        [
+            [diagonal_x @ diagonal_x, diagonal_x @ diagonal_w],
+            [diagonal_w @ diagonal_x, diagonal_w @ diagonal_w],
+        ]
+    )
+    np.testing.assert_allclose(observed, expected, rtol=0.025, atol=0.0)
 
 
 def test_directional_cross_panels_are_not_interchangeable_per_snp():

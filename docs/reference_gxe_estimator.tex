@@ -1,0 +1,575 @@
+\documentclass[11pt]{article}
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb,bm,booktabs,array,microtype}
+\usepackage[hidelinks]{hyperref}
+\usepackage{xcolor}
+\newcommand{\tr}{\operatorname{tr}}
+\newcommand{\diag}{\operatorname{diag}}
+\newcommand{\E}{\mathbb E}
+\newcommand{\R}{\mathbb R}
+\newcommand{\bI}{\bm I}
+\newcommand{\bP}{\bm P}
+\newcommand{\bK}{\bm K}
+\newcommand{\by}{\bm y}
+\newcommand{\be}{\bm e}
+\newcommand{\bX}{\bm X}
+\newcommand{\bW}{\bm W}
+\newcommand{\bC}{\bm C}
+\newcommand{\bD}{\bm D}
+\newcommand{\bone}{\bm 1}
+
+\title{A reference-cohort summary estimator for genetic and gene--environment variance components}
+\author{SUMMIT technical report}
+\date{14 August 2026}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+GENIE estimates additive genetic (G), gene--environment (G$\times$E),
+noise--environment (N$\times$E), and residual variance components from one
+individual-level cohort.  Rewriting GENIE's right-hand side in terms of
+marginal GWAS and GWIS scores is exact when the kernel traces and the scores
+come from the same individuals.  It is not, by itself, a reusable reference
+method.  This report derives the additional moments needed when G and
+G$\times$E kernel quantities are estimated in an independent cohort containing
+all individuals with measured environment, while trait-specific marginal
+scores may use smaller and different samples.  The key is to transfer the
+same-individual and different-individual parts of each genetic kernel-product
+trace separately.  For G$\times$E, the same-individual term is a non-universal
+fourth moment and cannot be replaced by the additive-only constant.  It can be
+estimated during the existing randomized, in-memory reference pass with an
+order-two probe U-statistic and $O(N_RK)$ additional memory, independent of the
+number of probes.  Study-specific N$\times$E moments remain exact low-dimensional
+summaries.  We also audit covariate handling in the released GENIE code and
+distinguish two coherent feature definitions from the incoherent mixture of
+raw projected kernels and hard-coded traces.
+\end{abstract}
+
+\section{Notation and generative assumptions}
+
+We follow the notation of Kerin and Marchini~\cite{genie}.  Cohort $S$ is the
+trait study and cohort $R$ is the reusable reference.  They share an ordered
+set of $M$ variants and the same annotation weights $A_{jk}\geq0$,
+$k=1,\ldots,K$, with $M_k=\sum_j A_{jk}$.  Their individuals need not be the
+same.  Let $\bC_S$ contain an intercept, the environment, and the other fixed
+effects used by the trait analysis.  Define
+\begin{equation}
+ \bP_S=\bI-\bC_S(\bC_S^\top\bC_S)^+\bC_S^\top,
+ \qquad r_S=\tr(\bP_S)=N_S-\operatorname{rank}(\bC_S),
+ \label{eq:projector}
+\end{equation}
+where $(\cdot)^+$ is the Moore--Penrose inverse.  The same definitions apply
+to $R$.
+
+Let $\bm G_S$ be a centered, pre-scaled genotype matrix and let $\be_S$ be a
+centered environment measured in standard-deviation units.  The default
+one-environment GENIE generative model, before fixed-effect projection, is
+\begin{equation}
+ \widetilde{\by}_S=\bm G_S\widetilde{\bm\beta}
+  +\diag(\be_S)\bm G_S\widetilde{\bm\alpha}
+  +\diag(\be_S)\bm\delta+\bC_S\bm\gamma+\bm\varepsilon.
+ \label{eq:rawmodel}
+\end{equation}
+The published framework allows several environments; the present derivation
+applies to one environment at a time.  GENIE uses the naturally scaled
+projected columns $\bP_S\bm G_S$ and
+$\bP_S\diag(\be_S)\bm G_S$.  SUMMIT's default instead restandardizes those
+columns after projection:
+\begin{align}
+ \bm U_S&=\bP_S\bm G_S,&
+ \bX_{S,:,j}&=\bm U_{S,:,j}
+       \sqrt{\frac{r_S}{\bm U_{S,:,j}^\top\bm U_{S,:,j}}},\nonumber\\
+ \bm V_S&=\bP_S\diag(\be_S)\bm G_S,&
+ \bW_{S,:,j}&=\bm V_{S,:,j}
+       \sqrt{\frac{r_S}{\bm V_{S,:,j}^\top\bm V_{S,:,j}}}.
+ \label{eq:features}
+\end{align}
+Thus every retained column of $\bX_S$ and $\bW_S$ has squared norm $r_S$.
+This is the G$\times$E analogue of SUMMIT's covariate-residualized,
+restandardized additive feature definition~\cite{summit}.  The two choices
+define different random-effect scalings, but the method-of-moments algebra
+below is the same when all traces and scores use one choice coherently.  The
+external implementation uses the standardized choice.  Define
+\begin{align}
+ \bK^G_{Sk}&=\frac{\bX_S\diag(\bm A_{:k})\bX_S^\top}{M_k},&
+ \bK^I_{Sk}&=\frac{\bW_S\diag(\bm A_{:k})\bW_S^\top}{M_k},\nonumber\\
+ \bD_S&=\bP_S\diag(\be_S^2)\bP_S,&
+ \bK^0_S&=\bP_S.
+ \label{eq:kernels}
+\end{align}
+The superscript $I$ denotes interaction and avoids confusing an environment
+vector with an expectation.
+
+The residualized phenotype is generated under the second-moment model
+\begin{equation}
+ \by_S=\sum_{k=1}^K\bX_S\bm\beta_k
+       +\sum_{k=1}^K\bW_S\bm\alpha_k
+       +\bP_S\diag(\be_S)\bm\delta+\bP_S\bm\varepsilon,
+ \label{eq:model}
+\end{equation}
+with mutually uncorrelated, mean-zero effects
+\begin{align*}
+ \operatorname{Cov}(\bm\beta_k)&=\frac{\sigma^2_{Gk}}{M_k}
+       \diag(\bm A_{:k}),&
+ \operatorname{Cov}(\bm\alpha_k)&=\frac{\sigma^2_{Ik}}{M_k}
+       \diag(\bm A_{:k}),\\
+ \operatorname{Cov}(\bm\delta)&=\sigma_D^2\bI,&
+ \operatorname{Cov}(\bm\varepsilon)&=\sigma_0^2\bI.
+\end{align*}
+For overlapping annotations this is understood as a linear covariance model;
+the coefficients need not each be nonnegative.  Conditional on the design,
+\begin{equation}
+ \bm\Sigma_S=\operatorname{Cov}(\by_S\mid\bX_S,\bW_S,\be_S,\bC_S)
+ =\sum_k\sigma^2_{Gk}\bK^G_{Sk}
+ +\sum_k\sigma^2_{Ik}\bK^I_{Sk}
+ +\sigma_D^2\bD_S+\sigma_0^2\bP_S.
+ \label{eq:covariance}
+\end{equation}
+No Gaussian assumption on the effects is required for the moment equations.
+
+\section{GENIE as an in-sample method-of-moments estimator}
+
+Index the $2K+2$ kernels in Eq.~\eqref{eq:covariance} by
+$\mathcal K_S=(\bK^G_{S1},\ldots,\bK^G_{SK},
+\bK^I_{S1},\ldots,\bK^I_{SK},\bD_S,\bP_S)$ and collect their coefficients in
+$\bm\theta$.  GENIE minimizes the Frobenius loss
+\begin{equation}
+ \left\|\by_S\by_S^\top-\sum_a\theta_a\mathcal K_{Sa}\right\|_F^2.
+\end{equation}
+Differentiation gives the normal equations
+\begin{equation}
+ \bm T_S\widehat{\bm\theta}=\bm q_S,
+ \qquad (T_S)_{ab}=\tr(\mathcal K_{Sa}\mathcal K_{Sb}),
+ \qquad (q_S)_a=\by_S^\top\mathcal K_{Sa}\by_S.
+ \label{eq:normal}
+\end{equation}
+This is precisely Supplemental Note~S1 of GENIE after writing the projected
+kernels explicitly~\cite{geniesupp}.  GENIE estimates large traces by
+Hutchinson random projection: for independent isotropic probes $\bm z_v$,
+\begin{equation}
+ \tr(\mathcal K_a\mathcal K_b)
+ =\E_v[(\mathcal K_a\bm z_v)^\top(\mathcal K_b\bm z_v)].
+\end{equation}
+
+For a genetic family $F\in\{G,I\}$, define the marginal HE-scale score
+\begin{equation}
+ s^F_{Sj}=\frac{\bm F_{S,:,j}^\top\by_S}{\sqrt{r_S}}.
+ \label{eq:score}
+\end{equation}
+It follows exactly that
+\begin{equation}
+ \by_S^\top\bK^F_{Sk}\by_S
+ =\frac{r_S}{M_k}\sum_j A_{jk}(s^F_{Sj})^2.
+ \label{eq:rhs}
+\end{equation}
+The required statistics are marginal cross-products after the common
+fixed-effect projection.  A usual conditional interaction Wald statistic is
+not interchangeable with Eq.~\eqref{eq:score} unless its numerator and scale
+are transformed back to this marginal score.
+
+Let
+\begin{equation}
+ L^{FH}_{S,jk}=\sum_m A_{mk}
+ \left(\frac{\bm F_{S,:,j}^\top\bm H_{S,:,m}}{r_S}\right)^2.
+ \label{eq:ldpanel}
+\end{equation}
+Then the genetic block of Eq.~\eqref{eq:normal} is also exact:
+\begin{equation}
+ \tr(\bK^F_{Sk}\bK^H_{S\ell})
+ =\frac{r_S^2}{M_kM_\ell}\sum_j A_{jk}L^{FH}_{S,j\ell}.
+ \label{eq:exacttrace}
+\end{equation}
+Equations~\eqref{eq:rhs} and \eqref{eq:exacttrace} explain the existing
+matched-cohort summary implementation.  They do \emph{not} justify inserting
+an independently estimated $L_R$ into Eq.~\eqref{eq:exacttrace}: the
+finite-cohort trace has both same-person fourth moments and different-person
+LD moments, which scale differently with cohort size.
+
+\section{A genuinely reusable reference estimator}
+
+\subsection{Population transport assumptions}
+
+The reference construction requires the following assumptions.
+\begin{enumerate}
+ \item Cohorts $R$ and $S$ are independent draws from the same target
+ population, with the same variant/allele and annotation definitions.
+ \item After applying the declared fixed-effect convention and per-cohort
+ restandardization, the joint second and fourth moments of $(X,W,E)$ are
+ transportable.  Fixed-effect dimension is small relative to cohort size, so
+ the projection's dependence and leverage perturb the exchangeable-individual
+ moments only at lower order.  Large leverage differences or
+ population/LD/environment shift violate this assumption.
+ \item Trait missingness may change $N_S$ but is ignorable conditional on the
+ modeled variables.  Genotypes, environment, and covariates used to form the
+ marginal scores obey the same feature convention as the reference.
+\end{enumerate}
+These are reference-panel assumptions, not algebraic identities.  If the
+joint G--E distribution differs, the estimator converges to a reference-weighted
+pseudo-parameter, just as additive SUMMIT with mismatched LD has target
+$(\bm A_R)^{-1}\bm A_S\bm h^2$~\cite{summit}.
+
+\subsection{Same-person and different-person trace moments}
+
+For any genetic kernels $a=(F,k)$ and $b=(H,\ell)$, write
+\begin{align}
+ D^C_{ab}&=\sum_{i=1}^{N_C}K^C_a(i,i)K^C_b(i,i),\nonumber\\
+ O^C_{ab}&=\sum_{i\ne i'}K^C_a(i,i')K^C_b(i,i'),\qquad
+ T^C_{ab}=D^C_{ab}+O^C_{ab}.
+ \label{eq:do}
+\end{align}
+The split is on the individual axis, not an arbitrary orthonormal basis for
+the residual subspace.  Residual rank $r_C$ controls feature and score
+normalization, but it is not the number of exchangeable people.  Define
+population moments
+\begin{equation}
+ d_{ab}=\E[K_a(i,i)K_b(i,i)],\qquad
+ o_{ab}=\E[K_a(i,i')K_b(i,i')],\quad i\ne i'.
+\end{equation}
+Then
+\begin{equation}
+ \E[T^S_{ab}]=N_Sd_{ab}+N_S(N_S-1)o_{ab}.
+ \label{eq:populationtrace}
+\end{equation}
+The reference estimators are
+\begin{equation}
+ \widehat d_{ab}=\frac{\widehat D^R_{ab}}{N_R},\qquad
+ \widehat o_{ab}=\frac{\widehat T^R_{ab}-\widehat D^R_{ab}}
+ {N_R(N_R-1)},
+\end{equation}
+and therefore
+\begin{equation}
+ \boxed{\widehat T^{S\mid R}_{ab}
+ =\frac{N_S}{N_R}\widehat D^R_{ab}
+ +\frac{N_S(N_S-1)}{N_R(N_R-1)}
+  (\widehat T^R_{ab}-\widehat D^R_{ab}).}
+ \label{eq:transfer}
+\end{equation}
+When $N_S=N_R$, Eq.~\eqref{eq:transfer} returns the original reference trace
+exactly.  For additive standardized genotypes, $D^R$ is close to the familiar
+$N_R$-order baseline.  For G$\times$E, it contains quantities such as
+$\E[X^2E^2X'^2E'^2]$ and is not universal.  This is the precise reason that
+blind squared-rank scaling, or importing the additive leading term, fails.
+There is no assumption-free way to recover a study's conditional trace from
+an independent cohort.  Equation~\eqref{eq:transfer} is the reference-panel
+estimator under the population-transport assumptions above; without them the
+target is necessarily reference weighted.
+
+\subsection{Estimating the fourth-moment term without a second genotype pass}
+
+For feature family $a=(F,k)$ and probe $v$, the reference trace pass already
+forms
+\begin{equation}
+ S_{aiv}=\sum_jF_{R,ij}\sqrt{A_{jk}}z_{jv},
+ \qquad \E_z[S_{aiv}^2]=M_kK^R_a(i,i).
+\end{equation}
+For $B\ge2$, an unbiased order-two probe U-statistic is
+\begin{equation}
+ \widehat D^R_{ab}=
+ \frac{1}{B(B-1)M_kM_\ell}
+ \sum_i\left[
+  \left(\sum_vS_{aiv}^2\right)\left(\sum_uS_{biu}^2\right)
+  -\sum_vS_{aiv}^2S_{biv}^2
+ \right].
+ \label{eq:ustat}
+\end{equation}
+The subtraction excludes identical probes; different probe indices are
+independent even when annotations overlap and G/G$\times$E sketches share the
+same underlying probe.  An implementation needs an $N_R\times2K$ matrix of
+running square sums and one $2K\times2K$ accumulator.  Temporary conversion is
+chunked over probes.  Memory is $16N_RK+O(K^2)$ bytes in float64 and is
+independent of $B$; at $N_R=291{,}273,K=1$ it is about 4.4 MiB.  No source
+sketch, block sketch, or cache is written to disk.
+
+\subsection{N$\times$E and residual moments}
+
+N$\times$E is study specific and cheap; it should not be borrowed from $R$.
+Let $\bm Q_S$ be an orthonormal basis for the fixed effects and
+$\bm d_S=\be_S^2$.  With $\bD_S=\bP_S\diag(\bm d_S)\bP_S$,
+\begin{align}
+ \tr(\bD_S)
+ &=\sum_i d_{Si}-\tr(\bm Q_S^\top\diag(\bm d_S)\bm Q_S),\label{eq:trd}\\
+ \tr(\bD_S^2)
+ &=\sum_i d_{Si}^2
+ -2\tr(\bm Q_S^\top\diag(\bm d_S^2)\bm Q_S)
+ +\tr\{(\bm Q_S^\top\diag(\bm d_S)\bm Q_S)^2\}.
+ \label{eq:trd2}
+\end{align}
+The phenotype supplies
+\begin{equation}
+ q_D=\by_S^\top\bD_S\by_S=\|\be_S\odot\by_S\|^2,
+ \qquad q_0=\by_S^\top\by_S=r_S,
+\end{equation}
+on SUMMIT's normalized residual scale.  Cross-traces with genetic kernels are
+also exact study summaries.  The same pass that computes marginal GWAS/GWIS
+scores forms
+\begin{equation}
+ d^F_{Sj}=\frac{\bm F_{S,:,j}^{\top}\diag(\be_S^2)
+                    \bm F_{S,:,j}}{r_S},\qquad
+ \tr(\bK^F_{Sk}\bD_S)=\frac{r_S}{M_k}\sum_j A_{jk}d^F_{Sj},
+ \label{eq:kd}
+\end{equation}
+because projected feature columns satisfy
+$\bP_S\bm F_{S,:,j}=\bm F_{S,:,j}$.  This costs no extra genotype decode and
+avoids transporting an environment-sensitive fourth moment.  Because
+Eq.~\eqref{eq:features} makes
+$\tr(\bK^S_a)=r_S$, genetic--residual cross-traces are exact.
+
+Equations~\eqref{eq:rhs}, \eqref{eq:transfer}, \eqref{eq:trd}--\eqref{eq:kd}
+fill every entry of the study normal equations.  Solving them estimates the
+four classes $(G,G\times E,N\times E,\text{residual})$ using genotype/environment
+moments from all eligible reference individuals and trait-specific marginal
+scores from the study cohort.
+
+\subsection{The summary-data boundary}
+
+The reusable reference object contains the ordered variant/allele and
+annotation definitions, $N_R,r_R$, the randomized genetic trace matrix
+$\widehat{\bm T}_R$, and the compact same-individual matrix
+$\widehat{\bm D}_R$.  These quantities are phenotype independent and are
+computed once in every individual with an observed environment and reference
+covariates.  For each trait, the required study object is
+\begin{equation}
+ \mathcal S_y=\{N_S,r_S,\bm s^G_S,\bm s^I_S,
+ q_D,q_0,\tr(\bD_S),\tr(\bD_S^2),
+ \tr(\bK^G_{Sk}\bD_S),\tr(\bK^I_{Sk}\bD_S)\}_{k=1}^K.
+ \label{eq:summaryinterface}
+\end{equation}
+The two score vectors are marginal GWAS/GWIS cross-products.  The remaining
+terms are scalars or $O(K)$ design summaries.  Equation~\eqref{eq:kd} lets the
+genetic--N$\times$E terms be accumulated in the same streamed genotype pass
+that produces GWAS/GWIS, with no randomized trace calculation and no second
+decode.  Once $\mathcal S_y$ is written, fitting uses no individual-level
+phenotype, genotype, or environment.  Thus trait missingness affects the cheap
+trait summary but does not force reconstruction of the all-E G$\times$E
+reference.
+
+\subsection{Uncertainty and identifiability}
+
+There are three uncertainty sources: trait-score sampling, finite reference
+sampling, and randomized-probe error.  A SNP-block jackknife deletes the
+corresponding GWAS/GWIS score rows and reference LD-score rows.  The default
+block-local approximation assumes cross-block LD is negligible and reuses the
+full-reference $\widehat D^R$ in each replicate.  This omits a change of order
+the deleted SNP fraction in the diagonal term, so it is an explicit
+approximation whose stability should be checked when blocks are few, large, or
+annotation-imbalanced.  An exact deletion would require block-specific
+cross-sketch moments and is intentionally not the production default.
+
+Increasing $B$ reduces only probe error.  It cannot repair reference mismatch
+or an unidentified model.  In particular, if $E^2$ is constant after
+projection, $\bD_S$ is proportional to $\bP_S$ and N$\times$E is aliased with
+residual noise.  Collinear annotation kernels cause analogous rank failure.
+
+\section{Validation}
+
+Three independent checks were used.
+\begin{enumerate}
+ \item A dense oracle forms all individual-level kernels and verifies that the
+ matched summary equations reproduce every GENIE matrix, right-hand side, and
+ trace entry to floating-point tolerance (maximum tested discrepancy below
+ $2\times10^{-13}$).
+ \item Setting $N_S=N_R$ in the implemented transfer reproduces the complete
+ reference genetic block exactly, irrespective of how $T_R$ is split into
+ $D_R$ and $O_R$.
+ \item In a separate continuous-$E$ Monte Carlo experiment, an independent
+ $N_R=2500$ reference and 60 independent $N_S=350$ studies used $M=60$
+ correlated Gaussian markers (AR(1) correlation $0.35$), with intercept and
+ $E$ projected out.  Median relative errors of Eq.~\eqref{eq:transfer} were
+ 2.17\% (G--G), 3.14\% (G--G$\times$E), and 2.23\%
+ (G$\times$E--G$\times$E).  Blind squared-rank scaling gave 9.27\%, 86.46\%,
+ and 23.51\%, respectively.  Genetic--N$\times$E cross-traces were computed
+ exactly in each study rather than transported.  These are finite-reference
+ errors, not claimed universal operating characteristics.
+\end{enumerate}
+An end-to-end integration test also constructs one reference, removes a trait
+value to create a different study cohort, writes the study GWAS/GWIS moments,
+and fits the transferred equations.
+
+\section{Covariates and restandardization in released GENIE code}
+
+The equations in the GENIE paper are coherent: with
+$\bm V=\bI-\bC(\bC^\top\bC)^{-1}\bC^\top$, Supplemental Note~S1 uses
+$\tr(K_kVK_\ell V)$, $\tr(VK_k)$, $\by^\top VK_kV\by$, and residual dimension
+$N-C$~\cite{geniesupp}.  The concerns below apply to the released code at
+commit \texttt{22bee9c}, not to that formal derivation.
+
+\paragraph{Ordinary inverse and column count.}
+The implementation computes \texttt{Q = WtW.inverse()} and sets the residual
+dimension to \texttt{Nindv\_mask - Ncov}~\cite{geniecodecov}.  This is correct
+only if the retained covariate columns are exactly full rank and numerically
+well conditioned.  Environment, intercept, duplicated indicators, or a
+constant covariate can make that false.  A rank-revealing QR/SVD and
+$N-\operatorname{rank}(C)$ are required for the projector in
+Eq.~\eqref{eq:projector}.
+
+\paragraph{Scaling before the analysis mask.}
+The genotype code computes allele means over \texttt{Nindv} and applies the
+HWE scale $\{2p(1-p)\}^{-1/2}$ before the phenotype/environment mask and
+fixed-effect projection~\cite{geniecodescale}.  Consequently a retained,
+projected column generally does not have squared norm $N_{\rm mask}$ or
+$N_{\rm mask}-\operatorname{rank}(C)$.  This is especially visible when trait
+missingness creates a much smaller analysis sample.
+
+\paragraph{The important distinction: two coherent estimands and one
+incoherent hybrid.}
+There are two valid choices.
+\begin{enumerate}
+ \item \emph{Raw projected kernel:} use $U=PX$ and $W=P(E\odot X)$ without
+ post-projection scaling.  This defines a valid model, but every trace,
+ including $\tr(K)$, must be computed from the realized columns and the random
+ effect prior is tied to the pre-projection genotype scale.
+ \item \emph{Restandardized projected kernel:} rescale every projected column
+ as in Eq.~\eqref{eq:features}.  Then all genetic kernel traces equal $r$ and
+ summary moments have a stable, cohort-comparable per-residual-SD definition.
+ This is SUMMIT's default.
+\end{enumerate}
+The released GENIE implementation initializes each additive genetic trace to
+\texttt{Nindv\_mask}, while interaction/noise traces are estimated from the
+random projections, and then applies a projection subtraction~\cite{geniecodetrace}.
+That mixes the raw-kernel Gram and phenotype moments with a unit-norm additive
+trace assumption that the preceding HWE scaling/masking does not guarantee.
+The problem is not simply ``GENIE fails to restandardize'': raw projected
+kernels are legitimate.  The problem is using their realized Gram/RHS while
+hard-coding a trace from the alternative standardized-kernel convention.
+
+\paragraph{Phenotype scaling.}
+The default code standardizes the phenotype, projects covariates, and then
+standardizes the projected phenotype again using denominator
+$N_{\rm mask}-1$~\cite{geniecodepheno}, while the residual kernel dimension is
+declared $N_{\rm mask}-N_{\rm cov}$.  Because the code retains the realized
+$\by^\top\by$ in the normal equations, phenotype rescaling alone is not
+necessarily a bias.  It does, however, mean that reported components are not
+automatically on the $r$-normalized scale and should not be combined with
+hard-coded $r$ traces without an explicit scale conversion.
+
+These issues can be small when covariates are full rank, missingness is mild,
+and HWE scaling nearly matches the retained sample variance.  They are not
+algebraically controlled in the released implementation.  SUMMIT instead uses
+a rank-revealing orthonormal basis, records the numerical rank, applies the
+trait/reference mask before feature construction, and either restandardizes
+projected columns or computes their actual traces consistently.
+
+\section{Computational implications}
+
+The new population statistic does not change the dominant complexity.  With
+$B$ probes, $K$ annotations, $M$ variants, and streamed genotype blocks, the
+G/G$\times$E reference remains linear in $N_R$, $M$, $B$, and $K$ for $K=1$
+(and in the number of requested directional annotation products generally).
+The added Eq.~\eqref{eq:ustat} work is $O(N_RBK^2)$ but has a very small
+constant and no genotype decode or large matrix multiply; its persistent
+memory is $O(N_RK)$.
+
+On tabla, a full $N_R=291{,}273$, $M=454{,}207$, $B=32$ EUR age calculation
+completed its numerical work in 1,939.5 seconds and peaked at 4.05 GiB.  Its
+feature, source, panel-preparation, and target phases took 523.3, 347.8, 0.18,
+and 979.9 seconds.  The artifacts from this diagnostic were deliberately not
+sealed: the native extension file was rebuilt during the run, and SUMMIT's
+executable-inode guard rejected publication.  The timing and integrity counts
+were recorded before that publication failure, but this is not a completed
+scientific reference.
+
+A direct $B/32$ extrapolation is too pessimistic because the $B=32$ products
+are skinny.  In a dense-oracle benchmark with $N=100{,}000$ and $M=1{,}000$,
+increasing $B$ from 32 to 512 increased native source time from 0.319 to 1.267
+seconds (3.97-fold) and the relevant 2$B$ target time from 0.458 to 2.396
+seconds (5.23-fold), rather than 16-fold.  An affine fit to the measured
+$B=32,128,512$ phase timings, scaled by the full-cohort $B=32$ phases, gives a
+current $B=1024$ planning range of approximately 3--3.5 hours.  This is still
+an extrapolation, not a completed $B=1024$ production timing.  It should be
+replaced by a measured value before a large production campaign.
+
+Probe tiling and block-width adaptation bound memory.  For one annotation, the
+float32 $[XZ,WZ]$ source sketch costs $8N_RB$ bytes.  The native opaque
+$[S,E\odot S]$ target panel costs $32N_RB$ bytes, while the protected
+non-decoded target operand costs at most another $16N_RB$ bytes \emph{inside}
+the configured native workspace.  At $N_R=291{,}273$ and $B=1024$, these terms
+are about 2.22, 8.89, and 4.44 GiB.  The first two allocations plus the bounded
+16-GiB native workspace (whose variant block shrinks as the protected operand
+grows) imply an expected peak of roughly 25--30 GiB, not $32$ times the $B=32$
+RSS.  The new population-transfer statistic itself adds only about 4.4 MiB for
+$K=1$.
+
+The numerical failures are not caused by extreme Rademacher probes: their
+entries are exactly $\pm1$.  Nor is float32 the arithmetic root cause.  The
+decoder, feature moments, projection, source/target GEMMs, checksums, and
+repairs use float64; float32 controls only retained sketch buffers.  Switching
+those buffers to float64 doubles their memory and reduces accumulation
+roundoff, but cannot prevent a vendor GEMM from sparsely changing a double
+input or output.  Dropping extreme LD-score values would be unsafe here: an
+extreme Monte Carlo realization and a corrupt output are different events,
+and clipping squared traces creates downward bias.
+
+Before the environment repair, tabla loaded two BLAS runtimes in one process:
+NumPy's pip wheel bundled OpenBLAS 0.3.30/Haswell while the native extension
+used conda OpenBLAS 0.3.34/Zen.  The environment has now been changed to conda
+NumPy 2.3.5, so NumPy and the extension both resolve to the same OpenBLAS
+0.3.34 Zen library.  This removes a concrete source of process-wide thread and
+runtime interference, but it did not remove the numerical fault.  The
+full-cohort $B=32$ diagnostic triggered 384 repaired output columns.  More
+decisively, a production-shaped dense test with $N=291{,}273$, $M=1{,}207$, and
+$B=32$ intermittently observed a maximum target error of 58.15 from the
+internally threaded vendor path, despite using binary64 arithmetic.  Repeating
+the same test could also return only ordinary accumulation-order error, proving
+that the failure is intermittent and shape/thread dependent.
+
+SUMMIT therefore no longer invokes an internally threaded OpenBLAS GEMM for
+these products.  It fixes OpenBLAS at one thread per call and partitions
+disjoint output rows across SUMMIT-owned OpenMP workers.  This was faster, not
+slower, in the production-shaped no-fault comparison (1.09 versus 1.33 seconds
+for the 2$B$ target and 1.79 versus 2.28 seconds for 4$B$).  Across 20 repeated
+2$B$/4$B$ calls, the selective ABFT layer repaired 257 output columns and every
+final output remained within $2.283\times10^{-6}$ of the independent dense
+float64 oracle.  Thus the vendor/concurrency problem is still observable, but
+the returned result is protected without duplicating the full genotype
+operand.  The ABFT path checks wide GEMMs, repairs only discrepant output
+columns with a non-vendor cache-tiled kernel, and falls back to a deterministic
+fresh decode only if the reconstructable genotype input changes.
+
+\section{Practical contract}
+
+The implemented external path is explicit.  A reference generated with at
+least two probes records the compact population trace matrix in its manifest.
+Trait scoring with \texttt{--gxe-population-}\allowbreak\texttt{reference} permits a different
+retained sample, recomputes study feature standardization, and writes study
+$N$, $r$, $q_D$, $q_0$, $\tr(D)$, $\tr(D^2)$, and exact genetic--$D$
+cross-traces (plus delete-block versions when requested).  The fit requires the exact
+reference-manifest hash, identical ordered variants/alleles and annotations,
+the same named environment/covariate convention, and standardized kernels.
+It fails closed for GENIE/raw kernels because their genetic traces are not
+fixed by $r$.  Existing matched-cohort behavior remains the default.
+
+\begin{thebibliography}{9}
+\bibitem{genie}
+Kerin M, Marchini J. Estimation of gene--environment interaction heritability
+from large-scale biobanks. \emph{American Journal of Human Genetics} (2024).
+\href{https://doi.org/10.1016/j.ajhg.2024.05.015}{doi:10.1016/j.ajhg.2024.05.015}.
+
+\bibitem{geniesupp}
+Kerin M, Marchini J. GENIE Supplemental Notes, especially Note S1.
+\href{https://ars.els-cdn.com/content/image/1-s2.0-S0002929724001782-mmc1.pdf}{Publisher supplement}.
+
+\bibitem{summit}
+SUMMIT manuscript and Supplementary Information, local working version,
+Methods ``Estimation of genome-wide LD scores'' and Supplementary Note
+``Effect of reference-LD mismatch on SUMMIT estimates'' (accessed 13 August
+2026).
+
+\bibitem{geniecodecov}
+GENIE source, commit \texttt{22bee9c}, covariate inverse and projection.
+\href{https://github.com/sriramlab/GENIE/blob/22bee9cd53d61eabb2ffcec70acf3c5bb43ede01/src/ge_flexible.cpp#L2303-L2362}{\texttt{ge\_flexible.cpp}, lines 2303--2362}.
+
+\bibitem{geniecodescale}
+GENIE source, commit \texttt{22bee9c}, genotype mean and HWE scale.
+\href{https://github.com/sriramlab/GENIE/blob/22bee9cd53d61eabb2ffcec70acf3c5bb43ede01/src/ge_flexible.cpp#L654-L665}{\texttt{ge\_flexible.cpp}, lines 654--665}.
+
+\bibitem{geniecodetrace}
+GENIE source, commit \texttt{22bee9c}, additive trace initialization.
+\href{https://github.com/sriramlab/GENIE/blob/22bee9cd53d61eabb2ffcec70acf3c5bb43ede01/src/ge_flexible.cpp#L1655-L1674}{\texttt{ge\_flexible.cpp}, lines 1655--1674}.
+
+\bibitem{geniecodepheno}
+GENIE source, commit \texttt{22bee9c}, projected phenotype normalization.
+\href{https://github.com/sriramlab/GENIE/blob/22bee9cd53d61eabb2ffcec70acf3c5bb43ede01/src/ge_flexible.cpp#L2331-L2362}{\texttt{ge\_flexible.cpp}, lines 2331--2362}.
+\end{thebibliography}
+
+\end{document}

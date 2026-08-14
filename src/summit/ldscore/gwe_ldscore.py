@@ -17,7 +17,7 @@ from typing import Sequence
 import numpy as np
 import pandas as pd
 from bed_reader import open_bed
-from threadpoolctl import threadpool_limits
+from threadpoolctl import threadpool_info, threadpool_limits
 from tqdm import tqdm
 
 from .. import utils
@@ -237,6 +237,69 @@ def _native_strict_feature_moment_verification_policy(
         "deterministic disjoint-output tiled GEMMs independent of "
         f"{build_info.get('blas_vendor')}"
     )
+
+
+def _validate_native_blas_runtime(build_info: Mapping) -> dict[str, str | int]:
+    """Require the direct backend and NumPy to share one BLAS runtime."""
+    records = []
+    for raw in threadpool_info():
+        if str(raw.get("user_api", "")).strip().lower() != "blas":
+            continue
+        path = str(raw.get("filepath", "")).strip()
+        records.append(
+            {
+                "internal_api": str(raw.get("internal_api", "")).strip().lower(),
+                "version": str(raw.get("version", "")).strip(),
+                "path": os.path.realpath(path) if path else "",
+                "num_threads": int(raw.get("num_threads", 0)),
+            }
+        )
+    unique = {
+        (record["internal_api"], record["version"], record["path"]): record
+        for record in records
+    }
+    if len(unique) != 1:
+        descriptions = sorted(
+            f"{api or 'unknown'} {version or 'unknown'} at {path or 'unknown'}"
+            for api, version, path in unique
+        )
+        raise RuntimeError(
+            "The direct GxE backend requires exactly one process-wide BLAS runtime; "
+            f"observed {len(unique)}: {descriptions}. Install NumPy and SUMMIT "
+            "against the same BLAS before running native GxE traces."
+        )
+    record = next(iter(unique.values()))
+    expected_vendor = str(build_info.get("blas_vendor", "")).strip().lower()
+    observed_vendor = str(record["internal_api"])
+    if expected_vendor and expected_vendor not in {"all", "generic"}:
+        aliases = {
+            "openblas": "openblas",
+            "intel10_64lp": "mkl",
+            "intel10_64ilp": "mkl",
+            "intel10_64_dyn": "mkl",
+            "mkl": "mkl",
+            "blis": "blis",
+        }
+        expected_api = aliases.get(expected_vendor, expected_vendor)
+        if expected_api != observed_vendor:
+            raise RuntimeError(
+                "The direct GxE extension and loaded BLAS runtime disagree: "
+                f"built for {expected_vendor!r}, loaded {observed_vendor!r}."
+            )
+        runtime_config = str(build_info.get("blas_runtime_config", "")).split()
+        expected_version = (
+            runtime_config[1]
+            if expected_api == "openblas"
+            and len(runtime_config) >= 2
+            and runtime_config[0].lower() == "openblas"
+            else ""
+        )
+        if expected_version and expected_version != record["version"]:
+            raise RuntimeError(
+                "The direct GxE extension and loaded OpenBLAS version disagree: "
+                f"built against {expected_version!r}, loaded {record['version']!r}."
+            )
+    return record
 
 
 def _validate_backend_provenance(value: Mapping, *, expected_stage: str | None = None) -> None:
@@ -1601,6 +1664,7 @@ class GenomewideEnvLDScore:
         self.score_w_all: np.ndarray | None = None
         self.feature_diagnostics: dict[str, float | int | list[float]] = {}
         self.resource_estimates: dict[str, float | int] = {}
+        self.population_same_individual_products: np.ndarray | None = None
         self._vtiles_used: list[tuple[int, int]] | None = None
         self.native_workspace_gib = float(native_workspace_gib)
         if not np.isfinite(self.native_workspace_gib) or self.native_workspace_gib <= 0.0:
@@ -1613,6 +1677,7 @@ class GenomewideEnvLDScore:
         self._native_binary_descriptor: int | None = None
         self._native_binary_record: dict | None = None
         self._native_build_info: dict | None = None
+        self.native_blas_runtime_record: dict[str, str | int] | None = None
         self.native_strict_feature_moment_verification = False
         self.native_feature_moment_integrity_reason = "Python backend"
         self.native_phase_timings: dict[str, float] = {}
@@ -1648,6 +1713,7 @@ class GenomewideEnvLDScore:
                         _gxeldcore
                     )
                     build_info = dict(_gxeldcore.build_info())
+                    runtime_record = _validate_native_blas_runtime(build_info)
                     source_commit = build_info.get("source_commit")
                     source_tree_sha256 = build_info.get("source_tree_sha256")
                     if not (
@@ -1667,6 +1733,12 @@ class GenomewideEnvLDScore:
                     self._native_binary_descriptor = native_descriptor
                     self._native_binary_record = native_record
                     self._native_build_info = build_info
+                    self.native_blas_runtime_record = runtime_record
+                    self.log._log(
+                        "[gxe:native] Verified one process BLAS runtime: "
+                        f"{runtime_record['internal_api']} "
+                        f"{runtime_record['version']} at {runtime_record['path']}."
+                    )
                     (
                         self.native_strict_feature_moment_verification,
                         self.native_feature_moment_integrity_reason,
@@ -2587,6 +2659,110 @@ class GenomewideEnvLDScore:
             row_sums = np.sum(seg * seg, axis=1, dtype=np.float64) * scale
             out[:, source_bin] += annot_left.T @ row_sums
 
+    def _accumulate_population_diagonal_moments(
+        self,
+        sources: np.ndarray,
+        probes_per_bin: int,
+        probe_square_sums: np.ndarray,
+        same_probe_products: np.ndarray,
+    ) -> None:
+        """Accumulate a bounded-memory U-statistic for kernel diagonals.
+
+        For source sketch ``S[a, v] = F_a sqrt(A_a) z_v``, independent probe
+        indices satisfy
+
+          E[S[a,v]^2 S[b,u]^2] = M_a M_b K_a(ii) K_b(ii),  v != u.
+
+        Summing the order-two U-statistic over individuals gives the
+        same-individual part of ``tr(K_a K_b)``. Only the N-by-2K running sums
+        and a 2K-by-2K matrix persist; no probe sketch is written to disk.
+        """
+        source_array = np.asarray(sources)
+        families = 2 * self.nbins
+        expected = (self.nsamp, families * int(probes_per_bin))
+        if source_array.shape != expected:
+            raise RuntimeError(
+                f"Population diagonal source shape {source_array.shape} does not match {expected}."
+            )
+        if probe_square_sums.shape != (self.nsamp, families):
+            raise RuntimeError("Population diagonal probe-square accumulator is mis-sized.")
+        if same_probe_products.shape != (families, families):
+            raise RuntimeError("Population diagonal same-probe accumulator is mis-sized.")
+
+        probe_chunk = min(8, int(probes_per_bin))
+        for start in range(0, int(probes_per_bin), probe_chunk):
+            stop = min(int(probes_per_bin), start + probe_chunk)
+            for left in range(families):
+                left_offset = left * int(probes_per_bin)
+                left_values = np.asarray(
+                    source_array[:, left_offset + start : left_offset + stop],
+                    dtype=np.float64,
+                )
+                left_squared = np.square(left_values)
+                probe_square_sums[:, left] += np.sum(
+                    left_squared, axis=1, dtype=np.float64
+                )
+                for right in range(left, families):
+                    if right == left:
+                        right_squared = left_squared
+                    else:
+                        right_offset = right * int(probes_per_bin)
+                        right_values = np.asarray(
+                            source_array[
+                                :, right_offset + start : right_offset + stop
+                            ],
+                            dtype=np.float64,
+                        )
+                        right_squared = np.square(right_values)
+                    value = float(
+                        np.sum(left_squared * right_squared, dtype=np.float64)
+                    )
+                    same_probe_products[left, right] += value
+                    if right != left:
+                        same_probe_products[right, left] += value
+
+    def _finalize_population_diagonal_moments(
+        self,
+        probe_square_sums: np.ndarray,
+        same_probe_products: np.ndarray,
+    ) -> np.ndarray:
+        """Return the 2K-by-2K same-individual kernel-product estimate."""
+        if self.nvecs < 2:
+            raise ValueError(
+                "Reference-population trace transfer requires at least two random vectors."
+            )
+        families = 2 * self.nbins
+        cross_probe = np.empty((families, families), dtype=np.float64)
+        for left in range(families):
+            for right in range(left, families):
+                total = float(
+                    np.sum(
+                        probe_square_sums[:, left]
+                        * probe_square_sums[:, right],
+                        dtype=np.float64,
+                    )
+                )
+                value = total - float(same_probe_products[left, right])
+                cross_probe[left, right] = value
+                cross_probe[right, left] = value
+        masses = np.concatenate(
+            [
+                np.asarray(self.nsnps_bin, dtype=np.float64),
+                np.asarray(self.nsnps_bin, dtype=np.float64),
+            ]
+        )
+        denominator = (
+            float(self.nvecs * (self.nvecs - 1))
+            * masses[:, None]
+            * masses[None, :]
+        )
+        result = cross_probe / denominator
+        if not np.all(np.isfinite(result)):
+            raise RuntimeError(
+                "Reference-population same-individual trace estimate is non-finite."
+            )
+        return 0.5 * (result + result.T)
+
     def _native_source_block(
         self,
         blk_start: int,
@@ -3103,6 +3279,9 @@ class GenomewideEnvLDScore:
             compile_options["strict_feature_moment_verification"] = bool(
                 self.native_strict_feature_moment_verification
             )
+            compile_options["loaded_blas_runtime"] = dict(
+                self.native_blas_runtime_record or {}
+            )
             workspace_cap = int(self.native_workspace_gib * (1024 ** 3))
             panel_columns = int(self.native_target_panel_columns)
         else:
@@ -3457,6 +3636,29 @@ class GenomewideEnvLDScore:
             ),
             "files": files,
         }
+        if self.population_same_individual_products is not None:
+            population_products = np.asarray(
+                self.population_same_individual_products, dtype=np.float64
+            )
+            expected_shape = (2 * self.nbins, 2 * self.nbins)
+            if (
+                population_products.shape != expected_shape
+                or not np.all(np.isfinite(population_products))
+            ):
+                raise RuntimeError(
+                    "Population same-individual products are incomplete or mis-sized."
+                )
+            payload["population_trace"] = {
+                "method": "independent_probe_u_statistic_v1",
+                "sampling_axis": "individual",
+                "num_vectors": int(self.nvecs),
+                "feature_order": [
+                    *[f"G:{name}" for name in self.l2cols],
+                    *[f"GxE:{name}" for name in self.l2cols],
+                ],
+                "same_individual_kernel_products": population_products.tolist(),
+                "jackknife_diagonal_method": "full_reference_reuse",
+            }
         if jackknife_payload is not None:
             payload["jackknife"] = jackknife_payload
         if self.feature_cache_path is not None and self.feature_cache_sha256 is not None:
@@ -4189,6 +4391,19 @@ class GenomewideEnvLDScore:
         bar = tqdm(total=total_units, desc="GxE-LD progress", unit="task", smoothing=0.2, disable=(not self.verbose))
         within_jackknife = None
         max_native_source_leakage = 0.0
+        population_probe_square_sums = None
+        population_same_probe_products = None
+        if not self.shard_mode and self.nvecs >= 2:
+            population_probe_square_sums = np.zeros(
+                (self.nsamp, 2 * self.nbins), dtype=np.float64
+            )
+            population_same_probe_products = np.zeros(
+                (2 * self.nbins, 2 * self.nbins), dtype=np.float64
+            )
+            self.resource_estimates["population_trace_workspace_gib"] = float(
+                population_probe_square_sums.nbytes
+                + population_same_probe_products.nbytes
+            ) / (1024 ** 3)
         if exact_jackknife:
             within_jackknife = {
                 key: np.zeros((len(self.jackknife_labels), self.nbins, self.nbins), dtype=np.float64)
@@ -4331,6 +4546,14 @@ class GenomewideEnvLDScore:
                     # The global target pass is independent of jackknife block
                     # count and uses the same bounded compute blocks as ordinary
                     # genome-wide LD-score estimation.
+                    if population_probe_square_sums is not None:
+                        assert population_same_probe_products is not None
+                        self._accumulate_population_diagonal_moments(
+                            sources,
+                            Vt,
+                            population_probe_square_sums,
+                            population_same_probe_products,
+                        )
                     if self.native_backend == "direct":
                         global_panel, leakage = self._native_prepare_projected_sources(
                             sources
@@ -4426,6 +4649,21 @@ class GenomewideEnvLDScore:
                 f"{repaired_gemm_columns}; freshly decoded input retries="
                 f"{retried_input_mutations}."
             )
+
+        if population_probe_square_sums is not None:
+            assert population_same_probe_products is not None
+            self.population_same_individual_products = (
+                self._finalize_population_diagonal_moments(
+                    population_probe_square_sums,
+                    population_same_probe_products,
+                )
+            )
+            self.log._log(
+                "[gxe:population] accumulated same-individual kernel products "
+                "in memory for external-cohort trace transfer."
+            )
+        else:
+            self.population_same_individual_products = None
 
         scores = {name: value / float(self.nvecs) for name, value in accum.items()}
         if within_jackknife is not None:

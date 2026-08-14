@@ -436,6 +436,29 @@ def generate_multi_environment_references(
         }
         for _ in estimators
     ]
+    population_enabled = first.nvecs >= 2
+    population_probe_square_sums = (
+        [
+            np.zeros((estimator.nsamp, 2 * estimator.nbins), dtype=np.float64)
+            for estimator in estimators
+        ]
+        if population_enabled
+        else []
+    )
+    population_same_probe_products = (
+        [
+            np.zeros((2 * estimator.nbins, 2 * estimator.nbins), dtype=np.float64)
+            for estimator in estimators
+        ]
+        if population_enabled
+        else []
+    )
+    if population_enabled:
+        for index, estimator in enumerate(estimators):
+            estimator.resource_estimates["population_trace_workspace_gib"] = float(
+                population_probe_square_sums[index].nbytes
+                + population_same_probe_products[index].nbytes
+            ) / 1024**3
     for probe_start, probe_count in vtiles:
         columns = first.nbins * probe_count
         global_sources = [
@@ -472,6 +495,15 @@ def generate_multi_environment_references(
                 del x, w, annotation
             del genotype, probes
 
+        if population_enabled:
+            for index, estimator in enumerate(estimators):
+                estimator._accumulate_population_diagonal_moments(
+                    global_sources[index],
+                    probe_count,
+                    population_probe_square_sums[index],
+                    population_same_probe_products[index],
+                )
+
         for start, stop in blocks:
             genotype = first._read_genotype_block(start, stop)
             for index, estimator in enumerate(estimators):
@@ -507,6 +539,14 @@ def generate_multi_environment_references(
         gc.collect()
 
     first._assert_construction_genotype_state()
+    if population_enabled:
+        for index, estimator in enumerate(estimators):
+            estimator.population_same_individual_products = (
+                estimator._finalize_population_diagonal_moments(
+                    population_probe_square_sums[index],
+                    population_same_probe_products[index],
+                )
+            )
     references = []
     published: list[tuple[Path, int, int, str]] = []
     try:

@@ -29,6 +29,7 @@ from threadpoolctl import threadpool_limits
 from ..inference.gxe import (
     _BLOCK_LOCAL_JACKKNIFE_METHOD,
     _EXACT_JACKKNIFE_METHOD,
+    _population_same_individual_products,
     _validate_reference_feature_cache_contract,
     ordered_variant_digest,
 )
@@ -482,8 +483,19 @@ def _validate_reference_manifest(
     )
 
 
-def _validate_genotype_files(prefix: str, reference: _ValidatedReference) -> tuple[int, int]:
+def _validate_genotype_files(
+    prefix: str,
+    reference: _ValidatedReference,
+    *,
+    exact_reference: bool = True,
+) -> tuple[int, int]:
     n, m = _validate_plink_bed_shape(prefix)
+    if m != len(reference.diagonal):
+        raise ValueError(
+            f"Genotype BIM has {m} variants but the reference diagonal has {len(reference.diagonal)}."
+        )
+    if not exact_reference:
+        return n, m
     provenance = reference.payload.get("genotype_files")
     if not isinstance(provenance, dict) or not set(_GENOTYPE_EXTENSIONS).issubset(provenance):
         raise ValueError("Schema-v3 reference is missing complete genotype provenance.")
@@ -512,10 +524,6 @@ def _validate_genotype_files(prefix: str, reference: _ValidatedReference) -> tup
             raise ValueError(f"Genotype {extension} failed its reference SHA-256 check.")
     if n != int(reference.payload["n_samples"]) and n < int(reference.payload["n_samples"]):
         raise ValueError("Genotype FAM has fewer samples than the reference analysis.")
-    if m != len(reference.diagonal):
-        raise ValueError(
-            f"Genotype BIM has {m} variants but the reference diagonal has {len(reference.diagonal)}."
-        )
     return n, m
 
 
@@ -650,6 +658,7 @@ def _validate_design_against_reference(
     row_selection: np.ndarray,
     covariate_names: Sequence[str],
     observed_transform: dict[str, Any],
+    exact_reference: bool = True,
 ) -> None:
     if environment_name != reference.payload["environment"]:
         raise ValueError("Environment column name disagrees with the reference manifest.")
@@ -659,6 +668,21 @@ def _validate_design_against_reference(
     n = len(row_selection)
     rank = int(fixed_basis.shape[1])
     residual_rank = n - rank - 1
+    if residual_rank <= 0:
+        raise ValueError(
+            "The phenotype/environment-specific design has non-positive residual rank."
+        )
+    transform = reference.payload["environment_transform"]
+    if (
+        observed_transform.get("standardized") is not True
+        or observed_transform.get("units") != "per_environment_sd"
+        or int(observed_transform.get("ddof", -1)) != int(transform["ddof"])
+    ):
+        raise ValueError(
+            "Study and reference environments must use the same per-SD/ddof convention."
+        )
+    if not exact_reference:
+        return
     if n != int(reference.payload["n_samples"]):
         raise ValueError(
             f"Retained phenotype sample count {n} disagrees with reference N={reference.payload['n_samples']}."
@@ -668,7 +692,6 @@ def _validate_design_against_reference(
     if residual_rank != int(reference.payload["residual_rank"]):
         raise ValueError("Residual rank disagrees with the reference manifest.")
 
-    transform = reference.payload["environment_transform"]
     for key in ("raw_mean", "raw_sd", "analysis_mean", "analysis_sum_squares"):
         if not np.isclose(
             float(observed_transform[key]),
@@ -703,6 +726,7 @@ def _validate_analysis_inputs(
     pheno_path: str | Path,
     pheno_col: str | None,
     missing_values: Sequence[str],
+    exact_reference: bool = True,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, str, float, dict[str, Any]]:
     transform = reference.payload["environment_transform"]
     (
@@ -741,6 +765,7 @@ def _validate_analysis_inputs(
         row_selection=np.asarray(row_selection, dtype=int),
         covariate_names=covariate_names,
         observed_transform=observed_transform,
+        exact_reference=exact_reference,
     )
     return (
         np.asarray(row_selection, dtype=int),
@@ -1011,7 +1036,13 @@ def _score_one_genotype_pass(
     step_size: int,
     eps_var: float,
     num_threads: int | None,
-) -> tuple[np.ndarray, np.ndarray]:
+    residual_rank: int | None = None,
+    exact_reference: bool = True,
+    return_feature_nxe: bool = False,
+) -> (
+    tuple[np.ndarray, np.ndarray]
+    | tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]
+):
     if num_threads is None:
         bed = open_bed(prefix + ".bed")
     else:
@@ -1029,7 +1060,13 @@ def _score_one_genotype_pass(
             f"BED reader shape {bed.shape} disagrees with validated FAM/BIM shape {expected_shape}."
         )
     m = len(reference.diagonal)
-    residual_rank = int(reference.payload["residual_rank"])
+    residual_rank = (
+        int(reference.payload["residual_rank"])
+        if residual_rank is None
+        else int(residual_rank)
+    )
+    if residual_rank <= 0:
+        raise ValueError("residual_rank must be positive for GxE scoring.")
     root_rank = math.sqrt(float(residual_rank))
     phenotype_array = np.asarray(phenotype, dtype=np.float64)
     single_trait = phenotype_array.ndim == 1
@@ -1056,6 +1093,13 @@ def _score_one_genotype_pass(
         )
     score_x = np.empty((m, phenotype_matrix.shape[1]), dtype=np.float64)
     score_w = np.empty((m, phenotype_matrix.shape[1]), dtype=np.float64)
+    feature_nxe_x = (
+        np.empty(m, dtype=np.float64) if return_feature_nxe else None
+    )
+    feature_nxe_w = (
+        np.empty(m, dtype=np.float64) if return_feature_nxe else None
+    )
+    environment_squared = environment * environment if return_feature_nxe else None
     genotype_scale = str(reference.payload["genotype_scale"])
     ddof = int(reference.payload["environment_transform"]["ddof"])
     kernel_mode = str(reference.payload["kernel_mode"])
@@ -1103,16 +1147,19 @@ def _score_one_genotype_pass(
                 # a second rounding at the last printed digit.
                 exact_scale_x = 1.0 / np.sqrt(raw_norm_x)
                 exact_scale_w = 1.0 / np.sqrt(raw_norm_w)
-                if not np.allclose(
-                    exact_scale_x,
-                    reference.scale_x[start:end],
-                    rtol=1.0e-9,
-                    atol=1.0e-10,
-                ) or not np.allclose(
-                    exact_scale_w,
-                    reference.scale_w[start:end],
-                    rtol=1.0e-9,
-                    atol=1.0e-10,
+                if exact_reference and (
+                    not np.allclose(
+                        exact_scale_x,
+                        reference.scale_x[start:end],
+                        rtol=1.0e-9,
+                        atol=1.0e-10,
+                    )
+                    or not np.allclose(
+                        exact_scale_w,
+                        reference.scale_w[start:end],
+                        rtol=1.0e-9,
+                        atol=1.0e-10,
+                    )
                 ):
                     raise ValueError(
                         "Stored feature scales disagree with the supplied "
@@ -1127,16 +1174,19 @@ def _score_one_genotype_pass(
             observed_norm_w = (
                 np.sum(interaction * interaction, axis=0, dtype=np.float64) / residual_rank
             )
-            if not np.allclose(
-                observed_norm_x,
-                reference.norm_x[start:end],
-                rtol=1.0e-9,
-                atol=1.0e-9,
-            ) or not np.allclose(
-                observed_norm_w,
-                reference.norm_w[start:end],
-                rtol=1.0e-9,
-                atol=1.0e-9,
+            if exact_reference and (
+                not np.allclose(
+                    observed_norm_x,
+                    reference.norm_x[start:end],
+                    rtol=1.0e-9,
+                    atol=1.0e-9,
+                )
+                or not np.allclose(
+                    observed_norm_w,
+                    reference.norm_w[start:end],
+                    rtol=1.0e-9,
+                    atol=1.0e-9,
+                )
             ):
                 raise ValueError(
                     "Genotype scaling/projected feature norms disagree with the "
@@ -1144,9 +1194,125 @@ def _score_one_genotype_pass(
                 )
             score_x[start:end, :] = (additive.T @ phenotype_matrix) / root_rank
             score_w[start:end, :] = (interaction.T @ phenotype_matrix) / root_rank
+            if return_feature_nxe:
+                assert feature_nxe_x is not None and feature_nxe_w is not None
+                assert environment_squared is not None
+                # Scores no longer need these feature blocks, so square them
+                # in place and avoid allocating two additional N-by-block
+                # temporaries for the exact genetic-by-NxE traces.
+                np.square(additive, out=additive)
+                np.square(interaction, out=interaction)
+                feature_nxe_x[start:end] = (
+                    environment_squared @ additive / float(residual_rank)
+                )
+                feature_nxe_w[start:end] = (
+                    environment_squared @ interaction / float(residual_rank)
+                )
+    if return_feature_nxe:
+        assert feature_nxe_x is not None and feature_nxe_w is not None
+        if not np.all(np.isfinite(feature_nxe_x)) or not np.all(
+            np.isfinite(feature_nxe_w)
+        ):
+            raise RuntimeError("Study genetic-by-NxE feature moments are non-finite.")
     if single_trait:
-        return score_x[:, 0], score_w[:, 0]
-    return score_x, score_w
+        scores = (score_x[:, 0], score_w[:, 0])
+    else:
+        scores = (score_x, score_w)
+    if return_feature_nxe:
+        return scores[0], scores[1], feature_nxe_x, feature_nxe_w
+    return scores
+
+
+def _nxe_traces(
+    environment: np.ndarray, fixed_basis: np.ndarray
+) -> tuple[float, float]:
+    """Return tr(P diag(E^2) P) and its squared-kernel trace exactly."""
+    env = np.asarray(environment, dtype=np.float64)
+    basis = np.asarray(fixed_basis, dtype=np.float64)
+    if env.ndim != 1 or basis.ndim != 2 or basis.shape[0] != env.size:
+        raise ValueError("Environment and fixed-effect basis are not sample aligned.")
+    n = env.size
+    intercept = np.full((n, 1), 1.0 / math.sqrt(float(n)), dtype=np.float64)
+    q_basis = np.asfortranarray(np.column_stack([intercept, basis]))
+    d = env * env
+    qdq = q_basis.T @ (d[:, None] * q_basis)
+    sum_d = float(np.sum(d, dtype=np.float64))
+    sum_d2 = float(np.sum(d * d, dtype=np.float64))
+    trace_qd2q = float(np.sum((d[:, None] * q_basis) ** 2, dtype=np.float64))
+    trace_nxe = sum_d - float(np.trace(qdq))
+    trace_nxe_sq = (
+        sum_d2 - 2.0 * trace_qd2q + float(np.sum(qdq * qdq.T, dtype=np.float64))
+    )
+    tolerance = 2.0e-10 * max(1.0, sum_d, sum_d2)
+    if trace_nxe < -tolerance or trace_nxe_sq < -tolerance:
+        raise RuntimeError("Study NxE projection produced a negative trace.")
+    return max(0.0, trace_nxe), max(0.0, trace_nxe_sq)
+
+
+def _population_design_moments(
+    reference: _ValidatedReference,
+    feature_nxe_x: np.ndarray,
+    feature_nxe_w: np.ndarray,
+    residual_rank: int,
+) -> dict[str, Any]:
+    """Aggregate exact study genetic-by-NxE traces, including deletions."""
+    names = tuple(str(value) for value in reference.payload["annotation_names"])
+    weight_columns = [f"ANNOT_{index}" for index in range(len(names))]
+    annotations = reference.diagonal.loc[:, weight_columns].to_numpy(
+        dtype=np.float64
+    )
+    masses = annotations.sum(axis=0, dtype=np.float64)
+    x = np.asarray(feature_nxe_x, dtype=np.float64)
+    w = np.asarray(feature_nxe_w, dtype=np.float64)
+    if x.shape != (len(annotations),) or w.shape != (len(annotations),):
+        raise RuntimeError("Study genetic-by-NxE vectors are not variant aligned.")
+    full_sums = np.concatenate([annotations.T @ x, annotations.T @ w])
+    full_masses = np.concatenate([masses, masses])
+    full = float(residual_rank) * full_sums / full_masses
+    if not np.all(np.isfinite(full)) or np.any(full < 0.0):
+        raise RuntimeError("Study genetic-by-NxE traces are invalid.")
+    declaration: dict[str, Any] = {
+        "method": "exact_projected_feature_nxe_v1",
+        "feature_order": [
+            *[f"G:{name}" for name in names],
+            *[f"GxE:{name}" for name in names],
+        ],
+        "genetic_nxe_traces": full.tolist(),
+    }
+
+    jackknife = reference.payload.get("jackknife")
+    if jackknife is None:
+        return declaration
+    labels = jackknife.get("block_labels") if isinstance(jackknife, Mapping) else None
+    if not isinstance(labels, list) or len(labels) < 2:
+        raise RuntimeError("Reference jackknife labels are unavailable for study moments.")
+    blocks = pd.to_numeric(reference.diagonal["BLOCK"], errors="raise").to_numpy(
+        dtype=np.int64
+    )
+    nblock = len(labels)
+    block_masses = np.zeros((nblock, len(names)), dtype=np.float64)
+    block_x = np.zeros_like(block_masses)
+    block_w = np.zeros_like(block_masses)
+    np.add.at(block_masses, blocks, annotations)
+    np.add.at(block_x, blocks, annotations * x[:, None])
+    np.add.at(block_w, blocks, annotations * w[:, None])
+    remain_masses = masses[None, :] - block_masses
+    if np.any(remain_masses <= 0.0):
+        raise RuntimeError("A study jackknife deletion empties an annotation.")
+    full_x = annotations.T @ x
+    full_w = annotations.T @ w
+    deleted = float(residual_rank) * np.concatenate(
+        [
+            (full_x[None, :] - block_x) / remain_masses,
+            (full_w[None, :] - block_w) / remain_masses,
+        ],
+        axis=1,
+    )
+    if not np.all(np.isfinite(deleted)) or np.any(deleted < 0.0):
+        raise RuntimeError("Study delete-block genetic-by-NxE traces are invalid.")
+    declaration["jackknife_block_labels"] = [str(value) for value in labels]
+    declaration["jackknife_genetic_nxe_traces"] = deleted.tolist()
+    return declaration
 
 
 def _relative_path(target: Path, manifest: Path) -> str:
@@ -1281,13 +1447,14 @@ def score_phenotype_from_reference(
     step_size: int = 1000,
     eps_var: float = 1.0e-10,
     num_threads: int | None = None,
+    population_transfer: bool = False,
 ) -> GxEPhenotypeScoreArtifacts:
     """Score one quantitative phenotype against an existing GxE reference.
 
-    The supplied environment/covariate/phenotype files must reproduce the
-    reference's exact retained sample and common fixed-effect design.  The
-    function verifies all schema-v3 hashes and invariants before decoding the
-    BED, decodes each variant exactly once, and refuses to replace any output.
+    By default the supplied inputs must reproduce the reference's exact cohort.
+    With ``population_transfer=True``, the SNP axis and feature convention stay
+    fixed but the retained study cohort may differ; the reference must contain
+    the population trace statistic required to transfer its kernel moments.
     """
 
     step_size = int(step_size)
@@ -1305,10 +1472,23 @@ def score_phenotype_from_reference(
         reference = _validate_reference_manifest(
             reference_manifest, scratch_dir=stage_dir
         )
+        if population_transfer:
+            if reference.payload.get("kernel_mode") != "standardized":
+                raise ValueError(
+                    "Population-reference scoring requires post-projection standardized kernels."
+                )
+            _population_same_individual_products(
+                reference.payload,
+                reference.payload["annotation_names"],
+            )
         stable_prefix, stable_descriptors, stable_state = resources.enter_context(
             _stable_genotype_prefix(prefix, stage_dir)
         )
-        total_samples, _ = _validate_genotype_files(stable_prefix, reference)
+        total_samples, _ = _validate_genotype_files(
+            stable_prefix,
+            reference,
+            exact_reference=not population_transfer,
+        )
         _validate_variant_axis(stable_prefix, reference)
         (
             row_selection,
@@ -1317,7 +1497,7 @@ def score_phenotype_from_reference(
             phenotype,
             phenotype_name,
             residual_fraction,
-            _,
+            observed_transform,
         ) = _validate_analysis_inputs(
             prefix=stable_prefix,
             reference=reference,
@@ -1326,8 +1506,11 @@ def score_phenotype_from_reference(
             pheno_path=pheno_path,
             pheno_col=pheno_col,
             missing_values=tuple(str(value) for value in missing_values),
+            exact_reference=not population_transfer,
         )
-        score_x, score_w = _score_one_genotype_pass(
+        study_n = int(len(row_selection))
+        study_rank = int(study_n - fixed_basis.shape[1] - 1)
+        score_result = _score_one_genotype_pass(
             prefix=stable_prefix,
             reference=reference,
             row_selection=row_selection,
@@ -1338,17 +1521,35 @@ def score_phenotype_from_reference(
             step_size=step_size,
             eps_var=eps_var,
             num_threads=num_threads,
+            residual_rank=study_rank,
+            exact_reference=not population_transfer,
+            return_feature_nxe=population_transfer,
         )
+        if population_transfer:
+            score_x, score_w, feature_nxe_x, feature_nxe_w = score_result
+            population_design = _population_design_moments(
+                reference,
+                feature_nxe_x,
+                feature_nxe_w,
+                study_rank,
+            )
+        else:
+            score_x, score_w = score_result
+            population_design = None
         # Re-hash after the final decode.  These are staged controlled-data
         # copies on Hoffman, so a mismatch means the score could reflect a
         # moving/mixed PLINK input and must never be published.
-        _validate_genotype_files(stable_prefix, reference)
+        _validate_genotype_files(
+            stable_prefix,
+            reference,
+            exact_reference=not population_transfer,
+        )
         _assert_stable_genotype_snapshot(stable_descriptors, stable_state)
 
         gwas_target, gwis_target, moments_target = targets
         base = reference.variants.copy()
-        base["N"] = int(reference.payload["n_samples"])
-        base["DF"] = int(reference.payload["residual_rank"])
+        base["N"] = study_n
+        base["DF"] = study_rank
         base["SCORE_MODE"] = _SCORE_MODE
         gwas = base.copy()
         gwis = base.copy()
@@ -1361,14 +1562,26 @@ def score_phenotype_from_reference(
             temporary_gwas = _write_dataframe_temp(gwas, gwas_target, stage_dir)
             temporary_gwis = _write_dataframe_temp(gwis, gwis_target, stage_dir)
             temporary_paths.extend([temporary_gwas, temporary_gwis])
+            trace_nxe, trace_nxe_sq = _nxe_traces(environment, fixed_basis)
+            study_fingerprint = _analysis_fingerprint(
+                Path(stable_prefix + ".fam"),
+                row_selection,
+                environment,
+                fixed_basis,
+                str(observed_transform["fixed_effect_design_sha256"]),
+            )
             moments = {
                 "kind": _MOMENTS_KIND,
                 "schema_version": _SCHEMA_VERSION,
-                "analysis_fingerprint": reference.payload["analysis_fingerprint"],
+                "analysis_fingerprint": study_fingerprint,
                 "variant_digest": reference.payload["variant_digest"],
                 "phenotype": phenotype_name,
-                "n_samples": int(reference.payload["n_samples"]),
-                "residual_rank": int(reference.payload["residual_rank"]),
+                "n_samples": study_n,
+                "fixed_effect_rank_excluding_intercept": int(fixed_basis.shape[1]),
+                "residual_rank": study_rank,
+                "reference_mode": (
+                    "population" if population_transfer else "matched"
+                ),
                 "score_definition": _SCORE_DEFINITION,
                 "reference_manifest_sha256": reference.manifest_sha256,
                 "score_sha256": {
@@ -1377,13 +1590,17 @@ def score_phenotype_from_reference(
                 },
                 "q_nxe": float(np.dot(environment * phenotype, environment * phenotype)),
                 "q_residual": float(np.dot(phenotype, phenotype)),
+                "trace_nxe": trace_nxe,
+                "trace_nxe_sq": trace_nxe_sq,
                 "phenotype_residual_variance_fraction": residual_fraction,
                 "files": {
                     "gwas": _relative_path(gwas_target, moments_target),
                     "gwis": _relative_path(gwis_target, moments_target),
                 },
             }
-            if reference.feature_cache_path is not None:
+            if population_design is not None:
+                moments["population_design"] = population_design
+            if not population_transfer and reference.feature_cache_path is not None:
                 moments["feature_cache_sha256"] = reference.feature_cache_sha256
                 moments["feature_cache"] = {
                     "path": _relative_path(reference.feature_cache_path, moments_target),

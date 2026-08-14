@@ -62,12 +62,23 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--scratch-model-n", type=int, default=300_000)
     parser.add_argument("--max-abs-error", type=float, default=1e-8)
     parser.add_argument(
+        "--stress-repeats",
+        type=int,
+        default=0,
+        help="Repeat native 2B/4B target calls against the same dense oracle.",
+    )
+    parser.add_argument(
         "--full-estimator-probes", type=int, default=0,
         help="Optionally benchmark one complete Python/direct estimator transaction.",
     )
     parser.add_argument(
         "--skip-legacy", action="store_true",
         help="Skip diagnostic additive direct/Mailman panel timings.",
+    )
+    parser.add_argument(
+        "--skip-materialized",
+        action="store_true",
+        help="Skip redundant Python feature-rematerialization timings.",
     )
     parser.add_argument("--json", type=Path, default=None, help="Optional JSON output path.")
     return parser
@@ -309,6 +320,7 @@ def run(args) -> dict:
         or args.scratch_gib <= 0.0
         or args.scratch_model_n <= 0
         or args.max_abs_error <= 0.0
+        or args.stress_repeats < 0
         or args.full_estimator_probes < 0
     ):
         raise ValueError("Scratch-model dimensions and error tolerance must be positive.")
@@ -344,6 +356,8 @@ def run(args) -> dict:
             "scratch_gib": args.scratch_gib,
             "scratch_model_n": args.scratch_model_n,
             "max_abs_error": args.max_abs_error,
+            "stress_repeats": args.stress_repeats,
+            "skip_materialized": args.skip_materialized,
         },
         "provenance": {
             "argv": list(sys.argv),
@@ -388,6 +402,7 @@ def run(args) -> dict:
             gwldcore.set_num_threads(args.decode_threads)
 
             for count in counts:
+                integrity_before = dict(context.info())
                 probes = _probes(args.m, count, args.seed)
                 dense_source_timing, dense_pair = _timed(
                     lambda: (x @ probes, w @ probes), args.repeats, args.warmups
@@ -412,9 +427,11 @@ def run(args) -> dict:
                     )
                     return additive @ probes, interaction @ probes
 
-                python_source_timing, _ = _timed(
-                    materialized_source, args.repeats, args.warmups
-                )
+                python_source_timing = None
+                if not args.skip_materialized:
+                    python_source_timing, _ = _timed(
+                        materialized_source, args.repeats, args.warmups
+                    )
 
                 def materialized_target(panel):
                     additive, interaction = _materialize_scaled_features(
@@ -422,14 +439,17 @@ def run(args) -> dict:
                     )
                     return additive.T @ panel, interaction.T @ panel
 
-                python_target_2b_timing, _ = _timed(
-                    lambda: materialized_target(dense_sources_2b),
-                    args.repeats, args.warmups,
-                )
-                python_target_4b_timing, _ = _timed(
-                    lambda: materialized_target(dense_sources_4b),
-                    args.repeats, args.warmups,
-                )
+                python_target_2b_timing = None
+                python_target_4b_timing = None
+                if not args.skip_materialized:
+                    python_target_2b_timing, _ = _timed(
+                        lambda: materialized_target(dense_sources_2b),
+                        args.repeats, args.warmups,
+                    )
+                    python_target_4b_timing, _ = _timed(
+                        lambda: materialized_target(dense_sources_4b),
+                        args.repeats, args.warmups,
+                    )
                 native_source_timing, native_source = _timed(
                     lambda: context.source_block(
                         0, args.m, scale_x, scale_w, np.ones(args.m), probes,
@@ -480,11 +500,48 @@ def run(args) -> dict:
                     float(np.max(np.abs(native_x_4b - dense_target_4b[0]))),
                     float(np.max(np.abs(native_w_4b - dense_target_4b[1]))),
                 )
+                stress_2b_errors: list[float] = []
+                stress_4b_errors: list[float] = []
+                for _ in range(args.stress_repeats):
+                    stress_x_2b, stress_w_2b, stress_missing_2b, _ = (
+                        context.target_projected_block(
+                            0, args.m, scale_x, scale_w, panel_2b, True
+                        )
+                    )
+                    stress_x_4b, stress_w_4b, stress_missing_4b, _ = (
+                        context.target_projected_pair_block(
+                            0, args.m, scale_x, scale_w,
+                            panel_2b, block_panel_2b, True,
+                        )
+                    )
+                    if int(stress_missing_2b) != 0 or int(stress_missing_4b) != 0:
+                        raise RuntimeError("Missing genotypes appeared in native target stress work.")
+                    stress_2b_errors.append(max(
+                        float(np.max(np.abs(stress_x_2b - dense_target_2b[0]))),
+                        float(np.max(np.abs(stress_w_2b - dense_target_2b[1]))),
+                    ))
+                    stress_4b_errors.append(max(
+                        float(np.max(np.abs(stress_x_4b - dense_target_4b[0]))),
+                        float(np.max(np.abs(stress_w_4b - dense_target_4b[1]))),
+                    ))
+                if stress_2b_errors:
+                    target_2b_error = max(target_2b_error, max(stress_2b_errors))
+                    target_4b_error = max(target_4b_error, max(stress_4b_errors))
+                integrity_after = dict(context.info())
+                repaired_columns = int(
+                    integrity_after["repaired_gemm_output_columns"]
+                ) - int(integrity_before["repaired_gemm_output_columns"])
+                retried_inputs = int(
+                    integrity_after["retried_gemm_input_mutations"]
+                ) - int(integrity_before["retried_gemm_input_mutations"])
+                if repaired_columns < 0 or retried_inputs < 0:
+                    raise RuntimeError("Native integrity counters decreased during a benchmark case.")
                 if max(source_error, target_2b_error, target_4b_error) > args.max_abs_error:
                     raise RuntimeError(
                         "Native benchmark equivalence exceeded the configured error tolerance: "
                         f"source={source_error}, target2B={target_2b_error}, "
-                        f"target4B={target_4b_error}, tolerance={args.max_abs_error}."
+                        f"target4B={target_4b_error}, tolerance={args.max_abs_error}; "
+                        f"ABFT repairs={repaired_columns}, input retries={retried_inputs}."
                     )
                 scratch_limit = int(args.scratch_gib * 1024**3)
                 scratch_per_probe = (
@@ -495,29 +552,36 @@ def run(args) -> dict:
                     count, vmax=scratch_vmax, gran=64, max_tiles=8
                 )
                 scratch_peak = scratch_per_probe * max(size for _, size in scratch_tiles)
+                timings = {
+                    "native_feature": feature_timing,
+                    "dense_gemm_lower_bound_source": dense_source_timing,
+                    "dense_gemm_lower_bound_target_2b": dense_target_2b_timing,
+                    "dense_gemm_lower_bound_target_4b": dense_target_4b_timing,
+                    "native_source": native_source_timing,
+                    "native_prepare_projected_2b": prepare_2b_timing,
+                    "native_prepare_projected_block_2b": prepare_block_2b_timing,
+                    "native_target_2b": native_target_2b_timing,
+                    "native_target_4b": native_target_4b_timing,
+                }
+                speedups = None
+                if python_source_timing is not None:
+                    assert python_target_2b_timing is not None
+                    assert python_target_4b_timing is not None
+                    timings.update({
+                        "python_materialized_source": python_source_timing,
+                        "python_materialized_target_2b": python_target_2b_timing,
+                        "python_materialized_target_4b": python_target_4b_timing,
+                    })
+                    speedups = {
+                        "source": python_source_timing["median"] / native_source_timing["median"],
+                        "target_2b": python_target_2b_timing["median"] / native_target_2b_timing["median"],
+                        "target_4b": python_target_4b_timing["median"] / native_target_4b_timing["median"],
+                    }
                 case = {
                     "B": count,
                     "actual_target_columns_2b": 2 * count,
                     "actual_target_columns_4b": 4 * count,
-                    "timings_seconds": {
-                        "native_feature": feature_timing,
-                        "dense_gemm_lower_bound_source": dense_source_timing,
-                        "dense_gemm_lower_bound_target_2b": dense_target_2b_timing,
-                        "dense_gemm_lower_bound_target_4b": dense_target_4b_timing,
-                        "python_materialized_source": python_source_timing,
-                        "python_materialized_target_2b": python_target_2b_timing,
-                        "python_materialized_target_4b": python_target_4b_timing,
-                        "native_source": native_source_timing,
-                        "native_prepare_projected_2b": prepare_2b_timing,
-                        "native_prepare_projected_block_2b": prepare_block_2b_timing,
-                        "native_target_2b": native_target_2b_timing,
-                        "native_target_4b": native_target_4b_timing,
-                    },
-                    "speedups_vs_python_materialized": {
-                        "source": python_source_timing["median"] / native_source_timing["median"],
-                        "target_2b": python_target_2b_timing["median"] / native_target_2b_timing["median"],
-                        "target_4b": python_target_4b_timing["median"] / native_target_4b_timing["median"],
-                    },
+                    "timings_seconds": timings,
                     "correctness": {
                         "max_abs_source_error": source_error,
                         "max_abs_target_2b_error": target_2b_error,
@@ -525,6 +589,10 @@ def run(args) -> dict:
                         "max_source_projection_leakage": max(
                             float(panel_2b.leakage), float(block_panel_2b.leakage)
                         ),
+                        "abft_repaired_output_columns": repaired_columns,
+                        "fresh_decode_input_retries": retried_inputs,
+                        "stress_target_2b_errors": stress_2b_errors,
+                        "stress_target_4b_errors": stress_4b_errors,
                         "threshold": args.max_abs_error,
                     },
                     "production_scratch_model": {
@@ -542,6 +610,8 @@ def run(args) -> dict:
                         ),
                     },
                 }
+                if speedups is not None:
+                    case["speedups_vs_python_materialized"] = speedups
                 if not args.skip_legacy:
                     direct_timing, direct_norm = _legacy_additive_timing(
                         prefix, native_sources_2b, scale_x, q, args, mailman=False

@@ -39,6 +39,8 @@ _FIT_BATCH_SCHEMA_VERSION = 1
 _FIT_BATCH_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
 _EXACT_JACKKNIFE_METHOD = "two_sided_snp_kernel_deletion"
 _BLOCK_LOCAL_JACKKNIFE_METHOD = "block_local_ldscore_deletion"
+_MATCHED_REFERENCE_MODE = "matched"
+_POPULATION_REFERENCE_MODE = "population"
 
 
 def _is_sha256(value: Any) -> bool:
@@ -195,8 +197,226 @@ class _PreparedGxEReference:
     block_masses: np.ndarray | None
     deleted_matrices: np.ndarray | None
     deleted_traces: np.ndarray | None
+    population_same_individual_products: np.ndarray | None
     reference_provenance: GxEInputProvenance
     feature_cache_provenance: GxEInputProvenance | None
+
+
+def _population_same_individual_products(
+    payload: Mapping[str, Any], annotation_names: Sequence[str]
+) -> np.ndarray:
+    declaration = payload.get("population_trace")
+    if not isinstance(declaration, Mapping):
+        raise ValueError(
+            "Population-reference inference requires a reference with population_trace moments."
+        )
+    if (
+        declaration.get("method") != "independent_probe_u_statistic_v1"
+        or declaration.get("sampling_axis") != "individual"
+        or declaration.get("jackknife_diagonal_method") != "full_reference_reuse"
+    ):
+        raise ValueError("Reference population_trace uses an unsupported estimator.")
+    probes = declaration.get("num_vectors")
+    if isinstance(probes, bool) or not isinstance(probes, int) or probes < 2:
+        raise ValueError("Reference population_trace requires at least two probes.")
+    randomization = payload.get("randomization")
+    if (
+        not isinstance(randomization, Mapping)
+        or randomization.get("num_vectors") != probes
+    ):
+        raise ValueError(
+            "Reference population_trace probe count disagrees with its randomization."
+        )
+    expected_order = [
+        *[f"G:{name}" for name in annotation_names],
+        *[f"GxE:{name}" for name in annotation_names],
+    ]
+    if declaration.get("feature_order") != expected_order:
+        raise ValueError("Reference population_trace feature order is inconsistent.")
+    products = _as_float_array(
+        "population same-individual kernel products",
+        declaration.get("same_individual_kernel_products"),
+        ndim=2,
+    )
+    expected_shape = (2 * len(annotation_names), 2 * len(annotation_names))
+    _require_shape("population same-individual kernel products", products, expected_shape)
+    # The estimand is entrywise non-negative, but the unbiased order-two
+    # finite-probe U-statistic need not be.  Do not truncate or reject a valid
+    # Monte Carlo realization; its uncertainty is controlled by B.
+    scale = max(1.0, float(np.max(np.abs(products))))
+    if float(np.max(np.abs(products - products.T))) > 2.0e-10 * scale:
+        raise ValueError("Reference population same-individual products are not symmetric.")
+    return 0.5 * (products + products.T)
+
+
+def _study_population_design_moments(
+    payload: Mapping[str, Any],
+    annotation_names: Sequence[str],
+    block_labels: Sequence[str] = (),
+) -> tuple[np.ndarray, np.ndarray | None]:
+    """Validate exact study-side genetic-by-NxE trace summaries."""
+    declaration = payload.get("population_design")
+    if not isinstance(declaration, Mapping):
+        raise ValueError(
+            "Population-reference inference requires exact study population_design moments."
+        )
+    if declaration.get("method") != "exact_projected_feature_nxe_v1":
+        raise ValueError("Study population_design uses an unsupported estimator.")
+    expected_order = [
+        *[f"G:{name}" for name in annotation_names],
+        *[f"GxE:{name}" for name in annotation_names],
+    ]
+    if declaration.get("feature_order") != expected_order:
+        raise ValueError("Study population_design feature order is inconsistent.")
+    full = _as_float_array(
+        "study genetic-by-NxE traces",
+        declaration.get("genetic_nxe_traces"),
+        ndim=1,
+    )
+    _require_shape("study genetic-by-NxE traces", full, (len(expected_order),))
+    if np.any(full < 0.0):
+        raise ValueError("Study genetic-by-NxE traces must be non-negative.")
+
+    labels = tuple(str(value) for value in block_labels)
+    deleted_raw = declaration.get("jackknife_genetic_nxe_traces")
+    declared_labels = declaration.get("jackknife_block_labels")
+    if not labels:
+        if deleted_raw is not None or declared_labels is not None:
+            raise ValueError(
+                "Study population_design declares jackknife moments for a non-jackknife reference."
+            )
+        return full, None
+    if declared_labels != list(labels):
+        raise ValueError(
+            "Study population_design jackknife labels disagree with the reference."
+        )
+    deleted = _as_float_array(
+        "study delete-block genetic-by-NxE traces", deleted_raw, ndim=2
+    )
+    _require_shape(
+        "study delete-block genetic-by-NxE traces",
+        deleted,
+        (len(labels), len(expected_order)),
+    )
+    if np.any(deleted < 0.0):
+        raise ValueError("Study delete-block genetic-by-NxE traces must be non-negative.")
+    return full, deleted
+
+
+def transfer_reference_normal_equations(
+    reference_equations: GxENormalEquations,
+    *,
+    reference_n_samples: int,
+    study_n_samples: int,
+    reference_residual_rank: int,
+    study_residual_rank: int,
+    same_individual_products: np.ndarray,
+    genetic_nxe_traces: np.ndarray,
+    q_nxe: float,
+    q_residual: float,
+    trace_nxe: float,
+    trace_nxe_sq: float,
+) -> GxENormalEquations:
+    """Transfer phenotype-independent kernel moments to a study cohort.
+
+    The reference genetic block is decomposed into same-person and
+    different-person parts. Under the declared reference-population
+    approximation, those parts scale as N and N(N-1), respectively. The
+    study's genetic-by-NxE and low-dimensional NxE moments are exact and are
+    never borrowed from the reference.
+    """
+    n_ref = int(reference_n_samples)
+    n_study = int(study_n_samples)
+    r_ref = int(reference_residual_rank)
+    r_study = int(study_residual_rank)
+    if (
+        n_ref < 2
+        or n_study < 2
+        or r_ref < 2
+        or r_study < 2
+        or r_ref >= n_ref
+        or r_study >= n_study
+    ):
+        raise ValueError("Population trace transfer has inconsistent sample sizes/ranks.")
+    reference_matrix = _as_float_array(
+        "reference normal matrix", reference_equations.matrix, ndim=2
+    )
+    reference_traces = _as_float_array(
+        "reference kernel traces", reference_equations.traces, ndim=1
+    )
+    p = reference_matrix.shape[0]
+    if reference_matrix.shape != (p, p) or reference_traces.shape != (p,):
+        raise ValueError("Reference equations have inconsistent dimensions.")
+    if (p - 2) % 2:
+        raise ValueError("Reference equations do not have a G/GxE/NxE/residual layout.")
+    genetic_count = p - 2
+    diagonal = _as_float_array(
+        "same_individual_products", same_individual_products, ndim=2
+    )
+    _require_shape(
+        "same_individual_products", diagonal, (genetic_count, genetic_count)
+    )
+    genetic_nxe = _as_float_array(
+        "genetic_nxe_traces", genetic_nxe_traces, ndim=1
+    )
+    _require_shape("genetic_nxe_traces", genetic_nxe, (genetic_count,))
+    if np.any(genetic_nxe < 0.0):
+        raise ValueError("genetic_nxe_traces must be non-negative.")
+    if not np.allclose(
+        reference_traces[:genetic_count],
+        float(r_ref),
+        rtol=1.0e-9,
+        atol=1.0e-8,
+    ):
+        raise ValueError(
+            "Population transfer requires standardized reference genetic kernels."
+        )
+
+    matrix = np.zeros_like(reference_matrix)
+    same_scale = float(n_study) / float(n_ref)
+    different_scale = (
+        float(n_study * (n_study - 1)) / float(n_ref * (n_ref - 1))
+    )
+    reference_genetic = reference_matrix[:genetic_count, :genetic_count]
+    matrix[:genetic_count, :genetic_count] = (
+        same_scale * diagonal
+        + different_scale * (reference_genetic - diagonal)
+    )
+    matrix[:genetic_count, genetic_count] = genetic_nxe
+    matrix[genetic_count, :genetic_count] = matrix[
+        :genetic_count, genetic_count
+    ]
+    traces = np.zeros_like(reference_traces)
+    traces[:genetic_count] = float(r_study)
+    matrix[:genetic_count, genetic_count + 1] = traces[:genetic_count]
+    matrix[genetic_count + 1, :genetic_count] = traces[:genetic_count]
+
+    q_nxe = float(q_nxe)
+    q_residual = float(q_residual)
+    trace_nxe = float(trace_nxe)
+    trace_nxe_sq = float(trace_nxe_sq)
+    scalars = (q_nxe, q_residual, trace_nxe, trace_nxe_sq)
+    if not all(np.isfinite(value) for value in scalars):
+        raise ValueError("Study NxE/residual moments must be finite.")
+    if q_nxe < 0.0 or trace_nxe < 0.0 or trace_nxe_sq < 0.0:
+        raise ValueError("Study NxE moments must be non-negative.")
+    if not np.isclose(q_residual, float(r_study), rtol=1.0e-10, atol=1.0e-8):
+        raise ValueError(
+            "Study q_residual is inconsistent with its residual rank: "
+            f"expected {r_study}, got {q_residual:.16g}."
+        )
+    traces[genetic_count] = trace_nxe
+    traces[genetic_count + 1] = float(r_study)
+    matrix[genetic_count, genetic_count] = trace_nxe_sq
+    matrix[genetic_count, genetic_count + 1] = trace_nxe
+    matrix[genetic_count + 1, genetic_count] = trace_nxe
+    matrix[genetic_count + 1, genetic_count + 1] = float(r_study)
+    return GxENormalEquations(
+        0.5 * (matrix + matrix.T),
+        np.zeros(p, dtype=np.float64),
+        traces,
+        reference_equations.component_names,
+    )
 
 
 def assemble_normal_equations(
@@ -844,6 +1064,11 @@ def _prepare_reference_sufficient_statistics(
         deleted_traces=(
             None if deleted_traces is None else np.array(deleted_traces, copy=True)
         ),
+        population_same_individual_products=(
+            None
+            if payload.get("population_trace") is None
+            else _population_same_individual_products(payload, annotation_names)
+        ),
         reference_provenance=reference_provenance,
         feature_cache_provenance=feature_cache_provenance,
     )
@@ -856,6 +1081,13 @@ def _equations_from_prepared_scores(
     *,
     q_nxe: float,
     q_residual: float,
+    reference_mode: str = _MATCHED_REFERENCE_MODE,
+    study_n_samples: int | None = None,
+    study_residual_rank: int | None = None,
+    genetic_nxe_traces: np.ndarray | None = None,
+    jackknife_genetic_nxe_traces: np.ndarray | None = None,
+    trace_nxe: float | None = None,
+    trace_nxe_sq: float | None = None,
 ) -> tuple[GxENormalEquations, tuple[GxENormalEquations, ...]]:
     """Insert phenotype score moments into prepared reference templates."""
     annot = prepared.annotations
@@ -864,7 +1096,30 @@ def _equations_from_prepared_scores(
     sw = _as_float_array("score_w", score_w, ndim=1)
     _require_shape("score_x", sx, (m,))
     _require_shape("score_w", sw, (m,))
-    r = float(prepared.residual_rank)
+    if reference_mode not in {
+        _MATCHED_REFERENCE_MODE,
+        _POPULATION_REFERENCE_MODE,
+    }:
+        raise ValueError(f"Unsupported GxE reference_mode={reference_mode!r}.")
+    population_transfer = reference_mode == _POPULATION_REFERENCE_MODE
+    if population_transfer:
+        if prepared.population_same_individual_products is None:
+            raise ValueError(
+                "Reference does not contain population same-individual trace moments."
+            )
+        if (
+            study_n_samples is None
+            or study_residual_rank is None
+            or genetic_nxe_traces is None
+            or trace_nxe is None
+            or trace_nxe_sq is None
+        ):
+            raise ValueError(
+                "Population-reference fitting requires study size and exact design traces."
+            )
+        r = float(int(study_residual_rank))
+    else:
+        r = float(prepared.residual_rank)
     q_nxe = float(q_nxe)
     q_residual = float(q_residual)
     if not np.isfinite(q_nxe) or not np.isfinite(q_residual):
@@ -900,12 +1155,33 @@ def _equations_from_prepared_scores(
     rhs[k : 2 * k] = r * score_full["w"] / prepared.annotation_masses
     rhs[2 * k] = q_nxe
     rhs[2 * k + 1] = q_residual
-    full = GxENormalEquations(
-        np.array(prepared.normal_matrix, copy=True),
-        rhs,
-        np.array(prepared.traces, copy=True),
-        prepared.component_names,
-    )
+    if population_transfer:
+        transferred = transfer_reference_normal_equations(
+            GxENormalEquations(
+                np.array(prepared.normal_matrix, copy=True),
+                np.zeros(2 * k + 2, dtype=np.float64),
+                np.array(prepared.traces, copy=True),
+                prepared.component_names,
+            ),
+            reference_n_samples=int(prepared.payload["n_samples"]),
+            study_n_samples=int(study_n_samples),
+            reference_residual_rank=prepared.residual_rank,
+            study_residual_rank=int(r),
+            same_individual_products=prepared.population_same_individual_products,
+            genetic_nxe_traces=np.asarray(genetic_nxe_traces, dtype=np.float64),
+            q_nxe=q_nxe,
+            q_residual=q_residual,
+            trace_nxe=float(trace_nxe),
+            trace_nxe_sq=float(trace_nxe_sq),
+        )
+        full = replace(transferred, rhs=rhs)
+    else:
+        full = GxENormalEquations(
+            np.array(prepared.normal_matrix, copy=True),
+            rhs,
+            np.array(prepared.traces, copy=True),
+            prepared.component_names,
+        )
 
     deleted: list[GxENormalEquations] = []
     if prepared.block_values is not None:
@@ -930,14 +1206,38 @@ def _equations_from_prepared_scores(
             )
             deleted_rhs[2 * k] = q_nxe
             deleted_rhs[2 * k + 1] = q_residual
-            deleted.append(
-                GxENormalEquations(
-                    np.array(prepared.deleted_matrices[block_id], copy=True),
-                    deleted_rhs,
-                    np.array(prepared.deleted_traces[block_id], copy=True),
-                    prepared.component_names,
-                )
+            deleted_reference = GxENormalEquations(
+                np.array(prepared.deleted_matrices[block_id], copy=True),
+                np.zeros(2 * k + 2, dtype=np.float64),
+                np.array(prepared.deleted_traces[block_id], copy=True),
+                prepared.component_names,
             )
+            if population_transfer:
+                if jackknife_genetic_nxe_traces is None:
+                    raise ValueError(
+                        "Population-reference jackknife requires study delete-block design traces."
+                    )
+                deleted_template = transfer_reference_normal_equations(
+                    deleted_reference,
+                    reference_n_samples=int(prepared.payload["n_samples"]),
+                    study_n_samples=int(study_n_samples),
+                    reference_residual_rank=prepared.residual_rank,
+                    study_residual_rank=int(r),
+                    same_individual_products=(
+                        prepared.population_same_individual_products
+                    ),
+                    genetic_nxe_traces=np.asarray(
+                        jackknife_genetic_nxe_traces[block_id],
+                        dtype=np.float64,
+                    ),
+                    q_nxe=q_nxe,
+                    q_residual=q_residual,
+                    trace_nxe=float(trace_nxe),
+                    trace_nxe_sq=float(trace_nxe_sq),
+                )
+                deleted.append(replace(deleted_template, rhs=deleted_rhs))
+            else:
+                deleted.append(replace(deleted_reference, rhs=deleted_rhs))
     return full, tuple(deleted)
 
 
@@ -1419,6 +1719,13 @@ def _fit_from_input_snapshots(
             "Reference and phenotype bundles use different schema versions: "
             f"reference={ref_version}, moments={moments_version}."
         )
+    reference_mode = moments.get("reference_mode", _MATCHED_REFERENCE_MODE)
+    if reference_mode not in {
+        _MATCHED_REFERENCE_MODE,
+        _POPULATION_REFERENCE_MODE,
+    }:
+        raise ValueError(f"Unsupported phenotype reference_mode={reference_mode!r}.")
+    population_transfer = reference_mode == _POPULATION_REFERENCE_MODE
     kernel_mode = ref.get("kernel_mode")
     if kernel_mode not in {"genie", "standardized"}:
         raise ValueError(f"Reference manifest has unsupported kernel_mode={kernel_mode!r}.")
@@ -1428,7 +1735,12 @@ def _fit_from_input_snapshots(
     null_corrected = ref.get("null_corrected")
     if not isinstance(null_corrected, bool):
         raise ValueError("Reference manifest null_corrected must be a JSON boolean.")
-    for key in ("analysis_fingerprint", "variant_digest", "residual_rank"):
+    identity_fields = (
+        ("variant_digest",)
+        if population_transfer
+        else ("analysis_fingerprint", "variant_digest", "residual_rank")
+    )
+    for key in identity_fields:
         if str(ref.get(key)) != str(moments.get(key)):
             raise ValueError(f"Reference and phenotype bundles disagree on {key}.")
     n_samples = ref.get("n_samples")
@@ -1444,6 +1756,30 @@ def _fit_from_input_snapshots(
     if residual_rank != n_samples - fixed_rank - 1:
         raise ValueError(
             "Reference residual rank is inconsistent with its sample size and fixed-effect rank."
+        )
+    study_n = moments.get("n_samples")
+    study_residual_rank = moments.get("residual_rank")
+    if any(
+        not isinstance(value, int) or isinstance(value, bool)
+        for value in (study_n, study_residual_rank)
+    ):
+        raise ValueError("Phenotype sample size and residual rank must be JSON integers.")
+    if study_n <= 0 or study_residual_rank <= 0 or study_residual_rank >= study_n:
+        raise ValueError("Phenotype sample size and residual rank are inconsistent.")
+    if population_transfer:
+        study_fixed_rank = moments.get("fixed_effect_rank_excluding_intercept")
+        if (
+            isinstance(study_fixed_rank, bool)
+            or not isinstance(study_fixed_rank, int)
+            or study_fixed_rank < 0
+            or study_residual_rank != study_n - study_fixed_rank - 1
+        ):
+            raise ValueError(
+                "Population phenotype fixed-effect rank is missing or inconsistent."
+            )
+    if population_transfer and kernel_mode != "standardized":
+        raise ValueError(
+            "Population-reference inference requires post-projection standardized kernels."
         )
     if moments.get("score_definition") != "feature_transpose_residualized_y_over_sqrt_residual_rank":
         raise ValueError("Phenotype moments use an unsupported marginal-score scale.")
@@ -1523,7 +1859,11 @@ def _fit_from_input_snapshots(
             and moments_cache_hash != verified_moments_cache_hash
         ):
             raise ValueError("Phenotype moments contain inconsistent feature-cache hashes.")
-    if observed_reference_hash != expected_reference_hash:
+    if population_transfer and observed_reference_hash != expected_reference_hash:
+        raise ValueError(
+            "Population phenotype moments must bind the exact reference manifest."
+        )
+    if not population_transfer and observed_reference_hash != expected_reference_hash:
         # Phenotype scores do not depend on the randomized trace realization.
         # They may therefore be reused across B10/B100 references only when
         # both manifests are cryptographically bound to the exact same feature
@@ -1606,6 +1946,22 @@ def _fit_from_input_snapshots(
     if not isinstance(annotation_names_raw, list):
         raise ValueError("Reference annotation_names must be a JSON list.")
     names = tuple(_validate_gxe_annotation_names(annotation_names_raw))
+    study_genetic_nxe: np.ndarray | None = None
+    study_deleted_genetic_nxe: np.ndarray | None = None
+    if population_transfer:
+        reference_jackknife = ref.get("jackknife")
+        population_block_labels: tuple[str, ...] = ()
+        if isinstance(reference_jackknife, Mapping):
+            raw_labels = reference_jackknife.get("block_labels")
+            if isinstance(raw_labels, list):
+                population_block_labels = tuple(str(value) for value in raw_labels)
+        study_genetic_nxe, study_deleted_genetic_nxe = (
+            _study_population_design_moments(
+                moments,
+                names,
+                population_block_labels,
+            )
+        )
     weight_cols = [f"ANNOT_{i}" for i in range(len(names))]
     required_diag = ["CHR", "SNP", "BP", "A1", "A2", "NORM_X", "NORM_W", "DNXE_X", "DNXE_W", *weight_cols]
     if ref_version >= 3:
@@ -1818,10 +2174,14 @@ def _fit_from_input_snapshots(
         df_values = pd.to_numeric(table["DF"], errors="raise").to_numpy(dtype=np.float64) if "DF" in table else None
         if n_values is None or df_values is None:
             raise ValueError(f"{label} score file must contain N and DF columns.")
-        if not np.all(n_values == float(ref["n_samples"])):
-            raise ValueError(f"{label} score file N does not match the reference sample count.")
-        if not np.all(df_values == float(ref["residual_rank"])):
-            raise ValueError(f"{label} score file DF does not match the reference residual rank.")
+        expected_n = float(study_n if population_transfer else ref["n_samples"])
+        expected_df = float(
+            study_residual_rank if population_transfer else ref["residual_rank"]
+        )
+        if not np.all(n_values == expected_n):
+            raise ValueError(f"{label} score file N does not match the phenotype sample count.")
+        if not np.all(df_values == expected_df):
+            raise ValueError(f"{label} score file DF does not match the phenotype residual rank.")
         score_arrays.append(table["SCORE"].to_numpy(dtype=np.float64))
 
     shared_cache_snapshot = (
@@ -1845,7 +2205,7 @@ def _fit_from_input_snapshots(
             allow_negative_storage=null_corrected,
         )
 
-    eq = assemble_normal_equations(
+    reference_eq = assemble_normal_equations(
         annotations=annotations,
         score_x=score_arrays[0],
         score_w=score_arrays[1],
@@ -1858,14 +2218,46 @@ def _fit_from_input_snapshots(
         diag_nxe_x=diag["DNXE_X"].to_numpy(dtype=np.float64),
         diag_nxe_w=diag["DNXE_W"].to_numpy(dtype=np.float64),
         residual_rank=int(ref["residual_rank"]),
-        q_nxe=float(moments["q_nxe"]),
-        q_residual=float(moments["q_residual"]),
+        q_nxe=(0.0 if population_transfer else float(moments["q_nxe"])),
+        q_residual=(
+            float(ref["residual_rank"])
+            if population_transfer
+            else float(moments["q_residual"])
+        ),
         trace_nxe=float(ref["trace_nxe"]),
         trace_nxe_sq=float(ref["trace_nxe_sq"]),
         annotation_names=names,
         ld_scale=str(ref["ld_scale"]),
         null_corrected=null_corrected,
     )
+    if population_transfer:
+        assert study_genetic_nxe is not None
+        products = _population_same_individual_products(ref, names)
+        transferred = transfer_reference_normal_equations(
+            reference_eq,
+            reference_n_samples=int(n_samples),
+            study_n_samples=int(study_n),
+            reference_residual_rank=int(ref["residual_rank"]),
+            study_residual_rank=int(study_residual_rank),
+            same_individual_products=products,
+            genetic_nxe_traces=study_genetic_nxe,
+            q_nxe=float(moments["q_nxe"]),
+            q_residual=float(moments["q_residual"]),
+            trace_nxe=float(moments["trace_nxe"]),
+            trace_nxe_sq=float(moments["trace_nxe_sq"]),
+        )
+        transferred_rhs = np.array(transferred.rhs, copy=True)
+        genetic_count = len(transferred_rhs) - 2
+        transferred_rhs[:genetic_count] = (
+            float(study_residual_rank)
+            / float(ref["residual_rank"])
+            * reference_eq.rhs[:genetic_count]
+        )
+        transferred_rhs[genetic_count] = float(moments["q_nxe"])
+        transferred_rhs[genetic_count + 1] = float(moments["q_residual"])
+        eq = replace(transferred, rhs=transferred_rhs)
+    else:
+        eq = reference_eq
     fit = solve_normal_equations(
         eq,
         allow_ill_conditioned=allow_ill_conditioned,
@@ -1960,7 +2352,7 @@ def _fit_from_input_snapshots(
             norm_w=diag["NORM_W"].to_numpy(dtype=np.float64),
             diag_x=diag["DNXE_X"].to_numpy(dtype=np.float64),
             diag_w=diag["DNXE_W"].to_numpy(dtype=np.float64),
-            equations=eq,
+            equations=reference_eq,
             block_values=block_values,
             block_labels=labels,
             within=within,
@@ -1973,6 +2365,17 @@ def _fit_from_input_snapshots(
             score_arrays[1],
             q_nxe=float(moments["q_nxe"]),
             q_residual=float(moments["q_residual"]),
+            reference_mode=str(reference_mode),
+            study_n_samples=int(study_n),
+            study_residual_rank=int(study_residual_rank),
+            genetic_nxe_traces=study_genetic_nxe,
+            jackknife_genetic_nxe_traces=study_deleted_genetic_nxe,
+            trace_nxe=(
+                float(moments["trace_nxe"]) if population_transfer else None
+            ),
+            trace_nxe_sq=(
+                float(moments["trace_nxe_sq"]) if population_transfer else None
+            ),
         )
         replicate_proportions = []
         for deleted in deleted_equations:
@@ -2010,7 +2413,7 @@ def _fit_from_input_snapshots(
             norm_w=diag["NORM_W"].to_numpy(dtype=np.float64),
             diag_x=diag["DNXE_X"].to_numpy(dtype=np.float64),
             diag_w=diag["DNXE_W"].to_numpy(dtype=np.float64),
-            equations=eq,
+            equations=reference_eq,
             null_corrected=null_corrected,
         )
     fit = replace(
@@ -2056,9 +2459,51 @@ def _fit_prepared_from_input_snapshots(
             "Reference and phenotype bundles use different schema versions: "
             f"reference={prepared.schema_version}, moments={moments_version}."
         )
-    for key in ("analysis_fingerprint", "variant_digest", "residual_rank"):
+    reference_mode = moments.get("reference_mode", _MATCHED_REFERENCE_MODE)
+    if reference_mode not in {
+        _MATCHED_REFERENCE_MODE,
+        _POPULATION_REFERENCE_MODE,
+    }:
+        raise ValueError(f"Unsupported phenotype reference_mode={reference_mode!r}.")
+    population_transfer = reference_mode == _POPULATION_REFERENCE_MODE
+    identity_fields = (
+        ("variant_digest",)
+        if population_transfer
+        else ("analysis_fingerprint", "variant_digest", "residual_rank")
+    )
+    for key in identity_fields:
         if str(ref.get(key)) != str(moments.get(key)):
             raise ValueError(f"Reference and phenotype bundles disagree on {key}.")
+    study_n = moments.get("n_samples")
+    study_residual_rank = moments.get("residual_rank")
+    if any(
+        not isinstance(value, int) or isinstance(value, bool)
+        for value in (study_n, study_residual_rank)
+    ) or study_n <= 0 or study_residual_rank <= 0 or study_residual_rank >= study_n:
+        raise ValueError("Phenotype sample size and residual rank are inconsistent.")
+    if population_transfer:
+        study_fixed_rank = moments.get("fixed_effect_rank_excluding_intercept")
+        if (
+            isinstance(study_fixed_rank, bool)
+            or not isinstance(study_fixed_rank, int)
+            or study_fixed_rank < 0
+            or study_residual_rank != study_n - study_fixed_rank - 1
+        ):
+            raise ValueError(
+                "Population phenotype fixed-effect rank is missing or inconsistent."
+            )
+    if population_transfer and prepared.population_same_individual_products is None:
+        raise ValueError("Reference lacks population trace-transfer moments.")
+    study_genetic_nxe: np.ndarray | None = None
+    study_deleted_genetic_nxe: np.ndarray | None = None
+    if population_transfer:
+        study_genetic_nxe, study_deleted_genetic_nxe = (
+            _study_population_design_moments(
+                moments,
+                prepared.annotation_names,
+                prepared.block_labels,
+            )
+        )
     if moments.get("score_definition") != (
         "feature_transpose_residualized_y_over_sqrt_residual_rank"
     ):
@@ -2100,7 +2545,11 @@ def _fit_prepared_from_input_snapshots(
             and moments_cache_hash != verified_moments_cache_hash
         ):
             raise ValueError("Phenotype moments contain inconsistent feature-cache hashes.")
-    if prepared.manifest_sha256 != expected_reference_hash:
+    if population_transfer and prepared.manifest_sha256 != expected_reference_hash:
+        raise ValueError(
+            "Population phenotype moments must bind the exact reference manifest."
+        )
+    if not population_transfer and prepared.manifest_sha256 != expected_reference_hash:
         if (
             ref_cache_hash is None
             or verified_moments_cache_hash is None
@@ -2200,10 +2649,14 @@ def _fit_prepared_from_input_snapshots(
         )
         if n_values is None or df_values is None:
             raise ValueError(f"{label} score file must contain N and DF columns.")
-        if not np.all(n_values == float(ref["n_samples"])):
-            raise ValueError(f"{label} score file N does not match the reference sample count.")
-        if not np.all(df_values == float(prepared.residual_rank)):
-            raise ValueError(f"{label} score file DF does not match the reference residual rank.")
+        expected_n = float(study_n if population_transfer else ref["n_samples"])
+        expected_df = float(
+            study_residual_rank if population_transfer else prepared.residual_rank
+        )
+        if not np.all(n_values == expected_n):
+            raise ValueError(f"{label} score file N does not match the phenotype sample count.")
+        if not np.all(df_values == expected_df):
+            raise ValueError(f"{label} score file DF does not match the phenotype residual rank.")
         score_arrays.append(table["SCORE"].to_numpy(dtype=np.float64))
 
     equations, deleted_equations = _equations_from_prepared_scores(
@@ -2212,6 +2665,15 @@ def _fit_prepared_from_input_snapshots(
         score_arrays[1],
         q_nxe=float(moments["q_nxe"]),
         q_residual=float(moments["q_residual"]),
+        reference_mode=str(reference_mode),
+        study_n_samples=int(study_n),
+        study_residual_rank=int(study_residual_rank),
+        genetic_nxe_traces=study_genetic_nxe,
+        jackknife_genetic_nxe_traces=study_deleted_genetic_nxe,
+        trace_nxe=(float(moments["trace_nxe"]) if population_transfer else None),
+        trace_nxe_sq=(
+            float(moments["trace_nxe_sq"]) if population_transfer else None
+        ),
     )
     fit = solve_normal_equations(
         equations,

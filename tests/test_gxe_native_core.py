@@ -20,6 +20,7 @@ from summit.ldscore.gwe_ldscore import (
     _native_gemm_integrity_workspace_elements,
     _native_strict_feature_moment_verification_policy,
     _orthonormalize_columns,
+    _validate_native_blas_runtime,
 )
 from summit.logger import Logger
 
@@ -220,6 +221,53 @@ def test_native_integrity_workspace_is_vendor_independent():
         dimensions[0] + 2 * dimensions[2] + 2 * dimensions[1]
     ) + dimensions[2] * dimensions[1]
     assert _native_gemm_integrity_workspace_elements(None, *dimensions) == 0
+
+
+def test_native_blas_runtime_requires_one_matching_library(monkeypatch):
+    single = {
+        "user_api": "blas",
+        "internal_api": "openblas",
+        "version": "0.3.34",
+        "filepath": "/opt/lib/libopenblas.so",
+        "num_threads": 16,
+    }
+    monkeypatch.setattr(
+        "summit.ldscore.gwe_ldscore.threadpool_info", lambda: [single]
+    )
+    observed = _validate_native_blas_runtime(
+        {
+            "blas_vendor": "OpenBLAS",
+            "blas_runtime_config": "OpenBLAS 0.3.34 DYNAMIC_ARCH Zen",
+        }
+    )
+    assert observed["internal_api"] == "openblas"
+    assert observed["version"] == "0.3.34"
+    assert observed["num_threads"] == 16
+
+    second = {
+        **single,
+        "version": "0.3.30",
+        "filepath": "/wheel/numpy.libs/libopenblas.so",
+    }
+    monkeypatch.setattr(
+        "summit.ldscore.gwe_ldscore.threadpool_info", lambda: [single, second]
+    )
+    with pytest.raises(RuntimeError, match="exactly one process-wide BLAS"):
+        _validate_native_blas_runtime({"blas_vendor": "OpenBLAS"})
+
+    monkeypatch.setattr(
+        "summit.ldscore.gwe_ldscore.threadpool_info", lambda: [single]
+    )
+    with pytest.raises(RuntimeError, match="disagree"):
+        _validate_native_blas_runtime({"blas_vendor": "Intel10_64_dyn"})
+
+    with pytest.raises(RuntimeError, match="OpenBLAS version disagree"):
+        _validate_native_blas_runtime(
+            {
+                "blas_vendor": "OpenBLAS",
+                "blas_runtime_config": "OpenBLAS 0.3.30 DYNAMIC_ARCH Haswell",
+            }
+        )
 
 
 def test_native_compute_block_coalescing_preserves_probe_streams():

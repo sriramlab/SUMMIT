@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -121,6 +122,47 @@ def test_common_cohort_multi_environment_cli_dispatches_once(tmp_path, monkeypat
     )
     cli.main()
     assert observed == ["age,bmi"]
+
+
+def test_population_reference_cli_dispatches_one_trait_to_scalar_scorer(
+    tmp_path, monkeypatch
+):
+    from summit import cli
+    from summit.logger import Logger
+
+    observed = {}
+
+    def capture(**kwargs):
+        observed.update(kwargs)
+        return SimpleNamespace(
+            gwas=Path("height.gxe.gwas.tsv.gz"),
+            gwis=Path("height.gxe.gwis.tsv.gz"),
+            moments=Path("height.gxe.moments.json"),
+        )
+
+    monkeypatch.setattr(cli, "score_phenotype_from_reference", capture)
+
+    def forbidden_wide(**_):
+        raise AssertionError("population-reference mode dispatched the wide scorer")
+
+    monkeypatch.setattr(cli, "score_phenotypes_from_reference", forbidden_wide)
+    args = cli.build_parser().parse_args(
+        [
+            "--geno", "study",
+            "--env", "age.tsv",
+            "--covar", "covariates.tsv",
+            "--gxe-pheno", "phenotype.tsv",
+            "--gxe-pheno-col", "height",
+            "--gxe-score-reference", "reference.gxe.ref.json",
+            "--gxe-population-reference",
+            "--out", str(tmp_path / "height"),
+        ]
+    )
+    cli._dispatch_gxe_score(args, Logger(suppress=True))
+
+    assert observed["pheno_col"] == "height"
+    assert observed["population_transfer"] is True
+    assert observed["reference_manifest"] == "reference.gxe.ref.json"
 
 
 @pytest.mark.parametrize(
