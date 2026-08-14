@@ -398,6 +398,17 @@ void dgemm_tn_openblas_partitioned(int m, int n, int k,
                                    double* c, int ldc,
                                    int requested_threads,
                                    double alpha = 1.0, double beta = 0.0) {
+    // For a wide left/output dimension, splitting by output columns makes
+    // every application thread independently repack and stream the same A
+    // panel. One internally threaded GEMM reuses that packing and is much
+    // faster for the production-sized GxE target blocks. Skinny products keep
+    // the disjoint-call path, which benchmarks better at small m.
+    constexpr int kInternallyThreadedMinimumRows = 512;
+    if (m >= kInternallyThreadedMinimumRows) {
+        openblas_set_num_threads(std::max(1, requested_threads));
+        dgemm_tn(m, n, k, a, lda, b, ldb, c, ldc, alpha, beta);
+        return;
+    }
     openblas_set_num_threads(1);
     const int threads = std::max(1, std::min(requested_threads, n));
 #ifdef _OPENMP
