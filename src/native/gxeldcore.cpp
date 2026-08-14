@@ -59,13 +59,6 @@ namespace {
 
 constexpr double kOrthonormalTolerance = 1.0e-10;
 constexpr double kStandardizedEnvTolerance = 1.0e-8;
-#ifdef GWLDCORE_USE_OPENBLAS
-constexpr const char* kNativeGemmIntegrityMode =
-    "openmp_partitioned_single_thread_openblas_eight_check_abft";
-#else
-constexpr const char* kNativeGemmIntegrityMode =
-    "deterministic_disjoint_output_tiled_gemm";
-#endif
 
 size_t checked_add(size_t a, size_t b, const char* label) {
     if (b > std::numeric_limits<size_t>::max() - a) {
@@ -1034,7 +1027,7 @@ public:
         result["strict_feature_moment_verification"] = strict_feature_moment_verification_;
         result["feature_moment_integrity_mode"] = strict_feature_moment_verification_
             ? "strict_duplicate"
-            : kNativeGemmIntegrityMode;
+            : "deterministic_disjoint_output_tiled_gemm";
         result["repaired_gemm_output_columns"] =
             repaired_gemm_output_columns_.load(std::memory_order_relaxed);
         result["environment_mean"] = environment_mean_;
@@ -1060,11 +1053,6 @@ public:
         const size_t moment_copies = strict_feature_moment_verification_ ? 8U : 4U;
         elements = checked_add(elements, checked_mul(moment_copies, checked_mul(static_cast<size_t>(q_), static_cast<size_t>(l), "feature moments"), "feature moments"), "feature workspace");
         elements = checked_add(elements, checked_mul(11U, static_cast<size_t>(l), "feature vectors"), "feature workspace");
-        elements = checked_add(
-            elements,
-            partitioned_gemm_integrity_workspace_elements(moment_rows, l, n_),
-            "feature integrity workspace"
-        );
         ensure_workspace(elements, "feature block");
 
         double* scale_x = nullptr;
@@ -1131,12 +1119,17 @@ public:
             // [Q, E Q, E^2 Q, E^3 Q]^T G yields every required projected
             // moment in one cache-efficient GEMM instead of four skinny
             // products and three full genotype rewrites.
-            const int64_t abft_repairs = dgemm_tn_partitioned_columns(
+#if defined(GWLDCORE_GEMM_INTEGRITY)
+            dgemm_tn_tiled(
                 moment_rows, l, n_, feature_moment_basis_.data(), n_,
                 geno.get(), n_, moments.data(), moment_rows, decode_threads_
             );
-            repaired_feature_moment_columns += abft_repairs;
-            record_gemm_repairs(abft_repairs);
+#else
+            dgemm_tn(
+                moment_rows, l, n_, feature_moment_basis_.data(), n_,
+                geno.get(), n_, moments.data(), moment_rows
+            );
+#endif
             if (strict_feature_moment_verification_) {
                 // Strict mode repeats the full product. It is retained for
                 // stress testing and unusually conservative deployments.
@@ -1271,7 +1264,7 @@ public:
         result["strict_feature_moment_verification"] = strict_feature_moment_verification_;
         result["feature_moment_integrity_mode"] = strict_feature_moment_verification_
             ? "strict_duplicate"
-            : kNativeGemmIntegrityMode;
+            : "deterministic_disjoint_output_tiled_gemm";
         result["missing_genotype_calls"] = missing;
         return result;
     }

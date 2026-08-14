@@ -226,7 +226,8 @@ def _native_strict_feature_moment_verification_policy(
 
     if str(build_info.get("blas_vendor", "")).strip().lower() == "openblas":
         return False, (
-            "eight-check ABFT over SUMMIT-partitioned single-thread OpenBLAS GEMMs"
+            "deterministic tiled feature GEMMs; eight-check ABFT over "
+            "partitioned single-thread OpenBLAS trace GEMMs"
         )
     return False, (
         "deterministic disjoint-output tiled GEMMs independent of "
@@ -1972,15 +1973,7 @@ class GenomewideEnvLDScore:
         desired = int(self.nsnps)
 
         def required(variants: int) -> int:
-            return (
-                int(variants) * elements_per_variant
-                + _native_gemm_integrity_workspace_elements(
-                    self._native_build_info,
-                    4 * q_rank,
-                    int(variants),
-                    self.nsamp,
-                )
-            )
+            return int(variants) * elements_per_variant
 
         low, high = 0, desired
         while low < high:
@@ -2274,13 +2267,7 @@ class GenomewideEnvLDScore:
             "feature_moment_integrity_mode": (
                 "strict_duplicate"
                 if self.native_strict_feature_moment_verification
-                else (
-                    "openmp_partitioned_single_thread_openblas_eight_check_abft"
-                    if str(
-                        (self._native_build_info or {}).get("blas_vendor", "")
-                    ).strip().lower() == "openblas"
-                    else "deterministic_disjoint_output_tiled_gemm"
-                )
+                else "deterministic_disjoint_output_tiled_gemm"
             ),
             "feature_moment_integrity_reason": (
                 self.native_feature_moment_integrity_reason
@@ -4020,14 +4007,7 @@ class GenomewideEnvLDScore:
         native_feature_moment_copies = (
             8 if self.native_strict_feature_moment_verification else 4
         )
-        native_feature_integrity_elements = (
-            _native_gemm_integrity_workspace_elements(
-                self._native_build_info,
-                4 * q_rank,
-                max_feature_block,
-                self.nsamp,
-            )
-        )
+        native_feature_integrity_elements = 0
         native_feature_bytes = 8 * (
             self.nsamp * max_feature_block
             + native_feature_moment_copies * q_rank * max_feature_block

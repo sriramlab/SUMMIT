@@ -165,7 +165,7 @@ def test_native_feature_moment_verification_defaults_to_partitioned_gemm(monkeyp
         }
     )
     assert enabled is False
-    assert "SUMMIT-partitioned single-thread OpenBLAS GEMMs" in reason
+    assert "deterministic tiled feature GEMMs" in reason
 
     enabled, reason = _native_strict_feature_moment_verification_policy(
         {
@@ -174,7 +174,7 @@ def test_native_feature_moment_verification_defaults_to_partitioned_gemm(monkeyp
         }
     )
     assert enabled is False
-    assert "SUMMIT-partitioned single-thread OpenBLAS GEMMs" in reason
+    assert "deterministic tiled feature GEMMs" in reason
 
     enabled, reason = _native_strict_feature_moment_verification_policy(
         {
@@ -183,7 +183,7 @@ def test_native_feature_moment_verification_defaults_to_partitioned_gemm(monkeyp
         }
     )
     assert enabled is False
-    assert "SUMMIT-partitioned single-thread OpenBLAS GEMMs" in reason
+    assert "deterministic tiled feature GEMMs" in reason
 
     enabled, reason = _native_strict_feature_moment_verification_policy(
         {
@@ -285,7 +285,7 @@ def test_native_feature_source_target_match_dense_oracle(
         assert info["feature_moment_integrity_mode"] == (
             "strict_duplicate"
             if strict_feature_moment_verification
-            else "openmp_partitioned_single_thread_openblas_eight_check_abft"
+            else "deterministic_disjoint_output_tiled_gemm"
         )
         assert info["repaired_gemm_output_columns"] >= 0
         feature = _feature(context, m)
