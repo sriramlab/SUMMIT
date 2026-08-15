@@ -1681,6 +1681,12 @@ class GenomewideEnvLDScore:
         self.native_strict_feature_moment_verification = False
         self.native_feature_moment_integrity_reason = "Python backend"
         self.native_phase_timings: dict[str, float] = {}
+        # A common-cohort multi-environment executor owns a shared Python
+        # genotype stream but may route every wide product through the same
+        # protected native GEMMs as the direct backend.  It supplies an exact
+        # provenance template here without pretending that each estimator
+        # owns an independent DirectContext.
+        self.shared_backend_provenance: dict | None = None
         if self.native_backend != "python":
             unsupported = []
             if self.nbins != 1:
@@ -3242,6 +3248,29 @@ class GenomewideEnvLDScore:
         }
 
     def _backend_provenance(self, artifact_stage: str) -> dict:
+        shared = self.shared_backend_provenance
+        if shared is not None:
+            provenance = dict(shared)
+            provenance["artifact_stage"] = str(artifact_stage)
+            global_width = int(
+                self.resource_estimates.get("actual_global_2b_source_columns", 0)
+            )
+            jackknife_width = int(
+                self.resource_estimates.get("actual_jackknife_2b_source_columns", 0)
+            )
+            target_width = int(
+                self.resource_estimates.get("target_source_columns", 0)
+            )
+            if artifact_stage == "feature_construction":
+                global_width = jackknife_width = target_width = 0
+            provenance["actual_global_2b_source_columns"] = global_width
+            provenance["actual_jackknife_2b_source_columns"] = jackknife_width
+            provenance["actual_target_source_columns"] = target_width
+            _validate_backend_provenance(
+                provenance, expected_stage=str(artifact_stage)
+            )
+            return provenance
+
         build_info = None
         native_binary_sha256 = None
         if self.native_backend == "direct":

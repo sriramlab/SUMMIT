@@ -19,9 +19,15 @@ from pathlib import Path
 import numpy as np
 
 from .gwe_ldscore import (
+    _BACKEND_PROVENANCE_SCHEMA_VERSION,
     GenomewideEnvLDScore,
     _build_balanced_vtiles,
+    _is_canonical_sha256,
+    _loaded_native_binary_record,
+    _sha256_descriptor,
+    _validate_backend_provenance,
     _validate_jackknife_probe_count,
+    _validate_native_blas_runtime,
 )
 
 
@@ -34,6 +40,207 @@ def safe_environment_suffix(name: str) -> str:
     if not suffix:
         raise ValueError(f"Environment name {name!r} has no safe filename characters.")
     return suffix
+
+
+class _MultiEnvironmentGemm:
+    """Matrix executor for the shared stream, with exact native provenance."""
+
+    def __init__(
+        self, requested_backend: str, estimator: GenomewideEnvLDScore
+    ) -> None:
+        backend = str(requested_backend).strip().lower()
+        if backend not in {"python", "direct"}:
+            raise ValueError("requested_backend must be 'python' or 'direct'.")
+        self.protected = backend == "direct"
+        self.threads = int(estimator.num_threads)
+        self.compute_dtype = np.dtype(
+            np.float64 if self.protected else estimator.dtype
+        )
+        self.repaired_output_columns = 0
+        self._module = None
+        self._descriptor: int | None = None
+        self._binary_record: dict | None = None
+        self._template: dict | None = None
+        if not self.protected:
+            return
+
+        try:
+            from .. import gxeldcore
+        except Exception as exc:
+            raise RuntimeError(
+                "The requested protected multi-environment GxE extension is unavailable."
+            ) from exc
+        for function in ("protected_matmul_nn", "protected_matmul_tn"):
+            if not callable(getattr(gxeldcore, function, None)):
+                raise RuntimeError(
+                    "The loaded GxE extension predates protected shared GEMMs; "
+                    "rebuild/install SUMMIT from the current source before running "
+                    "--gxe-env-cols with --gxe-native-backend direct."
+                )
+
+        descriptor = None
+        try:
+            descriptor, binary_record = _loaded_native_binary_record(gxeldcore)
+            build_info = dict(gxeldcore.build_info())
+            runtime_record = _validate_native_blas_runtime(build_info)
+            source_commit = build_info.get("source_commit")
+            source_tree_sha256 = build_info.get("source_tree_sha256")
+            if not (
+                isinstance(source_commit, str)
+                and len(source_commit) == 40
+                and all(character in "0123456789abcdef" for character in source_commit)
+                and _is_canonical_sha256(source_tree_sha256)
+            ):
+                raise RuntimeError(
+                    "The protected shared GxE extension lacks exact source provenance."
+                )
+            compile_options = {
+                key: build_info.get(key)
+                for key in (
+                    "api_version", "compiler_id", "compiler_version", "build_type",
+                    "blas_vendor", "cxx_standard", "optimization",
+                    "architecture_tuning", "openmp_enabled",
+                    "native_optimization_enabled", "platform",
+                    "blas_runtime_config",
+                )
+            }
+            compile_options["execution_mode"] = (
+                "shared_multi_environment_protected_gemm"
+            )
+            compile_options["loaded_blas_runtime"] = dict(runtime_record)
+            template = {
+                "schema_version": _BACKEND_PROVENANCE_SCHEMA_VERSION,
+                "artifact_stage": "feature_construction",
+                "backend_name": str(
+                    build_info.get("backend_name", "gxeldcore_direct")
+                ),
+                "backend_version": str(build_info.get("backend_version", "unknown")),
+                "source_commit": source_commit,
+                "source_tree_sha256": source_tree_sha256,
+                "native_binary_sha256": binary_record["sha256"],
+                "compile_options": compile_options,
+                "native_workspace_cap_bytes": int(
+                    estimator.native_workspace_gib * 1024**3
+                ),
+                "configured_target_panel_columns": int(
+                    estimator.native_target_panel_columns
+                ),
+                "actual_global_2b_source_columns": 0,
+                "actual_jackknife_2b_source_columns": 0,
+                "actual_target_source_columns": 0,
+            }
+            _validate_backend_provenance(
+                template, expected_stage="feature_construction"
+            )
+        except Exception:
+            if descriptor is not None:
+                os.close(descriptor)
+            raise
+        self._module = gxeldcore
+        self._descriptor = descriptor
+        self._binary_record = binary_record
+        self._template = template
+
+    def __enter__(self) -> "_MultiEnvironmentGemm":
+        return self
+
+    def __exit__(self, *_exc) -> None:
+        self.close()
+
+    def close(self) -> None:
+        if self._descriptor is not None:
+            os.close(self._descriptor)
+            self._descriptor = None
+
+    def provenance_template(self) -> dict | None:
+        if not self.protected:
+            return None
+        if (
+            self._descriptor is None
+            or self._binary_record is None
+            or self._template is None
+        ):
+            raise RuntimeError("The protected shared GxE executor is closed.")
+        observed = os.fstat(self._descriptor)
+        identity = (
+            observed.st_dev, observed.st_ino, observed.st_size,
+            observed.st_mtime_ns, observed.st_ctime_ns,
+        )
+        if identity != tuple(self._binary_record["identity"]):
+            raise RuntimeError(
+                "The loaded protected GxE extension inode changed during execution."
+            )
+        if _sha256_descriptor(self._descriptor) != self._binary_record["sha256"]:
+            raise RuntimeError(
+                "The loaded protected GxE extension bytes changed during execution."
+            )
+        return dict(self._template)
+
+    def nn(self, left: np.ndarray, right: np.ndarray) -> np.ndarray:
+        if not self.protected:
+            return left @ right
+        assert self._module is not None
+        result, repaired = self._module.protected_matmul_nn(
+            np.asfortranarray(left, dtype=np.float64),
+            np.asfortranarray(right, dtype=np.float64),
+            self.threads,
+        )
+        self.repaired_output_columns += int(repaired)
+        return np.asarray(result)
+
+    def tn(self, left: np.ndarray, right: np.ndarray) -> np.ndarray:
+        if not self.protected:
+            return left.T @ right
+        assert self._module is not None
+        result, repaired = self._module.protected_matmul_tn(
+            np.asfortranarray(left, dtype=np.float64),
+            np.asfortranarray(right, dtype=np.float64),
+            self.threads,
+        )
+        self.repaired_output_columns += int(repaired)
+        return np.asarray(result)
+
+
+def _prepare_feature_block(
+    estimator: GenomewideEnvLDScore,
+    genotype: np.ndarray,
+    start: int,
+    stop: int,
+    *,
+    interaction: bool,
+    apply_scale: bool,
+    executor: _MultiEnvironmentGemm,
+) -> np.ndarray:
+    if not executor.protected:
+        method = (
+            estimator._prepare_interaction_block
+            if interaction else estimator._prepare_additive_block
+        )
+        return method(
+            start, stop, G=genotype, apply_scale=apply_scale,
+            out_dtype=executor.compute_dtype,
+        )
+
+    if interaction:
+        feature = np.asarray(
+            genotype * estimator.env[:, None], dtype=np.float64, order="F"
+        )
+    else:
+        feature = np.array(genotype, copy=True, dtype=np.float64, order="F")
+    if estimator.p_eff > 0:
+        coefficients = executor.tn(estimator.C_int, feature)
+        feature -= executor.nn(estimator.C_int, coefficients)
+    feature -= feature.mean(axis=0, keepdims=True)
+    if apply_scale and estimator.kernel_mode == "standardized":
+        scales = (
+            estimator.inv_sqrt_resvar_w_all
+            if interaction else estimator.inv_sqrt_resvar_x_all
+        )
+        if scales is None:
+            label = "Interaction" if interaction else "Additive"
+            raise RuntimeError(f"{label} residual variances have not been precomputed.")
+        feature *= scales[start:stop].reshape(1, -1)
+    return np.asarray(feature, dtype=executor.compute_dtype, order="F")
 
 
 def _new_feature_state(estimator: GenomewideEnvLDScore) -> dict:
@@ -52,13 +259,16 @@ def _accumulate_feature_block(
     genotype: np.ndarray,
     start: int,
     stop: int,
+    executor: _MultiEnvironmentGemm,
 ) -> None:
     """Consume one shared standardized genotype block for one environment."""
-    x = estimator._prepare_additive_block(
-        start, stop, G=genotype, apply_scale=False, out_dtype=np.float64
+    x = _prepare_feature_block(
+        estimator, genotype, start, stop,
+        interaction=False, apply_scale=False, executor=executor,
     )
-    w = estimator._prepare_interaction_block(
-        start, stop, G=genotype, apply_scale=False, out_dtype=np.float64
+    w = _prepare_feature_block(
+        estimator, genotype, start, stop,
+        interaction=True, apply_scale=False, executor=executor,
     )
     ssx = np.sum(x * x, axis=0, dtype=np.float64)
     ssw = np.sum(w * w, axis=0, dtype=np.float64)
@@ -106,8 +316,8 @@ def _accumulate_feature_block(
     leaked_x_sq = (x.sum(axis=0, dtype=np.float64) / root_n) ** 2
     leaked_w_sq = (w.sum(axis=0, dtype=np.float64) / root_n) ** 2
     if estimator.p_eff > 0:
-        projected_x = estimator.C_int.T @ x
-        projected_w = estimator.C_int.T @ w
+        projected_x = executor.tn(estimator.C_int, x)
+        projected_w = executor.tn(estimator.C_int, w)
         leaked_x_sq += np.sum(projected_x * projected_x, axis=0, dtype=np.float64)
         leaked_w_sq += np.sum(projected_w * projected_w, axis=0, dtype=np.float64)
     state["max_leak_x"] = max(
@@ -259,7 +469,10 @@ def _require_common_contract(estimators: Sequence[GenomewideEnvLDScore]) -> None
         )
 
 
-def _shared_vtiles(estimators: Sequence[GenomewideEnvLDScore]) -> list[tuple[int, int]]:
+def _shared_vtiles(
+    estimators: Sequence[GenomewideEnvLDScore],
+    compute_dtype: np.dtype,
+) -> list[tuple[int, int]]:
     first = estimators[0]
     budget = min(float(estimator.target_xz_mem) for estimator in estimators)
     # Jackknife deletion is performed later from completed per-variant LD
@@ -271,7 +484,7 @@ def _shared_vtiles(estimators: Sequence[GenomewideEnvLDScore]) -> list[tuple[int
         * len(estimators)
         * first.nsamp
         * first.nbins
-        * np.dtype(first.dtype).itemsize
+        * np.dtype(compute_dtype).itemsize
     )
     vmax = int((budget * 1024**3) // max(1, bytes_per_probe))
     if vmax < 1:
@@ -281,6 +494,31 @@ def _shared_vtiles(estimators: Sequence[GenomewideEnvLDScore]) -> list[tuple[int
             f"limit={int(budget * 1024**3)} bytes."
         )
     return _build_balanced_vtiles(first.nvecs, vmax)
+
+
+def _accumulate_sketch_block(
+    estimator: GenomewideEnvLDScore,
+    target: np.ndarray,
+    feature: np.ndarray,
+    probes: np.ndarray,
+    annotation: np.ndarray,
+    executor: _MultiEnvironmentGemm,
+) -> None:
+    if not executor.protected:
+        estimator._accumulate_sketch_block(target, feature, probes, annotation)
+        return
+    sqrt_annotation = np.sqrt(np.maximum(annotation, 0))
+    for index in range(estimator.nbins):
+        weights = sqrt_annotation[:, index]
+        if not np.any(weights):
+            continue
+        segment = slice(
+            index * probes.shape[1], (index + 1) * probes.shape[1]
+        )
+        weighted_probes = np.asfortranarray(
+            weights.reshape(-1, 1) * probes, dtype=np.float64
+        )
+        target[:, segment] += executor.nn(feature, weighted_probes)
 
 
 def _publish_json_no_replace(payload: dict, target: Path) -> tuple[int, int]:
@@ -338,7 +576,28 @@ def generate_multi_environment_references(
     """Generate independent references while sharing every genotype block read."""
     estimators = tuple(estimators)
     _require_common_contract(estimators)
+    with _MultiEnvironmentGemm(requested_backend, estimators[0]) as executor:
+        return _generate_multi_environment_references(
+            estimators,
+            batch_manifest=batch_manifest,
+            requested_backend=requested_backend,
+            executor=executor,
+        )
+
+
+def _generate_multi_environment_references(
+    estimators: Sequence[GenomewideEnvLDScore],
+    *,
+    batch_manifest: str | Path,
+    requested_backend: str,
+    executor: _MultiEnvironmentGemm,
+) -> Path:
     first = estimators[0]
+    shared_provenance = executor.provenance_template()
+    for estimator in estimators:
+        estimator.shared_backend_provenance = (
+            None if shared_provenance is None else dict(shared_provenance)
+        )
     target = Path(batch_manifest).expanduser().resolve()
     if target.exists():
         raise FileExistsError(f"Refusing existing multi-environment manifest: {target}.")
@@ -353,7 +612,7 @@ def generate_multi_environment_references(
     first._assert_construction_genotype_state()
     initial_provenance = first._genotype_provenance()
     blocks = first._make_compute_blocks()
-    vtiles = _shared_vtiles(estimators)
+    vtiles = _shared_vtiles(estimators, executor.compute_dtype)
     for estimator in estimators:
         estimator._vtiles_used = list(vtiles)
 
@@ -362,17 +621,19 @@ def generate_multi_environment_references(
         f"{len(estimators)} independent environments: "
         f"{[estimator.env_name for estimator in estimators]}."
     )
-    if requested_backend == "direct":
+    if executor.protected:
         first.log._log(
-            "[gxe:multi] The shared decoded-block BLAS executor supersedes the "
-            "one-environment direct context for this batch."
+            "[gxe:multi] Shared decoded blocks use double-precision native "
+            "partitioned GEMMs with checksum detection and deterministic repair."
         )
 
     feature_states = [_new_feature_state(estimator) for estimator in estimators]
     for start, stop in blocks:
         genotype = first._read_genotype_block(start, stop)
         for estimator, state in zip(estimators, feature_states, strict=True):
-            _accumulate_feature_block(estimator, state, genotype, start, stop)
+            _accumulate_feature_block(
+                estimator, state, genotype, start, stop, executor
+            )
         del genotype
     for estimator, state in zip(estimators, feature_states, strict=True):
         _finish_feature_state(estimator, state)
@@ -383,7 +644,7 @@ def generate_multi_environment_references(
     gc.collect()
 
     max_vt = max(size for _, size in vtiles)
-    itemsize = np.dtype(first.dtype).itemsize
+    itemsize = executor.compute_dtype.itemsize
     resident_multiplier = 2
     total_resident = (
         resident_multiplier
@@ -398,8 +659,9 @@ def generate_multi_environment_references(
     passes = 1 + len(vtiles) * passes_per_tile
     for estimator in estimators:
         estimator.resource_estimates = {
-            "native_direct_backend": 0,
+            "native_direct_backend": int(executor.protected),
             "multi_environment_shared_decode": 1,
+            "multi_environment_protected_gemm": int(executor.protected),
             "multi_environment_count": len(estimators),
             "shared_genotype_passes": passes,
             "decoded_genotype_block_gib": float(
@@ -462,7 +724,11 @@ def generate_multi_environment_references(
     for probe_start, probe_count in vtiles:
         columns = first.nbins * probe_count
         global_sources = [
-            np.zeros((first.nsamp, 2 * columns), dtype=first.dtype, order="F")
+            np.zeros(
+                (first.nsamp, 2 * columns),
+                dtype=executor.compute_dtype,
+                order="F",
+            )
             for _ in estimators
         ]
         for start, stop in blocks:
@@ -474,23 +740,25 @@ def generate_multi_environment_references(
                 v_start=probe_start,
             )
             for index, estimator in enumerate(estimators):
-                x = estimator._prepare_additive_block(
-                    start, stop, G=genotype, apply_scale=True,
-                    out_dtype=estimator.dtype,
+                x = _prepare_feature_block(
+                    estimator, genotype, start, stop,
+                    interaction=False, apply_scale=True, executor=executor,
                 )
-                w = estimator._prepare_interaction_block(
-                    start, stop, G=genotype, apply_scale=True,
-                    out_dtype=estimator.dtype,
+                w = _prepare_feature_block(
+                    estimator, genotype, start, stop,
+                    interaction=True, apply_scale=True, executor=executor,
                 )
                 annotation = np.asarray(
-                    estimator.annot[start:stop], dtype=estimator.dtype
+                    estimator.annot[start:stop], dtype=executor.compute_dtype
                 )
-                estimator._accumulate_sketch_block(
-                    global_sources[index][:, :columns], x, probes, annotation,
+                _accumulate_sketch_block(
+                    estimator, global_sources[index][:, :columns], x,
+                    probes, annotation, executor,
                 )
-                estimator._accumulate_sketch_block(
-                    global_sources[index][:, columns:2 * columns], w, probes,
-                    annotation,
+                _accumulate_sketch_block(
+                    estimator,
+                    global_sources[index][:, columns:2 * columns],
+                    w, probes, annotation, executor,
                 )
                 del x, w, annotation
             del genotype, probes
@@ -507,16 +775,20 @@ def generate_multi_environment_references(
         for start, stop in blocks:
             genotype = first._read_genotype_block(start, stop)
             for index, estimator in enumerate(estimators):
-                x = estimator._prepare_additive_block(
-                    start, stop, G=genotype, apply_scale=True,
-                    out_dtype=estimator.dtype,
+                x = _prepare_feature_block(
+                    estimator, genotype, start, stop,
+                    interaction=False, apply_scale=True, executor=executor,
                 )
-                w = estimator._prepare_interaction_block(
-                    start, stop, G=genotype, apply_scale=True,
-                    out_dtype=estimator.dtype,
+                w = _prepare_feature_block(
+                    estimator, genotype, start, stop,
+                    interaction=True, apply_scale=True, executor=executor,
                 )
-                work_x = np.asarray(x.T @ global_sources[index], dtype=np.float64)
-                work_w = np.asarray(w.T @ global_sources[index], dtype=np.float64)
+                work_x = np.asarray(
+                    executor.tn(x, global_sources[index]), dtype=np.float64
+                )
+                work_w = np.asarray(
+                    executor.tn(w, global_sources[index]), dtype=np.float64
+                )
                 estimator._accumulate_left_scores(
                     work_x[:, :columns], accumulators[index]["xx"],
                     start, stop, probe_count,
@@ -539,6 +811,23 @@ def generate_multi_environment_references(
         gc.collect()
 
     first._assert_construction_genotype_state()
+    if executor.protected:
+        # Re-hash the still-loaded extension immediately before sealing any
+        # scientific bundle, then expose the aggregate repair count in every
+        # independently consumable reference.
+        shared_provenance = executor.provenance_template()
+        for estimator in estimators:
+            estimator.shared_backend_provenance = dict(shared_provenance)
+            estimator.resource_estimates[
+                "native_repaired_gemm_output_columns"
+            ] = int(executor.repaired_output_columns)
+            estimator.resource_estimates[
+                "native_retried_gemm_input_mutations"
+            ] = 0
+        first.log._log(
+            "[gxe:multi:integrity] ABFT-repaired output columns="
+            f"{executor.repaired_output_columns}; input mutation policy=abort."
+        )
     if population_enabled:
         for index, estimator in enumerate(estimators):
             estimator.population_same_individual_products = (
@@ -581,6 +870,10 @@ def generate_multi_environment_references(
             "schema_version": 1,
             "execution": "shared_in_memory_decoded_blocks",
             "requested_backend": str(requested_backend),
+            "protected_native_gemm": bool(executor.protected),
+            "repaired_gemm_output_columns": int(
+                executor.repaired_output_columns
+            ),
             "num_environments": len(estimators),
             "common_complete_case_samples": first.nsamp,
             "num_variants": first.nsnps,

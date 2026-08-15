@@ -122,6 +122,42 @@ def _python_features(
     }
 
 
+def test_protected_shared_gemm_entry_points_match_numpy():
+    rng = np.random.default_rng(12817)
+    left_nn = np.asfortranarray(rng.normal(size=(37, 11)))
+    right_nn = np.asfortranarray(rng.normal(size=(11, 7)))
+    observed_nn, repaired_nn = gxeldcore.protected_matmul_nn(
+        left_nn, right_nn, 2
+    )
+    np.testing.assert_allclose(observed_nn, left_nn @ right_nn, rtol=2e-14, atol=2e-14)
+    assert np.asarray(observed_nn).flags.f_contiguous
+    assert repaired_nn == 0
+
+    left_tn = np.asfortranarray(rng.normal(size=(41, 13)))
+    right_tn = np.asfortranarray(rng.normal(size=(41, 5)))
+    observed_tn, repaired_tn = gxeldcore.protected_matmul_tn(
+        left_tn, right_tn, 2
+    )
+    np.testing.assert_allclose(observed_tn, left_tn.T @ right_tn, rtol=2e-14, atol=2e-14)
+    assert np.asarray(observed_tn).flags.f_contiguous
+    assert repaired_tn == 0
+
+
+def test_protected_shared_gemm_rejects_incompatible_shapes():
+    with pytest.raises(RuntimeError, match="incompatible dimensions"):
+        gxeldcore.protected_matmul_nn(
+            np.ones((5, 3), dtype=np.float64, order="F"),
+            np.ones((4, 2), dtype=np.float64, order="F"),
+            1,
+        )
+    with pytest.raises(RuntimeError, match="incompatible dimensions"):
+        gxeldcore.protected_matmul_tn(
+            np.ones((5, 3), dtype=np.float64, order="F"),
+            np.ones((4, 2), dtype=np.float64, order="F"),
+            1,
+        )
+
+
 def _feature(context, m: int, *, require_missing_free: bool = True):
     return context.feature_block(
         blk_start=0,

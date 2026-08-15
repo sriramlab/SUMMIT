@@ -2417,6 +2417,106 @@ private:
 #endif
 };
 
+void validate_protected_gemm_threads(int requested_threads) {
+    if (requested_threads <= 0) {
+        throw std::runtime_error("Protected GxE GEMM threads must be positive");
+    }
+#ifdef _OPENMP
+    int thread_limit = omp_get_thread_limit();
+#if defined(__linux__)
+    cpu_set_t affinity;
+    CPU_ZERO(&affinity);
+    if (::sched_getaffinity(0, sizeof(affinity), &affinity) == 0) {
+        const int affinity_count = CPU_COUNT(&affinity);
+        if (affinity_count > 0) {
+            thread_limit = std::min(thread_limit, affinity_count);
+        }
+    }
+#endif
+    if (requested_threads > thread_limit) {
+        throw std::runtime_error(
+            "Protected GxE GEMM threads exceed the OpenMP/CPU-affinity limit"
+        );
+    }
+#else
+    if (requested_threads != 1) {
+        throw std::runtime_error(
+            "Protected GxE GEMM threads must be one when OpenMP is unavailable"
+        );
+    }
+#endif
+}
+
+nb::tuple protected_matmul_nn(
+    nb_mat2f_ro<double> left,
+    nb_mat2f_ro<double> right,
+    int requested_threads
+) {
+    validate_protected_gemm_threads(requested_threads);
+    if (left.shape(1) != right.shape(0)) {
+        throw std::runtime_error(
+            "Protected GxE NN GEMM operands have incompatible dimensions"
+        );
+    }
+    const int m = checked_blas_dim(left.shape(0), "protected NN rows");
+    const int k = checked_blas_dim(left.shape(1), "protected NN reduction");
+    const int n = checked_blas_dim(right.shape(1), "protected NN columns");
+    if (m == 0 || n == 0 || k == 0) {
+        throw std::runtime_error("Protected GxE NN GEMM operands must be non-empty");
+    }
+    double* output = nullptr;
+    auto result = make_owned_numpy_mat2f<double>(
+        static_cast<size_t>(m), static_cast<size_t>(n), &output
+    );
+    int64_t repaired = 0;
+    {
+        nb::gil_scoped_release release;
+        repaired = dgemm_nn_partitioned_rows(
+            m, n, k,
+            left.data(), m,
+            right.data(), k,
+            output, m,
+            requested_threads
+        );
+    }
+    return nb::make_tuple(result, repaired);
+}
+
+nb::tuple protected_matmul_tn(
+    nb_mat2f_ro<double> left,
+    nb_mat2f_ro<double> right,
+    int requested_threads
+) {
+    validate_protected_gemm_threads(requested_threads);
+    if (left.shape(0) != right.shape(0)) {
+        throw std::runtime_error(
+            "Protected GxE TN GEMM operands have incompatible dimensions"
+        );
+    }
+    const int k = checked_blas_dim(left.shape(0), "protected TN reduction");
+    const int m = checked_blas_dim(left.shape(1), "protected TN rows");
+    const int n = checked_blas_dim(right.shape(1), "protected TN columns");
+    if (m == 0 || n == 0 || k == 0) {
+        throw std::runtime_error("Protected GxE TN GEMM operands must be non-empty");
+    }
+    double* output = nullptr;
+    auto result = make_owned_numpy_mat2f<double>(
+        static_cast<size_t>(m), static_cast<size_t>(n), &output
+    );
+    int64_t repaired = 0;
+    {
+        nb::gil_scoped_release release;
+        repaired = dgemm_tn_partitioned_rows(
+            m, n, k,
+            left.data(), k,
+            right.data(), k,
+            output, m,
+            requested_threads
+        );
+    }
+    return nb::make_tuple(result, repaired);
+}
+
 }  // namespace
 
 NB_MODULE(gxeldcore, module) {
@@ -2448,6 +2548,16 @@ NB_MODULE(gxeldcore, module) {
 #endif
         return result;
     });
+    module.def(
+        "protected_matmul_nn", &protected_matmul_nn,
+        nb::arg("left"), nb::arg("right"), nb::arg("threads"),
+        "Compute left @ right with the GxE integrity-checked GEMM executor."
+    );
+    module.def(
+        "protected_matmul_tn", &protected_matmul_tn,
+        nb::arg("left"), nb::arg("right"), nb::arg("threads"),
+        "Compute left.T @ right with the GxE integrity-checked GEMM executor."
+    );
     nb::class_<ProjectedPanel>(module, "ProjectedPanel")
         .def_prop_ro("columns", &ProjectedPanel::columns)
         .def_prop_ro("leakage", &ProjectedPanel::leakage);
