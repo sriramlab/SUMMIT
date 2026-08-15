@@ -122,6 +122,8 @@ def test_shared_multi_environment_matches_independent_references(tmp_path):
     assert payload["kind"] == "summit.gxe.multi_environment_reference_batch"
     assert payload["num_environments"] == 2
     assert payload["shared_genotype_passes"] == 3
+    assert payload["protected_native_gemm"] is True
+    assert payload["repaired_gemm_output_columns"] == 0
     assert [item["environment"] for item in payload["references"]] == ["age", "bmi"]
 
     for column in ("age", "bmi"):
@@ -141,8 +143,16 @@ def test_shared_multi_environment_matches_independent_references(tmp_path):
         assert manifest["jackknife"]["method"] == "block_local_ldscore_deletion"
         resources = manifest["resource_estimates"]
         assert resources["multi_environment_shared_decode"] == 1
+        assert resources["multi_environment_protected_gemm"] == 1
         assert resources["multi_environment_count"] == 2
         assert resources["shared_genotype_passes"] == 3
+        assert resources["native_repaired_gemm_output_columns"] == 0
+        provenance = manifest["backend_provenance"]
+        assert provenance["backend_name"] == "gxeldcore_direct"
+        assert (
+            provenance["compile_options"]["execution_mode"]
+            == "shared_multi_environment_protected_gemm"
+        )
 
 
 def test_multi_environment_rejects_different_complete_case_cohorts(tmp_path):
