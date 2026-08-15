@@ -521,6 +521,78 @@ def _accumulate_sketch_block(
         target[:, segment] += executor.nn(feature, weighted_probes)
 
 
+def _accumulate_unprojected_source_block(
+    estimator: GenomewideEnvLDScore,
+    target: np.ndarray,
+    genotype: np.ndarray,
+    probes: np.ndarray,
+    annotation: np.ndarray,
+    start: int,
+    stop: int,
+    *,
+    interaction: bool,
+    executor: _MultiEnvironmentGemm,
+) -> None:
+    """Accumulate a raw source; one panel projection follows the full pass."""
+    scales = (
+        estimator.inv_sqrt_resvar_w_all
+        if interaction else estimator.inv_sqrt_resvar_x_all
+    )
+    if scales is None:
+        raise RuntimeError("GxE source scales have not been precomputed.")
+    sqrt_annotation = np.sqrt(np.maximum(annotation, 0))
+    block_scales = scales[start:stop]
+    for index in range(estimator.nbins):
+        weights = sqrt_annotation[:, index]
+        if not np.any(weights):
+            continue
+        segment = slice(
+            index * probes.shape[1], (index + 1) * probes.shape[1]
+        )
+        weighted_probes = np.asfortranarray(
+            (weights * block_scales).reshape(-1, 1) * probes,
+            dtype=np.float64,
+        )
+        contribution = executor.nn(genotype, weighted_probes)
+        if interaction:
+            contribution *= estimator.env[:, None]
+        target[:, segment] += contribution
+
+
+def _project_source_panel_inplace(
+    estimator: GenomewideEnvLDScore,
+    panel: np.ndarray,
+    executor: _MultiEnvironmentGemm,
+) -> float:
+    """Project one completed source panel and return relative leakage."""
+    if estimator.p_eff > 0:
+        coefficients = executor.tn(estimator.C_int, panel)
+        panel -= executor.nn(estimator.C_int, coefficients)
+    panel -= panel.mean(axis=0, keepdims=True)
+
+    denominator = np.sum(panel * panel, axis=0, dtype=np.float64)
+    root_n = math.sqrt(float(estimator.nsamp))
+    leaked = (panel.sum(axis=0, dtype=np.float64) / root_n) ** 2
+    if estimator.p_eff > 0:
+        coefficients = executor.tn(estimator.C_int, panel)
+        leaked += np.sum(coefficients * coefficients, axis=0, dtype=np.float64)
+    relative = np.sqrt(
+        np.divide(
+            leaked,
+            denominator,
+            out=np.full_like(leaked, np.inf),
+            where=denominator > 0.0,
+        )
+    )
+    maximum = float(np.max(relative))
+    if not np.isfinite(maximum) or maximum > 1.0e-9:
+        raise RuntimeError(
+            f"Projected source panel for environment {estimator.env_name!r} "
+            f"has excessive fixed-effect leakage: {maximum:.6g}."
+        )
+    return maximum
+
+
 def _publish_json_no_replace(payload: dict, target: Path) -> tuple[int, int]:
     """Atomically seal a new batch manifest without replacing another writer."""
     target.parent.mkdir(parents=True, exist_ok=True)
@@ -645,7 +717,10 @@ def _generate_multi_environment_references(
 
     max_vt = max(size for _, size in vtiles)
     itemsize = executor.compute_dtype.itemsize
-    resident_multiplier = 2
+    # The protected algebraic target retains E*S beside each projected 2B
+    # source panel.  This trades one additional bounded panel per environment
+    # for eliminating its repeated construction in every variant block.
+    resident_multiplier = 4 if executor.protected else 2
     total_resident = (
         resident_multiplier
         * len(estimators)
@@ -740,6 +815,34 @@ def _generate_multi_environment_references(
                 v_start=probe_start,
             )
             for index, estimator in enumerate(estimators):
+                annotation = np.asarray(
+                    estimator.annot[start:stop], dtype=executor.compute_dtype
+                )
+                if executor.protected:
+                    _accumulate_unprojected_source_block(
+                        estimator,
+                        global_sources[index][:, :columns],
+                        genotype,
+                        probes,
+                        annotation,
+                        start,
+                        stop,
+                        interaction=False,
+                        executor=executor,
+                    )
+                    _accumulate_unprojected_source_block(
+                        estimator,
+                        global_sources[index][:, columns:2 * columns],
+                        genotype,
+                        probes,
+                        annotation,
+                        start,
+                        stop,
+                        interaction=True,
+                        executor=executor,
+                    )
+                    del annotation
+                    continue
                 x = _prepare_feature_block(
                     estimator, genotype, start, stop,
                     interaction=False, apply_scale=True, executor=executor,
@@ -747,9 +850,6 @@ def _generate_multi_environment_references(
                 w = _prepare_feature_block(
                     estimator, genotype, start, stop,
                     interaction=True, apply_scale=True, executor=executor,
-                )
-                annotation = np.asarray(
-                    estimator.annot[start:stop], dtype=executor.compute_dtype
                 )
                 _accumulate_sketch_block(
                     estimator, global_sources[index][:, :columns], x,
@@ -763,6 +863,29 @@ def _generate_multi_environment_references(
                 del x, w, annotation
             del genotype, probes
 
+        environment_weighted_sources = []
+        if executor.protected:
+            for index, estimator in enumerate(estimators):
+                leakage = _project_source_panel_inplace(
+                    estimator, global_sources[index], executor
+                )
+                estimator.resource_estimates[
+                    "max_native_source_projection_leakage"
+                ] = max(
+                    float(
+                        estimator.resource_estimates.get(
+                            "max_native_source_projection_leakage", 0.0
+                        )
+                    ),
+                    leakage,
+                )
+                environment_weighted_sources.append(
+                    np.asfortranarray(
+                        estimator.env[:, None] * global_sources[index],
+                        dtype=np.float64,
+                    )
+                )
+
         if population_enabled:
             for index, estimator in enumerate(estimators):
                 estimator._accumulate_population_diagonal_moments(
@@ -775,20 +898,39 @@ def _generate_multi_environment_references(
         for start, stop in blocks:
             genotype = first._read_genotype_block(start, stop)
             for index, estimator in enumerate(estimators):
-                x = _prepare_feature_block(
-                    estimator, genotype, start, stop,
-                    interaction=False, apply_scale=True, executor=executor,
-                )
-                w = _prepare_feature_block(
-                    estimator, genotype, start, stop,
-                    interaction=True, apply_scale=True, executor=executor,
-                )
-                work_x = np.asarray(
-                    executor.tn(x, global_sources[index]), dtype=np.float64
-                )
-                work_w = np.asarray(
-                    executor.tn(w, global_sources[index]), dtype=np.float64
-                )
+                if executor.protected:
+                    work_x = np.asarray(
+                        executor.tn(genotype, global_sources[index]),
+                        dtype=np.float64,
+                    )
+                    work_w = np.asarray(
+                        executor.tn(
+                            genotype, environment_weighted_sources[index]
+                        ),
+                        dtype=np.float64,
+                    )
+                    work_x *= estimator.inv_sqrt_resvar_x_all[
+                        start:stop
+                    ].reshape(-1, 1)
+                    work_w *= estimator.inv_sqrt_resvar_w_all[
+                        start:stop
+                    ].reshape(-1, 1)
+                else:
+                    x = _prepare_feature_block(
+                        estimator, genotype, start, stop,
+                        interaction=False, apply_scale=True, executor=executor,
+                    )
+                    w = _prepare_feature_block(
+                        estimator, genotype, start, stop,
+                        interaction=True, apply_scale=True, executor=executor,
+                    )
+                    work_x = np.asarray(
+                        executor.tn(x, global_sources[index]), dtype=np.float64
+                    )
+                    work_w = np.asarray(
+                        executor.tn(w, global_sources[index]), dtype=np.float64
+                    )
+                    del x, w
                 estimator._accumulate_left_scores(
                     work_x[:, :columns], accumulators[index]["xx"],
                     start, stop, probe_count,
@@ -805,8 +947,9 @@ def _generate_multi_environment_references(
                     work_w[:, columns:2 * columns], accumulators[index]["ww"],
                     start, stop, probe_count,
                 )
-                del x, w, work_x, work_w
+                del work_x, work_w
             del genotype
+        del environment_weighted_sources
         del global_sources
         gc.collect()
 
