@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import json
+import os
 
 import numpy as np
 import pytest
@@ -358,12 +359,26 @@ def test_python_and_native_global_probes_match_across_threads() -> None:
         pytest.skip("loaded native extension predates Stage 03 global probes")
     variants = np.asarray([31, 0, 8, 999, 8, 4], dtype=np.int64)
     probes = np.asarray([17, 3, 4097, 18], dtype=np.int64)
+    info = dict(gxeldcore.build_info())
+    available_threads = (
+        len(os.sched_getaffinity(0))
+        if hasattr(os, "sched_getaffinity")
+        else max(1, os.cpu_count() or 1)
+    )
+    if info.get("blas_runtime_environment_immutable") is True:
+        available_threads = min(
+            available_threads, int(info["blas_runtime_threads"])
+        )
+    thread_counts = tuple(
+        threads for threads in (1, 2, 4) if threads <= available_threads
+    )
+    assert thread_counts
     expected = generate_global_variant_probes(
         variants,
         probes,
         root_seed=2**63 + 41,
     )
-    for threads in (1, 2, 4):
+    for threads in thread_counts:
         observed = native_global_variant_probes(
             variants,
             probes,
@@ -373,7 +388,6 @@ def test_python_and_native_global_probes_match_across_threads() -> None:
         )
         assert observed.flags.f_contiguous
         np.testing.assert_array_equal(observed, expected)
-    info = gxeldcore.build_info()
     assert info["global_variant_probe_supported"] is True
     assert (
         info["global_variant_probe_algorithm"]

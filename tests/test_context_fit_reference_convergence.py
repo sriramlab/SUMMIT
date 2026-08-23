@@ -19,6 +19,7 @@ def test_independent_reference_fit_converges_toward_exact_study_fit(
             str(repository / "scripts/context/validate_fit_reference_convergence.py"),
             "--output-dir",
             str(tmp_path),
+            "--no-figure",
         ],
         cwd=repository,
         env=environment,

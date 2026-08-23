@@ -40,6 +40,11 @@ MAXIMUM_GENOTYPE_CONTEXT_LOADING = 0.30
 def _arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument(
+        "--no-figure",
+        action="store_true",
+        help="Write only the aggregate JSON result without importing Matplotlib.",
+    )
     parser.add_argument("--replicates", type=int, default=24)
     parser.add_argument("--study-n", type=int, default=96)
     parser.add_argument(
@@ -493,7 +498,8 @@ def main() -> None:
     serialized = json.dumps(payload, sort_keys=True, indent=2, allow_nan=False) + "\n"
     args.output_dir.mkdir(parents=True, exist_ok=True)
     (args.output_dir / f"{OUTPUT_STEM}.json").write_text(serialized, encoding="utf-8")
-    _write_figure(payload, args.output_dir)
+    if not args.no_figure:
+        _write_figure(payload, args.output_dir)
 
 
 if __name__ == "__main__":
