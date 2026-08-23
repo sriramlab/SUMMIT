@@ -40,7 +40,7 @@ def test_zero_overlap_requires_explicit_opt_in(tmp_path: Path):
         )
 
 
-def test_zero_overlap_has_exact_zero_intercept_when_allowed(tmp_path: Path):
+def test_zero_overlap_has_exact_zero_overlap_covariance_when_allowed(tmp_path: Path):
     phen, phen_list, mapping = _write_inputs(tmp_path)
 
     result = build_rg_manifest(
@@ -54,4 +54,4 @@ def test_zero_overlap_has_exact_zero_intercept_when_allowed(tmp_path: Path):
 
     assert result.shape[0] == 1
     assert int(result.loc[0, "n_overlap"]) == 0
-    assert float(result.loc[0, "intercept_rg"]) == 0.0
+    assert float(result.loc[0, "overlap_covariance"]) == 0.0

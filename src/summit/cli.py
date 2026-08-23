@@ -300,7 +300,7 @@ def build_parser() -> argparse.ArgumentParser:
                         help="Path to the primary LD-score file. Use '@' as a chromosome placeholder for split files.")
     parser.add_argument("--ldscores-reg", default=None, type=str,
                         help=(
-                            "Optional LD-score file used only for the bivariate intercept regression. "
+                            "Optional LD-score file used only for summary-only overlap-covariance estimation. "
                             "A 1D total-LD file is preferred; multi-column files are collapsed to "
                             "total LD by default and must be non-overlapping."
                         ))
@@ -311,7 +311,7 @@ def build_parser() -> argparse.ArgumentParser:
                         ))
     parser.add_argument("--collapse-reg-ld", action="store_true", default=True,
                         help=(
-                            "Deprecated no-op: multi-column intercept-regression LD is collapsed "
+                            "Deprecated no-op: multi-column overlap-covariance LD is collapsed "
                             "to total LD by default."
                         ))
 
@@ -358,9 +358,9 @@ def build_parser() -> argparse.ArgumentParser:
                             "Either a comma-separated pair of summary-statistics files for bivariate rg estimation, "
                             "where each file may be a chromosome-split '@' spec, "
                             "or a manifest file path for batch rg. Manifest mode requires per-row phen1, phen2, "
-                            "and sumstats1, sumstats2 columns. A finite per-row intercept_rg is required in fast "
+                            "and sumstats1, sumstats2 columns. A finite per-row overlap_covariance is required in fast "
                             "manifest mode and optional in regular mode; omitted regular values use SUMMIT's "
-                            "summary-estimated intercept with delete refits."
+                            "summary-only overlap-covariance estimation with delete refits."
                         ))
     parser.add_argument("--make-rg-manifest", default=None, type=str,
                         help=(
@@ -440,11 +440,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--compact", action="store_true", help="Write a compact rg manifest with only the core columns needed downstream.",)
     parser.add_argument("--rg-manifest-fast", action="store_true", default=False,
                         help=(
-                            "Use the HE/jackknife sparse-drop fast path for fixed-intercept rg manifest mode. "
+                            "Use the HE/jackknife sparse-drop fast path for supplied-overlap rg manifest mode. "
                             "This reuses cached sumstats and shared unit-level moment summaries, "
                             "writes manifest.results.tsv with total and per-bin rg/gamma columns, "
-                            "and also emits per-pair .log files. Every row requires a finite intercept_rg; "
-                            "constrained cov-LDSC and summary-estimated intercepts require regular mode."
+                            "and also emits per-pair .log files. Every row requires a finite overlap_covariance; "
+                            "constrained cov-LDSC and summary-only overlap-covariance estimation require regular mode."
                         ))
     parser.add_argument("--rg-fast-no-pair-logs", action="store_true", default=False,
                         help=(
@@ -482,15 +482,47 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--allow-zero-rg-overlap", action="store_true", default=False,
                         help=(
                             "In --make-rg-manifest mode, retain phenotype pairs with no overlapping "
-                            "individuals and set their exact overlap covariance intercept to zero."
+                            "individuals and set their exact sample-overlap covariance to zero."
                         ))
     parser.add_argument("--max-chisq", default=None, type=str,
                         help="Main chi^2 threshold. Use 'auto' for max(80, 0.001*Nmax).")
-    parser.add_argument("--intercept-chisq-thr", default=None, type=str,
-                        help="Chi^2 threshold used only for the cross-trait intercept regression. Use 'auto' for max(80, 0.001*Nmax).")
-    parser.add_argument("--intercept-weight-mode", default="score", type=str,
-                        choices=["ldsc", "score"],
-                        help="Weighting scheme for the constrained cross-trait intercept fit: 'ldsc' for LDSC-style IRWLS weights, or 'score' for fixed w_j = 1 / w_ld,j.")
+    parser.add_argument(
+        "--overlap-covariance-chisq-thr",
+        dest="intercept_chisq_thr",
+        default=None,
+        type=str,
+        help=(
+            "Chi^2 threshold used only for summary-only overlap-covariance "
+            "estimation. Use 'auto' for max(80, 0.001*Nmax)."
+        ),
+    )
+    parser.add_argument(
+        "--intercept-chisq-thr",
+        dest="intercept_chisq_thr",
+        default=None,
+        type=str,
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--overlap-covariance-weight-mode",
+        dest="intercept_weight_mode",
+        default="score",
+        type=str,
+        choices=["ldsc", "score"],
+        help=(
+            "Weighting scheme for summary-only overlap-covariance estimation: "
+            "'ldsc' for LDSC-style IRWLS weights, or 'score' for fixed "
+            "w_j = 1 / w_ld,j."
+        ),
+    )
+    parser.add_argument(
+        "--intercept-weight-mode",
+        dest="intercept_weight_mode",
+        default="score",
+        type=str,
+        choices=["ldsc", "score"],
+        help=argparse.SUPPRESS,
+    )
     parser.add_argument("--weight-mode", default="he", type=str,
                         choices=["he", "ldsc"],
                         help=(
@@ -499,7 +531,7 @@ def build_parser() -> argparse.ArgumentParser:
                             "LDSC for h2 and constrained score-scale cov-LDSC for genetic covariance "
                             "by closed-form IRWLS. rg is formed from covariance and h2 refits. It retains "
                             "SUMMIT's exact-score "
-                            "response, scalar effective-sample-size convention, and nuisance-intercept "
+                            "response, scalar effective-sample-size convention, and overlap-covariance "
                             "refit semantics, so it is not literal ldsc.py when per-SNP sample sizes vary."
                         ))
     parser.add_argument("--ldsc-m", default=None, type=str,
@@ -517,15 +549,30 @@ def build_parser() -> argparse.ArgumentParser:
                         choices=["drop", "clip", "warn", "none"],
                         help="What to do with high-chi^2 SNPs on the main analysis axis.")
 
-    parser.add_argument("--intercept-rg", default=None, type=float, help=(
-        "Fix the SUMCORE nuisance offset c for rg estimation. "
-        "This must be c = y_overlap^T y_overlap / sqrt(N1*N2) = N_overlap * rho_y,overlap / sqrt(N1*N2)."
-    ))
+    parser.add_argument(
+        "--overlap-covariance-rg",
+        dest="intercept_rg",
+        default=None,
+        type=float,
+        help=(
+            "Supply the SUM-CORE overlapping phenotype covariance c_ov on the "
+            "HE scale: c_ov = y_overlap^T y_overlap / sqrt(N1*N2) = "
+            "N_overlap * rho_y,overlap / sqrt(N1*N2)."
+        ),
+    )
+    parser.add_argument(
+        "--intercept-rg",
+        dest="intercept_rg",
+        default=None,
+        type=float,
+        help=argparse.SUPPRESS,
+    )
     parser.add_argument("--pheno-rg", default=None, type=str, help=(
         "Comma-separated pair of phenotype files for the traits in --rg. "
         "Each file should contain sample ID column(s) followed by the phenotype in the last column. "
         "SUMCORE standardizes each phenotype on its own study sample, intersects overlapping IDs, "
-        "and computes c = y_overlap^T y_overlap / sqrt(N1*N2). Mutually exclusive with --intercept-rg."
+        "and computes c_ov = y_overlap^T y_overlap / sqrt(N1*N2). Mutually exclusive "
+        "with --overlap-covariance-rg."
     ))
     parser.add_argument(
         "--pheno-rg-cov",
@@ -2232,8 +2279,6 @@ def _normalize_rg_manifest(path: str, log=None, *, require_intercept: bool = Tru
     raw = _read_rg_manifest(path)
 
     required = ["phen1", "phen2", "sumstats1", "sumstats2"]
-    if require_intercept:
-        required.append("intercept_rg")
     cols = {}
     for name in required:
         hit = _manifest_column(raw, name)
@@ -2241,7 +2286,23 @@ def _normalize_rg_manifest(path: str, log=None, *, require_intercept: bool = Tru
             raise ValueError(f"RG manifest '{path}' is missing required column '{name}'.")
         cols[name] = hit
 
-    intercept_col = _manifest_column(raw, "intercept_rg")
+    overlap_covariance_col = _manifest_column(raw, "overlap_covariance")
+    legacy_overlap_covariance_col = _manifest_column(raw, "intercept_rg")
+    if (
+        overlap_covariance_col is not None
+        and legacy_overlap_covariance_col is not None
+    ):
+        raise ValueError(
+            f"RG manifest '{path}' contains both overlap_covariance and its "
+            "legacy alias; provide only overlap_covariance."
+        )
+    if overlap_covariance_col is None:
+        overlap_covariance_col = legacy_overlap_covariance_col
+    if require_intercept and overlap_covariance_col is None:
+        raise ValueError(
+            f"RG manifest '{path}' is missing required column "
+            "'overlap_covariance'."
+        )
     opt_cov1 = _manifest_column(raw, "cov_rank1")
     opt_cov2 = _manifest_column(raw, "cov_rank2")
 
@@ -2264,22 +2325,30 @@ def _normalize_rg_manifest(path: str, log=None, *, require_intercept: bool = Tru
         if not utils._path_spec_exists(sumstats2):
             raise ValueError(f"Manifest row {row_id}: could not find sumstats2 file/spec '{sumstats2_raw}'.")
 
-        raw_intercept = None if intercept_col is None else row[intercept_col]
+        raw_intercept = (
+            None
+            if overlap_covariance_col is None
+            else row[overlap_covariance_col]
+        )
         intercept_missing = pd.isna(raw_intercept) or str(raw_intercept).strip() == ""
         if intercept_missing:
             if require_intercept:
-                raise ValueError(f"Manifest row {row_id}: intercept_rg must be finite.")
+                raise ValueError(
+                    f"Manifest row {row_id}: overlap_covariance must be finite."
+                )
             intercept_rg = np.nan
         else:
             try:
                 intercept_rg = float(raw_intercept)
             except (TypeError, ValueError) as exc:
                 raise ValueError(
-                    f"Manifest row {row_id}: intercept_rg must be a finite numeric value "
+                    f"Manifest row {row_id}: overlap_covariance must be a finite numeric value "
                     "or omitted in regular manifest mode."
                 ) from exc
             if not np.isfinite(intercept_rg):
-                raise ValueError(f"Manifest row {row_id}: intercept_rg must be finite.")
+                raise ValueError(
+                    f"Manifest row {row_id}: overlap_covariance must be finite."
+                )
 
         cov_rank1 = _coerce_optional_cov_rank(row[opt_cov1], row_label=str(row_id), col_name="cov_rank1") if opt_cov1 is not None else None
         cov_rank2 = _coerce_optional_cov_rank(row[opt_cov2], row_label=str(row_id), col_name="cov_rank2") if opt_cov2 is not None else None
@@ -2509,7 +2578,12 @@ def _dispatch_rg_manifest(args, log):
         log._log("!!! --ldscores must be provided for rg estimation. !!!")
         raise SystemExit(1)
     if args.intercept_rg is not None or args.pheno_rg is not None or args.pheno_rg_cov is not None:
-        log._log("!!! In rg manifest mode, use optional per-row intercept_rg values; omit them in regular mode for summary estimation. Global --intercept-rg / --pheno-rg / --pheno-rg-cov are not allowed. !!!")
+        log._log(
+            "!!! In rg manifest mode, use optional per-row overlap_covariance "
+            "values; omit them in regular mode for summary-only estimation. "
+            "Global --overlap-covariance-rg / --pheno-rg / --pheno-rg-cov "
+            "are not allowed. !!!"
+        )
         raise SystemExit(1)
     if args.cov_rank is not None:
         log._log("!!! In rg manifest mode, provide trait-specific cov_rank via optional manifest columns cov_rank1 / cov_rank2 or via the sumstats files. Global --cov-rank is not allowed. !!!")

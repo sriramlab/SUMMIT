@@ -10,17 +10,18 @@ supported by ordinary `--h2`, single-pair `--rg`, and regular rg manifests. The
 default `--weight-mode he` is unchanged.
 
 Here *constrained* means that the univariate null intercept is fixed at one, or
-that the bivariate nuisance intercept `c` is resolved by SUMMIT before the main
-covariance regression and is not jointly estimated with the covariance
+that the bivariate sample-overlap covariance `c_ov` is resolved by SUMMIT before
+the main covariance regression and is not jointly estimated with the covariance
 coefficients. It does not impose non-negativity or boundedness constraints on
 h2 or covariance coefficients. Clipping is used only in the working-variance
-weights. These definitions retain SUMMIT's score-scale moments and intercept/
-delete-refit semantics; they are not literal `ldsc.py` fits.
+weights. These definitions retain SUMMIT's score-scale moments and
+overlap-covariance/delete-refit semantics; they are not literal `ldsc.py` fits.
 
-`--intercept-weight-mode` remains a separate option: it controls how SUMMIT
-fits an unknown bivariate nuisance intercept, while `--weight-mode ldsc`
-controls the two h2 equations and main cov-LDSC equation after that intercept
-has been resolved. Fast cached h2 and fast rg manifests remain HE-only.
+`--overlap-covariance-weight-mode` remains a separate option: it controls how
+SUMMIT estimates an unknown overlapping phenotype covariance, while
+`--weight-mode ldsc` controls the two h2 equations and main cov-LDSC equation
+after that quantity has been resolved. Fast cached h2 and fast rg manifests
+remain HE-only.
 
 ## Mean model and weighted estimating equation
 
@@ -65,11 +66,11 @@ implemented by changing a scalar weight inside the existing HE normal equations.
 For trait `t`, let `n_t* = N_t,max - cov_rank_t - 1`, using the covariate-rank
 metadata resolved by the rg path. (The h2 denominator fits retain SUMMIT's
 current forced `cov_rank=0` h2 convention.) Let `z1*_j` and `z2*_j` be the
-score-scale statistics and let `c` be the nuisance intercept resolved by the
-existing SUMMIT intercept step. Define
+score-scale statistics and let `c_ov` be the overlapping phenotype covariance
+resolved by the existing SUMMIT overlap-covariance step. Define
 
 ```text
-q12_j = z1*_j z2*_j - c,
+q12_j = z1*_j z2*_j - c_ov,
 D12_jk = sqrt(n1* n2*) L_jk / M_k.
 ```
 
@@ -86,7 +87,7 @@ the current matching replicate, and define
 ```text
 a_j = 1 + clip(h1+, 0, 1) n1* max(L_j+, 1) / M_+,
 b_j = 1 + clip(h2+, 0, 1) n2* max(L_j+, 1) / M_+,
-c_j = c + clip(gamma+, -1, 1) sqrt(n1* n2*) max(L_j+, 1) / M_+,
+c_j = c_ov + clip(gamma+, -1, 1) sqrt(n1* n2*) max(L_j+, 1) / M_+,
 w12_j = 1 / {max(Lw_j, 1) [a_j b_j + c_j^2]}.
 ```
 
@@ -94,14 +95,15 @@ The working variance `a_j b_j + c_j^2` is the Gaussian variance of the cross
 product `z1*_j z2*_j`. As for h2, flooring affects only the weight model, not
 the covariance design.
 
-SUMMIT deliberately does not refit `c` jointly with `gamma`. If `c` came from
-`--intercept-rg` or `--pheno-rg`, the established SUMMIT contract holds it
-fixed in every SNP jackknife replicate. If SUMMIT estimated `c` from summary
-statistics, covariance replicate `r` uses the corresponding intercept
-delete-refit `c_r`. Each covariance delete refit also uses the matching LDSC
-h2 delete estimates for both traits, then repeats covariance initialization
-and every IRWLS update. Thus the intercept is resolved exactly as in the
-default SUMMIT estimator; only the main h2 and covariance instruments change.
+SUMMIT deliberately does not refit `c_ov` jointly with `gamma`. If `c_ov` came
+from `--overlap-covariance-rg` or `--pheno-rg`, the established SUMMIT contract
+holds it fixed in every SNP jackknife replicate. If SUMMIT estimated `c_ov`
+from summary statistics, covariance replicate `r` uses the corresponding
+overlap-covariance delete-refit `c_ov,r`. Each covariance delete refit also uses
+the matching LDSC h2 delete estimates for both traits, then repeats covariance
+initialization and every IRWLS update. Thus the overlap covariance is resolved
+exactly as in the default SUMMIT estimator; only the main h2 and covariance
+instruments change.
 
 Component and total genetic correlations are computed from the matched
 replicate estimates:
@@ -222,8 +224,9 @@ SUMMIT does not silently compute an SE from a partial set.
 Literal univariate LDSC ordinarily regresses a Wald `Z_j^2-1` response with
 per-SNP sample size `N_j`. SUMMIT instead retains its exact score response and
 the scalar `n*` used by the HE estimator. In the bivariate path, SUMMIT first
-resolves `c` under its existing fixed-or-summary intercept contract, performs
-matched h2 and covariance delete refits, and then forms rg as their ratio.
+resolves `c_ov` under its existing supplied-or-summary overlap-covariance
+contract, performs matched h2 and covariance delete refits, and then forms rg
+as their ratio.
 These conventions coincide with package LDSC only in special cases, such as
 effectively constant sample size with equivalent score and Wald statistics.
 The implemented modes should therefore be called constrained score-scale

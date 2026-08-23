@@ -23,7 +23,7 @@ def _beta_for_exact_score_z(z_star, *, n: float, se: float) -> np.ndarray:
     return float(se) * z_star * np.sqrt(resid_df / (n_scale - z2))
 
 
-def test_fast_multimodel_fixed_intercept_matches_separate_sumcore_he_fits(tmp_path):
+def test_fast_multimodel_supplied_overlap_matches_separate_sumcore_he_fits(tmp_path):
     m = 72
     idx = np.arange(m, dtype=np.float64)
     chrom = np.repeat(np.arange(1, 5), m // 4)
@@ -95,7 +95,7 @@ def test_fast_multimodel_fixed_intercept_matches_separate_sumcore_he_fits(tmp_pa
             "aliases": ["base,focal", "base,focal"],
         },
     )
-    fixed_intercept = 0.125
+    supplied_overlap_covariance = 0.125
     manifest = pd.DataFrame(
         [
             {
@@ -104,7 +104,7 @@ def test_fast_multimodel_fixed_intercept_matches_separate_sumcore_he_fits(tmp_pa
                 "phen2": "trait2",
                 "sumstats1": trait1,
                 "sumstats2": trait2,
-                "intercept_rg": fixed_intercept,
+                "intercept_rg": supplied_overlap_covariance,
                 "cov_rank1": None,
                 "cov_rank2": None,
                 "out_stem": "trait1__trait2",
@@ -180,7 +180,7 @@ def test_fast_multimodel_fixed_intercept_matches_separate_sumcore_he_fits(tmp_pa
             chisq_threshold=None,
             chisq_action="none",
             align_alleles=True,
-            intercept_rg=fixed_intercept,
+            intercept_rg=supplied_overlap_covariance,
             intercept_rg_source="manifest",
             rg_se_method="jackknife",
             weight_mode="he",

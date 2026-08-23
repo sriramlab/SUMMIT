@@ -571,7 +571,7 @@ def _write_sumcore_ldsc_fixture(tmp_path):
     return ld_path, annot_path, weight_path, trait1, trait2, trait2_negative
 
 
-def test_regular_rg_manifest_allows_mixed_fixed_and_estimated_intercepts(tmp_path):
+def test_regular_rg_manifest_allows_mixed_supplied_and_estimated_overlap_covariances(tmp_path):
     paths = {}
     for name in ("trait1", "trait2", "trait3"):
         path = tmp_path / f"{name}.tsv"
@@ -586,14 +586,14 @@ def test_regular_rg_manifest_allows_mixed_fixed_and_estimated_intercepts(tmp_pat
                 "phen2": "trait2",
                 "sumstats1": paths["trait1"],
                 "sumstats2": paths["trait2"],
-                "intercept_rg": np.nan,
+                "overlap_covariance": np.nan,
             },
             {
                 "phen1": "trait1",
                 "phen2": "trait3",
                 "sumstats1": paths["trait1"],
                 "sumstats2": paths["trait3"],
-                "intercept_rg": 0.125,
+                "overlap_covariance": 0.125,
             },
         ]
     ).to_csv(manifest, sep="\t", index=False)
@@ -604,12 +604,14 @@ def test_regular_rg_manifest_allows_mixed_fixed_and_estimated_intercepts(tmp_pat
     assert np.isnan(normalized.loc[0, "intercept_rg"])
     assert normalized.loc[1, "intercept_rg"] == pytest.approx(0.125)
 
-    with pytest.raises(ValueError, match="intercept_rg must be finite"):
+    with pytest.raises(ValueError, match="overlap_covariance must be finite"):
         _normalize_rg_manifest(str(manifest), require_intercept=True)
 
 
-@pytest.mark.parametrize("bad_intercept", ["not-a-number", "inf", "-inf"])
-def test_rg_manifest_rejects_invalid_present_intercept(tmp_path, bad_intercept):
+@pytest.mark.parametrize("bad_overlap_covariance", ["not-a-number", "inf", "-inf"])
+def test_rg_manifest_rejects_invalid_present_overlap_covariance(
+    tmp_path, bad_overlap_covariance
+):
     trait1 = tmp_path / "trait1.tsv"
     trait2 = tmp_path / "trait2.tsv"
     trait1.write_text("SNP\nrs1\n", encoding="utf-8")
@@ -622,16 +624,90 @@ def test_rg_manifest_rejects_invalid_present_intercept(tmp_path, bad_intercept):
                 "phen2": "trait2",
                 "sumstats1": trait1,
                 "sumstats2": trait2,
-                "intercept_rg": bad_intercept,
+                "overlap_covariance": bad_overlap_covariance,
             }
         ]
     ).to_csv(manifest, sep="\t", index=False)
 
-    with pytest.raises(ValueError, match="intercept_rg must be"):
+    with pytest.raises(ValueError, match="overlap_covariance must be"):
         _normalize_rg_manifest(str(manifest), require_intercept=False)
 
 
-def test_regular_manifest_cov_ldsc_estimates_intercept_and_harmonizes_alleles(
+def test_rg_manifest_accepts_legacy_overlap_covariance_alias(tmp_path):
+    trait1 = tmp_path / "trait1.tsv"
+    trait2 = tmp_path / "trait2.tsv"
+    trait1.write_text("SNP\nrs1\n", encoding="utf-8")
+    trait2.write_text("SNP\nrs1\n", encoding="utf-8")
+    manifest = tmp_path / "legacy_manifest.tsv"
+    pd.DataFrame(
+        [{
+            "phen1": "trait1",
+            "phen2": "trait2",
+            "sumstats1": trait1,
+            "sumstats2": trait2,
+            "intercept_rg": 0.25,
+        }]
+    ).to_csv(manifest, sep="\t", index=False)
+
+    normalized, _ = _normalize_rg_manifest(str(manifest), require_intercept=True)
+    assert normalized.loc[0, "intercept_rg"] == pytest.approx(0.25)
+
+
+def test_rg_manifest_rejects_both_overlap_covariance_column_names(tmp_path):
+    trait1 = tmp_path / "trait1.tsv"
+    trait2 = tmp_path / "trait2.tsv"
+    trait1.write_text("SNP\nrs1\n", encoding="utf-8")
+    trait2.write_text("SNP\nrs1\n", encoding="utf-8")
+    manifest = tmp_path / "ambiguous_manifest.tsv"
+    pd.DataFrame(
+        [{
+            "phen1": "trait1",
+            "phen2": "trait2",
+            "sumstats1": trait1,
+            "sumstats2": trait2,
+            "overlap_covariance": 0.25,
+            "intercept_rg": 0.25,
+        }]
+    ).to_csv(manifest, sep="\t", index=False)
+
+    with pytest.raises(ValueError, match="contains both overlap_covariance"):
+        _normalize_rg_manifest(str(manifest), require_intercept=True)
+
+
+def test_overlap_covariance_cli_names_are_preferred_and_legacy_aliases_work():
+    parser = summit_cli.build_parser()
+    preferred = parser.parse_args(
+        [
+            "--overlap-covariance-rg", "0.125",
+            "--overlap-covariance-weight-mode", "ldsc",
+            "--overlap-covariance-chisq-thr", "auto",
+        ]
+    )
+    assert preferred.intercept_rg == pytest.approx(0.125)
+    assert preferred.intercept_weight_mode == "ldsc"
+    assert preferred.intercept_chisq_thr == "auto"
+
+    legacy = parser.parse_args(
+        [
+            "--intercept-rg", "0.25",
+            "--intercept-weight-mode", "score",
+            "--intercept-chisq-thr", "80",
+        ]
+    )
+    assert legacy.intercept_rg == pytest.approx(0.25)
+    assert legacy.intercept_weight_mode == "score"
+    assert legacy.intercept_chisq_thr == "80"
+
+    help_text = parser.format_help()
+    assert "--overlap-covariance-rg" in help_text
+    assert "--overlap-covariance-weight-mode" in help_text
+    assert "--overlap-covariance-chisq-thr" in help_text
+    assert "--intercept-rg" not in help_text
+    assert "--intercept-weight-mode" not in help_text
+    assert "--intercept-chisq-thr" not in help_text
+
+
+def test_regular_manifest_cov_ldsc_estimates_overlap_covariance_and_harmonizes_alleles(
     tmp_path, monkeypatch
 ):
     ld_path, annot_path, weight_path, trait1, trait2, _ = (
@@ -697,6 +773,7 @@ def test_regular_manifest_cov_ldsc_estimates_intercept_and_harmonizes_alleles(
     summit_cli.main()
 
     observed = pd.read_csv(outdir / "manifest.results.tsv", sep="\t").iloc[0]
+    assert pd.isna(observed["overlap_covariance_input"])
     assert pd.isna(observed["intercept_rg_input"])
     assert observed["estimator"] == "constrained_cov_ldsc_irwls"
     expected = {
@@ -704,6 +781,8 @@ def test_regular_manifest_cov_ldsc_estimates_intercept_and_harmonizes_alleles(
         "h2_trait1_se": direct["h2_fit1"].h2[-1, 1],
         "h2_trait2": direct["h2_fit2"].h2[-1, 0],
         "h2_trait2_se": direct["h2_fit2"].h2[-1, 1],
+        "overlap_covariance": direct["intercept"].c[0],
+        "overlap_covariance_se": direct["intercept"].c[1],
         "intercept_c": direct["intercept"].c[0],
         "intercept_c_se": direct["intercept"].c[1],
         "gamma_g_total": direct["rg_fit"].gamma_total[0],
@@ -719,10 +798,10 @@ def test_regular_manifest_cov_ldsc_estimates_intercept_and_harmonizes_alleles(
     with open(pair_prefix + ".log", encoding="utf-8") as handle:
         pair_log = handle.read()
     assert "constrained score-scale cov-LDSC IRWLS" in pair_log
-    assert "intercept source 'summit_intercept_regression'" in pair_log
+    assert "overlap-covariance source 'summit_intercept_regression'" in pair_log
 
 
-def test_sumcore_ldsc_rg_uses_fitted_summit_intercept_delete_refits(tmp_path):
+def test_sumcore_ldsc_rg_uses_summary_overlap_covariance_delete_refits(tmp_path):
     (
         ld_path,
         annot_path,
@@ -754,11 +833,13 @@ def test_sumcore_ldsc_rg_uses_fitted_summit_intercept_delete_refits(tmp_path):
     h2_fit2 = forward["h2_fit2"]
 
     # --weight-mode ldsc changes h2/covariance weighting, not SUMMIT's
-    # intercept/refit semantics. No external InterceptFit was supplied here.
+    # overlap-covariance refit semantics. No supplied c_ov was provided here.
     assert intercept.info.get("fixed", False) is False
     assert intercept.info["weight_mode"] == "score"
     assert rg_fit.weight_info["intercept_fixed"] is False
     assert rg_fit.weight_info["intercept_replicates"] == "summit_delete_refits"
+    assert rg_fit.weight_info["overlap_covariance_supplied"] is False
+    assert rg_fit.weight_info["overlap_covariance_replicates"] == "summit_delete_refits"
     assert rg_fit.weight_info["h2_plugins"] == "matching_ldsc_delete_refits"
     assert rg_fit.weight_info["jackknife_weights"] == "refit_irwls_per_replicate"
     assert h2_fit1.weight_info["jackknife_weights"] == "refit_irwls_per_replicate"

@@ -32,7 +32,7 @@ _COMPACT_RG_MANIFEST_COLUMNS = (
     "phen2",
     "sumstats1",
     "sumstats2",
-    "intercept_rg",
+    "overlap_covariance",
     "cov_rank1",
     "cov_rank2",
 )
@@ -846,7 +846,7 @@ def _compute_pairs_blockwise(
         pairs_by_block.setdefault(key, []).append((li, lj, ridx))
 
     overlap_dtype = np.float32 if axis_len <= _FLOAT32_EXACT_INT_MAX else np.float64
-    intercepts = np.full(len(pairs), np.nan, dtype=np.float64)
+    overlap_covariances = np.full(len(pairs), np.nan, dtype=np.float64)
     overlaps = np.zeros(len(pairs), dtype=np.int64)
 
     if log is not None:
@@ -881,9 +881,10 @@ def _compute_pairs_blockwise(
                 denom = math.sqrt(float(rss[i]) * float(rss[j]))
                 if not (math.isfinite(num) and math.isfinite(denom) and denom > 0.0):
                     raise RuntimeError(
-                        f"Failed to compute intercept for pair '{pair.phen1}' vs '{pair.phen2}'."
+                        f"Failed to compute overlap covariance for pair "
+                        f"'{pair.phen1}' vs '{pair.phen2}'."
                     )
-                intercepts[ridx] = num / denom
+                overlap_covariances[ridx] = num / denom
                 ov_raw = float(O[li, lj])
                 ov = int(round(ov_raw))
                 if abs(ov_raw - float(ov)) > 1e-3:
@@ -897,9 +898,12 @@ def _compute_pairs_blockwise(
         for k in kill:
             del block_cache[k]
 
-    if np.any(~np.isfinite(intercepts)):
-        bad = np.where(~np.isfinite(intercepts))[0].tolist()
-        raise RuntimeError(f"Non-finite intercept estimates encountered for pair indices: {bad[:10]}")
+    if np.any(~np.isfinite(overlap_covariances)):
+        bad = np.where(~np.isfinite(overlap_covariances))[0].tolist()
+        raise RuntimeError(
+            "Non-finite overlap-covariance estimates encountered for pair "
+            f"indices: {bad[:10]}"
+        )
     zero_overlap = overlaps == 0
     if np.any(overlaps < 0) or (np.any(zero_overlap) and not allow_zero_overlap):
         invalid = overlaps < 0 if allow_zero_overlap else overlaps <= 0
@@ -907,14 +911,14 @@ def _compute_pairs_blockwise(
         raise RuntimeError(f"Non-positive overlap counts encountered for pair indices: {bad[:10]}")
     if np.any(zero_overlap):
         # Disjoint study samples imply an exact overlap covariance of zero.
-        intercepts[zero_overlap] = 0.0
+        overlap_covariances[zero_overlap] = 0.0
         if log is not None:
             log._log(
-                f"[make-rg-manifest] assigned intercept_rg=0 to "
+                f"[make-rg-manifest] assigned overlap_covariance=0 to "
                 f"{int(np.sum(zero_overlap))} zero-overlap pair(s)."
             )
 
-    return intercepts, overlaps
+    return overlap_covariances, overlaps
 
 
 # -----------------------------------------------------------------------------
@@ -939,15 +943,15 @@ def build_rg_manifest(
     log=None,
 ) -> pd.DataFrame:
     """
-    Build an rg manifest exactly matching the phenotype-side fixed-intercept logic,
-    but without recomputing covariate regression and overlap cross-products one pair
+    Build an rg manifest with the phenotype-side supplied-overlap covariance,
+    without recomputing covariate regression and overlap cross-products one pair
     at a time.
 
     Mathematical identity used
     --------------------------
     For trait t, let r_t be the full-sample residual after projecting its phenotype
     onto [1, covariates_t] using its own study sample. Then for pair (s,t), the
-    current SUMCORE fixed intercept is
+    SUM-CORE sample-overlap covariance is
 
         c_st = <r_s[overlap], r_t[overlap]> / sqrt( ||r_s||^2 ||r_t||^2 ).
 
@@ -1052,7 +1056,7 @@ def build_rg_manifest(
         if pair.phen1 not in phen_set or pair.phen2 not in phen_set:
             raise ValueError(f"Requested pair uses an unknown phenotype: ({pair.phen1}, {pair.phen2})")
 
-    intercepts, overlaps = _compute_pairs_blockwise(
+    overlap_covariances, overlaps = _compute_pairs_blockwise(
         traits,
         pairs,
         axis_len=axis_len,
@@ -1065,10 +1069,13 @@ def build_rg_manifest(
     for ridx, pair in enumerate(pairs):
         tr1 = trait_map[pair.phen1]
         tr2 = trait_map[pair.phen2]
-        intercept_rg = float(intercepts[ridx])
+        overlap_covariance = float(overlap_covariances[ridx])
         n_overlap = int(overlaps[ridx])
-        if not np.isfinite(intercept_rg):
-            raise RuntimeError(f"Computed non-finite intercept_rg for pair '{pair.phen1}' vs '{pair.phen2}'.")
+        if not np.isfinite(overlap_covariance):
+            raise RuntimeError(
+                f"Computed non-finite overlap_covariance for pair "
+                f"'{pair.phen1}' vs '{pair.phen2}'."
+            )
         if n_overlap < 0 or (n_overlap == 0 and not allow_zero_overlap):
             raise RuntimeError(f"No overlapping individuals for pair '{pair.phen1}' vs '{pair.phen2}'.")
 
@@ -1077,7 +1084,7 @@ def build_rg_manifest(
             "phen2": pair.phen2,
             "sumstats1": tr1.sumstats_path,
             "sumstats2": tr2.sumstats_path,
-            "intercept_rg": intercept_rg,
+            "overlap_covariance": overlap_covariance,
             "cov_rank1": int(tr1.cov_rank),
             "cov_rank2": int(tr2.cov_rank),
             "n_overlap": n_overlap,
@@ -1089,7 +1096,7 @@ def build_rg_manifest(
         if log is not None:
             log._log(
                 f"[make-rg-manifest] pair {pair.phen1} vs {pair.phen2}: "
-                f"n_overlap={n_overlap}, intercept_rg={intercept_rg:.15g}"
+                f"n_overlap={n_overlap}, overlap_covariance={overlap_covariance:.15g}"
             )
 
     out_df = pd.DataFrame(rows)

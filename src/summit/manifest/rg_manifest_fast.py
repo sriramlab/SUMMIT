@@ -266,7 +266,8 @@ def _write_fast_pair_log(
 
     add(
         f"^^^ Phenotype [{phen1}] & [{phen2}] "
-        f"Intercept (c): {intercept.c[0]:.9g} (SE: {intercept.c[1]:.6g})"
+        f"Sample-overlap covariance (c_ov): {intercept.c[0]:.9g} "
+        f"(SE: {intercept.c[1]:.6g})"
     )
 
     for j, header in enumerate(annot_header):
@@ -814,7 +815,7 @@ def _fit_score_intercept_scalar_fast(
     reg_ld = np.asarray(reg_ld, dtype=np.float64).ravel()
     M = int(fast_tv.nsnps)
     if not (z1.size == z2.size == y.size == reg_ld.size == M):
-        raise ValueError("Fast intercept arrays must all live on the pair compact SNP axis.")
+        raise ValueError("Fast overlap-covariance arrays must all live on the pair compact SNP axis.")
 
     keep, info = _make_intercept_keep_mask(
         z1,
@@ -827,11 +828,11 @@ def _fit_score_intercept_scalar_fast(
         chisq_mode="either",
     )
     if info["n_kept"] <= 1:
-        raise RuntimeError("Fast intercept regression has <=1 SNP after filtering.")
+        raise RuntimeError("Fast overlap-covariance regression has <=1 SNP after filtering.")
     if log is not None and info.get("threshold") is not None:
         tag = " (auto)" if info.get("threshold_mode") == "auto" else ""
         log._log(
-            f"[rg:c] intercept chi^2 filter: threshold={info['threshold']:.3f}{tag}, "
+            f"[rg:c] overlap-covariance chi^2 filter: threshold={info['threshold']:.3f}{tag}, "
             f"mode={info['chisq_mode']}, removed={info['n_removed_chisq']} SNPs, "
             f"kept_after_all={info['n_kept']}."
         )
@@ -842,7 +843,10 @@ def _fit_score_intercept_scalar_fast(
     unit_sizes = jk.unit_sizes(active_mask=keep, dtype=np.float64)
     sqrt_n1n2 = float(np.sqrt(float(n1_scale) * float(n2_scale)))
     if not (np.isfinite(sqrt_n1n2) and sqrt_n1n2 > 0.0):
-        raise RuntimeError(f"Invalid n_scale pair for fast intercept: {n1_scale}, {n2_scale}.")
+        raise RuntimeError(
+            f"Invalid n_scale pair for fast overlap-covariance estimation: "
+            f"{n1_scale}, {n2_scale}."
+        )
 
     m_u, t_u, S_u = _compute_intercept_unit_summaries(jk, a, x, y, keep)
     m_full = np.sum(m_u, axis=0, dtype=np.float64)
@@ -874,7 +878,7 @@ def _fit_score_intercept_scalar_fast(
         denom_floor=denom_floor,
     )
     if not bool(good[-1]):
-        raise RuntimeError("Fast constrained intercept solve failed on the full sample.")
+        raise RuntimeError("Fast constrained overlap-covariance solve failed on the full sample.")
 
     c_est, c_se = jk.summarize(
         c_reps,
@@ -938,7 +942,7 @@ def _fit_score_intercept_scalar_fast(
     if log is not None:
         n_bad = int(np.sum(~np.isfinite(c_reps[:R])))
         log._log(
-            f"[rg:c] constrained SCORE-weight intercept (scalar): "
+            f"[rg:c] constrained SCORE-weight overlap covariance (scalar): "
             f"final_c={c[0]:.6g}, bad_reps={n_bad}/{R}"
         )
 
@@ -984,8 +988,9 @@ def dispatch_rg_manifest_fast(args, log, manifest_df, trait_meta, verbose_level:
     intercept_vals = pd.to_numeric(manifest_df["intercept_rg"], errors="coerce").to_numpy(dtype=np.float64)
     if np.any(~np.isfinite(intercept_vals)):
         raise ValueError(
-            "--rg-manifest-fast requires a finite fixed intercept_rg in every manifest row. "
-            "Use regular manifest mode without --rg-manifest-fast for summary-estimated intercepts."
+            "--rg-manifest-fast requires a finite supplied overlap_covariance in every "
+            "manifest row. Use regular manifest mode without --rg-manifest-fast for "
+            "summary-only overlap-covariance estimation."
         )
     if jk_spec.mode == "block":
         _log(

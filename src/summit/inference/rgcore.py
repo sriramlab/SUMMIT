@@ -201,6 +201,8 @@ class RGResultWriter:
                 "n1_scale": n1_scale,
                 "n2_scale": n2_scale,
                 "nrep": R,
+                "overlap_covariance_source": str(info.get("source", "")),
+                # Compatibility field retained for readers of v1 SCORE dumps.
                 "fixed_intercept_source": str(info.get("source", "")),
                 "cov_adjusted": bool(info.get("cov_adjusted", False)),
                 "annot_headers": headers,
@@ -262,6 +264,8 @@ def build_manifest_summary_row(
         "sumstats2": sumstats2,
         "cov_rank1": cov_rank1,
         "cov_rank2": cov_rank2,
+        "overlap_covariance_input": intercept_rg_input,
+        # Compatibility alias retained for existing manifest-result readers.
         "intercept_rg_input": intercept_rg_input,
         "out_prefix": out_prefix,
         "n_snps": (int(n_snps) if n_snps is not None else None),
@@ -269,6 +273,9 @@ def build_manifest_summary_row(
         "h2_trait1_se": float(h2_fit1.h2[-1, 1]),
         "h2_trait2": float(h2_fit2.h2[-1, 0]),
         "h2_trait2_se": float(h2_fit2.h2[-1, 1]),
+        "overlap_covariance": float(intercept.c[0]),
+        "overlap_covariance_se": float(intercept.c[1]),
+        # Compatibility aliases retained for existing manifest-result readers.
         "intercept_c": float(intercept.c[0]),
         "intercept_c_se": float(intercept.c[1]),
         "gamma_g_total": float(rg_fit.gamma_total[0]),
@@ -587,11 +594,12 @@ def _estimate_fixedc_cluster_robust_se_single_component(
     nan_policy: str = "omit",
 ):
     """
-    Robust SE for the SINGLE-COMPONENT constrained rg estimator with FIXED external intercept.
+    Robust SE for the single-component constrained rg estimator with supplied
+    sample-overlap covariance.
 
     This is the correct sandwich target for the estimator actually reported by
     the constrained pipeline:
-        gamma_hat(c0 fixed) solves sum_u m_u(gamma; c0) = 0
+        gamma_hat(c_ov fixed) solves sum_u m_u(gamma; c_ov) = 0
 
     It does NOT profile a free nuisance regression. That earlier approach targets
     a different estimator and tends to reproduce summary-only SEs.
@@ -601,7 +609,8 @@ def _estimate_fixedc_cluster_robust_se_single_component(
     prepared
         RGPrepared from prepare_rg(...), must have K == 1.
     intercept_fit
-        InterceptFit. Must correspond to a FIXED external intercept (info['fixed']=True).
+        InterceptFit compatibility object. Must contain a supplied
+        sample-overlap covariance (info['fixed']=True).
     h2_fit1, h2_fit2
         H2 fits, used only to convert robust gamma SE into rg SE via a delta correction
         for denominator uncertainty.
@@ -617,7 +626,7 @@ def _estimate_fixedc_cluster_robust_se_single_component(
         'cr2' = leverage-corrected sandwich with CR1 prefactor.
     add_external_c_se
         If True, and intercept_fit.c[1] > 0, add an independent delta-method variance
-        contribution from the external intercept:
+        contribution from the supplied sample-overlap covariance:
             Var_gamma += (d gamma / d c)^2 Var(c)
         This is OFF by default because independence is often not justified.
     """
@@ -628,7 +637,7 @@ def _estimate_fixedc_cluster_robust_se_single_component(
     info = intercept_fit.info if isinstance(intercept_fit.info, dict) else {}
     if not bool(info.get("fixed", False)):
         raise ValueError(
-            "rg_se_method='robust' currently requires a FIXED external intercept "
+            "rg_se_method='robust' currently requires supplied sample-overlap covariance "
             "(intercept_fit.info['fixed'] == True)."
         )
 
@@ -638,7 +647,7 @@ def _estimate_fixedc_cluster_robust_se_single_component(
 
     c0 = float(np.asarray(intercept_fit.c_reps[-1], dtype=np.float64))
     if not np.isfinite(c0):
-        raise RuntimeError(f"Non-finite fixed intercept c0={c0}")
+        raise RuntimeError(f"Non-finite supplied sample-overlap covariance c_ov={c0}")
 
     # Block-level quantities from RGPrepared
     a_u = np.asarray(p.Ak_unit[:, 0], dtype=np.float64)       # (U,)
@@ -815,7 +824,7 @@ def _estimate_kmoment_model_se_single_component(
 
     Exact target:
       - K == 1
-      - fixed external intercept
+      - supplied sample-overlap covariance
       - common projected sample space
 
     Practical relaxed mode:
@@ -829,8 +838,8 @@ def _estimate_kmoment_model_se_single_component(
     info = intercept_fit.info if isinstance(intercept_fit.info, dict) else {}
     if not bool(info.get("fixed", False)):
         raise ValueError(
-            "rg_se_method='moments' currently requires a FIXED external intercept "
-            "(--pheno-rg/--pheno-rg-cov or --intercept-rg)."
+            "rg_se_method='moments' currently requires supplied sample-overlap covariance "
+            "(--pheno-rg/--pheno-rg-cov or --overlap-covariance-rg)."
         )
 
     tv = p.trace_view
@@ -957,13 +966,15 @@ def _estimate_kmoment_model_se_single_component(
     sample_warning = bool(sample_rel_gap > float(sample_warn_tol))
 
     # ------------------------------------------------------------------
-    # 3) Fixed intercept and plug-in point estimates
+    # 3) Supplied overlap covariance and plug-in point estimates
     # ------------------------------------------------------------------
     c0 = float(np.asarray(intercept_fit.c_reps[-1], dtype=np.float64))
     gamma_full = float(gamma_full)
 
     if not np.isfinite(c0):
-        raise RuntimeError(f"Non-finite fixed intercept in rg_se_method='moments': c={c0}")
+        raise RuntimeError(
+            f"Non-finite supplied overlap covariance in rg_se_method='moments': c_ov={c0}"
+        )
     if not np.isfinite(gamma_full):
         raise RuntimeError(f"Non-finite gamma_full in rg_se_method='moments': gamma={gamma_full}")
 
@@ -1162,7 +1173,7 @@ def fit_rg(
     R = p.jackknife.nrep
 
     if intercept_fit.c_reps.shape != (R + 1,):
-        raise ValueError("intercept_fit.c_reps shape mismatch with RGPrepared replicates.")
+        raise ValueError("Overlap-covariance replicate shape mismatch with RGPrepared replicates.")
 
     c_reps = np.asarray(intercept_fit.c_reps, dtype=np.float64)
     sqrt_n1n2 = float(np.sqrt(float(p.n1_scale) * float(p.n2_scale)))
@@ -1321,7 +1332,7 @@ def fit_rg(
     )
 
 # -----------------------------------------------------------------------------
-# intercept estimation
+# summary-only overlap-covariance estimation
 # -----------------------------------------------------------------------------
 
 @dataclass(frozen=True)
@@ -1375,12 +1386,12 @@ def _select_intercept_regression_system(trace_view, *, collapse_reg_ld=True, log
         if source == "reg":
             raise RuntimeError(
                 "--ldscores-reg must contain exactly one LD-score column for unconstrained "
-                "rg intercept estimation. If the regression LD scores come from non-overlapping "
+                "rg overlap-covariance estimation. If the regression LD scores come from non-overlapping "
                 "annotations, pre-collapse them to total LD before passing --ldscores-reg. "
                 "Do not collapse overlapping annotations."
             )
         raise RuntimeError(
-            "Unconstrained rg intercept estimation requires a 1D regression LD score. "
+            "Summary-only rg overlap-covariance estimation requires a 1D regression LD score. "
             "The primary --ldscores file has multiple LD-score columns and no 1D "
             "--ldscores-reg was provided. Provide a pre-collapsed --ldscores-reg file."
         )
@@ -1389,7 +1400,7 @@ def _select_intercept_regression_system(trace_view, *, collapse_reg_ld=True, log
         label = "primary --ldscores" if source == "main" else "--ldscores-reg"
         log._log(
             f"[rg:c] collapsing "
-            f"{P}-column {label} to total LD for scalar intercept regression. "
+            f"{P}-column {label} to total LD for scalar overlap-covariance regression. "
             "A 1D total-LD regression score is preferred; multi-column inputs must be non-overlapping."
         )
     X = np.sum(X_raw, axis=1, dtype=np.float64, keepdims=True)
@@ -1410,7 +1421,9 @@ def _select_intercept_weight_ld(trace_view, regsys: InterceptRegressionSystem, *
 
     P = int(regsys.x.shape[1])
     if P != 1:
-        raise RuntimeError("Internal error: unconstrained rg intercept regression must use a 1D LD score.")
+        raise RuntimeError(
+            "Internal error: summary-only rg overlap-covariance regression must use a 1D LD score."
+        )
 
     if mode == "score":
         if weight_ld_override is not None and log is not None:
@@ -1441,12 +1454,15 @@ def _select_intercept_weight_ld(trace_view, regsys: InterceptRegressionSystem, *
                 f"ldscores_reg_w length mismatch with TraceView SNP axis: {w.size} vs {trace_view.nsnps}."
             )
         if log is not None:
-            log._log("[rg:c] using explicit 1D regression-weight LD (ldscores_reg_w) for intercept weights.")
+            log._log(
+                "[rg:c] using explicit 1D regression-weight LD (ldscores_reg_w) "
+                "for overlap-covariance weights."
+            )
         return np.asarray(w, dtype=np.float64, order="C"), str(source or "reg-w")
 
     if log is not None and mode == "ldsc":
         log._log(
-            "[rg:c] no ldscores_reg_w provided; scalar LDSC-weighted intercept regression "
+            "[rg:c] no ldscores_reg_w provided; scalar LDSC-weighted overlap-covariance regression "
             "falls back to the legacy total regression LD weights."
         )
     return np.asarray(regsys.total_ld, dtype=np.float64, order="C"), "fallback-total-ld"
@@ -1467,14 +1483,14 @@ def _make_intercept_keep_mask(
     z2 = np.asarray(z2, dtype=np.float64).ravel()
     total_ld = np.asarray(total_ld, dtype=np.float64).ravel()
     if not (z1.size == z2.size == total_ld.size):
-        raise ValueError("z1/z2/total_ld length mismatch in intercept keep-mask construction.")
+        raise ValueError("z1/z2/total_ld length mismatch in overlap-covariance keep-mask construction.")
 
     if y is None:
         finite_y = np.ones(total_ld.size, dtype=bool)
     else:
         y = np.asarray(y, dtype=np.float64).ravel()
         if y.size != total_ld.size:
-            raise ValueError("y length mismatch in intercept keep-mask construction.")
+            raise ValueError("y length mismatch in overlap-covariance keep-mask construction.")
         finite_y = np.isfinite(y)
 
     if weight_ld is None:
@@ -1482,7 +1498,7 @@ def _make_intercept_keep_mask(
     else:
         weight_ld = np.asarray(weight_ld, dtype=np.float64).ravel()
         if weight_ld.size != total_ld.size:
-            raise ValueError("weight_ld length mismatch in intercept keep-mask construction.")
+            raise ValueError("weight_ld length mismatch in overlap-covariance keep-mask construction.")
         finite_wld = np.isfinite(weight_ld) & (weight_ld > 0.0)
 
     finite_z = np.isfinite(z1) & np.isfinite(z2)
@@ -1533,11 +1549,14 @@ def _build_simple_intercept_weights(weight_ld, keep):
     if weight_ld.size != keep.size:
         raise ValueError("weight_ld/keep length mismatch.")
     if np.any(keep & ((~np.isfinite(weight_ld)) | (weight_ld <= 0.0))):
-        raise ValueError("Regression-weight LD must be finite and >0 for kept SNPs in the intercept regression.")
+        raise ValueError(
+            "Regression-weight LD must be finite and >0 for SNPs kept in the "
+            "overlap-covariance regression."
+        )
     w = np.zeros(weight_ld.size, dtype=np.float64)
     w[keep] = 1.0 / weight_ld[keep]
     if not np.isfinite(w).all() or np.sum(w) <= 0.0:
-        raise ValueError("Invalid intercept regression weights.")
+        raise ValueError("Invalid overlap-covariance regression weights.")
     return w
 
 
@@ -1552,7 +1571,7 @@ def _compute_intercept_unit_summaries(jackknife, a, x, y, keep):
     if a.shape != x.shape:
         raise ValueError("a and x must have the same shape.")
     if y.size != a.shape[0] or keep.size != a.shape[0]:
-        raise ValueError("Axis length mismatch in intercept unit summaries.")
+        raise ValueError("Axis length mismatch in overlap-covariance unit summaries.")
 
     U = int(jackknife.nunit)
     P = int(x.shape[1])
@@ -1587,7 +1606,7 @@ def _compute_weighted_intercept_unit_summaries(jackknife, x, y, w):
     if x.ndim != 2:
         raise ValueError("x must be a 2D array.")
     if y.size != x.shape[0] or w.size != x.shape[0]:
-        raise ValueError("Axis length mismatch in weighted intercept unit summaries.")
+        raise ValueError("Axis length mismatch in weighted overlap-covariance unit summaries.")
 
     U = int(jackknife.nunit)
     P = int(x.shape[1])
@@ -1625,7 +1644,7 @@ def _compute_weighted_intercept_summaries(x, y, w):
     if x.ndim != 2:
         raise ValueError("x must be a 2D array.")
     if y.size != x.shape[0] or w.size != x.shape[0]:
-        raise ValueError("Axis length mismatch in weighted intercept summaries.")
+        raise ValueError("Axis length mismatch in weighted overlap-covariance summaries.")
     wy = w * y
     W = float(np.sum(w))
     XW = np.einsum("ni,n->i", x, w, optimize=True)
@@ -1871,7 +1890,7 @@ def _ldsc_gencov_weights_1d(
     den = np.maximum(den, eps)
     w = 1.0 / (w_ld_eff * den)
     if not np.isfinite(w).all():
-        raise ValueError("Non-finite LDSC intercept weights encountered.")
+        raise ValueError("Non-finite LDSC overlap-covariance weights encountered.")
     return w
 
 
@@ -1914,6 +1933,7 @@ def _make_fixed_intercept_fit(
 
     meta["fixed"] = True
     meta.setdefault("source", source)
+    meta.setdefault("overlap_covariance_source", source)
     if summary_y_info is not None:
         meta["summary_y_mode"] = str(summary_y_info.get("mode", "unknown"))
         meta["trait1_n_scale"] = float(summary_y_info.get("trait1_n_scale", getattr(matched1, "n_scale", matched1.nsamp)))
@@ -1922,13 +1942,13 @@ def _make_fixed_intercept_fit(
     if log is not None:
         if c_se > 0.0:
             log._log(
-                f"[rg:c] using fixed external c={fixed_c:.6g} (SE: {c_se:.6g}) "
-                f"(source={source}); intercept regression skipped."
+                f"[rg:c] using supplied sample-overlap covariance c_ov={fixed_c:.6g} "
+                f"(SE: {c_se:.6g}, source={source}); summary-only estimation skipped."
             )
         else:
             log._log(
-                f"[rg:c] using fixed external c={fixed_c:.6g} "
-                f"(source={source}); intercept regression skipped."
+                f"[rg:c] using supplied sample-overlap covariance c_ov={fixed_c:.6g} "
+                f"(source={source}); summary-only estimation skipped."
             )
 
     return InterceptFit(
@@ -1991,7 +2011,7 @@ def fit_intercept(
 
     mode = str(intercept_weight_mode).strip().lower()
     if mode not in {"ldsc", "score"}:
-        raise ValueError("intercept_weight_mode must be one of {'ldsc','score'}")
+        raise ValueError("overlap_covariance_weight_mode must be one of {'ldsc','score'}")
 
     if summary_y is None:
         summary_y, summary_y_info = build_rg_summary_moment(matched1, matched2)
@@ -2020,9 +2040,11 @@ def fit_intercept(
     full_mass = np.asarray(regsys.full_mass, dtype=np.float64).ravel()
 
     if x.shape != a.shape:
-        raise RuntimeError("Intercept regression design and score-side mass design must have the same shape.")
+        raise RuntimeError(
+            "Overlap-covariance regression design and score-side mass design must have the same shape."
+        )
     if x.shape[0] != trace_view.nsnps or total_ld.size != trace_view.nsnps:
-        raise RuntimeError("Intercept regression design was not built on the main SNP axis.")
+        raise RuntimeError("Overlap-covariance regression design was not built on the main SNP axis.")
 
     P = int(x.shape[1])
     R = int(jackknife.nrep)
@@ -2069,6 +2091,7 @@ def fit_intercept(
     info["weight_mode"] = mode
     info["fixed"] = False
     info["source"] = "summit_intercept_regression"
+    info["overlap_covariance_mode"] = "summary_only"
     info["summary_y_mode"] = None if summary_y_info is None else str(summary_y_info.get("mode", "unknown"))
     info["trait1_n_scale"] = n1_scalar
     info["trait2_n_scale"] = n2_scalar
@@ -2083,12 +2106,12 @@ def fit_intercept(
                 info[key] = summary_y_info[key]
 
     if info["n_kept"] <= 1:
-        raise RuntimeError("Intercept regression has <=1 SNP after filtering.")
+        raise RuntimeError("Overlap-covariance regression has <=1 SNP after filtering.")
 
     if log is not None and info.get("threshold") is not None:
         tag = " (auto)" if info.get("threshold_mode") == "auto" else ""
         log._log(
-            f"[rg:c] intercept chi^2 filter: threshold={info['threshold']:.3f}{tag}, "
+            f"[rg:c] overlap-covariance chi^2 filter: threshold={info['threshold']:.3f}{tag}, "
             f"mode={info['chisq_mode']}, removed={info['n_removed_chisq']} SNPs, "
             f"kept_after_all={info['n_kept']}."
         )
@@ -2102,7 +2125,8 @@ def fit_intercept(
         m_tot_weight = float(np.sum(full_mass))
     if not (np.isfinite(sqrt_n1n2) and sqrt_n1n2 > 0.0 and np.isfinite(m_tot_weight) and m_tot_weight > 0.0):
         raise RuntimeError(
-            f"Invalid scales for intercept regression: sqrt_n1n2={sqrt_n1n2}, m_tot={m_tot_weight}."
+            f"Invalid scales for overlap-covariance regression: "
+            f"sqrt_n1n2={sqrt_n1n2}, m_tot={m_tot_weight}."
         )
 
     m_u, t_u, S_u = _compute_intercept_unit_summaries(jackknife, a, x, y, keep)
@@ -2115,9 +2139,11 @@ def fit_intercept(
     S_rep = _stack_delete_replicates(S_full, S_u, D)
 
     if not (np.isfinite(m_full).all() and np.isfinite(t_full).all() and np.isfinite(S_full).all()):
-        raise RuntimeError("Intercept regression summaries contain non-finite values.")
+        raise RuntimeError("Overlap-covariance regression summaries contain non-finite values.")
     if not np.any(m_full > 0.0):
-        raise RuntimeError("Intercept regression retained zero score-side mass after filtering.")
+        raise RuntimeError(
+            "Overlap-covariance regression retained zero score-side mass after filtering."
+        )
 
     w_score = _build_simple_intercept_weights(weight_ld, keep)
     W_u0, XW_u0, XXW_u0, Sy_u0, XWy_u0 = _compute_weighted_intercept_unit_summaries(
@@ -2150,7 +2176,7 @@ def fit_intercept(
         denom_floor=denom_floor0,
     )
     if not bool(good0[-1]):
-        raise RuntimeError("Failed to initialize constrained intercept fit.")
+        raise RuntimeError("Failed to initialize constrained overlap-covariance fit.")
 
     w_final_full = w_score
 
@@ -2162,13 +2188,14 @@ def fit_intercept(
             np.isfinite(n1_scalar) and np.isfinite(n2_scalar) and n1_scalar > 0.0 and n2_scalar > 0.0
         ):
             raise RuntimeError(
-                f"Invalid n_scale values for intercept IRWLS: n1={n1_scalar}, n2={n2_scalar}."
+                f"Invalid n_scale values for overlap-covariance IRWLS: "
+                f"n1={n1_scalar}, n2={n2_scalar}."
             )
 
         h1_tot_reps = np.asarray(h2_fit1.h2_reps[:, -1], dtype=np.float64)
         h2_tot_reps = np.asarray(h2_fit2.h2_reps[:, -1], dtype=np.float64)
         if h1_tot_reps.shape != (R + 1,) or h2_tot_reps.shape != (R + 1,):
-            raise ValueError("h2 jackknife replicate shape mismatch with rg intercept replicates.")
+            raise ValueError("h2 jackknife replicate shape mismatch with rg overlap-covariance replicates.")
 
         n1_vec = np.full(total_ld.size, n1_scalar, dtype=np.float64)
         n2_vec = np.full(total_ld.size, n2_scalar, dtype=np.float64)
@@ -2181,7 +2208,10 @@ def fit_intercept(
         for _ in range(n_iter):
             rho_full = _score_gamma_total_from_c(score_prepared_local, c_full, rep_index=R)
             if not np.isfinite(rho_full):
-                raise RuntimeError("Failed to obtain a finite full-sample SCORE plug-in gamma_g for LDSC-IRWLS intercept weighting.")
+                raise RuntimeError(
+                    "Failed to obtain a finite full-sample SCORE plug-in gamma_g for "
+                    "LDSC-IRWLS overlap-covariance weighting."
+                )
             w_cur = _ldsc_gencov_weights_1d(
                 ld=total_ld,
                 w_ld=weight_ld,
@@ -2211,7 +2241,7 @@ def fit_intercept(
                 denom_floor=0.0,
             )
             if not ok:
-                raise RuntimeError("LDSC-IRWLS intercept update failed on the full sample.")
+                raise RuntimeError("LDSC-IRWLS overlap-covariance update failed on the full sample.")
             c_full = float(c_new)
             beta_full = np.asarray(beta_new, dtype=np.float64)
             w_final_full = w_cur
@@ -2230,7 +2260,7 @@ def fit_intercept(
             denom_floor=denom_floor_full,
         )
         if not ok:
-            raise RuntimeError("Final constrained full-sample intercept solve failed.")
+            raise RuntimeError("Final constrained full-sample overlap-covariance solve failed.")
         c_reps[-1] = float(c_fin)
         beta_reps[-1] = np.asarray(beta_fin, dtype=np.float64)
 
@@ -2423,7 +2453,7 @@ def fit_intercept(
         else:
             tag = "partitioned" if P > 1 else "scalar"
             log._log(
-                f"[rg:c] constrained SCORE-weight intercept ({tag}): "
+                f"[rg:c] constrained SCORE-weight overlap covariance ({tag}): "
                 f"final_c={c[0]:.6g}, bad_reps={n_bad}/{R}"
             )
 

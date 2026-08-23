@@ -32,7 +32,7 @@ class Sumcore:
         -> JackknifeDesign on that axis for contiguous block jackknife, or a
            subsetted chromosome JackknifeDesign from the full Trace axis
         -> h2 fits for trait 1 / trait 2 on that same axis
-        -> intercept fit on a stricter subset mask of that same axis
+        -> overlap-covariance fit on a stricter subset mask of that same axis
         -> gamma_g / rg fit on the same axis / same replicate ordering
     """
 
@@ -272,7 +272,7 @@ class Sumcore:
         if self.chisq_action not in ("drop", "clip", "warn", "none"):
             raise ValueError("chisq_action must be one of {'drop','clip','warn','none'}")
         if self.intercept_weight_mode not in {"ldsc", "score"}:
-            raise ValueError("intercept_weight_mode must be one of {'ldsc','score'}")
+            raise ValueError("overlap_covariance_weight_mode must be one of {'ldsc','score'}")
 
         self.intercept_rg = None if intercept_rg is None else float(intercept_rg)
         self.intercept_rg_source = str(intercept_rg_source).strip() or "cli"
@@ -282,7 +282,10 @@ class Sumcore:
         if self.intercept_rg is not None and (
             self.pheno_rg_paths is not None or self.pheno_rg_cov_paths is not None
         ):
-            raise ValueError("Provide at most one of --intercept-rg or (--pheno-rg [and --pheno-rg-cov]).")
+            raise ValueError(
+                "Provide at most one of --overlap-covariance-rg or "
+                "(--pheno-rg [and --pheno-rg-cov])."
+            )
         if self.pheno_rg_cov_paths is not None and self.pheno_rg_paths is None:
             raise ValueError("--pheno-rg-cov requires --pheno-rg.")
         if self.pheno_rg_paths is not None and len(self.pheno_rg_paths) != 2:
@@ -545,8 +548,8 @@ class Sumcore:
             self.log._log(
                 f"[rg:ldsc] constrained score-scale cov-LDSC IRWLS using M source "
                 f"'{self.ldsc_m_source}', weight LD source "
-                f"'{info.get('weight_ld_source', 'unknown')}', intercept source "
-                f"'{info.get('intercept_source', 'unknown')}', "
+                f"'{info.get('weight_ld_source', 'unknown')}', overlap-covariance source "
+                f"'{info.get('overlap_covariance_source', info.get('intercept_source', 'unknown'))}', "
                 f"iterations={info.get('irwls_iters', 'NA')}."
             )
         _stage_stop("fit_rg", t_stage)
@@ -674,7 +677,8 @@ class Sumcore:
 
         self.log._log(
             f"^^^ Phenotype [{self.phen_names[0]}] & [{self.phen_names[1]}] "
-            f"Intercept (c): {intercept.c[0]:.9g} (SE: {intercept.c[1]:.6g})"
+            f"Sample-overlap covariance (c_ov): {intercept.c[0]:.9g} "
+            f"(SE: {intercept.c[1]:.6g})"
         )
 
         for j, header in enumerate(self.trace.annot_header):
@@ -1015,14 +1019,14 @@ class Sumcore:
         y12,
     ) -> float:
         """
-        Compute the exact score-scale intercept
+        Compute the exact score-scale sample-overlap covariance
 
-            c = <r1, r2> / sqrt(RSS1 * RSS2)
+            c_ov = <r1, r2> / sqrt(RSS1 * RSS2)
 
         where r_a is the phenotype residual after projecting y_a onto [1, covariates_a].
 
-        This is the correct intercept scale for the exact score moments used in
-        build_rg_summary_moment(), and is independent of n_scale.
+        This is the correct overlap-covariance scale for the exact score moments
+        used in build_rg_summary_moment(), and is independent of n_scale.
         """
         try:
             alpha1 = cls._solve_small_linear(A1, b1)
@@ -1136,7 +1140,10 @@ class Sumcore:
             y12_full,
         )
         if not np.isfinite(c_full):
-            raise RuntimeError("Computed non-finite fixed intercept from --pheno-rg / --pheno-rg-cov.")
+            raise RuntimeError(
+                "Computed non-finite sample-overlap covariance from "
+                "--pheno-rg / --pheno-rg-cov."
+            )
 
         c_se = 0.0
         nblocks = self._choose_pheno_nblocks(n_overlap)
@@ -1267,7 +1274,7 @@ class Sumcore:
     def _resolve_external_intercept(self, matched1, matched2):
         if self.intercept_rg is not None:
             if not np.isfinite(self.intercept_rg):
-                raise ValueError("--intercept-rg must be finite.")
+                raise ValueError("--overlap-covariance-rg must be finite.")
             return float(self.intercept_rg), {"source": self.intercept_rg_source}
 
         if self.pheno_rg_paths is not None:

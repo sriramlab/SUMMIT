@@ -29,7 +29,7 @@ def _require_matching_rg_plugin_axis(
     label: str,
     require_active_mask: bool = True,
 ) -> None:
-    """Reject h2/intercept plug-ins built on a different SNP/delete design."""
+    """Reject h2/overlap-covariance plug-ins from another SNP/delete design."""
     plugin_prepared = getattr(plugin, "prepared", None)
     if plugin_prepared is None:
         plugin_trace = getattr(plugin, "trace_view", None)
@@ -115,7 +115,9 @@ def _cov_ldsc_weights(
         and m_total > 0.0
         and np.isfinite(intercept)
     ):
-        raise ValueError("Invalid sample-size, reference-mass, or intercept scale.")
+        raise ValueError(
+            "Invalid sample-size, reference-mass, or overlap-covariance scale."
+        )
 
     ld_floor = float(ld_floor)
     variance_floor = float(variance_floor)
@@ -161,11 +163,11 @@ def fit_constrained_cov_ldsc_irwls(
     ld_floor: float = 1.0,
     variance_floor: float = 1e-12,
 ) -> LDSCCovIRWLSFit:
-    """Fit fixed-intercept score-scale covariance LDSC by closed-form IRWLS.
+    """Fit supplied-overlap score-scale covariance LDSC by closed-form IRWLS.
 
     The response is ``z1* z2* - c`` and column ``k`` of the design is
     ``sqrt(n1* n2*) L_k / M_k``.  ``c`` is supplied by SUMMIT's separate
-    nuisance-intercept step and is never estimated in this solve.
+    overlap-covariance step and is never estimated in this solve.
     """
     design = np.asarray(design, dtype=np.float64)
     response = np.asarray(response, dtype=np.float64).reshape(-1)
@@ -362,13 +364,13 @@ def fit_rg_ldsc(
         )
     _require_matching_rg_plugin_axis(p, h2_fit1, label="trait-1 h2 fit")
     _require_matching_rg_plugin_axis(p, h2_fit2, label="trait-2 h2 fit")
-    # SUMMIT's intercept fit may intentionally use a stricter, intercept-only
-    # SNP filter.  Its c_r values are nevertheless paired to covariance refits
-    # by the shared Trace axis and delete-design ordering.
+    # SUMMIT's summary-only overlap-covariance fit may intentionally use a
+    # stricter SNP filter. Its c_ov,r values are nevertheless paired to
+    # covariance refits by the shared Trace axis and delete-design ordering.
     _require_matching_rg_plugin_axis(
         p,
         intercept_fit,
-        label="rg intercept fit",
+        label="rg overlap-covariance fit",
         require_active_mask=False,
     )
 
@@ -495,7 +497,7 @@ def fit_rg_ldsc(
     )
     weight_info = {
         "estimator": "constrained_cov_ldsc_irwls",
-        "response": "score_z1_times_z2_minus_summit_intercept",
+        "response": "score_z1_times_z2_minus_overlap_covariance",
         "n1_scale": float(p.n1_scale),
         "n2_scale": float(p.n2_scale),
         "m_annot": m_annot.copy(),
@@ -504,6 +506,17 @@ def fit_rg_ldsc(
         "intercept_source": str(intercept_info.get("source", "estimated")),
         "intercept_fixed": bool(intercept_info.get("fixed", False)),
         "intercept_replicates": (
+            "fixed_across_replicates"
+            if bool(intercept_info.get("fixed", False))
+            else "summit_delete_refits"
+        ),
+        "overlap_covariance_source": str(
+            intercept_info.get("source", "estimated")
+        ),
+        "overlap_covariance_supplied": bool(
+            intercept_info.get("fixed", False)
+        ),
+        "overlap_covariance_replicates": (
             "fixed_across_replicates"
             if bool(intercept_info.get("fixed", False))
             else "summit_delete_refits"

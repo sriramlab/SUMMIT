@@ -88,7 +88,7 @@ _PRIVATE_STABLE_ARTIFACT_V1_ALLOWLIST = frozenset(
 
 _LEGACY_SOURCE_SHA256 = {
     "src/summit/cli.py": (
-        "a469ba8f73594f5832b19ab6e249958850d6019f205b363f4ecb2611d6dfe3ca"
+        "57cfafc0c854094befa2c52de4ceb07a529034017c62faff2be7f13e2839605c"
     ),
     "src/summit/__init__.py": (
         "448f5770e516c134d875bdd95627aca81eb6520c9026681f959eea903e3e0153"
@@ -100,7 +100,7 @@ _LEGACY_SOURCE_SHA256 = {
         "e077aa42e0cb53e401b4139fdd7264c3b416397be2a8933572ef6f58c2d521b0"
     ),
 }
-_LEGACY_HELP_SHA256 = "01fd04cb2b640415372cce40ecde77838faea33add75e7f07eb0baa160a76f7c"
+_LEGACY_HELP_SHA256 = "85f402d01c85ca7da9194405fa2ca22bd7c043da3f6f11de19a1508fc641c07b"
 _LEGACY_DEFAULTS_SHA256 = (
     "29b7813d8dc5e8be8778405addd0a10cb0111eac7f79426846687bec06229210"
 )
@@ -474,8 +474,8 @@ def test_private_stable_v1_allowlist_and_legacy_cli_surface_are_frozen(
     long_options = {
         option for option in parser._option_string_actions if option.startswith("--")
     }
-    assert len(parser._option_string_actions) == 131
-    assert len(long_options) == 130
+    assert len(parser._option_string_actions) == 134
+    assert len(long_options) == 133
     assert not any("context" in option.lower() for option in long_options)
     assert "context" not in help_text.lower()
     assert hashlib.sha256(help_text.encode("utf-8")).hexdigest() == (

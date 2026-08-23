@@ -20,11 +20,12 @@ moments.
 - `--weight-mode ldsc` fits constrained score-scale LDSC-style IRWLS for h2
   and constrained score-scale cov-LDSC IRWLS for genetic covariance; rg is
   formed from matched covariance and h2 refits. These modes retain SUMMIT's
-  intercept semantics and are not literal `ldsc.py`; the default remains HE.
-- Genetic correlation estimation with either a fixed overlap intercept or a
-  summary-estimated intercept.
+  sample-overlap covariance semantics and are not literal `ldsc.py`; the
+  default remains HE.
+- Genetic correlation estimation with either a supplied sample-overlap
+  covariance or ancillary summary-only overlap-covariance estimation.
 - Batch genetic-correlation manifests, including a sparse fast path for
-  fixed-intercept analyses.
+  supplied-overlap analyses.
 - Integrated allele validation/alignment for rg (enabled by default), with
   strand-ambiguous SNPs dropped by default and `--no-align-alleles` as an
   explicit escape hatch for pre-harmonized inputs.
@@ -457,21 +458,22 @@ summit \
 The one-column `--ldscores-w` file is recommended, especially for overlapping
 annotations. If it is omitted, SUMMIT uses the row sum of the primary LD-score
 columns. In rg analyses the same flag fits both h2 denominator models and the
-constrained cov-LDSC covariance numerator. `--intercept-weight-mode` controls
-only the separate summary-estimated `c` fit; it does not enable cov-LDSC.
+constrained cov-LDSC covariance numerator. `--overlap-covariance-weight-mode`
+controls only the separate summary-estimated `c_ov` fit; it does not enable
+cov-LDSC.
 IRWLS is rerun inside every delete block. This mode is available for ordinary
 `--h2` and single-pair/regular-manifest `--rg`, but not fast cached h2 or fast
 rg manifests. See
 [Constrained score-scale LDSC and cov-LDSC](docs/ldsc_weight_mode.md).
 
-### Genetic Correlation With a Fixed Intercept
+### Genetic Correlation With a Supplied Sample-Overlap Covariance
 
-For non-overlapping studies, the fixed intercept is usually zero:
+For non-overlapping studies, the supplied sample-overlap covariance is zero:
 
 ```bash
 summit \
   --rg trait1.sumstats.gz,trait2.sumstats.gz \
-  --intercept-rg 0 \
+  --overlap-covariance-rg 0 \
   --ldscores ref.mafld.gw.ldscore.gz \
   --annot mafld.annot.gz \
   --align-alleles \
@@ -481,22 +483,25 @@ summit \
 
 For overlapping individual-level samples, use either:
 
-- `--intercept-rg c`, where `c = y_overlap' y_overlap / sqrt(N1*N2)`, or
+- `--overlap-covariance-rg c_ov`, where
+  `c_ov = y_overlap' y_overlap / sqrt(N1*N2)`, or
 - `--pheno-rg pheno1.txt,pheno2.txt` with optional
-  `--pheno-rg-cov cov1.txt,cov2.txt` so SUMMIT computes the overlap intercept.
+  `--pheno-rg-cov cov1.txt,cov2.txt` so SUMMIT computes the sample-overlap
+  covariance.
 
 Phenotype files must have a header, `FID IID`, and the phenotype in the last
 column. Covariate files must have `FID IID` followed by covariates.
 
-### Genetic Correlation With a Summary-Estimated Intercept
+### Genetic Correlation With Summary-Only Overlap-Covariance Estimation
 
-When `--intercept-rg` and `--pheno-rg` are omitted, SUMMIT estimates the
-cross-trait intercept from summary statistics first, then passes it to the
-selected main covariance equation: HE/SCORE or constrained cov-LDSC.
+When `--overlap-covariance-rg` and `--pheno-rg` are omitted, SUMMIT estimates
+the overlapping phenotype covariance from HE-scale summary moments first, then
+passes it to the selected main covariance equation: HE/SCORE or constrained
+cov-LDSC.
 
-The intercept regression LD scores must be one-dimensional. If the primary
-analysis uses partitioned LD scores, provide a separate scalar `--ldscores-reg`
-file:
+The LD scores used for summary-only overlap-covariance estimation must be
+one-dimensional. If the primary analysis uses partitioned LD scores, provide a
+separate scalar `--ldscores-reg` file:
 
 ```bash
 summit \
@@ -505,11 +510,11 @@ summit \
   --ldscores-reg ref.total.gw.ldscore.gz \
   --annot mafld.annot.gz \
   --align-alleles \
-  --out outs/trait1.trait2.summary_intercept \
+  --out outs/trait1.trait2.summary_overlap_covariance \
   --njack chr
 ```
 
-SUMMIT uses a scalar LD score for the summary-estimated intercept fit. A 1D
+SUMMIT uses a scalar LD score for the summary-only overlap-covariance fit. A 1D
 `--ldscores-reg` file is preferred. If a multi-column regression LD file is
 provided, SUMMIT collapses it to total LD by default; this is valid only when
 the LD-score columns are non-overlapping, such as a disjoint MAF-LD partition.
@@ -520,12 +525,12 @@ LD score instead.
 
 Use `--weight-mode ldsc` to fit constrained score-scale LDSC for both trait h2
 models and constrained score-scale cov-LDSC for genetic covariance. For
-example, with a fixed zero cross-trait intercept:
+example, with a supplied zero sample-overlap covariance:
 
 ```bash
 summit \
   --rg trait1.sumstats.gz,trait2.sumstats.gz \
-  --intercept-rg 0 \
+  --overlap-covariance-rg 0 \
   --ldscores ref.mafld.gw.ldscore.gz \
   --ldscores-w ref.regression.l2.ldscore.gz \
   --ldsc-m ref.mafld.gw.M \
@@ -535,11 +540,12 @@ summit \
   --njack chr
 ```
 
-“Constrained” refers to the intercept: the h2 null intercept is fixed at one,
-and bivariate `c` is fixed or estimated by SUMMIT before the main covariance
-fit rather than jointly with its coefficients. It does not constrain h2 or
-covariance coefficients to be nonnegative. rg is calculated from the matched
-covariance and h2 full/delete estimates, not fitted by a separate regression.
+For h2, “constrained” means that the LDSC null intercept is fixed at one. For
+the bivariate fit, `c_ov` is supplied or estimated by SUMMIT before the main
+covariance fit rather than jointly with its coefficients. The mode does not
+constrain h2 or covariance coefficients to be nonnegative. rg is calculated
+from the matched covariance and h2 full/delete estimates, not fitted by a
+separate regression.
 
 ### rg Allele Harmonization
 
@@ -570,7 +576,7 @@ summit \
   --out outs/manifest_build
 ```
 
-Run a manifest with fixed intercepts:
+Run a manifest with supplied overlap covariances:
 
 ```bash
 summit \
@@ -582,16 +588,18 @@ summit \
   --njack chr
 ```
 
-Regular manifests may mix finite fixed `intercept_rg` values with omitted
-values; omitted values use SUMMIT's summary-estimated intercept and matching
-delete refits. The fast path requires a finite fixed `intercept_rg` in every
-row, uses HE weighting and jackknife SEs only, and does not support
+Regular manifests may mix finite supplied `overlap_covariance` values with
+omitted values; omitted values use SUMMIT's summary-only overlap-covariance
+estimation and matching delete refits. The fast path requires a finite supplied
+`overlap_covariance` in every row, uses HE weighting and jackknife SEs only, and
+does not support
 `--adjust-delta` or normal-equation dumps. With chromosome jackknife its fixed-
-unit sparse corrections reproduce the regular fixed-intercept estimator.
+unit sparse corrections reproduce the regular supplied-overlap estimator.
 Integer block mode instead uses pre-drop blocks and therefore differs from the
 regular post-filter block jackknife. Omit `--rg-manifest-fast` for constrained
-cov-LDSC or summary-estimated intercepts. Add `--rg-fast-no-pair-logs` for large
-batches to retain only `batch.log` and `manifest.results.tsv`.
+cov-LDSC or summary-only overlap-covariance estimation. Add
+`--rg-fast-no-pair-logs` for large batches to retain only `batch.log` and
+`manifest.results.tsv`.
 
 For many models that share annotation columns, such as baseline plus one focal
 cell-type annotation, place every unique column in one union annotation/LD-score
@@ -629,9 +637,10 @@ LD-score columns are identical before retaining one shared copy.
 
 The `example/` directory contains small, runnable scripts. The bundled summary
 statistics are legacy Z-format, so `prepare_example_inputs.py` creates compatible
-toy `BETA`/`SE` files under `example/out/`. The fixed-intercept rg example reuses
-the same toy signal twice and therefore sets `--intercept-rg 1`; use
-`--intercept-rg 0` for genuinely non-overlapping studies.
+toy `BETA`/`SE` files under `example/out/`. The supplied-overlap rg example
+reuses the same toy signal twice and therefore sets
+`--overlap-covariance-rg 1`; use `--overlap-covariance-rg 0` for genuinely
+non-overlapping studies.
 
 ```bash
 cd example
@@ -640,9 +649,9 @@ cd example
 ./estimate_windowed_ldscore.sh
 ./estimate_gxe_ldscore.sh
 ./h2_ldscore.sh
-./rg_fixed_intercept.sh
+./rg_supplied_overlap_covariance.sh
 ./rg_unconstrained.sh
-./rg_manifest_fixed_intercept.sh
+./rg_manifest_supplied_overlap_covariance.sh
 ```
 
 The scripts prefer the installed `summit` executable and fall back to
@@ -663,23 +672,25 @@ Exactly one of these modes must be specified.
 ### h2/rg options
 
 - `--ldscores`: primary LD-score file or chromosome-split spec.
-- `--ldscores-reg`: optional scalar LD-score file for summary-estimated rg intercept
-  regression.
+- `--ldscores-reg`: optional scalar LD-score file for summary-only rg
+  overlap-covariance estimation.
 - `--weight-mode`: `he` (default), or constrained score-scale LDSC for h2 and
   constrained score-scale cov-LDSC for genetic covariance; rg is their matched
   ratio.
-- `--intercept-weight-mode`: `score` (default) or `ldsc` weighting for the
-  separate summary-estimated cross-trait intercept.
+- `--overlap-covariance-weight-mode`: `score` (default) or `ldsc` weighting for
+  the ancillary summary-only overlap-covariance fit.
 - `--ldscores-w`: optional scalar regression-SNP LD score used in LDSC weights.
 - `--ldsc-m`: fixed reference annotation masses; split files with `@` are summed.
 - `--ldsc-irwls-iters`, `--ldsc-irwls-tol`: LDSC update controls.
 - `--annot`: annotation file or split-file spec; omitted means single component.
 - `--max-chisq`: main chi-square filter; use `auto` for `max(80, 0.001*Nmax)`.
-- `--intercept-chisq-thr`: chi-square filter used only for intercept regression.
+- `--overlap-covariance-chisq-thr`: chi-square filter used only for summary-only
+  overlap-covariance estimation.
 - `--chisq-action`: `drop`, `clip`, `warn`, or `none`.
-- `--intercept-rg`: fixed rg intercept on SUMMIT's SCORE scale.
-- `--pheno-rg`, `--pheno-rg-cov`: compute fixed intercept from overlapping
-  phenotype/covariate files.
+- `--overlap-covariance-rg`: supplied sample-overlap covariance on SUMMIT's HE
+  scale.
+- `--pheno-rg`, `--pheno-rg-cov`: compute the supplied sample-overlap covariance
+  from overlapping phenotype/covariate files.
 - `--align-alleles`: validate and align the second summary-statistic file to
   the first (default).
 - `--no-align-alleles`: explicitly skip allele validation/alignment for inputs
@@ -691,7 +702,7 @@ Exactly one of these modes must be specified.
 - `--write-normeq`: save explicit SCORE normal-equation JSON for eligible rg runs.
 - `--h2-batch-fast`, `--h2-cache-dir`: exact chromosome-jackknife HE batching
   and optional reusable trait-moment cache.
-- `--rg-manifest-fast`, `--rg-model-manifest`: fixed-intercept HE batching and
+- `--rg-manifest-fast`, `--rg-model-manifest`: supplied-overlap HE batching and
   optional multi-model column selection.
 - `--rg-fast-no-pair-logs`: omit fast-mode per-pair logs while retaining the
   batch log and combined result table.

@@ -12,10 +12,10 @@ fi
 
 "${SUMMIT[@]}" \
   --rg ./out/trait_a.sumstats,./out/trait_b.sumstats \
-  --intercept-rg 1 \
+  --overlap-covariance-rg 1 \
   --ldscores ./double_uniform_10k_stoc_k100.gw.ldscore.gz \
   --annot ./double_uniform_0.2.annot.txt \
   --align-alleles \
-  --out ./out/rg_fixed_intercept \
+  --out ./out/rg_supplied_overlap_covariance \
   --njack 100 \
   --num-threads 2

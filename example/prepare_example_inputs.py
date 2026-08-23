@@ -50,7 +50,7 @@ def _write_manifest() -> None:
                 "phen2": "trait_b",
                 "sumstats1": str(trait_a),
                 "sumstats2": str(trait_b),
-                "intercept_rg": 1.0,
+                "overlap_covariance": 1.0,
                 "cov_rank1": 0,
                 "cov_rank2": 0,
             }
