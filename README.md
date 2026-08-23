@@ -17,11 +17,6 @@ moments.
   score summaries and an in-sample XX/XW/WX/WW trace bundle.
 - Heritability estimation from `BETA`/`SE` summary statistics.
 - Exact chromosome-jackknife batched h2 with an optional reusable binary cache.
-- `--weight-mode ldsc` fits constrained score-scale LDSC-style IRWLS for h2
-  and constrained score-scale cov-LDSC IRWLS for genetic covariance; rg is
-  formed from matched covariance and h2 refits. These modes retain SUMMIT's
-  sample-overlap covariance semantics and are not literal `ldsc.py`; the
-  default remains HE.
 - Genetic correlation estimation with either a supplied sample-overlap
   covariance or ancillary summary-only overlap-covariance estimation.
 - Batch genetic-correlation manifests, including a sparse fast path for
@@ -141,8 +136,8 @@ Use `@` as a chromosome placeholder for split files, for example
 If `--annot` is omitted, SUMMIT runs a single-component model. Otherwise,
 annotations can be:
 
-- LDSC-style full annotations with `CHR`, `BP`, `SNP`, optional `CM`, and one or
-  more annotation columns.
+- Full annotation tables with `CHR`, `BP`, `SNP`, optional `CM`, and one or more
+  annotation columns.
 - Thin annotation matrices with one row per BIM/LD-score SNP. If a header is
   present, column names are used as annotation names.
 
@@ -440,31 +435,8 @@ reuse cached score moments via `--h2-cache-dir`. This path is HE-only, requires
 `--njack chr[:...]`, and rejects `--chisq-action clip`; see
 [Fast batched h2](docs/fast_h2_batch.md).
 
-To replace the default HE estimating instrument with constrained score-scale
-LDSC-style IRWLS:
-
-```bash
-summit \
-  --h2 trait.sumstats.gz \
-  --ldscores ref.mafld.gw.ldscore.gz \
-  --ldscores-w ref.regression.l2.ldscore.gz \
-  --ldsc-m ref.mafld.gw.M \
-  --annot mafld.annot.gz \
-  --weight-mode ldsc \
-  --out outs/trait.mafld.ldsc \
-  --njack chr
-```
-
-The one-column `--ldscores-w` file is recommended, especially for overlapping
-annotations. If it is omitted, SUMMIT uses the row sum of the primary LD-score
-columns. In rg analyses the same flag fits both h2 denominator models and the
-constrained cov-LDSC covariance numerator. `--overlap-covariance-weight-mode`
-controls only the separate summary-estimated `c_ov` fit; it does not enable
-cov-LDSC.
-IRWLS is rerun inside every delete block. This mode is available for ordinary
-`--h2` and single-pair/regular-manifest `--rg`, but not fast cached h2 or fast
-rg manifests. See
-[Constrained score-scale LDSC and cov-LDSC](docs/ldsc_weight_mode.md).
+Additional regression-weighting modes are described in the
+[technical documentation](docs/ldsc_weight_mode.md).
 
 ### Genetic Correlation With a Supplied Sample-Overlap Covariance
 
@@ -496,8 +468,7 @@ column. Covariate files must have `FID IID` followed by covariates.
 
 When `--overlap-covariance-rg` and `--pheno-rg` are omitted, SUMMIT estimates
 the overlapping phenotype covariance from HE-scale summary moments first, then
-passes it to the selected main covariance equation: HE/SCORE or constrained
-cov-LDSC.
+passes it to the main covariance equation.
 
 The LD scores used for summary-only overlap-covariance estimation must be
 one-dimensional. If the primary analysis uses partitioned LD scores, provide a
@@ -520,32 +491,6 @@ provided, SUMMIT collapses it to total LD by default; this is valid only when
 the LD-score columns are non-overlapping, such as a disjoint MAF-LD partition.
 For overlapping annotations, precompute or provide a genuine scalar regression
 LD score instead.
-
-### Constrained cov-LDSC Genetic Covariance and rg
-
-Use `--weight-mode ldsc` to fit constrained score-scale LDSC for both trait h2
-models and constrained score-scale cov-LDSC for genetic covariance. For
-example, with a supplied zero sample-overlap covariance:
-
-```bash
-summit \
-  --rg trait1.sumstats.gz,trait2.sumstats.gz \
-  --overlap-covariance-rg 0 \
-  --ldscores ref.mafld.gw.ldscore.gz \
-  --ldscores-w ref.regression.l2.ldscore.gz \
-  --ldsc-m ref.mafld.gw.M \
-  --annot mafld.annot.gz \
-  --weight-mode ldsc \
-  --out outs/trait1.trait2.cov_ldsc \
-  --njack chr
-```
-
-For h2, “constrained” means that the LDSC null intercept is fixed at one. For
-the bivariate fit, `c_ov` is supplied or estimated by SUMMIT before the main
-covariance fit rather than jointly with its coefficients. The mode does not
-constrain h2 or covariance coefficients to be nonnegative. rg is calculated
-from the matched covariance and h2 full/delete estimates, not fitted by a
-separate regression.
 
 ### rg Allele Harmonization
 
@@ -596,8 +541,8 @@ does not support
 `--adjust-delta` or normal-equation dumps. With chromosome jackknife its fixed-
 unit sparse corrections reproduce the regular supplied-overlap estimator.
 Integer block mode instead uses pre-drop blocks and therefore differs from the
-regular post-filter block jackknife. Omit `--rg-manifest-fast` for constrained
-cov-LDSC or summary-only overlap-covariance estimation. Add
+regular post-filter block jackknife. Omit `--rg-manifest-fast` for alternative
+weighting or summary-only overlap-covariance estimation. Add
 `--rg-fast-no-pair-logs` for large batches to retain only `batch.log` and
 `manifest.results.tsv`.
 
@@ -674,14 +619,6 @@ Exactly one of these modes must be specified.
 - `--ldscores`: primary LD-score file or chromosome-split spec.
 - `--ldscores-reg`: optional scalar LD-score file for summary-only rg
   overlap-covariance estimation.
-- `--weight-mode`: `he` (default), or constrained score-scale LDSC for h2 and
-  constrained score-scale cov-LDSC for genetic covariance; rg is their matched
-  ratio.
-- `--overlap-covariance-weight-mode`: `score` (default) or `ldsc` weighting for
-  the ancillary summary-only overlap-covariance fit.
-- `--ldscores-w`: optional scalar regression-SNP LD score used in LDSC weights.
-- `--ldsc-m`: fixed reference annotation masses; split files with `@` are summed.
-- `--ldsc-irwls-iters`, `--ldsc-irwls-tol`: LDSC update controls.
 - `--annot`: annotation file or split-file spec; omitted means single component.
 - `--max-chisq`: main chi-square filter; use `auto` for `max(80, 0.001*Nmax)`.
 - `--overlap-covariance-chisq-thr`: chi-square filter used only for summary-only
@@ -780,12 +717,11 @@ Exactly one of these modes must be specified.
   batch fitting writes one result/JSON pair per manifest trait plus the global
   batch log prefix.
 - h2: `<out>.results.tsv`, `<out>.log`, optionally `<out>.<trait>.jack`; the
-  result table records `estimator` (`he` or `constrained_ldsc_irwls`).
+  result table records the estimator mode.
 - rg: `<out>.log`, optionally `<out>.rg.jack` and
   `<out>.rg.scoreeq.json`.
 - rg manifest: `<out>/batch.log`, `<out>/manifest.results.tsv`, and per-pair
-  logs/results where applicable; the combined table records `estimator` (`he`
-  or `constrained_cov_ldsc_irwls`).
+  logs/results where applicable; the combined table records the estimator mode.
 
 ## Citation
 
