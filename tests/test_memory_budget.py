@@ -32,7 +32,13 @@ def test_cli_defaults_to_auto_memory_and_semantic_mailman_selection():
     defaults = cli.build_parser().parse_args([])
     assert defaults.target_xz_mem == "auto"
     assert defaults.target_mem is None
+    assert defaults.gxe_total_memory_gib == "auto"
     assert defaults.use_mailman == "auto"
+
+    explicit = cli.build_parser().parse_args(
+        ["--gxe-total-memory-gib", "24.5"]
+    )
+    assert explicit.gxe_total_memory_gib == 24.5
 
 
 def test_mailman_auto_is_small_probe_and_hwe_only():

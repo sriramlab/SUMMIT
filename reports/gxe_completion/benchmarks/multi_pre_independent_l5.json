@@ -1,0 +1,35 @@
+{
+  "affinity": [
+    0,
+    1,
+    2,
+    3
+  ],
+  "arguments": {
+    "environments": 5,
+    "m": 800,
+    "memory_gib": 1.0,
+    "n": 8000,
+    "probes": 32,
+    "seed": 20260814,
+    "step_size": 200,
+    "threads": 4,
+    "workspace_gib": 2.0
+  },
+  "cpu_seconds": 4.71694682,
+  "decode": {
+    "calls": 60
+  },
+  "label": "pre_fusion_6bf009e",
+  "max_rss_kib": 235372,
+  "mode": "independent",
+  "native_phase_seconds": {
+    "feature_precompute": 0.29705763698439114,
+    "panel_preparation": 0.017633963987464085,
+    "source_calls": 0.3825090260070283,
+    "target_calls": 0.3214672620233614
+  },
+  "schema": "summit.gxe.multi_environment_profile.v1",
+  "shared_genotype_passes": 15,
+  "wall_seconds": 1.9808488610142376
+}

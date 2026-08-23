@@ -1,0 +1,189 @@
+{
+  "affinity": [
+    0,
+    1,
+    2,
+    3
+  ],
+  "arguments": {
+    "environments": 5,
+    "m": 800,
+    "memory_gib": 1.0,
+    "n": 8000,
+    "probes": 32,
+    "seed": 20260814,
+    "step_size": 200,
+    "threads": 4,
+    "workspace_gib": 2.0
+  },
+  "cpu_seconds": 4.4242128240000005,
+  "decode": {
+    "calls": 12,
+    "seconds": 0.6413459440227598
+  },
+  "gemm": [
+    {
+      "calls": 4,
+      "left": [
+        8000,
+        2
+      ],
+      "operation": "NN",
+      "output": [
+        8000,
+        200
+      ],
+      "right": [
+        2,
+        200
+      ],
+      "seconds": 0.012342284026090056
+    },
+    {
+      "calls": 1,
+      "left": [
+        8000,
+        2
+      ],
+      "operation": "NN",
+      "output": [
+        8000,
+        320
+      ],
+      "right": [
+        2,
+        320
+      ],
+      "seconds": 0.0016592199972365052
+    },
+    {
+      "calls": 4,
+      "left": [
+        8000,
+        2
+      ],
+      "operation": "NN",
+      "output": [
+        8000,
+        1000
+      ],
+      "right": [
+        2,
+        1000
+      ],
+      "seconds": 0.06096041898126714
+    },
+    {
+      "calls": 4,
+      "left": [
+        8000,
+        200
+      ],
+      "operation": "NN",
+      "output": [
+        8000,
+        320
+      ],
+      "right": [
+        200,
+        320
+      ],
+      "seconds": 0.12208070597262122
+    },
+    {
+      "calls": 4,
+      "left": [
+        8000,
+        2
+      ],
+      "operation": "TN",
+      "output": [
+        2,
+        200
+      ],
+      "right": [
+        8000,
+        200
+      ],
+      "seconds": 0.005497977050254121
+    },
+    {
+      "calls": 1,
+      "left": [
+        8000,
+        2
+      ],
+      "operation": "TN",
+      "output": [
+        2,
+        320
+      ],
+      "right": [
+        8000,
+        320
+      ],
+      "seconds": 0.001390958990668878
+    },
+    {
+      "calls": 4,
+      "left": [
+        8000,
+        5
+      ],
+      "operation": "TN",
+      "output": [
+        5,
+        200
+      ],
+      "right": [
+        8000,
+        200
+      ],
+      "seconds": 0.010976746998494491
+    },
+    {
+      "calls": 4,
+      "left": [
+        8000,
+        15
+      ],
+      "operation": "TN",
+      "output": [
+        15,
+        200
+      ],
+      "right": [
+        8000,
+        200
+      ],
+      "seconds": 0.02858869798365049
+    },
+    {
+      "calls": 8,
+      "left": [
+        8000,
+        200
+      ],
+      "operation": "TN",
+      "output": [
+        200,
+        320
+      ],
+      "right": [
+        8000,
+        320
+      ],
+      "seconds": 0.24648964093648829
+    }
+  ],
+  "gemm_total_calls": 34,
+  "gemm_total_seconds": 0.4899866509367712,
+  "label": "post_fused_noprofile_l5",
+  "max_rss_kib": 293532,
+  "mode": "shared",
+  "profile": null,
+  "repairs": 0,
+  "schema": "summit.gxe.multi_environment_profile.v1",
+  "shared_genotype_passes": 3,
+  "wall_seconds": 2.5454299109987915
+}

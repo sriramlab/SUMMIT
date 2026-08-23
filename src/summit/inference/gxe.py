@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import re
 import stat
@@ -24,6 +25,7 @@ import pandas as pd
 from ..ldscore.gwe_ldscore import (
     _FEATURE_CACHE_ARRAY_DTYPES,
     _validate_backend_provenance,
+    _validate_feature_convention_metadata,
     _validate_feature_cache_semantics,
     _validate_gxe_annotation_names,
 )
@@ -32,7 +34,11 @@ from ..ldscore.gwe_ldscore import (
 _REFERENCE_KIND = "summit.gxe.reference"
 _MOMENTS_KIND = "summit.gxe.phenotype_moments"
 _SCHEMA_VERSION = 3
-_SUPPORTED_SCHEMA_VERSIONS = frozenset({2, 3})
+# Reference/moments schema v4 pledges canonical binary64 annotation values;
+# v3 may have rounded continuous annotations to the randomized
+# retained-storage dtype.  Moments must match their reference's version, so
+# cross-contract reference/moments pairs are rejected below.
+_SUPPORTED_SCHEMA_VERSIONS = frozenset({2, 3, 4})
 _COPY_CHUNK_BYTES = 8 * 1024 * 1024
 _FIT_BATCH_KIND = "summit.gxe.fit_batch"
 _FIT_BATCH_SCHEMA_VERSION = 1
@@ -94,6 +100,7 @@ class GxENormalEquations:
     rhs: np.ndarray
     traces: np.ndarray
     component_names: tuple[str, ...]
+    diagnostics: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -129,6 +136,12 @@ class GxEFitResult:
     rank: int
     condition_number: float
     relative_residual: float
+    solve_method: str = "residual_eliminated_svd"
+    normal_symmetry_error: float = 0.0
+    cauchy_schwarz_max_violation: float = 0.0
+    component_influence: np.ndarray | None = None
+    identifiable: bool = True
+    normal_equation_diagnostics: dict[str, Any] | None = None
     standard_errors: np.ndarray | None = None
     jackknife_estimates: np.ndarray | None = None
     jackknife_block_labels: tuple[str, ...] = ()
@@ -210,10 +223,11 @@ def _population_same_individual_products(
         raise ValueError(
             "Population-reference inference requires a reference with population_trace moments."
         )
+    legacy_diagonal_method = declaration.get("jackknife_diagonal_method")
     if (
         declaration.get("method") != "independent_probe_u_statistic_v1"
         or declaration.get("sampling_axis") != "individual"
-        or declaration.get("jackknife_diagonal_method") != "full_reference_reuse"
+        or legacy_diagonal_method not in {None, "full_reference_reuse"}
     ):
         raise ValueError("Reference population_trace uses an unsupported estimator.")
     probes = declaration.get("num_vectors")
@@ -356,6 +370,12 @@ def transfer_reference_normal_equations(
     _require_shape(
         "same_individual_products", diagonal, (genetic_count, genetic_count)
     )
+    diagonal_scale = max(1.0, float(np.max(np.abs(diagonal))))
+    diagonal_symmetry_error = float(np.max(np.abs(diagonal - diagonal.T)))
+    if diagonal_symmetry_error > 2.0e-10 * diagonal_scale:
+        raise ValueError("same_individual_products are materially asymmetric.")
+    diagonal = 0.5 * (diagonal + diagonal.T)
+    diagonal_eigenvalues = np.linalg.eigvalsh(diagonal)
     genetic_nxe = _as_float_array(
         "genetic_nxe_traces", genetic_nxe_traces, ndim=1
     )
@@ -416,6 +436,19 @@ def transfer_reference_normal_equations(
         np.zeros(p, dtype=np.float64),
         traces,
         reference_equations.component_names,
+        {
+            "population_transfer": "same_and_different_individual_moment_scaling_v1",
+            "reference_n_samples": n_ref,
+            "study_n_samples": n_study,
+            "reference_residual_rank": r_ref,
+            "study_residual_rank": r_study,
+            "same_individual_scale": same_scale,
+            "different_individual_scale": different_scale,
+            "extrapolation": bool(n_study > n_ref),
+            "same_individual_symmetry_error": diagonal_symmetry_error,
+            "same_individual_minimum_eigenvalue": float(diagonal_eigenvalues[0]),
+            "same_individual_estimator_psd_expected": False,
+        },
     )
 
 
@@ -618,7 +651,7 @@ def solve_normal_equations(
     max_condition: float = 1.0e12,
     allow_ill_conditioned: bool = False,
 ) -> GxEFitResult:
-    """Solve the unconstrained MoM system with explicit identifiability checks."""
+    """Solve the unconstrained MoM system after eliminating the residual row."""
     max_condition = float(max_condition)
     if not np.isfinite(max_condition) or max_condition <= 0.0:
         raise ValueError(f"max_condition must be positive and finite; got {max_condition!r}.")
@@ -626,11 +659,53 @@ def solve_normal_equations(
         rcond = float(rcond)
         if not np.isfinite(rcond) or rcond <= 0.0:
             raise ValueError(f"rcond must be positive and finite when supplied; got {rcond!r}.")
-    lhs = _as_float_array("normal matrix", equations.matrix, ndim=2)
+    lhs_raw = _as_float_array("normal matrix", equations.matrix, ndim=2)
     rhs = _as_float_array("normal RHS", equations.rhs, ndim=1)
-    if lhs.shape[0] != lhs.shape[1] or lhs.shape[0] != rhs.shape[0]:
+    if (
+        lhs_raw.shape[0] != lhs_raw.shape[1]
+        or lhs_raw.shape[0] != rhs.shape[0]
+        or lhs_raw.shape[0] < 2
+    ):
         raise ValueError("Normal matrix must be square and match the RHS length.")
-    _require_shape("traces", np.asarray(equations.traces), (rhs.shape[0],))
+    traces = _as_float_array("traces", equations.traces, ndim=1)
+    _require_shape("traces", traces, (rhs.shape[0],))
+
+    matrix_scale = max(float(np.max(np.abs(lhs_raw))), 1.0)
+    symmetry_error = float(np.max(np.abs(lhs_raw - lhs_raw.T)))
+    symmetry_tolerance = 2.0e-10 * matrix_scale
+    if symmetry_error > symmetry_tolerance:
+        raise ValueError(
+            "GxE/NxE normal matrix has material asymmetry: "
+            f"maximum={symmetry_error:.6g}, tolerance={symmetry_tolerance:.6g}."
+        )
+    lhs = 0.5 * (lhs_raw + lhs_raw.T)
+
+    diagonal = np.diag(lhs)
+    diagonal_tolerance = 2.0e-10 * matrix_scale
+    if float(np.min(diagonal)) < -diagonal_tolerance:
+        raise ValueError(
+            "GxE/NxE normal matrix has a materially negative kernel norm: "
+            f"minimum diagonal={float(np.min(diagonal)):.6g}."
+        )
+    cauchy_bound = np.sqrt(
+        np.maximum(diagonal, 0.0)[:, None]
+        * np.maximum(diagonal, 0.0)[None, :]
+    )
+    cauchy_violation = np.abs(lhs) - cauchy_bound
+    cauchy_max = float(np.max(cauchy_violation))
+    cauchy_tolerance = 2.0e-10 * max(
+        matrix_scale, float(np.max(cauchy_bound)), 1.0
+    )
+    if cauchy_max > cauchy_tolerance:
+        location = np.unravel_index(
+            int(np.argmax(cauchy_violation)), cauchy_violation.shape
+        )
+        raise ValueError(
+            "GxE/NxE kernel Gram matrix is not positive semidefinite because it "
+            "violates a Cauchy--Schwarz bound: "
+            f"entry={location}, excess={cauchy_max:.6g}, "
+            f"tolerance={cauchy_tolerance:.6g}."
+        )
 
     eigenvalues = np.linalg.eigvalsh(lhs)
     eigen_scale = max(float(np.max(np.abs(eigenvalues))), 1.0)
@@ -643,24 +718,82 @@ def solve_normal_equations(
             "increase --nvecs and regenerate the complete reference bundle."
         )
 
-    _, singular, _ = np.linalg.svd(lhs, full_matrices=False)
-    if singular.size == 0 or singular[0] <= 0.0:
-        raise ValueError("Normal matrix has no positive singular values.")
-    tol = (max(lhs.shape) * np.finfo(np.float64).eps * singular[0]) if rcond is None else float(rcond) * singular[0]
-    rank = int(np.sum(singular > tol))
-    condition = float(np.inf if singular[-1] <= 0.0 else singular[0] / singular[-1])
-    if not allow_ill_conditioned and (rank < lhs.shape[0] or condition > max_condition):
+    residual_trace = float(traces[-1])
+    residual_tolerance = 2.0e-10 * max(
+        matrix_scale, abs(residual_trace), 1.0
+    )
+    if residual_trace <= 0.0:
+        raise ValueError("Residual kernel trace must be positive.")
+    if (
+        abs(lhs[-1, -1] - residual_trace) > residual_tolerance
+        or float(np.max(np.abs(lhs[:-1, -1] - traces[:-1])))
+        > residual_tolerance
+        or abs(rhs[-1] - residual_trace) > residual_tolerance
+    ):
         raise ValueError(
-            "GxE/NxE normal equations are not identifiable at the requested tolerance: "
+            "GxE/NxE residual row is incompatible with the declared kernel "
+            "traces or normalized phenotype RHS."
+        )
+
+    trace_nonresidual = traces[:-1]
+    reduced = (
+        lhs[:-1, :-1]
+        - np.outer(trace_nonresidual, trace_nonresidual) / residual_trace
+    )
+    reduced = 0.5 * (reduced + reduced.T)
+    reduced_rhs = rhs[:-1] - trace_nonresidual
+    u, singular, vh = np.linalg.svd(reduced, full_matrices=False)
+    if singular.size == 0 or singular[0] <= 0.0:
+        raise ValueError("Residual-eliminated normal matrix has no positive singular values.")
+    tol = (
+        max(reduced.shape) * np.finfo(np.float64).eps * singular[0]
+        if rcond is None
+        else float(rcond) * singular[0]
+    )
+    reduced_rank = int(np.sum(singular > tol))
+    rank = reduced_rank + 1
+    condition = float(np.inf if singular[-1] <= 0.0 else singular[0] / singular[-1])
+    if not allow_ill_conditioned and (
+        reduced_rank < reduced.shape[0] or condition > max_condition
+    ):
+        raise ValueError(
+            "Residual-eliminated GxE/NxE normal equations are not identifiable "
+            "at the requested tolerance: "
             f"rank={rank}/{lhs.shape[0]}, condition={condition:.6g}. "
             "This commonly occurs when E^2 is constant (NxE equals residual noise), "
             "or when annotations/kernels are redundant."
         )
 
-    coef = np.linalg.lstsq(lhs, rhs, rcond=rcond)[0]
+    inverse_singular = np.zeros_like(singular)
+    inverse_singular[singular > tol] = 1.0 / singular[singular > tol]
+    reduced_pseudoinverse = (
+        vh.T * inverse_singular.reshape(1, -1)
+    ) @ u.T
+    coef_nonresidual = reduced_pseudoinverse @ reduced_rhs
+    coef_residual = (
+        1.0
+        - float(trace_nonresidual @ coef_nonresidual) / residual_trace
+    )
+    coef = np.concatenate(
+        [np.asarray(coef_nonresidual, dtype=np.float64), [coef_residual]]
+    )
     resid_denom = max(float(np.linalg.norm(rhs)), np.finfo(np.float64).tiny)
     rel_resid = float(np.linalg.norm(lhs @ coef - rhs) / resid_denom)
-    contributions = coef * np.asarray(equations.traces, dtype=np.float64)
+    component_influence = np.empty(lhs.shape[0], dtype=np.float64)
+    component_influence[:-1] = np.linalg.norm(
+        reduced_pseudoinverse, axis=1
+    )
+    component_influence[-1] = math.sqrt(
+        1.0
+        + float(
+            np.linalg.norm(
+                trace_nonresidual @ reduced_pseudoinverse
+                / residual_trace
+            )
+            ** 2
+        )
+    )
+    contributions = coef * traces
     total = float(contributions.sum())
     proportions = np.full_like(contributions, np.nan)
     if np.isfinite(total) and abs(total) > np.finfo(np.float64).tiny:
@@ -677,6 +810,18 @@ def solve_normal_equations(
         rank=rank,
         condition_number=condition,
         relative_residual=rel_resid,
+        solve_method="residual_eliminated_svd",
+        normal_symmetry_error=symmetry_error,
+        cauchy_schwarz_max_violation=max(0.0, cauchy_max),
+        component_influence=component_influence,
+        identifiable=bool(
+            reduced_rank == reduced.shape[0] and condition <= max_condition
+        ),
+        normal_equation_diagnostics=(
+            None
+            if equations.diagnostics is None
+            else dict(equations.diagnostics)
+        ),
     )
 
 
@@ -1700,6 +1845,15 @@ def _fit_from_input_snapshots(
     moments_version = int(moments_version_raw)
     if ref.get("kind") != _REFERENCE_KIND or ref_version not in _SUPPORTED_SCHEMA_VERSIONS:
         raise ValueError(f"Unsupported GxE reference manifest: {ref_path}.")
+    reference_annotation_dtype = ref.get("annotation_value_dtype")
+    if ref_version >= 4 and reference_annotation_dtype != "float64":
+        raise ValueError(
+            f"Schema-v4 GxE reference lacks the canonical binary64 annotation pledge: {ref_path}."
+        )
+    if ref_version < 4 and reference_annotation_dtype is not None:
+        raise ValueError(
+            f"Schema-v{ref_version} GxE reference carries an unexpected annotation dtype pledge: {ref_path}."
+        )
     if ref.get("backend_provenance") is not None:
         _validate_backend_provenance(
             ref["backend_provenance"], expected_stage="reference"
@@ -1729,6 +1883,14 @@ def _fit_from_input_snapshots(
     kernel_mode = ref.get("kernel_mode")
     if kernel_mode not in {"genie", "standardized"}:
         raise ValueError(f"Reference manifest has unsupported kernel_mode={kernel_mode!r}.")
+    feature_convention = _validate_feature_convention_metadata(ref)
+    moments_feature_convention = moments.get("feature_convention")
+    moments_feature_version = moments.get("feature_convention_version")
+    if moments_feature_convention is not None or moments_feature_version is not None:
+        if moments_feature_version != 1 or moments_feature_convention != feature_convention:
+            raise ValueError(
+                "Reference and phenotype bundles use different feature conventions."
+            )
     genotype_scale = ref.get("genotype_scale")
     if genotype_scale not in {"hwe", "sample"}:
         raise ValueError(f"Reference manifest has unsupported genotype_scale={genotype_scale!r}.")
@@ -2981,6 +3143,16 @@ def write_fit(
         "rank": fit.rank,
         "condition_number": fit.condition_number,
         "relative_residual": fit.relative_residual,
+        "solve_method": fit.solve_method,
+        "normal_symmetry_error": fit.normal_symmetry_error,
+        "cauchy_schwarz_max_violation": fit.cauchy_schwarz_max_violation,
+        "component_influence": (
+            None
+            if fit.component_influence is None
+            else fit.component_influence.tolist()
+        ),
+        "identifiable": fit.identifiable,
+        "normal_equation_diagnostics": fit.normal_equation_diagnostics,
         "singular_values": fit.singular_values.tolist(),
         "normal_eigenvalues": fit.normal_eigenvalues.tolist(),
         "normal_matrix": fit.normal_matrix.tolist(),

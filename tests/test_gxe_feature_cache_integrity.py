@@ -48,8 +48,6 @@ def _make_builder(tmp_path: Path, name: str = "cache") -> GenomewideEnvLDScore:
         kernel_mode="standardized",
         genotype_scale="sample",
         target_xz_mem=0.01,
-        write_jackknife=True,
-        jackknife_spec="3",
     )
 
 
@@ -211,12 +209,15 @@ def test_cache_aborts_if_open_genotype_inode_changes_during_generation(
     assert not cache.exists()
 
     # The contract intentionally makes an estimator unusable once its bound
-    # input inode changes.  A fresh estimator binds the now-current input and
-    # remains suitable for the independent jackknife-digest check below.
+    # input inode changes. A fresh estimator binds the now-current input and
+    # remains suitable for the independent legacy-jackknife rejection below.
     fresh_builder = _make_builder(tmp_path, "moving-genotype")
     fresh_builder.write_feature_cache(cache)
     metadata, arrays = _read_cache(cache)
-    arrays["jackknife_ids"] = np.roll(arrays["jackknife_ids"], 1)
+    arrays["jackknife_ids"] = (
+        np.arange(arrays["annotations"].shape[0], dtype=np.int32) % 2
+    )
+    metadata["jackknife_labels"] = ["block:1", "block:2"]
     _reseal_cache(cache, metadata, arrays)
     with pytest.raises(ValueError, match="jackknife digest"):
         fresh_builder._load_feature_cache(cache)
@@ -252,7 +253,6 @@ def test_cache_rejects_legacy_schema_and_wrong_dtype(tmp_path):
         ("mass", "annotation masses"),
         ("scale", "nonpositive"),
         ("correlation", "Cauchy-Schwarz"),
-        ("jackknife", "out of range"),
         ("variant_digest", "variant digest"),
         ("annotation_digest", "annotation digest"),
         ("annotation_name", "reserved artifact"),
@@ -283,8 +283,6 @@ def test_semantic_validator_rejects_resealed_malformed_contracts(tmp_path, case,
         arrays["scale_w"][0] = 0.0
     elif case == "correlation":
         arrays["corr_xw"][0] = 2.0
-    elif case == "jackknife":
-        arrays["jackknife_ids"][0] = 99
     elif case == "variant_digest":
         arrays["variant_snp"][0] = "tampered"
     elif case == "annotation_digest":

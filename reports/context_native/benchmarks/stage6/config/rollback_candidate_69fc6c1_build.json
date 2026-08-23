@@ -1,0 +1,24 @@
+{
+  "schema": "context_native_stage6_build_spec_v1",
+  "label": "rollback-69fc6c1",
+  "install_prefix": "/tmp/summit-stage6-serial-rollback-69fc6c1.Wndsw1/install",
+  "native_module": "/tmp/summit-stage6-serial-rollback-69fc6c1.Wndsw1/install/summit/gxeldcore.cpython-312-x86_64-linux-gnu.so",
+  "python_executable": "/home/bronsonj/anaconda3/envs/summit/bin/python3.12",
+  "dependency_paths": [
+    "/home/bronsonj/anaconda3/envs/summit/lib/python3.12/site-packages"
+  ],
+  "environment": {
+    "LD_LIBRARY_PATH": "/home/bronsonj/anaconda3/envs/summit/lib",
+    "LD_PRELOAD": "/home/bronsonj/anaconda3/envs/summit/lib/libstdc++.so.6",
+    "OMP_DYNAMIC": "FALSE"
+  },
+  "expected_native_sha256": "7a52639ba60e5e486f4cf60cecd7275cb77a1f49a04f660b00865324058ec8f7",
+  "expected_package_sha256": "a2c3614195f0ed96d82b4f7c0a79c01d98c3ffc99b38f6d1b518ebc1afc616b4",
+  "expected_python_runtime_sha256": "d525812398709daca5133a1cd12f4f7da127433a04f17a7d978151a8df6e9ac5",
+  "expected_dependency_runtime_sha256": "988388f2ca470dffaf208e8455771003149c9abbb495faaacf35036f9f252d10",
+  "expected_source_commit": "69fc6c19d0b5b4cdc762c0ae92ad91a4cae61861",
+  "expected_source_tree_sha256": "aa63e704eb31954e70fabe09bbae7337e1bdb1653ba98de8d57be15f09bbb956",
+  "qualification_evidence_path": "/home/bronsonj/SUMMIT/reports/context_native/benchmarks/stage6/config/rollback_candidate_69fc6c1_fault_qualification.json",
+  "qualification_evidence_sha256": "e170992b27d849f16b55e0e0744d8dc22c73d247ce725ddb91940b233cbaad5a",
+  "declared_parent_source_commit": null
+}

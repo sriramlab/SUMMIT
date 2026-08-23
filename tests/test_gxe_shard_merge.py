@@ -88,9 +88,6 @@ def _estimator(
         kernel_mode="standardized",
         genotype_scale="sample",
         target_xz_mem=0.01,
-        write_jackknife=True,
-        jackknife_spec="3",
-        allow_low_probe_jackknife=False,
         probe_offset=offset,
         feature_cache_path=None if cache is None else str(cache),
         shard_mode=shard,
@@ -124,9 +121,6 @@ def _deployment_shard_estimator(
         kernel_mode="standardized",
         genotype_scale="sample",
         target_xz_mem=0.01,
-        write_jackknife=True,
-        jackknife_spec="3",
-        allow_low_probe_jackknife=False,
         probe_offset=offset,
         feature_cache_path=None if cache is None else str(cache),
         shard_mode=shard,
@@ -159,7 +153,6 @@ def deployment_b1024_shards(tmp_path_factory):
     config = json.loads(DEPLOY_CONFIG_PATH.read_text(encoding="utf-8"))
     config["scratch_root"] = str(scratch)
     config["estimator"]["annotation_mass"] = m
-    config["estimator"]["jackknife_blocks"] = 3
     config["estimator"]["step_size"] = m
     return scratch, cache, shards, config
 
@@ -177,7 +170,7 @@ def deployment_b1024_shards(tmp_path_factory):
         ),
     ],
 )
-def test_hoffman_merge_plan_executes_and_postvalidates_without_low_probe_override(
+def test_hoffman_merge_plan_is_hard_gated_as_retired_persisted_workflow(
     deployment_b1024_shards,
     monkeypatch: pytest.MonkeyPatch,
     task: str,
@@ -221,20 +214,14 @@ def test_hoffman_merge_plan_executes_and_postvalidates_without_low_probe_overrid
     }
     plan = HOFFMAN_DEPLOY._prepare_task(spec, common, config, artifacts_ready=False)
     assert "--allow-low-probe-gxe-jackknife" not in plan["command"]
-    artifacts.mkdir(mode=0o700)
-    HOFFMAN_DEPLOY._execute_plan(
-        plan,
-        {"cli_module": importlib.import_module("summit.cli")},
-        common,
-        task,
-    )
-    records = HOFFMAN_DEPLOY._postvalidate_task(spec, common, config, plan, runtime={})
-    manifest = artifacts / manifest_name
-    reference = json.loads(manifest.read_text(encoding="utf-8"))
-    assert reference["randomization"]["num_vectors"] == expected_probes
-    assert reference["randomization"]["probe_offset"] == expected_offset
-    assert reference["randomization"]["low_probe_jackknife_override"] is False
-    assert records == [HOFFMAN_DEPLOY._record(path) for path in plan["outputs"]]
+    with pytest.raises(RuntimeError, match="retired.*does not persist"):
+        HOFFMAN_DEPLOY._execute_plan(
+            plan,
+            {"cli_module": importlib.import_module("summit.cli")},
+            common,
+            task,
+        )
+    assert not artifacts.exists()
 
 
 @pytest.fixture(scope="module")
@@ -258,7 +245,9 @@ def merged_bundle(tmp_path_factory):
 
     monolithic._read_genotype_block = types.MethodType(counted, monolithic)
     monolithic._compute_ldscore()
-    assert reads == 7
+    # One source pass and one target pass; the retired block-jackknife path
+    # no longer rereads the genotype blocks for within-block sketches.
+    assert reads == 2
     merge_reference_shards(
         [root / "mono-contribution.gxe.shard.json"],
         feature_cache_path=cache,
@@ -333,6 +322,32 @@ def test_panel_reader_rejects_ambiguous_or_negative_contributions(
         )
 
 
+def test_panel_reader_round_trips_binary64_contributions(tmp_path):
+    variants = pd.DataFrame(
+        {"CHR": ["1", "1"], "SNP": ["rs1", "rs2"], "BP": [10, 20]}
+    )
+    expected = np.asarray(
+        [[np.nextafter(1.0, 2.0)], [np.nextafter(0.5, 1.0)]],
+        dtype=np.float64,
+    )
+    panel = tmp_path / "round-trip.ldscore.gz"
+    variants.assign(L2_0=expected[:, 0]).to_csv(
+        panel,
+        sep="\t",
+        index=False,
+        compression="gzip",
+        float_format="%.17g",
+    )
+    observed = gxe_merge._read_panel_file(
+        panel,
+        gxe_merge._sha256(panel),
+        variants,
+        ["L2_0"],
+        scratch_dir=tmp_path,
+    )
+    np.testing.assert_array_equal(observed, expected)
+
+
 def test_cache_skip_shards_merge_and_fit_equal_monolithic(merged_bundle):
     root, inputs, cache, shards, merged = merged_bundle
     mono = root / "mono.gxe.ref.json"
@@ -342,15 +357,8 @@ def test_cache_skip_shards_merge_and_fit_equal_monolithic(merged_bundle):
         pd.testing.assert_frame_equal(
             left, right, check_exact=False, rtol=2e-9, atol=2e-9
         )
-    mono_jack = np.load(root / "mono.gxe.jackknife.npz")
-    merged_jack = np.load(root / "merged.gxe.jackknife.npz")
-    for key in ("xx", "xw", "wx", "ww"):
-        np.testing.assert_allclose(
-            mono_jack[f"within_{key}"],
-            merged_jack[f"within_{key}"],
-            rtol=2e-13,
-            atol=2e-13,
-        )
+    assert not (root / "mono.gxe.jackknife.npz").exists()
+    assert not (root / "merged.gxe.jackknife.npz").exists()
 
     prefix, env, cov, pheno, _, _ = inputs
     mono_scores = score_phenotype_from_reference(
@@ -392,15 +400,10 @@ def test_cache_skip_shards_merge_and_fit_equal_monolithic(merged_bundle):
     np.testing.assert_allclose(
         fit_mono.proportions, fit_merged.proportions, rtol=2e-8, atol=2e-8
     )
-    np.testing.assert_allclose(
-        fit_mono.jackknife_estimates,
-        fit_merged.jackknife_estimates,
-        rtol=3e-8,
-        atol=3e-8,
-    )
-    np.testing.assert_allclose(
-        fit_mono.standard_errors, fit_merged.standard_errors, rtol=3e-8, atol=3e-8
-    )
+    assert fit_mono.jackknife_estimates is None
+    assert fit_merged.jackknife_estimates is None
+    assert fit_mono.standard_errors is None
+    assert fit_merged.standard_errors is None
 
     # Marginal phenotype scores are feature-cache quantities, not randomized
     # trace quantities.  A second merge of the identical cache/probes has a
@@ -445,29 +448,12 @@ def test_cache_skip_shards_merge_and_fit_equal_monolithic(merged_bundle):
             max_condition=1e16,
         )
 
-    for label, num_vectors, override, message in (
-        ("string-count", "10", False, "num_vectors"),
-        ("string-override", 10, "false", "JSON boolean"),
-    ):
-        unsafe_reference = root / f"unsafe-{label}.gxe.ref.json"
-        unsafe = json.loads(Path(merged).read_text(encoding="utf-8"))
-        unsafe["randomization"]["num_vectors"] = num_vectors
-        unsafe["randomization"]["low_probe_jackknife_override"] = override
-        unsafe_reference.write_text(json.dumps(unsafe), encoding="utf-8")
-        with pytest.raises(ValueError, match=message):
-            fit_from_files(
-                unsafe_reference,
-                merged_scores.moments,
-                merged_scores.gwas,
-                merged_scores.gwis,
-                max_condition=1e16,
-            )
-
     for path in [cache, merged, *shards, *root.glob("merged.g*")]:
         assert (Path(path).stat().st_mode & 0o777) == 0o600
     for shard in shards:
         payload = json.loads(shard.read_text(encoding="utf-8"))
-        assert payload["schema_version"] == 2
+        assert payload["schema_version"] == 3
+        assert payload["annotation_value_dtype"] == "float64"
         identity = shard.parent / payload["files"]["identity"]
         assert identity.is_file()
         assert (identity.stat().st_mode & 0o777) == 0o600
@@ -487,7 +473,6 @@ def test_duplicate_mixed_and_overwrite_rejected(merged_bundle, monkeypatch):
             [shards[0], shards[2]],
             feature_cache_path=cache,
             output_prefix=root / "gapped",
-            allow_low_probe_jackknife=True,
         )
     mixed_estimator = _estimator(
         inputs, root / "mixed", probes=10, offset=100, cache=cache, shard=True, seed=999
@@ -510,21 +495,16 @@ def test_duplicate_mixed_and_overwrite_rejected(merged_bundle, monkeypatch):
             feature_cache_path=cache,
             output_prefix=root / "mixed-step-merge",
         )
-    with pytest.raises(ValueError, match="at least 100 merged probes"):
-        merge_reference_shards(
-            [shards[0]],
-            feature_cache_path=cache,
-            output_prefix=root / "low-probe",
-        )
     diagnostic = merge_reference_shards(
         [shards[0]],
         feature_cache_path=cache,
-        output_prefix=root / "low-probe-diagnostic",
-        allow_low_probe_jackknife=True,
+        output_prefix=root / "low-probe",
     )
     diagnostic_manifest = json.loads(diagnostic.read_text(encoding="utf-8"))
     assert diagnostic_manifest["randomization"]["num_vectors"] == 10
-    assert diagnostic_manifest["randomization"]["low_probe_jackknife_override"] is True
+    assert "low_probe_jackknife_override" not in diagnostic_manifest["randomization"]
+    assert "jackknife" not in diagnostic_manifest
+    assert "jackknife" not in diagnostic_manifest["files"]
     monkeypatch.setattr(
         gxe_merge,
         "_read_cache",
@@ -567,7 +547,6 @@ def test_relabelled_identical_shard_contributions_are_rejected(merged_bundle):
             crafted,
             feature_cache_path=cache,
             output_prefix=root / "relabelled-merge",
-            allow_low_probe_jackknife=True,
         )
 
 
@@ -595,7 +574,6 @@ def test_merge_hashes_and_parses_each_panel_from_same_bytes(merged_bundle, monke
             [shards[0]],
             feature_cache_path=cache,
             output_prefix=root / "read-once",
-            allow_low_probe_jackknife=True,
         )
         assert result.is_file()
         assert replaced

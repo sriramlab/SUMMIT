@@ -36,9 +36,14 @@ from ..inference.gxe import (
 from .gwe_ldscore import (
     _FEATURE_CACHE_ARRAY_DTYPES,
     _canonical_bfile_prefix,
+    _loaded_native_binary_record,
+    _native_strict_feature_moment_verification_policy,
+    _sha256_descriptor,
+    _validate_feature_convention_metadata,
     _validate_feature_cache_semantics,
     _validate_backend_provenance,
     _validate_gxe_annotation_names,
+    _validate_native_blas_runtime,
     _validate_plink_bed_shape,
     read_env_and_cov,
 )
@@ -46,13 +51,18 @@ from .gwe_ldscore import (
 
 _REFERENCE_KIND = "summit.gxe.reference"
 _MOMENTS_KIND = "summit.gxe.phenotype_moments"
-_SCHEMA_VERSION = 3
+# Reference schema v3 predates the canonical binary64 annotation pledge and
+# may have rounded continuous annotations to the randomized retained-storage
+# dtype; v4 pledges binary64 annotation values.  Phenotype moments echo the
+# reference's schema version so cross-contract pairs cannot mix silently.
+_SUPPORTED_REFERENCE_SCHEMA_VERSIONS = frozenset({3, 4})
 _SCORE_DEFINITION = "feature_transpose_residualized_y_over_sqrt_residual_rank"
 _SCORE_MODE = "marginal_cross_product"
 _GENOTYPE_EXTENSIONS = (".bed", ".bim", ".fam")
 _REFERENCE_ARTIFACTS = frozenset({"xx", "xw", "wx", "ww", "diagonal"})
 _MAX_IN_MEMORY_SCORE_BYTES = 8 * 1024**3
 _MAX_WIDE_WORKING_BYTES = 12 * 1024**3
+_NATIVE_SCORE_WORKSPACE_BYTES = 16 * 1024**3
 
 
 @dataclass(frozen=True)
@@ -259,8 +269,24 @@ def _validate_reference_manifest(
 ) -> _ValidatedReference:
     path = Path(reference_manifest).resolve()
     payload, manifest_sha256 = _load_json_and_sha256(path)
-    if payload.get("kind") != _REFERENCE_KIND or payload.get("schema_version") != _SCHEMA_VERSION:
-        raise ValueError("Reusable phenotype scoring requires a schema-v3 SUMMIT GxE reference.")
+    schema_version = payload.get("schema_version")
+    if (
+        payload.get("kind") != _REFERENCE_KIND
+        or schema_version not in _SUPPORTED_REFERENCE_SCHEMA_VERSIONS
+    ):
+        raise ValueError(
+            "Reusable phenotype scoring requires a schema-v3 or schema-v4 "
+            "SUMMIT GxE reference."
+        )
+    annotation_value_dtype = payload.get("annotation_value_dtype")
+    if schema_version >= 4 and annotation_value_dtype != "float64":
+        raise ValueError(
+            "Schema-v4 GxE reference lacks the canonical binary64 annotation pledge."
+        )
+    if schema_version < 4 and annotation_value_dtype is not None:
+        raise ValueError(
+            "Schema-v3 GxE reference carries an unexpected annotation dtype pledge."
+        )
     if payload.get("backend_provenance") is not None:
         _validate_backend_provenance(
             payload["backend_provenance"], expected_stage="reference"
@@ -278,6 +304,7 @@ def _validate_reference_manifest(
     genotype_scale = payload.get("genotype_scale")
     if kernel_mode not in {"standardized", "genie"}:
         raise ValueError(f"Reference manifest has unsupported kernel_mode={kernel_mode!r}.")
+    _validate_feature_convention_metadata(payload)
     if genotype_scale not in {"sample", "hwe"}:
         raise ValueError(f"Reference manifest has unsupported genotype_scale={genotype_scale!r}.")
     if payload.get("ld_scale") != "cross_product_over_rank_squared":
@@ -1024,6 +1051,290 @@ def _project_and_center(matrix: np.ndarray, fixed_basis: np.ndarray) -> np.ndarr
     return matrix
 
 
+def _direct_native_score_module(reference: _ValidatedReference):
+    """Return the guard-free API-v6 scorer when its runtime contract is met."""
+    provenance = reference.payload.get("backend_provenance")
+    if not isinstance(provenance, Mapping) or provenance.get("backend_name") != (
+        "gxeldcore_direct"
+    ):
+        return None
+    if (
+        reference.payload.get("kernel_mode") != "standardized"
+        or reference.payload.get("genotype_scale") != "sample"
+    ):
+        return None
+    try:
+        from .. import gxeldcore as native_module
+    except (ImportError, OSError):
+        return None
+    build_info = dict(native_module.build_info())
+    if (
+        int(build_info.get("api_version", 0)) < 6
+        or not callable(getattr(native_module.DirectContext, "phenotype_score_block", None))
+    ):
+        return None
+    # This path deliberately promises no ABFT, repair, or retry overhead.  A
+    # process-shared extension must keep using the compatibility scorer unless
+    # its guarded runtime policy is selected explicitly elsewhere.
+    if (
+        build_info.get("blas_runtime_isolation") != "private_static"
+        or build_info.get("gemm_integrity_enabled") is not False
+        or build_info.get("gemm_execution_mode")
+        != "serialized_fixed_private_openblas"
+    ):
+        return None
+    return native_module
+
+
+def _assert_native_binary_unchanged(
+    descriptor: int, record: Mapping[str, Any]
+) -> None:
+    observed = os.fstat(descriptor)
+    identity = (
+        observed.st_dev,
+        observed.st_ino,
+        observed.st_size,
+        observed.st_mtime_ns,
+        observed.st_ctime_ns,
+    )
+    if tuple(record["identity"]) != identity:
+        raise RuntimeError("The loaded native GxE scorer changed during execution.")
+    if _sha256_descriptor(descriptor) != record["sha256"]:
+        raise RuntimeError("The loaded native GxE scorer failed its final SHA-256 check.")
+
+
+def _score_one_genotype_pass_native(
+    *,
+    native_module,
+    reference: _ValidatedReference,
+    genotype_descriptors: Mapping[str, int],
+    row_selection: np.ndarray,
+    environment: np.ndarray,
+    fixed_basis: np.ndarray,
+    phenotype_matrix: np.ndarray,
+    step_size: int,
+    eps_var: float,
+    num_threads: int | None,
+    residual_rank: int,
+    exact_reference: bool,
+    return_feature_nxe: bool,
+    score_x: np.ndarray,
+    score_w: np.ndarray,
+    feature_nxe_x: np.ndarray | None,
+    feature_nxe_w: np.ndarray | None,
+) -> dict[str, Any]:
+    initial_build_info = dict(native_module.build_info())
+    native_threads = (
+        int(num_threads)
+        if num_threads is not None
+        else int(initial_build_info["blas_runtime_threads"])
+    )
+    configured_threads = int(native_module.configure_blas_threads(native_threads))
+    if configured_threads != native_threads:
+        raise RuntimeError("The native GxE scorer configured an unexpected thread count.")
+    build_info = dict(native_module.build_info())
+    runtime_record = _validate_native_blas_runtime(build_info)
+    strict_moments, integrity_reason = (
+        _native_strict_feature_moment_verification_policy(build_info)
+    )
+    if strict_moments:
+        raise RuntimeError(
+            "The guard-free native phenotype scorer unexpectedly requested duplicate "
+            "feature-moment verification."
+        )
+
+    n = len(row_selection)
+    intercept = np.full((n, 1), 1.0 / math.sqrt(float(n)), dtype=np.float64)
+    q_basis = np.asfortranarray(np.column_stack([intercept, fixed_basis]))
+    expected_rank = fixed_basis.shape[1] + 1
+    if q_basis.shape != (n, expected_rank) or not np.allclose(
+        q_basis.T @ q_basis,
+        np.eye(expected_rank),
+        rtol=1.0e-10,
+        atol=1.0e-10,
+    ):
+        raise RuntimeError("The native phenotype scorer received a non-orthonormal design.")
+
+    native_descriptor, native_record = _loaded_native_binary_record(native_module)
+    context = None
+    max_leak_x = 0.0
+    max_leak_w = 0.0
+    max_phenotype_leakage = 0.0
+    missing_calls = 0
+    repaired_feature_columns = 0
+    try:
+        context = native_module.DirectContext(
+            bed_descriptor=int(genotype_descriptors[".bed"]),
+            bim_descriptor=int(genotype_descriptors[".bim"]),
+            fam_descriptor=int(genotype_descriptors[".fam"]),
+            row_sel=np.asarray(row_selection, dtype=np.int64),
+            ddof=int(reference.payload["environment_transform"]["ddof"]),
+            env=np.asarray(environment, dtype=np.float64),
+            q_basis=q_basis,
+            decode_threads=native_threads,
+            blas_threads=native_threads,
+            max_workspace_bytes=_NATIVE_SCORE_WORKSPACE_BYTES,
+            target_panel_columns=max(1, int(phenotype_matrix.shape[1])),
+            strict_feature_moment_verification=False,
+        )
+        context_info = dict(context.info())
+        if (
+            int(context_info["n_selected"]) != n
+            or int(context_info["m_total"]) != len(reference.diagonal)
+            or int(context_info["q_rank"]) != expected_rank
+            or int(context_info["decode_threads"]) != native_threads
+            or int(context_info["blas_threads"]) != native_threads
+            or bool(context_info["strict_feature_moment_verification"])
+        ):
+            raise RuntimeError(
+                "The native phenotype scorer disagrees with validated dimensions/state."
+            )
+        projected_phenotype = context.prepare_projected_sources(
+            np.asfortranarray(phenotype_matrix, dtype=np.float64),
+            tolerance=1.0e-10,
+        )
+        max_phenotype_leakage = float(projected_phenotype.leakage)
+        root_rank = math.sqrt(float(residual_rank))
+        m = len(reference.diagonal)
+        for start in range(0, m, step_size):
+            end = min(m, start + step_size)
+            if exact_reference and not return_feature_nxe:
+                block_score_x, block_score_w, block_missing, block_leakage = (
+                    context.target_projected_block(
+                        start,
+                        end,
+                        np.asarray(reference.scale_x[start:end], dtype=np.float64),
+                        np.asarray(reference.scale_w[start:end], dtype=np.float64),
+                        projected_phenotype,
+                        False,
+                    )
+                )
+                score_x[start:end, :] = (
+                    np.asarray(block_score_x, dtype=np.float64) / root_rank
+                )
+                score_w[start:end, :] = (
+                    np.asarray(block_score_w, dtype=np.float64) / root_rank
+                )
+                missing_calls += int(block_missing)
+                max_phenotype_leakage = max(
+                    max_phenotype_leakage, float(block_leakage)
+                )
+                continue
+
+            block = dict(
+                context.phenotype_score_block(
+                    start,
+                    end,
+                    projected_phenotype,
+                    eps_var,
+                    False,
+                )
+            )
+            exact_scale_x = np.asarray(block["scale_x"], dtype=np.float64)
+            exact_scale_w = np.asarray(block["scale_w"], dtype=np.float64)
+            observed_norm_x = np.asarray(block["norm_x"], dtype=np.float64)
+            observed_norm_w = np.asarray(block["norm_w"], dtype=np.float64)
+            if exact_reference and (
+                not np.allclose(
+                    exact_scale_x,
+                    reference.scale_x[start:end],
+                    rtol=1.0e-9,
+                    atol=1.0e-10,
+                )
+                or not np.allclose(
+                    exact_scale_w,
+                    reference.scale_w[start:end],
+                    rtol=1.0e-9,
+                    atol=1.0e-10,
+                )
+            ):
+                raise ValueError(
+                    "Stored feature scales disagree with the supplied genotype/design "
+                    f"in block [{start}:{end})."
+                )
+            if exact_reference and (
+                not np.allclose(
+                    observed_norm_x,
+                    reference.norm_x[start:end],
+                    rtol=1.0e-9,
+                    atol=1.0e-9,
+                )
+                or not np.allclose(
+                    observed_norm_w,
+                    reference.norm_w[start:end],
+                    rtol=1.0e-9,
+                    atol=1.0e-9,
+                )
+            ):
+                raise ValueError(
+                    "Genotype scaling/projected feature norms disagree with the "
+                    f"reference in block [{start}:{end})."
+                )
+            score_x[start:end, :] = (
+                np.asarray(block["score_x"], dtype=np.float64) / root_rank
+            )
+            score_w[start:end, :] = (
+                np.asarray(block["score_w"], dtype=np.float64) / root_rank
+            )
+            if return_feature_nxe:
+                assert feature_nxe_x is not None and feature_nxe_w is not None
+                feature_nxe_x[start:end] = np.asarray(
+                    block["diag_nxe_x"], dtype=np.float64
+                )
+                feature_nxe_w[start:end] = np.asarray(
+                    block["diag_nxe_w"], dtype=np.float64
+                )
+            max_leak_x = max(
+                max_leak_x, float(block["max_projection_leakage_additive"])
+            )
+            max_leak_w = max(
+                max_leak_w, float(block["max_projection_leakage_interaction"])
+            )
+            missing_calls += int(block["missing_genotype_calls"])
+            repaired_feature_columns += int(block["repaired_feature_moment_columns"])
+
+        final_context_info = dict(context.info())
+        repaired_gemm_columns = int(final_context_info["repaired_gemm_output_columns"])
+        retried_inputs = int(final_context_info["retried_gemm_input_mutations"])
+        if repaired_feature_columns or repaired_gemm_columns or retried_inputs:
+            raise RuntimeError(
+                "The guard-free native phenotype scorer reported an impossible "
+                "repair or retry event."
+            )
+        _assert_native_binary_unchanged(native_descriptor, native_record)
+    finally:
+        if context is not None:
+            context.close()
+        os.close(native_descriptor)
+
+    return {
+        "execution_mode": (
+            "native_fused_sealed_scale_one_pass"
+            if exact_reference and not return_feature_nxe
+            else "native_fused_study_moment_one_pass"
+        ),
+        "genotype_passes": 1,
+        "native_threads": native_threads,
+        "native_workspace_cap_bytes": _NATIVE_SCORE_WORKSPACE_BYTES,
+        "backend_version": str(build_info["backend_version"]),
+        "api_version": int(build_info["api_version"]),
+        "source_commit": str(build_info["source_commit"]),
+        "source_tree_sha256": str(build_info["source_tree_sha256"]),
+        "native_binary_sha256": str(native_record["sha256"]),
+        "blas_runtime": runtime_record,
+        "gemm_integrity_enabled": False,
+        "strict_feature_moment_verification": False,
+        "feature_moment_integrity_reason": integrity_reason,
+        "repaired_feature_moment_columns": repaired_feature_columns,
+        "repaired_gemm_output_columns": 0,
+        "retried_gemm_input_mutations": 0,
+        "missing_genotype_calls": missing_calls,
+        "max_projection_leakage_additive": max_leak_x,
+        "max_projection_leakage_interaction": max_leak_w,
+        "phenotype_projection_leakage": max_phenotype_leakage,
+    }
+
+
 def _score_one_genotype_pass(
     *,
     prefix: str,
@@ -1039,6 +1350,8 @@ def _score_one_genotype_pass(
     residual_rank: int | None = None,
     exact_reference: bool = True,
     return_feature_nxe: bool = False,
+    genotype_descriptors: Mapping[str, int] | None = None,
+    backend_diagnostics: dict[str, Any] | None = None,
 ) -> (
     tuple[np.ndarray, np.ndarray]
     | tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]
@@ -1103,6 +1416,42 @@ def _score_one_genotype_pass(
     genotype_scale = str(reference.payload["genotype_scale"])
     ddof = int(reference.payload["environment_transform"]["ddof"])
     kernel_mode = str(reference.payload["kernel_mode"])
+
+    native_module = _direct_native_score_module(reference)
+    if native_module is not None and genotype_descriptors is not None:
+        diagnostics = _score_one_genotype_pass_native(
+            native_module=native_module,
+            reference=reference,
+            genotype_descriptors=genotype_descriptors,
+            row_selection=row_selection,
+            environment=environment,
+            fixed_basis=fixed_basis,
+            phenotype_matrix=phenotype_matrix,
+            step_size=step_size,
+            eps_var=eps_var,
+            num_threads=num_threads,
+            residual_rank=residual_rank,
+            exact_reference=exact_reference,
+            return_feature_nxe=return_feature_nxe,
+            score_x=score_x,
+            score_w=score_w,
+            feature_nxe_x=feature_nxe_x,
+            feature_nxe_w=feature_nxe_w,
+        )
+        if backend_diagnostics is not None:
+            backend_diagnostics.update(diagnostics)
+        if return_feature_nxe:
+            assert feature_nxe_x is not None and feature_nxe_w is not None
+            return (
+                score_x[:, 0] if single_trait else score_x,
+                score_w[:, 0] if single_trait else score_w,
+                feature_nxe_x,
+                feature_nxe_w,
+            )
+        return (
+            score_x[:, 0] if single_trait else score_x,
+            score_w[:, 0] if single_trait else score_w,
+        )
 
     blas_scope = (
         threadpool_limits(limits=num_threads) if num_threads is not None else nullcontext()
@@ -1208,6 +1557,15 @@ def _score_one_genotype_pass(
                 feature_nxe_w[start:end] = (
                     environment_squared @ interaction / float(residual_rank)
                 )
+    if backend_diagnostics is not None:
+        backend_diagnostics.update(
+            {
+                "execution_mode": "python_numpy_one_pass",
+                "genotype_passes": 1,
+                "repaired_gemm_output_columns": 0,
+                "retried_gemm_input_mutations": 0,
+            }
+        )
     if return_feature_nxe:
         assert feature_nxe_x is not None and feature_nxe_w is not None
         if not np.all(np.isfinite(feature_nxe_x)) or not np.all(
@@ -1510,6 +1868,7 @@ def score_phenotype_from_reference(
         )
         study_n = int(len(row_selection))
         study_rank = int(study_n - fixed_basis.shape[1] - 1)
+        score_backend: dict[str, Any] = {}
         score_result = _score_one_genotype_pass(
             prefix=stable_prefix,
             reference=reference,
@@ -1524,6 +1883,8 @@ def score_phenotype_from_reference(
             residual_rank=study_rank,
             exact_reference=not population_transfer,
             return_feature_nxe=population_transfer,
+            genotype_descriptors=stable_descriptors,
+            backend_diagnostics=score_backend,
         )
         if population_transfer:
             score_x, score_w, feature_nxe_x, feature_nxe_w = score_result
@@ -1572,18 +1933,24 @@ def score_phenotype_from_reference(
             )
             moments = {
                 "kind": _MOMENTS_KIND,
-                "schema_version": _SCHEMA_VERSION,
+                "schema_version": int(reference.payload["schema_version"]),
                 "analysis_fingerprint": study_fingerprint,
                 "variant_digest": reference.payload["variant_digest"],
                 "phenotype": phenotype_name,
                 "n_samples": study_n,
                 "fixed_effect_rank_excluding_intercept": int(fixed_basis.shape[1]),
                 "residual_rank": study_rank,
+                "feature_convention": reference.payload.get(
+                    "feature_convention",
+                    _validate_feature_convention_metadata(reference.payload),
+                ),
+                "feature_convention_version": 1,
                 "reference_mode": (
                     "population" if population_transfer else "matched"
                 ),
                 "score_definition": _SCORE_DEFINITION,
                 "reference_manifest_sha256": reference.manifest_sha256,
+                "score_backend_provenance": score_backend,
                 "score_sha256": {
                     "gwas": _sha256_file(temporary_gwas),
                     "gwis": _sha256_file(temporary_gwis),
@@ -1710,6 +2077,7 @@ def _write_wide_score_bundles(
     q_nxe: np.ndarray,
     q_residual: np.ndarray,
     residual_fraction: np.ndarray,
+    score_backend: Mapping[str, Any],
     targets: dict[str, tuple[Path, Path, Path]],
     staging_dir: Path,
 ) -> dict[str, GxEPhenotypeScoreArtifacts]:
@@ -1748,14 +2116,20 @@ def _write_wide_score_bundles(
             temporary_pairs.append((temporary_gwis, gwis_target))
             moments = {
                 "kind": _MOMENTS_KIND,
-                "schema_version": _SCHEMA_VERSION,
+                "schema_version": int(reference.payload["schema_version"]),
                 "analysis_fingerprint": reference.payload["analysis_fingerprint"],
                 "variant_digest": reference.payload["variant_digest"],
                 "phenotype": trait,
                 "n_samples": int(reference.payload["n_samples"]),
                 "residual_rank": int(reference.payload["residual_rank"]),
+                "feature_convention": reference.payload.get(
+                    "feature_convention",
+                    _validate_feature_convention_metadata(reference.payload),
+                ),
+                "feature_convention_version": 1,
                 "score_definition": _SCORE_DEFINITION,
                 "reference_manifest_sha256": reference.manifest_sha256,
+                "score_backend_provenance": dict(score_backend),
                 "score_sha256": {
                     "gwas": _sha256_file(temporary_gwas),
                     "gwis": _sha256_file(temporary_gwis),
@@ -1908,6 +2282,7 @@ def score_phenotypes_from_reference(
         )
         if validated_traits != traits:
             raise RuntimeError("Wide phenotype trait order changed during validation.")
+        score_backend: dict[str, Any] = {}
         score_x, score_w = _score_one_genotype_pass(
             prefix=stable_prefix,
             reference=reference,
@@ -1919,6 +2294,8 @@ def score_phenotypes_from_reference(
             step_size=step_size,
             eps_var=eps_var,
             num_threads=num_threads,
+            genotype_descriptors=stable_descriptors,
+            backend_diagnostics=score_backend,
         )
         _validate_genotype_files(stable_prefix, reference)
         _assert_stable_genotype_snapshot(stable_descriptors, stable_state)
@@ -1951,6 +2328,7 @@ def score_phenotypes_from_reference(
             q_nxe=q_nxe,
             q_residual=q_residual,
             residual_fraction=residual_fraction,
+            score_backend=score_backend,
             targets=targets,
             staging_dir=stage_dir,
         )

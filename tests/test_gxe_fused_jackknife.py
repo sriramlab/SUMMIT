@@ -56,9 +56,6 @@ def _make_toy(tmp_path, out_name: str):
         kernel_mode="genie",
         genotype_scale="sample",
         target_xz_mem=0.01,
-        write_jackknife=True,
-        jackknife_spec="3",
-        allow_low_probe_jackknife=True,
         num_threads=1,
     )
 
@@ -70,7 +67,7 @@ def _make_toy(tmp_path, out_name: str):
     return obj, raw, env_raw, annot
 
 
-def _dense_panels(raw, env_raw, annot, block_ids):
+def _dense_panels(raw, env_raw, annot):
     n, _ = raw.shape
     e = (env_raw - env_raw.mean()) / env_raw.std(ddof=1)
     qfull = _orthonormalize_columns(np.column_stack([np.ones(n), e]))
@@ -86,19 +83,31 @@ def _dense_panels(raw, env_raw, annot, block_ids):
         "ww": w.T @ w / rank,
     }
     scores = {key: (value * value) @ annot for key, value in cross.items()}
-    within = {
-        key: np.zeros((int(block_ids.max()) + 1, annot.shape[1], annot.shape[1]))
-        for key in cross
-    }
-    for block_id in range(int(block_ids.max()) + 1):
-        rows = np.flatnonzero(block_ids == block_id)
-        for key, value in cross.items():
-            square = value[np.ix_(rows, rows)] ** 2
-            within[key][block_id] = annot[rows].T @ square @ annot[rows]
-    return scores, within
+    return scores
 
 
-def test_block_local_jackknife_uses_global_passes_and_matches_dense_scores(tmp_path):
+def test_xw_wx_are_transposed_aggregates_not_duplicate_variant_scores():
+    rng = np.random.default_rng(903)
+    x = rng.normal(size=(19, 7))
+    w = rng.normal(size=(19, 7))
+    annotations = rng.uniform(0.1, 1.0, size=(7, 3))
+    cross = x.T @ w
+    xw = (cross * cross) @ annotations
+    wx = (cross.T * cross.T) @ annotations
+
+    # A row norm and the corresponding column norm need not agree for a SNP.
+    assert not np.allclose(xw, wx, rtol=1e-12, atol=1e-12)
+    # The normal-equation aggregate is the same only after transposing the
+    # directional annotation indices.  This identity does not reconstruct one
+    # per-variant panel from the other.
+    for left in range(annotations.shape[1]):
+        for source in range(annotations.shape[1]):
+            forward = annotations[:, left] @ xw[:, source]
+            reverse = annotations[:, source] @ wx[:, left]
+            np.testing.assert_allclose(forward, reverse, rtol=2e-15, atol=2e-12)
+
+
+def test_reference_uses_global_passes_and_matches_dense_scores(tmp_path):
     obj, raw, env_raw, annot = _make_toy(tmp_path, "fused")
     original_read = obj._read_genotype_block
     read_count = 0
@@ -113,70 +122,13 @@ def test_block_local_jackknife_uses_global_passes_and_matches_dense_scores(tmp_p
     assert read_count == 3 * math.ceil(raw.shape[1] / obj.step_size)
     assert not list(tmp_path.glob(".gxe-jackknife-*"))
 
-    dense_scores, _ = _dense_panels(raw, env_raw, annot, obj.jackknife_ids)
+    dense_scores = _dense_panels(raw, env_raw, annot)
     suffix = {"xx": "gxx", "xw": "gxe", "wx": "exg", "ww": "gee"}
     for key, stem in suffix.items():
         observed = pd.read_csv(tmp_path / f"fused.{stem}.ldscore.gz", sep="\t")[["a", "b"]].to_numpy()
-        # Text score bundles are intentionally written with %.10g.
-        np.testing.assert_allclose(observed, dense_scores[key], rtol=1e-9, atol=1e-9)
+        # Text score bundles round-trip the binary64 reference values.
+        np.testing.assert_allclose(observed, dense_scores[key], rtol=2e-14, atol=2e-14)
     assert not (tmp_path / "fused.gxe.jackknife.npz").exists()
-
-
-def test_block_local_jackknife_tiling_accounts_only_for_global_workspace():
-    obj = GenomewideEnvLDScore.__new__(GenomewideEnvLDScore)
-    obj.target_xz_mem = 2 * 101 * 3 * 7.5 * 4 / (1024 ** 3)
-    obj.dtype = np.float32
-    obj.nsamp = 101
-    obj.nbins = 3
-    obj.nvecs = 23
-    obj.jackknife_ids = np.zeros(5, dtype=np.int32)
-    obj.shard_mode = False
-    obj.log = Logger(suppress=True)
-    tiles = obj._auto_vtiles()
-    assert max(size for _, size in tiles) == 6
-    assert sum(size for _, size in tiles) == 23
-    resident = 2 * obj.nsamp * obj.nbins * max(size for _, size in tiles) * 4
-    assert resident <= obj.target_xz_mem * (1024 ** 3)
-
-
-def test_production_shaped_block_local_jackknife_has_no_block_sketch():
-    obj = GenomewideEnvLDScore.__new__(GenomewideEnvLDScore)
-    obj.target_xz_mem = 32.0
-    obj.dtype = np.float64
-    obj.nsamp = 300_000
-    obj.nbins = 1
-    obj.nvecs = 1_024
-    obj.jackknife_ids = np.arange(100, dtype=np.int32)
-    obj.jackknife_labels = [f"block:{index}" for index in range(100)]
-    obj.shard_mode = False
-    obj.log = Logger(suppress=True)
-
-    tiles = obj._auto_vtiles()
-    assert sum(size for _, size in tiles) == obj.nvecs
-    assert tiles == [(0, 1_024)]
-    paired_global = 2 * obj.nsamp * max(size for _, size in tiles) * 8
-    assert paired_global == 4_915_200_000
-    assert paired_global / (1024 ** 3) == pytest.approx(4.57763671875)
-
-
-def test_exact_shard_jackknife_keeps_only_one_block_in_memory():
-    obj = GenomewideEnvLDScore.__new__(GenomewideEnvLDScore)
-    obj.target_xz_mem = 32.0
-    obj.dtype = np.float64
-    obj.nsamp = 300_000
-    obj.nbins = 1
-    obj.nvecs = 1_024
-    obj.jackknife_ids = np.arange(100, dtype=np.int32)
-    obj.jackknife_labels = [f"block:{index}" for index in range(100)]
-    obj.shard_mode = True
-    obj.log = Logger(suppress=True)
-
-    all_blocks = 2 * 100 * obj.nsamp * obj.nvecs * 8
-    assert all_blocks / (1024 ** 3) > 450.0
-    assert obj._auto_vtiles() == [(0, 1_024)]
-    one_block = 2 * obj.nsamp * obj.nvecs * 8
-    assert one_block / (1024 ** 3) == pytest.approx(4.57763671875)
-
 
 def test_native_tiling_accounts_for_opaque_panel_preparation_peak():
     obj = GenomewideEnvLDScore.__new__(GenomewideEnvLDScore)
@@ -185,8 +137,8 @@ def test_native_tiling_accounts_for_opaque_panel_preparation_peak():
     obj.nsamp = 101
     obj.nbins = 3
     obj.nvecs = 23
-    obj.jackknife_ids = np.zeros(5, dtype=np.int32)
-    obj.jackknife_labels = ["one"]
+    obj.jackknife_ids = None
+    obj.jackknife_labels = []
     obj.shard_mode = False
     obj.native_backend = "direct"
     obj.log = Logger(suppress=True)
@@ -225,7 +177,7 @@ def test_bed_reader_thread_forwarding():
     assert calls[0]["num_threads"] == 3
 
 
-def test_in_memory_jackknife_failure_leaves_no_outputs(tmp_path):
+def test_reference_failure_leaves_no_outputs(tmp_path):
     obj, _, _, _ = _make_toy(tmp_path, "failure")
 
     def fail_during_source_construction(self, *args, **kwargs):

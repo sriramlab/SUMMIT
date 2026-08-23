@@ -1,11 +1,53 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
+import hmac
 import os
+import re
+import secrets
+import shutil
+import subprocess
 import sys
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
+
+
+def _canonicalize_cpu_affinity_mask(values):
+    """Return a sorted immutable CPU mask, or ``None`` when malformed."""
+    try:
+        observed = tuple(values)
+    except (TypeError, ValueError):
+        return None
+    if not observed or any(type(cpu) is not int or cpu < 0 for cpu in observed):
+        return None
+    return tuple(sorted(set(observed)))
+
+
+def _capture_pre_numerical_cpu_affinity():
+    """Snapshot the launch CPU mask before a numerical runtime can bind it."""
+    try:
+        observed = os.sched_getaffinity(0)
+    except (AttributeError, OSError):
+        return None
+    return _canonicalize_cpu_affinity_mask(observed)
+
+
+_PRE_NUMERICAL_CPU_AFFINITY = _capture_pre_numerical_cpu_affinity()
+
+
+from ._early_numa import preconfigure_numa_from_argv
+
+
+_EARLY_NUMA_ATTESTATION = preconfigure_numa_from_argv(sys.argv[1:])
+
+try:
+    from ._native_build_config import RECOMMENDED_OMP_WAIT_POLICY
+except ImportError:
+    # A pure source checkout has no CMake-generated runtime description. Keep
+    # the conservative policy used by shared/pthread BLAS builds.
+    RECOMMENDED_OMP_WAIT_POLICY = "PASSIVE"
 
 
 def _preparse_num_threads_from_argv(argv):
@@ -49,6 +91,37 @@ def _set_thread_env_vars(num_threads):
 
     os.environ["OMP_DYNAMIC"] = "FALSE"
     os.environ["MKL_DYNAMIC"] = "FALSE"
+    # Install the build-specific policy during argv preparse, before either
+    # numerical runtime starts. Numerical teams must sleep during streamed
+    # Python/native reductions; otherwise an idle OpenMP BLAS team can consume
+    # the full allocation at its barrier. Explicit user settings remain
+    # authoritative.
+    os.environ.setdefault("OMP_WAIT_POLICY", RECOMMENDED_OMP_WAIT_POLICY)
+    if os.environ["OMP_WAIT_POLICY"].strip().upper() == "PASSIVE":
+        os.environ.setdefault("GOMP_SPINCOUNT", "0")
+    os.environ.setdefault("OPENBLAS_THREAD_TIMEOUT", "1")
+
+
+def _python_isolation_prefix():
+    """Recreate import/bytecode isolation for fresh internal workers."""
+    prefix = [sys.executable]
+    if bool(getattr(sys.flags, "isolated", 0)):
+        prefix.append("-I")
+    else:
+        if bool(getattr(sys.flags, "ignore_environment", 0)):
+            prefix.append("-E")
+        if bool(getattr(sys.flags, "no_user_site", 0)):
+            prefix.append("-s")
+        if bool(getattr(sys.flags, "safe_path", 0)):
+            prefix.append("-P")
+    if bool(getattr(sys.flags, "no_site", 0)):
+        prefix.append("-S")
+    if bool(getattr(sys.flags, "dont_write_bytecode", 0)):
+        prefix.append("-B")
+    optimize = int(getattr(sys.flags, "optimize", 0))
+    if optimize > 0:
+        prefix.append("-" + "O" * min(optimize, 2))
+    return prefix
 
 
 def _parse_mailman_mode(value):
@@ -68,11 +141,11 @@ _GXE_BATCH_REFERENCE_OPTIONS = frozenset(
         "--geno",
         "--env",
         "--gxe-env-cols",
+        "--gxe-parallel-environment-groups",
+        "--gxe-explicit-openmp-placement",
+        "--gxe-explicit-openmp-memory-scope",
         "--covar",
         "--annot",
-        "--_gxe-feature-cache",
-        "--_gxe-reference-shard",
-        "--_gxe-probe-offset",
         "--gxe-pheno",
         "--gxe-pheno-col",
         "--gxe-pheno-cols",
@@ -80,11 +153,9 @@ _GXE_BATCH_REFERENCE_OPTIONS = frozenset(
         "--gxe-kernel-mode",
         "--gxe-genotype-scale",
         "--gxe-native-backend",
+        "--gxe-fp64-layout",
         "--gxe-native-workspace-gib",
         "--gxe-native-target-panel-columns",
-        "--write-gxe-jackknife",
-        "--allow-low-probe-gxe-jackknife",
-        "--njack",
         "--nvecs",
         "--step_size",
         "--seed",
@@ -95,6 +166,7 @@ _GXE_BATCH_REFERENCE_OPTIONS = frozenset(
         "--impute-method",
         "--target-xz-mem",
         "--target-mem",
+        "--gxe-total-memory-gib",
         "--device",
     }
 )
@@ -131,9 +203,15 @@ import pandas as pd
 
 from . import utils
 from .logger import Logger
-from .ldscore.gw_ldscore import GenomewideLDScore, apply_env
+from .ldscore.gw_ldscore import (
+    GenomewideLDScore,
+    _validate_cpu_placement_attestation,
+    _validate_openmp_placement_build_contract,
+    apply_env,
+)
 from .ldscore.gwe_ldscore import GenomewideEnvLDScore
 from .ldscore.gxe_multi import (
+    combine_multi_environment_reference_batches,
     generate_multi_environment_references,
     safe_environment_suffix,
 )
@@ -165,7 +243,7 @@ _THREADPOOL_LIMITER = None
 
 def _apply_runtime_thread_cap(num_threads, log=None):
     if num_threads is None:
-        return
+        return False
 
     try:
         n = int(num_threads)
@@ -184,12 +262,14 @@ def _apply_runtime_thread_cap(num_threads, log=None):
         _THREADPOOL_LIMITER = threadpool_limits(limits=n)
         if log is not None:
             log._log(f"[threads] capped BLAS/OpenMP thread pools to {n} thread(s).")
+        return True
     except Exception as e:
         if log is not None:
             log._log(
                 f"[threads] requested --num-threads {n}; set common thread-count environment variables. "
                 f"Runtime threadpool cap unavailable ({e.__class__.__name__}: {e})."
             )
+        return False
 
 
 
@@ -312,40 +392,21 @@ def build_parser() -> argparse.ArgumentParser:
                         help="Maximum allowed GxE normal-equation condition number.")
     parser.add_argument("--allow-ill-conditioned-gxe", action="store_true", default=False,
                         help="Solve a poorly identified GxE system by least squares after reporting diagnostics.")
-    parser.add_argument(
-        "--_gxe-build-cache",
-        dest="_gxe_build_cache",
-        action="store_true",
-        default=False,
-        help=argparse.SUPPRESS,
-    )
-    parser.add_argument(
-        "--_gxe-feature-cache",
-        dest="_gxe_feature_cache",
-        default=None,
-        type=str,
-        help=argparse.SUPPRESS,
-    )
-    parser.add_argument(
-        "--_gxe-reference-shard",
-        dest="_gxe_reference_shard",
-        action="store_true",
-        default=False,
-        help=argparse.SUPPRESS,
+    # Legacy cache/shard attributes remain as inert internal defaults so old
+    # orchestration code fails at argument parsing instead of accidentally
+    # entering a disk-backed construction path.  There are intentionally no
+    # command-line options that can set them.
+    parser.set_defaults(
+        _gxe_build_cache=False,
+        _gxe_feature_cache=None,
+        _gxe_reference_shard=False,
+        _gxe_merge_shards=None,
     )
     parser.add_argument(
         "--_gxe-probe-offset",
         dest="_gxe_probe_offset",
         default=0,
         type=int,
-        help=argparse.SUPPRESS,
-    )
-    parser.add_argument(
-        "--_gxe-merge-shards",
-        dest="_gxe_merge_shards",
-        nargs="+",
-        default=None,
-        metavar="SHARD_JSON",
         help=argparse.SUPPRESS,
     )
     parser.add_argument(
@@ -561,8 +622,13 @@ def build_parser() -> argparse.ArgumentParser:
                         ))
     parser.add_argument("--nvecs", default=1000, type=int,
                         help="Number of random vectors for stochastic genome-wide LD scores.")
-    parser.add_argument("--step_size", default=1000, type=int,
-                        help="Step size for LD-score computation.")
+    parser.add_argument("--step_size", default=1000, type=_step_size_argument,
+                        help="Step size for LD-score computation. GxE reference "
+                             "generation also accepts 'auto', which picks a "
+                             "deterministic canonical block width from the "
+                             "variant count; the resolved value is recorded in "
+                             "the manifest and defines the finite-probe "
+                             "realization exactly like an explicit width.")
     parser.add_argument("--seed", default=None, type=int,
                         help="Random seed.")
     parser.add_argument("--covar", default=None, type=str,
@@ -578,22 +644,97 @@ def build_parser() -> argparse.ArgumentParser:
               "G+GxE+NxE+residual references while sharing streamed genotype reads. "
               "All columns must retain exactly the same complete-case cohort."),
     )
+    parser.add_argument(
+        "--gxe-parallel-environment-groups",
+        default="auto",
+        choices=["auto", "1", "2"],
+        help=(
+            "Run a large direct multi-environment reference as one group or as "
+            "two process-isolated, socket-local groups (default: auto)."
+        ),
+    )
+    parser.add_argument(
+        "--gxe-explicit-openmp-placement",
+        action="store_true",
+        default=False,
+        help=(
+            "Run a direct single-group multi-environment reference in a fresh "
+            "process with an explicit, verified socket-local OpenMP CPU "
+            "placement contract; requires --num-threads."
+        ),
+    )
+    parser.add_argument(
+        "--gxe-explicit-openmp-memory-scope",
+        default="selected-cpus",
+        choices=["selected-cpus", "selected-socket"],
+        help=(
+            "NUMA memory scope for --gxe-explicit-openmp-placement. The "
+            "default binds only nodes covered by the selected CPUs; "
+            "selected-socket binds the full verified NUMA-node set of that "
+            "same socket without changing CPU or OpenMP placement."
+        ),
+    )
+    parser.add_argument(
+        "--_gxe-multi-batch-manifest",
+        default=None,
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--_gxe-environment-group-worker",
+        action="store_true",
+        default=False,
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--_gxe-worker-cpus",
+        default=None,
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--_gxe-worker-auth-sha256",
+        default=None,
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--_gxe-log-path",
+        default=None,
+        help=argparse.SUPPRESS,
+    )
     parser.add_argument("--gxe-pheno", default=None, type=str,
                         help="Optional quantitative phenotype file; writes aligned marginal GWAS/GWIS scores and NxE moments.")
     parser.add_argument("--gxe-pheno-col", default=None, type=str,
                         help="Phenotype column name when --gxe-pheno contains more than one value column.")
     parser.add_argument("--gxe-missing-values", default="-9,NA,NaN,nan,.,None,null", type=str,
                         help="Comma-separated missing tokens for GxE environment, covariate, and phenotype inputs.")
-    parser.add_argument("--gxe-kernel-mode", default="standardized", choices=["standardized", "genie"],
-                        help=("Use SUMMIT partial-correlation kernels with post-projection feature normalization "
-                              "(default), or unnormalized projected GENIE-compatible kernels."))
+    parser.add_argument(
+        "--gxe-kernel-mode",
+        default="standardized",
+        choices=[
+            "standardized_projected", "raw_projected", "standardized", "genie"
+        ],
+        help=("Feature convention: post-projection per-variant standardization "
+              "(standardized_projected, default legacy alias: standardized) or "
+              "naturally scaled projected columns (raw_projected, legacy alias: genie)."),
+    )
     parser.add_argument("--gxe-genotype-scale", default=None, choices=["hwe", "sample"],
                         help=("Pre-projection genotype scaling. Defaults to sample scaling for standardized "
                               "SUMMIT kernels and HWE scaling for GENIE compatibility."))
     parser.add_argument(
         "--gxe-native-backend", default="python", choices=["python", "direct"],
-        help=("Opt-in direct C++ BED algebra for missing-free, phenotype-free, "
-              "K=1 standardized/sample GxE references. Python remains the default oracle."),
+        help=("Opt-in descriptor-owned C++ BED reference pipeline for "
+              "phenotype-free standardized/sample references with Rademacher "
+              "probes. The same native path handles one or multiple "
+              "environments; Python "
+              "remains the default oracle."),
+    )
+    parser.add_argument(
+        "--gxe-fp64-layout",
+        default="current",
+        choices=["current"],
+        help=(
+            "Production full-precision GEMM layout. Only the established "
+            "current column-major source and target path is accepted."
+        ),
     )
     parser.add_argument(
         "--gxe-native-workspace-gib", default=16.0, type=float,
@@ -604,17 +745,13 @@ def build_parser() -> argparse.ArgumentParser:
         help=("Temporary panel width for the generic native raw-source target method. "
               "The production opaque in-memory GxE target uses full-width GEMMs."),
     )
-    parser.add_argument("--write-gxe-jackknife", action="store_true", default=False,
-                        help=("Write block IDs for additive-analogous, block-local GxE "
-                              "LD-score jackknife SEs; uses --njack blocks and writes no sketches."))
-    parser.add_argument("--allow-low-probe-gxe-jackknife", action="store_true", default=False,
-                        help="Permit fewer than 100 probes for a diagnostic GxE jackknife despite unreliable Monte Carlo SEs.")
     parser.add_argument("--gxe-overwrite", action="store_true", default=False,
                         help="Explicitly permit replacement of existing fixed-prefix GxE generation or fit outputs.")
     parser.add_argument("--rand-dist", default="spherical", type=str, choices=["spherical", "gaussian", "normal", "rademacher"],
                         help="Distribution for randomized LD-score estimation.")
     parser.add_argument("--dtype", default="float32", type=str,
-                        help="dtype for LD-score computation.")
+                        help="Retained storage dtype for randomized probe/sketch panels. "
+                             "Annotation values, masses, and native arithmetic always stay binary64.")
     parser.add_argument("--rand-samp", default=None, type=str,
                         help="Random subset of samples: ratio in (0,1] or an integer count >100.")
     parser.add_argument("--ddof", default=1, type=int,
@@ -663,6 +800,15 @@ def build_parser() -> argparse.ArgumentParser:
         "--target-mem", type=utils.parse_memory_budget, default=None,
         help="Alias overriding --target-xz-mem with a GiB value or 'auto'.",
     )
+    parser.add_argument(
+        "--gxe-total-memory-gib",
+        type=utils.parse_memory_budget,
+        default="auto",
+        help=(
+            "Maximum modeled GxE process peak in GiB, or 'auto' (default). "
+            "This is independent of the sketch-panel budget."
+        ),
+    )
     parser.add_argument("--device", type=str, default="cpu",
                         help="Device for GWLD computation.")
     parser.add_argument("--use-tp32", action="store_true", default=False,
@@ -679,8 +825,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--malloc-mmap-threshold", type=int, default=131072)
     parser.add_argument("--numa-mode", default="interleave", choices=["interleave", "membind", "cpunodebind", "preferred"])
     parser.add_argument("--numa-nodes", default="all")
-    parser.add_argument("--force_affinity_all", default=True, type=str2bool,
-                        help="Expand CPU affinity to all online CPUs (true/false).")
+    parser.add_argument("--force_affinity_all", default=False, type=str2bool,
+                        help=(
+                            "Expand CPU affinity to all online CPUs (true/false; "
+                            "default false preserves taskset/scheduler placement)."
+                        ))
     parser.add_argument("--decode_threads_cap", default=32)
 
     return parser
@@ -759,8 +908,13 @@ def _log_cli_args(parser, args, log):
             opts_take_value.add(s)
 
     i = 0
+    sensitive_options = {"--_gxe-worker-auth-sha256"}
     while i < len(tokens):
         t = tokens[i]
+        token_option = t.split("=", 1)[0]
+        if any(option.startswith(token_option) for option in sensitive_options):
+            i += 1 if "=" in t else 2
+            continue
         if t.startswith("--") and "=" in t:
             log._log("\t" + t)
             i += 1
@@ -782,12 +936,14 @@ def _log_cli_args(parser, args, log):
     if _verbose_to_level(args.verbose) > 0:
         log._log(">>> Effective options")
         for k, v in sorted(vars(args).items()):
+            if k == "_gxe_worker_auth_sha256":
+                continue
             log._log(f"  {k} = {v!r}")
     log._log("=========================================================================='".replace("'", ""))
 
 
 def _make_low_level_env(args):
-    return {
+    low_level = {
         "num_threads": args.num_threads,
         "numa_mode": args.numa_mode,
         "numa_nodes": args.numa_nodes,
@@ -800,6 +956,16 @@ def _make_low_level_env(args):
         "force_affinity_all": args.force_affinity_all,
         "decode_threads_cap": args.decode_threads_cap,
     }
+    if getattr(args, "_gxe_group_worker_authenticated", False):
+        low_level.update(
+            {
+                "_gxe_group_worker_authenticated": True,
+                "_gxe_worker_cpu_ids": tuple(args._gxe_worker_cpu_ids),
+                "_gxe_cpu_placement": dict(args._gxe_cpu_placement),
+                "_gxe_cpu_placement_complete": True,
+            }
+        )
+    return low_level
 
 
 def _make_gxe_generator(args, log, verbose_on, low_level, *, env_col=None, out_path=None,
@@ -823,6 +989,7 @@ def _make_gxe_generator(args, log, verbose_on, low_level, *, env_col=None, out_p
         ddof=args.ddof,
         target_xz_mem=args.target_xz_mem,
         target_mem=args.target_mem,
+        gxe_total_memory_gib=getattr(args, "gxe_total_memory_gib", "auto"),
         device=args.device,
         impute_method=args.impute_method,
         kernel_mode=args.gxe_kernel_mode,
@@ -830,10 +997,7 @@ def _make_gxe_generator(args, log, verbose_on, low_level, *, env_col=None, out_p
         pheno_path=args.gxe_pheno,
         pheno_col=args.gxe_pheno_col,
         missing_values=tuple(x.strip() for x in args.gxe_missing_values.split(",") if x.strip()),
-        write_jackknife=args.write_gxe_jackknife,
-        jackknife_spec=args.njack,
         overwrite=args.gxe_overwrite,
-        allow_low_probe_jackknife=args.allow_low_probe_gxe_jackknife,
         probe_offset=args._gxe_probe_offset,
         feature_cache_path=args._gxe_feature_cache,
         shard_mode=args._gxe_reference_shard,
@@ -856,6 +1020,7 @@ def _dispatch_gxe_cache(args, log, verbose_on, low_level):
 
 
 def _dispatch_gxe_score(args, log):
+    _require_integer_step_size(args, "GxE phenotype scoring")
     columns = None
     if args.gxe_pheno_col is not None and args.gxe_pheno_cols is not None:
         raise SystemExit(
@@ -909,11 +1074,760 @@ def _dispatch_gxe_merge(args, log):
         args._gxe_merge_shards,
         feature_cache_path=args._gxe_feature_cache,
         output_prefix=args.out,
-        allow_low_probe_jackknife=args.allow_low_probe_gxe_jackknife,
     )
     log._log(
         f"[gxe:merge] merged {len(args._gxe_merge_shards)} disjoint shard(s) into {manifest}."
     )
+
+
+def _replace_long_option(tokens, option, value):
+    """Return argv with one long option set exactly once."""
+    result = []
+    index = 0
+    while index < len(tokens):
+        token = tokens[index]
+        if token == option:
+            index += 2
+            continue
+        if token.startswith(option + "="):
+            index += 1
+            continue
+        result.append(token)
+        index += 1
+    result.extend((option, str(value)))
+    return result
+
+
+_GXE_GROUP_WORKER_TOKEN_ENV = "SUMMIT_GXE_GROUP_WORKER_TOKEN"
+_GXE_OMP_AFFINITY_CONFLICTS = (
+    "GOMP_CPU_AFFINITY",
+    "KMP_AFFINITY",
+    "KMP_HW_SUBSET",
+    "KMP_PLACE_THREADS",
+    "OMP_NESTED",
+)
+_GXE_BLIS_AUTOMATIC_CONFLICTS = (
+    "BLIS_NT",
+    "BLIS_TI",
+    "BLIS_THREAD_IMPL",
+    "BLIS_JC_NT",
+    "BLIS_PC_NT",
+    "BLIS_IC_NT",
+    "BLIS_JR_NT",
+    "BLIS_IR_NT",
+    "BLIS_ARCH_TYPE",
+    "BLIS_ARCH_DEBUG",
+    "BLIS_PACK_A",
+    "BLIS_PACK_B",
+)
+
+
+@dataclass(frozen=True)
+class _GxeGroupWorkerCpuContract:
+    cpu_ids: tuple[int, ...]
+    threads: int
+
+
+def _canonical_omp_places(cpu_ids):
+    return ",".join(f"{{{int(cpu)}}}" for cpu in cpu_ids)
+
+
+def _parse_canonical_cpu_ranges(value):
+    text = str(value)
+    parsed = set()
+    try:
+        for component in text.split(","):
+            bounds = component.split("-", 1)
+            if not component or len(bounds) > 2:
+                raise ValueError
+            start = int(bounds[0])
+            stop = int(bounds[-1])
+            if start < 0 or stop < start:
+                raise ValueError
+            parsed.update(range(start, stop + 1))
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError("Internal GxE worker CPU list is malformed.") from exc
+    cpus = tuple(sorted(parsed))
+    if not cpus or _format_integer_ranges(cpus) != text:
+        raise RuntimeError("Internal GxE worker CPU list is not canonical.")
+    return cpus
+
+
+def _parse_canonical_kernel_integer_ranges(value):
+    """Parse a canonical Linux cpulist/nodelist, failing closed."""
+    text = str(value).strip()
+    parsed = set()
+    try:
+        for component in text.split(","):
+            bounds = component.split("-", 1)
+            if not component or len(bounds) > 2:
+                raise ValueError
+            start = int(bounds[0])
+            stop = int(bounds[-1])
+            if start < 0 or stop < start:
+                raise ValueError
+            parsed.update(range(start, stop + 1))
+    except (TypeError, ValueError):
+        return None
+    values = tuple(sorted(parsed))
+    if not values or _format_integer_ranges(values) != text:
+        return None
+    return values
+
+
+def _verified_full_socket_numa_nodes(
+    socket_id,
+    *,
+    node_root=Path("/sys/devices/system/node"),
+    cpu_root=Path("/sys/devices/system/cpu"),
+    process_status=Path("/proc/self/status"),
+):
+    """Resolve all online, process-allowed NUMA nodes for one CPU package."""
+    if type(socket_id) is not int or socket_id < 0:
+        return None
+    try:
+        online_nodes = _parse_canonical_kernel_integer_ranges(
+            (node_root / "online").read_text(encoding="utf-8")
+        )
+        status_lines = process_status.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return None
+    allowed_lines = [
+        line.split(":", 1)[1].strip()
+        for line in status_lines
+        if line.split(":", 1)[0] == "Mems_allowed_list"
+    ]
+    if online_nodes is None or len(allowed_lines) != 1:
+        return None
+    allowed_nodes = _parse_canonical_kernel_integer_ranges(allowed_lines[0])
+    if allowed_nodes is None:
+        return None
+
+    package_by_node = {}
+    for node in online_nodes:
+        try:
+            node_cpus = _parse_canonical_kernel_integer_ranges(
+                (node_root / f"node{node}" / "cpulist").read_text(
+                    encoding="utf-8"
+                )
+            )
+        except OSError:
+            return None
+        if node_cpus is None:
+            return None
+        packages = set()
+        for cpu in node_cpus:
+            try:
+                package_text = (
+                    cpu_root
+                    / f"cpu{cpu}"
+                    / "topology"
+                    / "physical_package_id"
+                ).read_text(encoding="utf-8").strip()
+                if not re.fullmatch(r"[0-9]+", package_text):
+                    return None
+                package = int(package_text)
+            except (OSError, ValueError):
+                return None
+            packages.add(package)
+        if len(packages) != 1:
+            return None
+        package_by_node[node] = packages.pop()
+
+    selected_nodes = tuple(
+        node for node in online_nodes if package_by_node[node] == socket_id
+    )
+    if not selected_nodes or not set(selected_nodes).issubset(allowed_nodes):
+        return None
+    return selected_nodes
+
+
+def _authenticate_gxe_group_worker(args):
+    raw_token = os.environ.pop(_GXE_GROUP_WORKER_TOKEN_ENV, None)
+    cpu_text = getattr(args, "_gxe_worker_cpus", None)
+    expected_digest = getattr(args, "_gxe_worker_auth_sha256", None)
+    if not args._gxe_environment_group_worker:
+        if cpu_text is not None or expected_digest is not None or raw_token is not None:
+            raise RuntimeError(
+                "Internal GxE group-worker credentials require the worker flag."
+            )
+        return None
+    if cpu_text is None or expected_digest is None or raw_token is None:
+        raise RuntimeError("Internal GxE group-worker authentication is incomplete.")
+    if not isinstance(expected_digest, str) or not re.fullmatch(
+        r"[0-9a-f]{64}", expected_digest
+    ):
+        raise RuntimeError("Internal GxE group-worker authentication hash is malformed.")
+    observed_digest = hashlib.sha256(raw_token.encode("utf-8")).hexdigest()
+    if not hmac.compare_digest(observed_digest, expected_digest):
+        raise RuntimeError("Internal GxE group-worker authentication failed.")
+    cpus = _parse_canonical_cpu_ranges(cpu_text)
+    if args.num_threads is None or int(args.num_threads) != len(cpus):
+        raise RuntimeError(
+            "Internal GxE worker threads disagree with its authenticated CPU list."
+        )
+    if (
+        args.gxe_native_backend != "direct"
+        or str(args.gxe_parallel_environment_groups) != "1"
+        or args.gxe_env_cols is None
+        or args._gxe_multi_batch_manifest is None
+    ):
+        raise RuntimeError(
+            "Authenticated GxE group workers require direct, single-group "
+            "multi-environment execution with a private batch manifest."
+        )
+    args._gxe_worker_auth_sha256 = None
+    return _GxeGroupWorkerCpuContract(cpu_ids=cpus, threads=len(cpus))
+
+
+def _validate_gxe_group_worker_openmp_environment(contract):
+    expected = {
+        "OMP_NUM_THREADS": str(contract.threads),
+        "OMP_THREAD_LIMIT": str(contract.threads),
+        "OMP_DYNAMIC": "FALSE",
+        "OMP_PROC_BIND": "SPREAD",
+        "OMP_PLACES": _canonical_omp_places(contract.cpu_ids),
+        "OMP_MAX_ACTIVE_LEVELS": "1",
+        "BLIS_NUM_THREADS": str(contract.threads),
+    }
+    disagreements = {
+        name: {"expected": value, "observed": os.environ.get(name)}
+        for name, value in expected.items()
+        if os.environ.get(name) != value
+    }
+    conflicts = [
+        name
+        for name in (
+            *_GXE_OMP_AFFINITY_CONFLICTS,
+            *_GXE_BLIS_AUTOMATIC_CONFLICTS,
+        )
+        if name in os.environ
+    ]
+    if disagreements or conflicts:
+        raise RuntimeError(
+            "Authenticated GxE group worker has a noncanonical threading environment: "
+            f"disagreements={disagreements}, conflicts={conflicts}."
+        )
+
+
+def _configure_gxe_group_worker_placement(contract, native_module=None):
+    _validate_gxe_group_worker_openmp_environment(contract)
+    if native_module is None:
+        from . import gxeldcore as native_module
+    configure = getattr(native_module, "configure_openmp_placement", None)
+    if not callable(configure):
+        raise RuntimeError(
+            "The direct GxE extension lacks the OpenMP placement contract API."
+        )
+    placement = _validate_cpu_placement_attestation(
+        dict(configure(list(contract.cpu_ids), contract.threads)),
+        expected_cpu_ids=contract.cpu_ids,
+        expected_threads=contract.threads,
+    )
+    _validate_openmp_placement_build_contract(native_module.build_info(), placement)
+    return placement
+
+
+def _validated_explicit_outer_cpu_affinity():
+    """Recover a launch mask narrowed only by canonical OpenMP binding."""
+    captured = _PRE_NUMERICAL_CPU_AFFINITY
+    if (
+        not isinstance(captured, tuple)
+        or _canonicalize_cpu_affinity_mask(captured) != captured
+    ):
+        raise RuntimeError(
+            "Explicit OpenMP placement requires a valid immutable "
+            "pre-numerical CPU-affinity capture."
+        )
+    try:
+        live = _canonicalize_cpu_affinity_mask(os.sched_getaffinity(0))
+    except (AttributeError, OSError):
+        live = None
+    if live is None:
+        raise RuntimeError(
+            "Explicit OpenMP placement requires a nonempty current CPU affinity."
+        )
+    if not set(live).issubset(captured):
+        raise RuntimeError(
+            "Current CPU affinity escapes the pre-numerical launch mask."
+        )
+    if live != captured:
+        threads = str(len(captured))
+        expected = {
+            "OMP_NUM_THREADS": threads,
+            "OMP_THREAD_LIMIT": threads,
+            "OMP_DYNAMIC": "FALSE",
+            "OMP_PROC_BIND": "SPREAD",
+            "OMP_PLACES": _canonical_omp_places(captured),
+            "OMP_MAX_ACTIVE_LEVELS": "1",
+        }
+        disagreements = {
+            name: {"expected": value, "observed": os.environ.get(name)}
+            for name, value in expected.items()
+            if os.environ.get(name) != value
+        }
+        if disagreements:
+            raise RuntimeError(
+                "A strict subset of the pre-numerical CPU-affinity mask is "
+                "trusted only with the canonical explicit OpenMP launcher "
+                f"contract; disagreements={disagreements}."
+            )
+    return captured
+
+
+def _socket_local_core_groups(*, allowed_cpu_ids=None):
+    """Return one allowed logical CPU per physical core, grouped by socket."""
+    if allowed_cpu_ids is None:
+        try:
+            allowed = _canonicalize_cpu_affinity_mask(os.sched_getaffinity(0))
+        except (AttributeError, OSError):
+            return []
+    else:
+        allowed = _canonicalize_cpu_affinity_mask(allowed_cpu_ids)
+    if allowed is None:
+        return []
+    physical = {}
+    node_by_cpu = {}
+    for cpu in allowed:
+        topology = Path(f"/sys/devices/system/cpu/cpu{cpu}/topology")
+        try:
+            package = int((topology / "physical_package_id").read_text().strip())
+            core = int((topology / "core_id").read_text().strip())
+        except (OSError, ValueError):
+            return []
+        if package < 0 or core < 0:
+            return []
+        physical.setdefault((package, core), cpu)
+        node_paths = sorted(Path(f"/sys/devices/system/cpu/cpu{cpu}").glob("node[0-9]*"))
+        if len(node_paths) != 1:
+            return []
+        try:
+            node_by_cpu[cpu] = int(node_paths[0].name[4:])
+        except ValueError:
+            return []
+        if node_by_cpu[cpu] < 0:
+            return []
+    by_socket = {}
+    for (package, _core), cpu in sorted(physical.items()):
+        record = by_socket.setdefault(package, {"cpus": [], "nodes": set()})
+        record["cpus"].append(cpu)
+        record["nodes"].add(node_by_cpu[cpu])
+    return [
+        {
+            "socket": package,
+            "cpus": tuple(sorted(record["cpus"])),
+            "nodes": tuple(sorted(record["nodes"])),
+            "node_by_cpu": {
+                cpu: node_by_cpu[cpu] for cpu in sorted(record["cpus"])
+            },
+        }
+        for package, record in sorted(by_socket.items())
+        if record["cpus"] and record["nodes"]
+    ]
+
+
+def _format_integer_ranges(values):
+    ordered = sorted(set(int(value) for value in values))
+    ranges = []
+    start = previous = ordered[0]
+    for value in ordered[1:]:
+        if value == previous + 1:
+            previous = value
+            continue
+        ranges.append(str(start) if start == previous else f"{start}-{previous}")
+        start = previous = value
+    ranges.append(str(start) if start == previous else f"{start}-{previous}")
+    return ",".join(ranges)
+
+
+def _validate_explicit_openmp_placement_request(args):
+    explicit_placement = bool(
+        getattr(args, "gxe_explicit_openmp_placement", False)
+    )
+    memory_scope = getattr(
+        args, "gxe_explicit_openmp_memory_scope", "selected-cpus"
+    )
+    if memory_scope not in {"selected-cpus", "selected-socket"}:
+        raise ValueError(
+            "--gxe-explicit-openmp-memory-scope must be selected-cpus or "
+            "selected-socket."
+        )
+    if memory_scope != "selected-cpus" and not explicit_placement:
+        raise ValueError(
+            "--gxe-explicit-openmp-memory-scope=selected-socket requires "
+            "--gxe-explicit-openmp-placement."
+        )
+    if not explicit_placement:
+        return
+    valid = (
+        getattr(args, "gxe_native_backend", None) == "direct"
+        and str(getattr(args, "gxe_parallel_environment_groups", "")) == "1"
+        and getattr(args, "geno", None) is not None
+        and getattr(args, "env", None) is not None
+        and getattr(args, "gxe_env_cols", None) is not None
+        and type(getattr(args, "num_threads", None)) is int
+        and args.num_threads > 0
+        and not bool(getattr(args, "_gxe_build_cache", False))
+        and getattr(args, "gxe_score_reference", None) is None
+        and getattr(args, "_gxe_merge_shards", None) is None
+        and getattr(args, "gxe_fit", None) is None
+        and getattr(args, "gxe_fit_batch", None) is None
+    )
+    if not valid:
+        raise ValueError(
+            "--gxe-explicit-openmp-placement is valid only for direct "
+            "multi-environment reference construction with "
+            "--gxe-parallel-environment-groups=1 and an explicit positive "
+            "--num-threads."
+        )
+
+
+def _verified_physical_cpu_inventory(sockets):
+    cpu_to_node = {}
+    for record in sockets:
+        cpus = record.get("cpus") if isinstance(record, dict) else None
+        nodes = record.get("nodes") if isinstance(record, dict) else None
+        node_by_cpu = (
+            record.get("node_by_cpu") if isinstance(record, dict) else None
+        )
+        if (
+            not isinstance(cpus, tuple)
+            or not cpus
+            or any(type(cpu) is not int or cpu < 0 for cpu in cpus)
+            or tuple(sorted(set(cpus))) != cpus
+            or not isinstance(nodes, tuple)
+            or not nodes
+            or any(type(node) is not int or node < 0 for node in nodes)
+            or tuple(sorted(set(nodes))) != nodes
+            or not isinstance(node_by_cpu, dict)
+            or any(type(cpu) is not int or cpu < 0 for cpu in node_by_cpu)
+            or set(node_by_cpu) != set(cpus)
+            or set(node_by_cpu.values()) != set(nodes)
+            or any(type(node) is not int or node < 0 for node in node_by_cpu.values())
+            or set(cpus) & set(cpu_to_node)
+        ):
+            return None
+        cpu_to_node.update(node_by_cpu)
+    if not cpu_to_node:
+        return None
+    return tuple(sorted(cpu_to_node)), cpu_to_node
+
+
+def _parallel_environment_layout(args, columns):
+    requested = str(args.gxe_parallel_environment_groups)
+    explicit_single_group = bool(
+        getattr(args, "gxe_explicit_openmp_placement", False)
+    )
+    memory_scope = getattr(
+        args, "gxe_explicit_openmp_memory_scope", "selected-cpus"
+    )
+    if memory_scope not in {"selected-cpus", "selected-socket"}:
+        raise RuntimeError(
+            "Explicit OpenMP memory scope must be selected-cpus or "
+            "selected-socket."
+        )
+    if memory_scope != "selected-cpus" and not explicit_single_group:
+        raise RuntimeError(
+            "A nondefault explicit OpenMP memory scope requires explicit "
+            "single-group placement."
+        )
+    if args._gxe_environment_group_worker:
+        return None
+    if requested == "1" and not explicit_single_group:
+        return None
+    if explicit_single_group:
+        allowed_cpu_ids = _validated_explicit_outer_cpu_affinity()
+        sockets = _socket_local_core_groups(allowed_cpu_ids=allowed_cpu_ids)
+        if (
+            requested != "1"
+            or args.gxe_native_backend != "direct"
+            or len(columns) < 2
+        ):
+            raise RuntimeError(
+                "Explicit OpenMP placement requires a direct single-group "
+                "multi-environment reference."
+            )
+        if _verified_physical_cpu_inventory(sockets) is None:
+            raise RuntimeError(
+                "Explicit OpenMP placement requires complete allowed physical "
+                "CPU and NUMA topology."
+            )
+        if memory_scope == "selected-socket":
+            socket_ids = tuple(record.get("socket") for record in sockets)
+            if (
+                any(
+                    type(socket_id) is not int or socket_id < 0
+                    for socket_id in socket_ids
+                )
+                or len(set(socket_ids)) != len(socket_ids)
+            ):
+                raise RuntimeError(
+                    "Full-socket NUMA scope requires unambiguous physical "
+                    "CPU package identities."
+                )
+        if type(args.num_threads) is not int or args.num_threads <= 0:
+            raise RuntimeError(
+                "Explicit OpenMP placement requires an explicit positive thread count."
+            )
+        requested_threads = args.num_threads
+        selected_socket = next(
+            (
+                record
+                for record in sockets
+                if len(record["cpus"]) >= requested_threads
+            ),
+            None,
+        )
+        if selected_socket is None:
+            raise RuntimeError(
+                "Explicit OpenMP placement cannot satisfy the requested thread "
+                "count from one verified physical CPU socket."
+            )
+        selected_cpus = tuple(selected_socket["cpus"][:requested_threads])
+        if memory_scope == "selected-socket":
+            selected_nodes = _verified_full_socket_numa_nodes(
+                selected_socket["socket"]
+            )
+            if (
+                selected_nodes is None
+                or not set(selected_socket["nodes"]).issubset(selected_nodes)
+            ):
+                raise RuntimeError(
+                    "Full-socket NUMA scope requires a complete, unambiguous "
+                    "online socket topology within the process memory-node "
+                    "allowlist."
+                )
+        else:
+            selected_nodes = tuple(
+                sorted(
+                    {
+                        selected_socket["node_by_cpu"][cpu]
+                        for cpu in selected_cpus
+                    }
+                )
+            )
+        return (
+            {
+                "columns": tuple(columns),
+                "cpus": selected_cpus,
+                "nodes": selected_nodes,
+                "threads": requested_threads,
+            },
+        )
+    sockets = _socket_local_core_groups()
+    total_available = sum(len(record["cpus"]) for record in sockets[:2])
+    requested_threads = (
+        total_available if args.num_threads is None else int(args.num_threads)
+    )
+    eligible = (
+        args.gxe_native_backend == "direct"
+        and len(columns) >= 4
+        and len(sockets) >= 2
+        and bool(sockets[0]["nodes"])
+        and bool(sockets[1]["nodes"])
+        and set(sockets[0]["cpus"]).isdisjoint(sockets[1]["cpus"])
+        and set(sockets[0]["nodes"]).isdisjoint(sockets[1]["nodes"])
+        and all(
+            isinstance(record.get("node_by_cpu"), dict)
+            and set(record["node_by_cpu"]) == set(record["cpus"])
+            and set(record["node_by_cpu"].values()) == set(record["nodes"])
+            for record in sockets[:2]
+        )
+        and min(len(record["cpus"]) for record in sockets[:2]) >= 8
+        and requested_threads >= 32
+    )
+    if requested == "auto" and not eligible:
+        return None
+    if requested == "2" and not eligible:
+        raise RuntimeError(
+            "Two GxE environment groups require the direct backend, at least four "
+            "environments, at least two allowed CPU sockets with eight physical "
+            "cores each, and at least 32 total requested threads."
+        )
+    if requested == "2" and requested_threads > total_available:
+        raise RuntimeError(
+            "Two GxE environment groups cannot satisfy the requested thread "
+            "count from the verified allowed physical cores."
+        )
+    total_threads = min(requested_threads, total_available)
+    first_threads = min(len(sockets[0]["cpus"]), (total_threads + 1) // 2)
+    second_threads = min(len(sockets[1]["cpus"]), total_threads - first_threads)
+    unassigned = total_threads - first_threads - second_threads
+    if unassigned:
+        additional_first = min(
+            len(sockets[0]["cpus"]) - first_threads, unassigned
+        )
+        first_threads += additional_first
+        unassigned -= additional_first
+    if unassigned:
+        additional_second = min(
+            len(sockets[1]["cpus"]) - second_threads, unassigned
+        )
+        second_threads += additional_second
+        unassigned -= additional_second
+    if min(first_threads, second_threads) < 1 or unassigned:
+        if requested == "2":
+            raise RuntimeError("Could not allocate threads to both GxE socket groups.")
+        return None
+    split = (len(columns) + 1) // 2
+    column_groups = (columns[:split], columns[split:])
+    layout = []
+    for group, socket, threads in zip(
+        column_groups, sockets[:2], (first_threads, second_threads), strict=True
+    ):
+        cpus = tuple(socket["cpus"][:threads])
+        nodes = tuple(sorted({socket["node_by_cpu"][cpu] for cpu in cpus}))
+        if not nodes:
+            if requested == "2":
+                raise RuntimeError(
+                    "Could not resolve NUMA nodes for a GxE socket group."
+                )
+            return None
+        layout.append(
+            {
+                "columns": group,
+                "cpus": cpus,
+                "nodes": nodes,
+                "threads": threads,
+            }
+        )
+    return tuple(layout)
+
+
+def _dispatch_parallel_gxe_environment_groups(args, columns, layout, log):
+    canonical_manifest = Path(
+        args._gxe_multi_batch_manifest or f"{args.out}.gxe.multi.json"
+    ).expanduser().resolve()
+    if canonical_manifest.exists():
+        raise FileExistsError(
+            f"Refusing existing multi-environment manifest: {canonical_manifest}."
+        )
+    base_tokens = list(sys.argv[1:])
+    processes = []
+    group_manifests = []
+    try:
+        for index, record in enumerate(layout):
+            group_manifest = Path(
+                f"{args.out}.group{index}.gxe.multi.json"
+            ).expanduser().resolve()
+            group_log = Path(f"{args.out}.group{index}.gxe.log").expanduser().resolve()
+            for target in (group_manifest, group_log):
+                if target.exists() or target.is_symlink():
+                    raise FileExistsError(f"Refusing existing group output: {target}.")
+            tokens = _replace_long_option(
+                base_tokens, "--gxe-env-cols", ",".join(record["columns"])
+            )
+            tokens = _replace_long_option(
+                tokens, "--gxe-parallel-environment-groups", "1"
+            )
+            tokens = _replace_long_option(tokens, "--num-threads", record["threads"])
+            tokens = _replace_long_option(tokens, "--force_affinity_all", "false")
+            tokens = _replace_long_option(
+                tokens, "--_gxe-multi-batch-manifest", group_manifest
+            )
+            tokens = _replace_long_option(tokens, "--_gxe-log-path", group_log)
+            raw_token = secrets.token_urlsafe(32)
+            authentication_digest = hashlib.sha256(
+                raw_token.encode("utf-8")
+            ).hexdigest()
+            tokens = _replace_long_option(
+                tokens,
+                "--_gxe-worker-cpus",
+                _format_integer_ranges(record["cpus"]),
+            )
+            tokens = _replace_long_option(
+                tokens,
+                "--_gxe-worker-auth-sha256",
+                authentication_digest,
+            )
+            if "--_gxe-environment-group-worker" not in tokens:
+                tokens.append("--_gxe-environment-group-worker")
+            if record["nodes"]:
+                tokens = _replace_long_option(tokens, "--numa-mode", "membind")
+                tokens = _replace_long_option(
+                    tokens, "--numa-nodes", _format_integer_ranges(record["nodes"])
+                )
+            command = [
+                shutil.which("taskset") or "taskset",
+                "-c",
+                _format_integer_ranges(record["cpus"]),
+                *_python_isolation_prefix(),
+                "-m",
+                "summit.cli",
+                *tokens,
+            ]
+            environment = os.environ.copy()
+            for name in (
+                "OMP_NUM_THREADS", "OMP_THREAD_LIMIT", "OPENBLAS_NUM_THREADS",
+                "MKL_NUM_THREADS", "BLIS_NUM_THREADS", "VECLIB_MAXIMUM_THREADS",
+                "NUMEXPR_NUM_THREADS",
+            ):
+                environment[name] = str(record["threads"])
+            environment["OMP_DYNAMIC"] = "FALSE"
+            environment["OMP_WAIT_POLICY"] = "PASSIVE"
+            environment["GOMP_SPINCOUNT"] = "0"
+            environment["OMP_PROC_BIND"] = "SPREAD"
+            environment["OMP_PLACES"] = _canonical_omp_places(record["cpus"])
+            environment["OMP_MAX_ACTIVE_LEVELS"] = "1"
+            for name in _GXE_OMP_AFFINITY_CONFLICTS:
+                environment.pop(name, None)
+            for name in _GXE_BLIS_AUTOMATIC_CONFLICTS:
+                environment.pop(name, None)
+            environment[_GXE_GROUP_WORKER_TOKEN_ENV] = raw_token
+            # A parent sentinel is meaningful only for the parent's outer
+            # invocation. Each socket worker must establish its own policy.
+            environment.pop("SUMMIT_NUMACTL_WRAPPED", None)
+            log._log(
+                f"[gxe:multi:parallel] group {index}: environments="
+                f"{list(record['columns'])}; CPUs={_format_integer_ranges(record['cpus'])}; "
+                f"NUMA nodes={_format_integer_ranges(record['nodes']) if record['nodes'] else 'local'}; "
+                f"threads={record['threads']}."
+            )
+            processes.append(subprocess.Popen(command, env=environment))
+            group_manifests.append(group_manifest)
+
+        failed = None
+        while processes:
+            remaining = []
+            for process in processes:
+                status = process.poll()
+                if status is None:
+                    remaining.append(process)
+                elif status != 0 and failed is None:
+                    failed = status
+            if failed is not None:
+                for process in remaining:
+                    process.terminate()
+                for process in remaining:
+                    process.wait()
+                raise RuntimeError(
+                    f"A socket-isolated GxE environment group exited with status {failed}."
+                )
+            processes = remaining
+            if processes:
+                import time
+                time.sleep(1.0)
+    except BaseException:
+        for process in processes:
+            if process.poll() is None:
+                process.terminate()
+        for process in processes:
+            process.wait()
+        raise
+
+    manifest = combine_multi_environment_reference_batches(
+        group_manifests,
+        batch_manifest=canonical_manifest,
+        environment_order=columns,
+        require_cpu_placement=True,
+        expected_cpu_groups=[record["cpus"] for record in layout],
+        expected_numa_groups=[record["nodes"] for record in layout],
+    )
+    log._log(
+        f"[gxe:multi:parallel] published {len(columns)} references through "
+        f"canonical batch manifest {manifest}."
+    )
+    return manifest
 
 
 def _dispatch_gxe_multi_reference(args, log, verbose_on, low_level):
@@ -930,6 +1844,21 @@ def _dispatch_gxe_multi_reference(args, log, verbose_on, low_level):
         raise ValueError(
             "--gxe-env-cols names collide after filename normalization."
         )
+
+    layout = _parallel_environment_layout(args, columns)
+    if (
+        bool(getattr(args, "gxe_explicit_openmp_placement", False))
+        and getattr(args, "_gxe_group_worker_authenticated", False) is not True
+        and not layout
+    ):
+        raise RuntimeError(
+            "Explicit single-group OpenMP placement did not produce its "
+            "mandatory fresh-worker layout; a nonempty layout is required "
+            "before dispatch, and in-process estimator construction is refused."
+        )
+    if layout is not None:
+        _dispatch_parallel_gxe_environment_groups(args, columns, layout, log)
+        return
 
     estimators = []
     try:
@@ -949,8 +1878,11 @@ def _dispatch_gxe_multi_reference(args, log, verbose_on, low_level):
             )
         manifest = generate_multi_environment_references(
             estimators,
-            batch_manifest=f"{args.out}.gxe.multi.json",
+            batch_manifest=(
+                args._gxe_multi_batch_manifest or f"{args.out}.gxe.multi.json"
+            ),
             requested_backend=args.gxe_native_backend,
+            full_precision_layout=args.gxe_fp64_layout,
         )
         log._log(
             f"[gxe:multi] wrote {len(estimators)} independent references and "
@@ -979,9 +1911,36 @@ def _dispatch_ldscore(args, log, verbose_on, low_level):
             _dispatch_gxe_multi_reference(args, log, verbose_on, low_level)
             return
         log._log(f">>> LD score mode: genome-wide GxE cross/interaction LD scores, --env {args.env}")
-        gwe = _make_gxe_generator(args, log, verbose_on, low_level)
+        unified_native_reference = bool(
+            args.gxe_native_backend == "direct"
+            and args.gxe_pheno is None
+            and args._gxe_feature_cache is None
+            and not args._gxe_reference_shard
+        )
+        gwe = _make_gxe_generator(
+            args,
+            log,
+            verbose_on,
+            low_level,
+            native_backend=("python" if unified_native_reference else None),
+        )
         try:
-            gwe._compute_ldscore()
+            if unified_native_reference:
+                manifest = generate_multi_environment_references(
+                    [gwe],
+                    batch_manifest=(
+                        args._gxe_multi_batch_manifest
+                        or f"{args.out}.gxe.multi.json"
+                    ),
+                    requested_backend="direct",
+                    full_precision_layout=args.gxe_fp64_layout,
+                )
+                log._log(
+                    "[gxe:native] wrote the single-environment reference "
+                    f"through the unified descriptor-owned pipeline: {manifest}."
+                )
+            else:
+                gwe._compute_ldscore()
         finally:
             gwe.close()
         return
@@ -996,6 +1955,7 @@ def _dispatch_ldscore(args, log, verbose_on, low_level):
             log._log("!!! --ld-wind-kb must be finite and positive !!!")
             raise SystemExit(1)
         log._log(f">>> LD score mode: windowed, --ld-wind-kb {args.ld_wind_kb}")
+        _require_integer_step_size(args, "windowed LD scores")
         winld = WindowedLDScore(
             bed_path=args.geno,
             annot_path=args.annot,
@@ -1021,6 +1981,7 @@ def _dispatch_ldscore(args, log, verbose_on, low_level):
             winld.close()
         return
 
+    _require_integer_step_size(args, "genome-wide additive LD scores")
     gwld = GenomewideLDScore(
         bed_path=args.geno,
         annot_path=args.annot,
@@ -1767,9 +2728,40 @@ def _dispatch_make_rg_manifest(args, log):
     )
 
 
+def _step_size_argument(text):
+    """Parse --step_size as a positive integer or the literal 'auto'."""
+    value = str(text).strip().lower()
+    if value == "auto":
+        return "auto"
+    return int(text)
+
+
+def _require_integer_step_size(args, command: str) -> None:
+    if getattr(args, "step_size", None) == "auto":
+        raise ValueError(
+            f"--step_size auto is only supported for GxE reference "
+            f"generation; {command} requires an explicit integer step size."
+        )
+
+
 def main():
     parser = build_parser()
     args = parser.parse_args()
+    try:
+        _validate_explicit_openmp_placement_request(args)
+    except ValueError as exc:
+        parser.error(str(exc))
+    worker_contract = _authenticate_gxe_group_worker(args)
+    args._gxe_group_worker_authenticated = worker_contract is not None
+    args._gxe_worker_cpu_ids = None
+    args._gxe_cpu_placement = None
+    args._gxe_cpu_placement_complete = False
+    if worker_contract is not None:
+        args._gxe_worker_cpu_ids = worker_contract.cpu_ids
+        args._gxe_cpu_placement = _configure_gxe_group_worker_placement(
+            worker_contract
+        )
+        args._gxe_cpu_placement_complete = True
     args.rand_samp = _parse_rand_samp(args.rand_samp)
 
     verbose_level = _verbose_to_level(args.verbose)
@@ -1940,7 +2932,6 @@ def main():
                 ".gxx.ldscore.gz", ".gxe.ldscore.gz", ".exg.ldscore.gz", ".gee.ldscore.gz",
                 ".gxe.diag.tsv.gz", ".gxe.ref.json",
             ]
-            suffixes.append(".gxe.jackknife.npz")
         elif gxe_fit_batch_mode:
             # Trait-specific pairs are reserved transactionally by write_fits().
             suffixes = []
@@ -1954,8 +2945,6 @@ def main():
                 suffixes.extend([".gxe.diag.tsv.gz", ".gxe.ref.json"])
                 if args.gxe_pheno is not None:
                     suffixes.extend([".gxe.gwas.tsv.gz", ".gxe.gwis.tsv.gz", ".gxe.moments.json"])
-            if args.write_gxe_jackknife and args._gxe_reference_shard:
-                suffixes.append(".gxe.jackknife.npz")
         else:
             suffixes = [".gxe.results.tsv", ".gxe.fit.json"]
         existing = [args.out + suffix for suffix in suffixes if Path(args.out + suffix).exists()]
@@ -1971,13 +2960,27 @@ def main():
         log.attach_file(str(Path(args.out) / "batch.log"))
     else:
         log_suffix = (".gxe.log" if gxe_workflow_mode else (".win.log" if (args.geno and args.ld_wind_kb is not None) else (".gw.log" if args.geno else ".log")))
-        log_path = args.out + log_suffix
+        log_path = args._gxe_log_path or (args.out + log_suffix)
         log.attach_file(log_path, mode=("w" if (gxe_workflow_mode and args.gxe_overwrite) else "a"))
 
-    _apply_runtime_thread_cap(args.num_threads, log=log)
-
-    low_level = _make_low_level_env(args)
-    apply_env(low_level)
+    explicit_outer_dispatch = bool(args.gxe_explicit_openmp_placement) and (
+        worker_contract is None
+    )
+    if explicit_outer_dispatch:
+        # This outer controller performs no numerical work. In particular, it
+        # must retain the pre-import launch mask until it has derived and
+        # authenticated the fresh worker's CPU placement.
+        low_level = None
+    else:
+        low_level = _make_low_level_env(args)
+        low_level["_runtime_threadpool_capped"] = _apply_runtime_thread_cap(
+            args.num_threads, log=log
+        )
+        actual_runtime_threads = apply_env(low_level)
+        # Constructors receive the same settings for provenance and derived
+        # decoder controls, but must not resize process-global numerical pools.
+        low_level["_runtime_preconfigured"] = True
+        low_level["_actual_runtime_threads"] = actual_runtime_threads
 
     _log_cli_args(parser, args, log)
 

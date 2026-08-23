@@ -1,0 +1,11 @@
+{
+  "boundary_convention": "lower_inclusive_upper_exclusive_final_upper_closed",
+  "kind": "summit.context.maf_ld_partition_config",
+  "ld_score_edges": [0.0, 5.0, 15.0, 50.0, 1000000.0],
+  "maf_edges": [0.0, 0.05, 0.2, 0.5],
+  "ordering": "maf_major_then_ld_score_minor",
+  "require_balanced_loo_groups": true,
+  "schema_version": 1,
+  "source": "external_reference_panel_maf_ld_v1",
+  "unassigned_policy": "error"
+}

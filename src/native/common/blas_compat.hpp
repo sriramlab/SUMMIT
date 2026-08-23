@@ -10,6 +10,10 @@ extern "C" {
 // CMake should define ACCELERATE_NEW_LAPACK to avoid deprecation warnings.
   #include <Accelerate/Accelerate.h>
 
+#elif defined(GWLDCORE_USE_BLIS)
+// ---- Upstream BLIS, using the attested installed header directly ----
+  #include <blis/cblas.h>
+
 #elif defined(GWLDCORE_USE_GENERIC_CBLAS)
 // ---- Generic CBLAS (OpenBLAS / Netlib) ----
   #include <cblas.h>

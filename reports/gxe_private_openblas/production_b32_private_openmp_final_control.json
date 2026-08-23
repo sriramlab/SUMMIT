@@ -1,0 +1,278 @@
+{
+  "arguments": {
+    "blas_threads": 32,
+    "decode_threads": 32,
+    "jackknife_blocks": 100,
+    "m": 1207,
+    "max_abs_error": 1e-05,
+    "n": 291273,
+    "probe_counts": [
+      32
+    ],
+    "repeats": 1,
+    "scratch_gib": 64.0,
+    "scratch_model_n": 300000,
+    "seed": 20260809,
+    "skip_materialized": true,
+    "step_size": 500,
+    "stress_repeats": 0,
+    "target_panel_columns": 64,
+    "warmups": 0,
+    "workspace_gib": 16.0
+  },
+  "cases": [
+    {
+      "B": 32,
+      "actual_target_columns_2b": 64,
+      "actual_target_columns_4b": 128,
+      "correctness": {
+        "abft_repaired_output_columns": 0,
+        "fresh_decode_input_retries": 0,
+        "max_abs_source_error": 2.334061832698353e-10,
+        "max_abs_target_2b_error": 2.2822641767561436e-06,
+        "max_abs_target_4b_error": 2.2822641767561436e-06,
+        "max_source_projection_leakage": 4.9507112796743084e-18,
+        "stress_source_errors": [],
+        "stress_source_repeat_deltas": [],
+        "stress_target_2b_errors": [],
+        "stress_target_2b_repeat_deltas": [],
+        "stress_target_4b_errors": [],
+        "stress_target_4b_repeat_deltas": [],
+        "threshold": 1e-05
+      },
+      "production_scratch_model": {
+        "configured_limit_bytes": 68719476736,
+        "dtype": "float64",
+        "jackknife_blocks": 100,
+        "monolithic_bytes": 15360000000,
+        "n": 300000,
+        "peak_one_block_mapped_bytes": 153600000,
+        "peak_tile_bytes": 15360000000,
+        "peak_tile_gib": 14.30511474609375,
+        "probe_tiles": [
+          [
+            0,
+            32
+          ]
+        ]
+      },
+      "timings_seconds": {
+        "dense_gemm_lower_bound_source": {
+          "maximum": 0.6246659890166484,
+          "median": 0.6246659890166484,
+          "minimum": 0.6246659890166484,
+          "raw": [
+            0.6246659890166484
+          ]
+        },
+        "dense_gemm_lower_bound_target_2b": {
+          "maximum": 0.8440046490286477,
+          "median": 0.8440046490286477,
+          "minimum": 0.8440046490286477,
+          "raw": [
+            0.8440046490286477
+          ]
+        },
+        "dense_gemm_lower_bound_target_4b": {
+          "maximum": 2.539183784974739,
+          "median": 2.539183784974739,
+          "minimum": 2.539183784974739,
+          "raw": [
+            2.539183784974739
+          ]
+        },
+        "native_feature": {
+          "maximum": 0.8220676340279169,
+          "median": 0.8220676340279169,
+          "minimum": 0.8220676340279169,
+          "raw": [
+            0.8220676340279169
+          ]
+        },
+        "native_prepare_projected_2b": {
+          "maximum": 0.07716752402484417,
+          "median": 0.07716752402484417,
+          "minimum": 0.07716752402484417,
+          "raw": [
+            0.07716752402484417
+          ]
+        },
+        "native_prepare_projected_block_2b": {
+          "maximum": 0.07889490900561213,
+          "median": 0.07889490900561213,
+          "minimum": 0.07889490900561213,
+          "raw": [
+            0.07889490900561213
+          ]
+        },
+        "native_source": {
+          "maximum": 0.6380973790073767,
+          "median": 0.6380973790073767,
+          "minimum": 0.6380973790073767,
+          "raw": [
+            0.6380973790073767
+          ]
+        },
+        "native_target_2b": {
+          "maximum": 0.8635818650363944,
+          "median": 0.8635818650363944,
+          "minimum": 0.8635818650363944,
+          "raw": [
+            0.8635818650363944
+          ]
+        },
+        "native_target_4b": {
+          "maximum": 1.8420628819731064,
+          "median": 1.8420628819731064,
+          "minimum": 1.8420628819731064,
+          "raw": [
+            1.8420628819731064
+          ]
+        }
+      }
+    }
+  ],
+  "contracts": {
+    "legacy_mailman_exact_gxe_eligible": false,
+    "legacy_mailman_limitation": "diagnostic additive GRM only; HWE decoder and no interaction source/W-left API",
+    "source": "explicit Python Philox probes; [Ux,Uw]=2B float64 columns",
+    "target_global": "opaque context-bound projected panel, width=2B",
+    "target_jackknife": "opaque global+block panels, total width=4B"
+  },
+  "dense_feature_timing_seconds": {
+    "maximum": 22.535806020954624,
+    "median": 22.535806020954624,
+    "minimum": 22.535806020954624,
+    "raw": [
+      22.535806020954624
+    ]
+  },
+  "provenance": {
+    "affinity": [
+      64,
+      65,
+      66,
+      67,
+      68,
+      69,
+      70,
+      71,
+      72,
+      73,
+      74,
+      75,
+      76,
+      77,
+      78,
+      79,
+      80,
+      81,
+      82,
+      83,
+      84,
+      85,
+      86,
+      87,
+      88,
+      89,
+      90,
+      91,
+      92,
+      93,
+      94,
+      95
+    ],
+    "argv": [
+      "scripts/gxe/benchmark_native.py",
+      "--n",
+      "291273",
+      "--m",
+      "1207",
+      "--probe-counts",
+      "32",
+      "--repeats",
+      "1",
+      "--warmups",
+      "0",
+      "--decode-threads",
+      "32",
+      "--blas-threads",
+      "32",
+      "--step-size",
+      "500",
+      "--target-panel-columns",
+      "64",
+      "--workspace-gib",
+      "16",
+      "--jackknife-blocks",
+      "100",
+      "--scratch-gib",
+      "64",
+      "--scratch-model-n",
+      "300000",
+      "--max-abs-error",
+      "1e-5",
+      "--stress-repeats",
+      "0",
+      "--skip-legacy",
+      "--skip-materialized",
+      "--json",
+      "reports/gxe_private_openblas/production_b32_private_openmp_final_control.json"
+    ],
+    "cpu_count": 128,
+    "hostname": "Tabla",
+    "machine": "x86_64",
+    "native_binary": "/tmp/summit-stage-openmp-final2.0j4PIk/summit/gxeldcore.cpython-312-x86_64-linux-gnu.so",
+    "native_binary_sha256": "2089f4146d0474e9fd7d925e73a445db7ab527f239afba4af04ad83d6400fd93",
+    "native_build": {
+      "api_version": 4,
+      "architecture_tuning": "-march=native",
+      "backend_name": "gxeldcore_direct",
+      "backend_version": "1.1",
+      "blas_runtime_config": "OpenBLAS 0.3.34 NO_LAPACK NO_LAPACKE NO_AFFINITY USE_OPENMP ZEN MAX_THREADS=128",
+      "blas_runtime_isolation": "private_static",
+      "blas_runtime_threading_layer": "openmp",
+      "blas_runtime_threads": 32,
+      "blas_vendor": "OpenBLAS",
+      "build_type": "Release",
+      "compiler_id": "GNU",
+      "compiler_version": "12.2.0",
+      "cxx_standard": 17,
+      "gemm_execution_mode": "serialized_fixed_private_openblas",
+      "gemm_integrity_enabled": false,
+      "native_optimization_enabled": true,
+      "openmp_enabled": true,
+      "optimization": "-O3",
+      "platform": "linux",
+      "private_openblas_archive_sha256": "49609db51d9c91bb4beaa40af20ef6a57698698b8043b3d9ac15ffc25554f521",
+      "protected_pair_input_mode": "mprotect_read_only",
+      "source_commit": "6bf009e850afd4b112bf46ee04d2cdea7acd8896",
+      "source_tree_sha256": "d1047f3b082da5a1fdfca17d3f67ce98c0ceea2627b453d90174d7d77c6635ff"
+    },
+    "numpy": "2.3.5",
+    "platform": "Linux-4.19.0-21-amd64-x86_64-with-glibc2.36",
+    "processor": "",
+    "python": "3.12.12 | packaged by conda-forge | (main, Oct 22 2025, 23:25:55) [GCC 14.3.0]",
+    "threadpools": [
+      {
+        "architecture": "Zen",
+        "filepath": "/home/bronsonj/anaconda3/envs/summit/lib/libopenblasp-r0.3.34.so",
+        "internal_api": "openblas",
+        "num_threads": 32,
+        "prefix": "libopenblas",
+        "threading_layer": "pthreads",
+        "user_api": "blas",
+        "version": "0.3.34"
+      },
+      {
+        "filepath": "/home/bronsonj/anaconda3/lib/libgomp.so.1.0.0",
+        "internal_api": "openmp",
+        "num_threads": 32,
+        "prefix": "libgomp",
+        "user_api": "openmp",
+        "version": null
+      }
+    ]
+  },
+  "schema": "summit-native-gxe-benchmark-v2"
+}

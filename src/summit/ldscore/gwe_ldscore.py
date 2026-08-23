@@ -1,23 +1,26 @@
 from __future__ import annotations
 
 import gc
+import gzip
 import hashlib
+import io
 import json
 import math
 import os
+import re
 import stat
 import tempfile
 import time
 import weakref
 from collections.abc import Mapping
-from contextlib import nullcontext
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Sequence
 
 import numpy as np
 import pandas as pd
 from bed_reader import open_bed
-from threadpoolctl import threadpool_info, threadpool_limits
+from threadpoolctl import threadpool_info
 from tqdm import tqdm
 
 from .. import utils
@@ -85,15 +88,6 @@ def _close_file_descriptors(descriptors: Sequence[int]) -> None:
             pass
 
 
-def _validate_jackknife_probe_count(nvecs: int, enabled: bool, allow_low: bool) -> None:
-    if enabled and int(nvecs) < 100 and not allow_low:
-        raise ValueError(
-            "Exact GxE jackknife traces require at least 100 random probes by default; "
-            f"got {int(nvecs)}. Low-probe within-block trace noise can materially distort SEs. "
-            "Use --allow-low-probe-gxe-jackknife only for explicit diagnostics."
-        )
-
-
 def _ndarray_sha256(value: np.ndarray) -> str:
     array = np.ascontiguousarray(value)
     digest = hashlib.sha256()
@@ -105,7 +99,20 @@ def _ndarray_sha256(value: np.ndarray) -> str:
     return digest.hexdigest()
 
 
+def _non_blas_fp64_inner_product(left: np.ndarray, right: np.ndarray) -> float:
+    """Use a compensated fixed-order diagnostic sum without entering BLAS."""
+    left_array = np.asarray(left, dtype=np.float64)
+    right_array = np.asarray(right, dtype=np.float64)
+    if left_array.ndim != 1 or right_array.ndim != 1:
+        raise ValueError("Diagnostic inner-product operands must be one-dimensional.")
+    if left_array.shape != right_array.shape:
+        raise ValueError("Diagnostic inner-product operands must have equal length.")
+    products = np.multiply(left_array, right_array, dtype=np.float64)
+    return float(math.fsum(products))
+
+
 _BACKEND_PROVENANCE_SCHEMA_VERSION = 3
+_REFERENCE_FLOAT_FORMAT = "%.17g"
 _NATIVE_GEMM_INTEGRITY_CHECKS = 8
 _NATIVE_GEMM_CHECK_MINIMUM_FLOPS = 1_000_000_000
 _NATIVE_PREFERRED_CALL_WORKSPACE_BYTES = 3 * 1024**3
@@ -228,10 +235,21 @@ def _native_strict_feature_moment_verification_policy(
     if override == "always":
         return True, "forced by SUMMIT_GXE_VERIFY_FEATURE_MOMENTS=always"
 
-    if str(build_info.get("blas_vendor", "")).strip().lower() == "openblas":
+    if (
+        str(build_info.get("blas_runtime_isolation", "")).strip().lower()
+        == "private_static"
+        and build_info.get("gemm_integrity_enabled") is False
+    ):
+        return False, (
+            "deterministic tiled feature moments; serialized fixed-thread "
+            "private OpenBLAS trace GEMMs"
+        )
+    vendor = str(build_info.get("blas_vendor", "")).strip()
+    if vendor.lower() in {"openblas", "blis"}:
         return False, (
             "deterministic tiled feature GEMMs; eight-check ABFT over "
-            "shape-adaptive OpenBLAS trace GEMMs with fresh-decode fallback"
+            f"serialized-entry internally threaded {vendor} trace GEMMs with "
+            "fresh-decode fallback"
         )
     return False, (
         "deterministic disjoint-output tiled GEMMs independent of "
@@ -240,7 +258,7 @@ def _native_strict_feature_moment_verification_policy(
 
 
 def _validate_native_blas_runtime(build_info: Mapping) -> dict[str, str | int]:
-    """Require the direct backend and NumPy to share one BLAS runtime."""
+    """Validate either an isolated native BLAS or the legacy shared runtime."""
     records = []
     for raw in threadpool_info():
         if str(raw.get("user_api", "")).strip().lower() != "blas":
@@ -252,12 +270,189 @@ def _validate_native_blas_runtime(build_info: Mapping) -> dict[str, str | int]:
                 "version": str(raw.get("version", "")).strip(),
                 "path": os.path.realpath(path) if path else "",
                 "num_threads": int(raw.get("num_threads", 0)),
+                "threading_layer": str(raw.get("threading_layer", "")).strip().lower(),
             }
         )
     unique = {
         (record["internal_api"], record["version"], record["path"]): record
         for record in records
     }
+    isolation = str(build_info.get("blas_runtime_isolation", "")).strip().lower()
+    if isolation == "private_static":
+        execution_mode = str(build_info.get("gemm_execution_mode", ""))
+        private_backend = str(
+            build_info.get("private_blas_backend", "")
+        ).strip().lower()
+        if private_backend in {"", "none"}:
+            # Backward compatibility for accepted private-OpenBLAS artifacts
+            # created before the backend-generic provenance keys existed.
+            if execution_mode == "serialized_fixed_private_openblas":
+                private_backend = "openblas"
+        expected_modes = {
+            "openblas": "serialized_fixed_private_openblas",
+            "upstream_blis": "serialized_fixed_private_blis",
+        }
+        if execution_mode != expected_modes.get(private_backend):
+            raise RuntimeError(
+                "The private GxE BLAS does not declare fixed serialized execution."
+            )
+        archive_sha256 = build_info.get("private_blas_archive_sha256")
+        if private_backend == "openblas" and not _is_canonical_sha256(
+            archive_sha256
+        ):
+            archive_sha256 = build_info.get("private_openblas_archive_sha256")
+        if not _is_canonical_sha256(archive_sha256):
+            raise RuntimeError(
+                "The private GxE BLAS lacks exact archive provenance."
+            )
+        runtime_config = str(build_info.get("blas_runtime_config", "")).split()
+        if private_backend == "openblas":
+            version = (
+                runtime_config[1]
+                if len(runtime_config) >= 2
+                and runtime_config[0].lower() == "openblas"
+                else ""
+            )
+            version_match = re.match(
+                r"^(\d+)\.(\d+)\.(\d+)(?:\D.*)?$", version
+            )
+            if version_match is None or tuple(
+                int(value) for value in version_match.groups()
+            ) < (0, 3, 31):
+                raise RuntimeError(
+                    "The private GxE backend requires OpenBLAS 0.3.31 or newer; "
+                    f"embedded {version!r}."
+                )
+            internal_api = "openblas"
+        else:
+            if (
+                str(build_info.get("blas_vendor", "")).strip().lower()
+                != "blis"
+                or build_info.get("gemm_integrity_enabled") is not True
+                or build_info.get("gemm_vendor_entry_outer_openmp_guard") is not True
+                or build_info.get("blas_runtime_owner_thread_configured") is not True
+            ):
+                raise RuntimeError(
+                    "The private GxE BLIS runtime lacks its guarded integrity contract."
+                )
+            version = (
+                runtime_config[1]
+                if len(runtime_config) >= 2
+                and runtime_config[0].lower() == "blis"
+                else ""
+            )
+            if re.fullmatch(r"\d+\.\d+(?:\.\d+)?", version) is None:
+                raise RuntimeError(
+                    "The private GxE BLIS runtime lacks an exact version."
+                )
+            exact_blis_provenance = (
+                build_info.get("private_blas_source_tree_sha256"),
+                build_info.get("private_blas_header_sha256"),
+                build_info.get("private_blas_cblas_header_sha256"),
+            )
+            if not all(
+                _is_canonical_sha256(value) for value in exact_blis_provenance
+            ) or re.fullmatch(
+                r"[0-9a-f]{40}",
+                str(build_info.get("private_blas_source_commit", "")),
+            ) is None:
+                raise RuntimeError(
+                    "The private GxE BLIS runtime lacks exact source/header provenance."
+                )
+            config_family = str(
+                build_info.get("private_blas_config_family", "")
+            ).strip()
+            if (
+                not config_family
+                or runtime_config[2:] != [f"config={config_family}"]
+                or str(build_info.get("blas_runtime_corename", ""))
+                != config_family
+            ):
+                raise RuntimeError(
+                    "The private GxE BLIS architecture/configuration is inconsistent."
+                )
+            if (
+                build_info.get("blas_runtime_tls_enabled") is not True
+                or build_info.get("blas_runtime_owner_thread_enforced") is not True
+                or build_info.get("blas_runtime_environment_immutable") is not True
+                or build_info.get("blas_runtime_environment_contract")
+                != "blis_process_start_v1"
+            ):
+                raise RuntimeError(
+                    "The private GxE BLIS runtime lacks its immutable TLS/owner contract."
+                )
+            internal_api = "blis"
+        native_threads = build_info.get("blas_runtime_threads")
+        if (
+            isinstance(native_threads, bool)
+            or not isinstance(native_threads, (int, np.integer))
+            or int(native_threads) <= 0
+        ):
+            raise RuntimeError("The private GxE BLAS reports an invalid thread count.")
+        threading_layer = str(
+            build_info.get("blas_runtime_threading_layer", "")
+        ).strip().lower()
+        allowed_threading_layers = (
+            {"pthreads", "openmp"}
+            if private_backend == "openblas"
+            else {"pthreads"}
+        )
+        if threading_layer not in allowed_threading_layers:
+            raise RuntimeError(
+                "The private GxE BLAS reports an unsupported threading layer: "
+                f"{threading_layer!r}."
+            )
+        if private_backend == "upstream_blis":
+            if (
+                build_info.get("blas_runtime_worker_affinity_policy")
+                != "inherit_authenticated_selected_cpu_set_per_call"
+            ):
+                raise RuntimeError(
+                    "The private GxE BLIS runtime lacks its authenticated "
+                    "pthread affinity contract."
+                )
+            strategy = str(
+                build_info.get("blas_runtime_thread_strategy", "")
+            ).strip().lower()
+            ways = build_info.get("blas_runtime_thread_ways")
+            if strategy not in {"automatic", "manual"} or not isinstance(
+                ways, Mapping
+            ) or set(ways) != {"jc", "pc", "ic", "jr", "ir"}:
+                raise RuntimeError(
+                    "The private GxE BLIS runtime reports an invalid thread strategy."
+                )
+            normalized_ways = []
+            for name in ("jc", "pc", "ic", "jr", "ir"):
+                value = ways[name]
+                if (
+                    isinstance(value, bool)
+                    or not isinstance(value, (int, np.integer))
+                    or int(value) <= 0
+                ):
+                    raise RuntimeError(
+                        "The private GxE BLIS runtime reports invalid loop ways."
+                    )
+                normalized_ways.append(int(value))
+            if strategy == "automatic" and normalized_ways != [1, 1, 1, 1, 1]:
+                raise RuntimeError(
+                    "The automatic private GxE BLIS runtime has manual loop ways."
+                )
+            if strategy == "manual" and (
+                normalized_ways[1] != 1
+                or math.prod(normalized_ways) != int(native_threads)
+            ):
+                raise RuntimeError(
+                    "The manual private GxE BLIS loop ways violate its thread contract."
+                )
+        return {
+            "internal_api": internal_api,
+            "version": version,
+            "path": "private-static gxeldcore image",
+            "num_threads": int(native_threads),
+            "isolation": "private_static",
+            "process_blas_runtimes": len(unique),
+            "threading_layer": threading_layer,
+        }
     if len(unique) != 1:
         descriptions = sorted(
             f"{api or 'unknown'} {version or 'unknown'} at {path or 'unknown'}"
@@ -269,6 +464,8 @@ def _validate_native_blas_runtime(build_info: Mapping) -> dict[str, str | int]:
             "against the same BLAS before running native GxE traces."
         )
     record = next(iter(unique.values()))
+    record["isolation"] = "process_shared"
+    record["process_blas_runtimes"] = len(unique)
     expected_vendor = str(build_info.get("blas_vendor", "")).strip().lower()
     observed_vendor = str(record["internal_api"])
     if expected_vendor and expected_vendor not in {"all", "generic"}:
@@ -286,6 +483,18 @@ def _validate_native_blas_runtime(build_info: Mapping) -> dict[str, str | int]:
                 "The direct GxE extension and loaded BLAS runtime disagree: "
                 f"built for {expected_vendor!r}, loaded {observed_vendor!r}."
             )
+        if expected_api == "openblas":
+            version_match = re.match(
+                r"^(\d+)\.(\d+)\.(\d+)(?:\D.*)?$", str(record["version"])
+            )
+            if version_match is None or tuple(
+                int(value) for value in version_match.groups()
+            ) < (0, 3, 31):
+                raise RuntimeError(
+                    "The direct GxE backend requires OpenBLAS 0.3.31 or newer; "
+                    f"loaded {record['version']!r}. OpenBLAS 0.3.30 contained a "
+                    "parallel-GEMM race."
+                )
         runtime_config = str(build_info.get("blas_runtime_config", "")).split()
         expected_version = (
             runtime_config[1]
@@ -513,6 +722,56 @@ def _feature_cache_variant_digest(arrays: Mapping[str, np.ndarray]) -> str:
     return digest.hexdigest()
 
 
+# Deterministic canonical block width for ``step_size="auto"``.  The value
+# is a pure function of the variant count only — never of machine state or
+# resolved memory budgets — so an auto-selected realization is reproducible
+# from its manifest (which always records the resolved numeric step_size).
+# 8192 keeps the target GEMM's variant dimension wide enough for full
+# per-thread tiles, saturates the source GEMM's inner dimension, and cuts
+# the per-block panel-accumulation traffic roughly fourfold versus the
+# historical 2000-variant default, while a 454K-variant genome still forms
+# 56 bounded blocks.  Changing the width changes the finite-probe
+# realization exactly as an explicit --step_size change would.
+_AUTO_STEP_SIZE_CANONICAL_WIDTH = 8192
+
+
+def _auto_reference_step_size(nsnps: int) -> int:
+    """Return the deterministic auto-selected canonical block width."""
+    return max(1, min(int(nsnps), _AUTO_STEP_SIZE_CANONICAL_WIDTH))
+
+
+def _canonicalize_annotation_matrix(raw) -> np.ndarray:
+    """Return the canonical contiguous binary64 annotation matrix.
+
+    The canonical matrix defines the scientific estimand; the estimator
+    ``dtype`` option controls randomized probe/sketch retained storage only
+    and never rounds annotation values.  The conversion must be exact and the
+    canonical matrix is validated after its final conversion.
+    """
+    raw = np.asarray(raw)
+    canonical = np.ascontiguousarray(raw, dtype=np.float64)
+    if np.issubdtype(raw.dtype, np.integer):
+        if np.any(raw > 2 ** 53) or np.any(raw < -(2 ** 53)):
+            raise ValueError(
+                "Integer annotation values above 2**53 are not exactly "
+                "representable in the canonical binary64 annotation matrix."
+            )
+    elif (
+        np.issubdtype(raw.dtype, np.floating)
+        and raw.dtype.itemsize > 8
+        and not np.array_equal(canonical.astype(raw.dtype), raw, equal_nan=True)
+    ):
+        raise ValueError(
+            "Extended-precision annotation values change under binary64 "
+            "conversion; supply binary64-exact annotation values."
+        )
+    if not np.all(np.isfinite(canonical)):
+        raise ValueError("Annotation values must all be finite; NaN/Inf values are not accepted.")
+    if np.any(canonical < 0.0):
+        raise ValueError("Annotation values must be non-negative.")
+    return canonical
+
+
 def _feature_cache_annotation_digest(metadata: Mapping, arrays: Mapping[str, np.ndarray]) -> str:
     digest = hashlib.sha256()
     for name in metadata["annotation_names"]:
@@ -537,6 +796,35 @@ def _feature_cache_jackknife_digest(metadata: Mapping, arrays: Mapping[str, np.n
             digest.update(str(label).encode("utf-8"))
             digest.update(b"\n")
     return digest.hexdigest()
+
+
+def _validate_feature_convention_metadata(metadata: Mapping[str, object]) -> str:
+    """Validate canonical feature metadata while accepting sealed legacy v3 files."""
+    kernel_mode = metadata.get("kernel_mode")
+    expected = {
+        "standardized": "standardized_projected",
+        "genie": "raw_projected",
+    }.get(kernel_mode)
+    if expected is None:
+        raise ValueError(f"Unsupported GxE kernel_mode={kernel_mode!r}.")
+    convention = metadata.get("feature_convention")
+    version = metadata.get("feature_convention_version")
+    if convention is None and version is None:
+        return expected
+    if version != 1:
+        raise ValueError(
+            f"Unsupported GxE feature_convention_version={version!r}."
+        )
+    if convention not in {"standardized_projected", "raw_projected"}:
+        raise ValueError(
+            f"Unsupported GxE feature_convention={convention!r}."
+        )
+    if convention != expected:
+        raise ValueError(
+            "The manifest encodes a different GxE reference feature scale/GENIE convention: "
+            "kernel_mode and canonical feature_convention disagree."
+        )
+    return str(convention)
 
 
 def _validate_feature_cache_semantics(
@@ -613,6 +901,7 @@ def _validate_feature_cache_semantics(
     genotype_scale = metadata.get("genotype_scale")
     if kernel_mode not in ("standardized", "genie"):
         raise ValueError("GxE feature-cache kernel_mode is invalid.")
+    _validate_feature_convention_metadata(metadata)
     if genotype_scale not in ("sample", "hwe"):
         raise ValueError("GxE feature-cache genotype_scale is invalid.")
 
@@ -961,14 +1250,11 @@ def _orthonormalize_columns(X: np.ndarray, tol: float = 1e-10) -> np.ndarray:
         raise ValueError("X must be two-dimensional.")
     if X.shape[1] == 0:
         return np.empty((X.shape[0], 0), dtype=np.float64, order="F")
-    # This is a tall-skinny fixed-effect problem (typically N x <30), not a
-    # throughput bottleneck.  Running its LAPACK reduction on one thread avoids
-    # exposing the analysis-defining basis to the rare wide threaded-BLAS
-    # corruption observed on tabla; large genotype GEMMs remain multithreaded.
-    with threadpool_limits(limits=1, user_api="blas"):
-        U, singular, _ = np.linalg.svd(
-            np.asarray(X, dtype=np.float64), full_matrices=False
-        )
+    # The process cap is installed once before numerical runtimes start. Do
+    # not resize a process-global BLAS pool around this small factorization.
+    U, singular, _ = np.linalg.svd(
+        np.asarray(X, dtype=np.float64), full_matrices=False
+    )
     if singular.size == 0 or singular[0] <= 0.0:
         return np.empty((X.shape[0], 0), dtype=np.float64, order="F")
     rank_tol = max(float(tol), max(X.shape) * np.finfo(np.float64).eps * float(singular[0]))
@@ -1015,6 +1301,7 @@ def read_env_and_cov(
     missing_values: Sequence[str] = ("-9", "NA", "NaN", "nan", ".", "None", "null"),
     sample_ids: pd.DataFrame | None = None,
     env_col: str | None = None,
+    return_common_basis: bool = False,
 ):
     id_types = {"FID": str, "IID": str}
     if sample_ids is None:
@@ -1224,6 +1511,7 @@ def read_env_and_cov(
     # Interaction / GWIS covariate space: user covariates + environment main effect.
     # We use the same space for the additive X side in the XW cross-score so that the
     # resulting summary objects match the score-scale derivation.
+    C_common = _orthonormalize_columns(cov_base)
     design_base = np.column_stack([cov_base, env_vec.reshape(-1, 1)])
     design_digest = hashlib.sha256()
     for name in [*kept_cov_cols, str(env_name)]:
@@ -1268,7 +1556,7 @@ def read_env_and_cov(
             f"effective covariate rank={C.shape[1]} ({len(kept_cov_cols)} user covariate(s) + environment main effect)."
         )
 
-    return (
+    result = (
         np.asarray(env_vec, dtype=np.float64),
         str(env_name),
         np.asfortranarray(C),
@@ -1280,6 +1568,9 @@ def read_env_and_cov(
         phenotype_residual_fraction,
         env_transform,
     )
+    if return_common_basis:
+        return result + (np.asfortranarray(C_common),)
+    return result
 
 
 class GenomewideEnvLDScore:
@@ -1287,6 +1578,11 @@ class GenomewideEnvLDScore:
     Estimate the four directional additive/interaction trace panels required
     by one-environment projected-kernel normal equations using randomized
     sketches.
+
+    This mature variant-probe source/target path is the systems template for
+    the generalized per-variant GxE LD-score estimator. The generalized path
+    has a distinct artifact/contract and must not inherit this class's fixed
+    X/W scientific layout or separate post-projection X/W scales.
 
     For each annotation bin k, the module estimates
         ell^{WW}_{jk} = sum_{j' in S_k} (r^{WW}_{jj'})^2,
@@ -1296,6 +1592,14 @@ class GenomewideEnvLDScore:
     rescales every valid projected column to squared norm ``rank(P)``.  The
     explicit ``genie`` compatibility mode retains each projected column's
     natural norm after HWE scaling.
+
+    Although ``R_WX = R_XW.T``, the per-variant XW and WX panels are not
+    duplicates: they are respectively annotation-weighted squared row and
+    column norms of ``R_XW``.  Their annotation-aggregated normal-equation
+    entries agree after swapping the left/source bins.  Both directional
+    panels are retained for per-variant summaries and exact deletion
+    bookkeeping, while the native target path obtains both from one shared
+    GEMM rather than repeating the expensive product.
 
     Output files:
         {out}.gxx.ldscore.gz   -> XX / additive-additive trace scores
@@ -1325,6 +1629,7 @@ class GenomewideEnvLDScore:
         ddof=1,
         target_xz_mem="auto",
         target_mem=None,
+        gxe_total_memory_gib="auto",
         device="cpu",
         impute_method: str = "mean",
         kernel_mode: str = "standardized",
@@ -1332,10 +1637,7 @@ class GenomewideEnvLDScore:
         pheno_path: str | None = None,
         pheno_col: str | None = None,
         missing_values: Sequence[str] = ("-9", "NA", "NaN", "nan", ".", "None", "null"),
-        write_jackknife: bool = False,
-        jackknife_spec: str = "100",
         overwrite: bool = False,
-        allow_low_probe_jackknife: bool = False,
         probe_offset: int = 0,
         feature_cache_path: str | None = None,
         shard_mode: bool = False,
@@ -1449,7 +1751,12 @@ class GenomewideEnvLDScore:
             self.nsamp_total = int(len(self.sample_ids))
             self.nsnps = int(len(self.snplist))
         self.nvecs = int(num_vecs)
-        self.step_size = int(step_size)
+        if isinstance(step_size, str) and step_size.strip().lower() == "auto":
+            self.step_size = _auto_reference_step_size(self.nsnps)
+            self.step_size_selection = "auto_v1"
+        else:
+            self.step_size = int(step_size)
+            self.step_size_selection = "explicit"
         if self.nvecs <= 0:
             raise ValueError("num_vecs must be positive.")
         if self.nvecs > 2**64:
@@ -1469,17 +1776,38 @@ class GenomewideEnvLDScore:
         self.target_xz_mem, self.memory_budget = utils.resolve_memory_budget_gib(
             requested_memory
         )
+        self.gxe_total_memory_request = utils.parse_memory_budget(
+            gxe_total_memory_gib
+        )
         self.log._log(
             f"[memory] sketch budget={self.target_xz_mem:.3f} GiB "
-            f"(mode={self.memory_budget['mode']})."
+            f"(mode={self.memory_budget['mode']}); total-process budget request="
+            f"{self.gxe_total_memory_request}."
         )
         self.device = str(device).strip().lower()
         self.impute_method = str(impute_method).strip().lower()
         if self.impute_method != "mean":
             raise ValueError("The current Python GxE LD-score implementation supports only impute_method='mean'.")
-        self.kernel_mode = str(kernel_mode).strip().lower()
-        if self.kernel_mode not in ("genie", "standardized"):
-            raise ValueError("kernel_mode must be 'genie' or 'standardized'.")
+        requested_kernel_mode = str(kernel_mode).strip().lower()
+        feature_conventions = {
+            "standardized": "standardized_projected",
+            "standardized_projected": "standardized_projected",
+            "genie": "raw_projected",
+            "raw_projected": "raw_projected",
+        }
+        if requested_kernel_mode not in feature_conventions:
+            raise ValueError(
+                "kernel_mode must be 'standardized_projected' or "
+                "'raw_projected' (legacy aliases: 'standardized', 'genie')."
+            )
+        self.feature_convention = feature_conventions[requested_kernel_mode]
+        # Retain the legacy internal labels until the v3 readers are retired;
+        # all numerical branches and existing file consumers remain unchanged.
+        self.kernel_mode = (
+            "standardized"
+            if self.feature_convention == "standardized_projected"
+            else "genie"
+        )
         if genotype_scale is None:
             genotype_scale = "sample" if self.kernel_mode == "standardized" else "hwe"
         self.genotype_scale = str(genotype_scale).strip().lower()
@@ -1488,10 +1816,7 @@ class GenomewideEnvLDScore:
         self.pheno_path = None if pheno_path is None else str(pheno_path)
         self.pheno_col = pheno_col
         self.missing_values = tuple(str(x) for x in missing_values)
-        self.write_jackknife = bool(write_jackknife)
-        self.jackknife_spec = str(jackknife_spec)
         self.overwrite = bool(overwrite)
-        self.allow_low_probe_jackknife = bool(allow_low_probe_jackknife)
         self.probe_offset = int(probe_offset)
         if self.probe_offset < 0 or self.probe_offset >= 2**64:
             raise ValueError(
@@ -1543,24 +1868,62 @@ class GenomewideEnvLDScore:
             raise ValueError(f"seed must be in [0, 2**64); got {self.root_seed}.")
         self.rng = np.random.default_rng(self.root_seed)
 
+        self._gxe_group_worker_authenticated = bool(
+            low_level is not None
+            and low_level.get("_gxe_group_worker_authenticated") is True
+        )
+        self.cpu_placement: dict | None = None
+        self.cpu_placement_complete = False
+        try:
+            caller_affinity_threads = len(os.sched_getaffinity(0))
+        except Exception:
+            caller_affinity_threads = max(1, os.cpu_count() or 1)
         if low_level is not None:
+            # The authenticated socket worker has one singleton affinity on
+            # its Python caller after libgomp binding. Its complete native
+            # team attestation is the only permitted capacity override.
+            from .gw_ldscore import (
+                _validate_cpu_placement_attestation,
+                _validated_thread_capacity,
+                apply_env as _apply_env,
+            )
+
+            validated_capacity = _validated_thread_capacity(
+                low_level, caller_affinity_threads
+            )
+            if self._gxe_group_worker_authenticated:
+                placement = _validate_cpu_placement_attestation(
+                    low_level.get("_gxe_cpu_placement"),
+                    expected_cpu_ids=low_level.get("_gxe_worker_cpu_ids"),
+                    expected_threads=low_level.get("num_threads"),
+                )
+                self.cpu_placement = placement
+                self.cpu_placement_complete = True
             try:
                 # Keep the pure-Python GxE module importable without the native
                 # GWLD extension; the low-level helper is needed only here.
-                from .gw_ldscore import apply_env as _apply_env
-
                 actual_threads = _apply_env(low_level)
             except Exception as e:
+                if self._gxe_group_worker_authenticated:
+                    raise RuntimeError(
+                        "Authenticated GxE group-worker runtime setup failed."
+                    ) from e
                 self.log._log(f"[threads] apply_env failed in GxE LD-score setup (non-fatal): {e}")
                 actual_threads = None
         else:
+            validated_capacity = caller_affinity_threads
             actual_threads = None
         if num_threads is not None and int(num_threads) > 0:
-            try:
-                affinity_threads = len(os.sched_getaffinity(0))
-            except Exception:
-                affinity_threads = max(1, os.cpu_count() or 1)
-            self.num_threads = max(1, min(int(num_threads), affinity_threads))
+            requested_threads = int(num_threads)
+            if (
+                self._gxe_group_worker_authenticated
+                and requested_threads != validated_capacity
+            ):
+                raise RuntimeError(
+                    "Authenticated GxE group-worker threads disagree with its "
+                    "verified OpenMP capacity."
+                )
+            self.num_threads = max(1, min(requested_threads, validated_capacity))
         elif actual_threads is not None:
             self.num_threads = int(actual_threads)
         else:
@@ -1571,6 +1934,9 @@ class GenomewideEnvLDScore:
         else:
             self.decode_threads = self.num_threads
 
+        # ``dtype`` selects the retained storage precision of randomized
+        # probe/sketch panels only.  The canonical annotation matrix, its
+        # masses, and every native arithmetic path stay binary64 regardless.
         if dtype in (np.float32, "float32", "f4"):
             self.dtype = np.float32
         elif dtype in (np.float64, "float64", "f8"):
@@ -1600,9 +1966,11 @@ class GenomewideEnvLDScore:
         else:
             self.log._log(f"Reading {self.genotype_prefix}.pvar for variants")
         self._read_annot(annot_path)
-        self.jackknife_ids, self.jackknife_labels = self._build_jackknife_blocks(
-            self.jackknife_spec if self.write_jackknife else None
-        )
+        # Schema-v2 feature caches retain empty legacy jackknife identity fields
+        # for backward-readable artifacts. New GxE references no longer create
+        # block-local or within-block jackknife outputs.
+        self.jackknife_ids = None
+        self.jackknife_labels = []
 
         (
             env_vec,
@@ -1615,6 +1983,7 @@ class GenomewideEnvLDScore:
             phenotype_name,
             phenotype_residual_fraction,
             env_transform,
+            C_common,
         ) = read_env_and_cov(
             env_filename=self.env_path,
             fam_filename=self.fam_path,
@@ -1630,12 +1999,14 @@ class GenomewideEnvLDScore:
             missing_values=self.missing_values,
             sample_ids=self.sample_ids,
             env_col=env_col,
+            return_common_basis=True,
         )
         self.row_sel = np.asarray(keep_idx_global, dtype=int)
         self.env = np.asarray(env_vec, dtype=np.float64)
         self.env_name = env_name
         self.C_int = np.asarray(C_int, dtype=np.float64, order="F")
         self.cov_R_int = np.asarray(cov_R_int, dtype=np.float64, order="F")
+        self.C_common = np.asarray(C_common, dtype=np.float64, order="F")
         self.cov_cols = list(cov_cols)
         self.pheno = pheno_vec
         self.phenotype_name = phenotype_name
@@ -1663,6 +2034,14 @@ class GenomewideEnvLDScore:
         self.score_x_all: np.ndarray | None = None
         self.score_w_all: np.ndarray | None = None
         self.feature_diagnostics: dict[str, float | int | list[float]] = {}
+        self.genotype_missing_call_count = np.zeros(self.nsnps, dtype=np.int64)
+        self.genotype_missing_environment_correlation = np.zeros(
+            self.nsnps, dtype=np.float64
+        )
+        self.genotype_missing_phenotype_correlation = np.zeros(
+            self.nsnps, dtype=np.float64
+        )
+        self._missingness_warning_logged = False
         self.resource_estimates: dict[str, float | int] = {}
         self.population_same_individual_products: np.ndarray | None = None
         self._vtiles_used: list[tuple[int, int]] | None = None
@@ -1681,6 +2060,7 @@ class GenomewideEnvLDScore:
         self.native_strict_feature_moment_verification = False
         self.native_feature_moment_integrity_reason = "Python backend"
         self.native_phase_timings: dict[str, float] = {}
+        self.performance_phase_timings: dict[str, dict[str, float | int]] = {}
         # A common-cohort multi-environment executor owns a shared Python
         # genotype stream but may route every wide product through the same
         # protected native GEMMs as the direct backend.  It supplies an exact
@@ -1715,6 +2095,18 @@ class GenomewideEnvLDScore:
                         "The requested bounded native GxE extension is unavailable."
                     ) from exc
                 else:
+                    configure_blas_threads = getattr(
+                        _gxeldcore, "configure_blas_threads", None
+                    )
+                    if callable(configure_blas_threads):
+                        configured_threads = int(
+                            configure_blas_threads(self.num_threads)
+                        )
+                        if configured_threads != self.num_threads:
+                            raise RuntimeError(
+                                "The direct GxE extension configured an unexpected "
+                                "BLAS thread count."
+                            )
                     native_descriptor, native_record = _loaded_native_binary_record(
                         _gxeldcore
                     )
@@ -1741,9 +2133,10 @@ class GenomewideEnvLDScore:
                     self._native_build_info = build_info
                     self.native_blas_runtime_record = runtime_record
                     self.log._log(
-                        "[gxe:native] Verified one process BLAS runtime: "
+                        "[gxe:native] Verified BLAS runtime: "
                         f"{runtime_record['internal_api']} "
-                        f"{runtime_record['version']} at {runtime_record['path']}."
+                        f"{runtime_record['version']} at {runtime_record['path']} "
+                        f"(isolation={runtime_record['isolation']})."
                     )
                     (
                         self.native_strict_feature_moment_verification,
@@ -1774,6 +2167,7 @@ class GenomewideEnvLDScore:
                         env=np.asarray(self.env, dtype=np.float64),
                         q_basis=q_basis,
                         decode_threads=int(self.decode_threads),
+                        blas_threads=int(self.num_threads),
                         max_workspace_bytes=workspace_bytes,
                         target_panel_columns=self.native_target_panel_columns,
                         strict_feature_moment_verification=(
@@ -1787,6 +2181,7 @@ class GenomewideEnvLDScore:
                         or int(context_info["n_selected"]) != self.nsamp
                         or int(context_info["q_rank"]) != expected_rank
                         or int(context_info["decode_threads"]) != self.decode_threads
+                        or int(context_info["blas_threads"]) != self.num_threads
                         or bool(context_info["strict_feature_moment_verification"])
                         != self.native_strict_feature_moment_verification
                     ):
@@ -1795,19 +2190,6 @@ class GenomewideEnvLDScore:
                         raise RuntimeError(
                             "The bounded native GxE context disagrees with validated Python dimensions/state."
                         )
-                    if self.jackknife_ids is not None:
-                        group_counts = [
-                            int(np.unique(self.jackknife_ids[s:e]).size)
-                            for s, e in self._make_compute_blocks()
-                        ]
-                        if max(group_counts, default=1) > 4:
-                            self._native_context.close()
-                            self._native_context = None
-                            raise ValueError(
-                                "The native GxE source API supports at most four jackknife "
-                                "groups per compute block; reduce --step-size or use the "
-                                "Python backend."
-                            )
                     self.native_backend = "direct"
                     self.log._log(
                         "[gxe:native] Enabled immutable descriptor-owned direct BED context "
@@ -1889,19 +2271,33 @@ class GenomewideEnvLDScore:
             raise ValueError("BIM file contains duplicate SNP identifiers; unique IDs are required for summary alignment.")
 
     def _read_annot(self, annot_path):
+        # The canonical annotation matrix defines the scientific estimand and
+        # is always contiguous binary64.  The estimator ``dtype`` option
+        # controls randomized probe/sketch retained storage only; it never
+        # rounds annotation values, masses, or sqrt-annotation source weights.
         if annot_path is None:
-            self.annot = np.ones((self.nsnps, 1), dtype=np.float64)
+            self.annot = np.ascontiguousarray(
+                np.ones((self.nsnps, 1), dtype=np.float64)
+            )
             self.nbins = 1
             self.l2cols = ["L2_0"]
             self.is_continuous = False
-            self.annot = np.ascontiguousarray(self.annot.astype(self.dtype, copy=False))
-            self.nsnps_bin = np.asarray(self.annot, dtype=np.float64).sum(axis=0)
+            self.nsnps_bin = self.annot.sum(axis=0, dtype=np.float64)
             self.log._log("Calculating genome-wide (non-partitioned) GxE LD scores")
             self.log._log(f"Number of total SNPs: {self.nsnps}, annotation shape: {self.annot.shape}")
             return
 
         parsed_ldsc = False
-        df = pd.read_csv(annot_path, sep=r"\s+", compression="infer", dtype={"CHR": str, "SNP": str})
+        # The parsed decimal text defines the binary64 estimand, so parsing
+        # must be correctly rounded; the default pandas float parser can be
+        # one ulp off for extreme values.
+        df = pd.read_csv(
+            annot_path,
+            sep=r"\s+",
+            compression="infer",
+            dtype={"CHR": str, "SNP": str},
+            float_precision="round_trip",
+        )
         base_cols = {"CHR", "BP", "SNP", "CM"}
         if {"CHR", "BP", "SNP"}.issubset(set(df.columns)):
             if df["SNP"].duplicated().any():
@@ -1978,17 +2374,12 @@ class GenomewideEnvLDScore:
                 f"the input genotype file ({self.nsnps})."
             )
         self.l2cols = _validate_gxe_annotation_names(list(self.l2cols))
-        if not np.all(np.isfinite(self.annot)):
-            raise ValueError("Annotation values must all be finite; NaN/Inf values are not accepted.")
-        if np.any(self.annot < 0.0):
-            raise ValueError("Annotation values must be non-negative.")
+        self.annot = _canonicalize_annotation_matrix(self.annot)
         self.is_continuous = not np.all(np.isin(np.unique(self.annot), [0.0, 1.0]))
-
-        self.annot = np.ascontiguousarray(self.annot.astype(self.dtype, copy=False))
-        # The canonical stored dtype defines the kernels.  Compute masses after
-        # casting so the manifest, diagonal table, full traces, and deleted
-        # traces all use byte-identical annotation weights.
-        self.nsnps_bin = np.asarray(self.annot, dtype=np.float64).sum(axis=0)
+        # Masses come from the canonical binary64 matrix so the manifest,
+        # diagonal table, native inputs, full traces, and deleted traces all
+        # use byte-identical binary64 annotation weights.
+        self.nsnps_bin = self.annot.sum(axis=0, dtype=np.float64)
         if np.any(self.nsnps_bin <= 0.0):
             bad = np.flatnonzero(self.nsnps_bin <= 0.0).tolist()
             raise ValueError(f"Annotation columns must have positive mass; empty columns: {bad}.")
@@ -2083,104 +2474,176 @@ class GenomewideEnvLDScore:
             for start in range(0, self.nsnps, feature_step)
         ]
 
-    def _make_jackknife_compute_blocks(self) -> list[list[tuple[int, int]]]:
-        """Split every jackknife group into bounded contiguous genotype reads."""
-        if self.jackknife_ids is None:
-            return []
-        block_ids = np.asarray(self.jackknife_ids, dtype=np.int32)
-        nblocks = len(self.jackknife_labels)
-        if block_ids.shape != (self.nsnps,):
-            raise RuntimeError(
-                "GxE jackknife IDs must have one entry per variant; "
-                f"got {block_ids.shape} for {self.nsnps} variants."
-            )
-        if np.any(block_ids < 0) or np.any(block_ids >= nblocks):
-            raise RuntimeError("GxE jackknife IDs contain an out-of-range block index.")
-        grouped: list[list[tuple[int, int]]] = [[] for _ in range(nblocks)]
-        boundaries = np.r_[
-            0,
-            np.flatnonzero(block_ids[1:] != block_ids[:-1]) + 1,
-            self.nsnps,
-        ]
-        for run_index in range(boundaries.size - 1):
-            run_start = int(boundaries[run_index])
-            run_end = int(boundaries[run_index + 1])
-            block_id = int(block_ids[run_start])
-            for start in range(run_start, run_end, self.step_size):
-                grouped[block_id].append((start, min(run_end, start + self.step_size)))
-        if any(not chunks for chunks in grouped):
-            raise RuntimeError("GxE jackknife construction produced an empty block.")
-        return grouped
-
-    def _build_jackknife_blocks(self, spec: str | None) -> tuple[np.ndarray | None, list[str]]:
-        if spec is None:
-            return None, []
-        text = str(spec).strip().lower()
-        if text == "chr":
-            labels_raw = self.snplist["CHR"].astype(str).to_numpy()
-            labels = list(dict.fromkeys(labels_raw.tolist()))
-            lookup = {label: idx for idx, label in enumerate(labels)}
-            block_ids = np.asarray([lookup[x] for x in labels_raw], dtype=np.int32)
-            labels = [f"chr:{x}" for x in labels]
-        else:
-            try:
-                count = int(text)
-            except ValueError as exc:
-                raise ValueError(
-                    "GxE reference jackknife supports --njack chr or a positive integer; "
-                    f"got {spec!r}."
-                ) from exc
-            if count < 2 or count > self.nsnps:
-                raise ValueError(f"GxE jackknife block count must be in [2, {self.nsnps}]; got {count}.")
-            block_ids = np.minimum(
-                count - 1,
-                (np.arange(self.nsnps, dtype=np.int64) * count) // self.nsnps,
-            ).astype(np.int32)
-            labels = [f"block:{idx + 1}" for idx in range(count)]
-        counts = np.bincount(block_ids, minlength=len(labels))
-        if len(labels) < 2:
-            raise ValueError("GxE jackknife requires at least two non-empty SNP blocks.")
-        if np.any(counts == 0):
-            raise ValueError("GxE jackknife construction produced an empty block.")
-        block_masses = np.zeros((len(labels), self.nbins), dtype=np.float64)
-        np.add.at(block_masses, block_ids, np.asarray(self.annot, dtype=np.float64))
-        remaining_masses = self.nsnps_bin.reshape(1, -1) - block_masses
-        invalid = np.argwhere(remaining_masses <= 0.0)
-        if invalid.size:
-            block_id, annotation_id = (int(x) for x in invalid[0])
-            raise ValueError(
-                "GxE jackknife deletion would empty an annotation: "
-                f"block={labels[block_id]!r}, annotation={self.l2cols[annotation_id]!r}. "
-                "Choose blocks for which every annotation retains positive mass."
-            )
-        method = (
-            "exact two-sided shard deletion"
-            if self.shard_mode
-            else "block-local LD-score deletion"
+    def _record_performance_phase(
+        self,
+        phase: str,
+        wall_seconds: float,
+        process_cpu_seconds: float,
+    ) -> None:
+        """Accumulate bounded wall/CPU evidence for streamed phase accounting."""
+        timings = getattr(self, "performance_phase_timings", None)
+        if timings is None:
+            # Some focused reader tests construct this class with ``__new__``.
+            timings = {}
+            self.performance_phase_timings = timings
+        record = timings.setdefault(
+            str(phase),
+            {"wall_seconds": 0.0, "process_cpu_seconds": 0.0, "calls": 0},
         )
-        self.log._log(
-            f"[gxe:jackknife] configured {len(labels)} {method} blocks "
-            f"({int(counts.min())}-{int(counts.max())} variants per block)."
+        record["wall_seconds"] = float(record["wall_seconds"]) + float(
+            wall_seconds
         )
-        return block_ids, labels
+        record["process_cpu_seconds"] = float(
+            record["process_cpu_seconds"]
+        ) + float(process_cpu_seconds)
+        record["calls"] = int(record["calls"]) + 1
 
-    def _read_genotype_block(self, blk_start: int, blk_end: int) -> np.ndarray:
+    @contextmanager
+    def _performance_phase(self, phase: str):
+        """Time one output/read interval without changing its exception behavior."""
+        wall_started = time.perf_counter()
+        cpu_started = time.process_time()
+        try:
+            yield
+        finally:
+            self._record_performance_phase(
+                phase,
+                time.perf_counter() - wall_started,
+                time.process_time() - cpu_started,
+            )
+
+    def _read_genotype_block(
+        self, blk_start: int, blk_end: int, *, memory_order: str = "F"
+    ) -> np.ndarray:
+        memory_order = str(memory_order).strip().upper()
+        if memory_order not in {"F", "C"}:
+            raise ValueError("Genotype block memory_order must be 'F' or 'C'.")
+        read_wall_started = time.perf_counter()
+        read_cpu_started = time.process_time()
+        bound_owner = None
+        bound_array = None
+        bound_byte_count = None
+        bound_allocation_evidence = None
+        bound_selected_nodes = None
         if getattr(self, "genotype_format", "bed") == "pgen":
+            if memory_order != "F":
+                raise RuntimeError(
+                    "Direct row-major genotype decoding is currently limited to BED input."
+                )
             if self._pgen_reader is None:
                 raise RuntimeError("PGEN reader is closed.")
             G = self._pgen_reader.read_standardized_block(blk_start, blk_end)
         else:
-            indexer = np.s_[self.row_sel, blk_start:blk_end]
-            try:
-                G = self.G.read(index=indexer, dtype=np.float64, num_threads=self.decode_threads)
-            except TypeError:
-                try:
-                    G = self.G.read(index=indexer, dtype=np.float64)
-                except TypeError:
+            bound_nodes = getattr(
+                self, "_native_numa_bound_decode_nodes", None
+            )
+            if bound_nodes is not None:
+                if memory_order != "F":
+                    raise RuntimeError(
+                        "NUMA-bound direct BED decoding currently requires "
+                        "Fortran-order genotype blocks."
+                    )
+                from bed_reader.bed_reader import read_f64
+
+                from .._early_numa import (
+                    allocate_numa_bound_anonymous_buffer,
+                    verify_numa_bound_anonymous_buffer,
+                )
+
+                if not getattr(self, "_native_parallel_standardization", False):
+                    raise RuntimeError(
+                        "NUMA-bound direct BED decoding requires native in-place "
+                        "genotype standardization."
+                    )
+                selected_nodes = tuple(bound_nodes)
+                rows = int(self.nsamp)
+                columns = int(blk_end - blk_start)
+                if rows <= 0 or columns <= 0:
+                    raise RuntimeError(
+                        "NUMA-bound direct BED decoding requires a nonempty block."
+                    )
+                byte_count = rows * columns * np.dtype(np.float64).itemsize
+                owner, allocation_evidence = (
+                    allocate_numa_bound_anonymous_buffer(
+                        byte_count, selected_nodes
+                    )
+                )
+                G = np.ndarray(
+                    (rows, columns),
+                    dtype=np.float64,
+                    buffer=owner,
+                    order="F",
+                )
+                bound_owner = owner
+                bound_array = G
+                bound_byte_count = byte_count
+                bound_allocation_evidence = allocation_evidence
+                bound_selected_nodes = selected_nodes
+                iid_index = getattr(
+                    self, "_native_numa_bound_iid_index", None
+                )
+                if iid_index is None:
+                    iid_index = np.ascontiguousarray(
+                        self.row_sel, dtype=np.intp
+                    )
+                    if (
+                        iid_index.ndim != 1
+                        or iid_index.shape[0] != rows
+                        or np.any(iid_index < 0)
+                        or np.any(iid_index >= int(self.G.iid_count))
+                    ):
+                        raise RuntimeError(
+                            "The NUMA-bound BED sample index is malformed."
+                        )
+                    self._native_numa_bound_iid_index = iid_index
+                sid_index = np.arange(
+                    blk_start, blk_end, dtype=np.intp
+                )
+                read_f64(
+                    str(self.G.filepath),
+                    iid_count=int(self.G.iid_count),
+                    sid_count=int(self.G.sid_count),
+                    is_a1_counted=bool(self.G.count_A1),
+                    iid_index=iid_index,
+                    sid_index=sid_index,
+                    val=G,
+                    num_threads=int(self.decode_threads),
+                )
+            else:
+                indexer = np.s_[self.row_sel, blk_start:blk_end]
+                if memory_order == "C":
                     try:
-                        G = self.G.read(index=indexer)
+                        G = self.G.read(
+                            index=indexer,
+                            dtype=np.float64,
+                            order="C",
+                            num_threads=self.decode_threads,
+                        )
+                    except TypeError as exc:
+                        raise RuntimeError(
+                            "The optimized FP64 target layout requires a BED reader "
+                            "that decodes directly into C order; refusing an implicit "
+                            "N-by-block layout copy."
+                        ) from exc
+                else:
+                    try:
+                        G = self.G.read(index=indexer, dtype=np.float64, num_threads=self.decode_threads)
                     except TypeError:
-                        G = self.G.read(indexer)
+                        try:
+                            G = self.G.read(index=indexer, dtype=np.float64)
+                        except TypeError:
+                            try:
+                                G = self.G.read(index=indexer)
+                            except TypeError:
+                                G = self.G.read(indexer)
+
+        self._record_performance_phase(
+            "bed_read_decode",
+            time.perf_counter() - read_wall_started,
+            time.process_time() - read_cpu_started,
+        )
+        standardize_wall_started = time.perf_counter()
+        standardize_cpu_started = time.process_time()
 
         G = np.asarray(G, dtype=np.float64)
         if G.shape == (blk_end - blk_start, self.nsamp):
@@ -2190,30 +2653,270 @@ class GenomewideEnvLDScore:
                 f"Unexpected genotype block shape {G.shape} for block [{blk_start}:{blk_end}); "
                 f"expected ({self.nsamp}, {blk_end - blk_start})."
             )
+        if memory_order == "C" and not G.flags.c_contiguous:
+            raise RuntimeError(
+                "The BED reader did not honor direct C-order genotype decoding; "
+                "refusing an implicit N-by-block layout copy."
+            )
 
-        mask = np.isnan(G)
-        nobs = G.shape[0] - mask.sum(axis=0, dtype=np.int64)
-        col_means = np.divide(
-            np.nansum(G, axis=0, dtype=np.float64),
-            nobs,
-            out=np.zeros(G.shape[1], dtype=np.float64),
-            where=nobs > 0,
+        if getattr(self, "_native_parallel_standardization", False):
+            from .. import gxeldcore
+
+            targets = getattr(self, "_native_missingness_targets", None)
+            if targets is None:
+                centered_targets = []
+                for target in (self.env, self.pheno):
+                    if target is None:
+                        centered_targets.append(np.zeros(self.nsamp, dtype=np.float64))
+                    else:
+                        centered = np.asarray(target, dtype=np.float64)
+                        centered_targets.append(centered - centered.mean())
+                targets = np.asfortranarray(
+                    np.column_stack(centered_targets), dtype=np.float64
+                )
+                self._native_missingness_targets = targets
+            if memory_order == "C":
+                if not callable(
+                    getattr(gxeldcore, "standardize_genotype_block_row_major", None)
+                ):
+                    raise RuntimeError(
+                        "The loaded GxE extension lacks row-major standardization."
+                    )
+                standardize = gxeldcore.standardize_genotype_block_row_major
+            else:
+                G = np.asfortranarray(G, dtype=np.float64)
+                standardize = gxeldcore.standardize_genotype_block
+            missing_counts, missing_correlations = (
+                standardize(
+                    G,
+                    targets,
+                    int(self.ddof),
+                    self.genotype_scale == "hwe",
+                    float(self.eps_var),
+                    int(self.num_threads),
+                )
+            )
+            counts = np.asarray(missing_counts, dtype=np.int64)
+            correlations = np.asarray(missing_correlations, dtype=np.float64)
+            sinks = getattr(self, "_native_missingness_sinks", None)
+            if sinks is not None:
+                if len(sinks) != correlations.shape[0]:
+                    raise RuntimeError(
+                        "Shared GxE missingness sinks do not match the native "
+                        "diagnostic target count."
+                    )
+                seen_estimators: set[int] = set()
+                for target_index, sink in enumerate(sinks):
+                    estimator, attribute_name = sink
+                    identity = id(estimator)
+                    if identity not in seen_estimators:
+                        estimator.genotype_missing_call_count[
+                            blk_start:blk_end
+                        ] = counts
+                        seen_estimators.add(identity)
+                    getattr(estimator, attribute_name)[blk_start:blk_end] = (
+                        correlations[target_index]
+                    )
+            elif hasattr(self, "genotype_missing_call_count"):
+                self.genotype_missing_call_count[blk_start:blk_end] = counts
+                self.genotype_missing_environment_correlation[blk_start:blk_end] = (
+                    correlations[0]
+                )
+                self.genotype_missing_phenotype_correlation[blk_start:blk_end] = (
+                    correlations[1]
+                )
+            self._record_performance_phase(
+                "genotype_standardization",
+                time.perf_counter() - standardize_wall_started,
+                time.process_time() - standardize_cpu_started,
+            )
+            if bound_owner is not None:
+                if (
+                    bound_array is None
+                    or bound_byte_count is None
+                    or bound_allocation_evidence is None
+                    or bound_selected_nodes is None
+                    or not G.flags.f_contiguous
+                    or not np.shares_memory(G, bound_array)
+                ):
+                    raise RuntimeError(
+                        "Native standardization did not preserve the dedicated "
+                        "NUMA-bound genotype mapping."
+                    )
+                verification = verify_numa_bound_anonymous_buffer(
+                    bound_owner, bound_byte_count, bound_selected_nodes
+                )
+                if verification.get("complete") is not True:
+                    raise RuntimeError(
+                        "NUMA-bound BED decoding returned incomplete evidence."
+                    )
+                records = getattr(
+                    self, "_native_numa_bound_decode_records", None
+                )
+                if records is None:
+                    records = []
+                    self._native_numa_bound_decode_records = records
+                records.append(
+                    {
+                        "genotype_block": [int(blk_start), int(blk_end)],
+                        "memory_order": "F",
+                        "decoder": "bed_reader.read_f64_into_bound_mapping",
+                        "allocation": bound_allocation_evidence,
+                        "bound_mapping_preserved_after_standardization": True,
+                        "verification_stage": "post_standardization_pre_return",
+                        "verification": verification,
+                    }
+                )
+            return G
+
+        # A full N-by-block boolean mask followed by NumPy's bool-to-int64
+        # reduction can transiently consume more memory than the genotype
+        # block itself. Scan in bounded column chunks first. The common
+        # missing-free case then needs no persistent mask or integer cast;
+        # the complete diagnostic path is retained when a missing call exists.
+        scan_columns = min(64, G.shape[1])
+        has_missing = any(
+            bool(np.isnan(G[:, start:start + scan_columns]).any())
+            for start in range(0, G.shape[1], scan_columns)
         )
-        if mask.any():
+        if has_missing:
+            mask = np.isnan(G)
+            missing_counts = mask.sum(axis=0, dtype=np.int64)
+            self._record_genotype_missingness(
+                blk_start, blk_end, mask, counts=missing_counts
+            )
+            nobs = G.shape[0] - missing_counts
+            col_means = np.divide(
+                np.nansum(G, axis=0, dtype=np.float64),
+                nobs,
+                out=np.zeros(G.shape[1], dtype=np.float64),
+                where=nobs > 0,
+            )
             rr, cc = np.where(mask)
             G[rr, cc] = col_means[cc]
+            del mask, rr, cc
+        else:
+            col_means = G.mean(axis=0, dtype=np.float64)
         G -= col_means
         if self.genotype_scale == "hwe":
             # With mean dosage mu=2p, sqrt(mu * (1-mu/2)) is sqrt(2p(1-p)).
             col_std = np.sqrt(np.maximum(col_means * (1.0 - 0.5 * col_means), 0.0))
         else:
-            col_std = G.std(axis=0, ddof=self.ddof)
+            centered_ss = np.einsum("ij,ij->j", G, G, optimize=False)
+            col_std = np.sqrt(centered_ss / float(G.shape[0] - self.ddof))
         good = np.isfinite(col_std) & (col_std > self.eps_var)
         if np.any(good):
             G[:, good] /= col_std[good]
         if np.any(~good):
             G[:, ~good] = 0.0
-        return np.asarray(G, dtype=np.float64, order="F")
+        result = np.asarray(G, dtype=np.float64, order="F")
+        self._record_performance_phase(
+            "genotype_standardization",
+            time.perf_counter() - standardize_wall_started,
+            time.process_time() - standardize_cpu_started,
+        )
+        return result
+
+    def _record_genotype_missingness(
+        self,
+        blk_start: int,
+        blk_end: int,
+        mask: np.ndarray,
+        *,
+        counts: np.ndarray | None = None,
+    ) -> None:
+        """Retain call rate and differential-missingness evidence before imputation."""
+        # A few low-level reader tests construct the object with ``__new__`` to
+        # exercise decode forwarding in isolation.  Missingness diagnostics are
+        # available only on fully initialized estimators.
+        if not hasattr(self, "genotype_missing_call_count"):
+            return
+        if counts is None:
+            counts = mask.sum(axis=0, dtype=np.int64)
+        else:
+            counts = np.asarray(counts, dtype=np.int64)
+        estimators = getattr(self, "_shared_missingness_estimators", (self,))
+        for estimator in estimators:
+            estimator.genotype_missing_call_count[blk_start:blk_end] = counts
+            correlations = []
+            for target in (estimator.env, estimator.pheno):
+                result = np.zeros(blk_end - blk_start, dtype=np.float64)
+                if target is not None:
+                    centered = np.asarray(target, dtype=np.float64)
+                    centered = centered - centered.mean()
+                    target_norm = float(np.linalg.norm(centered))
+                    valid = (
+                        (counts > 0)
+                        & (counts < estimator.nsamp)
+                        & (target_norm > 0.0)
+                    )
+                    if np.any(valid):
+                        missing_norm = np.sqrt(
+                            counts[valid]
+                            * (1.0 - counts[valid] / float(estimator.nsamp))
+                        )
+                        numerator = (
+                            np.asarray(mask[:, valid], dtype=np.float64).T
+                            @ centered
+                        )
+                        result[valid] = numerator / (
+                            missing_norm * target_norm
+                        )
+                correlations.append(result)
+            estimator.genotype_missing_environment_correlation[
+                blk_start:blk_end
+            ] = correlations[0]
+            estimator.genotype_missing_phenotype_correlation[
+                blk_start:blk_end
+            ] = correlations[1]
+
+    def _missing_genotype_diagnostics(self) -> dict[str, float | int | str | bool]:
+        """Summarize documented warning thresholds for cohort-mean imputation."""
+        counts = np.asarray(self.genotype_missing_call_count, dtype=np.int64)
+        missing_fraction = counts / float(self.nsamp)
+        maximum_missing = float(np.max(missing_fraction, initial=0.0))
+        maximum_environment = float(
+            np.max(
+                np.abs(self.genotype_missing_environment_correlation), initial=0.0
+            )
+        )
+        maximum_phenotype = float(
+            np.max(
+                np.abs(self.genotype_missing_phenotype_correlation), initial=0.0
+            )
+        )
+        call_rate_warning_threshold = 0.05
+        differential_warning_threshold = 0.10
+        warning = bool(
+            maximum_missing > call_rate_warning_threshold
+            or maximum_environment > differential_warning_threshold
+            or maximum_phenotype > differential_warning_threshold
+        )
+        if warning and not self._missingness_warning_logged:
+            self.log._log(
+                "[gxe:missingness:warning] Cohort-mean genotype imputation "
+                "requires sensitivity analysis: max missing fraction="
+                f"{maximum_missing:.6g}, max |corr(missing,E)|="
+                f"{maximum_environment:.6g}, max |corr(missing,y)|="
+                f"{maximum_phenotype:.6g}."
+            )
+            self._missingness_warning_logged = True
+        return {
+            "genotype_imputation": "cohort_variant_mean_before_projection",
+            "genotype_variants_with_missing_calls": int(np.count_nonzero(counts)),
+            "genotype_missing_calls": int(np.sum(counts, dtype=np.int64)),
+            "minimum_genotype_call_rate": float(1.0 - maximum_missing),
+            "maximum_missing_environment_correlation": maximum_environment,
+            "maximum_missing_phenotype_correlation": maximum_phenotype,
+            "call_rate_warning_threshold": call_rate_warning_threshold,
+            "differential_missingness_warning_threshold": differential_warning_threshold,
+            "missingness_warning": warning,
+            "mean_imputation_validity": (
+                "requires_sensitivity_analysis"
+                if warning
+                else "no_threshold_exceedance_observed"
+            ),
+        }
 
     def _project_and_center_inplace(self, M: np.ndarray) -> np.ndarray:
         if self.p_eff > 0:
@@ -2273,8 +2976,16 @@ class GenomewideEnvLDScore:
                     blk_start=int(s),
                     blk_end=int(e),
                     eps_var=float(self.eps_var),
-                    require_missing_free=True,
+                    require_missing_free=False,
             )
+            if int(result.get("missing_genotype_calls", 0)):
+                self.log._log(
+                    "[gxe:native] Missing genotype calls require per-variant "
+                    "differential-missingness diagnostics; falling back to the "
+                    "streaming Python oracle for this reference."
+                )
+                self.native_backend = "python"
+                return self._precompute_residual_variances_python()
             for name in arrays:
                 arrays[name][s:e] = np.asarray(result[name], dtype=np.float64)
             max_leak_x = max(
@@ -2356,6 +3067,7 @@ class GenomewideEnvLDScore:
                 self.native_feature_moment_integrity_reason
             ),
         }
+        self.feature_diagnostics.update(self._missing_genotype_diagnostics())
         self.log._log(
             "[gxe:native:invariants] max fixed-effect leakage "
             f"X={max_leak_x:.3e}, W={max_leak_w:.3e}; "
@@ -2518,6 +3230,7 @@ class GenomewideEnvLDScore:
             "max_trace_error_additive": float(np.max(np.abs(trace_x - self.df_corr))),
             "max_trace_error_interaction": float(np.max(np.abs(trace_w - self.df_corr))),
         }
+        self.feature_diagnostics.update(self._missing_genotype_diagnostics())
         self.log._log(
             "[gxe:invariants] max fixed-effect leakage "
             f"X={max_projection_leakage_x:.3e}, W={max_projection_leakage_w:.3e}; "
@@ -2552,24 +3265,18 @@ class GenomewideEnvLDScore:
         target_gib = float(self.target_xz_mem)
         itemsize = int(np.dtype(self.dtype).itemsize)
         native_direct = getattr(self, "native_backend", "python") == "direct"
-        # Ordinary references use additive-analogous block-local deletion from
-        # their completed LD-score rows.  Only legacy reference shards retain
-        # the exact two-sided within-block machinery.
-        exact_jackknife = self.jackknife_ids is not None and bool(
-            getattr(self, "shard_mode", False)
-        )
-        resident_multiplier = 4 if exact_jackknife else 2
+        resident_multiplier = 2
         if native_direct:
             # Let U=N*K*B*8.  Each opaque panel owns S and e*S.  Preparing
             # a panel peaks at its 2U input plus a 4U snapshot. Exact JK keeps
             # both 2B stored sketches during block preparation, but never keeps
             # the global and block opaque panels together.
             if itemsize == np.dtype(np.float64).itemsize:
-                peak_multiplier = 8 if exact_jackknife else 6
+                peak_multiplier = 6
             else:
                 # The two float32 stored sketches use 2U total. Python's 2U
                 # float64 call input and C++'s 4U opaque snapshot peak at 8U.
-                peak_multiplier = 8 if exact_jackknife else 7
+                peak_multiplier = 7
             denominator_itemsize = np.dtype(np.float64).itemsize
         else:
             peak_multiplier = resident_multiplier
@@ -2602,11 +3309,7 @@ class GenomewideEnvLDScore:
         label = (
             "native opaque-panel preparation peak"
             if native_direct
-            else (
-                "global+one-block in-memory sketches"
-                if exact_jackknife
-                else "paired global sketches"
-            )
+            else "paired global sketches"
         )
         self.log._log(
             f"[gxe:auto_vchunk] dtype={self.dtype} target≈{target_gib:.1f} GiB, "
@@ -2774,22 +3477,11 @@ class GenomewideEnvLDScore:
         blk_start: int,
         blk_end: int,
         probes: np.ndarray,
-        jackknife_ids: np.ndarray | None,
-    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    ) -> tuple[np.ndarray, np.ndarray]:
         if self._native_context is None:
             raise RuntimeError("The bounded native GxE backend was not initialized.")
         length = blk_end - blk_start
-        if jackknife_ids is None:
-            unique_ids = np.asarray([0], dtype=np.int32)
-            dense_ids = np.zeros(length, dtype=np.int32)
-        else:
-            unique_ids = np.unique(np.asarray(jackknife_ids, dtype=np.int32))
-            if unique_ids.size > 4:
-                raise RuntimeError(
-                    "A GxE compute block intersects more than four jackknife groups; "
-                    "reduce --step-size or use the Python backend."
-                )
-            dense_ids = np.searchsorted(unique_ids, jackknife_ids).astype(np.int32)
+        dense_ids = np.zeros(length, dtype=np.int32)
         started = time.perf_counter()
         try:
             source_x, source_w, missing = self._native_context.source_block(
@@ -2809,7 +3501,7 @@ class GenomewideEnvLDScore:
                 ),
                 probes=np.asfortranarray(probes, dtype=np.float64),
                 group_ids=dense_ids,
-                num_groups=int(unique_ids.size),
+                num_groups=1,
                 require_missing_free=True,
             )
         finally:
@@ -2821,7 +3513,7 @@ class GenomewideEnvLDScore:
             )
         if int(missing) != 0:
             raise RuntimeError("Native GxE source unexpectedly consumed missing genotypes.")
-        return unique_ids, np.asarray(source_x), np.asarray(source_w)
+        return np.asarray(source_x), np.asarray(source_w)
 
     def _native_target_block(
         self,
@@ -2926,82 +3618,26 @@ class GenomewideEnvLDScore:
             raise RuntimeError("Native GxE projected-source validation was non-finite.")
         return leakage
 
-    def _compute_within_jackknife_scores(
-        self,
-        blocks: list[tuple[int, int]],
-        vtiles: list[tuple[int, int]],
-    ) -> dict[str, np.ndarray] | None:
-        """Legacy reread oracle retained for focused equivalence tests only."""
-        if self.jackknife_ids is None:
-            return None
-        nblock = len(self.jackknife_labels)
-        within = {
-            key: np.zeros((nblock, self.nbins, self.nbins), dtype=np.float64)
-            for key in ("xx", "xw", "wx", "ww")
-        }
-        self.log._log("[gxe:jackknife:oracle] using legacy reread implementation.")
-        for v0, vt in vtiles:
-            for block_id in range(nblock):
-                relevant: list[tuple[int, int, np.ndarray]] = []
-                for s, e in blocks:
-                    local = np.flatnonzero(self.jackknife_ids[s:e] == block_id)
-                    if local.size:
-                        relevant.append((s, e, local))
-
-                sketch_x = np.zeros((self.nsamp, self.nbins * vt), dtype=self.dtype, order="F")
-                sketch_w = np.zeros((self.nsamp, self.nbins * vt), dtype=self.dtype, order="F")
-                for s, e, local in relevant:
-                    geno = self._read_genotype_block(s, e)
-                    x = self._prepare_additive_block(s, e, G=geno, apply_scale=True, out_dtype=self.dtype)
-                    w = self._prepare_interaction_block(s, e, G=geno, apply_scale=True, out_dtype=self.dtype)
-                    probes = self._generate_random_block(L=e - s, v_count=vt, blk_start=s, v_start=v0)
-                    annot_local = np.asarray(self.annot[s:e][local], dtype=self.dtype)
-                    probes_local = np.asarray(probes[local], order="F")
-                    self._accumulate_sketch_block(
-                        sketch_x, np.asarray(x[:, local], order="F"), probes_local, annot_local
-                    )
-                    self._accumulate_sketch_block(
-                        sketch_w, np.asarray(w[:, local], order="F"), probes_local, annot_local
-                    )
-                    del geno, x, w, probes, probes_local, annot_local
-
-                for s, e, local in relevant:
-                    geno = self._read_genotype_block(s, e)
-                    annot_left = np.asarray(self.annot[s:e][local], dtype=np.float64)
-                    x = self._prepare_additive_block(s, e, G=geno, apply_scale=True, out_dtype=self.dtype)
-                    w = self._prepare_interaction_block(s, e, G=geno, apply_scale=True, out_dtype=self.dtype)
-                    for key, left, sketch in (
-                        ("xx", x, sketch_x), ("xw", x, sketch_w),
-                        ("wx", w, sketch_x), ("ww", w, sketch_w),
-                    ):
-                        work = np.asarray(left[:, local].T @ sketch, dtype=np.float64)
-                        self._accumulate_annotation_pair_sums(
-                            work, annot_left, within[key][block_id], vt
-                        )
-                        del work
-                    del geno, x, w, annot_left
-                del sketch_x, sketch_w
-                gc.collect()
-        for key in within:
-            within[key] /= float(self.nvecs)
-        return within
-
     def _save_score_file(self, path: str, score: np.ndarray) -> None:
-        snpcols = ["CHR", "SNP", "BP"]
-        if self.snplist is None:
-            snpdf = pd.DataFrame(np.nan * np.ones((self.nsnps, 3)), columns=snpcols)
-        else:
-            snpdf = self.snplist[["CHR", "SNP", "BP"]].copy()
-            snpdf.columns = snpcols
-        scores_df = pd.DataFrame(score, columns=self.l2cols)
-        out_df = pd.concat([snpdf, scores_df], axis=1)
-        self._atomic_dataframe(
-            out_df,
-            path,
-            sep="\t",
-            compression="gzip",
-            float_format="%.17g" if self.shard_mode else "%.10g",
-        )
+        with self._performance_phase("output_conversion"):
+            snpcols = ["CHR", "SNP", "BP"]
+            if self.snplist is None:
+                snpdf = pd.DataFrame(
+                    np.nan * np.ones((self.nsnps, 3)), columns=snpcols
+                )
+            else:
+                snpdf = self.snplist[["CHR", "SNP", "BP"]].copy()
+                snpdf.columns = snpcols
+            scores_df = pd.DataFrame(score, columns=self.l2cols)
+            out_df = pd.concat([snpdf, scores_df], axis=1)
+        with self._performance_phase("output_serialization_compression_staging"):
+            self._atomic_dataframe(
+                out_df,
+                path,
+                sep="\t",
+                compression="gzip",
+                float_format=_REFERENCE_FLOAT_FORMAT,
+            )
 
     @staticmethod
     def _atomic_dataframe(frame: pd.DataFrame, path: str, **kwargs) -> None:
@@ -3011,7 +3647,31 @@ class GenomewideEnvLDScore:
         os.fchmod(fd, 0o600)
         os.close(fd)
         try:
-            frame.to_csv(temporary, index=False, **kwargs)
+            compression = kwargs.pop("compression", None)
+            kwargs.setdefault("chunksize", 65_536)
+            if compression == "gzip":
+                # Avoid embedding the random staging filename in the gzip
+                # header and favor throughput over maximum compression. The
+                # 17-digit numeric representation remains lossless.
+                with open(temporary, "wb") as raw:
+                    with gzip.GzipFile(
+                        filename="",
+                        mode="wb",
+                        compresslevel=1,
+                        fileobj=raw,
+                        mtime=0,
+                    ) as compressed:
+                        with io.TextIOWrapper(
+                            compressed, encoding="utf-8", newline=""
+                        ) as text:
+                            frame.to_csv(text, index=False, **kwargs)
+            else:
+                frame.to_csv(
+                    temporary,
+                    index=False,
+                    compression=compression,
+                    **kwargs,
+                )
             os.replace(temporary, target)
         finally:
             Path(temporary).unlink(missing_ok=True)
@@ -3056,8 +3716,6 @@ class GenomewideEnvLDScore:
             suffixes.extend([".gxe.diag.tsv.gz", ".gxe.ref.json"])
         if self.pheno is not None:
             suffixes.extend([".gxe.gwas.tsv.gz", ".gxe.gwis.tsv.gz", ".gxe.moments.json"])
-        if self.write_jackknife and self.shard_mode:
-            suffixes.append(".gxe.jackknife.npz")
         return [Path(f"{self.outpath}{suffix}") for suffix in suffixes]
 
     def _assert_output_paths_available(self) -> None:
@@ -3070,6 +3728,9 @@ class GenomewideEnvLDScore:
             )
 
     def _variant_digest(self) -> str:
+        shared = getattr(self, "_shared_variant_digest", None)
+        if shared is not None:
+            return str(shared)
         digest = hashlib.sha256()
         if self.snplist is None:
             for idx in range(self.nsnps):
@@ -3080,7 +3741,8 @@ class GenomewideEnvLDScore:
                 digest.update(b"\n")
         return digest.hexdigest()
 
-    def _analysis_fingerprint(self) -> str:
+    def _analysis_sample_fingerprint_prefix(self):
+        """Hash the selected IDs shared by all environments in one batch."""
         selected = self.sample_ids.iloc[self.row_sel]
         digest = hashlib.sha256()
         for fid, iid in selected.itertuples(index=False, name=None):
@@ -3088,6 +3750,15 @@ class GenomewideEnvLDScore:
             digest.update(b"\x1f")
             digest.update(str(iid).encode("utf-8"))
             digest.update(b"\n")
+        return digest
+
+    def _analysis_fingerprint(self) -> str:
+        shared = getattr(self, "_shared_analysis_sample_prefix", None)
+        digest = (
+            shared.copy()
+            if shared is not None
+            else self._analysis_sample_fingerprint_prefix()
+        )
         digest.update(np.asarray(self.env, dtype="<f8").tobytes(order="C"))
         design_hash = self.environment_transform.get("fixed_effect_design_sha256")
         if not isinstance(design_hash, str) or len(design_hash) != 64:
@@ -3100,7 +3771,9 @@ class GenomewideEnvLDScore:
         """Return compact exact statistics for ``P diag(e**2) P`` traces."""
         n = self.nsamp
         intercept = np.ones((n, 1), dtype=np.float64) / math.sqrt(float(n))
-        q_full = _orthonormalize_columns(np.column_stack([intercept, self.C_int]))
+        q_full = _orthonormalize_columns(
+            np.column_stack([intercept, self.C_int])
+        )
         expected_rank = int(self.C_int.shape[1]) + 1
         if q_full.shape != (n, expected_rank):
             raise RuntimeError(
@@ -3235,6 +3908,8 @@ class GenomewideEnvLDScore:
             "fixed_effect_rank_excluding_intercept": self.p_eff,
             "residual_rank": self.df_corr,
             "kernel_mode": self.kernel_mode,
+            "feature_convention": self.feature_convention,
+            "feature_convention_version": 1,
             "genotype_scale": self.genotype_scale,
             "ddof": self.ddof,
             "eps_var": self.eps_var,
@@ -3302,7 +3977,28 @@ class GenomewideEnvLDScore:
                     "blas_vendor", "cxx_standard", "optimization",
                     "architecture_tuning", "openmp_enabled",
                     "native_optimization_enabled", "platform",
-                    "blas_runtime_config",
+                    "blas_runtime_config", "gemm_execution_mode",
+                    "protected_pair_input_mode", "blas_runtime_isolation",
+                    "blas_runtime_threads", "blas_runtime_threading_layer",
+                    "blas_runtime_worker_affinity_policy",
+                    "gemm_integrity_enabled", "private_openblas_archive_sha256",
+                    "private_blas_backend", "private_blas_archive_sha256",
+                    "private_blas_source_commit",
+                    "private_blas_source_tree_sha256",
+                    "private_blas_config_family", "private_blas_header_sha256",
+                    "private_blas_cblas_header_sha256",
+                    "blas_runtime_thread_strategy", "blas_runtime_thread_ways",
+                    "blas_runtime_owner_thread_enforced",
+                    "blas_runtime_owner_thread_configured",
+                    "blas_runtime_environment_immutable",
+                    "blas_runtime_environment_contract",
+                    "blas_runtime_tls_enabled",
+                    "blas_runtime_corename", "gemm_telemetry_schema_version",
+                    "gemm_telemetry_capacity",
+                    "gemm_vendor_entry_outer_openmp_guard",
+                    "gemm_integrity_minimum_vendor_flops",
+                    "gemm_operand_numa_sampling_method",
+                    "gemm_operand_numa_sample_limit_per_operand",
                 )
             }
             compile_options["strict_feature_moment_verification"] = bool(
@@ -3564,64 +4260,53 @@ class GenomewideEnvLDScore:
     def _write_bundle_metadata(
         self,
         score_paths: dict[str, str],
-        within_jackknife: dict[str, np.ndarray] | None = None,
     ) -> tuple[str, str | None]:
         if any(x is None for x in (self.norm_x_all, self.norm_w_all, self.diag_nxe_x_all, self.diag_nxe_w_all)):
             raise RuntimeError("Feature metadata were not computed before writing the GxE bundle.")
         if self.snplist is None:
             raise ValueError("A BIM file is required for a reusable GxE summary bundle.")
 
-        variant_digest = self._variant_digest()
-        analysis_fingerprint = self._analysis_fingerprint()
-        trace_nxe, trace_nxe_sq = self._nxe_reference_traces()
+        with self._performance_phase("output_hashing"):
+            variant_digest = self._variant_digest()
+            analysis_fingerprint = self._analysis_fingerprint()
+        with self._performance_phase("fp64_output_diagnostics"):
+            trace_nxe, trace_nxe_sq = self._nxe_reference_traces()
         diag_path = f"{self.outpath}.gxe.diag.tsv.gz"
-        diag = self.snplist[["CHR", "SNP", "BP", "A1", "A2"]].copy()
-        diag["NORM_X"] = self.norm_x_all
-        diag["NORM_W"] = self.norm_w_all
-        diag["SCALE_X"] = self.inv_sqrt_resvar_x_all
-        diag["SCALE_W"] = self.inv_sqrt_resvar_w_all
-        diag["DNXE_X"] = self.diag_nxe_x_all
-        diag["DNXE_W"] = self.diag_nxe_w_all
-        diag["CORR_XW"] = self.corr_xw_all
-        for idx in range(self.nbins):
-            diag[f"ANNOT_{idx}"] = np.asarray(self.annot[:, idx], dtype=np.float64)
-        if self.jackknife_ids is not None:
-            diag["BLOCK"] = np.asarray(self.jackknife_ids, dtype=np.int32)
-        self._atomic_dataframe(diag, diag_path, sep="\t", compression="gzip", float_format="%.12g")
+        with self._performance_phase("output_conversion"):
+            diag = self.snplist[["CHR", "SNP", "BP", "A1", "A2"]].copy()
+            diag["NORM_X"] = self.norm_x_all
+            diag["NORM_W"] = self.norm_w_all
+            diag["SCALE_X"] = self.inv_sqrt_resvar_x_all
+            diag["SCALE_W"] = self.inv_sqrt_resvar_w_all
+            diag["DNXE_X"] = self.diag_nxe_x_all
+            diag["DNXE_W"] = self.diag_nxe_w_all
+            diag["CORR_XW"] = self.corr_xw_all
+            for idx in range(self.nbins):
+                diag[f"ANNOT_{idx}"] = np.asarray(
+                    self.annot[:, idx], dtype=np.float64
+                )
+        with self._performance_phase("output_serialization_compression_staging"):
+            self._atomic_dataframe(
+                diag,
+                diag_path,
+                sep="\t",
+                compression="gzip",
+                float_format=_REFERENCE_FLOAT_FORMAT,
+            )
 
         manifest_path = f"{self.outpath}.gxe.ref.json"
         files = {
             **{k: self._relative_output_path(v, manifest_path) for k, v in score_paths.items()},
             "diagonal": self._relative_output_path(diag_path, manifest_path),
         }
-        jackknife_payload = None
-        if within_jackknife is not None:
-            jackknife_path = f"{self.outpath}.gxe.jackknife.npz"
-            self._atomic_npz(
-                jackknife_path,
-                block_labels=np.asarray(self.jackknife_labels, dtype=np.str_),
-                within_xx=within_jackknife["xx"],
-                within_xw=within_jackknife["xw"],
-                within_wx=within_jackknife["wx"],
-                within_ww=within_jackknife["ww"],
-            )
-            files["jackknife"] = self._relative_output_path(jackknife_path, manifest_path)
-            jackknife_payload = {
-                "method": "two_sided_snp_kernel_deletion",
-                "num_blocks": len(self.jackknife_labels),
-                "block_labels": self.jackknife_labels,
-                "within_scale": "cross_product_over_rank_squared",
-            }
-        elif self.jackknife_ids is not None:
-            jackknife_payload = {
-                "method": "block_local_ldscore_deletion",
-                "num_blocks": len(self.jackknife_labels),
-                "block_labels": self.jackknife_labels,
-                "assumption": "cross_block_directional_ld_is_negligible",
-            }
         payload = {
             "kind": "summit.gxe.reference",
-            "schema_version": 3,
+            # Schema v4 pledges canonical binary64 annotation values.  A v3
+            # reference may instead have rounded a continuous annotation to
+            # its randomized retained-storage dtype and therefore names a
+            # (slightly) different estimand; the two must never be treated as
+            # interchangeable.
+            "schema_version": 4,
             "analysis_fingerprint": analysis_fingerprint,
             "variant_digest": variant_digest,
             "n_samples": self.nsamp,
@@ -3631,10 +4316,14 @@ class GenomewideEnvLDScore:
             "environment_transform": self.environment_transform,
             "covariates": self.cov_cols,
             "kernel_mode": self.kernel_mode,
+            "feature_convention": self.feature_convention,
+            "feature_convention_version": 1,
             "genotype_scale": self.genotype_scale,
             "ld_scale": "cross_product_over_rank_squared",
             "null_corrected": False,
             "annotation_names": list(self.l2cols),
+            "annotation_value_dtype": "float64",
+            "annotation_digest": self._annotation_digest(),
             "annotation_masses": np.asarray(self.nsnps_bin, dtype=np.float64).tolist(),
             "feature_diagnostics": self.feature_diagnostics,
             "resource_estimates": self.resource_estimates,
@@ -3651,9 +4340,9 @@ class GenomewideEnvLDScore:
                 "probe_stop": self.probe_offset + self.nvecs,
                 "dtype": str(np.dtype(self.dtype)),
                 "step_size": self.step_size,
+                "step_size_selection": self.step_size_selection,
                 "target_paired_sketch_gib": float(self.target_xz_mem),
                 "probe_tiles": [list(tile) for tile in (self._vtiles_used or [])],
-                "low_probe_jackknife_override": self.allow_low_probe_jackknife,
             },
             "genotype_files": (
                 self.feature_cache_metadata["genotype_files"]
@@ -3665,6 +4354,13 @@ class GenomewideEnvLDScore:
             ),
             "files": files,
         }
+        if self.cpu_placement is not None:
+            if self.cpu_placement_complete is not True:
+                raise RuntimeError(
+                    "Refusing to publish incomplete CPU placement evidence."
+                )
+            payload["cpu_placement"] = dict(self.cpu_placement)
+            payload["cpu_placement_complete"] = True
         if self.population_same_individual_products is not None:
             population_products = np.asarray(
                 self.population_same_individual_products, dtype=np.float64
@@ -3686,58 +4382,78 @@ class GenomewideEnvLDScore:
                     *[f"GxE:{name}" for name in self.l2cols],
                 ],
                 "same_individual_kernel_products": population_products.tolist(),
-                "jackknife_diagonal_method": "full_reference_reuse",
             }
-        if jackknife_payload is not None:
-            payload["jackknife"] = jackknife_payload
         if self.feature_cache_path is not None and self.feature_cache_sha256 is not None:
             payload["feature_cache"] = {
                 "path": self._relative_output_path(self.feature_cache_path, manifest_path),
                 "sha256": self.feature_cache_sha256,
             }
-        payload["artifact_sha256"] = {
-            key: self._file_sha256(_resolve_output)
-            for key, _resolve_output in {
-                **score_paths,
-                "diagonal": diag_path,
-                **({"jackknife": jackknife_path} if within_jackknife is not None else {}),
-            }.items()
-        }
-        self._atomic_json(payload, manifest_path)
-        reference_manifest_sha256 = self._file_sha256(manifest_path)
+        with self._performance_phase("output_hashing"):
+            payload["artifact_sha256"] = {
+                key: self._file_sha256(_resolve_output)
+                for key, _resolve_output in {
+                    **score_paths,
+                    "diagonal": diag_path,
+                }.items()
+            }
+        with self._performance_phase("output_serialization_staging"):
+            self._atomic_json(payload, manifest_path)
+        with self._performance_phase("output_hashing"):
+            reference_manifest_sha256 = self._file_sha256(manifest_path)
         self.log._log(f"Saving GxE reference manifest into: {manifest_path}")
 
         moments_path = None
         if self.pheno is not None:
             if self.score_x_all is None or self.score_w_all is None:
                 raise RuntimeError("Phenotype scores were not computed.")
-            base = self.snplist[["CHR", "SNP", "BP", "A1", "A2"]].copy()
-            base["N"] = self.nsamp
-            base["DF"] = self.df_corr
-            base["SCORE_MODE"] = "marginal_cross_product"
-            gwas_path = f"{self.outpath}.gxe.gwas.tsv.gz"
-            gwis_path = f"{self.outpath}.gxe.gwis.tsv.gz"
-            gwas = base.copy()
-            gwas["SCORE"] = self.score_x_all
-            gwis = base.copy()
-            gwis["SCORE"] = self.score_w_all
-            self._atomic_dataframe(gwas, gwas_path, sep="\t", compression="gzip", float_format="%.12g")
-            self._atomic_dataframe(gwis, gwis_path, sep="\t", compression="gzip", float_format="%.12g")
+            with self._performance_phase("output_conversion"):
+                base = self.snplist[["CHR", "SNP", "BP", "A1", "A2"]].copy()
+                base["N"] = self.nsamp
+                base["DF"] = self.df_corr
+                base["SCORE_MODE"] = "marginal_cross_product"
+                gwas_path = f"{self.outpath}.gxe.gwas.tsv.gz"
+                gwis_path = f"{self.outpath}.gxe.gwis.tsv.gz"
+                gwas = base.copy()
+                gwas["SCORE"] = self.score_x_all
+                gwis = base.copy()
+                gwis["SCORE"] = self.score_w_all
+            with self._performance_phase(
+                "output_serialization_compression_staging"
+            ):
+                self._atomic_dataframe(
+                    gwas,
+                    gwas_path,
+                    sep="\t",
+                    compression="gzip",
+                    float_format="%.12g",
+                )
+                self._atomic_dataframe(
+                    gwis,
+                    gwis_path,
+                    sep="\t",
+                    compression="gzip",
+                    float_format="%.12g",
+                )
             moments_path = f"{self.outpath}.gxe.moments.json"
+            with self._performance_phase("output_hashing"):
+                score_sha256 = {
+                    "gwas": self._file_sha256(gwas_path),
+                    "gwis": self._file_sha256(gwis_path),
+                }
             moments = {
                 "kind": "summit.gxe.phenotype_moments",
-                "schema_version": 3,
+                # Paired with the schema-v4 reference manifest written above.
+                "schema_version": 4,
                 "analysis_fingerprint": analysis_fingerprint,
                 "variant_digest": variant_digest,
                 "phenotype": self.phenotype_name,
                 "n_samples": self.nsamp,
                 "residual_rank": self.df_corr,
+                "feature_convention": self.feature_convention,
+                "feature_convention_version": 1,
                 "score_definition": "feature_transpose_residualized_y_over_sqrt_residual_rank",
                 "reference_manifest_sha256": reference_manifest_sha256,
-                "score_sha256": {
-                    "gwas": self._file_sha256(gwas_path),
-                    "gwis": self._file_sha256(gwis_path),
-                },
+                "score_sha256": score_sha256,
                 "q_nxe": float(np.dot(self.env * self.pheno, self.env * self.pheno)),
                 "q_residual": float(np.dot(self.pheno, self.pheno)),
                 "phenotype_residual_variance_fraction": self.phenotype_residual_fraction,
@@ -3746,14 +4462,14 @@ class GenomewideEnvLDScore:
                     "gwis": self._relative_output_path(gwis_path, moments_path),
                 },
             }
-            self._atomic_json(moments, moments_path)
+            with self._performance_phase("output_serialization_staging"):
+                self._atomic_json(moments, moments_path)
             self.log._log(f"Saving marginal GWAS/GWIS scores and NxE phenotype moments with prefix: {self.outpath}")
         return manifest_path, moments_path
 
     def _write_shard_metadata(
         self,
         score_paths: dict[str, str],
-        within_jackknife: dict[str, np.ndarray] | None,
     ) -> str:
         if not self.shard_mode or self.feature_cache_path is None or self.feature_cache_sha256 is None:
             raise RuntimeError("Shard metadata require a validated feature cache.")
@@ -3763,31 +4479,13 @@ class GenomewideEnvLDScore:
             for key, value in score_paths.items()
         }
         artifact_paths = dict(score_paths)
-        jackknife = None
-        if within_jackknife is not None:
-            jackknife_path = f"{self.outpath}.gxe.jackknife.npz"
-            self._atomic_npz(
-                jackknife_path,
-                block_labels=np.asarray(self.jackknife_labels, dtype=np.str_),
-                within_xx=within_jackknife["xx"],
-                within_xw=within_jackknife["xw"],
-                within_wx=within_jackknife["wx"],
-                within_ww=within_jackknife["ww"],
-            )
-            files["jackknife"] = self._relative_output_path(jackknife_path, manifest_path)
-            artifact_paths["jackknife"] = jackknife_path
-            jackknife = {
-                "method": "two_sided_snp_kernel_deletion",
-                "num_blocks": len(self.jackknife_labels),
-                "block_labels": list(self.jackknife_labels),
-                "within_scale": "cross_product_over_rank_squared",
-            }
         randomization = {
             "distribution": self.rand_dist,
             "algorithm": "philox_per_probe_block_v1",
             "seed": self.root_seed,
             "dtype": str(np.dtype(self.dtype)),
             "step_size": self.step_size,
+            "step_size_selection": self.step_size_selection,
             "num_vectors": self.nvecs,
             "probe_offset": self.probe_offset,
             "probe_stop": self.probe_offset + self.nvecs,
@@ -3810,9 +4508,12 @@ class GenomewideEnvLDScore:
             "annotation_digest": self._annotation_digest(),
             "jackknife_digest": self._jackknife_digest(),
             "kernel_mode": self.kernel_mode,
+            "feature_convention": self.feature_convention,
+            "feature_convention_version": 1,
             "genotype_scale": self.genotype_scale,
             "ld_scale": "cross_product_over_rank_squared",
             "annotation_names": list(self.l2cols),
+            "annotation_value_dtype": "float64",
             "feature_cache_sha256": self.feature_cache_sha256,
             "backend_provenance": self._backend_provenance("reference_shard"),
             "feature_backend_provenance": self.feature_backend_provenance,
@@ -3831,15 +4532,21 @@ class GenomewideEnvLDScore:
 
         payload = {
             "kind": "summit.gxe.reference_shard",
-            "schema_version": 2,
+            # Schema v3 shards pledge canonical binary64 annotation values; a
+            # v2 shard may have rounded continuous annotations to the
+            # randomized retained-storage dtype.
+            "schema_version": 3,
             "analysis_fingerprint": identity["analysis_fingerprint"],
             "variant_digest": identity["variant_digest"],
             "annotation_digest": identity["annotation_digest"],
             "jackknife_digest": identity["jackknife_digest"],
             "kernel_mode": self.kernel_mode,
+            "feature_convention": self.feature_convention,
+            "feature_convention_version": 1,
             "genotype_scale": self.genotype_scale,
             "ld_scale": "cross_product_over_rank_squared",
             "annotation_names": list(self.l2cols),
+            "annotation_value_dtype": "float64",
             "feature_cache": {
                 "path": self._relative_output_path(self.feature_cache_path, manifest_path),
                 "sha256": self.feature_cache_sha256,
@@ -3851,8 +4558,6 @@ class GenomewideEnvLDScore:
             "backend_provenance": identity["backend_provenance"],
             "feature_backend_provenance": identity["feature_backend_provenance"],
         }
-        if jackknife is not None:
-            payload["jackknife"] = jackknife
         self._atomic_json(payload, manifest_path)
         self.log._log(f"Saving non-fit-able GxE reference shard manifest into: {manifest_path}")
         return manifest_path
@@ -3930,18 +4635,11 @@ class GenomewideEnvLDScore:
                 stage_prefix = stage_dir / final_prefix.name
                 self.outpath = str(stage_prefix)
                 try:
-                    try:
-                        from threadpoolctl import threadpool_limits
-
-                        blas_context = threadpool_limits(limits=self.num_threads, user_api="blas")
-                    except Exception:
-                        blas_context = nullcontext()
-                    with blas_context:
-                        result = (
-                            self._compute_ldscore_impl()
-                            if compute_callback is None
-                            else compute_callback()
-                        )
+                    result = (
+                        self._compute_ldscore_impl()
+                        if compute_callback is None
+                        else compute_callback()
+                    )
 
                     # Output artifacts remain beside their manifest after
                     # publication, so their basename-relative paths are
@@ -3978,12 +4676,13 @@ class GenomewideEnvLDScore:
                         )
 
                     staged_outputs = self._planned_output_paths()
-                    expected_published_hashes = {
-                        Path(
-                            f"{final_prefix}{str(staged)[len(str(stage_prefix)) :]}"
-                        ): self._file_sha256(str(staged))
-                        for staged in staged_outputs
-                    }
+                    with self._performance_phase("output_hashing"):
+                        expected_published_hashes = {
+                            Path(
+                                f"{final_prefix}{str(staged)[len(str(stage_prefix)) :]}"
+                            ): self._file_sha256(str(staged))
+                            for staged in staged_outputs
+                        }
 
                     def publication_priority(path: Path) -> tuple[int, str]:
                         name = path.name
@@ -3996,24 +4695,31 @@ class GenomewideEnvLDScore:
                         return (0, name)
 
                     def verify_published_bundle() -> None:
-                        for path, device, inode in published:
-                            try:
-                                observed = path.stat(follow_symlinks=False)
-                            except FileNotFoundError as exc:
-                                raise RuntimeError(
-                                    "A published GxE artifact disappeared before manifest commit: "
-                                    f"{path}."
-                                ) from exc
-                            if observed.st_dev != device or observed.st_ino != inode:
-                                raise RuntimeError(
-                                    "A published GxE artifact was concurrently replaced before "
-                                    f"manifest commit: {path}."
-                                )
-                            if self._file_sha256(str(path)) != expected_published_hashes[path]:
-                                raise RuntimeError(
-                                    "A published GxE artifact was modified in place before "
-                                    f"manifest commit: {path}."
-                                )
+                        with self._performance_phase("output_hashing"):
+                            for path, device, inode in published:
+                                try:
+                                    observed = path.stat(follow_symlinks=False)
+                                except FileNotFoundError as exc:
+                                    raise RuntimeError(
+                                        "A published GxE artifact disappeared before "
+                                        f"manifest commit: {path}."
+                                    ) from exc
+                                if (
+                                    observed.st_dev != device
+                                    or observed.st_ino != inode
+                                ):
+                                    raise RuntimeError(
+                                        "A published GxE artifact was concurrently replaced "
+                                        f"before manifest commit: {path}."
+                                    )
+                                if (
+                                    self._file_sha256(str(path))
+                                    != expected_published_hashes[path]
+                                ):
+                                    raise RuntimeError(
+                                        "A published GxE artifact was modified in place "
+                                        f"before manifest commit: {path}."
+                                    )
 
                     for staged in sorted(staged_outputs, key=publication_priority):
                         priority, _ = publication_priority(staged)
@@ -4024,17 +4730,21 @@ class GenomewideEnvLDScore:
                             verify_published_bundle()
                         suffix = str(staged)[len(str(stage_prefix)):]
                         final = Path(f"{final_prefix}{suffix}")
-                        if self.overwrite:
-                            os.replace(staged, final)
-                            continue
-                        staged_stat = staged.stat()
-                        try:
-                            os.link(staged, final)
-                        except FileExistsError as exc:
-                            raise FileExistsError(
-                                f"Refusing to overwrite concurrently created GxE artifact: {final}."
-                            ) from exc
-                        published.append((final, staged_stat.st_dev, staged_stat.st_ino))
+                        with self._performance_phase("output_publication"):
+                            if self.overwrite:
+                                os.replace(staged, final)
+                                continue
+                            staged_stat = staged.stat()
+                            try:
+                                os.link(staged, final)
+                            except FileExistsError as exc:
+                                raise FileExistsError(
+                                    "Refusing to overwrite concurrently created GxE "
+                                    f"artifact: {final}."
+                                ) from exc
+                            published.append(
+                                (final, staged_stat.st_dev, staged_stat.st_ino)
+                            )
                     if not self.overwrite:
                         verify_published_bundle()
 
@@ -4088,11 +4798,6 @@ class GenomewideEnvLDScore:
 
     def _compute_ldscore_impl(self):
         self._assert_output_paths_available()
-        _validate_jackknife_probe_count(
-            self.nvecs,
-            self.write_jackknife and not self.shard_mode,
-            self.allow_low_probe_jackknife,
-        )
         self.log._log(f"num_vecs: {self.nvecs}, step_size: {self.step_size}, seed: {self.root_seed}")
         self.log._log(f"Using {self.rand_dist} random vectors.")
         if self.native_backend == "direct":
@@ -4121,16 +4826,12 @@ class GenomewideEnvLDScore:
                 time.perf_counter() - feature_started
             )
         blocks = self._make_compute_blocks()
-        exact_jackknife = self.jackknife_ids is not None and self.shard_mode
-        jackknife_blocks = (
-            self._make_jackknife_compute_blocks() if exact_jackknife else []
-        )
         vtiles = self._auto_vtiles()
         self._vtiles_used = list(vtiles)
 
         max_vt = max(vt for _, vt in vtiles)
         itemsize = int(np.dtype(self.dtype).itemsize)
-        if self.native_backend == "direct" and not exact_jackknife:
+        if self.native_backend == "direct":
             native_cap_elements = _native_execution_workspace_bytes(
                 self.native_workspace_gib
             ) // 8
@@ -4215,15 +4916,15 @@ class GenomewideEnvLDScore:
             int(getattr(self, "native_feature_step_size", self.step_size)),
             self.nsnps,
         )
-        resident_multiplier = 4 if exact_jackknife else 2
+        resident_multiplier = 2
         # A native projected panel owns S and e*S for one 2B source sketch.
         # Block and global panels are never retained at the same time.
         native_opaque_retained_multiplier = 4 if self.native_backend == "direct" else 0
         native_opaque_prepare_peak_multiplier = (
             (
-                (8 if exact_jackknife else 6)
+                6
                 if itemsize == np.dtype(np.float64).itemsize
-                else (8 if exact_jackknife else 7)
+                else 7
             )
             if self.native_backend == "direct"
             else 0
@@ -4232,14 +4933,7 @@ class GenomewideEnvLDScore:
         source_columns = self.nbins * max_vt
         q_rank = self.p_eff + 1
         global_source_columns = 2 * self.nbins * max_vt
-        jackknife_source_columns = (
-            2 * self.nbins * max_vt if exact_jackknife else 0
-        )
-        jackknife_block_bytes = (
-            0
-            if not exact_jackknife
-            else 2 * self.nsamp * self.nbins * max_vt * itemsize
-        )
+        jackknife_source_columns = 0
         native_feature_moment_copies = (
             8 if self.native_strict_feature_moment_verification else 4
         )
@@ -4296,7 +4990,7 @@ class GenomewideEnvLDScore:
         )
         native_target_bytes = 8 * (
             self.nsamp * max_block
-            + (6 if exact_jackknife else 4) * max_block * target_source_columns
+            + 4 * max_block * target_source_columns
             + 2 * max_block
             + native_target_integrity_elements
         )
@@ -4389,17 +5083,12 @@ class GenomewideEnvLDScore:
             "target_work_native_plus_float64_gib": float(
                 2 * max_block * target_source_columns * 8 / (1024 ** 3)
             ),
-            "jackknife_in_memory_block_sketch_gib": float(
-                jackknife_block_bytes / (1024 ** 3)
-            ),
             "blas_threads": int(self.num_threads),
             "bed_reader_threads": int(self.decode_threads),
         }
         self.log._log(
             "[gxe:resources] modeled resident sketch workspace="
             f"{self.resource_estimates['resident_sketch_workspace_gib']:.3f} GiB; "
-            "jackknife block sketch in memory="
-            f"{self.resource_estimates['jackknife_in_memory_block_sketch_gib']:.3f} GiB; "
             f"BLAS threads={self.num_threads}, bed-reader threads={self.decode_threads}."
         )
 
@@ -4410,15 +5099,9 @@ class GenomewideEnvLDScore:
             "ww": np.zeros((self.nsnps, self.nbins), dtype=np.float64),
         }
 
-        jackknife_units = sum(len(group) for group in jackknife_blocks)
-        units_per_tile = (
-            2 * len(execution_groups)
-            if not exact_jackknife
-            else 2 * jackknife_units + len(blocks)
-        )
+        units_per_tile = 2 * len(execution_groups)
         total_units = max(1, len(vtiles) * units_per_tile)
         bar = tqdm(total=total_units, desc="GxE-LD progress", unit="task", smoothing=0.2, disable=(not self.verbose))
-        within_jackknife = None
         max_native_source_leakage = 0.0
         population_probe_square_sums = None
         population_same_probe_products = None
@@ -4433,11 +5116,6 @@ class GenomewideEnvLDScore:
                 population_probe_square_sums.nbytes
                 + population_same_probe_products.nbytes
             ) / (1024 ** 3)
-        if exact_jackknife:
-            within_jackknife = {
-                key: np.zeros((len(self.jackknife_labels), self.nbins, self.nbins), dtype=np.float64)
-                for key in ("xx", "xw", "wx", "ww")
-            }
         try:
             for v0, Vt in vtiles:
                 kt = self.nbins * Vt
@@ -4446,135 +5124,45 @@ class GenomewideEnvLDScore:
                 )
                 global_x = sources[:, :kt]
                 global_w = sources[:, kt:2 * kt]
-                block_sources = None
-                block_x = None
-                block_w = None
                 global_panel = None
-                block_panel = None
                 try:
-                    source_groups = (
-                        [
-                            [((int(start), int(end)),) for start, end in group]
-                            for group in jackknife_blocks
-                        ]
-                        if within_jackknife is not None
-                        else [execution_groups]
-                    )
-                    for block_id, source_blocks in enumerate(source_groups):
-                        if within_jackknife is not None:
-                            block_sources = np.zeros(
-                                (self.nsamp, 2 * kt), dtype=self.dtype, order="F"
-                            )
-                            block_x = block_sources[:, :kt]
-                            block_w = block_sources[:, kt:2 * kt]
-
-                        # Each variant contributes once to the global source;
-                        # exact jackknifing mirrors it into only the current
-                        # in-memory block source.
-                        for constituent_blocks in source_blocks:
-                            s = int(constituent_blocks[0][0])
-                            e = int(constituent_blocks[-1][1])
-                            Z = self._generate_random_group(
-                                constituent_blocks, v_count=Vt, v_start=v0
-                            )
-                            if self.native_backend == "direct":
-                                unique_ids, source_x, source_w = self._native_source_block(
-                                    s, e, Z, None
-                                )
-                                if unique_ids.tolist() != [0]:
-                                    raise RuntimeError(
-                                        "A single-group native GxE source call returned "
-                                        f"unexpected group IDs {unique_ids.tolist()}."
-                                    )
-                                global_x += source_x[:, :kt]
-                                global_w += source_w[:, :kt]
-                                if block_sources is not None:
-                                    block_x += source_x[:, :kt]
-                                    block_w += source_w[:, :kt]
-                                del unique_ids, source_x, source_w
-                            else:
-                                G = self._read_genotype_block(s, e)
-                                X = self._prepare_additive_block(
-                                    s, e, G=G, apply_scale=True, out_dtype=self.dtype
-                                )
-                                W = self._prepare_interaction_block(
-                                    s, e, G=G, apply_scale=True, out_dtype=self.dtype
-                                )
-                                annot_blk = np.asarray(self.annot[s:e], dtype=self.dtype)
-                                self._accumulate_sketch_block(
-                                    global_x, X, Z, annot_blk, mirror_chunk=block_x
-                                )
-                                self._accumulate_sketch_block(
-                                    global_w, W, Z, annot_blk, mirror_chunk=block_w
-                                )
-                                del G, X, W, annot_blk
-                            del Z
-                            bar.update(1)
-
-                        if within_jackknife is None:
-                            continue
-
-                        # Seal and evaluate this block before allocating the
-                        # next one. No block sketch is written to disk.
+                    for constituent_blocks in execution_groups:
+                        s = int(constituent_blocks[0][0])
+                        e = int(constituent_blocks[-1][1])
+                        Z = self._generate_random_group(
+                            constituent_blocks, v_count=Vt, v_start=v0
+                        )
                         if self.native_backend == "direct":
-                            block_panel, leakage = self._native_prepare_projected_sources(
-                                block_sources
+                            source_x, source_w = self._native_source_block(
+                                s, e, Z
                             )
-                            max_native_source_leakage = max(
-                                max_native_source_leakage, leakage
+                            global_x += source_x[:, :kt]
+                            global_w += source_w[:, :kt]
+                            del source_x, source_w
+                        else:
+                            G = self._read_genotype_block(s, e)
+                            X = self._prepare_additive_block(
+                                s, e, G=G, apply_scale=True, out_dtype=self.dtype
                             )
-                            del block_x, block_w, block_sources
-                            block_x = block_w = block_sources = None
-                        for constituent_blocks in source_blocks:
-                            s = int(constituent_blocks[0][0])
-                            e = int(constituent_blocks[-1][1])
-                            annot_left = np.asarray(self.annot[s:e], dtype=np.float64)
-                            if self.native_backend == "direct":
-                                work_x, work_w = self._native_target_block(
-                                    s, e, block_panel
-                                )
-                            else:
-                                G = self._read_genotype_block(s, e)
-                                X = self._prepare_additive_block(
-                                    s, e, G=G, apply_scale=True, out_dtype=self.dtype
-                                )
-                                W = self._prepare_interaction_block(
-                                    s, e, G=G, apply_scale=True, out_dtype=self.dtype
-                                )
-                                work_x = np.asarray(X.T @ block_sources, dtype=np.float64)
-                                work_w = np.asarray(W.T @ block_sources, dtype=np.float64)
-                                del G, X, W
-                            self._accumulate_annotation_pair_sums(
-                                work_x[:, :kt], annot_left,
-                                within_jackknife["xx"][block_id], Vt,
+                            W = self._prepare_interaction_block(
+                                s, e, G=G, apply_scale=True, out_dtype=self.dtype
                             )
-                            self._accumulate_annotation_pair_sums(
-                                work_x[:, kt:2 * kt], annot_left,
-                                within_jackknife["xw"][block_id], Vt,
+                            # Source weights always derive from the canonical
+                            # binary64 annotations; only the retained sketch
+                            # storage below is permitted to round.
+                            annot_blk = np.asarray(
+                                self.annot[s:e], dtype=np.float64
                             )
-                            self._accumulate_annotation_pair_sums(
-                                work_w[:, :kt], annot_left,
-                                within_jackknife["wx"][block_id], Vt,
+                            self._accumulate_sketch_block(
+                                global_x, X, Z, annot_blk
                             )
-                            self._accumulate_annotation_pair_sums(
-                                work_w[:, kt:2 * kt], annot_left,
-                                within_jackknife["ww"][block_id], Vt,
+                            self._accumulate_sketch_block(
+                                global_w, W, Z, annot_blk
                             )
-                            del work_x, work_w, annot_left
-                            bar.update(1)
-                        block_panel = None
-                        if block_x is not None:
-                            del block_x
-                        if block_w is not None:
-                            del block_w
-                        if block_sources is not None:
-                            del block_sources
-                        block_x = block_w = block_sources = None
-                        gc.collect()
+                            del G, X, W, annot_blk
+                        del Z
+                        bar.update(1)
 
-                    # The global target pass is independent of jackknife block
-                    # count and uses the same bounded compute blocks as ordinary
-                    # genome-wide LD-score estimation.
                     if population_probe_square_sums is not None:
                         assert population_same_probe_products is not None
                         self._accumulate_population_diagonal_moments(
@@ -4625,14 +5213,7 @@ class GenomewideEnvLDScore:
                         del work_x, work_w
                         bar.update(1)
                 finally:
-                    block_panel = None
                     global_panel = None
-                    if block_x is not None:
-                        del block_x
-                    if block_w is not None:
-                        del block_w
-                    if block_sources is not None:
-                        del block_sources
                     if global_x is not None:
                         del global_x
                     if global_w is not None:
@@ -4695,17 +5276,11 @@ class GenomewideEnvLDScore:
             self.population_same_individual_products = None
 
         scores = {name: value / float(self.nvecs) for name, value in accum.items()}
-        if within_jackknife is not None:
-            within_jackknife = {
-                name: value / float(self.nvecs) for name, value in within_jackknife.items()
-            }
-
-        return self._finalize_ldscore_outputs(scores, within_jackknife)
+        return self._finalize_ldscore_outputs(scores)
 
     def _finalize_ldscore_outputs(
         self,
         scores: Mapping[str, np.ndarray],
-        within_jackknife: Mapping[str, np.ndarray] | None,
     ):
         """Validate and write already-computed in-memory directional scores."""
         self._assert_output_paths_available()
@@ -4720,61 +5295,54 @@ class GenomewideEnvLDScore:
                 )
             if not np.all(np.isfinite(array)):
                 raise ValueError(f"GxE {name.upper()} scores contain NaN or infinity.")
-        if within_jackknife is not None:
-            if self.jackknife_ids is None:
-                raise ValueError(
-                    "In-memory jackknife traces were supplied without configured "
-                    "GxE jackknife blocks."
-                )
-            if set(within_jackknife) != {"xx", "xw", "wx", "ww"}:
-                raise ValueError(
-                    "GxE jackknife directional trace set must be exactly XX/XW/WX/WW."
-                )
-            expected_shape = (
-                len(self.jackknife_labels),
-                self.nbins,
-                self.nbins,
-            )
-            for name, value in within_jackknife.items():
-                array = np.asarray(value)
-                if array.shape != expected_shape:
-                    raise ValueError(
-                        f"GxE {name.upper()} jackknife trace shape {array.shape} "
-                        f"does not match {expected_shape}."
-                    )
-                if not np.all(np.isfinite(array)):
-                    raise ValueError(
-                        f"GxE {name.upper()} jackknife traces contain NaN or infinity."
-                    )
-
         # Persist the raw realized-sample directional scores.  A common XX-like
         # M/r subtraction is not a valid finite-sample correction for XW/WX,
         # whose same-SNP cross-products are neither zero nor one.  The normal
         # equations below need the raw kernel Gram traces in every direction.
-        annot64 = np.asarray(self.annot, dtype=np.float64)
-        max_cross_abs = 0.0
-        max_cross_rel = 0.0
-        r2 = float(self.df_corr * self.df_corr)
-        for left_bin in range(self.nbins):
-            for source_bin in range(self.nbins):
-                forward = (
-                    r2
-                    * np.dot(annot64[:, left_bin], scores["xw"][:, source_bin])
-                    / (self.nsnps_bin[left_bin] * self.nsnps_bin[source_bin])
-                )
-                reverse = (
-                    r2
-                    * np.dot(annot64[:, source_bin], scores["wx"][:, left_bin])
-                    / (self.nsnps_bin[source_bin] * self.nsnps_bin[left_bin])
-                )
-                delta = abs(float(forward - reverse))
-                max_cross_abs = max(max_cross_abs, delta)
-                max_cross_rel = max(
-                    max_cross_rel,
-                    delta / max(abs(float(forward)), abs(float(reverse)), np.finfo(float).tiny),
-                )
-        self.feature_diagnostics["max_xw_wx_trace_asymmetry_absolute"] = max_cross_abs
-        self.feature_diagnostics["max_xw_wx_trace_asymmetry_relative"] = max_cross_rel
+        with self._performance_phase("fp64_output_diagnostics"):
+            annot64 = np.asarray(self.annot, dtype=np.float64)
+            max_cross_abs = 0.0
+            max_cross_rel = 0.0
+            r2 = float(self.df_corr * self.df_corr)
+            for left_bin in range(self.nbins):
+                for source_bin in range(self.nbins):
+                    forward = (
+                        r2
+                        * _non_blas_fp64_inner_product(
+                            annot64[:, left_bin], scores["xw"][:, source_bin]
+                        )
+                        / (
+                            self.nsnps_bin[left_bin]
+                            * self.nsnps_bin[source_bin]
+                        )
+                    )
+                    reverse = (
+                        r2
+                        * _non_blas_fp64_inner_product(
+                            annot64[:, source_bin], scores["wx"][:, left_bin]
+                        )
+                        / (
+                            self.nsnps_bin[source_bin]
+                            * self.nsnps_bin[left_bin]
+                        )
+                    )
+                    delta = abs(float(forward - reverse))
+                    max_cross_abs = max(max_cross_abs, delta)
+                    max_cross_rel = max(
+                        max_cross_rel,
+                        delta
+                        / max(
+                            abs(float(forward)),
+                            abs(float(reverse)),
+                            np.finfo(float).tiny,
+                        ),
+                    )
+            self.feature_diagnostics[
+                "max_xw_wx_trace_asymmetry_absolute"
+            ] = max_cross_abs
+            self.feature_diagnostics[
+                "max_xw_wx_trace_asymmetry_relative"
+            ] = max_cross_rel
         self.log._log(
             "[gxe:invariants] XW/WX aggregate trace asymmetry "
             f"max_abs={max_cross_abs:.3e}, max_rel={max_cross_rel:.3e}."
@@ -4802,9 +5370,9 @@ class GenomewideEnvLDScore:
             self._save_score_file(path, scores[name])
             self._log_score_summary(f"{labels[name]} LD scores", scores[name])
         if self.shard_mode:
-            self._write_shard_metadata(score_paths, within_jackknife=within_jackknife)
+            self._write_shard_metadata(score_paths)
         else:
-            self._write_bundle_metadata(score_paths, within_jackknife=within_jackknife)
+            self._write_bundle_metadata(score_paths)
 
         try:
             col_sums = pd.Series(self.nsnps_bin, index=self.l2cols)

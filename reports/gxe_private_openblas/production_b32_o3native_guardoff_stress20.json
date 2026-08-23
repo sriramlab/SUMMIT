@@ -1,0 +1,396 @@
+{
+  "arguments": {
+    "blas_threads": 32,
+    "decode_threads": 32,
+    "jackknife_blocks": 100,
+    "m": 1207,
+    "max_abs_error": 1e-05,
+    "n": 291273,
+    "probe_counts": [
+      32
+    ],
+    "repeats": 1,
+    "scratch_gib": 64.0,
+    "scratch_model_n": 300000,
+    "seed": 20260809,
+    "skip_materialized": true,
+    "step_size": 500,
+    "stress_repeats": 20,
+    "target_panel_columns": 64,
+    "warmups": 0,
+    "workspace_gib": 16.0
+  },
+  "cases": [
+    {
+      "B": 32,
+      "actual_target_columns_2b": 64,
+      "actual_target_columns_4b": 128,
+      "correctness": {
+        "abft_repaired_output_columns": 0,
+        "fresh_decode_input_retries": 0,
+        "max_abs_source_error": 2.334061832698353e-10,
+        "max_abs_target_2b_error": 2.2822641767561436e-06,
+        "max_abs_target_4b_error": 2.2822641767561436e-06,
+        "max_source_projection_leakage": 4.9507112796743084e-18,
+        "stress_source_errors": [
+          2.334061832698353e-10,
+          2.334061832698353e-10,
+          2.334061832698353e-10,
+          2.334061832698353e-10,
+          2.334061832698353e-10,
+          2.334061832698353e-10,
+          2.334061832698353e-10,
+          2.334061832698353e-10,
+          2.334061832698353e-10,
+          2.334061832698353e-10,
+          2.334061832698353e-10,
+          2.334061832698353e-10,
+          2.334061832698353e-10,
+          2.334061832698353e-10,
+          2.334061832698353e-10,
+          2.334061832698353e-10,
+          2.334061832698353e-10,
+          2.334061832698353e-10,
+          2.334061832698353e-10,
+          2.334061832698353e-10
+        ],
+        "stress_source_repeat_deltas": [
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0
+        ],
+        "stress_target_2b_errors": [
+          2.2822641767561436e-06,
+          2.2822641767561436e-06,
+          2.2822641767561436e-06,
+          2.2822641767561436e-06,
+          2.2822641767561436e-06,
+          2.2822641767561436e-06,
+          2.2822641767561436e-06,
+          2.2822641767561436e-06,
+          2.2822641767561436e-06,
+          2.2822641767561436e-06,
+          2.2822641767561436e-06,
+          2.2822641767561436e-06,
+          2.2822641767561436e-06,
+          2.2822641767561436e-06,
+          2.2822641767561436e-06,
+          2.2822641767561436e-06,
+          2.2822641767561436e-06,
+          2.2822641767561436e-06,
+          2.2822641767561436e-06,
+          2.2822641767561436e-06
+        ],
+        "stress_target_2b_repeat_deltas": [
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0
+        ],
+        "stress_target_4b_errors": [
+          2.2822641767561436e-06,
+          2.2822641767561436e-06,
+          2.2822641767561436e-06,
+          2.2822641767561436e-06,
+          2.2822641767561436e-06,
+          2.2822641767561436e-06,
+          2.2822641767561436e-06,
+          2.2822641767561436e-06,
+          2.2822641767561436e-06,
+          2.2822641767561436e-06,
+          2.2822641767561436e-06,
+          2.2822641767561436e-06,
+          2.2822641767561436e-06,
+          2.2822641767561436e-06,
+          2.2822641767561436e-06,
+          2.2822641767561436e-06,
+          2.2822641767561436e-06,
+          2.2822641767561436e-06,
+          2.2822641767561436e-06,
+          2.2822641767561436e-06
+        ],
+        "stress_target_4b_repeat_deltas": [
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0
+        ],
+        "threshold": 1e-05
+      },
+      "production_scratch_model": {
+        "configured_limit_bytes": 68719476736,
+        "dtype": "float64",
+        "jackknife_blocks": 100,
+        "monolithic_bytes": 15360000000,
+        "n": 300000,
+        "peak_one_block_mapped_bytes": 153600000,
+        "peak_tile_bytes": 15360000000,
+        "peak_tile_gib": 14.30511474609375,
+        "probe_tiles": [
+          [
+            0,
+            32
+          ]
+        ]
+      },
+      "timings_seconds": {
+        "dense_gemm_lower_bound_source": {
+          "maximum": 0.4824896480422467,
+          "median": 0.4824896480422467,
+          "minimum": 0.4824896480422467,
+          "raw": [
+            0.4824896480422467
+          ]
+        },
+        "dense_gemm_lower_bound_target_2b": {
+          "maximum": 0.736576508032158,
+          "median": 0.736576508032158,
+          "minimum": 0.736576508032158,
+          "raw": [
+            0.736576508032158
+          ]
+        },
+        "dense_gemm_lower_bound_target_4b": {
+          "maximum": 1.195942397986073,
+          "median": 1.195942397986073,
+          "minimum": 1.195942397986073,
+          "raw": [
+            1.195942397986073
+          ]
+        },
+        "native_feature": {
+          "maximum": 0.7861076829722151,
+          "median": 0.7861076829722151,
+          "minimum": 0.7861076829722151,
+          "raw": [
+            0.7861076829722151
+          ]
+        },
+        "native_prepare_projected_2b": {
+          "maximum": 0.10866022005211562,
+          "median": 0.10866022005211562,
+          "minimum": 0.10866022005211562,
+          "raw": [
+            0.10866022005211562
+          ]
+        },
+        "native_prepare_projected_block_2b": {
+          "maximum": 0.14068127097561955,
+          "median": 0.14068127097561955,
+          "minimum": 0.14068127097561955,
+          "raw": [
+            0.14068127097561955
+          ]
+        },
+        "native_source": {
+          "maximum": 0.5811485239537433,
+          "median": 0.5811485239537433,
+          "minimum": 0.5811485239537433,
+          "raw": [
+            0.5811485239537433
+          ]
+        },
+        "native_target_2b": {
+          "maximum": 2.260740493016783,
+          "median": 2.260740493016783,
+          "minimum": 2.260740493016783,
+          "raw": [
+            2.260740493016783
+          ]
+        },
+        "native_target_4b": {
+          "maximum": 19.24308792402735,
+          "median": 19.24308792402735,
+          "minimum": 19.24308792402735,
+          "raw": [
+            19.24308792402735
+          ]
+        }
+      }
+    }
+  ],
+  "contracts": {
+    "legacy_mailman_exact_gxe_eligible": false,
+    "legacy_mailman_limitation": "diagnostic additive GRM only; HWE decoder and no interaction source/W-left API",
+    "source": "explicit Python Philox probes; [Ux,Uw]=2B float64 columns",
+    "target_global": "opaque context-bound projected panel, width=2B",
+    "target_jackknife": "opaque global+block panels, total width=4B"
+  },
+  "dense_feature_timing_seconds": {
+    "maximum": 22.647343836026266,
+    "median": 22.647343836026266,
+    "minimum": 22.647343836026266,
+    "raw": [
+      22.647343836026266
+    ]
+  },
+  "provenance": {
+    "affinity": [
+      64,
+      65,
+      66,
+      67,
+      68,
+      69,
+      70,
+      71,
+      72,
+      73,
+      74,
+      75,
+      76,
+      77,
+      78,
+      79,
+      80,
+      81,
+      82,
+      83,
+      84,
+      85,
+      86,
+      87,
+      88,
+      89,
+      90,
+      91,
+      92,
+      93,
+      94,
+      95
+    ],
+    "argv": [
+      "benchmark_native.py",
+      "--n",
+      "291273",
+      "--m",
+      "1207",
+      "--probe-counts",
+      "32",
+      "--repeats",
+      "1",
+      "--warmups",
+      "0",
+      "--decode-threads",
+      "32",
+      "--blas-threads",
+      "32",
+      "--step-size",
+      "500",
+      "--target-panel-columns",
+      "64",
+      "--workspace-gib",
+      "16",
+      "--max-abs-error",
+      "1e-5",
+      "--stress-repeats",
+      "20",
+      "--skip-legacy",
+      "--skip-materialized",
+      "--json",
+      "reports/gxe_private_openblas/production_b32_o3native_guardoff_stress20.json"
+    ],
+    "cpu_count": 128,
+    "hostname": "Tabla",
+    "machine": "x86_64",
+    "native_binary": "/home/bronsonj/SUMMIT/build/cp312-private-openblas-guardoff/gxeldcore.cpython-312-x86_64-linux-gnu.so",
+    "native_binary_sha256": "f1aa090cefe2a3783c494f2028f0b24484fc0abd44b3e8d844f507fd531c0172",
+    "native_build": {
+      "api_version": 3,
+      "architecture_tuning": "-march=native",
+      "backend_name": "gxeldcore_direct",
+      "backend_version": "1.0",
+      "blas_runtime_config": "OpenBLAS 0.3.34 DYNAMIC_ARCH NO_AFFINITY Zen MAX_THREADS=128",
+      "blas_runtime_isolation": "private_static",
+      "blas_runtime_threads": 32,
+      "blas_vendor": "OpenBLAS",
+      "build_type": "Release",
+      "compiler_id": "GNU",
+      "compiler_version": "12.2.0",
+      "cxx_standard": 17,
+      "gemm_execution_mode": "serialized_fixed_private_openblas",
+      "gemm_integrity_enabled": false,
+      "native_optimization_enabled": true,
+      "openmp_enabled": true,
+      "optimization": "-O3",
+      "platform": "linux",
+      "protected_pair_input_mode": "mprotect_read_only",
+      "source_commit": "6bf009e850afd4b112bf46ee04d2cdea7acd8896",
+      "source_tree_sha256": "45ed26f2b79720c8350c05d3a26c1af478be8cf79357d3c7196e8dd4d3be703d"
+    },
+    "numpy": "2.3.5",
+    "platform": "Linux-4.19.0-21-amd64-x86_64-with-glibc2.36",
+    "processor": "",
+    "python": "3.12.12 | packaged by conda-forge | (main, Oct 22 2025, 23:25:55) [GCC 14.3.0]",
+    "threadpools": [
+      {
+        "filepath": "/home/bronsonj/anaconda3/envs/summit/lib/libgomp.so.1.0.0",
+        "internal_api": "openmp",
+        "num_threads": 32,
+        "prefix": "libgomp",
+        "user_api": "openmp",
+        "version": null
+      },
+      {
+        "architecture": "Zen",
+        "filepath": "/home/bronsonj/anaconda3/envs/summit/lib/libopenblasp-r0.3.34.so",
+        "internal_api": "openblas",
+        "num_threads": 32,
+        "prefix": "libopenblas",
+        "threading_layer": "pthreads",
+        "user_api": "blas",
+        "version": "0.3.34"
+      }
+    ]
+  },
+  "schema": "summit-native-gxe-benchmark-v2"
+}

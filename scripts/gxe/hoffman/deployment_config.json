@@ -10,18 +10,17 @@
     "arguments": ["--interleave=all"],
     "environment_sentinel": "SUMMIT_NUMACTL_WRAPPED"
   },
-  "panel_config_sha256": "3d8e977c2c9b56b32e2675025fc915e249f5ed7a3670d60c674a6efac50f582e",
+  "panel_config_sha256": "f806a69e72c1fdb7bbadcae944721b8f90a6e52d188d086bfaac6ce2fd4d94b7",
   "estimator": {
     "annotation": null,
     "annotation_contract": "all_variants_unit_weight",
     "annotation_name": "L2_0",
     "annotation_mass": 454207,
     "feature_cache_schema_version": 2,
-    "reference_shard_schema_version": 2,
-    "reference_schema_version": 3,
+    "reference_shard_schema_version": 3,
+    "reference_schema_version": 4,
     "kernel_mode": "standardized",
     "genotype_scale": "sample",
-    "jackknife_blocks": 100,
     "probes_per_shard": 128,
     "production_probes": 1024,
     "checkpoint_probes": [

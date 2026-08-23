@@ -1,0 +1,30 @@
+{
+  "schema": "context_native_stage6_result_invalidation_v1",
+  "scope": "crossbuild_foundation_e8f6331_candidate_6bdb43f_t8_n128_m512_q4_k2_g8_bt128_bd128",
+  "harness_fix_commit": "60a494cc6429543839640db200db4a582d071107",
+  "invalidated_results": [
+    {
+      "path": "reports/context_native/benchmarks/stage6/screen/crossbuild_foundation_candidate_t8_n128_m512_b128_dry_run.json",
+      "sha256": "71f9ada0f73190e4b2aa3a7adb3eab226f180dbffdcc67ad54ae04f028703366",
+      "reasons": [
+        "generated_by_pre_fix_harness",
+        "superseded_by_exclusive_post_fix_result"
+      ]
+    },
+    {
+      "path": "reports/context_native/benchmarks/stage6/screen/crossbuild_foundation_candidate_t8_n128_m512_b128.json",
+      "sha256": "7f233370eb5b81753370719a90ad62971b09e066d8438db8fedccff6f7776c44",
+      "reasons": [
+        "generated_by_pre_fix_harness",
+        "timing_contaminated_by_concurrent_core_node0_workers",
+        "superseded_by_exclusive_post_fix_result"
+      ]
+    }
+  ],
+  "replacement_results": [
+    {
+      "path": "reports/context_native/benchmarks/stage6/screen/crossbuild_foundation_candidate_t8_n128_m512_b128_exclusive_r3.json",
+      "sha256": "e7fe2b29e76a09cd874473591e07195a704ed32bfff1546111e5e51478fd3ff4"
+    }
+  ]
+}

@@ -1,5 +1,10 @@
 # GxE and heterogeneous-noise estimation from summary artifacts
 
+> **Generalization note.** The mature X/W estimator is the systems template for
+> the generalized per-variant two-pass LD-score path. Reuse its variant-probe
+> source/target machinery, not its hard-coded four-panel layout or separate X/W
+> post-projection scaling. See `docs/generalized_gxe_variant_ldscore_contract.md`.
+
 SUMMIT implements a one-environment, quantitative-trait method-of-moments model
 with additive genetic, gene-by-environment (GxE), noise-by-environment (NxE),
 and residual components. The estimator is a summary-artifact reformulation of
@@ -103,24 +108,14 @@ Projected feature norms and `F_j' diag(e^2) F_j` supply the genetic-by-residual
 and genetic-by-NxE trace blocks. Two scalar traces supply NxE-by-NxE and
 NxE-by-residual.
 
-## Block-local LD-score jackknife
+## Legacy LD-score jackknife artifacts
 
-The default GxE jackknife follows SUMMIT's additive convention. It assumes
-directional LD across jackknife blocks is negligible and constructs each
-replicate by deleting that block's completed LD-score rows, phenotype-score
-moments, feature traces, and annotation mass. Under block-local LD this is the
-same two-sided kernel deletion because a deleted row's source contribution is
-also contained in the deleted block. This applies independently to XX, XW, WX,
-and WW. `--write-gxe-jackknife` therefore writes only block IDs in the diagonal
-table and a labeled manifest declaration; it writes no randomized block
-sketches. Use `--njack 100` to match the published GENIE block count, or
-`--njack chr` for a chromosome jackknife.
-
-At least 100 trace probes remain the production default for jackknife-enabled
-references. A lower count is available through the explicit diagnostic override
-for smoke tests. Production analyses should check stability across probe counts
-and independent seeds. Exact two-sided legacy bundles remain readable, but
-ordinary reference construction does not generate their within-block traces.
+New GxE reference construction does not generate deletion-block metadata or
+`.gxe.jackknife.npz` files. Those optional artifacts affected only the
+jackknife uncertainty estimate, not the XX/XW/WX/WW point estimates, and the
+low-probe version was especially sensitive to Monte Carlo noise. Exact and
+block-local legacy bundles remain readable so previously sealed analyses are
+reproducible.
 
 The low-noise production target is B1024 in one reference transaction. Probe
 tiles are processed sequentially in memory and accumulated into the final four
@@ -171,14 +166,13 @@ After wide scoring, `--gxe-fit-batch` accepts a strict
 `summit.gxe.fit_batch` manifest and validates the reference and score panels once
 for all listed traits. Every phenotype moments/GWAS/GWIS triplet is still
 independently snapshotted, hashed, parsed, and checked against the reference
-SNP axis. Full and delete-block reference contractions are preaggregated once,
-so per-trait jackknife work depends on compact annotation/block sufficient
-statistics rather than rescanning all SNPs for every deletion block. The
-single-trait `--gxe-fit` path uses the same equations.
+SNP axis. Full reference contractions are preaggregated once. When reading an
+older sealed jackknife reference, its delete-block contractions still use the
+compact compatibility path. The single-trait `--gxe-fit` path uses the same
+equations.
 
-Older sealed exact two-sided jackknife bundles remain readable. Ordinary
-generation uses the block-local approximation and does not construct or write
-their within-block randomized trace state.
+Older sealed exact two-sided and block-local jackknife bundles remain readable.
+New reference generation does not construct either form of deletion state.
 
 ## Input contract and safety checks
 

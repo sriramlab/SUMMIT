@@ -35,19 +35,25 @@ def _run(monkeypatch, cli, *arguments: str) -> None:
     cli.main()
 
 
+def test_retired_gxe_jackknife_options_are_not_public_cli_options():
+    from summit import cli
+
+    options = cli.build_parser()._option_string_actions
+    assert "--write-gxe-jackknife" not in options
+    assert "--allow-low-probe-gxe-jackknife" not in options
+
+
 def test_cli_reference_wide_score_and_fit_roundtrip(tmp_path, monkeypatch):
     from summit import cli
 
     monkeypatch.setattr(cli, "apply_env", lambda _: None)
-    monkeypatch.setattr(cli, "_make_low_level_env", lambda _: None)
+    monkeypatch.setattr(cli, "_make_low_level_env", lambda _: {})
     genotype, environment, covariates, phenotypes = _inputs(tmp_path)
 
     common_generation = (
         "--geno", genotype,
         "--env", environment,
         "--covar", covariates,
-        "--write-gxe-jackknife",
-        "--njack", "3",
         "--gxe-kernel-mode", "standardized",
         "--gxe-genotype-scale", "sample",
         "--rand-dist", "rademacher",
@@ -69,6 +75,8 @@ def test_cli_reference_wide_score_and_fit_roundtrip(tmp_path, monkeypatch):
     reference_payload = json.loads(reference.read_text(encoding="utf-8"))
     assert reference_payload["kind"] == "summit.gxe.reference"
     assert reference_payload["randomization"]["num_vectors"] == 100
+    assert "jackknife" not in reference_payload
+    assert "jackknife" not in reference_payload["files"]
 
     score_prefix = tmp_path / "scores"
     _run(
@@ -104,6 +112,9 @@ def test_cli_reference_wide_score_and_fit_roundtrip(tmp_path, monkeypatch):
     fit_payload = json.loads(Path(f"{fit_prefix}.gxe.fit.json").read_text(encoding="utf-8"))
     assert fit_payload["component_names"] == ["G:L2_0", "GxE:L2_0", "NxE", "residual"]
     assert len(fit_payload["proportions"]) == 4
+    assert fit_payload["jackknife_block_labels"] == []
+    assert "standard_errors" not in fit_payload
+    assert "jackknife_estimates" not in fit_payload
 
     batch_manifest = tmp_path / "fit-batch.json"
     batch_manifest.write_text(

@@ -500,9 +500,17 @@ def run(args) -> dict:
                     float(np.max(np.abs(native_x_4b - dense_target_4b[0]))),
                     float(np.max(np.abs(native_w_4b - dense_target_4b[1]))),
                 )
+                stress_source_errors: list[float] = []
+                stress_source_repeat_deltas: list[float] = []
                 stress_2b_errors: list[float] = []
+                stress_2b_repeat_deltas: list[float] = []
                 stress_4b_errors: list[float] = []
+                stress_4b_repeat_deltas: list[float] = []
                 for _ in range(args.stress_repeats):
+                    stress_ux, stress_uw, stress_source_missing = context.source_block(
+                        0, args.m, scale_x, scale_w, np.ones(args.m), probes,
+                        np.zeros(args.m, dtype=np.int32), 1, True,
+                    )
                     stress_x_2b, stress_w_2b, stress_missing_2b, _ = (
                         context.target_projected_block(
                             0, args.m, scale_x, scale_w, panel_2b, True
@@ -514,19 +522,51 @@ def run(args) -> dict:
                             panel_2b, block_panel_2b, True,
                         )
                     )
-                    if int(stress_missing_2b) != 0 or int(stress_missing_4b) != 0:
-                        raise RuntimeError("Missing genotypes appeared in native target stress work.")
+                    if (
+                        int(stress_source_missing) != 0
+                        or int(stress_missing_2b) != 0
+                        or int(stress_missing_4b) != 0
+                    ):
+                        raise RuntimeError("Missing genotypes appeared in native stress work.")
+                    stress_source_errors.append(max(
+                        float(np.max(np.abs(stress_ux - dense_ux))),
+                        float(np.max(np.abs(stress_uw - dense_uw))),
+                    ))
+                    stress_source_repeat_deltas.append(max(
+                        float(np.max(np.abs(stress_ux - native_ux))),
+                        float(np.max(np.abs(stress_uw - native_uw))),
+                    ))
                     stress_2b_errors.append(max(
                         float(np.max(np.abs(stress_x_2b - dense_target_2b[0]))),
                         float(np.max(np.abs(stress_w_2b - dense_target_2b[1]))),
+                    ))
+                    stress_2b_repeat_deltas.append(max(
+                        float(np.max(np.abs(stress_x_2b - native_x_2b))),
+                        float(np.max(np.abs(stress_w_2b - native_w_2b))),
                     ))
                     stress_4b_errors.append(max(
                         float(np.max(np.abs(stress_x_4b - dense_target_4b[0]))),
                         float(np.max(np.abs(stress_w_4b - dense_target_4b[1]))),
                     ))
+                    stress_4b_repeat_deltas.append(max(
+                        float(np.max(np.abs(stress_x_4b - native_x_4b))),
+                        float(np.max(np.abs(stress_w_4b - native_w_4b))),
+                    ))
                 if stress_2b_errors:
+                    source_error = max(source_error, max(stress_source_errors))
                     target_2b_error = max(target_2b_error, max(stress_2b_errors))
                     target_4b_error = max(target_4b_error, max(stress_4b_errors))
+                    max_repeat_delta = max(
+                        max(stress_source_repeat_deltas),
+                        max(stress_2b_repeat_deltas),
+                        max(stress_4b_repeat_deltas),
+                    )
+                    if max_repeat_delta > args.max_abs_error:
+                        raise RuntimeError(
+                            "Native stress output changed across identical calls: "
+                            f"max repeat delta={max_repeat_delta}, "
+                            f"tolerance={args.max_abs_error}."
+                        )
                 integrity_after = dict(context.info())
                 repaired_columns = int(
                     integrity_after["repaired_gemm_output_columns"]
@@ -591,8 +631,12 @@ def run(args) -> dict:
                         ),
                         "abft_repaired_output_columns": repaired_columns,
                         "fresh_decode_input_retries": retried_inputs,
+                        "stress_source_errors": stress_source_errors,
+                        "stress_source_repeat_deltas": stress_source_repeat_deltas,
                         "stress_target_2b_errors": stress_2b_errors,
+                        "stress_target_2b_repeat_deltas": stress_2b_repeat_deltas,
                         "stress_target_4b_errors": stress_4b_errors,
+                        "stress_target_4b_repeat_deltas": stress_4b_repeat_deltas,
                         "threshold": args.max_abs_error,
                     },
                     "production_scratch_model": {

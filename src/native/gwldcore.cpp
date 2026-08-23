@@ -33,6 +33,7 @@
 #include "blas_compat.hpp"
 #include "arch_compat.hpp"
 #include "genotype.hpp"
+#include "mailman.hpp"
 
 // --- Interrupt handling (Ctrl-C) --------------------------------------------
 static inline void check_for_interrupt() { nb_check_for_interrupt(); }
@@ -916,44 +917,9 @@ static inline void mailman_pre_multiply_rowmajor(const CodeT* packed,
                                                  Tacc* result,
                                                  Tacc* work_table)
 {
-    const int64_t table_size = compute_mailman_table_size(segment_size_actual);
-    for (int i = 0; i < N; ++i) {
-        Tacc* __restrict tab = work_table + (size_t)packed[(size_t)i] * (size_t)Q;
-        const T* __restrict x = op + (size_t)i * (size_t)ldo;
-#ifdef _OPENMP
-        #pragma omp simd
-#endif
-        for (int c = 0; c < Q; ++c) tab[(size_t)c] += (Tacc)x[(size_t)c];
-    }
-    int64_t d = table_size;
-    for (int snp_in_seg = 0; snp_in_seg < segment_size_actual; ++snp_in_seg) {
-        d /= 3;
-        Tacc* __restrict out = result + (size_t)snp_in_seg * (size_t)Q;
-#ifdef _OPENMP
-        #pragma omp simd
-#endif
-        for (int c = 0; c < Q; ++c) out[(size_t)c] = Tacc(0);
-        for (int64_t i = 0; i < d; ++i) {
-            Tacc* __restrict row0 = work_table + (size_t)i * (size_t)Q;
-            Tacc* __restrict row1 = work_table + (size_t)(i + d) * (size_t)Q;
-            Tacc* __restrict row2 = work_table + (size_t)(i + 2 * d) * (size_t)Q;
-#ifdef _OPENMP
-            #pragma omp simd
-#endif
-            for (int c = 0; c < Q; ++c) {
-                const Tacc z1 = row1[(size_t)c];
-                const Tacc z2 = row2[(size_t)c];
-                row1[(size_t)c] = Tacc(0);
-                row2[(size_t)c] = Tacc(0);
-                row0[(size_t)c] += z1 + z2;
-                out[(size_t)c] += z1 + Tacc(2) * z2;
-            }
-        }
-    }
-#ifdef _OPENMP
-    #pragma omp simd
-#endif
-    for (int c = 0; c < Q; ++c) work_table[(size_t)c] = Tacc(0);
+    summit::mailman::pre_multiply_rowmajor(
+        packed, segment_size_actual, N, Q, op, ldo, result, work_table
+    );
 }
 
 template <typename CodeT, typename T>
@@ -968,29 +934,10 @@ static inline void mailman_post_multiply_colmajor_subset(const CodeT* packed,
                                                          int ldres,
                                                          double* work_table)
 {
-    const int64_t table_size = compute_mailman_table_size(segment_size_actual);
-    std::memset(work_table, 0, (size_t)table_size * (size_t)Q * sizeof(double));
-    int64_t prefix = 1;
-    for (int i = segment_size_actual - 1; i >= 0; --i) {
-        const double* op_row = op + (size_t)i * (size_t)ldop;
-        for (int64_t j = 0; j < prefix; ++j) {
-            const int64_t off0 = j * (int64_t)Q;
-            const int64_t off1 = (prefix + j) * (int64_t)Q;
-            const int64_t off2 = (2 * prefix + j) * (int64_t)Q;
-            for (int c = 0; c < Q; ++c) {
-                const double base = work_table[(size_t)off0 + (size_t)c];
-                work_table[(size_t)off1 + (size_t)c] = base + op_row[(size_t)c];
-                work_table[(size_t)off2 + (size_t)c] = base + 2.0 * op_row[(size_t)c];
-            }
-        }
-        prefix *= 3;
-    }
-    for (int i = 0; i < row_count; ++i) {
-        const CodeT code = packed[(size_t)(row_start + i)];
-        const double* src = work_table + (size_t)code * (size_t)Q;
-        T* dst = result + (size_t)(row_start + i);
-        for (int c = 0; c < Q; ++c) dst[(size_t)c * (size_t)ldres] += (T)src[(size_t)c];
-    }
+    summit::mailman::post_multiply_colmajor_subset(
+        packed, segment_size_actual, row_start, row_count, Q,
+        op, ldop, result, ldres, work_table
+    );
 }
 
 struct Phase1CSRKey {
@@ -1484,54 +1431,61 @@ void apply_grm_bed_panel_mailman_impl(
             const int tid = 0;
             const int Tn = 1;
 #endif
-            const int base_rows = N_rows / Tn;
-            const int rem = N_rows % Tn;
-            const int my_start = tid * base_rows + std::min(tid, rem);
-            const int my_count = base_rows + (tid < rem ? 1 : 0);
-
             static thread_local AlignedBuffer<double> work_table_tls;
             for (int q0 = 0; q0 < Q; q0 += qpanel) {
                 const int q = std::min(qpanel, Q - q0);
-                const size_t need_table = (size_t) pack.table_size * (size_t) q;
+                // Each output column has a single owner. Splitting columns
+                // avoids rebuilding the identical 3^segment lookup table in
+                // every row-partitioned worker.
+                const int base_columns = q / Tn;
+                const int rem = q % Tn;
+                const int my_start = tid * base_columns + std::min(tid, rem);
+                const int my_count = base_columns + (tid < rem ? 1 : 0);
+                const size_t need_table =
+                    (size_t) pack.table_size * (size_t) my_count;
                 if (work_table_tls.n < need_table)
                     work_table_tls.allocate(need_table, 64);
                 double* work_table = work_table_tls.ptr;
                 std::memset(work_table, 0, need_table * sizeof(double));
 
-                for (int64_t seg = 0; seg < pack.n_segments; ++seg) {
+                for (int64_t seg = 0;
+                     my_count > 0 && seg < pack.n_segments; ++seg) {
                     const int base = (int) (seg * (int64_t) pack.segment_size);
                     const int actual = std::min(pack.segment_size, L - base);
                     if (pack.use_u16) {
                         mailman_post_multiply_colmajor_subset<uint16_t>(pack.packed16.data() + (size_t) seg * (size_t) N_rows,
                                                                         actual,
-                                                                        my_start,
+                                                                        0,
+                                                                        N_rows,
                                                                         my_count,
-                                                                        q,
-                                                                        coef.data() + (size_t) base * (size_t) Q + (size_t) q0,
+                                                                        coef.data() + (size_t) base * (size_t) Q + (size_t) q0 + (size_t) my_start,
                                                                         Q,
-                                                                        outptr + (size_t) q0 * (size_t) N_rows,
+                                                                        outptr + (size_t) (q0 + my_start) * (size_t) N_rows,
                                                                         N_rows,
                                                                         work_table);
                     } else {
                         mailman_post_multiply_colmajor_subset<uint32_t>(pack.packed32.data() + (size_t) seg * (size_t) N_rows,
                                                                         actual,
-                                                                        my_start,
+                                                                        0,
+                                                                        N_rows,
                                                                         my_count,
-                                                                        q,
-                                                                        coef.data() + (size_t) base * (size_t) Q + (size_t) q0,
+                                                                        coef.data() + (size_t) base * (size_t) Q + (size_t) q0 + (size_t) my_start,
                                                                         Q,
-                                                                        outptr + (size_t) q0 * (size_t) N_rows,
+                                                                        outptr + (size_t) (q0 + my_start) * (size_t) N_rows,
                                                                         N_rows,
                                                                         work_table);
                     }
                 }
-                for (int c = 0; c < q; ++c) {
-                    T* col = outptr + (size_t) (q0 + c) * (size_t) N_rows + (size_t) my_start;
-                    const T corr = (T) mean_corr[(size_t) (q0 + c)];
+                for (int c = 0; c < my_count; ++c) {
+                    T* col = outptr
+                        + (size_t) (q0 + my_start + c) * (size_t) N_rows;
+                    const T corr = (T) mean_corr[
+                        (size_t) (q0 + my_start + c)
+                    ];
 #ifdef _OPENMP
                     #pragma omp simd
 #endif
-                    for (int i = 0; i < my_count; ++i)
+                    for (int i = 0; i < N_rows; ++i)
                         col[(size_t) i] -= corr;
                 }
             }

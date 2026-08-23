@@ -1,0 +1,29 @@
+{
+  "schema": "summit.gxe.gemm_reproducer.v1",
+  "date_utc": "2026-08-15",
+  "host": "tabla",
+  "affinity": "0-31",
+  "threads": 32,
+  "repeats_per_mode": 1,
+  "openblas_config": "OpenBLAS 0.3.34 DYNAMIC_ARCH NO_AFFINITY Zen MAX_THREADS=128",
+  "openblas_core": "Zen",
+  "results": [
+    {"shape": "source_2B", "op": "nn", "m": 291273, "n": 64, "k": 1207, "mode": "sequential", "seconds": 2.348846278, "max_abs_error": 0.0, "max_relative_error": 0.0, "input_unchanged": true, "guards_intact": true},
+    {"shape": "source_2B", "op": "nn", "m": 291273, "n": 64, "k": 1207, "mode": "external", "seconds": 0.377087696, "max_abs_error": 0.0, "max_relative_error": 0.0, "input_unchanged": true, "guards_intact": true},
+    {"shape": "source_2B", "op": "nn", "m": 291273, "n": 64, "k": 1207, "mode": "external_mutex", "seconds": 2.578843878, "max_abs_error": 0.0, "max_relative_error": 0.0, "input_unchanged": true, "guards_intact": true},
+    {"shape": "source_2B", "op": "nn", "m": 291273, "n": 64, "k": 1207, "mode": "internal", "seconds": 0.380547210, "max_abs_error": 0.0, "max_relative_error": 0.0, "input_unchanged": true, "guards_intact": true},
+    {"shape": "target_2B", "op": "tn", "m": 1207, "n": 64, "k": 291273, "mode": "sequential", "seconds": 2.381199013, "max_abs_error": 0.0, "max_relative_error": 0.0, "input_unchanged": true, "guards_intact": true},
+    {"shape": "target_2B", "op": "tn", "m": 1207, "n": 64, "k": 291273, "mode": "external", "seconds": 0.405845333, "max_abs_error": 0.0, "max_relative_error": 0.0, "input_unchanged": true, "guards_intact": true},
+    {"shape": "target_2B", "op": "tn", "m": 1207, "n": 64, "k": 291273, "mode": "external_mutex", "seconds": 2.908133355, "max_abs_error": 0.0, "max_relative_error": 0.0, "input_unchanged": true, "guards_intact": true},
+    {"shape": "target_2B", "op": "tn", "m": 1207, "n": 64, "k": 291273, "mode": "internal", "seconds": 0.297484652, "max_abs_error": 2.8421709430404007e-14, "max_relative_error": 2.220446049250313e-15, "input_unchanged": true, "guards_intact": true},
+    {"shape": "target_4B", "op": "tn", "m": 1207, "n": 128, "k": 291273, "mode": "sequential", "seconds": 4.357289661, "max_abs_error": 0.0, "max_relative_error": 0.0, "input_unchanged": true, "guards_intact": true},
+    {"shape": "target_4B", "op": "tn", "m": 1207, "n": 128, "k": 291273, "mode": "external", "seconds": 0.717678653, "max_abs_error": 0.0, "max_relative_error": 0.0, "input_unchanged": true, "guards_intact": true},
+    {"shape": "target_4B", "op": "tn", "m": 1207, "n": 128, "k": 291273, "mode": "external_mutex", "seconds": 5.430367857, "max_abs_error": 0.0, "max_relative_error": 0.0, "input_unchanged": true, "guards_intact": true},
+    {"shape": "target_4B", "op": "tn", "m": 1207, "n": 128, "k": 291273, "mode": "internal", "seconds": 0.357883890, "max_abs_error": 2.8421709430404007e-14, "max_relative_error": 2.4424906541753444e-15, "input_unchanged": true, "guards_intact": true}
+  ],
+  "limitations": [
+    "One exact-shape repetition per mode is a diagnostic, not the 10000/100000-call acceptance gate.",
+    "Only the installed OpenBLAS build and one physical host were tested.",
+    "The inputs are deterministic in-memory binary64 streams rather than persisted multi-gigabyte files."
+  ]
+}

@@ -11,6 +11,7 @@ import gzip
 import os, psutil
 import ctypes
 from concurrent.futures import ThreadPoolExecutor
+from collections.abc import Mapping
 from pathlib import Path
 import time
 try:
@@ -21,6 +22,8 @@ except Exception:
 from contextlib import contextmanager, nullcontext
 from threadpoolctl import threadpool_limits
 
+from .._early_numa import attest_numa_policy_request
+
 from .genotype_source import (
     PgenBlockReader,
     read_fam_sample_ids,
@@ -30,6 +33,244 @@ from .genotype_source import (
     resolve_genotype_input,
     validate_variant_metadata,
 )
+
+
+_CPU_PLACEMENT_SCHEMA = "summit.openmp_placement_attestation.v1"
+_CPU_PLACEMENT_KEYS = {
+    "schema",
+    "schema_version",
+    "verified",
+    "immutable",
+    "requested_threads",
+    "expected_cpu_ids",
+    "omp_dynamic",
+    "omp_thread_limit",
+    "omp_max_active_levels",
+    "omp_proc_bind",
+    "omp_binding_active",
+    "omp_num_places",
+    "effective_openmp_capacity",
+    "place_cpu_ids",
+    "team_size",
+    "exact_singleton_places",
+    "exact_team_coverage",
+    "workers",
+    "vendor_calls",
+}
+_CPU_PLACEMENT_WORKER_KEYS = {
+    "thread_num",
+    "place_num",
+    "place_cpu_ids",
+    "sched_affinity_cpu_ids",
+    "current_cpu",
+    "verified",
+}
+
+
+def _is_builtin_int(value) -> bool:
+    return type(value) is int
+
+
+def _validate_cpu_placement_attestation(
+    raw: Mapping,
+    *,
+    expected_cpu_ids=None,
+    expected_threads: int | None = None,
+) -> dict:
+    """Validate the exact native singleton-place OpenMP attestation."""
+    if not isinstance(raw, Mapping):
+        raise RuntimeError("CPU placement attestation is not a mapping.")
+    record = dict(raw)
+    if set(record) != _CPU_PLACEMENT_KEYS:
+        raise RuntimeError("CPU placement attestation has a noncanonical key set.")
+    cpu_ids = record.get("expected_cpu_ids")
+    if (
+        not isinstance(cpu_ids, list)
+        or not cpu_ids
+        or any(not _is_builtin_int(cpu) or cpu < 0 for cpu in cpu_ids)
+        or cpu_ids != sorted(set(cpu_ids))
+    ):
+        raise RuntimeError("CPU placement attestation has invalid expected CPU IDs.")
+    if expected_cpu_ids is not None:
+        expected_cpu_list = list(expected_cpu_ids)
+        if (
+            not expected_cpu_list
+            or any(
+                not _is_builtin_int(cpu) or cpu < 0 for cpu in expected_cpu_list
+            )
+            or expected_cpu_list != sorted(set(expected_cpu_list))
+            or cpu_ids != expected_cpu_list
+        ):
+            raise RuntimeError(
+                "CPU placement attestation disagrees with the caller CPU contract."
+            )
+    threads = record.get("requested_threads")
+    if not _is_builtin_int(threads) or threads <= 0:
+        raise RuntimeError("CPU placement attestation has an invalid thread count.")
+    if expected_threads is not None and (
+        not _is_builtin_int(expected_threads)
+        or expected_threads <= 0
+        or threads != expected_threads
+    ):
+        raise RuntimeError("CPU placement attestation disagrees with the requested threads.")
+    if threads != len(cpu_ids):
+        raise RuntimeError("CPU placement thread count differs from its CPU list.")
+    expected_places = [[cpu] for cpu in cpu_ids]
+    place_cpu_ids = record.get("place_cpu_ids")
+    workers = record.get("workers")
+    integer_fields = {
+        "schema_version": 1,
+        "omp_thread_limit": threads,
+        "omp_max_active_levels": 1,
+        "omp_num_places": threads,
+        "effective_openmp_capacity": threads,
+        "team_size": threads,
+        "vendor_calls": 0,
+    }
+    if (
+        record.get("schema") != _CPU_PLACEMENT_SCHEMA
+        or any(
+            not _is_builtin_int(record.get(key)) or record.get(key) != expected
+            for key, expected in integer_fields.items()
+        )
+        or record.get("verified") is not True
+        or record.get("immutable") is not True
+        or record.get("omp_dynamic") is not False
+        or record.get("omp_proc_bind") != "spread"
+        or record.get("omp_binding_active") is not True
+        or not isinstance(place_cpu_ids, list)
+        or len(place_cpu_ids) != threads
+        or any(
+            not isinstance(place, list)
+            or len(place) != 1
+            or not _is_builtin_int(place[0])
+            for place in place_cpu_ids
+        )
+        or place_cpu_ids != expected_places
+        or record.get("exact_singleton_places") is not True
+        or record.get("exact_team_coverage") is not True
+        or not isinstance(workers, list)
+        or len(workers) != threads
+    ):
+        raise RuntimeError("CPU placement attestation is incomplete or noncanonical.")
+    for thread_num, (cpu, worker) in enumerate(zip(cpu_ids, workers, strict=True)):
+        worker_place_cpu_ids = (
+            worker.get("place_cpu_ids") if isinstance(worker, Mapping) else None
+        )
+        worker_affinity_cpu_ids = (
+            worker.get("sched_affinity_cpu_ids")
+            if isinstance(worker, Mapping) else None
+        )
+        if not isinstance(worker, Mapping) or (
+            set(worker) != _CPU_PLACEMENT_WORKER_KEYS
+            or not _is_builtin_int(worker.get("thread_num"))
+            or worker.get("thread_num") != thread_num
+            or not _is_builtin_int(worker.get("place_num"))
+            or worker.get("place_num") != thread_num
+            or not isinstance(worker_place_cpu_ids, list)
+            or len(worker_place_cpu_ids) != 1
+            or not _is_builtin_int(worker_place_cpu_ids[0])
+            or worker_place_cpu_ids != [cpu]
+            or not isinstance(worker_affinity_cpu_ids, list)
+            or len(worker_affinity_cpu_ids) != 1
+            or not _is_builtin_int(worker_affinity_cpu_ids[0])
+            or worker_affinity_cpu_ids != [cpu]
+            or not _is_builtin_int(worker.get("current_cpu"))
+            or worker.get("current_cpu") != cpu
+            or worker.get("verified") is not True
+        ):
+            raise RuntimeError(
+                "CPU placement worker evidence is incomplete or noncanonical."
+            )
+    return record
+
+
+def _validate_openmp_placement_build_contract(
+    raw: Mapping, placement: Mapping
+) -> dict:
+    """Require the exact native API/build contract behind an attestation."""
+    if not isinstance(raw, Mapping):
+        raise RuntimeError("Native OpenMP placement build information is not a mapping.")
+    build_info = dict(raw)
+    placement_record = _validate_cpu_placement_attestation(placement)
+    build_evidence_raw = build_info.get("openmp_placement_contract_evidence")
+    build_evidence = (
+        _validate_cpu_placement_attestation(build_evidence_raw)
+        if isinstance(build_evidence_raw, Mapping)
+        else None
+    )
+    required_strings = {
+        "backend_version": "1.9",
+        "openmp_effective_capacity_policy": (
+            "bound_places_else_sched_affinity_v1"
+        ),
+        "openmp_placement_contract_schema": _CPU_PLACEMENT_SCHEMA,
+    }
+    blas_vendor = build_info.get("blas_vendor")
+    threading_layer = build_info.get("blas_runtime_threading_layer")
+    if blas_vendor == "BLIS":
+        threading_contract_valid = (
+            type(threading_layer) is str
+            and threading_layer == "pthreads"
+            and build_info.get("blas_runtime_worker_affinity_policy")
+            == "inherit_authenticated_selected_cpu_set_per_call"
+        )
+    else:
+        # The compatibility OpenBLAS placement contract still requires its
+        # existing OpenMP runtime.  Accepted private BLIS deliberately uses
+        # pthread workers so vendor execution is independent of libgomp.
+        threading_contract_valid = (
+            type(threading_layer) is str and threading_layer == "openmp"
+        )
+    if (
+        not _is_builtin_int(build_info.get("api_version"))
+        or build_info.get("api_version") != 9
+        or any(build_info.get(key) != value for key, value in required_strings.items())
+        or not threading_contract_valid
+        or build_info.get("openmp_placement_contract_supported") is not True
+        or build_info.get("openmp_placement_contract_configured") is not True
+        or build_info.get("openmp_placement_contract_immutable") is not True
+        or not _is_builtin_int(build_info.get("openmp_placement_probe_vendor_calls"))
+        or build_info.get("openmp_placement_probe_vendor_calls") != 0
+        or build_evidence != placement_record
+    ):
+        raise RuntimeError("Native OpenMP placement build contract is noncanonical.")
+    return build_info
+
+
+def _validated_thread_capacity(cfg: Mapping, caller_affinity_capacity: int) -> int:
+    """Permit a placement capacity only for an authenticated native record."""
+    caller_capacity = max(1, int(caller_affinity_capacity))
+    record = cfg.get("_gxe_cpu_placement")
+    complete = cfg.get("_gxe_cpu_placement_complete")
+    authenticated = cfg.get("_gxe_group_worker_authenticated")
+    if record is None:
+        if (
+            (complete is not None and complete is not False)
+            or (authenticated is not None and authenticated is not False)
+        ):
+            raise RuntimeError("Authenticated group worker lacks CPU placement evidence.")
+        return caller_capacity
+    if complete is not True or authenticated is not True:
+        raise RuntimeError(
+            "CPU placement capacity requires an authenticated complete group-worker contract."
+        )
+    expected_cpu_ids = cfg.get("_gxe_worker_cpu_ids")
+    if (
+        not isinstance(expected_cpu_ids, (tuple, list))
+        or not expected_cpu_ids
+        or any(not _is_builtin_int(cpu) or cpu < 0 for cpu in expected_cpu_ids)
+    ):
+        raise RuntimeError("Authenticated group worker lacks its expected CPU list.")
+    expected_threads = cfg.get("num_threads")
+    if not _is_builtin_int(expected_threads) or expected_threads <= 0:
+        raise RuntimeError("Authenticated group worker lacks its expected thread count.")
+    attestation = _validate_cpu_placement_attestation(
+        record,
+        expected_cpu_ids=expected_cpu_ids,
+        expected_threads=expected_threads,
+    )
+    return int(attestation["effective_openmp_capacity"])
 
 
 def _parse_device_str(s: str) -> tuple[str, int | None]:
@@ -57,6 +298,46 @@ def _pick_cuda_index_auto(gcu):
 def apply_env(cfg: dict) -> int:
     import os, sys, shutil, ctypes
 
+    if cfg.get("_runtime_preconfigured"):
+        preconfigured_numa_mode = cfg.get("numa_mode")
+        if str(preconfigured_numa_mode).strip().lower() == "membind":
+            preconfigured_numa_nodes = str(cfg.get("numa_nodes", "all"))
+            if not attest_numa_policy_request(
+                preconfigured_numa_mode, preconfigured_numa_nodes
+            ):
+                raise RuntimeError(
+                    "Preconfigured NUMA membind lacks a verified "
+                    "pre-numeric-import in-process attestation."
+                )
+        try:
+            caller_capacity = max(1, len(os.sched_getaffinity(0)))
+        except (AttributeError, OSError):
+            caller_capacity = max(1, os.cpu_count() or 1)
+        validated_capacity = _validated_thread_capacity(cfg, caller_capacity)
+        observed = cfg.get("_actual_runtime_threads")
+        if observed is not None:
+            observed_threads = max(1, int(observed))
+            if (
+                cfg.get("_gxe_group_worker_authenticated") is True
+                and observed_threads != validated_capacity
+            ):
+                raise RuntimeError(
+                    "Preconfigured runtime threads disagree with verified OpenMP capacity."
+                )
+            return observed_threads
+        requested = cfg.get("num_threads")
+        if requested is not None:
+            requested_threads = max(1, int(requested))
+            if (
+                cfg.get("_gxe_group_worker_authenticated") is True
+                and requested_threads > validated_capacity
+            ):
+                raise RuntimeError(
+                    "Requested runtime threads exceed verified OpenMP capacity."
+                )
+            return requested_threads
+        return validated_capacity
+
     def maybe_wrap_with_numactl(mode: str | None, nodes: str = "all") -> None:
         if not mode or os.name != "posix":
             return
@@ -76,24 +357,136 @@ def apply_env(cfg: dict) -> int:
         if sys.argv and sys.argv[0] in {"-c", "-"}:
             # The code supplied to `python -c` or standard input is not
             # present in sys.argv, so its invocation cannot be reconstructed.
-            os.environ["SUMMIT_NUMACTL_WRAPPED"] = "1"
             return
 
-        # With `python -m package.module`, sys.argv[0] is the resolved module
-        # filename rather than the original `-m package.module` invocation.
-        # Executing that file directly breaks package-relative imports.  The
-        # running __main__ spec retains the module name, so reconstruct the
-        # module invocation when one is available.
-        main_spec = getattr(sys.modules.get("__main__"), "__spec__", None)
-        main_module = getattr(main_spec, "name", None)
-        if isinstance(main_module, str) and main_module:
-            python_args = [sys.executable, "-m", main_module, *sys.argv[1:]]
+        # Preserve the original interpreter flags whenever Python exposes
+        # them. In particular, dropping ``-S`` here can make a clean installed
+        # SUMMIT invocation resolve a different site-packages checkout after
+        # the NUMA re-exec. ``sys.argv`` alone cannot distinguish ``-m`` from a
+        # directly executed module file and omits interpreter flags entirely.
+        original_argv = getattr(sys, "orig_argv", None)
+        if isinstance(original_argv, list) and original_argv:
+            # orig_argv[0] may be a PATH-resolved spelling such as ``python``
+            # rather than sys.executable. Replace only that first element and
+            # retain every original interpreter switch and invocation token.
+            python_args = [sys.executable, *original_argv[1:]]
         else:
-            python_args = [sys.executable, *sys.argv]
+            # Python <3.10 has no sys.orig_argv. Retain the isolation flags
+            # that affect import resolution and bytecode identity, then use
+            # the existing module-aware reconstruction.
+            python_args = [sys.executable]
+            if bool(getattr(sys.flags, "isolated", 0)):
+                python_args.append("-I")
+            else:
+                if bool(getattr(sys.flags, "ignore_environment", 0)):
+                    python_args.append("-E")
+                if bool(getattr(sys.flags, "no_user_site", 0)):
+                    python_args.append("-s")
+            if bool(getattr(sys.flags, "no_site", 0)):
+                python_args.append("-S")
+            if bool(getattr(sys.flags, "dont_write_bytecode", 0)):
+                python_args.append("-B")
+            if bool(getattr(sys.flags, "safe_path", 0)):
+                python_args.append("-P")
+            optimize = int(getattr(sys.flags, "optimize", 0))
+            if optimize > 0:
+                python_args.append("-" + "O" * min(optimize, 2))
+
+            # With `python -m package.module`, sys.argv[0] is the resolved
+            # module filename rather than the original `-m` invocation.
+            main_spec = getattr(sys.modules.get("__main__"), "__spec__", None)
+            main_module = getattr(main_spec, "name", None)
+            if isinstance(main_module, str) and main_module:
+                python_args.extend(["-m", main_module, *sys.argv[1:]])
+            else:
+                python_args.extend(sys.argv)
 
         os.environ["SUMMIT_NUMACTL_WRAPPED"] = "1"
         args = [exe, f"{flag}={nodes}", *python_args]
         os.execv(exe, args)
+
+    def maybe_apply_numa_with_libnuma(mode: str | None, nodes: str = "all") -> None:
+        """Apply the requested policy when the numactl executable is absent."""
+        if (
+            not mode
+            or os.name != "posix"
+            or os.environ.get("SUMMIT_NUMACTL_WRAPPED") == "1"
+        ):
+            return
+        try:
+            library = ctypes.CDLL("libnuma.so.1", use_errno=True)
+        except OSError:
+            return
+        library.numa_available.restype = ctypes.c_int
+        if library.numa_available() < 0:
+            return
+        library.numa_max_node.restype = ctypes.c_int
+        maximum_node = int(library.numa_max_node())
+
+        def parse_nodes(value: str) -> list[int]:
+            text = str(value).strip().lower()
+            if text == "all":
+                return list(range(maximum_node + 1))
+            parsed = set()
+            for part in text.split(","):
+                part = part.strip()
+                if not part:
+                    raise ValueError("NUMA node list contains an empty component.")
+                if "-" in part:
+                    left, right = part.split("-", 1)
+                    start, stop = int(left), int(right)
+                    if stop < start:
+                        raise ValueError("NUMA node range is reversed.")
+                    parsed.update(range(start, stop + 1))
+                else:
+                    parsed.add(int(part))
+            result = sorted(parsed)
+            if not result or result[0] < 0 or result[-1] > maximum_node:
+                raise ValueError(
+                    f"NUMA nodes must lie in [0, {maximum_node}]; got {value!r}."
+                )
+            return result
+
+        selected = parse_nodes(nodes)
+        normalized_mode = str(mode).lower()
+        ctypes.set_errno(0)
+        if normalized_mode == "preferred":
+            if len(selected) != 1:
+                raise ValueError("The preferred NUMA policy requires exactly one node.")
+            library.numa_set_preferred.argtypes = [ctypes.c_int]
+            library.numa_set_preferred(selected[0])
+        else:
+            library.numa_allocate_nodemask.restype = ctypes.c_void_p
+            library.numa_bitmask_setbit.argtypes = [ctypes.c_void_p, ctypes.c_uint]
+            library.numa_bitmask_free.argtypes = [ctypes.c_void_p]
+            mask = library.numa_allocate_nodemask()
+            if not mask:
+                raise MemoryError("libnuma could not allocate a node mask.")
+            try:
+                for node in selected:
+                    library.numa_bitmask_setbit(mask, node)
+                if normalized_mode == "interleave":
+                    library.numa_set_interleave_mask.argtypes = [ctypes.c_void_p]
+                    library.numa_set_interleave_mask(mask)
+                elif normalized_mode == "membind":
+                    library.numa_set_membind.argtypes = [ctypes.c_void_p]
+                    library.numa_set_membind(mask)
+                elif normalized_mode == "cpunodebind":
+                    library.numa_run_on_node_mask.argtypes = [ctypes.c_void_p]
+                    library.numa_run_on_node_mask.restype = ctypes.c_int
+                    if library.numa_run_on_node_mask(mask) != 0:
+                        error = ctypes.get_errno()
+                        raise OSError(error, os.strerror(error))
+                else:
+                    return
+            finally:
+                library.numa_bitmask_free(mask)
+        error = ctypes.get_errno()
+        if error:
+            raise OSError(error, os.strerror(error))
+        os.environ["SUMMIT_NUMA_POLICY_APPLIED"] = (
+            f"libnuma:{normalized_mode}:{','.join(str(node) for node in selected)}"
+        )
 
     def _cpu_set_allowed():
         try:
@@ -155,22 +548,41 @@ def apply_env(cfg: dict) -> int:
         except Exception:
             return _detect_blas_threads_fallback()
 
-    maybe_wrap_with_numactl(mode=cfg.get("numa_mode"), nodes=str(cfg.get("numa_nodes", "all")))
+    numa_mode = cfg.get("numa_mode")
+    numa_nodes = str(cfg.get("numa_nodes", "all"))
+    early_numa_attested = attest_numa_policy_request(numa_mode, numa_nodes)
+    if not early_numa_attested:
+        if str(numa_mode).strip().lower() == "membind":
+            raise RuntimeError(
+                "NUMA membind was requested without a verified pre-numeric-import "
+                "in-process attestation."
+            )
+        maybe_wrap_with_numactl(mode=numa_mode, nodes=numa_nodes)
+        maybe_apply_numa_with_libnuma(mode=numa_mode, nodes=numa_nodes)
     _expand_affinity_to_all_allowed()
 
     n_aff = _cpu_count_affinity()
+    validated_capacity = _validated_thread_capacity(cfg, n_aff)
     if cfg.get("num_threads") is not None:
-        n_threads = max(1, min(int(cfg["num_threads"]), n_aff))
+        requested_threads = max(1, int(cfg["num_threads"]))
+        if (
+            cfg.get("_gxe_group_worker_authenticated") is True
+            and requested_threads > validated_capacity
+        ):
+            raise RuntimeError(
+                "Requested runtime threads exceed verified OpenMP capacity."
+            )
+        n_threads = max(1, min(requested_threads, validated_capacity))
     else:
-        n_threads = max(1, n_aff)
+        n_threads = max(1, validated_capacity)
 
     if "decode_threads" in cfg and cfg["decode_threads"] is not None:
         dec = int(cfg["decode_threads"])
-        dec = max(1, min(dec, n_aff))
+        dec = max(1, min(dec, validated_capacity))
     else:
         cap = int(cfg.get("decode_threads_cap", 16))
         cap = max(1, cap)
-        dec = min(cap, n_aff)
+        dec = min(cap, validated_capacity)
 
     decode_mem_cap_mb = int(cfg.get("decode_mem_cap_mb", 2048))
     if decode_mem_cap_mb < 64:
@@ -180,8 +592,13 @@ def apply_env(cfg: dict) -> int:
 
     os.environ["OMP_NUM_THREADS"] = str(n_threads)
     os.environ["OMP_DYNAMIC"] = "FALSE"
-    os.environ.setdefault("OMP_PROC_BIND", str(cfg.get("omp_proc_bind", "spread")))
-    os.environ.setdefault("OMP_PLACES",    str(cfg.get("omp_places", "threads")))
+    # The private OpenBLAS build is NO_AFFINITY. Preserve the process cpuset
+    # and let the scheduler place its fixed team inside that cpuset; libgomp's
+    # early OMP_PROC_BIND initialization can otherwise narrow the main
+    # thread's visible affinity to a single place before native validation.
+    os.environ.setdefault("OMP_PROC_BIND", str(cfg.get("omp_proc_bind", "FALSE")))
+    if os.environ["OMP_PROC_BIND"].strip().upper() not in {"FALSE", "0", "OFF"}:
+        os.environ.setdefault("OMP_PLACES", str(cfg.get("omp_places", "cores")))
     os.environ.setdefault("KMP_BLOCKTIME", str(cfg.get("kmp_blocktime", 0)))
     os.environ.setdefault("MKL_ENABLE_INSTRUCTIONS", "AVX512")
 
@@ -190,27 +607,28 @@ def apply_env(cfg: dict) -> int:
     os.environ["OPENBLAS_DYNAMIC"] = "0"
     os.environ["MKL_DYNAMIC"] = "FALSE"
 
-    try:
-        import mkl  # type: ignore
-        mkl.set_num_threads(n_threads)
-    except Exception:
-        pass
+    if not cfg.get("_runtime_threadpool_capped"):
+        try:
+            import mkl  # type: ignore
+            mkl.set_num_threads(n_threads)
+        except Exception:
+            pass
 
-    try:
-        for soname in ("libopenblas.so", "libopenblas.so.0", "libopenblas64_.so", "libopenblas64_.so.0"):
-            try:
-                lib = ctypes.CDLL(soname)
-                for sym in ("openblas_set_num_threads", "openblas_set_num_threads64_"):
-                    try:
-                        getattr(lib, sym)(int(n_threads))
-                        break
-                    except AttributeError:
-                        continue
-                break
-            except OSError:
-                continue
-    except Exception:
-        pass
+        try:
+            for soname in ("libopenblas.so", "libopenblas.so.0", "libopenblas64_.so", "libopenblas64_.so.0"):
+                try:
+                    lib = ctypes.CDLL(soname)
+                    for sym in ("openblas_set_num_threads", "openblas_set_num_threads64_"):
+                        try:
+                            getattr(lib, sym)(int(n_threads))
+                            break
+                        except AttributeError:
+                            continue
+                    break
+                except OSError:
+                    continue
+        except Exception:
+            pass
 
     actual = _detect_blas_threads()
     os.environ["SUMMIT_BLAS_THREADS"] = str(actual)

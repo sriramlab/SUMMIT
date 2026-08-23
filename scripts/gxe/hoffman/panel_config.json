@@ -33,7 +33,6 @@
     "kernel_mode": "standardized",
     "genotype_scale": "sample",
     "num_probes": 1024,
-    "jackknife_blocks": 100,
     "probe_shards": 8,
     "probes_per_shard": 128,
     "checkpoint_probes": [

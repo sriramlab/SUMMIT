@@ -51,7 +51,6 @@ NUMACTL_SENTINEL = "SUMMIT_NUMACTL_WRAPPED"
 FIT_BATCH_MANIFEST_NAME = "fit_batch_manifest.json"
 CACHE_ATTESTATION_NAME = "cache_attestation.json"
 GIB = 1024**3
-MIN_FITTABLE_GXE_JACKKNIFE_PROBES = 100
 DATASETS = frozenset({"full", "subset_50k"})
 PRODUCTION_DATASET = "full"
 CALIBRATION_DATASET = "subset_50k"
@@ -646,13 +645,27 @@ def _check_cache_merge_compatibility_sources(
         raise ValueError(
             "Frozen shard merger does not share the cache writer's schema-version contract; deployment is blocked."
         )
-    if f'shard.get("schema_version") != {expected_shard}' not in merger_text:
+    if expected_shard not in (2, 3):
+        raise ValueError(
+            "Deployment configuration names an unsupported shard schema version."
+        )
+    if "shard_version not in (2, 3)" not in merger_text:
         raise ValueError(
             "Frozen shard merger does not require the configured shard schema."
         )
-    if f'"schema_version": {expected_reference}' not in merger_text:
+    # The merger derives the reference schema from the shard schema: v3
+    # shards (canonical binary64 annotations) seal a v4 reference and legacy
+    # v2 shards seal a v3 reference.
+    if (
+        'merged_schema_version = 4 if common["schema_version"] == 3 else 3'
+        not in merger_text
+    ):
         raise ValueError(
             "Frozen shard merger does not emit the configured reference schema."
+        )
+    if expected_reference != (4 if expected_shard == 3 else 3):
+        raise ValueError(
+            "Configured reference schema disagrees with the shard schema mapping."
         )
 
 
@@ -809,7 +822,6 @@ def _validate_frozen(
         "annotation_contract": "annotation_contract",
         "kernel_mode": "kernel_mode",
         "genotype_scale": "genotype_scale",
-        "jackknife_blocks": "jackknife_blocks",
         "probes_per_shard": "probes_per_shard",
         "production_probes": "num_probes",
         "checkpoint_probes": "checkpoint_probes",
@@ -1745,16 +1757,10 @@ def _validate_cache_file(path: Path, config: dict, group: dict | None = None) ->
             "Feature-cache annotation is not the canonical all-ones vector."
         )
     jackknife = np.asarray(arrays["jackknife_ids"], dtype=np.int64)
-    labels = metadata.get("jackknife_labels")
-    j = int(estimator["jackknife_blocks"])
-    if jackknife.shape != (m,) or sorted(np.unique(jackknife).tolist()) != list(
-        range(j)
-    ):
+    if jackknife.shape != (0,) or metadata.get("jackknife_labels") is not None:
         raise ValueError(
-            "Feature-cache jackknife IDs are not exactly J contiguous nonempty blocks."
+            "New feature caches must not contain GxE jackknife blocks."
         )
-    if not isinstance(labels, list) or len(labels) != j:
-        raise ValueError("Feature-cache jackknife labels differ from J.")
     for name in (
         "scale_x",
         "scale_w",
@@ -1898,9 +1904,9 @@ def _validate_shard_record(
         or stop != start + estimator["probes_per_shard"]
     ):
         raise ValueError("Reference shard has an invalid probe interval.")
-    if payload.get("jackknife", {}).get("num_blocks") != estimator["jackknife_blocks"]:
-        raise ValueError("Reference shard jackknife block count differs from J.")
-    required = {"xx", "xw", "wx", "ww", "jackknife", "identity"}
+    if payload.get("jackknife") is not None:
+        raise ValueError("New reference shards must not declare a GxE jackknife.")
+    required = {"xx", "xw", "wx", "ww", "identity"}
     artifacts = _resolve_manifest_artifacts(
         path, payload, scratch_root, required=required
     )
@@ -2001,15 +2007,14 @@ def _validate_reference_record(
     for key, value in expected_randomization.items():
         if randomization.get(key) != value:
             raise ValueError(f"Merged reference randomization differs for {key!r}.")
-    override = bool(randomization.get("low_probe_jackknife_override", False))
-    if override != (expected_probes < MIN_FITTABLE_GXE_JACKKNIFE_PROBES):
-        raise ValueError("Merged reference low-probe override policy is invalid.")
-    required = {"xx", "xw", "wx", "ww", "diagonal", "jackknife"}
+    if "low_probe_jackknife_override" in randomization:
+        raise ValueError("New merged references must not declare a low-probe jackknife override.")
+    required = {"xx", "xw", "wx", "ww", "diagonal"}
     artifacts = _resolve_manifest_artifacts(
         path, payload, scratch_root, required=required
     )
-    if payload.get("jackknife", {}).get("num_blocks") != estimator["jackknife_blocks"]:
-        raise ValueError("Merged reference jackknife block count differs from J.")
+    if payload.get("jackknife") is not None:
+        raise ValueError("New merged references must not declare a GxE jackknife.")
     return path, payload, artifacts
 
 
@@ -2176,9 +2181,6 @@ def _common_generation_args(
         str(estimator["kernel_mode"]),
         "--gxe-genotype-scale",
         str(estimator["genotype_scale"]),
-        "--write-gxe-jackknife",
-        "--njack",
-        str(estimator["jackknife_blocks"]),
         "--rand-dist",
         str(estimator["random_distribution"]),
         "--seed",
@@ -2639,7 +2641,6 @@ def _expected_cli_outputs(
                 ".gxe.ldscore.gz",
                 ".exg.ldscore.gz",
                 ".gee.ldscore.gz",
-                ".gxe.jackknife.npz",
                 ".gxe.shard.identity.json",
                 ".gxe.shard.json",
                 ".gxe.log",
@@ -2654,7 +2655,6 @@ def _expected_cli_outputs(
                 ".exg.ldscore.gz",
                 ".gee.ldscore.gz",
                 ".gxe.diag.tsv.gz",
-                ".gxe.jackknife.npz",
                 ".gxe.ref.json",
                 ".gxe.log",
             )
@@ -3424,8 +3424,6 @@ def _prepare_task(
                 "--_gxe-feature-cache",
                 str(cache_path),
             ]
-            if probes < MIN_FITTABLE_GXE_JACKKNIFE_PROBES:
-                command.append("--allow-low-probe-gxe-jackknife")
             command.extend(["--out", str(prefix)])
             plan = {
                 "mode": "summit",
@@ -4003,7 +4001,6 @@ def _validate_fit_outputs(
         "coefficients",
         "variance_contributions",
         "proportions",
-        "standard_errors",
     )
     vectors: dict[str, np.ndarray] = {}
     for key in vector_keys:
@@ -4011,23 +4008,21 @@ def _validate_fit_outputs(
         if values.shape != (4,) or not np.all(np.isfinite(values)):
             raise ValueError(f"Fit JSON vector {key!r} is incomplete or nonfinite.")
         vectors[key] = values
-    if np.any(vectors["standard_errors"] < 0.0):
-        raise ValueError("Fit jackknife standard errors must be nonnegative.")
     if not np.isclose(vectors["proportions"].sum(), 1.0, rtol=1e-8, atol=1e-8):
         raise ValueError("Fit proportions do not sum to one.")
-    labels = payload.get("jackknife_block_labels")
-    replicates = np.asarray(payload.get("jackknife_estimates"), dtype=np.float64)
-    j = int(config["estimator"]["jackknife_blocks"])
-    if not isinstance(labels, list) or len(labels) != j or len(set(labels)) != j:
-        raise ValueError("Fit JSON lacks the exact J unique jackknife labels.")
-    if replicates.shape != (j, 4) or not np.all(np.isfinite(replicates)):
-        raise ValueError("Fit JSON lacks finite J-by-four delete-block estimates.")
+    if payload.get("jackknife_block_labels") != []:
+        raise ValueError("New GxE fits must not declare jackknife block labels.")
+    if any(
+        key in payload
+        for key in (
+            "standard_errors",
+            "original_scale_standard_errors",
+            "jackknife_estimates",
+        )
+    ):
+        raise ValueError("New GxE fits must not contain jackknife estimates or standard errors.")
     for key, expected in (
         ("original_scale_proportions", vectors["proportions"] * residual_fraction),
-        (
-            "original_scale_standard_errors",
-            vectors["standard_errors"] * residual_fraction,
-        ),
     ):
         values = np.asarray(payload.get(key), dtype=np.float64)
         if (
@@ -4069,9 +4064,7 @@ def _validate_fit_outputs(
         "kernel_trace": "kernel_traces",
         "variance_contribution": "variance_contributions",
         "proportion": "proportions",
-        "proportion_se": "standard_errors",
         "original_scale_proportion": "original_scale_proportions",
-        "original_scale_se": "original_scale_standard_errors",
     }
     for column, key in comparisons.items():
         observed = pd.to_numeric(frame[column], errors="coerce").to_numpy(
@@ -4082,28 +4075,20 @@ def _validate_fit_outputs(
         ):
             raise ValueError(f"Fit TSV column {column!r} differs from fit JSON.")
 
-    try:
-        observed_z = pd.to_numeric(frame["z"], errors="raise").to_numpy(
-            dtype=np.float64
-        )
-    except (TypeError, ValueError) as error:
-        raise ValueError("Fit TSV column 'z' contains a nonnumeric value.") from error
-    with np.errstate(divide="ignore", invalid="ignore"):
-        expected_z = vectors["proportions"] / vectors["standard_errors"]
-    finite = np.isfinite(expected_z)
-    if (
-        not np.array_equal(np.isnan(observed_z), np.isnan(expected_z))
-        or not np.array_equal(np.isposinf(observed_z), np.isposinf(expected_z))
-        or not np.array_equal(np.isneginf(observed_z), np.isneginf(expected_z))
-        or not np.all(np.isfinite(observed_z[finite]))
-        or not np.allclose(
-            observed_z[finite], expected_z[finite], rtol=5e-10, atol=5e-12
-        )
-    ):
-        raise ValueError(
-            "Fit TSV column 'z' differs from proportion/proportion_se, including "
-            "the required zero-SE NaN/infinity behavior."
-        )
+    for column in ("proportion_se", "z", "original_scale_se"):
+        try:
+            observed = pd.to_numeric(frame[column], errors="raise").to_numpy(
+                dtype=np.float64
+            )
+        except (TypeError, ValueError) as error:
+            raise ValueError(
+                f"Fit TSV column {column!r} contains a nonnumeric value."
+            ) from error
+        if not np.all(np.isnan(observed)):
+            raise ValueError(
+                f"Fit TSV column {column!r} must be empty when GxE jackknife "
+                "generation is disabled."
+            )
 
 
 def _postvalidate_task(
@@ -4368,6 +4353,19 @@ def _invoke_summit_cli(cli, command: list[str]) -> None:
 
 
 def _execute_plan(plan: dict, runtime: dict, common: dict, task: str) -> None:
+    retired_persisted_tasks = {
+        "cache",
+        "cache_attest",
+        "shard",
+        "merge",
+        "merge_half",
+    }
+    if task in retired_persisted_tasks:
+        raise RuntimeError(
+            f"Hoffman task {task!r} is retired: the supported GxE workflow "
+            "does not persist feature caches or reference shards. Run the "
+            "monolithic or fused multi-environment path instead."
+        )
     command = list(plan["command"])
     if plan["mode"] == "write_json":
         if task != "cache_attest" or len(plan["outputs"]) != 1:

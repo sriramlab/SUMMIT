@@ -973,6 +973,252 @@ static void read_block_standardized_impl(const std::string &bed_path,
                                          N, L);
 }
 
+static void pack_mailman_from_snp0(
+    const unsigned char* snp0,
+    int n_total,
+    std::size_t bytes_per_snp,
+    int blk_start,
+    const std::vector<int>& rows,
+    int ddof,
+    uint64_t impute_seed,
+    bool hwe_impute,
+    MailmanPackedBlock& out
+) {
+    const int N = out.N;
+    const int L = out.L;
+    const RowDecodePlan& plan = get_row_decode_plan(rows, n_total);
+    int n_threads = 1;
+#ifdef _OPENMP
+    if (const char* value = std::getenv("SUMMIT_MAILMAN_PACK_THREADS")) {
+        const int requested = std::atoi(value);
+        n_threads = requested > 0 ? requested : omp_get_max_threads();
+    } else {
+        n_threads = omp_get_max_threads();
+    }
+    n_threads = std::min(
+        static_cast<int>(out.n_segments), std::max(1, n_threads)
+    );
+#endif
+
+#ifdef _OPENMP
+#pragma omp parallel num_threads(n_threads)
+#endif
+    {
+        static thread_local std::vector<uint8_t> codes_local;
+        static thread_local std::vector<int> missing_local;
+        if (static_cast<int>(codes_local.size()) < N) {
+            codes_local.resize(static_cast<size_t>(N));
+        }
+#ifdef _OPENMP
+#pragma omp for schedule(static)
+#endif
+        for (int64_t segment = 0; segment < out.n_segments; ++segment) {
+            const int column_begin = static_cast<int>(
+                segment * static_cast<int64_t>(out.segment_size)
+            );
+            const int column_end = std::min(
+                L, column_begin + out.segment_size
+            );
+            auto pack_segment = [&](auto* packed_segment) {
+                using CodeT = std::remove_pointer_t<decltype(packed_segment)>;
+                std::memset(
+                    packed_segment, 0, static_cast<size_t>(N) * sizeof(CodeT)
+                );
+                for (int column = column_begin; column < column_end; ++column) {
+                    const unsigned char* bytes = snp0
+                        + static_cast<size_t>(column) * bytes_per_snp;
+                    long long observed = 0;
+                    long long sum = 0;
+                    long long sumsq = 0;
+                    if (plan.full_range) {
+                        decode_all_rows_codes_into(
+                            bytes, n_total, codes_local.data(), observed,
+                            sum, sumsq, &missing_local
+                        );
+                    } else if (plan.use_sparse) {
+                        decode_rows_codes_sparse_precomp_into(
+                            bytes, plan.row_byte.data(), plan.row_shift.data(),
+                            N, codes_local.data(), observed, sum, sumsq,
+                            &missing_local
+                        );
+                    } else {
+                        decode_rows_codes_dense_sorted_into(
+                            bytes, n_total, rows, codes_local.data(), observed,
+                            sum, sumsq, &missing_local
+                        );
+                    }
+                    out.observed[static_cast<size_t>(column)] =
+                        static_cast<int>(observed);
+                    if (!hwe_impute) {
+                        out.missing_rows[static_cast<size_t>(column)] =
+                            missing_local;
+                    }
+                    long long completed_sum = sum;
+                    long long completed_sumsq = sumsq;
+                    if (hwe_impute
+                        && observed != static_cast<long long>(N)) {
+                        double q0 = 0.0;
+                        double q01 = 0.0;
+                        hwe_thresholds_from_obs(sum, observed, q0, q01);
+                        const uint64_t seed_base = hwe_seed_base(
+                            impute_seed, blk_start + column
+                        );
+                        impute_hwe_missing_inplace(
+                            codes_local.data(), missing_local, rows, q0, q01,
+                            seed_base, sum, sumsq,
+                            completed_sum, completed_sumsq
+                        );
+                    }
+                    double mean = 0.0;
+                    double inv_std = 1.0;
+                    if (hwe_impute) {
+                        compute_mean_invstd_from_completed(
+                            completed_sum, completed_sumsq, N, ddof,
+                            mean, inv_std
+                        );
+                    } else if (observed > 0) {
+                        mean = static_cast<double>(sum)
+                            / static_cast<double>(observed);
+                        double m2 = static_cast<double>(sumsq)
+                            - static_cast<double>(sum)
+                                * static_cast<double>(sum)
+                                / static_cast<double>(observed);
+                        if (m2 < 0.0 && m2 > -1.0e-12) m2 = 0.0;
+                        const int denominator = N - ddof;
+                        inv_std = denominator > 0 && m2 > 0.0
+                            ? std::sqrt(
+                                static_cast<double>(denominator) / m2
+                            )
+                            : 1.0;
+                    }
+                    out.mean[static_cast<size_t>(column)] = mean;
+                    out.inv_std[static_cast<size_t>(column)] = inv_std;
+                    pack_completed_codes(
+                        codes_local.data(), N, packed_segment
+                    );
+                }
+            };
+            if (out.use_u16) {
+                pack_segment(
+                    out.packed16.data()
+                        + static_cast<size_t>(segment) * static_cast<size_t>(N)
+                );
+            } else {
+                pack_segment(
+                    out.packed32.data()
+                        + static_cast<size_t>(segment) * static_cast<size_t>(N)
+                );
+            }
+        }
+    }
+}
+
+static void read_block_mailman_memory_impl(
+    const unsigned char* bed_base,
+    std::size_t bed_size,
+    int n_total,
+    std::size_t bytes_per_snp,
+    int blk_start,
+    int blk_end,
+    const std::vector<int>& rows,
+    int ddof,
+    uint64_t impute_seed,
+    bool hwe_impute,
+    MailmanPackedBlock& out
+) {
+    if (bed_base == nullptr || n_total <= 0 || bytes_per_snp == 0
+        || blk_start < 0 || blk_end < blk_start) {
+        throw std::runtime_error("Invalid mapped BED Mailman request");
+    }
+    const size_t required = static_cast<size_t>(3)
+        + static_cast<size_t>(blk_end) * bytes_per_snp;
+    if (required > bed_size || bed_size < 3
+        || bed_base[0] != 0x6c || bed_base[1] != 0x1b
+        || bed_base[2] != 0x01) {
+        throw std::runtime_error(
+            "Mapped BED is incompatible with the Mailman request"
+        );
+    }
+    for (int row : rows) {
+        if (row < 0 || row >= n_total) {
+            throw std::runtime_error(
+                "Mapped BED Mailman row selection is out of range"
+            );
+        }
+    }
+    const int N = static_cast<int>(rows.size());
+    const int L = blk_end - blk_start;
+    out.N = N;
+    out.L = L;
+    out.segment_size = compute_mailman_segment_size_from_n(N);
+    out.n_segments = L > 0
+        ? (L + out.segment_size - 1) / out.segment_size
+        : 0;
+    out.table_size = compute_mailman_table_size(out.segment_size);
+    out.use_u16 = out.table_size
+        <= static_cast<int64_t>(std::numeric_limits<uint16_t>::max());
+    if (out.use_u16) {
+        out.packed16.resize(
+            static_cast<size_t>(out.n_segments) * static_cast<size_t>(N)
+        );
+        out.packed32.clear();
+    } else {
+        out.packed32.resize(
+            static_cast<size_t>(out.n_segments) * static_cast<size_t>(N)
+        );
+        out.packed16.clear();
+    }
+    out.mean.resize(static_cast<size_t>(L));
+    out.inv_std.resize(static_cast<size_t>(L));
+    out.observed.resize(static_cast<size_t>(L));
+    if (hwe_impute) {
+        out.missing_rows.clear();
+    } else {
+        out.missing_rows.resize(static_cast<size_t>(L));
+    }
+    if (N <= 0 || L <= 0) return;
+    pack_mailman_from_snp0(
+        bed_base + 3 + static_cast<size_t>(blk_start) * bytes_per_snp,
+        n_total, bytes_per_snp, blk_start, rows, ddof, impute_seed,
+        hwe_impute, out
+    );
+}
+
+void read_block_mailman_hwe_memory(
+    const unsigned char* bed_base,
+    std::size_t bed_size,
+    int n_total,
+    std::size_t bytes_per_snp,
+    int blk_start,
+    int blk_end,
+    const std::vector<int>& rows,
+    int ddof,
+    uint64_t impute_seed,
+    MailmanPackedBlock& out
+) {
+    read_block_mailman_memory_impl(
+        bed_base, bed_size, n_total, bytes_per_snp,
+        blk_start, blk_end, rows, ddof, impute_seed, true, out
+    );
+}
+
+void read_block_mailman_mean_memory(
+    const unsigned char* bed_base,
+    std::size_t bed_size,
+    int n_total,
+    std::size_t bytes_per_snp,
+    int blk_start,
+    int blk_end,
+    const std::vector<int>& rows,
+    int ddof,
+    MailmanPackedBlock& out
+) {
+    read_block_mailman_memory_impl(
+        bed_base, bed_size, n_total, bytes_per_snp,
+        blk_start, blk_end, rows, ddof, 0, false, out
+    );
+}
+
 void read_block_mailman_hwe(const std::string& bed_path,
                             const std::string& fam_path,
                             int blk_start,
@@ -989,6 +1235,27 @@ void read_block_mailman_hwe(const std::string& bed_path,
     const int N = (int)rows.size();
     const int L = std::max(0, blk_end - blk_start);
 
+#if defined(__linux__)
+    {
+        const int nbytes_per_snp =
+            static_cast<int>(ceil_div(
+                static_cast<std::size_t>(N_total), static_cast<std::size_t>(4)
+            ));
+        auto mapping = get_bed_mapping_cached(bed_path);
+        if (!mapping || !mapping->base) {
+            throw std::runtime_error(
+                "Could not map BED for Mailman packing: " + bed_path
+            );
+        }
+        read_block_mailman_hwe_memory(
+            mapping->base, mapping->size, N_total,
+            static_cast<size_t>(nbytes_per_snp), blk_start, blk_end,
+            rows, ddof, impute_seed, out
+        );
+        return;
+    }
+#endif
+
     out.N = N;
     out.L = L;
     out.segment_size = compute_mailman_segment_size_from_n(N);
@@ -1004,6 +1271,7 @@ void read_block_mailman_hwe(const std::string& bed_path,
     }
     out.mean.resize((size_t)L);
     out.inv_std.resize((size_t)L);
+    out.observed.resize((size_t)L);
 
     if (N <= 0 || L <= 0) return;
 

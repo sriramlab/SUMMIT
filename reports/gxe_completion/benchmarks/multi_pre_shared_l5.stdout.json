@@ -1,0 +1,138 @@
+{
+  "affinity": [
+    0,
+    1,
+    2,
+    3
+  ],
+  "arguments": {
+    "environments": 5,
+    "m": 800,
+    "memory_gib": 1.0,
+    "n": 8000,
+    "probes": 32,
+    "seed": 20260814,
+    "step_size": 200,
+    "threads": 4,
+    "workspace_gib": 2.0
+  },
+  "cpu_seconds": 11.587104391,
+  "decode": {
+    "calls": 12,
+    "seconds": 0.6179126650386024
+  },
+  "gemm": [
+    {
+      "calls": 5,
+      "left": [
+        8000,
+        3
+      ],
+      "operation": "NN",
+      "output": [
+        8000,
+        64
+      ],
+      "right": [
+        3,
+        64
+      ],
+      "seconds": 0.0018287279817741364
+    },
+    {
+      "calls": 40,
+      "left": [
+        8000,
+        3
+      ],
+      "operation": "NN",
+      "output": [
+        8000,
+        200
+      ],
+      "right": [
+        3,
+        200
+      ],
+      "seconds": 0.07381253107450902
+    },
+    {
+      "calls": 40,
+      "left": [
+        8000,
+        200
+      ],
+      "operation": "NN",
+      "output": [
+        8000,
+        32
+      ],
+      "right": [
+        200,
+        32
+      ],
+      "seconds": 0.24337889498565346
+    },
+    {
+      "calls": 10,
+      "left": [
+        8000,
+        3
+      ],
+      "operation": "TN",
+      "output": [
+        3,
+        64
+      ],
+      "right": [
+        8000,
+        64
+      ],
+      "seconds": 0.004405799001688138
+    },
+    {
+      "calls": 80,
+      "left": [
+        8000,
+        3
+      ],
+      "operation": "TN",
+      "output": [
+        3,
+        200
+      ],
+      "right": [
+        8000,
+        200
+      ],
+      "seconds": 0.1331542921543587
+    },
+    {
+      "calls": 40,
+      "left": [
+        8000,
+        200
+      ],
+      "operation": "TN",
+      "output": [
+        200,
+        64
+      ],
+      "right": [
+        8000,
+        64
+      ],
+      "seconds": 0.7330068859737366
+    }
+  ],
+  "gemm_total_calls": 215,
+  "gemm_total_seconds": 1.18958713117172,
+  "label": "pre_fusion_6bf009e",
+  "max_rss_kib": 234088,
+  "mode": "shared",
+  "profile": "/home/bronsonj/SUMMIT/reports/gxe_completion/benchmarks/multi_pre_shared_l5.pstats",
+  "repairs": 0,
+  "schema": "summit.gxe.multi_environment_profile.v1",
+  "shared_genotype_passes": 3,
+  "wall_seconds": 7.635494438989554
+}

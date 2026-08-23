@@ -11,10 +11,8 @@ from summit.ldscore.gwe_ldscore import (
     _build_balanced_vtiles,
     _orthonormalize_columns,
     _stable_center_and_scale,
-    _validate_jackknife_probe_count,
     read_env_and_cov,
 )
-from summit.logger import Logger
 
 
 def test_svd_projector_preserves_rank_deficient_design_span():
@@ -58,13 +56,6 @@ def test_probe_tiles_never_exceed_memory_derived_cap():
         assert [start for start, _ in tiles] == list(
             np.cumsum([0] + [size for _, size in tiles[:-1]])
         )
-
-
-def test_low_probe_jackknife_requires_explicit_diagnostic_override():
-    with pytest.raises(ValueError, match="at least 100"):
-        _validate_jackknife_probe_count(99, True, False)
-    _validate_jackknife_probe_count(99, True, True)
-    _validate_jackknife_probe_count(100, True, False)
 
 
 def test_single_fractional_annotation_is_applied():
@@ -134,22 +125,3 @@ def test_nxe_trace_formula_matches_explicit_projected_kernel():
     hn = pmat @ np.diag(e * e) @ pmat
     np.testing.assert_allclose(trace_d, np.trace(hn), rtol=2e-14, atol=2e-14)
     np.testing.assert_allclose(trace_d2, np.trace(hn @ hn), rtol=2e-14, atol=2e-14)
-
-
-def test_jackknife_preflight_rejects_one_block_and_empty_annotation_deletion():
-    obj = GenomewideEnvLDScore.__new__(GenomewideEnvLDScore)
-    obj.nsnps = 4
-    obj.nbins = 1
-    obj.l2cols = ["a"]
-    obj.log = Logger(suppress=True)
-    obj.snplist = pd.DataFrame({"CHR": ["1"] * 4})
-    obj.annot = np.ones((4, 1))
-    obj.nsnps_bin = np.array([4.0])
-    with pytest.raises(ValueError, match="at least two"):
-        obj._build_jackknife_blocks("chr")
-
-    obj.snplist = pd.DataFrame({"CHR": ["1", "1", "2", "2"]})
-    obj.annot = np.array([[1.0], [1.0], [0.0], [0.0]])
-    obj.nsnps_bin = np.array([2.0])
-    with pytest.raises(ValueError, match="empty an annotation"):
-        obj._build_jackknife_blocks("2")

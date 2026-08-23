@@ -17,6 +17,7 @@ from .gwe_ldscore import (
     _FEATURE_CACHE_ARRAY_DTYPES,
     _FEATURE_CACHE_SCHEMA_VERSION,
     _BACKEND_PROVENANCE_SCHEMA_VERSION,
+    _REFERENCE_FLOAT_FORMAT,
     _ndarray_sha256,
     _validate_gxe_annotation_names,
     _validate_feature_cache_semantics,
@@ -208,6 +209,7 @@ def _read_panel_file(
             sep=r"\s+",
             dtype={"CHR": str, "SNP": str},
             compression="gzip",
+            float_precision="round_trip",
         )
     required = ["CHR", "SNP", "BP", *names]
     observed_columns = frame.columns.astype(str).tolist()
@@ -238,7 +240,6 @@ def _merge_reference_shards_impl(
     *,
     feature_cache_path: str | Path,
     output_prefix: str | Path,
-    allow_low_probe_jackknife: bool = False,
 ) -> Path:
     """Merge disjoint probe shards into one fit-able schema-v3 reference."""
     manifests = [Path(value).expanduser().resolve() for value in shard_manifests]
@@ -272,7 +273,7 @@ def _merge_reference_shards_impl(
     common_keys = (
         "analysis_fingerprint", "variant_digest", "annotation_digest",
         "jackknife_digest", "kernel_mode", "genotype_scale", "ld_scale",
-        "annotation_names",
+        "annotation_names", "annotation_value_dtype",
     )
     random_keys = ("distribution", "algorithm", "seed", "dtype", "step_size")
     identity_random_keys = (
@@ -283,8 +284,22 @@ def _merge_reference_shards_impl(
         manifest_raw = _read_bytes(manifest_path)
         manifest_hash = _sha256_bytes(manifest_raw)
         shard = _load_json_bytes(manifest_raw, manifest_path)
-        if shard.get("kind") != _SHARD_KIND or shard.get("schema_version") != 2:
+        shard_version = shard.get("schema_version")
+        if shard.get("kind") != _SHARD_KIND or shard_version not in (2, 3):
             raise ValueError(f"Unsupported or fit-able input passed as a shard: {manifest_path}.")
+        # Schema-v3 shards pledge canonical binary64 annotation values; v2
+        # shards predate that pledge and may have rounded continuous
+        # annotations to the randomized retained-storage dtype.  The two
+        # annotation contracts must never be merged silently.
+        annotation_value_dtype = shard.get("annotation_value_dtype")
+        if shard_version == 3 and annotation_value_dtype != "float64":
+            raise ValueError(
+                f"Schema-v3 shard lacks the binary64 annotation pledge: {manifest_path}."
+            )
+        if shard_version == 2 and annotation_value_dtype is not None:
+            raise ValueError(
+                f"Schema-v2 shard carries an unexpected annotation dtype pledge: {manifest_path}."
+            )
         cache_decl = shard.get("feature_cache")
         if not isinstance(cache_decl, dict) or cache_decl.get("sha256") != cache_hash:
             raise ValueError(f"Shard was generated from a different feature cache: {manifest_path}.")
@@ -299,6 +314,7 @@ def _merge_reference_shards_impl(
                 f"Shard feature-backend provenance differs from its cache: {manifest_path}."
             )
         config = {key: shard.get(key) for key in common_keys}
+        config["schema_version"] = shard_version
         randomization = shard.get("randomization")
         if not isinstance(randomization, dict):
             raise ValueError(f"Shard lacks randomization metadata: {manifest_path}.")
@@ -521,15 +537,11 @@ def _merge_reference_shards_impl(
     if within is not None:
         for value in within.values():
             value /= total_vectors
-    low_probe_override = False
     if within is not None and total_vectors < 100:
-        if not allow_low_probe_jackknife:
-            raise ValueError(
-                "A fit-able GxE jackknife reference requires at least 100 merged probes; "
-                f"got {total_vectors}. Pass allow_low_probe_jackknife=True only for an "
-                "explicit diagnostic merge."
-            )
-        low_probe_override = True
+        raise ValueError(
+            "A legacy GxE jackknife reference requires at least 100 merged probes; "
+            f"got {total_vectors}. New GxE references no longer create jackknife artifacts."
+        )
 
     if within is not None:
         paths["jackknife"] = Path(str(prefix) + ".gxe.jackknife.npz")
@@ -565,7 +577,7 @@ def _merge_reference_shards_impl(
                     staged[key],
                     sep="\t",
                     compression="gzip",
-                    float_format="%.10g",
+                    float_format=_REFERENCE_FLOAT_FORMAT,
                 )
                 del frame
             diagonal = variants.copy()
@@ -585,7 +597,7 @@ def _merge_reference_shards_impl(
                 staged["diagonal"],
                 sep="\t",
                 compression="gzip",
-                float_format="%.12g",
+                float_format=_REFERENCE_FLOAT_FORMAT,
             )
             if within is not None:
                 _atomic_npz(
@@ -597,9 +609,13 @@ def _merge_reference_shards_impl(
             output_hashes = {
                 key: _sha256(staged[key]) for key in output_files
             }
+            # Schema-v3 shards (canonical binary64 annotations) merge into a
+            # schema-v4 reference; legacy v2 shards keep producing a v3
+            # reference so the two annotation contracts stay distinguishable.
+            merged_schema_version = 4 if common["schema_version"] == 3 else 3
             payload = {
                 "kind": "summit.gxe.reference",
-                "schema_version": 3,
+                "schema_version": merged_schema_version,
                 "analysis_fingerprint": metadata["analysis_fingerprint"],
                 "variant_digest": metadata["variant_digest"],
                 "n_samples": int(metadata["n_samples"]),
@@ -613,6 +629,14 @@ def _merge_reference_shards_impl(
                 "ld_scale": "cross_product_over_rank_squared",
                 "null_corrected": False,
                 "annotation_names": names,
+                **(
+                    {
+                        "annotation_value_dtype": "float64",
+                        "annotation_digest": metadata["annotation_digest"],
+                    }
+                    if merged_schema_version >= 4
+                    else {}
+                ),
                 "annotation_masses": metadata["annotation_masses"],
                 "feature_diagnostics": metadata["feature_diagnostics"],
                 "resource_estimates": {"merged_shards": len(loaded)},
@@ -624,7 +648,6 @@ def _merge_reference_shards_impl(
                     "probe_ranges": [[start, stop] for start, stop, _, _ in intervals],
                     "probe_offset": intervals[0][0],
                     "probe_stop": intervals[-1][1],
-                    "low_probe_jackknife_override": low_probe_override,
                 },
                 "genotype_files": metadata["genotype_files"],
                 "feature_cache": {
@@ -738,7 +761,6 @@ def merge_reference_shards(
     *,
     feature_cache_path: str | Path,
     output_prefix: str | Path,
-    allow_low_probe_jackknife: bool = False,
 ) -> Path:
     """Merge reference shards under a cooperative, owner-only prefix lock."""
     prefix = Path(output_prefix).expanduser().resolve()
@@ -757,7 +779,6 @@ def merge_reference_shards(
             shard_manifests,
             feature_cache_path=feature_cache_path,
             output_prefix=prefix,
-            allow_low_probe_jackknife=allow_low_probe_jackknife,
         )
     finally:
         try:

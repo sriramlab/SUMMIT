@@ -1,0 +1,51 @@
+Stage 6 bounded restricted-only diagnostic failure evidence
+
+Recorded at (UTC): 2026-08-21T13:36:10Z
+Repository HEAD: 60a494cc6429543839640db200db4a582d071107
+Harness SHA-256: 58c7b945ef263c16ebb6d227c8d1212e2d52413326bba0de12850090bfe4d57c
+Build spec SHA-256: a21f9d26535571e4a6a0c07cdfd95a882a94ce0ba83df977ab5bf2ffcf054fb7
+Restricted plan SHA-256: 115efefa2943aad63c5489c66baca3fc0c9abc0c894d958ecda38113a2ee5966
+Observed controller exit code: 1
+Observed controller wall time: 4.195152698 seconds
+Failed worker PID reported by controller: 1101204
+Requested diagnostic output: reports/context_native/benchmarks/stage6/screen/screen_group_restricted_diagnostic_postfix_60a494c_r1.json
+Diagnostic output state after failure: absent
+Temporary summit-context-stage6 workspace state after failure: absent (controller cleanup completed)
+Benchmark worker process state when checked after failure: none running
+Invocation scope: restricted baseline only.
+Conclusion: the restricted baseline is directly implicated at this exact bounded geometry. The conditional direct-action-only diagnostic was not created or run.
+
+Exact command:
+
+/home/bronsonj/anaconda3/envs/summit/bin/python scripts/context/benchmark_context_native_stage6.py --build-spec reports/context_native/benchmarks/stage6/config/candidate_build.json --baseline-plan reports/context_native/benchmarks/stage6/config/screen_group_restricted_t8.json --input-kind synthetic --retained-samples 512 --retained-variants 2048 --q 4 --k 2 --groups 8 --sample-probes 16 --variant-probes 16 --traits 1 --residual-bases 2 --fixed-rank 2 --cpu-list 0-7 --warmups 0 --repeats 1 --worker-timeout-seconds 150 --sweep-timeout-seconds 540 --sample-interval-ms 100 --max-workspace-bytes 2147483648 --max-logical-variant-visits 50000000 --max-logical-bed-bytes 2147483648 --pilot-variant-ceiling 8192 --max-extrapolation-ratio 4 --estimate-safety-factor 2 --max-synthetic-cells 2000000 --max-input-hash-bytes 67108864 --preparation-variant-block 512 --work-root /tmp --output reports/context_native/benchmarks/stage6/screen/screen_group_restricted_diagnostic_postfix_60a494c_r1.json
+
+Exact stderr:
+
+Traceback (most recent call last):
+  File "/home/bronsonj/SUMMIT/scripts/context/benchmark_context_native_stage6.py", line 3456, in <module>
+    raise SystemExit(main())
+                     ^^^^^^
+  File "/home/bronsonj/SUMMIT/scripts/context/benchmark_context_native_stage6.py", line 3450, in main
+    result = _controller(args)
+             ^^^^^^^^^^^^^^^^^
+  File "/home/bronsonj/SUMMIT/scripts/context/benchmark_context_native_stage6.py", line 3246, in _controller
+    worker, monitor = _run_child_json(
+                      ^^^^^^^^^^^^^^^^
+  File "/home/bronsonj/SUMMIT/scripts/context/benchmark_context_native_stage6.py", line 2925, in _run_child_json
+    monitor = _run_monitored(
+              ^^^^^^^^^^^^^^^
+  File "/home/bronsonj/SUMMIT/scripts/context/benchmark_context_native_stage6.py", line 1208, in _run_monitored
+    raise RuntimeError(
+RuntimeError: worker 1101204 failed with exit 1: Traceback (most recent call last):
+  File "/home/bronsonj/SUMMIT/scripts/context/benchmark_context_native_stage6.py", line 3456, in <module>
+    raise SystemExit(main())
+                     ^^^^^^
+  File "/home/bronsonj/SUMMIT/scripts/context/benchmark_context_native_stage6.py", line 3446, in main
+    _execute_worker(parsed._request, parsed._result)
+  File "/home/bronsonj/SUMMIT/scripts/context/benchmark_context_native_stage6.py", line 1988, in _execute_worker
+    reference = run_contextual_reference_v1(reference_executor, publication)
+                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/tmp/summit-stage6-candidate-install.pKDHlB/summit/context/reference_v1.py", line 3396, in run_contextual_reference_v1
+    return adapt_native_contextual_reference_v1(run(), publication_identity)
+                                                ^^^^^
+RuntimeError: ContextualReferenceExecutorV1 trusted fallback verification failed

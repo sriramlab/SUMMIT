@@ -79,9 +79,6 @@ def test_file_bundle_reconstructs_explicit_individual_level_fit(tmp_path):
         kernel_mode="genie",
         genotype_scale="hwe",
         target_xz_mem=0.01,
-        write_jackknife=True,
-        jackknife_spec="3",
-        allow_low_probe_jackknife=True,
     )
 
     # A complete orthogonal probe panel makes the stochastic score identity
@@ -105,7 +102,6 @@ def test_file_bundle_reconstructs_explicit_individual_level_fit(tmp_path):
     obj._read_genotype_block = types.MethodType(counted_read, obj)
     obj._compute_ldscore()
     # Feature diagnostics, one global source pass, and one global target pass.
-    # Block-local jackknife replicates require no additional genotype reads.
     assert read_count == 3
 
     fitted, _ = fit_from_files(
@@ -140,9 +136,9 @@ def test_file_bundle_reconstructs_explicit_individual_level_fit(tmp_path):
     rhs = np.asarray([y @ a @ y for a in kernels])
     direct = np.linalg.solve(lhs, rhs)
     np.testing.assert_allclose(fitted.coefficients, direct, rtol=2e-9, atol=2e-9)
-    assert fitted.standard_errors is not None
-    assert fitted.jackknife_estimates.shape == (3, len(kernels))
-    assert np.all(np.isfinite(fitted.standard_errors))
+    assert fitted.standard_errors is None
+    assert fitted.jackknife_estimates is None
+    assert fitted.jackknife_block_labels == ()
 
     generated = list(tmp_path.glob("bundle.g*"))
     assert generated

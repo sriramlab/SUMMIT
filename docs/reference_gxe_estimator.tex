@@ -526,6 +526,14 @@ the deleted SNP fraction in the diagonal term, so it is an explicit
 approximation whose stability should be checked when blocks are few, large, or
 annotation-imbalanced.  An exact deletion would require block-specific
 cross-sketch moments and is intentionally not the production default.
+In a conditional $K=1$ simulation with 100 blocks and 5,000 estimating-
+equation replicates, reuse changed delete-block normal matrices by 0.12\% at
+the median and 0.48\% at the maximum.  G$\times$E-null type-I error was 5.02\%;
+under a moderate G$\times$E alternative, nominal 95\% coverage was 97.76\%
+and the median standard error was 17.5\% larger than with exact deletion.
+Thus the approximation was mildly conservative in this operating regime, not
+exact.  This result does not cover small high-leverage annotations, finite-
+reference sampling, probe variation, or study/reference overlap.
 
 Increasing $B$ reduces only probe error.  It cannot repair reference mismatch
 or an unidentified model.  In particular, if $E^2$ is constant after
@@ -655,9 +663,11 @@ elapsed time was 1,534.9 seconds (25.6 minutes), with 4.04 GiB peak RSS.  Its
 feature, source, panel-preparation, and target phases took 560.0, 368.6, 0.20,
 and 471.4 seconds.  The source tree, loaded native binary, and single OpenBLAS
 0.3.34 runtime are hash-bound in the published reference manifest.  Relative
-to the preceding internally threaded diagnostic, total elapsed time fell
-20.9\%, target time fell 51.9\%, and repaired output columns fell from 384 to
-3 without increasing memory.
+to an earlier diagnostic it reported only three repaired columns, and every
+reported product passed the integrity layer.  This run used the subsequently
+identified unsafe concurrent-entry design, so its scientific output remains
+protected but its favorable wall time is a historical measurement, not the
+forecast for the corrected serialized-entry executor.
 
 A cohort-matched additive-only $B=32$ run used the same $N=291{,}273$,
 $M=454{,}207$, covariates, probe distribution and seed, 32-core affinity, and
@@ -705,43 +715,51 @@ input or output.  Dropping extreme LD-score values would be unsafe here: an
 extreme Monte Carlo realization and a corrupt output are different events,
 and clipping squared traces creates downward bias.
 
-Before the environment repair, tabla loaded two BLAS runtimes in one process:
-NumPy's pip wheel bundled OpenBLAS 0.3.30/Haswell while the native extension
-used conda OpenBLAS 0.3.34/Zen.  The environment has now been changed to conda
-NumPy 2.3.5, so NumPy and the extension both resolve to the same OpenBLAS
-0.3.34 Zen library.  This removes a concrete source of process-wide thread and
-runtime interference, but it did not remove the numerical fault.  The
-full-cohort $B=32$ diagnostic triggered 384 repaired output columns.  More
-decisively, a production-shaped dense test with $N=291{,}273$, $M=1{,}207$, and
-$B=32$ intermittently observed a maximum target error of 58.15 from the
-internally threaded vendor path, despite using binary64 arithmetic.  Repeating
-the same test could also return only ordinary accumulation-order error, proving
-that the failure is intermittent and shape/thread dependent.
+Before the environment repair, tabla loaded two BLAS runtimes in one process.
+After unifying them, a pure C++ reproducer compiled at
+\texttt{-O3 -march=native} and using the exact production dimensions isolated
+one deployment trigger: simultaneous entry by multiple application threads
+into the same pthread OpenBLAS runtime.  A second exact-cohort reproducer found
+valid fixed-effect contractions could fail immediately after repeated
+one-to-many runtime thread-count transitions.  Thus the shared mutable runtime
+lifecycle, rather than a genotype layout or float32 error, was the common
+application-level cause.  The exact failing statement inside OpenBLAS was not
+localized.
 
-SUMMIT therefore no longer invokes an internally threaded OpenBLAS GEMM for
-these products.  It fixes OpenBLAS at one thread per call and partitions
-disjoint output rows across SUMMIT-owned OpenMP workers.  This was faster, not
-slower, in the production-shaped no-fault comparison (1.09 versus 1.33 seconds
-for the 2$B$ target and 1.79 versus 2.28 seconds for 4$B$).  Across 20 repeated
-2$B$/4$B$ calls, the selective ABFT layer repaired 257 output columns and every
-final output remained within $2.283\times10^{-6}$ of the independent dense
-float64 oracle.  Thus the vendor/concurrency problem is still observable, but
-the returned result is protected without duplicating the full genotype
-operand.  The ABFT path checks wide GEMMs, repairs only discrepant output
-columns with a non-vendor cache-tiled kernel, and falls back to a deterministic
-fresh decode only if the reconstructable genotype input changes.
+At the 4$B$ target shape, 6 of 200 concurrent Zen calls were corrupt, with
+maximum absolute error 0.356; one internally 32-threaded call was clean for all
+200 repetitions to $2.84\times10^{-14}$.  At the source shape, 4 of 100
+concurrent calls were corrupt, with maximum error 3.256, while all 100 internal
+calls were bitwise equal to the serial reference.  Inputs remained bitwise
+unchanged and every red-zone canary remained intact.  The fault persisted when
+each caller had a guarded private output matrix and when work was partitioned
+by columns.  A longer Haswell-dispatch control also failed (17 of 200 calls,
+maximum error 33.14), so the problem is not specific to Zen arithmetic or an
+adjacent output boundary.  Serializing concurrent calls with a mutex was clean
+in the bounded trial.
 
-A controlled microkernel experiment held the OpenBLAS 0.3.34 library, input,
-thread count, and 20-call stress sequence fixed, but forced dynamic dispatch
-from Zen to Haswell.  Repaired columns fell from 257 to 1 (99.6\%), while
-source, 2$B$ target, and 4$B$ target time increased by 29\%, 18\%, and 6\%,
-respectively.  This strongly localizes the residual failure to the Zen dispatch
-or microkernel path rather than genotype decoding, probe values, or float32
-storage.  Haswell is not yet safe enough to remove integrity checks, and the
-sealed full-cohort Zen run required only three repairs, so the faster Zen path
-with selective ABFT remains the production default.  A truly non-threaded
-OpenBLAS build or an independent BLAS implementation is the next clean test of
-the remaining vendor-runtime hypothesis.
+The supported Linux path now statically embeds a symbol-hidden private
+OpenBLAS in the G$\times$E extension.  Its thread count is set once at process
+initialization and cannot be resized; every vendor entry is serialized.  A
+private OpenMP build shares one worker runtime with the decoder, while a private
+pthread build uses passive OpenMP waiting to avoid idle-pool contention.  This
+removes both unsafe shared-state transitions.  The wide-product checksum,
+snapshot, repair, and retry stages are compiled out in private mode.  The
+opaque paired target operand remains sealed read-only with \texttt{mprotect},
+and context ownership/dimension checks remain.  A process-shared OpenBLAS
+fallback retains the eight-check integrity implementation and cannot be built
+unchecked.
+
+With $N=291{,}273$, $M=1{,}207$, and $B=32$, the private OpenMP build completed
+20 repeated source, 2$B$ target, and 4$B$ target calls with zero bitwise drift.
+Source error was $2.334\times10^{-10}$ and target error was
+$2.282\times10^{-6}$ against the independent dense float64 oracle.  No repair
+or retry path exists in that binary.  The initial active-wait measurement took
+0.654, 0.773, and 1.318 seconds for source, 2$B$, and 4$B$, respectively,
+versus 1.004, 1.007, and 2.275 seconds for the preceding guarded build.  A
+pthread-private control remained correct but was substantially slower when an
+active idle OpenMP team competed for the same CPUs, motivating the build-aware
+wait policy rather than one hard-coded setting.
 
 \section{Real-data validation status}
 

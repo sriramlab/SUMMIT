@@ -1,0 +1,48 @@
+{
+  "schema": "context_native_stage5_fault_qualification_v1",
+  "source_commit": "6bdb43fca41ed792205f89acd0115d065c2425be",
+  "source_tree_sha256": "e1c44a2ab0077c3080ea36bf5b1ebca4e5caa028a3f3fb4694b8fcdbc12c114c",
+  "native_module_sha256": "5a9ad681955ae5fe5dad4168b009787b06a0153bd86f3063124cdf4d4c5beca8",
+  "integrity_policy": "full_scalar_witness_v1",
+  "integrity_backend": "deterministic_tiled_fp64_with_scalar_witness_v1",
+  "fault_coverage_contract": "contextual_stage5_every_operation_r7_t4_v1",
+  "covered_operations": [
+    "sample_probe_projection_tn",
+    "sample_probe_projection_nn",
+    "source_tn",
+    "full_target_nn",
+    "action_projection_tn",
+    "action_projection_nn",
+    "action_gram_tn",
+    "group_target_nn",
+    "group_cross_gram_tn",
+    "direct_grouped_tn",
+    "same_person_target_nn",
+    "same_person_projection_tn",
+    "same_person_projection_nn",
+    "same_person_gram_tn",
+    "trait_score_tn",
+    "trait_feature_projection_tn",
+    "trait_feature_projection_nn"
+  ],
+  "recoverable_fault_modes": [
+    "one_shot",
+    "nan",
+    "inf",
+    "canary",
+    "repeated",
+    "repair_corruption",
+    "force_fallback"
+  ],
+  "terminal_fault_modes": [
+    "fallback_corruption",
+    "fallback_failure",
+    "operand_mutation",
+    "runtime_mutation"
+  ],
+  "release_fault_matrix_passed": true,
+  "focused_test_count": 57,
+  "full_regression_test_count": 1564,
+  "asan_ubsan_status": "passed",
+  "ubsan_status": "passed"
+}

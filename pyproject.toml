@@ -23,6 +23,7 @@ dependencies = [
 
 [project.scripts]
 summit = "summit.cli:main"
+summit-generalized-gxe-variant-ldscore = "summit.ldscore.generalized_gxe_variant_cli:main"
 
 [tool.scikit-build]
 minimum-version = "0.5"

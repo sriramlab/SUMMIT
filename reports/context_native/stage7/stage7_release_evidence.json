@@ -1,0 +1,122 @@
+{
+  "schema": "context_native_stage7_release_evidence_v1",
+  "implementation": {
+    "source_commit": "69203355d558792981993e2ac8fceb6851e41418",
+    "git_tree": "114c707aa3d8769ce02459d280836a889f2f83df",
+    "tracked_source_sha256": "5868faf8516eb46e0397091812fc2f6788ef387602d1a1d0be5204883b3b2c8c",
+    "tracked_file_count": 461,
+    "clean_detached_source": true
+  },
+  "release": {
+    "evidence_root": "/tmp/summit-stage7-release-6920335.yygYYi",
+    "install_prefix": "/tmp/summit-stage7-release-6920335.yygYYi/install",
+    "build_type": "Release",
+    "compiler": "GNU 12.2.0",
+    "optimization": "-O3",
+    "architecture_tuning": "-march=native",
+    "native_module_sha256": "2591764e6ccedd67e0c92a8df2d4febcaa0f89967e6e2cb5615982c326f72eb4",
+    "installed_package_sha256": "05e999e082b4cabc4126c1d5b899c8943cb53b8a015333c71c9e8099bbd6da19",
+    "python_runtime_sha256": "d525812398709daca5133a1cd12f4f7da127433a04f17a7d978151a8df6e9ac5",
+    "dependency_runtime_sha256": "988388f2ca470dffaf208e8455771003149c9abbb495faaacf35036f9f252d10",
+    "build_info_sha256": "6f7cf813d1b4c8989c822a7294703c6e473e78dd421e3b81cb27bf5aae0053f3",
+    "full_repository": {
+      "passed": 1588,
+      "skipped": 5,
+      "xpassed": 1,
+      "pytest_seconds": 140.48,
+      "log_sha256": "c884ec0a023b5e2b67e272ece9f8f5aee522c45a76cc8dc55c21e3a4588f3a2d"
+    },
+    "contextual": {
+      "passed": 816,
+      "skipped": 0,
+      "xpassed": 0,
+      "pytest_seconds": 84.67,
+      "log_sha256": "35cb3945731c1a26f8846122b3d4a69dc596a14740f3d1e208c74f78fc874f65"
+    },
+    "log_manifest_sha256": "e257791c9f7f8eb0093aa98b042475fd554c97330fb87c204d9eced10afc5557"
+  },
+  "asan_ubsan": {
+    "evidence_root": "/tmp/summit-stage7-asan-6920335.0JVW73",
+    "native_module_sha256": "50ce3e882ee9ae5c608fef1abf4fb1a55dd2927db52e94f642f9a862f9d482ef",
+    "installed_package_sha256": "fd562c654fe1d267993b785d332128faacb892f65b03863baf46a146e55dee39",
+    "passed": 904,
+    "skipped": 0,
+    "pytest_seconds": 141.83,
+    "pytest_log_sha256": "5b02a9f77172d183edd985303f203118d3c3d67af47cdf668715ef99241a3efa",
+    "log_manifest_sha256": "25d3d2e13718d107f133f7da59030a2f4f47d8c73e0581253450475ba1a1e97d",
+    "asan_options": "halt_on_error=1:abort_on_error=1:detect_leaks=0",
+    "ubsan_options": "halt_on_error=1:print_stacktrace=1",
+    "diagnostic_scan_clean": true,
+    "leak_freedom_claimed": false
+  },
+  "ubsan_only": {
+    "evidence_root": "/tmp/summit-stage7-definitive-ubsan-6920335.O7JawY",
+    "native_module_sha256": "13e28e8136de3d91900e80d411b101b366d091206955b2a559b05ce110f8cdd5",
+    "installed_package_sha256": "4f2efb2673c46716ffb2b0fcdde7b64440cf3f03fdc05a526814c0a080ed7d5d",
+    "passed": 904,
+    "skipped": 0,
+    "pytest_seconds": 101.05,
+    "pytest_log_sha256": "ca34e0b709748225ad21ad84ba11b0c7d3d6d074fc0b268fb61c3e054957e458",
+    "log_manifest_sha256": "749986c729ee31dedccdef8beb8a0a16d923275ee91db11c8d42309934bcb2ed",
+    "ubsan_options": "halt_on_error=1:print_stacktrace=1",
+    "diagnostic_scan_clean": true
+  },
+  "qualification": {
+    "path": "reports/context_native/stage7/config/stage7_fault_qualification.json",
+    "sha256": "7ac1361c88b8209df6bc5139d945cafc5499505050ee74d30af87d1d7e4a8be0",
+    "build_spec_path": "reports/context_native/stage7/config/stage7_release_build.json",
+    "build_spec_sha256": "99a19d06b0303531ee527223693366b85b00a54a1bd6812311a54417664bc1ad"
+  },
+  "benchmark": {
+    "dry_run_path": "reports/context_native/stage7/benchmark_core_node0_dry_run.json",
+    "dry_run_sha256": "79054829c6edc3570e18de5eff002555b6d03fd67e83342da06fc43953cb4867",
+    "production_path": "reports/context_native/stage7/benchmark_core_node0_production_r3.json",
+    "production_sha256": "246211f8f564dace3f34ce3ef3efac7aac9d2eb71465c745f221dcf59137b670",
+    "affinity_cpu_list": "0-7",
+    "affinity_identity_sha256": "32abc5691e2cc75018c65d7903be7699fa35d37c654430a8e134a9b001340c8a",
+    "science_identity_sha256": "7ef8ad8d19cbcf35a5e4ed2bed48da8bed2c9b9f5fa95173b7eda38ff53c918d",
+    "rank_identity_sha256": "693df1eb35dad74dca10ae46b3a8abb6e84fa79b2c61f7b8a8fdee3af7c93a6d",
+    "protected_trace_sha256": "8a687648779ed9b976768bfa8f30b0eb3c27a11f8b22085abc9090e2f9e845dd",
+    "t1": {
+      "record_sha256": "bdc18ee15fe8628d2cbf02bc93179daa25b51ff9a737f0c76608e97e2713660d",
+      "replicate_wall_seconds": [4.750784788, 4.75214269, 4.787291578],
+      "median_wall_seconds": 4.75214269,
+      "native_run_seconds": 1.014171892,
+      "integrity_overhead_seconds": 0.761602139,
+      "admitted_native_bytes": 14783488,
+      "peak_process_rss_bytes": 162144256,
+      "production_qualified": true
+    },
+    "t8": {
+      "record_sha256": "d4e0a28a5ba5224a5beb70c167dc76dc65e4b88e281fd3839feaedb50c5c6967",
+      "replicate_wall_seconds": [5.240278725, 4.998297064, 5.169534038],
+      "median_wall_seconds": 5.169534038,
+      "native_run_seconds": 1.170807002,
+      "integrity_overhead_seconds": 0.852754823,
+      "admitted_native_bytes": 14783488,
+      "peak_process_rss_bytes": 162058240,
+      "production_qualified": true,
+      "speedup_over_t1": 0.9192593868360559,
+      "selection_rejection_reason": "material_end_to_end_speedup_not_met"
+    },
+    "selected_plan": "stage7-core-node0-t1",
+    "all_measured_comparisons_exact": true,
+    "all_recovery_counts_zero": true
+  },
+  "decisions": {
+    "bounded_private_stable_v1": "NARROW_GO",
+    "public_contextual_interface": "NO_GO_DEFERRED",
+    "large_real_data_reference_generation": "NO_GO",
+    "overall": "NARROW_GO_BOUNDED_PRIVATE_ONLY"
+  },
+  "nonclaims": [
+    "target_scale_execution",
+    "full_process_memory_admission",
+    "verified_numa_page_ownership",
+    "numa_remote_bytes",
+    "physical_mmap_read_bytes",
+    "b1024_stable_publication",
+    "public_contextual_cli_or_configuration_schema",
+    "leak_sanitizer_freedom"
+  ]
+}

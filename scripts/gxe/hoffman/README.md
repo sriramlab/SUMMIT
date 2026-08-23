@@ -1,8 +1,16 @@
 # Hoffman common-cohort GxE runbook
 
+> **Retired persisted-reference workflow.** New feature-cache, probe-shard, and
+> shard-merge construction is no longer supported. The SUMMIT CLI no longer
+> accepts the hidden cache/shard controls, and `hoffman_deploy.py` hard-fails
+> those worker tasks before execution. This document is retained only to audit
+> already sealed historical artifacts. New references must use the streaming
+> monolithic path or the fused in-memory multi-environment path; neither writes
+> feature matrices or randomized sketches to disk.
+
 This directory contains preparation/verification code and an explicit runbook;
-it does not submit jobs. The cache, wide-score, probe-shard, and shard-merge
-APIs are implemented. The focused GxE/deployment suite must pass from the exact
+it does not submit jobs. The historical cache, wide-score, probe-shard, and
+shard-merge design is documented below for provenance only. The focused GxE/deployment suite must pass from the exact
 checksummed frozen snapshot before sealing. The production trace contract is
 eight contiguous B128 shards forming one B1024 reference, with sealed prefix
 checkpoints at B128, B256, B512, and B1024. Earlier B10/B50/B100 runs are
@@ -264,8 +272,9 @@ Options beginning with `--_gxe-` below are private deployment plumbing. They
 are intentionally hidden from public CLI help and may be used only by the
 version-matched deployment driver in this directory.
 
-Build one phenotype-free cache per dataset/group. `--write-gxe-jackknife` and
-`--njack 100` seal the production SNP-block definition into the cache:
+Build one phenotype-free cache per dataset/group. New caches retain empty
+legacy jackknife identity fields for schema-v2 compatibility but do not define
+or publish deletion blocks:
 
 ```bash
 "${GXE_SUMMIT}" \
@@ -275,8 +284,6 @@ Build one phenotype-free cache per dataset/group. `--write-gxe-jackknife` and
   --covar "${GXE_COVAR}" \
   --gxe-kernel-mode standardized \
   --gxe-genotype-scale sample \
-  --write-gxe-jackknife \
-  --njack 100 \
   --rand-dist rademacher \
   --seed 20260808 \
   --dtype float32 \
@@ -291,8 +298,9 @@ Build one phenotype-free cache per dataset/group. `--write-gxe-jackknife` and
 ```
 
 This writes `${GXE_CACHE_OUT}.gxe.cache.npz`. Validate its mode, SHA256,
-genotype/design fingerprints, N/rank, one-bin annotation contract, J=100 block
-labels, finite feature scales, and diagnostics before any shard job.
+genotype/design fingerprints, N/rank, one-bin annotation contract, empty
+legacy jackknife fields, finite feature scales, and diagnostics before any
+shard job.
 
 A schema-v2 cache produced by the frozen `0113342` deployment may be reused
 only through `cache_attest`. Its dependencies are ordered: first a newly
@@ -301,14 +309,14 @@ completed legacy cache qacct record. The task requires the exact allowlisted
 legacy deployment-config SHA and a deterministic fingerprint of every
 `src/summit/**/*.py` source recorded by the old frozen manifest, then reruns
 schema/array, genotype, group/design/rank, environment/covariate,
-analysis-fingerprint, annotation, and J-block validation. It also reads the
+analysis-fingerprint and annotation validation. It also reads the
 qacct-bound legacy cache job spec and requires its exact genotype/group records
 and stage report to declare the same dataset as the new attestation. It writes
 a new dataset-bound attestation; an attested-cache shard must cite that exact
 artifact and its completed qacct record. Merely having schema version 2 is
 insufficient.
 
-Each B128/J100 shard uses the same cache, seed, and estimator settings, with a
+Each B128 shard uses the same cache, seed, and estimator settings, with a
 disjoint global probe interval. Run one new job for each
 `GXE_SHARD_INDEX=0,...,7`; do not use an array or a task-concurrency cap:
 
@@ -328,8 +336,6 @@ GXE_SHARD_OUT="${GXE_PARTIAL_ROOT}/shard_${GXE_SHARD_TAG}"
   --nvecs 128 \
   --gxe-kernel-mode standardized \
   --gxe-genotype-scale sample \
-  --write-gxe-jackknife \
-  --njack 100 \
   --rand-dist rademacher \
   --seed 20260808 \
   --dtype float32 \
@@ -343,13 +349,12 @@ GXE_SHARD_OUT="${GXE_PARTIAL_ROOT}/shard_${GXE_SHARD_TAG}"
 ```
 
 The merge input is each `${GXE_SHARD_OUT}.gxe.shard.json`, not a directional
-panel or jackknife NPZ. Shards 00 through 07 cover `[0,128)` through
+panel. Shards 00 through 07 cover `[0,128)` through
 `[896,1024)`. Full production `merge` specs accept only `dataset=full` shards
 with `role=production`; subset calibration merges analogously require only
 `dataset=subset_50k`, `role=calibration` shards. Both accept only the four exact
 contiguous prefixes ending at B128, B256, B512, and B1024. All checkpoints are
-at or above the merger's 100-probe fit-able threshold and therefore must not
-carry the low-probe override:
+merged without a jackknife-specific probe threshold or override:
 
 ```bash
 GXE_B128_OUT="${GXE_MERGED_ROOT}/B128"
@@ -445,8 +450,9 @@ trait, and launches one single-slot command equivalent to:
 
 The job receipt binds the exact rendered manifest. Completion requires the
 single batch log and both result files for every configured trait, with no
-extra artifact, and postvalidates every fit's rank, conditioning, jackknife,
-four-component order, finite diagnostics, and JSON/TSV agreement. Publication
+extra artifact, and postvalidates every fit's rank, conditioning, absence of
+retired jackknife fields, four-component order, finite diagnostics, and
+JSON/TSV agreement. Publication
 is transactional in SUMMIT: an incomplete multi-trait result is not accepted
 as a completed Hoffman job. Because the strict CLI manifest schema contains
 paths rather than file records, Hoffman provenance separately records every
@@ -530,22 +536,17 @@ total is always checked as `slots × h_data-per-slot`:
 | per-trait fit | 1 | 4G | 4 GiB | 04:00:00 |
 | group batch fit | 1 | 4G | 4 GiB | 04:00:00 |
 
-At the largest sealed group (`N=290259`), B128, J=100, K=1, and float32, the
-preflight model is 27.681 GiB for the two deletion-sketch scratch maps, 0.554
-GiB for four resident sketches, and 3.785 GiB for the one-block decode/
-projection workspace: 32.020 GiB before unmodeled runtime overhead. The 48-GiB
-profile must also satisfy a configured 12-GiB modeled-memory reserve. Before
-rendering and again at job start, the scratch filesystem must have at least the
-27.681-GiB shard scratch allocation plus an 8-GiB free-space reserve. This is a
-per-job capacity gate; operators must still account for aggregate space before
-launching several shards concurrently.
+The former J=100 deletion-sketch scratch estimate is retired with GxE
+jackknife generation and must not be used as the memory model for a new shard
+deployment. Recalibrate the current point-estimate-only process peak before
+resuming this persisted shard workflow; the configured 48-GiB request remains
+an allocation limit, not evidence that the revised workflow has been accepted.
 
-B128 remains the production shard size because the explicit one-block model
-fits the 48-GiB request with reserve; no B64 fallback is needed. A cache-bound
-shard still makes two genotype passes, so eight B128 shards require 16 genotype
-passes per group. These are initial unmeasured full-cohort requests: inspect the
-first valid-50k and full-N B128 qacct records before broad launch, and change
-resources only in a newly checksummed/resealed snapshot. Do not use `-tc`.
+B128 remains the configured shard size, but its former memory justification is
+not an acceptance result for the revised workflow. A cache-bound shard still
+makes two genotype passes, so eight B128 shards require 16 genotype passes per
+group. Before any new launch, remeasure the valid-50k and full-N process peaks
+and reseal the configuration with the revised model. Do not use `-tc`.
 
 All `-o`/`-e` logs, Python temporary files, and generated job scripts must be
 scratch paths. The renderer fixes `TMPDIR` to a private job subdirectory; the

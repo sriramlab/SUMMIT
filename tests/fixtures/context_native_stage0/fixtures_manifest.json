@@ -1,0 +1,89 @@
+{
+  "fixtures": [
+    {
+      "B_D": 7,
+      "B_T": 7,
+      "C": 2,
+      "J": 4,
+      "K": 2,
+      "M": 72,
+      "N": 48,
+      "P": 1,
+      "Q": 1,
+      "file": "fixture_q1_k2.npz",
+      "raw_offdiag_min": null,
+      "sha256": "e146a8d9c1f63dc51a34dd409baed669217f0d38c5f271e08dc8ddb025cde96a"
+    },
+    {
+      "B_D": 7,
+      "B_T": 7,
+      "C": 6,
+      "J": 4,
+      "K": 2,
+      "M": 72,
+      "N": 48,
+      "P": 3,
+      "Q": 2,
+      "file": "fixture_q2_k2.npz",
+      "raw_offdiag_min": -4.480172139991283,
+      "sha256": "735f8123458f02bc7e1e66dc51f4a2de64e346ba948e7d7e1ac899ecdca655f1"
+    },
+    {
+      "B_D": 7,
+      "B_T": 7,
+      "C": 12,
+      "J": 4,
+      "K": 2,
+      "M": 96,
+      "N": 64,
+      "P": 6,
+      "Q": 3,
+      "file": "fixture_q3_k2.npz",
+      "raw_offdiag_min": -0.1319608237516902,
+      "sha256": "339a8f78a341cc6124c8b457a5bd5e49fdf25dc3937c71179440648b6539d1c5"
+    },
+    {
+      "B_D": 7,
+      "B_T": 7,
+      "C": 30,
+      "J": 4,
+      "K": 3,
+      "M": 96,
+      "N": 64,
+      "P": 10,
+      "Q": 4,
+      "file": "fixture_q4_k3.npz",
+      "raw_offdiag_min": -24.1744514067223,
+      "sha256": "49153e514bb00003c15a713ab35b812b10a89203588261701534a10d85ffa997"
+    }
+  ],
+  "generator": "snapshot_python_oracle",
+  "microcases": [
+    {
+      "file": "micro_projection_order.npz",
+      "kind": "projection_order",
+      "sha256": "6e52f9c4a0c7f65835823c5a70b23eb3a9216402a60915b2fdce0b37d87b66f5"
+    },
+    {
+      "file": "micro_directional_factors.npz",
+      "kind": "directional_factors",
+      "sha256": "415f6170b495862ec3fc2ac07174aea334e845e476f8562d9373f1bfe2ef284c"
+    },
+    {
+      "file": "micro_transfer_n_vs_r.npz",
+      "kind": "population_transfer",
+      "sha256": "4700032104b95bf5c5b9a579e93fc27adf82c1eca8aafc45cded9f103fedabc8"
+    },
+    {
+      "file": "micro_rank_deficient_overlap.npz",
+      "kind": "rank_deficient_overlap",
+      "sha256": "d5400c55f5ed10f0aba94df46f86ad4102a45cfc6a2a925be0271d700b0f8daf"
+    },
+    {
+      "file": "micro_overlap_grouped_algorithms.npz",
+      "kind": "overlap_grouped_algorithms",
+      "sha256": "b745a3c6c3fdf3a2375f31cf7a2ea5fa0f1ca0c0d298bd71f6ef663360a6f394"
+    }
+  ],
+  "source_commit": "251f197950775ca891f244dedc109476b2ad43b4"
+}

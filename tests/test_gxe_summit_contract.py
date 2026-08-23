@@ -119,7 +119,6 @@ def _new_estimator(
     pheno_path: Path | None = None,
     dtype: str = "float64",
     kernel_mode: str | None = "standardized",
-    write_jackknife: bool = False,
 ) -> GenomewideEnvLDScore:
     kwargs = dict(
         bed_path=str(inputs.prefix),
@@ -139,12 +138,6 @@ def _new_estimator(
         genotype_scale="hwe",
         target_xz_mem=0.01,
     )
-    if write_jackknife:
-        kwargs.update(
-            write_jackknife=True,
-            jackknife_spec="3",
-            allow_low_probe_jackknife=True,
-        )
     if kernel_mode is not None:
         kwargs["kernel_mode"] = kernel_mode
     return GenomewideEnvLDScore(**kwargs)
@@ -902,16 +895,13 @@ def test_fit_json_provenance_identifies_consumed_snapshot_across_aba_restore(
     ).hexdigest()
 
 
-def test_schema_v2_null_corrected_jackknife_batch_matches_singletons_and_dense(
+@pytest.mark.skip(reason="New GxE reference generation no longer creates block-jackknife artifacts.")
+def test_legacy_schema_v2_null_corrected_jackknife_batch_matches_singletons_and_dense(
     exact_bundle, tmp_path
 ):
     """Exercise the complete compatibility path, including every delete block."""
     out = tmp_path / "v2-null-jackknife"
-    estimator = _new_estimator(
-        exact_bundle.inputs,
-        out,
-        write_jackknife=True,
-    )
+    estimator = _new_estimator(exact_bundle.inputs, out)
     _install_exact_probes(estimator)
     estimator._compute_ldscore()
     within = estimator._compute_within_jackknife_scores(

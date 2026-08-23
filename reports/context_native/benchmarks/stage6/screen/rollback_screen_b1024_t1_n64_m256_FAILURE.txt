@@ -1,0 +1,90 @@
+timestamp_utc: 2026-08-21T14:20:21Z
+classification: artifact_round_trip_integrity_failure
+controller_exit_code: 1
+controller_wall_seconds: 6.180916839
+failed_worker_pid: 1277443
+failing_plan_id: rollback-screen-b1024-r128-t1
+final_output_created: false
+worker_process_after_exit: absent
+remaining_benchmark_processes_after_exit: none
+dry_run: reports/context_native/benchmarks/stage6/screen/rollback_screen_b1024_t1_n64_m256_dryrun.json
+dry_run_sha256: 38c27d0348ce0c4106bcd64ef3f5c1d14f4349ad492b12cee81d2d55354bd91e
+dry_run_result: all_four_plans_admitted
+unrun_plans:
+  - rollback-screen-b1024-r256-t1
+  - rollback-screen-b1024-r512-t1
+  - rollback-screen-b1024-r1024-t1
+real_input_family_status: not_run_due_to_stop_gate
+
+exact_command:
+  taskset -c 0-7 /home/bronsonj/anaconda3/envs/summit/bin/python3.12 scripts/context/benchmark_context_native_stage6.py \
+    --build-spec reports/context_native/benchmarks/stage6/config/rollback_candidate_69fc6c1_build.json \
+    --baseline-plan reports/context_native/benchmarks/stage6/config/rollback_screen_b1024_r128_t1.json \
+    --candidate-plan reports/context_native/benchmarks/stage6/config/rollback_screen_b1024_r256_t1.json \
+    --candidate-plan reports/context_native/benchmarks/stage6/config/rollback_screen_b1024_r512_t1.json \
+    --candidate-plan reports/context_native/benchmarks/stage6/config/rollback_screen_b1024_r1024_t1.json \
+    --input-kind synthetic \
+    --retained-samples 64 \
+    --retained-variants 256 \
+    --q 2 \
+    --k 2 \
+    --groups 4 \
+    --sample-probes 1024 \
+    --variant-probes 1024 \
+    --traits 1 \
+    --residual-bases 2 \
+    --fixed-rank 2 \
+    --annotation-mode strict_disjoint_binary_v1 \
+    --group-layout contiguous \
+    --seed 6042026 \
+    --cpu-list 0-7 \
+    --warmups 0 \
+    --repeats 1 \
+    --worker-timeout-seconds 150 \
+    --sweep-timeout-seconds 300 \
+    --sample-interval-ms 100 \
+    --max-workspace-bytes 2147483648 \
+    --max-logical-variant-visits 50000000 \
+    --max-logical-bed-bytes 2147483648 \
+    --pilot-variant-ceiling 8192 \
+    --max-extrapolation-ratio 4 \
+    --estimate-safety-factor 2 \
+    --max-synthetic-cells 2000000 \
+    --max-input-hash-bytes 67108864 \
+    --preparation-variant-block 512 \
+    --production-qualified \
+    --work-root /tmp \
+    --output reports/context_native/benchmarks/stage6/screen/rollback_screen_b1024_t1_n64_m256_r1.json
+
+exact_controller_stderr:
+  Traceback (most recent call last):
+    File "/home/bronsonj/SUMMIT/scripts/context/benchmark_context_native_stage6.py", line 3456, in <module>
+      raise SystemExit(main())
+                       ^^^^^^
+    File "/home/bronsonj/SUMMIT/scripts/context/benchmark_context_native_stage6.py", line 3450, in main
+      result = _controller(args)
+               ^^^^^^^^^^^^^^^^^
+    File "/home/bronsonj/SUMMIT/scripts/context/benchmark_context_native_stage6.py", line 3246, in _controller
+      worker, monitor = _run_child_json(
+                        ^^^^^^^^^^^^^^^^
+    File "/home/bronsonj/SUMMIT/scripts/context/benchmark_context_native_stage6.py", line 2925, in _run_child_json
+      monitor = _run_monitored(
+                ^^^^^^^^^^^^^^^
+    File "/home/bronsonj/SUMMIT/scripts/context/benchmark_context_native_stage6.py", line 1208, in _run_monitored
+      raise RuntimeError(
+  RuntimeError: worker 1277443 failed with exit 1: Traceback (most recent call last):
+    File "/home/bronsonj/SUMMIT/scripts/context/benchmark_context_native_stage6.py", line 3456, in <module>
+      raise SystemExit(main())
+                       ^^^^^^
+    File "/home/bronsonj/SUMMIT/scripts/context/benchmark_context_native_stage6.py", line 3446, in main
+      _execute_worker(parsed._request, parsed._result)
+    File "/home/bronsonj/SUMMIT/scripts/context/benchmark_context_native_stage6.py", line 2000, in _execute_worker
+      loaded_reference = load_contextual_reference_v1(reference_path)
+                         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    File "/tmp/summit-stage6-serial-rollback-69fc6c1.Wndsw1/install/summit/context/reference_v1.py", line 3446, in load_contextual_reference_v1
+      archive.read_text_scalar(
+    File "/tmp/summit-stage6-serial-rollback-69fc6c1.Wndsw1/install/summit/context/_artifact_io.py", line 560, in read_text_scalar
+      self._fail(f"member {member!r} is not a bounded Unicode scalar")
+    File "/tmp/summit-stage6-serial-rollback-69fc6c1.Wndsw1/install/summit/context/_artifact_io.py", line 737, in _fail
+      raise ValueError(f"{self._family} {message}.")
+  ValueError: Contextual reference V1 member 'manifest_json.npy' is not a bounded Unicode scalar.

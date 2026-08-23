@@ -39,6 +39,12 @@ struct MailmanPackedBlock {
     std::vector<uint32_t> packed32;
     std::vector<double> mean;
     std::vector<double> inv_std;
+    // Number of non-missing selected samples before deterministic HWE
+    // imputation. Keeping this with the packed block lets descriptor-owned
+    // consumers publish the same missingness diagnostics without a dense
+    // genotype decode.
+    std::vector<int> observed;
+    std::vector<std::vector<int>> missing_rows;
 };
 
 int compute_mailman_segment_size_optimized(int64_t n_rows);
@@ -98,6 +104,35 @@ void read_block_mailman_hwe(
     const std::vector<int>& rows,
     int ddof,
     uint64_t impute_seed,
+    MailmanPackedBlock& out);
+
+// Pack a validated SNP-major BED mapping directly. This is the descriptor-
+// owned entry point used by the GxE context; no path reopen or Python-visible
+// genotype matrix is involved.
+void read_block_mailman_hwe_memory(
+    const unsigned char* bed_base,
+    std::size_t bed_size,
+    int n_total,
+    std::size_t bytes_per_snp,
+    int blk_start,
+    int blk_end,
+    const std::vector<int>& rows,
+    int ddof,
+    uint64_t impute_seed,
+    MailmanPackedBlock& out);
+
+// Mean-imputed variant used by GxE. Missing rows remain encoded as zero and
+// are retained explicitly so packed products can apply the exact sparse
+// correction corresponding to a standardized value of zero.
+void read_block_mailman_mean_memory(
+    const unsigned char* bed_base,
+    std::size_t bed_size,
+    int n_total,
+    std::size_t bytes_per_snp,
+    int blk_start,
+    int blk_end,
+    const std::vector<int>& rows,
+    int ddof,
     MailmanPackedBlock& out);
 
 void compute_maf_block(

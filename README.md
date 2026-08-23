@@ -42,16 +42,41 @@ refactored h2/rg path; use per-SNP LD scores.
 - C++17 compiler
 - BLAS/LAPACK and OpenMP support
 
-The supplied environment uses OpenBLAS 0.3.31 or newer from conda-forge; 0.3.30
-contained a parallel-GEMM race. SUMMIT does not rely on the BLAS vendor or
-version for internally threaded large GxE products. With OpenBLAS, SUMMIT keeps
-each optimized GEMM single-threaded and uses OpenMP only across disjoint output
-tiles that it owns. Eight low-rank checks detect faulty output ranges, which
-are the only ranges recomputed with a deterministic cache-tiled kernel. Other
-BLAS vendors use the deterministic fallback directly. This avoids disk caches
-and duplicate full products. Bounded transient input snapshots prevent a faulty
-vendor call from modifying the authoritative decoded inputs used for repair.
-Set `SUMMIT_GXE_VERIFY_FEATURE_MOMENTS=always` only for strict duplicate-product
+The supplied environment uses OpenBLAS 0.3.31 or newer; the direct GxE backend
+rejects 0.3.30 because it contained a parallel-GEMM race. A portable build uses
+the environment BLAS and keeps the independent integrity layer enabled.
+Private OpenBLAS remains an explicit compatibility/testing option; it is not
+selected automatically and it is not allowed to disable integrity.
+
+The production GxE build uses a private pthread-BLIS archive and keeps the
+independent integrity layer enabled. Repeated fixed-input tests isolated the
+intermittent corruption to the high-thread BLIS/OpenMP execution path; the
+same production-shaped product was bit-identical in 1,000 private
+pthread-BLIS calls. OpenBLAS and OpenMP-BLIS remain compatibility and
+diagnostic configurations rather than production GxE backends.
+The pthread-BLIS path executes the requested probe width in one GEMM, so it
+has no backend-specific width-32 subdivision. Native source and target output
+scratch is capacity-based, retained across genotype blocks, and released at
+the source-to-target phase boundary.
+
+The accepted private pthread-BLIS build disables numerical checksum/recompute
+by default after fixed-input backend qualification. It retains immutable
+thread ownership, serialized vendor entry, exact input/output mapping and NUMA
+contracts, finite/dimension checks, and zero repair/drop requirements. Shared
+or OpenBLAS compatibility builds retain checksum protection; a checksum is not
+used as a substitute for selecting a clean production backend.
+
+The build records the selected archive SHA-256 and threading layer. Application
+OpenMP performs decode and non-BLAS loops; BLIS owns a separate pthread team
+whose affinity is inherited from the authenticated CPU set for each call.
+This separation avoids the failing nested/shared OpenMP execution path while
+preserving explicit placement. `OMP_WAIT_POLICY=PASSIVE` is recommended for
+this two-pool design. Explicit user environment settings win. Private OpenBLAS
+can still be requested with
+`-DGXELDCORE_USE_PRIVATE_OPENBLAS=ON` and
+`-DGXELDCORE_PRIVATE_OPENBLAS_ARCHIVE=/path/to/libopenblas.a`, but it remains a
+guarded compatibility configuration. Set
+`SUMMIT_GXE_VERIFY_FEATURE_MOMENTS=always` only for strict duplicate-product
 stress testing. If MKL is available through `MKLROOT` or the active conda
 environment, CMake may use MKL instead.
 
@@ -225,7 +250,6 @@ summit \
   --gxe-kernel-mode standardized --gxe-genotype-scale sample \
   --nvecs 1024 --seed 20260808 --rand-dist rademacher \
   --target-mem 16 \
-  --write-gxe-jackknife --njack 100 \
   --out outs/reference.B1024
 ```
 
@@ -249,10 +273,17 @@ score scale.
 
 The reference contains all four directional trace-score panels (`gxx`,
 `gxe`, `exg`, and `gee`), per-SNP projected norms/NxE diagonals, and
-block-local deletion metadata. With at least two probes it also records a
-compact same-person kernel-product statistic; no probe sketch is written to
-disk. Each trait triplet contains direct marginal additive and interaction
-scores plus the indispensable scalar `y' diag(E^2) y`.
+compact same-person kernel-product statistics when at least two probes are
+used. It does not write probe sketches or deletion-jackknife state. Each trait
+triplet contains direct marginal additive and interaction scores plus the
+indispensable scalar `y' diag(E^2) y`.
+
+The XW and WX matrices are transposes before squaring, but their per-SNP LD
+scores are not duplicates: XW contains annotation-weighted squared row norms
+of `X'W`, whereas WX contains its squared column norms. Their fully aggregated
+normal-equation entries agree only after swapping the left/source annotation
+indices. The native pipeline obtains both directions from one shared target
+GEMM, so retaining both panels does not repeat the expensive matrix product.
 
 To reuse that reference with a different trait-specific cohort, score one
 trait at a time explicitly:
@@ -280,23 +311,48 @@ streamed genotype read while retaining independent four-component models:
 ```bash
 summit \
   --geno ref_panel --env environments.txt --covar covariates.txt \
-  --gxe-env-cols age,bmi,smoking \
-  --nvecs 1024 --seed 20260808 --rand-dist rademacher \
-  --target-xz-mem 16 --write-gxe-jackknife --njack 100 \
+  --gxe-env-cols age,sex,bmi,alcohol,smoking \
+  --gxe-native-backend direct --gxe-parallel-environment-groups auto \
+  --num-threads 64 --step_size 2000 \
+  --nvecs 128 --seed 20260808 --rand-dist rademacher \
+  --target-xz-mem 16 --gxe-total-memory-gib auto \
   --out outs/reference.multi
 ```
 
 This writes `reference.multi.<environment>.gxe.ref.json` plus a batch manifest
 at `reference.multi.gxe.multi.json`. The implementation holds only each
 environment's current global source tile in RAM and never spills probe state to
-disk. Environments with different missingness are rejected; intersect their
+disk. With `--gxe-native-backend direct --rand-dist rademacher`, one persistent
+C++ context duplicates
+the validated BED/BIM/FAM descriptors and owns BED decode/standardization,
+NumPy-compatible Philox probe generation, the packed multi-environment feature
+plan, randomized source construction, fixed-effect projection, paired target
+products, normalization, and all four directional score reductions. Python
+constructs and seals the dimensions/design/annotation plan, validates native
+evidence, and transactionally publishes the final arrays; decoded genotype and
+intermediate numerical panels never cross the Python/C++ boundary. The same
+descriptor-owned path is used for a phenotype-free single `--env` direct
+reference (as a one-environment plan). Feature-cache, reference-shard, and
+phenotype-scoring workflows retain their purpose-specific paths.
+The protected source is accumulated directly into the first half of its final
+read-only `[S, e*S]` mapping. Sealing fills only the weighted half, eliminating
+one full-panel copy and reducing the panel live peak from three panels to two.
+Environments with different missingness are rejected; intersect their
 sample rows explicitly or place them in separate batches. The resulting models
 are independent per environment, not a cross-environment covariance model.
+On a multi-socket host, `auto` may divide four or more direct-backend
+environments between two process-isolated socket groups when at least 32 total
+threads are requested. Each group has a private BLAS runtime and disjoint
+physical cores; a canonical batch manifest is published only after both group
+manifests and every referenced artifact pass hash validation. Use `1` for the
+lowest aggregate memory footprint or `2` to require the isolated layout.
 
-Jackknife-enabled generation requires at least 100 probes by default. Lower
-counts can strongly contaminate the delete-block SE through randomized
-within-block trace noise; the diagnostic-only override is
-`--allow-low-probe-gxe-jackknife`.
+New GxE reference generation does not create block-local deletion-jackknife
+metadata or `.gxe.jackknife.npz` artifacts. These optional outputs did not
+change the LD-score point estimates and added a separate, probe-sensitive
+uncertainty path. Existing sealed references that already contain jackknife
+metadata remain readable for reproducibility, while new fits omit jackknife
+standard errors unless uncertainty is supplied by a future explicit method.
 
 ```bash
 summit \
@@ -659,11 +715,6 @@ Exactly one of these modes must be specified.
   sealed reference; `--gxe-pheno-cols` selects columns from `--gxe-pheno`.
 - `--gxe-population-reference`: explicitly score one `--gxe-pheno-col` in a
   different cohort using a standardized population reference.
-- `--write-gxe-jackknife`: record block IDs for the default block-local
-  LD-score deletion jackknife; block layout comes from `--njack` and no
-  per-block probe state is written.
-- `--allow-low-probe-gxe-jackknife`: diagnostic override for fewer than 100
-  probes; resulting SEs are not production-calibrated.
 - `--ld-wind-kb`: compute fixed-window LD scores instead of randomized
   genome-wide LD scores.
 - `--rand-samp`: random subset of samples; a ratio in `(0,1]` or an integer
@@ -675,16 +726,31 @@ Exactly one of these modes must be specified.
   references. It uses the same Philox probes and exact projected-feature
   algebra as the Python oracle and seals the loaded native binary and source
   snapshot in every artifact.
-- `--use-mailman auto` (default): for ordinary additive LD scores, use the
-  existing Mailman implementation only at `B<=10` and only with HWE
-  imputation. The existing Mailman kernel is not used for GxE because it does
-  not implement the required interaction-before-projection algebra.
+- `--gxe-parallel-environment-groups auto|1|2`: for four or more direct
+  references sharing one cohort, use one process or two socket-local isolated
+  groups. `auto` selects two only when the allowed topology and total thread
+  request support it.
+- `--force_affinity_all false` (default): preserve scheduler or `taskset`
+  placement. Set true only when intentionally discarding an inherited cpuset.
+- `--use-mailman auto` (default): packed Mailman execution is eligible only at
+  `B<=10`. The additive and direct GxE estimators share the native Mailman
+  pre/post primitives; the GxE context supplies its own interaction/projection
+  transforms around those primitives. Every `B>10` direct GxE job uses dense
+  BLIS, with memory tiling when required—never Mailman and never a hard-coded
+  width-32 backend split.
 - `--device`: `cpu` or `cuda[:index]` for supported genome-wide LD-score runs.
 - `--num-threads`: cap BLAS/OpenMP thread pools.
 - `--target-xz-mem`, `--target-mem`: sketch-panel budgets in GiB or `auto`
   (default). Auto uses the tightest observable memory limit and retains both a
   fixed reserve and a proportional margin; cluster workflows should keep an
   explicit budget when the scheduler allocation is not visible to the process.
+- `--gxe-total-memory-gib`: independent modeled complete-process peak in GiB
+  or `auto` (default). The direct GxE planner jointly searches environment and
+  probe tile counts, minimizes genotype passes, and rejects plans whose decoded
+  blocks, native context/output state, integrity/vendor workspace, thread
+  stacks, allocator slack, publication allowance, and 20% headroom exceed this
+  bound. The selected plan and exact phase/component arithmetic are retained in
+  reference, group, and combined manifests.
 
 ## Output Files
 
@@ -695,8 +761,8 @@ Exactly one of these modes must be specified.
 - Windowed LD scores: `<out>.win.ldscore.gz`, `<out>.win.M`,
   `<out>.win.M_5_50`, `<out>.win.log`.
 - GxE reference: `<out>.{gxx,gxe,exg,gee}.ldscore.gz`,
-  `<out>.gxe.diag.tsv.gz`, and `<out>.gxe.ref.json`. The default block-local
-  jackknife adds block IDs to the diagonal table but no probe-state artifact.
+  `<out>.gxe.diag.tsv.gz`, and `<out>.gxe.ref.json`. Reference construction
+  writes no deletion-jackknife or probe-state artifact.
 - Batched GxE phenotype summaries: `<out>.<trait>.gxe.{gwas,gwis}.tsv.gz` and
   `<out>.<trait>.gxe.moments.json`.
 - GxE fit: `<out>.gxe.results.tsv`, `<out>.gxe.fit.json`, `<out>.gxe.log`;

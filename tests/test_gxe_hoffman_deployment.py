@@ -144,8 +144,8 @@ def test_deployment_config_and_wrappers_are_fail_closed():
     assert estimator["annotation"] is None
     assert estimator["annotation_contract"] == "all_variants_unit_weight"
     assert estimator["feature_cache_schema_version"] == 2
-    assert estimator["reference_shard_schema_version"] == 2
-    assert estimator["reference_schema_version"] == 3
+    assert estimator["reference_shard_schema_version"] == 3
+    assert estimator["reference_schema_version"] == 4
     assert estimator["kernel_mode"] == "standardized"
     assert estimator["genotype_scale"] == "sample"
     assert estimator["production_probes"] == 1024
@@ -685,7 +685,9 @@ def test_generation_args_are_exact_and_annotation_free(tmp_path: Path):
     assert "--annot" not in args
     assert args[args.index("--gxe-kernel-mode") + 1] == "standardized"
     assert args[args.index("--gxe-genotype-scale") + 1] == "sample"
-    assert args[args.index("--njack") + 1] == "100"
+    assert "--write-gxe-jackknife" not in args
+    assert "--allow-low-probe-gxe-jackknife" not in args
+    assert "--njack" not in args
     assert args[args.index("--seed") + 1] == "20260808"
     assert args[args.index("--ddof") + 1] == "1"
     assert "--gxe-missing-values=-9,NA,NaN,nan,.,None,null" in args
@@ -1282,7 +1284,6 @@ def _write_fit_output_fixture(
         consumed_input_provenance = fixture_inputs
     components = ["G:L2_0", "GxE:L2_0", "NxE", "residual"]
     proportions = [0.0, 0.2, -0.3, 1.1]
-    standard_errors = [0.0, 0.0, 0.0, 0.05]
     residual_fraction = 0.8
     payload = {
         "kind": "summit.gxe.fit",
@@ -1298,15 +1299,10 @@ def _write_fit_output_fixture(
         "coefficients": [0.1, 0.2, 0.3, 0.4],
         "variance_contributions": proportions,
         "proportions": proportions,
-        "standard_errors": standard_errors,
         "original_scale_proportions": [
             value * residual_fraction for value in proportions
         ],
-        "original_scale_standard_errors": [
-            value * residual_fraction for value in standard_errors
-        ],
-        "jackknife_block_labels": [f"block_{index:03d}" for index in range(100)],
-        "jackknife_estimates": [proportions for _ in range(100)],
+        "jackknife_block_labels": [],
         "normal_matrix": [
             [1.0, 0.0, 0.0, 0.0],
             [0.0, 1.0, 0.0, 0.0],
@@ -1338,7 +1334,6 @@ def _write_fit_output_fixture(
         "z",
         "original_scale_se",
     ]
-    z_values = ["nan", "inf", "-inf", "22"]
     rows = []
     for index, component in enumerate(components):
         rows.append(
@@ -1348,10 +1343,10 @@ def _write_fit_output_fixture(
                 str(payload["kernel_traces"][index]),
                 str(payload["variance_contributions"][index]),
                 str(proportions[index]),
-                str(standard_errors[index]),
+                "nan",
                 str(payload["original_scale_proportions"][index]),
-                z_values[index],
-                str(payload["original_scale_standard_errors"][index]),
+                "nan",
+                "nan",
             ]
         )
     table = "\t".join(header) + "\n" + "\n".join("\t".join(row) for row in rows) + "\n"
@@ -1360,7 +1355,7 @@ def _write_fit_output_fixture(
     return prefix, config, consumed_input_provenance
 
 
-def test_fit_output_validation_covers_original_scale_and_zero_se_z(tmp_path: Path):
+def test_fit_output_validation_covers_original_scale_without_jackknife(tmp_path: Path):
     prefix, config, provenance = _write_fit_output_fixture(tmp_path)
     DEPLOY._validate_fit_outputs(prefix, config, expected_input_provenance=provenance)
 
@@ -1408,11 +1403,9 @@ def test_fit_output_validation_rejects_consumed_input_provenance_corruption(
     ("column", "row", "replacement", "message"),
     [
         ("original_scale_proportion", 1, "0.17", "original_scale_proportion"),
-        ("original_scale_se", 2, "0.025", "original_scale_se"),
-        ("z", 3, "9", "zero-SE NaN/infinity"),
-        ("z", 1, "0", "zero-SE NaN/infinity"),
-        ("z", 2, "0", "zero-SE NaN/infinity"),
-        ("z", 0, "0", "zero-SE NaN/infinity"),
+        ("original_scale_se", 2, "0.025", "must be empty"),
+        ("proportion_se", 1, "0", "must be empty"),
+        ("z", 3, "9", "must be empty"),
         ("z", 0, "corrupt", "nonnumeric"),
     ],
 )
@@ -1438,9 +1431,13 @@ def test_fit_output_validation_rejects_derived_column_corruption(
         )
 
 
-def test_current_cache_shard_merge_source_contract_is_2_2_3():
+def test_current_cache_shard_merge_source_contract_is_2_3_4():
     config = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
     DEPLOY._check_cache_merge_compatibility_sources(ROOT, config["estimator"])
+    mismatched = dict(config["estimator"])
+    mismatched["reference_schema_version"] = 3
+    with pytest.raises(ValueError, match="shard schema mapping"):
+        DEPLOY._check_cache_merge_compatibility_sources(ROOT, mismatched)
 
 
 def test_private_path_guard_rejects_hardlinks_symlinks_and_wrong_modes(

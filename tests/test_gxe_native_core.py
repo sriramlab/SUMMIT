@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import json
+import re
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -9,7 +10,6 @@ import numpy as np
 import pandas as pd
 import pytest
 from bed_reader import to_bed
-from threadpoolctl import threadpool_limits
 from scripts.gxe import benchmark_native
 
 from summit import gwldcore, gxeldcore
@@ -22,6 +22,7 @@ from summit.ldscore.gwe_ldscore import (
     _orthonormalize_columns,
     _validate_native_blas_runtime,
 )
+from summit.ldscore.gxe_score import score_phenotype_from_reference
 from summit.logger import Logger
 
 
@@ -122,6 +123,88 @@ def _python_features(
     }
 
 
+def test_native_blas_safety_mode_and_fixed_configuration():
+    info = dict(gxeldcore.build_info())
+    assert info["multi_environment_native_kernel_supported"] is True
+    assert (
+        info["multi_environment_native_kernel_schema"]
+        == "summit.multi_environment_native_kernel.v1"
+    )
+    assert (
+        info["multi_environment_native_kernel_execution"]
+        == "feature_source_projection_target_reduction_normalization"
+    )
+    isolation = info.get("blas_runtime_isolation")
+    integrity = info.get("gemm_integrity_enabled")
+    checksum = info.get("gemm_checksum_enabled")
+    assert type(checksum) is bool
+    assert isolation == "private_static" or integrity is True
+    if isolation == "private_static":
+        assert info["api_version"] >= 4
+        private_backend = info.get("private_blas_backend", "openblas")
+        archive_sha256 = info.get(
+            "private_blas_archive_sha256",
+            info.get("private_openblas_archive_sha256"),
+        )
+        assert re.fullmatch(r"[0-9a-f]{64}", str(archive_sha256))
+        assert info["blas_runtime_threading_layer"] in {"pthreads", "openmp"}
+        assert info["gemm_execution_mode"] == {
+            "openblas": "serialized_fixed_private_openblas",
+            "upstream_blis": "serialized_fixed_private_blis",
+        }[private_backend]
+        if private_backend == "upstream_blis":
+            assert integrity is True
+            # Production private BLIS defaults to the guarded, no-redundant-
+            # checksum path. An explicit diagnostic build may opt back in.
+            assert checksum is False
+            assert info["blas_runtime_threading_layer"] == "pthreads"
+            assert (
+                info["blas_runtime_worker_affinity_policy"]
+                == "inherit_authenticated_selected_cpu_set_per_call"
+            )
+            assert info["blas_runtime_tls_enabled"] is True
+        else:
+            assert checksum is True
+    else:
+        # The process-shared OpenBLAS compatibility build retains checksum
+        # detection because it does not provide private immutable ownership.
+        assert checksum is True
+        assert gxeldcore.configure_blas_threads(2) == 2
+        with pytest.raises(RuntimeError, match="differ"):
+            gxeldcore.configure_blas_threads(1)
+
+
+@pytest.mark.parametrize(
+    ("root_seed", "block_start", "probe_start", "rows", "probes"),
+    (
+        (0, 0, 0, 1, 1),
+        (20260808, 0, 0, 17, 5),
+        (2718, 13, 7, 4099, 3),
+    ),
+)
+def test_native_philox_rademacher_matches_numpy_exactly(
+    root_seed, block_start, probe_start, rows, probes
+):
+    keys = np.empty((probes, 2), dtype=np.uint64)
+    expected = np.empty((rows, probes), dtype=np.float64, order="F")
+    for local_probe in range(probes):
+        seed = _make_seed(root_seed, block_start, probe_start + local_probe)
+        bit_generator = np.random.Philox(seed)
+        keys[local_probe] = np.asarray(
+            bit_generator.state["state"]["key"], dtype=np.uint64
+        )
+        generator = np.random.Generator(np.random.Philox(seed))
+        values = generator.integers(0, 2, size=rows, dtype=np.int8)
+        expected[:, local_probe] = 2.0 * values.astype(np.float64) - 1.0
+
+    observed = np.asarray(
+        gxeldcore.numpy_philox_rademacher_block(keys, rows, 2),
+        dtype=np.float64,
+    )
+    assert observed.flags.f_contiguous
+    np.testing.assert_array_equal(observed, expected)
+
+
 def test_protected_shared_gemm_entry_points_match_numpy():
     rng = np.random.default_rng(12817)
     left_nn = np.asfortranarray(rng.normal(size=(37, 11)))
@@ -141,6 +224,126 @@ def test_protected_shared_gemm_entry_points_match_numpy():
     np.testing.assert_allclose(observed_tn, left_tn.T @ right_tn, rtol=2e-14, atol=2e-14)
     assert np.asarray(observed_tn).flags.f_contiguous
     assert repaired_tn == 0
+
+    basis = np.asfortranarray(rng.normal(size=(37, 3)))
+    coefficients = np.asfortranarray(rng.normal(size=(3, 11)))
+    target = np.asfortranarray(rng.normal(size=(37, 11)))
+    expected_update = target - basis @ coefficients
+    gxeldcore.protected_rank_update_nn(basis, coefficients, target, 2)
+    np.testing.assert_allclose(target, expected_update, rtol=2e-14, atol=2e-14)
+
+
+def test_fused_feature_scalar_moments_match_dense_reductions():
+    rng = np.random.default_rng(71821)
+    genotype = np.asfortranarray(rng.normal(size=(503, 37)))
+    environments = np.asfortranarray(rng.normal(size=(503, 5)))
+    observed = np.asarray(
+        gxeldcore.fused_feature_scalar_moments(genotype, environments, 2)
+    )
+    expected = np.empty_like(observed)
+    genotype_squared = genotype * genotype
+    expected[0] = np.sum(genotype_squared, axis=0, dtype=np.float64)
+    for index in range(environments.shape[1]):
+        environment = environments[:, index]
+        environment_squared = environment * environment
+        expected[1 + 3 * index] = np.sum(
+            environment[:, None] * genotype_squared, axis=0, dtype=np.float64
+        )
+        expected[2 + 3 * index] = np.sum(
+            environment_squared[:, None] * genotype_squared,
+            axis=0,
+            dtype=np.float64,
+        )
+        expected[3 + 3 * index] = np.sum(
+            (environment_squared * environment_squared)[:, None]
+            * genotype_squared,
+            axis=0,
+            dtype=np.float64,
+        )
+    np.testing.assert_allclose(observed, expected, rtol=2e-14, atol=4e-12)
+    assert observed.flags.f_contiguous
+
+
+@pytest.mark.parametrize("hwe_scale", [False, True])
+def test_parallel_genotype_standardization_matches_python(hwe_scale):
+    rng = np.random.default_rng(18271)
+    raw = np.asfortranarray(rng.integers(0, 3, size=(503, 37)).astype(np.float64))
+    raw[3, 2] = np.nan
+    raw[17:22, 11] = np.nan
+    raw[:, 19] = 1.0
+    raw[:, 31] = np.nan
+    targets = rng.normal(size=(503, 2))
+    targets -= targets.mean(axis=0)
+    targets = np.asfortranarray(targets)
+
+    expected = raw.copy(order="F")
+    mask = np.isnan(expected)
+    counts = mask.sum(axis=0, dtype=np.int64)
+    nobs = expected.shape[0] - counts
+    means = np.divide(
+        np.nansum(expected, axis=0, dtype=np.float64),
+        nobs,
+        out=np.zeros(expected.shape[1], dtype=np.float64),
+        where=nobs > 0,
+    )
+    rows, columns = np.where(mask)
+    expected[rows, columns] = means[columns]
+    expected -= means
+    if hwe_scale:
+        scales = np.sqrt(np.maximum(means * (1.0 - 0.5 * means), 0.0))
+    else:
+        scales = np.sqrt(np.einsum("ij,ij->j", expected, expected) / 502.0)
+    good = np.isfinite(scales) & (scales > 1.0e-10)
+    expected[:, good] /= scales[good]
+    expected[:, ~good] = 0.0
+    expected_correlations = np.zeros((2, expected.shape[1]), dtype=np.float64)
+    valid = (counts > 0) & (counts < expected.shape[0])
+    for target_index in range(targets.shape[1]):
+        expected_correlations[target_index, valid] = (
+            np.asarray(mask[:, valid], dtype=np.float64).T @ targets[:, target_index]
+        ) / (
+            np.sqrt(counts[valid] * (1.0 - counts[valid] / expected.shape[0]))
+            * np.linalg.norm(targets[:, target_index])
+        )
+
+    observed = raw.copy(order="F")
+    observed_counts, observed_correlations = gxeldcore.standardize_genotype_block(
+        observed, targets, 1, hwe_scale, 1.0e-10, 2
+    )
+    np.testing.assert_array_equal(observed_counts, counts)
+    np.testing.assert_allclose(observed_correlations, expected_correlations, rtol=2e-14, atol=2e-14)
+    np.testing.assert_allclose(observed, expected, rtol=2e-14, atol=2e-14)
+    assert observed.flags.f_contiguous
+
+
+def test_protected_row_weighted_pair_is_sealed_and_matches_numpy():
+    rng = np.random.default_rng(98127)
+    left = np.asfortranarray(rng.normal(size=(43, 9)))
+    right = np.asfortranarray(rng.normal(size=(43, 12)))
+    row_weights = np.asfortranarray(rng.normal(size=(43, 3)))
+    expected_right = right.copy(order="F")
+    expected_weights = row_weights.copy(order="F")
+    pair = gxeldcore.prepare_protected_row_weighted_pair(
+        right, row_weights, 2
+    )
+    assert pair.rows == 43
+    assert pair.columns == 12
+
+    # The opaque native pair owns the only operand used by subsequent calls.
+    # Mutating the Python construction arrays cannot alter the sealed panel.
+    right.fill(0.0)
+    row_weights.fill(0.0)
+    observed, repaired = gxeldcore.protected_matmul_tn_pair(left, pair, 2)
+    expected_weighted = np.empty_like(expected_right)
+    for group in range(3):
+        segment = slice(group * 4, (group + 1) * 4)
+        expected_weighted[:, segment] = (
+            expected_weights[:, group, None] * expected_right[:, segment]
+        )
+    expected = left.T @ np.column_stack([expected_right, expected_weighted])
+    np.testing.assert_allclose(observed, expected, rtol=2e-14, atol=2e-14)
+    assert np.asarray(observed).flags.f_contiguous
+    assert repaired == 0
 
 
 def test_protected_shared_gemm_rejects_incompatible_shapes():
@@ -193,7 +396,7 @@ def _ordinary_residual_scales(
     return np.asarray(scales)
 
 
-def test_native_feature_moment_verification_defaults_to_partitioned_gemm(monkeypatch):
+def test_native_feature_moment_verification_defaults_to_protected_gemm(monkeypatch):
     monkeypatch.delenv("SUMMIT_GXE_VERIFY_FEATURE_MOMENTS", raising=False)
     enabled, reason = _native_strict_feature_moment_verification_policy(
         {
@@ -203,7 +406,7 @@ def test_native_feature_moment_verification_defaults_to_partitioned_gemm(monkeyp
     )
     assert enabled is False
     assert "deterministic tiled feature GEMMs" in reason
-    assert "shape-adaptive OpenBLAS" in reason
+    assert "serialized-entry internally threaded OpenBLAS" in reason
 
     enabled, reason = _native_strict_feature_moment_verification_policy(
         {
@@ -280,6 +483,22 @@ def test_native_blas_runtime_requires_one_matching_library(monkeypatch):
     assert observed["version"] == "0.3.34"
     assert observed["num_threads"] == 16
 
+    unsupported = {
+        **single,
+        "version": "0.3.30",
+        "filepath": "/opt/lib/libopenblas-0.3.30.so",
+    }
+    monkeypatch.setattr(
+        "summit.ldscore.gwe_ldscore.threadpool_info", lambda: [unsupported]
+    )
+    with pytest.raises(RuntimeError, match="0.3.31 or newer"):
+        _validate_native_blas_runtime(
+            {
+                "blas_vendor": "OpenBLAS",
+                "blas_runtime_config": "OpenBLAS 0.3.30 DYNAMIC_ARCH Zen",
+            }
+        )
+
     second = {
         **single,
         "version": "0.3.30",
@@ -304,6 +523,59 @@ def test_native_blas_runtime_requires_one_matching_library(monkeypatch):
                 "blas_runtime_config": "OpenBLAS 0.3.30 DYNAMIC_ARCH Haswell",
             }
         )
+
+
+@pytest.mark.parametrize(
+    ("field", "invalid"),
+    [
+        ("blas_vendor", "OpenBLAS"),
+        ("gemm_integrity_enabled", False),
+        ("gemm_vendor_entry_outer_openmp_guard", False),
+        ("blas_runtime_owner_thread_configured", False),
+        ("blas_runtime_threading_layer", "openmp"),
+        ("blas_runtime_worker_affinity_policy", "unrestricted"),
+    ],
+)
+def test_private_blis_runtime_validation_requires_guarded_contract(
+    monkeypatch, field, invalid
+):
+    monkeypatch.setattr(
+        "summit.ldscore.gwe_ldscore.threadpool_info", lambda: []
+    )
+    build_info = {
+        "blas_vendor": "BLIS",
+        "blas_runtime_isolation": "private_static",
+        "gemm_execution_mode": "serialized_fixed_private_blis",
+        "private_blas_backend": "upstream_blis",
+        "private_blas_archive_sha256": "a" * 64,
+        "private_blas_source_commit": "b" * 40,
+        "private_blas_source_tree_sha256": "c" * 64,
+        "private_blas_config_family": "zen",
+        "private_blas_header_sha256": "d" * 64,
+        "private_blas_cblas_header_sha256": "e" * 64,
+        "blas_runtime_config": "BLIS 2.0 config=zen",
+        "blas_runtime_corename": "zen",
+        "blas_runtime_threads": 2,
+        "blas_runtime_threading_layer": "pthreads",
+        "blas_runtime_worker_affinity_policy": (
+            "inherit_authenticated_selected_cpu_set_per_call"
+        ),
+        "blas_runtime_thread_strategy": "automatic",
+        "blas_runtime_thread_ways": {
+            "jc": 1, "pc": 1, "ic": 1, "jr": 1, "ir": 1,
+        },
+        "blas_runtime_tls_enabled": True,
+        "blas_runtime_owner_thread_enforced": True,
+        "blas_runtime_owner_thread_configured": True,
+        "blas_runtime_environment_immutable": True,
+        "blas_runtime_environment_contract": "blis_process_start_v1",
+        "gemm_integrity_enabled": True,
+        "gemm_vendor_entry_outer_openmp_guard": True,
+    }
+    assert _validate_native_blas_runtime(build_info)["internal_api"] == "blis"
+    build_info[field] = invalid
+    with pytest.raises(RuntimeError, match="contract|threading layer"):
+        _validate_native_blas_runtime(build_info)
 
 
 def test_native_compute_block_coalescing_preserves_probe_streams():
@@ -558,6 +830,68 @@ def test_native_mean_imputation_matches_oracle_but_production_gate_rejects(tmp_p
         )
 
 
+def test_native_fused_phenotype_score_matches_dense_oracle(tmp_path):
+    rng = np.random.default_rng(77291)
+    n, m, traits = 113, 47, 3
+    raw = rng.binomial(
+        2, rng.uniform(0.08, 0.48, size=m), size=(n, m)
+    ).astype(float)
+    raw[3, 4] = np.nan
+    raw[77, 21] = np.nan
+    prefix = _write_plink(tmp_path, raw, "phenotype_score")
+    env, q = _design(n)
+    expected = _python_features(raw, env, q)
+    phenotype = rng.normal(size=(n, traits))
+    phenotype -= q @ (q.T @ phenotype)
+    phenotype = np.asfortranarray(phenotype)
+    residual_rank = n - q.shape[1]
+
+    with _native_context(
+        prefix,
+        env,
+        q,
+        target_panel_columns=traits,
+        strict_feature_moment_verification=False,
+    ) as context:
+        panel = context.prepare_projected_sources(phenotype, 1.0e-10)
+        observed = dict(
+            context.phenotype_score_block(0, m, panel, 1.0e-10, False)
+        )
+        context_info = dict(context.info())
+
+    np.testing.assert_allclose(
+        observed["score_x"], expected["x"].T @ phenotype,
+        rtol=3e-12, atol=3e-12,
+    )
+    np.testing.assert_allclose(
+        observed["score_w"], expected["w"].T @ phenotype,
+        rtol=3e-12, atol=3e-12,
+    )
+    for name in (
+        "scale_x", "scale_w", "norm_x", "norm_w",
+        "diag_nxe_x", "diag_nxe_w", "corr_xw",
+    ):
+        np.testing.assert_allclose(
+            observed[name], expected[name], rtol=3e-12, atol=3e-12
+        )
+    np.testing.assert_allclose(
+        observed["diag_nxe_x"],
+        (env * env) @ (expected["x"] * expected["x"]) / residual_rank,
+        rtol=3e-12,
+        atol=3e-12,
+    )
+    np.testing.assert_allclose(
+        observed["diag_nxe_w"],
+        (env * env) @ (expected["w"] * expected["w"]) / residual_rank,
+        rtol=3e-12,
+        atol=3e-12,
+    )
+    assert observed["missing_genotype_calls"] == 2
+    assert observed["repaired_feature_moment_columns"] == 0
+    assert context_info["repaired_gemm_output_columns"] == 0
+    assert context_info["retried_gemm_input_mutations"] == 0
+
+
 def test_native_context_owns_descriptors_and_isolated_same_path_replacement(tmp_path):
     rng = np.random.default_rng(334)
     n, m = 41, 13
@@ -764,12 +1098,10 @@ def test_native_context_rejects_mutation_bad_design_nonfinite_and_workspace(tmp_
         context.info()
 
 
-def test_native_pass_probe_tile_and_thread_determinism(tmp_path):
-    parallel_threads = min(4, len(os.sched_getaffinity(0)))
+def test_native_pass_probe_tile_and_fixed_thread_determinism(tmp_path):
+    parallel_threads = min(2, len(os.sched_getaffinity(0)))
     if parallel_threads < 2:
         pytest.skip("thread-determinism test requires at least two affinity-visible CPUs")
-    tile_threads = min(3, parallel_threads)
-
     rng = np.random.default_rng(662)
     n, m, probes = 53, 19, 16
     raw = rng.binomial(2, rng.uniform(0.12, 0.43, size=m), size=(n, m)).astype(float)
@@ -782,31 +1114,30 @@ def test_native_pass_probe_tile_and_thread_determinism(tmp_path):
     def source(start: int, stop: int, probe_slice: slice, threads: int):
         with _native_context(prefix, env, q, decode_threads=threads, target_panel_columns=5) as context:
             feature = _feature(context, m)
-            with threadpool_limits(limits=1):
-                result = context.source_block(
-                    start, stop,
-                    np.asarray(feature["scale_x"])[start:stop],
-                    np.asarray(feature["scale_w"])[start:stop],
-                    annotation[start:stop],
-                    np.asfortranarray(z[start:stop, probe_slice]),
-                    groups[start:stop], 1, True,
-                )[:2]
+            result = context.source_block(
+                start, stop,
+                np.asarray(feature["scale_x"])[start:stop],
+                np.asarray(feature["scale_w"])[start:stop],
+                annotation[start:stop],
+                np.asfortranarray(z[start:stop, probe_slice]),
+                groups[start:stop], 1, True,
+            )[:2]
             assert context.info()["decode_threads"] == threads
             return result, feature
 
-    (one_x, one_w), feature = source(0, m, slice(None), 1)
+    (one_x, one_w), feature = source(0, m, slice(None), parallel_threads)
     (four_x, four_w), _ = source(0, m, slice(None), parallel_threads)
     assert np.array_equal(one_x, four_x)
     assert np.array_equal(one_w, four_w)
 
-    (left_x, left_w), _ = source(0, 8, slice(None), 2)
-    (right_x, right_w), _ = source(8, m, slice(None), 2)
+    (left_x, left_w), _ = source(0, 8, slice(None), parallel_threads)
+    (right_x, right_w), _ = source(8, m, slice(None), parallel_threads)
     np.testing.assert_allclose(left_x + right_x, one_x, rtol=3e-15, atol=3e-13)
     np.testing.assert_allclose(left_w + right_w, one_w, rtol=3e-15, atol=3e-13)
 
     tile_x, tile_w = [], []
     for start, stop in ((0, 5), (5, 11), (11, probes)):
-        (x, w), _ = source(0, m, slice(start, stop), tile_threads)
+        (x, w), _ = source(0, m, slice(start, stop), parallel_threads)
         tile_x.append(x)
         tile_w.append(w)
     np.testing.assert_allclose(np.column_stack(tile_x), one_x, rtol=2e-15, atol=2e-14)
@@ -814,20 +1145,22 @@ def test_native_pass_probe_tile_and_thread_determinism(tmp_path):
 
     sources = np.asfortranarray(np.column_stack([one_x, one_w]))
     target_runs = []
-    for threads in (1, parallel_threads):
-        with _native_context(prefix, env, q, decode_threads=threads, target_panel_columns=5) as context:
+    for _ in range(2):
+        with _native_context(
+            prefix, env, q, decode_threads=parallel_threads,
+            target_panel_columns=5,
+        ) as context:
             panel = context.prepare_projected_sources(sources, 1e-10)
-            with threadpool_limits(limits=1):
-                target_runs.append(context.target_projected_block(
-                    0, m,
-                    np.asarray(feature["scale_x"]), np.asarray(feature["scale_w"]),
-                    panel, True,
-                )[:2])
+            target_runs.append(context.target_projected_block(
+                0, m,
+                np.asarray(feature["scale_x"]), np.asarray(feature["scale_w"]),
+                panel, True,
+            )[:2])
     assert np.array_equal(target_runs[0][0], target_runs[1][0])
     assert np.array_equal(target_runs[0][1], target_runs[1][1])
 
 
-def test_opt_in_native_reference_matches_python_artifacts_with_jackknife(tmp_path):
+def test_opt_in_native_reference_matches_python_artifacts(tmp_path):
     rng = np.random.default_rng(991)
     n, m = 47, 23
     raw = rng.binomial(2, rng.uniform(0.14, 0.46, size=m), size=(n, m)).astype(float)
@@ -846,8 +1179,7 @@ def test_opt_in_native_reference_matches_python_artifacts_with_jackknife(tmp_pat
             rand_dist="rademacher", low_level=None, num_vecs=20, step_size=6,
             seed=20260809, dtype="float64", num_threads=2,
             kernel_mode="standardized", genotype_scale="sample", impute_method="mean",
-            target_xz_mem=0.01, write_jackknife=True, jackknife_spec="4",
-            allow_low_probe_jackknife=True, native_backend=backend,
+            target_xz_mem=0.01, native_backend=backend,
             native_workspace_gib=0.25,
         )
 
@@ -871,7 +1203,6 @@ def test_opt_in_native_reference_matches_python_artifacts_with_jackknife(tmp_pat
                 rtol=2e-11, atol=2e-11,
             )
         assert native_estimator.resource_estimates["target_source_columns"] == 40
-        assert native_estimator.resource_estimates["jackknife_in_memory_block_sketch_gib"] == 0.0
         assert "jackknife_scratch_total_gib" not in native_estimator.resource_estimates
         manifest = json.loads(
             (tmp_path / "native.gxe.ref.json").read_text(encoding="utf-8")
@@ -901,9 +1232,84 @@ def test_opt_in_native_reference_matches_python_artifacts_with_jackknife(tmp_pat
         feature_backend = manifest["feature_backend_provenance"]
         assert feature_backend["artifact_stage"] == "feature_construction"
         assert feature_backend["backend_name"] == "gxeldcore_direct"
-        assert manifest["jackknife"]["method"] == "block_local_ldscore_deletion"
+        assert "jackknife" not in manifest
         assert not (tmp_path / "python.gxe.jackknife.npz").exists()
         assert not (tmp_path / "native.gxe.jackknife.npz").exists()
+
+        phenotype_values = rng.normal(size=n)
+        phenotype_path = tmp_path / "score.pheno.tsv"
+        ids.assign(Y=phenotype_values).to_csv(
+            phenotype_path, sep="\t", index=False
+        )
+        score_artifacts = score_phenotype_from_reference(
+            reference_manifest=tmp_path / "native.gxe.ref.json",
+            bed_path=prefix,
+            env_path=env_path,
+            covar_path=cov_path,
+            pheno_path=phenotype_path,
+            pheno_col="Y",
+            output_prefix=tmp_path / "native-score",
+            step_size=6,
+            num_threads=2,
+        )
+        fixed_basis = np.asarray(native_estimator.C_int, dtype=np.float64)
+        projected_phenotype = phenotype_values.astype(np.float64)
+        projected_phenotype -= fixed_basis @ (
+            fixed_basis.T @ projected_phenotype
+        )
+        projected_phenotype -= projected_phenotype.mean()
+        residual_rank = n - fixed_basis.shape[1] - 1
+        projected_phenotype *= np.sqrt(
+            residual_rank / np.dot(projected_phenotype, projected_phenotype)
+        )
+        q_basis = np.asfortranarray(
+            np.column_stack(
+                [np.full(n, 1.0 / np.sqrt(n), dtype=np.float64), fixed_basis]
+            )
+        )
+        expected_score_features = _python_features(
+            raw, np.asarray(native_estimator.env), q_basis
+        )
+        observed_gwas = pd.read_csv(score_artifacts.gwas, sep=r"\s+")
+        observed_gwis = pd.read_csv(score_artifacts.gwis, sep=r"\s+")
+        np.testing.assert_allclose(
+            observed_gwas["SCORE"],
+            expected_score_features["x"].T @ projected_phenotype
+            / np.sqrt(residual_rank),
+            rtol=2e-11,
+            atol=2e-11,
+        )
+        np.testing.assert_allclose(
+            observed_gwis["SCORE"],
+            expected_score_features["w"].T @ projected_phenotype
+            / np.sqrt(residual_rank),
+            rtol=2e-11,
+            atol=2e-11,
+        )
+        score_moments = json.loads(score_artifacts.moments.read_text())
+        score_backend = score_moments["score_backend_provenance"]
+        native_build = dict(gxeldcore.build_info())
+        native_score_eligible = (
+            native_build["blas_runtime_isolation"] == "private_static"
+            and native_build["gemm_integrity_enabled"] is False
+            and native_build["gemm_execution_mode"]
+            == "serialized_fixed_private_openblas"
+        )
+        expected_score_mode = (
+            "native_fused_sealed_scale_one_pass"
+            if native_score_eligible
+            else "python_numpy_one_pass"
+        )
+        assert score_backend["execution_mode"] == expected_score_mode
+        if expected_score_mode == "native_fused_sealed_scale_one_pass":
+            assert score_backend["api_version"] >= 6
+            assert score_backend["gemm_integrity_enabled"] is False
+            assert score_backend["strict_feature_moment_verification"] is False
+            assert score_backend["repaired_feature_moment_columns"] == 0
+            assert score_backend["repaired_gemm_output_columns"] == 0
+            assert score_backend["retried_gemm_input_mutations"] == 0
+        else:
+            assert "api_version" not in score_backend
     finally:
         python_estimator.close()
         native_estimator.close()
@@ -923,11 +1329,11 @@ def test_opt_in_native_backend_supports_float32_storage(tmp_path):
         return GenomewideEnvLDScore(
             bed_path=str(prefix), env_path=str(env_path), covar_path=None,
             annot_path=None, out_path=str(tmp_path / name), log=Logger(suppress=True),
-            rand_dist="rademacher", low_level=None, num_vecs=10, step_size=5,
-            seed=4, dtype="float32", kernel_mode="standardized",
-            genotype_scale="sample", impute_method="mean", native_backend=backend,
-            native_workspace_gib=0.25,
-        )
+                rand_dist="rademacher", low_level=None, num_vecs=10, step_size=5,
+                seed=4, dtype="float32", kernel_mode="standardized",
+                genotype_scale="sample", impute_method="mean", native_backend=backend,
+                native_workspace_gib=0.25, num_threads=2,
+            )
 
     python_estimator = estimator("gate-python", "python")
     native_estimator = estimator("gate-native", "direct")
@@ -989,7 +1395,7 @@ def test_checked_in_benchmark_records_4b_raw_timings_and_b128_scratch():
         [
             "--n", "32", "--m", "12", "--probe-counts", "1024",
             "--repeats", "1", "--warmups", "0", "--decode-threads", "2",
-            "--blas-threads", "1", "--skip-legacy",
+            "--blas-threads", "2", "--skip-legacy",
         ]
     )
     payload = benchmark_native.run(args)

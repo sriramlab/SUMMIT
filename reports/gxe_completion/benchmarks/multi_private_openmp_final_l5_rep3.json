@@ -1,0 +1,189 @@
+{
+  "affinity": [
+    64,
+    65,
+    66,
+    67
+  ],
+  "arguments": {
+    "environments": 5,
+    "m": 800,
+    "memory_gib": 1.0,
+    "n": 8000,
+    "probes": 32,
+    "seed": 20260814,
+    "step_size": 200,
+    "threads": 4,
+    "workspace_gib": 2.0
+  },
+  "cpu_seconds": 8.282964984000001,
+  "decode": {
+    "calls": 12,
+    "seconds": 0.6424897548859008
+  },
+  "gemm": [
+    {
+      "calls": 4,
+      "left": [
+        8000,
+        2
+      ],
+      "operation": "NN",
+      "output": [
+        8000,
+        200
+      ],
+      "right": [
+        2,
+        200
+      ],
+      "seconds": 0.013997804024256766
+    },
+    {
+      "calls": 1,
+      "left": [
+        8000,
+        2
+      ],
+      "operation": "NN",
+      "output": [
+        8000,
+        320
+      ],
+      "right": [
+        2,
+        320
+      ],
+      "seconds": 0.0031821790034882724
+    },
+    {
+      "calls": 4,
+      "left": [
+        8000,
+        200
+      ],
+      "operation": "NN",
+      "output": [
+        8000,
+        320
+      ],
+      "right": [
+        200,
+        320
+      ],
+      "seconds": 0.06876225996529683
+    },
+    {
+      "calls": 20,
+      "left": [
+        8000,
+        2
+      ],
+      "operation": "NN_UPDATE",
+      "output": [
+        8000,
+        200
+      ],
+      "right": [
+        2,
+        200
+      ],
+      "seconds": 0.01991566689684987
+    },
+    {
+      "calls": 4,
+      "left": [
+        8000,
+        2
+      ],
+      "operation": "TN",
+      "output": [
+        2,
+        200
+      ],
+      "right": [
+        8000,
+        200
+      ],
+      "seconds": 0.005152821948286146
+    },
+    {
+      "calls": 1,
+      "left": [
+        8000,
+        2
+      ],
+      "operation": "TN",
+      "output": [
+        2,
+        320
+      ],
+      "right": [
+        8000,
+        320
+      ],
+      "seconds": 0.0013838359736837447
+    },
+    {
+      "calls": 4,
+      "left": [
+        8000,
+        5
+      ],
+      "operation": "TN",
+      "output": [
+        5,
+        200
+      ],
+      "right": [
+        8000,
+        200
+      ],
+      "seconds": 0.004221208917442709
+    },
+    {
+      "calls": 4,
+      "left": [
+        8000,
+        15
+      ],
+      "operation": "TN",
+      "output": [
+        15,
+        200
+      ],
+      "right": [
+        8000,
+        200
+      ],
+      "seconds": 0.006286836985964328
+    },
+    {
+      "calls": 4,
+      "left": [
+        8000,
+        200
+      ],
+      "operation": "TN",
+      "output": [
+        200,
+        640
+      ],
+      "right": [
+        8000,
+        640
+      ],
+      "seconds": 0.11831886001164094
+    }
+  ],
+  "gemm_total_calls": 46,
+  "gemm_total_seconds": 0.2412214737269096,
+  "label": "private_openmp_final_l5_rep3",
+  "max_rss_kib": 263968,
+  "mode": "shared",
+  "profile": null,
+  "repairs": 0,
+  "schema": "summit.gxe.multi_environment_profile.v1",
+  "shared_genotype_passes": 3,
+  "wall_seconds": 2.1150386520312168
+}

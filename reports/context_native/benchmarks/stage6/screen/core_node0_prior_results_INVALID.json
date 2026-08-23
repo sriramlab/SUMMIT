@@ -1,0 +1,48 @@
+{
+  "schema": "context_native_stage6_result_invalidation_v1",
+  "scope": "core_node0_threads_n128_m512_q4_k2_g8_bt128_bd128",
+  "harness_fix_commit": "60a494cc6429543839640db200db4a582d071107",
+  "invalidated_results": [
+    {
+      "path": "reports/context_native/benchmarks/stage6/screen/core_node0_threads_smoke_dry_run.json",
+      "sha256": "77421b56b19ca437ce67e87feb5d928bd7724a48bc8f8632ff6f053536f2d92d",
+      "reasons": [
+        "generated_by_pre_fix_harness",
+        "superseded_by_post_fix_dry_run"
+      ]
+    },
+    {
+      "path": "reports/context_native/benchmarks/stage6/screen/core_node0_threads_smoke_r1.json",
+      "sha256": "4ba943425778e542a0c4bd768db6c61c3450aba35cca63b7279d116f2001ebf6",
+      "reasons": [
+        "generated_by_pre_fix_harness",
+        "runtime_thread_count_was_incorrectly_folded_into_build_provenance",
+        "superseded_by_exclusive_post_fix_smoke"
+      ]
+    },
+    {
+      "path": "reports/context_native/benchmarks/stage6/screen/core_node0_t1_t8_production_r3.json",
+      "sha256": "1605c69ba7237a1133782e1e603c1d4ae6cba13635b8cc78c5c394cbfe80d3ba",
+      "reasons": [
+        "generated_by_pre_fix_harness",
+        "runtime_thread_count_was_incorrectly_folded_into_build_provenance",
+        "timing_contaminated_by_concurrent_crossbuild_worker",
+        "superseded_by_exclusive_post_fix_production_run"
+      ]
+    }
+  ],
+  "replacement_results": [
+    {
+      "path": "reports/context_native/benchmarks/stage6/screen/core_node0_threads_smoke_dry_run_postfix_60a494c.json",
+      "sha256": "d1e2773685d280d0fda7a591ea47c61c9afa0cc1256fe00edcca94bbacf8b533"
+    },
+    {
+      "path": "reports/context_native/benchmarks/stage6/screen/core_node0_threads_smoke_r1_postfix_60a494c.json",
+      "sha256": "5021607342a5ca8c9cda16dae4f1aac3f7bdd0b3ea48eee49ed1076741a056b9"
+    },
+    {
+      "path": "reports/context_native/benchmarks/stage6/screen/core_node0_t1_t8_production_w1_r3_postfix_60a494c.json",
+      "sha256": "b3a1f225cf0868b21c004d75d654595677a403a07696c8d52e03b313d2a857fa"
+    }
+  ]
+}
