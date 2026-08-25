@@ -10,7 +10,7 @@ from summit.ldscore.generalized_gxe_variant_cli import build_parser, main
 from test_generalized_gxe_reference_v1 import _artifact
 
 
-def _plan_arguments(blocks: int) -> list[str]:
+def _plan_arguments() -> list[str]:
     return [
         "plan",
         "--samples",
@@ -23,8 +23,6 @@ def _plan_arguments(blocks: int) -> list[str]:
         "2",
         "--probes",
         "16",
-        "--jackknife-blocks",
-        str(blocks),
         "--memory-bytes",
         str(2 * 1024**3),
         "--genotype-format",
@@ -43,18 +41,16 @@ def test_help_names_variant_probe_two_pass_estimator() -> None:
     assert "sample-probe contextual action estimator" in help_text
 
 
-def test_dry_run_reports_exact_two_passes_and_canonical_jackknife(
+def test_dry_run_reports_exact_two_passes_and_no_estimator_jackknife(
     capsys,
 ) -> None:
-    assert main(_plan_arguments(10)) == 0
+    assert main(_plan_arguments()) == 0
     result = json.loads(capsys.readouterr().out)
     assert result["dry_run"] is True
     assert result["probe_axis"] == "variant"
     assert result["planned_reference_genotype_passes"] == 2
     assert result["work_plan"]["descriptor"]["planned_complete_passes"] == 2
-    assert result["jackknife_method"] == (
-        "frozen_full_genome_variant_ldscore_delete_block_v1"
-    )
+    assert result["reference_estimation_jackknife"] == "none"
 
 
 def test_inspect_validates_and_summarizes_closed_artifact(

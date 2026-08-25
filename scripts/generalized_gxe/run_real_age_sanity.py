@@ -14,9 +14,8 @@ import numpy as np
 
 from workflow import (
     align_table,
-    balanced_block_ids,
+    balanced_inference_block_ids,
     canonical_json,
-    file_sha256,
     fit_record,
     fixed_basis,
     full_fits,
@@ -168,7 +167,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--pilot", type=Path, default=DEFAULT_PILOT)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--probes", type=int, nargs="+", default=[128, 1024])
-    parser.add_argument("--blocks", type=int, default=200)
+    parser.add_argument(
+        "--njack", type=int, default=200,
+        help="post-hoc delete-block replicates for normal-equation inference",
+    )
     parser.add_argument("--seed", type=int, default=20260808)
     parser.add_argument("--memory-gib", type=float, default=64.0)
     parser.add_argument("--variant-block-width", type=int, default=4096)
@@ -203,7 +205,9 @@ def main() -> int:
         index for index, (left, right) in enumerate(residual_pairs) if left == right
     )
     annotations = np.ones((axes.m, 1), dtype=np.float64)
-    block_ids, block_labels = balanced_block_ids(axes.m, args.blocks)
+    inference_block_ids, inference_block_labels = balanced_inference_block_ids(
+        axes.m, args.njack
+    )
     memory_bytes = int(args.memory_gib * 1024**3)
     reference_runs = {}
     reference_times = {}
@@ -216,8 +220,8 @@ def main() -> int:
             fixed=fixed,
             annotations=annotations,
             annotation_names=("all_variants",),
-            block_ids=block_ids,
-            block_labels=block_labels,
+            inference_block_ids=inference_block_ids,
+            inference_block_labels=inference_block_labels,
             residual_names=residual_names,
             probes=probes,
             seed=args.seed,
@@ -243,15 +247,12 @@ def main() -> int:
         fixed=fixed,
         annotations=annotations,
         annotation_names=("all_variants",),
-        block_ids=block_ids,
-        block_labels=block_labels,
+        inference_block_ids=inference_block_ids,
+        inference_block_labels=inference_block_labels,
         phenotypes=phenotypes,
         trait_names=("diastolic_blood_pressure", "systolic_blood_pressure"),
         residual_basis=residual_basis,
         residual_names=residual_names,
-        threads=threads,
-        memory_bytes=memory_bytes,
-        native_module=gxeldcore,
         output=args.output / "age_bp_trait_batch",
         variant_block_width=args.variant_block_width,
     )
@@ -321,7 +322,7 @@ def main() -> int:
             "residual_rank": axes.n - fixed.shape[1],
             "traits": ["diastolic_blood_pressure", "systolic_blood_pressure"],
             "reference_probe_counts": args.probes,
-            "jackknife_blocks": args.blocks,
+            "njack": args.njack,
             "seed": args.seed,
             "residual_names": list(residual_names),
         },
@@ -329,7 +330,6 @@ def main() -> int:
             "build_info": build_info,
             "openmp_placement": placement,
             "native_binary": str(gxeldcore.__file__),
-            "native_binary_sha256": file_sha256(Path(gxeldcore.__file__)),
             "immutable_threads": threads,
         },
         "timing_seconds": {

@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import os
 from pathlib import Path
@@ -47,7 +46,6 @@ def _plan(args: argparse.Namespace):
             num_basis=args.basis,
             num_annotations=args.annotations,
             num_probes=args.probes,
-            num_jackknife_blocks=args.blocks,
             memory_limit_bytes=args.memory_gib * 1024**3,
             genotype_format="bed",
             threads=args.threads,
@@ -84,11 +82,7 @@ def _science_inputs(args: argparse.Namespace):
         annotations = np.zeros((m, args.annotations), dtype=np.float64)
         annotations[np.arange(m), np.arange(m) % args.annotations] = 1.0
     annotations = np.ascontiguousarray(annotations, dtype=np.float64)
-    block_ids = np.minimum(
-        args.blocks - 1,
-        np.arange(m, dtype=np.int64) * args.blocks // m,
-    )
-    return basis, fixed, annotations, block_ids
+    return basis, fixed, annotations
 
 
 def _ensure_bed(args: argparse.Namespace) -> None:
@@ -110,20 +104,6 @@ def _ensure_bed(args: argparse.Namespace) -> None:
     ).astype(np.float64)
     raw[rng.random(size=raw.shape) < args.missing_fraction] = np.nan
     to_bed(str(args.prefix) + ".bed", raw)
-
-
-def _output_digest(result: Any) -> str:
-    digest = hashlib.sha256()
-    for name in (
-        "directional_ldscores",
-        "directed_numerator",
-        "block_directed_numerator",
-        "genetic_gram",
-        "same_person",
-    ):
-        digest.update(name.encode("ascii"))
-        digest.update(np.ascontiguousarray(getattr(result, name)).tobytes())
-    return digest.hexdigest()
 
 
 def _summarize_mappings(records: Sequence[dict[str, float]]) -> dict[str, Any]:
@@ -161,7 +141,6 @@ def _one_execution(
     basis: np.ndarray,
     fixed: np.ndarray,
     annotations: np.ndarray,
-    block_ids: np.ndarray,
 ):
     flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
     descriptors = {
@@ -180,7 +159,6 @@ def _one_execution(
                 f"annotation_{index}" for index in range(args.annotations)
             ),
             annotation_masses=np.sum(annotations, axis=0, dtype=np.float64),
-            block_ids=block_ids,
             probe_spec=GlobalVariantProbeSpec(
                 root_seed=args.seed,
                 probe_offset=0,
@@ -199,7 +177,6 @@ def _one_execution(
         end_to_end = time.perf_counter() - begin
         return {
             "end_to_end_wall_seconds": end_to_end,
-            "digest": _output_digest(result),
             "ledger": dict(result.ledger),
             "telemetry": dict(result.telemetry),
             "performance_ledger": generalized_gxe_performance_ledger_from_native(
@@ -215,7 +192,7 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
     from summit import gxeldcore
 
     _ensure_bed(args)
-    basis, fixed, annotations, block_ids = _science_inputs(args)
+    basis, fixed, annotations = _science_inputs(args)
     plan = _plan(args)
     placement = None
     if args.cpu_ids is not None:
@@ -226,12 +203,10 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
         )
     gxeldcore.reset_gemm_telemetry()
     runs = [
-        _one_execution(args, plan, basis, fixed, annotations, block_ids)
+        _one_execution(args, plan, basis, fixed, annotations)
         for _ in range(args.warmups + args.repeats)
     ]
     measured = runs[args.warmups :]
-    digest_values = [record["digest"] for record in runs]
-    digests = set(digest_values)
     for record in measured:
         _validate_clean_ledger(record["ledger"], variants=args.variants)
     wall = [record["end_to_end_wall_seconds"] for record in measured]
@@ -246,7 +221,6 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
             "Q": args.basis,
             "K": args.annotations,
             "B": args.probes,
-            "J": args.blocks,
         },
         "configuration": {
             "backend": args.backend,
@@ -273,9 +247,6 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
                 ]
             ),
         },
-        "last_output_sha256": last["digest"],
-        "output_sha256_values": digest_values,
-        "bitwise_reproducible": len(digests) == 1,
         "ledger": last["ledger"],
         "performance_ledger": last["performance_ledger"],
         "native_vendor_gemm_records": native_gemm,
@@ -299,7 +270,6 @@ def _add_dimensions(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--basis", type=_positive, default=3)
     parser.add_argument("--annotations", type=_positive, default=1)
     parser.add_argument("--probes", type=_positive, default=128)
-    parser.add_argument("--blocks", type=_positive, default=200)
     parser.add_argument("--threads", type=_positive, default=1)
     parser.add_argument("--variant-block-width", type=_positive, default=4096)
     parser.add_argument("--probe-tile-width", type=_positive, default=16)
@@ -335,8 +305,6 @@ def _parser() -> argparse.ArgumentParser:
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
-    if args.blocks > args.variants:
-        raise SystemExit("--blocks cannot exceed --variants")
     if args.probe_tile_width > args.probes:
         raise SystemExit("--probe-tile-width cannot exceed --probes")
     if args.command == "plan":

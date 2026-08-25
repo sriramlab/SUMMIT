@@ -109,7 +109,7 @@ env PYTHONPATH=/tmp/summit-generalized-stage08-release.aYHX4I/install \
   scripts/benchmark_generalized_gxe_variant.py run \
   --prefix /home/bronsonj/SUMMIT_gxe_pilot_20260808/validation/geno/age_dbp_cc \
   --samples 9401 --variants 454207 --basis 3 --annotations 1 \
-  --probes 128 --blocks 200 --threads 32 \
+  --probes 128 --njack 200 --threads 32 \
   --variant-block-width 4096 --probe-tile-width 4 \
   --sample-tile-width 4096 --memory-gib 64 \
   --warmups 1 --repeats 3 \

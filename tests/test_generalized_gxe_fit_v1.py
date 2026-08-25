@@ -1,8 +1,5 @@
 from __future__ import annotations
 
-from dataclasses import replace
-from pathlib import Path
-
 import numpy as np
 import pytest
 
@@ -11,27 +8,23 @@ from summit.context.oracle import transfer_reference_gram
 from summit.context.spec import (
     ContextComponentIndex,
     ContextPairIndex,
-    canonical_sha256,
-)
-from summit.context.trait_v1 import (
-    load_contextual_trait_v1,
-    trait_moments_after_deleting_groups_v1,
-    write_contextual_trait_v1,
 )
 from summit.ldscore.generalized_gxe_fit_v1 import (
+    _trait_moments_after_deleting_blocks,
     assemble_generalized_gxe_normal_equations_v1,
     fit_generalized_gxe_variant_model_v1,
     validate_generalized_gxe_trait_compatibility_v1,
 )
 from summit.ldscore.generalized_gxe_reference_v1 import (
     build_generalized_gxe_variant_reference_v1,
+    serialize_generalized_gxe_inference_axes,
 )
 from summit.ldscore.generalized_gxe_variant import (
     GlobalVariantProbeSpec,
     TwoPassLedger,
-    serialize_generalized_gxe_axes,
 )
-from test_context_stage4_fit_v1 import _artifacts, _sha
+from summit.ldscore.generalized_gxe_trait_summary import GeneralizedGxETraitSummary
+from test_context_stage4_fit_v1 import _artifacts
 from test_context_stage4_trait_v1 import _artifact as stable_trait_artifact
 
 
@@ -50,34 +43,54 @@ def _completed_ledger(block_ids: np.ndarray) -> dict[str, int]:
     return ledger.to_dict()
 
 
-def _matching_reference(trait, *, include_panel: bool = False):
-    identity = trait.manifest["identity"]
-    maps = trait.manifest["maps"]
+def _current_trait(trait) -> GeneralizedGxETraitSummary:
+    dimensions = trait.manifest["dimensions"]
+    residual_rank = int(
+        dimensions.get("residual_rank", dimensions["N_study"] - 2)
+    )
+    return GeneralizedGxETraitSummary(
+        n_samples=trait.n_samples,
+        n_variants=trait.n_variants,
+        residual_rank=residual_rank,
+        component_index=trait.component_index,
+        group_ids=trait.group_ids,
+        trait_ids=trait.trait_ids,
+        residual_names=trait.residual_names,
+        genetic_rhs=trait.genetic_rhs,
+        genetic_traces=trait.genetic_traces,
+        genetic_residual=trait.genetic_residual,
+        residual_rhs=trait.residual_rhs,
+        residual_traces=trait.residual_traces,
+        residual_gram=trait.residual_gram,
+        group_rhs_unnormalized_num=trait.group_rhs_unnormalized_num,
+        group_trace_unnormalized_num=trait.group_trace_unnormalized_num,
+        group_genetic_residual_num=trait.group_genetic_residual_num,
+        annotation_masses=trait.annotation_masses,
+        group_annotation_masses=trait.group_annotation_masses,
+        group_variant_counts=trait.group_variant_counts,
+    )
+
+
+def _matching_reference(
+    trait, *, genotype_scale_plan, include_panel: bool = False
+):
     counts = np.asarray(trait.group_variant_counts, dtype=np.int64)
     block_ids = np.repeat(np.arange(len(counts), dtype=np.int64), counts)
     n_reference = max(10, trait.n_samples + 2)
     fixed_rank = 2
     residual_rank = n_reference - fixed_rank
-    axes = serialize_generalized_gxe_axes(
+    axes = serialize_generalized_gxe_inference_axes(
         num_variants=trait.n_variants,
-        variant_digest=identity["variant_order_allele_sha256"],
-        retained_variant_digest=identity["retained_variant_order_sha256"],
         num_samples=n_reference,
-        sample_digest=canonical_sha256({"reference_samples": n_reference}),
         basis_names=tuple(
             f"basis_{index}"
             for index in range(trait.component_index.pair_index.num_basis)
         ),
-        basis_digest=identity["basis_specification_sha256"],
-        basis_calibration_digest=identity["basis_calibration_sha256"],
-        fixed_effect_digest=identity["fixed_effect_spec_sha256"],
         fixed_effect_rank=fixed_rank,
         annotation_names=trait.component_index.annotation_names,
-        annotation_digest=maps["annotation_map_sha256"],
         annotation_masses=trait.annotation_masses,
         variant_block_ids=block_ids,
         block_labels=trait.group_ids,
-        jackknife_block_digest=maps["group_map_sha256"],
         residual_component_names=trait.residual_names,
     )
     c = len(trait.component_index)
@@ -143,7 +156,7 @@ def _matching_reference(trait, *, include_panel: bool = False):
     return build_generalized_gxe_variant_reference_v1(
         axes=axes,
         probe_spec=probe,
-        genotype_scale_plan=trait.scale_plan,
+        genotype_scale_plan=genotype_scale_plan,
         arrays=arrays,
         pass_ledger=_completed_ledger(block_ids),
         performance_ledger={
@@ -158,39 +171,27 @@ def _matching_reference(trait, *, include_panel: bool = False):
             "peak_rss_bytes": 0,
             "output_bytes": sum(value.nbytes for value in arrays.values()),
         },
-        provenance={
-            "source_commit": "d" * 40,
-            "source_tree_sha256": "e" * 64,
-            "native_binary_sha256": "f" * 64,
-        },
+        provenance={"fixture": "generalized-fit-current-contract"},
         diagnostics=diagnostics,
     )
 
 
 def _synthetic_pair(monkeypatch: pytest.MonkeyPatch, *, singular: bool = False):
-    _, trait = _artifacts(monkeypatch, trait_count=1, singular=singular)
-    trait.manifest["identity"]["fixed_effect_spec_sha256"] = _sha(
-        "fixed-effect-spec"
-    )
-    return _matching_reference(trait), trait
+    _, contextual = _artifacts(monkeypatch, trait_count=1, singular=singular)
+    trait = _current_trait(contextual)
+    return _matching_reference(
+        trait, genotype_scale_plan=contextual.scale_plan
+    ), trait
 
 
-def test_loaded_existing_trait_artifact_binds_to_new_reference(
-    tmp_path: Path,
-) -> None:
-    trait = stable_trait_artifact()
-    path = write_contextual_trait_v1(trait, tmp_path / "trait")
-    loaded = load_contextual_trait_v1(path)
-    reference = _matching_reference(loaded)
-    compatibility = validate_generalized_gxe_trait_compatibility_v1(
-        reference, loaded
+def test_contextual_trait_artifact_is_not_a_generalized_trait_input() -> None:
+    contextual = stable_trait_artifact()
+    trait = _current_trait(contextual)
+    reference = _matching_reference(
+        trait, genotype_scale_plan=contextual.scale_plan
     )
-    assert compatibility["reference_kind"] == (
-        "summit.generalized_gxe.variant_ldscore_reference"
-    )
-    assert compatibility["reference_manifest_sha256"] == (
-        reference.manifest_sha256
-    )
+    with pytest.raises(ValueError, match="generalized per-variant trait summary"):
+        validate_generalized_gxe_trait_compatibility_v1(reference, contextual)
 
 
 def test_full_fit_matches_direct_dense_symmetric_solve(
@@ -232,7 +233,7 @@ def test_every_deleted_fit_matches_direct_frozen_row_assembly(
             * 0.5 * (directed + directed.T)
             / np.outer(component_masses, component_masses)
         )
-        trait_moments = trait_moments_after_deleting_groups_v1(trait, (block,))
+        trait_moments = _trait_moments_after_deleting_blocks(trait, (block,))
         transferred = transfer_reference_gram(
             direct_gram,
             reference.same_person,
@@ -280,7 +281,7 @@ def test_fit_uses_only_compact_summaries_when_panel_is_omitted(
     assert result.manifest["per_variant_panel_accessed"] is False
 
 
-def test_fit_amortizes_artifact_verification_across_all_deleted_blocks(
+def test_fit_does_not_invoke_redundant_artifact_verification(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     reference, trait = _synthetic_pair(monkeypatch)
@@ -299,28 +300,7 @@ def test_fit_amortizes_artifact_verification_across_all_deleted_blocks(
     monkeypatch.setattr(type(reference), "verify", counted_reference_verify)
     monkeypatch.setattr(type(trait), "verify", counted_trait_verify)
     fit_generalized_gxe_variant_model_v1(reference, trait)
-    assert calls == {"reference": 2, "trait": 2}
-
-
-@pytest.mark.parametrize(
-    ("section", "field"),
-    (
-        ("identity", "variant_order_allele_sha256"),
-        ("identity", "retained_variant_order_sha256"),
-        ("identity", "basis_specification_sha256"),
-        ("identity", "basis_calibration_sha256"),
-        ("identity", "fixed_effect_spec_sha256"),
-        ("maps", "annotation_map_sha256"),
-        ("maps", "group_map_sha256"),
-    ),
-)
-def test_incompatible_trait_identities_fail_closed(
-    monkeypatch: pytest.MonkeyPatch, section: str, field: str
-) -> None:
-    reference, trait = _synthetic_pair(monkeypatch)
-    trait.manifest[section][field] = canonical_sha256({"mismatch": field})
-    with pytest.raises(ValueError, match=field):
-        validate_generalized_gxe_trait_compatibility_v1(reference, trait)
+    assert calls == {"reference": 0, "trait": 0}
 
 
 def test_incompatible_pair_annotation_and_group_axes_fail_closed(
@@ -341,30 +321,12 @@ def test_incompatible_pair_annotation_and_group_axes_fail_closed(
         "component_index",
         ContextComponentIndex(("different",), ContextPairIndex(1)),
     )
-    with pytest.raises(ValueError, match="component_map_sha256"):
+    with pytest.raises(ValueError, match="component_order"):
         validate_generalized_gxe_trait_compatibility_v1(reference, trait)
 
     reference, trait = _synthetic_pair(monkeypatch)
     object.__setattr__(trait, "annotation_masses", np.asarray([7.0]))
     with pytest.raises(ValueError, match="annotation_masses"):
-        validate_generalized_gxe_trait_compatibility_v1(reference, trait)
-
-
-def test_incompatible_common_scale_fails_closed(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    reference, trait = _synthetic_pair(monkeypatch)
-    object.__setattr__(
-        trait,
-        "scale_plan",
-        replace(
-            trait.scale_plan,
-            affine_inverse_scale_sha256=canonical_sha256(
-                {"different": "scale"}
-            ),
-        ),
-    )
-    with pytest.raises(ValueError, match="genotype_scale_plan_sha256"):
         validate_generalized_gxe_trait_compatibility_v1(reference, trait)
 
 

@@ -1,19 +1,16 @@
 from __future__ import annotations
 
-import hashlib
 import os
 from pathlib import Path
 import subprocess
 import sys
 import textwrap
-from dataclasses import replace
 
 import numpy as np
 import pytest
 from bed_reader import open_bed, to_bed
 
 from generalized_gxe_variant_ldscore_oracle import orthonormalize
-from summit.context.spec import array_sha256
 from summit.ldscore.generalized_gxe_native import (
     GeneralizedGxENativeBEDExecutor,
     generalized_gxe_performance_ledger_from_native,
@@ -29,12 +26,12 @@ from summit.ldscore.generalized_gxe_pass2 import (
 )
 from summit.ldscore.generalized_gxe_reference_v1 import (
     build_generalized_gxe_variant_reference_from_native_v1,
+    serialize_generalized_gxe_inference_axes,
 )
 from summit.ldscore.generalized_gxe_variant import (
     GeneralizedGxEPlanInputs,
     GlobalVariantProbeSpec,
     plan_generalized_gxe_variant_work,
-    serialize_generalized_gxe_axes,
 )
 
 
@@ -107,7 +104,6 @@ def _plan(
             num_basis=basis.shape[1],
             num_annotations=annotations.shape[1],
             num_probes=13,
-            num_jackknife_blocks=3,
             memory_limit_bytes=512 * 1024**2,
             genotype_format="bed",
             threads=threads,
@@ -124,7 +120,6 @@ def _reference(
     basis: np.ndarray,
     fixed: np.ndarray,
     annotations: np.ndarray,
-    block_ids: np.ndarray,
     probe_spec: GlobalVariantProbeSpec,
     plan,
     probe_width: int,
@@ -154,7 +149,6 @@ def _reference(
         fixed_effect_basis=fixed,
         annotations=annotations,
         annotation_names=names,
-        block_ids=block_ids,
         work_plan=plan,
         tn_operator=NumpyTNOperator(),
         probe_tile_width=probe_width,
@@ -168,7 +162,6 @@ def _native(
     basis: np.ndarray,
     fixed: np.ndarray,
     annotations: np.ndarray,
-    block_ids: np.ndarray,
     probe_spec: GlobalVariantProbeSpec,
     plan,
     probe_width: int,
@@ -201,7 +194,6 @@ def _native(
             annotation_masses=np.sum(
                 annotations, axis=0, dtype=np.float64
             ),
-            block_ids=block_ids,
             probe_spec=probe_spec,
             work_plan=plan,
             probe_tile_width=probe_width,
@@ -255,7 +247,6 @@ def test_native_dense_matches_every_stage05_layer(
         basis=basis,
         fixed=fixed,
         annotations=annotations,
-        block_ids=block_ids,
         probe_spec=probe_spec,
         plan=plan,
         probe_width=3,
@@ -265,7 +256,6 @@ def test_native_dense_matches_every_stage05_layer(
         basis=basis,
         fixed=fixed,
         annotations=annotations,
-        block_ids=block_ids,
         probe_spec=probe_spec,
         plan=plan,
         probe_width=3,
@@ -280,17 +270,11 @@ def test_native_dense_matches_every_stage05_layer(
         (observed.directed_numerator, expected.directed_numerator),
         (observed.symmetric_numerator, expected.symmetric_numerator),
         (observed.genetic_gram, expected.genetic_gram),
-        (
-            observed.block_directed_numerator,
-            expected.block_directed_numerator,
-        ),
-        (observed.block_annotation_mass, expected.block_annotation_mass),
     )
     for actual, target in comparisons:
         np.testing.assert_allclose(actual, target, rtol=3.0e-13, atol=3.0e-13)
     assert observed.pair_table == expected.pair_table
     assert observed.component_table == expected.component_table
-    assert observed.product_plan_digest == expected.product_plan_digest
     assert dict(observed.ledger)["observed_reference_genotype_passes"] == 2
     assert dict(observed.ledger)["observed_retained_variant_visits"] == 24
     assert dict(observed.ledger)["duplicate_variant_visits"] == 0
@@ -323,7 +307,6 @@ def test_packed_mailman_matches_dense_across_threads_and_tiles(
         basis=basis,
         fixed=fixed,
         annotations=annotations,
-        block_ids=block_ids,
         probe_spec=probe_spec,
         plan=plan,
         probe_width=4,
@@ -336,7 +319,6 @@ def test_packed_mailman_matches_dense_across_threads_and_tiles(
         basis=basis,
         fixed=fixed,
         annotations=annotations,
-        block_ids=block_ids,
         probe_spec=probe_spec,
         plan=plan,
         probe_width=4,
@@ -350,7 +332,6 @@ def test_packed_mailman_matches_dense_across_threads_and_tiles(
         "same_person",
         "directional_ldscores",
         "directed_numerator",
-        "block_directed_numerator",
         "genetic_gram",
     ):
         np.testing.assert_allclose(
@@ -364,7 +345,7 @@ def test_packed_mailman_matches_dense_across_threads_and_tiles(
         "source_nn_calls"
     ]
     assert dict(packed.ledger)["observed_retained_variant_visits"] == 24
-    assert packed.genotype_scale_plan.digest == dense.genotype_scale_plan.digest
+    assert dict(packed.genotype_scale) == dict(dense.genotype_scale)
 
 
 def test_packed_native_one_and_multiple_threads_match_in_fresh_processes(
@@ -391,7 +372,7 @@ def test_packed_native_one_and_multiple_threads_match_in_fresh_processes(
         )
         _, result = _native(
             prefix=prefix, basis=basis, fixed=fixed,
-            annotations=annotations, block_ids=block_ids,
+            annotations=annotations,
             probe_spec=probe_spec, plan=plan, probe_width=4,
             backend="packed", threads=threads,
         )
@@ -467,7 +448,6 @@ def test_context_is_single_use_and_omits_unrequested_base_sources(
         basis=basis,
         fixed=fixed,
         annotations=annotations,
-        block_ids=block_ids,
         probe_spec=probe_spec,
         plan=plan,
         probe_width=4,
@@ -518,7 +498,6 @@ def test_descriptor_mutation_before_run_fails_without_publication(
             annotations=annotations,
             annotation_names=("annotation_0",),
             annotation_masses=np.sum(annotations, axis=0),
-            block_ids=block_ids,
             probe_spec=probe_spec,
             work_plan=plan,
             probe_tile_width=3,
@@ -575,7 +554,6 @@ def test_algebraic_checksum_fault_fails_before_publication(
             annotations=annotations,
             annotation_names=("annotation_0",),
             annotation_masses=np.sum(annotations, axis=0),
-            block_ids=block_ids,
             probe_spec=probe_spec,
             work_plan=plan,
             probe_tile_width=3,
@@ -632,23 +610,20 @@ def test_native_result_adapts_directly_to_compact_closed_artifact(
         basis=basis,
         fixed=fixed,
         annotations=annotations,
-        block_ids=block_ids,
         probe_spec=probe_spec,
         plan=plan,
         probe_width=3,
         backend="dense",
         threads=1,
     )
-    retained_digest = array_sha256(np.arange(genotype.shape[1], dtype=np.int64))
-    scale_plan = result.genotype_scale_plan
-    assert scale_plan.retained_variant_order_sha256 == retained_digest
-    assert scale_plan.centering_source == "provided_v1"
-    assert scale_plan.centering_formula == "provided_variant_affine_mean_v1"
+    scale = result.genotype_scale
+    assert scale["centering_source"] == "provided_v1"
+    assert scale["centering_formula"] == "provided_variant_affine_mean_v1"
     assert (
-        scale_plan.scaling_formula
+        scale["scaling_formula"]
         == "dosage_minus_mean_times_inverse_scale_v1"
     )
-    assert scale_plan.missing_imputation == "sealed_mean_v1"
+    assert scale["missing_imputation"] == "sealed_mean_v1"
     raw = open_bed(str(prefix) + ".bed").read(dtype=np.float64)
     means = np.nanmean(raw, axis=0)
     compact = open_bed(str(prefix) + ".bed", count_A1=False).read(
@@ -661,31 +636,19 @@ def test_native_result_adapts_directly_to_compact_closed_artifact(
         total_squares = int(np.sum(observed * observed, dtype=np.float64))
         m2 = total_squares - total * total / observed.size
         inverse[variant] = np.sqrt((compact.shape[0] - 1) / m2)
-    assert scale_plan.affine_mean_sha256 == array_sha256(means)
-    assert scale_plan.affine_inverse_scale_sha256 == array_sha256(inverse)
     np.testing.assert_array_equal(result.affine_mean, means)
     np.testing.assert_array_equal(result.affine_inverse_scale, inverse)
     assert result.affine_mean.flags.writeable is False
     assert result.affine_inverse_scale.flags.writeable is False
-    axes = serialize_generalized_gxe_axes(
+    axes = serialize_generalized_gxe_inference_axes(
         num_variants=genotype.shape[1],
-        variant_digest=array_sha256(
-            np.arange(genotype.shape[1], dtype=np.uint64)
-        ),
-        retained_variant_digest=retained_digest,
         num_samples=genotype.shape[0],
-        sample_digest=array_sha256(np.arange(genotype.shape[0], dtype=np.int64)),
         basis_names=("intercept",),
-        basis_digest=array_sha256(basis),
-        basis_calibration_digest=array_sha256(basis.T @ basis),
-        fixed_effect_digest=array_sha256(fixed),
         fixed_effect_rank=fixed.shape[1],
         annotation_names=("annotation_0",),
-        annotation_digest=array_sha256(annotations),
         annotation_masses=np.sum(annotations, axis=0),
         variant_block_ids=block_ids,
         block_labels=("block_0", "block_1", "block_2"),
-        jackknife_block_digest=array_sha256(block_ids),
         residual_component_names=("identity",),
     )
     telemetry = dict(result.telemetry)
@@ -716,8 +679,6 @@ def test_native_result_adapts_directly_to_compact_closed_artifact(
         int(telemetry["source_nn_calls"])
         + int(telemetry["target_tn_calls"])
     )
-    build_info = dict(gxeldcore.build_info())
-    binary_sha256 = hashlib.sha256(Path(gxeldcore.__file__).read_bytes()).hexdigest()
     diagnostics = {
         "maximum_source_projection_leakage": float(
             telemetry["maximum_projection_leakage"]
@@ -728,54 +689,23 @@ def test_native_result_adapts_directly_to_compact_closed_artifact(
         "maximum_presymmetry_relative_error": float(
             telemetry["presymmetry_relative_error"]
         ),
-        "block_reconstruction_error": float(
-            telemetry["block_reconstruction_error"]
-        ),
         "same_person_probe_count": probe_spec.probe_count,
         "same_person_cross_tile_finalized": True,
         "minimum_annotation_mass": float(np.min(result.annotation_masses)),
-        "minimum_deleted_annotation_mass": float(
-            np.min(
-                result.annotation_masses[None, :]
-                - result.block_annotation_mass
-            )
-        ),
         "all_values_finite": True,
         "normal_matrix_rank": len(result.component_table),
         "normal_matrix_condition": 1.0,
         "dense_oracle_fixture_version": "stage07_native_adapter_v1",
         "backend_fixed_probe_maximum_error": 3.0e-13,
     }
-    with pytest.raises(ValueError, match="genotype scale plans differ"):
-        build_generalized_gxe_variant_reference_from_native_v1(
-            result,
-            axes=axes,
-            probe_spec=probe_spec,
-            genotype_scale_plan=replace(
-                scale_plan,
-                affine_mean_sha256=array_sha256(
-                    np.ones(genotype.shape[1], dtype=np.float64)
-                ),
-            ),
-            performance_ledger=performance_ledger,
-            provenance={
-                "source_commit": build_info["source_commit"],
-                "source_tree_sha256": build_info["source_tree_sha256"],
-                "native_binary_sha256": binary_sha256,
-            },
-            diagnostics=diagnostics,
-        )
     artifact = build_generalized_gxe_variant_reference_from_native_v1(
         result,
         axes=axes,
+        annotations=annotations,
         probe_spec=probe_spec,
-        genotype_scale_plan=scale_plan,
+        genotype_scale_plan=scale,
         performance_ledger=performance_ledger,
-        provenance={
-            "source_commit": build_info["source_commit"],
-            "source_tree_sha256": build_info["source_tree_sha256"],
-            "native_binary_sha256": binary_sha256,
-        },
+        provenance={"native_module": str(Path(gxeldcore.__file__))},
         diagnostics=diagnostics,
         include_directional_panel=False,
     )

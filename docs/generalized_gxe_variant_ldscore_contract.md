@@ -92,9 +92,11 @@ panels using the same orientation expansion as above.
 A normal reference run performs exactly two full genotype traversals. Tiling
 must not add scans.
 
-## Inference-time SNP-block jackknife
+## Post-hoc inference-time SNP-block jackknife
 
-During reference pass 2 accumulate
+Reference pass 2 emits one fixed directional score row per target SNP. It does
+not receive block IDs or accumulate deletion summaries. After the completed
+genome-wide panel is available, a separate reducer computes
 
 ```math
 BDNUM[g,c,d]
@@ -111,13 +113,15 @@ DNUM^{(-g)}=DNUM-BDNUM[g]
 and retained annotation masses. Do not recompute source sketches or retained
 SNP LD scores. Reuse the full same-person matrix.
 
-Reference writers publish `BDNUM` and the block annotation masses, but do not
-materialize delete-block genetic Grams. The inference adapter constructs each
-requested deleted Gram on demand without genotype access. Cached deleted Grams
-remain readable only for compatibility with older artifacts.
+The inference-ready reference publishes `BDNUM` and block annotation masses,
+but the generalized LD-score estimator itself has no block or jackknife input.
+The inference adapter constructs each requested deleted Gram on demand without
+genotype access. Trait-side scores, information, and heteroskedastic
+information follow the same rule: estimate per SNP first, reduce by `--njack`
+afterward.
 
-A separate changed-block-count invariance experiment is not a production or
-qualification requirement. The enforced reference-construction gates are the
+Changing `--njack` therefore never changes a per-SNP reference score or
+requires another genotype pass. The reference-estimation gates are the
 two-pass ledger, `2M` retained-variant visits, and clean integrity counters.
 
 Canonical method:

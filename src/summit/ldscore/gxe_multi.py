@@ -30,15 +30,10 @@ from .gw_ldscore import (
     _validate_openmp_placement_build_contract,
 )
 from .gwe_ldscore import (
-    _BACKEND_PROVENANCE_SCHEMA_VERSION,
     GenomewideEnvLDScore,
     _build_balanced_vtiles,
-    _is_canonical_sha256,
-    _loaded_native_binary_record,
     _make_seed,
     _orthonormalize_columns,
-    _sha256_descriptor,
-    _validate_backend_provenance,
     _validate_native_blas_runtime,
 )
 
@@ -445,7 +440,6 @@ def _validated_numa_bound_decode_report(
             "query_chunks",
             "query_chunk_page_limit",
             "node_histogram",
-            "ordered_status_sha256",
             "ordered_status_encoding",
             "complete",
         }
@@ -453,7 +447,7 @@ def _validated_numa_bound_decode_report(
         verification_nodes = verification.get("selected_nodes")
         if (
             set(allocation) != allocation_keys
-            or set(verification) != verification_keys
+            or set(verification) - {"ordered_status_sha256"} != verification_keys
             or type(allocation.get("schema_version")) is not int
             or type(verification.get("schema_version")) is not int
             or type(allocation.get("byte_count")) is not int
@@ -505,9 +499,6 @@ def _validated_numa_bound_decode_report(
             or isinstance(query_chunks, bool)
             or not isinstance(query_chunks, int)
             or query_chunks != (page_count + chunk_limit - 1) // chunk_limit
-            or not _is_canonical_sha256(
-                verification.get("ordered_status_sha256")
-            )
             or verification.get("ordered_status_encoding")
             != f"native_32bit_signed_{sys.byteorder}"
         ):
@@ -534,7 +525,9 @@ def _validated_numa_bound_decode_report(
             normalized_histogram[node] = count
         if sum(normalized_histogram.values()) != page_count:
             raise RuntimeError("NUMA page-node histogram is incomplete.")
-        normalized_records.append(_json_safe(dict(record)))
+        normalized_record = _json_safe(dict(record))
+        normalized_record["verification"].pop("ordered_status_sha256", None)
+        normalized_records.append(normalized_record)
         total_payload_bytes += expected_byte_count
         total_mapping_bytes += mapping_bytes
         maximum_mapping_bytes = max(maximum_mapping_bytes, mapping_bytes)
@@ -708,7 +701,7 @@ def _validate_packed_source_panel_numa_records(
                 or record.get("allocation_mode") != "legacy_anonymous_mapping"
             ):
                 raise RuntimeError(
-                    "Legacy packed source-panel allocation evidence is not exact."
+                    "Uncontracted packed source-panel allocation evidence is malformed."
                 )
             validated.append(_json_safe(dict(record)))
             continue
@@ -768,15 +761,13 @@ def _validate_packed_source_panel_numa_records(
                 for key, value in histogram.items()
             )
             or sum(histogram.values()) != record["mapping_page_count"]
-            or not isinstance(record.get("ordered_status_sha256"), str)
-            or re.fullmatch(
-                r"[0-9a-f]{64}", record["ordered_status_sha256"]
-            ) is None
         ):
             raise RuntimeError(
                 "Contracted packed source-panel NUMA evidence is incomplete."
             )
-        validated.append(_json_safe(dict(record)))
+        normalized = _json_safe(dict(record))
+        normalized.pop("ordered_status_sha256", None)
+        validated.append(normalized)
     tile_roles: dict[tuple[int, int, int, int], list[str]] = {}
     for record in validated:
         tile_key = (
@@ -971,9 +962,6 @@ class _MultiEnvironmentGemm:
         self.blas_vendor = "none"
         self.vendor_probe_chunk_width: int | None = None
         self.backend_version = str(np.__version__)
-        self.backend_build_sha256: str | None = None
-        self.source_commit: str | None = None
-        self.source_tree_sha256: str | None = None
         self.repaired_output_columns = 0
         self.integrity_enabled = False
         self.checksum_enabled = False
@@ -1030,23 +1018,7 @@ class _MultiEnvironmentGemm:
         self._multi_environment_kernel_repaired_columns = 0
         self._multi_environment_kernel_checksum_recomputed_columns = 0
         self._multi_environment_kernel_roundoff_only_columns = 0
-        self._descriptor: int | None = None
-        self._binary_record: dict | None = None
-        self._template: dict | None = None
         if not self.protected:
-            try:
-                multiarray = __import__(
-                    "numpy._core._multiarray_umath", fromlist=["__file__"]
-                )
-                binary_path = Path(multiarray.__file__).resolve()
-                if binary_path.is_file():
-                    self.backend_build_sha256 = GenomewideEnvLDScore._file_sha256(
-                        str(binary_path)
-                    )
-            except Exception as exc:
-                self._native_telemetry_errors.append(
-                    f"numpy_binary_identity_unavailable: {type(exc).__name__}: {exc}"
-                )
             return
 
         try:
@@ -1073,7 +1045,6 @@ class _MultiEnvironmentGemm:
                     "rebuild/install SUMMIT from the current source before running "
                     "--gxe-env-cols with --gxe-native-backend direct."
                 )
-        descriptor = None
         try:
             if self.cpu_placement is not None:
                 self.cpu_placement = _recheck_openmp_cpu_placement(
@@ -1089,7 +1060,6 @@ class _MultiEnvironmentGemm:
                         "The shared GxE executor configured an unexpected BLAS "
                         "thread count."
                     )
-            descriptor, binary_record = _loaded_native_binary_record(gxeldcore)
             build_info = dict(gxeldcore.build_info())
             if (
                 build_info.get("multi_environment_native_kernel_supported")
@@ -1162,105 +1132,6 @@ class _MultiEnvironmentGemm:
                 build_info.get("blas_runtime_isolation", "unknown")
             )
             runtime_record = _validate_native_blas_runtime(build_info)
-            source_commit = build_info.get("source_commit")
-            source_tree_sha256 = build_info.get("source_tree_sha256")
-            if not (
-                isinstance(source_commit, str)
-                and len(source_commit) == 40
-                and all(character in "0123456789abcdef" for character in source_commit)
-                and _is_canonical_sha256(source_tree_sha256)
-            ):
-                raise RuntimeError(
-                    "The protected shared GxE extension lacks exact source provenance."
-                )
-            compile_options = {
-                key: build_info.get(key)
-                for key in (
-                    "api_version", "compiler_id", "compiler_version", "build_type",
-                    "blas_vendor", "cxx_standard", "optimization",
-                    "architecture_tuning", "openmp_enabled",
-                    "native_optimization_enabled", "platform",
-                    "blas_runtime_config", "gemm_execution_mode",
-                    "protected_pair_input_mode", "blas_runtime_isolation",
-                    "blas_runtime_threads", "blas_runtime_threading_layer",
-                    "blas_runtime_worker_affinity_policy",
-                    "gemm_integrity_enabled", "gemm_checksum_enabled",
-                    "private_openblas_archive_sha256",
-                    "private_blas_backend", "private_blas_archive_sha256",
-                    "private_blas_source_commit",
-                    "private_blas_source_tree_sha256",
-                    "private_blas_config_family", "private_blas_header_sha256",
-                    "private_blas_cblas_header_sha256",
-                    "blas_runtime_thread_strategy", "blas_runtime_thread_ways",
-                    "blas_runtime_owner_thread_enforced",
-                    "blas_runtime_owner_thread_configured",
-                    "blas_runtime_environment_immutable",
-                    "blas_runtime_environment_contract",
-                    "blas_runtime_tls_enabled",
-                    "blas_runtime_corename", "gemm_telemetry_schema_version",
-                    "gemm_telemetry_capacity",
-                    "gemm_vendor_entry_outer_openmp_guard",
-                    "gemm_integrity_minimum_vendor_flops",
-                    "gemm_operand_numa_sampling_method",
-                    "gemm_operand_numa_sample_limit_per_operand",
-                    "native_integrity_snapshot_numa_contract_supported",
-                    "native_integrity_snapshot_numa_contract_schema",
-                    "native_integrity_snapshot_numa_query_chunk_page_limit",
-                    "native_gemm_output_numa_contract_supported",
-                    "native_gemm_output_numa_contract_schema",
-                    "native_gemm_output_numa_query_chunk_page_limit",
-                    "native_gemm_output_numa_evidence_capacity",
-                    "multi_environment_native_kernel_supported",
-                    "multi_environment_native_kernel_schema",
-                    "multi_environment_native_kernel_execution",
-                    "multi_environment_direct_context_supported",
-                    "multi_environment_direct_context_schema",
-                    "multi_environment_direct_context_execution",
-                    "multi_environment_direct_context_max_vendor_probe_chunk",
-                    "multi_environment_direct_context_mailman_maximum_probes",
-                    "optimized_fp64_layout",
-                    "optimized_fp64_row_pair_input_mode",
-                    "openmp_effective_capacity_policy",
-                    "openmp_placement_contract_supported",
-                    "openmp_placement_contract_schema",
-                    "openmp_placement_contract_configured",
-                    "openmp_placement_contract_immutable",
-                    "openmp_placement_probe_vendor_calls",
-                    "openmp_placement_contract_evidence",
-                )
-            }
-            compile_options["execution_mode"] = (
-                "shared_multi_environment_native_end_to_end"
-            )
-            compile_options["full_precision_layout"] = self.full_precision_layout
-            compile_options["selected_source_gemm_layout"] = "column_major_nn"
-            compile_options["selected_target_gemm_layout"] = "column_major_tn"
-            compile_options["source_to_target_layout_transition"] = "none"
-            compile_options["loaded_blas_runtime"] = dict(runtime_record)
-            template = {
-                "schema_version": _BACKEND_PROVENANCE_SCHEMA_VERSION,
-                "artifact_stage": "feature_construction",
-                "backend_name": str(
-                    build_info.get("backend_name", "gxeldcore_direct")
-                ),
-                "backend_version": str(build_info.get("backend_version", "unknown")),
-                "source_commit": source_commit,
-                "source_tree_sha256": source_tree_sha256,
-                "native_binary_sha256": binary_record["sha256"],
-                "compile_options": compile_options,
-                "native_workspace_cap_bytes": int(
-                    estimator.native_workspace_gib * 1024**3
-                ),
-                "configured_target_panel_columns": int(
-                    estimator.native_target_panel_columns
-                ),
-                "actual_global_2b_source_columns": 0,
-                "actual_jackknife_2b_source_columns": 0,
-                "actual_target_source_columns": 0,
-            }
-            _validate_backend_provenance(
-                template, expected_stage="feature_construction"
-            )
             output_contract_keys = (
                 "native_gemm_output_numa_contract_supported",
                 "native_gemm_output_numa_contract_schema",
@@ -1315,19 +1186,11 @@ class _MultiEnvironmentGemm:
                     "output NUMA contract."
                 )
         except Exception:
-            if descriptor is not None:
-                os.close(descriptor)
             raise
         self._module = gxeldcore
-        self._descriptor = descriptor
-        self._binary_record = binary_record
-        self._template = template
-        self.backend_name = str(template["backend_name"])
+        self.backend_name = str(build_info.get("backend_name", "gxeldcore_direct"))
         self.blas_vendor = str(build_info.get("blas_vendor", "unknown"))
-        self.backend_version = str(template["backend_version"])
-        self.backend_build_sha256 = str(binary_record["sha256"])
-        self.source_commit = str(source_commit)
-        self.source_tree_sha256 = str(source_tree_sha256)
+        self.backend_version = str(build_info.get("backend_version", "unknown"))
         self._initialize_native_telemetry()
         self._initialize_native_gemm_output_numa_evidence()
 
@@ -1353,9 +1216,6 @@ class _MultiEnvironmentGemm:
         self._multi_environment_direct_context_info = None
         self._multi_environment_kernel = None
         self._multi_environment_kernel_info = None
-        if self._descriptor is not None:
-            os.close(self._descriptor)
-            self._descriptor = None
 
     def _initialize_native_telemetry(self) -> None:
         """Enable native vendor-call telemetry (introduced in API 7)."""
@@ -1529,14 +1389,14 @@ class _MultiEnvironmentGemm:
                     "Authenticated placement requires contracted and complete "
                     "native GEMM output NUMA evidence."
                 )
-            legacy_keys = {
+            uncontracted_keys = {
                 "schema", "schema_version", "applicable", "operand_role",
                 "contract_required", "complete", "call_id", "logical_rows",
                 "logical_columns", "storage_layout", "logical_byte_count",
                 "allocation_mode",
             }
             if raw.get("schema_version") == 2:
-                legacy_keys.add("capacity_byte_count")
+                uncontracted_keys.add("capacity_byte_count")
                 capacity = raw.get("capacity_byte_count")
                 if (
                     isinstance(capacity, bool)
@@ -1547,7 +1407,7 @@ class _MultiEnvironmentGemm:
                         "The native GEMM output capacity accounting is not exact."
                     )
             if (
-                set(raw) != legacy_keys
+                set(raw) != uncontracted_keys
                 or raw.get("contract_required") is not False
                 or raw.get("complete") is not False
                 or raw.get("allocation_mode") != "legacy_posix_memalign"
@@ -1562,7 +1422,7 @@ class _MultiEnvironmentGemm:
                 not in {"column_major", "row_major"}
             ):
                 raise RuntimeError(
-                    "The legacy native GEMM output allocation evidence is not exact."
+                    "The uncontracted native GEMM output allocation evidence is malformed."
                 )
         evidence = _json_safe(dict(raw))
         if (
@@ -1707,9 +1567,6 @@ class _MultiEnvironmentGemm:
             )
             record.setdefault("backend", self.backend_name)
             record.setdefault("backend_version", self.backend_version)
-            record.setdefault("backend_build_sha256", self.backend_build_sha256)
-            record.setdefault("native_source_commit", self.source_commit)
-            record.setdefault("native_source_tree_sha256", self.source_tree_sha256)
             record.setdefault("arithmetic_dtype", self.arithmetic_dtype.name)
             record.setdefault("requested_storage_dtype", self.storage_dtype.name)
             record.setdefault("requested_blas_threads", self.threads)
@@ -2005,9 +1862,6 @@ class _MultiEnvironmentGemm:
             "bounded": True,
             "backend": self.backend_name,
             "backend_version": self.backend_version,
-            "backend_build_sha256": self.backend_build_sha256,
-            "native_source_commit": self.source_commit,
-            "native_source_tree_sha256": self.source_tree_sha256,
             "arithmetic_dtype": self.arithmetic_dtype.name,
             "requested_storage_dtype": self.storage_dtype.name,
             "requested_sketch_storage_dtype": self.storage_dtype.name,
@@ -2143,30 +1997,6 @@ class _MultiEnvironmentGemm:
             report["cpu_placement"] = dict(self.cpu_placement)
             report["cpu_placement_complete"] = True
         return report
-
-    def provenance_template(self) -> dict | None:
-        if not self.protected:
-            return None
-        if (
-            self._descriptor is None
-            or self._binary_record is None
-            or self._template is None
-        ):
-            raise RuntimeError("The protected shared GxE executor is closed.")
-        observed = os.fstat(self._descriptor)
-        identity = (
-            observed.st_dev, observed.st_ino, observed.st_size,
-            observed.st_mtime_ns, observed.st_ctime_ns,
-        )
-        if identity != tuple(self._binary_record["identity"]):
-            raise RuntimeError(
-                "The loaded protected GxE extension inode changed during execution."
-            )
-        if _sha256_descriptor(self._descriptor) != self._binary_record["sha256"]:
-            raise RuntimeError(
-                "The loaded protected GxE extension bytes changed during execution."
-            )
-        return dict(self._template)
 
     def _optimized_layout_telemetry_status(self) -> dict:
         """Retain the telemetry schema while reporting current-layout records."""
@@ -2541,10 +2371,6 @@ class _MultiEnvironmentGemm:
         self._multi_environment_kernel_repaired_columns = 0
         self._multi_environment_kernel_checksum_recomputed_columns = 0
         self._multi_environment_kernel_roundoff_only_columns = 0
-        if self._template is not None:
-            self._template["compile_options"][
-                "multi_environment_native_kernel_info"
-            ] = dict(info)
         return dict(info)
 
     def initialize_multi_environment_direct_context(
@@ -2638,7 +2464,7 @@ class _MultiEnvironmentGemm:
             ddof=int(first.ddof),
             total_probes=int(first.nvecs),
             eps_var=float(first.eps_var),
-            standardized=first.kernel_mode == "standardized",
+            standardized=first.kernel_mode == "standardized_projected",
             dense_blas_hybrid=dense_blas_hybrid,
             threads=self.threads,
         )
@@ -2848,13 +2674,6 @@ class _MultiEnvironmentGemm:
                 component_bytes["mailman_worker_scratch"]
             ),
         }
-        if self._template is not None:
-            self._template["compile_options"]["execution_mode"] = (
-                "descriptor_owned_multi_environment_native_end_to_end"
-            )
-            self._template["compile_options"][
-                "multi_environment_direct_context_info"
-            ] = dict(info)
         return dict(info)
 
     def run_multi_environment_direct_context(self) -> dict:
@@ -3593,7 +3412,7 @@ def _prepare_feature_block(
         coefficients = executor.tn(estimator.C_int, feature)
         feature -= executor.nn(estimator.C_int, coefficients)
     feature -= feature.mean(axis=0, keepdims=True)
-    if apply_scale and estimator.kernel_mode == "standardized":
+    if apply_scale and estimator.kernel_mode == "standardized_projected":
         scales = (
             estimator.inv_sqrt_resvar_w_all
             if interaction else estimator.inv_sqrt_resvar_x_all
@@ -3852,7 +3671,7 @@ def _accumulate_algebraic_feature_block(
                 f"and regenerate the complete batch. Examples: {', '.join(examples)}."
             )
 
-        if estimator.kernel_mode == "standardized":
+        if estimator.kernel_mode == "standardized_projected":
             scale_x = 1.0 / np.sqrt(varx)
             scale_w = 1.0 / np.sqrt(varw)
         else:
@@ -3913,9 +3732,9 @@ def _accumulate_native_feature_block(
     """Store one block of feature invariants computed by the native kernel."""
     if not estimators:
         raise RuntimeError("The native feature block has no environments.")
-    standardized = estimators[0].kernel_mode == "standardized"
+    standardized = estimators[0].kernel_mode == "standardized_projected"
     if any(
-        (estimator.kernel_mode == "standardized") != standardized
+        (estimator.kernel_mode == "standardized_projected") != standardized
         for estimator in estimators
     ):
         raise RuntimeError(
@@ -4023,7 +3842,7 @@ def _accumulate_prepared_feature_block(
             f"complete batch. Examples: {', '.join(examples)}."
         )
 
-    if estimator.kernel_mode == "standardized":
+    if estimator.kernel_mode == "standardized_projected":
         state["inv_x"][start:stop] = 1.0 / np.sqrt(varx)
         state["inv_w"][start:stop] = 1.0 / np.sqrt(varw)
     else:
@@ -4184,7 +4003,7 @@ def _accumulate_fused_feature_moments(
             f"complete batch. Examples: {', '.join(examples)}."
         )
 
-    if estimator.kernel_mode == "standardized":
+    if estimator.kernel_mode == "standardized_projected":
         inv_x = 1.0 / np.sqrt(varx)
         inv_w = 1.0 / np.sqrt(varw)
     else:
@@ -4377,7 +4196,10 @@ def _finish_feature_state(estimator: GenomewideEnvLDScore, state: dict) -> None:
             f"Projected features for environment {estimator.env_name!r} leak into "
             f"the fixed-effect span: X={max_leak_x:.6g}, W={max_leak_w:.6g}."
         )
-    if estimator.kernel_mode == "standardized" and max(max_norm_x, max_norm_w) > 1.0e-9:
+    if (
+        estimator.kernel_mode == "standardized_projected"
+        and max(max_norm_x, max_norm_w) > 1.0e-9
+    ):
         raise RuntimeError(
             f"Post-projection normalization failed for environment "
             f"{estimator.env_name!r}: X={max_norm_x:.6g}, W={max_norm_w:.6g}."
@@ -4496,13 +4318,8 @@ def _require_common_contract(estimators: Sequence[GenomewideEnvLDScore]) -> None
                 "Multi-environment construction owns one shared decoded genotype "
                 "stream and therefore requires Python-orchestrated BLAS estimators."
             )
-        if estimator.pheno is not None or estimator.feature_cache_path is not None:
-            raise ValueError(
-                "Multi-environment reference construction is phenotype-free and "
-                "does not consume feature caches."
-            )
-        if estimator.shard_mode:
-            raise ValueError("Multi-environment reference construction does not use shards.")
+        if estimator.pheno is not None:
+            raise ValueError("Multi-environment reference construction is phenotype-free.")
         if not np.array_equal(first.row_sel, estimator.row_sel):
             raise ValueError(
                 "Selected environments do not retain exactly the same complete-case "
@@ -5603,26 +5420,23 @@ def _publish_json_no_replace(payload: dict, target: Path) -> tuple[int, int]:
         temporary_path.unlink(missing_ok=True)
 
 
-def _published_file_identity(path: Path) -> tuple[Path, int, int, str]:
+def _published_file_identity(path: Path) -> tuple[Path, int, int]:
     observed = path.stat(follow_symlinks=False)
-    return path, observed.st_dev, observed.st_ino, GenomewideEnvLDScore._file_sha256(
-        str(path)
-    )
+    return path, observed.st_dev, observed.st_ino
 
 
 def _rollback_published_files(
-    published: Sequence[tuple[Path, int, int, str]],
+    published: Sequence[tuple[Path, int, int]],
 ) -> None:
-    """Remove only unchanged files published by this failed batch."""
-    for path, device, inode, expected_hash in reversed(published):
+    """Remove only files whose published inode is still ours."""
+    for path, device, inode in reversed(published):
         try:
             observed = path.stat(follow_symlinks=False)
         except FileNotFoundError:
             continue
         if observed.st_dev != device or observed.st_ino != inode:
             continue
-        if GenomewideEnvLDScore._file_sha256(str(path)) == expected_hash:
-            path.unlink(missing_ok=True)
+        path.unlink(missing_ok=True)
 
 
 def _validated_complete_memory_plan(value: Mapping) -> dict:
@@ -5846,7 +5660,7 @@ def combine_multi_environment_reference_batches(
     payload_decode_reports: list[dict | None] = []
     payload_packed_source_summaries: list[dict | None] = []
     payload_memory_plans: list[dict | None] = []
-    resolved_references: dict[str, tuple[Path, str]] = {}
+    resolved_references: dict[str, Path] = {}
     current_layout_metadata = {
         "source_panel_memory_order": "F",
         "target_panel_memory_order": "F",
@@ -5924,9 +5738,6 @@ def combine_multi_environment_reference_batches(
         "arithmetic_dtype",
         "requested_storage_dtype",
         "gemm_backend",
-        "gemm_backend_build_sha256",
-        "native_source_commit",
-        "native_source_tree_sha256",
         "native_gemm_integrity_enabled",
         "native_gemm_checksum_enabled",
         "native_blas_runtime_isolation",
@@ -5948,64 +5759,40 @@ def combine_multi_environment_reference_batches(
             raise ValueError(f"Unexpected multi-environment batch kind in {source}.")
         if int(observed.get("schema_version", -1)) != 1:
             raise ValueError(f"Unsupported multi-environment batch schema in {source}.")
-        declared_layout = observed.get("full_precision_layout", "current")
+        declared_layout = observed.get("full_precision_layout")
         if declared_layout != "current":
             raise ValueError(
                 f"Unsupported full-precision layout in {source}: "
                 f"{declared_layout!r}."
             )
-        # Schema-1 current-layout manifests predate these descriptive fields.
-        # Normalize only absent values; an explicit contradictory value is not
-        # a legacy omission and must not be relabeled as the established path.
         for key, value in current_layout_metadata.items():
-            if key in observed and observed[key] != value:
+            if observed.get(key) != value:
                 raise ValueError(
                     f"Current-layout manifest {source} reports noncanonical "
-                    f"{key}={observed[key]!r}; expected {value!r}."
+                    f"{key}={observed.get(key)!r}; expected {value!r}."
                 )
-            observed[key] = value
 
         packed_key = "modeled_packed_source_panel_gib"
         seal_key = "modeled_target_pair_sealing_live_peak_gib"
-        if packed_key not in observed:
-            # For the established layout, the legacy resident-sketch field is
-            # exactly the one packed [X/W] source panel P.
-            observed[packed_key] = optional_nonnegative_gib(
-                observed, "modeled_total_resident_sketch_workspace_gib"
-            )
-        else:
-            observed[packed_key] = optional_nonnegative_gib(observed, packed_key)
-        if seal_key not in observed:
-            protected = observed.get("protected_native_gemm")
-            packed_gib = observed[packed_key]
-            observed[seal_key] = (
-                (3.0 if protected is True else 2.0) * packed_gib
-                if packed_gib is not None and isinstance(protected, bool)
-                else None
-            )
-        else:
-            observed[seal_key] = optional_nonnegative_gib(observed, seal_key)
+        observed[packed_key] = optional_nonnegative_gib(observed, packed_key)
+        observed[seal_key] = optional_nonnegative_gib(observed, seal_key)
+        if observed[packed_key] is None or observed[seal_key] is None:
+            raise ValueError(f"Current memory fields are required in {source}.")
         performance = observed.get("performance_telemetry")
-        if performance is not None:
-            if not isinstance(performance, Mapping):
-                raise ValueError(
-                    f"Malformed performance telemetry in {source}."
-                )
-            performance_layout = performance.get("full_precision_layout")
-            if performance_layout not in (None, "current"):
-                raise ValueError(
-                    "Performance telemetry full_precision_layout disagrees "
-                    f"with group manifest {source}."
-                )
-            if not (
-                performance.get("phase_telemetry_complete") is True
-                and performance.get("telemetry_complete") is True
-                and performance.get("capture_boundary")
-                == "post_output_artifact_publication_pre_batch_manifest"
-            ):
-                raise ValueError(
-                    f"Incomplete final performance telemetry in {source}."
-                )
+        if not isinstance(performance, Mapping):
+            raise ValueError(f"Malformed performance telemetry in {source}.")
+        if performance.get("full_precision_layout") != "current":
+            raise ValueError(
+                "Performance telemetry full_precision_layout disagrees "
+                f"with group manifest {source}."
+            )
+        if not (
+            performance.get("phase_telemetry_complete") is True
+            and performance.get("telemetry_complete") is True
+            and performance.get("capture_boundary")
+            == "post_output_artifact_publication_pre_batch_manifest"
+        ):
+            raise ValueError(f"Incomplete final performance telemetry in {source}.")
         group_placement = validated_optional_cpu_placement(
             observed, source_description=f"group manifest {source}"
         )
@@ -6186,11 +5973,8 @@ def combine_multi_environment_reference_batches(
                         f"Contracted NUMA-bound BED decode evidence is malformed "
                         f"in {source}."
                     ) from exc
-        raw_memory_plan = observed.get("complete_process_memory_plan")
-        group_memory_plan = (
-            None
-            if raw_memory_plan is None
-            else _validated_complete_memory_plan(raw_memory_plan)
+        group_memory_plan = _validated_complete_memory_plan(
+            observed.get("complete_process_memory_plan")
         )
         if payloads:
             baseline = payloads[0]
@@ -6213,9 +5997,13 @@ def combine_multi_environment_reference_batches(
         payload_decode_reports.append(group_decode_report)
         payload_memory_plans.append(group_memory_plan)
         for record in observed.get("references", ()):
+            if not isinstance(record, Mapping) or set(record) != {
+                "environment",
+                "reference",
+            }:
+                raise ValueError(f"Malformed reference declaration in {source}.")
             environment = str(record.get("environment", ""))
-            declared_hash = str(record.get("sha256", ""))
-            if not environment or not _is_canonical_sha256(declared_hash):
+            if not environment:
                 raise ValueError(f"Malformed reference declaration in {source}.")
             if environment in resolved_references:
                 raise ValueError(
@@ -6225,12 +6013,6 @@ def combine_multi_environment_reference_batches(
             if not reference.is_file() or reference.is_symlink():
                 raise FileNotFoundError(
                     f"Declared environment reference is missing or not regular: {reference}."
-                )
-            actual_hash = GenomewideEnvLDScore._file_sha256(str(reference))
-            if actual_hash != declared_hash:
-                raise RuntimeError(
-                    f"Environment reference hash mismatch for {reference}: "
-                    f"expected {declared_hash}, observed {actual_hash}."
                 )
             reference_payload = json.loads(reference.read_text(encoding="utf-8"))
             if not isinstance(reference_payload, Mapping):
@@ -6295,7 +6077,7 @@ def combine_multi_environment_reference_batches(
                             f"environment reference {reference} is incomplete or "
                             "disagrees with its group manifest."
                         )
-            resolved_references[environment] = (reference, declared_hash)
+            resolved_references[environment] = reference
 
         payload_packed_source_summaries.append(
             group_packed_source_summary
@@ -6315,11 +6097,7 @@ def combine_multi_environment_reference_batches(
         raise ValueError(
             "Authenticated parallel environment groups require complete CPU placement evidence."
         )
-    memory_plan_presence = [plan is not None for plan in payload_memory_plans]
-    if any(memory_plan_presence) and not all(memory_plan_presence):
-        raise ValueError(
-            "Environment-group manifests mix current and legacy memory plans."
-        )
+    memory_plan_presence = [True for _plan in payload_memory_plans]
     numa_presence = [record is not None for record in payload_numa_groups]
     if require_cpu_placement and not all(numa_presence):
         raise ValueError(
@@ -6391,21 +6169,12 @@ def combine_multi_environment_reference_batches(
         "checksum_recomputed_gemm_output_columns",
         "roundoff_only_gemm_output_columns",
     )
-    integrity_resolution_presence = []
     for payload in payloads:
-        present = [key in payload for key in integrity_resolution_keys]
-        if any(present) and not all(present):
+        if any(key not in payload for key in integrity_resolution_keys):
             raise ValueError(
                 "Environment-group integrity resolution counters are incomplete."
             )
-        integrity_resolution_presence.append(all(present))
-    if any(integrity_resolution_presence) and not all(
-        integrity_resolution_presence
-    ):
-        raise ValueError(
-            "Environment groups mix legacy and current integrity resolution counters."
-        )
-    has_integrity_resolution = all(integrity_resolution_presence)
+    has_integrity_resolution = True
     observed_read_presence = [
         payload.get("observed_genotype_block_reads") is not None
         for payload in payloads
@@ -6428,7 +6197,6 @@ def combine_multi_environment_reference_batches(
     group_records = [
         {
             "manifest": os.path.relpath(source, start=target.parent),
-            "sha256": GenomewideEnvLDScore._file_sha256(str(source)),
             "environments": [
                 str(record["environment"]) for record in payload["references"]
             ],
@@ -6508,7 +6276,6 @@ def combine_multi_environment_reference_batches(
                     for key in (
                         "schema_version",
                         "backend",
-                        "backend_build_sha256",
                         "arithmetic_dtype",
                         "requested_storage_dtype",
                         "full_precision_layout",
@@ -6571,11 +6338,6 @@ def combine_multi_environment_reference_batches(
         "arithmetic_dtype": baseline.get("arithmetic_dtype"),
         "requested_storage_dtype": baseline.get("requested_storage_dtype"),
         "gemm_backend": baseline.get("gemm_backend"),
-        "gemm_backend_build_sha256": baseline.get(
-            "gemm_backend_build_sha256"
-        ),
-        "native_source_commit": baseline.get("native_source_commit"),
-        "native_source_tree_sha256": baseline.get("native_source_tree_sha256"),
         "native_gemm_integrity_enabled": baseline[
             "native_gemm_integrity_enabled"
         ],
@@ -6689,9 +6451,8 @@ def combine_multi_environment_reference_batches(
             {
                 "environment": environment,
                 "reference": os.path.relpath(
-                    resolved_references[environment][0], start=target.parent
+                    resolved_references[environment], start=target.parent
                 ),
-                "sha256": resolved_references[environment][1],
             }
             for environment in order
         ],
@@ -6789,14 +6550,10 @@ def _generate_multi_environment_references(
 ) -> Path:
     first = estimators[0]
     first._shared_missingness_estimators = tuple(estimators)
-    shared_provenance = executor.provenance_template()
     for estimator in estimators:
         if executor.cpu_placement is not None:
             estimator.cpu_placement = dict(executor.cpu_placement)
             estimator.cpu_placement_complete = True
-        estimator.shared_backend_provenance = (
-            None if shared_provenance is None else dict(shared_provenance)
-        )
     target = Path(batch_manifest).expanduser().resolve()
     if target.exists():
         raise FileExistsError(f"Refusing existing multi-environment manifest: {target}.")
@@ -6804,7 +6561,6 @@ def _generate_multi_environment_references(
         estimator._assert_output_paths_available()
 
     first._assert_construction_genotype_state()
-    initial_provenance = first._genotype_provenance()
     blocks = first._make_compute_blocks()
     common_basis, environment_directions = _environment_directions(estimators)
     feature_environment_constants = []
@@ -6879,8 +6635,8 @@ def _generate_multi_environment_references(
 
     # Freeze the authenticated decode contract before constructing the native
     # descriptor owner.  Contracted runs allocate, bind, populate, and verify
-    # every decoded block wholly inside C++; unplaced runs retain the legacy
-    # native allocation without making locality claims.
+    # every decoded block wholly inside C++; unplaced runs retain an
+    # uncontracted native allocation without making locality claims.
     bound_decode_nodes = None
     feature_states: list[dict] = []
     with executor.phase(
@@ -6944,13 +6700,6 @@ def _generate_multi_environment_references(
                     environment_directions,
                     estimators,
                 )
-            native_provenance = executor.provenance_template()
-            if native_provenance is None:
-                raise RuntimeError(
-                    "The initialized multi-environment native kernel lost provenance."
-                )
-            for estimator in estimators:
-                estimator.shared_backend_provenance = dict(native_provenance)
         if executor._multi_environment_direct_context is None:
             feature_states = [
                 _new_feature_state(estimator) for estimator in estimators
@@ -7196,9 +6945,6 @@ def _generate_multi_environment_references(
     with executor.phase("feature_finalization_fp64"):
         for estimator, state in zip(estimators, feature_states, strict=True):
             _finish_feature_state(estimator, state)
-            estimator.feature_backend_provenance = estimator._backend_provenance(
-                "feature_construction"
-            )
     del feature_states
     del feature_environment_constants
     algebraic_feature_basis_bytes = (
@@ -7285,9 +7031,6 @@ def _generate_multi_environment_references(
             ),
             "complete_process_memory_plan": complete_memory_plan,
             "gemm_backend": executor.backend_name,
-            "gemm_backend_build_sha256": executor.backend_build_sha256,
-            "native_source_commit": executor.source_commit,
-            "native_source_tree_sha256": executor.source_tree_sha256,
             "multi_environment_count": len(estimators),
             "multi_environment_tiles": len(environment_tiles),
             "multi_environment_max_tile_size": max_environment_tile,
@@ -7320,7 +7063,6 @@ def _generate_multi_environment_references(
             ),
             "source_columns": int(first.nbins * max_vt),
             "actual_global_2b_source_columns": int(2 * first.nbins * max_vt),
-            "actual_jackknife_2b_source_columns": 0,
             "target_source_columns": int(2 * first.nbins * max_vt),
             "blas_threads": int(first.num_threads),
             "bed_reader_threads": int(first.decode_threads),
@@ -7740,13 +7482,7 @@ def _generate_multi_environment_references(
         )
     first._assert_construction_genotype_state()
     if executor.protected:
-        # Re-hash the still-loaded extension immediately before sealing any
-        # scientific bundle, then expose the aggregate repair count in every
-        # independently consumable reference.
-        with executor.phase("native_binary_integrity_hashing"):
-            shared_provenance = executor.provenance_template()
         for estimator in estimators:
-            estimator.shared_backend_provenance = dict(shared_provenance)
             estimator.resource_estimates[
                 "native_repaired_gemm_output_columns"
             ] = int(executor.repaired_output_columns)
@@ -7830,16 +7566,6 @@ def _generate_multi_environment_references(
                 for value in accumulator.values():
                     value *= inverse_probe_count
 
-    # Variant metadata and the selected sample-ID byte stream are identical
-    # across this validated common cohort.  Hash each shared prefix once;
-    # environment values and fixed-effect designs remain independently bound.
-    with executor.phase("shared_input_identity_hashing"):
-        shared_variant_digest = first._variant_digest()
-        shared_analysis_sample_prefix = first._analysis_sample_fingerprint_prefix()
-    for estimator in estimators:
-        estimator._shared_variant_digest = shared_variant_digest
-        estimator._shared_analysis_sample_prefix = shared_analysis_sample_prefix
-
     compact_performance = executor.performance_report(
         estimator_phase_timings=_aggregate_estimator_phase_timings(estimators),
         include_records=False,
@@ -7888,7 +7614,7 @@ def _generate_multi_environment_references(
         estimator.resource_estimates["performance_telemetry"] = compact_performance
 
     references = []
-    published: list[tuple[Path, int, int, str]] = []
+    published: list[tuple[Path, int, int]] = []
     try:
         for index, estimator in enumerate(estimators):
             scores = accumulators[index]
@@ -7904,21 +7630,17 @@ def _generate_multi_environment_references(
                         lambda estimator=estimator, scores=scores:
                         estimator._finalize_ldscore_outputs(scores)
                     ),
-                    expected_provenance=initial_provenance,
-                    provenance_preverified=True,
                 )
-            with executor.phase("output_identity_hashing", output_context):
+            with executor.phase("output_validation", output_context):
                 published.extend(
                     _published_file_identity(path.resolve())
                     for path in estimator._planned_output_paths()
                 )
                 reference = Path(f"{estimator.outpath}.gxe.ref.json").resolve()
-                reference_sha256 = estimator._file_sha256(str(reference))
             references.append(
                 {
                     "environment": estimator.env_name,
                     "reference": os.path.relpath(reference, start=target.parent),
-                    "sha256": reference_sha256,
                 }
             )
 
@@ -7971,9 +7693,6 @@ def _generate_multi_environment_references(
             "arithmetic_dtype": executor.arithmetic_dtype.name,
             "requested_storage_dtype": executor.storage_dtype.name,
             "gemm_backend": executor.backend_name,
-            "gemm_backend_build_sha256": executor.backend_build_sha256,
-            "native_source_commit": executor.source_commit,
-            "native_source_tree_sha256": executor.source_tree_sha256,
             "native_gemm_integrity_enabled": bool(executor.integrity_enabled),
             "native_gemm_checksum_enabled": bool(executor.checksum_enabled),
             "native_blas_runtime_isolation": executor.runtime_isolation,
@@ -8097,15 +7816,9 @@ def _generate_multi_environment_references(
                 payload["numa_bound_bed_decode"] = _decode_report_for_output(
                     decode_evidence, include_records=False
                 )
-        # One final shared hash seals all environment bundles against the same
-        # input bytes immediately before the batch manifest becomes visible.
-        first._assert_genotype_provenance_unchanged(initial_provenance)
+        first._assert_construction_genotype_state()
         _publish_json_no_replace(payload, target)
     except Exception:
         _rollback_published_files(published)
         raise
-    finally:
-        for estimator in estimators:
-            del estimator._shared_variant_digest
-            del estimator._shared_analysis_sample_prefix
     return target

@@ -7410,8 +7410,6 @@ public:
                            nb_vec1_ro<double> scale_w,
                            nb_vec1_ro<double> sqrt_annotation,
                            nb_mat2f_ro<double> probes,
-                           nb_vec1_ro<int32_t> group_ids,
-                           int num_groups,
                            bool require_missing_free) const {
         auto guard = acquire_call_lock();
         validate_block(blk_start, blk_end);
@@ -7421,14 +7419,10 @@ public:
         if (v <= 0 || checked_blas_dim(probes.shape(0), "source variants") != l ||
             checked_blas_dim(scale_x.shape(0), "source scale_x") != l ||
             checked_blas_dim(scale_w.shape(0), "source scale_w") != l ||
-            checked_blas_dim(sqrt_annotation.shape(0), "source annotation") != l ||
-            checked_blas_dim(group_ids.shape(0), "source groups") != l) {
+            checked_blas_dim(sqrt_annotation.shape(0), "source annotation") != l) {
             throw std::runtime_error("GxE native source input shape mismatch");
         }
-        if (num_groups < 1 || num_groups > 4) {
-            throw std::runtime_error("GxE native source supports one to four local groups");
-        }
-        const size_t columns_size = checked_mul(static_cast<size_t>(num_groups), static_cast<size_t>(v), "source columns");
+        const size_t columns_size = static_cast<size_t>(v);
         const int columns = checked_blas_dim(columns_size, "source columns");
         const size_t fused_columns_size = checked_mul(
             2U, columns_size, "fused source columns"
@@ -7444,7 +7438,7 @@ public:
         elements = checked_add(elements, checked_mul(2U, checked_mul(static_cast<size_t>(n_), columns_size, "source outputs"), "source outputs"), "source workspace");
         elements = checked_add(elements, checked_mul(2U, checked_mul(static_cast<size_t>(q_), columns_size, "source projection"), "source projection"), "source workspace");
         elements = checked_add(elements, probe_elements, "source input snapshots");
-        elements = checked_add(elements, checked_mul(4U, static_cast<size_t>(l), "source vector snapshots"), "source input snapshots");
+        elements = checked_add(elements, checked_mul(3U, static_cast<size_t>(l), "source vector snapshots"), "source input snapshots");
         elements = checked_add(
             elements,
             std::max(
@@ -7473,10 +7467,6 @@ public:
         const std::vector<double> probe_snapshot(
             probes.data(), probes.data() + probe_elements
         );
-        const std::vector<int32_t> group_snapshot(
-            group_ids.data(), group_ids.data() + static_cast<size_t>(l)
-        );
-
         double* fused_source = nullptr;
         auto fused_source_out = make_owned_numpy_mat2f<double>(
             static_cast<size_t>(n_), fused_columns_size, &fused_source
@@ -7509,12 +7499,7 @@ public:
             const double* sxp = scale_x_snapshot.data();
             const double* swp = scale_w_snapshot.data();
             const double* ap = annotation_snapshot.data();
-            const int32_t* gp = group_snapshot.data();
             for (int j = 0; j < l; ++j) {
-                const int group = static_cast<int>(gp[j]);
-                if (group < 0 || group >= num_groups) {
-                    throw std::runtime_error("GxE native source group ID is out of range");
-                }
                 if (!std::isfinite(sxp[j]) || !std::isfinite(swp[j]) ||
                     sxp[j] <= 0.0 || swp[j] <= 0.0 ||
                     !std::isfinite(ap[j]) || ap[j] < 0.0) {
@@ -7525,7 +7510,7 @@ public:
                     if (!std::isfinite(probe)) {
                         throw std::runtime_error("GxE native source probe contains a non-finite value");
                     }
-                    const size_t index = static_cast<size_t>(group * v + c) * static_cast<size_t>(l) + static_cast<size_t>(j);
+                    const size_t index = static_cast<size_t>(c) * static_cast<size_t>(l) + static_cast<size_t>(j);
                     weighted[index] = probe * ap[j] * sxp[j];
                     // Form the interaction weight directly.  Reusing the X
                     // weight through ``*(scale_w / scale_x)`` is
@@ -7834,21 +7819,8 @@ public:
                                      nb_vec1_ro<double> scale_w,
                                      const ProjectedPanel& sources,
                                      bool require_missing_free) const {
-        return target_projected_panels(
-            blk_start, blk_end, scale_x, scale_w, sources, nullptr,
-            require_missing_free
-        );
-    }
-
-    nb::tuple target_projected_pair_block(int blk_start,
-                                          int blk_end,
-                                          nb_vec1_ro<double> scale_x,
-                                          nb_vec1_ro<double> scale_w,
-                                          const ProjectedPanel& first,
-                                          const ProjectedPanel& second,
-                                          bool require_missing_free) const {
-        return target_projected_panels(
-            blk_start, blk_end, scale_x, scale_w, first, &second,
+        return target_projected_panel(
+            blk_start, blk_end, scale_x, scale_w, sources,
             require_missing_free
         );
     }
@@ -8354,25 +8326,19 @@ private:
         }
     }
 
-    nb::tuple target_projected_panels(
+    nb::tuple target_projected_panel(
         int blk_start,
         int blk_end,
         nb_vec1_ro<double> scale_x,
         nb_vec1_ro<double> scale_w,
-        const ProjectedPanel& first,
-        const ProjectedPanel* second,
+        const ProjectedPanel& sources,
         bool require_missing_free) const {
         auto guard = acquire_call_lock();
         validate_block(blk_start, blk_end);
         check_files_unchanged();
-        validate_projected_panel_handle(first);
-        if (second != nullptr) validate_projected_panel_handle(*second);
+        validate_projected_panel_handle(sources);
         const int l = blk_end - blk_start;
-        const size_t columns_size = checked_add(
-            static_cast<size_t>(first.columns_),
-            second == nullptr ? 0U : static_cast<size_t>(second->columns_),
-            "projected target columns"
-        );
+        const size_t columns_size = static_cast<size_t>(sources.columns_);
         const int columns = checked_blas_dim(columns_size, "projected target columns");
         if (checked_blas_dim(scale_x.shape(0), "target scale_x") != l ||
             checked_blas_dim(scale_w.shape(0), "target scale_w") != l) {
@@ -8381,10 +8347,7 @@ private:
         size_t elements = checked_mul(static_cast<size_t>(n_), static_cast<size_t>(l), "target genotype");
         elements = checked_add(elements, checked_mul(2U, static_cast<size_t>(l), "target scale snapshots"), "target input snapshots");
         elements = checked_add(elements, checked_mul(2U, checked_mul(static_cast<size_t>(l), columns_size, "target outputs"), "target outputs"), "target workspace");
-        const size_t widest_panel = std::max(
-            static_cast<size_t>(first.columns_),
-            second == nullptr ? 0U : static_cast<size_t>(second->columns_)
-        );
+        const size_t widest_panel = static_cast<size_t>(sources.columns_);
         const int widest_fused_columns = checked_blas_dim(
             checked_mul(2U, widest_panel, "fused projected target columns"),
             "fused projected target columns"
@@ -8486,17 +8449,15 @@ private:
                 );
                 output_offset += static_cast<size_t>(panel.columns_);
             };
-            consume(first);
-            if (second != nullptr) consume(*second);
+            consume(sources);
             scale_target_outputs(
                 work_x, work_w, l, columns, scale_x_snapshot, scale_w_snapshot
             );
             check_files_unchanged();
         }
-        const double leakage = std::max(
-            first.leakage_, second == nullptr ? 0.0 : second->leakage_
+        return nb::make_tuple(
+            work_x_out, work_w_out, missing, sources.leakage_
         );
-        return nb::make_tuple(work_x_out, work_w_out, missing, leakage);
     }
 
     std::unique_lock<std::mutex> acquire_call_lock() const {
@@ -16012,11 +15973,9 @@ NB_MODULE(gxeldcore, module) {
                 int, int, int, nb::object, int,
                 nb_mat2f_ro<double>, nb_mat2f_ro<double>,
                 nb_mat2c_ro<double>, nb_vec1_ro<double>,
-                nb_vec1_ro<int64_t>, nb_mat2c_ro<int64_t>,
-                nb_mat2c_ro<int64_t>, nb_vec1_ro<int64_t>,
-                nb_mat2c_ro<int64_t>, const std::string&,
-                const std::string&, const std::string&,
-                const std::string&, const std::string&, uint64_t,
+                nb_mat2c_ro<int64_t>, nb_mat2c_ro<int64_t>,
+                nb_vec1_ro<int64_t>,
+                nb_mat2c_ro<int64_t>, uint64_t,
                 uint64_t, int64_t, int, int, int, int, int, uint64_t,
                 int, int, bool, bool, const std::string&, int, int, double
             >(),
@@ -16024,14 +15983,10 @@ NB_MODULE(gxeldcore, module) {
             nb::arg("fam_descriptor"), nb::arg("row_sel"),
             nb::arg("ddof"), nb::arg("basis"),
             nb::arg("fixed_effect_basis"), nb::arg("annotations"),
-            nb::arg("annotation_masses"), nb::arg("block_ids"),
-            nb::arg("pair_table"), nb::arg("component_table"),
+            nb::arg("annotation_masses"), nb::arg("pair_table"),
+            nb::arg("component_table"),
             nb::arg("product_offsets"), nb::arg("product_terms"),
-            nb::arg("pair_table_sha256"),
-            nb::arg("component_table_sha256"),
-            nb::arg("product_offsets_sha256"),
-            nb::arg("product_terms_sha256"),
-            nb::arg("product_plan_digest"), nb::arg("root_seed"),
+            nb::arg("root_seed"),
             nb::arg("namespace_key"), nb::arg("probe_offset"),
             nb::arg("probe_count"), nb::arg("variant_block_width"),
             nb::arg("source_probe_tile_width"),
@@ -16507,7 +16462,7 @@ NB_MODULE(gxeldcore, module) {
             "source_block", &DirectContext::source_block,
             nb::arg("blk_start"), nb::arg("blk_end"),
             nb::arg("scale_x"), nb::arg("scale_w"), nb::arg("sqrt_annotation"),
-            nb::arg("probes"), nb::arg("group_ids"), nb::arg("num_groups"),
+            nb::arg("probes"),
             nb::arg("require_missing_free") = true
         )
         .def(
@@ -16528,13 +16483,6 @@ NB_MODULE(gxeldcore, module) {
             "target_projected_block", &DirectContext::target_projected_block,
             nb::arg("blk_start"), nb::arg("blk_end"),
             nb::arg("scale_x"), nb::arg("scale_w"), nb::arg("sources"),
-            nb::arg("require_missing_free") = true
-        )
-        .def(
-            "target_projected_pair_block", &DirectContext::target_projected_pair_block,
-            nb::arg("blk_start"), nb::arg("blk_end"),
-            nb::arg("scale_x"), nb::arg("scale_w"),
-            nb::arg("first"), nb::arg("second"),
             nb::arg("require_missing_free") = true
         )
         .def(

@@ -58,6 +58,7 @@ from .oracle import (
     transfer_reference_gram,
     transform_omega,
 )
+from .fixed import thin_rank_revealing_fixed_effect_basis
 from .fit import (
     DEFAULT_SOLVE_RTOL,
     ContextFitResult,
@@ -500,6 +501,7 @@ __all__ = [
     "pointwise_normal_bands",
     "select_simultaneous_band_coordinate",
     "rank_revealing_projector",
+    "thin_rank_revealing_fixed_effect_basis",
     "residual_moments_low_rank",
     "require_identical_scale_plans",
     "reference_moments_after_deleting_groups",

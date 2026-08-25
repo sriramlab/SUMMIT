@@ -1,27 +1,18 @@
 """Contracts for the generalized per-variant GxE LD-score estimator.
 
-This module owns the estimator identity, V1 artifact validation, global
-variant/probe counter stream, work/memory planning, and two-pass accounting.
+This module owns the estimator identity, global variant/probe counter stream,
+work/memory planning, and two-pass accounting. Inference artifacts and their
+post-hoc block reductions live in ``generalized_gxe_reference_v1``.
 It deliberately contains no genotype traversal or LD-score kernel.
 """
 
 from __future__ import annotations
 
-import hashlib
 import math
 from dataclasses import dataclass, field
 from typing import Any, Mapping, Sequence
 
 import numpy as np
-
-from summit.context.spec import (
-    ContextComponentIndex,
-    ContextPairIndex,
-    array_sha256,
-    canonical_json,
-)
-from summit.context.schema import GenotypeScalePlanV1, GenotypeScalePolicy
-
 
 GENERALIZED_GXE_VARIANT_REFERENCE_KIND = (
     "summit.generalized_gxe.variant_ldscore_reference"
@@ -29,9 +20,6 @@ GENERALIZED_GXE_VARIANT_REFERENCE_KIND = (
 GENERALIZED_GXE_VARIANT_SCHEMA_VERSION = 1
 GENERALIZED_GXE_VARIANT_SCIENTIFIC_CONTRACT = (
     "generalized_gxe_variant_ldscore_v1"
-)
-GENERALIZED_GXE_VARIANT_JACKKNIFE_METHOD = (
-    "frozen_full_genome_variant_ldscore_delete_block_v1"
 )
 GENERALIZED_GXE_VARIANT_ESTIMATOR_FAMILY = (
     "variant_probe_two_pass_per_variant_ldscore"
@@ -48,56 +36,11 @@ GENERALIZED_GXE_VARIANT_FEATURE_CONVENTION = (
 GENERALIZED_GXE_VARIANT_NORMAL_ASSEMBLY = (
     "symmetrized_directional_variant_ldscore_v1"
 )
-GENERALIZED_GXE_VARIANT_SAME_PERSON_JACKKNIFE = "reuse_full_same_person_v1"
-
-_SAMPLE_PROBE_CONTEXTUAL_KIND = "summit.context.reference.v1"
-_SAMPLE_PROBE_CONTEXTUAL_DEVELOPMENT_KIND = "summit.context.reference"
-_LEGACY_GXE_REFERENCE_KIND = "summit.gxe.reference"
-_LEGACY_JACKKNIFE_ALIAS = "block_local_ldscore_deletion"
 _MASK64 = (1 << 64) - 1
 _MAX_INT64 = (1 << 63) - 1
 _MIX_VARIANT = 0xD2B74407B1CE6E93
 _MIX_PROBE = 0xCA5A826395121157
 _MIX_ROOT = 0x9E3779B97F4A7C15
-_FINGERPRINT_VARIANTS = (0, 1, 2, 7, 31)
-_REQUIRED_ARRAYS = frozenset(
-    {
-        "directed_numerator",
-        "symmetric_numerator",
-        "genetic_gram",
-        "block_directed_numerator",
-        "block_annotation_mass",
-        "same_person",
-    }
-)
-_OPTIONAL_ARRAYS = frozenset(
-    {"deleted_genetic_gram", "directional_ldscores"}
-)
-_REQUIRED_DIAGNOSTICS = frozenset(
-    {
-        "maximum_source_projection_leakage",
-        "maximum_presymmetry_absolute_error",
-        "maximum_presymmetry_relative_error",
-        "block_reconstruction_error",
-        "same_person_probe_count",
-        "same_person_cross_tile_finalized",
-        "minimum_annotation_mass",
-        "minimum_deleted_annotation_mass",
-        "all_values_finite",
-        "normal_matrix_rank",
-        "normal_matrix_condition",
-        "dense_oracle_fixture_version",
-        "backend_fixed_probe_maximum_error",
-    }
-)
-
-
-def _require_mapping(name: str, value: Any) -> Mapping[str, Any]:
-    if not isinstance(value, Mapping):
-        raise ValueError(f"{name} must be an object")
-    return value
-
-
 def _require_positive_int(name: str, value: Any, *, allow_zero: bool = False) -> int:
     minimum = 0 if allow_zero else 1
     if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
@@ -106,16 +49,6 @@ def _require_positive_int(name: str, value: Any, *, allow_zero: bool = False) ->
     if value > _MAX_INT64:
         raise OverflowError(f"{name} exceeds signed 64-bit range")
     return value
-
-
-def _require_sha256(name: str, value: Any) -> str:
-    if not isinstance(value, str) or len(value) != 64:
-        raise ValueError(f"{name} must be a SHA-256 digest")
-    try:
-        int(value, 16)
-    except ValueError as exc:
-        raise ValueError(f"{name} must be a SHA-256 digest") from exc
-    return value.lower()
 
 
 def _checked_product(name: str, *values: int) -> int:
@@ -138,11 +71,13 @@ def _splitmix64(value: int) -> int:
 def probe_namespace_key(namespace: str) -> int:
     if not isinstance(namespace, str) or not namespace:
         raise ValueError("probe namespace must be a nonempty string")
-    payload = (
-        b"summit-counter-global-variant-global-probe-v1\0"
-        + namespace.encode("utf-8")
-    )
-    return int.from_bytes(hashlib.sha256(payload).digest()[:8], "little")
+    # This is only a deterministic PRNG stream selector. FNV-1a keeps the
+    # namespace-to-stream mapping stable across processes and languages.
+    value = 0xCBF29CE484222325
+    for byte in namespace.encode("utf-8"):
+        value ^= byte
+        value = (value * 0x100000001B3) & _MASK64
+    return value
 
 
 def global_probe_sign(
@@ -250,25 +185,6 @@ class GlobalVariantProbeSpec:
             namespace=self.namespace,
         )
 
-    def fingerprint_record(self) -> dict[str, Any]:
-        relative_probes = tuple(
-            index for index in (0, 1, 3, 7) if index < self.probe_count
-        )
-        probe_indices = np.asarray(
-            [self.probe_offset + value for value in relative_probes],
-            dtype=np.uint64,
-        )
-        variants = np.asarray(_FINGERPRINT_VARIANTS, dtype=np.uint64)
-        signs = self.generate(variants)[:, list(relative_probes)]
-        signs_int8 = np.asarray(signs, dtype=np.int8, order="C")
-        return {
-            "variant_indices": list(_FINGERPRINT_VARIANTS),
-            "probe_indices": [int(value) for value in probe_indices],
-            "shape": list(signs_int8.shape),
-            "dtype": "int8",
-            "sha256": array_sha256(signs_int8),
-        }
-
     def to_metadata(self) -> dict[str, Any]:
         return {
             "distribution": "rademacher",
@@ -281,7 +197,6 @@ class GlobalVariantProbeSpec:
             "shared_with_same_person": True,
             "stream_namespace": self.namespace,
             "stream_namespace_key_uint64": self.namespace_key,
-            "fingerprint": self.fingerprint_record(),
         }
 
 
@@ -316,603 +231,6 @@ def native_global_variant_probes(
     )
 
 
-def serialize_generalized_gxe_axes(
-    *,
-    num_variants: int,
-    variant_digest: str,
-    retained_variant_digest: str,
-    num_samples: int,
-    sample_digest: str,
-    basis_names: Sequence[str],
-    basis_digest: str,
-    basis_calibration_digest: str,
-    fixed_effect_digest: str,
-    fixed_effect_rank: int,
-    annotation_names: Sequence[str],
-    annotation_digest: str,
-    annotation_masses: Sequence[float] | np.ndarray,
-    variant_block_ids: Sequence[int] | np.ndarray,
-    block_labels: Sequence[str],
-    jackknife_block_digest: str,
-    residual_component_names: Sequence[str],
-) -> dict[str, Any]:
-    """Serialize ordered axes using the existing contextual indexes."""
-    n_variants = _require_positive_int("num_variants", num_variants)
-    n_samples = _require_positive_int("num_samples", num_samples)
-    names = tuple(str(name) for name in basis_names)
-    annotations = tuple(str(name) for name in annotation_names)
-    residual_names = tuple(str(name) for name in residual_component_names)
-    if not names or not annotations or not residual_names:
-        raise ValueError("basis, annotation, and residual component axes must be nonempty")
-    pair_index = ContextPairIndex(num_basis=len(names))
-    component_index = ContextComponentIndex(
-        annotation_names=annotations,
-        pair_index=pair_index,
-    )
-    masses = np.asarray(annotation_masses, dtype=np.float64)
-    if masses.shape != (len(annotations),) or not np.all(np.isfinite(masses)):
-        raise ValueError("annotation_masses have the wrong shape or are nonfinite")
-    if np.any(masses <= 0.0):
-        raise ValueError("annotation_masses must be positive")
-    blocks = np.asarray(variant_block_ids)
-    labels = tuple(str(label) for label in block_labels)
-    if blocks.shape != (n_variants,) or blocks.dtype.kind not in "iu":
-        raise ValueError("variant_block_ids must be an integer vector of length M")
-    block_values = [int(value) for value in blocks]
-    if any(value < 0 for value in block_values):
-        raise ValueError("variant_block_ids must be nonnegative")
-    block_count = max(block_values) + 1
-    if set(block_values) != set(range(block_count)) or len(labels) != block_count:
-        raise ValueError("block IDs must be contiguous and match block_labels")
-    if len(set(labels)) != len(labels):
-        raise ValueError("block_labels must be unique")
-    return {
-        "variants": {
-            "count": n_variants,
-            "digest": _require_sha256("variant_digest", variant_digest),
-            "retained_order_digest": _require_sha256(
-                "retained_variant_digest", retained_variant_digest
-            ),
-        },
-        "samples": {
-            "count": n_samples,
-            "digest": _require_sha256("sample_digest", sample_digest),
-        },
-        "basis": {
-            "names": list(names),
-            "digest": _require_sha256("basis_digest", basis_digest),
-            "calibration_digest": _require_sha256(
-                "basis_calibration_digest", basis_calibration_digest
-            ),
-        },
-        "fixed_effects": {
-            "digest": _require_sha256(
-                "fixed_effect_digest", fixed_effect_digest
-            ),
-            "rank": _require_positive_int(
-                "fixed_effect_rank", fixed_effect_rank, allow_zero=True
-            ),
-            "residual_rank": n_samples - fixed_effect_rank,
-        },
-        "pairs": {
-            "table": [[entry.q, entry.r] for entry in pair_index.entries],
-            "digest": pair_index.digest,
-            "serialization": pair_index.to_dict(),
-        },
-        "annotations": {
-            "names": list(annotations),
-            "digest": _require_sha256("annotation_digest", annotation_digest),
-            "masses": [float(value) for value in masses],
-        },
-        "components": {
-            "table": [
-                [entry.annotation_index, entry.pair_index]
-                for entry in component_index.entries
-            ],
-            "digest": component_index.digest,
-            "serialization": component_index.to_dict(),
-        },
-        "jackknife_blocks": {
-            "variant_block_ids": block_values,
-            "block_labels": list(labels),
-            "digest": _require_sha256(
-                "jackknife_block_digest", jackknife_block_digest
-            ),
-        },
-        "residual_components": {"names": list(residual_names)},
-    }
-
-
-def numeric_array_metadata(value: np.ndarray) -> dict[str, Any]:
-    array = np.asarray(value)
-    if array.dtype != np.dtype(np.float64):
-        raise ValueError("generalized reference numeric arrays must be FP64")
-    if not np.all(np.isfinite(array)):
-        raise ValueError("generalized reference numeric arrays must be finite")
-    contiguous = np.ascontiguousarray(array)
-    return {
-        "shape": list(contiguous.shape),
-        "dtype": "float64",
-        "order": "C",
-        "sha256": array_sha256(contiguous),
-    }
-
-
-def build_generalized_gxe_variant_manifest(
-    *,
-    axes: Mapping[str, Any],
-    probe_spec: GlobalVariantProbeSpec,
-    arrays: Mapping[str, np.ndarray],
-    pass_ledger: Mapping[str, Any],
-    genotype_scale_plan: GenotypeScalePlanV1,
-    performance_ledger: Mapping[str, Any],
-    provenance: Mapping[str, Any],
-    diagnostics: Mapping[str, Any],
-) -> dict[str, Any]:
-    if not isinstance(genotype_scale_plan, GenotypeScalePlanV1):
-        raise ValueError("genotype_scale_plan must be a GenotypeScalePlanV1")
-    payload = {
-        "kind": GENERALIZED_GXE_VARIANT_REFERENCE_KIND,
-        "schema_version": GENERALIZED_GXE_VARIANT_SCHEMA_VERSION,
-        "scientific_contract": GENERALIZED_GXE_VARIANT_SCIENTIFIC_CONTRACT,
-        "estimator_family": GENERALIZED_GXE_VARIANT_ESTIMATOR_FAMILY,
-        "probe_axis": "variant",
-        "feature_convention": GENERALIZED_GXE_VARIANT_FEATURE_CONVENTION,
-        "normal_equation_assembly": GENERALIZED_GXE_VARIANT_NORMAL_ASSEMBLY,
-        "jackknife_method": GENERALIZED_GXE_VARIANT_JACKKNIFE_METHOD,
-        "same_person_jackknife": GENERALIZED_GXE_VARIANT_SAME_PERSON_JACKKNIFE,
-        "axes": dict(axes),
-        "randomization": probe_spec.to_metadata(),
-        "genotype_scale_plan": genotype_scale_plan.to_dict(),
-        "genotype_scale_plan_sha256": genotype_scale_plan.digest,
-        "jackknife": {
-            "method": GENERALIZED_GXE_VARIANT_JACKKNIFE_METHOD,
-            "num_blocks": len(axes["jackknife_blocks"]["block_labels"]),
-            "block_labels": list(axes["jackknife_blocks"]["block_labels"]),
-            "block_axis": "ordered_retained_variants",
-            "source_scores_recomputed": False,
-            "retained_ldscores_frozen": True,
-            "local_context_weighted_ld_assumption": True,
-            "same_person_deletion": GENERALIZED_GXE_VARIANT_SAME_PERSON_JACKKNIFE,
-        },
-        "numeric_arrays": {
-            name: numeric_array_metadata(value) for name, value in arrays.items()
-        },
-        "pass_ledger": dict(pass_ledger),
-        "performance_ledger": dict(performance_ledger),
-        "provenance": dict(provenance),
-        "diagnostics": dict(diagnostics),
-        "per_variant_panel": (
-            {
-                "storage": "inline_npz",
-                "logical_layout": (
-                    "variant_target_pair_source_component_c"
-                ),
-                "logical_compute_dtype": "float64",
-                "array": "directional_ldscores",
-                **numeric_array_metadata(arrays["directional_ldscores"]),
-            }
-            if "directional_ldscores" in arrays
-            else {
-                "storage": "omitted",
-                "logical_layout": (
-                    "variant_target_pair_source_component_c"
-                ),
-                "logical_compute_dtype": "float64",
-            }
-        ),
-        "terminal_status": "complete",
-    }
-    return validate_generalized_gxe_variant_manifest(payload, arrays=arrays)
-
-
-def _scale_plan_from_manifest(value: Any) -> GenotypeScalePlanV1:
-    record = dict(_require_mapping("genotype_scale_plan", value))
-    required = {
-        "policy",
-        "retained_variant_order_sha256",
-        "allele_orientation",
-        "allele_coding",
-        "centering_source",
-        "centering_formula",
-        "scaling_formula",
-        "missing_imputation",
-        "ploidy_policy",
-        "affine_mean_sha256",
-        "affine_inverse_scale_sha256",
-    }
-    if set(record) != required:
-        raise ValueError("genotype scale plan has a noncanonical field set")
-    try:
-        policy = GenotypeScalePolicy(record.pop("policy"))
-    except (TypeError, ValueError) as exc:
-        raise ValueError("genotype scale plan policy is unsupported") from exc
-    return GenotypeScalePlanV1(policy=policy, **record)
-
-
-def _validate_performance_ledger(value: Any) -> dict[str, Any]:
-    ledger = dict(_require_mapping("performance_ledger", value))
-    required = {
-        "backend",
-        "threads",
-        "affinity",
-        "numa_evidence",
-        "phase_wall_seconds",
-        "phase_cpu_seconds",
-        "bytes_read",
-        "gemm_dimensions",
-        "peak_rss_bytes",
-        "output_bytes",
-    }
-    if set(ledger) != required:
-        raise ValueError("performance ledger has a noncanonical field set")
-    if not isinstance(ledger["backend"], str) or not ledger["backend"]:
-        raise ValueError("performance backend must be nonempty text")
-    _require_positive_int("performance threads", ledger["threads"])
-    phases = {"pass1", "barrier", "pass2", "finalize"}
-    for field in ("phase_wall_seconds", "phase_cpu_seconds"):
-        values = _require_mapping(f"performance_ledger.{field}", ledger[field])
-        if set(values) != phases:
-            raise ValueError(f"performance {field} has the wrong phase set")
-        for phase, duration in values.items():
-            if (
-                isinstance(duration, bool)
-                or not isinstance(duration, (int, float))
-                or not math.isfinite(float(duration))
-                or float(duration) < 0.0
-            ):
-                raise ValueError(f"performance {field}.{phase} is invalid")
-    for field in ("bytes_read", "peak_rss_bytes", "output_bytes"):
-        _require_positive_int(field, ledger[field], allow_zero=True)
-    if not isinstance(ledger["gemm_dimensions"], list):
-        raise ValueError("performance gemm_dimensions must be an array")
-    _require_mapping("performance affinity", ledger["affinity"])
-    _require_mapping("performance NUMA evidence", ledger["numa_evidence"])
-    canonical_json(ledger)
-    return ledger
-
-
-def _validate_axes(axes_value: Any) -> dict[str, Any]:
-    axes = dict(_require_mapping("axes", axes_value))
-    variants = _require_mapping("axes.variants", axes.get("variants"))
-    samples = _require_mapping("axes.samples", axes.get("samples"))
-    basis = _require_mapping("axes.basis", axes.get("basis"))
-    fixed = _require_mapping("axes.fixed_effects", axes.get("fixed_effects"))
-    pairs = _require_mapping("axes.pairs", axes.get("pairs"))
-    annotations = _require_mapping("axes.annotations", axes.get("annotations"))
-    components = _require_mapping("axes.components", axes.get("components"))
-    blocks = _require_mapping("axes.jackknife_blocks", axes.get("jackknife_blocks"))
-    residual = _require_mapping(
-        "axes.residual_components", axes.get("residual_components")
-    )
-    n_variants = _require_positive_int("variant count", variants.get("count"))
-    n_samples = _require_positive_int("sample count", samples.get("count"))
-    _require_sha256("variant digest", variants.get("digest"))
-    _require_sha256(
-        "retained variant digest", variants.get("retained_order_digest")
-    )
-    _require_sha256("sample digest", samples.get("digest"))
-    basis_names = basis.get("names")
-    if not isinstance(basis_names, list) or not basis_names:
-        raise ValueError("basis names must be a nonempty ordered array")
-    _require_sha256("basis digest", basis.get("digest"))
-    _require_sha256("basis calibration digest", basis.get("calibration_digest"))
-    fixed_rank = _require_positive_int(
-        "fixed-effect rank", fixed.get("rank"), allow_zero=True
-    )
-    if fixed_rank >= n_samples:
-        raise ValueError("fixed-effect rank must be smaller than sample count")
-    if fixed.get("residual_rank") != n_samples - fixed_rank:
-        raise ValueError("residual rank contradicts sample count and fixed rank")
-    _require_sha256("fixed-effect digest", fixed.get("digest"))
-    pair_index = ContextPairIndex(num_basis=len(basis_names))
-    expected_pair_table = [[entry.q, entry.r] for entry in pair_index.entries]
-    if pairs.get("table") != expected_pair_table:
-        raise ValueError("pair table does not match diagonal-first schema order")
-    if pairs.get("serialization") != pair_index.to_dict():
-        raise ValueError("pair serialization does not match the contextual index")
-    if pairs.get("digest") != pair_index.digest:
-        raise ValueError("pair digest does not match the serialized pair index")
-    annotation_names = annotations.get("names")
-    masses = np.asarray(annotations.get("masses"), dtype=np.float64)
-    if not isinstance(annotation_names, list) or not annotation_names:
-        raise ValueError("annotation names must be a nonempty ordered array")
-    if masses.shape != (len(annotation_names),) or not np.all(np.isfinite(masses)):
-        raise ValueError("annotation masses are missing, nonfinite, or misaligned")
-    if np.any(masses <= 0.0):
-        raise ValueError("annotation masses must be positive")
-    _require_sha256("annotation digest", annotations.get("digest"))
-    component_index = ContextComponentIndex(
-        annotation_names=tuple(annotation_names),
-        pair_index=pair_index,
-    )
-    expected_component_table = [
-        [entry.annotation_index, entry.pair_index]
-        for entry in component_index.entries
-    ]
-    if components.get("table") != expected_component_table:
-        raise ValueError("component table does not match annotation-major schema order")
-    if components.get("serialization") != component_index.to_dict():
-        raise ValueError("component serialization does not match the contextual index")
-    if components.get("digest") != component_index.digest:
-        raise ValueError("component digest does not match its serialization")
-    block_ids = blocks.get("variant_block_ids")
-    block_labels = blocks.get("block_labels")
-    if not isinstance(block_ids, list) or len(block_ids) != n_variants:
-        raise ValueError("variant block IDs must align to the ordered variant axis")
-    if any(
-        isinstance(value, bool) or not isinstance(value, int) or value < 0
-        for value in block_ids
-    ):
-        raise ValueError("variant block IDs must be nonnegative integers")
-    block_count = max(block_ids) + 1
-    if set(block_ids) != set(range(block_count)):
-        raise ValueError("variant block IDs must be contiguous")
-    if (
-        not isinstance(block_labels, list)
-        or len(block_labels) != block_count
-        or len(set(block_labels)) != block_count
-    ):
-        raise ValueError("block labels must be unique and aligned to block IDs")
-    _require_sha256("jackknife block digest", blocks.get("digest"))
-    residual_names = residual.get("names")
-    if not isinstance(residual_names, list) or not residual_names:
-        raise ValueError("residual component order must be recorded")
-    return axes
-
-
-def _validate_randomization(value: Any) -> dict[str, Any]:
-    randomization = dict(_require_mapping("randomization", value))
-    expected = {
-        "distribution": "rademacher",
-        "algorithm": GENERALIZED_GXE_VARIANT_PROBE_ALGORITHM,
-        "variant_index_space": "retained_ordered_variant_axis_v1",
-        "tile_invariant": True,
-        "shared_with_same_person": True,
-    }
-    for key, expected_value in expected.items():
-        if randomization.get(key) != expected_value:
-            raise ValueError(f"randomization field {key!r} contradicts V1")
-    spec = GlobalVariantProbeSpec(
-        root_seed=randomization.get("root_seed"),
-        probe_offset=randomization.get("probe_offset"),
-        probe_count=randomization.get("probe_count"),
-        namespace=randomization.get("stream_namespace"),
-    )
-    if randomization.get("stream_namespace_key_uint64") != spec.namespace_key:
-        raise ValueError("probe namespace key does not match the namespace")
-    if randomization.get("fingerprint") != spec.fingerprint_record():
-        raise ValueError("probe fingerprint does not match the global counter stream")
-    return randomization
-
-
-def _validate_pass_ledger(value: Any, num_variants: int) -> dict[str, Any]:
-    ledger = dict(_require_mapping("pass_ledger", value))
-    exact_values = {
-        "planned_reference_genotype_passes": 2,
-        "observed_reference_genotype_passes": 2,
-        "planned_retained_variant_visits": 2 * num_variants,
-        "observed_retained_variant_visits": 2 * num_variants,
-        "duplicate_retained_variant_visits": 0,
-        "retry_count": 0,
-        "fallback_count": 0,
-        "integrity_failure_count": 0,
-    }
-    for key, expected in exact_values.items():
-        if ledger.get(key) != expected:
-            raise ValueError(f"published pass ledger field {key!r} must equal {expected}")
-    for key in ("pass1_decoded_blocks", "pass2_decoded_blocks", "repair_count"):
-        _require_positive_int(key, ledger.get(key), allow_zero=True)
-    if ledger["pass1_decoded_blocks"] < 1 or ledger["pass2_decoded_blocks"] < 1:
-        raise ValueError("each physical pass must decode at least one block")
-    return ledger
-
-
-def validate_generalized_gxe_variant_manifest(
-    payload: Mapping[str, Any],
-    *,
-    arrays: Mapping[str, np.ndarray],
-) -> dict[str, Any]:
-    """Validate the complete V1 reference manifest and loaded numeric arrays."""
-    if not isinstance(payload, Mapping):
-        raise ValueError("generalized GxE manifest must be an object")
-    result = dict(payload)
-    kind = result.get("kind")
-    if kind in {
-        _SAMPLE_PROBE_CONTEXTUAL_KIND,
-        _SAMPLE_PROBE_CONTEXTUAL_DEVELOPMENT_KIND,
-    }:
-        raise ValueError("sample-probe contextual artifacts are not variant LD scores")
-    if kind == _LEGACY_GXE_REFERENCE_KIND:
-        raise ValueError("legacy non-general GxE references are not generalized artifacts")
-    identity = {
-        "kind": GENERALIZED_GXE_VARIANT_REFERENCE_KIND,
-        "schema_version": GENERALIZED_GXE_VARIANT_SCHEMA_VERSION,
-        "scientific_contract": GENERALIZED_GXE_VARIANT_SCIENTIFIC_CONTRACT,
-        "estimator_family": GENERALIZED_GXE_VARIANT_ESTIMATOR_FAMILY,
-        "probe_axis": "variant",
-        "feature_convention": GENERALIZED_GXE_VARIANT_FEATURE_CONVENTION,
-        "normal_equation_assembly": GENERALIZED_GXE_VARIANT_NORMAL_ASSEMBLY,
-        "jackknife_method": GENERALIZED_GXE_VARIANT_JACKKNIFE_METHOD,
-        "same_person_jackknife": GENERALIZED_GXE_VARIANT_SAME_PERSON_JACKKNIFE,
-    }
-    for key, expected in identity.items():
-        if result.get(key) != expected:
-            raise ValueError(f"manifest identity field {key!r} contradicts V1")
-    axes = _validate_axes(result.get("axes"))
-    _validate_randomization(result.get("randomization"))
-    scale_plan = _scale_plan_from_manifest(result.get("genotype_scale_plan"))
-    if result.get("genotype_scale_plan_sha256") != scale_plan.digest:
-        raise ValueError("genotype scale plan digest does not match its record")
-    if (
-        scale_plan.retained_variant_order_sha256
-        != axes["variants"]["retained_order_digest"]
-    ):
-        raise ValueError("genotype scale plan does not bind the variant axis")
-    _validate_performance_ledger(result.get("performance_ledger"))
-    if result.get("terminal_status") != "complete":
-        raise ValueError("generalized reference terminal status is not complete")
-    jackknife = _require_mapping("jackknife", result.get("jackknife"))
-    jackknife_expected = {
-        "method": GENERALIZED_GXE_VARIANT_JACKKNIFE_METHOD,
-        "block_axis": "ordered_retained_variants",
-        "source_scores_recomputed": False,
-        "retained_ldscores_frozen": True,
-        "local_context_weighted_ld_assumption": True,
-        "same_person_deletion": GENERALIZED_GXE_VARIANT_SAME_PERSON_JACKKNIFE,
-    }
-    for key, expected in jackknife_expected.items():
-        if jackknife.get(key) != expected:
-            raise ValueError(f"jackknife field {key!r} contradicts V1")
-    block_labels = axes["jackknife_blocks"]["block_labels"]
-    if jackknife.get("num_blocks") != len(block_labels):
-        raise ValueError("jackknife block count contradicts the ordered block axis")
-    if jackknife.get("block_labels") != block_labels:
-        raise ValueError("jackknife labels contradict the ordered block axis")
-    n_variants = axes["variants"]["count"]
-    n_samples = axes["samples"]["count"]
-    pair_count = len(axes["pairs"]["table"])
-    annotation_count = len(axes["annotations"]["names"])
-    component_count = len(axes["components"]["table"])
-    block_count = len(block_labels)
-    residual_rank = axes["fixed_effects"]["residual_rank"]
-    masses = np.asarray(axes["annotations"]["masses"], dtype=np.float64)
-    component_annotations = np.asarray(
-        [entry[0] for entry in axes["components"]["table"]],
-        dtype=np.int64,
-    )
-    metadata = _require_mapping("numeric_arrays", result.get("numeric_arrays"))
-    array_names = set(arrays)
-    if not _REQUIRED_ARRAYS <= array_names or not array_names <= (
-        _REQUIRED_ARRAYS | _OPTIONAL_ARRAYS
-    ):
-        raise ValueError("numeric array set is missing required or contains unknown arrays")
-    if set(metadata) != array_names:
-        raise ValueError("numeric array metadata does not match loaded arrays")
-    expected_shapes = {
-        "directed_numerator": (component_count, component_count),
-        "symmetric_numerator": (component_count, component_count),
-        "genetic_gram": (component_count, component_count),
-        "block_directed_numerator": (block_count, component_count, component_count),
-        "block_annotation_mass": (block_count, annotation_count),
-        "same_person": (component_count, component_count),
-        "deleted_genetic_gram": (block_count, component_count, component_count),
-        "directional_ldscores": (n_variants, pair_count, component_count),
-    }
-    owned_arrays: dict[str, np.ndarray] = {}
-    for name, value in arrays.items():
-        array = np.asarray(value)
-        if array.dtype != np.dtype(np.float64) or array.shape != expected_shapes[name]:
-            raise ValueError(f"numeric array {name!r} has the wrong shape or dtype")
-        if not np.all(np.isfinite(array)):
-            raise ValueError(f"numeric array {name!r} is nonfinite")
-        expected_metadata = numeric_array_metadata(array)
-        if metadata[name] != expected_metadata:
-            raise ValueError(f"numeric array {name!r} metadata/hash mismatch")
-        owned_arrays[name] = array
-    panel = _require_mapping("per_variant_panel", result.get("per_variant_panel"))
-    common_panel = {
-        "logical_layout": "variant_target_pair_source_component_c",
-        "logical_compute_dtype": "float64",
-    }
-    for key, expected in common_panel.items():
-        if panel.get(key) != expected:
-            raise ValueError(f"per-variant panel field {key!r} contradicts V1")
-    if "directional_ldscores" in owned_arrays:
-        expected_panel = {
-            "storage": "inline_npz",
-            **common_panel,
-            "array": "directional_ldscores",
-            **numeric_array_metadata(owned_arrays["directional_ldscores"]),
-        }
-    else:
-        expected_panel = {"storage": "omitted", **common_panel}
-    if dict(panel) != expected_panel:
-        raise ValueError("per-variant panel declaration does not match storage")
-    directed = owned_arrays["directed_numerator"]
-    symmetric = owned_arrays["symmetric_numerator"]
-    if not np.allclose(symmetric, 0.5 * (directed + directed.T), rtol=0.0, atol=1.0e-12):
-        raise ValueError("symmetric numerator does not symmetrize the directed numerator")
-    denominator = (
-        masses[component_annotations, None]
-        * masses[component_annotations][None, :]
-    )
-    expected_gram = float(residual_rank**2) * symmetric / denominator
-    if not np.allclose(
-        owned_arrays["genetic_gram"],
-        expected_gram,
-        rtol=1.0e-12,
-        atol=1.0e-12,
-    ):
-        raise ValueError("genetic Gram contradicts numerator/rank/mass normalization")
-    block_directed = owned_arrays["block_directed_numerator"]
-    if not np.allclose(
-        np.sum(block_directed, axis=0),
-        directed,
-        rtol=1.0e-12,
-        atol=1.0e-12,
-    ):
-        raise ValueError("block directed numerators do not reconstruct the full numerator")
-    block_masses = owned_arrays["block_annotation_mass"]
-    if not np.allclose(
-        np.sum(block_masses, axis=0),
-        masses,
-        rtol=1.0e-12,
-        atol=1.0e-12,
-    ):
-        raise ValueError("block annotation masses do not reconstruct full masses")
-    if not np.allclose(
-        owned_arrays["same_person"],
-        owned_arrays["same_person"].T,
-        rtol=0.0,
-        atol=1.0e-12,
-    ):
-        raise ValueError("same-person matrix must be symmetric")
-    if "deleted_genetic_gram" in owned_arrays:
-        deleted = owned_arrays["deleted_genetic_gram"]
-        for block in range(block_count):
-            retained_mass = masses - block_masses[block]
-            if np.any(retained_mass <= 0.0):
-                raise ValueError("a deletion empties an annotation")
-            retained_directed = directed - block_directed[block]
-            retained_symmetric = 0.5 * (
-                retained_directed + retained_directed.T
-            )
-            retained_denominator = (
-                retained_mass[component_annotations, None]
-                * retained_mass[component_annotations][None, :]
-            )
-            expected_deleted = (
-                float(residual_rank**2)
-                * retained_symmetric
-                / retained_denominator
-            )
-            if not np.allclose(deleted[block], expected_deleted, rtol=1.0e-12, atol=1.0e-12):
-                raise ValueError("cached deleted Gram contradicts frozen row deletion")
-    _validate_pass_ledger(result.get("pass_ledger"), n_variants)
-    provenance = _require_mapping("provenance", result.get("provenance"))
-    source_commit = provenance.get("source_commit")
-    if (
-        not isinstance(source_commit, str)
-        or len(source_commit) != 40
-        or any(character not in "0123456789abcdef" for character in source_commit)
-    ):
-        raise ValueError("provenance source_commit must be 40 lowercase hex")
-    _require_sha256("source_tree_sha256", provenance.get("source_tree_sha256"))
-    _require_sha256("native_binary_sha256", provenance.get("native_binary_sha256"))
-    diagnostics = _require_mapping("diagnostics", result.get("diagnostics"))
-    if not _REQUIRED_DIAGNOSTICS <= set(diagnostics):
-        raise ValueError("scientific diagnostics are incomplete")
-    if diagnostics.get("all_values_finite") is not True:
-        raise ValueError("scientific diagnostics do not attest finite values")
-    if diagnostics.get("same_person_cross_tile_finalized") is not True:
-        raise ValueError("same-person cross-tile finalization is not attested")
-    if diagnostics.get("same_person_probe_count") != result["randomization"]["probe_count"]:
-        raise ValueError("same-person probe count contradicts randomization")
-    canonical_json(result)
-    return result
-
-
 @dataclass(frozen=True)
 class GeneralizedGxEPlanInputs:
     num_samples: int
@@ -920,7 +238,6 @@ class GeneralizedGxEPlanInputs:
     num_basis: int
     num_annotations: int
     num_probes: int
-    num_jackknife_blocks: int
     memory_limit_bytes: int
     genotype_format: str
     threads: int = 1
@@ -938,7 +255,6 @@ class GeneralizedGxEPlanInputs:
             "num_basis",
             "num_annotations",
             "num_probes",
-            "num_jackknife_blocks",
             "memory_limit_bytes",
             "threads",
             "preferred_variant_block_width",
@@ -1002,7 +318,6 @@ def _memory_candidate(
     q = inputs.num_basis
     k = inputs.num_annotations
     b = inputs.num_probes
-    j = inputs.num_jackknife_blocks
     p = q * (q + 1) // 2
     c = k * p
     v = min(variant_width, m)
@@ -1027,12 +342,6 @@ def _memory_candidate(
         ),
         "same_person_small_matrices": _checked_product(
             "same-person matrix bytes", 8, 3, c, c
-        ),
-        "block_directed_numerator": _checked_product(
-            "block numerator bytes", 8, j, c, c
-        ),
-        "block_annotation_mass": _checked_product(
-            "block mass bytes", 8, j, k
         ),
         "aggregate_matrices": _checked_product(
             "aggregate matrix bytes", 8, 3, c, c
@@ -1183,7 +492,6 @@ def plan_generalized_gxe_variant_work(
             "K": k,
             "C": c,
             "B": b,
-            "J": inputs.num_jackknife_blocks,
         },
         work={
             "pass1_flops": pass1_flops,

@@ -11,7 +11,6 @@ from summit.ldscore.generalized_gxe_reference_v1 import (
     load_generalized_gxe_variant_reference_v1,
 )
 from summit.ldscore.generalized_gxe_variant import (
-    GENERALIZED_GXE_VARIANT_JACKKNIFE_METHOD,
     GENERALIZED_GXE_VARIANT_SCIENTIFIC_CONTRACT,
     GeneralizedGxEPlanInputs,
     plan_generalized_gxe_variant_work,
@@ -38,7 +37,6 @@ def build_parser() -> argparse.ArgumentParser:
         ("--basis", "num_basis"),
         ("--annotations", "num_annotations"),
         ("--probes", "num_probes"),
-        ("--jackknife-blocks", "num_jackknife_blocks"),
         ("--memory-bytes", "memory_limit_bytes"),
     ):
         plan.add_argument(option, dest=destination, type=int, required=True)
@@ -66,7 +64,6 @@ def _plan(args: argparse.Namespace) -> dict:
             num_basis=args.num_basis,
             num_annotations=args.num_annotations,
             num_probes=args.num_probes,
-            num_jackknife_blocks=args.num_jackknife_blocks,
             memory_limit_bytes=args.memory_limit_bytes,
             genotype_format=args.genotype_format,
             threads=args.threads,
@@ -81,7 +78,7 @@ def _plan(args: argparse.Namespace) -> dict:
         "dry_run": True,
         "scientific_contract": GENERALIZED_GXE_VARIANT_SCIENTIFIC_CONTRACT,
         "probe_axis": "variant",
-        "jackknife_method": GENERALIZED_GXE_VARIANT_JACKKNIFE_METHOD,
+        "reference_estimation_jackknife": "none",
         "planned_reference_genotype_passes": 2,
         "work_plan": work.to_dict(),
     }
@@ -98,7 +95,6 @@ def _inspect(path: Path) -> dict:
         "probe_axis": artifact.manifest["probe_axis"],
         "jackknife_method": artifact.manifest["jackknife_method"],
         "same_person_jackknife": artifact.manifest["same_person_jackknife"],
-        "manifest_sha256": artifact.manifest_sha256,
         "dimensions": {
             "N": axes["samples"]["count"],
             "M": axes["variants"]["count"],

@@ -74,8 +74,6 @@ def test_primary_shape_benchmark_plan_is_an_exact_two_pass_dry_run(
             str(annotations),
             "--probes",
             str(probes),
-            "--blocks",
-            "200",
             "--threads",
             "64",
             "--variant-block-width",
@@ -100,7 +98,6 @@ def test_primary_shape_benchmark_plan_is_an_exact_two_pass_dry_run(
         "Q": basis,
         "K": annotations,
         "B": probes,
-        "J": 200,
         "P": basis * (basis + 1) // 2,
         "C": annotations * basis * (basis + 1) // 2,
     }

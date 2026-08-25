@@ -163,7 +163,7 @@ def run(args: argparse.Namespace) -> dict:
             target_xz_mem=0.5,
             gxe_total_memory_gib=args.memory_gib,
             impute_method="mean",
-            kernel_mode="standardized",
+            kernel_mode="standardized_projected",
             genotype_scale="sample",
             native_backend="python",
         )
@@ -180,7 +180,6 @@ def run(args: argparse.Namespace) -> dict:
                     num_basis=args.basis,
                     num_annotations=args.annotations,
                     num_probes=args.probes,
-                    num_jackknife_blocks=20,
                     memory_limit_bytes=int(args.memory_gib * 1024**3),
                     genotype_format="bed",
                     threads=threads,

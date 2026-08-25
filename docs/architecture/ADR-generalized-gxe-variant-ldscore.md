@@ -27,10 +27,10 @@ estimator:
    `Y[k,b]=P diag(phi_b) G sqrt(A_k) Xi`;
 2. pass 2 computes every target variant's cross-sketches and directional
    generalized LD scores;
-3. the normal matrix is assembled by annotation-weighted sums of those fixed
-   per-variant scores; and
-4. SNP-block jackknife replicates subtract target rows from the fixed sums and
-   renormalize masses. Retained SNP LD scores are not recomputed.
+3. only after the genome-wide per-variant panel is complete, a separate
+   `--njack` reducer forms annotation-weighted full and block sums; and
+4. SNP-block jackknife replicates subtract target rows from those fixed sums
+   and renormalize masses. Retained SNP LD scores are not recomputed.
 
 Exactly two complete reference-genotype traversals are a production invariant.
 Probe and RHS tiling occur while one decoded genotype block remains resident.
@@ -45,7 +45,8 @@ Positive:
 
 - directly generalizes the mature additive/non-general source-target framework;
 - produces the per-variant object required for the intended summary method;
-- block-indexed inference sufficient statistics are accumulated in pass 2;
+- block-indexed inference sufficient statistics are reduced post hoc from the
+  completed per-variant panel;
 - science-neutral native optimizations can be reused; and
 - estimator/artifact semantics are explicit.
 

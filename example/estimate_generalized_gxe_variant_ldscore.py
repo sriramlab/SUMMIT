@@ -4,13 +4,12 @@
 from __future__ import annotations
 
 import argparse
-import hashlib
 import os
 from pathlib import Path
 
 import numpy as np
 
-from summit.context.spec import array_sha256, canonical_json
+from summit.context.spec import canonical_json
 from summit.ldscore.generalized_gxe_native import (
     GeneralizedGxENativeBEDExecutor,
     generalized_gxe_performance_ledger_from_native,
@@ -18,22 +17,14 @@ from summit.ldscore.generalized_gxe_native import (
 from summit.ldscore.generalized_gxe_reference_v1 import (
     build_generalized_gxe_variant_reference_from_native_v1,
     load_generalized_gxe_variant_reference_v1,
+    serialize_generalized_gxe_inference_axes,
     write_generalized_gxe_variant_reference_v1,
 )
 from summit.ldscore.generalized_gxe_variant import (
     GeneralizedGxEPlanInputs,
     GlobalVariantProbeSpec,
     plan_generalized_gxe_variant_work,
-    serialize_generalized_gxe_axes,
 )
-
-
-def _sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
 
 
 def _line_count(path: Path) -> int:
@@ -99,7 +90,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--probes", type=int, default=16)
-    parser.add_argument("--blocks", type=int, default=20)
+    parser.add_argument(
+        "--njack", type=int, default=20,
+        help="post-hoc delete-block replicates for normal-equation inference",
+    )
     parser.add_argument("--threads", type=int)
     parser.add_argument("--variant-block-width", type=int, default=1024)
     parser.add_argument("--probe-tile-width", type=int, default=4)
@@ -123,8 +117,10 @@ def main() -> int:
         raise FileNotFoundError(f"missing PLINK files: {missing}")
     n = _line_count(paths[".fam"])
     m = _line_count(paths[".bim"])
-    blocks = min(args.blocks, m)
-    basis, fixed, annotations, block_ids = _inputs(n, m, blocks, args.seed)
+    njack = min(args.njack, m)
+    basis, fixed, annotations, inference_block_ids = _inputs(
+        n, m, njack, args.seed
+    )
 
     build_info = dict(gxeldcore.build_info())
     required_backend = {
@@ -162,7 +158,6 @@ def main() -> int:
             num_basis=basis.shape[1],
             num_annotations=annotations.shape[1],
             num_probes=args.probes,
-            num_jackknife_blocks=blocks,
             memory_limit_bytes=int(args.memory_gib * 1024**3),
             genotype_format="bed",
             threads=threads,
@@ -189,7 +184,6 @@ def main() -> int:
             annotations=annotations,
             annotation_names=("all_variants",),
             annotation_masses=np.sum(annotations, axis=0, dtype=np.float64),
-            block_ids=block_ids,
             probe_spec=probe_spec,
             work_plan=work_plan,
             probe_tile_width=args.probe_tile_width,
@@ -206,35 +200,21 @@ def main() -> int:
     _clean_ledger(result, m)
 
     annotation_masses = np.asarray(result.annotation_masses)
-    minimum_deleted_mass = float(
-        np.min(annotation_masses[None, :] - result.block_annotation_mass)
-    )
     condition = float(np.linalg.cond(result.genetic_gram))
     if not np.isfinite(condition):
         raise RuntimeError("example normal matrix is singular")
     telemetry = dict(result.telemetry)
-    axes = serialize_generalized_gxe_axes(
+    axes = serialize_generalized_gxe_inference_axes(
         num_variants=m,
-        variant_digest=_sha256(paths[".bim"]),
-        retained_variant_digest=(
-            result.genotype_scale_plan.retained_variant_order_sha256
-        ),
         num_samples=n,
-        sample_digest=_sha256(paths[".fam"]),
         basis_names=("intercept", "environment", "environment_squared"),
-        basis_digest=array_sha256(basis),
-        basis_calibration_digest=array_sha256(basis.T @ basis),
-        fixed_effect_digest=array_sha256(fixed),
         fixed_effect_rank=fixed.shape[1],
         annotation_names=("all_variants",),
-        annotation_digest=array_sha256(annotations),
         annotation_masses=annotation_masses,
-        variant_block_ids=block_ids,
-        block_labels=tuple(f"block_{index:03d}" for index in range(blocks)),
-        jackknife_block_digest=array_sha256(block_ids),
+        variant_block_ids=inference_block_ids,
+        block_labels=tuple(f"block_{index:03d}" for index in range(njack)),
         residual_component_names=("identity",),
     )
-    binary_sha256 = _sha256(Path(gxeldcore.__file__))
     diagnostics = {
         "maximum_source_projection_leakage": float(
             telemetry["maximum_projection_leakage"]
@@ -245,19 +225,15 @@ def main() -> int:
         "maximum_presymmetry_relative_error": float(
             result.presymmetry_relative_error
         ),
-        "block_reconstruction_error": float(result.block_reconstruction_error),
         "same_person_probe_count": args.probes,
         "same_person_cross_tile_finalized": True,
         "minimum_annotation_mass": float(np.min(annotation_masses)),
-        "minimum_deleted_annotation_mass": minimum_deleted_mass,
         "all_values_finite": all(
             np.all(np.isfinite(value))
             for value in (
                 result.directed_numerator,
                 result.symmetric_numerator,
                 result.genetic_gram,
-                result.block_directed_numerator,
-                result.block_annotation_mass,
                 result.same_person,
             )
         ),
@@ -269,14 +245,11 @@ def main() -> int:
     artifact = build_generalized_gxe_variant_reference_from_native_v1(
         result,
         axes=axes,
+        annotations=annotations,
         probe_spec=probe_spec,
-        genotype_scale_plan=result.genotype_scale_plan,
+        genotype_scale_plan=result.genotype_scale,
         performance_ledger=generalized_gxe_performance_ledger_from_native(result),
-        provenance={
-            "source_commit": build_info["source_commit"],
-            "source_tree_sha256": build_info["source_tree_sha256"],
-            "native_binary_sha256": binary_sha256,
-        },
+        provenance={"native_module": str(Path(gxeldcore.__file__))},
         diagnostics=diagnostics,
         include_directional_panel=not args.omit_directional_panel,
     )
@@ -292,10 +265,8 @@ def main() -> int:
                     "Q": 3,
                     "K": 1,
                     "B": args.probes,
-                    "J": blocks,
+                    "J": njack,
                 },
-                "genotype_scale_plan_sha256": loaded.scale_plan.digest,
-                "manifest_sha256": loaded.manifest_sha256,
                 "pass_ledger": dict(loaded.manifest["pass_ledger"]),
                 "per_variant_panel": dict(loaded.manifest["per_variant_panel"]),
             }

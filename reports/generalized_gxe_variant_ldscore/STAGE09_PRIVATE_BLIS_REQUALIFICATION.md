@@ -1,5 +1,9 @@
 # Stage 09 private-BLIS FP64 requalification
 
+> **Backend evidence only; estimator API superseded 2026-08-24.** The current
+> native reference estimator accepts no block IDs or jackknife argument. Its
+> per-SNP output is reduced into `--njack` normal-equation blocks afterward.
+
 Date: 2026-08-22
 
 Repository: `/home/bronsonj/SUMMIT`
@@ -22,9 +26,8 @@ production-row, `B=128`, and `B=1024` controls with exactly two passes, exactly
 integrity-failure counts.
 
 The changed-`J` invariance experiment has been removed as a requirement. SNP
-block deletion is an inference-time operation over fixed reference summaries;
-reference construction accumulates block target-row numerators and masses but
-does not run jackknife fits or materialize delete-block Gram cubes.
+block deletion is an inference-time operation over fixed per-SNP reference and
+trait summaries; reference construction does not accept or accumulate blocks.
 
 ## Frozen native identity
 
@@ -180,7 +183,7 @@ neither form of the optional panel.
 env BLIS_NUM_THREADS=4 OMP_NUM_THREADS=4 OMP_THREAD_LIMIT=4 \
   python example/estimate_generalized_gxe_variant_ldscore.py \
   --output /tmp/summit-generalized-example \
-  --probes 16 --blocks 20 --threads 4
+  --probes 16 --njack 20 --threads 4
 ```
 
 The installed command

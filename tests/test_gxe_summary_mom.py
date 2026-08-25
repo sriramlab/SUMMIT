@@ -11,10 +11,7 @@ import pytest
 
 from summit.inference import gxe as gxe_module
 from summit.inference.gxe import (
-    GxEConsumedInputProvenance,
-    GxEInputProvenance,
     GxENormalEquations,
-    _assemble_deleted_normal_equations,
     _equations_from_prepared_scores,
     _prepare_reference_sufficient_statistics,
     assemble_normal_equations,
@@ -284,37 +281,23 @@ def test_solver_rejects_materially_non_psd_trace_matrix():
 def test_fit_json_serializes_nonfinite_diagnostics_as_null(tmp_path):
     equations, _, _, _ = _exact_fixture()
     fitted = solve_normal_equations(equations, max_condition=1e16)
-    _, direct_json = write_fit(tmp_path / "direct-fit", fitted, equations)
-    assert json.loads(direct_json.read_text())["consumed_input_provenance"] is None
-
-    record = GxEInputProvenance(
-        path=str((tmp_path / "input").resolve()),
-        bytes=1,
-        sha256="0" * 64,
-    )
-    malformed = replace(
-        fitted,
-        consumed_input_provenance=GxEConsumedInputProvenance(
-            reference_manifest=record,
-            feature_cache=record,
-            phenotype_moments=record,
-            gwas=replace(record, path="relative/path"),
-            gwis=record,
-        ),
-    )
-    with pytest.raises(ValueError, match="canonical absolute path"):
-        write_fit(tmp_path / "malformed-provenance", malformed, equations)
-
     altered = replace(
         fitted,
         condition_number=np.inf,
-        proportions=np.where(np.arange(len(fitted.proportions)) == 0, np.nan, fitted.proportions),
+        proportions=np.where(
+            np.arange(len(fitted.proportions)) == 0,
+            np.nan,
+            fitted.proportions,
+        ),
     )
-    _, json_path = write_fit(tmp_path / "nonfinite", altered, equations)
+    table_path, json_path = write_fit(tmp_path / "nonfinite", altered, equations)
     payload = json.loads(json_path.read_text())
+    assert table_path.is_file()
     assert payload["condition_number"] is None
     assert payload["proportions"][0] is None
-
+    assert payload["jackknife_method"] == (
+        "frozen_full_genome_variant_ldscore_delete_block_v1"
+    )
 
 def test_fit_publication_rollback_preserves_competing_json(tmp_path, monkeypatch):
     equations, _, _, _ = _exact_fixture()
@@ -360,68 +343,19 @@ def test_fit_does_not_path_chmod_published_output(tmp_path, monkeypatch):
     assert not list(tmp_path.glob(".gxe-fit-stage-*"))
 
 
-def test_null_corrected_storage_offset_is_exactly_reversed():
-    equations, lhs, _, _ = _exact_fixture()
-    # Reconstruct the fixture and subtract the documented source mass/r offset
-    # from every row of every panel.
-    rng = np.random.default_rng(90210)
-    n, m = 41, 19
-    e = rng.normal(size=n)
-    e = (e - e.mean()) / e.std(ddof=1)
-    c = rng.normal(size=n)
-    pmat, r = _projector(np.column_stack([np.ones(n), e, c, c]))
-    x0 = rng.binomial(2, rng.uniform(0.1, 0.45, size=m), size=(n, m)).astype(float)
-    x0 -= x0.mean(axis=0)
-    x0 /= x0.std(axis=0, ddof=1)
-    x = pmat @ x0
-    w = pmat @ (e[:, None] * x0)
-    y = pmat @ rng.normal(size=n)
-    y *= np.sqrt(r / np.dot(y, y))
-    annot = np.column_stack([np.linspace(0.2, 1.0, m), 0.15 + (np.arange(m) % 3) / 3.0])
-    masses = annot.sum(axis=0)
+def test_posthoc_deletion_drops_only_fixed_target_rows_and_rescales():
+    rng = np.random.default_rng(947)
+    n, m, k, nblock = 31, 29, 3, 5
+    residual_rank = 27
+    x = rng.normal(size=(n, m))
+    w = rng.normal(size=(n, m))
+    y = rng.normal(size=n)
+    environment = rng.normal(size=n)
+    annotations = 0.05 + rng.random((m, k))
+    blocks = (np.arange(m) * 7 + 3) % nblock
 
     def panel(left, source):
-        return ((left.T @ source) / r) ** 2 @ annot - masses[None, :] / r
-
-    hn = pmat @ np.diag(e * e) @ pmat
-    corrected = assemble_normal_equations(
-        annotations=annot,
-        score_x=x.T @ y / np.sqrt(r),
-        score_w=w.T @ y / np.sqrt(r),
-        ld_xx=panel(x, x),
-        ld_xw=panel(x, w),
-        ld_wx=panel(w, x),
-        ld_ww=panel(w, w),
-        norm_x=np.sum(x * x, axis=0) / r,
-        norm_w=np.sum(w * w, axis=0) / r,
-        diag_nxe_x=np.sum((e[:, None] * x) ** 2, axis=0) / r,
-        diag_nxe_w=np.sum((e[:, None] * w) ** 2, axis=0) / r,
-        residual_rank=r,
-        q_nxe=float(np.sum(e * e * y * y)),
-        q_residual=float(y @ y),
-        trace_nxe=float(np.trace(hn)),
-        trace_nxe_sq=float(np.trace(hn @ hn)),
-        annotation_names=("fractional", "overlap"),
-        null_corrected=True,
-    )
-    np.testing.assert_allclose(corrected.matrix, lhs, rtol=3e-13, atol=3e-13)
-
-
-def test_two_sided_block_deletion_matches_explicit_deleted_kernels():
-    rng = np.random.default_rng(77)
-    n, m = 34, 18
-    e = rng.normal(size=n)
-    e = (e - e.mean()) / e.std(ddof=1)
-    pmat, r = _projector(np.column_stack([np.ones(n), e, rng.normal(size=n)]))
-    x0 = rng.normal(size=(n, m))
-    x = pmat @ x0
-    w = pmat @ (e[:, None] * x0)
-    y = pmat @ rng.normal(size=n)
-    annot = np.column_stack([0.2 + rng.random(m), 0.1 + (np.arange(m) % 4) / 4.0])
-    blocks = np.repeat(np.arange(3), m // 3)
-
-    def panel(left, source):
-        return ((left.T @ source) / r) ** 2 @ annot
+        return ((left.T @ source / residual_rank) ** 2) @ annotations
 
     panels = {
         "xx": panel(x, x),
@@ -429,95 +363,12 @@ def test_two_sided_block_deletion_matches_explicit_deleted_kernels():
         "wx": panel(w, x),
         "ww": panel(w, w),
     }
-    within = {key: np.zeros((3, 2, 2)) for key in panels}
-    for block_id in range(3):
-        take = blocks == block_id
-        a = annot[take]
-        for key, (left, source) in {
-            "xx": (x, x),
-            "xw": (x, w),
-            "wx": (w, x),
-            "ww": (w, w),
-        }.items():
-            within[key][block_id] = a.T @ (((left[:, take].T @ source[:, take]) / r) ** 2) @ a
-
-    hn = pmat @ np.diag(e * e) @ pmat
-    for block_id in range(3):
-        deleted = _assemble_deleted_normal_equations(
-            block_id=block_id,
-            annotations=annot,
-            blocks=blocks,
-            score_x=x.T @ y / np.sqrt(r),
-            score_w=w.T @ y / np.sqrt(r),
-            panels=panels,
-            within=within,
-            norm_x=np.sum(x * x, axis=0) / r,
-            norm_w=np.sum(w * w, axis=0) / r,
-            diag_x=np.sum((e[:, None] * x) ** 2, axis=0) / r,
-            diag_w=np.sum((e[:, None] * w) ** 2, axis=0) / r,
-            residual_rank=r,
-            q_nxe=float(y @ hn @ y),
-            q_residual=float(y @ y),
-            trace_nxe=float(np.trace(hn)),
-            trace_nxe_sq=float(np.trace(hn @ hn)),
-            annotation_names=("a", "b"),
-            null_corrected=False,
-        )
-        keep = blocks != block_id
-        masses = annot[keep].sum(axis=0)
-        kernels = []
-        for a in range(2):
-            kernels.append((x[:, keep] * annot[keep, a]) @ x[:, keep].T / masses[a])
-        for a in range(2):
-            kernels.append((w[:, keep] * annot[keep, a]) @ w[:, keep].T / masses[a])
-        kernels.extend([hn, pmat])
-        expected_lhs = np.asarray([[np.trace(a @ b) for b in kernels] for a in kernels])
-        expected_rhs = np.asarray([y @ a @ y for a in kernels])
-        np.testing.assert_allclose(deleted.matrix, expected_lhs, rtol=3e-13, atol=3e-13)
-        np.testing.assert_allclose(deleted.rhs, expected_rhs, rtol=3e-13, atol=3e-13)
-
-
-@pytest.mark.parametrize("null_corrected", [False, True])
-def test_preaggregated_deletion_matches_legacy_for_overlapping_annotations(
-    null_corrected,
-):
-    rng = np.random.default_rng(947)
-    n, m, k, nblock = 31, 29, 3, 5
-    r = 27
-    x = rng.normal(size=(n, m))
-    w = rng.normal(size=(n, m))
-    y = rng.normal(size=n)
-    e = rng.normal(size=n)
-    annotations = 0.05 + rng.random((m, k))
-    # Deliberately interleave blocks; the optimization cannot assume slices.
-    blocks = (np.arange(m) * 7 + 3) % nblock
-    cross = {
-        "xx": (x.T @ x / r) ** 2,
-        "xw": (x.T @ w / r) ** 2,
-        "wx": (w.T @ x / r) ** 2,
-        "ww": (w.T @ w / r) ** 2,
-    }
-    raw_panels = {key: value @ annotations for key, value in cross.items()}
-    masses = annotations.sum(axis=0)
-    panels = {
-        key: value - masses[None, :] / r if null_corrected else value
-        for key, value in raw_panels.items()
-    }
-    within = {key: np.empty((nblock, k, k)) for key in panels}
-    for block_id in range(nblock):
-        take = blocks == block_id
-        for key, value in cross.items():
-            within[key][block_id] = (
-                annotations[take].T
-                @ value[np.ix_(take, take)]
-                @ annotations[take]
-            )
-    score_x = x.T @ y / np.sqrt(r)
-    score_w = w.T @ y / np.sqrt(r)
-    norm_x = np.sum(x * x, axis=0) / r
-    norm_w = np.sum(w * w, axis=0) / r
-    diag_x = np.sum((e[:, None] * x) ** 2, axis=0) / r
-    diag_w = np.sum((e[:, None] * w) ** 2, axis=0) / r
+    score_x = x.T @ y / np.sqrt(residual_rank)
+    score_w = w.T @ y / np.sqrt(residual_rank)
+    norm_x = np.sum(x * x, axis=0) / residual_rank
+    norm_w = np.sum(w * w, axis=0) / residual_rank
+    diag_x = np.sum((environment[:, None] * x) ** 2, axis=0) / residual_rank
+    diag_w = np.sum((environment[:, None] * w) ** 2, axis=0) / residual_rank
     names = ("a", "b", "c")
     full = assemble_normal_equations(
         annotations=annotations,
@@ -531,13 +382,12 @@ def test_preaggregated_deletion_matches_legacy_for_overlapping_annotations(
         norm_w=norm_w,
         diag_nxe_x=diag_x,
         diag_nxe_w=diag_w,
-        residual_rank=r,
+        residual_rank=residual_rank,
         q_nxe=3.1,
-        q_residual=r,
+        q_residual=residual_rank,
         trace_nxe=25.4,
         trace_nxe_sq=30.2,
         annotation_names=names,
-        null_corrected=null_corrected,
     )
     variants = pd.DataFrame(
         {
@@ -551,17 +401,11 @@ def test_preaggregated_deletion_matches_legacy_for_overlapping_annotations(
     prepared = _prepare_reference_sufficient_statistics(
         path=Path("reference.json"),
         payload={
-            "residual_rank": r,
+            "residual_rank": residual_rank,
             "trace_nxe": 25.4,
             "trace_nxe_sq": 30.2,
         },
-        manifest_sha256="0" * 64,
-        schema_version=2,
-        feature_cache_sha256=None,
-        reference_provenance=GxEInputProvenance(
-            path="/reference.json", bytes=1, sha256="0" * 64
-        ),
-        feature_cache_provenance=None,
+        schema_version=4,
         variants=variants,
         annotations=annotations,
         annotation_names=names,
@@ -572,105 +416,36 @@ def test_preaggregated_deletion_matches_legacy_for_overlapping_annotations(
         diag_w=diag_w,
         equations=full,
         block_values=blocks,
-        block_labels=tuple(f"block:{index}" for index in range(nblock)),
-        within=within,
-        null_corrected=null_corrected,
+        block_labels=tuple(f"block_{index}" for index in range(nblock)),
     )
-    prepared_full, prepared_deleted = _equations_from_prepared_scores(
+    observed_full, deleted = _equations_from_prepared_scores(
         prepared,
         score_x,
         score_w,
         q_nxe=3.1,
-        q_residual=r,
+        q_residual=residual_rank,
     )
-    np.testing.assert_allclose(prepared_full.matrix, full.matrix, rtol=0.0, atol=0.0)
-    np.testing.assert_allclose(prepared_full.rhs, full.rhs, rtol=3e-15, atol=3e-14)
-    for block_id, observed in enumerate(prepared_deleted):
-        expected = _assemble_deleted_normal_equations(
-            block_id=block_id,
-            annotations=annotations,
-            blocks=blocks,
-            score_x=score_x,
-            score_w=score_w,
-            panels=panels,
-            within=within,
-            norm_x=norm_x,
-            norm_w=norm_w,
-            diag_x=diag_x,
-            diag_w=diag_w,
-            residual_rank=r,
-            q_nxe=3.1,
-            q_residual=r,
-            trace_nxe=25.4,
-            trace_nxe_sq=30.2,
-            annotation_names=names,
-            null_corrected=null_corrected,
-        )
-        np.testing.assert_allclose(observed.matrix, expected.matrix, rtol=3e-15, atol=1e-12)
-        np.testing.assert_allclose(observed.rhs, expected.rhs, rtol=3e-15, atol=1e-12)
-        np.testing.assert_allclose(observed.traces, expected.traces, rtol=3e-15, atol=1e-12)
-
-    block_local = _prepare_reference_sufficient_statistics(
-        path=Path("reference.json"),
-        payload={
-            "residual_rank": r,
-            "trace_nxe": 25.4,
-            "trace_nxe_sq": 30.2,
-        },
-        manifest_sha256="0" * 64,
-        schema_version=3,
-        feature_cache_sha256=None,
-        reference_provenance=GxEInputProvenance(
-            path="/reference.json", bytes=1, sha256="0" * 64
-        ),
-        feature_cache_provenance=None,
-        variants=variants,
-        annotations=annotations,
-        annotation_names=names,
-        panels=panels,
-        norm_x=norm_x,
-        norm_w=norm_w,
-        diag_x=diag_x,
-        diag_w=diag_w,
-        equations=full,
-        block_values=blocks,
-        block_labels=tuple(f"block:{index}" for index in range(nblock)),
-        within=None,
-        jackknife_method=gxe_module._BLOCK_LOCAL_JACKKNIFE_METHOD,
-        null_corrected=null_corrected,
-    )
-    _, local_deleted = _equations_from_prepared_scores(
-        block_local,
-        score_x,
-        score_w,
-        q_nxe=3.1,
-        q_residual=r,
-    )
-    for block_id, observed in enumerate(local_deleted):
+    np.testing.assert_allclose(observed_full.matrix, full.matrix, rtol=0.0, atol=0.0)
+    for block_id, observed in enumerate(deleted):
         keep = blocks != block_id
-        # This is the additive-style approximation: remove completed
-        # LD-score rows and all per-variant moments, then renormalize by the
-        # annotation mass that remains. Source-side LD from the deleted block
-        # is intentionally left in retained rows.
         expected = assemble_normal_equations(
             annotations=annotations[keep],
             score_x=score_x[keep],
             score_w=score_w[keep],
-            ld_xx=raw_panels["xx"][keep],
-            ld_xw=raw_panels["xw"][keep],
-            ld_wx=raw_panels["wx"][keep],
-            ld_ww=raw_panels["ww"][keep],
+            ld_xx=panels["xx"][keep],
+            ld_xw=panels["xw"][keep],
+            ld_wx=panels["wx"][keep],
+            ld_ww=panels["ww"][keep],
             norm_x=norm_x[keep],
             norm_w=norm_w[keep],
             diag_nxe_x=diag_x[keep],
             diag_nxe_w=diag_w[keep],
-            residual_rank=r,
+            residual_rank=residual_rank,
             q_nxe=3.1,
-            q_residual=r,
+            q_residual=residual_rank,
             trace_nxe=25.4,
             trace_nxe_sq=30.2,
             annotation_names=names,
-            null_corrected=False,
         )
         np.testing.assert_allclose(observed.matrix, expected.matrix, rtol=3e-15, atol=1e-12)
         np.testing.assert_allclose(observed.rhs, expected.rhs, rtol=3e-15, atol=1e-12)

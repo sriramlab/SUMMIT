@@ -243,7 +243,7 @@ automatically within the requested memory budget:
 summit \
   --geno ref_panel --env environment.txt --covar covariates.txt \
   --annot mafld.annot.gz \
-  --gxe-kernel-mode standardized --gxe-genotype-scale sample \
+  --gxe-kernel-mode standardized_projected --gxe-genotype-scale sample \
   --nvecs 1024 --seed 20260808 --rand-dist rademacher \
   --target-mem 16 \
   --out outs/reference.B1024
@@ -328,8 +328,10 @@ constructs and seals the dimensions/design/annotation plan, validates native
 evidence, and transactionally publishes the final arrays; decoded genotype and
 intermediate numerical panels never cross the Python/C++ boundary. The same
 descriptor-owned path is used for a phenotype-free single `--env` direct
-reference (as a one-environment plan). Feature-cache, reference-shard, and
-phenotype-scoring workflows retain their purpose-specific paths.
+reference (as a one-environment plan). Phenotype scoring is a separate
+streaming pass over the study genotype and phenotype inputs. Development-stage
+feature-cache and reference-shard workflows are not part of the current
+interface.
 The protected source is accumulated directly into the first half of its final
 read-only `[S, e*S]` mapping. Sealing fills only the weighted half, eliminating
 one full-panel copy and reducing the panel live peak from three panels to two.
@@ -339,16 +341,17 @@ are independent per environment, not a cross-environment covariance model.
 On a multi-socket host, `auto` may divide four or more direct-backend
 environments between two process-isolated socket groups when at least 32 total
 threads are requested. Each group has a private BLAS runtime and disjoint
-physical cores; a canonical batch manifest is published only after both group
-manifests and every referenced artifact pass hash validation. Use `1` for the
+physical cores; a batch manifest is published only after both group
+manifests and every referenced artifact pass direct structural validation. Use `1` for the
 lowest aggregate memory footprint or `2` to require the isolated layout.
 
-New GxE reference generation does not create block-local deletion-jackknife
-metadata or `.gxe.jackknife.npz` artifacts. These optional outputs did not
-change the LD-score point estimates and added a separate, probe-sensitive
-uncertainty path. Existing sealed references that already contain jackknife
-metadata remain readable for reproducibility, while new fits omit jackknife
-standard errors unless uncertainty is supplied by a future explicit method.
+One-environment GxE reference generation creates no deletion state: jackknife
+blocks do not enter LD-score estimation or phenotype scoring. At fitting time,
+`--njack` groups the fixed per-SNP reference and trait rows, drops each target
+block's contribution from the normal equations, rescales retained annotation
+masses, and solves the delete-block systems. It never recomputes source
+sketches or retained SNP LD scores. These post-hoc replicates provide the
+reported standard errors and Wald statistics.
 
 ```bash
 summit \
@@ -356,12 +359,13 @@ summit \
   --gxe-gwas outs/scores.trait1.gxe.gwas.tsv.gz \
   --gwis outs/scores.trait1.gxe.gwis.tsv.gz \
   --gxe-moments outs/scores.trait1.gxe.moments.json \
+  --njack 200 \
   --out outs/trait1
 ```
 
 For several traits sharing one reference, a strict batch manifest avoids
-reloading and reaggregating the reference for every fit while retaining full
-per-trait hash and SNP-axis validation:
+reloading and reaggregating the reference for every fit while retaining direct
+per-trait dimensions, labels, scaling, and SNP-axis validation:
 
 ```json
 {
@@ -388,24 +392,23 @@ All trait result pairs are preflighted and published as one no-overwrite
 transaction. Downstream consumers should wait for successful command/job
 completion before reading a batch.
 
-The default `--gxe-kernel-mode standardized` uses SUMMIT's covariate-adjusted
+The default `--gxe-kernel-mode standardized_projected` uses SUMMIT's covariate-adjusted
 partial-correlation convention: form `P G` and `P[diag(E)G]`, then normalize
 each valid projected column to squared norm `rank(P)`. This is the same
 post-projection convention used by SUMMIT's additive LD/score machinery and is
 invariant to nonsingular rescaling of a retained genotype column. The explicit
-`--gxe-kernel-mode genie --gxe-genotype-scale hwe` sensitivity mode instead
+`--gxe-kernel-mode raw_projected --gxe-genotype-scale hwe` sensitivity mode instead
 keeps the natural norms of HWE-scaled projected columns to reproduce GENIE's
 kernel definition. These are different random-effect estimands, so their
-artifacts cannot be mixed; both choices are recorded and hash-bound.
+artifacts cannot be mixed; both choices are recorded explicitly.
 
 Do not pass a conventional PLINK 2 `--glm interaction` `ADDxE` Z statistic as
 `--gwis`: it is conditional on the SNP main effect. GENIE requires the marginal
 cross-product of projected `G*E` with projected phenotype. SUMMIT's generated
 files declare `SCORE_MODE=marginal_cross_product` and the loader rejects other
-declared modes. Every score/reference artifact is SHA-256-bound. Phenotype
-summaries are also bound to the exact reference manifest and design, so files
-from different cohorts, environments, variants, or kernel conventions cannot
-be mixed.
+declared modes. Compatibility should be checked from concrete ordered SNP and
+allele columns, dimensions, environment/design labels, scaling conventions,
+and annotation values—not cryptographic file identity.
 
 Generation and fitting refuse an existing output prefix unless
 `--gxe-overwrite` is supplied explicitly; files are written atomically with

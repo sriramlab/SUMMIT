@@ -7,22 +7,20 @@ import argparse
 import json
 from pathlib import Path
 import time
-from types import SimpleNamespace
 
 import numpy as np
 
-from summit.context.reference_v1 import contextual_variant_order_allele_sha256_v1
-from summit.context.spec import array_sha256, canonical_sha256
-from summit.context.trait_v1 import load_contextual_trait_v1
 from summit.ldscore.generalized_gxe_reference_v1 import (
     load_generalized_gxe_variant_reference_v1,
+)
+from summit.ldscore.generalized_gxe_trait_summary import (
+    load_generalized_gxe_trait_summary,
 )
 
 from workflow import (
     ReferenceRun,
-    balanced_block_ids,
+    balanced_inference_block_ids,
     canonical_json,
-    file_sha256,
     full_fits,
     read_plink_axes,
     require_private_blis,
@@ -30,7 +28,6 @@ from workflow import (
     run_reference,
     run_trait_batch,
     symmetric_context_residual_basis,
-    zero_missingness_sha256,
 )
 
 
@@ -40,8 +37,6 @@ def _load_batch(directory: Path) -> tuple[dict, dict[str, np.ndarray]]:
     manifest = json.loads(manifest_path.read_text())
     if manifest.get("schema") != "summit.generalized_gxe.simulation_batch_v1":
         raise ValueError(f"unsupported simulation manifest {manifest_path}")
-    if file_sha256(array_path) != manifest["outputs"]["arrays_sha256"]:
-        raise RuntimeError(f"simulation arrays changed: {array_path}")
     with np.load(array_path, allow_pickle=False) as source:
         arrays = {name: np.asarray(source[name]) for name in source.files}
     if int(manifest["genotype"]["complete_traversals"]) != 1:
@@ -55,54 +50,14 @@ def _validate_reused_trait(
     *,
     trait,
     axes,
-    reference_run: ReferenceRun,
-    basis: np.ndarray,
-    fixed: np.ndarray,
     annotations: np.ndarray,
-    block_ids: np.ndarray,
-    block_labels: tuple[str, ...],
-    phenotypes: np.ndarray,
+    inference_block_ids: np.ndarray,
+    inference_block_labels: tuple[str, ...],
     trait_names: tuple[str, ...],
-    residual_basis: np.ndarray,
     residual_names: tuple[str, ...],
 ) -> None:
-    """Reject a named trait artifact unless every reusable input is identical."""
-    retained_samples = np.arange(axes.n, dtype=np.int64)
-    retained_variants = np.arange(axes.m, dtype=np.int64)
-    counted_a1 = np.ones(axes.m, dtype=np.uint8)
-    identity = trait.manifest["identity"]
-    expected_identity = {
-        "sample_order_sha256": canonical_sha256(
-            {"ordered_iids": list(axes.sample_ids)}
-        ),
-        "variant_order_allele_sha256": (
-            contextual_variant_order_allele_sha256_v1(
-                retained_variants,
-                axes.variant_ids,
-                axes.counted_alleles,
-                axes.other_alleles,
-                counted_a1,
-            )
-        ),
-        "retained_sample_map_sha256": array_sha256(retained_samples),
-        "retained_variant_order_sha256": array_sha256(retained_variants),
-        "fixed_effect_spec_sha256": array_sha256(fixed),
-        "basis_specification_sha256": array_sha256(basis),
-        "basis_calibration_sha256": array_sha256(basis.T @ basis),
-        "fixed_basis_sha256": array_sha256(fixed),
-        "evaluated_phi_sha256": array_sha256(basis),
-        "genotype_scale_plan_sha256": reference_run.artifact.scale_plan.digest,
-        "missingness_sha256": zero_missingness_sha256(axes.m, axes.n),
-        "annotation_map_sha256": array_sha256(annotations),
-        "group_map_sha256": array_sha256(block_ids),
-        "phenotype_batch_sha256": array_sha256(phenotypes),
-        "residual_basis_sha256": array_sha256(residual_basis),
-    }
-    mismatches = [
-        f"identity.{name}"
-        for name, expected in expected_identity.items()
-        if identity.get(name) != expected
-    ]
+    """Check the concrete reusable axes and block summaries."""
+    mismatches = []
     expected_values = {
         "N": (trait.n_samples, axes.n),
         "M": (trait.n_variants, axes.m),
@@ -112,10 +67,14 @@ def _validate_reused_trait(
             trait.component_index.annotation_names,
             ("all_variants",),
         ),
-        "block_labels": (trait.group_ids, block_labels),
-        "scale_plan": (
-            trait.scale_plan.digest,
-            reference_run.artifact.scale_plan.digest,
+        "block_labels": (trait.group_ids, inference_block_labels),
+        "annotation_masses": (
+            tuple(trait.annotation_masses),
+            tuple(np.sum(annotations, axis=0, dtype=np.float64)),
+        ),
+        "block_counts": (
+            tuple(int(value) for value in trait.group_variant_counts),
+            tuple(int(value) for value in np.bincount(inference_block_ids)),
         ),
     }
     mismatches.extend(
@@ -159,12 +118,15 @@ def _summarize_batch(
     normalized_omega = arrays["normalized_omega"]
     for pair_index, pair in enumerate(pairs):
         truth[:, pair_index] = normalized_omega[:, pair.q, pair.r]
-    for residual_index, pair in enumerate(residual_pairs):
-        truth[:, len(pairs) + residual_index] = (
-            arrays["normalized_residual_variance"]
-            if pair == (0, 0)
-            else 0.0
-        )
+    if "normalized_residual_coefficients" in arrays:
+        truth[:, len(pairs) :] = arrays["normalized_residual_coefficients"]
+    else:
+        for residual_index, pair in enumerate(residual_pairs):
+            truth[:, len(pairs) + residual_index] = (
+                arrays["normalized_residual_variance"]
+                if pair == (0, 0)
+                else 0.0
+            )
     z_null = np.divide(
         estimates,
         standard_errors,
@@ -208,11 +170,17 @@ def _summarize_batch(
         },
         **{
             name: (
-                arrays["normalized_residual_variance"]
-                if pair == (0, 0)
-                else np.zeros(normalized_omega.shape[0], dtype=np.float64)
+                arrays["normalized_residual_coefficients"][:, index]
+                if "normalized_residual_coefficients" in arrays
+                else (
+                    arrays["normalized_residual_variance"]
+                    if pair == (0, 0)
+                    else np.zeros(normalized_omega.shape[0], dtype=np.float64)
+                )
             )
-            for name, pair in zip(residual_names, residual_pairs, strict=True)
+            for index, (name, pair) in enumerate(
+                zip(residual_names, residual_pairs, strict=True)
+            )
         },
     }
     restricted_truth = np.column_stack(
@@ -338,7 +306,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--simulation", type=Path, action="append", required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--probes", type=int, default=128)
-    parser.add_argument("--blocks", type=int, default=200)
+    parser.add_argument(
+        "--njack", type=int, default=200,
+        help="post-hoc delete-block replicates for normal-equation inference",
+    )
     parser.add_argument("--seed", type=int, default=20260823)
     parser.add_argument("--memory-gib", type=float, default=64.0)
     parser.add_argument("--probe-tile-width", type=int, default=4)
@@ -381,17 +352,17 @@ def main() -> int:
         raise ValueError("benchmark requires at least two replicates per batch")
     prefix = Path(first_manifest["genotype"]["prefix"])
     axes = read_plink_axes(prefix)
-    source_hashes = first_manifest["genotype"]["source_sha256"]
-    for suffix in (".bed", ".bim", ".fam"):
-        source_path = Path(str(axes.prefix) + suffix)
-        if file_sha256(source_path) != source_hashes[suffix]:
-            raise RuntimeError(f"simulation genotype source changed: {source_path}")
     for manifest, arrays in batches:
         if Path(manifest["genotype"]["prefix"]).resolve() != axes.prefix:
             raise ValueError("simulation batches use different genotype sources")
-        if manifest["genotype"]["source_sha256"] != source_hashes:
-            raise ValueError("simulation batches have different genotype file hashes")
-        for name in ("basis", "fixed_basis", "residual_basis", "sample_ids"):
+        for name in (
+            "basis",
+            "fixed_basis",
+            "residual_basis",
+            "residual_names",
+            "residual_pairs",
+            "sample_ids",
+        ):
             if not np.array_equal(arrays[name], first_arrays[name]):
                 raise ValueError(f"simulation batches differ in shared {name}")
         if int(manifest["dimensions"]["replicates"]) != replicates_per_batch:
@@ -410,9 +381,14 @@ def main() -> int:
 
     build_info, threads, placement = require_private_blis(gxeldcore)
     annotations = np.ones((axes.m, 1), dtype=np.float64)
-    block_ids, block_labels = balanced_block_ids(axes.m, args.blocks)
-    residual_basis, residual_names, residual_pairs = (
-        symmetric_context_residual_basis(first_arrays["basis"])
+    inference_block_ids, inference_block_labels = balanced_inference_block_ids(
+        axes.m, args.njack
+    )
+    residual_basis = np.asfortranarray(first_arrays["residual_basis"])
+    residual_names = tuple(str(value) for value in first_arrays["residual_names"])
+    residual_pairs = tuple(
+        tuple(int(value) for value in pair)
+        for pair in first_arrays["residual_pairs"]
     )
     restricted_residual_indices = tuple(
         index for index, (left, right) in enumerate(residual_pairs) if left == right
@@ -429,8 +405,8 @@ def main() -> int:
             fixed=first_arrays["fixed_basis"],
             annotations=annotations,
             annotation_names=("all_variants",),
-            block_ids=block_ids,
-            block_labels=block_labels,
+            inference_block_ids=inference_block_ids,
+            inference_block_labels=inference_block_labels,
             residual_names=residual_names,
             probes=args.probes,
             seed=args.seed,
@@ -472,51 +448,33 @@ def main() -> int:
         artifact = load_generalized_gxe_variant_reference_v1(reference_path)
         artifact_axes = artifact.manifest["axes"]
         randomization = artifact.manifest["randomization"]
-        provenance = artifact.manifest["provenance"]
-        loaded_native_sha256 = file_sha256(Path(gxeldcore.__file__))
-        retained = np.arange(axes.m, dtype=np.int64)
-        counted_a1 = np.ones(axes.m, dtype=np.uint8)
-        variant_digest = contextual_variant_order_allele_sha256_v1(
-            retained,
-            axes.variant_ids,
-            axes.counted_alleles,
-            axes.other_alleles,
-            counted_a1,
-        )
-        sample_digest = canonical_sha256(
-            {"ordered_iids": list(axes.sample_ids)}
-        )
         mismatches = []
         expected = {
             "N": (artifact.n_samples, axes.n),
             "M": (artifact.n_variants, axes.m),
-            "sample_order": (
-                artifact_axes["samples"]["digest"],
-                sample_digest,
+            "basis_names": (
+                tuple(artifact_axes["basis"]["names"]),
+                ("intercept", "environment_1", "environment_2"),
             ),
-            "variant_order_alleles": (
-                artifact_axes["variants"]["digest"],
-                variant_digest,
+            "fixed_rank": (
+                int(artifact_axes["fixed_effects"]["rank"]),
+                int(first_arrays["fixed_basis"].shape[1]),
             ),
-            "basis": (
-                artifact_axes["basis"]["digest"],
-                array_sha256(first_arrays["basis"]),
+            "annotation_names": (
+                tuple(artifact_axes["annotations"]["names"]),
+                ("all_variants",),
             ),
-            "fixed": (
-                artifact_axes["fixed_effects"]["digest"],
-                array_sha256(first_arrays["fixed_basis"]),
+            "annotation_masses": (
+                tuple(artifact_axes["annotations"]["masses"]),
+                tuple(np.sum(annotations, axis=0, dtype=np.float64)),
             ),
-            "annotations": (
-                artifact_axes["annotations"]["digest"],
-                array_sha256(annotations),
-            ),
-            "blocks": (
-                artifact_axes["jackknife_blocks"]["digest"],
-                array_sha256(block_ids),
+            "block_ids": (
+                tuple(artifact_axes["jackknife_blocks"]["variant_block_ids"]),
+                tuple(int(value) for value in inference_block_ids),
             ),
             "block_labels": (
                 tuple(artifact_axes["jackknife_blocks"]["block_labels"]),
-                tuple(block_labels),
+                tuple(inference_block_labels),
             ),
             "residual_names": (
                 tuple(artifact_axes["residual_components"]["names"]),
@@ -524,18 +482,6 @@ def main() -> int:
             ),
             "probe_count": (int(randomization["probe_count"]), args.probes),
             "probe_seed": (int(randomization["root_seed"]), args.seed),
-            "native_binary_sha256": (
-                provenance["native_binary_sha256"],
-                loaded_native_sha256,
-            ),
-            "native_source_commit": (
-                provenance["source_commit"],
-                build_info["source_commit"],
-            ),
-            "native_source_tree": (
-                provenance["source_tree_sha256"],
-                build_info["source_tree_sha256"],
-            ),
         }
         for name, (observed, requested) in expected.items():
             if observed != requested:
@@ -546,38 +492,10 @@ def main() -> int:
             )
         reference_run = ReferenceRun(
             artifact=artifact,
-            native_result=SimpleNamespace(
-                ledger={
-                    "missing_genotype_calls": int(
-                        np.sum(first_arrays["missing_counts"], dtype=np.int64)
-                    )
-                },
-                genotype_scale_plan=artifact.scale_plan,
-                affine_mean=np.asarray(first_arrays["affine_mean"]),
-                affine_inverse_scale=np.asarray(
-                    first_arrays["affine_inverse_scale"]
-                ),
-            ),
+            native_result=None,
             artifact_path=reference_path,
         )
         reference_seconds = 0.0
-    scale_plan = reference_run.artifact.scale_plan
-    scale_hashes = {
-        "affine_mean": (
-            scale_plan.affine_mean_sha256,
-            array_sha256(first_arrays["affine_mean"]),
-        ),
-        "affine_inverse_scale": (
-            scale_plan.affine_inverse_scale_sha256,
-            array_sha256(first_arrays["affine_inverse_scale"]),
-        ),
-    }
-    bad_scale = [name for name, (left, right) in scale_hashes.items() if left != right]
-    if bad_scale:
-        raise RuntimeError(
-            "simulator/reference sealed scale hashes differ: "
-            + ", ".join(bad_scale)
-        )
     phenotype_batches = [arrays["phenotypes"] for _, arrays in batches]
     combined_phenotypes = np.asfortranarray(np.column_stack(phenotype_batches))
     combined_trait_names = tuple(
@@ -596,33 +514,25 @@ def main() -> int:
             fixed=first_arrays["fixed_basis"],
             annotations=annotations,
             annotation_names=("all_variants",),
-            block_ids=block_ids,
-            block_labels=block_labels,
+            inference_block_ids=inference_block_ids,
+            inference_block_labels=inference_block_labels,
             phenotypes=combined_phenotypes,
             trait_names=combined_trait_names,
             residual_basis=residual_basis,
             residual_names=residual_names,
-            threads=threads,
-            memory_bytes=memory_bytes,
-            native_module=gxeldcore,
             output=args.output / "all_simulations_trait_batch",
         )
         trait_seconds = time.perf_counter() - trait_started
     else:
         trait_path = args.reuse_trait.resolve()
-        trait = load_contextual_trait_v1(trait_path)
+        trait = load_generalized_gxe_trait_summary(trait_path)
         _validate_reused_trait(
             trait=trait,
             axes=axes,
-            reference_run=reference_run,
-            basis=first_arrays["basis"],
-            fixed=first_arrays["fixed_basis"],
             annotations=annotations,
-            block_ids=block_ids,
-            block_labels=block_labels,
-            phenotypes=combined_phenotypes,
+            inference_block_ids=inference_block_ids,
+            inference_block_labels=inference_block_labels,
             trait_names=combined_trait_names,
-            residual_basis=residual_basis,
             residual_names=residual_names,
         )
         if reference_reused:
@@ -631,7 +541,6 @@ def main() -> int:
         trait_execution = {
             "reused_without_genotype_access": True,
             "source_artifact": str(trait_path),
-            "source_manifest_sha256": trait.manifest_sha256,
         }
     fit_started = time.perf_counter()
     fits = full_fits(reference_run.artifact, trait)
@@ -677,7 +586,7 @@ def main() -> int:
             "Q": 3,
             "K": 1,
             "B": args.probes,
-            "J": args.blocks,
+            "J": args.njack,
             "H": len(residual_names),
             "replicates_per_batch": replicates_per_batch,
         },
@@ -685,7 +594,6 @@ def main() -> int:
             "build_info": build_info,
             "openmp_placement": placement,
             "native_binary": str(gxeldcore.__file__),
-            "native_binary_sha256": file_sha256(Path(gxeldcore.__file__)),
             "immutable_threads": threads,
         },
         "reference": {
@@ -693,8 +601,7 @@ def main() -> int:
             "runtime_seconds": reference_seconds,
             "reused_without_genotype_access": reference_reused,
             "pass_ledger": dict(reference_run.artifact.manifest["pass_ledger"]),
-            "scale_plan_sha256": reference_run.artifact.scale_plan.digest,
-            "simulator_scale_hashes_match_exactly": True,
+            "genotype_scale": dict(reference_run.artifact.genotype_scale),
         },
         "shared_trait_batch": {
             "artifact": str(trait_path),

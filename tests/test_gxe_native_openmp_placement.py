@@ -34,6 +34,10 @@ def _placement_environment(
     environment["PYTHONPATH"] = os.pathsep.join(
         dict.fromkeys(path for path in python_paths if path)
     )
+    # Keep isolated children on the same C++ runtime as the active test
+    # interpreter.  Login shells can prepend a different base-Conda runtime,
+    # which is ABI-incompatible with an extension built in this environment.
+    environment["LD_LIBRARY_PATH"] = str(Path(sys.prefix) / "lib")
     environment["PYTHONDONTWRITEBYTECODE"] = "1"
     environment.pop("GOMP_CPU_AFFINITY", None)
     for name in (

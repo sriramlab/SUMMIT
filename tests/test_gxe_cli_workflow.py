@@ -54,7 +54,7 @@ def test_cli_reference_wide_score_and_fit_roundtrip(tmp_path, monkeypatch):
         "--geno", genotype,
         "--env", environment,
         "--covar", covariates,
-        "--gxe-kernel-mode", "standardized",
+        "--gxe-kernel-mode", "standardized_projected",
         "--gxe-genotype-scale", "sample",
         "--rand-dist", "rademacher",
         "--dtype", "float64",
@@ -107,14 +107,19 @@ def test_cli_reference_wide_score_and_fit_roundtrip(tmp_path, monkeypatch):
         "--gxe-moments", f"{score_prefix}.Y1.gxe.moments.json",
         "--gxe-max-condition", "1e16",
         "--allow-ill-conditioned-gxe",
+        "--njack", "3",
         "--out", fit_prefix,
     )
     fit_payload = json.loads(Path(f"{fit_prefix}.gxe.fit.json").read_text(encoding="utf-8"))
     assert fit_payload["component_names"] == ["G:L2_0", "GxE:L2_0", "NxE", "residual"]
     assert len(fit_payload["proportions"]) == 4
-    assert fit_payload["jackknife_block_labels"] == []
-    assert "standard_errors" not in fit_payload
-    assert "jackknife_estimates" not in fit_payload
+    assert fit_payload["jackknife_block_labels"] == [
+        "block_0001", "block_0002", "block_0003"
+    ]
+    assert len(fit_payload["coefficient_standard_errors"]) == 4
+    assert len(fit_payload["proportion_standard_errors"]) == 4
+    assert np.asarray(fit_payload["jackknife_coefficients"]).shape == (3, 4)
+    assert np.asarray(fit_payload["jackknife_proportions"]).shape == (3, 4)
 
     batch_manifest = tmp_path / "fit-batch.json"
     batch_manifest.write_text(
@@ -146,6 +151,7 @@ def test_cli_reference_wide_score_and_fit_roundtrip(tmp_path, monkeypatch):
         "--gxe-fit-batch", batch_manifest,
         "--gxe-max-condition", "1e16",
         "--allow-ill-conditioned-gxe",
+        "--njack", "3",
         "--out", tmp_path / "batch-job",
     )
     for trait in ("Y1", "Y2"):

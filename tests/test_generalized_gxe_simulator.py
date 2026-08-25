@@ -89,6 +89,34 @@ def test_two_environments_are_centered_scaled_and_orthogonal() -> None:
     np.testing.assert_allclose(environment.T @ environment, 199.0 * np.eye(2), atol=2e-12)
 
 
+@pytest.mark.parametrize("environment_type", ("gaussian_binary", "binary_binary"))
+def test_binary_environment_design_is_centered_scaled_and_rank_reduced(
+    environment_type: str,
+) -> None:
+    environment = MODULE.generate_environment(
+        2_000,
+        np.random.SeedSequence(92),
+        environment_type=environment_type,
+        correlation=0.4,
+    )
+    np.testing.assert_allclose(np.mean(environment, axis=0), 0.0, atol=2e-16)
+    np.testing.assert_allclose(
+        np.diag(environment.T @ environment), [1999.0, 1999.0], atol=2e-11
+    )
+    if environment_type == "gaussian_binary":
+        assert np.unique(environment[:, 1]).size == 2
+    else:
+        assert np.unique(environment[:, 0]).size == 2
+        assert np.unique(environment[:, 1]).size == 2
+    basis = np.column_stack([np.ones(environment.shape[0]), environment])
+    residual, _, _ = WORKFLOW.rank_reduced_symmetric_context_residual_basis(
+        basis, ("intercept", "environment_1", "environment_2")
+    )
+    expected_rank = 5 if environment_type == "gaussian_binary" else 4
+    assert residual.shape[1] == expected_rank
+    assert np.linalg.matrix_rank(residual) == expected_rank
+
+
 def test_symmetric_residual_basis_matches_context_pair_order() -> None:
     basis = np.asarray(
         [[1.0, -1.0, 2.0], [1.0, 0.5, -3.0], [1.0, 2.0, 4.0]]

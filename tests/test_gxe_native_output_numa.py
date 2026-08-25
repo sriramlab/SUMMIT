@@ -387,16 +387,17 @@ def test_native_gemm_output_contract_queries_every_page_in_fresh_process(
     environment.pop("SUMMIT_NUMA_POLICY_PROVENANCE", None)
     environment.update(
         {
+            "LD_LIBRARY_PATH": str(Path(sys.prefix) / "lib"),
             "PYTHONNOUSERSITE": "1",
             "PYTHONDONTWRITEBYTECODE": "1",
             "PYTHONPYCACHEPREFIX": str(tmp_path / "empty-pycache"),
             "PYTHONPATH": os.pathsep.join(
                 (str(package_root), str(dependency_root))
             ),
-                "OMP_NUM_THREADS": "1",
-                "OMP_THREAD_LIMIT": "1",
-                "BLIS_NUM_THREADS": "1",
-                "OMP_DYNAMIC": "FALSE",
+            "OMP_NUM_THREADS": "1",
+            "OMP_THREAD_LIMIT": "1",
+            "BLIS_NUM_THREADS": "1",
+            "OMP_DYNAMIC": "FALSE",
             "OMP_MAX_ACTIVE_LEVELS": "1",
             "OMP_PROC_BIND": "FALSE",
             "SUMMIT_TEST_NUMA_NODE": str(selected_node),

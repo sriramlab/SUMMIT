@@ -4,6 +4,13 @@
 > the generalized per-variant two-pass LD-score path. Reuse its variant-probe
 > source/target machinery, not its hard-coded four-panel layout or separate X/W
 > post-projection scaling. See `docs/generalized_gxe_variant_ldscore_contract.md`.
+>
+> **Jackknife boundary.** No deletion blocks belong in reference LD-score or
+> trait-summary estimation. At inference time, both the generalized and
+> one-environment fitters form delete-block normal equations from the fixed
+> per-SNP rows. Retained SNP LD scores are never recomputed. The current readers
+> accept only the current artifact schemas; development-stage exact two-sided
+> and block-local bundles are not supported.
 
 SUMMIT implements a one-environment, quantitative-trait method-of-moments model
 with additive genetic, gene-by-environment (GxE), noise-by-environment (NxE),
@@ -46,7 +53,8 @@ R     = P.
 
 This post-projection normalization is the partial-correlation convention used
 by SUMMIT's additive LD and marginal-score equations. It is therefore the
-primary `standardized` SUMMIT estimand. The explicit `genie` compatibility mode
+primary `standardized_projected` SUMMIT estimand. The explicit
+`raw_projected` mode
 uses HWE-scaled `G`, sets `X=PG` and `W=P[diag(e)G]`, and does not normalize
 their projected norms. That matches GENIE's kernel definition, but it implies a
 different per-SNP random-effect prior whenever projected column norms vary.
@@ -73,7 +81,8 @@ ancestry-determined SNP had zero projected variance and was rejected, as the
 kernel contract requires. These results motivate a coherent estimand, not a
 claim that post-projection normalization universally has lower sampling error:
 SUMMIT uses the convention already assumed by its additive partial-score
-machinery, while `genie` remains a first-class replication/sensitivity mode.
+machinery, while `raw_projected` remains a first-class
+replication/sensitivity mode.
 
 For residualized/normalized phenotype `y`, SUMMIT solves the unconstrained
 system
@@ -108,14 +117,17 @@ Projected feature norms and `F_j' diag(e^2) F_j` supply the genetic-by-residual
 and genetic-by-NxE trace blocks. Two scalar traces supply NxE-by-NxE and
 NxE-by-residual.
 
-## Legacy LD-score jackknife artifacts
+## Jackknife boundary
 
-New GxE reference construction does not generate deletion-block metadata or
-`.gxe.jackknife.npz` files. Those optional artifacts affected only the
-jackknife uncertainty estimate, not the XX/XW/WX/WW point estimates, and the
-low-probe version was especially sensitive to Monte Carlo noise. Exact and
-block-local legacy bundles remain readable so previously sealed analyses are
-reproducible.
+GxE reference construction does not generate deletion-block metadata or
+`.gxe.jackknife.npz` files. It estimates one fixed XX/XW/WX/WW score row per
+SNP, and phenotype scoring likewise emits fixed per-SNP trait rows. `--njack`
+is consumed only by the fitter. For each inference block, the reducer removes
+the target SNP rows in that block, rescales the retained annotation masses,
+and solves the resulting normal equations. It reuses the full-genome reference
+scores for retained SNPs; it does not delete source-SNP contributions or rerun
+the randomized estimator. The replicate coefficients and proportions produce
+the reported block-jackknife standard errors and Wald statistics.
 
 The low-noise production target is B1024 in one reference transaction. Probe
 tiles are processed sequentially in memory and accumulated into the final four
@@ -130,11 +142,10 @@ but its large matrix products already execute in native BLAS. On Linux,
 `--gxe-native-backend direct` instead uses a descriptor-owned C++ BED context
 that computes feature diagnostics and source/target products without
 materializing full X/W genotype-design blocks. It is currently restricted to
-phenotype-free, one-annotation, `float32` or `float64`, standardized/sample-scaled
-references whose selected genotype calls are missing-free. Python and C++ use the same Philox probe identities,
-and dense differential tests cover global terms and block-local deletion.
-Artifacts bind the exact loaded extension inode/bytes, source snapshot,
-compiler options, workspace limits, and actual 2B/4B widths.
+phenotype-free, one-annotation, `float32` or `float64`,
+`standardized_projected`/sample-scaled references whose selected genotype calls
+are missing-free. Python and C++ use the same Philox probe identities, and dense
+differential tests cover the fixed genome-wide score terms.
 
 SUMMIT's older Mailman implementation is an additive-kernel optimization. It
 uses discrete HWE imputation and does not provide the interaction source and
@@ -147,10 +158,9 @@ BLAS path because measured setup/amortization no longer favors Mailman.
 
 Ordinary reference generation computes projected-feature metadata internally
 and divides large probe counts into memory-bounded tiles. Users provide the
-cohort/design inputs and one output prefix. The default block-local jackknife
-retains only the current global X/W probe tile in memory and records block IDs
-with the completed LD-score rows; it does not create a disk-backed probe
-store.
+cohort/design inputs and one output prefix. Reference generation retains only
+the current global X/W probe tile in memory and emits fixed per-SNP LD-score
+rows; it does not take jackknife blocks or create a disk-backed probe store.
 
 For a wide environment table whose selected columns retain exactly the same
 complete-case cohort, `--gxe-env-cols E1,E2,...` shares each standardized
@@ -164,15 +174,11 @@ than changing the estimand.
 
 After wide scoring, `--gxe-fit-batch` accepts a strict
 `summit.gxe.fit_batch` manifest and validates the reference and score panels once
-for all listed traits. Every phenotype moments/GWAS/GWIS triplet is still
-independently snapshotted, hashed, parsed, and checked against the reference
-SNP axis. Full reference contractions are preaggregated once. When reading an
-older sealed jackknife reference, its delete-block contractions still use the
-compact compatibility path. The single-trait `--gxe-fit` path uses the same
-equations.
-
-Older sealed exact two-sided and block-local jackknife bundles remain readable.
-New reference generation does not construct either form of deletion state.
+for all listed traits. Every phenotype moments/GWAS/GWIS triplet is parsed and
+checked against the concrete ordered reference SNP axis. Full reference
+contractions are preaggregated once. The single-trait `--gxe-fit` path uses the
+same equations. Only current schema-v4 references and trait artifacts are
+accepted.
 
 ## Input contract and safety checks
 
@@ -187,12 +193,9 @@ New reference generation does not construct either form of deletion state.
   overlapping annotations are supported; empty annotations are errors.
 - The same complete-case sample, environment coding, fixed-effect span,
   variants, alleles, annotations, and scaling must be used for every artifact.
-  Analysis/variant fingerprints and mandatory per-file SHA-256 hashes enforce
-  this for SUMMIT-generated bundles. Replacing, relabeling, or mixing one score,
-  LD panel, diagonal table, or jackknife file makes fitting fail closed.
-  Phenotype moments record and bind their exact generating reference-manifest
-  SHA-256. This prevents mixing genotype content, samples, covariates, modes,
-  scales, annotations, or SNP axes.
+  Enforce this with concrete ordered columns, dimensions, labels, and numerical
+  scale/annotation values. Hash identity is not a scientific compatibility
+  condition and should not be required by new code.
 - Matched-cohort scoring remains the default. Explicit
   `--gxe-population-reference` scoring permits a different trait-specific
   cohort for standardized kernels. It transfers the reference genetic trace
@@ -200,7 +203,8 @@ New reference generation does not construct either form of deletion state.
   the reference/study sample counts. The study score pass supplies exact NxE
   traces and genetic-by-NxE cross-traces. The ordered variant/allele axis,
   annotations, environment/covariate names, and feature convention must still
-  match, and the phenotype bundle binds the exact reference manifest.
+  match, and the phenotype bundle records the reference dimensions and
+  conventions it was scored against.
 - Variants with zero/invalid additive or interaction projected variance are an
   error. They must be QC-filtered before regenerating the entire bundle; they
   are never silently retained in annotation denominators as zero columns.
@@ -216,23 +220,11 @@ New reference generation does not construct either form of deletion state.
   permit a non-PSD trace matrix.
 - Fixed-prefix generation and fitting refuse to overwrite by default. New
   bundles are staged in private directories and published with same-filesystem
-  no-replace links, with hash-bound manifests last; final artifacts are
-  owner-readable/writable only. Use a new output prefix for reproducible runs;
+  no-replace links; final artifacts are owner-readable/writable only. Use a new output prefix for reproducible runs;
   `--gxe-overwrite` is an explicit escape hatch.
-- The fitter snapshots every consumed summary artifact into a private directory
-  beside the requested output (or beside the moments file for direct API calls),
-  hashes and parses those same bytes, and removes the snapshots on exit. Allow
-  temporary disk approximately equal to the four panels, diagonal, optional
-  legacy jackknife, and two score files; Hoffman fits therefore keep both
-  outputs and snapshot workspace under the designated scratch root rather than
-  node-local `/tmp`.
-
-New generation and reusable scoring use schema v3. The fitter retains explicit
-schema-v2 compatibility for already sealed, hash-bound pilot bundles, but it
-rejects the older unhashed experimental manifests. After an independent audit,
-`scripts/gxe/seal_legacy_bundle.py` can write new, hash-bound manifest copies
-without changing any legacy artifact; low-probe jackknife migration requires
-its explicit diagnostic override.
+Artifact compatibility is established from the concrete ordered SNP/allele
+axis, dimensions, feature convention, labels, and annotation values. Paths and
+cryptographic file hashes are not scientific compatibility conditions.
 
 If standardized binary `e` is exactly balanced, `e^2=1`, so NxE is identical to
 residual noise. Near balance can also make the system unstable. This is an
@@ -262,8 +254,8 @@ pseudo-parameter.
 
 ## Reuse and computational boundary
 
-The XX/XW/WX/WW traces, projected feature scales, NxE traces, and deletion
-intersections depend on the cohort, environment, fixed-effect span, variants,
+The XX/XW/WX/WW traces, projected feature scales, and NxE traces depend on the
+cohort, environment, fixed-effect span, variants,
 and annotations, but not on the phenotype. They should therefore be computed
 once per fixed design and reused. `--gxe-score-reference` implements the wide
 trait path: for `T` traits observed on that same row set,
@@ -273,8 +265,8 @@ Once those summary artifacts exist, fitting reads `O(MK)` values and solves a
 small `(2K+2)`-dimensional system; it does not revisit individual-level
 genotype or phenotype data.
 
-On the existing 454,207-variant age-by-DBP pilot bundle, full artifact hashing,
-loading, equation reconstruction, and fitting took 8.47 seconds with about
+On the existing 454,207-variant age-by-DBP pilot bundle, artifact loading,
+equation reconstruction, and fitting took 8.47 seconds with about
 522 MiB peak RSS on the local validation host. This benchmark describes the
 summary-only stage, not reference construction. Starting from raw data still
 requires `O(N M V K)` trace work and `O(N M T)` marginal-score work. An

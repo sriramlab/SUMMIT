@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import hashlib
 import json
 import math
 import types
@@ -76,7 +75,7 @@ def test_file_bundle_reconstructs_explicit_individual_level_fit(tmp_path):
         seed=1,
         verbose=False,
         dtype="float64",
-        kernel_mode="genie",
+        kernel_mode="raw_projected",
         genotype_scale="hwe",
         target_xz_mem=0.01,
     )
@@ -109,6 +108,7 @@ def test_file_bundle_reconstructs_explicit_individual_level_fit(tmp_path):
         str(out) + ".gxe.moments.json",
         str(out) + ".gxe.gwas.tsv.gz",
         str(out) + ".gxe.gwis.tsv.gz",
+        njack=3,
         max_condition=1e16,
     )
 
@@ -136,9 +136,15 @@ def test_file_bundle_reconstructs_explicit_individual_level_fit(tmp_path):
     rhs = np.asarray([y @ a @ y for a in kernels])
     direct = np.linalg.solve(lhs, rhs)
     np.testing.assert_allclose(fitted.coefficients, direct, rtol=2e-9, atol=2e-9)
-    assert fitted.standard_errors is None
-    assert fitted.jackknife_estimates is None
-    assert fitted.jackknife_block_labels == ()
+    assert fitted.coefficient_standard_errors is not None
+    assert fitted.proportion_standard_errors is not None
+    assert fitted.jackknife_coefficients.shape == (3, len(direct))
+    assert fitted.jackknife_proportions.shape == (3, len(direct))
+    assert fitted.jackknife_block_labels == (
+        "block_0001",
+        "block_0002",
+        "block_0003",
+    )
 
     generated = list(tmp_path.glob("bundle.g*"))
     assert generated
@@ -154,57 +160,58 @@ def test_file_bundle_reconstructs_explicit_individual_level_fit(tmp_path):
     assert generated_reference["randomization"]["step_size"] == m
     assert generated_reference["randomization"]["probe_tiles"] == [[0, m]]
 
-    # The phenotype moments bind the exact score paths as well as their bytes.
+    # Equivalent summary files remain portable across paths; compatibility is
+    # established from their actual variant axes and statistical metadata.
     copied_gwas = tmp_path / "copied.gwas.tsv.gz"
     copied_gwas.write_bytes(gwas_path.read_bytes())
-    with pytest.raises(ValueError, match="phenotype-bound artifact"):
-        fit_from_files(ref_path, moments_path, copied_gwas, gwis_path, max_condition=1e16)
+    copied_fit, _ = fit_from_files(
+        ref_path,
+        moments_path,
+        copied_gwas,
+        gwis_path,
+        njack=3,
+        max_condition=1e16,
+    )
+    np.testing.assert_array_equal(copied_fit.coefficients, fitted.coefficients)
 
     different_reference = json.loads(ref_path.read_text())
-    different_reference["kernel_mode"] = "standardized"
+    different_reference["kernel_mode"] = "standardized_projected"
     different_reference_path = tmp_path / "different.gxe.ref.json"
     different_reference_path.write_text(json.dumps(different_reference))
-    with pytest.raises(ValueError, match="different GxE reference"):
+    with pytest.raises(ValueError, match="feature convention"):
         fit_from_files(
-            different_reference_path, moments_path, gwas_path, gwis_path, max_condition=1e16
+            different_reference_path,
+            moments_path,
+            gwas_path,
+            gwis_path,
+            njack=3,
+            max_condition=1e16,
         )
-
-    unbound = json.loads(moments_path.read_text())
-    unbound.pop("score_sha256")
-    unbound_path = tmp_path / "unbound.gxe.moments.json"
-    unbound_path.write_text(json.dumps(unbound))
-    with pytest.raises(ValueError, match="cryptographically bind"):
-        fit_from_files(ref_path, unbound_path, gwas_path, gwis_path, max_condition=1e16)
 
     bad_gwas = pd.read_csv(gwas_path, sep=r"\s+")
     bad_gwas["N"] += 1
     bad_gwas_path = tmp_path / "bad.gwas.tsv.gz"
     bad_gwas.to_csv(bad_gwas_path, sep="\t", index=False, compression="gzip")
-    invalid_n = json.loads(moments_path.read_text())
-    invalid_n["files"]["gwas"] = bad_gwas_path.name
-    invalid_n["score_sha256"]["gwas"] = hashlib.sha256(bad_gwas_path.read_bytes()).hexdigest()
-    invalid_n_path = tmp_path / "invalid-n.gxe.moments.json"
-    invalid_n_path.write_text(json.dumps(invalid_n))
-    with pytest.raises(ValueError, match="sample count"):
-        fit_from_files(ref_path, invalid_n_path, bad_gwas_path, gwis_path, max_condition=1e16)
+    with pytest.raises(ValueError, match="N does not match"):
+        fit_from_files(
+            ref_path,
+            moments_path,
+            bad_gwas_path,
+            gwis_path,
+            njack=3,
+            max_condition=1e16,
+        )
 
     missing_mode = pd.read_csv(gwas_path, sep=r"\s+")
     missing_mode.loc[0, "SCORE_MODE"] = None
     missing_mode_path = tmp_path / "missing-mode.gwas.tsv.gz"
     missing_mode.to_csv(missing_mode_path, sep="\t", index=False, compression="gzip")
-    invalid_mode = json.loads(moments_path.read_text())
-    invalid_mode["files"]["gwas"] = missing_mode_path.name
-    invalid_mode["score_sha256"]["gwas"] = hashlib.sha256(missing_mode_path.read_bytes()).hexdigest()
-    invalid_mode_path = tmp_path / "invalid-mode.gxe.moments.json"
-    invalid_mode_path.write_text(json.dumps(invalid_mode))
-    with pytest.raises(ValueError, match="unsupported SCORE_MODE"):
+    with pytest.raises(ValueError, match="marginal cross-products"):
         fit_from_files(
-            ref_path, invalid_mode_path, missing_mode_path, gwis_path, max_condition=1e16
+            ref_path,
+            moments_path,
+            missing_mode_path,
+            gwis_path,
+            njack=3,
+            max_condition=1e16,
         )
-
-    # Reference panels are also byte-bound; aligned but modified values fail closed.
-    reference = json.loads(ref_path.read_text())
-    xx_path = tmp_path / reference["files"]["xx"]
-    xx_path.write_bytes(xx_path.read_bytes() + b"tamper")
-    with pytest.raises(ValueError, match="failed its SHA-256 check"):
-        fit_from_files(ref_path, moments_path, gwas_path, gwis_path, max_condition=1e16)

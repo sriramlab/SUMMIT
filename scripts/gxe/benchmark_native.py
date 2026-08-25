@@ -3,16 +3,12 @@
 
 The exact comparison uses missing-free PLINK BED data, K=1, sample-scaled
 genotypes, a complete Q=[1,E,C] projection, explicit Python Philox probes,
-and float64 accumulation.  Legacy direct/Mailman timings intentionally cover
-only their additive GRM application to the same production-shaped [Ux, Uw]
-panel; Mailman is not an exact GxE implementation because it has no W source
-or W-left operation and its decoder is HWE-scaled.
+and float64 accumulation.
 """
 
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import os
 import platform
@@ -28,7 +24,7 @@ import pandas as pd
 from bed_reader import to_bed
 from threadpoolctl import threadpool_info, threadpool_limits
 
-from summit import gwldcore, gxeldcore
+from summit import gxeldcore
 from summit.ldscore.gwe_ldscore import (
     GenomewideEnvLDScore,
     _build_balanced_vtiles,
@@ -57,23 +53,16 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--step-size", type=int, default=1000)
     parser.add_argument("--target-panel-columns", type=int, default=64)
     parser.add_argument("--workspace-gib", type=float, default=16.0)
-    parser.add_argument("--jackknife-blocks", type=int, default=100)
-    parser.add_argument("--scratch-gib", type=float, default=64.0)
-    parser.add_argument("--scratch-model-n", type=int, default=300_000)
     parser.add_argument("--max-abs-error", type=float, default=1e-8)
     parser.add_argument(
         "--stress-repeats",
         type=int,
         default=0,
-        help="Repeat native 2B/4B target calls against the same dense oracle.",
+        help="Repeat native source/target calls against the same dense oracle.",
     )
     parser.add_argument(
         "--full-estimator-probes", type=int, default=0,
         help="Optionally benchmark one complete Python/direct estimator transaction.",
-    )
-    parser.add_argument(
-        "--skip-legacy", action="store_true",
-        help="Skip diagnostic additive direct/Mailman panel timings.",
     )
     parser.add_argument(
         "--skip-materialized",
@@ -99,14 +88,6 @@ def _timed(function, repeats: int, warmups: int) -> tuple[dict, object]:
         "minimum": float(np.min(timings)),
         "maximum": float(np.max(timings)),
     }, result
-
-
-def _sha256(path: str | Path) -> str:
-    digest = hashlib.sha256()
-    with open(path, "rb") as handle:
-        for block in iter(lambda: handle.read(8 * 1024 * 1024), b""):
-            digest.update(block)
-    return digest.hexdigest()
 
 
 def _write_plink(directory: Path, raw: np.ndarray) -> Path:
@@ -192,53 +173,6 @@ def _materialize_scaled_features(
     return np.asfortranarray(additive), np.asfortranarray(interaction)
 
 
-def _legacy_additive_timing(
-    prefix: Path,
-    sources: np.ndarray,
-    scale_x: np.ndarray,
-    q: np.ndarray,
-    args,
-    *,
-    mailman: bool,
-) -> tuple[dict, float]:
-    output = np.zeros_like(sources, order="F")
-    function = (
-        gwldcore.apply_grm_bed_panel_mailman
-        if mailman
-        else gwldcore.apply_grm_bed_panel
-    )
-
-    def apply():
-        output.fill(0.0)
-        keywords = dict(
-            bed_prefix=str(prefix),
-            fam_path=str(prefix) + ".fam",
-            nsnps=args.m,
-            step_size=min(args.step_size, args.m),
-            row_sel=None,
-            ddof=1,
-            inv_all=np.asarray(scale_x, dtype=np.float64),
-            panel_in=sources,
-            panel_out=output,
-            C=np.asfortranarray(q),
-            R=np.asfortranarray(q.T),
-        )
-        if mailman:
-            keywords["impute_seed"] = args.seed
-        else:
-            # The ordinary decoder calls sample-standardized mean imputation
-            # "mean"; this is distinct from the estimator's genotype-scale label.
-            keywords["impute_mode"] = "mean"
-            keywords["impute_seed"] = args.seed
-        function(**keywords)
-        if not np.all(np.isfinite(output)):
-            raise RuntimeError("Legacy additive panel output was non-finite.")
-        return output
-
-    timing, observed = _timed(apply, args.repeats, args.warmups)
-    return timing, float(np.linalg.norm(observed))
-
-
 def _timing_summary(values: list[float]) -> dict:
     return {
         "raw": values,
@@ -274,7 +208,7 @@ def _full_estimator_benchmark(
                 log=Logger(suppress=True), rand_dist="rademacher", low_level=None,
                 num_vecs=probes, step_size=min(args.step_size, args.m), seed=args.seed,
                 dtype="float64", num_threads=args.decode_threads,
-                kernel_mode="standardized", genotype_scale="sample",
+                kernel_mode="standardized_projected", genotype_scale="sample",
                 impute_method="mean", target_xz_mem=max(0.01, args.workspace_gib),
                 native_backend=backend, native_workspace_gib=args.workspace_gib,
                 native_target_panel_columns=args.target_panel_columns,
@@ -316,10 +250,7 @@ def run(args) -> dict:
     if not counts or any(value <= 0 for value in counts):
         raise ValueError("Probe counts must be positive integers.")
     if (
-        args.jackknife_blocks <= 0
-        or args.scratch_gib <= 0.0
-        or args.scratch_model_n <= 0
-        or args.max_abs_error <= 0.0
+        args.max_abs_error <= 0.0
         or args.stress_repeats < 0
         or args.full_estimator_probes < 0
     ):
@@ -352,9 +283,6 @@ def run(args) -> dict:
             "step_size": args.step_size,
             "target_panel_columns": args.target_panel_columns,
             "workspace_gib": args.workspace_gib,
-            "jackknife_blocks": args.jackknife_blocks,
-            "scratch_gib": args.scratch_gib,
-            "scratch_model_n": args.scratch_model_n,
             "max_abs_error": args.max_abs_error,
             "stress_repeats": args.stress_repeats,
             "skip_materialized": args.skip_materialized,
@@ -372,16 +300,10 @@ def run(args) -> dict:
             "threadpools": threadpool_info(),
             "native_build": native_build,
             "native_binary": str(Path(gxeldcore.__file__).resolve()),
-            "native_binary_sha256": _sha256(gxeldcore.__file__),
         },
         "contracts": {
             "source": "explicit Python Philox probes; [Ux,Uw]=2B float64 columns",
             "target_global": "opaque context-bound projected panel, width=2B",
-            "target_jackknife": "opaque global+block panels, total width=4B",
-            "legacy_mailman_exact_gxe_eligible": False,
-            "legacy_mailman_limitation": (
-                "diagnostic additive GRM only; HWE decoder and no interaction source/W-left API"
-            ),
         },
         "dense_feature_timing_seconds": dense_feature_timing,
         "cases": [],
@@ -399,8 +321,6 @@ def run(args) -> dict:
             )
             scale_x = np.asarray(feature["scale_x"])
             scale_w = np.asarray(feature["scale_w"])
-            gwldcore.set_num_threads(args.decode_threads)
-
             for count in counts:
                 integrity_before = dict(context.info())
                 probes = _probes(args.m, count, args.seed)
@@ -409,15 +329,8 @@ def run(args) -> dict:
                 )
                 dense_ux, dense_uw = dense_pair
                 dense_sources_2b = np.asfortranarray(np.column_stack([dense_ux, dense_uw]))
-                dense_sources_4b = np.asfortranarray(
-                    np.column_stack([dense_ux, dense_uw, dense_ux, dense_uw])
-                )
                 dense_target_2b_timing, dense_target_2b = _timed(
                     lambda: (x.T @ dense_sources_2b, w.T @ dense_sources_2b),
-                    args.repeats, args.warmups,
-                )
-                dense_target_4b_timing, dense_target_4b = _timed(
-                    lambda: (x.T @ dense_sources_4b, w.T @ dense_sources_4b),
                     args.repeats, args.warmups,
                 )
 
@@ -440,20 +353,15 @@ def run(args) -> dict:
                     return additive.T @ panel, interaction.T @ panel
 
                 python_target_2b_timing = None
-                python_target_4b_timing = None
                 if not args.skip_materialized:
                     python_target_2b_timing, _ = _timed(
                         lambda: materialized_target(dense_sources_2b),
                         args.repeats, args.warmups,
                     )
-                    python_target_4b_timing, _ = _timed(
-                        lambda: materialized_target(dense_sources_4b),
-                        args.repeats, args.warmups,
-                    )
                 native_source_timing, native_source = _timed(
                     lambda: context.source_block(
                         0, args.m, scale_x, scale_w, np.ones(args.m), probes,
-                        np.zeros(args.m, dtype=np.int32), 1, True,
+                        True,
                     ),
                     args.repeats, args.warmups,
                 )
@@ -467,26 +375,14 @@ def run(args) -> dict:
                     lambda: context.prepare_projected_sources(native_sources_2b, 1e-9),
                     args.repeats, args.warmups,
                 )
-                prepare_block_2b_timing, block_panel_2b = _timed(
-                    lambda: context.prepare_projected_sources(native_sources_2b, 1e-9),
-                    args.repeats, args.warmups,
-                )
                 native_target_2b_timing, native_target_2b = _timed(
                     lambda: context.target_projected_block(
                         0, args.m, scale_x, scale_w, panel_2b, True
                     ),
                     args.repeats, args.warmups,
                 )
-                native_target_4b_timing, native_target_4b = _timed(
-                    lambda: context.target_projected_pair_block(
-                        0, args.m, scale_x, scale_w,
-                        panel_2b, block_panel_2b, True
-                    ),
-                    args.repeats, args.warmups,
-                )
                 native_x_2b, native_w_2b, target_missing_2b, _ = native_target_2b
-                native_x_4b, native_w_4b, target_missing_4b, _ = native_target_4b
-                if int(target_missing_2b) != 0 or int(target_missing_4b) != 0:
+                if int(target_missing_2b) != 0:
                     raise RuntimeError("Missing genotypes appeared in native target work.")
                 source_error = max(
                     float(np.max(np.abs(native_ux - dense_ux))),
@@ -496,36 +392,23 @@ def run(args) -> dict:
                     float(np.max(np.abs(native_x_2b - dense_target_2b[0]))),
                     float(np.max(np.abs(native_w_2b - dense_target_2b[1]))),
                 )
-                target_4b_error = max(
-                    float(np.max(np.abs(native_x_4b - dense_target_4b[0]))),
-                    float(np.max(np.abs(native_w_4b - dense_target_4b[1]))),
-                )
                 stress_source_errors: list[float] = []
                 stress_source_repeat_deltas: list[float] = []
                 stress_2b_errors: list[float] = []
                 stress_2b_repeat_deltas: list[float] = []
-                stress_4b_errors: list[float] = []
-                stress_4b_repeat_deltas: list[float] = []
                 for _ in range(args.stress_repeats):
                     stress_ux, stress_uw, stress_source_missing = context.source_block(
                         0, args.m, scale_x, scale_w, np.ones(args.m), probes,
-                        np.zeros(args.m, dtype=np.int32), 1, True,
+                        True,
                     )
                     stress_x_2b, stress_w_2b, stress_missing_2b, _ = (
                         context.target_projected_block(
                             0, args.m, scale_x, scale_w, panel_2b, True
                         )
                     )
-                    stress_x_4b, stress_w_4b, stress_missing_4b, _ = (
-                        context.target_projected_pair_block(
-                            0, args.m, scale_x, scale_w,
-                            panel_2b, block_panel_2b, True,
-                        )
-                    )
                     if (
                         int(stress_source_missing) != 0
                         or int(stress_missing_2b) != 0
-                        or int(stress_missing_4b) != 0
                     ):
                         raise RuntimeError("Missing genotypes appeared in native stress work.")
                     stress_source_errors.append(max(
@@ -544,22 +427,12 @@ def run(args) -> dict:
                         float(np.max(np.abs(stress_x_2b - native_x_2b))),
                         float(np.max(np.abs(stress_w_2b - native_w_2b))),
                     ))
-                    stress_4b_errors.append(max(
-                        float(np.max(np.abs(stress_x_4b - dense_target_4b[0]))),
-                        float(np.max(np.abs(stress_w_4b - dense_target_4b[1]))),
-                    ))
-                    stress_4b_repeat_deltas.append(max(
-                        float(np.max(np.abs(stress_x_4b - native_x_4b))),
-                        float(np.max(np.abs(stress_w_4b - native_w_4b))),
-                    ))
                 if stress_2b_errors:
                     source_error = max(source_error, max(stress_source_errors))
                     target_2b_error = max(target_2b_error, max(stress_2b_errors))
-                    target_4b_error = max(target_4b_error, max(stress_4b_errors))
                     max_repeat_delta = max(
                         max(stress_source_repeat_deltas),
                         max(stress_2b_repeat_deltas),
-                        max(stress_4b_repeat_deltas),
                     )
                     if max_repeat_delta > args.max_abs_error:
                         raise RuntimeError(
@@ -576,100 +449,51 @@ def run(args) -> dict:
                 ) - int(integrity_before["retried_gemm_input_mutations"])
                 if repaired_columns < 0 or retried_inputs < 0:
                     raise RuntimeError("Native integrity counters decreased during a benchmark case.")
-                if max(source_error, target_2b_error, target_4b_error) > args.max_abs_error:
+                if max(source_error, target_2b_error) > args.max_abs_error:
                     raise RuntimeError(
                         "Native benchmark equivalence exceeded the configured error tolerance: "
                         f"source={source_error}, target2B={target_2b_error}, "
-                        f"target4B={target_4b_error}, tolerance={args.max_abs_error}; "
+                        f"tolerance={args.max_abs_error}; "
                         f"ABFT repairs={repaired_columns}, input retries={retried_inputs}."
                     )
-                scratch_limit = int(args.scratch_gib * 1024**3)
-                scratch_per_probe = (
-                    2 * args.jackknife_blocks * args.scratch_model_n * 8
-                )
-                scratch_vmax = scratch_limit // scratch_per_probe
-                scratch_tiles = _build_balanced_vtiles(
-                    count, vmax=scratch_vmax, gran=64, max_tiles=8
-                )
-                scratch_peak = scratch_per_probe * max(size for _, size in scratch_tiles)
                 timings = {
                     "native_feature": feature_timing,
                     "dense_gemm_lower_bound_source": dense_source_timing,
                     "dense_gemm_lower_bound_target_2b": dense_target_2b_timing,
-                    "dense_gemm_lower_bound_target_4b": dense_target_4b_timing,
                     "native_source": native_source_timing,
                     "native_prepare_projected_2b": prepare_2b_timing,
-                    "native_prepare_projected_block_2b": prepare_block_2b_timing,
                     "native_target_2b": native_target_2b_timing,
-                    "native_target_4b": native_target_4b_timing,
                 }
                 speedups = None
                 if python_source_timing is not None:
                     assert python_target_2b_timing is not None
-                    assert python_target_4b_timing is not None
                     timings.update({
                         "python_materialized_source": python_source_timing,
                         "python_materialized_target_2b": python_target_2b_timing,
-                        "python_materialized_target_4b": python_target_4b_timing,
                     })
                     speedups = {
                         "source": python_source_timing["median"] / native_source_timing["median"],
                         "target_2b": python_target_2b_timing["median"] / native_target_2b_timing["median"],
-                        "target_4b": python_target_4b_timing["median"] / native_target_4b_timing["median"],
                     }
                 case = {
                     "B": count,
                     "actual_target_columns_2b": 2 * count,
-                    "actual_target_columns_4b": 4 * count,
                     "timings_seconds": timings,
                     "correctness": {
                         "max_abs_source_error": source_error,
                         "max_abs_target_2b_error": target_2b_error,
-                        "max_abs_target_4b_error": target_4b_error,
-                        "max_source_projection_leakage": max(
-                            float(panel_2b.leakage), float(block_panel_2b.leakage)
-                        ),
+                        "max_source_projection_leakage": float(panel_2b.leakage),
                         "abft_repaired_output_columns": repaired_columns,
                         "fresh_decode_input_retries": retried_inputs,
                         "stress_source_errors": stress_source_errors,
                         "stress_source_repeat_deltas": stress_source_repeat_deltas,
                         "stress_target_2b_errors": stress_2b_errors,
                         "stress_target_2b_repeat_deltas": stress_2b_repeat_deltas,
-                        "stress_target_4b_errors": stress_4b_errors,
-                        "stress_target_4b_repeat_deltas": stress_4b_repeat_deltas,
                         "threshold": args.max_abs_error,
-                    },
-                    "production_scratch_model": {
-                        "n": args.scratch_model_n,
-                        "jackknife_blocks": args.jackknife_blocks,
-                        "dtype": "float64",
-                        "configured_limit_bytes": scratch_limit,
-                        "monolithic_bytes": scratch_per_probe * count,
-                        "probe_tiles": [list(tile) for tile in scratch_tiles],
-                        "peak_tile_bytes": scratch_peak,
-                        "peak_tile_gib": scratch_peak / 1024**3,
-                        "peak_one_block_mapped_bytes": (
-                            2 * args.scratch_model_n
-                            * max(size for _, size in scratch_tiles) * 8
-                        ),
                     },
                 }
                 if speedups is not None:
                     case["speedups_vs_python_materialized"] = speedups
-                if not args.skip_legacy:
-                    direct_timing, direct_norm = _legacy_additive_timing(
-                        prefix, native_sources_2b, scale_x, q, args, mailman=False
-                    )
-                    mailman_timing, mailman_norm = _legacy_additive_timing(
-                        prefix, native_sources_2b, scale_x, q, args, mailman=True
-                    )
-                    case["legacy_additive_diagnostic"] = {
-                        "direct_timing_seconds": direct_timing,
-                        "mailman_timing_seconds": mailman_timing,
-                        "mailman_speedup": direct_timing["median"] / mailman_timing["median"],
-                        "direct_output_norm": direct_norm,
-                        "mailman_output_norm": mailman_norm,
-                    }
                 payload["cases"].append(case)
 
         if args.full_estimator_probes > 0:

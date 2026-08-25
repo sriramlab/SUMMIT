@@ -53,7 +53,7 @@ def _make_toy(tmp_path, out_name: str):
         step_size=4,
         seed=17,
         dtype="float64",
-        kernel_mode="genie",
+        kernel_mode="raw_projected",
         genotype_scale="sample",
         target_xz_mem=0.01,
         num_threads=1,
@@ -137,9 +137,6 @@ def test_native_tiling_accounts_for_opaque_panel_preparation_peak():
     obj.nsamp = 101
     obj.nbins = 3
     obj.nvecs = 23
-    obj.jackknife_ids = None
-    obj.jackknife_labels = []
-    obj.shard_mode = False
     obj.native_backend = "direct"
     obj.log = Logger(suppress=True)
     tiles = obj._auto_vtiles()

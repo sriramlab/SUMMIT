@@ -78,7 +78,6 @@ def _plan(
             num_basis=basis.shape[1],
             num_annotations=annotations.shape[1],
             num_probes=probe_count,
-            num_jackknife_blocks=2,
             memory_limit_bytes=512 * 1024**2,
             genotype_format="bed",
             threads=1,
@@ -292,13 +291,6 @@ def test_pass1_releases_base_scratch_and_seals_scientific_outputs() -> None:
         result.telemetry["barrier"][name] == value
         for name, value in expected_barrier.items()
     )
-    for name in (
-        "contextual_source_sha256",
-        "basis_sha256",
-        "fixed_effect_basis_sha256",
-        "annotation_sha256",
-    ):
-        assert len(result.telemetry["barrier"][name]) == 64
     with pytest.raises(ValueError):
         result.contextual_sources[0, 0, 0, 0] = 0.0
 
@@ -530,7 +522,7 @@ def test_native_pass1_one_and_multiple_threads_match_in_fresh_processes(
         spec = GlobalVariantProbeSpec(77123, 3, b)
         plan = plan_generalized_gxe_variant_work(GeneralizedGxEPlanInputs(
             num_samples=n, num_variants=m, num_basis=q, num_annotations=k,
-            num_probes=b, num_jackknife_blocks=3,
+            num_probes=b,
             memory_limit_bytes=512 * 1024**2, genotype_format="bed",
             threads=threads, preferred_variant_block_width=8,
             preferred_rhs_tile_columns=5, rhs_policy="tiled",
@@ -604,7 +596,6 @@ def test_mature_integrity_diagnostic_repairs_corrupted_pass1_nn_output() -> None
             num_basis=1,
             num_annotations=1,
             num_probes=b,
-            num_jackknife_blocks=2,
             memory_limit_bytes=1024**3,
             genotype_format="bed",
             threads=threads,

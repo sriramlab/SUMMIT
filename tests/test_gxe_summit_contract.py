@@ -1,11 +1,8 @@
 from __future__ import annotations
 
-import hashlib
 import inspect
 import json
 import math
-import os
-import shutil
 import types
 from dataclasses import dataclass
 from pathlib import Path
@@ -18,9 +15,7 @@ from bed_reader import to_bed
 from summit.inference import gxe as gxe_module
 from summit.inference.gxe import (
     GxENormalEquations,
-    GxEPhenotypeInput,
     fit_from_files,
-    fit_many_from_files,
     solve_normal_equations,
     write_fit,
 )
@@ -118,7 +113,7 @@ def _new_estimator(
     env_path: Path | None = None,
     pheno_path: Path | None = None,
     dtype: str = "float64",
-    kernel_mode: str | None = "standardized",
+    kernel_mode: str | None = "standardized_projected",
 ) -> GenomewideEnvLDScore:
     kwargs = dict(
         bed_path=str(inputs.prefix),
@@ -201,14 +196,14 @@ def exact_bundle(tmp_path_factory) -> ExactStandardizedBundle:
 
 def test_library_default_is_summit_post_projection_standardized():
     default = inspect.signature(GenomewideEnvLDScore).parameters["kernel_mode"].default
-    assert default == "standardized"
+    assert default == "standardized_projected"
 
 
 def test_cli_default_is_summit_post_projection_standardized():
     from summit.cli import build_parser
 
     defaults = build_parser().parse_args([])
-    assert defaults.gxe_kernel_mode == "standardized"
+    assert defaults.gxe_kernel_mode == "standardized_projected"
     assert defaults.gxe_native_backend == "python"
     assert defaults.gxe_native_workspace_gib == 16.0
     assert defaults.gxe_native_target_panel_columns == 64
@@ -377,6 +372,7 @@ def test_standardized_summary_reconstructs_dense_he_system(exact_bundle):
         str(out) + ".gxe.moments.json",
         str(out) + ".gxe.gwas.tsv.gz",
         str(out) + ".gxe.gwis.tsv.gz",
+        njack=3,
         allow_ill_conditioned=True,
         max_condition=1e16,
     )
@@ -448,7 +444,6 @@ def _mutated_bound_bundle(
         key: str((original_moments.parent / value).resolve())
         for key, value in moments["files"].items()
     }
-    moments["reference_manifest_sha256"] = hashlib.sha256(ref_path.read_bytes()).hexdigest()
     moments_path = tmp_path / f"{name}.gxe.moments.json"
     moments_path.write_text(json.dumps(moments, indent=2, sort_keys=True) + "\n")
     return ref_path, moments_path
@@ -464,6 +459,7 @@ def _fit_mutated_bundle(
         str(exact_bundle.out) + ".gxe.gwis.tsv.gz",
         allow_ill_conditioned=True,
         max_condition=1e16,
+        njack=3,
     )
 
 
@@ -530,6 +526,7 @@ def test_fit_json_records_nxe_residual_alias_diagnostic(exact_bundle, tmp_path):
         str(exact_bundle.out) + ".gxe.gwis.tsv.gz",
         allow_ill_conditioned=True,
         max_condition=1e16,
+        njack=3,
     )
     _, json_path = write_fit(tmp_path / "fit-diagnostics", fit, equations)
     payload = json.loads(json_path.read_text())
@@ -539,603 +536,3 @@ def test_fit_json_records_nxe_residual_alias_diagnostic(exact_bundle, tmp_path):
     assert payload["nxe_residual_kernel_correlation"] == pytest.approx(expected)
     correlation = np.asarray(payload["kernel_correlation_matrix"], dtype=np.float64)
     np.testing.assert_allclose(np.diag(correlation), 1.0, rtol=0.0, atol=2e-15)
-
-
-def _clone_fit_bundle_with_bound_cache(exact_bundle, root: Path):
-    original_ref_path = Path(str(exact_bundle.out) + ".gxe.ref.json")
-    original_moments_path = Path(str(exact_bundle.out) + ".gxe.moments.json")
-    reference = json.loads(original_ref_path.read_text(encoding="utf-8"))
-    moments = json.loads(original_moments_path.read_text(encoding="utf-8"))
-
-    copied_inputs: list[Path] = []
-    for key, value in reference["files"].items():
-        source = (original_ref_path.parent / value).resolve()
-        destination = root / source.name
-        shutil.copyfile(source, destination)
-        os.chmod(destination, 0o600)
-        reference["files"][key] = destination.name
-        copied_inputs.append(destination)
-    score_paths = {}
-    for key, value in moments["files"].items():
-        source = (original_moments_path.parent / value).resolve()
-        destination = root / source.name
-        shutil.copyfile(source, destination)
-        os.chmod(destination, 0o600)
-        moments["files"][key] = destination.name
-        score_paths[key] = destination
-        copied_inputs.append(destination)
-
-    cache_path = root / "bound.gxe.cache.npz"
-    cache_builder = GenomewideEnvLDScore(
-        bed_path=str(exact_bundle.inputs.prefix),
-        env_path=str(exact_bundle.inputs.env_path),
-        annot_path=str(exact_bundle.inputs.annot_path),
-        out_path=str(root / "cache-builder"),
-        log=Logger(suppress=True),
-        rand_dist="rademacher",
-        low_level=None,
-        covar_path=str(exact_bundle.inputs.cov_path),
-        pheno_path=None,
-        num_vecs=exact_bundle.inputs.raw.shape[1],
-        step_size=exact_bundle.inputs.raw.shape[1],
-        seed=11,
-        dtype="float64",
-        kernel_mode="standardized",
-        genotype_scale="hwe",
-        target_xz_mem=0.01,
-    )
-    cache_builder.write_feature_cache(cache_path)
-    cache_builder.close()
-    cache_hash = hashlib.sha256(cache_path.read_bytes()).hexdigest()
-    cache_binding = {"path": cache_path.name, "sha256": cache_hash}
-    reference["feature_cache"] = dict(cache_binding)
-    moments["feature_cache"] = dict(cache_binding)
-    moments["feature_cache_sha256"] = cache_hash
-    copied_inputs.append(cache_path)
-
-    ref_path = root / "snapshot.gxe.ref.json"
-    ref_path.write_text(
-        json.dumps(reference, indent=2, sort_keys=True) + "\n", encoding="utf-8"
-    )
-    os.chmod(ref_path, 0o600)
-    moments["reference_manifest_sha256"] = hashlib.sha256(ref_path.read_bytes()).hexdigest()
-    moments_path = root / "snapshot.gxe.moments.json"
-    moments_path.write_text(
-        json.dumps(moments, indent=2, sort_keys=True) + "\n", encoding="utf-8"
-    )
-    os.chmod(moments_path, 0o600)
-    return ref_path, moments_path, score_paths, copied_inputs
-
-
-def test_fit_hashes_and_parses_every_input_from_private_readonly_snapshots(
-    exact_bundle, tmp_path, monkeypatch
-):
-    expected_fit, expected_equations = fit_from_files(
-        str(exact_bundle.out) + ".gxe.ref.json",
-        str(exact_bundle.out) + ".gxe.moments.json",
-        str(exact_bundle.out) + ".gxe.gwas.tsv.gz",
-        str(exact_bundle.out) + ".gxe.gwis.tsv.gz",
-        allow_ill_conditioned=True,
-        max_condition=1e16,
-    )
-    ref_path, moments_path, scores, mutable_inputs = _clone_fit_bundle_with_bound_cache(
-        exact_bundle, tmp_path
-    )
-
-    snapshot_paths: list[Path] = []
-
-    def assert_private_snapshot(value) -> Path:
-        path = Path(value)
-        snapshot_paths.append(path)
-        assert path.parent.name.startswith(".summit-gxe-fit-inputs-")
-        assert (path.parent.stat().st_mode & 0o777) == 0o700
-        assert (path.stat().st_mode & 0o777) == 0o400
-        return path
-
-    original_load_json = gxe_module._load_json
-    json_mutated = False
-
-    def mutate_json_sources_after_capture(path):
-        nonlocal json_mutated
-        assert_private_snapshot(path)
-        if not json_mutated:
-            ref_path.write_text("not json\n", encoding="utf-8")
-            moments_path.write_text("not json\n", encoding="utf-8")
-            json_mutated = True
-        return original_load_json(path)
-
-    original_np_load = gxe_module.np.load
-    cache_mutated = False
-
-    def mutate_cache_after_capture(path, *args, **kwargs):
-        nonlocal cache_mutated
-        snapshot = assert_private_snapshot(path)
-        if snapshot.name.endswith(".cache.npz") and not cache_mutated:
-            cache_source = next(value for value in mutable_inputs if value.name.endswith(".cache.npz"))
-            cache_source.write_bytes(b"not an npz")
-            cache_mutated = True
-        return original_np_load(path, *args, **kwargs)
-
-    original_read_csv = gxe_module.pd.read_csv
-    tabular_inputs_mutated = False
-
-    def mutate_tables_and_jackknife_after_capture(path, *args, **kwargs):
-        nonlocal tabular_inputs_mutated
-        assert_private_snapshot(path)
-        if not tabular_inputs_mutated:
-            for source in mutable_inputs:
-                if not source.name.endswith(".cache.npz"):
-                    source.write_bytes(b"mutated after snapshot")
-            tabular_inputs_mutated = True
-        return original_read_csv(path, *args, **kwargs)
-
-    monkeypatch.setattr(gxe_module, "_load_json", mutate_json_sources_after_capture)
-    monkeypatch.setattr(gxe_module.np, "load", mutate_cache_after_capture)
-    monkeypatch.setattr(gxe_module.pd, "read_csv", mutate_tables_and_jackknife_after_capture)
-
-    observed_fit, observed_equations = fit_from_files(
-        ref_path,
-        moments_path,
-        scores["gwas"],
-        scores["gwis"],
-        allow_ill_conditioned=True,
-        max_condition=1e16,
-    )
-    assert json_mutated and cache_mutated and tabular_inputs_mutated
-    assert snapshot_paths
-    assert all(not path.exists() for path in snapshot_paths)
-    np.testing.assert_allclose(
-        observed_equations.matrix, expected_equations.matrix, rtol=0.0, atol=0.0
-    )
-    np.testing.assert_allclose(
-        observed_equations.rhs, expected_equations.rhs, rtol=0.0, atol=0.0
-    )
-    np.testing.assert_allclose(
-        observed_fit.proportions, expected_fit.proportions, rtol=0.0, atol=0.0
-    )
-
-
-def test_batch_fit_prepares_reference_once_and_matches_singletons(
-    exact_bundle, tmp_path, monkeypatch
-):
-    reference, moments, scores, _ = _clone_fit_bundle_with_bound_cache(
-        exact_bundle, tmp_path
-    )
-    first = GxEPhenotypeInput(
-        phenotype_moments=moments,
-        gwas_scores=scores["gwas"],
-        gwis_scores=scores["gwis"],
-    )
-    copied_gwas = tmp_path / "Y2.gxe.gwas.tsv.gz"
-    copied_gwis = tmp_path / "Y2.gxe.gwis.tsv.gz"
-    shutil.copy2(first.gwas_scores, copied_gwas)
-    shutil.copy2(first.gwis_scores, copied_gwis)
-    copied_moments = json.loads(Path(first.phenotype_moments).read_text())
-    copied_moments["phenotype"] = "Y2"
-    copied_moments["files"] = {
-        "gwas": copied_gwas.name,
-        "gwis": copied_gwis.name,
-    }
-    copied_moments_path = tmp_path / "Y2.gxe.moments.json"
-    copied_moments_path.write_text(
-        json.dumps(copied_moments, indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
-    )
-    second = GxEPhenotypeInput(
-        phenotype_moments=copied_moments_path,
-        gwas_scores=copied_gwas,
-        gwis_scores=copied_gwis,
-    )
-
-    expected_first = fit_from_files(
-        reference,
-        first.phenotype_moments,
-        first.gwas_scores,
-        first.gwis_scores,
-        allow_ill_conditioned=True,
-        max_condition=1e16,
-    )
-    expected_second = fit_from_files(
-        reference,
-        second.phenotype_moments,
-        second.gwas_scores,
-        second.gwis_scores,
-        allow_ill_conditioned=True,
-        max_condition=1e16,
-    )
-
-    aligned_calls = 0
-    cache_loads = 0
-    original_aligned_panel = gxe_module._aligned_panel
-    original_cache_loader = gxe_module._load_feature_cache_bundle
-
-    def counted_aligned_panel(*args, **kwargs):
-        nonlocal aligned_calls
-        aligned_calls += 1
-        return original_aligned_panel(*args, **kwargs)
-
-    def counted_cache_loader(*args, **kwargs):
-        nonlocal cache_loads
-        cache_loads += 1
-        return original_cache_loader(*args, **kwargs)
-
-    monkeypatch.setattr(gxe_module, "_aligned_panel", counted_aligned_panel)
-    monkeypatch.setattr(gxe_module, "_load_feature_cache_bundle", counted_cache_loader)
-    observed = fit_many_from_files(
-        reference,
-        {"Y1": first, "Y2": second},
-        allow_ill_conditioned=True,
-        max_condition=1e16,
-        scratch_dir=tmp_path,
-    )
-    assert aligned_calls == 4
-    assert cache_loads == 1
-    provenance = {
-        name: value[0].consumed_input_provenance
-        for name, value in observed.items()
-    }
-    assert provenance["Y1"] is not None
-    assert provenance["Y2"] is not None
-    assert (
-        provenance["Y1"].reference_manifest
-        == provenance["Y2"].reference_manifest
-    )
-    assert provenance["Y1"].feature_cache == provenance["Y2"].feature_cache
-    assert provenance["Y1"].phenotype_moments.path == str(Path(moments).resolve())
-    assert provenance["Y2"].phenotype_moments.path == str(copied_moments_path.resolve())
-    assert provenance["Y1"].gwas.path == str(Path(scores["gwas"]).resolve())
-    assert provenance["Y2"].gwas.path == str(copied_gwas.resolve())
-    assert provenance["Y1"].gwis.path == str(Path(scores["gwis"]).resolve())
-    assert provenance["Y2"].gwis.path == str(copied_gwis.resolve())
-    for name, expected in {"Y1": expected_first, "Y2": expected_second}.items():
-        fit, equations = observed[name]
-        expected_fit, expected_equations = expected
-        np.testing.assert_allclose(
-            equations.matrix, expected_equations.matrix, rtol=2e-14, atol=2e-12
-        )
-        np.testing.assert_allclose(
-            equations.rhs, expected_equations.rhs, rtol=2e-14, atol=2e-12
-        )
-        np.testing.assert_allclose(
-            fit.proportions, expected_fit.proportions, rtol=2e-12, atol=2e-12
-        )
-
-    copied_gwas.write_bytes(b"tampered score bytes")
-    with pytest.raises(ValueError, match="GWAS score file SHA-256"):
-        fit_many_from_files(
-            reference,
-            {"Y1": first, "Y2": second},
-            allow_ill_conditioned=True,
-            max_condition=1e16,
-            scratch_dir=tmp_path,
-        )
-
-
-def test_fit_json_provenance_identifies_consumed_snapshot_across_aba_restore(
-    exact_bundle, tmp_path, monkeypatch
-):
-    reference, moments, scores, _ = _clone_fit_bundle_with_bound_cache(
-        exact_bundle, tmp_path
-    )
-    original_moments = Path(moments).read_bytes()
-    mutated_payload = json.loads(original_moments)
-    mutated_payload["aba_marker"] = "bytes consumed by core fit"
-    mutated_moments = (
-        json.dumps(mutated_payload, indent=2, sort_keys=True) + "\n"
-    ).encode()
-    assert mutated_moments != original_moments
-    Path(moments).write_bytes(mutated_moments)
-
-    original_load_json = gxe_module._load_json
-    restored = False
-
-    def restore_live_moments_after_snapshot_is_parsed(path):
-        nonlocal restored
-        payload = original_load_json(path)
-        if payload.get("aba_marker") == "bytes consumed by core fit":
-            Path(moments).write_bytes(original_moments)
-            restored = True
-        return payload
-
-    monkeypatch.setattr(
-        gxe_module,
-        "_load_json",
-        restore_live_moments_after_snapshot_is_parsed,
-    )
-    fit, equations = fit_from_files(
-        reference,
-        moments,
-        scores["gwas"],
-        scores["gwis"],
-        allow_ill_conditioned=True,
-        max_condition=1e16,
-        scratch_dir=tmp_path,
-    )
-    assert restored
-    assert Path(moments).read_bytes() == original_moments
-    _, fit_json = write_fit(tmp_path / "aba-fit", fit, equations)
-    observed = json.loads(fit_json.read_text(encoding="utf-8"))[
-        "consumed_input_provenance"
-    ]
-    assert set(observed) == {
-        "reference_manifest",
-        "feature_cache",
-        "phenotype_moments",
-        "gwas",
-        "gwis",
-    }
-
-    reference_payload = json.loads(Path(reference).read_text(encoding="utf-8"))
-    cache_path = (
-        Path(reference).parent / reference_payload["feature_cache"]["path"]
-    ).resolve()
-
-    def live_record(path):
-        canonical = Path(path).resolve()
-        content = canonical.read_bytes()
-        return {
-            "path": str(canonical),
-            "bytes": len(content),
-            "sha256": hashlib.sha256(content).hexdigest(),
-        }
-
-    assert observed == {
-        "reference_manifest": live_record(reference),
-        "feature_cache": live_record(cache_path),
-        "phenotype_moments": {
-            "path": str(Path(moments).resolve()),
-            "bytes": len(mutated_moments),
-            "sha256": hashlib.sha256(mutated_moments).hexdigest(),
-        },
-        "gwas": live_record(scores["gwas"]),
-        "gwis": live_record(scores["gwis"]),
-    }
-    assert observed["phenotype_moments"]["sha256"] != hashlib.sha256(
-        original_moments
-    ).hexdigest()
-
-
-@pytest.mark.skip(reason="New GxE reference generation no longer creates block-jackknife artifacts.")
-def test_legacy_schema_v2_null_corrected_jackknife_batch_matches_singletons_and_dense(
-    exact_bundle, tmp_path
-):
-    """Exercise the complete compatibility path, including every delete block."""
-    out = tmp_path / "v2-null-jackknife"
-    estimator = _new_estimator(exact_bundle.inputs, out)
-    _install_exact_probes(estimator)
-    estimator._compute_ldscore()
-    within = estimator._compute_within_jackknife_scores(
-        estimator._make_compute_blocks(), [(0, estimator.nvecs)]
-    )
-    assert within is not None
-    estimator.close()
-
-    ref_path = Path(str(out) + ".gxe.ref.json")
-    moments1_path = Path(str(out) + ".gxe.moments.json")
-    gwas1_path = Path(str(out) + ".gxe.gwas.tsv.gz")
-    gwis1_path = Path(str(out) + ".gxe.gwis.tsv.gz")
-    reference = json.loads(ref_path.read_text(encoding="utf-8"))
-    moments1 = json.loads(moments1_path.read_text(encoding="utf-8"))
-    names = tuple(reference["annotation_names"])
-    masses = np.asarray(reference["annotation_masses"], dtype=np.float64)
-    residual_rank = int(reference["residual_rank"])
-    assert len(names) == 2
-
-    # Ordinary construction above deliberately produced the block-local
-    # default. Add a hand-built exact trace bundle so this remains a focused
-    # schema-v2 compatibility test for legacy/special exact references.
-    jackknife_path = Path(str(out) + ".gxe.jackknife.npz")
-    GenomewideEnvLDScore._atomic_npz(
-        str(jackknife_path),
-        block_labels=np.asarray(estimator.jackknife_labels, dtype=np.str_),
-        within_xx=within["xx"],
-        within_xw=within["xw"],
-        within_wx=within["wx"],
-        within_ww=within["ww"],
-    )
-    reference["files"]["jackknife"] = jackknife_path.name
-    reference["artifact_sha256"]["jackknife"] = hashlib.sha256(
-        jackknife_path.read_bytes()
-    ).hexdigest()
-    reference["jackknife"] = {
-        "method": "two_sided_snp_kernel_deletion",
-        "num_blocks": len(estimator.jackknife_labels),
-        "block_labels": list(estimator.jackknife_labels),
-        "within_scale": "cross_product_over_rank_squared",
-    }
-    assert "jackknife" in reference["files"]
-
-    # Schema v2 stored randomized panels after subtracting the analytic null
-    # floor.  Re-encode the exact schema-v3 panels in that supported legacy
-    # representation, leaving the raw within-block intersections unchanged.
-    for key in ("xx", "xw", "wx", "ww"):
-        panel_path = ref_path.parent / reference["files"][key]
-        panel = pd.read_csv(panel_path, sep=r"\s+")
-        panel.loc[:, list(names)] = (
-            panel.loc[:, list(names)].to_numpy(dtype=np.float64)
-            - masses[None, :] / residual_rank
-        )
-        panel.to_csv(
-            panel_path,
-            sep="\t",
-            index=False,
-            compression="gzip",
-            float_format="%.17g",
-        )
-        reference["artifact_sha256"][key] = hashlib.sha256(
-            panel_path.read_bytes()
-        ).hexdigest()
-    reference["schema_version"] = 2
-    reference["null_corrected"] = True
-    ref_path.write_text(
-        json.dumps(reference, indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
-    )
-    reference_hash = hashlib.sha256(ref_path.read_bytes()).hexdigest()
-    moments1["schema_version"] = 2
-    moments1["reference_manifest_sha256"] = reference_hash
-    moments1_path.write_text(
-        json.dumps(moments1, indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
-    )
-
-    pmat = exact_bundle.projector
-    h_nxe = pmat @ np.diag(estimator.env**2) @ pmat
-    raw_y2 = np.sin(0.73 * np.arange(estimator.nsamp)) + np.linspace(
-        -0.4, 0.6, estimator.nsamp
-    )
-    y2 = pmat @ raw_y2
-    y2 *= np.sqrt(residual_rank / float(y2 @ y2))
-    gwas2_path = tmp_path / "Y2.gxe.gwas.tsv.gz"
-    gwis2_path = tmp_path / "Y2.gxe.gwis.tsv.gz"
-    gwas2 = pd.read_csv(gwas1_path, sep=r"\s+")
-    gwis2 = pd.read_csv(gwis1_path, sep=r"\s+")
-    gwas2["SCORE"] = exact_bundle.x.T @ y2 / np.sqrt(residual_rank)
-    gwis2["SCORE"] = exact_bundle.w.T @ y2 / np.sqrt(residual_rank)
-    gwas2.to_csv(
-        gwas2_path,
-        sep="\t",
-        index=False,
-        compression="gzip",
-        float_format="%.17g",
-    )
-    gwis2.to_csv(
-        gwis2_path,
-        sep="\t",
-        index=False,
-        compression="gzip",
-        float_format="%.17g",
-    )
-    moments2 = dict(moments1)
-    moments2["phenotype"] = "Y2"
-    moments2["files"] = {"gwas": gwas2_path.name, "gwis": gwis2_path.name}
-    moments2["score_sha256"] = {
-        "gwas": hashlib.sha256(gwas2_path.read_bytes()).hexdigest(),
-        "gwis": hashlib.sha256(gwis2_path.read_bytes()).hexdigest(),
-    }
-    moments2["q_nxe"] = float(y2 @ h_nxe @ y2)
-    moments2["q_residual"] = residual_rank
-    moments2.pop("phenotype_residual_variance_fraction", None)
-    moments2_path = tmp_path / "Y2.gxe.moments.json"
-    moments2_path.write_text(
-        json.dumps(moments2, indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
-    )
-
-    phenotype_inputs = {
-        "Y1": GxEPhenotypeInput(moments1_path, gwas1_path, gwis1_path),
-        "Y2": GxEPhenotypeInput(moments2_path, gwas2_path, gwis2_path),
-    }
-    singleton = {
-        name: fit_from_files(
-            ref_path,
-            item.phenotype_moments,
-            item.gwas_scores,
-            item.gwis_scores,
-            allow_ill_conditioned=True,
-            max_condition=1e16,
-            scratch_dir=tmp_path,
-        )
-        for name, item in phenotype_inputs.items()
-    }
-    batch = fit_many_from_files(
-        ref_path,
-        phenotype_inputs,
-        allow_ill_conditioned=True,
-        max_condition=1e16,
-        scratch_dir=tmp_path,
-    )
-    for name in phenotype_inputs:
-        observed_fit, observed_equations = batch[name]
-        expected_fit, expected_equations = singleton[name]
-        assert observed_fit.jackknife_block_labels == expected_fit.jackknife_block_labels
-        assert observed_fit.rank == expected_fit.rank
-        for observed, expected in (
-            (observed_equations.matrix, expected_equations.matrix),
-            (observed_equations.rhs, expected_equations.rhs),
-            (observed_equations.traces, expected_equations.traces),
-            (observed_fit.coefficients, expected_fit.coefficients),
-            (observed_fit.contributions, expected_fit.contributions),
-            (observed_fit.proportions, expected_fit.proportions),
-            (observed_fit.jackknife_estimates, expected_fit.jackknife_estimates),
-            (observed_fit.standard_errors, expected_fit.standard_errors),
-        ):
-            np.testing.assert_allclose(observed, expected, rtol=2e-11, atol=2e-11)
-
-    diagonal = pd.read_csv(
-        ref_path.parent / reference["files"]["diagonal"], sep=r"\s+"
-    )
-    annotations = diagonal.loc[
-        :, [f"ANNOT_{index}" for index in range(len(names))]
-    ].to_numpy(dtype=np.float64)
-    blocks = diagonal["BLOCK"].to_numpy(dtype=np.int64)
-    component_names = tuple(f"G:{name}" for name in names) + tuple(
-        f"GxE:{name}" for name in names
-    ) + ("NxE", "residual")
-
-    def dense_equations(y, keep):
-        kept_annotations = annotations[keep]
-        kept_masses = kept_annotations.sum(axis=0)
-        kernels = [
-            (exact_bundle.x[:, keep] * kept_annotations[:, index])
-            @ exact_bundle.x[:, keep].T
-            / kept_masses[index]
-            for index in range(len(names))
-        ] + [
-            (exact_bundle.w[:, keep] * kept_annotations[:, index])
-            @ exact_bundle.w[:, keep].T
-            / kept_masses[index]
-            for index in range(len(names))
-        ] + [h_nxe, pmat]
-        matrix = np.asarray(
-            [[np.trace(left @ right) for right in kernels] for left in kernels]
-        )
-        rhs = np.asarray([y @ kernel @ y for kernel in kernels])
-        traces = np.asarray([np.trace(kernel) for kernel in kernels])
-        return GxENormalEquations(matrix, rhs, traces, component_names)
-
-    for name, y in {"Y1": exact_bundle.y, "Y2": y2}.items():
-        observed_fit, observed_equations = batch[name]
-        full = dense_equations(y, np.ones(len(blocks), dtype=bool))
-        explicit_fit = solve_normal_equations(
-            full, allow_ill_conditioned=True, max_condition=1e16
-        )
-        np.testing.assert_allclose(
-            observed_equations.matrix, full.matrix, rtol=4e-9, atol=4e-9
-        )
-        np.testing.assert_allclose(
-            observed_equations.rhs, full.rhs, rtol=4e-9, atol=4e-9
-        )
-        for observed, expected in (
-            (observed_fit.coefficients, explicit_fit.coefficients),
-            (observed_fit.contributions, explicit_fit.contributions),
-            (observed_fit.proportions, explicit_fit.proportions),
-        ):
-            np.testing.assert_allclose(observed, expected, rtol=2e-8, atol=2e-8)
-
-        explicit_replicates = np.asarray(
-            [
-                solve_normal_equations(
-                    dense_equations(y, blocks != block_id),
-                    allow_ill_conditioned=True,
-                    max_condition=1e16,
-                ).proportions
-                for block_id in range(len(observed_fit.jackknife_block_labels))
-            ]
-        )
-        center = explicit_replicates.mean(axis=0)
-        nblock = len(explicit_replicates)
-        explicit_se = np.sqrt(
-            (nblock - 1.0)
-            / nblock
-            * np.sum((explicit_replicates - center) ** 2, axis=0)
-        )
-        np.testing.assert_allclose(
-            observed_fit.jackknife_estimates,
-            explicit_replicates,
-            rtol=3e-8,
-            atol=3e-8,
-        )
-        np.testing.assert_allclose(
-            observed_fit.standard_errors, explicit_se, rtol=3e-8, atol=3e-8
-        )

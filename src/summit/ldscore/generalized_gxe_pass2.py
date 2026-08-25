@@ -12,8 +12,6 @@ import numpy as np
 from summit.context.spec import (
     ContextComponentIndex,
     ContextPairIndex,
-    array_sha256,
-    canonical_sha256,
 )
 from summit.ldscore.generalized_gxe_pass1 import GeneralizedGxEPass1Result
 from summit.ldscore.generalized_gxe_variant import GeneralizedGxEWorkPlan
@@ -54,7 +52,6 @@ class PairProductTerm:
 class PairProductPlan:
     pairs: tuple[tuple[int, int], ...]
     terms: tuple[tuple[tuple[PairProductTerm, ...], ...], ...]
-    digest: str
 
     @property
     def multiplicities(self) -> tuple[tuple[int, ...], ...]:
@@ -73,10 +70,8 @@ def build_pair_product_plan(num_basis: int) -> PairProductPlan:
         return ((q, q),) if q == r else ((q, r), (r, q))
 
     rows: list[tuple[tuple[PairProductTerm, ...], ...]] = []
-    serial_rows: list[list[list[list[int]]]] = []
     for target_pair in pairs:
         row: list[tuple[PairProductTerm, ...]] = []
-        serial_row: list[list[list[int]]] = []
         for source_pair in pairs:
             entries = tuple(
                 PairProductTerm(
@@ -89,18 +84,10 @@ def build_pair_product_plan(num_basis: int) -> PairProductPlan:
                 for source_left, source_right in orientations(source_pair)
             )
             row.append(entries)
-            serial_row.append([list(entry.to_tuple()) for entry in entries])
         rows.append(tuple(row))
-        serial_rows.append(serial_row)
-    record = {
-        "schema": "summit.generalized_gxe.pair_product_plan.v1",
-        "pairs": [list(pair) for pair in pairs],
-        "terms": serial_rows,
-    }
     return PairProductPlan(
         pairs=pairs,
         terms=tuple(rows),
-        digest=canonical_sha256(record),
     )
 
 
@@ -218,21 +205,15 @@ class GeneralizedGxEPass2Result:
     directed_numerator: Array
     symmetric_numerator: Array
     genetic_gram: Array
-    block_directed_numerator: Array
-    block_annotation_mass: Array
     same_person: Array
     annotation_masses: Array
     pair_table: tuple[tuple[int, int], ...]
     component_table: tuple[tuple[int, int], ...]
-    product_plan_digest: str
     residual_rank: int
     ledger: Any
-    block_reconstruction_error: float
     presymmetry_absolute_error: float
     presymmetry_relative_error: float
-    source_panel_sha256: str
     telemetry: Mapping[str, Any]
-    same_person_reused_for_all_deletions: bool = True
 
 
 class GeneralizedGxEPass2Executor:
@@ -247,7 +228,6 @@ class GeneralizedGxEPass2Executor:
         fixed_effect_basis: Array,
         annotations: Array,
         annotation_names: Sequence[str],
-        block_ids: Sequence[int] | Array,
         work_plan: GeneralizedGxEWorkPlan,
         tn_operator: Any,
         probe_tile_width: int | None = None,
@@ -294,18 +274,6 @@ class GeneralizedGxEPass2Executor:
             raise ValueError("basis, fixed effects, and annotations must be finite")
         if np.any(weights < 0.0):
             raise ValueError("annotations must be nonnegative")
-        if array_sha256(basis_array) != pass1_result.basis_sha256:
-            raise RuntimeError("basis identity changed after pass 1")
-        if array_sha256(fixed) != pass1_result.fixed_effect_basis_sha256:
-            raise RuntimeError("fixed-effect identity changed after pass 1")
-        if array_sha256(weights) != pass1_result.annotation_sha256:
-            raise RuntimeError("annotation identity changed after pass 1")
-        if (
-            array_sha256(pass1_result.contextual_sources)
-            != pass1_result.contextual_source_sha256
-        ):
-            raise RuntimeError("sealed contextual source hash does not verify")
-
         names = tuple(str(name) for name in annotation_names)
         if len(names) != weights.shape[1]:
             raise ValueError("annotation_names must match annotation columns")
@@ -327,18 +295,6 @@ class GeneralizedGxEPass2Executor:
         if residual_rank < 1:
             raise ValueError("fixed effects leave no residual rank")
 
-        blocks = np.asarray(block_ids)
-        if blocks.ndim != 1 or blocks.shape[0] != m or blocks.dtype.kind not in "iu":
-            raise ValueError("block_ids must be a variant-aligned integer vector")
-        blocks = np.asarray(blocks, dtype=np.int64)
-        if np.any(blocks < 0) or blocks[0] != 0 or np.any(np.diff(blocks) < 0):
-            raise ValueError("block IDs must be contiguous, ordered, and start at zero")
-        block_count = int(blocks[-1]) + 1
-        if block_count < 2 or not np.array_equal(
-            np.unique(blocks), np.arange(block_count, dtype=np.int64)
-        ):
-            raise ValueError("block IDs must contain at least two nonempty groups")
-
         dimensions = dict(work_plan.dimensions)
         expected_dimensions = {
             "N": n,
@@ -348,7 +304,6 @@ class GeneralizedGxEPass2Executor:
             "K": weights.shape[1],
             "C": len(component_index),
             "B": pass1_result.contextual_sources.shape[3],
-            "J": block_count,
         }
         for name, expected in expected_dimensions.items():
             if int(dimensions.get(name, -1)) != expected:
@@ -394,33 +349,11 @@ class GeneralizedGxEPass2Executor:
         self._fixed = _readonly(fixed)
         self._annotations = _readonly(weights)
         self._masses = _readonly(np.array(masses, copy=True))
-        self._blocks = _readonly(np.array(blocks, copy=True))
         self._pairs = pair_index
         self._components = component_index
         self._product_plan = build_pair_product_plan(basis_array.shape[1])
         self._residual_rank = residual_rank
         self._rhs_precomputed = bool(work_plan.tiling["rhs_precomputed"])
-
-    def _block_masses(self) -> Array:
-        result = np.zeros(
-            (int(self._blocks[-1]) + 1, self._annotations.shape[1]),
-            dtype=np.float64,
-        )
-        starts = np.concatenate(
-            [
-                np.asarray([0], dtype=np.int64),
-                np.flatnonzero(np.diff(self._blocks)) + 1,
-            ]
-        )
-        stops = np.concatenate(
-            [starts[1:], np.asarray([self._blocks.size], dtype=np.int64)]
-        )
-        for start, stop in zip(starts, stops, strict=True):
-            block = int(self._blocks[start])
-            result[block] = np.sum(
-                self._annotations[start:stop], axis=0, dtype=np.float64
-            )
-        return result
 
     def _precompute_rhs(self) -> Array:
         sources = self.pass1_result.contextual_sources
@@ -481,7 +414,6 @@ class GeneralizedGxEPass2Executor:
         m = self._annotations.shape[0]
         p_count = len(self._pairs)
         c_count = len(self._components)
-        block_count = int(self._blocks[-1]) + 1
         variant_width = int(self.work_plan.tiling["variant_block_width"])
         family_count = q_count * q_count
         phase_seconds = {
@@ -496,10 +428,6 @@ class GeneralizedGxEPass2Executor:
             "postprocess": 0.0,
         }
         total_started = time.perf_counter()
-        source_hash_before = array_sha256(sources)
-        if source_hash_before != self.pass1_result.contextual_source_sha256:
-            raise RuntimeError("contextual source identity failed before pass 2")
-
         precomputed_rhs: Array | None = None
         rhs_arena: Array | None = None
         rhs_started = time.perf_counter()
@@ -520,30 +448,6 @@ class GeneralizedGxEPass2Executor:
             (m, p_count, c_count), dtype=np.float64, order="C"
         )
         directed = np.zeros((c_count, c_count), dtype=np.float64)
-        block_directed = np.zeros(
-            (block_count, c_count, c_count), dtype=np.float64
-        )
-        block_masses = self._block_masses()
-        block_mass_reconstruction_error = float(
-            np.max(
-                np.abs(
-                    np.sum(block_masses, axis=0, dtype=np.float64)
-                    - self._masses
-                ),
-                initial=0.0,
-            )
-        )
-        block_mass_tolerance = (
-            64.0
-            * np.finfo(np.float64).eps
-            * float(max(1, m))
-            * max(1.0, float(np.max(np.abs(self._masses), initial=0.0)))
-        )
-        if block_mass_reconstruction_error > block_mass_tolerance:
-            raise RuntimeError("block annotation masses do not reconstruct full masses")
-        if np.any(self._masses[None, :] - block_masses <= 0.0):
-            raise ValueError("deleting a block empties at least one annotation")
-
         operator_passes_before = self.genotype_operator.observed_passes
         operator_visits_before = self.genotype_operator.observed_variant_visits
         operator_blocks_before = self.genotype_operator.blocks_read
@@ -675,37 +579,6 @@ class GeneralizedGxEPass2Executor:
             maximum_reduction_bytes = max(
                 maximum_reduction_bytes, block_reduction.nbytes
             )
-            local_blocks = self._blocks[row_start:row_stop]
-            local_starts = np.concatenate(
-                [
-                    np.asarray([0], dtype=np.int64),
-                    np.flatnonzero(np.diff(local_blocks)) + 1,
-                ]
-            )
-            local_stops = np.concatenate(
-                [
-                    local_starts[1:],
-                    np.asarray([block_width], dtype=np.int64),
-                ]
-            )
-            for local_start, local_stop in zip(
-                local_starts, local_stops, strict=True
-            ):
-                jackknife_block = int(local_blocks[local_start])
-                segmented = np.einsum(
-                    "vk,vpc->kpc",
-                    self._annotations[
-                        row_start + local_start : row_start + local_stop
-                    ],
-                    lrow[local_start:local_stop],
-                    dtype=np.float64,
-                    optimize=True,
-                ).reshape(c_count, c_count)
-                block_directed[jackknife_block] += segmented
-                maximum_reduction_bytes = max(
-                    maximum_reduction_bytes, segmented.nbytes
-                )
-                del segmented
             phase_seconds["numerator_reduction"] += (
                 time.perf_counter() - reduction_started
             )
@@ -725,10 +598,6 @@ class GeneralizedGxEPass2Executor:
         for _ in range(int(self.tn_operator.repaired_columns)):
             ledger.record_repair()
 
-        source_hash_after = array_sha256(sources)
-        if source_hash_after != source_hash_before:
-            ledger.record_integrity_failure()
-            raise RuntimeError("sealed contextual sources changed during pass 2")
         if (
             self.genotype_operator.observed_passes - operator_passes_before != 1
             or self.genotype_operator.observed_variant_visits
@@ -742,18 +611,6 @@ class GeneralizedGxEPass2Executor:
         ledger.validate_clean_completion()
 
         post_started = time.perf_counter()
-        reconstructed = np.sum(block_directed, axis=0, dtype=np.float64)
-        block_reconstruction_error = float(
-            np.max(np.abs(reconstructed - directed), initial=0.0)
-        )
-        reconstruction_tolerance = (
-            256.0
-            * np.finfo(np.float64).eps
-            * float(max(1, m))
-            * max(1.0, float(np.max(np.abs(directed), initial=0.0)))
-        )
-        if block_reconstruction_error > reconstruction_tolerance:
-            raise RuntimeError("block directed numerators do not reconstruct full sum")
         presymmetry_absolute_error = float(
             np.max(np.abs(directed - directed.T), initial=0.0)
         )
@@ -777,8 +634,6 @@ class GeneralizedGxEPass2Executor:
             ("directed_numerator", directed),
             ("symmetric_numerator", symmetric),
             ("genetic_gram", genetic_gram),
-            ("block_directed_numerator", block_directed),
-            ("block_annotation_mass", block_masses),
         ):
             if not np.all(np.isfinite(value)):
                 raise RuntimeError(f"{name} is non-finite after pass 2")
@@ -789,13 +644,9 @@ class GeneralizedGxEPass2Executor:
         directed = _readonly(directed)
         symmetric = _readonly(symmetric)
         genetic_gram = _readonly(genetic_gram)
-        block_directed = _readonly(block_directed)
-        block_masses = _readonly(block_masses)
         allocation_ledger = {
             "directional_panel_bytes": directional.nbytes,
             "directed_numerator_bytes": directed.nbytes,
-            "block_directed_numerator_bytes": block_directed.nbytes,
-            "block_annotation_mass_bytes": block_masses.nbytes,
             "precomputed_rhs_bytes": (
                 0 if precomputed_rhs is None else precomputed_rhs.nbytes
             ),
@@ -858,17 +709,7 @@ class GeneralizedGxEPass2Executor:
                 "allocation_ledger": allocation_ledger,
                 "native": native_telemetry,
                 "checks": {
-                    "block_reconstruction_error": block_reconstruction_error,
-                    "block_reconstruction_tolerance": reconstruction_tolerance,
-                    "block_mass_reconstruction_error": (
-                        block_mass_reconstruction_error
-                    ),
-                    "block_mass_reconstruction_tolerance": block_mass_tolerance,
-                    "source_hash_before": source_hash_before,
-                    "source_hash_after": source_hash_after,
-                    "same_person_reused_for_all_deletions": True,
-                    "target_rows_recomputed_for_deletions": False,
-                    "retained_ldscore_rows_changed": False,
+                    "reference_estimation_jackknife": "none",
                 },
             }
         )
@@ -877,18 +718,13 @@ class GeneralizedGxEPass2Executor:
             directed_numerator=directed,
             symmetric_numerator=symmetric,
             genetic_gram=genetic_gram,
-            block_directed_numerator=block_directed,
-            block_annotation_mass=block_masses,
             same_person=self.pass1_result.same_person,
             annotation_masses=self.pass1_result.annotation_masses,
             pair_table=self.pass1_result.pair_table,
             component_table=self.pass1_result.component_table,
-            product_plan_digest=self._product_plan.digest,
             residual_rank=self._residual_rank,
             ledger=ledger,
-            block_reconstruction_error=block_reconstruction_error,
             presymmetry_absolute_error=presymmetry_absolute_error,
             presymmetry_relative_error=presymmetry_relative_error,
-            source_panel_sha256=source_hash_after,
             telemetry=telemetry,
         )

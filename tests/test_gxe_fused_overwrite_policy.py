@@ -61,7 +61,7 @@ def _estimator(prefix, environment, out_path, column, *, overwrite):
         dtype="float64",
         num_threads=2,
         target_xz_mem=0.01,
-        kernel_mode="standardized",
+        kernel_mode="standardized_projected",
         genotype_scale="sample",
         native_backend="python",
         overwrite=overwrite,

@@ -1,13 +1,15 @@
 # Stage 05: pass 2 per-variant scores and fixed-row jackknife
 
+> **Superseded 2026-08-24.** This stage coupled block reductions to pass 2 and
+> must not be used as the current implementation contract. Pass 2 now emits
+> only fixed per-SNP scores and full aggregates. `--njack` is applied by a
+> separate post-hoc normal-equation reducer after reference and trait scans.
+
 Date: 2026-08-22
 
 Base commit: `9cbd1a63cea454164e236deb24c03f432ff22d2a`
 
-Scope: second and final reference-genotype traversal, complete per-variant
-directional generalized GxE LD-score panel, full and SNP-block directed
-numerators, full Gram, and frozen-LD-score delete-block Grams. No artifact or
-trait-fit integration is included.
+Scope: historical second-pass implementation, retained for audit only.
 
 ## Result
 
@@ -211,7 +213,7 @@ Command:
 PYTHONPATH=<fresh-release-install> \
   python scripts/benchmark_generalized_gxe_pass2.py \
   --samples 512 --variants 4096 --basis 3 --annotations 1 --probes 128 \
-  --jackknife-blocks 20 --variant-block-width 512 \
+  --variant-block-width 512 \
   --pass1-probe-width 64 --pass2-probe-width 128 \
   --threads 2 --memory-gib 2 --calibration-repeats 3
 ```

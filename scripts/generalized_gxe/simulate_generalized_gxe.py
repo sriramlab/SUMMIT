@@ -7,21 +7,21 @@ For SNP j, the simulator draws a Q-vector
 
 and generates
 
-    y = sum_q phi_q * (G beta_q) + C gamma + epsilon,
-    epsilon ~ N(0, residual_variance * I).
+    y_i = sum_q phi_iq * (G beta_q)_i + C_i gamma + phi_i' u_i,
+    u_i ~ N(0, Psi).
 
 All contexts use the same mean-imputed, sample-SD genotype scale.  Replicates
 share one environment realization so their phenotype summaries can be formed
-by one native multi-phenotype traversal.  The generated noise is homoskedastic,
-but the saved inference design includes every symmetric residual-context basis
-column ``eta_qr * phi_q * phi_r``.  The identity coefficient is the simulated
-residual variance and the other nuisance coefficients have truth zero.
+by one native multi-phenotype traversal.  By default, only ``Psi[0,0]`` is
+nonzero and the noise is homoskedastic.  ``--psi`` instead permits a full PSD
+contextual residual covariance.  The saved inference design includes the
+rank-reduced span of symmetric columns ``eta_qr * phi_q * phi_r`` and records
+the corresponding normalized truth coefficients.
 """
 
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 from pathlib import Path
 import time
@@ -32,8 +32,8 @@ from bed_reader import open_bed
 
 from workflow import (
     canonical_json,
-    file_sha256,
     fixed_basis,
+    rank_reduced_symmetric_context_residual_basis,
     read_plink_axes,
     standardized,
     symmetric_context_residual_basis,
@@ -61,18 +61,38 @@ def validate_omega(value: Any, q: int) -> tuple[np.ndarray, np.ndarray]:
     return omega, root
 
 
-def generate_environment(n: int, seed_sequence: np.random.SeedSequence) -> np.ndarray:
-    """Generate two centered, unit-SD, sample-orthogonal environments."""
+def generate_environment(
+    n: int,
+    seed_sequence: np.random.SeedSequence,
+    environment_type: str = "gaussian_gaussian",
+    correlation: float = 0.0,
+) -> np.ndarray:
+    """Generate two centered, unit-SD continuous or binary contexts."""
+    if environment_type not in {
+        "gaussian_gaussian",
+        "gaussian_binary",
+        "binary_binary",
+    }:
+        raise ValueError("unsupported environment type")
+    if not np.isfinite(correlation) or abs(correlation) >= 1.0:
+        raise ValueError("environment correlation must lie strictly between -1 and 1")
     rng = np.random.default_rng(seed_sequence)
     first = standardized(rng.standard_normal(n))
     second = rng.standard_normal(n)
     second -= np.mean(second, dtype=np.float64)
     second -= first * (first @ second) / (first @ first)
     second = standardized(second)
+    second = correlation * first + np.sqrt(1.0 - correlation**2) * second
+    if environment_type == "gaussian_binary":
+        second = standardized((second > 0.0).astype(np.float64))
+    elif environment_type == "binary_binary":
+        first = standardized((first > 0.0).astype(np.float64))
+        second = standardized((second > 0.0).astype(np.float64))
     environment = np.asfortranarray(np.column_stack([first, second]))
-    gram = environment.T @ environment
-    expected = (n - 1.0) * np.eye(2)
-    if not np.allclose(gram, expected, rtol=2.0e-13, atol=2.0e-10):
+    if any(np.unique(environment[:, index]).size < 2 for index in range(2)):
+        raise RuntimeError("an environment realization is constant")
+    diagonal = np.diag(environment.T @ environment)
+    if not np.allclose(diagonal, n - 1.0, rtol=2.0e-13, atol=2.0e-10):
         raise RuntimeError("environment calibration failed")
     return environment
 
@@ -114,23 +134,6 @@ def standardize_genotype_block(
     return values, means, inverse, missing
 
 
-class ArrayStreamDigest:
-    def __init__(self, dtype: np.dtype, shape: tuple[int, ...]):
-        canonical = np.dtype(dtype).newbyteorder("<")
-        self._dtype = canonical
-        self._digest = hashlib.sha256()
-        self._digest.update(canonical.str.encode("ascii"))
-        self._digest.update(b"\0")
-        self._digest.update(np.asarray(shape, dtype="<i8").tobytes())
-
-    def update(self, value: np.ndarray) -> None:
-        array = np.ascontiguousarray(value, dtype=self._dtype)
-        self._digest.update(array.tobytes(order="C"))
-
-    def finish(self) -> str:
-        return self._digest.hexdigest()
-
-
 def _parse_omega(token: str, q: int) -> np.ndarray:
     path = Path(token)
     text = path.read_text() if path.is_file() else token
@@ -155,6 +158,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--causal-fraction", type=float, default=1.0)
     parser.add_argument("--residual-variance", type=float, default=0.4)
     parser.add_argument(
+        "--psi",
+        help=(
+            "optional Q=3 PSD residual-effect covariance as JSON or a JSON file; "
+            "defaults to homoskedastic residual variance in the intercept component"
+        ),
+    )
+    parser.add_argument(
         "--omega",
         default="[[0.2,0,0],[0,0.2,0],[0,0,0.2]]",
         help="Q=3 PSD effect-covariance matrix as JSON or a JSON file",
@@ -162,6 +172,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--fixed-environment-effects", type=float, nargs=2, default=(0.25, -0.15)
     )
+    parser.add_argument(
+        "--environment-type",
+        choices=("gaussian_gaussian", "gaussian_binary", "binary_binary"),
+        default="gaussian_gaussian",
+    )
+    parser.add_argument("--environment-correlation", type=float, default=0.0)
     parser.add_argument("--label", default="diagonal_two_environment")
     return parser
 
@@ -181,15 +197,32 @@ def main() -> int:
     axes = read_plink_axes(args.prefix)
     n, m, q, r = axes.n, axes.m, 3, args.replicates
     omega, omega_root = validate_omega(_parse_omega(args.omega, q), q)
+    if args.psi is None:
+        psi = np.diag([args.residual_variance, 0.0, 0.0])
+    else:
+        psi = _parse_omega(args.psi, q)
+    psi, psi_root = validate_omega(psi, q)
     seed_sequence = np.random.SeedSequence(args.seed)
     environment_seed, effect_seed, causal_seed, noise_seed = seed_sequence.spawn(4)
-    environment = generate_environment(n, environment_seed)
+    environment = generate_environment(
+        n,
+        environment_seed,
+        args.environment_type,
+        args.environment_correlation,
+    )
     basis = np.asfortranarray(
         np.column_stack([np.ones(n, dtype=np.float64), environment])
     )
-    residual_basis, residual_names, residual_pairs = (
-        symmetric_context_residual_basis(basis)
-    )
+    if "binary" in args.environment_type:
+        residual_basis, residual_names, residual_pairs = (
+            rank_reduced_symmetric_context_residual_basis(
+                basis, ("intercept", "environment_1", "environment_2")
+            )
+        )
+    else:
+        residual_basis, residual_names, residual_pairs = (
+            symmetric_context_residual_basis(basis)
+        )
     fixed_design = np.column_stack([np.ones(n, dtype=np.float64), environment])
     fixed = fixed_basis(fixed_design)
     residual_rank = n - fixed.shape[1]
@@ -212,7 +245,6 @@ def main() -> int:
     means = np.empty(m, dtype=np.float64)
     inverse_scales = np.empty(m, dtype=np.float64)
     missing_counts = np.empty(m, dtype=np.int64)
-    effect_digest = ArrayStreamDigest(np.dtype(np.float64), (m, r, q))
     blocks = 0
     visits = 0
     started = time.perf_counter()
@@ -232,7 +264,6 @@ def main() -> int:
                 block_effects /= np.sqrt(counts[None, :, None])
             else:
                 block_effects /= np.sqrt(float(m))
-            effect_digest.update(block_effects)
             realized_effect_covariance += np.einsum(
                 "brq,brs->rqs", block_effects, block_effects, optimize=True
             )
@@ -249,8 +280,10 @@ def main() -> int:
 
     genetic = np.einsum("nq,nrq->nr", basis, component_scores, optimize=True)
     noise_rng = np.random.default_rng(noise_seed)
-    noise = noise_rng.normal(
-        scale=np.sqrt(args.residual_variance), size=(n, r)
+    residual_innovations = noise_rng.standard_normal((n, r, q))
+    residual_components = residual_innovations @ psi_root.T
+    noise = np.einsum(
+        "nq,nrq->nr", basis, residual_components, optimize=True
     )
     phenotypes = genetic + fixed_effect[:, None] + noise
     projected = phenotypes - fixed @ (fixed.T @ phenotypes)
@@ -258,7 +291,13 @@ def main() -> int:
     if np.any(phenotype_variances <= 0.0):
         raise RuntimeError("a simulated phenotype has zero projected variance")
     normalized_omega = omega[None, :, :] / phenotype_variances[:, None, None]
-    normalized_residual = args.residual_variance / phenotype_variances
+    normalized_residual = psi[0, 0] / phenotype_variances
+    normalized_residual_coefficients = np.column_stack(
+        [
+            psi[left, right] / phenotype_variances
+            for left, right in residual_pairs
+        ]
+    )
 
     projected_components = np.empty_like(component_scores)
     for replicate in range(r):
@@ -290,6 +329,7 @@ def main() -> int:
         environment=environment,
         normalized_omega=normalized_omega,
         normalized_residual_variance=normalized_residual,
+        normalized_residual_coefficients=normalized_residual_coefficients,
         phenotype_projected_variance=phenotype_variances,
         realized_effect_covariance=realized_effect_covariance,
         realized_component_covariance=realized_component_covariance,
@@ -298,9 +338,6 @@ def main() -> int:
         affine_inverse_scale=inverse_scales,
         missing_counts=missing_counts,
     )
-    source_paths = {
-        suffix: Path(str(axes.prefix) + suffix) for suffix in (".bed", ".bim", ".fam")
-    }
     manifest = {
         "schema": SCHEMA,
         "label": args.label,
@@ -311,6 +348,13 @@ def main() -> int:
             "omega": omega.tolist(),
             "omega_eigenvalues": np.linalg.eigvalsh(omega).tolist(),
             "residual_variance": args.residual_variance,
+            "psi": psi.tolist(),
+            "psi_eigenvalues": np.linalg.eigvalsh(psi).tolist(),
+            "environment_type": args.environment_type,
+            "requested_environment_correlation": args.environment_correlation,
+            "realized_environment_correlation": float(
+                np.corrcoef(environment, rowvar=False)[0, 1]
+            ),
             "fixed_environment_effects": list(args.fixed_environment_effects),
             "phenotype_inference_normalization": "project_then_unit_residual_variance_v1",
             "residual_nuisance_basis": (
@@ -318,8 +362,7 @@ def main() -> int:
             ),
             "residual_names": list(residual_names),
             "residual_true_coefficients": [
-                args.residual_variance,
-                *([0.0] * (len(residual_names) - 1)),
+                float(psi[left, right]) for left, right in residual_pairs
             ],
         },
         "dimensions": {
@@ -343,7 +386,6 @@ def main() -> int:
         },
         "genotype": {
             "prefix": str(axes.prefix),
-            "source_sha256": {suffix: file_sha256(path) for suffix, path in source_paths.items()},
             "scale": "mean_imputed_sample_sd_ddof1_common_across_contexts",
             "counted_allele": "BIM_A1",
             "causal_fraction": args.causal_fraction,
@@ -354,15 +396,16 @@ def main() -> int:
             "chunk_size": args.chunk_size,
             "missing_calls": int(np.sum(missing_counts, dtype=np.int64)),
         },
-        "effect_panel_sha256": effect_digest.finish(),
         "runtime_seconds": {"genotype_traversal_and_effect_gemm": genotype_seconds},
         "outputs": {
             "arrays": str(array_path),
-            "arrays_sha256": file_sha256(array_path),
         },
         "diagnostics": {
-            "maximum_environment_gram_error": float(
-                np.max(np.abs(environment.T @ environment - (n - 1.0) * np.eye(2)))
+            "maximum_environment_diagonal_gram_error": float(
+                np.max(np.abs(np.diag(environment.T @ environment) - (n - 1.0)))
+            ),
+            "realized_environment_correlation": float(
+                np.corrcoef(environment, rowvar=False)[0, 1]
             ),
             "maximum_effect_covariance_absolute_error": float(
                 np.max(np.abs(realized_effect_covariance - omega[None, :, :]))

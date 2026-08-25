@@ -2,7 +2,9 @@
 //
 // This file is included inside gxeldcore.cpp's anonymous namespace.  It uses
 // DirectContext only as the mature descriptor/decode operator; all pair,
-// annotation, and jackknife semantics remain in this generalized owner.
+// annotation semantics remain in this generalized owner.  Jackknife blocks
+// are deliberately absent: inference reduces the completed per-variant panel
+// after both reference-genotype passes have finished.
 
 struct GeneralizedGxEGemmShapeRecord {
     std::string operation;
@@ -57,16 +59,10 @@ public:
         nb_mat2f_ro<double> fixed_effect_basis,
         nb_mat2c_ro<double> annotations,
         nb_vec1_ro<double> annotation_masses,
-        nb_vec1_ro<int64_t> block_ids,
         nb_mat2c_ro<int64_t> pair_table,
         nb_mat2c_ro<int64_t> component_table,
         nb_vec1_ro<int64_t> product_offsets,
         nb_mat2c_ro<int64_t> product_terms,
-        const std::string& pair_table_sha256,
-        const std::string& component_table_sha256,
-        const std::string& product_offsets_sha256,
-        const std::string& product_terms_sha256,
-        const std::string& product_plan_digest,
         uint64_t root_seed,
         uint64_t namespace_key,
         int64_t probe_offset,
@@ -118,12 +114,7 @@ public:
           qualification_fault_phase_(qualification_fault_phase),
           qualification_fault_row_(qualification_fault_row),
           qualification_fault_column_(qualification_fault_column),
-          qualification_fault_delta_(qualification_fault_delta),
-          pair_table_sha256_(pair_table_sha256),
-          component_table_sha256_(component_table_sha256),
-          product_offsets_sha256_(product_offsets_sha256),
-          product_terms_sha256_(product_terms_sha256),
-          product_plan_digest_(product_plan_digest) {
+          qualification_fault_delta_(qualification_fault_delta) {
         validate_protected_gemm_threads(threads_);
         if (rows_ != checked_blas_dim(
                 basis.shape(0), "generalized basis rows") ||
@@ -132,8 +123,6 @@ public:
                 "generalized fixed-effect rows") ||
             variants_ != checked_blas_dim(
                 annotations.shape(0), "generalized annotation rows") ||
-            variants_ != checked_blas_dim(
-                block_ids.shape(0), "generalized block-id rows") ||
             q_ <= 0 || q_ >= rows_ || fixed_rank_ < 0 ||
             fixed_rank_ >= rows_ || annotations_count_ <= 0 || probes_ < 2 ||
             probe_offset_ < 0 || variant_block_width_ <= 0 ||
@@ -189,9 +178,6 @@ public:
             annotation_masses.data(),
             annotation_masses.data() + annotation_masses.shape(0)
         );
-        block_ids_.assign(
-            block_ids.data(), block_ids.data() + block_ids.shape(0)
-        );
         pair_table_.assign(
             pair_table.data(), pair_table.data() + checked_mul(
                 pair_table.shape(0), pair_table.shape(1),
@@ -239,7 +225,6 @@ public:
         result["pairs"] = pairs_;
         result["components"] = components_;
         result["probes"] = probes_;
-        result["jackknife_blocks"] = jackknife_blocks_;
         result["variant_block_width"] = variant_block_width_;
         result["source_probe_tile_width"] = source_probe_tile_width_;
         result["target_probe_tile_width"] = probe_tile_width_;
@@ -267,11 +252,6 @@ public:
             : "descriptor_packed_mailman";
         result["genotype_scale"] =
             "mean_imputed_single_affine_ddof_fp64_v1";
-        result["pair_table_sha256"] = pair_table_sha256_;
-        result["component_table_sha256"] = component_table_sha256_;
-        result["product_offsets_sha256"] = product_offsets_sha256_;
-        result["product_terms_sha256"] = product_terms_sha256_;
-        result["product_plan_digest"] = product_plan_digest_;
         return result;
     }
 
@@ -366,71 +346,6 @@ private:
         return "invalid";
     }
 
-    static bool valid_sha256(const std::string& value) noexcept {
-        if (value.size() != 64) return false;
-        for (char byte : value) {
-            if (!((byte >= '0' && byte <= '9') ||
-                  (byte >= 'a' && byte <= 'f'))) return false;
-        }
-        return true;
-    }
-
-    static std::string array_sha256_i64(
-        const int64_t* values,
-        const std::vector<int64_t>& shape
-    ) {
-        Sha256 digest;
-        const char dtype[] = "<i8";
-        digest.update(
-            reinterpret_cast<const unsigned char*>(dtype), 3
-        );
-        const unsigned char zero = 0;
-        digest.update(&zero, 1);
-        digest.update(
-            reinterpret_cast<const unsigned char*>(shape.data()),
-            checked_mul(shape.size(), sizeof(int64_t), "array hash shape")
-        );
-        size_t elements = 1;
-        for (int64_t extent : shape) {
-            elements = checked_mul(
-                elements, static_cast<size_t>(extent), "array hash elements"
-            );
-        }
-        digest.update(
-            reinterpret_cast<const unsigned char*>(values),
-            checked_mul(elements, sizeof(int64_t), "array hash payload")
-        );
-        return digest.finish();
-    }
-
-    static std::string array_sha256_f64(
-        const double* values,
-        const std::vector<int64_t>& shape
-    ) {
-        Sha256 digest;
-        const char dtype[] = "<f8";
-        digest.update(
-            reinterpret_cast<const unsigned char*>(dtype), 3
-        );
-        const unsigned char zero = 0;
-        digest.update(&zero, 1);
-        digest.update(
-            reinterpret_cast<const unsigned char*>(shape.data()),
-            checked_mul(shape.size(), sizeof(int64_t), "array hash shape")
-        );
-        size_t elements = 1;
-        for (int64_t extent : shape) {
-            elements = checked_mul(
-                elements, static_cast<size_t>(extent), "array hash elements"
-            );
-        }
-        digest.update(
-            reinterpret_cast<const unsigned char*>(values),
-            checked_mul(elements, sizeof(double), "array hash payload")
-        );
-        return digest.finish();
-    }
-
     static nb_numpy_vec1<double> copy_vector(
         const std::vector<double>& source
     ) {
@@ -490,16 +405,6 @@ private:
                 + static_cast<size_t>(target_pair))
                 * static_cast<size_t>(components_)
             + static_cast<size_t>(component);
-    }
-
-    size_t block_cube_index(
-        int block, int row, int column
-    ) const noexcept {
-        return (static_cast<size_t>(block)
-                    * static_cast<size_t>(components_)
-                + static_cast<size_t>(row))
-                * static_cast<size_t>(components_)
-            + static_cast<size_t>(column);
     }
 
     int pair_q(int pair) const noexcept {
@@ -583,7 +488,6 @@ private:
     int pairs_ = 0;
     int components_ = 0;
     int probes_ = 0;
-    int jackknife_blocks_ = 0;
     int residual_rank_ = 0;
     uint64_t root_seed_ = 0;
     uint64_t namespace_key_ = 0;
@@ -610,21 +514,10 @@ private:
     std::vector<double> annotation_values_;
     std::vector<double> sqrt_annotation_values_;
     std::vector<double> annotation_masses_;
-    std::vector<int64_t> block_ids_;
     std::vector<int64_t> pair_table_;
     std::vector<int64_t> component_table_;
     std::vector<int64_t> product_offsets_;
     std::vector<int64_t> product_terms_;
-    std::string pair_table_sha256_;
-    std::string component_table_sha256_;
-    std::string product_offsets_sha256_;
-    std::string product_terms_sha256_;
-    std::string product_plan_digest_;
-    std::string contextual_source_sha256_;
-    std::string retained_variant_order_sha256_;
-    std::string affine_mean_sha256_;
-    std::string affine_inverse_scale_sha256_;
-
     std::vector<double> base_sources_;
     std::vector<double> contextual_sources_;
     std::vector<double> same_person_;
@@ -632,8 +525,6 @@ private:
     std::vector<double> directed_;
     std::vector<double> symmetric_;
     std::vector<double> genetic_gram_;
-    std::vector<double> block_directed_;
-    std::vector<double> block_masses_;
     std::vector<double> affine_mean_;
     std::vector<double> affine_inverse_scale_;
 
@@ -655,7 +546,6 @@ private:
     double maximum_projection_leakage_ = 0.0;
     double maximum_relative_projection_leakage_ = 0.0;
     double same_person_presymmetry_error_ = 0.0;
-    double block_reconstruction_error_ = 0.0;
     double presymmetry_absolute_error_ = 0.0;
     double presymmetry_relative_error_ = 0.0;
     double phase_pass1_wall_seconds_ = 0.0;
@@ -680,8 +570,8 @@ private:
     double target_tn_cpu_seconds_ = 0.0;
     double reduction_wall_seconds_ = 0.0;
     double reduction_cpu_seconds_ = 0.0;
-    double hashing_audit_wall_seconds_ = 0.0;
-    double hashing_audit_cpu_seconds_ = 0.0;
+    double independent_audit_wall_seconds_ = 0.0;
+    double independent_audit_cpu_seconds_ = 0.0;
     double publication_wall_seconds_ = 0.0;
     double publication_cpu_seconds_ = 0.0;
     std::vector<GeneralizedGxEGemmShapeRecord> gemm_shapes_;
@@ -827,30 +717,6 @@ void GeneralizedGxELDScoreDirectContext::validate_inputs(
         }
     }
 
-    if (!valid_sha256(pair_table_sha256_) ||
-        !valid_sha256(component_table_sha256_) ||
-        !valid_sha256(product_offsets_sha256_) ||
-        !valid_sha256(product_terms_sha256_) ||
-        !valid_sha256(product_plan_digest_) ||
-        array_sha256_i64(
-            pair_table_.data(), {static_cast<int64_t>(pairs_), 2}
-        ) != pair_table_sha256_ ||
-        array_sha256_i64(
-            component_table_.data(), {static_cast<int64_t>(components_), 2}
-        ) != component_table_sha256_ ||
-        array_sha256_i64(
-            product_offsets_.data(),
-            {static_cast<int64_t>(product_offsets_.size())}
-        ) != product_offsets_sha256_ ||
-        array_sha256_i64(
-            product_terms_.data(),
-            {static_cast<int64_t>(product_terms.shape(0)), 4}
-        ) != product_terms_sha256_) {
-        throw std::runtime_error(
-            "Generalized native scientific table digest mismatch"
-        );
-    }
-
     for (double value : basis_) {
         if (!std::isfinite(value)) {
             throw std::runtime_error("Generalized basis is non-finite");
@@ -901,29 +767,6 @@ void GeneralizedGxELDScoreDirectContext::validate_inputs(
         }
     }
 
-    if (block_ids_.empty() || block_ids_[0] != 0) {
-        throw std::runtime_error(
-            "Generalized jackknife blocks must begin at zero"
-        );
-    }
-    int64_t previous = 0;
-    for (int64_t block : block_ids_) {
-        if (block < previous || block > previous + 1) {
-            throw std::runtime_error(
-                "Generalized jackknife blocks must be ordered and contiguous"
-            );
-        }
-        previous = block;
-    }
-    jackknife_blocks_ = checked_blas_dim(
-        static_cast<size_t>(block_ids_.back() + 1),
-        "generalized jackknife blocks"
-    );
-    if (jackknife_blocks_ < 2) {
-        throw std::runtime_error(
-            "Generalized jackknife requires at least two blocks"
-        );
-    }
     residual_rank_ = rows_ - fixed_rank_;
     if (residual_rank_ < 1) {
         throw std::runtime_error(
@@ -1237,21 +1080,6 @@ void GeneralizedGxELDScoreDirectContext::initialize_outputs() {
     directed_.assign(component_square, 0.0);
     symmetric_.assign(component_square, 0.0);
     genetic_gram_.assign(component_square, 0.0);
-    block_directed_.assign(
-        checked_mul(
-            static_cast<size_t>(jackknife_blocks_), component_square,
-            "generalized block directed numerators"
-        ),
-        0.0
-    );
-    block_masses_.assign(
-        checked_mul(
-            static_cast<size_t>(jackknife_blocks_),
-            static_cast<size_t>(annotations_count_),
-            "generalized block masses"
-        ),
-        0.0
-    );
     affine_mean_.assign(
         static_cast<size_t>(variants_),
         std::numeric_limits<double>::quiet_NaN()
@@ -1260,47 +1088,6 @@ void GeneralizedGxELDScoreDirectContext::initialize_outputs() {
         static_cast<size_t>(variants_),
         std::numeric_limits<double>::quiet_NaN()
     );
-    std::vector<int64_t> retained_variant_order(
-        static_cast<size_t>(variants_)
-    );
-    for (int variant = 0; variant < variants_; ++variant) {
-        retained_variant_order[static_cast<size_t>(variant)] = variant;
-    }
-    retained_variant_order_sha256_ = array_sha256_i64(
-        retained_variant_order.data(), {static_cast<int64_t>(variants_)}
-    );
-    for (int variant = 0; variant < variants_; ++variant) {
-        const int block = static_cast<int>(
-            block_ids_[static_cast<size_t>(variant)]
-        );
-        for (int annotation = 0; annotation < annotations_count_;
-             ++annotation) {
-            block_masses_[
-                static_cast<size_t>(block)
-                    * static_cast<size_t>(annotations_count_)
-                + static_cast<size_t>(annotation)
-            ] += annotation_values_[
-                static_cast<size_t>(variant)
-                    * static_cast<size_t>(annotations_count_)
-                + static_cast<size_t>(annotation)
-            ];
-        }
-    }
-    for (int block = 0; block < jackknife_blocks_; ++block) {
-        for (int annotation = 0; annotation < annotations_count_;
-             ++annotation) {
-            if (annotation_masses_[static_cast<size_t>(annotation)] -
-                    block_masses_[
-                        static_cast<size_t>(block)
-                            * static_cast<size_t>(annotations_count_)
-                        + static_cast<size_t>(annotation)
-                    ] <= 0.0) {
-                throw std::runtime_error(
-                    "Deleting a generalized jackknife block empties an annotation"
-                );
-            }
-        }
-    }
 }
 
 void GeneralizedGxELDScoreDirectContext::decode_block(
@@ -1806,9 +1593,9 @@ void GeneralizedGxELDScoreDirectContext::execute_pass1() {
                         probe_width, contribution_data,
                         static_cast<int>(source_nn_calls_)
                     );
-                    hashing_audit_wall_seconds_ +=
+                    independent_audit_wall_seconds_ +=
                         generalized_elapsed_seconds(audit_wall);
-                    hashing_audit_cpu_seconds_ += std::max(
+                    independent_audit_cpu_seconds_ += std::max(
                         0.0, process_cpu_seconds_now() - audit_cpu
                     );
                     ++gemm_output_numa_call_count_;
@@ -2179,22 +1966,6 @@ void GeneralizedGxELDScoreDirectContext::seal_sources_and_same_person() {
     same_person_cpu_seconds_ += std::max(
         0.0, process_cpu_seconds_now() - same_person_cpu
     );
-    const auto hash_wall = std::chrono::steady_clock::now();
-    const double hash_cpu = process_cpu_seconds_now();
-    contextual_source_sha256_ = array_sha256_f64(
-        contextual_sources_.data(),
-        {
-            static_cast<int64_t>(annotations_count_),
-            static_cast<int64_t>(q_), static_cast<int64_t>(rows_),
-            static_cast<int64_t>(probes_),
-        }
-    );
-    affine_mean_sha256_ = array_sha256_f64(
-        affine_mean_.data(), {static_cast<int64_t>(variants_)}
-    );
-    affine_inverse_scale_sha256_ = array_sha256_f64(
-        affine_inverse_scale_.data(), {static_cast<int64_t>(variants_)}
-    );
     for (int variant = 0; variant < variants_; ++variant) {
         const double mean = affine_mean_[static_cast<size_t>(variant)];
         const double inverse =
@@ -2206,10 +1977,6 @@ void GeneralizedGxELDScoreDirectContext::seal_sources_and_same_person() {
             );
         }
     }
-    hashing_audit_wall_seconds_ += generalized_elapsed_seconds(hash_wall);
-    hashing_audit_cpu_seconds_ += std::max(
-        0.0, process_cpu_seconds_now() - hash_cpu
-    );
     if (!retain_base_sources_) {
         std::vector<double>().swap(base_sources_);
     }
@@ -2221,25 +1988,6 @@ void GeneralizedGxELDScoreDirectContext::execute_pass2() {
         observed_variant_visits_ != variants_) {
         throw std::runtime_error("Invalid generalized pass-2 transition");
     }
-    const auto prehash_wall = std::chrono::steady_clock::now();
-    const double prehash_cpu = process_cpu_seconds_now();
-    const std::string source_before = array_sha256_f64(
-        contextual_sources_.data(),
-        {
-            static_cast<int64_t>(annotations_count_),
-            static_cast<int64_t>(q_), static_cast<int64_t>(rows_),
-            static_cast<int64_t>(probes_),
-        }
-    );
-    if (source_before != contextual_source_sha256_) {
-        throw std::runtime_error(
-            "Generalized sealed source checksum failed before pass 2"
-        );
-    }
-    hashing_audit_wall_seconds_ += generalized_elapsed_seconds(prehash_wall);
-    hashing_audit_cpu_seconds_ += std::max(
-        0.0, process_cpu_seconds_now() - prehash_cpu
-    );
     state_ = State::pass2_running;
     ++observed_passes_;
     std::fill(
@@ -2441,9 +2189,9 @@ void GeneralizedGxELDScoreDirectContext::execute_pass2() {
                         rhs_columns, cross_data,
                         static_cast<int>(target_tn_calls_)
                     );
-                    hashing_audit_wall_seconds_ +=
+                    independent_audit_wall_seconds_ +=
                         generalized_elapsed_seconds(audit_wall);
-                    hashing_audit_cpu_seconds_ += std::max(
+                    independent_audit_cpu_seconds_ += std::max(
                         0.0, process_cpu_seconds_now() - audit_cpu
                     );
                     ++gemm_output_numa_call_count_;
@@ -2592,9 +2340,6 @@ void GeneralizedGxELDScoreDirectContext::execute_pass2() {
         const double output_reduction_cpu = process_cpu_seconds_now();
         for (int variant = 0; variant < width; ++variant) {
             const int global_variant = start + variant;
-            const int block = static_cast<int>(
-                block_ids_[static_cast<size_t>(global_variant)]
-            );
             for (int target_pair = 0; target_pair < pairs_; ++target_pair) {
                 for (int component = 0; component < components_; ++component) {
                     const double value = lrow[
@@ -2639,9 +2384,6 @@ void GeneralizedGxELDScoreDirectContext::execute_pass2() {
                                 * static_cast<size_t>(components_)
                             + static_cast<size_t>(right_component)
                         ] += contribution;
-                        block_directed_[block_cube_index(
-                            block, left_component, right_component
-                        )] += contribution;
                     }
                 }
             }
@@ -2658,37 +2400,6 @@ void GeneralizedGxELDScoreDirectContext::execute_pass2() {
             "Generalized pass 2 did not visit every variant exactly once"
         );
     }
-    const auto posthash_wall = std::chrono::steady_clock::now();
-    const double posthash_cpu = process_cpu_seconds_now();
-    const std::string source_after = array_sha256_f64(
-        contextual_sources_.data(),
-        {
-            static_cast<int64_t>(annotations_count_),
-            static_cast<int64_t>(q_), static_cast<int64_t>(rows_),
-            static_cast<int64_t>(probes_),
-        }
-    );
-    if (source_after != contextual_source_sha256_) {
-        throw std::runtime_error(
-            "Generalized sealed source checksum changed during pass 2"
-        );
-    }
-    const std::string pass2_mean_sha256 = array_sha256_f64(
-        affine_mean_.data(), {static_cast<int64_t>(variants_)}
-    );
-    const std::string pass2_inverse_sha256 = array_sha256_f64(
-        affine_inverse_scale_.data(), {static_cast<int64_t>(variants_)}
-    );
-    if (pass2_mean_sha256 != affine_mean_sha256_ ||
-        pass2_inverse_sha256 != affine_inverse_scale_sha256_) {
-        throw std::runtime_error(
-            "Generalized genotype scale identity changed between passes"
-        );
-    }
-    hashing_audit_wall_seconds_ += generalized_elapsed_seconds(posthash_wall);
-    hashing_audit_cpu_seconds_ += std::max(
-        0.0, process_cpu_seconds_now() - posthash_cpu
-    );
 }
 
 void GeneralizedGxELDScoreDirectContext::finalize_scientific_outputs() {
@@ -2700,19 +2411,9 @@ void GeneralizedGxELDScoreDirectContext::finalize_scientific_outputs() {
     }
     for (int row = 0; row < components_; ++row) {
         for (int column = 0; column < components_; ++column) {
-            double reconstructed = 0.0;
-            for (int block = 0; block < jackknife_blocks_; ++block) {
-                reconstructed += block_directed_[block_cube_index(
-                    block, row, column
-                )];
-            }
             const size_t index = static_cast<size_t>(row)
                 * static_cast<size_t>(components_)
                 + static_cast<size_t>(column);
-            block_reconstruction_error_ = std::max(
-                block_reconstruction_error_,
-                std::abs(reconstructed - directed_[index])
-            );
             const size_t reverse = static_cast<size_t>(column)
                 * static_cast<size_t>(components_)
                 + static_cast<size_t>(row);
@@ -2756,7 +2457,7 @@ void GeneralizedGxELDScoreDirectContext::finalize_scientific_outputs() {
     }
     for (const std::vector<double>* values : {
             &directional_, &directed_, &symmetric_, &genetic_gram_,
-            &block_directed_, &block_masses_, &same_person_
+            &same_person_
          }) {
         for (double value : *values) {
             if (!std::isfinite(value)) {
@@ -2783,12 +2484,6 @@ nb::dict GeneralizedGxELDScoreDirectContext::publish_result() {
     );
     shapes["directional_ldscores"] = nb::make_tuple(
         variants_, pairs_, components_
-    );
-    shapes["block_directed_numerator"] = nb::make_tuple(
-        jackknife_blocks_, components_, components_
-    );
-    shapes["block_annotation_mass"] = nb::make_tuple(
-        jackknife_blocks_, annotations_count_
     );
 
     nb::dict ledger;
@@ -2844,11 +2539,6 @@ nb::dict GeneralizedGxELDScoreDirectContext::publish_result() {
         genetic_gram_, static_cast<size_t>(components_),
         static_cast<size_t>(components_)
     );
-    result["block_directed_numerator"] = copy_vector(block_directed_);
-    result["block_annotation_mass"] = copy_matrix(
-        block_masses_, static_cast<size_t>(jackknife_blocks_),
-        static_cast<size_t>(annotations_count_)
-    );
     result["annotation_masses"] = copy_vector(annotation_masses_);
     // The downstream trait pass must use the exact affine scale sealed by
     // this reference run.  Publish these small per-variant vectors with the
@@ -2858,18 +2548,10 @@ nb::dict GeneralizedGxELDScoreDirectContext::publish_result() {
     result["affine_inverse_scale"] =
         copy_vector(affine_inverse_scale_);
     result["residual_rank"] = residual_rank_;
-    result["contextual_source_sha256"] = contextual_source_sha256_;
-    result["product_plan_digest"] = product_plan_digest_;
-    result["genotype_scale_policy"] = "sealed_variant_affine_v1";
-    result["retained_variant_order_sha256"] =
-        retained_variant_order_sha256_;
+    result["genotype_scale_policy"] = "variant_affine_v1";
     result["allele_orientation"] = "bim_a1_counted_v1";
     result["allele_coding"] =
         "plink_bed_snp_major_diploid_hardcall_v1";
-    // Once pass 1 has sealed and pass 2 has reproduced these vectors, the
-    // downstream descriptor contract treats them as the provided affine
-    // plan. Their observed-data origin remains evidenced by the exact two-pass
-    // decoder ledger and the mean/inverse-scale hashes.
     result["centering_source"] = "provided_v1";
     result["centering_formula"] =
         "provided_variant_affine_mean_v1";
@@ -2877,9 +2559,6 @@ nb::dict GeneralizedGxELDScoreDirectContext::publish_result() {
         "dosage_minus_mean_times_inverse_scale_v1";
     result["missing_imputation"] = "sealed_mean_v1";
     result["ploidy_policy"] = "diploid_v1";
-    result["affine_mean_sha256"] = affine_mean_sha256_;
-    result["affine_inverse_scale_sha256"] =
-        affine_inverse_scale_sha256_;
     publication_wall_seconds_ += generalized_elapsed_seconds(publication_wall);
     publication_cpu_seconds_ += std::max(
         0.0, process_cpu_seconds_now() - publication_cpu
@@ -2905,7 +2584,7 @@ nb::dict GeneralizedGxELDScoreDirectContext::publish_result() {
     subphase_wall["same_person"] = same_person_wall_seconds_;
     subphase_wall["target_tn"] = target_tn_wall_seconds_;
     subphase_wall["row_product_reduction"] = reduction_wall_seconds_;
-    subphase_wall["hashing_audits"] = hashing_audit_wall_seconds_;
+    subphase_wall["independent_audits"] = independent_audit_wall_seconds_;
     subphase_wall["publication"] = publication_wall_seconds_;
     nb::dict subphase_cpu;
     subphase_cpu["decode"] = decode_cpu_seconds_;
@@ -2915,7 +2594,7 @@ nb::dict GeneralizedGxELDScoreDirectContext::publish_result() {
     subphase_cpu["same_person"] = same_person_cpu_seconds_;
     subphase_cpu["target_tn"] = target_tn_cpu_seconds_;
     subphase_cpu["row_product_reduction"] = reduction_cpu_seconds_;
-    subphase_cpu["hashing_audits"] = hashing_audit_cpu_seconds_;
+    subphase_cpu["independent_audits"] = independent_audit_cpu_seconds_;
     subphase_cpu["publication"] = publication_cpu_seconds_;
 
     nb::list gemm_dimensions;
@@ -2976,8 +2655,7 @@ nb::dict GeneralizedGxELDScoreDirectContext::publish_result() {
         static_cast<uint64_t>(
             contextual_sources_.size() + same_person_.size()
             + directional_.size() + directed_.size() + symmetric_.size()
-            + genetic_gram_.size() + block_directed_.size()
-            + block_masses_.size()
+            + genetic_gram_.size()
             + annotation_masses_.size()
             + affine_mean_.size() + affine_inverse_scale_.size()
             + (retain_base_sources_ ? base_sources_.size() : 0U)
@@ -3079,18 +2757,10 @@ nb::dict GeneralizedGxELDScoreDirectContext::publish_result() {
         maximum_relative_projection_leakage_;
     telemetry["same_person_presymmetry_error"] =
         same_person_presymmetry_error_;
-    telemetry["block_reconstruction_error"] =
-        block_reconstruction_error_;
     telemetry["presymmetry_absolute_error"] =
         presymmetry_absolute_error_;
     telemetry["presymmetry_relative_error"] =
         presymmetry_relative_error_;
-    telemetry["contextual_source_sha256"] = contextual_source_sha256_;
-    telemetry["pair_table_sha256"] = pair_table_sha256_;
-    telemetry["component_table_sha256"] = component_table_sha256_;
-    telemetry["product_offsets_sha256"] = product_offsets_sha256_;
-    telemetry["product_terms_sha256"] = product_terms_sha256_;
-    telemetry["product_plan_digest"] = product_plan_digest_;
     telemetry["pass_ledger"] = ledger;
 
     result["ledger"] = ledger;
@@ -3107,8 +2777,6 @@ void GeneralizedGxELDScoreDirectContext::clear_publishable_outputs() noexcept {
     std::vector<double>().swap(directed_);
     std::vector<double>().swap(symmetric_);
     std::vector<double>().swap(genetic_gram_);
-    std::vector<double>().swap(block_directed_);
-    std::vector<double>().swap(block_masses_);
     std::vector<double>().swap(affine_mean_);
     std::vector<double>().swap(affine_inverse_scale_);
     gemm_output_numa_call_count_ = 0;

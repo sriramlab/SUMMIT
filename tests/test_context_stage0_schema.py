@@ -583,7 +583,7 @@ def test_context_reference_loader_rejects_legacy_kind_before_artifact_io(
         load_context_reference(manifest_path)
 
 
-def test_legacy_reference_loader_rejects_context_kind_before_artifact_io(
+def test_gxe_reference_loader_rejects_context_kind_before_artifact_io(
     tmp_path,
 ) -> None:
     from summit.ldscore import gxe_score
@@ -594,5 +594,5 @@ def test_legacy_reference_loader_rejects_context_kind_before_artifact_io(
         encoding="utf-8",
     )
 
-    with pytest.raises(ValueError, match="schema-v3 or schema-v4"):
-        gxe_score._validate_reference_manifest(manifest_path, scratch_dir=tmp_path)
+    with pytest.raises(ValueError, match="schema-v4.*GxE reference"):
+        gxe_score._validate_reference_manifest(manifest_path)

@@ -341,7 +341,7 @@ is that native execution scratch no longer overlaps publication at all.
 ## 7. Production-shaped 10K gate
 
 Configuration (source-matched to
-`reports/gxe_completion/CURRENT_STATUS_AND_REMAINING_WORK.md`): real UKBB
+the archived GxE throughput audit): real UKBB
 EUR genotypes (M=454,207), three environments (age, sex, bmi), 22
 covariates, N=9,996 complete-case samples, B=256, K=2000 (228 blocks),
 T=32, float32 retained storage, private pthread-BLIS build at the ending

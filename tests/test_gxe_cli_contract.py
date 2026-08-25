@@ -880,58 +880,6 @@ def test_outer_numactl_sentinel_prevents_nested_cli_reexec(monkeypatch):
     assert os.environ["SUMMIT_NUMACTL_WRAPPED"] == "1"
 
 
-def test_numactl_reexec_preserves_python_isolation_and_module_invocation(monkeypatch):
-    from summit.ldscore import gw_ldscore
-
-    monkeypatch.delenv("SUMMIT_NUMACTL_WRAPPED", raising=False)
-    monkeypatch.setattr(gw_ldscore.shutil, "which", lambda name: "/usr/bin/numactl")
-    monkeypatch.setattr(
-        gw_ldscore, "attest_numa_policy_request", lambda *_args: False
-    )
-    original = [
-        "python",
-        "-S",
-        "-B",
-        "-m",
-        "summit.cli",
-        "--gxe-parallel-environment-groups",
-        "2",
-    ]
-    monkeypatch.setattr(sys, "orig_argv", original, raising=False)
-    observed = {}
-
-    class ReexecCaptured(RuntimeError):
-        pass
-
-    def capture_exec(executable, arguments):
-        observed["executable"] = executable
-        observed["arguments"] = list(arguments)
-        raise ReexecCaptured
-
-    monkeypatch.setattr(gw_ldscore.os, "execv", capture_exec)
-    with pytest.raises(ReexecCaptured):
-        gw_ldscore.apply_env(
-            {
-                "numa_mode": "interleave",
-                "numa_nodes": "0-3",
-                "force_affinity_all": False,
-                "num_threads": 2,
-                "decode_threads_cap": 2,
-            }
-        )
-
-    assert observed == {
-        "executable": "/usr/bin/numactl",
-        "arguments": [
-            "/usr/bin/numactl",
-            "--interleave=0-3",
-            sys.executable,
-            *original[1:],
-        ],
-    }
-    assert os.environ["SUMMIT_NUMACTL_WRAPPED"] == "1"
-
-
 def test_internal_worker_python_prefix_preserves_isolation_flags(monkeypatch):
     from summit import cli
 
@@ -1368,59 +1316,6 @@ def test_explicit_outer_layout_cannot_fall_through_to_estimator(
         cli._dispatch_gxe_multi_reference(args, None, False, None)
 
 
-@pytest.mark.parametrize(
-    "layout", ("source-tt-target-current", "source-tt-target-row")
-)
-def test_noncurrent_fp64_layout_is_rejected_before_output(
-    tmp_path, monkeypatch, capsys, layout
-):
-    from summit import cli
-
-    prefix = tmp_path / "single-environment"
-    monkeypatch.setattr(
-        sys,
-        "argv",
-        [
-            "summit", "--geno", "geno", "--env", "environment.tsv",
-            "--gxe-fp64-layout", layout,
-            "--out", str(prefix), "--suppress",
-        ],
-    )
-    with pytest.raises(SystemExit) as error:
-        cli.main()
-    assert error.value.code == 2
-    assert "invalid choice" in capsys.readouterr().err
-    assert not Path(f"{prefix}.gxe.log").exists()
-
-
-def test_explicit_current_layout_reaches_fused_multi_environment_dispatch(
-    tmp_path, monkeypatch
-):
-    from summit import cli
-
-    observed = []
-    monkeypatch.setattr(cli, "apply_env", lambda _: None)
-    monkeypatch.setattr(
-        cli,
-        "_dispatch_gxe_multi_reference",
-        lambda args, *_: observed.append(
-            (args.gxe_env_cols, args.gxe_fp64_layout)
-        ),
-    )
-    monkeypatch.setattr(
-        sys,
-        "argv",
-        [
-            "summit", "--geno", "geno", "--env", "wide.tsv",
-            "--gxe-env-cols", "age,bmi",
-            "--gxe-fp64-layout", "current",
-            "--out", str(tmp_path / "multi-current"), "--suppress",
-        ],
-    )
-    cli.main()
-    assert observed == [("age,bmi", "current")]
-
-
 def test_single_environment_direct_reference_uses_unified_descriptor_pipeline(
     monkeypatch,
 ):
@@ -1452,10 +1347,7 @@ def test_single_environment_direct_reference_uses_unified_descriptor_pipeline(
         gxe_env_cols=None,
         gxe_native_backend="direct",
         gxe_pheno=None,
-        _gxe_feature_cache=None,
-        _gxe_reference_shard=False,
         _gxe_multi_batch_manifest=None,
-        gxe_fp64_layout="current",
         out="reference",
     )
     log = SimpleNamespace(_log=lambda _message: None)
@@ -1535,9 +1427,7 @@ def test_gxe_reusable_workflow_modes_dispatch_once(
     calls = []
     monkeypatch.setattr(cli, "apply_env", lambda _: None)
     for name in (
-        "_dispatch_gxe_cache",
         "_dispatch_gxe_score",
-        "_dispatch_gxe_merge",
         "_dispatch_gxe_fit_batch",
     ):
         monkeypatch.setattr(
@@ -1554,86 +1444,21 @@ def test_gxe_reusable_workflow_modes_dispatch_once(
     assert calls == [dispatch_name]
 
 
-@pytest.mark.parametrize(
-    "retired",
-    [
-        ["--geno", "geno", "--env", "env", "--_gxe-build-cache"],
-        [
-            "--geno", "geno", "--env", "env", "--_gxe-reference-shard",
-            "--_gxe-feature-cache", "features.npz",
-        ],
-        [
-            "--_gxe-merge-shards", "shard-0.json", "shard-1.json",
-            "--_gxe-feature-cache", "features.npz",
-        ],
-    ],
-)
-def test_disk_backed_gxe_construction_flags_are_not_parseable(
-    tmp_path, monkeypatch, retired
-):
-    from summit import cli
-
-    monkeypatch.setattr(cli, "apply_env", lambda _: None)
-    monkeypatch.setattr(
-        sys,
-        "argv",
-        ["summit", *retired, "--out", str(tmp_path / "retired"), "--suppress"],
-    )
-    with pytest.raises(SystemExit) as error:
-        cli.main()
-    assert error.value.code == 2
-
-
-def test_private_gxe_reference_shard_reserves_identity_sidecar(tmp_path, monkeypatch):
-    from summit import cli
-
-    monkeypatch.setattr(cli, "apply_env", lambda _: None)
-    called = False
-
-    def capture(*_):
-        nonlocal called
-        called = True
-
-    monkeypatch.setattr(cli, "_dispatch_ldscore", capture)
-    prefix = tmp_path / "reserved"
-    Path(str(prefix) + ".gxe.shard.identity.json").write_text("{}\n", encoding="utf-8")
-    monkeypatch.setattr(
-        sys,
-        "argv",
-        [
-            "summit", "--geno", "geno", "--env", "env",
-            "--_gxe-reference-shard", "--_gxe-feature-cache", "features.npz",
-            "--nvecs", "10", "--out", str(prefix), "--suppress",
-        ],
-    )
-    with pytest.raises(SystemExit):
-        cli.main()
-    assert not called
-
-
 def test_gxe_reusable_mode_validation_rejects_ambiguous_or_unsafe_calls(tmp_path, monkeypatch):
     from summit import cli
 
     monkeypatch.setattr(cli, "apply_env", lambda _: None)
     cases = [
         [
-            "--geno", "geno", "--env", "env", "--_gxe-build-cache",
-            "--gxe-score-reference", "reference.json", "--gxe-pheno", "traits.tsv",
-        ],
-        ["--geno", "geno", "--env", "env", "--_gxe-reference-shard"],
-        ["--_gxe-merge-shards", "shard.json"],
-        [
             "--geno", "geno", "--env", "env", "--gxe-pheno", "traits.tsv",
             "--gxe-score-reference", "reference.json", "--gxe-overwrite",
         ],
         ["--gxe-fit", "reference.json", "--gxe-fit-batch", "batch.json"],
         ["--gxe-fit-batch", "batch.json", "--gxe-moments", "moments.json"],
-        ["--gxe-fit-batch", "batch.json", "--_gxe-feature-cache", "cache.npz"],
         ["--gxe-fit-batch", "batch.json", "--covar", "covariates.tsv"],
         ["--gxe-fit-batch", "batch.json", "--annot", "annotations.tsv"],
         ["--gxe-fit-batch", "batch.json", "--gxe-kernel-mode", "genie"],
         ["--gxe-fit-batch=batch.json", "--gxe-kernel-mode=standardized"],
-        ["--gxe-fit-batch", "batch.json", "--_gxe-feature-c", "cache.npz"],
         ["--gxe-fit-batch", "batch.json", "--gxe-kernel-m", "genie"],
         ["--gxe-fit-batch", "batch.json", "--ann", "annotations.tsv"],
         ["--gxe-fit-batch", "batch.json", "--gxe-overwrite"],
@@ -1646,25 +1471,3 @@ def test_gxe_reusable_mode_validation_rejects_ambiguous_or_unsafe_calls(tmp_path
         )
         with pytest.raises(SystemExit):
             cli.main()
-
-
-@pytest.mark.parametrize(
-    "removed_option",
-    (
-        "--gxe-build-cache",
-        "--gxe-feature-cache",
-        "--gxe-jackknife-scratch-gib",
-        "--gxe-reference-shard",
-        "--gxe-probe-offset",
-        "--gxe-merge-shards",
-    ),
-)
-def test_gxe_cache_and_shard_controls_are_not_public_cli_options(removed_option):
-    from summit import cli
-
-    parser = cli.build_parser()
-    help_text = parser.format_help()
-    assert removed_option not in help_text
-    assert "--_gxe-" not in help_text
-    with pytest.raises(SystemExit):
-        parser.parse_args([removed_option])

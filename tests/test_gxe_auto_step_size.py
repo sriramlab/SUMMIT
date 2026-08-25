@@ -63,7 +63,7 @@ def _estimator(prefix, environment, out_path, column, *, step_size):
         dtype="float64",
         num_threads=2,
         target_xz_mem=0.01,
-        kernel_mode="standardized",
+        kernel_mode="standardized_projected",
         genotype_scale="sample",
         native_backend="python",
     )
@@ -81,7 +81,7 @@ def _run(tmp_path, prefix, environment, tag, *, step_size):
         batch = generate_multi_environment_references(
             estimators,
             batch_manifest=tmp_path / f"{tag}.gxe.multi.json",
-            requested_backend="direct",
+            requested_backend="python",
         )
     finally:
         for estimator in estimators:
@@ -122,10 +122,7 @@ def test_auto_resolution_and_manifest_provenance(tmp_path):
     randomization = manifest["randomization"]
     assert randomization["step_size"] == min(M, 8192)
     assert randomization["step_size_selection"] == "auto_v1"
-    context = payload["performance_telemetry"][
-        "multi_environment_direct_context"
-    ]
-    assert context["block_count"] == -(-M // min(M, 8192))
+    assert payload["requested_backend"] == "python"
 
 
 def test_auto_realization_equals_the_explicit_width(tmp_path):

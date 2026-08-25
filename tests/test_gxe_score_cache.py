@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import hashlib
 import json
 import math
 import shutil
@@ -45,10 +44,6 @@ class CachedReferenceFixture:
     @property
     def original_moments(self) -> Path:
         return Path(str(self.reference_prefix) + ".gxe.moments.json")
-
-
-def _sha256(path: Path) -> str:
-    return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
 @pytest.fixture(scope="module")
@@ -108,7 +103,7 @@ def cached_reference(tmp_path_factory) -> CachedReferenceFixture:
         seed=31,
         verbose=False,
         dtype="float32",
-        kernel_mode="standardized",
+        kernel_mode="standardized_projected",
         genotype_scale="sample",
         target_xz_mem=0.01,
     )
@@ -181,8 +176,6 @@ def test_cached_scoring_matches_reference_generation_and_decodes_once(
     original_moments = json.loads(cached_reference.original_moments.read_text())
     cached_moments = json.loads(artifacts.moments.read_text())
     for key in (
-        "analysis_fingerprint",
-        "variant_digest",
         "phenotype",
         "n_samples",
         "residual_rank",
@@ -192,11 +185,6 @@ def test_cached_scoring_matches_reference_generation_and_decodes_once(
         "phenotype_residual_variance_fraction",
     ):
         assert cached_moments[key] == original_moments[key]
-    assert cached_moments["reference_manifest_sha256"] == _sha256(
-        cached_reference.manifest
-    )
-    assert cached_moments["score_sha256"]["gwas"] == _sha256(artifacts.gwas)
-    assert cached_moments["score_sha256"]["gwis"] == _sha256(artifacts.gwis)
     assert all(
         (path.stat().st_mode & 0o777) == 0o600
         for path in (artifacts.gwas, artifacts.gwis, artifacts.moments)
@@ -206,6 +194,7 @@ def test_cached_scoring_matches_reference_generation_and_decodes_once(
         artifacts.moments,
         artifacts.gwas,
         artifacts.gwis,
+        njack=3,
         allow_ill_conditioned=True,
         max_condition=1e16,
     )
@@ -251,6 +240,7 @@ def test_population_reference_scores_trait_specific_cohort_and_fits(
         artifacts.moments,
         artifacts.gwas,
         artifacts.gwis,
+        njack=3,
         allow_ill_conditioned=True,
         max_condition=1e16,
     )
@@ -312,7 +302,7 @@ def test_cached_scoring_refuses_overwrite_without_changing_outputs(
     assert not Path(str(output_prefix) + ".gxe.score.lock").exists()
 
 
-def test_cached_scoring_preserves_explicit_genie_compatibility(
+def test_trait_scoring_preserves_raw_projected_feature_convention(
     cached_reference, tmp_path
 ):
     genie_prefix = tmp_path / "genie-reference"
@@ -331,7 +321,7 @@ def test_cached_scoring_preserves_explicit_genie_compatibility(
         seed=53,
         verbose=False,
         dtype="float32",
-        kernel_mode="genie",
+        kernel_mode="raw_projected",
         genotype_scale="hwe",
         target_xz_mem=0.01,
     )
@@ -372,47 +362,7 @@ def _copy_reference_bundle(source_manifest: Path, target_directory: Path) -> Pat
     return target_manifest
 
 
-def test_cached_scoring_rejects_bed_sha_tamper(cached_reference, tmp_path):
-    tampered_prefix = tmp_path / "tampered-genotype"
-    _copy_genotype_triple(cached_reference.genotype_prefix, tampered_prefix)
-    bed_path = Path(str(tampered_prefix) + ".bed")
-    content = bytearray(bed_path.read_bytes())
-    content[-1] ^= 0x01
-    bed_path.write_bytes(content)
-
-    with pytest.raises(ValueError, match="BED|bed|SHA-256"):
-        gxe_score.score_phenotype_from_reference(
-            reference_manifest=cached_reference.manifest,
-            bed_path=tampered_prefix,
-            env_path=cached_reference.environment,
-            covar_path=cached_reference.covariates,
-            pheno_path=cached_reference.phenotype,
-            output_prefix=tmp_path / "bed-tamper-output",
-        )
-
-
-def test_cached_scoring_rejects_reference_artifact_tamper(
-    cached_reference, tmp_path
-):
-    copied_manifest = _copy_reference_bundle(
-        cached_reference.manifest, tmp_path / "tampered-reference"
-    )
-    payload = json.loads(copied_manifest.read_text())
-    diagonal = copied_manifest.parent / Path(payload["files"]["diagonal"]).name
-    diagonal.write_bytes(diagonal.read_bytes() + b"tamper")
-
-    with pytest.raises(ValueError, match="artifact.*SHA-256"):
-        gxe_score.score_phenotype_from_reference(
-            reference_manifest=copied_manifest,
-            bed_path=cached_reference.genotype_prefix,
-            env_path=cached_reference.environment,
-            covar_path=cached_reference.covariates,
-            pheno_path=cached_reference.phenotype,
-            output_prefix=tmp_path / "artifact-tamper-output",
-        )
-
-
-def test_cached_scoring_rejects_analysis_fingerprint_mismatch(
+def test_trait_scoring_rejects_environment_transform_mismatch(
     cached_reference, tmp_path
 ):
     altered = pd.read_csv(cached_reference.environment, sep=r"\s+")
@@ -420,7 +370,7 @@ def test_cached_scoring_rejects_analysis_fingerprint_mismatch(
     altered_environment = tmp_path / "altered-environment.tsv"
     altered.to_csv(altered_environment, sep="\t", index=False)
 
-    with pytest.raises(ValueError, match="Environment transform|fingerprint"):
+    with pytest.raises(ValueError, match="Environment transform"):
         gxe_score.score_phenotype_from_reference(
             reference_manifest=cached_reference.manifest,
             bed_path=cached_reference.genotype_prefix,
@@ -434,7 +384,7 @@ def test_cached_scoring_rejects_analysis_fingerprint_mismatch(
 @pytest.mark.parametrize(
     ("field", "replacement", "message"),
     [
-        ("kernel_mode", "genie", "scale|GENIE"),
+        ("kernel_mode", "raw_projected", "feature convention"),
         ("genotype_scale", "hwe", "norm|scal"),
         ("residual_rank", 999, "rank"),
     ],
@@ -460,7 +410,7 @@ def test_cached_scoring_rejects_manifest_feature_definition_mismatch(
         )
 
 
-def test_cached_scoring_rejects_variant_axis_mismatch_even_with_updated_bim_hash(
+def test_trait_scoring_rejects_variant_axis_mismatch(
     cached_reference, tmp_path
 ):
     altered_prefix = tmp_path / "altered-axis"
@@ -470,19 +420,9 @@ def test_cached_scoring_rejects_variant_axis_mismatch_even_with_updated_bim_hash
     bim.loc[0, 4] = "T" if bim.loc[0, 4] != "T" else "A"
     bim.to_csv(bim_path, sep="\t", index=False, header=False)
 
-    copied_manifest = _copy_reference_bundle(
-        cached_reference.manifest, tmp_path / "altered-axis-reference"
-    )
-    payload = json.loads(copied_manifest.read_text())
-    payload["genotype_files"][".bim"] = {
-        "bytes": bim_path.stat().st_size,
-        "sha256": _sha256(bim_path),
-    }
-    copied_manifest.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
-
-    with pytest.raises(ValueError, match="variant axis|variant digest"):
+    with pytest.raises(ValueError, match="variant axis"):
         gxe_score.score_phenotype_from_reference(
-            reference_manifest=copied_manifest,
+            reference_manifest=cached_reference.manifest,
             bed_path=altered_prefix,
             env_path=cached_reference.environment,
             covar_path=cached_reference.covariates,
@@ -586,8 +526,6 @@ def test_wide_cached_scoring_decodes_once_and_matches_single_trait_oracles(
         observed_moments = json.loads(artifacts.moments.read_text())
         expected_moments = json.loads(oracle_moments.read_text())
         for key in (
-            "analysis_fingerprint",
-            "variant_digest",
             "phenotype",
             "n_samples",
             "residual_rank",
@@ -606,11 +544,6 @@ def test_wide_cached_scoring_decodes_once_and_matches_single_trait_oracles(
             np.testing.assert_allclose(
                 observed_moments[key], expected_moments[key], rtol=2.0e-15, atol=1.0e-14
             )
-        assert observed_moments["reference_manifest_sha256"] == _sha256(
-            cached_reference.manifest
-        )
-        assert observed_moments["score_sha256"]["gwas"] == _sha256(artifacts.gwas)
-        assert observed_moments["score_sha256"]["gwis"] == _sha256(artifacts.gwis)
         assert all(
             (path.stat().st_mode & 0o777) == 0o600
             for path in (artifacts.gwas, artifacts.gwis, artifacts.moments)

@@ -86,7 +86,7 @@ def _estimator(
         dtype="float64",
         num_threads=args.threads,
         target_xz_mem=args.memory_gib,
-        kernel_mode="standardized",
+        kernel_mode="standardized_projected",
         genotype_scale="sample",
         native_backend=native_backend,
         native_workspace_gib=args.workspace_gib,

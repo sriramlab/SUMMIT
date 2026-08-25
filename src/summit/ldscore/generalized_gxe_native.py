@@ -8,11 +8,9 @@ from typing import Any, Mapping, Sequence
 
 import numpy as np
 
-from summit.context.schema import GenotypeScalePlanV1, GenotypeScalePolicy
 from summit.context.spec import (
     ContextComponentIndex,
     ContextPairIndex,
-    array_sha256,
 )
 from summit.ldscore.generalized_gxe_pass2 import build_pair_product_plan
 from summit.ldscore.generalized_gxe_variant import (
@@ -41,8 +39,6 @@ class GeneralizedGxENativeResult:
     directed_numerator: Array
     symmetric_numerator: Array
     genetic_gram: Array
-    block_directed_numerator: Array
-    block_annotation_mass: Array
     same_person: Array
     annotation_masses: Array
     affine_mean: Array
@@ -51,16 +47,12 @@ class GeneralizedGxENativeResult:
     base_sources: Array | None
     pair_table: tuple[tuple[int, int], ...]
     component_table: tuple[tuple[int, int], ...]
-    product_plan_digest: str
     residual_rank: int
-    source_panel_sha256: str
-    genotype_scale_plan: GenotypeScalePlanV1
+    genotype_scale: Mapping[str, str]
     ledger: Mapping[str, Any]
     telemetry: Mapping[str, Any]
-    block_reconstruction_error: float
     presymmetry_absolute_error: float
     presymmetry_relative_error: float
-    same_person_reused_for_all_deletions: bool = True
 
 
 def generalized_gxe_performance_ledger_from_native(
@@ -119,7 +111,6 @@ class GeneralizedGxENativeBEDExecutor:
         annotations: Array,
         annotation_names: Sequence[str],
         annotation_masses: Sequence[float] | Array,
-        block_ids: Sequence[int] | Array,
         probe_spec: GlobalVariantProbeSpec,
         work_plan: GeneralizedGxEWorkPlan,
         probe_tile_width: int | None = None,
@@ -160,7 +151,6 @@ class GeneralizedGxENativeBEDExecutor:
             annotations, dtype=np.float64, order="C", copy=True
         )
         masses = np.array(annotation_masses, dtype=np.float64, copy=True)
-        blocks = np.array(block_ids, dtype=np.int64, order="C", copy=True)
         if basis_value.ndim != 2 or fixed_value.ndim != 2:
             raise ValueError("basis and fixed_effect_basis must be matrices")
         n, q = basis_value.shape
@@ -170,8 +160,8 @@ class GeneralizedGxENativeBEDExecutor:
             raise ValueError("annotations must be a matrix")
         m, k = annotation_value.shape
         names = tuple(str(name) for name in annotation_names)
-        if len(names) != k or masses.shape != (k,) or blocks.shape != (m,):
-            raise ValueError("annotation names, masses, or blocks are mis-sized")
+        if len(names) != k or masses.shape != (k,):
+            raise ValueError("annotation names or masses are mis-sized")
         if not (
             np.all(np.isfinite(basis_value))
             and np.all(np.isfinite(fixed_value))
@@ -188,14 +178,6 @@ class GeneralizedGxENativeBEDExecutor:
             atol=0.0,
         ):
             raise ValueError("annotation masses do not match annotations")
-        if blocks.dtype.kind not in "iu" or blocks[0] != 0:
-            raise ValueError("block_ids must begin at zero")
-        if np.any(np.diff(blocks) < 0) or not np.array_equal(
-            np.unique(blocks),
-            np.arange(int(blocks[-1]) + 1, dtype=np.int64),
-        ):
-            raise ValueError("block_ids must be ordered and contiguous")
-
         pair_index = ContextPairIndex(q)
         component_index = ContextComponentIndex(names, pair_index)
         pairs = tuple((entry.q, entry.r) for entry in pair_index.entries)
@@ -224,7 +206,6 @@ class GeneralizedGxENativeBEDExecutor:
             "K": k,
             "C": len(components),
             "B": probe_spec.probe_count,
-            "J": int(blocks[-1]) + 1,
         }
         for name, expected in expected_dimensions.items():
             if int(dimensions.get(name, -1)) != expected:
@@ -318,16 +299,10 @@ class GeneralizedGxENativeBEDExecutor:
             fixed_effect_basis=fixed_value,
             annotations=annotation_value,
             annotation_masses=np.ascontiguousarray(masses),
-            block_ids=blocks,
             pair_table=pair_table,
             component_table=component_table,
             product_offsets=product_offsets,
             product_terms=product_terms,
-            pair_table_sha256=array_sha256(pair_table),
-            component_table_sha256=array_sha256(component_table),
-            product_offsets_sha256=array_sha256(product_offsets),
-            product_terms_sha256=array_sha256(product_terms),
-            product_plan_digest=product_plan.digest,
             root_seed=probe_spec.root_seed,
             namespace_key=probe_spec.namespace_key,
             probe_offset=probe_spec.probe_offset,
@@ -348,7 +323,6 @@ class GeneralizedGxENativeBEDExecutor:
         )
         self._pairs = pairs
         self._components = components
-        self._product_plan_digest = product_plan.digest
         self._dimensions = expected_dimensions
         self._retain_base_sources = retain_base_sources
         self._backend = backend
@@ -369,7 +343,6 @@ class GeneralizedGxENativeBEDExecutor:
 
         contextual = reshape("contextual_sources")
         directional = reshape("directional_ldscores")
-        block_directed = reshape("block_directed_numerator")
         base: Array | None
         if self._retain_base_sources:
             base = reshape("base_sources")
@@ -385,9 +358,6 @@ class GeneralizedGxENativeBEDExecutor:
             np.ascontiguousarray(raw["symmetric_numerator"], dtype=np.float64)
         )
         gram = _readonly(np.ascontiguousarray(raw["genetic_gram"], dtype=np.float64))
-        block_masses = _readonly(
-            np.ascontiguousarray(raw["block_annotation_mass"], dtype=np.float64)
-        )
         masses = _readonly(
             np.ascontiguousarray(raw["annotation_masses"], dtype=np.float64)
         )
@@ -406,39 +376,22 @@ class GeneralizedGxENativeBEDExecutor:
             or np.any(affine_inverse_scale <= 0.0)
         ):
             raise RuntimeError("native genotype-scale vectors are invalid")
-        source_hash = str(raw["contextual_source_sha256"])
-        if array_sha256(contextual) != source_hash:
-            raise RuntimeError("native contextual-source checksum does not verify")
-        if str(raw["product_plan_digest"]) != self._product_plan_digest:
-            raise RuntimeError("native product-plan digest changed")
+        scale_fields = (
+            "genotype_scale_policy",
+            "allele_orientation",
+            "allele_coding",
+            "centering_source",
+            "centering_formula",
+            "scaling_formula",
+            "missing_imputation",
+            "ploidy_policy",
+        )
         try:
-            scale_plan = GenotypeScalePlanV1(
-                policy=GenotypeScalePolicy(str(raw["genotype_scale_policy"])),
-                retained_variant_order_sha256=str(
-                    raw["retained_variant_order_sha256"]
-                ),
-                allele_orientation=str(raw["allele_orientation"]),
-                allele_coding=str(raw["allele_coding"]),
-                centering_source=str(raw["centering_source"]),
-                centering_formula=str(raw["centering_formula"]),
-                scaling_formula=str(raw["scaling_formula"]),
-                missing_imputation=str(raw["missing_imputation"]),
-                ploidy_policy=str(raw["ploidy_policy"]),
-                affine_mean_sha256=str(raw["affine_mean_sha256"]),
-                affine_inverse_scale_sha256=str(
-                    raw["affine_inverse_scale_sha256"]
-                ),
-            )
-        except (KeyError, TypeError, ValueError) as exc:
-            raise RuntimeError(
-                "native genotype-scale identity is invalid"
-            ) from exc
-        if (
-            array_sha256(affine_mean) != scale_plan.affine_mean_sha256
-            or array_sha256(affine_inverse_scale)
-            != scale_plan.affine_inverse_scale_sha256
-        ):
-            raise RuntimeError("native genotype-scale vector checksums do not verify")
+            scale = {name: str(raw[name]) for name in scale_fields}
+        except KeyError as exc:
+            raise RuntimeError("native genotype-scale metadata is incomplete") from exc
+        if any(not value for value in scale.values()):
+            raise RuntimeError("native genotype-scale metadata is invalid")
         ledger = dict(raw["ledger"])
         expected_visits = 2 * self._dimensions["M"]
         if (
@@ -448,18 +401,6 @@ class GeneralizedGxENativeBEDExecutor:
             or int(ledger["integrity_failures"]) != 0
         ):
             raise RuntimeError("native two-pass ledger is not a clean completion")
-        reconstructed = np.sum(block_directed, axis=0, dtype=np.float64)
-        reconstruction_error = float(
-            np.max(np.abs(reconstructed - directed), initial=0.0)
-        )
-        tolerance = (
-            256.0
-            * np.finfo(np.float64).eps
-            * max(1, self._dimensions["M"])
-            * max(1.0, float(np.max(np.abs(directed), initial=0.0)))
-        )
-        if reconstruction_error > tolerance:
-            raise RuntimeError("native block numerators do not reconstruct DNUM")
         telemetry = dict(raw["telemetry"])
         if telemetry.get("schema") != (
             "summit.generalized_gxe.native_execution_telemetry.v2"
@@ -473,16 +414,11 @@ class GeneralizedGxENativeBEDExecutor:
             telemetry.get("integrity_audit_count", 0)
         ) < 2:
             raise RuntimeError("native dense execution lacks phase checksum audits")
-        if float(telemetry["block_reconstruction_error"]) > tolerance:
-            raise RuntimeError("native reconstruction telemetry exceeds tolerance")
-
         return GeneralizedGxENativeResult(
             directional_ldscores=directional,
             directed_numerator=directed,
             symmetric_numerator=symmetric,
             genetic_gram=gram,
-            block_directed_numerator=block_directed,
-            block_annotation_mass=block_masses,
             same_person=same,
             annotation_masses=masses,
             affine_mean=affine_mean,
@@ -491,13 +427,10 @@ class GeneralizedGxENativeBEDExecutor:
             base_sources=base,
             pair_table=self._pairs,
             component_table=self._components,
-            product_plan_digest=self._product_plan_digest,
             residual_rank=int(raw["residual_rank"]),
-            source_panel_sha256=source_hash,
-            genotype_scale_plan=scale_plan,
+            genotype_scale=MappingProxyType(scale),
             ledger=MappingProxyType(ledger),
             telemetry=MappingProxyType(telemetry),
-            block_reconstruction_error=reconstruction_error,
             presymmetry_absolute_error=float(
                 telemetry["presymmetry_absolute_error"]
             ),

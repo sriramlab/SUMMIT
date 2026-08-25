@@ -84,7 +84,7 @@ def test_hundred_replicate_gate_is_dynamic_and_tightens_null_ceiling() -> None:
     assert not ratio_failure["all_passed"]
 
 
-def test_reused_trait_requires_the_exact_phenotype_batch_digest() -> None:
+def test_reused_trait_checks_concrete_ordered_axes_and_block_sums() -> None:
     axes = SimpleNamespace(
         n=5,
         m=3,
@@ -93,79 +93,33 @@ def test_reused_trait_requires_the_exact_phenotype_batch_digest() -> None:
         counted_alleles=("A", "C", "G"),
         other_alleles=("T", "G", "A"),
     )
-    basis = np.column_stack(
-        [np.ones(axes.n), np.linspace(-1.0, 1.0, axes.n)]
-    )
-    fixed = np.column_stack([np.ones(axes.n) / np.sqrt(axes.n)])
     annotations = np.ones((axes.m, 1))
     block_ids = np.asarray([0, 0, 1], dtype=np.int64)
     block_labels = ("block_0", "block_1")
-    phenotypes = np.arange(10, dtype=np.float64).reshape(axes.n, 2)
-    residual_basis, residual_names, _ = RUNNER.symmetric_context_residual_basis(
-        basis
-    )
-    scale_digest = "a" * 64
-    reference_run = SimpleNamespace(
-        artifact=SimpleNamespace(
-            scale_plan=SimpleNamespace(digest=scale_digest)
-        )
-    )
-    retained_samples = np.arange(axes.n, dtype=np.int64)
-    retained_variants = np.arange(axes.m, dtype=np.int64)
-    identity = {
-        "sample_order_sha256": RUNNER.canonical_sha256(
-            {"ordered_iids": list(axes.sample_ids)}
-        ),
-        "variant_order_allele_sha256": (
-            RUNNER.contextual_variant_order_allele_sha256_v1(
-                retained_variants,
-                axes.variant_ids,
-                axes.counted_alleles,
-                axes.other_alleles,
-                np.ones(axes.m, dtype=np.uint8),
-            )
-        ),
-        "retained_sample_map_sha256": RUNNER.array_sha256(retained_samples),
-        "retained_variant_order_sha256": RUNNER.array_sha256(retained_variants),
-        "fixed_effect_spec_sha256": RUNNER.array_sha256(fixed),
-        "basis_specification_sha256": RUNNER.array_sha256(basis),
-        "basis_calibration_sha256": RUNNER.array_sha256(basis.T @ basis),
-        "fixed_basis_sha256": RUNNER.array_sha256(fixed),
-        "evaluated_phi_sha256": RUNNER.array_sha256(basis),
-        "genotype_scale_plan_sha256": scale_digest,
-        "missingness_sha256": RUNNER.zero_missingness_sha256(axes.m, axes.n),
-        "annotation_map_sha256": RUNNER.array_sha256(annotations),
-        "group_map_sha256": RUNNER.array_sha256(block_ids),
-        "phenotype_batch_sha256": RUNNER.array_sha256(phenotypes),
-        "residual_basis_sha256": RUNNER.array_sha256(residual_basis),
-    }
+    residual_names = ("residual",)
     trait = SimpleNamespace(
-        manifest={"identity": identity},
         n_samples=axes.n,
         n_variants=axes.m,
         trait_ids=("t1", "t2"),
         residual_names=residual_names,
         component_index=SimpleNamespace(annotation_names=("all_variants",)),
         group_ids=block_labels,
-        scale_plan=SimpleNamespace(digest=scale_digest),
+        annotation_masses=np.asarray([3.0]),
+        group_variant_counts=np.asarray([2, 1]),
     )
     arguments = {
         "trait": trait,
         "axes": axes,
-        "reference_run": reference_run,
-        "basis": basis,
-        "fixed": fixed,
         "annotations": annotations,
-        "block_ids": block_ids,
-        "block_labels": block_labels,
-        "phenotypes": phenotypes,
+        "inference_block_ids": block_ids,
+        "inference_block_labels": block_labels,
         "trait_names": ("t1", "t2"),
-        "residual_basis": residual_basis,
         "residual_names": residual_names,
     }
     RUNNER._validate_reused_trait(**arguments)
 
-    changed = dict(arguments)
-    changed["phenotypes"] = phenotypes + 1.0
-    with np.testing.assert_raises_regex(ValueError, "phenotype_batch_sha256"):
+    wrong_trait = SimpleNamespace(**trait.__dict__)
+    wrong_trait.trait_ids = ("t1", "wrong")
+    changed = dict(arguments, trait=wrong_trait)
+    with np.testing.assert_raises_regex(ValueError, "trait_ids"):
         RUNNER._validate_reused_trait(**changed)

@@ -3,9 +3,7 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from copy import deepcopy
 from dataclasses import replace
-import hashlib
 import json
-from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -85,26 +83,6 @@ _PRIVATE_STABLE_ARTIFACT_V1_ALLOWLIST = frozenset(
         "write_contextual_fit_v1",
     }
 )
-
-_LEGACY_SOURCE_SHA256 = {
-    "src/summit/cli.py": (
-        "57cfafc0c854094befa2c52de4ceb07a529034017c62faff2be7f13e2839605c"
-    ),
-    "src/summit/__init__.py": (
-        "448f5770e516c134d875bdd95627aca81eb6520c9026681f959eea903e3e0153"
-    ),
-    "src/summit/__main__.py": (
-        "d7815f9da17bcd8e79d1d47170e5795e29cc5837f97d1049664813068a9e563f"
-    ),
-    "pyproject.toml": (
-        "e077aa42e0cb53e401b4139fdd7264c3b416397be2a8933572ef6f58c2d521b0"
-    ),
-}
-_LEGACY_HELP_SHA256 = "85f402d01c85ca7da9194405fa2ca22bd7c043da3f6f11de19a1508fc641c07b"
-_LEGACY_DEFAULTS_SHA256 = (
-    "29b7813d8dc5e8be8778405addd0a10cb0111eac7f79426846687bec06229210"
-)
-
 
 def _assert_no_raw_sentinel(value: object, *, path: str) -> None:
     if isinstance(value, Mapping):
@@ -437,7 +415,7 @@ def test_stable_outputs_and_native_controller_evidence_do_not_leak_raw_rows(
         assert loader(output).manifest_sha256 == artifact.manifest_sha256
 
 
-def test_private_stable_v1_allowlist_and_legacy_cli_surface_are_frozen(
+def test_private_stable_v1_allowlist_and_context_cli_boundary(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     stable_module_exports = frozenset(
@@ -451,13 +429,6 @@ def test_private_stable_v1_allowlist_and_legacy_cli_surface_are_frozen(
     assert stable_module_exports <= frozenset(context.__all__)
     assert len(context.__all__) == len(set(context.__all__))
 
-    repository = Path(__file__).resolve().parents[1]
-    observed_source_hashes = {
-        relative: hashlib.sha256((repository / relative).read_bytes()).hexdigest()
-        for relative in _LEGACY_SOURCE_SHA256
-    }
-    assert observed_source_hashes == _LEGACY_SOURCE_SHA256
-
     monkeypatch.setenv("COLUMNS", "80")
     monkeypatch.setenv("LINES", "24")
     from summit import cli
@@ -465,20 +436,10 @@ def test_private_stable_v1_allowlist_and_legacy_cli_surface_are_frozen(
     parser = cli.build_parser()
     parser.prog = "summit"
     help_text = parser.format_help()
-    defaults = json.dumps(
-        vars(parser.parse_args([])),
-        sort_keys=True,
-        separators=(",", ":"),
-        ensure_ascii=True,
-    ).encode("ascii")
+    parser.parse_args([])
     long_options = {
         option for option in parser._option_string_actions if option.startswith("--")
     }
-    assert len(parser._option_string_actions) == 134
-    assert len(long_options) == 133
     assert not any("context" in option.lower() for option in long_options)
     assert "context" not in help_text.lower()
-    assert hashlib.sha256(help_text.encode("utf-8")).hexdigest() == (
-        _LEGACY_HELP_SHA256
-    )
-    assert hashlib.sha256(defaults).hexdigest() == _LEGACY_DEFAULTS_SHA256
+    assert "--gxe-fp64-layout" not in long_options

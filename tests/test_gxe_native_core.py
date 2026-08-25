@@ -15,7 +15,6 @@ from scripts.gxe import benchmark_native
 from summit import gwldcore, gxeldcore
 from summit.ldscore.gwe_ldscore import (
     GenomewideEnvLDScore,
-    _loaded_native_binary_record,
     _make_seed,
     _native_gemm_integrity_workspace_elements,
     _native_strict_feature_moment_verification_policy,
@@ -663,21 +662,21 @@ def test_native_feature_source_target_match_dense_oracle(
             generator = np.random.Generator(np.random.Philox(_make_seed(91, 0, local_probe)))
             z[:, local_probe] = 2.0 * generator.integers(0, 2, size=m, dtype=np.int8) - 1.0
         annotation = np.sqrt(0.2 + np.arange(m, dtype=np.float64) / (m + 2.0))
-        group_ids = (np.arange(m) * 3 // m).astype(np.int32)
         source_x, source_w, missing = context.source_block(
             0, m,
             np.asarray(feature["scale_x"]), np.asarray(feature["scale_w"]),
-            annotation, z, group_ids, 3, True,
+            annotation, z, True,
         )
         assert missing == 0
         assert source_w.ctypes.data - source_x.ctypes.data == source_x.nbytes
-        for group in range(3):
-            keep = group_ids == group
-            expected_x = expected["x"][:, keep] @ (annotation[keep, None] * z[keep])
-            expected_w = expected["w"][:, keep] @ (annotation[keep, None] * z[keep])
-            segment = slice(group * probes, (group + 1) * probes)
-            np.testing.assert_allclose(source_x[:, segment], expected_x, rtol=3e-12, atol=3e-12)
-            np.testing.assert_allclose(source_w[:, segment], expected_w, rtol=3e-12, atol=3e-12)
+        np.testing.assert_allclose(
+            source_x, expected["x"] @ (annotation[:, None] * z),
+            rtol=3e-12, atol=3e-12,
+        )
+        np.testing.assert_allclose(
+            source_w, expected["w"] @ (annotation[:, None] * z),
+            rtol=3e-12, atol=3e-12,
+        )
 
         sources = np.asfortranarray(np.column_stack([source_x, source_w]))
         assert context.validate_projected_sources(sources, 1e-10) < 1e-12
@@ -723,8 +722,6 @@ def test_native_source_forms_interaction_weights_without_scale_ratio_overflow(tm
             np.ones(m, dtype=np.float64),
             np.ones(m, dtype=np.float64),
             probes,
-            np.zeros(m, dtype=np.int32),
-            1,
             True,
         )
 
@@ -760,22 +757,6 @@ def test_projected_panel_is_opaque_snapshot_bound_to_one_context(tmp_path):
             )
 
 
-def test_native_binary_record_binds_the_loaded_inode(tmp_path):
-    descriptor, record = _loaded_native_binary_record(gxeldcore)
-    try:
-        assert len(record["sha256"]) == 64
-        assert record["bytes"] > 0
-        assert os.fstat(descriptor).st_ino == record["identity"][1]
-    finally:
-        os.close(descriptor)
-
-    copied = tmp_path / Path(gxeldcore.__file__).name
-    copied.write_bytes(Path(gxeldcore.__file__).read_bytes())
-    fake = type("FakeNative", (), {"__file__": str(copied)})()
-    with pytest.raises(RuntimeError, match="does not identify the inode loaded"):
-        _loaded_native_binary_record(fake)
-
-
 def test_native_mean_imputation_matches_oracle_but_production_gate_rejects(tmp_path):
     rng = np.random.default_rng(741)
     n, m = 37, 11
@@ -801,7 +782,7 @@ def test_native_mean_imputation_matches_oracle_but_production_gate_rejects(tmp_p
         source_x, source_w, source_missing = context.source_block(
             0, m,
             np.asarray(feature["scale_x"]), np.asarray(feature["scale_w"]),
-            np.ones(m), probes, np.zeros(m, dtype=np.int32), 1, False,
+            np.ones(m), probes, False,
         )
         assert source_missing == 3
         np.testing.assert_allclose(source_x, expected["x"] @ probes, rtol=3e-12, atol=3e-12)
@@ -1088,7 +1069,7 @@ def test_native_context_rejects_mutation_bad_design_nonfinite_and_workspace(tmp_
             context.source_block(
                 0, m,
                 np.asarray(feature["scale_x"]), np.asarray(feature["scale_w"]),
-                np.ones(m), probes, np.zeros(m, dtype=np.int32), 1, True,
+                np.ones(m), probes, True,
             )
         sources = np.ones((n, 3), dtype=np.float64, order="F")
         sources[0, 0] = np.inf
@@ -1109,8 +1090,6 @@ def test_native_pass_probe_tile_and_fixed_thread_determinism(tmp_path):
     env, q = _design(n)
     z = np.asfortranarray(rng.choice([-1.0, 1.0], size=(m, probes)))
     annotation = np.ones(m, dtype=np.float64)
-    groups = np.zeros(m, dtype=np.int32)
-
     def source(start: int, stop: int, probe_slice: slice, threads: int):
         with _native_context(prefix, env, q, decode_threads=threads, target_panel_columns=5) as context:
             feature = _feature(context, m)
@@ -1120,7 +1099,7 @@ def test_native_pass_probe_tile_and_fixed_thread_determinism(tmp_path):
                 np.asarray(feature["scale_w"])[start:stop],
                 annotation[start:stop],
                 np.asfortranarray(z[start:stop, probe_slice]),
-                groups[start:stop], 1, True,
+                True,
             )[:2]
             assert context.info()["decode_threads"] == threads
             return result, feature
@@ -1178,7 +1157,7 @@ def test_opt_in_native_reference_matches_python_artifacts(tmp_path):
             annot_path=None, out_path=str(tmp_path / name), log=Logger(suppress=True),
             rand_dist="rademacher", low_level=None, num_vecs=20, step_size=6,
             seed=20260809, dtype="float64", num_threads=2,
-            kernel_mode="standardized", genotype_scale="sample", impute_method="mean",
+            kernel_mode="standardized_projected", genotype_scale="sample", impute_method="mean",
             target_xz_mem=0.01, native_backend=backend,
             native_workspace_gib=0.25,
         )
@@ -1207,20 +1186,6 @@ def test_opt_in_native_reference_matches_python_artifacts(tmp_path):
         manifest = json.loads(
             (tmp_path / "native.gxe.ref.json").read_text(encoding="utf-8")
         )
-        backend = manifest["backend_provenance"]
-        assert backend["schema_version"] == 3
-        assert backend["backend_name"] == "gxeldcore_direct"
-        assert backend["source_commit"] != "unknown"
-        assert len(backend["source_tree_sha256"]) == 64
-        assert len(backend["native_binary_sha256"]) == 64
-        assert (
-            backend["compile_options"]["blas_vendor"]
-            == gxeldcore.build_info()["blas_vendor"]
-        )
-        assert backend["native_workspace_cap_bytes"] == int(0.25 * 1024**3)
-        assert backend["actual_global_2b_source_columns"] == 40
-        assert backend["actual_jackknife_2b_source_columns"] == 0
-        assert backend["actual_target_source_columns"] == 40
         assert (
             native_estimator.resource_estimates[
                 "native_opaque_projected_panel_prepare_peak_gib"
@@ -1229,9 +1194,6 @@ def test_opt_in_native_reference_matches_python_artifacts(tmp_path):
                 "native_opaque_projected_panel_resident_gib"
             ]
         )
-        feature_backend = manifest["feature_backend_provenance"]
-        assert feature_backend["artifact_stage"] == "feature_construction"
-        assert feature_backend["backend_name"] == "gxeldcore_direct"
         assert "jackknife" not in manifest
         assert not (tmp_path / "python.gxe.jackknife.npz").exists()
         assert not (tmp_path / "native.gxe.jackknife.npz").exists()
@@ -1287,7 +1249,7 @@ def test_opt_in_native_reference_matches_python_artifacts(tmp_path):
             atol=2e-11,
         )
         score_moments = json.loads(score_artifacts.moments.read_text())
-        score_backend = score_moments["score_backend_provenance"]
+        score_backend = score_moments["score_backend"]
         native_build = dict(gxeldcore.build_info())
         native_score_eligible = (
             native_build["blas_runtime_isolation"] == "private_static"
@@ -1330,7 +1292,7 @@ def test_opt_in_native_backend_supports_float32_storage(tmp_path):
             bed_path=str(prefix), env_path=str(env_path), covar_path=None,
             annot_path=None, out_path=str(tmp_path / name), log=Logger(suppress=True),
                 rand_dist="rademacher", low_level=None, num_vecs=10, step_size=5,
-                seed=4, dtype="float32", kernel_mode="standardized",
+                seed=4, dtype="float32", kernel_mode="standardized_projected",
                 genotype_scale="sample", impute_method="mean", native_backend=backend,
                 native_workspace_gib=0.25, num_threads=2,
             )
@@ -1390,25 +1352,17 @@ def test_float32_panel_gate_allows_bounded_accumulation_roundoff():
     assert estimator._native_context.sources.dtype == np.float64
 
 
-def test_checked_in_benchmark_records_4b_raw_timings_and_b128_scratch():
+def test_checked_in_benchmark_records_current_raw_timings():
     args = benchmark_native._parser().parse_args(
         [
             "--n", "32", "--m", "12", "--probe-counts", "1024",
             "--repeats", "1", "--warmups", "0", "--decode-threads", "2",
-            "--blas-threads", "2", "--skip-legacy",
+            "--blas-threads", "2",
         ]
     )
     payload = benchmark_native.run(args)
     assert payload["schema"] == "summit-native-gxe-benchmark-v2"
-    assert len(payload["provenance"]["native_binary_sha256"]) == 64
     case = payload["cases"][0]
     assert case["actual_target_columns_2b"] == 2_048
-    assert case["actual_target_columns_4b"] == 4_096
-    assert case["production_scratch_model"]["probe_tiles"] == [
-        [start, 128] for start in range(0, 1_024, 128)
-    ]
-    assert case["production_scratch_model"]["peak_tile_gib"] == pytest.approx(
-        57.220458984375
-    )
-    assert len(case["timings_seconds"]["native_target_4b"]["raw"]) == 1
-    assert case["correctness"]["max_abs_target_4b_error"] <= 1e-8
+    assert len(case["timings_seconds"]["native_target_2b"]["raw"]) == 1
+    assert case["correctness"]["max_abs_target_2b_error"] <= 1e-8

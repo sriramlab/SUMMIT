@@ -1,33 +1,26 @@
 from __future__ import annotations
 
-import copy
-import json
 import os
 
 import numpy as np
 import pytest
 
-from summit.context.schema import GenotypeScalePlanV1, GenotypeScalePolicy
-from summit.context.spec import array_sha256, canonical_json
-from summit.ldscore.generalized_gxe_variant import (
+from summit.ldscore.generalized_gxe_reference_v1 import (
     GENERALIZED_GXE_VARIANT_JACKKNIFE_METHOD,
+    build_generalized_gxe_variant_reference_v1,
+    serialize_generalized_gxe_inference_axes,
+)
+from summit.ldscore.generalized_gxe_variant import (
     GENERALIZED_GXE_VARIANT_PROBE_ALGORITHM,
     GENERALIZED_GXE_VARIANT_REFERENCE_KIND,
     GENERALIZED_GXE_VARIANT_SCIENTIFIC_CONTRACT,
     GeneralizedGxEPlanInputs,
     GlobalVariantProbeSpec,
     TwoPassLedger,
-    build_generalized_gxe_variant_manifest,
     generate_global_variant_probes,
     native_global_variant_probes,
     plan_generalized_gxe_variant_work,
-    serialize_generalized_gxe_axes,
-    validate_generalized_gxe_variant_manifest,
 )
-
-
-def _digest(label: str) -> str:
-    return array_sha256(np.frombuffer(label.encode("utf-8"), dtype=np.uint8))
 
 
 def _completed_ledger(num_variants: int) -> dict[str, int]:
@@ -39,22 +32,6 @@ def _completed_ledger(num_variants: int) -> dict[str, int]:
         ledger.finish_pass()
     ledger.validate_clean_completion()
     return ledger.to_dict()
-
-
-def _scale_plan(variant_digest: str) -> GenotypeScalePlanV1:
-    return GenotypeScalePlanV1(
-        policy=GenotypeScalePolicy.SEALED_VARIANT_AFFINE_V1,
-        retained_variant_order_sha256=variant_digest,
-        allele_orientation="a1_count",
-        allele_coding="plink_a1_dosage_0_1_2",
-        centering_source="reference_retained_samples",
-        centering_formula="observed_mean_after_mean_imputation",
-        scaling_formula="inverse_sample_sd_ddof1",
-        missing_imputation="observed_mean",
-        ploidy_policy="diploid_autosome",
-        affine_mean_sha256=_digest("means"),
-        affine_inverse_scale_sha256=_digest("inverse-scales"),
-    )
 
 
 def _performance_ledger() -> dict:
@@ -79,23 +56,15 @@ def _valid_artifact() -> tuple[dict, dict[str, np.ndarray]]:
     annotation_names = ("baseline", "coding")
     annotation_masses = np.asarray([4.0, 5.0])
     block_ids = np.asarray([0, 0, 1, 1, 1])
-    axes = serialize_generalized_gxe_axes(
+    axes = serialize_generalized_gxe_inference_axes(
         num_variants=num_variants,
-        variant_digest=_digest("variants"),
-        retained_variant_digest=_digest("retained-variants"),
         num_samples=num_samples,
-        sample_digest=_digest("samples"),
         basis_names=basis_names,
-        basis_digest=_digest("basis"),
-        basis_calibration_digest=_digest("basis-calibration"),
-        fixed_effect_digest=_digest("fixed"),
         fixed_effect_rank=2,
         annotation_names=annotation_names,
-        annotation_digest=_digest("annotations"),
         annotation_masses=annotation_masses,
         variant_block_ids=block_ids,
         block_labels=("left", "right"),
-        jackknife_block_digest=_digest("jackknife-blocks"),
         residual_component_names=("identity",),
     )
     component_count = len(axes["components"]["table"])
@@ -168,23 +137,26 @@ def _valid_artifact() -> tuple[dict, dict[str, np.ndarray]]:
         "dense_oracle_fixture_version": "stage02_v1",
         "backend_fixed_probe_maximum_error": 0.0,
     }
-    manifest = build_generalized_gxe_variant_manifest(
+    artifact = build_generalized_gxe_variant_reference_v1(
         axes=axes,
         probe_spec=probe_spec,
+        genotype_scale_plan={
+            "genotype_scale_policy": "sealed_variant_affine_v1",
+            "allele_orientation": "a1_count",
+            "allele_coding": "plink_a1_dosage_0_1_2",
+            "centering_source": "reference_retained_samples",
+            "centering_formula": "observed_mean_after_mean_imputation",
+            "scaling_formula": "inverse_sample_sd_ddof1",
+            "missing_imputation": "observed_mean",
+            "ploidy_policy": "diploid_autosome",
+        },
         arrays=arrays,
         pass_ledger=_completed_ledger(num_variants),
-        genotype_scale_plan=_scale_plan(
-            axes["variants"]["retained_order_digest"]
-        ),
         performance_ledger=_performance_ledger(),
-        provenance={
-            "source_commit": "a" * 40,
-            "source_tree_sha256": "b" * 64,
-            "native_binary_sha256": "c" * 64,
-        },
+        provenance={"fixture": "generalized-gxe-contract-test"},
         diagnostics=diagnostics,
     )
-    return manifest, arrays
+    return dict(artifact.manifest), arrays
 
 
 def test_canonical_identity_constants_are_distinct() -> None:
@@ -210,15 +182,9 @@ def test_canonical_identity_constants_are_distinct() -> None:
     )
 
 
-def test_schema_roundtrip_binds_ordered_axes_arrays_and_fingerprint() -> None:
+def test_inference_artifact_has_concrete_ordered_axes() -> None:
     manifest, arrays = _valid_artifact()
-    roundtrip = json.loads(canonical_json(manifest))
-    observed = validate_generalized_gxe_variant_manifest(
-        roundtrip,
-        arrays=arrays,
-    )
-    assert observed == roundtrip
-    assert observed["axes"]["pairs"]["table"] == [
+    assert manifest["axes"]["pairs"]["table"] == [
         [0, 0],
         [1, 1],
         [2, 2],
@@ -226,7 +192,7 @@ def test_schema_roundtrip_binds_ordered_axes_arrays_and_fingerprint() -> None:
         [0, 2],
         [1, 2],
     ]
-    assert observed["axes"]["components"]["table"][:7] == [
+    assert manifest["axes"]["components"]["table"][:7] == [
         [0, 0],
         [0, 1],
         [0, 2],
@@ -235,70 +201,12 @@ def test_schema_roundtrip_binds_ordered_axes_arrays_and_fingerprint() -> None:
         [0, 5],
         [1, 0],
     ]
+    assert arrays["directional_ldscores"].shape[0] == 5
+
+    assert "identity" not in manifest
 
 
-@pytest.mark.parametrize(
-    "wrong_kind",
-    (
-        "summit.context.reference",
-        "summit.context.reference.v1",
-        "summit.gxe.reference",
-    ),
-)
-def test_new_loader_rejects_contextual_and_legacy_reference_kinds(
-    wrong_kind: str,
-) -> None:
-    manifest, arrays = _valid_artifact()
-    manifest["kind"] = wrong_kind
-    with pytest.raises(ValueError, match="not variant LD scores|not generalized"):
-        validate_generalized_gxe_variant_manifest(manifest, arrays=arrays)
-
-
-def test_new_loader_rejects_legacy_jackknife_alias() -> None:
-    manifest, arrays = _valid_artifact()
-    manifest["jackknife_method"] = "block_local_ldscore_deletion"
-    manifest["jackknife"]["method"] = "block_local_ldscore_deletion"
-    with pytest.raises(ValueError, match="identity field 'jackknife_method'"):
-        validate_generalized_gxe_variant_manifest(manifest, arrays=arrays)
-
-
-@pytest.mark.parametrize(
-    ("mutation", "match"),
-    (
-        ("pair_order", "pair table"),
-        ("array_hash", "metadata/hash"),
-        ("block_reconstruction", "do not reconstruct"),
-        ("probe_fingerprint", "probe fingerprint"),
-        ("extra_pass", "observed_reference_genotype_passes"),
-    ),
-)
-def test_schema_tampering_fails_closed(mutation: str, match: str) -> None:
-    manifest, arrays = _valid_artifact()
-    manifest = copy.deepcopy(manifest)
-    arrays = dict(arrays)
-    if mutation == "pair_order":
-        manifest["axes"]["pairs"]["table"][0] = [0, 1]
-    elif mutation == "array_hash":
-        manifest["numeric_arrays"]["same_person"]["sha256"] = "0" * 64
-    elif mutation == "block_reconstruction":
-        changed = arrays["block_directed_numerator"].copy()
-        changed[0, 0, 0] += 1.0
-        arrays["block_directed_numerator"] = changed
-        manifest["numeric_arrays"]["block_directed_numerator"] = {
-            "shape": list(changed.shape),
-            "dtype": "float64",
-            "order": "C",
-            "sha256": array_sha256(changed),
-        }
-    elif mutation == "probe_fingerprint":
-        manifest["randomization"]["fingerprint"]["sha256"] = "0" * 64
-    else:
-        manifest["pass_ledger"]["observed_reference_genotype_passes"] = 3
-    with pytest.raises(ValueError, match=match):
-        validate_generalized_gxe_variant_manifest(manifest, arrays=arrays)
-
-
-def test_global_probe_stream_has_frozen_values_and_fingerprint() -> None:
+def test_global_probe_stream_has_frozen_values() -> None:
     variants = np.asarray([0, 1, 7, 19])
     probes = np.asarray([3, 4, 11])
     observed = generate_global_variant_probes(
@@ -308,18 +216,13 @@ def test_global_probe_stream_has_frozen_values_and_fingerprint() -> None:
     )
     expected = np.asarray(
         [
-            [1.0, -1.0, 1.0],
-            [-1.0, -1.0, -1.0],
-            [1.0, 1.0, 1.0],
             [1.0, 1.0, -1.0],
+            [-1.0, -1.0, -1.0],
+            [-1.0, -1.0, -1.0],
+            [-1.0, 1.0, -1.0],
         ]
     )
     np.testing.assert_array_equal(observed, expected)
-    spec = GlobalVariantProbeSpec(20260822, 5, 11)
-    assert (
-        spec.fingerprint_record()["sha256"]
-        == "03dcce2fc63cf2d85ca84f8eabe9fb9cd9f1f53ba55d13ccf802fa55742224ad"
-    )
 
 
 def test_global_probe_stream_is_invariant_to_blocks_chunks_and_row_order() -> None:
@@ -416,7 +319,6 @@ def test_target_planner_work_and_memory_arithmetic(
         num_basis=num_basis,
         num_annotations=num_annotations,
         num_probes=num_probes,
-        num_jackknife_blocks=200,
         memory_limit_bytes=1024**4,
         genotype_format="bed",
         threads=64,
@@ -441,7 +343,7 @@ def test_target_planner_work_and_memory_arithmetic(
     assert plan.memory["cross_sketch_block"] == 8 * 4096 * total_rhs
     assert plan.memory["pair_reduction_scratch"] == 8 * 4096 * p * p
     assert plan.memory["same_person_sample_accumulator"] == 8 * c * 300_000
-    assert plan.memory["block_directed_numerator"] == 8 * 200 * c * c
+    assert "block_directed_numerator" not in plan.memory
     assert plan.output_size_bytes == 8 * 1_000_000 * num_annotations * p * p
     assert plan.tiling["rhs_precomputed"] is True
     assert plan.ledger["planned_reference_genotype_passes"] == 2
@@ -455,7 +357,6 @@ def test_constrained_memory_reduces_tiles_without_adding_passes() -> None:
         num_basis=3,
         num_annotations=1,
         num_probes=128,
-        num_jackknife_blocks=200,
         memory_limit_bytes=8 * 1024**3,
         genotype_format="pgen",
         threads=8,
@@ -480,7 +381,6 @@ def test_planner_rejects_memory_below_fixed_source_state() -> None:
         num_basis=3,
         num_annotations=1,
         num_probes=128,
-        num_jackknife_blocks=200,
         memory_limit_bytes=1 * 1024**3,
         genotype_format="bed",
         threads=8,
@@ -497,7 +397,6 @@ def test_bed_and_pgen_plans_change_metadata_not_work_or_passes() -> None:
         num_basis=3,
         num_annotations=1,
         num_probes=32,
-        num_jackknife_blocks=20,
         memory_limit_bytes=16 * 1024**3,
         threads=4,
     )
@@ -532,7 +431,6 @@ def test_planner_rejects_invalid_inputs(kwargs: dict) -> None:
         num_basis=3,
         num_annotations=1,
         num_probes=8,
-        num_jackknife_blocks=4,
         memory_limit_bytes=1024**3,
         genotype_format="bed",
     )
@@ -548,7 +446,6 @@ def test_planner_rejects_signed_64bit_arithmetic_overflow() -> None:
         num_basis=3,
         num_annotations=1,
         num_probes=8,
-        num_jackknife_blocks=4,
         memory_limit_bytes=2**62,
         genotype_format="bed",
     )

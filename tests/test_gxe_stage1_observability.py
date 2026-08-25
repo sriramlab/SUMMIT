@@ -514,6 +514,7 @@ def test_native_integrity_snapshot_contract_queries_every_page_in_fresh_process(
     environment.pop("SUMMIT_NUMA_POLICY_PROVENANCE", None)
     environment.update(
         {
+            "LD_LIBRARY_PATH": str(pathlib.Path(sys.prefix) / "lib"),
             "PYTHONNOUSERSITE": "1",
             "PYTHONDONTWRITEBYTECODE": "1",
             "PYTHONPYCACHEPREFIX": str(tmp_path / "empty-pycache"),
@@ -1140,9 +1141,6 @@ def test_multi_environment_records_native_semantics_and_phase_context() -> None:
     executor._native_telemetry_getter = None
     executor.backend_name = "gxeldcore_direct"
     executor.backend_version = "1.4"
-    executor.backend_build_sha256 = "a" * 64
-    executor.source_commit = "b" * 40
-    executor.source_tree_sha256 = "c" * 64
 
     left = np.asfortranarray(np.arange(30, dtype=np.float64).reshape(6, 5))
     right = np.asfortranarray(np.arange(20, dtype=np.float64).reshape(5, 4))
@@ -1182,9 +1180,6 @@ def test_multi_environment_records_native_semantics_and_phase_context() -> None:
     record = report["gemm_records"][0]
     assert record["telemetry_scope"] == "vendor_call"
     assert record["backend"] == "gxeldcore_direct"
-    assert record["backend_build_sha256"] == "a" * 64
-    assert record["native_source_commit"] == "b" * 40
-    assert record["native_source_tree_sha256"] == "c" * 64
     assert record["arithmetic_dtype"] == "float64"
     assert record["requested_storage_dtype"] == "float32"
     assert record["actual_left_storage_dtype"] == "float64"

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import gc
-import hashlib
 import json
 import os
 from pathlib import Path
@@ -13,7 +12,6 @@ import pytest
 from bed_reader import to_bed
 
 from summit import gxeldcore
-from summit.cli import build_parser
 from summit.ldscore.gwe_ldscore import GenomewideEnvLDScore
 from summit.ldscore.gxe_multi import (
     _MultiEnvironmentGemm,
@@ -163,7 +161,7 @@ def _estimator(
         dtype="float64",
         num_threads=2,
         target_xz_mem=0.01,
-        kernel_mode="standardized",
+        kernel_mode="standardized_projected",
         genotype_scale="sample",
         native_backend="python",
     )
@@ -211,8 +209,6 @@ def _population_and_diagonal(prefix: Path) -> tuple[np.ndarray, pd.DataFrame]:
     population_trace = payload["population_trace"]
     assert "jackknife_diagonal_method" not in population_trace
     diagonal = manifest.parent / payload["files"]["diagonal"]
-    digest = hashlib.sha256(diagonal.read_bytes()).hexdigest()
-    assert digest == payload["artifact_sha256"]["diagonal"]
     return (
         np.asarray(
             population_trace["same_individual_kernel_products"],
@@ -306,15 +302,6 @@ def test_explicit_current_layout_matches_default_four_family_oracle(tmp_path):
 
 
 def test_only_current_production_layout_is_accepted():
-    parser = build_parser()
-    assert parser.parse_args([]).gxe_fp64_layout == "current"
-    assert parser.parse_args(
-        ["--gxe-fp64-layout", "current"]
-    ).gxe_fp64_layout == "current"
-    for rejected in ("source-tt-target-current", "source-tt-target-row"):
-        with pytest.raises(SystemExit):
-            parser.parse_args(["--gxe-fp64-layout", rejected])
-
     fp64 = SimpleNamespace(num_threads=1, dtype=np.dtype(np.float64))
     for rejected in ("source_tt_target_current", "source_tt_target_row"):
         with pytest.raises(ValueError, match="only supported production"):

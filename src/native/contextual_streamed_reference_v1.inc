@@ -4649,8 +4649,39 @@ void ContextualReferenceExecutorV1::protected_gemm(
                 !std::isfinite(witness[index])) return false;
             const double tolerance = 4.0e-12 *
                 (1.0 + std::abs(witness[index]));
-            if (std::abs(values[index] - witness[index]) > tolerance)
-                return false;
+            if (std::abs(values[index] - witness[index]) <= tolerance)
+                continue;
+            // A result-relative tolerance is invalid for a long dot product
+            // whose terms nearly cancel.  Recheck only flagged entries using
+            // the cancellation-aware forward-error bound already qualified by
+            // SUMMIT's mature GEMM integrity layer.  This preserves detection
+            // of material corruption without rejecting ordinary differences
+            // between legal FP64 reduction trees at biobank-scale N.
+            const int row = static_cast<int>(
+                index % static_cast<std::size_t>(rows)
+            );
+            const int column = static_cast<int>(
+                index / static_cast<std::size_t>(rows)
+            );
+            long double absolute_product_sum = 0.0L;
+            for (int inner = 0; inner < reduction; ++inner) {
+                const double left_value = transpose_left
+                    ? left[static_cast<std::size_t>(inner) +
+                           static_cast<std::size_t>(row) * left_stride]
+                    : left[static_cast<std::size_t>(row) +
+                           static_cast<std::size_t>(inner) * left_stride];
+                const double right_value = right[
+                    static_cast<std::size_t>(inner) +
+                    static_cast<std::size_t>(column) * right_stride
+                ];
+                absolute_product_sum += std::abs(
+                    static_cast<long double>(left_value) *
+                    static_cast<long double>(right_value)
+                );
+            }
+            if (gemm_vendor_value_materially_disagrees(
+                    values[index], witness[index], absolute_product_sum,
+                    reduction)) return false;
         }
         return true;
     };

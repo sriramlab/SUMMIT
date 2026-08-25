@@ -6,7 +6,6 @@ Before editing generalized contextual/G×E reference code, read:
 
 - `docs/generalized_gxe_variant_ldscore_contract.md`
 - `docs/architecture/ADR-generalized-gxe-variant-ldscore.md`
-- `docs/context_native/scientific_contract_v1.md`
 
 Two different randomized estimators exist and must not be conflated.
 
@@ -15,10 +14,20 @@ Two different randomized estimators exist and must not be conflated.
 - uses **variant-axis** probes `Xi in R^{M x B}`;
 - completes global source sketches in pass 1;
 - scores every target variant against those completed sources in pass 2;
-- emits or reduces fixed full-genome per-variant directional LD scores;
+- emits fixed full-genome per-variant directional LD scores;
 - uses exactly two complete reference-genotype traversals; and
-- constructs SNP-block jackknife replicates by deleting target SNP rows from
-  fixed full-genome LD-score sums. It does not recompute retained SNP LD scores.
+- accepts no block IDs, block count, or jackknife argument.
+
+### Definitive jackknife boundary
+
+"No jackknife" applies only to estimation of generalized per-SNP reference LD
+scores and per-SNP trait statistics. After the genome-wide per-SNP rows exist,
+`--njack` assigns target SNPs to blocks and reduces those fixed rows into full
+and delete-block normal equations. Each replicate drops the deleted target-SNP
+contribution, rescales by retained annotation mass, and reuses all other
+quantities. It does not recompute source sketches or any retained SNP's LD
+score. Standard errors and Wald statistics come from these post-hoc
+normal-equation replicates.
 
 Canonical jackknife method:
 
@@ -45,7 +54,6 @@ non-general estimator's separate post-projection X/W column normalization.
 
 ### Reuse policy
 
-Reuse the mature non-general descriptor/decode/imputation/genotype-scale,
-protected NN/TN, packed/vendor-BLAS, threading, NUMA, telemetry, and artifact
-machinery. Do not copy its hard-coded X/W scientific layout or create a second
-genotype decoder.
+Reuse the mature non-general descriptor/decode/imputation/genotype-scale and
+numerical kernels where useful. Do not import its hard-coded X/W scientific
+layout, artifact identity checks, or create a second genotype decoder.

@@ -8,7 +8,6 @@ projection has been chosen.
 
 from __future__ import annotations
 
-import hashlib
 import json
 import math
 import os
@@ -22,49 +21,19 @@ from typing import Any, Mapping, Sequence
 import numpy as np
 import pandas as pd
 
-from ..ldscore.gwe_ldscore import (
-    _FEATURE_CACHE_ARRAY_DTYPES,
-    _validate_backend_provenance,
-    _validate_feature_convention_metadata,
-    _validate_feature_cache_semantics,
-    _validate_gxe_annotation_names,
-)
+from ..ldscore.gwe_ldscore import _validate_gxe_annotation_names
+from .jackknife import JackknifeSpec
 
 
 _REFERENCE_KIND = "summit.gxe.reference"
 _MOMENTS_KIND = "summit.gxe.phenotype_moments"
-_SCHEMA_VERSION = 3
-# Reference/moments schema v4 pledges canonical binary64 annotation values;
-# v3 may have rounded continuous annotations to the randomized
-# retained-storage dtype.  Moments must match their reference's version, so
-# cross-contract reference/moments pairs are rejected below.
-_SUPPORTED_SCHEMA_VERSIONS = frozenset({2, 3, 4})
-_COPY_CHUNK_BYTES = 8 * 1024 * 1024
+_SCHEMA_VERSION = 4
 _FIT_BATCH_KIND = "summit.gxe.fit_batch"
 _FIT_BATCH_SCHEMA_VERSION = 1
 _FIT_BATCH_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
-_EXACT_JACKKNIFE_METHOD = "two_sided_snp_kernel_deletion"
-_BLOCK_LOCAL_JACKKNIFE_METHOD = "block_local_ldscore_deletion"
+_POSTHOC_JACKKNIFE_METHOD = "frozen_full_genome_variant_ldscore_delete_block_v1"
 _MATCHED_REFERENCE_MODE = "matched"
 _POPULATION_REFERENCE_MODE = "population"
-
-
-def _is_sha256(value: Any) -> bool:
-    if not isinstance(value, str) or len(value) != 64:
-        return False
-    try:
-        int(value, 16)
-    except ValueError:
-        return False
-    return True
-
-
-def _sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with open(path, "rb") as handle:
-        for block in iter(lambda: handle.read(_COPY_CHUNK_BYTES), b""):
-            digest.update(block)
-    return digest.hexdigest()
 
 
 def _as_float_array(name: str, value: Any, ndim: int | None = None) -> np.ndarray:
@@ -81,19 +50,6 @@ def _require_shape(name: str, arr: np.ndarray, shape: tuple[int, ...]) -> None:
         raise ValueError(f"{name} has shape {arr.shape}; expected {shape}.")
 
 
-def ordered_variant_digest(frame: pd.DataFrame) -> str:
-    """Return a stable digest without serializing sample-level information."""
-    required = ("CHR", "SNP", "BP", "A1", "A2")
-    missing = [c for c in required if c not in frame.columns]
-    if missing:
-        raise ValueError(f"Variant table is missing columns: {missing}.")
-    digest = hashlib.sha256()
-    for row in frame.loc[:, required].itertuples(index=False, name=None):
-        digest.update("\x1f".join(str(x) for x in row).encode("utf-8"))
-        digest.update(b"\n")
-    return digest.hexdigest()
-
-
 @dataclass(frozen=True)
 class GxENormalEquations:
     matrix: np.ndarray
@@ -101,26 +57,6 @@ class GxENormalEquations:
     traces: np.ndarray
     component_names: tuple[str, ...]
     diagnostics: dict[str, Any] | None = None
-
-
-@dataclass(frozen=True)
-class GxEInputProvenance:
-    """Identity of one canonical input streamed into a private fit snapshot."""
-
-    path: str
-    bytes: int
-    sha256: str
-
-
-@dataclass(frozen=True)
-class GxEConsumedInputProvenance:
-    """Exact input snapshots consumed by one phenotype fit."""
-
-    reference_manifest: GxEInputProvenance
-    feature_cache: GxEInputProvenance | None
-    phenotype_moments: GxEInputProvenance
-    gwas: GxEInputProvenance
-    gwis: GxEInputProvenance
 
 
 @dataclass(frozen=True)
@@ -142,22 +78,28 @@ class GxEFitResult:
     component_influence: np.ndarray | None = None
     identifiable: bool = True
     normal_equation_diagnostics: dict[str, Any] | None = None
-    standard_errors: np.ndarray | None = None
-    jackknife_estimates: np.ndarray | None = None
+    coefficient_standard_errors: np.ndarray | None = None
+    proportion_standard_errors: np.ndarray | None = None
+    jackknife_coefficients: np.ndarray | None = None
+    jackknife_proportions: np.ndarray | None = None
     jackknife_block_labels: tuple[str, ...] = ()
     phenotype_residual_variance_fraction: float | None = None
-    consumed_input_provenance: GxEConsumedInputProvenance | None = None
 
     def to_frame(self) -> pd.DataFrame:
         return pd.DataFrame(
             {
                 "component": self.component_names,
                 "coefficient": self.coefficients,
+                "coefficient_se": (
+                    self.coefficient_standard_errors
+                    if self.coefficient_standard_errors is not None
+                    else np.full(len(self.component_names), np.nan)
+                ),
                 "variance_contribution": self.contributions,
                 "proportion": self.proportions,
                 "proportion_se": (
-                    self.standard_errors
-                    if self.standard_errors is not None
+                    self.proportion_standard_errors
+                    if self.proportion_standard_errors is not None
                     else np.full(len(self.component_names), np.nan)
                 ),
                 "original_scale_proportion": (
@@ -171,7 +113,7 @@ class GxEFitResult:
 
 @dataclass(frozen=True)
 class GxEPhenotypeInput:
-    """One hash-bound phenotype summary triplet for a reusable GxE reference."""
+    """One phenotype summary triplet for a reusable GxE reference."""
 
     phenotype_moments: str | Path
     gwas_scores: str | Path
@@ -193,9 +135,7 @@ class _PreparedGxEReference:
 
     path: Path
     payload: dict[str, Any]
-    manifest_sha256: str
     schema_version: int
-    feature_cache_sha256: str | None
     n_variants: int
     variant_axis: dict[str, np.ndarray]
     annotations: np.ndarray
@@ -211,8 +151,6 @@ class _PreparedGxEReference:
     deleted_matrices: np.ndarray | None
     deleted_traces: np.ndarray | None
     population_same_individual_products: np.ndarray | None
-    reference_provenance: GxEInputProvenance
-    feature_cache_provenance: GxEInputProvenance | None
 
 
 def _population_same_individual_products(
@@ -223,11 +161,9 @@ def _population_same_individual_products(
         raise ValueError(
             "Population-reference inference requires a reference with population_trace moments."
         )
-    legacy_diagonal_method = declaration.get("jackknife_diagonal_method")
     if (
         declaration.get("method") != "independent_probe_u_statistic_v1"
         or declaration.get("sampling_axis") != "individual"
-        or legacy_diagonal_method not in {None, "full_reference_reuse"}
     ):
         raise ValueError("Reference population_trace uses an unsupported estimator.")
     probes = declaration.get("num_vectors")
@@ -266,9 +202,8 @@ def _population_same_individual_products(
 def _study_population_design_moments(
     payload: Mapping[str, Any],
     annotation_names: Sequence[str],
-    block_labels: Sequence[str] = (),
-) -> tuple[np.ndarray, np.ndarray | None]:
-    """Validate exact study-side genetic-by-NxE trace summaries."""
+) -> np.ndarray:
+    """Validate exact full-study genetic-by-NxE trace summaries."""
     declaration = payload.get("population_design")
     if not isinstance(declaration, Mapping):
         raise ValueError(
@@ -291,30 +226,15 @@ def _study_population_design_moments(
     if np.any(full < 0.0):
         raise ValueError("Study genetic-by-NxE traces must be non-negative.")
 
-    labels = tuple(str(value) for value in block_labels)
-    deleted_raw = declaration.get("jackknife_genetic_nxe_traces")
-    declared_labels = declaration.get("jackknife_block_labels")
-    if not labels:
-        if deleted_raw is not None or declared_labels is not None:
-            raise ValueError(
-                "Study population_design declares jackknife moments for a non-jackknife reference."
-            )
-        return full, None
-    if declared_labels != list(labels):
+    if (
+        declaration.get("jackknife_genetic_nxe_traces") is not None
+        or declaration.get("jackknife_block_labels") is not None
+    ):
         raise ValueError(
-            "Study population_design jackknife labels disagree with the reference."
+            "Reference-bound population jackknife moments are obsolete; "
+            "delete-block traces are formed from per-SNP DNXE rows at inference."
         )
-    deleted = _as_float_array(
-        "study delete-block genetic-by-NxE traces", deleted_raw, ndim=2
-    )
-    _require_shape(
-        "study delete-block genetic-by-NxE traces",
-        deleted,
-        (len(labels), len(expected_order)),
-    )
-    if np.any(deleted < 0.0):
-        raise ValueError("Study delete-block genetic-by-NxE traces must be non-negative.")
-    return full, deleted
+    return full
 
 
 def transfer_reference_normal_equations(
@@ -472,7 +392,6 @@ def assemble_normal_equations(
     trace_nxe_sq: float,
     annotation_names: Sequence[str] | None = None,
     ld_scale: str = "cross_product_over_rank_squared",
-    null_corrected: bool = False,
 ) -> GxENormalEquations:
     """Assemble exact GENIE normal equations from aligned summary arrays.
 
@@ -515,7 +434,7 @@ def assemble_normal_equations(
     }.items():
         arr = _as_float_array(name, value, ndim=2)
         _require_shape(name, arr, (m, k))
-        if not null_corrected and np.any(arr < 0.0):
+        if np.any(arr < 0.0):
             bad = np.argwhere(arr < 0.0)[0].tolist()
             raise ValueError(
                 f"{name} must be non-negative squared-sketch contributions; "
@@ -550,24 +469,6 @@ def assemble_normal_equations(
     if np.any(~np.isfinite(masses)) or np.any(masses <= 0.0):
         bad = np.flatnonzero((~np.isfinite(masses)) | (masses <= 0.0)).tolist()
         raise ValueError(f"Annotation columns must have positive finite mass; invalid columns: {bad}.")
-
-    if null_corrected:
-        # Legacy schema-v2 bundles stored each source-bin panel as
-        #   raw[j, b] - annotation_mass[b] / residual_rank.
-        # Stored values may therefore be negative even though the recovered
-        # squared-sketch contribution is non-negative.  Validate that raw
-        # quantity here, before the aggregate offset is restored in directed().
-        offset = masses[None, :] / float(r)
-        tolerance = 5.0e-9 * np.maximum(1.0, offset)
-        for name, panel in panels.items():
-            recovered = panel + offset
-            invalid = recovered < -tolerance
-            if np.any(invalid):
-                bad = np.argwhere(invalid)[0].tolist()
-                raise ValueError(
-                    f"{name} has a materially negative squared-sketch contribution "
-                    f"after reversing its legacy storage offset; first invalid index is {bad}."
-                )
 
     if annotation_names is None:
         names = tuple(f"bin{i}" for i in range(k))
@@ -612,10 +513,6 @@ def assemble_normal_equations(
     def directed(panel: np.ndarray, left_bin: int, source_bin: int) -> float:
         value = scale * np.dot(annot[:, left_bin], panel[:, source_bin])
         value /= masses[left_bin] * masses[source_bin]
-        if null_corrected:
-            # The writer subtracted m_source/r from every row.  This is an
-            # algebraic storage offset, not a population-LD approximation.
-            value += float(r)
         return float(value)
 
     for a in range(k):
@@ -825,109 +722,6 @@ def solve_normal_equations(
     )
 
 
-def _assemble_deleted_normal_equations(
-    *,
-    block_id: int,
-    annotations: np.ndarray,
-    blocks: np.ndarray,
-    score_x: np.ndarray,
-    score_w: np.ndarray,
-    panels: Mapping[str, np.ndarray],
-    within: Mapping[str, np.ndarray],
-    norm_x: np.ndarray,
-    norm_w: np.ndarray,
-    diag_x: np.ndarray,
-    diag_w: np.ndarray,
-    residual_rank: int,
-    q_nxe: float,
-    q_residual: float,
-    trace_nxe: float,
-    trace_nxe_sq: float,
-    annotation_names: Sequence[str],
-    null_corrected: bool,
-) -> GxENormalEquations:
-    """Construct an exact two-sided leave-SNP-block-out kernel system."""
-    annot = np.asarray(annotations, dtype=np.float64)
-    m, k = annot.shape
-    mask = np.asarray(blocks == int(block_id), dtype=bool)
-    if mask.shape != (m,) or not np.any(mask):
-        raise ValueError(f"Jackknife block {block_id} is empty or misaligned.")
-    masses = annot.sum(axis=0, dtype=np.float64)
-    deleted_masses = annot[mask].sum(axis=0, dtype=np.float64)
-    remain = masses - deleted_masses
-    if np.any(remain <= 0.0):
-        bad = np.flatnonzero(remain <= 0.0).tolist()
-        raise ValueError(f"Deleting block {block_id} empties annotation columns {bad}.")
-    keep = ~mask
-    r = float(residual_rank)
-    p = 2 * k + 2
-    lhs = np.zeros((p, p), dtype=np.float64)
-    rhs = np.zeros(p, dtype=np.float64)
-    traces = np.zeros(p, dtype=np.float64)
-    names = tuple(f"G:{x}" for x in annotation_names) + tuple(
-        f"GxE:{x}" for x in annotation_names
-    ) + ("NxE", "residual")
-
-    for a in range(k):
-        wa = annot[:, a]
-        ma = remain[a]
-        gi, wi = a, k + a
-        rhs[gi] = r * np.dot(wa[keep], score_x[keep] ** 2) / ma
-        rhs[wi] = r * np.dot(wa[keep], score_w[keep] ** 2) / ma
-        traces[gi] = r * np.dot(wa[keep], norm_x[keep]) / ma
-        traces[wi] = r * np.dot(wa[keep], norm_w[keep]) / ma
-        lhs[gi, 2 * k] = lhs[2 * k, gi] = r * np.dot(wa[keep], diag_x[keep]) / ma
-        lhs[wi, 2 * k] = lhs[2 * k, wi] = r * np.dot(wa[keep], diag_w[keep]) / ma
-        lhs[gi, 2 * k + 1] = lhs[2 * k + 1, gi] = traces[gi]
-        lhs[wi, 2 * k + 1] = lhs[2 * k + 1, wi] = traces[wi]
-
-    def raw_column(panel_name: str, source_bin: int) -> np.ndarray:
-        col = np.asarray(panels[panel_name][:, source_bin], dtype=np.float64)
-        if null_corrected:
-            col = col + masses[source_bin] / r
-        return col
-
-    def deleted_directed(
-        forward: str,
-        reverse_name: str,
-        left_bin: int,
-        source_bin: int,
-    ) -> float:
-        forward_col = raw_column(forward, source_bin)
-        reverse_col = raw_column(reverse_name, left_bin)
-        total = np.dot(annot[:, left_bin], forward_col)
-        rows = np.dot(annot[mask, left_bin], forward_col[mask])
-        columns = np.dot(annot[mask, source_bin], reverse_col[mask])
-        intersection = float(within[forward][block_id, left_bin, source_bin])
-        cross_sum = total - rows - columns + intersection
-        return r * r * cross_sum / (remain[left_bin] * remain[source_bin])
-
-    for a in range(k):
-        for b in range(k):
-            lhs[a, b] = 0.5 * (
-                deleted_directed("xx", "xx", a, b)
-                + deleted_directed("xx", "xx", b, a)
-            )
-            lhs[k + a, k + b] = 0.5 * (
-                deleted_directed("ww", "ww", a, b)
-                + deleted_directed("ww", "ww", b, a)
-            )
-            cross = 0.5 * (
-                deleted_directed("xw", "wx", a, b)
-                + deleted_directed("wx", "xw", b, a)
-            )
-            lhs[a, k + b] = lhs[k + b, a] = cross
-
-    rhs[2 * k] = float(q_nxe)
-    rhs[2 * k + 1] = float(q_residual)
-    traces[2 * k] = float(trace_nxe)
-    traces[2 * k + 1] = r
-    lhs[2 * k, 2 * k] = float(trace_nxe_sq)
-    lhs[2 * k, 2 * k + 1] = lhs[2 * k + 1, 2 * k] = float(trace_nxe)
-    lhs[2 * k + 1, 2 * k + 1] = r
-    return GxENormalEquations(0.5 * (lhs + lhs.T), rhs, traces, names)
-
-
 def _block_weighted_sums(
     blocks: np.ndarray,
     values: np.ndarray,
@@ -964,6 +758,48 @@ def _block_weighted_sums(
     return result
 
 
+def _posthoc_inference_blocks(
+    variants: pd.DataFrame,
+    njack: str | int,
+) -> tuple[np.ndarray, tuple[str, ...]]:
+    """Assign fixed per-SNP rows to delete-one inference blocks.
+
+    This partition is deliberately created after reference LD scores and trait
+    summary rows have been estimated.  It never changes a retained SNP's
+    full-genome LD score.
+    """
+    spec = JackknifeSpec.parse(njack)
+    m = len(variants)
+    if m < 2:
+        raise ValueError("GxE jackknife inference requires at least two SNPs.")
+    if spec.mode == "block":
+        assert spec.nblocks is not None
+        nblock = int(spec.nblocks)
+        if not 2 <= nblock <= m:
+            raise ValueError(
+                f"GxE --njack requires 2 <= blocks <= SNPs; got {nblock} for {m} SNPs."
+            )
+        edges = np.floor(np.linspace(0, m, nblock + 1)).astype(np.int64)
+        blocks = np.empty(m, dtype=np.int64)
+        for block_id, (start, stop) in enumerate(zip(edges[:-1], edges[1:])):
+            blocks[start:stop] = block_id
+        labels = tuple(f"block_{block_id + 1:04d}" for block_id in range(nblock))
+        return blocks, labels
+
+    if spec.delete != 1 or spec.nrep is not None or spec.seed is not None:
+        raise ValueError(
+            "GxE inference currently supports delete-one chromosome jackknifing "
+            "(--njack chr), not chr delete-d/random replicate specifications."
+        )
+    chromosome = variants["CHR"].astype(str).to_numpy()
+    labels = tuple(dict.fromkeys(chromosome.tolist()))
+    if len(labels) < 2:
+        raise ValueError("GxE --njack chr requires SNPs on at least two chromosomes.")
+    lookup = {label: index for index, label in enumerate(labels)}
+    blocks = np.asarray([lookup[value] for value in chromosome], dtype=np.int64)
+    return blocks, tuple(f"chr_{label}" for label in labels)
+
+
 def _annotation_vector_aggregates(
     annotations: np.ndarray,
     blocks: np.ndarray,
@@ -990,15 +826,49 @@ def _annotation_vector_aggregates(
     )
 
 
+def _posthoc_population_design_moments(
+    annotations: np.ndarray,
+    d_nxe_x: np.ndarray,
+    d_nxe_w: np.ndarray,
+    residual_rank: int,
+    blocks: np.ndarray,
+    block_labels: Sequence[str],
+) -> tuple[np.ndarray, np.ndarray]:
+    """Reduce per-SNP study design rows to full/delete-block traces."""
+    annot = np.asarray(annotations, dtype=np.float64)
+    x = _as_float_array("GWAS DNXE", d_nxe_x, ndim=1)
+    w = _as_float_array("GWIS DNXE", d_nxe_w, ndim=1)
+    if x.shape != (annot.shape[0],) or w.shape != (annot.shape[0],):
+        raise ValueError("Population DNXE rows are not aligned to annotations.")
+    if np.any(x < 0.0) or np.any(w < 0.0):
+        raise ValueError("Population DNXE rows must be non-negative.")
+    nblock = len(block_labels)
+    masses = annot.sum(axis=0, dtype=np.float64)
+    block_masses = _block_weighted_sums(blocks, annot, nblock)
+    remain = masses[None, :] - block_masses
+    if np.any(remain <= 0.0):
+        raise ValueError("A GxE jackknife deletion empties an annotation column.")
+    full_x, block_x = _annotation_vector_aggregates(annot, blocks, x, nblock)
+    full_w, block_w = _annotation_vector_aggregates(annot, blocks, w, nblock)
+    rank = float(residual_rank)
+    full = rank * np.concatenate([full_x / masses, full_w / masses])
+    deleted = rank * np.concatenate(
+        [
+            (full_x[None, :] - block_x) / remain,
+            (full_w[None, :] - block_w) / remain,
+        ],
+        axis=1,
+    )
+    if not np.all(np.isfinite(full)) or not np.all(np.isfinite(deleted)):
+        raise ValueError("Population genetic-by-NxE traces are non-finite.")
+    return full, deleted
+
+
 def _prepare_reference_sufficient_statistics(
     *,
     path: Path,
     payload: dict[str, Any],
-    manifest_sha256: str,
     schema_version: int,
-    feature_cache_sha256: str | None,
-    reference_provenance: GxEInputProvenance,
-    feature_cache_provenance: GxEInputProvenance | None,
     variants: pd.DataFrame,
     annotations: np.ndarray,
     annotation_names: Sequence[str],
@@ -1010,11 +880,8 @@ def _prepare_reference_sufficient_statistics(
     equations: GxENormalEquations,
     block_values: np.ndarray | None = None,
     block_labels: Sequence[str] = (),
-    within: Mapping[str, np.ndarray] | None = None,
-    jackknife_method: str | None = None,
-    null_corrected: bool,
 ) -> _PreparedGxEReference:
-    """Collapse a validated reference to reusable full/deletion templates."""
+    """Collapse fixed per-SNP reference rows to full/delete-block templates."""
     annot = np.asarray(annotations, dtype=np.float64)
     m, k = annot.shape
     masses = annot.sum(axis=0, dtype=np.float64)
@@ -1025,28 +892,10 @@ def _prepare_reference_sufficient_statistics(
     block_masses: np.ndarray | None = None
     deleted_matrices: np.ndarray | None = None
     deleted_traces: np.ndarray | None = None
-    if jackknife_method is None and within is not None:
-        jackknife_method = _EXACT_JACKKNIFE_METHOD
-    has_jackknife = (
-        block_values is not None
-        or bool(labels)
-        or within is not None
-        or jackknife_method is not None
-    )
+    has_jackknife = block_values is not None or bool(labels)
     if has_jackknife:
         if block_values is None or len(labels) < 2:
             raise ValueError("Incomplete jackknife inputs for prepared GxE reference.")
-        if jackknife_method not in {
-            _EXACT_JACKKNIFE_METHOD,
-            _BLOCK_LOCAL_JACKKNIFE_METHOD,
-        }:
-            raise ValueError(f"Unsupported GxE jackknife method {jackknife_method!r}.")
-        if jackknife_method == _EXACT_JACKKNIFE_METHOD and within is None:
-            raise ValueError("Exact two-sided GxE deletion requires within-block traces.")
-        if jackknife_method == _BLOCK_LOCAL_JACKKNIFE_METHOD and within is not None:
-            raise ValueError(
-                "Block-local GxE deletion must not include exact within-block traces."
-            )
         prepared_blocks = np.asarray(block_values, dtype=np.int64)
         if prepared_blocks.shape != (m,):
             raise ValueError("Jackknife block IDs are not aligned to annotations.")
@@ -1081,8 +930,6 @@ def _prepare_reference_sufficient_statistics(
             panel = np.asarray(panels[key], dtype=np.float64)
             if panel.shape != (m, k):
                 raise ValueError(f"Reference panel {key!r} has inconsistent shape {panel.shape}.")
-            if null_corrected:
-                panel = panel + masses[None, :] / r
             panel_full[key] = np.asarray(
                 [
                     [np.dot(annot[:, left], panel[:, source]) for source in range(k)]
@@ -1107,7 +954,6 @@ def _prepare_reference_sufficient_statistics(
         def retained_directed(
             block_id: int,
             forward: str,
-            reverse: str,
             left: int,
             source: int,
         ) -> float:
@@ -1115,12 +961,6 @@ def _prepare_reference_sufficient_statistics(
                 panel_full[forward][left, source]
                 - panel_block[forward][block_id, left, source]
             )
-            if jackknife_method == _EXACT_JACKKNIFE_METHOD:
-                assert within is not None
-                cross_sum += (
-                    -panel_block[reverse][block_id, source, left]
-                    + float(within[forward][block_id, left, source])
-                )
             return float(
                 r
                 * r
@@ -1160,16 +1000,16 @@ def _prepare_reference_sufficient_statistics(
             for left in range(k):
                 for source in range(k):
                     lhs[left, source] = 0.5 * (
-                        retained_directed(block_id, "xx", "xx", left, source)
-                        + retained_directed(block_id, "xx", "xx", source, left)
+                        retained_directed(block_id, "xx", left, source)
+                        + retained_directed(block_id, "xx", source, left)
                     )
                     lhs[k + left, k + source] = 0.5 * (
-                        retained_directed(block_id, "ww", "ww", left, source)
-                        + retained_directed(block_id, "ww", "ww", source, left)
+                        retained_directed(block_id, "ww", left, source)
+                        + retained_directed(block_id, "ww", source, left)
                     )
                     cross = 0.5 * (
-                        retained_directed(block_id, "xw", "wx", left, source)
-                        + retained_directed(block_id, "wx", "xw", source, left)
+                        retained_directed(block_id, "xw", left, source)
+                        + retained_directed(block_id, "wx", source, left)
                     )
                     lhs[left, k + source] = lhs[k + source, left] = cross
 
@@ -1185,9 +1025,7 @@ def _prepare_reference_sufficient_statistics(
     return _PreparedGxEReference(
         path=path,
         payload=dict(payload),
-        manifest_sha256=str(manifest_sha256),
         schema_version=int(schema_version),
-        feature_cache_sha256=feature_cache_sha256,
         n_variants=len(variants),
         variant_axis={
             column: variants[column].astype(str).to_numpy()
@@ -1214,8 +1052,6 @@ def _prepare_reference_sufficient_statistics(
             if payload.get("population_trace") is None
             else _population_same_individual_products(payload, annotation_names)
         ),
-        reference_provenance=reference_provenance,
-        feature_cache_provenance=feature_cache_provenance,
     )
 
 
@@ -1388,365 +1224,17 @@ def _equations_from_prepared_scores(
 
 def _load_json(path: str | Path) -> dict[str, Any]:
     with open(path, "rt", encoding="utf-8") as handle:
-        obj = json.load(handle)
-    if not isinstance(obj, dict):
+        value = json.load(handle)
+    if not isinstance(value, dict):
         raise ValueError(f"Expected a JSON object in {path}.")
-    return obj
-
-
-@dataclass(frozen=True)
-class _InputSnapshot:
-    original_path: Path
-    snapshot_path: Path
-    sha256: str
-    size: int
-
-
-def _snapshot_provenance(snapshot: _InputSnapshot) -> GxEInputProvenance:
-    """Freeze provenance from the snapshot copy operation, not the live path."""
-    return GxEInputProvenance(
-        path=str(snapshot.original_path),
-        bytes=int(snapshot.size),
-        sha256=str(snapshot.sha256),
-    )
-
-
-def _consumed_input_provenance(
-    *,
-    reference_manifest: _InputSnapshot,
-    feature_cache: _InputSnapshot | None,
-    phenotype_moments: _InputSnapshot,
-    gwas: _InputSnapshot,
-    gwis: _InputSnapshot,
-) -> GxEConsumedInputProvenance:
-    return GxEConsumedInputProvenance(
-        reference_manifest=_snapshot_provenance(reference_manifest),
-        feature_cache=(
-            None if feature_cache is None else _snapshot_provenance(feature_cache)
-        ),
-        phenotype_moments=_snapshot_provenance(phenotype_moments),
-        gwas=_snapshot_provenance(gwas),
-        gwis=_snapshot_provenance(gwis),
-    )
-
-
-def _serialize_consumed_input_provenance(
-    provenance: GxEConsumedInputProvenance | None,
-) -> dict[str, dict[str, Any] | None] | None:
-    """Emit null for in-memory fits; strictly validate every supplied record."""
-    if provenance is None:
-        return None
-    if not isinstance(provenance, GxEConsumedInputProvenance):
-        raise ValueError(
-            "Refusing to write malformed consumed-input provenance."
-        )
-
-    def serialize_record(
-        role: str, record: GxEInputProvenance | None, *, optional: bool = False
-    ) -> dict[str, Any] | None:
-        if record is None and optional:
-            return None
-        if not isinstance(record, GxEInputProvenance):
-            raise ValueError(f"Consumed-input provenance for {role} is incomplete.")
-        if (
-            not isinstance(record.path, str)
-            or not record.path
-            or "\x00" in record.path
-            or not Path(record.path).is_absolute()
-            or str(Path(record.path)) != record.path
-        ):
-            raise ValueError(
-                f"Consumed-input provenance for {role} lacks a canonical absolute path."
-            )
-        if (
-            not isinstance(record.bytes, int)
-            or isinstance(record.bytes, bool)
-            or record.bytes < 0
-        ):
-            raise ValueError(f"Consumed-input provenance for {role} has invalid bytes.")
-        if not _is_sha256(record.sha256) or record.sha256 != record.sha256.lower():
-            raise ValueError(f"Consumed-input provenance for {role} has invalid SHA-256.")
-        return {
-            "path": record.path,
-            "bytes": record.bytes,
-            "sha256": record.sha256,
-        }
-
-    return {
-        "reference_manifest": serialize_record(
-            "reference_manifest", provenance.reference_manifest
-        ),
-        "feature_cache": serialize_record(
-            "feature_cache", provenance.feature_cache, optional=True
-        ),
-        "phenotype_moments": serialize_record(
-            "phenotype_moments", provenance.phenotype_moments
-        ),
-        "gwas": serialize_record("gwas", provenance.gwas),
-        "gwis": serialize_record("gwis", provenance.gwis),
-    }
-
-
-class _InputSnapshotStore:
-    """Stream fit inputs into private read-only files before validation/parsing."""
-
-    def __init__(self, scratch_dir: str | Path) -> None:
-        scratch_root = Path(scratch_dir).expanduser().resolve()
-        scratch_root.mkdir(parents=True, exist_ok=True)
-        if not scratch_root.is_dir():
-            raise ValueError(f"GxE fit scratch path is not a directory: {scratch_root}.")
-        self._temporary = tempfile.TemporaryDirectory(
-            prefix=".summit-gxe-fit-inputs-", dir=scratch_root
-        )
-        self.directory = Path(self._temporary.name)
-        os.chmod(self.directory, 0o700)
-        self._snapshots: dict[Path, _InputSnapshot] = {}
-
-    def __enter__(self) -> "_InputSnapshotStore":
-        return self
-
-    def __exit__(self, exc_type, exc, traceback) -> None:
-        self.close()
-
-    def close(self) -> None:
-        self._temporary.cleanup()
-
-    def capture(self, path: str | Path) -> _InputSnapshot:
-        try:
-            original = Path(path).expanduser().resolve(strict=True)
-        except FileNotFoundError:
-            raise FileNotFoundError(Path(path).expanduser().resolve()) from None
-        existing = self._snapshots.get(original)
-        if existing is not None:
-            return existing
-
-        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
-        if hasattr(os, "O_NOFOLLOW"):
-            flags |= os.O_NOFOLLOW
-        source_fd = os.open(original, flags)
-        destination: Path | None = None
-        try:
-            source_stat = os.fstat(source_fd)
-            if not stat.S_ISREG(source_stat.st_mode):
-                raise ValueError(f"GxE fit input is not a regular file: {original}.")
-            suffixes = original.suffixes
-            suffix = "".join(suffixes[-2:]) if suffixes else ".bin"
-            destination = self.directory / f"{len(self._snapshots):06d}{suffix}"
-            destination_fd = os.open(
-                destination,
-                os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0),
-                0o600,
-            )
-            digest = hashlib.sha256()
-            copied = 0
-            with os.fdopen(source_fd, "rb", closefd=True) as source, os.fdopen(
-                destination_fd, "wb", closefd=True
-            ) as sink:
-                source_fd = -1
-                while True:
-                    block = source.read(_COPY_CHUNK_BYTES)
-                    if not block:
-                        break
-                    digest.update(block)
-                    sink.write(block)
-                    copied += len(block)
-                sink.flush()
-                os.fsync(sink.fileno())
-            os.chmod(destination, 0o400)
-            snapshot = _InputSnapshot(
-                original_path=original,
-                snapshot_path=destination,
-                sha256=digest.hexdigest(),
-                size=copied,
-            )
-            self._snapshots[original] = snapshot
-            return snapshot
-        except Exception:
-            if destination is not None:
-                destination.unlink(missing_ok=True)
-            raise
-        finally:
-            if source_fd >= 0:
-                os.close(source_fd)
-
-
-def _load_feature_cache_bundle(
-    path: Path,
-) -> tuple[dict[str, Any], dict[str, np.ndarray]]:
-    """Load and semantically validate an exact schema-v2 feature cache."""
-    with np.load(path, allow_pickle=False) as bundle:
-        expected_members = {*_FEATURE_CACHE_ARRAY_DTYPES, "metadata_json"}
-        if len(bundle.files) != len(expected_members) or set(bundle.files) != expected_members:
-            raise ValueError(
-                f"GxE feature cache has unexpected, duplicate, or missing arrays: {path}."
-            )
-        try:
-            metadata = json.loads(str(bundle["metadata_json"].item()))
-        except (json.JSONDecodeError, TypeError, ValueError) as exc:
-            raise ValueError(f"GxE feature cache has invalid metadata_json: {path}.") from exc
-        arrays = {
-            name: np.asarray(bundle[name]).copy() for name in _FEATURE_CACHE_ARRAY_DTYPES
-        }
-    _validate_feature_cache_semantics(metadata, arrays)
-    return metadata, arrays
-
-
-def _validate_reference_feature_cache_contract(
-    reference: Mapping[str, Any],
-    diagonal: pd.DataFrame,
-    annotation_names: Sequence[str],
-    metadata: Mapping[str, Any],
-    arrays: Mapping[str, np.ndarray],
-) -> None:
-    """Prove that a reusable-score cache defines this exact reference."""
-    exact_fields = (
-        "analysis_fingerprint",
-        "variant_digest",
-        "n_samples",
-        "fixed_effect_rank_excluding_intercept",
-        "residual_rank",
-        "kernel_mode",
-        "genotype_scale",
-        "environment",
-        "environment_transform",
-        "covariates",
-        "genotype_files",
-    )
-    mismatched = [
-        field for field in exact_fields if reference.get(field) != metadata.get(field)
-    ]
-    if (
-        reference.get("feature_backend_provenance") is not None
-        or metadata.get("backend_provenance") is not None
-    ) and reference.get("feature_backend_provenance") != metadata.get(
-        "backend_provenance"
-    ):
-        mismatched.append("feature_backend_provenance")
-    if list(annotation_names) != metadata.get("annotation_names"):
-        mismatched.append("annotation_names")
-    if mismatched:
-        raise ValueError(
-            "Reference manifest disagrees with its bound feature cache for fields "
-            f"{sorted(set(mismatched))}."
-        )
-
-    cached_diagnostics = metadata.get("feature_diagnostics")
-    reference_diagnostics = reference.get("feature_diagnostics")
-    if not isinstance(cached_diagnostics, Mapping) or not isinstance(
-        reference_diagnostics, Mapping
-    ):
-        raise ValueError("Reference/cache feature diagnostics are invalid.")
-    changed_diagnostics = [
-        key
-        for key, value in cached_diagnostics.items()
-        if reference_diagnostics.get(key) != value
-    ]
-    allowed_reference_only = {
-        "max_xw_wx_trace_asymmetry_absolute",
-        "max_xw_wx_trace_asymmetry_relative",
-    }
-    unexpected_diagnostics = set(reference_diagnostics) - set(cached_diagnostics)
-    if changed_diagnostics or not unexpected_diagnostics.issubset(allowed_reference_only):
-        raise ValueError("Reference feature diagnostics disagree with its feature cache.")
-    for key in unexpected_diagnostics:
-        value = reference_diagnostics[key]
-        if (
-            isinstance(value, bool)
-            or not isinstance(value, (int, float))
-            or not np.isfinite(float(value))
-            or float(value) < 0.0
-        ):
-            raise ValueError(f"Reference feature diagnostic {key!r} is invalid.")
-
-    variants = {
-        "CHR": np.asarray(arrays["variant_chr"]).astype(str),
-        "SNP": np.asarray(arrays["variant_snp"]).astype(str),
-        "BP": np.asarray(arrays["variant_bp"]).astype(str),
-        "A1": np.asarray(arrays["variant_a1"]).astype(str),
-        "A2": np.asarray(arrays["variant_a2"]).astype(str),
-    }
-    for column, expected in variants.items():
-        observed = diagonal[column].astype(str).to_numpy()
-        if not np.array_equal(observed, expected):
-            raise ValueError(
-                f"Reference diagonal {column} axis disagrees with its feature cache."
-            )
-
-    weight_columns = [f"ANNOT_{index}" for index in range(len(annotation_names))]
-    comparisons = {
-        "annotations": (
-            diagonal.loc[:, weight_columns].to_numpy(dtype=np.float64),
-            np.asarray(arrays["annotations"], dtype=np.float64),
-        ),
-        "NORM_X": (
-            diagonal["NORM_X"].to_numpy(dtype=np.float64),
-            np.asarray(arrays["norm_x"], dtype=np.float64),
-        ),
-        "NORM_W": (
-            diagonal["NORM_W"].to_numpy(dtype=np.float64),
-            np.asarray(arrays["norm_w"], dtype=np.float64),
-        ),
-        "SCALE_X": (
-            diagonal["SCALE_X"].to_numpy(dtype=np.float64),
-            np.asarray(arrays["scale_x"], dtype=np.float64),
-        ),
-        "SCALE_W": (
-            diagonal["SCALE_W"].to_numpy(dtype=np.float64),
-            np.asarray(arrays["scale_w"], dtype=np.float64),
-        ),
-        "DNXE_X": (
-            diagonal["DNXE_X"].to_numpy(dtype=np.float64),
-            np.asarray(arrays["diag_nxe_x"], dtype=np.float64),
-        ),
-        "DNXE_W": (
-            diagonal["DNXE_W"].to_numpy(dtype=np.float64),
-            np.asarray(arrays["diag_nxe_w"], dtype=np.float64),
-        ),
-        "CORR_XW": (
-            diagonal["CORR_XW"].to_numpy(dtype=np.float64),
-            np.asarray(arrays["corr_xw"], dtype=np.float64),
-        ),
-    }
-    for label, (observed, expected) in comparisons.items():
-        if observed.shape != expected.shape or not np.allclose(
-            observed, expected, rtol=5.0e-10, atol=1.0e-10, equal_nan=False
-        ):
-            raise ValueError(
-                f"Reference diagonal {label} values disagree with its feature cache."
-            )
-
-    declared_masses = np.asarray(reference.get("annotation_masses"), dtype=np.float64)
-    cached_masses = np.asarray(metadata.get("annotation_masses"), dtype=np.float64)
-    if declared_masses.shape != cached_masses.shape or not np.allclose(
-        declared_masses, cached_masses, rtol=0.0, atol=0.0
-    ):
-        raise ValueError("Reference annotation masses disagree with its feature cache.")
-    for field in ("trace_nxe", "trace_nxe_sq"):
-        if not np.isclose(
-            float(reference.get(field)),
-            float(metadata.get(field)),
-            rtol=2.0e-12,
-            atol=2.0e-10,
-        ):
-            raise ValueError(f"Reference {field} disagrees with its feature cache.")
-
-    cached_labels = metadata.get("jackknife_labels")
-    if cached_labels is not None:
-        if "BLOCK" not in diagonal:
-            raise ValueError("Reference diagonal omits cache-bound jackknife block IDs.")
-        observed_blocks = pd.to_numeric(
-            diagonal["BLOCK"], errors="raise"
-        ).to_numpy(dtype=np.int32)
-        if not np.array_equal(observed_blocks, arrays["jackknife_ids"]):
-            raise ValueError("Reference jackknife block IDs disagree with its feature cache.")
-        jackknife = reference.get("jackknife")
-        if not isinstance(jackknife, Mapping) or jackknife.get("block_labels") != cached_labels:
-            raise ValueError("Reference jackknife labels disagree with its feature cache.")
+    return value
 
 
 def _resolve_path(manifest_path: Path, value: str) -> Path:
-    candidate = Path(value)
-    return candidate if candidate.is_absolute() else manifest_path.parent / candidate
+    candidate = Path(value).expanduser()
+    if not candidate.is_absolute():
+        candidate = manifest_path.parent / candidate
+    return candidate.resolve()
 
 
 def _read_table(path: Path) -> pd.DataFrame:
@@ -1764,1078 +1252,433 @@ def _aligned_panel(
     path: Path,
     variants: pd.DataFrame,
     value_columns: Sequence[str],
-    *,
-    allow_negative_storage: bool = False,
 ) -> np.ndarray:
     panel = _read_table(path)
-    required = ["CHR", "SNP", "BP", *value_columns]
-    observed_columns = panel.columns.astype(str).tolist()
-    if observed_columns != required or len(set(observed_columns)) != len(observed_columns):
+    expected = ["CHR", "SNP", "BP", *value_columns]
+    observed = panel.columns.astype(str).tolist()
+    if observed != expected or len(set(observed)) != len(observed):
         raise ValueError(
-            f"{path} must contain exactly the ordered columns {required}; "
-            f"observed {observed_columns}."
+            f"{path} must contain exactly the ordered columns {expected}; observed {observed}."
         )
     if len(panel) != len(variants):
         raise ValueError(f"{path} has {len(panel)} rows; expected {len(variants)}.")
-    for col in ("CHR", "SNP", "BP"):
-        if not np.array_equal(panel[col].astype(str).to_numpy(), variants[col].astype(str).to_numpy()):
-            raise ValueError(f"{path} is not in the reference variant order ({col} mismatch).")
-    values = panel.loc[:, list(value_columns)].to_numpy(
-        dtype=np.float64, copy=True
-    )
+    for column in ("CHR", "SNP", "BP"):
+        if not np.array_equal(
+            panel[column].astype(str).to_numpy(),
+            variants[column].astype(str).to_numpy(),
+        ):
+            raise ValueError(
+                f"{path} is not in the reference variant order ({column} mismatch)."
+            )
+    values = panel.loc[:, list(value_columns)].to_numpy(dtype=np.float64, copy=True)
     if not np.all(np.isfinite(values)):
         raise ValueError(f"{path} contains a non-finite panel value.")
-    if not allow_negative_storage and np.any(values < 0.0):
-        raise ValueError(f"{path} contains a negative squared-sketch panel value.")
-    values[values == 0.0] = 0.0
     return values
 
 
-def fit_from_files(
-    reference_manifest: str | Path,
-    phenotype_moments: str | Path,
-    gwas_scores: str | Path,
-    gwis_scores: str | Path,
-    *,
-    allow_ill_conditioned: bool = False,
-    max_condition: float = 1.0e12,
-    scratch_dir: str | Path | None = None,
-) -> tuple[GxEFitResult, GxENormalEquations]:
-    """Load an immutable snapshot of a SUMMIT bundle and fit the full model."""
-    result = fit_many_from_files(
-        reference_manifest,
-        {
-            "phenotype": GxEPhenotypeInput(
-                phenotype_moments=phenotype_moments,
-                gwas_scores=gwas_scores,
-                gwis_scores=gwis_scores,
-            )
-        },
-        allow_ill_conditioned=allow_ill_conditioned,
-        max_condition=max_condition,
-        scratch_dir=scratch_dir,
-    )
-    return result["phenotype"]
-
-
-def _fit_from_input_snapshots(
-    reference_manifest: str | Path,
-    phenotype_moments: str | Path,
-    gwas_scores: str | Path,
-    gwis_scores: str | Path,
-    *,
-    snapshots: _InputSnapshotStore,
-    allow_ill_conditioned: bool,
-    max_condition: float,
-    prepared_out: list[_PreparedGxEReference] | None = None,
-) -> tuple[GxEFitResult, GxENormalEquations]:
-    ref_path = Path(reference_manifest).resolve()
-    mom_path = Path(phenotype_moments).resolve()
-    ref_snapshot = snapshots.capture(ref_path)
-    moments_snapshot = snapshots.capture(mom_path)
-    ref = _load_json(ref_snapshot.snapshot_path)
-    moments = _load_json(moments_snapshot.snapshot_path)
-    ref_version_raw = ref.get("schema_version")
-    moments_version_raw = moments.get("schema_version")
-    if not isinstance(ref_version_raw, int) or isinstance(ref_version_raw, bool):
-        raise ValueError(f"Reference schema_version must be a JSON integer: {ref_path}.")
-    if not isinstance(moments_version_raw, int) or isinstance(moments_version_raw, bool):
-        raise ValueError(f"Phenotype schema_version must be a JSON integer: {mom_path}.")
-    ref_version = int(ref_version_raw)
-    moments_version = int(moments_version_raw)
-    if ref.get("kind") != _REFERENCE_KIND or ref_version not in _SUPPORTED_SCHEMA_VERSIONS:
-        raise ValueError(f"Unsupported GxE reference manifest: {ref_path}.")
-    reference_annotation_dtype = ref.get("annotation_value_dtype")
-    if ref_version >= 4 and reference_annotation_dtype != "float64":
-        raise ValueError(
-            f"Schema-v4 GxE reference lacks the canonical binary64 annotation pledge: {ref_path}."
-        )
-    if ref_version < 4 and reference_annotation_dtype is not None:
-        raise ValueError(
-            f"Schema-v{ref_version} GxE reference carries an unexpected annotation dtype pledge: {ref_path}."
-        )
-    if ref.get("backend_provenance") is not None:
-        _validate_backend_provenance(
-            ref["backend_provenance"], expected_stage="reference"
-        )
-    shard_backends = ref.get("shard_backend_provenance")
-    if shard_backends is not None:
-        if not isinstance(shard_backends, list) or not shard_backends:
-            raise ValueError("Merged GxE reference has invalid shard backend provenance.")
-        for backend in shard_backends:
-            _validate_backend_provenance(
-                backend, expected_stage="reference_shard"
-            )
-    if moments.get("kind") != _MOMENTS_KIND or moments_version not in _SUPPORTED_SCHEMA_VERSIONS:
-        raise ValueError(f"Unsupported GxE phenotype moments file: {mom_path}.")
-    if ref_version != moments_version:
-        raise ValueError(
-            "Reference and phenotype bundles use different schema versions: "
-            f"reference={ref_version}, moments={moments_version}."
-        )
-    reference_mode = moments.get("reference_mode", _MATCHED_REFERENCE_MODE)
-    if reference_mode not in {
-        _MATCHED_REFERENCE_MODE,
-        _POPULATION_REFERENCE_MODE,
-    }:
-        raise ValueError(f"Unsupported phenotype reference_mode={reference_mode!r}.")
-    population_transfer = reference_mode == _POPULATION_REFERENCE_MODE
-    kernel_mode = ref.get("kernel_mode")
-    if kernel_mode not in {"genie", "standardized"}:
-        raise ValueError(f"Reference manifest has unsupported kernel_mode={kernel_mode!r}.")
-    feature_convention = _validate_feature_convention_metadata(ref)
-    moments_feature_convention = moments.get("feature_convention")
-    moments_feature_version = moments.get("feature_convention_version")
-    if moments_feature_convention is not None or moments_feature_version is not None:
-        if moments_feature_version != 1 or moments_feature_convention != feature_convention:
-            raise ValueError(
-                "Reference and phenotype bundles use different feature conventions."
-            )
-    genotype_scale = ref.get("genotype_scale")
-    if genotype_scale not in {"hwe", "sample"}:
-        raise ValueError(f"Reference manifest has unsupported genotype_scale={genotype_scale!r}.")
-    null_corrected = ref.get("null_corrected")
-    if not isinstance(null_corrected, bool):
-        raise ValueError("Reference manifest null_corrected must be a JSON boolean.")
-    identity_fields = (
-        ("variant_digest",)
-        if population_transfer
-        else ("analysis_fingerprint", "variant_digest", "residual_rank")
-    )
-    for key in identity_fields:
-        if str(ref.get(key)) != str(moments.get(key)):
-            raise ValueError(f"Reference and phenotype bundles disagree on {key}.")
-    n_samples = ref.get("n_samples")
-    fixed_rank = ref.get("fixed_effect_rank_excluding_intercept")
-    residual_rank = ref.get("residual_rank")
-    if any(
-        not isinstance(value, int) or isinstance(value, bool)
-        for value in (n_samples, fixed_rank, residual_rank)
+def _validate_reference_design_diagnostics(
+    payload: Mapping[str, Any],
+    diagonal: pd.DataFrame,
+    annotations: np.ndarray,
+    masses: np.ndarray,
+    annotation_count: int,
+    residual_rank: int,
+) -> None:
+    transform = payload["environment_transform"]
+    expected_ss = float(payload["n_samples"] - int(transform["ddof"]))
+    if not np.isclose(
+        float(transform["analysis_mean"]), 0.0, rtol=0.0, atol=2.0e-10
     ):
-        raise ValueError("Reference sample size and fixed/residual ranks must be JSON integers.")
-    if n_samples <= 0 or fixed_rank < 0 or residual_rank <= 0:
-        raise ValueError("Reference sample size and fixed/residual ranks are not positive/valid.")
-    if residual_rank != n_samples - fixed_rank - 1:
-        raise ValueError(
-            "Reference residual rank is inconsistent with its sample size and fixed-effect rank."
-        )
-    study_n = moments.get("n_samples")
-    study_residual_rank = moments.get("residual_rank")
-    if any(
-        not isinstance(value, int) or isinstance(value, bool)
-        for value in (study_n, study_residual_rank)
+        raise ValueError("Reference standardized environment has nonzero analysis mean.")
+    if not np.isclose(
+        float(transform["analysis_sum_squares"]),
+        expected_ss,
+        rtol=2.0e-10,
+        atol=2.0e-8,
     ):
-        raise ValueError("Phenotype sample size and residual rank must be JSON integers.")
-    if study_n <= 0 or study_residual_rank <= 0 or study_residual_rank >= study_n:
-        raise ValueError("Phenotype sample size and residual rank are inconsistent.")
-    if population_transfer:
-        study_fixed_rank = moments.get("fixed_effect_rank_excluding_intercept")
+        raise ValueError("Reference environment sum of squares is inconsistent.")
+    diagnostics = payload.get("feature_diagnostics")
+    if not isinstance(diagnostics, Mapping):
+        raise ValueError("Reference is missing feature_diagnostics.")
+    m = len(diagonal)
+    if (
+        diagnostics.get("valid_additive_columns") != m
+        or diagnostics.get("valid_interaction_columns") != m
+    ):
+        raise ValueError("Reference feature diagnostics do not cover every SNP.")
+    for key in (
+        "max_projection_leakage_additive",
+        "max_projection_leakage_interaction",
+    ):
+        value = diagnostics.get(key)
         if (
-            isinstance(study_fixed_rank, bool)
-            or not isinstance(study_fixed_rank, int)
-            or study_fixed_rank < 0
-            or study_residual_rank != study_n - study_fixed_rank - 1
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not np.isfinite(value)
+            or value < 0.0
+            or value > 1.0e-9
         ):
-            raise ValueError(
-                "Population phenotype fixed-effect rank is missing or inconsistent."
-            )
-    if population_transfer and kernel_mode != "standardized":
-        raise ValueError(
-            "Population-reference inference requires post-projection standardized kernels."
+            raise ValueError(f"Reference feature diagnostic {key} is invalid.")
+    expected_traces = {
+        "kernel_traces_additive": (
+            float(residual_rank)
+            * annotations.T
+            @ diagonal["NORM_X"].to_numpy(dtype=np.float64)
+            / masses
+        ),
+        "kernel_traces_interaction": (
+            float(residual_rank)
+            * annotations.T
+            @ diagonal["NORM_W"].to_numpy(dtype=np.float64)
+            / masses
+        ),
+    }
+    for key, expected in expected_traces.items():
+        observed = _as_float_array(
+            f"feature_diagnostics[{key}]", diagnostics.get(key), ndim=1
         )
-    if moments.get("score_definition") != "feature_transpose_residualized_y_over_sqrt_residual_rank":
-        raise ValueError("Phenotype moments use an unsupported marginal-score scale.")
-    expected_reference_hash = moments.get("reference_manifest_sha256")
-    if not _is_sha256(expected_reference_hash):
-        raise ValueError("Phenotype moments do not bind the exact GxE reference manifest.")
-    observed_reference_hash = ref_snapshot.sha256
-    ref_cache = ref.get("feature_cache")
-    ref_cache_hash = None
-    ref_cache_path = None
-    ref_cache_metadata = None
-    ref_cache_arrays = None
-    ref_cache_snapshot: _InputSnapshot | None = None
-    validated_cache_by_hash: dict[
-        str, tuple[dict[str, Any], dict[str, np.ndarray]]
-    ] = {}
-    if ref_cache is not None:
-        if (
-            not isinstance(ref_cache, dict)
-            or not isinstance(ref_cache.get("path"), str)
-            or not ref_cache["path"]
-            or not _is_sha256(ref_cache.get("sha256"))
-        ):
-            raise ValueError("Reference manifest has an invalid feature-cache binding.")
-        ref_cache_hash = str(ref_cache["sha256"])
-        ref_cache_path = _resolve_path(ref_path, ref_cache["path"]).resolve()
-        ref_cache_snapshot = snapshots.capture(ref_cache_path)
-        if ref_cache_snapshot.sha256 != ref_cache_hash:
-            raise ValueError("Reference feature cache failed its SHA-256 check.")
-        ref_cache_metadata, ref_cache_arrays = _load_feature_cache_bundle(
-            ref_cache_snapshot.snapshot_path
-        )
-        validated_cache_by_hash[ref_cache_hash] = (
-            ref_cache_metadata,
-            ref_cache_arrays,
-        )
-    moments_cache_hash = moments.get("feature_cache_sha256")
-    if moments_cache_hash is not None and not _is_sha256(moments_cache_hash):
-        raise ValueError("Phenotype moments contain an invalid feature-cache SHA-256 binding.")
-    moments_cache = moments.get("feature_cache")
-    verified_moments_cache_hash = None
-    moments_cache_snapshot: _InputSnapshot | None = None
-    if moments_cache is not None:
-        if (
-            not isinstance(moments_cache, dict)
-            or not isinstance(moments_cache.get("path"), str)
-            or not moments_cache["path"]
-            or not _is_sha256(moments_cache.get("sha256"))
-        ):
-            raise ValueError("Phenotype moments have an invalid feature-cache binding.")
-        moments_cache_path = _resolve_path(mom_path, moments_cache["path"]).resolve()
-        verified_moments_cache_hash = str(moments_cache["sha256"])
-        moments_cache_snapshot = snapshots.capture(moments_cache_path)
-        if moments_cache_snapshot.sha256 != verified_moments_cache_hash:
-            raise ValueError("Phenotype-moment feature cache failed its SHA-256 check.")
-        if (
-            ref_cache_hash is not None
-            and verified_moments_cache_hash != ref_cache_hash
-        ):
-            raise ValueError(
-                "Phenotype moments and reference point to different feature caches."
-            )
-        if verified_moments_cache_hash in validated_cache_by_hash:
-            moments_cache_metadata, moments_cache_arrays = validated_cache_by_hash[
-                verified_moments_cache_hash
-            ]
-        else:
-            moments_cache_metadata, moments_cache_arrays = _load_feature_cache_bundle(
-                moments_cache_snapshot.snapshot_path
-            )
-            validated_cache_by_hash[verified_moments_cache_hash] = (
-                moments_cache_metadata,
-                moments_cache_arrays,
-            )
-        if (
-            moments_cache_hash is not None
-            and moments_cache_hash != verified_moments_cache_hash
-        ):
-            raise ValueError("Phenotype moments contain inconsistent feature-cache hashes.")
-    if population_transfer and observed_reference_hash != expected_reference_hash:
-        raise ValueError(
-            "Population phenotype moments must bind the exact reference manifest."
-        )
-    if not population_transfer and observed_reference_hash != expected_reference_hash:
-        # Phenotype scores do not depend on the randomized trace realization.
-        # They may therefore be reused across B10/B100 references only when
-        # both manifests are cryptographically bound to the exact same feature
-        # cache (genotype, samples, design, scales, annotations, and SNP axis).
-        if (
-            ref_cache_hash is None
-            or verified_moments_cache_hash is None
-            or verified_moments_cache_hash != ref_cache_hash
-        ):
-            raise ValueError(
-                "Phenotype moments were generated for a different GxE reference/feature definition."
-            )
-    elif moments_cache_hash is not None and moments_cache_hash != ref_cache_hash:
-        raise ValueError("Phenotype moments and reference declare different feature caches.")
+        _require_shape(f"feature_diagnostics[{key}]", observed, (annotation_count,))
+        if not np.allclose(observed, expected, rtol=5.0e-10, atol=1.0e-8):
+            raise ValueError(f"Reference feature diagnostic {key} disagrees with per-SNP rows.")
 
-    declared_score_files = moments.get("files")
-    if not isinstance(declared_score_files, dict) or not {"gwas", "gwis"}.issubset(declared_score_files):
-        raise ValueError("Phenotype moments must declare the exact GWAS and GWIS score artifacts.")
-    supplied_score_paths = (Path(gwas_scores).resolve(), Path(gwis_scores).resolve())
-    score_snapshots: dict[str, _InputSnapshot] = {}
-    for label, supplied in zip(("gwas", "gwis"), supplied_score_paths):
-        declared = _resolve_path(mom_path, str(declared_score_files[label])).resolve()
-        if supplied != declared:
-            raise ValueError(
-                f"Supplied {label.upper()} file {supplied} is not the phenotype-bound artifact {declared}."
-            )
-        score_hashes = moments.get("score_sha256")
-        if not isinstance(score_hashes, dict) or label not in score_hashes:
-            raise ValueError("Phenotype moments do not cryptographically bind both score artifacts.")
-        expected_hash = score_hashes[label]
-        if not _is_sha256(expected_hash):
-            raise ValueError(f"Phenotype moments contain an invalid {label.upper()} SHA-256.")
-        score_snapshot = snapshots.capture(supplied)
-        if score_snapshot.sha256 != str(expected_hash):
-            raise ValueError(f"{label.upper()} score file SHA-256 does not match phenotype moments.")
-        score_snapshots[label] = score_snapshot
 
-    artifact_hashes = ref.get("artifact_sha256")
-    required_artifacts = {"xx", "xw", "wx", "ww", "diagonal"}
-    if "jackknife" in ref.get("files", {}):
-        required_artifacts.add("jackknife")
-    if ref.get("jackknife") is not None:
-        randomization = ref.get("randomization")
-        if not isinstance(randomization, dict) or "num_vectors" not in randomization:
-            raise ValueError("Jackknife reference is missing its random-probe count.")
-        probe_count = randomization["num_vectors"]
-        if (
-            isinstance(probe_count, bool)
-            or not isinstance(probe_count, int)
-            or probe_count <= 0
-            or probe_count > 2**64
-        ):
-            raise ValueError(
-                "Jackknife reference num_vectors must be a positive uint64-range JSON integer."
-            )
-        low_probe_override = randomization.get("low_probe_jackknife_override", False)
-        if not isinstance(low_probe_override, bool):
-            raise ValueError(
-                "Jackknife reference low_probe_jackknife_override must be a JSON boolean."
-            )
-        if probe_count < 100 and not low_probe_override:
-            raise ValueError(
-                "Jackknife reference has fewer than 100 probes without an explicit diagnostic override."
-            )
-    if not isinstance(artifact_hashes, dict) or not required_artifacts.issubset(artifact_hashes):
-        raise ValueError("Reference manifest does not cryptographically bind every declared artifact.")
-    artifact_snapshots: dict[str, _InputSnapshot] = {}
-    for label in sorted(required_artifacts):
-        artifact = _resolve_path(ref_path, str(ref["files"][label])).resolve()
-        if not _is_sha256(artifact_hashes[label]):
-            raise ValueError(f"Reference artifact {label!r} has an invalid SHA-256 declaration.")
-        artifact_snapshot = snapshots.capture(artifact)
-        if artifact_snapshot.sha256 != str(artifact_hashes[label]):
-            raise ValueError(f"Reference artifact {label!r} failed its SHA-256 check: {artifact}.")
-        artifact_snapshots[label] = artifact_snapshot
+def _validate_reference_for_fit(
+    reference_manifest: str | Path,
+    njack: str | int,
+) -> _PreparedGxEReference:
+    path = Path(reference_manifest).expanduser().resolve()
+    ref = _load_json(path)
+    if ref.get("kind") != _REFERENCE_KIND or ref.get("schema_version") != _SCHEMA_VERSION:
+        raise ValueError("Only the current schema-v4 SUMMIT GxE reference is supported.")
+    for key in ("n_samples", "fixed_effect_rank_excluding_intercept", "residual_rank"):
+        value = ref.get(key)
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ValueError(f"Reference {key} must be a JSON integer.")
+    n = int(ref["n_samples"])
+    fixed_rank = int(ref["fixed_effect_rank_excluding_intercept"])
+    residual_rank = int(ref["residual_rank"])
+    if n <= 0 or fixed_rank < 0 or residual_rank != n - fixed_rank - 1:
+        raise ValueError("Reference sample size and fixed-effect rank are inconsistent.")
+    if ref.get("ld_scale") != "cross_product_over_rank_squared":
+        raise ValueError("Reference has an unsupported LD-score scale.")
+    if ref.get("null_corrected") is not False:
+        raise ValueError("Current GxE references must store raw, non-offset per-SNP scores.")
+    feature_convention = ref.get("feature_convention")
+    if feature_convention not in {"standardized_projected", "raw_projected"}:
+        raise ValueError("Reference has an unsupported feature convention.")
+    if ref.get("kernel_mode") != feature_convention:
+        raise ValueError("Reference kernel_mode must equal its canonical feature convention.")
+    if ref.get("genotype_scale") not in {"sample", "hwe"}:
+        raise ValueError("Reference has an unsupported genotype scale.")
+    if ref.get("annotation_value_dtype") != "float64":
+        raise ValueError("Reference annotations must use the schema-v4 float64 contract.")
+    transform = ref.get("environment_transform")
+    if not isinstance(transform, Mapping):
+        raise ValueError("Reference is missing environment_transform.")
+    if (
+        transform.get("standardized") is not True
+        or transform.get("units") != "per_environment_sd"
+        or transform.get("ddof") not in (0, 1)
+    ):
+        raise ValueError("Reference environment transform is unsupported.")
+    for key in ("raw_mean", "raw_sd", "analysis_mean", "analysis_sum_squares"):
+        value = transform.get(key)
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not np.isfinite(value):
+            raise ValueError(f"Reference environment_transform[{key!r}] is invalid.")
+    if float(transform["raw_sd"]) <= 0.0:
+        raise ValueError("Reference environment standard deviation must be positive.")
 
-    diag_path = _resolve_path(ref_path, str(ref["files"]["diagonal"]))
-    diag = _read_table(artifact_snapshots["diagonal"].snapshot_path)
-    annotation_names_raw = ref.get("annotation_names")
-    if not isinstance(annotation_names_raw, list):
+    names_raw = ref.get("annotation_names")
+    if not isinstance(names_raw, list):
         raise ValueError("Reference annotation_names must be a JSON list.")
-    names = tuple(_validate_gxe_annotation_names(annotation_names_raw))
-    study_genetic_nxe: np.ndarray | None = None
-    study_deleted_genetic_nxe: np.ndarray | None = None
-    if population_transfer:
-        reference_jackknife = ref.get("jackknife")
-        population_block_labels: tuple[str, ...] = ()
-        if isinstance(reference_jackknife, Mapping):
-            raw_labels = reference_jackknife.get("block_labels")
-            if isinstance(raw_labels, list):
-                population_block_labels = tuple(str(value) for value in raw_labels)
-        study_genetic_nxe, study_deleted_genetic_nxe = (
-            _study_population_design_moments(
-                moments,
-                names,
-                population_block_labels,
-            )
+    names = tuple(_validate_gxe_annotation_names(names_raw))
+    files = ref.get("files")
+    required_files = {"xx", "xw", "wx", "ww", "diagonal"}
+    if not isinstance(files, Mapping) or set(files) != required_files:
+        raise ValueError(
+            f"Reference files must contain exactly {sorted(required_files)}."
         )
-    weight_cols = [f"ANNOT_{i}" for i in range(len(names))]
-    required_diag = ["CHR", "SNP", "BP", "A1", "A2", "NORM_X", "NORM_W", "DNXE_X", "DNXE_W", *weight_cols]
-    if ref_version >= 3:
-        required_diag = [
-            "CHR", "SNP", "BP", "A1", "A2", "NORM_X", "NORM_W",
-            "SCALE_X", "SCALE_W", "DNXE_X", "DNXE_W", "CORR_XW",
-            *weight_cols,
-        ]
-        if ref.get("jackknife") is not None:
-            required_diag.append("BLOCK")
-        observed_diag_columns = diag.columns.astype(str).tolist()
-        if (
-            observed_diag_columns != required_diag
-            or len(set(observed_diag_columns)) != len(observed_diag_columns)
-        ):
-            raise ValueError(
-                f"{diag_path} must contain exactly the canonical ordered columns "
-                f"{required_diag}; observed {observed_diag_columns}."
-            )
-    missing = [c for c in required_diag if c not in diag.columns]
-    if missing:
-        raise ValueError(f"{diag_path} is missing columns {missing}.")
-    if diag["SNP"].duplicated().any():
-        raise ValueError(f"{diag_path} contains duplicate SNP identifiers.")
-    if ordered_variant_digest(diag) != str(ref["variant_digest"]):
-        raise ValueError("Diagonal file variant digest does not match its manifest.")
-    variants = diag.loc[:, ["CHR", "SNP", "BP", "A1", "A2"]].copy()
-    annotations = diag.loc[:, weight_cols].to_numpy(dtype=np.float64)
-    observed_masses = annotations.sum(axis=0, dtype=np.float64)
+    diagonal_path = _resolve_path(path, str(files["diagonal"]))
+    diagonal = _read_table(diagonal_path)
+    weight_columns = [f"ANNOT_{index}" for index in range(len(names))]
+    expected_columns = [
+        "CHR", "SNP", "BP", "A1", "A2",
+        "NORM_X", "NORM_W", "SCALE_X", "SCALE_W",
+        "DNXE_X", "DNXE_W", "CORR_XW", *weight_columns,
+    ]
+    observed_columns = diagonal.columns.astype(str).tolist()
+    if observed_columns != expected_columns or len(set(observed_columns)) != len(observed_columns):
+        raise ValueError(
+            f"{diagonal_path} must contain exactly the ordered columns {expected_columns}."
+        )
+    if len(diagonal) < 2 or diagonal["SNP"].duplicated().any():
+        raise ValueError("Reference diagonal is empty or contains duplicate SNP IDs.")
+    variants = diagonal.loc[:, ["CHR", "SNP", "BP", "A1", "A2"]].copy()
+    annotations = diagonal.loc[:, weight_columns].to_numpy(dtype=np.float64)
+    if not np.all(np.isfinite(annotations)) or np.any(annotations < 0.0):
+        raise ValueError("Reference annotations must be finite and non-negative.")
+    masses = annotations.sum(axis=0, dtype=np.float64)
     declared_masses = _as_float_array(
         "reference annotation_masses", ref.get("annotation_masses"), ndim=1
     )
-    _require_shape("reference annotation_masses", declared_masses, observed_masses.shape)
-    if not np.allclose(declared_masses, observed_masses, rtol=5.0e-10, atol=1.0e-8):
-        raise ValueError(
-            "Reference annotation_masses disagree with the canonical diagonal annotation weights."
-        )
-    if ref_cache_metadata is not None:
-        if ref_version < 3 or ref_cache_arrays is None:
-            raise ValueError(
-                "Cross-reference feature-cache reuse requires a schema-v3 reference "
-                "and a validated schema-v2 cache."
-            )
-        _validate_reference_feature_cache_contract(
-            ref,
-            diag,
-            names,
-            ref_cache_metadata,
-            ref_cache_arrays,
-        )
-        for _, cached_arrays in validated_cache_by_hash.values():
-            cached_arrays.clear()
-        validated_cache_by_hash.clear()
-        ref_cache_arrays = None
-    if validated_cache_by_hash:
-        for _, cached_arrays in validated_cache_by_hash.values():
-            cached_arrays.clear()
-        validated_cache_by_hash.clear()
-    if ref_version >= 3:
-        genotype_files = ref.get("genotype_files")
-        valid_genotype_trios = (
-            {".bed", ".bim", ".fam"},
-            {".pgen", ".pvar", ".psam"},
-        )
-        if (
-            not isinstance(genotype_files, dict)
-            or set(genotype_files) not in valid_genotype_trios
-        ):
-            raise ValueError("Schema-v3 reference is missing genotype file provenance.")
-        for extension in sorted(genotype_files):
-            entry = genotype_files[extension]
-            if (
-                not isinstance(entry, dict)
-                or not isinstance(entry.get("bytes"), int)
-                or int(entry["bytes"]) <= 0
-                or not _is_sha256(entry.get("sha256"))
-            ):
-                raise ValueError(f"Invalid genotype provenance for {extension} in reference manifest.")
-        env_transform = ref.get("environment_transform")
-        if not isinstance(env_transform, dict) or env_transform.get("standardized") is not True:
-            raise ValueError(
-                "Schema-v3 reference must declare a standardized per-SD environment transform."
-            )
-        for key in ("raw_mean", "raw_sd", "analysis_mean", "analysis_sum_squares"):
-            value = env_transform.get(key)
-            if not isinstance(value, (int, float)) or not np.isfinite(float(value)):
-                raise ValueError(f"Invalid environment_transform[{key!r}] in reference manifest.")
-        if not _is_sha256(env_transform.get("fixed_effect_design_sha256")):
-            raise ValueError(
-                "Schema-v3 environment transform lacks a fixed-effect design digest."
-            )
-        ddof = env_transform.get("ddof")
-        if not isinstance(ddof, int) or isinstance(ddof, bool) or ddof not in (0, 1):
-            raise ValueError("Schema-v3 environment transform has an invalid ddof declaration.")
-        if float(env_transform["raw_sd"]) <= 0.0 or env_transform.get("units") != "per_environment_sd":
-            raise ValueError("Schema-v3 environment transform has an invalid scale or units declaration.")
-        if abs(float(env_transform["analysis_mean"])) > 1.0e-10:
-            raise ValueError("Schema-v3 standardized environment is not centered.")
-        expected_environment_ss = float(n_samples - ddof)
-        if not np.isclose(
-            float(env_transform["analysis_sum_squares"]),
-            expected_environment_ss,
-            rtol=1.0e-10,
-            atol=1.0e-8,
-        ):
-            raise ValueError(
-                "Schema-v3 standardized environment sum of squares is inconsistent with N and ddof."
-            )
-        diagnostics = ref.get("feature_diagnostics")
-        if not isinstance(diagnostics, dict):
-            raise ValueError("Schema-v3 reference is missing feature_diagnostics.")
-        required_diagnostics = {
-            "valid_additive_columns",
-            "valid_interaction_columns",
-            "max_projection_leakage_additive",
-            "max_projection_leakage_interaction",
-            "kernel_traces_additive",
-            "kernel_traces_interaction",
-        }
-        if not required_diagnostics.issubset(diagnostics):
-            raise ValueError("Schema-v3 reference has incomplete feature_diagnostics.")
-        if (
-            diagnostics["valid_additive_columns"] != len(diag)
-            or diagnostics["valid_interaction_columns"] != len(diag)
-        ):
-            raise ValueError("Schema-v3 feature diagnostics do not cover every reference variant.")
-        for key in ("max_projection_leakage_additive", "max_projection_leakage_interaction"):
-            value = diagnostics[key]
-            if not isinstance(value, (int, float)) or not np.isfinite(float(value)) or float(value) < 0.0:
-                raise ValueError(f"Schema-v3 feature diagnostic {key!r} is invalid.")
-            if float(value) > 1.0e-9:
-                raise ValueError(f"Schema-v3 feature diagnostic {key!r} exceeds its projection tolerance.")
-        for key in ("kernel_traces_additive", "kernel_traces_interaction"):
-            values = _as_float_array(f"feature_diagnostics[{key}]", diagnostics[key], ndim=1)
-            _require_shape(f"feature_diagnostics[{key}]", values, (len(names),))
-        for scale_column in ("SCALE_X", "SCALE_W"):
-            values = diag[scale_column].to_numpy(dtype=np.float64)
-            if not np.all(np.isfinite(values)) or np.any(values <= 0.0):
-                raise ValueError(f"Schema-v3 reference contains an invalid {scale_column} value.")
-        corr_xw = diag["CORR_XW"].to_numpy(dtype=np.float64)
-        norm_bound = np.sqrt(
-            diag["NORM_X"].to_numpy(dtype=np.float64)
-            * diag["NORM_W"].to_numpy(dtype=np.float64)
-        )
-        if not np.all(np.isfinite(corr_xw)) or np.any(np.abs(corr_xw) > norm_bound + 1.0e-8):
-            raise ValueError("Schema-v3 additive/interaction correlations violate Cauchy-Schwarz.")
-        if kernel_mode == "standardized":
-            for norm_column in ("NORM_X", "NORM_W"):
-                values = diag[norm_column].to_numpy(dtype=np.float64)
-                if not np.allclose(values, 1.0, rtol=1.0e-9, atol=1.0e-9):
-                    raise ValueError(
-                        f"Schema-v3 standardized reference violates the {norm_column}=1 invariant."
-                    )
-        trace_from_diag = {
-            "kernel_traces_additive": (
-                float(residual_rank) * annotations.T @ diag["NORM_X"].to_numpy(dtype=np.float64)
-                / observed_masses
-            ),
-            "kernel_traces_interaction": (
-                float(residual_rank) * annotations.T @ diag["NORM_W"].to_numpy(dtype=np.float64)
-                / observed_masses
-            ),
-        }
-        for key, observed in trace_from_diag.items():
-            declared = np.asarray(diagnostics[key], dtype=np.float64)
-            if not np.allclose(declared, observed, rtol=5.0e-10, atol=1.0e-8):
-                raise ValueError(f"Schema-v3 feature diagnostic {key!r} disagrees with the diagonal table.")
-
-    reference_variant_axis = {
-        column: variants[column].astype(str).to_numpy()
-        for column in ("CHR", "SNP", "BP", "A1", "A2")
-    }
-    score_arrays = []
-    for label, score_key, path in zip(
-        ("GWAS", "GWIS"), ("gwas", "gwis"), supplied_score_paths
+    _require_shape("reference annotation_masses", declared_masses, masses.shape)
+    if np.any(masses <= 0.0) or not np.allclose(
+        masses, declared_masses, rtol=5.0e-10, atol=1.0e-8
     ):
-        table = _read_table(score_snapshots[score_key].snapshot_path)
-        required = ["CHR", "SNP", "BP", "A1", "A2", "SCORE", "SCORE_MODE"]
-        if ref_version >= 3:
-            canonical_score_columns = [
-                "CHR", "SNP", "BP", "A1", "A2", "N", "DF", "SCORE_MODE", "SCORE"
-            ]
-            observed_score_columns = table.columns.astype(str).tolist()
-            if (
-                observed_score_columns != canonical_score_columns
-                or len(set(observed_score_columns)) != len(observed_score_columns)
-            ):
-                raise ValueError(
-                    f"{label} score file must contain exactly the canonical ordered columns "
-                    f"{canonical_score_columns}; observed {observed_score_columns}."
-                )
-        missing = [c for c in required if c not in table.columns]
-        if missing:
-            raise ValueError(f"{label} score file {path} is missing columns {missing}.")
-        if len(table) != len(variants):
-            raise ValueError(f"{label} score file has {len(table)} rows; expected {len(variants)}.")
-        for col in ("CHR", "SNP", "BP", "A1", "A2"):
-            if not np.array_equal(
-                table[col].astype(str).to_numpy(), reference_variant_axis[col]
-            ):
-                raise ValueError(f"{label} score file is not aligned to the reference ({col} mismatch).")
-        modes = table["SCORE_MODE"].astype("string").str.lower()
-        mode_values = set(modes.dropna().astype(str))
-        if modes.isna().any() or not bool((modes == "marginal_cross_product").all()):
-            raise ValueError(
-                f"{label} uses unsupported SCORE_MODE={sorted(mode_values)}. "
-                "Conditional PLINK interaction statistics are not GENIE marginal scores."
-            )
-        n_values = pd.to_numeric(table["N"], errors="raise").to_numpy(dtype=np.float64) if "N" in table else None
-        df_values = pd.to_numeric(table["DF"], errors="raise").to_numpy(dtype=np.float64) if "DF" in table else None
-        if n_values is None or df_values is None:
-            raise ValueError(f"{label} score file must contain N and DF columns.")
-        expected_n = float(study_n if population_transfer else ref["n_samples"])
-        expected_df = float(
-            study_residual_rank if population_transfer else ref["residual_rank"]
-        )
-        if not np.all(n_values == expected_n):
-            raise ValueError(f"{label} score file N does not match the phenotype sample count.")
-        if not np.all(df_values == expected_df):
-            raise ValueError(f"{label} score file DF does not match the phenotype residual rank.")
-        score_arrays.append(table["SCORE"].to_numpy(dtype=np.float64))
-
-    shared_cache_snapshot = (
-        ref_cache_snapshot
-        if ref_cache_snapshot is not None
-        else moments_cache_snapshot
+        raise ValueError("Reference annotation masses disagree with the per-SNP rows.")
+    numeric_columns = [
+        "NORM_X", "NORM_W", "SCALE_X", "SCALE_W", "DNXE_X", "DNXE_W", "CORR_XW"
+    ]
+    numeric = diagonal.loc[:, numeric_columns].to_numpy(dtype=np.float64)
+    if not np.all(np.isfinite(numeric)):
+        raise ValueError("Reference diagonal contains non-finite values.")
+    for column in ("NORM_X", "NORM_W", "SCALE_X", "SCALE_W"):
+        if np.any(diagonal[column].to_numpy(dtype=np.float64) <= 0.0):
+            raise ValueError(f"Reference {column} values must be positive.")
+    norm_bound = np.sqrt(
+        diagonal["NORM_X"].to_numpy(dtype=np.float64)
+        * diagonal["NORM_W"].to_numpy(dtype=np.float64)
     )
-    reference_provenance = _snapshot_provenance(ref_snapshot)
-    feature_cache_provenance = (
-        None
-        if shared_cache_snapshot is None
-        else _snapshot_provenance(shared_cache_snapshot)
+    if np.any(np.abs(diagonal["CORR_XW"].to_numpy(dtype=np.float64)) > norm_bound + 1.0e-8):
+        raise ValueError("Reference additive/interaction diagonals violate Cauchy-Schwarz.")
+    if feature_convention == "standardized_projected":
+        for column in ("NORM_X", "NORM_W"):
+            if not np.allclose(
+                diagonal[column].to_numpy(dtype=np.float64),
+                1.0,
+                rtol=1.0e-9,
+                atol=1.0e-9,
+            ):
+                raise ValueError(f"Standardized reference violates {column}=1.")
+    elif not (
+        np.allclose(diagonal["SCALE_X"], 1.0, rtol=0.0, atol=1.0e-12)
+        and np.allclose(diagonal["SCALE_W"], 1.0, rtol=0.0, atol=1.0e-12)
+    ):
+        raise ValueError("Raw projected references must store unit post-projection scales.")
+    _validate_reference_design_diagnostics(
+        ref, diagonal, annotations, masses, len(names), residual_rank
     )
 
-    panels = {}
-    for key in ("xx", "xw", "wx", "ww"):
-        panels[key] = _aligned_panel(
-            artifact_snapshots[key].snapshot_path,
-            variants,
-            names,
-            allow_negative_storage=null_corrected,
-        )
-
-    reference_eq = assemble_normal_equations(
+    panels = {
+        key: _aligned_panel(_resolve_path(path, str(files[key])), variants, names)
+        for key in ("xx", "xw", "wx", "ww")
+    }
+    trace_nxe = float(ref.get("trace_nxe"))
+    trace_nxe_sq = float(ref.get("trace_nxe_sq"))
+    if not np.isfinite(trace_nxe) or not np.isfinite(trace_nxe_sq):
+        raise ValueError("Reference NxE traces must be finite.")
+    if trace_nxe < 0.0 or trace_nxe_sq < 0.0:
+        raise ValueError("Reference NxE traces must be non-negative.")
+    template = assemble_normal_equations(
         annotations=annotations,
-        score_x=score_arrays[0],
-        score_w=score_arrays[1],
+        score_x=np.zeros(len(variants), dtype=np.float64),
+        score_w=np.zeros(len(variants), dtype=np.float64),
         ld_xx=panels["xx"],
         ld_xw=panels["xw"],
         ld_wx=panels["wx"],
         ld_ww=panels["ww"],
-        norm_x=diag["NORM_X"].to_numpy(dtype=np.float64),
-        norm_w=diag["NORM_W"].to_numpy(dtype=np.float64),
-        diag_nxe_x=diag["DNXE_X"].to_numpy(dtype=np.float64),
-        diag_nxe_w=diag["DNXE_W"].to_numpy(dtype=np.float64),
-        residual_rank=int(ref["residual_rank"]),
-        q_nxe=(0.0 if population_transfer else float(moments["q_nxe"])),
-        q_residual=(
-            float(ref["residual_rank"])
-            if population_transfer
-            else float(moments["q_residual"])
-        ),
-        trace_nxe=float(ref["trace_nxe"]),
-        trace_nxe_sq=float(ref["trace_nxe_sq"]),
+        norm_x=diagonal["NORM_X"].to_numpy(dtype=np.float64),
+        norm_w=diagonal["NORM_W"].to_numpy(dtype=np.float64),
+        diag_nxe_x=diagonal["DNXE_X"].to_numpy(dtype=np.float64),
+        diag_nxe_w=diagonal["DNXE_W"].to_numpy(dtype=np.float64),
+        residual_rank=residual_rank,
+        q_nxe=0.0,
+        q_residual=float(residual_rank),
+        trace_nxe=trace_nxe,
+        trace_nxe_sq=trace_nxe_sq,
         annotation_names=names,
         ld_scale=str(ref["ld_scale"]),
-        null_corrected=null_corrected,
     )
+    blocks, labels = _posthoc_inference_blocks(variants, njack)
+    return _prepare_reference_sufficient_statistics(
+        path=path,
+        payload=ref,
+        schema_version=_SCHEMA_VERSION,
+        variants=variants,
+        annotations=annotations,
+        annotation_names=names,
+        panels=panels,
+        norm_x=diagonal["NORM_X"].to_numpy(dtype=np.float64),
+        norm_w=diagonal["NORM_W"].to_numpy(dtype=np.float64),
+        diag_x=diagonal["DNXE_X"].to_numpy(dtype=np.float64),
+        diag_w=diagonal["DNXE_W"].to_numpy(dtype=np.float64),
+        equations=template,
+        block_values=blocks,
+        block_labels=labels,
+    )
+
+
+def _load_score_table(
+    path: Path,
+    prepared: _PreparedGxEReference,
+    *,
+    label: str,
+    n_samples: int,
+    residual_rank: int,
+    population_transfer: bool,
+) -> tuple[np.ndarray, np.ndarray | None]:
+    table = _read_table(path)
+    expected_columns = [
+        "CHR", "SNP", "BP", "A1", "A2", "N", "DF", "SCORE_MODE", "SCORE"
+    ]
     if population_transfer:
-        assert study_genetic_nxe is not None
-        products = _population_same_individual_products(ref, names)
-        transferred = transfer_reference_normal_equations(
-            reference_eq,
-            reference_n_samples=int(n_samples),
-            study_n_samples=int(study_n),
-            reference_residual_rank=int(ref["residual_rank"]),
-            study_residual_rank=int(study_residual_rank),
-            same_individual_products=products,
-            genetic_nxe_traces=study_genetic_nxe,
-            q_nxe=float(moments["q_nxe"]),
-            q_residual=float(moments["q_residual"]),
-            trace_nxe=float(moments["trace_nxe"]),
-            trace_nxe_sq=float(moments["trace_nxe_sq"]),
+        expected_columns.append("DNXE")
+    observed_columns = table.columns.astype(str).tolist()
+    if observed_columns != expected_columns or len(set(observed_columns)) != len(observed_columns):
+        raise ValueError(
+            f"{label} must contain exactly the ordered columns {expected_columns}; "
+            f"observed {observed_columns}."
         )
-        transferred_rhs = np.array(transferred.rhs, copy=True)
-        genetic_count = len(transferred_rhs) - 2
-        transferred_rhs[:genetic_count] = (
-            float(study_residual_rank)
-            / float(ref["residual_rank"])
-            * reference_eq.rhs[:genetic_count]
+    if len(table) != prepared.n_variants:
+        raise ValueError(
+            f"{label} has {len(table)} rows; expected {prepared.n_variants}."
         )
-        transferred_rhs[genetic_count] = float(moments["q_nxe"])
-        transferred_rhs[genetic_count + 1] = float(moments["q_residual"])
-        eq = replace(transferred, rhs=transferred_rhs)
-    else:
-        eq = reference_eq
-    fit = solve_normal_equations(
-        eq,
-        allow_ill_conditioned=allow_ill_conditioned,
-        max_condition=max_condition,
-    )
-    residual_fraction_raw = moments.get("phenotype_residual_variance_fraction")
-    if residual_fraction_raw is not None:
-        residual_fraction = float(residual_fraction_raw)
-        if not np.isfinite(residual_fraction) or not (0.0 < residual_fraction <= 1.0 + 1e-8):
-            raise ValueError("Invalid phenotype_residual_variance_fraction in phenotype moments.")
-        fit = replace(fit, phenotype_residual_variance_fraction=residual_fraction)
-    jackknife_file = ref.get("files", {}).get("jackknife")
-    jackknife_declaration = ref.get("jackknife")
-    prepared: _PreparedGxEReference
-    if jackknife_declaration is not None:
-        if not isinstance(jackknife_declaration, dict):
-            raise ValueError("Reference jackknife declaration must be an object.")
-        jackknife_method = jackknife_declaration.get("method")
-        if jackknife_method not in {
-            _EXACT_JACKKNIFE_METHOD,
-            _BLOCK_LOCAL_JACKKNIFE_METHOD,
-        }:
-            raise ValueError(f"Unsupported GxE jackknife method {jackknife_method!r}.")
-        if "BLOCK" not in diag.columns:
-            raise ValueError("Reference declares a jackknife but its diagonal table has no BLOCK column.")
-        block_values = pd.to_numeric(diag["BLOCK"], errors="raise").to_numpy(dtype=np.int64)
-        declared_labels = jackknife_declaration.get("block_labels")
-        if not isinstance(declared_labels, list):
-            raise ValueError("Reference jackknife block_labels must be a JSON list.")
-        labels = tuple(str(value) for value in declared_labels)
-        within = None
-        if jackknife_method == _EXACT_JACKKNIFE_METHOD:
-            if jackknife_file is None:
-                raise ValueError("Exact two-sided GxE jackknife is missing its trace bundle.")
-            with np.load(artifact_snapshots["jackknife"].snapshot_path, allow_pickle=False) as bundle:
-                expected_members = {
-                    "block_labels", "within_xx", "within_xw", "within_wx", "within_ww"
-                }
-                if len(bundle.files) != len(expected_members) or set(bundle.files) != expected_members:
-                    raise ValueError(
-                        "Reference jackknife contains unexpected, duplicate, or missing arrays."
-                    )
-                label_array = np.asarray(bundle["block_labels"])
-                if label_array.ndim != 1 or label_array.dtype.kind != "U":
-                    raise ValueError("Reference jackknife block_labels must be a one-dimensional Unicode array.")
-                if tuple(label_array.tolist()) != labels:
-                    raise ValueError("Jackknife trace labels disagree with the reference manifest.")
-                within = {}
-                for key in ("xx", "xw", "wx", "ww"):
-                    raw = np.asarray(bundle[f"within_{key}"])
-                    if raw.dtype != np.dtype(np.float64):
-                        raise ValueError(f"Reference jackknife within_{key} must use float64.")
-                    within[key] = np.array(raw, copy=True)
-        elif jackknife_file is not None:
-            raise ValueError("Block-local GxE jackknife must not declare an exact trace bundle.")
-        nblock = len(labels)
-        if (
-            nblock < 2
-            or any(not label for label in labels)
-            or len(set(labels)) != nblock
-            or set(np.unique(block_values).tolist()) != set(range(nblock))
+    for column in ("CHR", "SNP", "BP", "A1", "A2"):
+        if not np.array_equal(
+            table[column].astype(str).to_numpy(), prepared.variant_axis[column]
         ):
-            raise ValueError("Jackknife block IDs are not contiguous or do not match block_labels.")
-        if jackknife_declaration.get("num_blocks") != nblock:
-            raise ValueError("Jackknife block count disagrees with its labels.")
-        if within is not None:
-            expected_shape = (nblock, len(names), len(names))
-            for key, value in within.items():
-                if (
-                    value.shape != expected_shape
-                    or not np.all(np.isfinite(value))
-                    or np.any(value < 0.0)
-                ):
-                    raise ValueError(
-                        f"Jackknife within_{key} has shape {value.shape}; expected finite, "
-                        f"non-negative float64 {expected_shape}."
-                    )
-                value[value == 0.0] = 0.0
-        prepared = _prepare_reference_sufficient_statistics(
-            path=ref_path,
-            payload=ref,
-            manifest_sha256=observed_reference_hash,
-            schema_version=ref_version,
-            feature_cache_sha256=ref_cache_hash,
-            reference_provenance=reference_provenance,
-            feature_cache_provenance=feature_cache_provenance,
-            variants=variants,
-            annotations=annotations,
-            annotation_names=names,
-            panels=panels,
-            norm_x=diag["NORM_X"].to_numpy(dtype=np.float64),
-            norm_w=diag["NORM_W"].to_numpy(dtype=np.float64),
-            diag_x=diag["DNXE_X"].to_numpy(dtype=np.float64),
-            diag_w=diag["DNXE_W"].to_numpy(dtype=np.float64),
-            equations=reference_eq,
-            block_values=block_values,
-            block_labels=labels,
-            within=within,
-            jackknife_method=str(jackknife_method),
-            null_corrected=null_corrected,
-        )
-        _, deleted_equations = _equations_from_prepared_scores(
-            prepared,
-            score_arrays[0],
-            score_arrays[1],
-            q_nxe=float(moments["q_nxe"]),
-            q_residual=float(moments["q_residual"]),
-            reference_mode=str(reference_mode),
-            study_n_samples=int(study_n),
-            study_residual_rank=int(study_residual_rank),
-            genetic_nxe_traces=study_genetic_nxe,
-            jackknife_genetic_nxe_traces=study_deleted_genetic_nxe,
-            trace_nxe=(
-                float(moments["trace_nxe"]) if population_transfer else None
-            ),
-            trace_nxe_sq=(
-                float(moments["trace_nxe_sq"]) if population_transfer else None
-            ),
-        )
-        replicate_proportions = []
-        for deleted in deleted_equations:
-            deleted_fit = solve_normal_equations(
-                deleted,
-                allow_ill_conditioned=allow_ill_conditioned,
-                max_condition=max_condition,
+            raise ValueError(
+                f"{label} is not aligned to the reference ({column} mismatch)."
             )
-            replicate_proportions.append(deleted_fit.proportions)
-        replicate_array = np.asarray(replicate_proportions, dtype=np.float64)
-        center = replicate_array.mean(axis=0)
-        se = np.sqrt((nblock - 1.0) / nblock * np.sum((replicate_array - center) ** 2, axis=0))
-        fit = replace(
-            fit,
-            standard_errors=se,
-            jackknife_estimates=replicate_array,
-            jackknife_block_labels=labels,
+    if not bool(
+        (table["SCORE_MODE"].astype("string").str.lower() == "marginal_cross_product").all()
+    ):
+        raise ValueError(
+            f"{label} must contain marginal cross-products, not conditional interaction statistics."
         )
-    else:
-        if jackknife_file is not None:
-            raise ValueError("Reference declares a jackknife artifact without jackknife metadata.")
-        prepared = _prepare_reference_sufficient_statistics(
-            path=ref_path,
-            payload=ref,
-            manifest_sha256=observed_reference_hash,
-            schema_version=ref_version,
-            feature_cache_sha256=ref_cache_hash,
-            reference_provenance=reference_provenance,
-            feature_cache_provenance=feature_cache_provenance,
-            variants=variants,
-            annotations=annotations,
-            annotation_names=names,
-            panels=panels,
-            norm_x=diag["NORM_X"].to_numpy(dtype=np.float64),
-            norm_w=diag["NORM_W"].to_numpy(dtype=np.float64),
-            diag_x=diag["DNXE_X"].to_numpy(dtype=np.float64),
-            diag_w=diag["DNXE_W"].to_numpy(dtype=np.float64),
-            equations=reference_eq,
-            null_corrected=null_corrected,
-        )
-    fit = replace(
-        fit,
-        consumed_input_provenance=_consumed_input_provenance(
-            reference_manifest=ref_snapshot,
-            feature_cache=shared_cache_snapshot,
-            phenotype_moments=moments_snapshot,
-            gwas=score_snapshots["gwas"],
-            gwis=score_snapshots["gwis"],
-        ),
+    if not np.all(pd.to_numeric(table["N"], errors="raise") == n_samples):
+        raise ValueError(f"{label} N does not match phenotype moments.")
+    if not np.all(pd.to_numeric(table["DF"], errors="raise") == residual_rank):
+        raise ValueError(f"{label} DF does not match phenotype moments.")
+    score = _as_float_array(f"{label} SCORE", table["SCORE"], ndim=1)
+    d_nxe = (
+        _as_float_array(f"{label} DNXE", table["DNXE"], ndim=1)
+        if population_transfer
+        else None
     )
-    if prepared_out is not None:
-        prepared_out.append(prepared)
-    return fit, eq
+    return score, d_nxe
 
 
-def _fit_prepared_from_input_snapshots(
+def _fit_prepared_trait(
     prepared: _PreparedGxEReference,
     phenotype_input: GxEPhenotypeInput,
     *,
-    snapshots: _InputSnapshotStore,
-    validated_cache_hashes: set[str],
     allow_ill_conditioned: bool,
     max_condition: float,
 ) -> tuple[GxEFitResult, GxENormalEquations]:
-    """Validate one phenotype triplet and fit it to an in-memory reference."""
-    ref = prepared.payload
-    mom_path = Path(phenotype_input.phenotype_moments).expanduser().resolve()
-    moments_snapshot = snapshots.capture(mom_path)
-    moments = _load_json(moments_snapshot.snapshot_path)
-    moments_version_raw = moments.get("schema_version")
-    if not isinstance(moments_version_raw, int) or isinstance(moments_version_raw, bool):
-        raise ValueError(f"Phenotype schema_version must be a JSON integer: {mom_path}.")
-    moments_version = int(moments_version_raw)
-    if (
-        moments.get("kind") != _MOMENTS_KIND
-        or moments_version not in _SUPPORTED_SCHEMA_VERSIONS
-    ):
-        raise ValueError(f"Unsupported GxE phenotype moments file: {mom_path}.")
-    if moments_version != prepared.schema_version:
-        raise ValueError(
-            "Reference and phenotype bundles use different schema versions: "
-            f"reference={prepared.schema_version}, moments={moments_version}."
-        )
-    reference_mode = moments.get("reference_mode", _MATCHED_REFERENCE_MODE)
-    if reference_mode not in {
-        _MATCHED_REFERENCE_MODE,
-        _POPULATION_REFERENCE_MODE,
-    }:
-        raise ValueError(f"Unsupported phenotype reference_mode={reference_mode!r}.")
-    population_transfer = reference_mode == _POPULATION_REFERENCE_MODE
-    identity_fields = (
-        ("variant_digest",)
-        if population_transfer
-        else ("analysis_fingerprint", "variant_digest", "residual_rank")
-    )
-    for key in identity_fields:
-        if str(ref.get(key)) != str(moments.get(key)):
-            raise ValueError(f"Reference and phenotype bundles disagree on {key}.")
-    study_n = moments.get("n_samples")
-    study_residual_rank = moments.get("residual_rank")
-    if any(
-        not isinstance(value, int) or isinstance(value, bool)
-        for value in (study_n, study_residual_rank)
-    ) or study_n <= 0 or study_residual_rank <= 0 or study_residual_rank >= study_n:
-        raise ValueError("Phenotype sample size and residual rank are inconsistent.")
-    if population_transfer:
-        study_fixed_rank = moments.get("fixed_effect_rank_excluding_intercept")
-        if (
-            isinstance(study_fixed_rank, bool)
-            or not isinstance(study_fixed_rank, int)
-            or study_fixed_rank < 0
-            or study_residual_rank != study_n - study_fixed_rank - 1
-        ):
-            raise ValueError(
-                "Population phenotype fixed-effect rank is missing or inconsistent."
-            )
-    if population_transfer and prepared.population_same_individual_products is None:
-        raise ValueError("Reference lacks population trace-transfer moments.")
-    study_genetic_nxe: np.ndarray | None = None
-    study_deleted_genetic_nxe: np.ndarray | None = None
-    if population_transfer:
-        study_genetic_nxe, study_deleted_genetic_nxe = (
-            _study_population_design_moments(
-                moments,
-                prepared.annotation_names,
-                prepared.block_labels,
-            )
-        )
+    moments_path = Path(phenotype_input.phenotype_moments).expanduser().resolve()
+    moments = _load_json(moments_path)
+    if moments.get("kind") != _MOMENTS_KIND or moments.get("schema_version") != _SCHEMA_VERSION:
+        raise ValueError("Only current schema-v4 GxE phenotype moments are supported.")
+    if moments.get("feature_convention") != prepared.payload.get("feature_convention"):
+        raise ValueError("Reference and phenotype feature conventions disagree.")
     if moments.get("score_definition") != (
         "feature_transpose_residualized_y_over_sqrt_residual_rank"
     ):
-        raise ValueError("Phenotype moments use an unsupported marginal-score scale.")
-
-    expected_reference_hash = moments.get("reference_manifest_sha256")
-    if not _is_sha256(expected_reference_hash):
-        raise ValueError("Phenotype moments do not bind the exact GxE reference manifest.")
-    ref_cache_hash = prepared.feature_cache_sha256
-    moments_cache_hash = moments.get("feature_cache_sha256")
-    if moments_cache_hash is not None and not _is_sha256(moments_cache_hash):
-        raise ValueError("Phenotype moments contain an invalid feature-cache SHA-256 binding.")
-    moments_cache = moments.get("feature_cache")
-    verified_moments_cache_hash = None
-    moments_cache_snapshot: _InputSnapshot | None = None
-    if moments_cache is not None:
-        if (
-            not isinstance(moments_cache, dict)
-            or not isinstance(moments_cache.get("path"), str)
-            or not moments_cache["path"]
-            or not _is_sha256(moments_cache.get("sha256"))
-        ):
-            raise ValueError("Phenotype moments have an invalid feature-cache binding.")
-        moments_cache_path = _resolve_path(mom_path, moments_cache["path"]).resolve()
-        verified_moments_cache_hash = str(moments_cache["sha256"])
-        moments_cache_snapshot = snapshots.capture(moments_cache_path)
-        if moments_cache_snapshot.sha256 != verified_moments_cache_hash:
-            raise ValueError("Phenotype-moment feature cache failed its SHA-256 check.")
-        if ref_cache_hash is not None and verified_moments_cache_hash != ref_cache_hash:
-            raise ValueError("Phenotype moments and reference point to different feature caches.")
-        if verified_moments_cache_hash not in validated_cache_hashes:
-            _, arrays = _load_feature_cache_bundle(
-                moments_cache_snapshot.snapshot_path
-            )
-            arrays.clear()
-            validated_cache_hashes.add(verified_moments_cache_hash)
-        if (
-            moments_cache_hash is not None
-            and moments_cache_hash != verified_moments_cache_hash
-        ):
-            raise ValueError("Phenotype moments contain inconsistent feature-cache hashes.")
-    if population_transfer and prepared.manifest_sha256 != expected_reference_hash:
-        raise ValueError(
-            "Population phenotype moments must bind the exact reference manifest."
-        )
-    if not population_transfer and prepared.manifest_sha256 != expected_reference_hash:
-        if (
-            ref_cache_hash is None
-            or verified_moments_cache_hash is None
-            or verified_moments_cache_hash != ref_cache_hash
-        ):
-            raise ValueError(
-                "Phenotype moments were generated for a different GxE reference/feature definition."
-            )
-    elif moments_cache_hash is not None and moments_cache_hash != ref_cache_hash:
-        raise ValueError("Phenotype moments and reference declare different feature caches.")
-
-    declared_score_files = moments.get("files")
-    if not isinstance(declared_score_files, dict) or not {"gwas", "gwis"}.issubset(
-        declared_score_files
+        raise ValueError("Phenotype moments use an unsupported score definition.")
+    reference_mode = moments.get("reference_mode", _MATCHED_REFERENCE_MODE)
+    if reference_mode not in {_MATCHED_REFERENCE_MODE, _POPULATION_REFERENCE_MODE}:
+        raise ValueError(f"Unsupported phenotype reference_mode={reference_mode!r}.")
+    population_transfer = reference_mode == _POPULATION_REFERENCE_MODE
+    study_n = moments.get("n_samples")
+    study_rank = moments.get("residual_rank")
+    if (
+        isinstance(study_n, bool)
+        or not isinstance(study_n, int)
+        or isinstance(study_rank, bool)
+        or not isinstance(study_rank, int)
+        or study_n <= 0
+        or study_rank <= 0
+        or study_rank >= study_n
     ):
-        raise ValueError("Phenotype moments must declare the exact GWAS and GWIS score artifacts.")
-    supplied_score_paths = (
-        Path(phenotype_input.gwas_scores).expanduser().resolve(),
-        Path(phenotype_input.gwis_scores).expanduser().resolve(),
+        raise ValueError("Phenotype sample size and residual rank are inconsistent.")
+    if not population_transfer and (
+        study_n != prepared.payload["n_samples"]
+        or study_rank != prepared.residual_rank
+    ):
+        raise ValueError("Matched-cohort phenotype size/rank disagree with the reference.")
+    if population_transfer:
+        fixed_rank = moments.get("fixed_effect_rank_excluding_intercept")
+        if (
+            isinstance(fixed_rank, bool)
+            or not isinstance(fixed_rank, int)
+            or fixed_rank < 0
+            or study_rank != study_n - fixed_rank - 1
+        ):
+            raise ValueError("Population phenotype fixed-effect rank is inconsistent.")
+        if prepared.population_same_individual_products is None:
+            raise ValueError("Reference lacks population trace-transfer moments.")
+
+    files = moments.get("files")
+    if not isinstance(files, Mapping) or set(files) != {"gwas", "gwis"}:
+        raise ValueError("Phenotype moments files must contain exactly gwas and gwis.")
+    supplied = {
+        "gwas": Path(phenotype_input.gwas_scores).expanduser().resolve(),
+        "gwis": Path(phenotype_input.gwis_scores).expanduser().resolve(),
+    }
+    for key, path in supplied.items():
+        if not path.is_file():
+            raise FileNotFoundError(path)
+    score_x, d_nxe_x = _load_score_table(
+        supplied["gwas"],
+        prepared,
+        label="GWAS",
+        n_samples=study_n,
+        residual_rank=study_rank,
+        population_transfer=population_transfer,
     )
-    score_snapshots: dict[str, _InputSnapshot] = {}
-    for label, supplied in zip(("gwas", "gwis"), supplied_score_paths):
-        declared = _resolve_path(mom_path, str(declared_score_files[label])).resolve()
-        if supplied != declared:
-            raise ValueError(
-                f"Supplied {label.upper()} file {supplied} is not the phenotype-bound artifact {declared}."
-            )
-        score_hashes = moments.get("score_sha256")
-        if not isinstance(score_hashes, dict) or label not in score_hashes:
-            raise ValueError("Phenotype moments do not cryptographically bind both score artifacts.")
-        expected_hash = score_hashes[label]
-        if not _is_sha256(expected_hash):
-            raise ValueError(f"Phenotype moments contain an invalid {label.upper()} SHA-256.")
-        score_snapshot = snapshots.capture(supplied)
-        if score_snapshot.sha256 != str(expected_hash):
-            raise ValueError(f"{label.upper()} score file SHA-256 does not match phenotype moments.")
-        score_snapshots[label] = score_snapshot
+    score_w, d_nxe_w = _load_score_table(
+        supplied["gwis"],
+        prepared,
+        label="GWIS",
+        n_samples=study_n,
+        residual_rank=study_rank,
+        population_transfer=population_transfer,
+    )
 
-    score_arrays: list[np.ndarray] = []
-    for label, score_key, path in zip(
-        ("GWAS", "GWIS"), ("gwas", "gwis"), supplied_score_paths
-    ):
-        table = _read_table(score_snapshots[score_key].snapshot_path)
-        required = ["CHR", "SNP", "BP", "A1", "A2", "SCORE", "SCORE_MODE"]
-        if prepared.schema_version >= 3:
-            canonical_score_columns = [
-                "CHR",
-                "SNP",
-                "BP",
-                "A1",
-                "A2",
-                "N",
-                "DF",
-                "SCORE_MODE",
-                "SCORE",
-            ]
-            observed_score_columns = table.columns.astype(str).tolist()
-            if (
-                observed_score_columns != canonical_score_columns
-                or len(set(observed_score_columns)) != len(observed_score_columns)
-            ):
-                raise ValueError(
-                    f"{label} score file must contain exactly the canonical ordered columns "
-                    f"{canonical_score_columns}; observed {observed_score_columns}."
-                )
-        missing = [column for column in required if column not in table.columns]
-        if missing:
-            raise ValueError(f"{label} score file {path} is missing columns {missing}.")
-        if len(table) != prepared.n_variants:
+    genetic_nxe: np.ndarray | None = None
+    deleted_genetic_nxe: np.ndarray | None = None
+    trace_nxe: float | None = None
+    trace_nxe_sq: float | None = None
+    if population_transfer:
+        assert d_nxe_x is not None and d_nxe_w is not None
+        genetic_nxe = _study_population_design_moments(
+            moments, prepared.annotation_names
+        )
+        if prepared.block_values is None:
+            raise RuntimeError("Prepared GxE reference has no inference blocks.")
+        reduced_full, deleted_genetic_nxe = _posthoc_population_design_moments(
+            prepared.annotations,
+            d_nxe_x,
+            d_nxe_w,
+            study_rank,
+            prepared.block_values,
+            prepared.block_labels,
+        )
+        if not np.allclose(
+            reduced_full, genetic_nxe, rtol=5.0e-10, atol=1.0e-8
+        ):
             raise ValueError(
-                f"{label} score file has {len(table)} rows; expected {prepared.n_variants}."
+                "Population per-SNP DNXE rows disagree with full design traces."
             )
-        for column in ("CHR", "SNP", "BP", "A1", "A2"):
-            if not np.array_equal(
-                table[column].astype(str).to_numpy(),
-                prepared.variant_axis[column],
-            ):
-                raise ValueError(
-                    f"{label} score file is not aligned to the reference ({column} mismatch)."
-                )
-        modes = table["SCORE_MODE"].astype("string").str.lower()
-        mode_values = set(modes.dropna().astype(str))
-        if modes.isna().any() or not bool((modes == "marginal_cross_product").all()):
-            raise ValueError(
-                f"{label} uses unsupported SCORE_MODE={sorted(mode_values)}. "
-                "Conditional PLINK interaction statistics are not GENIE marginal scores."
-            )
-        n_values = (
-            pd.to_numeric(table["N"], errors="raise").to_numpy(dtype=np.float64)
-            if "N" in table
-            else None
-        )
-        df_values = (
-            pd.to_numeric(table["DF"], errors="raise").to_numpy(dtype=np.float64)
-            if "DF" in table
-            else None
-        )
-        if n_values is None or df_values is None:
-            raise ValueError(f"{label} score file must contain N and DF columns.")
-        expected_n = float(study_n if population_transfer else ref["n_samples"])
-        expected_df = float(
-            study_residual_rank if population_transfer else prepared.residual_rank
-        )
-        if not np.all(n_values == expected_n):
-            raise ValueError(f"{label} score file N does not match the phenotype sample count.")
-        if not np.all(df_values == expected_df):
-            raise ValueError(f"{label} score file DF does not match the phenotype residual rank.")
-        score_arrays.append(table["SCORE"].to_numpy(dtype=np.float64))
+        trace_nxe = float(moments.get("trace_nxe"))
+        trace_nxe_sq = float(moments.get("trace_nxe_sq"))
+        if not np.isfinite(trace_nxe) or not np.isfinite(trace_nxe_sq):
+            raise ValueError("Population phenotype NxE traces must be finite.")
 
     equations, deleted_equations = _equations_from_prepared_scores(
         prepared,
-        score_arrays[0],
-        score_arrays[1],
-        q_nxe=float(moments["q_nxe"]),
-        q_residual=float(moments["q_residual"]),
+        score_x,
+        score_w,
+        q_nxe=float(moments.get("q_nxe")),
+        q_residual=float(moments.get("q_residual")),
         reference_mode=str(reference_mode),
-        study_n_samples=int(study_n),
-        study_residual_rank=int(study_residual_rank),
-        genetic_nxe_traces=study_genetic_nxe,
-        jackknife_genetic_nxe_traces=study_deleted_genetic_nxe,
-        trace_nxe=(float(moments["trace_nxe"]) if population_transfer else None),
-        trace_nxe_sq=(
-            float(moments["trace_nxe_sq"]) if population_transfer else None
-        ),
+        study_n_samples=study_n,
+        study_residual_rank=study_rank,
+        genetic_nxe_traces=genetic_nxe,
+        jackknife_genetic_nxe_traces=deleted_genetic_nxe,
+        trace_nxe=trace_nxe,
+        trace_nxe_sq=trace_nxe_sq,
     )
     fit = solve_normal_equations(
         equations,
@@ -2848,172 +1691,138 @@ def _fit_prepared_from_input_snapshots(
         if not np.isfinite(residual_fraction) or not (
             0.0 < residual_fraction <= 1.0 + 1.0e-8
         ):
-            raise ValueError("Invalid phenotype_residual_variance_fraction in phenotype moments.")
-        fit = replace(fit, phenotype_residual_variance_fraction=residual_fraction)
-
-    if deleted_equations:
-        replicate_array = np.asarray(
-            [
-                solve_normal_equations(
-                    deleted,
-                    allow_ill_conditioned=allow_ill_conditioned,
-                    max_condition=max_condition,
-                ).proportions
-                for deleted in deleted_equations
-            ],
-            dtype=np.float64,
+            raise ValueError("Invalid phenotype_residual_variance_fraction.")
+        fit = replace(
+            fit, phenotype_residual_variance_fraction=residual_fraction
         )
-        nblock = len(deleted_equations)
-        center = replicate_array.mean(axis=0)
-        se = np.sqrt(
+    replicate_fits = [
+        solve_normal_equations(
+            deleted,
+            allow_ill_conditioned=allow_ill_conditioned,
+            max_condition=max_condition,
+        )
+        for deleted in deleted_equations
+    ]
+    coefficient_replicates = np.asarray(
+        [replicate.coefficients for replicate in replicate_fits], dtype=np.float64
+    )
+    proportion_replicates = np.asarray(
+        [replicate.proportions for replicate in replicate_fits], dtype=np.float64
+    )
+    nblock = len(deleted_equations)
+    def jackknife_se(replicates: np.ndarray) -> np.ndarray:
+        center = replicates.mean(axis=0)
+        return np.sqrt(
             (nblock - 1.0)
             / nblock
-            * np.sum((replicate_array - center) ** 2, axis=0)
+            * np.sum((replicates - center) ** 2, axis=0)
         )
-        fit = replace(
-            fit,
-            standard_errors=se,
-            jackknife_estimates=replicate_array,
-            jackknife_block_labels=prepared.block_labels,
-        )
-    feature_cache_provenance = prepared.feature_cache_provenance
-    if (
-        prepared.feature_cache_sha256 is None
-        and moments_cache_snapshot is not None
-    ):
-        feature_cache_provenance = _snapshot_provenance(moments_cache_snapshot)
     fit = replace(
         fit,
-        consumed_input_provenance=GxEConsumedInputProvenance(
-            reference_manifest=prepared.reference_provenance,
-            feature_cache=feature_cache_provenance,
-            phenotype_moments=_snapshot_provenance(moments_snapshot),
-            gwas=_snapshot_provenance(score_snapshots["gwas"]),
-            gwis=_snapshot_provenance(score_snapshots["gwis"]),
-        ),
+        coefficient_standard_errors=jackknife_se(coefficient_replicates),
+        proportion_standard_errors=jackknife_se(proportion_replicates),
+        jackknife_coefficients=coefficient_replicates,
+        jackknife_proportions=proportion_replicates,
+        jackknife_block_labels=prepared.block_labels,
     )
     return fit, equations
+
+
+def fit_from_files(
+    reference_manifest: str | Path,
+    phenotype_moments: str | Path,
+    gwas_scores: str | Path,
+    gwis_scores: str | Path,
+    *,
+    njack: str | int = "chr",
+    allow_ill_conditioned: bool = False,
+    max_condition: float = 1.0e12,
+) -> tuple[GxEFitResult, GxENormalEquations]:
+    """Fit one phenotype from fixed per-SNP reference and trait summaries."""
+    return fit_many_from_files(
+        reference_manifest,
+        {
+            "phenotype": GxEPhenotypeInput(
+                phenotype_moments=phenotype_moments,
+                gwas_scores=gwas_scores,
+                gwis_scores=gwis_scores,
+            )
+        },
+        njack=njack,
+        allow_ill_conditioned=allow_ill_conditioned,
+        max_condition=max_condition,
+    )["phenotype"]
 
 
 def fit_many_from_files(
     reference_manifest: str | Path,
     phenotype_inputs: Mapping[str, GxEPhenotypeInput],
     *,
+    njack: str | int = "chr",
     allow_ill_conditioned: bool = False,
     max_condition: float = 1.0e12,
-    scratch_dir: str | Path | None = None,
 ) -> dict[str, tuple[GxEFitResult, GxENormalEquations]]:
-    """Fit several phenotype triplets after validating their reference once."""
+    """Fit several phenotype triplets after preparing one reference once."""
     if not isinstance(phenotype_inputs, Mapping) or not phenotype_inputs:
         raise ValueError("phenotype_inputs must be a non-empty mapping.")
     normalized: list[tuple[str, GxEPhenotypeInput]] = []
+    triplets: set[tuple[Path, Path, Path]] = set()
     for raw_name, phenotype_input in phenotype_inputs.items():
         name = str(raw_name)
         if not _FIT_BATCH_NAME.fullmatch(name):
             raise ValueError(f"Invalid GxE batch phenotype name {name!r}.")
         if not isinstance(phenotype_input, GxEPhenotypeInput):
             raise TypeError(
-                "Every phenotype_inputs value must be a GxEPhenotypeInput instance."
+                "Every phenotype_inputs value must be a GxEPhenotypeInput."
             )
+        triplet = (
+            Path(phenotype_input.phenotype_moments).expanduser().resolve(),
+            Path(phenotype_input.gwas_scores).expanduser().resolve(),
+            Path(phenotype_input.gwis_scores).expanduser().resolve(),
+        )
+        if triplet in triplets:
+            raise ValueError("GxE phenotype input triplets must be unique.")
+        triplets.add(triplet)
         normalized.append((name, phenotype_input))
-    if len({name for name, _ in normalized}) != len(normalized):
-        raise ValueError("GxE batch phenotype names must be unique.")
-    normalized_triplets = [
-        (
-            Path(value.phenotype_moments).expanduser().resolve(),
-            Path(value.gwas_scores).expanduser().resolve(),
-            Path(value.gwis_scores).expanduser().resolve(),
-        )
-        for _, value in normalized
-    ]
-    if len(set(normalized_triplets)) != len(normalized_triplets):
-        raise ValueError("GxE batch phenotype input triplets must be unique.")
-    if scratch_dir is None:
-        scratch_dir = (
-            Path(normalized[0][1].phenotype_moments).expanduser().resolve().parent
-        )
-
-    results: dict[str, tuple[GxEFitResult, GxENormalEquations]] = {}
-    with _InputSnapshotStore(scratch_dir) as snapshots:
-        # Capture every explicitly supplied file before parsing any manifest.
-        # Manifest-declared cache/reference artifacts are subsequently captured
-        # before their own validation and parsing, as in the singleton path.
-        snapshots.capture(reference_manifest)
-        for _, phenotype_input in normalized:
-            snapshots.capture(phenotype_input.phenotype_moments)
-            snapshots.capture(phenotype_input.gwas_scores)
-            snapshots.capture(phenotype_input.gwis_scores)
-
-        first_name, first_input = normalized[0]
-        prepared_out: list[_PreparedGxEReference] = []
-        results[first_name] = _fit_from_input_snapshots(
-            reference_manifest,
-            first_input.phenotype_moments,
-            first_input.gwas_scores,
-            first_input.gwis_scores,
-            snapshots=snapshots,
+    prepared = _validate_reference_for_fit(reference_manifest, njack)
+    return {
+        name: _fit_prepared_trait(
+            prepared,
+            phenotype_input,
             allow_ill_conditioned=allow_ill_conditioned,
             max_condition=max_condition,
-            prepared_out=prepared_out,
         )
-        if len(prepared_out) != 1:
-            raise RuntimeError("GxE reference preparation did not produce one reusable state.")
-        prepared = prepared_out[0]
-        validated_cache_hashes = (
-            {prepared.feature_cache_sha256}
-            if prepared.feature_cache_sha256 is not None
-            else set()
-        )
-        for name, phenotype_input in normalized[1:]:
-            results[name] = _fit_prepared_from_input_snapshots(
-                prepared,
-                phenotype_input,
-                snapshots=snapshots,
-                validated_cache_hashes=validated_cache_hashes,
-                allow_ill_conditioned=allow_ill_conditioned,
-                max_condition=max_condition,
-            )
-    return results
+        for name, phenotype_input in normalized
+    }
 
 
 def load_fit_batch_manifest(
     manifest_path: str | Path,
-    *,
-    scratch_dir: str | Path | None = None,
 ) -> tuple[Path, tuple[GxEFitBatchEntry, ...]]:
-    """Snapshot and validate a strict no-overwrite batch-fit manifest."""
+    """Validate a no-overwrite batch-fit manifest."""
     path = Path(manifest_path).expanduser().resolve()
-    if scratch_dir is None:
-        scratch_dir = path.parent
-    with _InputSnapshotStore(scratch_dir) as snapshots:
-        snapshot = snapshots.capture(path)
-        payload = _load_json(snapshot.snapshot_path)
+    payload = _load_json(path)
     expected_root = {"kind", "schema_version", "reference", "traits"}
     if set(payload) != expected_root:
         raise ValueError(
             f"GxE fit-batch manifest must contain exactly {sorted(expected_root)}."
         )
-    if payload.get("kind") != _FIT_BATCH_KIND:
-        raise ValueError("Unsupported GxE fit-batch manifest kind.")
     version = payload.get("schema_version")
     if (
-        isinstance(version, bool)
-        or not isinstance(version, int)
+        payload.get("kind") != _FIT_BATCH_KIND
+        or isinstance(version, bool)
         or version != _FIT_BATCH_SCHEMA_VERSION
     ):
         raise ValueError("Unsupported GxE fit-batch manifest schema_version.")
     reference_value = payload.get("reference")
     if not isinstance(reference_value, str) or not reference_value:
-        raise ValueError("GxE fit-batch reference must be a non-empty path string.")
+        raise ValueError("GxE fit-batch reference must be a non-empty path.")
     traits = payload.get("traits")
     if not isinstance(traits, list) or not traits:
         raise ValueError("GxE fit-batch traits must be a non-empty list.")
 
     def resolve(value: str) -> Path:
-        candidate = Path(value).expanduser()
-        if not candidate.is_absolute():
-            candidate = path.parent / candidate
-        return candidate.resolve()
+        return _resolve_path(path, value)
 
     entries: list[GxEFitBatchEntry] = []
     names: set[str] = set()
@@ -3025,56 +1834,57 @@ def load_fit_batch_manifest(
             raise ValueError(
                 f"GxE fit-batch trait {index} must contain exactly {sorted(expected_trait)}."
             )
-        if any(not isinstance(record[key], str) or not record[key] for key in expected_trait):
-            raise ValueError(f"GxE fit-batch trait {index} values must be non-empty strings.")
+        if any(
+            not isinstance(record[key], str) or not record[key]
+            for key in expected_trait
+        ):
+            raise ValueError(
+                f"GxE fit-batch trait {index} values must be non-empty strings."
+            )
         name = record["name"]
         if not _FIT_BATCH_NAME.fullmatch(name) or name in names:
-            raise ValueError(f"Invalid or duplicate GxE fit-batch trait name {name!r}.")
+            raise ValueError(f"Invalid or duplicate GxE trait name {name!r}.")
         output = resolve(record["out"])
-        if output in outputs:
-            raise ValueError(f"Duplicate GxE fit-batch output prefix {output}.")
-        input_triplet = (
+        triplet = (
             resolve(record["moments"]),
             resolve(record["gwas"]),
             resolve(record["gwis"]),
         )
-        if input_triplet in inputs:
-            raise ValueError("Duplicate GxE fit-batch phenotype input triplet.")
+        if output in outputs:
+            raise ValueError(f"Duplicate GxE batch output prefix {output}.")
+        if triplet in inputs:
+            raise ValueError("Duplicate GxE batch phenotype input triplet.")
         names.add(name)
         outputs.add(output)
-        inputs.add(input_triplet)
+        inputs.add(triplet)
         entries.append(
             GxEFitBatchEntry(
                 name=name,
                 phenotype_input=GxEPhenotypeInput(
-                    phenotype_moments=input_triplet[0],
-                    gwas_scores=input_triplet[1],
-                    gwis_scores=input_triplet[2],
+                    phenotype_moments=triplet[0],
+                    gwas_scores=triplet[1],
+                    gwis_scores=triplet[2],
                 ),
                 output_prefix=output,
             )
         )
-    output_parents = {entry.output_prefix.parent for entry in entries}
-    if len(output_parents) != 1:
-        raise ValueError(
-            "All GxE fit-batch output prefixes must share one parent directory."
-        )
-    planned_outputs = sorted(
-        path
+    if len({entry.output_prefix.parent for entry in entries}) != 1:
+        raise ValueError("All GxE batch outputs must share one parent directory.")
+    planned = [
+        output
         for entry in entries
-        for path in (
+        for output in (
             Path(str(entry.output_prefix) + ".gxe.results.tsv"),
             Path(str(entry.output_prefix) + ".gxe.fit.json"),
         )
-    )
-    existing = [path for path in planned_outputs if os.path.lexists(path)]
+    ]
+    existing = [output for output in planned if os.path.lexists(output)]
     if existing:
         raise FileExistsError(
-            "Refusing to overwrite existing GxE fit-batch output(s): "
-            + ", ".join(str(path) for path in existing)
+            "Refusing to overwrite existing GxE batch output(s): "
+            + ", ".join(str(output) for output in existing)
         )
     return resolve(reference_value), tuple(entries)
-
 
 def write_fit(
     prefix: str | Path,
@@ -3083,9 +1893,6 @@ def write_fit(
     *,
     overwrite: bool = False,
 ) -> tuple[Path, Path]:
-    consumed_input_provenance = _serialize_consumed_input_provenance(
-        fit.consumed_input_provenance
-    )
     prefix = Path(prefix)
     table_path = Path(str(prefix) + ".gxe.results.tsv")
     json_path = Path(str(prefix) + ".gxe.fit.json")
@@ -3102,12 +1909,17 @@ def write_fit(
         {
             "component": fit.component_names,
             "coefficient": fit.coefficients,
+            "coefficient_se": (
+                fit.coefficient_standard_errors
+                if fit.coefficient_standard_errors is not None
+                else np.full(len(fit.component_names), np.nan)
+            ),
             "kernel_trace": equations.traces,
             "variance_contribution": fit.contributions,
             "proportion": fit.proportions,
             "proportion_se": (
-                fit.standard_errors
-                if fit.standard_errors is not None
+                fit.proportion_standard_errors
+                if fit.proportion_standard_errors is not None
                 else np.full(len(fit.component_names), np.nan)
             ),
             "original_scale_proportion": (
@@ -3117,7 +1929,12 @@ def write_fit(
             ),
         }
     )
-    frame["z"] = frame["proportion"] / frame["proportion_se"]
+    frame["coefficient_z"] = frame["coefficient"] / frame["coefficient_se"]
+    frame["coefficient_p"] = [
+        math.erfc(abs(value) / math.sqrt(2.0)) if np.isfinite(value) else np.nan
+        for value in frame["coefficient_z"]
+    ]
+    frame["proportion_z"] = frame["proportion"] / frame["proportion_se"]
     frame["original_scale_se"] = (
         frame["proportion_se"] * fit.phenotype_residual_variance_fraction
         if fit.phenotype_residual_variance_fraction is not None
@@ -3138,7 +1955,6 @@ def write_fit(
     payload: dict[str, Any] = {
         "kind": "summit.gxe.fit",
         "schema_version": _SCHEMA_VERSION,
-        "consumed_input_provenance": consumed_input_provenance,
         "component_names": list(fit.component_names),
         "rank": fit.rank,
         "condition_number": fit.condition_number,
@@ -3169,17 +1985,26 @@ def write_fit(
             else None
         ),
         "jackknife_block_labels": list(fit.jackknife_block_labels),
+        "jackknife_method": _POSTHOC_JACKKNIFE_METHOD,
         "phenotype_residual_variance_fraction": fit.phenotype_residual_variance_fraction,
     }
-    if fit.standard_errors is not None:
-        payload["standard_errors"] = fit.standard_errors.tolist()
-        payload["original_scale_standard_errors"] = (
-            (fit.standard_errors * fit.phenotype_residual_variance_fraction).tolist()
+    if fit.coefficient_standard_errors is not None:
+        payload["coefficient_standard_errors"] = (
+            fit.coefficient_standard_errors.tolist()
+        )
+    if fit.proportion_standard_errors is not None:
+        payload["proportion_standard_errors"] = (
+            fit.proportion_standard_errors.tolist()
+        )
+        payload["original_scale_proportion_standard_errors"] = (
+            (fit.proportion_standard_errors * fit.phenotype_residual_variance_fraction).tolist()
             if fit.phenotype_residual_variance_fraction is not None
             else None
         )
-    if fit.jackknife_estimates is not None:
-        payload["jackknife_estimates"] = fit.jackknife_estimates.tolist()
+    if fit.jackknife_coefficients is not None:
+        payload["jackknife_coefficients"] = fit.jackknife_coefficients.tolist()
+    if fit.jackknife_proportions is not None:
+        payload["jackknife_proportions"] = fit.jackknife_proportions.tolist()
     def json_finite(value: Any) -> Any:
         if isinstance(value, (float, np.floating)):
             return float(value) if np.isfinite(value) else None
@@ -3218,11 +2043,6 @@ def write_fit(
         with os.fdopen(json_fd, "wt", encoding="utf-8") as handle:
             json.dump(payload, handle, indent=2, sort_keys=True, allow_nan=False)
             handle.write("\n")
-        expected_hashes = {
-            table_path: _sha256_file(staged_table),
-            json_path: _sha256_file(staged_json),
-        }
-
         def verify_published() -> None:
             for path, device, inode in published:
                 try:
@@ -3234,10 +2054,6 @@ def write_fit(
                 if observed.st_dev != device or observed.st_ino != inode:
                     raise RuntimeError(
                         f"A published GxE fit output was concurrently replaced: {path}."
-                    )
-                if _sha256_file(path) != expected_hashes[path]:
-                    raise RuntimeError(
-                        f"A published GxE fit output was modified in place: {path}."
                     )
 
         try:
@@ -3332,15 +2148,6 @@ def write_fits(
             staged_pairs.append(
                 (name, staged_table, staged_manifest, table, manifest)
             )
-        expected_hashes = {
-            final: _sha256_file(staged)
-            for _, staged_table, staged_manifest, table, manifest in staged_pairs
-            for staged, final in (
-                (staged_table, table),
-                (staged_manifest, manifest),
-            )
-        }
-
         def verify_published() -> None:
             for path, device, inode in published:
                 try:
@@ -3352,10 +2159,6 @@ def write_fits(
                 if observed.st_dev != device or observed.st_ino != inode:
                     raise RuntimeError(
                         f"A published GxE batch output was concurrently replaced: {path}."
-                    )
-                if _sha256_file(path) != expected_hashes[path]:
-                    raise RuntimeError(
-                        f"A published GxE batch output was modified in place: {path}."
                     )
 
         publication_order = [

@@ -9,7 +9,7 @@ import numpy as np
 import pytest
 
 from summit.context.reference_v1 import load_contextual_reference_v1
-from summit.context.spec import canonical_json, canonical_sha256
+from summit.context.spec import canonical_json
 from summit.ldscore import generalized_gxe_reference_v1 as reference_module
 from summit.ldscore.generalized_gxe_reference_v1 import (
     GENERALIZED_GXE_VARIANT_REFERENCE_V1_SUFFIX,
@@ -69,7 +69,7 @@ def test_atomic_reference_roundtrip_owns_immutable_arrays(
     )
     assert target.name.endswith(GENERALIZED_GXE_VARIANT_REFERENCE_V1_SUFFIX)
     loaded = load_generalized_gxe_variant_reference_v1(target)
-    assert loaded.manifest_sha256 == artifact.manifest_sha256
+    assert loaded.manifest == artifact.manifest
     assert loaded.manifest["kind"] == (
         "summit.generalized_gxe.variant_ldscore_reference"
     )
@@ -154,17 +154,18 @@ def test_loader_rejects_sample_probe_kind_before_arrays(tmp_path: Path) -> None:
     np.savez_compressed(
         target,
         manifest_json=np.asarray(canonical_json(wrong_manifest)),
-        manifest_sha256=np.asarray(canonical_sha256(wrong_manifest)),
         **{
             name: getattr(artifact, name)
             for name in artifact.manifest["numeric_arrays"]
         },
     )
-    with pytest.raises(ValueError, match="sample-probe"):
+    with pytest.raises(ValueError, match="other artifact families"):
         load_generalized_gxe_variant_reference_v1(target)
 
 
-def test_array_corruption_and_missing_member_are_rejected(tmp_path: Path) -> None:
+def test_numeric_values_are_checked_structurally_and_missing_member_is_rejected(
+    tmp_path: Path,
+) -> None:
     artifact = _artifact()
     arrays = {
         name: np.asarray(getattr(artifact, name)).copy()
@@ -177,11 +178,22 @@ def test_array_corruption_and_missing_member_are_rejected(tmp_path: Path) -> Non
     np.savez_compressed(
         corrupt,
         manifest_json=np.asarray(canonical_json(artifact.manifest)),
-        manifest_sha256=np.asarray(artifact.manifest_sha256),
         **arrays,
     )
-    with pytest.raises(ValueError, match="metadata/hash mismatch"):
-        load_generalized_gxe_variant_reference_v1(corrupt)
+    loaded = load_generalized_gxe_variant_reference_v1(corrupt)
+    np.testing.assert_array_equal(loaded.same_person, arrays["same_person"])
+
+    unexpected = tmp_path / (
+        "unexpected" + GENERALIZED_GXE_VARIANT_REFERENCE_V1_SUFFIX
+    )
+    np.savez_compressed(
+        unexpected,
+        manifest_json=np.asarray(canonical_json(artifact.manifest)),
+        obsolete_member=np.asarray(1),
+        **arrays,
+    )
+    with pytest.raises(ValueError, match="container key mismatch"):
+        load_generalized_gxe_variant_reference_v1(unexpected)
 
     arrays.pop("same_person")
     missing = tmp_path / (
@@ -190,30 +202,10 @@ def test_array_corruption_and_missing_member_are_rejected(tmp_path: Path) -> Non
     np.savez_compressed(
         missing,
         manifest_json=np.asarray(canonical_json(artifact.manifest)),
-        manifest_sha256=np.asarray(artifact.manifest_sha256),
         **arrays,
     )
     with pytest.raises(ValueError, match="key mismatch|missing required member"):
         load_generalized_gxe_variant_reference_v1(missing)
-
-
-def test_failed_temporary_validation_never_publishes_manifest(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    target = tmp_path / (
-        "partial" + GENERALIZED_GXE_VARIANT_REFERENCE_V1_SUFFIX
-    )
-
-    def fail(*_args, **_kwargs) -> None:
-        raise RuntimeError("injected temporary validation failure")
-
-    monkeypatch.setattr(
-        reference_module, "_validate_stable_npz_writer_temp", fail
-    )
-    with pytest.raises(RuntimeError, match="injected"):
-        write_generalized_gxe_variant_reference_v1(_artifact(), target)
-    assert not target.exists()
-    assert not tuple(tmp_path.glob(f".{target.name}.*"))
 
 
 def test_atomic_writer_is_no_replace(tmp_path: Path) -> None:

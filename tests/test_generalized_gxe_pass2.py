@@ -27,6 +27,9 @@ from summit.ldscore.generalized_gxe_pass2 import (
     ProtectedTNOperator,
     build_pair_product_plan,
 )
+from summit.ldscore.generalized_gxe_reference_v1 import (
+    reduce_generalized_gxe_reference_for_inference,
+)
 from summit.ldscore.generalized_gxe_variant import (
     GeneralizedGxEPlanInputs,
     GlobalVariantProbeSpec,
@@ -87,7 +90,6 @@ def _plan(
     basis: np.ndarray,
     annotations: np.ndarray,
     probe_count: int,
-    block_count: int,
     *,
     variant_width: int,
     rhs_probe_width: int,
@@ -103,7 +105,6 @@ def _plan(
             num_basis=basis.shape[1],
             num_annotations=annotations.shape[1],
             num_probes=probe_count,
-            num_jackknife_blocks=block_count,
             memory_limit_bytes=512 * 1024**2,
             genotype_format="bed",
             threads=threads,
@@ -121,7 +122,6 @@ def _run_two_pass(
     fixed: np.ndarray,
     annotations: np.ndarray,
     spec: GlobalVariantProbeSpec,
-    blocks: np.ndarray,
     variant_width: int,
     rhs_probe_width: int,
     rhs_policy: str = "tiled",
@@ -134,7 +134,6 @@ def _run_two_pass(
         basis,
         annotations,
         spec.probe_count,
-        int(blocks[-1]) + 1,
         variant_width=variant_width,
         rhs_probe_width=rhs_probe_width,
         rhs_policy=rhs_policy,
@@ -164,7 +163,6 @@ def _run_two_pass(
         fixed_effect_basis=fixed,
         annotations=annotations,
         annotation_names=names,
-        block_ids=blocks,
         work_plan=plan,
         tn_operator=NumpyTNOperator(threads=threads),
         probe_tile_width=(
@@ -192,7 +190,6 @@ def test_pair_product_plan_derives_one_two_four_from_orientations_only() -> None
         for source_pair, terms in enumerate(row):
             assert len(terms) == expected[target_pair, source_pair]
             assert len(set(term.to_tuple() for term in terms)) == len(terms)
-    assert len(plan.digest) == 64
 
 
 @pytest.mark.parametrize(
@@ -214,15 +211,11 @@ def test_complete_pass2_outputs_match_every_dense_oracle_layer(
         fixed=fixed,
         annotations=annotations,
         spec=spec,
-        blocks=blocks,
         variant_width=4,
         rhs_probe_width=3,
     )
     expected, expected_sources, _cross = randomized_two_pass_ldscores(
         genotype, basis, fixed, annotations, probes
-    )
-    _expected_deleted, expected_blocks, expected_masses = (
-        frozen_ldscore_delete_block(expected, annotations, blocks)
     )
     np.testing.assert_allclose(
         observed.directional_ldscores,
@@ -245,18 +238,20 @@ def test_complete_pass2_outputs_match_every_dense_oracle_layer(
     np.testing.assert_allclose(
         observed.genetic_gram, expected.gram, rtol=1.2e-13, atol=1.2e-13
     )
-    np.testing.assert_allclose(
-        observed.block_directed_numerator,
-        expected_blocks,
-        rtol=1.0e-13,
-        atol=1.0e-13,
+    block_directed, block_masses, error = (
+        reduce_generalized_gxe_reference_for_inference(
+            directional_ldscores=observed.directional_ldscores,
+            annotations=annotations,
+            variant_block_ids=blocks,
+            block_labels=("left", "middle", "right"),
+        )
     )
-    np.testing.assert_allclose(
-        observed.block_annotation_mass,
-        expected_masses,
-        rtol=3.0e-15,
-        atol=3.0e-15,
+    _deleted, expected_blocks, expected_masses = frozen_ldscore_delete_block(
+        expected, annotations, blocks
     )
+    np.testing.assert_allclose(block_directed, expected_blocks, rtol=1.0e-13, atol=1.0e-13)
+    np.testing.assert_allclose(block_masses, expected_masses, rtol=3.0e-15, atol=3.0e-15)
+    assert error < 1.0e-12
     np.testing.assert_allclose(
         pass1.contextual_sources,
         expected_sources,
@@ -264,21 +259,18 @@ def test_complete_pass2_outputs_match_every_dense_oracle_layer(
         atol=5.0e-14,
     )
     assert observed.same_person is pass1.same_person
-    assert observed.source_panel_sha256 == pass1.contextual_source_sha256
-    assert observed.same_person_reused_for_all_deletions is True
     observed.ledger.validate_clean_completion()
     assert observed.ledger.observed_reference_genotype_passes == 2
     assert observed.ledger.observed_retained_variant_visits == 2 * genotype.shape[1]
     assert operator.observed_passes == 2
     assert operator.observed_variant_visits == 2 * genotype.shape[1]
-    assert observed.telemetry["checks"]["retained_ldscore_rows_changed"] is False
 
 
 @pytest.mark.parametrize(
     ("variant_width", "rhs_probe_width", "rhs_policy"),
     ((2, 1, "tiled"), (4, 4, "tiled"), (10, 23, "precompute")),
 )
-def test_pass2_is_invariant_to_crossed_blocks_and_rhs_plans(
+def test_pass2_is_invariant_to_rhs_plans(
     variant_width: int,
     rhs_probe_width: int,
     rhs_policy: str,
@@ -286,14 +278,12 @@ def test_pass2_is_invariant_to_crossed_blocks_and_rhs_plans(
     genotype, basis, fixed, annotations, spec, probes = _fixture(
         3, 2, seed=5402
     )
-    blocks = np.asarray([0, 0, 0, 1, 1, 1, 1, 2, 2, 2])
     observed, _pass1, operator, plan = _run_two_pass(
         genotype=genotype,
         basis=basis,
         fixed=fixed,
         annotations=annotations,
         spec=spec,
-        blocks=blocks,
         variant_width=variant_width,
         rhs_probe_width=rhs_probe_width,
         rhs_policy=rhs_policy,
@@ -301,20 +291,11 @@ def test_pass2_is_invariant_to_crossed_blocks_and_rhs_plans(
     expected, _sources, _cross = randomized_two_pass_ldscores(
         genotype, basis, fixed, annotations, probes
     )
-    _expected_deleted, expected_blocks, _masses = frozen_ldscore_delete_block(
-        expected, annotations, blocks
-    )
     np.testing.assert_allclose(
         observed.directional_ldscores,
         expected.directional_ldscores,
         rtol=1.0e-13,
         atol=1.0e-13,
-    )
-    np.testing.assert_allclose(
-        observed.block_directed_numerator,
-        expected_blocks,
-        rtol=1.2e-13,
-        atol=1.2e-13,
     )
     assert operator.observed_variant_visits == 2 * genotype.shape[1]
     assert observed.telemetry["backend"]["rhs_precomputed"] is (
@@ -334,7 +315,6 @@ def test_q2_fixture_matches_mature_xw_orientation_multiplicities() -> None:
         fixed=fixed,
         annotations=annotations,
         spec=spec,
-        blocks=blocks,
         variant_width=6,
         rhs_probe_width=5,
     )
@@ -354,41 +334,37 @@ def test_q2_fixture_matches_mature_xw_orientation_multiplicities() -> None:
     )
 
 
-def test_j_changes_only_compact_reductions_not_scores_passes_or_tn_calls() -> None:
+def test_j_changes_only_posthoc_reductions_without_rescanning() -> None:
     genotype, basis, fixed, annotations, spec, _probes = _fixture(
         3, 2, seed=5602
     )
-    outputs = []
+    result, _pass1, operator, _plan_value = _run_two_pass(
+        genotype=genotype,
+        basis=basis,
+        fixed=fixed,
+        annotations=annotations,
+        spec=spec,
+        variant_width=4,
+        rhs_probe_width=3,
+    )
+    reductions = []
     for block_count in (2, 5):
-        result, _pass1, operator, _plan_value = _run_two_pass(
-            genotype=genotype,
-            basis=basis,
-            fixed=fixed,
+        blocks = _block_ids(genotype.shape[1], block_count)
+        block_directed, block_masses, error = reduce_generalized_gxe_reference_for_inference(
+            directional_ldscores=result.directional_ldscores,
             annotations=annotations,
-            spec=spec,
-            blocks=_block_ids(genotype.shape[1], block_count),
-            variant_width=4,
-            rhs_probe_width=3,
+            variant_block_ids=blocks,
+            block_labels=tuple(f"block_{index}" for index in range(block_count)),
         )
-        outputs.append((result, operator))
-    np.testing.assert_array_equal(
-        outputs[0][0].directional_ldscores,
-        outputs[1][0].directional_ldscores,
-    )
-    np.testing.assert_allclose(
-        outputs[0][0].directed_numerator,
-        outputs[1][0].directed_numerator,
-        rtol=0.0,
-        atol=2.0e-14,
-    )
-    assert outputs[0][0].telemetry["target_tn"]["calls"] == outputs[1][0].telemetry[
-        "target_tn"
-    ]["calls"]
-    for result, operator in outputs:
-        assert result.ledger.observed_reference_genotype_passes == 2
-        assert operator.observed_variant_visits == 2 * genotype.shape[1]
-    assert outputs[0][0].block_directed_numerator.shape[0] == 2
-    assert outputs[1][0].block_directed_numerator.shape[0] == 5
+        reductions.append((block_directed, block_masses))
+        assert error < 1.0e-12
+    assert reductions[0][0].shape[0] == 2
+    assert reductions[1][0].shape[0] == 5
+    for block_directed, block_masses in reductions:
+        np.testing.assert_allclose(np.sum(block_directed, axis=0), result.directed_numerator)
+        np.testing.assert_allclose(np.sum(block_masses, axis=0), np.sum(annotations, axis=0))
+    assert result.ledger.observed_reference_genotype_passes == 2
+    assert operator.observed_variant_visits == 2 * genotype.shape[1]
 
 
 def test_frozen_row_deletion_keeps_full_scores_sources_and_same_person() -> None:
@@ -402,16 +378,24 @@ def test_frozen_row_deletion_keeps_full_scores_sources_and_same_person() -> None
         fixed=fixed,
         annotations=annotations,
         spec=spec,
-        blocks=blocks,
         variant_width=4,
         rhs_probe_width=4,
     )
     expected, _sources, _cross = randomized_two_pass_ldscores(
         genotype, basis, fixed, annotations, probes
     )
-    fixed_deleted, _block_num, _block_mass = frozen_ldscore_delete_block(
+    fixed_deleted, expected_block_num, expected_block_mass = frozen_ldscore_delete_block(
         expected, annotations, blocks
     )
+    block_num, block_mass, error = reduce_generalized_gxe_reference_for_inference(
+        directional_ldscores=observed.directional_ldscores,
+        annotations=annotations,
+        variant_block_ids=blocks,
+        block_labels=("left", "middle", "right"),
+    )
+    np.testing.assert_allclose(block_num, expected_block_num, rtol=1.0e-13, atol=1.0e-13)
+    np.testing.assert_allclose(block_mass, expected_block_mass, rtol=3.0e-15, atol=3.0e-15)
+    assert error < 1.0e-12
     exact_deleted = exact_recomputed_delete_block_grams(
         genotype, basis, fixed, annotations, blocks
     )
@@ -424,16 +408,7 @@ def test_frozen_row_deletion_keeps_full_scores_sources_and_same_person() -> None
             rtol=1.0e-13,
             atol=1.0e-13,
         )
-    assert array_hash(pass1.contextual_sources) == observed.source_panel_sha256
     assert observed.same_person is pass1.same_person
-    assert observed.telemetry["checks"]["target_rows_recomputed_for_deletions"] is False
-
-
-def array_hash(value: np.ndarray) -> str:
-    from summit.context.spec import array_sha256
-
-    return array_sha256(value)
-
 
 def test_signed_per_snp_scores_are_not_clamped() -> None:
     genotype, basis, fixed, annotations, spec, _probes = _fixture(
@@ -445,7 +420,6 @@ def test_signed_per_snp_scores_are_not_clamped() -> None:
         fixed=fixed,
         annotations=annotations,
         spec=spec,
-        blocks=_block_ids(genotype.shape[1], 2),
         variant_width=5,
         rhs_probe_width=3,
     )
@@ -469,7 +443,6 @@ def test_row_complete_sink_round_trips_without_driving_aggregates() -> None:
         fixed=fixed,
         annotations=annotations,
         spec=spec,
-        blocks=_block_ids(genotype.shape[1], 3),
         variant_width=4,
         rhs_probe_width=3,
         row_complete_sink=sink,
@@ -483,17 +456,15 @@ def test_row_complete_sink_round_trips_without_driving_aggregates() -> None:
     np.testing.assert_array_equal(roundtrip, observed.directional_ldscores)
 
 
-def test_pass2_rejects_source_basis_annotation_and_block_identity_changes() -> None:
+def test_pass2_rejects_structural_annotation_mismatches() -> None:
     genotype, basis, fixed, annotations, spec, _probes = _fixture(
         3, 2, seed=6002
     )
-    blocks = _block_ids(genotype.shape[1], 2)
     plan = _plan(
         genotype,
         basis,
         annotations,
         spec.probe_count,
-        2,
         variant_width=4,
         rhs_probe_width=3,
         rhs_policy="tiled",
@@ -512,23 +483,20 @@ def test_pass2_rejects_source_basis_annotation_and_block_identity_changes() -> N
         nn_operator=NumpyNNOperator(),
         native_probe_module=False,
     ).execute()
-    changed_basis = basis.copy()
-    changed_basis[0, 0] += 1.0
-    with pytest.raises(RuntimeError, match="basis identity"):
+    with pytest.raises(ValueError, match="basis must have shape"):
         GeneralizedGxEPass2Executor(
             pass1_result=pass1,
             genotype_operator=operator,
-            basis=changed_basis,
+            basis=basis[:-1],
             fixed_effect_basis=fixed,
             annotations=annotations,
             annotation_names=names,
-            block_ids=blocks,
             work_plan=plan,
             tn_operator=NumpyTNOperator(),
         )
     changed_annotations = annotations.copy()
     changed_annotations[0, 0] += 0.1
-    with pytest.raises(RuntimeError, match="annotation identity"):
+    with pytest.raises(RuntimeError, match="annotation masses changed"):
         GeneralizedGxEPass2Executor(
             pass1_result=pass1,
             genotype_operator=operator,
@@ -536,54 +504,10 @@ def test_pass2_rejects_source_basis_annotation_and_block_identity_changes() -> N
             fixed_effect_basis=fixed,
             annotations=changed_annotations,
             annotation_names=names,
-            block_ids=blocks,
-            work_plan=plan,
-            tn_operator=NumpyTNOperator(),
-        )
-    pass1.contextual_sources.setflags(write=True)
-    pass1.contextual_sources[0, 0, 0, 0] += 1.0
-    pass1.contextual_sources.setflags(write=False)
-    with pytest.raises(RuntimeError, match="source hash"):
-        GeneralizedGxEPass2Executor(
-            pass1_result=pass1,
-            genotype_operator=operator,
-            basis=basis,
-            fixed_effect_basis=fixed,
-            annotations=annotations,
-            annotation_names=names,
-            block_ids=blocks,
-            work_plan=plan,
-            tn_operator=NumpyTNOperator(),
-        )
-    interleaved = np.asarray([0, 0, 1, 1, 0, 0, 1, 1, 1, 1])
-    # Rebuild clean sources because the previous mutation is deliberately fatal.
-    clean_operator = ArraySequentialGenotypeOperator(genotype)
-    clean_pass1 = GeneralizedGxEPass1Executor(
-        genotype_operator=clean_operator,
-        basis=basis,
-        fixed_effect_basis=fixed,
-        annotations=annotations,
-        annotation_names=names,
-        annotation_masses=np.sum(annotations, axis=0),
-        probe_spec=spec,
-        work_plan=plan,
-        nn_operator=NumpyNNOperator(),
-        native_probe_module=False,
-    ).execute()
-    with pytest.raises(ValueError, match="contiguous"):
-        GeneralizedGxEPass2Executor(
-            pass1_result=clean_pass1,
-            genotype_operator=clean_operator,
-            basis=basis,
-            fixed_effect_basis=fixed,
-            annotations=annotations,
-            annotation_names=names,
-            block_ids=interleaved,
             work_plan=plan,
             tn_operator=NumpyTNOperator(),
         )
     assert operator.observed_passes == 1
-    assert clean_operator.observed_passes == 1
 
 
 def test_planner_never_admits_rhs_narrower_than_q_squared() -> None:
@@ -597,7 +521,6 @@ def test_planner_never_admits_rhs_narrower_than_q_squared() -> None:
             num_basis=3,
             num_annotations=1,
             num_probes=spec.probe_count,
-            num_jackknife_blocks=2,
             memory_limit_bytes=512 * 1024**2,
             genotype_format="bed",
             preferred_rhs_tile_columns=1,
@@ -627,14 +550,12 @@ def test_protected_native_tn_matches_dense_backend_and_uses_two_passes() -> None
     genotype, basis, fixed, annotations, spec, probes = _fixture(
         3, 2, seed=6202
     )
-    blocks = _block_ids(genotype.shape[1], 3)
     threads = _configured_native_threads(gxeldcore)
     plan = _plan(
         genotype,
         basis,
         annotations,
         spec.probe_count,
-        3,
         variant_width=4,
         rhs_probe_width=4,
         rhs_policy="tiled",
@@ -663,7 +584,6 @@ def test_protected_native_tn_matches_dense_backend_and_uses_two_passes() -> None
         fixed_effect_basis=fixed,
         annotations=annotations,
         annotation_names=names,
-        block_ids=blocks,
         work_plan=plan,
         tn_operator=ProtectedTNOperator(threads=threads, native_module=gxeldcore),
         probe_tile_width=4,
@@ -716,7 +636,7 @@ def test_native_pass2_one_and_multiple_threads_match_in_fresh_processes(
         threads = int(sys.argv[1])
         output = sys.argv[2]
         rng = np.random.default_rng(77125)
-        n, m, q, k, b, j = 31, 29, 2, 2, 17, 3
+        n, m, q, k, b = 31, 29, 2, 2, 17
         genotype = np.asfortranarray(rng.normal(size=(n, m)))
         environment = rng.normal(size=n)
         basis = np.asfortranarray(np.column_stack([np.ones(n), environment]))
@@ -725,11 +645,10 @@ def test_native_pass2_one_and_multiple_threads_match_in_fresh_processes(
         )
         fixed = np.asfortranarray(fixed)
         annotations = rng.uniform(0.2, 1.1, size=(m, k))
-        blocks = np.repeat(np.arange(j), np.diff(np.linspace(0, m, j+1, dtype=int)))
         spec = GlobalVariantProbeSpec(77125, 3, b)
         plan = plan_generalized_gxe_variant_work(GeneralizedGxEPlanInputs(
             num_samples=n, num_variants=m, num_basis=q, num_annotations=k,
-            num_probes=b, num_jackknife_blocks=j,
+            num_probes=b,
             memory_limit_bytes=512 * 1024**2, genotype_format="bed",
             threads=threads, preferred_variant_block_width=8,
             preferred_rhs_tile_columns=q*q*5, rhs_policy="tiled",
@@ -747,7 +666,7 @@ def test_native_pass2_one_and_multiple_threads_match_in_fresh_processes(
         result = GeneralizedGxEPass2Executor(
             pass1_result=pass1, genotype_operator=operator, basis=basis,
             fixed_effect_basis=fixed, annotations=annotations,
-            annotation_names=names, block_ids=blocks, work_plan=plan,
+            annotation_names=names, work_plan=plan,
             tn_operator=ProtectedTNOperator(threads=threads, native_module=gxeldcore),
             probe_tile_width=5,
         ).execute()

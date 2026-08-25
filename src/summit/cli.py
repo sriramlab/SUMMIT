@@ -153,7 +153,6 @@ _GXE_BATCH_REFERENCE_OPTIONS = frozenset(
         "--gxe-kernel-mode",
         "--gxe-genotype-scale",
         "--gxe-native-backend",
-        "--gxe-fp64-layout",
         "--gxe-native-workspace-gib",
         "--gxe-native-target-panel-columns",
         "--nvecs",
@@ -215,7 +214,6 @@ from .ldscore.gxe_multi import (
     generate_multi_environment_references,
     safe_environment_suffix,
 )
-from .ldscore.gxe_merge import merge_reference_shards
 from .ldscore.gxe_score import (
     score_phenotype_from_reference,
     score_phenotypes_from_reference,
@@ -378,8 +376,8 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         type=str,
         help=(
-            "Fit multiple hash-bound phenotype triplets against one GxE reference "
-            "using a strict summit.gxe.fit_batch JSON manifest."
+            "Fit multiple phenotype summary triplets against one GxE reference "
+            "using a summit.gxe.fit_batch JSON manifest."
         ),
     )
     parser.add_argument("--gxe-gwas", default=None, type=str,
@@ -392,16 +390,6 @@ def build_parser() -> argparse.ArgumentParser:
                         help="Maximum allowed GxE normal-equation condition number.")
     parser.add_argument("--allow-ill-conditioned-gxe", action="store_true", default=False,
                         help="Solve a poorly identified GxE system by least squares after reporting diagnostics.")
-    # Legacy cache/shard attributes remain as inert internal defaults so old
-    # orchestration code fails at argument parsing instead of accidentally
-    # entering a disk-backed construction path.  There are intentionally no
-    # command-line options that can set them.
-    parser.set_defaults(
-        _gxe_build_cache=False,
-        _gxe_feature_cache=None,
-        _gxe_reference_shard=False,
-        _gxe_merge_shards=None,
-    )
     parser.add_argument(
         "--_gxe-probe-offset",
         dest="_gxe_probe_offset",
@@ -414,8 +402,8 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         type=str,
         help=(
-            "Score quantitative traits in --gxe-pheno against this sealed "
-            "schema-v3 GxE reference. The default matched-cohort mode supports "
+            "Score quantitative traits in --gxe-pheno against this GxE "
+            "reference. The default matched-cohort mode supports "
             "wide one-pass scoring; --gxe-population-reference scores one "
             "trait-specific cohort."
         ),
@@ -755,13 +743,11 @@ def build_parser() -> argparse.ArgumentParser:
                         help="Comma-separated missing tokens for GxE environment, covariate, and phenotype inputs.")
     parser.add_argument(
         "--gxe-kernel-mode",
-        default="standardized",
-        choices=[
-            "standardized_projected", "raw_projected", "standardized", "genie"
-        ],
+        default="standardized_projected",
+        choices=["standardized_projected", "raw_projected"],
         help=("Feature convention: post-projection per-variant standardization "
-              "(standardized_projected, default legacy alias: standardized) or "
-              "naturally scaled projected columns (raw_projected, legacy alias: genie)."),
+              "(standardized_projected, default) or naturally scaled projected "
+              "columns (raw_projected)."),
     )
     parser.add_argument("--gxe-genotype-scale", default=None, choices=["hwe", "sample"],
                         help=("Pre-projection genotype scaling. Defaults to sample scaling for standardized "
@@ -773,15 +759,6 @@ def build_parser() -> argparse.ArgumentParser:
               "probes. The same native path handles one or multiple "
               "environments; Python "
               "remains the default oracle."),
-    )
-    parser.add_argument(
-        "--gxe-fp64-layout",
-        default="current",
-        choices=["current"],
-        help=(
-            "Production full-precision GEMM layout. Only the established "
-            "current column-major source and target path is accepted."
-        ),
     )
     parser.add_argument(
         "--gxe-native-workspace-gib", default=16.0, type=float,
@@ -1046,24 +1023,11 @@ def _make_gxe_generator(args, log, verbose_on, low_level, *, env_col=None, out_p
         missing_values=tuple(x.strip() for x in args.gxe_missing_values.split(",") if x.strip()),
         overwrite=args.gxe_overwrite,
         probe_offset=args._gxe_probe_offset,
-        feature_cache_path=args._gxe_feature_cache,
-        shard_mode=args._gxe_reference_shard,
         native_backend=args.gxe_native_backend if native_backend is None else native_backend,
         native_workspace_gib=args.gxe_native_workspace_gib,
         native_target_panel_columns=args.gxe_native_target_panel_columns,
         env_col=env_col,
     )
-
-
-def _dispatch_gxe_cache(args, log, verbose_on, low_level):
-    log._log(">>> GxE mode: build phenotype-independent projected-feature cache")
-    generator = _make_gxe_generator(args, log, verbose_on, low_level)
-    cache_path = Path(args.out + ".gxe.cache.npz")
-    try:
-        generator.write_feature_cache(cache_path, overwrite=args.gxe_overwrite)
-        log._log(f"[gxe:cache] wrote {cache_path}.")
-    finally:
-        generator.close()
 
 
 def _dispatch_gxe_score(args, log):
@@ -1114,17 +1078,6 @@ def _dispatch_gxe_score(args, log):
         log._log(
             f"[gxe:score] {trait}: {bundle.gwas}, {bundle.gwis}, {bundle.moments}."
         )
-
-
-def _dispatch_gxe_merge(args, log):
-    manifest = merge_reference_shards(
-        args._gxe_merge_shards,
-        feature_cache_path=args._gxe_feature_cache,
-        output_prefix=args.out,
-    )
-    log._log(
-        f"[gxe:merge] merged {len(args._gxe_merge_shards)} disjoint shard(s) into {manifest}."
-    )
 
 
 def _replace_long_option(tokens, option, value):
@@ -1514,9 +1467,7 @@ def _validate_explicit_openmp_placement_request(args):
         and getattr(args, "gxe_env_cols", None) is not None
         and type(getattr(args, "num_threads", None)) is int
         and args.num_threads > 0
-        and not bool(getattr(args, "_gxe_build_cache", False))
         and getattr(args, "gxe_score_reference", None) is None
-        and getattr(args, "_gxe_merge_shards", None) is None
         and getattr(args, "gxe_fit", None) is None
         and getattr(args, "gxe_fit_batch", None) is None
     )
@@ -1929,7 +1880,7 @@ def _dispatch_gxe_multi_reference(args, log, verbose_on, low_level):
                 args._gxe_multi_batch_manifest or f"{args.out}.gxe.multi.json"
             ),
             requested_backend=args.gxe_native_backend,
-            full_precision_layout=args.gxe_fp64_layout,
+            full_precision_layout="current",
         )
         log._log(
             f"[gxe:multi] wrote {len(estimators)} independent references and "
@@ -1961,8 +1912,6 @@ def _dispatch_ldscore(args, log, verbose_on, low_level):
         unified_native_reference = bool(
             args.gxe_native_backend == "direct"
             and args.gxe_pheno is None
-            and args._gxe_feature_cache is None
-            and not args._gxe_reference_shard
         )
         gwe = _make_gxe_generator(
             args,
@@ -1980,7 +1929,7 @@ def _dispatch_ldscore(args, log, verbose_on, low_level):
                         or f"{args.out}.gxe.multi.json"
                     ),
                     requested_backend="direct",
-                    full_precision_layout=args.gxe_fp64_layout,
+                    full_precision_layout="current",
                 )
                 log._log(
                     "[gxe:native] wrote the single-environment reference "
@@ -2113,14 +2062,13 @@ def _dispatch_h2(args, log):
 def _dispatch_gxe_fit_batch(args, log):
     reference, entries = load_gxe_fit_batch_manifest(
         args.gxe_fit_batch,
-        scratch_dir=Path(args.out).expanduser().resolve().parent,
     )
     fitted = fit_many_gxe_from_files(
         reference,
         {entry.name: entry.phenotype_input for entry in entries},
+        njack=args.njack,
         allow_ill_conditioned=args.allow_ill_conditioned_gxe,
         max_condition=args.gxe_max_condition,
-        scratch_dir=Path(args.out).expanduser().resolve().parent,
     )
     outputs = write_gxe_fits(
         {
@@ -2163,9 +2111,9 @@ def _dispatch_gxe_fit(args, log):
         args.gxe_moments,
         args.gxe_gwas,
         args.gwis,
+        njack=args.njack,
         allow_ill_conditioned=args.allow_ill_conditioned_gxe,
         max_condition=args.gxe_max_condition,
-        scratch_dir=Path(args.out).expanduser().resolve().parent,
     )
     table_path, json_path = write_gxe_fit(args.out, fit, equations, overwrite=args.gxe_overwrite)
     log._log(
@@ -2854,21 +2802,16 @@ def main():
     else:
         _check_outdir(args.out, create=True, log=log)
 
-    gxe_cache_mode = bool(args._gxe_build_cache)
     gxe_score_mode = args.gxe_score_reference is not None
-    gxe_merge_mode = args._gxe_merge_shards is not None
     gxe_fit_mode = args.gxe_fit is not None
     gxe_fit_batch_mode = args.gxe_fit_batch is not None
     gxe_trace_mode = bool(
         args.geno is not None
         and args.env is not None
-        and not gxe_cache_mode
         and not gxe_score_mode
     )
     gxe_workflow_mode = bool(
-        gxe_cache_mode
-        or gxe_score_mode
-        or gxe_merge_mode
+        gxe_score_mode
         or gxe_fit_mode
         or gxe_fit_batch_mode
         or gxe_trace_mode
@@ -2877,58 +2820,25 @@ def main():
     special_gxe_modes = sum(
         int(value)
         for value in (
-            gxe_cache_mode,
             gxe_score_mode,
-            gxe_merge_mode,
             gxe_fit_mode,
             gxe_fit_batch_mode,
         )
     )
     if special_gxe_modes > 1:
         log._log(
-            "!!! Choose only one public GxE workflow mode; internal cache/merge "
-            "deployment modes cannot be combined with another mode. !!!"
+            "!!! Choose only one public GxE workflow mode. !!!"
         )
         raise SystemExit(1)
-    if gxe_cache_mode:
-        if args.geno is None or args.env is None:
-            log._log("!!! Internal GxE cache construction requires --geno and --env. !!!")
-            raise SystemExit(1)
-        if args.gxe_pheno is not None or args._gxe_feature_cache is not None or args._gxe_reference_shard:
-            log._log(
-                "!!! Internal GxE cache construction is phenotype-free and cannot be "
-                "combined with phenotype, cache-reuse, or shard inputs. !!!"
-            )
-            raise SystemExit(1)
     if gxe_score_mode:
         if args.geno is None or args.env is None or args.gxe_pheno is None:
             log._log(
                 "!!! --gxe-score-reference requires --geno, --env, and --gxe-pheno. !!!"
             )
             raise SystemExit(1)
-        if args._gxe_feature_cache is not None or args._gxe_reference_shard:
-            log._log(
-                "!!! --gxe-score-reference consumes a sealed reference, not a feature cache or shard. !!!"
-            )
-            raise SystemExit(1)
         if args.gxe_overwrite:
             log._log(
                 "!!! Wide GxE scoring is transactionally no-overwrite; choose a fresh --out prefix. !!!"
-            )
-            raise SystemExit(1)
-    if gxe_merge_mode:
-        if args._gxe_feature_cache is None:
-            log._log("!!! Internal GxE shard merging requires its feature cache. !!!")
-            raise SystemExit(1)
-        if any(value is not None for value in (args.geno, args.env, args.covar, args.annot, args.gxe_pheno)):
-            log._log(
-                "!!! Internal GxE shard merging is standalone and cannot be combined "
-                "with genotype/design inputs. !!!"
-            )
-            raise SystemExit(1)
-        if args.gxe_overwrite:
-            log._log(
-                "!!! GxE shard merging is transactionally no-overwrite; choose a fresh --out prefix. !!!"
             )
             raise SystemExit(1)
     if gxe_fit_batch_mode:
@@ -2957,12 +2867,6 @@ def main():
                 "!!! Batch GxE fitting is transactionally no-overwrite; choose fresh output prefixes. !!!"
             )
             raise SystemExit(1)
-    if args._gxe_reference_shard and not gxe_trace_mode:
-        log._log("!!! Internal GxE shard mode requires --geno/--env trace generation. !!!")
-        raise SystemExit(1)
-    if args._gxe_reference_shard and args._gxe_feature_cache is None:
-        log._log("!!! Internal GxE shard mode requires its feature cache. !!!")
-        raise SystemExit(1)
     if args.gxe_pheno_cols is not None and not gxe_score_mode:
         log._log("!!! --gxe-pheno-cols is valid only with --gxe-score-reference. !!!")
         raise SystemExit(1)
@@ -2983,11 +2887,6 @@ def main():
                 "against each generated reference afterward. !!!"
             )
             raise SystemExit(1)
-        if args._gxe_feature_cache is not None or args._gxe_reference_shard:
-            log._log(
-                "!!! Multi-environment construction does not consume feature caches or shards. !!!"
-            )
-            raise SystemExit(1)
         if args.gxe_overwrite:
             log._log(
                 "!!! Multi-environment batches are transactionally no-overwrite; "
@@ -2996,16 +2895,9 @@ def main():
             raise SystemExit(1)
 
     if gxe_workflow_mode and not args.gxe_overwrite:
-        if gxe_cache_mode:
-            suffixes = [".gxe.cache.npz"]
-        elif gxe_score_mode:
+        if gxe_score_mode:
             # Trait-specific triplets are reserved transactionally by the scorer.
             suffixes = []
-        elif gxe_merge_mode:
-            suffixes = [
-                ".gxx.ldscore.gz", ".gxe.ldscore.gz", ".exg.ldscore.gz", ".gee.ldscore.gz",
-                ".gxe.diag.tsv.gz", ".gxe.ref.json",
-            ]
         elif gxe_fit_batch_mode:
             # Trait-specific pairs are reserved transactionally by write_fits().
             suffixes = []
@@ -3013,12 +2905,9 @@ def main():
             suffixes = [
                 ".gxx.ldscore.gz", ".gxe.ldscore.gz", ".exg.ldscore.gz", ".gee.ldscore.gz",
             ]
-            if args._gxe_reference_shard:
-                suffixes.extend([".gxe.shard.identity.json", ".gxe.shard.json"])
-            else:
-                suffixes.extend([".gxe.diag.tsv.gz", ".gxe.ref.json"])
-                if args.gxe_pheno is not None:
-                    suffixes.extend([".gxe.gwas.tsv.gz", ".gxe.gwis.tsv.gz", ".gxe.moments.json"])
+            suffixes.extend([".gxe.diag.tsv.gz", ".gxe.ref.json"])
+            if args.gxe_pheno is not None:
+                suffixes.extend([".gxe.gwas.tsv.gz", ".gxe.gwis.tsv.gz", ".gxe.moments.json"])
         else:
             suffixes = [".gxe.results.tsv", ".gxe.fit.json"]
         existing = [args.out + suffix for suffix in suffixes if Path(args.out + suffix).exists()]
@@ -3058,7 +2947,7 @@ def main():
 
     _log_cli_args(parser, args, log)
 
-    if args.env is not None and args.geno is None and not gxe_merge_mode:
+    if args.env is not None and args.geno is None:
         log._log("!!! --env requires --geno. !!!")
         raise SystemExit(1)
     if args.gxe_pheno is not None and (args.geno is None or args.env is None):
@@ -3072,13 +2961,11 @@ def main():
         )
 
     base_genotype_mode = bool(
-        args.geno is not None and not gxe_cache_mode and not gxe_score_mode
+        args.geno is not None and not gxe_score_mode
     )
     modes = (
         int(base_genotype_mode)
-        + int(gxe_cache_mode)
         + int(gxe_score_mode)
-        + int(gxe_merge_mode)
         + int(args.h2 is not None)
         + int(args.rg is not None)
         + int(build_manifest_mode)
@@ -3087,17 +2974,13 @@ def main():
     )
     if modes != 1:
         log._log(
-            "!!! Select exactly one primary SUMMIT mode (genotype LD, GxE cache/score/merge/fit, "
+            "!!! Select exactly one primary SUMMIT mode (genotype LD, GxE score/fit, "
             "h2, rg, or manifest building). !!!"
         )
         raise SystemExit(1)
 
-    if gxe_cache_mode:
-        _dispatch_gxe_cache(args, log, verbose_on, low_level)
-    elif gxe_score_mode:
+    if gxe_score_mode:
         _dispatch_gxe_score(args, log)
-    elif gxe_merge_mode:
-        _dispatch_gxe_merge(args, log)
     elif gxe_fit_batch_mode:
         _dispatch_gxe_fit_batch(args, log)
     elif build_manifest_mode:

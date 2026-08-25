@@ -22,7 +22,6 @@ import numpy as np
 from summit.context.spec import (
     ContextComponentIndex,
     ContextPairIndex,
-    array_sha256,
 )
 from summit.ldscore.generalized_gxe_variant import (
     GeneralizedGxEWorkPlan,
@@ -462,10 +461,6 @@ class GeneralizedGxEPass1Result:
     ledger: TwoPassLedger
     genotype_scale_id: str
     genotype_operator_identity: int
-    contextual_source_sha256: str
-    basis_sha256: str
-    fixed_effect_basis_sha256: str
-    annotation_sha256: str
     maximum_projection_leakage: float
     maximum_relative_projection_leakage: float
     same_person_presymmetry_error: float
@@ -853,10 +848,6 @@ class GeneralizedGxEPass1Executor:
         phase_seconds["same_person"] = time.perf_counter() - same_started
 
         contextual = _readonly(contextual)
-        contextual_source_sha256 = array_sha256(contextual)
-        basis_sha256 = array_sha256(self._basis)
-        fixed_effect_basis_sha256 = array_sha256(self._fixed)
-        annotation_sha256 = array_sha256(self._annotations)
         masses = _readonly(np.array(self._masses, copy=True))
         phase_seconds["pass1_total"] = time.perf_counter() - started_total
         rss_exit = _peak_rss_bytes()
@@ -918,10 +909,6 @@ class GeneralizedGxEPass1Executor:
                     "target_scoring_started": False,
                     "contextual_sources_readonly": not contextual.flags.writeable,
                     "same_person_cross_tile_finalized": True,
-                    "contextual_source_sha256": contextual_source_sha256,
-                    "basis_sha256": basis_sha256,
-                    "fixed_effect_basis_sha256": fixed_effect_basis_sha256,
-                    "annotation_sha256": annotation_sha256,
                 },
             }
         )
@@ -939,10 +926,6 @@ class GeneralizedGxEPass1Executor:
             ledger=ledger,
             genotype_scale_id=self.genotype_operator.genotype_scale_id,
             genotype_operator_identity=id(self.genotype_operator),
-            contextual_source_sha256=contextual_source_sha256,
-            basis_sha256=basis_sha256,
-            fixed_effect_basis_sha256=fixed_effect_basis_sha256,
-            annotation_sha256=annotation_sha256,
             maximum_projection_leakage=maximum_absolute_leakage,
             maximum_relative_projection_leakage=maximum_relative_leakage,
             same_person_presymmetry_error=same_person_presymmetry_error,

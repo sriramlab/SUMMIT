@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import gc
 import gzip
-import hashlib
 import io
 import json
 import math
@@ -88,17 +87,6 @@ def _close_file_descriptors(descriptors: Sequence[int]) -> None:
             pass
 
 
-def _ndarray_sha256(value: np.ndarray) -> str:
-    array = np.ascontiguousarray(value)
-    digest = hashlib.sha256()
-    digest.update(str(array.dtype).encode("ascii"))
-    digest.update(b"\x1f")
-    digest.update(json.dumps(list(array.shape), separators=(",", ":")).encode("ascii"))
-    digest.update(b"\n")
-    digest.update(array.tobytes(order="C"))
-    return digest.hexdigest()
-
-
 def _non_blas_fp64_inner_product(left: np.ndarray, right: np.ndarray) -> float:
     """Use a compensated fixed-order diagnostic sum without entering BLAS."""
     left_array = np.asarray(left, dtype=np.float64)
@@ -111,7 +99,6 @@ def _non_blas_fp64_inner_product(left: np.ndarray, right: np.ndarray) -> float:
     return float(math.fsum(products))
 
 
-_BACKEND_PROVENANCE_SCHEMA_VERSION = 3
 _REFERENCE_FLOAT_FORMAT = "%.17g"
 _NATIVE_GEMM_INTEGRITY_CHECKS = 8
 _NATIVE_GEMM_CHECK_MINIMUM_FLOPS = 1_000_000_000
@@ -143,82 +130,6 @@ def _native_execution_workspace_bytes(native_workspace_gib: float) -> int:
     """Use the configured workspace as a ceiling, not an allocation target."""
     configured = int(float(native_workspace_gib) * (1024**3))
     return min(configured, _NATIVE_PREFERRED_CALL_WORKSPACE_BYTES)
-
-
-def _sha256_path(path: str | Path) -> str:
-    digest = hashlib.sha256()
-    with open(path, "rb") as handle:
-        for block in iter(lambda: handle.read(8 * 1024 * 1024), b""):
-            digest.update(block)
-    return digest.hexdigest()
-
-
-def _sha256_descriptor(descriptor: int) -> str:
-    digest = hashlib.sha256()
-    position = os.lseek(descriptor, 0, os.SEEK_CUR)
-    try:
-        os.lseek(descriptor, 0, os.SEEK_SET)
-        while True:
-            block = os.read(descriptor, 8 * 1024 * 1024)
-            if not block:
-                break
-            digest.update(block)
-    finally:
-        os.lseek(descriptor, position, os.SEEK_SET)
-    return digest.hexdigest()
-
-
-def _loaded_native_binary_record(native_module) -> tuple[int, dict]:
-    """Bind the extension's mapped inode to a stable descriptor and exact bytes."""
-    module_path = Path(native_module.__file__).resolve(strict=True)
-    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
-    if hasattr(os, "O_NOFOLLOW"):
-        flags |= os.O_NOFOLLOW
-    descriptor = os.open(module_path, flags)
-    try:
-        before = os.fstat(descriptor)
-        if not stat.S_ISREG(before.st_mode):
-            raise RuntimeError("The loaded GxE native extension is not a regular file.")
-        mapped = False
-        with open("/proc/self/maps", "r", encoding="utf-8") as handle:
-            for line in handle:
-                fields = line.split(None, 5)
-                if len(fields) < 5:
-                    continue
-                try:
-                    major_text, minor_text = fields[3].split(":", 1)
-                    device = os.makedev(int(major_text, 16), int(minor_text, 16))
-                    inode = int(fields[4])
-                except (ValueError, OSError):
-                    continue
-                if device == before.st_dev and inode == before.st_ino:
-                    mapped = True
-                    break
-        if not mapped:
-            raise RuntimeError(
-                "The GxE native extension pathname does not identify the inode loaded "
-                "into this process."
-            )
-        digest = _sha256_descriptor(descriptor)
-        after = os.fstat(descriptor)
-        identity = (
-            before.st_dev, before.st_ino, before.st_size,
-            before.st_mtime_ns, before.st_ctime_ns,
-        )
-        if identity != (
-            after.st_dev, after.st_ino, after.st_size,
-            after.st_mtime_ns, after.st_ctime_ns,
-        ):
-            raise RuntimeError("The loaded GxE native extension changed while hashing.")
-        return descriptor, {
-            "path": str(module_path),
-            "sha256": digest,
-            "bytes": int(before.st_size),
-            "identity": identity,
-        }
-    except Exception:
-        os.close(descriptor)
-        raise
 
 
 def _native_strict_feature_moment_verification_policy(
@@ -258,7 +169,7 @@ def _native_strict_feature_moment_verification_policy(
 
 
 def _validate_native_blas_runtime(build_info: Mapping) -> dict[str, str | int]:
-    """Validate either an isolated native BLAS or the legacy shared runtime."""
+    """Validate the selected isolated or process-shared native BLAS runtime."""
     records = []
     for raw in threadpool_info():
         if str(raw.get("user_api", "")).strip().lower() != "blas":
@@ -283,11 +194,6 @@ def _validate_native_blas_runtime(build_info: Mapping) -> dict[str, str | int]:
         private_backend = str(
             build_info.get("private_blas_backend", "")
         ).strip().lower()
-        if private_backend in {"", "none"}:
-            # Backward compatibility for accepted private-OpenBLAS artifacts
-            # created before the backend-generic provenance keys existed.
-            if execution_mode == "serialized_fixed_private_openblas":
-                private_backend = "openblas"
         expected_modes = {
             "openblas": "serialized_fixed_private_openblas",
             "upstream_blis": "serialized_fixed_private_blis",
@@ -295,15 +201,6 @@ def _validate_native_blas_runtime(build_info: Mapping) -> dict[str, str | int]:
         if execution_mode != expected_modes.get(private_backend):
             raise RuntimeError(
                 "The private GxE BLAS does not declare fixed serialized execution."
-            )
-        archive_sha256 = build_info.get("private_blas_archive_sha256")
-        if private_backend == "openblas" and not _is_canonical_sha256(
-            archive_sha256
-        ):
-            archive_sha256 = build_info.get("private_openblas_archive_sha256")
-        if not _is_canonical_sha256(archive_sha256):
-            raise RuntimeError(
-                "The private GxE BLAS lacks exact archive provenance."
             )
         runtime_config = str(build_info.get("blas_runtime_config", "")).split()
         if private_backend == "openblas":
@@ -344,20 +241,6 @@ def _validate_native_blas_runtime(build_info: Mapping) -> dict[str, str | int]:
             if re.fullmatch(r"\d+\.\d+(?:\.\d+)?", version) is None:
                 raise RuntimeError(
                     "The private GxE BLIS runtime lacks an exact version."
-                )
-            exact_blis_provenance = (
-                build_info.get("private_blas_source_tree_sha256"),
-                build_info.get("private_blas_header_sha256"),
-                build_info.get("private_blas_cblas_header_sha256"),
-            )
-            if not all(
-                _is_canonical_sha256(value) for value in exact_blis_provenance
-            ) or re.fullmatch(
-                r"[0-9a-f]{40}",
-                str(build_info.get("private_blas_source_commit", "")),
-            ) is None:
-                raise RuntimeError(
-                    "The private GxE BLIS runtime lacks exact source/header provenance."
                 )
             config_family = str(
                 build_info.get("private_blas_config_family", "")
@@ -511,94 +394,6 @@ def _validate_native_blas_runtime(build_info: Mapping) -> dict[str, str | int]:
     return record
 
 
-def _validate_backend_provenance(value: Mapping, *, expected_stage: str | None = None) -> None:
-    """Validate implementation provenance without making it scientific identity."""
-    if not isinstance(value, Mapping):
-        raise ValueError("GxE backend provenance must be a JSON object.")
-    required = {
-        "schema_version", "artifact_stage", "backend_name", "backend_version",
-        "source_commit", "source_tree_sha256", "native_binary_sha256", "compile_options",
-        "native_workspace_cap_bytes", "configured_target_panel_columns",
-        "actual_global_2b_source_columns", "actual_jackknife_2b_source_columns",
-        "actual_target_source_columns",
-    }
-    if set(value) != required:
-        raise ValueError("GxE backend provenance has unexpected or missing fields.")
-    if value.get("schema_version") != _BACKEND_PROVENANCE_SCHEMA_VERSION:
-        raise ValueError("Unsupported GxE backend-provenance schema.")
-    stage = value.get("artifact_stage")
-    if not isinstance(stage, str) or not stage or (
-        expected_stage is not None and stage != expected_stage
-    ):
-        raise ValueError("GxE backend provenance has an invalid artifact stage.")
-    for field in ("backend_name", "backend_version"):
-        if not isinstance(value.get(field), str) or not value[field]:
-            raise ValueError(f"GxE backend provenance field {field!r} is invalid.")
-    source_commit = value.get("source_commit")
-    if source_commit != "unknown" and not (
-        isinstance(source_commit, str)
-        and len(source_commit) == 40
-        and all(character in "0123456789abcdef" for character in source_commit)
-    ):
-        raise ValueError("GxE backend provenance source_commit is invalid.")
-    source_tree_sha256 = value.get("source_tree_sha256")
-    if source_tree_sha256 is not None and not _is_canonical_sha256(source_tree_sha256):
-        raise ValueError("GxE backend provenance source_tree_sha256 is invalid.")
-    native_hash = value.get("native_binary_sha256")
-    if native_hash is not None and not _is_canonical_sha256(native_hash):
-        raise ValueError("GxE backend provenance native binary SHA-256 is invalid.")
-    compile_options = value.get("compile_options")
-    if compile_options is not None and not isinstance(compile_options, Mapping):
-        raise ValueError("GxE backend provenance compile_options must be null or an object.")
-    integer_fields = (
-        "native_workspace_cap_bytes", "configured_target_panel_columns",
-        "actual_global_2b_source_columns", "actual_jackknife_2b_source_columns",
-        "actual_target_source_columns",
-    )
-    for field in integer_fields:
-        observed = value.get(field)
-        if isinstance(observed, bool) or not isinstance(observed, (int, np.integer)) or observed < 0:
-            raise ValueError(f"GxE backend provenance field {field!r} is invalid.")
-    global_width = int(value["actual_global_2b_source_columns"])
-    jackknife_width = int(value["actual_jackknife_2b_source_columns"])
-    target_width = int(value["actual_target_source_columns"])
-    if jackknife_width not in (0, global_width):
-        raise ValueError("GxE backend provenance has inconsistent global/block widths.")
-    if target_width != global_width:
-        raise ValueError("GxE backend provenance has an inconsistent target width.")
-    if value["backend_name"] == "gxeldcore_direct":
-        if (
-            source_commit == "unknown"
-            or source_tree_sha256 is None
-            or
-            native_hash is None
-            or compile_options is None
-            or int(value["native_workspace_cap_bytes"]) <= 0
-            or int(value["configured_target_panel_columns"]) <= 0
-        ):
-            raise ValueError("Direct GxE backend provenance is incomplete.")
-
-
-_FEATURE_CACHE_SCHEMA_VERSION = 2
-_FEATURE_CACHE_ARRAY_DTYPES = {
-    "variant_chr": "U",
-    "variant_snp": "U",
-    "variant_bp": np.dtype(np.int64),
-    "variant_a1": "U",
-    "variant_a2": "U",
-    "annotations": np.dtype(np.float64),
-    "jackknife_ids": np.dtype(np.int32),
-    "scale_x": np.dtype(np.float64),
-    "scale_w": np.dtype(np.float64),
-    "norm_x": np.dtype(np.float64),
-    "norm_w": np.dtype(np.float64),
-    "diag_nxe_x": np.dtype(np.float64),
-    "diag_nxe_w": np.dtype(np.float64),
-    "corr_xw": np.dtype(np.float64),
-    "nxe_qdq": np.dtype(np.float64),
-    "nxe_trace_terms": np.dtype(np.float64),
-}
-
 _GXE_RESERVED_ARTIFACT_COLUMNS = frozenset(
     {
         "CHR", "SNP", "BP", "A1", "A2", "NORM_X", "NORM_W",
@@ -635,103 +430,6 @@ def _validate_gxe_annotation_names(names: Sequence[str]) -> list[str]:
     return canonical
 
 
-def _is_canonical_sha256(value) -> bool:
-    if (
-        not isinstance(value, str)
-        or len(value) != 64
-        or value != value.lower()
-        or value == "0" * 64
-    ):
-        return False
-    try:
-        int(value, 16)
-    except ValueError:
-        return False
-    return True
-
-
-def _metadata_int(metadata: Mapping, name: str, *, minimum: int | None = None) -> int:
-    value = metadata.get(name)
-    if isinstance(value, bool) or not isinstance(value, (int, np.integer)):
-        raise ValueError(f"GxE feature-cache metadata field {name!r} must be an integer.")
-    value = int(value)
-    if minimum is not None and value < minimum:
-        raise ValueError(
-            f"GxE feature-cache metadata field {name!r} must be at least {minimum}; got {value}."
-        )
-    return value
-
-
-def _metadata_float(metadata: Mapping, name: str, *, positive: bool = False) -> float:
-    value = metadata.get(name)
-    if isinstance(value, bool) or not isinstance(value, (int, float, np.integer, np.floating)):
-        raise ValueError(f"GxE feature-cache metadata field {name!r} must be numeric.")
-    value = float(value)
-    if not np.isfinite(value) or (positive and value <= 0.0):
-        qualifier = "positive and finite" if positive else "finite"
-        raise ValueError(f"GxE feature-cache metadata field {name!r} must be {qualifier}.")
-    return value
-
-
-def _require_close(name: str, observed, expected, *, rtol: float = 2e-12, atol: float = 2e-10) -> None:
-    try:
-        close = bool(np.allclose(observed, expected, rtol=rtol, atol=atol, equal_nan=False))
-    except (TypeError, ValueError):
-        close = False
-    if not close:
-        raise ValueError(f"GxE feature cache has inconsistent {name}.")
-
-
-def _environment_transforms_equal(observed: Any, expected: Any) -> bool:
-    """Compare one fixed design exactly, allowing only floating reduction noise."""
-    if not isinstance(observed, Mapping) or not isinstance(expected, Mapping):
-        return False
-    if set(observed) != set(expected):
-        return False
-    exact_fields = (
-        "standardized", "ddof", "units", "fixed_effect_design_sha256",
-    )
-    if any(observed.get(name) != expected.get(name) for name in exact_fields):
-        return False
-    numeric_fields = (
-        "raw_mean", "raw_sd", "analysis_mean", "analysis_sum_squares",
-    )
-    try:
-        observed_values = np.asarray(
-            [observed[name] for name in numeric_fields], dtype=np.float64,
-        )
-        expected_values = np.asarray(
-            [expected[name] for name in numeric_fields], dtype=np.float64,
-        )
-    except (KeyError, TypeError, ValueError):
-        return False
-    return bool(np.allclose(
-        observed_values, expected_values, rtol=2e-12, atol=2e-10,
-        equal_nan=False,
-    ))
-
-
-def _feature_cache_variant_digest(arrays: Mapping[str, np.ndarray]) -> str:
-    digest = hashlib.sha256()
-    for values in zip(
-        arrays["variant_chr"], arrays["variant_snp"], arrays["variant_bp"],
-        arrays["variant_a1"], arrays["variant_a2"],
-    ):
-        digest.update("\x1f".join(str(value) for value in values).encode("utf-8"))
-        digest.update(b"\n")
-    return digest.hexdigest()
-
-
-# Deterministic canonical block width for ``step_size="auto"``.  The value
-# is a pure function of the variant count only — never of machine state or
-# resolved memory budgets — so an auto-selected realization is reproducible
-# from its manifest (which always records the resolved numeric step_size).
-# 8192 keeps the target GEMM's variant dimension wide enough for full
-# per-thread tiles, saturates the source GEMM's inner dimension, and cuts
-# the per-block panel-accumulation traffic roughly fourfold versus the
-# historical 2000-variant default, while a 454K-variant genome still forms
-# 56 bounded blocks.  Changing the width changes the finite-probe
-# realization exactly as an explicit --step_size change would.
 _AUTO_STEP_SIZE_CANONICAL_WIDTH = 8192
 
 
@@ -770,422 +468,6 @@ def _canonicalize_annotation_matrix(raw) -> np.ndarray:
     if np.any(canonical < 0.0):
         raise ValueError("Annotation values must be non-negative.")
     return canonical
-
-
-def _feature_cache_annotation_digest(metadata: Mapping, arrays: Mapping[str, np.ndarray]) -> str:
-    digest = hashlib.sha256()
-    for name in metadata["annotation_names"]:
-        digest.update(str(name).encode("utf-8"))
-        digest.update(b"\n")
-    digest.update(
-        np.asarray(arrays["annotations"], dtype="<f8", order="C").tobytes(order="C")
-    )
-    return digest.hexdigest()
-
-
-def _feature_cache_jackknife_digest(metadata: Mapping, arrays: Mapping[str, np.ndarray]) -> str:
-    digest = hashlib.sha256()
-    labels = metadata["jackknife_labels"]
-    if labels is None:
-        digest.update(b"none\n")
-    else:
-        digest.update(
-            np.asarray(arrays["jackknife_ids"], dtype="<i4", order="C").tobytes(order="C")
-        )
-        for label in labels:
-            digest.update(str(label).encode("utf-8"))
-            digest.update(b"\n")
-    return digest.hexdigest()
-
-
-def _validate_feature_convention_metadata(metadata: Mapping[str, object]) -> str:
-    """Validate canonical feature metadata while accepting sealed legacy v3 files."""
-    kernel_mode = metadata.get("kernel_mode")
-    expected = {
-        "standardized": "standardized_projected",
-        "genie": "raw_projected",
-    }.get(kernel_mode)
-    if expected is None:
-        raise ValueError(f"Unsupported GxE kernel_mode={kernel_mode!r}.")
-    convention = metadata.get("feature_convention")
-    version = metadata.get("feature_convention_version")
-    if convention is None and version is None:
-        return expected
-    if version != 1:
-        raise ValueError(
-            f"Unsupported GxE feature_convention_version={version!r}."
-        )
-    if convention not in {"standardized_projected", "raw_projected"}:
-        raise ValueError(
-            f"Unsupported GxE feature_convention={convention!r}."
-        )
-    if convention != expected:
-        raise ValueError(
-            "The manifest encodes a different GxE reference feature scale/GENIE convention: "
-            "kernel_mode and canonical feature_convention disagree."
-        )
-    return str(convention)
-
-
-def _validate_feature_cache_semantics(
-    metadata: Mapping,
-    arrays: Mapping[str, np.ndarray],
-    *,
-    expected_identity: Mapping | None = None,
-    expected_arrays: Mapping[str, np.ndarray] | None = None,
-) -> None:
-    """Validate the complete schema-v2 feature-cache contract.
-
-    This is deliberately independent of ``GenomewideEnvLDScore`` so shard
-    mergers can apply exactly the same checks.  Array hashes provide byte
-    integrity; the remaining checks bind those bytes to the declared variants,
-    annotations, jackknife, feature diagnostics, and exact NxE traces.  Cache
-    authenticity is supplied separately by an expected current-data identity
-    (during generation/loading) or by the cache digest sealed into each shard.
-    """
-    if not isinstance(metadata, Mapping):
-        raise ValueError("GxE feature-cache metadata must be a JSON object.")
-    if metadata.get("kind") != "summit.gxe.feature_cache":
-        raise ValueError("Unsupported GxE feature-cache kind.")
-    if metadata.get("schema_version") != _FEATURE_CACHE_SCHEMA_VERSION:
-        raise ValueError(
-            "Unsupported GxE feature-cache schema; regenerate a schema-v2 cache "
-            "so NxE traces can be verified."
-        )
-    if "backend_provenance" in metadata:
-        _validate_backend_provenance(
-            metadata["backend_provenance"], expected_stage="feature_construction"
-        )
-    if not isinstance(arrays, Mapping):
-        raise ValueError("GxE feature-cache arrays must be a mapping.")
-    required_names = set(_FEATURE_CACHE_ARRAY_DTYPES)
-    if set(arrays) != required_names:
-        missing = sorted(required_names - set(arrays))
-        extra = sorted(set(arrays) - required_names)
-        raise ValueError(
-            f"GxE feature-cache array set is invalid; missing={missing}, extra={extra}."
-        )
-
-    declared_hashes = metadata.get("array_sha256")
-    if not isinstance(declared_hashes, Mapping) or set(declared_hashes) != required_names:
-        raise ValueError("GxE feature cache does not bind every schema-v2 array.")
-    for name in sorted(required_names):
-        value = arrays[name]
-        if not isinstance(value, np.ndarray):
-            raise ValueError(f"GxE feature-cache array {name!r} is not an ndarray.")
-        expected_dtype = _FEATURE_CACHE_ARRAY_DTYPES[name]
-        if expected_dtype == "U":
-            dtype_ok = value.dtype.kind == "U"
-        else:
-            dtype_ok = value.dtype == expected_dtype
-        if not dtype_ok:
-            raise ValueError(
-                f"GxE feature-cache array {name!r} has dtype {value.dtype}; "
-                f"expected {expected_dtype}."
-            )
-        declared = declared_hashes.get(name)
-        if not _is_canonical_sha256(declared) or _ndarray_sha256(value) != declared:
-            raise ValueError(f"GxE feature-cache array {name!r} failed its SHA-256 check.")
-
-    n = _metadata_int(metadata, "n_samples", minimum=3)
-    m = _metadata_int(metadata, "n_variants", minimum=1)
-    p = _metadata_int(metadata, "fixed_effect_rank_excluding_intercept", minimum=1)
-    residual_rank = _metadata_int(metadata, "residual_rank", minimum=1)
-    if p >= n - 1 or residual_rank != n - p - 1:
-        raise ValueError("GxE feature-cache fixed-effect and residual ranks are inconsistent.")
-    ddof = _metadata_int(metadata, "ddof")
-    if ddof not in (0, 1):
-        raise ValueError("GxE feature-cache ddof must be 0 or 1.")
-    _metadata_float(metadata, "eps_var", positive=True)
-    kernel_mode = metadata.get("kernel_mode")
-    genotype_scale = metadata.get("genotype_scale")
-    if kernel_mode not in ("standardized", "genie"):
-        raise ValueError("GxE feature-cache kernel_mode is invalid.")
-    _validate_feature_convention_metadata(metadata)
-    if genotype_scale not in ("sample", "hwe"):
-        raise ValueError("GxE feature-cache genotype_scale is invalid.")
-
-    annotation_names = metadata.get("annotation_names")
-    if not isinstance(annotation_names, list):
-        raise ValueError("GxE feature-cache annotation names must be a JSON list.")
-    annotation_names = _validate_gxe_annotation_names(annotation_names)
-    k = len(annotation_names)
-    annotation_masses = metadata.get("annotation_masses")
-    if not isinstance(annotation_masses, list) or len(annotation_masses) != k:
-        raise ValueError("GxE feature-cache annotation masses have an invalid shape.")
-    if any(isinstance(value, bool) for value in annotation_masses):
-        raise ValueError("GxE feature-cache annotation masses must be numeric, not boolean.")
-    try:
-        annotation_masses = np.asarray(annotation_masses, dtype=np.float64)
-    except (TypeError, ValueError) as exc:
-        raise ValueError("GxE feature-cache annotation masses must be numeric.") from exc
-    if not np.all(np.isfinite(annotation_masses)) or np.any(annotation_masses <= 0.0):
-        raise ValueError("GxE feature-cache annotation masses must be positive and finite.")
-
-    one_dimensional = (
-        "variant_chr", "variant_snp", "variant_bp", "variant_a1", "variant_a2",
-        "scale_x", "scale_w", "norm_x", "norm_w", "diag_nxe_x", "diag_nxe_w",
-        "corr_xw",
-    )
-    for name in one_dimensional:
-        if arrays[name].shape != (m,):
-            raise ValueError(f"GxE feature-cache array {name!r} must have shape ({m},).")
-    if arrays["annotations"].shape != (m, k):
-        raise ValueError(
-            f"GxE feature-cache annotations must have shape ({m}, {k})."
-        )
-    q = p + 1
-    if arrays["nxe_qdq"].shape != (q, q):
-        raise ValueError(f"GxE feature-cache nxe_qdq must have shape ({q}, {q}).")
-    if arrays["nxe_trace_terms"].shape != (3,):
-        raise ValueError("GxE feature-cache nxe_trace_terms must have shape (3,).")
-
-    for name in (
-        "annotations", "scale_x", "scale_w", "norm_x", "norm_w", "diag_nxe_x",
-        "diag_nxe_w", "corr_xw", "nxe_qdq", "nxe_trace_terms",
-    ):
-        if not np.all(np.isfinite(arrays[name])):
-            raise ValueError(f"GxE feature-cache array {name!r} contains NaN or infinity.")
-    if np.any(arrays["annotations"] < 0.0):
-        raise ValueError("GxE feature-cache annotations must be non-negative.")
-    computed_masses = np.asarray(arrays["annotations"], dtype=np.float64).sum(axis=0)
-    _require_close("annotation masses", annotation_masses, computed_masses, rtol=0.0, atol=0.0)
-    if np.any(arrays["scale_x"] <= 0.0) or np.any(arrays["scale_w"] <= 0.0):
-        raise ValueError("GxE feature cache contains nonpositive projected-feature scales.")
-    if np.any(arrays["norm_x"] <= 0.0) or np.any(arrays["norm_w"] <= 0.0):
-        raise ValueError("GxE feature cache contains nonpositive projected-feature norms.")
-    if np.any(arrays["diag_nxe_x"] < 0.0) or np.any(arrays["diag_nxe_w"] < 0.0):
-        raise ValueError("GxE feature cache contains a negative NxE feature diagonal.")
-    cauchy_slack = (
-        arrays["norm_x"] * arrays["norm_w"] - arrays["corr_xw"] ** 2
-    )
-    cauchy_tol = 5e-12 * np.maximum(1.0, arrays["norm_x"] * arrays["norm_w"])
-    if np.any(cauchy_slack < -cauchy_tol):
-        raise ValueError("GxE feature-cache X/W correlations violate Cauchy-Schwarz.")
-    if kernel_mode == "standardized":
-        if max(
-            float(np.max(np.abs(arrays["norm_x"] - 1.0))),
-            float(np.max(np.abs(arrays["norm_w"] - 1.0))),
-        ) > 1.0e-9:
-            raise ValueError("Standardized GxE feature-cache columns do not have unit residual norm.")
-    elif not (
-        np.array_equal(arrays["scale_x"], np.ones(m, dtype=np.float64))
-        and np.array_equal(arrays["scale_w"], np.ones(m, dtype=np.float64))
-    ):
-        raise ValueError("GENIE-mode GxE feature-cache scales must be exactly one.")
-
-    for name in ("variant_chr", "variant_snp", "variant_a1", "variant_a2"):
-        if any(not str(value) for value in arrays[name]):
-            raise ValueError(f"GxE feature-cache array {name!r} contains an empty value.")
-    if len(set(arrays["variant_snp"].tolist())) != m:
-        raise ValueError("GxE feature-cache SNP identifiers must be unique.")
-    if np.any(arrays["variant_bp"] < 0):
-        raise ValueError("GxE feature-cache base-pair positions must be non-negative.")
-
-    labels = metadata.get("jackknife_labels")
-    jackknife_ids = arrays["jackknife_ids"]
-    if labels is None:
-        if jackknife_ids.shape != (0,):
-            raise ValueError("A feature cache without jackknife labels must have empty jackknife IDs.")
-    else:
-        if (
-            not isinstance(labels, list) or len(labels) < 2
-            or any(not isinstance(label, str) or not label for label in labels)
-            or len(set(labels)) != len(labels)
-        ):
-            raise ValueError("GxE feature-cache jackknife labels are invalid.")
-        if jackknife_ids.shape != (m,):
-            raise ValueError("GxE feature-cache jackknife IDs must align to all variants.")
-        if np.any(jackknife_ids < 0) or np.any(jackknife_ids >= len(labels)):
-            raise ValueError("GxE feature-cache jackknife IDs are out of range.")
-        counts = np.bincount(jackknife_ids, minlength=len(labels))
-        if np.any(counts == 0):
-            raise ValueError("GxE feature-cache jackknife contains an empty block.")
-        block_masses = np.zeros((len(labels), k), dtype=np.float64)
-        np.add.at(block_masses, jackknife_ids, arrays["annotations"])
-        if np.any(annotation_masses.reshape(1, -1) - block_masses <= 0.0):
-            raise ValueError("GxE feature-cache jackknife deletion empties an annotation.")
-
-    digest_fields = (
-        "analysis_fingerprint", "variant_digest", "annotation_digest", "jackknife_digest",
-    )
-    for name in digest_fields:
-        if not _is_canonical_sha256(metadata.get(name)):
-            raise ValueError(f"GxE feature-cache digest {name!r} is invalid.")
-    if metadata["variant_digest"] != _feature_cache_variant_digest(arrays):
-        raise ValueError("GxE feature-cache variant digest is inconsistent with its arrays.")
-    if metadata["annotation_digest"] != _feature_cache_annotation_digest(metadata, arrays):
-        raise ValueError("GxE feature-cache annotation digest is inconsistent with its arrays.")
-    if metadata["jackknife_digest"] != _feature_cache_jackknife_digest(metadata, arrays):
-        raise ValueError("GxE feature-cache jackknife digest is inconsistent with its arrays.")
-
-    environment = metadata.get("environment")
-    covariates = metadata.get("covariates")
-    if not isinstance(environment, str) or not environment:
-        raise ValueError("GxE feature-cache environment name is invalid.")
-    if (
-        not isinstance(covariates, list)
-        or any(not isinstance(name, str) or not name for name in covariates)
-        or len(set(covariates)) != len(covariates)
-        or environment in covariates
-    ):
-        raise ValueError("GxE feature-cache covariate names are invalid.")
-    if p > len(covariates) + 1:
-        raise ValueError("GxE feature-cache fixed-effect rank exceeds the declared design columns.")
-    transform = metadata.get("environment_transform")
-    required_transform = {
-        "standardized", "raw_mean", "raw_sd", "ddof", "analysis_mean",
-        "analysis_sum_squares", "units", "fixed_effect_design_sha256",
-    }
-    if not isinstance(transform, Mapping) or set(transform) != required_transform:
-        raise ValueError("GxE feature-cache environment transform is incomplete or noncanonical.")
-    if transform.get("standardized") is not True or transform.get("units") != "per_environment_sd":
-        raise ValueError("GxE feature-cache environment must use the standardized analysis scale.")
-    if _metadata_int(transform, "ddof") != ddof:
-        raise ValueError("GxE feature-cache environment and genotype ddof declarations disagree.")
-    _metadata_float(transform, "raw_mean")
-    _metadata_float(transform, "raw_sd", positive=True)
-    analysis_mean = _metadata_float(transform, "analysis_mean")
-    analysis_ss = _metadata_float(transform, "analysis_sum_squares", positive=True)
-    if abs(analysis_mean) > 1e-10:
-        raise ValueError("GxE feature-cache standardized environment is not centered.")
-    _require_close(
-        "standardized environment sum of squares", analysis_ss, float(n - ddof),
-    )
-    if not _is_canonical_sha256(transform.get("fixed_effect_design_sha256")):
-        raise ValueError("GxE feature-cache fixed-effect design digest is invalid.")
-
-    genotype_files = metadata.get("genotype_files")
-    if not isinstance(genotype_files, Mapping) or set(genotype_files) != {".bed", ".bim", ".fam"}:
-        raise ValueError("GxE feature-cache genotype provenance is incomplete.")
-    for extension, declaration in genotype_files.items():
-        if not isinstance(declaration, Mapping) or set(declaration) != {"bytes", "sha256"}:
-            raise ValueError(f"GxE feature-cache genotype provenance for {extension} is invalid.")
-        size = declaration.get("bytes")
-        if isinstance(size, bool) or not isinstance(size, (int, np.integer)) or int(size) <= 0:
-            raise ValueError(f"GxE feature-cache genotype byte count for {extension} is invalid.")
-        if not _is_canonical_sha256(declaration.get("sha256")):
-            raise ValueError(f"GxE feature-cache genotype digest for {extension} is invalid.")
-
-    qdq = arrays["nxe_qdq"]
-    terms = arrays["nxe_trace_terms"]
-    qdq_scale = max(1.0, float(np.max(np.abs(qdq))))
-    if float(np.max(np.abs(qdq - qdq.T))) > 2e-12 * qdq_scale:
-        raise ValueError("GxE feature-cache nxe_qdq is not symmetric.")
-    qdq_sym = 0.5 * (qdq + qdq.T)
-    if float(np.linalg.eigvalsh(qdq_sym)[0]) < -2e-11 * qdq_scale:
-        raise ValueError("GxE feature-cache nxe_qdq is not positive semidefinite.")
-    sum_d, sum_d2, trace_qd2q = (float(value) for value in terms)
-    if min(sum_d, sum_d2, trace_qd2q) < 0.0:
-        raise ValueError("GxE feature-cache NxE trace sufficient statistics must be non-negative.")
-    _require_close("NxE environment sum of squares", sum_d, analysis_ss)
-    inequality_tol = 2e-10 * max(1.0, sum_d2, trace_qd2q)
-    if sum_d2 + inequality_tol < (sum_d * sum_d) / float(n):
-        raise ValueError("GxE feature-cache NxE moments violate scalar Cauchy-Schwarz.")
-    qdq_sq_trace = float(np.sum(qdq * qdq.T))
-    if trace_qd2q > sum_d2 + inequality_tol or qdq_sq_trace > trace_qd2q + inequality_tol:
-        raise ValueError("GxE feature-cache NxE moments violate projection inequalities.")
-    trace_nxe = sum_d - float(np.trace(qdq))
-    trace_nxe_sq = sum_d2 - 2.0 * trace_qd2q + qdq_sq_trace
-    nonnegative_tol = 2e-10 * max(1.0, sum_d, sum_d2)
-    if trace_nxe < -nonnegative_tol or trace_nxe_sq < -nonnegative_tol:
-        raise ValueError("GxE feature-cache sufficient statistics imply a negative NxE trace.")
-    trace_nxe = max(0.0, trace_nxe)
-    trace_nxe_sq = max(0.0, trace_nxe_sq)
-    if trace_nxe_sq > trace_nxe * trace_nxe + nonnegative_tol:
-        raise ValueError("GxE feature-cache NxE traces violate positive-semidefinite trace bounds.")
-    _require_close("trace_nxe", _metadata_float(metadata, "trace_nxe"), trace_nxe)
-    _require_close("trace_nxe_sq", _metadata_float(metadata, "trace_nxe_sq"), trace_nxe_sq)
-
-    diagnostics = metadata.get("feature_diagnostics")
-    if not isinstance(diagnostics, Mapping):
-        raise ValueError("GxE feature cache lacks feature diagnostics.")
-    scalar_diagnostics = (
-        "max_projection_leakage_additive", "max_projection_leakage_interaction",
-        "min_norm_additive_over_rank", "max_norm_additive_over_rank",
-        "min_norm_interaction_over_rank", "max_norm_interaction_over_rank",
-        "max_norm_error_additive", "max_norm_error_interaction",
-        "max_trace_error_additive", "max_trace_error_interaction",
-    )
-    for name in scalar_diagnostics:
-        if _metadata_float(diagnostics, name) < 0.0:
-            raise ValueError(
-                f"GxE feature-cache diagnostic {name!r} must be non-negative."
-            )
-    if (
-        _metadata_int(diagnostics, "valid_additive_columns", minimum=0) != m
-        or _metadata_int(diagnostics, "valid_interaction_columns", minimum=0) != m
-    ):
-        raise ValueError("GxE feature-cache valid-column diagnostics are inconsistent.")
-    if min(
-        float(diagnostics["max_projection_leakage_additive"]),
-        float(diagnostics["max_projection_leakage_interaction"]),
-    ) < 0.0 or max(
-        float(diagnostics["max_projection_leakage_additive"]),
-        float(diagnostics["max_projection_leakage_interaction"]),
-    ) > 1.0e-9:
-        raise ValueError("GxE feature-cache diagnostics report fixed-effect projection leakage.")
-    expected_diagnostics = {
-        "min_norm_additive_over_rank": float(np.min(arrays["norm_x"])),
-        "max_norm_additive_over_rank": float(np.max(arrays["norm_x"])),
-        "min_norm_interaction_over_rank": float(np.min(arrays["norm_w"])),
-        "max_norm_interaction_over_rank": float(np.max(arrays["norm_w"])),
-        "max_norm_error_additive": float(np.max(np.abs(arrays["norm_x"] - 1.0))),
-        "max_norm_error_interaction": float(np.max(np.abs(arrays["norm_w"] - 1.0))),
-    }
-    for name, expected in expected_diagnostics.items():
-        _require_close(name, float(diagnostics[name]), expected)
-    trace_x = residual_rank * (arrays["annotations"].T @ arrays["norm_x"]) / annotation_masses
-    trace_w = residual_rank * (arrays["annotations"].T @ arrays["norm_w"]) / annotation_masses
-    diagnostic_trace_x = diagnostics.get("kernel_traces_additive")
-    diagnostic_trace_w = diagnostics.get("kernel_traces_interaction")
-    if not isinstance(diagnostic_trace_x, list) or not isinstance(diagnostic_trace_w, list):
-        raise ValueError("GxE feature-cache kernel-trace diagnostics are invalid.")
-    try:
-        diagnostic_trace_x = np.asarray(diagnostic_trace_x, dtype=np.float64)
-        diagnostic_trace_w = np.asarray(diagnostic_trace_w, dtype=np.float64)
-    except (TypeError, ValueError) as exc:
-        raise ValueError("GxE feature-cache kernel-trace diagnostics must be numeric.") from exc
-    if (
-        diagnostic_trace_x.shape != (k,)
-        or diagnostic_trace_w.shape != (k,)
-        or not np.all(np.isfinite(diagnostic_trace_x))
-        or not np.all(np.isfinite(diagnostic_trace_w))
-    ):
-        raise ValueError(
-            f"GxE feature-cache kernel-trace diagnostics must each have shape ({k},)."
-        )
-    _require_close("additive kernel-trace diagnostics", diagnostic_trace_x, trace_x)
-    _require_close("interaction kernel-trace diagnostics", diagnostic_trace_w, trace_w)
-    _require_close(
-        "max additive trace error", diagnostics["max_trace_error_additive"],
-        float(np.max(np.abs(trace_x - residual_rank))),
-    )
-    _require_close(
-        "max interaction trace error", diagnostics["max_trace_error_interaction"],
-        float(np.max(np.abs(trace_w - residual_rank))),
-    )
-
-    if expected_identity is not None:
-        mismatches = []
-        for key, expected_value in expected_identity.items():
-            observed_value = metadata.get(key)
-            if key == "environment_transform":
-                matches = _environment_transforms_equal(observed_value, expected_value)
-            else:
-                matches = observed_value == expected_value
-            if not matches:
-                mismatches.append(key)
-        if mismatches:
-            raise ValueError(
-                "GxE feature cache does not match the current genotype/design/annotation/mode/jackknife "
-                f"configuration; mismatched fields: {mismatches}."
-            )
-    if expected_arrays is not None:
-        for name, expected in expected_arrays.items():
-            if name not in arrays or not np.array_equal(arrays[name], expected):
-                raise ValueError(f"GxE feature-cache canonical array {name!r} is inconsistent.")
-
 
 
 def _round_up_to(x: int, gran: int) -> int:
@@ -1513,14 +795,6 @@ def read_env_and_cov(
     # resulting summary objects match the score-scale derivation.
     C_common = _orthonormalize_columns(cov_base)
     design_base = np.column_stack([cov_base, env_vec.reshape(-1, 1)])
-    design_digest = hashlib.sha256()
-    for name in [*kept_cov_cols, str(env_name)]:
-        design_digest.update(str(name).encode("utf-8"))
-        design_digest.update(b"\n")
-    design_digest.update(
-        np.asarray(design_base, dtype="<f8", order="C").tobytes(order="C")
-    )
-    env_transform["fixed_effect_design_sha256"] = design_digest.hexdigest()
     C = _orthonormalize_columns(design_base)
     R = np.asfortranarray(C.T)
 
@@ -1632,15 +906,13 @@ class GenomewideEnvLDScore:
         gxe_total_memory_gib="auto",
         device="cpu",
         impute_method: str = "mean",
-        kernel_mode: str = "standardized",
+        kernel_mode: str = "standardized_projected",
         genotype_scale: str | None = None,
         pheno_path: str | None = None,
         pheno_col: str | None = None,
         missing_values: Sequence[str] = ("-9", "NA", "NaN", "nan", ".", "None", "null"),
         overwrite: bool = False,
         probe_offset: int = 0,
-        feature_cache_path: str | None = None,
-        shard_mode: bool = False,
         native_backend: str = "python",
         native_workspace_gib: float = 16.0,
         native_target_panel_columns: int = 64,
@@ -1788,28 +1060,22 @@ class GenomewideEnvLDScore:
         self.impute_method = str(impute_method).strip().lower()
         if self.impute_method != "mean":
             raise ValueError("The current Python GxE LD-score implementation supports only impute_method='mean'.")
-        requested_kernel_mode = str(kernel_mode).strip().lower()
-        feature_conventions = {
-            "standardized": "standardized_projected",
-            "standardized_projected": "standardized_projected",
-            "genie": "raw_projected",
-            "raw_projected": "raw_projected",
-        }
-        if requested_kernel_mode not in feature_conventions:
+        self.feature_convention = str(kernel_mode).strip().lower()
+        if self.feature_convention not in {
+            "standardized_projected",
+            "raw_projected",
+        }:
             raise ValueError(
                 "kernel_mode must be 'standardized_projected' or "
-                "'raw_projected' (legacy aliases: 'standardized', 'genie')."
+                "'raw_projected'."
             )
-        self.feature_convention = feature_conventions[requested_kernel_mode]
-        # Retain the legacy internal labels until the v3 readers are retired;
-        # all numerical branches and existing file consumers remain unchanged.
-        self.kernel_mode = (
-            "standardized"
-            if self.feature_convention == "standardized_projected"
-            else "genie"
-        )
+        self.kernel_mode = self.feature_convention
         if genotype_scale is None:
-            genotype_scale = "sample" if self.kernel_mode == "standardized" else "hwe"
+            genotype_scale = (
+                "sample"
+                if self.kernel_mode == "standardized_projected"
+                else "hwe"
+            )
         self.genotype_scale = str(genotype_scale).strip().lower()
         if self.genotype_scale not in ("hwe", "sample"):
             raise ValueError("genotype_scale must be 'hwe' or 'sample'.")
@@ -1824,19 +1090,6 @@ class GenomewideEnvLDScore:
             )
         if self.probe_offset + self.nvecs > 2**64:
             raise ValueError("The requested GxE probe interval exceeds the uint64 identity space.")
-        self.feature_cache_path = (
-            None if feature_cache_path is None else str(Path(feature_cache_path).expanduser().resolve())
-        )
-        self.feature_cache_sha256: str | None = None
-        self.feature_cache_metadata: dict | None = None
-        self.feature_backend_provenance: dict | None = None
-        self.shard_mode = bool(shard_mode)
-        if self.shard_mode and self.feature_cache_path is None:
-            raise ValueError("GxE reference shards require a precomputed feature_cache_path.")
-        if self.shard_mode and self.pheno_path is not None:
-            raise ValueError("GxE reference shards must be phenotype-free.")
-        if self.feature_cache_path is not None and self.pheno_path is not None:
-            raise ValueError("Feature-cache trace generation is phenotype-free; score phenotypes separately.")
         requested_native_backend = str(native_backend).strip().lower()
         if requested_native_backend not in ("python", "direct"):
             raise ValueError("native_backend must be 'python' or 'direct'.")
@@ -1844,10 +1097,6 @@ class GenomewideEnvLDScore:
             unsupported = []
             if requested_native_backend != "python":
                 unsupported.append("native-direct execution")
-            if self.feature_cache_path is not None:
-                unsupported.append("feature-cache execution")
-            if self.shard_mode:
-                unsupported.append("reference shards")
             if self.genotype_scale != "sample":
                 unsupported.append(f"genotype_scale={self.genotype_scale}")
             if unsupported:
@@ -1966,12 +1215,6 @@ class GenomewideEnvLDScore:
         else:
             self.log._log(f"Reading {self.genotype_prefix}.pvar for variants")
         self._read_annot(annot_path)
-        # Schema-v2 feature caches retain empty legacy jackknife identity fields
-        # for backward-readable artifacts. New GxE references no longer create
-        # block-local or within-block jackknife outputs.
-        self.jackknife_ids = None
-        self.jackknife_labels = []
-
         (
             env_vec,
             env_name,
@@ -2053,25 +1296,17 @@ class GenomewideEnvLDScore:
             raise ValueError("native_target_panel_columns must be positive.")
         self.native_backend = requested_native_backend
         self._native_context = None
-        self._native_binary_descriptor: int | None = None
-        self._native_binary_record: dict | None = None
         self._native_build_info: dict | None = None
         self.native_blas_runtime_record: dict[str, str | int] | None = None
         self.native_strict_feature_moment_verification = False
         self.native_feature_moment_integrity_reason = "Python backend"
         self.native_phase_timings: dict[str, float] = {}
         self.performance_phase_timings: dict[str, dict[str, float | int]] = {}
-        # A common-cohort multi-environment executor owns a shared Python
-        # genotype stream but may route every wide product through the same
-        # protected native GEMMs as the direct backend.  It supplies an exact
-        # provenance template here without pretending that each estimator
-        # owns an independent DirectContext.
-        self.shared_backend_provenance: dict | None = None
         if self.native_backend != "python":
             unsupported = []
             if self.nbins != 1:
                 unsupported.append(f"K={self.nbins} annotations")
-            if self.kernel_mode != "standardized":
+            if self.kernel_mode != "standardized_projected":
                 unsupported.append(f"kernel_mode={self.kernel_mode}")
             if self.genotype_scale != "sample":
                 unsupported.append(f"genotype_scale={self.genotype_scale}")
@@ -2107,29 +1342,8 @@ class GenomewideEnvLDScore:
                                 "The direct GxE extension configured an unexpected "
                                 "BLAS thread count."
                             )
-                    native_descriptor, native_record = _loaded_native_binary_record(
-                        _gxeldcore
-                    )
                     build_info = dict(_gxeldcore.build_info())
                     runtime_record = _validate_native_blas_runtime(build_info)
-                    source_commit = build_info.get("source_commit")
-                    source_tree_sha256 = build_info.get("source_tree_sha256")
-                    if not (
-                        isinstance(source_commit, str)
-                        and len(source_commit) == 40
-                        and all(
-                            character in "0123456789abcdef"
-                            for character in source_commit
-                        )
-                        and _is_canonical_sha256(source_tree_sha256)
-                    ):
-                        os.close(native_descriptor)
-                        raise RuntimeError(
-                            "The direct GxE extension was not built with exact source "
-                            "commit and source-snapshot provenance."
-                        )
-                    self._native_binary_descriptor = native_descriptor
-                    self._native_binary_record = native_record
                     self._native_build_info = build_info
                     self.native_blas_runtime_record = runtime_record
                     self.log._log(
@@ -2142,9 +1356,6 @@ class GenomewideEnvLDScore:
                         self.native_strict_feature_moment_verification,
                         self.native_feature_moment_integrity_reason,
                     ) = _native_strict_feature_moment_verification_policy(build_info)
-                    self._native_binary_finalizer = weakref.finalize(
-                        self, _close_file_descriptors, (native_descriptor,)
-                    )
                     intercept = np.ones((self.nsamp, 1), dtype=np.float64)
                     q_basis = _orthonormalize_columns(
                         np.column_stack([intercept, self.C_int])
@@ -2238,10 +1449,6 @@ class GenomewideEnvLDScore:
             finalizer = getattr(self, "_descriptor_finalizer", None)
             if finalizer is not None and finalizer.alive:
                 finalizer()
-            native_finalizer = getattr(self, "_native_binary_finalizer", None)
-            if native_finalizer is not None and native_finalizer.alive:
-                native_finalizer()
-                self._native_binary_descriptor = None
         if self.covar_path is None:
             self.log._log("[env] No additional user covariates supplied; projecting on the environment main effect only.")
         else:
@@ -2929,7 +2136,7 @@ class GenomewideEnvLDScore:
             G = self._read_genotype_block(blk_start, blk_end)
         X = np.array(G, copy=True, dtype=np.float64, order="F")
         self._project_and_center_inplace(X)
-        if apply_scale and self.kernel_mode == "standardized":
+        if apply_scale and self.kernel_mode == "standardized_projected":
             if self.inv_sqrt_resvar_x_all is None:
                 raise RuntimeError("Additive residual variances have not been precomputed.")
             X *= self.inv_sqrt_resvar_x_all[blk_start:blk_end].reshape(1, -1)
@@ -2940,7 +2147,7 @@ class GenomewideEnvLDScore:
             G = self._read_genotype_block(blk_start, blk_end)
         W = np.asarray(G * self.env[:, None], dtype=np.float64, order="F")
         self._project_and_center_inplace(W)
-        if apply_scale and self.kernel_mode == "standardized":
+        if apply_scale and self.kernel_mode == "standardized_projected":
             if self.inv_sqrt_resvar_w_all is None:
                 raise RuntimeError("Interaction residual variances have not been precomputed.")
             W *= self.inv_sqrt_resvar_w_all[blk_start:blk_end].reshape(1, -1)
@@ -3100,7 +2307,7 @@ class GenomewideEnvLDScore:
             ssx = np.sum(X * X, axis=0, dtype=np.float64)
             varx = ssx / float(self.df_corr)
             good_x = np.isfinite(varx) & (varx > self.eps_var)
-            if self.kernel_mode == "standardized":
+            if self.kernel_mode == "standardized_projected":
                 inv_x[s:e][good_x] = 1.0 / np.sqrt(varx[good_x])
             else:
                 inv_x[s:e][good_x] = 1.0
@@ -3129,7 +2336,7 @@ class GenomewideEnvLDScore:
                     "projected variance. GxE kernel normalization cannot retain zero columns; "
                     f"QC/remove these variants and regenerate the complete bundle. Examples: {', '.join(examples)}."
                 )
-            if self.kernel_mode == "standardized":
+            if self.kernel_mode == "standardized_projected":
                 inv_w[s:e][good_w] = 1.0 / np.sqrt(varw[good_w])
             else:
                 inv_w[s:e][good_w] = 1.0
@@ -3205,7 +2412,7 @@ class GenomewideEnvLDScore:
                 f"max interaction={max_projection_leakage_w:.6g}, "
                 f"tolerance={projection_tolerance:.6g}."
             )
-        if self.kernel_mode == "standardized":
+        if self.kernel_mode == "standardized_projected":
             norm_tolerance = 1.0e-9
             if max(max_norm_error_x, max_norm_error_w) > norm_tolerance:
                 raise RuntimeError(
@@ -3267,10 +2474,8 @@ class GenomewideEnvLDScore:
         native_direct = getattr(self, "native_backend", "python") == "direct"
         resident_multiplier = 2
         if native_direct:
-            # Let U=N*K*B*8.  Each opaque panel owns S and e*S.  Preparing
-            # a panel peaks at its 2U input plus a 4U snapshot. Exact JK keeps
-            # both 2B stored sketches during block preparation, but never keeps
-            # the global and block opaque panels together.
+            # Let U=N*K*B*8. Each opaque panel owns S and e*S. Preparing
+            # a panel peaks at its 2U input plus a 4U snapshot.
             if itemsize == np.dtype(np.float64).itemsize:
                 peak_multiplier = 6
             else:
@@ -3480,8 +2685,6 @@ class GenomewideEnvLDScore:
     ) -> tuple[np.ndarray, np.ndarray]:
         if self._native_context is None:
             raise RuntimeError("The bounded native GxE backend was not initialized.")
-        length = blk_end - blk_start
-        dense_ids = np.zeros(length, dtype=np.int32)
         started = time.perf_counter()
         try:
             source_x, source_w, missing = self._native_context.source_block(
@@ -3500,8 +2703,6 @@ class GenomewideEnvLDScore:
                     )
                 ),
                 probes=np.asfortranarray(probes, dtype=np.float64),
-                group_ids=dense_ids,
-                num_groups=1,
                 require_missing_free=True,
             )
         finally:
@@ -3520,7 +2721,6 @@ class GenomewideEnvLDScore:
         blk_start: int,
         blk_end: int,
         sources,
-        second_sources=None,
     ) -> tuple[np.ndarray, np.ndarray]:
         if self._native_context is None:
             raise RuntimeError("The bounded native GxE backend was not initialized.")
@@ -3537,18 +2737,11 @@ class GenomewideEnvLDScore:
         }
         started = time.perf_counter()
         try:
-            if second_sources is None:
-                work_x, work_w, missing, source_leakage = (
-                    self._native_context.target_projected_block(
-                        sources=sources, **arguments
-                    )
+            work_x, work_w, missing, source_leakage = (
+                self._native_context.target_projected_block(
+                    sources=sources, **arguments
                 )
-            else:
-                work_x, work_w, missing, source_leakage = (
-                    self._native_context.target_projected_pair_block(
-                        first=sources, second=second_sources, **arguments
-                    )
-                )
+            )
         finally:
             if not hasattr(self, "native_phase_timings"):
                 self.native_phase_timings = {}
@@ -3710,10 +2903,7 @@ class GenomewideEnvLDScore:
             ".exg.ldscore.gz",
             ".gee.ldscore.gz",
         ]
-        if self.shard_mode:
-            suffixes.extend([".gxe.shard.identity.json", ".gxe.shard.json"])
-        else:
-            suffixes.extend([".gxe.diag.tsv.gz", ".gxe.ref.json"])
+        suffixes.extend([".gxe.diag.tsv.gz", ".gxe.ref.json"])
         if self.pheno is not None:
             suffixes.extend([".gxe.gwas.tsv.gz", ".gxe.gwis.tsv.gz", ".gxe.moments.json"])
         return [Path(f"{self.outpath}{suffix}") for suffix in suffixes]
@@ -3726,46 +2916,6 @@ class GenomewideEnvLDScore:
                 "Refusing to overwrite an existing GxE bundle. Choose a new --out prefix or explicitly pass "
                 f"--gxe-overwrite. Existing artifacts: {shown}"
             )
-
-    def _variant_digest(self) -> str:
-        shared = getattr(self, "_shared_variant_digest", None)
-        if shared is not None:
-            return str(shared)
-        digest = hashlib.sha256()
-        if self.snplist is None:
-            for idx in range(self.nsnps):
-                digest.update(f"NA\x1f{idx}\x1fNA\x1fNA\x1fNA\n".encode("utf-8"))
-        else:
-            for row in self.snplist[["CHR", "SNP", "BP", "A1", "A2"]].itertuples(index=False, name=None):
-                digest.update("\x1f".join(str(x) for x in row).encode("utf-8"))
-                digest.update(b"\n")
-        return digest.hexdigest()
-
-    def _analysis_sample_fingerprint_prefix(self):
-        """Hash the selected IDs shared by all environments in one batch."""
-        selected = self.sample_ids.iloc[self.row_sel]
-        digest = hashlib.sha256()
-        for fid, iid in selected.itertuples(index=False, name=None):
-            digest.update(str(fid).encode("utf-8"))
-            digest.update(b"\x1f")
-            digest.update(str(iid).encode("utf-8"))
-            digest.update(b"\n")
-        return digest
-
-    def _analysis_fingerprint(self) -> str:
-        shared = getattr(self, "_shared_analysis_sample_prefix", None)
-        digest = (
-            shared.copy()
-            if shared is not None
-            else self._analysis_sample_fingerprint_prefix()
-        )
-        digest.update(np.asarray(self.env, dtype="<f8").tobytes(order="C"))
-        design_hash = self.environment_transform.get("fixed_effect_design_sha256")
-        if not isinstance(design_hash, str) or len(design_hash) != 64:
-            raise RuntimeError("Fixed-effect design digest is missing from the GxE analysis metadata.")
-        digest.update(bytes.fromhex(design_hash))
-        digest.update(int(self.p_eff).to_bytes(8, byteorder="little", signed=False))
-        return digest.hexdigest()
 
     def _nxe_reference_statistics(self) -> tuple[np.ndarray, np.ndarray]:
         """Return compact exact statistics for ``P diag(e**2) P`` traces."""
@@ -3805,42 +2955,6 @@ class GenomewideEnvLDScore:
     def _relative_output_path(self, target: str, manifest_path: str) -> str:
         return os.path.relpath(os.path.abspath(target), start=os.path.dirname(os.path.abspath(manifest_path)) or ".")
 
-    @staticmethod
-    def _file_sha256(path: str) -> str:
-        digest = hashlib.sha256()
-        with open(path, "rb") as handle:
-            for block in iter(lambda: handle.read(1024 * 1024), b""):
-                digest.update(block)
-        return digest.hexdigest()
-
-    def _annotation_digest(self) -> str:
-        digest = hashlib.sha256()
-        for name in self.l2cols:
-            digest.update(str(name).encode("utf-8"))
-            digest.update(b"\n")
-        digest.update(np.asarray(self.annot, dtype="<f8", order="C").tobytes(order="C"))
-        return digest.hexdigest()
-
-    def _jackknife_digest(self) -> str:
-        digest = hashlib.sha256()
-        if self.jackknife_ids is None:
-            digest.update(b"none\n")
-        else:
-            digest.update(np.asarray(self.jackknife_ids, dtype="<i4").tobytes(order="C"))
-            for label in self.jackknife_labels:
-                digest.update(str(label).encode("utf-8"))
-                digest.update(b"\n")
-        return digest.hexdigest()
-
-    def _genotype_provenance(self) -> dict[str, dict[str, int | str]]:
-        return {
-            ext: {
-                "bytes": int(os.fstat(self._genotype_descriptors[ext]).st_size),
-                "sha256": self._file_sha256(str(self._stable_genotype_paths[ext])),
-            }
-            for ext in self._genotype_extensions
-        }
-
     def _capture_genotype_file_state(
         self,
     ) -> dict[str, tuple[int, int, int, int, int]]:
@@ -3874,389 +2988,6 @@ class GenomewideEnvLDScore:
                 f"state; construct a fresh estimator. Changed files: {changed}."
             )
 
-    def _assert_genotype_provenance_unchanged(
-        self, expected: Mapping[str, Mapping[str, int | str]]
-    ) -> None:
-        self._assert_construction_genotype_state()
-        observed = self._genotype_provenance()
-        if observed != dict(expected):
-            changed = [
-                extension
-                for extension in self._genotype_extensions
-                if observed.get(extension) != expected.get(extension)
-            ]
-            raise RuntimeError(
-                "PLINK genotype inputs changed while GxE artifacts were being computed; "
-                f"aborting publication. Changed files: {changed}."
-            )
-
-    def _feature_cache_identity(
-        self,
-        genotype_files: Mapping[str, Mapping[str, int | str]] | None = None,
-    ) -> dict:
-        if genotype_files is None:
-            genotype_files = getattr(self, "_active_genotype_provenance", None)
-        if genotype_files is None:
-            genotype_files = self._genotype_provenance()
-        return {
-            "analysis_fingerprint": self._analysis_fingerprint(),
-            "variant_digest": self._variant_digest(),
-            "annotation_digest": self._annotation_digest(),
-            "jackknife_digest": self._jackknife_digest(),
-            "n_samples": self.nsamp,
-            "n_variants": self.nsnps,
-            "fixed_effect_rank_excluding_intercept": self.p_eff,
-            "residual_rank": self.df_corr,
-            "kernel_mode": self.kernel_mode,
-            "feature_convention": self.feature_convention,
-            "feature_convention_version": 1,
-            "genotype_scale": self.genotype_scale,
-            "ddof": self.ddof,
-            "eps_var": self.eps_var,
-            "annotation_names": list(self.l2cols),
-            "annotation_masses": np.asarray(self.nsnps_bin, dtype=np.float64).tolist(),
-            "jackknife_labels": None if self.jackknife_ids is None else list(self.jackknife_labels),
-            "environment": self.env_name,
-            "environment_transform": self.environment_transform,
-            "covariates": list(self.cov_cols),
-            "genotype_files": genotype_files,
-        }
-
-    def _backend_provenance(self, artifact_stage: str) -> dict:
-        shared = self.shared_backend_provenance
-        if shared is not None:
-            provenance = dict(shared)
-            provenance["artifact_stage"] = str(artifact_stage)
-            global_width = int(
-                self.resource_estimates.get("actual_global_2b_source_columns", 0)
-            )
-            jackknife_width = int(
-                self.resource_estimates.get("actual_jackknife_2b_source_columns", 0)
-            )
-            target_width = int(
-                self.resource_estimates.get("target_source_columns", 0)
-            )
-            if artifact_stage == "feature_construction":
-                global_width = jackknife_width = target_width = 0
-            provenance["actual_global_2b_source_columns"] = global_width
-            provenance["actual_jackknife_2b_source_columns"] = jackknife_width
-            provenance["actual_target_source_columns"] = target_width
-            _validate_backend_provenance(
-                provenance, expected_stage=str(artifact_stage)
-            )
-            return provenance
-
-        build_info = None
-        native_binary_sha256 = None
-        if self.native_backend == "direct":
-            build_info = self._native_build_info
-            descriptor = self._native_binary_descriptor
-            binary_record = self._native_binary_record
-            if build_info is None or descriptor is None or binary_record is None:
-                raise RuntimeError("Direct GxE backend build provenance is unavailable.")
-            observed = os.fstat(descriptor)
-            identity = (
-                observed.st_dev, observed.st_ino, observed.st_size,
-                observed.st_mtime_ns, observed.st_ctime_ns,
-            )
-            if identity != tuple(binary_record["identity"]):
-                raise RuntimeError(
-                    "The loaded GxE native extension inode changed after initialization."
-                )
-            native_binary_sha256 = _sha256_descriptor(descriptor)
-            if native_binary_sha256 != binary_record["sha256"]:
-                raise RuntimeError(
-                    "The loaded GxE native extension bytes changed after initialization."
-                )
-            backend_name = str(build_info.get("backend_name", "gxeldcore_direct"))
-            backend_version = str(build_info.get("backend_version", "unknown"))
-            compile_options = {
-                key: build_info.get(key)
-                for key in (
-                    "api_version", "compiler_id", "compiler_version", "build_type",
-                    "blas_vendor", "cxx_standard", "optimization",
-                    "architecture_tuning", "openmp_enabled",
-                    "native_optimization_enabled", "platform",
-                    "blas_runtime_config", "gemm_execution_mode",
-                    "protected_pair_input_mode", "blas_runtime_isolation",
-                    "blas_runtime_threads", "blas_runtime_threading_layer",
-                    "blas_runtime_worker_affinity_policy",
-                    "gemm_integrity_enabled", "private_openblas_archive_sha256",
-                    "private_blas_backend", "private_blas_archive_sha256",
-                    "private_blas_source_commit",
-                    "private_blas_source_tree_sha256",
-                    "private_blas_config_family", "private_blas_header_sha256",
-                    "private_blas_cblas_header_sha256",
-                    "blas_runtime_thread_strategy", "blas_runtime_thread_ways",
-                    "blas_runtime_owner_thread_enforced",
-                    "blas_runtime_owner_thread_configured",
-                    "blas_runtime_environment_immutable",
-                    "blas_runtime_environment_contract",
-                    "blas_runtime_tls_enabled",
-                    "blas_runtime_corename", "gemm_telemetry_schema_version",
-                    "gemm_telemetry_capacity",
-                    "gemm_vendor_entry_outer_openmp_guard",
-                    "gemm_integrity_minimum_vendor_flops",
-                    "gemm_operand_numa_sampling_method",
-                    "gemm_operand_numa_sample_limit_per_operand",
-                )
-            }
-            compile_options["strict_feature_moment_verification"] = bool(
-                self.native_strict_feature_moment_verification
-            )
-            compile_options["loaded_blas_runtime"] = dict(
-                self.native_blas_runtime_record or {}
-            )
-            workspace_cap = int(self.native_workspace_gib * (1024 ** 3))
-            panel_columns = int(self.native_target_panel_columns)
-        else:
-            backend_name = "python_numpy"
-            backend_version = "gxe_python_v1"
-            compile_options = None
-            workspace_cap = 0
-            panel_columns = 0
-        source_commit = (
-            str(build_info.get("source_commit", "unknown"))
-            if build_info is not None
-            else "unknown"
-        )
-        source_tree_sha256 = (
-            str(build_info["source_tree_sha256"])
-            if build_info is not None
-            else None
-        )
-        global_width = int(
-            self.resource_estimates.get("actual_global_2b_source_columns", 0)
-        )
-        jackknife_width = int(
-            self.resource_estimates.get("actual_jackknife_2b_source_columns", 0)
-        )
-        target_width = int(self.resource_estimates.get("target_source_columns", 0))
-        if artifact_stage == "feature_construction":
-            global_width = jackknife_width = target_width = 0
-        provenance = {
-            "schema_version": _BACKEND_PROVENANCE_SCHEMA_VERSION,
-            "artifact_stage": str(artifact_stage),
-            "backend_name": backend_name,
-            "backend_version": backend_version,
-            "source_commit": source_commit,
-            "source_tree_sha256": source_tree_sha256,
-            "native_binary_sha256": native_binary_sha256,
-            "compile_options": compile_options,
-            "native_workspace_cap_bytes": workspace_cap,
-            "configured_target_panel_columns": panel_columns,
-            "actual_global_2b_source_columns": global_width,
-            "actual_jackknife_2b_source_columns": jackknife_width,
-            "actual_target_source_columns": target_width,
-        }
-        _validate_backend_provenance(provenance, expected_stage=str(artifact_stage))
-        return provenance
-
-    def write_feature_cache(self, path: str | Path, *, overwrite: bool = False) -> Path:
-        """Write exact phenotype-independent projected-feature metadata."""
-        if self.genotype_format != "bed":
-            raise ValueError("Reusable GxE feature caches currently require BED/BIM/FAM input.")
-        if self.pheno is not None or self.pheno_path is not None:
-            raise ValueError("A reusable GxE feature cache must be phenotype-free.")
-        target = Path(path).expanduser().resolve()
-        if target.exists() and not overwrite:
-            raise FileExistsError(f"Refusing to overwrite existing GxE feature cache: {target}.")
-        self._assert_construction_genotype_state()
-        initial_provenance = self._genotype_provenance()
-        # Recompute unconditionally so a cache can never publish stale feature
-        # arrays retained on a long-lived estimator after its PLINK inputs were
-        # replaced between calls.
-        self.inv_sqrt_resvar_x_all, self.inv_sqrt_resvar_w_all = (
-            self._precompute_residual_variances()
-        )
-        required = (
-            self.inv_sqrt_resvar_x_all, self.inv_sqrt_resvar_w_all,
-            self.norm_x_all, self.norm_w_all, self.diag_nxe_x_all,
-            self.diag_nxe_w_all, self.corr_xw_all,
-        )
-        if any(value is None for value in required):
-            raise RuntimeError("Projected-feature metadata are incomplete.")
-        identity = self._feature_cache_identity(initial_provenance)
-        nxe_qdq, nxe_trace_terms = self._nxe_reference_statistics()
-        trace_nxe = max(0.0, float(nxe_trace_terms[0] - np.trace(nxe_qdq)))
-        trace_nxe_sq = max(
-            0.0,
-            float(
-                nxe_trace_terms[1]
-                - 2.0 * nxe_trace_terms[2]
-                + np.sum(nxe_qdq * nxe_qdq.T)
-            ),
-        )
-        metadata = {
-            "kind": "summit.gxe.feature_cache",
-            "schema_version": _FEATURE_CACHE_SCHEMA_VERSION,
-            **identity,
-            "feature_diagnostics": self.feature_diagnostics,
-            "trace_nxe": trace_nxe,
-            "trace_nxe_sq": trace_nxe_sq,
-            "backend_provenance": self._backend_provenance(
-                "feature_construction"
-            ),
-        }
-        variants = self.snplist[["CHR", "SNP", "BP", "A1", "A2"]]
-        arrays = {
-            "variant_chr": variants["CHR"].astype(str).to_numpy(dtype=np.str_),
-            "variant_snp": variants["SNP"].astype(str).to_numpy(dtype=np.str_),
-            "variant_bp": variants["BP"].to_numpy(dtype=np.int64),
-            "variant_a1": variants["A1"].astype(str).to_numpy(dtype=np.str_),
-            "variant_a2": variants["A2"].astype(str).to_numpy(dtype=np.str_),
-            "annotations": np.asarray(self.annot, dtype=np.float64),
-            "jackknife_ids": (
-                np.asarray([], dtype=np.int32)
-                if self.jackknife_ids is None
-                else np.asarray(self.jackknife_ids, dtype=np.int32)
-            ),
-            "scale_x": np.asarray(self.inv_sqrt_resvar_x_all, dtype=np.float64),
-            "scale_w": np.asarray(self.inv_sqrt_resvar_w_all, dtype=np.float64),
-            "norm_x": np.asarray(self.norm_x_all, dtype=np.float64),
-            "norm_w": np.asarray(self.norm_w_all, dtype=np.float64),
-            "diag_nxe_x": np.asarray(self.diag_nxe_x_all, dtype=np.float64),
-            "diag_nxe_w": np.asarray(self.diag_nxe_w_all, dtype=np.float64),
-            "corr_xw": np.asarray(self.corr_xw_all, dtype=np.float64),
-            "nxe_qdq": nxe_qdq,
-            "nxe_trace_terms": nxe_trace_terms,
-        }
-        metadata["array_sha256"] = {
-            name: _ndarray_sha256(value) for name, value in arrays.items()
-        }
-        _validate_feature_cache_semantics(
-            metadata,
-            arrays,
-            expected_identity=identity,
-        )
-        arrays["metadata_json"] = np.asarray(
-            json.dumps(metadata, sort_keys=True, separators=(",", ":"))
-        )
-        target.parent.mkdir(parents=True, exist_ok=True)
-        fd, staged_name = tempfile.mkstemp(
-            prefix=f".{target.name}.", suffix=".stage", dir=target.parent
-        )
-        os.close(fd)
-        staged = Path(staged_name)
-        staged.unlink()
-        published_inode: tuple[int, int] | None = None
-        try:
-            self._atomic_npz(str(staged), **arrays)
-            staged_stat = staged.stat()
-            staged_sha256 = self._file_sha256(str(staged))
-            self._assert_genotype_provenance_unchanged(initial_provenance)
-            if overwrite:
-                os.replace(staged, target)
-            else:
-                try:
-                    os.link(staged, target)
-                except FileExistsError as exc:
-                    raise FileExistsError(
-                        f"Refusing to overwrite existing GxE feature cache: {target}."
-                    ) from exc
-                published_inode = (staged_stat.st_dev, staged_stat.st_ino)
-            observed = target.stat(follow_symlinks=False)
-            if observed.st_dev != staged_stat.st_dev or observed.st_ino != staged_stat.st_ino:
-                raise RuntimeError(
-                    "Published GxE feature cache was concurrently replaced before verification."
-                )
-            if self._file_sha256(str(target)) != staged_sha256:
-                raise RuntimeError(
-                    "Published GxE feature cache was modified in place before verification."
-                )
-        except Exception:
-            if not overwrite and published_inode is not None:
-                try:
-                    current = target.stat(follow_symlinks=False)
-                except FileNotFoundError:
-                    pass
-                else:
-                    if (current.st_dev, current.st_ino) == published_inode:
-                        target.unlink(missing_ok=True)
-            raise
-        finally:
-            staged.unlink(missing_ok=True)
-        self.feature_cache_sha256 = staged_sha256
-        self.feature_cache_metadata = metadata
-        self.feature_backend_provenance = dict(metadata["backend_provenance"])
-        return target
-
-    def _load_feature_cache(self, path: str | Path) -> None:
-        target = Path(path).expanduser().resolve()
-        if not target.is_file():
-            raise FileNotFoundError(target)
-        # Copy once into an owner-only temporary snapshot while hashing, then
-        # parse that exact immutable byte stream.  This avoids a pathname or
-        # in-place-mutation TOCTOU window without retaining the compressed
-        # cache in RAM.
-        scratch_parent = Path(self.outpath).expanduser().resolve().parent
-        scratch_parent.mkdir(parents=True, exist_ok=True)
-        digest = hashlib.sha256()
-        with tempfile.TemporaryFile(
-            prefix=".gxe-cache-validated-", suffix=".tmp", dir=scratch_parent
-        ) as snapshot:
-            os.fchmod(snapshot.fileno(), 0o600)
-            with open(target, "rb") as source:
-                for block in iter(lambda: source.read(1024 * 1024), b""):
-                    digest.update(block)
-                    snapshot.write(block)
-            cache_sha256 = digest.hexdigest()
-            snapshot.seek(0)
-            with np.load(snapshot, allow_pickle=False) as bundle:
-                expected_members = {*_FEATURE_CACHE_ARRAY_DTYPES, "metadata_json"}
-                if (
-                    len(bundle.files) != len(expected_members)
-                    or set(bundle.files) != expected_members
-                ):
-                    raise ValueError(
-                        "GxE feature cache contains unexpected, duplicate, or missing "
-                        "schema-v2 arrays."
-                    )
-                metadata = json.loads(str(bundle["metadata_json"].item()))
-                arrays = {
-                    name: np.asarray(bundle[name]).copy()
-                    for name in _FEATURE_CACHE_ARRAY_DTYPES
-                }
-        expected_identity = self._feature_cache_identity()
-        current_variants = self.snplist[["CHR", "SNP", "BP", "A1", "A2"]]
-        expected_variant_arrays = {
-            "variant_chr": current_variants["CHR"].astype(str).to_numpy(dtype=np.str_),
-            "variant_snp": current_variants["SNP"].astype(str).to_numpy(dtype=np.str_),
-            "variant_bp": current_variants["BP"].to_numpy(dtype=np.int64),
-            "variant_a1": current_variants["A1"].astype(str).to_numpy(dtype=np.str_),
-            "variant_a2": current_variants["A2"].astype(str).to_numpy(dtype=np.str_),
-            "annotations": np.asarray(self.annot, dtype=np.float64),
-            "jackknife_ids": (
-                np.asarray([], dtype=np.int32)
-                if self.jackknife_ids is None
-                else np.asarray(self.jackknife_ids, dtype=np.int32)
-            ),
-        }
-        _validate_feature_cache_semantics(
-            metadata,
-            arrays,
-            expected_identity=expected_identity,
-            expected_arrays=expected_variant_arrays,
-        )
-        self.inv_sqrt_resvar_x_all = arrays["scale_x"]
-        self.inv_sqrt_resvar_w_all = arrays["scale_w"]
-        self.norm_x_all = arrays["norm_x"]
-        self.norm_w_all = arrays["norm_w"]
-        self.diag_nxe_x_all = arrays["diag_nxe_x"]
-        self.diag_nxe_w_all = arrays["diag_nxe_w"]
-        self.corr_xw_all = arrays["corr_xw"]
-        self.feature_diagnostics = dict(metadata["feature_diagnostics"])
-        self.score_x_all = None
-        self.score_w_all = None
-        self.feature_cache_sha256 = cache_sha256
-        self.feature_cache_metadata = metadata
-        self.feature_backend_provenance = (
-            None
-            if metadata.get("backend_provenance") is None
-            else dict(metadata["backend_provenance"])
-        )
-        self.log._log(f"[gxe:cache] loaded exact projected-feature cache: {target}")
-
     def _write_bundle_metadata(
         self,
         score_paths: dict[str, str],
@@ -4266,9 +2997,6 @@ class GenomewideEnvLDScore:
         if self.snplist is None:
             raise ValueError("A BIM file is required for a reusable GxE summary bundle.")
 
-        with self._performance_phase("output_hashing"):
-            variant_digest = self._variant_digest()
-            analysis_fingerprint = self._analysis_fingerprint()
         with self._performance_phase("fp64_output_diagnostics"):
             trace_nxe, trace_nxe_sq = self._nxe_reference_traces()
         diag_path = f"{self.outpath}.gxe.diag.tsv.gz"
@@ -4301,21 +3029,14 @@ class GenomewideEnvLDScore:
         }
         payload = {
             "kind": "summit.gxe.reference",
-            # Schema v4 pledges canonical binary64 annotation values.  A v3
-            # reference may instead have rounded a continuous annotation to
-            # its randomized retained-storage dtype and therefore names a
-            # (slightly) different estimand; the two must never be treated as
-            # interchangeable.
             "schema_version": 4,
-            "analysis_fingerprint": analysis_fingerprint,
-            "variant_digest": variant_digest,
             "n_samples": self.nsamp,
             "fixed_effect_rank_excluding_intercept": self.p_eff,
             "residual_rank": self.df_corr,
             "environment": self.env_name,
-            "environment_transform": self.environment_transform,
+            "environment_transform": dict(self.environment_transform),
             "covariates": self.cov_cols,
-            "kernel_mode": self.kernel_mode,
+            "kernel_mode": self.feature_convention,
             "feature_convention": self.feature_convention,
             "feature_convention_version": 1,
             "genotype_scale": self.genotype_scale,
@@ -4323,12 +3044,9 @@ class GenomewideEnvLDScore:
             "null_corrected": False,
             "annotation_names": list(self.l2cols),
             "annotation_value_dtype": "float64",
-            "annotation_digest": self._annotation_digest(),
             "annotation_masses": np.asarray(self.nsnps_bin, dtype=np.float64).tolist(),
             "feature_diagnostics": self.feature_diagnostics,
             "resource_estimates": self.resource_estimates,
-            "backend_provenance": self._backend_provenance("reference"),
-            "feature_backend_provenance": self.feature_backend_provenance,
             "trace_nxe": trace_nxe,
             "trace_nxe_sq": trace_nxe_sq,
             "randomization": {
@@ -4344,14 +3062,6 @@ class GenomewideEnvLDScore:
                 "target_paired_sketch_gib": float(self.target_xz_mem),
                 "probe_tiles": [list(tile) for tile in (self._vtiles_used or [])],
             },
-            "genotype_files": (
-                self.feature_cache_metadata["genotype_files"]
-                if self.feature_cache_metadata is not None
-                else (
-                    getattr(self, "_active_genotype_provenance", None)
-                    or self._genotype_provenance()
-                )
-            ),
             "files": files,
         }
         if self.cpu_placement is not None:
@@ -4383,23 +3093,8 @@ class GenomewideEnvLDScore:
                 ],
                 "same_individual_kernel_products": population_products.tolist(),
             }
-        if self.feature_cache_path is not None and self.feature_cache_sha256 is not None:
-            payload["feature_cache"] = {
-                "path": self._relative_output_path(self.feature_cache_path, manifest_path),
-                "sha256": self.feature_cache_sha256,
-            }
-        with self._performance_phase("output_hashing"):
-            payload["artifact_sha256"] = {
-                key: self._file_sha256(_resolve_output)
-                for key, _resolve_output in {
-                    **score_paths,
-                    "diagonal": diag_path,
-                }.items()
-            }
         with self._performance_phase("output_serialization_staging"):
             self._atomic_json(payload, manifest_path)
-        with self._performance_phase("output_hashing"):
-            reference_manifest_sha256 = self._file_sha256(manifest_path)
         self.log._log(f"Saving GxE reference manifest into: {manifest_path}")
 
         moments_path = None
@@ -4435,25 +3130,16 @@ class GenomewideEnvLDScore:
                     float_format="%.12g",
                 )
             moments_path = f"{self.outpath}.gxe.moments.json"
-            with self._performance_phase("output_hashing"):
-                score_sha256 = {
-                    "gwas": self._file_sha256(gwas_path),
-                    "gwis": self._file_sha256(gwis_path),
-                }
             moments = {
                 "kind": "summit.gxe.phenotype_moments",
                 # Paired with the schema-v4 reference manifest written above.
                 "schema_version": 4,
-                "analysis_fingerprint": analysis_fingerprint,
-                "variant_digest": variant_digest,
                 "phenotype": self.phenotype_name,
                 "n_samples": self.nsamp,
                 "residual_rank": self.df_corr,
                 "feature_convention": self.feature_convention,
                 "feature_convention_version": 1,
                 "score_definition": "feature_transpose_residualized_y_over_sqrt_residual_rank",
-                "reference_manifest_sha256": reference_manifest_sha256,
-                "score_sha256": score_sha256,
                 "q_nxe": float(np.dot(self.env * self.pheno, self.env * self.pheno)),
                 "q_residual": float(np.dot(self.pheno, self.pheno)),
                 "phenotype_residual_variance_fraction": self.phenotype_residual_fraction,
@@ -4466,101 +3152,6 @@ class GenomewideEnvLDScore:
                 self._atomic_json(moments, moments_path)
             self.log._log(f"Saving marginal GWAS/GWIS scores and NxE phenotype moments with prefix: {self.outpath}")
         return manifest_path, moments_path
-
-    def _write_shard_metadata(
-        self,
-        score_paths: dict[str, str],
-    ) -> str:
-        if not self.shard_mode or self.feature_cache_path is None or self.feature_cache_sha256 is None:
-            raise RuntimeError("Shard metadata require a validated feature cache.")
-        manifest_path = f"{self.outpath}.gxe.shard.json"
-        files = {
-            key: self._relative_output_path(value, manifest_path)
-            for key, value in score_paths.items()
-        }
-        artifact_paths = dict(score_paths)
-        randomization = {
-            "distribution": self.rand_dist,
-            "algorithm": "philox_per_probe_block_v1",
-            "seed": self.root_seed,
-            "dtype": str(np.dtype(self.dtype)),
-            "step_size": self.step_size,
-            "step_size_selection": self.step_size_selection,
-            "num_vectors": self.nvecs,
-            "probe_offset": self.probe_offset,
-            "probe_stop": self.probe_offset + self.nvecs,
-            "probe_tiles": [list(tile) for tile in (self._vtiles_used or [])],
-        }
-        artifact_sha256 = {
-            key: self._file_sha256(value) for key, value in artifact_paths.items()
-        }
-        # A shard manifest is easy to copy and edit.  Bind the declared probe
-        # identities to the exact contribution bytes in a separate sidecar,
-        # then bind that sidecar into the outer manifest.  The merger also
-        # hashes parsed numerical contributions, so the same B-probe result
-        # cannot be counted repeatedly under relabelled intervals.
-        identity_path = f"{self.outpath}.gxe.shard.identity.json"
-        identity = {
-            "kind": "summit.gxe.reference_shard_identity",
-            "schema_version": 1,
-            "analysis_fingerprint": self._analysis_fingerprint(),
-            "variant_digest": self._variant_digest(),
-            "annotation_digest": self._annotation_digest(),
-            "jackknife_digest": self._jackknife_digest(),
-            "kernel_mode": self.kernel_mode,
-            "feature_convention": self.feature_convention,
-            "feature_convention_version": 1,
-            "genotype_scale": self.genotype_scale,
-            "ld_scale": "cross_product_over_rank_squared",
-            "annotation_names": list(self.l2cols),
-            "annotation_value_dtype": "float64",
-            "feature_cache_sha256": self.feature_cache_sha256,
-            "backend_provenance": self._backend_provenance("reference_shard"),
-            "feature_backend_provenance": self.feature_backend_provenance,
-            "randomization": {
-                key: randomization[key]
-                for key in (
-                    "distribution", "algorithm", "seed", "dtype", "step_size",
-                    "num_vectors", "probe_offset", "probe_stop",
-                )
-            },
-            "artifact_sha256": artifact_sha256,
-        }
-        self._atomic_json(identity, identity_path)
-        files["identity"] = self._relative_output_path(identity_path, manifest_path)
-        artifact_sha256["identity"] = self._file_sha256(identity_path)
-
-        payload = {
-            "kind": "summit.gxe.reference_shard",
-            # Schema v3 shards pledge canonical binary64 annotation values; a
-            # v2 shard may have rounded continuous annotations to the
-            # randomized retained-storage dtype.
-            "schema_version": 3,
-            "analysis_fingerprint": identity["analysis_fingerprint"],
-            "variant_digest": identity["variant_digest"],
-            "annotation_digest": identity["annotation_digest"],
-            "jackknife_digest": identity["jackknife_digest"],
-            "kernel_mode": self.kernel_mode,
-            "feature_convention": self.feature_convention,
-            "feature_convention_version": 1,
-            "genotype_scale": self.genotype_scale,
-            "ld_scale": "cross_product_over_rank_squared",
-            "annotation_names": list(self.l2cols),
-            "annotation_value_dtype": "float64",
-            "feature_cache": {
-                "path": self._relative_output_path(self.feature_cache_path, manifest_path),
-                "sha256": self.feature_cache_sha256,
-            },
-            "randomization": randomization,
-            "files": files,
-            "artifact_sha256": artifact_sha256,
-            "resource_estimates": self.resource_estimates,
-            "backend_provenance": identity["backend_provenance"],
-            "feature_backend_provenance": identity["feature_backend_provenance"],
-        }
-        self._atomic_json(payload, manifest_path)
-        self.log._log(f"Saving non-fit-able GxE reference shard manifest into: {manifest_path}")
-        return manifest_path
 
     def _log_score_summary(self, label: str, score: np.ndarray) -> None:
         try:
@@ -4580,17 +3171,7 @@ class GenomewideEnvLDScore:
     def _compute_ldscore(
         self,
         compute_callback=None,
-        expected_provenance=None,
-        *,
-        provenance_preverified: bool = False,
     ):
-        if provenance_preverified and (
-            compute_callback is None or expected_provenance is None
-        ):
-            raise ValueError(
-                "Preverified genotype provenance is valid only when publishing "
-                "precomputed scores against an explicit provenance record."
-            )
         original_outpath = self.outpath
         final_prefix = Path(original_outpath).expanduser().resolve()
         lock_path = Path(f"{final_prefix}.gxe.bundle.lock")
@@ -4604,29 +3185,11 @@ class GenomewideEnvLDScore:
         lock_stat = os.fstat(lock_descriptor)
         os.close(lock_descriptor)
         published: list[tuple[Path, int, int]] = []
-        initial_provenance = None
         try:
             # Fail cheaply on normal retries, but retain no-replace publication
             # below as the authority for concurrent, non-cooperating writers.
             self._assert_output_paths_available()
-            # Seal the exact PLINK bytes before the first genotype pass.  A
-            # final re-hash below prevents publication of arrays computed from
-            # a moving or mixed BED/BIM/FAM target.
             self._assert_construction_genotype_state()
-            initial_provenance = (
-                {key: dict(value) for key, value in expected_provenance.items()}
-                if provenance_preverified
-                else self._genotype_provenance()
-            )
-            if (
-                expected_provenance is not None
-                and initial_provenance != expected_provenance
-            ):
-                raise RuntimeError(
-                    "PLINK input provenance changed after shared multi-environment "
-                    "computation and before bundle publication."
-                )
-            self._active_genotype_provenance = initial_provenance
             with tempfile.TemporaryDirectory(
                 prefix=".gxe-bundle-stage-", dir=final_prefix.parent
             ) as stage_name:
@@ -4641,61 +3204,20 @@ class GenomewideEnvLDScore:
                         else compute_callback()
                     )
 
-                    # Output artifacts remain beside their manifest after
-                    # publication, so their basename-relative paths are
-                    # unchanged.  An external feature cache is outside the
-                    # staging directory and must be rebased to the final
-                    # manifest directory before the manifest is sealed.
-                    if self.feature_cache_path is not None:
-                        for suffix in (".gxe.shard.json", ".gxe.ref.json"):
-                            manifest = Path(f"{stage_prefix}{suffix}")
-                            if not manifest.is_file():
-                                continue
-                            with open(manifest, "rt", encoding="utf-8") as handle:
-                                payload = json.load(handle)
-                            cache_decl = payload.get("feature_cache")
-                            if not isinstance(cache_decl, dict):
-                                raise RuntimeError(
-                                    f"Staged GxE manifest lacks feature-cache metadata: {manifest}."
-                                )
-                            cache_decl["path"] = os.path.relpath(
-                                Path(self.feature_cache_path).resolve(),
-                                start=final_prefix.parent,
-                            )
-                            self._atomic_json(payload, str(manifest))
-
-                    if provenance_preverified:
-                        # The multi-environment owner brackets publication with
-                        # shared full-file hashes. Avoid re-reading the same BED
-                        # twice for every environment while still catching
-                        # inode/size/timestamp changes before each bundle seal.
-                        self._assert_construction_genotype_state()
-                    else:
-                        self._assert_genotype_provenance_unchanged(
-                            initial_provenance
-                        )
+                    self._assert_construction_genotype_state()
 
                     staged_outputs = self._planned_output_paths()
-                    with self._performance_phase("output_hashing"):
-                        expected_published_hashes = {
-                            Path(
-                                f"{final_prefix}{str(staged)[len(str(stage_prefix)) :]}"
-                            ): self._file_sha256(str(staged))
-                            for staged in staged_outputs
-                        }
 
                     def publication_priority(path: Path) -> tuple[int, str]:
                         name = path.name
-                        if name.endswith(".gxe.shard.identity.json"):
-                            return (10, name)
-                        if name.endswith(".gxe.ref.json") or name.endswith(".gxe.shard.json"):
+                        if name.endswith(".gxe.ref.json"):
                             return (20, name)
                         if name.endswith(".gxe.moments.json"):
                             return (30, name)
                         return (0, name)
 
                     def verify_published_bundle() -> None:
-                        with self._performance_phase("output_hashing"):
+                        with self._performance_phase("output_validation"):
                             for path, device, inode in published:
                                 try:
                                     observed = path.stat(follow_symlinks=False)
@@ -4710,14 +3232,6 @@ class GenomewideEnvLDScore:
                                 ):
                                     raise RuntimeError(
                                         "A published GxE artifact was concurrently replaced "
-                                        f"before manifest commit: {path}."
-                                    )
-                                if (
-                                    self._file_sha256(str(path))
-                                    != expected_published_hashes[path]
-                                ):
-                                    raise RuntimeError(
-                                        "A published GxE artifact was modified in place "
                                         f"before manifest commit: {path}."
                                     )
 
@@ -4783,7 +3297,6 @@ class GenomewideEnvLDScore:
                         path.unlink(missing_ok=True)
             raise
         finally:
-            self._active_genotype_provenance = None
             self.outpath = original_outpath
             try:
                 observed_lock = lock_path.stat(follow_symlinks=False)
@@ -4814,13 +3327,7 @@ class GenomewideEnvLDScore:
         self.native_phase_timings = {}
         feature_started = time.perf_counter()
         try:
-            if self.feature_cache_path is None:
-                self.inv_sqrt_resvar_x_all, self.inv_sqrt_resvar_w_all = self._precompute_residual_variances()
-                self.feature_backend_provenance = self._backend_provenance(
-                    "feature_construction"
-                )
-            else:
-                self._load_feature_cache(self.feature_cache_path)
+            self.inv_sqrt_resvar_x_all, self.inv_sqrt_resvar_w_all = self._precompute_residual_variances()
         finally:
             self.native_phase_timings["feature_precompute"] = (
                 time.perf_counter() - feature_started
@@ -4933,7 +3440,6 @@ class GenomewideEnvLDScore:
         source_columns = self.nbins * max_vt
         q_rank = self.p_eff + 1
         global_source_columns = 2 * self.nbins * max_vt
-        jackknife_source_columns = 0
         native_feature_moment_copies = (
             8 if self.native_strict_feature_moment_verification else 4
         )
@@ -5045,7 +3551,6 @@ class GenomewideEnvLDScore:
             ),
             "source_columns": int(source_columns),
             "actual_global_2b_source_columns": int(global_source_columns),
-            "actual_jackknife_2b_source_columns": int(jackknife_source_columns),
             "target_source_columns": int(target_source_columns),
             "native_workspace_cap_bytes": native_workspace_cap_bytes,
             "native_execution_target_bytes": native_execution_target_bytes,
@@ -5105,7 +3610,7 @@ class GenomewideEnvLDScore:
         max_native_source_leakage = 0.0
         population_probe_square_sums = None
         population_same_probe_products = None
-        if not self.shard_mode and self.nvecs >= 2:
+        if self.nvecs >= 2:
             population_probe_square_sums = np.zeros(
                 (self.nsamp, 2 * self.nbins), dtype=np.float64
             )
@@ -5369,10 +3874,7 @@ class GenomewideEnvLDScore:
             self.log._log(f"Saving {labels[name]} trace scores into: {path}")
             self._save_score_file(path, scores[name])
             self._log_score_summary(f"{labels[name]} LD scores", scores[name])
-        if self.shard_mode:
-            self._write_shard_metadata(score_paths)
-        else:
-            self._write_bundle_metadata(score_paths)
+        self._write_bundle_metadata(score_paths)
 
         try:
             col_sums = pd.Series(self.nsnps_bin, index=self.l2cols)

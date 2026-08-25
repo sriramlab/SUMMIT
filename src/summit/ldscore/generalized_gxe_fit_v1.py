@@ -18,27 +18,23 @@ from summit.context.fit_v1 import (
     assemble_contextual_normal_equations_from_moments_v1,
 )
 from summit.context.oracle import coefficients_to_omegas
-from summit.context.schema import require_identical_scale_plans
 from summit.context.spec import (
-    RAW_PROJECTED_FEATURE_MODE,
     ContextComponentIndex,
-    array_sha256,
-    canonical_sha256,
     freeze_context_mapping,
     owned_readonly_array,
 )
-from summit.context.trait_v1 import (
-    ContextualTraitArtifactV1,
-    _trait_moments_after_deleting_groups_prevalidated_v1,
-)
+from summit.context.trait_v1 import ContextualTraitMomentsV1
 from summit.ldscore.generalized_gxe_reference_v1 import (
+    GENERALIZED_GXE_VARIANT_JACKKNIFE_METHOD,
     GeneralizedGxEVariantReferenceArtifactV1,
     _reference_moments_after_deleting_variant_blocks_prevalidated_v1,
 )
 from summit.ldscore.generalized_gxe_variant import (
-    GENERALIZED_GXE_VARIANT_JACKKNIFE_METHOD,
     GENERALIZED_GXE_VARIANT_REFERENCE_KIND,
     GENERALIZED_GXE_VARIANT_SCIENTIFIC_CONTRACT,
+)
+from summit.ldscore.generalized_gxe_trait_summary import (
+    GeneralizedGxETraitSummary,
 )
 
 
@@ -46,7 +42,8 @@ GENERALIZED_GXE_VARIANT_FIT_KIND = "summit.generalized_gxe.variant_ldscore_fit"
 
 
 def _select_trait(
-    trait: ContextualTraitArtifactV1, selector: str | int | None
+    trait: GeneralizedGxETraitSummary,
+    selector: str | int | None,
 ) -> tuple[int, str]:
     if selector is None:
         if trait.n_traits != 1:
@@ -58,67 +55,26 @@ def _select_trait(
 
 def validate_generalized_gxe_trait_compatibility_v1(
     reference: GeneralizedGxEVariantReferenceArtifactV1,
-    trait: ContextualTraitArtifactV1,
+    trait: GeneralizedGxETraitSummary,
 ) -> Mapping[str, Any]:
-    """Bind the new reference to an unchanged contextual trait artifact."""
+    """Check concrete axes and dimensions without cryptographic identities."""
     if not isinstance(reference, GeneralizedGxEVariantReferenceArtifactV1):
         raise ValueError("reference must be a generalized variant-LD-score artifact")
-    if not isinstance(trait, ContextualTraitArtifactV1):
-        raise ValueError("trait must be a ContextualTraitArtifactV1")
-    reference.verify()
-    trait.verify()
+    if not isinstance(trait, GeneralizedGxETraitSummary):
+        raise ValueError("trait must be a generalized per-variant trait summary")
     mismatches: list[str] = []
-    try:
-        require_identical_scale_plans(reference.scale_plan, trait.scale_plan)
-    except ValueError:
-        mismatches.append("genotype_scale_plan_sha256")
-    if reference.component_index.digest != trait.component_index.digest:
-        mismatches.append("component_map_sha256")
+    if reference.component_index.entries != trait.component_index.entries:
+        mismatches.append("component_order")
     if reference.block_labels != trait.group_ids:
         mismatches.append("group_ids")
-    axes = reference.manifest["axes"]
-    dimensions = trait.manifest.get("dimensions", {})
-    expected_dimensions = {
-        "M": reference.n_variants,
-        "Q": reference.component_index.pair_index.num_basis,
-        "K": len(reference.component_index.annotation_names),
-        "C": len(reference.component_index),
-        "J": len(reference.block_labels),
-    }
-    for name, expected in expected_dimensions.items():
-        if dimensions.get(name) != expected:
-            mismatches.append(f"dimensions.{name}")
-    identity = trait.manifest.get("identity", {})
-    identity_matches = {
-        "variant_order_allele_sha256": axes["variants"]["digest"],
-        "retained_variant_order_sha256": axes["variants"][
-            "retained_order_digest"
-        ],
-        "basis_specification_sha256": axes["basis"]["digest"],
-        "basis_calibration_sha256": axes["basis"]["calibration_digest"],
-        "fixed_effect_spec_sha256": axes["fixed_effects"]["digest"],
-    }
-    for name, expected in identity_matches.items():
-        if identity.get(name) != expected:
-            mismatches.append(f"identity.{name}")
-    maps = trait.manifest.get("maps", {})
-    map_matches = {
-        "annotation_map_sha256": axes["annotations"]["digest"],
-        "group_map_sha256": axes["jackknife_blocks"]["digest"],
-    }
-    for name, expected in map_matches.items():
-        if maps.get(name) != expected:
-            mismatches.append(f"maps.{name}")
-    if trait.manifest.get("feature_mode") != RAW_PROJECTED_FEATURE_MODE:
-        mismatches.append("feature_mode")
-    if tuple(axes["residual_components"]["names"]) != trait.residual_names:
+    if reference.n_variants != trait.n_variants:
+        mismatches.append("variant_count")
+    if tuple(reference.manifest["axes"]["residual_components"]["names"]) != trait.residual_names:
         mismatches.append("residual_component_names")
-    if array_sha256(reference.annotation_masses) != array_sha256(
-        trait.annotation_masses
-    ):
+    if not np.array_equal(reference.annotation_masses, trait.annotation_masses):
         mismatches.append("annotation_masses")
-    if array_sha256(reference.block_annotation_mass) != array_sha256(
-        trait.group_annotation_masses
+    if not np.array_equal(
+        reference.block_annotation_mass, trait.group_annotation_masses
     ):
         mismatches.append("group_annotation_masses")
     if not np.array_equal(reference.group_variant_counts, trait.group_variant_counts):
@@ -131,32 +87,67 @@ def validate_generalized_gxe_trait_compatibility_v1(
     return freeze_context_mapping(
         {
             "reference_kind": GENERALIZED_GXE_VARIANT_REFERENCE_KIND,
-            "reference_manifest_sha256": reference.manifest_sha256,
-            "trait_manifest_sha256": trait.manifest_sha256,
-            "trait_upstream_compatible_reference_identity_sha256": (
-                trait.manifest.get("compatible_reference_identity_sha256")
-            ),
-            "matched_scale_plan_sha256": reference.scale_plan.digest,
-            "matched_component_map_sha256": reference.component_index.digest,
-            "matched_variant_order_allele_sha256": axes["variants"]["digest"],
-            "matched_retained_variant_order_sha256": axes["variants"][
-                "retained_order_digest"
-            ],
-            "matched_basis_specification_sha256": axes["basis"]["digest"],
-            "matched_basis_calibration_sha256": axes["basis"][
-                "calibration_digest"
-            ],
-            "matched_fixed_effect_spec_sha256": axes["fixed_effects"]["digest"],
-            "matched_annotation_map_sha256": axes["annotations"]["digest"],
-            "matched_group_map_sha256": axes["jackknife_blocks"]["digest"],
-            "matched_group_sequence": list(reference.block_labels),
+            "variant_count": reference.n_variants,
+            "basis_count": reference.component_index.pair_index.num_basis,
+            "annotation_count": len(reference.component_index.annotation_names),
+            "component_count": len(reference.component_index),
+            "block_count": len(reference.block_labels),
+            "group_sequence": list(reference.block_labels),
+            "compatibility_policy": "direct_axes_dimensions_and_masses_v1",
         }
+    )
+
+
+def _trait_moments_after_deleting_blocks(
+    trait: GeneralizedGxETraitSummary,
+    blocks: Sequence[str],
+) -> ContextualTraitMomentsV1:
+    requested = tuple(blocks)
+    if len(set(requested)) != len(requested):
+        raise ValueError("deleted variant blocks must be unique")
+    unknown = set(requested) - set(trait.group_ids)
+    if unknown:
+        raise ValueError(f"unknown variant blocks: {sorted(unknown)}")
+    if not requested:
+        return trait.full_moments
+    deleted_set = set(requested)
+    deleted = np.asarray(
+        [label in deleted_set for label in trait.group_ids], dtype=bool
+    )
+    retained_masses = trait.annotation_masses - np.sum(
+        trait.group_annotation_masses[deleted], axis=0, dtype=np.float64
+    )
+    if np.any(retained_masses <= 0.0):
+        raise ValueError("variant-block deletion empties an annotation")
+    component_annotations = np.fromiter(
+        (entry.annotation_index for entry in trait.component_index.entries),
+        dtype=np.int64,
+        count=len(trait.component_index),
+    )
+    component_masses = retained_masses[component_annotations]
+    return ContextualTraitMomentsV1(
+        annotation_masses=retained_masses,
+        genetic_rhs=np.sum(
+            trait.group_rhs_unnormalized_num[~deleted], axis=0, dtype=np.float64
+        )
+        / component_masses[:, None],
+        genetic_traces=np.sum(
+            trait.group_trace_unnormalized_num[~deleted], axis=0, dtype=np.float64
+        )
+        / component_masses,
+        genetic_residual=np.sum(
+            trait.group_genetic_residual_num[~deleted], axis=0, dtype=np.float64
+        )
+        / component_masses[:, None],
+        residual_rhs=trait.residual_rhs,
+        residual_traces=trait.residual_traces,
+        residual_gram=trait.residual_gram,
     )
 
 
 def assemble_generalized_gxe_normal_equations_v1(
     reference: GeneralizedGxEVariantReferenceArtifactV1,
-    trait: ContextualTraitArtifactV1,
+    trait: GeneralizedGxETraitSummary,
     *,
     trait_selector: str | int | None = None,
     deleted_blocks: Sequence[str] = (),
@@ -173,7 +164,7 @@ def assemble_generalized_gxe_normal_equations_v1(
 
 def _assemble_generalized_gxe_normal_equations_prevalidated_v1(
     reference: GeneralizedGxEVariantReferenceArtifactV1,
-    trait: ContextualTraitArtifactV1,
+    trait: GeneralizedGxETraitSummary,
     *,
     trait_selector: str | int | None,
     deleted_blocks: Sequence[str],
@@ -188,9 +179,7 @@ def _assemble_generalized_gxe_normal_equations_prevalidated_v1(
             reference, requested
         )
     )
-    trait_moments = _trait_moments_after_deleting_groups_prevalidated_v1(
-        trait, requested
-    )
+    trait_moments = _trait_moments_after_deleting_blocks(trait, requested)
     return assemble_contextual_normal_equations_from_moments_v1(
         component_index=reference.component_index,
         reference_n=reference.n_samples,
@@ -204,7 +193,7 @@ def _assemble_generalized_gxe_normal_equations_prevalidated_v1(
 
 def assemble_generalized_gxe_normal_equation_batch_v1(
     reference: GeneralizedGxEVariantReferenceArtifactV1,
-    trait: ContextualTraitArtifactV1,
+    trait: GeneralizedGxETraitSummary,
     *,
     trait_selector: str | int | None = None,
     deleted_block_sets: Sequence[Sequence[str]],
@@ -280,17 +269,13 @@ class GeneralizedGxEVariantFitResultV1:
         )
 
     @property
-    def manifest_sha256(self) -> str:
-        return canonical_sha256(self.manifest)
-
-    @property
     def raw_rank(self) -> int:
         return int(self.manifest["solve"]["rank"])
 
 
 def fit_generalized_gxe_variant_model_v1(
     reference: GeneralizedGxEVariantReferenceArtifactV1,
-    trait: ContextualTraitArtifactV1,
+    trait: GeneralizedGxETraitSummary,
     *,
     trait_selector: str | int | None = None,
     rtol: float | None = None,
@@ -355,8 +340,6 @@ def fit_generalized_gxe_variant_model_v1(
         "schema_version": 1,
         "scientific_contract": GENERALIZED_GXE_VARIANT_SCIENTIFIC_CONTRACT,
         "source_reference_kind": GENERALIZED_GXE_VARIANT_REFERENCE_KIND,
-        "reference_manifest_sha256": reference.manifest_sha256,
-        "trait_manifest_sha256": trait.manifest_sha256,
         "selected_trait_id": trait_id,
         "selected_trait_index": trait_index,
         "jackknife_method": GENERALIZED_GXE_VARIANT_JACKKNIFE_METHOD,

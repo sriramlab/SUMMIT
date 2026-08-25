@@ -9,7 +9,6 @@ assembled later from fixed target-row summaries.
 from __future__ import annotations
 
 from dataclasses import dataclass
-import hashlib
 import json
 import os
 from pathlib import Path
@@ -17,15 +16,7 @@ from typing import Any, Mapping, Sequence
 
 import numpy as np
 
-from summit.context.oracle import rank_revealing_projector
-from summit.context.reference_v1 import contextual_variant_order_allele_sha256_v1
-from summit.context.spec import array_sha256, canonical_sha256
-from summit.context.trait_v1 import (
-    ContextualTraitArtifactV1,
-    ContextualTraitPublicationIdentityV1,
-    run_contextual_trait_v1,
-    write_contextual_trait_v1,
-)
+from summit.context.fixed import thin_rank_revealing_fixed_effect_basis
 from summit.ldscore.generalized_gxe_fit_v1 import (
     GeneralizedGxEVariantFitResultV1,
     assemble_generalized_gxe_normal_equation_batch_v1,
@@ -36,16 +27,22 @@ from summit.ldscore.generalized_gxe_native import (
     GeneralizedGxENativeResult,
     generalized_gxe_performance_ledger_from_native,
 )
+from summit.ldscore.generalized_gxe_trait_summary import (
+    GeneralizedGxETraitSummary,
+    aggregate_generalized_gxe_trait_statistics,
+    stream_generalized_gxe_per_variant_trait_statistics_from_bed,
+    write_generalized_gxe_trait_summary,
+)
 from summit.ldscore.generalized_gxe_reference_v1 import (
     GeneralizedGxEVariantReferenceArtifactV1,
     build_generalized_gxe_variant_reference_from_native_v1,
+    serialize_generalized_gxe_inference_axes,
     write_generalized_gxe_variant_reference_v1,
 )
 from summit.ldscore.generalized_gxe_variant import (
     GeneralizedGxEPlanInputs,
     GlobalVariantProbeSpec,
     plan_generalized_gxe_variant_work,
-    serialize_generalized_gxe_axes,
 )
 
 
@@ -97,7 +94,7 @@ class PlinkAxes:
 @dataclass(frozen=True)
 class ReferenceRun:
     artifact: GeneralizedGxEVariantReferenceArtifactV1
-    native_result: GeneralizedGxENativeResult
+    native_result: GeneralizedGxENativeResult | None
     artifact_path: Path | None
 
 
@@ -109,14 +106,6 @@ def canonical_json(value: Any) -> str:
         ensure_ascii=True,
         allow_nan=False,
     )
-
-
-def file_sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for block in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(block)
-    return digest.hexdigest()
 
 
 def read_plink_axes(prefix: str | Path) -> PlinkAxes:
@@ -206,7 +195,8 @@ def standardized(value: np.ndarray) -> np.ndarray:
 
 
 def fixed_basis(design: np.ndarray) -> np.ndarray:
-    return np.asfortranarray(rank_revealing_projector(design).fixed_basis)
+    """Return the production thin-QR basis without materializing ``N`` squared."""
+    return thin_rank_revealing_fixed_effect_basis(design)
 
 
 def symmetric_context_residual_basis(
@@ -238,26 +228,96 @@ def symmetric_context_residual_basis(
     return residual, names, pairs
 
 
-def balanced_block_ids(m: int, blocks: int) -> tuple[np.ndarray, tuple[str, ...]]:
-    if m < 2 or blocks < 2 or blocks > m:
+def rank_reduced_symmetric_context_residual_basis(
+    basis: np.ndarray,
+    basis_names: Sequence[str],
+    *,
+    relative_tolerance: float | None = None,
+) -> tuple[np.ndarray, tuple[str, ...], tuple[tuple[int, int], ...]]:
+    """Return an independent basis for the symmetric residual context span.
+
+    Products involving the intercept are considered first, followed by the
+    remaining squares and cross-products.  This makes a binary context's
+    linear term identifiable while pruning its redundant square.
+    """
+    values = np.asarray(basis, dtype=np.float64)
+    if values.ndim != 2 or values.shape[0] < 1 or values.shape[1] < 1:
+        raise ValueError("basis must be a nonempty finite matrix")
+    if not np.all(np.isfinite(values)):
+        raise ValueError("basis must be a nonempty finite matrix")
+    if len(basis_names) != values.shape[1] or len(set(basis_names)) != len(basis_names):
+        raise ValueError("basis names must be unique and match the basis columns")
+    if relative_tolerance is not None and (
+        not np.isfinite(relative_tolerance) or relative_tolerance <= 0.0
+    ):
+        raise ValueError("relative tolerance must be finite and positive")
+
+    q = values.shape[1]
+    pairs = tuple((0, right) for right in range(q)) + tuple(
+        (left, right)
+        for left in range(1, q)
+        for right in range(left, q)
+    )
+    columns = [
+        values[:, left]
+        * values[:, right]
+        * (1.0 if left == right else 2.0)
+        for left, right in pairs
+    ]
+    retained: list[int] = []
+    current = np.empty((values.shape[0], 0), dtype=np.float64)
+    current_rank = 0
+    for index, column in enumerate(columns):
+        candidate = np.column_stack([current, column])
+        if relative_tolerance is None:
+            candidate_rank = int(np.linalg.matrix_rank(candidate))
+        else:
+            singular = np.linalg.svd(candidate, compute_uv=False)
+            threshold = relative_tolerance * singular[0]
+            candidate_rank = int(np.count_nonzero(singular > threshold))
+        if candidate_rank > current_rank:
+            retained.append(index)
+            current = candidate
+            current_rank = candidate_rank
+
+    retained_pairs = tuple(pairs[index] for index in retained)
+    names = tuple(
+        "residual_" + basis_names[left] + "_x_" + basis_names[right]
+        for left, right in retained_pairs
+    )
+    return np.asfortranarray(current), names, retained_pairs
+
+
+def _normalized_row_selection(
+    axes: PlinkAxes,
+    sample_count: int,
+    row_selection: Sequence[int] | np.ndarray | None,
+) -> np.ndarray:
+    if row_selection is None:
+        if sample_count != axes.n:
+            raise ValueError(
+                "an explicit row selection is required when inputs do not use every FAM row"
+            )
+        return np.arange(axes.n, dtype=np.int64)
+    rows = np.asarray(row_selection, dtype=np.int64)
+    if rows.ndim != 1 or rows.size != sample_count:
+        raise ValueError("row selection must match the input sample axis")
+    if np.any(rows < 0) or np.any(rows >= axes.n):
+        raise ValueError("row selection contains an out-of-range FAM row")
+    if np.unique(rows).size != rows.size:
+        raise ValueError("row selection must not contain duplicate FAM rows")
+    return np.ascontiguousarray(rows)
+
+
+def balanced_inference_block_ids(
+    m: int, njack: int
+) -> tuple[np.ndarray, tuple[str, ...]]:
+    """Assign target SNPs to post-hoc normal-equation jackknife blocks."""
+    if m < 2 or njack < 2 or njack > m:
         raise ValueError("balanced blocks require 2 <= blocks <= M")
-    ids = np.minimum(np.arange(m, dtype=np.int64) * blocks // m, blocks - 1)
-    labels = tuple(f"block_{index:03d}" for index in range(blocks))
+    ids = np.minimum(np.arange(m, dtype=np.int64) * njack // m, njack - 1)
+    labels = tuple(f"block_{index:03d}" for index in range(njack))
     return ids, labels
-
-
-def zero_missingness_sha256(m: int, n: int) -> str:
-    """Hash the canonical M-by-N uint8 all-observed missingness matrix."""
-    digest = hashlib.sha256()
-    digest.update(b"|u1\0")
-    digest.update(np.asarray((m, n), dtype="<i8").tobytes())
-    zero_block = bytes(1024 * 1024)
-    remaining = m * n
-    while remaining:
-        width = min(remaining, len(zero_block))
-        digest.update(zero_block[:width])
-        remaining -= width
-    return digest.hexdigest()
 
 
 def _open_descriptors(prefix: Path) -> dict[str, int]:
@@ -363,14 +423,15 @@ def run_reference(
     fixed: np.ndarray,
     annotations: np.ndarray,
     annotation_names: Sequence[str],
-    block_ids: np.ndarray,
-    block_labels: Sequence[str],
+    inference_block_ids: np.ndarray,
+    inference_block_labels: Sequence[str],
     residual_names: Sequence[str],
     probes: int,
     seed: int,
     threads: int,
     memory_bytes: int,
     native_module: Any,
+    row_selection: Sequence[int] | np.ndarray | None = None,
     output: Path | None = None,
     include_directional_panel: bool = True,
     variant_block_width: int = 4096,
@@ -379,10 +440,11 @@ def run_reference(
 ) -> ReferenceRun:
     n, q = basis.shape
     m, k = annotations.shape
-    if (n, m) != (axes.n, axes.m):
-        raise ValueError("PLINK dimensions disagree with reference inputs")
+    if m != axes.m:
+        raise ValueError("PLINK variant count disagrees with reference inputs")
     if fixed.shape[0] != n:
         raise ValueError("fixed basis has the wrong sample count")
+    retained_samples = _normalized_row_selection(axes, n, row_selection)
     masses = np.sum(annotations, axis=0, dtype=np.float64)
     probe_spec = GlobalVariantProbeSpec(
         root_seed=seed, probe_offset=0, probe_count=probes
@@ -394,7 +456,6 @@ def run_reference(
             num_basis=q,
             num_annotations=k,
             num_probes=probes,
-            num_jackknife_blocks=len(block_labels),
             memory_limit_bytes=memory_bytes,
             genotype_format="bed",
             threads=threads,
@@ -408,14 +469,13 @@ def run_reference(
     try:
         native = GeneralizedGxENativeBEDExecutor(
             stable_descriptors=descriptors,
-            row_selection=None,
+            row_selection=retained_samples,
             ddof=1,
             basis=np.asfortranarray(basis, dtype=np.float64),
             fixed_effect_basis=np.asfortranarray(fixed, dtype=np.float64),
             annotations=np.ascontiguousarray(annotations, dtype=np.float64),
             annotation_names=tuple(annotation_names),
             annotation_masses=masses,
-            block_ids=np.ascontiguousarray(block_ids, dtype=np.int64),
             probe_spec=probe_spec,
             work_plan=plan,
             probe_tile_width=probe_tile_width,
@@ -447,37 +507,15 @@ def run_reference(
     }
     if failures:
         raise RuntimeError(f"reference clean-run ledger failed: {failures}")
-    retained = np.arange(m, dtype=np.int64)
-    counted_a1 = np.ones(m, dtype=np.uint8)
-    variant_digest = contextual_variant_order_allele_sha256_v1(
-        retained,
-        axes.variant_ids,
-        axes.counted_alleles,
-        axes.other_alleles,
-        counted_a1,
-    )
-    basis_digest = array_sha256(basis)
-    calibration_digest = array_sha256(basis.T @ basis)
-    fixed_digest = array_sha256(fixed)
-    annotation_digest = array_sha256(annotations)
-    block_digest = array_sha256(block_ids)
-    serialized_axes = serialize_generalized_gxe_axes(
+    serialized_axes = serialize_generalized_gxe_inference_axes(
         num_variants=m,
-        variant_digest=variant_digest,
-        retained_variant_digest=native.genotype_scale_plan.retained_variant_order_sha256,
         num_samples=n,
-        sample_digest=canonical_sha256({"ordered_iids": list(axes.sample_ids)}),
         basis_names=tuple(basis_names),
-        basis_digest=basis_digest,
-        basis_calibration_digest=calibration_digest,
-        fixed_effect_digest=fixed_digest,
         fixed_effect_rank=fixed.shape[1],
         annotation_names=tuple(annotation_names),
-        annotation_digest=annotation_digest,
         annotation_masses=masses,
-        variant_block_ids=block_ids,
-        block_labels=tuple(block_labels),
-        jackknife_block_digest=block_digest,
+        variant_block_ids=inference_block_ids,
+        block_labels=tuple(inference_block_labels),
         residual_component_names=tuple(residual_names),
     )
     telemetry = dict(native.telemetry)
@@ -486,31 +524,23 @@ def run_reference(
         "maximum_source_projection_leakage": float(telemetry["maximum_projection_leakage"]),
         "maximum_presymmetry_absolute_error": float(native.presymmetry_absolute_error),
         "maximum_presymmetry_relative_error": float(native.presymmetry_relative_error),
-        "block_reconstruction_error": float(native.block_reconstruction_error),
         "same_person_probe_count": probes,
         "same_person_cross_tile_finalized": True,
         "minimum_annotation_mass": float(np.min(masses)),
-        "minimum_deleted_annotation_mass": float(
-            np.min(masses[None, :] - native.block_annotation_mass)
-        ),
         "all_values_finite": True,
         "normal_matrix_rank": int(np.linalg.matrix_rank(native.genetic_gram)),
         "normal_matrix_condition": condition,
         "dense_oracle_fixture_version": "generalized_gxe_dense_oracle_v1",
         "backend_fixed_probe_maximum_error": 3.0e-13,
     }
-    build_info = dict(native_module.build_info())
     artifact = build_generalized_gxe_variant_reference_from_native_v1(
         native,
         axes=serialized_axes,
+        annotations=annotations,
         probe_spec=probe_spec,
-        genotype_scale_plan=native.genotype_scale_plan,
+        genotype_scale_plan=native.genotype_scale,
         performance_ledger=generalized_gxe_performance_ledger_from_native(native),
-        provenance={
-            "source_commit": str(build_info["source_commit"]),
-            "source_tree_sha256": str(build_info["source_tree_sha256"]),
-            "native_binary_sha256": file_sha256(Path(native_module.__file__)),
-        },
+        provenance={"native_module": str(Path(native_module.__file__))},
         diagnostics=diagnostics,
         include_directional_panel=include_directional_panel,
     )
@@ -528,133 +558,76 @@ def run_trait_batch(
     fixed: np.ndarray,
     annotations: np.ndarray,
     annotation_names: Sequence[str],
-    block_ids: np.ndarray,
-    block_labels: Sequence[str],
+    inference_block_ids: np.ndarray,
+    inference_block_labels: Sequence[str],
     phenotypes: np.ndarray,
     trait_names: Sequence[str],
     residual_basis: np.ndarray,
     residual_names: Sequence[str],
-    threads: int,
-    memory_bytes: int,
-    native_module: Any,
+    row_selection: Sequence[int] | np.ndarray | None = None,
     output: Path | None = None,
-    variant_block_width: int = 4096,
-) -> tuple[ContextualTraitArtifactV1, Path | None, Mapping[str, Any]]:
+    variant_block_width: int = 256,
+) -> tuple[GeneralizedGxETraitSummary, Path | None, Mapping[str, Any]]:
+    """Compute per-SNP study summaries in one BED traversal."""
     reference = reference_run.artifact
     native_reference = reference_run.native_result
-    n, q = basis.shape
-    m, k = annotations.shape
+    n = basis.shape[0]
+    m = annotations.shape[0]
     phenotypes = np.asfortranarray(phenotypes, dtype=np.float64)
     residual_basis = np.asfortranarray(residual_basis, dtype=np.float64)
     if phenotypes.shape != (n, len(trait_names)):
         raise ValueError("phenotype batch shape disagrees with trait names")
     if residual_basis.shape != (n, len(residual_names)):
         raise ValueError("residual basis shape disagrees with residual names")
-    ledger = dict(native_reference.ledger)
-    if int(ledger.get("missing_genotype_calls", -1)) != 0:
-        raise ValueError(
-            "benchmark trait handoff currently requires an imputed BED with zero missing calls"
+    if native_reference is None:
+        if (
+            reference.affine_mean is None
+            or reference.affine_inverse_scale is None
+        ):
+            raise ValueError(
+                "reference lacks the persisted genotype affine-scale handoff"
+            )
+        affine_mean = reference.affine_mean
+        affine_inverse_scale = reference.affine_inverse_scale
+    else:
+        affine_mean = native_reference.affine_mean
+        affine_inverse_scale = native_reference.affine_inverse_scale
+    retained_samples = _normalized_row_selection(axes, n, row_selection)
+    per_variant, performance = (
+        stream_generalized_gxe_per_variant_trait_statistics_from_bed(
+            bed_path=Path(str(axes.prefix) + ".bed"),
+            raw_sample_count=axes.n,
+            variant_count=axes.m,
+            sample_indices=retained_samples,
+            affine_mean=affine_mean,
+            affine_inverse_scale=affine_inverse_scale,
+            basis=basis,
+            fixed_basis=fixed,
+            phenotypes=phenotypes,
+            residual_basis=residual_basis,
+            variant_block_width=variant_block_width,
         )
-    retained_samples = np.arange(n, dtype=np.int64)
-    retained_variants = np.arange(m, dtype=np.int64)
-    counted_a1 = np.ones(m, dtype=np.uint8)
-    expected_missing = np.zeros(m, dtype=np.int64)
-    missingness_sha = zero_missingness_sha256(m, n)
-    variant_digest = contextual_variant_order_allele_sha256_v1(
-        retained_variants,
-        axes.variant_ids,
-        axes.counted_alleles,
-        axes.other_alleles,
-        counted_a1,
     )
-    sample_map_sha = array_sha256(retained_samples)
-    sample_order_sha = canonical_sha256({"ordered_iids": list(axes.sample_ids)})
-    basis_digest = array_sha256(basis)
-    calibration_digest = array_sha256(basis.T @ basis)
-    fixed_digest = array_sha256(fixed)
-    annotation_digest = array_sha256(annotations)
-    block_digest = array_sha256(block_ids)
-    publication = ContextualTraitPublicationIdentityV1(
-        sample_order_sha256=sample_order_sha,
-        variant_order_allele_sha256=variant_digest,
-        fixed_effect_spec_sha256=fixed_digest,
-        basis_specification_sha256=basis_digest,
-        basis_calibration_sha256=calibration_digest,
-        compatible_reference_identity_sha256=reference.manifest_sha256,
-        retained_sample_map_sha256=sample_map_sha,
-        retained_variant_order_sha256=array_sha256(retained_variants),
-        fixed_basis_sha256=fixed_digest,
-        evaluated_phi_sha256=basis_digest,
-        genotype_scale_plan_sha256=native_reference.genotype_scale_plan.digest,
-        missingness_sha256=missingness_sha,
-        annotation_map_sha256=annotation_digest,
-        annotation_names=tuple(annotation_names),
-        group_map_sha256=block_digest,
-        group_ids=tuple(block_labels),
-        phenotype_batch_sha256=array_sha256(phenotypes),
-        residual_basis_sha256=array_sha256(residual_basis),
-        trait_ids=tuple(trait_names),
-        residual_names=tuple(residual_names),
+    trait = aggregate_generalized_gxe_trait_statistics(
+        per_variant,
+        annotations=annotations,
+        annotation_names=annotation_names,
+        variant_group_ids=inference_block_ids,
+        group_labels=inference_block_labels,
+        trait_ids=trait_names,
+        residual_names=residual_names,
+        n_samples=n,
+        retain_per_variant=True,
     )
-    options = {
-        "annotation_mode": "generic_nonnegative_weights_v1",
-        "retained_variant_order_sha256": array_sha256(retained_variants),
-        "affine_mean_sha256": array_sha256(native_reference.affine_mean),
-        "affine_inverse_scale_sha256": array_sha256(native_reference.affine_inverse_scale),
-        "missingness_sha256": missingness_sha,
-        "scale_plan_sha256": native_reference.genotype_scale_plan.digest,
-        "centering_source": native_reference.genotype_scale_plan.centering_source,
-        "variant_block": variant_block_width,
-        "trait_feature_tile": variant_block_width,
-        "decode_threads": threads,
-        "blas_threads": threads,
-        "workspace_cap_bytes": memory_bytes,
-        "telemetry_capacity": 64 * 1024**2,
-        "numa_policy": "unbound_first_touch_v1",
-        "output_numa_node": -1,
-    }
-    descriptors = _open_descriptors(axes.prefix)
-    try:
-        executor = native_module.ContextualTraitExecutorV1(
-            descriptors[".bed"],
-            descriptors[".bim"],
-            descriptors[".fam"],
-            retained_samples,
-            retained_variants,
-            list(axes.variant_ids),
-            list(axes.counted_alleles),
-            list(axes.other_alleles),
-            counted_a1,
-            native_reference.affine_mean,
-            native_reference.affine_inverse_scale,
-            expected_missing,
-            fixed,
-            basis,
-            annotations,
-            block_ids,
-            phenotypes,
-            residual_basis,
-            list(annotation_names),
-            list(block_labels),
-            list(trait_names),
-            list(residual_names),
-            **options,
-        )
-    finally:
-        for descriptor in descriptors.values():
-            os.close(descriptor)
-    preflight = dict(executor.preflight())
-    trait = run_contextual_trait_v1(executor, publication)
-    performance = dict(executor.performance_report())
     artifact_path = None
     if output is not None:
-        artifact_path = write_contextual_trait_v1(trait, output)
-    return trait, artifact_path, {"preflight": preflight, "performance": performance}
+        artifact_path = write_generalized_gxe_trait_summary(trait, output)
+    return trait, artifact_path, {"performance": performance}
 
 
 def full_fits(
     reference: GeneralizedGxEVariantReferenceArtifactV1,
-    trait: ContextualTraitArtifactV1,
+    trait: GeneralizedGxETraitSummary,
 ) -> tuple[GeneralizedGxEVariantFitResultV1, ...]:
     return tuple(
         fit_generalized_gxe_variant_model_v1(reference, trait, trait_selector=index)
@@ -664,7 +637,7 @@ def full_fits(
 
 def restricted_diagonal_fit(
     reference: GeneralizedGxEVariantReferenceArtifactV1,
-    trait: ContextualTraitArtifactV1,
+    trait: GeneralizedGxETraitSummary,
     trait_index: int,
     *,
     residual_indices: Sequence[int] | None = None,
@@ -737,6 +710,8 @@ def fit_record(fit: GeneralizedGxEVariantFitResultV1) -> dict[str, Any]:
         "component_names": names,
         "coefficients": fit.raw_coefficients.tolist(),
         "standard_errors": fit.raw_standard_errors.tolist(),
+        "jackknife_covariance": fit.raw_jackknife_covariance.tolist(),
+        "loo_coefficients": fit.raw_loo_coefficients.tolist(),
         "omegas": fit.raw_omegas.tolist(),
         "rank": fit.raw_rank,
         "condition_number": float(fit.manifest["solve"]["condition_number"]),

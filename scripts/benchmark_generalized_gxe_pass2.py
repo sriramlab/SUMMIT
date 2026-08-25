@@ -107,7 +107,6 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--basis", type=int, default=3)
     parser.add_argument("--annotations", type=int, default=1)
     parser.add_argument("--probes", type=int, default=128)
-    parser.add_argument("--jackknife-blocks", type=int, default=20)
     parser.add_argument("--variant-block-width", type=int, default=512)
     parser.add_argument("--pass1-probe-width", type=int, default=64)
     parser.add_argument("--pass2-probe-width", type=int, default=128)
@@ -116,15 +115,6 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--memory-gib", type=float, default=2.0)
     parser.add_argument("--calibration-repeats", type=int, default=3)
     return parser
-
-
-def _block_ids(num_variants: int, block_count: int) -> np.ndarray:
-    return np.repeat(
-        np.arange(block_count, dtype=np.int64),
-        np.diff(
-            np.linspace(0, num_variants, block_count + 1, dtype=np.int64)
-        ),
-    )
 
 
 def _peak_rss_bytes() -> int:
@@ -177,7 +167,6 @@ def run(args: argparse.Namespace) -> dict:
         "basis",
         "annotations",
         "probes",
-        "jackknife_blocks",
         "variant_block_width",
         "pass1_probe_width",
         "pass2_probe_width",
@@ -188,8 +177,6 @@ def run(args: argparse.Namespace) -> dict:
             raise ValueError(f"--{name.replace('_', '-')} must be positive")
     if args.probes < 2:
         raise ValueError("--probes must be at least two")
-    if args.jackknife_blocks < 2 or args.jackknife_blocks > args.variants:
-        raise ValueError("--jackknife-blocks must be in [2, variants]")
     if args.pass2_probe_width > args.probes:
         raise ValueError("--pass2-probe-width cannot exceed --probes")
     if not np.isfinite(args.memory_gib) or args.memory_gib <= 0.0:
@@ -225,7 +212,7 @@ def run(args: argparse.Namespace) -> dict:
             target_xz_mem=0.5,
             gxe_total_memory_gib=args.memory_gib,
             impute_method="mean",
-            kernel_mode="standardized",
+            kernel_mode="standardized_projected",
             genotype_scale="sample",
             native_backend="python",
         )
@@ -243,7 +230,6 @@ def run(args: argparse.Namespace) -> dict:
                     num_basis=args.basis,
                     num_annotations=args.annotations,
                     num_probes=args.probes,
-                    num_jackknife_blocks=args.jackknife_blocks,
                     memory_limit_bytes=int(args.memory_gib * 1024**3),
                     genotype_format="bed",
                     threads=threads,
@@ -286,7 +272,6 @@ def run(args: argparse.Namespace) -> dict:
                 fixed_effect_basis=fixed,
                 annotations=annotations,
                 annotation_names=names,
-                block_ids=_block_ids(args.variants, args.jackknife_blocks),
                 work_plan=plan,
                 tn_operator=ProtectedTNOperator(
                     threads=threads, native_module=gxeldcore
@@ -315,7 +300,6 @@ def run(args: argparse.Namespace) -> dict:
             "Q": args.basis,
             "K": args.annotations,
             "B": args.probes,
-            "J": args.jackknife_blocks,
         },
         "threads": threads,
         "variant_block_width": args.variant_block_width,

@@ -1,14 +1,12 @@
-"""Canonical binary64 annotation semantics (audit Finding 1).
+"""Canonical binary64 annotation semantics.
 
 The user-supplied annotation matrix defines the scientific estimand.  It must
 stay contiguous binary64 independently of the randomized retained-storage
-``dtype`` option, and the artifact schema must distinguish binary64-annotation
-references (schema v4) from legacy references that may have rounded continuous
-annotations to the storage dtype (schema v3).
+``dtype`` option, and the current artifact schema pledges binary64 annotation
+storage explicitly.
 """
 from __future__ import annotations
 
-import hashlib
 import json
 import shutil
 from pathlib import Path
@@ -102,7 +100,7 @@ def _estimator(prefix, environment, out_path, column, *, annot, dtype, num_vecs=
         dtype=dtype,
         num_threads=2,
         target_xz_mem=0.01,
-        kernel_mode="standardized",
+        kernel_mode="standardized_projected",
         genotype_scale="sample",
         native_backend="python",
     )
@@ -140,15 +138,6 @@ def _scores(out_dir: Path, column: str) -> dict[str, np.ndarray]:
         ]
         result[suffix] = frame[value_columns].to_numpy()
     return result
-
-
-def _expected_digest(names, matrix: np.ndarray) -> str:
-    digest = hashlib.sha256()
-    for name in names:
-        digest.update(str(name).encode("utf-8"))
-        digest.update(b"\n")
-    digest.update(np.asarray(matrix, dtype="<f8", order="C").tobytes(order="C"))
-    return digest.hexdigest()
 
 
 def test_canonical_conversion_is_exact_and_validated():
@@ -204,14 +193,10 @@ def test_annotation_matrix_and_masses_ignore_storage_dtype(tmp_path):
             observed[dtype] = (
                 estimator.annot.tobytes(),
                 estimator.nsnps_bin.tobytes(),
-                estimator._annotation_digest(),
             )
         finally:
             estimator.close()
     assert observed["float32"] == observed["float64"]
-    assert observed["float64"][2] == _expected_digest(
-        ["CONT_A", "CONT_B", "CONT_C"], expected
-    )
 
 
 def test_reference_outputs_identical_across_storage_dtypes(tmp_path):
@@ -239,7 +224,6 @@ def test_reference_outputs_identical_across_storage_dtypes(tmp_path):
             assert manifest["schema_version"] == 4
             assert manifest["annotation_value_dtype"] == "float64"
             assert manifest["randomization"]["dtype"] == dtype
-        assert left_manifest["annotation_digest"] == right_manifest["annotation_digest"]
         assert left_manifest["annotation_masses"] == right_manifest["annotation_masses"]
         assert left_manifest["annotation_masses"] == [
             float(value)
@@ -275,12 +259,7 @@ def test_reference_schema_pledge_handling(tmp_path):
         tmp_path, prefix, environment, annot, "float64", "pledge"
     )
     manifest_path = out_dir / "ref.age.gxe.ref.json"
-    scratch = tmp_path / "scratch"
-    scratch.mkdir()
-
-    validated = gxe_score._validate_reference_manifest(
-        manifest_path, scratch_dir=scratch
-    )
+    validated = gxe_score._validate_reference_manifest(manifest_path)
     assert validated.payload["schema_version"] == 4
     assert validated.payload["annotation_value_dtype"] == "float64"
 
@@ -296,33 +275,17 @@ def test_reference_schema_pledge_handling(tmp_path):
     def drop_pledge(payload):
         del payload["annotation_value_dtype"]
 
-    with pytest.raises(ValueError, match="binary64 annotation pledge"):
-        gxe_score._validate_reference_manifest(
-            doctored("v4_missing_pledge", drop_pledge), scratch_dir=scratch
-        )
+    with pytest.raises(ValueError, match="float64"):
+        gxe_score._validate_reference_manifest(doctored("v4_missing_pledge", drop_pledge))
 
     def downgrade_keep_pledge(payload):
         payload["schema_version"] = 3
 
-    with pytest.raises(ValueError, match="unexpected annotation dtype pledge"):
-        gxe_score._validate_reference_manifest(
-            doctored("v3_with_pledge", downgrade_keep_pledge), scratch_dir=scratch
-        )
-
-    def legacy(payload):
-        payload["schema_version"] = 3
-        del payload["annotation_value_dtype"]
-        del payload["annotation_digest"]
-
-    legacy_validated = gxe_score._validate_reference_manifest(
-        doctored("v3_legacy", legacy), scratch_dir=scratch
-    )
-    assert legacy_validated.payload["schema_version"] == 3
+    with pytest.raises(ValueError, match="current schema-v4"):
+        gxe_score._validate_reference_manifest(doctored("v3", downgrade_keep_pledge))
 
     def unsupported(payload):
         payload["schema_version"] = 5
 
-    with pytest.raises(ValueError, match="schema-v3 or schema-v4"):
-        gxe_score._validate_reference_manifest(
-            doctored("v5_unknown", unsupported), scratch_dir=scratch
-        )
+    with pytest.raises(ValueError, match="current schema-v4"):
+        gxe_score._validate_reference_manifest(doctored("v5_unknown", unsupported))
