@@ -498,6 +498,9 @@ def _write_results_table(path: str, rows: list[tuple], nbins: int):
     header = ["phen_index", "phen", "num_bins", "h2", "h2_se"]
     header.extend(f"h2bin_{j}" for j in range(nbins))
     header.extend(f"h2bin_se_{j}" for j in range(nbins))
+    header.extend(f"enrichment_{j}" for j in range(nbins))
+    header.extend(f"enrichment_se_{j}" for j in range(nbins))
+    header.append("enrichment_mode")
     header.append("estimator")
     with open(tmp, "w") as handle:
         handle.write("\t".join(header) + "\n")
@@ -511,6 +514,9 @@ def _write_results_table(path: str, rows: list[tuple], nbins: int):
             ]
             row.extend(format(float(fit.h2[j, 0]), ".12g") for j in range(nbins))
             row.extend(format(float(fit.h2[j, 1]), ".12g") for j in range(nbins))
+            row.extend(format(float(fit.enrich[j, 0]), ".12g") for j in range(nbins))
+            row.extend(format(float(fit.enrich[j, 1]), ".12g") for j in range(nbins))
+            row.append(str(fit.enrich_mode_used))
             row.append(str((fit.weight_info or {}).get("estimator", "he")))
             handle.write("\t".join(row) + "\n")
     os.replace(tmp, path)

@@ -154,6 +154,26 @@ def test_fast_batch_matches_legacy_with_sparse_drops(tmp_path):
         rtol=2e-11,
         atol=2e-11,
     )
+    expected_enrichment_columns = {
+        *(f"enrichment_{j}" for j in range(3)),
+        *(f"enrichment_se_{j}" for j in range(3)),
+        "enrichment_mode",
+    }
+    assert expected_enrichment_columns.issubset(fast_table.columns)
+    assert set(fast_table["enrichment_mode"]) == {"overlap"}
+    for j in range(3):
+        np.testing.assert_allclose(
+            fast_table[f"enrichment_{j}"],
+            [fit.enrich[j, 0] for fit in fast_results],
+            rtol=2e-11,
+            atol=2e-11,
+        )
+        np.testing.assert_allclose(
+            fast_table[f"enrichment_se_{j}"],
+            [fit.enrich[j, 1] for fit in fast_results],
+            rtol=2e-11,
+            atol=2e-11,
+        )
     assert set(fast_table["estimator"]) == {"he"}
 
 
@@ -360,3 +380,12 @@ def test_fast_batch_cli_dispatch(tmp_path, module):
     table = pd.read_csv(str(out) + ".results.tsv", sep="\t")
     assert table.shape[0] == 2
     assert np.isfinite(table[["h2", "h2_se"]].to_numpy()).all()
+    assert {
+        "enrichment_0",
+        "enrichment_1",
+        "enrichment_2",
+        "enrichment_se_0",
+        "enrichment_se_1",
+        "enrichment_se_2",
+        "enrichment_mode",
+    }.issubset(table.columns)

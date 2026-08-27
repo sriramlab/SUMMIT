@@ -403,6 +403,9 @@ class Sumrhe:
         header = ["phen_index", "phen", "num_bins", "h2", "h2_se"]
         header.extend([f"h2bin_{j}" for j in range(k)])
         header.extend([f"h2bin_se_{j}" for j in range(k)])
+        header.extend([f"enrichment_{j}" for j in range(k)])
+        header.extend([f"enrichment_se_{j}" for j in range(k)])
+        header.append("enrichment_mode")
         header.append("estimator")
 
         with open(tmp, "w") as fout:
@@ -419,6 +422,9 @@ class Sumrhe:
                 ]
                 row.extend(format(float(fit.h2[j, 0]), ".12g") for j in range(k))
                 row.extend(format(float(fit.h2[j, 1]), ".12g") for j in range(k))
+                row.extend(format(float(fit.enrich[j, 0]), ".12g") for j in range(k))
+                row.extend(format(float(fit.enrich[j, 1]), ".12g") for j in range(k))
+                row.append(str(fit.enrich_mode_used))
                 row.append(str((fit.weight_info or {}).get("estimator", "he")))
                 fout.write("\t".join(row) + "\n")
 
