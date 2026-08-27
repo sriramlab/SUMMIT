@@ -645,6 +645,39 @@ def restricted_diagonal_fit(
     """Fit diagonal genetic Omega with a selected residual nuisance subset."""
     pairs = reference.component_index.pair_index.entries
     genetic = [index for index, pair in enumerate(pairs) if pair.q == pair.r]
+    return restricted_genetic_fit(
+        reference,
+        trait,
+        trait_index,
+        genetic_pair_indices=genetic,
+        residual_indices=residual_indices,
+    )
+
+
+def restricted_genetic_fit(
+    reference: GeneralizedGxEVariantReferenceArtifactV1,
+    trait: GeneralizedGxETraitSummary,
+    trait_index: int | str,
+    *,
+    genetic_pair_indices: Sequence[int],
+    residual_indices: Sequence[int] | None = None,
+    normal_equations: Sequence[Any] | None = None,
+) -> dict[str, Any]:
+    """Fit a declared genetic-pair subset with fixed residual nuisance terms.
+
+    ``normal_equations`` may contain the full system followed by the same
+    delete-block systems used by the full fit. Supplying it lets several
+    nested restrictions reuse one inference-time assembly; it never changes
+    or re-estimates the per-SNP reference LD scores.
+    """
+    pairs = reference.component_index.pair_index.entries
+    genetic = [int(index) for index in genetic_pair_indices]
+    if not genetic:
+        raise ValueError("restricted fit requires at least one genetic pair")
+    if len(set(genetic)) != len(genetic):
+        raise ValueError("restricted genetic pair indices must be unique")
+    if any(index < 0 or index >= len(pairs) for index in genetic):
+        raise ValueError("restricted genetic pair index is out of range")
     if residual_indices is None:
         residual_local = list(range(len(trait.residual_names)))
     else:
@@ -658,12 +691,20 @@ def restricted_diagonal_fit(
     residual = [len(reference.component_index) + index for index in residual_local]
     selected = np.asarray(genetic + residual, dtype=np.int64)
 
-    systems = assemble_generalized_gxe_normal_equation_batch_v1(
-        reference,
-        trait,
-        trait_selector=trait_index,
-        deleted_block_sets=((), *((label,) for label in reference.block_labels)),
-    )
+    if normal_equations is None:
+        systems = assemble_generalized_gxe_normal_equation_batch_v1(
+            reference,
+            trait,
+            trait_selector=trait_index,
+            deleted_block_sets=((), *((label,) for label in reference.block_labels)),
+        )
+    else:
+        systems = tuple(normal_equations)
+        if len(systems) != len(reference.block_labels) + 1:
+            raise ValueError(
+                "normal equations must contain the full system and one system "
+                "per inference block"
+            )
 
     def solve(equations) -> np.ndarray:
         matrix = equations.matrix[np.ix_(selected, selected)]
@@ -672,7 +713,7 @@ def restricted_diagonal_fit(
         values = np.linalg.solve(matrix, rhs)
         relative = np.linalg.norm(matrix @ values - rhs) / max(np.linalg.norm(rhs), 1.0)
         if relative > 1.0e-10:
-            raise RuntimeError("restricted diagonal solve residual is too large")
+            raise RuntimeError("restricted solve residual is too large")
         return values
 
     coefficients = solve(systems[0])
@@ -685,6 +726,7 @@ def restricted_diagonal_fit(
     return {
         "component_names": names,
         "selected_indices": selected.tolist(),
+        "selected_genetic_pair_indices": genetic,
         "selected_residual_indices": residual_local,
         "coefficients": coefficients.tolist(),
         "standard_errors": standard_errors.tolist(),

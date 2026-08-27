@@ -225,7 +225,6 @@ from .transform import (
     write_context_transform_summary,
 )
 from .multienvironment import (
-    DEFAULT_MAX_BASIS,
     MULTIENVIRONMENT_CALIBRATION_KIND,
     MULTIENVIRONMENT_PRESET_KIND,
     MULTIENVIRONMENT_SCHEMA_VERSION,
@@ -251,7 +250,6 @@ from .multienvironment import (
 )
 from .direction import (
     DEFAULT_MAX_CONTEXT_METRIC_CONDITION,
-    DEFAULT_MAX_ENVIRONMENTS,
     DIRECTION_CROSSFIT_KIND,
     DIRECTION_ESTIMAND,
     DIRECTION_OBJECTIVES,
@@ -353,9 +351,7 @@ __all__ = [
     "DenseNormalEquations",
     "DEFAULT_SOLVE_RTOL",
     "DEFAULT_FIT_V1_RTOL",
-    "DEFAULT_MAX_BASIS",
     "DEFAULT_MAX_CONTEXT_METRIC_CONDITION",
-    "DEFAULT_MAX_ENVIRONMENTS",
     "DIRECTION_CROSSFIT_KIND",
     "DIRECTION_ESTIMAND",
     "DIRECTION_OBJECTIVES",

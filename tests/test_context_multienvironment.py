@@ -309,13 +309,20 @@ def test_typed_categories_do_not_coerce_boolean_and_integer_identity() -> None:
         )
 
 
-def test_q_limit_counts_expanded_categorical_columns() -> None:
+def test_five_column_basis_calibrates_and_applies() -> None:
     sources = _reference_sources(seed=7105)
     mask = np.ones(len(sources["first"]), dtype=bool)
-    too_many = _source_specs() + (MultiEnvironmentSourceSpec("extra", "continuous"),)
+    five_columns = _source_specs() + (
+        MultiEnvironmentSourceSpec("extra", "continuous"),
+    )
     sources["extra"] = np.linspace(-1.0, 1.0, mask.size)
-    with pytest.raises(ValueError, match="(?i)basis|Q|maximum|4"):
-        calibrate_multienvironment_basis(sources, too_many, mask=mask, max_basis=4)
+    calibration = calibrate_multienvironment_basis(
+        sources, five_columns, mask=mask
+    )
+    preset = apply_multienvironment_calibration(calibration, sources, mask=mask)
+    assert calibration.basis.shape == (mask.size, 5)
+    assert preset.basis.shape == (mask.size, 5)
+    assert len(preset.component_index.pair_index) == 15
 
 
 def test_fixed_effect_main_effects_interactions_and_hashes_are_explicit() -> None:

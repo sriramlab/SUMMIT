@@ -180,10 +180,6 @@ ContextualDensePreflightNumbersV1 contextual_dense_preflight_numbers_v1(
             "and variant probe count must be at least two"
         );
     }
-    if (q > 4)
-        throw std::runtime_error(
-            "ContextualBlockExecutorV1 validation: Q must be in [1,4]"
-        );
     if (fixed_rank >= n)
         throw std::runtime_error(
             "ContextualBlockExecutorV1 validation: fixed rank must be below N"
@@ -194,7 +190,9 @@ ContextualDensePreflightNumbersV1 contextual_dense_preflight_numbers_v1(
     variant_probe_tile = variant_probe_tile == 0
         ? variant_probes : std::min(variant_probe_tile, variant_probes);
     const std::uint64_t pairs = contextual_checked_u64_v1(
-        static_cast<__uint128_t>(q) * (q + 1) / 2, "pair count"
+        static_cast<__uint128_t>(q)
+            * (static_cast<__uint128_t>(q) + 1U) / 2U,
+        "pair count"
     );
     const std::uint64_t components = contextual_mul_u64_v1(
         k, pairs, "component count"
@@ -792,10 +790,6 @@ private:
             throw std::runtime_error(
                 "ContextualBlockExecutorV1 validation: dimensions must be "
                 "positive and variant probe count must be at least two"
-            );
-        if (q_ > 4)
-            throw std::runtime_error(
-                "ContextualBlockExecutorV1 validation: Q must be in [1,4]"
             );
         if (rank_ >= n_)
             throw std::runtime_error(

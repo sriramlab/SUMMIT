@@ -62,8 +62,10 @@ def _fixture(
 
     environment = rng.normal(size=n)
     basis_columns = [np.ones(n), environment]
-    if q_count == 3:
-        basis_columns.append(0.35 * environment**2 + rng.normal(size=n))
+    for index in range(2, q_count):
+        basis_columns.append(
+            (0.15 + 0.1 * index) * environment**index + rng.normal(size=n)
+        )
     basis = np.asfortranarray(np.column_stack(basis_columns[:q_count]))
     fixed = orthonormalize(
         np.column_stack([np.ones(n), rng.normal(size=n)])
@@ -212,7 +214,13 @@ def _native(
 
 @pytest.mark.parametrize(
     ("q_count", "annotation_count", "seed"),
-    ((1, 1, 6101), (2, 1, 6201), (3, 1, 6301), (3, 2, 6302)),
+    (
+        (1, 1, 6101),
+        (2, 1, 6201),
+        (3, 1, 6301),
+        (3, 2, 6302),
+        (5, 1, 6501),
+    ),
 )
 def test_native_dense_matches_every_stage05_layer(
     tmp_path: Path,

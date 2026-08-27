@@ -482,7 +482,6 @@ def _case(q_count: int, args: argparse.Namespace) -> dict[str, Any]:
             fixture["source_specs"],
             mask=fixture["reference_mask"],
             basis_id=f"benchmark_q{q_count}",
-            max_basis=4,
         )
     )
     reference_preset, reference_apply_seconds, reference_apply_peak = _timed(

@@ -529,8 +529,8 @@ def _random_case(q_count: int, *, seed: int) -> dict[str, Any]:
     }
 
 
-@pytest.mark.parametrize("q_count", [1, 2, 3, 4])
-def test_seeded_random_q1_q4_matches_active_python_builders(q_count: int) -> None:
+@pytest.mark.parametrize("q_count", [1, 2, 3, 4, 5])
+def test_seeded_random_q1_q5_matches_active_python_builders(q_count: int) -> None:
     case = _random_case(q_count, seed=71100 + q_count)
     oracle_reference, oracle_summary = _oracle_artifacts(case)
     result = dict(

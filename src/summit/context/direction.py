@@ -60,7 +60,6 @@ DIRECTION_OBJECTIVES = (
     "interaction_trace_contribution",
     "he_moment_gain",
 )
-DEFAULT_MAX_ENVIRONMENTS = 3
 DEFAULT_MAX_CONTEXT_METRIC_CONDITION = 1.0e10
 
 
@@ -594,10 +593,8 @@ def build_direction_reference_contractions(
     if context_array.shape[0] != n_samples:
         raise ValueError("Reference genotype and context sample counts differ.")
     n_environments = context_array.shape[1]
-    if n_environments < 1 or n_environments > DEFAULT_MAX_ENVIRONMENTS:
-        raise ValueError(
-            f"Direction learning supports 1..{DEFAULT_MAX_ENVIRONMENTS} environments."
-        )
+    if n_environments < 1:
+        raise ValueError("Direction learning requires at least one environment.")
     names = _environment_names(environment_names, n_environments)
     metric = _validate_metric(context_metric, n_environments)
     projector_array, _ = _validate_projector(
@@ -713,10 +710,8 @@ def build_direction_trait_contractions(
     if context_array.shape[0] != n_samples:
         raise ValueError("Study genotype and context sample counts differ.")
     n_environments = context_array.shape[1]
-    if n_environments < 1 or n_environments > DEFAULT_MAX_ENVIRONMENTS:
-        raise ValueError(
-            f"Direction learning supports 1..{DEFAULT_MAX_ENVIRONMENTS} environments."
-        )
+    if n_environments < 1:
+        raise ValueError("Direction learning requires at least one environment.")
     names = _environment_names(environment_names, n_environments)
     metric = _validate_metric(context_metric, n_environments)
     projector_array, residual_rank = _validate_projector(

@@ -472,7 +472,7 @@ def test_pair_weights_use_diagonal_first_order_and_no_extra_offdiagonal_factor()
     assert observed[3] < 0.0
 
 
-@pytest.mark.parametrize("l_count", [2, 3])
+@pytest.mark.parametrize("l_count", [2, 3, 4])
 def test_every_stored_base_pair_moment_matches_explicit_dense_kernels(
     l_count: int,
 ) -> None:

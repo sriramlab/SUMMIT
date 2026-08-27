@@ -2,9 +2,7 @@
 
 This module is a correctness-first layer over the generic contextual engine.  It
 owns reference calibration, a declared cohort mask, nuisance-design identity,
-explicit basis pruning, pair contrasts, and basis-metric covariance modes.  It
-does not learn an environment direction and it deliberately caps the retained
-basis at four columns for the Python development path.
+explicit basis pruning, pair contrasts, and basis-metric covariance modes.
 """
 
 from __future__ import annotations
@@ -43,7 +41,6 @@ from .spec import (
 MULTIENVIRONMENT_CALIBRATION_KIND = "summit.context.multienvironment_calibration"
 MULTIENVIRONMENT_PRESET_KIND = "summit.context.multienvironment_preset"
 MULTIENVIRONMENT_SCHEMA_VERSION = 1
-DEFAULT_MAX_BASIS = 4
 
 
 def _name(value: Any, label: str) -> str:
@@ -405,14 +402,11 @@ def calibrate_multienvironment_basis(
     *,
     mask: object,
     basis_id: str = "multienvironment",
-    max_basis: int = DEFAULT_MAX_BASIS,
 ) -> MultiEnvironmentCalibration:
     """Fit immutable centers, scales, levels, and ``M_phi`` on a reference."""
     specs = tuple(source_specs)
     if not specs or len({spec.name for spec in specs}) != len(specs):
         raise ValueError("Source specifications must be nonempty and uniquely named.")
-    if isinstance(max_basis, bool) or not isinstance(max_basis, int) or max_basis < 1:
-        raise ValueError("max_basis must be a positive integer.")
     n_samples = _source_length(sources, specs)
     retained = _mask(mask, n_samples)
     calibrations: list[MultiEnvironmentSourceCalibration] = []
@@ -534,11 +528,6 @@ def calibrate_multienvironment_basis(
             )
         )
     basis = np.ascontiguousarray(np.column_stack(columns), dtype=np.float64)
-    if basis.shape[1] > max_basis:
-        raise ValueError(
-            f"Requested basis has Q={basis.shape[1]}; fixed multi-environment v1 "
-            f"requires Q <= {max_basis}."
-        )
     basis_spec = ContextBasisSpec(basis_id=basis_id, columns=tuple(column_specs))
     metric = np.ascontiguousarray(basis.T @ basis / basis.shape[0], dtype=np.float64)
     conditioning = _calibration_conditioning(basis, basis_spec.names)
@@ -559,7 +548,6 @@ def calibrate_multienvironment_basis(
         "reference_basis_hash": array_sha256(basis),
         "metric_semantics": "uncentered_reference_second_moment_E_phi_phi_transpose",
         "q": basis.shape[1],
-        "max_basis": max_basis,
     }
     return MultiEnvironmentCalibration(
         basis_spec=basis_spec,
@@ -795,8 +783,6 @@ def apply_multienvironment_calibration(
     if pruning_value.transform.shape[0] != requested_basis.shape[1]:
         raise ValueError("Pruning transform has an incompatible requested basis.")
     basis = np.ascontiguousarray(requested_basis @ pruning_value.transform)
-    if basis.shape[1] > DEFAULT_MAX_BASIS:
-        raise ValueError(f"Retained basis Q={basis.shape[1]} exceeds the v1 Q<=4 cap.")
     reference_metric = np.ascontiguousarray(
         pruning_value.transform.T @ calibration.basis_metric @ pruning_value.transform
     )

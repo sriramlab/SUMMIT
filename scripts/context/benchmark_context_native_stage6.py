@@ -3036,8 +3036,6 @@ def _validate_public_args(args: argparse.Namespace) -> None:
         value = getattr(args, name)
         if not math.isfinite(value) or value <= 0.0:
             raise ValueError(f"--{name.replace('_', '-')} must be positive")
-    if args.q > 4:
-        raise ValueError("--q cannot exceed the frozen native maximum of four")
     if args.fixed_rank >= args.retained_samples:
         raise ValueError("--fixed-rank must be smaller than retained samples")
     if args.sample_probes < 2 or args.variant_probes < 2:
