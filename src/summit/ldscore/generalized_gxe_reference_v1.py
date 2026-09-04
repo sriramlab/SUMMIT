@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import tempfile
+import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Mapping, Sequence
@@ -33,6 +34,10 @@ GENERALIZED_GXE_VARIANT_JACKKNIFE_METHOD = (
     "frozen_full_genome_variant_ldscore_delete_block_v1"
 )
 GENERALIZED_GXE_VARIANT_SAME_PERSON_JACKKNIFE = "reuse_full_same_person_v1"
+GENERALIZED_GXE_VARIANT_SAME_PERSON_METHOD = (
+    "exact_component_kernel_diagonal_v1"
+)
+GENERALIZED_GXE_VARIANT_REFERENCE_MODES = ("summary", "composable")
 GENERALIZED_GXE_VARIANT_REFERENCE_V1_SUFFIX = (
     ".generalized-gxe-variant-ldscore-v1.npz"
 )
@@ -48,6 +53,8 @@ _REQUIRED_ARRAY_NAMES = (
 _OPTIONAL_ARRAY_NAMES = (
     "deleted_genetic_gram",
     "directional_ldscores",
+    "annotations",
+    "component_kernel_diagonal",
     "affine_mean",
     "affine_inverse_scale",
 )
@@ -143,7 +150,9 @@ def serialize_generalized_gxe_inference_axes(
     if (
         np.any(block_values < 0)
         or np.any(block_values >= len(labels))
-        or set(block_values.tolist()) != set(range(len(labels)))
+        or not np.array_equal(
+            np.unique(block_values), np.arange(len(labels), dtype=np.int64)
+        )
     ):
         raise ValueError("variant block IDs do not match the block labels")
     pairs = ContextPairIndex(len(basis_labels))
@@ -188,6 +197,7 @@ def reduce_generalized_gxe_reference_for_inference(
     annotations: np.ndarray,
     variant_block_ids: Sequence[int] | np.ndarray,
     block_labels: Sequence[str],
+    expected_directed_numerator: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray, float]:
     """Reduce fixed per-SNP LD scores into delete-block normal-equation terms.
 
@@ -211,7 +221,9 @@ def reduce_generalized_gxe_reference_for_inference(
         or len(set(labels)) != len(labels)
         or np.any(block_ids < 0)
         or np.any(block_ids >= len(labels))
-        or set(block_ids.tolist()) != set(range(len(labels)))
+        or not np.array_equal(
+            np.unique(block_ids), np.arange(len(labels), dtype=np.int64)
+        )
     ):
         raise ValueError("inference blocks must be nonempty, contiguous, and labeled")
     if (
@@ -227,26 +239,83 @@ def reduce_generalized_gxe_reference_for_inference(
     block_directed = np.empty(
         (block_count, component_count, component_count), dtype=np.float64
     )
-    for annotation in range(annotation_count):
-        annotation_weight = weights[:, annotation]
-        block_masses[:, annotation] = np.bincount(
-            block_ids, weights=annotation_weight, minlength=block_count
+    transitions = np.flatnonzero(block_ids[1:] != block_ids[:-1]) + 1
+    contiguous_balanced_blocks = (
+        block_ids[0] == 0
+        and block_ids[-1] == block_count - 1
+        and transitions.size == block_count - 1
+        and np.array_equal(
+            block_ids[transitions], np.arange(1, block_count, dtype=np.int64)
         )
-        for target_pair in range(pair_count):
-            left = annotation * pair_count + target_pair
-            for right in range(component_count):
-                block_directed[:, left, right] = np.bincount(
-                    block_ids,
-                    weights=(
-                        annotation_weight
-                        * directional[:, target_pair, right]
-                    ),
-                    minlength=block_count,
-                )
+    )
+    boundaries = (
+        np.concatenate(([0], transitions, [m]))
+        if contiguous_balanced_blocks
+        else None
+    )
+    singleton_rows = np.count_nonzero(weights, axis=1) == 1
+    singleton_layout = bool(np.all(singleton_rows))
+    if singleton_layout:
+        singleton_index = np.argmax(weights, axis=1)
+        singleton_weight = weights[np.arange(m), singleton_index]
+    for block in range(block_count):
+        selected: slice | np.ndarray
+        if boundaries is not None:
+            selected = slice(
+                int(boundaries[block]), int(boundaries[block + 1])
+            )
+        else:
+            selected = block_ids == block
+        block_weights = weights[selected]
+        block_directional = directional[selected]
+        if singleton_layout:
+            block_singleton_index = singleton_index[selected]
+            block_singleton_weight = singleton_weight[selected]
+            block_masses[block] = np.bincount(
+                block_singleton_index,
+                weights=block_singleton_weight,
+                minlength=annotation_count,
+            )
+            reduced = np.zeros(
+                (annotation_count, pair_count * component_count),
+                dtype=np.float64,
+            )
+            flattened = block_directional.reshape(
+                block_directional.shape[0], pair_count * component_count
+            )
+            for annotation in range(annotation_count):
+                annotation_rows = block_singleton_index == annotation
+                if np.any(annotation_rows):
+                    reduced[annotation] = (
+                        block_singleton_weight[annotation_rows]
+                        @ flattened[annotation_rows]
+                    )
+            block_directed[block] = reduced.reshape(
+                component_count, component_count
+            )
+        else:
+            block_masses[block] = np.sum(
+                block_weights, axis=0, dtype=np.float64
+            )
+            block_directed[block] = np.einsum(
+                "mk,mpr->kpr",
+                block_weights,
+                block_directional,
+                dtype=np.float64,
+                optimize=True,
+            ).reshape(component_count, component_count)
     reconstructed = np.sum(block_directed, axis=0, dtype=np.float64)
-    full = np.einsum(
-        "mk,mpr->kpr", weights, directional, optimize=True
-    ).reshape(component_count, component_count)
+    if expected_directed_numerator is None:
+        full = np.einsum(
+            "mk,mpr->kpr", weights, directional, optimize=True
+        ).reshape(component_count, component_count)
+    else:
+        full = np.asarray(expected_directed_numerator, dtype=np.float64)
+        if (
+            full.shape != (component_count, component_count)
+            or not np.all(np.isfinite(full))
+        ):
+            raise ValueError("expected directed numerator is invalid")
     reconstruction_error = float(
         np.max(np.abs(reconstructed - full), initial=0.0)
     )
@@ -259,6 +328,13 @@ def _validate_reference_structure(
     """Validate the concrete axes and numeric arrays directly."""
     if manifest.get("kind") != GENERALIZED_GXE_VARIANT_REFERENCE_KIND:
         raise ValueError("not a generalized variant-LD-score reference")
+    if manifest.get("same_person_method") != (
+        GENERALIZED_GXE_VARIANT_SAME_PERSON_METHOD
+    ):
+        raise ValueError("generalized reference same-person method is obsolete")
+    mode = manifest.get("publication_mode")
+    if mode not in GENERALIZED_GXE_VARIANT_REFERENCE_MODES:
+        raise ValueError("generalized reference publication mode is invalid")
     try:
         axes = manifest["axes"]
         n = int(axes["samples"]["count"])
@@ -299,7 +375,10 @@ def _validate_reference_structure(
         or len(block_labels) < 2
         or np.any(block_ids < 0)
         or np.any(block_ids >= len(block_labels))
-        or set(block_ids.tolist()) != set(range(len(block_labels)))
+        or not np.array_equal(
+            np.unique(block_ids),
+            np.arange(len(block_labels), dtype=np.int64),
+        )
     ):
         raise ValueError("generalized reference block axis is invalid")
 
@@ -319,6 +398,8 @@ def _validate_reference_structure(
     optional = {
         "deleted_genetic_gram": (j_count, c_count, c_count),
         "directional_ldscores": (m, len(pairs), c_count),
+        "annotations": (m, k_count),
+        "component_kernel_diagonal": (c_count, n),
         "affine_mean": (m,),
         "affine_inverse_scale": (m,),
     }
@@ -332,6 +413,31 @@ def _validate_reference_structure(
         raise ValueError("generalized reference contains nonfinite numeric values")
     if ("affine_mean" in arrays) != ("affine_inverse_scale" in arrays):
         raise ValueError("genotype affine vectors must be present together")
+    composition_names = {
+        "directional_ldscores",
+        "annotations",
+        "component_kernel_diagonal",
+    }
+    present_composition = composition_names.intersection(arrays)
+    if mode == "composable" and present_composition != composition_names:
+        raise ValueError("composable reference payload is incomplete")
+    if mode == "summary" and present_composition.intersection(
+        {"annotations", "component_kernel_diagonal"}
+    ):
+        raise ValueError("summary reference contains private composition arrays")
+    if "annotations" in arrays:
+        if np.any(arrays["annotations"] < 0.0):
+            raise ValueError("generalized reference annotations are negative")
+        observed_masses = np.sum(
+            arrays["annotations"], axis=0, dtype=np.float64
+        )
+        if not np.allclose(
+            observed_masses,
+            annotation_masses,
+            rtol=2.0e-15,
+            atol=0.0,
+        ):
+            raise ValueError("stored annotations disagree with annotation masses")
     if "affine_inverse_scale" in arrays and np.any(
         arrays["affine_inverse_scale"] <= 0.0
     ):
@@ -365,6 +471,8 @@ class GeneralizedGxEVariantReferenceArtifactV1:
     same_person: np.ndarray
     deleted_genetic_gram: np.ndarray | None = None
     directional_ldscores: np.ndarray | None = None
+    annotations: np.ndarray | None = None
+    component_kernel_diagonal: np.ndarray | None = None
     affine_mean: np.ndarray | None = None
     affine_inverse_scale: np.ndarray | None = None
     component_index: ContextComponentIndex = field(init=False)
@@ -430,6 +538,10 @@ class GeneralizedGxEVariantReferenceArtifactV1:
         return int(self.manifest["axes"]["variants"]["count"])
 
     @property
+    def publication_mode(self) -> str:
+        return str(self.manifest["publication_mode"])
+
+    @property
     def residual_rank(self) -> int:
         return int(self.manifest["axes"]["fixed_effects"]["residual_rank"])
 
@@ -478,10 +590,13 @@ def build_generalized_gxe_variant_reference_v1(
     performance_ledger: Mapping[str, Any],
     provenance: Mapping[str, Any],
     diagnostics: Mapping[str, Any],
+    mode: str = "summary",
 ) -> GeneralizedGxEVariantReferenceArtifactV1:
     """Construct a reference validated from its concrete fields and arrays."""
     if not isinstance(probe_spec, GlobalVariantProbeSpec):
         raise TypeError("probe_spec must be a GlobalVariantProbeSpec")
+    if mode not in GENERALIZED_GXE_VARIANT_REFERENCE_MODES:
+        raise ValueError("mode must be 'summary' or 'composable'")
     if isinstance(genotype_scale_plan, GenotypeScalePlanV1):
         scale_record = {
             "genotype_scale_policy": genotype_scale_plan.policy.value,
@@ -501,7 +616,13 @@ def build_generalized_gxe_variant_reference_v1(
         raise TypeError("genotype scale metadata must be a mapping")
     if not scale_record or any(not key or not value for key, value in scale_record.items()):
         raise ValueError("genotype scale metadata is invalid")
-    owned = {name: _owned_readonly(value) for name, value in arrays.items()}
+    # The frozen artifact performs the single ownership copy in __post_init__.
+    # Copying here as well doubled peak memory for composable directional
+    # panels without adding an isolation boundary.
+    prepared = {
+        name: np.asarray(value, dtype=np.float64)
+        for name, value in arrays.items()
+    }
     randomization = {
         "distribution": "rademacher",
         "algorithm": "counter_global_variant_global_probe_v1",
@@ -510,7 +631,7 @@ def build_generalized_gxe_variant_reference_v1(
         "probe_count": probe_spec.probe_count,
         "variant_index_space": "retained_ordered_variant_axis_v1",
         "tile_invariant": True,
-        "shared_with_same_person": True,
+        "shared_with_same_person": False,
         "stream_namespace": probe_spec.namespace,
         "stream_namespace_key_uint64": probe_spec.namespace_key,
     }
@@ -519,12 +640,12 @@ def build_generalized_gxe_variant_reference_v1(
         "logical_layout": "variant_target_pair_source_component_c",
         "logical_compute_dtype": "float64",
     }
-    if "directional_ldscores" in owned:
+    if "directional_ldscores" in prepared:
         panel = {
             **panel,
             "storage": "inline_npz",
             "array": "directional_ldscores",
-            **_numeric_metadata(owned["directional_ldscores"]),
+            **_numeric_metadata(prepared["directional_ldscores"]),
         }
     block_labels = list(axes["jackknife_blocks"]["block_labels"])
     manifest = {
@@ -535,6 +656,8 @@ def build_generalized_gxe_variant_reference_v1(
         "probe_axis": "variant",
         "feature_convention": GENERALIZED_GXE_VARIANT_FEATURE_CONVENTION,
         "normal_equation_assembly": GENERALIZED_GXE_VARIANT_NORMAL_ASSEMBLY,
+        "publication_mode": mode,
+        "same_person_method": GENERALIZED_GXE_VARIANT_SAME_PERSON_METHOD,
         "jackknife_method": GENERALIZED_GXE_VARIANT_JACKKNIFE_METHOD,
         "same_person_jackknife": GENERALIZED_GXE_VARIANT_SAME_PERSON_JACKKNIFE,
         "axes": dict(axes),
@@ -551,7 +674,7 @@ def build_generalized_gxe_variant_reference_v1(
             "same_person_deletion": GENERALIZED_GXE_VARIANT_SAME_PERSON_JACKKNIFE,
         },
         "numeric_arrays": {
-            name: _numeric_metadata(value) for name, value in owned.items()
+            name: _numeric_metadata(value) for name, value in prepared.items()
         },
         "pass_ledger": dict(pass_ledger),
         "performance_ledger": dict(performance_ledger),
@@ -562,7 +685,10 @@ def build_generalized_gxe_variant_reference_v1(
     }
     return GeneralizedGxEVariantReferenceArtifactV1(
         manifest=manifest,
-        **{name: owned.get(name) for name in (*_REQUIRED_ARRAY_NAMES, *_OPTIONAL_ARRAY_NAMES)},
+        **{
+            name: prepared.get(name)
+            for name in (*_REQUIRED_ARRAY_NAMES, *_OPTIONAL_ARRAY_NAMES)
+        },
     )
 
 
@@ -635,10 +761,13 @@ def build_generalized_gxe_variant_reference_from_native_v1(
     provenance: Mapping[str, Any],
     diagnostics: Mapping[str, Any],
     include_directional_panel: bool = False,
+    mode: str = "summary",
 ) -> GeneralizedGxEVariantReferenceArtifactV1:
     """Publishable adapter from the Stage 06 native result, without genotypes."""
     if not isinstance(include_directional_panel, bool):
         raise ValueError("native artifact inclusion policy must be boolean")
+    if mode not in GENERALIZED_GXE_VARIANT_REFERENCE_MODES:
+        raise ValueError("mode must be 'summary' or 'composable'")
     native_scale = getattr(native_result, "genotype_scale", None)
     if native_scale is not None and not isinstance(native_scale, Mapping):
         raise ValueError("native genotype scale metadata is invalid")
@@ -659,13 +788,28 @@ def build_generalized_gxe_variant_reference_from_native_v1(
         annotations=annotations,
         variant_block_ids=axes["jackknife_blocks"]["variant_block_ids"],
         block_labels=axes["jackknife_blocks"]["block_labels"],
+        expected_directed_numerator=np.asarray(
+            native_result.directed_numerator
+        ),
         )
     )
     arrays["block_directed_numerator"] = block_directed
     arrays["block_annotation_mass"] = block_masses
-    if include_directional_panel:
+    if include_directional_panel or mode == "composable":
         arrays["directional_ldscores"] = np.asarray(
             getattr(native_result, "directional_ldscores")
+        )
+    if mode == "composable":
+        component_diagonal = getattr(
+            native_result, "component_kernel_diagonal", None
+        )
+        if component_diagonal is None:
+            raise ValueError(
+                "composable native result lacks component kernel diagonals"
+            )
+        arrays["annotations"] = np.asarray(annotations)
+        arrays["component_kernel_diagonal"] = np.asarray(
+            component_diagonal
         )
     arrays["affine_mean"] = np.asarray(getattr(native_result, "affine_mean"))
     arrays["affine_inverse_scale"] = np.asarray(
@@ -694,6 +838,232 @@ def build_generalized_gxe_variant_reference_from_native_v1(
         performance_ledger=performance_ledger,
         provenance=provenance,
         diagnostics=diagnostic_record,
+        mode=mode,
+    )
+
+
+def compose_generalized_gxe_variant_references_v1(
+    selections: Sequence[
+        tuple[GeneralizedGxEVariantReferenceArtifactV1, Sequence[str]]
+    ],
+    *,
+    variant_block_ids: Sequence[int] | np.ndarray,
+    block_labels: Sequence[str],
+    mode: str = "summary",
+) -> GeneralizedGxEVariantReferenceArtifactV1:
+    """Compose selected annotation columns without genotype access."""
+    if mode not in GENERALIZED_GXE_VARIANT_REFERENCE_MODES:
+        raise ValueError("mode must be 'summary' or 'composable'")
+    if not selections:
+        raise ValueError("at least one reference selection is required")
+    first = selections[0][0]
+    if not isinstance(first, GeneralizedGxEVariantReferenceArtifactV1):
+        raise TypeError("reference selections must contain generalized references")
+    first.verify()
+    first_axes = first.manifest["axes"]
+    pair_count = len(first.component_index.pair_index)
+    compatibility_fields = (
+        "randomization",
+        "genotype_scale",
+        "scientific_contract",
+        "feature_convention",
+    )
+    selected_names: list[str] = []
+    selected_masses: list[float] = []
+    annotation_columns: list[np.ndarray] = []
+    directional_columns: list[np.ndarray] = []
+    diagonal_rows: list[np.ndarray] = []
+    source_count = 0
+    for artifact, requested_names in selections:
+        if not isinstance(
+            artifact, GeneralizedGxEVariantReferenceArtifactV1
+        ):
+            raise TypeError(
+                "reference selections must contain generalized references"
+            )
+        artifact.verify()
+        if artifact.publication_mode != "composable":
+            raise ValueError("reference selection is not composable")
+        axes = artifact.manifest["axes"]
+        mismatches = []
+        if artifact.n_samples != first.n_samples:
+            mismatches.append("sample_count")
+        if artifact.n_variants != first.n_variants:
+            mismatches.append("variant_count")
+        if axes["basis"] != first_axes["basis"]:
+            mismatches.append("basis_order")
+        if axes["pairs"] != first_axes["pairs"]:
+            mismatches.append("pair_order")
+        if axes["fixed_effects"] != first_axes["fixed_effects"]:
+            mismatches.append("fixed_effect_dimensions")
+        if axes["residual_components"] != first_axes["residual_components"]:
+            mismatches.append("residual_component_order")
+        for field in compatibility_fields:
+            if artifact.manifest.get(field) != first.manifest.get(field):
+                mismatches.append(field)
+        if (artifact.affine_mean is None) != (first.affine_mean is None):
+            mismatches.append("genotype_affine_presence")
+        if artifact.affine_mean is not None and (
+            not np.array_equal(artifact.affine_mean, first.affine_mean)
+            or not np.array_equal(
+                artifact.affine_inverse_scale,
+                first.affine_inverse_scale,
+            )
+        ):
+            mismatches.append("genotype_affine_values")
+        if mismatches:
+            raise ValueError(
+                "incompatible generalized reference bundles: "
+                + ", ".join(sorted(set(mismatches)))
+            )
+        assert artifact.annotations is not None
+        assert artifact.directional_ldscores is not None
+        assert artifact.component_kernel_diagonal is not None
+        available = artifact.component_index.annotation_names
+        requested = tuple(str(value) for value in requested_names)
+        if not requested:
+            raise ValueError("each reference selection must request annotations")
+        for name in requested:
+            try:
+                annotation = available.index(name)
+            except ValueError as exc:
+                raise ValueError(f"unknown annotation {name!r}") from exc
+            if name in selected_names:
+                raise ValueError(f"duplicate composed annotation {name!r}")
+            selected_names.append(name)
+            selected_masses.append(float(artifact.annotation_masses[annotation]))
+            annotation_columns.append(artifact.annotations[:, annotation])
+            component_slice = slice(
+                annotation * pair_count,
+                (annotation + 1) * pair_count,
+            )
+            directional_columns.append(
+                artifact.directional_ldscores[:, :, component_slice]
+            )
+            diagonal_rows.append(
+                artifact.component_kernel_diagonal[component_slice, :]
+            )
+        source_count += 1
+
+    annotations = np.ascontiguousarray(
+        np.column_stack(annotation_columns), dtype=np.float64
+    )
+    directional = np.ascontiguousarray(
+        np.concatenate(directional_columns, axis=2), dtype=np.float64
+    )
+    component_diagonal = np.ascontiguousarray(
+        np.concatenate(diagonal_rows, axis=0), dtype=np.float64
+    )
+    component_count = directional.shape[2]
+    directed = np.einsum(
+        "mk,mpr->kpr",
+        annotations,
+        directional,
+        dtype=np.float64,
+        optimize=True,
+    ).reshape(component_count, component_count)
+    block_directed, block_masses, reconstruction_error = (
+        reduce_generalized_gxe_reference_for_inference(
+            directional_ldscores=directional,
+            annotations=annotations,
+            variant_block_ids=variant_block_ids,
+            block_labels=block_labels,
+            expected_directed_numerator=directed,
+        )
+    )
+    symmetric = 0.5 * (directed + directed.T)
+    component_masses = np.repeat(
+        np.asarray(selected_masses, dtype=np.float64), pair_count
+    )
+    genetic_gram = (
+        float(first.residual_rank**2)
+        * symmetric
+        / np.outer(component_masses, component_masses)
+    )
+    same_person = component_diagonal @ component_diagonal.T
+    same_person = 0.5 * (same_person + same_person.T)
+    axes = serialize_generalized_gxe_inference_axes(
+        num_variants=first.n_variants,
+        num_samples=first.n_samples,
+        basis_names=tuple(first_axes["basis"]["names"]),
+        fixed_effect_rank=int(first_axes["fixed_effects"]["rank"]),
+        annotation_names=tuple(selected_names),
+        annotation_masses=np.asarray(selected_masses, dtype=np.float64),
+        variant_block_ids=variant_block_ids,
+        block_labels=block_labels,
+        residual_component_names=tuple(
+            first_axes["residual_components"]["names"]
+        ),
+    )
+    arrays: dict[str, np.ndarray] = {
+        "directed_numerator": directed,
+        "symmetric_numerator": symmetric,
+        "genetic_gram": genetic_gram,
+        "block_directed_numerator": block_directed,
+        "block_annotation_mass": block_masses,
+        "same_person": same_person,
+    }
+    if first.affine_mean is not None:
+        arrays["affine_mean"] = first.affine_mean
+        assert first.affine_inverse_scale is not None
+        arrays["affine_inverse_scale"] = first.affine_inverse_scale
+    if mode == "composable":
+        arrays.update(
+            {
+                "directional_ldscores": directional,
+                "annotations": annotations,
+                "component_kernel_diagonal": component_diagonal,
+            }
+        )
+    randomization = first.manifest["randomization"]
+    probe_spec = GlobalVariantProbeSpec(
+        root_seed=int(randomization["root_seed"]),
+        probe_offset=int(randomization["probe_offset"]),
+        probe_count=int(randomization["probe_count"]),
+        namespace=str(randomization["stream_namespace"]),
+    )
+    zero_phases = {
+        name: 0.0 for name in ("pass1", "barrier", "pass2", "finalize")
+    }
+    return build_generalized_gxe_variant_reference_v1(
+        axes=axes,
+        probe_spec=probe_spec,
+        genotype_scale_plan=first.genotype_scale,
+        arrays=arrays,
+        pass_ledger={
+            "construction": "annotation_column_composition_v1",
+            "source_bundle_count": source_count,
+            "genotype_passes_during_composition": 0,
+        },
+        performance_ledger={
+            "backend": "in_memory_directional_panel_reducer_v1",
+            "threads": 1,
+            "affinity": {},
+            "numa_evidence": {},
+            "phase_wall_seconds": dict(zero_phases),
+            "phase_cpu_seconds": dict(zero_phases),
+            "bytes_read": 0,
+            "gemm_dimensions": [],
+            "peak_rss_bytes": 0,
+            "output_bytes": sum(value.nbytes for value in arrays.values()),
+        },
+        provenance={
+            "construction": "annotation_column_composition_v1",
+            "source_bundle_count": source_count,
+            "genotype_accessed": False,
+        },
+        diagnostics={
+            "block_reconstruction_error": reconstruction_error,
+            "minimum_annotation_mass": float(np.min(selected_masses)),
+            "minimum_deleted_annotation_mass": float(
+                np.min(
+                    np.asarray(selected_masses, dtype=np.float64)[None, :]
+                    - block_masses
+                )
+            ),
+            "all_values_finite": True,
+        },
+        mode=mode,
     )
 
 
@@ -768,6 +1138,14 @@ def write_generalized_gxe_variant_reference_v1(
     if not isinstance(artifact, GeneralizedGxEVariantReferenceArtifactV1):
         raise ValueError("only the generalized variant-LD-score V1 artifact is accepted")
     artifact.verify()
+    if artifact.publication_mode == "composable":
+        warnings.warn(
+            "--mode composable writes sample-aligned generalized GxE "
+            "component kernel diagonals; this artifact should not be "
+            "publicly shared (yet).",
+            UserWarning,
+            stacklevel=2,
+        )
     arrays = _artifact_arrays(artifact)
     manifest_json = np.asarray(canonical_json(artifact.manifest))
     path = Path(output)
@@ -781,7 +1159,12 @@ def write_generalized_gxe_variant_reference_v1(
     )
     try:
         with os.fdopen(descriptor, "wb") as handle:
-            np.savez_compressed(
+            writer = (
+                np.savez
+                if artifact.publication_mode == "composable"
+                else np.savez_compressed
+            )
+            writer(
                 handle,
                 manifest_json=manifest_json,
                 **arrays,
@@ -855,7 +1238,10 @@ def load_generalized_gxe_variant_reference_v1(
                     raise ValueError(
                         f"generalized reference array {name!r} disagrees with metadata"
                     )
-                arrays[name] = np.array(value, dtype=np.float64, order="C", copy=True)
+                # np.load has already materialized an owning array.  The
+                # artifact constructor makes the sole defensive ownership
+                # copy after the archive closes.
+                arrays[name] = value
     except (OSError, ValueError) as exc:
         if isinstance(exc, ValueError) and (
             str(exc).startswith(_FAMILY)

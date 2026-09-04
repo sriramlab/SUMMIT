@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -59,9 +60,17 @@ def test_primary_shape_benchmark_plan_is_an_exact_two_pass_dry_run(
         / "scripts"
         / "benchmark_generalized_gxe_variant.py"
     )
+    environment = dict(os.environ)
+    environment["PYTHONPATH"] = os.pathsep.join(
+        (
+            str(Path(__file__).resolve().parents[1] / "src"),
+            str(Path(pytest.__file__).resolve().parent.parent),
+        )
+    )
     completed = subprocess.run(
         [
             sys.executable,
+            "-S",
             str(script),
             "plan",
             "--samples",
@@ -86,6 +95,7 @@ def test_primary_shape_benchmark_plan_is_an_exact_two_pass_dry_run(
         check=True,
         capture_output=True,
         text=True,
+        env=environment,
     )
     payload = json.loads(completed.stdout)
     assert payload["schema"] == (

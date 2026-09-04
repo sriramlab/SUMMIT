@@ -99,12 +99,25 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--probe-tile-width", type=int, default=4)
     parser.add_argument("--memory-gib", type=float, default=4.0)
     parser.add_argument("--seed", type=int, default=20260822)
+    parser.add_argument(
+        "--mode",
+        choices=("summary", "composable"),
+        default="summary",
+        help=(
+            "summary writes the public-release-safe aggregate artifact; "
+            "composable also stores sample-aligned data that should not be "
+            "publicly shared"
+        ),
+    )
     parser.add_argument("--omit-directional-panel", action="store_true")
     return parser
 
 
 def main() -> int:
-    args = build_parser().parse_args()
+    parser = build_parser()
+    args = parser.parse_args()
+    if args.mode == "composable" and args.omit_directional_panel:
+        parser.error("--mode composable is incompatible with --omit-directional-panel")
     from summit import gxeldcore
 
     prefix = args.prefix.resolve()
@@ -162,11 +175,13 @@ def main() -> int:
             genotype_format="bed",
             threads=threads,
             preferred_variant_block_width=args.variant_block_width,
+            fixed_effect_rank=fixed.shape[1],
             preferred_rhs_tile_columns=(
                 basis.shape[1] ** 2 * args.probe_tile_width
             ),
             rhs_policy="tiled",
             write_directional_panel=not args.omit_directional_panel,
+            write_composable_payload=args.mode == "composable",
         )
     )
 
@@ -183,7 +198,15 @@ def main() -> int:
             fixed_effect_basis=fixed,
             annotations=annotations,
             annotation_names=("all_variants",),
-            annotation_masses=np.sum(annotations, axis=0, dtype=np.float64),
+            annotation_masses=np.asarray(
+                [
+                    np.cumsum(
+                        annotations[:, index], dtype=np.longdouble
+                    )[-1]
+                    for index in range(annotations.shape[1])
+                ],
+                dtype=np.float64,
+            ),
             probe_spec=probe_spec,
             work_plan=work_plan,
             probe_tile_width=args.probe_tile_width,
@@ -191,6 +214,8 @@ def main() -> int:
             threads=threads,
             decode_threads=threads,
             retain_base_sources=False,
+            publish_component_kernel_diagonal=args.mode == "composable",
+            retain_contextual_sources=False,
             backend="dense",
             native_module=gxeldcore,
         ).execute()
@@ -225,8 +250,8 @@ def main() -> int:
         "maximum_presymmetry_relative_error": float(
             result.presymmetry_relative_error
         ),
-        "same_person_probe_count": args.probes,
-        "same_person_cross_tile_finalized": True,
+        "same_person_method": "exact_component_kernel_diagonal_v1",
+        "component_kernel_diagonal_orientation": "component_by_sample_c_n",
         "minimum_annotation_mass": float(np.min(annotation_masses)),
         "all_values_finite": all(
             np.all(np.isfinite(value))
@@ -252,6 +277,7 @@ def main() -> int:
         provenance={"native_module": str(Path(gxeldcore.__file__))},
         diagnostics=diagnostics,
         include_directional_panel=not args.omit_directional_panel,
+        mode=args.mode,
     )
     output = write_generalized_gxe_variant_reference_v1(artifact, args.output)
     loaded = load_generalized_gxe_variant_reference_v1(output)

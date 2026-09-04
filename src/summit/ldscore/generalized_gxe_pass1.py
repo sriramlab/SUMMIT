@@ -454,7 +454,6 @@ class ProtectedNNOperator:
 @dataclass(frozen=True)
 class GeneralizedGxEPass1Result:
     contextual_sources: Array
-    same_person: Array
     annotation_masses: Array
     pair_table: tuple[tuple[int, int], ...]
     component_table: tuple[tuple[int, int], ...]
@@ -463,7 +462,6 @@ class GeneralizedGxEPass1Result:
     genotype_operator_identity: int
     maximum_projection_leakage: float
     maximum_relative_projection_leakage: float
-    same_person_presymmetry_error: float
     base_sources: Array | None
     telemetry: Mapping[str, Any]
     pass1_barrier_sealed: bool = True
@@ -579,8 +577,6 @@ class GeneralizedGxEPass1Executor:
             raise ValueError("work plan genotype format does not match its operator")
         if work_plan.peak_resident_bytes > work_plan.memory_limit_bytes:
             raise MemoryError("work plan was not admitted under its memory limit")
-        if probe_spec.probe_count < 2:
-            raise ValueError("same-person estimation requires at least two probes")
         if self.probe_tile_width > probe_spec.probe_count:
             raise ValueError("probe_tile_width cannot exceed the probe count")
         self._basis = _readonly(basis_array)
@@ -618,7 +614,6 @@ class GeneralizedGxEPass1Executor:
         m = self._annotations.shape[0]
         k_count = self._annotations.shape[1]
         b_count = self.probe_spec.probe_count
-        c_count = len(self._components)
         variant_width = int(self.work_plan.tiling["variant_block_width"])
         phase_seconds = {
             "pass1_total": 0.0,
@@ -626,7 +621,6 @@ class GeneralizedGxEPass1Executor:
             "probe_rhs": 0.0,
             "protected_nn": 0.0,
             "projection": 0.0,
-            "same_person": 0.0,
         }
         started_total = time.perf_counter()
         rss_entry = _peak_rss_bytes()
@@ -762,91 +756,7 @@ class GeneralizedGxEPass1Executor:
             base_result = None
             del base
 
-        same_started = time.perf_counter()
-        sample_accumulator = np.zeros((c_count, n), dtype=np.float64)
-        same_probe = np.zeros((c_count, c_count), dtype=np.float64)
-        maximum_same_person_tile_bytes = 0
         component_entries = self._components.entries
-        for probe_start in range(0, b_count, self.probe_tile_width):
-            probe_stop = min(b_count, probe_start + self.probe_tile_width)
-            for sample_start in range(0, n, self.same_person_sample_tile_width):
-                sample_stop = min(n, sample_start + self.same_person_sample_tile_width)
-                for left_position, component in enumerate(component_entries):
-                    left_values = (
-                        float(component.kernel_factor)
-                        * contextual[
-                            component.annotation_index,
-                            component.q,
-                            sample_start:sample_stop,
-                            probe_start:probe_stop,
-                        ]
-                        * contextual[
-                            component.annotation_index,
-                            component.r,
-                            sample_start:sample_stop,
-                            probe_start:probe_stop,
-                        ]
-                        / self._masses[component.annotation_index]
-                    )
-                    sample_accumulator[
-                        component.index, sample_start:sample_stop
-                    ] += np.sum(left_values, axis=1, dtype=np.float64)
-                    maximum_same_person_tile_bytes = max(
-                        maximum_same_person_tile_bytes, left_values.nbytes
-                    )
-                    for right_component in component_entries[left_position:]:
-                        if right_component.index == component.index:
-                            right_values = left_values
-                            scratch_bytes = left_values.nbytes
-                        else:
-                            right_values = (
-                                float(right_component.kernel_factor)
-                                * contextual[
-                                    right_component.annotation_index,
-                                    right_component.q,
-                                    sample_start:sample_stop,
-                                    probe_start:probe_stop,
-                                ]
-                                * contextual[
-                                    right_component.annotation_index,
-                                    right_component.r,
-                                    sample_start:sample_stop,
-                                    probe_start:probe_stop,
-                                ]
-                                / self._masses[
-                                    right_component.annotation_index
-                                ]
-                            )
-                            scratch_bytes = left_values.nbytes + right_values.nbytes
-                        value = float(
-                            np.einsum(
-                                "iv,iv->",
-                                left_values,
-                                right_values,
-                                dtype=np.float64,
-                                optimize=False,
-                            )
-                        )
-                        same_probe[component.index, right_component.index] += value
-                        if right_component.index != component.index:
-                            same_probe[right_component.index, component.index] += value
-                        maximum_same_person_tile_bytes = max(
-                            maximum_same_person_tile_bytes, scratch_bytes
-                        )
-                        if right_values is not left_values:
-                            del right_values
-                    del left_values
-        same_person_raw = (
-            sample_accumulator @ sample_accumulator.T - same_probe
-        ) / float(b_count * (b_count - 1))
-        same_person_presymmetry_error = float(
-            np.max(np.abs(same_person_raw - same_person_raw.T), initial=0.0)
-        )
-        same_person = _readonly(
-            np.ascontiguousarray(0.5 * (same_person_raw + same_person_raw.T))
-        )
-        phase_seconds["same_person"] = time.perf_counter() - same_started
-
         contextual = _readonly(contextual)
         masses = _readonly(np.array(self._masses, copy=True))
         phase_seconds["pass1_total"] = time.perf_counter() - started_total
@@ -854,15 +764,11 @@ class GeneralizedGxEPass1Executor:
         allocation_ledger = {
             "base_sources_bytes": base_bytes,
             "contextual_sources_bytes": contextual.nbytes,
-            "same_person_sample_accumulator_bytes": sample_accumulator.nbytes,
-            "same_person_same_probe_bytes": same_probe.nbytes,
-            "same_person_result_bytes": same_person.nbytes,
             "maximum_decoded_genotype_block_bytes": maximum_decoded_bytes,
             "maximum_probe_tile_bytes": maximum_probe_bytes,
             "maximum_rhs_tile_bytes": maximum_rhs_bytes,
             "maximum_nn_output_bytes": maximum_nn_output_bytes,
             "maximum_projection_scratch_bytes": maximum_projection_scratch_bytes,
-            "maximum_same_person_tile_bytes": maximum_same_person_tile_bytes,
             "planned_peak_resident_bytes": self.work_plan.peak_resident_bytes,
             "memory_limit_bytes": self.work_plan.memory_limit_bytes,
             "process_peak_rss_bytes_at_entry": rss_entry,
@@ -908,7 +814,7 @@ class GeneralizedGxEPass1Executor:
                     "pass1_sealed": True,
                     "target_scoring_started": False,
                     "contextual_sources_readonly": not contextual.flags.writeable,
-                    "same_person_cross_tile_finalized": True,
+                    "same_person_deferred_to_exact_pass2_diagonal": True,
                 },
             }
         )
@@ -919,7 +825,6 @@ class GeneralizedGxEPass1Executor:
         )
         return GeneralizedGxEPass1Result(
             contextual_sources=contextual,
-            same_person=same_person,
             annotation_masses=masses,
             pair_table=pair_table,
             component_table=component_table,
@@ -928,7 +833,6 @@ class GeneralizedGxEPass1Executor:
             genotype_operator_identity=id(self.genotype_operator),
             maximum_projection_leakage=maximum_absolute_leakage,
             maximum_relative_projection_leakage=maximum_relative_leakage,
-            same_person_presymmetry_error=same_person_presymmetry_error,
             base_sources=base_result,
             telemetry=telemetry,
         )

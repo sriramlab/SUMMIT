@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import sys
+import threading
+import time
 from types import MappingProxyType
-from typing import Any, Mapping, Sequence
+from typing import Any, Mapping, Sequence, TextIO
 
 import numpy as np
 
@@ -43,7 +46,8 @@ class GeneralizedGxENativeResult:
     annotation_masses: Array
     affine_mean: Array
     affine_inverse_scale: Array
-    contextual_sources: Array
+    component_kernel_diagonal: Array | None
+    contextual_sources: Array | None
     base_sources: Array | None
     pair_table: tuple[tuple[int, int], ...]
     component_table: tuple[tuple[int, int], ...]
@@ -119,6 +123,8 @@ class GeneralizedGxENativeBEDExecutor:
         threads: int | None = None,
         decode_threads: int | None = None,
         retain_base_sources: bool = False,
+        publish_component_kernel_diagonal: bool = False,
+        retain_contextual_sources: bool = False,
         backend: str = "dense",
         qualification_fault_injection: Mapping[str, Any] | None = None,
         native_module: Any | None = None,
@@ -171,12 +177,16 @@ class GeneralizedGxENativeBEDExecutor:
             raise ValueError("native scientific inputs must be finite")
         if np.any(annotation_value < 0.0) or np.any(masses <= 0.0):
             raise ValueError("annotations must be nonnegative with positive masses")
-        if not np.allclose(
-            masses,
-            np.sum(annotation_value, axis=0, dtype=np.float64),
-            rtol=2.0e-15,
-            atol=0.0,
-        ):
+        observed_masses = np.asarray(
+            [
+                np.cumsum(
+                    annotation_value[:, index], dtype=np.longdouble
+                )[-1]
+                for index in range(k)
+            ],
+            dtype=np.float64,
+        )
+        if not np.array_equal(masses, observed_masses):
             raise ValueError("annotation masses do not match annotations")
         pair_index = ContextPairIndex(q)
         component_index = ContextComponentIndex(names, pair_index)
@@ -219,28 +229,59 @@ class GeneralizedGxENativeBEDExecutor:
         if decode_threads is None:
             decode_threads = threads
         decode_threads = _positive_int("decode_threads", decode_threads)
-        if probe_tile_width is None:
-            rhs_columns = int(work_plan.tiling["rhs_tile_columns"])
-            probe_tile_width = min(
-                probe_spec.probe_count, rhs_columns // (q * q)
+        planned_probe_tile_width = int(
+            work_plan.tiling.get(
+                "probe_tile_width",
+                min(
+                    probe_spec.probe_count,
+                    int(work_plan.tiling["rhs_tile_columns"]) // (q * q),
+                ),
             )
+        )
+        if probe_tile_width is None:
+            probe_tile_width = planned_probe_tile_width
         probe_tile_width = _positive_int(
             "probe_tile_width", probe_tile_width
         )
         if probe_tile_width > probe_spec.probe_count:
             raise ValueError("probe tile exceeds the global probe count")
+        if probe_tile_width != planned_probe_tile_width:
+            raise ValueError("probe tile does not match the bounded work plan")
+        planned_source_probe_tile_width = int(
+            work_plan.tiling.get(
+                "source_probe_tile_width", planned_probe_tile_width
+            )
+        )
         if source_probe_tile_width is None:
-            source_probe_tile_width = probe_tile_width
+            source_probe_tile_width = planned_source_probe_tile_width
         source_probe_tile_width = _positive_int(
             "source_probe_tile_width", source_probe_tile_width
         )
         if source_probe_tile_width > probe_spec.probe_count:
             raise ValueError("source probe tile exceeds the global probe count")
+        if source_probe_tile_width != planned_source_probe_tile_width:
+            raise ValueError(
+                "source probe tile does not match the bounded work plan"
+            )
+        source_annotation_batch_width = _positive_int(
+            "source_annotation_batch_width",
+            int(work_plan.tiling.get("source_annotation_batch_width", 1)),
+        )
+        target_annotation_batch_width = _positive_int(
+            "target_annotation_batch_width",
+            int(work_plan.tiling.get("target_annotation_batch_width", 1)),
+        )
         sample_tile = _positive_int(
             "same_person_sample_tile_width", same_person_sample_tile_width
         )
         if not isinstance(retain_base_sources, bool):
             raise ValueError("retain_base_sources must be boolean")
+        if not isinstance(publish_component_kernel_diagonal, bool):
+            raise ValueError(
+                "publish_component_kernel_diagonal must be boolean"
+            )
+        if not isinstance(retain_contextual_sources, bool):
+            raise ValueError("retain_contextual_sources must be boolean")
         if backend not in {"dense", "packed"}:
             raise ValueError("backend must be 'dense' or 'packed'")
         fault_phase = "none"
@@ -309,13 +350,20 @@ class GeneralizedGxENativeBEDExecutor:
             probe_count=probe_spec.probe_count,
             variant_block_width=int(work_plan.tiling["variant_block_width"]),
             source_probe_tile_width=source_probe_tile_width,
+            source_annotation_batch_width=source_annotation_batch_width,
             probe_tile_width=probe_tile_width,
+            target_annotation_batch_width=target_annotation_batch_width,
             same_person_sample_tile_width=sample_tile,
             max_workspace_bytes=work_plan.memory_limit_bytes,
             decode_threads=decode_threads,
             threads=threads,
             retain_base_sources=retain_base_sources,
+            publish_component_kernel_diagonal=(
+                publish_component_kernel_diagonal
+            ),
+            retain_contextual_sources=retain_contextual_sources,
             dense_blas_hybrid=backend == "dense",
+            precompute_rhs=bool(work_plan.tiling["rhs_precomputed"]),
             qualification_fault_phase=fault_phase,
             qualification_fault_row=fault_row,
             qualification_fault_column=fault_column,
@@ -325,13 +373,207 @@ class GeneralizedGxENativeBEDExecutor:
         self._components = components
         self._dimensions = expected_dimensions
         self._retain_base_sources = retain_base_sources
+        self._publish_component_kernel_diagonal = (
+            publish_component_kernel_diagonal
+        )
+        self._retain_contextual_sources = retain_contextual_sources
         self._backend = backend
+        self._rhs_precomputed = bool(work_plan.tiling["rhs_precomputed"])
+        self._variant_block_width = int(
+            work_plan.tiling["variant_block_width"]
+        )
 
     def info(self) -> Mapping[str, Any]:
         return MappingProxyType(dict(self._context.info()))
 
-    def execute(self) -> GeneralizedGxENativeResult:
-        raw = dict(self._context.run())
+    def progress(self) -> Mapping[str, Any]:
+        """Return a coherent lock-free snapshot of native execution progress."""
+        snapshot = dict(self._context.progress())
+        if snapshot.get("schema") != (
+            "summit.generalized_gxe.native_progress.v1"
+        ):
+            raise RuntimeError("native generalized GxE progress schema is unsupported")
+        return MappingProxyType(snapshot)
+
+    def request_cancel(self) -> None:
+        """Request cancellation at the next safe native tile boundary."""
+        self._context.request_cancel()
+
+    @staticmethod
+    def _status_line(snapshot: Mapping[str, Any]) -> str:
+        completed = int(snapshot["completed_blocks"])
+        total = int(snapshot["total_blocks"])
+        unit_done = int(snapshot["completed_units"])
+        unit_total = int(snapshot["total_units"])
+        block_text = f"blocks={completed}/{total}" if total else "blocks=0/0"
+        unit_text = (
+            f" units={unit_done}/{unit_total}" if unit_total > 0 else ""
+        )
+        eta = snapshot.get("phase_eta_seconds")
+        eta_text = (
+            f" phase_eta={float(eta):.0f}s" if eta is not None else ""
+        )
+        subphase_elapsed = snapshot.get("subphase_elapsed_seconds")
+        subphase_text = (
+            f" subphase_elapsed={float(subphase_elapsed):.0f}s"
+            if subphase_elapsed is not None
+            else ""
+        )
+        peak_rss = int(snapshot.get("peak_rss_bytes", 0))
+        memory_text = (
+            f" peak_rss={peak_rss / 1024**3:.1f}GiB"
+            if peak_rss > 0
+            else ""
+        )
+        return (
+            "[generalized-gxe] "
+            f"phase={snapshot['phase']} subphase={snapshot['subphase']} "
+            f"{block_text}{unit_text} "
+            f"elapsed={float(snapshot['elapsed_seconds']):.1f}s"
+            f"{subphase_text}{eta_text}{memory_text}"
+        )
+
+    def _run_with_progress(
+        self,
+        *,
+        stream: TextIO,
+        poll_interval_seconds: float,
+        status_interval_seconds: float,
+    ) -> dict[str, Any]:
+        if not np.isfinite(poll_interval_seconds) or poll_interval_seconds <= 0.0:
+            raise ValueError("poll_interval_seconds must be positive and finite")
+        if not np.isfinite(status_interval_seconds) or status_interval_seconds <= 0.0:
+            raise ValueError("status_interval_seconds must be positive and finite")
+
+        reporter_failure: dict[str, BaseException] = {}
+        finished = threading.Event()
+        total_blocks = (
+            self._dimensions["M"] + self._variant_block_width - 1
+        ) // self._variant_block_width
+        interactive = bool(getattr(stream, "isatty", lambda: False)())
+        progress_bar: Any | None = None
+        if interactive:
+            from tqdm import tqdm
+
+            progress_bar = tqdm(
+                total=total_blocks,
+                desc="GxE reference",
+                unit="block",
+                file=stream,
+                dynamic_ncols=True,
+                leave=True,
+            )
+        else:
+            print(
+                f"[generalized-gxe] started blocks={total_blocks}",
+                file=stream,
+                flush=True,
+            )
+
+        def reporter() -> None:
+            previous_phase: str | None = None
+            previous_subphase: str | None = None
+            previous_completed = 0
+            last_status = time.monotonic()
+            phase_started = last_status
+            subphase_started = last_status
+
+            def emit(snapshot: Mapping[str, Any], *, final: bool) -> None:
+                nonlocal previous_phase, previous_subphase
+                nonlocal previous_completed, last_status
+                nonlocal phase_started, subphase_started
+                phase = str(snapshot["phase"])
+                subphase = str(snapshot["subphase"])
+                completed = int(snapshot["completed_blocks"])
+                now = time.monotonic()
+                if phase != previous_phase:
+                    phase_started = now
+                if phase != previous_phase or subphase != previous_subphase:
+                    subphase_started = now
+                enriched = dict(snapshot)
+                if phase in {"pass1", "pass2"} and completed > 0:
+                    rate = completed / max(now - phase_started, 1.0e-12)
+                    enriched["phase_eta_seconds"] = max(
+                        0.0, (total_blocks - completed) / rate
+                    )
+                enriched["subphase_elapsed_seconds"] = max(
+                    0.0, now - subphase_started
+                )
+                if progress_bar is not None:
+                    if phase in {"pass1", "pass2"} and phase != previous_phase:
+                        progress_bar.reset(total=total_blocks)
+                        previous_completed = 0
+                    if phase in {"pass1", "pass2"}:
+                        delta = max(0, completed - previous_completed)
+                        if delta:
+                            progress_bar.update(delta)
+                        previous_completed = max(previous_completed, completed)
+                    progress_bar.set_description_str(
+                        f"GxE {phase}/{snapshot['subphase']}"
+                    )
+                    units = int(snapshot["total_units"])
+                    postfix = []
+                    if units > 0:
+                        postfix.append(
+                            f"units {snapshot['completed_units']}/{units}"
+                        )
+                    peak_rss = int(snapshot.get("peak_rss_bytes", 0))
+                    if peak_rss > 0:
+                        postfix.append(f"rss≤{peak_rss / 1024**3:.1f}GiB")
+                    progress_bar.set_postfix_str(" ".join(postfix))
+                elif (
+                    final
+                    or phase != previous_phase
+                    or now - last_status >= status_interval_seconds
+                ):
+                    print(self._status_line(enriched), file=stream, flush=True)
+                    last_status = now
+                previous_phase = phase
+                previous_subphase = subphase
+
+            try:
+                while not finished.wait(poll_interval_seconds):
+                    emit(self.progress(), final=False)
+                emit(self.progress(), final=True)
+            except BaseException as exc:
+                reporter_failure["exception"] = exc
+                self.request_cancel()
+
+        thread = threading.Thread(
+            target=reporter,
+            name="summit-generalized-gxe-progress",
+            daemon=True,
+        )
+        thread.start()
+        try:
+            raw = dict(self._context.run())
+        finally:
+            finished.set()
+            thread.join()
+            if progress_bar is not None:
+                progress_bar.close()
+        if "exception" in reporter_failure:
+            raise reporter_failure["exception"]
+        return raw
+
+    def execute(
+        self,
+        *,
+        show_progress: bool = False,
+        progress_stream: TextIO | None = None,
+        poll_interval_seconds: float = 1.0,
+        status_interval_seconds: float = 300.0,
+    ) -> GeneralizedGxENativeResult:
+        if not isinstance(show_progress, bool):
+            raise TypeError("show_progress must be boolean")
+        if show_progress:
+            raw = self._run_with_progress(
+                stream=sys.stderr if progress_stream is None else progress_stream,
+                poll_interval_seconds=float(poll_interval_seconds),
+                status_interval_seconds=float(status_interval_seconds),
+            )
+        else:
+            raw = dict(self._context.run())
         shapes = {name: tuple(value) for name, value in dict(raw["shapes"]).items()}
 
         def reshape(name: str) -> Array:
@@ -341,7 +583,24 @@ class GeneralizedGxENativeBEDExecutor:
                 raise RuntimeError(f"native {name} has the wrong element count")
             return _readonly(np.ascontiguousarray(value.reshape(expected)))
 
-        contextual = reshape("contextual_sources")
+        contextual: Array | None
+        if self._retain_contextual_sources:
+            contextual = reshape("contextual_sources")
+        else:
+            if raw["contextual_sources"] is not None:
+                raise RuntimeError(
+                    "native context published unrequested contextual sources"
+                )
+            contextual = None
+        component_diagonal: Array | None
+        if self._publish_component_kernel_diagonal:
+            component_diagonal = reshape("component_kernel_diagonal")
+        else:
+            if raw["component_kernel_diagonal"] is not None:
+                raise RuntimeError(
+                    "native context published an unrequested component diagonal"
+                )
+            component_diagonal = None
         directional = reshape("directional_ldscores")
         base: Array | None
         if self._retain_base_sources:
@@ -410,6 +669,10 @@ class GeneralizedGxENativeBEDExecutor:
             raise RuntimeError("native execution used a forbidden serial witness")
         if int(telemetry.get("tile_induced_descriptor_rereads", -1)) != 0:
             raise RuntimeError("native execution reread descriptors for a tile")
+        if telemetry.get("same_person_method") != (
+            "exact_component_kernel_diagonal_v1"
+        ):
+            raise RuntimeError("native execution used an unsupported same-person method")
         if self._backend == "dense" and int(
             telemetry.get("integrity_audit_count", 0)
         ) < 2:
@@ -423,6 +686,7 @@ class GeneralizedGxENativeBEDExecutor:
             annotation_masses=masses,
             affine_mean=affine_mean,
             affine_inverse_scale=affine_inverse_scale,
+            component_kernel_diagonal=component_diagonal,
             contextual_sources=contextual,
             base_sources=base,
             pair_table=self._pairs,

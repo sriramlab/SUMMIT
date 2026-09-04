@@ -153,7 +153,18 @@ def test_hash_free_trait_summary_roundtrip_loads_compact_moments(tmp_path) -> No
     assert loaded.component_index.entries == summary.component_index.entries
     assert loaded.group_ids == summary.group_ids
     assert loaded.trait_ids == summary.trait_ids
-    assert loaded.per_variant is None
+    assert loaded.per_variant is not None
+    np.testing.assert_array_equal(
+        loaded.per_variant.scores, summary.per_variant.scores
+    )
+    np.testing.assert_array_equal(
+        loaded.per_variant.information, summary.per_variant.information
+    )
+    np.testing.assert_array_equal(
+        loaded.per_variant.residual_information,
+        summary.per_variant.residual_information,
+    )
+    assert loaded.per_variant.normalized_phenotypes is None
     for name in (
         "genetic_rhs",
         "genetic_traces",

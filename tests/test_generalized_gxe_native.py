@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import gc
+import io
 import os
 from pathlib import Path
 import subprocess
@@ -10,7 +12,11 @@ import numpy as np
 import pytest
 from bed_reader import open_bed, to_bed
 
-from generalized_gxe_variant_ldscore_oracle import orthonormalize
+from generalized_gxe_variant_ldscore_oracle import (
+    exact_component_kernel_diagonal,
+    exact_same_person_matrix,
+    orthonormalize,
+)
 from summit.ldscore.generalized_gxe_native import (
     GeneralizedGxENativeBEDExecutor,
     generalized_gxe_performance_ledger_from_native,
@@ -98,6 +104,8 @@ def _plan(
     variant_width: int,
     probe_width: int,
     threads: int,
+    rhs_policy: str = "tiled",
+    source_probe_width: int | None = None,
 ):
     return plan_generalized_gxe_variant_work(
         GeneralizedGxEPlanInputs(
@@ -111,7 +119,8 @@ def _plan(
             threads=threads,
             preferred_variant_block_width=variant_width,
             preferred_rhs_tile_columns=basis.shape[1] ** 2 * probe_width,
-            rhs_policy="tiled",
+            preferred_source_probe_tile_width=source_probe_width,
+            rhs_policy=rhs_policy,
         )
     )
 
@@ -171,7 +180,11 @@ def _native(
     threads: int,
     source_probe_width: int | None = None,
     retain_base: bool = True,
+    publish_component_diagonal: bool = True,
+    retain_contextual: bool = True,
     qualification_fault_injection=None,
+    show_progress: bool = False,
+    progress_stream=None,
 ):
     from summit import gxeldcore
 
@@ -193,8 +206,14 @@ def _native(
             annotation_names=tuple(
                 f"annotation_{index}" for index in range(annotations.shape[1])
             ),
-            annotation_masses=np.sum(
-                annotations, axis=0, dtype=np.float64
+            annotation_masses=np.asarray(
+                [
+                    np.cumsum(
+                        annotations[:, index], dtype=np.longdouble
+                    )[-1]
+                    for index in range(annotations.shape[1])
+                ],
+                dtype=np.float64,
             ),
             probe_spec=probe_spec,
             work_plan=plan,
@@ -203,10 +222,19 @@ def _native(
             same_person_sample_tile_width=4,
             threads=execution_threads,
             retain_base_sources=retain_base,
+            publish_component_kernel_diagonal=(
+                publish_component_diagonal
+            ),
+            retain_contextual_sources=retain_contextual,
             backend=backend,
             qualification_fault_injection=qualification_fault_injection,
         )
-        return executor, executor.execute()
+        return executor, executor.execute(
+            show_progress=show_progress,
+            progress_stream=progress_stream,
+            poll_interval_seconds=0.001,
+            status_interval_seconds=0.001,
+        )
     finally:
         for descriptor in descriptors.values():
             os.close(descriptor)
@@ -273,7 +301,16 @@ def test_native_dense_matches_every_stage05_layer(
     comparisons = (
         (observed.base_sources, pass1.base_sources),
         (observed.contextual_sources, pass1.contextual_sources),
-        (observed.same_person, pass1.same_person),
+        (
+            observed.component_kernel_diagonal,
+            exact_component_kernel_diagonal(
+                genotype, basis, fixed, annotations
+            ),
+        ),
+        (
+            observed.same_person,
+            exact_same_person_matrix(genotype, basis, fixed, annotations),
+        ),
         (observed.directional_ldscores, expected.directional_ldscores),
         (observed.directed_numerator, expected.directed_numerator),
         (observed.symmetric_numerator, expected.symmetric_numerator),
@@ -289,6 +326,70 @@ def test_native_dense_matches_every_stage05_layer(
     assert dict(executor.info())["state"] == "finalized"
 
 
+def test_native_singleton_annotation_fast_path_matches_reference(
+    tmp_path: Path,
+) -> None:
+    (
+        prefix,
+        genotype,
+        basis,
+        fixed,
+        _,
+        _,
+        probe_spec,
+    ) = _fixture(tmp_path, q_count=3, annotation_count=2, seed=6351)
+    annotations = np.zeros((genotype.shape[1], 2), dtype=np.float64)
+    annotations[np.arange(genotype.shape[1]), np.arange(genotype.shape[1]) % 2] = (
+        1.0
+    )
+    plan = _plan(
+        genotype,
+        basis,
+        annotations,
+        variant_width=4,
+        probe_width=3,
+        threads=1,
+    )
+    pass1, expected = _reference(
+        genotype=genotype,
+        basis=basis,
+        fixed=fixed,
+        annotations=annotations,
+        probe_spec=probe_spec,
+        plan=plan,
+        probe_width=3,
+    )
+    executor, observed = _native(
+        prefix=prefix,
+        basis=basis,
+        fixed=fixed,
+        annotations=annotations,
+        probe_spec=probe_spec,
+        plan=plan,
+        probe_width=3,
+        backend="dense",
+        threads=1,
+    )
+    for actual, target in (
+        (observed.base_sources, pass1.base_sources),
+        (
+            observed.component_kernel_diagonal,
+            exact_component_kernel_diagonal(
+                genotype, basis, fixed, annotations
+            ),
+        ),
+        (observed.directional_ldscores, expected.directional_ldscores),
+        (observed.directed_numerator, expected.directed_numerator),
+        (observed.genetic_gram, expected.genetic_gram),
+    ):
+        np.testing.assert_allclose(actual, target, rtol=3.0e-13, atol=3.0e-13)
+    assert dict(executor.info())["singleton_annotation_rows"] is True
+    telemetry = dict(observed.telemetry)
+    assert telemetry["component_annotation_reduction"] == (
+        "single_nonzero_annotation_fused_pair_reduction_ordered_v1"
+    )
+
+
 @pytest.mark.parametrize("threads", (1,))
 def test_packed_mailman_matches_dense_across_threads_and_tiles(
     tmp_path: Path, threads: int
@@ -302,13 +403,23 @@ def test_packed_mailman_matches_dense_across_threads_and_tiles(
         block_ids,
         probe_spec,
     ) = _fixture(tmp_path, q_count=3, annotation_count=2, seed=6400 + threads)
-    plan = _plan(
+    dense_plan = _plan(
         genotype,
         basis,
         annotations,
         variant_width=5,
         probe_width=4,
         threads=threads,
+        source_probe_width=13,
+    )
+    packed_plan = _plan(
+        genotype,
+        basis,
+        annotations,
+        variant_width=5,
+        probe_width=4,
+        threads=threads,
+        source_probe_width=5,
     )
     _, dense = _native(
         prefix=prefix,
@@ -316,7 +427,7 @@ def test_packed_mailman_matches_dense_across_threads_and_tiles(
         fixed=fixed,
         annotations=annotations,
         probe_spec=probe_spec,
-        plan=plan,
+        plan=dense_plan,
         probe_width=4,
         backend="dense",
         threads=threads,
@@ -328,7 +439,7 @@ def test_packed_mailman_matches_dense_across_threads_and_tiles(
         fixed=fixed,
         annotations=annotations,
         probe_spec=probe_spec,
-        plan=plan,
+        plan=packed_plan,
         probe_width=4,
         backend="packed",
         threads=threads,
@@ -337,6 +448,7 @@ def test_packed_mailman_matches_dense_across_threads_and_tiles(
     for name in (
         "base_sources",
         "contextual_sources",
+        "component_kernel_diagonal",
         "same_person",
         "directional_ldscores",
         "directed_numerator",
@@ -356,6 +468,92 @@ def test_packed_mailman_matches_dense_across_threads_and_tiles(
     assert dict(packed.genotype_scale) == dict(dense.genotype_scale)
 
 
+@pytest.mark.parametrize("backend", ("dense", "packed"))
+def test_precomputed_rhs_matches_tiled_without_extra_genotype_visits(
+    tmp_path: Path,
+    backend: str,
+) -> None:
+    (
+        prefix,
+        genotype,
+        basis,
+        fixed,
+        annotations,
+        block_ids,
+        probe_spec,
+    ) = _fixture(tmp_path, q_count=3, annotation_count=2, seed=6451)
+    tiled_plan = _plan(
+        genotype,
+        basis,
+        annotations,
+        variant_width=5,
+        probe_width=4,
+        threads=1,
+    )
+    precomputed_plan = _plan(
+        genotype,
+        basis,
+        annotations,
+        variant_width=5,
+        probe_width=4,
+        threads=1,
+        rhs_policy="precompute",
+    )
+    assert tiled_plan.tiling["rhs_precomputed"] is False
+    assert precomputed_plan.tiling["rhs_precomputed"] is True
+    _, tiled = _native(
+        prefix=prefix,
+        basis=basis,
+        fixed=fixed,
+        annotations=annotations,
+        probe_spec=probe_spec,
+        plan=tiled_plan,
+        probe_width=4,
+        backend=backend,
+        threads=1,
+    )
+    _, precomputed = _native(
+        prefix=prefix,
+        basis=basis,
+        fixed=fixed,
+        annotations=annotations,
+        probe_spec=probe_spec,
+        plan=precomputed_plan,
+        probe_width=4,
+        backend=backend,
+        threads=1,
+    )
+    for name in (
+        "base_sources",
+        "contextual_sources",
+        "component_kernel_diagonal",
+        "same_person",
+        "directional_ldscores",
+        "directed_numerator",
+        "symmetric_numerator",
+        "genetic_gram",
+    ):
+        np.testing.assert_allclose(
+            getattr(precomputed, name),
+            getattr(tiled, name),
+            rtol=3.0e-13,
+            atol=3.0e-13,
+        )
+    telemetry = dict(precomputed.telemetry)
+    assert telemetry["rhs_precomputed"] is True
+    assert telemetry["rhs_precomputed_columns"] == (
+        annotations.shape[1]
+        * probe_spec.probe_count
+        * basis.shape[1] ** 2
+    )
+    assert telemetry["rhs_precomputed_bytes"] == (
+        genotype.shape[0] * telemetry["rhs_precomputed_columns"] * 8
+    )
+    assert dict(precomputed.ledger)["observed_retained_variant_visits"] == (
+        2 * genotype.shape[1]
+    )
+
+
 def test_packed_native_one_and_multiple_threads_match_in_fresh_processes(
     tmp_path: Path,
 ) -> None:
@@ -366,6 +564,19 @@ def test_packed_native_one_and_multiple_threads_match_in_fresh_processes(
         import sys
         from pathlib import Path
         import numpy as np
+
+        repository = Path.cwd()
+        local_extensions = list(
+            (repository / "build").glob("*/gxeldcore*.so")
+        )
+        if local_extensions:
+            sys.meta_path[:] = [
+                finder for finder in sys.meta_path
+                if finder.__class__.__module__ != "_gwldcore_editable"
+            ]
+            sys.path.insert(0, str(repository / "src"))
+            import summit
+            summit.__path__.append(str(local_extensions[0].parent))
         from test_generalized_gxe_native import _fixture, _native, _plan
 
         threads = int(sys.argv[1])
@@ -431,7 +642,7 @@ def test_packed_native_one_and_multiple_threads_match_in_fresh_processes(
         )
 
 
-def test_context_is_single_use_and_omits_unrequested_base_sources(
+def test_context_is_single_use_and_omits_unrequested_private_sources(
     tmp_path: Path,
 ) -> None:
     (
@@ -462,10 +673,110 @@ def test_context_is_single_use_and_omits_unrequested_base_sources(
         backend="dense",
         threads=1,
         retain_base=False,
+        publish_component_diagonal=False,
+        retain_contextual=False,
     )
     assert result.base_sources is None
+    assert result.contextual_sources is None
+    assert result.component_kernel_diagonal is None
     with pytest.raises(RuntimeError, match="single-use"):
         executor.execute()
+
+
+def test_progress_snapshots_and_noninteractive_status_are_complete(
+    tmp_path: Path,
+) -> None:
+    (
+        prefix,
+        genotype,
+        basis,
+        fixed,
+        annotations,
+        block_ids,
+        probe_spec,
+    ) = _fixture(tmp_path, q_count=3, annotation_count=2, seed=6551)
+    plan = _plan(
+        genotype,
+        basis,
+        annotations,
+        variant_width=4,
+        probe_width=3,
+        threads=1,
+    )
+    stream = io.StringIO()
+    executor, _ = _native(
+        prefix=prefix,
+        basis=basis,
+        fixed=fixed,
+        annotations=annotations,
+        probe_spec=probe_spec,
+        plan=plan,
+        probe_width=3,
+        backend="dense",
+        threads=1,
+        show_progress=True,
+        progress_stream=stream,
+    )
+    progress = dict(executor.progress())
+    assert progress["schema"] == "summit.generalized_gxe.native_progress.v1"
+    assert progress["phase"] == "complete"
+    assert progress["subphase"] == "idle"
+    assert progress["active"] is False
+    assert progress["cancel_requested"] is False
+    assert progress["completed_blocks"] == 3
+    assert progress["total_blocks"] == 3
+    assert progress["variant_start"] == genotype.shape[1]
+    assert progress["variant_stop"] == genotype.shape[1]
+    assert progress["elapsed_seconds"] >= 0.0
+    assert progress["peak_rss_bytes"] > 0
+    status = stream.getvalue()
+    assert "[generalized-gxe] started blocks=3" in status
+    assert "phase=complete subphase=idle blocks=3/3" in status
+    assert "peak_rss=" in status
+
+
+def test_zero_copy_published_buffers_outlive_native_context(
+    tmp_path: Path,
+) -> None:
+    (
+        prefix,
+        genotype,
+        basis,
+        fixed,
+        annotations,
+        block_ids,
+        probe_spec,
+    ) = _fixture(tmp_path, q_count=3, annotation_count=2, seed=6552)
+    plan = _plan(
+        genotype,
+        basis,
+        annotations,
+        variant_width=4,
+        probe_width=3,
+        threads=1,
+    )
+    executor, result = _native(
+        prefix=prefix,
+        basis=basis,
+        fixed=fixed,
+        annotations=annotations,
+        probe_spec=probe_spec,
+        plan=plan,
+        probe_width=3,
+        backend="dense",
+        threads=1,
+        retain_base=False,
+        publish_component_diagonal=True,
+        retain_contextual=False,
+    )
+    directional = result.directional_ldscores.copy()
+    component_diagonal = result.component_kernel_diagonal.copy()
+    del executor
+    gc.collect()
+    np.testing.assert_array_equal(result.directional_ldscores, directional)
+    np.testing.assert_array_equal(
+        result.component_kernel_diagonal, component_diagonal
+    )
 
 
 def test_descriptor_mutation_before_run_fails_without_publication(
@@ -505,7 +816,15 @@ def test_descriptor_mutation_before_run_fails_without_publication(
             fixed_effect_basis=fixed,
             annotations=annotations,
             annotation_names=("annotation_0",),
-            annotation_masses=np.sum(annotations, axis=0),
+            annotation_masses=np.asarray(
+                [
+                    np.cumsum(
+                        annotations[:, index], dtype=np.longdouble
+                    )[-1]
+                    for index in range(annotations.shape[1])
+                ],
+                dtype=np.float64,
+            ),
             probe_spec=probe_spec,
             work_plan=plan,
             probe_tile_width=3,
@@ -561,7 +880,15 @@ def test_algebraic_checksum_fault_fails_before_publication(
             fixed_effect_basis=fixed,
             annotations=annotations,
             annotation_names=("annotation_0",),
-            annotation_masses=np.sum(annotations, axis=0),
+            annotation_masses=np.asarray(
+                [
+                    np.cumsum(
+                        annotations[:, index], dtype=np.longdouble
+                    )[-1]
+                    for index in range(annotations.shape[1])
+                ],
+                dtype=np.float64,
+            ),
             probe_spec=probe_spec,
             work_plan=plan,
             probe_tile_width=3,

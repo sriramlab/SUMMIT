@@ -10,7 +10,9 @@ import numpy as np
 import pytest
 
 from generalized_gxe_variant_ldscore_oracle import (
+    exact_component_kernel_diagonal,
     exact_recomputed_delete_block_grams,
+    exact_same_person_matrix,
     frozen_ldscore_delete_block,
     orthonormalize,
     randomized_two_pass_ldscores,
@@ -258,7 +260,21 @@ def test_complete_pass2_outputs_match_every_dense_oracle_layer(
         rtol=5.0e-14,
         atol=5.0e-14,
     )
-    assert observed.same_person is pass1.same_person
+    expected_diagonal = exact_component_kernel_diagonal(
+        genotype, basis, fixed, annotations
+    )
+    np.testing.assert_allclose(
+        observed.component_kernel_diagonal,
+        expected_diagonal,
+        rtol=1.0e-13,
+        atol=1.0e-13,
+    )
+    np.testing.assert_allclose(
+        observed.same_person,
+        exact_same_person_matrix(genotype, basis, fixed, annotations),
+        rtol=1.0e-13,
+        atol=1.0e-13,
+    )
     observed.ledger.validate_clean_completion()
     assert observed.ledger.observed_reference_genotype_passes == 2
     assert observed.ledger.observed_retained_variant_visits == 2 * genotype.shape[1]
@@ -408,7 +424,12 @@ def test_frozen_row_deletion_keeps_full_scores_sources_and_same_person() -> None
             rtol=1.0e-13,
             atol=1.0e-13,
         )
-    assert observed.same_person is pass1.same_person
+    np.testing.assert_allclose(
+        observed.same_person,
+        exact_same_person_matrix(genotype, basis, fixed, annotations),
+        rtol=1.0e-13,
+        atol=1.0e-13,
+    )
 
 def test_signed_per_snp_scores_are_not_clamped() -> None:
     genotype, basis, fixed, annotations, spec, _probes = _fixture(

@@ -340,9 +340,23 @@ def test_target_planner_work_and_memory_arithmetic(
     )
     assert plan.memory["pass2_rhs"] == 8 * 300_000 * total_rhs
     assert plan.memory["decoded_genotype_block"] == 8 * 300_000 * 4096
-    assert plan.memory["cross_sketch_block"] == 8 * 4096 * total_rhs
-    assert plan.memory["pair_reduction_scratch"] == 8 * 4096 * p * p
-    assert plan.memory["same_person_sample_accumulator"] == 8 * c * 300_000
+    target_batch = plan.tiling["target_annotation_batch_width"]
+    source_batch = plan.tiling["source_annotation_batch_width"]
+    target_tile_columns = plan.tiling["rhs_tile_columns"]
+    source_tile_width = plan.tiling["source_probe_tile_width"]
+    assert (
+        plan.memory["cross_sketch_block"]
+        == 8 * 4096 * target_tile_columns * target_batch
+    )
+    assert (
+        plan.memory["pair_reduction_scratch"]
+        == 8 * 4096 * p * p * target_batch
+    )
+    assert (
+        plan.memory["pass1_source_contribution"]
+        == 8 * 300_000 * source_tile_width * source_batch
+    )
+    assert plan.memory["component_kernel_diagonal"] == 8 * c * 300_000
     assert "block_directed_numerator" not in plan.memory
     assert plan.output_size_bytes == 8 * 1_000_000 * num_annotations * p * p
     assert plan.tiling["rhs_precomputed"] is True
@@ -366,7 +380,8 @@ def test_constrained_memory_reduces_tiles_without_adding_passes() -> None:
     assert plan.peak_resident_bytes <= inputs.memory_limit_bytes
     assert plan.tiling["rhs_precomputed"] is False
     assert plan.tiling["variant_block_width"] == 2048
-    assert plan.tiling["rhs_tile_columns"] == 128
+    assert plan.tiling["rhs_tile_columns"] == 126
+    assert plan.tiling["rhs_tile_columns"] % inputs.num_basis**2 == 0
     assert plan.tiling["rhs_tile_columns"] < plan.tiling["total_rhs_columns"]
     assert plan.descriptor["planned_complete_passes"] == 2
     assert plan.ledger["planned_reference_genotype_passes"] == 2
