@@ -42,7 +42,7 @@ class GeneralizedGxEPerVariantTraitStatistics:
     scores: np.ndarray
     information: np.ndarray
     residual_information: np.ndarray
-    normalized_phenotypes: np.ndarray
+    normalized_phenotypes: np.ndarray | None
     residual_rhs: np.ndarray
     residual_traces: np.ndarray
     residual_gram: np.ndarray
@@ -53,12 +53,17 @@ class GeneralizedGxEPerVariantTraitStatistics:
             "scores",
             "information",
             "residual_information",
-            "normalized_phenotypes",
             "residual_rhs",
             "residual_traces",
             "residual_gram",
         ):
             object.__setattr__(self, name, _readonly(getattr(self, name)))
+        if self.normalized_phenotypes is not None:
+            object.__setattr__(
+                self,
+                "normalized_phenotypes",
+                _readonly(self.normalized_phenotypes),
+            )
         if self.scores.ndim != 3:
             raise ValueError("scores must have shape M by Q by L")
         m, q, _ = self.scores.shape
@@ -72,9 +77,13 @@ class GeneralizedGxEPerVariantTraitStatistics:
                 "residual_information must have shape M by Q(Q+1)/2 by H"
             )
         h = self.residual_information.shape[2]
-        n = self.normalized_phenotypes.shape[0]
-        if self.normalized_phenotypes.shape[1] != self.scores.shape[2]:
-            raise ValueError("normalized phenotype and score trait axes differ")
+        n = None
+        if self.normalized_phenotypes is not None:
+            n = self.normalized_phenotypes.shape[0]
+            if self.normalized_phenotypes.shape[1] != self.scores.shape[2]:
+                raise ValueError(
+                    "normalized phenotype and score trait axes differ"
+                )
         if self.residual_rhs.shape != (h, self.scores.shape[2]):
             raise ValueError("residual_rhs has the wrong shape")
         if self.residual_traces.shape != (h,) or self.residual_gram.shape != (h, h):
@@ -83,20 +92,24 @@ class GeneralizedGxEPerVariantTraitStatistics:
             isinstance(self.residual_rank, bool)
             or not isinstance(self.residual_rank, int)
             or self.residual_rank < 1
-            or self.residual_rank > n
+            or (n is not None and self.residual_rank > n)
         ):
             raise ValueError("residual_rank is invalid")
         for name in (
             "scores",
             "information",
             "residual_information",
-            "normalized_phenotypes",
             "residual_rhs",
             "residual_traces",
             "residual_gram",
         ):
             if not np.all(np.isfinite(getattr(self, name))):
                 raise ValueError(f"{name} contains nonfinite values")
+        if (
+            self.normalized_phenotypes is not None
+            and not np.all(np.isfinite(self.normalized_phenotypes))
+        ):
+            raise ValueError("normalized_phenotypes contains nonfinite values")
 
     @property
     def n_variants(self) -> int:
@@ -152,6 +165,19 @@ class GeneralizedGxETraitSummary:
             raise ValueError("trait IDs must be unique")
         if len(set(self.residual_names)) != len(self.residual_names):
             raise ValueError("residual names must be unique")
+        if (
+            isinstance(self.n_samples, bool)
+            or not isinstance(self.n_samples, int)
+            or self.n_samples < 2
+            or isinstance(self.n_variants, bool)
+            or not isinstance(self.n_variants, int)
+            or self.n_variants < 1
+            or isinstance(self.residual_rank, bool)
+            or not isinstance(self.residual_rank, int)
+            or self.residual_rank < 1
+            or self.residual_rank > self.n_samples
+        ):
+            raise ValueError("trait summary dimensions are invalid")
         float_arrays = (
             "genetic_rhs",
             "genetic_traces",
@@ -211,8 +237,16 @@ class GeneralizedGxETraitSummary:
             raise ValueError("group masses do not reconstruct annotation masses")
         if self.per_variant is not None and (
             self.per_variant.n_variants != self.n_variants
+            or self.per_variant.n_basis
+            != self.component_index.pair_index.num_basis
             or self.per_variant.n_traits != l
             or self.per_variant.n_residual != h
+            or self.per_variant.residual_rank != self.residual_rank
+            or (
+                self.per_variant.normalized_phenotypes is not None
+                and self.per_variant.normalized_phenotypes.shape[0]
+                != self.n_samples
+            )
         ):
             raise ValueError("per-variant statistics disagree with compact axes")
 
@@ -461,6 +495,36 @@ def aggregate_generalized_gxe_trait_statistics(
         group_annotation_masses=group_masses,
         group_variant_counts=group_counts,
         per_variant=statistics if retain_per_variant else None,
+    )
+
+
+def reaggregate_generalized_gxe_trait_summary(
+    summary: GeneralizedGxETraitSummary,
+    *,
+    annotations: object,
+    annotation_names: Sequence[str],
+    variant_group_ids: object,
+    group_labels: Sequence[str],
+    retain_per_variant: bool = True,
+) -> GeneralizedGxETraitSummary:
+    """Reaggregate saved per-SNP trait rows for a new annotation panel."""
+    if not isinstance(summary, GeneralizedGxETraitSummary):
+        raise TypeError("summary must be a generalized GxE trait summary")
+    if summary.per_variant is None:
+        raise ValueError(
+            "trait summary lacks per-variant statistics required for "
+            "annotation reaggregation"
+        )
+    return aggregate_generalized_gxe_trait_statistics(
+        summary.per_variant,
+        annotations=annotations,
+        annotation_names=annotation_names,
+        variant_group_ids=variant_group_ids,
+        group_labels=group_labels,
+        trait_ids=summary.trait_ids,
+        residual_names=summary.residual_names,
+        n_samples=summary.n_samples,
+        retain_per_variant=retain_per_variant,
     )
 
 
@@ -904,12 +968,50 @@ def load_generalized_gxe_trait_summary(
             for name in required
             if name != "metadata_json"
         }
+        per_variant_names = {
+            "variant_scores",
+            "variant_information",
+            "variant_residual_information",
+        }
+        included = metadata.get("per_variant_included")
+        if not isinstance(included, bool):
+            raise ValueError(
+                "generalized trait summary per-variant declaration is invalid"
+            )
+        present = per_variant_names.intersection(archive.files)
+        if included is True and present != per_variant_names:
+            raise ValueError(
+                "generalized trait summary has an incomplete per-variant payload"
+            )
+        if included is not True and present:
+            raise ValueError(
+                "generalized trait summary has undeclared per-variant arrays"
+            )
+        variant_arrays = (
+            {name: np.asarray(archive[name]) for name in per_variant_names}
+            if included is True
+            else None
+        )
     try:
         pair_index = ContextPairIndex(int(metadata["basis_count"]))
         component_index = ContextComponentIndex(
             tuple(str(value) for value in metadata["annotation_names"]),
             pair_index,
         )
+        per_variant = None
+        if variant_arrays is not None:
+            per_variant = GeneralizedGxEPerVariantTraitStatistics(
+                scores=variant_arrays["variant_scores"],
+                information=variant_arrays["variant_information"],
+                residual_information=variant_arrays[
+                    "variant_residual_information"
+                ],
+                normalized_phenotypes=None,
+                residual_rhs=arrays["residual_rhs"],
+                residual_traces=arrays["residual_traces"],
+                residual_gram=arrays["residual_gram"],
+                residual_rank=int(metadata["residual_rank"]),
+            )
         summary = GeneralizedGxETraitSummary(
             n_samples=int(metadata["n_samples"]),
             n_variants=int(metadata["n_variants"]),
@@ -920,7 +1022,7 @@ def load_generalized_gxe_trait_summary(
             residual_names=tuple(
                 str(value) for value in metadata["residual_names"]
             ),
-            per_variant=None,
+            per_variant=per_variant,
             **arrays,
         )
     except (KeyError, TypeError, ValueError) as exc:
@@ -935,6 +1037,7 @@ __all__ = [
     "aggregate_generalized_gxe_trait_statistics",
     "generalized_gxe_per_variant_trait_statistics",
     "load_generalized_gxe_trait_summary",
+    "reaggregate_generalized_gxe_trait_summary",
     "stream_generalized_gxe_per_variant_trait_statistics_from_bed",
     "write_generalized_gxe_trait_summary",
 ]

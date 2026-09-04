@@ -434,10 +434,14 @@ def run_reference(
     row_selection: Sequence[int] | np.ndarray | None = None,
     output: Path | None = None,
     include_directional_panel: bool = True,
+    mode: str = "summary",
     variant_block_width: int = 4096,
-    probe_tile_width: int = 4,
+    probe_tile_width: int | None = None,
     source_probe_tile_width: int | None = None,
+    component_diagonal_sample_tile_width: int = 8192,
 ) -> ReferenceRun:
+    if mode not in {"summary", "composable"}:
+        raise ValueError("mode must be 'summary' or 'composable'")
     n, q = basis.shape
     m, k = annotations.shape
     if m != axes.m:
@@ -445,7 +449,16 @@ def run_reference(
     if fixed.shape[0] != n:
         raise ValueError("fixed basis has the wrong sample count")
     retained_samples = _normalized_row_selection(axes, n, row_selection)
-    masses = np.sum(annotations, axis=0, dtype=np.float64)
+    # The native executor verifies each annotation column with a sequential
+    # long-double accumulator.  ``np.sum`` may use pairwise reduction, so use a
+    # cumulative sum per column to reproduce the native summation order.
+    masses = np.asarray(
+        [
+            np.cumsum(annotations[:, index], dtype=np.longdouble)[-1]
+            for index in range(k)
+        ],
+        dtype=np.float64,
+    )
     probe_spec = GlobalVariantProbeSpec(
         root_seed=seed, probe_offset=0, probe_count=probes
     )
@@ -458,11 +471,21 @@ def run_reference(
             num_probes=probes,
             memory_limit_bytes=memory_bytes,
             genotype_format="bed",
+            fixed_effect_rank=fixed.shape[1],
             threads=threads,
             preferred_variant_block_width=variant_block_width,
-            preferred_rhs_tile_columns=q * q * probe_tile_width,
-            rhs_policy="tiled",
+            preferred_rhs_tile_columns=(
+                None
+                if probe_tile_width is None
+                else q * q * probe_tile_width
+            ),
+            preferred_source_probe_tile_width=source_probe_tile_width,
+            rhs_policy="auto",
             write_directional_panel=include_directional_panel,
+            component_diagonal_sample_tile_width=(
+                component_diagonal_sample_tile_width
+            ),
+            write_composable_payload=mode == "composable",
         )
     )
     descriptors = _open_descriptors(axes.prefix)
@@ -478,15 +501,21 @@ def run_reference(
             annotation_masses=masses,
             probe_spec=probe_spec,
             work_plan=plan,
-            probe_tile_width=probe_tile_width,
-            source_probe_tile_width=source_probe_tile_width,
-            same_person_sample_tile_width=1024,
+            probe_tile_width=int(plan.tiling["probe_tile_width"]),
+            source_probe_tile_width=int(
+                plan.tiling["source_probe_tile_width"]
+            ),
+            same_person_sample_tile_width=(
+                component_diagonal_sample_tile_width
+            ),
             threads=threads,
             decode_threads=threads,
             retain_base_sources=False,
+            publish_component_kernel_diagonal=mode == "composable",
+            retain_contextual_sources=False,
             backend="dense",
             native_module=native_module,
-        ).execute()
+        ).execute(show_progress=True)
     finally:
         for descriptor in descriptors.values():
             os.close(descriptor)
@@ -524,8 +553,8 @@ def run_reference(
         "maximum_source_projection_leakage": float(telemetry["maximum_projection_leakage"]),
         "maximum_presymmetry_absolute_error": float(native.presymmetry_absolute_error),
         "maximum_presymmetry_relative_error": float(native.presymmetry_relative_error),
-        "same_person_probe_count": probes,
-        "same_person_cross_tile_finalized": True,
+        "same_person_method": "exact_component_kernel_diagonal_v1",
+        "component_kernel_diagonal_orientation": "component_by_sample_c_n",
         "minimum_annotation_mass": float(np.min(masses)),
         "all_values_finite": True,
         "normal_matrix_rank": int(np.linalg.matrix_rank(native.genetic_gram)),
@@ -543,11 +572,19 @@ def run_reference(
         provenance={"native_module": str(Path(native_module.__file__))},
         diagnostics=diagnostics,
         include_directional_panel=include_directional_panel,
+        mode=mode,
     )
     artifact_path = None
     if output is not None:
         artifact_path = write_generalized_gxe_variant_reference_v1(artifact, output)
-    return ReferenceRun(artifact=artifact, native_result=native, artifact_path=artifact_path)
+    # The closed artifact persists the exact affine scale needed by the trait
+    # pass.  Dropping the ephemeral native container here releases its second
+    # copy of a composable directional panel before downstream work begins.
+    return ReferenceRun(
+        artifact=artifact,
+        native_result=None,
+        artifact_path=artifact_path,
+    )
 
 
 def run_trait_batch(

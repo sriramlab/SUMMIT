@@ -311,8 +311,22 @@ def build_parser() -> argparse.ArgumentParser:
         help="post-hoc delete-block replicates for normal-equation inference",
     )
     parser.add_argument("--seed", type=int, default=20260823)
+    parser.add_argument(
+        "--mode",
+        choices=("summary", "composable"),
+        default="summary",
+        help=(
+            "composable stores sample-aligned data and should not be used "
+            "for public release"
+        ),
+    )
     parser.add_argument("--memory-gib", type=float, default=64.0)
-    parser.add_argument("--probe-tile-width", type=int, default=4)
+    parser.add_argument(
+        "--probe-tile-width",
+        type=int,
+        default=None,
+        help="pass-2 target tile; defaults to planner-selected",
+    )
     parser.add_argument(
         "--source-probe-tile-width",
         type=int,
@@ -415,6 +429,7 @@ def main() -> int:
             native_module=gxeldcore,
             output=args.output / f"simulation_reference_b{args.probes}",
             include_directional_panel=False,
+            mode=args.mode,
             probe_tile_width=args.probe_tile_width,
             source_probe_tile_width=(
                 args.source_probe_tile_width
@@ -424,18 +439,18 @@ def main() -> int:
         )
         reference_seconds = time.perf_counter() - reference_started
         if not np.array_equal(
-            reference_run.native_result.affine_mean,
+            reference_run.artifact.affine_mean,
             first_arrays["affine_mean"],
         ):
             raise RuntimeError("simulator/reference affine means differ")
         if not np.array_equal(
-            reference_run.native_result.affine_inverse_scale,
+            reference_run.artifact.affine_inverse_scale,
             first_arrays["affine_inverse_scale"],
         ):
             maximum = float(
                 np.max(
                     np.abs(
-                        reference_run.native_result.affine_inverse_scale
+                        reference_run.artifact.affine_inverse_scale
                         - first_arrays["affine_inverse_scale"]
                     )
                 )

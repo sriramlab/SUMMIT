@@ -66,6 +66,27 @@ T[c,d]
 \frac{DNUM[c,d]+DNUM[d,c]}2.
 ```
 
+## Exact component diagonals and same-person term
+
+For pair `p=(q,r)`, let `kappa(q,r)=1` on the diagonal and `2` off the
+diagonal. The normalized component-kernel diagonal is stored component-major:
+
+```math
+d[k,p,i]
+=
+\frac{\kappa(q,r)}{M_k}
+\sum_j A[j,k]F_q[i,j]F_r[i,j].
+```
+
+The same-person trace matrix is exact, not probe-estimated:
+
+```math
+D=d d^T.
+```
+
+The numerator is accumulated once per already decoded pass-2 genotype block,
+outside annotation/probe scoring loops. This adds no genotype traversal.
+
 ## Required randomized construction
 
 Use variant probes `Xi in R^{M x B}`.
@@ -91,6 +112,30 @@ panels using the same orientation expansion as above.
 
 A normal reference run performs exactly two full genotype traversals. Tiling
 must not add scans.
+
+## Artifact modes and annotation composition
+
+`summary` is the default, public-release-oriented mode. It publishes the
+fixed-annotation aggregate moments and omits both the annotation matrix and
+sample-aligned component diagonals.
+
+`composable` additionally publishes the full directional panel, annotation
+columns, and `component_kernel_diagonal` with shape `C x N`. Because the last
+array is sample-aligned, composable artifacts currently emit a warning and
+should not be publicly shared.
+
+Container compression is not part of the estimator. Composable NPZ files use
+uncompressed array members for high-throughput publication of their large,
+effectively incompressible FP64 panels; summary NPZ files remain compressed.
+
+Compatible composable bundles can be combined with
+`compose_generalized_gxe_variant_references_v1`. The operation selects and
+concatenates annotation columns in caller order, concatenates the matching
+source-component columns and diagonal rows, then reruns only the in-memory
+target reducer. It does not access genotypes. Compatibility checks cover
+sample/variant dimensions, basis and component order, fixed-effect dimensions,
+probe convention, and genotype scaling; callers remain responsible for using
+the same ordered samples and SNPs.
 
 ## Post-hoc inference-time SNP-block jackknife
 

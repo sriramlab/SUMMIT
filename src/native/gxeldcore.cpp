@@ -15976,8 +15976,10 @@ NB_MODULE(gxeldcore, module) {
                 nb_mat2c_ro<int64_t>, nb_mat2c_ro<int64_t>,
                 nb_vec1_ro<int64_t>,
                 nb_mat2c_ro<int64_t>, uint64_t,
-                uint64_t, int64_t, int, int, int, int, int, uint64_t,
-                int, int, bool, bool, const std::string&, int, int, double
+                uint64_t, int64_t, int, int, int, int, int, int, int,
+                uint64_t,
+                int, int, bool, bool, bool, bool, bool,
+                const std::string&, int, int, double
             >(),
             nb::arg("bed_descriptor"), nb::arg("bim_descriptor"),
             nb::arg("fam_descriptor"), nb::arg("row_sel"),
@@ -15990,17 +15992,27 @@ NB_MODULE(gxeldcore, module) {
             nb::arg("namespace_key"), nb::arg("probe_offset"),
             nb::arg("probe_count"), nb::arg("variant_block_width"),
             nb::arg("source_probe_tile_width"),
+            nb::arg("source_annotation_batch_width"),
             nb::arg("probe_tile_width"),
+            nb::arg("target_annotation_batch_width"),
             nb::arg("same_person_sample_tile_width"),
             nb::arg("max_workspace_bytes"), nb::arg("decode_threads"),
             nb::arg("threads"), nb::arg("retain_base_sources") = false,
+            nb::arg("publish_component_kernel_diagonal") = false,
+            nb::arg("retain_contextual_sources") = false,
             nb::arg("dense_blas_hybrid") = true,
+            nb::arg("precompute_rhs") = false,
             nb::arg("qualification_fault_phase") = "none",
             nb::arg("qualification_fault_row") = -1,
             nb::arg("qualification_fault_column") = -1,
             nb::arg("qualification_fault_delta") = 0.0
         )
         .def("info", &GeneralizedGxELDScoreDirectContext::info)
+        .def("progress", &GeneralizedGxELDScoreDirectContext::progress)
+        .def(
+            "request_cancel",
+            &GeneralizedGxELDScoreDirectContext::request_cancel
+        )
         .def("run", &GeneralizedGxELDScoreDirectContext::run);
     module.def(
         "configure_openmp_placement", &configure_openmp_placement,

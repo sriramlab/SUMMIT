@@ -206,6 +206,7 @@ class GeneralizedGxEPass2Result:
     symmetric_numerator: Array
     genetic_gram: Array
     same_person: Array
+    component_kernel_diagonal: Array
     annotation_masses: Array
     pair_table: tuple[tuple[int, int], ...]
     component_table: tuple[tuple[int, int], ...]
@@ -231,6 +232,7 @@ class GeneralizedGxEPass2Executor:
         work_plan: GeneralizedGxEWorkPlan,
         tn_operator: Any,
         probe_tile_width: int | None = None,
+        component_diagonal_sample_tile_width: int = 1024,
         row_complete_sink: RowCompleteSink | None = None,
     ) -> None:
         if not isinstance(pass1_result, GeneralizedGxEPass1Result):
@@ -240,8 +242,6 @@ class GeneralizedGxEPass2Executor:
             raise RuntimeError("pass-1 result does not attest a sealed barrier")
         if pass1_result.contextual_sources.flags.writeable:
             raise RuntimeError("pass-1 contextual sources are not sealed read-only")
-        if pass1_result.same_person.flags.writeable:
-            raise RuntimeError("pass-1 same-person matrix is not sealed read-only")
         if id(genotype_operator) != pass1_result.genotype_operator_identity:
             raise RuntimeError("pass 2 must use the same genotype operator as pass 1")
         if genotype_operator.genotype_scale_id != pass1_result.genotype_scale_id:
@@ -315,7 +315,7 @@ class GeneralizedGxEPass2Executor:
         expected_output_bytes = (
             m * len(pair_index) * len(component_index) * np.dtype(np.float64).itemsize
         )
-        if work_plan.output_size_bytes != expected_output_bytes:
+        if work_plan.output_size_bytes < expected_output_bytes:
             raise ValueError("Stage 05 requires an admitted FP64 directional panel")
         if (
             work_plan.peak_resident_bytes + expected_output_bytes
@@ -337,6 +337,10 @@ class GeneralizedGxEPass2Executor:
         )
         if self.probe_tile_width > maximum_probe_width:
             raise ValueError("probe tile exceeds the admitted RHS width")
+        self.component_diagonal_sample_tile_width = _positive_int(
+            "component_diagonal_sample_tile_width",
+            component_diagonal_sample_tile_width,
+        )
         if row_complete_sink is not None and not callable(row_complete_sink):
             raise TypeError("row_complete_sink must be callable")
 
@@ -351,6 +355,11 @@ class GeneralizedGxEPass2Executor:
         self._masses = _readonly(np.array(masses, copy=True))
         self._pairs = pair_index
         self._components = component_index
+        self._weighted_fixed = np.asfortranarray(
+            (basis_array[:, :, None] * fixed[:, None, :]).reshape(
+                n, basis_array.shape[1] * fixed.shape[1]
+            )
+        )
         self._product_plan = build_pair_product_plan(basis_array.shape[1])
         self._residual_rank = residual_rank
         self._rhs_precomputed = bool(work_plan.tiling["rhs_precomputed"])
@@ -423,6 +432,7 @@ class GeneralizedGxEPass2Executor:
             "rhs_prepare": 0.0,
             "protected_tn": 0.0,
             "row_products": 0.0,
+            "component_diagonal": 0.0,
             "numerator_reduction": 0.0,
             "output_sink": 0.0,
             "postprocess": 0.0,
@@ -448,6 +458,9 @@ class GeneralizedGxEPass2Executor:
             (m, p_count, c_count), dtype=np.float64, order="C"
         )
         directed = np.zeros((c_count, c_count), dtype=np.float64)
+        component_diagonal_numerator = np.zeros(
+            (c_count, n), dtype=np.float64
+        )
         operator_passes_before = self.genotype_operator.observed_passes
         operator_visits_before = self.genotype_operator.observed_variant_visits
         operator_blocks_before = self.genotype_operator.blocks_read
@@ -458,6 +471,7 @@ class GeneralizedGxEPass2Executor:
         maximum_lsum_bytes = 0
         maximum_lrow_bytes = 0
         maximum_reduction_bytes = 0
+        maximum_component_diagonal_scratch_bytes = 0
         tn_flops = 0
         tn_dimension_counts: dict[str, int] = {}
 
@@ -480,6 +494,52 @@ class GeneralizedGxEPass2Executor:
             genotype = block.values
             block_width = row_stop - row_start
             maximum_decoded_bytes = max(maximum_decoded_bytes, genotype.nbytes)
+            diagonal_started = time.perf_counter()
+            projection_coefficients = (
+                genotype.T @ self._weighted_fixed
+            ).reshape(block_width, q_count, self._fixed.shape[1])
+            annotation_block = self._annotations[row_start:row_stop]
+            for sample_start in range(
+                0, n, self.component_diagonal_sample_tile_width
+            ):
+                sample_stop = min(
+                    n,
+                    sample_start + self.component_diagonal_sample_tile_width,
+                )
+                sample_slice = slice(sample_start, sample_stop)
+                sample_width = sample_stop - sample_start
+                feature_tile = np.empty(
+                    (q_count, sample_width, block_width), dtype=np.float64
+                )
+                for coordinate in range(q_count):
+                    feature_tile[coordinate] = (
+                        self._basis[sample_slice, coordinate, None]
+                        * genotype[sample_slice]
+                        - self._fixed[sample_slice]
+                        @ projection_coefficients[:, coordinate, :].T
+                    )
+                for pair in self._pairs.entries:
+                    pair_tile = (
+                        float(pair.kernel_factor)
+                        * feature_tile[pair.q]
+                        * feature_tile[pair.r]
+                    )
+                    annotation_product = pair_tile @ annotation_block
+                    for annotation in range(k_count):
+                        component = annotation * p_count + pair.index
+                        component_diagonal_numerator[
+                            component, sample_slice
+                        ] += annotation_product[:, annotation]
+                    maximum_component_diagonal_scratch_bytes = max(
+                        maximum_component_diagonal_scratch_bytes,
+                        feature_tile.nbytes
+                        + pair_tile.nbytes
+                        + annotation_product.nbytes
+                        + projection_coefficients.nbytes,
+                    )
+            phase_seconds["component_diagonal"] += (
+                time.perf_counter() - diagonal_started
+            )
             lrow = np.empty(
                 (block_width, p_count, c_count), dtype=np.float64, order="C"
             )
@@ -624,6 +684,16 @@ class GeneralizedGxEPass2Executor:
             dtype=np.int64,
         )
         component_masses = self._masses[component_annotations]
+        component_kernel_diagonal = (
+            component_diagonal_numerator / component_masses[:, None]
+        )
+        same_person_raw = (
+            component_kernel_diagonal @ component_kernel_diagonal.T
+        )
+        same_person_presymmetry_error = float(
+            np.max(np.abs(same_person_raw - same_person_raw.T), initial=0.0)
+        )
+        same_person = 0.5 * (same_person_raw + same_person_raw.T)
         genetic_gram = (
             float(self._residual_rank**2)
             * symmetric
@@ -634,6 +704,8 @@ class GeneralizedGxEPass2Executor:
             ("directed_numerator", directed),
             ("symmetric_numerator", symmetric),
             ("genetic_gram", genetic_gram),
+            ("component_kernel_diagonal", component_kernel_diagonal),
+            ("same_person", same_person),
         ):
             if not np.all(np.isfinite(value)):
                 raise RuntimeError(f"{name} is non-finite after pass 2")
@@ -644,6 +716,10 @@ class GeneralizedGxEPass2Executor:
         directed = _readonly(directed)
         symmetric = _readonly(symmetric)
         genetic_gram = _readonly(genetic_gram)
+        component_kernel_diagonal = _readonly(
+            np.ascontiguousarray(component_kernel_diagonal)
+        )
+        same_person = _readonly(np.ascontiguousarray(same_person))
         allocation_ledger = {
             "directional_panel_bytes": directional.nbytes,
             "directed_numerator_bytes": directed.nbytes,
@@ -657,6 +733,12 @@ class GeneralizedGxEPass2Executor:
             "maximum_lsum_bytes": maximum_lsum_bytes,
             "maximum_lrow_bytes": maximum_lrow_bytes,
             "maximum_reduction_bytes": maximum_reduction_bytes,
+            "component_kernel_diagonal_bytes": (
+                component_kernel_diagonal.nbytes
+            ),
+            "maximum_component_diagonal_scratch_bytes": (
+                maximum_component_diagonal_scratch_bytes
+            ),
             "planned_peak_resident_bytes": self.work_plan.peak_resident_bytes,
             "memory_limit_bytes": self.work_plan.memory_limit_bytes,
         }
@@ -710,6 +792,12 @@ class GeneralizedGxEPass2Executor:
                 "native": native_telemetry,
                 "checks": {
                     "reference_estimation_jackknife": "none",
+                    "same_person_method": (
+                        "exact_component_kernel_diagonal_v1"
+                    ),
+                    "same_person_presymmetry_error": (
+                        same_person_presymmetry_error
+                    ),
                 },
             }
         )
@@ -718,7 +806,8 @@ class GeneralizedGxEPass2Executor:
             directed_numerator=directed,
             symmetric_numerator=symmetric,
             genetic_gram=genetic_gram,
-            same_person=self.pass1_result.same_person,
+            same_person=same_person,
+            component_kernel_diagonal=component_kernel_diagonal,
             annotation_masses=self.pass1_result.annotation_masses,
             pair_table=self.pass1_result.pair_table,
             component_table=self.pass1_result.component_table,

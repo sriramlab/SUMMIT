@@ -8,6 +8,40 @@ retry, repair, fallback, and integrity-failure counts.
 
 This is not the sample-probe contextual action estimator.
 
+The same-person term is formed exactly as
+`component_kernel_diagonal @ component_kernel_diagonal.T`. Its diagonal rows
+are accumulated during the existing pass 2; no third genotype pass is used.
+
+## Output mode
+
+The default is release-safe summary mode:
+
+```bash
+python example/estimate_generalized_gxe_variant_ldscore.py \
+  --mode summary --output /tmp/summit-generalized-example
+```
+
+For internal annotation reuse, opt in explicitly:
+
+```bash
+python example/estimate_generalized_gxe_variant_ldscore.py \
+  --mode composable --output /secure/internal/reference
+```
+
+Composable output contains the annotation matrix, the full directional panel,
+and a sample-aligned `C x N` component-kernel diagonal. SUMMIT warns when this
+mode is written. Do not publicly share these artifacts. Use
+`compose_generalized_gxe_variant_references_v1` to select columns from
+compatible bundles and build a normal fit-ready reference without genotype
+access. Trait artifacts that retained per-SNP sufficient statistics can be
+aligned to the selected annotation panel with
+`reaggregate_generalized_gxe_trait_summary`.
+
+Composable artifacts are written as uncompressed NPZ containers. Their large
+FP64 directional panels are effectively incompressible, so DEFLATE added a
+long serial publication step without materially reducing storage. Summary
+artifacts remain compressed.
+
 ## Definitive jackknife boundary
 
 The LD-score estimator has no block count, block-ID vector, or jackknife
@@ -42,6 +76,44 @@ summit-generalized-gxe-variant-ldscore plan \
 
 `variant-block-width` is an I/O/memory tile and is unrelated to jackknife
 blocks.
+
+The plan reports separate target and source probe widths plus source/target
+annotation batch widths. These are execution choices only: batching joins
+independent GEMM columns so that a decoded genotype block can be reused, while
+each probe contribution and component reduction retains its defined order.
+The planner accounts for the batched RHS, GEMM output, pair-reduction, and
+component-diagonal buffers before admitting a plan.
+
+When every variant has exactly one nonzero annotation entry (as in disjoint
+MAF--LD bins), the native executor automatically compacts pass-1 source
+products by bin and fuses pass-2 pair formation with the ordered bin
+reduction. Overlapping annotations retain the general dense path. Detection is
+exact, is reported in native telemetry, and does not alter either genotype
+traversal or the FP64 estimator.
+
+With `rhs-policy=auto`, the planner retains a read-only, probe-tile-major RHS
+when the complete allocation fits the memory limit. Otherwise it constructs a
+bounded RHS tile inside pass 2. Both paths use the same two genotype passes and
+produce the same estimator. The production workflow leaves the target probe
+width planner-selected by default; `--probe-tile-width` remains available for
+an explicit override. The real-data and simulation runners use the full probe
+range as the preferred pass-1 source tile, subject to the planner's memory
+admission.
+
+## Progress and cancellation
+
+Production reference runs call the native executor with progress reporting
+enabled. In a terminal this is a lightweight `tqdm` block bar with the current
+phase/subphase, unit count, and peak RSS. Non-interactive logs emit a start
+record, phase changes, periodic status (five minutes by default), and
+completion; they include the current subphase age and a phase ETA after the
+first completed block. The native snapshot is also available through
+`executor.progress()` and includes block, variant, subphase-unit,
+elapsed-time, heartbeat, and peak-RSS fields.
+
+`executor.request_cancel()` requests termination at the next safe native tile
+boundary. Cancellation never publishes a partial reference; the context moves
+to the failed/cancelled state instead.
 
 ## End-to-end example
 

@@ -567,6 +567,22 @@ def exact_same_person_matrix(
     return diagonals @ diagonals.T
 
 
+def exact_component_kernel_diagonal(
+    genotype: Array,
+    basis: Array,
+    fixed_basis: Array,
+    annotations: Array,
+) -> Array:
+    """Return annotation-major normalized component-kernel diagonals."""
+    features = contextual_features(genotype, basis, fixed_basis)
+    kernels, _masses, _component_annotation, _component_pair = normalized_kernels(
+        features,
+        annotations,
+        pair_order(np.asarray(basis).shape[1]),
+    )
+    return np.diagonal(kernels, axis1=1, axis2=2).copy()
+
+
 def same_person_ustatistic(
     contextual_sources: Array,
     annotations: Array,

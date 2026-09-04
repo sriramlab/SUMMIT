@@ -3,7 +3,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from summit.context.fit import ContextRankError
+from summit.context.fit import ContextNormalEquations, ContextRankError
 from summit.context.oracle import transfer_reference_gram
 from summit.context.spec import (
     ContextComponentIndex,
@@ -12,6 +12,7 @@ from summit.context.spec import (
 from summit.ldscore.generalized_gxe_fit_v1 import (
     _trait_moments_after_deleting_blocks,
     assemble_generalized_gxe_normal_equations_v1,
+    fit_profiled_response_rank_v1,
     fit_generalized_gxe_variant_model_v1,
     validate_generalized_gxe_trait_compatibility_v1,
 )
@@ -26,6 +27,130 @@ from summit.ldscore.generalized_gxe_variant import (
 from summit.ldscore.generalized_gxe_trait_summary import GeneralizedGxETraitSummary
 from test_context_stage4_fit_v1 import _artifacts
 from test_context_stage4_trait_v1 import _artifact as stable_trait_artifact
+
+
+def _rank_fit_equations(
+    omega: np.ndarray, *, residual_count: int = 3
+) -> tuple[ContextNormalEquations, ContextComponentIndex, np.ndarray]:
+    components = ContextComponentIndex(("all",), ContextPairIndex(len(omega)))
+    genetic = np.asarray(
+        [omega[entry.q, entry.r] for entry in components.entries], dtype=float
+    )
+    residual = np.linspace(0.1, 0.1 * residual_count, residual_count)
+    coefficients = np.concatenate((genetic, residual))
+    rng = np.random.default_rng(9137)
+    design = rng.normal(size=(len(coefficients) + 4, len(coefficients)))
+    matrix = design.T @ design + np.eye(len(coefficients))
+    rhs = matrix @ coefficients
+    equations = ContextNormalEquations(
+        matrix=matrix,
+        rhs=rhs,
+        traces=np.zeros(len(coefficients)),
+        component_names=tuple(
+            [f"omega_{entry.q}_{entry.r}" for entry in components.entries]
+            + [f"residual_{index}" for index in range(residual_count)]
+        ),
+        genetic_count=len(components),
+        annotation_masses=np.ones(1),
+        deleted_groups=(),
+        reference_genetic_gram=np.eye(len(components)),
+        transferred_genetic_gram=np.eye(len(components)),
+        reference_n=1000,
+        study_n=900,
+    )
+    return equations, components, coefficients
+
+
+def test_profiled_rank_one_recovers_exact_rank_one_covariance() -> None:
+    baseline = 0.4
+    alignment = np.asarray([0.2, -0.1, 0.3])
+    response = np.asarray([0.1, 0.25, -0.2])
+    omega = np.zeros((4, 4))
+    omega[0, 0] = baseline
+    omega[0, 1:] = omega[1:, 0] = baseline * alignment
+    omega[1:, 1:] = baseline * np.outer(alignment, alignment) + np.outer(
+        response, response
+    )
+    equations, components, expected = _rank_fit_equations(omega)
+    result = fit_profiled_response_rank_v1(
+        equations, components, response_rank=1
+    )
+    np.testing.assert_allclose(result.coefficients, expected, rtol=2e-8, atol=2e-9)
+    np.testing.assert_allclose(result.omega, omega, rtol=2e-8, atol=2e-9)
+    assert np.linalg.eigvalsh(result.omega)[0] >= -1e-10
+    assert np.linalg.matrix_rank(result.conditional_response, tol=1e-9) == 1
+    assert result.profiled_quadratic_distance < 1e-8
+
+
+def test_profiled_rank_models_are_nested_and_profile_residual_terms() -> None:
+    baseline = 0.35
+    alignment = np.asarray([0.1, 0.2, -0.15])
+    response = np.diag([0.08, 0.04, 0.02])
+    omega = np.zeros((4, 4))
+    omega[0, 0] = baseline
+    omega[0, 1:] = omega[1:, 0] = baseline * alignment
+    omega[1:, 1:] = baseline * np.outer(alignment, alignment) + response
+    equations, components, _ = _rank_fit_equations(omega)
+    rank_zero = fit_profiled_response_rank_v1(
+        equations, components, response_rank=0
+    )
+    rank_one = fit_profiled_response_rank_v1(
+        equations, components, response_rank=1
+    )
+    assert rank_one.optimizer_cost <= rank_zero.optimizer_cost + 1e-10
+    assert np.linalg.matrix_rank(rank_zero.conditional_response, tol=1e-10) == 0
+    assert np.linalg.matrix_rank(rank_one.conditional_response, tol=1e-10) <= 1
+    c = len(components)
+    residual_normal_equations = (
+        equations.matrix[c:, :] @ rank_one.coefficients - equations.rhs[c:]
+    )
+    np.testing.assert_allclose(residual_normal_equations, 0.0, atol=2e-10)
+
+
+def test_profiled_rank_fit_rejects_invalid_rank() -> None:
+    equations, components, _ = _rank_fit_equations(np.eye(3))
+    with pytest.raises(ValueError, match="zero or one"):
+        fit_profiled_response_rank_v1(
+            equations, components, response_rank=2
+        )
+
+
+def test_profiled_rank_fit_accepts_covariance_metric_for_indefinite_system() -> None:
+    baseline = 0.4
+    alignment = np.asarray([0.2, -0.1])
+    response = np.asarray([0.15, 0.3])
+    omega = np.zeros((3, 3))
+    omega[0, 0] = baseline
+    omega[0, 1:] = omega[1:, 0] = baseline * alignment
+    omega[1:, 1:] = baseline * np.outer(alignment, alignment) + np.outer(
+        response, response
+    )
+    equations, components, expected = _rank_fit_equations(omega)
+    matrix = np.asarray(equations.matrix).copy()
+    matrix[0, 0] = -abs(matrix[0, 0])
+    matrix = 0.5 * (matrix + matrix.T)
+    indefinite = ContextNormalEquations(
+        matrix=matrix,
+        rhs=matrix @ expected,
+        traces=equations.traces,
+        component_names=equations.component_names,
+        genetic_count=equations.genetic_count,
+        annotation_masses=equations.annotation_masses,
+        deleted_groups=equations.deleted_groups,
+        reference_genetic_gram=equations.reference_genetic_gram,
+        transferred_genetic_gram=equations.transferred_genetic_gram,
+        reference_n=equations.reference_n,
+        study_n=equations.study_n,
+    )
+    result = fit_profiled_response_rank_v1(
+        indefinite,
+        components,
+        response_rank=1,
+        coefficient_covariance=np.eye(len(components)),
+    )
+    np.testing.assert_allclose(result.genetic_coefficients, expected[: len(components)], atol=2e-8)
+    assert result.objective_metric == "genetic_jackknife_covariance_precision"
+    assert result.objective_rank == len(components)
 
 
 def _completed_ledger(block_ids: np.ndarray) -> dict[str, int]:

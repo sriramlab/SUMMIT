@@ -31,6 +31,13 @@ def _positive(value: str) -> int:
     return parsed
 
 
+def _nonnegative(value: str) -> int:
+    parsed = int(value)
+    if parsed < 0:
+        raise argparse.ArgumentTypeError("value must be nonnegative")
+    return parsed
+
+
 def _cpu_ids(value: str) -> list[int]:
     result = [int(item) for item in value.split(",") if item]
     if not result or len(set(result)) != len(result) or min(result) < 0:
@@ -48,12 +55,25 @@ def _plan(args: argparse.Namespace):
             num_probes=args.probes,
             memory_limit_bytes=args.memory_gib * 1024**3,
             genotype_format="bed",
+            fixed_effect_rank=args.fixed_effect_rank,
             threads=args.threads,
             preferred_variant_block_width=args.variant_block_width,
             preferred_rhs_tile_columns=(
                 args.basis**2 * args.probe_tile_width
             ),
-            rhs_policy="tiled",
+            preferred_source_probe_tile_width=(
+                args.source_probe_tile_width
+            ),
+            preferred_source_annotation_batch_width=(
+                args.source_annotation_batch_width
+            ),
+            preferred_target_annotation_batch_width=(
+                args.target_annotation_batch_width
+            ),
+            rhs_policy=args.rhs_policy,
+            component_diagonal_sample_tile_width=getattr(
+                args, "sample_tile_width", 1024
+            ),
         )
     )
 
@@ -67,12 +87,19 @@ def _science_inputs(args: argparse.Namespace):
         basis_rng.normal(size=n) for _ in range(args.basis - 1)
     )
     basis = np.asfortranarray(np.column_stack(basis_columns))
-    fixed_rng = np.random.default_rng(args.seed + 2)
-    fixed, _ = np.linalg.qr(
-        np.column_stack((np.ones(n), fixed_rng.normal(size=n))),
-        mode="reduced",
-    )
-    fixed = np.asfortranarray(fixed)
+    if args.fixed_effect_rank:
+        fixed_rng = np.random.default_rng(args.seed + 2)
+        fixed_design = np.column_stack(
+            [np.ones(n)]
+            + [
+                fixed_rng.normal(size=n)
+                for _ in range(args.fixed_effect_rank - 1)
+            ]
+        )
+        fixed, _ = np.linalg.qr(fixed_design, mode="reduced")
+        fixed = np.asfortranarray(fixed)
+    else:
+        fixed = np.empty((n, 0), dtype=np.float64, order="F")
     if args.annotation_layout == "overlap":
         annotation_rng = np.random.default_rng(args.seed + 3)
         annotations = annotation_rng.uniform(
@@ -158,14 +185,25 @@ def _one_execution(
             annotation_names=tuple(
                 f"annotation_{index}" for index in range(args.annotations)
             ),
-            annotation_masses=np.sum(annotations, axis=0, dtype=np.float64),
+            annotation_masses=np.asarray(
+                [
+                    np.cumsum(
+                        annotations[:, index], dtype=np.longdouble
+                    )[-1]
+                    for index in range(annotations.shape[1])
+                ],
+                dtype=np.float64,
+            ),
             probe_spec=GlobalVariantProbeSpec(
                 root_seed=args.seed,
                 probe_offset=0,
                 probe_count=args.probes,
             ),
             work_plan=plan,
-            probe_tile_width=args.probe_tile_width,
+            probe_tile_width=int(plan.tiling["probe_tile_width"]),
+            source_probe_tile_width=int(
+                plan.tiling["source_probe_tile_width"]
+            ),
             same_person_sample_tile_width=args.sample_tile_width,
             threads=args.threads,
             decode_threads=args.threads,
@@ -173,7 +211,10 @@ def _one_execution(
             backend=args.backend,
         )
         begin = time.perf_counter()
-        result = executor.execute()
+        result = executor.execute(
+            show_progress=args.show_progress,
+            status_interval_seconds=args.status_interval_seconds,
+        )
         end_to_end = time.perf_counter() - begin
         return {
             "end_to_end_wall_seconds": end_to_end,
@@ -221,6 +262,7 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
             "Q": args.basis,
             "K": args.annotations,
             "B": args.probes,
+            "F": args.fixed_effect_rank,
         },
         "configuration": {
             "backend": args.backend,
@@ -229,7 +271,17 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
             "annotation_layout": args.annotation_layout,
             "variant_block_width": plan.tiling["variant_block_width"],
             "probe_tile_width": args.probe_tile_width,
+            "source_probe_tile_width": plan.tiling[
+                "source_probe_tile_width"
+            ],
             "rhs_tile_columns": plan.tiling["rhs_tile_columns"],
+            "rhs_precomputed": plan.tiling["rhs_precomputed"],
+            "source_annotation_batch_width": plan.tiling[
+                "source_annotation_batch_width"
+            ],
+            "target_annotation_batch_width": plan.tiling[
+                "target_annotation_batch_width"
+            ],
             "warmups": args.warmups,
             "repeats": args.repeats,
         },
@@ -256,6 +308,18 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
         "telemetry_policy": {
             "schema": telemetry["schema"],
             "algebraic_checksum_policy": telemetry["algebraic_checksum_policy"],
+            "source_annotation_batching": telemetry[
+                "source_annotation_batching"
+            ],
+            "component_annotation_reduction": telemetry[
+                "component_annotation_reduction"
+            ],
+            "target_annotation_batching": telemetry[
+                "target_annotation_batching"
+            ],
+            "row_product_reduction": telemetry["row_product_reduction"],
+            "directed_aggregation": telemetry["directed_aggregation"],
+            "publication": telemetry["publication"],
             "full_serial_output_witness_calls": telemetry[
                 "full_serial_output_witness_calls"
             ],
@@ -273,6 +337,15 @@ def _add_dimensions(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--threads", type=_positive, default=1)
     parser.add_argument("--variant-block-width", type=_positive, default=4096)
     parser.add_argument("--probe-tile-width", type=_positive, default=16)
+    parser.add_argument("--source-probe-tile-width", type=_positive)
+    parser.add_argument("--fixed-effect-rank", type=_nonnegative, default=2)
+    parser.add_argument(
+        "--rhs-policy",
+        choices=("auto", "precompute", "tiled"),
+        default="tiled",
+    )
+    parser.add_argument("--source-annotation-batch-width", type=_positive)
+    parser.add_argument("--target-annotation-batch-width", type=_positive)
     parser.add_argument("--memory-gib", type=_positive, default=128)
 
 
@@ -300,6 +373,17 @@ def _parser() -> argparse.ArgumentParser:
     run.add_argument("--warmups", type=int, default=1)
     run.add_argument("--repeats", type=_positive, default=3)
     run.add_argument("--cpu-ids", type=_cpu_ids)
+    run.add_argument(
+        "--show-progress",
+        action="store_true",
+        help="report native phase and block progress while benchmarking",
+    )
+    run.add_argument(
+        "--status-interval-seconds",
+        type=float,
+        default=300.0,
+        help="non-interactive progress-report interval",
+    )
     return parser
 
 
@@ -307,6 +391,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     if args.probe_tile_width > args.probes:
         raise SystemExit("--probe-tile-width cannot exceed --probes")
+    if args.fixed_effect_rank >= args.samples:
+        raise SystemExit("--fixed-effect-rank must be smaller than --samples")
     if args.command == "plan":
         payload = {
             "schema": "summit.generalized_gxe.variant_benchmark_plan.v1",
@@ -317,6 +403,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             raise SystemExit("--missing-fraction must be in [0,1)")
         if args.warmups < 0:
             raise SystemExit("--warmups must be nonnegative")
+        if (
+            not np.isfinite(args.status_interval_seconds)
+            or args.status_interval_seconds <= 0.0
+        ):
+            raise SystemExit("--status-interval-seconds must be positive and finite")
         payload = _run(args)
     print(json.dumps(payload, sort_keys=True, default=str))
     return 0

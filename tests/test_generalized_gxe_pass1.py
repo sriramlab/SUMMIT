@@ -13,7 +13,6 @@ from generalized_gxe_variant_ldscore_oracle import (
     orthonormalize,
     pair_order,
     pass1_sources,
-    same_person_ustatistic,
 )
 from summit.ldscore.generalized_gxe_pass1 import (
     ArraySequentialGenotypeOperator,
@@ -134,9 +133,6 @@ def test_pass1_fixed_global_probes_match_dense_oracle_and_seal_barrier() -> None
     expected_base, expected_contextual = pass1_sources(
         genotype, basis, fixed, annotations, probes
     )
-    expected_same = same_person_ustatistic(
-        expected_contextual, annotations, pair_order(basis.shape[1])
-    )
     observed, operator = _execute_numpy(
         genotype=genotype,
         basis=basis,
@@ -157,9 +153,6 @@ def test_pass1_fixed_global_probes_match_dense_oracle_and_seal_barrier() -> None
         expected_contextual,
         rtol=4.0e-14,
         atol=4.0e-14,
-    )
-    np.testing.assert_allclose(
-        observed.same_person, expected_same, rtol=8.0e-14, atol=8.0e-14
     )
     expected_leakage = max(
         float(np.max(np.abs(fixed.T @ expected_contextual[k, q])))
@@ -209,9 +202,6 @@ def test_pass1_is_invariant_to_all_logical_tile_widths(
     expected_base, expected_contextual = pass1_sources(
         genotype, basis, fixed, annotations, probes
     )
-    expected_same = same_person_ustatistic(
-        expected_contextual, annotations, pair_order(3)
-    )
     observed, operator = _execute_numpy(
         genotype=genotype,
         basis=basis,
@@ -230,9 +220,6 @@ def test_pass1_is_invariant_to_all_logical_tile_widths(
         expected_contextual,
         rtol=5.0e-14,
         atol=5.0e-14,
-    )
-    np.testing.assert_allclose(
-        observed.same_person, expected_same, rtol=1.0e-13, atol=1.0e-13
     )
     assert operator.observed_variant_visits == genotype.shape[1]
     assert observed.ledger.observed_retained_variant_visits == genotype.shape[1]
@@ -258,7 +245,6 @@ def test_pass1_numpy_thread_request_is_scientifically_invariant() -> None:
     np.testing.assert_array_equal(
         results[0].contextual_sources, results[1].contextual_sources
     )
-    np.testing.assert_array_equal(results[0].same_person, results[1].same_person)
 
 
 def test_pass1_releases_base_scratch_and_seals_scientific_outputs() -> None:
@@ -276,7 +262,6 @@ def test_pass1_releases_base_scratch_and_seals_scientific_outputs() -> None:
     )
     assert result.base_sources is None
     assert result.contextual_sources.flags.writeable is False
-    assert result.same_person.flags.writeable is False
     assert result.annotation_masses.flags.writeable is False
     assert result.telemetry["allocation_ledger"][
         "base_source_scratch_released"
@@ -285,7 +270,7 @@ def test_pass1_releases_base_scratch_and_seals_scientific_outputs() -> None:
         "pass1_sealed": True,
         "target_scoring_started": False,
         "contextual_sources_readonly": True,
-        "same_person_cross_tile_finalized": True,
+        "same_person_deferred_to_exact_pass2_diagonal": True,
     }
     assert all(
         result.telemetry["barrier"][name] == value
@@ -439,9 +424,6 @@ def test_native_protected_nn_pass1_matches_dense_oracle_and_publishes_telemetry(
     expected_base, expected_contextual = pass1_sources(
         genotype, basis, fixed, annotations, probes
     )
-    expected_same = same_person_ustatistic(
-        expected_contextual, annotations, pair_order(3)
-    )
     threads = _configured_native_threads(gxeldcore)
     operator = ArraySequentialGenotypeOperator(genotype)
     result = GeneralizedGxEPass1Executor(
@@ -474,9 +456,6 @@ def test_native_protected_nn_pass1_matches_dense_oracle_and_publishes_telemetry(
         expected_contextual,
         rtol=5.0e-14,
         atol=5.0e-14,
-    )
-    np.testing.assert_allclose(
-        result.same_person, expected_same, rtol=1.0e-13, atol=1.0e-13
     )
     assert result.telemetry["native"]["available"] is True
     assert result.telemetry["source_nn"]["calls"] == 36
@@ -539,7 +518,7 @@ def test_native_pass1_one_and_multiple_threads_match_in_fresh_processes(
         ).execute()
         np.savez(
             output, base=result.base_sources,
-            contextual=result.contextual_sources, same=result.same_person,
+            contextual=result.contextual_sources,
         )
         """
     )
@@ -561,7 +540,7 @@ def test_native_pass1_one_and_multiple_threads_match_in_fresh_processes(
         )
         assert completed.returncode == 0, completed.stderr
         outputs.append(np.load(output))
-    for name in ("base", "contextual", "same"):
+    for name in ("base", "contextual"):
         np.testing.assert_allclose(
             outputs[0][name], outputs[1][name], rtol=5.0e-14, atol=5.0e-14
         )

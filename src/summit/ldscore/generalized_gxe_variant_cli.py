@@ -42,12 +42,19 @@ def build_parser() -> argparse.ArgumentParser:
         plan.add_argument(option, dest=destination, type=int, required=True)
     plan.add_argument("--genotype-format", choices=("bed", "pgen"), required=True)
     plan.add_argument("--threads", type=int, default=1)
+    plan.add_argument("--fixed-effect-rank", type=int, default=0)
     plan.add_argument("--variant-block-width", type=int, default=4096)
+    plan.add_argument(
+        "--component-diagonal-sample-tile-width", type=int, default=1024
+    )
     plan.add_argument("--rhs-tile-columns", type=int)
     plan.add_argument(
         "--rhs-policy", choices=("auto", "precompute", "tiled"), default="auto"
     )
     plan.add_argument("--omit-per-variant-panel", action="store_true")
+    plan.add_argument(
+        "--mode", choices=("summary", "composable"), default="summary"
+    )
 
     inspect = subcommands.add_parser(
         "inspect", help="validate and summarize a closed V1 reference artifact"
@@ -66,11 +73,18 @@ def _plan(args: argparse.Namespace) -> dict:
             num_probes=args.num_probes,
             memory_limit_bytes=args.memory_limit_bytes,
             genotype_format=args.genotype_format,
+            fixed_effect_rank=args.fixed_effect_rank,
             threads=args.threads,
             preferred_variant_block_width=args.variant_block_width,
             preferred_rhs_tile_columns=args.rhs_tile_columns,
             rhs_policy=args.rhs_policy,
-            write_directional_panel=not args.omit_per_variant_panel,
+            write_directional_panel=(
+                not args.omit_per_variant_panel or args.mode == "composable"
+            ),
+            component_diagonal_sample_tile_width=(
+                args.component_diagonal_sample_tile_width
+            ),
+            write_composable_payload=args.mode == "composable",
         )
     )
     return {
@@ -79,6 +93,12 @@ def _plan(args: argparse.Namespace) -> dict:
         "scientific_contract": GENERALIZED_GXE_VARIANT_SCIENTIFIC_CONTRACT,
         "probe_axis": "variant",
         "reference_estimation_jackknife": "none",
+        "publication_mode": args.mode,
+        "privacy_warning": (
+            "composable output is sample-aligned and should not be publicly shared"
+            if args.mode == "composable"
+            else None
+        ),
         "planned_reference_genotype_passes": 2,
         "work_plan": work.to_dict(),
     }
@@ -95,6 +115,8 @@ def _inspect(path: Path) -> dict:
         "probe_axis": artifact.manifest["probe_axis"],
         "jackknife_method": artifact.manifest["jackknife_method"],
         "same_person_jackknife": artifact.manifest["same_person_jackknife"],
+        "same_person_method": artifact.manifest["same_person_method"],
+        "publication_mode": artifact.publication_mode,
         "dimensions": {
             "N": axes["samples"]["count"],
             "M": axes["variants"]["count"],

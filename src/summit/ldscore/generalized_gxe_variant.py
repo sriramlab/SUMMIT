@@ -41,6 +41,13 @@ _MAX_INT64 = (1 << 63) - 1
 _MIX_VARIANT = 0xD2B74407B1CE6E93
 _MIX_PROBE = 0xCA5A826395121157
 _MIX_ROOT = 0x9E3779B97F4A7C15
+_COMPONENT_PAIR_BATCH_LIMIT = 8
+_COMPONENT_PAIR_BATCH_BYTE_LIMIT = 256 * 1024**2
+_SOURCE_ANNOTATION_BATCH_LIMIT = 8
+_SOURCE_ANNOTATION_BATCH_BYTE_LIMIT = 2 * 1024**3
+_TARGET_ANNOTATION_BATCH_LIMIT = 8
+
+
 def _require_positive_int(name: str, value: Any, *, allow_zero: bool = False) -> int:
     minimum = 0 if allow_zero else 1
     if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
@@ -194,7 +201,7 @@ class GlobalVariantProbeSpec:
             "probe_count": self.probe_count,
             "variant_index_space": "retained_ordered_variant_axis_v1",
             "tile_invariant": True,
-            "shared_with_same_person": True,
+            "shared_with_same_person": False,
             "stream_namespace": self.namespace,
             "stream_namespace_key_uint64": self.namespace_key,
         }
@@ -240,12 +247,18 @@ class GeneralizedGxEPlanInputs:
     num_probes: int
     memory_limit_bytes: int
     genotype_format: str
+    fixed_effect_rank: int = 0
     threads: int = 1
     preferred_variant_block_width: int = 4096
     preferred_rhs_tile_columns: int | None = None
+    preferred_source_probe_tile_width: int | None = None
+    preferred_source_annotation_batch_width: int | None = None
+    preferred_target_annotation_batch_width: int | None = None
     rhs_policy: str = "auto"
     write_directional_panel: bool = True
     output_storage_bytes: int = 8
+    component_diagonal_sample_tile_width: int = 1024
+    write_composable_payload: bool = False
     headroom_fraction: float = 0.15
 
     def __post_init__(self) -> None:
@@ -259,12 +272,36 @@ class GeneralizedGxEPlanInputs:
             "threads",
             "preferred_variant_block_width",
             "output_storage_bytes",
+            "component_diagonal_sample_tile_width",
         ):
             _require_positive_int(name, getattr(self, name))
+        _require_positive_int(
+            "fixed_effect_rank", self.fixed_effect_rank, allow_zero=True
+        )
+        if self.fixed_effect_rank >= self.num_samples:
+            raise ValueError("fixed_effect_rank must be smaller than num_samples")
         if self.preferred_rhs_tile_columns is not None:
             _require_positive_int(
                 "preferred_rhs_tile_columns", self.preferred_rhs_tile_columns
             )
+        if self.preferred_source_probe_tile_width is not None:
+            _require_positive_int(
+                "preferred_source_probe_tile_width",
+                self.preferred_source_probe_tile_width,
+            )
+            if self.preferred_source_probe_tile_width > self.num_probes:
+                raise ValueError(
+                    "preferred_source_probe_tile_width exceeds num_probes"
+                )
+        for name in (
+            "preferred_source_annotation_batch_width",
+            "preferred_target_annotation_batch_width",
+        ):
+            value = getattr(self, name)
+            if value is not None:
+                _require_positive_int(name, value)
+                if value > self.num_annotations:
+                    raise ValueError(f"{name} exceeds num_annotations")
         if self.genotype_format not in {"bed", "pgen"}:
             raise ValueError("genotype_format must be 'bed' or 'pgen'")
         if self.rhs_policy not in {"auto", "precompute", "tiled"}:
@@ -273,6 +310,8 @@ class GeneralizedGxEPlanInputs:
             raise ValueError("output_storage_bytes must be 4 or 8")
         if not isinstance(self.write_directional_panel, bool):
             raise ValueError("write_directional_panel must be boolean")
+        if not isinstance(self.write_composable_payload, bool):
+            raise ValueError("write_composable_payload must be boolean")
         if (
             not np.isfinite(self.headroom_fraction)
             or self.headroom_fraction < 0.0
@@ -311,7 +350,11 @@ def _memory_candidate(
     inputs: GeneralizedGxEPlanInputs,
     *,
     variant_width: int,
-    rhs_columns: int,
+    rhs_resident_columns: int,
+    target_tile_columns: int,
+    source_probe_tile_width: int,
+    source_annotation_batch_width: int,
+    target_annotation_batch_width: int,
 ) -> tuple[dict[str, int], int]:
     n = inputs.num_samples
     m = inputs.num_variants
@@ -321,24 +364,120 @@ def _memory_candidate(
     p = q * (q + 1) // 2
     c = k * p
     v = min(variant_width, m)
-    output_buffer_rows = v
+    sample_tile = min(inputs.component_diagonal_sample_tile_width, n)
+    one_pair_tile = _checked_product(
+        "component diagonal pair tile bytes", 8, sample_tile, v
+    )
+    pair_batch_width = min(
+        p,
+        _COMPONENT_PAIR_BATCH_LIMIT,
+        max(1, _COMPONENT_PAIR_BATCH_BYTE_LIMIT // one_pair_tile),
+    )
     memory = {
         "base_sources": _checked_product("base source bytes", 8, n, k, b),
         "contextual_sources": _checked_product(
             "contextual source bytes", 8, n, k, q, b
         ),
-        "pass2_rhs": _checked_product("pass-2 RHS bytes", 8, n, rhs_columns),
+        "pass1_probe_signs": _checked_product(
+            "pass-1 probe bytes", 8, v, source_probe_tile_width
+        ),
+        "pass1_source_rhs": _checked_product(
+            "pass-1 source RHS bytes",
+            8,
+            v,
+            source_probe_tile_width,
+            source_annotation_batch_width,
+        ),
+        "pass1_source_contribution": _checked_product(
+            "pass-1 source contribution bytes",
+            8,
+            n,
+            source_probe_tile_width,
+            source_annotation_batch_width,
+        ),
+        "pass2_rhs": _checked_product(
+            "pass-2 RHS bytes", 8, n, rhs_resident_columns
+        ),
         "decoded_genotype_block": _checked_product(
             "decoded genotype bytes", 8, n, v
         ),
+        # A proven single-nonzero annotation layout may compact one bin's
+        # genotype columns before its source GEMM.  The planner does not
+        # inspect annotation values, so reserve the conservative all-variants
+        # upper bound; overlapping annotations do not materialize this arena.
+        "singleton_annotation_source_genotype": (
+            _checked_product(
+                "singleton annotation source genotype bytes", 8, n, v
+            )
+            if inputs.genotype_format == "bed" and k > 1
+            else 0
+        ),
         "cross_sketch_block": _checked_product(
-            "cross-sketch bytes", 8, v, rhs_columns
+            "cross-sketch bytes",
+            8,
+            v,
+            target_tile_columns,
+            target_annotation_batch_width,
         ),
         "pair_reduction_scratch": _checked_product(
-            "pair reduction bytes", 8, v, p, p
+            "pair reduction bytes",
+            8,
+            v,
+            p,
+            p,
+            target_annotation_batch_width,
         ),
-        "same_person_sample_accumulator": _checked_product(
-            "same-person accumulator bytes", 8, c, n
+        "pair_reduction_tile_scratch": _checked_product(
+            "pair reduction tile bytes",
+            8,
+            v,
+            p,
+            p,
+            target_annotation_batch_width,
+        ),
+        "target_row_block": _checked_product(
+            "target row block bytes", 8, v, p, c
+        ),
+        "component_kernel_diagonal": _checked_product(
+            "component kernel diagonal bytes", 8, c, n
+        ),
+        "component_diagonal_weighted_fixed_basis": _checked_product(
+            "component diagonal weighted fixed basis bytes",
+            8,
+            n,
+            q,
+            inputs.fixed_effect_rank,
+        ),
+        "component_diagonal_projection_coefficients": _checked_product(
+            "component diagonal projection bytes",
+            8,
+            q,
+            inputs.fixed_effect_rank,
+            v,
+        ),
+        "component_diagonal_fixed_tile": _checked_product(
+            "component diagonal fixed tile bytes",
+            8,
+            sample_tile,
+            inputs.fixed_effect_rank,
+        ),
+        "component_diagonal_feature_tile": _checked_product(
+            "component diagonal feature tile bytes", 8, q, sample_tile, v
+        ),
+        "component_diagonal_genotype_tile": _checked_product(
+            "component diagonal genotype tile bytes", 8, sample_tile, v
+        ),
+        "component_diagonal_pair_tile": _checked_product(
+            "component diagonal pair tile bytes",
+            one_pair_tile,
+            pair_batch_width,
+        ),
+        "component_diagonal_annotation_product": _checked_product(
+            "component diagonal annotation product bytes",
+            8,
+            sample_tile,
+            k,
+            pair_batch_width,
         ),
         "same_person_small_matrices": _checked_product(
             "same-person matrix bytes", 8, 3, c, c
@@ -346,16 +485,8 @@ def _memory_candidate(
         "aggregate_matrices": _checked_product(
             "aggregate matrix bytes", 8, 3, c, c
         ),
-        "output_buffer": (
-            _checked_product(
-                "output buffer bytes",
-                inputs.output_storage_bytes,
-                output_buffer_rows,
-                p,
-                c,
-            )
-            if inputs.write_directional_panel
-            else 0
+        "directional_panel": _checked_product(
+            "directional panel bytes", 8, m, p, c
         ),
     }
     subtotal = sum(memory.values())
@@ -390,7 +521,23 @@ def plan_generalized_gxe_variant_work(
     pass2_flops = _checked_product("pass-2 work", 2, n, m, k, q, q, b)
     if pass1_flops + pass2_flops > _MAX_INT64:
         raise OverflowError("total leading work exceeds signed 64-bit range")
-    reduction_terms = _checked_product("pair reduction work", m, k, p, p, b)
+    reduction_terms = _checked_product(
+        "pair reduction product terms", m, k, b, q, q, q, q
+    )
+    barrier_projection_flops = _checked_product(
+        "barrier projection work", 6, n, k, q, b, inputs.fixed_effect_rank
+    )
+    component_residualization_flops = _checked_product(
+        "component residualization work",
+        4,
+        n,
+        m,
+        q,
+        inputs.fixed_effect_rank,
+    )
+    component_annotation_flops = _checked_product(
+        "component annotation work", 2, n, m, k, p
+    )
     output_size = (
         _checked_product(
             "directional output bytes",
@@ -403,81 +550,220 @@ def plan_generalized_gxe_variant_work(
         if inputs.write_directional_panel
         else 0
     )
+    if inputs.write_composable_payload:
+        output_size += _checked_product(
+            "composable annotation output bytes", 8, m, k
+        )
+        output_size += _checked_product(
+            "composable component diagonal output bytes", 8, c, n
+        )
 
     preferred_variant_width = min(inputs.preferred_variant_block_width, m)
-    selected: tuple[int, int, bool, dict[str, int], int] | None = None
-    if inputs.rhs_policy in {"auto", "precompute"}:
-        memory, peak = _memory_candidate(
-            inputs,
-            variant_width=preferred_variant_width,
-            rhs_columns=total_rhs_columns,
+    requested_rhs_columns = inputs.preferred_rhs_tile_columns
+    if requested_rhs_columns is None:
+        requested_rhs_columns = min(total_rhs_columns, max(128, b))
+    preferred_probe_tile_width = min(
+        b, max(1, requested_rhs_columns // (q * q))
+    )
+    preferred_source_probe_tile_width = (
+        preferred_probe_tile_width
+        if inputs.preferred_source_probe_tile_width is None
+        else inputs.preferred_source_probe_tile_width
+    )
+
+    def source_batch_limit(probe_tile_width: int) -> int:
+        one_annotation_output = _checked_product(
+            "one-annotation source output bytes", 8, n, probe_tile_width
         )
-        if peak <= inputs.memory_limit_bytes:
-            selected = (
-                preferred_variant_width,
-                total_rhs_columns,
-                True,
-                memory,
-                peak,
+        return min(
+            k,
+            (
+                _SOURCE_ANNOTATION_BATCH_LIMIT
+                if inputs.preferred_source_annotation_batch_width is None
+                else inputs.preferred_source_annotation_batch_width
+            ),
+            max(1, _SOURCE_ANNOTATION_BATCH_BYTE_LIMIT // one_annotation_output),
+        )
+
+    def candidate_at(
+        *,
+        variant_width: int,
+        probe_tile_width: int,
+        source_probe_tile_width: int,
+        rhs_precomputed: bool,
+    ) -> tuple[int, int, int, int, int, bool, dict[str, int], int] | None:
+        target_tile_columns = _checked_product(
+            "target tile columns", q, q, probe_tile_width
+        )
+        maximum_target_batch_width = min(
+            k,
+            (
+                _TARGET_ANNOTATION_BATCH_LIMIT
+                if inputs.preferred_target_annotation_batch_width is None
+                else inputs.preferred_target_annotation_batch_width
+            ),
+        )
+        for target_batch_width in range(maximum_target_batch_width, 0, -1):
+            rhs_resident_columns = (
+                total_rhs_columns
+                if rhs_precomputed
+                else target_tile_columns * target_batch_width
             )
-        elif inputs.rhs_policy == "precompute":
-            variant_width = preferred_variant_width
-            while variant_width > 1 and selected is None:
-                variant_width = max(1, variant_width // 2)
+            for source_batch_width in range(
+                source_batch_limit(source_probe_tile_width), 0, -1
+            ):
                 memory, peak = _memory_candidate(
                     inputs,
                     variant_width=variant_width,
-                    rhs_columns=total_rhs_columns,
+                    rhs_resident_columns=rhs_resident_columns,
+                    target_tile_columns=target_tile_columns,
+                    source_probe_tile_width=source_probe_tile_width,
+                    source_annotation_batch_width=source_batch_width,
+                    target_annotation_batch_width=target_batch_width,
                 )
                 if peak <= inputs.memory_limit_bytes:
-                    selected = (
+                    return (
                         variant_width,
-                        total_rhs_columns,
-                        True,
+                        probe_tile_width,
+                        source_probe_tile_width,
+                        source_batch_width,
+                        target_batch_width,
+                        rhs_precomputed,
                         memory,
                         peak,
                     )
+        return None
+
+    selected: tuple[
+        int, int, int, int, int, bool, dict[str, int], int
+    ] | None = None
+    if inputs.rhs_policy in {"auto", "precompute"}:
+        selected = candidate_at(
+            variant_width=preferred_variant_width,
+            probe_tile_width=preferred_probe_tile_width,
+            source_probe_tile_width=preferred_source_probe_tile_width,
+            rhs_precomputed=True,
+        )
+        if selected is None and inputs.rhs_policy == "precompute":
+            variant_width = preferred_variant_width
+            probe_tile_width = preferred_probe_tile_width
+            source_probe_tile_width = preferred_source_probe_tile_width
+            while selected is None:
+                if variant_width > 1:
+                    variant_width = max(1, variant_width // 2)
+                elif probe_tile_width > 1:
+                    probe_tile_width = max(1, probe_tile_width // 2)
+                elif source_probe_tile_width > 1:
+                    source_probe_tile_width = max(
+                        1, source_probe_tile_width // 2
+                    )
+                else:
+                    break
+                selected = candidate_at(
+                    variant_width=variant_width,
+                    probe_tile_width=probe_tile_width,
+                    source_probe_tile_width=source_probe_tile_width,
+                    rhs_precomputed=True,
+                )
 
     if selected is None and inputs.rhs_policy != "precompute":
-        minimum_rhs_columns = _checked_product(
-            "minimum tiled RHS columns", q, q
-        )
-        requested_rhs = inputs.preferred_rhs_tile_columns
-        if requested_rhs is None:
-            requested_rhs = min(total_rhs_columns, max(128, b))
-        rhs_width = min(
-            total_rhs_columns, max(minimum_rhs_columns, requested_rhs)
-        )
+        probe_tile_width = preferred_probe_tile_width
+        source_probe_tile_width = preferred_source_probe_tile_width
         variant_width = preferred_variant_width
         while selected is None and variant_width >= 1:
-            memory, peak = _memory_candidate(
-                inputs,
+            selected = candidate_at(
                 variant_width=variant_width,
-                rhs_columns=rhs_width,
+                probe_tile_width=probe_tile_width,
+                source_probe_tile_width=source_probe_tile_width,
+                rhs_precomputed=False,
             )
-            if peak <= inputs.memory_limit_bytes:
-                selected = (variant_width, rhs_width, False, memory, peak)
+            if selected is not None:
                 break
             if variant_width > 1:
                 variant_width = max(1, variant_width // 2)
             else:
                 break
-        while selected is None and rhs_width > minimum_rhs_columns:
-            rhs_width = max(minimum_rhs_columns, rhs_width // 2)
-            memory, peak = _memory_candidate(
-                inputs,
+        while selected is None and probe_tile_width > 1:
+            probe_tile_width = max(1, probe_tile_width // 2)
+            selected = candidate_at(
                 variant_width=1,
-                rhs_columns=rhs_width,
+                probe_tile_width=probe_tile_width,
+                source_probe_tile_width=source_probe_tile_width,
+                rhs_precomputed=False,
             )
-            if peak <= inputs.memory_limit_bytes:
-                selected = (1, rhs_width, False, memory, peak)
+        while selected is None and source_probe_tile_width > 1:
+            source_probe_tile_width = max(1, source_probe_tile_width // 2)
+            selected = candidate_at(
+                variant_width=1,
+                probe_tile_width=1,
+                source_probe_tile_width=source_probe_tile_width,
+                rhs_precomputed=False,
+            )
     if selected is None:
         raise MemoryError(
             "memory limit cannot admit fixed global sources and minimum two-pass tiles"
         )
 
-    variant_width, rhs_width, rhs_precomputed, memory, peak = selected
+    (
+        variant_width,
+        probe_tile_width,
+        source_probe_tile_width,
+        source_annotation_batch_width,
+        target_annotation_batch_width,
+        rhs_precomputed,
+        memory,
+        peak,
+    ) = selected
+    rhs_width = _checked_product(
+        "selected target tile columns", q, q, probe_tile_width
+    )
     decoded_blocks = math.ceil(m / variant_width)
+    pass1_rhs_products = _checked_product(
+        "pass-1 RHS products", m, k, b
+    )
+    pass2_rhs_products = _checked_product(
+        "pass-2 RHS products",
+        n,
+        k,
+        q,
+        q,
+        b,
+        1 if rhs_precomputed else decoded_blocks,
+    )
+    target_cross_scale_products = _checked_product(
+        "target cross scaling products", m, k, q, q, b
+    )
+    pair_reduction_flops = _checked_product(
+        "pair reduction flops", 2, reduction_terms
+    )
+    directed_aggregation_flops = _checked_product(
+        "directed aggregation flops", 2, m, k, k, p, p
+    )
+    total_estimated_flops = sum(
+        (
+            pass1_flops,
+            pass2_flops,
+            barrier_projection_flops,
+            component_residualization_flops,
+            component_annotation_flops,
+            pair_reduction_flops,
+            directed_aggregation_flops,
+        )
+    )
+    if total_estimated_flops > _MAX_INT64:
+        raise OverflowError("total estimated work exceeds signed 64-bit range")
+    selected_sample_tile = min(
+        inputs.component_diagonal_sample_tile_width, n
+    )
+    selected_one_pair_tile = _checked_product(
+        "selected component pair tile bytes",
+        8,
+        selected_sample_tile,
+        min(variant_width, m),
+    )
+    component_pair_batch_width = (
+        memory["component_diagonal_pair_tile"] // selected_one_pair_tile
+    )
     descriptor_bytes_per_pass = (
         _checked_product("BED bytes", math.ceil(n / 4), m)
         if inputs.genotype_format == "bed"
@@ -497,7 +783,18 @@ def plan_generalized_gxe_variant_work(
             "pass1_flops": pass1_flops,
             "pass2_flops": pass2_flops,
             "total_leading_flops": pass1_flops + pass2_flops,
+            "barrier_projection_flops": barrier_projection_flops,
+            "component_residualization_flops": (
+                component_residualization_flops
+            ),
+            "component_annotation_flops": component_annotation_flops,
             "pair_reduction_product_terms": reduction_terms,
+            "pair_reduction_flops": pair_reduction_flops,
+            "directed_aggregation_flops": directed_aggregation_flops,
+            "total_estimated_flops": total_estimated_flops,
+            "pass1_rhs_products": pass1_rhs_products,
+            "pass2_rhs_products": pass2_rhs_products,
+            "target_cross_scale_products": target_cross_scale_products,
         },
         memory=memory,
         tiling={
@@ -505,6 +802,11 @@ def plan_generalized_gxe_variant_work(
             "total_rhs_columns": total_rhs_columns,
             "rhs_tile_columns": rhs_width,
             "rhs_precomputed": rhs_precomputed,
+            "probe_tile_width": probe_tile_width,
+            "source_probe_tile_width": source_probe_tile_width,
+            "source_annotation_batch_width": source_annotation_batch_width,
+            "target_annotation_batch_width": target_annotation_batch_width,
+            "component_pair_batch_width": component_pair_batch_width,
             "pass1_decoded_blocks": decoded_blocks,
             "pass2_decoded_blocks": decoded_blocks,
         },

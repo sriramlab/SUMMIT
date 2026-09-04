@@ -172,9 +172,23 @@ def build_parser() -> argparse.ArgumentParser:
         help="post-hoc delete-block replicates for normal-equation inference",
     )
     parser.add_argument("--seed", type=int, default=20260808)
+    parser.add_argument(
+        "--mode",
+        choices=("summary", "composable"),
+        default="summary",
+        help=(
+            "composable stores sample-aligned data and should not be used "
+            "for public release"
+        ),
+    )
     parser.add_argument("--memory-gib", type=float, default=64.0)
     parser.add_argument("--variant-block-width", type=int, default=4096)
-    parser.add_argument("--probe-tile-width", type=int, default=4)
+    parser.add_argument(
+        "--probe-tile-width",
+        type=int,
+        default=None,
+        help="pass-2 target tile; defaults to planner-selected",
+    )
     parser.add_argument(
         "--source-probe-tile-width",
         type=int,
@@ -230,6 +244,7 @@ def main() -> int:
             native_module=gxeldcore,
             output=args.output / f"age_b{probes}_reference",
             include_directional_panel=True,
+            mode=args.mode,
             variant_block_width=args.variant_block_width,
             probe_tile_width=args.probe_tile_width,
             source_probe_tile_width=(

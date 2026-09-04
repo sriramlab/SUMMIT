@@ -32,6 +32,13 @@ estimator:
 4. SNP-block jackknife replicates subtract target rows from those fixed sums
    and renormalize masses. Retained SNP LD scores are not recomputed.
 
+During pass 2, the executor also accumulates the exact normalized component
+kernel diagonals. Their row Gram is the canonical same-person matrix. Internal
+composable artifacts may retain those sample-aligned rows, the annotation
+columns, and the directional panel; public summary artifacts omit the first
+two. Compatible annotation columns can then be concatenated and reduced
+without another genotype traversal.
+
 Exactly two complete reference-genotype traversals are a production invariant.
 Probe and RHS tiling occur while one decoded genotype block remains resident.
 
