@@ -10,6 +10,13 @@ void prefetch_bed_block(const std::string& bed_path,
                         int blk_start, int blk_end,
                         int ahead_blocks = 1);
 
+// Descriptor-owned consumers reuse the selected-row BED decode plan. Output
+// is sample-by-variant column-major BIM A1 hard calls: 0/1/2/-127 missing.
+void read_bed_calls_a1_memory(
+    const unsigned char* bed_base, std::size_t bed_size, int n_total,
+    std::size_t bytes_per_snp, const std::vector<int>& rows,
+    const int64_t* variants, int columns, int threads, int8_t* output);
+
 int64_t count_lines_cached(const std::string& path);
 
 struct BedMappingCacheInfo {

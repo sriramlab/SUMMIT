@@ -7194,7 +7194,8 @@ public:
                   int decode_threads,
                   uint64_t max_workspace_bytes,
                   int blas_threads,
-                  DescriptorOnlyDirectContextTag)
+                  DescriptorOnlyDirectContextTag,
+                  int minimum_selected_rows = 3)
         : context_id_(next_context_id()),
           ddof_(ddof),
           decode_threads_(decode_threads),
@@ -7289,7 +7290,7 @@ public:
                     "Descriptor-backed input is not a SNP-major PLINK BED"
                 );
             }
-            parse_rows(std::move(row_sel_obj));
+            parse_rows(std::move(row_sel_obj), minimum_selected_rows);
             check_files_unchanged();
         } catch (...) {
             close_internal();
@@ -8018,6 +8019,7 @@ public:
 private:
     friend class MultiEnvironmentDirectContext;
     friend class GeneralizedGxELDScoreDirectContext;
+    friend class PredictionBEDReader;
     void compute_feature_moments_from_genotype(
         const double* genotype,
         int columns,
@@ -8489,7 +8491,9 @@ private:
         }
     }
 
-    void parse_rows(nb::object row_sel_obj) {
+    void parse_rows(nb::object row_sel_obj, int minimum_selected_rows = 3) {
+        if (minimum_selected_rows < 1)
+            throw std::runtime_error("Invalid minimum selected sample count");
         if (row_sel_obj.is_none()) {
             rows_.resize(static_cast<size_t>(n_total_));
             for (int i = 0; i < n_total_; ++i) rows_[static_cast<size_t>(i)] = i;
@@ -8515,8 +8519,10 @@ private:
                 throw std::runtime_error("GxE native row_sel must have dtype int32 or int64");
             }
         }
-        if (rows_.size() < 3) {
-            throw std::runtime_error("GxE native context requires at least three selected samples");
+        if (rows_.size() < static_cast<size_t>(minimum_selected_rows)) {
+            if (minimum_selected_rows == 3)
+                throw std::runtime_error("GxE native context requires at least three selected samples");
+            throw std::runtime_error("Descriptor-backed prediction requires a nonempty selected sample axis");
         }
         int previous = -1;
         for (int row : rows_) {
@@ -15954,6 +15960,7 @@ void protected_rank_update_nn(
 }
 
 #include "generalized_gxe_variant.inc"
+#include "prediction.inc"
 
 }  // namespace
 
@@ -15963,6 +15970,7 @@ void protected_rank_update_nn(
 NB_MODULE(gxeldcore, module) {
     module.doc() = "Bounded double-precision native context with guarded, observable GxE GEMMs";
     module.attr("__version__") = "1.7";
+    bind_prediction(module);
     summit::context_v1::bind_contextual_dense_v1(module);
     summit::context_v1::bind_contextual_reference_executor_v1(module);
     nb::class_<GeneralizedGxELDScoreDirectContext>(
@@ -16045,6 +16053,8 @@ NB_MODULE(gxeldcore, module) {
         result["backend_name"] = "gxeldcore_direct";
         result["backend_version"] = "1.9";
         result["api_version"] = 9;
+        result["prediction_native_schema"] = "summit.prediction.native.v1";
+        result["prediction_arithmetic"] = "fp64";
         result["source_commit"] = GWLDCORE_SOURCE_COMMIT;
         result["source_tree_sha256"] = GWLDCORE_SOURCE_TREE_SHA256;
         result["compiler_id"] = GWLDCORE_COMPILER_ID;

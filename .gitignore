@@ -2,6 +2,7 @@ build/
 *.egg-info/
 __pycache__/
 *.py[cod]
+/src/summit/*.so
 
 # Generated example outputs.
 example/out/

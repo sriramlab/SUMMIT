@@ -973,6 +973,50 @@ static void read_block_standardized_impl(const std::string &bed_path,
                                          N, L);
 }
 
+void read_bed_calls_a1_memory(
+    const unsigned char* bed_base, std::size_t bed_size, int n_total,
+    std::size_t bytes_per_snp, const std::vector<int>& rows,
+    const int64_t* variants, int columns, int threads, int8_t* output)
+{
+    if (!bed_base || !variants || !output || columns <= 0 || threads <= 0 ||
+        n_total <= 0 || rows.empty() || bed_size < 3 ||
+        bytes_per_snp != (static_cast<std::size_t>(n_total) + 3) / 4) {
+        throw std::runtime_error("Invalid descriptor-owned raw BED decode");
+    }
+    for (std::size_t i = 0; i < rows.size(); ++i) {
+        if (rows[i] < 0 || rows[i] >= n_total || (i && rows[i] <= rows[i-1]))
+            throw std::runtime_error("Raw BED rows must be sorted unique and in range");
+    }
+    const std::size_t m = (bed_size - 3) / bytes_per_snp;
+    for (int j = 0; j < columns; ++j) {
+        if (variants[j] < 0 || static_cast<uint64_t>(variants[j]) >= m)
+            throw std::runtime_error("Raw BED variant index out of range");
+    }
+    const RowDecodePlan& plan = get_row_decode_plan(rows, n_total);
+    const int n = static_cast<int>(rows.size());
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static) num_threads(threads)
+#endif
+    for (int j = 0; j < columns; ++j) {
+        const auto* bytes = bed_base + 3 + static_cast<std::size_t>(variants[j]) * bytes_per_snp;
+        auto* column = output + static_cast<std::size_t>(j) * rows.size();
+        auto* codes = reinterpret_cast<uint8_t*>(column);
+        long long observed = 0, sum = 0, sumsq = 0;
+        if (plan.full_range) {
+            decode_all_rows_codes_into(bytes, n_total, codes, observed, sum, sumsq);
+        } else if (plan.use_sparse) {
+            decode_rows_codes_sparse_precomp_into(bytes, plan.row_byte.data(),
+                plan.row_shift.data(), n, codes, observed, sum, sumsq);
+        } else {
+            decode_rows_codes_dense_sorted_into(bytes, n_total, rows, codes, observed, sum, sumsq);
+        }
+        for (int i = 0; i < n; ++i) {
+            const uint8_t bits = codes[i];
+            column[i] = bits == 1 ? -127 : bits == 0 ? 2 : bits == 2 ? 1 : 0;
+        }
+    }
+}
+
 static void pack_mailman_from_snp0(
     const unsigned char* snp0,
     int n_total,

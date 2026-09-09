@@ -567,7 +567,24 @@ def _evaluate_calibration(
     *,
     mask: object | None,
 ) -> np.ndarray:
-    specs = tuple(value.spec for value in calibration.source_calibrations)
+    return evaluate_multienvironment_sources(
+        calibration.source_calibrations, calibration.names, sources, mask=mask
+    )
+
+
+def evaluate_multienvironment_sources(
+    source_calibrations: Sequence[MultiEnvironmentSourceCalibration],
+    names: Sequence[str],
+    sources: Mapping[str, Any],
+    *,
+    mask: object | None = None,
+) -> np.ndarray:
+    """Evaluate frozen source coding without retaining reference participants.
+
+    Shared by the reference calibration and portable prediction artifacts.
+    This operation never estimates new centers, scales or categorical levels.
+    """
+    specs = tuple(value.spec for value in source_calibrations)
     normalized: dict[str, np.ndarray] = {}
     lengths: list[int] = []
     for spec in specs:
@@ -589,7 +606,7 @@ def _evaluate_calibration(
         np.ones(n_samples, dtype=np.bool_) if mask is None else _mask(mask, n_samples)
     )
     columns: list[np.ndarray] = [np.ones(int(np.sum(retained)), dtype=np.float64)]
-    for fitted in calibration.source_calibrations:
+    for fitted in source_calibrations:
         raw = normalized[fitted.spec.name][retained]
         if fitted.spec.kind == "continuous":
             try:
@@ -624,7 +641,7 @@ def _evaluate_calibration(
             )
             columns.append(indicator - probability)
     result = np.ascontiguousarray(np.column_stack(columns), dtype=np.float64)
-    if result.shape[1] != len(calibration.names):
+    if result.shape[1] != len(names):
         raise AssertionError("Internal calibrated basis shape mismatch.")
     return result
 

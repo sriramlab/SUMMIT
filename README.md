@@ -21,6 +21,8 @@ moments.
   covariance or ancillary summary-only overlap-covariance estimation.
 - Batch genetic-correlation manifests, including a sparse fast path for
   supplied-overlap analyses.
+- [Contextual posterior prediction](docs/prediction.md) with shared genotype
+  streaming across traits and candidate models, portable weights, and scoring.
 - Integrated allele validation/alignment for rg (enabled by default), with
   strand-ambiguous SNPs dropped by default and `--no-align-alleles` as an
   explicit escape hatch for pre-harmonized inputs.
