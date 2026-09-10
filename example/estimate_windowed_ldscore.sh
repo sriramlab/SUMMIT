@@ -2,7 +2,7 @@
 set -euo pipefail
 
 cd "$(dirname "$0")"
-mkdir -p out
+python ./prepare_example_inputs.py
 
 if command -v summit >/dev/null 2>&1; then
   SUMMIT=(summit)
@@ -11,11 +11,10 @@ else
 fi
 
 "${SUMMIT[@]}" \
-  --geno ./small.bed \
-  --annot ./small.2bins_annot.txt \
-  --covar ./small.cov \
+  --geno ./out/synthetic/small.bed \
+  --annot ./out/synthetic/small.annot \
+  --covar ./out/synthetic/small.cov \
   --ld-wind-kb 20000 \
   --out ./out/small.2bins.20mb \
-  --rand-samp 0.5 \
   --seed 1 \
   --num-threads 2

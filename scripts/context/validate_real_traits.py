@@ -36,12 +36,6 @@ from summit.context import (
 )
 
 
-DEFAULT_GENOTYPE_PREFIX = Path(
-    "/home/bronsonj/UKBB/ldscores/refsample_h2_sensitivity_20260813/"
-    "onekg_matched_unrelated_20260813/eur_matching/"
-    "UKB_EUR_300k.seed20260813.n5000.common"
-)
-DEFAULT_PHENOTYPE_ROOT = Path("/home/bronsonj/UKBB/asha/phens")
 TRAITS = ("bmi", "hdl", "testosterone", "c_reactive_prot")
 SEX_TRAITS = TRAITS
 SMOKING_TRAITS = ("bmi", "hdl", "c_reactive_prot")
@@ -58,12 +52,12 @@ OUTPUT_STEMS = (
 def _arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output-dir", type=Path, required=True)
-    parser.add_argument("--geno-prefix", type=Path, default=DEFAULT_GENOTYPE_PREFIX)
-    parser.add_argument("--phenotype-root", type=Path, default=DEFAULT_PHENOTYPE_ROOT)
+    parser.add_argument("--geno-prefix", type=Path, required=True)
+    parser.add_argument("--phenotype-root", type=Path, required=True)
     parser.add_argument(
         "--covariate-file",
         type=Path,
-        default=DEFAULT_PHENOTYPE_ROOT / "testosterone.covar",
+        required=True,
     )
     parser.add_argument("--max-samples", type=int, default=320)
     parser.add_argument("--variants", type=int, default=96)

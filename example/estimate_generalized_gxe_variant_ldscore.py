@@ -85,8 +85,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--prefix",
         type=Path,
-        default=Path(__file__).resolve().parent / "small",
-        help="PLINK BED prefix (default: the repository example/small)",
+        default=Path(__file__).resolve().parent / "out" / "synthetic" / "small",
+        help="PLINK BED prefix (default: generated example/out/synthetic/small)",
     )
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--probes", type=int, default=16)

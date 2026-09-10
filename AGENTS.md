@@ -1,59 +1,33 @@
-# SUMMIT coding-agent guardrails
+# SUMMIT development rules
 
-## Generalized G×E LD scores
+Before changing generalized contextual/G×E reference code, read
+[Methods](docs/wiki/Methods.md) and the relevant implementation and tests.
 
-Before editing generalized contextual/G×E reference code, read:
+## Generalized per-SNP reference estimator
 
-- `docs/generalized_gxe_variant_ldscore_contract.md`
-- `docs/architecture/ADR-generalized-gxe-variant-ldscore.md`
+- Use variant-axis probes with shape M×B.
+- Complete all global source sketches in pass 1, then score targets in pass 2.
+- Estimate fixed full-genome per-SNP directional LD scores in exactly two
+  complete reference-genotype traversals.
+- Keep block IDs and jackknife counts out of reference estimation.
 
-Two different randomized estimators exist and must not be conflated.
+After the per-SNP reference and trait rows exist, `--njack` groups target rows
+and forms full/delete-block normal equations. Each replicate subtracts the
+block contribution, rescales retained annotation mass, and reuses the other
+quantities. It never recomputes retained-SNP LD scores or source sketches.
+The method name is `frozen_full_genome_variant_ldscore_delete_block_v1`.
 
-### Production generalized per-variant LD-score estimator
+The sample-probe contextual estimator in `src/summit/context/reference_v1.py`
+and `src/native/contextual_streamed_reference_v1.inc` estimates aggregate
+kernel actions and grouped numerators. Keep its formats and calculation
+separate from the generalized per-SNP estimator.
 
-- uses **variant-axis** probes `Xi in R^{M x B}`;
-- completes global source sketches in pass 1;
-- scores every target variant against those completed sources in pass 2;
-- emits fixed full-genome per-variant directional LD scores;
-- uses exactly two complete reference-genotype traversals; and
-- accepts no block IDs, block count, or jackknife argument.
+## Feature definitions and reuse
 
-### Definitive jackknife boundary
+Generalized features are `F_q = P diag(phi_q) G`, using one genotype scale
+across contexts. Preserve the order of multiplication and projection. Do not
+add context-specific post-projection column normalization.
 
-"No jackknife" applies only to estimation of generalized per-SNP reference LD
-scores and per-SNP trait statistics. After the genome-wide per-SNP rows exist,
-`--njack` assigns target SNPs to blocks and reduces those fixed rows into full
-and delete-block normal equations. Each replicate drops the deleted target-SNP
-contribution, rescales by retained annotation mass, and reuses all other
-quantities. It does not recompute source sketches or any retained SNP's LD
-score. Standard errors and Wald statistics come from these post-hoc
-normal-equation replicates.
-
-Canonical jackknife method:
-
-```text
-frozen_full_genome_variant_ldscore_delete_block_v1
-```
-
-### Separate sample-probe contextual covariance estimator
-
-The stable contextual reference under `src/summit/context/reference_v1.py` and
-`src/native/contextual_streamed_reference_v1.inc` uses **sample-axis** probes to
-estimate an aggregate kernel Gram and grouped action numerators. It is not the
-per-variant generalized LD-score estimator and must retain a distinct artifact
-identity and command path.
-
-### Non-negotiable feature convention
-
-```math
-F_q=P\operatorname{diag}(\phi_q)G
-```
-
-uses one sealed genotype scale shared across contexts. Do not import the mature
-non-general estimator's separate post-projection X/W column normalization.
-
-### Reuse policy
-
-Reuse the mature non-general descriptor/decode/imputation/genotype-scale and
-numerical kernels where useful. Do not import its hard-coded X/W scientific
-layout, artifact identity checks, or create a second genotype decoder.
+Reuse existing genotype descriptors, decoding, imputation, scaling, and
+numerical kernels. Keep the scientific layout specific to the estimator;
+do not add an independent genotype decoder.

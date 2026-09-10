@@ -3,13 +3,13 @@
   "label": "stage7-6920335-release",
   "install_prefix": "/tmp/summit-stage7-release-6920335.yygYYi/install",
   "native_module": "/tmp/summit-stage7-release-6920335.yygYYi/install/summit/gxeldcore.cpython-312-x86_64-linux-gnu.so",
-  "python_executable": "/home/bronsonj/anaconda3/envs/summit/bin/python3.12",
+  "python_executable": "/path/to/python3.12",
   "dependency_paths": [
-    "/home/bronsonj/anaconda3/envs/summit/lib/python3.12/site-packages"
+    "/path/to/site-packages"
   ],
   "environment": {
-    "LD_LIBRARY_PATH": "/home/bronsonj/anaconda3/envs/summit/lib",
-    "LD_PRELOAD": "/home/bronsonj/anaconda3/envs/summit/lib/libstdc++.so.6",
+    "LD_LIBRARY_PATH": "/path/to/lib",
+    "LD_PRELOAD": "/path/to/libstdc++.so.6",
     "OMP_DYNAMIC": "FALSE"
   },
   "expected_native_sha256": "2591764e6ccedd67e0c92a8df2d4febcaa0f89967e6e2cb5615982c326f72eb4",
@@ -18,7 +18,7 @@
   "expected_dependency_runtime_sha256": "988388f2ca470dffaf208e8455771003149c9abbb495faaacf35036f9f252d10",
   "expected_source_commit": "69203355d558792981993e2ac8fceb6851e41418",
   "expected_source_tree_sha256": "5868faf8516eb46e0397091812fc2f6788ef387602d1a1d0be5204883b3b2c8c",
-  "qualification_evidence_path": "/home/bronsonj/SUMMIT/reports/context_native/stage7/config/stage7_fault_qualification.json",
+  "qualification_evidence_path": "/path/to/stage7_fault_qualification.json",
   "qualification_evidence_sha256": "7ac1361c88b8209df6bc5139d945cafc5499505050ee74d30af87d1d7e4a8be0",
   "declared_parent_source_commit": null
 }

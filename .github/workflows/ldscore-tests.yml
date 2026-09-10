@@ -12,6 +12,8 @@ jobs:
         shell: bash -el {0}
     steps:
       - uses: actions/checkout@v4
+      - name: Check repository content
+        run: python scripts/check_repository_content.py
       - uses: conda-incubator/setup-miniconda@8ee1f361103df19b6f8c8655fd3967a8ecb162d5
         with:
           activate-environment: summit

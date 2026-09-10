@@ -28,10 +28,7 @@ from workflow import (
 )
 
 
-DEFAULT_PILOT = Path("/home/bronsonj/SUMMIT_gxe_pilot_20260808")
-
-
-def _load_real_inputs(axes, pilot: Path):
+def _load_real_inputs(axes, pilot: Path, sbp_phenotype: Path):
     input_dir = pilot / "validation" / "inputs"
     covar_ids, covar_columns = read_id_table(input_dir / "age_dbp_cc.covar")
     env_ids, env_columns = read_id_table(input_dir / "age_dbp_cc.env")
@@ -39,9 +36,7 @@ def _load_real_inputs(axes, pilot: Path):
     covariates = align_table(axes.sample_ids, covar_ids, covar_columns)
     environment = align_table(axes.sample_ids, env_ids, env_columns)["ENV"]
     dbp = align_table(axes.sample_ids, pheno_ids, pheno_columns)["PHENO"]
-    sbp_ids, sbp_columns = read_id_table(
-        "/home/bronsonj/UKBB/asha/phens/bp_systolic.pheno"
-    )
+    sbp_ids, sbp_columns = read_id_table(sbp_phenotype)
     sbp = align_table(axes.sample_ids, sbp_ids, sbp_columns)["pheno"]
     for name, value in (("DBP", dbp), ("SBP", sbp)):
         if np.any(value == -9.0):
@@ -162,9 +157,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--prefix",
         type=Path,
-        default=DEFAULT_PILOT / "validation" / "geno" / "age_dbp_cc",
+        required=True,
     )
-    parser.add_argument("--pilot", type=Path, default=DEFAULT_PILOT)
+    parser.add_argument("--pilot", type=Path, required=True)
+    parser.add_argument("--sbp-phenotype", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--probes", type=int, nargs="+", default=[128, 1024])
     parser.add_argument(
@@ -214,7 +210,7 @@ def main() -> int:
         residual_basis,
         residual_names,
         residual_pairs,
-    ) = _load_real_inputs(axes, args.pilot)
+    ) = _load_real_inputs(axes, args.pilot, args.sbp_phenotype)
     restricted_residual_indices = tuple(
         index for index, (left, right) in enumerate(residual_pairs) if left == right
     )

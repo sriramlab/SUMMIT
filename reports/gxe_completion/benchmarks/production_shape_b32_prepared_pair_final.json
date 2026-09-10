@@ -256,7 +256,7 @@
     "cpu_count": 128,
     "hostname": "Tabla",
     "machine": "x86_64",
-    "native_binary": "/home/bronsonj/SUMMIT/build/cp312-cp312-linux_x86_64/gxeldcore.cpython-312-x86_64-linux-gnu.so",
+    "native_binary": "/path/to/gxeldcore.cpython-312-x86_64-linux-gnu.so",
     "native_binary_sha256": "372df94210c0f22750fee3f881171eaa844aebf55e8b39e9bca0d46b931e3ab8",
     "native_build": {
       "api_version": 3,
@@ -284,7 +284,7 @@
     "threadpools": [
       {
         "architecture": "Zen",
-        "filepath": "/home/bronsonj/anaconda3/envs/summit/lib/libopenblasp-r0.3.34.so",
+        "filepath": "/path/to/libopenblasp-r0.3.34.so",
         "internal_api": "openblas",
         "num_threads": 1,
         "prefix": "libopenblas",
@@ -293,7 +293,7 @@
         "version": "0.3.34"
       },
       {
-        "filepath": "/home/bronsonj/anaconda3/lib/libgomp.so.1.0.0",
+        "filepath": "/path/to/libgomp.so.1.0.0",
         "internal_api": "openmp",
         "num_threads": 32,
         "prefix": "libgomp",

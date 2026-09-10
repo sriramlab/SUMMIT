@@ -305,7 +305,7 @@
   "label": "corrected_preopt_profile_l5",
   "max_rss_kib": 291932,
   "mode": "shared",
-  "profile": "/home/bronsonj/SUMMIT/reports/gxe_completion/benchmarks/multi_corrected_preopt_profile_l5.pstats",
+  "profile": "/path/to/multi_corrected_preopt_profile_l5.pstats",
   "repairs": 0,
   "schema": "summit.gxe.multi_environment_profile.v1",
   "shared_genotype_passes": 3,

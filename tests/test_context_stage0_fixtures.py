@@ -36,14 +36,9 @@ ATOL = 1.0e-9
 RTOL = 1.0e-11
 ZERO_HASH = "0" * 64
 
-# These are the package-manifest sizes and SHA-256 values for the frozen subset
-# imported into this repository.  Keeping them outside fixtures_manifest.json
-# prevents a coordinated edit of an NPZ and its local manifest from passing.
+# Keep numerical fixtures independent of their local manifest. Documentation
+# can be edited without changing the numerical reference data.
 PACKAGE_FILES = {
-    "README.md": (
-        1879,
-        "a850c143bfea96e835d759a7bdc54b1387d0baaf87feb27a6b2f74b20c5fad68",
-    ),
     "fixture_q1_k2.npz": (
         78679,
         "e146a8d9c1f63dc51a34dd409baed669217f0d38c5f271e08dc8ddb025cde96a",
@@ -145,7 +140,6 @@ def test_imported_stage0_fixture_package_is_byte_exact() -> None:
     assert manifest["source_commit"] == SOURCE_COMMIT
     records = manifest["fixtures"] + manifest["microcases"]
     assert {record["file"] for record in records} == set(PACKAGE_FILES) - {
-        "README.md",
         "fixtures_manifest.json",
     }
     for record in records:

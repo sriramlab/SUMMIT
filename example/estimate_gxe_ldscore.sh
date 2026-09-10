@@ -11,14 +11,13 @@ else
 fi
 
 "${SUMMIT[@]}" \
-  --geno ./small.bed \
-  --env ./out/small.env \
-  --annot ./small.2bins_annot.txt \
-  --covar ./small.cov \
+  --geno ./out/synthetic/small.bed \
+  --env ./out/synthetic/small.env \
+  --annot ./out/synthetic/small.annot \
+  --covar ./out/synthetic/small.cov \
   --out ./out/small.2bins.env \
   --nvecs 100 \
-  --step_size 10000 \
+  --step_size 256 \
   --seed 1 \
   --dtype float64 \
-  --rand-samp 0.5 \
   --num-threads 2

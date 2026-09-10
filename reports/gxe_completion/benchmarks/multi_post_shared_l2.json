@@ -288,7 +288,7 @@
   "label": "post_fusion_l2",
   "max_rss_kib": 264956,
   "mode": "shared",
-  "profile": "/home/bronsonj/SUMMIT/reports/gxe_completion/benchmarks/multi_post_shared_l2.pstats",
+  "profile": "/path/to/multi_post_shared_l2.pstats",
   "repairs": 0,
   "schema": "summit.gxe.multi_environment_profile.v1",
   "shared_genotype_passes": 3,

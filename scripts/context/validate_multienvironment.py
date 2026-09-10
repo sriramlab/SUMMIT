@@ -1,11 +1,8 @@
 #!/usr/bin/env python3
-"""Validate fixed multi-environment bases and covariance-operator modes.
+"""Validate multi-environment covariance models with synthetic data.
 
-The default path is a deterministic synthetic gate for Q=3 and Q=4 context
-bases.  It exercises the public Stage-07A calibration, preset, pruning, mode,
-and contrast APIs together with the existing contextual reference/summary
-fitter.  An opt-in real-data path uses a small protected UKBB subset and emits
-aggregate diagnostics only.  No sample or variant rows are written.
+Optional real-trait checks use explicitly supplied local inputs and write
+aggregate diagnostics and figures.
 """
 
 from __future__ import annotations
@@ -52,12 +49,6 @@ from summit.context import (
 
 OUTPUT_STEM = "07a_multienvironment_validation"
 GENOTYPE_SCALING = "synthetic_population_unit_variance"
-DEFAULT_GENOTYPE_PREFIX = Path(
-    "/home/bronsonj/UKBB/ldscores/refsample_h2_sensitivity_20260813/"
-    "onekg_matched_unrelated_20260813/eur_matching/"
-    "UKB_EUR_300k.seed20260813.n5000.common"
-)
-DEFAULT_PHENOTYPE_ROOT = Path("/home/bronsonj/UKBB/asha/phens")
 PC_COLUMNS = tuple(f"f.22009.0.{index}" for index in range(1, 6))
 
 
@@ -108,12 +99,12 @@ def _parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Run an aggregate-only Q3/Q4 BMI/HDL/CRP sanity check.",
     )
-    parser.add_argument("--geno-prefix", type=Path, default=DEFAULT_GENOTYPE_PREFIX)
-    parser.add_argument("--phenotype-root", type=Path, default=DEFAULT_PHENOTYPE_ROOT)
+    parser.add_argument("--geno-prefix", type=Path, default=None)
+    parser.add_argument("--phenotype-root", type=Path, default=None)
     parser.add_argument(
         "--covariate-file",
         type=Path,
-        default=DEFAULT_PHENOTYPE_ROOT / "testosterone.covar",
+        default=None,
     )
     parser.add_argument("--real-n", type=int, default=256)
     parser.add_argument("--real-m", type=int, default=96)
@@ -140,6 +131,8 @@ def _validate_arguments(
     if args.seed < 0:
         parser.error("--seed must be non-negative")
     if args.real_traits:
+        if any(value is None for value in (args.geno_prefix, args.phenotype_root, args.covariate_file)):
+            parser.error("--real-traits requires --geno-prefix, --phenotype-root, and --covariate-file")
         if args.real_n < 96:
             parser.error("--real-n must be at least 96")
         if args.real_m < 48 or args.real_m % args.loo_groups:

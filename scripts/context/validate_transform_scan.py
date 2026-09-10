@@ -1,14 +1,8 @@
 #!/usr/bin/env python3
-"""Validate batched phenotype-transform scans and joint scale inference.
+"""Validate phenotype transformations and contextual covariance fits.
 
-The default validation is entirely synthetic.  It checks an exactly known
-Box--Cox target, removable amplification, persistent rank-two heterogeneity,
-weak-signal indeterminacy, invalid transformations, batched-versus-separate
-summary/fit parity, scaling with the number of transformations, and ideal
-equal-group multiplier coverage.  An opt-in real-trait mode performs a small
-aggregate-only BMI/CRP sanity check on the declared UK Biobank fixture.
-
-No individual- or variant-level rows are written.
+The default examples use synthetic data. Optional real-trait checks require
+explicit local input paths and write aggregate diagnostics.
 """
 
 from __future__ import annotations
@@ -60,12 +54,6 @@ GENOTYPE_SCALING = "synthetic_population_unit_variance"
 TARGET_TRANSFORM_ID = "box_cox_0p5_target"
 USER_TARGET_TRANSFORM_ID = "user_known_target"
 COORDINATE_NAMES = ("amplification_cross_term", "second_mode_magnitude")
-DEFAULT_GENOTYPE_PREFIX = Path(
-    "/home/bronsonj/UKBB/ldscores/refsample_h2_sensitivity_20260813/"
-    "onekg_matched_unrelated_20260813/eur_matching/"
-    "UKB_EUR_300k.seed20260813.n5000.common"
-)
-DEFAULT_PHENOTYPE_ROOT = Path("/home/bronsonj/UKBB/asha/phens")
 PC_COLUMNS = tuple(f"f.22009.0.{index}" for index in range(1, 6))
 
 
@@ -128,12 +116,12 @@ def _parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Also run a small aggregate-only BMI/CRP sanity analysis.",
     )
-    parser.add_argument("--geno-prefix", type=Path, default=DEFAULT_GENOTYPE_PREFIX)
-    parser.add_argument("--phenotype-root", type=Path, default=DEFAULT_PHENOTYPE_ROOT)
+    parser.add_argument("--geno-prefix", type=Path, default=None)
+    parser.add_argument("--phenotype-root", type=Path, default=None)
     parser.add_argument(
         "--covariate-file",
         type=Path,
-        default=DEFAULT_PHENOTYPE_ROOT / "testosterone.covar",
+        default=None,
     )
     parser.add_argument("--real-n", type=int, default=256)
     parser.add_argument("--real-m", type=int, default=96)
@@ -170,6 +158,8 @@ def _validate_arguments(
     if args.seed < 0:
         parser.error("--seed must be non-negative")
     if args.real_traits:
+        if any(value is None for value in (args.geno_prefix, args.phenotype_root, args.covariate_file)):
+            parser.error("--real-traits requires --geno-prefix, --phenotype-root, and --covariate-file")
         if args.real_n < 96:
             parser.error("--real-n must be at least 96")
         if args.real_m < 48 or args.real_m % args.loo_groups:

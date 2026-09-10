@@ -4536,7 +4536,7 @@ def _descriptor_memory_candidate(
     mailman_code_bytes = 2 if mailman_table <= 65_535 else 4
     # The packed direct path retains one integer index per missing genotype so
     # feature diagnostics can exactly reconstruct mean-imputation corrections.
-    # Charge the all-missing upper bound rather than assuming UKBB sparsity.
+    # Reserve enough storage for every genotype call to be missing.
     packed_missing_indices = rows * block_width * 4
     packed_missing_vectors = block_width * 24
     packed_genotype = (

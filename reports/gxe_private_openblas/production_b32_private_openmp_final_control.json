@@ -256,7 +256,7 @@
     "threadpools": [
       {
         "architecture": "Zen",
-        "filepath": "/home/bronsonj/anaconda3/envs/summit/lib/libopenblasp-r0.3.34.so",
+        "filepath": "/path/to/libopenblasp-r0.3.34.so",
         "internal_api": "openblas",
         "num_threads": 32,
         "prefix": "libopenblas",
@@ -265,7 +265,7 @@
         "version": "0.3.34"
       },
       {
-        "filepath": "/home/bronsonj/anaconda3/lib/libgomp.so.1.0.0",
+        "filepath": "/path/to/libgomp.so.1.0.0",
         "internal_api": "openmp",
         "num_threads": 32,
         "prefix": "libgomp",

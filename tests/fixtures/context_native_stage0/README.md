@@ -1,37 +1,17 @@
-# Frozen oracle fixtures and analytic microcases
+# Synthetic numerical fixtures
 
-The Q=1–4 fixtures were generated from the bundled correctness-first Python source at snapshot commit `251f197950775ca891f244dedc109476b2ad43b4`. They are synthetic, license-safe, and contain no participant data.
+These small arrays test contextual covariance equations. They contain generated
+inputs and expected results, with no participant IDs or external cohort inputs.
 
-Each NPZ contains explicit inputs and expected fixed-probe reference, same-person, grouped-deletion, trait, transfer, and raw-fit outputs. The agent must independently recompute them with the active Python oracle before treating them as authoritative. Numerical changes require review; do not silently replace expected files.
+The Q=1–4 cases cover component ordering, fixed-effect projection, kernel Gram
+matrices, same-person terms, grouped deletion, reference transfer, and fitting.
+The analytic microcases isolate off-diagonal factors, projection order,
+overlapping annotations, rank deficiency, and unequal study/reference sizes.
 
-Coverage:
-
-- `Q=1,2,3,4`;
-- `K=2`, with `Q=4,K=3`;
-- strict-disjoint annotations across four deletion groups;
-- explicit sample and variant Rademacher probes;
-- residual rank different from sample count;
-- exact dense and fixed-probe Gram moments;
-- signed variant-probe same-person U-statistic;
-- grouped Gram/RHS/trace/genetic-residual numerators;
-- transfer for `study_N != reference_N`;
-- full raw fit and every frozen group deletion;
-- negative fitted off-diagonals for `Q>=2` in the deterministic construction.
-
-Analytic microcases separately freeze projection order, directional factors, `Omega` packing, sample-count transfer, rank-deficient overlap behavior, and exact equivalence of direct grouped TN versus group-restricted actions under nontrivial overlapping annotations.
-
-Regenerate the oracle fixtures with:
+Run the independent calculations with:
 
 ```bash
-python FIXTURES/generate_fixtures.py \
-  --source-root <path-to-generalized_python/src> \
-  --output-dir FIXTURES
+python -m pytest -q tests/test_context_stage0_fixtures.py tests/test_context_stage1_dense_native.py
 ```
 
-Then run:
-
-```bash
-python TOOLS/validate_package.py
-```
-
-The validator independently reconstructs features, dense kernels, fixed-probe actions/Gram, both grouped-attribution algorithms, the signed same-person U-statistic, and study-side trait moments from the stored inputs rather than only checking stored arrays against one another.
+Check expected results against the equations before changing a fixture.

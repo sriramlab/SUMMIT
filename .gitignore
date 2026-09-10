@@ -7,3 +7,22 @@ __pycache__/
 # Generated example outputs.
 example/out/
 example/output.log
+
+# Keep local genotype and participant inputs out of version control.
+*.bed
+*.bim
+*.fam
+*.pgen
+*.pvar
+*.pvar.zst
+*.psam
+*.bgen
+*.sample
+*.cov
+*.covar
+*.pheno
+*.keep
+*.sumstat
+*.sumstats
+*.sumstats.gz
+*.ldscore.gz

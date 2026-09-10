@@ -130,7 +130,7 @@
   "label": "pre_fusion_6bf009e",
   "max_rss_kib": 234088,
   "mode": "shared",
-  "profile": "/home/bronsonj/SUMMIT/reports/gxe_completion/benchmarks/multi_pre_shared_l5.pstats",
+  "profile": "/path/to/multi_pre_shared_l5.pstats",
   "repairs": 0,
   "schema": "summit.gxe.multi_environment_profile.v1",
   "shared_genotype_passes": 3,

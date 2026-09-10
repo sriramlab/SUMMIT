@@ -149,7 +149,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--prefix",
         type=Path,
-        default=Path("/home/bronsonj/UKBB/geno/EUR/UKBB_EUR_unrel_3rd.no_mhc_imp"),
+        required=True,
     )
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--replicates", type=int, default=25)
