@@ -5,6 +5,9 @@
 | Directory | Contents |
 |---|---|
 | `src/summit/ldscore` | Genome-wide, windowed, and G×E reference calculations |
+| `src/summit/inference` | h², rg, G×E fitting, and jackknife calculations |
+| `src/summit/sumstats` | Summary-statistic loading and score moments |
+| `src/summit/manifest` | Pair manifests and batch rg execution |
 | `src/summit/context` | Context coding, covariance models, and research APIs |
 | `src/summit/prediction` | PGS fitting, model files, scoring, and calibration |
 | `src/native` | Genotype decoding and numerical kernels |
