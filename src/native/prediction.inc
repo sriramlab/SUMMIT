@@ -77,6 +77,65 @@ static void prediction_no_alias(const double* input, size_t ni,
         throw std::runtime_error("Prediction output must not alias an input");
 }
 
+// Select, allele-orient, impute and affine-scale in one column-major pass.
+// Raw calls still come from the shared decoder. Subtraction and multiplication
+// are separate operations, matching the FP64 NumPy reference (no FMA).
+template <typename T>
+static void prediction_standardize(
+    nb_mat2f_ro<T> raw, nb_vec1_ro<int64_t> rows, nb_vec1_ro<int64_t> columns,
+    nb_vec1_ro<double> mean, nb_vec1_ro<double> inverse_scale,
+    nb_vec1_ro<bool> flips, nb_mat2f_rw<double> output, int threads)
+{
+    const size_t n = rows.size(), b = columns.size();
+    if (!n || !b || output.shape(0) != n || output.shape(1) != b ||
+        mean.size() != b || inverse_scale.size() != b || flips.size() != b || threads < 1)
+        throw std::runtime_error("Prediction standardization dimensions/threads disagree");
+    const auto out_begin = reinterpret_cast<uintptr_t>(output.data());
+    const auto out_end = out_begin + output.size()*sizeof(double);
+    const auto no_alias = [&](const void* pointer, size_t bytes) {
+        const auto begin = reinterpret_cast<uintptr_t>(pointer);
+        if (begin < out_end && out_begin < begin + bytes)
+            throw std::runtime_error("Prediction standardization output must not alias an input");
+    };
+    no_alias(raw.data(), raw.size()*sizeof(T));
+    no_alias(rows.data(), n*sizeof(int64_t));
+    no_alias(columns.data(), b*sizeof(int64_t));
+    no_alias(mean.data(), b*sizeof(double));
+    no_alias(inverse_scale.data(), b*sizeof(double));
+    no_alias(flips.data(), b*sizeof(bool));
+    for (size_t i = 0; i < n; ++i)
+        if (rows.data()[i] < 0 || static_cast<size_t>(rows.data()[i]) >= raw.shape(0))
+            throw std::runtime_error("Prediction standardization row out of range");
+    for (size_t j = 0; j < b; ++j)
+        if (columns.data()[j] < 0 || static_cast<size_t>(columns.data()[j]) >= raw.shape(1) ||
+            !std::isfinite(mean.data()[j]) || !std::isfinite(inverse_scale.data()[j]))
+            throw std::runtime_error("Prediction standardization column/scale invalid");
+    validate_configured_openmp_placement_for_entry();
+    nb::gil_scoped_release release;
+    int invalid = 0;
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static) num_threads(threads) reduction(|:invalid)
+#endif
+    for (size_t j = 0; j < b; ++j) {
+        const T* input = raw.data() + static_cast<size_t>(columns.data()[j])*raw.shape(0);
+        double* out = output.data() + j*n;
+        const double center = mean.data()[j], scale = inverse_scale.data()[j];
+        for (size_t i = 0; i < n; ++i) {
+            double value = static_cast<double>(input[rows.data()[i]]);
+            if (value == -127.0) {
+                out[i] = 0.0;
+            } else {
+                if (flips.data()[j]) value = 2.0 - value;
+                value -= center;
+                value *= scale;
+                out[i] = value;
+                invalid |= !std::isfinite(value);
+            }
+        }
+    }
+    if (invalid) throw std::runtime_error("nonfinite standardized genotypes");
+}
+
 static void prediction_product(nb_mat2f_ro<double> left, nb_mat2f_ro<double> right,
                                nb_mat2f_rw<double> output, bool transpose, int threads) {
     const int m = prediction_dim(left.shape(transpose ? 1 : 0));
@@ -98,10 +157,28 @@ static void prediction_product(nb_mat2f_ro<double> left, nb_mat2f_ro<double> rig
     }
 }
 
+struct PredictionWorkspace {
+    std::mutex mutex;
+    size_t small_capacity = 0, large_capacity = 0;
+    std::unique_ptr<double[]> transposed, mixed, product;
+    void reserve(size_t small, size_t large) {
+        if (small > small_capacity) {
+            transposed.reset(new double[small]);
+            mixed.reset(new double[small]);
+            small_capacity = small;
+        }
+        if (large > large_capacity) {
+            product.reset(new double[large]);
+            large_capacity = large;
+        }
+    }
+};
+
 static void prediction_covariance_block(
     nb_mat2f_ro<double> genotype, nb_mat2f_ro<double> packed,
     nb_mat2c_ro<double> priors, nb_mat2f_ro<double> phi,
-    nb_mat2f_rw<double> output, double mass, int threads)
+    nb_mat2f_rw<double> output, double mass, int threads,
+    PredictionWorkspace* workspace)
 {
     const int n = prediction_dim(genotype.shape(0));
     const int b = prediction_dim(genotype.shape(1));
@@ -120,12 +197,17 @@ static void prediction_covariance_block(
     validate_protected_gemm_threads(threads);
     const size_t small = checked_mul(static_cast<size_t>(b), columns, "prediction SNP tile");
     const size_t large = checked_mul(static_cast<size_t>(n), columns, "prediction product tile");
+    PredictionWorkspace local;
+    auto& scratch = workspace ? *workspace : local;
+    const std::unique_lock<std::mutex> lock(scratch.mutex, std::try_to_lock);
+    if (!lock.owns_lock()) throw std::runtime_error("Prediction workspace is already in use");
     nb::gil_scoped_release release;
     // Both GEMMs use beta=0 and every mixed cell is assigned. Avoid zeroing
     // multi-megabyte scratch that is immediately overwritten (NUMA first touch).
-    std::unique_ptr<double[]> transposed(new double[small]);
-    std::unique_ptr<double[]> mixed(new double[small]);
-    std::unique_ptr<double[]> product(new double[large]);
+    scratch.reserve(small, large);
+    auto& transposed = scratch.transposed;
+    auto& mixed = scratch.mixed;
+    auto& product = scratch.product;
     (void)dgemm_tn_partitioned_columns(b, columns, n, genotype.data(), n,
         packed.data(), n, transposed.get(), b, threads);
 #ifdef _OPENMP
@@ -159,6 +241,16 @@ static void prediction_covariance_block(
 }
 
 static void bind_prediction(nb::module_& module) {
+    module.attr("prediction_execution_version") = 2;
+    nb::class_<PredictionWorkspace>(module, "PredictionWorkspace").def(nb::init<>());
+    module.def("prediction_standardize", &prediction_standardize<int8_t>,
+        nb::arg("raw").noconvert(), nb::arg("rows").noconvert(), nb::arg("columns").noconvert(),
+        nb::arg("mean").noconvert(), nb::arg("inverse_scale").noconvert(),
+        nb::arg("flips").noconvert(), nb::arg("out").noconvert(), nb::arg("threads"));
+    module.def("prediction_standardize", &prediction_standardize<double>,
+        nb::arg("raw").noconvert(), nb::arg("rows").noconvert(), nb::arg("columns").noconvert(),
+        nb::arg("mean").noconvert(), nb::arg("inverse_scale").noconvert(),
+        nb::arg("flips").noconvert(), nb::arg("out").noconvert(), nb::arg("threads"));
     nb::class_<PredictionBEDReader>(module, "PredictionBEDReader")
         .def(nb::init<int, int, int, nb::object, int, uint64_t>(),
              nb::arg("bed_descriptor"), nb::arg("bim_descriptor"), nb::arg("fam_descriptor"),
@@ -170,5 +262,6 @@ static void bind_prediction(nb::module_& module) {
         nb::arg("right").noconvert(), nb::arg("out").noconvert(), nb::arg("transpose"), nb::arg("threads"));
     module.def("prediction_covariance_block", &prediction_covariance_block,
         nb::arg("genotype").noconvert(), nb::arg("packed").noconvert(), nb::arg("priors").noconvert(),
-        nb::arg("phi").noconvert(), nb::arg("out").noconvert(), nb::arg("mass"), nb::arg("threads"));
+        nb::arg("phi").noconvert(), nb::arg("out").noconvert(), nb::arg("mass"), nb::arg("threads"),
+        nb::arg("workspace") = nb::none());
 }
