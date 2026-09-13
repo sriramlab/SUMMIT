@@ -5,7 +5,8 @@ from dataclasses import dataclass, asdict
 import numpy as np
 
 from ._validation import array, digest, indices, positive_int
-from .genotype import RawBlockStream, standardize, native_module
+from .genotype import RawBlockStream, StandardizedBlock, native_module
+from .runtime import configure_prediction_threads
 
 
 @dataclass(frozen=True)
@@ -92,10 +93,11 @@ def score_prediction(models, source, inputs, *, block_size=512, rhs_columns=64, 
             raise ValueError("scoring feature dimensions disagree with model")
         if rhs_columns < model.weights.shape[1]:
             raise ValueError("scoring RHS tile must fit a complete model")
-        mapping = align_variants(model.variants, source.variants, missing_variants=missing_variants)
         group = (model.trait_id, model.scale.identity, model.variants.identity)
+        if group not in maps:
+            maps[group] = align_variants(model.variants, source.variants, missing_variants=missing_variants)
+        mapping = maps[group]
         groups.setdefault(group, []).append(model)
-        maps[group] = mapping
         reports["/".join(model.key)] = dict(used_variants=len(mapping[0]), total_variants=len(model.variants.ids),
             allele_swaps=int(mapping[2].sum()), missing_variants=len(model.variants.ids)-len(mapping[0]))
     rows = np.unique(np.concatenate([inputs[m.trait_id].rows for m in models]))
@@ -109,7 +111,8 @@ def score_prediction(models, source, inputs, *, block_size=512, rhs_columns=64, 
     components = {m.key: np.zeros((len(inputs[m.trait_id].rows), m.weights.shape[1]), order="F") for m in models}
     native = native_module() if backend == "native" else None
     if native is not None:
-        native.configure_blas_threads(threads)
+        configure_prediction_threads(native, threads)
+    affine_block = StandardizedBlock(native, threads)
     ledger = None
     if len(variants):
         stream = RawBlockStream(source, rows, variants, block_size=block_size, threads=threads)
@@ -122,11 +125,9 @@ def score_prediction(models, source, inputs, *, block_size=512, rhs_columns=64, 
                 hi = int(np.searchsorted(sr, v[-1], side="right"))
                 if lo == hi:
                     continue
-                selected = raw[np.ix_(row_maps[model.trait_id], np.searchsorted(v, sr[lo:hi]))].astype(np.float64)
-                mask = selected != -127
-                selected[:, flip[lo:hi]] = np.where(mask[:, flip[lo:hi]], 2-selected[:, flip[lo:hi]], -127)
                 model_index = mr[lo:hi]
-                g = standardize(selected, model.scale.mean[model_index], model.scale.inverse_scale[model_index])
+                g = affine_block.prepare(raw, row_maps[model.trait_id], np.searchsorted(v, sr[lo:hi]),
+                    model.scale.mean[model_index], model.scale.inverse_scale[model_index], flip[lo:hi])
                 q = model.weights.shape[1]
                 width = max(1, rhs_columns // q)
                 for begin in range(0, len(batch), width):

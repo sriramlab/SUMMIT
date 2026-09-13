@@ -16,7 +16,7 @@ def native_module():
         from summit import gxeldcore
     except ImportError as exc:
         raise ImportError("Build SUMMIT with prediction native support before using the native backend") from exc
-    if not hasattr(gxeldcore, "PredictionBEDReader"):
+    if getattr(gxeldcore, "prediction_execution_version", 0) < 2:
         raise ImportError("Installed gxeldcore predates prediction support; rebuild this branch")
     return gxeldcore
 
@@ -285,6 +285,33 @@ def standardize(raw, mean, inverse_scale):
     if not np.all(np.isfinite(result)):
         raise ValueError("nonfinite standardized genotypes")
     return result
+
+
+class StandardizedBlock:
+    """One reusable FP64 block; its view expires on the next call.
+
+    The NumPy path remains the independent arithmetic reference. Native
+    selection writes directly from raw calls/dosages into the bounded buffer.
+    """
+    def __init__(self, native, threads):
+        self.native, self.threads = native, threads
+        self.buffer = np.empty(0, dtype=np.float64)
+
+    def prepare(self, raw, rows, columns, mean, inverse_scale, flips=None):
+        if flips is None:
+            flips = np.zeros(len(columns), dtype=bool)
+        if self.native is None:
+            selected = raw[np.ix_(rows, columns)].astype(np.float64)
+            selected[:, flips] = np.where(selected[:, flips] == -127, -127, 2-selected[:, flips])
+            return standardize(selected, mean, inverse_scale)
+        size = len(rows)*len(columns)
+        if self.buffer.size < size:
+            self.buffer = np.empty(size, dtype=np.float64)
+        output = self.buffer[:size].reshape((len(rows), len(columns)), order="F")
+        self.native.prediction_standardize(raw, rows, columns,
+            np.ascontiguousarray(mean), np.ascontiguousarray(inverse_scale),
+            np.ascontiguousarray(flips), output, self.threads)
+        return output
 
 
 class RawBlockStream:

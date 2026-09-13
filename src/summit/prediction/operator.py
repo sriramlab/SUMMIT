@@ -9,7 +9,8 @@ from __future__ import annotations
 import numpy as np
 
 from ._validation import array_digest
-from .genotype import RawBlockStream, native_module, standardize
+from .genotype import RawBlockStream, native_module, StandardizedBlock
+from .runtime import configure_prediction_threads
 
 
 class GenotypeOperator:
@@ -20,7 +21,9 @@ class GenotypeOperator:
         self.backend = backend
         self.native = native_module() if backend == "native" else None
         if self.native is not None:
-            self.native.configure_blas_threads(plan.threads)
+            configure_prediction_threads(self.native, plan.threads)
+        self.affine_block = StandardizedBlock(self.native, plan.threads)
+        self.workspace = self.native.PredictionWorkspace() if self.native is not None else None
         self.stream = RawBlockStream(source, np.concatenate([t.rows for t in traits]),
             np.concatenate([t.variants for t in traits]), block_size=plan.block_size,
             storage=plan.storage, threads=plan.threads)
@@ -48,8 +51,8 @@ class GenotypeOperator:
         if key in self.standardized_cache and self.ready:
             return lo, hi, self.standardized_cache[key][:, lo:hi]
         positions = np.searchsorted(variants, t.variants[lo:hi])
-        selected = raw[np.ix_(self.row_maps[key], positions)]
-        return lo, hi, standardize(selected, t.scale.mean[lo:hi], t.scale.inverse_scale[lo:hi])
+        return lo, hi, self.affine_block.prepare(raw, self.row_maps[key], positions,
+            t.scale.mean[lo:hi], t.scale.inverse_scale[lo:hi])
 
     def setup(self):
         if self.ready:
@@ -138,7 +141,7 @@ class GenotypeOperator:
                         out = outputs[t.id][:, begin:end]
                         if self.native is not None:
                             self.native.prediction_covariance_block(g, packed, covariance, t.phi,
-                                out, float(len(t.variants)), self.plan.threads)
+                                out, float(len(t.variants)), self.plan.threads, self.workspace)
                         else:
                             transposed = g.T @ packed
                             mixed = np.einsum("bkq,kqr->bkr", transposed.reshape(len(g.T), end-begin, q),
@@ -183,3 +186,5 @@ class GenotypeOperator:
     def release(self):
         self.stream.cache = None
         self.standardized_cache.clear()
+        self.affine_block.buffer = np.empty(0, dtype=np.float64)
+        self.workspace = None

@@ -123,6 +123,50 @@ The solver accepts a fit only after evaluating its true residual against the
 requested tolerance. A failed candidate raises `ConvergenceError`; no complete
 model bundle is published. See [Methods](Methods.md) for the linear system.
 
+## Long fits and restart state
+
+Pass `checkpoint="private/solver.npz"` to `fit_prediction` to save projected-PCG
+state after each completed solver pass. If the process is interrupted, repeat
+the call with the same arguments and `resume=True`. CLI equivalents are
+`--checkpoint private/solver.npz` and `--resume`.
+
+The checkpoint stores search directions, residuals, solutions, pending true
+checks, and already verified candidates. It does not store the genotype cache;
+resuming rebuilds that cache in one source pass. An interrupted pass is repeated.
+The file is replaced atomically and an exclusive sidecar lock rejects duplicate
+writers. The input, prior, solver, Python/native implementation, thread count,
+and block/RHS sizes must match. Existing checkpoints require explicit resume;
+existing output bundles are never overwritten. A solved checkpoint can export
+to a new directory if interruption left an incomplete model directory.
+
+Checkpoint vectors are individual-level training data. Keep the checkpoint and
+its `.lock` alongside protected training inputs, outside portable model bundles.
+Saving requires space for two generations during atomic replacement (about
+`6 * 8 * N * candidates` bytes plus small metadata for a single trait).
+
+The native executor fuses sample/SNP selection, allele orientation, missing-call
+imputation and FP64 scaling into one reusable block. It also reuses GEMM scratch.
+There is no genome-sized FP64 expansion in compact BED mode. Candidates awaiting
+true-residual verification remain frozen while their checks share the next
+genotype traversal with other candidates' CG steps. This does not relax any
+convergence threshold. The pass ledger distinguishes `cg`, `verification`, and
+`cg_and_verification`.
+
+For bound OpenMP workers, set explicit singleton `OMP_PLACES` and the other
+OpenMP controls before importing numerical libraries. The prediction API now
+registers this placement with the native backend, which gives BLIS workers the
+complete reserved CPU set. Ambiguous bound placement fails before cache setup.
+For example, on an allocation containing physical CPUs 0, 2, 4 and 6:
+
+```bash
+env OMP_NUM_THREADS=4 OMP_THREAD_LIMIT=4 OMP_DYNAMIC=FALSE \
+  OMP_MAX_ACTIVE_LEVELS=1 OMP_PROC_BIND=SPREAD OMP_PLACES='{0},{2},{4},{6}' \
+  BLIS_NUM_THREADS=4 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1 python fit.py
+```
+
+Use the CPUs actually assigned by the scheduler. Native builds predating
+`prediction_execution_version=2` must be rebuilt for this Python implementation.
+
 ## Calibration and evaluation
 
 `select_and_calibrate` compares frozen score candidates on pilot data using

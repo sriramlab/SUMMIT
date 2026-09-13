@@ -214,6 +214,9 @@ def main(argv=None):
             p.add_argument("--genotype-storage", choices=["stream", "compact", "standardized"], default="stream")
         if name in ("fit", "score", "scale"):
             p.add_argument("--out", required=True)
+        if name == "fit":
+            p.add_argument("--checkpoint", help="private solver restart file, saved after each complete pass")
+            p.add_argument("--resume", action="store_true", help="resume exactly the matching solver checkpoint")
         if name == "score":
             p.add_argument("--models", required=True)
         if name == "inspect":
@@ -241,7 +244,8 @@ def main(argv=None):
                 if args.command == "plan":
                     result = plan.to_dict()
                 else:
-                    models = fit_prediction(traits, source, output=args.out, plan=plan, solver=solver)
+                    models = fit_prediction(traits, source, output=args.out, plan=plan, solver=solver,
+                        checkpoint=args.checkpoint, resume=args.resume)
                     result = dict(output=args.out, models=len(models))
             finally:
                 source.close()
