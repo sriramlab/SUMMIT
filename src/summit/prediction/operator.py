@@ -126,7 +126,7 @@ class GenotypeOperator:
             for key, traits in self.groups.items():
                 if not any(t.id in selected for t in traits):
                     continue
-                _, _, g = self._group_block(key, variants, raw)
+                lo, hi, g = self._group_block(key, variants, raw)
                 if g is None:
                     continue
                 for t in traits:
@@ -138,14 +138,26 @@ class GenotypeOperator:
                         end = min(begin+width, len(selected[t.id]))
                         packed = packs[t.id][:, begin*q:end*q]
                         covariance = priors[t.id][begin:end]
+                        batch = selected[t.id][begin:end]
+                        annotated = any(c.annotation_prior is not None for c in batch)
+                        if annotated:
+                            covariance = np.empty((hi-lo, end-begin, q*q))
+                            for j, candidate in enumerate(batch):
+                                covariance[:, j] = (candidate.covariance.ravel() if candidate.annotation_prior is None
+                                    else candidate.annotation_prior.block(lo, hi))
+                            covariance = covariance.reshape((hi-lo)*(end-begin), q*q)
                         out = outputs[t.id][:, begin:end]
                         if self.native is not None:
                             self.native.prediction_covariance_block(g, packed, covariance, t.phi,
                                 out, float(len(t.variants)), self.plan.threads, self.workspace)
                         else:
                             transposed = g.T @ packed
-                            mixed = np.einsum("bkq,kqr->bkr", transposed.reshape(len(g.T), end-begin, q),
-                                covariance.reshape(end-begin, q, q)).reshape(len(g.T), -1) / len(t.variants)
+                            if annotated:
+                                mixed = np.einsum("bkq,bkqr->bkr", transposed.reshape(len(g.T), end-begin, q),
+                                    covariance.reshape(len(g.T), end-begin, q, q)).reshape(len(g.T), -1) / len(t.variants)
+                            else:
+                                mixed = np.einsum("bkq,kqr->bkr", transposed.reshape(len(g.T), end-begin, q),
+                                    covariance.reshape(end-begin, q, q)).reshape(len(g.T), -1) / len(t.variants)
                             product = g @ mixed
                             out += np.einsum("nkq,nq->nk", product.reshape(len(t.rows), end-begin, q), t.phi)
         result = {}
@@ -180,7 +192,11 @@ class GenotypeOperator:
                         batch = active[begin:begin+width]
                         product = self.product(g, packed[:, begin*q:(begin+len(batch))*q], transpose=True)
                         for j, c in enumerate(batch):
-                            weights = product[:, j*q:(j+1)*q] @ c.covariance / len(t.variants)
+                            if c.annotation_prior is None:
+                                weights = product[:, j*q:(j+1)*q] @ c.covariance / len(t.variants)
+                            else:
+                                weights = np.einsum('bq,bqr->br', product[:, j*q:(j+1)*q],
+                                    c.annotation_prior.block(lo, hi).reshape(hi-lo, q, q))/len(t.variants)
                             sink((t.id, c.id), lo, hi, weights)
 
     def release(self):

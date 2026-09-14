@@ -64,6 +64,7 @@ def _load_fit(path):
     from .features import evaluate_contexts, evaluate_fixed
     from .priors import ResponseGeometry, common_scale, separate_scales
     from .spec import TraitTraining, CandidatePrior, SolverSpec
+    from .annotations import AnnotationPrior, load_annotation_design
     path = Path(path).resolve()
     root = path.parent
     resolve = lambda value: root/Path(value)
@@ -73,6 +74,7 @@ def _load_fit(path):
         raise ValueError("unsupported fit specification")
     source = source_from_spec(spec["genotypes"], root)
     traits = []
+    annotation_designs = {}
     try:
         for t in spec["traits"]:
             closed(t, ("id", "phenotype", "samples", "contexts", "context_spec", "covariates", "fixed_spec",
@@ -115,23 +117,33 @@ def _load_fit(path):
                 operation = c.get("operation") if isinstance(c, dict) else None
                 fields = {"common_scale": ("kappa",), "separate_scales": ("kappa_a", "kappa_h"),
                           "spectral_shrinkage": ("tau", "kappa"), "spectral_rank": ("rank", "kappa"),
-                          "supplied": ("covariance", "provenance")}
+                          "supplied": ("covariance", "provenance"),
+                          "annotation": ("annotation_design", "covariances", "provenance")}
                 if operation not in fields:
                     raise ValueError("unknown candidate operation; profiled ranks require a supplied prior")
                 closed(c, ("id", "operation", *fields[operation]), name="candidate")
+                annotation_prior = None
                 if operation == "common_scale":
                     covariance = common_scale(omega, c["kappa"])
                 elif operation == "separate_scales":
                     covariance = separate_scales(omega, c["kappa_a"], c["kappa_h"])
                 elif operation == "supplied":
                     covariance = c["covariance"]
+                elif operation == "annotation":
+                    if not c['provenance']:
+                        raise ValueError('annotation candidate provenance is required')
+                    design_path = resolve(c['annotation_design']).resolve()
+                    if design_path not in annotation_designs:
+                        annotation_designs[design_path] = load_annotation_design(design_path)
+                    annotation_prior = AnnotationPrior(annotation_designs[design_path], c['covariances'])
+                    covariance = annotation_prior.aggregate
                 else:
                     if geometry is None:
                         raise ValueError("spectral prior needs a declared metric and anchor")
                     restricted = geometry.prior(tau=c["tau"]) if operation == "spectral_shrinkage" else geometry.prior(rank=c["rank"])
                     covariance = common_scale(restricted, c["kappa"])
                 candidates.append(CandidatePrior(c["id"], covariance, residual,
-                    {"candidate": c, "architecture": parent, "residual": r}))
+                    {"candidate": c, "architecture": parent, "residual": r}, annotation_prior=annotation_prior))
             traits.append(TraitTraining(t["id"], rows, variants, y, phi, fixed, scale, tuple(candidates),
                 context_spec, fixed_spec, {"units": pheno["units"], "center": center, "scale": scale_y,
                 "transform": "linear", "prediction_units": "centered_scaled_phenotype"}, geometry))

@@ -57,6 +57,8 @@ class GeneralizedGxENativeResult:
     telemetry: Mapping[str, Any]
     presymmetry_absolute_error: float
     presymmetry_relative_error: float
+    trait_scores: Array | None = None
+    trait_residual_information: Array | None = None
 
 
 def generalized_gxe_performance_ledger_from_native(
@@ -128,6 +130,9 @@ class GeneralizedGxENativeBEDExecutor:
         backend: str = "dense",
         qualification_fault_injection: Mapping[str, Any] | None = None,
         native_module: Any | None = None,
+        variant_start: int = 0,
+        phenotypes: Array | None = None,
+        residual_basis: Array | None = None,
     ) -> None:
         if not isinstance(stable_descriptors, Mapping):
             raise TypeError("stable_descriptors must be a mapping")
@@ -165,6 +170,24 @@ class GeneralizedGxENativeBEDExecutor:
         if annotation_value.ndim != 2:
             raise ValueError("annotations must be a matrix")
         m, k = annotation_value.shape
+        if isinstance(variant_start, bool) or not isinstance(variant_start, int) or variant_start < 0:
+            raise ValueError("variant_start must be a nonnegative integer")
+        if (phenotypes is None) != (residual_basis is None):
+            raise ValueError("phenotypes and residual_basis must be supplied together")
+        trait_count = residual_count = 0
+        if phenotypes is not None:
+            phenotype_value = np.asarray(phenotypes, dtype=np.float64, order="F")
+            residual_value = np.asarray(residual_basis, dtype=np.float64, order="F")
+            if (phenotype_value.ndim != 2 or residual_value.ndim != 2
+                    or phenotype_value.shape[0] != n or residual_value.shape[0] != n
+                    or phenotype_value.shape[1] < 1 or residual_value.shape[1] < 1
+                    or not np.isfinite(phenotype_value).all()
+                    or not np.isfinite(residual_value).all()):
+                raise ValueError("invalid fused trait input dimensions or values")
+            trait_count, residual_count = phenotype_value.shape[1], residual_value.shape[1]
+        if (work_plan.dimensions.get("T", 0) != trait_count
+                or work_plan.dimensions.get("H", 0) != residual_count):
+            raise ValueError("work plan does not cover the requested fused trait statistics")
         names = tuple(str(name) for name in annotation_names)
         if len(names) != k or masses.shape != (k,):
             raise ValueError("annotation names or masses are mis-sized")
@@ -368,7 +391,13 @@ class GeneralizedGxENativeBEDExecutor:
             qualification_fault_row=fault_row,
             qualification_fault_column=fault_column,
             qualification_fault_delta=float(fault_delta),
+            variant_start=variant_start,
+            variant_stop=variant_start + m,
         )
+        if trait_count:
+            self._context.enable_trait_statistics(phenotype_value, residual_value)
+        self._trait_count = trait_count
+        self._residual_count = residual_count
         self._pairs = pairs
         self._components = components
         self._dimensions = expected_dimensions
@@ -677,6 +706,15 @@ class GeneralizedGxENativeBEDExecutor:
             telemetry.get("integrity_audit_count", 0)
         ) < 2:
             raise RuntimeError("native dense execution lacks phase checksum audits")
+        scores = information = None
+        if self._trait_count:
+            m, q, p = (self._dimensions[key] for key in ("M", "Q", "P"))
+            scores = _readonly(np.asarray(raw["trait_scores"]).reshape(
+                self._trait_count, q, m).transpose(2, 1, 0))
+            information = _readonly(np.asarray(raw["trait_residual_information"]).reshape(
+                p, self._residual_count, m).transpose(2, 0, 1))
+            if not np.isfinite(scores).all() or not np.isfinite(information).all():
+                raise RuntimeError("nonfinite fused trait statistics")
         return GeneralizedGxENativeResult(
             directional_ldscores=directional,
             directed_numerator=directed,
@@ -701,4 +739,6 @@ class GeneralizedGxENativeBEDExecutor:
             presymmetry_relative_error=float(
                 telemetry["presymmetry_relative_error"]
             ),
+            trait_scores=scores,
+            trait_residual_information=information,
         )

@@ -12,6 +12,8 @@ _EXPORTS = {
     "score_prediction": "score", "ScoreInput": "score",
     "FileGenotypeSource": "genotype", "ArrayGenotypeSource": "genotype", "estimate_scale": "genotype",
     "ShardedGenotypeSource": "genotype",
+    "AnnotationDesign": "annotations", "AnnotationPrior": "annotations",
+    "write_annotation_design": "annotations", "load_annotation_design": "annotations",
     "TraitTraining": "spec", "CandidatePrior": "spec", "GenotypeScale": "spec", "SolverSpec": "spec", "VariantAxis": "spec",
     "ResponseGeometry": "priors", "common_scale": "priors", "separate_scales": "priors",
     "select_and_calibrate": "selection", "CalibrationCandidate": "selection", "fit_calpred": "calibration",

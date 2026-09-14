@@ -183,11 +183,14 @@ static void prediction_covariance_block(
     const int n = prediction_dim(genotype.shape(0));
     const int b = prediction_dim(genotype.shape(1));
     const int q = prediction_dim(phi.shape(1));
-    const int models = prediction_dim(priors.shape(0));
+    const int models = prediction_dim(output.shape(1));
+    const bool variant_dependent = priors.shape(0) != static_cast<size_t>(models);
     const int columns = prediction_dim(checked_mul(static_cast<size_t>(q), models, "prediction RHS"));
     if (phi.shape(0) != static_cast<size_t>(n) || packed.shape(0) != static_cast<size_t>(n) ||
         packed.shape(1) != static_cast<size_t>(columns) ||
         priors.shape(1) != checked_mul(static_cast<size_t>(q), q, "prediction covariance") ||
+        (variant_dependent && priors.shape(0) != checked_mul(static_cast<size_t>(models), b,
+                                                          "prediction variant covariances")) ||
         output.shape(0) != static_cast<size_t>(n) || output.shape(1) != static_cast<size_t>(models) ||
         !(mass > 0.0) || !std::isfinite(mass))
         throw std::runtime_error("Prediction covariance block dimensions/mass disagree");
@@ -215,11 +218,12 @@ static void prediction_covariance_block(
 #endif
     for (int model = 0; model < models; ++model) {
         for (int j = 0; j < b; ++j) {
+            const size_t prior_row = variant_dependent ? static_cast<size_t>(j)*models+model : model;
             for (int r = 0; r < q; ++r) {
                 double value = 0.0;
                 for (int s = 0; s < q; ++s)
                     value += transposed[static_cast<size_t>(model*q+s)*b+j] *
-                        priors.data()[static_cast<size_t>(model)*q*q+s*q+r];
+                        priors.data()[prior_row*q*q+s*q+r];
                 mixed[static_cast<size_t>(model*q+r)*b+j] = value / mass;
             }
         }

@@ -96,6 +96,7 @@ class CandidatePrior:
     covariance: np.ndarray
     residual: np.ndarray
     specification: dict
+    annotation_prior: object = None
 
     def __post_init__(self):
         identifier(self.id, "model ID")
@@ -105,9 +106,21 @@ class CandidatePrior:
             raise ValueError("residual variances must be strictly positive")
         if not self.specification:
             raise ValueError("prior/residual provenance must be declared")
+        specification = metadata(self.specification)
+        if self.annotation_prior is not None:
+            from .annotations import AnnotationPrior
+            prior = self.annotation_prior
+            if not isinstance(prior, AnnotationPrior) or prior.aggregate.shape != covariance.shape:
+                raise ValueError("invalid annotation prior or covariance dimensions")
+            if not np.allclose(covariance, prior.aggregate, rtol=1e-12, atol=0):
+                raise ValueError("candidate covariance must equal the aggregate annotation prior")
+            if 'annotation_prior' in specification and specification['annotation_prior'] != prior.specification:
+                raise ValueError("conflicting annotation prior provenance")
+            specification['annotation_prior'] = prior.specification
+            covariance = prior.aggregate
         object.__setattr__(self, "covariance", covariance)
         object.__setattr__(self, "residual", residual)
-        object.__setattr__(self, "specification", metadata(self.specification))
+        object.__setattr__(self, "specification", specification)
 
 
 @dataclass(frozen=True)

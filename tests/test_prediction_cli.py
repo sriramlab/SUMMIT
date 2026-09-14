@@ -14,6 +14,7 @@ from summit.prediction.artifacts import write_json, write_genotype_scale, load_p
 from summit.prediction.genotype import FileGenotypeSource, estimate_scale
 from summit.prediction.features import fit_contexts, evaluate_contexts, evaluate_fixed
 from summit.prediction.cli import main
+from summit.prediction import AnnotationDesign, write_annotation_design
 
 
 def test_cli_full_pipeline_and_frozen_feature_transform(tmp_path, capsys):
@@ -41,6 +42,9 @@ def test_cli_full_pipeline_and_frozen_feature_transform(tmp_path, capsys):
     with FileGenotypeSource(bed, genome_build="GRCh37") as file_source:
         scale = estimate_scale(file_source, rows, np.arange(len(source.variants.ids)), block_size=9, threads=prediction_threads())
     write_genotype_scale(tmp_path/"scale", scale)
+    annotation_design = AnnotationDesign(np.column_stack([np.ones(len(source.variants.ids)),
+        np.arange(len(source.variants.ids)) % 3 == 0]), ('all', 'coding'), scale.variant_identity)
+    write_annotation_design(tmp_path/'annotations.npz', annotation_design)
     q = len(context_spec["names"])
     omega = np.diag(np.r_[.3, np.full(q-1, .07)])
     write_json(tmp_path/"prior.json", dict(kind="summit.prediction.prior", schema_version=1,
@@ -52,12 +56,14 @@ def test_cli_full_pipeline_and_frozen_feature_transform(tmp_path, capsys):
         contexts="contexts.tsv", context_spec="context.json", covariates="fixed.tsv", fixed_spec="fixed.json",
         genotype_scale="scale", architecture_prior="prior.json", residual_spec="residual.json",
         candidates=[dict(id="full", operation="common_scale", kappa=.5),
-                    dict(id="amplification", operation="separate_scales", kappa_a=.5, kappa_h=0)])
+                    dict(id="amplification", operation="separate_scales", kappa_a=.5, kappa_h=0),
+                    dict(id='annotated', operation='annotation', annotation_design='annotations.npz',
+                         covariances=np.stack([omega*.4, omega*.1]).tolist(), provenance={'source': 'synthetic'})])
     write_json(tmp_path/"fit.json", dict(kind="summit.prediction.fit_spec", schema_version=1,
         genotypes=dict(geno=bed.name, genome_build="GRCh37"), traits=[trait], solver=dict(rtol=1e-10)))
     assert main(["plan", "--spec", str(tmp_path/"fit.json"), "--memory-gib", "1", "--num-threads", str(prediction_threads())]) == 0
     plan = json.loads(capsys.readouterr().out)
-    assert plan["models"] == 2
+    assert plan["models"] == 3
     assert not (tmp_path/"fit").exists()
     assert main(["fit", "--spec", str(tmp_path/"fit.json"), "--out", str(tmp_path/"fit"),
         "--genotype-storage", "compact", "--block-size", "9", "--memory-gib", "1", "--num-threads", str(prediction_threads())]) == 0
@@ -71,7 +77,7 @@ def test_cli_full_pipeline_and_frozen_feature_transform(tmp_path, capsys):
     capsys.readouterr()
     assert main(["inspect", str(tmp_path/"fit"), "--num-threads", str(prediction_threads())]) == 0
     result = json.loads(capsys.readouterr().out)
-    assert len(result["models"]) == 2
+    assert len(result["models"]) == 3
     novel = context.copy()
     novel.loc[0, "group"] = 9
     with pytest.raises(ValueError, match="unknown categorical"):

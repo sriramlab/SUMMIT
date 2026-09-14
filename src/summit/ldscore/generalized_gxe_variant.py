@@ -260,6 +260,8 @@ class GeneralizedGxEPlanInputs:
     component_diagonal_sample_tile_width: int = 1024
     write_composable_payload: bool = False
     headroom_fraction: float = 0.15
+    num_traits: int = 0
+    num_residual_components: int = 0
 
     def __post_init__(self) -> None:
         for name in (
@@ -278,6 +280,10 @@ class GeneralizedGxEPlanInputs:
         _require_positive_int(
             "fixed_effect_rank", self.fixed_effect_rank, allow_zero=True
         )
+        for name in ("num_traits", "num_residual_components"):
+            _require_positive_int(name, getattr(self, name), allow_zero=True)
+        if bool(self.num_traits) != bool(self.num_residual_components):
+            raise ValueError("fused trait and residual counts must both be positive or zero")
         if self.fixed_effect_rank >= self.num_samples:
             raise ValueError("fixed_effect_rank must be smaller than num_samples")
         if self.preferred_rhs_tile_columns is not None:
@@ -489,6 +495,14 @@ def _memory_candidate(
             "directional panel bytes", 8, m, p, c
         ),
     }
+    if inputs.num_traits:
+        t, h = inputs.num_traits, inputs.num_residual_components
+        memory["fused_trait_inputs"] = _checked_product("trait inputs", 16, n, t + h)
+        memory["fused_trait_scores"] = _checked_product("trait scores", 8, m, q, t)
+        memory["fused_residual_information"] = _checked_product("trait information", 8, m, p, h)
+        memory["fused_trait_pair_tile"] = one_pair_tile
+        memory["fused_trait_score_tile"] = _checked_product("trait score tile", 8, v, q, t)
+        memory["fused_trait_information_tile"] = _checked_product("trait information tile", 8, v, h)
     subtotal = sum(memory.values())
     if subtotal > _MAX_INT64:
         raise OverflowError("resident memory subtotal exceeds signed 64-bit range")
@@ -557,6 +571,9 @@ def plan_generalized_gxe_variant_work(
         output_size += _checked_product(
             "composable component diagonal output bytes", 8, c, n
         )
+    if inputs.num_traits:
+        output_size += _checked_product("fused trait output bytes", 8, m,
+            q*inputs.num_traits+p*inputs.num_residual_components)
 
     preferred_variant_width = min(inputs.preferred_variant_block_width, m)
     requested_rhs_columns = inputs.preferred_rhs_tile_columns
@@ -778,6 +795,8 @@ def plan_generalized_gxe_variant_work(
             "K": k,
             "C": c,
             "B": b,
+            **({"T": inputs.num_traits, "H": inputs.num_residual_components}
+               if inputs.num_traits else {}),
         },
         work={
             "pass1_flops": pass1_flops,
