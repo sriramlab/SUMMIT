@@ -75,8 +75,11 @@ This is an approximate target-row jackknife, not a chromosome bootstrap or
 an exact refit. No inference blocks enter native LD construction.
 
 The native feature projection and fused information products use protected
-overwrite GEMMs followed by bounded elementwise updates. Numerical integrity
-checks remain enabled. Singleton annotation diagonals retain the variant
+overwrite GEMMs followed by bounded elementwise updates. Reference qualification
+uses `GXELDCORE_GEMM_INTEGRITY=ON` and `GXELDCORE_GEMM_CHECKSUM=ON` explicitly;
+private BLIS otherwise defaults to checksum recomputation off. Native ledgers
+record independent phase audits and protected GEMM audits separately.
+Singleton annotation diagonals retain the variant
 summation order while moving the response-pair loop outside the variant loop.
 
 ## Annotation-dependent prediction

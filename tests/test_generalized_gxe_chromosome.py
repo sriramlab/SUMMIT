@@ -12,6 +12,11 @@ from summit.ldscore.generalized_gxe_chromosome import reduce_chromosome_result, 
 
 @pytest.mark.parametrize('q,k,backend', [(2, 1, 'dense'), (3, 2, 'dense'), (3, 2, 'packed')])
 def test_interval_fused_statistics_and_joint_profile(tmp_path, q, k, backend):
+    from summit import gxeldcore
+
+    # The native runtime freezes its process-wide thread contract at first use.
+    # Reuse it when this test follows another native test in the full suite.
+    threads = max(1, int(gxeldcore.configured_blas_threads()))
     prefix, genotype, phi, fixed, annotations, _, probe = _fixture(
         tmp_path, q_count=q, annotation_count=k, seed=1413)
     rng = np.random.default_rng(17)
@@ -25,7 +30,7 @@ def test_interval_fused_statistics_and_joint_profile(tmp_path, q, k, backend):
     for chromosome, (start, stop) in enumerate(((0, 5), (5, 12)), 1):
         a = annotations[start:stop]
         inputs = GeneralizedGxEPlanInputs(len(phi), stop-start, q, k, probe.probe_count,
-            512*2**20, 'bed', fixed_effect_rank=fixed.shape[1],
+            512*2**20, 'bed', fixed_effect_rank=fixed.shape[1], threads=threads,
             preferred_variant_block_width=3, preferred_rhs_tile_columns=q*q*4,
             component_diagonal_sample_tile_width=4, num_traits=2, num_residual_components=3)
         plan = plan_generalized_gxe_variant_work(inputs)
@@ -35,7 +40,7 @@ def test_interval_fused_statistics_and_joint_profile(tmp_path, q, k, backend):
                 row_selection=None, ddof=1, basis=phi, fixed_effect_basis=fixed,
                 annotations=a, annotation_names=tuple(f'a{j}' for j in range(k)),
                 annotation_masses=np.asarray([np.cumsum(a[:, j], dtype=np.longdouble)[-1] for j in range(k)], float),
-                probe_spec=probe, work_plan=plan, threads=1, backend=backend,
+                probe_spec=probe, work_plan=plan, threads=threads, backend=backend,
                 variant_start=start, phenotypes=full.normalized_phenotypes, residual_basis=residual,
                 same_person_sample_tile_width=4, publish_component_kernel_diagonal=True).execute()
         finally:
