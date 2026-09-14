@@ -19,21 +19,26 @@ import summit
 if Path(summit.__file__).resolve() != ROOT/"src/summit/__init__.py":
     raise RuntimeError("checkout bootstrap resolved the wrong SUMMIT package")
 
-if len(sys.argv) > 1 and sys.argv[1] == "test":
-    for name in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS", "BLIS_NUM_THREADS"):
-        os.environ[name] = "1"
-    os.environ["PYTHONDONTWRITEBYTECODE"] = "1"
-    sys.dont_write_bytecode = True
-    import pytest
-    args = sys.argv[2:]
-    explicit_paths = any((ROOT/arg.split("::", 1)[0]).exists() for arg in args if not arg.startswith("-"))
-    if not explicit_paths:
-        args = [*[str(p) for p in sorted((ROOT/"tests").glob("test_prediction_*.py"))], *args]
-    raise SystemExit(pytest.main([*args, "-p", "no:cacheprovider"]))
-elif len(sys.argv) > 1 and sys.argv[1] in ("benchmark", "demo"):
-    from importlib import import_module
-    main = import_module(sys.argv[1]).main
-    raise SystemExit(main(sys.argv[2:]))
-else:
-    from summit.prediction.cli import main
-    raise SystemExit(main())
+def main():
+    if len(sys.argv) > 1 and sys.argv[1] == "test":
+        for name in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS", "BLIS_NUM_THREADS"):
+            os.environ[name] = "1"
+        os.environ["PYTHONDONTWRITEBYTECODE"] = "1"
+        sys.dont_write_bytecode = True
+        import pytest
+        args = sys.argv[2:]
+        explicit_paths = any((ROOT/arg.split("::", 1)[0]).exists() for arg in args if not arg.startswith("-"))
+        if not explicit_paths:
+            args = [*[str(p) for p in sorted((ROOT/"tests").glob("test_prediction_*.py"))], *args]
+        raise SystemExit(pytest.main([*args, "-p", "no:cacheprovider"]))
+    elif len(sys.argv) > 1 and sys.argv[1] in ("benchmark", "demo"):
+        from importlib import import_module
+        main = import_module(sys.argv[1]).main
+        raise SystemExit(main(sys.argv[2:]))
+    else:
+        from summit.prediction.cli import main
+        raise SystemExit(main())
+
+
+if __name__ == "__main__":
+    main()

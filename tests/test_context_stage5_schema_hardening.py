@@ -249,6 +249,10 @@ from pathlib import Path
 import json
 import sys
 
+# Honor the explicit checkout even when a shared editable installation exists.
+sys.meta_path[:] = [finder for finder in sys.meta_path
+                   if type(finder).__module__ != "_gwldcore_editable"]
+
 import numpy as np
 import summit
 
@@ -393,6 +397,10 @@ print(json.dumps({
 from pathlib import Path
 import json
 import sys
+
+# Honor the explicit checkout even when a shared editable installation exists.
+sys.meta_path[:] = [finder for finder in sys.meta_path
+                   if type(finder).__module__ != "_gwldcore_editable"]
 
 import numpy as np
 

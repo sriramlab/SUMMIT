@@ -3,7 +3,9 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from test_prediction_core import fixture, native_threads
+from prediction_helpers import prediction_threads
+
+from test_prediction_core import fixture
 from summit.prediction.genotype import FileGenotypeSource, ArrayGenotypeSource, RawBlockStream, estimate_scale
 from summit.prediction.spec import CandidatePrior, SolverSpec, VariantAxis
 from summit.prediction.batch import plan_prediction
@@ -17,8 +19,7 @@ def test_zero_rhs_singular_prior_shared_residual_and_no_hidden_scans():
     source, traits = fixture()
     t = replace(traits[0], y=np.zeros(len(traits[0].rows)))
     assert len({id(c.residual) for c in t.candidates}) == 1
-    operator = GenotypeOperator(source, [t], plan_prediction([t], source, block_size=7,
-        threads=native_threads()), backend="native")
+    operator = GenotypeOperator(source, [t], plan_prediction([t], source, block_size=7, threads=prediction_threads()), backend="native")
     operator.setup()
     result = solve(operator, SolverSpec(rtol=1e-12))
     assert operator.ledger.traversals == {"setup": 1, "verification": 1}
@@ -92,8 +93,7 @@ def test_strongly_scaled_aliased_fixed_design_matches_projected_dense():
     z = np.column_stack([t.fixed[:, 0], t.fixed[:, 1]*1e5, t.fixed[:, 2]*1e-2,
                          t.fixed[:, 3], t.fixed[:, 1]*2e5])
     t = replace(t, fixed=z)
-    operator = GenotypeOperator(source, [t], plan_prediction([t], source, block_size=11,
-        threads=native_threads()), backend="native")
+    operator = GenotypeOperator(source, [t], plan_prediction([t], source, block_size=11, threads=prediction_threads()), backend="native")
     operator.setup()
     result = solve(operator, SolverSpec(rtol=1e-10, qr_rtol=1e-12))
     u = result.solutions[(t.id, t.candidates[0].id)]
@@ -120,7 +120,7 @@ def test_sharded_source_boundary_and_sample_axis(tmp_path):
     with ShardedGenotypeSource(paths, genome_build="GRCh37") as shards:
         rows = traits[0].rows
         variants = np.arange(15, 29, dtype=np.int64)
-        shards.prepare(rows, 14, native_threads())
+        shards.prepare(rows, 14, prediction_threads())
         actual = shards.read(variants)
         np.testing.assert_array_equal(actual, source.values[np.ix_(rows, variants)])
         assert shards.sources[0].samples is shards.sources[1].samples

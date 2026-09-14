@@ -4,7 +4,9 @@ from dataclasses import replace
 import numpy as np
 import pytest
 
-from test_prediction_core import fixture, native_threads
+from prediction_helpers import prediction_threads
+
+from test_prediction_core import fixture
 from summit.prediction.api import fit_prediction
 from summit.prediction.artifacts import load_prediction_models, load_genotype_scale, write_genotype_scale
 from summit.prediction.batch import plan_prediction
@@ -16,11 +18,10 @@ from summit.prediction.spec import VariantAxis
 @pytest.mark.parametrize("backend", ["numpy", "native"])
 def test_model_reload_score_raw_conversion_and_allele_reorder(tmp_path, backend):
     source, traits = fixture()
-    threads = native_threads() if backend == "native" else 1
     models = fit_prediction(traits, source, output=tmp_path/"fit",
-        plan=plan_prediction(traits, source, storage="compact", block_size=9, rhs_columns=6, threads=threads), backend=backend)
+        plan=plan_prediction(traits, source, storage="compact", block_size=9, rhs_columns=6, threads=prediction_threads()), backend=backend)
     inputs = {t.id: ScoreInput(t.rows, t.phi, t.fixed, t.context_spec, t.fixed_spec) for t in traits}
-    scores = score_prediction(models, source, inputs, backend=backend, block_size=11, rhs_columns=6, threads=threads)
+    scores = score_prediction(models, source, inputs, backend=backend, block_size=11, rhs_columns=6, threads=prediction_threads())
     for m in models:
         t = next(t for t in traits if t.id == m.trait_id)
         raw = source.values[np.ix_(t.rows, t.variants)].astype(float)
@@ -38,7 +39,7 @@ def test_model_reload_score_raw_conversion_and_allele_reorder(tmp_path, backend)
     values = source.values[:, order]
     values = np.where(values == -127, -127, 2-values)
     other = ArrayGenotypeSource(values, source.samples, swapped, hard_calls=True)
-    rescored = score_prediction(models, other, inputs, backend=backend, block_size=7, threads=threads)
+    rescored = score_prediction(models, other, inputs, backend=backend, block_size=7, threads=prediction_threads())
     for key in scores.genetic:
         np.testing.assert_allclose(scores.genetic[key], rescored.genetic[key], atol=3e-14)
     assert scores.report["ledger"]["source_variants"] == len(source.variants.ids)
@@ -92,10 +93,10 @@ def test_native_bed_reads_orientation_missingness_masks_and_mutation(tmp_path):
     with FileGenotypeSource(path, genome_build="GRCh37") as source:
         assert source.variants.identity == array_source.variants.identity
         rows, variants = traits[1].rows, traits[1].variants
-        source.prepare(rows, 100, native_threads())
+        source.prepare(rows, 100, prediction_threads())
         calls = source.read(variants)
         np.testing.assert_array_equal(calls, array_source.values[np.ix_(rows, variants)])
-        source.prepare(np.array([rows[0]], dtype=np.int64), 100, native_threads())
+        source.prepare(np.array([rows[0]], dtype=np.int64), 100, prediction_threads())
         single = source.read(variants)
         np.testing.assert_array_equal(single, array_source.values[np.ix_([rows[0]], variants)])
         with path.open("r+b") as handle:
@@ -109,11 +110,10 @@ def test_native_bed_reads_orientation_missingness_masks_and_mutation(tmp_path):
 
 def test_bed_fit_and_score_match_array_source(tmp_path):
     array_source, traits, path = write_bed(tmp_path)
-    threads = native_threads()
     with FileGenotypeSource(path, genome_build="GRCh37") as source:
-        bed_traits = [replace(t, scale=estimate_scale(source, t.rows, t.variants, block_size=8, threads=threads)) for t in traits]
+        bed_traits = [replace(t, scale=estimate_scale(source, t.rows, t.variants, block_size=8, threads=prediction_threads())) for t in traits]
         native_models = fit_prediction(bed_traits, source, output=tmp_path/"bed-fit",
-            plan=plan_prediction(bed_traits, source, storage="compact", block_size=8, rhs_columns=6, threads=threads))
+            plan=plan_prediction(bed_traits, source, storage="compact", block_size=8, rhs_columns=6, threads=prediction_threads()))
     array_models = fit_prediction(traits, array_source, output=tmp_path/"array-fit", backend="numpy")
     for a, b in zip(native_models, array_models):
         np.testing.assert_allclose(a.weights, b.weights, atol=1e-12, rtol=1e-12)
