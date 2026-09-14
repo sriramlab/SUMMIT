@@ -6,6 +6,8 @@ import numpy as np
 import pandas as pd
 import pytest
 
+from prediction_helpers import prediction_threads
+
 from test_prediction_io import write_bed
 from summit.prediction._validation import digest
 from summit.prediction.artifacts import write_json, write_genotype_scale, load_prediction_models, read_json
@@ -37,7 +39,7 @@ def test_cli_full_pipeline_and_frozen_feature_transform(tmp_path, capsys):
     write_json(tmp_path/"context.json", context_spec)
     write_json(tmp_path/"fixed.json", fixed_spec)
     with FileGenotypeSource(bed, genome_build="GRCh37") as file_source:
-        scale = estimate_scale(file_source, rows, np.arange(len(source.variants.ids)), block_size=9)
+        scale = estimate_scale(file_source, rows, np.arange(len(source.variants.ids)), block_size=9, threads=prediction_threads())
     write_genotype_scale(tmp_path/"scale", scale)
     q = len(context_spec["names"])
     omega = np.diag(np.r_[.3, np.full(q-1, .07)])
@@ -53,18 +55,18 @@ def test_cli_full_pipeline_and_frozen_feature_transform(tmp_path, capsys):
                     dict(id="amplification", operation="separate_scales", kappa_a=.5, kappa_h=0)])
     write_json(tmp_path/"fit.json", dict(kind="summit.prediction.fit_spec", schema_version=1,
         genotypes=dict(geno=bed.name, genome_build="GRCh37"), traits=[trait], solver=dict(rtol=1e-10)))
-    assert main(["plan", "--spec", str(tmp_path/"fit.json"), "--memory-gib", "1"]) == 0
+    assert main(["plan", "--spec", str(tmp_path/"fit.json"), "--memory-gib", "1", "--num-threads", str(prediction_threads())]) == 0
     plan = json.loads(capsys.readouterr().out)
     assert plan["models"] == 2
     assert not (tmp_path/"fit").exists()
     assert main(["fit", "--spec", str(tmp_path/"fit.json"), "--out", str(tmp_path/"fit"),
-        "--genotype-storage", "compact", "--block-size", "9", "--memory-gib", "1"]) == 0
+        "--genotype-storage", "compact", "--block-size", "9", "--memory-gib", "1", "--num-threads", str(prediction_threads())]) == 0
     capsys.readouterr()
     models = load_prediction_models(tmp_path/"fit")
     write_json(tmp_path/"score.json", dict(kind="summit.prediction.score_spec", schema_version=1,
         genotypes=dict(geno=bed.name, genome_build="GRCh37"), traits=[dict(id="trait", samples="score.keep", contexts="contexts.tsv", covariates="fixed.tsv")]))
     assert main(["score", "--models", str(tmp_path/"fit"), "--spec", str(tmp_path/"score.json"),
-        "--out", str(tmp_path/"scores"), "--block-size", "7", "--memory-gib", "1"]) == 0
+        "--out", str(tmp_path/"scores"), "--block-size", "7", "--memory-gib", "1", "--num-threads", str(prediction_threads())]) == 0
     assert (tmp_path/"scores"/"COMPLETE.json").is_file()
     capsys.readouterr()
     assert main(["inspect", str(tmp_path/"fit")]) == 0

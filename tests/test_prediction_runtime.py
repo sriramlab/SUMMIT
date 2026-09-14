@@ -6,6 +6,8 @@ import os
 import numpy as np
 import pytest
 
+from prediction_helpers import prediction_threads
+
 from test_prediction_core import fixture, dense
 from summit.prediction.api import fit_prediction
 from summit.prediction.batch import plan_prediction
@@ -104,7 +106,7 @@ def test_failed_true_check_restarts_without_accepting_recursive_convergence(monk
 def test_interrupted_fit_resumes_identical_models_and_rejects_changed_fit(tmp_path, monkeypatch, backend):
     source, traits = fixture()
     spec = SolverSpec(rtol=1e-10)
-    plan = plan_prediction(traits, source, storage="compact", block_size=7, rhs_columns=6)
+    plan = plan_prediction(traits, source, storage="compact", block_size=7, rhs_columns=6, threads=prediction_threads())
     expected = fit_prediction(traits, source, output=tmp_path/"expected", plan=plan, solver=spec, backend=backend)
     checkpoint = tmp_path/"solver.npz"
     original = GenotypeOperator.apply
@@ -184,3 +186,17 @@ def test_prediction_registers_bound_worker_set_and_rejects_ambiguous_placement(m
     monkeypatch.setenv("OMP_PLACES", "cores")
     with pytest.raises(RuntimeError, match="singleton"):
         configure_prediction_threads(Native(), 2)
+
+
+@pytest.mark.parametrize("storage", ["stream", "compact", "standardized"])
+def test_wide_rhs_tiles_match_narrow_independent_gls(storage):
+    source, traits = fixture(m=137)
+    native = GenotypeOperator(source, traits, plan_prediction(traits, source,
+        storage=storage, block_size=67, rhs_columns=160, threads=prediction_threads()))
+    native.setup()
+    result = solve(native, SolverSpec(rtol=1e-10))
+    for t in traits:
+        for c in t.candidates:
+            expected, *_ = dense(source, t, c.covariance, c.residual)
+            np.testing.assert_allclose(result.solutions[(t.id, c.id)], expected, atol=2e-8, rtol=2e-8)
+    native.release()
