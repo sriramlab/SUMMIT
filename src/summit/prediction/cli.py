@@ -209,7 +209,7 @@ def main(argv=None):
             p.add_argument("--spec", required=True)
             p.add_argument("--memory-gib", type=float, default=16)
             p.add_argument("--block-size", type=int, default=512)
-            p.add_argument("--rhs-columns", type=int, default=64)
+            p.add_argument("--rhs-columns", type=int, default=64 if name == "score" else 160)
         if name in ("plan", "fit"):
             p.add_argument("--genotype-storage", choices=["stream", "compact", "standardized"], default="stream")
         if name in ("fit", "score", "scale"):

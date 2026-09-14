@@ -29,6 +29,13 @@ env BLIS_NUM_THREADS=8 OPENBLAS_NUM_THREADS=8 OMP_NUM_THREADS=8 MKL_NUM_THREADS=
 
 `scripts/prediction/demo.py` is a complete synthetic construction of both inputs.
 
+The default fitting RHS tile is 160 columns. A 28-candidate, five-component fit then
+uses one 140-column matrix batch per genotype block, reducing repeated reads
+of that block. `rhs_columns` (CLI `--rhs-columns`) remains an explicit memory
+and throughput control; smaller values can help when memory is tight. The
+planner includes the wider scratch in its admission estimate. This changes
+matrix tiling only; priors, FP64 arithmetic and convergence checks are unchanged.
+
 ## Building a trait
 
 `TraitTraining` combines source row and variant indices, y, the context matrix

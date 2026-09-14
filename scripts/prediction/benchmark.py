@@ -13,7 +13,7 @@ def main(argv=None):
     parser.add_argument("--threads", type=int, default=1)
     parser.add_argument("--mode", choices=["stream", "compact", "standardized"], default="compact")
     parser.add_argument("--block-size", type=int, default=256)
-    parser.add_argument("--rhs-columns", type=int, default=64)
+    parser.add_argument("--rhs-columns", type=int, default=160)
     parser.add_argument("--repetitions", type=int, default=3)
     args = parser.parse_args(argv)
     if any(v <= 0 for k, v in vars(args).items() if k != "mode"):
