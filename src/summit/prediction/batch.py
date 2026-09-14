@@ -23,7 +23,7 @@ class ResourcePlan:
         return asdict(self)
 
 
-def plan_prediction(traits, source, *, storage="stream", block_size=512, rhs_columns=64,
+def plan_prediction(traits, source, *, storage="stream", block_size=512, rhs_columns=160,
                     threads=1, memory_bytes=16 * 2**30):
     """Metadata-only conservative allocation estimate; never scans genotypes."""
     traits = tuple(traits)
