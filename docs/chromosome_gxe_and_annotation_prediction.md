@@ -116,6 +116,15 @@ genotype products per RHS tile. Homogeneous and annotated candidates can share
 the same batch. A design can be reused across candidates without duplicating
 the M-by-K matrix. Content identities are cached on immutable backing stores.
 
+Native annotation fits using BLIS require both `GXELDCORE_GEMM_INTEGRITY=ON`
+and `GXELDCORE_GEMM_CHECKSUM=ON`. Full-array qualification found intermittent
+discrepancies around 1e-6 in the unchecked build, despite passing small tests;
+their cause remains unresolved. The protected full-array candidate sequence
+agreed with independent per-annotation products to 1.8e-16 relative error.
+The API rejects the unqualified BLIS configuration before genotype preparation.
+This is a qualification restriction, not a claim that the discrepancy's cause
+has been fixed or that the annotation formula caused it.
+
 The positive aggregate-covariance diagonal is an approximate preconditioner;
 the covariance operator and exported weights use the exact per-SNP priors.
 Convergence is checked against the actual operator. Planning, checkpoint

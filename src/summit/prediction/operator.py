@@ -20,6 +20,19 @@ class GenotypeOperator:
         self.source, self.traits, self.plan = source, tuple(traits), plan
         self.backend = backend
         self.native = native_module() if backend == "native" else None
+        if self.native is not None and any(
+                c.annotation_prior is not None for t in self.traits for c in t.candidates):
+            build = self.native.build_info()
+            # Full-array qualification found intermittent discrepancies in
+            # the unchecked private-BLIS path. The protected path passed the
+            # candidate-switch and independent weighted-product checks. Keep
+            # the new prior family on that qualified path until this is resolved.
+            if build.get("blas_vendor") == "BLIS" and not (
+                    build.get("gemm_integrity_enabled") and build.get("gemm_checksum_enabled")):
+                raise ValueError(
+                    "Annotation-prior BLIS fits require GXELDCORE_GEMM_INTEGRITY=ON "
+                    "and GXELDCORE_GEMM_CHECKSUM=ON; the unchecked BLIS path "
+                    "has not passed full-array numerical qualification")
         if self.native is not None:
             configure_prediction_threads(self.native, plan.threads)
         self.affine_block = StandardizedBlock(self.native, plan.threads)

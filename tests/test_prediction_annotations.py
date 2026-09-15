@@ -106,6 +106,19 @@ def test_annotation_normalization_identity_and_validation(tmp_path):
     np.testing.assert_allclose(equivalent.block(0, len(a)), p.block(0, len(a)), atol=1e-15)
 
 
+@pytest.mark.parametrize('integrity,checksum', [(False, False), (True, False), (False, True)])
+def test_unqualified_annotation_blis_rejected_before_genotype_preparation(monkeypatch, integrity, checksum):
+    from types import SimpleNamespace
+    source, trait = annotated_fixture()
+    plan = plan_prediction([trait], source, block_size=7, rhs_columns=6, threads=prediction_threads())
+    native = SimpleNamespace(build_info=lambda: dict(blas_vendor='BLIS',
+        gemm_integrity_enabled=integrity, gemm_checksum_enabled=checksum))
+    monkeypatch.setattr('summit.prediction.operator.native_module', lambda: native)
+    monkeypatch.setattr(source, 'prepare', lambda *args: pytest.fail('must reject before genotype preparation'))
+    with pytest.raises(ValueError, match='GXELDCORE_GEMM_CHECKSUM=ON'):
+        GenotypeOperator(source, [trait], plan, backend='native')
+
+
 @pytest.mark.parametrize('backend', ['numpy', 'native'])
 def test_annotated_checkpoint_reload_and_score(tmp_path, monkeypatch, backend):
     source, trait = annotated_fixture()
