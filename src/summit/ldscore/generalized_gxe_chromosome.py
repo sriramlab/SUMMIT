@@ -19,7 +19,7 @@ import numpy as np
 
 from summit.context.fit import ContextNormalEquations
 from summit.context.spec import ContextComponentIndex, ContextPairIndex, owned_readonly_array
-from summit.context.spec import array_sha256, canonical_json
+from summit.context.spec import array_sha256, canonical_json, canonical_sha256
 from summit.ldscore.generalized_gxe_native import GeneralizedGxENativeResult
 
 CHROMOSOME_LD_POLICY = "within_chromosome_residual_profile_global_mass_v1"
@@ -146,6 +146,41 @@ embedded here on the shared genome-wide component axis. No source is rebuilt.
         str(chromosome), cohort_identity, tuple(annotation_names), tuple(trait_names), q,
         result.component_kernel_diagonal.shape[1],
         result.residual_rank, labels, masses, directed, rhs, cross)
+
+
+def combine_chromosome_annotations(chunk, weights, annotation_names):
+    """Reuse fixed LD moments for the annotation design ``A_new = A @ weights``.
+
+    This is an exact linear reduction of the existing stochastic moments. It
+    needs no genotypes, new sketches, or separately fitted chromosome effects.
+    For disjoint bins covering every SNP, an all-one column merges them into
+    the unpartitioned model. Global masses are recomputed during joint fitting,
+    including each target-block deletion. Nonnegative overlapping combinations
+    are supported; they cannot recover a finer partition than the input design.
+    """
+    if not isinstance(chunk, ChromosomeMoments):
+        raise ValueError('validated chromosome moments are required')
+    if np.iscomplexobj(weights):
+        raise ValueError('annotation combination must be real')
+    weights = np.asarray(weights, dtype=float)
+    names = tuple(annotation_names)
+    if (weights.shape != (len(chunk.annotation_names), len(names)) or not names
+            or len(set(names)) != len(names)
+            or any(not isinstance(name, str) or not name for name in names)
+            or not np.isfinite(weights).all() or np.any(weights < 0)
+            or np.any(weights.sum(axis=0) <= 0)):
+        raise ValueError('invalid annotation combination weights or names')
+    p = chunk.num_basis*(chunk.num_basis+1)//2
+    transform = np.kron(weights, np.eye(p))
+    identity = canonical_sha256(dict(cohort=chunk.cohort_identity,
+        annotation_combination=array_sha256(weights), annotation_names=names))
+    return ChromosomeMoments(
+        chunk.chromosome, identity, names, chunk.trait_names, chunk.num_basis,
+        chunk.n_samples, chunk.residual_rank, chunk.block_ids,
+        chunk.block_masses@weights,
+        transform.T@chunk.block_directed@transform,
+        transform.T@chunk.block_genetic_rhs,
+        transform.T@chunk.block_genetic_residual)
 
 
 def joint_chromosome_equations(

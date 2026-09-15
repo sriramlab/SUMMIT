@@ -7,7 +7,8 @@ from test_generalized_gxe_native import _fixture, _reference
 from summit.ldscore.generalized_gxe_native import GeneralizedGxENativeBEDExecutor
 from summit.ldscore.generalized_gxe_variant import GeneralizedGxEPlanInputs, plan_generalized_gxe_variant_work
 from summit.ldscore.generalized_gxe_trait_summary import generalized_gxe_per_variant_trait_statistics
-from summit.ldscore.generalized_gxe_chromosome import reduce_chromosome_result, joint_chromosome_equations
+from summit.ldscore.generalized_gxe_chromosome import (
+    reduce_chromosome_result, joint_chromosome_equations, combine_chromosome_annotations)
 
 
 @pytest.mark.parametrize('q,k,backend', [(2, 1, 'dense'), (3, 2, 'dense'), (3, 2, 'packed')])
@@ -96,6 +97,26 @@ def test_interval_fused_statistics_and_joint_profile(tmp_path, q, k, backend):
         profiled += (value+value.T)/2
     actual = deleted.matrix[:c, :c]-deleted.matrix[:c, c:]@np.linalg.solve(rg, deleted.matrix[c:, :c])
     np.testing.assert_allclose(actual, profiled, rtol=1e-11, atol=1e-11)
+    # A normalized kernel transformation is an independent oracle for combining
+    # unnormalized per-block moments, both before and after deleting target rows.
+    for weights in (np.ones((k, 1)), np.column_stack([np.ones(k), np.arange(1, k+1)])):
+        names = tuple(f'combined_{i}' for i in range(weights.shape[1]))
+        combined = [combine_chromosome_annotations(x, weights, names) for x in chunks]
+        for deletion in ((), (1,)):
+            original = joint_chromosome_equations(chunks, **kwargs, deleted_blocks=deletion)
+            merged = joint_chromosome_equations(combined, **kwargs, deleted_blocks=deletion)
+            new_mass = original.annotation_masses@weights
+            normalized = original.annotation_masses[:, None]*weights/new_mass[None, :]
+            transform = np.zeros((c+3, len(new_mass)*p+3))
+            transform[:c, :len(new_mass)*p] = np.kron(normalized, np.eye(p))
+            transform[c:, len(new_mass)*p:] = np.eye(3)
+            np.testing.assert_allclose(merged.matrix, transform.T@original.matrix@transform,
+                rtol=1e-10, atol=1e-10)
+            np.testing.assert_allclose(merged.rhs, transform.T@original.rhs, rtol=1e-11, atol=1e-11)
+            np.testing.assert_allclose(merged.annotation_masses, new_mass, rtol=1e-13)
+    for bad in (np.zeros((k, 1)), -np.ones((k, 1)), np.full((k, 1), np.nan)):
+        with pytest.raises(ValueError, match='combination'):
+            combine_chromosome_annotations(chunks[0], bad, ('bad',))
     with pytest.raises(ValueError, match='duplicate chromosome'):
         joint_chromosome_equations(chunks+chunks[:1], **kwargs)
     with pytest.raises(ValueError, match='incomplete'):

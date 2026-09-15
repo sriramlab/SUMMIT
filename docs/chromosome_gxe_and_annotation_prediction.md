@@ -68,6 +68,14 @@ duplicate, missing, and incompatible chromosome contributions. The residual
 basis must begin with the constant-one kernel. The resulting equations use
 the existing rank-checked solver.
 
+`combine_chromosome_annotations(chunk, weights, names)` reuses these compact
+moments for the design `A_new = A @ weights`. An all-one column merges disjoint
+MAF bins covering the panel into the unpartitioned model. This produces both
+overall and partitioned estimates from the same genotype passes. It combines
+unnormalized moments and recomputes global masses in each fit and deletion;
+it does not average the fitted bin coefficients. It also supports nonnegative
+overlapping combinations of the existing annotations.
+
 Block deletion is post hoc: source sketches remain frozen, selected target
 rows are removed, and global retained annotation masses are used. The nuisance
 correction uses retained target B and full source B, symmetrized after reduction.
