@@ -8,7 +8,24 @@ from summit.ldscore.generalized_gxe_native import GeneralizedGxENativeBEDExecuto
 from summit.ldscore.generalized_gxe_variant import GeneralizedGxEPlanInputs, plan_generalized_gxe_variant_work
 from summit.ldscore.generalized_gxe_trait_summary import generalized_gxe_per_variant_trait_statistics
 from summit.ldscore.generalized_gxe_chromosome import (
-    reduce_chromosome_result, joint_chromosome_equations, combine_chromosome_annotations)
+    reduce_chromosome_result, joint_chromosome_equations, combine_chromosome_annotations,
+    transferred_chromosome_equations)
+
+
+def test_large_centered_residual_trace_roundoff():
+    from summit.ldscore.generalized_gxe_chromosome import ChromosomeMoments
+    n = 300000
+    chunk = ChromosomeMoments('1', 'test', ('all',), ('trait',), 1, n, n-2,
+        np.array([0]), np.array([[10.]]), np.ones((1,1,1)),
+        np.ones((1,1,1)), np.ones((1,1,2)))
+    gram = np.diag([n-2., float(n)])
+    gram[0,1] = gram[1,0] = 4e-8
+    options = dict(residual_gram=gram, residual_rhs=np.ones((2,1)),
+        residual_traces=np.array([n-2.,0.]), residual_names=('one','centered'))
+    joint_chromosome_equations([chunk], **options)
+    gram[0,1] = gram[1,0] = 1e-3
+    with pytest.raises(ValueError, match='constant-one'):
+        joint_chromosome_equations([chunk], **options)
 
 
 @pytest.mark.parametrize('q,k,backend', [(2, 1, 'dense'), (3, 2, 'dense'), (3, 2, 'packed')])
@@ -75,6 +92,33 @@ def test_interval_fused_statistics_and_joint_profile(tmp_path, q, k, backend):
     kwargs = dict(residual_gram=full.residual_gram, residual_rhs=full.residual_rhs,
         residual_traces=full.residual_traces, residual_names=('one', 'e', 'e2'))
     equations = joint_chromosome_equations(chunks, **kwargs, expected_chromosomes=(1, 2))
+    # Equal-N transfer must recover the original full and target-deleted fits,
+    # including the study's own trait RHS and residual moments.
+    for deletion in ((), (1,)):
+        original = joint_chromosome_equations(chunks, **kwargs, deleted_blocks=deletion)
+        transfer = transferred_chromosome_equations(chunks, chunks,
+            reference_residual_gram=full.residual_gram,
+            reference_residual_traces=full.residual_traces,
+            reference_same_person=np.eye(k*p), deleted_blocks=deletion, **kwargs)
+        np.testing.assert_allclose(transfer.matrix, original.matrix, rtol=5e-15, atol=5e-14)
+        np.testing.assert_allclose(transfer.rhs, original.rhs, rtol=0, atol=0)
+    # Unequal-N assembly must scale same-person and distinct-person terms
+    # separately and retain the study's nuisance moments and phenotype RHS.
+    factor = (chunks[0].residual_rank-2)/chunks[0].residual_rank
+    smaller = [replace(x, n_samples=x.n_samples-2, residual_rank=x.residual_rank-2,
+        block_genetic_rhs=x.block_genetic_rhs*factor,
+        block_genetic_residual=x.block_genetic_residual*factor) for x in chunks]
+    small_kwargs = dict(kwargs, residual_gram=full.residual_gram*factor,
+        residual_traces=full.residual_traces*factor, residual_rhs=full.residual_rhs*factor)
+    transfer = transferred_chromosome_equations(chunks, smaller,
+        reference_residual_gram=full.residual_gram, reference_residual_traces=full.residual_traces,
+        reference_same_person=np.eye(k*p), **small_kwargs)
+    nr, ns = chunks[0].n_samples, smaller[0].n_samples
+    expected = (ns/nr)*np.eye(k*p) + ns*(ns-1)/(nr*(nr-1))*(equations.reference_genetic_gram-np.eye(k*p))
+    np.testing.assert_allclose(transfer.matrix[:k*p, :k*p], (expected+expected.T)/2, rtol=1e-13)
+    own = joint_chromosome_equations(smaller, **small_kwargs)
+    np.testing.assert_allclose(transfer.matrix[k*p:], own.matrix[k*p:], rtol=0, atol=0)
+    np.testing.assert_allclose(transfer.rhs, own.rhs, rtol=0, atol=0)
     total_cross = sum(expected_cross); rg = full.residual_gram
     expected_profile = sum(g-b@np.linalg.solve(rg, b.T) for g, b in zip(expected_grams, expected_cross))
     c = k*p

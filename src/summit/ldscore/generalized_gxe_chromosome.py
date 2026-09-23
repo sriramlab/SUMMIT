@@ -2,7 +2,8 @@
 
 This is a distinct approximation, not a full-genome LD reference. It assumes
 cross-chromosome genetic kernels are uncorrelated after projection away from
-the residual-kernel span. Only same-cohort reference/trait moments are accepted.
+the residual-kernel span. The primary assembler uses exact-cohort moments;
+the separate transfer adapter requires explicit same-person reference moments.
 Chromosome kernels use global annotation masses; coefficients are therefore
 genome-wide covariance contributions, not chromosome-specific estimates.
 
@@ -223,7 +224,11 @@ The residual basis must start with the constant-one column for trace recovery.
             or not np.allclose(gram, gram.T, rtol=1e-12, atol=1e-12)):
         raise ValueError("invalid common residual moments")
     np.linalg.cholesky(gram)
-    if not np.allclose(gram[0], traces, rtol=1e-10, atol=1e-10) or not np.isclose(
+    # Centered residual kernels can have nearly zero trace although their
+    # individual summands are O(N). Compare cancellation error on the natural
+    # Gram scale, not with a fixed absolute tolerance in sample-count units.
+    trace_scale = np.sqrt(gram[0, 0]*np.diag(gram))
+    if not np.all(np.abs(gram[0]-traces) <= 1e-10*np.abs(traces)+1e-12*trace_scale) or not np.isclose(
             traces[0], first.residual_rank, rtol=1e-10, atol=1e-10):
         raise ValueError("residual moments must start with the projected constant-one kernel")
     deleted = tuple(deleted_blocks)
@@ -258,3 +263,50 @@ The residual basis must start with the constant-one column for trace recovery.
         annotation_masses=masses, deleted_groups=tuple(map(str, deleted)),
         reference_genetic_gram=genetic_gram, transferred_genetic_gram=genetic_gram,
         reference_n=first.n_samples, study_n=first.n_samples)
+
+
+def transferred_chromosome_equations(
+    reference_chromosomes, study_chromosomes, *, reference_residual_gram,
+    reference_residual_traces, reference_same_person, residual_gram,
+    residual_rhs, residual_traces, residual_names, deleted_blocks=(),
+    expected_chromosomes=None,
+):
+    """Transfer one shared chromosome reference to one trait's exact moments.
+
+    This uses the existing same-person/distinct-person population transfer.
+    Shared environment/covariate definitions and compatible populations remain
+    caller requirements: sample-size scaling cannot correct selective missingness.
+    Genotype affine scaling must be identical for the reference and study.
+    Approximate target-row jackknife reuses full-reference same-person moments,
+    matching the existing generalized-GxE variant-reference convention.
+    """
+    from dataclasses import replace
+    from summit.context.oracle import transfer_reference_gram
+
+    ref, study = tuple(reference_chromosomes), tuple(study_chromosomes)
+    if not ref or not study:
+        raise ValueError('reference and study chromosomes are required')
+    ref_by_chr = {x.chromosome: x for x in ref}
+    if set(ref_by_chr) != {x.chromosome for x in study}:
+        raise ValueError('reference and study chromosome sets differ')
+    for chunk in study:
+        other = ref_by_chr[chunk.chromosome]
+        if (chunk.annotation_names != other.annotation_names or chunk.num_basis != other.num_basis
+                or not np.array_equal(chunk.block_ids, other.block_ids)
+                or not np.array_equal(chunk.block_masses, other.block_masses)):
+            raise ValueError('reference and study variant block designs differ')
+    options = dict(residual_names=residual_names, deleted_blocks=deleted_blocks,
+                   expected_chromosomes=expected_chromosomes)
+    reference = joint_chromosome_equations(ref,
+        residual_gram=reference_residual_gram, residual_traces=reference_residual_traces,
+        residual_rhs=np.zeros((len(residual_names), len(ref[0].trait_names))), **options)
+    target = joint_chromosome_equations(study, residual_gram=residual_gram,
+        residual_traces=residual_traces, residual_rhs=residual_rhs, **options)
+    transferred = transfer_reference_gram(reference.reference_genetic_gram,
+        reference_same_person, reference_n=reference.reference_n, study_n=target.study_n)
+    matrix = target.matrix.copy()
+    c = target.genetic_count
+    matrix[:c, :c] = transferred
+    return replace(target, matrix=matrix,
+        reference_genetic_gram=reference.reference_genetic_gram,
+        transferred_genetic_gram=transferred, reference_n=reference.reference_n)
