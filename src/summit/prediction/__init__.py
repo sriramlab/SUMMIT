@@ -6,6 +6,10 @@ Imports stay light so CLI thread placement can precede numerical imports.
 from importlib import import_module
 
 _EXPORTS = {
+    "fit_mixture_prediction": "mixture", "MixtureSpec": "mixture", "MixtureSolverSpec": "mixture",
+    "plan_mixture_prediction": "mixture",
+    "SeparateSparsitySpec": "mixture",
+    "shrink_orthogonal_covariance": "mixture",
     "fit_prediction": "api", "plan_prediction": "batch",
     "load_prediction_models": "artifacts", "load_genotype_scale": "artifacts",
     "write_genotype_scale": "artifacts", "PredictionModel": "artifacts",

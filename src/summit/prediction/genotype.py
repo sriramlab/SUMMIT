@@ -381,7 +381,17 @@ def estimate_scale(source, rows, variants, *, ddof=1, block_size=512, threads=1,
         raise MemoryError("scale setup exceeds memory budget; reduce block size")
     stream = RawBlockStream(source, rows, variants, block_size=block_size, threads=threads)
     mean, inv = np.empty(len(variants)), np.empty(len(variants))
+    native_scale = None
+    if source.hard_calls:
+        try:
+            native_scale = getattr(native_module(), 'prediction_hardcall_scale', None)
+        except ImportError:
+            # Array/reference workflows remain usable without native modules.
+            pass
     for start, v, raw in stream.blocks("scale"):
+        if native_scale is not None:
+            native_scale(raw, mean[start:start+len(v)], inv[start:start+len(v)], ddof, threads)
+            continue
         observed = raw != -127
         calls = np.where(observed, raw, 0).astype(np.float64)
         count = observed.sum(axis=0)

@@ -17,7 +17,8 @@ from summit.prediction.cli import main
 from summit.prediction import AnnotationDesign, write_annotation_design
 
 
-def test_cli_full_pipeline_and_frozen_feature_transform(tmp_path, capsys):
+@pytest.mark.parametrize('mixture', [False, 'radial', 'separate'])
+def test_cli_full_pipeline_and_frozen_feature_transform(tmp_path, capsys, mixture):
     source, old_traits, bed = write_bed(tmp_path)
     rng = np.random.default_rng(232)
     samples = pd.DataFrame(source.samples, columns=["FID", "IID"])
@@ -59,8 +60,15 @@ def test_cli_full_pipeline_and_frozen_feature_transform(tmp_path, capsys):
                     dict(id="amplification", operation="separate_scales", kappa_a=.5, kappa_h=0),
                     dict(id='annotated', operation='annotation', annotation_design='annotations.npz',
                          covariances=np.stack([omega*.4, omega*.1]).tolist(), provenance={'source': 'synthetic'})])
+    solver = dict(rtol=1e-10)
+    if mixture:
+        solver['kind'] = 'mixture'
+        for candidate in trait['candidates']:
+            candidate['mixture'] = (dict(probability=.1, small_variance_fraction=.2) if mixture=='radial' else
+                dict(kind='separate_sparsity',baseline=dict(probability=.1,small_variance_fraction=.2),
+                     response=dict(probability=.3,small_variance_fraction=.1)))
     write_json(tmp_path/"fit.json", dict(kind="summit.prediction.fit_spec", schema_version=1,
-        genotypes=dict(geno=bed.name, genome_build="GRCh37"), traits=[trait], solver=dict(rtol=1e-10)))
+        genotypes=dict(geno=bed.name, genome_build="GRCh37"), traits=[trait], solver=solver))
     assert main(["plan", "--spec", str(tmp_path/"fit.json"), "--memory-gib", "1", "--num-threads", str(prediction_threads())]) == 0
     plan = json.loads(capsys.readouterr().out)
     assert plan["models"] == 3

@@ -14,6 +14,16 @@ from summit.prediction.score import ScoreInput, score_prediction
 from summit.prediction.solver import solve
 
 
+def test_rank_one_annotation_candidate_roundoff_and_real_mismatch():
+    design=AnnotationDesign(np.ones((7,1)),('all',),'axis')
+    direction=np.array([1.,1e-8,.2,-.3,.01])
+    prior=AnnotationPrior(design,np.outer(direction,direction)[None])
+    candidate=prior.candidate('rank_one',np.ones(13),{'source':'test'})
+    np.testing.assert_array_equal(candidate.covariance,prior.aggregate)
+    with pytest.raises(ValueError,match='must equal'):
+        CandidatePrior('bad',prior.aggregate*1.001,np.ones(13),{'source':'test'},annotation_prior=prior)
+
+
 def annotated_fixture(overlap=True):
     source, original = fixture()
     t = original[0]; m = len(t.variants)

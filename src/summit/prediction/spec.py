@@ -112,7 +112,11 @@ class CandidatePrior:
             prior = self.annotation_prior
             if not isinstance(prior, AnnotationPrior) or prior.aggregate.shape != covariance.shape:
                 raise ValueError("invalid annotation prior or covariance dimensions")
-            if not np.allclose(covariance, prior.aggregate, rtol=1e-12, atol=0):
+            # Revalidating a rank-deficient prior can remove another tiny
+            # roundoff-negative eigenvalue. Compare in covariance-scale units;
+            # elementwise relative error is undefined at structural zeros.
+            scale = max(float(np.max(abs(prior.aggregate))),np.finfo(float).tiny)
+            if np.max(abs(covariance-prior.aggregate)) > 1e-12*scale:
                 raise ValueError("candidate covariance must equal the aggregate annotation prior")
             if 'annotation_prior' in specification and specification['annotation_prior'] != prior.specification:
                 raise ValueError("conflicting annotation prior provenance")
