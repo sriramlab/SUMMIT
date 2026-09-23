@@ -26,3 +26,8 @@ example/output.log
 *.sumstats
 *.sumstats.gz
 *.ldscore.gz
+
+# Local development notes and generated reports.
+AGENTS.md
+AUDIT*.md
+/reports/

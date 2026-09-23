@@ -16,7 +16,7 @@ gene–environment interaction models and polygenic scores.
 - G×E polygenic score fitting, scoring, and calibration.
 
 Genotype input can be PLINK BED hard calls or biallelic diploid PGEN dosages.
-See the [user guide](docs/wiki/Home.md) for the inputs and availability of each method.
+See the [user guide](https://github.com/bronsonj98/SUMMIT/wiki) for the inputs and availability of each method.
 
 ## Install
 
@@ -34,7 +34,7 @@ summit --help
 summit-pgs --help
 ```
 
-See [Installation](docs/wiki/Installation.md) for compiler setup, development
+See [Installation](https://github.com/bronsonj98/SUMMIT/wiki/Installation) for compiler setup, development
 installs, and the additional build needed for generalized G×E reference estimation.
 
 ## Try it
@@ -52,14 +52,15 @@ sample sizes are unsuitable for evaluating statistical performance.
 
 ## Documentation
 
-- [Input files](docs/wiki/Input-files.md)
-- [LD scores](docs/wiki/LD-scores.md)
-- [Heritability and genetic correlation](docs/wiki/Heritability-and-genetic-correlation.md)
-- [Batch analyses](docs/wiki/Batch-analyses.md)
-- [G×E models](docs/wiki/GxE-models.md)
-- [Multiple environments](docs/wiki/Multiple-environments.md)
-- [G×E polygenic scores](docs/wiki/Polygenic-scores.md)
-- [Benchmarks](docs/wiki/Benchmarks.md)
+- [Input files](https://github.com/bronsonj98/SUMMIT/wiki/Input-files)
+- [LD scores](https://github.com/bronsonj98/SUMMIT/wiki/LD-scores)
+- [Heritability and genetic correlation](https://github.com/bronsonj98/SUMMIT/wiki/Heritability-and-genetic-correlation)
+- [Batch analyses](https://github.com/bronsonj98/SUMMIT/wiki/Batch-analyses)
+- [G×E models](https://github.com/bronsonj98/SUMMIT/wiki/GxE-models)
+- [Multiple environments](https://github.com/bronsonj98/SUMMIT/wiki/Multiple-environments)
+- [G×E polygenic scores](https://github.com/bronsonj98/SUMMIT/wiki/Polygenic-scores)
+- [Real-data results](https://github.com/bronsonj98/SUMMIT/wiki/Real-data-results)
+- [Benchmarks](https://github.com/bronsonj98/SUMMIT/wiki/Benchmarks)
 
 ## Citation
 

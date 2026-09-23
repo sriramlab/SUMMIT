@@ -1,7 +1,22 @@
 # SUMMIT user guide
 
-Start with [Installation](Installation.md) and [Input files](Input-files.md).
-Each analysis guide explains what to supply, how to run it, and how to read the results.
+SUMMIT estimates heritability and genetic correlation, computes reference LD
+scores, and fits gene–environment interaction models and polygenic scores.
+
+Start with [Installation](Installation.md), try the synthetic
+example below, then choose an analysis guide. [Input files](Input-files.md)
+describes the formats needed for your own data.
+
+```bash
+python example/prepare_example_inputs.py
+bash example/estimate_partitioned_gwldscore.sh
+bash example/h2_ldscore.sh
+```
+
+Run these commands from an installed SUMMIT checkout. Generated inputs and
+results go to `example/out/`.
+
+## Choose an analysis
 
 | Analysis | Guide |
 |---|---|
@@ -14,9 +29,13 @@ Each analysis guide explains what to supply, how to run it, and how to read the 
 | Python model construction and mathematical details | [PGS API](PGS-API.md), [Methods](Methods.md) |
 | Research extensions | [Contextual Python API](Contextual-Python-API.md) |
 
-[Benchmarks](Benchmarks.md) describes measured performance and reproduction
-commands. [Troubleshooting](Troubleshooting.md) covers input, build, and fitting
-errors. [Development](Development.md) describes the source layout and tests.
+## Results and background
+
+- [Real-data results](Real-data-results.md): genetic-variance estimates from
+  UK Biobank, with aggregate figures and downloadable plot data.
+- [Benchmarks](Benchmarks.md): runtime, memory, and reproduction commands.
+- [Methods](Methods.md): model definitions and estimating equations.
+- [Troubleshooting](Troubleshooting.md): input, installation, and fitting errors.
 
 The main `summit` command supports LD scores, h²/rg, and one-environment G×E.
 Joint generalized G×E estimation is available through Python, with a separate

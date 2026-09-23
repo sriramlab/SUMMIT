@@ -45,6 +45,11 @@ def plan_prediction(traits, source, *, storage="stream", block_size=512, rhs_col
             raise ValueError(f"{t.id}: scale variant/allele identity mismatch")
         if t.scale.sample_identity != digest([source.samples[int(i)] for i in t.rows]):
             raise ValueError(f"{t.id}: scale discovery sample/order identity mismatch")
+        for candidate in t.candidates:
+            prior = candidate.annotation_prior
+            if prior is not None and (prior.design.weights.shape[0] != len(t.variants)
+                    or prior.design.variant_identity != t.scale.variant_identity):
+                raise ValueError(f"{t.id}: annotation variant/order identity mismatch")
     nmax = max(len(t.rows) for t in traits)
     qmax = max(t.phi.shape[1] for t in traits)
     if rhs_columns < qmax:
@@ -71,6 +76,14 @@ def plan_prediction(traits, source, *, storage="stream", block_size=512, rhs_col
         "axes_and_scales": 128*(len(source.samples)+len(source.variants.ids)) + sum(24*len(t.variants) for t in traits),
         "runtime_reserve": 256*2**20,
     }
+    annotated = [c.annotation_prior for t in traits for c in t.candidates if c.annotation_prior is not None]
+    if annotated:
+        designs = {id(prior.design): prior.design for prior in annotated}
+        priors = {id(prior): prior for prior in annotated}
+        allocations['annotation_designs_and_priors'] = (
+            sum(d.weights.nbytes+d.masses.nbytes for d in designs.values())
+            + sum(p.covariances.nbytes+p.scaled_covariances.nbytes+p.aggregate.nbytes for p in priors.values()))
+        allocations['annotation_covariance_tile'] = 8*b*(rhs_columns*qmax+qmax*qmax)
     peak = sum(allocations.values())
     if peak > memory_bytes:
         raise MemoryError(f"prediction plan needs approximately {peak/2**30:.3f} GiB; budget {memory_bytes/2**30:.3f} GiB; reduce tiles or use stream storage")
@@ -80,6 +93,8 @@ def plan_prediction(traits, source, *, storage="stream", block_size=512, rhs_col
         geometry=None if t.geometry is None else [array_digest(t.geometry.omega), array_digest(t.geometry.metric),
                                                   t.geometry.reference, t.geometry.anchor],
         candidates=[dict(id=c.id, covariance=array_digest(c.covariance), residual=array_digest(c.residual),
-                         specification=c.specification) for c in t.candidates]) for t in traits]])
+                         specification=c.specification,
+                         **({'annotation_prior': c.annotation_prior.identity} if c.annotation_prior is not None else {}))
+                    for c in t.candidates]) for t in traits]])
     return ResourcePlan(storage, block_size, rhs_columns, threads, memory_bytes, peak, allocations,
                         len(rows), len(variants), sum(len(t.candidates) for t in traits), identity)

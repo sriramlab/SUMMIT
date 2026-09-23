@@ -137,7 +137,8 @@ static void prediction_standardize(
 }
 
 static void prediction_product(nb_mat2f_ro<double> left, nb_mat2f_ro<double> right,
-                               nb_mat2f_rw<double> output, bool transpose, int threads) {
+                               nb_mat2f_rw<double> output, bool transpose, int threads,
+                               bool deterministic = false) {
     const int m = prediction_dim(left.shape(transpose ? 1 : 0));
     const int k = prediction_dim(left.shape(transpose ? 0 : 1));
     const int n = prediction_dim(right.shape(1));
@@ -148,6 +149,13 @@ static void prediction_product(nb_mat2f_ro<double> left, nb_mat2f_ro<double> rig
     prediction_no_alias(right.data(), right.size(), output.data(), output.size());
     validate_protected_gemm_threads(threads);
     nb::gil_scoped_release release;
+    if (deterministic) {
+        if (transpose)
+            dgemm_tn_tiled(m, n, k, left.data(), k, right.data(), k, output.data(), m, threads);
+        else
+            dgemm_nn_tiled(m, n, k, left.data(), m, right.data(), k, output.data(), m, threads);
+        return;
+    }
     if (transpose) {
         (void)dgemm_tn_partitioned_columns(m, n, k, left.data(), k, right.data(), k,
                                           output.data(), m, threads);
@@ -183,11 +191,14 @@ static void prediction_covariance_block(
     const int n = prediction_dim(genotype.shape(0));
     const int b = prediction_dim(genotype.shape(1));
     const int q = prediction_dim(phi.shape(1));
-    const int models = prediction_dim(priors.shape(0));
+    const int models = prediction_dim(output.shape(1));
+    const bool variant_dependent = priors.shape(0) != static_cast<size_t>(models);
     const int columns = prediction_dim(checked_mul(static_cast<size_t>(q), models, "prediction RHS"));
     if (phi.shape(0) != static_cast<size_t>(n) || packed.shape(0) != static_cast<size_t>(n) ||
         packed.shape(1) != static_cast<size_t>(columns) ||
         priors.shape(1) != checked_mul(static_cast<size_t>(q), q, "prediction covariance") ||
+        (variant_dependent && priors.shape(0) != checked_mul(static_cast<size_t>(models), b,
+                                                          "prediction variant covariances")) ||
         output.shape(0) != static_cast<size_t>(n) || output.shape(1) != static_cast<size_t>(models) ||
         !(mass > 0.0) || !std::isfinite(mass))
         throw std::runtime_error("Prediction covariance block dimensions/mass disagree");
@@ -215,11 +226,12 @@ static void prediction_covariance_block(
 #endif
     for (int model = 0; model < models; ++model) {
         for (int j = 0; j < b; ++j) {
+            const size_t prior_row = variant_dependent ? static_cast<size_t>(j)*models+model : model;
             for (int r = 0; r < q; ++r) {
                 double value = 0.0;
                 for (int s = 0; s < q; ++s)
                     value += transposed[static_cast<size_t>(model*q+s)*b+j] *
-                        priors.data()[static_cast<size_t>(model)*q*q+s*q+r];
+                        priors.data()[prior_row*q*q+s*q+r];
                 mixed[static_cast<size_t>(model*q+r)*b+j] = value / mass;
             }
         }
@@ -240,8 +252,40 @@ static void prediction_covariance_block(
     }
 }
 
+#include "prediction_mixture.inc"
+#include "prediction_residual.inc"
+
 static void bind_prediction(nb::module_& module) {
     module.attr("prediction_execution_version") = 2;
+    module.attr("prediction_mixture_version") = 2;
+    module.attr("prediction_residual_version") = 1;
+    module.def("prediction_interaction_design", &prediction_interaction_design,
+        nb::arg("genotype").noconvert(), nb::arg("phi").noconvert(),
+        nb::arg("out").noconvert(), nb::arg("threads"));
+    nb::class_<PredictionMixtureResidual>(module,"PredictionMixtureResidual")
+        .def(nb::init<nb_vec1_ro<double>,nb_mat2f_ro<double>,int,int>(),
+             nb::arg("yw").noconvert(),nb::arg("basis").noconvert(),nb::arg("models"),nb::arg("threads"))
+        .def("score",&PredictionMixtureResidual::score,nb::arg("w").noconvert(),
+             nb::arg("projection").noconvert(),nb::arg("out").noconvert())
+        .def("update",&PredictionMixtureResidual::update,nb::arg("w").noconvert(),
+             nb::arg("delta").noconvert(),nb::arg("projection").noconvert())
+        .def("begin_reconstruction",&PredictionMixtureResidual::begin_reconstruction)
+        .def("add_prediction",&PredictionMixtureResidual::add_prediction,
+             nb::arg("w").noconvert(),nb::arg("beta").noconvert())
+        .def("finish_reconstruction",&PredictionMixtureResidual::finish_reconstruction)
+        .def("copy_residual",&PredictionMixtureResidual::copy_residual,nb::arg("out").noconvert())
+        .def("copy_prediction",&PredictionMixtureResidual::copy_prediction,nb::arg("out").noconvert())
+        .def("copy_phenotype",&PredictionMixtureResidual::copy_phenotype,nb::arg("out").noconvert())
+        .def("restore",&PredictionMixtureResidual::restore,nb::arg("value").noconvert());
+    module.def("prediction_hardcall_scale", &prediction_hardcall_scale,
+        nb::arg("raw").noconvert(), nb::arg("mean").noconvert(),
+        nb::arg("inverse_scale").noconvert(), nb::arg("ddof"), nb::arg("threads"));
+    module.def("prediction_mixture_block", &prediction_mixture_block,
+        nb::arg("gram").noconvert(), nb::arg("score").noconvert(),
+        nb::arg("posterior_covariance").noconvert(), nb::arg("log_normalizer").noconvert(),
+        nb::arg("weights").noconvert(), nb::arg("penalty").noconvert(),
+        nb::arg("metrics").noconvert(), nb::arg("q"), nb::arg("sweeps"),
+        nb::arg("tolerance"), nb::arg("independent"), nb::arg("threads"));
     nb::class_<PredictionWorkspace>(module, "PredictionWorkspace").def(nb::init<>());
     module.def("prediction_standardize", &prediction_standardize<int8_t>,
         nb::arg("raw").noconvert(), nb::arg("rows").noconvert(), nb::arg("columns").noconvert(),
@@ -259,7 +303,8 @@ static void bind_prediction(nb::module_& module) {
         .def("close", &PredictionBEDReader::close)
         .def("info", &PredictionBEDReader::info);
     module.def("prediction_product", &prediction_product, nb::arg("left").noconvert(),
-        nb::arg("right").noconvert(), nb::arg("out").noconvert(), nb::arg("transpose"), nb::arg("threads"));
+        nb::arg("right").noconvert(), nb::arg("out").noconvert(), nb::arg("transpose"), nb::arg("threads"),
+        nb::arg("deterministic") = false);
     module.def("prediction_covariance_block", &prediction_covariance_block,
         nb::arg("genotype").noconvert(), nb::arg("packed").noconvert(), nb::arg("priors").noconvert(),
         nb::arg("phi").noconvert(), nb::arg("out").noconvert(), nb::arg("mass"), nb::arg("threads"),

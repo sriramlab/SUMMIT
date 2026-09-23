@@ -146,7 +146,15 @@ def score_prediction(models, source, inputs, *, block_size=512, rhs_columns=64, 
         m.check()
         f = inputs[m.trait_id]
         genetic[m.key] = np.einsum("nq,nq->n", components[m.key], f.phi)
-        predictions[m.key] = genetic[m.key] + f.fixed @ m.fixed_coefficients
+        if native is not None and f.fixed.shape[1]:
+            fixed_prediction = np.empty((len(f.rows), 1), order="F")
+            native.prediction_product(np.asfortranarray(f.fixed),
+                np.asfortranarray(m.fixed_coefficients[:, None]),
+                fixed_prediction, False, threads)
+            fixed_prediction = fixed_prediction[:, 0]
+        else:
+            fixed_prediction = f.fixed @ m.fixed_coefficients
+        predictions[m.key] = genetic[m.key] + fixed_prediction
         if not np.all(np.isfinite(predictions[m.key])):
             raise FloatingPointError("nonfinite scoring output")
     source.check()

@@ -1,0 +1,49 @@
+trait,label,environment,estimate,standard_error
+height,Height,Smoking,-0.000695819,0.0020677
+bmi,BMI,Smoking,0.00553608,0.0017355
+whr,Waist-to-hip ratio,Smoking,-0.00100153,0.00188621
+bp_systolic,Systolic blood pressure,Smoking,0.000190503,0.00194799
+bp_diastolic,Diastolic blood pressure,Smoking,-1.61048e-05,0.00191588
+hdl,HDL cholesterol,Smoking,-0.00319225,0.00224871
+ldl,LDL cholesterol,Smoking,-0.0015375,0.00244169
+triglycerides,Triglycerides,Smoking,-0.0015537,0.00208997
+hba1c,HbA1c,Smoking,0.00157874,0.0023618
+creatinine,Creatinine,Smoking,0.000108481,0.00247123
+cystatin_c,Cystatin C,Smoking,0.00690059,0.00364338
+testosterone,Testosterone,Smoking,0.00314717,0.00219313
+height,Height,Sex,0.00789253,0.00182071
+bmi,BMI,Sex,0.010765,0.00201526
+whr,Waist-to-hip ratio,Sex,0.0372835,0.00355718
+bp_systolic,Systolic blood pressure,Sex,0.00940128,0.00181568
+bp_diastolic,Diastolic blood pressure,Sex,0.00943582,0.00207548
+hdl,HDL cholesterol,Sex,0.0172453,0.00266214
+ldl,LDL cholesterol,Sex,0.016673,0.00359117
+triglycerides,Triglycerides,Sex,0.0123802,0.00225496
+hba1c,HbA1c,Sex,0.00496804,0.00178734
+creatinine,Creatinine,Sex,0.0190051,0.00232171
+cystatin_c,Cystatin C,Sex,0.00704333,0.00201687
+testosterone,Testosterone,Sex,0.119098,0.0121934
+height,Height,Age,0.00207307,0.00169903
+bmi,BMI,Age,0.00732685,0.00181131
+whr,Waist-to-hip ratio,Age,0.0029259,0.00159942
+bp_systolic,Systolic blood pressure,Age,0.00893605,0.00180257
+bp_diastolic,Diastolic blood pressure,Age,0.0198766,0.00205878
+hdl,HDL cholesterol,Age,0.00161303,0.00218008
+ldl,LDL cholesterol,Age,0.0251809,0.00339466
+triglycerides,Triglycerides,Age,0.00841021,0.00229564
+hba1c,HbA1c,Age,0.00653563,0.00207016
+creatinine,Creatinine,Age,0.00541402,0.00208344
+cystatin_c,Cystatin C,Age,0.0095975,0.00191898
+testosterone,Testosterone,Age,0.00487989,0.00171119
+height,Height,Statin use,0.00229111,0.00200744
+bmi,BMI,Statin use,0.00701058,0.00179937
+whr,Waist-to-hip ratio,Statin use,0.00373176,0.00169984
+bp_systolic,Systolic blood pressure,Statin use,0.00685114,0.00196138
+bp_diastolic,Diastolic blood pressure,Statin use,0.00825812,0.00230897
+hdl,HDL cholesterol,Statin use,0.00435053,0.00248562
+ldl,LDL cholesterol,Statin use,0.0178176,0.00385533
+triglycerides,Triglycerides,Statin use,0.00662472,0.00247235
+hba1c,HbA1c,Statin use,0.0204292,0.0026929
+creatinine,Creatinine,Statin use,0.00157671,0.00238591
+cystatin_c,Cystatin C,Statin use,0.00535969,0.00227011
+testosterone,Testosterone,Statin use,0.00136668,0.00206794

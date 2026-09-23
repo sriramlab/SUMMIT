@@ -85,19 +85,7 @@ on another, then reverses the roles. Its two-fold variation is descriptive,
 and it does not provide calibrated post-selection inference. Construction of
 these contractions uses dense arrays and is intended for small experiments.
 
-## Examples and limits
-
-The synthetic validation scripts also serve as executable API examples:
-
-```bash
-python scripts/context/validate_context_fit.py --output-dir results/context-fit
-python scripts/context/validate_multienvironment.py --output-dir results/multienv
-python scripts/context/validate_context_annotations.py --output-dir results/annotations
-```
-
-These scripts may require plotting dependencies. Optional real-trait runs need
-explicit local input paths. They write aggregate diagnostics; participant
-inputs must remain in protected storage.
+## Limits
 
 Dense routines can allocate feature and kernel matrices that are too large for
 cohort-scale use. Native memory plans are estimates and should be checked

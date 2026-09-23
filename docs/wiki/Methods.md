@@ -60,7 +60,7 @@ and U an orthonormal basis for the fixed-effect design. Projection is
 Generalized contextual features use
 
 ```math
-F_q = P\,\operatorname{diag}(\phi_q)G.
+F_q = P\,\mathrm{diag}(\phi_q)G.
 ```
 
 Every context uses the same genotype scale. Multiplication by context occurs
@@ -159,7 +159,7 @@ Fixed-effect coefficients are recovered from `y-Vu` in the retained fixed-effect
 Posterior SNP weights are
 
 ```math
-B=G^T\operatorname{diag}(u)\Phi\Lambda/M.
+B=G^T\mathrm{diag}(u)\Phi\Lambda/M.
 ```
 
 The algorithm requires neither an inverse of Lambda nor an N-by-N matrix.

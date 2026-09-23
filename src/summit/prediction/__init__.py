@@ -6,12 +6,18 @@ Imports stay light so CLI thread placement can precede numerical imports.
 from importlib import import_module
 
 _EXPORTS = {
+    "fit_mixture_prediction": "mixture", "MixtureSpec": "mixture", "MixtureSolverSpec": "mixture",
+    "plan_mixture_prediction": "mixture",
+    "SeparateSparsitySpec": "mixture",
+    "shrink_orthogonal_covariance": "mixture",
     "fit_prediction": "api", "plan_prediction": "batch",
     "load_prediction_models": "artifacts", "load_genotype_scale": "artifacts",
     "write_genotype_scale": "artifacts", "PredictionModel": "artifacts",
     "score_prediction": "score", "ScoreInput": "score",
     "FileGenotypeSource": "genotype", "ArrayGenotypeSource": "genotype", "estimate_scale": "genotype",
     "ShardedGenotypeSource": "genotype",
+    "AnnotationDesign": "annotations", "AnnotationPrior": "annotations",
+    "write_annotation_design": "annotations", "load_annotation_design": "annotations",
     "TraitTraining": "spec", "CandidatePrior": "spec", "GenotypeScale": "spec", "SolverSpec": "spec", "VariantAxis": "spec",
     "ResponseGeometry": "priors", "common_scale": "priors", "separate_scales": "priors",
     "select_and_calibrate": "selection", "CalibrationCandidate": "selection", "fit_calpred": "calibration",

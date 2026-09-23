@@ -2,6 +2,7 @@
 
 The measurements below describe specific tested workloads. Runtime depends on
 panel size, annotations, context dimension, storage, and CPU configuration.
+For estimated genetic variance in UK Biobank, see [Real-data results](Real-data-results.md).
 
 ## PGS synthetic benchmark
 
@@ -29,39 +30,6 @@ python scripts/prediction/checkout.py benchmark --mode standardized --threads 1
 
 Cached modes read the source once during setup. Streaming reads it on every
 operator call. Repeated outputs were identical in the recorded runs.
-
-## Numerical checks
-
-The initial PGS tests cover dense heteroskedastic GLS comparisons, singular and
-zero priors, trait-specific sample/SNP subsets, allele swaps, fractional dosages,
-artifact reload, invalid inputs, and convergence failure. A synthetic six-model
-fit reached a maximum relative true residual of `7.64e-11` with `rtol=1e-10` and
-scored 24 held-out samples in one traversal.
-
-The combined prediction and relevant context/genotype regression run passed
-107 tests, with six other CLI/end-to-end tests excluded from that selection.
-The prediction-only suite passed 24 tests. Reproduction commands are in
-[Development](Development.md).
-
-## Generalized G×E simulation results
-
-The recorded 100-replicate simulation used approximately 10,000 samples,
-454,207 variants, three context columns, and the complete six-component residual
-context basis. Phenotypes were simulated on a fixed genotype panel.
-
-At 1,024 random vectors, the three null off-diagonal components had empirical
-standard deviations 0.0415, 0.0438, and 0.0471. Mean reported jackknife standard
-errors were 0.0379, 0.0378, and 0.0451, with rejection counts 8, 9, and 4 out of
-100 at nominal 5%. These figures show some standard-error underestimation;
-100 replicates also leave substantial Monte Carlo uncertainty.
-
-At 128 vectors, two components showed appreciable point-estimate shifts and
-rejection counts of 13 and 16 out of 100. Probe-count sensitivity should be
-checked for the model being fitted.
-
-In a nonzero cross-response simulation, the mean generating coefficient was
-0.18051. At 1,024 vectors its mean estimate was 0.17491, with 94 of 100 replicates
-rejecting zero. These are results for that simulation, not general power claims.
 
 ## Batch h² timing
 
