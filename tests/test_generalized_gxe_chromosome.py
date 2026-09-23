@@ -34,7 +34,10 @@ def test_interval_fused_statistics_and_joint_profile(tmp_path, q, k, backend):
 
     # The native runtime freezes its process-wide thread contract at first use.
     # Reuse it when this test follows another native test in the full suite.
-    threads = max(1, int(gxeldcore.configured_blas_threads()))
+    build = gxeldcore.build_info()
+    threads = (int(build['blas_runtime_threads'])
+        if build.get('blas_runtime_environment_immutable', False)
+        else max(1, int(gxeldcore.configured_blas_threads())))
     prefix, genotype, phi, fixed, annotations, _, probe = _fixture(
         tmp_path, q_count=q, annotation_count=k, seed=1413)
     rng = np.random.default_rng(17)
