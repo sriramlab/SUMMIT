@@ -89,12 +89,17 @@ def main():
             offset=panel.get('physical_start',0);reader.read_range(begin+offset,end+offset,raw[:width],allele_idx=1)
             x=raw[:width].astype(float);missing=x==-9;x-=mean[begin:end,None];x*=inverse[begin:end,None];x[missing]=0
             decode=time.monotonic()-tick;baseline=np.nan
+            tile_annotations=annotations[begin:end];tile_groups=groups[begin:end]
+            if a.common_only:
+                active=np.any(tile_annotations>0,axis=1)
+                x=x[active];tile_annotations=tile_annotations[active];tile_groups=tile_groups[active]
             if a.mode=='benchmark':
                 tick=time.monotonic()
                 for _ in masked.block(x):pass
                 baseline=time.monotonic()-tick
             score_before=batch.scores.seconds;residual_before=batch.residual_seconds;tick=time.monotonic()
-            for _ in batch.block(x,annotations[begin:end],groups[begin:end]):pass
+            if len(x):
+                for _ in batch.block(x,tile_annotations,tile_groups):pass
             total=time.monotonic()-tick;visits+=width
             row=dict(begin=begin,end=end,decode_seconds=decode,within_seconds=baseline,cross_total_seconds=total,
                 score_seconds=batch.scores.seconds-score_before,residual_seconds=batch.residual_seconds-residual_before)
