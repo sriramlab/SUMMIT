@@ -6,6 +6,7 @@ default to build/private_blis; SUMMIT_PRIVATE_NATIVE_DIR can select a staged
 build. Usage: python private_python.py module.name [module arguments ...]
 """
 import ctypes
+import importlib.util
 import os
 from pathlib import Path
 import runpy
@@ -20,7 +21,16 @@ sys.meta_path[:]=[f for f in sys.meta_path if type(f).__module__!='_gwldcore_edi
 sys.path[:0]=[str(root/'src'),str(root/'scripts/generalized_gxe')]
 import summit
 assert Path(summit.__file__).resolve()==root/'src/summit/__init__.py'
-summit.__path__.insert(0,os.environ.get('SUMMIT_PRIVATE_NATIVE_DIR',str(root/'build/private_blis')))
+native=Path(os.environ.get('SUMMIT_PRIVATE_NATIVE_DIR',str(root/'build/private_blis')))
+# Load only extensions from the qualified runtime. A runtime directory may
+# also contain old Python modules, which must never shadow this checkout.
+for leaf in ('gxeldcore','gwldcore','winldcore'):
+    candidates=list(native.glob(leaf+'*.so'))
+    if len(candidates)!=1:
+        raise RuntimeError(f'exactly one {leaf} extension required in {native}')
+    spec=importlib.util.spec_from_file_location('summit.'+leaf,candidates[0])
+    extension=importlib.util.module_from_spec(spec);sys.modules[spec.name]=extension
+    spec.loader.exec_module(extension)
 from summit import gxeldcore
 import workflow
 workflow._PRE_NUMERICAL_CPU_AFFINITY=cpus
