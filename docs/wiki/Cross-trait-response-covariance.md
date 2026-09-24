@@ -293,6 +293,7 @@ These results do not by themselves establish all acceptance criteria.
 | Private-BLIS optional pooled-cache and study publication checks at 5fc39bf | 20 passed |
 | Private-BLIS parallel cache and study publication checks at 04515d0 | 23 passed |
 | Standalone chr22 Z, local versus Hoffman | Block products agree to 3.29e-16 relative; Hoffman traversal 651.87 s, one pass |
+| Reference probe tiling, N=50,112, M=1,024, B=1,024 | Tile 4 versus 128: 33.11 versus 13.70 s; Gram difference 1.65e-16 relative; same-person matrix bit-identical |
 
 Real-mask Gram relative Frobenius errors at N=20,000:
 
@@ -321,6 +322,14 @@ slower; it does not establish an absolute throughput improvement. All timing
 configurations and CPU budgets are retained in the run report. Streaming
 fixed bases and releasing unused overlaps reduced peak RSS from approximately
 11.8 million to 5.9 million KiB.
+
+The simulation reference CLI exposes `--probe-tile-width` (default four).
+This controls the existing native pass-2 product grouping, with no change to
+the probe identities, count or two-pass estimator. The Hoffman simulation
+launcher uses the qualified width 128. The bounded real-panel comparison
+tested widths 4, 16, 64 and 128 at unchanged B=1,024; portable and private
+native tests also compare their reference arrays. It is a tiling throughput
+check, not evidence that the large simulation has completed or met coverage.
 
 The first full-chromosome fused pilot traversed all 99,273 SNPs in 78.3
 accounted minutes but failed artifact publication: an unmeasured timing was
