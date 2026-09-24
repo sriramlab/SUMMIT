@@ -104,6 +104,12 @@ def test_authenticated_pilot_all_modes_end_to_end(tmp_path):
     assert result['omega_xy'].shape==(1,q,q)
     assert result['loo_h_xy'].shape==(len(labels),1,q-1,q-1)
     assert meta['genotype_traversals']==0
+    path=path.with_name('cross_trait_pilot_report.py')
+    spec=importlib.util.spec_from_file_location('pilot_report',path)
+    reporting=importlib.util.module_from_spec(spec);spec.loader.exec_module(reporting)
+    report_output=tmp_path/'report';report_output.mkdir();reporting.report(output,report_output)
+    report_manifest=json.loads((report_output/'COMPLETE.json').read_text())
+    assert report_manifest['pairs']==28 and report_manifest['age_bmi_entries']==112
     # The ordinary fitter consumes the same authenticated block products,
     # independently of the context normal equations and without genotypes.
     path=path.with_name('cross_trait_bivariate.py')

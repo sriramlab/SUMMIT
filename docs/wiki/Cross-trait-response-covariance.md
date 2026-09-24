@@ -209,6 +209,13 @@ python scripts/generalized_gxe/cross_trait_refit.py --base "$BASE" \
 
 python scripts/generalized_gxe/cross_trait_pilot_fit.py --base "$BASE" \
   --study-root "$NEW/pilot_study" --z-root "$NEW" --output "$NEW/pilot_fits"
+
+python scripts/generalized_gxe/cross_trait_pilot_report.py \
+  --fits "$NEW/pilot_fits" --output "$NEW/pilot_report"
+
+python scripts/generalized_gxe/cross_trait_bivariate.py --base "$BASE" \
+  --study-root "$NEW/pilot_study" --pilot-fits "$NEW/pilot_fits" \
+  --output "$NEW/baseline_regression"
 ```
 
 Production guarded native runs use the qualified placement launcher
@@ -239,7 +246,7 @@ These results do not by themselves establish all acceptance criteria.
 
 | Check | Observed result |
 |---|---|
-| Portable suite at commit 22e61a9 | 1,463 passed; 6 skipped; 1 xpassed |
+| Portable suite at commit f00fa16 | 1,465 passed; 6 skipped; 1 xpassed |
 | Legacy within-trait full/deletion regression | Bit-identical |
 | Dense oracle, N=2,000, M=3,000, Q=3, about 60% overlap, fixed ranks 5 and 4 | Genetic Gram relative error 2.37e-15; coefficient error 3.29e-14 |
 | Dense real chr22 reference, N=20,000, 41,275 common SNPs | Z repair relative error 2.26e-15 |
@@ -251,6 +258,7 @@ These results do not by themselves establish all acceptance criteria.
 | Block same-person apportionment, chr22 | Maximum relative LD-scalar error 0.000151906 (passes 0.001) |
 | Hoffman placement qualification 14886620 | 20 tests passed; eight physical cores; NumPy and native worker affinities verified |
 | Private-BLIS prediction and cross-trait checks at b271d90 | 95 passed |
+| Private-BLIS batched residual checks at f00fa16 | 19 passed |
 | Standalone chr22 Z, local versus Hoffman | Block products agree to 3.29e-16 relative; Hoffman traversal 651.87 s, one pass |
 
 Real-mask Gram relative Frobenius errors at N=20,000:
