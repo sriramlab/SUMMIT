@@ -275,7 +275,7 @@ These results do not by themselves establish all acceptance criteria.
 
 | Check | Observed result |
 |---|---|
-| Portable suite including study checkpoint/resume | 1,475 passed; 6 skipped; 1 xpassed |
+| Portable suite including checkpoint/resume and pair-sum reuse | 1,477 passed; 6 skipped; 1 xpassed |
 | Checkpoint/resume through separate OS processes | Score and Z arrays bit-identical to uninterrupted traversal; changed tile width rejected; both BLAS configurations pass |
 | Legacy within-trait full/deletion regression | Bit-identical |
 | Dense oracle, N=2,000, M=3,000, Q=3, about 60% overlap, fixed ranks 5 and 4 | Genetic Gram relative error 2.37e-15; coefficient error 3.23e-14 |
@@ -290,6 +290,7 @@ These results do not by themselves establish all acceptance criteria.
 | Eight-core 42-trait timing, 256 pooled groups, minimum 16 rows, addition penalty eight | 14.574 versus 10.275 s per block; 41.84% increment; RSS 5,844,816 KiB |
 | Same pooled cache, products built on eight reserved residual workers | 14.391 versus 10.459 s per block; 37.59% increment; RSS 6,182,660 KiB (fails 30% target) |
 | Eight-core pooled cache, ceiling 512, minimum eight rows (331 eligible groups) | 15.459 versus 11.218 s per block; 37.80% increment; RSS 6,280,056 KiB |
+| Eight-core pooled cache with 64 reused pair sums, 31 measured tiles on CPUs88–95 | 13.821 versus 10.635 s per block; 29.956% total increment; RSS 6,187,152 KiB; narrowly meets target |
 | Longer 42-trait check, 31 measured tiles on CPUs96–103 | 27.477 versus 18.465 s per block; 48.81% increment; RSS 6,167,092 KiB; most memory allocated across sockets |
 | 42 traits, 16 BLAS threads and 16 residual workers | 24.730 versus 22.100 s per block; 11.90% increment, but slower in absolute time than eight cores |
 | 42 traits, eight BLAS threads and 16 residual workers on 16 reserved CPUs | 18.187 versus 13.363 s per block; 36.10% increment |
@@ -301,6 +302,7 @@ These results do not by themselves establish all acceptance criteria.
 | Private-BLIS complete study publication, Z and batch checks at fe7bf6a | 20 passed |
 | Private-BLIS optional pooled-cache and study publication checks at 5fc39bf | 20 passed |
 | Private-BLIS parallel cache and study publication checks at 04515d0 | 23 passed |
+| Reused pair-sum cache and study publication at 22f655c | 26 portable and 26 private-BLIS checks passed |
 | Standalone chr22 Z, local versus Hoffman | Block products agree to 3.29e-16 relative; Hoffman traversal 651.87 s, one pass |
 | Completed fused chr22 study/Z, eight traits | 99,273 SNPs in one traversal; 776 guarded TN calls, zero repairs; 3,792.20 accounted s; RSS 6,174,252 KiB |
 | Fused versus standalone chr22 Z | Block products agree to 7.91e-15 relative; global products to 7.85e-15 |
@@ -340,15 +342,18 @@ traversal for all 100 replicates. The small complete BED pipeline is tested.
 The original August simulation reference is obsolete under current
 same-person validation, so the large benchmark constructs a new guarded
 reference instead of bypassing that check. Large-simulation coverage and pilot results
-remain pending in this version of the page. Complete eight-core 42-trait
-performance remains above the 30% target. The 16-thread configuration has a
+remain pending in this version of the page. The complete eight-core 42-trait
+pass with 64 reused pair sums adds
+29.956% in 31 measured tiles, narrowly below the 30% target. This small
+margin does not establish a robust bound across hosts or load conditions.
+The 16-thread configuration has a
 smaller percentage increment because its within-only pass is substantially
 slower; it does not establish an absolute throughput improvement. All timing
-configurations and CPU budgets are retained in the run report (20 completed
+configurations and CPU budgets are retained in the run report (21 completed
 arms). The longer run's local NUMA nodes had little free memory; observed
 remote allocation is a possible contributor, not an isolated causal result.
-Streaming
-fixed bases and releasing unused overlaps reduced peak RSS from approximately
+Streaming fixed bases and releasing unused overlaps reduced peak RSS from
+approximately
 11.8 million to 5.9 million KiB.
 
 The simulation reference CLI exposes `--probe-tile-width` (default four).
