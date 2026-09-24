@@ -25,14 +25,15 @@ def test_all_pairs_batched_scores_and_requested_order():
 
 @pytest.mark.parametrize('disjoint',[False,True])
 @pytest.mark.parametrize('workers',[1,2])
-def test_cross_projected_residual_moments_dense(disjoint,workers):
+@pytest.mark.parametrize('rank_y',[0,3,5])
+def test_cross_projected_residual_moments_dense(disjoint,workers,rank_y):
     rng=np.random.default_rng(411);n,m,q,c=67,31,3,5
     phi=np.c_[np.ones(n),rng.normal(size=(n,q-1))]
     fixed=np.linalg.qr(np.c_[phi,rng.normal(size=(n,c-q))])[0]
     residual=np.c_[phi,phi[:,1:]**2,phi[:,1]*phi[:,2]]
     gen=rng.normal(size=(n,m));a=rng.uniform(size=(m,2));groups=np.arange(m)//11
     rows=(np.arange(29),np.arange(29,n)) if disjoint else (np.arange(53),np.arange(13,n))
-    traits=[dict(name=str(i),indices=idx,fixed_basis=np.linalg.qr(fixed[idx])[0],
+    traits=[dict(name=str(i),indices=idx,fixed_basis=np.linalg.qr(fixed[idx,:c if i==0 else rank_y])[0],
                  phenotype=rng.normal(size=len(idx))) for i,idx in enumerate(rows)]
     masked=MaskedTraitBatch(basis=phi,fixed_basis=fixed,residual_basis=residual,traits=traits)
     cpus=sorted(getattr(sys.modules.get('workflow'),'_PRE_NUMERICAL_CPU_AFFINITY',os.sched_getaffinity(0)))

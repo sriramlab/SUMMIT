@@ -30,7 +30,8 @@ def main():
     nx=int(n/1.4);offset=n-nx;rows=(np.arange(nx),np.arange(offset,n))
     g=rng.normal(size=(n,m));traits=[]
     for i,idx in enumerate(rows):
-        u=np.linalg.qr(fixed[idx])[0]@np.linalg.qr(rng.normal(size=(5,5)))[0]
+        rank=5-i
+        u=np.linalg.qr(fixed[idx,:rank])[0]@np.linalg.qr(rng.normal(size=(rank,rank)))[0]
         traits.append(dict(name=str(i),indices=idx,fixed_basis=u,phenotype=rng.normal(size=len(idx))))
     oracle=dense_cross_trait_moments(g,phi,rows_x=rows[0],rows_y=rows[1],fixed_x=traits[0]['fixed_basis'],
         fixed_y=traits[1]['fixed_basis'],phenotype_x=traits[0]['phenotype'],phenotype_y=traits[1]['phenotype'],residual_basis=d)
@@ -68,6 +69,7 @@ def main():
     errors['coefficients']=float(np.linalg.norm(actual-exact)/np.linalg.norm(exact))
     assert errors['coefficients']<1e-9
     result=dict(n=n,m=m,q=q,n_x=nx,n_y=nx,n_overlap=len(overlap),seed=args.seed,
+        fixed_ranks=[t['fixed_basis'].shape[1] for t in traits],
         relative_errors=errors,seconds=time.monotonic()-start,peak_rss_kib=resource.getrusage(resource.RUSAGE_SELF).ru_maxrss,
         cpus=sorted(os.sched_getaffinity(0)),script_sha256=file_sha256(__file__),passed=True)
     with args.output.open('x') as f:json.dump(result,f,indent=2)

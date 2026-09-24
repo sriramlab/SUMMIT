@@ -110,7 +110,7 @@ class CrossTraitBatch:
             use_missing=len(joint_missing)<len(overlap)
             self.geometry.append(dict(overlap=overlap,correction=joint_missing if use_missing else overlap,
                 inclusion_exclusion=use_missing,nested=nested,
-                cross_gemm=np.ascontiguousarray(cross.transpose(1,0,2)).reshape(masked.fixed_rank,-1)))
+                cross_gemm=np.ascontiguousarray(cross.transpose(1,0,2)).reshape(x['fixed_rank'],h*y['fixed_rank'])))
         self._ordered_lookup=np.empty((q,q),dtype=int)
         for i,(a,b) in enumerate(masked.pairs):
             self._ordered_lookup[a,b]=self._ordered_lookup[b,a]=i
@@ -194,8 +194,10 @@ class CrossTraitBatch:
             value-=np.einsum('jqc,jhrc->jqrh',master_projection[ix],linear[:,1:],optimize=True)
             # An unconstrained einsum path makes a width*Q²*C² outer product.
             # Explicit GEMMs contract C first, using width*Q*H*C workspace.
-            projected=(zx.reshape(-1,m.fixed_rank)@geom['cross_gemm']).reshape(len(x),q*h,m.fixed_rank)
-            value+=(projected@zy.transpose(0,2,1)).reshape(len(x),q,h,q).transpose(0,1,3,2)
+            cx,cy=zx.shape[-1],zy.shape[-1]
+            if cx and cy:
+                projected=(zx.reshape(len(x)*q,cx)@geom['cross_gemm']).reshape(len(x),q*h,cy)
+                value+=(projected@zy.transpose(0,2,1)).reshape(len(x),q,h,q).transpose(0,1,3,2)
             value=value.reshape(len(x),q*q,h)
             phases['projection']+=perf_counter()-tick;tick=perf_counter()
             for label in np.unique(g):

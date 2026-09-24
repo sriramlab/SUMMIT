@@ -61,22 +61,23 @@ class MaskedTraitBatch:
                 raise ValueError('trait names and sample indices must be unique and valid')
             names.add(name)
             fixed = _finite_matrix('trait fixed_basis', spec['fixed_basis'])
-            if fixed.shape != (len(idx), self.fixed_rank):
+            rank=fixed.shape[1]
+            if fixed.shape[0] != len(idx) or rank>self.fixed_rank:
                 raise ValueError('trait covariate rank or sample axis differs')
             master = u[idx]
             transform = np.linalg.solve(master.T @ master, master.T @ fixed)
             if not np.allclose(master @ transform, fixed, rtol=1e-10, atol=1e-11):
                 raise ValueError('trait fixed basis is outside the shared covariate span')
-            if not np.allclose(fixed.T @ fixed, np.eye(self.fixed_rank), rtol=0, atol=1e-10):
+            if not np.allclose(fixed.T @ fixed, np.eye(rank), rtol=0, atol=1e-10):
                 raise ValueError('trait fixed basis must be orthonormal')
             y = np.asarray(spec['phenotype'], dtype=float).reshape(-1, 1)
             if y.shape != (len(idx), 1) or not np.isfinite(y).all():
                 raise ValueError('each trait must contain one phenotype')
             y = y-fixed @ (fixed.T @ y)
             ss = float(np.sum(y*y))
-            if ss <= np.finfo(float).eps*len(idx) or len(idx) <= self.fixed_rank:
+            if ss <= np.finfo(float).eps*len(idx) or len(idx) <= rank:
                 raise ValueError('trait has zero residual variance or no residual degrees of freedom')
-            y *= np.sqrt((len(idx)-self.fixed_rank)/ss)
+            y *= np.sqrt((len(idx)-rank)/ss)
             absent = np.ones(n, dtype=bool)
             absent[idx] = False
             missing = np.flatnonzero(absent)
@@ -93,7 +94,7 @@ class MaskedTraitBatch:
             ds = d[idx]
             leverage = np.sum(fixed*fixed, axis=1)
             common = SimpleNamespace(normalized_phenotypes=y,
-                residual_rank=len(idx)-self.fixed_rank, residual_rhs=ds.T @ (y*y),
+                residual_rank=len(idx)-rank, residual_rhs=ds.T @ (y*y),
                 residual_traces=ds.sum(axis=0)-np.trace(compressed_residual, axis1=1, axis2=2),
                 residual_gram=ds.T @ (ds*(1-2*leverage)[:, None])
                     + np.einsum('hij,kji->hk', compressed_residual, compressed_residual))
@@ -101,7 +102,7 @@ class MaskedTraitBatch:
             weights[idx] = phi[idx]*y
             score_weights.append(weights)
             self.traits.append(dict(name=name, indices=idx.copy(), common=common,
-                transform=transform, compressed_residual=compressed_residual,
+                transform=transform, fixed_rank=rank,compressed_residual=compressed_residual,
                 master_residual=corrected,
                 correction=correction, subtract=subtract))
         if not self.traits:
