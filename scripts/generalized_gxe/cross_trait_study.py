@@ -43,8 +43,11 @@ def main():
     p.add_argument('--variants',type=int,default=256);p.add_argument('--traits',type=int,choices=[6,8,42],default=8)
     p.add_argument('--threads',type=int,default=8);p.add_argument('--common-only',action='store_true')
     p.add_argument('--z-output',type=Path,help='collect guarded reference Z moments in this same traversal')
-    a=p.parse_args();a.output.mkdir(exist_ok=False);start=time.monotonic()
+    p.add_argument('--max-cached-missing-patterns',type=int,default=64)
+    a=p.parse_args()
     if a.z_output is not None and a.mode!='study':p.error('Z publication requires a complete study chromosome')
+    if a.max_cached_missing_patterns<0:p.error('missing-pattern cache limit must be nonnegative')
+    a.output.mkdir(exist_ok=False);start=time.monotonic()
     source_hashes={str(path.relative_to(ROOT)):file_sha256(path) for path in (
         Path(__file__),ROOT/'src/summit/ldscore/generalized_gxe_masked_batch.py',
         ROOT/'src/summit/ldscore/generalized_gxe_cross_trait_batch.py')}
@@ -82,7 +85,8 @@ def main():
     with threadpool_limits(limits=1):
         residual,residual_names,_=workflow.rank_reduced_symmetric_context_residual_basis(phi,tuple(basis_names.astype(str)))
         masked=MaskedTraitBatch(basis=phi,fixed_basis=fixed,residual_basis=residual,traits=traits)
-        batch=CrossTraitBatch(masked,block_ids=np.unique(groups[:limit]),annotation_names=annotation_names)
+        batch=CrossTraitBatch(masked,block_ids=np.unique(groups[:limit]),annotation_names=annotation_names,
+            max_cached_missing_patterns=a.max_cached_missing_patterns)
     z_accumulator=None;shared_tn=None;z_telemetry=[]
     if a.z_output is not None:
         if a.z_output.exists():raise FileExistsError(a.z_output)
@@ -131,6 +135,7 @@ def main():
         reference_files=record['files'],reference_manifest_sha256=file_sha256(refroot/'MANIFEST.json'),
         source_sha256=source_hashes,variant_visits=visits,genotype_traversals=1,
         genotype_scale='sealed_affine_mean_imputed',common_only=a.common_only,threads=a.threads,cpus=CPUS,
+        max_cached_missing_patterns=a.max_cached_missing_patterns,
         timings=timings,seconds=time.monotonic()-start,traversal_seconds=time.monotonic()-traversal,
         peak_rss_kib=resource.getrusage(resource.RUSAGE_SELF).ru_maxrss,
         residual_basis_sha256=array_sha256(residual),residual_names=list(residual_names))
