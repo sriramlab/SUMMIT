@@ -237,6 +237,9 @@ disjoint groups. A group serves a pair only if every member misses both
 traits; uncached rows are still contracted exactly. Its
 `--cache-addition-penalty-rows` controls a mask-only cost model, not a
 statistical approximation. Defaults retain the individual-pattern cache.
+`--parallel-cache-products` optionally uses the same reserved worker pool
+for independent cached products, with one BLAS thread per worker. Every task
+is joined before the process-wide BLAS limit is restored.
 
 `cross_trait_bivariate.py` compares both context-model baseline centerings
 with the existing ordinary SUMMIT HE fitter. It profiles baseline reference
@@ -255,7 +258,7 @@ These results do not by themselves establish all acceptance criteria.
 
 | Check | Observed result |
 |---|---|
-| Portable suite at commit 5fc39bf | 1,471 passed; 6 skipped; 1 xpassed |
+| Portable suite at commit 04515d0 | 1,474 passed; 6 skipped; 1 xpassed |
 | Legacy within-trait full/deletion regression | Bit-identical |
 | Dense oracle, N=2,000, M=3,000, Q=3, about 60% overlap, fixed ranks 5 and 4 | Genetic Gram relative error 2.37e-15; coefficient error 3.23e-14 |
 | Dense real chr22 reference, N=20,000, 41,275 common SNPs | Z repair relative error 2.26e-15 |
@@ -263,7 +266,8 @@ These results do not by themselves establish all acceptance criteria.
 | 42 traits × six within-trait arms, full-genome same-person diagonals, no genotype pass | 252 fits completed and authenticated; 142 entries above one SE across 11 traits; maximum 7.52 SE |
 | Six-trait chr22 timing after streamed inputs, five measured tiles | 2.578 versus 2.229 s per 128-SNP block; 15.67% total increment; RSS 5,696,408 KiB |
 | Eight-core 42-trait timing, 256 individual-pattern groups with minimum 16 rows, five measured tiles | 15.092 versus 10.516 s per 128-SNP block; 43.51% increment; RSS 5,943,260 KiB |
-| Fastest completed eight-core 42-trait timing, 256 pooled groups, minimum 16 rows, addition penalty eight | 14.574 versus 10.275 s per block; 41.84% increment; RSS 5,844,816 KiB (fails 30% target) |
+| Eight-core 42-trait timing, 256 pooled groups, minimum 16 rows, addition penalty eight | 14.574 versus 10.275 s per block; 41.84% increment; RSS 5,844,816 KiB |
+| Same pooled cache, products built on eight reserved residual workers | 14.391 versus 10.459 s per block; 37.59% increment; RSS 6,182,660 KiB (fails 30% target) |
 | 42 traits, 16 BLAS threads and 16 residual workers | 24.730 versus 22.100 s per block; 11.90% increment, but slower in absolute time than eight cores |
 | 42 traits, eight BLAS threads and 16 residual workers on 16 reserved CPUs | 18.187 versus 13.363 s per block; 36.10% increment |
 | 42-trait score accumulation alone, individual-pattern cache | 0.0192% of within-trait time; exact overlap residual work dominates |
@@ -273,6 +277,7 @@ These results do not by themselves establish all acceptance criteria.
 | Private-BLIS batched residual checks at f00fa16 | 19 passed |
 | Private-BLIS complete study publication, Z and batch checks at fe7bf6a | 20 passed |
 | Private-BLIS optional pooled-cache and study publication checks at 5fc39bf | 20 passed |
+| Private-BLIS parallel cache and study publication checks at 04515d0 | 23 passed |
 | Standalone chr22 Z, local versus Hoffman | Block products agree to 3.29e-16 relative; Hoffman traversal 651.87 s, one pass |
 
 Real-mask Gram relative Frobenius errors at N=20,000:
