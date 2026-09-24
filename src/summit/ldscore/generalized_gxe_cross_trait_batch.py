@@ -69,8 +69,10 @@ class CrossTraitBatch:
     """
 
     def __init__(self, masked, *, block_ids, annotation_names, pairs=None,max_cached_missing_patterns=64,
-                 residual_workers=1,residual_cpus=None):
+                 minimum_cached_pattern_rows=64,residual_workers=1,residual_cpus=None):
         self.masked=masked;self.annotation_names=tuple(annotation_names)
+        if int(minimum_cached_pattern_rows)!=minimum_cached_pattern_rows or minimum_cached_pattern_rows<1:
+            raise ValueError('cached missing patterns require a positive minimum row count')
         self.residual_workers=int(residual_workers)
         self.residual_cpus=tuple(sorted(os.sched_getaffinity(0) if residual_cpus is None else residual_cpus))
         if (self.residual_workers<1 or self.residual_workers>len(self.residual_cpus)
@@ -119,8 +121,8 @@ class CrossTraitBatch:
         for i,(a,b) in enumerate(masked.pairs):
             self._ordered_lookup[a,b]=self._ordered_lookup[b,a]=i
         # People with the same missing-trait bit pattern contribute identical
-        # raw overlap corrections to many pairs. Cache at most 64 disjoint
-        # groups per tile; each person's genotype is still decoded only once.
+        # raw overlap corrections to many pairs. Cache a bounded number of
+        # disjoint groups per tile; each genotype is decoded only once.
         # Small/private patterns remain in the exact per-pair correction.
         self.missing_pattern_rows=[]
         if len(masked.traits)<=64 and max_cached_missing_patterns>0:
@@ -133,7 +135,7 @@ class CrossTraitBatch:
             for ix,iy in self.scores.pairs:
                 flag=(np.uint64(1)<<np.uint64(ix))|(np.uint64(1)<<np.uint64(iy))
                 support+=(patterns&flag)==flag
-            eligible=np.flatnonzero((counts>=64)&(support>1))
+            eligible=np.flatnonzero((counts>=minimum_cached_pattern_rows)&(support>1))
             eligible=eligible[np.argsort((counts*support)[eligible])[::-1][:max_cached_missing_patterns]]
             selected=patterns[eligible]
             self.missing_pattern_rows=[np.flatnonzero(bits==pattern) for pattern in selected]

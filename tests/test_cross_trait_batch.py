@@ -72,18 +72,20 @@ def test_cross_projected_residual_moments_dense(disjoint,workers,rank_y):
         batch.genetic_residual[:,1].reshape(3,2,q,q,-1).swapaxes(2,3),atol=1e-10)
 
 
-def test_shared_missing_pattern_cache_preserves_exact_residual_moments():
+@pytest.mark.parametrize('minimum_rows',[16,64])
+def test_shared_missing_pattern_cache_preserves_exact_residual_moments(minimum_rows):
     rng=np.random.default_rng(889);n,m,q=321,29,3
     phi=np.c_[np.ones(n),rng.normal(size=(n,2))];u=np.linalg.qr(phi)[0]
     traits=[]
     for t in range(4):
-        idx=np.setdiff1d(np.arange(100,n),np.arange(100+10*t,110+10*t))
+        missing=np.r_[np.arange(100+10*t,110+10*t),np.arange(200,220) if t<3 else np.array([],int)]
+        idx=np.setdiff1d(np.arange(100,n),missing)
         traits.append(dict(name=str(t),indices=idx,fixed_basis=np.linalg.qr(u[idx])[0],phenotype=rng.normal(size=len(idx))))
     masked=MaskedTraitBatch(basis=phi,fixed_basis=u,residual_basis=phi,traits=traits)
     args=dict(block_ids=np.arange(3),annotation_names=('all',))
     uncached=CrossTraitBatch(masked,**args,max_cached_missing_patterns=0)
-    cached=CrossTraitBatch(masked,**args)
-    assert len(cached.missing_pattern_rows)==1 and len(cached.missing_pattern_rows[0])==100
+    cached=CrossTraitBatch(masked,**args,minimum_cached_pattern_rows=minimum_rows)
+    assert sorted(map(len,cached.missing_pattern_rows))==([20,100] if minimum_rows==16 else [100])
     g=rng.normal(size=(m,n));a=np.ones((m,1));groups=np.arange(m)//10
     list(uncached.block(g,a,groups));list(cached.block(g,a,groups))
     np.testing.assert_allclose(cached.genetic_residual,uncached.genetic_residual,rtol=1e-12,atol=1e-10)
