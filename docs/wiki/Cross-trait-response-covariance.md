@@ -276,6 +276,7 @@ These results do not by themselves establish all acceptance criteria.
 | Legacy within-trait full/deletion regression | Bit-identical |
 | Dense oracle, N=2,000, M=3,000, Q=3, about 60% overlap, fixed ranks 5 and 4 | Genetic Gram relative error 2.37e-15; coefficient error 3.23e-14 |
 | Dense real chr22 reference, N=20,000, 41,275 common SNPs | Z repair relative error 2.26e-15 |
+| Dense real chr22 reference, N=40,000, same 41,275 common SNPs | Z repair and production assembly errors 1.60e-15; 4,604.46 accounted seconds; RSS 28,357,036 KiB |
 | Q=1 baseline regression against bivariate SUMMIT | Agreement at 1e-12 on the same dense panel |
 | 42 traits × six within-trait arms, full-genome same-person diagonals, no genotype pass | 252 fits completed and authenticated; 142 entries above one SE across 11 traits; maximum 7.52 SE |
 | Six-trait chr22 timing after streamed inputs, five measured tiles | 2.578 versus 2.229 s per 128-SNP block; 15.67% total increment; RSS 5,696,408 KiB |
@@ -307,14 +308,28 @@ Factorized transport improves the selected FEV1 mask, but does not outperform
 legacy in Frobenius error for LDL alone. This result is retained, not filtered
 out. The exact orientation repair cannot correct population-selection error.
 
+At N=40,000, factorization improves all three selected comparisons:
+
+| Mask pair | Factorized | Plus residual | Legacy | Z-repaired legacy |
+|---|---:|---:|---:|---:|
+| FEV1–FEV1 | 0.003414 | 0.003230 | 0.044525 | 0.044516 |
+| LDL–LDL | 0.002704 | 0.001028 | 0.003831 | 0.003824 |
+| FEV1–LDL | 0.003051 | 0.002332 | 0.029719 | 0.029712 |
+
+The corresponding factorized coefficient errors are 0.003335, 0.002122 and
+0.002844, compared with legacy errors 0.029885, 0.004954 and 0.037015.
+The run report includes every signed Gram-entry error at both sample sizes
+(7,500 entries each), audited against the saved dense matrices and summary
+norms without another genotype pass. The N=20,000 LDL result remains a
+counterexample to a universal improvement claim.
+
 The reproducible simulation driver specifies nonsymmetric cross effects,
 nonzero H, a positive-baseline/zero-H scenario after cohort centering, and
 heteroskedastic correlated residuals. Generation and scoring each use one
 traversal for all 100 replicates. The small complete BED pipeline is tested.
 The original August simulation reference is obsolete under current
 same-person validation, so the large benchmark constructs a new guarded
-reference instead of bypassing that check. Large-simulation coverage,
-40,000-person validation and pilot results
+reference instead of bypassing that check. Large-simulation coverage and pilot results
 remain pending in this version of the page. Complete eight-core 42-trait
 performance remains above the 30% target. The 16-thread configuration has a
 smaller percentage increment because its within-only pass is substantially
