@@ -552,3 +552,71 @@ seconds at commit 65105dd; subsequent changes are documentation only.
 Every milestone push was retried but GitHub returned HTTP 403. Local SHAs
 and exact commands are recorded in the report. No remote SHA or Actions
 conclusion is claimed for these unpublished commits.
+
+## Calibration investigation, 24 September 2026
+
+The branch was subsequently pushed successfully using the conda `summit`
+GitHub credential helper. Remote commit `8207302f66fc485eba785303fa1202bf2e672dd7`
+passed [SUMMIT core tests](https://github.com/sriramlab/SUMMIT/actions/runs/36068248273).
+The earlier HTTP403 statements above describe the original publication attempts.
+
+The saved 100-replicate simulations identify two effects in the aggregate
+orthogonal-response correlation. First, restored deletion coefficients have a
+systematic center shift under the inherited frozen same-person convention.
+For uniform target blocks with fraction f, let A be the full genetic Gram after
+profiling the residual span and D the frozen same-person Gram. The current
+single-chromosome, single-annotation equations imply
+
+```
+restored_theta_delete = solve(A - f*D, A @ theta_full)
+```
+
+This is an exact algebraic identity for uniform sufficient statistics, not a
+claim that real blocks are uniform. A regression test verifies it independently.
+Using the actual simulation geometry predicts the observed mean coefficient
+shift with relative errors 5.70e-5 (XX), 5.08e-5 (YY) and 2.15e-4 (XY).
+The shared-response scenario's mean orthogonal variances change from
+0.07317/0.08499 at the full fit to 0.09050/0.10419 at the deletion center.
+Differentiating the ratio at these inflated denominators compresses its SE.
+
+Second, the nonlinear ratio has greater sampling dispersion than its
+linearization at the generating truth. The nonlinear/linearized SD ratios are
+1.1845 and 1.1035 in the shared-response and zero-H scenarios. By comparison,
+RMS jackknife SE divided by the empirical SD of that *same linearized*
+estimator is 1.0493 and 1.0428. Thus the observed ratio problem is not evidence
+of a uniformly underestimated covariance matrix for the primitive coefficients.
+
+`scripts/generalized_gxe/cross_trait_calibration_diagnostics.py` authenticates
+saved fits and compares the original intervals, recentered deletion
+coefficients, and a full-fit delta method retaining the joint XX/YY/XY
+covariance. It also reports a truth-linearized diagnostic. No genotypes are
+read, fits changed, or invalid replicates discarded from coverage denominators.
+For the default Gram mode:
+
+| Scenario | Original RMS SE / SD | Original coverage | Full-fit delta RMS SE / SD | Delta coverage |
+|---|---:|---:|---:|---:|
+| Shared response | 0.808 | 90/100 | 1.127 | 98/100 |
+| Zero H, positive baseline covariance | 0.838 | 92/100 | 1.084 | 98/100 |
+
+These are diagnostic comparisons on the existing replicates, not independent
+validation of a replacement interval. The delta method still overshoots in
+RMS and can fail near nonpositive response variances. A defensible next step
+is to qualify a full-estimate influence/delta calculation and an estimating-
+equation-consistent deletion convention on new seeds and multiple sample sizes,
+with test inversion or validated parametric bootstrap for weak denominators.
+Retain the legacy convention explicitly. Do not apply a universal SE multiplier,
+clip correlations, or silently omit invalid draws. Reference/probe uncertainty
+and transport bias require separate assessment; these simulations condition on
+one genotype/exposure/reference realization.
+
+A narrower pilot diagnostic applies the delta method to the saved paired
+trace covariance C, variances Vx/Vy and baseline rg at their full-fit values.
+It changes aggregate SEs by -0.6% to +2.0% across 28 pairs. It does not recompute
+the H Jacobian from primitive within-trait coefficients, and therefore is not
+a complete validation of full-cohort uncertainty. The LDL–DBP contrast changes
+from 0.4338 [0.2252,0.6424] to 0.4338 [0.2253,0.6423].
+
+The reproducible investigation and biological comparison are in
+`cross_trait_20260923/calibration_20260924/REPORT.md`, with commands, source
+hashes, all-entry simulation tables and the 28-pair pilot diagnostic. Original
+fit files and intervals remain unchanged.

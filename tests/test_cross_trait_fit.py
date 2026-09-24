@@ -91,6 +91,33 @@ def test_annotation_restoration_matches_existing_study_collector():
     np.testing.assert_array_equal(restored[:,len(components):],raw[:,len(components):])
 
 
+@pytest.mark.parametrize('nblocks',[4,200])
+def test_uniform_deletion_exposes_frozen_diagonal_center_drift(nblocks):
+    # Eliminate random block heterogeneity. The inherited frozen-source
+    # convention still shifts restored coefficients, which matters when a
+    # nonlinear derived quantity is differentiated around the deletion mean.
+    rng=np.random.default_rng(604);q=2;p=q*q;mass=1000.;fraction=1/nblocks
+    b=rng.normal(size=(p,2));rr=np.eye(2)
+    a=np.diag([3.,4.,5.,6.]);d=np.diag([.5,.6,.7,.8])
+    genetic=a+b@b.T;theta=rng.normal(size=p);psi=rng.normal(size=2)
+    rhs=genetic@theta+b@psi;rrhs=b.T@theta+psi
+    record=dict(block_ids=np.arange(nblocks),block_masses=np.full((nblocks,1),mass/nblocks),
+        block_rhs=np.broadcast_to((rhs*mass/nblocks).reshape(1,1,q,q),(nblocks,1,q,q)),
+        block_genetic_residual=np.broadcast_to((b*mass/nblocks)[None,None],(nblocks,1,p,2)),
+        gram=ChromosomeGram(np.broadcast_to((genetic-d)/nblocks,(nblocks,p,p)),d,{}))
+    plan=CrossTraitMomentPlan([record],residual_gram=rr,residual_rhs=rrhs,
+        num_basis=q,annotation_names=('all',))
+    full=solve_cross_trait_normal_equations(plan.equations()).coefficients[:p]
+    eq=plan.equations((0,));matrix=eq.equations.matrix
+    profile=matrix[:p,:p]-matrix[:p,p:]@np.linalg.solve(matrix[p:,p:],matrix[p:,:p])
+    actual=solve_cross_trait_normal_equations(eq).coefficients[:p]/(1-fraction)
+    expected=np.linalg.solve(a-fraction*d,a@theta)
+    np.testing.assert_allclose(full,theta,atol=1e-13)
+    np.testing.assert_allclose(profile,(a-fraction*d)/(1-fraction),atol=1e-13)
+    np.testing.assert_allclose(actual,expected,atol=1e-13)
+    assert np.linalg.norm(actual-full)>1e-5
+
+
 def test_orthogonal_correlation_requires_positive_centered_baseline_variances():
     xx=np.array([[-1.,.1],[.1,1.]])
     yy=np.array([[1.,.2],[.2,1.]])
