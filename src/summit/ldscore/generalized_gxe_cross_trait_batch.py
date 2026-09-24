@@ -8,6 +8,11 @@ cost is recorded separately and must not be hidden in the score benchmark.
 from __future__ import annotations
 
 from time import perf_counter
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import nullcontext
+from itertools import count
+import os
+from threadpoolctl import threadpool_limits
 import numpy as np
 
 from summit.context.cross_trait_zpass import write_array_artifact
@@ -63,8 +68,15 @@ class CrossTraitBatch:
     Both zero overlap and partially overlapping fixed bases are supported.
     """
 
-    def __init__(self, masked, *, block_ids, annotation_names, pairs=None,max_cached_missing_patterns=64):
+    def __init__(self, masked, *, block_ids, annotation_names, pairs=None,max_cached_missing_patterns=64,
+                 residual_workers=1,residual_cpus=None):
         self.masked=masked;self.annotation_names=tuple(annotation_names)
+        self.residual_workers=int(residual_workers)
+        self.residual_cpus=tuple(sorted(os.sched_getaffinity(0) if residual_cpus is None else residual_cpus))
+        if (self.residual_workers<1 or self.residual_workers>len(self.residual_cpus)
+                or len(set(self.residual_cpus))!=len(self.residual_cpus)):
+            raise ValueError('residual workers require distinct reserved CPU IDs')
+        self._executor=None;self.residual_worker_affinity={}
         self.scores=CrossTraitScoreAccumulator(trait_names=[t['name'] for t in masked.traits],
             num_basis=masked.q,num_annotations=len(annotation_names),block_ids=block_ids,pairs=pairs)
         self.geometry=[];self.residual_seconds=0.
@@ -153,34 +165,29 @@ class CrossTraitBatch:
         # multipliers. This is algebraically identical and avoids Q*H copies
         # of the C by C transform for every pair and SNP.
         master_projection={i:z@m.traits[i]['transform'].T for i,z in projections.items()}
-        cache={}
-        for pair_index,(ix,iy) in enumerate(self.scores.pairs):
+        def pair_work(pair_index):
+            ix,iy=self.scores.pairs[pair_index]
+            phases={name:0. for name in self.residual_phase_seconds}
             tick=perf_counter()
             geom=self.geometry[pair_index];rows=geom['correction']
-            key=(int(ix),int(iy))
-            # Identical masks share their raw moments in this tile. Retain
-            # only the most recent mask to bound storage independently of T².
-            if key not in cache:
-                if geom['nested'] is not None:
-                    linear,square=raw_traits[geom['nested']]
-                elif len(rows):
-                    linear=x[:,rows]@m.fixed_weights[rows]
-                    square=squared[:,rows]@m.square_weights[rows]
-                else:
-                    linear=np.zeros_like(common_linear);square=np.zeros_like(common_square)
-                for pattern in geom.get('cached_patterns',()):
-                    linear+=pattern_products[pattern][0];square+=pattern_products[pattern][1]
-                if geom['nested'] is None and geom['inclusion_exclusion']:
-                    linear=raw_traits[ix][0]+raw_traits[iy][0]-common_linear+linear
-                    square=raw_traits[ix][1]+raw_traits[iy][1]-common_square+square
-                self.residual_phase_seconds['raw_products']+=perf_counter()-tick;tick=perf_counter()
-                linear=np.einsum('jrc,rs->jsc',linear.reshape(len(x),m.multiplier_rank,m.fixed_rank),
-                                 m.fixed_coefficients,optimize=True).reshape(len(x),h+1,q,m.fixed_rank)
-                raw=(square@m.square_coefficients).reshape(len(x),h+1,p)
-                cache={key:(linear,raw)}
-                self.residual_phase_seconds['span_expansion']+=perf_counter()-tick
+            if geom['nested'] is not None:
+                linear,square=raw_traits[geom['nested']]
+            elif len(rows):
+                linear=x[:,rows]@m.fixed_weights[rows]
+                square=squared[:,rows]@m.square_weights[rows]
+            else:
+                linear=np.zeros_like(common_linear);square=np.zeros_like(common_square)
+            for pattern in geom.get('cached_patterns',()):
+                linear+=pattern_products[pattern][0];square+=pattern_products[pattern][1]
+            if geom['nested'] is None and geom['inclusion_exclusion']:
+                linear=raw_traits[ix][0]+raw_traits[iy][0]-common_linear+linear
+                square=raw_traits[ix][1]+raw_traits[iy][1]-common_square+square
+            phases['raw_products']+=perf_counter()-tick;tick=perf_counter()
+            linear=np.einsum('jrc,rs->jsc',linear.reshape(len(x),m.multiplier_rank,m.fixed_rank),
+                             m.fixed_coefficients,optimize=True).reshape(len(x),h+1,q,m.fixed_rank)
+            raw=(square@m.square_coefficients).reshape(len(x),h+1,p)
+            phases['span_expansion']+=perf_counter()-tick
             tick=perf_counter()
-            linear,raw=cache[key]
             zx,zy=projections[ix],projections[iy]
             value=raw[:,1:,self._ordered_lookup].transpose(0,2,3,1).copy()
             value-=np.einsum('jhqc,jrc->jqrh',linear[:,1:],master_projection[iy],optimize=True)
@@ -190,12 +197,45 @@ class CrossTraitBatch:
             projected=(zx.reshape(-1,m.fixed_rank)@geom['cross_gemm']).reshape(len(x),q*h,m.fixed_rank)
             value+=(projected@zy.transpose(0,2,1)).reshape(len(x),q,h,q).transpose(0,1,3,2)
             value=value.reshape(len(x),q*q,h)
-            self.residual_phase_seconds['projection']+=perf_counter()-tick;tick=perf_counter()
+            phases['projection']+=perf_counter()-tick;tick=perf_counter()
             for label in np.unique(g):
                 take=g==label;b=np.searchsorted(self.scores.block_ids,label)
                 self.genetic_residual[b,pair_index]+=np.einsum('jk,jph->kph',a[take],value[take],optimize=True)
-            self.residual_phase_seconds['reduction']+=perf_counter()-tick
+            phases['reduction']+=perf_counter()-tick
+            return phases
+        if self.residual_workers>1 and self._executor is None:
+            next_cpu=count()
+            def initialize_worker():
+                cpu=self.residual_cpus[next(next_cpu)]
+                os.sched_setaffinity(0,{cpu})
+                if os.sched_getaffinity(0)!={cpu}:raise RuntimeError('residual worker affinity differs')
+                self.residual_worker_affinity[cpu]=[cpu]
+            self._executor=ThreadPoolExecutor(max_workers=self.residual_workers,
+                initializer=initialize_worker,thread_name_prefix='summit-cross-residual')
+        # Only this independent residual section runs concurrently. NumPy's
+        # process-wide BLAS limit is restored before another shared/native call.
+        limit=threadpool_limits(limits=1,user_api='blas') if self._executor else nullcontext()
+        with limit:
+            try:
+                results=(self._executor.map(pair_work,range(len(self.geometry))) if self._executor
+                         else map(pair_work,range(len(self.geometry))))
+                for phases in results:
+                    for name,value in phases.items():self.residual_phase_seconds[name]+=value
+            except BaseException:
+                # Join workers before restoring a process-wide BLAS limit.
+                self.close()
+                raise
         self.residual_seconds+=perf_counter()-start
+
+    def close(self):
+        if self._executor is not None:
+            self._executor.shutdown(wait=True,cancel_futures=True);self._executor=None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self,*exc):
+        self.close()
 
     def write(self,path,*,provenance):
         write_array_artifact(path,kind='summit.cross_trait.summary',arrays=dict(

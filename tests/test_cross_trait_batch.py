@@ -1,3 +1,5 @@
+import os
+import sys
 import numpy as np
 import pytest
 
@@ -22,7 +24,8 @@ def test_all_pairs_batched_scores_and_requested_order():
 
 
 @pytest.mark.parametrize('disjoint',[False,True])
-def test_cross_projected_residual_moments_dense(disjoint):
+@pytest.mark.parametrize('workers',[1,2])
+def test_cross_projected_residual_moments_dense(disjoint,workers):
     rng=np.random.default_rng(411);n,m,q,c=67,31,3,5
     phi=np.c_[np.ones(n),rng.normal(size=(n,q-1))]
     fixed=np.linalg.qr(np.c_[phi,rng.normal(size=(n,c-q))])[0]
@@ -32,9 +35,17 @@ def test_cross_projected_residual_moments_dense(disjoint):
     traits=[dict(name=str(i),indices=idx,fixed_basis=np.linalg.qr(fixed[idx])[0],
                  phenotype=rng.normal(size=len(idx))) for i,idx in enumerate(rows)]
     masked=MaskedTraitBatch(basis=phi,fixed_basis=fixed,residual_basis=residual,traits=traits)
-    batch=CrossTraitBatch(masked,block_ids=np.unique(groups),annotation_names=('a','b'),pairs=[(0,1),(1,0)])
-    for start in range(0,m,7):
-        list(batch.block(gen[:,start:start+7].T,a[start:start+7],groups[start:start+7]))
+    cpus=sorted(getattr(sys.modules.get('workflow'),'_PRE_NUMERICAL_CPU_AFFINITY',os.sched_getaffinity(0)))
+    if len(cpus)<workers:pytest.skip('not enough reserved CPUs for concurrent residual qualification')
+    batch=CrossTraitBatch(masked,block_ids=np.unique(groups),annotation_names=('a','b'),pairs=[(0,1),(1,0)],
+        residual_workers=workers,residual_cpus=cpus)
+    with batch:
+        for start in range(0,m,7):
+            list(batch.block(gen[:,start:start+7].T,a[start:start+7],groups[start:start+7]))
+    if workers>1:
+        assert batch.residual_worker_affinity
+        for cpu,affinity in batch.residual_worker_affinity.items():
+            assert affinity==[cpu] and cpu in cpus[:workers]
     features=[];projectors=[]
     for trait in traits:
         idx=trait['indices'];u=trait['fixed_basis'];p=np.eye(len(idx))-u@u.T

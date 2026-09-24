@@ -44,6 +44,8 @@ def main():
     p.add_argument('--threads',type=int,default=8);p.add_argument('--common-only',action='store_true')
     p.add_argument('--z-output',type=Path,help='collect guarded reference Z moments in this same traversal')
     p.add_argument('--max-cached-missing-patterns',type=int,default=64)
+    p.add_argument('--residual-workers',type=int,default=1,
+        help='independent residual-pair workers, one BLAS thread each on reserved CPUs')
     a=p.parse_args()
     if a.z_output is not None and a.mode!='study':p.error('Z publication requires a complete study chromosome')
     if a.max_cached_missing_patterns<0:p.error('missing-pattern cache limit must be nonnegative')
@@ -86,7 +88,8 @@ def main():
         residual,residual_names,_=workflow.rank_reduced_symmetric_context_residual_basis(phi,tuple(basis_names.astype(str)))
         masked=MaskedTraitBatch(basis=phi,fixed_basis=fixed,residual_basis=residual,traits=traits)
         batch=CrossTraitBatch(masked,block_ids=np.unique(groups[:limit]),annotation_names=annotation_names,
-            max_cached_missing_patterns=a.max_cached_missing_patterns)
+            max_cached_missing_patterns=a.max_cached_missing_patterns,
+            residual_workers=a.residual_workers,residual_cpus=CPUS)
     z_accumulator=None;shared_tn=None;z_telemetry=[]
     if a.z_output is not None:
         if a.z_output.exists():raise FileExistsError(a.z_output)
@@ -103,7 +106,7 @@ def main():
                           cpus=CPUS,blas=threadpool_info())),flush=True)
     raw_n=sum(1 for _ in open(prefix+'.fam'));raw=np.empty((a.width,len(rows)),dtype=np.int8)
     timings=[];traversal=time.monotonic();visits=0
-    with threadpool_limits(limits=a.threads),pgenlib.PgenReader(os.fsencode(prefix+'.bed'),raw_sample_ct=raw_n,
+    with batch,threadpool_limits(limits=a.threads),pgenlib.PgenReader(os.fsencode(prefix+'.bed'),raw_sample_ct=raw_n,
             variant_ct=panel.get('bed_variant_count',m),sample_subset=rows.astype(np.uint32)) as reader:
         for begin in range(0,limit,a.width):
             end=min(begin+a.width,limit);width=end-begin;tick=time.monotonic()
@@ -136,6 +139,8 @@ def main():
         source_sha256=source_hashes,variant_visits=visits,genotype_traversals=1,
         genotype_scale='sealed_affine_mean_imputed',common_only=a.common_only,threads=a.threads,cpus=CPUS,
         max_cached_missing_patterns=a.max_cached_missing_patterns,
+        residual_workers=a.residual_workers,residual_worker_affinity=batch.residual_worker_affinity,
+        residual_phase_timing='sum of worker elapsed times; residual_seconds measures wall time',
         timings=timings,seconds=time.monotonic()-start,traversal_seconds=time.monotonic()-traversal,
         peak_rss_kib=resource.getrusage(resource.RUSAGE_SELF).ru_maxrss,
         residual_basis_sha256=array_sha256(residual),residual_names=list(residual_names))
