@@ -190,8 +190,12 @@ class CrossTraitBatch:
             tick=perf_counter()
             zx,zy=projections[ix],projections[iy]
             value=raw[:,1:,self._ordered_lookup].transpose(0,2,3,1).copy()
-            value-=np.einsum('jhqc,jrc->jqrh',linear[:,1:],master_projection[iy],optimize=True)
-            value-=np.einsum('jqc,jhrc->jqrh',master_projection[ix],linear[:,1:],optimize=True)
+            # The shared SNP batch axis prevents einsum from selecting an
+            # ordinary GEMM. Contract the fixed-effect axis explicitly with
+            # batched GEMMs, retaining only width*H*Q*C workspace.
+            linear_flat=np.ascontiguousarray(linear[:,1:]).reshape(len(x),h*q,m.fixed_rank)
+            value-=(linear_flat@master_projection[iy].transpose(0,2,1)).reshape(len(x),h,q,q).transpose(0,2,3,1)
+            value-=(master_projection[ix]@linear_flat.transpose(0,2,1)).reshape(len(x),q,h,q).transpose(0,1,3,2)
             # An unconstrained einsum path makes a width*Q²*C² outer product.
             # Explicit GEMMs contract C first, using width*Q*H*C workspace.
             cx,cy=zx.shape[-1],zy.shape[-1]
