@@ -66,12 +66,23 @@ case $mode in
     cross_trait_real_gram --base "$base" --bed-prefix /u/home/b/bronsonj/project-sriram/UKBB/imp/qc.v1/by_chr/imp.22 \
     --annotations "$base/imputed_maf3_design/annotations_chr22.npy" --output "$output_root/real_gram_n40000" --n 40000 --threads 8
   ;;
- pilot|pilot_with_z)
+ pilot|pilot_with_z|pilot_array)
   chromosome=${3:-${SGE_TASK_ID:?chromosome required}}
   [[ $chromosome =~ ^([1-9]|1[0-9]|2[0-2])$ ]]
+  if [[ $mode == pilot_array ]]; then
+   # A scheduler dependency is released after failure as well as success.
+   # COMPLETE is written only after both authenticated artifacts are closed.
+   # Require all three before doing any further genotype work.
+   [[ -s $output_root/pilot_study/chr22/COMPLETE.json \
+      && -s $output_root/pilot_study/chr22/cross_trait_summary.npz \
+      && -s $output_root/zpass_chr22.npz ]] || {
+    echo 'Fused chr22 qualification has no completed score/Z publication' >&2
+    exit 1
+   }
+  fi
   z_args=()
   mkdir -p "$output_root/pilot_study"
-  if [[ $mode == pilot_with_z ]]; then z_args=(--z-output "$output_root/zpass_chr$chromosome.npz"); fi
+  if [[ $mode != pilot ]]; then z_args=(--z-output "$output_root/zpass_chr$chromosome.npz"); fi
   if [[ $chromosome == 22 ]]; then
    "$python_exe" "$launch" --threads 8 -- "$python_exe" "$code_root/scripts/generalized_gxe/private_python.py" \
     pytest "$code_root/tests/test_cross_trait_zpass.py" "$code_root/tests/test_cross_trait_batch.py" \
