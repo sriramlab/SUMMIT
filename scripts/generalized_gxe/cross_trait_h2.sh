@@ -2,7 +2,7 @@
 # qsub supplies -wd, -o, -pe shared 8, -binding set linear:1, and complete resources.
 set -euo pipefail
 umask 077
-mode=${1:?qualify or zpass}
+mode=${1:?qualify, zpass, simulation_reference or simulation}
 output_root=${2:?exclusive output root required}
 # UGE executes a spooled copy of this script, so $0 is not the source path.
 # qsub -wd is the authenticated immutable checkout selected by the submitter.
@@ -35,6 +35,25 @@ case $mode in
     --bed-prefix "/u/home/b/bronsonj/project-sriram/UKBB/imp/qc.v1/by_chr/imp.$chromosome" \
     --annotations "$base/imputed_maf3_design/annotations_chr$chromosome.npy" \
     --output "$output_root/zpass_chr$chromosome.npz" --num-threads 8 --width 128
+  ;;
+ simulation_reference|simulation)
+  input_root=/u/project/jflint/bronsonj/cross_trait_20260923/simulation_inputs
+  common_args=(--axes "$input_root/axes.npz" --bed-prefix "$input_root/UKBB_EUR_50k_unrel_3rd.no_mhc_imp" --threads 8)
+  if [[ $mode == simulation_reference ]]; then
+   "$python_exe" "$launch" --threads 8 -- "$python_exe" "$code_root/scripts/generalized_gxe/private_python.py" \
+    pytest "$code_root/tests/test_cross_trait_simulation_truth.py" -q -p no:cacheprovider
+   exec "$python_exe" "$launch" --threads 8 -- "$python_exe" "$code_root/scripts/generalized_gxe/private_python.py" \
+    cross_trait_simulation reference "${common_args[@]}" --output "$output_root/simulation_reference" \
+    --probes 1024 --blocks 200 --memory-gib 24
+  fi
+  ref="$output_root/simulation_reference/reference.generalized-gxe-variant-ldscore-v1.npz"
+  [[ -f $output_root/simulation_reference/COMPLETE.json && -f $ref ]]
+  for phase in generate score fit; do
+   "$python_exe" "$launch" --threads 8 -- "$python_exe" "$code_root/scripts/generalized_gxe/private_python.py" \
+    cross_trait_simulation "$phase" "${common_args[@]}" --reference "$ref" \
+    --output "$output_root/simulation_$phase" --replicates 100 \
+    --generated "$output_root/simulation_generate/generated.npz" --scores "$output_root/simulation_score/scores.npz"
+  done
   ;;
  *) exit 2 ;;
 esac
