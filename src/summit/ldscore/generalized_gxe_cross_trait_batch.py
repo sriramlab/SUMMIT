@@ -63,11 +63,12 @@ class CrossTraitBatch:
     Both zero overlap and partially overlapping fixed bases are supported.
     """
 
-    def __init__(self, masked, *, block_ids, annotation_names, pairs=None):
+    def __init__(self, masked, *, block_ids, annotation_names, pairs=None,max_cached_missing_patterns=64):
         self.masked=masked;self.annotation_names=tuple(annotation_names)
         self.scores=CrossTraitScoreAccumulator(trait_names=[t['name'] for t in masked.traits],
             num_basis=masked.q,num_annotations=len(annotation_names),block_ids=block_ids,pairs=pairs)
         self.geometry=[];self.residual_seconds=0.
+        self.residual_phase_seconds={name:0. for name in ('patterns','raw_products','span_expansion','projection','reduction')}
         h=masked.h;q=masked.q
         self.genetic_residual=np.zeros((*self.scores.rhs.shape[:-2],q*q,h))
         self.residual_gram=np.zeros((len(self.scores.pairs),h,h))
@@ -101,6 +102,33 @@ class CrossTraitBatch:
         self._ordered_lookup=np.empty((q,q),dtype=int)
         for i,(a,b) in enumerate(masked.pairs):
             self._ordered_lookup[a,b]=self._ordered_lookup[b,a]=i
+        # People with the same missing-trait bit pattern contribute identical
+        # raw overlap corrections to many pairs. Cache at most 64 disjoint
+        # groups per tile; each person's genotype is still decoded only once.
+        # Small/private patterns remain in the exact per-pair correction.
+        self.missing_pattern_rows=[]
+        if len(masked.traits)<=64 and max_cached_missing_patterns>0:
+            bits=np.zeros(masked.n,dtype=np.uint64)
+            for t,trait in enumerate(masked.traits):
+                absent=np.ones(masked.n,dtype=bool);absent[trait['indices']]=False
+                bits[absent]|=np.uint64(1)<<np.uint64(t)
+            patterns,counts=np.unique(bits,return_counts=True)
+            support=np.zeros(len(patterns),dtype=np.int64)
+            for ix,iy in self.scores.pairs:
+                flag=(np.uint64(1)<<np.uint64(ix))|(np.uint64(1)<<np.uint64(iy))
+                support+=(patterns&flag)==flag
+            eligible=np.flatnonzero((counts>=64)&(support>1))
+            eligible=eligible[np.argsort((counts*support)[eligible])[::-1][:max_cached_missing_patterns]]
+            selected=patterns[eligible]
+            self.missing_pattern_rows=[np.flatnonzero(bits==pattern) for pattern in selected]
+            for geom,(ix,iy) in zip(self.geometry,self.scores.pairs):
+                geom['cached_patterns']=np.array([],dtype=int)
+                if geom['nested'] is not None or not geom['inclusion_exclusion']:continue
+                flag=(np.uint64(1)<<np.uint64(ix))|(np.uint64(1)<<np.uint64(iy))
+                groups=np.flatnonzero((selected&flag)==flag);geom['cached_patterns']=groups
+                if len(groups):
+                    cached=np.sort(np.concatenate([self.missing_pattern_rows[j] for j in groups]))
+                    geom['correction']=np.setdiff1d(geom['correction'],cached,assume_unique=True)
 
     def block(self,genotype,annotations,groups,*,z_callback=None,shared_tn_operator=None):
         """Yield unchanged within-trait statistics; accumulate cross statistics."""
@@ -118,12 +146,16 @@ class CrossTraitBatch:
         # across every pair; no decoded genotype is revisited.
         common_linear,common_square=shared
         squared=x*x
+        pattern_products=[(x[:,rows]@m.fixed_weights[rows],squared[:,rows]@m.square_weights[rows])
+                          for rows in self.missing_pattern_rows]
+        self.residual_phase_seconds['patterns']+=perf_counter()-start
         # Contract the small trait transform before applying all residual
         # multipliers. This is algebraically identical and avoids Q*H copies
         # of the C by C transform for every pair and SNP.
         master_projection={i:z@m.traits[i]['transform'].T for i,z in projections.items()}
         cache={}
         for pair_index,(ix,iy) in enumerate(self.scores.pairs):
+            tick=perf_counter()
             geom=self.geometry[pair_index];rows=geom['correction']
             key=(int(ix),int(iy))
             # Identical masks share their raw moments in this tile. Retain
@@ -136,13 +168,18 @@ class CrossTraitBatch:
                     square=squared[:,rows]@m.square_weights[rows]
                 else:
                     linear=np.zeros_like(common_linear);square=np.zeros_like(common_square)
+                for pattern in geom.get('cached_patterns',()):
+                    linear+=pattern_products[pattern][0];square+=pattern_products[pattern][1]
                 if geom['nested'] is None and geom['inclusion_exclusion']:
                     linear=raw_traits[ix][0]+raw_traits[iy][0]-common_linear+linear
                     square=raw_traits[ix][1]+raw_traits[iy][1]-common_square+square
+                self.residual_phase_seconds['raw_products']+=perf_counter()-tick;tick=perf_counter()
                 linear=np.einsum('jrc,rs->jsc',linear.reshape(len(x),m.multiplier_rank,m.fixed_rank),
                                  m.fixed_coefficients,optimize=True).reshape(len(x),h+1,q,m.fixed_rank)
                 raw=(square@m.square_coefficients).reshape(len(x),h+1,p)
                 cache={key:(linear,raw)}
+                self.residual_phase_seconds['span_expansion']+=perf_counter()-tick
+            tick=perf_counter()
             linear,raw=cache[key]
             zx,zy=projections[ix],projections[iy]
             value=raw[:,1:,self._ordered_lookup].transpose(0,2,3,1).copy()
@@ -153,9 +190,11 @@ class CrossTraitBatch:
             projected=(zx.reshape(-1,m.fixed_rank)@geom['cross_gemm']).reshape(len(x),q*h,m.fixed_rank)
             value+=(projected@zy.transpose(0,2,1)).reshape(len(x),q,h,q).transpose(0,1,3,2)
             value=value.reshape(len(x),q*q,h)
+            self.residual_phase_seconds['projection']+=perf_counter()-tick;tick=perf_counter()
             for label in np.unique(g):
                 take=g==label;b=np.searchsorted(self.scores.block_ids,label)
                 self.genetic_residual[b,pair_index]+=np.einsum('jk,jph->kph',a[take],value[take],optimize=True)
+            self.residual_phase_seconds['reduction']+=perf_counter()-tick
         self.residual_seconds+=perf_counter()-start
 
     def write(self,path,*,provenance):

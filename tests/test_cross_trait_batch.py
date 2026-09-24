@@ -58,3 +58,21 @@ def test_cross_projected_residual_moments_dense(disjoint):
             np.testing.assert_allclose(batch.scores.rhs[b,0,k],rhs,atol=1e-10,rtol=1e-11)
     np.testing.assert_allclose(batch.genetic_residual[:,0].reshape(3,2,q,q,-1),
         batch.genetic_residual[:,1].reshape(3,2,q,q,-1).swapaxes(2,3),atol=1e-10)
+
+
+def test_shared_missing_pattern_cache_preserves_exact_residual_moments():
+    rng=np.random.default_rng(889);n,m,q=321,29,3
+    phi=np.c_[np.ones(n),rng.normal(size=(n,2))];u=np.linalg.qr(phi)[0]
+    traits=[]
+    for t in range(4):
+        idx=np.setdiff1d(np.arange(100,n),np.arange(100+10*t,110+10*t))
+        traits.append(dict(name=str(t),indices=idx,fixed_basis=np.linalg.qr(u[idx])[0],phenotype=rng.normal(size=len(idx))))
+    masked=MaskedTraitBatch(basis=phi,fixed_basis=u,residual_basis=phi,traits=traits)
+    args=dict(block_ids=np.arange(3),annotation_names=('all',))
+    uncached=CrossTraitBatch(masked,**args,max_cached_missing_patterns=0)
+    cached=CrossTraitBatch(masked,**args)
+    assert len(cached.missing_pattern_rows)==1 and len(cached.missing_pattern_rows[0])==100
+    g=rng.normal(size=(m,n));a=np.ones((m,1));groups=np.arange(m)//10
+    list(uncached.block(g,a,groups));list(cached.block(g,a,groups))
+    np.testing.assert_allclose(cached.genetic_residual,uncached.genetic_residual,rtol=1e-12,atol=1e-10)
+    np.testing.assert_array_equal(cached.scores.rhs,uncached.scores.rhs)

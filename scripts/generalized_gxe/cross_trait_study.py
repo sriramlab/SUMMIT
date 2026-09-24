@@ -93,6 +93,8 @@ def main():
         masked.fixed_weights=np.asfortranarray(masked.fixed_weights)
         shared_tn.begin_execution()
     print(json.dumps(dict(masked.report,phase='prepared',pairs=len(batch.scores.pairs),seconds=time.monotonic()-start,
+                          cached_missing_patterns=len(batch.missing_pattern_rows),
+                          cached_missing_people=sum(map(len,batch.missing_pattern_rows)),
                           cpus=CPUS,blas=threadpool_info())),flush=True)
     raw_n=sum(1 for _ in open(prefix+'.fam'));raw=np.empty((a.width,len(rows)),dtype=np.int8)
     timings=[];traversal=time.monotonic();visits=0
@@ -112,6 +114,7 @@ def main():
                 for _ in masked.block(x):pass
                 baseline=time.monotonic()-tick
             score_before=batch.scores.seconds;residual_before=batch.residual_seconds;tick=time.monotonic()
+            residual_phases_before=dict(batch.residual_phase_seconds)
             if len(x):
                 callback=(None if z_accumulator is None else
                     lambda z:z_accumulator.add(z,full_annotations[begin:end],groups[begin:end]))
@@ -119,7 +122,8 @@ def main():
                 if shared_tn is not None:z_telemetry.append(canonical_sha256(shared_tn.finish_execution()))
             total=time.monotonic()-tick;visits+=width
             row=dict(begin=begin,end=end,decode_seconds=decode,within_seconds=baseline,cross_total_seconds=total,
-                score_seconds=batch.scores.seconds-score_before,residual_seconds=batch.residual_seconds-residual_before)
+                score_seconds=batch.scores.seconds-score_before,residual_seconds=batch.residual_seconds-residual_before,
+                residual_phase_seconds={key:value-residual_phases_before[key] for key,value in batch.residual_phase_seconds.items()})
             timings.append(row)
             if a.mode=='benchmark' or len(timings)%32==0:print(json.dumps(row),flush=True)
     provenance=dict(chromosome=a.chromosome,traits=list(names),input_sha256=input_hashes,
