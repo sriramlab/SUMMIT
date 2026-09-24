@@ -278,6 +278,8 @@ These results do not by themselves establish all acceptance criteria.
 | Dense real chr22 reference, N=20,000, 41,275 common SNPs | Z repair relative error 2.26e-15 |
 | Dense real chr22 reference, N=40,000, same 41,275 common SNPs | Z repair and production assembly errors 1.60e-15; 4,604.46 accounted seconds; RSS 28,357,036 KiB |
 | Q=1 baseline regression against bivariate SUMMIT | Agreement at 1e-12 on the same dense panel |
+| Real chr22 downstream qualification, all eight traits | 112 pair/mode artifacts authenticate; rank 38 throughout; 28 contrasts and 112 age–BMI entries published |
+| Real chr22 ordinary-bivariate comparison | All 28 pairs and four modes within one SE for both baseline centerings; maximum 0.076 SE; only three deletion blocks |
 | 42 traits × six within-trait arms, full-genome same-person diagonals, no genotype pass | 252 fits completed and authenticated; 142 entries above one SE across 11 traits; maximum 7.52 SE |
 | Six-trait chr22 timing after streamed inputs, five measured tiles | 2.578 versus 2.229 s per 128-SNP block; 15.67% total increment; RSS 5,696,408 KiB |
 | Eight-core 42-trait timing, 256 individual-pattern groups with minimum 16 rows, five measured tiles | 15.092 versus 10.516 s per 128-SNP block; 43.51% increment; RSS 5,943,260 KiB |
@@ -369,6 +371,13 @@ measure a within-only comparator. After this qualification, chromosomes 1–21
 were submitted with the same code and binding, eight cores, 16 GiB per task,
 14 hours and no task-concurrency cap. Checkpointed partial tasks must resume
 before any full-genome fit is reported.
+
+The chr22-only downstream qualification also runs all four fitting modes,
+the paired report and the ordinary-bivariate comparison without genotypes.
+It uses deletion blocks 197–199 and is explicitly labeled as chromosome 22
+in its output paths and report scope. These artifacts verify the real input
+schema and numerical chain; they are not the requested full-genome,
+200-block pilot and do not establish genome-wide uncertainty calibration.
 
 The corrected refit table is `within_refits_full_diagonal/within_trait_mode_comparison.tsv`.
 The older `within_refits` run is preserved as provisional and must not supply
