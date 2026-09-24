@@ -49,6 +49,14 @@ def test_simulation_pipeline_small_bed(tmp_path):
     args.reference=Path(json.loads((args.output/'COMPLETE.json').read_text())['reference'])
     # The current reference is the authoritative floating-point affine scale.
     ref=module.load_generalized_gxe_variant_reference_v1(args.reference)
+    # The same variant probes and guarded two-pass estimator must agree when
+    # pass 2 groups more probes into each matrix product.
+    tiled=SimpleNamespace(**vars(args));tiled.output=tmp_path/'ref_tiled';tiled.probe_tile_width=16
+    tiled.output.mkdir();module.reference_run(tiled)
+    other=module.load_generalized_gxe_variant_reference_v1(
+        json.loads((tiled.output/'COMPLETE.json').read_text())['reference'])
+    for name in ('block_directed_numerator','same_person','affine_mean','affine_inverse_scale'):
+        np.testing.assert_allclose(getattr(other,name),getattr(ref,name),rtol=1e-12,atol=1e-12)
     with np.load(axes) as z:values={key:z[key] for key in z.files}
     values.update(affine_mean=ref.affine_mean,affine_inverse_scale=ref.affine_inverse_scale)
     np.savez(axes,**values)

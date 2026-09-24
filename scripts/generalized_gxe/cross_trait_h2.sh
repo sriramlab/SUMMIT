@@ -46,7 +46,7 @@ case $mode in
     pytest "$code_root/tests/test_cross_trait_simulation_truth.py" -q -p no:cacheprovider
    exec "$python_exe" "$launch" --threads 8 -- "$python_exe" "$code_root/scripts/generalized_gxe/private_python.py" \
     cross_trait_simulation reference "${common_args[@]}" --output "$output_root/simulation_reference" \
-    --probes 1024 --blocks 200 --memory-gib 24
+    --probes 1024 --blocks 200 --memory-gib 24 --probe-tile-width 128
   fi
   ref="$output_root/simulation_reference/reference.generalized-gxe-variant-ldscore-v1.npz"
   [[ -f $output_root/simulation_reference/COMPLETE.json && -f $ref ]]

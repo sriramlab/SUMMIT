@@ -45,7 +45,8 @@ def reference_run(args):
         inference_block_ids=groups,inference_block_labels=labels,residual_names=tuple(names.astype(str)),
         probes=args.probes,seed=args.seed,threads=args.threads,memory_bytes=args.memory_gib*2**30,
         native_module=gxeldcore,output=args.output/'reference',include_directional_panel=False,
-        mode='summary',variant_block_width=args.width,probe_tile_width=4,
+        mode='summary',variant_block_width=args.width,
+        probe_tile_width=getattr(args,'probe_tile_width',4),
         source_probe_tile_width=args.probes)
     artifact=result.artifact_path
     with (args.output/'COMPLETE.json').open('x') as f:
@@ -285,6 +286,8 @@ def main():
     p.add_argument('--replicates',type=int,default=100);p.add_argument('--seed',type=int,default=2026092301)
     p.add_argument('--threads',type=int,default=8);p.add_argument('--width',type=int,default=1024)
     p.add_argument('--probes',type=int,default=1024);p.add_argument('--blocks',type=int,default=200)
+    p.add_argument('--probe-tile-width',type=int,default=4,
+        help='Pass-2 probe tile width; changes tiling, not the probes or estimator')
     p.add_argument('--memory-gib',type=int,default=24)
     p.add_argument('--gram-mode',choices=['factorized','factorized_plus_residual','legacy_transport'],default='factorized')
     args=p.parse_args();args.output.mkdir(exist_ok=False)
