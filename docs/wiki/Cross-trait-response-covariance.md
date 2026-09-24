@@ -238,7 +238,7 @@ per-SNP observations and cannot support SNP filtering or IRWLS. The ordinary
 baseline-only model and a conditional GxE baseline need not agree under
 nonzero context effects. Both comparisons and any one-SE failures are retained.
 
-## Validation recorded on 23 September 2026
+## Validation recorded on 23–24 September 2026
 
 The detailed run report and table checksums are under
 `~/UKBB/manuscript/general_gxe_method/cross_trait_20260923/round2/`.
@@ -246,19 +246,20 @@ These results do not by themselves establish all acceptance criteria.
 
 | Check | Observed result |
 |---|---|
-| Portable suite at commit f00fa16 | 1,465 passed; 6 skipped; 1 xpassed |
+| Portable suite at commit fe7bf6a | 1,467 passed; 6 skipped; 1 xpassed |
 | Legacy within-trait full/deletion regression | Bit-identical |
 | Dense oracle, N=2,000, M=3,000, Q=3, about 60% overlap, fixed ranks 5 and 4 | Genetic Gram relative error 2.37e-15; coefficient error 3.29e-14 |
 | Dense real chr22 reference, N=20,000, 41,275 common SNPs | Z repair relative error 2.26e-15 |
 | Q=1 baseline regression against bivariate SUMMIT | Agreement at 1e-12 on the same dense panel |
 | 42 traits × six within-trait arms, full-genome same-person diagonals, no genotype pass | 252 fits completed and authenticated; 142 entries above one SE across 11 traits; maximum 7.52 SE |
 | Six-trait chr22 timing, five measured tiles | 2.565 versus 2.198 s per 128-SNP block; 16.66% total increment |
-| 42-trait chr22 timing, eight exact residual workers, five measured tiles | 25.322 versus 14.266 s per 128-SNP block; 77.49% increment; RSS 11,803,520 KiB (fails 30% target) |
-| 42-trait score accumulation alone | 0.025% of within-trait time; exact overlap residual work dominates |
+| 42-trait chr22 timing, batched projector products and eight exact residual workers, five measured tiles | 21.872 versus 15.295 s per 128-SNP block; 43.01% increment; RSS 11,809,732 KiB (fails 30% target) |
+| 42-trait score accumulation alone | 0.0167% of within-trait time; exact overlap residual work dominates |
 | Block same-person apportionment, chr22 | Maximum relative LD-scalar error 0.000151906 (passes 0.001) |
 | Hoffman placement qualification 14886620 | 20 tests passed; eight physical cores; NumPy and native worker affinities verified |
 | Private-BLIS prediction and cross-trait checks at b271d90 | 95 passed |
 | Private-BLIS batched residual checks at f00fa16 | 19 passed |
+| Private-BLIS complete study publication, Z and batch checks at fe7bf6a | 20 passed |
 | Standalone chr22 Z, local versus Hoffman | Block products agree to 3.29e-16 relative; Hoffman traversal 651.87 s, one pass |
 
 Real-mask Gram relative Frobenius errors at N=20,000:
@@ -284,6 +285,14 @@ reference instead of bypassing that check. Large-simulation coverage,
 remain pending in this version of the page. The 42-trait performance criterion
 is a measured failure. Increasing the cache limit from 64 to 256 did not
 improve the matched within/cross time ratio.
+
+The first full-chromosome fused pilot traversed all 99,273 SNPs in 78.3
+accounted minutes but failed artifact publication: an unmeasured timing was
+represented as NaN in canonical JSON provenance. No reusable score or fused
+Z artifact was published. Study timings now use JSON null, invalid provenance
+is rejected before opening an artifact, and a complete-driver test exercises
+publication and numerical read-back. The failed run is preserved; a rerun is
+required before chromosome expansion.
 
 The corrected refit table is `within_refits_full_diagonal/within_trait_mode_comparison.tsv`.
 The older `within_refits` run is preserved as provisional and must not supply
