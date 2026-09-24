@@ -26,6 +26,7 @@ CPUS=tuple(workflow._PRE_NUMERICAL_CPU_AFFINITY)
 from summit.context.reference_zpass_cli import authenticated_reference,file_sha256
 from summit.context.spec import array_sha256,canonical_sha256
 from summit.context.cross_trait_zpass import ZMomentAccumulator
+from summit.context.cross_trait_checkpoint import save_study_checkpoint,restore_study_checkpoint
 from summit.ldscore.generalized_gxe_pass2 import ProtectedTNOperator
 from summit.ldscore.generalized_gxe_masked_batch import MaskedTraitBatch
 from summit.ldscore.generalized_gxe_cross_trait_batch import CrossTraitBatch
@@ -48,6 +49,13 @@ def main():
     p.add_argument('--missing-cache-strategy',choices=('patterns','pooled'),default='patterns')
     p.add_argument('--cache-addition-penalty-rows',type=float,default=8.)
     p.add_argument('--parallel-cache-products',action='store_true')
+    p.add_argument('--checkpoint-every-blocks',type=int,default=0,
+        help='publish immutable running sums every this many decoded tiles (study only)')
+    p.add_argument('--resume-from',type=Path,help='continue after this authenticated completed-tile checkpoint')
+    p.add_argument('--max-run-seconds',type=float,default=0,
+        help='gracefully checkpoint at a tile boundary after this process time; exit 75')
+    p.add_argument('--stop-after-blocks',type=int,default=0,
+        help='qualification: checkpoint and exit 75 after this many new tiles')
     p.add_argument('--residual-workers',type=int,default=1,
         help='independent residual-pair workers, one BLAS thread each on reserved CPUs')
     a=p.parse_args()
@@ -56,10 +64,17 @@ def main():
     if a.minimum_cached_pattern_rows<1:p.error('cached patterns require a positive minimum row count')
     if not np.isfinite(a.cache_addition_penalty_rows) or a.cache_addition_penalty_rows<0:
         p.error('cache addition penalty must be finite and nonnegative')
-    a.output.mkdir(exist_ok=False);start=time.monotonic()
+    if (min(a.checkpoint_every_blocks,a.stop_after_blocks)<0 or not np.isfinite(a.max_run_seconds)
+            or a.max_run_seconds<0):p.error('checkpoint limits must be finite and nonnegative')
+    checkpointing=bool(a.checkpoint_every_blocks or a.resume_from or a.max_run_seconds or a.stop_after_blocks)
+    if checkpointing and a.mode!='study':p.error('checkpoint/resume requires study mode')
+    a.output.mkdir(exist_ok=a.resume_from is not None);start=time.monotonic()
+    if (a.output/'COMPLETE.json').exists() or (a.output/'cross_trait_summary.npz').exists():
+        raise FileExistsError('study publication already exists; use a new output path for recovery')
     source_hashes={str(path.relative_to(ROOT)):file_sha256(path) for path in (
         Path(__file__),ROOT/'src/summit/ldscore/generalized_gxe_masked_batch.py',
-        ROOT/'src/summit/ldscore/generalized_gxe_cross_trait_batch.py')}
+        ROOT/'src/summit/ldscore/generalized_gxe_cross_trait_batch.py',
+        ROOT/'src/summit/context/cross_trait_checkpoint.py')}
     refroot=a.base/'shared_reference_full_20260916';master=a.base/'full_cohort_inputs_20260916/height_raw.npz'
     manifest,panel,reference,record=authenticated_reference(refroot/'MANIFEST.json',refroot,a.chromosome,master)
     expansion=a.base/'imputed_expansion_20260917';expanded=json.loads((expansion/'MANIFEST.json').read_text())
@@ -118,11 +133,45 @@ def main():
                           cached_missing_patterns=len(batch.missing_pattern_rows),
                           cached_missing_people=sum(map(len,batch.missing_pattern_rows)),
                           cpus=CPUS,blas=threadpool_info())),flush=True)
+    identity=dict(chromosome=a.chromosome,variants=m,width=a.width,traits=list(names),
+        source_sha256=source_hashes,input_sha256=input_hashes,reference_files=record['files'],
+        manifest_sha256=file_sha256(refroot/'MANIFEST.json'),master_sha256=file_sha256(master),
+        annotation_sha256=panel['annotation_sha256'],residual_basis_sha256=array_sha256(residual),
+        common_only=a.common_only,z_enabled=z_accumulator is not None,threads=a.threads,
+        max_cached_missing_patterns=a.max_cached_missing_patterns,
+        minimum_cached_pattern_rows=a.minimum_cached_pattern_rows,missing_cache_strategy=a.missing_cache_strategy,
+        cache_addition_penalty_rows=a.cache_addition_penalty_rows,parallel_cache_products=a.parallel_cache_products,
+        residual_workers=a.residual_workers,
+        native_sha256=file_sha256(shared_tn._module.__file__) if shared_tn is not None else None)
+    previous=(restore_study_checkpoint(a.resume_from,batch=batch,z=z_accumulator,identity=identity)
+              if a.resume_from is not None else {})
     raw_n=sum(1 for _ in open(prefix+'.fam'));raw=np.empty((a.width,len(rows)),dtype=np.int8)
-    timings=[];traversal=time.monotonic();visits=0
+    timings=list(previous.get('timings',[]));z_telemetry=list(previous.get('z_telemetry',[]))
+    traversal=time.monotonic();visits=previous.get('next_variant',0);segment_begin=visits;new_tiles=0
+    prior_calls=previous.get('protected_tn_calls',0);prior_repairs=previous.get('repaired_columns',0)
+    def progress():
+        segments=list(previous.get('segments',[]))
+        if visits>segment_begin:
+            segments.append(dict(begin=segment_begin,end=visits,hostname=os.uname().nodename,
+                job_id=os.environ.get('JOB_ID'),cpu_ids=list(CPUS),seconds=time.monotonic()-start,
+                max_run_seconds=a.max_run_seconds,checkpoint_every_blocks=a.checkpoint_every_blocks))
+        return dict(next_variant=visits,score_variants=batch.scores.variants,
+            z_variants=z_accumulator.variants if z_accumulator is not None else 0,
+            score_seconds=batch.scores.seconds,residual_seconds=batch.residual_seconds,
+            residual_phase_seconds=batch.residual_phase_seconds,timings=timings,z_telemetry=z_telemetry,
+            protected_tn_calls=prior_calls+(shared_tn.calls if shared_tn is not None else 0),
+            repaired_columns=prior_repairs+(shared_tn.repaired_columns if shared_tn is not None else 0),
+            seconds=previous.get('seconds',0)+time.monotonic()-start,
+            traversal_seconds=previous.get('traversal_seconds',0)+time.monotonic()-traversal,segments=segments,
+            peak_rss_kib=max(previous.get('peak_rss_kib',0),resource.getrusage(resource.RUSAGE_SELF).ru_maxrss))
+    def checkpoint():
+        path=a.output/f'checkpoint_{visits:012d}.npz'
+        save_study_checkpoint(path,batch=batch,z=z_accumulator,identity=identity,progress=progress())
+        print(json.dumps(dict(phase='checkpoint',next_variant=visits,path=str(path),sha256=file_sha256(path))),flush=True)
+        return path
     with batch,threadpool_limits(limits=a.threads),pgenlib.PgenReader(os.fsencode(prefix+'.bed'),raw_sample_ct=raw_n,
             variant_ct=panel.get('bed_variant_count',m),sample_subset=rows.astype(np.uint32)) as reader:
-        for begin in range(0,limit,a.width):
+        for begin in range(visits,limit,a.width):
             end=min(begin+a.width,limit);width=end-begin;tick=time.monotonic()
             offset=panel.get('physical_start',0);reader.read_range(begin+offset,end+offset,raw[:width],allele_idx=1)
             x=raw[:width].astype(float);missing=x==-9;x-=mean[begin:end,None];x*=inverse[begin:end,None];x[missing]=0
@@ -150,7 +199,17 @@ def main():
                 score_seconds=batch.scores.seconds-score_before,residual_seconds=batch.residual_seconds-residual_before,
                 residual_phase_seconds={key:value-residual_phases_before[key] for key,value in batch.residual_phase_seconds.items()})
             timings.append(row)
+            new_tiles+=1
             if a.mode=='benchmark' or len(timings)%32==0:print(json.dumps(row),flush=True)
+            stop=(a.stop_after_blocks and new_tiles>=a.stop_after_blocks
+                  or a.max_run_seconds and time.monotonic()-start>=a.max_run_seconds)
+            if checkpointing and (visits==limit or stop or
+                    a.checkpoint_every_blocks and len(timings)%a.checkpoint_every_blocks==0):
+                path=checkpoint()
+                if stop and visits<limit:
+                    print(json.dumps(dict(phase='paused',next_variant=visits,resume_from=str(path))),flush=True)
+                    raise SystemExit(75)
+    final_progress=progress()
     provenance=dict(chromosome=a.chromosome,traits=list(names),input_sha256=input_hashes,
         reference_files=record['files'],reference_manifest_sha256=file_sha256(refroot/'MANIFEST.json'),
         source_sha256=source_hashes,variant_visits=visits,genotype_traversals=1,
@@ -162,8 +221,11 @@ def main():
         parallel_cache_products=a.parallel_cache_products,
         residual_workers=a.residual_workers,residual_worker_affinity=batch.residual_worker_affinity,
         residual_phase_timing='sum of worker elapsed times; residual_seconds measures wall time',
-        timings=timings,seconds=time.monotonic()-start,traversal_seconds=time.monotonic()-traversal,
-        peak_rss_kib=resource.getrusage(resource.RUSAGE_SELF).ru_maxrss,
+        timings=timings,seconds=final_progress['seconds'],traversal_seconds=final_progress['traversal_seconds'],
+        process_segments=final_progress['segments'],
+        resumed_checkpoint_sha256=file_sha256(a.resume_from) if a.resume_from is not None else None,
+        resumed_checkpoint=str(a.resume_from.resolve()) if a.resume_from is not None else None,
+        peak_rss_kib=final_progress['peak_rss_kib'],
         residual_basis_sha256=array_sha256(residual),residual_names=list(residual_names))
     if a.mode=='benchmark':
         measured=timings[1:] or timings
@@ -182,7 +244,7 @@ def main():
             manifest_sha256=file_sha256(refroot/'MANIFEST.json'),annotation_sha256=array_sha256(full_annotations),
             native_build=native_build,telemetry_sha256=z_telemetry,
             execution_ledger=dict(observed_genotype_passes=1,retained_variant_visits=limit,
-                protected_tn_calls=shared_tn.calls,repaired_columns=shared_tn.repaired_columns),
+                protected_tn_calls=final_progress['protected_tn_calls'],repaired_columns=final_progress['repaired_columns']),
             z_source='guarded shared fixed_weights contraction; no additional genotype product or pass'))
     with (a.output/'COMPLETE.json').open('x') as f:json.dump(provenance,f,indent=2)
 

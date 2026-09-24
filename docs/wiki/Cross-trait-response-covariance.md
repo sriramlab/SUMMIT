@@ -191,6 +191,19 @@ derived covariance matrices, Gram mode and input provenance. Pilot fits also
 include basis names, annotation names, factorization residuals and
 same-person shares per block/annotation pair.
 
+Long studies may add `--checkpoint-every-blocks 128 --max-run-seconds 46800`.
+This writes immutable `.study_checkpoint` artifacts every 128 decoded tiles
+and exits with code 75 at a completed tile boundary when the time budget is
+reached. `--resume-from PATH` restores the running sums and begins at the next
+unread SNP. It checks input, Python-source and native-binary identities,
+residual geometry and the guarded traversal ledger. Partial files are never
+published as checkpoints. The final receipt records contiguous process
+segments, so a graceful continuation retains one genotype traversal and the
+original floating-point addition order. An unexpected kill can lose the
+uncheckpointed tail; any replay of that tail must be reported as aborted work,
+not silently included in the successful traversal claim. A final checkpoint
+also precedes score/Z publication when checkpointing is enabled.
+
 Run paths below are placeholders for authenticated inputs and **new** outputs:
 
 ```bash
@@ -258,7 +271,8 @@ These results do not by themselves establish all acceptance criteria.
 
 | Check | Observed result |
 |---|---|
-| Portable suite at commit 04515d0 | 1,474 passed; 6 skipped; 1 xpassed |
+| Portable suite including study checkpoint/resume | 1,475 passed; 6 skipped; 1 xpassed |
+| Checkpoint/resume through separate OS processes | Score and Z arrays bit-identical to uninterrupted traversal; changed tile width rejected; both BLAS configurations pass |
 | Legacy within-trait full/deletion regression | Bit-identical |
 | Dense oracle, N=2,000, M=3,000, Q=3, about 60% overlap, fixed ranks 5 and 4 | Genetic Gram relative error 2.37e-15; coefficient error 3.23e-14 |
 | Dense real chr22 reference, N=20,000, 41,275 common SNPs | Z repair relative error 2.26e-15 |

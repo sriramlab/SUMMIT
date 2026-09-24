@@ -87,6 +87,12 @@ case $mode in
  pilot|pilot_with_z|pilot_array)
   chromosome=${3:-${SGE_TASK_ID:?chromosome required}}
   [[ $chromosome =~ ^([1-9]|1[0-9]|2[0-2])$ ]]
+  if [[ $mode != pilot && -s $output_root/pilot_study/chr$chromosome/COMPLETE.json ]]; then
+   exec "$python_exe" "$launch" --threads 8 -- "$python_exe" "$code_root/scripts/generalized_gxe/private_python.py" \
+    cross_trait_qualification --study-output "$output_root/pilot_study/chr$chromosome" \
+    --z-output "$output_root/zpass_chr$chromosome.npz" --chromosome "$chromosome" \
+    --manifest "$base/shared_reference_full_20260916/MANIFEST.json"
+  fi
   if [[ $mode == pilot_array ]]; then
    # A scheduler dependency is released after failure as well as success.
    # COMPLETE is written only after both authenticated artifacts are closed.
@@ -104,6 +110,17 @@ case $mode in
   z_args=()
   mkdir -p "$output_root/pilot_study"
   if [[ $mode != pilot ]]; then z_args=(--z-output "$output_root/zpass_chr$chromosome.npz"); fi
+  # Default requests are six hours for chr22 and fourteen for array tasks.
+  # A graceful boundary leaves at least 30/60 minutes for publication/exit.
+  budget_seconds=46800
+  if [[ $chromosome == 22 ]]; then budget_seconds=19800; fi
+  checkpoint_args=(--checkpoint-every-blocks 128 --max-run-seconds "${4:-$budget_seconds}")
+  shopt -s nullglob
+  checkpoints=("$output_root/pilot_study/chr$chromosome"/checkpoint_*.npz)
+  shopt -u nullglob
+  if (( ${#checkpoints[@]} )); then
+   checkpoint_args+=(--resume-from "${checkpoints[-1]}")
+  fi
   if [[ $chromosome == 22 ]]; then
    "$python_exe" "$launch" --threads 8 -- "$python_exe" "$code_root/scripts/generalized_gxe/private_python.py" \
     pytest "$code_root/tests/test_cross_trait_zpass.py" "$code_root/tests/test_cross_trait_batch.py" \
@@ -113,7 +130,8 @@ case $mode in
     cross_trait_study study --base "$base" \
     --bed-prefix "/u/home/b/bronsonj/project-sriram/UKBB/imp/qc.v1/by_chr/imp.$chromosome" \
     --annotations "$base/imputed_maf3_design/annotations_chr$chromosome.npy" \
-    --output "$output_root/pilot_study/chr$chromosome" --chromosome "$chromosome" --common-only --traits 8 --threads 8 "${z_args[@]}"
+    --output "$output_root/pilot_study/chr$chromosome" --chromosome "$chromosome" --common-only --traits 8 --threads 8 \
+    "${z_args[@]}" "${checkpoint_args[@]}"
   ;;
  *) exit 2 ;;
 esac

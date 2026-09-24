@@ -3,6 +3,8 @@ import importlib.util
 import json
 from pathlib import Path
 import sys
+import os
+import subprocess
 import numpy as np
 import pytest
 from bed_reader import to_bed
@@ -19,7 +21,8 @@ def test_invalid_provenance_does_not_create_an_empty_artifact(tmp_path):
     assert not path.exists()
 
 
-def test_fused_study_driver_publishes_complete_summary_and_z(tmp_path,monkeypatch):
+@pytest.mark.parametrize('resume',[False,True])
+def test_fused_study_driver_publishes_complete_summary_and_z(tmp_path,monkeypatch,resume):
     from summit import gxeldcore
     script=Path(__file__).resolve().parents[1]/'scripts/generalized_gxe/cross_trait_study.py'
     spec=importlib.util.spec_from_file_location('study_publication',script)
@@ -55,16 +58,51 @@ def test_fused_study_driver_publishes_complete_summary_and_z(tmp_path,monkeypatc
     (chrom/'REFERENCE_COMPLETE.json').write_text(json.dumps(dict(passed=True,manifest_sha256=file_sha256(manifest),
         files={name:file_sha256(chrom/name) for name in ('reference.npz','reference_aux.npz')})))
     output=tmp_path/'study';zpath=tmp_path/'z.npz';threads=int(gxeldcore.build_info()['blas_runtime_threads'])
-    monkeypatch.setattr(sys,'argv',[str(script),'study','--base',str(tmp_path),'--bed-prefix',str(bed),
+    command=[str(script),'study','--base',str(tmp_path),'--bed-prefix',str(bed),
         '--annotations',str(annotation_path),'--output',str(output),'--z-output',str(zpath),
-        '--traits','8','--common-only','--threads',str(threads),'--width','7'])
-    module.main()
+        '--traits','8','--common-only','--threads',str(threads),'--width','7']
+    if resume:
+        # Separate OS processes: no in-memory accumulator/native state can
+        # survive the exit-75 boundary. Restore only the authenticated NPZ.
+        native=gxeldcore.build_info()
+        launch=([sys.executable,str(script.with_name('private_python.py')),'cross_trait_study']
+                if native.get('private_blas_backend')=='upstream_blis' else [sys.executable,str(script)])
+        launch=['taskset','-c',','.join(map(str,module.CPUS)),*launch]
+        env=dict(os.environ,PYTHONDONTWRITEBYTECODE='1')
+        first=subprocess.run([*launch,*command[1:],'--stop-after-blocks','2'],env=env,
+            capture_output=True,text=True)
+        assert first.returncode==75,first.stdout+first.stderr
+        checkpoint=output/'checkpoint_000000000014.npz'
+        assert checkpoint.exists() and not (output/'COMPLETE.json').exists() and not zpath.exists()
+        digest=file_sha256(checkpoint)
+        wrong=command.copy();wrong[wrong.index('--output')+1]=str(tmp_path/'wrong_width')
+        rejected=subprocess.run([*launch,*wrong[1:],'--resume-from',str(checkpoint),'--width','8'],
+            env=env,capture_output=True,text=True)
+        assert rejected.returncode!=0 and 'checkpoint study identity differs' in rejected.stderr
+        second=subprocess.run([*launch,*command[1:],'--resume-from',str(checkpoint)],env=env,
+            capture_output=True,text=True)
+        assert second.returncode==0,second.stdout+second.stderr
+        assert file_sha256(checkpoint)==digest
+        # Independent uninterrupted run, with the identical tile grouping.
+        full=command.copy();full[full.index('--output')+1]=str(tmp_path/'uninterrupted')
+        full[full.index('--z-output')+1]=str(tmp_path/'uninterrupted_z.npz')
+        monkeypatch.setattr(sys,'argv',full);module.main()
+        resumed,_=load_array_artifact(output/'cross_trait_summary.npz',kind='summit.cross_trait.summary')
+        whole,_=load_array_artifact(tmp_path/'uninterrupted/cross_trait_summary.npz',kind='summit.cross_trait.summary')
+        for key in whole:np.testing.assert_array_equal(resumed[key],whole[key])
+        rz,_=load_array_artifact(zpath,kind='summit.cross_trait.z_moments')
+        wz,_=load_array_artifact(tmp_path/'uninterrupted_z.npz',kind='summit.cross_trait.z_moments')
+        for key in wz:np.testing.assert_array_equal(rz[key],wz[key])
+    else:
+        monkeypatch.setattr(sys,'argv',command);module.main()
     data,provenance=load_array_artifact(output/'cross_trait_summary.npz',kind='summit.cross_trait.summary')
     z,zmeta=load_array_artifact(zpath,kind='summit.cross_trait.z_moments')
     assert provenance['variant_visits']==m and provenance['genotype_traversals']==1
     assert all(t['within_seconds'] is None for t in provenance['timings'])
     assert json.loads((output/'COMPLETE.json').read_text())['variant_visits']==m
     assert zmeta['execution_ledger']['retained_variant_visits']==m
+    assert zmeta['execution_ledger']['protected_tn_calls']==(m+6)//7
+    assert [(s['begin'],s['end']) for s in provenance['process_segments']]==([(0,14),(14,m)] if resume else [(0,m)])
     groups=np.arange(m)*4//m;expected=ZMomentAccumulator(np.unique(groups),3,q,c)
     expected.add(np.einsum('nj,na,nc->jac',g,phi,u),annotations,groups)
     np.testing.assert_allclose(z['block_products'],expected.products,rtol=1e-11,atol=1e-10)

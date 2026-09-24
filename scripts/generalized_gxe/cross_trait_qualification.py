@@ -29,6 +29,13 @@ def validate(study_output, z_output, manifest, *, chromosome=22):
         raise ValueError('qualification traversal ledger differs')
     if not all(zprov['native_build'][key] for key in ('gemm_integrity_enabled','gemm_checksum_enabled')):
         raise ValueError('qualification did not use both native GEMM guards')
+    if 'process_segments' in complete:
+        position=0
+        for segment in complete['process_segments']:
+            if segment['begin']!=position or segment['end']<=position:
+                raise ValueError('qualification process segments overlap or have a gap')
+            position=segment['end']
+        if position!=panel['m']:raise ValueError('qualification process segments are incomplete')
     np.testing.assert_array_equal(summary['block_ids'],z['block_ids'])
     np.testing.assert_array_equal(summary['trait_names'],complete['traits'])
     return dict(qualified=True,chromosome=chromosome,variants=panel['m'],
