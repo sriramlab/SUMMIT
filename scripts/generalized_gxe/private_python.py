@@ -7,6 +7,7 @@ build. Usage: python private_python.py module.name [module arguments ...]
 """
 import ctypes
 import importlib.util
+import json
 import os
 from pathlib import Path
 import runpy
@@ -36,5 +37,7 @@ import workflow
 workflow._PRE_NUMERICAL_CPU_AFFINITY=cpus
 info,threads,placement=workflow.require_private_blis(gxeldcore)
 assert info['gemm_integrity_enabled'] and info['gemm_checksum_enabled']
+print(json.dumps(dict(phase='runtime_placement',launch_cpu_ids=cpus,threads=threads,
+    placement=placement,native_path=gxeldcore.__file__,native_build=info)),flush=True)
 module=sys.argv[1];sys.argv=sys.argv[1:]
 runpy.run_module(module,run_name='__main__')
