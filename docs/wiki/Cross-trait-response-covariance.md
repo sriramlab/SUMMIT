@@ -296,6 +296,8 @@ These results do not by themselves establish all acceptance criteria.
 | Private-BLIS optional pooled-cache and study publication checks at 5fc39bf | 20 passed |
 | Private-BLIS parallel cache and study publication checks at 04515d0 | 23 passed |
 | Standalone chr22 Z, local versus Hoffman | Block products agree to 3.29e-16 relative; Hoffman traversal 651.87 s, one pass |
+| Completed fused chr22 study/Z, eight traits | 99,273 SNPs in one traversal; 776 guarded TN calls, zero repairs; 3,792.20 accounted s; RSS 6,174,252 KiB |
+| Fused versus standalone chr22 Z | Block products agree to 7.91e-15 relative; global products to 7.85e-15 |
 | Reference probe tiling, N=50,112, M=1,024, B=1,024 | Tile 4 versus 128: 33.11 versus 13.70 s; Gram difference 1.65e-16 relative; same-person matrix bit-identical |
 
 Real-mask Gram relative Frobenius errors at N=20,000:
@@ -360,7 +362,13 @@ publication and numerical read-back. The failed run is preserved. After its
 full-chromosome traversal timing, a dependent array was submitted using that
 measured workload. Each task authenticates the replacement chr22 completion
 receipt, score/Z arrays and guarded traversal ledger before any genotype
-work; scheduler dependency release alone is insufficient.
+work; scheduler dependency release alone is insufficient. The replacement
+completed and authenticated both artifacts. Its full numerical pass averaged
+4.458 seconds per 128-SNP tile, plus 0.312 seconds decoding; this run did not
+measure a within-only comparator. After this qualification, chromosomes1–21
+were submitted with the same code and binding, eight cores, 16 GiB per task,
+14 hours and no task-concurrency cap. Checkpointed partial tasks must resume
+before any full-genome fit is reported.
 
 The corrected refit table is `within_refits_full_diagonal/within_trait_mode_comparison.tsv`.
 The older `within_refits` run is preserved as provisional and must not supply
