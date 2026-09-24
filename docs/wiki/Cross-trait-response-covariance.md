@@ -236,7 +236,18 @@ python scripts/generalized_gxe/cross_trait_pilot_report.py \
 python scripts/generalized_gxe/cross_trait_bivariate.py --base "$BASE" \
   --study-root "$NEW/pilot_study" --pilot-fits "$NEW/pilot_fits" \
   --output "$NEW/baseline_regression"
+
+python scripts/generalized_gxe/cross_trait_audit_pilot.py --repo "$PWD" \
+  --fits "$NEW/pilot_fits" --report "$NEW/pilot_report" \
+  --expected-blocks 200 --output "$NEW/pilot_audit"
 ```
+
+The pilot audit authenticates all 112 pair/mode artifacts and independently
+recomputes the 5,936 estimates and paired intervals, covariance matrices,
+1,484 mode shifts, and the named age/BMI report. It reads no genotypes and
+does not refit. `cross_trait_audit_simulation.py` similarly recomputes every
+simulation bias, RMSE, SE calibration and coverage value from the recorded
+replicates and checks undefined correlations against their marginal variances.
 
 Production guarded native runs use the qualified placement launcher
 `scripts/generalized_gxe/private_python.py`; the Hoffman launcher is
@@ -285,7 +296,7 @@ These results do not by themselves establish all acceptance criteria.
 | Portable suite including checkpoint/resume, pair-sum reuse and deletion mass restoration | 1,478 passed; 6 skipped; 1 xpassed |
 | Checkpoint/resume through separate OS processes | Score and Z arrays bit-identical to uninterrupted traversal; changed tile width rejected; both BLAS configurations pass |
 | Legacy within-trait full/deletion regression | Bit-identical |
-| Legacy fits against original saved study outputs: body fat, triglycerides and height | Point estimates and raw genetic deletion coefficients bit-identical; restored deletion matrices match the existing collector |
+| Legacy fits against all 22 available original saved study fits | Normal matrix, RHS, coefficients, Omega and raw deletion coefficients bit-identical; restored deletion matrices match the existing collector |
 | Dense oracle, N=2,000, M=3,000, Q=3, about 60% overlap, fixed ranks 5 and 4 | Genetic Gram relative error 2.37e-15; coefficient error 3.23e-14 |
 | Dense real chr22 reference, N=20,000, 41,275 common SNPs | Z repair relative error 2.26e-15 |
 | Dense real chr22 reference, N=40,000, same 41,275 common SNPs | Z repair and production assembly errors 1.60e-15; 4,604.46 accounted seconds; RSS 28,357,036 KiB |
