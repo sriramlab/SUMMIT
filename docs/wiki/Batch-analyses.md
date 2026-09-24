@@ -88,5 +88,14 @@ and legacy transport arms. Within-trait saved summaries can be refitted under
 six mode/diagonal combinations without reopening genotypes; explicit
 legacy/scaled assembly preserves the old within-trait result bit for bit.
 See the linked page for commands, exactness boundaries, paired deletions and
-the completed and pending validation results. Complete-pass benchmarks include
+the validation results. Complete-pass benchmarks include
 the exact overlap residual contractions as well as score accumulation.
+
+The eight-trait common-bin pilot completed all 22 chromosomes in one study/Z
+traversal per chromosome and produced 112 pair/mode fits with 200 paired
+deletion blocks. The 42-trait benchmark adds 29.956% to the within-only pass;
+this is a narrow measured pass. All 42 saved within-trait summaries were
+refitted under six arms without genotypes. The simulation coverage criterion
+is not fully met, and weak individual-context correlations can have undefined
+intervals. The pilot remains exploratory; see the linked page for the full
+results, exactness limits and authenticated artifacts.

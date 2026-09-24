@@ -296,8 +296,10 @@ nonzero context effects. Both comparisons and any one-SE failures are retained.
 
 ## Validation recorded on 23–24 September 2026
 
-The detailed run report and table checksums are under
-`~/UKBB/manuscript/general_gxe_method/cross_trait_20260923/round2/`.
+The detailed report, commands and checksum inventory are
+`~/UKBB/manuscript/general_gxe_method/cross_trait_20260923/ROUND2_REPORT.md`,
+`ROUND2_COMMANDS.md` and `ROUND2_VERIFICATION.json`; artifacts are in the
+adjacent `round2/` directory.
 These results do not by themselves establish all acceptance criteria.
 
 | Check | Observed result |
@@ -313,6 +315,8 @@ These results do not by themselves establish all acceptance criteria.
 | Q=1 baseline regression against bivariate SUMMIT | Agreement at 1e-12 on the same dense panel |
 | Real chr22 downstream qualification, all eight traits | 112 pair/mode artifacts authenticate; rank 38 throughout; 28 contrasts and 112 age–BMI entries published |
 | Real chr22 ordinary-bivariate comparison | All 28 pairs and four modes within one SE for both baseline centerings; maximum 0.076 SE; only three deletion blocks |
+| Full-genome eight-trait common-bin pilot | 112 pair/mode artifacts, 200 paired blocks; independent audit verifies all 5,936 estimate/interval rows, 1,484 maximum-mode-shift rows and 112 age–BMI entries; rank 38 throughout, condition numbers 70.38–72.04 |
+| Full-genome ordinary-bivariate regression | All 224 comparisons pass one context-model SE; maximum raw-baseline difference 0.03650 SE, centered-baseline difference 0.04105 SE |
 | 42 traits × six within-trait arms, full-genome same-person diagonals and restored deletions, no genotype pass | 252 fits completed and authenticated; 142 comparison rows (71 distinct entries) above one SE across 11 traits; maximum 7.48 SE |
 | Six-trait chr22 timing after streamed inputs, five measured tiles | 2.578 versus 2.229 s per 128-SNP block; 15.67% total increment; RSS 5,696,408 KiB |
 | Eight-core 42-trait timing, 256 individual-pattern groups with minimum 16 rows, five measured tiles | 15.092 versus 10.516 s per 128-SNP block; 43.51% increment; RSS 5,943,260 KiB |
@@ -381,8 +385,8 @@ traversal for all 100 replicates. The small complete BED pipeline is tested.
 The original August simulation reference is obsolete under current
 same-person validation, so the large benchmark constructs a new guarded
 reference instead of bypassing that check. The reference and all simulation
-phases have now completed and their artifacts authenticate. Genome-wide
-pilot results remain pending in this version of the page. The complete eight-core 42-trait
+phases have now completed and their artifacts authenticate. The genome-wide
+pilot also completed; its exploratory findings are below. The complete eight-core 42-trait
 pass with 64 reused pair sums adds
 29.956% in 31 measured tiles, narrowly below the 30% target. This small
 margin does not establish a robust bound across hosts or load conditions.
@@ -437,8 +441,8 @@ completed and authenticated both artifacts. Its full numerical pass averaged
 4.458 seconds per 128-SNP tile, plus 0.312 seconds decoding; this run did not
 measure a within-only comparator. After this qualification, chromosomes 1–21
 were submitted with the same code and binding, eight cores, 16 GiB per task,
-14 hours and no task-concurrency cap. Checkpointed partial tasks must resume
-before any full-genome fit is reported.
+14 hours and no task-concurrency cap. All production tasks completed without
+needing to resume a partial traversal.
 All 22 traversals have now completed and authenticate. The independent
 `cross_trait_audit_traversal.py` checks common cohort identities, all 200
 block IDs, global annotation mass, guarded call counts and successful
@@ -469,3 +473,82 @@ direction among LDL, ApoB, total cholesterol, non-HDL, HbA1c and DBP, absent
 for height and platelets. All 28 pairs are retained. Pilot findings are
 exploratory; a nonsignificant control estimate does not establish absence.
 The common-only model omits lower-frequency effects and is reported as such.
+
+## Completed common-bin pilot
+
+The successful production run visited 7,774,235 SNPs once per chromosome for
+all eight traits and their 28 pairs, collecting Z moments in the same pass.
+The common annotation contains 3,202,459 SNPs. All four modes were fitted
+from these summaries with 200 paired, mass-restored deletions. Job 14888839
+completed the fitting, report and bivariate comparison in 2,446.585 accounted
+seconds with 2,734,568 KiB peak RSS and no genotype traversal. Independent
+audits authenticate the traversal ledgers, array checksums, restored
+coefficients, uncertainty tables and baseline-regression replicates.
+
+Selected factorized/actual-overlap results are below. The last column uses
+the paired jackknife for the difference; it is not a difference of separate
+interval endpoints. Baseline rg uses the original master-context intercept.
+
+| Trait pair | Baseline rg | Orthogonal-response rg | Paired difference, nominal 95% interval |
+|---|---:|---:|---:|
+| LDL–ApoB | 0.959 | 0.968 | 0.009 [-0.016, 0.034] |
+| LDL–HbA1c | 0.046 | -0.297 | -0.342 [-0.631, -0.053] |
+| LDL–DBP | -0.077 | 0.357 | 0.434 [0.225, 0.642] |
+| Cholesterol–non-HDL | 0.907 | 0.960 | 0.053 [0.013, 0.093] |
+| LDL–height | -0.107 | -0.107 | -0.000 [-0.279, 0.279] |
+| LDL–platelets | 0.070 | 0.233 | 0.163 [-0.219, 0.545] |
+
+Lipid–BP response alignment exceeds baseline alignment, while lipid–HbA1c
+orthogonal-response estimates are negative. Among the 15 cardiometabolic
+pairs, five difference intervals are above zero and three below zero; all
+13 control-involving difference intervals include zero. These results do
+not support a uniformly positive six-trait response program. Nor do they
+establish absence in the controls: eight of 52 control-involving age/BMI
+covariance intervals exclude zero nominally. No multiplicity correction is
+applied, and the lipid traits are closely related.
+
+The named, centered covariance entries retain direction. For example,
+LDL-age with HbA1c-BMI is -0.001946 (95% interval -0.003535 to -0.000358),
+and LDL-age with DBP-BMI is 0.001788 (0.000225 to 0.003351).
+LDL-age with height-BMI is -0.001571 (-0.002720 to -0.000423), and with
+platelet-BMI is 0.001724 (0.000403 to 0.003044). These are covariance
+entries in the study's standardized named-exposure basis, not correlations.
+
+Across finite default-SE comparisons, maximum shifts among the four modes
+are 0.371 SE for Omega, 0.044 SE for H, 0.0242 SE for baseline rg,
+0.0152 SE for orthogonal-response rg, and 0.0105 SE for their paired
+difference. This stability does not resolve the failed simulation coverage
+gate or establish that all modes are unbiased.
+
+All 28 baseline and orthogonal-trace correlations have finite intervals and
+point estimates within [-1,1]. Individual-context correlations are less
+stable: of 112 coordinates, 18 smoking-response point estimates are
+undefined, 34 jackknife intervals are undefined (27 smoking and seven BMI),
+and 14 finite point estimates lie outside [-1,1]. The estimator imposes no
+PSD constraint or clipping. Nonpositive estimated marginal variances make
+ratios undefined; the tables retain these cases and identify undefined mode
+shifts. Together with the simulation result, this limits paper inference
+about weak individual-context responses.
+
+The final artifacts are under `round2/pilot_fused_v3/` in the report tree:
+
+- `pilot_fits/pilot_estimates.tsv`: every Omega and H entry and derived
+  quantity, with paired uncertainty in all four modes; the corresponding
+  112 NPZ files include deletion estimates, covariance and provenance.
+- `pilot_fits/pilot_maximum_mode_shifts.tsv` and
+  `pilot_gram_mode_differences.tsv`: sensitivity and Gram diagnostics.
+- `pilot_report/baseline_vs_orthogonal_response.tsv` and
+  `age_bmi_cross_exposure_covariance.tsv`: all 28 paired comparisons and
+  112 named age/BMI entries under the default.
+- `baseline_regression/baseline_rg_regression.tsv`: all 224 ordinary-SUMMIT
+  comparisons, with authenticated replicate arrays beside the table.
+- `pilot_figures/`: audited forest plot and oriented age/BMI covariance
+  matrix, both PDF and PNG, with figure hashes and renderer versions.
+- `traversal_audit/`, `pilot_audit/` and `FINAL_SUMMARY.json`: independently
+  checked execution, numerical and report receipts.
+
+The complete suite passed 1,478 tests (six skipped, one xpassed) in 153.61
+seconds at commit 65105dd; subsequent changes are documentation only.
+Every milestone push was retried but GitHub returned HTTP 403. Local SHAs
+and exact commands are recorded in the report. No remote SHA or Actions
+conclusion is claimed for these unpublished commits.
