@@ -66,6 +66,24 @@ case $mode in
     cross_trait_real_gram --base "$base" --bed-prefix /u/home/b/bronsonj/project-sriram/UKBB/imp/qc.v1/by_chr/imp.22 \
     --annotations "$base/imputed_maf3_design/annotations_chr22.npy" --output "$output_root/real_gram_n40000" --n 40000 --threads 8
   ;;
+ pilot_finish)
+  # No genotypes: verify every completed traversal before creating fit outputs.
+  # A failed/partial predecessor must not turn into a reduced-chromosome fit.
+  for chromosome in {1..22}; do
+   "$python_exe" "$launch" --threads 8 -- "$python_exe" "$code_root/scripts/generalized_gxe/private_python.py" \
+    cross_trait_qualification --study-output "$output_root/pilot_study/chr$chromosome" \
+    --z-output "$output_root/zpass_chr$chromosome.npz" --chromosome "$chromosome" \
+    --manifest "$base/shared_reference_full_20260916/MANIFEST.json"
+  done
+  "$python_exe" "$launch" --threads 8 -- "$python_exe" "$code_root/scripts/generalized_gxe/private_python.py" \
+   cross_trait_pilot_fit --base "$base" --study-root "$output_root/pilot_study" \
+   --z-root "$output_root" --output "$output_root/pilot_fits"
+  "$python_exe" "$launch" --threads 8 -- "$python_exe" "$code_root/scripts/generalized_gxe/private_python.py" \
+   cross_trait_pilot_report --fits "$output_root/pilot_fits" --output "$output_root/pilot_report"
+  exec "$python_exe" "$launch" --threads 8 -- "$python_exe" "$code_root/scripts/generalized_gxe/private_python.py" \
+   cross_trait_bivariate --base "$base" --study-root "$output_root/pilot_study" \
+   --pilot-fits "$output_root/pilot_fits" --output "$output_root/baseline_regression"
+  ;;
  pilot|pilot_with_z|pilot_array)
   chromosome=${3:-${SGE_TASK_ID:?chromosome required}}
   [[ $chromosome =~ ^([1-9]|1[0-9]|2[0-2])$ ]]

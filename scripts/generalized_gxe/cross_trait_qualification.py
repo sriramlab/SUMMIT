@@ -40,8 +40,9 @@ def main():
     parser=argparse.ArgumentParser(description=__doc__)
     for name in ('study-output','z-output','manifest'):
         parser.add_argument('--'+name,type=Path,required=True)
+    parser.add_argument('--chromosome',type=int,choices=range(1,23),default=22)
     args=parser.parse_args()
-    print(json.dumps(validate(args.study_output,args.z_output,args.manifest)),flush=True)
+    print(json.dumps(validate(args.study_output,args.z_output,args.manifest,chromosome=args.chromosome)),flush=True)
 
 
 if __name__=='__main__':main()
