@@ -1,7 +1,7 @@
 """Ordered cross-trait MoM using the existing rank-revealing SUMMIT solver.
 
 Residual kernels span only symmetric exposure products on shared people.
-They are whitened on their identifiable span before the genetic/residual
+They are restricted to their identifiable span before the genetic/residual
 system is solved. No symmetry constraint or PSD clipping is imposed on XY.
 """
 from __future__ import annotations
@@ -44,7 +44,10 @@ def assemble_cross_trait_normal_equations(*, genetic_gram, genetic_rhs,
     tol=max(np.max(np.abs(ev),initial=0)*residual_rtol,np.finfo(float).eps*100)
     if np.min(ev,initial=0)<-tol:
         raise ValueError('residual Gram is not positive semidefinite')
-    keep=ev>tol;transform=u[:,keep]/np.sqrt(ev[keep])
+    # Keep residual units comparable to the genetic Gram. Whitening only the
+    # residual block would artificially inflate full-cohort condition numbers
+    # by O(N), potentially changing the genetic rank decision.
+    keep=ev>tol;transform=u[:,keep]
     # Null residual directions cannot carry a material RHS or genetic moment.
     null=u[:,~keep]
     if (np.linalg.norm(gr@null)>1e-8*max(1,np.linalg.norm(gr))
@@ -123,6 +126,7 @@ def cross_trait_derived(omega_xy,omega_xx,omega_yy,*,mean_x,mean_y,context_covar
     denominators and records its cohort in provenance.
     """
     xy=np.asarray(omega_xy,dtype=float);xx=np.asarray(omega_xx,dtype=float);yy=np.asarray(omega_yy,dtype=float)
+    raw_xy,raw_xx,raw_yy=xy,xx,yy
     q=xy.shape[-1];cx=np.eye(q);cy=np.eye(q)
     cx[0,1:]=mean_x;cy[0,1:]=mean_y
     xy=cx@xy@cy.T;xx=cx@xx@cx.T;yy=cy@yy@cy.T
@@ -140,11 +144,13 @@ def cross_trait_derived(omega_xy,omega_xx,omega_yy,*,mean_x,mean_y,context_covar
         tx=np.einsum('ij,...ji->...',s,hx);ty=np.einsum('ij,...ji->...',s,hy)
         def ratio(c,vx,vy):
             return np.where((vx>0)&(vy>0),c/np.sqrt(vx*vy),np.nan)
-        baseline=ratio(xy[...,0,0],xx[...,0,0],yy[...,0,0])
+        baseline=ratio(raw_xy[...,0,0],raw_xx[...,0,0],raw_yy[...,0,0])
+        centered_baseline=ratio(xy[...,0,0],xx[...,0,0],yy[...,0,0])
         response=ratio(np.diagonal(xy,axis1=-2,axis2=-1)[...,1:],
                        np.diagonal(xx,axis1=-2,axis2=-1)[...,1:],np.diagonal(yy,axis1=-2,axis2=-1)[...,1:])
         orthogonal=ratio(trace,tx,ty)
-    return dict(omega_centered=xy,baseline_covariance=xy[...,0,0],baseline_rg=baseline,
+    return dict(omega_centered=xy,baseline_covariance=raw_xy[...,0,0],baseline_rg=baseline,
+        centered_baseline_covariance=xy[...,0,0],centered_baseline_rg=centered_baseline,
         response_block=xy[...,1:,1:],response_rg=response,h_xy=h,h_xx=hx,h_yy=hy,
         orthogonal_trace=trace,orthogonal_rg=orthogonal,
         baseline_rg_admissible=np.isfinite(baseline)&(np.abs(baseline)<=1),
@@ -173,6 +179,9 @@ def write_cross_trait_fit(path,fit,*,provenance,within_x=None,within_y=None,
                           mean_x=None,mean_y=None,context_covariance=None):
     arrays=dict(fit)
     if within_x is not None and within_y is not None:
+        for within in (within_x,within_y):
+            if 'block_ids' not in within or not np.array_equal(within['block_ids'],fit['block_ids']):
+                raise ValueError('within/cross deletion blocks must be explicitly paired')
         point=cross_trait_derived(fit['omega_xy'],within_x['omega'],within_y['omega'],
             mean_x=mean_x,mean_y=mean_y,context_covariance=context_covariance)
         deleted=cross_trait_derived(fit['loo_omega_xy'],within_x['loo'],within_y['loo'],

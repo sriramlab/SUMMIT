@@ -284,7 +284,24 @@ from .direction import (
     validate_direction_trait,
 )
 
+from .cross_trait_fit import (
+    CrossTraitEquations,
+    CrossTraitMomentPlan,
+    assemble_cross_trait_normal_equations,
+    solve_cross_trait_normal_equations,
+    cross_trait_derived,
+    fit_cross_trait,
+    write_cross_trait_fit,
+)
+
 __all__ = [
+    "CrossTraitEquations",
+    "CrossTraitMomentPlan",
+    "assemble_cross_trait_normal_equations",
+    "solve_cross_trait_normal_equations",
+    "cross_trait_derived",
+    "fit_cross_trait",
+    "write_cross_trait_fit",
     "APPROXIMATE_DELETION_CONTRACT",
     "ANNOTATION_PARTITION_KIND",
     "ANNOTATION_PARTITION_SCHEMA_VERSION",
