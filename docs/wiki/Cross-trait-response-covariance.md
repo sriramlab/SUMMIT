@@ -253,6 +253,10 @@ statistical approximation. Defaults retain the individual-pattern cache.
 `--parallel-cache-products` optionally uses the same reserved worker pool
 for independent cached products, with one BLAS thread per worker. Every task
 is joined before the process-wide BLAS limit is restored.
+`--max-cached-pair-sums` optionally bounds reusable sums of identical cached
+group combinations across trait pairs (default zero). These sums preserve
+the same exact overlap contraction, with possible floating-point regrouping;
+they do not approximate the masks or require another genotype traversal.
 
 `cross_trait_bivariate.py` compares both context-model baseline centerings
 with the existing ordinary SUMMIT HE fitter. It profiles baseline reference

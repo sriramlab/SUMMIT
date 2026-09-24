@@ -49,6 +49,8 @@ def main():
     p.add_argument('--missing-cache-strategy',choices=('patterns','pooled'),default='patterns')
     p.add_argument('--cache-addition-penalty-rows',type=float,default=8.)
     p.add_argument('--parallel-cache-products',action='store_true')
+    p.add_argument('--max-cached-pair-sums',type=int,default=0,
+        help='bound reusable sums of identical missing-group combinations across pairs')
     p.add_argument('--checkpoint-every-blocks',type=int,default=0,
         help='publish immutable running sums every this many decoded tiles (study only)')
     p.add_argument('--resume-from',type=Path,help='continue after this authenticated completed-tile checkpoint')
@@ -61,6 +63,7 @@ def main():
     a=p.parse_args()
     if a.z_output is not None and a.mode!='study':p.error('Z publication requires a complete study chromosome')
     if a.max_cached_missing_patterns<0:p.error('missing-pattern cache limit must be nonnegative')
+    if a.max_cached_pair_sums<0:p.error('cached pair-sum limit must be nonnegative')
     if a.minimum_cached_pattern_rows<1:p.error('cached patterns require a positive minimum row count')
     if not np.isfinite(a.cache_addition_penalty_rows) or a.cache_addition_penalty_rows<0:
         p.error('cache addition penalty must be finite and nonnegative')
@@ -118,6 +121,7 @@ def main():
             missing_cache_strategy=a.missing_cache_strategy,
             cache_addition_penalty_rows=a.cache_addition_penalty_rows,
             parallel_cache_products=a.parallel_cache_products,
+            max_cached_pair_sums=a.max_cached_pair_sums,
             residual_workers=a.residual_workers,residual_cpus=CPUS)
     z_accumulator=None;shared_tn=None;z_telemetry=[]
     if a.z_output is not None:
@@ -131,6 +135,7 @@ def main():
         shared_tn.begin_execution()
     print(json.dumps(dict(masked.report,phase='prepared',pairs=len(batch.scores.pairs),seconds=time.monotonic()-start,
                           cached_missing_patterns=len(batch.missing_pattern_rows),
+                          cached_pair_sum_groups=len(batch.cached_pair_sum_groups),
                           cached_missing_people=sum(map(len,batch.missing_pattern_rows)),
                           cpus=CPUS,blas=threadpool_info())),flush=True)
     identity=dict(chromosome=a.chromosome,variants=m,width=a.width,traits=list(names),
@@ -141,6 +146,7 @@ def main():
         max_cached_missing_patterns=a.max_cached_missing_patterns,
         minimum_cached_pattern_rows=a.minimum_cached_pattern_rows,missing_cache_strategy=a.missing_cache_strategy,
         cache_addition_penalty_rows=a.cache_addition_penalty_rows,parallel_cache_products=a.parallel_cache_products,
+        max_cached_pair_sums=a.max_cached_pair_sums,
         residual_workers=a.residual_workers,
         native_sha256=file_sha256(shared_tn._module.__file__) if shared_tn is not None else None)
     previous=(restore_study_checkpoint(a.resume_from,batch=batch,z=z_accumulator,identity=identity)
@@ -219,6 +225,7 @@ def main():
         missing_cache_strategy=a.missing_cache_strategy,
         cache_addition_penalty_rows=a.cache_addition_penalty_rows,
         parallel_cache_products=a.parallel_cache_products,
+        max_cached_pair_sums=a.max_cached_pair_sums,
         residual_workers=a.residual_workers,residual_worker_affinity=batch.residual_worker_affinity,
         residual_phase_timing='sum of worker elapsed times; residual_seconds measures wall time',
         timings=timings,seconds=final_progress['seconds'],traversal_seconds=final_progress['traversal_seconds'],

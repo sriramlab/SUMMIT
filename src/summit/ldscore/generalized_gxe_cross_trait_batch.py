@@ -10,6 +10,7 @@ from __future__ import annotations
 from time import perf_counter
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
+from collections import Counter
 from itertools import count
 import os
 from threadpoolctl import threadpool_limits
@@ -137,6 +138,7 @@ class CrossTraitBatch:
     def __init__(self, masked, *, block_ids, annotation_names, pairs=None,max_cached_missing_patterns=64,
                  minimum_cached_pattern_rows=64,missing_cache_strategy='patterns',
                  cache_addition_penalty_rows=8.,parallel_cache_products=False,
+                 max_cached_pair_sums=0,
                  residual_workers=1,residual_cpus=None):
         self.masked=masked;self.annotation_names=tuple(annotation_names)
         if int(minimum_cached_pattern_rows)!=minimum_cached_pattern_rows or minimum_cached_pattern_rows<1:
@@ -147,6 +149,8 @@ class CrossTraitBatch:
             raise ValueError('cache addition penalty must be finite and nonnegative')
         if int(max_cached_missing_patterns)!=max_cached_missing_patterns or max_cached_missing_patterns<0:
             raise ValueError('cache group budget must be a nonnegative integer')
+        if int(max_cached_pair_sums)!=max_cached_pair_sums or max_cached_pair_sums<0:
+            raise ValueError('cached pair-sum budget must be a nonnegative integer')
         self.residual_workers=int(residual_workers)
         self.residual_cpus=tuple(sorted(os.sched_getaffinity(0) if residual_cpus is None else residual_cpus))
         if (self.residual_workers<1 or self.residual_workers>len(self.residual_cpus)
@@ -230,6 +234,16 @@ class CrossTraitBatch:
                 if len(groups):
                     cached=np.sort(np.concatenate([self.missing_pattern_rows[j] for j in groups]))
                     geom['correction']=np.setdiff1d(geom['correction'],cached,assume_unique=True)
+        # Several pairs often use the identical collection of cached groups.
+        # Reuse a bounded number of complete sums, without expanding a dense
+        # pair-by-pattern-by-feature tensor or revisiting any genotype rows.
+        keys=[tuple(g.get('cached_patterns',())) for g in self.geometry]
+        counts=Counter(keys)
+        reusable=[key for key,n_use in counts.items() if n_use>1 and len(key)>1]
+        reusable.sort(key=lambda key:((counts[key]-1)*(len(key)-1),key),reverse=True)
+        self.cached_pair_sum_groups=reusable[:int(max_cached_pair_sums)]
+        lookup={key:i for i,key in enumerate(self.cached_pair_sum_groups)}
+        for geom,key in zip(self.geometry,keys):geom['cached_pair_sum']=lookup.get(key)
 
     def block(self,genotype,annotations,groups,*,z_callback=None,shared_tn_operator=None):
         """Yield unchanged within-trait statistics; accumulate cross statistics."""
@@ -252,6 +266,12 @@ class CrossTraitBatch:
         pattern_products=(self._map_residual_work(pattern_product,self.missing_pattern_rows)
                           if self.parallel_cache_products else
                           list(map(pattern_product,self.missing_pattern_rows)))
+        def sum_patterns(indices):
+            linear,square=(value.copy() for value in pattern_products[indices[0]])
+            for pattern in indices[1:]:
+                linear+=pattern_products[pattern][0];square+=pattern_products[pattern][1]
+            return linear,square
+        pair_sums=self._map_residual_work(sum_patterns,self.cached_pair_sum_groups)
         self.residual_phase_seconds['patterns']+=perf_counter()-start
         # Contract the small trait transform before applying all residual
         # multipliers. This is algebraically identical and avoids Q*H copies
@@ -270,8 +290,12 @@ class CrossTraitBatch:
                 square=squared[:,rows]@m.square_weights[rows]
             else:
                 linear=np.zeros_like(common_linear);square=np.zeros_like(common_square)
-            for pattern in geom.get('cached_patterns',()):
-                linear+=pattern_products[pattern][0];square+=pattern_products[pattern][1]
+            cached_sum=geom['cached_pair_sum']
+            if cached_sum is not None:
+                linear+=pair_sums[cached_sum][0];square+=pair_sums[cached_sum][1]
+            else:
+                for pattern in geom.get('cached_patterns',()):
+                    linear+=pattern_products[pattern][0];square+=pattern_products[pattern][1]
             if geom['nested'] is None and geom['inclusion_exclusion']:
                 linear=raw_traits[ix][0]+raw_traits[iy][0]-common_linear+linear
                 square=raw_traits[ix][1]+raw_traits[iy][1]-common_square+square

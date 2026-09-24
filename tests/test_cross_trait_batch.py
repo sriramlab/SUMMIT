@@ -73,7 +73,8 @@ def test_cross_projected_residual_moments_dense(disjoint,workers,rank_y):
 
 
 @pytest.mark.parametrize('minimum_rows',[16,64])
-def test_shared_missing_pattern_cache_preserves_exact_residual_moments(minimum_rows):
+@pytest.mark.parametrize('pair_sums',[0,8])
+def test_shared_missing_pattern_cache_preserves_exact_residual_moments(minimum_rows,pair_sums):
     rng=np.random.default_rng(889);n,m,q=321,29,3
     phi=np.c_[np.ones(n),rng.normal(size=(n,2))];u=np.linalg.qr(phi)[0]
     traits=[]
@@ -84,8 +85,10 @@ def test_shared_missing_pattern_cache_preserves_exact_residual_moments(minimum_r
     masked=MaskedTraitBatch(basis=phi,fixed_basis=u,residual_basis=phi,traits=traits)
     args=dict(block_ids=np.arange(3),annotation_names=('all',))
     uncached=CrossTraitBatch(masked,**args,max_cached_missing_patterns=0)
-    cached=CrossTraitBatch(masked,**args,minimum_cached_pattern_rows=minimum_rows)
+    cached=CrossTraitBatch(masked,**args,minimum_cached_pattern_rows=minimum_rows,
+        max_cached_pair_sums=pair_sums)
     assert sorted(map(len,cached.missing_pattern_rows))==([20,100] if minimum_rows==16 else [100])
+    assert bool(cached.cached_pair_sum_groups)==(bool(pair_sums) and minimum_rows==16)
     g=rng.normal(size=(m,n));a=np.ones((m,1));groups=np.arange(m)//10
     list(uncached.block(g,a,groups));list(cached.block(g,a,groups))
     np.testing.assert_allclose(cached.genetic_residual,uncached.genetic_residual,rtol=1e-12,atol=1e-10)
@@ -112,8 +115,10 @@ def test_pooled_mask_cache_reuses_disjoint_partial_patterns_exactly(budget,paral
     if parallel and len(cpus)<2:pytest.skip('two reserved CPUs required for parallel cache qualification')
     pooled=CrossTraitBatch(masked,**args,max_cached_missing_patterns=budget,
         minimum_cached_pattern_rows=1,missing_cache_strategy='pooled',cache_addition_penalty_rows=0,
+        max_cached_pair_sums=8,
         parallel_cache_products=parallel,residual_workers=2 if parallel else 1,residual_cpus=cpus)
     assert 0<len(pooled.missing_pattern_rows)<=budget
+    if budget==32:assert pooled.cached_pair_sum_groups
     used=np.concatenate(pooled.missing_pattern_rows)
     assert len(used)==len(np.unique(used))
     if budget<32:
