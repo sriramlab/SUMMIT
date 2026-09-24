@@ -68,6 +68,21 @@ def test_masked_callbacks_expose_existing_products_without_changing_outputs():
     np.testing.assert_array_equal(scores[0],np.stack([item[1] for item in got],axis=1))
 
 
+def test_different_annotations_have_a_mixed_sector_outside_single_annotation_repair():
+    phi,u,g,f,r,z=dense();m=len(z);q=phi.shape[1]
+    weights=np.c_[np.linspace(.1,1.7,m),np.linspace(1.9,.2,m)]
+    moments=ZMomentAccumulator([0],2,q,u.shape[1])
+    moments.add(z,weights,np.zeros(m,dtype=int))
+    mass=weights.sum(0)
+    true=np.einsum('j,k,acjk,bdjk->abcd',weights[:,0],weights[:,1],r,r).reshape(q*q,q*q)/mass.prod()
+    # Applying the SAME-annotation formula here deliberately violates its
+    # precondition. It cannot recover the cross-annotation antisymmetric part.
+    candidate=repair_single_annotation(saved(true,q),moments.global_products[0],
+        moments.global_products[1],mass=np.sqrt(mass.prod()))
+    assert np.linalg.norm(true-true.T)/np.linalg.norm(true)>1e-3
+    assert np.linalg.norm(candidate-true)/np.linalg.norm(true)>1e-3
+
+
 def test_guarded_shared_product_supplies_z_without_an_extra_product():
     from summit import gxeldcore
     from summit.ldscore.generalized_gxe_pass2 import ProtectedTNOperator

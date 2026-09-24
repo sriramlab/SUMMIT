@@ -7,7 +7,8 @@ target-block V matrices do not suffice for annotation-specific corrections.
 The quadratic antisymmetric correction repairs the symmetrized target-block
 Gram for a single annotation when supplied exact (not finite-probe) saved
 moments. Cross-annotation mixed symmetric/antisymmetric terms are not repaired
-by these moments alone. The API rejects that unsupported exactness claim.
+by this quadratic correction. The repair helper requires a single annotation;
+callers must establish target/source annotation identity from provenance.
 """
 from __future__ import annotations
 from pathlib import Path
