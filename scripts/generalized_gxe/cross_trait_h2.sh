@@ -66,6 +66,10 @@ case $mode in
   z_args=()
   mkdir -p "$output_root/pilot_study"
   if [[ $mode == pilot_with_z ]]; then z_args=(--z-output "$output_root/zpass_chr$chromosome.npz"); fi
+  if [[ $chromosome == 22 ]]; then
+   "$python_exe" "$launch" --threads 8 -- "$python_exe" "$code_root/scripts/generalized_gxe/private_python.py" \
+    pytest "$code_root/tests/test_cross_trait_zpass.py" "$code_root/tests/test_cross_trait_batch.py" -q -p no:cacheprovider
+  fi
   exec "$python_exe" "$launch" --threads 8 -- "$python_exe" "$code_root/scripts/generalized_gxe/private_python.py" \
     cross_trait_study study --base "$base" \
     --bed-prefix "/u/home/b/bronsonj/project-sriram/UKBB/imp/qc.v1/by_chr/imp.$chromosome" \
