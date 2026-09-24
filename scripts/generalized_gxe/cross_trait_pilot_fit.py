@@ -146,11 +146,14 @@ def fit_pilot(args):
         for ix,iy in pairs:
             if ix==iy:continue
             x,y=TRAITS[ix],TRAITS[iy];fit=fits[ix,iy]
+            cohort=dict(n_x=len(rows[x]),n_y=len(rows[y]),
+                n_overlap=len(np.intersect1d(rows[x],rows[y],assume_unique=True)))
             wx=dict(omega=fits[ix,ix]['omega_xy'],loo=fits[ix,ix]['loo_omega_xy'],block_ids=fit['block_ids'])
             wy=dict(omega=fits[iy,iy]['omega_xy'],loo=fits[iy,iy]['loo_omega_xy'],block_ids=fit['block_ids'])
             kwargs=dict(mean_x=phi[rows[x],1:].mean(0),mean_y=phi[rows[y],1:].mean(0),context_covariance=s)
             write_cross_trait_fit(args.output/f'{x}__{y}__{mode}.npz',fit,
-                provenance=dict(provenance,gram_mode=mode,trait_x=x,trait_y=y),within_x=wx,within_y=wy,**kwargs)
+                provenance=dict(provenance,gram_mode=mode,trait_x=x,trait_y=y,
+                    reference_n=n,**cohort),within_x=wx,within_y=wy,**kwargs)
             point=cross_trait_derived(fit['omega_xy'],wx['omega'],wy['omega'],**kwargs)
             loo=cross_trait_derived(fit['loo_omega_xy'],wx['loo'],wy['loo'],**kwargs)
             point['omega_xy']=fit['omega_xy'];loo['omega_xy']=fit['loo_omega_xy']
@@ -162,7 +165,7 @@ def fit_pilot(args):
                     elif quantity=='h_xy':ex,ey=basis_names[1+j//(q-1)],basis_names[1+j%(q-1)]
                     elif quantity in ('response_rg','response_minus_baseline_rg'):ex=ey=basis_names[j+1]
                     else:ex=ey='intercept' if quantity=='baseline_rg' else 'context_weighted'
-                    table.append(dict(trait_x=x,trait_y=y,mode=mode,quantity=quantity,entry=j,
+                    table.append(dict(trait_x=x,trait_y=y,**cohort,mode=mode,quantity=quantity,entry=j,
                         exposure_x=str(ex),exposure_y=str(ey),estimate=value,jackknife_se=se[j],
                         lower_95=value-1.96*se[j],upper_95=value+1.96*se[j]))
             print(json.dumps(dict(mode=mode,pair=[x,y],**diagnostics[ix,iy])),flush=True)

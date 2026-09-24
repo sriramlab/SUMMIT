@@ -28,7 +28,9 @@ def report(fits,output):
     comparisons=[];blocks=[]
     for x,y in itertools.combinations(TRAITS,2):
         category='cardiometabolic' if x in TRAITS[:6] and y in TRAITS[:6] else 'control_involving'
-        row=dict(trait_x=x,trait_y=y,pair_category=category,exploratory=True)
+        baseline=default[x,y,'baseline_rg','0']
+        cohort={name:baseline.get(name,'') for name in ('n_x','n_y','n_overlap')}
+        row=dict(trait_x=x,trait_y=y,**cohort,pair_category=category,exploratory=True)
         for quantity in ('baseline_rg','orthogonal_rg','orthogonal_minus_baseline_rg'):
             k=(x,y,quantity,'0');entry=default[k]
             for field in ('estimate','jackknife_se','lower_95','upper_95'):
@@ -45,7 +47,7 @@ def report(fits,output):
         if len(selected)!=4:raise ValueError('four named age/BMI cross entries are required')
         for entry in selected:
             k=key(entry)
-            blocks.append(dict(trait_x=x,trait_y=y,pair_category=category,exploratory=True,
+            blocks.append(dict(trait_x=x,trait_y=y,**cohort,pair_category=category,exploratory=True,
                 **{f:entry[f] for f in ('exposure_x','exposure_y','estimate','jackknife_se','lower_95','upper_95')},
                 maximum_mode_shift_se=shifts[k]['maximum_mode_shift_se'],
                 undefined_shift_modes=shifts[k]['undefined_shift_modes']))
