@@ -18,6 +18,7 @@ ROOT=Path(__file__).resolve().parents[2]
 sys.meta_path[:]=[f for f in sys.meta_path if type(f).__module__!='_gwldcore_editable']
 sys.path.insert(0,str(ROOT/'src'))
 import numpy as np
+from threadpoolctl import threadpool_limits
 from bed_reader import open_bed
 from summit.context.cross_trait_gram import chromosome_gram,orientation_matrix,saved
 from summit.context.cross_trait_zpass import repair_single_annotation
@@ -53,6 +54,7 @@ def main():
     parser.add_argument('--annotations',type=Path,required=True);parser.add_argument('--output',type=Path,required=True)
     parser.add_argument('--n',type=int,default=20000);parser.add_argument('--threads',type=int,default=8)
     args=parser.parse_args();args.output.mkdir(exist_ok=False);start=time.monotonic()
+    threadpool_limits(limits=args.threads)
     libc=ctypes.CDLL(None);assert libc.prctl(41,1,0,0,0)==0 and libc.prctl(42,0,0,0,0)==1
     master=args.base/'full_cohort_inputs_20260916/height_raw.npz';refroot=args.base/'shared_reference_full_20260916'
     manifest,panel,refdir,record=authenticated_reference(refroot/'MANIFEST.json',refroot,22,master)

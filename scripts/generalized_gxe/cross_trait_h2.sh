@@ -55,5 +55,19 @@ case $mode in
     --generated "$output_root/simulation_generate/generated.npz" --scores "$output_root/simulation_score/scores.npz"
   done
   ;;
+ real_gram)
+  exec "$python_exe" "$launch" --threads 8 -- "$python_exe" "$code_root/scripts/generalized_gxe/private_python.py" \
+    cross_trait_real_gram --base "$base" --bed-prefix /u/home/b/bronsonj/project-sriram/UKBB/imp/qc.v1/by_chr/imp.22 \
+    --annotations "$base/imputed_maf3_design/annotations_chr22.npy" --output "$output_root/real_gram_n40000" --n 40000 --threads 8
+  ;;
+ pilot)
+  chromosome=${3:-${SGE_TASK_ID:?chromosome required}}
+  [[ $chromosome =~ ^([1-9]|1[0-9]|2[0-2])$ ]]
+  exec "$python_exe" "$launch" --threads 8 -- "$python_exe" "$code_root/scripts/generalized_gxe/private_python.py" \
+    cross_trait_study study --base "$base" \
+    --bed-prefix "/u/home/b/bronsonj/project-sriram/UKBB/imp/qc.v1/by_chr/imp.$chromosome" \
+    --annotations "$base/imputed_maf3_design/annotations_chr$chromosome.npy" \
+    --output "$output_root/pilot_study/chr$chromosome" --chromosome "$chromosome" --common-only --traits 8 --threads 8
+  ;;
  *) exit 2 ;;
 esac
