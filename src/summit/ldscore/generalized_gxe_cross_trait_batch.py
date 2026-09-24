@@ -78,15 +78,25 @@ class CrossTraitBatch:
             ux=masked.fixed_basis[overlap]@x['transform']
             uy=masked.fixed_basis[overlap]@y['transform']
             d=masked.residual_basis[overlap]
-            cross=np.einsum('ih,ic,id->hcd',d,ux,uy,optimize=True)
+            # Inclusion/exclusion of missing-person products reuses the
+            # already computed per-trait fixed moments. Nested masks need no
+            # additional large covariate product at all.
+            nested=ix if len(overlap)==len(x['indices']) else (iy if len(overlap)==len(y['indices']) else None)
+            joint_missing=np.setdiff1d(np.arange(masked.n),np.union1d(x['indices'],y['indices']),assume_unique=True)
+            if nested is not None:
+                joint=masked.traits[nested]['master_residual']
+            else:
+                u0=masked.fixed_basis[joint_missing];d0=masked.residual_basis[joint_missing]
+                joint=(x['master_residual']+y['master_residual']-masked.master_residual
+                    +np.stack([u0.T@(d0[:,j,None]*u0) for j in range(h)]))
+            cross=x['transform'].T@joint@y['transform']
             leverage=1-np.sum(ux*ux,axis=1)-np.sum(uy*uy,axis=1)
             self.residual_gram[pair_index]=d.T@(d*leverage[:,None])+np.einsum('hcd,kcd->hk',cross,cross)
             self.residual_rhs[pair_index]=d.T@(x['common'].normalized_phenotypes[lx,0]
                                                          *y['common'].normalized_phenotypes[ly,0])
-            missing=np.setdiff1d(np.arange(masked.n),overlap,assume_unique=True)
-            subtract=len(missing)<len(overlap)
-            self.geometry.append(dict(overlap=overlap,correction=missing if subtract else overlap,
-                                      subtract=subtract,cross=cross))
+            use_missing=len(joint_missing)<len(overlap)
+            self.geometry.append(dict(overlap=overlap,correction=joint_missing if use_missing else overlap,
+                                      inclusion_exclusion=use_missing,nested=nested,cross=cross))
         self._ordered_lookup=np.empty((q,q),dtype=int)
         for i,(a,b) in enumerate(masked.pairs):
             self._ordered_lookup[a,b]=self._ordered_lookup[b,a]=i
@@ -94,12 +104,13 @@ class CrossTraitBatch:
     def block(self,genotype,annotations,groups,*,z_callback=None):
         """Yield unchanged within-trait statistics; accumulate cross statistics."""
         x=np.asarray(genotype,dtype=float);a=np.asarray(annotations,dtype=float);g=np.asarray(groups)
-        projections={};shared=[]
+        projections={};shared=[];raw_traits={}
         def collect(index,value):
             projections[index]=value
         yield from self.masked.block(x,score_callback=lambda s:self.scores.add(s,a,g),
             z_callback=z_callback,projection_callback=collect,
-            shared_callback=lambda linear,square:shared.extend((linear,square)))
+            shared_callback=lambda linear,square:shared.extend((linear,square)),
+            raw_callback=lambda i,linear,square:raw_traits.update({i:(linear,square)}))
         start=perf_counter();m=self.masked;q=m.q;h=m.h;p=len(m.pairs)
         # Only complements of overlaps are multiplied. Reuse shared products
         # across every pair; no decoded genotype is revisited.
@@ -108,17 +119,20 @@ class CrossTraitBatch:
         cache={}
         for pair_index,(ix,iy) in enumerate(self.scores.pairs):
             geom=self.geometry[pair_index];rows=geom['correction']
-            key=(geom['subtract'],rows.tobytes())
+            key=(int(ix),int(iy))
             # Identical masks share their raw moments in this tile. Retain
             # only the most recent mask to bound storage independently of T².
             if key not in cache:
-                if len(rows):
+                if geom['nested'] is not None:
+                    linear,square=raw_traits[geom['nested']]
+                elif len(rows):
                     linear=x[:,rows]@m.fixed_weights[rows]
                     square=squared[:,rows]@m.square_weights[rows]
                 else:
                     linear=np.zeros_like(common_linear);square=np.zeros_like(common_square)
-                if geom['subtract']:
-                    linear=common_linear-linear;square=common_square-square
+                if geom['nested'] is None and geom['inclusion_exclusion']:
+                    linear=raw_traits[ix][0]+raw_traits[iy][0]-common_linear+linear
+                    square=raw_traits[ix][1]+raw_traits[iy][1]-common_square+square
                 linear=np.einsum('jrc,rs->jsc',linear.reshape(len(x),m.multiplier_rank,m.fixed_rank),
                                  m.fixed_coefficients,optimize=True).reshape(len(x),h+1,q,m.fixed_rank)
                 raw=(square@m.square_coefficients).reshape(len(x),h+1,p)

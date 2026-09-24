@@ -48,6 +48,7 @@ class MaskedTraitBatch:
         square = np.column_stack([products] + [d[:, h, None]*products for h in range(self.h)])
         self.square_weights, self.square_coefficients = _compressed_column_span(square)
         master_residual = np.stack([u.T @ (d[:, h, None]*u) for h in range(self.h)])
+        self.master_residual = master_residual
         self.traits = []
         names = set()
         score_weights = []
@@ -101,6 +102,7 @@ class MaskedTraitBatch:
             score_weights.append(weights)
             self.traits.append(dict(name=name, indices=idx.copy(), common=common,
                 transform=transform, compressed_residual=compressed_residual,
+                master_residual=corrected,
                 correction=correction, subtract=subtract))
         if not self.traits:
             raise ValueError('at least one trait is required')
@@ -116,7 +118,7 @@ class MaskedTraitBatch:
                 self.fixed_weights, self.square_weights, self.score_weights)))
 
     def block(self, genotype, *, score_callback=None, z_callback=None,
-              projection_callback=None, shared_callback=None):
+              projection_callback=None, shared_callback=None, raw_callback=None):
         """Yield (name, scores[M,Q], information[M,P], residual[M,P,H]).
 
         Genotypes have shape variants x master people, use the reference
@@ -152,6 +154,8 @@ class MaskedTraitBatch:
                     square = shared_square-square
             else:
                 linear, square = shared_linear, shared_square
+            if raw_callback is not None:
+                raw_callback(index, linear, square)
             cross = np.einsum('brp,rt->btp',
                 linear.reshape(width, self.multiplier_rank, self.fixed_rank),
                 self.fixed_coefficients, optimize=True) @ trait['transform']

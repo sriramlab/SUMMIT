@@ -40,6 +40,9 @@ def main():
     p.add_argument('--variants',type=int,default=256);p.add_argument('--traits',type=int,choices=[6,8,42],default=8)
     p.add_argument('--threads',type=int,default=8);p.add_argument('--common-only',action='store_true')
     a=p.parse_args();a.output.mkdir(exist_ok=False);start=time.monotonic()
+    source_hashes={str(path.relative_to(ROOT)):file_sha256(path) for path in (
+        Path(__file__),ROOT/'src/summit/ldscore/generalized_gxe_masked_batch.py',
+        ROOT/'src/summit/ldscore/generalized_gxe_cross_trait_batch.py')}
     refroot=a.base/'shared_reference_full_20260916';master=a.base/'full_cohort_inputs_20260916/height_raw.npz'
     manifest,panel,reference,record=authenticated_reference(refroot/'MANIFEST.json',refroot,a.chromosome,master)
     expansion=a.base/'imputed_expansion_20260917';expanded=json.loads((expansion/'MANIFEST.json').read_text())
@@ -99,7 +102,7 @@ def main():
             if a.mode=='benchmark' or len(timings)%32==0:print(json.dumps(row),flush=True)
     provenance=dict(chromosome=a.chromosome,traits=list(names),input_sha256=input_hashes,
         reference_files=record['files'],reference_manifest_sha256=file_sha256(refroot/'MANIFEST.json'),
-        script_sha256=file_sha256(__file__),variant_visits=visits,genotype_traversals=1,
+        source_sha256=source_hashes,variant_visits=visits,genotype_traversals=1,
         genotype_scale='sealed_affine_mean_imputed',common_only=a.common_only,threads=a.threads,cpus=CPUS,
         timings=timings,seconds=time.monotonic()-start,traversal_seconds=time.monotonic()-traversal,
         peak_rss_kib=resource.getrusage(resource.RUSAGE_SELF).ru_maxrss,
