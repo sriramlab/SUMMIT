@@ -153,6 +153,8 @@ def cross_trait_derived(omega_xy,omega_xx,omega_yy,*,mean_x,mean_y,context_covar
         centered_baseline_covariance=xy[...,0,0],centered_baseline_rg=centered_baseline,
         response_block=xy[...,1:,1:],response_rg=response,h_xy=h,h_xx=hx,h_yy=hy,
         orthogonal_trace=trace,orthogonal_rg=orthogonal,
+        response_minus_baseline_rg=response-baseline[...,None],
+        orthogonal_minus_baseline_rg=orthogonal-baseline,
         baseline_rg_admissible=np.isfinite(baseline)&(np.abs(baseline)<=1),
         orthogonal_rg_admissible=np.isfinite(orthogonal)&(np.abs(orthogonal)<=1))
 
