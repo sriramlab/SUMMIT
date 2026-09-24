@@ -47,6 +47,7 @@ def main():
     p.add_argument('--minimum-cached-pattern-rows',type=int,default=64)
     p.add_argument('--missing-cache-strategy',choices=('patterns','pooled'),default='patterns')
     p.add_argument('--cache-addition-penalty-rows',type=float,default=8.)
+    p.add_argument('--parallel-cache-products',action='store_true')
     p.add_argument('--residual-workers',type=int,default=1,
         help='independent residual-pair workers, one BLAS thread each on reserved CPUs')
     a=p.parse_args()
@@ -101,6 +102,7 @@ def main():
             minimum_cached_pattern_rows=a.minimum_cached_pattern_rows,
             missing_cache_strategy=a.missing_cache_strategy,
             cache_addition_penalty_rows=a.cache_addition_penalty_rows,
+            parallel_cache_products=a.parallel_cache_products,
             residual_workers=a.residual_workers,residual_cpus=CPUS)
     z_accumulator=None;shared_tn=None;z_telemetry=[]
     if a.z_output is not None:
@@ -157,6 +159,7 @@ def main():
         minimum_cached_pattern_rows=a.minimum_cached_pattern_rows,
         missing_cache_strategy=a.missing_cache_strategy,
         cache_addition_penalty_rows=a.cache_addition_penalty_rows,
+        parallel_cache_products=a.parallel_cache_products,
         residual_workers=a.residual_workers,residual_worker_affinity=batch.residual_worker_affinity,
         residual_phase_timing='sum of worker elapsed times; residual_seconds measures wall time',
         timings=timings,seconds=time.monotonic()-start,traversal_seconds=time.monotonic()-traversal,

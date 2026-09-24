@@ -136,7 +136,8 @@ class CrossTraitBatch:
 
     def __init__(self, masked, *, block_ids, annotation_names, pairs=None,max_cached_missing_patterns=64,
                  minimum_cached_pattern_rows=64,missing_cache_strategy='patterns',
-                 cache_addition_penalty_rows=8.,residual_workers=1,residual_cpus=None):
+                 cache_addition_penalty_rows=8.,parallel_cache_products=False,
+                 residual_workers=1,residual_cpus=None):
         self.masked=masked;self.annotation_names=tuple(annotation_names)
         if int(minimum_cached_pattern_rows)!=minimum_cached_pattern_rows or minimum_cached_pattern_rows<1:
             raise ValueError('cached missing patterns require a positive minimum row count')
@@ -152,6 +153,7 @@ class CrossTraitBatch:
                 or len(set(self.residual_cpus))!=len(self.residual_cpus)):
             raise ValueError('residual workers require distinct reserved CPU IDs')
         self._executor=None;self.residual_worker_affinity={}
+        self.parallel_cache_products=bool(parallel_cache_products)
         self.scores=CrossTraitScoreAccumulator(trait_names=[t['name'] for t in masked.traits],
             num_basis=masked.q,num_annotations=len(annotation_names),block_ids=block_ids,pairs=pairs)
         self.geometry=[];self.residual_seconds=0.
@@ -245,8 +247,11 @@ class CrossTraitBatch:
         # across every pair; no decoded genotype is revisited.
         common_linear,common_square=shared
         squared=x*x
-        pattern_products=[(x[:,rows]@m.fixed_weights[rows],squared[:,rows]@m.square_weights[rows])
-                          for rows in self.missing_pattern_rows]
+        def pattern_product(rows):
+            return x[:,rows]@m.fixed_weights[rows],squared[:,rows]@m.square_weights[rows]
+        pattern_products=(self._map_residual_work(pattern_product,self.missing_pattern_rows)
+                          if self.parallel_cache_products else
+                          list(map(pattern_product,self.missing_pattern_rows)))
         self.residual_phase_seconds['patterns']+=perf_counter()-start
         # Contract the small trait transform before applying all residual
         # multipliers. This is algebraically identical and avoids Q*H copies
@@ -299,6 +304,12 @@ class CrossTraitBatch:
                 self.genetic_residual[b,pair_index]+=np.einsum('jk,jph->kph',a[take],value[take],optimize=True)
             phases['reduction']+=perf_counter()-tick
             return phases
+        for phases in self._map_residual_work(pair_work,range(len(self.geometry))):
+            for name,value in phases.items():self.residual_phase_seconds[name]+=value
+        self.residual_seconds+=perf_counter()-start
+
+    def _map_residual_work(self,function,items):
+        """Finish every independent task before restoring the global BLAS limit."""
         if self.residual_workers>1 and self._executor is None:
             next_cpu=count()
             def initialize_worker():
@@ -313,15 +324,11 @@ class CrossTraitBatch:
         limit=threadpool_limits(limits=1,user_api='blas') if self._executor else nullcontext()
         with limit:
             try:
-                results=(self._executor.map(pair_work,range(len(self.geometry))) if self._executor
-                         else map(pair_work,range(len(self.geometry))))
-                for phases in results:
-                    for name,value in phases.items():self.residual_phase_seconds[name]+=value
+                return list(self._executor.map(function,items) if self._executor else map(function,items))
             except BaseException:
                 # Join workers before restoring a process-wide BLAS limit.
                 self.close()
                 raise
-        self.residual_seconds+=perf_counter()-start
 
     def close(self):
         if self._executor is not None:
