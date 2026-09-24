@@ -44,8 +44,9 @@ per annotation/target-block fragment. No SNP or trait-pair Python loop is
 used for this score reduction. Exact overlap residual contractions are
 computed separately and included in the complete-pass timing.
 
-For large masked cohorts, the fixed-effect column span must be shared on
-master rows; its orthonormal restriction and rotation may differ by trait.
+For large masked cohorts, every fixed-effect column must lie in the master
+column span on that trait's rows. Its rank, orthonormal restriction and
+rotation may differ by trait, including a zero-column fixed basis.
 The dense oracle also supports unrelated fixed-effect spaces. Zero overlap
 has no residual kernels and no same-person contribution.
 
@@ -155,6 +156,9 @@ retain the existing frozen-source residual-profile change relative to its
 full-data value, using the study's residual geometry. Cross-chromosome LD is
 not computed. These deletion and chromosome conventions are approximations,
 not dense recomputation after removing both SNP axes.
+These intervals are conditional on the supplied reference and transport
+mode. They do not include independent probe redraws or transport-model
+uncertainty; the mode comparison reports that additional sensitivity.
 
 The baseline covariance and correlation use the master-basis `[0,0]` entries.
 For named-exposure orthogonal responses, first center each trait's intercept
@@ -214,6 +218,18 @@ The study command defaults to eight traits and all three annotations unless
 `--common-only` is supplied. `benchmark --traits 6` and `benchmark --traits 42`
 time within-only and complete cross passes on each decoded tile, report peak
 RSS and separate score and residual costs, and omit the first timing tile.
+`--residual-workers 8` distributes exact pair residual contractions across
+eight explicitly reserved CPUs while keeping each worker's NumPy BLAS
+single-threaded. Recorded worker affinities must match those reservations.
+
+`cross_trait_bivariate.py` compares both context-model baseline centerings
+with the existing ordinary SUMMIT HE fitter. It profiles baseline reference
+moments through `joint_chromosome_equations` and preserves all SNP/block
+counts. Expanding block means reproduces the original unweighted fitter's
+sufficient statistics and deletions exactly; it does not reconstruct
+per-SNP observations and cannot support SNP filtering or IRWLS. The ordinary
+baseline-only model and a conditional GxE baseline need not agree under
+nonzero context effects. Both comparisons and any one-SE failures are retained.
 
 ## Validation recorded on 23 September 2026
 
@@ -223,18 +239,19 @@ These results do not by themselves establish all acceptance criteria.
 
 | Check | Observed result |
 |---|---|
-| Portable suite at commit d996129 | 1,450 passed; 6 skipped; 1 xpassed |
+| Portable suite at commit 22e61a9 | 1,463 passed; 6 skipped; 1 xpassed |
 | Legacy within-trait full/deletion regression | Bit-identical |
-| Dense oracle, N=2,000, M=3,000, Q=3, about 60% overlap | Genetic Gram relative error 5.58e-15; coefficient error 1.86e-14 |
+| Dense oracle, N=2,000, M=3,000, Q=3, about 60% overlap, fixed ranks 5 and 4 | Genetic Gram relative error 2.37e-15; coefficient error 3.29e-14 |
 | Dense real chr22 reference, N=20,000, 41,275 common SNPs | Z repair relative error 2.26e-15 |
 | Q=1 baseline regression against bivariate SUMMIT | Agreement at 1e-12 on the same dense panel |
-| 42 traits × six within-trait arms, no genotype pass | First 252-fit run completed; corrected full-genome diagonal refit running |
+| 42 traits × six within-trait arms, full-genome same-person diagonals, no genotype pass | 252 fits completed and authenticated; 142 entries above one SE across 11 traits; maximum 7.52 SE |
 | Six-trait chr22 timing, five measured tiles | 2.565 versus 2.198 s per 128-SNP block; 16.66% total increment |
-| 42-trait chr22 timing, default exact missing-pattern cache | 30.481 versus 12.984 s per 128-SNP block; 134.76% increment (fails 30% target) |
+| 42-trait chr22 timing, eight exact residual workers, five measured tiles | 25.322 versus 14.266 s per 128-SNP block; 77.49% increment; RSS 11,803,520 KiB (fails 30% target) |
 | 42-trait score accumulation alone | 0.025% of within-trait time; exact overlap residual work dominates |
 | Block same-person apportionment, chr22 | Maximum relative LD-scalar error 0.000151906 (passes 0.001) |
 | Hoffman placement qualification 14886620 | 20 tests passed; eight physical cores; NumPy and native worker affinities verified |
 | Private-BLIS prediction and cross-trait checks at b271d90 | 95 passed |
+| Standalone chr22 Z, local versus Hoffman | Block products agree to 3.29e-16 relative; Hoffman traversal 651.87 s, one pass |
 
 Real-mask Gram relative Frobenius errors at N=20,000:
 
@@ -255,10 +272,17 @@ traversal for all 100 replicates. The small complete BED pipeline is tested.
 The original August simulation reference is obsolete under current
 same-person validation, so the large benchmark constructs a new guarded
 reference instead of bypassing that check. Large-simulation coverage,
-40,000-person validation, corrected 42-trait mode comparisons and pilot results
+40,000-person validation and pilot results
 remain pending in this version of the page. The 42-trait performance criterion
 is a measured failure. Increasing the cache limit from 64 to 256 did not
 improve the matched within/cross time ratio.
+
+The corrected refit table is `within_refits_full_diagonal/within_trait_mode_comparison.tsv`.
+The older `within_refits` run is preserved as provisional and must not supply
+paper estimates. Shared per-block diagnostics cover 221 chromosome fragments
+of the 200 deletion blocks. Their maximum factorization residual is 20.1%
+for a 285-SNP chr2 fragment (common-to-rare annotation pair); chromosome-average
+errors are not bounds on individual block residuals.
 
 The pilot hypothesis was recorded before fitting: a shared age–BMI response
 direction among LDL, ApoB, total cholesterol, non-HDL, HbA1c and DBP, absent
