@@ -240,6 +240,10 @@ python scripts/generalized_gxe/cross_trait_bivariate.py --base "$BASE" \
 python scripts/generalized_gxe/cross_trait_audit_pilot.py --repo "$PWD" \
   --fits "$NEW/pilot_fits" --report "$NEW/pilot_report" \
   --expected-blocks 200 --output "$NEW/pilot_audit"
+
+python scripts/generalized_gxe/cross_trait_pilot_figures.py \
+  --fits "$NEW/pilot_fits" --report "$NEW/pilot_report" \
+  --audit "$NEW/pilot_audit" --output "$NEW/pilot_figures"
 ```
 
 The pilot audit authenticates all 112 pair/mode artifacts and independently
@@ -248,6 +252,11 @@ recomputes the 5,936 estimates and paired intervals, covariance matrices,
 does not refit. `cross_trait_audit_simulation.py` similarly recomputes every
 simulation bias, RMSE, SE calibration and coverage value from the recorded
 replicates and checks undefined correlations against their marginal variances.
+The figure command requires the complete 22-chromosome, 200-block audit. It
+exports PDF and PNG versions of the paired response-minus-baseline intervals
+and the age–BMI covariance matrix, with file hashes and renderer versions.
+Matrix rows denote the trait's age response and columns its BMI response;
+the diagonal uses within-trait H. Intervals are nominal and exploratory.
 
 Production guarded native runs use the qualified placement launcher
 `scripts/generalized_gxe/private_python.py`; the Hoffman launcher is
