@@ -60,14 +60,17 @@ case $mode in
     cross_trait_real_gram --base "$base" --bed-prefix /u/home/b/bronsonj/project-sriram/UKBB/imp/qc.v1/by_chr/imp.22 \
     --annotations "$base/imputed_maf3_design/annotations_chr22.npy" --output "$output_root/real_gram_n40000" --n 40000 --threads 8
   ;;
- pilot)
+ pilot|pilot_with_z)
   chromosome=${3:-${SGE_TASK_ID:?chromosome required}}
   [[ $chromosome =~ ^([1-9]|1[0-9]|2[0-2])$ ]]
+  z_args=()
+  mkdir -p "$output_root/pilot_study"
+  if [[ $mode == pilot_with_z ]]; then z_args=(--z-output "$output_root/zpass_chr$chromosome.npz"); fi
   exec "$python_exe" "$launch" --threads 8 -- "$python_exe" "$code_root/scripts/generalized_gxe/private_python.py" \
     cross_trait_study study --base "$base" \
     --bed-prefix "/u/home/b/bronsonj/project-sriram/UKBB/imp/qc.v1/by_chr/imp.$chromosome" \
     --annotations "$base/imputed_maf3_design/annotations_chr$chromosome.npy" \
-    --output "$output_root/pilot_study/chr$chromosome" --chromosome "$chromosome" --common-only --traits 8 --threads 8
+    --output "$output_root/pilot_study/chr$chromosome" --chromosome "$chromosome" --common-only --traits 8 --threads 8 "${z_args[@]}"
   ;;
  *) exit 2 ;;
 esac

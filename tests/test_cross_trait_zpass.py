@@ -66,3 +66,20 @@ def test_masked_callbacks_expose_existing_products_without_changing_outputs():
             np.testing.assert_array_equal(a,b)
     np.testing.assert_allclose(zs[0],z,rtol=1e-12,atol=1e-12)
     np.testing.assert_array_equal(scores[0],np.stack([item[1] for item in got],axis=1))
+
+
+def test_guarded_shared_product_supplies_z_without_an_extra_product():
+    from summit import gxeldcore
+    from summit.ldscore.generalized_gxe_pass2 import ProtectedTNOperator
+    phi,u,g,_,_,z=dense()
+    batch=MaskedTraitBatch(basis=phi,fixed_basis=u,residual_basis=phi,traits=[dict(name='x',
+        indices=np.arange(len(phi)),fixed_basis=u,phenotype=np.random.default_rng(61).normal(size=len(phi)))])
+    expected=list(batch.block(g.T));values=[]
+    operator=ProtectedTNOperator(threads=int(gxeldcore.build_info()['blas_runtime_threads']))
+    operator.begin_execution()
+    actual=list(batch.block(g.T,z_callback=values.append,shared_tn_operator=operator))
+    assert operator.calls==1
+    np.testing.assert_allclose(values[0],z,rtol=1e-12,atol=1e-12)
+    for left,right in zip(actual[0][1:],expected[0][1:]):
+        np.testing.assert_allclose(left,right,rtol=1e-12,atol=1e-12)
+    assert operator.finish_execution()['available']

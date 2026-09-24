@@ -118,7 +118,8 @@ class MaskedTraitBatch:
                 self.fixed_weights, self.square_weights, self.score_weights)))
 
     def block(self, genotype, *, score_callback=None, z_callback=None,
-              projection_callback=None, shared_callback=None, raw_callback=None):
+              projection_callback=None, shared_callback=None, raw_callback=None,
+              shared_tn_operator=None):
         """Yield (name, scores[M,Q], information[M,P], residual[M,P,H]).
 
         Genotypes have shape variants x master people, use the reference
@@ -128,7 +129,8 @@ class MaskedTraitBatch:
         if x.shape[1] != self.n:
             raise ValueError('genotype block does not match master sample axis')
         width = len(x)
-        shared_linear = x @ self.fixed_weights
+        shared_linear = (x @ self.fixed_weights if shared_tn_operator is None
+            else shared_tn_operator.matmul_tn(x.T,self.fixed_weights))
         scores = (x @ self.score_weights).reshape(width, len(self.traits), self.q)
         if score_callback is not None:
             score_callback(scores)

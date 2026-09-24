@@ -76,6 +76,8 @@ def fit_pilot(args):
             zp=args.z_root/f'zpass_chr{ch}.npz';z,zm=load_array_artifact(zp,kind='summit.cross_trait.z_moments')
             if zm['reference_files']!=record['files'] or zm['master_input_sha256']!=file_sha256(master):
                 raise ValueError(f'Z pass identity differs: {zp}')
+            if zm['execution_ledger']['retained_variant_visits']!=panel['m']:
+                raise ValueError('Z pass chromosome is incomplete')
             np.testing.assert_array_equal(z['block_ids'],refs[-1].block_ids)
             repaired.append(z);completion_hashes[str(zp)]=file_sha256(zp)
         for r0 in {roots[t] for t in TRAITS}:

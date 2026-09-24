@@ -102,7 +102,7 @@ class CrossTraitBatch:
         for i,(a,b) in enumerate(masked.pairs):
             self._ordered_lookup[a,b]=self._ordered_lookup[b,a]=i
 
-    def block(self,genotype,annotations,groups,*,z_callback=None):
+    def block(self,genotype,annotations,groups,*,z_callback=None,shared_tn_operator=None):
         """Yield unchanged within-trait statistics; accumulate cross statistics."""
         x=np.asarray(genotype,dtype=float);a=np.asarray(annotations,dtype=float);g=np.asarray(groups)
         projections={};shared=[];raw_traits={}
@@ -110,6 +110,7 @@ class CrossTraitBatch:
             projections[index]=value
         yield from self.masked.block(x,score_callback=lambda s:self.scores.add(s,a,g),
             z_callback=z_callback,projection_callback=collect,
+            shared_tn_operator=shared_tn_operator,
             shared_callback=lambda linear,square:shared.extend((linear,square)),
             raw_callback=lambda i,linear,square:raw_traits.update({i:(linear,square)}))
         start=perf_counter();m=self.masked;q=m.q;h=m.h;p=len(m.pairs)

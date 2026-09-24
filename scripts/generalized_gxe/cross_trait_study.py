@@ -23,7 +23,9 @@ import pgenlib
 from threadpoolctl import threadpool_limits,threadpool_info
 import workflow
 from summit.context.reference_zpass_cli import authenticated_reference,file_sha256
-from summit.context.spec import array_sha256
+from summit.context.spec import array_sha256,canonical_sha256
+from summit.context.cross_trait_zpass import ZMomentAccumulator
+from summit.ldscore.generalized_gxe_pass2 import ProtectedTNOperator
 from summit.ldscore.generalized_gxe_masked_batch import MaskedTraitBatch
 from summit.ldscore.generalized_gxe_cross_trait_batch import CrossTraitBatch
 
@@ -39,7 +41,9 @@ def main():
     p.add_argument('--chromosome',type=int,default=22);p.add_argument('--width',type=int,default=128)
     p.add_argument('--variants',type=int,default=256);p.add_argument('--traits',type=int,choices=[6,8,42],default=8)
     p.add_argument('--threads',type=int,default=8);p.add_argument('--common-only',action='store_true')
+    p.add_argument('--z-output',type=Path,help='collect guarded reference Z moments in this same traversal')
     a=p.parse_args();a.output.mkdir(exist_ok=False);start=time.monotonic()
+    if a.z_output is not None and a.mode!='study':p.error('Z publication requires a complete study chromosome')
     source_hashes={str(path.relative_to(ROOT)):file_sha256(path) for path in (
         Path(__file__),ROOT/'src/summit/ldscore/generalized_gxe_masked_batch.py',
         ROOT/'src/summit/ldscore/generalized_gxe_cross_trait_batch.py')}
@@ -68,7 +72,7 @@ def main():
         if file_sha256(prefix+suffix)!=panel[key]:raise ValueError(f'panel checksum differs: {suffix}')
     if Path(prefix+'.bed').stat().st_size!=panel['bed_size']:raise ValueError('BED size differs')
     with np.load(reference/'reference_aux.npz') as z:mean,inverse=z['affine_mean'],z['affine_inverse_scale']
-    annotation_names=manifest['annotation_names']
+    full_annotations=annotations;annotation_names=manifest['annotation_names']
     if a.common_only:
         # The sealed annotations are ordered rare, low-frequency, common.
         annotation_names=[annotation_names[2]];annotations=annotations[:,2:3]
@@ -78,6 +82,16 @@ def main():
         residual,residual_names,_=workflow.rank_reduced_symmetric_context_residual_basis(phi,tuple(basis_names.astype(str)))
         masked=MaskedTraitBatch(basis=phi,fixed_basis=fixed,residual_basis=residual,traits=traits)
         batch=CrossTraitBatch(masked,block_ids=np.unique(groups[:limit]),annotation_names=annotation_names)
+    z_accumulator=None;shared_tn=None;z_telemetry=[]
+    if a.z_output is not None:
+        if a.z_output.exists():raise FileExistsError(a.z_output)
+        z_accumulator=ZMomentAccumulator(np.unique(groups[:limit]),full_annotations.shape[1],masked.q,masked.fixed_rank)
+        shared_tn=ProtectedTNOperator(threads=a.threads)
+        native_build=dict(shared_tn._module.build_info())
+        if not native_build['gemm_integrity_enabled'] or not native_build['gemm_checksum_enabled']:
+            raise RuntimeError('fused Z collection requires both native GEMM guards')
+        masked.fixed_weights=np.asfortranarray(masked.fixed_weights)
+        shared_tn.begin_execution()
     print(json.dumps(dict(masked.report,phase='prepared',pairs=len(batch.scores.pairs),seconds=time.monotonic()-start,
                           cpus=CPUS,blas=threadpool_info())),flush=True)
     raw_n=sum(1 for _ in open(prefix+'.fam'));raw=np.empty((a.width,len(rows)),dtype=np.int8)
@@ -90,7 +104,7 @@ def main():
             x=raw[:width].astype(float);missing=x==-9;x-=mean[begin:end,None];x*=inverse[begin:end,None];x[missing]=0
             decode=time.monotonic()-tick;baseline=np.nan
             tile_annotations=annotations[begin:end];tile_groups=groups[begin:end]
-            if a.common_only:
+            if a.common_only and z_accumulator is None:
                 active=np.any(tile_annotations>0,axis=1)
                 x=x[active];tile_annotations=tile_annotations[active];tile_groups=tile_groups[active]
             if a.mode=='benchmark':
@@ -99,7 +113,10 @@ def main():
                 baseline=time.monotonic()-tick
             score_before=batch.scores.seconds;residual_before=batch.residual_seconds;tick=time.monotonic()
             if len(x):
-                for _ in batch.block(x,tile_annotations,tile_groups):pass
+                callback=(None if z_accumulator is None else
+                    lambda z:z_accumulator.add(z,full_annotations[begin:end],groups[begin:end]))
+                for _ in batch.block(x,tile_annotations,tile_groups,z_callback=callback,shared_tn_operator=shared_tn):pass
+                if shared_tn is not None:z_telemetry.append(canonical_sha256(shared_tn.finish_execution()))
             total=time.monotonic()-tick;visits+=width
             row=dict(begin=begin,end=end,decode_seconds=decode,within_seconds=baseline,cross_total_seconds=total,
                 score_seconds=batch.scores.seconds-score_before,residual_seconds=batch.residual_seconds-residual_before)
@@ -123,6 +140,14 @@ def main():
     else:
         if visits!=m:raise RuntimeError('incomplete chromosome traversal')
         batch.write(a.output/'cross_trait_summary.npz',provenance=provenance)
+    if z_accumulator is not None:
+        if z_accumulator.variants!=limit:raise RuntimeError('fused Z visit ledger differs')
+        z_accumulator.write(a.z_output,provenance=dict(provenance,master_input_sha256=file_sha256(master),
+            manifest_sha256=file_sha256(refroot/'MANIFEST.json'),annotation_sha256=array_sha256(full_annotations),
+            native_build=native_build,telemetry_sha256=z_telemetry,
+            execution_ledger=dict(observed_genotype_passes=1,retained_variant_visits=limit,
+                protected_tn_calls=shared_tn.calls,repaired_columns=shared_tn.repaired_columns),
+            z_source='guarded shared fixed_weights contraction; no additional genotype product or pass'))
     with (a.output/'COMPLETE.json').open('x') as f:json.dump(provenance,f,indent=2)
 
 
