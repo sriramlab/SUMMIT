@@ -96,7 +96,8 @@ class CrossTraitBatch:
                                                          *y['common'].normalized_phenotypes[ly,0])
             use_missing=len(joint_missing)<len(overlap)
             self.geometry.append(dict(overlap=overlap,correction=joint_missing if use_missing else overlap,
-                                      inclusion_exclusion=use_missing,nested=nested,cross=cross))
+                inclusion_exclusion=use_missing,nested=nested,
+                cross_gemm=np.ascontiguousarray(cross.transpose(1,0,2)).reshape(masked.fixed_rank,-1)))
         self._ordered_lookup=np.empty((q,q),dtype=int)
         for i,(a,b) in enumerate(masked.pairs):
             self._ordered_lookup[a,b]=self._ordered_lookup[b,a]=i
@@ -116,6 +117,10 @@ class CrossTraitBatch:
         # across every pair; no decoded genotype is revisited.
         common_linear,common_square=shared
         squared=x*x
+        # Contract the small trait transform before applying all residual
+        # multipliers. This is algebraically identical and avoids Q*H copies
+        # of the C by C transform for every pair and SNP.
+        master_projection={i:z@m.traits[i]['transform'].T for i,z in projections.items()}
         cache={}
         for pair_index,(ix,iy) in enumerate(self.scores.pairs):
             geom=self.geometry[pair_index];rows=geom['correction']
@@ -138,12 +143,14 @@ class CrossTraitBatch:
                 raw=(square@m.square_coefficients).reshape(len(x),h+1,p)
                 cache={key:(linear,raw)}
             linear,raw=cache[key]
-            tx,ty=m.traits[ix]['transform'],m.traits[iy]['transform']
             zx,zy=projections[ix],projections[iy]
             value=raw[:,1:,self._ordered_lookup].transpose(0,2,3,1).copy()
-            value-=np.einsum('jhqc,jrc->jqrh',linear[:,1:]@ty,zy,optimize=True)
-            value-=np.einsum('jqc,jhrc->jqrh',zx,linear[:,1:]@tx,optimize=True)
-            value+=np.einsum('jqc,hcd,jrd->jqrh',zx,geom['cross'],zy,optimize=True)
+            value-=np.einsum('jhqc,jrc->jqrh',linear[:,1:],master_projection[iy],optimize=True)
+            value-=np.einsum('jqc,jhrc->jqrh',master_projection[ix],linear[:,1:],optimize=True)
+            # An unconstrained einsum path makes a width*Q²*C² outer product.
+            # Explicit GEMMs contract C first, using width*Q*H*C workspace.
+            projected=(zx.reshape(-1,m.fixed_rank)@geom['cross_gemm']).reshape(len(x),q*h,m.fixed_rank)
+            value+=(projected@zy.transpose(0,2,1)).reshape(len(x),q,h,q).transpose(0,1,3,2)
             value=value.reshape(len(x),q*q,h)
             for label in np.unique(g):
                 take=g==label;b=np.searchsorted(self.scores.block_ids,label)
