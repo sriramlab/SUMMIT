@@ -103,7 +103,7 @@ class MaskedTraitBatch:
             score_weights.append(weights)
             self.traits.append(dict(name=name, indices=idx.copy(), common=common,
                 transform=transform, fixed_rank=rank,compressed_residual=compressed_residual,
-                master_residual=corrected,
+                master_residual=corrected,fixed_leverage=leverage,
                 correction=correction, subtract=subtract))
         if not self.traits:
             raise ValueError('at least one trait is required')

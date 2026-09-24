@@ -88,8 +88,6 @@ class CrossTraitBatch:
         for pair_index,(ix,iy) in enumerate(self.scores.pairs):
             x,y=masked.traits[ix],masked.traits[iy]
             overlap,lx,ly=np.intersect1d(x['indices'],y['indices'],return_indices=True)
-            ux=masked.fixed_basis[overlap]@x['transform']
-            uy=masked.fixed_basis[overlap]@y['transform']
             d=masked.residual_basis[overlap]
             # Inclusion/exclusion of missing-person products reuses the
             # already computed per-trait fixed moments. Nested masks need no
@@ -103,7 +101,10 @@ class CrossTraitBatch:
                 joint=(x['master_residual']+y['master_residual']-masked.master_residual
                     +np.stack([u0.T@(d0[:,j,None]*u0) for j in range(h)]))
             cross=x['transform'].T@joint@y['transform']
-            leverage=1-np.sum(ux*ux,axis=1)-np.sum(uy*uy,axis=1)
+            # These are the actual supplied trait projectors' row norms,
+            # already computed once by MaskedTraitBatch. Reconstructing two
+            # overlap-by-fixed-rank matrices per pair is unnecessary.
+            leverage=1-x['fixed_leverage'][lx]-y['fixed_leverage'][ly]
             self.residual_gram[pair_index]=d.T@(d*leverage[:,None])+np.einsum('hcd,kcd->hk',cross,cross)
             self.residual_rhs[pair_index]=d.T@(x['common'].normalized_phenotypes[lx,0]
                                                          *y['common'].normalized_phenotypes[ly,0])

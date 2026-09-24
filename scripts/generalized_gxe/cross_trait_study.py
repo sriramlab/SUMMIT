@@ -61,16 +61,19 @@ def main():
     names=sorted(inputroots) if a.traits==42 else PILOT[:a.traits]
     if len(names)!=a.traits:raise ValueError(f'expected {a.traits} input traits, found {len(names)}')
     with np.load(master) as z:rows,phi,fixed,basis_names=(z[k] for k in ('rows','phi','fixed','basis_names'))
-    traits=[];input_hashes={}
-    for name in names:
-        inputroot,source_manifest=inputroots[name];path=inputroot/f'{name}.npz'
-        digest=file_sha256(path)
-        if digest!=source_manifest['trait_sources'][name]:raise ValueError(f'input checksum differs: {path}')
-        input_hashes[str(path)]=digest
-        with np.load(path) as z:
-            idx=np.searchsorted(rows,z['rows']);np.testing.assert_array_equal(rows[idx],z['rows'])
-            u=z['fixed'] if 'fixed' in z else fixed[idx]@z['fixed_from_master']
-            traits.append(dict(name=name,indices=idx,fixed_basis=u,phenotype=z['y']))
+    input_hashes={}
+    def load_traits():
+        # The batch keeps transforms and sufficient moments. Supply one
+        # full fixed basis at a time instead of retaining all T input bases.
+        for name in names:
+            inputroot,source_manifest=inputroots[name];path=inputroot/f'{name}.npz'
+            digest=file_sha256(path)
+            if digest!=source_manifest['trait_sources'][name]:raise ValueError(f'input checksum differs: {path}')
+            input_hashes[str(path)]=digest
+            with np.load(path) as z:
+                idx=np.searchsorted(rows,z['rows']);np.testing.assert_array_equal(rows[idx],z['rows'])
+                u=z['fixed'] if 'fixed' in z else fixed[idx]@z['fixed_from_master']
+                yield dict(name=name,indices=idx,fixed_basis=u,phenotype=z['y'])
     annotations=np.load(a.annotations,allow_pickle=False)
     if array_sha256(annotations)!=panel['annotation_sha256']:raise ValueError('annotation checksum differs')
     prefix=str(a.bed_prefix)
@@ -86,7 +89,7 @@ def main():
     groups=(np.arange(m)+panel['global_start'])*manifest['njack']//manifest['variants']
     with threadpool_limits(limits=1):
         residual,residual_names,_=workflow.rank_reduced_symmetric_context_residual_basis(phi,tuple(basis_names.astype(str)))
-        masked=MaskedTraitBatch(basis=phi,fixed_basis=fixed,residual_basis=residual,traits=traits)
+        masked=MaskedTraitBatch(basis=phi,fixed_basis=fixed,residual_basis=residual,traits=load_traits())
         batch=CrossTraitBatch(masked,block_ids=np.unique(groups[:limit]),annotation_names=annotation_names,
             max_cached_missing_patterns=a.max_cached_missing_patterns,
             residual_workers=a.residual_workers,residual_cpus=CPUS)
