@@ -87,6 +87,10 @@ def main():
     ref=SimpleNamespace(n_samples=args.n,num_basis=q,annotation_names=('common',),residual_rank=args.n-u.shape[1],
         block_masses=np.array([[mass]],dtype=float),block_directed=saved(tr,q)[None]*mass**2/(args.n-u.shape[1])**2)
     diagonal=orientation_matrix(q)@dr
+    reference_assembled=chromosome_gram(ref,diagonal,phi,np.arange(args.n),
+        global_masses=[mass],mode='legacy_transport_exact',repaired_blocks=repaired[None]).matrix
+    assembly_error=float(np.linalg.norm(reference_assembled-tr)/np.linalg.norm(tr))
+    if assembly_error>1e-12:raise AssertionError(('Z-repaired reference assembly',assembly_error))
     traits=[];input_hashes={}
     for name,path in (
         ('fev1',args.base/'full_cohort_inputs_20260916/fev1_best_acceptable_litres.npz'),
@@ -135,6 +139,7 @@ def main():
         writer=csv.DictWriter(f,fieldnames=list(tables[0]),delimiter='\t');writer.writeheader();writer.writerows(tables)
     with (args.output/'dense_moments.npz').open('xb') as f:np.savez(f,**arrays)
     result=dict(n=args.n,m=mass,seed=1,Z_repair_relative_error=repair_error,seconds=time.monotonic()-start,
+        Z_repaired_reference_assembly_relative_error=assembly_error,
         reference_source_files=record['files'],input_sha256=input_hashes,script_sha256=file_sha256(__file__),
         peak_rss_kib=resource.getrusage(resource.RUSAGE_SELF).ru_maxrss,cpus=sorted(os.sched_getaffinity(0)),
         common_genotype_scale='sealed full-cohort affine, no subsample renormalization',
