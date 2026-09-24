@@ -244,7 +244,7 @@ def within_trait_equations(reference_chromosomes, study_chromosomes, *,
         reference_diagonals, phi, rows, mode='factorized', same_person_mode='own_rows',
         reference_residual_gram, reference_residual_traces, reference_same_person,
         residual_gram, residual_rhs, residual_traces, residual_names,
-        deleted_blocks=(), expected_chromosomes=None):
+        deleted_blocks=(), expected_chromosomes=None, prepared_grams=None):
     """Corrected within-trait chromosome assembly, with a bit-exact old arm.
 
     The legacy/scaled arm delegates to the unchanged in-house implementation.
@@ -278,9 +278,16 @@ def within_trait_equations(reference_chromosomes, study_chromosomes, *,
                 or not np.array_equal(r.block_masses, c.block_masses)
                 or r.annotation_names != c.annotation_names):
             raise ValueError('reference/study block designs differ')
-        g = chromosome_gram(r, reference_diagonals[c.chromosome], phi, rows,
-            global_masses=full_masses, mode=mode, same_person_mode=same_person_mode,
-            ordered=False)
+        if prepared_grams is None:
+            g = chromosome_gram(r, reference_diagonals[c.chromosome], phi, rows,
+                global_masses=full_masses, mode=mode, same_person_mode=same_person_mode,
+                ordered=False)
+        else:
+            g = prepared_grams[c.chromosome]
+            if (g.diagnostics['mode'] != mode or g.diagnostics['same_person_mode'] != same_person_mode
+                    or g.diagnostics['n_x'] != len(rows) or g.diagnostics['n_y'] != len(rows)
+                    or g.same_person.shape != (target.genetic_count, target.genetic_count)):
+                raise ValueError('prepared chromosome Gram design differs')
         take = ~np.isin(c.block_ids, deleted_blocks)
         off = g.different_person_blocks[take].sum(axis=0)
         replacement += g.same_person + off*mass_restore[:, None]*mass_restore[None]
