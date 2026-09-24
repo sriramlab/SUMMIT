@@ -19,6 +19,7 @@ sys.path.insert(0,str(ROOT/'src'))
 import numpy as np
 from summit.context.cross_trait_gram import chromosome_gram,within_trait_equations
 from summit.context.fit import solve_context_normal_equations
+from summit.context.cross_trait_fit import restore_deleted_genetic_mass
 from summit.context.annotations import _jackknife_covariance
 from summit.context.oracle import coefficients_to_omegas
 from summit.context.spec import ContextComponentIndex,ContextPairIndex
@@ -68,6 +69,8 @@ def main():
     p=argparse.ArgumentParser(description=__doc__)
     p.add_argument('--base',type=Path,required=True);p.add_argument('--output',type=Path,required=True)
     p.add_argument('--traits',nargs='*')
+    p.add_argument('--unrestored-deletions',action='store_true',
+        help='reproduce raw deleted-system coefficients before study-collector mass restoration')
     p.add_argument('--diagnostics-only',action='store_true',help='publish shared per-block reference diagnostics without fitting')
     a=p.parse_args();a.output.mkdir(exist_ok=False)
     started=time.monotonic();refroot=a.base/'shared_reference_full_20260916'
@@ -109,6 +112,7 @@ def main():
     table=[];diagnostics=[];failures=[]
     commit=subprocess.check_output(['git','rev-parse','HEAD'],cwd=ROOT,text=True).strip()
     provenance=dict(branch='feat/cross-trait-response-covariance',commit=commit,script_sha256=file_sha256(__file__),
+        deleted_genetic_mass_restored=not a.unrestored_deletions,
         source_completion_sha256=completion_hashes,manifest_sha256={str(k):v for k,v in hashes.items()},
         uncertainty='paired 200-block frozen-source mass-restored deletion; frozen same-person',genotype_traversals=0)
     # These reference diagnostics do not depend on the trait mask or fit mode.
@@ -153,13 +157,20 @@ def main():
                         mode=mode,same_person_mode=sp,prepared_grams=prepared,deleted_blocks=deleted,
                         full_same_person=own_same if sp=='own_rows' else len(rows)/ref[0].n_samples*same,**options,**common)
                 full=eq();fit=solve_context_normal_equations(full)
-                loo=np.array([solve_context_normal_equations(eq((b,))).coefficients for b in blocks])
+                deleted_equations=[eq((b,)) for b in blocks]
+                raw_loo=np.array([solve_context_normal_equations(e).coefficients for e in deleted_equations])
+                retained=np.array([e.annotation_masses for e in deleted_equations])
+                loo=(raw_loo.copy() if a.unrestored_deletions else
+                     restore_deleted_genetic_mass(raw_loo,masses,retained,len(ContextPairIndex(q))))
                 omega=coefficients_to_omegas(fit.coefficients[:len(components)],components)
                 loomega=np.array([coefficients_to_omegas(row[:len(components)],components) for row in loo])
                 values=quantities(omega,mean,s);deleted=quantities(loomega,mean,s)
                 results[key]=(values,deleted,full.matrix)
                 arrays=dict(omega=omega,loo_omega=loomega,coefficients=fit.coefficients,loo_coefficients=loo,
                     covariance=_jackknife_covariance(loo),normal_matrix=full.matrix,normal_rhs=full.rhs,
+                    raw_loo_coefficients=raw_loo,loo_annotation_masses=retained,
+                    loo_mass_restoration=masses[None]/retained,
+                    loo_genetic_mass_restored=np.array(not a.unrestored_deletions),
                     same_person_gram=own_same if sp=='own_rows' else len(rows)/ref[0].n_samples*same,
                     block_ids=blocks,environment_mean=mean,environment_covariance=s)
                 write_array_artifact(a.output/f'{name}__{key}.npz',kind='summit.cross_trait.within_refit',arrays=arrays,

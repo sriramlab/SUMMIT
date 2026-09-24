@@ -181,21 +181,51 @@ def cross_trait_derived(omega_xy,omega_xx,omega_yy,*,mean_x,mean_y,context_covar
         orthogonal_rg_admissible=np.isfinite(orthogonal)&(np.abs(orthogonal)<=1))
 
 
-def fit_cross_trait(plan, *, rtol=None):
+def restore_deleted_genetic_mass(coefficients, full_masses, retained_masses,
+                                components_per_annotation):
+    """Use the study collector's full-mass scale after a deleted-system solve.
+
+    The equations use retained annotation masses on both kernel axes. The
+    reported genetic coefficients then receive M/(M-M_b), as in
+    research_push_20260922/scripts/collect_scales.py. Residual coefficients
+    retain their solved units. This is distinct from normalizing the Gram.
+    """
+    values=np.asarray(coefficients,dtype=float)
+    full=np.asarray(full_masses,dtype=float);retained=np.asarray(retained_masses,dtype=float)
+    width=int(components_per_annotation);p=len(full)*width
+    if (full.ndim!=1 or width<1 or width!=components_per_annotation
+            or values.ndim!=2 or retained.shape!=(len(values),len(full))
+            or values.shape[1]<p or not np.isfinite(values).all()
+            or not np.isfinite(full).all() or not np.isfinite(retained).all()
+            or np.any(full<=0) or np.any(retained<=0) or np.any(retained>full)):
+        raise ValueError('invalid deleted annotation masses or coefficient axes')
+    restored=values.copy()
+    restored[:,:p]*=np.repeat(full[None]/retained,width,axis=1)
+    return restored
+
+
+def fit_cross_trait(plan, *, rtol=None, restore_mass=True):
     full=plan.equations();point=solve_cross_trait_normal_equations(full,rtol=rtol)
     p=full.equations.genetic_count
-    loo=[];loo_full=[];loo_rank=[];loo_condition=[]
+    loo_full=[];loo_rank=[];loo_condition=[];retained_masses=[]
     for block in plan.block_ids:
-        result=solve_cross_trait_normal_equations(plan.equations((block,)),rtol=rtol)
+        deleted=plan.equations((block,))
+        result=solve_cross_trait_normal_equations(deleted,rtol=rtol)
         loo_full.append(result.coefficients)
-        loo.append(result.coefficients[:p]);loo_rank.append(result.rank);loo_condition.append(result.condition_number)
-    loo=np.asarray(loo)
-    loo_full=np.asarray(loo_full)
+        retained_masses.append(deleted.equations.annotation_masses)
+        loo_rank.append(result.rank);loo_condition.append(result.condition_number)
+    raw_loo=np.asarray(loo_full);retained_masses=np.asarray(retained_masses)
+    loo_full=(restore_deleted_genetic_mass(raw_loo,plan.masses,retained_masses,plan.q**2)
+              if restore_mass else raw_loo.copy())
+    loo=loo_full[:,:p]
     return dict(omega_xy=point.coefficients[:p].reshape(-1,plan.q,plan.q),
         loo_omega_xy=loo.reshape(len(loo),-1,plan.q,plan.q),
         covariance=_jackknife_covariance(loo),block_ids=plan.block_ids,
         coefficients=point.coefficients,residual_coefficients=full.residual_transform@point.coefficients[p:],
         loo_coefficients=loo_full,coefficient_covariance=_jackknife_covariance(loo_full),
+        raw_loo_coefficients=raw_loo,loo_annotation_masses=retained_masses,
+        loo_mass_restoration=plan.masses[None]/retained_masses,
+        loo_genetic_mass_restored=np.array(restore_mass),
         residual_transform=full.residual_transform,
         loo_residual_coefficients=loo_full[:,p:]@full.residual_transform.T,
         same_person_gram=plan.same_person,

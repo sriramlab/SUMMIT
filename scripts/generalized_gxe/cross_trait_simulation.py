@@ -224,23 +224,25 @@ def fit(args):
         block_directed=reference.block_directed_numerator)
     grams=[chromosome_gram(ref,gen['reference_diagonal'],phi,masks[i],masks[j],global_masses=[panel.m],
                           mode=args.gram_mode) for i,j in types]
-    estimate=[];deleted=[]
+    estimate=[];deleted=[];raw_deleted=[]
     for case in range(2*args.replicates):
-        sc,rep=divmod(case,args.replicates);fits=[];loo=[]
+        sc,rep=divmod(case,args.replicates);fits=[];loo=[];raw=[]
         for t,(i,j) in enumerate(types):
             record=dict(block_ids=scores['block_ids'],block_masses=scores['block_masses'],
                 block_rhs=scores['block_rhs'][:,case*3+t],
                 block_genetic_residual=scores['block_genetic_residual'][:,t],gram=grams[t])
             plan=CrossTraitMomentPlan([record],residual_gram=scores['residual_gram'][t],
                 residual_rhs=scores['residual_rhs'][case*3+t],num_basis=q,annotation_names=('all_variants',))
-            result=fit_cross_trait(plan)
+            result=fit_cross_trait(plan,restore_mass=not getattr(args,'unrestored_deletions',False))
             # Undo the exact per-phenotype normalization; truth is the specified
             # generating Omega, not a sample-variance-dependent moving target.
             scale=scores['scales'][sc,rep,i]*scores['scales'][sc,rep,j]
             fits.append(result['omega_xy'][0]/scale);loo.append(result['loo_omega_xy'][:,0]/scale)
-        estimate.append(fits);deleted.append(loo)
+            raw.append(result['raw_loo_coefficients'][:,:q*q].reshape(-1,q,q)/scale)
+        estimate.append(fits);deleted.append(loo);raw_deleted.append(raw)
     estimate=np.asarray(estimate).reshape(2,args.replicates,3,q,q)
     deleted=np.asarray(deleted).reshape(2,args.replicates,3,len(scores['block_ids']),q,q)
+    raw_deleted=np.asarray(raw_deleted).reshape(deleted.shape)
     s=np.cov(phi[:,1:].T,bias=True);means=(phi[x,1:].mean(0),phi[y,1:].mean(0))
     rows=[];replicate_rows=[]
     for sc in range(2):
@@ -271,10 +273,12 @@ def fit(args):
         with (args.output/name).open('x',newline='') as f:
             writer=csv.DictWriter(f,fieldnames=list(data[0]),delimiter='\t');writer.writeheader();writer.writerows(data)
     provenance=dict(generated_sha256=file_sha256(args.generated),scores_sha256=file_sha256(args.scores),
+        deleted_genetic_mass_restored=not getattr(args,'unrestored_deletions',False),
         gram_mode=args.gram_mode,seconds=time.monotonic()-start,all_coverage_gates_pass=all(row['coverage_acceptance'] for row in rows),
         files={p.name:file_sha256(p) for p in args.output.glob('*.tsv')})
     write_array_artifact(args.output/'fits.npz',kind='summit.cross_trait.simulation_fit',
-        arrays=dict(omega=estimate,loo_omega=deleted,truth=gen['omega']),provenance=provenance)
+        arrays=dict(omega=estimate,loo_omega=deleted,raw_loo_omega=raw_deleted,truth=gen['omega'],
+            block_ids=scores['block_ids'],loo_mass_restoration=result['loo_mass_restoration']),provenance=provenance)
     with (args.output/'COMPLETE.json').open('x') as f:json.dump(provenance,f,indent=2)
 
 
@@ -290,6 +294,7 @@ def main():
         help='Pass-2 probe tile width; changes tiling, not the probes or estimator')
     p.add_argument('--memory-gib',type=int,default=24)
     p.add_argument('--gram-mode',choices=['factorized','factorized_plus_residual','legacy_transport'],default='factorized')
+    p.add_argument('--unrestored-deletions',action='store_true')
     args=p.parse_args();args.output.mkdir(exist_ok=False)
     {'reference':reference_run,'generate':generate,'score':score,'fit':fit}[args.mode](args)
 

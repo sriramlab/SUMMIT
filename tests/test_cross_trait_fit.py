@@ -67,6 +67,28 @@ def test_mass_restored_deletions_keep_same_person_frozen():
     fit=fit_cross_trait(plan)
     assert fit['loo_omega_xy'].shape==(4,1,1,1)
     assert fit['covariance'][0,0]>0
+    raw=fit_cross_trait(plan,restore_mass=False)
+    np.testing.assert_array_equal(fit['raw_loo_coefficients'],raw['loo_coefficients'])
+    expected=np.array([plan.equations((b,)).equations.rhs[0]/
+        plan.equations((b,)).equations.matrix[0,0] for b in blocks])
+    np.testing.assert_allclose(fit['loo_omega_xy'].ravel(),expected*100/(100-mass.ravel()),rtol=1e-15)
+    np.testing.assert_array_equal(fit['omega_xy'],raw['omega_xy'])
+
+
+def test_annotation_restoration_matches_existing_study_collector():
+    from summit.context.cross_trait_fit import restore_deleted_genetic_mass
+    from summit.context.spec import ContextComponentIndex,ContextPairIndex
+    from summit.context.oracle import coefficients_to_omegas
+    rng=np.random.default_rng(523);q=3;components=ContextComponentIndex(('a','b'),ContextPairIndex(q))
+    raw=rng.normal(size=(4,len(components)+2));mass=np.array([100.,80.])
+    retained=mass-np.array([[10.,20.],[20.,5.],[30.,15.],[40.,40.]])
+    restored=restore_deleted_genetic_mass(raw,mass,retained,len(ContextPairIndex(q)))
+    # Independent reproduction of collect_scales.load_fit: convert, then restore.
+    expected=np.array([coefficients_to_omegas(row[:len(components)],components) for row in raw])
+    expected*=(mass/retained)[:,:,None,None]
+    observed=np.array([coefficients_to_omegas(row[:len(components)],components) for row in restored])
+    np.testing.assert_array_equal(observed,expected)
+    np.testing.assert_array_equal(restored[:,len(components):],raw[:,len(components):])
 
 
 def test_orthogonal_correlation_requires_positive_centered_baseline_variances():

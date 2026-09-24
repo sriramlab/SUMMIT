@@ -112,6 +112,7 @@ def fit_pilot(args):
         chromosomes=list(args.chromosomes),annotation=refs[0].annotation_names[0],
         context_metric='master cohort population covariance',genotype_traversals=0,
         same_person_assembly='sum_chromosome_diagonals_before_Gram; frozen full-profile deletion adjustment',
+        deleted_genetic_mass_restored=not getattr(args,'unrestored_deletions',False),
         interpretation='exploratory common-bin-only model; omitted lower-frequency effects may confound estimates',
         prespecified_hypothesis='Shared age-BMI response direction in lipid-glycaemic-BP cluster; absent in height and platelets')
     for mode in args.modes:
@@ -139,7 +140,8 @@ def fit_pilot(args):
             plan=CrossTraitMomentPlan(records,residual_gram=rr,residual_rhs=rrhs,num_basis=q,
                 annotation_names=refs[0].annotation_names,reference_n=n,n_x=len(rows[x]),n_y=len(rows[y]),
                 full_same_person=full_person[ix,iy])
-            fit=fit_cross_trait(plan);fits[ix,iy]=fit;matrices[ix,iy]=plan.equations().equations.matrix
+            fit=fit_cross_trait(plan,restore_mass=not getattr(args,'unrestored_deletions',False))
+            fits[ix,iy]=fit;matrices[ix,iy]=plan.equations().equations.matrix
             fit.update(factorization_residual=np.concatenate(factorization),same_person_share=np.concatenate(shares),
                 basis_names=basis_names,annotation_names=np.array(refs[0].annotation_names))
             diagnostics[ix,iy]=dict(rank=int(fit['rank']),condition=float(fit['condition_number']))
@@ -198,6 +200,8 @@ def main():
     for name in ('base','study-root','z-root','output'):p.add_argument('--'+name,type=Path,required=True)
     p.add_argument('--chromosomes',type=int,nargs='+',default=list(range(1,23)))
     p.add_argument('--modes',nargs='+',choices=MODES,default=list(MODES))
+    p.add_argument('--unrestored-deletions',action='store_true',
+        help='reproduce deleted-system coefficients before the study-collector mass restoration')
     args=p.parse_args()
     if 'factorized' not in args.modes:p.error('factorized default is required for comparisons')
     args.output.mkdir(exist_ok=False);fit_pilot(args)

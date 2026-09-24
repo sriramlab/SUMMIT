@@ -27,6 +27,7 @@ def main():
         if meta[key]!=completed[key]:raise ValueError('refit and diagnostic input identities differ')
     artifacts={};ranks=[]
     for path in sorted(a.refits.glob('*.npz')):
+        if path.name=='reference_diagnostics.npz':continue
         data,provenance=load_array_artifact(path,kind='summit.cross_trait.within_refit')
         np.testing.assert_array_equal(data['block_ids'],np.arange(200))
         artifacts[path.name]=file_sha256(path)
