@@ -73,3 +73,20 @@ model. Verify that shared columns are identical before combining existing
 annotation datasets.
 
 PGS batching is described in [Polygenic scores](Polygenic-scores.md).
+
+## Cross-trait environmental responses
+
+[Cross-trait response covariance](Cross-trait-response-covariance.md) extends
+the masked generalized-GxE batch to all ordered context coefficients for
+every requested trait pair in one decoded genotype traversal. Each trait
+retains its own mask and fixed-effect projector. Reference Z moments can be
+collected from the same guarded shared fixed-basis product with `--z-output`.
+
+The paper workflow defaults to cohort exposure-moment factorization and
+same-person diagonals on the actual overlap. It also reports residual-preserving
+and legacy transport arms. Within-trait saved summaries can be refitted under
+six mode/diagonal combinations without reopening genotypes; explicit
+legacy/scaled assembly preserves the old within-trait result bit for bit.
+See the linked page for commands, exactness boundaries, paired deletions and
+the completed and pending validation results. Complete-pass benchmarks include
+the exact overlap residual contractions as well as score accumulation.
