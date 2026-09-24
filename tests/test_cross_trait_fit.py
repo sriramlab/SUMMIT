@@ -80,14 +80,21 @@ def test_orthogonal_correlation_requires_positive_centered_baseline_variances():
     np.testing.assert_array_equal(result['omega_centered'],xy)
 
 
-def test_multiple_chromosomes_use_full_diagonals_not_residual_profile_surrogate():
+@pytest.mark.parametrize('support',['disjoint','diagonal'])
+def test_multiple_chromosomes_use_full_diagonals_not_residual_profile_surrogate(support):
     rng=np.random.default_rng(292);n,m,q=12,10,2
+    if support=='diagonal':m=2*n
     phi=np.c_[np.ones(n),rng.normal(size=n)];d=np.c_[np.ones(n),phi[:,1],phi[:,1]**2]
     y=rng.normal(size=n);records=[];kernels=[];diagonals=[]
     # Disjoint individual support makes the cross-chromosome kernel inner
     # product exactly zero, while their residual projections are not zero.
     for ch in range(2):
-        g=rng.normal(size=(n,m//2));g[:n//2] *= ch;g[n//2:] *= 1-ch
+        if support=='disjoint':
+            g=rng.normal(size=(n,m//2));g[:n//2] *= ch;g[n//2:] *= 1-ch
+        else:
+            # All kernel mass is on the same people, so cross-chromosome
+            # diagonal products must be included and off-person terms vanish.
+            g=np.diag(rng.normal(size=n))
         f=phi.T[:,:,None]*g[None]
         k=np.einsum('aij,blj->abil',f,f).reshape(q*q,n,n)/m
         diag=np.diagonal(k,axis1=1,axis2=2);gg=k.reshape(q*q,-1)@k.reshape(q*q,-1).T
