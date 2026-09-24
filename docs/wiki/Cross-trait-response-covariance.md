@@ -281,6 +281,7 @@ These results do not by themselves establish all acceptance criteria.
 | Dense oracle, N=2,000, M=3,000, Q=3, about 60% overlap, fixed ranks 5 and 4 | Genetic Gram relative error 2.37e-15; coefficient error 3.23e-14 |
 | Dense real chr22 reference, N=20,000, 41,275 common SNPs | Z repair relative error 2.26e-15 |
 | Dense real chr22 reference, N=40,000, same 41,275 common SNPs | Z repair and production assembly errors 1.60e-15; 4,604.46 accounted seconds; RSS 28,357,036 KiB |
+| Large simulation, N=50,112, M=454,207, 100 replicates per scenario | Default passes 33/38 summary gates and 17/18 Omega gates; full coverage acceptance fails (details below) |
 | Q=1 baseline regression against bivariate SUMMIT | Agreement at 1e-12 on the same dense panel |
 | Real chr22 downstream qualification, all eight traits | 112 pair/mode artifacts authenticate; rank 38 throughout; 28 contrasts and 112 age–BMI entries published |
 | Real chr22 ordinary-bivariate comparison | All 28 pairs and four modes within one SE for both baseline centerings; maximum 0.076 SE; only three deletion blocks |
@@ -350,8 +351,9 @@ heteroskedastic correlated residuals. Generation and scoring each use one
 traversal for all 100 replicates. The small complete BED pipeline is tested.
 The original August simulation reference is obsolete under current
 same-person validation, so the large benchmark constructs a new guarded
-reference instead of bypassing that check. Large-simulation coverage and pilot results
-remain pending in this version of the page. The complete eight-core 42-trait
+reference instead of bypassing that check. The reference and all simulation
+phases have now completed and their artifacts authenticate. Genome-wide
+pilot results remain pending in this version of the page. The complete eight-core 42-trait
 pass with 64 reused pair sums adds
 29.956% in 31 measured tiles, narrowly below the 30% target. This small
 margin does not establish a robust bound across hosts or load conditions.
@@ -364,6 +366,25 @@ remote allocation is a possible contributor, not an isolated causal result.
 Streaming fixed bases and releasing unused overlaps reduced peak RSS from
 approximately
 11.8 million to 5.9 million KiB.
+
+The prespecified factorized simulation arm fails the full coverage criterion.
+Seventeen of 18 Omega entries meet 0.90–0.98 coverage; the remaining entry
+has 0.99. Two cross-context H entries also have 0.99 coverage. The two
+response-correlation coordinates in the shared-program scenario each have
+99 valid replicates: a full-fit marginal response variance is negative in
+replicate 41 (first context, Y) or 67 (second context, X). Undefined ratios
+are retained; they are not clipped or removed from the acceptance denominator.
+Overall, 33 of 38 summary-row gates pass.
+
+Across the 18 Omega entries, bias ranges from -0.003419 to 0.000941, RMSE
+from 0.010144 to 0.013210, and mean jackknife SE / empirical SD from 0.925
+to 1.137. Orthogonal-response correlation coverage is 0.90 and 0.92 in the
+shared and zero-program scenarios, respectively; SE calibration is 0.788
+and 0.823. These uncertainty estimates need further qualification for weak
+response variances. Diagnostic plus-residual and legacy refits of the same
+saved summaries each pass 32/38 gates and retain the same undefined ratios.
+They do not replace the prespecified default or change the generating truth.
+The run report includes all entries and replicate values with SHA-256 hashes.
 
 The simulation reference CLI exposes `--probe-tile-width` (default four).
 This controls the existing native pass-2 product grouping, with no change to
