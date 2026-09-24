@@ -75,3 +75,11 @@ def test_fused_study_driver_publishes_complete_summary_and_z(tmp_path,monkeypatc
     pair=np.flatnonzero(np.all(data['pairs']==[0,1],axis=1)).item()
     np.testing.assert_allclose(data['block_rhs'][:,pair,0].sum(0),
         scores[0].T@(annotations[:,2,None]*scores[1]),rtol=1e-11,atol=1e-10)
+    qualification=script.with_name('cross_trait_qualification.py')
+    spec=importlib.util.spec_from_file_location('study_qualification',qualification)
+    check=importlib.util.module_from_spec(spec);spec.loader.exec_module(check)
+    assert check.validate(output,zpath,manifest)['qualified']
+    complete=json.loads((output/'COMPLETE.json').read_text());complete['variant_visits']-=1
+    (output/'COMPLETE.json').write_text(json.dumps(complete))
+    with pytest.raises(ValueError,match='provenance differs'):
+        check.validate(output,zpath,manifest)

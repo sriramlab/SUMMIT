@@ -79,6 +79,9 @@ case $mode in
     echo 'Fused chr22 qualification has no completed score/Z publication' >&2
     exit 1
    }
+   "$python_exe" "$launch" --threads 8 -- "$python_exe" "$code_root/scripts/generalized_gxe/private_python.py" \
+    cross_trait_qualification --study-output "$output_root/pilot_study/chr22" \
+    --z-output "$output_root/zpass_chr22.npz" --manifest "$base/shared_reference_full_20260916/MANIFEST.json"
   fi
   z_args=()
   mkdir -p "$output_root/pilot_study"
