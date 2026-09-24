@@ -114,7 +114,7 @@ class MaskedTraitBatch:
             persistent_weight_bytes=sum(a.nbytes for a in (
                 self.fixed_weights, self.square_weights, self.score_weights)))
 
-    def block(self, genotype):
+    def block(self, genotype, *, score_callback=None, z_callback=None):
         """Yield (name, scores[M,Q], information[M,P], residual[M,P,H]).
 
         Genotypes have shape variants x master people, use the reference
@@ -126,6 +126,15 @@ class MaskedTraitBatch:
         width = len(x)
         shared_linear = x @ self.fixed_weights
         scores = (x @ self.score_weights).reshape(width, len(self.traits), self.q)
+        if score_callback is not None:
+            score_callback(scores)
+        if z_callback is not None:
+            # The compressed multiplier span contains phi itself. Undo only
+            # that compression to expose G.T @ (phi_q * master fixed basis).
+            z = np.einsum('jrc,rq->jqc',
+                shared_linear.reshape(width, self.multiplier_rank, self.fixed_rank),
+                self.fixed_coefficients[:, :self.q], optimize=True)
+            z_callback(z)
         squared = x*x
         shared_square = squared @ self.square_weights
         p = len(self.pairs)
