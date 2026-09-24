@@ -77,7 +77,7 @@ class CrossTraitMomentPlan:
     """Cached chromosome Grams with paired, frozen-source deletion assembly.
 
     Each record contains block_ids, block_masses, block_rhs[B,K,Q,Q],
-    block_genetic_residual[B,K,Q²,H], and a ChromosomeGram. Same-person
+    block_genetic_residual[B,K,Q²,H], and a ChromosomeGram.
     The full same-person Gram is formed AFTER summing chromosome diagonals,
     then frozen on actual overlap rows. The full-data different-person Gram
     sums chromosome contributions (no cross-chromosome LD). Deletions retain
@@ -167,7 +167,8 @@ def cross_trait_derived(omega_xy,omega_xx,omega_yy,*,mean_x,mean_y,context_covar
         centered_baseline=ratio(xy[...,0,0],xx[...,0,0],yy[...,0,0])
         response=ratio(np.diagonal(xy,axis1=-2,axis2=-1)[...,1:],
                        np.diagonal(xx,axis1=-2,axis2=-1)[...,1:],np.diagonal(yy,axis1=-2,axis2=-1)[...,1:])
-        orthogonal=ratio(trace,tx,ty)
+        baseline_valid=(xx[...,0,0]>0)&(yy[...,0,0]>0)
+        orthogonal=np.where(baseline_valid,ratio(trace,tx,ty),np.nan)
     return dict(omega_centered=xy,baseline_covariance=raw_xy[...,0,0],baseline_rg=baseline,
         centered_baseline_covariance=xy[...,0,0],centered_baseline_rg=centered_baseline,
         response_block=xy[...,1:,1:],response_rg=response,h_xy=h,h_xx=hx,h_yy=hy,
@@ -175,6 +176,8 @@ def cross_trait_derived(omega_xy,omega_xx,omega_yy,*,mean_x,mean_y,context_covar
         response_minus_baseline_rg=response-baseline[...,None],
         orthogonal_minus_baseline_rg=orthogonal-baseline,
         baseline_rg_admissible=np.isfinite(baseline)&(np.abs(baseline)<=1),
+        response_rg_admissible=np.isfinite(response)&(np.abs(response)<=1),
+        orthogonal_baseline_variances_positive=baseline_valid,
         orthogonal_rg_admissible=np.isfinite(orthogonal)&(np.abs(orthogonal)<=1))
 
 

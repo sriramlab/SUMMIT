@@ -69,6 +69,17 @@ def test_mass_restored_deletions_keep_same_person_frozen():
     assert fit['covariance'][0,0]>0
 
 
+def test_orthogonal_correlation_requires_positive_centered_baseline_variances():
+    xx=np.array([[-1.,.1],[.1,1.]])
+    yy=np.array([[1.,.2],[.2,1.]])
+    xy=np.array([[.2,.1],[.05,.4]])
+    result=cross_trait_derived(xy,xx,yy,mean_x=[0.],mean_y=[0.],context_covariance=[[1.]])
+    assert np.isfinite(result['h_xy']).all()
+    assert np.isnan(result['orthogonal_rg'])
+    assert not result['orthogonal_baseline_variances_positive']
+    np.testing.assert_array_equal(result['omega_centered'],xy)
+
+
 def test_multiple_chromosomes_use_full_diagonals_not_residual_profile_surrogate():
     rng=np.random.default_rng(292);n,m,q=12,10,2
     phi=np.c_[np.ones(n),rng.normal(size=n)];d=np.c_[np.ones(n),phi[:,1],phi[:,1]**2]

@@ -67,7 +67,9 @@ def write_table(path,rows):
 def main():
     p=argparse.ArgumentParser(description=__doc__)
     p.add_argument('--base',type=Path,required=True);p.add_argument('--output',type=Path,required=True)
-    p.add_argument('--traits',nargs='*');a=p.parse_args();a.output.mkdir(exist_ok=False)
+    p.add_argument('--traits',nargs='*')
+    p.add_argument('--diagnostics-only',action='store_true',help='publish shared per-block reference diagnostics without fitting')
+    a=p.parse_args();a.output.mkdir(exist_ok=False)
     started=time.monotonic();refroot=a.base/'shared_reference_full_20260916'
     expansion=a.base/'imputed_expansion_20260917';sources=(refroot,expansion)
     manifests={root:json.loads((root/'MANIFEST.json').read_text()) for root in sources}
@@ -109,6 +111,20 @@ def main():
     provenance=dict(branch='feat/cross-trait-response-covariance',commit=commit,script_sha256=file_sha256(__file__),
         source_completion_sha256=completion_hashes,manifest_sha256={str(k):v for k,v in hashes.items()},
         uncertainty='paired 200-block frozen-source mass-restored deletion; frozen same-person',genotype_traversals=0)
+    # These reference diagnostics do not depend on the trait mask or fit mode.
+    # Publish once and authenticate the common file in every fit's provenance.
+    reference_diagnostics={key:[] for key in ('chromosome','block_id','factorization_residual','same_person_share','ld_scalar')}
+    for c in ref:
+        g=chromosome_gram(c,diagonals[c.chromosome],phi,np.arange(len(phi)),global_masses=masses,ordered=False)
+        reference_diagnostics['chromosome'].extend([c.chromosome]*len(c.block_ids))
+        reference_diagnostics['block_id'].extend(c.block_ids)
+        for key in ('factorization_residual','same_person_share','ld_scalar'):
+            reference_diagnostics[key].extend(g.diagnostics[key])
+    diagnostic_path=a.output/'reference_diagnostics.npz'
+    write_array_artifact(diagnostic_path,kind='summit.cross_trait.reference_diagnostics',
+        arrays={key:np.asarray(value) for key,value in reference_diagnostics.items()},provenance=provenance)
+    provenance['reference_diagnostics']=dict(file=diagnostic_path.name,sha256=file_sha256(diagnostic_path))
+    if a.diagnostics_only:selected=[]
     for name in selected:
         root=trait_root[name];inputroot=(a.base/'full_cohort_inputs_20260916' if root==refroot else expansion/'inputs')
         inputpath=inputroot/f'{name}.npz'
