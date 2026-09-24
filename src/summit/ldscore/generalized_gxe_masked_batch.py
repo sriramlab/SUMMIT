@@ -37,6 +37,7 @@ class MaskedTraitBatch:
         if not np.allclose(u.T @ u, np.eye(u.shape[1]), rtol=0, atol=1e-10):
             raise ValueError('master fixed basis must be orthonormal')
         self.n, self.q, self.h, self.fixed_rank = n, q, d.shape[1], u.shape[1]
+        self.basis, self.fixed_basis, self.residual_basis = phi, u, d
         self.pairs = tuple((p.q, p.r) for p in ContextPairIndex(q).entries)
         multipliers = np.column_stack([phi] + [d[:, h, None]*phi for h in range(self.h)])
         span, self.fixed_coefficients = _compressed_column_span(multipliers)
@@ -114,7 +115,8 @@ class MaskedTraitBatch:
             persistent_weight_bytes=sum(a.nbytes for a in (
                 self.fixed_weights, self.square_weights, self.score_weights)))
 
-    def block(self, genotype, *, score_callback=None, z_callback=None):
+    def block(self, genotype, *, score_callback=None, z_callback=None,
+              projection_callback=None, shared_callback=None):
         """Yield (name, scores[M,Q], information[M,P], residual[M,P,H]).
 
         Genotypes have shape variants x master people, use the reference
@@ -137,6 +139,8 @@ class MaskedTraitBatch:
             z_callback(z)
         squared = x*x
         shared_square = squared @ self.square_weights
+        if shared_callback is not None:
+            shared_callback(shared_linear, shared_square)
         p = len(self.pairs)
         for index, trait in enumerate(self.traits):
             rows = trait['correction']
@@ -151,6 +155,8 @@ class MaskedTraitBatch:
             cross = np.einsum('brp,rt->btp',
                 linear.reshape(width, self.multiplier_rank, self.fixed_rank),
                 self.fixed_coefficients, optimize=True) @ trait['transform']
+            if projection_callback is not None:
+                projection_callback(index, cross[:, :self.q])
             raw_square = square @ self.square_coefficients
             information = np.empty((width, p))
             residual = np.empty((width, p, self.h))
