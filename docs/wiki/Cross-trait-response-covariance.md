@@ -365,7 +365,7 @@ receipt, score/Z arrays and guarded traversal ledger before any genotype
 work; scheduler dependency release alone is insufficient. The replacement
 completed and authenticated both artifacts. Its full numerical pass averaged
 4.458 seconds per 128-SNP tile, plus 0.312 seconds decoding; this run did not
-measure a within-only comparator. After this qualification, chromosomes1–21
+measure a within-only comparator. After this qualification, chromosomes 1–21
 were submitted with the same code and binding, eight cores, 16 GiB per task,
 14 hours and no task-concurrency cap. Checkpointed partial tasks must resume
 before any full-genome fit is reported.

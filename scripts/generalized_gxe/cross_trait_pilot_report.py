@@ -17,6 +17,8 @@ from cross_trait_refit import write_table
 
 def report(fits,output):
     complete=json.loads((fits/'COMPLETE.json').read_text())
+    chromosomes=complete.get('chromosomes')
+    chromosome_label=','.join(map(str,chromosomes)) if chromosomes is not None else ''
     for name,digest in complete['tables'].items():
         if file_sha256(fits/name)!=digest:raise ValueError('pilot table checksum differs')
     def read(name):
@@ -30,7 +32,8 @@ def report(fits,output):
         category='cardiometabolic' if x in TRAITS[:6] and y in TRAITS[:6] else 'control_involving'
         baseline=default[x,y,'baseline_rg','0']
         cohort={name:baseline.get(name,'') for name in ('n_x','n_y','n_overlap')}
-        row=dict(trait_x=x,trait_y=y,**cohort,pair_category=category,exploratory=True)
+        row=dict(trait_x=x,trait_y=y,**cohort,chromosomes=chromosome_label,
+            pair_category=category,exploratory=True)
         for quantity in ('baseline_rg','orthogonal_rg','orthogonal_minus_baseline_rg'):
             k=(x,y,quantity,'0');entry=default[k]
             for field in ('estimate','jackknife_se','lower_95','upper_95'):
@@ -47,14 +50,16 @@ def report(fits,output):
         if len(selected)!=4:raise ValueError('four named age/BMI cross entries are required')
         for entry in selected:
             k=key(entry)
-            blocks.append(dict(trait_x=x,trait_y=y,**cohort,pair_category=category,exploratory=True,
+            blocks.append(dict(trait_x=x,trait_y=y,**cohort,chromosomes=chromosome_label,
+                pair_category=category,exploratory=True,
                 **{f:entry[f] for f in ('exposure_x','exposure_y','estimate','jackknife_se','lower_95','upper_95')},
                 maximum_mode_shift_se=shifts[k]['maximum_mode_shift_se'],
                 undefined_shift_modes=shifts[k]['undefined_shift_modes']))
     write_table(output/'baseline_vs_orthogonal_response.tsv',comparisons)
     write_table(output/'age_bmi_cross_exposure_covariance.tsv',blocks)
     result=dict(pilot_completion_sha256=file_sha256(fits/'COMPLETE.json'),script_sha256=file_sha256(__file__),
-        input_tables=complete['tables'],default_mode='factorized',pairs=len(comparisons),age_bmi_entries=len(blocks),
+        input_tables=complete['tables'],chromosomes=chromosomes,
+        default_mode='factorized',pairs=len(comparisons),age_bmi_entries=len(blocks),
         undefined_orthogonal_correlations=sum(not math.isfinite(float(r['orthogonal_rg_estimate'])) for r in comparisons),
         interpretation='exploratory; a nonsignificant control does not establish absence',
         interval_convention='paired target-SNP deletion; contrast uses its own paired jackknife SE',
