@@ -156,6 +156,13 @@ retain the existing frozen-source residual-profile change relative to its
 full-data value, using the study's residual geometry. Cross-chromosome LD is
 not computed. These deletion and chromosome conventions are approximations,
 not dense recomputation after removing both SNP axes.
+After solving each deleted system, each annotation's genetic coefficients
+are multiplied by `M_k / (M_k - M_bk)`, matching the existing study collector.
+Residual coefficients retain their units. Fits store both raw and restored
+deletion coefficients and the restoration factors; `restore_mass=False`
+(CLI `--unrestored-deletions`) reproduces the earlier unadjusted deletion
+output. All paper tables use restored deletions. This final coefficient
+scaling is separate from the retained-mass normalization in the equations.
 These intervals are conditional on the supplied reference and transport
 mode. They do not include independent probe redraws or transport-model
 uncertainty; the mode comparison reports that additional sensitivity.
@@ -275,9 +282,10 @@ These results do not by themselves establish all acceptance criteria.
 
 | Check | Observed result |
 |---|---|
-| Portable suite including checkpoint/resume and pair-sum reuse | 1,477 passed; 6 skipped; 1 xpassed |
+| Portable suite including checkpoint/resume, pair-sum reuse and deletion mass restoration | 1,478 passed; 6 skipped; 1 xpassed |
 | Checkpoint/resume through separate OS processes | Score and Z arrays bit-identical to uninterrupted traversal; changed tile width rejected; both BLAS configurations pass |
 | Legacy within-trait full/deletion regression | Bit-identical |
+| Legacy fits against original saved study outputs: body fat, triglycerides and height | Point estimates and raw genetic deletion coefficients bit-identical; restored deletion matrices match the existing collector |
 | Dense oracle, N=2,000, M=3,000, Q=3, about 60% overlap, fixed ranks 5 and 4 | Genetic Gram relative error 2.37e-15; coefficient error 3.23e-14 |
 | Dense real chr22 reference, N=20,000, 41,275 common SNPs | Z repair relative error 2.26e-15 |
 | Dense real chr22 reference, N=40,000, same 41,275 common SNPs | Z repair and production assembly errors 1.60e-15; 4,604.46 accounted seconds; RSS 28,357,036 KiB |
@@ -285,7 +293,7 @@ These results do not by themselves establish all acceptance criteria.
 | Q=1 baseline regression against bivariate SUMMIT | Agreement at 1e-12 on the same dense panel |
 | Real chr22 downstream qualification, all eight traits | 112 pair/mode artifacts authenticate; rank 38 throughout; 28 contrasts and 112 age–BMI entries published |
 | Real chr22 ordinary-bivariate comparison | All 28 pairs and four modes within one SE for both baseline centerings; maximum 0.076 SE; only three deletion blocks |
-| 42 traits × six within-trait arms, full-genome same-person diagonals, no genotype pass | 252 fits completed and authenticated; 142 comparison rows (71 distinct entries) above one SE across 11 traits; maximum 7.52 SE |
+| 42 traits × six within-trait arms, full-genome same-person diagonals and restored deletions, no genotype pass | 252 fits completed and authenticated; 142 comparison rows (71 distinct entries) above one SE across 11 traits; maximum 7.48 SE |
 | Six-trait chr22 timing after streamed inputs, five measured tiles | 2.578 versus 2.229 s per 128-SNP block; 15.67% total increment; RSS 5,696,408 KiB |
 | Eight-core 42-trait timing, 256 individual-pattern groups with minimum 16 rows, five measured tiles | 15.092 versus 10.516 s per 128-SNP block; 43.51% increment; RSS 5,943,260 KiB |
 | Eight-core 42-trait timing, 256 pooled groups, minimum 16 rows, addition penalty eight | 14.574 versus 10.275 s per block; 41.84% increment; RSS 5,844,816 KiB |
@@ -312,10 +320,10 @@ These results do not by themselves establish all acceptance criteria.
 The 142 flagged within-trait comparison rows cover 71 distinct
 trait/annotation/quantity entries: 102 rows are rare-bin, ten low-frequency
 and 30 common-bin. Holding factorization fixed, the scaled versus actual-row
-same-person choice shifts rare-bin testosterone Omega[0,3] by 5.09 SE.
+same-person choice shifts rare-bin testosterone Omega[0,3] by 5.07 SE.
 Holding actual-row diagonals fixed, legacy versus factorized transport shifts
-common-bin FVC Omega[0,1] by 3.45 SE. Factorized and plus-residual fits with
-actual-row diagonals differ by at most 0.150 SE across all reported entries.
+common-bin FVC Omega[0,1] by 3.44 SE. Factorized and plus-residual fits with
+actual-row diagonals differ by at most 0.1492 SE across all reported entries.
 These are observed mode sensitivities, not a guarantee of unbiasedness.
 
 Real-mask Gram relative Frobenius errors at N=20,000:
@@ -377,8 +385,8 @@ are retained; they are not clipped or removed from the acceptance denominator.
 Overall, 33 of 38 summary-row gates pass.
 
 Across the 18 Omega entries, bias ranges from -0.003419 to 0.000941, RMSE
-from 0.010144 to 0.013210, and mean jackknife SE / empirical SD from 0.925
-to 1.137. Orthogonal-response correlation coverage is 0.90 and 0.92 in the
+from 0.010144 to 0.013210, and mean jackknife SE / empirical SD from 0.930
+to 1.143. Orthogonal-response correlation coverage is 0.90 and 0.92 in the
 shared and zero-program scenarios, respectively; SE calibration is 0.788
 and 0.823. These uncertainty estimates need further qualification for weak
 response variances. Diagnostic plus-residual and legacy refits of the same
@@ -418,9 +426,13 @@ in its output paths and report scope. These artifacts verify the real input
 schema and numerical chain; they are not the requested full-genome,
 200-block pilot and do not establish genome-wide uncertainty calibration.
 
-The corrected refit table is `within_refits_full_diagonal/within_trait_mode_comparison.tsv`.
-The older `within_refits` run is preserved as provisional and must not supply
-paper estimates. Shared per-block diagnostics cover 221 chromosome fragments
+The corrected refit table is
+`within_refits_full_diagonal_mass_restored/within_trait_mode_comparison.tsv`.
+The older `within_refits` and `within_refits_full_diagonal` runs are preserved
+as superseded outputs and must not supply paper uncertainty estimates.
+The latter omitted the final post-solve coefficient restoration; its point
+estimates and normal equations are unchanged. The corrected simulation
+tables are under `simulation_v3/mass_restored_*`. Shared per-block diagnostics cover 221 chromosome fragments
 of the 200 deletion blocks. Their maximum factorization residual is 20.1%
 for a 285-SNP chr2 fragment (common-to-rare annotation pair); chromosome-average
 errors are not bounds on individual block residuals.
