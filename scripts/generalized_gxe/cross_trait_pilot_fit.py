@@ -16,7 +16,7 @@ ROOT=Path(__file__).resolve().parents[2]
 sys.meta_path[:]=[f for f in sys.meta_path if type(f).__module__!='_gwldcore_editable']
 sys.path[:0]=[str(ROOT/'src'),str(ROOT/'scripts/generalized_gxe')]
 import numpy as np
-from summit.context.cross_trait_gram import chromosome_gram,orientation_matrix
+from summit.context.cross_trait_gram import chromosome_gram,orientation_matrix,same_person
 from summit.context.cross_trait_fit import CrossTraitMomentPlan,fit_cross_trait,write_cross_trait_fit,cross_trait_derived
 from summit.context.cross_trait_zpass import load_array_artifact,repair_single_annotation
 from summit.context.reference_zpass_cli import file_sha256,authenticated_reference
@@ -96,6 +96,10 @@ def fit_pilot(args):
     # Stored diagonals use genome-wide masses even for a chromosome timing fit.
     global_masses=np.asarray(manifests[refroot]['global_masses'],dtype=float)[2:3]
     for i in range(len(diagonals)):diagonals[i]=diagonals[i]*(global_masses[0]/masses[0])
+    diagonal_total=sum(diagonals)
+    pair_order=[(i,i) for i in range(len(TRAITS))]+list(itertools.combinations(range(len(TRAITS)),2))
+    full_person={(i,j):same_person(diagonal_total,rows[TRAITS[i]],rows[TRAITS[j]],q=q)
+                 for i,j in pair_order}
     repaired_blocks=[]
     if repaired:
         for ref,z in zip(refs,repaired):
@@ -103,13 +107,16 @@ def fit_pilot(args):
             repaired_blocks.append(repair_single_annotation(tr,z['block_products'][:,2],z['global_products'][2],mass=masses[0]))
     modes={};table=[];gram_rows=[]
     provenance=dict(input_sha256=input_hashes,source_sha256=completion_hashes,script_sha256=file_sha256(__file__),
+        implementation_sha256={name:file_sha256(ROOT/'src/summit/context'/name) for name in
+            ('cross_trait_fit.py','cross_trait_gram.py','cross_trait_zpass.py')},
         chromosomes=list(args.chromosomes),annotation=refs[0].annotation_names[0],
         context_metric='master cohort population covariance',genotype_traversals=0,
+        same_person_assembly='sum_chromosome_diagonals_before_Gram; frozen full-profile deletion adjustment',
         interpretation='exploratory common-bin-only model; omitted lower-frequency effects may confound estimates',
         prespecified_hypothesis='Shared age-BMI response direction in lipid-glycaemic-BP cluster; absent in height and platelets')
     for mode in args.modes:
         fits={};matrices={};diagnostics={}
-        pairs=[(i,i) for i in range(len(TRAITS))]+list(itertools.combinations(range(len(TRAITS)),2))
+        pairs=pair_order
         for ix,iy in pairs:
             x,y=TRAITS[ix],TRAITS[iy];records=[];factorization=[];shares=[]
             for i,ref in enumerate(refs):
@@ -130,7 +137,8 @@ def fit_pilot(args):
                     np.testing.assert_allclose(rrhs,previous_rhs,rtol=1e-13,atol=1e-10)
                 previous_rr,previous_rhs=rr,rrhs;record['gram']=gram;records.append(record)
             plan=CrossTraitMomentPlan(records,residual_gram=rr,residual_rhs=rrhs,num_basis=q,
-                annotation_names=refs[0].annotation_names,reference_n=n,n_x=len(rows[x]),n_y=len(rows[y]))
+                annotation_names=refs[0].annotation_names,reference_n=n,n_x=len(rows[x]),n_y=len(rows[y]),
+                full_same_person=full_person[ix,iy])
             fit=fit_cross_trait(plan);fits[ix,iy]=fit;matrices[ix,iy]=plan.equations().equations.matrix
             fit.update(factorization_residual=np.concatenate(factorization),same_person_share=np.concatenate(shares),
                 basis_names=basis_names,annotation_names=np.array(refs[0].annotation_names))
@@ -172,8 +180,11 @@ def fit_pilot(args):
     for key,d in default.items():
         values=[abs(r['shift_from_default_se']) for r in table
                 if (r['trait_x'],r['trait_y'],r['quantity'],r['entry'])==key and np.isfinite(r['shift_from_default_se'])]
+        undefined=[r['mode'] for r in table if (r['trait_x'],r['trait_y'],r['quantity'],r['entry'])==key
+                   and not np.isfinite(r['shift_from_default_se'])]
         shifts.append(dict(trait_x=key[0],trait_y=key[1],quantity=key[2],entry=key[3],
-            maximum_mode_shift_se=max(values) if values else np.nan))
+            maximum_mode_shift_se=max(values) if values else np.nan,valid_modes=len(values),
+            undefined_shift_modes=','.join(undefined)))
     write_table(args.output/'pilot_maximum_mode_shifts.tsv',shifts)
     with (args.output/'COMPLETE.json').open('x') as f:
         json.dump(dict(provenance,seconds=time.monotonic()-start,tables={p.name:file_sha256(p) for p in args.output.glob('*.tsv')}),f,indent=2)

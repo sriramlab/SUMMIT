@@ -67,3 +67,30 @@ def test_mass_restored_deletions_keep_same_person_frozen():
     fit=fit_cross_trait(plan)
     assert fit['loo_omega_xy'].shape==(4,1,1,1)
     assert fit['covariance'][0,0]>0
+
+
+def test_multiple_chromosomes_use_full_diagonals_not_residual_profile_surrogate():
+    rng=np.random.default_rng(292);n,m,q=12,10,2
+    phi=np.c_[np.ones(n),rng.normal(size=n)];d=np.c_[np.ones(n),phi[:,1],phi[:,1]**2]
+    y=rng.normal(size=n);records=[];kernels=[];diagonals=[]
+    # Disjoint individual support makes the cross-chromosome kernel inner
+    # product exactly zero, while their residual projections are not zero.
+    for ch in range(2):
+        g=rng.normal(size=(n,m//2));g[:n//2] *= ch;g[n//2:] *= 1-ch
+        f=phi.T[:,:,None]*g[None]
+        k=np.einsum('aij,blj->abil',f,f).reshape(q*q,n,n)/m
+        diag=np.diagonal(k,axis1=1,axis2=2);gg=k.reshape(q*q,-1)@k.reshape(q*q,-1).T
+        dd=diag@diag.T;gr=diag@d
+        records.append(dict(block_ids=np.array([ch]),block_masses=np.array([[m/2]]),
+            block_rhs=(m*np.einsum('i,aij,j->a',y,k,y)).reshape(1,1,q,q),
+            block_genetic_residual=(m*gr).reshape(1,1,q*q,-1),gram=ChromosomeGram((gg-dd)[None],dd,{})))
+        kernels.append(k);diagonals.append(diag)
+    full_diag=sum(diagonals);same=full_diag@full_diag.T
+    plan=CrossTraitMomentPlan(records,residual_gram=d.T@d,residual_rhs=d.T@(y*y),num_basis=q,
+        annotation_names=('all',),full_same_person=same)
+    full_kernel=sum(kernels).reshape(q*q,-1)
+    np.testing.assert_allclose(plan.equations().equations.matrix[:q*q,:q*q],full_kernel@full_kernel.T,atol=1e-12)
+    assert np.linalg.norm(plan.full_cross_profile)>0.1
+    np.testing.assert_array_equal(plan.same_person,same)
+    with pytest.raises(ValueError,match='summed per-person'):
+        CrossTraitMomentPlan(records,residual_gram=d.T@d,residual_rhs=d.T@(y*y),num_basis=q,annotation_names=('all',))

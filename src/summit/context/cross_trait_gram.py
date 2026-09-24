@@ -244,12 +244,14 @@ def within_trait_equations(reference_chromosomes, study_chromosomes, *,
         reference_diagonals, phi, rows, mode='factorized', same_person_mode='own_rows',
         reference_residual_gram, reference_residual_traces, reference_same_person,
         residual_gram, residual_rhs, residual_traces, residual_names,
-        deleted_blocks=(), expected_chromosomes=None, prepared_grams=None):
+        deleted_blocks=(), expected_chromosomes=None, prepared_grams=None,full_same_person=None):
     """Corrected within-trait chromosome assembly, with a bit-exact old arm.
 
     The legacy/scaled arm delegates to the unchanged in-house implementation.
-    Corrected arms retain its chromosome residual-profile approximation and
-    exact study genetic/residual moments, using the study residual geometry.
+    Corrected arms form the full same-person Gram from the sum of chromosome
+    diagonals and retain exact study genetic/residual moments. Deletions use
+    the existing frozen-source residual-profile change relative to full data;
+    the full-data profile cannot replace the explicit full same-person Gram.
     """
     from summit.ldscore.generalized_gxe_chromosome import (
         joint_chromosome_equations, transferred_chromosome_equations)
@@ -271,7 +273,23 @@ def within_trait_equations(reference_chromosomes, study_chromosomes, *,
     full_masses = sum(c.block_masses.sum(axis=0) for c in study)
     p = study[0].num_basis*(study[0].num_basis+1)//2
     mass_restore = np.repeat(full_masses/target.annotation_masses, p)
-    replacement = np.zeros((target.genetic_count, target.genetic_count))
+    if full_same_person is None:
+        if same_person_mode=='scaled':
+            full_same_person=(len(rows)/ref[0].n_samples)*reference_same_person
+        else:
+            if reference_diagonals is None:
+                raise ValueError('own-row assembly requires full same-person moments or all chromosome diagonals')
+            diagonal=sum(reference_diagonals[c.chromosome] for c in ref)
+            full_same_person=same_person(diagonal,rows,q=ref[0].num_basis,ordered=False)
+    replacement=np.array(full_same_person,dtype=float,copy=True)
+    if (replacement.shape!=(target.genetic_count,target.genetic_count) or not np.isfinite(replacement).all()
+            or not np.allclose(replacement,replacement.T,rtol=1e-12,atol=1e-10)):
+        raise ValueError('invalid full same-person Gram')
+    full_inverse=np.repeat(1/full_masses,p)
+    full_b=[c.block_genetic_residual.sum(0)*full_inverse[:,None] for c in study]
+    full_total=sum(full_b)
+    full_profile=(full_total@np.linalg.solve(residual_gram,full_total.T)
+        -sum(b@np.linalg.solve(residual_gram,b.T) for b in full_b)) if len(study)>1 else np.zeros_like(replacement)
     for c in study:
         r = ref_by_chr[c.chromosome]
         if (not np.array_equal(r.block_ids, c.block_ids)
@@ -290,15 +308,17 @@ def within_trait_equations(reference_chromosomes, study_chromosomes, *,
                 raise ValueError('prepared chromosome Gram design differs')
         take = ~np.isin(c.block_ids, deleted_blocks)
         off = g.different_person_blocks[take].sum(axis=0)
-        replacement += g.same_person + off*mass_restore[:, None]*mass_restore[None]
+        replacement += off*mass_restore[:, None]*mass_restore[None]
         # Match the existing frozen-source, mass-restored chromosome profile.
-        inv = np.repeat(1/target.annotation_masses, p)
-        b = c.block_genetic_residual[take].sum(axis=0)*inv[:, None]
-        source = c.block_genetic_residual.sum(axis=0)*inv[:, None]
-        profile = b @ np.linalg.solve(residual_gram, source.T)
-        replacement -= (profile+profile.T)/2
+        if len(deleted_blocks):
+            inv = np.repeat(1/target.annotation_masses, p)
+            b = c.block_genetic_residual[take].sum(axis=0)*inv[:, None]
+            source = c.block_genetic_residual.sum(axis=0)*inv[:, None]
+            profile = b @ np.linalg.solve(residual_gram, source.T)
+            replacement -= (profile+profile.T)/2
     btotal = target.matrix[:target.genetic_count, target.genetic_count:]
-    replacement += btotal @ np.linalg.solve(residual_gram, btotal.T)
+    if len(deleted_blocks):
+        replacement += btotal @ np.linalg.solve(residual_gram, btotal.T)-full_profile
     replacement = (replacement+replacement.T)/2
     matrix = target.matrix.copy()
     matrix[:target.genetic_count, :target.genetic_count] = replacement

@@ -95,7 +95,7 @@ def main():
         for source in sources:
             authenticate(source/f'chr{ch}','STUDY_COMPLETE.json',hashes[source])
             marker=source/f'chr{ch}/STUDY_COMPLETE.json';completion_hashes[str(marker)]=file_sha256(marker)
-    same=diagonal_sum@diagonal_sum.T;del diagonal_sum
+    same=diagonal_sum@diagonal_sum.T
     masses=sum(c.block_masses.sum(0) for c in ref);q=ref[0].num_basis
     components=ContextComponentIndex(ref[0].annotation_names,ContextPairIndex(q))
     blocks=np.unique(np.concatenate([c.block_ids for c in ref]))
@@ -116,6 +116,7 @@ def main():
             raise ValueError(f'trait input checksum differs: {inputpath}')
         with np.load(inputpath) as z:rows=np.searchsorted(master_rows,z['rows']);np.testing.assert_array_equal(master_rows[rows],z['rows'])
         mean=phi[rows,1:].mean(0);s=np.cov(phi[rows,1:].T,bias=True)
+        own_same=diagonal_sum[:,rows]@diagonal_sum[:,rows].T
         study=[];common=None
         for ch in range(1,23):
             chunk,_=load_chromosome_moments(root/f'chr{ch}/{name}.npz');study.append(chunk)
@@ -133,7 +134,8 @@ def main():
                         mode=mode,same_person_mode=sp,ordered=False) for c in ref}
                 def eq(deleted=()):
                     return within_trait_equations(ref,study,reference_diagonals=None,phi=phi,rows=rows,
-                        mode=mode,same_person_mode=sp,prepared_grams=prepared,deleted_blocks=deleted,**options,**common)
+                        mode=mode,same_person_mode=sp,prepared_grams=prepared,deleted_blocks=deleted,
+                        full_same_person=own_same if sp=='own_rows' else len(rows)/ref[0].n_samples*same,**options,**common)
                 full=eq();fit=solve_context_normal_equations(full)
                 loo=np.array([solve_context_normal_equations(eq((b,))).coefficients for b in blocks])
                 omega=coefficients_to_omegas(fit.coefficients[:len(components)],components)
@@ -142,9 +144,11 @@ def main():
                 results[key]=(values,deleted,full.matrix)
                 arrays=dict(omega=omega,loo_omega=loomega,coefficients=fit.coefficients,loo_coefficients=loo,
                     covariance=_jackknife_covariance(loo),normal_matrix=full.matrix,normal_rhs=full.rhs,
+                    same_person_gram=own_same if sp=='own_rows' else len(rows)/ref[0].n_samples*same,
                     block_ids=blocks,environment_mean=mean,environment_covariance=s)
                 write_array_artifact(a.output/f'{name}__{key}.npz',kind='summit.cross_trait.within_refit',arrays=arrays,
-                    provenance=dict(provenance,trait=name,mode=mode,same_person_mode=sp,input_sha256=file_sha256(inputpath)))
+                    provenance=dict(provenance,trait=name,mode=mode,same_person_mode=sp,input_sha256=file_sha256(inputpath),
+                        same_person_assembly='sum_chromosome_diagonals_before_Gram; frozen full-profile deletion adjustment'))
                 diagnostics.append(dict(trait=name,mode=mode,same_person_mode=sp,rank=fit.rank,
                     condition_number=fit.condition_number,relative_residual=fit.relative_residual,
                     minimum_eigenvalue=fit.minimum_gram_eigenvalue,seconds=time.monotonic()-tick))

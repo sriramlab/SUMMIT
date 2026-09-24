@@ -78,11 +78,14 @@ class CrossTraitMomentPlan:
 
     Each record contains block_ids, block_masses, block_rhs[B,K,Q,Q],
     block_genetic_residual[B,K,Q²,H], and a ChromosomeGram. Same-person
-    terms are frozen on actual overlap rows. Cross-chromosome genetic
-    information follows joint_chromosome_equations' residual-profile rule.
+    The full same-person Gram is formed AFTER summing chromosome diagonals,
+    then frozen on actual overlap rows. The full-data different-person Gram
+    sums chromosome contributions (no cross-chromosome LD). Deletions retain
+    the existing frozen-source residual-profile change, subtracting its
+    full-data value so it cannot replace the explicit full same-person term.
     """
     def __init__(self, chromosomes, *, residual_gram, residual_rhs, num_basis,
-                 annotation_names, reference_n=0, n_x=0, n_y=0):
+                 annotation_names, reference_n=0, n_x=0, n_y=0,full_same_person=None):
         self.chromosomes=tuple(chromosomes)
         if not self.chromosomes:
             raise ValueError('at least one chromosome required')
@@ -92,6 +95,20 @@ class CrossTraitMomentPlan:
         self.masses=sum(c['block_masses'].sum(axis=0) for c in self.chromosomes)
         self.block_ids=np.unique(np.concatenate([c['block_ids'] for c in self.chromosomes]))
         self.rr_inverse=np.linalg.pinv(self.rr,rcond=1e-12,hermitian=True)
+        p=len(self.names)*self.q*self.q
+        if full_same_person is None:
+            if len(self.chromosomes)!=1:
+                raise ValueError('multiple chromosomes require the Gram of the summed per-person diagonals')
+            full_same_person=self.chromosomes[0]['gram'].same_person
+        self.same_person=np.asarray(full_same_person,dtype=float)
+        if (self.same_person.shape!=(p,p) or not np.isfinite(self.same_person).all()
+                or not np.allclose(self.same_person,self.same_person.T,rtol=1e-12,atol=1e-10)):
+            raise ValueError('invalid full same-person Gram')
+        inv=np.repeat(1/self.masses,self.q*self.q)
+        bs=[c['block_genetic_residual'].sum(0).reshape(p,-1)*inv[:,None] for c in self.chromosomes]
+        bt=sum(bs)
+        self.full_cross_profile=(bt@self.rr_inverse@bt.T
+            -sum(b@self.rr_inverse@b.T for b in bs)) if len(bs)>1 else np.zeros((p,p))
 
     def equations(self,deleted_blocks=()):
         if not np.isin(deleted_blocks,self.block_ids).all():
@@ -101,17 +118,19 @@ class CrossTraitMomentPlan:
         if np.any(masses<=0):
             raise ValueError('deletion exhausts an annotation')
         inv=np.repeat(1/masses,self.q*self.q);restore=np.repeat(self.masses/masses,self.q*self.q)
-        p=len(inv);gram=np.zeros((p,p));rhs=np.zeros(p);btotal=np.zeros((p,len(self.rr)))
+        p=len(inv);gram=self.same_person.copy();rhs=np.zeros(p);btotal=np.zeros((p,len(self.rr)))
         for c,take in zip(self.chromosomes,masks):
             g=c['gram']
-            gram+=g.same_person+g.different_person_blocks[take].sum(axis=0)*restore[:,None]*restore[None]
+            gram+=g.different_person_blocks[take].sum(axis=0)*restore[:,None]*restore[None]
             b=c['block_genetic_residual'][take].sum(axis=0).reshape(p,-1)*inv[:,None]
-            source=c['block_genetic_residual'].sum(axis=0).reshape(p,-1)*inv[:,None]
-            profile=b@self.rr_inverse@source.T
-            gram-=(profile+profile.T)/2
+            if len(deleted_blocks):
+                source=c['block_genetic_residual'].sum(axis=0).reshape(p,-1)*inv[:,None]
+                profile=b@self.rr_inverse@source.T
+                gram-=(profile+profile.T)/2
             btotal+=b
             rhs+=c['block_rhs'][take].sum(axis=0).reshape(p)*inv
-        gram+=btotal@self.rr_inverse@btotal.T
+        if len(deleted_blocks):
+            gram+=btotal@self.rr_inverse@btotal.T-self.full_cross_profile
         return assemble_cross_trait_normal_equations(genetic_gram=(gram+gram.T)/2,genetic_rhs=rhs,
             genetic_residual=btotal,residual_gram=self.rr,residual_rhs=self.rrhs,num_basis=self.q,
             annotation_masses=masses,annotation_names=self.names,deleted_blocks=deleted_blocks,**self.meta)
@@ -162,15 +181,22 @@ def cross_trait_derived(omega_xy,omega_xx,omega_yy,*,mean_x,mean_y,context_covar
 def fit_cross_trait(plan, *, rtol=None):
     full=plan.equations();point=solve_cross_trait_normal_equations(full,rtol=rtol)
     p=full.equations.genetic_count
-    loo=[];loo_rank=[];loo_condition=[]
+    loo=[];loo_full=[];loo_rank=[];loo_condition=[]
     for block in plan.block_ids:
         result=solve_cross_trait_normal_equations(plan.equations((block,)),rtol=rtol)
+        loo_full.append(result.coefficients)
         loo.append(result.coefficients[:p]);loo_rank.append(result.rank);loo_condition.append(result.condition_number)
     loo=np.asarray(loo)
+    loo_full=np.asarray(loo_full)
     return dict(omega_xy=point.coefficients[:p].reshape(-1,plan.q,plan.q),
         loo_omega_xy=loo.reshape(len(loo),-1,plan.q,plan.q),
         covariance=_jackknife_covariance(loo),block_ids=plan.block_ids,
         coefficients=point.coefficients,residual_coefficients=full.residual_transform@point.coefficients[p:],
+        loo_coefficients=loo_full,coefficient_covariance=_jackknife_covariance(loo_full),
+        residual_transform=full.residual_transform,
+        loo_residual_coefficients=loo_full[:,p:]@full.residual_transform.T,
+        same_person_gram=plan.same_person,
+        frozen_full_cross_chromosome_profile=plan.full_cross_profile,
         condition_number=np.array(point.condition_number),rank=np.array(point.rank),
         residual_rank=np.array(full.residual_rank),relative_residual=np.array(point.relative_residual),
         minimum_gram_eigenvalue=np.array(point.minimum_gram_eigenvalue),

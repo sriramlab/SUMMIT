@@ -147,9 +147,13 @@ number, minimum Gram eigenvalue, solve residual and deletion diagnostics.
 The paper convention uses 200 paired target-SNP deletion blocks: both traits'
 score products and matching reference target blocks are deleted together.
 Genetic moments are mass-restored, reference source products stay frozen,
-and the own-overlap same-person term stays frozen. Chromosomes use the
-existing residual-profile combination rule; cross-chromosome LD is not
-computed. These deletion and chromosome conventions are approximations,
+and the own-overlap same-person term stays frozen. For the full-genome
+same-person term, chromosome diagonals are summed **before** taking their
+Gram; this includes same-person products between chromosomes. Full-data
+different-person contributions are summed across chromosomes. Deletions
+retain the existing frozen-source residual-profile change relative to its
+full-data value, using the study's residual geometry. Cross-chromosome LD is
+not computed. These deletion and chromosome conventions are approximations,
 not dense recomputation after removing both SNP axes.
 
 The baseline covariance and correlation use the master-basis `[0,0]` entries.
