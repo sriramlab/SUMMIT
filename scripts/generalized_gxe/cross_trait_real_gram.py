@@ -72,7 +72,10 @@ def main():
         raw=bed.read(index=np.s_[fam_rows,common],dtype='float32')
     missing=np.isnan(raw);g=raw.astype(float);del raw
     g-=mean;g*=inverse;g[missing]=0;del missing
-    mass=len(common);kernel=g@g.T/mass
+    mass=len(common);kernel=g@g.T
+    # At N=40,000 another dense result would cost 12.8 GB. Do not depend
+    # on NumPy's temporary-elision heuristics for the memory admission plan.
+    kernel/=mass
     # Independent direct genotype dot-products qualify the dense GRM product.
     check=np.linspace(0,len(g)-1,19,dtype=int)
     np.testing.assert_allclose(kernel[np.ix_(check,check)],g[check]@g[check].T/mass,rtol=1e-12,atol=1e-12)
