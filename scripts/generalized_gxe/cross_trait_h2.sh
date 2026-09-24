@@ -4,7 +4,10 @@ set -euo pipefail
 umask 077
 mode=${1:?qualify or zpass}
 output_root=${2:?exclusive output root required}
-code_root=$(cd "$(dirname "$0")/../.." && pwd)
+# UGE executes a spooled copy of this script, so $0 is not the source path.
+# qsub -wd is the authenticated immutable checkout selected by the submitter.
+code_root=$PWD
+[[ -f $code_root/scripts/generalized_gxe/private_python.py ]]
 base=/u/scratch/b/bronsonj/general_gxe_chromosome_20260914
 python_exe=/u/home/b/bronsonj/.conda/envs/summit/bin/python
 export LD_PRELOAD=/u/home/b/bronsonj/.conda/envs/summit/lib/libstdc++.so.6
