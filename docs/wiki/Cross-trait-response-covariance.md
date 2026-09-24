@@ -284,7 +284,7 @@ These results do not by themselves establish all acceptance criteria.
 | Q=1 baseline regression against bivariate SUMMIT | Agreement at 1e-12 on the same dense panel |
 | Real chr22 downstream qualification, all eight traits | 112 pair/mode artifacts authenticate; rank 38 throughout; 28 contrasts and 112 age–BMI entries published |
 | Real chr22 ordinary-bivariate comparison | All 28 pairs and four modes within one SE for both baseline centerings; maximum 0.076 SE; only three deletion blocks |
-| 42 traits × six within-trait arms, full-genome same-person diagonals, no genotype pass | 252 fits completed and authenticated; 142 entries above one SE across 11 traits; maximum 7.52 SE |
+| 42 traits × six within-trait arms, full-genome same-person diagonals, no genotype pass | 252 fits completed and authenticated; 142 comparison rows (71 distinct entries) above one SE across 11 traits; maximum 7.52 SE |
 | Six-trait chr22 timing after streamed inputs, five measured tiles | 2.578 versus 2.229 s per 128-SNP block; 15.67% total increment; RSS 5,696,408 KiB |
 | Eight-core 42-trait timing, 256 individual-pattern groups with minimum 16 rows, five measured tiles | 15.092 versus 10.516 s per 128-SNP block; 43.51% increment; RSS 5,943,260 KiB |
 | Eight-core 42-trait timing, 256 pooled groups, minimum 16 rows, addition penalty eight | 14.574 versus 10.275 s per block; 41.84% increment; RSS 5,844,816 KiB |
@@ -307,6 +307,15 @@ These results do not by themselves establish all acceptance criteria.
 | Completed fused chr22 study/Z, eight traits | 99,273 SNPs in one traversal; 776 guarded TN calls, zero repairs; 3,792.20 accounted s; RSS 6,174,252 KiB |
 | Fused versus standalone chr22 Z | Block products agree to 7.91e-15 relative; global products to 7.85e-15 |
 | Reference probe tiling, N=50,112, M=1,024, B=1,024 | Tile 4 versus 128: 33.11 versus 13.70 s; Gram difference 1.65e-16 relative; same-person matrix bit-identical |
+
+The 142 flagged within-trait comparison rows cover 71 distinct
+trait/annotation/quantity entries: 102 rows are rare-bin, ten low-frequency
+and 30 common-bin. Holding factorization fixed, the scaled versus actual-row
+same-person choice shifts rare-bin testosterone Omega[0,3] by 5.09 SE.
+Holding actual-row diagonals fixed, legacy versus factorized transport shifts
+common-bin FVC Omega[0,1] by 3.45 SE. Factorized and plus-residual fits with
+actual-row diagonals differ by at most 0.150 SE across all reported entries.
+These are observed mode sensitivities, not a guarantee of unbiasedness.
 
 Real-mask Gram relative Frobenius errors at N=20,000:
 
