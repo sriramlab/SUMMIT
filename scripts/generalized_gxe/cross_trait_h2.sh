@@ -2,7 +2,7 @@
 # qsub supplies -wd, -o, -pe shared 8, -binding set linear:1, and complete resources.
 set -euo pipefail
 umask 077
-mode=${1:?qualify, zpass, simulation_reference or simulation}
+mode=${1:?qualify, zpass, simulation_reference, simulation or simulation_PHASE}
 output_root=${2:?exclusive output root required}
 export TMPDIR="$output_root/tmp/${JOB_ID:?}.${SGE_TASK_ID:-0}"
 mkdir -p "$TMPDIR"
@@ -38,7 +38,7 @@ case $mode in
     --annotations "$base/imputed_maf3_design/annotations_chr$chromosome.npy" \
     --output "$output_root/zpass_chr$chromosome.npz" --num-threads 8 --width 128
   ;;
- simulation_reference|simulation)
+ simulation_reference|simulation|simulation_generate|simulation_score|simulation_fit)
   input_root=/u/project/jflint/bronsonj/cross_trait_20260923/simulation_inputs
   common_args=(--axes "$input_root/axes.npz" --bed-prefix "$input_root/UKBB_EUR_50k_unrel_3rd.no_mhc_imp" --threads 8)
   if [[ $mode == simulation_reference ]]; then
@@ -50,7 +50,11 @@ case $mode in
   fi
   ref="$output_root/simulation_reference/reference.generalized-gxe-variant-ldscore-v1.npz"
   [[ -f $output_root/simulation_reference/COMPLETE.json && -f $ref ]]
-  for phase in generate score fit; do
+  phases=(generate score fit)
+  if [[ $mode != simulation ]]; then phases=("${mode#simulation_}"); fi
+  # Separate phase jobs allow resuming only the incomplete phase. Python
+  # authenticates prerequisite arrays and publishes to exclusive new paths.
+  for phase in "${phases[@]}"; do
    "$python_exe" "$launch" --threads 8 -- "$python_exe" "$code_root/scripts/generalized_gxe/private_python.py" \
     cross_trait_simulation "$phase" "${common_args[@]}" --reference "$ref" \
     --output "$output_root/simulation_$phase" --replicates 100 \
