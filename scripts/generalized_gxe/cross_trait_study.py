@@ -45,12 +45,16 @@ def main():
     p.add_argument('--z-output',type=Path,help='collect guarded reference Z moments in this same traversal')
     p.add_argument('--max-cached-missing-patterns',type=int,default=64)
     p.add_argument('--minimum-cached-pattern-rows',type=int,default=64)
+    p.add_argument('--missing-cache-strategy',choices=('patterns','pooled'),default='patterns')
+    p.add_argument('--cache-addition-penalty-rows',type=float,default=8.)
     p.add_argument('--residual-workers',type=int,default=1,
         help='independent residual-pair workers, one BLAS thread each on reserved CPUs')
     a=p.parse_args()
     if a.z_output is not None and a.mode!='study':p.error('Z publication requires a complete study chromosome')
     if a.max_cached_missing_patterns<0:p.error('missing-pattern cache limit must be nonnegative')
     if a.minimum_cached_pattern_rows<1:p.error('cached patterns require a positive minimum row count')
+    if not np.isfinite(a.cache_addition_penalty_rows) or a.cache_addition_penalty_rows<0:
+        p.error('cache addition penalty must be finite and nonnegative')
     a.output.mkdir(exist_ok=False);start=time.monotonic()
     source_hashes={str(path.relative_to(ROOT)):file_sha256(path) for path in (
         Path(__file__),ROOT/'src/summit/ldscore/generalized_gxe_masked_batch.py',
@@ -95,6 +99,8 @@ def main():
         batch=CrossTraitBatch(masked,block_ids=np.unique(groups[:limit]),annotation_names=annotation_names,
             max_cached_missing_patterns=a.max_cached_missing_patterns,
             minimum_cached_pattern_rows=a.minimum_cached_pattern_rows,
+            missing_cache_strategy=a.missing_cache_strategy,
+            cache_addition_penalty_rows=a.cache_addition_penalty_rows,
             residual_workers=a.residual_workers,residual_cpus=CPUS)
     z_accumulator=None;shared_tn=None;z_telemetry=[]
     if a.z_output is not None:
@@ -149,6 +155,8 @@ def main():
         genotype_scale='sealed_affine_mean_imputed',common_only=a.common_only,threads=a.threads,cpus=CPUS,
         max_cached_missing_patterns=a.max_cached_missing_patterns,
         minimum_cached_pattern_rows=a.minimum_cached_pattern_rows,
+        missing_cache_strategy=a.missing_cache_strategy,
+        cache_addition_penalty_rows=a.cache_addition_penalty_rows,
         residual_workers=a.residual_workers,residual_worker_affinity=batch.residual_worker_affinity,
         residual_phase_timing='sum of worker elapsed times; residual_seconds measures wall time',
         timings=timings,seconds=time.monotonic()-start,traversal_seconds=time.monotonic()-traversal,

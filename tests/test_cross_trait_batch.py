@@ -90,3 +90,35 @@ def test_shared_missing_pattern_cache_preserves_exact_residual_moments(minimum_r
     list(uncached.block(g,a,groups));list(cached.block(g,a,groups))
     np.testing.assert_allclose(cached.genetic_residual,uncached.genetic_residual,rtol=1e-12,atol=1e-10)
     np.testing.assert_array_equal(cached.scores.rhs,uncached.scores.rhs)
+
+
+@pytest.mark.parametrize('budget',[1,4,32])
+def test_pooled_mask_cache_reuses_disjoint_partial_patterns_exactly(budget):
+    rng=np.random.default_rng(728);n,m,q=283,23,3
+    phi=np.c_[np.ones(n),rng.normal(size=(n,2))];u=np.linalg.qr(phi)[0]
+    present=rng.random((n,6))>.16
+    # Two nonidentical patterns have a useful common missing-trait subset.
+    present[:80,:3]=False;present[:40,3]=False;present[40:80,4]=False
+    traits=[]
+    for t in range(6):
+        idx=np.flatnonzero(present[:,t])
+        traits.append(dict(name=str(t),indices=idx,fixed_basis=np.linalg.qr(u[idx])[0],
+                           phenotype=rng.normal(size=len(idx))))
+    masked=MaskedTraitBatch(basis=phi,fixed_basis=u,residual_basis=phi,traits=traits)
+    args=dict(block_ids=np.arange(3),annotation_names=('all',),pairs=[(x,y) for x in range(6) for y in range(6)])
+    uncached=CrossTraitBatch(masked,**args,max_cached_missing_patterns=0)
+    pooled=CrossTraitBatch(masked,**args,max_cached_missing_patterns=budget,
+        minimum_cached_pattern_rows=1,missing_cache_strategy='pooled',cache_addition_penalty_rows=0)
+    assert 0<len(pooled.missing_pattern_rows)<=budget
+    used=np.concatenate(pooled.missing_pattern_rows)
+    assert len(used)==len(np.unique(used))
+    if budget<32:
+        assert any(len(np.unique(present[rows],axis=0))>1 for rows in pooled.missing_pattern_rows)
+    for geom,(x,y) in zip(pooled.geometry,pooled.scores.pairs):
+        for i in geom.get('cached_patterns',()):
+            rows=pooled.missing_pattern_rows[i]
+            assert not present[rows,x].any() and not present[rows,y].any()
+    g=rng.normal(size=(m,n));a=np.ones((m,1));groups=np.arange(m)//8
+    list(uncached.block(g,a,groups));list(pooled.block(g,a,groups))
+    np.testing.assert_allclose(pooled.genetic_residual,uncached.genetic_residual,rtol=1e-12,atol=1e-10)
+    np.testing.assert_array_equal(pooled.scores.rhs,uncached.scores.rhs)

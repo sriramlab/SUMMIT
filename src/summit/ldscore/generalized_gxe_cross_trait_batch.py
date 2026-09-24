@@ -18,6 +18,72 @@ import numpy as np
 from summit.context.cross_trait_zpass import write_array_artifact
 
 
+def _pooled_missing_groups(bits, flags, *, budget, minimum_rows, addition_penalty):
+    """Plan disjoint cached row groups, using masks only (no genotype data).
+
+    A group can serve a pair only when every person in it misses both traits.
+    Split distinct missingness patterns on balanced trait bits, then select a
+    disjoint tree cut with at most ``budget`` groups. The cost model counts
+    avoided row products and charges a configurable row-equivalent cost for
+    adding a cached product. It changes work allocation, never the moments.
+    """
+    if not len(flags):
+        return np.array([], dtype=np.uint64), []
+    patterns, inverse, counts = np.unique(bits, return_inverse=True, return_counts=True)
+    bitflags = np.left_shift(np.uint64(1), np.arange(64, dtype=np.uint64))
+
+    def build(indices):
+        common = np.bitwise_and.reduce(patterns[indices])
+        support = int(np.count_nonzero((common & flags) == flags))
+        mass = int(counts[indices].sum())
+        gain = mass * (support - 1) - addition_penalty * support
+        eligible = mass >= minimum_rows and support > 1 and gain > 0
+        values = np.array([0., gain]) if eligible else np.array([0.])
+        choice = np.array([-1, -2]) if eligible else np.array([-1])
+        node = dict(indices=indices, common=common)
+        if len(indices) > 1:
+            frequency = counts[indices] @ ((patterns[indices, None] & bitflags) != 0)
+            bit = bitflags[np.argmax(np.minimum(frequency, mass-frequency))]
+            take = (patterns[indices] & bit) != 0
+            left, right = build(indices[take]), build(indices[~take])
+            a, b = left['values'], right['values']
+            size = max(len(values), min(budget, len(a)+len(b)-2)+1)
+            best = np.full(size, -np.inf)
+            split = np.full(size, -1, dtype=int)
+            for i in range(min(len(a), size)):
+                candidate = a[i]+b[:size-i]
+                better = candidate > best[i:i+len(candidate)]
+                best[i:i+len(candidate)][better] = candidate[better]
+                split[i:i+len(candidate)][better] = i
+            if eligible and gain > best[1]:
+                best[1], split[1] = gain, -2
+            values, choice = best, split
+            node['children'] = left, right
+        node.update(values=values, choice=choice)
+        return node
+
+    root = build(np.arange(len(patterns)))
+    selected = []
+
+    def recover(node, count):
+        if count == 0:
+            return
+        split = int(node['choice'][count])
+        if split == -2:
+            selected.append(node)
+        else:
+            left, right = node['children']
+            recover(left, split)
+            recover(right, count-split)
+
+    recover(root, int(np.argmax(root['values'])))
+    labels = np.full(len(patterns), -1, dtype=int)
+    for i, node in enumerate(selected):
+        labels[node['indices']] = i
+    rows = [np.flatnonzero(labels[inverse] == i) for i in range(len(selected))]
+    return np.array([node['common'] for node in selected], dtype=np.uint64), rows
+
+
 class CrossTraitScoreAccumulator:
     """Annotation-major ordered Q x Q score sums, on paired target blocks."""
 
@@ -69,10 +135,17 @@ class CrossTraitBatch:
     """
 
     def __init__(self, masked, *, block_ids, annotation_names, pairs=None,max_cached_missing_patterns=64,
-                 minimum_cached_pattern_rows=64,residual_workers=1,residual_cpus=None):
+                 minimum_cached_pattern_rows=64,missing_cache_strategy='patterns',
+                 cache_addition_penalty_rows=8.,residual_workers=1,residual_cpus=None):
         self.masked=masked;self.annotation_names=tuple(annotation_names)
         if int(minimum_cached_pattern_rows)!=minimum_cached_pattern_rows or minimum_cached_pattern_rows<1:
             raise ValueError('cached missing patterns require a positive minimum row count')
+        if missing_cache_strategy not in ('patterns','pooled'):
+            raise ValueError('unknown missing-row cache strategy')
+        if not np.isfinite(cache_addition_penalty_rows) or cache_addition_penalty_rows<0:
+            raise ValueError('cache addition penalty must be finite and nonnegative')
+        if int(max_cached_missing_patterns)!=max_cached_missing_patterns or max_cached_missing_patterns<0:
+            raise ValueError('cache group budget must be a nonnegative integer')
         self.residual_workers=int(residual_workers)
         self.residual_cpus=tuple(sorted(os.sched_getaffinity(0) if residual_cpus is None else residual_cpus))
         if (self.residual_workers<1 or self.residual_workers>len(self.residual_cpus)
@@ -130,15 +203,23 @@ class CrossTraitBatch:
             for t,trait in enumerate(masked.traits):
                 absent=np.ones(masked.n,dtype=bool);absent[trait['indices']]=False
                 bits[absent]|=np.uint64(1)<<np.uint64(t)
-            patterns,counts=np.unique(bits,return_counts=True)
-            support=np.zeros(len(patterns),dtype=np.int64)
-            for ix,iy in self.scores.pairs:
-                flag=(np.uint64(1)<<np.uint64(ix))|(np.uint64(1)<<np.uint64(iy))
-                support+=(patterns&flag)==flag
-            eligible=np.flatnonzero((counts>=minimum_cached_pattern_rows)&(support>1))
-            eligible=eligible[np.argsort((counts*support)[eligible])[::-1][:max_cached_missing_patterns]]
-            selected=patterns[eligible]
-            self.missing_pattern_rows=[np.flatnonzero(bits==pattern) for pattern in selected]
+            if missing_cache_strategy=='pooled':
+                flags=np.array([(np.uint64(1)<<np.uint64(ix))|(np.uint64(1)<<np.uint64(iy))
+                    for geom,(ix,iy) in zip(self.geometry,self.scores.pairs)
+                    if geom['nested'] is None and geom['inclusion_exclusion']],dtype=np.uint64)
+                selected,self.missing_pattern_rows=_pooled_missing_groups(bits,flags,
+                    budget=int(max_cached_missing_patterns),minimum_rows=minimum_cached_pattern_rows,
+                    addition_penalty=cache_addition_penalty_rows)
+            else:
+                patterns,counts=np.unique(bits,return_counts=True)
+                support=np.zeros(len(patterns),dtype=np.int64)
+                for ix,iy in self.scores.pairs:
+                    flag=(np.uint64(1)<<np.uint64(ix))|(np.uint64(1)<<np.uint64(iy))
+                    support+=(patterns&flag)==flag
+                eligible=np.flatnonzero((counts>=minimum_cached_pattern_rows)&(support>1))
+                eligible=eligible[np.argsort((counts*support)[eligible])[::-1][:max_cached_missing_patterns]]
+                selected=patterns[eligible]
+                self.missing_pattern_rows=[np.flatnonzero(bits==pattern) for pattern in selected]
             for geom,(ix,iy) in zip(self.geometry,self.scores.pairs):
                 geom['cached_patterns']=np.array([],dtype=int)
                 if geom['nested'] is not None or not geom['inclusion_exclusion']:continue
