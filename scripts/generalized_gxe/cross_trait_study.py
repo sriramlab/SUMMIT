@@ -112,7 +112,10 @@ def main():
             end=min(begin+a.width,limit);width=end-begin;tick=time.monotonic()
             offset=panel.get('physical_start',0);reader.read_range(begin+offset,end+offset,raw[:width],allele_idx=1)
             x=raw[:width].astype(float);missing=x==-9;x-=mean[begin:end,None];x*=inverse[begin:end,None];x[missing]=0
-            decode=time.monotonic()-tick;baseline=np.nan
+            # Study mode does not run a separate within-only timing pass.
+            # JSON null records that absence without invalidating canonical
+            # provenance after a complete chromosome traversal.
+            decode=time.monotonic()-tick;baseline=None
             tile_annotations=annotations[begin:end];tile_groups=groups[begin:end]
             if a.common_only and z_accumulator is None:
                 active=np.any(tile_annotations>0,axis=1)

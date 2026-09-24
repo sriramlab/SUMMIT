@@ -28,8 +28,9 @@ def write_array_artifact(path, *, kind, arrays, provenance):
         raise ValueError('object arrays cannot be published')
     metadata=dict(kind=kind,schema_version=1,provenance=provenance,
                   arrays={k:array_sha256(v) for k,v in values.items()})
+    encoded=canonical_json(metadata)
     with Path(path).open('xb') as f:
-        np.savez(f,manifest=np.array(canonical_json(metadata)),**values)
+        np.savez(f,manifest=np.array(encoded),**values)
 
 
 def load_array_artifact(path, *, kind):
