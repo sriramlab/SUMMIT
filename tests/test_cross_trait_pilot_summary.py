@@ -104,3 +104,14 @@ def test_authenticated_pilot_all_modes_end_to_end(tmp_path):
     assert result['omega_xy'].shape==(1,q,q)
     assert result['loo_h_xy'].shape==(len(labels),1,q-1,q-1)
     assert meta['genotype_traversals']==0
+    # The ordinary fitter consumes the same authenticated block products,
+    # independently of the context normal equations and without genotypes.
+    path=path.with_name('cross_trait_bivariate.py')
+    spec=importlib.util.spec_from_file_location('bivariate_pipeline',path)
+    bivariate=importlib.util.module_from_spec(spec);spec.loader.exec_module(bivariate)
+    comparison=tmp_path/'ordinary';comparison.mkdir()
+    bivariate.run(SimpleNamespace(base=tmp_path,study_root=crossroot,pilot_fits=output,
+        output=comparison,modes=module.MODES,chromosomes=[22]))
+    ordinary,meta=load_array_artifact(comparison/'ordinary_bivariate.npz',kind='summit.cross_trait.bivariate_regression')
+    np.testing.assert_array_equal(ordinary['block_ids'],labels)
+    assert meta['genotype_traversals']==0
