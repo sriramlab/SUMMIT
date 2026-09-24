@@ -108,7 +108,10 @@ class CrossTraitBatch:
             self.residual_rhs[pair_index]=d.T@(x['common'].normalized_phenotypes[lx,0]
                                                          *y['common'].normalized_phenotypes[ly,0])
             use_missing=len(joint_missing)<len(overlap)
-            self.geometry.append(dict(overlap=overlap,correction=joint_missing if use_missing else overlap,
+            # Keep only rows needed by the tile correction. The full overlap
+            # is used above for fixed residual moments and otherwise costs
+            # O(number_of_pairs * cohort_size) unused persistent storage.
+            self.geometry.append(dict(correction=joint_missing if use_missing else overlap,
                 inclusion_exclusion=use_missing,nested=nested,
                 cross_gemm=np.ascontiguousarray(cross.transpose(1,0,2)).reshape(x['fixed_rank'],h*y['fixed_rank'])))
         self._ordered_lookup=np.empty((q,q),dtype=int)
