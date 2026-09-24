@@ -2767,6 +2767,9 @@ def _require_integer_step_size(args, command: str) -> None:
 
 
 def main():
+    if sys.argv[1:3] == ['reference', 'zpass']:
+        from .context.reference_zpass_cli import main as zpass_main
+        return zpass_main(sys.argv[3:])
     parser = build_parser()
     args = parser.parse_args()
     try:
