@@ -169,6 +169,7 @@ class CrossTraitBatch:
         # multipliers. This is algebraically identical and avoids Q*H copies
         # of the C by C transform for every pair and SNP.
         master_projection={i:z@m.traits[i]['transform'].T for i,z in projections.items()}
+        residual_coefficients=np.ascontiguousarray(m.fixed_coefficients[:,q:])
         def pair_work(pair_index):
             ix,iy=self.scores.pairs[pair_index]
             phases={name:0. for name in self.residual_phase_seconds}
@@ -187,19 +188,21 @@ class CrossTraitBatch:
                 linear=raw_traits[ix][0]+raw_traits[iy][0]-common_linear+linear
                 square=raw_traits[ix][1]+raw_traits[iy][1]-common_square+square
             phases['raw_products']+=perf_counter()-tick;tick=perf_counter()
-            linear=np.einsum('jrc,rs->jsc',linear.reshape(len(x),m.multiplier_rank,m.fixed_rank),
-                             m.fixed_coefficients,optimize=True).reshape(len(x),h+1,q,m.fixed_rank)
+            linear=linear.reshape(len(x),m.multiplier_rank,m.fixed_rank)
             raw=(square@m.square_coefficients).reshape(len(x),h+1,p)
             phases['span_expansion']+=perf_counter()-tick
             tick=perf_counter()
             zx,zy=projections[ix],projections[iy]
             value=raw[:,1:,self._ordered_lookup].transpose(0,2,3,1).copy()
-            # The shared SNP batch axis prevents einsum from selecting an
-            # ordinary GEMM. Contract the fixed-effect axis explicitly with
-            # batched GEMMs, retaining only width*H*Q*C workspace.
-            linear_flat=np.ascontiguousarray(linear[:,1:]).reshape(len(x),h*q,m.fixed_rank)
-            value-=(linear_flat@master_projection[iy].transpose(0,2,1)).reshape(len(x),h,q,q).transpose(0,2,3,1)
-            value-=(master_projection[ix]@linear_flat.transpose(0,2,1)).reshape(len(x),q,h,q).transpose(0,1,3,2)
+            # Contract C while the multiplier axis is still rank-compressed,
+            # then expand only width*rank*Q to width*H*Q². This avoids the
+            # width*H*Q*C intermediate without changing either contraction.
+            left=linear@master_projection[iy].transpose(0,2,1)
+            left=left.transpose(0,2,1).reshape(len(x)*q,m.multiplier_rank)@residual_coefficients
+            value-=left.reshape(len(x),q,h,q).transpose(0,3,1,2)
+            right=linear@master_projection[ix].transpose(0,2,1)
+            right=right.transpose(0,2,1).reshape(len(x)*q,m.multiplier_rank)@residual_coefficients
+            value-=right.reshape(len(x),q,h,q).transpose(0,1,3,2)
             # An unconstrained einsum path makes a width*Q²*C² outer product.
             # Explicit GEMMs contract C first, using width*Q*H*C workspace.
             cx,cy=zx.shape[-1],zy.shape[-1]
