@@ -22,6 +22,7 @@ import numpy as np
 import pgenlib
 from threadpoolctl import threadpool_limits,threadpool_info
 import workflow
+CPUS=tuple(workflow._PRE_NUMERICAL_CPU_AFFINITY)
 from summit.context.reference_zpass_cli import authenticated_reference,file_sha256
 from summit.context.spec import array_sha256,canonical_sha256
 from summit.context.cross_trait_zpass import ZMomentAccumulator

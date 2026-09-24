@@ -4,6 +4,8 @@ set -euo pipefail
 umask 077
 mode=${1:?qualify, zpass, simulation_reference or simulation}
 output_root=${2:?exclusive output root required}
+export TMPDIR="$output_root/tmp/${JOB_ID:?}.${SGE_TASK_ID:-0}"
+mkdir -p "$TMPDIR"
 # UGE executes a spooled copy of this script, so $0 is not the source path.
 # qsub -wd is the authenticated immutable checkout selected by the submitter.
 code_root=$PWD
@@ -23,7 +25,7 @@ case $mode in
   exec "$python_exe" "$launch" --threads 8 -- "$python_exe" "$code_root/scripts/generalized_gxe/private_python.py" pytest \
     "$code_root/tests/test_cross_trait_gram.py" "$code_root/tests/test_cross_trait_zpass.py" \
     "$code_root/tests/test_cross_trait_batch.py" "$code_root/tests/test_cross_trait_fit.py" \
-    "$code_root/tests/test_reference_zpass_cli.py" -q -p no:cacheprovider
+    "$code_root/tests/test_reference_zpass_cli.py" "$code_root/tests/test_cross_trait_runtime_placement.py" -q -p no:cacheprovider
   ;;
  zpass)
   chromosome=${3:-${SGE_TASK_ID:?chromosome required}}
