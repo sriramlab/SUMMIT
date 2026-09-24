@@ -334,6 +334,7 @@ These results do not by themselves establish all acceptance criteria.
 | Reused pair-sum cache and study publication at 22f655c | 26 portable and 26 private-BLIS checks passed |
 | Standalone chr22 Z, local versus Hoffman | Block products agree to 3.29e-16 relative; Hoffman traversal 651.87 s, one pass |
 | Completed fused chr22 study/Z, eight traits | 99,273 SNPs in one traversal; 776 guarded TN calls, zero repairs; 3,792.20 accounted s; RSS 6,174,252 KiB |
+| Completed fused study/Z across all 22 chromosomes | 7,774,235 SNPs; 60,747 guarded TN calls; zero repairs; one contiguous traversal per chromosome; 200 paired blocks; 354,263.502 aggregate accounted seconds |
 | Fused versus standalone chr22 Z | Block products agree to 7.91e-15 relative; global products to 7.85e-15 |
 | Reference probe tiling, N=50,112, M=1,024, B=1,024 | Tile 4 versus 128: 33.11 versus 13.70 s; Gram difference 1.65e-16 relative; same-person matrix bit-identical |
 
@@ -438,6 +439,12 @@ measure a within-only comparator. After this qualification, chromosomes 1–21
 were submitted with the same code and binding, eight cores, 16 GiB per task,
 14 hours and no task-concurrency cap. Checkpointed partial tasks must resume
 before any full-genome fit is reported.
+All 22 traversals have now completed and authenticate. The independent
+`cross_trait_audit_traversal.py` checks common cohort identities, all 200
+block IDs, global annotation mass, guarded call counts and successful
+eight-slot accounting. Its execution table records each chromosome's
+runtime, peak RSS and score/Z hashes. These counts describe the successful
+production run; the aborted attempts above remain part of the run history.
 
 The chr22-only downstream qualification also runs all four fitting modes,
 the paired report and the ordinary-bivariate comparison without genotypes.
