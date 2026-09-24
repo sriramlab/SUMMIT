@@ -228,6 +228,15 @@ RSS and separate score and residual costs, and omit the first timing tile.
 `--residual-workers 8` distributes exact pair residual contractions across
 eight explicitly reserved CPUs while keeping each worker's NumPy BLAS
 single-threaded. Recorded worker affinities must match those reservations.
+Trait fixed bases are streamed at initialization and their row norms are
+reused across pairs. Missing-row caches are exact work-sharing optimizations:
+`--max-cached-missing-patterns` bounds the number of groups and
+`--minimum-cached-pattern-rows` controls their minimum size. The optional
+`--missing-cache-strategy pooled` also combines distinct patterns into
+disjoint groups. A group serves a pair only if every member misses both
+traits; uncached rows are still contracted exactly. Its
+`--cache-addition-penalty-rows` controls a mask-only cost model, not a
+statistical approximation. Defaults retain the individual-pattern cache.
 
 `cross_trait_bivariate.py` compares both context-model baseline centerings
 with the existing ordinary SUMMIT HE fitter. It profiles baseline reference
@@ -246,20 +255,24 @@ These results do not by themselves establish all acceptance criteria.
 
 | Check | Observed result |
 |---|---|
-| Portable suite at commit fe7bf6a | 1,467 passed; 6 skipped; 1 xpassed |
+| Portable suite at commit 5fc39bf | 1,471 passed; 6 skipped; 1 xpassed |
 | Legacy within-trait full/deletion regression | Bit-identical |
-| Dense oracle, N=2,000, M=3,000, Q=3, about 60% overlap, fixed ranks 5 and 4 | Genetic Gram relative error 2.37e-15; coefficient error 3.29e-14 |
+| Dense oracle, N=2,000, M=3,000, Q=3, about 60% overlap, fixed ranks 5 and 4 | Genetic Gram relative error 2.37e-15; coefficient error 3.23e-14 |
 | Dense real chr22 reference, N=20,000, 41,275 common SNPs | Z repair relative error 2.26e-15 |
 | Q=1 baseline regression against bivariate SUMMIT | Agreement at 1e-12 on the same dense panel |
 | 42 traits × six within-trait arms, full-genome same-person diagonals, no genotype pass | 252 fits completed and authenticated; 142 entries above one SE across 11 traits; maximum 7.52 SE |
-| Six-trait chr22 timing, five measured tiles | 2.565 versus 2.198 s per 128-SNP block; 16.66% total increment |
-| 42-trait chr22 timing, batched projector products and eight exact residual workers, five measured tiles | 21.872 versus 15.295 s per 128-SNP block; 43.01% increment; RSS 11,809,732 KiB (fails 30% target) |
-| 42-trait score accumulation alone | 0.0167% of within-trait time; exact overlap residual work dominates |
+| Six-trait chr22 timing after streamed inputs, five measured tiles | 2.578 versus 2.229 s per 128-SNP block; 15.67% total increment; RSS 5,696,408 KiB |
+| Eight-core 42-trait timing, 256 individual-pattern groups with minimum 16 rows, five measured tiles | 15.092 versus 10.516 s per 128-SNP block; 43.51% increment; RSS 5,943,260 KiB |
+| Fastest completed eight-core 42-trait timing, 256 pooled groups, minimum 16 rows, addition penalty eight | 14.574 versus 10.275 s per block; 41.84% increment; RSS 5,844,816 KiB (fails 30% target) |
+| 42 traits, 16 BLAS threads and 16 residual workers | 24.730 versus 22.100 s per block; 11.90% increment, but slower in absolute time than eight cores |
+| 42 traits, eight BLAS threads and 16 residual workers on 16 reserved CPUs | 18.187 versus 13.363 s per block; 36.10% increment |
+| 42-trait score accumulation alone, individual-pattern cache | 0.0192% of within-trait time; exact overlap residual work dominates |
 | Block same-person apportionment, chr22 | Maximum relative LD-scalar error 0.000151906 (passes 0.001) |
 | Hoffman placement qualification 14886620 | 20 tests passed; eight physical cores; NumPy and native worker affinities verified |
 | Private-BLIS prediction and cross-trait checks at b271d90 | 95 passed |
 | Private-BLIS batched residual checks at f00fa16 | 19 passed |
 | Private-BLIS complete study publication, Z and batch checks at fe7bf6a | 20 passed |
+| Private-BLIS optional pooled-cache and study publication checks at 5fc39bf | 20 passed |
 | Standalone chr22 Z, local versus Hoffman | Block products agree to 3.29e-16 relative; Hoffman traversal 651.87 s, one pass |
 
 Real-mask Gram relative Frobenius errors at N=20,000:
@@ -282,17 +295,24 @@ The original August simulation reference is obsolete under current
 same-person validation, so the large benchmark constructs a new guarded
 reference instead of bypassing that check. Large-simulation coverage,
 40,000-person validation and pilot results
-remain pending in this version of the page. The 42-trait performance criterion
-is a measured failure. Increasing the cache limit from 64 to 256 did not
-improve the matched within/cross time ratio.
+remain pending in this version of the page. Complete eight-core 42-trait
+performance remains above the 30% target. The 16-thread configuration has a
+smaller percentage increment because its within-only pass is substantially
+slower; it does not establish an absolute throughput improvement. All timing
+configurations and CPU budgets are retained in the run report. Streaming
+fixed bases and releasing unused overlaps reduced peak RSS from approximately
+11.8 million to 5.9 million KiB.
 
 The first full-chromosome fused pilot traversed all 99,273 SNPs in 78.3
 accounted minutes but failed artifact publication: an unmeasured timing was
 represented as NaN in canonical JSON provenance. No reusable score or fused
 Z artifact was published. Study timings now use JSON null, invalid provenance
 is rejected before opening an artifact, and a complete-driver test exercises
-publication and numerical read-back. The failed run is preserved; a rerun is
-required before chromosome expansion.
+publication and numerical read-back. The failed run is preserved. After its
+full-chromosome traversal timing, a dependent array was submitted using that
+measured workload. Each task authenticates the replacement chr22 completion
+receipt, score/Z arrays and guarded traversal ledger before any genotype
+work; scheduler dependency release alone is insufficient.
 
 The corrected refit table is `within_refits_full_diagonal/within_trait_mode_comparison.tsv`.
 The older `within_refits` run is preserved as provisional and must not supply
