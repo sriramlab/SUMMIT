@@ -223,14 +223,18 @@ These results do not by themselves establish all acceptance criteria.
 
 | Check | Observed result |
 |---|---|
-| Portable suite at commit 62267ba | 1,446 passed; 5 skipped; 1 xpassed |
+| Portable suite at commit d996129 | 1,450 passed; 6 skipped; 1 xpassed |
 | Legacy within-trait full/deletion regression | Bit-identical |
-| Dense oracle, N=2,000, M=3,000, Q=3, about 60% overlap | Genetic Gram relative error 5.58e-15; coefficient error 1.40e-13 |
+| Dense oracle, N=2,000, M=3,000, Q=3, about 60% overlap | Genetic Gram relative error 5.58e-15; coefficient error 1.86e-14 |
 | Dense real chr22 reference, N=20,000, 41,275 common SNPs | Z repair relative error 2.26e-15 |
 | Q=1 baseline regression against bivariate SUMMIT | Agreement at 1e-12 on the same dense panel |
-| 42 traits × six within-trait arms, no genotype pass | All 252 fits completed; 25,704 comparison rows |
-| Within-trait shifts above one default jackknife SE | 85 rows across 11 traits; maximum 7.52 SE |
-| Optimized six-trait chr22 timing | 3.317 versus 2.607 s per 128-SNP block; 27.2% total increment |
+| 42 traits × six within-trait arms, no genotype pass | First 252-fit run completed; corrected full-genome diagonal refit running |
+| Six-trait chr22 timing, five measured tiles | 2.565 versus 2.198 s per 128-SNP block; 16.66% total increment |
+| 42-trait chr22 timing, default exact missing-pattern cache | 30.481 versus 12.984 s per 128-SNP block; 134.76% increment (fails 30% target) |
+| 42-trait score accumulation alone | 0.025% of within-trait time; exact overlap residual work dominates |
+| Block same-person apportionment, chr22 | Maximum relative LD-scalar error 0.000151906 (passes 0.001) |
+| Hoffman placement qualification 14886620 | 20 tests passed; eight physical cores; NumPy and native worker affinities verified |
+| Private-BLIS prediction and cross-trait checks at b271d90 | 95 passed |
 
 Real-mask Gram relative Frobenius errors at N=20,000:
 
@@ -251,8 +255,10 @@ traversal for all 100 replicates. The small complete BED pipeline is tested.
 The original August simulation reference is obsolete under current
 same-person validation, so the large benchmark constructs a new guarded
 reference instead of bypassing that check. Large-simulation coverage,
-40,000-person validation, final 42-trait performance and pilot results remain
-pending in this version of the page.
+40,000-person validation, corrected 42-trait mode comparisons and pilot results
+remain pending in this version of the page. The 42-trait performance criterion
+is a measured failure. Increasing the cache limit from 64 to 256 did not
+improve the matched within/cross time ratio.
 
 The pilot hypothesis was recorded before fitting: a shared age–BMI response
 direction among LDL, ApoB, total cholesterol, non-HDL, HbA1c and DBP, absent
