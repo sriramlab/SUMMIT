@@ -34,6 +34,21 @@ EXTERNAL={'TC':'cholesterol_raw','LDL-C':'ldl_raw','TG':'triglycerides_log','HDL
 EXPOSURES={'Age':'age','Sex':'sex','Ever-smoking':'ever_smoked'}
 
 
+def analysis_family(x,y):
+    """Trait-set families fixed before the new chromosome scoring results."""
+    pair=frozenset((x,y))
+    if pair.issubset(tuple(LABELS)[:8]):return 'pilot'
+    if pair in {frozenset(('glucose_log',t)) for t in
+            ('hba1c_raw','ldl_raw','apo_b_raw','diastolic_blood_pressure_raw')}:
+        return 'glycaemic_followup'
+    external=(('triglycerides_log','hdl_raw'),('triglycerides_log','ldl_raw'),
+        ('aspartate_aminotransferase_log','alanine_aminotransferase_log'),
+        ('aspartate_aminotransferase_log','gamma_glutamyltransferase_log'),
+        ('creatinine_log','urea_log'),('platelet_count_raw','white_blood_cell_count_log'),
+        ('diastolic_blood_pressure_raw','bp_systolic_raw'))
+    return 'external_followup' if pair in {frozenset(p) for p in external} else 'other_exploratory'
+
+
 def quantities(xy,xx,yy,*,mean_x,mean_y,context_covariance,age,bmi):
     base=cross_trait_derived(xy,xx,yy,mean_x=mean_x,mean_y=mean_y,context_covariance=context_covariance)
     h,hx,hy=(base[k] for k in ('h_xy','h_xx','h_yy'))
@@ -101,6 +116,18 @@ def bh(values):
     return result
 
 
+def assign_fdr(rows):
+    """Keep pilot inference unchanged when adding prespecified follow-up sets."""
+    groups={}
+    for row in rows:
+        family=analysis_family(row['trait_x'],row['trait_y'])
+        row['analysis_family']=family
+        groups.setdefault((family,row['quantity']),[]).append(row)
+    for (family,name),selected in groups.items():
+        for row,fdr in zip(selected,bh([r['p'] for r in selected])):
+            row['fdr_family']=family+':'+name;row['fdr']=float(fdr)
+
+
 def write(path,rows):
     with path.open('x',newline='') as f:
         writer=csv.DictWriter(f,fieldnames=list(rows[0]),delimiter='\t');writer.writeheader();writer.writerows(rows)
@@ -145,10 +172,7 @@ def main():
                         exploratory=True))
     # Each named contrast family is specified before testing. These FDRs are
     # descriptive under the usual BH dependence assumptions, not replication.
-    for name in {r['quantity'] for r in rows}:
-        selected=[r for r in rows if r['quantity']==name]
-        for row,fdr in zip(selected,bh([r['p'] for r in selected])):
-            row['fdr_family']=name;row['fdr']=float(fdr)
+    assign_fdr(rows)
     write(args.output/'biological_contrasts.tsv',rows)
     # Highly correlated lipid measurements are not independent replications.
     # Average the four estimands and their paired influences, not their SEs.
@@ -231,7 +255,8 @@ def plot(output,rows,external):
     axes[0].legend(handles=[Line2D([],[],color=colors[k],marker='o',ls='',label=l) for k,l in
         [('baseline_rg','Baseline'),('orthogonal_rg','Baseline-orthogonal response')]],
         loc='lower left',bbox_to_anchor=(0,1.002),ncol=2,fontsize=8,frameon=False)
-    fig.text(.02,-.025,'Exploratory common-bin fits. Bars: nominal 95% delta intervals. Blue differences: BH FDR < 0.05 across displayed pairs.',fontsize=8)
+    fig.text(.02,-.045,'Exploratory common-bin fits. Bars: nominal 95% delta intervals.\n'
+        'Blue paired differences: BH FDR < 0.05 within the recorded pilot, external or glycaemic analysis family.',fontsize=8)
     fig.tight_layout();save(fig,'baseline_and_orthogonal_response')
     # Same-exposure response slopes are the immediate single-exposure analog.
     fig,axes=plt.subplots(1,4,figsize=(14,max(6,len(pairs)*.25)),sharey=True)

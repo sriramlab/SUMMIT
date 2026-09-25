@@ -16,7 +16,7 @@ import numpy as np
 from summit.context.cross_trait_uncertainty import paired_delta_covariances
 from summit.context.cross_trait_zpass import load_array_artifact
 from summit.context.reference_zpass_cli import file_sha256
-from cross_trait_biology import LABELS,bh,write
+from cross_trait_biology import LABELS,analysis_family,bh,write
 
 
 def profiles(primitive,*,mean_x,mean_y,exposure,offsets):
@@ -70,8 +70,13 @@ def main():
     from scipy.stats import norm
     pvalues=[2*norm.sf(abs(r['high_minus_low_rg']/r['paired_delta_se']))
         if np.isfinite(r['paired_delta_se']) and r['paired_delta_se']>0 else np.nan for r in changes]
-    for record,pvalue,fdr in zip(changes,pvalues,bh(pvalues)):
-        record.update(p=float(pvalue),fdr=float(fdr),fdr_family='all trait-pair age and BMI endpoint contrasts')
+    families={}
+    for record,pvalue in zip(changes,pvalues):
+        family=analysis_family(record['trait_x'],record['trait_y'])
+        record.update(p=float(pvalue),analysis_family=family,fdr_family=family+':age and BMI endpoint contrasts')
+        families.setdefault(family,[]).append(record)
+    for selected in families.values():
+        for record,fdr in zip(selected,bh([r['p'] for r in selected])):record['fdr']=float(fdr)
     write(args.output/'context_profiles.tsv',rows);write(args.output/'paired_context_changes.tsv',changes)
     import matplotlib
     matplotlib.use('Agg')

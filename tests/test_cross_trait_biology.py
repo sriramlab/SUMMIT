@@ -32,3 +32,13 @@ def test_joint_baseline_response_against_full_gaussian_schur_complement():
 def test_bh_retains_undefined_and_counts_only_testable_entries():
     result=module().bh([.01,.04,np.nan,.2])
     np.testing.assert_allclose(result,[.03,.06,np.nan,.2],equal_nan=True)
+
+
+def test_adding_followup_sets_preserves_the_original_pilot_fdr_family():
+    bio=module()
+    rows=[dict(trait_x='ldl_raw',trait_y=y,quantity='orthogonal_rg',p=p)
+        for y,p in [('hba1c_raw',.01),('height_raw',.08),('glucose_log',.04),('triglycerides_log',1e-8)]]
+    bio.assign_fdr(rows)
+    np.testing.assert_allclose([r['fdr'] for r in rows],[.02,.08,.04,1e-8])
+    assert [r['analysis_family'] for r in rows]==['pilot','pilot','glycaemic_followup','external_followup']
+    assert bio.analysis_family('triglycerides_log','ldl_raw')=='external_followup'
