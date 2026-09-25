@@ -22,7 +22,8 @@ def test_invalid_provenance_does_not_create_an_empty_artifact(tmp_path):
 
 
 @pytest.mark.parametrize('resume',[False,True])
-def test_fused_study_driver_publishes_complete_summary_and_z(tmp_path,monkeypatch,resume):
+@pytest.mark.parametrize('requested',[False,True])
+def test_fused_study_driver_publishes_complete_summary_and_z(tmp_path,monkeypatch,resume,requested):
     from summit import gxeldcore
     script=Path(__file__).resolve().parents[1]/'scripts/generalized_gxe/cross_trait_study.py'
     spec=importlib.util.spec_from_file_location('study_publication',script)
@@ -61,6 +62,10 @@ def test_fused_study_driver_publishes_complete_summary_and_z(tmp_path,monkeypatc
     command=[str(script),'study','--base',str(tmp_path),'--bed-prefix',str(bed),
         '--annotations',str(annotation_path),'--output',str(output),'--z-output',str(zpath),
         '--traits','8','--common-only','--threads',str(threads),'--width','7']
+    if requested:
+        path=tmp_path/'requested.json'
+        path.write_text(json.dumps([[module.PILOT[0],module.PILOT[1]],[module.PILOT[2],module.PILOT[0]]]))
+        command.extend(['--pairs-file',str(path),'--trait-names',*module.PILOT])
     if resume:
         # Separate OS processes: no in-memory accumulator/native state can
         # survive the exit-75 boundary. Restore only the authenticated NPZ.
@@ -96,6 +101,8 @@ def test_fused_study_driver_publishes_complete_summary_and_z(tmp_path,monkeypatc
     else:
         monkeypatch.setattr(sys,'argv',command);module.main()
     data,provenance=load_array_artifact(output/'cross_trait_summary.npz',kind='summit.cross_trait.summary')
+    if requested:
+        np.testing.assert_array_equal(data['pairs'],[[0,1],[2,0]])
     z,zmeta=load_array_artifact(zpath,kind='summit.cross_trait.z_moments')
     assert provenance['variant_visits']==m and provenance['genotype_traversals']==1
     assert all(t['within_seconds'] is None for t in provenance['timings'])

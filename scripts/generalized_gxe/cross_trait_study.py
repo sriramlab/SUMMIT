@@ -35,6 +35,27 @@ PILOT=('ldl_raw','apo_b_raw','cholesterol_raw','non_hdl_cholesterol_raw','hba1c_
        'diastolic_blood_pressure_raw','height_raw','platelet_count_raw')
 
 
+def select_trait_pairs(available, names, pairs_path=None):
+    """Resolve requested names once; preserve orientation and reject aliases."""
+    names=tuple(names)
+    if not names or len(set(names))!=len(names) or not set(names)<=set(available):
+        raise ValueError('trait names must be unique and present in the sealed inputs')
+    if pairs_path is None:
+        return names,None
+    requested=json.loads(pairs_path.read_text())
+    if not isinstance(requested,list) or not requested:
+        raise ValueError('pairs file must be a nonempty list of trait-name pairs')
+    indices=[];seen=set()
+    for pair in requested:
+        if not isinstance(pair,list) or len(pair)!=2 or any(t not in names for t in pair):
+            raise ValueError('each requested pair must contain two selected trait names')
+        i,j=map(names.index,pair)
+        if i==j or tuple(sorted((i,j))) in seen:
+            raise ValueError('requested cross-trait pairs must be distinct and nonduplicated')
+        seen.add(tuple(sorted((i,j))));indices.append((i,j))
+    return names,indices
+
+
 def main():
     p=argparse.ArgumentParser(description=__doc__)
     p.add_argument('mode',choices=['benchmark','study'])
@@ -42,6 +63,8 @@ def main():
     p.add_argument('--bed-prefix',type=Path,required=True);p.add_argument('--annotations',type=Path,required=True)
     p.add_argument('--chromosome',type=int,default=22);p.add_argument('--width',type=int,default=128)
     p.add_argument('--variants',type=int,default=256);p.add_argument('--traits',type=int,choices=[6,8,42],default=8)
+    p.add_argument('--trait-names',nargs='+',help='explicit subset of authenticated sealed trait inputs')
+    p.add_argument('--pairs-file',type=Path,help='JSON list of ordered trait-name pairs; one shared traversal')
     p.add_argument('--threads',type=int,default=8);p.add_argument('--common-only',action='store_true')
     p.add_argument('--z-output',type=Path,help='collect guarded reference Z moments in this same traversal')
     p.add_argument('--max-cached-missing-patterns',type=int,default=64)
@@ -83,8 +106,10 @@ def main():
     expansion=a.base/'imputed_expansion_20260917';expanded=json.loads((expansion/'MANIFEST.json').read_text())
     inputroots={t:(a.base/'full_cohort_inputs_20260916',manifest) for t in manifest['traits']}
     inputroots.update({t:(expansion/'inputs',expanded) for t in expanded['traits'] if t!='height_raw'})
-    names=sorted(inputroots) if a.traits==42 else PILOT[:a.traits]
-    if len(names)!=a.traits:raise ValueError(f'expected {a.traits} input traits, found {len(names)}')
+    names=a.trait_names if a.trait_names else sorted(inputroots) if a.traits==42 else PILOT[:a.traits]
+    names,requested_pairs=select_trait_pairs(inputroots,names,a.pairs_file)
+    if not a.trait_names and len(names)!=a.traits:
+        raise ValueError(f'expected {a.traits} input traits, found {len(names)}')
     with np.load(master) as z:rows,phi,fixed,basis_names=(z[k] for k in ('rows','phi','fixed','basis_names'))
     input_hashes={}
     def load_traits():
@@ -116,6 +141,7 @@ def main():
         residual,residual_names,_=workflow.rank_reduced_symmetric_context_residual_basis(phi,tuple(basis_names.astype(str)))
         masked=MaskedTraitBatch(basis=phi,fixed_basis=fixed,residual_basis=residual,traits=load_traits())
         batch=CrossTraitBatch(masked,block_ids=np.unique(groups[:limit]),annotation_names=annotation_names,
+            pairs=requested_pairs,
             max_cached_missing_patterns=a.max_cached_missing_patterns,
             minimum_cached_pattern_rows=a.minimum_cached_pattern_rows,
             missing_cache_strategy=a.missing_cache_strategy,
@@ -139,6 +165,7 @@ def main():
                           cached_missing_people=sum(map(len,batch.missing_pattern_rows)),
                           cpus=CPUS,blas=threadpool_info())),flush=True)
     identity=dict(chromosome=a.chromosome,variants=m,width=a.width,traits=list(names),
+        pairs=batch.scores.pairs.tolist(),
         source_sha256=source_hashes,input_sha256=input_hashes,reference_files=record['files'],
         manifest_sha256=file_sha256(refroot/'MANIFEST.json'),master_sha256=file_sha256(master),
         annotation_sha256=panel['annotation_sha256'],residual_basis_sha256=array_sha256(residual),
