@@ -42,3 +42,19 @@ def test_adding_followup_sets_preserves_the_original_pilot_fdr_family():
     np.testing.assert_allclose([r['fdr'] for r in rows],[.02,.08,.04,1e-8])
     assert [r['analysis_family'] for r in rows]==['pilot','pilot','glycaemic_followup','external_followup']
     assert bio.analysis_family('triglycerides_log','ldl_raw')=='external_followup'
+
+
+def test_glycaemic_specificity_retains_covariance_across_pairs():
+    bio=module();b=200
+    common=np.linspace(-10,10,b);difference=np.linspace(-.01,.01,b)
+    quantities=('baseline_rg','orthogonal_rg','joint_baseline_response_rg','response_rg','orthogonal_exposure_rg')
+    left={k:np.array(.4) for k in quantities};right={k:np.array(.1) for k in quantities}
+    il={k:common+difference for k in quantities};ir={k:common for k in quantities}
+    lookup={frozenset(('ldl_raw','hba1c_raw')):(left,None,['age','bmi'],None,None,il),
+            frozenset(('ldl_raw','glucose_log')):(right,None,['age','bmi'],None,None,ir)}
+    rows=bio.glycaemic_specificity(lookup)
+    assert len(rows)==5
+    expected=np.sqrt((b-1)/b*np.sum(difference**2))
+    np.testing.assert_allclose([r['estimate'] for r in rows],.3)
+    np.testing.assert_allclose([r['paired_delta_se'] for r in rows],expected,rtol=1e-12)
+    assert bio.glycaemic_specificity({})==[]

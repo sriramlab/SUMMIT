@@ -133,6 +133,35 @@ def write(path,rows):
         writer=csv.DictWriter(f,fieldnames=list(rows[0]),delimiter='\t');writer.writeheader();writer.writerows(rows)
 
 
+def glycaemic_specificity(lookup):
+    """Paired HbA1c-minus-glucose sharing, not a difference of significance."""
+    rows=[]
+    for anchor in ('ldl_raw','apo_b_raw','diastolic_blood_pressure_raw'):
+        left=lookup.get(frozenset((anchor,'hba1c_raw')))
+        right=lookup.get(frozenset((anchor,'glucose_log')))
+        if left is None or right is None:continue
+        if left[2]!=right[2]:raise ValueError('exposure order differs between paired fits')
+        for quantity in ('baseline_rg','orthogonal_rg','joint_baseline_response_rg',
+                         'response_rg','orthogonal_exposure_rg'):
+            value=np.asarray(left[0][quantity])-np.asarray(right[0][quantity])
+            influence=np.asarray(left[5][quantity])-np.asarray(right[5][quantity])
+            b=len(influence)
+            if b<2:raise ValueError('paired influence covariance needs at least two blocks')
+            error=np.sqrt((b-1)/b*np.sum(influence**2,axis=0))
+            for i,(point,se) in enumerate(zip(value.ravel(),error.ravel())):
+                rows.append(dict(anchor=anchor,comparison='HbA1c sharing minus glucose sharing',
+                    quantity=quantity,entry=i,exposure=left[2][i] if value.size==len(left[2]) else 'all',
+                    estimate=float(point),paired_delta_se=float(se),
+                    lower_95=float(point-1.96*se),upper_95=float(point+1.96*se),
+                    p=float(2*norm.sf(abs(point/se))) if np.isfinite(point) and np.isfinite(se) and se>0 else np.nan,
+                    exploratory=True))
+    for quantity in dict.fromkeys(r['quantity'] for r in rows):
+        selected=[r for r in rows if r['quantity']==quantity]
+        for row,fdr in zip(selected,bh([r['p'] for r in selected])):
+            row.update(fdr=float(fdr),fdr_family='glycaemic_specificity:'+quantity)
+    return rows
+
+
 def main():
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--fits',type=Path,nargs='+',required=True)
@@ -197,6 +226,8 @@ def main():
                 estimate=a-b,delta_se=error,lower_95=a-b-1.96*error,upper_95=a-b+1.96*error,
                 interpretation='post-hoc exploratory contrast with covariance across all eight pairs'))
     if cluster:write(args.output/'paired_lipid_group_contrasts.tsv',cluster)
+    specificity=glycaemic_specificity(lookup)
+    if specificity:write(args.output/'glycaemic_specificity_contrasts.tsv',specificity)
     external=[];unavailable=[]
     for row in json.loads(args.namba_table.read_text())[2:]:
         x,y=EXTERNAL.get(row['B']),EXTERNAL.get(row['C']);exposure=EXPOSURES.get(row['D'])
@@ -214,12 +245,32 @@ def main():
     if external:write(args.output/'namba_comparisons.tsv',external)
     if unavailable:write(args.output/'namba_unavailable.tsv',unavailable)
     plot(args.output,rows,external)
+    if specificity:plot_glycaemic_specificity(args.output,specificity)
     receipt=dict(script_sha256=file_sha256(__file__),source_sha256=sources,
         literature_sha256=file_sha256(args.namba_table),paired_blocks=200,genotype_traversals=0,
         uncertainty='full-point delta with corrected paired coefficient covariance',
         exploratory=True,pairs=len(lookup),external_entries=len(external),
         files={p.name:file_sha256(p) for p in args.output.iterdir() if p.is_file()})
     with (args.output/'COMPLETE.json').open('x') as f:json.dump(receipt,f,indent=2)
+
+
+def plot_glycaemic_specificity(output,rows):
+    import matplotlib.pyplot as plt
+    selected=[r for r in rows if r['quantity']=='orthogonal_rg']
+    fig,ax=plt.subplots(figsize=(8,3.5))
+    for i,row in enumerate(selected):
+        if np.isfinite(row['estimate']) and np.isfinite(row['paired_delta_se']):
+            ax.errorbar(row['estimate'],i,xerr=1.96*row['paired_delta_se'],fmt='o',color='#0072B2',capsize=3)
+        else:ax.text(.03,i,'undefined',transform=ax.get_yaxis_transform())
+    ax.set_yticks(range(len(selected)),[LABELS[r['anchor']] for r in selected]);ax.invert_yaxis()
+    ax.axvline(0,color='#999999',lw=.8);ax.spines[['top','right']].set_visible(False)
+    ax.set_xlabel('Orthogonal-response rg with HbA1c − rg with glucose')
+    ax.set_title('Does response sharing differ between HbA1c and glucose?',loc='left')
+    fig.text(.02,.015,'Paired nominal 95% delta intervals; covariance across both fitted pairs is retained.\n'
+        'Exploratory common-bin contrast. A difference does not identify erythrocyte, treatment or causal mechanisms.',fontsize=8)
+    fig.tight_layout(rect=(0,.16,1,1))
+    for suffix in ('pdf','png'):fig.savefig(output/f'glycaemic_specificity.{suffix}',dpi=180,bbox_inches='tight')
+    plt.close(fig)
 
 
 def plot(output,rows,external):

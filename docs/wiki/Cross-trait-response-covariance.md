@@ -757,3 +757,31 @@ The saved scaling is retained from the original common coding: its empirical
 variance on the reunited master cohort need not be exactly one. Profile offsets
 are units of that saved basis, not newly computed trait-specific standard
 deviations. The measured master covariance S is saved with every fit.
+
+The corrected 42-trait refit completed all 252 trait/mode fits and 25,704
+reported rows, without a genotype pass. An independent audit checked saved
+array identities, coefficient units, normal-equation residuals, paired
+covariances and finite directional derivatives against the production delta
+implementation. Primitive Omega point estimates changed by at most 1.0e-14
+relative to the previous refit; the change is in inference. Twelve traits
+have at least one mode shift above one default SE (145 rows). The largest is
+7.48 SE for the low-frequency testosterone baseline–sex covariance; lung
+function traits also show substantial sensitivity. This does not contradict
+the small mode shifts in the common-bin eight-trait pilot.
+
+Weak denominators remain a material limitation. In the default within-trait
+arm, 137/252, 132/252 and 52/252 exposure-correlation delta intervals are
+undefined in the 0.1–1%, 1–5% and at-least-5% MAF bins, respectively.
+These are within-trait correlations between different exposure responses,
+not cross-trait aggregate correlations. Nonlinear jackknife has additional
+undefined intervals when individual deletions cross the variance boundary.
+Finite moment ratios outside [-1,1] are also retained and flagged; delta
+does not make weakly identified correlations reliable. See the complete
+validity and mode-sensitivity tables in `round3_20260924/within42/`.
+
+For completed glucose follow-ups, `cross_trait_biology.py` additionally
+exports paired HbA1c-minus-glucose sharing contrasts with LDL, ApoB and DBP.
+Covariance across both pairs is retained through their aligned deletion
+influences. Each named metric has a separate recorded BH family across
+anchors and exposure coordinates. This tests a difference directly; a
+significant HbA1c result and nonsignificant glucose result alone would not.
