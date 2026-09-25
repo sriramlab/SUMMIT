@@ -11,6 +11,30 @@ from .annotations import _jackknife_covariance
 from .cross_trait_fit import cross_trait_derived
 
 
+def paired_delta_covariances(function, point, deleted):
+    """Delta covariance for a dictionary-valued analytic array function.
+
+    The function must preserve complex dtype and use real-part domain checks.
+    Deletions must already have the same coefficient units as the full fit.
+    """
+    point=np.asarray(point,dtype=float);deleted=np.asarray(deleted,dtype=float)
+    if (deleted.ndim!=point.ndim+1 or deleted.shape[1:]!=point.shape or len(deleted)<2
+            or not np.isfinite(point).all() or not np.isfinite(deleted).all()):
+        raise ValueError('finite point and paired deletion arrays required')
+    p=point.size;step=1e-30
+    perturbed=(point.ravel()[None]+1j*step*np.eye(p)).reshape((p,)+point.shape)
+    values=function(point);derivatives=function(perturbed)
+    covariance=_jackknife_covariance(deleted.reshape(len(deleted),-1))
+    result={}
+    for name,value in derivatives.items():
+        if np.asarray(value).dtype.kind!='c':continue
+        jacobian=np.asarray(value).imag.reshape(p,-1).T/step
+        jacobian=np.where(np.isfinite(values[name]).ravel()[:,None],jacobian,np.nan)
+        cov=jacobian@covariance@jacobian.T
+        result[name]=(cov+cov.T)/2
+    return result
+
+
 def derived_jacobians(omega_xy, omega_xx, omega_yy, **kwargs):
     arrays=[np.asarray(a,dtype=float) for a in (omega_xx,omega_yy,omega_xy)]
     if any(a.shape!=arrays[0].shape or not np.isfinite(a).all() for a in arrays):

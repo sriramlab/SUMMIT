@@ -17,9 +17,10 @@ ROOT=Path(__file__).resolve().parents[2]
 sys.meta_path[:]=[f for f in sys.meta_path if type(f).__module__!='_gwldcore_editable']
 sys.path.insert(0,str(ROOT/'src'))
 import numpy as np
-from summit.context.cross_trait_gram import chromosome_gram,within_trait_equations
+from summit.context.cross_trait_gram import chromosome_gram,within_trait_equations,prepare_within_trait_target_jackknife
 from summit.context.fit import solve_context_normal_equations
 from summit.context.cross_trait_fit import restore_deleted_genetic_mass
+from summit.context.cross_trait_uncertainty import paired_delta_covariances
 from summit.context.annotations import _jackknife_covariance
 from summit.context.oracle import coefficients_to_omegas
 from summit.context.spec import ContextComponentIndex,ContextPairIndex
@@ -53,7 +54,7 @@ def quantities(omega,mean,s):
             if a!=b:
                 with np.errstate(invalid='ignore',divide='ignore'):
                     output[f'orthogonal_response_correlation:{a+1},{b+1}']=np.where(
-                        (h[...,a,a]>0)&(h[...,b,b]>0),h[...,a,b]/np.sqrt(h[...,a,a]*h[...,b,b]),np.nan)
+                        (h[...,a,a].real>0)&(h[...,b,b].real>0),h[...,a,b]/np.sqrt(h[...,a,a]*h[...,b,b]),np.nan)
     output['response_trace']=np.einsum('ij,...ji->...',s,centered[...,1:,1:])
     output['orthogonal_response_trace']=np.einsum('ij,...ji->...',s,h)
     return output
@@ -70,6 +71,7 @@ def main():
     p.add_argument('--base',type=Path,required=True);p.add_argument('--output',type=Path,required=True)
     p.add_argument('--traits',nargs='*')
     p.add_argument('--deletion-method',choices=['target_moments','legacy'],default='target_moments')
+    p.add_argument('--uncertainty-method',choices=['delta','jackknife'],default='delta')
     p.add_argument('--unrestored-deletions',action='store_true',
         help='reproduce raw deleted-system coefficients before study-collector mass restoration')
     p.add_argument('--diagnostics-only',action='store_true',help='publish shared per-block reference diagnostics without fitting')
@@ -115,7 +117,7 @@ def main():
     provenance=dict(branch=subprocess.check_output(['git','branch','--show-current'],cwd=ROOT,text=True).strip(),commit=commit,script_sha256=file_sha256(__file__),
         deletion_method=a.deletion_method,deleted_genetic_mass_restored=a.deletion_method=='legacy' and not a.unrestored_deletions,
         source_completion_sha256=completion_hashes,manifest_sha256={str(k):v for k,v in hashes.items()},
-        uncertainty='paired 200-block frozen-source mass-restored deletion; frozen same-person',genotype_traversals=0)
+        uncertainty=a.uncertainty_method,genotype_traversals=0)
     # These reference diagnostics do not depend on the trait mask or fit mode.
     # Publish once and authenticate the common file in every fit's provenance.
     reference_diagnostics={key:[] for key in ('chromosome','block_id','factorization_residual','same_person_share','ld_scalar')}
@@ -153,11 +155,15 @@ def main():
                 prepared=None if (mode,sp)==('legacy_transport','scaled') and a.deletion_method=='legacy' else {
                     c.chromosome:chromosome_gram(c,diagonals[c.chromosome],phi,rows,global_masses=masses,
                         mode=mode,same_person_mode=sp,ordered=False) for c in ref}
+                prepared_target=None
                 def eq(deleted=()):
                     return within_trait_equations(ref,study,reference_diagonals=None,phi=phi,rows=rows,
                         mode=mode,same_person_mode=sp,prepared_grams=prepared,deleted_blocks=deleted,deletion_method=a.deletion_method,
+                        prepared_target_deletions=prepared_target,
                         full_same_person=own_same if sp=='own_rows' else len(rows)/ref[0].n_samples*same,**options,**common)
                 full=eq();fit=solve_context_normal_equations(full)
+                if a.deletion_method=='target_moments':
+                    prepared_target=prepare_within_trait_target_jackknife(full,study,prepared,common['residual_gram'])
                 deleted_equations=[eq((b,)) for b in blocks]
                 raw_loo=np.array([solve_context_normal_equations(e).coefficients for e in deleted_equations])
                 retained=np.array([e.annotation_masses for e in deleted_equations])
@@ -166,7 +172,11 @@ def main():
                 omega=coefficients_to_omegas(fit.coefficients[:len(components)],components)
                 loomega=np.array([coefficients_to_omegas(row[:len(components)],components) for row in loo])
                 values=quantities(omega,mean,s);deleted=quantities(loomega,mean,s)
-                results[key]=(values,deleted,full.matrix)
+                delta=paired_delta_covariances(lambda x:quantities(x,mean,s),omega,loomega)
+                uncertainty={k:np.sqrt(np.maximum(0,np.diag(delta[k]))).reshape(np.shape(v))
+                    if a.uncertainty_method=='delta' else np.sqrt((len(blocks)-1)*np.var(deleted[k],axis=0))
+                    for k,v in values.items()}
+                results[key]=(values,deleted,full.matrix,uncertainty)
                 arrays=dict(omega=omega,loo_omega=loomega,coefficients=fit.coefficients,loo_coefficients=loo,
                     covariance=_jackknife_covariance(loo),normal_matrix=full.matrix,normal_rhs=full.rhs,
                     raw_loo_coefficients=raw_loo,loo_annotation_masses=retained,
@@ -174,6 +184,7 @@ def main():
                     loo_genetic_mass_restored=np.array(a.deletion_method=='legacy' and not a.unrestored_deletions),
                     same_person_gram=own_same if sp=='own_rows' else len(rows)/ref[0].n_samples*same,
                     block_ids=blocks,environment_mean=mean,environment_covariance=s)
+                arrays.update({k+'_delta_covariance':v for k,v in delta.items()})
                 write_array_artifact(a.output/f'{name}__{key}.npz',kind='summit.cross_trait.within_refit',arrays=arrays,
                     provenance=dict(provenance,trait=name,mode=mode,same_person_mode=sp,input_sha256=file_sha256(inputpath),
                         same_person_assembly='sum_chromosome_diagonals_before_Gram; frozen full-profile deletion adjustment'))
@@ -185,16 +196,17 @@ def main():
                 failures.append(dict(trait=name,mode=mode,same_person_mode=sp,error=str(exc)))
                 print(json.dumps(failures[-1]),flush=True)
         legacy=results.get('legacy_transport__scaled');default=results.get('factorized__own_rows')
-        for key,(point,deleted,matrix) in results.items():
+        for key,(point,deleted,matrix,uncertainty) in results.items():
             for quantity,value in point.items():
-                se=np.sqrt((len(blocks)-1)*np.var(deleted[quantity],axis=0))
+                se=uncertainty[quantity]
                 legacy_value=legacy[0][quantity] if legacy else np.full_like(value,np.nan)
                 default_value=default[0][quantity] if default else np.full_like(value,np.nan)
-                default_se=np.sqrt((len(blocks)-1)*np.var(default[1][quantity],axis=0)) if default else se*np.nan
+                default_se=default[3][quantity] if default else se*np.nan
                 for k,annotation in enumerate(ref[0].annotation_names):
                     shift=(value[k]-default_value[k])/default_se[k] if default_se[k]>0 else np.nan
                     table.append(dict(trait=name,n=len(rows),annotation=annotation,quantity=quantity,arm=key,
-                        estimate=value[k],jackknife_se=se[k],shift_from_legacy=value[k]-legacy_value[k],
+                        estimate=value[k],standard_error=se[k],uncertainty_method=a.uncertainty_method,
+                        jackknife_se=np.sqrt((len(blocks)-1)*np.var(deleted[quantity],axis=0))[k],shift_from_legacy=value[k]-legacy_value[k],
                         shift_from_default_se=shift,flag_shift_gt_one_se=bool(abs(shift)>1),
                         normal_matrix_difference_2norm=float(np.linalg.norm(matrix-default[2],2)) if default else np.nan))
     if table:write_table(a.output/'within_trait_mode_comparison.tsv',table)

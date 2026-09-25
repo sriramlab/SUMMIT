@@ -109,10 +109,10 @@ def fit_pilot(args):
     modes={};table=[];gram_rows=[]
     provenance=dict(input_sha256=input_hashes,source_sha256=completion_hashes,script_sha256=file_sha256(__file__),
         implementation_sha256={name:file_sha256(ROOT/'src/summit/context'/name) for name in
-            ('cross_trait_fit.py','cross_trait_gram.py','cross_trait_zpass.py')},
+            ('cross_trait_fit.py','cross_trait_gram.py','cross_trait_zpass.py','target_jackknife.py','cross_trait_uncertainty.py','fit.py')},
         chromosomes=list(args.chromosomes),annotation=refs[0].annotation_names[0],
         context_metric='master cohort population covariance',genotype_traversals=0,
-        same_person_assembly='sum_chromosome_diagonals_before_Gram; frozen full-profile deletion adjustment',
+        same_person_assembly='sum_chromosome_diagonals_before_Gram; target mass apportionment for corrected deletions',
         deletion_method=args.deletion_method,uncertainty_method=args.uncertainty_method,
         deleted_genetic_mass_restored=args.deletion_method=='legacy' and not getattr(args,'unrestored_deletions',False),
         interpretation='exploratory common-bin-only model; omitted lower-frequency effects may confound estimates',

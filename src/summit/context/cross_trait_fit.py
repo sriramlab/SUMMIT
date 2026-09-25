@@ -26,7 +26,7 @@ class CrossTraitEquations:
 def assemble_cross_trait_normal_equations(*, genetic_gram, genetic_rhs,
         genetic_residual, residual_gram, residual_rhs, num_basis, annotation_masses,
         annotation_names=None, deleted_blocks=(), reference_n=0, n_x=0, n_y=0,
-        residual_rtol=1e-12):
+        residual_rtol=1e-12,target_source=False):
     """Assemble from moments already on ordinary kernel (1/M) normalization."""
     q=int(num_basis);masses=np.asarray(annotation_masses,dtype=float)
     k=len(masses);p=k*q*q
@@ -38,7 +38,7 @@ def assemble_cross_trait_normal_equations(*, genetic_gram, genetic_rhs,
             or gr.shape!=(p,len(r_rhs)) or rhs.shape!=(p,)
             or not all(np.isfinite(v).all() for v in (masses,gg,gr,rr,rhs,r_rhs))):
         raise ValueError('invalid cross-trait moment dimensions/values')
-    if (not np.allclose(gg,gg.T,rtol=1e-12,atol=1e-10)
+    if ((not target_source and not np.allclose(gg,gg.T,rtol=1e-12,atol=1e-10))
             or not np.allclose(rr,rr.T,rtol=1e-12,atol=1e-10)):
         raise ValueError('moment Grams must be symmetric')
     ev,u=np.linalg.eigh((rr+rr.T)/2)
@@ -63,7 +63,8 @@ def assemble_cross_trait_normal_equations(*, genetic_gram, genetic_rhs,
     equations=ContextNormalEquations(matrix=matrix,rhs=np.r_[rhs,transform.T@r_rhs],
         traces=np.zeros(p+rank),component_names=components+tuple(f'residual:{j}' for j in range(rank)),
         genetic_count=p,annotation_masses=masses,deleted_groups=tuple(map(str,deleted_blocks)),
-        reference_genetic_gram=gg,transferred_genetic_gram=gg,reference_n=reference_n,study_n=n_x)
+        reference_genetic_gram=gg,transferred_genetic_gram=gg,reference_n=reference_n,study_n=n_x,
+        target_source=target_source)
     return CrossTraitEquations(equations,transform,q,rank)
 
 
@@ -75,15 +76,16 @@ def solve_cross_trait_normal_equations(equations, *, rtol=None, require_full_ran
 
 
 class CrossTraitMomentPlan:
-    """Cached chromosome Grams with paired, frozen-source deletion assembly.
+    """Cached chromosome moments with paired fixed-source target deletion.
 
     Each record contains block_ids, block_masses, block_rhs[B,K,Q,Q],
     block_genetic_residual[B,K,Q²,H], and a ChromosomeGram.
     The full same-person Gram is formed AFTER summing chromosome diagonals,
     then frozen on actual overlap rows. The full-data different-person Gram
-    sums chromosome contributions (no cross-chromosome LD). Deletions retain
-    the existing frozen-source residual-profile change, subtracting its
-    full-data value so it cannot replace the explicit full same-person term.
+    sums chromosome contributions (no cross-chromosome LD). The default
+    deletes directional target estimating equations on fixed full-mass units,
+    apportioning stored same-person moments by target annotation mass. The
+    explicit legacy arm retains the historical frozen-diagonal assembly.
     """
     def __init__(self, chromosomes, *, residual_gram, residual_rhs, num_basis,
                  annotation_names, reference_n=0, n_x=0, n_y=0,full_same_person=None,
@@ -128,7 +130,7 @@ class CrossTraitMomentPlan:
                 genetic_rhs=h.ravel()+b@self.rr_inverse@self.rrhs,
                 genetic_residual=b,residual_gram=self.rr,residual_rhs=self.rrhs,
                 num_basis=self.q,annotation_masses=masses,annotation_names=self.names,
-                deleted_blocks=deleted_blocks,**self.meta)
+                deleted_blocks=deleted_blocks,target_source=True,**self.meta)
         if not np.isin(deleted_blocks,self.block_ids).all():
             raise ValueError('unknown deleted block')
         masks=[~np.isin(c['block_ids'],deleted_blocks) for c in self.chromosomes]
@@ -162,7 +164,7 @@ def cross_trait_derived(omega_xy,omega_xx,omega_yy,*,mean_x,mean_y,context_covar
     The caller supplies one common exposure covariance metric S for both
     denominators and records its cohort in provenance.
     """
-    dtype=np.result_type(omega_xy,omega_xx,omega_yy,np.float64)
+    dtype=np.result_type(*(np.asarray(a).dtype for a in (omega_xy,omega_xx,omega_yy)),np.float64)
     xy=np.asarray(omega_xy,dtype=dtype);xx=np.asarray(omega_xx,dtype=dtype);yy=np.asarray(omega_yy,dtype=dtype)
     raw_xy,raw_xx,raw_yy=xy,xx,yy
     q=xy.shape[-1];cx=np.eye(q);cy=np.eye(q)
@@ -287,7 +289,9 @@ def fit_cross_trait_rhs_batch(plan, chromosome_rhs, residual_rhs, *, rtol=None, 
         # same rank decision and spectral formula as the scalar solver.
         solved=solve_cross_trait_normal_equations(eq,rtol=rtol)
         u=solved.retained_directions
-        eigenvalues=np.einsum('ni,nm,mi->i',u,system.matrix,u)
+        left=solved.left_retained_directions if system.target_source else u
+        eigenvalues=(solved.retained_singular_values if system.target_source else
+            np.einsum('ni,nm,mi->i',u,system.matrix,u))
         inv=np.repeat(1/(system.annotation_masses if plan.deletion_method=='legacy'
                         else plan.masses),plan.q**2)
         genetic=np.zeros((p,nr));bkeep=np.zeros((p,len(plan.rr)))
@@ -299,7 +303,7 @@ def fit_cross_trait_rhs_batch(plan, chromosome_rhs, residual_rhs, *, rtol=None, 
         if len(deleted) and plan.deletion_method=='target_moments':
             genetic+=(plan.target_deletions.full_b-bkeep)@plan.rr_inverse@rrhs
         rhs=np.concatenate((genetic,eq.residual_transform.T@rrhs),axis=0)
-        coefficients=u@((u.T@rhs)/eigenvalues[:,None])
+        coefficients=u@((left.T@rhs)/eigenvalues[:,None])
         solutions.append(coefficients.T);ranks.append(solved.rank);conditions.append(solved.condition_number)
         masses.append(system.annotation_masses)
     point=solutions[0];raw=np.stack(solutions[1:],axis=1);loo=raw.copy()

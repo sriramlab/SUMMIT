@@ -71,6 +71,36 @@ def test_batched_rhs_matches_independent_rank_revealing_solves(method):
             np.testing.assert_allclose(batch[key][i],direct[key],rtol=1e-12,atol=1e-13)
 
 
+def test_heterogeneous_directed_blocks_preserve_population_moment_truth():
+    # Target kernels vary by block; their inner products with frozen source
+    # kernels are directional. Symmetrizing each block changes E[q_b].
+    blocks=np.array([[[3.,2.],[.4,4.]],[[7.,-2.],[-.4,6.]]])
+    theta=np.array([.2,.7]);masses=np.full((2,2),10.)
+    rhs=(blocks@theta)*20
+    record=dict(block_ids=np.arange(2),block_masses=masses,block_rhs=rhs.reshape(2,2,1,1),
+        block_genetic_residual=np.empty((2,2,1,0)),
+        gram=ChromosomeGram(blocks,np.zeros((2,2)),{}))
+    plan=CrossTraitMomentPlan([record],residual_gram=np.empty((0,0)),residual_rhs=np.empty(0),
+        num_basis=1,annotation_names=('a','b'))
+    result=fit_cross_trait(plan)
+    np.testing.assert_allclose(result['omega_xy'].ravel(),theta,rtol=1e-13)
+    np.testing.assert_allclose(result['loo_omega_xy'].reshape(2,2),np.broadcast_to(theta,(2,2)),rtol=1e-12)
+
+
+def test_unequal_annotation_mass_fractions_preserve_population_truth():
+    fractions=np.array([[.1,.6],[.3,.1],[.6,.3]])
+    a=np.array([[4.,1.],[1.,3.]]);d=np.array([[.4,.1],[.1,.2]])
+    theta=np.array([.2,.7]);blocks=fractions[:,:,None]*a
+    record=dict(block_ids=np.arange(3),block_masses=fractions*[100,200],
+        block_rhs=((blocks@theta)*[100,200]).reshape(3,2,1,1),
+        block_genetic_residual=np.empty((3,2,1,0)),
+        gram=ChromosomeGram(blocks-fractions[:,:,None]*d,d,{}))
+    plan=CrossTraitMomentPlan([record],residual_gram=np.empty((0,0)),residual_rhs=np.empty(0),
+        num_basis=1,annotation_names=('a','b'))
+    result=fit_cross_trait(plan)
+    np.testing.assert_allclose(result['loo_omega_xy'].reshape(3,2),np.broadcast_to(theta,(3,2)),rtol=1e-12)
+
+
 def fixture():
     rng=np.random.default_rng(157);q=3
     a=rng.normal(size=(2*q,2*q));joint=a@a.T+np.eye(2*q)

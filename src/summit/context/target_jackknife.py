@@ -8,6 +8,55 @@ for proportional blocks, not an exact reconstruction of missing diagonals.
 from __future__ import annotations
 
 import numpy as np
+from dataclasses import dataclass
+
+
+@dataclass(frozen=True)
+class TargetRankDiagnostics:
+    rank: int
+    condition_number: float
+    tolerance: float
+    singular_values: np.ndarray
+    null_space: np.ndarray
+
+
+@dataclass(frozen=True)
+class TargetSolveResult:
+    coefficients: np.ndarray
+    diagnostics: TargetRankDiagnostics
+    rank: int
+    condition_number: float
+    solve_residual: np.ndarray
+    relative_residual: float
+    retained_directions: np.ndarray
+    left_retained_directions: np.ndarray
+    retained_singular_values: np.ndarray
+    # A target/source moment matrix is not a symmetric Gram.
+    minimum_gram_eigenvalue: float = np.nan
+
+
+def solve_target_equations(equations, *, rtol=None, require_full_rank=True):
+    """Rank-revealing SVD of directional target/source moment equations."""
+    from .fit import DEFAULT_SOLVE_RTOL, ContextRankError
+    matrix=np.asarray(equations.matrix,dtype=float);rhs=np.asarray(equations.rhs,dtype=float)
+    relative=DEFAULT_SOLVE_RTOL if rtol is None else float(rtol)
+    if (matrix.ndim!=2 or matrix.shape[0]!=matrix.shape[1] or rhs.shape!=(len(matrix),)
+            or not np.isfinite(matrix).all() or not np.isfinite(rhs).all()
+            or not np.isfinite(relative) or relative<=0):
+        raise ValueError('invalid directional moment system or rank tolerance')
+    u,s,vt=np.linalg.svd(matrix,full_matrices=True)
+    scale=max(float(np.max(abs(matrix),initial=0)),1.)
+    tolerance=max(100*np.finfo(float).eps*scale,relative*s.max(initial=0))
+    keep=s>tolerance;rank=int(keep.sum())
+    condition=float(s[0]/s[-1]) if rank==len(matrix) and rank else float('inf')
+    diagnostics=TargetRankDiagnostics(rank,condition,tolerance,s,vt[~keep].T)
+    if require_full_rank and rank!=len(matrix):
+        raise ContextRankError(f'Target/source moment system is not identifiable: rank {rank} of {len(matrix)}',
+            diagnostics=diagnostics,component_names=equations.component_names)
+    coefficients=vt[keep].T@((u[:,keep].T@rhs)/s[keep])
+    residual=matrix@coefficients-rhs
+    return TargetSolveResult(coefficients,diagnostics,rank,condition,residual,
+        float(np.linalg.norm(residual)/max(1.,np.linalg.norm(rhs))),vt[keep].T,u[:,keep],s[keep])
 
 
 class TargetMomentJackknife:
@@ -39,7 +88,12 @@ class TargetMomentJackknife:
         self.projection = self.b @ residual_inverse
         fractions = np.repeat(self.block_masses/self.masses, width, axis=1)
         block = self.off + fractions[:, :, None]*same_person - self.projection @ self.full_b.T
-        self.profile_blocks = (block + block.swapaxes(-1, -2))/2
+        # Keep target/source orientation: symmetrizing a deletion changes its
+        # population RHS. The full noisy reference is symmetrized by the
+        # established estimator; apportion that full correction by target mass.
+        full=block.sum(0)
+        correction=(full.T-full)/2
+        self.profile_blocks = block+fractions[:,:,None]*correction
         self.full_profile = self.profile_blocks.sum(0)
         self.residual_inverse = residual_inverse
 

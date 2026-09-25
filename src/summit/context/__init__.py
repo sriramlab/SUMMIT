@@ -291,8 +291,10 @@ from .cross_trait_fit import (
     solve_cross_trait_normal_equations,
     cross_trait_derived,
     fit_cross_trait,
+    fit_cross_trait_rhs_batch,
     write_cross_trait_fit,
 )
+from .cross_trait_uncertainty import derived_uncertainty, paired_delta_covariances
 
 __all__ = [
     "CrossTraitEquations",
@@ -301,6 +303,9 @@ __all__ = [
     "solve_cross_trait_normal_equations",
     "cross_trait_derived",
     "fit_cross_trait",
+    "fit_cross_trait_rhs_batch",
+    "derived_uncertainty",
+    "paired_delta_covariances",
     "write_cross_trait_fit",
     "APPROXIMATE_DELETION_CONTRACT",
     "ANNOTATION_PARTITION_KIND",
