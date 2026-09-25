@@ -254,17 +254,23 @@ static void prediction_covariance_block(
 
 #include "prediction_mixture.inc"
 #include "prediction_residual.inc"
+#include "prediction_cache.inc"
 
 static void bind_prediction(nb::module_& module) {
+    module.def("prediction_pack_calls", &prediction_pack_calls,
+        nb::arg("raw").noconvert(), nb::arg("packed").noconvert(), nb::arg("threads"));
+    module.def("prediction_unpack_calls", &prediction_unpack_calls,
+        nb::arg("packed").noconvert(), nb::arg("raw").noconvert(), nb::arg("threads"));
     module.attr("prediction_execution_version") = 2;
     module.attr("prediction_mixture_version") = 2;
-    module.attr("prediction_residual_version") = 1;
+    module.attr("prediction_residual_version") = 2;
     module.def("prediction_interaction_design", &prediction_interaction_design,
         nb::arg("genotype").noconvert(), nb::arg("phi").noconvert(),
         nb::arg("out").noconvert(), nb::arg("threads"));
     nb::class_<PredictionMixtureResidual>(module,"PredictionMixtureResidual")
-        .def(nb::init<nb_vec1_ro<double>,nb_mat2f_ro<double>,int,int>(),
-             nb::arg("yw").noconvert(),nb::arg("basis").noconvert(),nb::arg("models"),nb::arg("threads"))
+        .def(nb::init<nb_vec1_ro<double>,nb_mat2f_ro<double>,int,int,bool>(),
+             nb::arg("yw").noconvert(),nb::arg("basis").noconvert(),nb::arg("models"),nb::arg("threads"),
+             nb::arg("deferred_projection")=false)
         .def("score",&PredictionMixtureResidual::score,nb::arg("w").noconvert(),
              nb::arg("projection").noconvert(),nb::arg("out").noconvert())
         .def("update",&PredictionMixtureResidual::update,nb::arg("w").noconvert(),
@@ -276,6 +282,7 @@ static void bind_prediction(nb::module_& module) {
         .def("copy_residual",&PredictionMixtureResidual::copy_residual,nb::arg("out").noconvert())
         .def("copy_prediction",&PredictionMixtureResidual::copy_prediction,nb::arg("out").noconvert())
         .def("copy_phenotype",&PredictionMixtureResidual::copy_phenotype,nb::arg("out").noconvert())
+        .def("synchronize",&PredictionMixtureResidual::synchronize)
         .def("restore",&PredictionMixtureResidual::restore,nb::arg("value").noconvert());
     module.def("prediction_hardcall_scale", &prediction_hardcall_scale,
         nb::arg("raw").noconvert(), nb::arg("mean").noconvert(),

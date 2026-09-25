@@ -54,7 +54,7 @@ def dense(source, trait, covariance, residual):
     return u, weights, z @ alpha, g
 
 
-@pytest.mark.parametrize("storage", ["stream", "compact", "standardized"])
+@pytest.mark.parametrize("storage", ["stream", "compact", "packed", "standardized"])
 @pytest.mark.parametrize("backend", ["numpy", "native"])
 def test_masked_joint_solve_dense_gls_and_passes(storage, backend):
     source, traits = fixture()

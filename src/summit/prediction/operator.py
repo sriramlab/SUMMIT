@@ -39,7 +39,7 @@ class GenotypeOperator:
         self.workspace = self.native.PredictionWorkspace() if self.native is not None else None
         self.stream = RawBlockStream(source, np.concatenate([t.rows for t in traits]),
             np.concatenate([t.variants for t in traits]), block_size=plan.block_size,
-            storage=plan.storage, threads=plan.threads)
+            storage=plan.storage, threads=plan.threads, native=self.native)
         self.groups = {}
         self.trait_group = {}
         for t in traits:
@@ -74,7 +74,7 @@ class GenotypeOperator:
             self.row_diagonal[key] = np.zeros(len(ts[0].rows))
             if self.plan.storage == "standardized":
                 self.standardized_cache[key] = np.empty((len(ts[0].rows), len(ts[0].variants)), order="F")
-        for _, variants, raw in self.stream.blocks("setup", build_cache=self.plan.storage == "compact"):
+        for _, variants, raw in self.stream.blocks("setup", build_cache=self.plan.storage in ("compact", "packed")):
             for key, ts in self.groups.items():
                 lo, hi, g = self._group_block(key, variants, raw)
                 if g is None:
@@ -214,6 +214,8 @@ class GenotypeOperator:
 
     def release(self):
         self.stream.cache = None
+        self.stream.cache_ready = False
+        self.stream.unpack_buffer = None
         self.standardized_cache.clear()
         self.affine_block.buffer = np.empty(0, dtype=np.float64)
         self.workspace = None

@@ -164,6 +164,8 @@ class MixtureSolverSpec:
     block_sweeps: int = 50
     qr_rtol: float = 1e-12
     residual_refresh: int = 5
+    freeze_converged: bool = True
+    deferred_projection: bool = True
 
     def __post_init__(self):
         for key in ('rtol', 'qr_rtol'):
@@ -174,6 +176,10 @@ class MixtureSolverSpec:
         positive_int(self.max_sweeps, 'max_sweeps')
         positive_int(self.block_sweeps, 'block_sweeps')
         positive_int(self.residual_refresh, 'residual_refresh')
+        if type(self.freeze_converged) is not bool:
+            raise TypeError('freeze_converged must be boolean')
+        if type(self.deferred_projection) is not bool:
+            raise TypeError('deferred_projection must be boolean')
 
 
 class _Checkpoint(SolverCheckpoint):
@@ -188,6 +194,9 @@ class _Checkpoint(SolverCheckpoint):
                 records[name] = dict(shape=list(value.shape), sha256=array_digest(value))
         meta = dict(schema=1, kind='mixture', identity=self.identity, arrays=records,
                     sweep=sweep, history=history, elapsed=elapsed,
+                    active=[g['active'].tolist() for g in groups],
+                    certified_sweeps=[g['certified_sweeps'].tolist() for g in groups],
+                    ready_checked=[g['ready_checked'] for g in groups],
                     initialization=getattr(self,'initialization',None))
         arrays['metadata'] = np.frombuffer(canonical(meta).encode(), dtype=np.uint8)
         fd, temporary = tempfile.mkstemp(prefix=self.path.name+'.', suffix='.tmp', dir=self.path.parent)
@@ -211,6 +220,9 @@ class _Checkpoint(SolverCheckpoint):
             if type(meta['sweep']) is not int or meta['sweep'] < 0:
                 raise ValueError('invalid mixture checkpoint iteration')
             self.initialization = meta.get('initialization')
+            if (len(meta['active']) != len(groups) or len(meta['certified_sweeps']) != len(groups)
+                    or len(meta['ready_checked']) != len(groups)):
+                raise ValueError('mixture checkpoint candidate groups disagree')
             for j, group in enumerate(groups):
                 for field in ('weights', 'residual', 'penalty'):
                     name = f'{field}_{j}'
@@ -220,6 +232,19 @@ class _Checkpoint(SolverCheckpoint):
                             not np.isfinite(value).all() or array_digest(value) != record['sha256']):
                         raise ValueError('mixture checkpoint array mismatch')
                     group[field][...] = value
+                active, certified = meta['active'][j], meta['certified_sweeps'][j]
+                k = len(group['candidates'])
+                if (any(type(i) is not int or not 0 <= i < k for i in active)
+                        or active != sorted(set(active)) or len(certified) != k
+                        or any(type(i) is not int or not 0 <= i <= meta['sweep'] for i in certified)
+                        or any((i in active) != (s == 0) for i, s in enumerate(certified))):
+                    raise ValueError('invalid mixture checkpoint candidate state')
+                # Restored inactive candidates are independently re-certified before export.
+                group['active'] = np.array(active, dtype=np.int64)
+                group['certified_sweeps'] = np.array(certified, dtype=np.int64)
+                if type(meta['ready_checked'][j]) is not bool:
+                    raise ValueError('invalid mixture checkpoint verification state')
+                group['ready_checked'] = meta['ready_checked'][j]
             return meta['sweep'], meta['history'], meta['elapsed']
 
 
@@ -228,13 +253,23 @@ def _posterior(gram, covariance, spec, component_count=None):
     q = gram.shape[-1]
     covariances, normalizers = [], []
     probabilities, components = spec.components(covariance)
+    repeat = 1
+    if component_count is not None:
+        positive_int(component_count, 'component_count')
     if component_count is not None and len(probabilities) != component_count:
         if component_count % len(probabilities):
             raise ValueError('incompatible mixture component counts')
-        factor = component_count//len(probabilities)
-        probabilities = np.repeat(probabilities/factor,factor)
-        components = np.repeat(components,factor,axis=0)
+        repeat = component_count//len(probabilities)
+        probabilities = probabilities/repeat
+    solved = []
     for probability, component in zip(probabilities, components):
+        # Equality here is exact, never a near-equality approximation to a prior.
+        # Radial padding and Gaussian limits otherwise repeat the same eigensolve.
+        identical = next((entry for entry in solved if np.array_equal(entry[0],component)), None)
+        if identical is not None:
+            covariances.append(identical[1])
+            normalizers.append(np.log(probability)-.5*identical[2])
+            continue
         values, vectors = np.linalg.eigh(component)
         scale = np.maximum(np.max(abs(values),axis=1,keepdims=True),np.finfo(float).tiny)
         if np.any(values < -1e-10*scale):
@@ -246,9 +281,16 @@ def _posterior(gram, covariance, spec, component_count=None):
         sign, logdet = np.linalg.slogdet(precision)
         if np.any(sign <= 0):
             raise FloatingPointError('mixture posterior precision is not positive definite')
-        covariances.append(factor@np.linalg.solve(precision, factor.transpose(0, 2, 1)))
+        posterior = factor@np.linalg.solve(precision, factor.transpose(0, 2, 1))
+        covariances.append(posterior)
         normalizers.append(np.log(probability)-.5*logdet)
-    return np.stack(covariances, axis=1), np.stack(normalizers, axis=1)
+        solved.append((component,posterior,logdet))
+    covariance = np.stack(covariances, axis=1)
+    normalizer = np.stack(normalizers, axis=1)
+    if repeat != 1:
+        covariance = np.repeat(covariance,repeat,axis=1)
+        normalizer = np.repeat(normalizer,repeat,axis=1)
+    return covariance, normalizer
 
 
 def _numpy_update(gram, score, covariances, normalizers, weights, penalty, q,
@@ -290,8 +332,8 @@ def plan_mixture_prediction(traits, source, *, storage='stream', block_size=128,
                             threads=1, memory_bytes=16*2**30):
     """Metadata-only admission including Gram and component-posterior caches."""
     traits = tuple(traits)
-    if not traits or storage not in ('stream', 'compact'):
-        raise ValueError('mixture requires traits and stream or compact storage')
+    if not traits or storage not in ('stream', 'compact', 'packed'):
+        raise ValueError('mixture requires traits and stream, compact or packed storage')
     if any(not 1 <= t.phi.shape[1] <= 32 for t in traits):
         raise ValueError('mixture supports one to 32 basis coordinates')
     rhs = max(t.phi.shape[1]*len(t.candidates) for t in traits)
@@ -306,7 +348,9 @@ def plan_mixture_prediction(traits, source, *, storage='stream', block_size=128,
                     + 3*n*k + surfaces*n*(t.fixed.shape[1]+1)
                     + 6*n*min(block_size, m)*q
                     + (min(block_size, m)*q)**2
-                    + min(threads,k)*min(block_size, m)*q)
+                    + min(threads,k)*min(block_size, m)*q
+                    + surfaces*(t.fixed.shape[1]**2+2*t.fixed.shape[1]*k)
+                    + k*m*q)
     peak = plan.estimated_peak_bytes+extra
     if peak > memory_bytes:
         raise MemoryError('mixture Gram/posterior cache exceeds the memory budget; reduce block_size')
@@ -335,8 +379,8 @@ def fit_mixture_prediction(traits, source, *, output, mixtures, storage='stream'
     keys = {(t.id, c.id) for t in traits for c in t.candidates}
     if set(mixtures) != keys or any(not isinstance(x, (MixtureSpec,SeparateSparsitySpec)) for x in mixtures.values()):
         raise ValueError('supply exactly one MixtureSpec for each trait/candidate')
-    if storage not in ('stream', 'compact'):
-        raise ValueError('mixture storage must be stream or compact')
+    if storage not in ('stream', 'compact', 'packed'):
+        raise ValueError('mixture storage must be stream, compact or packed')
     if not isinstance(solver, MixtureSolverSpec):
         raise TypeError('mixture fitting requires MixtureSolverSpec')
     if resume and checkpoint is None:
@@ -384,7 +428,10 @@ def fit_mixture_prediction(traits, source, *, output, mixtures, storage='stream'
             if getattr(op.native, 'prediction_mixture_version', 0) != 2:
                 raise ImportError('rebuild SUMMIT with native mixture support')
             if getattr(op.native, 'prediction_residual_version', 0) != 1:
-                raise ImportError('rebuild SUMMIT with native mixture residual ownership')
+                if getattr(op.native, 'prediction_residual_version', 0) != 2:
+                    raise ImportError('rebuild SUMMIT with native mixture residual ownership')
+            if solver.deferred_projection and getattr(op.native, 'prediction_residual_version', 0) < 2:
+                raise ImportError('rebuild SUMMIT with deferred mixture projection support')
             build = op.native.build_info()
             if build.get('blas_vendor') == 'BLIS' and not (build.get('gemm_integrity_enabled') and build.get('gemm_checksum_enabled')):
                 raise ValueError('mixture BLIS fits require both GEMM integrity and checksum guards')
@@ -420,6 +467,11 @@ def fit_mixture_prediction(traits, source, *, output, mixtures, storage='stream'
                 return np.zeros_like(value)
             return product(basis,product(basis,value,transpose=True))
 
+        def new_workspace(yw, basis, k):
+            args = (np.ascontiguousarray(yw), basis, k, threads)
+            return (op.native.PredictionMixtureResidual(*args, deferred_projection=True)
+                    if solver.deferred_projection else op.native.PredictionMixtureResidual(*args))
+
         groups = []
         design_buffers = {}
         for t in traits:
@@ -443,7 +495,7 @@ def fit_mixture_prediction(traits, source, *, output, mixtures, storage='stream'
                 if op.native is None:
                     yp = yw-fixed_projection(basis,yw[:,None])[:,0]
                 else:
-                    workspace = op.native.PredictionMixtureResidual(np.ascontiguousarray(yw),basis,k,threads)
+                    workspace = new_workspace(yw,basis,k)
                     yp = np.empty_like(yw)
                     workspace.copy_phenotype(yp)
                 groups.append(dict(trait=t, candidates=candidates, scale=scale, fixed=fixed, basis=basis,
@@ -452,7 +504,11 @@ def fit_mixture_prediction(traits, source, *, output, mixtures, storage='stream'
                     update_buffer=np.empty((len(t.rows),k),order='F'),
                     fixed_update_buffer=np.empty((len(t.rows),k),order='F'),
                     residual=np.asfortranarray(np.repeat(yp[:, None], k, axis=1)), cache={},
-                    threshold=max(solver.atol, solver.rtol*np.linalg.norm(yp))))
+                    threshold=max(solver.atol, solver.rtol*np.linalg.norm(yp)),
+                    active=np.arange(k), certified_sweeps=np.zeros(k, dtype=np.int64), ready_checked=False))
+        # The group must be the sole owner, so compaction really releases the
+        # original full-width native state before allocating its replacement.
+        del workspace
 
         def design(group, variants, raw):
             t = group['trait']
@@ -467,7 +523,7 @@ def fit_mixture_prediction(traits, source, *, output, mixtures, storage='stream'
                 op.native.prediction_interaction_design(g,group['weighted_phi'],w,threads)
             return lo, hi, w
 
-        for _, variants, raw in op.stream.blocks('mixture_setup', build_cache=storage == 'compact'):
+        for _, variants, raw in op.stream.blocks('mixture_setup', build_cache=storage in ('compact', 'packed')):
             for group in groups:
                 lo, hi, w = design(group, variants, raw)
                 if w is None:
@@ -498,85 +554,139 @@ def fit_mixture_prediction(traits, source, *, output, mixtures, storage='stream'
         op.ready = True
         setup_seconds = time.monotonic()-started
         sweep, history, prior_seconds = 0, [], 0.
+        work = dict(candidate_block_updates=0, candidate_block_verifications=0)
+        timings = dict(design=0., score=0., coordinates=0., residual_update=0., reconstruction=0.)
+
+        def activate(group, active):
+            """Compact the native RHS, retaining full, stable candidate-indexed artifacts."""
+            group['active'] = np.asarray(active, dtype=np.int64)
+            if op.native is not None:
+                # Release before allocating the smaller owner; avoid doubling peak state.
+                group['workspace'] = None
+                if len(active):
+                    group['workspace'] = new_workspace(group['yw'], group['basis'], len(active))
+                    group['workspace'].restore(np.asfortranarray(group['residual'][:, active]))
+
         if state is not None and resume:
             sweep, history, prior_seconds = state.load(groups)
             for group in groups:
-                if group['workspace'] is not None:
-                    group['workspace'].restore(group['residual'])
+                activate(group, group['active'])
 
         def update(group, lo, hi, w, independent=False):
-            q = group['trait'].phi.shape[1]; k = len(group['candidates']); cache = group['cache'][lo]
+            active = group['active']
+            q = group['trait'].phi.shape[1]; k = len(active); cache = group['cache'][lo]
             workspace = group['workspace']
+            started_score = time.monotonic()
             if workspace is not None:
                 score = np.empty((w.shape[1],k),order='F')
                 workspace.score(w,cache['projection'],score)
             else:
-                score = product(w, group['residual'], transpose=True)
+                residual = group['residual'][:, active]
+                score = product(w, residual, transpose=True)
                 if group['basis'].shape[1]:
                     score -= product(cache['projection'],
-                        product(group['basis'], group['residual'], transpose=True), transpose=True)
+                        product(group['basis'], residual, transpose=True), transpose=True)
+            timings['score'] += time.monotonic()-started_score
             score = np.ascontiguousarray(score.T)
-            # A one-candidate slice can already be contiguous; retain a copy
-            # before assigning the new weights so the residual update is real.
-            old = np.array(group['weights'][:, lo:hi].reshape(k, -1), order='C', copy=True)
+            full = k == len(group['candidates'])
+            old = (np.array(group['weights'][:, lo:hi].reshape(k, -1), order='C', copy=True) if full
+                   else np.ascontiguousarray(group['weights'][active, lo:hi].reshape(k, -1)))
             beta = old.copy(); penalty = np.empty((k, hi-lo))
             tolerance = group['threshold']/max(1., np.sqrt(len(group['trait'].variants)))
-            arguments = (cache['gram'], score, cache['covariance'], cache['normalizer'], beta, penalty)
+            # Avoid copying the large posterior cache while the whole batch is active.
+            arguments = (cache['gram'], score, cache['covariance'] if full else cache['covariance'][active],
+                         cache['normalizer'] if full else cache['normalizer'][active], beta, penalty)
+            started_coordinates = time.monotonic()
             if op.native is None:
                 metrics = _numpy_update(*arguments, q, solver.block_sweeps, tolerance, independent)
             else:
                 metrics = np.empty((k, 2))
                 op.native.prediction_mixture_block(*arguments, metrics, q, solver.block_sweeps,
                                                   tolerance, independent, threads)
+            timings['coordinates'] += time.monotonic()-started_coordinates
+            work['candidate_block_verifications' if independent else 'candidate_block_updates'] += k
             if not independent:
-                group['weights'][:, lo:hi] = beta.reshape(k, hi-lo, q)
-                group['penalty'][:, lo:hi] = penalty
+                group['weights'][active, lo:hi] = beta.reshape(k, hi-lo, q)
+                group['penalty'][active, lo:hi] = penalty
                 delta = (beta-old).T
+                started_update = time.monotonic()
                 if workspace is not None:
                     workspace.update(w,np.asfortranarray(delta),cache['projection'])
                 else:
-                    product_into(w,delta,group['update_buffer'])
-                    group['residual'] -= group['update_buffer']
+                    buffer = group['update_buffer'][:, :k]
+                    product_into(w,delta,buffer)
+                    group['residual'][:, active] -= buffer
                     if group['basis'].shape[1]:
-                        product_into(group['basis'],product(cache['projection'],delta),group['fixed_update_buffer'])
-                        group['residual'] += group['fixed_update_buffer']
+                        fixed_buffer = group['fixed_update_buffer'][:, :k]
+                        product_into(group['basis'],product(cache['projection'],delta),fixed_buffer)
+                        group['residual'][:, active] += fixed_buffer
+                timings['residual_update'] += time.monotonic()-started_update
             return metrics[:, 0]
 
+        def snapshot(group):
+            if group['workspace'] is not None:
+                if solver.deferred_projection:
+                    group['workspace'].synchronize()
+                full = len(group['active']) == len(group['candidates'])
+                buffer = group['residual'] if full else group['fixed_update_buffer'][:, :len(group['active'])]
+                group['workspace'].copy_residual(buffer)
+                if not full:
+                    group['residual'][:, group['active']] = buffer
+
         def reconstruct():
+            started_reconstruction = time.monotonic()
             for group in groups:
-                group['raw_prediction'] = np.zeros_like(group['residual'], order='F')
+                if 'raw_prediction' not in group:
+                    group['raw_prediction'] = np.zeros_like(group['residual'], order='F')
+                group['residual_drift'] = 0.
                 if group['workspace'] is not None:
                     group['workspace'].begin_reconstruction()
+                else:
+                    group['raw_prediction'][:, group['active']] = 0.
             for variants, raw in op.blocks('mixture_reconstruct'):
                 for group in groups:
+                    active = group['active']
+                    if not len(active):
+                        continue
                     lo, hi, w = design(group, variants, raw)
                     if w is not None:
-                        weights = group['weights'][:, lo:hi].reshape(len(group['candidates']), -1)
+                        weights = group['weights'][active, lo:hi].reshape(len(active), -1)
                         if group['workspace'] is not None:
                             group['workspace'].add_prediction(w,np.asfortranarray(weights.T))
                         else:
-                            product_into(w,weights.T,group['update_buffer'])
-                            group['raw_prediction'] += group['update_buffer']
+                            buffer = group['update_buffer'][:, :len(active)]
+                            product_into(w,weights.T,buffer)
+                            group['raw_prediction'][:, active] += buffer
             for group in groups:
-                if group['workspace'] is not None:
-                    # Retain the incremental state until the independent
-                    # reconstruction passes. A failed guard must not discard
-                    # a costly full-data sweep or its diagnostic evidence.
-                    group['workspace'].copy_residual(group['update_buffer'])
-                    group['residual_drift'] = group['workspace'].finish_reconstruction()
-                    group['workspace'].copy_residual(group['residual'])
-                    group['workspace'].copy_prediction(group['raw_prediction'])
+                active = group['active']
+                if not len(active):
                     continue
-                basis = group['basis']; fitted = group['raw_prediction']
+                if group['workspace'] is not None:
+                    # Keep the incremental state for the unchanged arithmetic guard.
+                    buffer = group['update_buffer'][:, :len(active)]
+                    group['workspace'].copy_residual(buffer)
+                    group['residual_drift'] = group['workspace'].finish_reconstruction()
+                    snapshot(group)
+                    full = len(active) == len(group['candidates'])
+                    other = group['raw_prediction'] if full else group['fixed_update_buffer'][:, :len(active)]
+                    group['workspace'].copy_prediction(other)
+                    if not full:
+                        group['raw_prediction'][:, active] = other
+                    continue
+                basis = group['basis']; fitted = group['raw_prediction'][:, active]
                 residual = group['yp'][:, None]-fitted+fixed_projection(basis,fitted)
-                group['residual_drift'] = float(np.linalg.norm(residual-group['residual']))
-                group['residual'][...] = residual
+                group['residual_drift'] = float(np.linalg.norm(residual-group['residual'][:, active]))
+                group['residual'][:, active] = residual
+            timings['reconstruction'] += time.monotonic()-started_reconstruction
 
-        def verify():
-            reconstruct()
-            errors = [np.zeros(len(g['candidates'])) for g in groups]
+        def verify(*, reconstructed=False):
+            if not reconstructed:
+                reconstruct()
+            errors = [np.zeros(len(g['active'])) for g in groups]
             for variants, raw in op.blocks('mixture_verification'):
                 for j, group in enumerate(groups):
+                    if not len(group['active']):
+                        continue
                     lo, hi, w = design(group, variants, raw)
                     if w is not None:
                         errors[j] += update(group, lo, hi, w, independent=True)
@@ -588,18 +698,25 @@ def fit_mixture_prediction(traits, source, *, output, mixtures, storage='stream'
                     group['weights'][j]=initial_weights[group['trait'].id,c.id]
             reconstruct()
         errors = None
+        final_errors = None
         for sweep in range(sweep+1, solver.max_sweeps+1):
-            previous = [g['weights'].copy() for g in groups]
+            if not any(len(g['active']) for g in groups):
+                break
+            previous = [g['weights'].copy() if len(g['active']) == len(g['candidates'])
+                        else g['weights'][g['active']] for g in groups]
             for variants, raw in op.blocks('mixture_sweep'):
                 for group in groups:
+                    if not len(group['active']):
+                        continue
+                    start_design = time.monotonic()
                     lo, hi, w = design(group, variants, raw)
+                    timings['design'] += time.monotonic()-start_design
                     if w is not None:
                         update(group, lo, hi, w)
             refreshed = sweep == 1 or sweep % solver.residual_refresh == 0
             if not refreshed:
                 for group in groups:
-                    if group['workspace'] is not None:
-                        group['workspace'].copy_residual(group['residual'])
+                    snapshot(group)
             if refreshed:
                 reconstruct()
                 if any(g['residual_drift'] > 1e-9*max(np.linalg.norm(g['yp']),1.) for g in groups):
@@ -610,7 +727,9 @@ def fit_mixture_prediction(traits, source, *, output, mixtures, storage='stream'
                             for name in ('weights','residual','raw_prediction','yp','penalty'):
                                 arrays[f'{name}_{j}'] = g[name]
                             if g['workspace'] is not None:
-                                arrays[f'incremental_residual_{j}'] = g['update_buffer']
+                                incremental = g['residual'].copy(order='F')
+                                incremental[:, g['active']] = g['update_buffer'][:, :len(g['active'])]
+                                arrays[f'incremental_residual_{j}'] = incremental
                         metadata = dict(kind='mixture_arithmetic_failure',schema=1,
                             passed=False,resumable=False,sweep=sweep,identity=identity,
                             elapsed=prior_seconds+time.monotonic()-started,setup_seconds=setup_seconds,
@@ -629,21 +748,72 @@ def fit_mixture_prediction(traits, source, *, output, mixtures, storage='stream'
             if history and np.any(bounds < np.array(history[-1])-1e-8*np.maximum(abs(bounds), 1)):
                 raise FloatingPointError('mixture variational objective decreased')
             history.append(bounds.tolist())
-            change = max(np.linalg.norm(g['weights']-old)/max(np.linalg.norm(g['weights']), 1e-30)
-                         for g, old in zip(groups, previous))
+            changes = []
+            for g, old in zip(groups, previous):
+                current = (g['weights'] if len(g['active']) == len(g['candidates'])
+                           else g['weights'][g['active']])
+                if len(current):
+                    difference = (current-old).reshape(len(current), -1)
+                    g['relative_changes'] = np.linalg.norm(difference, axis=1)/np.maximum(
+                        np.linalg.norm(current.reshape(len(current), -1), axis=1), 1e-30)
+                    changes.append(np.linalg.norm(difference)/max(np.linalg.norm(current), 1e-30))
+                else:
+                    g['relative_changes'] = np.empty(0)
+            change = max(changes, default=0.)
             del previous
+            # Checking only after *all* candidates settle keeps paying for the easy ones.
+            # Check independent fixed points when any candidate settles. On refresh sweeps
+            # reuse the reconstruction already performed for the arithmetic guard.
+            trigger = max(solver.rtol*10, 1e-9)
+            pending = any(np.any(g['relative_changes'] < trigger) for g in groups)
+            # Do not delay an easy whole batch until the next refresh. After a
+            # failed all-ready check, retry on refresh rather than on every sweep.
+            newly_ready = any(len(g['active']) and not g['ready_checked']
+                              and np.all(g['relative_changes'] < trigger) for g in groups)
+            check = (((pending and refreshed) or newly_ready if solver.freeze_converged else change < trigger)
+                     or sweep == solver.max_sweeps)
+            if check:
+                complete_check = all(len(g['active']) == len(g['candidates']) for g in groups)
+                errors = verify(reconstructed=refreshed)
+                for group, error in zip(groups, errors):
+                    active = group['active']
+                    if not len(active):
+                        continue
+                    group['ready_checked'] = bool(np.all(group['relative_changes'] < trigger))
+                    residual = group['residual'][:, active]
+                    projection = (np.linalg.norm(product(group['basis'], residual, transpose=True), axis=0)
+                        /np.maximum(np.linalg.norm(residual, axis=0), 1e-30)
+                        if group['basis'].shape[1] else np.zeros(len(active)))
+                    passed = (error <= group['threshold']) & (projection <= max(1e-12, 10*solver.qr_rtol))
+                    if solver.freeze_converged:
+                        group['certified_sweeps'][active[passed]] = sweep
+                        if np.any(passed):
+                            activate(group, active[~passed])
+                if not solver.freeze_converged and all(np.all(e <= g['threshold']) for e,g in zip(errors,groups)):
+                    for group in groups:
+                        group['certified_sweeps'][:] = sweep
+                        activate(group, np.empty(0, dtype=np.int64))
+                if complete_check and not any(len(g['active']) for g in groups):
+                    final_errors = errors
             if state is not None:
                 state.save(groups, sweep, history, prior_seconds+time.monotonic()-started)
             if progress is not None:
                 progress(dict(sweep=sweep, elbo=bounds.tolist(), relative_weight_change=float(change),
                               seconds=time.monotonic()-started, setup_seconds=setup_seconds,
+                              active_candidates=sum(len(g['active']) for g in groups),
+                              candidate_work=dict(work), phase_seconds=dict(timings),
                               residual_refresh_error=([g['residual_drift'] for g in groups] if refreshed else None)))
-            if change < max(solver.rtol*10, 1e-9) or sweep == solver.max_sweeps:
-                errors = verify()
-                if all(np.all(e <= g['threshold']) for e, g in zip(errors, groups)):
-                    break
-        if errors is None:
+            if not any(len(g['active']) for g in groups):
+                break
+        # Recheck previously frozen or restored certificates together from actual
+        # final weights. Reuse a check of the entire final batch in this invocation;
+        # a checkpoint receipt alone never substitutes for fresh verification.
+        if final_errors is None:
+            for group in groups:
+                activate(group, np.arange(len(group['candidates'])))
             errors = verify()
+        else:
+            errors = final_errors
         reports, fixed = {}, {}
         for group, error in zip(groups, errors):
             t = group['trait']; basis = group['basis']
@@ -655,7 +825,8 @@ def fit_mixture_prediction(traits, source, *, output, mixtures, storage='stream'
             for j, c in enumerate(group['candidates']):
                 key = t.id, c.id
                 good = bool(error[j] <= group['threshold'] and projection[j] <= max(1e-12, 10*solver.qr_rtol))
-                reports[key] = dict(converged=good, method='mixture_vb_fixed_point', iterations=sweep,
+                reports[key] = dict(converged=good, method='mixture_vb_fixed_point',
+                    iterations=int(group['certified_sweeps'][j]) or sweep,
                     true_residual_norm=float(error[j]), threshold=float(group['threshold']),
                     fixed_projection=float(projection[j]), fixed_rank=basis.shape[1],
                     residual_reconstruction_error=group['residual_drift'],
@@ -680,7 +851,8 @@ def fit_mixture_prediction(traits, source, *, output, mixtures, storage='stream'
                     hi = min(lo+block_size, len(t.variants))
                     writer.write((t.id, c.id), lo, hi, group['weights'][j, lo:hi])
         writer.finish(dict(plan=plan.to_dict(), ledger=asdict(op.ledger),
-            setup_seconds=setup_seconds, elapsed_seconds=time.monotonic()-started,
+            setup_seconds=setup_seconds, candidate_work=work, phase_seconds=timings,
+            elapsed_seconds=time.monotonic()-started,
             cumulative_seconds=result.elapsed_seconds, objective_history=history,
             resumed_solver=bool(resume), solver_checkpoint_enabled=state is not None))
     return load_prediction_models(output)

@@ -76,8 +76,8 @@ def test_failed_residual_guard_preserves_nonresumable_evidence(tmp_path,monkeypa
     from summit.prediction._validation import array_digest
     actual=native.PredictionMixtureResidual
     class CorruptResidual:
-        def __init__(self,yw,basis,models,threads):
-            self.state=actual(yw,basis,models,threads)
+        def __init__(self,yw,basis,models,threads,**kwargs):
+            self.state=actual(yw,basis,models,threads,**kwargs)
             self.shape=(len(yw),models);self.corrupted=False
         def __getattr__(self,name):return getattr(self.state,name)
         def update(self,*args):

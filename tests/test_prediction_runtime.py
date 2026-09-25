@@ -188,7 +188,7 @@ def test_prediction_registers_bound_worker_set_and_rejects_ambiguous_placement(m
         configure_prediction_threads(Native(), 2)
 
 
-@pytest.mark.parametrize("storage", ["stream", "compact", "standardized"])
+@pytest.mark.parametrize("storage", ["stream", "compact", "packed", "standardized"])
 def test_wide_rhs_tiles_match_narrow_independent_gls(storage):
     source, traits = fixture(m=137)
     native = GenotypeOperator(source, traits, plan_prediction(traits, source,

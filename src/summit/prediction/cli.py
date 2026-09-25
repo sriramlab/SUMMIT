@@ -238,7 +238,7 @@ def main(argv=None):
             p.add_argument("--block-size", type=int, default=512)
             p.add_argument("--rhs-columns", type=int, default=64 if name == "score" else 160)
         if name in ("plan", "fit"):
-            p.add_argument("--genotype-storage", choices=["stream", "compact", "standardized"], default="stream")
+            p.add_argument("--genotype-storage", choices=["stream", "compact", "packed", "standardized"], default="stream")
         if name in ("fit", "score", "scale"):
             p.add_argument("--out", required=True)
         if name == "fit":

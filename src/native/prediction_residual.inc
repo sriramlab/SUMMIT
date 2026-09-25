@@ -24,9 +24,9 @@ static void prediction_interaction_design(nb_mat2f_ro<double> genotype,
 class PredictionMixtureResidual {
 public:
     PredictionMixtureResidual(nb_vec1_ro<double> yw, nb_mat2f_ro<double> basis,
-                              int models, int threads)
+                              int models, int threads, bool deferred_projection=false)
         : n_(prediction_dim(yw.size())), k_(models), rank_(static_cast<int>(basis.shape(1))),
-          threads_(threads) {
+          threads_(threads), deferred_(deferred_projection) {
         if (k_<1 || threads_<1 || basis.shape(0)!=static_cast<size_t>(n_) || rank_>=n_)
             throw std::runtime_error("Invalid native mixture residual dimensions");
         validate_protected_gemm_threads(threads_);
@@ -43,6 +43,14 @@ public:
         }
         for (int model=0;model<k_;++model)
             std::copy(yp_.begin(),yp_.end(),residual_.begin()+static_cast<size_t>(model)*n_);
+        if (deferred_ && rank_) {
+            correction_.assign(small_.size(),0.);
+            residual_projection_.resize(small_.size());
+            basis_error_.resize(checked_mul(static_cast<size_t>(rank_),rank_,"mixture basis Gram"));
+            dgemm_tn_tiled(rank_,rank_,n_,basis_.data(),n_,basis_.data(),n_,basis_error_.data(),rank_,threads_);
+            for (int j=0;j<rank_;++j) basis_error_[j+static_cast<size_t>(rank_)*j]-=1.;
+            refresh_projection();
+        }
     }
 
     void score(nb_mat2f_ro<double> w, nb_mat2f_ro<double> projection,
@@ -55,8 +63,15 @@ public:
         auto guard=lock(); nb::gil_scoped_release release;
         dgemm_tn_tiled(d,k_,n_,w.data(),n_,residual_.data(),n_,output.data(),d,threads_);
         if (rank_) {
-            dgemm_tn_tiled(rank_,k_,n_,basis_.data(),n_,residual_.data(),n_,small_.data(),rank_,threads_);
-            dgemm_tn_tiled(d,k_,rank_,projection.data(),rank_,small_.data(),rank_,output.data(),d,threads_,-1.,1.);
+            if (deferred_) {
+                // r = residual_ + B correction_; residual_projection_ = B' r.
+                for (size_t i=0;i<small_.size();++i)
+                    small_[i]=correction_[i]-residual_projection_[i];
+                dgemm_tn_tiled(d,k_,rank_,projection.data(),rank_,small_.data(),rank_,output.data(),d,threads_,1.,1.);
+            } else {
+                dgemm_tn_tiled(rank_,k_,n_,basis_.data(),n_,residual_.data(),n_,small_.data(),rank_,threads_);
+                dgemm_tn_tiled(d,k_,rank_,projection.data(),rank_,small_.data(),rank_,output.data(),d,threads_,-1.,1.);
+            }
         }
     }
 
@@ -67,7 +82,16 @@ public:
         dgemm_nn_tiled(n_,k_,d,w.data(),n_,delta.data(),d,residual_.data(),n_,threads_,-1.,1.);
         if (rank_) {
             dgemm_nn_tiled(rank_,k_,d,projection.data(),rank_,delta.data(),d,small_.data(),rank_,threads_);
-            dgemm_nn_tiled(n_,k_,rank_,basis_.data(),n_,small_.data(),rank_,residual_.data(),n_,threads_,1.,1.);
+            if (deferred_) {
+                for (size_t i=0;i<small_.size();++i) correction_[i]+=small_[i];
+                // B'(r-PW delta) = B'r + (B'B-I)(B'W delta).
+                // Retain B'B-I instead of assuming numerically perfect orthogonality.
+                dgemm_nn_tiled(rank_,k_,rank_,basis_error_.data(),rank_,small_.data(),rank_,
+                    residual_projection_.data(),rank_,threads_,1.,1.);
+                dirty_=true;
+            } else {
+                dgemm_nn_tiled(n_,k_,rank_,basis_.data(),n_,small_.data(),rank_,residual_.data(),n_,threads_,1.,1.);
+            }
         }
     }
 
@@ -87,6 +111,7 @@ public:
         auto guard=lock();
         if (!reconstructing_) throw std::runtime_error("Mixture reconstruction was not started");
         nb::gil_scoped_release release;
+        synchronize_unlocked();
         if (rank_) {
             dgemm_tn_tiled(rank_,k_,n_,basis_.data(),n_,raw_.data(),n_,small_.data(),rank_,threads_);
             dgemm_nn_tiled(n_,k_,rank_,basis_.data(),n_,small_.data(),rank_,projected_.data(),n_,threads_);
@@ -100,9 +125,23 @@ public:
             drift+=error*error; residual_[i]=value;
         }
         reconstructing_=false;
+        if (deferred_ && rank_) refresh_projection();
         return std::sqrt(static_cast<double>(drift));
     }
-    void copy_residual(nb_mat2f_rw<double> out) { snapshot(residual_,out); }
+    void copy_residual(nb_mat2f_rw<double> out) {
+        if (out.shape(0)!=static_cast<size_t>(n_) || out.shape(1)!=static_cast<size_t>(k_))
+            throw std::runtime_error("Mixture snapshot shape mismatch");
+        auto guard=lock(); nb::gil_scoped_release release;
+        std::copy(residual_.begin(),residual_.end(),out.data());
+        if (deferred_ && rank_ && dirty_)
+            dgemm_nn_tiled(n_,k_,rank_,basis_.data(),n_,correction_.data(),rank_,out.data(),n_,threads_,1.,1.);
+    }
+    // Canonicalize at sweep/checkpoint boundaries. Resuming then reproduces the
+    // same arithmetic state, without serializing an implementation-specific gauge.
+    void synchronize() {
+        auto guard=lock(); nb::gil_scoped_release release;
+        synchronize_unlocked();
+    }
     void copy_prediction(nb_mat2f_rw<double> out) { snapshot(raw_,out); }
     void copy_phenotype(nb_vec1_rw<double> out) {
         if (out.size()!=yp_.size()) throw std::runtime_error("Mixture phenotype shape mismatch");
@@ -117,12 +156,29 @@ public:
             if (!std::isfinite(value.data()[i])) throw std::runtime_error("Nonfinite restored residual");
         }
         std::copy(value.data(),value.data()+value.size(),residual_.begin());
+        if (deferred_ && rank_) {
+            std::fill(correction_.begin(),correction_.end(),0.);
+            dirty_=false;
+            refresh_projection();
+        }
     }
 private:
     int n_, k_, rank_, threads_;
-    bool reconstructing_=false;
+    bool reconstructing_=false, deferred_=false, dirty_=false;
     std::mutex mutex_;
     std::vector<double> basis_,yp_,residual_,raw_,projected_,small_;
+    std::vector<double> correction_,residual_projection_,basis_error_;
+    void refresh_projection() {
+        dgemm_tn_tiled(rank_,k_,n_,basis_.data(),n_,residual_.data(),n_,
+            residual_projection_.data(),rank_,threads_);
+    }
+    void synchronize_unlocked() {
+        if (!(deferred_ && rank_ && dirty_)) return;
+        dgemm_nn_tiled(n_,k_,rank_,basis_.data(),n_,correction_.data(),rank_,residual_.data(),n_,threads_,1.,1.);
+        std::fill(correction_.begin(),correction_.end(),0.);
+        dirty_=false;
+        refresh_projection();
+    }
     std::unique_lock<std::mutex> lock() {
         std::unique_lock<std::mutex> guard(mutex_,std::try_to_lock);
         if (!guard.owns_lock()) throw std::runtime_error("Native mixture residual already in use");

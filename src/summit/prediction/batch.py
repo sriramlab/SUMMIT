@@ -32,8 +32,10 @@ def plan_prediction(traits, source, *, storage="stream", block_size=512, rhs_col
     for key, value in dict(block_size=block_size, rhs_columns=rhs_columns, threads=threads,
                            memory_bytes=memory_bytes).items():
         positive_int(value, key)
-    if storage not in ("stream", "compact", "standardized"):
+    if storage not in ("stream", "compact", "packed", "standardized"):
         raise ValueError("unknown genotype storage mode")
+    if storage == "packed" and not source.hard_calls:
+        raise ValueError("packed storage requires exact hard calls")
     rows = np.unique(np.concatenate([t.rows for t in traits]))
     variants = np.unique(np.concatenate([t.variants for t in traits]))
     if rows[-1] >= len(source.samples) or variants[-1] >= len(source.variants.ids):
@@ -58,6 +60,8 @@ def plan_prediction(traits, source, *, storage="stream", block_size=512, rhs_col
     nkq = sum(len(t.rows)*len(t.candidates)*t.phi.shape[1] for t in traits)
     raw_itemsize = 1 if source.hard_calls else 8
     cache = len(rows)*len(variants)*raw_itemsize if storage == "compact" else 0
+    if storage == "packed":
+        cache = ((len(rows)+3)//4)*len(variants)
     if storage == "standardized":
         seen = set()
         for t in traits:

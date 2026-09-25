@@ -130,6 +130,25 @@ class FileGenotypeSource:
             raise ValueError("genotype inputs must be regular files")
         return [s.st_dev, s.st_ino, s.st_size, s.st_mtime_ns, s.st_ctime_ns]
 
+    def authenticate_content(self):
+        """Opt in to cross-host identity before scale fitting or source preparation.
+
+        Hash all three open input files once. Their descriptor/path state still
+        guards live mutation on every read; persistent identity uses file bytes
+        and ordered scientific axes instead of host-specific device/inode IDs.
+        Existing default identities and checkpoints are never rewritten.
+        """
+        import json
+        from .migration import _source_content
+        from ._validation import canonical
+        self.check()
+        if self.generation or self._reader is not None:
+            raise RuntimeError('content identity must be established before source preparation')
+        content=_source_content(self)
+        self._content_json=canonical(content)
+        self.identity=digest(['prediction_file_content_v1',content])
+        return json.loads(self._content_json)
+
     def check(self):
         if not self._fds:
             raise RuntimeError("genotype source is closed")
@@ -315,9 +334,11 @@ class StandardizedBlock:
 
 
 class RawBlockStream:
-    def __init__(self, source, rows, variants, *, block_size=512, storage="stream", threads=1, ledger=None):
-        if storage not in ("stream", "compact", "standardized"):
+    def __init__(self, source, rows, variants, *, block_size=512, storage="stream", threads=1, ledger=None, native=None):
+        if storage not in ("stream", "compact", "packed", "standardized"):
             raise ValueError("unknown genotype storage mode")
+        if storage == "packed" and not source.hard_calls:
+            raise ValueError("packed storage requires exact hard calls")
         self.source = source
         self.rows = np.unique(rows)
         self.variants = np.unique(variants)
@@ -325,6 +346,12 @@ class RawBlockStream:
         self.storage = storage
         self.ledger = ledger if ledger is not None else PassLedger()
         self.cache = None
+        self.cache_ready = False
+        self.unpack_buffer = None
+        self.threads = threads
+        # The operator supplies its already-configured native runtime. Pure
+        # NumPy callers retain a dependency-free reference packing path.
+        self.pack_native = native if storage == "packed" and hasattr(native,"prediction_pack_calls") else None
         source.prepare(self.rows, self.block_size, threads)
         self.generation = source.generation
 
@@ -335,19 +362,34 @@ class RawBlockStream:
 
     def blocks(self, phase, *, build_cache=False):
         self.check()
+        if self.cache is not None and not self.cache_ready:
+            raise RuntimeError('genotype cache build is incomplete; create a new stream')
         self.ledger.begin(phase)
         existing = self.cache is not None
         if build_cache:
-            if existing or self.storage != "compact":
+            if existing or self.storage not in ("compact", "packed"):
                 raise ValueError("compact cache can be built exactly once")
-            self.cache = np.empty((len(self.variants), len(self.rows)),
-                dtype=np.int8 if self.source.hard_calls else np.float64)
+            if self.storage == "packed":
+                self.cache = np.empty((len(self.variants), (len(self.rows)+3)//4), dtype=np.uint8)
+                self.unpack_buffer = np.empty((len(self.rows), min(self.block_size,len(self.variants))), dtype=np.int8, order="F")
+            else:
+                self.cache = np.empty((len(self.variants), len(self.rows)),
+                    dtype=np.int8 if self.source.hard_calls else np.float64)
         for start in range(0, len(self.variants), self.block_size):
             self.check()
             stop = min(start + self.block_size, len(self.variants))
             variants = self.variants[start:stop]
             if existing:
                 raw = self.cache[start:stop].T
+                if self.storage == "packed":
+                    packed, raw = raw, self.unpack_buffer[:, :stop-start]
+                    if self.pack_native is not None:
+                        self.pack_native.prediction_unpack_calls(packed, raw, self.threads)
+                    else:
+                        for offset in range(4):
+                            part=raw[offset::4]
+                            code=(packed[:len(part)]>>(2*offset))&3
+                            part[:]=np.where(code==3,np.int8(-127),code.astype(np.int8))
                 self.ledger.cache_blocks += 1
                 self.ledger.cache_variants += len(variants)
             else:
@@ -356,11 +398,27 @@ class RawBlockStream:
                 self.ledger.source_variants += len(variants)
                 self.ledger.source_decoded_bytes += raw.nbytes
                 if build_cache:
-                    self.cache[start:stop] = raw.T
+                    if self.storage == "packed":
+                        packed=self.cache[start:stop].T
+                        if self.pack_native is not None:
+                            self.pack_native.prediction_pack_calls(raw, packed, self.threads)
+                        else:
+                            if np.any((raw!=-127)&((raw<0)|(raw>2))):
+                                raise ValueError("invalid hard call in packed cache")
+                            packed[:]=255
+                            for offset in range(4):
+                                part=raw[offset::4]
+                                target=packed[:len(part)]
+                                target &= np.uint8(255^(3<<(2*offset)))
+                                target |= np.where(part==-127,3,part).astype(np.uint8)<<(2*offset)
+                    else:
+                        self.cache[start:stop] = raw.T
             yield start, variants, raw
         if build_cache:
             self.cache.setflags(write=False)
         self.check()
+        if build_cache:
+            self.cache_ready = True
 
 
 def estimate_scale(source, rows, variants, *, ddof=1, block_size=512, threads=1, memory_bytes=16*2**30):
