@@ -1,6 +1,6 @@
 """Context-specific genetic correlation curves from saved covariance estimates.
 
-Offsets use the master-standardized exposure units and are added to each
+Offsets use the shared saved-standardization units and are added to each
 trait's own context mean. These are fitted cross-sectional response surfaces,
 not longitudinal predictions or causal intervention effects.
 """
@@ -60,13 +60,13 @@ def main():
                 values=function(point);covariances=paired_delta_covariances(function,point,deleted)
                 for i,offset in enumerate(offsets):
                     value=float(values['context_rg'][i]);se=float(np.sqrt(np.maximum(0,covariances['context_rg'][i,i])))
-                    rows.append(dict(trait_x=x,trait_y=y,exposure=exposure,offset_master_sd=float(offset),
+                    rows.append(dict(trait_x=x,trait_y=y,exposure=exposure,offset_basis_units=float(offset),
                         rg=value,delta_se=se,lower_95=value-1.96*se,upper_95=value+1.96*se,
                         admissible=bool(np.isfinite(value) and abs(value)<=1),exploratory=True))
                 value=float(values['high_minus_low_rg']);se=float(np.sqrt(np.maximum(0,covariances['high_minus_low_rg'].item())))
                 changes.append(dict(trait_x=x,trait_y=y,exposure=exposure,high_minus_low_rg=value,
                     paired_delta_se=se,lower_95=value-1.96*se,upper_95=value+1.96*se,
-                    contrast='own mean +1 master SD minus own mean -1 master SD',exploratory=True))
+                    contrast='own mean +1 saved basis unit minus own mean -1 saved basis unit',exploratory=True))
     from scipy.stats import norm
     pvalues=[2*norm.sf(abs(r['high_minus_low_rg']/r['paired_delta_se']))
         if np.isfinite(r['paired_delta_se']) and r['paired_delta_se']>0 else np.nan for r in changes]
@@ -80,25 +80,25 @@ def main():
     fig,axes=plt.subplots(2,4,figsize=(13,6),sharex=True,sharey=True)
     for col,target in enumerate(targets):
         for row,(exposure,label) in enumerate([('age','Age'),('bmi_raw','BMI')]):
-            selected=sorted([r for r in rows if {r['trait_x'],r['trait_y']}=={'ldl_raw',target} and r['exposure']==exposure],key=lambda r:r['offset_master_sd'])
+            selected=sorted([r for r in rows if {r['trait_x'],r['trait_y']}=={'ldl_raw',target} and r['exposure']==exposure],key=lambda r:r['offset_basis_units'])
             ax=axes[row,col]
             if selected:
-                grid=np.array([r['offset_master_sd'] for r in selected]);values=np.array([r['rg'] for r in selected])
+                grid=np.array([r['offset_basis_units'] for r in selected]);values=np.array([r['rg'] for r in selected])
                 low=np.array([r['lower_95'] for r in selected]);high=np.array([r['upper_95'] for r in selected])
                 ax.plot(grid,values,color='#0072B2');ax.fill_between(grid,low,high,color='#0072B2',alpha=.18)
             ax.axhline(0,color='#bbbbbb',lw=.6);ax.axvline(0,color='#bbbbbb',lw=.6,ls=':')
-            ax.set_xlabel(label+' offset (master SD)');ax.set_xticks([-1,0,1]);ax.spines[['top','right']].set_visible(False)
+            ax.set_xlabel(label+' (standardized offset)');ax.set_xticks([-1,0,1]);ax.spines[['top','right']].set_visible(False)
             if row==0:ax.set_title('LDL – '+LABELS[target])
             if col==0:ax.set_ylabel('Context-specific genetic rg')
     fig.suptitle('Fitted genetic sharing across age and BMI',fontsize=14)
-    fig.text(.02,.015,'Offsets are relative to each trait’s mean; all other contexts remain at that mean. Shading: pointwise 95% delta intervals.\n'
+    fig.text(.02,.015,'Shared saved standardization; offsets are relative to each trait’s mean, with other contexts at that mean. Shading: pointwise 95% delta intervals.\n'
         'Common-bin, cross-sectional model estimates. These curves do not predict causal effects of aging, weight loss or treatment.',fontsize=8)
     fig.tight_layout(rect=(0,.11,1,.94))
     for suffix in ('pdf','png'):fig.savefig(args.output/f'context_specific_genetic_correlations.{suffix}',dpi=180,bbox_inches='tight')
     plt.close(fig)
     files={path.name:file_sha256(path) for path in args.output.iterdir()}
     (args.output/'COMPLETE.json').write_text(json.dumps(dict(sources=sources,script_sha256=file_sha256(__file__),
-        files=files,context_units='master-standardized offset from trait-specific means'),indent=2)+'\n')
+        files=files,context_units='shared saved-standardization offset from trait-specific means'),indent=2)+'\n')
 
 
 if __name__=='__main__':main()

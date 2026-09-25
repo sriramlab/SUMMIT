@@ -744,7 +744,7 @@ must not be attributed solely to a change of propagation method.
 
 `cross_trait_context_profiles.py --fits <fit-directory> --output <new-directory>`
 reports fitted genetic correlation across age and BMI offsets from each
-trait's own context mean, on the master-standardized scale. Other contexts
+trait's own context mean, on the shared saved-standardization scale. Other contexts
 stay at their means. Both the curves and paired endpoint contrasts use the
 full coefficient covariance; shaded curve intervals are pointwise, not
 simultaneous. These are cross-sectional model implications, not observed
@@ -753,3 +753,7 @@ rg does not require total genetic rg to increase with age: the latter also
 depends on baseline–response covariance and changing genetic variances.
 Out-of-range moment ratios are kept in numerical tables and explicitly
 flagged in figures rather than clipped into admissible correlations.
+The saved scaling is retained from the original common coding: its empirical
+variance on the reunited master cohort need not be exactly one. Profile offsets
+are units of that saved basis, not newly computed trait-specific standard
+deviations. The measured master covariance S is saved with every fit.
