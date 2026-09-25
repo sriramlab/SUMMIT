@@ -33,11 +33,12 @@ def report(fits,output):
         baseline=default[x,y,'baseline_rg','0']
         cohort={name:baseline.get(name,'') for name in ('n_x','n_y','n_overlap')}
         row=dict(trait_x=x,trait_y=y,**cohort,chromosomes=chromosome_label,
-            pair_category=category,exploratory=True)
+            pair_category=category,exploratory=True,uncertainty_method=baseline.get('uncertainty_method','jackknife'))
         for quantity in ('baseline_rg','orthogonal_rg','orthogonal_minus_baseline_rg'):
             k=(x,y,quantity,'0');entry=default[k]
             for field in ('estimate','jackknife_se','lower_95','upper_95'):
                 row[quantity+'_'+field]=entry[field]
+            row[quantity+'_standard_error']=entry.get('standard_error',entry['jackknife_se'])
             row[quantity+'_maximum_mode_shift_se']=shifts[k]['maximum_mode_shift_se']
             row[quantity+'_undefined_shift_modes']=shifts[k]['undefined_shift_modes']
             if quantity!='orthogonal_minus_baseline_rg':
@@ -53,6 +54,8 @@ def report(fits,output):
             blocks.append(dict(trait_x=x,trait_y=y,**cohort,chromosomes=chromosome_label,
                 pair_category=category,exploratory=True,
                 **{f:entry[f] for f in ('exposure_x','exposure_y','estimate','jackknife_se','lower_95','upper_95')},
+                standard_error=entry.get('standard_error',entry['jackknife_se']),
+                uncertainty_method=entry.get('uncertainty_method','jackknife'),
                 maximum_mode_shift_se=shifts[k]['maximum_mode_shift_se'],
                 undefined_shift_modes=shifts[k]['undefined_shift_modes']))
     write_table(output/'baseline_vs_orthogonal_response.tsv',comparisons)
@@ -62,7 +65,8 @@ def report(fits,output):
         default_mode='factorized',pairs=len(comparisons),age_bmi_entries=len(blocks),
         undefined_orthogonal_correlations=sum(not math.isfinite(float(r['orthogonal_rg_estimate'])) for r in comparisons),
         interpretation='exploratory; a nonsignificant control does not establish absence',
-        interval_convention='paired target-SNP deletion; contrast uses its own paired jackknife SE',
+        uncertainty_method=complete.get('uncertainty_method','jackknife'),
+        interval_convention='paired target-SNP coefficient covariance; selected uncertainty method also applies to contrasts',
         tables={p.name:file_sha256(p) for p in output.glob('*.tsv')})
     with (output/'COMPLETE.json').open('x') as f:json.dump(result,f,indent=2)
 

@@ -113,3 +113,32 @@ def test_legacy_within_trait_is_bit_exact_full_and_deleted():
             mode='legacy_transport',same_person_mode='scaled',deleted_blocks=deleted,deletion_method='legacy',**options)
         for name in ('matrix','rhs','reference_genetic_gram','transferred_genetic_gram'):
             np.testing.assert_array_equal(getattr(got,name),getattr(expected,name))
+
+
+def test_cached_within_directional_deletions_preserve_population_truth():
+    from summit.context.cross_trait_gram import ChromosomeGram,prepare_within_trait_target_jackknife
+    from summit.context.fit import solve_context_normal_equations
+    fractions=np.array([[.1,.6],[.3,.1],[.6,.3]]);masses=np.array([100.,200.])
+    a=np.array([[4.,1.],[1.,3.]]);d=np.eye(2)*.2;b=np.array([[1.],[2.]])
+    rr=np.array([[79.]]);g=a+b@b.T/79;theta=np.array([.2,.7]);psi=np.array([.3])
+    rhs=g@theta+b@psi;rrhs=b.T@theta+rr@psi
+    direct=fractions[:,:,None]*g*masses[None,:,None]*masses[None,None,:]/79**2
+    study=ChromosomeMoments('1','study',('a','b'),('trait',),1,80,79,np.arange(3),
+        fractions*masses,direct,(fractions*rhs*masses)[:,:,None],
+        fractions[:,:,None]*b*masses[None,:,None])
+    reference=replace(study,cohort_identity='reference',n_samples=100,residual_rank=99)
+    gram=ChromosomeGram(fractions[:,:,None]*(g-d),d,
+        dict(mode='factorized',same_person_mode='own_rows',n_x=80,n_y=80))
+    options=dict(reference_diagonals=None,phi=None,rows=np.arange(80),prepared_grams={'1':gram},
+        full_same_person=d,reference_residual_gram=np.array([[99.]]),reference_residual_traces=np.array([99.]),
+        reference_same_person=d,residual_gram=rr,residual_rhs=rrhs[:,None],
+        residual_traces=np.array([79.]),residual_names=('one',))
+    full=within_trait_equations([reference],[study],**options)
+    cache=prepare_within_trait_target_jackknife(full,[study],{'1':gram},rr)
+    np.testing.assert_allclose(solve_context_normal_equations(full).coefficients,np.r_[theta,psi],atol=1e-12)
+    for block in range(3):
+        uncached=within_trait_equations([reference],[study],deleted_blocks=[block],**options)
+        cached=within_trait_equations([reference],[study],deleted_blocks=[block],prepared_target_deletions=cache,**options)
+        np.testing.assert_array_equal(cached.matrix,uncached.matrix)
+        np.testing.assert_array_equal(cached.rhs,uncached.rhs)
+        np.testing.assert_allclose(solve_context_normal_equations(cached).coefficients,np.r_[theta,psi],atol=1e-12)

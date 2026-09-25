@@ -17,12 +17,14 @@ sys.meta_path[:]=[f for f in sys.meta_path if type(f).__module__!='_gwldcore_edi
 sys.path.insert(0,str(a.repo/'src'))
 import numpy as np
 from summit.context.cross_trait_zpass import load_array_artifact
+from summit.context.cross_trait_fit import cross_trait_derived
 sha=lambda path:hashlib.sha256(path.read_bytes()).hexdigest()
 read=lambda path:list(csv.DictReader(path.open(),delimiter='\t'))
 close=lambda x,y:np.testing.assert_allclose(x,y,rtol=2e-11,atol=1e-13,equal_nan=True)
 fc=json.loads((a.fits/'COMPLETE.json').read_text())
 rc=json.loads((a.report/'COMPLETE.json').read_text())
-assert fc['deleted_genetic_mass_restored'] is True
+if fc.get('deletion_method','legacy')=='target_moments':
+    assert fc['deleted_genetic_mass_restored'] is False
 assert rc['pilot_completion_sha256']==sha(a.fits/'COMPLETE.json')
 for root,complete in ((a.fits,fc),(a.report,rc)):
     for name,digest in complete['tables'].items():
@@ -36,29 +38,60 @@ for path in sorted(a.fits.glob('*.npz')):
     x,y,mode=pr['trait_x'],pr['trait_y'],pr['gram_mode']
     for name,value in fc.items():
         if name not in ('seconds','tables'):assert pr[name]==value,(path,name)
-    assert bool(f['loo_genetic_mass_restored'])
+    assert bool(f['loo_genetic_mass_restored'])==fc['deleted_genetic_mass_restored']
     assert len(f['block_ids'])==a.expected_blocks
     if ids is None:ids=f['block_ids']
     np.testing.assert_array_equal(ids,f['block_ids'])
     assert len(np.unique(ids))==len(ids)
     q=f['omega_xy'].shape[-1];width=f['omega_xy'].size
     expected=f['raw_loo_coefficients'].copy()
-    expected[:,:width]*=np.repeat(f['loo_mass_restoration'],q*q,axis=1)
+    if bool(f['loo_genetic_mass_restored']):
+        expected[:,:width]*=np.repeat(f['loo_mass_restoration'],q*q,axis=1)
     np.testing.assert_array_equal(expected,f['loo_coefficients'])
     np.testing.assert_array_equal(expected[:,:width].reshape(f['loo_omega_xy'].shape),f['loo_omega_xy'])
+    linear=None
+    if pr.get('uncertainty_method','jackknife')=='delta':
+        # Independent finite directional differences along actual paired
+        # coefficient deviations audit the production complex-step Jacobian.
+        centers=[f['omega_'+k] for k in ('xx','yy','xy')]
+        deviations=[f['loo_omega_'+k]-f['loo_omega_'+k].mean(0) for k in ('xx','yy','xy')]
+        def evaluate(sign,step):
+            xx,yy,xy=[c+sign*step*d for c,d in zip(centers,deviations)]
+            return cross_trait_derived(xy,xx,yy,mean_x=f['mean_x'],mean_y=f['mean_y'],context_covariance=f['context_covariance'])
+        step=1e-3
+        for _ in range(6):
+            derivatives=[]
+            for h in (step,step/2):
+                plus,minus=evaluate(1,h),evaluate(-1,h)
+                derivatives.append({k:(plus[k]-minus[k])/(2*h) for k in plus if plus[k].dtype.kind=='f'})
+            error=0.
+            for k in derivatives[0]:
+                left,right=derivatives[0][k],derivatives[1][k];ok=np.isfinite(left)&np.isfinite(right)
+                error=max(error,np.linalg.norm((left-right)[ok])/max(1e-20,np.linalg.norm(right[ok])))
+            if error<1e-7:
+                linear=derivatives[1];break
+            step/=10
+        if linear is None:raise ValueError('independent delta derivative check did not converge')
     for quantity in ('omega_xy','h_xy','response_rg','baseline_rg','orthogonal_rg','orthogonal_trace',
                      'orthogonal_minus_baseline_rg','response_minus_baseline_rg'):
         point=f[quantity].ravel();loo=f['loo_'+quantity].reshape(len(ids),-1)
-        se=np.sqrt((len(ids)-1)*np.var(loo,axis=0))
+        jackknife_se=np.sqrt((len(ids)-1)*np.var(loo,axis=0))
         centered=loo-loo.mean(axis=0)
         covariance=(len(ids)-1)/len(ids)*(centered.T@centered)
+        if linear is not None and quantity!='omega_xy':
+            projected=linear[quantity].reshape(len(ids),-1)
+            covariance=(len(ids)-1)/len(ids)*(projected.T@projected)
         saved=f['covariance'] if quantity=='omega_xy' else f[quantity+'_covariance']
-        close(covariance,saved)
+        if linear is not None and quantity!='omega_xy':
+            np.testing.assert_allclose(covariance,saved,rtol=2e-6,atol=1e-11,equal_nan=True)
+        else:close(covariance,saved)
+        se=np.sqrt(np.maximum(0,np.diag(saved)))
         for j,value in enumerate(point):
             k=(x,y,mode,quantity,str(j));row=table[k];seen.add(k)
-            for name,expected_value in (('estimate',value),('jackknife_se',se[j]),
+            for name,expected_value in (('estimate',value),('jackknife_se',jackknife_se[j]),
                     ('lower_95',value-1.96*se[j]),('upper_95',value+1.96*se[j])):
                 close(expected_value,float(row[name]))
+            if 'standard_error' in row:close(se[j],float(row['standard_error']))
             for name in ('n_x','n_y','n_overlap'):assert int(row[name])==pr[name]
     for prefix in ('','loo_'):
         h,hx,hy=(f[prefix+k] for k in ('h_xy','h_xx','h_yy'))
@@ -78,7 +111,7 @@ for row in shifts:
     valid=[];invalid=[]
     for mode in ('factorized','factorized_plus_residual','legacy_transport','legacy_transport_exact'):
         other=table[x,y,mode,quantity,entry]
-        se=float(default['jackknife_se'])
+        se=float(default.get('standard_error',default['jackknife_se']))
         delta=(float(other['estimate'])-float(default['estimate']))/se if se>0 else np.nan
         close(delta,float(other['shift_from_default_se']))
         if np.isfinite(delta):valid.append(abs(delta))

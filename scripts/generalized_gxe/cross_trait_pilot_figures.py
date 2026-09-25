@@ -33,6 +33,7 @@ def main():
         marker=root/'COMPLETE.json'
         assert audit['source_completion_sha256'][str(marker)]==sha(marker)
     complete=json.loads((a.report/'COMPLETE.json').read_text())
+    uncertainty=complete.get('uncertainty_method','jackknife')
     for name,digest in complete['tables'].items():assert sha(a.report/name)==digest
     with (a.report/'baseline_vs_orthogonal_response.tsv').open() as f:
         contrasts=list(csv.DictReader(f,delimiter='\t'))
@@ -49,10 +50,11 @@ def main():
         ix,iy=[traits.index(provenance[key]) for key in ('trait_x','trait_y')]
         for i,j,q,r in ((ix,iy,age,bmi),(iy,ix,bmi,age)):
             covariance[i,j]=fit['h_xy'][0,q,r]
-            se[i,j]=np.sqrt(199*np.var(fit['loo_h_xy'][:,0,q,r]))
+            se[i,j]=np.sqrt(fit['h_xy_covariance'][q*(len(names)-1)+r,q*(len(names)-1)+r])
         for i,side in ((ix,'x'),(iy,'y')):
             value=float(fit['h_'+side+side][0,age,bmi])
-            error=float(np.sqrt(199*np.var(fit['loo_h_'+side+side][:,0,age,bmi])))
+            entry=age*(len(names)-1)+bmi
+            error=float(np.sqrt(fit['h_'+side+side+'_covariance'][entry,entry]))
             if i in self_entries:np.testing.assert_allclose([value,error],self_entries[i],rtol=1e-12,atol=1e-14)
             self_entries[i]=(value,error);covariance[i,i]=value;se[i,i]=error
     assert np.isfinite(covariance).all() and np.isfinite(se).all()
@@ -83,7 +85,7 @@ def main():
     ax.set_yticks(range(28),[LABELS[r['trait_x']]+' / '+LABELS[r['trait_y']] for r in contrasts],fontsize=8)
     ax.invert_yaxis();ax.axvline(0,color='#666666',ls='--',lw=.8)
     ax.axhline(14.5,color='#aaaaaa',lw=.6)
-    ax.set_xlabel('Orthogonal-response rg minus baseline rg\nPaired nominal 95% interval, 200 deletion blocks')
+    ax.set_xlabel(f'Orthogonal-response rg minus baseline rg\nPaired {uncertainty} nominal 95% interval, 200 deletion blocks')
     ax.set_title('Exploratory common-bin pilot\nFactorized Gram with same-person terms on actual rows',loc='left')
     ax.grid(axis='x',alpha=.15)
     ax.spines[['top','right']].set_visible(False)

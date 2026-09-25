@@ -28,11 +28,17 @@ case $phase in
  generate|score|fit)
   inputs=/u/project/jflint/bronsonj/cross_trait_20260923/simulation_inputs
   reference=/u/scratch/b/bronsonj/cross_trait_20260923/simulation_v3/simulation_reference/reference.generalized-gxe-variant-ldscore-v1.npz
+  if [[ $phase == score || $phase == fit ]]; then [[ -s $output_root/simulation_generate/generated.npz ]]; fi
+  if [[ $phase == fit ]]; then [[ -s $output_root/simulation_score/scores.npz ]]; fi
   exec "${run[@]}" cross_trait_simulation "$phase" --axes "$inputs/axes.npz" \
     --bed-prefix "$inputs/UKBB_EUR_50k_unrel_3rd.no_mhc_imp" --reference "$reference" \
     --generated "$output_root/simulation_generate/generated.npz" \
     --scores "$output_root/simulation_score/scores.npz" --output "$output_root/simulation_$phase" \
     --replicates 500 --seed 2026092402 --threads 8
+  ;;
+ within)
+  exec "${run[@]}" cross_trait_refit --base "$base" --output "$output_root/within_directional" \
+    --source-commit "${3:?immutable source commit required}"
   ;;
  study)
   chromosome=${3:-${SGE_TASK_ID:?chromosome required}}

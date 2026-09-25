@@ -117,8 +117,9 @@ repair; unweighted V alone is insufficient. Storage scales as
 `8 * blocks * K * Q² * fixed_rank²` bytes, plus chromosome source products.
 
 The four-trace formula in `antisymmetric_gram` obtains T^A, and repair is
-`reconstruct(saved(T-T^A)) + T^A`. Frozen target blocks use their symmetric
-part, which is what enters the normal equation. Dense tests establish this
+`reconstruct(saved(T-T^A)) + T^A`. The repair reconstructs the symmetric target-block sector
+used by the original reference normal equations; it does not supply every
+directional per-block term for a changed projector. Dense tests establish this
 identity for a **single annotation**, including a weighted annotation.
 Arbitrary cross-annotation blocks also contain mixed symmetric/antisymmetric
 terms; the quadratic products alone do not repair those terms. The exact
@@ -145,27 +146,67 @@ shared product. Standalone and fused artifacts use the same schema.
 context solver after reducing the residual span. Fits report rank, condition
 number, minimum Gram eigenvalue, solve residual and deletion diagnostics.
 
-The paper convention uses 200 paired target-SNP deletion blocks: both traits'
-score products and matching reference target blocks are deleted together.
-Genetic moments are mass-restored, reference source products stay frozen,
-and the own-overlap same-person term stays frozen. For the full-genome
-same-person term, chromosome diagonals are summed **before** taking their
-Gram; this includes same-person products between chromosomes. Full-data
-different-person contributions are summed across chromosomes. Deletions
-retain the existing frozen-source residual-profile change relative to its
-full-data value, using the study's residual geometry. Cross-chromosome LD is
-not computed. These deletion and chromosome conventions are approximations,
+The default uses 200 paired target-SNP blocks, `deletion_method="target_moments"`,
+and `uncertainty_method="delta"`. Full estimates are unchanged. Write the
+full residual-profiled equation as `A theta = h`, with full-mass moments
+
+```
+A = sym(sum_b O_b) + D - B C^+ B'
+h = sum_b q_b - B C^+ r,             B = sum_b B_b.
+```
+
+`O_b` is the saved target-block off-person matrix; `B_b` and `q_b` are exact
+study moments. `D` is computed after summing chromosome diagonals, on actual
+overlap rows. If `F_b` is the diagonal matrix of each annotation's target
+block mass fraction, the block equations are
+
+```
+A_b = O_b + F_b D - B_b C^+ B'
+h_b = q_b - B_b C^+ r.
+```
+
+The full reference's antisymmetric remainder is removed by allocating
+`sym(sum A_b) - sum A_b` with `F_b`; thus block matrices sum to the established
+full profiled matrix. For exact symmetric full moments this correction is
+zero up to roundoff. Deletion solves `(A-A_b) theta_-b = h-h_b` on **fixed
+full-genome coefficient units**, without post-solve mass inflation. These
+matrices are directional target/source moments, not symmetric Grams, and
+use a rank-revealing SVD. Symmetrizing each block can change its population
+RHS and is incorrect. Full and legacy systems retain the existing symmetric
+spectral solver. Geometry is cached once, including for within-trait fits;
+simulation right-hand sides share each factorization.
+
+With exact block moments, the full and deleted coefficient estimators have
+the same expectation. Their realized estimates need not agree. Nonlinear
+correlations need not be unbiased. The sealed reference does not contain
+per-target person diagonals: `F_b D` remains a mass-apportionment approximation.
+Reference transport, probe noise and omitted cross-chromosome LD also remain
+explicit approximations. This is target resampling with fixed source kernels,
 not dense recomputation after removing both SNP axes.
-After solving each deleted system, each annotation's genetic coefficients
-are multiplied by `M_k / (M_k - M_bk)`, matching the existing study collector.
-Residual coefficients retain their units. Fits store both raw and restored
-deletion coefficients and the restoration factors; `restore_mass=False`
-(CLI `--unrestored-deletions`) reproduces the earlier unadjusted deletion
-output. All paper tables use restored deletions. This final coefficient
-scaling is separate from the retained-mass normalization in the equations.
-These intervals are conditional on the supplied reference and transport
-mode. They do not include independent probe redraws or transport-model
-uncertainty; the mode comparison reports that additional sensitivity.
+
+The delta method propagates the **joint** paired deletion covariance of
+`Omega_XX`, `Omega_YY`, and ordered `Omega_XY` through the full-fit Jacobian.
+It includes centring, baseline projection and both denominators. It is not
+an independent replacement for estimating coefficient covariance: the 200
+paired block summaries are still required. A vectorized complex-step
+Jacobian avoids finite-difference subtraction error; unit tests and the
+report audit check it with independent central differences. Both delta and
+nonlinear jackknife covariance matrices are stored. `--uncertainty-method
+jackknife` selects the latter. Nonpositive variance denominators remain
+undefined; correlations are never clipped to [-1,1].
+
+For historical reproduction select `--deletion-method legacy
+--uncertainty-method jackknife`. The old deletion equations and coefficient
+multiplier `M_k/(M_k-M_bk)` remain available; `--unrestored-deletions` further
+reproduces the earlier raw coefficients. Within-trait `legacy_transport`
+with scaled diagonals and legacy deletion delegates to the unchanged old
+assembler and is tested bit for bit. Historical round-2 tables below used
+that former deletion convention; they are retained as archived results.
+
+Intervals are conditional on the supplied reference and transport mode.
+They do not include independent probe redraws or transport-model uncertainty;
+the mode comparison reports that sensitivity. Delta linearization does not
+cure a weak denominator, misspecified variance model or biased Gram.
 
 The baseline covariance and correlation use the master-basis `[0,0]` entries.
 For named-exposure orthogonal responses, first center each trait's intercept
@@ -196,7 +237,12 @@ unchanged. Pair fits include `omega_xy`, `loo_omega_xy`, genetic covariance,
 residual coefficients, block IDs, diagnostics, derived point/deletion arrays,
 derived covariance matrices, Gram mode and input provenance. Pilot fits also
 include basis names, annotation names, factorization residuals and
-same-person shares per block/annotation pair.
+same-person shares per block/annotation pair. New pair files additionally
+store full and deleted `omega_xx`/`omega_yy`, the joint primitive covariance,
+`deletion_method`, `uncertainty_method`, and separately named
+`*_delta_covariance` and `*_jackknife_covariance`. `*_covariance` is the selected
+method. Tables distinguish `standard_error` from `jackknife_se`; interval
+endpoints use the selected standard error.
 
 Long studies may add `--checkpoint-every-blocks 128 --max-run-seconds 46800`.
 This writes immutable `.study_checkpoint` artifacts every 128 decoded tiles
@@ -620,3 +666,54 @@ The reproducible investigation and biological comparison are in
 `cross_trait_20260923/calibration_20260924/REPORT.md`, with commands, source
 hashes, all-entry simulation tables and the 28-pair pilot diagnostic. Original
 fit files and intervals remain unchanged.
+
+
+## Directional deletion and delta validation (24 September follow-up)
+
+A population-moment oracle with heterogeneous directed blocks and unequal
+annotation fractions exposed an additional error in symmetrizing individual
+target/source equations. The corrected SVD path preserves the generating
+coefficients at 1e-12; proportional-block, multi-chromosome, residual-profile,
+cache-equivalence and paired-covariance tests also pass. Legacy assembly
+remains bit-identical. The portable suite at the directional milestone passed
+1,496 tests (six skipped, one xpassed); later publication receipts identify
+the exact final test count and commit.
+
+On the original 100-replicate panel, corrected directional deletions plus
+full-fit delta propagation give aggregate orthogonal-response correlation
+coverage of 0.97 and 0.98 in the shared- and zero-program scenarios. Mean
+SE/empirical SD is 0.981 and 1.008; RMS SE/SD is 1.072 and 1.037. These
+are diagnostics on the simulations used to identify the problem, not
+independent validation. Some other entries still have 0.99 coverage, and
+one replicate has an undefined individual-exposure correlation in the
+shared-program scenario. Do not omit undefined intervals when describing
+coverage. Batched fitting of all 100 replicates and both scenarios took
+3.8 seconds locally, without reading genotypes.
+
+The follow-up protocol specifies seed 2026092402 and 500 independent replicates
+per scenario on the existing 50,112-person array panel, and 11 requested real-data
+pairs over 15 traits. The new pairs expand the Namba single-exposure comparison
+beyond LDL/total cholesterol and test whether the HbA1c pattern generalizes
+to glucose. Job completion and prospective results must be read from the
+follow-up report, not inferred from successful submission:
+`cross_trait_20260923/round3_20260924/`.
+
+`cross_trait_biology.py` exports baseline versus aggregate-response forests,
+four single-exposure panels, an ordered age/BMI correlation matrix, and
+matched Namba comparisons. Its numerical tables include paired asymmetry
+contrasts, conditioning on both baselines as a sensitivity analysis, and
+post-hoc lipid averages with covariance across all contributing pairs.
+The four lipid measurements are correlated outcomes, not four independent
+replications. The single aggregate response correlation measures alignment
+of the two residual genetic response functions under the recorded exposure
+covariance metric; it is not the arithmetic mean of four exposure-specific
+correlations. Positive sharing does not identify the direction of the mean
+phenotypic response to an exposure or establish a causal intervention effect.
+
+External comparisons use ordinary same-exposure slope correlation, without
+baseline orthogonalization. Namba et al.'s Table S22 contains significant
+entries only. UKB comparisons overlap samples; BBJ is an independent cohort
+with different ancestry and ascertainment. Exposure sets, phenotype transforms
+and SNP panels differ. Current smoking is not equated with ever smoking, and
+missing table entries are not null results. Nonsignificant height or platelet
+contrasts do not establish absence of response sharing.

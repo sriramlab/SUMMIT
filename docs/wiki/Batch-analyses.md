@@ -99,3 +99,22 @@ refitted under six arms without genotypes. The simulation coverage criterion
 is not fully met, and weak individual-context correlations can have undefined
 intervals. The pilot remains exploratory; see the linked page for the full
 results, exactness limits and authenticated artifacts.
+
+
+As of the 24 September inference correction, new fits default to directional
+fixed-source target deletions on full-genome units and full-point delta
+uncertainty for nonlinear derived quantities. The joint coefficient covariance
+still comes from the 200 paired blocks. Both uncertainty choices are available;
+`--deletion-method legacy --uncertainty-method jackknife` preserves the old
+inference path. The within-trait assembler's legacy/scaled arm remains
+bit-exact. See the cross-trait page for the block-diagonal approximation and
+calibration boundaries.
+
+The study driver accepts `--trait-names ... --pairs-file pairs.json`, where
+`pairs.json` is a list of ordered trait-name pairs. All requested pairs share
+one traversal, with orientation, identities and accumulators protected on
+checkpoint/resume. The fit driver accepts the same trait names in summary
+order and fits the recorded pair subset; it reuses sealed within-trait
+summaries and reads no genotypes. `cross_trait_biology.py` publishes interpretable
+single-exposure and aggregate-response plots, paired biological contrasts,
+and matched external comparisons, with source tables and file hashes.

@@ -138,3 +138,13 @@ def test_paired_delta_contrast_includes_shared_covariance_and_domains():
     bad=derived_uncertainty(xy,invalid,yy,looz,loox-xx+invalid,looy,**options)
     assert np.isnan(bad['baseline_rg_covariance']).all()
     assert np.isnan(bad['orthogonal_rg_covariance']).all()
+
+
+def test_general_delta_function_includes_covariance_between_numerator_and_denominator():
+    from summit.context.cross_trait_uncertainty import paired_delta_covariances
+    from summit.context.annotations import _jackknife_covariance
+    rng=np.random.default_rng(50);point=np.array([2.,3.]);deleted=point+rng.normal(size=(20,2))*.01
+    result=paired_delta_covariances(lambda a:dict(ratio=a[...,0]/a[...,1]),point,deleted)
+    jac=np.array([1/3,-2/9])
+    expected=jac@_jackknife_covariance(deleted)@jac
+    np.testing.assert_allclose(result['ratio'],[[expected]],rtol=1e-14)

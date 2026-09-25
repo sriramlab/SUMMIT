@@ -2,6 +2,7 @@ import importlib.util
 from pathlib import Path
 from types import SimpleNamespace
 import numpy as np
+import pytest
 from summit.context.cross_trait_gram import orientation_matrix
 
 
@@ -21,7 +22,8 @@ def test_common_within_score_expansion_preserves_ordered_oracle():
     np.testing.assert_array_equal(result['block_genetic_residual'][:,0],gr)
 
 
-def test_authenticated_pilot_all_modes_end_to_end(tmp_path):
+@pytest.mark.parametrize('requested',[False,True])
+def test_authenticated_pilot_all_modes_end_to_end(tmp_path,requested):
     import json
     from summit.context.reference_zpass_cli import file_sha256
     from summit.context.cross_trait_zpass import ZMomentAccumulator,load_array_artifact
@@ -88,7 +90,8 @@ def test_authenticated_pilot_all_modes_end_to_end(tmp_path):
         for filename in (f'{name}.npz',f'{name}_common.npz'):study_files[filename]=file_sha256(chrroot/filename)
     (chrroot/'STUDY_COMPLETE.json').write_text(json.dumps(dict(passed=True,manifest_sha256=mh,files=study_files)))
     crossroot=tmp_path/'cross';crossroot.mkdir();(crossroot/'chr22').mkdir()
-    batch=CrossTraitBatch(masked,block_ids=labels,annotation_names=('common',))
+    pair_list=[(0,1),(2,0)] if requested else None
+    batch=CrossTraitBatch(masked,block_ids=labels,annotation_names=('common',),pairs=pair_list)
     list(batch.block(g.T,a[:,2:3],groups))
     batch.write(crossroot/'chr22/cross_trait_summary.npz',provenance=dict(reference_files=reference_files,
         common_only=True,genotype_traversals=1,variant_visits=m,input_sha256=hashes))
@@ -98,18 +101,28 @@ def test_authenticated_pilot_all_modes_end_to_end(tmp_path):
         master_input_sha256=hashes[str(inputs/'height_raw.npz')],execution_ledger=dict(retained_variant_visits=m)))
     output=tmp_path/'fits';output.mkdir()
     module.fit_pilot(SimpleNamespace(base=tmp_path,study_root=crossroot,z_root=zroot,output=output,
-        modes=module.MODES,chromosomes=[22],deletion_method='target_moments',uncertainty_method='delta'))
-    assert len(list(output.glob('*.npz')))==28*4
+        modes=module.MODES,chromosomes=[22],deletion_method='target_moments',uncertainty_method='delta',
+        trait_names=module.TRAITS if requested else None))
+    assert len(list(output.glob('*.npz')))==(2 if requested else 28)*4
     result,meta=load_array_artifact(output/f'{module.TRAITS[0]}__{module.TRAITS[1]}__factorized.npz',kind='summit.cross_trait.fit')
     assert result['omega_xy'].shape==(1,q,q)
     assert result['loo_h_xy'].shape==(len(labels),1,q-1,q-1)
     assert meta['genotype_traversals']==0
+    if requested:
+        assert (output/f'{module.TRAITS[2]}__{module.TRAITS[0]}__factorized.npz').exists()
+        return
     path=path.with_name('cross_trait_pilot_report.py')
     spec=importlib.util.spec_from_file_location('pilot_report',path)
     reporting=importlib.util.module_from_spec(spec);spec.loader.exec_module(reporting)
     report_output=tmp_path/'report';report_output.mkdir();reporting.report(output,report_output)
     report_manifest=json.loads((report_output/'COMPLETE.json').read_text())
     assert report_manifest['pairs']==28 and report_manifest['age_bmi_entries']==112
+    import subprocess
+    import sys
+    audit=subprocess.run([sys.executable,str(path.with_name('cross_trait_audit_pilot.py')),
+        '--repo',str(path.parents[2]),'--fits',str(output),'--report',str(report_output),
+        '--expected-blocks',str(len(labels)),'--output',str(tmp_path/'audit')],capture_output=True,text=True)
+    assert audit.returncode==0,audit.stdout+audit.stderr
     # The ordinary fitter consumes the same authenticated block products,
     # independently of the context normal equations and without genotypes.
     path=path.with_name('cross_trait_bivariate.py')

@@ -72,6 +72,7 @@ def main():
     p.add_argument('--traits',nargs='*')
     p.add_argument('--deletion-method',choices=['target_moments','legacy'],default='target_moments')
     p.add_argument('--uncertainty-method',choices=['delta','jackknife'],default='delta')
+    p.add_argument('--source-commit',help='verified commit of an immutable git-archive checkout')
     p.add_argument('--unrestored-deletions',action='store_true',
         help='reproduce raw deleted-system coefficients before study-collector mass restoration')
     p.add_argument('--diagnostics-only',action='store_true',help='publish shared per-block reference diagnostics without fitting')
@@ -113,8 +114,12 @@ def main():
         reference_same_person=same,residual_names=tuple(refcommon['residual_names'].astype(str)),expected_chromosomes=range(1,23))
     modes=[(mode,sp) for mode in ('legacy_transport','factorized','factorized_plus_residual') for sp in ('scaled','own_rows')]
     table=[];diagnostics=[];failures=[]
-    commit=subprocess.check_output(['git','rev-parse','HEAD'],cwd=ROOT,text=True).strip()
-    provenance=dict(branch=subprocess.check_output(['git','branch','--show-current'],cwd=ROOT,text=True).strip(),commit=commit,script_sha256=file_sha256(__file__),
+    commit=a.source_commit or subprocess.check_output(['git','rev-parse','HEAD'],cwd=ROOT,text=True).strip()
+    if len(commit)!=40 or any(c not in '0123456789abcdef' for c in commit):raise ValueError('invalid source commit')
+    branch='working' if a.source_commit else subprocess.check_output(['git','branch','--show-current'],cwd=ROOT,text=True).strip()
+    provenance=dict(branch=branch,commit=commit,script_sha256=file_sha256(__file__),
+        implementation_sha256={name:file_sha256(ROOT/'src/summit/context'/name) for name in
+            ('cross_trait_gram.py','fit.py','target_jackknife.py','cross_trait_uncertainty.py')},
         deletion_method=a.deletion_method,deleted_genetic_mass_restored=a.deletion_method=='legacy' and not a.unrestored_deletions,
         source_completion_sha256=completion_hashes,manifest_sha256={str(k):v for k,v in hashes.items()},
         uncertainty=a.uncertainty_method,genotype_traversals=0)
@@ -187,7 +192,7 @@ def main():
                 arrays.update({k+'_delta_covariance':v for k,v in delta.items()})
                 write_array_artifact(a.output/f'{name}__{key}.npz',kind='summit.cross_trait.within_refit',arrays=arrays,
                     provenance=dict(provenance,trait=name,mode=mode,same_person_mode=sp,input_sha256=file_sha256(inputpath),
-                        same_person_assembly='sum_chromosome_diagonals_before_Gram; frozen full-profile deletion adjustment'))
+                        same_person_assembly='sum_chromosome_diagonals_before_Gram; target mass apportionment for corrected deletions'))
                 diagnostics.append(dict(trait=name,mode=mode,same_person_mode=sp,rank=fit.rank,
                     condition_number=fit.condition_number,relative_residual=fit.relative_residual,
                     minimum_eigenvalue=fit.minimum_gram_eigenvalue,seconds=time.monotonic()-tick))

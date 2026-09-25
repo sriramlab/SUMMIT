@@ -38,6 +38,7 @@ def ordered_within_record(study):
 
 
 def fit_pilot(args):
+    traits=tuple(getattr(args,'trait_names',None) or TRAITS)
     start=time.monotonic();base=args.base;refroot=base/'shared_reference_full_20260916'
     master=base/'full_cohort_inputs_20260916/height_raw.npz'
     with np.load(master,allow_pickle=False) as z:master_rows,phi,basis_names=z['rows'],z['phi'],z['basis_names']
@@ -46,14 +47,14 @@ def fit_pilot(args):
     manifests={r:json.loads((r/'MANIFEST.json').read_text()) for r in (refroot,expanded)}
     roots={t:r for r in manifests for t in manifests[r]['traits']};roots['height_raw']=refroot
     rows={};input_hashes={};completion_hashes={}
-    for name in TRAITS:
+    for name in traits:
         r=roots[name];ip=(base/'full_cohort_inputs_20260916' if r==refroot else expanded/'inputs')/f'{name}.npz'
         digest=file_sha256(ip)
         if digest!=manifests[r]['trait_sources'][name]:raise ValueError(f'trait identity differs: {ip}')
         input_hashes[str(ip)]=digest
         with np.load(ip,allow_pickle=False) as z:
             rows[name]=np.searchsorted(master_rows,z['rows']);np.testing.assert_array_equal(master_rows[rows[name]],z['rows'])
-    refs=[];diagonals=[];cross=[];repaired=[];within={t:[] for t in TRAITS};commons={}
+    refs=[];diagonals=[];cross=[];repaired=[];within={t:[] for t in traits};commons={}
     select=np.array([[0.],[0.],[1.]])
     # Read masses from validated artifacts; no manifest key guessing.
     for ch in args.chromosomes:
@@ -66,12 +67,13 @@ def fit_pilot(args):
         data,provenance=load_array_artifact(cp,kind='summit.cross_trait.summary')
         if (provenance['reference_files']!=record['files'] or not provenance['common_only']
                 or provenance['genotype_traversals']!=1 or provenance['variant_visits']!=panel['m']
-                or tuple(data['trait_names'].astype(str))!=TRAITS):raise ValueError(f'cross-study design differs: {cp}')
+                or tuple(data['trait_names'].astype(str))!=traits):raise ValueError(f'cross-study design differs: {cp}')
         identities=lambda values:{Path(k).name:v for k,v in values.items()}
         if identities(provenance['input_sha256'])!=identities(input_hashes):
             raise ValueError('cross study input identities differ')
         np.testing.assert_array_equal(data['block_ids'],refs[-1].block_ids)
         np.testing.assert_array_equal(data['block_masses'],refs[-1].block_masses)
+        if cross:np.testing.assert_array_equal(data['pairs'],cross[0]['pairs'])
         cross.append(data);completion_hashes[str(cp)]=file_sha256(cp)
         if 'legacy_transport_exact' in args.modes:
             zp=args.z_root/f'zpass_chr{ch}.npz';z,zm=load_array_artifact(zp,kind='summit.cross_trait.z_moments')
@@ -81,10 +83,10 @@ def fit_pilot(args):
                 raise ValueError('Z pass chromosome is incomplete')
             np.testing.assert_array_equal(z['block_ids'],refs[-1].block_ids)
             repaired.append(z);completion_hashes[str(zp)]=file_sha256(zp)
-        for r0 in {roots[t] for t in TRAITS}:
+        for r0 in {roots[t] for t in traits}:
             authenticate(r0/f'chr{ch}','STUDY_COMPLETE.json',file_sha256(r0/'MANIFEST.json'))
             marker=r0/f'chr{ch}/STUDY_COMPLETE.json';completion_hashes[str(marker)]=file_sha256(marker)
-        for name in TRAITS:
+        for name in traits:
             r0=roots[name]/f'chr{ch}';study,_=load_chromosome_moments(r0/f'{name}.npz')
             study=combine_chromosome_annotations(study,select,common_name)
             within[name].append(ordered_within_record(study))
@@ -98,8 +100,12 @@ def fit_pilot(args):
     global_masses=np.asarray(manifests[refroot]['global_masses'],dtype=float)[2:3]
     for i in range(len(diagonals)):diagonals[i]=diagonals[i]*(global_masses[0]/masses[0])
     diagonal_total=sum(diagonals)
-    pair_order=[(i,i) for i in range(len(TRAITS))]+list(itertools.combinations(range(len(TRAITS)),2))
-    full_person={(i,j):same_person(diagonal_total,rows[TRAITS[i]],rows[TRAITS[j]],q=q)
+    requested=[tuple(map(int,pair)) for pair in cross[0]['pairs']]
+    if (any(i==j or min(i,j)<0 or max(i,j)>=len(traits) for i,j in requested)
+            or len({tuple(sorted(pair)) for pair in requested})!=len(requested)):
+        raise ValueError('invalid requested pair layout')
+    pair_order=[(i,i) for i in range(len(traits))]+requested
+    full_person={(i,j):same_person(diagonal_total,rows[traits[i]],rows[traits[j]],q=q)
                  for i,j in pair_order}
     repaired_blocks=[]
     if repaired:
@@ -121,7 +127,7 @@ def fit_pilot(args):
         fits={};matrices={};diagnostics={}
         pairs=pair_order
         for ix,iy in pairs:
-            x,y=TRAITS[ix],TRAITS[iy];records=[];factorization=[];shares=[]
+            x,y=traits[ix],traits[iy];records=[];factorization=[];shares=[]
             for i,ref in enumerate(refs):
                 gram=chromosome_gram(ref,diagonals[i],phi,rows[x],rows[y],global_masses=masses,
                     mode=mode,repaired_blocks=repaired_blocks[i] if repaired_blocks else None)
@@ -149,7 +155,7 @@ def fit_pilot(args):
             diagnostics[ix,iy]=dict(rank=int(fit['rank']),condition=float(fit['condition_number']))
         for ix,iy in pairs:
             if ix==iy:continue
-            x,y=TRAITS[ix],TRAITS[iy];fit=fits[ix,iy]
+            x,y=traits[ix],traits[iy];fit=fits[ix,iy]
             cohort=dict(n_x=len(rows[x]),n_y=len(rows[y]),
                 n_overlap=len(np.intersect1d(rows[x],rows[y],assume_unique=True)))
             wx=dict(omega=fits[ix,ix]['omega_xy'],loo=fits[ix,ix]['loo_omega_xy'],block_ids=fit['block_ids'])
@@ -182,9 +188,9 @@ def fit_pilot(args):
     for row in table:
         d=default[row['trait_x'],row['trait_y'],row['quantity'],row['entry']]
         row['shift_from_default_se']=(row['estimate']-d['estimate'])/d['standard_error'] if d['standard_error']>0 else np.nan
-    for ix,iy in itertools.combinations(range(len(TRAITS)),2):
+    for ix,iy in requested:
         for mode in args.modes:
-            gram_rows.append(dict(trait_x=TRAITS[ix],trait_y=TRAITS[iy],mode=mode,
+            gram_rows.append(dict(trait_x=traits[ix],trait_y=traits[iy],mode=mode,
                 normal_matrix_difference_2norm=np.linalg.norm(modes[mode][ix,iy]-modes['factorized'][ix,iy],2)))
     write_table(args.output/'pilot_estimates.tsv',table);write_table(args.output/'pilot_gram_mode_differences.tsv',gram_rows)
     shifts=[]
@@ -206,6 +212,7 @@ def main():
     for name in ('base','study-root','z-root','output'):p.add_argument('--'+name,type=Path,required=True)
     p.add_argument('--chromosomes',type=int,nargs='+',default=list(range(1,23)))
     p.add_argument('--modes',nargs='+',choices=MODES,default=list(MODES))
+    p.add_argument('--trait-names',nargs='+',help='must match the selected-trait summary names and order')
     p.add_argument('--deletion-method',choices=['target_moments','legacy'],default='target_moments')
     p.add_argument('--uncertainty-method',choices=['delta','jackknife'],default='delta')
     p.add_argument('--unrestored-deletions',action='store_true',
