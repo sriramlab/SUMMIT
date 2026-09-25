@@ -40,6 +40,18 @@ case $phase in
   exec "${run[@]}" cross_trait_refit --base "$base" --output "$output_root/within_directional" \
     --source-commit "${3:?immutable source commit required}"
   ;;
+ followup_fit)
+  # Summary loading validates every chromosome, pair order and source hash.
+  for chromosome in {1..22}; do
+    [[ -s $output_root/study/chr$chromosome/cross_trait_summary.npz ]]
+    [[ -s $output_root/study/chr$chromosome/COMPLETE.json ]]
+  done
+  mapfile -t traits < <("$python_exe" -c 'import json,sys; print("\n".join(sorted({t for p in json.load(open(sys.argv[1])) for t in p})))' "$output_root/pairs.json")
+  exec "${run[@]}" cross_trait_pilot_fit --base "$base" \
+    --study-root "$output_root/study" \
+    --z-root /u/scratch/b/bronsonj/cross_trait_20260923/pilot_fused_v3 \
+    --output "$output_root/fits_directional" --trait-names "${traits[@]}"
+  ;;
  study)
   chromosome=${3:-${SGE_TASK_ID:?chromosome required}}
   [[ $chromosome =~ ^([1-9]|1[0-9]|2[0-2])$ ]]

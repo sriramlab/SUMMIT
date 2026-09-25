@@ -118,3 +118,12 @@ order and fits the recorded pair subset; it reuses sealed within-trait
 summaries and reads no genotypes. `cross_trait_biology.py` publishes interpretable
 single-exposure and aggregate-response plots, paired biological contrasts,
 and matched external comparisons, with source tables and file hashes.
+
+`cross_trait_context_profiles.py` evaluates the saved full covariance at age
+and BMI offsets and reports paired changes in context-specific genetic rg.
+These curves complement the response-correlation plots; neither analysis
+requires another genotype traversal. `cross_trait_calibration_report.py`
+compares saved uncertainty arms, retaining undefined intervals in the
+all-replicate coverage denominator. The Hoffman follow-up launcher includes
+a `followup_fit` phase that requires all 22 chromosome summaries and completion
+markers before fitting the requested pair set under all four Gram modes.
