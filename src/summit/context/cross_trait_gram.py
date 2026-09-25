@@ -162,8 +162,10 @@ def chromosome_gram(reference, diagonal, phi, rows_x, rows_y=None, *,
 
     The target block share of D_R uses target-annotation mass. It sums back
     to the full chromosome D_R. Its only effect in factorized mode is on ell.
-    Full D_XY is frozen during jackknife; retained different-person blocks
-    receive the usual mass restoration in the downstream assembler.
+    This function returns full-mass blocks, without deleting any targets.
+    The default downstream target-moment jackknife apportions the full D_XY
+    by target annotation mass; the explicit legacy arm freezes D_XY and
+    applies the historical retained-mass restoration.
     """
     if mode not in GRAM_MODES or same_person_mode not in ('own_rows', 'scaled'):
         raise ValueError('unknown Gram or same-person mode')
@@ -264,9 +266,11 @@ def within_trait_equations(reference_chromosomes, study_chromosomes, *,
 
     The legacy/scaled arm delegates to the unchanged in-house implementation.
     Corrected arms form the full same-person Gram from the sum of chromosome
-    diagonals and retain exact study genetic/residual moments. Deletions use
-    the existing frozen-source residual-profile change relative to full data;
-    the full-data profile cannot replace the explicit full same-person Gram.
+    diagonals and retain exact study genetic/residual moments. Default
+    deletions retain directional target/source moments on full coefficient
+    units, with target-mass shares of the full same-person term. Only the
+    explicit legacy deletion method uses the historical residual profile
+    and post-fit mass restoration.
     """
     from summit.ldscore.generalized_gxe_chromosome import (
         joint_chromosome_equations, transferred_chromosome_equations)

@@ -717,3 +717,39 @@ with different ancestry and ascertainment. Exposure sets, phenotype transforms
 and SNP panels differ. Current smoking is not equated with ever smoking, and
 missing table entries are not null results. Nonsignificant height or platelet
 contrasts do not establish absence of response sharing.
+
+The corrected eight-trait common-bin refit has 112 fits (28 pairs in four
+Gram modes), all independently audited. All 224 baseline comparisons (two
+baseline centerings, four modes, 28 pairs) are within one jackknife SE of
+ordinary bivariate SUMMIT; the largest discrepancy is 0.0411 SE. Maximum
+between-mode shifts are 0.0245 SE for baseline rg and 0.0151 SE for aggregate
+orthogonal-response rg. These checks concern this panel and do not establish
+unconditional uncertainty over a newly sampled reference.
+
+The exploratory lipid–DBP response correlations are positive, whereas the
+lipid–HbA1c response correlations are negative. For LDL–DBP, baseline rg is
+−0.0767 and orthogonal-response rg is 0.3571; their paired difference is
+0.4338 (95% delta interval 0.2256–0.6420). This is evidence of different
+baseline and response sharing, not proof of a single positively shared
+cardiometabolic program. Opposite loadings on one latent factor remain
+compatible with opposite-signed correlations. The planned glucose comparisons
+test whether the HbA1c pattern extends to a direct glycaemic measure.
+
+`cross_trait_calibration_report.py --legacy <old-replicates.tsv> --corrected
+<new-replicates.tsv> --output <new-directory>` compares both uncertainty
+methods, finite-interval counts, coverage over all draws, conditional coverage,
+and Monte Carlo intervals. Correcting the deletion equations improves the
+original simulation's nonlinear jackknife as well as its delta SEs; the gain
+must not be attributed solely to a change of propagation method.
+
+`cross_trait_context_profiles.py --fits <fit-directory> --output <new-directory>`
+reports fitted genetic correlation across age and BMI offsets from each
+trait's own context mean, on the master-standardized scale. Other contexts
+stay at their means. Both the curves and paired endpoint contrasts use the
+full coefficient covariance; shaded curve intervals are pointwise, not
+simultaneous. These are cross-sectional model implications, not observed
+longitudinal trajectories or causal intervention effects. Positive response
+rg does not require total genetic rg to increase with age: the latter also
+depends on baseline–response covariance and changing genetic variances.
+Out-of-range moment ratios are kept in numerical tables and explicitly
+flagged in figures rather than clipped into admissible correlations.

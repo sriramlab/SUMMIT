@@ -227,9 +227,10 @@ def plot(output,rows,external):
     for ax in axes:
         ax.axvline(0,color='#aaaaaa',lw=.7);ax.grid(axis='x',alpha=.15);ax.spines[['top','right']].set_visible(False)
     axes[0].set_xlabel('Genetic correlation');axes[1].set_xlabel('Orthogonal-response rg − baseline rg')
-    axes[0].set_title('Baseline and aggregate response sharing',loc='left');axes[1].set_title('Paired difference',loc='left')
+    axes[0].set_title('Baseline and aggregate response sharing',loc='left',pad=28);axes[1].set_title('Paired difference',loc='left',pad=28)
     axes[0].legend(handles=[Line2D([],[],color=colors[k],marker='o',ls='',label=l) for k,l in
-        [('baseline_rg','Baseline'),('orthogonal_rg','Baseline-orthogonal response')]],loc='lower right',fontsize=8,frameon=False)
+        [('baseline_rg','Baseline'),('orthogonal_rg','Baseline-orthogonal response')]],
+        loc='lower left',bbox_to_anchor=(0,1.002),ncol=2,fontsize=8,frameon=False)
     fig.text(.02,-.025,'Exploratory common-bin fits. Bars: nominal 95% delta intervals. Blue differences: BH FDR < 0.05 across displayed pairs.',fontsize=8)
     fig.tight_layout();save(fig,'baseline_and_orthogonal_response')
     # Same-exposure response slopes are the immediate single-exposure analog.
@@ -239,13 +240,27 @@ def plot(output,rows,external):
         for i,(x,y) in enumerate(pairs):
             r=index[x,y,'response_rg',e];base=index[x,y,'baseline_rg',0]
             if np.isfinite(r['estimate']) and np.isfinite(r['delta_se']):
-                ax.errorbar(r['estimate'],i,xerr=1.96*r['delta_se'],fmt='o',ms=3,color='#009E73',lw=.8)
+                value=r['estimate'];low,high=value-1.96*r['delta_se'],value+1.96*r['delta_se']
+                left,right=-1.2,1.2
+                if max(left,low)<=min(right,high):
+                    ax.hlines(i,max(left,low),min(right,high),color='#009E73',lw=.8)
+                if left<=value<=right:
+                    ax.plot(value,i,'o',ms=3,color='#009E73')
+                else:
+                    boundary=left if value<left else right
+                    ax.plot(boundary,i,'<' if value<left else '>',ms=5,color='#009E73',clip_on=False)
+                    ax.text(boundary+(.06 if value<left else -.06),i-.18,f'{value:.2f}',
+                        ha='left' if value<left else 'right',fontsize=6,color='#007554')
+                if low<left:ax.plot(left,i,'<',ms=4,color='#009E73',clip_on=False)
+                if high>right:ax.plot(right,i,'>',ms=4,color='#009E73',clip_on=False)
                 ax.plot(base['estimate'],i,'|',color='#777777',ms=7)
             else:ax.text(.02,i,'undefined',transform=ax.get_yaxis_transform(),fontsize=6,color='#777777')
         ax.axvline(0,color='#bbbbbb',lw=.7);ax.set_title(title);ax.set_xlabel('Response-slope rg');ax.spines[['top','right']].set_visible(False)
+        ax.set_xlim(-1.2,1.2);ax.set_xticks([-1,-.5,0,.5,1]);ax.grid(axis='x',alpha=.12)
     axes[0].set_yticks(range(len(pairs)),labels,fontsize=8);axes[0].invert_yaxis()
     fig.text(.02,-.025,'Green: same-exposure slope correlation (no baseline orthogonalization); grey tick: baseline rg.\n'
-        'Nominal 95% delta intervals. Undefined denominators are labeled; out-of-range estimates are retained.',fontsize=8)
+        'Nominal 95% delta intervals. Triangles mark off-scale intervals or estimates; off-scale point values are printed.\n'
+        'Undefined denominators are labeled. Full untruncated estimates and intervals are in the source table.',fontsize=8)
     fig.tight_layout();save(fig,'single_exposure_response_correlations')
     pilot=list(LABELS)[:8];matrix=np.full((8,8),np.nan)
     for (x,y) in pairs:
@@ -253,19 +268,29 @@ def plot(output,rows,external):
             i,j=pilot.index(x),pilot.index(y)
             matrix[i,j]=index[x,y,'age_bmi_rg',0]['estimate']
             matrix[j,i]=index[x,y,'bmi_age_rg',0]['estimate']
-    fig,ax=plt.subplots(figsize=(7,6));cmap=plt.get_cmap('RdBu_r').copy();cmap.set_bad('#eeeeee')
-    limit=max(1,float(np.nanmax(abs(matrix)))) if np.isfinite(matrix).any() else 1
-    im=ax.imshow(matrix,cmap=cmap,vmin=-limit,vmax=limit)
+    fig,ax=plt.subplots(figsize=(9,8));cmap=plt.get_cmap('RdBu_r').copy();cmap.set_bad('#eeeeee')
+    # Unconstrained moment ratios outside [-1,1] are retained in the table,
+    # but must not look like stronger biological correlations in a heatmap.
+    displayed=np.where(abs(matrix)<=1,matrix,np.nan)
+    im=ax.imshow(displayed,cmap=cmap,vmin=-1,vmax=1)
     for i in range(8):
         for j in range(8):
-            if np.isfinite(matrix[i,j]):ax.text(j,i,f'{matrix[i,j]:.2f}',ha='center',va='center',fontsize=7)
+            if np.isfinite(matrix[i,j]):
+                label=f'{matrix[i,j]:.2f}'
+                if abs(matrix[i,j])>1:
+                    label='unstable\n'+label
+                    from matplotlib.patches import Rectangle
+                    ax.add_patch(Rectangle((j-.5,i-.5),1,1,facecolor='none',edgecolor='#cccccc',hatch='///',lw=0))
+                ax.text(j,i,label,ha='center',va='center',fontsize=8)
     ax.set_xticks(range(8),[LABELS[t] for t in pilot],rotation=45,ha='right')
     ax.set_yticks(range(8),[LABELS[t] for t in pilot])
     ax.set_xlabel('Trait with BMI response');ax.set_ylabel('Trait with age response')
     ax.set_title('Age response of one trait versus BMI response of another\nBoth responses orthogonal to their own baseline',loc='left')
     fig.colorbar(im,ax=ax,fraction=.045,pad=.04,label='Response correlation')
-    fig.text(.02,-.07,'Ordered cross-exposure correlations need not be symmetric. Grey diagonal: within-trait entries omitted.\n'
-        'Exploratory common-bin estimates; intervals and paired asymmetry tests are in biological_contrasts.tsv.',fontsize=8)
+    fig.subplots_adjust(left=.20,right=.88,bottom=.25,top=.86)
+    fig.text(.02,.015,'Ordered cross-exposure correlations need not be symmetric. Grey diagonal: within-trait entries omitted.\n'
+        'Hatched cells: inadmissible moment ratios outside [−1, 1]; do not interpret these as correlations.\n'
+        'Exploratory common-bin estimates; full intervals and paired asymmetry tests are in biological_contrasts.tsv.',fontsize=8)
     save(fig,'age_bmi_ordered_response')
     if external:
         fig,ax=plt.subplots(figsize=(8,max(3,len(external)*.5)))
@@ -275,8 +300,8 @@ def plot(output,rows,external):
                     ax.errorbar(row[prefix+'_rg'],i+offset,xerr=1.96*row[prefix+'_se'],fmt='o',ms=4,color=color,capsize=2)
         ax.set_yticks(range(len(external)),[f"{LABELS[r['trait_x']]} – {LABELS[r['trait_y']]} | {r['exposure']} | {r['cohort']}" for r in external])
         ax.invert_yaxis();ax.axvline(0,color='#aaaaaa',lw=.7);ax.set_xlabel('Single-exposure response rg, nominal 95% interval')
-        ax.legend(handles=[Line2D([],[],marker='o',ls='',color=c,label=l) for c,l in [('#D55E00','Namba et al.'),('#0072B2','SUMMIT')]],frameon=False)
-        ax.set_title('External single-exposure comparison',loc='left');ax.spines[['top','right']].set_visible(False)
+        ax.legend(handles=[Line2D([],[],marker='o',ls='',color=c,label=l) for c,l in [('#D55E00','Namba et al.'),('#0072B2','SUMMIT')]],frameon=False,loc='lower left',bbox_to_anchor=(0,1.01),ncol=2)
+        ax.set_title('External single-exposure comparison',loc='left',pad=32);ax.spines[['top','right']].set_visible(False)
         fig.text(.01,-.10,'UKB comparisons overlap samples; BBJ differs in ancestry and ascertainment. Exposure sets, transformations and SNP panels differ.\n'
             'Namba Table S22 contains significant entries only. This is a concordance check, not an independent replication test.',fontsize=8)
         save(fig,'namba_single_exposure_comparison')
