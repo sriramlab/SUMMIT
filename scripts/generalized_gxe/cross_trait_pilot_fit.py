@@ -16,6 +16,7 @@ ROOT=Path(__file__).resolve().parents[2]
 sys.meta_path[:]=[f for f in sys.meta_path if type(f).__module__!='_gwldcore_editable']
 sys.path[:0]=[str(ROOT/'src'),str(ROOT/'scripts/generalized_gxe')]
 import numpy as np
+from summit.context.cross_trait_uncertainty import derived_uncertainty
 from summit.context.cross_trait_gram import chromosome_gram,orientation_matrix,same_person
 from summit.context.cross_trait_fit import CrossTraitMomentPlan,fit_cross_trait,write_cross_trait_fit,cross_trait_derived
 from summit.context.cross_trait_zpass import load_array_artifact,repair_single_annotation
@@ -112,7 +113,8 @@ def fit_pilot(args):
         chromosomes=list(args.chromosomes),annotation=refs[0].annotation_names[0],
         context_metric='master cohort population covariance',genotype_traversals=0,
         same_person_assembly='sum_chromosome_diagonals_before_Gram; frozen full-profile deletion adjustment',
-        deleted_genetic_mass_restored=not getattr(args,'unrestored_deletions',False),
+        deletion_method=args.deletion_method,uncertainty_method=args.uncertainty_method,
+        deleted_genetic_mass_restored=args.deletion_method=='legacy' and not getattr(args,'unrestored_deletions',False),
         interpretation='exploratory common-bin-only model; omitted lower-frequency effects may confound estimates',
         prespecified_hypothesis='Shared age-BMI response direction in lipid-glycaemic-BP cluster; absent in height and platelets')
     for mode in args.modes:
@@ -139,8 +141,8 @@ def fit_pilot(args):
                 previous_rr,previous_rhs=rr,rrhs;record['gram']=gram;records.append(record)
             plan=CrossTraitMomentPlan(records,residual_gram=rr,residual_rhs=rrhs,num_basis=q,
                 annotation_names=refs[0].annotation_names,reference_n=n,n_x=len(rows[x]),n_y=len(rows[y]),
-                full_same_person=full_person[ix,iy])
-            fit=fit_cross_trait(plan,restore_mass=not getattr(args,'unrestored_deletions',False))
+                full_same_person=full_person[ix,iy],deletion_method=args.deletion_method)
+            fit=fit_cross_trait(plan,restore_mass=args.deletion_method=='legacy' and not getattr(args,'unrestored_deletions',False))
             fits[ix,iy]=fit;matrices[ix,iy]=plan.equations().equations.matrix
             fit.update(factorization_residual=np.concatenate(factorization),same_person_share=np.concatenate(shares),
                 basis_names=basis_names,annotation_names=np.array(refs[0].annotation_names))
@@ -155,27 +157,31 @@ def fit_pilot(args):
             kwargs=dict(mean_x=phi[rows[x],1:].mean(0),mean_y=phi[rows[y],1:].mean(0),context_covariance=s)
             write_cross_trait_fit(args.output/f'{x}__{y}__{mode}.npz',fit,
                 provenance=dict(provenance,gram_mode=mode,trait_x=x,trait_y=y,
-                    reference_n=n,**cohort),within_x=wx,within_y=wy,**kwargs)
+                    reference_n=n,**cohort),within_x=wx,within_y=wy,uncertainty_method=args.uncertainty_method,**kwargs)
             point=cross_trait_derived(fit['omega_xy'],wx['omega'],wy['omega'],**kwargs)
             loo=cross_trait_derived(fit['loo_omega_xy'],wx['loo'],wy['loo'],**kwargs)
             point['omega_xy']=fit['omega_xy'];loo['omega_xy']=fit['loo_omega_xy']
+            errors=derived_uncertainty(fit['omega_xy'],wx['omega'],wy['omega'],
+                fit['loo_omega_xy'],wx['loo'],wy['loo'],method=args.uncertainty_method,**kwargs)
             for quantity in ('omega_xy','h_xy','response_rg','baseline_rg','orthogonal_rg','orthogonal_trace',
                              'orthogonal_minus_baseline_rg','response_minus_baseline_rg'):
-                se=np.sqrt((len(fit['block_ids'])-1)*np.var(loo[quantity],axis=0)).ravel()
+                covariance=fit['covariance'] if quantity=='omega_xy' else errors[quantity+'_covariance']
+                se=np.sqrt(np.maximum(0,np.diag(covariance)))
                 for j,value in enumerate(point[quantity].ravel()):
                     if quantity=='omega_xy':ex,ey=basis_names[j//q],basis_names[j%q]
                     elif quantity=='h_xy':ex,ey=basis_names[1+j//(q-1)],basis_names[1+j%(q-1)]
                     elif quantity in ('response_rg','response_minus_baseline_rg'):ex=ey=basis_names[j+1]
                     else:ex=ey='intercept' if quantity=='baseline_rg' else 'context_weighted'
                     table.append(dict(trait_x=x,trait_y=y,**cohort,mode=mode,quantity=quantity,entry=j,
-                        exposure_x=str(ex),exposure_y=str(ey),estimate=value,jackknife_se=se[j],
+                        exposure_x=str(ex),exposure_y=str(ey),estimate=value,uncertainty_method=args.uncertainty_method,standard_error=se[j],
+                        jackknife_se=np.sqrt((len(fit['block_ids'])-1)*np.var(loo[quantity],axis=0)).ravel()[j],
                         lower_95=value-1.96*se[j],upper_95=value+1.96*se[j]))
             print(json.dumps(dict(mode=mode,pair=[x,y],**diagnostics[ix,iy])),flush=True)
         modes[mode]=matrices
     default={(r['trait_x'],r['trait_y'],r['quantity'],r['entry']):r for r in table if r['mode']=='factorized'}
     for row in table:
         d=default[row['trait_x'],row['trait_y'],row['quantity'],row['entry']]
-        row['shift_from_default_se']=(row['estimate']-d['estimate'])/d['jackknife_se'] if d['jackknife_se']>0 else np.nan
+        row['shift_from_default_se']=(row['estimate']-d['estimate'])/d['standard_error'] if d['standard_error']>0 else np.nan
     for ix,iy in itertools.combinations(range(len(TRAITS)),2):
         for mode in args.modes:
             gram_rows.append(dict(trait_x=TRAITS[ix],trait_y=TRAITS[iy],mode=mode,
@@ -200,6 +206,8 @@ def main():
     for name in ('base','study-root','z-root','output'):p.add_argument('--'+name,type=Path,required=True)
     p.add_argument('--chromosomes',type=int,nargs='+',default=list(range(1,23)))
     p.add_argument('--modes',nargs='+',choices=MODES,default=list(MODES))
+    p.add_argument('--deletion-method',choices=['target_moments','legacy'],default='target_moments')
+    p.add_argument('--uncertainty-method',choices=['delta','jackknife'],default='delta')
     p.add_argument('--unrestored-deletions',action='store_true',
         help='reproduce deleted-system coefficients before the study-collector mass restoration')
     args=p.parse_args()

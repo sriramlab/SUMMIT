@@ -12,6 +12,7 @@ import numpy as np
 from .fit import ContextNormalEquations, solve_context_normal_equations
 from .annotations import _jackknife_covariance
 from .cross_trait_zpass import write_array_artifact
+from .target_jackknife import TargetMomentJackknife
 
 
 @dataclass(frozen=True)
@@ -85,7 +86,11 @@ class CrossTraitMomentPlan:
     full-data value so it cannot replace the explicit full same-person term.
     """
     def __init__(self, chromosomes, *, residual_gram, residual_rhs, num_basis,
-                 annotation_names, reference_n=0, n_x=0, n_y=0,full_same_person=None):
+                 annotation_names, reference_n=0, n_x=0, n_y=0,full_same_person=None,
+                 deletion_method='target_moments'):
+        if deletion_method not in ('target_moments', 'legacy'):
+            raise ValueError('unknown deletion method')
+        self.deletion_method=deletion_method
         self.chromosomes=tuple(chromosomes)
         if not self.chromosomes:
             raise ValueError('at least one chromosome required')
@@ -109,8 +114,21 @@ class CrossTraitMomentPlan:
         bt=sum(bs)
         self.full_cross_profile=(bt@self.rr_inverse@bt.T
             -sum(b@self.rr_inverse@b.T for b in bs)) if len(bs)>1 else np.zeros((p,p))
+        self.target_deletions=(TargetMomentJackknife(self.chromosomes,masses=self.masses,
+            same_person=self.same_person,residual_inverse=self.rr_inverse,width=self.q**2)
+            if deletion_method=='target_moments' else None)
 
     def equations(self,deleted_blocks=()):
+        if len(deleted_blocks) and self.target_deletions is not None:
+            target=self.target_deletions
+            a,h,masses=target.retained(deleted_blocks,self.rrhs)
+            b=target.full_b
+            return assemble_cross_trait_normal_equations(
+                genetic_gram=a+b@self.rr_inverse@b.T,
+                genetic_rhs=h.ravel()+b@self.rr_inverse@self.rrhs,
+                genetic_residual=b,residual_gram=self.rr,residual_rhs=self.rrhs,
+                num_basis=self.q,annotation_masses=masses,annotation_names=self.names,
+                deleted_blocks=deleted_blocks,**self.meta)
         if not np.isin(deleted_blocks,self.block_ids).all():
             raise ValueError('unknown deleted block')
         masks=[~np.isin(c['block_ids'],deleted_blocks) for c in self.chromosomes]
@@ -144,7 +162,8 @@ def cross_trait_derived(omega_xy,omega_xx,omega_yy,*,mean_x,mean_y,context_covar
     The caller supplies one common exposure covariance metric S for both
     denominators and records its cohort in provenance.
     """
-    xy=np.asarray(omega_xy,dtype=float);xx=np.asarray(omega_xx,dtype=float);yy=np.asarray(omega_yy,dtype=float)
+    dtype=np.result_type(omega_xy,omega_xx,omega_yy,np.float64)
+    xy=np.asarray(omega_xy,dtype=dtype);xx=np.asarray(omega_xx,dtype=dtype);yy=np.asarray(omega_yy,dtype=dtype)
     raw_xy,raw_xx,raw_yy=xy,xx,yy
     q=xy.shape[-1];cx=np.eye(q);cy=np.eye(q)
     cx[0,1:]=mean_x;cy[0,1:]=mean_y
@@ -162,12 +181,12 @@ def cross_trait_derived(omega_xy,omega_xx,omega_yy,*,mean_x,mean_y,context_covar
         trace=np.einsum('ij,...ji->...',s,h)
         tx=np.einsum('ij,...ji->...',s,hx);ty=np.einsum('ij,...ji->...',s,hy)
         def ratio(c,vx,vy):
-            return np.where((vx>0)&(vy>0),c/np.sqrt(vx*vy),np.nan)
+            return np.where((vx.real>0)&(vy.real>0),c/np.sqrt(vx*vy),np.nan)
         baseline=ratio(raw_xy[...,0,0],raw_xx[...,0,0],raw_yy[...,0,0])
         centered_baseline=ratio(xy[...,0,0],xx[...,0,0],yy[...,0,0])
         response=ratio(np.diagonal(xy,axis1=-2,axis2=-1)[...,1:],
                        np.diagonal(xx,axis1=-2,axis2=-1)[...,1:],np.diagonal(yy,axis1=-2,axis2=-1)[...,1:])
-        baseline_valid=(xx[...,0,0]>0)&(yy[...,0,0]>0)
+        baseline_valid=(xx[...,0,0].real>0)&(yy[...,0,0].real>0)
         orthogonal=np.where(baseline_valid,ratio(trace,tx,ty),np.nan)
     return dict(omega_centered=xy,baseline_covariance=raw_xy[...,0,0],baseline_rg=baseline,
         centered_baseline_covariance=xy[...,0,0],centered_baseline_rg=centered_baseline,
@@ -204,7 +223,11 @@ def restore_deleted_genetic_mass(coefficients, full_masses, retained_masses,
     return restored
 
 
-def fit_cross_trait(plan, *, rtol=None, restore_mass=True):
+def fit_cross_trait(plan, *, rtol=None, restore_mass=None):
+    if restore_mass is None:
+        restore_mass=plan.deletion_method=='legacy'
+    if restore_mass and plan.deletion_method!='legacy':
+        raise ValueError('target-moment deletions already use full-mass coefficient units')
     full=plan.equations();point=solve_cross_trait_normal_equations(full,rtol=rtol)
     p=full.equations.genetic_count
     loo_full=[];loo_rank=[];loo_condition=[];retained_masses=[]
@@ -226,6 +249,7 @@ def fit_cross_trait(plan, *, rtol=None, restore_mass=True):
         raw_loo_coefficients=raw_loo,loo_annotation_masses=retained_masses,
         loo_mass_restoration=plan.masses[None]/retained_masses,
         loo_genetic_mass_restored=np.array(restore_mass),
+        deletion_method=np.array(plan.deletion_method),
         residual_transform=full.residual_transform,
         loo_residual_coefficients=loo_full[:,p:]@full.residual_transform.T,
         same_person_gram=plan.same_person,
@@ -236,8 +260,62 @@ def fit_cross_trait(plan, *, rtol=None, restore_mass=True):
         loo_rank=np.asarray(loo_rank),loo_condition=np.asarray(loo_condition))
 
 
+def fit_cross_trait_rhs_batch(plan, chromosome_rhs, residual_rhs, *, rtol=None, restore_mass=None):
+    """Reuse each rank-revealed system for many phenotypes with one geometry.
+
+    Input RHS arrays append a phenotype axis to each chromosome's block_rhs.
+    The in-house solver determines rank/tolerance and retained directions;
+    its spectral solve is then applied to all right-hand sides in one GEMM.
+    """
+    if restore_mass is None:
+        restore_mass=plan.deletion_method=='legacy'
+    if restore_mass and plan.deletion_method!='legacy':
+        raise ValueError('target-moment deletions already use full-mass coefficient units')
+    rrhs=np.asarray(residual_rhs,dtype=float)
+    if rrhs.ndim!=2 or rrhs.shape[0]!=len(plan.rr) or not np.isfinite(rrhs).all():
+        raise ValueError('residual RHS must have residual-by-phenotype axes')
+    nr=rrhs.shape[1];p=len(plan.names)*plan.q**2
+    values=tuple(np.asarray(a,dtype=float) for a in chromosome_rhs)
+    if len(values)!=len(plan.chromosomes) or any(
+            a.shape!=c['block_rhs'].shape+(nr,) or not np.isfinite(a).all()
+            for a,c in zip(values,plan.chromosomes)):
+        raise ValueError('chromosome phenotype RHS axes disagree')
+    solutions=[];ranks=[];conditions=[];masses=[]
+    for deleted in [()]+[(b,) for b in plan.block_ids]:
+        eq=plan.equations(deleted);system=eq.equations
+        # The returned directions and eigenvalues implement precisely the
+        # same rank decision and spectral formula as the scalar solver.
+        solved=solve_cross_trait_normal_equations(eq,rtol=rtol)
+        u=solved.retained_directions
+        eigenvalues=np.einsum('ni,nm,mi->i',u,system.matrix,u)
+        inv=np.repeat(1/(system.annotation_masses if plan.deletion_method=='legacy'
+                        else plan.masses),plan.q**2)
+        genetic=np.zeros((p,nr));bkeep=np.zeros((p,len(plan.rr)))
+        for c,a in zip(plan.chromosomes,values):
+            take=~np.isin(c['block_ids'],deleted)
+            genetic+=a[take].sum(0).reshape(p,nr)*inv[:,None]
+            if len(deleted) and plan.deletion_method=='target_moments':
+                bkeep+=c['block_genetic_residual'][take].sum(0).reshape(p,-1)*inv[:,None]
+        if len(deleted) and plan.deletion_method=='target_moments':
+            genetic+=(plan.target_deletions.full_b-bkeep)@plan.rr_inverse@rrhs
+        rhs=np.concatenate((genetic,eq.residual_transform.T@rrhs),axis=0)
+        coefficients=u@((u.T@rhs)/eigenvalues[:,None])
+        solutions.append(coefficients.T);ranks.append(solved.rank);conditions.append(solved.condition_number)
+        masses.append(system.annotation_masses)
+    point=solutions[0];raw=np.stack(solutions[1:],axis=1);loo=raw.copy()
+    retained=np.asarray(masses[1:]);factors=plan.masses/retained
+    if restore_mass:
+        loo[:,:,:p]*=np.repeat(factors,plan.q**2,axis=1)[None]
+    return dict(omega_xy=point[:,:p].reshape(nr,-1,plan.q,plan.q),
+        loo_omega_xy=loo[:,:,:p].reshape(nr,len(plan.block_ids),-1,plan.q,plan.q),
+        raw_loo_coefficients=raw,coefficients=point,loo_coefficients=loo,
+        loo_mass_restoration=factors,rank=np.asarray(ranks),condition_number=np.asarray(conditions))
+
+
 def write_cross_trait_fit(path,fit,*,provenance,within_x=None,within_y=None,
-                          mean_x=None,mean_y=None,context_covariance=None):
+                          mean_x=None,mean_y=None,context_covariance=None,
+                          uncertainty_method='delta'):
+    from .cross_trait_uncertainty import derived_uncertainty
     arrays=dict(fit)
     if within_x is not None and within_y is not None:
         for within in (within_x,within_y):
@@ -247,11 +325,15 @@ def write_cross_trait_fit(path,fit,*,provenance,within_x=None,within_y=None,
             mean_x=mean_x,mean_y=mean_y,context_covariance=context_covariance)
         deleted=cross_trait_derived(fit['loo_omega_xy'],within_x['loo'],within_y['loo'],
             mean_x=mean_x,mean_y=mean_y,context_covariance=context_covariance)
+        uncertainty=derived_uncertainty(fit['omega_xy'],within_x['omega'],within_y['omega'],
+            fit['loo_omega_xy'],within_x['loo'],within_y['loo'],mean_x=mean_x,mean_y=mean_y,
+            context_covariance=context_covariance,method=uncertainty_method)
+        arrays.update(uncertainty)
         for name,value in point.items():
             arrays[name]=value;arrays['loo_'+name]=deleted[name]
-            if np.asarray(value).dtype.kind=='f':
-                rows=deleted[name].reshape(len(fit['block_ids']),-1)
-                arrays[name+'_covariance']=_jackknife_covariance(rows)
+        arrays.update(omega_xx=within_x['omega'],omega_yy=within_y['omega'],
+            loo_omega_xx=within_x['loo'],loo_omega_yy=within_y['loo'])
         arrays['context_covariance']=context_covariance
         arrays['mean_x']=mean_x;arrays['mean_y']=mean_y
-    write_array_artifact(path,kind='summit.cross_trait.fit',arrays=arrays,provenance=provenance)
+    write_array_artifact(path,kind='summit.cross_trait.fit',arrays=arrays,
+        provenance=dict(provenance,uncertainty_method=uncertainty_method))

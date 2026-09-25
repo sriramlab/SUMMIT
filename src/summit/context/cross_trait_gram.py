@@ -244,7 +244,8 @@ def within_trait_equations(reference_chromosomes, study_chromosomes, *,
         reference_diagonals, phi, rows, mode='factorized', same_person_mode='own_rows',
         reference_residual_gram, reference_residual_traces, reference_same_person,
         residual_gram, residual_rhs, residual_traces, residual_names,
-        deleted_blocks=(), expected_chromosomes=None, prepared_grams=None,full_same_person=None):
+        deleted_blocks=(), expected_chromosomes=None, prepared_grams=None,full_same_person=None,
+        deletion_method='target_moments'):
     """Corrected within-trait chromosome assembly, with a bit-exact old arm.
 
     The legacy/scaled arm delegates to the unchanged in-house implementation.
@@ -256,6 +257,36 @@ def within_trait_equations(reference_chromosomes, study_chromosomes, *,
     from summit.ldscore.generalized_gxe_chromosome import (
         joint_chromosome_equations, transferred_chromosome_equations)
     ref, study = tuple(reference_chromosomes), tuple(study_chromosomes)
+    if deletion_method not in ('target_moments','legacy'):
+        raise ValueError('unknown deletion method')
+    if len(deleted_blocks) and deletion_method=='target_moments':
+        from .target_jackknife import TargetMomentJackknife
+        full=within_trait_equations(ref,study,reference_diagonals=reference_diagonals,
+            phi=phi,rows=rows,mode=mode,same_person_mode=same_person_mode,
+            reference_residual_gram=reference_residual_gram,
+            reference_residual_traces=reference_residual_traces,reference_same_person=reference_same_person,
+            residual_gram=residual_gram,residual_rhs=residual_rhs,residual_traces=residual_traces,
+            residual_names=residual_names,expected_chromosomes=expected_chromosomes,
+            prepared_grams=prepared_grams,full_same_person=full_same_person,deletion_method='legacy')
+        records=[];ref_by_chr={c.chromosome:c for c in ref}
+        for c in study:
+            g=(prepared_grams[c.chromosome] if prepared_grams is not None else
+                chromosome_gram(ref_by_chr[c.chromosome],reference_diagonals[c.chromosome],phi,rows,
+                    global_masses=full.annotation_masses,mode=mode,same_person_mode=same_person_mode,ordered=False))
+            records.append(dict(block_ids=c.block_ids,block_masses=c.block_masses,
+                block_rhs=c.block_genetic_rhs,block_genetic_residual=c.block_genetic_residual,gram=g))
+        p=full.genetic_count;off=sum(c['gram'].different_person_blocks.sum(0) for c in records)
+        # Preserve the full-data matrix also in the historical scaled arm.
+        diagonal=full.matrix[:p,:p]-(off+off.T)/2
+        cinv=np.linalg.pinv(residual_gram,rcond=1e-12,hermitian=True)
+        target=TargetMomentJackknife(records,masses=full.annotation_masses,
+            same_person=diagonal,residual_inverse=cinv,width=study[0].num_basis*(study[0].num_basis+1)//2)
+        a,h,masses=target.retained(deleted_blocks,residual_rhs)
+        b=target.full_b;matrix=full.matrix.copy();rhs=full.rhs.copy()
+        matrix[:p,:p]=a+b@cinv@b.T
+        rhs[:p]=h.reshape(full.rhs[:p].shape)+(b@cinv@np.asarray(residual_rhs)).reshape(full.rhs[:p].shape)
+        return replace(full,matrix=matrix,rhs=rhs,annotation_masses=masses,
+            deleted_groups=tuple(map(str,deleted_blocks)),transferred_genetic_gram=matrix[:p,:p])
     common = dict(residual_gram=residual_gram, residual_rhs=residual_rhs,
         residual_traces=residual_traces, residual_names=residual_names,
         deleted_blocks=deleted_blocks, expected_chromosomes=expected_chromosomes)

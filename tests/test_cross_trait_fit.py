@@ -59,7 +59,7 @@ def test_mass_restored_deletions_keep_same_person_frozen():
     record=dict(block_ids=blocks,block_masses=mass,block_rhs=np.arange(4.)[:,None,None,None]+1,
         block_genetic_residual=np.zeros((4,1,1,0)),gram=ChromosomeGram(off,d,{}))
     plan=CrossTraitMomentPlan([record],residual_gram=np.empty((0,0)),residual_rhs=np.empty(0),
-        num_basis=q,annotation_names=('all',))
+        num_basis=q,annotation_names=('all',),deletion_method='legacy')
     full=plan.equations();deleted=plan.equations((2,))
     assert full.equations.matrix[0,0]==21
     np.testing.assert_allclose(deleted.equations.matrix[0,0],7+10*(100/70)**2,rtol=1e-15)
@@ -106,7 +106,7 @@ def test_uniform_deletion_exposes_frozen_diagonal_center_drift(nblocks):
         block_genetic_residual=np.broadcast_to((b*mass/nblocks)[None,None],(nblocks,1,p,2)),
         gram=ChromosomeGram(np.broadcast_to((genetic-d)/nblocks,(nblocks,p,p)),d,{}))
     plan=CrossTraitMomentPlan([record],residual_gram=rr,residual_rhs=rrhs,
-        num_basis=q,annotation_names=('all',))
+        num_basis=q,annotation_names=('all',),deletion_method='legacy')
     full=solve_cross_trait_normal_equations(plan.equations()).coefficients[:p]
     eq=plan.equations((0,));matrix=eq.equations.matrix
     profile=matrix[:p,:p]-matrix[:p,p:]@np.linalg.solve(matrix[p:,p:],matrix[p:,:p])
@@ -160,4 +160,4 @@ def test_multiple_chromosomes_use_full_diagonals_not_residual_profile_surrogate(
     assert np.linalg.norm(plan.full_cross_profile)>0.1
     np.testing.assert_array_equal(plan.same_person,same)
     with pytest.raises(ValueError,match='summed per-person'):
-        CrossTraitMomentPlan(records,residual_gram=d.T@d,residual_rhs=d.T@(y*y),num_basis=q,annotation_names=('all',))
+        CrossTraitMomentPlan(records,residual_gram=d.T@d,residual_rhs=d.T@(y*y),num_basis=q,annotation_names=('all',),deletion_method='legacy')

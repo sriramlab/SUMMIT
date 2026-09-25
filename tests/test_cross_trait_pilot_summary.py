@@ -98,7 +98,7 @@ def test_authenticated_pilot_all_modes_end_to_end(tmp_path):
         master_input_sha256=hashes[str(inputs/'height_raw.npz')],execution_ledger=dict(retained_variant_visits=m)))
     output=tmp_path/'fits';output.mkdir()
     module.fit_pilot(SimpleNamespace(base=tmp_path,study_root=crossroot,z_root=zroot,output=output,
-        modes=module.MODES,chromosomes=[22]))
+        modes=module.MODES,chromosomes=[22],deletion_method='target_moments',uncertainty_method='delta'))
     assert len(list(output.glob('*.npz')))==28*4
     result,meta=load_array_artifact(output/f'{module.TRAITS[0]}__{module.TRAITS[1]}__factorized.npz',kind='summit.cross_trait.fit')
     assert result['omega_xy'].shape==(1,q,q)

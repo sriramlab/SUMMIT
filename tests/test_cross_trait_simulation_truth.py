@@ -43,7 +43,7 @@ def test_simulation_pipeline_small_bed(tmp_path):
         affine_mean=raw.mean(0),affine_inverse_scale=1/raw.std(0,ddof=1))
     args=SimpleNamespace(axes=axes,bed_prefix=bed,output=tmp_path/'ref',blocks=5,probes=32,
         seed=2901,threads=int(gxeldcore.build_info()['blas_runtime_threads']),memory_gib=1,width=31,
-        replicates=2,gram_mode='factorized')
+        replicates=2,gram_mode='factorized',deletion_method='target_moments',uncertainty_method='delta',unrestored_deletions=False)
     args.output.mkdir();module.reference_run(args)
     import json
     args.reference=Path(json.loads((args.output/'COMPLETE.json').read_text())['reference'])

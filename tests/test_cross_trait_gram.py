@@ -110,6 +110,6 @@ def test_legacy_within_trait_is_bit_exact_full_and_deleted():
     for deleted in ((),(1,),(0,3)):
         expected=transferred_chromosome_equations(ref,study,deleted_blocks=deleted,**options)
         got=within_trait_equations(ref,study,reference_diagonals=None,phi=None,rows=None,
-            mode='legacy_transport',same_person_mode='scaled',deleted_blocks=deleted,**options)
+            mode='legacy_transport',same_person_mode='scaled',deleted_blocks=deleted,deletion_method='legacy',**options)
         for name in ('matrix','rhs','reference_genetic_gram','transferred_genetic_gram'):
             np.testing.assert_array_equal(getattr(got,name),getattr(expected,name))

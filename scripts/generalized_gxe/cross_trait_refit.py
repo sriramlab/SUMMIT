@@ -69,6 +69,7 @@ def main():
     p=argparse.ArgumentParser(description=__doc__)
     p.add_argument('--base',type=Path,required=True);p.add_argument('--output',type=Path,required=True)
     p.add_argument('--traits',nargs='*')
+    p.add_argument('--deletion-method',choices=['target_moments','legacy'],default='target_moments')
     p.add_argument('--unrestored-deletions',action='store_true',
         help='reproduce raw deleted-system coefficients before study-collector mass restoration')
     p.add_argument('--diagnostics-only',action='store_true',help='publish shared per-block reference diagnostics without fitting')
@@ -111,8 +112,8 @@ def main():
     modes=[(mode,sp) for mode in ('legacy_transport','factorized','factorized_plus_residual') for sp in ('scaled','own_rows')]
     table=[];diagnostics=[];failures=[]
     commit=subprocess.check_output(['git','rev-parse','HEAD'],cwd=ROOT,text=True).strip()
-    provenance=dict(branch='feat/cross-trait-response-covariance',commit=commit,script_sha256=file_sha256(__file__),
-        deleted_genetic_mass_restored=not a.unrestored_deletions,
+    provenance=dict(branch=subprocess.check_output(['git','branch','--show-current'],cwd=ROOT,text=True).strip(),commit=commit,script_sha256=file_sha256(__file__),
+        deletion_method=a.deletion_method,deleted_genetic_mass_restored=a.deletion_method=='legacy' and not a.unrestored_deletions,
         source_completion_sha256=completion_hashes,manifest_sha256={str(k):v for k,v in hashes.items()},
         uncertainty='paired 200-block frozen-source mass-restored deletion; frozen same-person',genotype_traversals=0)
     # These reference diagnostics do not depend on the trait mask or fit mode.
@@ -149,18 +150,18 @@ def main():
         for mode,sp in modes:
             key=f'{mode}__{sp}';tick=time.monotonic()
             try:
-                prepared=None if (mode,sp)==('legacy_transport','scaled') else {
+                prepared=None if (mode,sp)==('legacy_transport','scaled') and a.deletion_method=='legacy' else {
                     c.chromosome:chromosome_gram(c,diagonals[c.chromosome],phi,rows,global_masses=masses,
                         mode=mode,same_person_mode=sp,ordered=False) for c in ref}
                 def eq(deleted=()):
                     return within_trait_equations(ref,study,reference_diagonals=None,phi=phi,rows=rows,
-                        mode=mode,same_person_mode=sp,prepared_grams=prepared,deleted_blocks=deleted,
+                        mode=mode,same_person_mode=sp,prepared_grams=prepared,deleted_blocks=deleted,deletion_method=a.deletion_method,
                         full_same_person=own_same if sp=='own_rows' else len(rows)/ref[0].n_samples*same,**options,**common)
                 full=eq();fit=solve_context_normal_equations(full)
                 deleted_equations=[eq((b,)) for b in blocks]
                 raw_loo=np.array([solve_context_normal_equations(e).coefficients for e in deleted_equations])
                 retained=np.array([e.annotation_masses for e in deleted_equations])
-                loo=(raw_loo.copy() if a.unrestored_deletions else
+                loo=(raw_loo.copy() if a.unrestored_deletions or a.deletion_method!='legacy' else
                      restore_deleted_genetic_mass(raw_loo,masses,retained,len(ContextPairIndex(q))))
                 omega=coefficients_to_omegas(fit.coefficients[:len(components)],components)
                 loomega=np.array([coefficients_to_omegas(row[:len(components)],components) for row in loo])
@@ -170,7 +171,7 @@ def main():
                     covariance=_jackknife_covariance(loo),normal_matrix=full.matrix,normal_rhs=full.rhs,
                     raw_loo_coefficients=raw_loo,loo_annotation_masses=retained,
                     loo_mass_restoration=masses[None]/retained,
-                    loo_genetic_mass_restored=np.array(not a.unrestored_deletions),
+                    loo_genetic_mass_restored=np.array(a.deletion_method=='legacy' and not a.unrestored_deletions),
                     same_person_gram=own_same if sp=='own_rows' else len(rows)/ref[0].n_samples*same,
                     block_ids=blocks,environment_mean=mean,environment_covariance=s)
                 write_array_artifact(a.output/f'{name}__{key}.npz',kind='summit.cross_trait.within_refit',arrays=arrays,
