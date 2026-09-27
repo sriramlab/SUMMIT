@@ -4,8 +4,8 @@ This follow-up checks whether the remaining qualification failures identify an
 implementation error, and removes redundant work in the binary reference path.
 It follows [the first jackknife audit](pcgc_jackknife_audit.md). New outputs are
 under `/data1/bronsonj/summit_pcgc_second_audit_20260926/`; earlier results remain
-unchanged. The existing SNP deletion equations and experimental SE gate are
-unchanged in this pass.
+unchanged. The SNP deletion equations were unchanged in this audit. A later
+[interface review](pcgc_interface_audit.md) removed the experimental SE gate.
 
 The subsequent [release validation](pcgc_release_validation.md) extends the
 corrected-jackknife comparison to the other binary modes and annotation

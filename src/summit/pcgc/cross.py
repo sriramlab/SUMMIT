@@ -120,5 +120,5 @@ def fit_pair(pair, *, block_ids=None):
                       finite_ratio_deletions=int(np.isfinite(correlation(deleted)["rg"]).sum()),
                       jackknife_method=fits[2]['jackknife_method'],
                       uncertainty_conditioning=fits[2]['uncertainty_conditioning'],
-                      uncertainty_status="experimental_unqualified")
+                      uncertainty_status=fits[2]['uncertainty_status'])
     return result

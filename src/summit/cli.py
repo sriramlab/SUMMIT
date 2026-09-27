@@ -624,7 +624,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     # SE / jackknife
     parser.add_argument("--njack", default="chr", type=str, help=(
-        "Jackknife scheme for LD-score input.\n"
+        "Jackknife scheme for LD-score input (default: chr). "
+        "Binary inference instead defaults to 200 contiguous SNP blocks and accepts integer counts >=2.\n"
         "  * integer (e.g., 1000): contiguous SNP blocks\n"
         "  * 'chr'               : LOCO delete-1\n"
         "  * 'chr:d'             : delete-d LOCO over chromosomes\n"
@@ -2775,7 +2776,7 @@ def main():
     parser = build_parser()
     args = parser.parse_args()
     if any(token.split("=", 1)[0].startswith("--binary-") or
-           token.split("=", 1)[0] in {"--make-binary-sumstats", "--_binary-research"}
+           token.split("=", 1)[0] == "--make-binary-sumstats"
            for token in sys.argv[1:]):
         from .pcgc.cli import run as run_binary
         try:

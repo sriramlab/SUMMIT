@@ -54,44 +54,43 @@ This table contains `SNP` followed by weight columns, with every genotype SNP
 present exactly once. Without it, SUMMIT fits one component over all SNPs.
 
 Preparation writes `.binary.npz`; inference writes `.binary.json`. The output
-contains conditional and marginal component estimates, totals, risk diagnostics,
-and reference diagnostics. Existing output files are not overwritten.
+contains conditional and marginal component estimates and SEs, totals, risk
+diagnostics, and reference diagnostics. Existing output files are not overwritten.
 Use the same method at both stages. Changing risks, prevalence, or the sample
 selection requires preparing new moments.
 
 ## Choose a method
 
-| Flag value | Use | Availability |
+| Flag value | Use | Main condition |
 |---|---|---|
-| `pcgc` | Individual risk weights in scores and the study reference | Point estimates and SNP-block jackknife SEs |
-| `liability` | Constant population risk; scalar liability conversion | Point estimates and SNP-block jackknife SEs |
-| `pcgc-basis` | Supplied basis and coefficients that exactly reproduce the risk sensitivity | Point estimates and SNP-block jackknife SEs |
-| `pcgc-inverse` | Inverse risk weighting with an unweighted genotype reference | Requires `--binary-research` |
-| `pcgc-ld` | Transfer from an independent population LD reference | Requires `--binary-research` |
+| `pcgc` | Individual risk weights in scores and the study reference | Exogenous risk covariates and population genotype scaling |
+| `liability` | Constant population risk; scalar liability conversion | Constant population risk |
+| `pcgc-basis` | Supplied basis and coefficients that exactly reproduce the risk sensitivity | Exact sensitivity span |
+| `pcgc-inverse` | Inverse risk weighting with an unweighted genotype reference | Inverse weights must have finite variance |
+| `pcgc-ld` | Transfer from an independent population LD reference | Matched reference and valid risk/genotype factorization |
 
 `pcgc-basis` takes `--binary-basis-columns` and
 `--binary-basis-coefficients`. An exact span gives the same moments as `pcgc`;
 arbitrary risk binning is not an exact span. `pcgc-ld` additionally needs
 `--binary-reference-geno`. Its factorization can fail when risk weights and
 genotypes are dependent after ascertainment. Inverse weighting can be unstable
-with strong continuous risk factors. Neither research method is automatically
+with strong continuous risk factors. Neither method is automatically
 selected from the data.
 
 ## Standard errors and interpretation
 
-All five methods implement SNP-block jackknife SEs for annotation components
-and totals. The corrected scaling and per-SNP diagonal subtraction are tested
-against independent equations. The CLI currently requires `--binary-research`
-when requesting SEs with `--njack`; this is a qualification restriction on
-the public interface. It was retained because some simulation settings did
-not pass the prespecified calibration screens.
+All five methods report SNP-block jackknife SEs for annotation components
+and totals by default. Binary inference uses 200 contiguous SNP blocks. Set
+`--njack` to another integer of at least two when needed for the SNP count
+and LD structure; it cannot exceed the number of SNPs. The HE/LDSC default
+remains chromosome deletion (`chr`). No research flag is needed.
 
-To obtain estimates and SEs:
+For example, to use 100 blocks:
 
 ```bash
-summit --binary-method pcgc --binary-research \
-  --h2 results/trait_pcgc.binary.npz --njack 50 \
-  --out results/trait_pcgc_jackknife
+summit --binary-method pcgc \
+  --h2 results/trait_pcgc.binary.npz --njack 100 \
+  --out results/trait_pcgc_100_blocks
 ```
 
 The jackknife removes target SNP blocks and retains the full source reference.
@@ -99,8 +98,9 @@ An integer block count divides the saved variant order into contiguous groups.
 Use genotypes ordered by chromosome and position, with blocks large enough
 to contain local LD.
 It holds the risk fit, prevalence, population scales, and reference probes fixed.
-It therefore excludes uncertainty in those quantities. Old schema-1 artifacts
-support point estimates only; regenerate them to obtain corrected uncertainty.
+It therefore excludes uncertainty in those quantities. Regenerate old schema-1
+artifacts before CLI inference: they lack the per-SNP diagonal corrections
+needed for SEs. Current preparation writes schema 2.
 
 Conditional genetic variance is measured relative to liability variance after
 the covariate predictor, fixed at one. Marginal estimates divide by
@@ -110,10 +110,11 @@ each annotation's SNP set in isolation.
 
 The model assumes case-status sampling, exogenous risk covariates, and a
 compatible population genotype scale. It does not implement ancestry adjustment
-by ordinary covariate projection. Calibration is setting-dependent; research
-status is retained for binary uncertainty. The
-[qualification reports](../pcgc_release_validation.md) give the tested settings
-and distinguish numerical agreement from statistical calibration.
+by ordinary covariate projection. The [validation report](../pcgc_release_validation.md)
+gives calibration results and their Monte Carlo intervals. The [interface review](../pcgc_interface_audit.md)
+explains why the earlier screening thresholds no longer restrict SE reporting.
+The upstream PCGC and S-PCGC implementations use different deletion rules;
+SUMMIT is not an end-to-end replica of either package.
 
 ## Computation and cross-trait work
 

@@ -5,6 +5,7 @@ from dataclasses import dataclass
 import numpy as np
 
 from summit.context.oracle import symmetric_rank_diagnostics
+from summit.context.annotations import _jackknife_covariance
 from summit.ldscore.generalized_gxe_reference_v1 import reduce_generalized_gxe_reference_for_inference
 from summit.sumstats.binary import finite_array, readonly
 
@@ -184,11 +185,11 @@ def fit_moments(moments, *, block_ids=None):
             H = moments.n_samples**2 * dr / np.outer(retained, mass)
             loo.append(solve(H, (raw_rhs - br) / retained, deletion=True)[0])
         loo = np.asarray(loo)
-        centered = loo - loo.mean(axis=0)
-        covariance = (count - 1) / count * centered.T @ centered
+        covariance = _jackknife_covariance(loo)
         result.update({
-            "uncertainty_status": "experimental_unqualified",
+            "uncertainty_status": "estimated",
             "jackknife_method": FROZEN_JACKKNIFE,
+            "jackknife_blocks": count,
             "conditional_jackknife_covariance": covariance.tolist(),
             "marginal_jackknife_covariance": (covariance/(1+moments.covariate_variance)**2).tolist(),
             "conditional_standard_errors": np.sqrt(np.maximum(0, covariance.diagonal())).tolist(),

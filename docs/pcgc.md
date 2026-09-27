@@ -8,18 +8,16 @@ defines the staged qualification protocol.
 For commands and input formats, start with
 [Binary traits and PCGC](wiki/Binary-traits-and-PCGC.md).
 
-All five binary methods implement point estimates and SNP-block jackknife
-SEs under the contract below. The CLI accepts `liability`, `pcgc`, and exact
-`pcgc-basis` point estimates without a research flag. Requesting jackknife SEs
-with `--njack` currently requires `--binary-research`; inverse weighting and
-external-LD transfer also require that flag for point estimates. These are
-public-interface qualification restrictions. The corrected jackknife is
-implemented and tested across methods and annotation components. The
-[release validation](pcgc_release_validation.md) checks the corrected jackknife
-across methods. The [initial qualification report](pcgc_qualification.md)
-records the original point-estimate comparisons. Algebraic
-agreement, a successful native run and statistical calibration are different
-requirements. The quantitative command's defaults do not change.
+All five binary methods report point estimates and SNP-block jackknife SEs
+for components and totals. Binary inference defaults to 200 contiguous SNP
+blocks; `--njack` selects another integer count of at least two. No research
+flag is required. The quantitative command's defaults are unchanged.
+
+The [interface and calibration review](pcgc_interface_audit.md) explains the
+upstream comparison, the block count, and why the earlier qualification screen
+no longer controls SE availability. The [release validation](pcgc_release_validation.md)
+retains the measured calibration results across methods. These results do not
+establish calibration outside the tested sampling and risk models.
 
 The [second uncertainty and scaling audit](pcgc_second_audit.md) compares the
 actual upstream jackknife routines, checks the expected jackknife covariance
@@ -143,9 +141,9 @@ summit --binary-method pcgc \
 summit --binary-method pcgc \
   --h2 study_pcgc.binary.npz --out study_pcgc_fit
 
-# Optional research uncertainty, with a separate output prefix:
-summit --binary-method pcgc --binary-research \
-  --h2 study_pcgc.binary.npz --njack 50 --out study_pcgc_jackknife
+# Choose a different block count when appropriate for the analyzed region:
+summit --binary-method pcgc \
+  --h2 study_pcgc.binary.npz --njack 100 --out study_pcgc_100_blocks
 ```
 
 Use `--binary-risk-column RISK` instead of `--binary-covariates` for supplied
@@ -155,7 +153,9 @@ use `SNP` plus nonnegative weight columns. `pcgc-basis` additionally takes
 takes `--binary-reference-geno` pointing to an independent population sample.
 
 Preparation writes a single `.binary.npz` joint reference/trait artifact;
-inference writes `.binary.json`. The archive records variant/allele axes,
+inference writes `.binary.json` with component and total estimates, SEs,
+jackknife covariance, block sizes, and conditioning metadata. The archive
+records variant/allele axes,
 annotation names, sample/risk/scale identities, prevalence, sample fraction,
 method, scientific contract, probe specification, native build, feature
 identity and numeric checksums. This initial format is
@@ -189,8 +189,10 @@ The previous PCGC implementation incorrectly applied retained masses on both
 axes and subtracted the full same-person matrix in each deletion. The current
 two-pass adapter accumulates per-SNP diagonal corrections, stores only corrected
 LD rows, and discards the temporary diagonal rows. Reference estimation still
-has no block IDs. Legacy schema-1 artifacts remain readable for point estimates;
-corrected uncertainty requires regeneration as schema 2. Generalized GxE's
+has no block IDs. Legacy schema-1 artifacts remain readable through the Python
+point-estimate API.
+CLI inference requires regeneration as schema 2 because those old archives lack
+the per-SNP diagonal corrections needed for SEs. Generalized GxE's
 separate deletion contract and implementation are unchanged.
 
 SNP blocks do not remove people or change case fraction, risk covariates, or the
@@ -201,14 +203,21 @@ nuisance-model uncertainty, or independent reference/probe Monte Carlo error.
 Use comparable, sufficiently large contiguous genomic blocks; block sizes are
 reported. The ordinary equal-group jackknife variance formula is used.
 
-Without an explicit `--njack`, no uncertainty is manufactured. With it, the
-current CLI supports an integer block count and labels uncertainty experimental.
-Neither this method nor a passing point-estimate screen automatically provides
-calibrated inference for estimated risks, uncertain prevalence, arbitrary small
-references, rare-trait inverse weighting, population structure or overlapping
-binary studies. Those are separate qualification boundaries.
+CLI inference always computes SEs. The default is 200 blocks; fewer than 200
+SNPs require an explicit smaller `--njack`. Chromosome and delete-d schemes
+are not exposed for binary inference. Choose blocks large enough to contain
+local LD. The 50-block validation design used 4,000 SNPs with 40-SNP LD blocks;
+Each of the 50 deletion groups contained two complete LD blocks. It was not a
+production default. Reference preparation is independent of this choice.
 
-There is also an analytic reason to restrict inverse weighting. At the null,
+Block membership comes from `JackknifeSpec` and `JackknifeDesign`. Annotation
+reduction reuses the generalized reference reducer, and covariance uses the
+same equal-block helper as contextual and cross-trait inference. The
+chromosome module's unequal-unit pseudovalue calculation is a different
+scheme and is not substituted for this SNP-block covariance. The low-level
+`fit_moments` API can still omit `block_ids` for point-only numerical checks.
+
+Inverse weighting has an additional statistical limitation. At the null,
 `Var(z/d | C, sampled) = 1/d(C)^2`. For a Gaussian population covariate
 `C ~ N(0,1)` and risk predictor `eta = gamma*C-t`, the lower-tail contribution
 to its unconditional second moment is proportional to
@@ -251,7 +260,7 @@ the unprojected features and does not change generalized GxE calculations.
 Bivariate APIs remain research-only. There is no binary `--rg` dispatch or
 public bivariate artifact contract. The optional uncertainty
 uses the existing paired delta calculation on common frozen block deletions;
-it retains its experimental status even when a particular scenario passes.
+its assumptions and fixed-nuisance conditioning are the same as above.
 
 The reproducible research drivers are:
 

@@ -1,7 +1,6 @@
-"""Development CLI for typed binary preparation and inference."""
+"""CLI for typed binary preparation and SNP-block jackknife inference."""
 from __future__ import annotations
 
-import argparse
 from contextlib import ExitStack
 from pathlib import Path
 from types import SimpleNamespace
@@ -17,6 +16,8 @@ from summit.sumstats.binary import fit_binary_risk, prepare_binary_risk
 from .artifacts import load_artifact, write_artifact
 from .genotype import prepare_from_source
 from .moments import fit_moments
+
+DEFAULT_BINARY_NJACK = 200
 
 
 def add_arguments(parser):
@@ -37,9 +38,6 @@ def add_arguments(parser):
     group.add_argument("--binary-block-size", type=int, default=256)
     group.add_argument("--binary-basis-columns", help="Comma-separated sample-table basis columns for pcgc-basis.")
     group.add_argument("--binary-basis-coefficients", help="Comma-separated coefficients; basis must span the risk sensitivity exactly.")
-    group.add_argument("--_binary-research", action="store_true", help=argparse.SUPPRESS)
-    group.add_argument("--binary-research", action="store_true",
-                       help="Enable unqualified inverse/external-LD methods or experimental jackknife uncertainty.")
 
 
 def selected_columns(table, names):
@@ -144,17 +142,13 @@ def run(args, argv):
     allowed = {"--binary-method", "--make-binary-sumstats", "--binary-scale", "--binary-prevalence",
                "--binary-genome-build", "--binary-covariates", "--binary-risk-column", "--binary-covariate-variance",
                "--binary-probes", "--binary-seed", "--binary-memory-gib", "--binary-block-size",
-               "--binary-basis-columns", "--binary-basis-coefficients", "--binary-reference-geno", "--_binary-research", "--binary-research",
+               "--binary-basis-columns", "--binary-basis-coefficients", "--binary-reference-geno",
                "--geno", "--annot", "--out", "--h2", "--njack", "--num-threads"}
     explicit = {x.split("=", 1)[0] for x in argv if x.startswith("--")}
     if explicit-allowed:
         raise ValueError("unsupported options for the binary contract: "+", ".join(sorted(explicit-allowed)))
     if args.binary_method is None or args.out is None:
         raise ValueError("binary workflows require --binary-method and --out")
-    research = args.binary_research or args._binary_research
-    if not research and (args.binary_method in ("pcgc-inverse", "pcgc-ld") or "--njack" in explicit):
-        raise ValueError("this method or uncertainty option has not passed general qualification; use --binary-research for validation only")
-    qualification = "experimental" if research else "point_estimate_only"
     if bool(args.make_binary_sumstats) == bool(args.h2):
         raise ValueError("choose --make-binary-sumstats or --h2 with one typed binary artifact")
     prefix = Path(args.out)
@@ -167,29 +161,30 @@ def run(args, argv):
         artifact = prepare(args)
         write_artifact(artifact, output)
     else:
-        preparation_options = explicit - {"--binary-method", "--h2", "--out", "--njack", "--num-threads", "--_binary-research", "--binary-research"}
+        preparation_options = explicit - {"--binary-method", "--h2", "--out", "--njack", "--num-threads"}
         if preparation_options:
             raise ValueError("binary fit uses the sealed artifact; remove preparation options: "+", ".join(sorted(preparation_options)))
         artifact = load_artifact(args.h2)
         if args.binary_method != artifact.moments.method:
             raise ValueError("binary method disagrees with the prepared artifact; recompute raw scores/reference")
-        blocks = None
-        if "--njack" in explicit:
-            from summit.inference.jackknife import JackknifeDesign, JackknifeSpec
-            try:
-                count = int(args.njack)
-            except ValueError as exc:
-                raise ValueError("binary research jackknife requires an integer block count") from exc
-            spec = JackknifeSpec.parse(count)
-            if spec.mode != "block" or spec.nblocks < 2:
-                raise ValueError("binary research jackknife currently requires an integer block count >=2")
-            view = SimpleNamespace(nsnps=len(artifact.moments.rhs_rows))
-            blocks = JackknifeDesign.from_trace_view(view, spec).unit_id
+        from summit.inference.jackknife import JackknifeDesign, JackknifeSpec
+        # The root parser's chromosome default belongs to HE/LDSC. Binary
+        # inference uses equal-count SNP blocks and always computes uncertainty.
+        try:
+            count = int(args.njack) if "--njack" in explicit else DEFAULT_BINARY_NJACK
+        except (ValueError, TypeError) as exc:
+            raise ValueError("binary jackknife requires an integer block count >=2") from exc
+        if count < 2:
+            raise ValueError("binary jackknife requires an integer block count >=2")
+        view = SimpleNamespace(nsnps=len(artifact.moments.rhs_rows))
+        if count > view.nsnps:
+            raise ValueError(f"binary --njack ({count}) exceeds the {view.nsnps} SNPs; choose a smaller block count >=2")
+        blocks = JackknifeDesign.from_trace_view(view, JackknifeSpec.parse(count)).unit_id
         result = fit_moments(artifact.moments, block_ids=blocks)
-        result.update(kind="summit.pcgc.fit", schema_version=1, input_manifest_hash=artifact.manifest["manifest_hash"],
-                      qualification=qualification, risk=artifact.manifest["risk"],
+        result.update(kind="summit.pcgc.fit", schema_version=2, input_manifest_hash=artifact.manifest["manifest_hash"],
+                      risk=artifact.manifest["risk"],
                       annotation_names=artifact.manifest["annotation_names"], diagnostics=artifact.manifest["diagnostics"])
         output.parent.mkdir(parents=True, exist_ok=True)
         write_json(output, result)
-    print(canonical_json({"output": str(output), "method": args.binary_method, "qualification": qualification}))
+    print(canonical_json({"output": str(output), "method": args.binary_method}))
     return 0

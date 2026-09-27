@@ -22,14 +22,18 @@ def parser():
 
 
 def test_cli_fit_dispatch_and_rejection_of_incompatible_flags(tmp_path):
-    _, x, axis, risk, scale = fixture()
+    _, x, axis, risk, scale = fixture(64, 257)
     artifact = make_artifact(exact_moments(x, np.ones((len(axis.ids), 1)), risk), variant_axis=axis,
         annotation_names=["all"], sample_identity="a"*64, genotype_scale_identity=scale.identity, risk=risk, diagnostics={})
     path = write_artifact(artifact, tmp_path/"prepared.npz")
     argv = ["--binary-method", "pcgc", "--h2", str(path), "--out", str(tmp_path/"fit")]
     run(parser().parse_args(argv), argv)
     assert (tmp_path/"fit.binary.json").exists()
-    assert json.loads((tmp_path/"fit.binary.json").read_text())["qualification"] == "point_estimate_only"
+    result = json.loads((tmp_path/"fit.binary.json").read_text())
+    assert result["uncertainty_status"] == "estimated"
+    assert result["jackknife_blocks"] == 200
+    assert result["schema_version"] == 2
+    assert "qualification" not in result
     with pytest.raises(FileExistsError):
         run(parser().parse_args(argv), argv)
     for unsupported in ("--weight-mode", "--rg", "--covar", "--ldscores"):
@@ -39,14 +43,63 @@ def test_cli_fit_dispatch_and_rejection_of_incompatible_flags(tmp_path):
     wrong[1] = "pcgc-inverse"
     wrong[5] = str(tmp_path/"wrong_method")
     with pytest.raises(ValueError, match="disagrees"):
-        run(parser().parse_args(wrong+["--binary-research"]), wrong+["--binary-research"])
-    with pytest.raises(ValueError, match="qualification"):
         run(parser().parse_args(wrong), wrong)
-    with pytest.raises(ValueError, match="qualification"):
-        run(parser().parse_args(argv+["--njack", "8"]), argv+["--njack", "8"])
-    fractional = [*argv[:5], str(tmp_path/"fractional"), "--binary-research", "--njack", "3.5"]
-    with pytest.raises(ValueError, match="integer"):
-        run(parser().parse_args(fractional), fractional)
+    for count in ("3.5", "chr", "0", "1", "258"):
+        invalid = [*argv[:5], str(tmp_path/"invalid"), "--njack", count]
+        with pytest.raises(ValueError, match="integer|exceeds"):
+            run(parser().parse_args(invalid), invalid)
+
+
+@pytest.mark.parametrize("method", ["liability", "pcgc", "pcgc-inverse", "pcgc-basis", "pcgc-ld"])
+def test_all_methods_report_component_and_total_se_without_a_gate(tmp_path, method):
+    from summit.pcgc.research import exact_external_ld, external_ld_moments
+    from summit.sumstats.binary import prepare_binary_risk
+    from summit.inference.jackknife import JackknifeDesign, JackknifeSpec
+    _, x, axis, risk, scale = fixture(128, 257)
+    if method == "liability":
+        risk = prepare_binary_risk(risk.z > 0, .1)
+    # Overlapping weights exercise covariance between components, unequal
+    # block sizes, and the annotation reduction path at the 200-block default.
+    a = np.column_stack([np.ones(len(axis.ids)), np.linspace(.1, 1, len(axis.ids))])
+    kwargs = {"sensitivity": risk.sensitivity} if method == "pcgc-basis" else {}
+    moments = exact_moments(x, a, risk, method, **kwargs)
+    if method == "pcgc-ld":
+        reference = np.random.default_rng(953).normal(size=(512, len(a)))
+        moments = external_ld_moments(moments.rhs_rows, a, risk, exact_external_ld(reference, a))
+    artifact = make_artifact(moments, variant_axis=axis, annotation_names=["all", "weighted"],
+        sample_identity="a"*64, genotype_scale_identity=scale.identity, risk=risk, diagnostics={})
+    path = write_artifact(artifact, tmp_path/"prepared.npz")
+    for count in (200, 8):
+        prefix = tmp_path/f"fit{count}"
+        argv = ["--binary-method", method, "--h2", str(path), "--out", str(prefix)]
+        if count != 200:
+            argv += ["--njack=8"]
+        run(parser().parse_args(argv), argv)
+        result = json.loads(prefix.with_suffix(".binary.json").read_text())
+        design = JackknifeDesign.from_trace_view(SimpleNamespace(nsnps=len(a)), JackknifeSpec.parse(count))
+        # Recompute each deletion directly, without the production reducer.
+        loo = np.array([np.linalg.solve(*moments.equations(design.unit_id != b)) for b in range(count)])
+        centered = loo - loo.mean(axis=0)
+        cov = (count-1)/count * centered.T @ centered
+        np.testing.assert_allclose(result["jackknife_replicates"], loo, rtol=1e-10, atol=1e-12)
+        np.testing.assert_allclose(result["conditional_standard_errors"], np.sqrt(cov.diagonal()), rtol=1e-10)
+        np.testing.assert_allclose(result["conditional_total_standard_error"], np.sqrt(cov.sum()), rtol=1e-10)
+        np.testing.assert_allclose(result["marginal_total_standard_error"], np.sqrt(cov.sum())/(1+risk.covariate_variance), rtol=1e-10)
+        assert result["uncertainty_status"] == "estimated"
+        assert result["jackknife_blocks"] == count
+
+
+def test_small_artifact_requires_an_explicit_smaller_block_count(tmp_path):
+    _, x, axis, risk, scale = fixture()
+    moments = exact_moments(x, np.ones((len(axis.ids), 1)), risk)
+    artifact = make_artifact(moments, variant_axis=axis, annotation_names=["all"],
+        sample_identity="a"*64, genotype_scale_identity=scale.identity, risk=risk, diagnostics={})
+    path = write_artifact(artifact, tmp_path/"prepared.npz")
+    argv = ["--binary-method", "pcgc", "--h2", str(path), "--out", str(tmp_path/"fit")]
+    with pytest.raises(ValueError, match="choose a smaller block count"):
+        run(parser().parse_args(argv), argv)
+    assert not (tmp_path/"fit.binary.json").exists()
+    run(parser().parse_args(argv+["--njack", "8"]), argv+["--njack", "8"])
 
 
 def test_sample_alignment_by_ids_and_unknown_id_rejection(tmp_path):
@@ -117,9 +170,22 @@ def test_actual_summit_cli_prepares_and_fits_binary_artifact(tmp_path, monkeypat
     monkeypatch.setattr(sys, "argv", ["summit", "--binary-method", "pcgc", "--make-binary-sumstats", str(tmp_path/"samples.tsv"),
         "--geno", str(tmp_path/"test.bed"), "--binary-scale", str(tmp_path/"scale"), "--binary-genome-build", "test",
         "--binary-prevalence", ".1", "--binary-risk-column", "RISK", "--binary-probes", "61", "--num-threads", str(prediction_threads()),
-        "--out", str(tmp_path/"prepared"), "--_binary-research"])
+        "--out", str(tmp_path/"prepared")])
     assert cli.main() == 0
     monkeypatch.setattr(sys, "argv", ["summit", "--binary-method", "pcgc", "--h2", str(tmp_path/"prepared.binary.npz"),
-        "--njack", "8", "--out", str(tmp_path/"fit"), "--_binary-research"])
+        "--out", str(tmp_path/"fit")])
     assert cli.main() == 0
     assert (tmp_path/"fit.binary.json").exists()
+    result = json.loads((tmp_path/"fit.binary.json").read_text())
+    assert result["jackknife_blocks"] == 200
+    assert np.isfinite(result["marginal_total_standard_error"])
+
+
+def test_root_cli_documents_binary_default_and_removes_research_flags():
+    from summit.cli import build_parser
+    root = build_parser()
+    assert root.parse_args([]).njack == "chr"
+    assert "200 contiguous SNP blocks" in " ".join(root.format_help().split())
+    for flag in ("--binary-research", "--_binary-research"):
+        with pytest.raises(SystemExit):
+            root.parse_args([flag])

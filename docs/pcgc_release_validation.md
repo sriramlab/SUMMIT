@@ -7,10 +7,10 @@ prespecified screens. Univariate calibration remains setting-dependent,
 including conservative SEs with binary risk covariates and incomplete
 qualification under strong continuous risks. The corrected SNP-block
 jackknife is implemented for every binary method and annotation component.
-The CLI retains `--binary-research` for all binary SEs and for inverse and
-external-LD point estimates. That release restriction reflects incomplete
-calibration qualification, rather than missing SE functionality or an
-additional jackknife algebra error identified by this audit.
+All five CLI methods now report SEs by default, using 200 SNP blocks unless
+`--njack` is supplied. The [interface review](pcgc_interface_audit.md) explains
+why the earlier release gate was removed. The historical simulation results
+below remain unchanged; their 50-block design is distinct from the CLI default.
 
 This audit checks the corrected SNP-block jackknife across the implemented
 binary methods, including annotation components and binary cross-trait fits.

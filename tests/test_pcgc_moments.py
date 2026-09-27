@@ -134,7 +134,7 @@ def test_jackknife_matches_independent_rectangular_sample_pair_equations():
         assert np.linalg.norm(H-H.T) > 1e-5
         independent.append(np.linalg.solve(H, b))
     np.testing.assert_allclose(fitted["jackknife_replicates"], independent, atol=1e-12)
-    assert fitted["uncertainty_status"] == "experimental_unqualified"
+    assert fitted["uncertainty_status"] == "estimated"
 
 
 def test_external_ld_removes_finite_reference_diagonal_before_transfer():

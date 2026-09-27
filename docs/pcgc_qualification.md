@@ -3,7 +3,11 @@
 Date: 2026-09-26. Branch: `feat/pcgc`, based on `working` at
 `af6430efdfb3995b2905a878e35114148bc0863d`.
 
-**Historical qualification at `4a96bb1`.** The PCGC jackknife below used an
+**Historical qualification at `4a96bb1`; not current CLI instructions.**
+The [current guide](wiki/Binary-traits-and-PCGC.md) reports SEs by default and
+removes the former research flags.
+
+**Original qualification.** The PCGC jackknife below used an
 incorrect deletion scaling. It is superseded by the
 [jackknife audit and local-data checks](pcgc_jackknife_audit.md). The original
 results are retained for paired comparison; they do not qualify v2 uncertainty.
