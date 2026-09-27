@@ -5,9 +5,12 @@ Date: 2026-09-27.
 The binary cross-trait settings and the PCGC annotation components pass the
 prespecified screens. Univariate calibration remains setting-dependent,
 including conservative SEs with binary risk covariates and incomplete
-qualification under strong continuous risks. Point-estimate support is
-unchanged; all binary SEs, inverse weighting, and external-LD transfer retain
-their research gates.
+qualification under strong continuous risks. The corrected SNP-block
+jackknife is implemented for every binary method and annotation component.
+The CLI retains `--binary-research` for all binary SEs and for inverse and
+external-LD point estimates. That release restriction reflects incomplete
+calibration qualification, rather than missing SE functionality or an
+additional jackknife algebra error identified by this audit.
 
 This audit checks the corrected SNP-block jackknife across the implemented
 binary methods, including annotation components and binary cross-trait fits.

@@ -8,9 +8,13 @@ defines the staged qualification protocol.
 For commands and input formats, start with
 [Binary traits and PCGC](wiki/Binary-traits-and-PCGC.md).
 
-`--binary-method liability|pcgc|pcgc-basis` exposes point estimates under the
-contract below. Inverse weighting, external-LD transfer and all jackknife
-uncertainty require `--binary-research`. The
+All five binary methods implement point estimates and SNP-block jackknife
+SEs under the contract below. The CLI accepts `liability`, `pcgc`, and exact
+`pcgc-basis` point estimates without a research flag. Requesting jackknife SEs
+with `--njack` currently requires `--binary-research`; inverse weighting and
+external-LD transfer also require that flag for point estimates. These are
+public-interface qualification restrictions. The corrected jackknife is
+implemented and tested across methods and annotation components. The
 [release validation](pcgc_release_validation.md) checks the corrected jackknife
 across methods. The [initial qualification report](pcgc_qualification.md)
 records the original point-estimate comparisons. Algebraic

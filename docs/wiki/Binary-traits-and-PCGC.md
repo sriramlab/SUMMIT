@@ -63,9 +63,9 @@ selection requires preparing new moments.
 
 | Flag value | Use | Availability |
 |---|---|---|
-| `pcgc` | Individual risk weights in scores and the study reference | Point estimates |
-| `liability` | Constant population risk; scalar liability conversion | Point estimates |
-| `pcgc-basis` | Supplied basis and coefficients that exactly reproduce the risk sensitivity | Point estimates |
+| `pcgc` | Individual risk weights in scores and the study reference | Point estimates and SNP-block jackknife SEs |
+| `liability` | Constant population risk; scalar liability conversion | Point estimates and SNP-block jackknife SEs |
+| `pcgc-basis` | Supplied basis and coefficients that exactly reproduce the risk sensitivity | Point estimates and SNP-block jackknife SEs |
 | `pcgc-inverse` | Inverse risk weighting with an unweighted genotype reference | Requires `--binary-research` |
 | `pcgc-ld` | Transfer from an independent population LD reference | Requires `--binary-research` |
 
@@ -79,8 +79,14 @@ selected from the data.
 
 ## Standard errors and interpretation
 
-Point estimates are available without a jackknife. Experimental SNP-block
-uncertainty requires an explicit research flag and integer block count:
+All five methods implement SNP-block jackknife SEs for annotation components
+and totals. The corrected scaling and per-SNP diagonal subtraction are tested
+against independent equations. The CLI currently requires `--binary-research`
+when requesting SEs with `--njack`; this is a qualification restriction on
+the public interface. It was retained because some simulation settings did
+not pass the prespecified calibration screens.
+
+To obtain estimates and SEs:
 
 ```bash
 summit --binary-method pcgc --binary-research \
