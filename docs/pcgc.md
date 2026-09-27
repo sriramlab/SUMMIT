@@ -133,10 +133,10 @@ For example, with exogenous columns AGE and RISK_FACTOR:
 ```sh
 summit --binary-method pcgc \
   --make-binary-sumstats people.tsv --geno study.bed \
-  --binary-prevalence 0.1 --binary-genome-build GRCh38 \
+  --binary-prevalence 0.1 --genome-build GRCh38 \
   --binary-scale population_scale.tsv \
   --binary-covariates AGE,RISK_FACTOR \
-  --binary-probes 256 --num-threads 4 --out study_pcgc
+  --nvecs 256 --num-threads 4 --out study_pcgc
 
 summit --binary-method pcgc \
   --h2 study_pcgc.binary.npz --out study_pcgc_fit

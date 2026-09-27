@@ -1,7 +1,6 @@
 """Read-only sealed-reference Z pass; publish a separate checksummed artifact."""
 from __future__ import annotations
 
-import argparse
 import ctypes
 import hashlib
 import json
@@ -10,6 +9,8 @@ from pathlib import Path
 import time
 
 import numpy as np
+
+from summit.cli_options import ArgumentParser
 
 from .spec import array_sha256,canonical_sha256
 from .cross_trait_zpass import ZMomentAccumulator
@@ -115,16 +116,16 @@ def run_zpass(*,manifest_path,reference_root,chromosome,master_input,bed_prefix,
 
 
 def main(argv=None):
-    parser=argparse.ArgumentParser(prog='summit reference zpass',description=__doc__)
+    parser=ArgumentParser(prog='summit reference zpass',description=__doc__)
     parser.add_argument('--manifest',type=Path,required=True)
     parser.add_argument('--reference-root',type=Path,required=True)
     parser.add_argument('--chromosome',type=int,required=True)
     parser.add_argument('--master-input',type=Path,required=True)
-    parser.add_argument('--bed-prefix',type=Path,required=True)
-    parser.add_argument('--annotations',type=Path,required=True)
-    parser.add_argument('--output',type=Path,required=True)
+    parser.add_argument('--geno','--bed-prefix',dest='bed_prefix',type=Path,required=True)
+    parser.add_argument('--annot','--annotations',dest='annotations',type=Path,required=True)
+    parser.add_argument('--out','--output',dest='output',type=Path,required=True)
     parser.add_argument('--num-threads',type=int,default=1)
-    parser.add_argument('--width',type=int,default=128)
+    parser.add_argument('--block-size','--width',dest='width',type=int,default=128)
     args=parser.parse_args(argv)
     result=run_zpass(manifest_path=args.manifest,reference_root=args.reference_root,
         chromosome=args.chromosome,master_input=args.master_input,bed_prefix=args.bed_prefix,

@@ -21,7 +21,7 @@ The reference estimator reads genotypes twice. It uses one genotype scale
 across all context columns. The context-dependent features are
 `P diag(phi_q) G`, where P removes fixed effects.
 
-This estimator has a Python interface. The separate command below plans
+This estimator has a Python interface. The command below plans
 resources and inspects results; it does not yet provide a general fit-spec CLI.
 The native reference executor currently requires BED and the Linux BLIS build
 noted in [Installation](Installation.md).
@@ -29,10 +29,10 @@ noted in [Installation](Installation.md).
 ## Plan resources
 
 ```bash
-summit-generalized-gxe-variant-ldscore plan \
-  --samples 10000 --variants 100000 --basis 3 --annotations 2 --probes 128 \
-  --memory-bytes 8589934592 --genotype-format bed --threads 4 \
-  --variant-block-width 1024 --rhs-tile-columns 36 --rhs-policy tiled
+summit reference plan \
+  --samples 10000 --variants 100000 --basis 3 --annotations 2 --nvecs 128 \
+  --memory-gib 8 --genotype-format bed --num-threads 4 \
+  --block-size 1024 --rhs-tile-columns 36 --rhs-policy tiled
 ```
 
 Planning reads no genotypes. More basis columns increase the number of genetic
@@ -47,7 +47,7 @@ python example/prepare_example_inputs.py
 env BLIS_NUM_THREADS=4 OMP_NUM_THREADS=4 OMP_THREAD_LIMIT=4 \
   python example/estimate_generalized_gxe_variant_ldscore.py \
   --output example/out/generalized --probes 16 --njack 20 --threads 4
-summit-generalized-gxe-variant-ldscore inspect \
+summit reference inspect \
   example/out/generalized.generalized-gxe-variant-ldscore-v1.npz
 ```
 

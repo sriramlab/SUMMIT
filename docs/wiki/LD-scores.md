@@ -7,7 +7,7 @@ to the ancestry and variant set of the GWAS being analyzed.
 
 ```bash
 summit --geno reference.bed --out results/reference \
-  --nvecs 1000 --step_size 1000 --num-threads 8
+  --nvecs 1000 --block-size 1000 --num-threads 8
 ```
 
 `--nvecs` controls the number of random vectors. More vectors reduce Monte Carlo
@@ -17,7 +17,7 @@ Add annotations and covariates when needed:
 
 ```bash
 summit --geno reference.bed --annot annotations.tsv --covar covariates.tsv \
-  --out results/partitioned --nvecs 1000 --step_size 1000 --num-threads 8
+  --out results/partitioned --nvecs 1000 --block-size 1000 --num-threads 8
 ```
 
 Outputs are `<out>.gw.ldscore.gz`, `<out>.gw.M`, and `<out>.gw.log`.
@@ -47,9 +47,9 @@ decoded panels and cache.
 
 ## Choosing resources
 
-`--num-threads` sets the CPU thread count. `--step_size` controls variants per
-block; smaller blocks reduce temporary memory. `--target-mem` and
-`--target-xz-mem` set memory budgets in GiB. Use an explicit budget on a cluster
+`--num-threads` sets the CPU thread count. `--block-size` controls variants per
+block; smaller blocks reduce temporary memory. `--target-mem` sets the
+sketch-panel or windowed-LD memory budget in GiB. Use an explicit budget on a cluster
 when the process cannot detect its scheduler allocation.
 
 CUDA is available for supported BED genome-wide runs. The default Monte Carlo
@@ -61,8 +61,7 @@ The default `.gw.mc.tsv` reports the RMS per-SNP Monte Carlo standard error and
 its size relative to the RMS LD score. This measures random-vector error
 conditional on the reference panel. It excludes uncertainty from sampling that panel.
 
-For per-SNP variances and approximate 95% intervals, add `--write-ld-mc-var`
-(or `--write-ld-mc-ci`). This needs at least two vectors and additional storage.
+For per-SNP variances and approximate 95% intervals, add `--write-ld-mc-var`. This needs at least two vectors and additional storage.
 The intervals are pointwise. They may extend below zero.
 
 The [Methods](Methods.md) page gives the variance formula. For a runnable

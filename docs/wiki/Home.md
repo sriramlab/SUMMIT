@@ -6,6 +6,8 @@ scores, and fits gene–environment interaction models and polygenic scores.
 Start with [Installation](Installation.md), try the synthetic
 example below, then choose an analysis guide. [Input files](Input-files.md)
 describes the formats needed for your own data.
+[Commands and options](Commands-and-options.md) lists shared controls and
+compatibility spellings.
 
 ```bash
 python example/prepare_example_inputs.py
@@ -41,7 +43,7 @@ results go to `example/out/`.
 
 The main `summit` command supports LD scores, h²/rg, one-environment G×E,
 and binary-trait PCGC preparation and inference.
-Joint generalized G×E estimation is available through Python, with a separate
-planning and inspection command. PGS uses `summit-pgs`. Research functions in
+Joint generalized G×E estimation is available through Python; `summit reference`
+provides planning and inspection. PGS uses `summit pgs`. Research functions in
 `summit.context` and binary cross-trait functions in `summit.pcgc.cross` are
 identified in their guides.

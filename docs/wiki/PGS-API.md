@@ -19,7 +19,7 @@ with FileGenotypeSource("discovery.bed", genome_build="GRCh37") as source:
 
 Here `traits` contains `TraitTraining` objects and `score_inputs` maps trait
 names to `ScoreInput` objects. Set the numerical-library thread environment
-before importing the backend; `summit-pgs` does this automatically.
+before importing the backend; `summit pgs` does this automatically.
 For the eight-thread Python example above, launch your script with:
 
 ```bash

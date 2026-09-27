@@ -1,4 +1,3 @@
-import argparse
 import json
 from types import SimpleNamespace
 
@@ -6,19 +5,15 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from summit.pcgc.cli import add_arguments, run, sample_table, annotation_table, population_scale
+from summit.pcgc.cli import run, sample_table, annotation_table, population_scale
 from summit.pcgc.artifacts import make_artifact, write_artifact
 from summit.pcgc.research import exact_moments
 from test_pcgc_io import fixture
 
 
 def parser():
-    p = argparse.ArgumentParser()
-    add_arguments(p)
-    for name in ("geno", "out", "h2", "njack", "annot"):
-        p.add_argument("--"+name)
-    p.add_argument("--num-threads", type=int)
-    return p
+    from summit.cli import build_parser
+    return build_parser()
 
 
 def test_cli_fit_dispatch_and_rejection_of_incompatible_flags(tmp_path):
@@ -167,11 +162,17 @@ def test_actual_summit_cli_prepares_and_fits_binary_artifact(tmp_path, monkeypat
     pd.DataFrame(dict(FID=[s[0] for s in samples], IID=[s[1] for s in samples],
                       Y=(risk.z > 0).astype(int), RISK=risk.population_risk)).iloc[::-1].to_csv(tmp_path/"samples.tsv", sep="\t", index=False)
     write_genotype_scale(tmp_path/"scale", scale)
-    monkeypatch.setattr(sys, "argv", ["summit", "--binary-method", "pcgc", "--make-binary-sumstats", str(tmp_path/"samples.tsv"),
-        "--geno", str(tmp_path/"test.bed"), "--binary-scale", str(tmp_path/"scale"), "--binary-genome-build", "test",
-        "--binary-prevalence", ".1", "--binary-risk-column", "RISK", "--binary-probes", "61", "--num-threads", str(prediction_threads()),
-        "--out", str(tmp_path/"prepared")])
-    assert cli.main() == 0
+    from summit.pcgc.artifacts import load_artifact
+    from summit.entrypoint import main as entry_main
+    common = ["--binary-method", "pcgc", "--make-binary-sumstats", str(tmp_path/"samples.tsv"),
+        "--geno", str(tmp_path/"test.bed"), "--binary-scale", str(tmp_path/"scale"),
+        "--binary-prevalence", ".1", "--binary-risk-column", "RISK", "--num-threads", str(prediction_threads())]
+    for name, options in (("prepared", ["--genome-build", "test", "--nvecs", "61", "--seed", "81", "--block-size", "37", "--memory-gib", "1"]),
+                          ("legacy", ["--binary-genome-build", "test", "--binary-probes", "61", "--binary-seed", "81", "--binary-block-size", "37", "--binary-memory-gib", "1"])):
+        assert entry_main([*common, *options, "--out", str(tmp_path/name)]) == 0
+    canonical, legacy = [load_artifact(tmp_path/(name+".binary.npz")) for name in ("prepared", "legacy")]
+    for field in ("rhs_rows", "ldscores", "annotations", "same_person"):
+        np.testing.assert_array_equal(getattr(canonical.moments, field), getattr(legacy.moments, field))
     monkeypatch.setattr(sys, "argv", ["summit", "--binary-method", "pcgc", "--h2", str(tmp_path/"prepared.binary.npz"),
         "--out", str(tmp_path/"fit")])
     assert cli.main() == 0

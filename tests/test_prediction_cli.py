@@ -13,12 +13,15 @@ from summit.prediction._validation import digest
 from summit.prediction.artifacts import write_json, write_genotype_scale, load_prediction_models, read_json
 from summit.prediction.genotype import FileGenotypeSource, estimate_scale
 from summit.prediction.features import fit_contexts, evaluate_contexts, evaluate_fixed
-from summit.prediction.cli import main
+from summit.prediction.cli import main as legacy_main
 from summit.prediction import AnnotationDesign, write_annotation_design
 
 
 @pytest.mark.parametrize('mixture', [False, 'radial', 'separate'])
-def test_cli_full_pipeline_and_frozen_feature_transform(tmp_path, capsys, mixture):
+@pytest.mark.parametrize('launcher', ['legacy', 'unified'])
+def test_cli_full_pipeline_and_frozen_feature_transform(tmp_path, capsys, mixture, launcher):
+    from summit.entrypoint import main as unified_main
+    main = legacy_main if launcher == 'legacy' else lambda argv: unified_main(['pgs', *argv])
     source, old_traits, bed = write_bed(tmp_path)
     rng = np.random.default_rng(232)
     samples = pd.DataFrame(source.samples, columns=["FID", "IID"])

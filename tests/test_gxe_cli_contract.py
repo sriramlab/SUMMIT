@@ -9,6 +9,15 @@ from types import SimpleNamespace
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def restore_runtime_environment():
+    """Mock startup tests must not change later native tests' thread contract."""
+    before = dict(os.environ)
+    yield
+    os.environ.clear()
+    os.environ.update(before)
+
+
 def _cpu_placement(cpu_ids):
     cpus = list(cpu_ids)
     threads = len(cpus)

@@ -3,6 +3,7 @@
 **Start here**
 
 - [Installation](Installation.md)
+- [Commands and options](Commands-and-options.md)
 - [Input files](Input-files.md)
 - [Troubleshooting](Troubleshooting.md)
 

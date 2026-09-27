@@ -92,7 +92,7 @@ For separate sparsity, use:
 }
 ```
 
-The usual `summit-pgs plan`, `fit`, `--checkpoint`, `--resume`, and reloaded
+The usual `summit pgs plan`, `fit`, `--checkpoint`, `--resume`, and reloaded
 `score` operations apply. Mixture candidates are rejected by the Gaussian
 solver. Hyperparameter selection is a separate validation step; fitting a
 candidate menu does not itself perform cross-validation.

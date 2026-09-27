@@ -1,6 +1,6 @@
 # G×E polygenic scores
 
-`summit-pgs` fits SNP weights whose contribution can depend on a person's
+`summit pgs` fits SNP weights whose contribution can depend on a person's
 context. It supports several candidate priors and traits in one run, sharing
 genotype reads across them.
 
@@ -37,11 +37,11 @@ prepare these inputs and define candidate priors.
 ## Fit and inspect
 
 ```bash
-summit-pgs plan --spec fit.json --genotype-storage compact \
+summit pgs plan --spec fit.json --genotype-storage compact \
   --memory-gib 16 --num-threads 8
-summit-pgs fit --spec fit.json --out models \
+summit pgs fit --spec fit.json --out models \
   --genotype-storage compact --memory-gib 16 --num-threads 8
-summit-pgs inspect models
+summit pgs inspect models
 ```
 
 `plan` checks metadata, feature tables, and model inputs without scanning
@@ -84,7 +84,7 @@ variances must already be in those transformed units.
 ## Score new samples
 
 ```bash
-summit-pgs score --models models --spec score.json --out predictions \
+summit pgs score --models models --spec score.json --out predictions \
   --memory-gib 16 --num-threads 8
 ```
 

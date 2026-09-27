@@ -33,7 +33,8 @@ conda env create -f environment.yml
 conda activate summit
 python -m pip install .
 summit --help
-summit-pgs --help
+summit pgs --help
+summit reference --help
 ```
 
 See [Installation](https://github.com/bronsonj98/SUMMIT/wiki/Installation) for compiler setup, development
@@ -53,6 +54,9 @@ Examples write to `example/out/`. They illustrate the commands; their small
 sample sizes are unsuitable for evaluating statistical performance.
 
 ## Documentation
+
+[Commands and options](docs/wiki/Commands-and-options.md) lists the shared flags
+and older spellings that remain supported.
 
 - [Input files](https://github.com/bronsonj98/SUMMIT/wiki/Input-files)
 - [LD scores](https://github.com/bronsonj98/SUMMIT/wiki/LD-scores)

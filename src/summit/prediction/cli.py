@@ -1,10 +1,11 @@
 """Opt-in prediction commands; thread/NUMA setup precedes numerical imports."""
 from __future__ import annotations
 
-import argparse
 import os
 from pathlib import Path
 import sys
+
+from summit.cli_options import ArgumentParser
 
 
 def _runtime(args):
@@ -224,8 +225,8 @@ def _score(args):
     return dict(output=str(output), models=len(models))
 
 
-def main(argv=None):
-    parser = argparse.ArgumentParser(prog="summit-pgs", allow_abbrev=False)
+def main(argv=None, *, prog="summit-pgs"):
+    parser = ArgumentParser(prog=prog, allow_abbrev=False)
     subs = parser.add_subparsers(dest="command", required=True)
     for name in ("plan", "fit", "score", "scale", "inspect"):
         p = subs.add_parser(name, allow_abbrev=False)
@@ -310,7 +311,7 @@ def main(argv=None):
         print(canonical(result))
         return 0
     except (ValueError, OSError, RuntimeError, KeyError, TypeError, MemoryError, ImportError, OverflowError, FloatingPointError) as exc:
-        parser.exit(2, f"summit-pgs: {exc}\n")
+        parser.exit(2, f"{prog}: {exc}\n")
 
 
 if __name__ == "__main__":

@@ -24,8 +24,8 @@ Verify the commands:
 
 ```bash
 summit --help
-summit-pgs --help
-summit-generalized-gxe-variant-ldscore --help
+summit pgs --help
+summit reference --help
 ```
 
 The distribution is currently named `gwldcore`; its Python package and main
@@ -50,7 +50,11 @@ From an activated environment:
 python -m pip install --no-build-isolation -e .
 ```
 
-Reinstall after changing native code. If you use a separate worktree with an
+Reinstall after changing native code or console entry points. In particular,
+refresh an existing installation after pulling the unified `summit pgs` and
+`summit reference` launcher. Use the same native build configuration as before.
+The older standalone commands remain available. `python -m summit` also uses
+the unified launcher. If you use a separate worktree with an
 older editable installation in the same environment, the PGS checkout launcher
 selects the current source tree for that process:
 

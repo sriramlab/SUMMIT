@@ -8,6 +8,7 @@ from types import SimpleNamespace
 import numpy as np
 import pandas as pd
 
+from summit.cli_options import explicit_options
 from summit.context.spec import canonical_json, canonical_sha256
 from summit.prediction.artifacts import load_genotype_scale, write_json, file_digest
 from summit.prediction.genotype import FileGenotypeSource
@@ -28,14 +29,9 @@ def add_arguments(parser):
     group.add_argument("--binary-scale", help="Population scale: sealed SUMMIT directory or SNP/A1/A2/MEAN/INV_SD TSV.")
     group.add_argument("--binary-reference-geno", help="Independent population BED/PGEN reference for the pcgc-ld approximation.")
     group.add_argument("--binary-prevalence", type=float, help="Externally supplied population prevalence.")
-    group.add_argument("--binary-genome-build", help="Genome build matching the sealed genotype scale.")
     group.add_argument("--binary-covariates", help="Comma-separated exogenous covariate columns in the sample table; no intercept.")
     group.add_argument("--binary-risk-column", help="Column of supplied individual population risks instead of a probit fit.")
     group.add_argument("--binary-covariate-variance", type=float, help="Population variance of the covariate liability predictor.")
-    group.add_argument("--binary-probes", type=int, default=256, help="Reference variant probes (default: 256).")
-    group.add_argument("--binary-seed", type=int, default=0)
-    group.add_argument("--binary-memory-gib", type=float, default=1.)
-    group.add_argument("--binary-block-size", type=int, default=256)
     group.add_argument("--binary-basis-columns", help="Comma-separated sample-table basis columns for pcgc-basis.")
     group.add_argument("--binary-basis-coefficients", help="Comma-separated coefficients; basis must span the risk sensitivity exactly.")
 
@@ -103,19 +99,21 @@ def population_scale(path, source):
 
 
 def prepare(args):
-    if any(value is None for value in (args.geno, args.binary_scale, args.binary_prevalence, args.binary_genome_build)):
-        raise ValueError("--make-binary-sumstats requires --geno, --binary-scale, --binary-prevalence and --binary-genome-build")
+    if any(value is None for value in (args.geno, args.binary_scale, args.binary_prevalence, args.genome_build)):
+        raise ValueError("--make-binary-sumstats requires --geno, --binary-scale, --binary-prevalence and --genome-build")
     if args.binary_risk_column and args.binary_covariates:
         raise ValueError("choose supplied population risks or fitted risk covariates")
     if args.binary_covariate_variance is not None and not args.binary_risk_column:
         raise ValueError("--binary-covariate-variance accompanies supplied population risks")
-    if not np.isfinite(args.binary_memory_gib) or args.binary_memory_gib <= 0:
+    if not np.isfinite(args.memory_gib) or args.memory_gib <= 0:
         raise ValueError("binary reference memory must be finite and positive")
+    if args.step_size == "auto":
+        raise ValueError("binary --block-size requires a positive integer; auto is supported only by GxE reference generation")
     with ExitStack() as stack:
-        source = stack.enter_context(FileGenotypeSource(args.geno, genome_build=args.binary_genome_build))
+        source = stack.enter_context(FileGenotypeSource(args.geno, genome_build=args.genome_build))
         scale = population_scale(args.binary_scale, source)
         reference = None if args.binary_reference_geno is None else stack.enter_context(
-            FileGenotypeSource(args.binary_reference_geno, genome_build=args.binary_genome_build))
+            FileGenotypeSource(args.binary_reference_geno, genome_build=args.genome_build))
         rows, table = sample_table(args.make_binary_sumstats, source)
         y = table.Y.to_numpy(dtype=float)
         if args.binary_risk_column:
@@ -131,20 +129,23 @@ def prepare(args):
         c = None if args.binary_basis_coefficients is None else np.array([float(x) for x in args.binary_basis_coefficients.split(",")])
         return prepare_from_source(source, scale, rows, risk, a, annotation_names=names,
                                    method=args.binary_method, basis=basis, coefficients=c,
-                                   probes=args.binary_probes, seed=args.binary_seed,
-                                   memory_bytes=int(args.binary_memory_gib*2**30),
-                                   threads=1 if args.num_threads is None else args.num_threads, block_size=args.binary_block_size,
+                                   probes=args.nvecs, seed=args.seed,
+                                   memory_bytes=int(args.memory_gib*2**30),
+                                   threads=1 if args.num_threads is None else args.num_threads, block_size=args.step_size,
                                    reference_source=reference)
 
 
-def run(args, argv):
+def run(args, argv, *, parser=None):
     """Only explicitly supported flags can enter the binary scientific path."""
     allowed = {"--binary-method", "--make-binary-sumstats", "--binary-scale", "--binary-prevalence",
-               "--binary-genome-build", "--binary-covariates", "--binary-risk-column", "--binary-covariate-variance",
-               "--binary-probes", "--binary-seed", "--binary-memory-gib", "--binary-block-size",
+               "--genome-build", "--binary-covariates", "--binary-risk-column", "--binary-covariate-variance",
+               "--nvecs", "--seed", "--memory-gib", "--block-size",
                "--binary-basis-columns", "--binary-basis-coefficients", "--binary-reference-geno",
                "--geno", "--annot", "--out", "--h2", "--njack", "--num-threads"}
-    explicit = {x.split("=", 1)[0] for x in argv if x.startswith("--")}
+    if parser is None:
+        from summit.cli import build_parser
+        parser = build_parser()
+    explicit = explicit_options(parser, argv)
     if explicit-allowed:
         raise ValueError("unsupported options for the binary contract: "+", ".join(sorted(explicit-allowed)))
     if args.binary_method is None or args.out is None:

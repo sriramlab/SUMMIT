@@ -34,10 +34,10 @@ For age and another exogenous risk factor:
 ```bash
 summit --binary-method pcgc \
   --make-binary-sumstats people.tsv --geno study.bed \
-  --binary-prevalence 0.1 --binary-genome-build GRCh38 \
+  --binary-prevalence 0.1 --genome-build GRCh38 \
   --binary-scale population_scale.tsv \
   --binary-covariates AGE,RISK_FACTOR \
-  --binary-probes 256 --binary-memory-gib 4 \
+  --nvecs 256 --memory-gib 4 \
   --num-threads 4 --out results/trait_pcgc
 
 summit --binary-method pcgc \
@@ -123,9 +123,9 @@ readers, variant probes, and protected matrix products. Exact basis contraction
 is performed before reference calculation. The external-LD method uses one
 study scoring traversal and two reference traversals.
 
-`--binary-memory-gib` budgets reference workspace; other process allocations
-need additional memory. Reducing `--binary-block-size` changes tiling, while
-reducing `--binary-probes` also changes numerical precision. Annotation count
+`--memory-gib` budgets reference workspace; other process allocations
+need additional memory. Reducing `--block-size` changes tiling, while
+reducing `--nvecs` also changes numerical precision. Annotation count
 increases both sketch memory and computation. Full-cohort memory plans and a
 bounded full-sample benchmark are available in the
 [scaling audit](../pcgc_second_audit.md); full-genome throughput is not yet measured.
