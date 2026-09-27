@@ -5,6 +5,9 @@ basis. For example, `[1, exposure1, exposure2]` includes baseline effects,
 each environmental response, and their covariances. Contexts can be continuous,
 categorical, or a specified combination.
 
+The [cross-trait extension](Cross-trait-analysis.md) estimates the corresponding
+covariance between two traits, with separate sample masks and overlap handling.
+
 ## Workflow
 
 1. Fit the context coding on the reference cohort: continuous centers/scales,

@@ -25,6 +25,8 @@ results go to `example/out/`.
 | Many traits or annotation models | [Batch analyses](Batch-analyses.md) |
 | One environment, including heterogeneous residual variance | [G×E models](GxE-models.md) |
 | Joint continuous and categorical environments | [Multiple environments](Multiple-environments.md) |
+| Shared genetic responses across traits | [Cross-trait response models](Cross-trait-analysis.md) |
+| Binary traits with case–control ascertainment | [Binary traits and PCGC](Binary-traits-and-PCGC.md) |
 | Context-dependent genetic prediction | [Polygenic scores](Polygenic-scores.md) |
 | Python model construction and mathematical details | [PGS API](PGS-API.md), [Methods](Methods.md) |
 | Research extensions | [Contextual Python API](Contextual-Python-API.md) |
@@ -37,7 +39,9 @@ results go to `example/out/`.
 - [Methods](Methods.md): model definitions and estimating equations.
 - [Troubleshooting](Troubleshooting.md): input, installation, and fitting errors.
 
-The main `summit` command supports LD scores, h²/rg, and one-environment G×E.
+The main `summit` command supports LD scores, h²/rg, one-environment G×E,
+and binary-trait PCGC preparation and inference.
 Joint generalized G×E estimation is available through Python, with a separate
 planning and inspection command. PGS uses `summit-pgs`. Research functions in
-`summit.context` are identified in their guide.
+`summit.context` and binary cross-trait functions in `summit.pcgc.cross` are
+identified in their guides.

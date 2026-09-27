@@ -1,0 +1,331 @@
+{
+  "schema": "summit-gxe-uncertainty-diagnostics-v1",
+  "seed": 20260815,
+  "probe_estimators": {
+    "samples": 120,
+    "variants": 80,
+    "components": 4,
+    "repetitions": 400,
+    "truth_minimum_eigenvalue": 1.8190535482848378,
+    "cases": {
+      "rademacher_B2": {
+        "u_statistic": {
+          "relative_bias_frobenius": 0.03846309748774631,
+          "relative_rmse_frobenius": 0.6184176786752865,
+          "non_psd_fraction": 0.8275,
+          "median_minimum_eigenvalue": -27.21718673566289
+        },
+        "split_probe": {
+          "relative_bias_frobenius": 0.03846309748774615,
+          "relative_rmse_frobenius": 0.6184176786752867,
+          "non_psd_fraction": 0.8275,
+          "median_minimum_eigenvalue": -27.217186735662438
+        },
+        "plugin": {
+          "relative_bias_frobenius": 0.649059347378682,
+          "relative_rmse_frobenius": 1.0792743707488335,
+          "non_psd_fraction": 0.0,
+          "median_minimum_eigenvalue": 38.660389573903416
+        }
+      },
+      "rademacher_B4": {
+        "u_statistic": {
+          "relative_bias_frobenius": 0.01356204281561296,
+          "relative_rmse_frobenius": 0.42758334515303287,
+          "non_psd_fraction": 0.7575,
+          "median_minimum_eigenvalue": -10.073925057794597
+        },
+        "split_probe": {
+          "relative_bias_frobenius": 0.016304924054001208,
+          "relative_rmse_frobenius": 0.4461122795940044,
+          "non_psd_fraction": 0.745,
+          "median_minimum_eigenvalue": -11.20320217748797
+        },
+        "plugin": {
+          "relative_bias_frobenius": 0.34775150593140247,
+          "relative_rmse_frobenius": 0.6619762636900103,
+          "non_psd_fraction": 0.0,
+          "median_minimum_eigenvalue": 21.313321427456412
+        }
+      },
+      "rademacher_B16": {
+        "u_statistic": {
+          "relative_bias_frobenius": 0.012017991477563656,
+          "relative_rmse_frobenius": 0.19037852205263306,
+          "non_psd_fraction": 0.5575,
+          "median_minimum_eigenvalue": -0.4764171483888713
+        },
+        "split_probe": {
+          "relative_bias_frobenius": 0.012257756245135967,
+          "relative_rmse_frobenius": 0.19476175655944292,
+          "non_psd_fraction": 0.5875,
+          "median_minimum_eigenvalue": -0.8537994047412123
+        },
+        "plugin": {
+          "relative_bias_frobenius": 0.09559342424113794,
+          "relative_rmse_frobenius": 0.22688567228164844,
+          "non_psd_fraction": 0.0,
+          "median_minimum_eigenvalue": 6.944633758059471
+        }
+      },
+      "rademacher_B64": {
+        "u_statistic": {
+          "relative_bias_frobenius": 0.006745640787738236,
+          "relative_rmse_frobenius": 0.09315506903630956,
+          "non_psd_fraction": 0.0525,
+          "median_minimum_eigenvalue": 1.4628372598261286
+        },
+        "split_probe": {
+          "relative_bias_frobenius": 0.006959089205168076,
+          "relative_rmse_frobenius": 0.09358504325889085,
+          "non_psd_fraction": 0.12,
+          "median_minimum_eigenvalue": 1.4613693082522095
+        },
+        "plugin": {
+          "relative_bias_frobenius": 0.01639349053472211,
+          "relative_rmse_frobenius": 0.09638569742426857,
+          "non_psd_fraction": 0.0,
+          "median_minimum_eigenvalue": 3.09984029438022
+        }
+      },
+      "gaussian_B2": {
+        "u_statistic": {
+          "relative_bias_frobenius": 0.0125275851307677,
+          "relative_rmse_frobenius": 0.8617493115031444,
+          "non_psd_fraction": 0.86,
+          "median_minimum_eigenvalue": -26.071126901935116
+        },
+        "split_probe": {
+          "relative_bias_frobenius": 0.012527585130767687,
+          "relative_rmse_frobenius": 0.8617493115031442,
+          "non_psd_fraction": 0.86,
+          "median_minimum_eigenvalue": -26.07112690193589
+        },
+        "plugin": {
+          "relative_bias_frobenius": 0.7404855145176316,
+          "relative_rmse_frobenius": 1.4447985815206366,
+          "non_psd_fraction": 0.0,
+          "median_minimum_eigenvalue": 36.88986203175376
+        }
+      },
+      "gaussian_B4": {
+        "u_statistic": {
+          "relative_bias_frobenius": 0.04478342334431682,
+          "relative_rmse_frobenius": 0.5231734063243315,
+          "non_psd_fraction": 0.8575,
+          "median_minimum_eigenvalue": -12.441493241757582
+        },
+        "split_probe": {
+          "relative_bias_frobenius": 0.04646166243854531,
+          "relative_rmse_frobenius": 0.5583278764174091,
+          "non_psd_fraction": 0.81,
+          "median_minimum_eigenvalue": -14.71038971155362
+        },
+        "plugin": {
+          "relative_bias_frobenius": 0.42527599775446484,
+          "relative_rmse_frobenius": 0.8266031021564175,
+          "non_psd_fraction": 0.0,
+          "median_minimum_eigenvalue": 21.856772158258508
+        }
+      },
+      "gaussian_B16": {
+        "u_statistic": {
+          "relative_bias_frobenius": 0.01654349740999602,
+          "relative_rmse_frobenius": 0.21191926539197262,
+          "non_psd_fraction": 0.5975,
+          "median_minimum_eigenvalue": -0.6691568606818683
+        },
+        "split_probe": {
+          "relative_bias_frobenius": 0.017447116444919482,
+          "relative_rmse_frobenius": 0.21414559970117392,
+          "non_psd_fraction": 0.5825,
+          "median_minimum_eigenvalue": -0.894748000025219
+        },
+        "plugin": {
+          "relative_bias_frobenius": 0.0803554131639334,
+          "relative_rmse_frobenius": 0.24567187907487653,
+          "non_psd_fraction": 0.0,
+          "median_minimum_eigenvalue": 6.9706119504475215
+        }
+      },
+      "gaussian_B64": {
+        "u_statistic": {
+          "relative_bias_frobenius": 0.011816995696089625,
+          "relative_rmse_frobenius": 0.10998501860093993,
+          "non_psd_fraction": 0.055,
+          "median_minimum_eigenvalue": 1.394607558649541
+        },
+        "split_probe": {
+          "relative_bias_frobenius": 0.011766197021543155,
+          "relative_rmse_frobenius": 0.11013254363463804,
+          "non_psd_fraction": 0.1175,
+          "median_minimum_eigenvalue": 1.3522628986070035
+        },
+        "plugin": {
+          "relative_bias_frobenius": 0.03437997785022532,
+          "relative_rmse_frobenius": 0.11727821174475156,
+          "non_psd_fraction": 0.0,
+          "median_minimum_eigenvalue": 3.175646831770971
+        }
+      }
+    }
+  },
+  "delete_block_same_person_diagonal": {
+    "blocks": 10,
+    "median_relative_frobenius_error": 0.01622391093886859,
+    "maximum_relative_frobenius_error": 0.09366008476927089,
+    "records": [
+      {
+        "block": 0,
+        "variants": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7
+        ],
+        "relative_frobenius_error_full_diagonal_reuse": 0.042173831006787336,
+        "minimum_remaining_annotation_mass": 16.0
+      },
+      {
+        "block": 1,
+        "variants": [
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15
+        ],
+        "relative_frobenius_error_full_diagonal_reuse": 0.07406043528901703,
+        "minimum_remaining_annotation_mass": 16.0
+      },
+      {
+        "block": 2,
+        "variants": [
+          16,
+          17,
+          18,
+          19,
+          20,
+          21,
+          22,
+          23
+        ],
+        "relative_frobenius_error_full_diagonal_reuse": 0.006953793549627241,
+        "minimum_remaining_annotation_mass": 24.0
+      },
+      {
+        "block": 3,
+        "variants": [
+          24,
+          25,
+          26,
+          27,
+          28,
+          29,
+          30,
+          31
+        ],
+        "relative_frobenius_error_full_diagonal_reuse": 0.012702638022165768,
+        "minimum_remaining_annotation_mass": 24.0
+      },
+      {
+        "block": 4,
+        "variants": [
+          32,
+          33,
+          34,
+          35,
+          36,
+          37,
+          38,
+          39
+        ],
+        "relative_frobenius_error_full_diagonal_reuse": 0.0230333036465838,
+        "minimum_remaining_annotation_mass": 24.0
+      },
+      {
+        "block": 5,
+        "variants": [
+          40,
+          41,
+          42,
+          43,
+          44,
+          45,
+          46,
+          47
+        ],
+        "relative_frobenius_error_full_diagonal_reuse": 0.09366008476927089,
+        "minimum_remaining_annotation_mass": 16.0
+      },
+      {
+        "block": 6,
+        "variants": [
+          48,
+          49,
+          50,
+          51,
+          52,
+          53,
+          54,
+          55
+        ],
+        "relative_frobenius_error_full_diagonal_reuse": 0.014043583064430612,
+        "minimum_remaining_annotation_mass": 24.0
+      },
+      {
+        "block": 7,
+        "variants": [
+          56,
+          57,
+          58,
+          59,
+          60,
+          61,
+          62,
+          63
+        ],
+        "relative_frobenius_error_full_diagonal_reuse": 0.0023110182620255837,
+        "minimum_remaining_annotation_mass": 24.0
+      },
+      {
+        "block": 8,
+        "variants": [
+          64,
+          65,
+          66,
+          67,
+          68,
+          69,
+          70,
+          71
+        ],
+        "relative_frobenius_error_full_diagonal_reuse": 0.01007949855794557,
+        "minimum_remaining_annotation_mass": 24.0
+      },
+      {
+        "block": 9,
+        "variants": [
+          72,
+          73,
+          74,
+          75,
+          76,
+          77,
+          78,
+          79
+        ],
+        "relative_frobenius_error_full_diagonal_reuse": 0.01840423881330657,
+        "minimum_remaining_annotation_mass": 24.0
+      }
+    ]
+  },
+  "scope": "Finite-probe bias/variance/PSD and exact-versus-full-diagonal deletion only; not confidence-interval coverage or type-I-error calibration."
+}

@@ -13,6 +13,8 @@
 - [Batch analyses](Batch-analyses.md)
 - [G×E models](GxE-models.md)
 - [Multiple environments](Multiple-environments.md)
+- [Cross-trait response models](Cross-trait-analysis.md)
+- [Binary traits and PCGC](Binary-traits-and-PCGC.md)
 - [Polygenic scores](Polygenic-scores.md)
 
 **Results and reference**

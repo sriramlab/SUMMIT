@@ -120,7 +120,9 @@ public:
         const std::string& qualification_fault_phase,
         int qualification_fault_row,
         int qualification_fault_column,
-        double qualification_fault_delta
+        double qualification_fault_delta,
+        int variant_start,
+        int variant_stop
     )
         : reader_(std::make_unique<DirectContext>(
               bed_descriptor, bim_descriptor, fam_descriptor,
@@ -130,6 +132,7 @@ public:
           )),
           rows_(reader_->n_),
           variants_(reader_->m_total_),
+          variant_start_(variant_start),
           q_(checked_blas_dim(basis.shape(1),
                               "generalized basis columns")),
           fixed_rank_(checked_blas_dim(
@@ -164,6 +167,12 @@ public:
           qualification_fault_column_(qualification_fault_column),
           qualification_fault_delta_(qualification_fault_delta) {
         validate_protected_gemm_threads(threads_);
+        if (variant_start < 0 || variant_start >= reader_->m_total_ ||
+            variant_stop < -1 || variant_stop > reader_->m_total_ ||
+            (variant_stop >= 0 && variant_stop <= variant_start)) {
+            throw std::invalid_argument("Invalid generalized variant interval");
+        }
+        variants_ = (variant_stop < 0 ? reader_->m_total_ : variant_stop) - variant_start;
         if (rows_ != checked_blas_dim(
                 basis.shape(0), "generalized basis rows") ||
             rows_ != checked_blas_dim(
@@ -451,6 +460,47 @@ public:
         result["internal_source_layout"] =
             "annotation_coordinate_probe_sample_v1";
         return result;
+    }
+
+    void enable_trait_statistics(
+        nb_mat2f_ro<double> phenotypes,
+        nb_mat2f_ro<double> residual_basis
+    ) {
+        std::lock_guard<std::mutex> guard(mutex_);
+        if (state_ != State::constructed || trait_count_ != 0) {
+            throw std::runtime_error("Trait statistics must be configured once before run");
+        }
+        const int traits = checked_blas_dim(phenotypes.shape(1), "trait count");
+        const int residuals = checked_blas_dim(residual_basis.shape(1), "residual count");
+        if (phenotypes.shape(0) != static_cast<size_t>(rows_) ||
+            residual_basis.shape(0) != static_cast<size_t>(rows_) ||
+            traits <= 0 || residuals <= 0) {
+            throw std::invalid_argument("Invalid fused trait statistics dimensions");
+        }
+        const size_t score_size = checked_mul(
+            checked_mul(variants_, q_, "trait scores"), traits, "trait scores");
+        const size_t info_size = checked_mul(
+            checked_mul(variants_, pairs_, "residual information"),
+            residuals, "residual information");
+        const size_t input_size = checked_mul(rows_, traits + residuals, "trait inputs");
+        if (checked_mul(score_size + info_size + input_size, sizeof(double),
+                        "trait statistics bytes") > max_workspace_bytes_) {
+            throw std::invalid_argument("Fused trait statistics exceed workspace budget");
+        }
+        for (size_t i = 0; i < phenotypes.size(); ++i) {
+            if (!std::isfinite(phenotypes.data()[i]))
+                throw std::invalid_argument("Nonfinite trait phenotype");
+        }
+        for (size_t i = 0; i < residual_basis.size(); ++i) {
+            if (!std::isfinite(residual_basis.data()[i]))
+                throw std::invalid_argument("Nonfinite residual basis");
+        }
+        trait_phenotypes_.assign(phenotypes.data(), phenotypes.data() + phenotypes.size());
+        trait_residual_basis_.assign(residual_basis.data(), residual_basis.data() + residual_basis.size());
+        trait_scores_.assign(score_size, 0.0);
+        trait_residual_information_.assign(info_size, 0.0);
+        trait_count_ = traits;
+        trait_residual_count_ = residuals;
     }
 
     nb::dict run() {
@@ -918,6 +968,13 @@ private:
     std::unique_ptr<DirectContext> reader_;
     int rows_ = 0;
     int variants_ = 0;
+    int variant_start_ = 0;
+    int trait_count_ = 0;
+    int trait_residual_count_ = 0;
+    std::vector<double> trait_phenotypes_;
+    std::vector<double> trait_residual_basis_;
+    std::vector<double> trait_scores_;
+    std::vector<double> trait_residual_information_;
     int q_ = 0;
     int fixed_rank_ = 0;
     int annotations_count_ = 0;
@@ -1624,7 +1681,8 @@ void GeneralizedGxELDScoreDirectContext::decode_block(
     ));
     std::vector<int> observed;
     missing_calls_ += reader_->decode_block_into(
-        start, stop, false, genotype.data(), observed,
+        variant_start_ + start, variant_start_ + stop,
+        false, genotype.data(), observed,
         affine_mean_.data() + static_cast<size_t>(start),
         affine_inverse_scale_.data() + static_cast<size_t>(start)
     );
@@ -1643,7 +1701,8 @@ void GeneralizedGxELDScoreDirectContext::read_packed_block(
     const double cpu = process_cpu_seconds_now();
     read_block_mailman_mean_memory(
         reader_->bed_base_, reader_->bed_size_, reader_->n_total_,
-        reader_->bytes_per_snp_, start, stop, reader_->rows_,
+        reader_->bytes_per_snp_, variant_start_ + start,
+        variant_start_ + stop, reader_->rows_,
         reader_->ddof_, packed
     );
     if (packed.N != rows_ || packed.L != stop - start) {
@@ -2931,6 +2990,17 @@ void GeneralizedGxELDScoreDirectContext::accumulate_component_kernel_diagonal(
             "generalized component-diagonal pair tile"
         ));
     }
+    // Reuse the already residualized feature tile. No new genotype traversal,
+    // per-trait feature matrix, or annotation-specific genotype decode.
+    std::vector<double> trait_pair_tile, trait_score_tile, trait_information_tile;
+    if (trait_count_ > 0) {
+        trait_pair_tile.resize(one_pair_tile_elements);
+        trait_score_tile.resize(checked_mul(
+            checked_mul(width, q_, "trait score tile"),
+            trait_count_, "trait score tile"));
+        trait_information_tile.resize(checked_mul(
+            width, trait_residual_count_, "trait information tile"));
+    }
     GeneralizedUninitializedDoubleBuffer& annotation_product =
         workspace.annotation_product;
     annotation_product.resize(checked_mul(
@@ -3052,7 +3122,7 @@ void GeneralizedGxELDScoreDirectContext::accumulate_component_kernel_diagonal(
                 coefficients.data(), feature_rows,
                 fixed_tile.data(), fixed_rank_,
                 feature_tile.data(), feature_rows, threads_,
-                -1.0, 0.0, &feature_resolution
+                1.0, 0.0, &feature_resolution
             );
             record_gemm_shape(
                 "pass2_component_diagonal_residual_nn", false,
@@ -3087,8 +3157,8 @@ void GeneralizedGxELDScoreDirectContext::accumulate_component_kernel_diagonal(
 #pragma omp simd
 #endif
                     for (int variant = 0; variant < width; ++variant) {
-                        destination[variant] +=
-                            phi * genotype_values[variant];
+                        destination[variant] =
+                            phi * genotype_values[variant] - destination[variant];
                     }
                 } else {
 #ifdef _OPENMP
@@ -3100,6 +3170,70 @@ void GeneralizedGxELDScoreDirectContext::accumulate_component_kernel_diagonal(
                     }
                 }
             }
+        }
+
+        if (trait_count_ > 0) {
+            const auto trait_wall = std::chrono::steady_clock::now();
+            const double trait_cpu = process_cpu_seconds_now();
+            GemmIntegrityResolution score_resolution;
+            (void)dgemm_nn_partitioned_rows(
+                feature_rows, trait_count_, sample_width,
+                feature_tile.data(), feature_rows,
+                trait_phenotypes_.data() + sample_start, rows_,
+                trait_score_tile.data(), feature_rows, threads_,
+                1.0, 0.0, &score_resolution);
+            record_integrity_resolution(score_resolution);
+            for (int trait = 0; trait < trait_count_; ++trait) {
+                for (int coordinate = 0; coordinate < q_; ++coordinate) {
+                    double* destination = trait_scores_.data()
+                        + static_cast<size_t>(trait * q_ + coordinate) * variants_ + start;
+                    const double* source = trait_score_tile.data()
+                        + static_cast<size_t>(trait * q_ + coordinate) * width;
+                    for (int variant = 0; variant < width; ++variant)
+                        destination[variant] += source[variant];
+                }
+            }
+            for (int pair = 0; pair < pairs_; ++pair) {
+                const int left = static_cast<int>(pair_table_[2 * pair]);
+                const int right = static_cast<int>(pair_table_[2 * pair + 1]);
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static) num_threads(threads_)
+#endif
+                for (int sample = 0; sample < sample_width; ++sample) {
+                    const double* l = feature_tile.data()
+                        + static_cast<size_t>(sample * q_ + left) * width;
+                    const double* r = feature_tile.data()
+                        + static_cast<size_t>(sample * q_ + right) * width;
+                    double* destination = trait_pair_tile.data()
+                        + static_cast<size_t>(sample) * width;
+                    for (int variant = 0; variant < width; ++variant)
+                        destination[variant] = l[variant] * r[variant];
+                }
+                GemmIntegrityResolution info_resolution;
+                (void)dgemm_nn_partitioned_rows(
+                    width, trait_residual_count_, sample_width,
+                    trait_pair_tile.data(), width,
+                    trait_residual_basis_.data() + sample_start, rows_,
+                    trait_information_tile.data(), width, threads_,
+                    1.0, 0.0, &info_resolution);
+                record_integrity_resolution(info_resolution);
+                // Keep the protected GEMM as an overwrite. A beta=1 call
+                // deliberately uses a deterministic fallback intended for
+                // small projection ranks, which is expensive at sample rank.
+                for (int residual = 0; residual < trait_residual_count_; ++residual) {
+                    double* destination = trait_residual_information_.data()
+                        + static_cast<size_t>(pair * trait_residual_count_ + residual) * variants_ + start;
+                    const double* source = trait_information_tile.data()
+                        + static_cast<size_t>(residual) * width;
+                    for (int variant = 0; variant < width; ++variant)
+                        destination[variant] += source[variant];
+                }
+            }
+            record_gemm_shape(
+                "pass2_fused_trait_statistics_nn", false,
+                width, q_ * trait_count_ + pairs_ * trait_residual_count_,
+                sample_width, generalized_elapsed_seconds(trait_wall),
+                std::max(0.0, process_cpu_seconds_now() - trait_cpu));
         }
 
         for (int pair_start = 0; pair_start < pairs_;
@@ -3129,41 +3263,25 @@ void GeneralizedGxELDScoreDirectContext::accumulate_component_kernel_diagonal(
                                 + static_cast<size_t>(annotations_count_),
                             0.0
                         );
-                    }
-                    for (int variant = 0; variant < width; ++variant) {
-                        const size_t global_variant =
-                            static_cast<size_t>(start + variant);
-                        const int annotation = singleton_annotation_index_[
-                            global_variant
-                        ];
-                        const double weight = singleton_annotation_weight_[
-                            global_variant
-                        ];
-                        for (int local_pair = 0; local_pair < pair_width;
-                             ++local_pair) {
-                            const int pair = pair_start + local_pair;
-                            const int left = pair_q(pair);
-                            const int right = pair_r(pair);
-                            const double* left_values = feature_tile.data()
-                                + (static_cast<size_t>(sample)
-                                       * static_cast<size_t>(q_)
-                                   + static_cast<size_t>(left))
-                                    * static_cast<size_t>(width);
-                            const double* right_values = feature_tile.data()
-                                + (static_cast<size_t>(sample)
-                                       * static_cast<size_t>(q_)
-                                   + static_cast<size_t>(right))
-                                    * static_cast<size_t>(width);
-                            const double pair_value = pair_factor(pair)
+                        // Keep one pair's K accumulators hot. With power-of-two
+                        // sample tiles, cycling through every pair inside the
+                        // variant loop causes severe cache-set aliasing. The
+                        // variant reduction order for each cell is unchanged.
+                        const int pair = pair_start + local_pair;
+                        const int left = pair_q(pair);
+                        const int right = pair_r(pair);
+                        const double factor = pair_factor(pair);
+                        const double* left_values = feature_tile.data()
+                            + (static_cast<size_t>(sample) * q_ + left) * width;
+                        const double* right_values = feature_tile.data()
+                            + (static_cast<size_t>(sample) * q_ + right) * width;
+                        for (int variant = 0; variant < width; ++variant) {
+                            const size_t global_variant = static_cast<size_t>(start + variant);
+                            const int annotation = singleton_annotation_index_[global_variant];
+                            const double weight = singleton_annotation_weight_[global_variant];
+                            const double pair_value = factor
                                 * left_values[variant]
                                 * right_values[variant];
-                            double* destination = annotation_product.data()
-                                + (static_cast<size_t>(local_pair)
-                                       * static_cast<size_t>(sample_width)
-                                   + static_cast<size_t>(sample))
-                                    * static_cast<size_t>(
-                                        annotations_count_
-                                    );
                             destination[annotation] += weight * pair_value;
                         }
                     }
@@ -4071,6 +4189,9 @@ nb::dict GeneralizedGxELDScoreDirectContext::publish_result() {
     ledger["integrity_failures"] = integrity_failures_;
     ledger["integrity_failure_count"] = integrity_failures_;
     ledger["state"] = "finalized";
+    ledger["physical_variant_start"] = variant_start_;
+    ledger["physical_variant_stop"] = variant_start_ + variants_;
+    ledger["fused_trait_count"] = trait_count_;
 
     const uint64_t base_source_output_bytes = checked_mul(
         static_cast<uint64_t>(
@@ -4104,6 +4225,7 @@ nb::dict GeneralizedGxELDScoreDirectContext::publish_result() {
             + genetic_gram_.size()
             + annotation_masses_.size()
             + affine_mean_.size() + affine_inverse_scale_.size()
+            + trait_scores_.size() + trait_residual_information_.size()
             + (retain_base_sources_ ? base_sources_.size() : 0U)
         ),
         static_cast<uint64_t>(sizeof(double)),
@@ -4152,6 +4274,8 @@ nb::dict GeneralizedGxELDScoreDirectContext::publish_result() {
         static_cast<size_t>(components_)
     );
     result["annotation_masses"] = move_vector(annotation_masses_);
+    result["trait_scores"] = move_vector(trait_scores_);
+    result["trait_residual_information"] = move_vector(trait_residual_information_);
     // The downstream trait pass must use the exact affine scale sealed by
     // this reference run.  Publish these small per-variant vectors with the
     // ephemeral native result so callers do not need an extra genotype pass.

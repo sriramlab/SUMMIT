@@ -286,6 +286,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="SUMMIT: Summary-stats-based Unified Method for Multivariate Inference of Traits"
     )
+    from .pcgc.cli import add_arguments as add_binary_arguments
+    add_binary_arguments(parser)
 
     # Trace / LD input
     parser.add_argument("--trace", default=None, type=str,
@@ -2767,8 +2769,19 @@ def _require_integer_step_size(args, command: str) -> None:
 
 
 def main():
+    if sys.argv[1:3] == ['reference', 'zpass']:
+        from .context.reference_zpass_cli import main as zpass_main
+        return zpass_main(sys.argv[3:])
     parser = build_parser()
     args = parser.parse_args()
+    if any(token.split("=", 1)[0].startswith("--binary-") or
+           token.split("=", 1)[0] in {"--make-binary-sumstats", "--_binary-research"}
+           for token in sys.argv[1:]):
+        from .pcgc.cli import run as run_binary
+        try:
+            return run_binary(args, sys.argv[1:])
+        except (ValueError, RuntimeError, OSError) as exc:
+            parser.error(str(exc))
     try:
         _validate_explicit_openmp_placement_request(args)
     except ValueError as exc:

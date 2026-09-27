@@ -72,6 +72,7 @@ class ContextNormalEquations:
     transferred_genetic_gram: np.ndarray
     reference_n: int
     study_n: int
+    target_source: bool = False
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "component_names", tuple(self.component_names))
@@ -381,7 +382,15 @@ def solve_context_normal_equations(
     rtol: float | None = None,
     require_full_rank: bool = True,
 ) -> ContextSolveResult:
-    """Solve a complete symmetric system without an inverse or regularizer."""
+    """Rank-revealing solve, with an explicit directional target/source arm.
+
+    Full and historical systems use the unchanged symmetric spectral solve.
+    Fixed-source target deletions use SVD because their row and column
+    kernels differ. They must not be silently symmetrized.
+    """
+    if equations.target_source:
+        from .target_jackknife import solve_target_equations
+        return solve_target_equations(equations,rtol=rtol,require_full_rank=require_full_rank)
     matrix = _finite_float64("normal matrix", equations.matrix, ndim=2)
     rhs = _finite_float64("normal RHS", equations.rhs, ndim=1)
     if matrix.shape[0] != matrix.shape[1] or rhs.shape != (matrix.shape[0],):

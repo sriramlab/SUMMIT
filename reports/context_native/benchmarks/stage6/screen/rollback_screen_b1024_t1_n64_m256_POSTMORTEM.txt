@@ -1,0 +1,64 @@
+scope: read_only_postmortem_no_rerun
+failure_evidence: reports/context_native/benchmarks/stage6/screen/rollback_screen_b1024_t1_n64_m256_FAILURE.txt
+failure_evidence_sha256: 4a650b4376105fbd2873c6163826cd5b737bc4225c0d1be06084ec32427b6e36
+
+artifact_recovery:
+  final_benchmark_output: absent
+  failed_worker_pid: absent_after_controller_exit
+  generated_reference_npz: unavailable
+  recent_workspace_request_result_or_npz_files: none_found_under_/tmp
+  conclusion: controller TemporaryDirectory cleanup removed the failed worker workspace and generated reference artifact
+
+stable_reference_container_bounds:
+  family_member_count_cap: 8
+  family_members: 6_scientific_arrays_plus_manifest_json_and_manifest_sha256
+  manifest_json_npy_file_size_cap_bytes: 16777216
+  manifest_sha256_npy_file_size_cap_bytes: 1024
+  npy_header_length_cap_bytes: 65536
+  generic_member_file_size_cap_bytes: 8589934592
+  total_uncompressed_container_cap_bytes: 17179869184
+  maximum_central_directory_bytes: 532848
+
+recoverable_failed_member_properties:
+  member: manifest_json.npy
+  writer_expression: np.asarray(canonical_json(artifact.manifest))
+  writer_shape: scalar_`()`
+  writer_descriptor: little_endian_unicode_`<U{character_count}`
+  loader_failure_predicate: descriptor_not_unicode_OR_shape_not_scalar_OR_member_file_size_above_16777216
+  inference: because this artifact was produced immediately beforehand by the paired stable writer, which fixes the Unicode scalar descriptor and scalar shape, the triggered predicate is member_file_size_above_16777216
+  exact_descriptor: unavailable_after_workspace_cleanup
+  exact_npy_header_length: unavailable_after_workspace_cleanup_but_was_within_65536_or_inspection_would_have_failed_earlier
+  exact_unicode_payload_bytes: unavailable_after_workspace_cleanup
+  recoverable_member_size_bound: strictly_greater_than_16777216_bytes
+
+reference_native_call_ledger_for_exact_geometry:
+  sample_probe_projection_tn: 64
+  sample_probe_projection_nn: 64
+  source_tn: 128
+  full_target_nn: 256
+  action_projection_tn: 64
+  action_projection_nn: 64
+  action_gram_tn: 8
+  group_target_nn: 512
+  group_cross_gram_tn: 4
+  direct_grouped_tn: 0
+  same_person_target_nn: 128
+  same_person_projection_tn: 64
+  same_person_projection_nn: 64
+  same_person_gram_tn: 65
+  total_protected_calls: 1485
+  required_telemetry_capacity_formula: total_protected_calls_times_8_plus_32
+  required_telemetry_capacity_events: 11912
+  event_struct_bytes_from_same_build_accepted_B16_admission: 376
+  admitted_native_telemetry_bytes: 4478912
+  expected_no_fault_observed_events: 2987
+  expected_event_formula: 2_times_1485_protected_and_scalar_witness_plus_5_phase_transitions_plus_9_checkpoints_plus_1_group_reconstruction_plus_1_scratch_release_plus_1_publication
+
+trait_native_ledger_not_reached:
+  total_protected_calls: 10
+  required_telemetry_capacity_events: 112
+  expected_no_fault_observed_events: 30
+
+classification: rejected_by_existing_16MiB_bounded_manifest_policy
+source_or_loader_change_performed: false
+b1024_r256_r512_r1024_workers_run: false

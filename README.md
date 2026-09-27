@@ -13,6 +13,8 @@ gene–environment interaction models and polygenic scores.
 - Batch analysis of many traits and annotation models.
 - Gene–environment interaction (G×E) and environment-dependent residual variance.
 - Joint models of multiple continuous or categorical environments.
+- Cross-trait genetic response covariance through the research Python API.
+- Ascertainment-aware binary-trait regression with PCGC.
 - G×E polygenic score fitting, scoring, and calibration.
 
 Genotype input can be PLINK BED hard calls or biallelic diploid PGEN dosages.
@@ -58,6 +60,8 @@ sample sizes are unsuitable for evaluating statistical performance.
 - [Batch analyses](https://github.com/bronsonj98/SUMMIT/wiki/Batch-analyses)
 - [G×E models](https://github.com/bronsonj98/SUMMIT/wiki/GxE-models)
 - [Multiple environments](https://github.com/bronsonj98/SUMMIT/wiki/Multiple-environments)
+- [Cross-trait response models](https://github.com/bronsonj98/SUMMIT/wiki/Cross-trait-analysis)
+- [Binary traits and PCGC](https://github.com/bronsonj98/SUMMIT/wiki/Binary-traits-and-PCGC)
 - [G×E polygenic scores](https://github.com/bronsonj98/SUMMIT/wiki/Polygenic-scores)
 - [Real-data results](https://github.com/bronsonj98/SUMMIT/wiki/Real-data-results)
 - [Benchmarks](https://github.com/bronsonj98/SUMMIT/wiki/Benchmarks)

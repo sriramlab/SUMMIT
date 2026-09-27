@@ -1,0 +1,121 @@
+{
+  "affinity": [
+    32,
+    33,
+    34,
+    35
+  ],
+  "arguments": {
+    "environments": 5,
+    "m": 800,
+    "memory_gib": 1.0,
+    "n": 8000,
+    "probes": 32,
+    "seed": 20260814,
+    "step_size": 200,
+    "threads": 4,
+    "workspace_gib": 2.0
+  },
+  "cpu_seconds": 2.556075356,
+  "decode": {
+    "calls": 12,
+    "seconds": 0.4585105918813497
+  },
+  "gemm": [
+    {
+      "calls": 1,
+      "left": [
+        8000,
+        2
+      ],
+      "operation": "NN",
+      "output": [
+        8000,
+        320
+      ],
+      "right": [
+        2,
+        320
+      ],
+      "seconds": 0.0029120350372977555
+    },
+    {
+      "calls": 4,
+      "left": [
+        8000,
+        200
+      ],
+      "operation": "NN",
+      "output": [
+        8000,
+        320
+      ],
+      "right": [
+        200,
+        320
+      ],
+      "seconds": 0.09340730792609975
+    },
+    {
+      "calls": 1,
+      "left": [
+        8000,
+        2
+      ],
+      "operation": "TN",
+      "output": [
+        2,
+        320
+      ],
+      "right": [
+        8000,
+        320
+      ],
+      "seconds": 0.0013975950423628092
+    },
+    {
+      "calls": 4,
+      "left": [
+        8000,
+        80
+      ],
+      "operation": "TN",
+      "output": [
+        80,
+        200
+      ],
+      "right": [
+        8000,
+        200
+      ],
+      "seconds": 0.03366856597131118
+    },
+    {
+      "calls": 4,
+      "left": [
+        8000,
+        200
+      ],
+      "operation": "TN",
+      "output": [
+        200,
+        640
+      ],
+      "right": [
+        8000,
+        640
+      ],
+      "seconds": 0.14394466107478365
+    }
+  ],
+  "gemm_total_calls": 14,
+  "gemm_total_seconds": 0.27533016505185515,
+  "label": "private_passive_algebraic_l5_rep3",
+  "max_rss_kib": 266156,
+  "mode": "shared",
+  "profile": null,
+  "repairs": 0,
+  "schema": "summit.gxe.multi_environment_profile.v1",
+  "shared_genotype_passes": 3,
+  "wall_seconds": 1.3599964019958861
+}

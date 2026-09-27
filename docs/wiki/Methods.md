@@ -3,6 +3,17 @@
 This page collects the definitions needed to interpret the estimates. Usage
 examples are in the individual analysis guides.
 
+The binary-trait path has a separate [PCGC guide](Binary-traits-and-PCGC.md)
+and [scientific contract](../pcgc.md).
+It uses ascertainment-aware risks and off-diagonal moments without the
+quantitative variance row described below. Ordinary beta/SE inputs do not
+implicitly become PCGC summaries.
+
+Ordered cross-trait G×E equations and their paired uncertainty are described in
+[Cross-trait genetic response covariance](Cross-trait-response-covariance.md).
+Their directional target-block deletion convention is distinct from the
+generalized within-trait convention below.
+
 ## h² and rg summary statistics
 
 For a marginal linear-regression coefficient beta, standard error se, and

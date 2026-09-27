@@ -3,6 +3,11 @@
 These analyses require GWAS summary statistics, reference LD scores, and
 optional SNP annotations. See [Input files](Input-files.md) for column names.
 
+For binary traits, [PCGC](Binary-traits-and-PCGC.md) prepares ascertainment-aware
+moments from individual data. Ordinary logistic beta/SE files cannot substitute
+for those moments. To estimate covariance between two traits' environmental
+genetic responses, use the [cross-trait research API](Cross-trait-analysis.md).
+
 ## Heritability
 
 ```bash

@@ -1,0 +1,19 @@
+{
+  "child_ru_maxrss_kib": 13515824,
+  "child_system_cpu_seconds": 29.883119999999998,
+  "child_user_cpu_seconds": 405.13975,
+  "elapsed_seconds": 60.42564592504641,
+  "exit_code": 0,
+  "finished_utc": "2026-08-15T22:35:19Z",
+  "forwarded_signal": null,
+  "kind": "summit.process_resource_measurement",
+  "num_samples": 3,
+  "peak_sampled_process_tree": {
+    "pss_bytes": 10988155904,
+    "rss_bytes": 11022204928,
+    "uss_bytes": 10963132416
+  },
+  "sample_interval_seconds": 30.0,
+  "schema_version": 1,
+  "started_utc": "2026-08-15T22:34:19Z"
+}

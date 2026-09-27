@@ -1,0 +1,20 @@
+{
+  "schema": "context_native_stage6_fault_qualification_pending_v1",
+  "status": "pending",
+  "usable_as_build_qualification": false,
+  "source_commit": "69fc6c19d0b5b4cdc762c0ae92ad91a4cae61861",
+  "source_tree_sha256": "aa63e704eb31954e70fabe09bbae7337e1bdb1653ba98de8d57be15f09bbb956",
+  "native_module_sha256": "7a52639ba60e5e486f4cf60cecd7275cb77a1f49a04f660b00865324058ec8f7",
+  "completed_evidence": {
+    "clean_release_build": true,
+    "serial_witness_regression_passed": 2,
+    "focused_stage2_to_stage6_passed": 474,
+    "focused_stage2_to_stage6_skipped": 1
+  },
+  "pending_evidence": [
+    "full_regression",
+    "asan_ubsan",
+    "ubsan",
+    "content_bound_fault_qualification"
+  ]
+}

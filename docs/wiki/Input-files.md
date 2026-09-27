@@ -47,6 +47,12 @@ Optional `COV_RANK` or `P_EFF` gives the number of non-intercept GWAS covariates
 h² calculation uses a covariate-rank value of zero, including when h² supplies
 the denominator for rg. [Methods](Methods.md) explains the calculation.
 
+Binary PCGC uses a separate joint `.binary.npz` artifact containing compatible
+trait and reference moments. Prepare it from a `FID IID Y` table, population
+prevalence, population genotype scales, and optional risk covariates; see
+[Binary traits and PCGC](Binary-traits-and-PCGC.md). Its annotation TSV has
+`SNP` followed only by named nonnegative weight columns.
+
 ## LD scores and annotations
 
 LD-score files begin with `CHR SNP BP`, optionally `CM`, followed by LD-score

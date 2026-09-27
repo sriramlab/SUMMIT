@@ -15987,7 +15987,7 @@ NB_MODULE(gxeldcore, module) {
                 uint64_t, int64_t, int, int, int, int, int, int, int,
                 uint64_t,
                 int, int, bool, bool, bool, bool, bool,
-                const std::string&, int, int, double
+                const std::string&, int, int, double, int, int
             >(),
             nb::arg("bed_descriptor"), nb::arg("bim_descriptor"),
             nb::arg("fam_descriptor"), nb::arg("row_sel"),
@@ -16013,8 +16013,13 @@ NB_MODULE(gxeldcore, module) {
             nb::arg("qualification_fault_phase") = "none",
             nb::arg("qualification_fault_row") = -1,
             nb::arg("qualification_fault_column") = -1,
-            nb::arg("qualification_fault_delta") = 0.0
+            nb::arg("qualification_fault_delta") = 0.0,
+            nb::arg("variant_start") = 0,
+            nb::arg("variant_stop") = -1
         )
+        .def("enable_trait_statistics",
+             &GeneralizedGxELDScoreDirectContext::enable_trait_statistics,
+             nb::arg("phenotypes"), nb::arg("residual_basis"))
         .def("info", &GeneralizedGxELDScoreDirectContext::info)
         .def("progress", &GeneralizedGxELDScoreDirectContext::progress)
         .def(

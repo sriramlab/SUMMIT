@@ -1,0 +1,35 @@
+{
+  "components": [
+    "G--G",
+    "G--GxE",
+    "GxE--GxE"
+  ],
+  "design": {
+    "annotation_count": 1,
+    "ar1_correlation": 0.35,
+    "feature_convention": "post-projection per-variant standardization",
+    "marker_distribution": "correlated Gaussian",
+    "projected_design": [
+      "intercept",
+      "standardized_environment"
+    ],
+    "reference_samples": 2500,
+    "seed": 20260814,
+    "studies": 60,
+    "study_samples": 350,
+    "variants": 60
+  },
+  "median_absolute_relative_error_percent": {
+    "naive_squared_residual_rank_scaling": [
+      9.267914156002004,
+      86.46409781585874,
+      23.513940167331064
+    ],
+    "same_different_person_transfer": [
+      2.1715952715648945,
+      3.135345280994321,
+      2.230506708202805
+    ]
+  },
+  "schema": "summit.gxe.reference_transfer_simulation.v1"
+}
