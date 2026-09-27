@@ -9,7 +9,7 @@ from summit.prediction import (
     fit_prediction, score_prediction,
 )
 
-with FileGenotypeSource("discovery.bed", genome_build="GRCh37") as source:
+with FileGenotypeSource("discovery.bed") as source:
     plan = plan_prediction(traits, source, storage="compact",
                            memory_bytes=16 * 2**30, threads=8)
     models = fit_prediction(traits, source, output="models",
@@ -29,12 +29,9 @@ env BLIS_NUM_THREADS=8 OPENBLAS_NUM_THREADS=8 OMP_NUM_THREADS=8 MKL_NUM_THREADS=
 
 `scripts/prediction/demo.py` is a complete synthetic construction of both inputs.
 
-The default fitting RHS tile is 160 columns. A 28-candidate, five-component fit then
-uses one 140-column matrix batch per genotype block, reducing repeated reads
-of that block. `rhs_columns` (CLI `--rhs-columns`) remains an explicit memory
-and throughput control; smaller values can help when memory is tight. The
-planner includes the wider scratch in its admission estimate. This changes
-matrix tiling only; priors, FP64 arithmetic and convergence checks are unchanged.
+`rhs_columns` (CLI `--rhs-columns`) controls the number of simultaneous
+model columns in a matrix operation; the fitting default is 160. Smaller
+tiles reduce temporary memory but may require more computation.
 
 ## Building a trait
 
@@ -151,18 +148,9 @@ its `.lock` alongside protected training inputs, outside portable model bundles.
 Saving requires space for two generations during atomic replacement (about
 `6 * 8 * N * candidates` bytes plus small metadata for a single trait).
 
-The native executor fuses sample/SNP selection, allele orientation, missing-call
-imputation and FP64 scaling into one reusable block. It also reuses GEMM scratch.
-There is no genome-sized FP64 expansion in compact BED mode. Candidates awaiting
-true-residual verification remain frozen while their checks share the next
-genotype traversal with other candidates' CG steps. This does not relax any
-convergence threshold. The pass ledger distinguishes `cg`, `verification`, and
-`cg_and_verification`.
-
 For bound OpenMP workers, set explicit singleton `OMP_PLACES` and the other
-OpenMP controls before importing numerical libraries. The prediction API now
-registers this placement with the native backend, which gives BLIS workers the
-complete reserved CPU set. Ambiguous bound placement fails before cache setup.
+OpenMP controls before importing numerical libraries. BLIS and OpenMP workers must use the
+reserved CPU set.
 For example, on an allocation containing physical CPUs 0, 2, 4 and 6:
 
 ```bash
@@ -171,8 +159,7 @@ env OMP_NUM_THREADS=4 OMP_THREAD_LIMIT=4 OMP_DYNAMIC=FALSE \
   BLIS_NUM_THREADS=4 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1 python fit.py
 ```
 
-Use the CPUs actually assigned by the scheduler. Native builds predating
-`prediction_execution_version=2` must be rebuilt for this Python implementation.
+Use the CPUs actually assigned by the scheduler.
 
 ## Calibration and evaluation
 

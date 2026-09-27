@@ -24,9 +24,9 @@ DEFAULT_BINARY_NJACK = 200
 def add_arguments(parser):
     group = parser.add_argument_group("Binary liability regression")
     group.add_argument("--binary-method", choices=("liability", "pcgc", "pcgc-inverse", "pcgc-basis", "pcgc-ld"),
-                       help="Ascertainment-aware method; requires a typed binary artifact or raw score preparation.")
+                       help="Ascertainment-aware method; requires a binary moment file or raw score preparation.")
     group.add_argument("--make-binary-sumstats", metavar="TSV", help="Prepare binary moments from FID, IID, Y and optional risk covariates.")
-    group.add_argument("--binary-scale", help="Population scale: sealed SUMMIT directory or SNP/A1/A2/MEAN/INV_SD TSV.")
+    group.add_argument("--binary-scale", help="Population scale: SUMMIT scale directory or SNP/A1/A2/MEAN/INV_SD TSV.")
     group.add_argument("--binary-reference-geno", help="Independent population BED/PGEN reference for the pcgc-ld approximation.")
     group.add_argument("--binary-prevalence", type=float, help="Externally supplied population prevalence.")
     group.add_argument("--binary-covariates", help="Comma-separated exogenous covariate columns in the sample table; no intercept.")
@@ -99,14 +99,14 @@ def population_scale(path, source):
 
 
 def prepare(args):
-    if any(value is None for value in (args.geno, args.binary_scale, args.binary_prevalence, args.genome_build)):
-        raise ValueError("--make-binary-sumstats requires --geno, --binary-scale, --binary-prevalence and --genome-build")
+    if any(value is None for value in (args.geno, args.binary_scale, args.binary_prevalence)):
+        raise ValueError("--make-binary-sumstats requires --geno, --binary-scale, --binary-prevalence")
     if args.binary_risk_column and args.binary_covariates:
         raise ValueError("choose supplied population risks or fitted risk covariates")
     if args.binary_covariate_variance is not None and not args.binary_risk_column:
         raise ValueError("--binary-covariate-variance accompanies supplied population risks")
-    if not np.isfinite(args.memory_gib) or args.memory_gib <= 0:
-        raise ValueError("binary reference memory must be finite and positive")
+    if args.memory_gib == "auto" or not np.isfinite(args.memory_gib) or args.memory_gib <= 0:
+        raise ValueError("binary --memory-gib requires a finite positive number")
     if args.step_size == "auto":
         raise ValueError("binary --block-size requires a positive integer; auto is supported only by GxE reference generation")
     with ExitStack() as stack:
@@ -135,23 +135,20 @@ def prepare(args):
                                    reference_source=reference)
 
 
-def run(args, argv, *, parser=None):
+def run(args, argv):
     """Only explicitly supported flags can enter the binary scientific path."""
     allowed = {"--binary-method", "--make-binary-sumstats", "--binary-scale", "--binary-prevalence",
                "--genome-build", "--binary-covariates", "--binary-risk-column", "--binary-covariate-variance",
                "--nvecs", "--seed", "--memory-gib", "--block-size",
                "--binary-basis-columns", "--binary-basis-coefficients", "--binary-reference-geno",
                "--geno", "--annot", "--out", "--h2", "--njack", "--num-threads"}
-    if parser is None:
-        from summit.cli import build_parser
-        parser = build_parser()
-    explicit = explicit_options(parser, argv)
+    explicit = explicit_options(argv)
     if explicit-allowed:
-        raise ValueError("unsupported options for the binary contract: "+", ".join(sorted(explicit-allowed)))
+        raise ValueError("unsupported options for the binary analysis: "+", ".join(sorted(explicit-allowed)))
     if args.binary_method is None or args.out is None:
         raise ValueError("binary workflows require --binary-method and --out")
     if bool(args.make_binary_sumstats) == bool(args.h2):
-        raise ValueError("choose --make-binary-sumstats or --h2 with one typed binary artifact")
+        raise ValueError("choose --make-binary-sumstats or --h2 with one binary moment file")
     prefix = Path(args.out)
     output = Path(str(prefix)+(".binary.npz" if args.make_binary_sumstats else ".binary.json"))
     if output.exists():
@@ -164,7 +161,7 @@ def run(args, argv, *, parser=None):
     else:
         preparation_options = explicit - {"--binary-method", "--h2", "--out", "--njack", "--num-threads"}
         if preparation_options:
-            raise ValueError("binary fit uses the sealed artifact; remove preparation options: "+", ".join(sorted(preparation_options)))
+            raise ValueError("binary fit uses the saved binary file; remove preparation options: "+", ".join(sorted(preparation_options)))
         artifact = load_artifact(args.h2)
         if args.binary_method != artifact.moments.method:
             raise ValueError("binary method disagrees with the prepared artifact; recompute raw scores/reference")

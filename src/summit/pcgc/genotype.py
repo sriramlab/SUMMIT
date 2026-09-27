@@ -16,7 +16,7 @@ def scaled_file_operator(source, scale, rows, *, block_size=256, threads=1, nati
     if np.any(np.diff(rows) <= 0):
         raise ValueError("binary sample rows must be sorted")
     if scale.variant_identity != source.variants.identity:
-        raise ValueError("population genotype scale and source variant/allele axes disagree")
+        raise ValueError("population genotype scale and source variant/allele axes disagree; check SNP order, alleles, and any saved genome-build label")
     if scale.provenance.get("population_scale") is not True:
         raise ValueError("PCGC requires a scale explicitly declared to describe the population")
     if len(scale.mean) != len(source.variants.ids):

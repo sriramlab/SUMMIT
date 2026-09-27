@@ -18,7 +18,7 @@ gene–environment interaction models and polygenic scores.
 - G×E polygenic score fitting, scoring, and calibration.
 
 Genotype input can be PLINK BED hard calls or biallelic diploid PGEN dosages.
-See the [user guide](https://github.com/bronsonj98/SUMMIT/wiki) for the inputs and availability of each method.
+See the [user guide](https://github.com/sriramlab/SUMMIT/wiki) for the inputs and availability of each method.
 
 ## Install
 
@@ -27,7 +27,7 @@ The environment file supplies the Python and numerical-library dependencies.
 Linux is recommended; the direct generalized G×E backend requires Linux.
 
 ```bash
-git clone https://github.com/bronsonj98/SUMMIT.git
+git clone https://github.com/sriramlab/SUMMIT.git
 cd SUMMIT
 conda env create -f environment.yml
 conda activate summit
@@ -37,7 +37,7 @@ summit pgs --help
 summit reference --help
 ```
 
-See [Installation](https://github.com/bronsonj98/SUMMIT/wiki/Installation) for compiler setup, development
+See [Installation](https://github.com/sriramlab/SUMMIT/wiki/Installation) for compiler setup, development
 installs, and the additional build needed for generalized G×E reference estimation.
 
 ## Try it
@@ -55,20 +55,19 @@ sample sizes are unsuitable for evaluating statistical performance.
 
 ## Documentation
 
-[Commands and options](docs/wiki/Commands-and-options.md) lists the shared flags
-and older spellings that remain supported.
+[Commands and options](docs/wiki/Commands-and-options.md) lists the commands and shared analysis options.
 
-- [Input files](https://github.com/bronsonj98/SUMMIT/wiki/Input-files)
-- [LD scores](https://github.com/bronsonj98/SUMMIT/wiki/LD-scores)
-- [Heritability and genetic correlation](https://github.com/bronsonj98/SUMMIT/wiki/Heritability-and-genetic-correlation)
-- [Batch analyses](https://github.com/bronsonj98/SUMMIT/wiki/Batch-analyses)
-- [G×E models](https://github.com/bronsonj98/SUMMIT/wiki/GxE-models)
-- [Multiple environments](https://github.com/bronsonj98/SUMMIT/wiki/Multiple-environments)
-- [Cross-trait response models](https://github.com/bronsonj98/SUMMIT/wiki/Cross-trait-analysis)
-- [Binary traits and PCGC](https://github.com/bronsonj98/SUMMIT/wiki/Binary-traits-and-PCGC)
-- [G×E polygenic scores](https://github.com/bronsonj98/SUMMIT/wiki/Polygenic-scores)
-- [Real-data results](https://github.com/bronsonj98/SUMMIT/wiki/Real-data-results)
-- [Benchmarks](https://github.com/bronsonj98/SUMMIT/wiki/Benchmarks)
+- [Input files](https://github.com/sriramlab/SUMMIT/wiki/Input-files)
+- [LD scores](https://github.com/sriramlab/SUMMIT/wiki/LD-scores)
+- [Heritability and genetic correlation](https://github.com/sriramlab/SUMMIT/wiki/Heritability-and-genetic-correlation)
+- [Batch analyses](https://github.com/sriramlab/SUMMIT/wiki/Batch-analyses)
+- [G×E models](https://github.com/sriramlab/SUMMIT/wiki/GxE-models)
+- [Multiple environments](https://github.com/sriramlab/SUMMIT/wiki/Multiple-environments)
+- [Cross-trait response models](https://github.com/sriramlab/SUMMIT/wiki/Cross-trait-analysis)
+- [Binary traits and PCGC](https://github.com/sriramlab/SUMMIT/wiki/Binary-traits-and-PCGC)
+- [G×E polygenic scores](https://github.com/sriramlab/SUMMIT/wiki/Polygenic-scores)
+- [Real-data results](https://github.com/sriramlab/SUMMIT/wiki/Real-data-results)
+- [Benchmarks](https://github.com/sriramlab/SUMMIT/wiki/Benchmarks)
 
 ## Citation
 

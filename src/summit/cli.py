@@ -13,7 +13,7 @@ import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
-from .cli_options import ArgumentParser, explicit_options, positive_gib
+from .cli_options import ArgumentParser, explicit_options
 
 
 def _canonicalize_cpu_affinity_mask(values):
@@ -165,19 +165,15 @@ _GXE_BATCH_REFERENCE_OPTIONS = frozenset(
         "--rand-samp",
         "--ddof",
         "--impute-method",
-        "--target-xz-mem",
-        "--target-mem",
+        "--memory-gib",
         "--gxe-total-memory-gib",
         "--device",
     }
 )
 
 
-def _provided_long_options(argv, *, parser=None):
-    """Return canonical explicit long options, including accepted abbreviations."""
-    if parser is not None:
-        return explicit_options(parser, argv)
-    return {token.split("=", 1)[0] for token in argv if isinstance(token, str) and token.startswith("--")}
+def _provided_long_options(argv):
+    return explicit_options(argv)
 
 import numpy as np
 import pandas as pd
@@ -268,14 +264,12 @@ class _SummitArgumentParser(ArgumentParser):
     def parse_known_args(self, args=None, namespace=None):
         tokens = list(sys.argv[1:] if args is None else args)
         parsed, rest = super().parse_known_args(tokens, namespace)
-        if parsed.binary_method is not None or parsed.make_binary_sumstats is not None:
-            supplied = explicit_options(self, tokens)
-            # Sharing names must not silently change a method's numerical
-            # defaults or its finite-probe realization.
-            for flag, dest, value in (("--nvecs", "nvecs", 256), ("--seed", "seed", 0),
-                                      ("--block-size", "step_size", 256), ("--memory-gib", "memory_gib", 1.)):
-                if flag not in supplied:
-                    setattr(parsed, dest, value)
+        binary = parsed.binary_method is not None or parsed.make_binary_sumstats is not None
+        defaults = dict(nvecs=256 if binary else 1000, seed=0 if binary else None,
+                        step_size=256 if binary else 1000, memory_gib=1. if binary else "auto")
+        for name, value in defaults.items():
+            if getattr(parsed, name) is None:
+                setattr(parsed, name, value)
         return parsed, rest
 
 
@@ -283,8 +277,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = _SummitArgumentParser(
         description="SUMMIT: Summary-stats-based Unified Method for Multivariate Inference of Traits",
         epilog="Other commands: summit pgs {plan,fit,score,scale,inspect}; "
-               "summit reference {plan,inspect,zpass}. Use COMMAND --help for its options. "
-               "Compatibility spellings remain accepted but are omitted from help."
+               "summit reference {plan,inspect,zpass}. Use COMMAND --help for its options."
     )
     inputs = parser.add_argument_group('Inputs')
     modes = parser.add_argument_group('Analysis selection')
@@ -302,12 +295,8 @@ def build_parser() -> argparse.ArgumentParser:
     add_binary_arguments(parser)
 
     # Trace / LD input
-    parser.add_argument("--trace", default=None, type=str,
-                        help=argparse.SUPPRESS)
-    parser.add_argument("--save-trace", default=None, type=str,
-                        help=argparse.SUPPRESS)
     inputs.add_argument("--bim", default=None, type=str,
-                        help="Reference .bim file used for annotation alignment or trace summaries.")
+                        help="Reference .bim file used for annotation alignment.")
     inputs.add_argument("--ldscores", default=None, type=str,
                         help="Path to the primary LD-score file. Use '@' as a chromosome placeholder for split files.")
     inputs.add_argument("--ldscores-reg", default=None, type=str,
@@ -321,8 +310,6 @@ def build_parser() -> argparse.ArgumentParser:
                             "Optional one-column LD-score file for the LDSC overcounting weight. "
                             "Used only with --weight-mode ldsc; when omitted, total primary LD is used."
                         ))
-    parser.add_argument("--collapse-reg-ld", action="store_true", default=True,
-                        help=argparse.SUPPRESS)
 
     # Sumstats / regression mode
     modes.add_argument("--h2", default=None, type=str,
@@ -392,7 +379,7 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     gxe.add_argument("--gxe-gwas", default=None, type=str,
-                        help="Marginal additive score file for --gxe-fit (direct SCORE contract).")
+                        help="Marginal additive SCORE file for --gxe-fit.")
     gxe.add_argument("--gwis", default=None, type=str,
                         help="Marginal interaction score file for --gxe-fit; conditional PLINK ADDxE statistics are rejected.")
     gxe.add_argument("--gxe-moments", default=None, type=str,
@@ -495,13 +482,6 @@ def build_parser() -> argparse.ArgumentParser:
             "estimation. Use 'auto' for max(80, 0.001*Nmax)."
         ),
     )
-    parser.add_argument(
-        "--intercept-chisq-thr",
-        dest="intercept_chisq_thr",
-        default=None,
-        type=str,
-        help=argparse.SUPPRESS,
-    )
     cross.add_argument(
         "--overlap-covariance-weight-mode",
         dest="intercept_weight_mode",
@@ -513,14 +493,6 @@ def build_parser() -> argparse.ArgumentParser:
             "'ldsc' for LDSC-style IRWLS weights, or 'score' for fixed "
             "w_j = 1 / w_ld,j."
         ),
-    )
-    parser.add_argument(
-        "--intercept-weight-mode",
-        dest="intercept_weight_mode",
-        default="score",
-        type=str,
-        choices=["ldsc", "score"],
-        help=argparse.SUPPRESS,
     )
     regression.add_argument("--weight-mode", default="he", type=str,
                         choices=["he", "ldsc"],
@@ -558,13 +530,6 @@ def build_parser() -> argparse.ArgumentParser:
             "HE scale: c_ov = y_overlap^T y_overlap / sqrt(N1*N2) = "
             "N_overlap * rho_y,overlap / sqrt(N1*N2)."
         ),
-    )
-    parser.add_argument(
-        "--intercept-rg",
-        dest="intercept_rg",
-        default=None,
-        type=float,
-        help=argparse.SUPPRESS,
     )
     cross.add_argument("--pheno-rg", default=None, type=str, help=(
         "Comma-separated pair of phenotype files for the traits in --rg. "
@@ -615,9 +580,8 @@ def build_parser() -> argparse.ArgumentParser:
     # Output / behavior
     output.add_argument("--out", default=None, type=str,
                         help="Output prefix for single-run modes. In rg manifest mode, this must be an output directory.")
-    output.add_argument("--verbose", nargs="?", const="1", default="0", type=str,
+    output.add_argument("--verbose", nargs="?", const="1", default="0", choices=["0", "1", "2", "max"],
                         help=("Verbosity level: 0, 1, 2, or 'max'. "
-                              "Legacy values 'jack' and 'normeq' request extra output files without enabling verbose diagnostics. "
                               "Passing --verbose with no value implies 1."))
     output.add_argument("--write-jack", action="store_true", default=False,
                         help="Write jackknife replicate dumps without enabling verbose diagnostics. For h2 this writes <out>.<phen>.jack; for rg this writes <out>.rg.jack.")
@@ -651,10 +615,7 @@ def build_parser() -> argparse.ArgumentParser:
                         help="Apply delta-based deleted-source correction when Trace.delta is available.")
 
     # Allele alignment for rg
-    allele_group = cross.add_mutually_exclusive_group()
-    allele_group.add_argument("--align-alleles", dest="align_alleles", action="store_true",
-                              help="Align the second trait to the first trait by allele labels (the default).")
-    allele_group.add_argument("--no-align-alleles", dest="align_alleles", action="store_false",
+    cross.add_argument("--no-align-alleles", dest="align_alleles", action="store_false",
                               help="Assume both rg inputs are already identically oriented; skip allele validation/alignment.")
     parser.set_defaults(align_alleles=True)
     cross.add_argument("--keep-ambiguous", action="store_true", default=False,
@@ -667,21 +628,17 @@ def build_parser() -> argparse.ArgumentParser:
                             "BED/BIM/FAM or PGEN/PVAR/PSAM path/prefix for LD-score calculation. "
                             "Pass an explicit .bed or .pgen path when both trios share a prefix."
                         ))
-    shared.add_argument("--nvecs", "--binary-probes", default=1000, type=int,
+    shared.add_argument("--nvecs", default=None, type=int,
                         help="Random-vector count (LD/GxE default: 1000; binary: 256). The probe axis is defined by the estimator.")
-    shared.add_argument("--block-size", "--step_size", "--binary-block-size", dest="step_size", default=1000, type=_step_size_argument,
-                        help="Step size for LD-score computation. GxE reference "
-                             "generation also accepts 'auto', which picks a "
-                             "deterministic canonical block width from the "
-                             "variant count; the resolved value is recorded in "
-                             "the manifest and defines the finite-probe "
-                             "realization exactly like an explicit width. Defaults: LD/GxE 1000; binary 256.")
-    shared.add_argument("--seed", "--binary-seed", default=None, type=int,
+    shared.add_argument("--block-size", dest="step_size", metavar="N", default=None, type=_step_size_argument,
+                        help="Variants per genotype block (LD/GxE default: 1000; binary: 256). "
+                             "GxE references also accept auto; the resolved width is saved with the reference.")
+    shared.add_argument("--seed", default=None, type=int,
                         help="Random seed (binary default: 0; LD/GxE: unspecified).")
-    inputs.add_argument("--genome-build", "--binary-genome-build",
-                        help="Genome build matching the population genotype scale for binary preparation.")
-    memory.add_argument("--memory-gib", "--binary-memory-gib", type=positive_gib,
-                        help="Binary reference workspace budget in GiB (default: 1); excludes other process allocations.")
+    inputs.add_argument("--genome-build",
+                        help="Optional build label for binary inputs; use the same label as a saved genotype scale.")
+    memory.add_argument("--memory-gib", type=utils.parse_memory_budget,
+                        help="LD/GxE sketch-panel, windowed-LD, or binary reference workspace in GiB (LD/GxE default: auto; binary: 1).")
     inputs.add_argument("--covar", default=None, type=str,
                         help="Covariate file for LD-score estimation.")
     gxe.add_argument("--env", default=None, type=str,
@@ -711,7 +668,7 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Run a direct single-group multi-environment reference in a fresh "
             "process with an explicit, verified socket-local OpenMP CPU "
-            "placement contract; requires --num-threads."
+            "placement; requires --num-threads."
         ),
     )
     gxe.add_argument(
@@ -770,11 +727,11 @@ def build_parser() -> argparse.ArgumentParser:
                               "SUMMIT kernels and HWE scaling for GENIE compatibility."))
     gxe.add_argument(
         "--gxe-native-backend", default="python", choices=["python", "direct"],
-        help=("Opt-in descriptor-owned C++ BED reference pipeline for "
+        help=("C++ BED reference calculation for "
               "phenotype-free standardized/sample references with Rademacher "
               "probes. The same native path handles one or multiple "
               "environments; Python "
-              "remains the default oracle."),
+              "is the default."),
     )
     memory.add_argument(
         "--gxe-native-workspace-gib", default=16.0, type=float,
@@ -811,14 +768,13 @@ def build_parser() -> argparse.ArgumentParser:
                         help="Write .gw.kmoments for unpartitioned genome-wide LD-score estimation.")
     mc_group = ld.add_mutually_exclusive_group()
     mc_group.add_argument(
-        "--write-ld-mc-var", "--write-ld-mc-ci", dest="write_ld_mc_var",
+        "--write-ld-mc-var", dest="write_ld_mc_var",
         action="store_true",
         help=("Write optional per-SNP Monte Carlo variances, SEs, and pointwise "
               "95%% conditional MC intervals for genome-wide LD scores."),
     )
     mc_group.add_argument("--skip-ld-mc", action="store_true",
                           help="Disable the default annotation-level genome-wide LD-score MC noise diagnostic.")
-    parser.add_argument("--skip-kmoments", action="store_true", help=argparse.SUPPRESS)
     ld.add_argument(
         "--use-mailman", default="auto", type=_parse_mailman_mode,
         help=(
@@ -832,14 +788,6 @@ def build_parser() -> argparse.ArgumentParser:
     # Resource / performance knobs
     shared.add_argument("--num-threads", default=None, type=int,
                         help="Cap BLAS / compute threads.")
-    memory.add_argument(
-        "--target-xz-mem", type=utils.parse_memory_budget, default="auto",
-        help=argparse.SUPPRESS,
-    )
-    memory.add_argument(
-        "--target-mem", type=utils.parse_memory_budget, default=None,
-        help="LD/GxE sketch-panel or windowed-LD memory budget in GiB, or 'auto' (default).",
-    )
     memory.add_argument(
         "--gxe-total-memory-gib",
         type=utils.parse_memory_budget,
@@ -865,12 +813,12 @@ def build_parser() -> argparse.ArgumentParser:
     runtime.add_argument("--malloc-mmap-threshold", type=int, default=131072)
     runtime.add_argument("--numa-mode", default="interleave", choices=["interleave", "membind", "cpunodebind", "preferred"])
     runtime.add_argument("--numa-nodes", default="all")
-    runtime.add_argument("--force_affinity_all", default=False, type=str2bool,
+    runtime.add_argument("--force-affinity-all", dest="force_affinity_all", default=False, type=str2bool,
                         help=(
                             "Expand CPU affinity to all online CPUs (true/false; "
                             "default false preserves taskset/scheduler placement)."
                         ))
-    runtime.add_argument("--decode_threads_cap", default=32)
+    runtime.add_argument("--decode-threads-cap", dest="decode_threads_cap", type=int, default=32)
 
     return parser
 
@@ -1027,8 +975,7 @@ def _make_gxe_generator(args, log, verbose_on, low_level, *, env_col=None, out_p
         rand_samp=args.rand_samp,
         low_level=low_level,
         ddof=args.ddof,
-        target_xz_mem=args.target_xz_mem,
-        target_mem=args.target_mem,
+        target_mem=args.memory_gib,
         gxe_total_memory_gib=getattr(args, "gxe_total_memory_gib", "auto"),
         device=args.device,
         impute_method=args.impute_method,
@@ -1333,7 +1280,7 @@ def _configure_gxe_group_worker_placement(contract, native_module=None):
     configure = getattr(native_module, "configure_openmp_placement", None)
     if not callable(configure):
         raise RuntimeError(
-            "The direct GxE extension lacks the OpenMP placement contract API."
+            "The direct GxE extension lacks the OpenMP placement API."
         )
     placement = _validate_cpu_placement_attestation(
         dict(configure(list(contract.cpu_ids), contract.threads)),
@@ -1735,7 +1682,7 @@ def _dispatch_parallel_gxe_environment_groups(args, columns, layout, log):
                 tokens, "--gxe-parallel-environment-groups", "1"
             )
             tokens = _replace_long_option(tokens, "--num-threads", record["threads"])
-            tokens = _replace_long_option(tokens, "--force_affinity_all", "false")
+            tokens = _replace_long_option(tokens, "--force-affinity-all", "false")
             tokens = _replace_long_option(
                 tokens, "--_gxe-multi-batch-manifest", group_manifest
             )
@@ -1985,7 +1932,7 @@ def _dispatch_ldscore(args, log, verbose_on, low_level):
             impute_method=args.impute_method,
             panel_cols=args.win_panel_cols,
             cache_mb=args.win_cache_mb,
-            target_mem=args.target_mem,
+            target_mem=None if args.memory_gib == "auto" else args.memory_gib,
         )
         try:
             winld._compute_ldscore()
@@ -2009,12 +1956,11 @@ def _dispatch_ldscore(args, log, verbose_on, low_level):
         num_threads=args.num_threads,
         rand_samp=args.rand_samp,
         low_level=low_level,
-        target_xz_mem=args.target_xz_mem,
-        target_mem=args.target_mem,
+        target_mem=args.memory_gib,
         device=args.device,
         use_tp32=args.use_tp32,
         correct_skew=args.correct_skew,
-        write_kmoments=(args.write_kmoments and not args.skip_kmoments),
+        write_kmoments=args.write_kmoments,
         estimate_mc_noise=(not args.skip_ld_mc),
         write_ld_mc_var=args.write_ld_mc_var,
         use_mailman=args.use_mailman,
@@ -2028,9 +1974,6 @@ def _dispatch_ldscore(args, log, verbose_on, low_level):
 
 
 def _dispatch_h2(args, log):
-    if args.trace is not None:
-        log._log("!!! Trace summaries are not supported in the refactored h2 path yet. Use --ldscores. !!!")
-        raise SystemExit(1)
     if args.ldscores is None:
         log._log("!!! --ldscores must be provided for refactored h2 estimation. !!!")
         raise SystemExit(1)
@@ -2160,9 +2103,6 @@ def _dispatch_gxe_fit(args, log):
 
 
 def _dispatch_rg(args, log):
-    if args.trace is not None:
-        log._log("!!! Trace summaries are not supported in the refactored rg path yet. Use --ldscores. !!!")
-        raise SystemExit(1)
     if args.ldscores is None:
         log._log("!!! --ldscores must be provided for rg estimation. !!!")
         raise SystemExit(1)
@@ -2190,7 +2130,7 @@ def _dispatch_rg(args, log):
         annot=args.annot,
         enrich_mode=args.enrich_mode,
         jack_mode=args.jack_mode,
-        collapse_reg_ld=args.collapse_reg_ld,
+        collapse_reg_ld=True,
         clip_nonfinite_vals=args.clip_nonfinite_vals,
         rg_se_method=args.rg_se_method,
         align_alleles=args.align_alleles,
@@ -2535,9 +2475,6 @@ def _load_manifest_trait_entry(
 
 
 def _dispatch_rg_manifest(args, log):
-    if args.trace is not None:
-        log._log("!!! Trace summaries are not supported in the refactored rg path yet. Use --ldscores. !!!")
-        raise SystemExit(1)
     if args.ldscores is None:
         log._log("!!! --ldscores must be provided for rg estimation. !!!")
         raise SystemExit(1)
@@ -2650,7 +2587,7 @@ def _dispatch_rg_manifest(args, log):
             out=pair_prefix,
             align_alleles=args.align_alleles,
             drop_ambiguous=(not args.keep_ambiguous),
-            collapse_reg_ld=args.collapse_reg_ld,
+            collapse_reg_ld=True,
             enrich_mode=args.enrich_mode,
             jack_mode=args.jack_mode,
             clip_nonfinite_vals=args.clip_nonfinite_vals,
@@ -2738,8 +2675,8 @@ def _dispatch_make_rg_manifest(args, log):
     if args.sum_dir is None:
         log._log("!!! --sum-dir must be provided in --make-rg-manifest mode. !!!")
         raise SystemExit(1)
-    if args.trace is not None or args.ldscores is not None or args.h2 is not None or args.rg is not None or args.geno is not None:
-        log._log("!!! --make-rg-manifest is a standalone mode and cannot be combined with --geno / --h2 / --rg / trace inputs. !!!")
+    if args.ldscores is not None or args.h2 is not None or args.rg is not None or args.geno is not None:
+        log._log("!!! --make-rg-manifest is a standalone mode and cannot be combined with --geno / --h2 / --rg / --ldscores. !!!")
         raise SystemExit(1)
     if args.phen_list is None and args.pair_list is None:
         log._log("!!! Provide at least one of --phen-list or --pair-list in --make-rg-manifest mode. !!!")
@@ -2793,12 +2730,11 @@ def main():
            for token in sys.argv[1:]):
         from .pcgc.cli import run as run_binary
         try:
-            return run_binary(args, sys.argv[1:], parser=parser)
+            return run_binary(args, sys.argv[1:])
         except (ValueError, RuntimeError, OSError) as exc:
             parser.error(str(exc))
-    if args.memory_gib is not None or args.genome_build is not None:
-        parser.error("--memory-gib and --genome-build in this command require --binary-method; "
-                     "LD/GxE use their separate sketch, native-workspace and total-memory budgets")
+    if args.genome_build is not None:
+        parser.error("--genome-build applies to binary preparation in this command")
     try:
         _validate_explicit_openmp_placement_request(args)
     except ValueError as exc:
@@ -2882,7 +2818,7 @@ def main():
             )
             raise SystemExit(1)
         conflicting_reference_options = sorted(
-            _provided_long_options(sys.argv[1:], parser=parser)
+            _provided_long_options(sys.argv[1:])
             & _GXE_BATCH_REFERENCE_OPTIONS
         )
         if conflicting_reference_options:

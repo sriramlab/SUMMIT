@@ -34,6 +34,17 @@ Use the original architecture model's genotype scale. Estimating a fresh scale
 from a different cohort changes the model. [PGS API](PGS-API.md) describes how to
 prepare these inputs and define candidate priors.
 
+When preparing a new architecture analysis, create a genotype scale on the
+discovery samples:
+
+```bash
+summit pgs scale --geno discovery.bed --samples discovery.keep \
+  --out discovery.scale --num-threads 8
+```
+
+Build labels are optional. If an existing scale was created with
+`--genome-build`, retain that label in the fit specification.
+
 ## Fit and inspect
 
 ```bash
@@ -51,7 +62,7 @@ genotypes. A fit specification names each trait's inputs and candidate models:
 {
   "kind": "summit.prediction.fit_spec",
   "schema_version": 1,
-  "genotypes": {"geno": "discovery.bed", "genome_build": "GRCh37"},
+  "genotypes": {"geno": "discovery.bed"},
   "traits": [{
     "id": "trait1",
     "phenotype": {"file": "traits.tsv", "column": "trait1", "units": "trait units"},
@@ -94,13 +105,14 @@ A score specification uses the saved model's context and fixed-effect recipes:
 {
   "kind": "summit.prediction.score_spec",
   "schema_version": 1,
-  "genotypes": {"geno": "evaluation.pgen", "genome_build": "GRCh37"},
+  "genotypes": {"geno": "evaluation.pgen"},
   "traits": [{"id": "trait1", "samples": "evaluation.keep",
               "contexts": "contexts.tsv", "covariates": "covariates.tsv"}]
 }
 ```
 
-Scoring matches SNP IDs, positions, build, and allele pairs. It handles explicit
+Scoring matches SNP IDs, positions, and allele pairs. Optional `genome_build`
+labels are checked when supplied in both inputs. It handles explicit
 allele swaps but does not infer strand. Missing calls use the training mean;
 unknown categorical levels are rejected. A missing model SNP is an error by
 default. Explicit `missing_variants: "mean_impute"` retains the original model
@@ -115,7 +127,8 @@ transformation was used, convert back with `scale*prediction + center`.
 | Storage mode | Use when |
 |---|---|
 | `stream` | The genotype panel does not fit in RAM |
-| `compact` | BED calls fit in RAM; avoids repeated decoding |
+| `compact` | Calls or dosages fit in RAM; avoids repeated decoding |
+| `packed` | BED calls fit in two-bit storage; reduces cache memory |
 | `standardized` | More RAM is available; avoids repeated standardization |
 
 All computation is FP64. Compact PGEN retains fractional dosages and uses more

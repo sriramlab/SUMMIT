@@ -143,7 +143,7 @@ component. HE component uncertainty was not exported by the comparator and
 was not evaluated. This experiment tests a partition; overlapping annotations
 are covered by numerical oracle tests, not a separate calibration panel here.
 
-The [complete univariate table](../reports/pcgc_release_20260927/univariate.tsv)
+The [complete univariate table](../../docs/../reports/pcgc_release_20260927/univariate.tsv)
 includes both scales, risk sources, Monte Carlo intervals, and finite-interval
 counts. Single-component duplicates are omitted. HE component rows have zero
 finite intervals because the helper does not return those SEs.
@@ -166,7 +166,7 @@ ratio estimates for all 50 deletions in each dataset. Fitted-risk results are:
 Covariance is on the conditional scale: truth is zero for BB0 and 0.125 for
 the other settings. Genetic-correlation truths are zero and 0.5. Supplied-risk
 SE/SD ratios range from 1.106 to 1.208, with coverage 76/80 to 78/80; all pass
-the same screens. The [complete bivariate table](../reports/pcgc_release_20260927/bivariate.tsv)
+the same screens. The [complete bivariate table](../../docs/../reports/pcgc_release_20260927/bivariate.tsv)
 includes the Monte Carlo intervals and counts.
 
 These tests support the implementation under the stated marginal sampling
@@ -191,7 +191,7 @@ master height definition.
 Quantitative cross-trait response models are a separate path. The integrated
 tests exercise all four reference modes, including authenticated fitting with
 additional phenotype inputs. Their statistical evidence remains the
-[existing validation record](wiki/Cross-trait-response-covariance.md): corrected
+[existing validation record](../../docs/wiki/Cross-trait-response-covariance.md): corrected
 aggregate response-correlation coverage was 97/100 and 98/100 on the saved
 panel, with RMS SE/SD 1.072 and 1.037. Those were reanalyses of the datasets
 used to diagnose the earlier problem, and some other coordinates still failed

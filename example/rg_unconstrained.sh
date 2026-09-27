@@ -17,7 +17,6 @@ fi
   --rg ./out/synthetic/trait_a.sumstats,./out/synthetic/trait_b.sumstats \
   --ldscores ./out/small.2bins.gw.ldscore.gz \
   --annot ./out/synthetic/small.annot \
-  --align-alleles \
   --collapse-reg-ld \
   --out ./out/rg_unconstrained \
   --njack chr \

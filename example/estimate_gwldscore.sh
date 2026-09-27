@@ -14,7 +14,7 @@ fi
   --geno ./out/synthetic/small.bed \
   --out ./out/small.single \
   --nvecs 100 \
-  --step_size 256 \
+  --block-size 256 \
   --seed 1 \
   --dtype float64 \
   --covar ./out/synthetic/small.cov \

@@ -167,12 +167,17 @@ def test_actual_summit_cli_prepares_and_fits_binary_artifact(tmp_path, monkeypat
     common = ["--binary-method", "pcgc", "--make-binary-sumstats", str(tmp_path/"samples.tsv"),
         "--geno", str(tmp_path/"test.bed"), "--binary-scale", str(tmp_path/"scale"),
         "--binary-prevalence", ".1", "--binary-risk-column", "RISK", "--num-threads", str(prediction_threads())]
-    for name, options in (("prepared", ["--genome-build", "test", "--nvecs", "61", "--seed", "81", "--block-size", "37", "--memory-gib", "1"]),
-                          ("legacy", ["--binary-genome-build", "test", "--binary-probes", "61", "--binary-seed", "81", "--binary-block-size", "37", "--binary-memory-gib", "1"])):
-        assert entry_main([*common, *options, "--out", str(tmp_path/name)]) == 0
-    canonical, legacy = [load_artifact(tmp_path/(name+".binary.npz")) for name in ("prepared", "legacy")]
+    options = ["--nvecs", "61", "--seed", "81", "--block-size", "37", "--memory-gib", "1"]
+    assert entry_main([*common, *options, "--genome-build", "test", "--out", str(tmp_path/"prepared")]) == 0
+    # A build label has no numerical effect. Test an unlabeled TSV scale too.
+    pd.DataFrame(dict(SNP=axis.ids, A1=axis.counted, A2=axis.other,
+                      MEAN=scale.mean, INV_SD=scale.inverse_scale)).to_csv(tmp_path/"scale.tsv", sep="\t", index=False)
+    unlabeled = list(common)
+    unlabeled[unlabeled.index("--binary-scale")+1] = str(tmp_path/"scale.tsv")
+    assert entry_main([*unlabeled, *options, "--out", str(tmp_path/"unlabeled")]) == 0
+    labeled, unlabeled = [load_artifact(tmp_path/(name+".binary.npz")) for name in ("prepared", "unlabeled")]
     for field in ("rhs_rows", "ldscores", "annotations", "same_person"):
-        np.testing.assert_array_equal(getattr(canonical.moments, field), getattr(legacy.moments, field))
+        np.testing.assert_allclose(getattr(labeled.moments, field), getattr(unlabeled.moments, field), rtol=1e-14, atol=1e-14)
     monkeypatch.setattr(sys, "argv", ["summit", "--binary-method", "pcgc", "--h2", str(tmp_path/"prepared.binary.npz"),
         "--out", str(tmp_path/"fit")])
     assert cli.main() == 0

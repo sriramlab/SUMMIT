@@ -76,54 +76,10 @@ PGS batching is described in [Polygenic scores](Polygenic-scores.md).
 
 ## Cross-trait environmental responses
 
-[Cross-trait response covariance](Cross-trait-response-covariance.md) extends
-the masked generalized-GxE batch to all ordered context coefficients for
-every requested trait pair in one decoded genotype traversal. Each trait
-retains its own mask and fixed-effect projector. Reference Z moments can be
-collected from the same guarded shared fixed-basis product with `--z-output`.
+`CrossTraitBatch` estimates the ordered context-score products for multiple
+trait pairs in one genotype traversal. Each trait retains its own samples
+and fixed effects. Within-trait and cross-trait fits use aligned SNP blocks
+so their uncertainty can be propagated jointly.
 
-The paper workflow defaults to cohort exposure-moment factorization and
-same-person diagonals on the actual overlap. It also reports residual-preserving
-and legacy transport arms. Within-trait saved summaries can be refitted under
-six mode/diagonal combinations without reopening genotypes; explicit
-legacy/scaled assembly preserves the old within-trait result bit for bit.
-See the linked page for commands, exactness boundaries, paired deletions and
-the validation results. Complete-pass benchmarks include
-the exact overlap residual contractions as well as score accumulation.
-
-The eight-trait common-bin pilot completed all 22 chromosomes in one study/Z
-traversal per chromosome and produced 112 pair/mode fits with 200 paired
-deletion blocks. The 42-trait benchmark adds 29.956% to the within-only pass;
-this is a narrow measured pass. All 42 saved within-trait summaries were
-refitted under six arms without genotypes. The simulation coverage criterion
-is not fully met, and weak individual-context correlations can have undefined
-intervals. The pilot remains exploratory; see the linked page for the full
-results, exactness limits and authenticated artifacts.
-
-
-As of the 24 September inference correction, new fits default to directional
-fixed-source target deletions on full-genome units and full-point delta
-uncertainty for nonlinear derived quantities. The joint coefficient covariance
-still comes from the 200 paired blocks. Both uncertainty choices are available;
-`--deletion-method legacy --uncertainty-method jackknife` preserves the old
-inference path. The within-trait assembler's legacy/scaled arm remains
-bit-exact. See the cross-trait page for the block-diagonal approximation and
-calibration boundaries.
-
-The study driver accepts `--trait-names ... --pairs-file pairs.json`, where
-`pairs.json` is a list of ordered trait-name pairs. All requested pairs share
-one traversal, with orientation, identities and accumulators protected on
-checkpoint/resume. The fit driver accepts the same trait names in summary
-order and fits the recorded pair subset; it reuses sealed within-trait
-summaries and reads no genotypes. `cross_trait_biology.py` publishes interpretable
-single-exposure and aggregate-response plots, paired biological contrasts,
-and matched external comparisons, with source tables and file hashes.
-
-`cross_trait_context_profiles.py` evaluates the saved full covariance at age
-and BMI offsets and reports paired changes in context-specific genetic rg.
-These curves complement the response-correlation plots; neither analysis
-requires another genotype traversal. `cross_trait_calibration_report.py`
-compares saved uncertainty arms, retaining undefined intervals in the
-all-replicate coverage denominator. The Hoffman follow-up launcher includes
-a `followup_fit` phase that requires all 22 chromosome summaries and completion
-markers before fitting the requested pair set under all four Gram modes.
+See [Cross-trait analysis](Cross-trait-analysis.md) for the Python workflow,
+reference assumptions, and interpretation of response correlations.

@@ -13,15 +13,14 @@ from summit.prediction._validation import digest
 from summit.prediction.artifacts import write_json, write_genotype_scale, load_prediction_models, read_json
 from summit.prediction.genotype import FileGenotypeSource, estimate_scale
 from summit.prediction.features import fit_contexts, evaluate_contexts, evaluate_fixed
-from summit.prediction.cli import main as legacy_main
 from summit.prediction import AnnotationDesign, write_annotation_design
 
 
 @pytest.mark.parametrize('mixture', [False, 'radial', 'separate'])
-@pytest.mark.parametrize('launcher', ['legacy', 'unified'])
-def test_cli_full_pipeline_and_frozen_feature_transform(tmp_path, capsys, mixture, launcher):
+@pytest.mark.parametrize('genome_build', [None, 'GRCh37'])
+def test_cli_full_pipeline_and_frozen_feature_transform(tmp_path, capsys, mixture, genome_build):
     from summit.entrypoint import main as unified_main
-    main = legacy_main if launcher == 'legacy' else lambda argv: unified_main(['pgs', *argv])
+    main = lambda argv: unified_main(['pgs', *argv])
     source, old_traits, bed = write_bed(tmp_path)
     rng = np.random.default_rng(232)
     samples = pd.DataFrame(source.samples, columns=["FID", "IID"])
@@ -43,7 +42,7 @@ def test_cli_full_pipeline_and_frozen_feature_transform(tmp_path, capsys, mixtur
     samples.to_csv(tmp_path/"score.keep", sep="\t", index=False)
     write_json(tmp_path/"context.json", context_spec)
     write_json(tmp_path/"fixed.json", fixed_spec)
-    with FileGenotypeSource(bed, genome_build="GRCh37") as file_source:
+    with FileGenotypeSource(bed, genome_build=genome_build) as file_source:
         scale = estimate_scale(file_source, rows, np.arange(len(source.variants.ids)), block_size=9, threads=prediction_threads())
     write_genotype_scale(tmp_path/"scale", scale)
     annotation_design = AnnotationDesign(np.column_stack([np.ones(len(source.variants.ids)),
@@ -71,7 +70,7 @@ def test_cli_full_pipeline_and_frozen_feature_transform(tmp_path, capsys, mixtur
                 dict(kind='separate_sparsity',baseline=dict(probability=.1,small_variance_fraction=.2),
                      response=dict(probability=.3,small_variance_fraction=.1)))
     write_json(tmp_path/"fit.json", dict(kind="summit.prediction.fit_spec", schema_version=1,
-        genotypes=dict(geno=bed.name, genome_build="GRCh37"), traits=[trait], solver=solver))
+        genotypes=dict(geno=bed.name, **({"genome_build": genome_build} if genome_build else {})), traits=[trait], solver=solver))
     assert main(["plan", "--spec", str(tmp_path/"fit.json"), "--memory-gib", "1", "--num-threads", str(prediction_threads())]) == 0
     plan = json.loads(capsys.readouterr().out)
     assert plan["models"] == 3
@@ -80,8 +79,9 @@ def test_cli_full_pipeline_and_frozen_feature_transform(tmp_path, capsys, mixtur
         "--genotype-storage", "compact", "--block-size", "9", "--memory-gib", "1", "--num-threads", str(prediction_threads())]) == 0
     capsys.readouterr()
     models = load_prediction_models(tmp_path/"fit")
+    assert all(m.variants.genome_build == genome_build for m in models)
     write_json(tmp_path/"score.json", dict(kind="summit.prediction.score_spec", schema_version=1,
-        genotypes=dict(geno=bed.name, genome_build="GRCh37"), traits=[dict(id="trait", samples="score.keep", contexts="contexts.tsv", covariates="fixed.tsv")]))
+        genotypes=dict(geno=bed.name, **({"genome_build": genome_build} if genome_build else {})), traits=[dict(id="trait", samples="score.keep", contexts="contexts.tsv", covariates="fixed.tsv")]))
     assert main(["score", "--models", str(tmp_path/"fit"), "--spec", str(tmp_path/"score.json"),
         "--out", str(tmp_path/"scores"), "--block-size", "7", "--memory-gib", "1", "--num-threads", str(prediction_threads())]) == 0
     assert (tmp_path/"scores"/"COMPLETE.json").is_file()
@@ -107,3 +107,12 @@ def test_json_unknown_duplicate_nonfinite_and_unsafe_array(tmp_path):
         read_json(nonfinite)
     with pytest.raises(ValueError, match="unsafe"):
         load_array(tmp_path, dict(file="../bad.npy", shape=[2], dtype="<f8", bytes=20, sha256="a"))
+
+
+def test_cli_input_error_reports_command_name(tmp_path, capsys):
+    from summit.entrypoint import main
+    with pytest.raises(SystemExit) as error:
+        main(["pgs", "plan", "--spec", str(tmp_path/"missing.json"),
+              "--num-threads", str(prediction_threads())])
+    assert error.value.code == 2
+    assert "summit pgs:" in capsys.readouterr().err

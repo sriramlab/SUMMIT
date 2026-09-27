@@ -18,7 +18,6 @@ fi
   --overlap-covariance-rg 1 \
   --ldscores ./out/small.2bins.gw.ldscore.gz \
   --annot ./out/synthetic/small.annot \
-  --align-alleles \
   --out ./out/rg_supplied_overlap_covariance \
   --njack chr \
   --num-threads 2

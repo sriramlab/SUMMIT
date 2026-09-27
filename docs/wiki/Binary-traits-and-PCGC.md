@@ -2,7 +2,7 @@
 
 PCGC estimates genetic variance on a liability scale while accounting for
 case–control sampling and individual disease risks. Select it with
-`--binary-method`. The ordinary HE/LDSC workflows keep their existing defaults.
+`--binary-method`.
 
 Preparation needs individual genotypes and binary phenotypes. It produces
 compatible score and reference moments together; ordinary logistic GWAS
@@ -15,12 +15,13 @@ beta/SE files and ordinary LD scores are not interchangeable with these inputs.
   numeric risk covariates or a column of supplied population risks if needed.
 - Population prevalence K. The sample case fraction P is computed from Y.
 - Population genotype means and inverse standard deviations, on the same
-  variant, allele, and genome-build axes as the genotypes.
+  SNP order and counted alleles as the genotypes.
 - Optional nonnegative SNP annotation weights, including overlapping columns.
 
 The population-scale TSV has exactly `SNP A1 A2 MEAN INV_SD`. `MEAN` refers
 to the reader's counted allele: BED A1 or PGEN REF. A saved SUMMIT genotype-scale
-directory is also accepted. Do not estimate these scales from an ascertained
+directory is also accepted; if it was prepared with a build label, supply
+the same `--genome-build`. Build labels are otherwise optional. Do not estimate these scales from an ascertained
 study and label them population scales.
 
 The sample table selects the analyzed people. IDs and SNPs must be unique;
@@ -34,7 +35,7 @@ For age and another exogenous risk factor:
 ```bash
 summit --binary-method pcgc \
   --make-binary-sumstats people.tsv --geno study.bed \
-  --binary-prevalence 0.1 --genome-build GRCh38 \
+  --binary-prevalence 0.1 \
   --binary-scale population_scale.tsv \
   --binary-covariates AGE,RISK_FACTOR \
   --nvecs 256 --memory-gib 4 \
@@ -83,7 +84,7 @@ All five methods report SNP-block jackknife SEs for annotation components
 and totals by default. Binary inference uses 200 contiguous SNP blocks. Set
 `--njack` to another integer of at least two when needed for the SNP count
 and LD structure; it cannot exceed the number of SNPs. The HE/LDSC default
-remains chromosome deletion (`chr`). No research flag is needed.
+is chromosome deletion (`chr`).
 
 For example, to use 100 blocks:
 
@@ -98,9 +99,7 @@ An integer block count divides the saved variant order into contiguous groups.
 Use genotypes ordered by chromosome and position, with blocks large enough
 to contain local LD.
 It holds the risk fit, prevalence, population scales, and reference probes fixed.
-It therefore excludes uncertainty in those quantities. Regenerate old schema-1
-artifacts before CLI inference: they lack the per-SNP diagonal corrections
-needed for SEs. Current preparation writes schema 2.
+It therefore excludes uncertainty in those quantities.
 
 Conditional genetic variance is measured relative to liability variance after
 the covariate predictor, fixed at one. Marginal estimates divide by
@@ -110,30 +109,25 @@ each annotation's SNP set in isolation.
 
 The model assumes case-status sampling, exogenous risk covariates, and a
 compatible population genotype scale. It does not implement ancestry adjustment
-by ordinary covariate projection. The [validation report](../pcgc_release_validation.md)
-gives calibration results and their Monte Carlo intervals. The [interface review](../pcgc_interface_audit.md)
-explains why the earlier screening thresholds no longer restrict SE reporting.
-The upstream PCGC and S-PCGC implementations use different deletion rules;
-SUMMIT is not an end-to-end replica of either package.
+by ordinary covariate projection. See the [PCGC methods](../pcgc.md) for
+the estimating equations and assumptions of each method.
 
 ## Computation and cross-trait work
 
 Study-specific preparation uses two genotype traversals and SUMMIT's existing
-readers, variant probes, and protected matrix products. Exact basis contraction
+genotype readers and matrix operations. Exact basis contraction
 is performed before reference calculation. The external-LD method uses one
 study scoring traversal and two reference traversals.
 
 `--memory-gib` budgets reference workspace; other process allocations
 need additional memory. Reducing `--block-size` changes tiling, while
 reducing `--nvecs` also changes numerical precision. Annotation count
-increases both sketch memory and computation. Full-cohort memory plans and a
-bounded full-sample benchmark are available in the
-[scaling audit](../pcgc_second_audit.md); full-genome throughput is not yet measured.
+increases both sketch memory and computation.
 
 Binary–binary and binary–quantitative covariance are available through
 `summit.pcgc.cross.prepare_pair` and `fit_pair` under an explicit marginal
-case-status sampling contract. Shared controls require aligned identities and
+case-status sampling assumption. Shared controls require aligned sample IDs and
 a compatible selection design. This remains a research Python API; binary
 `--rg` and general cross-study binary artifacts are not exposed.
 
-See the [PCGC scientific contract](../pcgc.md) for the equations and API limits.
+See the [PCGC methods](../pcgc.md) for the equations and API limits.

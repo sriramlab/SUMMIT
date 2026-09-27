@@ -17,7 +17,7 @@ fi
   --covar ./out/synthetic/small.cov \
   --out ./out/small.2bins.env \
   --nvecs 100 \
-  --step_size 256 \
+  --block-size 256 \
   --seed 1 \
   --dtype float64 \
   --num-threads 2

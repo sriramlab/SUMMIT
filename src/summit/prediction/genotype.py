@@ -86,7 +86,7 @@ class FileGenotypeSource:
     Reader lifetime belongs to this object. A new source is inexpensive and is
     recommended for each fit/scoring operation. The caller closes it explicitly.
     """
-    def __init__(self, path, *, genome_build):
+    def __init__(self, path, *, genome_build=None):
         from summit.ldscore.genotype_source import (
             resolve_genotype_input, read_fam_sample_ids, read_psam_sample_ids,
             read_pvar_variants, validate_variant_metadata,
@@ -216,7 +216,7 @@ class FileGenotypeSource:
 
 class ShardedGenotypeSource:
     """Ordered chromosome trios with one authenticated common sample axis."""
-    def __init__(self, paths, *, genome_build):
+    def __init__(self, paths, *, genome_build=None):
         self.sources = []
         self.generation = 0
         self.rows = None
@@ -285,14 +285,14 @@ class ShardedGenotypeSource:
 
 def source_from_spec(spec, root):
     from ._validation import closed
-    closed(spec, ("genome_build",), ("geno", "shards"), name="genotype specification")
+    closed(spec, (), ("geno", "shards", "genome_build"), name="genotype specification")
     if ("geno" in spec) == ("shards" in spec):
         raise ValueError("supply exactly one genotype trio or ordered shard list")
     if "geno" in spec:
-        return FileGenotypeSource(Path(root)/spec["geno"], genome_build=spec["genome_build"])
+        return FileGenotypeSource(Path(root)/spec["geno"], genome_build=spec.get("genome_build"))
     if not isinstance(spec["shards"], list) or any(not isinstance(x, str) or not x for x in spec["shards"]):
         raise ValueError("genotype shards must be an ordered list of paths")
-    return ShardedGenotypeSource([Path(root)/x for x in spec["shards"]], genome_build=spec["genome_build"])
+    return ShardedGenotypeSource([Path(root)/x for x in spec["shards"]], genome_build=spec.get("genome_build"))
 
 
 def standardize(raw, mean, inverse_scale):

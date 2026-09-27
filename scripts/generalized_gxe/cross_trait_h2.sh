@@ -34,9 +34,9 @@ case $mode in
     summit.context.reference_zpass_cli --manifest "$base/shared_reference_full_20260916/MANIFEST.json" \
     --reference-root "$base/shared_reference_full_20260916" --chromosome "$chromosome" \
     --master-input "$base/full_cohort_inputs_20260916/height_raw.npz" \
-    --bed-prefix "/u/home/b/bronsonj/project-sriram/UKBB/imp/qc.v1/by_chr/imp.$chromosome" \
-    --annotations "$base/imputed_maf3_design/annotations_chr$chromosome.npy" \
-    --output "$output_root/zpass_chr$chromosome.npz" --num-threads 8 --width 128
+    --geno "/u/home/b/bronsonj/project-sriram/UKBB/imp/qc.v1/by_chr/imp.$chromosome" \
+    --annot "$base/imputed_maf3_design/annotations_chr$chromosome.npy" \
+    --out "$output_root/zpass_chr$chromosome.npz" --num-threads 8 --block-size 128
   ;;
  simulation_reference|simulation|simulation_generate|simulation_score|simulation_fit)
   input_root=/u/project/jflint/bronsonj/cross_trait_20260923/simulation_inputs

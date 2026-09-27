@@ -2,7 +2,7 @@
 
 The auto width is a pure function of the variant count — never machine
 state — so an auto-selected finite-probe realization is exactly the one
-an explicit --step_size of the same value would produce, and the manifest
+an explicit --block-size of the same value would produce, and the manifest
 records the resolved numeric width plus its selection provenance.
 """
 from __future__ import annotations

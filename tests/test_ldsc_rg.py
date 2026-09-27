@@ -674,7 +674,7 @@ def test_rg_manifest_rejects_both_overlap_covariance_column_names(tmp_path):
         _normalize_rg_manifest(str(manifest), require_intercept=True)
 
 
-def test_overlap_covariance_cli_names_are_preferred_and_legacy_aliases_work():
+def test_overlap_covariance_cli_options():
     parser = summit_cli.build_parser()
     preferred = parser.parse_args(
         [
@@ -686,17 +686,6 @@ def test_overlap_covariance_cli_names_are_preferred_and_legacy_aliases_work():
     assert preferred.intercept_rg == pytest.approx(0.125)
     assert preferred.intercept_weight_mode == "ldsc"
     assert preferred.intercept_chisq_thr == "auto"
-
-    legacy = parser.parse_args(
-        [
-            "--intercept-rg", "0.25",
-            "--intercept-weight-mode", "score",
-            "--intercept-chisq-thr", "80",
-        ]
-    )
-    assert legacy.intercept_rg == pytest.approx(0.25)
-    assert legacy.intercept_weight_mode == "score"
-    assert legacy.intercept_chisq_thr == "80"
 
     help_text = parser.format_help()
     assert "--overlap-covariance-rg" in help_text
@@ -763,7 +752,6 @@ def test_regular_manifest_cov_ldsc_estimates_overlap_covariance_and_harmonizes_a
             "ldsc",
             "--njack",
             "chr",
-            "--align-alleles",
             "--write-jack",
             "--out",
             str(outdir),

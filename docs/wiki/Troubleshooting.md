@@ -17,7 +17,6 @@ SUMMIT environment. Rebuild after changing the compiler or numerical libraries.
 
 An editable installation can point at another checkout. Reinstall from the
 intended repository with `python -m pip install --no-build-isolation -e .`.
-For a separate PGS worktree, see the checkout launcher in [Installation](Installation.md).
 
 ## Genotype input is ambiguous or unsupported
 
@@ -53,7 +52,7 @@ loosening the tolerance changes numerical accuracy and should be recorded.
 
 ## Memory use is too high
 
-Reduce SNP blocks, model/RHS tiles, or batch size. PGS `stream` mode avoids
+Reduce `--block-size`, model/RHS tiles, or batch size. PGS `stream` mode avoids
 retaining the genotype panel. Cached PGEN uses more bytes than cached BED.
 A planner cannot guarantee an operating-system RSS ceiling; allow room for
 libraries, parsers, and output arrays.

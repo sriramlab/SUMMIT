@@ -19,16 +19,16 @@ from summit.ldscore.generalized_gxe_variant import (
 )
 
 
-def build_parser(*, prog="summit-generalized-gxe-variant-ldscore") -> argparse.ArgumentParser:
+def build_parser() -> argparse.ArgumentParser:
     parser = ArgumentParser(
-        prog=prog,
+        prog="summit reference",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         description=(
             "Plan or inspect the generalized per-variant SUMMIT-GxE LD-score "
             "reference. This is the variant-probe, exactly-two-pass estimator; "
             "it is not the sample-probe contextual action estimator."
         ),
-        epilog="For authenticated cross-trait Z summaries, use summit reference zpass --help.",
+        epilog="For cross-trait reference Z moments, use summit reference zpass --help.",
     )
     subcommands = parser.add_subparsers(dest="command", required=True)
     plan = subcommands.add_parser(
@@ -41,16 +41,14 @@ def build_parser(*, prog="summit-generalized-gxe-variant-ldscore") -> argparse.A
         ("--annotations", "num_annotations"),
     ):
         plan.add_argument(option, dest=destination, type=int, required=True)
-    plan.add_argument("--nvecs", "--probes", dest="num_probes", type=int, required=True,
+    plan.add_argument("--nvecs", dest="num_probes", type=int, required=True,
                       help="Number of variant-axis random probes.")
-    memory = plan.add_mutually_exclusive_group(required=True)
-    memory.add_argument("--memory-gib", dest="memory_limit_bytes", type=gib_bytes,
+    plan.add_argument("--memory-gib", required=True, dest="memory_limit_bytes", type=gib_bytes,
                         help="Reference work-plan budget in GiB.")
-    memory.add_argument("--memory-bytes", dest="memory_limit_bytes", type=int, help=argparse.SUPPRESS)
     plan.add_argument("--genotype-format", choices=("bed", "pgen"), required=True)
-    plan.add_argument("--num-threads", "--threads", dest="threads", type=int, default=1)
+    plan.add_argument("--num-threads", dest="threads", type=int, default=1)
     plan.add_argument("--fixed-effect-rank", type=int, default=0)
-    plan.add_argument("--block-size", "--variant-block-width", dest="variant_block_width", type=int, default=4096)
+    plan.add_argument("--block-size", dest="variant_block_width", type=int, default=4096)
     plan.add_argument(
         "--component-diagonal-sample-tile-width", type=int, default=1024
     )
@@ -140,8 +138,8 @@ def _inspect(path: Path) -> dict:
     }
 
 
-def main(argv: Sequence[str] | None = None, *, prog="summit-generalized-gxe-variant-ldscore") -> int:
-    parser = build_parser(prog=prog)
+def main(argv: Sequence[str] | None = None) -> int:
+    parser = build_parser()
     args = parser.parse_args(argv)
     if args.command == "plan":
         result = _plan(args)

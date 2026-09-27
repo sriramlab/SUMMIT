@@ -6,8 +6,7 @@ scores, and fits gene–environment interaction models and polygenic scores.
 Start with [Installation](Installation.md), try the synthetic
 example below, then choose an analysis guide. [Input files](Input-files.md)
 describes the formats needed for your own data.
-[Commands and options](Commands-and-options.md) lists shared controls and
-compatibility spellings.
+[Commands and options](Commands-and-options.md) lists the commands and shared controls.
 
 ```bash
 python example/prepare_example_inputs.py

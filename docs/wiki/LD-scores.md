@@ -48,7 +48,7 @@ decoded panels and cache.
 ## Choosing resources
 
 `--num-threads` sets the CPU thread count. `--block-size` controls variants per
-block; smaller blocks reduce temporary memory. `--target-mem` sets the
+block; smaller blocks reduce temporary memory. `--memory-gib` sets the
 sketch-panel or windowed-LD memory budget in GiB. Use an explicit budget on a cluster
 when the process cannot detect its scheduler allocation.
 

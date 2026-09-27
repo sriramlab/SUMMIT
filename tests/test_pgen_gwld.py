@@ -159,7 +159,8 @@ def _hardcalls() -> np.ndarray:
         ("gxe", (".gxe.ldscore.gz", ".gee.ldscore.gz")),
     ],
 )
-def test_pgen_cli_dispatch_smoke(tmp_path, mode, expected_suffixes):
+@pytest.mark.parametrize("memory", [None, "auto", "0.01"])
+def test_pgen_cli_dispatch_smoke(tmp_path, mode, expected_suffixes, memory):
     alt = _hardcalls()
     if mode == "gxe":
         # Summary GxE bundles require positive projected variance for every
@@ -179,7 +180,7 @@ def test_pgen_cli_dispatch_smoke(tmp_path, mode, expected_suffixes):
         str(prefix.with_suffix(".pgen")),
         "--out",
         str(out),
-        "--step_size",
+        "--block-size",
         "3",
         "--seed",
         "811",
@@ -224,6 +225,8 @@ def test_pgen_cli_dispatch_smoke(tmp_path, mode, expected_suffixes):
             ]
         )
 
+    if memory is not None:
+        command.extend(["--memory-gib", memory])
     env = os.environ.copy()
     env["SUMMIT_NUMACTL_WRAPPED"] = "1"
     subprocess.run(command, check=True, env=env)

@@ -14,7 +14,7 @@ reference uses one fixed set of samples and variants.
 
 ```bash
 summit --geno reference.bed --env environment.tsv --covar covariates.tsv \
-  --nvecs 1024 --seed 1 --rand-dist rademacher --target-mem 16 \
+  --nvecs 1024 --seed 1 --rand-dist rademacher --memory-gib 16 \
   --num-threads 8 --out results/reference
 ```
 

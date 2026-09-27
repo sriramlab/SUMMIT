@@ -1,8 +1,7 @@
 # Commands and options
 
-Use `summit` for installed command-line workflows. Each command keeps its
-existing estimator, input format and defaults. Older executables and option
-spellings remain accepted so existing scripts continue to run.
+Use `summit --help` for analysis options, or add `--help` to a command such
+as `summit pgs fit`.
 
 ## Commands
 
@@ -11,107 +10,66 @@ spellings remain accepted so existing scripts continue to run.
 | Genome-wide or windowed LD scores | `summit --geno ...` |
 | Heritability or genetic correlation | `summit --h2 ...` or `summit --rg ...` |
 | Binary-trait preparation and inference | `summit --binary-method pcgc ...` |
-| GxE reference, scoring and fitting | `summit --geno ... --env ...`, `--gxe-score-reference`, `--gxe-fit`, or `--gxe-fit-batch` |
-| Plan, fit, score or inspect PGS models | `summit pgs {plan,fit,score,scale,inspect}` |
-| Plan or inspect generalized GxE references | `summit reference {plan,inspect}` |
-| Collect authenticated reference Z summaries | `summit reference zpass` |
+| One-environment G×E | `summit --geno ... --env ...`, `--gxe-score-reference`, `--gxe-fit`, or `--gxe-fit-batch` |
+| Polygenic scores | `summit pgs {plan,fit,score,scale,inspect}` |
+| Generalized G×E reference planning and inspection | `summit reference {plan,inspect}` |
+| Cross-trait reference Z moments | `summit reference zpass` |
 
-Use `--help` after the command, for example `summit pgs fit --help`.
-The main help groups inputs, analysis modes, regression, uncertainty,
-randomization, memory, and runtime controls. It shows one spelling per option.
-Unsupported trace inputs and the deprecated `--collapse-reg-ld` no-op no
-longer appear in help; their parser compatibility is retained.
-
-The `reference plan` command plans work and memory; it does not generate a
-reference or fit a model. `reference zpass` requires an authenticated study
-layout. Cross-trait research drivers and Python APIs retain their specialized
-input contracts; the new launcher does not turn them into generic GWAS readers.
+Generalized G×E fitting and cross-trait response models use Python APIs.
+See [Multiple environments](Multiple-environments.md) and
+[Cross-trait analysis](Cross-trait-analysis.md) for their workflows.
 
 ## Shared controls
 
 | Option | Meaning |
 |---|---|
-| `--nvecs` | Number of random probes in LD/GxE/PCGC preparation or reference planning |
-| `--seed` | Random seed for LD/GxE/PCGC preparation |
-| `--block-size` | Genotype variants processed per block |
-| `--num-threads` | Compute thread count, or the thread count used in a dry-run plan |
-| `--genome-build` | Build label in binary preparation or PGS genotype-scale preparation |
-| `--geno`, `--annot`, `--out` | Genotype input, annotation input and output, where the command accepts them |
+| `--geno` | BED or PGEN input, with companion files |
+| `--annot` | SNP annotations |
+| `--out` | Output prefix or directory, as specified by the command |
+| `--nvecs` | Number of random vectors for reference estimation |
+| `--seed` | Random seed |
+| `--block-size` | Number of genotype variants processed together |
+| `--num-threads` | Compute thread count |
+| `--memory-gib` | Working-memory budget in GiB |
+| `--njack` | Jackknife block count or scheme |
 
-The probe axis remains part of the estimator: sharing `--nvecs` does not make
-ordinary LD scores and binary reference statistics interchangeable.
-Windowed LD scores are deterministic and do not use probes. `--block-size auto`
-is supported only for GxE reference generation. An explicit width can affect
-that estimator's finite-probe realization; changing its spelling does not.
+Use complete option names. `--block-size` controls computation; `--njack`
+controls uncertainty estimation. Windowed LD scores do not use random vectors.
+`--block-size auto` is available for one-environment G×E reference generation.
+Its resolved width is saved with the reference because it affects the
+finite-vector estimate.
 
-Defaults are preserved:
+| Workflow | Random vectors | Seed | Block size | Memory budget |
+|---|---:|---|---:|---|
+| LD/G×E preparation | 1,000 | Unspecified | 1,000 | `auto` |
+| Binary preparation | 256 | 0 | 256 | 1 GiB |
+| PGS | — | — | 512 | 16 GiB |
+| Generalized reference plan | Required | — | 4,096 | Required |
+| Reference Z moments | — | — | 128 | — |
 
-| Workflow | Probes | Seed | Genotype block size |
-|---|---:|---|---:|
-| Main LD/GxE preparation | 1,000 | Unspecified | 1,000 |
-| Binary preparation | 256 | 0 | 256 |
-| PGS | Not applicable | Not applicable | 512 |
-| Generalized reference plan | Required | Not applicable | 4,096 |
-| Reference Z pass | Not applicable | Not applicable | 128 |
+Binary inference uses 200 contiguous SNP blocks by default. HE/LDSC uses
+chromosome deletion (`--njack chr`). Input formats and method-specific
+settings are described in the individual analysis guides.
 
-Binary inference still reports SEs with 200 SNP blocks by default. `--njack`
-controls these deletion groups; `--block-size` controls genotype processing.
-They are different quantities. The HE/LDSC `--njack` default remains `chr`.
+## Memory
 
-## Memory budgets
+For LD/G×E, `--memory-gib` budgets the sketch panels or windowed-LD workspace.
+For binary preparation it budgets reference workspace; for PGS it supplies
+the fit or scoring memory plan. It is not a limit on process resident memory.
+Allow additional memory for inputs, libraries, and output arrays.
 
-These budgets cover different allocations and remain separate:
+G×E also provides `--gxe-native-workspace-gib` for each direct native call
+(default 16 GiB), and `--gxe-total-memory-gib` for the estimated process peak
+(default `auto`). `--win-cache-mb` controls the windowed-LD cache in MiB.
+These limits cover different allocations.
 
-| Command or option | Scope |
-|---|---|
-| Binary `--memory-gib` | Reference workspace; default 1 GiB |
-| PGS `--memory-gib` | Prediction or scale-preparation memory plan; default 16 GiB |
-| `reference plan --memory-gib` | Generalized reference work-plan limit; required |
-| Main LD/GxE `--target-mem` | Sketch-panel or windowed-LD budget; default `auto` |
-| `--gxe-native-workspace-gib` | Hard ceiling for each direct native GxE call; default 16 GiB |
-| `--gxe-total-memory-gib` | Modeled GxE process peak; default `auto` |
-| `--win-cache-mb` | Windowed-LD cache in MiB |
+## Genome build
 
-A workspace budget is not a limit on the process's resident memory. Passing
-binary `--memory-gib` to ordinary LD/GxE fails with a message naming the relevant
-budgets, rather than being ignored. `--target-mem` retains its historical
-precedence over `--target-xz-mem` if an old script supplies both. The latter
-remains a sketch-only legacy control; windowed LD uses `--target-mem`.
+Provide build-matched genotypes, annotations, and reference files. SUMMIT does
+not convert coordinates or infer the genome build.
 
-## Compatibility table
-
-Use the right-hand spelling in new scripts. The left-hand forms still work.
-
-| Previous spelling | Preferred spelling |
-|---|---|
-| `summit-pgs ...` | `summit pgs ...` |
-| `summit-generalized-gxe-variant-ldscore ...` | `summit reference ...` |
-| `--binary-probes` | `--nvecs` |
-| `--binary-seed` | `--seed` |
-| `--step_size`, `--binary-block-size` | `--block-size` |
-| `--binary-memory-gib` | `--memory-gib` |
-| `--binary-genome-build` | `--genome-build` |
-| Reference plan `--probes` | `--nvecs` |
-| Reference plan `--threads` | `--num-threads` |
-| Reference plan `--variant-block-width` | `--block-size` |
-| Reference plan `--memory-bytes 8589934592` | `--memory-gib 8` |
-| Reference Z pass `--bed-prefix`, `--annotations`, `--output`, `--width` | `--geno`, `--annot`, `--out`, `--block-size` |
-| Main LD/GxE `--target-xz-mem` | `--target-mem` |
-| `--write-ld-mc-ci` | `--write-ld-mc-var` |
-
-The new option aliases share one parsed value. Conflicting values, such as
-`--nvecs 256 --binary-probes 1000`, fail explicitly. Equal values are accepted.
-Reference planning accepts either GiB or legacy bytes, never both in one call.
-Existing overlap-covariance/intercept aliases retain their previous behavior.
-
-Keep scientific inputs distinct: `--covar` names a projection-covariate file,
-while `--binary-covariates` selects risk columns from the binary sample table.
-`--binary-scale` supplies population means and inverse standard deviations;
-`--gxe-genotype-scale` chooses a scaling rule. Merging these options would
-change the model.
-
-For an existing installation, reinstall with the same build configuration to
-refresh console entry points; see [Installation](Installation.md).
-The old standalone commands continue to work. `python -m summit` also uses
-the unified dispatcher. PGS retains its own thread/NUMA initialization before
-numerical imports; it does not pass through the legacy LD runtime setup.
+`--genome-build` optionally records a label during binary or PGS scale
+preparation. The PGS specification accepts the equivalent `genome_build`
+field. Labeled saved scales must be reused with the same label. PGS scoring
+rejects conflicting labels when both are supplied and always checks SNP
+positions and allele pairs, including when labels are omitted.

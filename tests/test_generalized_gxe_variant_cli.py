@@ -21,13 +21,13 @@ def _plan_arguments() -> list[str]:
         "3",
         "--annotations",
         "2",
-        "--probes",
+        "--nvecs",
         "16",
-        "--memory-bytes",
-        str(2 * 1024**3),
+        "--memory-gib",
+        "2",
         "--genotype-format",
         "bed",
-        "--threads",
+        "--num-threads",
         "2",
         "--omit-per-variant-panel",
     ]
@@ -35,7 +35,7 @@ def _plan_arguments() -> list[str]:
 
 def test_help_names_variant_probe_two_pass_estimator() -> None:
     help_text = " ".join(build_parser().format_help().split())
-    assert "summit-generalized-gxe-variant-ldscore" in help_text
+    assert "summit reference" in help_text
     assert "variant-probe" in help_text
     assert "exactly-two-pass" in help_text
     assert "sample-probe contextual action estimator" in help_text

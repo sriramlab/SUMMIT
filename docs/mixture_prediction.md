@@ -1,9 +1,9 @@
-# Mixture shrinkage for SUMMIT-pgs
+# Mixture priors for polygenic scores
 
 `fit_mixture_prediction` fits a joint mixture prior over each SNP's baseline
 and environment-response coefficients. It uses SUMMIT's genotype readers,
-protected matrix products, annotation priors, model artifacts and scoring API.
-It does not invoke LDAK. The existing Gaussian solver remains the default.
+matrix operations, annotation priors, model files and scoring API.
+The Gaussian solver is the default.
 
 For the existing per-SNP covariance `Lambda[j]`, the prior is
 
@@ -108,7 +108,7 @@ candidate updates instead of projecting all SNP columns again.
 
 No full genome-wide LD matrix is formed. Gram storage is proportional to
 `M * block_size * Q**2` per distinct trait/residual group, with additional
-posterior and fixed-projection caches included in admission planning. Compact
+posterior and fixed-projection caches included in memory planning. Compact
 storage adds an `N*M` byte hard-call cache; streaming avoids that allocation.
 Use the planner on the actual traits and candidate menu before choosing these
 settings. An individual Gaussian or small-panel timing does not establish
@@ -117,26 +117,20 @@ full-menu throughput.
 Convergence requires an independent simultaneous site-update check after
 reconstructing the residual from all saved weights, as well as fixed-effect
 orthogonality. The artifact records `method="mixture_vb_fixed_point"` and the
-observed error and threshold. This certifies a variational fixed point; it is
-neither an exact posterior certificate nor a guarantee of the global optimum.
+observed error and threshold. This checks convergence to a variational fixed point; it does not establish
+an exact posterior or a global optimum.
 The objective is monitored for decreases. LDAK can reach a different fixed
 point because update order, initialization and stopping criteria differ.
 
-Checkpoints atomically retain weights, residuals, site penalties and objective
-history after each complete sweep. Residuals are independently reconstructed
-after the first sweep and every five sweeps by default (`residual_refresh`); appreciable accumulated
-drift raises an error. Mixture matrix products, including fixed-effect projection
-and residual reconstruction, use the deterministic native tiled path. The fixed
-basis also undergoes an independent orthonormality check. A C++ workspace owns
-the residual and reconstruction state, while native interaction-design
-construction avoids Python broadcast temporaries. Checkpoints receive explicit
-snapshots and restore into the same native state. The private-BLIS
-runtime protection contract remains required.
-Resume authenticates source, inputs,
-solver settings, Python implementation and native binary. Rebuilding caches
-after restart requires another source traversal. Existing model directories
-are never overwritten. The BLIS path requires both integrity and checksum
-guards and the established native worker-placement contract.
+Checkpoints save weights, residuals, site penalties, and objective history
+after each complete sweep. Residuals are independently reconstructed after
+the first sweep and every five sweeps by default (`residual_refresh`).
+Appreciable numerical drift raises an error.
+
+Resume requires matching inputs, solver settings, and implementation.
+Rebuilding caches after restart requires another genotype pass. Existing model
+directories are never overwritten. See [Installation](wiki/Installation.md)
+for the native build requirements.
 
 The Python API also accepts `initial_weights`, with exactly one finite array
 per candidate. This starts a new fit and reconstructs residuals and variational
@@ -155,8 +149,3 @@ parameter `alpha` corresponds to covariance weights proportional to
 `v[j]**(1+alpha)`. These weights can be represented by `AnnotationDesign`.
 The prior and residual variance must use the same residualized phenotype
 variance, not an assumed unit variance.
-
-Qualification covers the Gaussian limit against dense GLS, joint posterior
-quadrature, singular and annotated priors, basis rotations, native/reference
-agreement, interruption/resume and artifact scoring. Full-array LDAK parity
-and throughput remain empirical checks; small-panel agreement is insufficient.

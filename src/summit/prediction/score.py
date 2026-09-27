@@ -38,7 +38,8 @@ class ScoreResult:
 
 
 def align_variants(model_axis, source_axis, *, missing_variants="error"):
-    if model_axis.genome_build != source_axis.genome_build:
+    if (model_axis.genome_build is not None and source_axis.genome_build is not None
+            and model_axis.genome_build != source_axis.genome_build):
         raise ValueError("scoring genome build differs from model")
     if missing_variants not in ("error", "mean_impute"):
         raise ValueError("unknown missing model variant policy")

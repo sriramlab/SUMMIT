@@ -225,8 +225,8 @@ def _score(args):
     return dict(output=str(output), models=len(models))
 
 
-def main(argv=None, *, prog="summit-pgs"):
-    parser = ArgumentParser(prog=prog, allow_abbrev=False)
+def main(argv=None):
+    parser = ArgumentParser(prog="summit pgs")
     subs = parser.add_subparsers(dest="command", required=True)
     for name in ("plan", "fit", "score", "scale", "inspect"):
         p = subs.add_parser(name, allow_abbrev=False)
@@ -251,7 +251,7 @@ def main(argv=None, *, prog="summit-pgs"):
             p.add_argument("models")
         if name == "scale":
             p.add_argument("--geno", required=True)
-            p.add_argument("--genome-build", required=True)
+            p.add_argument("--genome-build", help="Optional build label to retain with the genotype scale.")
             p.add_argument("--samples", required=True)
             p.add_argument("--variants")
             p.add_argument("--block-size", type=int, default=512)
@@ -311,7 +311,7 @@ def main(argv=None, *, prog="summit-pgs"):
         print(canonical(result))
         return 0
     except (ValueError, OSError, RuntimeError, KeyError, TypeError, MemoryError, ImportError, OverflowError, FloatingPointError) as exc:
-        parser.exit(2, f"{prog}: {exc}\n")
+        parser.exit(2, f"{parser.prog}: {exc}\n")
 
 
 if __name__ == "__main__":

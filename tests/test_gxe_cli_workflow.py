@@ -58,9 +58,9 @@ def test_cli_reference_wide_score_and_fit_roundtrip(tmp_path, monkeypatch):
         "--gxe-genotype-scale", "sample",
         "--rand-dist", "rademacher",
         "--dtype", "float64",
-        "--step_size", "17",
+        "--block-size", "17",
         "--num-threads", "1",
-        "--target-xz-mem", "0.01",
+        "--memory-gib", "0.01",
     )
     reference_prefix = tmp_path / "reference"
     _run(
@@ -88,7 +88,7 @@ def test_cli_reference_wide_score_and_fit_roundtrip(tmp_path, monkeypatch):
         "--covar", covariates,
         "--gxe-pheno", phenotypes,
         "--gxe-pheno-cols", "Y1,Y2",
-        "--step_size", "17",
+        "--block-size", "17",
         "--num-threads", "1",
         "--out", score_prefix,
     )

@@ -5,12 +5,10 @@ using the existing stochastic variant-axis reference. It then forms one
 genome-wide normal system and estimates a single covariance per annotation.
 It does not average separately fitted chromosome covariance estimates.
 
-This is an opt-in approximation with its own artifact policy,
-`within_chromosome_residual_profile_global_mass_v1`. The initial API requires
+This approximation requires
 the same participants, genotype scaling, context basis and fixed-effect span
 for reference and trait statistics. Population transfer is not implemented for
-this artifact family. Full-data concordance and timing are qualification steps;
-small algebraic tests do not establish calibration or biobank throughput.
+these summaries.
 
 ## Global normalization and joint estimation
 
@@ -82,14 +80,6 @@ correction uses retained target B and full source B, symmetrized after reduction
 This is an approximate target-row jackknife, not a chromosome bootstrap or
 an exact refit. No inference blocks enter native LD construction.
 
-The native feature projection and fused information products use protected
-overwrite GEMMs followed by bounded elementwise updates. Reference qualification
-uses `GXELDCORE_GEMM_INTEGRITY=ON` and `GXELDCORE_GEMM_CHECKSUM=ON` explicitly;
-private BLIS otherwise defaults to checksum recomputation off. Native ledgers
-record independent phase audits and protected GEMM audits separately.
-Singleton annotation diagonals retain the variant
-summation order while moving the response-pair loop outside the variant loop.
-
 ## Annotation-dependent prediction
 
 The public prediction API accepts `AnnotationDesign` and `AnnotationPrior`:
@@ -116,21 +106,15 @@ genotype products per RHS tile. Homogeneous and annotated candidates can share
 the same batch. A design can be reused across candidates without duplicating
 the M-by-K matrix. Content identities are cached on immutable backing stores.
 
-Native annotation fits using BLIS require both `GXELDCORE_GEMM_INTEGRITY=ON`
-and `GXELDCORE_GEMM_CHECKSUM=ON`. Full-array qualification found intermittent
-discrepancies around 1e-6 in the unchecked build, despite passing small tests;
-their cause remains unresolved. The protected full-array candidate sequence
-agreed with independent per-annotation products to 1.8e-16 relative error.
-The API rejects the unqualified BLIS configuration before genotype preparation.
-This is a qualification restriction, not a claim that the discrepancy's cause
-has been fixed or that the annotation formula caused it.
+Native annotation fits using BLIS require `GXELDCORE_GEMM_INTEGRITY=ON`
+and `GXELDCORE_GEMM_CHECKSUM=ON` when building. These numerical checks are
+required by the prediction backend.
 
 The positive aggregate-covariance diagonal is an approximate preconditioner;
 the covariance operator and exported weights use the exact per-SNP priors.
 Convergence is checked against the actual operator. Planning, checkpoint
 identity, interruption/resume, export and reloaded scoring use the regular
-prediction API. Annotated designs are authenticated against the ordered
-training variant/allele axis. No annotations are needed when scoring saved
+prediction API. Annotation designs must match the ordered training SNPs and alleles. No annotations are needed when scoring saved
 posterior weights.
 
 For the CLI, write a design with `write_annotation_design(path, design)` and

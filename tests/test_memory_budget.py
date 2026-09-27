@@ -30,8 +30,7 @@ def test_auto_memory_budget_keeps_fractional_and_fixed_margin(monkeypatch):
 
 def test_cli_defaults_to_auto_memory_and_semantic_mailman_selection():
     defaults = cli.build_parser().parse_args([])
-    assert defaults.target_xz_mem == "auto"
-    assert defaults.target_mem is None
+    assert defaults.memory_gib == "auto"
     assert defaults.gxe_total_memory_gib == "auto"
     assert defaults.use_mailman == "auto"
 

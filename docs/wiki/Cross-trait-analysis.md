@@ -35,9 +35,9 @@ summing chromosome Grams would omit cross-chromosome diagonal products.
 
 There is no general `summit` cross-trait G×E command yet. The research drivers
 `scripts/generalized_gxe/cross_trait_study.py` and `cross_trait_pilot_fit.py`
-show the complete workflow, including input authentication and checkpoint
-resume. They expect the documented study directory layout and are not generic
-readers for ordinary GWAS summary files.
+show the complete workflow, including input checks and checkpoint
+resume. These scripts use a study-specific directory layout; adapting them requires
+preparing the same input files. They do not accept ordinary GWAS summaries.
 
 ## Reference modes
 
@@ -54,14 +54,6 @@ does not establish calibration for every sampling design. The last mode needs
 compatible Z summaries. Reference-mode choice does not change the scientific
 definition of the ordered cross-trait covariance.
 
-For treatment-aware masks or additional phenotypes, both research drivers
-accept `--extra-input-root`. The directory needs a `MANIFEST.json` with
-`trait_sources` hashes and `inputs/<trait>.npz`; fitting also requires completed
-per-chromosome within-trait summaries. The master `height_raw` input keeps its
-original definition. Use the same extra input root for scoring and fitting.
-The cluster launcher forwards `CROSS_TRAIT_EXTRA_INPUT_ROOT` and accepts
-`CROSS_TRAIT_MAX_RUN_SECONDS` for the study time budget.
-
 ## Uncertainty and interpretation
 
 `baseline_rg` uses the original context origin; `centered_baseline_rg` uses
@@ -74,9 +66,7 @@ such as response correlation minus baseline correlation use paired uncertainty;
 subtracting two independent confidence intervals is incorrect.
 
 The research fitter also exposes `--uncertainty-method jackknife` for nonlinear
-delete-block estimates. `--deletion-method legacy` retains the older equations
-for reproducing historical results. Those options do not change the default
-generalized within-trait estimator's separate deletion convention.
+delete-block estimates. Both methods use the paired SNP blocks.
 
 The aggregate orthogonal-response correlation measures shared response after
 removing each trait's genetic association with its baseline, under the recorded
@@ -85,12 +75,11 @@ and does not describe the direction of an environmental intervention.
 
 Weak or nonpositive genetic-variance denominators can make correlations and
 intervals undefined. Raw values outside [-1, 1] are retained and flagged.
-The corrected simulation results improve the earlier aggregate SE calibration,
-but not every coordinate passes the qualification screens. The uncertainty
-conditions on the supplied reference and does not include reference/probe redraws
-or transport-model error.
+Uncertainty is conditional on the supplied reference. It excludes reference
+sampling, random-vector error, and error from transferring reference moments
+to a different study cohort.
 
-The [method and validation record](Cross-trait-response-covariance.md) gives
-the equations, calibration results, and performance measurements.
+The [method description](Cross-trait-response-covariance.md) gives
+the equations and reference approximations.
 [Binary cross-trait PCGC](Binary-traits-and-PCGC.md) is a separate research path
-with its own ascertainment and overlap contract.
+with its own ascertainment and overlap assumptions.

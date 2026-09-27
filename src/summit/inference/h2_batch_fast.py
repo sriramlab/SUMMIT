@@ -524,8 +524,6 @@ def _write_results_table(path: str, rows: list[tuple], nbins: int):
 
 def dispatch_h2_batch_fast(args, log):
     """Run exact chromosome-jackknife h2 in bounded phenotype batches."""
-    if args.trace is not None:
-        raise ValueError("--h2-batch-fast requires per-SNP --ldscores, not --trace.")
     if args.ldscores is None:
         raise ValueError("--h2-batch-fast requires --ldscores.")
     if str(args.chisq_action).strip().lower() == "clip":

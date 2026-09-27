@@ -15,7 +15,7 @@ class VariantAxis:
     position: tuple[int, ...]
     counted: tuple[str, ...]
     other: tuple[str, ...]
-    genome_build: str
+    genome_build: str | None = None
 
     def __post_init__(self):
         for key in ("ids", "chromosome", "position", "counted", "other"):
@@ -25,8 +25,8 @@ class VariantAxis:
             raise ValueError("variant axis lengths disagree or are empty")
         if len(set(self.ids)) != m or any(not isinstance(x, str) or not x.strip() for x in self.ids):
             raise ValueError("variant IDs must be unique nonempty strings")
-        if not isinstance(self.genome_build, str) or not self.genome_build:
-            raise ValueError("genome build must be declared")
+        if self.genome_build is not None and (not isinstance(self.genome_build, str) or not self.genome_build.strip()):
+            raise ValueError("genome build must be a nonempty label when supplied")
         if any(x not in tuple(str(i) for i in range(1, 23)) for x in self.chromosome):
             raise ValueError("V1 supports autosomal diploid variants only")
         if any(isinstance(x, bool) or not isinstance(x, (int, np.integer)) or x < 1 for x in self.position):

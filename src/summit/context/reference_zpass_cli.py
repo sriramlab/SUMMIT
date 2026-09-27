@@ -121,11 +121,11 @@ def main(argv=None):
     parser.add_argument('--reference-root',type=Path,required=True)
     parser.add_argument('--chromosome',type=int,required=True)
     parser.add_argument('--master-input',type=Path,required=True)
-    parser.add_argument('--geno','--bed-prefix',dest='bed_prefix',type=Path,required=True)
-    parser.add_argument('--annot','--annotations',dest='annotations',type=Path,required=True)
-    parser.add_argument('--out','--output',dest='output',type=Path,required=True)
+    parser.add_argument('--geno',dest='bed_prefix',type=Path,required=True)
+    parser.add_argument('--annot',dest='annotations',type=Path,required=True)
+    parser.add_argument('--out',dest='output',type=Path,required=True)
     parser.add_argument('--num-threads',type=int,default=1)
-    parser.add_argument('--block-size','--width',dest='width',type=int,default=128)
+    parser.add_argument('--block-size',dest='width',type=int,default=128)
     args=parser.parse_args(argv)
     result=run_zpass(manifest_path=args.manifest,reference_root=args.reference_root,
         chromosome=args.chromosome,master_input=args.master_input,bed_prefix=args.bed_prefix,

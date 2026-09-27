@@ -117,3 +117,24 @@ def test_bed_fit_and_score_match_array_source(tmp_path):
     array_models = fit_prediction(traits, array_source, output=tmp_path/"array-fit", backend="numpy")
     for a, b in zip(native_models, array_models):
         np.testing.assert_allclose(a.weights, b.weights, atol=1e-12, rtol=1e-12)
+
+
+@pytest.mark.parametrize("build", [None, "GRCh37"])
+def test_optional_build_preserves_position_and_allele_checks(build):
+    from summit.prediction.score import align_variants
+    source, _ = fixture()
+    model = replace(source.variants, genome_build=build)
+    for label in (None, build):
+        rows, cols, flips = align_variants(model, replace(model, genome_build=label))
+        np.testing.assert_array_equal(rows, cols)
+        assert not flips.any()
+    if build is not None:
+        with pytest.raises(ValueError, match="genome build"):
+            align_variants(model, replace(model, genome_build="GRCh38"))
+    with pytest.raises(ValueError, match="genomic position"):
+        align_variants(model, replace(model, genome_build=None,
+                                      position=(model.position[0]+1, *model.position[1:])))
+    bad = next(a for a in "ACGT" if a not in (model.counted[0], model.other[0]))
+    with pytest.raises(ValueError, match="allele mismatch"):
+        align_variants(model, replace(model, genome_build=None,
+                                      counted=(bad, *model.counted[1:])))

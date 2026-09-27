@@ -8,10 +8,10 @@ def main(argv=None):
     tokens = list(sys.argv[1:] if argv is None else argv)
     if tokens[:1] == ["pgs"]:
         from .prediction.cli import main as pgs_main
-        return pgs_main(tokens[1:], prog="summit pgs")
+        return pgs_main(tokens[1:])
     if tokens[:1] == ["reference"] and tokens[1:2] != ["zpass"]:
         from .ldscore.generalized_gxe_variant_cli import main as reference_main
-        return reference_main(tokens[1:], prog="summit reference")
+        return reference_main(tokens[1:])
     # The legacy CLI reads argv during import to establish its runtime. Keep
     # that ordering, and retain it for the existing reference zpass command.
     original = sys.argv

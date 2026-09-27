@@ -4,7 +4,7 @@ Date: 2026-09-26. Branch: `feat/pcgc`, based on `working` at
 `af6430efdfb3995b2905a878e35114148bc0863d`.
 
 **Historical qualification at `4a96bb1`; not current CLI instructions.**
-The [current guide](wiki/Binary-traits-and-PCGC.md) reports SEs by default and
+The [current guide](../../docs/wiki/Binary-traits-and-PCGC.md) reports SEs by default and
 removes the former research flags.
 
 **Original qualification.** The PCGC jackknife below used an
@@ -24,7 +24,7 @@ validity for arbitrary ascertainment, ancestry structure or reference panels.
 
 ## What is implemented
 
-The [scientific and input contract](pcgc.md) defines all five methods. Risk
+The [scientific and input contract](../../docs/pcgc.md) defines all five methods. Risk
 preparation fits an ascertainment-aware population-probit likelihood or accepts
 supplied population risks. Standard, inverse and scalar methods share the
 same moment representation, solver and block reduction. Exact basis
