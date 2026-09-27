@@ -37,6 +37,12 @@ estimate the overlap covariance from summary statistics by omitting that option.
 The supplied value is the standardized phenotype cross-product on the shared
 samples divided by `sqrt(N1*N2)`. It is not the number or proportion of overlapping participants.
 
+When N varies across SNPs, the overlap correction assumes a constant overlap
+covariance on the local score scale. This is appropriate for shared genotype
+missingness with similar missing fractions in both traits and their overlap.
+Different cohort contributions or trait-specific missingness require additional
+overlap information; per-SNP N alone is insufficient.
+
 If you have participant-level inputs locally, `--pheno-rg a.tsv,b.tsv` and
 optional `--pheno-rg-cov a.cov,b.cov` compute this value. Phenotype tables have
 `FID IID` and the phenotype as their last column.
@@ -66,6 +72,10 @@ because their strand is ambiguous.
 ## Standard errors and filtering
 
 `--njack chr` deletes one chromosome at a time. An integer requests SNP blocks.
+The default jackknife supports varying per-SNP N. The optional
+`--rg-se-method kmoments` and full SCORE normal-equation export require
+constant per-SNP sample sizes because they assume one shared sample matrix.
+
 `--max-chisq auto` uses `max(80, 0.001*Nmax)`; `--chisq-action` chooses `drop`,
 `clip`, `warn`, or `none`. Review the retained SNP counts in the log.
 

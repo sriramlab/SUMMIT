@@ -23,7 +23,7 @@ from .ldsc_h2 import (
     read_ldsc_weight_ld_aligned,
     resolve_ldsc_reference_moments,
 )
-from ..sumstats.moments import exact_score_z_from_arrays, effective_n_scale
+from ..sumstats.moments import h2_moment_from_arrays, effective_n_scale
 
 
 class Sumrhe:
@@ -350,14 +350,13 @@ class Sumrhe:
         if np.any(pos < 0):
             raise ValueError("keep_mask includes SNPs that are absent from the sumstats.")
 
-        z_star = exact_score_z_from_arrays(
+        y_used = h2_moment_from_arrays(
             beta=ss.beta[pos],
             se=ss.se[pos],
             n_obs=ss.n[pos],
             nsamp=float(ss.nsamp),
             cov_rank=0,
         )
-        y_used = z_star * z_star
         y_used[~np.isfinite(y_used)] = np.nan
 
         y = np.full(M, np.nan, dtype=np.float64)

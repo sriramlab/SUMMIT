@@ -33,7 +33,7 @@ def resolve_cov_rank(
 
 def effective_n_scale(nsamp, cov_rank):
     """
-    Common scalar used everywhere in your codebase:
+    Reference sample-size scale for the moment equations:
         n_star = N_gwas - cov_rank - 1
     """
     n = float(nsamp) - float(cov_rank) - 1.0
@@ -74,12 +74,15 @@ def derived_wald_z(beta, se, n_obs, n_scale):
 
 def exact_score_z_from_arrays(beta, se, n_obs, nsamp, cov_rank):
     """
-    Exact score-scale z-equivalent:
+    Score statistic on the reference sample-size scale:
         z*_j = sqrt(n_star) * beta_j / sqrt(beta_j^2 + nu_j * se_j^2)
 
     where
         n_star = nsamp - cov_rank - 1
         nu_j   = n_obs_j - cov_rank - 2
+
+    Its null variance is n_star / (nu_j + 1), not one when N varies.
+    Use h2_moment_from_arrays for the univariate estimating response.
     """
     beta = np.asarray(beta, dtype=np.float64)
     se = np.asarray(se, dtype=np.float64)
@@ -101,29 +104,50 @@ def exact_score_z_from_arrays(beta, se, n_obs, nsamp, cov_rank):
     out[good] = np.sqrt(n_star) * beta[good] / np.sqrt(den[good])
     return out
 
+
+def score_noise_scale(n_obs, nsamp, cov_rank):
+    """Null variance of a reference-scaled OLS score, N* / n*_j."""
+    n_star = effective_n_scale(nsamp, cov_rank)
+    local = gwas_resid_df(n_obs, cov_rank) + 1.0
+    if np.all(local == n_star):
+        return 1.0
+    out = np.full(local.shape, np.nan, dtype=np.float64)
+    np.divide(n_star, local, out=out, where=np.isfinite(local) & (local > 1.0))
+    return out
+
+
+def summary_noise_scale(matched, info, *, trait=None):
+    """Noise scale for beta/SE summaries; supplied moments keep their own scale."""
+    if not info or not str(info.get("mode", "")).startswith("beta_se_exact"):
+        return 1.0
+    key = "cov_rank" if trait is None else f"trait{trait}_cov_rank"
+    return score_noise_scale(matched.n, matched.nsamp, int(info.get(key, 0)))
+
+
+def h2_moment_from_arrays(beta, se, n_obs, nsamp, cov_rank=0):
+    """Return 1 + N* [r_j^2 - 1/n*_j], preserving the signal scale.
+
+    The subtraction centers the response at one under the OLS null even
+    when SNP sample sizes differ. The result can be negative; it must not
+    be clipped or represented as the square of another score statistic.
+    """
+    z = exact_score_z_from_arrays(beta, se, n_obs, nsamp, cov_rank)
+    y = z * z
+    y -= score_noise_scale(n_obs, nsamp, cov_rank) - 1.0
+    return y
+
+
 def build_h2_summary_moment(
     matched,
     *,
     cov_rank=None,
     cov_rank_source=None,
 ):
-    """
-    Experimental h2 summary moment with cov_rank completely disabled.
-
-    This forces the h2 summary-mode estimator onto the intercept-only scale:
-        cov_rank = 0
-        n_scale  = N - 1
-
-    It intentionally ignores:
-      - the explicit cov_rank / cov_rank_source arguments
-      - any cov_rank metadata attached to the sumstats object
-
-    Nothing else in the codebase is changed by this swap.
-    """
+    """Build the h2 response using the intercept-only GWAS convention."""
     resolved_cov_rank = 0
     source = "forced0_no_covrank_h2"
 
-    z_star = exact_score_z_from_arrays(
+    y = h2_moment_from_arrays(
         beta=np.asarray(matched.beta, dtype=np.float64),
         se=np.asarray(matched.se, dtype=np.float64),
         n_obs=np.asarray(matched.n, dtype=np.float64),
@@ -131,7 +155,6 @@ def build_h2_summary_moment(
         cov_rank=resolved_cov_rank,
     )
 
-    y = z_star * z_star
     y[~np.isfinite(y)] = np.nan
 
     return y, {

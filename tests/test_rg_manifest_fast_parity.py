@@ -4,6 +4,7 @@ from types import SimpleNamespace
 
 import numpy as np
 import pandas as pd
+import pytest
 
 from summit.inference.sumcore import Sumcore
 from summit.manifest.rg_manifest_fast import dispatch_rg_manifest_fast
@@ -23,7 +24,8 @@ def _beta_for_exact_score_z(z_star, *, n: float, se: float) -> np.ndarray:
     return float(se) * z_star * np.sqrt(resid_df / (n_scale - z2))
 
 
-def test_fast_multimodel_supplied_overlap_matches_separate_sumcore_he_fits(tmp_path):
+@pytest.mark.parametrize("varying_n", [False, True])
+def test_fast_multimodel_supplied_overlap_matches_separate_sumcore_he_fits(tmp_path, varying_n):
     m = 72
     idx = np.arange(m, dtype=np.float64)
     chrom = np.repeat(np.arange(1, 5), m // 4)
@@ -86,6 +88,14 @@ def test_fast_multimodel_supplied_overlap_matches_separate_sumcore_he_fits(tmp_p
             "SE": se,
         },
     )
+
+    if varying_n:
+        for path, multiplier in [(trait1, 1400), (trait2, 900)]:
+            frame = pd.read_csv(path, sep="\t")
+            frame["N"] -= multiplier * (np.arange(m) % 7)
+            # Include negative corrected h2 responses and pair-specific drops.
+            frame.loc[frame.index % 8 == 1, "BETA"] = 0.0
+            frame.iloc[1 if path == trait1 else 2:].to_csv(path, sep="\t", index=False)
 
     model_manifest = _write_table(
         tmp_path / "models.tsv",
@@ -191,7 +201,7 @@ def test_fast_multimodel_supplied_overlap_matches_separate_sumcore_he_fits(tmp_p
         intercept = direct["intercept"]
         rg_fit = direct["rg_fit"]
         expected = {
-            "n_snps": m,
+            "n_snps": int(np.sum(rg_fit.prepared.active_mask)),
             "h2_trait1": h2_fit1.h2[-1, 0],
             "h2_trait1_se": h2_fit1.h2[-1, 1],
             "h2_trait2": h2_fit2.h2[-1, 0],

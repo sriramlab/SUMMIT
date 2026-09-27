@@ -12,7 +12,7 @@ import pandas as pd
 from .. import utils
 from ..sumstats.moments import (
     derived_wald_z,
-    exact_score_z_from_arrays,
+    h2_moment_from_arrays,
     effective_n_scale,
     resolve_cov_rank,
 )
@@ -168,20 +168,20 @@ def _parse_trait_column(
     if np.any(source_rows < 0):
         raise RuntimeError("Internal alignment error: retained SNP is absent from sumstats.")
 
-    z_star = exact_score_z_from_arrays(
+    y_used = h2_moment_from_arrays(
         beta=ss.beta[source_rows],
         se=ss.se[source_rows],
         n_obs=ss.n[source_rows],
         nsamp=float(ss.nsamp),
         cov_rank=0,
     )
-    finite = np.isfinite(z_star)
+    finite = np.isfinite(y_used)
     active_rows = used_rows[finite]
 
     y_column.fill(0.0)
     active_column.fill(False)
     if active_rows.size:
-        y_column[active_rows] = z_star[finite] * z_star[finite]
+        y_column[active_rows] = y_used[finite]
         active_column[active_rows] = True
 
     used_summary = used_top = None
@@ -381,18 +381,18 @@ def _stream_trait_column(
         present[rows[~keep_qc]] = False
         rows = rows[keep_qc]
 
-    z_star = exact_score_z_from_arrays(
+    y_used = h2_moment_from_arrays(
         beta=beta[rows],
         se=se[rows],
         n_obs=obs_n[rows],
         nsamp=nmax,
         cov_rank=0,
     )
-    finite_h2 = np.isfinite(z_star)
+    finite_h2 = np.isfinite(y_used)
     active_rows = rows[finite_h2]
     y_column.fill(0.0)
     active_column.fill(False)
-    y_column[active_rows] = z_star[finite_h2] * z_star[finite_h2]
+    y_column[active_rows] = y_used[finite_h2]
     active_column[active_rows] = True
 
     matched = H2MatchedMetadata(

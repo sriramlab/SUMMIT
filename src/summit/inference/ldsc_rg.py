@@ -5,6 +5,7 @@ from dataclasses import dataclass
 import numpy as np
 
 from .ldsc_h2 import _solve_weighted_design
+from ..sumstats.moments import summary_noise_scale
 
 
 @dataclass(frozen=True)
@@ -86,6 +87,8 @@ def _cov_ldsc_weights(
     intercept: float,
     ld_floor: float = 1.0,
     variance_floor: float = 1e-12,
+    noise_scale1=1.0,
+    noise_scale2=1.0,
 ) -> np.ndarray:
     """Return score-scale bivariate LDSC inverse-variance weights.
 
@@ -134,9 +137,14 @@ def _cov_ldsc_weights(
     ld_eff = np.maximum(ref_ld_total, ld_floor)
     overcount = np.maximum(weight_ld, ld_floor)
 
-    a = 1.0 + (n1_scale * h1 / m_total) * ld_eff
-    b = 1.0 + (n2_scale * h2 / m_total) * ld_eff
-    c = intercept + (np.sqrt(n1_scale * n2_scale) * gamma / m_total) * ld_eff
+    noise1 = np.broadcast_to(np.asarray(noise_scale1, dtype=np.float64), ref_ld_total.shape)
+    noise2 = np.broadcast_to(np.asarray(noise_scale2, dtype=np.float64), ref_ld_total.shape)
+    if not (np.isfinite(noise1).all() and np.all(noise1 > 0.0)
+            and np.isfinite(noise2).all() and np.all(noise2 > 0.0)):
+        raise ValueError("Covariance LDSC score noise scales must be positive and finite.")
+    a = noise1 + (n1_scale * h1 / m_total) * ld_eff
+    b = noise2 + (n2_scale * h2 / m_total) * ld_eff
+    c = intercept * np.sqrt(noise1 * noise2) + (np.sqrt(n1_scale * n2_scale) * gamma / m_total) * ld_eff
     variance = np.maximum(a * b + c * c, variance_floor)
     weights = 1.0 / (overcount * variance)
     if not (np.isfinite(weights).all() and np.all(weights > 0.0)):
@@ -162,12 +170,15 @@ def fit_constrained_cov_ldsc_irwls(
     initial_gamma=None,
     ld_floor: float = 1.0,
     variance_floor: float = 1e-12,
+    noise_scale1=1.0,
+    noise_scale2=1.0,
 ) -> LDSCCovIRWLSFit:
     """Fit supplied-overlap score-scale covariance LDSC by closed-form IRWLS.
 
-    The response is ``z1* z2* - c`` and column ``k`` of the design is
-    ``sqrt(n1* n2*) L_k / M_k``.  ``c`` is supplied by SUMMIT's separate
-    overlap-covariance step and is never estimated in this solve.
+    The response subtracts ``c * sqrt(noise_scale1 * noise_scale2)`` from
+    the reference-scaled score product. Column ``k`` of the design is
+    ``sqrt(n1* n2*) L_k / M_k``. The separate overlap-covariance step supplies
+    ``c``; this solve estimates only the genetic covariance coefficients.
     """
     design = np.asarray(design, dtype=np.float64)
     response = np.asarray(response, dtype=np.float64).reshape(-1)
@@ -264,6 +275,8 @@ def fit_constrained_cov_ldsc_irwls(
             raise ValueError(f"initial_gamma must be finite with shape ({k},).")
         initialization = "provided"
 
+    noise1 = np.broadcast_to(np.asarray(noise_scale1, dtype=np.float64), (m,))[keep]
+    noise2 = np.broadcast_to(np.asarray(noise_scale2, dtype=np.float64), (m,))[keep]
     path = [gamma_current.copy()]
     final_lhs = None
     final_rhs = None
@@ -287,6 +300,8 @@ def fit_constrained_cov_ldsc_irwls(
             intercept=intercept,
             ld_floor=ld_floor,
             variance_floor=variance_floor,
+            noise_scale1=noise1,
+            noise_scale2=noise2,
         )
         gamma_next, lhs, rhs, rank, condition = _solve_weighted_design(
             dk, qk, weights
@@ -415,6 +430,8 @@ def fit_rg_ldsc(
     if unit_id.shape != (m,) or delete.shape != (R, int(p.jackknife.nunit)):
         raise ValueError("LDSC rg jackknife design does not match the SNP axis.")
 
+    noise1 = summary_noise_scale(getattr(p, "matched1", None), getattr(p, "summary_y_info", None), trait=1)
+    noise2 = summary_noise_scale(getattr(p, "matched2", None), getattr(p, "summary_y_info", None), trait=2)
     gamma_reps = np.full((R + 1, k), np.nan, dtype=np.float64)
     failures = []
     full_fit = None
@@ -423,9 +440,11 @@ def fit_rg_ldsc(
         try:
             fit = fit_constrained_cov_ldsc_irwls(
                 design,
-                y - float(c_reps[r]),
+                y - float(c_reps[r]) * getattr(p, "overlap_scale", 1.0),
                 ref_ld_total,
                 weight_ld,
+                noise_scale1=noise1,
+                noise_scale2=noise2,
                 n1_scale=float(p.n1_scale),
                 n2_scale=float(p.n2_scale),
                 m_annot=m_annot,
@@ -497,7 +516,7 @@ def fit_rg_ldsc(
     )
     weight_info = {
         "estimator": "constrained_cov_ldsc_irwls",
-        "response": "score_z1_times_z2_minus_overlap_covariance",
+        "response": "score_z1_times_z2_minus_snp_overlap_covariance",
         "n1_scale": float(p.n1_scale),
         "n2_scale": float(p.n2_scale),
         "m_annot": m_annot.copy(),

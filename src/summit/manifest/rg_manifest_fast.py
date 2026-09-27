@@ -18,7 +18,9 @@ from ..inference.h2core import (
     _symmetrize_with_design as _sym_h2,
 )
 from ..inference.jackknife import JackknifeDesign, JackknifeSpec
-from ..sumstats.moments import exact_score_z_from_arrays, effective_n_scale
+from ..sumstats.moments import (
+    exact_score_z_from_arrays, effective_n_scale, h2_moment_from_arrays, score_noise_scale,
+)
 from ..inference.rgcore import (
     RGPrepared,
     InterceptFit,
@@ -35,6 +37,7 @@ from ..inference.rgcore import (
     _full_intercept_denominator,
     _intercept_gamma_total_from_beta,
     _component_rg,
+    overlap_unit_sums,
 )
 from ..sumstats.sumstats import Sumstats, harmonize_allele_codes
 from ..inference.trace import Trace
@@ -50,8 +53,9 @@ class _FastTrait:
     cov_rank_source: str
     keep: np.ndarray
     drop_idx: np.ndarray
-    z_h2: np.ndarray
+    y_h2: np.ndarray
     z_rg: np.ndarray
+    noise_scale: np.ndarray | float
     a1_code: np.ndarray
     a2_code: np.ndarray
     h2_ay_unit: np.ndarray | None
@@ -534,21 +538,21 @@ def _build_fast_traits(
         )
         entry = type("Entry", (), {"aligned": aligned, "sumstats": ss})
         beta, se, n = _full_axis_sumstats_arrays(entry, shared_trace)
-        z_h2 = exact_score_z_from_arrays(beta, se, n, nsamp=float(ss.nsamp), cov_rank=0)
+        y_h2 = h2_moment_from_arrays(beta, se, n, nsamp=float(ss.nsamp), cov_rank=0)
         z_rg = exact_score_z_from_arrays(beta, se, n, nsamp=float(ss.nsamp), cov_rank=int(ss.cov_rank))
-        keep &= np.isfinite(z_h2) & np.isfinite(z_rg)
+        keep &= np.isfinite(y_h2) & np.isfinite(z_rg)
 
         # Sparse-drop mode keeps the full Trace axis and zeroes excluded SNPs.
         # Pair-specific sufficient statistics are then full sums minus explicit
         # dropped-SNP corrections, which is exact for fixed pre-drop units such
         # as chromosome jackknife.
-        z_h2[~keep] = 0.0
+        y_h2[~keep] = 0.0
         z_rg[~keep] = 0.0
-        z_h2[~np.isfinite(z_h2)] = 0.0
+        y_h2[~np.isfinite(y_h2)] = 0.0
         z_rg[~np.isfinite(z_rg)] = 0.0
 
         h2_ay_unit = (
-            _compute_full_ay_unit(A, z_h2 * z_h2, jk)
+            _compute_full_ay_unit(A, y_h2, jk)
             if compute_h2_ay
             else None
         )
@@ -562,8 +566,9 @@ def _build_fast_traits(
             cov_rank_source=str(ss.cov_rank_source),
             keep=keep,
             drop_idx=np.flatnonzero(~keep).astype(np.int64),
-            z_h2=z_h2,
+            y_h2=y_h2,
             z_rg=z_rg,
+            noise_scale=score_noise_scale(n, ss.nsamp, ss.cov_rank),
             a1_code=a1_code,
             a2_code=a2_code,
             h2_ay_unit=h2_ay_unit,
@@ -755,6 +760,8 @@ def _stack_rg_prepared(
     n2_scale: float,
     summary_y_info: dict,
     y: np.ndarray,
+    overlap_scale=1.0,
+    annot=None,
 ):
     R = int(jk.nrep)
     Ak_rep = _stack_rg(struct.Ak.sum(axis=0), struct.Ak, jk.D)
@@ -767,6 +774,8 @@ def _stack_rg_prepared(
     lhs = utils._calc_rg_trace_from_ld_batch(AL_rep, n1_scale, n2_scale, M_k, M_l)
     unit_sizes = jk.unit_sizes(active_mask=active_mask, dtype=np.float64)
     lhs = _sym_rg(lhs, jk, unit_sizes, exact_loco_fast=True)
+
+    Ac_unit, Ac_rep = overlap_unit_sums(annot, jk, active_mask, overlap_scale)
 
     return RGPrepared(
         trace_view=fast_tv,
@@ -786,6 +795,9 @@ def _stack_rg_prepared(
         Ay_rep=Ay_rep,
         AL_rep=AL_rep,
         lhs=lhs,
+        overlap_scale=overlap_scale,
+        Ac_unit=Ac_unit,
+        Ac_rep=Ac_rep,
     )
 
 
@@ -1073,7 +1085,7 @@ def dispatch_rg_manifest_fast(args, log, manifest_df, trait_meta, verbose_level:
                 model_A, model_L, jk, log=log
             )
             model_h2_ay[model.name] = {
-                spath: _compute_full_ay_unit(model_A, tr.z_h2 * tr.z_h2, jk)
+                spath: _compute_full_ay_unit(model_A, tr.y_h2, jk)
                 for spath, tr in traits.items()
             }
             del model_L
@@ -1257,7 +1269,7 @@ def dispatch_rg_manifest_fast(args, log, manifest_df, trait_meta, verbose_level:
                 if drop2_for_1.size:
                     ay1_union = ay1_union - _row_ay_correction(
                         A,
-                        tr1.z_h2 * tr1.z_h2,
+                        tr1.y_h2,
                         drop2_for_1,
                         unit_id,
                         U,
@@ -1267,7 +1279,7 @@ def dispatch_rg_manifest_fast(args, log, manifest_df, trait_meta, verbose_level:
                 if drop1_for_2.size:
                     ay2_union = ay2_union - _row_ay_correction(
                         A,
-                        tr2.z_h2 * tr2.z_h2,
+                        tr2.y_h2,
                         drop1_for_2,
                         unit_id,
                         U,
@@ -1306,7 +1318,7 @@ def dispatch_rg_manifest_fast(args, log, manifest_df, trait_meta, verbose_level:
                     if drop2_for_1.size:
                         ay1 = ay1 - _row_ay_correction(
                             model_A,
-                            tr1.z_h2 * tr1.z_h2,
+                            tr1.y_h2,
                             drop2_for_1,
                             unit_id,
                             U,
@@ -1316,7 +1328,7 @@ def dispatch_rg_manifest_fast(args, log, manifest_df, trait_meta, verbose_level:
                     if drop1_for_2.size:
                         ay2 = ay2 - _row_ay_correction(
                             model_A,
-                            tr2.z_h2 * tr2.z_h2,
+                            tr2.y_h2,
                             drop1_for_2,
                             unit_id,
                             U,
@@ -1355,6 +1367,8 @@ def dispatch_rg_manifest_fast(args, log, manifest_df, trait_meta, verbose_level:
                     n2_scale=float(tr2.n_scale),
                     summary_y_info=rg_info,
                     y=np.array([], dtype=np.float64),
+                    overlap_scale=np.sqrt(tr1.noise_scale * tr2.noise_scale),
+                    annot=model_matrices[model.name],
                 )
 
                 row_intercept = float(row.intercept_rg)

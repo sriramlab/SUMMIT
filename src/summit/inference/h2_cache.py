@@ -18,7 +18,7 @@ except ImportError:  # pragma: no cover - SUMMIT production targets are Unix.
     fcntl = None
 
 
-_CACHE_VERSION = 3
+_CACHE_VERSION = 4
 
 
 def trace_axis_digest(snps: np.ndarray) -> str:

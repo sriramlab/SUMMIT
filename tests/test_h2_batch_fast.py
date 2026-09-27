@@ -389,3 +389,18 @@ def test_fast_batch_cli_dispatch(tmp_path, module):
         "enrichment_se_2",
         "enrichment_mode",
     }.issubset(table.columns)
+
+
+def test_cache_from_before_snp_null_correction_is_not_reused(tmp_path, monkeypatch):
+    from summit.inference import h2_cache
+
+    ld_path, annot_path, sums = _write_fixture(tmp_path, n_traits=1)
+    args = _fast_args(ld_path, annot_path, sums, tmp_path / "write_old")
+    args.h2_cache_dir = str(tmp_path / "cache")
+    with monkeypatch.context() as old:
+        old.setattr(h2_cache, "_CACHE_VERSION", 3)
+        dispatch_h2_batch_fast(args, Logger(suppress=True))
+    args.h2_cache_mode = "read"
+    args.out = str(tmp_path / "read_new")
+    with pytest.raises(RuntimeError, match="cache entry is missing or invalid"):
+        dispatch_h2_batch_fast(args, Logger(suppress=True))

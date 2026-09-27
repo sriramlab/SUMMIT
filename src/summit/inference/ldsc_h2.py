@@ -5,7 +5,7 @@ import numpy as np
 import pandas as pd
 
 from .. import utils
-from ..sumstats.moments import build_h2_summary_moment
+from ..sumstats.moments import build_h2_summary_moment, summary_noise_scale
 
 
 @dataclass(frozen=True)
@@ -415,12 +415,14 @@ def fit_constrained_ldsc_irwls(
     initial_h=None,
     ld_floor: float = 1.0,
     mean_floor: float = 1e-3,
+    noise_scale=1.0,
 ) -> LDSCIRWLSFit:
     """Fit fixed-intercept LDSC by closed-form WLS updates.
 
-    ``q`` is the fixed-intercept response (for h2, score ``Z^2 - 1``), and
-    ``design[:, k] = n_scale * LD[:, k] / M_k``.  The design is never floored;
-    flooring applies only to the heteroskedasticity and overcounting weights.
+    ``q`` is the null-centered response on the reference sample scale, and
+    ``design[:, k] = n_scale * LD[:, k] / M_k``. ``noise_scale`` is the
+    per-SNP null variance of the uncentered score. The design is never
+    floored; floors apply only to heteroskedasticity and overcounting weights.
     """
     design = np.asarray(design, dtype=np.float64)
     q = np.asarray(q, dtype=np.float64).reshape(-1)
@@ -491,6 +493,9 @@ def fit_constrained_ldsc_irwls(
     qk = np.asarray(q[keep], dtype=np.float64)
     ref_weight = np.maximum(np.asarray(ref_ld_total[keep], dtype=np.float64), ld_floor)
     oc_weight = np.maximum(np.asarray(weight_ld[keep], dtype=np.float64), ld_floor)
+    noise = np.broadcast_to(np.asarray(noise_scale, dtype=np.float64), (m,))[keep]
+    if not (np.isfinite(noise).all() and np.all(noise > 0.0)):
+        raise ValueError("LDSC score noise scales must be positive and finite.")
     path = [h_current.copy()]
     final_lhs = None
     final_rhs = None
@@ -503,7 +508,7 @@ def fit_constrained_ldsc_irwls(
 
     for iteration in range(irwls_iters):
         h_for_weights = float(np.clip(np.sum(h_current, dtype=np.float64), 0.0, 1.0))
-        mean = 1.0 + h_for_weights * (n_scale / m_total) * ref_weight
+        mean = noise + h_for_weights * (n_scale / m_total) * ref_weight
         mean = np.maximum(mean, mean_floor)
         weights = 1.0 / (2.0 * mean * mean * oc_weight)
         if not (np.isfinite(weights).all() and np.all(weights > 0.0)):
@@ -583,6 +588,7 @@ def fit_h2_ldsc(
     if source_nsnps <= 0:
         raise ValueError("source_nsnps must be positive.")
 
+    noise_scale = summary_noise_scale(p.matched, p.summary_y_info)
     q = y - 1.0
     valid = active & np.isfinite(q) & np.isfinite(L).all(axis=1)
     if not np.any(valid):
@@ -619,6 +625,7 @@ def fit_h2_ldsc(
                 ref_ld_total,
                 weight_ld,
                 n_scale=float(p.n_scale),
+                noise_scale=noise_scale,
                 m_annot=m_annot,
                 keep=keep,
                 irwls_iters=irwls_iters,
@@ -720,7 +727,7 @@ def fit_h2_ldsc(
     full = full_fit
     weight_info = {
         "estimator": "constrained_ldsc_irwls",
-        "response": "score_z_squared_minus_1",
+        "response": "score_z_squared_minus_snp_null_variance",
         "n_scale": float(p.n_scale),
         "m_annot": m_annot.copy(),
         "m_total_for_weights": float(np.sum(m_annot)),

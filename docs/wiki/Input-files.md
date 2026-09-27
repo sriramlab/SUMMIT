@@ -42,6 +42,11 @@ For h² and rg, provide BETA and SE; Z alone is insufficient. These methods
 reconstruct marginal linear-regression score statistics, so verify suitability
 before using statistics from a different association model.
 
+Use each SNP's observed sample size in `N`; do not replace varying values with
+the file maximum. SUMMIT accounts for these differences in its null moments
+and regression weights. For rg, see the sample-overlap assumptions in
+[Methods](Methods.md).
+
 Optional `COV_RANK` or `P_EFF` gives the number of non-intercept GWAS covariates;
 `--cov-rank` overrides it. The rg calculation uses this metadata. The current
 h² calculation uses a covariate-rank value of zero, including when h² supplies

@@ -28,21 +28,47 @@ Here c is the non-intercept covariate rank. The current h² implementation sets
 c=0; rg resolves c from the input metadata. Heritability denominators in rg
 retain the h² convention. This distinction matters when comparing implementations.
 
-The default HE equations use annotation columns as estimating instruments.
-`--weight-mode ldsc` instead uses iteratively weighted LD-score columns. For
-annotation mass M_k and `n* = N_max - 1`, its univariate regression is
+Write `N* = N_max - c - 1` and `n*_j = n_j - c - 1`. Under the
+linear-regression null, the variance of this reference-scaled score is
+`d_j = N*/n*_j`. SUMMIT subtracts this SNP-specific null term:
 
 ```text
-q_j = z*_j² - 1
-D_jk = n* L_jk / M_k
+q_j = z*_j² - d_j
+D_jk = N* L_jk / M_k.
+```
+
+The HE equations use annotation columns as estimating instruments. Equivalently,
+the univariate variance equations receive `y_j = 1 + q_j`. Keeping the signal
+on the reference scale allows traits to share the reference calculations even
+when their SNP sample sizes differ. No average-N approximation is needed.
+
+`--weight-mode ldsc` solves
+
+```text
 h = argmin_h ||sqrt(W) (q - D h)||².
 ```
 
-The bivariate version uses `q12 = z1* z2* - c_ov` and design
-`sqrt(n1* n2*) L_jk / M_k`. Each covariance estimate is divided by its matching
+Its iterative working variances use `d_j + N* h² L_j/M`, with floors applied
+only to the weights. This is equivalent to regressing local-N score squares
+minus one against `n*_j L_jk/M_k`, with the corresponding local-N weights.
+
+For two traits, let `b_j = sqrt(d1_j d2_j)`. The bivariate response is
+`q12_j = z1*_j z2*_j - c_ov b_j`, with design
+`sqrt(N1* N2*) L_jk/M_k`. Each covariance estimate is divided by its matching
 h² estimates to obtain rg. The overlap covariance is supplied or estimated in
-a separate step. When estimated from summaries, it is refitted in each
-jackknife replicate.
+a separate step; the latter uses `b_j` as its intercept column and refits it in
+every jackknife replicate. All refits retain the same per-SNP sample scales.
+
+This bivariate model assumes that the overlap covariance on the local score
+scale is constant across SNPs. Shared genotype missingness with comparable
+missing fractions in both traits and their overlap satisfies this assumption
+to the usual large-sample approximation. Different contributing cohorts or
+trait-specific missingness can violate it. The two N columns alone do not
+determine SNP-specific overlap. Nonoverlapping studies use `c_ov = 0`.
+
+The null subtraction follows the OLS partial-correlation identity; it is not
+an exact finite-sample identity for logistic or arbitrary meta-analysis beta/SE
+statistics. The usual LD-score signal model and its assumptions still apply.
 
 Working-variance floors affect regression weights. They do not impose
 nonnegative h² or bounded rg. For overlapping annotations, component estimates

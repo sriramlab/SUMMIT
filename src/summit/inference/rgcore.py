@@ -6,7 +6,7 @@ import numpy as np
 
 import json
 from .. import utils
-from ..sumstats.moments import build_rg_summary_moment
+from ..sumstats.moments import build_rg_summary_moment, summary_noise_scale
 
 @dataclass(frozen=True)
 class RGPrepared:
@@ -27,6 +27,17 @@ class RGPrepared:
     Ay_rep: np.ndarray             # (R+1,K)
     AL_rep: np.ndarray             # (R+1,K,K)
     lhs: np.ndarray                # (R+1,K,K)
+    overlap_scale: np.ndarray | float = 1.0
+    Ac_unit: np.ndarray | None = None
+    Ac_rep: np.ndarray | None = None
+
+    @property
+    def intercept_mass_unit(self):
+        return self.Ak_unit if self.Ac_unit is None else self.Ac_unit
+
+    @property
+    def intercept_mass_rep(self):
+        return self.Ak_rep if self.Ac_rep is None else self.Ac_rep
 
 
 @dataclass(frozen=True)
@@ -126,6 +137,11 @@ class RGResultWriter:
                 "Full SCORE normal-equation dump requires known overlap N; "
                 "run rg with --pheno-rg (and optionally --pheno-rg-cov)."
             )
+
+        if np.ndim(fit.prepared.overlap_scale) != 0 and np.any(
+            np.asarray(fit.prepared.overlap_scale)[fit.prepared.active_mask] != 1.0
+        ):
+            raise ValueError("SCORE normal-equation export requires constant per-SNP sample sizes.")
 
         n_overlap = float(n_overlap)
         if not (np.isfinite(n_overlap) and n_overlap > 0.0):
@@ -423,6 +439,18 @@ def _validate_common_axis(trace_view, matched1, matched2, jackknife):
 # main rg preparation / fit
 # -----------------------------------------------------------------------------
 
+def overlap_unit_sums(annot, jackknife, active_mask, scale):
+    """Accumulate the SNP-specific overlap multiplier on the existing blocks."""
+    if np.ndim(scale) == 0 and float(scale) == 1.0:
+        return None, None
+    scale = np.broadcast_to(np.asarray(scale, dtype=np.float64), (len(active_mask),))
+    unit = np.zeros((jackknife.nunit, annot.shape[1]), dtype=np.float64)
+    for u, (start, end) in enumerate(zip(jackknife.starts, jackknife.ends)):
+        keep = active_mask[start:end]
+        unit[u] = annot[start:end][keep].T @ scale[start:end][keep]
+    return unit, _stack_delete_replicates(unit.sum(axis=0), unit, jackknife.D)
+
+
 def prepare_rg(
     trace_view,
     matched1,
@@ -513,6 +541,12 @@ def prepare_rg(
 
     lhs = _symmetrize_with_design(lhs, jackknife, unit_sizes)
 
+    overlap_scale = np.sqrt(
+        summary_noise_scale(matched1, summary_y_info, trait=1)
+        * summary_noise_scale(matched2, summary_y_info, trait=2)
+    )
+    Ac_unit, Ac_rep = overlap_unit_sums(A, jackknife, active_mask, overlap_scale)
+
     return RGPrepared(
         trace_view=trace_view,
         matched1=matched1,
@@ -531,6 +565,9 @@ def prepare_rg(
         Ay_rep=Ay_rep,
         AL_rep=AL_rep,
         lhs=lhs,
+        overlap_scale=overlap_scale,
+        Ac_unit=Ac_unit,
+        Ac_rep=Ac_rep,
     )
 
 
@@ -651,6 +688,7 @@ def _estimate_fixedc_cluster_robust_se_single_component(
 
     # Block-level quantities from RGPrepared
     a_u = np.asarray(p.Ak_unit[:, 0], dtype=np.float64)       # (U,)
+    ac_u = np.asarray(p.intercept_mass_unit[:, 0], dtype=np.float64)
     s_u = np.asarray(p.Ay_unit[:, 0], dtype=np.float64)       # (U,)
     l_u = np.asarray(p.AL_unit[:, 0, 0], dtype=np.float64)    # (U,)
 
@@ -679,8 +717,8 @@ def _estimate_fixedc_cluster_robust_se_single_component(
     # Block score evaluated at the FULL-SAMPLE constrained estimator:
     #   m_u = r_u - t_u * gamma_hat
     # with
-    #   r_u = sqrt(n1*n2)/A * (s_u - c0 * a_u)
-    r_u = (sqrt_n1n2 / A_full) * (s_u - c0 * a_u)
+    #   r_u = sqrt(n1*n2)/A * (s_u - c0 * ac_u)
+    r_u = (sqrt_n1n2 / A_full) * (s_u - c0 * ac_u)
     psi_u = r_u - t_u * float(gamma_full)
 
     valid = (
@@ -715,8 +753,8 @@ def _estimate_fixedc_cluster_robust_se_single_component(
     if add_external_c_se:
         c_se = float(np.asarray(intercept_fit.c[1], dtype=np.float64))
         if np.isfinite(c_se) and c_se > 0.0:
-            # d gamma / d c = -sqrt(n1*n2) / T
-            var_gamma += (sqrt_n1n2 / T_full) ** 2 * (c_se ** 2)
+            # d gamma / d c includes the annotation-weighted overlap multiplier.
+            var_gamma += (sqrt_n1n2 * np.sum(ac_u) / (A_full * T_full)) ** 2 * (c_se ** 2)
 
     if not (np.isfinite(var_gamma) and var_gamma >= 0.0):
         raise RuntimeError(f"Invalid robust gamma variance: {var_gamma}")
@@ -833,20 +871,28 @@ def _estimate_kmoment_model_se_single_component(
     """
     p = prepared
     if int(p.trace_view.nbins) != 1:
-        raise ValueError("rg_se_method='moments' is implemented only for the single-component case (K == 1).")
+        raise ValueError("rg_se_method='kmoments' is implemented only for the single-component case (K == 1).")
 
     info = intercept_fit.info if isinstance(intercept_fit.info, dict) else {}
     if not bool(info.get("fixed", False)):
         raise ValueError(
-            "rg_se_method='moments' currently requires supplied sample-overlap covariance "
+            "rg_se_method='kmoments' currently requires supplied sample-overlap covariance "
             "(--pheno-rg/--pheno-rg-cov or --overlap-covariance-rg)."
+        )
+
+    if np.ndim(p.overlap_scale) != 0 and np.any(
+        np.asarray(p.overlap_scale)[p.active_mask] != 1.0
+    ):
+        raise ValueError(
+            "rg_se_method='kmoments' requires constant per-SNP sample sizes; "
+            "use --rg-se-method jackknife for varying N."
         )
 
     tv = p.trace_view
     km = getattr(tv, "kmoments", None)
     if km is None:
         raise ValueError(
-            "rg_se_method='moments' requested, but no .gw.kmoments file was found "
+            "rg_se_method='kmoments' requested, but no .gw.kmoments file was found "
             "next to the main LD-score file."
         )
 
@@ -882,7 +928,7 @@ def _estimate_kmoment_model_se_single_component(
 
     if not (drop_frac_total <= float(drop_tol)):
         raise ValueError(
-            "rg_se_method='moments' can only reuse full-panel kmoments when SNP loss is small. "
+            "rg_se_method='kmoments' can only reuse full-panel kmoments when SNP loss is small. "
             f"full_panel_M={M_full}, trace_view_M={tv.nsnps}, active_keep={keep_frac_active:.6f}, "
             f"total_drop={drop_frac_total:.3%} > tol={float(drop_tol):.3%}."
         )
@@ -901,7 +947,7 @@ def _estimate_kmoment_model_se_single_component(
     cr2 = syi.get("trait2_cov_rank", None)
     if cr1 is not None and cr2 is not None and int(cr1) != int(cr2):
         raise ValueError(
-            "rg_se_method='moments' currently requires the same covariate rank for both traits "
+            "rg_se_method='kmoments' currently requires the same covariate rank for both traits "
             f"(got trait1_cov_rank={cr1}, trait2_cov_rank={cr2})."
         )
 
@@ -909,7 +955,7 @@ def _estimate_kmoment_model_se_single_component(
     r2 = float(p.n2_scale)
     if not (np.isfinite(r1) and np.isfinite(r2) and r1 > 0.0 and r2 > 0.0):
         raise ValueError(
-            f"Invalid projected sample scales for rg_se_method='moments': n1_scale={r1}, n2_scale={r2}."
+            f"Invalid projected sample scales for rg_se_method='kmoments': n1_scale={r1}, n2_scale={r2}."
         )
 
     scale_rel_gap = _rel_gap(r1, r2)
@@ -952,12 +998,12 @@ def _estimate_kmoment_model_se_single_component(
 
     if not np.isfinite(sample_rel_gap):
         raise ValueError(
-            "Could not construct a valid projected-sample mismatch diagnostic for rg_se_method='moments'."
+            "Could not construct a valid projected-sample mismatch diagnostic for rg_se_method='kmoments'."
         )
 
     if sample_rel_gap > float(sample_hard_tol):
         raise ValueError(
-            "rg_se_method='moments' requires near-complete agreement of the projected sample scales. "
+            "rg_se_method='kmoments' requires near-complete agreement of the projected sample scales. "
             f"scale_rel_gap={scale_rel_gap:.3%}, overlap_rel_gap={overlap_rel_gap:.3%}, "
             f"max_gap={sample_rel_gap:.3%} > hard_tol={float(sample_hard_tol):.3%}."
         )
@@ -973,10 +1019,10 @@ def _estimate_kmoment_model_se_single_component(
 
     if not np.isfinite(c0):
         raise RuntimeError(
-            f"Non-finite supplied overlap covariance in rg_se_method='moments': c_ov={c0}"
+            f"Non-finite supplied overlap covariance in rg_se_method='kmoments': c_ov={c0}"
         )
     if not np.isfinite(gamma_full):
-        raise RuntimeError(f"Non-finite gamma_full in rg_se_method='moments': gamma={gamma_full}")
+        raise RuntimeError(f"Non-finite gamma_full in rg_se_method='kmoments': gamma={gamma_full}")
 
     # Single-component h2 plug-ins actually used by the variance formula.
     h1 = float(np.clip(np.asarray(h2_fit1.sigma_reps[-1, 0], dtype=np.float64), 0.0, 1.0))
@@ -1180,7 +1226,7 @@ def fit_rg(
 
     rhs = np.full((R + 1, K), np.nan, dtype=np.float64)
     with np.errstate(divide="ignore", invalid="ignore"):
-        rhs = ((p.Ay_rep - c_reps[:, None] * p.Ak_rep) * sqrt_n1n2) / p.Ak_rep
+        rhs = ((p.Ay_rep - c_reps[:, None] * p.intercept_mass_rep) * sqrt_n1n2) / p.Ak_rep
     bad_rhs = (~np.isfinite(rhs)) | (~np.isfinite(p.Ak_rep)) | (p.Ak_rep <= 0.0)
     rhs[bad_rhs] = np.nan
 
@@ -1560,7 +1606,7 @@ def _build_simple_intercept_weights(weight_ld, keep):
     return w
 
 
-def _compute_intercept_unit_summaries(jackknife, a, x, y, keep):
+def _compute_intercept_unit_summaries(jackknife, a, x, y, keep, intercept_scale=1.0):
     a = np.asarray(a, dtype=np.float64, order="C")
     x = np.asarray(x, dtype=np.float64, order="C")
     y = np.asarray(y, dtype=np.float64).ravel()
@@ -1591,14 +1637,16 @@ def _compute_intercept_unit_summaries(jackknife, a, x, y, keep):
         au = a[s:e, :][mu, :]
         xu = x[s:e, :][mu, :]
         yu = y[s:e][mu]
-        m_u[u] = au.sum(axis=0, dtype=np.float64)
+        bu = (intercept_scale if np.ndim(intercept_scale) == 0
+              else intercept_scale[s:e][mu])
+        m_u[u] = au.sum(axis=0, dtype=np.float64) * bu if np.ndim(bu) == 0 else au.T @ bu
         t_u[u] = au.T @ yu
         S_u[u] = au.T @ xu
 
     return m_u, t_u, S_u
 
 
-def _compute_weighted_intercept_unit_summaries(jackknife, x, y, w):
+def _compute_weighted_intercept_unit_summaries(jackknife, x, y, w, intercept_scale=1.0):
     x = np.asarray(x, dtype=np.float64, order="C")
     y = np.asarray(y, dtype=np.float64).ravel()
     w = np.asarray(w, dtype=np.float64).ravel()
@@ -1627,17 +1675,24 @@ def _compute_weighted_intercept_unit_summaries(jackknife, x, y, w):
             continue
         xu = x[s:e, :]
         yu = y[s:e]
+        bu = intercept_scale if np.ndim(intercept_scale) == 0 else intercept_scale[s:e]
+        active = wu != 0.0
+        if not np.all(active):
+            xu, yu, wu = xu[active], yu[active], wu[active]
+            if np.ndim(bu) != 0:
+                bu = bu[active]
         wyu = wu * yu
-        W_u[u] = float(np.sum(wu))
-        XW_u[u] = np.einsum("ni,n->i", xu, wu, optimize=True)
+        wb = wu * bu
+        W_u[u] = float(np.sum(wb * bu))
+        XW_u[u] = np.einsum("ni,n->i", xu, wb, optimize=True)
         XXW_u[u] = np.einsum("ni,n,nj->ij", xu, wu, xu, optimize=True)
-        Sy_u[u] = float(np.dot(wu, yu))
+        Sy_u[u] = float(np.dot(wb, yu))
         XWy_u[u] = np.einsum("ni,n->i", xu, wyu, optimize=True)
 
     return W_u, XW_u, XXW_u, Sy_u, XWy_u
 
 
-def _compute_weighted_intercept_summaries(x, y, w):
+def _compute_weighted_intercept_summaries(x, y, w, intercept_scale=1.0):
     x = np.asarray(x, dtype=np.float64, order="C")
     y = np.asarray(y, dtype=np.float64).ravel()
     w = np.asarray(w, dtype=np.float64).ravel()
@@ -1645,11 +1700,17 @@ def _compute_weighted_intercept_summaries(x, y, w):
         raise ValueError("x must be a 2D array.")
     if y.size != x.shape[0] or w.size != x.shape[0]:
         raise ValueError("Axis length mismatch in weighted overlap-covariance summaries.")
+    active = w != 0.0
+    if not np.all(active):
+        x, y, w = x[active], y[active], w[active]
+        if np.ndim(intercept_scale) != 0:
+            intercept_scale = np.asarray(intercept_scale)[active]
     wy = w * y
-    W = float(np.sum(w))
-    XW = np.einsum("ni,n->i", x, w, optimize=True)
+    wb = w * intercept_scale
+    W = float(np.sum(wb * intercept_scale))
+    XW = np.einsum("ni,n->i", x, wb, optimize=True)
     XXW = np.einsum("ni,n,nj->ij", x, w, x, optimize=True)
-    Sy = float(np.dot(w, y))
+    Sy = float(np.dot(wb, y))
     XWy = np.einsum("ni,n->i", x, wy, optimize=True)
     return W, XW, XXW, Sy, XWy
 
@@ -1804,7 +1865,8 @@ def _score_gamma_total_from_c(prepared: RGPrepared, c, *, rep_index: int):
     sqrt_n1n2 = float(np.sqrt(float(prepared.n1_scale) * float(prepared.n2_scale)))
 
     with np.errstate(divide="ignore", invalid="ignore"):
-        rhs = ((Ay - c * Ak) * sqrt_n1n2) / Ak
+        Ac = prepared.intercept_mass_rep[rep_index].reshape(1, -1)
+        rhs = ((Ay - c * Ac) * sqrt_n1n2) / Ak
     bad = (~np.isfinite(rhs)) | (~np.isfinite(Ak)) | (Ak <= 0.0)
     rhs[bad] = np.nan
 
@@ -1865,15 +1927,15 @@ def _ldsc_gencov_weights_1d(
     h1 = min(max(float(h1), 0.0), 1.0)
     h2 = min(max(float(h2), 0.0), 1.0)
     rho_g = min(max(float(rho_g), -1.0), 1.0)
-    intercept_gencov = float(intercept_gencov)
-    intercept_hsq1 = float(intercept_hsq1)
-    intercept_hsq2 = float(intercept_hsq2)
+    intercept_gencov = np.asarray(intercept_gencov, dtype=np.float64)
+    intercept_hsq1 = np.asarray(intercept_hsq1, dtype=np.float64)
+    intercept_hsq2 = np.asarray(intercept_hsq2, dtype=np.float64)
 
     int_floor = float(intercept_hsq_floor)
     if not (np.isfinite(int_floor) and int_floor > 0.0):
         int_floor = 1e-8
-    intercept_hsq1 = max(intercept_hsq1, int_floor)
-    intercept_hsq2 = max(intercept_hsq2, int_floor)
+    intercept_hsq1 = np.maximum(intercept_hsq1, int_floor)
+    intercept_hsq2 = np.maximum(intercept_hsq2, int_floor)
 
     ld_eff = np.fmax(ld, 1.0)
     w_ld_eff = np.fmax(w_ld, 1.0)
@@ -2129,7 +2191,21 @@ def fit_intercept(
             f"sqrt_n1n2={sqrt_n1n2}, m_tot={m_tot_weight}."
         )
 
-    m_u, t_u, S_u = _compute_intercept_unit_summaries(jackknife, a, x, y, keep)
+    noise1 = summary_noise_scale(matched1, summary_y_info, trait=1)
+    noise2 = summary_noise_scale(matched2, summary_y_info, trait=2)
+    overlap_scale = np.sqrt(noise1 * noise2)
+    # Masked rows must not propagate NaNs into zero-weight sums.
+    overlap_scale = np.where(keep, overlap_scale, 1.0)
+    noise1 = np.where(keep, noise1, 1.0)
+    noise2 = np.where(keep, noise2, 1.0)
+    m_u, t_u, S_u = _compute_intercept_unit_summaries(
+        jackknife, a, x, y, keep, overlap_scale
+    )
+    mass_u = np.asarray([
+        a[start:end][keep[start:end]].sum(axis=0)
+        for start, end in zip(jackknife.starts, jackknife.ends)
+    ])
+    mass_rep = _stack_delete_replicates(mass_u.sum(axis=0), mass_u, D)
     m_full = np.sum(m_u, axis=0, dtype=np.float64)
     t_full = np.sum(t_u, axis=0, dtype=np.float64)
     S_full = np.sum(S_u, axis=0, dtype=np.float64)
@@ -2151,6 +2227,7 @@ def fit_intercept(
         x,
         y,
         w_score,
+        overlap_scale,
     )
     W_rep0 = _stack_delete_replicates(np.sum(W_u0, dtype=np.float64), W_u0, D)
     XW_rep0 = _stack_delete_replicates(np.sum(XW_u0, axis=0, dtype=np.float64), XW_u0, D)
@@ -2221,14 +2298,14 @@ def fit_intercept(
                 h1=h1_plugin,
                 h2=h2_plugin,
                 rho_g=rho_full,
-                intercept_gencov=c_full,
-                intercept_hsq1=intercept_hsq1,
-                intercept_hsq2=intercept_hsq2,
+                intercept_gencov=c_full * overlap_scale,
+                intercept_hsq1=intercept_hsq1 * noise1,
+                intercept_hsq2=intercept_hsq2 * noise2,
                 intercept_hsq_floor=intercept_hsq_floor,
                 weight_floor=intercept_weight_floor,
             )
             w_cur = np.where(keep, w_cur, 0.0)
-            Wf, XWf, XXWf, Syf, XWyf = _compute_weighted_intercept_summaries(x, y, w_cur)
+            Wf, XWf, XXWf, Syf, XWyf = _compute_weighted_intercept_summaries(x, y, w_cur, overlap_scale)
             c_new, beta_new, ok = _solve_constrained_intercept_from_sums(
                 m_full,
                 S_full,
@@ -2300,14 +2377,14 @@ def fit_intercept(
                     h1=h1_r,
                     h2=h2_r,
                     rho_g=rho_r,
-                    intercept_gencov=c_r,
-                    intercept_hsq1=intercept_hsq1,
-                    intercept_hsq2=intercept_hsq2,
+                    intercept_gencov=c_r * overlap_scale,
+                    intercept_hsq1=intercept_hsq1 * noise1,
+                    intercept_hsq2=intercept_hsq2 * noise2,
                     intercept_hsq_floor=intercept_hsq_floor,
                     weight_floor=intercept_weight_floor,
                 )
                 w_r = np.where(active, w_r, 0.0)
-                W_last, XW_last, XXW_last, Sy_last, XWy_last = _compute_weighted_intercept_summaries(x, y, w_r)
+                W_last, XW_last, XXW_last, Sy_last, XWy_last = _compute_weighted_intercept_summaries(x, y, w_r, overlap_scale)
                 c_new, beta_new, ok = _solve_constrained_intercept_from_sums(
                     m_rep[r],
                     S_rep[r],
@@ -2376,7 +2453,7 @@ def fit_intercept(
     beta_est = np.asarray(beta_est, dtype=np.float64)
     beta_se = np.asarray(beta_se, dtype=np.float64)
 
-    gamma_reg_reps = _intercept_gamma_total_from_beta(beta_reps, m_rep, sqrt_n1n2)
+    gamma_reg_reps = _intercept_gamma_total_from_beta(beta_reps, mass_rep, sqrt_n1n2)
     gamma_reg_est, gamma_reg_se = jackknife.summarize(
         gamma_reg_reps,
         unit_sizes=unit_sizes,
@@ -2492,7 +2569,7 @@ def _external_c_sensitivity_se(prepared: RGPrepared, h2_fit1, h2_fit2, intercept
     sqrt_n1n2 = float(np.sqrt(float(p.n1_scale) * float(p.n2_scale)))
 
     lhs_full = np.asarray(p.lhs[-1], dtype=np.float64)
-    rhs_sens = np.full((1, K), sqrt_n1n2, dtype=np.float64)
+    rhs_sens = (sqrt_n1n2 * p.intercept_mass_rep[-1] / p.Ak_rep[-1])[None, :]
     sens = _solve_linear_batch(lhs_full[None, :, :], rhs_sens)[0]
     if sens.shape != (K,) or not np.isfinite(sens).all():
         return None
