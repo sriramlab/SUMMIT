@@ -9,5 +9,5 @@ def prediction_threads():
     if info.get("blas_runtime_environment_immutable", False):
         desired = int(info["blas_runtime_threads"])
     else:
-        desired = int(native.configured_blas_threads()) or min(2, len(os.sched_getaffinity(0)))
+        desired = int(native.configured_blas_threads()) or min(2, len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else (os.cpu_count() or 1))
     return int(native.configure_blas_threads(desired))

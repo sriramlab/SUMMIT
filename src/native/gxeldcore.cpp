@@ -23,13 +23,16 @@
 #include <thread>
 #include <vector>
 
-#if defined(__linux__)
+#if defined(__linux__) || defined(__APPLE__)
   #include <fcntl.h>
   #include <sys/mman.h>
-  #include <sys/syscall.h>
-  #include <sched.h>
+  #include <sys/resource.h>
   #include <sys/stat.h>
   #include <unistd.h>
+#endif
+#if defined(__linux__)
+  #include <sys/syscall.h>
+  #include <sched.h>
 #endif
 
 #ifdef _OPENMP
@@ -6416,7 +6419,7 @@ int64_t dgemm_row_tn_partitioned(
 #endif
 }
 
-#if defined(__linux__)
+#if defined(__linux__) || defined(__APPLE__)
 
 struct FileState {
     dev_t device{};
@@ -6437,8 +6440,13 @@ FileState state_from_stat(const struct stat& observed) {
         observed.st_ino,
         observed.st_size,
         observed.st_nlink,
+#if defined(__APPLE__)
+        observed.st_mtimespec,
+        observed.st_ctimespec,
+#else
         observed.st_mtim,
         observed.st_ctim,
+#endif
     };
 }
 
@@ -6627,7 +6635,7 @@ class GeneralizedGxELDScoreDirectContext;
 struct DescriptorOnlyDirectContextTag {};
 void validate_protected_gemm_threads(int requested_threads);
 
-#if defined(__linux__)
+#if defined(__linux__) || defined(__APPLE__)
 class ReadOnlyDoubleMapping {
 public:
     explicit ReadOnlyDoubleMapping(size_t elements) {
@@ -7095,10 +7103,10 @@ public:
           max_workspace_bytes_(max_workspace_bytes),
           target_panel_columns_(target_panel_columns),
           strict_feature_moment_verification_(strict_feature_moment_verification) {
-#if !defined(__linux__)
+#if !defined(__linux__) && !defined(__APPLE__)
         (void)bed_descriptor; (void)bim_descriptor; (void)fam_descriptor;
         (void)row_sel_obj; (void)env; (void)q_basis;
-        throw std::runtime_error("The bounded GxE native context requires Linux");
+        throw std::runtime_error("The bounded GxE native context requires Linux or macOS");
 #else
         if (ddof_ != 0 && ddof_ != 1) {
             throw std::runtime_error("GxE native context supports ddof 0 or 1");
@@ -7195,7 +7203,8 @@ public:
                   uint64_t max_workspace_bytes,
                   int blas_threads,
                   DescriptorOnlyDirectContextTag,
-                  int minimum_selected_rows = 3)
+                  int minimum_selected_rows = 3,
+                  bool configure_blas_runtime = true)
         : context_id_(next_context_id()),
           ddof_(ddof),
           decode_threads_(decode_threads),
@@ -7203,11 +7212,11 @@ public:
           max_workspace_bytes_(max_workspace_bytes),
           target_panel_columns_(1),
           strict_feature_moment_verification_(false) {
-#if !defined(__linux__)
+#if !defined(__linux__) && !defined(__APPLE__)
         (void)bed_descriptor; (void)bim_descriptor; (void)fam_descriptor;
         (void)row_sel_obj;
         throw std::runtime_error(
-            "The descriptor-backed genotype operator requires Linux"
+            "The descriptor-backed genotype operator requires Linux or macOS"
         );
 #else
         if (ddof_ != 0 && ddof_ != 1) {
@@ -7236,7 +7245,7 @@ public:
         }
 #endif
 #ifdef GWLDCORE_USE_FIXED_VENDOR_BLAS
-        configure_fixed_vendor_threads(blas_threads_);
+        if (configure_blas_runtime) configure_fixed_vendor_threads(blas_threads_);
 #endif
         if (max_workspace_bytes_ == 0 ||
             max_workspace_bytes_ >
@@ -8800,7 +8809,7 @@ private:
     }
 
     void check_files_unchanged() const {
-#if defined(__linux__)
+#if defined(__linux__) || defined(__APPLE__)
         ensure_open();
         if (!same_state(validate_regular_fd(bed_fd_, "BED"), bed_state_) ||
             !same_state(validate_regular_fd(bim_fd_, "BIM"), bim_state_) ||
@@ -8811,7 +8820,7 @@ private:
     }
 
     void close_internal() noexcept {
-#if defined(__linux__)
+#if defined(__linux__) || defined(__APPLE__)
         if (bed_base_ != nullptr) {
             ::munmap(bed_base_, bed_size_);
             bed_base_ = nullptr;
@@ -8850,7 +8859,7 @@ private:
     mutable std::mutex call_mutex_;
     mutable std::atomic<int64_t> repaired_gemm_output_columns_{0};
     mutable std::atomic<int64_t> retried_gemm_input_mutations_{0};
-#if defined(__linux__)
+#if defined(__linux__) || defined(__APPLE__)
     int bed_fd_ = -1;
     int bim_fd_ = -1;
     int fam_fd_ = -1;

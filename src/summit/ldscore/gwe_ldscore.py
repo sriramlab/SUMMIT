@@ -22,6 +22,9 @@ from bed_reader import open_bed
 from threadpoolctl import threadpool_info
 from tqdm import tqdm
 
+from ._pinned_genotype import (
+    DescriptorBEDReader, descriptor_directory, open_pinned_file, read_metadata_table,
+)
 from .. import utils
 from .genotype_source import (
     PgenBlockReader,
@@ -50,7 +53,7 @@ def _validate_plink_file_paths(paths: Mapping[str, Path]) -> tuple[int, int]:
 
     counts = {}
     for ext in (".fam", ".bim"):
-        with open(paths[ext], "rb") as handle:
+        with open_pinned_file(paths[ext]) as handle:
             count = 0
             for line_number, line in enumerate(handle, start=1):
                 if not line.strip():
@@ -61,7 +64,7 @@ def _validate_plink_file_paths(paths: Mapping[str, Path]) -> tuple[int, int]:
     if n <= 0 or m <= 0:
         raise ValueError(f"PLINK FAM/BIM must be non-empty; observed N={n}, M={m}.")
     expected = 3 + ((n + 3) // 4) * m
-    with open(paths[".bed"], "rb") as handle:
+    with open_pinned_file(paths[".bed"]) as handle:
         magic = handle.read(3)
     observed = paths[".bed"].stat().st_size
     if magic != b"\x6c\x1b\x01" or observed != expected:
@@ -928,11 +931,9 @@ class GenomewideEnvLDScore:
         self.env_path = str(env_path)
         self.covar_path = covar_path
         self._pgen_reader: PgenBlockReader | None = None
-        proc_fds = Path("/proc/self/fd")
-        if not proc_fds.is_dir():
-            raise RuntimeError(
-                "Stable zero-copy GxE genotype input requires Linux /proc/self/fd."
-            )
+        proc_fds = descriptor_directory()
+        if self.genotype_format == "pgen" and proc_fds != Path("/proc/self/fd"):
+            raise RuntimeError("Pinned PGEN GxE input currently requires Linux; use BED on macOS.")
         if self.genotype_format == "bed":
             source_paths = {
                 ".bed": self.genotype_input.genotype_path,
@@ -965,7 +966,7 @@ class GenomewideEnvLDScore:
             raise
         self._genotype_descriptors = genotype_descriptors
         self._stable_genotype_paths = {
-            extension: Path(f"/proc/self/fd/{descriptor}")
+            extension: proc_fds / str(descriptor)
             for extension, descriptor in genotype_descriptors.items()
         }
         self._descriptor_finalizer = weakref.finalize(
@@ -1000,12 +1001,17 @@ class GenomewideEnvLDScore:
             expected_n, expected_m = _validate_plink_file_paths(
                 self._stable_genotype_paths
             )
-            self.G = open_bed(
-                str(self._stable_genotype_paths[".bed"]),
-                fam_filepath=str(self._stable_genotype_paths[".fam"]),
-                bim_filepath=str(self._stable_genotype_paths[".bim"]),
-                num_threads=requested_reader_threads,
-            )
+            if proc_fds == Path("/proc/self/fd"):
+                self.G = open_bed(
+                    str(self._stable_genotype_paths[".bed"]),
+                    fam_filepath=str(self._stable_genotype_paths[".fam"]),
+                    bim_filepath=str(self._stable_genotype_paths[".bim"]),
+                    num_threads=requested_reader_threads,
+                )
+            else:
+                self.G = DescriptorBEDReader(
+                    genotype_descriptors, (expected_n, expected_m), requested_reader_threads
+                )
             self.nsamp_total, self.nsnps = self.G.shape
             if (self.nsamp_total, self.nsnps) != (expected_n, expected_m):
                 raise RuntimeError(
@@ -1462,7 +1468,7 @@ class GenomewideEnvLDScore:
             self.snplist = None
             return
         self.log._log(f"Reading {bim_path} for SNPs")
-        self.snplist = pd.read_csv(
+        self.snplist = read_metadata_table(
             bim_path,
             header=None,
             sep=r"\s+",

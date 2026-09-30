@@ -117,13 +117,13 @@ find_package(nanobind CONFIG REQUIRED)
 
 # =====================================================================================
 # BLAS vendor selection (overridable with -DBLA_VENDOR=...)
-#   macOS              -> Generic (Accelerate)
+#   macOS              -> OpenBLAS (shared with the conda NumPy runtime)
 #   MKL available      -> Intel10_64lp
 #   otherwise (Linux)  -> OpenBLAS (explicit, prefer conda)
 # =====================================================================================
 if (NOT DEFINED BLA_VENDOR)
   if (APPLE)
-    set(BLA_VENDOR Generic CACHE STRING "" FORCE)  # Accelerate
+    set(BLA_VENDOR OpenBLAS CACHE STRING "" FORCE)
   else()
     if (DEFINED ENV{MKLROOT} OR EXISTS "$ENV{CONDA_PREFIX}/lib/libmkl_rt.so")
       set(BLA_VENDOR Intel10_64lp CACHE STRING "" FORCE)
@@ -435,6 +435,20 @@ endif()
 option(GWLDCORE_USE_OPENMP "Enable OpenMP if available" ON)
 if (GWLDCORE_USE_OPENMP)
   find_package(OpenMP)
+  # AppleClang needs a separately installed libomp and an explicit header path.
+  # Conda's llvm-openmp supplies both without requiring a different compiler.
+  if (APPLE AND NOT OpenMP_CXX_FOUND)
+    find_path(SUMMIT_OMP_INCLUDE_DIR omp.h HINTS "$ENV{CONDA_PREFIX}/include")
+    find_library(SUMMIT_OMP_LIBRARY omp HINTS "$ENV{CONDA_PREFIX}/lib")
+    if (SUMMIT_OMP_INCLUDE_DIR AND SUMMIT_OMP_LIBRARY)
+      add_library(OpenMP::OpenMP_CXX INTERFACE IMPORTED)
+      set_target_properties(OpenMP::OpenMP_CXX PROPERTIES
+        INTERFACE_COMPILE_OPTIONS "-Xpreprocessor;-fopenmp"
+        INTERFACE_INCLUDE_DIRECTORIES "${SUMMIT_OMP_INCLUDE_DIR}"
+        INTERFACE_LINK_LIBRARIES "${SUMMIT_OMP_LIBRARY}")
+      set(OpenMP_CXX_FOUND TRUE)
+    endif()
+  endif()
 endif()
 if (GXELDCORE_USE_PRIVATE_BLIS AND NOT OpenMP_CXX_FOUND)
   message(FATAL_ERROR
@@ -645,7 +659,7 @@ function(gwldcore_configure_module target_name)
   if (GXELDCORE_PRIVATE_BLAS_ENABLED AND target_name STREQUAL "gxeldcore")
     # The private archive was fully linked above.  Do not also put the shared
     # process BLAS on this extension's link line.
-  elseif (APPLE)
+  elseif (APPLE AND BLA_VENDOR MATCHES "^(Apple|Generic)$")
     target_compile_definitions(${target_name} PRIVATE GWLDCORE_USE_ACCELERATE ACCELERATE_NEW_LAPACK)
     if (TARGET BLAS::BLAS)
       target_link_libraries(${target_name} PRIVATE BLAS::BLAS)
@@ -681,9 +695,14 @@ function(gwldcore_configure_module target_name)
   endif()
 
   if (DEFINED ENV{CONDA_PREFIX} AND UNIX)
+    if (APPLE)
+      set(_SUMMIT_ORIGIN "@loader_path")
+    else()
+      set(_SUMMIT_ORIGIN "$ORIGIN")
+    endif()
     set_target_properties(${target_name} PROPERTIES
-      BUILD_RPATH "$ORIGIN;$ENV{CONDA_PREFIX}/lib"
-      INSTALL_RPATH "$ORIGIN;$ENV{CONDA_PREFIX}/lib")
+      BUILD_RPATH "${_SUMMIT_ORIGIN};$ENV{CONDA_PREFIX}/lib"
+      INSTALL_RPATH "${_SUMMIT_ORIGIN};$ENV{CONDA_PREFIX}/lib")
   endif()
 endfunction()
 
@@ -700,10 +719,9 @@ gwldcore_configure_module(winldcore)
 
 set(GWLDCORE_MODULE_TARGETS gwldcore winldcore)
 
-# The bounded direct GxE context deliberately owns Linux file descriptors and
-# an mmap.  Do not make supported Apple builds compile a source file whose
-# decoder cannot be correct there; Python keeps the portable NumPy fallback.
-if (CMAKE_SYSTEM_NAME STREQUAL "Linux")
+# The direct GxE context owns POSIX descriptors and a read-only BED mapping.
+# Linux-only affinity/NUMA operations remain guarded inside the implementation.
+if (CMAKE_SYSTEM_NAME STREQUAL "Linux" OR APPLE)
   nanobind_add_module(gxeldcore NOMINSIZE ${SUMMIT_NATIVE_DIR}/gxeldcore.cpp)
   gwldcore_configure_module(gxeldcore)
   if (GXELDCORE_GEMM_INTEGRITY)

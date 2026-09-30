@@ -14,6 +14,7 @@ except Exception:
     import gwldcore
 
 from .. import utils
+from ._pinned_genotype import read_metadata_table
 
 
 @dataclass(frozen=True)
@@ -93,7 +94,7 @@ def resolve_genotype_input(path: str) -> GenotypeInput:
 
 
 def read_fam_sample_ids(path: str) -> pd.DataFrame:
-    samples = pd.read_csv(
+    samples = read_metadata_table(
         path, sep=r"\s+", header=None, usecols=[0, 1], names=["FID", "IID"],
         dtype=str, keep_default_na=False,
     )

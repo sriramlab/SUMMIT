@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import json
 import re
+import sys
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -937,6 +938,7 @@ def test_native_context_snapshots_rows_and_rejects_invalid_indices(tmp_path):
             pass
 
 
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux additive BED mmap cache")
 def test_existing_native_caches_version_paths_and_explicit_row_contents(tmp_path):
     rng = np.random.default_rng(930)
     n, m = 54, 10
@@ -986,6 +988,7 @@ def test_existing_native_caches_version_paths_and_explicit_row_contents(tmp_path
     assert not np.array_equal(before_replacement, after_replacement)
 
 
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux additive BED mmap cache")
 def test_existing_native_bed_cache_is_bounded_lru(tmp_path):
     rng = np.random.default_rng(211)
     n, m = 24, 4
@@ -1049,7 +1052,7 @@ def test_native_context_rejects_mutation_bad_design_nonfinite_and_workspace(tmp_
                 clean_prefix,
                 env,
                 q,
-                decode_threads=len(os.sched_getaffinity(0)) + 1,
+                decode_threads=(len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else (os.cpu_count() or 1)) + 1,
             ):
                 pass
     bad_q = q.copy(order="F")
@@ -1080,7 +1083,7 @@ def test_native_context_rejects_mutation_bad_design_nonfinite_and_workspace(tmp_
 
 
 def test_native_pass_probe_tile_and_fixed_thread_determinism(tmp_path):
-    parallel_threads = min(2, len(os.sched_getaffinity(0)))
+    parallel_threads = min(2, (len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else (os.cpu_count() or 1)))
     if parallel_threads < 2:
         pytest.skip("thread-determinism test requires at least two affinity-visible CPUs")
     rng = np.random.default_rng(662)

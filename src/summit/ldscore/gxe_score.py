@@ -29,6 +29,7 @@ from ..inference.gxe import (
     _population_same_individual_products,
     _validate_reference_design_diagnostics,
 )
+from ._pinned_genotype import DescriptorBEDReader, descriptor_directory, read_metadata_table
 from .gwe_ldscore import (
     _canonical_bfile_prefix,
     _native_strict_feature_moment_verification_policy,
@@ -99,7 +100,7 @@ def _as_finite_vector(name: str, value: Any, length: int) -> np.ndarray:
 def _read_bim(path: Path) -> pd.DataFrame:
     if not path.is_file():
         raise FileNotFoundError(path)
-    return pd.read_csv(
+    return read_metadata_table(
         path,
         sep=r"\s+",
         header=None,
@@ -264,19 +265,14 @@ def _validate_genotype_files(
 
 @contextmanager
 def _stable_genotype_prefix(prefix: str, staging_dir: Path):
-    """Expose one-open-descriptor PLINK inputs through private /proc links.
+    """Expose pinned PLINK inputs through private descriptor links.
 
     This neither copies the production BED nor changes source inode metadata.
     Path replacement cannot redirect an already-open descriptor, while final
     final fstat detects in-place mutation during the scoring pass.
     """
     stable_prefix = str(staging_dir / "validated-genotype")
-    proc_fds = Path("/proc/self/fd")
-    if not proc_fds.is_dir():
-        raise RuntimeError(
-            "Stable zero-copy PLINK scoring requires Linux /proc/self/fd; "
-            "run on the supported Linux/Hoffman environment."
-        )
+    proc_fds = descriptor_directory()
     descriptors: dict[str, int] = {}
     state: dict[str, tuple[int, int, int, int, int]] = {}
     try:
@@ -574,7 +570,7 @@ def _read_and_project_wide_phenotypes(
         raise ValueError("Wide phenotype file must contain FID and IID columns.")
     if phenotype_table.duplicated(subset=["FID", "IID"]).any():
         raise ValueError("Wide phenotype file contains duplicate FID/IID rows.")
-    fam = pd.read_csv(
+    fam = read_metadata_table(
         fam_path,
         sep=r"\s+",
         header=None,
@@ -982,7 +978,13 @@ def _score_one_genotype_pass(
     tuple[np.ndarray, np.ndarray]
     | tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]
 ):
-    if num_threads is None:
+    if descriptor_directory() != Path("/proc/self/fd"):
+        if genotype_descriptors is None:
+            raise RuntimeError("Pinned BED descriptors are required for macOS scoring.")
+        bed = DescriptorBEDReader(
+            genotype_descriptors, (int(total_samples), len(reference.diagonal)), num_threads
+        )
+    elif num_threads is None:
         bed = open_bed(prefix + ".bed")
     else:
         try:

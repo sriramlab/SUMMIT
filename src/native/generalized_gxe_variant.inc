@@ -79,6 +79,12 @@ uint64_t generalized_process_peak_rss_bytes() noexcept {
         }
     } catch (...) {
     }
+#elif defined(__APPLE__)
+    struct rusage usage{};
+    if (::getrusage(RUSAGE_SELF, &usage) == 0 && usage.ru_maxrss > 0) {
+        // Darwin reports bytes, whereas Linux reports KiB.
+        return static_cast<uint64_t>(usage.ru_maxrss);
+    }
 #endif
     return 0;
 }

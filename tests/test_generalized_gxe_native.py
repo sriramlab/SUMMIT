@@ -557,7 +557,7 @@ def test_precomputed_rhs_matches_tiled_without_extra_genotype_visits(
 def test_packed_native_one_and_multiple_threads_match_in_fresh_processes(
     tmp_path: Path,
 ) -> None:
-    if len(os.sched_getaffinity(0)) < 2:
+    if (len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else (os.cpu_count() or 1)) < 2:
         pytest.skip("native multi-thread comparison requires two available CPUs")
     script = textwrap.dedent(
         """

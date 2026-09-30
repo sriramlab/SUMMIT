@@ -6,7 +6,7 @@ public:
     PredictionBEDReader(int bed, int bim, int fam, nb::object rows,
                         int threads, uint64_t workspace)
         : reader_(std::make_unique<DirectContext>(bed, bim, fam, std::move(rows),
-              1, threads, workspace, threads, DescriptorOnlyDirectContextTag{}, 1)) {}
+              1, threads, workspace, threads, DescriptorOnlyDirectContextTag{}, 1, false)) {}
 
     void read(nb_vec1_ro<int64_t> variants, nb_mat2f_rw<int8_t> output) {
         auto lock = reader_->acquire_call_lock();

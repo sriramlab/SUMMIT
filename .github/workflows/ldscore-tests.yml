@@ -42,3 +42,43 @@ jobs:
         env:
           PYTHONFAULTHANDLER: "1"
         run: python -X faulthandler -m pytest -q
+
+  macos-native:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [macos-15, macos-15-intel]
+    runs-on: ${{ matrix.runner }}
+    defaults:
+      run:
+        shell: bash -el {0}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: conda-incubator/setup-miniconda@8ee1f361103df19b6f8c8655fd3967a8ecb162d5
+        with:
+          activate-environment: summit
+          environment-file: environment.yml
+          auto-activate-base: false
+      - name: Install AppleClang OpenMP runtime
+        run: conda install -y -c conda-forge llvm-openmp
+      - name: Build all native modules against OpenBLAS
+        env:
+          CMAKE_ARGS: -DBLA_VENDOR=OpenBLAS
+          CMAKE_BUILD_PARALLEL_LEVEL: "2"
+        run: python -m pip install -e . --no-deps
+      - name: Run native GxE, generalized, and prediction numerical tests
+        env:
+          PYTHONFAULTHANDLER: "1"
+        run: >-
+          python -X faulthandler -m pytest -q
+          tests/test_pinned_genotype.py
+          tests/test_gxe_native_core.py
+          tests/test_gxe_multi_environment.py
+          tests/test_generalized_gxe_native.py
+          tests/test_generalized_gxe_composition.py
+          tests/test_prediction_core.py
+          tests/test_prediction_io.py
+          tests/test_prediction_packed.py
+          tests/test_prediction_annotations.py
+          tests/test_prediction_mixture.py
+          tests/test_memory_budget.py
