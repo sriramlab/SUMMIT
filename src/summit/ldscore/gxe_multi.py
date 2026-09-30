@@ -4631,6 +4631,17 @@ def _descriptor_memory_candidate(
     )
     fixed_owned = context_copies + persistent_outputs
 
+    # CSV publication streams at most 65,536 rows at a time. Scale the
+    # historical 1 GiB serialization allowance with that chunk for small
+    # inputs, retaining a 16 MiB floor for fixed pandas/gzip overhead. The
+    # full allowance and table-size estimate are unchanged for large inputs.
+    publication_buffer = max(
+        16 * 1024**2, min(variants, 65_536) * (_GIB // 65_536)
+    )
+    publication_workspace = max(
+        publication_buffer, 8 * variants * (4 * annotation_bins + 16)
+    )
+
     if dense_protected:
         feature_integrity = 0
         source_integrity = 0
@@ -4668,7 +4679,7 @@ def _descriptor_memory_candidate(
             + block_scales
             + vendor_workspace,
             "publication": fixed_owned
-            + max(_GIB, 8 * variants * (4 * annotation_bins + 16)),
+            + publication_workspace,
         }
         panel_live_peak = 2 * source_panel
     elif protected:
@@ -4713,7 +4724,7 @@ def _descriptor_memory_candidate(
             + block_scales
             + mailman_worker_scratch,
             "publication": fixed_owned
-            + max(_GIB, 8 * variants * (4 * annotation_bins + 16)),
+            + publication_workspace,
         }
         panel_live_peak = source_panel
     else:
@@ -4779,7 +4790,7 @@ def _descriptor_memory_candidate(
             + target_integrity
             + vendor_workspace,
             "publication": fixed_owned
-            + max(_GIB, 8 * variants * (4 * annotation_bins + 16)),
+            + publication_workspace,
         }
         panel_live_peak = 2 * source_panel
     peak_phase = max(phase_peak_bytes, key=phase_peak_bytes.get)

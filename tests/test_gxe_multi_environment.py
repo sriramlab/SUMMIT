@@ -855,6 +855,37 @@ def test_total_process_budget_has_exact_baseline_and_available_boundaries():
         )
 
 
+@pytest.mark.parametrize("protected", [False, True])
+def test_small_reference_fits_auto_budget_without_genome_sized_publication_reserve(protected):
+    estimator = SimpleNamespace(
+        target_xz_mem=0.01, gxe_total_memory_request="auto", nsamp=31,
+        nsnps=23, nbins=2, nvecs=100, p_eff=2, num_threads=2,
+        native_workspace_gib=16.0,
+    )
+    _, _, plan = gxe_multi._shared_execution_tiles(
+        [estimator], np.dtype(np.float64), protected=protected,
+        blocks=[(0, 23)], feature_plan={"basis": np.empty((31, 3))},
+        common_rank=1, integrity_enabled=True,
+        baseline_rss_bytes=256 * 1024**2,
+        available_memory=(3 * 1024**3, {"limiting_source": "test"}),
+    )
+    assert plan["memory_contract_satisfied"] is True
+    assert plan["total_process_budget"]["mode"] == "auto"
+    assert plan["modeled_complete_process_peak_bytes"] < 1.75 * 1024**3
+    assert plan["allocator_slack_bytes"] >= 512 * 1024**2
+    assert plan["telemetry_allowance_bytes"] == 256 * 1024**2
+    # A full publication chunk keeps the original production allowance.
+    candidate = gxe_multi._descriptor_memory_candidate(
+        rows=31, variants=65_536, annotation_bins=2, environments=1,
+        probes=100, block_width=256, block_count=256, feature_columns=3,
+        common_rank=1, reader_rank=2, threads=2, environment_tile_count=1,
+        probe_tile_count=1, protected=protected, integrity_enabled=True,
+        native_workspace_gib=16.0, baseline_rss_bytes=256 * 1024**2,
+        direct_kernel_mode="dense_blas_hybrid" if protected else "packed_mailman",
+    )
+    assert candidate["phase_peak_bytes"]["publication"] >= 1024**3
+
+
 def test_multi_environment_batch_manifest_failure_rolls_back_bundles(
     tmp_path, monkeypatch
 ):
