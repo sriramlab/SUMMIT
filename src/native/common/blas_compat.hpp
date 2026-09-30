@@ -1,6 +1,7 @@
 #pragma once
 
-extern "C" {
+// Vendor headers manage their own C linkage. Accelerate also includes C++
+// templates, so it must not be wrapped in an extern "C" block.
 #if defined(GWLDCORE_USE_MKL_CBLAS)
 // ---- Intel MKL (Linux/Intel) ----
   #include <mkl_cblas.h>
@@ -26,4 +27,3 @@ extern "C" {
     #include <cblas.h>
   #endif
 #endif
-} // extern "C"
