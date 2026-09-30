@@ -136,13 +136,21 @@ def main() -> int:
     )
 
     build_info = dict(gxeldcore.build_info())
-    required_backend = {
-        "blas_vendor": "BLIS",
-        "private_blas_backend": "upstream_blis",
-        "blas_runtime_isolation": "private_static",
-        "blas_runtime_owner_thread_enforced": True,
-        "blas_runtime_environment_immutable": True,
-    }
+    from summit.ldscore.gwe_ldscore import _validate_native_blas_runtime
+
+    if build_info.get("blas_vendor") == "OpenBLAS":
+        required_backend = {
+            "gemm_integrity_enabled": True,
+            "gemm_checksum_enabled": True,
+        }
+    else:
+        required_backend = {
+            "blas_vendor": "BLIS",
+            "private_blas_backend": "upstream_blis",
+            "blas_runtime_isolation": "private_static",
+            "blas_runtime_owner_thread_enforced": True,
+            "blas_runtime_environment_immutable": True,
+        }
     for key, expected in required_backend.items():
         if build_info.get(key) != expected:
             raise RuntimeError(
@@ -151,12 +159,13 @@ def main() -> int:
             )
     configured_threads = int(gxeldcore.configured_blas_threads())
     if configured_threads <= 0:
-        configured_threads = int(build_info["blas_runtime_threads"])
+        configured_threads = int(gxeldcore.configure_blas_threads(args.threads or 1))
+    _validate_native_blas_runtime(dict(gxeldcore.build_info()))
     threads = configured_threads if args.threads is None else args.threads
     if threads != configured_threads:
         raise RuntimeError(
-            "--threads must equal the immutable BLIS_NUM_THREADS value sealed "
-            "at process start"
+            "--threads must equal the native BLAS thread count already sealed "
+            "for this process"
         )
 
     probe_spec = GlobalVariantProbeSpec(

@@ -82,3 +82,17 @@ jobs:
           tests/test_prediction_annotations.py
           tests/test_prediction_mixture.py
           tests/test_memory_budget.py
+      - name: Run synthetic GxE examples
+        run: |
+          example_dir=$(mktemp -d)
+          cp example/prepare_example_inputs.py example/estimate_gxe_ldscore.sh "$example_dir/"
+          bash "$example_dir/estimate_gxe_ldscore.sh"
+          summit --geno "$example_dir/out/synthetic/small.bed" \
+            --env "$example_dir/out/synthetic/small.env" \
+            --annot "$example_dir/out/synthetic/small.annot" \
+            --covar "$example_dir/out/synthetic/small.cov" \
+            --out "$example_dir/out/native" --nvecs 100 --block-size 256 \
+            --seed 1 --dtype float64 --num-threads 2 --gxe-native-backend direct
+          python example/estimate_generalized_gxe_variant_ldscore.py \
+            --prefix "$example_dir/out/synthetic/small" \
+            --output "$example_dir/out/generalized" --probes 16 --njack 20 --threads 2

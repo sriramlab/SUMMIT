@@ -23,8 +23,8 @@ across all context columns. The context-dependent features are
 
 This estimator has a Python interface. The command below plans
 resources and inspects results; it does not yet provide a general fit-spec CLI.
-The native reference executor currently requires BED and the Linux BLIS build
-noted in [Installation](Installation.md).
+The native reference executor requires BED and supports protected OpenBLAS on
+Linux and macOS, or private BLIS on Linux; see [Installation](Installation.md).
 
 ## Plan resources
 

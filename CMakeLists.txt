@@ -134,6 +134,20 @@ if (NOT DEFINED BLA_VENDOR)
 endif()
 message(STATUS "Using BLA_VENDOR=${BLA_VENDOR}")
 
+if (APPLE AND BLA_VENDOR STREQUAL "OpenBLAS")
+  # Searching for cblas.h alone can select vecLib's framework headers before
+  # Conda's include directory. Identify the OpenBLAS header family explicitly.
+  find_path(SUMMIT_OPENBLAS_INCLUDE_DIR openblas_config.h
+    HINTS "$ENV{CONDA_PREFIX}/include"
+          "/opt/homebrew/opt/openblas/include" "/usr/local/opt/openblas/include"
+    PATH_SUFFIXES openblas)
+  if (NOT SUMMIT_OPENBLAS_INCLUDE_DIR OR
+      NOT EXISTS "${SUMMIT_OPENBLAS_INCLUDE_DIR}/cblas.h")
+    message(FATAL_ERROR "OpenBLAS headers not found; install conda-forge openblas")
+  endif()
+  set(OPENBLAS_INCLUDE_DIR "${SUMMIT_OPENBLAS_INCLUDE_DIR}")
+endif()
+
 set(BLA_STATIC OFF CACHE BOOL "" FORCE)
 find_package(BLAS)
 
@@ -721,7 +735,7 @@ set(GWLDCORE_MODULE_TARGETS gwldcore winldcore)
 
 # The direct GxE context owns POSIX descriptors and a read-only BED mapping.
 # Linux-only affinity/NUMA operations remain guarded inside the implementation.
-if (CMAKE_SYSTEM_NAME STREQUAL "Linux" OR APPLE)
+if (CMAKE_SYSTEM_NAME STREQUAL "Linux" OR (APPLE AND BLA_VENDOR STREQUAL "OpenBLAS"))
   nanobind_add_module(gxeldcore NOMINSIZE ${SUMMIT_NATIVE_DIR}/gxeldcore.cpp)
   gwldcore_configure_module(gxeldcore)
   if (GXELDCORE_GEMM_INTEGRITY)

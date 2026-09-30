@@ -2844,7 +2844,7 @@ void ContextualReferenceExecutorV1::seal_execution_plan() {
             &observed_scale_plan_sha256_, &observed_missingness_sha256_,
             &group_execution_order_sha256_, &numa_policy_})
         add_string(*value);
-    for (std::uint64_t value : {
+    for (std::uint64_t value : std::initializer_list<std::uint64_t>{
             kContextualBackendVersionV1, n_, m_, rank_, q_, k_, groups_,
             pairs_, components_, bt_, bd_, l_, h_, variant_block_,
             sample_probe_resident_, sample_probe_tile_, action_tile_,
