@@ -4454,14 +4454,18 @@ def _resolve_total_process_budget(
     if available_bytes <= 0:
         raise RuntimeError("No available memory remains for GxE execution.")
     if parsed == "auto":
-        reserve = 4 * _GIB
+        # Match the adaptive reserve used for sketch panels in utils.
+        reserve = min(4 * _GIB, available_bytes // 2)
         increment = min(
             int(math.floor(0.65 * available_bytes)), available_bytes - reserve
         )
         if increment < 256 * 1024**2:
             raise RuntimeError(
                 "Automatic GxE total-memory planning found less than 0.25 GiB "
-                "after its reserve."
+                "after its reserve "
+                f"(available={available_bytes / _GIB:.3f} GiB, "
+                f"limiting_source={available_evidence.get('limiting_source', 'unknown')!r}, "
+                f"reserve={reserve / _GIB:.3f} GiB)."
             )
         resolved = baseline_rss_bytes + increment
         mode = "auto"

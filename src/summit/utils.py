@@ -99,17 +99,23 @@ def resolve_memory_budget_gib(
     reserve_gib: float = 4.0,
     usable_fraction: float = 0.65,
 ) -> tuple[float, dict]:
-    """Resolve an explicit/automatic panel budget without consuming all available RAM."""
+    """Resolve a panel budget, capping the fixed reserve at half the available RAM."""
     parsed = parse_memory_budget(value)
     if parsed != "auto":
         return float(parsed), {"mode": "explicit", "resolved_gib": float(parsed)}
     available, evidence = available_memory_bytes()
-    reserve = int(float(reserve_gib) * (1024 ** 3))
+    # A fixed 4 GiB reserve can exceed all available RAM on a laptop or in a
+    # small allocation. Keep headroom without imposing a 4 GiB minimum host.
+    reserve = min(int(float(reserve_gib) * (1024 ** 3)), available // 2)
     budget = min(int(available * float(usable_fraction)), available - reserve)
     minimum = 256 * 1024 ** 2
     if budget < minimum:
         raise RuntimeError(
-            "Auto memory budgeting found less than 0.25 GiB after safety margins; "
+            "Auto memory budgeting found less than 0.25 GiB after safety margins "
+            f"(available={available / 1024**3:.3f} GiB, "
+            f"limiting_source={evidence.get('limiting_source', 'unknown')!r}, "
+            f"reserve={reserve / 1024**3:.3f} GiB, "
+            f"usable_fraction={float(usable_fraction):.2f}); "
             "free memory or provide a valid explicit allocation."
         )
     resolved = budget / float(1024 ** 3)
@@ -117,7 +123,8 @@ def resolve_memory_budget_gib(
         "mode": "auto",
         "resolved_gib": resolved,
         "available_gib": available / float(1024 ** 3),
-        "reserve_gib": float(reserve_gib),
+        "reserve_gib": reserve / float(1024 ** 3),
+        "requested_reserve_gib": float(reserve_gib),
         "usable_fraction": float(usable_fraction),
         **evidence,
     }

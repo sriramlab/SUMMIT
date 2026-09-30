@@ -801,6 +801,37 @@ def test_complete_memory_planner_charges_both_source_families_and_optimizes_pass
         )
 
 
+@pytest.mark.parametrize(
+    "available_gib, expected_increment_gib",
+    [(0.5, 0.25), (1, 0.5), (3, 1.5), (8, 4), (10, 6), (20, 13)],
+)
+def test_auto_total_process_budget_keeps_headroom_in_small_allocations(
+    available_gib, expected_increment_gib
+):
+    gib = 1024**3
+    baseline = 256 * 1024**2
+    budget = gxe_multi._resolve_total_process_budget(
+        "auto",
+        baseline_rss_bytes=baseline,
+        available_memory=(int(available_gib * gib), {"limiting_source": "test"}),
+    )
+    assert budget["resolved_increment_bytes"] == int(expected_increment_gib * gib)
+    assert budget["resolved_bytes"] == baseline + int(expected_increment_gib * gib)
+    assert budget["mode"] == "auto"
+
+
+def test_auto_total_process_budget_still_rejects_insufficient_memory():
+    with pytest.raises(RuntimeError, match="less than 0.25 GiB") as error:
+        gxe_multi._resolve_total_process_budget(
+            "auto",
+            baseline_rss_bytes=128 * 1024**2,
+            available_memory=(256 * 1024**2, {"limiting_source": "host_available"}),
+        )
+    assert "available=0.250 GiB" in str(error.value)
+    assert "limiting_source='host_available'" in str(error.value)
+    assert "reserve=0.125 GiB" in str(error.value)
+
+
 def test_total_process_budget_has_exact_baseline_and_available_boundaries():
     gib = 1024**3
     accepted = gxe_multi._resolve_total_process_budget(
