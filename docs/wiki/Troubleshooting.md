@@ -13,6 +13,40 @@ CMAKE_ARGS=-DBLA_VENDOR=OpenBLAS python -m pip install .
 Avoid mixing the base Conda environment's shared libraries with those in the
 SUMMIT environment. Rebuild after changing the compiler or numerical libraries.
 
+## macOS: OpenBLAS headers not found
+
+`OpenBLAS headers not found; install conda-forge openblas` means CMake could not
+find the development headers. An environment can contain `libopenblas`,
+`libblas`, and `liblapack` while still lacking those headers. Install the
+`openblas` development package in the activated environment and rebuild from
+the SUMMIT checkout:
+
+```bash
+conda activate summit
+conda install -c conda-forge "openblas>=0.3.31" llvm-openmp
+ls "$CONDA_PREFIX/include/openblas_config.h" "$CONDA_PREFIX/include/cblas.h"
+CMAKE_ARGS=-DBLA_VENDOR=OpenBLAS python -m pip install --no-cache-dir .
+```
+
+Both header paths should exist before rebuilding. OpenBLAS 0.3.31 or newer is
+required by native G×E; updating only the runtime or reinstalling with pip does
+not supply the missing development package. If NumPy uses another BLAS provider,
+follow the full [environment upgrade](Installation.md#update-an-existing-macos-installation).
+
+## macOS: OpenMP is missing
+
+Install `llvm-openmp` with `conda install -c conda-forge llvm-openmp` in the
+activated SUMMIT environment, then repeat the build. Apple's compiler also
+requires the Xcode Command Line Tools; see [Installation](Installation.md).
+
+## macOS: G×E reports that Linux /proc/self/fd is required
+
+This message comes from an older installation. Current SUMMIT supports BED-based
+G×E on macOS, including the native backend. Follow the
+[update instructions](Installation.md#update-an-existing-macos-installation)
+to pull and rebuild the code. Pinned PGEN G×E input still requires Linux;
+use BED with its BIM and FAM companions on macOS.
+
 ## The installed command uses old code
 
 An editable installation can point at another checkout. Reinstall from the

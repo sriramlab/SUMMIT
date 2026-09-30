@@ -7,35 +7,45 @@ a C++17 compiler, OpenMP, and BLAS/LAPACK. Conda installs the numerical librarie
 and Python packages listed in `environment.yml`; install a compiler separately
 if one is unavailable on your system.
 
-macOS supports BED-based G×E reference estimation and scoring, including the
-optimized native backend and generalized per-SNP executor. Use OpenBLAS from
-the same Conda environment as NumPy. Private BLIS, explicit CPU placement,
-and NUMA controls remain Linux features. Pinned PGEN G×E input currently
-requires Linux; use BED on macOS.
+macOS on Apple Silicon and Intel supports BED-based G×E reference estimation
+and scoring, including the optimized native backend and generalized per-SNP
+executor. Use OpenBLAS from the same Conda environment as NumPy. Private BLIS,
+explicit CPU placement, and NUMA controls remain Linux features. Pinned PGEN
+G×E input currently requires Linux; use BED on macOS.
+
+The recommended Conda setup uses OpenBLAS 0.3.31 or newer, including its
+development headers. Keep NumPy and SUMMIT linked to the OpenBLAS in that
+environment; the native G×E backend checks this at runtime.
 
 ## Standard installation
+
+On macOS, first install Apple's Xcode Command Line Tools if they are not already
+available, then wait for the installer to finish:
+
+```bash
+xcode-select --install
+```
+
+On either Linux or macOS, create the environment from the repository:
 
 ```bash
 git clone https://github.com/sriramlab/SUMMIT.git
 cd SUMMIT
 conda env create -f environment.yml
 conda activate summit
-python -m pip install .
 ```
 
-On macOS, install the Xcode Command Line Tools if needed (`xcode-select --install`)
-and add OpenMP before the pip installation:
+On macOS, add OpenMP to that environment before building:
 
 ```bash
 conda install -c conda-forge llvm-openmp
-CMAKE_ARGS=-DBLA_VENDOR=OpenBLAS python -m pip install .
 ```
 
-To rebuild an existing installation after updating SUMMIT, use that same pip
-command with `--no-cache-dir`. The default one-environment example uses NumPy;
-add `--gxe-native-backend direct --rand-dist rademacher` to its `summit` command
-to select native G×E execution. Use a new `--out` prefix when comparing the two
-runs, and use the same probe distribution in both runs for numerical comparisons.
+Then build and install on either platform:
+
+```bash
+CMAKE_ARGS=-DBLA_VENDOR=OpenBLAS python -m pip install .
+```
 
 Verify the commands:
 
@@ -48,11 +58,53 @@ summit reference --help
 The distribution is currently named `gwldcore`; its Python package and main
 command are named `summit`. A normal install compiles the native modules.
 
+## Update an existing macOS installation
+
+From your SUMMIT checkout, activate the environment and update both the source
+and build dependencies before reinstalling:
+
+```bash
+conda activate summit
+git pull --ff-only
+conda install -c conda-forge \
+  "openblas>=0.3.31" \
+  "libblas=*=*openblas" "libcblas=*=*openblas" "liblapack=*=*openblas" \
+  llvm-openmp
+CMAKE_ARGS=-DBLA_VENDOR=OpenBLAS python -m pip install --no-cache-dir .
+```
+
+`git pull --ff-only` updates the checkout only when Git can advance it without
+creating a merge commit. If your local branch has diverged, it stops so you can
+resolve the local changes. Pulling alone does not rebuild an installed SUMMIT.
+
+Older environments may have only `libopenblas`, which supplies the runtime
+library. The separate `openblas` package supplies the headers needed to compile
+SUMMIT and installs a matching runtime. The command above includes both the
+headers and the minimum version required by native G×E.
+
+## Run the examples
+
+From the repository root, run the small synthetic examples:
+
+```bash
+bash example/estimate_gwldscore.sh
+bash example/estimate_gxe_ldscore.sh
+```
+
+These generate their inputs and write results under `example/out/`. Choose a
+new output prefix for additional G×E runs. The one-environment shell example
+uses the NumPy backend; see [G×E models](GxE-models.md#native-backend-on-linux-and-macos)
+for a complete native command using `--gxe-native-backend direct` and
+`--rand-dist rademacher`. Use the same probe distribution when comparing backends.
+
 ## Generalized G×E reference estimation
 
 The generalized reference executor supports the standard protected OpenBLAS
 build on Linux and macOS. The native implementation retains its two complete
 genotype traversals and uses the same scientific definitions on both platforms.
+No additional build is needed with the OpenBLAS installation above. See
+[Multiple environments](Multiple-environments.md#synthetic-reference-example)
+for the synthetic native example.
 
 For a site-specific BLIS build, configure `GXELDCORE_USE_PRIVATE_BLIS` and the
 archive/include locations in `CMakeLists.txt`. The accompanying source metadata

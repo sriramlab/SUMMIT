@@ -23,22 +23,37 @@ See the [user guide](https://github.com/sriramlab/SUMMIT/wiki) for the inputs an
 ## Install
 
 You need Conda, Python 3.10 or newer, and a C++17 compiler with OpenMP support.
-The environment file supplies the Python and numerical-library dependencies.
-Linux is recommended; the direct generalized G×E backend requires Linux.
+The environment file supplies the Python and numerical-library dependencies,
+including OpenBLAS headers. Linux and macOS (Apple Silicon and Intel) support
+the optimized native G×E backend with BED input. On macOS, first install the
+Xcode Command Line Tools if needed with `xcode-select --install`.
 
 ```bash
 git clone https://github.com/sriramlab/SUMMIT.git
 cd SUMMIT
 conda env create -f environment.yml
 conda activate summit
-python -m pip install .
+```
+
+On macOS, add OpenMP before building:
+
+```bash
+conda install -c conda-forge llvm-openmp
+```
+
+Then install SUMMIT on either platform:
+
+```bash
+CMAKE_ARGS=-DBLA_VENDOR=OpenBLAS python -m pip install .
 summit --help
 summit pgs --help
 summit reference --help
 ```
 
-See [Installation](https://github.com/sriramlab/SUMMIT/wiki/Installation) for compiler setup, development
-installs, and the additional build needed for generalized G×E reference estimation.
+See [Installation](https://github.com/sriramlab/SUMMIT/wiki/Installation) for
+upgrading an existing environment, development installs, and platform limits.
+If a build reports missing OpenBLAS headers, install the `openblas` development
+package as described in [Troubleshooting](https://github.com/sriramlab/SUMMIT/wiki/Troubleshooting).
 
 ## Try it
 
@@ -52,6 +67,8 @@ bash example/h2_ldscore.sh
 
 Examples write to `example/out/`. They illustrate the commands; their small
 sample sizes are unsuitable for evaluating statistical performance.
+See the [example guide](example/README.md) for G×E examples, including an
+explicit native-backend command that also runs on macOS.
 
 ## Documentation
 

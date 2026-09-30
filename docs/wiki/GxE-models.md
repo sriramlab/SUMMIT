@@ -23,6 +23,31 @@ environment, and covariates. Genetic and interaction feature columns are
 normalized after that adjustment. The reference can be reused only with
 compatible SNPs, annotations, and feature definitions.
 
+### Native backend on Linux and macOS
+
+The default one-environment backend uses NumPy. To select the optimized native
+backend, add `--gxe-native-backend direct --rand-dist rademacher`. BED input is
+supported on both Linux and macOS with the OpenBLAS build described in
+[Installation](Installation.md).
+
+For a small native example, run from the repository root:
+
+```bash
+python example/prepare_example_inputs.py
+summit --geno example/out/synthetic/small.bed \
+  --env example/out/synthetic/small.env \
+  --annot example/out/synthetic/small.annot \
+  --covar example/out/synthetic/small.cov \
+  --out example/out/small.2bins.env.native \
+  --nvecs 100 --block-size 256 --seed 1 --dtype float64 --num-threads 2 \
+  --gxe-native-backend direct --rand-dist rademacher
+```
+
+Use a new output prefix if you have already run this command. The native path
+requires Rademacher probes; set the same distribution in a NumPy run when
+comparing results. The shell example `estimate_gxe_ldscore.sh` uses the default
+probe distribution, so its estimates need not match this native example exactly.
+
 ## 2. Compute trait summaries
 
 ```bash
