@@ -92,7 +92,8 @@ jobs:
             --annot "$example_dir/out/synthetic/small.annot" \
             --covar "$example_dir/out/synthetic/small.cov" \
             --out "$example_dir/out/native" --nvecs 100 --block-size 256 \
-            --seed 1 --dtype float64 --num-threads 2 --gxe-native-backend direct
+            --seed 1 --dtype float64 --num-threads 2 \
+            --gxe-native-backend direct --rand-dist rademacher
           python example/estimate_generalized_gxe_variant_ldscore.py \
             --prefix "$example_dir/out/synthetic/small" \
             --output "$example_dir/out/generalized" --probes 16 --njack 20 --threads 2

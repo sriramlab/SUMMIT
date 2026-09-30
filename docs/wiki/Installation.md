@@ -33,8 +33,9 @@ CMAKE_ARGS=-DBLA_VENDOR=OpenBLAS python -m pip install .
 
 To rebuild an existing installation after updating SUMMIT, use that same pip
 command with `--no-cache-dir`. The default one-environment example uses NumPy;
-add `--gxe-native-backend direct` to its `summit` command to select native G×E
-execution. Use a new `--out` prefix when comparing the two runs.
+add `--gxe-native-backend direct --rand-dist rademacher` to its `summit` command
+to select native G×E execution. Use a new `--out` prefix when comparing the two
+runs, and use the same probe distribution in both runs for numerical comparisons.
 
 Verify the commands:
 
