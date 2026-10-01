@@ -51,7 +51,7 @@ summit reference --help
 ```
 
 See [Installation](https://github.com/sriramlab/SUMMIT/wiki/Installation) for
-upgrading an existing environment, development installs, and platform limits.
+the complete setup instructions, development installs, and platform limits.
 If a build reports missing OpenBLAS headers, install the `openblas` development
 package as described in [Troubleshooting](https://github.com/sriramlab/SUMMIT/wiki/Troubleshooting).
 

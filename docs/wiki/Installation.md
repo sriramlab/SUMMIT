@@ -13,11 +13,14 @@ executor. Use OpenBLAS from the same Conda environment as NumPy. Private BLIS,
 explicit CPU placement, and NUMA controls remain Linux features. Pinned PGEN
 G×E input currently requires Linux; use BED on macOS.
 
-The recommended Conda setup uses OpenBLAS 0.3.31 or newer, including its
-development headers. Keep NumPy and SUMMIT linked to the OpenBLAS in that
-environment; the native G×E backend checks this at runtime.
+The environment file installs OpenBLAS 0.3.31 or newer, including the `openblas`
+development package that supplies its headers. Keep NumPy and SUMMIT linked to
+the OpenBLAS in that environment; the native G×E backend checks this at runtime.
 
 ## Standard installation
+
+Start with Conda installed, then follow the steps below to create a new SUMMIT
+environment.
 
 On macOS, first install Apple's Xcode Command Line Tools if they are not already
 available, then wait for the installer to finish:
@@ -57,30 +60,6 @@ summit reference --help
 
 The distribution is currently named `gwldcore`; its Python package and main
 command are named `summit`. A normal install compiles the native modules.
-
-## Update an existing macOS installation
-
-From your SUMMIT checkout, activate the environment and update both the source
-and build dependencies before reinstalling:
-
-```bash
-conda activate summit
-git pull --ff-only
-conda install -c conda-forge \
-  "openblas>=0.3.31" \
-  "libblas=*=*openblas" "libcblas=*=*openblas" "liblapack=*=*openblas" \
-  llvm-openmp
-CMAKE_ARGS=-DBLA_VENDOR=OpenBLAS python -m pip install --no-cache-dir .
-```
-
-`git pull --ff-only` updates the checkout only when Git can advance it without
-creating a merge commit. If your local branch has diverged, it stops so you can
-resolve the local changes. Pulling alone does not rebuild an installed SUMMIT.
-
-Older environments may have only `libopenblas`, which supplies the runtime
-library. The separate `openblas` package supplies the headers needed to compile
-SUMMIT and installs a matching runtime. The command above includes both the
-headers and the minimum version required by native G×E.
 
 ## Run the examples
 
