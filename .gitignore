@@ -8,6 +8,10 @@ __pycache__/
 example/out/
 example/output.log
 
+# Reviewer-generated figures, tables, and simulation inputs/results.
+manuscript/output/
+manuscript/inputs/
+
 # Keep local genotype and participant inputs out of version control.
 *.bed
 *.bim

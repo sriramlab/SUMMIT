@@ -8,6 +8,7 @@ build-backend = "scikit_build_core.build"
 [project]
 name = "gwldcore"
 version = "0.1.0"
+license = {file = "LICENSE"}
 requires-python = ">=3.10"
 description = "Nanobind-backed genome-wide and windowed LD score native extensions"
 dependencies = [

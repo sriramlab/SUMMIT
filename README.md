@@ -50,7 +50,7 @@ summit pgs --help
 summit reference --help
 ```
 
-See [Installation](https://github.com/sriramlab/SUMMIT/wiki/Installation) for
+See [Installation](docs/wiki/Installation.md) for
 the complete setup instructions, development installs, and platform limits.
 If a build reports missing OpenBLAS headers, install the `openblas` development
 package as described in [Troubleshooting](https://github.com/sriramlab/SUMMIT/wiki/Troubleshooting).
@@ -63,12 +63,14 @@ Generate a small synthetic dataset and estimate partitioned LD scores:
 python example/prepare_example_inputs.py
 bash example/estimate_partitioned_gwldscore.sh
 bash example/h2_ldscore.sh
+bash example/rg_supplied_overlap_covariance.sh
 ```
 
 Examples write to `example/out/`. They illustrate the commands; their small
 sample sizes are unsuitable for evaluating statistical performance.
-See the [example guide](example/README.md) for G×E examples, including an
-explicit native-backend command that also runs on macOS.
+See the [example guide](example/README.md) for expected results, measured
+runtime, and G×E examples, including an explicit native-backend command
+that also runs on macOS.
 
 ## Documentation
 
@@ -85,6 +87,24 @@ explicit native-backend command that also runs on macOS.
 - [G×E polygenic scores](https://github.com/sriramlab/SUMMIT/wiki/Polygenic-scores)
 - [Real-data results](https://github.com/sriramlab/SUMMIT/wiki/Real-data-results)
 - [Benchmarks](https://github.com/sriramlab/SUMMIT/wiki/Benchmarks)
+
+## Manuscript reproduction
+
+The [manuscript package](manuscript/README.md) contains the aggregate source
+data and scripts for Figures 1–8 and S1–S44, supplementary metadata, and
+phenotype simulation utilities. Its plotting workflow uses relative paths
+and requires no individual-level data. See the
+[installation notes](docs/wiki/Installation.md#tested-environments-and-hardware)
+for tested environments, hardware requirements, and installation time.
+
+For a reproducible software reference, record the repository commit
+(`git rev-parse HEAD`) together with the environment used. The package version
+alone does not identify a particular source revision.
+
+## License
+
+SUMMIT software is distributed under the [MIT License](LICENSE).
+External datasets remain subject to their original access and use terms.
 
 ## Citation
 

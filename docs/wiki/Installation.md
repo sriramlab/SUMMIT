@@ -2,7 +2,7 @@
 
 ## Requirements
 
-Use Linux for the widest feature support. SUMMIT requires Python 3.10 or newer,
+SUMMIT supports Linux and macOS. It requires Python 3.10 or newer,
 a C++17 compiler, OpenMP, and BLAS/LAPACK. Conda installs the numerical libraries
 and Python packages listed in `environment.yml`; install a compiler separately
 if one is unavailable on your system.
@@ -61,16 +61,46 @@ summit reference --help
 The distribution is currently named `gwldcore`; its Python package and main
 command are named `summit`. A normal install compiles the native modules.
 
+## Tested environments and hardware
+
+The manuscript LD-score, heritability, and genetic-correlation workflows run
+on ordinary CPU hardware. No GPU or other non-standard hardware is required.
+Memory and runtime depend on the number of samples, variants, annotations,
+and random vectors; the bundled synthetic demo is suitable for a desktop.
+
+| System | Verification |
+| --- | --- |
+| Debian GNU/Linux 12, x86-64 | Native OpenBLAS build and the complete synthetic LD-score/h²/rg demo |
+| macOS 15, Apple Silicon and Intel | Automated tests in GitHub Actions |
+| macOS Tahoe 26.6.2 | Author-reported installation and functional testing |
+
+The Debian demo was checked with Python 3.12.12, NumPy 2.3.5, pandas 2.3.3,
+SciPy 1.16.3, bed-reader 1.0.0, pgenlib 0.94.1, psutil 7.1.3,
+threadpoolctl 3.6.0, tqdm 4.67.1, and OpenBLAS 0.3.34. The build used
+GCC 12.2.0, CMake 4.1.2, Ninja 1.13.1, nanobind 2.12.0, and
+scikit-build-core 0.11.6. These are tested versions; the supported dependency
+ranges are in `environment.yml` and `pyproject.toml`.
+
+Allow a few minutes for the SUMMIT build after the compiler and dependencies
+are installed. A native build took about 100 seconds with two build workers
+on an AMD EPYC 7501 Linux system. Conda environment creation and dependency
+downloads are additional and depend on the network and package cache.
+
 ## Run the examples
 
 From the repository root, run the small synthetic examples:
 
 ```bash
-bash example/estimate_gwldscore.sh
-bash example/estimate_gxe_ldscore.sh
+python example/prepare_example_inputs.py
+bash example/estimate_partitioned_gwldscore.sh
+bash example/h2_ldscore.sh
+bash example/rg_supplied_overlap_covariance.sh
 ```
 
-These generate their inputs and write results under `example/out/`. Choose a
+These generate their inputs and write results under `example/out/`.
+The [example README](../../example/README.md) lists expected outputs and timing.
+
+For G×E, run `bash example/estimate_gxe_ldscore.sh`. Choose a
 new output prefix for additional G×E runs. The one-environment shell example
 uses the NumPy backend; see [G×E models](GxE-models.md#native-backend-on-linux-and-macos)
 for a complete native command using `--gxe-native-backend direct` and

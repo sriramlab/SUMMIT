@@ -1,0 +1,289 @@
+reference_pop,target_pop,metric,annotation,annotation_label,annotation_family,reference_estimate,target_estimate
+EUR_300k,EUR,tau_star,Coding_UCSC_w_flanking,Coding,Coding/gene model,-0.21545321042159643,0.09386980593691115
+EUR_300k,EUR,tau_star,Conserved_LindbladToh_w_flanking,Conserved (LindbladToh),Selection/conservation,-0.014331152099344598,0.15266243642518065
+EUR_300k,EUR,tau_star,CTCF_Hoffman_w_flanking,CTCF Hoffman + flank,Regulatory,-0.03153459936056023,0.11927041036715522
+EUR_300k,EUR,tau_star,DGF_ENCODE_w_flanking,DGF ENCODE + flank,Other,0.002176518282400085,0.04151610268661955
+EUR_300k,EUR,tau_star,DHS_peaks_Trynka,DHS peaks,Regulatory,0.012520164601140398,-0.1194716186529242
+EUR_300k,EUR,tau_star,DHS_Trynka_w_flanking,DHS + flank,Regulatory,-0.03918491560588045,-0.0006059434275608349
+EUR_300k,EUR,tau_star,Enhancer_Andersson_w_flanking,Enhancer Andersson + flank,Regulatory,-0.04298157857814138,-0.17586389433703303
+EUR_300k,EUR,tau_star,Enhancer_Hoffman_w_flanking,Enhancer Hoffman + flank,Regulatory,-0.01483953880716751,-0.15009055658883924
+EUR_300k,EUR,tau_star,FetalDHS_Trynka_w_flanking,FetalDHS Trynka + flank,Regulatory,-0.008037184552450435,0.06240552823417678
+EUR_300k,EUR,tau_star,H3K27ac_Hnisz_w_flanking,H3K27ac Hnisz + flank,Regulatory,0.04337280612595426,-0.05921899008399012
+EUR_300k,EUR,tau_star,H3K27ac_PGC2_w_flanking,H3K27ac PGC2 + flank,Other,0.01808868593680797,0.07624272419839531
+EUR_300k,EUR,tau_star,H3K4me1_peaks_Trynka,H3K4me1 peaks Trynka,Regulatory,-0.005537707392452969,0.150132336236345
+EUR_300k,EUR,tau_star,H3K4me1_Trynka_w_flanking,H3K4me1 Trynka + flank,Regulatory,0.06127017118295116,0.19904770583344963
+EUR_300k,EUR,tau_star,H3K4me3_peaks_Trynka,H3K4me3 peaks Trynka,Regulatory,-0.05102211590887055,0.017549129215809943
+EUR_300k,EUR,tau_star,H3K4me3_Trynka_w_flanking,H3K4me3 Trynka + flank,Regulatory,0.006903877943294775,-0.25562190551234015
+EUR_300k,EUR,tau_star,H3K9ac_peaks_Trynka,H3K9ac peaks Trynka,Regulatory,0.04315888814312901,-0.1227153415514708
+EUR_300k,EUR,tau_star,H3K9ac_Trynka_w_flanking,H3K9ac Trynka + flank,Regulatory,0.049467333516301636,0.21754349237812665
+EUR_300k,EUR,tau_star,Intron_UCSC_w_flanking,Intron UCSC + flank,Coding/gene model,0.00041177281596649183,-0.03171993919292411
+EUR_300k,EUR,tau_star,PromoterFlanking_Hoffman_w_flanking,Promoter flank,Coding/gene model,-0.03759104046807503,-0.13121168542463169
+EUR_300k,EUR,tau_star,Promoter_UCSC_w_flanking,Promoter,Coding/gene model,-0.14749706649780295,-0.2514251498816352
+EUR_300k,EUR,tau_star,Repressed_Hoffman_w_flanking,Repressed Hoffman + flank,Other,-0.06569070880189856,-0.11726993083183204
+EUR_300k,EUR,tau_star,SuperEnhancer_Hnisz_w_flanking,SuperEnhancer Hnisz + flank,Regulatory,0.05514916658907522,0.033212001969961026
+EUR_300k,EUR,tau_star,TFBS_ENCODE_w_flanking,TFBS + flank,Regulatory,0.014397819388714851,0.03436903545638634
+EUR_300k,EUR,tau_star,Transcr_Hoffman_w_flanking,Transcr Hoffman + flank,Other,0.036353840481429776,-0.033517480606729724
+EUR_300k,EUR,tau_star,TSS_Hoffman_w_flanking,TSS + flank,Coding/gene model,0.010208509548703497,0.1356574994614975
+EUR_300k,EUR,tau_star,UTR_3_UCSC_w_flanking,UTR 3 UCSC + flank,Coding/gene model,0.07842902748246816,0.25501358848858147
+EUR_300k,EUR,tau_star,UTR_5_UCSC_w_flanking,UTR 5 UCSC + flank,Coding/gene model,0.06570077908253216,0.06071303833659597
+EUR_300k,EUR,tau_star,WeakEnhancer_Hoffman_w_flanking,WeakEnhancer Hoffman + flank,Regulatory,-0.016550226741161113,-0.03386531935265537
+EUR_300k,EUR,tau_star,GERP.NS,GERP.NS,Selection/conservation,0.17842727131882694,0.09083532348682945
+EUR_300k,EUR,tau_star,GERP.RSsup4,GERP.RS>4,Selection/conservation,0.10642004175758424,0.04162464393573706
+EUR_300k,EUR,tau_star,Backgrd_Selection_Stat,Background selection,Selection/conservation,0.25683838272711507,0.17763371352005833
+EUR_300k,EUR,tau_star,CpG_Content_50kb,CpG content (50 kb),Selection/conservation,0.14440583926731124,0.06716232055236487
+EUR_300k,EUR,tau_star,GTEx_eQTL_MaxCPP,GTEx eQTL MaxCPP,Molecular QTL,0.12627266204001167,-0.03044229498591464
+EUR_300k,EUR,tau_star,BLUEPRINT_H3K27acQTL_MaxCPP,BLUEPRINT H3K27ac QTL,Molecular QTL,0.0039792146488787095,0.10018324800306741
+EUR_300k,EUR,tau_star,BLUEPRINT_H3K4me1QTL_MaxCPP,BLUEPRINT H3K4me1 QTL,Molecular QTL,0.022127840469858533,-0.11751554686204892
+EUR_300k,EUR,tau_star,BLUEPRINT_DNA_methylation_MaxCPP,BLUEPRINT methylation QTL,Molecular QTL,-0.019081422182134714,-0.0644280736182737
+EUR_300k,EUR,tau_star,synonymous,Synonymous,Coding/gene model,-0.08308089176834457,-0.1892605334740734
+EUR_300k,EUR,tau_star,non_synonymous,Nonsynonymous,Coding/gene model,-0.08278940345831816,-0.25613740076953334
+EUR_300k,EUR,tau_star,Conserved_Vertebrate_phastCons46way_w_flanking,phastCons vertebrate,Selection/conservation,-0.004938178812112985,-0.2659504432068991
+EUR_300k,EUR,tau_star,Conserved_Mammal_phastCons46way_w_flanking,phastCons mammal,Selection/conservation,0.011075042970489307,0.13234178334822505
+EUR_300k,EUR,tau_star,Conserved_Primate_phastCons46way_w_flanking,phastCons primate,Selection/conservation,0.14758383272439404,0.0028733438183950475
+EUR_300k,EUR,tau_star,BivFlnk_w_flanking,BivFlnk + flank,Other,0.032817660888076625,0.12067657265221696
+EUR_300k,EUR,tau_star,Human_Promoter_Villar_w_flanking,Human promoter (Villar),Hujoel,0.014117740430005394,0.10461902117103439
+EUR_300k,EUR,tau_star,Human_Enhancer_Villar_w_flanking,Human enhancer (Villar),Hujoel,-0.022908034821843237,-0.016430172805014607
+EUR_300k,EUR,tau_star,Ancient_Sequence_Age_Human_Promoter_w_flanking,Ancient promoter age,Hujoel,0.15550570492082064,0.3539243478103361
+EUR_300k,EUR,tau_star,Ancient_Sequence_Age_Human_Enhancer_w_flanking,Ancient enhancer age,Hujoel,0.09118421082503281,0.08134454474455616
+EUR_300k,EUR,tau_star,Human_Enhancer_Villar_Species_Enhancer_Count,Enhancer species count,Hujoel,0.046996772732134866,0.32059924986604443
+EUR_300k,EUR,tau_star,Human_Promoter_Villar_ExAC_w_flanking,LoF-intolerant promoter,Hujoel,0.04218749346864437,-0.05718022618368984
+EUR_300k,EUR,log2_enrichment,Coding_UCSC_w_flanking,Coding,Coding/gene model,0.6759822208711426,1.4777230723426507
+EUR_300k,EUR,log2_enrichment,Conserved_LindbladToh_w_flanking,Conserved (LindbladToh),Selection/conservation,0.365287801736136,0.5232288955327922
+EUR_300k,EUR,log2_enrichment,CTCF_Hoffman_w_flanking,CTCF Hoffman + flank,Regulatory,0.21666424770312961,1.2173475796848288
+EUR_300k,EUR,log2_enrichment,DGF_ENCODE_w_flanking,DGF ENCODE + flank,Other,0.24507698478838155,0.3549744454790185
+EUR_300k,EUR,log2_enrichment,DHS_peaks_Trynka,DHS peaks,Regulatory,0.4866273024254528,0.8055687013775518
+EUR_300k,EUR,log2_enrichment,DHS_Trynka_w_flanking,DHS + flank,Regulatory,0.22097954291988955,0.33916767426174466
+EUR_300k,EUR,log2_enrichment,Enhancer_Andersson_w_flanking,Enhancer Andersson + flank,Regulatory,0.5796783936772053,1.474164065929743
+EUR_300k,EUR,log2_enrichment,Enhancer_Hoffman_w_flanking,Enhancer Hoffman + flank,Regulatory,0.7942305242508317,1.211662524575318
+EUR_300k,EUR,log2_enrichment,FetalDHS_Trynka_w_flanking,FetalDHS Trynka + flank,Regulatory,0.35905405118196465,0.5762679129959699
+EUR_300k,EUR,log2_enrichment,H3K27ac_Hnisz_w_flanking,H3K27ac Hnisz + flank,Regulatory,0.42590750954957113,0.5279708802433144
+EUR_300k,EUR,log2_enrichment,H3K27ac_PGC2_w_flanking,H3K27ac PGC2 + flank,Other,0.5344576974291066,0.7434170962655378
+EUR_300k,EUR,log2_enrichment,H3K4me1_peaks_Trynka,H3K4me1 peaks Trynka,Regulatory,0.5215273819283126,0.852080489248084
+EUR_300k,EUR,log2_enrichment,H3K4me1_Trynka_w_flanking,H3K4me1 Trynka + flank,Regulatory,0.2686722866060376,0.38270937926124105
+EUR_300k,EUR,log2_enrichment,H3K4me3_peaks_Trynka,H3K4me3 peaks Trynka,Regulatory,0.7548972973686815,1.7088185502200004
+EUR_300k,EUR,log2_enrichment,H3K4me3_Trynka_w_flanking,H3K4me3 Trynka + flank,Regulatory,0.4763979158194393,0.670970581238574
+EUR_300k,EUR,log2_enrichment,H3K9ac_peaks_Trynka,H3K9ac peaks Trynka,Regulatory,1.041801637033337,1.5598778326102285
+EUR_300k,EUR,log2_enrichment,H3K9ac_Trynka_w_flanking,H3K9ac Trynka + flank,Regulatory,0.6596861122529553,0.922841132196362
+EUR_300k,EUR,log2_enrichment,Intron_UCSC_w_flanking,Intron UCSC + flank,Coding/gene model,0.31706234788993937,0.48771744919450327
+EUR_300k,EUR,log2_enrichment,PromoterFlanking_Hoffman_w_flanking,Promoter flank,Coding/gene model,0.700188426973692,1.758262221816481
+EUR_300k,EUR,log2_enrichment,Promoter_UCSC_w_flanking,Promoter,Coding/gene model,0.6651856393034059,1.4040993537880442
+EUR_300k,EUR,log2_enrichment,Repressed_Hoffman_w_flanking,Repressed Hoffman + flank,Other,-0.2022097716420608,-0.21220019412094518
+EUR_300k,EUR,log2_enrichment,SuperEnhancer_Hnisz_w_flanking,SuperEnhancer Hnisz + flank,Regulatory,0.701439281912031,0.9318870826221187
+EUR_300k,EUR,log2_enrichment,TFBS_ENCODE_w_flanking,TFBS + flank,Regulatory,0.35110144537129184,0.6129018000445371
+EUR_300k,EUR,log2_enrichment,Transcr_Hoffman_w_flanking,Transcr Hoffman + flank,Other,0.03230704674954566,0.04046029908581616
+EUR_300k,EUR,log2_enrichment,TSS_Hoffman_w_flanking,TSS + flank,Coding/gene model,1.2736060415390862,1.9619065963190085
+EUR_300k,EUR,log2_enrichment,UTR_3_UCSC_w_flanking,UTR 3 UCSC + flank,Coding/gene model,0.8757070955238775,1.9299584883338008
+EUR_300k,EUR,log2_enrichment,UTR_5_UCSC_w_flanking,UTR 5 UCSC + flank,Coding/gene model,0.9320045371350095,2.0063429814370024
+EUR_300k,EUR,log2_enrichment,WeakEnhancer_Hoffman_w_flanking,WeakEnhancer Hoffman + flank,Regulatory,0.48696724837527433,1.0115095453984844
+EUR_300k,EUR,log2_enrichment,GERP.NS,GERP.NS,Selection/conservation,0.2307594530243876,0.1772942820970494
+EUR_300k,EUR,log2_enrichment,GERP.RSsup4,GERP.RS>4,Selection/conservation,1.1398713541799654,2.2114217409483357
+EUR_300k,EUR,log2_enrichment,Backgrd_Selection_Stat,Background selection,Selection/conservation,0.421992464939035,0.4607800598024755
+EUR_300k,EUR,log2_enrichment,CpG_Content_50kb,CpG content (50 kb),Selection/conservation,0.19662265088861589,0.25930288433878323
+EUR_300k,EUR,log2_enrichment,GTEx_eQTL_MaxCPP,GTEx eQTL MaxCPP,Molecular QTL,1.9272802523239618,3.005156618123716
+EUR_300k,EUR,log2_enrichment,BLUEPRINT_H3K27acQTL_MaxCPP,BLUEPRINT H3K27ac QTL,Molecular QTL,0.9714701897068798,2.187170375049088
+EUR_300k,EUR,log2_enrichment,BLUEPRINT_H3K4me1QTL_MaxCPP,BLUEPRINT H3K4me1 QTL,Molecular QTL,1.1310177211904149,1.9155375261153071
+EUR_300k,EUR,log2_enrichment,BLUEPRINT_DNA_methylation_MaxCPP,BLUEPRINT methylation QTL,Molecular QTL,0.8292484900945863,1.50894258331779
+EUR_300k,EUR,log2_enrichment,synonymous,Synonymous,Coding/gene model,0.4979659930387919,2.5534946722580942
+EUR_300k,EUR,log2_enrichment,non_synonymous,Nonsynonymous,Coding/gene model,0.7594918036204458,2.0534513625561326
+EUR_300k,EUR,log2_enrichment,Conserved_Vertebrate_phastCons46way_w_flanking,phastCons vertebrate,Selection/conservation,0.3190942495320484,0.3044526809872407
+EUR_300k,EUR,log2_enrichment,Conserved_Mammal_phastCons46way_w_flanking,phastCons mammal,Selection/conservation,0.3694782809892507,0.4727294191880616
+EUR_300k,EUR,log2_enrichment,Conserved_Primate_phastCons46way_w_flanking,phastCons primate,Selection/conservation,0.5948202787425183,0.7212846247011179
+EUR_300k,EUR,log2_enrichment,BivFlnk_w_flanking,BivFlnk + flank,Other,1.0339525827561251,1.7378937194321509
+EUR_300k,EUR,log2_enrichment,Human_Promoter_Villar_w_flanking,Human promoter (Villar),Hujoel,1.5690234864801864,2.5816972864372114
+EUR_300k,EUR,log2_enrichment,Human_Enhancer_Villar_w_flanking,Human enhancer (Villar),Hujoel,1.1260185792173802,1.8641065738312768
+EUR_300k,EUR,log2_enrichment,Ancient_Sequence_Age_Human_Promoter_w_flanking,Ancient promoter age,Hujoel,1.8615362464428287,3.1430389244353334
+EUR_300k,EUR,log2_enrichment,Ancient_Sequence_Age_Human_Enhancer_w_flanking,Ancient enhancer age,Hujoel,1.44717829904281,2.4316392536771816
+EUR_300k,EUR,log2_enrichment,Human_Enhancer_Villar_Species_Enhancer_Count,Enhancer species count,Hujoel,1.6658848493567786,2.489869769960766
+EUR_300k,EUR,log2_enrichment,Human_Promoter_Villar_ExAC_w_flanking,LoF-intolerant promoter,Hujoel,1.898274853198713,3.5126524887192296
+EUR_300k,SAS,tau_star,Coding_UCSC_w_flanking,Coding,Coding/gene model,-0.21545321042159643,0.0752004954011619
+EUR_300k,SAS,tau_star,Conserved_LindbladToh_w_flanking,Conserved (LindbladToh),Selection/conservation,-0.014331152099344598,0.038306610149818676
+EUR_300k,SAS,tau_star,CTCF_Hoffman_w_flanking,CTCF Hoffman + flank,Regulatory,-0.03153459936056023,-0.17668082993643916
+EUR_300k,SAS,tau_star,DGF_ENCODE_w_flanking,DGF ENCODE + flank,Other,0.002176518282400085,-0.005434012088118569
+EUR_300k,SAS,tau_star,DHS_peaks_Trynka,DHS peaks,Regulatory,0.012520164601140398,-0.02439738434429865
+EUR_300k,SAS,tau_star,DHS_Trynka_w_flanking,DHS + flank,Regulatory,-0.03918491560588045,0.026992472227954995
+EUR_300k,SAS,tau_star,Enhancer_Andersson_w_flanking,Enhancer Andersson + flank,Regulatory,-0.04298157857814138,0.057483898438614095
+EUR_300k,SAS,tau_star,Enhancer_Hoffman_w_flanking,Enhancer Hoffman + flank,Regulatory,-0.01483953880716751,-0.04785014957457884
+EUR_300k,SAS,tau_star,FetalDHS_Trynka_w_flanking,FetalDHS Trynka + flank,Regulatory,-0.008037184552450435,-0.08188013497925035
+EUR_300k,SAS,tau_star,H3K27ac_Hnisz_w_flanking,H3K27ac Hnisz + flank,Regulatory,0.04337280612595426,0.06767849360681812
+EUR_300k,SAS,tau_star,H3K27ac_PGC2_w_flanking,H3K27ac PGC2 + flank,Other,0.01808868593680797,0.003875934048324105
+EUR_300k,SAS,tau_star,H3K4me1_peaks_Trynka,H3K4me1 peaks Trynka,Regulatory,-0.005537707392452969,0.011995281057372294
+EUR_300k,SAS,tau_star,H3K4me1_Trynka_w_flanking,H3K4me1 Trynka + flank,Regulatory,0.06127017118295116,0.1365668213873523
+EUR_300k,SAS,tau_star,H3K4me3_peaks_Trynka,H3K4me3 peaks Trynka,Regulatory,-0.05102211590887055,-0.10997002369965568
+EUR_300k,SAS,tau_star,H3K4me3_Trynka_w_flanking,H3K4me3 Trynka + flank,Regulatory,0.006903877943294775,0.07728071843856191
+EUR_300k,SAS,tau_star,H3K9ac_peaks_Trynka,H3K9ac peaks Trynka,Regulatory,0.04315888814312901,-0.13860877767962654
+EUR_300k,SAS,tau_star,H3K9ac_Trynka_w_flanking,H3K9ac Trynka + flank,Regulatory,0.049467333516301636,0.11244532814104186
+EUR_300k,SAS,tau_star,Intron_UCSC_w_flanking,Intron UCSC + flank,Coding/gene model,0.00041177281596649183,-0.05581087995457481
+EUR_300k,SAS,tau_star,PromoterFlanking_Hoffman_w_flanking,Promoter flank,Coding/gene model,-0.03759104046807503,-0.27156230497708767
+EUR_300k,SAS,tau_star,Promoter_UCSC_w_flanking,Promoter,Coding/gene model,-0.14749706649780295,-0.12568835203859485
+EUR_300k,SAS,tau_star,Repressed_Hoffman_w_flanking,Repressed Hoffman + flank,Other,-0.06569070880189856,0.02736112934604329
+EUR_300k,SAS,tau_star,SuperEnhancer_Hnisz_w_flanking,SuperEnhancer Hnisz + flank,Regulatory,0.05514916658907522,-0.07638987463047535
+EUR_300k,SAS,tau_star,TFBS_ENCODE_w_flanking,TFBS + flank,Regulatory,0.014397819388714851,0.02035757483518731
+EUR_300k,SAS,tau_star,Transcr_Hoffman_w_flanking,Transcr Hoffman + flank,Other,0.036353840481429776,0.08059518077244832
+EUR_300k,SAS,tau_star,TSS_Hoffman_w_flanking,TSS + flank,Coding/gene model,0.010208509548703497,0.23127238075064335
+EUR_300k,SAS,tau_star,UTR_3_UCSC_w_flanking,UTR 3 UCSC + flank,Coding/gene model,0.07842902748246816,0.019518826369416657
+EUR_300k,SAS,tau_star,UTR_5_UCSC_w_flanking,UTR 5 UCSC + flank,Coding/gene model,0.06570077908253216,0.2601868410387811
+EUR_300k,SAS,tau_star,WeakEnhancer_Hoffman_w_flanking,WeakEnhancer Hoffman + flank,Regulatory,-0.016550226741161113,0.22762894578883952
+EUR_300k,SAS,tau_star,GERP.NS,GERP.NS,Selection/conservation,0.17842727131882694,0.21647283282807667
+EUR_300k,SAS,tau_star,GERP.RSsup4,GERP.RS>4,Selection/conservation,0.10642004175758424,0.15903168331278433
+EUR_300k,SAS,tau_star,Backgrd_Selection_Stat,Background selection,Selection/conservation,0.25683838272711507,0.018866367637513665
+EUR_300k,SAS,tau_star,CpG_Content_50kb,CpG content (50 kb),Selection/conservation,0.14440583926731124,0.131820691565478
+EUR_300k,SAS,tau_star,GTEx_eQTL_MaxCPP,GTEx eQTL MaxCPP,Molecular QTL,0.12627266204001167,0.014805021802259476
+EUR_300k,SAS,tau_star,BLUEPRINT_H3K27acQTL_MaxCPP,BLUEPRINT H3K27ac QTL,Molecular QTL,0.0039792146488787095,-0.00742259536313433
+EUR_300k,SAS,tau_star,BLUEPRINT_H3K4me1QTL_MaxCPP,BLUEPRINT H3K4me1 QTL,Molecular QTL,0.022127840469858533,-0.1310062210003258
+EUR_300k,SAS,tau_star,BLUEPRINT_DNA_methylation_MaxCPP,BLUEPRINT methylation QTL,Molecular QTL,-0.019081422182134714,0.01280466697623142
+EUR_300k,SAS,tau_star,synonymous,Synonymous,Coding/gene model,-0.08308089176834457,-0.26226167876897366
+EUR_300k,SAS,tau_star,non_synonymous,Nonsynonymous,Coding/gene model,-0.08278940345831816,-0.04558442972756613
+EUR_300k,SAS,tau_star,Conserved_Vertebrate_phastCons46way_w_flanking,phastCons vertebrate,Selection/conservation,-0.004938178812112985,0.1549793690366255
+EUR_300k,SAS,tau_star,Conserved_Mammal_phastCons46way_w_flanking,phastCons mammal,Selection/conservation,0.011075042970489307,-0.2102028621750284
+EUR_300k,SAS,tau_star,Conserved_Primate_phastCons46way_w_flanking,phastCons primate,Selection/conservation,0.14758383272439404,0.17570079938266298
+EUR_300k,SAS,tau_star,BivFlnk_w_flanking,BivFlnk + flank,Other,0.032817660888076625,0.009097366589600156
+EUR_300k,SAS,tau_star,Human_Promoter_Villar_w_flanking,Human promoter (Villar),Hujoel,0.014117740430005394,0.0034175187423562837
+EUR_300k,SAS,tau_star,Human_Enhancer_Villar_w_flanking,Human enhancer (Villar),Hujoel,-0.022908034821843237,0.10553165083015298
+EUR_300k,SAS,tau_star,Ancient_Sequence_Age_Human_Promoter_w_flanking,Ancient promoter age,Hujoel,0.15550570492082064,0.12349128718447434
+EUR_300k,SAS,tau_star,Ancient_Sequence_Age_Human_Enhancer_w_flanking,Ancient enhancer age,Hujoel,0.09118421082503281,-0.026755636513062148
+EUR_300k,SAS,tau_star,Human_Enhancer_Villar_Species_Enhancer_Count,Enhancer species count,Hujoel,0.046996772732134866,0.09550126352594601
+EUR_300k,SAS,tau_star,Human_Promoter_Villar_ExAC_w_flanking,LoF-intolerant promoter,Hujoel,0.04218749346864437,-0.0013230404481432503
+EUR_300k,SAS,log2_enrichment,Coding_UCSC_w_flanking,Coding,Coding/gene model,0.6759822208711426,1.2410113694354568
+EUR_300k,SAS,log2_enrichment,Conserved_LindbladToh_w_flanking,Conserved (LindbladToh),Selection/conservation,0.365287801736136,0.45159805226836597
+EUR_300k,SAS,log2_enrichment,CTCF_Hoffman_w_flanking,CTCF Hoffman + flank,Regulatory,0.21666424770312961,1.4423595414361756
+EUR_300k,SAS,log2_enrichment,DGF_ENCODE_w_flanking,DGF ENCODE + flank,Other,0.24507698478838155,0.29819020986810135
+EUR_300k,SAS,log2_enrichment,DHS_peaks_Trynka,DHS peaks,Regulatory,0.4866273024254528,0.905155251560544
+EUR_300k,SAS,log2_enrichment,DHS_Trynka_w_flanking,DHS + flank,Regulatory,0.22097954291988955,0.3803148549119712
+EUR_300k,SAS,log2_enrichment,Enhancer_Andersson_w_flanking,Enhancer Andersson + flank,Regulatory,0.5796783936772053,1.8517125766677962
+EUR_300k,SAS,log2_enrichment,Enhancer_Hoffman_w_flanking,Enhancer Hoffman + flank,Regulatory,0.7942305242508317,1.2326064512183457
+EUR_300k,SAS,log2_enrichment,FetalDHS_Trynka_w_flanking,FetalDHS Trynka + flank,Regulatory,0.35905405118196465,0.581378664790324
+EUR_300k,SAS,log2_enrichment,H3K27ac_Hnisz_w_flanking,H3K27ac Hnisz + flank,Regulatory,0.42590750954957113,0.4903978002100735
+EUR_300k,SAS,log2_enrichment,H3K27ac_PGC2_w_flanking,H3K27ac PGC2 + flank,Other,0.5344576974291066,0.6072985559548371
+EUR_300k,SAS,log2_enrichment,H3K4me1_peaks_Trynka,H3K4me1 peaks Trynka,Regulatory,0.5215273819283126,0.9646616960370438
+EUR_300k,SAS,log2_enrichment,H3K4me1_Trynka_w_flanking,H3K4me1 Trynka + flank,Regulatory,0.2686722866060376,0.304867677054393
+EUR_300k,SAS,log2_enrichment,H3K4me3_peaks_Trynka,H3K4me3 peaks Trynka,Regulatory,0.7548972973686815,1.6824259942448034
+EUR_300k,SAS,log2_enrichment,H3K4me3_Trynka_w_flanking,H3K4me3 Trynka + flank,Regulatory,0.4763979158194393,0.7776826532544915
+EUR_300k,SAS,log2_enrichment,H3K9ac_peaks_Trynka,H3K9ac peaks Trynka,Regulatory,1.041801637033337,1.9334685874003323
+EUR_300k,SAS,log2_enrichment,H3K9ac_Trynka_w_flanking,H3K9ac Trynka + flank,Regulatory,0.6596861122529553,0.9946892904296938
+EUR_300k,SAS,log2_enrichment,Intron_UCSC_w_flanking,Intron UCSC + flank,Coding/gene model,0.31706234788993937,0.39573649223558466
+EUR_300k,SAS,log2_enrichment,PromoterFlanking_Hoffman_w_flanking,Promoter flank,Coding/gene model,0.700188426973692,1.9641805146677742
+EUR_300k,SAS,log2_enrichment,Promoter_UCSC_w_flanking,Promoter,Coding/gene model,0.6651856393034059,1.4258163345641341
+EUR_300k,SAS,log2_enrichment,Repressed_Hoffman_w_flanking,Repressed Hoffman + flank,Other,-0.2022097716420608,0.03516888919440772
+EUR_300k,SAS,log2_enrichment,SuperEnhancer_Hnisz_w_flanking,SuperEnhancer Hnisz + flank,Regulatory,0.701439281912031,0.6998338124347948
+EUR_300k,SAS,log2_enrichment,TFBS_ENCODE_w_flanking,TFBS + flank,Regulatory,0.35110144537129184,0.5360320201021069
+EUR_300k,SAS,log2_enrichment,Transcr_Hoffman_w_flanking,Transcr Hoffman + flank,Other,0.03230704674954566,0.13461572850088607
+EUR_300k,SAS,log2_enrichment,TSS_Hoffman_w_flanking,TSS + flank,Coding/gene model,1.2736060415390862,2.1923568116555354
+EUR_300k,SAS,log2_enrichment,UTR_3_UCSC_w_flanking,UTR 3 UCSC + flank,Coding/gene model,0.8757070955238775,2.24349806173099
+EUR_300k,SAS,log2_enrichment,UTR_5_UCSC_w_flanking,UTR 5 UCSC + flank,Coding/gene model,0.9320045371350095,2.1043049458697944
+EUR_300k,SAS,log2_enrichment,WeakEnhancer_Hoffman_w_flanking,WeakEnhancer Hoffman + flank,Regulatory,0.48696724837527433,1.2886295009272537
+EUR_300k,SAS,log2_enrichment,GERP.NS,GERP.NS,Selection/conservation,0.2307594530243876,0.32007759329082686
+EUR_300k,SAS,log2_enrichment,GERP.RSsup4,GERP.RS>4,Selection/conservation,1.1398713541799654,2.1188689270066727
+EUR_300k,SAS,log2_enrichment,Backgrd_Selection_Stat,Background selection,Selection/conservation,0.421992464939035,0.34057591636309265
+EUR_300k,SAS,log2_enrichment,CpG_Content_50kb,CpG content (50 kb),Selection/conservation,0.19662265088861589,0.19249892421517423
+EUR_300k,SAS,log2_enrichment,GTEx_eQTL_MaxCPP,GTEx eQTL MaxCPP,Molecular QTL,1.9272802523239618,2.8797027187263087
+EUR_300k,SAS,log2_enrichment,BLUEPRINT_H3K27acQTL_MaxCPP,BLUEPRINT H3K27ac QTL,Molecular QTL,0.9714701897068798,1.7757469153729581
+EUR_300k,SAS,log2_enrichment,BLUEPRINT_H3K4me1QTL_MaxCPP,BLUEPRINT H3K4me1 QTL,Molecular QTL,1.1310177211904149,2.1121809116095056
+EUR_300k,SAS,log2_enrichment,BLUEPRINT_DNA_methylation_MaxCPP,BLUEPRINT methylation QTL,Molecular QTL,0.8292484900945863,1.215844900556359
+EUR_300k,SAS,log2_enrichment,synonymous,Synonymous,Coding/gene model,0.4979659930387919,2.364414915421174
+EUR_300k,SAS,log2_enrichment,non_synonymous,Nonsynonymous,Coding/gene model,0.7594918036204458,2.0085434504633723
+EUR_300k,SAS,log2_enrichment,Conserved_Vertebrate_phastCons46way_w_flanking,phastCons vertebrate,Selection/conservation,0.3190942495320484,0.4922566186624211
+EUR_300k,SAS,log2_enrichment,Conserved_Mammal_phastCons46way_w_flanking,phastCons mammal,Selection/conservation,0.3694782809892507,0.5521831296246686
+EUR_300k,SAS,log2_enrichment,Conserved_Primate_phastCons46way_w_flanking,phastCons primate,Selection/conservation,0.5948202787425183,0.8779400122885346
+EUR_300k,SAS,log2_enrichment,BivFlnk_w_flanking,BivFlnk + flank,Other,1.0339525827561251,1.86723688027592
+EUR_300k,SAS,log2_enrichment,Human_Promoter_Villar_w_flanking,Human promoter (Villar),Hujoel,1.5690234864801864,2.4632087947368135
+EUR_300k,SAS,log2_enrichment,Human_Enhancer_Villar_w_flanking,Human enhancer (Villar),Hujoel,1.1260185792173802,2.1031949496694358
+EUR_300k,SAS,log2_enrichment,Ancient_Sequence_Age_Human_Promoter_w_flanking,Ancient promoter age,Hujoel,1.8615362464428287,2.961207662758382
+EUR_300k,SAS,log2_enrichment,Ancient_Sequence_Age_Human_Enhancer_w_flanking,Ancient enhancer age,Hujoel,1.44717829904281,2.290007159055421
+EUR_300k,SAS,log2_enrichment,Human_Enhancer_Villar_Species_Enhancer_Count,Enhancer species count,Hujoel,1.6658848493567786,2.6468916434940084
+EUR_300k,SAS,log2_enrichment,Human_Promoter_Villar_ExAC_w_flanking,LoF-intolerant promoter,Hujoel,1.898274853198713,3.532812961012175
+EUR_300k,AFR,tau_star,Coding_UCSC_w_flanking,Coding,Coding/gene model,-0.21545321042159643,-0.46098405522145836
+EUR_300k,AFR,tau_star,Conserved_LindbladToh_w_flanking,Conserved (LindbladToh),Selection/conservation,-0.014331152099344598,0.42163126788152705
+EUR_300k,AFR,tau_star,CTCF_Hoffman_w_flanking,CTCF Hoffman + flank,Regulatory,-0.03153459936056023,0.2389756366189099
+EUR_300k,AFR,tau_star,DGF_ENCODE_w_flanking,DGF ENCODE + flank,Other,0.002176518282400085,-0.5397068230069677
+EUR_300k,AFR,tau_star,DHS_peaks_Trynka,DHS peaks,Regulatory,0.012520164601140398,0.05684010251006217
+EUR_300k,AFR,tau_star,DHS_Trynka_w_flanking,DHS + flank,Regulatory,-0.03918491560588045,0.2906310004152029
+EUR_300k,AFR,tau_star,Enhancer_Andersson_w_flanking,Enhancer Andersson + flank,Regulatory,-0.04298157857814138,0.29789185555921677
+EUR_300k,AFR,tau_star,Enhancer_Hoffman_w_flanking,Enhancer Hoffman + flank,Regulatory,-0.01483953880716751,0.6687619528361822
+EUR_300k,AFR,tau_star,FetalDHS_Trynka_w_flanking,FetalDHS Trynka + flank,Regulatory,-0.008037184552450435,-0.6514561392871291
+EUR_300k,AFR,tau_star,H3K27ac_Hnisz_w_flanking,H3K27ac Hnisz + flank,Regulatory,0.04337280612595426,0.04386770094663321
+EUR_300k,AFR,tau_star,H3K27ac_PGC2_w_flanking,H3K27ac PGC2 + flank,Other,0.01808868593680797,0.04121507856206978
+EUR_300k,AFR,tau_star,H3K4me1_peaks_Trynka,H3K4me1 peaks Trynka,Regulatory,-0.005537707392452969,0.46646321046135397
+EUR_300k,AFR,tau_star,H3K4me1_Trynka_w_flanking,H3K4me1 Trynka + flank,Regulatory,0.06127017118295116,-0.2402148021940988
+EUR_300k,AFR,tau_star,H3K4me3_peaks_Trynka,H3K4me3 peaks Trynka,Regulatory,-0.05102211590887055,-0.11569927634283643
+EUR_300k,AFR,tau_star,H3K4me3_Trynka_w_flanking,H3K4me3 Trynka + flank,Regulatory,0.006903877943294775,0.15433611742480835
+EUR_300k,AFR,tau_star,H3K9ac_peaks_Trynka,H3K9ac peaks Trynka,Regulatory,0.04315888814312901,0.714997018060414
+EUR_300k,AFR,tau_star,H3K9ac_Trynka_w_flanking,H3K9ac Trynka + flank,Regulatory,0.049467333516301636,-0.2140817876394945
+EUR_300k,AFR,tau_star,Intron_UCSC_w_flanking,Intron UCSC + flank,Coding/gene model,0.00041177281596649183,0.08555967044642475
+EUR_300k,AFR,tau_star,PromoterFlanking_Hoffman_w_flanking,Promoter flank,Coding/gene model,-0.03759104046807503,-0.5536542118991978
+EUR_300k,AFR,tau_star,Promoter_UCSC_w_flanking,Promoter,Coding/gene model,-0.14749706649780295,0.30293602369308636
+EUR_300k,AFR,tau_star,Repressed_Hoffman_w_flanking,Repressed Hoffman + flank,Other,-0.06569070880189856,-0.15895037430153236
+EUR_300k,AFR,tau_star,SuperEnhancer_Hnisz_w_flanking,SuperEnhancer Hnisz + flank,Regulatory,0.05514916658907522,-0.1268750821492586
+EUR_300k,AFR,tau_star,TFBS_ENCODE_w_flanking,TFBS + flank,Regulatory,0.014397819388714851,-0.04609732997480153
+EUR_300k,AFR,tau_star,Transcr_Hoffman_w_flanking,Transcr Hoffman + flank,Other,0.036353840481429776,-0.24230317113622976
+EUR_300k,AFR,tau_star,TSS_Hoffman_w_flanking,TSS + flank,Coding/gene model,0.010208509548703497,-0.4711560389333096
+EUR_300k,AFR,tau_star,UTR_3_UCSC_w_flanking,UTR 3 UCSC + flank,Coding/gene model,0.07842902748246816,0.20622978798151217
+EUR_300k,AFR,tau_star,UTR_5_UCSC_w_flanking,UTR 5 UCSC + flank,Coding/gene model,0.06570077908253216,-1.9181076162322264e-18
+EUR_300k,AFR,tau_star,WeakEnhancer_Hoffman_w_flanking,WeakEnhancer Hoffman + flank,Regulatory,-0.016550226741161113,0.08725450414140062
+EUR_300k,AFR,tau_star,GERP.NS,GERP.NS,Selection/conservation,0.17842727131882694,0.2892208006381248
+EUR_300k,AFR,tau_star,GERP.RSsup4,GERP.RS>4,Selection/conservation,0.10642004175758424,-0.017635834160359746
+EUR_300k,AFR,tau_star,Backgrd_Selection_Stat,Background selection,Selection/conservation,0.25683838272711507,-0.1563387110855645
+EUR_300k,AFR,tau_star,CpG_Content_50kb,CpG content (50 kb),Selection/conservation,0.14440583926731124,0.40902107185181896
+EUR_300k,AFR,tau_star,GTEx_eQTL_MaxCPP,GTEx eQTL MaxCPP,Molecular QTL,0.12627266204001167,0.23330618472570214
+EUR_300k,AFR,tau_star,BLUEPRINT_H3K27acQTL_MaxCPP,BLUEPRINT H3K27ac QTL,Molecular QTL,0.0039792146488787095,-0.039593789508067356
+EUR_300k,AFR,tau_star,BLUEPRINT_H3K4me1QTL_MaxCPP,BLUEPRINT H3K4me1 QTL,Molecular QTL,0.022127840469858533,-0.2309474851226811
+EUR_300k,AFR,tau_star,BLUEPRINT_DNA_methylation_MaxCPP,BLUEPRINT methylation QTL,Molecular QTL,-0.019081422182134714,-0.12731259256296648
+EUR_300k,AFR,tau_star,synonymous,Synonymous,Coding/gene model,-0.08308089176834457,-0.09429193832725483
+EUR_300k,AFR,tau_star,non_synonymous,Nonsynonymous,Coding/gene model,-0.08278940345831816,-0.08562311638415623
+EUR_300k,AFR,tau_star,Conserved_Vertebrate_phastCons46way_w_flanking,phastCons vertebrate,Selection/conservation,-0.004938178812112985,0.24030633204178328
+EUR_300k,AFR,tau_star,Conserved_Mammal_phastCons46way_w_flanking,phastCons mammal,Selection/conservation,0.011075042970489307,0.05966357679594662
+EUR_300k,AFR,tau_star,Conserved_Primate_phastCons46way_w_flanking,phastCons primate,Selection/conservation,0.14758383272439404,-0.1993212566204333
+EUR_300k,AFR,tau_star,BivFlnk_w_flanking,BivFlnk + flank,Other,0.032817660888076625,-0.09460391240526748
+EUR_300k,AFR,tau_star,Human_Promoter_Villar_w_flanking,Human promoter (Villar),Hujoel,0.014117740430005394,0.12478519327694305
+EUR_300k,AFR,tau_star,Human_Enhancer_Villar_w_flanking,Human enhancer (Villar),Hujoel,-0.022908034821843237,0.004900816807546375
+EUR_300k,AFR,tau_star,Ancient_Sequence_Age_Human_Promoter_w_flanking,Ancient promoter age,Hujoel,0.15550570492082064,0.054257904938793865
+EUR_300k,AFR,tau_star,Ancient_Sequence_Age_Human_Enhancer_w_flanking,Ancient enhancer age,Hujoel,0.09118421082503281,-0.03042304702085987
+EUR_300k,AFR,tau_star,Human_Enhancer_Villar_Species_Enhancer_Count,Enhancer species count,Hujoel,0.046996772732134866,0.02059751449093704
+EUR_300k,AFR,tau_star,Human_Promoter_Villar_ExAC_w_flanking,LoF-intolerant promoter,Hujoel,0.04218749346864437,-0.3273511323808357
+EUR_300k,AFR,log2_enrichment,Coding_UCSC_w_flanking,Coding,Coding/gene model,0.6759822208711426,2.6072110685889327
+EUR_300k,AFR,log2_enrichment,Conserved_LindbladToh_w_flanking,Conserved (LindbladToh),Selection/conservation,0.365287801736136,1.1710752035435024
+EUR_300k,AFR,log2_enrichment,CTCF_Hoffman_w_flanking,CTCF Hoffman + flank,Regulatory,0.21666424770312961,2.3112642659062312
+EUR_300k,AFR,log2_enrichment,DGF_ENCODE_w_flanking,DGF ENCODE + flank,Other,0.24507698478838155,0.8142553272934485
+EUR_300k,AFR,log2_enrichment,DHS_peaks_Trynka,DHS peaks,Regulatory,0.4866273024254528,2.111904125009488
+EUR_300k,AFR,log2_enrichment,DHS_Trynka_w_flanking,DHS + flank,Regulatory,0.22097954291988955,0.8678357064069024
+EUR_300k,AFR,log2_enrichment,Enhancer_Andersson_w_flanking,Enhancer Andersson + flank,Regulatory,0.5796783936772053,3.313720683035768
+EUR_300k,AFR,log2_enrichment,Enhancer_Hoffman_w_flanking,Enhancer Hoffman + flank,Regulatory,0.7942305242508317,2.3941536389050446
+EUR_300k,AFR,log2_enrichment,FetalDHS_Trynka_w_flanking,FetalDHS Trynka + flank,Regulatory,0.35905405118196465,1.3740390286658182
+EUR_300k,AFR,log2_enrichment,H3K27ac_Hnisz_w_flanking,H3K27ac Hnisz + flank,Regulatory,0.42590750954957113,0.9239163479109678
+EUR_300k,AFR,log2_enrichment,H3K27ac_PGC2_w_flanking,H3K27ac PGC2 + flank,Other,0.5344576974291066,1.0422169237521404
+EUR_300k,AFR,log2_enrichment,H3K4me1_peaks_Trynka,H3K4me1 peaks Trynka,Regulatory,0.5215273819283126,1.9988854589757847
+EUR_300k,AFR,log2_enrichment,H3K4me1_Trynka_w_flanking,H3K4me1 Trynka + flank,Regulatory,0.2686722866060376,0.6654296348429225
+EUR_300k,AFR,log2_enrichment,H3K4me3_peaks_Trynka,H3K4me3 peaks Trynka,Regulatory,0.7548972973686815,3.1728871909522103
+EUR_300k,AFR,log2_enrichment,H3K4me3_Trynka_w_flanking,H3K4me3 Trynka + flank,Regulatory,0.4763979158194393,1.5066992675700428
+EUR_300k,AFR,log2_enrichment,H3K9ac_peaks_Trynka,H3K9ac peaks Trynka,Regulatory,1.041801637033337,3.0051460316077963
+EUR_300k,AFR,log2_enrichment,H3K9ac_Trynka_w_flanking,H3K9ac Trynka + flank,Regulatory,0.6596861122529553,1.3411514232661839
+EUR_300k,AFR,log2_enrichment,Intron_UCSC_w_flanking,Intron UCSC + flank,Coding/gene model,0.31706234788993937,0.5561213932955293
+EUR_300k,AFR,log2_enrichment,PromoterFlanking_Hoffman_w_flanking,Promoter flank,Coding/gene model,0.700188426973692,2.696558027272082
+EUR_300k,AFR,log2_enrichment,Promoter_UCSC_w_flanking,Promoter,Coding/gene model,0.6651856393034059,2.6006515152296505
+EUR_300k,AFR,log2_enrichment,Repressed_Hoffman_w_flanking,Repressed Hoffman + flank,Other,-0.2022097716420608,0.08232342045592447
+EUR_300k,AFR,log2_enrichment,SuperEnhancer_Hnisz_w_flanking,SuperEnhancer Hnisz + flank,Regulatory,0.701439281912031,1.4636263362259367
+EUR_300k,AFR,log2_enrichment,TFBS_ENCODE_w_flanking,TFBS + flank,Regulatory,0.35110144537129184,1.041129790218363
+EUR_300k,AFR,log2_enrichment,Transcr_Hoffman_w_flanking,Transcr Hoffman + flank,Other,0.03230704674954566,0.29854857919035555
+EUR_300k,AFR,log2_enrichment,TSS_Hoffman_w_flanking,TSS + flank,Coding/gene model,1.2736060415390862,3.46914838668676
+EUR_300k,AFR,log2_enrichment,UTR_3_UCSC_w_flanking,UTR 3 UCSC + flank,Coding/gene model,0.8757070955238775,2.848375511939323
+EUR_300k,AFR,log2_enrichment,UTR_5_UCSC_w_flanking,UTR 5 UCSC + flank,Coding/gene model,0.9320045371350095,2.511308219065506
+EUR_300k,AFR,log2_enrichment,WeakEnhancer_Hoffman_w_flanking,WeakEnhancer Hoffman + flank,Regulatory,0.48696724837527433,2.346803575236033
+EUR_300k,AFR,log2_enrichment,GERP.NS,GERP.NS,Selection/conservation,0.2307594530243876,0.4464749240634224
+EUR_300k,AFR,log2_enrichment,GERP.RSsup4,GERP.RS>4,Selection/conservation,1.1398713541799654,3.996643087925703
+EUR_300k,AFR,log2_enrichment,Backgrd_Selection_Stat,Background selection,Selection/conservation,0.421992464939035,0.24981101832014668
+EUR_300k,AFR,log2_enrichment,CpG_Content_50kb,CpG content (50 kb),Selection/conservation,0.19662265088861589,0.3258038099100836
+EUR_300k,AFR,log2_enrichment,GTEx_eQTL_MaxCPP,GTEx eQTL MaxCPP,Molecular QTL,1.9272802523239618,3.200322267144761
+EUR_300k,AFR,log2_enrichment,BLUEPRINT_H3K27acQTL_MaxCPP,BLUEPRINT H3K27ac QTL,Molecular QTL,0.9714701897068798,2.57081108590242
+EUR_300k,AFR,log2_enrichment,BLUEPRINT_H3K4me1QTL_MaxCPP,BLUEPRINT H3K4me1 QTL,Molecular QTL,1.1310177211904149,3.202525514818059
+EUR_300k,AFR,log2_enrichment,BLUEPRINT_DNA_methylation_MaxCPP,BLUEPRINT methylation QTL,Molecular QTL,0.8292484900945863,3.2752983017261754
+EUR_300k,AFR,log2_enrichment,synonymous,Synonymous,Coding/gene model,0.4979659930387919,4.358338018785356
+EUR_300k,AFR,log2_enrichment,non_synonymous,Nonsynonymous,Coding/gene model,0.7594918036204458,4.586259073229139
+EUR_300k,AFR,log2_enrichment,Conserved_Vertebrate_phastCons46way_w_flanking,phastCons vertebrate,Selection/conservation,0.3190942495320484,0.9953107631510373
+EUR_300k,AFR,log2_enrichment,Conserved_Mammal_phastCons46way_w_flanking,phastCons mammal,Selection/conservation,0.3694782809892507,1.1616407262552704
+EUR_300k,AFR,log2_enrichment,Conserved_Primate_phastCons46way_w_flanking,phastCons primate,Selection/conservation,0.5948202787425183,2.008195021263896
+EUR_300k,AFR,log2_enrichment,BivFlnk_w_flanking,BivFlnk + flank,Other,1.0339525827561251,3.4933425966432985
+EUR_300k,AFR,log2_enrichment,Human_Promoter_Villar_w_flanking,Human promoter (Villar),Hujoel,1.5690234864801864,3.3590630512783664
+EUR_300k,AFR,log2_enrichment,Human_Enhancer_Villar_w_flanking,Human enhancer (Villar),Hujoel,1.1260185792173802,2.729955041382351
+EUR_300k,AFR,log2_enrichment,Ancient_Sequence_Age_Human_Promoter_w_flanking,Ancient promoter age,Hujoel,1.8615362464428287,4.140955029780256
+EUR_300k,AFR,log2_enrichment,Ancient_Sequence_Age_Human_Enhancer_w_flanking,Ancient enhancer age,Hujoel,1.44717829904281,3.4138235613553407
+EUR_300k,AFR,log2_enrichment,Human_Enhancer_Villar_Species_Enhancer_Count,Enhancer species count,Hujoel,1.6658848493567786,3.1413200817557234
+EUR_300k,AFR,log2_enrichment,Human_Promoter_Villar_ExAC_w_flanking,LoF-intolerant promoter,Hujoel,1.898274853198713,4.695661308522246

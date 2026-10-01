@@ -1,0 +1,14 @@
+annotation,label,n_variants,n_maf_lt_0.01,frac_maf_lt_0.01
+Conserved_Primate_phastCons46way_w_flanking,Primate phastCons,1514182,616768,0.4073275207339673
+GTEx_eQTL_MaxCPP,GTEx eQTL MaxCPP,196790,119,0.0006047055236546573
+Ancient_Sequence_Age_Human_Promoter_w_flanking,Ancient promoter age,82859,35735,0.43127481625411845
+GERP.RSsup4,GERP.RSsup4,92760,45131,0.48653514445881846
+BLUEPRINT_DNA_methylation_MaxCPP,BLUEPRINT DNA methylation,636714,85,0.0001334979284262636
+non_synonymous,Non-synonymous,39783,22756,0.5720031169092326
+GERP.NS,GERP.NS,7102715,2713034,0.38197140107691213
+Backgrd_Selection_Stat,Background selection,7766974,2947510,0.37949270848595607
+CpG_Content_50kb,"CpG content, 50 kb",7774148,2949756,0.37943141807951175
+Coding_UCSC_w_flanking,Coding + flank,553064,231071,0.4178015564202335
+Promoter_UCSC_w_flanking,Promoter + flank,447929,180430,0.4028093738070096
+PromoterFlanking_Hoffman_w_flanking,Promoter-flanking,260873,103821,0.3979752599924101
+DHS_Trynka_w_flanking,DHS + flank,3939112,1524304,0.38696640258007386

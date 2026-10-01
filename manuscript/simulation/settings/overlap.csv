@@ -1,0 +1,4 @@
+scenario,pop,annot,annot_cols,add_base,annotation_model,out_prefix,sig1,sig2,rho_g,gamma_e,num_reps,seed,max_mem,architecture
+focal_h2_005,EUR,baseline.annot.gz,Ancient_Sequence_Age_Human_Promoter_w_flanking,1,overlap_additive,focal_heritability_005,"0.45,0.05","0.45,0.05","0,0",0.0,100,27601,0,gcta
+focal_h2_005,SAS,baseline.annot.gz,Ancient_Sequence_Age_Human_Promoter_w_flanking,1,overlap_additive,focal_heritability_005,"0.45,0.05","0.45,0.05","0,0",0.0,100,27601,0,gcta
+focal_h2_005,AFR,baseline.annot.gz,Ancient_Sequence_Age_Human_Promoter_w_flanking,1,overlap_additive,focal_heritability_005,"0.45,0.05","0.45,0.05","0,0",0.0,100,27601,0,gcta

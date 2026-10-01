@@ -1,0 +1,13 @@
+pop,annot,out_prefix,sig1,sig2,rho_g,gamma_e,num_reps,seed,max_mem
+AFR,maf_ld.tsv,signed_balanced_lowMAFpos_highMAFneg_rg0,0.03125,0.075,"0.6,0.6,0.6,0.6,-0.6,-0.6,-0.6,-0.6",0.0,100,4242,1
+AFR,maf_ld.tsv,signed_lowMAFpos80_highMAFneg20_rg03,0.03125,0.075,"0.8,0.8,0.8,0.8,-0.2,-0.2,-0.2,-0.2",0.0,100,4242,1
+AFR,maf_ld.tsv,signed_lowMAFneg20_highMAFpos80_rg03,0.03125,0.075,"-0.2,-0.2,-0.2,-0.2,0.8,0.8,0.8,0.8",0.0,100,4242,1
+EUR,maf_ld.tsv,signed_balanced_lowMAFpos_highMAFneg_rg0,0.03125,0.075,"0.6,0.6,0.6,0.6,-0.6,-0.6,-0.6,-0.6",0.0,100,4242,1
+EUR,maf_ld.tsv,signed_lowMAFpos80_highMAFneg20_rg03,0.03125,0.075,"0.8,0.8,0.8,0.8,-0.2,-0.2,-0.2,-0.2",0.0,100,4242,1
+EUR,maf_ld.tsv,signed_lowMAFneg20_highMAFpos80_rg03,0.03125,0.075,"-0.2,-0.2,-0.2,-0.2,0.8,0.8,0.8,0.8",0.0,100,4242,1
+EUR_300k,maf_ld.tsv,signed_balanced_lowMAFpos_highMAFneg_rg0,0.03125,0.075,"0.6,0.6,0.6,0.6,-0.6,-0.6,-0.6,-0.6",0.0,100,4242,1
+EUR_300k,maf_ld.tsv,signed_lowMAFpos80_highMAFneg20_rg03,0.03125,0.075,"0.8,0.8,0.8,0.8,-0.2,-0.2,-0.2,-0.2",0.0,100,4242,1
+EUR_300k,maf_ld.tsv,signed_lowMAFneg20_highMAFpos80_rg03,0.03125,0.075,"-0.2,-0.2,-0.2,-0.2,0.8,0.8,0.8,0.8",0.0,100,4242,1
+SAS,maf_ld.tsv,signed_balanced_lowMAFpos_highMAFneg_rg0,0.03125,0.075,"0.6,0.6,0.6,0.6,-0.6,-0.6,-0.6,-0.6",0.0,100,4242,1
+SAS,maf_ld.tsv,signed_lowMAFpos80_highMAFneg20_rg03,0.03125,0.075,"0.8,0.8,0.8,0.8,-0.2,-0.2,-0.2,-0.2",0.0,100,4242,1
+SAS,maf_ld.tsv,signed_lowMAFneg20_highMAFpos80_rg03,0.03125,0.075,"-0.2,-0.2,-0.2,-0.2,0.8,0.8,0.8,0.8",0.0,100,4242,1

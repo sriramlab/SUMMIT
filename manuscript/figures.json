@@ -1,0 +1,968 @@
+{
+  "1": {
+    "figure": "1",
+    "label": "fig:maintext_fig1",
+    "output": "figs/main/fig01_ld_and_h2_benchmarks.png",
+    "script": "scripts/figure1/render.py",
+    "args": [],
+    "inputs": [
+      "data/sim_h2/figure1/panel_a_source.tsv",
+      "data/sim_h2/figure1/panel_b_source.tsv",
+      "data/sim_h2/figure1/panel_c_relmse_summary.tsv",
+      "data/sim_h2/figure1/panel_d_bias_source.tsv"
+    ],
+    "extra_outputs": [
+      "figs/main/fig01_ld_and_h2_benchmarks.pdf"
+    ]
+  },
+  "2": {
+    "figure": "2",
+    "label": "fig:maintext_fig2",
+    "output": "figs/main/fig02_enrichment_benchmarks.png",
+    "script": "scripts/figure2/render.py",
+    "args": [],
+    "inputs": [
+      "data/sim_h2/figure2/calibration.tsv",
+      "data/sim_h2/figure2/overlap_curves.tsv",
+      "data/sim_h2/figure2/discrimination.tsv"
+    ],
+    "extra_outputs": [
+      "figs/main/fig02_enrichment_benchmarks.pdf"
+    ]
+  },
+  "3": {
+    "figure": "3",
+    "label": "fig:maintext_fig3",
+    "output": "figs/main/fig03_genetic_correlation_benchmarks.png",
+    "script": "scripts/figure3/render.py",
+    "args": [],
+    "inputs": [
+      "data/sim_rg/figure3/calibration.tsv",
+      "data/sim_rg/figure3/normalization.tsv",
+      "data/sim_rg/figure3/panelB.tsv",
+      "data/sim_rg/figure3/panelC.tsv"
+    ],
+    "extra_outputs": []
+  },
+  "4": {
+    "figure": "4",
+    "label": "fig:real_mafld_totalh2_tripanel",
+    "output": "figs/main/fig04_real_trait_heritability.png",
+    "script": "scripts/real_h2/figure4.py",
+    "args": [
+      "--outs-base",
+      "data/real_h2",
+      "--outfile",
+      "figs/main/fig04_real_trait_heritability.pdf"
+    ],
+    "inputs": [
+      "data/real_h2/EUR_300k/estimates.csv",
+      "data/real_h2/EUR/estimates.csv",
+      "data/real_h2/SAS/estimates.csv",
+      "data/real_h2/AFR/estimates.csv",
+      "data/traits/trait_categories.tsv",
+      "data/traits/population_comparison_traits.txt",
+      "data/traits/traits.txt",
+      "data/traits/wgs_heritability.csv"
+    ],
+    "extra_outputs": [
+      "figs/main/fig04_real_trait_heritability.pdf"
+    ]
+  },
+  "5": {
+    "figure": "5",
+    "label": "fig:real_baseline_h2",
+    "output": "figs/main/fig05_baseline_enrichment.png",
+    "script": "scripts/baseline/render.py",
+    "args": [
+      "--figure",
+      "5",
+      "--outfile",
+      "figs/main/fig05_baseline_enrichment.png"
+    ],
+    "inputs": [
+      "data/baseline/figure5/panelA_pairwise_portability.csv",
+      "data/baseline/figure5/ratio_meta.csv"
+    ],
+    "extra_outputs": [
+      "figs/main/fig05_baseline_enrichment.pdf"
+    ]
+  },
+  "6": {
+    "figure": "6",
+    "label": "fig:real_mafld_rg_heatmap_main",
+    "output": "figs/main/fig06_genetic_correlation_heatmaps.png",
+    "script": "scripts/real_rg/render_heatmap.py",
+    "args": [
+      "--outfile",
+      "figs/main/fig06_genetic_correlation_heatmaps.png",
+      "--csv",
+      "data/real_rg/estimates.csv",
+      "--phen-list",
+      "data/traits/population_comparison_traits.txt",
+      "--annot",
+      "mafld_8bins",
+      "--threshold",
+      "fdr",
+      "--panel"
+    ],
+    "inputs": [
+      "data/real_rg/estimates.csv",
+      "data/traits/population_comparison_traits.txt"
+    ],
+    "extra_outputs": []
+  },
+  "7": {
+    "figure": "7",
+    "label": "fig:real_mafld_rg_main_fdr",
+    "output": "figs/main/fig07_genetic_correlation_agreement.png",
+    "script": "scripts/real_rg/figure7.py",
+    "args": [],
+    "inputs": [
+      "data/real_rg/estimates.csv"
+    ],
+    "extra_outputs": [
+      "figs/main/fig07_genetic_correlation_agreement.pdf"
+    ]
+  },
+  "8": {
+    "figure": "8",
+    "label": "fig:real_external",
+    "output": "figs/main/fig08_external_enrichment.png",
+    "script": "scripts/external/figure8.py",
+    "args": [],
+    "inputs": [
+      "data/external/ld_components.tsv",
+      "data/external/reference_swap.tsv",
+      "data/external/enrichment_values.csv",
+      "data/external/enrichment_jackknife.tsv"
+    ],
+    "extra_outputs": [
+      "figs/main/fig08_external_enrichment.pdf"
+    ]
+  },
+  "S1": {
+    "figure": "S1",
+    "label": "fig:supp_maf_dist",
+    "output": "figs/supplementary/fig_s01_snp_sets.png",
+    "script": "scripts/qc/snp_overlap.py",
+    "args": [],
+    "inputs": [
+      "data/qc/snp_overlap.json"
+    ],
+    "extra_outputs": []
+  },
+  "S2": {
+    "figure": "S2",
+    "label": "fig:supp_mean_ldscores",
+    "output": "figs/supplementary/fig_s02_ld_scores.pdf",
+    "script": "scripts/ld/population_ld.py",
+    "args": [],
+    "inputs": [
+      "data/ld/summary_nocov.csv",
+      "data/ld/summary_pc.csv"
+    ],
+    "extra_outputs": []
+  },
+  "S3": {
+    "figure": "S3",
+    "label": "fig:supp_pc_sensitivity_ld",
+    "output": "figs/supplementary/fig_s03_pc_sensitivity_ld.png",
+    "script": "scripts/ld/pc_ld.py",
+    "args": [],
+    "inputs": [
+      "data/ld/pc_ld_summary.csv"
+    ],
+    "extra_outputs": [
+      "figs/supplementary/fig_s03_pc_sensitivity_ld.pdf"
+    ]
+  },
+  "S4": {
+    "figure": "S4",
+    "label": "fig:supp_pc_sensitivity_h2",
+    "output": "figs/supplementary/fig_s04_pc_sensitivity_h2.png",
+    "script": "scripts/ld/pc_h2.py",
+    "args": [
+      "--csv",
+      "data/ld/pc_sensitivity_h2.csv",
+      "--outfile",
+      "figs/supplementary/fig_s04_pc_sensitivity_h2.pdf"
+    ],
+    "inputs": [
+      "data/ld/pc_sensitivity_h2.csv"
+    ],
+    "extra_outputs": [
+      "figs/supplementary/fig_s04_pc_sensitivity_h2.pdf"
+    ]
+  },
+  "S5": {
+    "figure": "S5",
+    "label": "fig:sims_h2_window_sweep",
+    "output": "figs/supplementary/fig_s05_h2_window_sensitivity.pdf",
+    "script": "scripts/sim_h2/total_h2.py",
+    "args": [
+      "--plot-window"
+    ],
+    "inputs": [
+      "data/sim_h2/total/EUR/estimates.csv",
+      "data/sim_h2/total/SAS/estimates.csv",
+      "data/sim_h2/total/AFR/estimates.csv"
+    ],
+    "extra_outputs": [
+      "figs/supplementary/fig_s06_h2_metrics.csv",
+      "figs/supplementary/fig_s06_h2_simulations.pdf"
+    ]
+  },
+  "S6": {
+    "figure": "S6",
+    "label": "fig:sims_gw_full",
+    "output": "figs/supplementary/fig_s06_h2_simulations.pdf",
+    "script": "scripts/sim_h2/total_h2.py",
+    "args": [
+      "--plot-window"
+    ],
+    "inputs": [
+      "data/sim_h2/total/EUR/estimates.csv",
+      "data/sim_h2/total/SAS/estimates.csv",
+      "data/sim_h2/total/AFR/estimates.csv"
+    ],
+    "extra_outputs": [
+      "figs/supplementary/fig_s05_h2_window_sensitivity.pdf",
+      "figs/supplementary/fig_s06_h2_metrics.csv"
+    ]
+  },
+  "S7": {
+    "figure": "S7",
+    "label": "fig:sims_gw_eur300k",
+    "output": "figs/supplementary/fig_s07_h2_simulations_eur300k.pdf",
+    "script": "scripts/sim_h2/eur300k.py",
+    "args": [],
+    "inputs": [
+      "data/sim_h2/eur300k_h2.tsv"
+    ],
+    "extra_outputs": []
+  },
+  "S8": {
+    "figure": "S8",
+    "label": "fig:sims_gw_binary",
+    "output": "figs/supplementary/fig_s08_binary_h2_simulations.pdf",
+    "script": "scripts/sim_h2/binary_h2.py",
+    "args": [
+      "--methods",
+      "covsumrhe,covldsc"
+    ],
+    "inputs": [
+      "data/sim_h2/binary/EUR/estimates.csv",
+      "data/sim_h2/binary/SAS/estimates.csv",
+      "data/sim_h2/binary/AFR/estimates.csv"
+    ],
+    "extra_outputs": [
+      "figs/supplementary/fig_s08_binary_h2_metrics_liab.csv"
+    ]
+  },
+  "S9": {
+    "figure": "S9",
+    "label": "fig:supp_no_pc_residualization",
+    "output": "figs/supplementary/fig_s09_pc_adjustment.pdf",
+    "script": "scripts/sim_h2/no_pc.py",
+    "args": [],
+    "inputs": [
+      "data/sim_h2/no_pc_comparison.tsv"
+    ],
+    "extra_outputs": []
+  },
+  "S10": {
+    "figure": "S10",
+    "label": "fig:sims_cov_effects",
+    "output": "figs/supplementary/fig_s10_pc_stratified_simulations.pdf",
+    "script": "scripts/sim_h2/pc_stratified.py",
+    "args": [],
+    "inputs": [
+      "data/sim_h2/pc_stratified.tsv"
+    ],
+    "extra_outputs": [
+      "figs/supplementary/fig_s10_pc_stratified_simulations.png",
+      "figs/supplementary/fig_s10_pc_stratified_simulations_relmse.tsv"
+    ]
+  },
+  "S11": {
+    "figure": "S11",
+    "label": "fig:supp_missing_snp_sensitivity",
+    "output": "figs/supplementary/fig_s11_missing_snp_sensitivity.png",
+    "script": "scripts/sim_h2/missing_snps.py",
+    "args": [],
+    "inputs": [
+      "data/sim_h2/missing_snp_summary.csv"
+    ],
+    "extra_outputs": [
+      "figs/supplementary/fig_s11_missing_snp_sensitivity.pdf"
+    ]
+  },
+  "S12": {
+    "figure": "S12",
+    "label": "fig:sims_mafld_totalh2_mse",
+    "output": "figs/supplementary/fig_s12_mafld_h2_mse.pdf",
+    "script": "scripts/sim_h2/render_mafld.py",
+    "args": [
+      "--outs-root",
+      "data/sim_h2/mafld"
+    ],
+    "inputs": [
+      "data/sim_h2/mafld/EUR/estimates.csv",
+      "data/sim_h2/mafld/SAS/estimates.csv",
+      "data/sim_h2/mafld/AFR/estimates.csv"
+    ],
+    "extra_outputs": [
+      "figs/supplementary/fig_s13_mafld_h2_error.pdf"
+    ]
+  },
+  "S13": {
+    "figure": "S13",
+    "label": "fig:sims_mafld_totalh2_err",
+    "output": "figs/supplementary/fig_s13_mafld_h2_error.pdf",
+    "script": "scripts/sim_h2/render_mafld.py",
+    "args": [
+      "--outs-root",
+      "data/sim_h2/mafld"
+    ],
+    "inputs": [
+      "data/sim_h2/mafld/EUR/estimates.csv",
+      "data/sim_h2/mafld/SAS/estimates.csv",
+      "data/sim_h2/mafld/AFR/estimates.csv"
+    ],
+    "extra_outputs": [
+      "figs/supplementary/fig_s12_mafld_h2_mse.pdf"
+    ]
+  },
+  "S14": {
+    "figure": "S14",
+    "label": "fig:sims_coding",
+    "output": "figs/supplementary/fig_s14_coding_power.pdf",
+    "script": "scripts/sim_h2/render_coding_curves.py",
+    "args": [
+      "--main-text"
+    ],
+    "inputs": [
+      "data/sim_h2/coding/EUR/estimates.csv",
+      "data/sim_h2/coding_null/EUR/estimates.csv",
+      "data/sim_h2/coding/SAS/estimates.csv",
+      "data/sim_h2/coding_null/SAS/estimates.csv",
+      "data/sim_h2/coding/AFR/estimates.csv",
+      "data/sim_h2/coding_null/AFR/estimates.csv",
+      "data/sim_h2/coding_curves.json"
+    ],
+    "extra_outputs": [],
+    "prepare": {
+      "script": "scripts/sim_h2/prepare_coding_curves.py",
+      "args": [],
+      "output": "data/sim_h2/coding_curves.json"
+    }
+  },
+  "S15": {
+    "figure": "S15",
+    "label": "fig:sims_coding_calib",
+    "output": "figs/supplementary/fig_s15_coding_calibration.png",
+    "script": "scripts/sim_h2/coding_calibration.py",
+    "args": [],
+    "inputs": [
+      "data/sim_h2/coding_null/EUR/estimates.csv",
+      "data/sim_h2/coding_null/SAS/estimates.csv",
+      "data/sim_h2/coding_null/AFR/estimates.csv",
+      "data/sim_h2/coding_calibration.tsv"
+    ],
+    "extra_outputs": [],
+    "prepare": {
+      "script": "scripts/sim_h2/prepare_coding_calibration.py",
+      "args": [],
+      "output": "data/sim_h2/coding_calibration.tsv"
+    }
+  },
+  "S16": {
+    "figure": "S16",
+    "label": "fig:sims_mafld_rg_part_err",
+    "output": "figs/supplementary/fig_s16_partitioned_rg_error.pdf",
+    "script": "scripts/sim_rg/render_partitioned.py",
+    "args": [
+      "--figure",
+      "S16",
+      "--outfile",
+      "figs/supplementary/fig_s16_partitioned_rg_error.pdf"
+    ],
+    "inputs": [
+      "data/sim_rg/partitioned/EUR_300k/estimates.csv",
+      "data/sim_rg/partitioned/EUR/estimates.csv",
+      "data/sim_rg/partitioned/SAS/estimates.csv",
+      "data/sim_rg/partitioned/AFR/estimates.csv",
+      "data/sim_rg/partitioned/truth.csv"
+    ],
+    "extra_outputs": []
+  },
+  "S17": {
+    "figure": "S17",
+    "label": "fig:sims_mafld_rg_total_err",
+    "output": "figs/supplementary/fig_s17_total_rg_error.pdf",
+    "script": "scripts/sim_rg/render_partitioned.py",
+    "args": [
+      "--figure",
+      "S17",
+      "--outfile",
+      "figs/supplementary/fig_s17_total_rg_error.pdf"
+    ],
+    "inputs": [
+      "data/sim_rg/partitioned/EUR_300k/estimates.csv",
+      "data/sim_rg/partitioned/EUR/estimates.csv",
+      "data/sim_rg/partitioned/SAS/estimates.csv",
+      "data/sim_rg/partitioned/AFR/estimates.csv",
+      "data/sim_rg/partitioned/truth.csv"
+    ],
+    "extra_outputs": []
+  },
+  "S18": {
+    "figure": "S18",
+    "label": "fig:real_mafld_genarch_rg_slope",
+    "output": "figs/supplementary/fig_s18_rg_architecture_differences.png",
+    "script": "scripts/real_rg/gradient.py",
+    "args": [
+      "--run-dir",
+      "data/real_rg/gradient",
+      "--csv",
+      "data/real_rg/gradient/parsed.csv",
+      "--outpath",
+      "figs/supplementary/fig_s18_rg_architecture_differences.pdf",
+      "--error-bars",
+      "se"
+    ],
+    "inputs": [
+      "data/real_rg/gradient/pair_summary.csv",
+      "data/real_rg/gradient/pair_hits_directional_nominal.csv",
+      "data/real_rg/gradient/parsed.csv"
+    ],
+    "extra_outputs": [
+      "figs/supplementary/fig_s18_rg_architecture_differences.pdf",
+      "figs/supplementary/fig_s18_rg_architecture_differences_source_data.csv"
+    ]
+  },
+  "S19": {
+    "figure": "S19",
+    "label": "fig:supp_sumcore_modes",
+    "output": "figs/supplementary/fig_s19_sumcore_overlap_modes.png",
+    "script": "scripts/sim_rg/overlap_modes.py",
+    "args": [],
+    "inputs": [
+      "data/sim_rg/total/EUR_300k/estimates.csv",
+      "data/sim_rg/total/EUR/estimates.csv",
+      "data/sim_rg/total/SAS/estimates.csv",
+      "data/sim_rg/total/AFR/estimates.csv"
+    ],
+    "extra_outputs": [
+      "figs/supplementary/fig_s19_sumcore_overlap_modes.pdf",
+      "figs/supplementary/fig_s19_sumcore_overlap_modes__metrics.csv",
+      "figs/supplementary/fig_s19_sumcore_overlap_modes__source_data.csv"
+    ]
+  },
+  "S20": {
+    "figure": "S20",
+    "label": "fig:supp_numvec_sensitivity_ld",
+    "output": "figs/supplementary/fig_s20_ld_projection_error.png",
+    "script": "scripts/ld/numvec_error.py",
+    "args": [],
+    "inputs": [
+      "data/ld/numvec_error.csv"
+    ],
+    "extra_outputs": [
+      "figs/supplementary/fig_s20_ld_projection_error.pdf"
+    ]
+  },
+  "S21": {
+    "figure": "S21",
+    "label": "fig:supp_numvec_sensitivity_hist",
+    "output": "figs/supplementary/fig_s21_ld_projection_distributions.png",
+    "script": "scripts/ld/numvec_histogram.py",
+    "args": [],
+    "inputs": [
+      "data/ld/numvec_histogram.csv"
+    ],
+    "extra_outputs": [
+      "figs/supplementary/fig_s21_ld_projection_distributions.pdf"
+    ]
+  },
+  "S22": {
+    "figure": "S22",
+    "label": "fig:supp_numvec_sensitivity_h2",
+    "output": "figs/supplementary/fig_s22_h2_projection_sensitivity.png",
+    "script": "scripts/ld/numvec_h2.py",
+    "args": [],
+    "inputs": [
+      "data/ld/numvec_h2.csv"
+    ],
+    "extra_outputs": [
+      "figs/supplementary/fig_s22_h2_projection_sensitivity.pdf"
+    ]
+  },
+  "S23": {
+    "figure": "S23",
+    "label": "fig:supp_runtime_scaling",
+    "output": "figs/supplementary/fig_s23_runtime_scaling.png",
+    "script": "scripts/ld/runtime_scaling.py",
+    "args": [],
+    "inputs": [
+      "data/ld/runtime_scaling.csv"
+    ],
+    "extra_outputs": []
+  },
+  "S24": {
+    "figure": "S24",
+    "label": "fig:real_mafld_totalh2_24bins_all40",
+    "output": "figs/supplementary/fig_s24_real_h2_24bins.pdf",
+    "script": "scripts/real_h2/total_h2.py",
+    "args": [
+      "--outs-base",
+      "data/real_h2",
+      "--phen-list",
+      "data/traits/trait_categories.tsv",
+      "--bins",
+      "24",
+      "--phen-order-bins",
+      "24",
+      "--outfile",
+      "figs/supplementary/fig_s24_real_h2_24bins.pdf"
+    ],
+    "inputs": [
+      "data/real_h2/EUR_300k/estimates.csv",
+      "data/real_h2/EUR/estimates.csv",
+      "data/real_h2/SAS/estimates.csv",
+      "data/real_h2/AFR/estimates.csv",
+      "data/traits/trait_categories.tsv",
+      "data/traits/population_comparison_traits.txt",
+      "data/traits/traits.txt"
+    ],
+    "extra_outputs": []
+  },
+  "S25": {
+    "figure": "S25",
+    "label": "fig:real_mafld_totalh2_8bins_all40",
+    "output": "figs/supplementary/fig_s25_real_h2_8bins.pdf",
+    "script": "scripts/real_h2/total_h2.py",
+    "args": [
+      "--outs-base",
+      "data/real_h2",
+      "--phen-list",
+      "data/traits/trait_categories.tsv",
+      "--bins",
+      "8",
+      "--phen-order-bins",
+      "24",
+      "--outfile",
+      "figs/supplementary/fig_s25_real_h2_8bins.pdf"
+    ],
+    "inputs": [
+      "data/real_h2/EUR_300k/estimates.csv",
+      "data/real_h2/EUR/estimates.csv",
+      "data/real_h2/SAS/estimates.csv",
+      "data/real_h2/AFR/estimates.csv",
+      "data/traits/trait_categories.tsv",
+      "data/traits/population_comparison_traits.txt",
+      "data/traits/traits.txt"
+    ],
+    "extra_outputs": []
+  },
+  "S26": {
+    "figure": "S26",
+    "label": "fig:supp_mafld_totalh2_8v24",
+    "output": "figs/supplementary/fig_s26_real_h2_annotation_comparison.pdf",
+    "script": "scripts/real_h2/annotation_comparison.py",
+    "args": [
+      "--outs-base",
+      "data/real_h2",
+      "--outfile",
+      "figs/supplementary/fig_s26_real_h2_annotation_comparison.pdf",
+      "--separate-plots",
+      "--remove-stats"
+    ],
+    "inputs": [
+      "data/real_h2/EUR_300k/estimates.csv",
+      "data/real_h2/EUR/estimates.csv",
+      "data/real_h2/SAS/estimates.csv",
+      "data/real_h2/AFR/estimates.csv",
+      "data/traits/trait_categories.tsv",
+      "data/traits/population_comparison_traits.txt",
+      "data/traits/traits.txt"
+    ],
+    "extra_outputs": [
+      "figs/supplementary/fig_s26_real_h2_annotation_comparison_source_data.tsv"
+    ]
+  },
+  "S27": {
+    "figure": "S27",
+    "label": "fig:real_mafld_h2_diff_full",
+    "output": "figs/supplementary/fig_s27_heritability_population_differences.pdf",
+    "script": "scripts/real_h2/population_differences.py",
+    "args": [
+      "--outs-base",
+      "data/real_h2",
+      "--bins",
+      "8,24",
+      "--methods",
+      "covldsc,ldsc,sumher,sumher_ldak,sumrhe",
+      "--out-csv",
+      "figs/supplementary/fig_s27_tests.csv",
+      "--out-sig-csv",
+      "figs/supplementary/fig_s27_significant.csv",
+      "--out-fig",
+      "figs/supplementary/fig_s27_heritability_population_differences.pdf"
+    ],
+    "inputs": [
+      "data/real_h2/EUR_300k/estimates.csv",
+      "data/real_h2/EUR/estimates.csv",
+      "data/real_h2/SAS/estimates.csv",
+      "data/real_h2/AFR/estimates.csv",
+      "data/traits/trait_categories.tsv",
+      "data/traits/population_comparison_traits.txt",
+      "data/traits/traits.txt"
+    ],
+    "extra_outputs": [
+      "figs/supplementary/fig_s27_tests.csv",
+      "figs/supplementary/fig_s27_significant.csv"
+    ]
+  },
+  "S28": {
+    "figure": "S28",
+    "label": "fig:supp_real_baseline_h2_portability",
+    "output": "figs/supplementary/fig_s28_baseline_enrichment_portability.png",
+    "script": "scripts/baseline/render.py",
+    "args": [
+      "--figure",
+      "S28",
+      "--outfile",
+      "figs/supplementary/fig_s28_baseline_enrichment_portability.png"
+    ],
+    "inputs": [
+      "data/baseline/s28/panelA_pairwise_portability.csv",
+      "data/baseline/s28/trait_detail.csv",
+      "data/baseline/s28/annotation_pairs.csv",
+      "data/baseline/s28/annotation_summary.csv"
+    ],
+    "extra_outputs": [
+      "figs/supplementary/fig_s28_baseline_enrichment_portability.pdf"
+    ]
+  },
+  "S29": {
+    "figure": "S29",
+    "label": "fig:real_baseline_h2_tau",
+    "output": "figs/supplementary/fig_s29_baseline_tau.png",
+    "script": "scripts/baseline/tau_all_pops.py",
+    "args": [],
+    "inputs": [
+      "data/baseline/tau_all_pops.csv"
+    ],
+    "extra_outputs": [
+      "figs/supplementary/fig_s29_baseline_tau.pdf"
+    ]
+  },
+  "S30": {
+    "figure": "S30",
+    "label": "fig:real_baseline_gazal2017",
+    "output": "figs/supplementary/fig_s30_baseline_gazal_comparison.png",
+    "script": "scripts/external/gazal.py",
+    "args": [],
+    "inputs": [
+      "data/external/gazal_comparison.tsv"
+    ],
+    "extra_outputs": [
+      "figs/supplementary/fig_s30_baseline_gazal_comparison.pdf"
+    ]
+  },
+  "S31": {
+    "figure": "S31",
+    "label": "fig:imp_vs_array_fig1",
+    "output": "figs/supplementary/fig_s31_array_imputed_h2.png",
+    "script": "scripts/array_imputed/render.py",
+    "args": [
+      "--figure",
+      "S31",
+      "--outfile",
+      "figs/supplementary/fig_s31_array_imputed_h2.png"
+    ],
+    "inputs": [
+      "data/array_imputed/total_heritability.csv",
+      "data/array_imputed/annotation_comparison.csv",
+      "data/array_imputed/annotation_variant_counts.csv",
+      "data/array_imputed/variant_count_summary.csv"
+    ],
+    "extra_outputs": [
+      "figs/supplementary/fig_s31_array_imputed_h2.pdf"
+    ]
+  },
+  "S32": {
+    "figure": "S32",
+    "label": "fig:imp_vs_array_fig2",
+    "output": "figs/supplementary/fig_s32_array_imputed_enrichment.png",
+    "script": "scripts/array_imputed/render.py",
+    "args": [
+      "--figure",
+      "S32",
+      "--outfile",
+      "figs/supplementary/fig_s32_array_imputed_enrichment.png"
+    ],
+    "inputs": [
+      "data/array_imputed/total_heritability.csv",
+      "data/array_imputed/annotation_comparison.csv",
+      "data/array_imputed/annotation_variant_counts.csv",
+      "data/array_imputed/variant_count_summary.csv"
+    ],
+    "extra_outputs": [
+      "figs/supplementary/fig_s32_array_imputed_enrichment.pdf"
+    ]
+  },
+  "S33": {
+    "figure": "S33",
+    "label": "fig:real_mafld_rg_heatmap_all40_eur_300k",
+    "output": "figs/supplementary/fig_s33_rg_heatmap_eur300k.png",
+    "script": "scripts/real_rg/render_heatmap.py",
+    "args": [
+      "--outfile",
+      "figs/supplementary/fig_s33_rg_heatmap_eur300k.png",
+      "--csv",
+      "data/real_rg/estimates.csv",
+      "--phen-list",
+      "data/traits/trait_categories.tsv",
+      "--annot",
+      "mafld_8bins",
+      "--threshold",
+      "fdr",
+      "--pops",
+      "EUR_300k"
+    ],
+    "inputs": [
+      "data/real_rg/estimates.csv",
+      "data/traits/trait_categories.tsv"
+    ],
+    "extra_outputs": []
+  },
+  "S34": {
+    "figure": "S34",
+    "label": "fig:real_mafld_rg_heatmap_all40_eur",
+    "output": "figs/supplementary/fig_s34_rg_heatmap_eur.png",
+    "script": "scripts/real_rg/render_heatmap.py",
+    "args": [
+      "--outfile",
+      "figs/supplementary/fig_s34_rg_heatmap_eur.png",
+      "--csv",
+      "data/real_rg/estimates.csv",
+      "--phen-list",
+      "data/traits/trait_categories.tsv",
+      "--annot",
+      "mafld_8bins",
+      "--threshold",
+      "fdr",
+      "--pops",
+      "EUR"
+    ],
+    "inputs": [
+      "data/real_rg/estimates.csv",
+      "data/traits/trait_categories.tsv"
+    ],
+    "extra_outputs": []
+  },
+  "S35": {
+    "figure": "S35",
+    "label": "fig:real_mafld_rg_heatmap_all40_sas",
+    "output": "figs/supplementary/fig_s35_rg_heatmap_sas.png",
+    "script": "scripts/real_rg/render_heatmap.py",
+    "args": [
+      "--outfile",
+      "figs/supplementary/fig_s35_rg_heatmap_sas.png",
+      "--csv",
+      "data/real_rg/estimates.csv",
+      "--phen-list",
+      "data/traits/trait_categories.tsv",
+      "--annot",
+      "mafld_8bins",
+      "--threshold",
+      "fdr",
+      "--pops",
+      "SAS"
+    ],
+    "inputs": [
+      "data/real_rg/estimates.csv",
+      "data/traits/trait_categories.tsv"
+    ],
+    "extra_outputs": []
+  },
+  "S36": {
+    "figure": "S36",
+    "label": "fig:real_mafld_rg_heatmap_all40_afr",
+    "output": "figs/supplementary/fig_s36_rg_heatmap_afr.png",
+    "script": "scripts/real_rg/render_heatmap.py",
+    "args": [
+      "--outfile",
+      "figs/supplementary/fig_s36_rg_heatmap_afr.png",
+      "--csv",
+      "data/real_rg/estimates.csv",
+      "--phen-list",
+      "data/traits/trait_categories.tsv",
+      "--annot",
+      "mafld_8bins",
+      "--threshold",
+      "fdr",
+      "--pops",
+      "AFR"
+    ],
+    "inputs": [
+      "data/real_rg/estimates.csv",
+      "data/traits/trait_categories.tsv"
+    ],
+    "extra_outputs": []
+  },
+  "S37": {
+    "figure": "S37",
+    "label": "fig:real_mafld_rg_venn_main_bonf",
+    "output": "figs/supplementary/fig_s37_rg_bonferroni_overlap.png",
+    "script": "scripts/real_rg/render_venn.py",
+    "args": [
+      "--figure",
+      "S37",
+      "--outfile",
+      "figs/supplementary/fig_s37_rg_bonferroni_overlap.png"
+    ],
+    "inputs": [
+      "data/real_rg/estimates.csv"
+    ],
+    "extra_outputs": [
+      "figs/supplementary/fig_s37_rg_bonferroni_overlap.pdf",
+      "figs/supplementary/fig_s37_rg_bonferroni_overlap__region_counts.csv",
+      "figs/supplementary/fig_s37_rg_bonferroni_overlap__source_data.csv"
+    ]
+  },
+  "S38": {
+    "figure": "S38",
+    "label": "fig:supp_rg_venn_fdr_summit",
+    "output": "figs/supplementary/fig_s38_rg_fdr_overlap.png",
+    "script": "scripts/real_rg/render_venn.py",
+    "args": [
+      "--figure",
+      "S38",
+      "--outfile",
+      "figs/supplementary/fig_s38_rg_fdr_overlap.png"
+    ],
+    "inputs": [
+      "data/real_rg/estimates.csv"
+    ],
+    "extra_outputs": [
+      "figs/supplementary/fig_s38_rg_fdr_overlap.pdf",
+      "figs/supplementary/fig_s38_rg_fdr_overlap__region_counts.csv",
+      "figs/supplementary/fig_s38_rg_fdr_overlap__source_data.csv"
+    ]
+  },
+  "S39": {
+    "figure": "S39",
+    "label": "fig:real_rg_annot_scatter_eur_300k",
+    "output": "figs/supplementary/fig_s39_rg_annotation_comparison_eur300k.png",
+    "script": "scripts/real_rg/annotation_comparison.py",
+    "args": [
+      "--csv",
+      "data/real_rg/estimates.csv",
+      "--pop",
+      "EUR_300k",
+      "--out-prefix",
+      "figs/supplementary/fig_s39_rg_annotation_comparison_eur300k"
+    ],
+    "inputs": [
+      "data/real_rg/estimates.csv"
+    ],
+    "extra_outputs": [
+      "figs/supplementary/fig_s39_rg_annotation_comparison_eur300k.metrics.csv",
+      "figs/supplementary/fig_s39_rg_annotation_comparison_eur300k.pdf"
+    ]
+  },
+  "S40": {
+    "figure": "S40",
+    "label": "fig:real_rg_annot_scatter_eur",
+    "output": "figs/supplementary/fig_s40_rg_annotation_comparison_eur.png",
+    "script": "scripts/real_rg/annotation_comparison.py",
+    "args": [
+      "--csv",
+      "data/real_rg/estimates.csv",
+      "--pop",
+      "EUR",
+      "--out-prefix",
+      "figs/supplementary/fig_s40_rg_annotation_comparison_eur"
+    ],
+    "inputs": [
+      "data/real_rg/estimates.csv"
+    ],
+    "extra_outputs": [
+      "figs/supplementary/fig_s40_rg_annotation_comparison_eur.metrics.csv",
+      "figs/supplementary/fig_s40_rg_annotation_comparison_eur.pdf"
+    ]
+  },
+  "S41": {
+    "figure": "S41",
+    "label": "fig:real_rg_annot_scatter_sas",
+    "output": "figs/supplementary/fig_s41_rg_annotation_comparison_sas.png",
+    "script": "scripts/real_rg/annotation_comparison.py",
+    "args": [
+      "--csv",
+      "data/real_rg/estimates.csv",
+      "--pop",
+      "SAS",
+      "--out-prefix",
+      "figs/supplementary/fig_s41_rg_annotation_comparison_sas"
+    ],
+    "inputs": [
+      "data/real_rg/estimates.csv"
+    ],
+    "extra_outputs": [
+      "figs/supplementary/fig_s41_rg_annotation_comparison_sas.metrics.csv",
+      "figs/supplementary/fig_s41_rg_annotation_comparison_sas.pdf"
+    ]
+  },
+  "S42": {
+    "figure": "S42",
+    "label": "fig:real_rg_annot_scatter_afr",
+    "output": "figs/supplementary/fig_s42_rg_annotation_comparison_afr.png",
+    "script": "scripts/real_rg/annotation_comparison.py",
+    "args": [
+      "--csv",
+      "data/real_rg/estimates.csv",
+      "--pop",
+      "AFR",
+      "--out-prefix",
+      "figs/supplementary/fig_s42_rg_annotation_comparison_afr"
+    ],
+    "inputs": [
+      "data/real_rg/estimates.csv"
+    ],
+    "extra_outputs": [
+      "figs/supplementary/fig_s42_rg_annotation_comparison_afr.metrics.csv",
+      "figs/supplementary/fig_s42_rg_annotation_comparison_afr.pdf"
+    ]
+  },
+  "S43": {
+    "figure": "S43",
+    "label": "fig:external_only_h2",
+    "output": "figs/supplementary/fig_s43_external_heritability.png",
+    "script": "scripts/external/total_h2.py",
+    "args": [],
+    "inputs": [
+      "data/external/total_h2.tsv"
+    ],
+    "extra_outputs": [
+      "figs/supplementary/fig_s43_external_heritability.pdf"
+    ]
+  },
+  "S44": {
+    "figure": "S44",
+    "label": "fig:external_reference_mismatch_diagnostics",
+    "output": "figs/supplementary/fig_s44_external_reference_mismatch.png",
+    "script": "scripts/external/reference_diagnostics.py",
+    "args": [],
+    "inputs": [
+      "data/external/reference_swap.tsv",
+      "data/external/ld_hexbin.json"
+    ],
+    "extra_outputs": [
+      "figs/supplementary/fig_s44_external_reference_mismatch.pdf"
+    ]
+  }
+}
