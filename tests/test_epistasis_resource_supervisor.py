@@ -152,6 +152,10 @@ def test_explicit_supervisor_stop_reaches_child(tmp_path):
 def test_two_local_jobs_share_one_monitored_budget(tmp_path):
     import hashlib
     from scripts.epistasis.local_batch import validate_batch
+    from scripts.epistasis.cpu_policy import require_affinity
+    # The supervisor retains its admitted allocation, including idle SMT
+    # siblings on CI. Each child still receives one disjoint physical core.
+    allocated=sorted({cpu for mask in require_affinity().values() for cpu in mask})
     physical={}
     for cpu in sorted(os.sched_getaffinity(0)):
         topology=Path(f'/sys/devices/system/cpu/cpu{cpu}/topology')
@@ -182,7 +186,7 @@ time.sleep(30)
     output=tmp_path/'monitor';output.mkdir()
     digest=hashlib.sha256(manifest.read_bytes()).hexdigest()
     command=[sys.executable,'-m','scripts.epistasis.local_batch',str(manifest),'--sha256',digest]
-    plan=dict(cpu_ids=cpus,max_seconds=1.,max_rss_bytes=128*2**20,
+    plan=dict(cpu_ids=allocated,max_seconds=1.,max_rss_bytes=128*2**20,
         max_output_growth_bytes=2**20,min_available_memory_bytes=0,min_free_disk_bytes=0,
         output_root=str(output),work_roots=list(map(str,roots)))
     result=execute(command,output/'resources.json',interval=.1,plan=plan)

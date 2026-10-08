@@ -3,6 +3,7 @@
 For private BLIS use scripts/generalized_gxe/private_python.py instead.
 SUMMIT_NATIVE_DIR optionally selects a qualified portable native build.
 """
+import importlib.machinery
 import importlib.util
 import os
 from pathlib import Path
@@ -23,11 +24,32 @@ if sys.platform.startswith("linux"):
 
 root = Path(__file__).resolve().parents[2]
 sys.dont_write_bytecode = True
-sys.meta_path[:] = [
-    f for f in sys.meta_path if type(f).__module__ != "_gwldcore_editable"
-]
+installed = importlib.util.find_spec("summit")
+
+
+class CheckoutFinder:
+    """Resolve checkout modules before any editable-install finder."""
+
+    @staticmethod
+    def find_spec(fullname, path=None, target=None):
+        if fullname != "summit" and not fullname.startswith("summit."):
+            return None
+        parent = root / "src"
+        for part in fullname.split(".")[:-1]:
+            parent /= part
+        return importlib.machinery.PathFinder.find_spec(fullname, [str(parent)])
+
+
+sys.meta_path.insert(0, CheckoutFinder)
 sys.path[:0] = [str(root / "src"), str(root)]
-import summit
+spec = CheckoutFinder.find_spec("summit")
+summit = importlib.util.module_from_spec(spec)
+# Keep installed extensions available when no separate native build is given.
+# Python modules are always resolved from the checkout by CheckoutFinder.
+if installed is not None:
+    summit.__path__.extend(installed.submodule_search_locations or ())
+sys.modules["summit"] = summit
+spec.loader.exec_module(summit)
 
 assert Path(summit.__file__).resolve() == root / "src/summit/__init__.py"
 if os.environ.get("SUMMIT_NATIVE_DIR"):
