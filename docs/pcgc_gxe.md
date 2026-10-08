@@ -13,7 +13,7 @@ For population-scaled genotypes X and context vector φ, the genetic model is
 
 ```math
 g_i=\sum_j X_{ij}\phi_i^T\beta_j,\qquad
-\operatorname{Cov}(\beta_j)=\sum_a A_{ja}\Omega_a/M_a,
+\mathrm{Cov}(\beta_j)=\sum_a A_{ja}\Omega_a/M_a,
 \qquad M_a=\sum_j A_{ja}.
 ```
 
@@ -81,6 +81,15 @@ the mean model requires them; SUMMIT does not create those columns.
 
 ## Four modes
 
+Use `pcgc` for the primary analysis. Its study-specific directional LD scores
+use features `F_q = diag(d/s) diag(phi_q) X`, where d is the PCGC risk
+sensitivity and s is the supplied conditional liability SD. The sensitivity
+depends on population risk and case–control sampling, as defined in
+[PCGC methods](pcgc.md#risk-adjustment-and-estimating-equations). Trait scores
+use the same features, and preparation removes same-person terms from both
+the trait and reference moments. Ordinary quantitative-trait directional LD
+scores generally cannot be reused for this fit.
+
 | Method | Reference and weighting | Additional inputs or assumptions |
 |---|---|---|
 | `pcgc` | Study-specific risk-weighted context reference | Population risks and genotype scale |
@@ -109,7 +118,7 @@ Its denominator is the marginal liability variance. When conditional genotype
 variances are one, the numerator reduces to
 
 ```math
-V_g=\sum_a\operatorname{tr}\{\Omega_a E_{\rm pop}[\phi\phi^T]\}.
+V_g=\sum_a\mathrm{tr}\{\Omega_a E_{\mathrm{pop}}[\phi\phi^T]\}.
 ```
 
 Population moments use inverse ascertainment weights by default. The Python

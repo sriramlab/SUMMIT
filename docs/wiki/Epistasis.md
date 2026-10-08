@@ -152,7 +152,7 @@ A, and covariate projection P, the interaction kernel is
 
 ```math
 K=\frac{1}{\sum_j A_j}
-P\operatorname{diag}(x)X\operatorname{diag}(A)X^T\operatorname{diag}(x)P.
+P\mathrm{diag}(x)X\mathrm{diag}(A)X^T\mathrm{diag}(x)P.
 ```
 
 The target is excluded from its background. A moment fit estimates the
