@@ -440,6 +440,11 @@ def test_private_stable_v1_allowlist_and_context_cli_boundary(
     long_options = {
         option for option in parser._option_string_actions if option.startswith("--")
     }
-    assert not any("context" in option.lower() for option in long_options)
-    assert "context" not in help_text.lower()
+    # Binary context preparation is public; the private quantitative artifact
+    # interface still has no general context CLI.
+    assert {option for option in long_options if "context" in option.lower()} == {
+        "--binary-context-columns"
+    }
+    assert "--binary-context-columns" in help_text
+    assert "--context" not in help_text
     assert "--gxe-fp64-layout" not in long_options

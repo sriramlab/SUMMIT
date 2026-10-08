@@ -708,6 +708,11 @@ def restricted_genetic_fit(
     or re-estimates the per-SNP reference LD scores.
     """
     pairs = reference.component_index.pair_index.entries
+    if len(reference.component_index.annotation_names) != 1:
+        raise ValueError(
+            "research restricted helper supports one annotation only; "
+            "pair indices are not annotation-major component indices"
+        )
     genetic = [int(index) for index in genetic_pair_indices]
     if not genetic:
         raise ValueError("restricted fit requires at least one genetic pair")

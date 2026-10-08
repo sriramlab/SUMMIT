@@ -57,6 +57,33 @@ def dense_annotated(source, trait, candidate):
     return u, weights, z@fixed, g
 
 
+@pytest.mark.parametrize('backend', ['numpy', 'native'])
+def test_annotation_products_shared_across_independent_trait_rhs(backend):
+    source, first = annotated_fixture()
+    second = replace(first, id='second', y=first.y[::-1],
+                     candidates=tuple(replace(c, residual=c.residual*1.3) for c in first.candidates))
+    traits = [first, second]
+    plan = plan_prediction(traits, source, storage='packed', block_size=7,
+                           rhs_columns=12, threads=prediction_threads())
+    operator = GenotypeOperator(source, traits, plan, backend=backend)
+    operator.setup()
+    solved = solve(operator, SolverSpec(rtol=1e-10, max_iterations=160))
+    weights = {(t.id, c.id): np.zeros((len(t.variants), t.phi.shape[1]))
+               for t in traits for c in t.candidates}
+    def sink(key, lo, hi, value):
+        weights[key][lo:hi] = value
+    operator.extract(solved.solutions, sink)
+    for t in traits:
+        for candidate in t.candidates:
+            key = (t.id, candidate.id)
+            u, w, mean, _ = dense_annotated(source, t, candidate)
+            np.testing.assert_allclose(solved.solutions[key], u, rtol=2e-8, atol=2e-8)
+            np.testing.assert_allclose(weights[key], w, rtol=2e-8, atol=2e-9)
+            np.testing.assert_allclose(t.fixed@solved.fixed_coefficients[key], mean, rtol=2e-9, atol=2e-9)
+    assert operator.ledger.source_variants == len(first.variants)
+    operator.release()
+
+
 @pytest.mark.parametrize('overlap', [False, True])
 @pytest.mark.parametrize('storage', ['stream', 'compact', 'standardized'])
 @pytest.mark.parametrize('backend', ['numpy', 'native'])

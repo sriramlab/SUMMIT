@@ -13,13 +13,19 @@ from pathlib import Path
 import runpy
 import sys
 
+# Reject unsafe local placement before imports or BLAS warmup. Do not narrow
+# here: callers must apply the assigned mask at the outer command boundary.
+runpy.run_path(str(Path(__file__).resolve().parents[2] /
+    'scripts/epistasis/cpu_policy.py'))['require_numerical_startup']()
+
 cpus=tuple(sorted(os.sched_getaffinity(0)))
 libc=ctypes.CDLL(None,use_errno=True)
-assert libc.prctl(41,1,0,0,0)==0 and libc.prctl(42,0,0,0,0)==1
+if libc.prctl(41,1,0,0,0)!=0 or libc.prctl(42,0,0,0,0)!=1:
+    raise RuntimeError('process-local THP guard failed')
 root=Path(__file__).resolve().parents[2]
 sys.dont_write_bytecode=True
 sys.meta_path[:]=[f for f in sys.meta_path if type(f).__module__!='_gwldcore_editable']
-sys.path[:0]=[str(root/'src'),str(root/'scripts/generalized_gxe')]
+sys.path[:0]=[str(root/'src'),str(root/'scripts/generalized_gxe'),str(root)]
 import summit
 assert Path(summit.__file__).resolve()==root/'src/summit/__init__.py'
 # Importing libgomp can bind the main thread to its first singleton place.
@@ -51,7 +57,7 @@ workflow._PRE_NUMERICAL_CPU_AFFINITY=cpus
 workflow._NUMPY_POOL_WORKER_AFFINITY=numpy_worker_affinity
 info,threads,placement=workflow.require_private_blis(gxeldcore)
 assert info['gemm_integrity_enabled'] and info['gemm_checksum_enabled']
-print(json.dumps(dict(phase='runtime_placement',launch_cpu_ids=cpus,threads=threads,
+print(json.dumps(dict(phase='runtime_placement',launch_cpu_ids=cpus,threads=threads,thp_disabled=True,
     numpy_worker_affinity=numpy_worker_affinity,
     placement=placement,native_path=gxeldcore.__file__,native_build=info)),flush=True)
 module=sys.argv[1];sys.argv=sys.argv[1:]

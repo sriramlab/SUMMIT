@@ -112,7 +112,9 @@ class RankOneReference:
 
 def rank_one_reference(operator, annotations, weight, *, responses=None, probes=256,
                        seed=0, threads=1, memory_bytes=2**30, block_size=256,
-                       native=True):
+                       native=True, probe_square_sink=None):
+    if probe_square_sink is not None and not callable(probe_square_sink):
+        raise TypeError('probe_square_sink must be callable')
     a = annotations_array(annotations, operator.num_variants)
     w = finite_array('feature weight', weight, 1)
     n, m = operator.num_samples, operator.num_variants
@@ -228,6 +230,10 @@ def rank_one_reference(operator, annotations, weight, *, responses=None, probes=
                     np.square(cross, out=cross)
                     for j in range(cs//probes, (ce-1)//probes+1):
                         lo, hi = max(cs, j*probes)-cs, min(ce, (j+1)*probes)-cs
+                        if probe_square_sink is not None:
+                            view = cross[:,lo:hi].view()
+                            view.setflags(write=False)
+                            probe_square_sink(start,stop,j,cs+lo-j*probes,view)
                         ld[start:stop, j] += cross[:, lo:hi].sum(axis=1)/(probes*n**2)
                     del cross
             ledger.record_block(start, stop)

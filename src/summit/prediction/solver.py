@@ -39,6 +39,19 @@ def solve(operator, spec=SolverSpec(), *, checkpoint=None):
         u = bases[key[0]]
         return value - u @ (u.T @ value)
 
+    # A supplied inverse is a computational preconditioner only. Every
+    # convergence decision still uses the original full covariance operator.
+    # The default prediction path retains its existing Jacobi calculation.
+    inverse = getattr(operator, 'precondition', None)
+
+    def precondition(key, value):
+        if inverse is None:
+            return project(key, value / diagonal[key])
+        result = np.asarray(inverse(key, value), dtype=float)
+        if result.shape != value.shape or not np.all(np.isfinite(result)):
+            raise ValueError('invalid projected preconditioner result')
+        return project(key, result)
+
     for t in operator.traits:
         py = project((t.id, ""), t.y)
         for c in t.candidates:
@@ -50,7 +63,7 @@ def solve(operator, spec=SolverSpec(), *, checkpoint=None):
             diagonal[key] = d
             x[key] = np.zeros(len(py))
             residual[key] = py.copy()
-            z = project(key, py / d)
+            z = precondition(key, py)
             directions[key] = z
             rho[key] = float(py @ z)
             norm = float(np.linalg.norm(py))
@@ -72,7 +85,7 @@ def solve(operator, spec=SolverSpec(), *, checkpoint=None):
                 fixed_coefficients=fixed_coefficients,
                 elapsed_seconds=prior_seconds+time.monotonic()-start))
 
-    def verify(keys, values=None):
+    def verify(keys, values=None, *, recovered=False):
         # Every success, including a zero RHS, uses an actual covariance check.
         if values is None:
             values = operator.apply({key: x[key] for key in keys}, phase="verification")
@@ -95,10 +108,15 @@ def solve(operator, spec=SolverSpec(), *, checkpoint=None):
                 # second rank threshold to Z could choose a different mean.
                 fixed_coefficients[key] = linalg.lstsq(basis.T @ t.fixed,
                     basis.T @ (t.y-vu), cond=0.0, lapack_driver="gelsy")[0] if basis.shape[1] else np.zeros(t.fixed.shape[1])
+            elif recovered:
+                # An authenticated archive may still contain a bad numerical
+                # solution. Preserve it and stop; do not silently repair a
+                # previously reported converged result during recovery.
+                raise ValueError("Completed checkpoint failed fresh covariance verification: " + "/".join(key))
             elif rep["restarts"] < spec.max_restarts:
                 rep["restarts"] += 1
                 residual[key] = true
-                z = project(key, true/diagonal[key])
+                z = precondition(key, true)
                 directions[key] = z
                 rho[key] = float(true @ z)
                 active.add(key)
@@ -114,6 +132,15 @@ def solve(operator, spec=SolverSpec(), *, checkpoint=None):
         x, residual, directions = state["x"], state["residual"], state["directions"]
         fixed_coefficients = state["fixed_coefficients"]
         prior_seconds = state["elapsed_seconds"]
+        completed = sorted(set(x)-active-pending)
+        if completed:
+            for key in completed:
+                norm = float(np.linalg.norm(rhs[key]))
+                reports[key]["rhs_norm"] = norm
+                reports[key]["threshold"] = max(spec.atol, spec.rtol*norm)
+            # Recompute covariance products and finite-mean coefficients. The
+            # saved residual report alone is not evidence on this execution.
+            verify(completed, recovered=True)
     else:
         pending = {k for k in active if reports[k]["rhs_norm"] <= reports[k]["threshold"]}
         active -= pending
@@ -152,7 +179,7 @@ def solve(operator, spec=SolverSpec(), *, checkpoint=None):
                 active.discard(key)
                 pending.add(key)
                 continue
-            z = project(key, residual[key] / diagonal[key])
+            z = precondition(key, residual[key])
             new_rho = float(residual[key] @ z)
             directions[key] = z + (new_rho/rho[key])*directions[key]
             rho[key] = new_rho

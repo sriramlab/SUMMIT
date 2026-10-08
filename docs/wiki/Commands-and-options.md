@@ -14,6 +14,7 @@ as `summit pgs fit`.
 | Polygenic scores | `summit pgs {plan,fit,score,scale,inspect}` |
 | Generalized G×E reference planning and inspection | `summit reference {plan,inspect}` |
 | Cross-trait reference Z moments | `summit reference zpass` |
+| Quantitative epistasis | `summit epistasis {make-inputs,train-direction,prepare,prepare-traits,fit,combine,followup}` |
 
 Generalized G×E fitting and cross-trait response models use Python APIs.
 See [Multiple environments](Multiple-environments.md) and

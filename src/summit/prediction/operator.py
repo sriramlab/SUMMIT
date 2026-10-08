@@ -47,6 +47,7 @@ class GenotypeOperator:
             self.groups.setdefault(key, []).append(t)
             self.trait_group[t.id] = key
         self.row_maps = {k: np.searchsorted(self.stream.rows, ts[0].rows) for k, ts in self.groups.items()}
+        self.context_hash = {t.id: array_digest(t.phi) for t in self.traits}
         self.row_diagonal = {}
         self.standardized_cache = {}
         self.ready = False
@@ -111,106 +112,108 @@ class GenotypeOperator:
         self.native.prediction_product(left, right, out, transpose, self.plan.threads)
         return out
 
+    def _packed_groups(self, vectors):
+        """Pack independent model inputs with an identical genotype/context map."""
+        groups = {}
+        count = 0
+        for genotype_key, traits in self.groups.items():
+            contexts = {}
+            for t in traits:
+                active = [c for c in t.candidates if (t.id, c.id) in vectors]
+                if active:
+                    contexts.setdefault(self.context_hash[t.id], []).extend((t, c) for c in active)
+            for context_key, models in contexts.items():
+                t = models[0][0]
+                q = t.phi.shape[1]
+                packed = np.empty((len(t.rows), len(models)*q), order="F")
+                for j, (trait, candidate) in enumerate(models):
+                    vector = np.asarray(vectors[(trait.id, candidate.id)])
+                    if vector.shape != (len(trait.rows),) or not np.all(np.isfinite(vector)):
+                        raise ValueError("invalid covariance input vector")
+                    np.multiply(trait.phi, vector[:, None], out=packed[:, j*q:(j+1)*q])
+                groups.setdefault(genotype_key, []).append((models, packed))
+                count += len(models)
+        if not count or count != len(vectors):
+            raise ValueError("empty or unknown model IDs in covariance application")
+        return groups
+
     def apply(self, vectors, *, phase="cg"):
-        """vectors maps (trait ID, candidate ID) to unprojected V inputs."""
+        """Apply independent covariances, sharing compatible cross-trait GEMMs."""
         self.ledger.operator_calls += 1
-        outputs, packs, selected, priors = {}, {}, {}, {}
-        for t in self.traits:
-            active = [c for c in t.candidates if (t.id, c.id) in vectors]
-            if not active:
-                continue
-            selected[t.id] = active
-            q = t.phi.shape[1]
-            packed = np.empty((len(t.rows), len(active)*q), order="F")
-            for j, c in enumerate(active):
-                vector = np.asarray(vectors[(t.id, c.id)])
-                if vector.shape != (len(t.rows),) or not np.all(np.isfinite(vector)):
-                    raise ValueError("invalid covariance input vector")
-                np.multiply(t.phi, vector[:, None], out=packed[:, j*q:(j+1)*q])
-            packs[t.id] = packed
-            priors[t.id] = np.ascontiguousarray([c.covariance.ravel() for c in active])
-            outputs[t.id] = np.zeros((len(t.rows), len(active)), order="F")
-        if not selected:
-            raise ValueError("empty covariance application")
-        if sum(len(v) for v in selected.values()) != len(vectors):
-            raise ValueError("unknown model ID in covariance application")
-        self.ledger.active_rhs.append(sum(v.shape[1] for v in packs.values()))
+        groups = self._packed_groups(vectors)
+        output_groups = {}
+        for key, batches in groups.items():
+            output_groups[key] = [np.zeros((len(packed), len(models)), order="F")
+                                  for models, packed in batches]
+        self.ledger.active_rhs.append(sum(p.shape[1] for batches in groups.values() for _, p in batches))
         for variants, raw in self.blocks(phase):
-            for key, traits in self.groups.items():
-                if not any(t.id in selected for t in traits):
-                    continue
+            for key, batches in groups.items():
                 lo, hi, g = self._group_block(key, variants, raw)
                 if g is None:
                     continue
-                for t in traits:
-                    if t.id not in selected:
-                        continue
+                for (models, pack), output in zip(batches, output_groups[key]):
+                    t = models[0][0]
                     q = t.phi.shape[1]
                     width = max(1, self.plan.rhs_columns // q)
-                    for begin in range(0, len(selected[t.id]), width):
-                        end = min(begin+width, len(selected[t.id]))
-                        packed = packs[t.id][:, begin*q:end*q]
-                        covariance = priors[t.id][begin:end]
-                        batch = selected[t.id][begin:end]
-                        annotated = any(c.annotation_prior is not None for c in batch)
+                    for begin in range(0, len(models), width):
+                        batch = models[begin:begin+width]
+                        end = begin+len(batch)
+                        packed = pack[:, begin*q:end*q]
+                        annotated = any(c.annotation_prior is not None for _, c in batch)
                         if annotated:
-                            covariance = np.empty((hi-lo, end-begin, q*q))
-                            for j, candidate in enumerate(batch):
+                            covariance = np.empty((hi-lo, len(batch), q*q))
+                            for j, (_, candidate) in enumerate(batch):
                                 covariance[:, j] = (candidate.covariance.ravel() if candidate.annotation_prior is None
                                     else candidate.annotation_prior.block(lo, hi))
-                            covariance = covariance.reshape((hi-lo)*(end-begin), q*q)
-                        out = outputs[t.id][:, begin:end]
+                            covariance = covariance.reshape((hi-lo)*len(batch), q*q)
+                        else:
+                            covariance = np.ascontiguousarray([c.covariance.ravel() for _, c in batch])
+                        out = output[:, begin:end]
                         if self.native is not None:
                             self.native.prediction_covariance_block(g, packed, covariance, t.phi,
                                 out, float(len(t.variants)), self.plan.threads, self.workspace)
                         else:
                             transposed = g.T @ packed
                             if annotated:
-                                mixed = np.einsum("bkq,bkqr->bkr", transposed.reshape(len(g.T), end-begin, q),
-                                    covariance.reshape(len(g.T), end-begin, q, q)).reshape(len(g.T), -1) / len(t.variants)
+                                mixed = np.einsum("bkq,bkqr->bkr", transposed.reshape(len(g.T), len(batch), q),
+                                    covariance.reshape(len(g.T), len(batch), q, q)).reshape(len(g.T), -1) / len(t.variants)
                             else:
-                                mixed = np.einsum("bkq,kqr->bkr", transposed.reshape(len(g.T), end-begin, q),
-                                    covariance.reshape(end-begin, q, q)).reshape(len(g.T), -1) / len(t.variants)
+                                mixed = np.einsum("bkq,kqr->bkr", transposed.reshape(len(g.T), len(batch), q),
+                                    covariance.reshape(len(batch), q, q)).reshape(len(g.T), -1) / len(t.variants)
                             product = g @ mixed
-                            out += np.einsum("nkq,nq->nk", product.reshape(len(t.rows), end-begin, q), t.phi)
+                            out += np.einsum("nkq,nq->nk", product.reshape(len(t.rows), len(batch), q), t.phi)
         result = {}
-        for t in self.traits:
-            for j, c in enumerate(selected.get(t.id, [])):
-                key = (t.id, c.id)
-                result[key] = outputs[t.id][:, j]
-                result[key] += c.residual * vectors[key]
-                if not np.all(np.isfinite(result[key])):
-                    raise FloatingPointError(f"nonfinite covariance product for {key}")
+        for key, batches in groups.items():
+            for (models, _), output in zip(batches, output_groups[key]):
+                for j, (t, c) in enumerate(models):
+                    model = (t.id, c.id)
+                    result[model] = output[:, j]
+                    result[model] += c.residual * vectors[model]
+                    if not np.all(np.isfinite(result[model])):
+                        raise FloatingPointError(f"nonfinite covariance product for {model}")
         return result
 
     def extract(self, solutions, sink):
-        """Write bounded (variant, Q) posterior blocks directly to a model sink."""
-        packs = {}
-        for t in self.traits:
-            active = [c for c in t.candidates if (t.id, c.id) in solutions]
-            q = t.phi.shape[1]
-            packed = np.empty((len(t.rows), len(active)*q), order="F")
-            for j, c in enumerate(active):
-                packed[:, j*q:(j+1)*q] = t.phi * solutions[(t.id, c.id)][:, None]
-            packs[t.id] = (active, packed)
+        """Write bounded posterior blocks, sharing compatible trait products."""
+        groups = self._packed_groups(solutions)
         for variants, raw in self.blocks("extraction"):
-            for group, traits in self.groups.items():
-                lo, hi, g = self._group_block(group, variants, raw)
+            for key, batches in groups.items():
+                lo, hi, g = self._group_block(key, variants, raw)
                 if g is None:
                     continue
-                for t in traits:
-                    active, packed = packs[t.id]
+                for models, packed in batches:
+                    t = models[0][0]
                     q, width = t.phi.shape[1], max(1, self.plan.rhs_columns // t.phi.shape[1])
-                    for begin in range(0, len(active), width):
-                        batch = active[begin:begin+width]
+                    for begin in range(0, len(models), width):
+                        batch = models[begin:begin+width]
                         product = self.product(g, packed[:, begin*q:(begin+len(batch))*q], transpose=True)
-                        for j, c in enumerate(batch):
+                        for j, (trait, c) in enumerate(batch):
                             if c.annotation_prior is None:
-                                weights = product[:, j*q:(j+1)*q] @ c.covariance / len(t.variants)
+                                weights = product[:, j*q:(j+1)*q] @ c.covariance / len(trait.variants)
                             else:
                                 weights = np.einsum('bq,bqr->br', product[:, j*q:(j+1)*q],
-                                    c.annotation_prior.block(lo, hi).reshape(hi-lo, q, q))/len(t.variants)
-                            sink((t.id, c.id), lo, hi, weights)
+                                    c.annotation_prior.block(lo, hi).reshape(hi-lo, q, q))/len(trait.variants)
+                            sink((trait.id, c.id), lo, hi, weights)
 
     def release(self):
         self.stream.cache = None

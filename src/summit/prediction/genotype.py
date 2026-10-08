@@ -285,11 +285,22 @@ class ShardedGenotypeSource:
 
 def source_from_spec(spec, root):
     from ._validation import closed
-    closed(spec, (), ("geno", "shards", "genome_build"), name="genotype specification")
+    closed(spec, (), ("geno", "shards", "genome_build", "content_identity"), name="genotype specification")
+    if type(spec.get('content_identity',False)) is not bool:
+        raise ValueError('content_identity must be boolean')
     if ("geno" in spec) == ("shards" in spec):
         raise ValueError("supply exactly one genotype trio or ordered shard list")
     if "geno" in spec:
-        return FileGenotypeSource(Path(root)/spec["geno"], genome_build=spec.get("genome_build"))
+        source = FileGenotypeSource(Path(root)/spec["geno"], genome_build=spec.get("genome_build"))
+        try:
+            if spec.get('content_identity'):
+                source.authenticate_content()
+        except BaseException:
+            source.close()
+            raise
+        return source
+    if spec.get('content_identity'):
+        raise ValueError('content identity currently requires a single genotype trio')
     if not isinstance(spec["shards"], list) or any(not isinstance(x, str) or not x for x in spec["shards"]):
         raise ValueError("genotype shards must be an ordered list of paths")
     return ShardedGenotypeSource([Path(root)/x for x in spec["shards"]], genome_build=spec.get("genome_build"))

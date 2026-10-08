@@ -15,7 +15,7 @@ from .priors import ResponseGeometry
 from .spec import GenotypeScale, VariantAxis
 
 KIND = "summit.prediction.models"
-VERSION = 1
+VERSION = 2
 
 
 def file_digest(path):
@@ -48,6 +48,23 @@ def write_json(path, value):
         handle.write(canonical(value)+"\n")
         handle.flush()
         os.fsync(handle.fileno())
+
+
+def json_record(path):
+    return dict(file=path.name, bytes=path.stat().st_size, sha256=file_digest(path))
+
+
+def load_json_member(root, record):
+    closed(record, ("file", "bytes", "sha256"), name="JSON member")
+    name = record["file"]
+    if not isinstance(name, str) or Path(name).name != name or not name.endswith(".json"):
+        raise ValueError("unsafe JSON member path")
+    path = Path(root) / name
+    if path.is_symlink() or path.stat().st_size != record["bytes"]:
+        raise ValueError("JSON member size or symlink mismatch")
+    if file_digest(path) != record["sha256"]:
+        raise ValueError("JSON member checksum mismatch")
+    return read_json(path)
 
 
 def _sync_directory(path):
@@ -234,7 +251,7 @@ class ModelWriter:
                 handle.flush()
                 os.fsync(handle.fileno())
                 handle.close()
-        trait_records = []
+        trait_records, axes, scales = [], {}, {}
         for ti, t in enumerate(self.traits):
             def save(name, values):
                 path = self.path/f"{name}-{ti}.npy"
@@ -245,10 +262,16 @@ class ModelWriter:
                 return array_record(path)
             geometry = None if t.geometry is None else dict(omega=t.geometry.omega.tolist(),
                 metric=t.geometry.metric.tolist(), reference=t.geometry.reference, anchor=t.geometry.anchor)
-            entry = dict(id=t.id, variants=self.source.variants.subset(t.variants).to_dict(),
-                scale=dict(mean=save("mean", t.scale.mean), inverse_scale=save("inverse-scale", t.scale.inverse_scale),
+            axis_identity = t.scale.variant_identity
+            if axis_identity not in axes:
+                axis_path = self.path / f"variant-axis-{len(axes)}.json"
+                write_json(axis_path, self.source.variants.subset(t.variants).to_dict())
+                axes[axis_identity] = json_record(axis_path)
+            if t.scale.identity not in scales:
+                scales[t.scale.identity] = dict(mean=save("mean", t.scale.mean), inverse_scale=save("inverse-scale", t.scale.inverse_scale),
                     variant_identity=t.scale.variant_identity, sample_identity=t.scale.sample_identity,
-                    provenance=t.scale.provenance, ddof=t.scale.ddof, arithmetic=t.scale.arithmetic),
+                    provenance=t.scale.provenance, ddof=t.scale.ddof, arithmetic=t.scale.arithmetic)
+            entry = dict(id=t.id, variants=axis_identity, scale=scales[t.scale.identity],
                 context_spec=t.context_spec, fixed_spec=t.fixed_spec, phenotype_spec=t.phenotype_spec,
                 geometry=geometry, models=[])
             for ci, c in enumerate(t.candidates):
@@ -258,7 +281,7 @@ class ModelWriter:
                     prior_spec=c.specification, convergence=self.result.reports[key]))
             trait_records.append(entry)
         manifest = dict(kind=KIND, schema_version=VERSION, created_utc=datetime.now(timezone.utc).isoformat(), traits=trait_records,
-                        provenance=self.provenance, run_report=run_report)
+                        provenance=self.provenance, run_report=run_report, variant_axes=axes)
         write_json(self.path/"manifest.json", manifest)
         write_json(self.path/"COMPLETE.json", dict(kind=KIND, schema_version=VERSION,
                    manifest_sha256=file_digest(self.path/"manifest.json")))
@@ -272,27 +295,50 @@ def load_prediction_models(path):
         raise ValueError("model root cannot be a symlink")
     complete = read_json(path/"COMPLETE.json", max_bytes=4096)
     closed(complete, ("kind", "schema_version", "manifest_sha256"), name="completion")
-    if complete["kind"] != KIND or complete["schema_version"] != VERSION:
+    if complete["kind"] != KIND or complete["schema_version"] not in (1, VERSION):
         raise ValueError("unsupported prediction artifact kind/version")
     if file_digest(path/"manifest.json") != complete["manifest_sha256"]:
         raise ValueError("model manifest checksum mismatch")
     manifest = read_json(path/"manifest.json")
-    closed(manifest, ("kind", "schema_version", "created_utc", "traits", "provenance", "run_report"), name="model manifest")
-    if manifest["kind"] != KIND or manifest["schema_version"] != VERSION:
+    required = ("kind", "schema_version", "created_utc", "traits", "provenance", "run_report")
+    if complete["schema_version"] == 2:
+        required += ("variant_axes",)
+    closed(manifest, required, name="model manifest")
+    if manifest["kind"] != KIND or manifest["schema_version"] != complete["schema_version"]:
         raise ValueError("unsupported prediction artifact kind/version")
-    models, seen_traits = [], set()
+    models, seen_traits, axes, scales = [], set(), {}, {}
+    if manifest["schema_version"] == 2:
+        if not isinstance(manifest["variant_axes"], dict) or not manifest["variant_axes"]:
+            raise ValueError("model bundle needs named variant axes")
+        for identity, member in manifest["variant_axes"].items():
+            record = load_json_member(path, member)
+            closed(record, ("ids", "chromosome", "position", "counted", "other", "genome_build"), name="variant axis")
+            axis = VariantAxis(**record)
+            if identity != axis.identity:
+                raise ValueError("shared variant axis identity mismatch")
+            axes[identity] = axis
     for t in manifest["traits"]:
         closed(t, ("id", "variants", "scale", "context_spec", "fixed_spec", "phenotype_spec", "geometry", "models"), name="trait model")
         if t["id"] in seen_traits:
             raise ValueError("duplicate trait ID in artifact")
         seen_traits.add(t["id"])
-        closed(t["variants"], ("ids", "chromosome", "position", "counted", "other", "genome_build"), name="variant axis")
-        axis = VariantAxis(**t["variants"])
+        if manifest["schema_version"] == 1:
+            closed(t["variants"], ("ids", "chromosome", "position", "counted", "other", "genome_build"), name="variant axis")
+            axis = VariantAxis(**t["variants"])
+        else:
+            if not isinstance(t["variants"], str) or t["variants"] not in axes:
+                raise ValueError("unknown shared variant axis")
+            axis = axes[t["variants"]]
         s = t["scale"]
         closed(s, ("mean", "inverse_scale", "variant_identity", "sample_identity", "provenance", "ddof", "arithmetic"), name="model scale")
-        scale = GenotypeScale(load_array(path, s["mean"], expected_shape=(len(axis.ids),), expected_dtype="float64"),
-            load_array(path, s["inverse_scale"], expected_shape=(len(axis.ids),), expected_dtype="float64"),
-            **{k: s[k] for k in ("variant_identity", "sample_identity", "provenance", "ddof", "arithmetic")})
+        scale_key = digest(s)
+        if scale_key not in scales:
+            scales[scale_key] = GenotypeScale(load_array(path, s["mean"], expected_shape=(len(axis.ids),), expected_dtype="float64"),
+                load_array(path, s["inverse_scale"], expected_shape=(len(axis.ids),), expected_dtype="float64"),
+                **{k: s[k] for k in ("variant_identity", "sample_identity", "provenance", "ddof", "arithmetic")})
+        scale = scales[scale_key]
+        if scale.variant_identity != axis.identity:
+            raise ValueError("shared scale and variant axis disagree")
         geometry = t["geometry"]
         if geometry is not None:
             closed(geometry, ("omega", "metric", "reference", "anchor"), name="geometry")

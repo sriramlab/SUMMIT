@@ -8,6 +8,21 @@ Preparation needs individual genotypes and binary phenotypes. It produces
 compatible score and reference moments together; ordinary logistic GWAS
 beta/SE files and ordinary LD scores are not interchangeable with these inputs.
 
+## Binary G×E
+
+Joint additive and interaction covariance estimation is available with
+`--binary-context-columns` and an explicit conditional liability scale.
+All four PCGC modes are supported; external LD remains a factorization
+approximation. See [Generalized G×E PCGC](../pcgc_gxe.md) for the model,
+inputs, examples, and interpretation.
+
+Contextual preparation also supports genotype-PC adjustment through
+`--binary-genotype-covariates`. Experimental sampling SEs use
+`--binary-sampling-partners`; `--binary-architecture-probes` adds a Gaussian
+SNP-effect variance model. These intervals remain experimental, with
+undercoverage in some rare-disease and overlapping-LD simulations. The
+[G×E guide](../pcgc_gxe.md#estimates-and-uncertainty) explains their scope.
+
 ## Inputs
 
 - BED or biallelic diploid PGEN genotypes, with their companion files.

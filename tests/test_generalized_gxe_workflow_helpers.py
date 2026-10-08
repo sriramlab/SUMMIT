@@ -112,3 +112,11 @@ def test_restricted_genetic_fit_reuses_one_normal_equation_batch(monkeypatch) ->
     assert fit["selected_indices"] == [0, 2, 3, 4]
     np.testing.assert_allclose(fit["coefficients"], [1.0, 3.0, 4.0, 5.0])
     assert np.asarray(fit["loo_coefficients"]).shape == (2, 4)
+
+
+def test_restricted_fit_rejects_silent_first_annotation_selection():
+    reference = SimpleNamespace(
+        component_index=ContextComponentIndex(("a", "b"), ContextPairIndex(2)),
+    )
+    with pytest.raises(ValueError, match="one annotation only"):
+        WORKFLOW.restricted_genetic_fit(reference, None, 0, genetic_pair_indices=(0, 1))

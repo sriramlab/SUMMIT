@@ -234,6 +234,7 @@ class GeneralizedGxEPass2Executor:
         probe_tile_width: int | None = None,
         component_diagonal_sample_tile_width: int = 1024,
         row_complete_sink: RowCompleteSink | None = None,
+        probe_product_sink: Callable | None = None,
     ) -> None:
         if not isinstance(pass1_result, GeneralizedGxEPass1Result):
             raise TypeError("pass1_result must be a generalized pass-1 result")
@@ -349,6 +350,9 @@ class GeneralizedGxEPass2Executor:
         self.work_plan = work_plan
         self.tn_operator = tn_operator
         self.row_complete_sink = row_complete_sink
+        if probe_product_sink is not None and not callable(probe_product_sink):
+            raise TypeError("probe_product_sink must be callable")
+        self.probe_product_sink = probe_product_sink
         self._basis = _readonly(basis_array)
         self._fixed = _readonly(fixed)
         self._annotations = _readonly(weights)
@@ -590,6 +594,13 @@ class GeneralizedGxEPass2Executor:
                         block_width,
                     ).transpose(1, 2, 3, 0)
                     product_started = time.perf_counter()
+                    if self.probe_product_sink is not None:
+                        # The consumer owns and budgets its accumulators. It
+                        # receives completed source/target products, with no
+                        # jackknife groups or reference recomputation.
+                        view = panels.view()
+                        view.setflags(write=False)
+                        self.probe_product_sink(row_start,row_stop,annotation,probe_start,view,self._product_plan)
                     for target_pair in range(p_count):
                         for source_pair in range(p_count):
                             for term in self._product_plan.terms[

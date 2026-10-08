@@ -109,6 +109,11 @@ operations. A spectral rank cut cannot divide a nonzero tied eigenspace.
 
 ## Model files
 
+New model bundles use format 2. Traits with the same variant axis and affine
+scale share authenticated members instead of duplicating them in the manifest.
+Copy the complete model directory when moving a bundle. The current loader
+also reads format-1 models; older loaders require an update to read format 2.
+
 `fit_prediction` writes a new directory containing a JSON manifest, numeric NPY
 arrays, and a completion marker. Reload with `load_prediction_models` before
 scoring elsewhere. Incomplete or modified bundles are rejected.
@@ -141,7 +146,10 @@ The file is replaced atomically and an exclusive sidecar lock rejects duplicate
 writers. The input, prior, solver, Python/native implementation, thread count,
 and block/RHS sizes must match. Existing checkpoints require explicit resume;
 existing output bundles are never overwritten. A solved checkpoint can export
-to a new directory if interruption left an incomplete model directory.
+to a new directory if interruption left an incomplete model directory. Before
+reusing a completed solution, SUMMIT recalculates its full covariance residual
+and finite-mean coefficients. This adds one verification product and stops if
+the original convergence tolerance fails; the saved checkpoint is preserved.
 
 Checkpoint vectors are individual-level training data. Keep the checkpoint and
 its `.lock` alongside protected training inputs, outside portable model bundles.

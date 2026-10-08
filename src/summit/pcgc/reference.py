@@ -11,6 +11,41 @@ from summit.sumstats.binary import finite_array
 from .moments import BinaryMoments, annotations_array, method_vectors
 
 
+class ProbeGramCollector:
+    """Small per-probe normal matrices; same-person terms are deterministic."""
+    def __init__(self,annotations,num_contexts,probes,n_samples):
+        if type(probes) is not int or probes < 2:
+            raise ValueError("reference-probe uncertainty needs at least two probes")
+        self.annotations = annotations
+        self.pairs = num_contexts*(num_contexts+1)//2
+        self.n_samples = n_samples
+        c = annotations.shape[1]*self.pairs
+        self.directed = np.zeros((probes,c,c))
+
+    def __call__(self,start,stop,annotation,probe_start,panels,plan):
+        p = self.pairs
+        width = panels.shape[-1]
+        for target in range(p):
+            for source in range(p):
+                product = np.zeros((stop-start,width))
+                for term in plan.terms[target][source]:
+                    product += panels[term.first_target,term.first_source]*panels[term.second_target,term.second_source]
+                values = self.annotations[start:stop].T@product
+                self.directed[probe_start:probe_start+width,target::p,annotation*p+source] += values.T
+
+    def deviations(self):
+        mass = np.repeat(self.annotations.sum(0),self.pairs)
+        value = self.n_samples**2*self.directed/np.outer(mass,mass)[None]
+        return value-value.mean(0)
+
+    def add_squared(self,start,stop,annotation,probe_start,squared):
+        if self.pairs != 1:
+            raise ValueError("rank-one probe products require one context")
+        width = squared.shape[1]
+        values = self.annotations[start:stop].T@squared
+        self.directed[probe_start:probe_start+width,:,annotation] += values.T/self.n_samples**2
+
+
 def reference_provenance(options):
     """Small replay metadata; large feature and genotype arrays stay private."""
     probe = GlobalVariantProbeSpec(root_seed=options.get("seed", 0), probe_offset=0,
@@ -30,7 +65,7 @@ def reference_provenance(options):
 class ScoredOperator:
     """Add batched raw trait products to the existing second genotype pass."""
     def __init__(self, operator, responses, tn, nn, *, diagonal_annotations=None, diagonal_weights=None,
-                 diagonal_responses=None):
+                 diagonal_responses=None, kernel_summary_weights=None):
         self.operator, self.tn, self.nn = operator, tn, nn
         self.responses = np.asfortranarray(finite_array("score responses", responses, 2))
         with np.errstate(over='ignore', invalid='ignore'):
@@ -44,6 +79,8 @@ class ScoredOperator:
         self.diagonals = np.empty((operator.num_variants, self.response_squares.shape[1]))
         self.diagonal_annotations = diagonal_annotations
         self.diagonal_rhs = None
+        self.kernel_summary_weights = kernel_summary_weights
+        self.kernel_summary = None
         if diagonal_annotations is not None:
             self.diagonal_weights = np.asfortranarray(finite_array("diagonal weights", diagonal_weights, 2))
             if len(self.diagonal_weights) != operator.num_samples or not self.diagonal_weights.shape[1]:
@@ -70,6 +107,9 @@ class ScoredOperator:
                 if self.diagonal_annotations is None:
                     self.diagonal_rhs = self.response_squares
                 else:
+                    if self.kernel_summary_weights is not None:
+                        self.kernel_summary = self.tn.matmul_tn(
+                            self.kernel_summary_weights, np.asfortranarray(self.kernel_diagonal_numerators))
                     k = self.diagonal_annotations.shape[1]
                     r = self.response_squares.shape[1]
                     self.diagonal_rhs = np.empty((len(x), r+k*self.diagonal_weights.shape[1]), order="F")
@@ -90,7 +130,8 @@ class ScoredOperator:
 
 def generalized_reference(operator, annotations, basis, *, responses=None, probes=256,
                           seed=0, threads=1, memory_bytes=2**30, block_size=256, native=True,
-                          collect_diagonal_rows=False, diagonal_responses=None, diagonal_weights=None):
+                          collect_diagonal_rows=False, diagonal_responses=None, diagonal_weights=None,
+                          admit_resident_output=False, kernel_summary_weights=None, probe_product_sink=None):
     """Exactly two genotype traversals; risk fitting/scale preparation precede it.
 
     There is intentionally no projection argument: applying P D X would change
@@ -109,6 +150,11 @@ def generalized_reference(operator, annotations, basis, *, responses=None, probe
     nn = ProtectedNNOperator(threads=threads, native_module=module) if native else NumpyNNOperator(threads=threads)
     tn = ProtectedTNOperator(threads=threads, native_module=module) if native else NumpyTNOperator(threads=threads)
     score_bytes = 0
+    if kernel_summary_weights is not None:
+        kernel_summary_weights = np.asfortranarray(finite_array("kernel summary weights", kernel_summary_weights, 2))
+        if not collect_diagonal_rows or len(kernel_summary_weights) != operator.num_samples:
+            raise ValueError("kernel summary weights require source diagonals and the sample axis")
+        score_bytes += 8*kernel_summary_weights.shape[1]*(operator.num_samples+a.shape[1])
     if collect_diagonal_rows:
         if diagonal_weights is None:
             if phi.shape[1] != 1:
@@ -121,19 +167,27 @@ def generalized_reference(operator, annotations, basis, *, responses=None, probe
         n, m, r = operator.num_samples, operator.num_variants, responses.shape[1]
         s = r if diagonal_responses is None else finite_array("diagonal responses", diagonal_responses, 2).shape[1]
         b = min(block_size, m)
-        score_bytes = 8*((n+m)*(r+s) + n*b)
+        score_bytes += 8*((n+m)*(r+s) + n*b)
         if collect_diagonal_rows:
             diagonal_weights = finite_array("diagonal weights", diagonal_weights, 2)
             q, k = diagonal_weights.shape[1], a.shape[1]
             score_bytes += 8*(n*k + m*q*k + n*q + (n+b)*(s+q*k))
     if memory_bytes <= score_bytes:
         raise MemoryError("memory budget cannot accommodate PCGC score buffers")
+    output_bytes = (8*operator.num_variants*(phi.shape[1]*(phi.shape[1]+1)//2)**2*a.shape[1]
+                    if admit_resident_output else 0)
+    planning_budget = memory_bytes-score_bytes-output_bytes
+    if planning_budget <= 0:
+        raise MemoryError("memory budget cannot accommodate resident contextual output")
     plan = plan_generalized_gxe_variant_work(GeneralizedGxEPlanInputs(
         num_samples=operator.num_samples, num_variants=operator.num_variants,
         num_basis=phi.shape[1], num_annotations=a.shape[1], num_probes=probes,
-        memory_limit_bytes=memory_bytes-score_bytes, genotype_format=operator.genotype_format, threads=threads,
+        memory_limit_bytes=planning_budget, genotype_format=operator.genotype_format, threads=threads,
         preferred_variant_block_width=block_size,
         preferred_rhs_tile_columns=phi.shape[1]**2 * min(probes, 64), rhs_policy="tiled"))
+    if admit_resident_output:
+        from dataclasses import replace
+        plan = replace(plan, memory_limit_bytes=memory_bytes-score_bytes)
     # Admit the complete plan BEFORE allocating M-by-trait/annotation buffers.
     configure = getattr(operator, 'configure_block_width', None)
     if configure is not None:
@@ -142,7 +196,8 @@ def generalized_reference(operator, annotations, basis, *, responses=None, probe
         operator = ScoredOperator(operator, responses, tn, nn,
                                   diagonal_annotations=a if collect_diagonal_rows else None,
                                   diagonal_weights=diagonal_weights,
-                                  diagonal_responses=diagonal_responses)
+                                  diagonal_responses=diagonal_responses,
+                                  kernel_summary_weights=kernel_summary_weights)
         operator.pcgc_score_buffer_bytes = score_bytes
     fixed = np.empty((operator.num_samples, 0))
     names = tuple(f"annotation_{i}" for i in range(a.shape[1]))
@@ -150,12 +205,15 @@ def generalized_reference(operator, annotations, basis, *, responses=None, probe
         genotype_operator=operator, basis=phi, fixed_effect_basis=fixed,
         annotations=a, annotation_names=names, annotation_masses=a.sum(axis=0),
         probe_spec=GlobalVariantProbeSpec(root_seed=seed, probe_offset=0, probe_count=probes),
-        work_plan=plan, nn_operator=nn, annotation_tile_width=a.shape[1],
-        probe_tile_width=min(probes, 64), native_probe_module=module if native else False).execute()
+        work_plan=plan, nn_operator=nn,
+        annotation_tile_width=(plan.tiling["source_annotation_batch_width"] if admit_resident_output else a.shape[1]),
+        probe_tile_width=(min(probes, plan.tiling["source_probe_tile_width"]) if admit_resident_output else min(probes, 64)),
+        native_probe_module=module if native else False).execute()
     p2 = GeneralizedGxEPass2Executor(
         pass1_result=p1, genotype_operator=operator, basis=phi, fixed_effect_basis=fixed,
         annotations=a, annotation_names=names, work_plan=plan, tn_operator=tn,
-        probe_tile_width=min(probes, 64)).execute()
+        probe_tile_width=(min(probes, plan.tiling["rhs_tile_columns"]//phi.shape[1]**2)
+                          if admit_resident_output else min(probes, 64)),probe_product_sink=probe_product_sink).execute()
     return p2, operator, plan
 
 

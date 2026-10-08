@@ -8,6 +8,11 @@ categorical, or a specified combination.
 The [cross-trait extension](Cross-trait-analysis.md) estimates the corresponding
 covariance between two traits, with separate sample masks and overlap handling.
 
+For binary disease outcomes, use the [generalized PCGC path](../pcgc_gxe.md).
+It retains the context covariance axes but uses ascertainment-aware risks,
+unprojected features, and distinct-person moments on an explicitly declared
+liability scale. Quantitative trait summaries cannot be reused as PCGC inputs.
+
 ## Workflow
 
 1. Fit the context coding on the reference cohort: continuous centers/scales,

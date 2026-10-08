@@ -34,6 +34,8 @@ def add_arguments(parser):
     group.add_argument("--binary-covariate-variance", type=float, help="Population variance of the covariate liability predictor.")
     group.add_argument("--binary-basis-columns", help="Comma-separated sample-table basis columns for pcgc-basis.")
     group.add_argument("--binary-basis-coefficients", help="Comma-separated coefficients; basis must span the risk sensitivity exactly.")
+    from .gxe_cli import add_arguments as add_gxe_arguments
+    add_gxe_arguments(group)
 
 
 def selected_columns(table, names):
@@ -109,6 +111,12 @@ def prepare(args):
         raise ValueError("binary --memory-gib requires a finite positive number")
     if args.step_size == "auto":
         raise ValueError("binary --block-size requires a positive integer; auto is supported only by GxE reference generation")
+    if getattr(args, "binary_context_columns", None):
+        from .gxe_cli import prepare as prepare_contextual
+        return prepare_contextual(args)
+    if any(getattr(args, name, None) for name in ("binary_unit_liability", "binary_liability_sd_column", "binary_ld_factorization",
+                                                "binary_genotype_covariates", "binary_reference_covariates", "binary_sampling_partners", "binary_architecture_probes")):
+        raise ValueError("contextual binary options require --binary-context-columns")
     with ExitStack() as stack:
         source = stack.enter_context(FileGenotypeSource(args.geno, genome_build=args.genome_build))
         scale = population_scale(args.binary_scale, source)
@@ -142,6 +150,8 @@ def run(args, argv):
                "--nvecs", "--seed", "--memory-gib", "--block-size",
                "--binary-basis-columns", "--binary-basis-coefficients", "--binary-reference-geno",
                "--geno", "--annot", "--out", "--h2", "--njack", "--num-threads"}
+    from .gxe_cli import OPTIONS
+    allowed |= OPTIONS
     explicit = explicit_options(argv)
     if explicit-allowed:
         raise ValueError("unsupported options for the binary analysis: "+", ".join(sorted(explicit-allowed)))
@@ -157,12 +167,18 @@ def run(args, argv):
         if "--njack" in explicit:
             raise ValueError("--njack belongs to inference after the reference is complete")
         artifact = prepare(args)
-        write_artifact(artifact, output)
+        if getattr(args, "binary_context_columns", None):
+            from .gxe_io import write_gxe_artifact
+            write_gxe_artifact(artifact, output)
+        else:
+            write_artifact(artifact, output)
     else:
         preparation_options = explicit - {"--binary-method", "--h2", "--out", "--njack", "--num-threads"}
         if preparation_options:
             raise ValueError("binary fit uses the saved binary file; remove preparation options: "+", ".join(sorted(preparation_options)))
-        artifact = load_artifact(args.h2)
+        from .gxe_io import is_gxe_artifact, load_gxe_artifact
+        contextual = is_gxe_artifact(args.h2)
+        artifact = load_gxe_artifact(args.h2) if contextual else load_artifact(args.h2)
         if args.binary_method != artifact.moments.method:
             raise ValueError("binary method disagrees with the prepared artifact; recompute raw scores/reference")
         from summit.inference.jackknife import JackknifeDesign, JackknifeSpec
@@ -178,10 +194,14 @@ def run(args, argv):
         if count > view.nsnps:
             raise ValueError(f"binary --njack ({count}) exceeds the {view.nsnps} SNPs; choose a smaller block count >=2")
         blocks = JackknifeDesign.from_trace_view(view, JackknifeSpec.parse(count)).unit_id
-        result = fit_moments(artifact.moments, block_ids=blocks)
-        result.update(kind="summit.pcgc.fit", schema_version=2, input_manifest_hash=artifact.manifest["manifest_hash"],
-                      risk=artifact.manifest["risk"],
-                      annotation_names=artifact.manifest["annotation_names"], diagnostics=artifact.manifest["diagnostics"])
+        if contextual:
+            from .gxe_cli import fit as fit_contextual
+            result = fit_contextual(artifact, blocks)
+        else:
+            result = fit_moments(artifact.moments, block_ids=blocks)
+            result.update(kind="summit.pcgc.fit", schema_version=2, input_manifest_hash=artifact.manifest["manifest_hash"],
+                          risk=artifact.manifest["risk"],
+                          annotation_names=artifact.manifest["annotation_names"], diagnostics=artifact.manifest["diagnostics"])
         output.parent.mkdir(parents=True, exist_ok=True)
         write_json(output, result)
     print(canonical_json({"output": str(output), "method": args.binary_method}))

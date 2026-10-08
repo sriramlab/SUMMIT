@@ -43,6 +43,11 @@
 #include "genotype.hpp"
 #include "mailman.hpp"
 
+// Older OpenBLAS headers and BLIS use CBLAS_ORDER; newer headers also expose
+// CBLAS_LAYOUT. The enum constant supplies the vendor's exact parameter type
+// without depending on that optional alias.
+using SummitCblasLayout = decltype(CblasRowMajor);
+
 #ifdef GWLDCORE_USE_BLIS
   #include <blis/blis.h>
 #if !defined(BLIS_ENABLE_TLS)
@@ -51,10 +56,6 @@
 #if !defined(BLIS_ENABLE_PTHREADS) || !defined(BLIS_ENABLE_PTHREADS_AS_DEFAULT)
   #error "The private upstream BLIS candidate must default to pthreads"
 #endif
-// Upstream BLIS 2.0 retains the original CBLAS_ORDER spelling while newer
-// CBLAS headers expose the same enum as CBLAS_LAYOUT. Keep the implementation
-// type-safe without changing the shared compatibility header.
-using CBLAS_LAYOUT = CBLAS_ORDER;
 #endif
 
 #if defined(GWLDCORE_USE_OPENBLAS) || defined(GWLDCORE_USE_BLIS)
@@ -1008,7 +1009,7 @@ bool append_operand_numa_page_samples(
 }
 
 GemmNumaPageSamples sample_gemm_operand_numa_pages(
-    CBLAS_LAYOUT layout,
+    SummitCblasLayout layout,
     CBLAS_TRANSPOSE transpose_a,
     CBLAS_TRANSPOSE transpose_b,
     int m,
@@ -2936,7 +2937,7 @@ thread_local std::shared_ptr<SharedNativeGemmOutputNumaEvidence>
     active_native_gemm_output_evidence;
 thread_local const double* active_native_gemm_output_begin = nullptr;
 thread_local size_t active_native_gemm_output_byte_count = 0;
-thread_local CBLAS_LAYOUT active_native_gemm_output_layout = CblasColMajor;
+thread_local SummitCblasLayout active_native_gemm_output_layout = CblasColMajor;
 
 void record_gemm_telemetry_immediate(GemmTelemetryRecord&& record) {
     auto& buffer = gemm_telemetry_buffer();
@@ -3025,7 +3026,7 @@ public:
     void register_output(
         const double* begin,
         size_t byte_count,
-        CBLAS_LAYOUT layout
+        SummitCblasLayout layout
     ) {
         if (!active_ || completed_ || begin == nullptr || byte_count == 0) {
             throw std::runtime_error(
@@ -3079,7 +3080,7 @@ private:
 };
 
 void validate_active_native_gemm_output_vendor_span(
-    CBLAS_LAYOUT layout,
+    SummitCblasLayout layout,
     int m,
     int n,
     const double* c,
@@ -3270,7 +3271,7 @@ void observed_vendor_dgemm(bool transpose_a,
                                native_integrity_snapshot_numa = nullptr);
 
 void observed_vendor_dgemm_general(
-    CBLAS_LAYOUT layout,
+    SummitCblasLayout layout,
     CBLAS_TRANSPOSE transpose_a,
     CBLAS_TRANSPOSE transpose_b,
     int m, int n, int k,
@@ -3407,7 +3408,7 @@ const char* cblas_transpose_name(CBLAS_TRANSPOSE transpose) {
 
 #ifdef GWLDCORE_USE_BLIS
 void execute_private_blis_gemm(
-    CBLAS_LAYOUT layout,
+    SummitCblasLayout layout,
     CBLAS_TRANSPOSE transpose_a,
     CBLAS_TRANSPOSE transpose_b,
     int m,
@@ -3486,7 +3487,7 @@ void execute_private_blis_gemm(
 #endif
 
 void observed_vendor_dgemm_general(
-    CBLAS_LAYOUT layout,
+    SummitCblasLayout layout,
     CBLAS_TRANSPOSE transpose_a,
     CBLAS_TRANSPOSE transpose_b,
     int m, int n, int k,
@@ -9347,7 +9348,7 @@ nb_numpy_mat2c<double> make_native_gemm_output_mat2c(
     NativeGemmOutputTelemetryScope& scope,
     NativeGemmOutputAllocation** allocation_out,
     double** output,
-    CBLAS_LAYOUT vendor_output_layout = CblasRowMajor
+    SummitCblasLayout vendor_output_layout = CblasRowMajor
 ) {
     const size_t elements = checked_mul(
         rows, columns, "native row-major GEMM output elements"

@@ -189,6 +189,9 @@ def _native(
     from summit import gxeldcore
 
     configured = int(gxeldcore.configured_blas_threads())
+    build = gxeldcore.build_info()
+    if build.get("blas_runtime_environment_immutable"):
+        configured = int(build["blas_runtime_threads"])
     execution_threads = configured if configured > 0 else threads
     flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
     descriptors = {
@@ -808,6 +811,9 @@ def test_descriptor_mutation_before_run_fails_without_publication(
     }
     try:
         configured = int(gxeldcore.configured_blas_threads())
+        build = gxeldcore.build_info()
+        if build.get("blas_runtime_environment_immutable"):
+            configured = int(build["blas_runtime_threads"])
         executor = GeneralizedGxENativeBEDExecutor(
             stable_descriptors=descriptors,
             row_selection=None,
@@ -872,6 +878,9 @@ def test_algebraic_checksum_fault_fails_before_publication(
     }
     try:
         configured = int(gxeldcore.configured_blas_threads())
+        build = gxeldcore.build_info()
+        if build.get("blas_runtime_environment_immutable"):
+            configured = int(build["blas_runtime_threads"])
         executor = GeneralizedGxENativeBEDExecutor(
             stable_descriptors=descriptors,
             row_selection=None,

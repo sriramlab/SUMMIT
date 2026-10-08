@@ -26,6 +26,7 @@ results go to `example/out/`.
 | Many traits or annotation models | [Batch analyses](Batch-analyses.md) |
 | One environment, including heterogeneous residual variance | [G×E models](GxE-models.md) |
 | Joint continuous and categorical environments | [Multiple environments](Multiple-environments.md) |
+| Supplied epistasis targets and backgrounds | [Quantitative epistasis](Epistasis.md) |
 | Shared genetic responses across traits | [Cross-trait response models](Cross-trait-analysis.md) |
 | Binary traits with case–control ascertainment | [Binary traits and PCGC](Binary-traits-and-PCGC.md) |
 | Context-dependent genetic prediction | [Polygenic scores](Polygenic-scores.md) |

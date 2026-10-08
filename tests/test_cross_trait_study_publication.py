@@ -81,8 +81,16 @@ def test_fused_study_driver_publishes_complete_summary_and_z(tmp_path,monkeypatc
         # Separate OS processes: no in-memory accumulator/native state can
         # survive the exit-75 boundary. Restore only the authenticated NPZ.
         native=gxeldcore.build_info()
-        launch=([sys.executable,str(script.with_name('private_python.py')),'cross_trait_study']
-                if native.get('private_blas_backend')=='upstream_blis' else [sys.executable,str(script)])
+        if native.get('private_blas_backend')=='upstream_blis':
+            launch=[sys.executable,str(script.with_name('private_python.py')),'cross_trait_study']
+        elif os.environ.get('SUMMIT_NATIVE_DIR'):
+            # A source-checkout parent loaded these extensions explicitly.
+            # Its fresh children must use the same qualified build, rather
+            # than finding an installed or absent native module by accident.
+            launch=[sys.executable,str(script.parents[1]/'epistasis/checkout_python.py'),
+                    'scripts.generalized_gxe.cross_trait_study']
+        else:
+            launch=[sys.executable,str(script)]
         launch=['taskset','-c',','.join(map(str,module.CPUS)),*launch]
         env=dict(os.environ,PYTHONDONTWRITEBYTECODE='1')
         first=subprocess.run([*launch,*command[1:],'--stop-after-blocks','2'],env=env,

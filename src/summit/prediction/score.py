@@ -4,7 +4,7 @@ from __future__ import annotations
 from dataclasses import dataclass, asdict
 import numpy as np
 
-from ._validation import array, digest, indices, positive_int
+from ._validation import array, array_digest, digest, indices, positive_int
 from .genotype import RawBlockStream, StandardizedBlock, native_module
 from .runtime import configure_prediction_threads
 
@@ -69,7 +69,8 @@ def align_variants(model_axis, source_axis, *, missing_variants="error"):
 
 
 def score_prediction(models, source, inputs, *, block_size=512, rhs_columns=64, threads=1,
-                     memory_bytes=16*2**30, missing_variants="error", backend="native"):
+                     memory_bytes=16*2**30, missing_variants="error", backend="native",
+                     components_only=False, adaptive_blocks=False):
     models = tuple(models)
     source.check()
     if not models or len({m.key for m in models}) != len(models):
@@ -78,6 +79,8 @@ def score_prediction(models, source, inputs, *, block_size=512, rhs_columns=64, 
         raise ValueError("scoring inputs must match the requested trait IDs exactly")
     if backend not in ("native", "numpy"):
         raise ValueError("unknown scoring backend")
+    if type(components_only) is not bool or type(adaptive_blocks) is not bool:
+        raise ValueError("components_only and adaptive_blocks must be boolean")
     for key, val in dict(block_size=block_size, rhs_columns=rhs_columns, threads=threads, memory_bytes=memory_bytes).items():
         positive_int(val, key)
     groups, maps, reports = {}, {}, {}
@@ -90,11 +93,16 @@ def score_prediction(models, source, inputs, *, block_size=512, rhs_columns=64, 
             raise ValueError("scoring sample index outside source")
         if digest(features.context_spec) != digest(model.context_spec) or digest(features.fixed_spec) != digest(model.fixed_spec):
             raise ValueError("scoring context/fixed recipe does not match model")
-        if features.phi.shape[1] != model.weights.shape[1] or features.fixed.shape[1] != len(model.fixed_coefficients):
+        fixed_count = 0 if components_only else len(model.fixed_coefficients)
+        if features.phi.shape[1] != model.weights.shape[1] or features.fixed.shape[1] != fixed_count:
             raise ValueError("scoring feature dimensions disagree with model")
         if rhs_columns < model.weights.shape[1]:
             raise ValueError("scoring RHS tile must fit a complete model")
-        group = (model.trait_id, model.scale.identity, model.variants.identity)
+        # Genotype component scores depend on rows, affine scale and alleles,
+        # not on the phenotype name or its later context/fixed combination.
+        # Share standardization and GEMM across compatible trait models too.
+        group = (array_digest(features.rows), model.scale.identity,
+                 model.variants.identity, model.weights.shape[1])
         if group not in maps:
             maps[group] = align_variants(model.variants, source.variants, missing_variants=missing_variants)
         mapping = maps[group]
@@ -104,9 +112,16 @@ def score_prediction(models, source, inputs, *, block_size=512, rhs_columns=64, 
     rows = np.unique(np.concatenate([inputs[m.trait_id].rows for m in models]))
     variants = np.unique(np.concatenate([x[1] for x in maps.values()]))
     nmax = max(len(inputs[m.trait_id].rows) for m in models)
-    outputs_bytes = sum(8*len(inputs[m.trait_id].rows)*(m.weights.shape[1]+2) for m in models)
-    scratch_bytes = 8*(4*len(rows)*block_size+8*nmax*rhs_columns)+256*2**20
+    outputs_bytes = sum(8*len(inputs[m.trait_id].rows)*(m.weights.shape[1]+(0 if components_only else 2)) for m in models)
     model_bytes = sum(m.weights.nbytes for m in models) + 256*(len(source.samples)+len(source.variants.ids))
+    requested_block_size = block_size
+    fixed_scratch = 64*nmax*rhs_columns+256*2**20
+    if adaptive_blocks:
+        # Bound the actual live block before any genotype traversal. Only the
+        # tile changes; models, allele alignment and score definition do not.
+        affordable = (memory_bytes-outputs_bytes-model_bytes-fixed_scratch)//(32*len(rows))
+        block_size = max(1,min(block_size,max(1,len(variants)),int(affordable)))
+    scratch_bytes = 32*len(rows)*block_size+fixed_scratch
     if outputs_bytes+scratch_bytes+model_bytes > memory_bytes:
         raise MemoryError("scoring outputs and bounded blocks exceed budget; split the requested samples/models and account for additional passes")
     components = {m.key: np.zeros((len(inputs[m.trait_id].rows), m.weights.shape[1]), order="F") for m in models}
@@ -145,6 +160,10 @@ def score_prediction(models, source, inputs, *, block_size=512, rhs_columns=64, 
     genetic, predictions = {}, {}
     for m in models:
         m.check()
+        if components_only:
+            if not np.all(np.isfinite(components[m.key])):
+                raise FloatingPointError("nonfinite component scores")
+            continue
         f = inputs[m.trait_id]
         genetic[m.key] = np.einsum("nq,nq->n", components[m.key], f.phi)
         if native is not None and f.fixed.shape[1]:
@@ -162,5 +181,8 @@ def score_prediction(models, source, inputs, *, block_size=512, rhs_columns=64, 
     return ScoreResult({t: tuple(source.samples[int(i)] for i in f.rows) for t, f in inputs.items()},
         components, genetic, predictions, {m.key: m.identity for m in models},
         dict(alignment=reports, ledger=ledger, output_units="model phenotype units",
+             components_only=components_only, adaptive_blocks=adaptive_blocks,
+             block_size=block_size, requested_block_size=requested_block_size,
+             affine_groups=len(groups),
              allocated_output_bytes=outputs_bytes, estimated_scratch_bytes=scratch_bytes,
              model_and_axis_bytes=model_bytes))

@@ -135,11 +135,21 @@ def test_interrupted_fit_resumes_identical_models_and_rejects_changed_fit(tmp_pa
     for a, b in zip(actual, expected):
         np.testing.assert_array_equal(a.weights, b.weights)
         np.testing.assert_array_equal(a.fixed_coefficients, b.fixed_coefficients)
-    # A fully solved checkpoint can re-export without another covariance pass.
+    # Re-export authenticates completed solutions with one fresh covariance
+    # product; it must not repeat CG or trust the saved residual report alone.
+    checks = []
+    def verify_completed(self, vectors, **kw):
+        assert kw.get("phase") == "verification"
+        checks.append(tuple(vectors))
+        return original(self, vectors, **kw)
     with monkeypatch.context() as patch:
-        patch.setattr(GenotypeOperator, "apply", lambda *a, **kw: pytest.fail("completed solve repeated"))
-        fit_prediction(traits, source, output=tmp_path/"reexport", plan=plan, solver=spec,
+        patch.setattr(GenotypeOperator, "apply", verify_completed)
+        reexport = fit_prediction(traits, source, output=tmp_path/"reexport", plan=plan, solver=spec,
             backend=backend, checkpoint=checkpoint, resume=True)
+    assert len(checks) == 1 and len(checks[0]) == sum(len(t.candidates) for t in traits)
+    for a, b in zip(reexport, expected):
+        np.testing.assert_array_equal(a.weights, b.weights)
+        np.testing.assert_allclose(a.fixed_coefficients, b.fixed_coefficients, rtol=1e-13, atol=1e-13)
 
 
 def test_checkpoint_lock_atomicity_and_checksum(tmp_path, monkeypatch):
