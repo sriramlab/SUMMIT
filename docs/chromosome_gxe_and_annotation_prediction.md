@@ -1,84 +1,59 @@
 # Chromosome LD and annotation-dependent prediction
 
-The chromosome estimator computes SNP-pair LD **only within each chromosome**,
-using the existing stochastic variant-axis reference. It then forms one
-genome-wide normal system and estimates a single covariance per annotation.
-It does not average separately fitted chromosome covariance estimates.
+The chromosome estimator computes within-chromosome SNP-pair LD and combines
+the moments in a single genome-wide fit. It estimates one covariance matrix
+per annotation using the same participants, genotype scaling, context basis,
+and fixed-effect span for reference and trait summaries. Population transfer
+is not implemented for these summaries.
 
-This approximation requires
-the same participants, genotype scaling, context basis and fixed-effect span
-for reference and trait statistics. Population transfer is not implemented for
-these summaries.
+## Normalization and approximation
 
-## Global normalization and joint estimation
+For annotation weights A[j,k], define M[k] as their sum over all chromosomes.
+A chromosome contributes
 
-For annotation weights A[j,k], define M[k] = sum over **all chromosomes** of
-A[j,k]. A chromosome's kernel contribution is
-
-    K[c,k,qr] = sum_{j in c} A[j,k] F[q,j] F[r,j]' / M[k]
+```text
+K[c,k,qr] = sum_{j in c} A[j,k] F[q,j] F[r,j]' / M[k]
+```
 
 with the symmetric second orientation included when q != r, and
-F[q] = (I - UU') diag(phi[q]) G. The native chromosome reference uses local
-annotation masses; its unnormalized numerators are converted to the shared
-global masses during joint assembly. A small chromosome therefore contributes
-its share of the genome-wide annotation variance. An annotation absent on one
-chromosome is omitted from that native task and embedded as zero in reduction.
+`F[q] = (I - UU') diag(phi[q]) G`. Global annotation masses give each chromosome
+its share of the genome-wide variance. An annotation absent on one chromosome
+contributes zero there.
 
-Let T[c] be the within-chromosome genetic Gram, B[c] the genetic/residual cross
-moments, C the common residual Gram, g[c] the genetic RHS and r the residual RHS.
-The joint profiled system is
+Joint estimation includes one shared set of residual coefficients. The
+approximation sets cross-chromosome residual-projected kernel products to
+zero. Local LD makes this plausible, but population structure, relatedness,
+and genotype–context dependence can affect its accuracy. Assess agreement
+with a genome-wide reference for the intended cohort.
 
-    A = sum_c {T[c] - B[c] solve(C, B[c]')}
-    u = sum_c {g[c] - B[c] solve(C, r)}.
+## Preparing and combining chromosome summaries
 
-The normal system returned by `joint_chromosome_equations` reconstructs a
-single shared residual coefficient vector with B = sum_c B[c]. This counts
-C and r once. Simply summing T[c] and coupling that sum to B would subtract
-cross-chromosome residual background without retaining the corresponding
-genetic background, potentially producing negative information.
+`GeneralizedGxENativeBEDExecutor` can read a chromosome from a merged BED using
+`variant_start` and `annotations.shape[0]`, or from a chromosome BED with
+`variant_start=0`. It makes two passes over that interval. Check chromosome
+membership and shared sample and variant identities before execution.
 
-The approximation sets cross-chromosome **residual-projected** kernel products
-to zero. It computes no cross-chromosome LD. Local LD makes this plausible;
-population structure, relatedness and genotype/context dependence can affect
-its accuracy. Concordance must be assessed on the actual cohort.
+Supplying normalized residual `phenotypes` and a `residual_basis` computes
+trait summaries in the same passes. Set the planner's `num_traits` and
+`num_residual_components` accordingly. Sharing this reference across traits
+requires identical sample and design definitions.
 
-## Execution and artifacts
+`reduce_chromosome_result` reduces the reference and trait moments.
+`write_chromosome_moments` saves them with checksums and provenance to a new
+file. `joint_chromosome_equations(..., expected_chromosomes=range(1, 23))`
+checks for missing, duplicate, and incompatible chromosome contributions
+before assembly. The residual basis must begin with the constant-one kernel.
 
-`GeneralizedGxENativeBEDExecutor` accepts `variant_start` and uses exactly
-`annotations.shape[0]` consecutive variants. It reuses the descriptor-owned
-decoder and performs two traversals of that interval. Thus a chromosome can
-be read from a merged BED without copying it, or from an existing chromosome
-BED using `variant_start=0`. The caller must verify chromosome membership
-and the shared sample/variant identities before execution.
+`combine_chromosome_annotations(chunk, weights, names)` reuses these summaries
+for `A_new = A @ weights`, including nonnegative overlapping combinations.
+An all-one column combines disjoint bins covering the panel into an
+unpartitioned model. The fit recomputes annotation masses from the combined
+moments, allowing overall and partitioned estimates from the same genotype
+passes.
 
-Optional `phenotypes` (normalized residual phenotypes) and `residual_basis`
-enable fused per-SNP trait statistics from the already projected feature tiles.
-The planner must receive the corresponding `num_traits` and
-`num_residual_components`. These outputs add no genotype traversal and share
-the costly reference across traits with exactly matching sample/design axes.
-Nonmatching trait masks must not be combined as though they shared a reference.
-
-`reduce_chromosome_result` reduces fixed LD and trait rows after execution.
-`write_chromosome_moments` publishes compact arrays with content checksums and
-caller-supplied provenance, refusing to overwrite an existing file.
-`joint_chromosome_equations(..., expected_chromosomes=range(1, 23))` rejects
-duplicate, missing, and incompatible chromosome contributions. The residual
-basis must begin with the constant-one kernel. The resulting equations use
-the existing rank-checked solver.
-
-`combine_chromosome_annotations(chunk, weights, names)` reuses these compact
-moments for the design `A_new = A @ weights`. An all-one column merges disjoint
-MAF bins covering the panel into the unpartitioned model. This produces both
-overall and partitioned estimates from the same genotype passes. It combines
-unnormalized moments and recomputes global masses in each fit and deletion;
-it does not average the fitted bin coefficients. It also supports nonnegative
-overlapping combinations of the existing annotations.
-
-Block deletion is post hoc: source sketches remain frozen, selected target
-rows are removed, and global retained annotation masses are used. The nuisance
-correction uses retained target B and full source B, symmetrized after reduction.
-This is an approximate target-row jackknife, not a chromosome bootstrap or
-an exact refit. No inference blocks enter native LD construction.
+SNP-block deletion removes selected target rows and updates retained annotation
+masses while holding source reference sketches fixed. This is an approximate
+jackknife; it excludes reference-probe variation and cross-chromosome LD.
 
 ## Annotation-dependent prediction
 
@@ -99,23 +74,17 @@ candidate = prior.candidate(
 )
 ```
 
-The SNP prior is Lambda[j] = sum_k A[j,k] Omega[k] / M[k]. The implementation
-forms only a bounded variant-by-candidate covariance tile. Each batched
-operator application still has one shared genotype traversal and two large
-genotype products per RHS tile. Homogeneous and annotated candidates can share
-the same batch. A design can be reused across candidates without duplicating
-the M-by-K matrix. Content identities are cached on immutable backing stores.
+The SNP prior is `Lambda[j] = sum_k A[j,k] Omega[k] / M[k]`. Homogeneous and
+annotated candidates can share genotype reads and run in the same batch.
+Annotation designs must match the ordered training SNPs and alleles.
 
 Native annotation fits using BLIS require `GXELDCORE_GEMM_INTEGRITY=ON`
 and `GXELDCORE_GEMM_CHECKSUM=ON` when building. These numerical checks are
 required by the prediction backend.
 
-The positive aggregate-covariance diagonal is an approximate preconditioner;
-the covariance operator and exported weights use the exact per-SNP priors.
-Convergence is checked against the actual operator. Planning, checkpoint
-identity, interruption/resume, export and reloaded scoring use the regular
-prediction API. Annotation designs must match the ordered training SNPs and alleles. No annotations are needed when scoring saved
-posterior weights.
+Planning, checkpoints, model saving, and scoring use the regular
+[prediction API](wiki/PGS-API.md). The fitted weights use the supplied per-SNP
+priors. Scoring saved weights requires no annotation input.
 
 For the CLI, write a design with `write_annotation_design(path, design)` and
 use a candidate with `operation: "annotation"`, `annotation_design` (a path
@@ -125,9 +94,8 @@ specifications still apply. Candidate construction does not estimate the
 annotation covariances or select hyperparameters; those must come from the
 declared training/tuning procedure.
 
-With overlap, Omega[k] is a conditional covariance contribution, not the
-covariance of all variants carrying label k. For a variant set S, reconstruct
-its covariance as sum_{j in S} Lambda[j]. Requiring PSD components is a
+With overlap, Omega[k] is a conditional covariance contribution. The covariance
+of a variant set S is `sum_{j in S} Lambda[j]`. Requiring PSD components is a
 sufficient, interpretable restriction, but it excludes negative conditional
 increments. In particular, an all-SNP-plus-coding PSD prior only adds coding
 variance. Start with disjoint coding/noncoding bins if both enrichment and

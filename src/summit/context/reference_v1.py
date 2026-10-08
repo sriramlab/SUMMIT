@@ -1,13 +1,8 @@
-"""Stable V1 publication boundary for native contextual reference statistics.
+"""Native contextual reference statistics estimated with sample-axis probes.
 
-Estimator identity: this module implements the sample-axis-probe aggregate
-contextual covariance/action estimator. It is not the generalized per-variant
-GxE LD-score estimator, whose contract is documented in
-``docs/generalized_gxe_variant_ldscore_contract.md``.
-
-This module is intentionally separate from :mod:`summit.context.reference`.
-The latter contains the private NumPy development formats; neither loader
-accepts artifacts from the other family.
+See ``docs/wiki/Methods.md`` for the generalized per-variant GxE LD-score
+estimator. This module and :mod:`summit.context.reference` use separate file
+formats; each loader accepts only its corresponding format.
 """
 
 from __future__ import annotations

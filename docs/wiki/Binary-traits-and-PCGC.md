@@ -43,8 +43,9 @@ The sample table selects the analyzed people. IDs and SNPs must be unique;
 missing phenotypes, risks, or selected covariates are rejected. Encode categorical
 covariates numerically and omit an intercept column; the risk fit includes one.
 
-## Prepare and fit
+## Prepare reference and trait moments
 
+`--make-binary-sumstats` computes both the PCGC reference and trait moments.
 For age and another exogenous risk factor:
 
 ```bash
@@ -55,12 +56,9 @@ summit --binary-method pcgc \
   --binary-covariates AGE,RISK_FACTOR \
   --nvecs 256 --memory-gib 4 \
   --num-threads 4 --out results/trait_pcgc
-
-summit --binary-method pcgc \
-  --h2 results/trait_pcgc.binary.npz --out results/trait_pcgc_fit
 ```
 
-The first command fits an ascertainment-aware population-probit risk model.
+This command fits an ascertainment-aware population-probit risk model.
 For supplied individual population risks, replace `--binary-covariates` with
 `--binary-risk-column RISK`. `--binary-covariate-variance` optionally supplies
 the population variance of the covariate liability predictor.
@@ -69,11 +67,28 @@ Add `--annot annotations.tsv` at preparation for partitioned estimates.
 This table contains `SNP` followed by weight columns, with every genotype SNP
 present exactly once. Without it, SUMMIT fits one component over all SNPs.
 
-Preparation writes `.binary.npz`; inference writes `.binary.json`. The output
-contains conditional and marginal component estimates and SEs, totals, risk
-diagnostics, and reference diagnostics. Existing output files are not overwritten.
-Use the same method at both stages. Changing risks, prevalence, or the sample
-selection requires preparing new moments.
+Preparation writes `results/trait_pcgc.binary.npz`. This NumPy archive contains
+PCGC LD-score rows, trait score products, same-person corrections, annotations,
+and their shared variant, scale, and risk metadata. Standard PCGC uses a
+study-specific, risk-weighted reference; saving it with the trait moments keeps
+the two consistent. The [input guide](Input-files.md#files-used-for-inference)
+compares this format with quantitative-trait summaries.
+
+Changes to risks, prevalence, population genotype scaling, or sample selection
+require new preparation. Existing output files are not overwritten.
+
+## Fit the saved moments
+
+```bash
+summit --binary-method pcgc \
+  --h2 results/trait_pcgc.binary.npz --out results/trait_pcgc_fit
+```
+
+Use the same method at both stages. The archive supplies both reference and
+trait moments, so fitting needs no separate `--ldscores` file or genotype input.
+It writes `results/trait_pcgc_fit.binary.json`, containing conditional and
+marginal component estimates and SEs, totals, risk diagnostics, and reference
+diagnostics.
 
 ## Choose a method
 
@@ -122,10 +137,11 @@ the covariate predictor, fixed at one. Marginal estimates divide by
 annotations, components are conditional contributions, not heritability of
 each annotation's SNP set in isolation.
 
-The model assumes case-status sampling, exogenous risk covariates, and a
-compatible population genotype scale. It does not implement ancestry adjustment
-by ordinary covariate projection. See the [PCGC methods](../pcgc.md) for
-the estimating equations and assumptions of each method.
+The additive model assumes case-status sampling, exogenous risk covariates,
+and a compatible population genotype scale, with unprojected genotype features.
+For genotype-PC adjustment in the generalized G×E path, see
+[Covariate adjustment](../pcgc_gxe.md#covariate-adjustment).
+The [PCGC methods](../pcgc.md) give the additive estimating equations.
 
 ## Computation and cross-trait work
 
@@ -143,6 +159,6 @@ Binary–binary and binary–quantitative covariance are available through
 `summit.pcgc.cross.prepare_pair` and `fit_pair` under an explicit marginal
 case-status sampling assumption. Shared controls require aligned sample IDs and
 a compatible selection design. This remains a research Python API; binary
-`--rg` and general cross-study binary artifacts are not exposed.
+`--rg` and general cross-study binary summary files are not exposed.
 
 See the [PCGC methods](../pcgc.md) for the equations and API limits.

@@ -70,25 +70,33 @@ participant-specific residual variances, rank-deficient fixed covariates,
 singular genetic covariances and differing participant masks across traits.
 The context dimension is limited to 32.
 
-For a CLI fit specification, set
+In the [CLI fit specification](wiki/Polygenic-scores.md#fit-and-inspect),
+replace the `solver` field with the following setting. These snippets show the
+fields to add to the full specification or candidate object.
 
 ```json
-"solver": {"kind": "mixture", "rtol": 1e-7, "max_sweeps": 100}
+{
+  "solver": {"kind": "mixture", "rtol": 1e-7, "max_sweeps": 100}
+}
 ```
 
-and add to every candidate:
+Add a `mixture` field to every candidate:
 
 ```json
-"mixture": {"probability": 0.01, "small_variance_fraction": 0.1}
+{
+  "mixture": {"probability": 0.01, "small_variance_fraction": 0.1}
+}
 ```
 
-For separate sparsity, use:
+For separate sparsity, use this candidate field:
 
 ```json
-"mixture": {
-  "kind": "separate_sparsity",
-  "baseline": {"probability": 0.01, "small_variance_fraction": 0.1},
-  "response": {"probability": 0.1, "small_variance_fraction": 0.2}
+{
+  "mixture": {
+    "kind": "separate_sparsity",
+    "baseline": {"probability": 0.01, "small_variance_fraction": 0.1},
+    "response": {"probability": 0.1, "small_variance_fraction": 0.2}
+  }
 }
 ```
 
@@ -99,12 +107,9 @@ candidate menu does not itself perform cross-validation.
 
 ## Computation and convergence
 
-The variational distribution factors across SNPs, retaining a full joint
-response distribution within each SNP. Blockwise Gauss–Seidel updates use
-cached projected Gram matrices. Candidates sharing a residual surface reuse
-the same genotype products. Fixed-covariate projections and component
-posterior precisions are cached once; later passes apply the projection to
-candidate updates instead of projecting all SNP columns again.
+The variational distribution factors across SNPs and retains a joint response
+distribution within each SNP. Fitting uses blockwise updates and cached local
+Gram matrices. Candidates sharing a residual surface reuse genotype products.
 
 No full genome-wide LD matrix is formed. Gram storage is proportional to
 `M * block_size * Q**2` per distinct trait/residual group, with additional
@@ -114,13 +119,12 @@ Use the planner on the actual traits and candidate menu before choosing these
 settings. An individual Gaussian or small-panel timing does not establish
 full-menu throughput.
 
-Convergence requires an independent simultaneous site-update check after
-reconstructing the residual from all saved weights, as well as fixed-effect
-orthogonality. The artifact records `method="mixture_vb_fixed_point"` and the
-observed error and threshold. This checks convergence to a variational fixed point; it does not establish
-an exact posterior or a global optimum.
-The objective is monitored for decreases. LDAK can reach a different fixed
-point because update order, initialization and stopping criteria differ.
+The fit checks simultaneous site updates and fixed-effect orthogonality
+against independently reconstructed residuals. The saved model records
+`method="mixture_vb_fixed_point"`, the convergence error, and its threshold.
+The solution is a variational fixed point; an exact posterior or global
+optimum is not guaranteed. Update order, initialization, and stopping criteria
+can lead to different fitted weights across implementations.
 
 Checkpoints save weights, residuals, site penalties, and objective history
 after each complete sweep. Residuals are independently reconstructed after
@@ -133,11 +137,9 @@ directories are never overwritten. See [Installation](wiki/Installation.md)
 for the native build requirements.
 
 The Python API also accepts `initial_weights`, with exactly one finite array
-per candidate. This starts a new fit and reconstructs residuals and variational
-state. It cannot be combined with checkpoint resume, and the initial arrays
-are hashed in checkpoint initialization provenance. Resume authenticates the
-unchanged fitting problem and saved iterative state without requiring the
-original warm-start array again.
+per candidate, to initialize a new fit. Use either `initial_weights` or
+checkpoint resume. Resuming uses the saved state and requires no original
+initial-weight array.
 
 ## Matching an additive comparator
 

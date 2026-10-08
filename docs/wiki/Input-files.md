@@ -18,7 +18,8 @@ Convert BGEN or compressed PVAR input before running SUMMIT. If both genotype
 formats share a prefix, specify the desired filename.
 
 PGEN is supported for genome-wide, windowed, and one-environment G×E LD scores,
-and PGS. The direct generalized reference executor currently reads BED.
+PCGC preparation, and PGS. The direct quantitative generalized reference
+executor currently reads BED.
 
 ## GWAS summary statistics
 
@@ -52,11 +53,35 @@ Optional `COV_RANK` or `P_EFF` gives the number of non-intercept GWAS covariates
 h² calculation uses a covariate-rank value of zero, including when h² supplies
 the denominator for rg. [Methods](Methods.md) explains the calculation.
 
-Binary PCGC uses a separate joint `.binary.npz` artifact containing compatible
-trait and reference moments. Prepare it from a `FID IID Y` table, population
-prevalence, population genotype scales, and optional risk covariates; see
-[Binary traits and PCGC](Binary-traits-and-PCGC.md). Its annotation TSV has
-`SNP` followed only by named nonnegative weight columns.
+PCGC uses moments prepared from individual binary outcomes and genotypes.
+The [PCGC guide](Binary-traits-and-PCGC.md) describes its sample table,
+population scales, risks, and annotation format.
+
+## Files used for inference
+
+Reference and trait summaries are stored differently across workflows:
+
+| Workflow | Reference input | Trait input |
+|---|---|---|
+| Additive h²/rg | LD scores, usually `.ldscore.gz` | Summary statistics with BETA and SE |
+| One-environment quantitative G×E | `.gxe.ref.json` describing the reference files | `.gxe.gwas.tsv.gz`, `.gxe.gwis.tsv.gz`, and `.gxe.moments.json` per trait |
+| Generalized quantitative G×E | `.generalized-gxe-variant-ldscore-v1.npz` | `.generalized-gxe-trait-summary-v1.npz` |
+| Additive or generalized G×E PCGC | One `.binary.npz` file containing both reference and trait moments | Included in the same file |
+
+In the PCGC command, `--make-binary-sumstats` prepares **both** sets of moments.
+The resulting archive also stores their common variant definitions, scaling
+metadata, and any requested uncertainty summaries. Fitting reads this file
+through `--h2` and needs no genotype input. These trait moments are PCGC score
+products with same-person terms removed; they are not a table of marginal
+BETA and SE values.
+
+Standard PCGC's reference weights depend on the disease-risk model and analyzed
+sample. Keeping the corresponding moments together prevents mismatched inputs.
+This is a storage choice: separate files could represent the same estimator
+if their shared definitions were checked. The current PCGC interface accepts
+the combined file. See [Generalized G×E PCGC](../pcgc_gxe.md) for its contents
+and [Multiple environments](Multiple-environments.md) for the quantitative
+Python interface.
 
 ## LD scores and annotations
 

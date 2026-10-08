@@ -51,7 +51,10 @@ Use `--binary-unit-liability` for the unit conditional variance model.
 For known heterogeneous SDs, use `--binary-risk-column RISK` together with
 `--binary-liability-sd-column SD`.
 
-## Prepare and fit
+## Prepare reference and trait moments
+
+`--make-binary-sumstats` computes both the PCGC directional LD scores and
+the trait score moments:
 
 ```bash
 summit --binary-method pcgc \
@@ -63,15 +66,43 @@ summit --binary-method pcgc \
   --binary-sampling-partners 128 --binary-architecture-probes 32 \
   --nvecs 256 --memory-gib 8 --num-threads 2 \
   --out results/disease_gxe
+```
 
+This writes `results/disease_gxe.binary.npz`, a NumPy archive containing:
+
+| Contents | Purpose |
+|---|---|
+| `ldscores` | PCGC directional reference rows with same-person terms removed |
+| `rhs_rows` | Per-SNP context-pair trait score products with same-person terms removed |
+| Annotations and population moments | Component definitions and population heritability calculation |
+| Metadata | Variant order, alleles, context names, scales, risk diagnostics, and compatibility checks |
+| Optional covariance summaries | Sampling and SNP-effect uncertainty calculations requested during preparation |
+
+Standard PCGC's reference depends on the analyzed sample and risk model.
+Preparation computes the matched reference and trait moments together, so
+SUMMIT saves them in one file. This also retains the additional arrays needed
+for uncertainty estimation. Separate reference and trait files would be
+mathematically equivalent if their definitions were checked; the current
+interface uses the combined archive. The [input guide](wiki/Input-files.md#files-used-for-inference)
+compares this with the quantitative workflows.
+
+Add `--annot annotations.tsv` for partitioned estimates. Changes to risks,
+prevalence, genotype scaling, context coding, or sample selection require new
+preparation. Choose a new output prefix for each preparation.
+
+## Fit the saved moments
+
+```bash
 summit --binary-method pcgc --h2 results/disease_gxe.binary.npz \
   --njack 100 --out results/disease_gxe_fit
 ```
 
-Preparation writes `.binary.npz`; fitting writes `.binary.json`. Use new
-output paths and the same method at both stages. Add `--annot annotations.tsv`
-for partitioned estimates. Changing risks, context coding, or sample selection
-requires preparing new moments.
+`--h2` reads both sets of moments from the archive; no separate `--ldscores`
+file or genotype input is needed. Use the same PCGC method as in preparation.
+Fitting writes `results/disease_gxe_fit.binary.json`. You can reuse the archive
+with a different `--njack` value and a new output prefix.
+
+## Covariate adjustment
 
 Genotype-PC adjustment removes the supplied PC directions from X before
 context and risk weighting. These PCs also enter fitted risks. The binary

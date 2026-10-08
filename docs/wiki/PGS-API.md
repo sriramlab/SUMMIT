@@ -109,8 +109,8 @@ operations. A spectral rank cut cannot divide a nonzero tied eigenspace.
 
 ## Model files
 
-New model bundles use format 2. Traits with the same variant axis and affine
-scale share authenticated members instead of duplicating them in the manifest.
+New model bundles use format 2. Traits with the same variants and genotype
+scaling share those saved arrays.
 Copy the complete model directory when moving a bundle. The current loader
 also reads format-1 models; older loaders require an update to read format 2.
 
@@ -129,8 +129,8 @@ is `Phi @ c`, so it can depend on context. It cannot generally be replaced by
 one global intercept.
 
 The solver accepts a fit only after evaluating its true residual against the
-requested tolerance. A failed candidate raises `ConvergenceError`; no complete
-model bundle is published. See [Methods](Methods.md) for the linear system.
+requested tolerance. If a candidate fails, fitting raises `ConvergenceError`
+and leaves no completed model. See [Methods](Methods.md) for the linear system.
 
 ## Long fits and restart state
 
@@ -139,17 +139,16 @@ state after each completed solver pass. If the process is interrupted, repeat
 the call with the same arguments and `resume=True`. CLI equivalents are
 `--checkpoint private/solver.npz` and `--resume`.
 
-The checkpoint stores search directions, residuals, solutions, pending true
-checks, and already verified candidates. It does not store the genotype cache;
-resuming rebuilds that cache in one source pass. An interrupted pass is repeated.
-The file is replaced atomically and an exclusive sidecar lock rejects duplicate
-writers. The input, prior, solver, Python/native implementation, thread count,
-and block/RHS sizes must match. Existing checkpoints require explicit resume;
-existing output bundles are never overwritten. A solved checkpoint can export
-to a new directory if interruption left an incomplete model directory. Before
-reusing a completed solution, SUMMIT recalculates its full covariance residual
-and finite-mean coefficients. This adds one verification product and stops if
-the original convergence tolerance fails; the saved checkpoint is preserved.
+The checkpoint saves the iterative solver state. Resume rebuilds the genotype
+cache in one source pass and repeats any interrupted solver pass. Use matching
+inputs, priors, solver settings, Python/native versions, thread counts, and
+block/RHS sizes. Existing checkpoints require explicit resume; output model
+directories are never overwritten.
+
+If interruption left an incomplete model directory, a solved checkpoint can
+write to a new directory after rechecking convergence. A completed model
+contains the fitted weights; resuming an interrupted fit requires its solver
+checkpoint.
 
 Checkpoint vectors are individual-level training data. Keep the checkpoint and
 its `.lock` alongside protected training inputs, outside portable model bundles.
@@ -171,7 +170,7 @@ Use the CPUs actually assigned by the scheduler.
 
 ## Calibration and evaluation
 
-`select_and_calibrate` compares frozen score candidates on pilot data using
+`select_and_calibrate` compares fitted score candidates on pilot data using
 nested folds and ridge mean calibration. Centering and scaling are estimated
 inside each training fold. Save the selected calibration and reload it with
 `load_mean_calibration` for final evaluation.

@@ -16,8 +16,10 @@ numerical kernels are in `src/native`. Read [AGENTS.md](AGENTS.md) and the
 [methods](docs/wiki/Methods.md) before changing reference estimators.
 
 Edit user guides in `docs/wiki`; these are also the GitHub Wiki sources.
-Document inputs, commands, outputs, and scientific assumptions in the relevant
-guide. Keep development logs and machine-specific job histories out of it.
+Additional method guides are listed in [docs/README.md](docs/README.md).
+Keep one current guide for each topic and update links when removing an obsolete
+page. Document inputs, commands, outputs, and scientific assumptions. Keep
+development logs and machine-specific job histories out of user guides.
 
 Before publishing, run `python scripts/check_repository_content.py`.
 Tests and examples must use synthetic or published aggregate data.

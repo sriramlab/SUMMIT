@@ -1,17 +1,17 @@
 # Multiple environments
 
-A joint model estimates a covariance matrix of SNP effects across a context
-basis. For example, `[1, exposure1, exposure2]` includes baseline effects,
-each environmental response, and their covariances. Contexts can be continuous,
-categorical, or a specified combination.
+For a quantitative trait, a joint model estimates a covariance matrix of SNP
+effects across a context basis. For example, `[1, exposure1, exposure2]` includes
+baseline effects, each environmental response, and their covariances. Contexts
+can be continuous, categorical, or a specified combination.
 
 The [cross-trait extension](Cross-trait-analysis.md) estimates the corresponding
 covariance between two traits, with separate sample masks and overlap handling.
 
 For binary disease outcomes, use the [generalized PCGC path](../pcgc_gxe.md).
-It retains the context covariance axes but uses ascertainment-aware risks,
-unprojected features, and distinct-person moments on an explicitly declared
-liability scale. Quantitative trait summaries cannot be reused as PCGC inputs.
+The PCGC command estimates the same types of effect covariance on a declared
+liability scale, accounting for disease risks and case–control sampling.
+It prepares its own reference and trait moments.
 
 ## Workflow
 
@@ -59,6 +59,39 @@ summit reference inspect \
 The example source shows how to construct the executor and adapt its result.
 `scripts/generalized_gxe/workflow.py` contains reference, trait, and fitting
 helpers used by the research runners. Those runners require explicit local inputs.
+
+## Reference and trait files
+
+The quantitative Python workflow stores the two inputs separately:
+
+- `.generalized-gxe-variant-ldscore-v1.npz` contains the reference LD-score moments.
+- `.generalized-gxe-trait-summary-v1.npz` contains the corresponding trait moments.
+
+Once both files have been prepared with matching definitions, fit a trait with:
+
+```python
+from summit.ldscore.generalized_gxe_reference_v1 import (
+    load_generalized_gxe_variant_reference_v1,
+)
+from summit.ldscore.generalized_gxe_trait_summary import (
+    load_generalized_gxe_trait_summary,
+)
+from summit.ldscore.generalized_gxe_fit_v1 import fit_generalized_gxe_variant_model_v1
+
+reference = load_generalized_gxe_variant_reference_v1(
+    "results/reference.generalized-gxe-variant-ldscore-v1.npz"
+)
+trait = load_generalized_gxe_trait_summary(
+    "results/trait.generalized-gxe-trait-summary-v1.npz"
+)
+fit = fit_generalized_gxe_variant_model_v1(reference, trait, trait_selector="trait1")
+```
+
+Use a trait name saved in the summary. The fitter checks compatibility and
+uses the saved SNP-block definitions for its jackknife. A reference can be
+reused across traits with compatible samples, scaling, contexts, and fixed
+effects. [PCGC preparation](../pcgc_gxe.md) saves its reference and trait moments
+together in one `.binary.npz` file.
 
 ## Reusing annotation columns
 

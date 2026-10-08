@@ -84,7 +84,7 @@ checks does not establish calibration for an arbitrary study.
 
 Training and confirmation samples must be disjoint. Training estimates a
 target-specific score using a prespecified trans background; confirmation
-uses its frozen weights. All tuning and target selection must respect that
+uses its saved weights. All tuning and target selection must respect that
 separation.
 
 The conditional polygenic procedure includes additive, dominance, and supplied
@@ -183,6 +183,6 @@ Increase `--nvecs` to assess reference precision; `--exact` is limited to small
 numerical examples. Match process thread settings to `--num-threads` as
 described in [Installation](Installation.md).
 
-Use new output paths. Cohort references and training artifacts can contain
+Use new output paths. Cohort references and training files can contain
 sample-aligned information and belong in protected storage. Reuse requires
 matching samples, genotypes, scaling, features, and nuisance design.

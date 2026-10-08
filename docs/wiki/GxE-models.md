@@ -1,8 +1,9 @@
 # G×E models
 
-The one-environment model estimates additive genetic variance, interaction
-variance, residual variance, and environment-dependent residual variance.
-It can reuse one reference calculation across traits.
+For quantitative traits, the one-environment model estimates additive genetic
+variance, interaction variance, residual variance, and environment-dependent
+residual variance. It can reuse one reference calculation across traits.
+For binary outcomes, see [Generalized G×E PCGC](../pcgc_gxe.md).
 
 ## Inputs
 
@@ -20,8 +21,9 @@ summit --geno reference.bed --env environment.tsv --covar covariates.tsv \
 
 The default standardizes the environment and adjusts for the intercept,
 environment, and covariates. Genetic and interaction feature columns are
-normalized after that adjustment. The reference can be reused only with
-compatible SNPs, annotations, and feature definitions.
+normalized after that adjustment. `results/reference.gxe.ref.json` identifies
+the saved reference files. The reference can be reused only with compatible
+SNPs, annotations, and feature definitions.
 
 ### Native backend on Linux and macOS
 
@@ -59,7 +61,9 @@ summit --gxe-score-reference results/reference.gxe.ref.json \
 
 All selected traits must be finite on the reference sample set. SUMMIT adjusts
 and normalizes the phenotypes and computes marginal additive and interaction
-scores in one genotype pass.
+scores in one genotype pass. Each trait produces additive `.gxe.gwas.tsv.gz`
+and interaction `.gxe.gwis.tsv.gz` tables, plus a `.gxe.moments.json` file
+needed for fitting.
 
 A conventional conditional interaction statistic, such as PLINK's `ADDxE`
 coefficient, is not the marginal interaction score required here. Use SUMMIT's

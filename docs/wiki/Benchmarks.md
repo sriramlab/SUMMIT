@@ -17,8 +17,9 @@ process performs setup, one warmup, and three operator repetitions.
 | Standardized FP64 | 0.1708 | 0.1788 | 261.1 |
 
 These Linux measurements used pthread BLIS, SNP blocks of 256, and RHS width 64.
-Peak RSS includes fixture generation. The timing covers a covariance operation,
-not a complete fit. Full-cohort PGS memory and throughput have not been measured.
+Peak RSS includes fixture generation. These timings measure covariance
+operations. Full-cohort fitting time and memory require measurements on the
+intended sample, variant panel, and candidate models.
 
 Run each mode in a fresh process:
 
@@ -51,4 +52,4 @@ the end-to-end run. Uncached batching was not faster in this comparison.
 Measure complete wall time through result writing and reload, peak RSS, and
 input traversals. Compare estimates at the same solver tolerance or random-vector
 count. For PGS, include held-out scoring; for randomized references, check more
-than one seed and vector count before choosing a production setting.
+than one seed and vector count before choosing analysis settings.

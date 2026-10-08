@@ -17,6 +17,7 @@
 - [Quantitative epistasis](Epistasis.md)
 - [Cross-trait response models](Cross-trait-analysis.md)
 - [Binary traits and PCGC](Binary-traits-and-PCGC.md)
+- [Generalized G×E PCGC](../pcgc_gxe.md)
 - [Polygenic scores](Polygenic-scores.md)
 
 **Results and reference**

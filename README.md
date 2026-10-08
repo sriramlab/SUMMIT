@@ -14,7 +14,8 @@ gene–environment interaction models and polygenic scores.
 - Gene–environment interaction (G×E) and environment-dependent residual variance.
 - Joint models of multiple continuous or categorical environments.
 - Cross-trait genetic response covariance through the research Python API.
-- Ascertainment-aware binary-trait regression with PCGC.
+- Additive and generalized G×E estimation for binary traits with PCGC.
+- Quantitative epistasis with supplied targets and genetic backgrounds.
 - G×E polygenic score fitting, scoring, and calibration.
 
 Genotype input can be PLINK BED hard calls or biallelic diploid PGEN dosages.
@@ -84,6 +85,8 @@ that also runs on macOS.
 - [Multiple environments](https://github.com/sriramlab/SUMMIT/wiki/Multiple-environments)
 - [Cross-trait response models](https://github.com/sriramlab/SUMMIT/wiki/Cross-trait-analysis)
 - [Binary traits and PCGC](https://github.com/sriramlab/SUMMIT/wiki/Binary-traits-and-PCGC)
+- [Generalized G×E PCGC](docs/pcgc_gxe.md)
+- [Quantitative epistasis](https://github.com/sriramlab/SUMMIT/wiki/Epistasis)
 - [G×E polygenic scores](https://github.com/sriramlab/SUMMIT/wiki/Polygenic-scores)
 - [Real-data results](https://github.com/sriramlab/SUMMIT/wiki/Real-data-results)
 - [Benchmarks](https://github.com/sriramlab/SUMMIT/wiki/Benchmarks)

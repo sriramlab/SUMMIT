@@ -1,9 +1,10 @@
 # Contextual Python API
 
 `summit.context` provides continuous and categorical context coding, covariance
-summaries, and research analyses. Dense builders are intended for small numerical
-checks. The native reference/trait interface streams BED input; generalized
-per-SNP estimation is described separately in [Multiple environments](Multiple-environments.md).
+summaries, and research analyses. For generalized per-SNP LD scores and fitting,
+start with [Multiple environments](Multiple-environments.md). The interfaces
+below provide dense calculations for small numerical checks and a separate
+native estimator using sample-axis probes and streamed BED input.
 
 ## Context coding
 
@@ -33,7 +34,7 @@ participant context rows.
 Inputs specify genotype scaling, context and fixed-effect columns, variants,
 annotations, residual components, and deletion groups. Use the same definitions
 for reference and study. The native loaders and writers use their own versioned
-formats; dense-development files cannot be substituted for them.
+formats, separate from the dense Python summaries.
 
 The fit returns raw covariance coefficients, joint jackknife covariance, and
 rank/conditioning diagnostics. A rank-deficient model is reported explicitly.
@@ -82,8 +83,8 @@ The objectives are descriptive fitted coefficients or moment-fit improvement.
 
 `crossfit_context_direction` learns on one group of variant blocks and evaluates
 on another, then reverses the roles. Its two-fold variation is descriptive,
-and it does not provide calibrated post-selection inference. Construction of
-these contractions uses dense arrays and is intended for small experiments.
+and it does not provide calibrated post-selection inference. The calculations
+use dense arrays and are intended for small experiments.
 
 ## Limits
 

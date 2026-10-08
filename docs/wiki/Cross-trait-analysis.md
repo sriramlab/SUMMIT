@@ -22,7 +22,7 @@ the matrix. Each SNP annotation has its own matrix.
    and within-trait scores, and computes overlap residual moments.
 4. Assemble compatible within-trait and ordered cross-trait equations from
    the saved summaries. Fit them on the same SNP blocks.
-5. Derive correlations and contrasts using the joint covariance of both
+5. Derive correlations and their differences using the joint covariance of both
    within-trait estimates and the cross-trait estimate.
 
 The API modules are `summit.ldscore.generalized_gxe_cross_trait_batch`,

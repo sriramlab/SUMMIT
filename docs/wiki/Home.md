@@ -28,7 +28,7 @@ results go to `example/out/`.
 | Joint continuous and categorical environments | [Multiple environments](Multiple-environments.md) |
 | Supplied epistasis targets and backgrounds | [Quantitative epistasis](Epistasis.md) |
 | Shared genetic responses across traits | [Cross-trait response models](Cross-trait-analysis.md) |
-| Binary traits with case–control ascertainment | [Binary traits and PCGC](Binary-traits-and-PCGC.md) |
+| Binary traits with case–control ascertainment | [Additive PCGC](Binary-traits-and-PCGC.md), [generalized G×E PCGC](../pcgc_gxe.md) |
 | Context-dependent genetic prediction | [Polygenic scores](Polygenic-scores.md) |
 | Python model construction and mathematical details | [PGS API](PGS-API.md), [Methods](Methods.md) |
 | Research extensions | [Contextual Python API](Contextual-Python-API.md) |
@@ -42,8 +42,7 @@ results go to `example/out/`.
 - [Troubleshooting](Troubleshooting.md): input, installation, and fitting errors.
 
 The main `summit` command supports LD scores, h²/rg, one-environment G×E,
-and binary-trait PCGC preparation and inference.
-Joint generalized G×E estimation is available through Python; `summit reference`
-provides planning and inspection. PGS uses `summit pgs`. Research functions in
-`summit.context` and binary cross-trait functions in `summit.pcgc.cross` are
-identified in their guides.
+and additive or generalized G×E PCGC. Quantitative generalized G×E fitting
+uses Python; `summit reference` provides planning and inspection. Epistasis
+uses `summit epistasis`, and PGS uses `summit pgs`. Each guide describes the
+available interfaces and statistical assumptions.

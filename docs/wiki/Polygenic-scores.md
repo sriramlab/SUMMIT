@@ -4,8 +4,7 @@
 context. It supports several candidate priors and traits in one run, sharing
 genotype reads across them.
 
-Unlike summary-statistic h²/rg analysis, fitting PGS requires discovery
-genotypes and phenotypes. Keep discovery, calibration, and final evaluation
+Fitting PGS requires discovery genotypes and phenotypes. Keep discovery, calibration, and final evaluation
 samples separate.
 
 ## Try the synthetic example
