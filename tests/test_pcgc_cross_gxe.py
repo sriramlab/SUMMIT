@@ -188,10 +188,12 @@ def test_known_covariance_and_frozen_target_deletion():
     np.testing.assert_allclose(np.asarray(fit["covariance"]),0,atol=2e-20)
 
 
-def test_reversal_signed_scores_and_basis_transformation():
+@pytest.mark.parametrize("kind",["qq","bq","bb"])
+@pytest.mark.parametrize("qb",[2,3])
+def test_reversal_signed_scores_and_basis_transformation(kind,qb):
     from dataclasses import replace
     from summit.pcgc.cross_gxe_fit import fit_cross_gxe
-    x,a,traits,ids,rows=fixture("qq",8,2,2)
+    x,a,traits,ids,rows=fixture(kind,8,2,qb)
     a=np.ones((len(a),1))
     def prep(tt):
         return prepare_cross_gxe(ArraySequentialGenotypeOperator(x),a,tt,ids,
@@ -199,11 +201,19 @@ def test_reversal_signed_scores_and_basis_transformation():
     original=prep(traits)
     reverse=prep(traits[::-1])
     ab=original.pairs[1];ba=reverse.pairs[1]
-    index=np.array([0,2,1,3])
+    index=np.arange(2*qb).reshape(2,qb).T.ravel()
     np.testing.assert_allclose(ab.ldscores[:,index][:,:,index],ba.ldscores,atol=2e-11)
     np.testing.assert_allclose(ab.rhs_rows[:,index],ba.rhs_rows,atol=2e-11)
     scale=np.array([[1.,.3],[0.,1.8]])
-    changed=prep([replace(traits[0],contexts=traits[0].contexts@scale),traits[1]])
+    changed_traits=[replace(traits[0],contexts=traits[0].contexts@scale),traits[1]]
+    changed=prep(changed_traits)
+    # Isolate the fitted basis identity from weak randomized normal equations
+    # in this deliberately tiny cohort. The stochastic reversal is checked above.
+    for moments,tt in ((original,traits),(changed,changed_traits)):
+        oracle=dense_oracle(x,a,tt,rows)
+        for pair in moments.pairs:
+            pair.ldscores=oracle[pair.left,pair.right]["exact"]/pair.sample_product
+            pair.probe_grams[:]=pair.probe_grams.mean(0)
     f0,f1=fit_cross_gxe(original),fit_cross_gxe(changed)
     omega0=np.array(f0["pairs"]["0:1"]["omega_total"])
     omega1=np.array(f1["pairs"]["0:1"]["omega_total"])

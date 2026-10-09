@@ -46,6 +46,9 @@ Supply H_AA and H_BB for the matching genetic variances. Genetic correlation
 is C_g,AB / √(V_g,A V_g,B). Heritability instead divides a genetic variance by
 the total population phenotype or liability variance. A covariance divided by
 total phenotype SDs is a standardized covariance, not a genetic correlation.
+State whether a heritability denominator includes variation in fixed mean
+effects. Unit conditional liability variance does not imply unit total
+population liability variance when those means vary.
 
 ## Supported sampling and scales
 
@@ -139,7 +142,7 @@ multiplication; binary weighted features receive no extra OLS projection.
 
 ```bash
 summit pcgc-cross prepare pair.json \
-  --nvecs 256 --block-size 256 --probe-tile 32 \
+  --nvecs 256 --block-size 256 --probe-tile 32 --context-tile 4 \
   --memory-gib 8 --num-threads 2 --out results/pair
 ```
 
@@ -181,6 +184,7 @@ printed by preparation, `target_population`,
 and `total_variances` in trait order. Every kernel metric has shape
 annotation × left context × right context. Supply moments for all reported
 pairs and their denominators, on a common target population. These quantities
+must use the same trait scales as preparation. The population quantities
 are treated as fixed; their estimation uncertainty is not included. The file
 must refer to the matched preparation and contain exactly its ordered pairs.
 The fit records a checksum of these declared population moments.
@@ -206,8 +210,11 @@ and its legacy combined files retain their existing behavior.
 The reference uses shared global variant-axis probes and two complete genotype
 passes. Source contributions cover the full retained genome. Genotype reads
 and the first-pass genotype sketch are shared across contexts and requested
-pairs. Variant and probe tiles limit workspace without making the reference
-chromosome-local.
+pairs. Variant, probe and context tiles limit workspace without making the
+reference chromosome-local. Projection coefficients are retained on the
+fixed-effect axis, so each context does not need a separate participant-sized
+source sketch. The ordered projection corrections remain distinct when
+context products share a calculation.
 
 Same-person corrections are exact conditional on the supplied designs.
 For quantitative traits, projection can spread residual covariance beyond
@@ -284,6 +291,43 @@ block count did not resolve the within-trait deficit. This is a reproducible
 uncertainty limitation, and the favorable correlation coverage in that setting
 does not validate all covariance-surface contrasts.
 
+Follow-up held the larger genetic variance and 8,192 SNPs fixed. With 8,192
+participants, coverage was 93.4–95.6%; with 32,768 participants it was
+91.1–95.1%. In the latter experiment, cross-trait components covered
+94.2–95.1%, while some within-trait variances remained underestimated.
+Increasing the sample size can therefore expose a deficit that response noise
+masks in a smaller cohort. These results concern the tested LD and genetic
+architecture; they do not establish a universal sample-size threshold.
+
+Further 5,000-replicate tests used shared contexts, unequal disease risks,
+strong genetic covariance and same-person residual correlation 0.8.
+Coefficient coverage remained approximately 94–96%, but rare-outcome
+correlations often had weak or undefined denominators. Favorable coverage
+among the defined correlations does not qualify those weak estimates.
+An eight-annotation, zero-cross-covariance experiment gave 4.54–6.28% null
+rejection across the ordered cross-trait coefficients. For a biomarker and
+its exact binary threshold, component coverage was 93.78–95.44%; correlation
+coverage at the boundary value one was conservative (96.9%). Unconstrained
+correlations above one were retained. These examples use an unrestricted
+cohort; they do not validate analysis conditional on having measured illness.
+
+With eight disjoint annotations, 32,768 participants and 8,192 SNPs, the
+strong-correlation binary experiment covered 93.98–95.38% across components
+and 95.1% for correlation, with no weak or undefined denominators.
+Allowing different genetic covariance matrices across eight annotations at
+N=32,768, M=4,096 gave 93.62–95.32% component coverage and 94.48% correlation
+coverage in 5,000 further replicates. Reported component variances were
+0.94–1.04 times empirical variances. A heterogeneous, overlapping-annotation
+mixed pair covered 94.36–95.20% across components. Neither experiment had
+weak or undefined correlations.
+
+Independent randomized-reference confirmation redrew both responses and
+probes in 5,000 binary-pair replicates at N=2,048, M=512. Reported reference
+variances were 0.94–1.03 times the paired empirical errors at 32 probes and
+0.97–1.03 at 128 probes. The largest discrepancy across the joint reference
+covariance matrix was 2.85 Monte Carlo SEs. This checks correlated reference
+draws in that model; it does not remove finite-probe inversion bias.
+
 Separate retrospective case–control experiments use cohorts disjoint before
 selection. At 2,048 people per cohort, 256 SNPs and 128 blocks, 1,000
 replicates with correctly specified fitted two-stratum probit risks gave
@@ -309,6 +353,32 @@ and serialization copies. Fitting separately checks archive loading, checksum
 workspace, block reductions and joint covariance output against its memory budget.
 Large context bases or many pairs can exceed the
 budget even with small tiles; preparation then stops before decoding.
+
+On a Hoffman compute node with eight physical cores, 337,845 participants,
+eight annotations, one binary and one quantitative trait with two contexts
+each and 256 probes, private
+BLIS preparation plus input, serialization and fitting took 165.2 seconds
+for 1,024 SNPs and 320.5 seconds for 2,048 SNPs. Both used genotype chunks of
+1,024 SNPs, ten genotype PCs, two quantitative fixed-effect columns and two
+genotype passes. The maximum observed RSS was 42.9 GiB;
+the full 448,562-SNP memory plan reserved 73.6 GiB within an 88 GiB program
+budget and a 96 GiB allocation. Portable OpenBLAS took 163.7 seconds for the
+1,024-SNP case. These timings use synthetic outcomes.
+
+The measured private-BLIS slope projects approximately 18.9 hours for that
+448,562-SNP configuration, below the 24-hour limit. This is a full-cohort,
+bounded-SNP forecast, not an observed genome-wide completion. Larger bases,
+additional pairs, different projections or a different runtime need their
+own measurement. Genotype decoding was a small fraction of elapsed time;
+reference products, feature construction and exact overlap corrections
+dominated. Timings for protected matrix products include operand preparation
+and integrity checks, and overlap the broader phase timers.
+The native vendor timers separately measure CBLAS calls. A matched 1,024-SNP
+run spent 17.2 seconds in OpenBLAS calls or 16.5 seconds in private BLIS calls,
+within approximately 150 seconds total. Those calls used nearly all eight
+cores; the whole preparation averaged about three active cores. Data movement,
+projection and exact correction work therefore matter more than vendor GEMM
+speed alone in this configuration.
 
 No cross-trait checkpoint/resume interface is currently provided. Before a
 full-genome run, measure a bounded-SNP job with the full cohort, required probe
