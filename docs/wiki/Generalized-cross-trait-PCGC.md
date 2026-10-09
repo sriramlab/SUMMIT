@@ -241,7 +241,12 @@ degrees of freedom from the SNP-block and reference-draw variance estimates.
 This accounts for estimating variance from finitely many blocks or probes.
 It is not an exact pivot under arbitrary LD, unequal blocks or fitted risks.
 The reference contribution is a first-order delta approximation; finite-probe
-inversion bias and higher-order interactions are not corrected.
+inversion bias and higher-order interactions are not corrected. The fit also
+reports reference perturbation after multiplication by the inverse normal
+matrix and a second-order inversion-bias estimate on each pair's coefficient
+axis. These are diagnostic approximations. Large inverse perturbation calls
+for more probes and a stability check; a small raw reference error alone does
+not establish accurate inversion.
 
 External prevalence, genotype scale, supplied liability SDs and population
 moments are treated as fixed. General fitted-risk and estimated-moment

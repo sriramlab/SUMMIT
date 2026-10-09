@@ -467,3 +467,30 @@ def test_finite_block_intervals_and_missing_trait_uncertainty():
     assert linear_interval(result,[1.,0.])["interval"] is None
     with pytest.raises(ValueError,match="confidence"):
         linear_interval(result,[1.,0.],confidence=1)
+
+def test_inverse_reference_diagnostics_against_exact_inverse_average():
+    from itertools import product
+    from summit.pcgc.cross_gxe_fit import _reference_inverse_diagnostics
+    # Enumerate the complete independent Rademacher draw law. The true bias
+    # comes from actual inverses, independently of the Taylor calculation.
+    estimates=[];predictions=[]
+    for signs in product((-1.,1.),repeat=8):
+        draws=1+.05*np.asarray(signs)
+        h=np.array([[draws.mean()]])
+        theta=np.array([2./h[0,0]])
+        diagnostics=_reference_inverse_diagnostics(h,(draws-draws.mean())[:,None,None],theta)
+        estimates.append(theta[0]);predictions.append(diagnostics["reference_inverse_second_order_bias"][0])
+    exact_bias=np.mean(estimates)-2.
+    assert exact_bias>0
+    np.testing.assert_allclose(np.mean(predictions),exact_bias,rtol=.01)
+    # Directed matrices need their actual ordered inverse products.
+    h=np.array([[2.,.5],[-.2,1.5]])
+    delta=np.array([[.03,-.02],[.04,.01]])
+    theta=np.array([.1,-.04])
+    diagnostic=_reference_inverse_diagnostics(h,np.stack((delta,-delta)),theta)
+    exact=(np.linalg.solve(h+delta,h@theta)+np.linalg.solve(h-delta,h@theta))/2-theta
+    np.testing.assert_allclose(diagnostic["reference_inverse_second_order_bias"],exact,rtol=.002,atol=1e-10)
+    assert diagnostic["reference_inverse_rms_perturbation"]>0
+    zero=_reference_inverse_diagnostics(h,np.zeros((8,2,2)),theta)
+    assert zero["reference_inverse_rms_perturbation"]==0
+    assert zero["reference_inverse_second_order_bias"]==[0.,0.]

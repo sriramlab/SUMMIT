@@ -38,7 +38,7 @@ def plan_cross_fit(moments, blocks, memory_bytes=None):
     # delete-block arrays coexist with NumPy storage at return/serialization.
     row_copy=max(p.ldscores.nbytes for p in moments.pairs)
     workspace=row_copy+8*(4*blocks*largest**2+16*dimension**2+
-                           12*blocks*dimension+4*probes*dimension+8*len(moments.annotations))
+                           12*blocks*dimension+4*probes*dimension+4*probes*largest**2+8*len(moments.annotations))
     peak=baseline+workspace
     if memory_bytes is not None:
         if type(memory_bytes) is not int or memory_bytes<1:
@@ -47,6 +47,24 @@ def plan_cross_fit(moments, blocks, memory_bytes=None):
             raise MemoryError("cross-trait fit rows and joint uncertainty exceed memory budget")
     return dict(baseline_rss_bytes=baseline,fit_workspace_bytes=workspace,
                 peak_planned_bytes=peak,memory_budget_bytes=memory_bytes)
+
+
+def _reference_inverse_diagnostics(h, deviations, theta):
+    """Plug-in Neumann expansion; diagnostics only, no bias correction.
+
+    R_b = H^-1 (H_b - mean(H_b)). With B independent common probe draws,
+    sum ||R_b||_F^2 / [B(B-1)] estimates squared relative error of the mean.
+    The next inverse term is sum R_b R_b theta / [B(B-1)]. Neither expression
+    guarantees accuracy when the inverse perturbation is large.
+    """
+    b,c,_=deviations.shape
+    relative=np.linalg.solve(h,deviations.transpose(1,0,2).reshape(c,-1)).reshape(c,b,c).transpose(1,0,2)
+    denominator=b*(b-1)
+    rms=np.sqrt(np.einsum("bij,bij->",relative,relative)/denominator)
+    impact=np.einsum("bij,j->bi",relative,theta)
+    bias=np.einsum("bij,bj->i",relative,impact)/denominator
+    return dict(reference_inverse_rms_perturbation=float(rms),
+                reference_inverse_second_order_bias=bias.tolist())
 
 
 def fit_cross_gxe(moments, *, block_ids=None, memory_bytes=None, confidence=.95):
@@ -86,6 +104,7 @@ def fit_cross_gxe(moments, *, block_ids=None, memory_bytes=None, confidence=.95)
             results[key]["omega_minimum_eigenvalues"]=np.linalg.eigvalsh(matrix).min(1).tolist()
         dev=pair.probe_grams-pair.probe_grams.mean(0)
         mc_actions.append(-np.linalg.solve(H,np.einsum("bij,j->bi",dev,theta).T).T)
+        results[key].update(_reference_inverse_diagnostics(H,dev,theta))
         results[key]["relative_reference_mc_frobenius_se"]=float(
             np.sqrt(np.sum(dev**2)/(len(dev)*(len(dev)-1)))/np.linalg.norm(H))
         if labels is not None:
