@@ -15,6 +15,7 @@ def test_shared_options_preserve_workflow_defaults():
     parser = build_parser()
     binary = parser.parse_args(["--binary-method", "pcgc"])
     assert (binary.nvecs, binary.seed, binary.step_size, binary.memory_gib, binary.genome_build) == (256, 0, 256, 1., None)
+    assert binary.binary_output_format == "separate"
     ordinary = parser.parse_args([])
     assert (ordinary.nvecs, ordinary.seed, ordinary.step_size, ordinary.memory_gib, ordinary.njack) == (1000, None, 1000, "auto", "chr")
     args = parser.parse_args(["--binary-method", "pcgc", "--nvecs=31", "--seed", "19", "--block-size=7", "--memory-gib", "2"])
@@ -48,13 +49,17 @@ def test_help_shows_shared_controls():
     assert "summit pgs" in help_text
 
 
-@pytest.mark.parametrize("flag", ["--nvecs", "--seed", "--block-size", "--memory-gib"])
-def test_binary_fit_rejects_preparation_controls(tmp_path, flag):
+@pytest.mark.parametrize("flag,value", [
+    ("--nvecs", "10"), ("--seed", "10"), ("--block-size", "10"),
+    ("--memory-gib", "10"), ("--binary-output-format", "combined"),
+])
+def test_binary_fit_rejects_preparation_controls(tmp_path, flag, value):
     from summit.cli import build_parser
     from summit.pcgc.cli import run
-    argv = ["--binary-method", "pcgc", "--h2", "missing", "--out", str(tmp_path/"fit"), flag, "10"]
-    with pytest.raises(ValueError, match="saved binary file"):
+    argv = ["--binary-method", "pcgc", "--h2", "missing", "--out", str(tmp_path/"fit"), flag, value]
+    with pytest.raises(ValueError, match="remove preparation options") as error:
         run(build_parser().parse_args(argv), argv)
+    assert flag in str(error.value)
     assert list(tmp_path.iterdir()) == []
 
 
