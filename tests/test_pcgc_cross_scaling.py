@@ -95,19 +95,30 @@ def test_randomized_variant_oracle_matches_production(kind, overlap):
 
 
 @pytest.mark.parametrize("correlation", [None,.9])
-def test_overlapping_unequal_annotation_mass_matches_generating_kernel(correlation):
+@pytest.mark.parametrize("heterogeneity", [False,True])
+def test_overlapping_unequal_annotation_mass_matches_generating_kernel(correlation,heterogeneity):
     design=make_design(24,25,kind="qq",overlap=.5,annotations=2,annotation_mixing=.8,
-                       effect_correlation=correlation,shared_context=True,residual_correlation=.8)
+                       effect_correlation=correlation,shared_context=True,residual_correlation=.8,
+                       annotation_heterogeneity=heterogeneity)
     models,truth=exact_equations(design,[5])
     total=max(max(r) for r in design["rows"])+1
     x=np.empty((total,25))
     for rows,base in zip(design["rows"],design["bases"]): x[rows]=base
     oracle=dense_oracle(x,design["ann"],design["traits"],design["rows"])
     estimate=[]
+    roots=design["variant_roots"]
+    if roots is None:
+        roots=np.tile(design["omega"]/5,(25,1,1))
+    covariance=roots@roots.transpose(0,2,1)
+    for t in range(2):
+        raw=design["bases"][t][:,None,:]*design["phi"][t][:,:,None]
+        kernel=np.einsum("iqj,jqr,krj->ik",raw,covariance[:,2*t:2*t+2,2*t:2*t+2],raw)
+        np.testing.assert_allclose(np.diag(kernel)+design["residual"][t],design["sd"][t]**2,
+                                   rtol=2e-12,atol=2e-12)
     for model,matrix in zip(models,design["truth_matrices"]):
         left,right=model["left"],model["right"]
-        genetic=sum(design["features"][left][q]@design["features"][right][r].T*matrix[q,r]
-                    for q in range(2) for r in range(2))/25
+        genetic=np.einsum("iqj,jqr,krj->ik",np.stack(design["features"][left],axis=1),
+            covariance[:,2*left:2*left+2,2*right:2*right+2],np.stack(design["features"][right],axis=1))
         tests=oracle[left,right]["tests"]
         rhs=np.einsum("ja,jpuv,uv->ap",design["ann"],tests,genetic).ravel()
         estimate.extend(np.linalg.solve(model["blocks"][5]["H"],rhs))

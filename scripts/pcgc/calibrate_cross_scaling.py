@@ -23,7 +23,7 @@ from scripts.pcgc.calibrate_cross_gxe import wilson
 def make_design(n, m, *, kind, overlap, annotations=1, seed=729103,
                 prevalence=.2, risk_strength=.6, heterogeneous=False,
                 genotype="gaussian", signal=.035, native=False, threads=1, annotation_mixing=0., genetic_scale=1., effect_correlation=None, shared_context=False,
-                prevalence_b=None, residual_correlation=.2):
+                prevalence_b=None, residual_correlation=.2, annotation_heterogeneity=False):
     rng=np.random.default_rng(seed)
     shared=int(n*overlap);total=2*n-shared
     rows=[np.arange(n),np.r_[np.arange(shared),np.arange(n,total)]]
@@ -62,6 +62,22 @@ def make_design(n, m, *, kind, overlap, annotations=1, seed=729103,
     aa*=genetic_scale;bb*=genetic_scale;ab*=genetic_scale
     omega=np.block([[aa,ab],[ab.T,bb]])
     root=np.linalg.cholesky(omega)
+    mass=ann.sum(0)
+    component_covariances=mass[:,None,None]/m*omega
+    variant_roots=None
+    if annotation_heterogeneity:
+        if annotations<2:
+            raise ValueError("annotation heterogeneity requires multiple components")
+        forward=np.linspace(.35,1.65,annotations)
+        reverse=forward[::-1].copy()
+        forward/=mass@forward/m;reverse/=mass@reverse/m
+        scales=np.sqrt(np.column_stack((forward,reverse,reverse,forward)))
+        component_covariances*=scales[:,:,None]*scales[:,None,:]
+        attenuation=np.linspace(.3,1.,annotations)
+        component_covariances[:,:2,2:]*=attenuation[:,None,None]
+        component_covariances[:,2:,:2]*=attenuation[:,None,None]
+        variant_covariances=np.einsum("ja,auv->juv",ann/mass,component_covariances)
+        variant_roots=np.linalg.cholesky(variant_covariances)
     traits=[]
     for t in range(2):
         ids=tuple(("s",str(i)) for i in rows[t])
@@ -79,13 +95,19 @@ def make_design(n, m, *, kind, overlap, annotations=1, seed=729103,
                for q in range(2)] for base,t in zip(bases,traits)]
     variance=[]
     for t,mat in enumerate((aa,bb)):
-        genetic=np.sum(bases[t]**2,axis=1)/m*np.einsum("iq,qr,ir->i",phi[t],mat,phi[t])
+        if variant_roots is None:
+            genetic=np.sum(bases[t]**2,axis=1)/m*np.einsum("iq,qr,ir->i",phi[t],mat,phi[t])
+        else:
+            context_variance=products.nn(bases[t]**2,
+                variant_covariances[:,2*t:2*t+2,2*t:2*t+2].reshape(m,4)).reshape(n,2,2)
+            genetic=np.einsum("iq,iqr,ir->i",phi[t],context_variance,phi[t])
         variance.append(sd[t]**2-genetic)
     if min(v.min() for v in variance)<=0:
         raise ValueError("generating residual variance is nonpositive")
     del x
     return dict(n=n,m=m,rows=rows,ann=ann,traits=traits,phi=phi,sd=sd,risk=risk,
                 omega=root,truth_matrices=(aa,ab,bb),residual=variance,bases=bases,
+                component_covariances=component_covariances,variant_roots=variant_roots,
                 features=features,products=products,kind=kind,seed=seed,shared=shared,
                 residual_correlation=residual_correlation)
 
@@ -137,7 +159,13 @@ def exact_equations(design, block_counts, *, retain_grams=False):
                 deleted_inverse=np.linalg.inv(h[None]-hs),diagonal=db,H=h,H_blocks=hs,
                 correction_blocks=(db.reshape(len(ia),count*c).T@corrected).reshape(count,c,c))
         models.append(dict(left=left,right=right,layout=layout,overlap=(ia,ib),remover=remover,blocks=models_by_blocks))
-        truth.extend(np.outer(mass/m,[matrix[q,r] for orientation in layout for q,r in orientation[:1]]).ravel())
+        if design.get("variant_roots") is None:
+            truth.extend(np.outer(mass/m,[matrix[q,r] for orientation in layout
+                                         for q,r in orientation[:1]]).ravel())
+        else:
+            components=design["component_covariances"][:,2*left:2*left+2,2*right:2*right+2]
+            truth.extend(np.column_stack([components[:,q,r] for orientation in layout
+                                          for q,r in orientation[:1]]).ravel())
         products.drain()
     return models,np.asarray(truth)
 
@@ -145,7 +173,11 @@ def exact_equations(design, block_counts, *, retain_grams=False):
 def responses(design, rng, batch):
     n,m=design["n"],design["m"]
     products=design["products"]
-    beta=(rng.normal(size=(m*batch,4))@design["omega"].T/np.sqrt(m)).reshape(m,batch,4)
+    noise=rng.normal(size=(m*batch,4))
+    if design.get("variant_roots") is None:
+        beta=(noise@design["omega"].T/np.sqrt(m)).reshape(m,batch,4)
+    else:
+        beta=np.einsum("mbr,mqr->mbq",noise.reshape(m,batch,4),design["variant_roots"])
     residual=[rng.normal(size=(n,batch)),rng.normal(size=(n,batch))]
     shared=design["shared"]
     rho=design["residual_correlation"]
@@ -266,6 +298,7 @@ def main():
     parser.add_argument("--residual-correlation",type=float,default=.2)
     parser.add_argument("--genetic-scale",type=float,default=1.)
     parser.add_argument("--annotation-mixing",type=float,default=0.)
+    parser.add_argument("--annotation-heterogeneity",action="store_true")
     parser.add_argument("--signal",type=float,default=.035);parser.add_argument("--seed",type=int,default=729103)
     parser.add_argument("--threads",type=int,default=2);parser.add_argument("--out",type=Path,required=True)
     args=parser.parse_args()
@@ -276,7 +309,8 @@ def main():
     design=make_design(args.n,args.m,kind=args.kind,overlap=args.overlap,annotations=args.annotations,
         seed=args.seed,prevalence=args.prevalence,risk_strength=args.risk_strength,heterogeneous=args.heterogeneous,
         genotype=args.genotype,signal=args.signal,native=True,threads=args.threads,annotation_mixing=args.annotation_mixing,genetic_scale=args.genetic_scale,effect_correlation=args.effect_correlation,shared_context=args.shared_context,
-        prevalence_b=args.prevalence_b,residual_correlation=args.residual_correlation)
+        prevalence_b=args.prevalence_b,residual_correlation=args.residual_correlation,
+        annotation_heterogeneity=args.annotation_heterogeneity)
     prepared=perf_counter();models,truth=exact_equations(design,args.blocks);reference=perf_counter()
     results=run(design,models,truth,replicates=args.replicates,batch=args.batch)
     cpu_end=resource.getrusage(resource.RUSAGE_SELF)
@@ -284,6 +318,7 @@ def main():
     out=dict(cpu_seconds=cpu_seconds,average_active_cores=cpu_seconds/(perf_counter()-start),configuration={**vars(args),"out":str(args.out)},results=results,
         design_seconds=prepared-start,exact_reference_seconds=reference-prepared,simulation_seconds=perf_counter()-reference,
         peak_rss_bytes=_peak_rss_bytes(),source_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+        annotation_effect_covariances=design["component_covariances"].tolist(),
         reference="exact_bounded_variant_Gram_oracle",fitted_nuisances=False,reference_randomization=False,
         normal_conditions=[float(np.linalg.cond(model["blocks"][args.blocks[0]]["H"])) for model in models],
         gemm_repaired_columns=design["products"].left.repaired_columns+design["products"].right.repaired_columns)
