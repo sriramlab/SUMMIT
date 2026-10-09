@@ -25,6 +25,8 @@ class Products:
         self.left = (ProtectedNNOperator if native else NumpyNNOperator)(threads=threads)
         self.right = (ProtectedTNOperator if native else NumpyTNOperator)(threads=threads)
         self.seconds = 0.
+        self.vendor_operations = {}
+        self.vendor_available = False
         self.left.begin_execution()
 
     def nn(self, a, b):
@@ -42,6 +44,13 @@ class Products:
     def drain(self):
         # Consume bounded telemetry after each block; do not retain large logs.
         value = self.left.finish_execution()
+        self.vendor_available |= bool(value.get("available", False))
+        for record in value.get("gemm_records", ()):
+            operation = self.vendor_operations.setdefault(record["operation"],
+                dict(calls=0, wall_seconds=0., process_cpu_seconds=0., flop_count=0.))
+            operation["calls"] += 1
+            for key in ("wall_seconds", "process_cpu_seconds", "flop_count"):
+                operation[key] += record[key]
         return value.get("gemm_status", {})
 
 
@@ -411,6 +420,9 @@ def prepare_cross_gxe(operator, annotations, traits, master_samples, *,
         genotype_scale_identity=operator.genotype_scale_id, probes=spec.to_metadata(),
         panel_method="diagonal_weights_with_ordered_projection_correction_v1",
         projection_cancellation_fallbacks=projection_fallbacks,
+        native_vendor_gemm=dict(available=products.vendor_available,
+                                scope="native_process_calls_during_preparation_including_genotype_projection",
+                                operations=products.vendor_operations),
         native=native, threads=threads, gemm_calls=products.left.calls+products.right.calls,
         repaired_columns=products.left.repaired_columns+products.right.repaired_columns)
     identity = dict(master_sample_sha256=canonical_sha256({"samples": master_samples}),
