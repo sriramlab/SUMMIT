@@ -7,6 +7,10 @@ interaction variances, and their three covariances. Continuous exposures,
 categorical variables encoded numerically, and supplied nonlinear basis
 columns use the same interface.
 
+For covariance between two traits, see
+[Generalized cross-trait PCGC](Generalized-cross-trait-PCGC.md). That workflow
+requires joint preparation and has separate selection and uncertainty limits.
+
 ## Model and scale
 
 For population-scaled genotypes X and context vector φ, the genetic model is

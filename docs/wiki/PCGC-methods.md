@@ -4,6 +4,8 @@ PCGC estimates liability-scale genetic variance from case–control data.
 This page describes additive PCGC. For inputs and commands, see
 [Binary traits and PCGC](Binary-traits-and-PCGC.md); for context-dependent
 SNP effects, see [Generalized G×E PCGC](Generalized-GxE-PCGC.md).
+For distinct trait bases and quantitative projections, see
+[Generalized cross-trait PCGC](Generalized-cross-trait-PCGC.md).
 
 ## Risk adjustment and estimating equations
 

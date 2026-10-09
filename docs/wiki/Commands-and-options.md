@@ -10,6 +10,7 @@ as `summit pgs fit`.
 | Genome-wide or windowed LD scores | `summit --geno ...` |
 | Heritability or genetic correlation | `summit --h2 ...` or `summit --rg ...` |
 | Additive and generalized G×E PCGC | `summit --binary-method pcgc ...` |
+| Generalized cross-trait PCGC | `summit pcgc-cross {prepare,fit}` |
 | One-environment G×E | `summit --geno ... --env ...`, `--gxe-score-reference`, `--gxe-fit`, or `--gxe-fit-batch` |
 | Polygenic scores | `summit pgs {plan,fit,score,scale,inspect}` |
 | Generalized G×E reference planning and inspection | `summit reference {plan,inspect}` |
@@ -25,6 +26,10 @@ PCGC preparation (`--make-binary-sumstats`) writes `.binary.sumstats.npz` and
 they match. `--binary-output-format combined` retains the older single-file
 output, which is fitted through `--h2` alone. [Input files](Input-files.md#files-used-for-inference)
 compares the formats used by each workflow.
+
+[Generalized cross-trait PCGC](Generalized-cross-trait-PCGC.md) writes matched
+`.cross.ldscores.npz` and `.cross.sumstats.npz` files. Its selection assumptions
+and experimental joint uncertainty are described in that guide.
 
 ## Shared controls
 

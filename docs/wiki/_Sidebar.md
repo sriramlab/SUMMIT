@@ -18,6 +18,7 @@
 - [Cross-trait response models](Cross-trait-analysis.md)
 - [Binary traits and PCGC](Binary-traits-and-PCGC.md)
 - [Generalized G×E PCGC](Generalized-GxE-PCGC.md)
+- [Generalized cross-trait PCGC](Generalized-cross-trait-PCGC.md)
 - [Polygenic scores](Polygenic-scores.md)
 - [Mixture priors](Mixture-priors.md)
 
