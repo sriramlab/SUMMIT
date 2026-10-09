@@ -9,7 +9,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        numpy: ["numpy>=1.26,<2", "numpy>=2"]
+        numpy: ["numpy=1.26.*", "numpy=2.3.*"]
     runs-on: ubuntu-latest
     defaults:
       run:
