@@ -134,6 +134,8 @@ def sampling_workspace_bytes(n,m,q,k,partners,block_size,risk_rank=0,architectur
     # covariance tensors, assembly copies, and bounded product scratch.
     result = 8*(n*partners*(k+1)+m*q+n*(6*c+3*k+8*risk_rank+8*c*c)+n*b
               +6*(1+c+c*c)*j*j+6*c**4)+64*1024**2
+    # The final Gram and its coefficient-axis transpose coexist while copying.
+    result += 8*(c*j)**2
     if architecture_probes:
         from .architecture import architecture_workspace_bytes
         result += architecture_workspace_bytes(n,q,k,architecture_probes,b)
@@ -387,8 +389,12 @@ def build_sampling_moments(*, pair_kernels, partners, kernel_actions, genotype_d
     a = center_strata(a,cases)
     b = center_strata(b,cases)
     const = a.T@a
-    linear = np.einsum('ni,ndj->dij',a,b)+np.einsum('ndi,nj->dij',b,a)
-    quadratic = np.einsum('ndi,nej->deij',b,b)
+    # Flatten coefficient/equation axes into columns. The Gram has axes
+    # (d,i,e,j); transpose back to the covariance polynomial's (d,e,i,j).
+    influence = np.ascontiguousarray(b.reshape(n,c*j))
+    cross = (a.T@influence).reshape(j,c,j).transpose(1,0,2)
+    linear = cross+cross.transpose(0,2,1)
+    quadratic = (influence.T@influence).reshape(c,j,c,j).transpose(0,2,1,3).copy()
     const[:c,:c] -= 2*t0/count**2
     linear[:,:c,:c] += 2*(t1.transpose(2,0,1)+t1.transpose(2,1,0))/count**2
     quadratic[:,:,:c,:c] -= 2*t2.transpose(1,3,0,2)/count**2

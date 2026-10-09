@@ -98,8 +98,12 @@ def main():
         if Path(summit.__file__).resolve() != root/"src/summit/__init__.py":
             raise RuntimeError("wrong Python checkout")
         import numpy as np
-        warm = np.ones((64,64)); assert (warm@warm)[0,0] == 64
+        warm = np.ones((512,512)); assert (warm@warm)[0,0] == 512
         del warm
+        numpy_workers = {int(p.name):sorted(os.sched_getaffinity(int(p.name)))
+            for p in Path('/proc/self/task').iterdir() if int(p.name) != os.getpid()}
+        if any(mask != sorted(cpus) for mask in numpy_workers.values()):
+            raise RuntimeError('NumPy workers did not inherit the allocated CPU set before OpenMP initialization')
         from summit import gxeldcore
         from summit.prediction.runtime import configure_prediction_threads
         configure_prediction_threads(gxeldcore,threads)
@@ -112,8 +116,7 @@ def main():
             sys.path.insert(0,str(root/"scripts/generalized_gxe"))
             import workflow
             workflow._PRE_NUMERICAL_CPU_AFFINITY = tuple(sorted(cpus))
-            workflow._NUMPY_POOL_WORKER_AFFINITY = {int(p.name):sorted(os.sched_getaffinity(int(p.name)))
-                for p in Path("/proc/self/task").iterdir() if int(p.name) != os.getpid()}
+            workflow._NUMPY_POOL_WORKER_AFFINITY = numpy_workers
             workflow.require_private_blis(gxeldcore)
         elif info.get("blas_vendor") != "OpenBLAS":
             raise RuntimeError("wrong portable backend")

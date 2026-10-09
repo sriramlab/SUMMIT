@@ -55,6 +55,43 @@ def test_exact_sampling_polynomial_matches_dense_u_statistic(inverse):
             2*np.einsum('cij,dij->cd',residual,residual)/(n*(n-1))**2,rtol=2e-12,atol=1e-15)
 
 
+@pytest.mark.parametrize('overlapping',[False,True])
+def test_multi_annotation_covariance_polynomial_matches_dense_pairs(overlapping):
+    data,_,_ = fixture(n=24,m=31)
+    x,risk,sd,response = (data[name] for name in ('x','risk','sd','response'))
+    n,m = x.shape
+    phi = np.column_stack((data['contexts'],data['contexts'][:,1]**2))
+    features = phi*(risk.sensitivity/sd)[:,None]
+    annotations = np.column_stack((np.arange(m)<m//2,np.arange(m)>=m//2)).astype(float)
+    if overlapping:
+        annotations[:,0] = 1.
+        annotations[:,1] = np.linspace(.2,1.8,m)
+    bases = np.stack([(x*column)@x.T/column.sum() for column in annotations.T],axis=-1)
+    kernels = []
+    for base in np.moveaxis(bases,-1,0):
+        for u,v in context_pairs(phi.shape[1]):
+            matrix = base*np.outer(features[:,u],features[:,v])
+            if u != v:
+                matrix += matrix.T.copy()
+            np.fill_diagonal(matrix,0.)
+            kernels.append(matrix)
+    kernels = np.asarray(kernels)
+    c = len(kernels)
+    partners = np.array([np.delete(np.arange(n),i) for i in range(n)])
+    moments = build_sampling_moments(
+        pair_kernels=bases[np.arange(n)[:,None],partners],partners=partners,sampled=False,
+        kernel_actions=np.einsum('cij,j->ic',kernels,response),
+        genotype_diagonal=np.stack([np.diag(bases[:,:,a]) for a in range(2)],axis=1),
+        contexts=phi,features=features,response=response,risk=risk,sd=sd,method='pcgc')
+    for theta in [np.zeros(c),np.linspace(-.03,.08,c),np.linspace(.15,-.1,c)]:
+        residual = kernels*(np.outer(response,response)-np.einsum('c,cij->ij',theta,kernels))
+        rows = center_strata(residual.sum(2).T,risk.z>0)
+        pair = 2*np.einsum('cij,dij->cd',residual,residual)/(n*(n-1))**2
+        expected = 4*rows.T@rows/(n*(n-1))**2-pair
+        np.testing.assert_allclose(moments.covariance(theta)[:c,:c],expected,rtol=3e-11,atol=2e-15)
+        np.testing.assert_allclose(moments.pair_covariance(theta),pair,rtol=3e-11,atol=2e-15)
+
+
 @pytest.mark.parametrize('inverse',[False,True])
 def test_complete_nuisance_derivative_matches_finite_difference(inverse):
     data,kernels,base = fixture(fitted=True,inverse=inverse)
