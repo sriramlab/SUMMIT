@@ -112,8 +112,8 @@ def prepare(args):
             threads=1 if args.num_threads is None else args.num_threads, **options)
 
 
-def fit(artifact, blocks):
-    result = fit_gxe(artifact.moments, block_ids=blocks)
+def fit(artifact, blocks, *, native=True,threads=None):
+    result = fit_gxe(artifact.moments, block_ids=blocks,native=native,threads=threads)
     result.update(kind="summit.pcgc.context_fit", schema_version=1,
                   input_manifest_hash=artifact.manifest["manifest_hash"],
                   risk=artifact.manifest["risk"], annotation_names=artifact.manifest["annotation_names"],

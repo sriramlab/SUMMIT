@@ -15969,6 +15969,7 @@ void protected_rank_update_nn(
     }
 }
 
+#include "pcgc_moments.inc"
 #include "generalized_gxe_variant.inc"
 #include "prediction.inc"
 
@@ -15981,6 +15982,7 @@ NB_MODULE(gxeldcore, module) {
     module.doc() = "Bounded double-precision native context with guarded, observable GxE GEMMs";
     module.attr("__version__") = "1.7";
     bind_prediction(module);
+    bind_pcgc_moments(module);
     summit::context_v1::bind_contextual_dense_v1(module);
     summit::context_v1::bind_contextual_reference_executor_v1(module);
     nb::class_<GeneralizedGxELDScoreDirectContext>(

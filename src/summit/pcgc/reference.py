@@ -13,12 +13,14 @@ from .moments import BinaryMoments, annotations_array, method_vectors
 
 class ProbeGramCollector:
     """Small per-probe normal matrices; same-person terms are deterministic."""
-    def __init__(self,annotations,num_contexts,probes,n_samples):
+    def __init__(self,annotations,num_contexts,probes,n_samples,*,native=False,threads=1):
         if type(probes) is not int or probes < 2:
             raise ValueError("reference-probe uncertainty needs at least two probes")
         self.annotations = annotations
         self.pairs = num_contexts*(num_contexts+1)//2
         self.n_samples = n_samples
+        from summit.ldscore.matrix_products import MatrixProducts
+        self.products = MatrixProducts(native=native,threads=threads)
         c = annotations.shape[1]*self.pairs
         self.directed = np.zeros((probes,c,c))
 
@@ -30,7 +32,7 @@ class ProbeGramCollector:
                 product = np.zeros((stop-start,width))
                 for term in plan.terms[target][source]:
                     product += panels[term.first_target,term.first_source]*panels[term.second_target,term.second_source]
-                values = self.annotations[start:stop].T@product
+                values = self.products.tn(self.annotations[start:stop],product)
                 self.directed[probe_start:probe_start+width,target::p,annotation*p+source] += values.T
 
     def deviations(self):
@@ -42,7 +44,7 @@ class ProbeGramCollector:
         if self.pairs != 1:
             raise ValueError("rank-one probe products require one context")
         width = squared.shape[1]
-        values = self.annotations[start:stop].T@squared
+        values = self.products.tn(self.annotations[start:stop],squared)
         self.directed[probe_start:probe_start+width,:,annotation] += values.T/self.n_samples**2
 
 

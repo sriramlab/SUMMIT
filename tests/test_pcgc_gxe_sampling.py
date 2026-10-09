@@ -5,6 +5,7 @@ from scipy.special import ndtr,ndtri
 from summit.pcgc.sampling import build_sampling_moments,center_strata,nuisance_derivatives
 from summit.pcgc.gxe import context_pairs
 from summit.sumstats.binary import prepare_binary_risk,fit_binary_risk
+from prediction_helpers import prediction_threads
 
 
 def fixture(n=40,m=31,*,fitted=False,inverse=False):
@@ -38,7 +39,8 @@ def panel(data,base,partners,sampled):
     return build_sampling_moments(**args,pair_kernels=base[np.arange(len(base))[:,None],partners,None],partners=partners,sampled=sampled)
 
 
-def test_large_cohort_pair_normalization_matches_constant_kernel():
+@pytest.mark.parametrize('native',[False,True])
+def test_large_cohort_pair_normalization_matches_constant_kernel(native):
     # Keep memory linear in N while exercising the full-cohort denominator.
     n = 337534
     risk = prepare_binary_risk(np.arange(n)%2,.5)
@@ -51,7 +53,8 @@ def test_large_cohort_pair_normalization_matches_constant_kernel():
         pair_kernels=np.ones((n,2,1)),partners=partners,
         kernel_actions=-kernel*risk.z[:,None],genotype_diagonal=phi,
         contexts=phi,features=features,response=risk.z,risk=risk,
-        sd=np.ones(n),method='pcgc')
+        sd=np.ones(n),method='pcgc',native=native,
+        threads=prediction_threads())
     for theta in (0.,.3):
         expected = 2*(kernel*(1-theta*kernel))**2/n/(n-1)
         np.testing.assert_allclose(moments.pair_covariance([theta]),[[expected]],rtol=1e-11,atol=0)

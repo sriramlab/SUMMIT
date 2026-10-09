@@ -81,7 +81,7 @@ class ArchitectureSketch:
                             np.asfortranarray(a[:,annotation,None]*cross[3,:,right]))
 
 
-def gaussian_architecture_covariance(theta,q,metric,left,right,probes):
+def gaussian_architecture_covariance(theta,q,metric,left,right,probes,*,evaluator=None):
     """Working Gaussian architecture covariance; point estimates stay signed.
 
     PSD projection is confined to the covariance's working model and uses the
@@ -99,7 +99,8 @@ def gaussian_architecture_covariance(theta,q,metric,left,right,probes):
         e,u = np.linalg.eigh(root@item@root)
         working.append(inverse@((u*np.maximum(e,0))@u.T)@inverse)
     working = np.asarray(working)
-    covariance = architecture_trace_covariance(working,left,right,probes)
+    covariance = (architecture_trace_covariance(working,left,right,probes) if evaluator is None
+                  else evaluator.covariance(working))
     diagnostics = dict(model="independent_gaussian_snp_effects_by_annotation",
         working_omega=working.tolist(),working_omega_adjustment_norm=float(np.linalg.norm(working-omega)),
         projection_metric="population_context_second_moment",variant_probes_per_family=probes,
@@ -126,3 +127,60 @@ def architecture_trace_covariance(omega,left,right,probes):
     transformed = transform@left@transform
     covariance = 2*np.einsum('cij,dji->cd',transformed,right)/probes**2
     return (covariance+covariance.T)/2
+
+
+class ArchitectureCovariance:
+    """Apply the context covariance within annotation/probe blocks.
+
+    The native feature transform costs O(C D² Q), with D=K Q B, and uses
+    SUMMIT's protected TN reducer for the trace products. Scalar confidence
+    polynomials contract equation weights before touching the sketch axes.
+    """
+    def __init__(self,left,right,q,probes,products):
+        self.left,self.right = np.asarray(left),np.asarray(right)
+        self.q,self.probes,self.products = q,probes,products
+        c,d,_ = self.left.shape
+        if self.right.shape != (c,d,d) or d%(q*probes):
+            raise ValueError('architecture sketch axes disagree')
+        self.k = d//(q*probes)
+        self.flat_left = np.ascontiguousarray(self.left.reshape(c,-1))
+        self.flat_right = np.ascontiguousarray(self.right.reshape(c,-1))
+        if products.native:
+            for name in ('pcgc_architecture_features','pcgc_architecture_polynomials'):
+                if not callable(getattr(products.module,name,None)):
+                    raise RuntimeError('native extension lacks PCGC architecture kernels; rebuild SUMMIT')
+
+    def covariance(self,omega):
+        if not self.products.native:
+            return architecture_trace_covariance(omega,self.left,self.right,self.probes)
+        function = self.products.module.pcgc_architecture_features
+        weight = np.ascontiguousarray(omega).reshape(self.k,-1)
+        left = np.asarray(function(weight,self.flat_left,self.q,self.probes,False,self.products.threads))
+        right = np.asarray(function(weight,self.flat_right,self.q,self.probes,True,self.products.threads))
+        value = 2*self.products.tn(left,right)/self.probes**2
+        self.products.drain()
+        return (value+value.T)/2
+
+    def scalar_polynomials(self,omega,rows,directions):
+        rows = np.asarray(rows)
+        directions = np.asarray(directions)
+        if directions.shape != (len(rows),self.k,self.q,self.q) or rows.shape[1] != len(self.left):
+            raise ValueError('architecture confidence directions disagree')
+        if not self.products.native:
+            result = []
+            for row,direction in zip(rows,directions):
+                v0 = float(row@self.covariance(omega)@row)
+                vp = float(row@self.covariance(omega+direction)@row)
+                vm = float(row@self.covariance(omega-direction)@row)
+                result.append([v0,(vp-vm)/2,(vp+vm)/2-v0])
+            return np.asarray(result)
+        # TN output is F-order D² by T; its transpose is the C-order T by D²
+        # input used by the native trace reducer, without another large copy.
+        left = self.products.tn(self.flat_left,rows.T).T
+        right = self.products.tn(self.flat_right,rows.T).T
+        result = np.asarray(self.products.module.pcgc_architecture_polynomials(
+            np.ascontiguousarray(omega).reshape(self.k,-1),
+            np.ascontiguousarray(directions).reshape(len(rows),-1),left,right,
+            self.q,self.probes,self.products.threads))
+        self.products.drain()
+        return result
