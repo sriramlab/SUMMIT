@@ -22,7 +22,7 @@ from scripts.pcgc.calibrate_cross_gxe import wilson
 
 def make_design(n, m, *, kind, overlap, annotations=1, seed=729103,
                 prevalence=.2, risk_strength=.6, heterogeneous=False,
-                genotype="gaussian", signal=.035, native=False, threads=1, annotation_mixing=0., genetic_scale=1.):
+                genotype="gaussian", signal=.035, native=False, threads=1, annotation_mixing=0., genetic_scale=1., effect_correlation=None):
     rng=np.random.default_rng(seed)
     shared=int(n*overlap);total=2*n-shared
     rows=[np.arange(n),np.r_[np.arange(shared),np.arange(n,total)]]
@@ -46,6 +46,12 @@ def make_design(n, m, *, kind, overlap, annotations=1, seed=729103,
     risk=[ndtr(ndtri(prevalence)+risk_strength*f[:,1]) for f in phi]
     aa=np.diag([.12,.035]);bb=np.diag([.1,.03])
     ab=np.array([[signal,.01 if signal else 0.],[-.004 if signal else 0.,signal/3]])
+    if effect_correlation is not None:
+        if not np.isfinite(effect_correlation) or abs(effect_correlation)>=1:
+            raise ValueError("effect correlation must lie strictly inside (-1,1)")
+        angle=.2
+        rotation=np.array([[np.cos(angle),-np.sin(angle)],[np.sin(angle),np.cos(angle)]])
+        ab=effect_correlation*np.sqrt(np.diag(aa))[:,None]*rotation*np.sqrt(np.diag(bb))[None,:]
     if not np.isfinite(genetic_scale) or genetic_scale<=0:
         raise ValueError("genetic scale must be positive")
     aa*=genetic_scale;bb*=genetic_scale;ab*=genetic_scale
@@ -247,6 +253,7 @@ def main():
     parser.add_argument("--overlap",type=float,default=1.);parser.add_argument("--annotations",type=int,default=1)
     parser.add_argument("--prevalence",type=float,default=.2);parser.add_argument("--risk-strength",type=float,default=.6)
     parser.add_argument("--heterogeneous",action="store_true");parser.add_argument("--genotype",choices=["gaussian","hardcall_ld"],default="gaussian")
+    parser.add_argument("--effect-correlation",type=float,help="override AB with a rotated common correlation model")
     parser.add_argument("--genetic-scale",type=float,default=1.)
     parser.add_argument("--annotation-mixing",type=float,default=0.)
     parser.add_argument("--signal",type=float,default=.035);parser.add_argument("--seed",type=int,default=729103)
@@ -258,7 +265,7 @@ def main():
     start=perf_counter();cpu_start=resource.getrusage(resource.RUSAGE_SELF)
     design=make_design(args.n,args.m,kind=args.kind,overlap=args.overlap,annotations=args.annotations,
         seed=args.seed,prevalence=args.prevalence,risk_strength=args.risk_strength,heterogeneous=args.heterogeneous,
-        genotype=args.genotype,signal=args.signal,native=True,threads=args.threads,annotation_mixing=args.annotation_mixing,genetic_scale=args.genetic_scale)
+        genotype=args.genotype,signal=args.signal,native=True,threads=args.threads,annotation_mixing=args.annotation_mixing,genetic_scale=args.genetic_scale,effect_correlation=args.effect_correlation)
     prepared=perf_counter();models,truth=exact_equations(design,args.blocks);reference=perf_counter()
     results=run(design,models,truth,replicates=args.replicates,batch=args.batch)
     cpu_end=resource.getrusage(resource.RUSAGE_SELF)

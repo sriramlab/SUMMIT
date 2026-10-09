@@ -89,7 +89,7 @@ def quantitative_trait(name, samples, y, contexts, *, context_names, population_
             u = np.linalg.qr(design/norm, mode="reduced")[0]
     return CrossTrait(name, tuple(samples), contexts, tuple(context_names), y/sd,
                       np.ones(len(y)), u, dict(kind="quantitative", selection=selection,
-                      population_sd=sd, response_scale="supplied_population_sd",
+                      population_sd=sd, sample_size=len(y), response_scale="supplied_population_sd",
                       nuisance_source="fixed_design_OLS"))
 
 
@@ -142,8 +142,13 @@ def binary_trait(name, samples, y, contexts, *, context_names, liability_sd,
     lp, lq, slope = sampled_log_probabilities(ndtri(k), -np.log(odds))
     z = np.where(y == 1, np.exp(.5*(lq-lp)), -np.exp(.5*(lp-lq)))
     w = slope*np.exp(.5*(lp+lq))/sd
+    relative_w = w/np.max(w)
     return CrossTrait(name, tuple(samples), contexts, tuple(context_names), z, w,
                       np.empty((len(y), 0)), dict(kind="binary", selection=selection,
+                      sample_size=len(y),case_count=int(y.sum()),control_count=int(len(y)-y.sum()),
+                      population_risk_range=[float(k.min()),float(k.max())],
+                      liability_sd_range=[float(sd.min()),float(sd.max())],
+                      sensitivity_effective_sample_size=float(np.sum(relative_w**2)**2/np.sum(relative_w**4)),
                       sampling_odds=float(odds), prevalence=prevalence, risk_source=source,
                       fitted_coefficients_sha256=risk_identity,
                       risk_design_sha256=(None if risk_covariates is None else array_sha256(np.asarray(risk_covariates,dtype=float))),
