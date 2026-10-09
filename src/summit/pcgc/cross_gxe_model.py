@@ -168,7 +168,7 @@ class DiagonalRemoval:
             raise ValueError("overlap projection has excessive leverage; diagonal removal is unstable")
         self.v = np.asfortranarray((a[:, :, None]*b[:, None, :]).reshape(len(a), a.shape[1]*b.shape[1]))
         self.factor = None
-        if self.v.shape[1]:
+        if len(self.d) and self.v.shape[1]:
             gram = products.tn(self.v, self.v/self.d[:, None])
             self.factor = cho_factor(np.eye(gram.shape[0])+gram, lower=True, check_finite=True)
 

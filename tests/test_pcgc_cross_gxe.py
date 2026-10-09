@@ -88,10 +88,13 @@ def dense_oracle(x, a, traits, rows, probes=37, seed=41):
 
 @pytest.mark.parametrize("kind", ["qq", "bq", "bb"])
 @pytest.mark.parametrize("overlap", [0, 8, 17])
-def test_explicit_rectangular_kernels(kind, overlap):
+@pytest.mark.parametrize("native", [False, True])
+def test_explicit_rectangular_kernels(kind, overlap, native):
+    from prediction_helpers import prediction_threads
     x,a,traits,ids,rows = fixture(kind, overlap)
     actual = prepare_cross_gxe(ArraySequentialGenotypeOperator(x),a,traits,ids,
-                              probes=37,seed=41,native=False,block_size=7,probe_tile=11)
+                              probes=37,seed=41,native=native,block_size=7,probe_tile=11,
+                              threads=prediction_threads())
     expected = dense_oracle(x,a,traits,rows)
     for pair in actual.pairs:
         value = expected[pair.left,pair.right]
