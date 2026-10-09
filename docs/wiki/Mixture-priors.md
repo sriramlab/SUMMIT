@@ -70,7 +70,7 @@ participant-specific residual variances, rank-deficient fixed covariates,
 singular genetic covariances and differing participant masks across traits.
 The context dimension is limited to 32.
 
-In the [CLI fit specification](wiki/Polygenic-scores.md#fit-and-inspect),
+In the [CLI fit specification](Polygenic-scores.md#fit-and-inspect),
 replace the `solver` field with the following setting. These snippets show the
 fields to add to the full specification or candidate object.
 
@@ -133,7 +133,7 @@ Appreciable numerical drift raises an error.
 
 Resume requires matching inputs, solver settings, and implementation.
 Rebuilding caches after restart requires another genotype pass. Existing model
-directories are never overwritten. See [Installation](wiki/Installation.md)
+directories are never overwritten. See [Installation](Installation.md)
 for the native build requirements.
 
 The Python API also accepts `initial_weights`, with exactly one finite array

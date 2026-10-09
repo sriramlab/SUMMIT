@@ -1,7 +1,7 @@
 """Off-diagonal liability GxE moments on SUMMIT's generalized context axes.
 
-No projection or variance row is applied. See docs/pcgc_gxe.md for the scale,
-ascertainment and external-reference contracts.
+No projection or variance row is applied. See
+docs/wiki/Generalized-GxE-PCGC.md for scale, sampling and reference assumptions.
 """
 from dataclasses import dataclass
 import numpy as np

@@ -3,7 +3,7 @@
 For quantitative traits, the one-environment model estimates additive genetic
 variance, interaction variance, residual variance, and environment-dependent
 residual variance. It can reuse one reference calculation across traits.
-For binary outcomes, see [Generalized G×E PCGC](../pcgc_gxe.md).
+For binary outcomes, see [Generalized G×E PCGC](Generalized-GxE-PCGC.md).
 
 ## Inputs
 

@@ -85,7 +85,7 @@ that also runs on macOS.
 - [Multiple environments](https://github.com/sriramlab/SUMMIT/wiki/Multiple-environments)
 - [Cross-trait response models](https://github.com/sriramlab/SUMMIT/wiki/Cross-trait-analysis)
 - [Binary traits and PCGC](https://github.com/sriramlab/SUMMIT/wiki/Binary-traits-and-PCGC)
-- [Generalized G×E PCGC](docs/pcgc_gxe.md)
+- [Generalized G×E PCGC](https://github.com/sriramlab/SUMMIT/wiki/Generalized-GxE-PCGC)
 - [Quantitative epistasis](https://github.com/sriramlab/SUMMIT/wiki/Epistasis)
 - [G×E polygenic scores](https://github.com/sriramlab/SUMMIT/wiki/Polygenic-scores)
 - [Real-data results](https://github.com/sriramlab/SUMMIT/wiki/Real-data-results)

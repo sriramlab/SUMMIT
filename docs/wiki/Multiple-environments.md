@@ -8,10 +8,13 @@ can be continuous, categorical, or a specified combination.
 The [cross-trait extension](Cross-trait-analysis.md) estimates the corresponding
 covariance between two traits, with separate sample masks and overlap handling.
 
-For binary disease outcomes, use the [generalized PCGC path](../pcgc_gxe.md).
+For binary disease outcomes, use the [generalized PCGC path](Generalized-GxE-PCGC.md).
 The PCGC command estimates the same types of effect covariance on a declared
 liability scale, accounting for disease risks and case–control sampling.
 It prepares its own reference and trait moments.
+
+For quantitative analyses split across chromosomes, see
+[Chromosome LD and annotation prediction](Chromosome-LD-and-annotation-prediction.md).
 
 ## Workflow
 
@@ -90,7 +93,7 @@ fit = fit_generalized_gxe_variant_model_v1(reference, trait, trait_selector="tra
 Use a trait name saved in the summary. The fitter checks compatibility and
 uses the saved SNP-block definitions for its jackknife. A reference can be
 reused across traits with compatible samples, scaling, contexts, and fixed
-effects. [PCGC preparation](../pcgc_gxe.md) also saves separate reference and
+effects. [PCGC preparation](Generalized-GxE-PCGC.md) also saves separate reference and
 trait files, using `.binary.ldscores.npz` and `.binary.sumstats.npz`. Its fitter
 requires the reference identified by the trait summary.
 

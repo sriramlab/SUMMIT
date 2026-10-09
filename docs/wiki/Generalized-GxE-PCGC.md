@@ -37,7 +37,7 @@ and a finite randomized reference can affect finite-sample estimates.
 ## Inputs
 
 Use the genotype, population-scale, and sample-table formats described in
-[Binary traits and PCGC](wiki/Binary-traits-and-PCGC.md). The sample table
+[Binary traits and PCGC](Binary-traits-and-PCGC.md). The sample table
 must include `FID IID Y E1 E2`, with Y coded 0/1, plus any risk covariates.
 Context columns are used as supplied; SUMMIT adds an intercept. Choose the
 exposure centers, scales, and categorical reference levels before preparation.
@@ -113,7 +113,7 @@ and analyzed sample.
 
 Existing combined `.binary.npz` files remain accepted through `--h2` alone.
 To prepare that format, add `--binary-output-format combined`. Separate files
-are the default for all binary methods. The [input guide](wiki/Input-files.md#files-used-for-inference)
+are the default for all binary methods. The [input guide](Input-files.md#files-used-for-inference)
 compares the formats across workflows.
 
 ## Covariate adjustment
@@ -130,7 +130,7 @@ Use `pcgc` for the primary analysis. Its study-specific directional LD scores
 use features `F_q = diag(d/s) diag(phi_q) X`, where d is the PCGC risk
 sensitivity and s is the supplied conditional liability SD. The sensitivity
 depends on population risk and case–control sampling, as defined in
-[PCGC methods](pcgc.md#risk-adjustment-and-estimating-equations). Trait scores
+[PCGC methods](PCGC-methods.md#risk-adjustment-and-estimating-equations). Trait scores
 use the same features, and preparation removes same-person terms from both
 the trait and reference moments. Ordinary quantitative-trait directional LD
 scores generally cannot be reused for this fit.

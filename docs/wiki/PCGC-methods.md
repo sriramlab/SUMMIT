@@ -2,8 +2,8 @@
 
 PCGC estimates liability-scale genetic variance from case–control data.
 This page describes additive PCGC. For inputs and commands, see
-[Binary traits and PCGC](wiki/Binary-traits-and-PCGC.md); for context-dependent
-SNP effects, see [Generalized G×E PCGC](pcgc_gxe.md).
+[Binary traits and PCGC](Binary-traits-and-PCGC.md); for context-dependent
+SNP effects, see [Generalized G×E PCGC](Generalized-GxE-PCGC.md).
 
 ## Risk adjustment and estimating equations
 
@@ -84,7 +84,7 @@ The additive methods above use unprojected genotype features. In general,
 `P diag(d) X` differs from `diag(d) P X`, and projecting heteroskedastic binary
 residuals creates off-diagonal noise. Risk covariates are assumed exogenous.
 The generalized G×E path supports genotype-PC adjustment before context and
-risk weighting; its [covariate-adjustment section](pcgc_gxe.md#covariate-adjustment)
+risk weighting; its [covariate-adjustment section](Generalized-GxE-PCGC.md#covariate-adjustment)
 describes the required inputs and order of operations.
 
 ## SNP-block standard errors

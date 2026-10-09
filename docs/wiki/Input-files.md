@@ -83,7 +83,7 @@ depend on the disease-risk model and analyzed sample.
 
 Existing combined `.binary.npz` files are accepted through `--h2` alone.
 `--binary-output-format combined` selects that format during preparation.
-See [Generalized G×E PCGC](../pcgc_gxe.md#matching-reference-and-summary-files)
+See [Generalized G×E PCGC](Generalized-GxE-PCGC.md#matching-reference-and-summary-files)
 for the compatibility checks and [Multiple environments](Multiple-environments.md)
 for the quantitative Python interface.
 

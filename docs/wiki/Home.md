@@ -28,7 +28,7 @@ results go to `example/out/`.
 | Joint continuous and categorical environments | [Multiple environments](Multiple-environments.md) |
 | Supplied epistasis targets and backgrounds | [Quantitative epistasis](Epistasis.md) |
 | Shared genetic responses across traits | [Cross-trait response models](Cross-trait-analysis.md) |
-| Binary traits with case–control ascertainment | [Additive PCGC](Binary-traits-and-PCGC.md), [generalized G×E PCGC](../pcgc_gxe.md) |
+| Binary traits with case–control ascertainment | [Additive PCGC](Binary-traits-and-PCGC.md), [generalized G×E PCGC](Generalized-GxE-PCGC.md) |
 | Context-dependent genetic prediction | [Polygenic scores](Polygenic-scores.md) |
 | Python model construction and mathematical details | [PGS API](PGS-API.md), [Methods](Methods.md) |
 | Research extensions | [Contextual Python API](Contextual-Python-API.md) |

@@ -15,8 +15,9 @@ Source modules are grouped by analysis in `src/summit`; genotype decoding and
 numerical kernels are in `src/native`. Read [AGENTS.md](AGENTS.md) and the
 [methods](docs/wiki/Methods.md) before changing reference estimators.
 
-Edit user guides in `docs/wiki`; these are also the GitHub Wiki sources.
-Additional method guides are listed in [docs/README.md](docs/README.md).
+Edit user and method guides in `docs/wiki`; these are also the GitHub Wiki
+sources. Use links to other wiki pages for guide navigation. The documentation
+index is [docs/README.md](docs/README.md).
 Keep one current guide for each topic and update links when removing an obsolete
 page. Document inputs, commands, outputs, and scientific assumptions. Keep
 development logs and machine-specific job histories out of user guides.

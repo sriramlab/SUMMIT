@@ -1,7 +1,9 @@
 # PGS Python API
 
 The main entry points are `plan_prediction`, `fit_prediction`, and
-`score_prediction` in `summit.prediction`.
+`score_prediction` in `summit.prediction`. For annotation-dependent priors,
+see [Chromosome LD and annotation prediction](Chromosome-LD-and-annotation-prediction.md);
+for non-Gaussian priors, see [Mixture priors](Mixture-priors.md).
 
 ```python
 from summit.prediction import (

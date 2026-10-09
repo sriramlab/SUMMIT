@@ -13,7 +13,7 @@ beta/SE files and ordinary LD scores are not interchangeable with these inputs.
 Joint additive and interaction covariance estimation is available with
 `--binary-context-columns` and an explicit conditional liability scale.
 All four PCGC modes are supported; external LD remains a factorization
-approximation. See [Generalized G×E PCGC](../pcgc_gxe.md) for the model,
+approximation. See [Generalized G×E PCGC](Generalized-GxE-PCGC.md) for the model,
 inputs, examples, and interpretation.
 
 Contextual preparation also supports genotype-PC adjustment through
@@ -21,7 +21,7 @@ Contextual preparation also supports genotype-PC adjustment through
 `--binary-sampling-partners`; `--binary-architecture-probes` adds a Gaussian
 SNP-effect variance model. These intervals remain experimental, with
 undercoverage in some rare-disease and overlapping-LD simulations. The
-[G×E guide](../pcgc_gxe.md#estimates-and-uncertainty) explains their scope.
+[G×E guide](Generalized-GxE-PCGC.md#estimates-and-uncertainty) explains their scope.
 
 ## Inputs
 
@@ -152,8 +152,8 @@ each annotation's SNP set in isolation.
 The additive model assumes case-status sampling, exogenous risk covariates,
 and a compatible population genotype scale, with unprojected genotype features.
 For genotype-PC adjustment in the generalized G×E path, see
-[Covariate adjustment](../pcgc_gxe.md#covariate-adjustment).
-The [PCGC methods](../pcgc.md) give the additive estimating equations.
+[Covariate adjustment](Generalized-GxE-PCGC.md#covariate-adjustment).
+The [PCGC methods](PCGC-methods.md) give the additive estimating equations.
 
 ## Computation and cross-trait work
 
@@ -173,4 +173,4 @@ case-status sampling assumption. Shared controls require aligned sample IDs and
 a compatible selection design. This remains a research Python API; binary
 `--rg` and general cross-study binary summary files are not exposed.
 
-See the [PCGC methods](../pcgc.md) for the equations and API limits.
+See the [PCGC methods](PCGC-methods.md) for the equations and API limits.

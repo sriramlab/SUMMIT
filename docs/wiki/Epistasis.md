@@ -4,7 +4,7 @@ SUMMIT tests interactions between supplied SNP pairs or between a target SNP
 and a genetic score. It also estimates target-by-background variance components.
 Choose targets, backgrounds, and test families before examining confirmation
 outcomes. These workflows use quantitative traits; binary G×E estimation is
-described in [Generalized G×E PCGC](../pcgc_gxe.md).
+described in [Generalized G×E PCGC](Generalized-GxE-PCGC.md).
 
 ## Choose a model
 

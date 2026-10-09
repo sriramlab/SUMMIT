@@ -83,7 +83,7 @@ and `GXELDCORE_GEMM_CHECKSUM=ON` when building. These numerical checks are
 required by the prediction backend.
 
 Planning, checkpoints, model saving, and scoring use the regular
-[prediction API](wiki/PGS-API.md). The fitted weights use the supplied per-SNP
+[prediction API](PGS-API.md). The fitted weights use the supplied per-SNP
 priors. Scoring saved weights requires no annotation input.
 
 For the CLI, write a design with `write_annotation_design(path, design)` and

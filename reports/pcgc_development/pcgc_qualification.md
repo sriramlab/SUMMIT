@@ -24,7 +24,7 @@ validity for arbitrary ascertainment, ancestry structure or reference panels.
 
 ## What is implemented
 
-The [scientific and input contract](../../docs/pcgc.md) defines all five methods. Risk
+The [PCGC methods](../../docs/wiki/PCGC-methods.md) defines all five methods. Risk
 preparation fits an ascertainment-aware population-probit likelihood or accepts
 supplied population risks. Standard, inverse and scalar methods share the
 same moment representation, solver and block reduction. Exact basis
