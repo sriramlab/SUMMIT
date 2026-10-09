@@ -28,6 +28,9 @@ jobs:
 
           source = Path("environment.yml").read_text()
           source = source.replace("  - numpy>=1.25\n", f"  - {os.environ['NUMPY_SPEC']}\n")
+          # The conda bed-reader build pins NumPy <2; its wheel supports both.
+          source = source.replace("  - bed-reader>=1.0\n", "")
+          source = source.replace("  - pip:\n", "  - pip:\n      - bed-reader==1.0.0\n")
           Path(".github/summit-ci-environment.yml").write_text(source)
           PY
       - uses: conda-incubator/setup-miniconda@8ee1f361103df19b6f8c8655fd3967a8ecb162d5
