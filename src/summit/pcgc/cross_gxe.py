@@ -126,14 +126,14 @@ class CrossGxEMoments:
 
 
 def plan_cross_reference(n, m, traits, pairs, *, annotations, probes, block_size,
-                         probe_tile, memory_bytes, native=True, extra_bytes=0, threads=1, genotype_format="bed"):
+                         probe_tile, memory_bytes, native=True, extra_bytes=0, threads=1, genotype_format="bed", context_tile=4):
     """Conservative total working-set admission, including resident artifacts.
 
     Reuses the mature reference planner for decoder/native workspace; additional
     cross-trait arrays are budgeted explicitly. All source sketches remain
     resident; probe tiling bounds product workspace, never source scope.
     """
-    if any(type(v) is not int or v < 1 for v in (n, m, annotations, block_size, probe_tile, memory_bytes)):
+    if any(type(v) is not int or v < 1 for v in (n, m, annotations, block_size, probe_tile, context_tile, memory_bytes)):
         raise ValueError("cross-trait planner sizes must be positive integers")
     if type(probes) is not int or probes < 2:
         raise ValueError("at least two global variant probes are required")
@@ -145,7 +145,7 @@ def plan_cross_reference(n, m, traits, pairs, *, annotations, probes, block_size
     max_overlap_rank = max((o*traits[a].fixed_basis.shape[1]*traits[b].fixed_basis.shape[1]
                             for o, (a, b) in zip(overlap, pairs)), default=0)
     outputs = m*(k*sum(p*p for p in ps)+sum(ps)+sum(t.q for t in traits))+probes*k*k*sum(p*p for p in ps)
-    sketches = (n+nq)*k*probes
+    sketches = (n+sum(t.fixed_basis.shape[1]*t.q for t in traits))*k*probes
     diagonals = sum(o*(k*p+1) for o, p in zip(overlap, ps))
     # Native GEMM accepts/copies F-order operands, including projection and
     # correction inputs. Include coexistence during artifact serialization.
@@ -153,8 +153,15 @@ def plan_cross_reference(n, m, traits, pairs, *, annotations, probes, block_size
     fixed = baseline+8*(2*outputs+sketches+3*diagonals+4*max_overlap_rank+4*max_rank**2+
                m*k+sum(len(t.samples)*(3*t.q+3*t.fixed_basis.shape[1]+8) for t in traits))+extra_bytes
     b, tile = min(m, block_size), min(probes, probe_tile)
+    context_tile=min(context_tile,max(t.q*(t.q+1)//2 for t in traits))
     while True:
-        workspace = 8*(6*n*b+3*nq*b+4*nq*k*tile+
+        # Also reserve the two-sided projected source used when the
+        # low-rank subtraction would lose precision through cancellation.
+        source_workspace=max(len(t.samples)*max(
+            4*min(context_tile,t.q*(t.q+1)//2),
+            2*min(context_tile,t.q*(t.q+1)//2)+(4 if t.fixed_basis.shape[1] else 0))
+            for t in traits)
+        workspace = 8*(6*n*b+3*nq*b+source_workspace*k*tile+
                        4*b*k*tile*sum(t.q*t.q for t in traits)+4*b*tile*k)
         remaining = memory_bytes-fixed-workspace
         if remaining > 0:
@@ -171,9 +178,12 @@ def plan_cross_reference(n, m, traits, pairs, *, annotations, probes, block_size
             b = max(1, b//2)
         elif tile > 1:
             tile = max(1, tile//2)
+        elif context_tile > 1:
+            context_tile = max(1, context_tile//2)
         else:
             raise MemoryError("cross-trait resident sketches, rows and overlap workspace exceed memory budget")
     return dict(block_size=min(b, base.tiling["variant_block_width"]), probe_tile=min(tile, base.tiling["source_probe_tile_width"]),
+                context_tile=context_tile,
                 baseline_rss_bytes=baseline, resident_artifact_bytes=8*outputs, source_sketch_bytes=8*sketches,
                 overlap_diagonal_bytes=8*diagonals, fixed_reserved_bytes=fixed,
                 cross_workspace_bytes=workspace, native_decoder_plan=base.to_dict(),
@@ -182,7 +192,7 @@ def plan_cross_reference(n, m, traits, pairs, *, annotations, probes, block_size
 
 
 def prepare_cross_gxe(operator, annotations, traits, master_samples, *,
-                      pairs=None, probes=256, seed=0, block_size=256, probe_tile=32,
+                      pairs=None, probes=256, seed=0, block_size=256, probe_tile=32, context_tile=4,
                       memory_bytes=2**30, native=True, threads=1, extra_bytes=0):
     """Joint reference/trait preparation; selection checks precede genotype I/O."""
     start_time = perf_counter()
@@ -218,16 +228,22 @@ def prepare_cross_gxe(operator, annotations, traits, master_samples, *,
     plan = plan_cross_reference(n, m, traits, pairs, annotations=a.shape[1], probes=probes,
                                block_size=block_size, probe_tile=probe_tile,
                                memory_bytes=memory_bytes, native=native, extra_bytes=extra_bytes,
-                               threads=threads, genotype_format=operator.genotype_format)
+                               threads=threads, genotype_format=operator.genotype_format, context_tile=context_tile)
     block_size, tile = plan["block_size"], plan["probe_tile"]
+    context_tile=plan["context_tile"]
     if hasattr(operator, "configure_block_width"):
         operator.configure_block_width(block_size)
     products = Products(native, threads)
     k = a.shape[1]
+    context_weights=[np.asfortranarray(t.contexts*t.sensitivity[:,None]) for t in traits]
+    if any(not np.isfinite(value).all() for value in context_weights):
+        raise ValueError("risk-weighted contexts must remain finite on the supplied scale")
     spec = GlobalVariantProbeSpec(root_seed=seed, probe_offset=0, probe_count=probes)
     response = [project(t.response[:, None], t.fixed_basis, products)[:, 0] for t in traits]
     base_sketch = np.zeros((n, k*probes), order="F")
-    sketches = None
+    projection_sketches=[[np.zeros((t.fixed_basis.shape[1],k*probes),order="F")
+                          for _ in range(t.q)] for t in traits]
+    diagonal_products=[tuple((q,u) for q in range(t.q) for u in range(q,t.q)) for t in traits]
     summaries, diagonals = [], []
     for (left, right), (ia, ib) in zip(pairs, overlap_indices):
         layout = pair_layout(traits[left].q, traits[right].q, left == right)
@@ -241,14 +257,23 @@ def prepare_cross_gxe(operator, annotations, traits, master_samples, *,
                    score_seconds=0., overlap_row_seconds=0., overlap_solve_seconds=0.,
                    genotype_read_transform_seconds=0., reference_draw_aggregation_seconds=0.)
     correction, response_correction = [], []
+    projection_fallbacks=0
 
     def features(x):
-        values = []
-        for t, index in zip(traits, row_views):
+        values,coefficients = [],[]
+        for t, index, context_weight in zip(traits, row_views, context_weights):
             base = x[index]
-            values.append([project(base*(t.sensitivity*t.contexts[:, q])[:, None],
-                                   t.fixed_basis, products) for q in range(t.q)])
-        return values
+            vv,cc=[],[]
+            for q in range(t.q):
+                value=np.asfortranarray(base*context_weight[:,q,None])
+                if t.fixed_basis.shape[1]:
+                    coefficient=products.tn(t.fixed_basis,value)
+                    value=np.asfortranarray(value-products.nn(t.fixed_basis,coefficient))
+                else:
+                    coefficient=np.empty((0,x.shape[1]))
+                vv.append(value);cc.append(coefficient)
+            values.append(vv);coefficients.append(cc)
+        return values,coefficients
 
     for pass_number in (1, 2):
         operator.begin_pass(pass_number)
@@ -258,7 +283,7 @@ def prepare_cross_gxe(operator, annotations, traits, master_samples, *,
             x = operator.read_block(first, last).values
             timings["genotype_read_transform_seconds"] += perf_counter()-read_start
             tick = perf_counter()
-            f = features(x)
+            f,coefficients = features(x)
             timings["feature_seconds"] += perf_counter()-tick
             weights = a[first:last]
             if pass_number == 1:
@@ -280,6 +305,17 @@ def prepare_cross_gxe(operator, annotations, traits, master_samples, *,
                     for annotation in range(k):
                         base_sketch[:, annotation*probes+begin:annotation*probes+end] += contribution[:, annotation*(end-begin):(annotation+1)*(end-begin)]
                     del contribution
+                    # U' D_q X has already been computed for the target features.
+                    # Accumulate its global variant sketch without N-sized
+                    # projected context sketches or an additional genotype pass.
+                    for t,trait in enumerate(traits):
+                        rank=trait.fixed_basis.shape[1]
+                        if rank:
+                            value=products.nn(np.concatenate(coefficients[t],axis=0),az)
+                            for q in range(trait.q):
+                                for annotation in range(k):
+                                    projection_sketches[t][q][:,annotation*probes+begin:annotation*probes+end] += value[q*rank:(q+1)*rank,annotation*(end-begin):(annotation+1)*(end-begin)]
+                            del value
                 phase_seconds = perf_counter()-tick
                 timings["reference_seconds"] += phase_seconds
                 timings["pass1_sketch_seconds"] += phase_seconds
@@ -304,10 +340,40 @@ def prepare_cross_gxe(operator, annotations, traits, master_samples, *,
                     end = min(probes, begin+tile)
                     panels = []
                     for t, trait in enumerate(traits):
-                        source = np.concatenate([s[:, annotation*probes+begin:annotation*probes+end]
-                                                 for s in sketches[t] for annotation in range(k)], axis=1)
-                        target = np.concatenate(f[t], axis=1)
-                        panels.append(products.tn(target, source).reshape(trait.q, last-first, trait.q, k, end-begin))
+                        base=np.asfortranarray(x[row_views[t]])
+                        source_base=np.asfortranarray(np.concatenate([
+                            base_sketch[row_views[t],annotation*probes+begin:annotation*probes+end]
+                            for annotation in range(k)],axis=1))
+                        projected_source=[np.concatenate([
+                            value[:,annotation*probes+begin:annotation*probes+end]
+                            for annotation in range(k)],axis=1) for value in projection_sketches[t]]
+                        panel=np.empty((trait.q,last-first,trait.q,k,end-begin))
+                        for first_context in range(0,len(diagonal_products[t]),context_tile):
+                            batch=diagonal_products[t][first_context:first_context+context_tile]
+                            source=np.concatenate([
+                                source_base*(context_weights[t][:,q]*context_weights[t][:,u])[:,None]
+                                for q,u in batch],axis=1)
+                            core=products.tn(base,source).reshape(last-first,len(batch),k*(end-begin))
+                            for index,(q,u) in enumerate(batch):
+                                # X' D_q D_u Z is shared, but the ordered
+                                # projection term (U'D_q X)' (U'D_u Z) is not.
+                                orientations=((q,u),) if q==u else ((q,u),(u,q))
+                                for left_context,right_context in orientations:
+                                    raw=core[:,index]
+                                    value=raw
+                                    if trait.fixed_basis.shape[1]:
+                                        low_rank=products.tn(coefficients[t][left_context],projected_source[right_context])
+                                        value=raw-low_rank
+                                        if np.any(np.abs(value)<1e-6*(np.abs(raw)+np.abs(low_rank))):
+                                            # Reuse the stable two-sided projected
+                                            # product when subtraction nearly cancels.
+                                            fallback=project(source_base*context_weights[t][:,right_context,None],
+                                                             trait.fixed_basis,products)
+                                            value=products.tn(f[t][left_context],fallback)
+                                            del fallback
+                                            projection_fallbacks+=1
+                                    panel[left_context,:,right_context]=value.reshape(last-first,k,end-begin)
+                        panels.append(panel)
                     for pair in summaries:
                         left, right = panels[pair.left], panels[pair.right]
                         for p, target in enumerate(pair.layout):
@@ -326,27 +392,6 @@ def prepare_cross_gxe(operator, annotations, traits, master_samples, *,
         operator.finish_pass()
         if pass_number == 1:
             tick = perf_counter()
-            sketches = []
-            for t, index in zip(traits, row_views):
-                trait_sketches = []
-                for q in range(t.q):
-                    transformed = np.empty((len(t.samples), k*probes), order="F")
-                    for begin in range(0, probes, tile):
-                        end = min(probes, begin+tile)
-                        value = np.concatenate([base_sketch[index, annotation*probes+begin:annotation*probes+end]
-                                                for annotation in range(k)], axis=1)
-                        value = value*(t.sensitivity*t.contexts[:,q])[:,None]
-                        projected = project(value, t.fixed_basis, products)
-                        for annotation in range(k):
-                            transformed[:, annotation*probes+begin:annotation*probes+end] = projected[:, annotation*(end-begin):(annotation+1)*(end-begin)]
-                        del value, projected
-                    trait_sketches.append(transformed)
-                sketches.append(trait_sketches)
-            del base_sketch
-            phase_seconds = perf_counter()-tick
-            timings["reference_seconds"] += phase_seconds
-            timings["source_transform_seconds"] += phase_seconds
-            tick = perf_counter()
             for pair, (ia, ib), diagonal in zip(summaries, overlap_indices, diagonals):
                 remover = DiagonalRemoval(traits[pair.left].fixed_basis[ia],
                                           traits[pair.right].fixed_basis[ib], products)
@@ -364,6 +409,8 @@ def prepare_cross_gxe(operator, annotations, traits, master_samples, *,
         peak_rss_bytes=_peak_rss_bytes(),
         genotype_passes=operator.observed_passes, variant_visits=operator.observed_variant_visits,
         genotype_scale_identity=operator.genotype_scale_id, probes=spec.to_metadata(),
+        panel_method="diagonal_weights_with_ordered_projection_correction_v1",
+        projection_cancellation_fallbacks=projection_fallbacks,
         native=native, threads=threads, gemm_calls=products.left.calls+products.right.calls,
         repaired_columns=products.left.repaired_columns+products.right.repaired_columns)
     identity = dict(master_sample_sha256=canonical_sha256({"samples": master_samples}),

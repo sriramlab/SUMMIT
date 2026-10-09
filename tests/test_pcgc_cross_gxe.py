@@ -120,8 +120,9 @@ def test_chunk_probe_tile_and_native_invariance():
     x,a,traits,ids,rows = fixture()
     from prediction_helpers import prediction_threads
     runs = [prepare_cross_gxe(ArraySequentialGenotypeOperator(x),a,traits,ids,
-             probes=37,seed=41,native=native,block_size=block,probe_tile=tile,
-             threads=prediction_threads()) for native,block,tile in [(False,5,7),(False,24,37),(True,9,13)]]
+             probes=37,seed=41,native=native,block_size=block,probe_tile=tile,context_tile=context_tile,
+             threads=prediction_threads()) for native,block,tile,context_tile in
+             [(False,5,7,1),(False,24,37,4),(True,9,13,2)]]
     for run in runs[1:]:
         for p,r in zip(runs[0].pairs,run.pairs):
             for name in ("rhs_rows","ldscores","probe_grams"):
@@ -494,3 +495,24 @@ def test_inverse_reference_diagnostics_against_exact_inverse_average():
     zero=_reference_inverse_diagnostics(h,np.zeros((8,2,2)),theta)
     assert zero["reference_inverse_rms_perturbation"]==0
     assert zero["reference_inverse_second_order_bias"]==[0.,0.]
+
+@pytest.mark.parametrize("native",[False,True])
+def test_projection_subtraction_cancellation_uses_direct_products(native):
+    from prediction_helpers import prediction_threads
+    rng=np.random.default_rng(28729)
+    n,m=96,8
+    x=rng.normal(size=(n,m));a=np.ones((m,1))
+    x[:,0]*=1e4  # Expose cancellation with a large removed direction.
+    ids=tuple(("f",str(i)) for i in range(n))
+    trait=quantitative_trait("trait",ids,rng.normal(size=n),np.ones((n,1)),
+        context_names=("intercept",),population_sd=1.,
+        fixed_effects=np.column_stack((np.ones(n),x[:,0])))
+    actual=prepare_cross_gxe(ArraySequentialGenotypeOperator(x),a,[trait],ids,
+        probes=19,seed=72,block_size=8,probe_tile=7,context_tile=1,
+        native=native,threads=prediction_threads())
+    assert actual.diagnostics["projection_cancellation_fallbacks"]>0
+    expected=dense_oracle(x,a,[trait],[np.arange(n)],probes=19,seed=72)[0,0]["stochastic"]
+    np.testing.assert_allclose(actual.pairs[0].ldscores*n*n,expected,rtol=2e-8,atol=2e-7)
+    # This target's genetic feature was removed by the fixed-effect model.
+    # A raw-Gram subtraction leaves substantially larger roundoff here.
+    assert np.max(np.abs(actual.pairs[0].ldscores[0]))<1e-20

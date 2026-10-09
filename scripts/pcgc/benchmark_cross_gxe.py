@@ -86,6 +86,7 @@ def main():
     parser.add_argument("--probes",type=int,default=32)
     parser.add_argument("--block-size",type=int,default=64)
     parser.add_argument("--probe-tile",type=int,default=16)
+    parser.add_argument("--context-tile",type=int,default=4)
     parser.add_argument("--memory-gib",type=float,default=8)
     parser.add_argument("--threads",type=int,default=2)
     parser.add_argument("--separate",action="store_true")
@@ -118,7 +119,7 @@ def main():
         axis=VariantAxis(tuple(f"s{i}" for i in range(args.m)),("1",)*args.m,tuple(range(1,args.m+1)),("A",)*args.m,("G",)*args.m)
     traits,risk_seconds=generated_traits(ids,indices,args.contexts)
     input_seconds=time.perf_counter()-start
-    options=dict(probes=args.probes,seed=191,block_size=args.block_size,probe_tile=args.probe_tile,
+    options=dict(probes=args.probes,seed=191,block_size=args.block_size,probe_tile=args.probe_tile,context_tile=args.context_tile,
                  memory_bytes=int(args.memory_gib*2**30),threads=args.threads)
     def run(trait_indices):
         tt=[traits[i] for i in trait_indices]

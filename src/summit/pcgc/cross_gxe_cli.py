@@ -168,6 +168,7 @@ def main(argv=None):
     prep.add_argument("--seed",type=int,default=0)
     prep.add_argument("--block-size",type=int,default=256)
     prep.add_argument("--probe-tile",type=int,default=32)
+    prep.add_argument("--context-tile",type=int,default=4,help="maximum diagonal context products per reference tile")
     fit=sub.add_parser("fit",help="fit matching separate files without genotypes")
     fit.add_argument("--sumstats",type=Path,required=True)
     fit.add_argument("--ldscores",type=Path,required=True)
@@ -190,7 +191,7 @@ def main(argv=None):
             if path.exists() or path.is_symlink():
                 raise FileExistsError(f"refusing to overwrite {path}")
         moments,axis,names=prepare_manifest(args.manifest,probes=args.nvecs,seed=args.seed,
-            block_size=args.block_size,probe_tile=args.probe_tile,memory_bytes=memory_bytes,
+            block_size=args.block_size,probe_tile=args.probe_tile,context_tile=args.context_tile,memory_bytes=memory_bytes,
             threads=args.num_threads)
         receipt=write_cross_artifacts(moments,args.out,variant_axis=axis,annotation_names=names)
         print(json.dumps({**receipt,"diagnostics":moments.diagnostics},sort_keys=True))
