@@ -22,7 +22,8 @@ from scripts.pcgc.calibrate_cross_gxe import wilson
 
 def make_design(n, m, *, kind, overlap, annotations=1, seed=729103,
                 prevalence=.2, risk_strength=.6, heterogeneous=False,
-                genotype="gaussian", signal=.035, native=False, threads=1, annotation_mixing=0., genetic_scale=1., effect_correlation=None):
+                genotype="gaussian", signal=.035, native=False, threads=1, annotation_mixing=0., genetic_scale=1., effect_correlation=None, shared_context=False,
+                prevalence_b=None, residual_correlation=.2):
     rng=np.random.default_rng(seed)
     shared=int(n*overlap);total=2*n-shared
     rows=[np.arange(n),np.r_[np.arange(shared),np.arange(n,total)]]
@@ -42,8 +43,12 @@ def make_design(n, m, *, kind, overlap, annotations=1, seed=729103,
         raise ValueError("annotation mixing must lie in [0,1)")
     ann=(1-annotation_mixing)*np.eye(annotations)[np.arange(m)%annotations]+annotation_mixing/annotations
     phi=[np.column_stack((np.ones(n),rng.uniform(-1,1,n))) for _ in range(2)]
+    if shared_context: phi[1][:shared]=phi[0][:shared]
     sd=[np.sqrt(1+.35*f[:,1]) if heterogeneous else np.ones(n) for f in phi]
-    risk=[ndtr(ndtri(prevalence)+risk_strength*f[:,1]) for f in phi]
+    prevalences=[prevalence,prevalence if prevalence_b is None else prevalence_b]
+    if any(not 0<v<1 for v in prevalences) or not -1<residual_correlation<1:
+        raise ValueError("invalid prevalence or residual correlation")
+    risk=[ndtr(ndtri(v)+risk_strength*f[:,1]) for v,f in zip(prevalences,phi)]
     aa=np.diag([.12,.035]);bb=np.diag([.1,.03])
     ab=np.array([[signal,.01 if signal else 0.],[-.004 if signal else 0.,signal/3]])
     if effect_correlation is not None:
@@ -81,7 +86,8 @@ def make_design(n, m, *, kind, overlap, annotations=1, seed=729103,
     del x
     return dict(n=n,m=m,rows=rows,ann=ann,traits=traits,phi=phi,sd=sd,risk=risk,
                 omega=root,truth_matrices=(aa,ab,bb),residual=variance,bases=bases,
-                features=features,products=products,kind=kind,seed=seed,shared=shared)
+                features=features,products=products,kind=kind,seed=seed,shared=shared,
+                residual_correlation=residual_correlation)
 
 
 def exact_equations(design, block_counts, *, retain_grams=False):
@@ -142,7 +148,8 @@ def responses(design, rng, batch):
     beta=(rng.normal(size=(m*batch,4))@design["omega"].T/np.sqrt(m)).reshape(m,batch,4)
     residual=[rng.normal(size=(n,batch)),rng.normal(size=(n,batch))]
     shared=design["shared"]
-    residual[1][:shared]=.2*residual[0][:shared]+np.sqrt(.96)*residual[1][:shared]
+    rho=design["residual_correlation"]
+    residual[1][:shared]=rho*residual[0][:shared]+np.sqrt(1-rho*rho)*residual[1][:shared]
     z=[];eligible=np.ones(batch,dtype=bool);case_counts=[]
     for t in range(2):
         effect=beta[:,:,2*t:2*t+2].transpose(0,2,1).reshape(m,2*batch)
@@ -254,6 +261,9 @@ def main():
     parser.add_argument("--prevalence",type=float,default=.2);parser.add_argument("--risk-strength",type=float,default=.6)
     parser.add_argument("--heterogeneous",action="store_true");parser.add_argument("--genotype",choices=["gaussian","hardcall_ld"],default="gaussian")
     parser.add_argument("--effect-correlation",type=float,help="override AB with a rotated common correlation model")
+    parser.add_argument("--shared-context",action="store_true")
+    parser.add_argument("--prevalence-b",type=float)
+    parser.add_argument("--residual-correlation",type=float,default=.2)
     parser.add_argument("--genetic-scale",type=float,default=1.)
     parser.add_argument("--annotation-mixing",type=float,default=0.)
     parser.add_argument("--signal",type=float,default=.035);parser.add_argument("--seed",type=int,default=729103)
@@ -265,7 +275,8 @@ def main():
     start=perf_counter();cpu_start=resource.getrusage(resource.RUSAGE_SELF)
     design=make_design(args.n,args.m,kind=args.kind,overlap=args.overlap,annotations=args.annotations,
         seed=args.seed,prevalence=args.prevalence,risk_strength=args.risk_strength,heterogeneous=args.heterogeneous,
-        genotype=args.genotype,signal=args.signal,native=True,threads=args.threads,annotation_mixing=args.annotation_mixing,genetic_scale=args.genetic_scale,effect_correlation=args.effect_correlation)
+        genotype=args.genotype,signal=args.signal,native=True,threads=args.threads,annotation_mixing=args.annotation_mixing,genetic_scale=args.genetic_scale,effect_correlation=args.effect_correlation,shared_context=args.shared_context,
+        prevalence_b=args.prevalence_b,residual_correlation=args.residual_correlation)
     prepared=perf_counter();models,truth=exact_equations(design,args.blocks);reference=perf_counter()
     results=run(design,models,truth,replicates=args.replicates,batch=args.batch)
     cpu_end=resource.getrusage(resource.RUSAGE_SELF)

@@ -94,8 +94,10 @@ def test_randomized_variant_oracle_matches_production(kind, overlap):
     np.testing.assert_allclose(fitted["covariance"],snp+mc,rtol=2e-10,atol=2e-10)
 
 
-def test_overlapping_unequal_annotation_mass_matches_generating_kernel():
-    design=make_design(24,25,kind="qq",overlap=.5,annotations=2,annotation_mixing=.8)
+@pytest.mark.parametrize("correlation", [None,.9])
+def test_overlapping_unequal_annotation_mass_matches_generating_kernel(correlation):
+    design=make_design(24,25,kind="qq",overlap=.5,annotations=2,annotation_mixing=.8,
+                       effect_correlation=correlation,shared_context=True,residual_correlation=.8)
     models,truth=exact_equations(design,[5])
     total=max(max(r) for r in design["rows"])+1
     x=np.empty((total,25))
