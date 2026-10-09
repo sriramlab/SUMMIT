@@ -163,7 +163,8 @@ class PolygenicKernels:
             # prior and accumulates its product without a Python N x Q x B array.
             phi=np.asfortranarray(self.contexts[:,active])
             one=np.ones((n,1),order='F')
-        for start, selected, raw in self.stream.blocks(phase):
+        blocks = self.stream.blocks(phase) if len(active) or dominance_active else ()
+        for start, selected, raw in blocks:
             for kind in range(2):
                 if (kind == 0 and not len(active)) or (kind == 1 and not dominance_active):
                     continue

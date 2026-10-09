@@ -206,15 +206,11 @@ def prepare_robust_scores(
     e[saturated] = 0
     denominator = 1 - leverage
     denominator[saturated] = 1
-    meat = np.stack(
-        [
-            tn(
-                r * (e[:, i] / denominator)[:, None],
-                r * (e[:, i] / denominator)[:, None],
-            )
-            for i in range(y.shape[1])
-        ]
-    )
+    meat = np.empty((y.shape[1], f.shape[1], f.shape[1]))
+    for i in range(y.shape[1]):
+        weighted = r * (e[:, i] / denominator)[:, None]
+        meat[i] = tn(weighted, weighted)
+        del weighted
     supported = np.diag(h) > 0
     normalized = r[:, supported] / np.sqrt(np.diag(h)[supported])
     diagnostics = dict(

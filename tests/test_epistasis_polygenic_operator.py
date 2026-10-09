@@ -45,6 +45,17 @@ def fixture():
     return rng, operator, np.stack(kernels), i0, i1, contexts
 
 
+def test_diagonal_only_action_does_not_read_genotypes():
+    rng, make, kernels, i0, _, _ = fixture()
+    operator = make(i0)
+    vectors = rng.normal(size=(len(i0), 3))
+    theta = np.zeros((operator.count, 3))
+    theta[-2:] = rng.uniform(.1, 1., (2, 3))
+    expected = np.einsum('kij,jb,kb->ib', kernels[:, i0][:, :, i0], vectors, theta)
+    np.testing.assert_allclose(operator.apply(vectors, theta), expected, atol=1e-12)
+    assert not operator.stream.ledger.traversals
+
+
 def test_streamed_covariance_he_and_native_solver(tmp_path):
     from summit.epistasis.polygenic import he_geometry, estimate_components, projected_solve
     from scripts.epistasis.conditional_polygenic_reference import fit_covariance

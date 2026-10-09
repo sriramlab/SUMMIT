@@ -29,8 +29,16 @@ def solve(operator, spec=SolverSpec(), *, checkpoint=None):
     start = time.monotonic()
     bases, rhs, diagonal, x, residual, directions, rho, reports = {}, {}, {}, {}, {}, {}, {}, {}
     traits = {t.id: t for t in operator.traits}
+    # Panel RHSs can share the exact same design object. Retain one QR and
+    # one reduced design per object for this solve only; no content hashing,
+    # cross-call cache, or assumption that different arrays have equal spans.
+    shared_bases, fixed_coordinates = {}, {}
     for t in operator.traits:
-        u = thin_rank_revealing_fixed_effect_basis(t.fixed, rtol=spec.qr_rtol)
+        design_key = id(t.fixed)
+        if design_key not in shared_bases:
+            shared_bases[design_key] = thin_rank_revealing_fixed_effect_basis(
+                t.fixed, rtol=spec.qr_rtol)
+        u = shared_bases[design_key]
         if u.shape[1] >= len(t.rows):
             raise ValueError(f"{t.id}: fixed effects exhaust the sample space")
         bases[t.id] = u
@@ -106,8 +114,14 @@ def solve(operator, spec=SolverSpec(), *, checkpoint=None):
                 basis = bases[key[0]]
                 # Recover within exactly the retained QR span. Applying a
                 # second rank threshold to Z could choose a different mean.
-                fixed_coefficients[key] = linalg.lstsq(basis.T @ t.fixed,
-                    basis.T @ (t.y-vu), cond=0.0, lapack_driver="gelsy")[0] if basis.shape[1] else np.zeros(t.fixed.shape[1])
+                if basis.shape[1]:
+                    design_key = id(t.fixed)
+                    if design_key not in fixed_coordinates:
+                        fixed_coordinates[design_key] = basis.T @ t.fixed
+                    fixed_coefficients[key] = linalg.lstsq(fixed_coordinates[design_key],
+                        basis.T @ (t.y-vu), cond=0.0, lapack_driver="gelsy")[0]
+                else:
+                    fixed_coefficients[key] = np.zeros(t.fixed.shape[1])
             elif recovered:
                 # An authenticated archive may still contain a bad numerical
                 # solution. Preserve it and stop; do not silently repair a
