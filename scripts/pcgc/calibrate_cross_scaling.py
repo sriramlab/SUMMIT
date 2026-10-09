@@ -22,7 +22,7 @@ from scripts.pcgc.calibrate_cross_gxe import wilson
 
 def make_design(n, m, *, kind, overlap, annotations=1, seed=729103,
                 prevalence=.2, risk_strength=.6, heterogeneous=False,
-                genotype="gaussian", signal=.035, native=False, threads=1):
+                genotype="gaussian", signal=.035, native=False, threads=1, annotation_mixing=0., genetic_scale=1.):
     rng=np.random.default_rng(seed)
     shared=int(n*overlap);total=2*n-shared
     rows=[np.arange(n),np.r_[np.arange(shared),np.arange(n,total)]]
@@ -38,12 +38,17 @@ def make_design(n, m, *, kind, overlap, annotations=1, seed=729103,
         raw=np.where(copy,shared_allele,own).sum(2).reshape(total,-1)[:,:m]
         p=np.repeat(p,4)[:m]
         x=(raw-2*p)/np.sqrt(2*p*(1-p))
-    ann=np.eye(annotations)[np.arange(m)%annotations]
+    if not 0<=annotation_mixing<1:
+        raise ValueError("annotation mixing must lie in [0,1)")
+    ann=(1-annotation_mixing)*np.eye(annotations)[np.arange(m)%annotations]+annotation_mixing/annotations
     phi=[np.column_stack((np.ones(n),rng.uniform(-1,1,n))) for _ in range(2)]
     sd=[np.sqrt(1+.35*f[:,1]) if heterogeneous else np.ones(n) for f in phi]
     risk=[ndtr(ndtri(prevalence)+risk_strength*f[:,1]) for f in phi]
     aa=np.diag([.12,.035]);bb=np.diag([.1,.03])
     ab=np.array([[signal,.01 if signal else 0.],[-.004 if signal else 0.,signal/3]])
+    if not np.isfinite(genetic_scale) or genetic_scale<=0:
+        raise ValueError("genetic scale must be positive")
+    aa*=genetic_scale;bb*=genetic_scale;ab*=genetic_scale
     omega=np.block([[aa,ab],[ab.T,bb]])
     root=np.linalg.cholesky(omega)
     traits=[]
@@ -73,7 +78,7 @@ def make_design(n, m, *, kind, overlap, annotations=1, seed=729103,
                 features=features,products=products,kind=kind,seed=seed,shared=shared)
 
 
-def exact_equations(design, block_counts):
+def exact_equations(design, block_counts, *, retain_grams=False):
     """Variant-Gram oracle checked against explicit person kernels in tests."""
     f=design["features"];traits=design["traits"];a=design["ann"];m=len(a);k=a.shape[1]
     products=design["products"];mass=a.sum(0)
@@ -86,6 +91,7 @@ def exact_equations(design, block_counts):
                 g[u,q]=g[q,u].T
         gram.append(g)
         products.drain()
+    if retain_grams: design["grams"]=gram
     models=[];truth=[]
     for (left,right),matrix in zip(((0,0),(0,1),(1,1)),design["truth_matrices"]):
         layout=pair_layout(2,2,left==right);p=len(layout);c=k*p
@@ -116,9 +122,10 @@ def exact_equations(design, block_counts):
                 for target in range(p):
                     db[:,:,annotation*p+target]=np.add.reduceat(diagonal[target]*a[:,annotation],boundaries[:-1],axis=1)
             models_by_blocks[count]=dict(boundaries=boundaries,inverse=np.linalg.inv(h),
-                deleted_inverse=np.linalg.inv(h[None]-hs),diagonal=db,H=h,H_blocks=hs)
+                deleted_inverse=np.linalg.inv(h[None]-hs),diagonal=db,H=h,H_blocks=hs,
+                correction_blocks=(db.reshape(len(ia),count*c).T@corrected).reshape(count,c,c))
         models.append(dict(left=left,right=right,layout=layout,overlap=(ia,ib),remover=remover,blocks=models_by_blocks))
-        truth.extend(np.tile([matrix[q,r]/k for orientation in layout for q,r in orientation[:1]],k))
+        truth.extend(np.outer(mass/m,[matrix[q,r] for orientation in layout for q,r in orientation[:1]]).ravel())
         products.drain()
     return models,np.asarray(truth)
 
@@ -130,7 +137,7 @@ def responses(design, rng, batch):
     residual=[rng.normal(size=(n,batch)),rng.normal(size=(n,batch))]
     shared=design["shared"]
     residual[1][:shared]=.2*residual[0][:shared]+np.sqrt(.96)*residual[1][:shared]
-    z=[];eligible=np.ones(batch,dtype=bool)
+    z=[];eligible=np.ones(batch,dtype=bool);case_counts=[]
     for t in range(2):
         effect=beta[:,:,2*t:2*t+2].transpose(0,2,1).reshape(m,2*batch)
         genetic=products.nn(design["bases"][t],effect).reshape(n,2,batch)
@@ -138,9 +145,12 @@ def responses(design, rng, batch):
         if design["kind"][t]=="b":
             risk=design["risk"][t]
             y=latent+design["sd"][t][:,None]*ndtri(risk)[:,None]>0
+            case_counts.append(y.sum(0))
             eligible &= (y.sum(0)>0)&(y.sum(0)<n)
             latent=(y-risk[:,None])/np.sqrt(risk*(1-risk))[:,None]
+        if design["kind"][t]!="b": case_counts.append(None)
         z.append(project(latent,design["traits"][t].fixed_basis,products))
+    design["last_case_counts"]=case_counts
     return z,eligible
 
 
@@ -185,7 +195,7 @@ def report(estimates,variances,rg,truth,blocks,eligible,mean_covariance):
         out[label]=dict(coverage=(hit/n).tolist(),coverage_wilson95=[wilson(h,n) for h in hit],
             null_type1=[float(reject[i]/n) if v==0 else None for i,v in enumerate(truth)],
             null_type1_wilson95=[wilson(reject[i],n) if v==0 else None for i,v in enumerate(truth)])
-    valid=np.isfinite(rg[:,0]);r=rg[valid];target=truth[3*len(truth)//10]/np.sqrt(truth[0]*truth[7*len(truth)//10])
+    valid=np.isfinite(rg[:,0]);r=rg[valid];k=len(truth)//10;target=truth[3*k:7*k:4].sum()/np.sqrt(truth[:3*k:3].sum()*truth[7*k::3].sum())
     out["rg"]=dict(defined=int(valid.sum()),undefined=int((~valid).sum()),
         weak=int(r[:,2].sum()),outside_unit_interval=int((abs(r[:,0])>1).sum()),truth=float(target),
         normal_coverage_among_defined=float(np.mean(abs(r[:,0]-target)<=z*r[:,1])),
@@ -199,11 +209,14 @@ def report(estimates,variances,rg,truth,blocks,eligible,mean_covariance):
 def run(design,models,truth,*,replicates,batch):
     counts=list(models[0]["blocks"]);estimates={j:[] for j in counts};variances={j:[] for j in counts};ratios={j:[] for j in counts}
     covariance_sums={j:np.zeros((len(truth),len(truth))) for j in counts}
+    case_counts=[[],[]]
     eligible=[];rng=np.random.default_rng(design["seed"]+8392)
     k=design["ann"].shape[1];contrast=np.zeros((3,len(truth)))
     contrast[0,np.arange(k)*3]=1;contrast[1,7*k+np.arange(k)*3]=1;contrast[2,3*k+np.arange(k)*4]=1
     for first in range(0,replicates,batch):
         z,valid=responses(design,rng,min(batch,replicates-first));eligible.append(valid)
+        for t,count in enumerate(design["last_case_counts"]):
+            if count is not None: case_counts[t].extend(count.tolist())
         fitted=fit_responses(design,models,z)
         baseline=fitted[counts[0]][0]
         for count,(point,loo) in fitted.items():
@@ -220,7 +233,10 @@ def run(design,models,truth,*,replicates,batch):
             ratio[good,0]=r;ratio[good,1]=np.sqrt(np.maximum(0,np.einsum("ri,rij,rj->r",gradient,vcov[good],gradient)))
             ratio[good,2]=np.any(vg[:,:2]-1.96*np.sqrt(np.diagonal(vcov[good],axis1=1,axis2=2)[:,:2])<=0,axis=1)
             ratios[count].append(ratio)
-    return {str(j):report(np.concatenate(estimates[j]),np.concatenate(variances[j]),np.concatenate(ratios[j]),truth,j,np.concatenate(eligible),covariance_sums[j]/replicates) for j in counts}
+    results={str(j):report(np.concatenate(estimates[j]),np.concatenate(variances[j]),np.concatenate(ratios[j]),truth,j,np.concatenate(eligible),covariance_sums[j]/replicates) for j in counts}
+    for value in results.values():
+        value["binary_case_count_quantiles"]=[None if not count else np.quantile(count,[0,.025,.5,.975,1]).tolist() for count in case_counts]
+    return results
 
 
 def main():
@@ -231,6 +247,8 @@ def main():
     parser.add_argument("--overlap",type=float,default=1.);parser.add_argument("--annotations",type=int,default=1)
     parser.add_argument("--prevalence",type=float,default=.2);parser.add_argument("--risk-strength",type=float,default=.6)
     parser.add_argument("--heterogeneous",action="store_true");parser.add_argument("--genotype",choices=["gaussian","hardcall_ld"],default="gaussian")
+    parser.add_argument("--genetic-scale",type=float,default=1.)
+    parser.add_argument("--annotation-mixing",type=float,default=0.)
     parser.add_argument("--signal",type=float,default=.035);parser.add_argument("--seed",type=int,default=729103)
     parser.add_argument("--threads",type=int,default=2);parser.add_argument("--out",type=Path,required=True)
     args=parser.parse_args()
@@ -240,7 +258,7 @@ def main():
     start=perf_counter();cpu_start=resource.getrusage(resource.RUSAGE_SELF)
     design=make_design(args.n,args.m,kind=args.kind,overlap=args.overlap,annotations=args.annotations,
         seed=args.seed,prevalence=args.prevalence,risk_strength=args.risk_strength,heterogeneous=args.heterogeneous,
-        genotype=args.genotype,signal=args.signal,native=True,threads=args.threads)
+        genotype=args.genotype,signal=args.signal,native=True,threads=args.threads,annotation_mixing=args.annotation_mixing,genetic_scale=args.genetic_scale)
     prepared=perf_counter();models,truth=exact_equations(design,args.blocks);reference=perf_counter()
     results=run(design,models,truth,replicates=args.replicates,batch=args.batch)
     cpu_end=resource.getrusage(resource.RUSAGE_SELF)
@@ -249,6 +267,7 @@ def main():
         design_seconds=prepared-start,exact_reference_seconds=reference-prepared,simulation_seconds=perf_counter()-reference,
         peak_rss_bytes=_peak_rss_bytes(),source_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
         reference="exact_bounded_variant_Gram_oracle",fitted_nuisances=False,reference_randomization=False,
+        normal_conditions=[float(np.linalg.cond(model["blocks"][args.blocks[0]]["H"])) for model in models],
         gemm_repaired_columns=design["products"].left.repaired_columns+design["products"].right.repaired_columns)
     args.out.parent.mkdir(parents=True,exist_ok=True)
     old=os.umask(0o077)

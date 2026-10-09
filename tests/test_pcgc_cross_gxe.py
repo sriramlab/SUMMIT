@@ -448,3 +448,22 @@ def test_binary_case_relabeling_changes_cross_sign_only():
         np.testing.assert_allclose(before.ldscores,after.ldscores,rtol=2e-10,atol=2e-10)
         np.testing.assert_allclose(before.rhs_rows,(-1 if before.left!=before.right else 1)*after.rhs_rows,
                                    rtol=2e-10,atol=2e-10)
+
+
+def test_finite_block_intervals_and_missing_trait_uncertainty():
+    from scipy.stats import t
+    from summit.pcgc.cross_gxe_fit import linear_interval
+    result=dict(components=[.3,.1],snp_block_covariance=[[.04,.01],[.01,.02]],
+                reference_mc_covariance=[[0.,0.],[0.,0.]],jackknife_block_count=8,
+                reference_probe_count=32,confidence_level=.95)
+    interval=linear_interval(result,[1.,0.])
+    np.testing.assert_allclose(interval["interval"],.3+np.array([-1,1])*t.ppf(.975,7)*.2)
+    assert interval["degrees_of_freedom"]==pytest.approx(7)
+    result["reference_mc_covariance"]=[[.04,0.],[0.,0.]]
+    interval=linear_interval(result,[1.,0.])
+    assert interval["degrees_of_freedom"]>7
+    assert interval["reference_variance_fraction"]==pytest.approx(.5)
+    result["jackknife_block_count"]=0
+    assert linear_interval(result,[1.,0.])["interval"] is None
+    with pytest.raises(ValueError,match="confidence"):
+        linear_interval(result,[1.,0.],confidence=1)

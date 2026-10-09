@@ -140,6 +140,7 @@ def main(argv=None):
     fit.add_argument("--ldscores",type=Path,required=True)
     fit.add_argument("--out",type=Path,required=True)
     fit.add_argument("--njack",type=int,default=200)
+    fit.add_argument("--confidence",type=float,default=.95,help="working finite-block interval confidence level")
     fit.add_argument("--population-metrics",type=Path,help="JSON of fixed annotation-specific population kernel moments")
     for p in (prep,fit):
         p.add_argument("--num-threads",type=int,default=1)
@@ -172,7 +173,7 @@ def main(argv=None):
         if not 2<=args.njack<=m:
             raise ValueError("njack must be between 2 and the variant count")
         blocks=np.arange(m,dtype=np.int64)*args.njack//m
-        result=fit_cross_gxe(moments,block_ids=blocks,memory_bytes=memory_bytes)
+        result=fit_cross_gxe(moments,block_ids=blocks,memory_bytes=memory_bytes,confidence=args.confidence)
         result.update(reference_identity=header["manifest_hash"],annotation_names=header["annotation_names"])
         if args.population_metrics:
             metrics=_strict_json_loads(args.population_metrics.read_text())

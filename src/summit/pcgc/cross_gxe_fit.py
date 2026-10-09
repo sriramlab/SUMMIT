@@ -49,9 +49,11 @@ def plan_cross_fit(moments, blocks, memory_bytes=None):
                 peak_planned_bytes=peak,memory_budget_bytes=memory_bytes)
 
 
-def fit_cross_gxe(moments, *, block_ids=None, memory_bytes=None):
+def fit_cross_gxe(moments, *, block_ids=None, memory_bytes=None, confidence=.95):
     """No genotype access; reference draws and deletion IDs are shared."""
     start = perf_counter()
+    if not np.isfinite(confidence) or not 0 < confidence < 1:
+        raise ValueError("confidence must lie strictly inside (0,1)")
     moments.validate()
     a = moments.annotations
     labels = ids = None
@@ -114,16 +116,24 @@ def fit_cross_gxe(moments, *, block_ids=None, memory_bytes=None):
     result=dict(kind="summit.pcgc.cross_context_fit",schema_version=1,fit_memory_plan=plan,
         traits=list(moments.traits),pairs=results,components=point.tolist(),
         reference_mc_covariance=mc.tolist(),estimates_constrained=False,
+        reference_probe_count=len(actions),jackknife_block_count=0 if labels is None else len(labels),
+        confidence_level=float(confidence),
         uncertainty_status="reference_mc_only",
         uncertainty_limitations=[
             "first_order_liability_moments",
-            "no_participant_sampling_or_binary_fourth_moment_covariance",
-            "no_gaussian_SNP_effect_covariance",
+            "SNP_blocks_require_weak_between_block_dependence_and_no_dominant_block",
+            "no_separate_model_based_response_or_SNP_effect_covariance",
             "no_fitted_risk_or_estimated_population_metric_influence",
             "external_prevalence_genotype_scale_and_liability_SD_fixed",
             "finite_probe_inverse_bias_not_removed",
             "interval_calibration_not_established"])
     if labels is not None:
+        block_mass=np.column_stack([np.bincount(ids,weights=column,minlength=len(labels)) for column in a.T])
+        result["block_diagnostics"]=dict(
+            count=len(labels),few_blocks=len(labels)<30,
+            annotation_occupied_blocks=np.sum(block_mass>0,axis=0).tolist(),
+            annotation_maximum_mass_fraction=np.max(block_mass/a.sum(0),axis=0).tolist(),
+            maximum_variant_fraction=float(np.bincount(ids).max()/len(ids)))
         loo=np.concatenate(deleted,axis=1)
         snp=_jackknife_covariance(loo)
         covariance+=snp
@@ -141,7 +151,49 @@ def fit_cross_gxe(moments, *, block_ids=None, memory_bytes=None):
         bb=np.array(results[f"{pair.right}:{pair.right}"]["omega_total"])
         ab=np.array(results[key]["omega_total"])
         result["pairs"][key]["joint_minimum_eigenvalue"]=float(np.linalg.eigvalsh(np.block([[aa,ab],[ab.T,bb]])).min())
+    result["component_intervals"]=[linear_interval(result,direction) for direction in np.eye(len(point))]
     return result
+
+
+def linear_interval(result, contrast, *, value=None, confidence=None):
+    """Working finite-block interval for a linear contrast or delta gradient.
+
+    The Welch-Satterthwaite degrees of freedom assume independent variance
+    estimates from approximately independent, balanced SNP blocks and probes.
+    This is not an exact t pivot for arbitrary LD or fitted nuisance models.
+    """
+    from scipy.stats import norm, t
+    c=np.asarray(contrast,dtype=float)
+    point=np.asarray(result["components"])
+    if c.shape!=point.shape or not np.isfinite(c).all():
+        raise ValueError("contrast must match the finite coefficient axis")
+    level=result.get("confidence_level",.95) if confidence is None else confidence
+    if not np.isfinite(level) or not 0<level<1:
+        raise ValueError("confidence must lie strictly inside (0,1)")
+    estimate=float(c@point) if value is None else float(value)
+    if not np.isfinite(estimate):
+        raise ValueError("interval estimate must be finite")
+    out=dict(estimate=estimate,confidence=float(level),interval=None,
+             method="undefined_without_trait_uncertainty",degrees_of_freedom=None)
+    blocks=result.get("jackknife_block_count",0)
+    if blocks<2:
+        return out
+    vs=max(0.,float(c@np.asarray(result["snp_block_covariance"])@c))
+    vr=max(0.,float(c@np.asarray(result["reference_mc_covariance"])@c))
+    variance=vs+vr
+    if variance==0:
+        out.update(interval=[estimate,estimate],standard_error=0.,method="degenerate_zero_variance")
+        return out
+    probes=result["reference_probe_count"]
+    denominator=vs*vs/(blocks-1)+vr*vr/(probes-1)
+    df=variance*variance/denominator if denominator else np.inf
+    critical=float(t.ppf((1+level)/2,df)) if np.isfinite(df) else float(norm.ppf((1+level)/2))
+    half=critical*np.sqrt(variance)
+    out.update(interval=[float(estimate-half),float(estimate+half)],standard_error=float(np.sqrt(variance)),
+               method="approximate_SNP_block_reference_Satterthwaite",
+               degrees_of_freedom=float(df) if np.isfinite(df) else None,
+               reference_variance_fraction=vr/variance)
+    return out
 
 
 def _contrast(result, left, right, metric):
@@ -190,14 +242,22 @@ def derived_covariance(result, left, right, metric_aa, metric_bb, metric_ab, *,
              genetic_correlation=None,genetic_correlation_se=None,
              correlation_status="undefined_nonpositive_denominator",
              uncertainty_status=result["uncertainty_status"])
+    out["variance_intervals"]=[linear_interval(result,direction) for direction in contrasts[:2]]
+    out["genetic_covariance_interval"]=linear_interval(result,contrasts[2])
     if va>0 and vb>0:
         denom=np.sqrt(va*vb);r=c/denom
         jac=np.array([-r/(2*va),-r/(2*vb),1/denom])
+        correlation_interval=linear_interval(result,jac@contrasts,value=r)
+        out["genetic_correlation_interval"]=correlation_interval
+        variance_lower=[item["interval"][0] if item["interval"] is not None else -np.inf
+                        for item in out["variance_intervals"]]
         out.update(genetic_correlation=float(r),
                    genetic_correlation_se=float(np.sqrt(max(0,jac@cov@jac))),
-                   correlation_status=("unreliable_weak_denominator" if min(va-1.96*se[0],vb-1.96*se[1])<=0
+                   correlation_status=("unreliable_weak_denominator" if min(variance_lower)<=0
                        else "experimental"),
                    correlation_outside_unit_interval=bool(abs(r)>1))
+        if result.get("jackknife_block_count",0)<2:
+            out["correlation_status"]="unreliable_no_trait_uncertainty"
         if any(result["pairs"][key]["weak_normal_equations"] for key in
                (f"{left}:{left}",f"{right}:{right}",f"{min(left,right)}:{max(left,right)}")):
             out["correlation_status"]="unreliable_weak_normal_equations"
