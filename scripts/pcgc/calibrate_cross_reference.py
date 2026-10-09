@@ -122,6 +122,10 @@ def main():
     result={}
     for probes,d in data.items():
         point=np.asarray(d["point"]);delta=point-np.asarray(d["exact"]);mc=np.mean(d["reference"],axis=0)
+        # Compare the full paired error matrix, with Monte Carlo uncertainty.
+        # This includes finite-probe bias squared; it is not a conditional
+        # reference variance estimate when inversion bias is appreciable.
+        reference_error=delta[:,:,None]*delta[:,None,:]-np.asarray(d["reference"])
         value=report(point,np.asarray(d["variance"]),np.asarray(d["ratio"]),truth,args.blocks,
                      np.asarray(d["eligible"]),np.mean(d["cov"],axis=0))
         hit=np.asarray(d["student_hits"]).sum(0)
@@ -129,6 +133,9 @@ def main():
             paired_reference_bias=delta.mean(0).tolist(),
             paired_reference_bias_mcse=(delta.std(0,ddof=1)/np.sqrt(len(delta))).tolist(),
             paired_reference_mse=(delta*delta).mean(0).tolist(),
+            paired_reference_second_moment=(delta.T@delta/len(delta)).tolist(),
+            paired_reference_mse_minus_reported=reference_error.mean(0).tolist(),
+            paired_reference_mse_minus_reported_mcse=(reference_error.std(0,ddof=1)/np.sqrt(len(delta))).tolist(),
             satterthwaite_coverage=(hit/len(point)).tolist(),
             satterthwaite_coverage_wilson95=[wilson(h,len(point)) for h in hit])
         result[str(probes)]=value
