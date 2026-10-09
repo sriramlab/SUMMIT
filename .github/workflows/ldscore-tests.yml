@@ -38,6 +38,16 @@ jobs:
           activate-environment: summit
           environment-file: .github/summit-ci-environment.yml
           auto-activate-base: false
+      - name: Restore a clean source tree for build provenance
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import subprocess
+
+          Path(".github/summit-ci-environment.yml").unlink()
+          if subprocess.check_output(["git", "status", "--porcelain"], text=True).strip():
+              raise RuntimeError("CI environment setup left a modified source tree")
+          PY
       - name: Build SUMMIT against the environment OpenBLAS
         env:
           CMAKE_ARGS: -DBLA_VENDOR=OpenBLAS
@@ -47,6 +57,14 @@ jobs:
           python - <<'PY'
           from threadpoolctl import threadpool_info
           import numpy as np
+          import os
+          from summit import gxeldcore
+
+          build = gxeldcore.build_info()
+          if build["source_commit"] != os.environ["GITHUB_SHA"]:
+              raise RuntimeError("Native build has the wrong source commit")
+          if len(build["source_tree_sha256"]) != 64:
+              raise RuntimeError("Native build lacks its source-tree digest")
 
           np.ones((2, 2)) @ np.ones((2, 2))
           runtimes = [
