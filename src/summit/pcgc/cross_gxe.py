@@ -226,7 +226,7 @@ def prepare_cross_gxe(operator, annotations, traits, master_samples, *,
     k = a.shape[1]
     spec = GlobalVariantProbeSpec(root_seed=seed, probe_offset=0, probe_count=probes)
     response = [project(t.response[:, None], t.fixed_basis, products)[:, 0] for t in traits]
-    base_sketch = np.zeros((n, k, probes))
+    base_sketch = np.zeros((n, k*probes), order="F")
     sketches = None
     summaries, diagonals = [], []
     for (left, right), (ia, ib) in zip(pairs, overlap_indices):
@@ -235,7 +235,7 @@ def prepare_cross_gxe(operator, annotations, traits, master_samples, *,
         summaries.append(CrossPairRows(left, right, layout, len(ia),
             len(traits[left].samples)*len(traits[right].samples),
             np.zeros((m, p, k*p)), np.empty((m, p)), np.zeros((probes, k*p, k*p))))
-        diagonals.append(np.zeros((len(ia), k*p)))
+        diagonals.append(np.zeros((len(ia), k*p), order="F"))
     scores = [np.empty((m, t.q)) for t in traits]
     timings = dict(pass1_sketch_seconds=0., source_transform_seconds=0., pass2_reference_seconds=0., feature_seconds=0., diagonal_seconds=0., reference_seconds=0.,
                    score_seconds=0., overlap_row_seconds=0., overlap_solve_seconds=0.,
@@ -276,7 +276,10 @@ def prepare_cross_gxe(operator, annotations, traits, master_samples, *,
                          root_seed=seed, threads=threads) if native else
                          GlobalVariantProbeSpec(seed, begin, end-begin).generate(np.arange(first, last)))
                     az = (np.sqrt(weights)[:, :, None]*z[:, None, :]).reshape(last-first, -1)
-                    base_sketch[:, :, begin:end] += products.nn(x, az).reshape(n, k, end-begin)
+                    contribution = products.nn(x, az)
+                    for annotation in range(k):
+                        base_sketch[:, annotation*probes+begin:annotation*probes+end] += contribution[:, annotation*(end-begin):(annotation+1)*(end-begin)]
+                    del contribution
                 phase_seconds = perf_counter()-tick
                 timings["reference_seconds"] += phase_seconds
                 timings["pass1_sketch_seconds"] += phase_seconds
@@ -301,8 +304,8 @@ def prepare_cross_gxe(operator, annotations, traits, master_samples, *,
                     end = min(probes, begin+tile)
                     panels = []
                     for t, trait in enumerate(traits):
-                        source = np.concatenate([s[:, :, begin:end].reshape(len(trait.samples), -1)
-                                                 for s in sketches[t]], axis=1)
+                        source = np.concatenate([s[:, annotation*probes+begin:annotation*probes+end]
+                                                 for s in sketches[t] for annotation in range(k)], axis=1)
                         target = np.concatenate(f[t], axis=1)
                         panels.append(products.tn(target, source).reshape(trait.q, last-first, trait.q, k, end-begin))
                     for pair in summaries:
@@ -327,12 +330,16 @@ def prepare_cross_gxe(operator, annotations, traits, master_samples, *,
             for t, index in zip(traits, row_views):
                 trait_sketches = []
                 for q in range(t.q):
-                    transformed = np.empty((len(t.samples), k, probes))
+                    transformed = np.empty((len(t.samples), k*probes), order="F")
                     for begin in range(0, probes, tile):
                         end = min(probes, begin+tile)
-                        value = base_sketch[index, :, begin:end].reshape(len(t.samples), -1)
+                        value = np.concatenate([base_sketch[index, annotation*probes+begin:annotation*probes+end]
+                                                for annotation in range(k)], axis=1)
                         value = value*(t.sensitivity*t.contexts[:,q])[:,None]
-                        transformed[:, :, begin:end] = project(value, t.fixed_basis, products).reshape(len(t.samples),k,end-begin)
+                        projected = project(value, t.fixed_basis, products)
+                        for annotation in range(k):
+                            transformed[:, annotation*probes+begin:annotation*probes+end] = projected[:, annotation*(end-begin):(annotation+1)*(end-begin)]
+                        del value, projected
                     trait_sketches.append(transformed)
                 sketches.append(trait_sketches)
             del base_sketch
