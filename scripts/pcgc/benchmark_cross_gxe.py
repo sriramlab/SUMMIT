@@ -3,6 +3,7 @@ import argparse
 import hashlib
 import json
 import os
+import resource
 from pathlib import Path
 import time
 import numpy as np
@@ -97,6 +98,7 @@ def main():
     args.out.parent.mkdir(parents=True,exist_ok=True)
     os.umask(0o077)
     start=time.perf_counter()
+    cpu_start=resource.getrusage(resource.RUSAGE_SELF)
     source=None
     if args.bed:
         if args.overlap!=1.:
@@ -149,6 +151,9 @@ def main():
         report["separate_pair_seconds"]=sum(r["timings"]["total_seconds"] for r in reports)
         report["separate_pair_genotype_passes"]=sum(r["genotype_passes"] for r in reports)
     report["total_seconds"]=time.perf_counter()-start
+    cpu_end=resource.getrusage(resource.RUSAGE_SELF)
+    report["cpu_seconds"]=cpu_end.ru_utime+cpu_end.ru_stime-cpu_start.ru_utime-cpu_start.ru_stime
+    report["average_active_cores"]=report["cpu_seconds"]/report["total_seconds"]
     report["peak_rss_bytes"]=_peak_rss_bytes()
     if source is not None:
         source.close()
