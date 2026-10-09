@@ -28,12 +28,12 @@ jobs:
 
           source = Path("environment.yml").read_text()
           source = source.replace("  - numpy>=1.25\n", f"  - {os.environ['NUMPY_SPEC']}\n")
-          Path(os.environ["RUNNER_TEMP"], "summit-environment.yml").write_text(source)
+          Path(".github/summit-ci-environment.yml").write_text(source)
           PY
       - uses: conda-incubator/setup-miniconda@8ee1f361103df19b6f8c8655fd3967a8ecb162d5
         with:
           activate-environment: summit
-          environment-file: ${{ runner.temp }}/summit-environment.yml
+          environment-file: .github/summit-ci-environment.yml
           auto-activate-base: false
       - name: Build SUMMIT against the environment OpenBLAS
         env:
