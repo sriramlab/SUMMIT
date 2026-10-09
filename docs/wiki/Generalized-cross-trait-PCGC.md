@@ -5,9 +5,11 @@ continuous, binary–continuous and binary–binary trait pairs. Preparation use
 the analyzed cohorts jointly and writes separate reference and trait files.
 It supports different context bases, fixed effects, risks and cohort sizes.
 
-The method is experimental. Point estimates have independent dense-kernel
-checks. The available intervals are conditional approximations and have shown
-undercoverage in simulations; they should not be described as calibrated.
+Point estimates have independent dense-kernel checks, and uncertainty has
+been tested with repeated simulations that vary sample size, SNP count and
+block count separately. Inference remains experimental outside the validated
+settings below, especially with rare outcomes, fitted nuisance models or
+weak genetic-variance denominators.
 
 ## Estimand
 
@@ -161,7 +163,8 @@ each pair in the order of the trait definitions.
 summit pcgc-cross fit \
   --sumstats results/pair.cross.sumstats.npz \
   --ldscores results/pair.cross.ldscores.npz \
-  --njack 100 --memory-gib 8 --num-threads 2 --out results/pair_fit
+  --njack 200 --confidence 0.95 \
+  --memory-gib 8 --num-threads 2 --out results/pair_fit
 ```
 
 The output is `pair_fit.cross.json`. Pair keys refer to zero-based trait
@@ -171,12 +174,16 @@ components and correlations outside [−1, 1]. Singular or nonpositive normal
 equations stop the fit; weaker conditioning is reported diagnostically.
 
 For population summaries, `--population-metrics population.json` accepts
-`target_population`, `centering: "population_feature_means_removed"`,
+`schema: "summit.pcgc.cross_population_metrics.v1"`, the `reference_identity`
+printed by preparation, `target_population`,
+`centering: "population_feature_means_removed"`,
 `kernel_second_moments` keyed by these pair indices,
 and `total_variances` in trait order. Every kernel metric has shape
 annotation × left context × right context. Supply moments for all reported
 pairs and their denominators, on a common target population. These quantities
-are treated as fixed; their estimation uncertainty is not included.
+are treated as fixed; their estimation uncertainty is not included. The file
+must refer to the matched preparation and contain exactly its ordered pairs.
+The fit records a checksum of these declared population moments.
 
 The Python API provides `binary_trait`, `quantitative_trait`,
 `prepare_cross_gxe`, `prepare_cross_from_source`, `fit_cross_gxe`,
@@ -184,7 +191,10 @@ The Python API provides `binary_trait`, `quantitative_trait`,
 `summit.pcgc.cross_gxe_model`, `cross_gxe`, `cross_gxe_io`, and
 `cross_gxe_fit`. The context evaluator reports an effect covariance surface
 and matching genetic-variance denominators. A nonpositive denominator gives
-an undefined correlation; a weak denominator is marked unreliable.
+an undefined correlation; a variance interval reaching zero makes the
+correlation unreliable. Weak normal equations are reported separately.
+The program does not clip a correlation or project the fitted joint effect
+covariance to a positive semidefinite matrix.
 
 Arbitrary existing within-trait PCGC files cannot be combined into these
 inputs: their products can discard signs, and they lack the joint projected
@@ -196,7 +206,7 @@ and its legacy combined files retain their existing behavior.
 The reference uses shared global variant-axis probes and two complete genotype
 passes. Source contributions cover the full retained genome. Genotype reads
 and the first-pass genotype sketch are shared across contexts and requested
-pairs. Context and probe tiles limit workspace without making the reference
+pairs. Variant and probe tiles limit workspace without making the reference
 chromosome-local.
 
 Same-person corrections are exact conditional on the supplied designs.
@@ -219,30 +229,74 @@ for randomized-reference error. Shared participants and common probes are
 retained when combining within-trait and cross-trait coefficients. Correlation
 SEs use their joint covariance and both variance denominators.
 
-These calculations omit participant-sampling covariance, selected binary
-fourth moments, Gaussian SNP-effect uncertainty beyond what the target-block
-procedure captures, fitted-risk influence and estimated population-moment
-influence. External prevalence, genotype scale and supplied SDs are fixed.
-Finite-probe inversion bias is not removed.
+The paired block procedure can capture response and SNP-effect variation when
+blocks are approximately independent and no block dominates. It is not a
+general decomposition into participant, effect and nuisance uncertainty.
+Adding separate estimates of those pieces without their joint influence
+calculation can double count variation. The output reports annotation mass
+concentration across blocks and flags use of fewer than 30 blocks.
 
-In a fixed-design validation with 500 replicates per setting, N=128 per trait,
-64 SNPs and eight target blocks, nominal 95% component intervals covered
-86.2–93.2% across the principal continuous/binary and overlap settings.
-A rare-disease setting with heterogeneous supplied SDs reached 76.2% for
-one component. These are small-design conditional experiments with exact
-references, and do not establish accuracy for ascertained or full-cohort
-inference. The scripts report bias MCSEs, empirical SDs, SE ratios, coverage
-Wilson intervals and null rejection rates. Passing numerical checks does
-not resolve this undercoverage. A follow-up at N=512 reduced undefined
-correlations but retained component undercoverage. Rare-disease fitted-risk
-simulations also showed finite-sample bias and separated risk fits. Fitting
-risks does not supply their missing influence contribution to uncertainty.
+Intervals use a working Student approximation, with Welch–Satterthwaite
+degrees of freedom from the SNP-block and reference-draw variance estimates.
+This accounts for estimating variance from finitely many blocks or probes.
+It is not an exact pivot under arbitrary LD, unequal blocks or fitted risks.
+The reference contribution is a first-order delta approximation; finite-probe
+inversion bias and higher-order interactions are not corrected.
 
-The bounded benchmark and calibration drivers are
-`scripts/pcgc/benchmark_cross_gxe.py` and
-`scripts/pcgc/calibrate_cross_gxe.py`. The separate
-`scripts/pcgc/calibrate_cross_ascertainment.py` checks retrospective
-case–control point estimation. On shared research hosts, launch through
+External prevalence, genotype scale, supplied liability SDs and population
+moments are treated as fixed. General fitted-risk and estimated-moment
+influence calculations are not implemented. A correctly specified risk model
+can change both point estimation and its sampling covariance; its effect need
+not be an additional positive variance term.
+
+Validation distinguishes Monte Carlo uncertainty from persistent deficits.
+Independent exact person kernels check all trait-type combinations, partial
+overlap, unequal projectors and distinct bases. Bounded variant-Gram oracles
+allow larger known-truth simulations without changing the production
+reference algorithm. They redraw Gaussian SNP effects and participant
+residuals, with the declared liability scale, and compare every component
+and the joint correlation denominator.
+
+At N=M=512, eight-block normal intervals covered 89.6–93.3% in 1,000
+continuous-pair replicates; Student intervals covered 94.3–96.1%. Increasing
+the block count on the same responses removed most of this deficit. These
+small-design results are not evidence of large-sample failure. Conversely,
+with 32,768 participants, rare binary outcomes and 1,024 SNPs, independent
+5,000-replicate confirmation retained 91.6–95.2% normal coverage across
+components using 128 blocks. At 4,096 SNPs, coverage was 93.4–95.2%.
+At 8,192 SNPs, coverage was 94.1–95.3%.
+Sample size alone does not characterize this behavior.
+
+With 8,192 participants, 4,096 SNPs in four-SNP LD groups, two disjoint
+annotations and 128 blocks, 5,000-replicate confirmation covered approximately
+94–96% across continuous, mixed and binary pairs. These experiments use
+supplied risks and exact references; they do not establish calibration for
+arbitrary prevalence, effect size, LD or nuisance estimation. With rare
+outcomes, 32,768 participants, 4,096 SNPs and larger intercept genetic
+variances (0.36 and 0.30), coverage fell to 87.9% for a within-trait component.
+Cross-trait components covered 94.2–95.2% in that experiment. Increasing the
+block count did not resolve the within-trait deficit. This is a reproducible
+uncertainty limitation, and the favorable correlation coverage in that setting
+does not validate all covariance-surface contrasts.
+
+Separate retrospective case–control experiments use cohorts disjoint before
+selection. At 2,048 people per cohort, 256 SNPs and 128 blocks, 1,000
+replicates with correctly specified fitted two-stratum probit risks gave
+93.1–96.2% coverage for common disease and 93.2–95.7% for rare disease.
+Supplied-risk rare-disease variance components retained deficits. These
+results qualify that particular nuisance model, not general fitted-risk
+inference. Correlation coverage is reported with the frequencies of undefined
+and weak denominators; conditional coverage among successful fits cannot
+qualify weak correlations.
+
+The validation drivers report bias and its Monte Carlo SE, empirical and
+reported covariance, coverage Wilson intervals, null rejection and denominator
+failures. They are
+`scripts/pcgc/calibrate_cross_scaling.py`,
+`scripts/pcgc/calibrate_cross_ascertainment.py` and
+`scripts/pcgc/calibrate_cross_reference.py`.
+The bounded timing driver is `scripts/pcgc/benchmark_cross_gxe.py`.
+On shared research hosts, launch through
 the existing `scripts/pcgc/gxe_python.py` guard with explicit affinity,
 matching thread settings and the appropriate native backend. Memory admission
 includes resident rows, source sketches, overlap corrections, native workspace

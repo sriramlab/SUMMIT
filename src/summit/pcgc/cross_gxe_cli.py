@@ -125,6 +125,39 @@ def _jsonable(value):
     return value
 
 
+def read_population_metrics(path, header, moments):
+    """Validate declared fixed population moments against their prepared axes."""
+    import numpy as np
+    from summit.context.spec import canonical_sha256
+    from summit.ldscore.generalized_gxe_reference_v1 import _strict_json_loads
+    metrics=_strict_json_loads(Path(path).read_text())
+    fields={"schema","reference_identity","target_population","centering",
+            "kernel_second_moments","total_variances"}
+    if not isinstance(metrics,dict) or set(metrics)!=fields:
+        raise ValueError("population metrics need a version, reference_identity, target, centering, kernel_second_moments and total_variances")
+    if metrics["schema"]!="summit.pcgc.cross_population_metrics.v1":
+        raise ValueError("unsupported population metrics version")
+    if metrics["reference_identity"]!=header["manifest_hash"]:
+        raise ValueError("population metrics require their declared cross-trait reference identity")
+    if not isinstance(metrics["target_population"],str) or not metrics["target_population"].strip():
+        raise ValueError("population metrics need a nonempty target population")
+    if metrics["centering"]!="population_feature_means_removed":
+        raise ValueError("population genetic variances require centered genotype-by-context feature moments")
+    total=np.asarray(metrics["total_variances"],dtype=float)
+    if total.shape!=(len(moments.traits),) or not np.isfinite(total).all() or np.any(total<=0):
+        raise ValueError("population total variances must be positive and match the trait axis")
+    values=metrics["kernel_second_moments"]
+    if not isinstance(values,dict) or set(values)!={f"{p.left}:{p.right}" for p in moments.pairs}:
+        raise ValueError("population kernel moments must match the prepared ordered pair axis")
+    for pair in moments.pairs:
+        value=np.asarray(values[f"{pair.left}:{pair.right}"],dtype=float)
+        shape=(moments.annotations.shape[1],*[len(moments.traits[t]["context_names"])
+                                            for t in (pair.left,pair.right)])
+        if value.shape!=shape or not np.isfinite(value).all():
+            raise ValueError("population kernel moment annotation/context axes disagree")
+    return metrics,canonical_sha256(metrics)
+
+
 def main(argv=None):
     parser=argparse.ArgumentParser(description=__doc__)
     sub=parser.add_subparsers(dest="command",required=True)
@@ -173,16 +206,15 @@ def main(argv=None):
         if not 2<=args.njack<=m:
             raise ValueError("njack must be between 2 and the variant count")
         blocks=np.arange(m,dtype=np.int64)*args.njack//m
+        population=None if args.population_metrics is None else read_population_metrics(
+            args.population_metrics,header,moments)
         result=fit_cross_gxe(moments,block_ids=blocks,memory_bytes=memory_bytes,confidence=args.confidence)
         result.update(reference_identity=header["manifest_hash"],annotation_names=header["annotation_names"])
-        if args.population_metrics:
-            metrics=_strict_json_loads(args.population_metrics.read_text())
-            if set(metrics)!={"target_population","centering","kernel_second_moments","total_variances"} or not metrics["target_population"]:
-                raise ValueError("population metrics need a target, centering, kernel_second_moments and total_variances")
-            if metrics["centering"]!="population_feature_means_removed":
-                raise ValueError("population genetic variances require centered genotype-by-context feature moments")
+        if population is not None:
+            metrics,metrics_identity=population
             metric=metrics["kernel_second_moments"]
-            result["population"]={"target":metrics["target_population"],"centering":metrics["centering"],"pairs":{}}
+            result["population"]={"target":metrics["target_population"],"centering":metrics["centering"],
+                                  "metrics_identity":metrics_identity,"pairs":{}}
             for pair in moments.pairs:
                 if pair.left==pair.right:
                     continue

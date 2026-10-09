@@ -73,7 +73,7 @@ def test_actual_bed_cli_and_genotype_free_fit(tmp_path,kind):
                  "--nvecs","257","--block-size","31","--probe-tile","17","--memory-gib","3",
                  "--num-threads",str(prediction_threads())])==0
     ref,summary=output_paths(tmp_path/"prep")
-    moments,_=load_cross_artifacts(summary,ref)
+    moments,header=load_cross_artifacts(summary,ref)
     assert moments.diagnostics["genotype_passes"]==2
     assert [s.shape[1] for s in moments.signed_scores]==[2,1]
     # Fit is entirely independent of the source genotype descriptors.
@@ -86,7 +86,8 @@ def test_actual_bed_cli_and_genotype_free_fit(tmp_path,kind):
     assert result["uncertainty_status"].startswith("experimental")
 
 
-    metric=dict(target_population="synthetic population",centering="population_feature_means_removed",
+    metric=dict(schema="summit.pcgc.cross_population_metrics.v1",reference_identity=header["manifest_hash"],
+        target_population="synthetic population",centering="population_feature_means_removed",
         kernel_second_moments={"0:0":[[[1.,0.],[0.,1.]]],"0:1":[[[1.],[0.]]],"1:1":[[[1.]]]},
         total_variances=[1.,1.])
     metric_path=tmp_path/"population.json"
@@ -101,4 +102,15 @@ def test_actual_bed_cli_and_genotype_free_fit(tmp_path,kind):
     metric_path.write_text(json.dumps(metric))
     args[args.index("--out")+1]=str(tmp_path/"invalid_population_fit")
     with pytest.raises(ValueError,match="centered genotype-by-context"):
+        main(args)
+
+    metric["centering"]="population_feature_means_removed"
+    metric["reference_identity"]="wrong reference"
+    metric_path.write_text(json.dumps(metric))
+    with pytest.raises(ValueError,match="declared cross-trait reference"):
+        main(args)
+    metric["reference_identity"]=header["manifest_hash"]
+    metric["kernel_second_moments"]["1:0"]=metric["kernel_second_moments"].pop("0:1")
+    metric_path.write_text(json.dumps(metric))
+    with pytest.raises(ValueError,match="ordered pair axis"):
         main(args)
