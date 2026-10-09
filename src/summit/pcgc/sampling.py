@@ -371,7 +371,9 @@ def build_sampling_moments(*, pair_kernels, partners, kernel_actions, genotype_d
         a[:,:c] += risk_if@db.T
         dh = 4*np.einsum('ir,icd->rcd',log_weight,hrow)
         b[:,:,:c] -= np.einsum('ir,rcd->idc',risk_if,dh)
-    count = n*(n-1)
+    # Squared pair counts exceed uint64 at N >= 65537. NumPy 1.x would
+    # promote division by that Python integer to object arithmetic.
+    count = float(n*(n-1))
     a[:,:c] /= count
     b[:,:,:c] /= count
     K,P = risk.population_prevalence,risk.sample_prevalence

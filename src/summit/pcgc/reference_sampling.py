@@ -36,7 +36,8 @@ def reference_pair_covariance(relatedness, *, sampled=True):
     factor = n*(n-1)/denominator
     covariance = factor*(4*centered.T@centered-2*fourth)+2*np.outer(total,total)/denominator
     covariance -= (4*factor*(1-1/n)+2/denominator)*noise
-    covariance /= (n*(n-1))**2
+    # Keep large-cohort normalization in float64 on NumPy 1.x as well.
+    covariance /= float(n*(n-1))**2
     return (covariance+covariance.T)/2
 
 

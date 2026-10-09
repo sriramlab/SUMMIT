@@ -38,6 +38,28 @@ def panel(data,base,partners,sampled):
     return build_sampling_moments(**args,pair_kernels=base[np.arange(len(base))[:,None],partners,None],partners=partners,sampled=sampled)
 
 
+def test_large_cohort_pair_normalization_matches_constant_kernel():
+    # Keep memory linear in N while exercising the full-cohort denominator.
+    n = 337534
+    risk = prepare_binary_risk(np.arange(n)%2,.5)
+    phi = np.ones((n,1))
+    features = phi*risk.sensitivity[:,None]
+    kernel = float(features[0,0]**2)
+    # Both partners have the same case status as their focal participant.
+    partners = (np.arange(n)[:,None]+np.array([2,4]))%n
+    moments = build_sampling_moments(
+        pair_kernels=np.ones((n,2,1)),partners=partners,
+        kernel_actions=-kernel*risk.z[:,None],genotype_diagonal=phi,
+        contexts=phi,features=features,response=risk.z,risk=risk,
+        sd=np.ones(n),method='pcgc')
+    for theta in (0.,.3):
+        expected = 2*(kernel*(1-theta*kernel))**2/n/(n-1)
+        np.testing.assert_allclose(moments.pair_covariance([theta]),[[expected]],rtol=1e-11,atol=0)
+    # At theta=0 only the pair constant remains after stratum centering.
+    np.testing.assert_allclose(moments.covariance([0.])[0,0],
+        -2*kernel**2/n/(n-1),rtol=1e-11,atol=0)
+
+
 @pytest.mark.parametrize('inverse',[False,True])
 def test_exact_sampling_polynomial_matches_dense_u_statistic(inverse):
     data,kernels,base = fixture(inverse=inverse)
