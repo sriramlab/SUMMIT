@@ -73,7 +73,8 @@ def test_cli_fitted_risks_with_genotype_pcs_and_sampling(tmp_path):
         '--binary-context-columns','E','--binary-unit-liability','--binary-genotype-covariates','PC1',
         '--binary-covariates','PC1_E','--binary-sampling-partners','32','--binary-architecture-probes','8',
         '--nvecs','113','--memory-gib','1','--num-threads',str(prediction_threads()),'--out',str(tmp_path/'fit')]) == 0
-    artifact = load_gxe_artifact(tmp_path/'fit.binary.npz')
+    from summit.pcgc.split_io import load_split_artifact, output_paths
+    artifact = load_split_artifact(*output_paths(tmp_path/'fit'))
     diagnostics = artifact.manifest['diagnostics']
     assert diagnostics['genotype_ancestry_adjustment']['rank'] == 1
     assert diagnostics['sampling_inference']['nuisance'] == 'same_study_probit_observed_information'

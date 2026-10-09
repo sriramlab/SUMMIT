@@ -66,22 +66,26 @@ Reference and trait summaries are stored differently across workflows:
 | Additive h²/rg | LD scores, usually `.ldscore.gz` | Summary statistics with BETA and SE |
 | One-environment quantitative G×E | `.gxe.ref.json` describing the reference files | `.gxe.gwas.tsv.gz`, `.gxe.gwis.tsv.gz`, and `.gxe.moments.json` per trait |
 | Generalized quantitative G×E | `.generalized-gxe-variant-ldscore-v1.npz` | `.generalized-gxe-trait-summary-v1.npz` |
-| Additive or generalized G×E PCGC | One `.binary.npz` file containing both reference and trait moments | Included in the same file |
+| Additive or generalized G×E PCGC | `.binary.ldscores.npz` | `.binary.sumstats.npz` |
 
-In the PCGC command, `--make-binary-sumstats` prepares **both** sets of moments.
-The resulting archive also stores their common variant definitions, scaling
-metadata, and any requested uncertainty summaries. Fitting reads this file
-through `--h2` and needs no genotype input. These trait moments are PCGC score
-products with same-person terms removed; they are not a table of marginal
-BETA and SE values.
+PCGC preparation (`--make-binary-sumstats`) computes both sets of moments and
+writes them separately. Fit with `--h2 study.binary.sumstats.npz` and
+`--ldscores study.binary.ldscores.npz`. These trait summaries contain PCGC score
+products with same-person terms removed, plus any requested trait-dependent
+uncertainty summaries. NPZ stores the multidimensional arrays without flattening
+them into BETA/SE tables.
 
-Standard PCGC's reference weights depend on the disease-risk model and analyzed
-sample. Keeping the corresponding moments together prevents mismatched inputs.
-This is a storage choice: separate files could represent the same estimator
-if their shared definitions were checked. The current PCGC interface accepts
-the combined file. See [Generalized G×E PCGC](../pcgc_gxe.md) for its contents
-and [Multiple environments](Multiple-environments.md) for the quantitative
-Python interface.
+The summary records its expected reference identity. SUMMIT checks preparation
+metadata and array checksums before fitting; renaming or moving the files does
+not change compatibility. Use the reference saved with the summary, including
+the same realized random-vector estimate. Standard PCGC's reference weights
+depend on the disease-risk model and analyzed sample.
+
+Existing combined `.binary.npz` files are accepted through `--h2` alone.
+`--binary-output-format combined` selects that format during preparation.
+See [Generalized G×E PCGC](../pcgc_gxe.md#matching-reference-and-summary-files)
+for the compatibility checks and [Multiple environments](Multiple-environments.md)
+for the quantitative Python interface.
 
 ## LD scores and annotations
 

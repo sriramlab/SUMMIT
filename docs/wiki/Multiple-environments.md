@@ -90,8 +90,9 @@ fit = fit_generalized_gxe_variant_model_v1(reference, trait, trait_selector="tra
 Use a trait name saved in the summary. The fitter checks compatibility and
 uses the saved SNP-block definitions for its jackknife. A reference can be
 reused across traits with compatible samples, scaling, contexts, and fixed
-effects. [PCGC preparation](../pcgc_gxe.md) saves its reference and trait moments
-together in one `.binary.npz` file.
+effects. [PCGC preparation](../pcgc_gxe.md) also saves separate reference and
+trait files, using `.binary.ldscores.npz` and `.binary.sumstats.npz`. Its fitter
+requires the reference identified by the trait summary.
 
 ## Reusing annotation columns
 

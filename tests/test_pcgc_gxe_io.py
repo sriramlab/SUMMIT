@@ -12,6 +12,7 @@ from summit.prediction.genotype import FileGenotypeSource
 from summit.ldscore.generalized_gxe_pass1 import ArraySequentialGenotypeOperator as Operator
 from test_pcgc_io import fixture
 from prediction_helpers import prediction_threads
+from summit.pcgc.split_io import load_split_artifact, output_paths
 
 
 def write_bed(path,raw,axis,label="study"):
@@ -69,7 +70,9 @@ def test_actual_cli_preparation_and_fit_all_modes(tmp_path,method,sampling):
           "--binary-liability-sd-column","SD","--nvecs","251","--seed","836","--block-size","37",
           "--memory-gib","1","--num-threads",str(prediction_threads()),"--out",str(tmp_path/"prepared"),*extra]
     assert main(argv)==0
-    artifact=load_gxe_artifact(tmp_path/"prepared.binary.npz")
+    summary, reference = output_paths(tmp_path/"prepared")
+    artifact=load_split_artifact(summary, reference)
+    assert not (tmp_path/"prepared.binary.npz").exists()
     assert artifact.moments.num_contexts==2
     assert tuple(artifact.manifest["context_names"])==("intercept","E")
     if method!="pcgc-ld":
@@ -78,8 +81,12 @@ def test_actual_cli_preparation_and_fit_all_modes(tmp_path,method,sampling):
             liability_sd=1.3,probes=251,seed=836,block_size=37,native=False,**options)
         np.testing.assert_allclose(artifact.moments.ldscores,expected.ldscores,atol=2e-12)
         np.testing.assert_allclose(artifact.moments.rhs_rows,expected.rhs_rows,atol=2e-10)
-    assert main(["--binary-method",method,"--h2",str(tmp_path/"prepared.binary.npz"),
+    assert main(["--binary-method",method,"--h2",str(summary),"--ldscores",str(reference),
                  "--njack","8","--out",str(tmp_path/"fit")])==0
+    combined = write_gxe_artifact(artifact, tmp_path/"combined.binary.npz")
+    assert main(["--binary-method",method,"--h2",str(combined),
+                 "--njack","8","--out",str(tmp_path/"combined_fit")])==0
+    assert (tmp_path/"fit.binary.json").read_bytes() == (tmp_path/"combined_fit.binary.json").read_bytes()
     result=json.loads((tmp_path/"fit.binary.json").read_text())
     assert result["kind"]=="summit.pcgc.context_fit"
     assert result["jackknife_blocks"]==8

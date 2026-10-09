@@ -298,7 +298,7 @@ def build_parser() -> argparse.ArgumentParser:
     inputs.add_argument("--bim", default=None, type=str,
                         help="Reference .bim file used for annotation alignment.")
     inputs.add_argument("--ldscores", default=None, type=str,
-                        help="Path to the primary LD-score file. Use '@' as a chromosome placeholder for split files.")
+                        help="Path to the primary LD-score file, or matching .binary.ldscores.npz for PCGC. HE/LDSC accepts '@' as a chromosome placeholder.")
     inputs.add_argument("--ldscores-reg", default=None, type=str,
                         help=(
                             "Optional LD-score file used only for summary-only overlap-covariance estimation. "

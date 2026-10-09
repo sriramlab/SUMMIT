@@ -7,6 +7,7 @@ import pytest
 
 from summit.pcgc.cli import run, sample_table, annotation_table, population_scale
 from summit.pcgc.artifacts import make_artifact, write_artifact
+from summit.pcgc.split_io import load_fit_artifact, write_split_artifact, output_paths
 from summit.pcgc.research import exact_moments
 from test_pcgc_io import fixture
 
@@ -31,7 +32,7 @@ def test_cli_fit_dispatch_and_rejection_of_incompatible_flags(tmp_path):
     assert "qualification" not in result
     with pytest.raises(FileExistsError):
         run(parser().parse_args(argv), argv)
-    for unsupported in ("--weight-mode", "--rg", "--covar", "--ldscores"):
+    for unsupported in ("--weight-mode", "--rg", "--covar"):
         with pytest.raises(ValueError, match="unsupported"):
             run(parser().parse_args(argv), argv+[unsupported, "x"])
     wrong = argv.copy()
@@ -46,7 +47,8 @@ def test_cli_fit_dispatch_and_rejection_of_incompatible_flags(tmp_path):
 
 
 @pytest.mark.parametrize("method", ["liability", "pcgc", "pcgc-inverse", "pcgc-basis", "pcgc-ld"])
-def test_all_methods_report_component_and_total_se_without_a_gate(tmp_path, method):
+@pytest.mark.parametrize("separate", [False, True])
+def test_all_methods_report_component_and_total_se_without_a_gate(tmp_path, method, separate):
     from summit.pcgc.research import exact_external_ld, external_ld_moments
     from summit.sumstats.binary import prepare_binary_risk
     from summit.inference.jackknife import JackknifeDesign, JackknifeSpec
@@ -63,10 +65,15 @@ def test_all_methods_report_component_and_total_se_without_a_gate(tmp_path, meth
         moments = external_ld_moments(moments.rhs_rows, a, risk, exact_external_ld(reference, a))
     artifact = make_artifact(moments, variant_axis=axis, annotation_names=["all", "weighted"],
         sample_identity="a"*64, genotype_scale_identity=scale.identity, risk=risk, diagnostics={})
-    path = write_artifact(artifact, tmp_path/"prepared.npz")
+    reference_args = []
+    if separate:
+        path, reference = write_split_artifact(artifact, *output_paths(tmp_path/"prepared"))
+        reference_args = ["--ldscores", str(reference)]
+    else:
+        path = write_artifact(artifact, tmp_path/"prepared.npz")
     for count in (200, 8):
         prefix = tmp_path/f"fit{count}"
-        argv = ["--binary-method", method, "--h2", str(path), "--out", str(prefix)]
+        argv = ["--binary-method", method, "--h2", str(path), "--out", str(prefix), *reference_args]
         if count != 200:
             argv += ["--njack=8"]
         run(parser().parse_args(argv), argv)
@@ -144,7 +151,8 @@ def test_population_scale_table_preserves_allele_and_variant_axes(tmp_path):
         population_scale(path, source)
 
 
-def test_actual_summit_cli_prepares_and_fits_binary_artifact(tmp_path, monkeypatch):
+@pytest.mark.parametrize("output_format", ["separate", "combined"])
+def test_actual_summit_cli_prepares_and_fits_binary_artifact(tmp_path, monkeypatch, output_format):
     native = pytest.importorskip("summit.gxeldcore")
     if getattr(native, "prediction_execution_version", 0) < 2:
         pytest.skip("native build lacks shared genotype source")
@@ -162,12 +170,13 @@ def test_actual_summit_cli_prepares_and_fits_binary_artifact(tmp_path, monkeypat
     pd.DataFrame(dict(FID=[s[0] for s in samples], IID=[s[1] for s in samples],
                       Y=(risk.z > 0).astype(int), RISK=risk.population_risk)).iloc[::-1].to_csv(tmp_path/"samples.tsv", sep="\t", index=False)
     write_genotype_scale(tmp_path/"scale", scale)
-    from summit.pcgc.artifacts import load_artifact
     from summit.entrypoint import main as entry_main
     common = ["--binary-method", "pcgc", "--make-binary-sumstats", str(tmp_path/"samples.tsv"),
         "--geno", str(tmp_path/"test.bed"), "--binary-scale", str(tmp_path/"scale"),
         "--binary-prevalence", ".1", "--binary-risk-column", "RISK", "--num-threads", str(prediction_threads())]
     options = ["--nvecs", "61", "--seed", "81", "--block-size", "37", "--memory-gib", "1"]
+    if output_format == "combined":
+        options += ["--binary-output-format", "combined"]
     assert entry_main([*common, *options, "--genome-build", "test", "--out", str(tmp_path/"prepared")]) == 0
     # A build label has no numerical effect. Test an unlabeled TSV scale too.
     pd.DataFrame(dict(SNP=axis.ids, A1=axis.counted, A2=axis.other,
@@ -175,11 +184,14 @@ def test_actual_summit_cli_prepares_and_fits_binary_artifact(tmp_path, monkeypat
     unlabeled = list(common)
     unlabeled[unlabeled.index("--binary-scale")+1] = str(tmp_path/"scale.tsv")
     assert entry_main([*unlabeled, *options, "--out", str(tmp_path/"unlabeled")]) == 0
-    labeled, unlabeled = [load_artifact(tmp_path/(name+".binary.npz")) for name in ("prepared", "unlabeled")]
+    paths = [output_paths(tmp_path/name) if output_format == "separate" else
+             (tmp_path/(name+".binary.npz"),) for name in ("prepared", "unlabeled")]
+    labeled, unlabeled = [load_fit_artifact(*files) for files in paths]
     for field in ("rhs_rows", "ldscores", "annotations", "same_person"):
         np.testing.assert_allclose(getattr(labeled.moments, field), getattr(unlabeled.moments, field), rtol=1e-14, atol=1e-14)
-    monkeypatch.setattr(sys, "argv", ["summit", "--binary-method", "pcgc", "--h2", str(tmp_path/"prepared.binary.npz"),
-        "--out", str(tmp_path/"fit")])
+    reference_args = ["--ldscores", str(paths[0][1])] if output_format == "separate" else []
+    monkeypatch.setattr(sys, "argv", ["summit", "--binary-method", "pcgc", "--h2", str(paths[0][0]),
+        "--out", str(tmp_path/"fit"), *reference_args])
     assert cli.main() == 0
     assert (tmp_path/"fit.binary.json").exists()
     result = json.loads((tmp_path/"fit.binary.json").read_text())

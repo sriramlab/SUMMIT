@@ -187,16 +187,23 @@ def load_gxe_artifact(path):
         arrays = ARRAYS+tuple(name for feature in features for name in FEATURE_ARRAYS[feature])
         if len(data.files) != len(arrays)+1 or set(data.files) != set(arrays)|{"manifest_json"}:
             raise ValueError("contextual PCGC archive members do not match the contract")
-        names = ("n_samples", "num_contexts", "method", "population_liability_variance")
-        if not set(names) <= set(h):
-            raise ValueError("contextual PCGC moment metadata are incomplete")
-        values = {k:data[k] for k in arrays if k not in SAMPLING_ARRAYS+ARCHITECTURE_ARRAYS+PAIR_ARRAYS}
-        if "individual_sampling_covariance" in features:
-            from .sampling import SamplingMoments
-            architecture = ({**{k:data[k] for k in ARCHITECTURE_ARRAYS},"architecture_probes":h.get("architecture_probes")} if "gaussian_architecture_covariance" in features else {})
-            if "hoeffding_pair_covariance" in features: architecture.update({k:data[k] for k in PAIR_ARRAYS})
-            values["sampling_moments"] = SamplingMoments(**{k.removeprefix("sampling_"):data[k] for k in SAMPLING_ARRAYS},n_samples=h["n_samples"],**architecture)
-        m = GxEMoments(**values, **{k:h[k] for k in names})
+        return _artifact_from_arrays(h, data)
+
+
+def _artifact_from_arrays(h, data):
+    """Reconstruct contextual moments after checking archive members."""
+    features = _manifest_features(h)
+    arrays = ARRAYS+tuple(name for feature in features for name in FEATURE_ARRAYS[feature])
+    names = ("n_samples", "num_contexts", "method", "population_liability_variance")
+    if not set(names) <= set(h):
+        raise ValueError("contextual PCGC moment metadata are incomplete")
+    values = {k:data[k] for k in arrays if k not in SAMPLING_ARRAYS+ARCHITECTURE_ARRAYS+PAIR_ARRAYS}
+    if "individual_sampling_covariance" in features:
+        from .sampling import SamplingMoments
+        architecture = ({**{k:data[k] for k in ARCHITECTURE_ARRAYS},"architecture_probes":h.get("architecture_probes")} if "gaussian_architecture_covariance" in features else {})
+        if "hoeffding_pair_covariance" in features: architecture.update({k:data[k] for k in PAIR_ARRAYS})
+        values["sampling_moments"] = SamplingMoments(**{k.removeprefix("sampling_"):data[k] for k in SAMPLING_ARRAYS},n_samples=h["n_samples"],**architecture)
+    m = GxEMoments(**values, **{k:h[k] for k in names})
     return GxEArtifact(m, h)
 
 

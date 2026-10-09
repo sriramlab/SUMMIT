@@ -20,9 +20,10 @@ Quantitative generalized G×E fitting and cross-trait response models use
 Python APIs. See [Multiple environments](Multiple-environments.md) and
 [Cross-trait analysis](Cross-trait-analysis.md) for their workflows.
 
-PCGC preparation (`--make-binary-sumstats`) saves both reference LD-score
-moments and trait score moments in one `.binary.npz` file. Pass that file to
-`--h2`; no separate `--ldscores` input is used. [Input files](Input-files.md#files-used-for-inference)
+PCGC preparation (`--make-binary-sumstats`) writes `.binary.sumstats.npz` and
+`.binary.ldscores.npz` files. Fit with `--h2` and `--ldscores`; SUMMIT checks that
+they match. `--binary-output-format combined` retains the older single-file
+output, which is fitted through `--h2` alone. [Input files](Input-files.md#files-used-for-inference)
 compares the formats used by each workflow.
 
 ## Shared controls

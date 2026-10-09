@@ -119,7 +119,12 @@ def load_artifact(path):
             raise ValueError("not a typed PCGC artifact; OLS/logistic statistics cannot be converted implicitly")
         if not {"n_samples", "method", "covariate_variance"} <= set(header):
             raise ValueError("typed PCGC manifest is missing moment metadata")
-        moments = BinaryMoments(**{k: data[k] for k in ARRAYS}, n_samples=header["n_samples"],
-                                method=header["method"], covariate_variance=header["covariate_variance"],
-                                ldscore_contract=LEGACY_DIAGONAL if header.get("schema_version") == 1 else header.get("ldscore_contract"))
+        return _artifact_from_arrays(header, data)
+
+
+def _artifact_from_arrays(header, data):
+    """Apply the same moment and metadata checks to combined or separate files."""
+    moments = BinaryMoments(**{k: data[k] for k in ARRAYS}, n_samples=header["n_samples"],
+                            method=header["method"], covariate_variance=header["covariate_variance"],
+                            ldscore_contract=LEGACY_DIAGONAL if header.get("schema_version") == 1 else header.get("ldscore_contract"))
     return BinaryArtifact(moments, header)

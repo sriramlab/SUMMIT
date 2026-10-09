@@ -14,7 +14,8 @@ from summit.prediction.artifacts import load_genotype_scale, write_json, file_di
 from summit.prediction.genotype import FileGenotypeSource
 from summit.prediction.spec import GenotypeScale
 from summit.sumstats.binary import fit_binary_risk, prepare_binary_risk
-from .artifacts import load_artifact, write_artifact
+from .artifacts import write_artifact
+from .split_io import load_fit_artifact, output_paths, write_split_artifact
 from .genotype import prepare_from_source
 from .moments import fit_moments
 
@@ -24,8 +25,10 @@ DEFAULT_BINARY_NJACK = 200
 def add_arguments(parser):
     group = parser.add_argument_group("Binary liability regression")
     group.add_argument("--binary-method", choices=("liability", "pcgc", "pcgc-inverse", "pcgc-basis", "pcgc-ld"),
-                       help="Ascertainment-aware method; requires a binary moment file or raw score preparation.")
-    group.add_argument("--make-binary-sumstats", metavar="TSV", help="Prepare binary moments from FID, IID, Y and optional risk covariates.")
+                       help="Ascertainment-aware method; prepare binary scores or fit PCGC summary statistics with matching LD scores.")
+    group.add_argument("--make-binary-sumstats", metavar="TSV", help="Prepare separate PCGC summary statistics and LD scores from FID, IID, Y and optional risk covariates.")
+    group.add_argument("--binary-output-format", choices=("separate", "combined"), default="separate",
+                       help="Preparation output: separate summary/reference files (default), or a combined .binary.npz file.")
     group.add_argument("--binary-scale", help="Population scale: SUMMIT scale directory or SNP/A1/A2/MEAN/INV_SD TSV.")
     group.add_argument("--binary-reference-geno", help="Independent population BED/PGEN reference for the pcgc-ld approximation.")
     group.add_argument("--binary-prevalence", type=float, help="Externally supplied population prevalence.")
@@ -149,7 +152,7 @@ def run(args, argv):
                "--genome-build", "--binary-covariates", "--binary-risk-column", "--binary-covariate-variance",
                "--nvecs", "--seed", "--memory-gib", "--block-size",
                "--binary-basis-columns", "--binary-basis-coefficients", "--binary-reference-geno",
-               "--geno", "--annot", "--out", "--h2", "--njack", "--num-threads"}
+               "--geno", "--annot", "--out", "--h2", "--ldscores", "--binary-output-format", "--njack", "--num-threads"}
     from .gxe_cli import OPTIONS
     allowed |= OPTIONS
     explicit = explicit_options(argv)
@@ -158,27 +161,36 @@ def run(args, argv):
     if args.binary_method is None or args.out is None:
         raise ValueError("binary workflows require --binary-method and --out")
     if bool(args.make_binary_sumstats) == bool(args.h2):
-        raise ValueError("choose --make-binary-sumstats or --h2 with one binary moment file")
+        raise ValueError("choose --make-binary-sumstats or --h2 with saved PCGC inputs")
     prefix = Path(args.out)
-    output = Path(str(prefix)+(".binary.npz" if args.make_binary_sumstats else ".binary.json"))
-    if output.exists():
-        raise FileExistsError(f"refusing to overwrite {output}")
     if args.make_binary_sumstats:
+        if "--ldscores" in explicit:
+            raise ValueError("--ldscores belongs to inference; preparation writes its matching PCGC reference")
         if "--njack" in explicit:
             raise ValueError("--njack belongs to inference after the reference is complete")
+        separate = args.binary_output_format == "separate"
+        outputs = output_paths(prefix) if separate else (Path(str(prefix) + ".binary.npz"),)
+        for output in outputs:
+            if output.exists() or output.is_symlink():
+                raise FileExistsError(f"refusing to overwrite {output}")
         artifact = prepare(args)
-        if getattr(args, "binary_context_columns", None):
+        if separate:
+            output, reference_output = write_split_artifact(artifact, *outputs)
+        elif getattr(args, "binary_context_columns", None):
             from .gxe_io import write_gxe_artifact
-            write_gxe_artifact(artifact, output)
+            output = write_gxe_artifact(artifact, outputs[0])
         else:
-            write_artifact(artifact, output)
+            output = write_artifact(artifact, outputs[0])
     else:
-        preparation_options = explicit - {"--binary-method", "--h2", "--out", "--njack", "--num-threads"}
+        preparation_options = explicit - {"--binary-method", "--h2", "--ldscores", "--out", "--njack", "--num-threads"}
         if preparation_options:
-            raise ValueError("binary fit uses the saved binary file; remove preparation options: "+", ".join(sorted(preparation_options)))
-        from .gxe_io import is_gxe_artifact, load_gxe_artifact
-        contextual = is_gxe_artifact(args.h2)
-        artifact = load_gxe_artifact(args.h2) if contextual else load_artifact(args.h2)
+            raise ValueError("binary fit uses saved PCGC inputs; remove preparation options: "+", ".join(sorted(preparation_options)))
+        output = Path(str(prefix) + ".binary.json")
+        if output.exists():
+            raise FileExistsError(f"refusing to overwrite {output}")
+        artifact = load_fit_artifact(args.h2, args.ldscores)
+        from .gxe_io import GxEArtifact
+        contextual = isinstance(artifact, GxEArtifact)
         if args.binary_method != artifact.moments.method:
             raise ValueError("binary method disagrees with the prepared artifact; recompute raw scores/reference")
         from summit.inference.jackknife import JackknifeDesign, JackknifeSpec
@@ -204,5 +216,8 @@ def run(args, argv):
                           annotation_names=artifact.manifest["annotation_names"], diagnostics=artifact.manifest["diagnostics"])
         output.parent.mkdir(parents=True, exist_ok=True)
         write_json(output, result)
-    print(canonical_json({"output": str(output), "method": args.binary_method}))
+    message = {"output": str(output), "method": args.binary_method}
+    if args.make_binary_sumstats and separate:
+        message["ldscores"] = str(reference_output)
+    print(canonical_json(message))
     return 0

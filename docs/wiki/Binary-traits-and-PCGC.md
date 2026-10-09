@@ -67,12 +67,12 @@ Add `--annot annotations.tsv` at preparation for partitioned estimates.
 This table contains `SNP` followed by weight columns, with every genotype SNP
 present exactly once. Without it, SUMMIT fits one component over all SNPs.
 
-Preparation writes `results/trait_pcgc.binary.npz`. This NumPy archive contains
-PCGC LD-score rows, trait score products, same-person corrections, annotations,
-and their shared variant, scale, and risk metadata. Standard PCGC uses a
-study-specific, risk-weighted reference; saving it with the trait moments keeps
-the two consistent. The [input guide](Input-files.md#files-used-for-inference)
-compares this format with quantitative-trait summaries.
+Preparation writes two NumPy archives:
+
+- `results/trait_pcgc.binary.sumstats.npz`: per-SNP trait score products after
+  same-person subtraction, with risk and scale metadata.
+- `results/trait_pcgc.binary.ldscores.npz`: PCGC LD-score rows, annotations,
+  same-person reference diagnostics, and matching metadata.
 
 Changes to risks, prevalence, population genotype scaling, or sample selection
 require new preparation. Existing output files are not overwritten.
@@ -81,14 +81,25 @@ require new preparation. Existing output files are not overwritten.
 
 ```bash
 summit --binary-method pcgc \
-  --h2 results/trait_pcgc.binary.npz --out results/trait_pcgc_fit
+  --h2 results/trait_pcgc.binary.sumstats.npz \
+  --ldscores results/trait_pcgc.binary.ldscores.npz \
+  --out results/trait_pcgc_fit
 ```
 
-Use the same method at both stages. The archive supplies both reference and
-trait moments, so fitting needs no separate `--ldscores` file or genotype input.
-It writes `results/trait_pcgc_fit.binary.json`, containing conditional and
-marginal component estimates and SEs, totals, risk diagnostics, and reference
-diagnostics.
+Use the same method at both stages. The summary identifies its reference by
+contents, so both files can be renamed or moved. Fitting checks their sample,
+risk, scale, annotation, variant, and allele definitions, plus array checksums.
+A mismatched pair is rejected. Use the reference saved during preparation;
+matching dimensions or SNP names alone does not establish compatibility.
+
+Fitting needs no genotype input. It writes `results/trait_pcgc_fit.binary.json`,
+containing conditional and marginal component estimates and SEs, totals, risk
+diagnostics, and reference diagnostics.
+
+Existing combined `.binary.npz` files still work with `--h2` alone. Add
+`--binary-output-format combined` during preparation to retain that output
+format. The [input guide](Input-files.md#files-used-for-inference) compares
+PCGC files with quantitative-trait summaries.
 
 ## Choose a method
 
@@ -120,7 +131,8 @@ For example, to use 100 blocks:
 
 ```bash
 summit --binary-method pcgc \
-  --h2 results/trait_pcgc.binary.npz --njack 100 \
+  --h2 results/trait_pcgc.binary.sumstats.npz \
+  --ldscores results/trait_pcgc.binary.ldscores.npz --njack 100 \
   --out results/trait_pcgc_100_blocks
 ```
 

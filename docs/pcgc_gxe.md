@@ -68,23 +68,17 @@ summit --binary-method pcgc \
   --out results/disease_gxe
 ```
 
-This writes `results/disease_gxe.binary.npz`, a NumPy archive containing:
+Preparation writes two NumPy archives:
 
-| Contents | Purpose |
+| File | Contents |
 |---|---|
-| `ldscores` | PCGC directional reference rows with same-person terms removed |
-| `rhs_rows` | Per-SNP context-pair trait score products with same-person terms removed |
-| Annotations and population moments | Component definitions and population heritability calculation |
-| Metadata | Variant order, alleles, context names, scales, risk diagnostics, and compatibility checks |
-| Optional covariance summaries | Sampling and SNP-effect uncertainty calculations requested during preparation |
+| `results/disease_gxe.binary.ldscores.npz` | PCGC directional reference rows, annotations, and any reference uncertainty arrays |
+| `results/disease_gxe.binary.sumstats.npz` | Per-SNP context-pair trait score products, population moments, and any sampling or SNP-effect covariance summaries |
 
-Standard PCGC's reference depends on the analyzed sample and risk model.
-Preparation computes the matched reference and trait moments together, so
-SUMMIT saves them in one file. This also retains the additional arrays needed
-for uncertainty estimation. Separate reference and trait files would be
-mathematically equivalent if their definitions were checked; the current
-interface uses the combined archive. The [input guide](wiki/Input-files.md#files-used-for-inference)
-compares this with the quantitative workflows.
+Both the reference rows (`ldscores`) and trait score products (`rhs_rows`) have
+same-person terms removed. The NPZ format retains their multiple context and
+annotation dimensions. The files record variant order, alleles, context names,
+and the sample, risk, genotype-scale, and liability-scale definitions.
 
 Add `--annot annotations.tsv` for partitioned estimates. Changes to risks,
 prevalence, genotype scaling, context coding, or sample selection require new
@@ -93,14 +87,34 @@ preparation. Choose a new output prefix for each preparation.
 ## Fit the saved moments
 
 ```bash
-summit --binary-method pcgc --h2 results/disease_gxe.binary.npz \
+summit --binary-method pcgc \
+  --h2 results/disease_gxe.binary.sumstats.npz \
+  --ldscores results/disease_gxe.binary.ldscores.npz \
   --njack 100 --out results/disease_gxe_fit
 ```
 
-`--h2` reads both sets of moments from the archive; no separate `--ldscores`
-file or genotype input is needed. Use the same PCGC method as in preparation.
-Fitting writes `results/disease_gxe_fit.binary.json`. You can reuse the archive
-with a different `--njack` value and a new output prefix.
+Use the same PCGC method as in preparation. Fitting writes
+`results/disease_gxe_fit.binary.json` and requires no genotype input. You can
+reuse the two files with a different `--njack` value and a new output prefix.
+
+### Matching reference and summary files
+
+The summary records the expected reference identity. Fitting checks the stored
+sample, risk, scaling, context, annotation, and variant definitions, including
+alleles and any genome-build label. It also checks the reference array contents
+and both files' checksums. A mismatch stops the fit.
+
+Use the reference written with the summary. The checks require that particular
+reference realization, including any uncertainty arrays, because the saved
+sampling calculations can depend on it. Matching SNP names or dimensions alone
+is insufficient. You can move or rename the files; matching uses their contents.
+Standard PCGC's risk-weighted reference is generally specific to the disease
+and analyzed sample.
+
+Existing combined `.binary.npz` files remain accepted through `--h2` alone.
+To prepare that format, add `--binary-output-format combined`. Separate files
+are the default for all binary methods. The [input guide](wiki/Input-files.md#files-used-for-inference)
+compares the formats across workflows.
 
 ## Covariate adjustment
 
@@ -187,6 +201,8 @@ memory when sizing jobs.
 `summit.context.binary` exposes `prepare_gxe_moments`, `prepare_gxe_external`,
 `fit_gxe`, `evaluate_contexts`, and `plan_gxe_reference`. File-backed
 preparation is available through
-`summit.pcgc.gxe_io.prepare_gxe_from_source`. Quantitative G×E summaries and
-binary contextual summaries have separate formats. Cross-trait contextual
+`summit.pcgc.gxe_io.prepare_gxe_from_source`. Use
+`summit.pcgc.split_io.write_split_artifact` and `load_split_artifact` to save
+and reload the separate files. Quantitative G×E summaries and binary contextual
+summaries have separate formats. Cross-trait contextual
 PCGC is not currently exposed.
