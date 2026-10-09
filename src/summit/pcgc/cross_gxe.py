@@ -51,6 +51,16 @@ def project(value, u, products):
     return np.asfortranarray(value-products.nn(u, products.tn(u, value)))
 
 
+def row_selector(indices):
+    """Preserve column-major views for consecutive participant rows."""
+    if not len(indices):
+        return slice(0, 0)
+    first = int(indices[0])
+    if np.array_equal(indices, np.arange(first, first+len(indices))):
+        return slice(first, first+len(indices))
+    return indices
+
+
 def pair_layout(qa, qb, within):
     pairs = context_pairs(qa) if within else tuple((u, v) for u in range(qa) for v in range(qb))
     return tuple(((u, v),) if not within or u == v else ((u, v), (v, u)) for u, v in pairs)
@@ -203,6 +213,8 @@ def prepare_cross_gxe(operator, annotations, traits, master_samples, *,
                   np.sum(traits[right].fixed_basis[ib]**2,axis=1) <= 1e-8):
             raise ValueError("overlap projection has excessive leverage; diagonal removal is unstable")
         overlap_indices.append((ia, ib))
+    row_views = [row_selector(index) for index in rows]
+    overlap_views = [(row_selector(ia), row_selector(ib)) for ia, ib in overlap_indices]
     plan = plan_cross_reference(n, m, traits, pairs, annotations=a.shape[1], probes=probes,
                                block_size=block_size, probe_tile=probe_tile,
                                memory_bytes=memory_bytes, native=native, extra_bytes=extra_bytes,
@@ -225,14 +237,14 @@ def prepare_cross_gxe(operator, annotations, traits, master_samples, *,
             np.zeros((m, p, k*p)), np.empty((m, p)), np.zeros((probes, k*p, k*p))))
         diagonals.append(np.zeros((len(ia), k*p)))
     scores = [np.empty((m, t.q)) for t in traits]
-    timings = dict(feature_seconds=0., diagonal_seconds=0., reference_seconds=0.,
+    timings = dict(pass1_sketch_seconds=0., source_transform_seconds=0., pass2_reference_seconds=0., feature_seconds=0., diagonal_seconds=0., reference_seconds=0.,
                    score_seconds=0., overlap_row_seconds=0., overlap_solve_seconds=0.,
                    genotype_read_transform_seconds=0., reference_draw_aggregation_seconds=0.)
     correction, response_correction = [], []
 
     def features(x):
         values = []
-        for t, index in zip(traits, rows):
+        for t, index in zip(traits, row_views):
             base = x[index]
             values.append([project(base*(t.sensitivity*t.contexts[:, q])[:, None],
                                    t.fixed_basis, products) for q in range(t.q)])
@@ -251,8 +263,8 @@ def prepare_cross_gxe(operator, annotations, traits, master_samples, *,
             weights = a[first:last]
             if pass_number == 1:
                 tick = perf_counter()
-                for pair, (ia, ib), diagonal in zip(summaries, overlap_indices, diagonals):
-                    if len(ia):
+                for pair, (ia, ib), diagonal in zip(summaries, overlap_views, diagonals):
+                    if pair.overlap:
                         for p, orientations in enumerate(pair.layout):
                             value = sum(f[pair.left][u][ia]*f[pair.right][v][ib] for u, v in orientations)
                             diagonal[:, p::pair.p] += products.nn(value, weights)
@@ -265,7 +277,9 @@ def prepare_cross_gxe(operator, annotations, traits, master_samples, *,
                          GlobalVariantProbeSpec(seed, begin, end-begin).generate(np.arange(first, last)))
                     az = (np.sqrt(weights)[:, :, None]*z[:, None, :]).reshape(last-first, -1)
                     base_sketch[:, :, begin:end] += products.nn(x, az).reshape(n, k, end-begin)
-                timings["reference_seconds"] += perf_counter()-tick
+                phase_seconds = perf_counter()-tick
+                timings["reference_seconds"] += phase_seconds
+                timings["pass1_sketch_seconds"] += phase_seconds
             else:
                 tick = perf_counter()
                 for t, trait in enumerate(traits):
@@ -273,10 +287,10 @@ def prepare_cross_gxe(operator, annotations, traits, master_samples, *,
                         scores[t][first:last, q] = products.tn(f[t][q], response[t][:, None])[:, 0]
                 timings["score_seconds"] += perf_counter()-tick
                 tick = perf_counter()
-                for index, (pair, (ia, ib)) in enumerate(zip(summaries, overlap_indices)):
+                for index, (pair, (ia, ib)) in enumerate(zip(summaries, overlap_views)):
                     for p, orientations in enumerate(pair.layout):
                         rhs = sum(scores[pair.left][first:last, u]*scores[pair.right][first:last, v] for u, v in orientations)
-                        if len(ia):
+                        if pair.overlap:
                             d = sum(f[pair.left][u][ia]*f[pair.right][v][ib] for u, v in orientations)
                             rhs -= products.tn(d, response_correction[index])[:, 0]
                             pair.ldscores[first:last, p] -= products.tn(d, correction[index])
@@ -302,25 +316,29 @@ def prepare_cross_gxe(operator, annotations, traits, master_samples, *,
                                     draw = products.tn(weights, product[:, annotation])
                                     pair.probe_grams[begin:end, p::pair.p, annotation*pair.p+s] += draw.T
                                 timings["reference_draw_aggregation_seconds"] += perf_counter()-aggregation_start
-                timings["reference_seconds"] += perf_counter()-tick
+                phase_seconds = perf_counter()-tick
+                timings["reference_seconds"] += phase_seconds
+                timings["pass2_reference_seconds"] += phase_seconds
             products.drain()
         operator.finish_pass()
         if pass_number == 1:
             tick = perf_counter()
             sketches = []
-            for t, index in zip(traits, rows):
+            for t, index in zip(traits, row_views):
                 trait_sketches = []
                 for q in range(t.q):
-                    transformed = np.empty((len(index), k, probes))
+                    transformed = np.empty((len(t.samples), k, probes))
                     for begin in range(0, probes, tile):
                         end = min(probes, begin+tile)
-                        value = base_sketch[index, :, begin:end].reshape(len(index), -1)
+                        value = base_sketch[index, :, begin:end].reshape(len(t.samples), -1)
                         value = value*(t.sensitivity*t.contexts[:,q])[:,None]
-                        transformed[:, :, begin:end] = project(value, t.fixed_basis, products).reshape(len(index),k,end-begin)
+                        transformed[:, :, begin:end] = project(value, t.fixed_basis, products).reshape(len(t.samples),k,end-begin)
                     trait_sketches.append(transformed)
                 sketches.append(trait_sketches)
             del base_sketch
-            timings["reference_seconds"] += perf_counter()-tick
+            phase_seconds = perf_counter()-tick
+            timings["reference_seconds"] += phase_seconds
+            timings["source_transform_seconds"] += phase_seconds
             tick = perf_counter()
             for pair, (ia, ib), diagonal in zip(summaries, overlap_indices, diagonals):
                 remover = DiagonalRemoval(traits[pair.left].fixed_basis[ia],

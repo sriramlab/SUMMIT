@@ -5,11 +5,13 @@ from scripts.pcgc.calibrate_cross_scaling import make_design, exact_equations, f
 from test_pcgc_cross_gxe import dense_oracle
 
 
+@pytest.mark.parametrize("native", [False, True])
 @pytest.mark.parametrize("kind", ["qq", "bq", "bb"])
 @pytest.mark.parametrize("overlap", [0., .5, 1.])
-def test_scaling_variant_gram_oracle(kind, overlap):
+def test_scaling_variant_gram_oracle(kind, overlap, native):
+    from prediction_helpers import prediction_threads
     design = make_design(24, 24, kind=kind, overlap=overlap, annotations=2,
-                         heterogeneous=True)
+                         heterogeneous=True, native=native, threads=prediction_threads())
     models, truth = exact_equations(design, [4, 6])
     total = max(max(r) for r in design["rows"])+1
     x = np.empty((total, 24))

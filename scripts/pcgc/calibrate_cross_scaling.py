@@ -157,7 +157,8 @@ def fit_responses(design,models,z):
             br=np.empty((count,k*p,z[0].shape[1]))
             for annotation in range(k):
                 br[:,annotation*p:(annotation+1)*p]=np.add.reduceat(values*a[:,annotation,None,None],work["boundaries"][:-1],axis=0)
-            br-=products.tn(work["diagonal"].reshape(len(ia),count*k*p),correction).reshape(br.shape)
+            if len(ia):
+                br-=products.tn(work["diagonal"].reshape(len(ia),count*k*p),correction).reshape(br.shape)
             rhs=br.sum(0)
             full.setdefault(count,[]).append((work["inverse"]@rhs).T)
             deleted.setdefault(count,[]).append(np.einsum("bij,bjr->bri",work["deleted_inverse"],rhs[None]-br))
