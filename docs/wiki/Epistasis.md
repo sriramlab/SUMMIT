@@ -177,6 +177,49 @@ traits, and follow-up families.
 
 ## Computation
 
+### Continuous phenotype-scale test
+
+`scale-test` tests whether some Box--Cox power in a declared continuous
+interval makes the supplied interaction coefficients zero. Each transformed
+outcome is jointly refitted with all nuisance and interaction terms, using
+HC3 covariance. The same power applies to every feature in an omnibus test.
+This tests a specified scale family, not arbitrary monotone invariance or
+biological causality. Independent-individual and finite-mean inference
+assumptions remain; leverage/support flags are not overridden.
+
+Save an NPZ with aligned arrays `features` (N by p), `fixed_effects` (N by k),
+and `phenotype` (N positive raw measurements). Include an intercept and the
+declared additive/dominance adjustment in `fixed_effects`. Freeze feature
+selection/learning outside the analyzed outcomes. Then run:
+
+```bash
+python -m summit.epistasis.cli scale-test arrays.npz --out scale.json \
+  --lambda-min -2 --lambda-max 2 --alpha 0.000625 \
+  --max-evaluations 257 --num-threads 4 --memory-gib 32
+```
+
+The example alpha is .05/80; choose the multiplicity family before testing.
+Optional `--groups groups.json` supplies a mapping of test names to zero-based
+feature indices. Every group is conditional on the other supplied features.
+The default tests all features jointly. Transform raw measurements before
+adjustment, never previously residualized outcomes. Positive changes of units
+leave the test unchanged; adding a constant changes the Box--Cox family.
+
+The result bounds `sup_lambda p_lambda`. `p_sup_lower` is the largest sampled
+p and is **not** sufficient to reject the composite null. `p_upper` includes
+Taylor remainder bounds between evaluated powers. A rejection requires
+`p_upper < alpha`; unresolved searches retain a conservative bound. Finding
+a compatible power means failure to reject, not proof of latent additivity.
+The bounds use float64 numerical slack, not formal interval arithmetic.
+
+Python callers can reuse `prepare_robust_nuisance` across panels,
+`prepare_robust_geometry` across transformations, and `boxcox_scale_test`
+from `summit.epistasis.scale`. The command uses the existing protected native
+NN/TN products. No genome traversal or sample-square covariance is needed
+when the finite features already exist.
+
+### Resources and data
+
 Preparation uses SUMMIT's genotype readers and matrix operations. Larger
 backgrounds use streamed products and randomized reference summaries.
 Increase `--nvecs` to assess reference precision; `--exact` is limited to small

@@ -26,6 +26,16 @@ def _jsonable(value):
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
+    scale = sub.add_parser("scale-test", help="continuous Box-Cox union-null HC3 test on frozen finite features")
+    scale.add_argument("arrays",type=Path)
+    scale.add_argument("--out",type=Path,required=True)
+    scale.add_argument("--groups",type=Path)
+    scale.add_argument("--lambda-min",type=float,default=-2.)
+    scale.add_argument("--lambda-max",type=float,default=2.)
+    scale.add_argument("--alpha",type=float,default=.05)
+    scale.add_argument("--max-evaluations",type=int,default=129)
+    scale.add_argument("--num-threads",type=int,default=1)
+    scale.add_argument("--memory-gib",type=float,default=4.)
     inputs = sub.add_parser(
         "make-inputs", help="construct supplied-target manifests using training genotype support"
     )
@@ -97,6 +107,14 @@ def main(argv=None):
     followup.add_argument("manifest", type=Path)
     followup.add_argument("--out", type=Path, required=True)
     args = parser.parse_args(argv)
+    if args.command == "scale-test":
+        from .scale_workflow import run_scale_arrays
+        run_scale_arrays(args.arrays,args.out,
+            groups=None if args.groups is None else json.loads(args.groups.read_text()),
+            threads=args.num_threads,memory_bytes=int(args.memory_gib*2**30),
+            bounds=(args.lambda_min,args.lambda_max),alpha=args.alpha,
+            max_evaluations=args.max_evaluations)
+        return 0
     if args.command == "make-inputs":
         from .inputs import prepare_inputs
 

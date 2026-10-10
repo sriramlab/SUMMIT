@@ -123,6 +123,102 @@ class RobustScoreSummary:
         object.__setattr__(self, "metadata", freeze_context_mapping(self.metadata))
 
 
+class RobustMeanGeometry:
+    """Reusable finite-mean geometry with the same HC3 rules as score preparation.
+
+    Construct with ``prepare_robust_geometry``. No outcomes or mutable input
+    design are retained. Large products use the supplied SUMMIT NN/TN hooks.
+    """
+
+    def fit(self, phenotypes):
+        y = np.asarray(phenotypes, dtype=float)
+        if y.ndim == 1:
+            y = y[:, None]
+        if y.ndim != 2 or len(y) != len(self.r) or not np.all(np.isfinite(y)):
+            raise ValueError("finite sample-aligned outcomes required")
+        active_y = y.copy()
+        active_y[self.saturated] = 0
+        py = active_y - self.nn(self.u, self.tn(self.u, active_y))
+        scores = self.tn(self.r, py)
+        coefficients = self.nn(self.inverse, scores)
+        residual = py - self.nn(self.r, coefficients)
+        residual[self.saturated] = 0
+        meat = np.empty((y.shape[1], self.r.shape[1], self.r.shape[1]))
+        for j in range(y.shape[1]):
+            weighted = self.r * (residual[:, j] / self.denominator)[:, None]
+            meat[j] = self.tn(weighted, weighted)
+            del weighted
+        return scores, coefficients, residual, meat, py
+
+
+@dataclass(frozen=True)
+class RobustNuisanceGeometry:
+    basis: np.ndarray
+    design_shape: tuple
+    design_hash: str
+
+
+def prepare_robust_nuisance(fixed_effects):
+    """Freeze a nuisance span once for multiple feature panels or outcomes."""
+    c = np.asarray(fixed_effects, dtype=float)
+    basis = thin_rank_revealing_fixed_effect_basis(c)
+    basis.setflags(write=False)
+    return RobustNuisanceGeometry(basis, c.shape, array_sha256(c))
+
+
+def prepare_robust_geometry(features, fixed_effects=None, *, nuisance=None, nn=None, tn=None):
+    """Factor a declared design once for repeated outcome transformations.
+
+    Original feature coordinates, rank decisions, and saturated-row rules
+    agree with ``prepare_robust_scores``. Designs are not cached globally.
+    """
+    f = np.asarray(features, dtype=float)
+    if (fixed_effects is None) == (nuisance is None):
+        raise ValueError('supply fixed effects or a prepared nuisance span, exclusively')
+    if nuisance is None:
+        nuisance = prepare_robust_nuisance(fixed_effects)
+    if (not isinstance(nuisance, RobustNuisanceGeometry) or f.ndim != 2
+            or not f.shape[1] or len(f) != nuisance.design_shape[0]
+            or not np.all(np.isfinite(f))):
+        raise ValueError("robust inputs must be finite and sample aligned")
+    geometry = RobustMeanGeometry()
+    nn = nn or (lambda a, b: a @ b)
+    tn = tn or (lambda a, b: a.T @ b)
+    u = nuisance.basis
+    r = f - nn(u, tn(u, f))
+    r -= nn(u, tn(u, r))
+    energy = np.sum(r * r, axis=0)
+    absorbed = energy <= (
+        64 * np.finfo(float).eps * max(nuisance.design_shape + f.shape)
+    ) ** 2 * np.maximum(np.sum(f * f, axis=0), np.finfo(float).tiny)
+    r[:, absorbed] = 0
+    h = tn(r, r)
+    inverse, estimable, rank, condition = _span_inverse(h)
+    if rank == 0:
+        raise ValueError("interaction feature span is absorbed by the nuisance mean")
+    leverage_c = np.sum(u * u, axis=1)
+    partial = np.sum(r * nn(r, inverse), axis=1)
+    leverage = leverage_c + partial
+    roundoff = 64 * np.finfo(float).eps * max(nuisance.design_shape + f.shape)
+    saturated = (abs(1 - leverage_c) <= roundoff) & (abs(partial) <= roundoff**2)
+    active = ~saturated
+    if len(f) - u.shape[1] - rank < 3 or np.any(leverage[active] >= 1 - 1e-8):
+        raise ValueError(
+            "insufficient residual support for HC3 inference: essential or unresolved unit leverage"
+        )
+    r[saturated] = 0
+    denominator = 1 - leverage
+    denominator[saturated] = 1
+    for name, value in dict(u=u, r=r, h=h, inverse=inverse, estimable=estimable,
+            rank=rank, condition=condition, leverage_c=leverage_c, partial=partial,
+            leverage=leverage, saturated=saturated, active=active,
+            denominator=denominator, nn=nn, tn=tn).items():
+        if isinstance(value, np.ndarray):
+            value.setflags(write=False)
+        setattr(geometry, name, value)
+    return geometry
+
+
 def prepare_robust_scores(
     features,
     phenotypes,
@@ -169,48 +265,12 @@ def prepare_robust_scores(
         )
     nn = nn or (lambda a, b: a @ b)
     tn = tn or (lambda a, b: a.T @ b)
-    u = thin_rank_revealing_fixed_effect_basis(c)
-    r = f - nn(u, tn(u, f))
-    # A second projection removes roundoff in nearly redundant nuisance terms.
-    r -= nn(u, tn(u, r))
-    energy = np.sum(r * r, axis=0)
-    absorbed = energy <= (
-        64 * np.finfo(float).eps * max(c.shape + f.shape)
-    ) ** 2 * np.maximum(np.sum(f * f, axis=0), np.finfo(float).tiny)
-    r[:, absorbed] = 0
-    h = tn(r, r)
-    inverse, estimable, rank, condition = _span_inverse(h)
-    if rank == 0:
-        raise ValueError("interaction feature span is absorbed by the nuisance mean")
-    # Rank decisions use the scaled information, but scores and meat stay in
-    # the ORIGINAL coordinates. Hence s' W s retains the declared kernel.
-    leverage_c = np.sum(u * u, axis=1)
-    partial = np.sum(r * nn(r, inverse), axis=1)
-    leverage = leverage_c + partial
-    roundoff = 64 * np.finfo(float).eps * max(c.shape + f.shape)
-    saturated = (abs(1 - leverage_c) <= roundoff) & (abs(partial) <= roundoff**2)
-    # A nuisance-only saturated row has zero interaction influence and zero
-    # residual. Its 0/0 HC3 term is algebraically zero, not an estimated variance.
-    active = ~saturated
-    if len(y) - u.shape[1] - rank < 3 or np.any(leverage[active] >= 1 - 1e-8):
-        raise ValueError(
-            "insufficient residual support for HC3 inference: essential or unresolved unit leverage"
-        )
-    r[saturated] = 0
-    y_active = y.copy()
-    y_active[saturated] = 0
-    py = y_active - nn(u, tn(u, y_active))
-    s = tn(r, py)
-    coef = nn(inverse, s)
-    e = py - nn(r, coef)
-    e[saturated] = 0
-    denominator = 1 - leverage
-    denominator[saturated] = 1
-    meat = np.empty((y.shape[1], f.shape[1], f.shape[1]))
-    for i in range(y.shape[1]):
-        weighted = r * (e[:, i] / denominator)[:, None]
-        meat[i] = tn(weighted, weighted)
-        del weighted
+    geometry = prepare_robust_geometry(f, c, nn=nn, tn=tn)
+    u, r, h, inverse = geometry.u, geometry.r, geometry.h, geometry.inverse
+    estimable, rank, condition = geometry.estimable, geometry.rank, geometry.condition
+    leverage_c, partial, leverage = geometry.leverage_c, geometry.partial, geometry.leverage
+    saturated, active, denominator = geometry.saturated, geometry.active, geometry.denominator
+    s, coef, e, meat, py = geometry.fit(y)
     supported = np.diag(h) > 0
     normalized = r[:, supported] / np.sqrt(np.diag(h)[supported])
     diagnostics = dict(
