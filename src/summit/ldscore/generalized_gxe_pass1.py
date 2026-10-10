@@ -382,6 +382,8 @@ class ProtectedNNOperator:
         if native_module is None:
             from summit import gxeldcore as native_module
         self._module = native_module
+        from .matrix_products import native_execution_evidence
+        self._evidence = native_execution_evidence(native_module)
         protected = getattr(native_module, "protected_matmul_nn", None)
         if not callable(protected):
             raise RuntimeError("native extension lacks protected_matmul_nn")
@@ -395,17 +397,12 @@ class ProtectedNNOperator:
     def begin_execution(self) -> None:
         self.calls = 0
         self.repaired_columns = 0
-        reset = getattr(self._module, "reset_gemm_telemetry", None)
-        if callable(reset):
-            reset()
-        reset_output = getattr(
-            self._module, "reset_native_gemm_output_numa_evidence", None
-        )
-        if callable(reset_output):
-            reset_output()
+        self._evidence.begin()
 
     def matmul(self, left: Array, right: Array) -> Array:
+        self._evidence.check()
         output, repaired = self._protected(left, right, self.threads)
+        self._evidence.check()
         result = np.asarray(output)
         expected = (left.shape[0], right.shape[1])
         if result.dtype != np.dtype(np.float64) or result.shape != expected:
@@ -420,35 +417,7 @@ class ProtectedNNOperator:
         return result
 
     def finish_execution(self) -> dict[str, Any]:
-        status_getter = getattr(self._module, "gemm_telemetry_status", None)
-        consumer = getattr(self._module, "consume_gemm_telemetry", None)
-        output_status_getter = getattr(
-            self._module, "native_gemm_output_numa_evidence_status", None
-        )
-        output_consumer = getattr(
-            self._module, "consume_native_gemm_output_numa_evidence", None
-        )
-        status = dict(status_getter()) if callable(status_getter) else {}
-        if int(status.get("dropped_records", 0)) != 0:
-            raise RuntimeError("native GEMM telemetry overflowed")
-        output_status = (
-            dict(output_status_getter()) if callable(output_status_getter) else {}
-        )
-        if int(output_status.get("failed_calls", 0)) != 0:
-            raise RuntimeError("native protected-output NUMA verification failed")
-        return {
-            "available": callable(consumer),
-            "gemm_records": (
-                [dict(item) for item in consumer()] if callable(consumer) else []
-            ),
-            "gemm_status": status,
-            "output_numa_evidence": (
-                [dict(item) for item in output_consumer()]
-                if callable(output_consumer)
-                else []
-            ),
-            "output_numa_status": output_status,
-        }
+        return self._evidence.finish()
 
 
 @dataclass(frozen=True)

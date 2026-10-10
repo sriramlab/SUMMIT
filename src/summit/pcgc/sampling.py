@@ -125,15 +125,46 @@ class SamplingMoments:
         value = self.pair_constant+np.einsum('d,dij->ij',theta,self.pair_linear)+np.einsum('d,e,deij->ij',theta,theta,self.pair_quadratic)
         return (value+value.T)/2
 
+    def component_direction_terms(self,theta,rows,products):
+        """Linear/quadratic variance terms along each coefficient axis."""
+        c = len(theta)
+        if np.asarray(rows).shape != (c,2*c+1):
+            raise ValueError('sampling confidence rows disagree')
+        if products.native:
+            return np.asarray(products.module.pcgc_sampling_direction_terms(
+                np.asarray(theta),np.ascontiguousarray(rows),
+                np.ascontiguousarray(self.linear.reshape(c,-1)),
+                np.ascontiguousarray(self.quadratic.reshape(c*c,-1)),products.threads))
+        result = []
+        for d,row in enumerate(rows):
+            first = self.linear[d]+np.einsum('e,eij->ij',theta,self.quadratic[d]+self.quadratic[:,d])
+            result.append([row@first@row,row@self.quadratic[d,d]@row])
+        return np.asarray(result)
+
+
+def sampling_tile_people(n,partners):
+    return min(n,max(1,32768//partners))
+
+
+def sampling_panel_bytes(people,partners,c,p,s):
+    # Six published panels plus the native feature/weight workspace. Protected
+    # GEMM input snapshots are reserved separately in sampling_workspace_bytes.
+    return 8*(people*partners*(3*s+3*c+p+2)+people*s)
+
 
 def sampling_workspace_bytes(n,m,q,k,partners,block_size,risk_rank=0,architecture_probes=0):
     c = k*q*(q+1)//2
     j = 2*c+1
     b = min(m,block_size)
+    packed = c*(c+1)//2
     # Pair identities/relatedness, score/actions/diagonals, nuisance arrays,
     # covariance tensors, assembly copies, and bounded product scratch.
-    result = 8*(n*partners*(k+1)+m*q+n*(6*c+3*k+8*risk_rank+8*c*c)+n*b
+    # Four copies of the packed influence panel cover the resident values,
+    # protected input snapshots, and nuisance/centering scratch.
+    result = 8*(n*partners*(k+1)+m*q+n*(6*c+3*k+8*risk_rank+4*packed)+n*b
               +6*(1+c+c*c)*j*j+6*c**4)+64*1024**2
+    result += 8*packed*packed
+    result += 3*sampling_panel_bytes(sampling_tile_people(n,partners),partners,c,q*(q+1)//2,packed)
     if architecture_probes:
         from .architecture import architecture_workspace_bytes
         result += architecture_workspace_bytes(n,q,k,architecture_probes,b)
@@ -177,6 +208,13 @@ class SamplingOperator:
             raise ValueError("individual-sampling inference requires at least two partners per person")
         if type(seed) is not int or seed < 0:
             raise ValueError("individual partner seed must be a nonnegative integer")
+        if native:
+            from summit.prediction.genotype import native_module
+            module = native_module()
+            required = ("pcgc_accumulate_relatedness","pcgc_pair_panels","pcgc_center_strata",
+                        "pcgc_sampling_direction_terms","pcgc_architecture_features","pcgc_architecture_polynomials")
+            if any(not callable(getattr(module,name,None)) for name in required):
+                raise RuntimeError("native extension lacks PCGC moment kernels; rebuild SUMMIT")
         self.operator = operator
         self.annotations = annotations
         self.contexts,self.risk,self.sd = contexts,risk,sd
@@ -191,6 +229,7 @@ class SamplingOperator:
         q,k = contexts.shape[1],annotations.shape[1]
         self.pairs = context_pairs(q)
         self.mass = annotations.sum(0)
+        self.native,self.threads = native,threads
         self.partner_probabilities = partner_proposal(features,response)
         self.partners = sample_partners(self.partner_probabilities,partners,seed)
         self.relatedness = np.zeros((n,partners,k))
@@ -232,18 +271,13 @@ class SamplingOperator:
         if self.observed_passes == 1:
             self.scores[start:stop] = self.tn.matmul_tn(x,np.asfortranarray(self.features*self.response[:,None]))
             self.diagonal += self.nn.matmul(np.asfortranarray(x*x),a)
-            # Pair sampling gathers participant rows repeatedly. A contiguous
-            # row copy avoids strided reads from the reference's column layout;
-            # the n*block_size workspace allowance covers this copy.
-            pair_genotypes = np.ascontiguousarray(x)
-            width = max(1,2**20//(stop-start))
-            values = self.relatedness.reshape(-1,k)
-            other = self.partners.ravel()
-            for first in range(0,n*l,width):
-                last = min(n*l,first+width)
-                rows = np.arange(first,last)//l
-                products = np.asfortranarray(pair_genotypes[rows]*pair_genotypes[other[first:last]])
-                values[first:last] += self.nn.matmul(products,a)
+            from .genotype import accumulate_relatedness
+            from time import perf_counter
+            started = perf_counter()
+            accumulate_relatedness(x,a,self.partners,self.relatedness,
+                nn=self.nn,native=self.native,threads=self.threads)
+            self.diagnostics['sampled_pair_seconds'] = self.diagnostics.get('sampled_pair_seconds',0.)+perf_counter()-started
+            self.diagnostics['sampled_pair_variant_products'] = self.diagnostics.get('sampled_pair_variant_products',0)+n*l*(stop-start)
         elif self.observed_passes == 2:
             for annotation in range(k):
                 values = self.nn.matmul(x,np.asfortranarray(a[:,annotation,None]*self.scores[start:stop]))
@@ -267,7 +301,8 @@ class SamplingOperator:
             features=self.features,response=self.response,risk=self.risk,sd=self.sd,method=self.method,
             risk_covariates=self.risk_covariates,estimate_population_metric=self.estimate_population_metric,
             estimate_population_variance=self.estimate_population_variance,
-            reference_annotation_gram=reference_annotation_gram)
+            reference_annotation_gram=reference_annotation_gram,native=self.native,threads=self.threads,
+            execution=self.diagnostics.setdefault("execution",{}))
         if self.architecture is not None:
             from dataclasses import replace
             result = replace(result,architecture_left=self.architecture.left,architecture_right=self.architecture.right,
@@ -278,7 +313,8 @@ class SamplingOperator:
 def build_sampling_moments(*, pair_kernels, partners, kernel_actions, genotype_diagonal,
                            contexts, features, response, risk, sd, method, risk_covariates=None,
                            estimate_population_metric=True, estimate_population_variance=True,
-                           sampled=True, reference_annotation_gram=None,partner_probabilities=None):
+                           sampled=True, reference_annotation_gram=None,partner_probabilities=None,
+                           native=False,threads=1,execution=None):
     """Form an unbiased pair-sampling approximation to a U-statistic sandwich.
 
     Each row samples L independent partners from all other people. Optional
@@ -322,56 +358,95 @@ def build_sampling_moments(*, pair_kernels, partners, kernel_actions, genotype_d
         low_rank = center_strata(2*risk_if,cases)
         leverage += 2*np.sum(low_rank*log_weight,axis=1)
         leverage += np.einsum('ir,rs,is->i',log_weight,low_rank.T@low_rank,log_weight)
-    hrow = np.empty((n,c,c))
+    from summit.ldscore.matrix_products import MatrixProducts
+    products_backend = MatrixProducts(native=native,threads=threads)
+    context_only = reference_annotation_gram is not None
+    dimension = p if context_only else c
+    upper = np.column_stack(np.triu_indices(dimension)).astype(np.int64)
+    pair_index = np.empty((dimension,dimension),dtype=np.int64)
+    pair_index[upper[:,0],upper[:,1]] = np.arange(len(upper))
+    pair_index[upper[:,1],upper[:,0]] = np.arange(len(upper))
+    if context_only:
+        gram = finite_array("external annotation LD Gram",reference_annotation_gram,2)
+        if gram.shape != (k,k):
+            raise ValueError("external annotation LD Gram axes disagree")
+        # Directional annotation Grams need not be symmetric. Only the context
+        # product is shared; keep the ordered annotation multiplier intact.
+        index = pair_index[np.arange(c)[:,None]%p,np.arange(c)[None,:]%p]
+        multiplier = gram[np.arange(c)[:,None]//p,np.arange(c)[None,:]//p]
+    else:
+        index = pair_index
+        multiplier = np.ones((c,c))
+    s = len(upper)
+    hrow = np.empty((n,s),order="F")
     t0 = np.zeros((c,c))
-    t1 = np.zeros((c,c,c))
-    t2 = np.zeros((c,c,c,c))
-    mc = np.zeros_like(t2)
-    # Bound temporary C^2 products independently of N and the SNP count.
-    width = max(1,min(n,2**20//max(1,l*c*c)))
+    t1 = np.zeros((c,s))
+    t2 = np.zeros((s,s))
+    mc = np.zeros((s,s))
+    width = sampling_tile_people(n,l)
+    panel_bytes = sampling_panel_bytes(width,l,c,p,s)
+    context_pairs_array = np.asarray(pairs,dtype=np.int64)
+    if native:
+        panel_function = getattr(products_backend.module,"pcgc_pair_panels",None)
+        if not callable(panel_function):
+            raise RuntimeError("native extension lacks PCGC moment kernels; rebuild SUMMIT")
+        base = np.ascontiguousarray(base)
+        partner = np.ascontiguousarray(partner,dtype=np.int64)
+        features = np.ascontiguousarray(features)
+        response = np.ascontiguousarray(response)
+        probability_input = np.empty(0) if probabilities is None else np.ascontiguousarray(probabilities)
+    from time import perf_counter
+    started = perf_counter()
     for start in range(0,n,width):
         stop = min(n,start+width)
-        other = partner[start:stop]
-        f = features[start:stop]
-        products = np.stack([f[:,u,None]*features[other,v] if u == v else
-            f[:,u,None]*features[other,v]+f[:,v,None]*features[other,u] for u,v in pairs],axis=-1)
-        kernels = (base[start:stop,:,:,None]*products[:,:,None,:]).reshape(stop-start,l,c)
-        if reference_annotation_gram is None:
-            square = (kernels[:,:,:,None]*kernels[:,:,None,:]).reshape(stop-start,l,c*c)
+        if native:
+            panels = panel_function(base.reshape(n*l,k),partner,features,response,probability_input,
+                np.ascontiguousarray(leverage),context_pairs_array,upper,start,stop,context_only,
+                panel_bytes,threads)
+            score,weighted_score,square,weighted_square,noise_square,mean = map(np.asarray,panels)
         else:
-            gram = finite_array("external annotation LD Gram",reference_annotation_gram,2)
-            if gram.shape != (k,k):
-                raise ValueError("external annotation LD Gram axes disagree")
-            square = np.einsum('ab,nlp,nlr->nlapbr',gram,products,products).reshape(stop-start,l,c*c)
-        inverse_probability = (np.full((stop-start,l),n-1.) if probabilities is None else
-            (1-probabilities[start:stop,None])/probabilities[other])
-        weighted_square = square*inverse_probability[:,:,None]
-        mean = weighted_square.mean(1)
-        hrow[start:stop] = mean.reshape(stop-start,c,c)
-        ypair = response[start:stop,None]*response[other]
-        flat = kernels.reshape(-1,c)
-        score = flat*ypair.reshape(-1,1)
-        t0 += (score.T@(score*inverse_probability.reshape(-1,1)))/l
-        t1 += ((score.T@weighted_square.reshape(-1,c*c))/l).reshape(c,c,c)
-        fourth = square.reshape(-1,c*c).T@weighted_square.reshape(-1,c*c)
-        t2 += (fourth/l).reshape(c,c,c,c)
+            other = partner[start:stop]
+            f = features[start:stop]
+            context = np.stack([f[:,u,None]*features[other,v] if u == v else
+                f[:,u,None]*features[other,v]+f[:,v,None]*features[other,u] for u,v in pairs],axis=-1)
+            kernels = (base[start:stop,:,:,None]*context[:,:,None,:]).reshape(-1,c)
+            values = context.reshape(-1,p) if context_only else kernels
+            square = values[:,upper[:,0]]*values[:,upper[:,1]]
+            inverse = (np.full((stop-start,l),n-1.) if probabilities is None else
+                (1-probabilities[start:stop,None])/probabilities[other]).reshape(-1,1)
+            score = kernels*(response[start:stop,None]*response[other]).reshape(-1,1)
+            weighted_score = score*inverse
+            weighted_square = square*inverse
+            noise_square = weighted_square*inverse*np.repeat(leverage[start:stop],l)[:,None]
+            mean = weighted_square.reshape(stop-start,l,s).mean(1)
+        hrow[start:stop] = mean
+        t0 += products_backend.tn(score,weighted_score)/l
+        t1 += products_backend.tn(score,weighted_square)/l
+        t2 += products_backend.tn(square,weighted_square)/l
         if sampled:
-            weights = leverage[start:stop]
-            weighted_fourth = weighted_square.reshape(-1,c*c).T@(weighted_square*weights[:,None,None]).reshape(-1,c*c)
-            mc += ((weighted_fourth/l-mean.T@(weights[:,None]*mean))/(l-1)).reshape(c,c,c,c)
+            mc += (products_backend.tn(square,noise_square)/l -
+                products_backend.tn(mean,leverage[start:stop,None]*mean))/(l-1)
+        products_backend.drain()
+        del score,weighted_score,square,weighted_square,noise_square,mean
+        if native:
+            del panels
+    pair_seconds = perf_counter()-started
     j = 2*c+1
-    a = np.zeros((n,j))
-    b = np.zeros((n,c,j))
+    a = np.zeros((n,j),order="F")
     a[:,:c] = 2*response[:,None]*actions
-    b[:,:,:c] = -2*hrow.transpose(0,2,1)
     if risk_if.shape[1]:
-        db = 2*actions.T@(dresponse+response[:,None]*log_weight)
-        a[:,:c] += risk_if@db.T
-        dh = 4*np.einsum('ir,icd->rcd',log_weight,hrow)
-        b[:,:,:c] -= np.einsum('ir,rcd->idc',risk_if,dh)
-    count = n*(n-1)
+        db = 2*products_backend.tn(actions,dresponse+response[:,None]*log_weight)
+        a[:,:c] += products_backend.nn(risk_if,db.T)
+        dh = 4*products_backend.tn(log_weight,hrow)
+    # One coefficient per unique pair product. All population-summary columns
+    # of the old N x C x (2C+1) influence array were identically zero.
+    b = hrow
+    b *= -2
+    if risk_if.shape[1]:
+        products_backend.subtract_rank(b,risk_if,dh)
+    count = float(n*(n-1))
     a[:,:c] /= count
-    b[:,:,:c] /= count
+    b /= count
     K,P = risk.population_prevalence,risk.sample_prevalence
     weights = np.where(cases,K/P,(1-K)/(1-P))/n
     if estimate_population_metric:
@@ -384,20 +459,35 @@ def build_sampling_moments(*, pair_kernels, partners, kernel_actions, genotype_d
         if risk_if.shape[1]:
             derivative = 2*(weights*centered_mu*sd)@design
             a[:,-1] += risk_if@derivative
-    a = center_strata(a,cases)
-    b = center_strata(b,cases)
-    const = a.T@a
-    linear = np.einsum('ni,ndj->dij',a,b)+np.einsum('ndi,nj->dij',b,a)
-    quadratic = np.einsum('ndi,nej->deij',b,b)
-    const[:c,:c] -= 2*t0/count**2
-    linear[:,:c,:c] += 2*(t1.transpose(2,0,1)+t1.transpose(2,1,0))/count**2
-    quadratic[:,:,:c,:c] -= 2*t2.transpose(1,3,0,2)/count**2
-    # mc axes are (equation, coefficient, equation, coefficient).
-    quadratic[:,:,:c,:c] -= 4*mc.transpose(1,3,0,2)/count**2
+    products_backend.center_strata(a,cases)
+    products_backend.center_strata(b,cases)
+    const = products_backend.tn(a,a)
+    cross = products_backend.tn(a,b)
+    gram = products_backend.tn(b,b)
+    # index is (equation, coefficient); the saved polynomial is
+    # (coefficient[, coefficient], equation, equation).
+    ix,scale = index.T,multiplier.T
+    linear = np.zeros((c,j,j))
+    linear[:,:,:c] = cross[:,ix].transpose(1,0,2)*scale[:,None,:]
+    linear += linear.transpose(0,2,1).copy()
+    pair_linear = -2*(t1[:,ix].transpose(1,0,2)*scale[:,None,:])/count**2
+    pair_linear += pair_linear.transpose(0,2,1).copy()
+    left,right = ix[:,None,:,None],ix[None,:,None,:]
+    factor = scale[:,None,:,None]*scale[None,:,None,:]
+    quadratic = np.zeros((c,c,j,j))
+    quadratic[:,:,:c,:c] = (gram-(2*t2+4*mc)/count**2)[left,right]*factor
+    pair_quadratic = (2*t2/count**2)[left,right]*factor
+    pair_constant = 2*t0/count**2
+    const[:c,:c] -= pair_constant
+    linear[:,:c,:c] -= pair_linear
+    if execution is not None:
+        execution.update(products_backend.drain(),pair_feature_columns=s,
+            expanded_pair_columns=c*c,pair_accumulation_seconds=pair_seconds,
+            finalization_seconds=perf_counter()-started)
+    else:
+        products_backend.drain()
     return SamplingMoments(const,linear,quadratic,n,
-        pair_constant=2*t0/count**2,
-        pair_linear=-2*(t1.transpose(2,0,1)+t1.transpose(2,1,0))/count**2,
-        pair_quadratic=2*t2.transpose(1,3,0,2)/count**2)
+        pair_constant=pair_constant,pair_linear=pair_linear,pair_quadratic=pair_quadratic)
 
 
 def hoeffding_working_covariance(covariance,pair_covariance):
@@ -444,8 +534,10 @@ def hoeffding_working_covariance(covariance,pair_covariance):
         equation_relative_adjustment=float(np.linalg.norm(adjustment[:c,:c])/max(np.linalg.norm(covariance[:c,:c]),np.finfo(float).tiny)))
 
 
-def sampling_inference(moments,theta,H,population_weights):
+def sampling_inference(moments,theta,H,population_weights,*,native=True,threads=None):
     """Propagate component, population-kernel and liability-variance sampling."""
+    from summit.ldscore.matrix_products import MatrixProducts
+    products = MatrixProducts(native=native,threads=threads)
     c = len(theta)
     count = moments.n_samples*(moments.n_samples-1)
     transform = np.eye(2*c+1)
@@ -458,17 +550,21 @@ def sampling_inference(moments,theta,H,population_weights):
         working_adjustment,working_diagnostics = hoeffding_working_covariance(
             moments.sampling_moments.covariance(theta),pair_covariance)
     if moments.sampling_moments.architecture_probes:
-        from .architecture import gaussian_architecture_covariance
+        from .architecture import gaussian_architecture_covariance,ArchitectureCovariance
         model = moments.sampling_moments
+        evaluator = ArchitectureCovariance(model.architecture_left,model.architecture_right,
+            moments.num_contexts,model.architecture_probes,products)
         architecture,architecture_diagnostics = gaussian_architecture_covariance(theta,moments.num_contexts,
-            moments.population_second_moment,model.architecture_left,model.architecture_right,model.architecture_probes)
-    def equation_covariance(value):
-        result = moments.sampling_moments.covariance(value)+working_adjustment
-        if architecture_diagnostics is not None:
-            from .architecture import architecture_trace_covariance
+            moments.population_second_moment,model.architecture_left,model.architecture_right,model.architecture_probes,
+            evaluator=evaluator)
+    def equation_covariance(value,*,include_sampling=True,include_architecture=True):
+        result = working_adjustment.copy()
+        if include_sampling:
+            result += moments.sampling_moments.covariance(value)
+        if include_architecture and architecture_diagnostics is not None:
             from .gxe import _omega
             working = np.asarray(architecture_diagnostics['working_omega'])+_omega(value-theta,moments.num_contexts)
-            result[:c,:c] += architecture_trace_covariance(working,model.architecture_left,model.architecture_right,model.architecture_probes)
+            result[:c,:c] += architecture if np.array_equal(value,theta) else evaluator.covariance(working)
         if moments.reference_probe_deviations is not None:
             deviations = np.einsum('bij,j->bi',moments.reference_probe_deviations,value)/count
             probes = len(deviations)
@@ -519,13 +615,23 @@ def sampling_inference(moments,theta,H,population_weights):
     # sets, including an unbounded set if its quadratic requires one.
     sets = []
     variance_polynomials = []
+    sampling_terms = moments.sampling_moments.component_direction_terms(theta,transform[:c],products)
+    architecture_terms = np.zeros((c,3))
+    if architecture_diagnostics is not None:
+        from .gxe import _omega
+        architecture_terms = evaluator.scalar_polynomials(
+            np.asarray(architecture_diagnostics['working_omega']),transform[:c,:c],
+            np.asarray([_omega(direction,moments.num_contexts) for direction in np.eye(c)]))
+    extra0 = equation_covariance(theta,include_sampling=False,include_architecture=False)
     for target in range(c):
         direction = np.eye(c)[target]
         row = transform[target]
-        v0 = float(row@equation_covariance(theta)@row)
-        vp = float(row@equation_covariance(theta+direction)@row)
-        vm = float(row@equation_covariance(theta-direction)@row)
-        v1,v2 = (vp-vm)/2,(vp+vm)/2-v0
+        v0 = float(cov[target,target])
+        base = float(row@extra0@row)
+        vp = float(row@equation_covariance(theta+direction,include_sampling=False,include_architecture=False)@row)
+        vm = float(row@equation_covariance(theta-direction,include_sampling=False,include_architecture=False)@row)
+        v1 = (vp-vm)/2+sampling_terms[target,0]+architecture_terms[target,1]
+        v2 = (vp+vm)/2-base+sampling_terms[target,1]+architecture_terms[target,2]
         variance_polynomials.append([v0,v1,v2])
         z2 = 1.959963984540054**2
         from .score_sets import polynomial_nonpositive_set
@@ -561,4 +667,5 @@ def sampling_inference(moments,theta,H,population_weights):
             from .score_sets import polynomial_nonpositive_set
             output[label+"_plugin_score_set_95"] = polynomial_nonpositive_set(criterion,center=point,scale=scale)
     output["population_score_set_nuisance"] = "coefficient_covariance_direction_with_estimated_metric_and_liability_variance"
+    products.drain()
     return output

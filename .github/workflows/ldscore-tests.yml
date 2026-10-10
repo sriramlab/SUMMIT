@@ -6,6 +6,10 @@ on:
 
 jobs:
   core:
+    strategy:
+      fail-fast: false
+      matrix:
+        numpy: ["numpy=1.26.*", "numpy=2.3.*"]
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -14,11 +18,36 @@ jobs:
       - uses: actions/checkout@v4
       - name: Check repository content
         run: python scripts/check_repository_content.py
+      - name: Prepare the selected NumPy environment
+        env:
+          NUMPY_SPEC: ${{ matrix.numpy }}
+        run: |
+          python - <<'PY'
+          import os
+          from pathlib import Path
+
+          source = Path("environment.yml").read_text()
+          source = source.replace("  - numpy>=1.25\n", f"  - {os.environ['NUMPY_SPEC']}\n")
+          # The conda bed-reader build pins NumPy <2; its wheel supports both.
+          source = source.replace("  - bed-reader>=1.0\n", "")
+          source = source.replace("  - pip:\n", "  - pip:\n      - bed-reader==1.0.0\n")
+          Path(".github/summit-ci-environment.yml").write_text(source)
+          PY
       - uses: conda-incubator/setup-miniconda@8ee1f361103df19b6f8c8655fd3967a8ecb162d5
         with:
           activate-environment: summit
-          environment-file: environment.yml
+          environment-file: .github/summit-ci-environment.yml
           auto-activate-base: false
+      - name: Restore a clean source tree for build provenance
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import subprocess
+
+          Path(".github/summit-ci-environment.yml").unlink()
+          if subprocess.check_output(["git", "status", "--porcelain"], text=True).strip():
+              raise RuntimeError("CI environment setup left a modified source tree")
+          PY
       - name: Build SUMMIT against the environment OpenBLAS
         env:
           CMAKE_ARGS: -DBLA_VENDOR=OpenBLAS
@@ -28,6 +57,14 @@ jobs:
           python - <<'PY'
           from threadpoolctl import threadpool_info
           import numpy as np
+          import os
+          from summit import gxeldcore
+
+          build = gxeldcore.build_info()
+          if build["source_commit"] != os.environ["GITHUB_SHA"]:
+              raise RuntimeError("Native build has the wrong source commit")
+          if len(build["source_tree_sha256"]) != 64:
+              raise RuntimeError("Native build lacks its source-tree digest")
 
           np.ones((2, 2)) @ np.ones((2, 2))
           runtimes = [
@@ -82,6 +119,7 @@ jobs:
           tests/test_prediction_annotations.py
           tests/test_prediction_mixture.py
           tests/test_memory_budget.py
+          tests/test_pcgc*.py
       - name: Run synthetic GxE examples
         run: |
           example_dir=$(mktemp -d)

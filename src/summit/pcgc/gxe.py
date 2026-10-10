@@ -209,7 +209,7 @@ def _omega(theta, q):
     return out
 
 
-def fit_gxe(moments, *, block_ids=None):
+def fit_gxe(moments, *, block_ids=None,native=True,threads=None):
     """Estimate every annotation/context covariance; never PSD-clip estimates."""
     H, b = moments.equations()
     theta, diagnostics = solve(H, b)
@@ -277,7 +277,7 @@ def fit_gxe(moments, *, block_ids=None):
         if "covariance" in result:
             result["snp_block_covariance"] = result["covariance"]
             result["snp_block_standard_errors"] = result["standard_errors"]
-        result.update(sampling_inference(moments,theta,H,contrast))
+        result.update(sampling_inference(moments,theta,H,contrast,native=native,threads=threads))
         result["omega_standard_errors"] = _omega(result["standard_errors"],q).tolist()
     return result
 
@@ -341,7 +341,7 @@ def plan_gxe_reference(*, num_samples, num_variants, num_contexts, num_annotatio
         if type(sampling_partners) is not int or sampling_partners < 2:
             raise ValueError("sampling partners must be zero or an integer >=2")
         reserve += sampling_workspace_bytes(n,m,q,k,sampling_partners,block_size,risk_rank,architecture_probes)
-        reserve += 8*(4*probes*(k*p)**2+2*b*min(probes,64)+k*min(probes,64))
+        reserve += 8*(4*probes*(k*p)**2+4*b*(min(probes,64)+k)+k*min(probes,64))
     elif architecture_probes:
         raise ValueError("architecture inference requires individual-sampling partners")
     score = 8*((n+m)*(q+p)+n*b+n*k+m*t*k+n*t+(n+b)*(p+t*k)+p*(n+k))
@@ -385,7 +385,7 @@ def prepare_gxe_moments(operator, annotations, risk, contexts, method="pcgc", *,
             raise ValueError("sampling partners must be zero or an integer >=2")
         reserve += sampling_workspace_bytes(n,m,q,k,sampling_partners,options.get("block_size",256),risk_rank,architecture_probes)
         probes = options.get("probes",256)
-        reserve += 8*(4*probes*(k*p)**2+2*min(m,options.get("block_size",256))*min(probes,64)+k*min(probes,64))
+        reserve += 8*(4*probes*(k*p)**2+4*min(m,options.get("block_size",256))*(min(probes,64)+k)+k*min(probes,64))
     elif risk_covariates is not None:
         raise ValueError("risk inference covariates require individual-sampling inference")
     elif architecture_probes:
@@ -398,7 +398,8 @@ def prepare_gxe_moments(operator, annotations, risk, contexts, method="pcgc", *,
         genotype_format=operator.genotype_format,sampling_partners=sampling_partners,risk_rank=risk_rank,architecture_probes=architecture_probes)
     if sampling_partners:
         from .reference import ProbeGramCollector
-        probe_collector = ProbeGramCollector(a,q,options.get("probes",256),n)
+        probe_collector = ProbeGramCollector(a,q,options.get("probes",256),n,
+            native=options.get("native",True),threads=options.get("threads",1))
         response = risk.z/(risk.sensitivity/sd) if method == "pcgc-inverse" else risk.z
         sampler = SamplingOperator(operator,a,phi,risk,sd,psi,response,method,
             partners=sampling_partners,seed=sampling_seed,risk_covariates=risk_covariates,
@@ -501,7 +502,7 @@ def prepare_gxe_external(operator, reference_operator, annotations, risk, contex
             raise ValueError("sampling partners must be zero or an integer >=2")
         reserve += sampling_workspace_bytes(n,m,q,k,sampling_partners,block_size,risk_rank,architecture_probes)
         probes = options.get("probes",256)
-        reserve += 8*(4*probes*(k*p)**2+4*probes*k*k)
+        reserve += 8*(4*probes*(k*p)**2+4*probes*k*k+4*min(m,block_size)*(min(probes,64)+k))
         from .reference_sampling import reference_sampling_workspace_bytes
         reserve += reference_sampling_workspace_bytes(reference_operator.num_samples,k,sampling_partners,block_size)
     elif risk_covariates is not None:
@@ -517,7 +518,8 @@ def prepare_gxe_external(operator, reference_operator, annotations, risk, contex
         block_size=block_size, threads=threads, genotype_format=reference_operator.genotype_format)
     if sampling_partners:
         from .reference import ProbeGramCollector
-        probe_collector = ProbeGramCollector(a,1,options.get("probes",256),reference_operator.num_samples)
+        probe_collector = ProbeGramCollector(a,1,options.get("probes",256),reference_operator.num_samples,
+            native=native,threads=threads)
         sampler = SamplingOperator(operator,a,phi,risk,sd,psi,risk.z,"pcgc-ld",
             partners=sampling_partners,seed=sampling_seed,risk_covariates=risk_covariates,
             threads=threads,native=native,

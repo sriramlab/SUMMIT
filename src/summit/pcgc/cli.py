@@ -208,7 +208,7 @@ def run(args, argv):
         blocks = JackknifeDesign.from_trace_view(view, JackknifeSpec.parse(count)).unit_id
         if contextual:
             from .gxe_cli import fit as fit_contextual
-            result = fit_contextual(artifact, blocks)
+            result = fit_contextual(artifact, blocks, threads=args.num_threads)
         else:
             result = fit_moments(artifact.moments, block_ids=blocks)
             result.update(kind="summit.pcgc.fit", schema_version=2, input_manifest_hash=artifact.manifest["manifest_hash"],

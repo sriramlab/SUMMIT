@@ -41,7 +41,7 @@ def test_rank_one_probe_equations_and_reference_sampling_share_two_passes(native
     n,m,B = 47,31,71
     x = rng.normal(size=(n,m))
     a = np.column_stack((np.ones(m),rng.uniform(.2,1,m)))
-    collector = ProbeGramCollector(a,1,B,n)
+    collector = ProbeGramCollector(a,1,B,n,native=native,threads=prediction_threads())
     sampler = ReferenceSamplingOperator(Operator(x),a,partners=12,seed=411,threads=prediction_threads(),native=native)
     pop,_ = population_ld_reference(sampler,a,probes=B,seed=777,block_size=7,native=native,
         threads=prediction_threads(),probe_square_sink=collector.add_squared)
@@ -76,3 +76,14 @@ def test_reference_pair_covariance_and_partner_noise_correction():
         draws.append(reference_pair_covariance(kernels[np.arange(n)[:,None],indices]))
     draws = np.asarray(draws)
     np.testing.assert_array_less(np.abs(draws.mean(0)-target),4.5*draws.std(0,ddof=1)/np.sqrt(len(draws))+1e-16)
+
+
+@pytest.mark.parametrize('native',[False,True])
+def test_large_reference_pair_normalization_matches_row_moments(native):
+    n = 337534
+    values = (1+np.arange(n)%3).astype(float)
+    # Identical partners within each row make the partner-noise term zero.
+    pairs = np.repeat(values[:,None,None],2,axis=1)
+    expected = (4*n-6)*np.var(values**2)/((n-2)*(n-3))
+    np.testing.assert_allclose(reference_pair_covariance(pairs,native=native,threads=prediction_threads()),
+        [[expected]],rtol=1e-11,atol=0)

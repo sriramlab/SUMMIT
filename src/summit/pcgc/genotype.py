@@ -11,6 +11,25 @@ from .reference import prepare_moments, population_ld_reference, reference_prove
 from .moments import method_vectors, external_ld_moments
 
 
+def accumulate_relatedness(genotype,annotations,partners,relatedness,*,nn,native,threads):
+    """Add sampled genotype-pair products using the shared decoded block."""
+    x = np.ascontiguousarray(genotype)
+    n,l,k = relatedness.shape
+    values = relatedness.reshape(n*l,k)
+    a = np.asfortranarray(annotations)
+    if native:
+        return bool(nn._module.pcgc_accumulate_relatedness(x,a,
+            np.ascontiguousarray(partners,dtype=np.int64),values,threads))
+    width = max(1,2**20//x.shape[1])
+    other = partners.ravel()
+    for first in range(0,n*l,width):
+        last = min(n*l,first+width)
+        rows = np.arange(first,last)//l
+        products = np.asfortranarray(x[rows]*x[other[first:last]])
+        values[first:last] += nn.matmul(products,a)
+    return bool(np.all(np.count_nonzero(a,axis=1)<=1))
+
+
 def scaled_file_operator(source, scale, rows, *, block_size=256, threads=1, native=True, variant_indices=None):
     rows = indices(rows, name="binary sample rows", size=len(source.samples))
     if np.any(np.diff(rows) <= 0):

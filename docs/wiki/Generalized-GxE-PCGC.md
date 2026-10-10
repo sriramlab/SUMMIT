@@ -198,6 +198,12 @@ participant-by-participant matrices. More contexts and annotations increase
 memory and work; `--memory-gib` budgets workspace, so allow additional process
 memory when sizing jobs.
 
+All four modes use SUMMIT's native genotype readers and protected matrix
+products. Sampled-pair relatedness, covariance preparation, and SNP-effect
+trace calculations also run in the compiled extension. Python handles risk
+fitting, preparation order, and the small estimating equations.
+`--num-threads` controls native work during preparation and fitting.
+
 `summit.context.binary` exposes `prepare_gxe_moments`, `prepare_gxe_external`,
 `fit_gxe`, `evaluate_contexts`, and `plan_gxe_reference`. File-backed
 preparation is available through
