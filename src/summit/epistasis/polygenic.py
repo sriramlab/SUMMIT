@@ -232,6 +232,44 @@ class PolygenicKernels:
         out[q+1:] = self.noise.T@(v*v)
         return out
 
+    def component_grams(self, vectors, *, phase='polygenic_component_grams'):
+        """V' K_k V and tr(K_k), sharing one existing genotype traversal.
+
+        Retain only coefficient-space Gram matrices, never K_k V or N x N.
+        All expensive products use the shared native prediction machinery.
+        The traces also bound the PSD kernel operator norms for scale envelopes.
+        """
+        v = np.asarray(vectors, float)
+        n, q = len(self.rows), self.contexts.shape[1]
+        if v.ndim != 2 or len(v) != n or not v.shape[1] or not np.all(np.isfinite(v)):
+            raise ValueError('finite aligned covariance Gram vectors required')
+        b = v.shape[1]
+        needed = self.base_bytes + 8*(3*n*b + self.count*b*b + 4*self.stream.block_size*b)
+        if needed > self.memory_bytes:
+            raise MemoryError('component Gram contraction exceeds memory budget')
+        gram, trace = np.zeros((self.count,b,b)), np.zeros(self.count)
+        mass = float(len(self.variants))
+        self.stream.ledger.operator_calls += 1
+        self.stream.ledger.active_rhs.append((q+1)*b)
+        for start, selected, raw in self.stream.blocks(phase):
+            for kind in range(2):
+                g = self._block(raw,start,len(selected),kind)
+                squares = np.einsum('ij,ij->i',g,g)/mass
+                for k in (range(q) if kind == 0 else (q,)):
+                    context = self.contexts[:,k] if kind == 0 else None
+                    packed = v*context[:,None] if context is not None else v
+                    inner = self.product(g,packed,transpose=True)
+                    gram[k] += self.product(inner,inner,transpose=True)/mass
+                    trace[k] += squares @ (context*context) if context is not None else squares.sum()
+        for j in range(self.noise.shape[1]):
+            weighted = v*np.sqrt(self.noise[:,j,None])
+            gram[q+1+j] = self.product(weighted,weighted,transpose=True)
+            trace[q+1+j] = self.noise[:,j].sum()
+        if not np.all(np.isfinite(gram)) or not np.all(np.isfinite(trace)):
+            raise ArithmeticError('nonfinite covariance Gram contraction')
+        return dict(gram=(gram+gram.transpose(0,2,1))/2,trace=trace,
+                    operator_identity=self.identity)
+
     def cross_products(self, vectors, input_index, output_index, coefficients=None,
                        *, phase='polygenic_cross_product'):
         """K[output,input] times vectors and each input quadratic form.
@@ -497,10 +535,7 @@ def estimate_components(operator, y, geometry, *, return_uncertainty=False):
         residual = weights[:,None]*project(geometry['basis'],weights[:,None]*y)
     products = operator.apply(residual, phase="polygenic_trait_moments")
     moments = np.einsum("nb,knb->kb", residual, products)/geometry["norms"][:, None]
-    values, vectors = np.linalg.eigh(geometry["h"])
-    root = np.sqrt(values)[:, None]*vectors.T
-    rhs = (vectors.T@moments)/np.sqrt(values)[:, None]
-    theta = np.column_stack([nnls(root, r)[0]/geometry["norms"] for r in rhs.T])
+    theta = components_from_normalized_moments(moments, geometry)
     if not return_uncertainty:
         return theta
     # B_k = T K_k T, T = D P_(DC) D. Reuse K_k T y from the fit.
@@ -550,6 +585,20 @@ def estimate_components(operator, y, geometry, *, return_uncertainty=False):
         covariance = inverse@omega@inverse.T
         sampling.append((covariance+covariance.T)/2)
     return theta, dict(sampling=np.asarray(sampling),trace=np.asarray(trace))
+
+
+def components_from_normalized_moments(moments, geometry):
+    """Shared nonnegative HE solve for phenotype or precontracted moments."""
+    moments = np.asarray(moments,float)
+    if (moments.ndim != 2 or moments.shape[0] != len(geometry['norms'])
+            or not np.all(np.isfinite(moments))):
+        raise ValueError('finite normalized covariance moment columns required')
+    values, vectors = np.linalg.eigh(geometry['h'])
+    if values[0] <= 0:
+        raise ValueError('positive definite covariance moment geometry required')
+    root = np.sqrt(values)[:, None]*vectors.T
+    rhs = (vectors.T@moments)/np.sqrt(values)[:, None]
+    return np.column_stack([nnls(root,r)[0]/geometry['norms'] for r in rhs.T])
 
 
 def conditional_variance_precision(complete, i0, i1, fitted, theta, uncertainty, *, training=None):
