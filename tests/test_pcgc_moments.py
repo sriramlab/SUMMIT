@@ -79,7 +79,11 @@ def test_shared_basis_contracts_exactly_with_common_probes():
                                   basis=phi, coefficients=c, allow_basis_approximation=True, **options)
     assert diag["basis_relative_error"] > 0
     f = (phi @ c)[:, None]*x
-    np.testing.assert_allclose(approx.ldscores, dl-(f*f).T @ ((f*f) @ a)/len(x)**2, rtol=2e-14)
+    diagonal = (f*f).T @ ((f*f) @ a)/len(x)**2
+    # Subtraction can leave small off-diagonal scores. Bound rounding in the
+    # two input moments as well as relative error in the remaining score.
+    rounding = 8*np.finfo(float).eps*np.max(np.abs(dl)+np.abs(diagonal))
+    np.testing.assert_allclose(approx.ldscores, dl-diagonal, rtol=2e-14, atol=rounding)
 
 
 def test_exact_basis_checks_tiny_individual_sensitivities_not_just_global_norm():
