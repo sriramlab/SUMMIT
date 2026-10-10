@@ -20,7 +20,8 @@ from summit.epistasis.scale_polygenic import prepare_polygenic_scale, boxcox_pol
 from summit.epistasis.scale_workflow import protected_scale_products
 
 
-def study(*, n, replicates, continuous_replicates, case, seed, threads):
+def study(*, n, replicates, continuous_replicates, case, seed, threads,
+          max_evaluations=65, continuous_indices=None):
     start=time.monotonic(); rng=np.random.default_rng(seed); m=256; p=6
     nn,tn,products=protected_scale_products(threads)
     z=rng.normal(size=n)
@@ -53,6 +54,8 @@ def study(*, n, replicates, continuous_replicates, case, seed, threads):
     covariance=np.einsum('k,kij->ij',theta,g.grams)
     inverse=np.linalg.inv(covariance)
     counts={name:{'0.05':0,'0.01':0} for name in ('oracle','plugin_omnibus','plugin_sparse_hybrid')}
+    selected=set(range(continuous_replicates)) if continuous_indices is None else set(continuous_indices)
+    if not selected<=set(range(replicates)):raise ValueError('continuous repetition outside generated range')
     continuous=[]; boundaries=np.zeros(5,int); discrepancy=0.
     for begin in range(0,replicates,32):
         r=min(32,replicates-begin)
@@ -75,14 +78,14 @@ def study(*, n, replicates, continuous_replicates, case, seed, threads):
                         plugin_sparse_hybrid=min(1.,2*min(full,sparse)))
             for name,value in values.items():
                 for threshold in counts[name]:counts[name][threshold]+=int(value<float(threshold))
-            if begin+j<continuous_replicates:
+            if begin+j in selected:
                 y=np.exp(.3*latent[:,j])
-                result=boxcox_polygenic_scale_test(g,y[a],y[b],bounds=(-2.,2.),alpha=.05,max_evaluations=65)
+                result=boxcox_polygenic_scale_test(g,y[a],y[b],bounds=(-2.,2.),alpha=.05,max_evaluations=max_evaluations)
                 point=next(x for x in result['points'] if x['power']==0.)
                 discrepancy=max(discrepancy,abs(point['p']['joint']-full))
                 test=result['tests']['joint']
                 if test['p_upper']+1e-10<full:raise ArithmeticError('continuous envelope below true-scale p')
-                continuous.append(dict(**test,evaluations=result['evaluations']))
+                continuous.append(dict(**test,replicate=begin+j,evaluations=result['evaluations']))
         print(json.dumps(dict(phase='benchmark',case=case,n=n,completed=begin+r,seconds=time.monotonic()-start)),flush=True)
     rates={name:{threshold:dict(count=count,rate=count/replicates,
             interval95=[float(beta_dist.ppf(.025,count,replicates-count+1)) if count else 0.,
@@ -92,6 +95,7 @@ def study(*, n, replicates, continuous_replicates, case, seed, threads):
     return dict(n=n,training_n=len(a),markers=m,features=p,case=case,replicates=replicates,seed=seed,
         related_cross_split_pairs=related,true_components=theta.tolist(),pointwise=rates,
         boundary_counts=boundaries.tolist(),continuous=continuous,true_point_max_discrepancy=discrepancy,
+        max_evaluations=max_evaluations,continuous_indices=sorted(selected),
         diagnostics=g.diagnostics,seconds=time.monotonic()-start,
         native_execution={k:native[k] for k in ('gemm_status','output_numa_status','gemm_record_count')},
         scope='Focused nominal-tail model calibration; not extreme-tail certification or real-model adequacy.')
@@ -101,13 +105,16 @@ def main():
     parser=argparse.ArgumentParser(__doc__)
     parser.add_argument('--n',type=int,default=8192);parser.add_argument('--replicates',type=int,default=1024)
     parser.add_argument('--continuous-replicates',type=int,default=32)
+    parser.add_argument('--continuous-indices',type=int,nargs='+')
+    parser.add_argument('--max-evaluations',type=int,default=65)
     parser.add_argument('--case',choices=('null','boundary','sparse','diffuse','heavy_noise'),default='null')
     parser.add_argument('--seed',type=int,default=731401);parser.add_argument('--threads',type=int,default=1)
     parser.add_argument('--out',type=Path,required=True)
     args=parser.parse_args()
     if args.out.exists():raise FileExistsError(args.out)
     result=study(n=args.n,replicates=args.replicates,continuous_replicates=args.continuous_replicates,
-                 case=args.case,seed=args.seed,threads=args.threads)
+                 case=args.case,seed=args.seed,threads=args.threads,max_evaluations=args.max_evaluations,
+                 continuous_indices=args.continuous_indices)
     with args.out.open('x') as f:json.dump(result,f,indent=2,allow_nan=False);f.write('\n')
 
 
