@@ -204,6 +204,13 @@ trace calculations also run in the compiled extension. Python handles risk
 fitting, preparation order, and the small estimating equations.
 `--num-threads` controls native work during preparation and fitting.
 
+Reference LD scores use randomized variant probes. Sampling covariance reuses
+the genotype passes and accumulates sampled-pair moments. Products shared by
+annotation and context combinations are evaluated once, then expanded into
+the full coefficient covariance. This is an algebraic simplification and adds
+no Monte Carlo approximation. Gaussian SNP-effect covariance uses separate
+probe families and four participant groups.
+
 `summit.context.binary` exposes `prepare_gxe_moments`, `prepare_gxe_external`,
 `fit_gxe`, `evaluate_contexts`, and `plan_gxe_reference`. File-backed
 preparation is available through

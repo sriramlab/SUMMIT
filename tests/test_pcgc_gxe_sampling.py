@@ -81,7 +81,8 @@ def test_exact_sampling_polynomial_matches_dense_u_statistic(inverse):
 
 
 @pytest.mark.parametrize('overlapping',[False,True])
-def test_multi_annotation_covariance_polynomial_matches_dense_pairs(overlapping):
+@pytest.mark.parametrize('native',[False,True])
+def test_multi_annotation_covariance_polynomial_matches_dense_pairs(overlapping,native):
     data,_,_ = fixture(n=24,m=31)
     x,risk,sd,response = (data[name] for name in ('x','risk','sd','response'))
     n,m = x.shape
@@ -107,7 +108,8 @@ def test_multi_annotation_covariance_polynomial_matches_dense_pairs(overlapping)
         pair_kernels=bases[np.arange(n)[:,None],partners],partners=partners,sampled=False,
         kernel_actions=np.einsum('cij,j->ic',kernels,response),
         genotype_diagonal=np.stack([np.diag(bases[:,:,a]) for a in range(2)],axis=1),
-        contexts=phi,features=features,response=response,risk=risk,sd=sd,method='pcgc')
+        contexts=phi,features=features,response=response,risk=risk,sd=sd,method='pcgc',
+        native=native,threads=prediction_threads())
     for theta in [np.zeros(c),np.linspace(-.03,.08,c),np.linspace(.15,-.1,c)]:
         residual = kernels*(np.outer(response,response)-np.einsum('c,cij->ij',theta,kernels))
         rows = center_strata(residual.sum(2).T,risk.z>0)

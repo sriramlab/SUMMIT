@@ -152,13 +152,115 @@ def sampling_panel_bytes(people,partners,c,p,s):
     return 8*(people*partners*(3*s+3*c+p+2)+people*s)
 
 
+def factorized_pair_plan(k,q):
+    """Admit exact annotation/context moments when their products are smaller."""
+    from math import comb
+    p = q*(q+1)//2
+    c = k*p
+    s = c*(c+1)//2
+    compact = k*(k+1)//2*p*(p+1)//2
+    sizes = [(comb(k+d-1,d),comb(q+d-1,d)*(comb(q+d-1,d)+1)//2) for d in (2,3,4)]
+    work = sizes[0][0]*sizes[0][1]+sizes[1][0]*sizes[1][1]+2*sizes[2][0]*sizes[2][1]
+    ordinary = c*c+c*s+2*s*s
+    panel = max(a+(2 if d == 4 else 1)*b+2*comb(q+d-1,d)+3 for d,(a,b) in zip((2,3,4),sizes))
+    return work < ordinary/2 and panel <= 3*compact+3*c+p+2 and k**4+p**4 <= 2**20
+
+
+def _symmetric_power_basis(size,degree):
+    from itertools import combinations_with_replacement,permutations
+    powers = np.asarray(list(combinations_with_replacement(range(size),degree)),dtype=np.int64)
+    index = np.empty((size,)*degree,dtype=np.int64)
+    for j,power in enumerate(powers):
+        for orientation in set(permutations(power)):
+            index[orientation] = j
+    return powers,index
+
+
+def _context_power_expansion(q,degree):
+    """Expand products of symmetric context kernels into person monomials."""
+    from itertools import product
+    from .gxe import context_pairs
+    pairs = context_pairs(q)
+    powers,lookup = _symmetric_power_basis(q,degree)
+    kernel_powers,kernel_lookup = _symmetric_power_basis(len(pairs),degree)
+    expansion = np.zeros((len(powers)**2,len(kernel_powers)),order='F')
+    for column,indices in enumerate(kernel_powers):
+        choices = [((u,v),) if u == v else ((u,v),(v,u)) for u,v in (pairs[i] for i in indices)]
+        for orientation in product(*choices):
+            left,right = zip(*orientation)
+            expansion[lookup[left]*len(powers)+lookup[right],column] += 1
+    # Every h_p is symmetric in the two people. Its expansion has equal
+    # coefficients at (alpha,beta) and (beta,alpha), even with asymmetric
+    # proposal weights. Sum those two monomials within each sampled pair.
+    i,j = np.triu_indices(len(powers))
+    return powers,np.asfortranarray(expansion.reshape(len(powers),len(powers),-1)[i,j]),kernel_lookup
+
+
+def _factorized_pair_reduction(base,partner,features,response,probabilities,leverage,pairs,upper,
+                               sampled,products,execution):
+    """Exact degree-2/3/4 moments of r_a(i,j) h_p(i,j).
+
+    Each product factors into a monomial in annotation relatedness and one in
+    each person's contexts. Accumulate those moments before expanding the
+    component axes. The proposal weights and partner-noise correction are
+    identical to the direct pair-feature reducer.
+    """
+    n,l,k = base.shape
+    q = features.shape[1]
+    p,c,s = len(pairs),k*len(pairs),len(upper)
+    bases = []
+    for degree in (2,3,4):
+        annotation_powers,annotation_lookup = _symmetric_power_basis(k,degree)
+        context_powers,expansion,context_lookup = _context_power_expansion(q,degree)
+        moments = np.zeros((len(annotation_powers),len(expansion)*(2 if sampled and degree == 4 else 1)))
+        bases.append((annotation_powers,annotation_lookup,context_powers,expansion,context_lookup,moments))
+    hrow = np.empty((n,s),order='F')
+    width = sampling_tile_people(n,l)
+    probability_input = np.empty(0) if probabilities is None else np.ascontiguousarray(probabilities)
+    arguments = (np.ascontiguousarray(base).reshape(n*l,k),np.ascontiguousarray(partner,dtype=np.int64),
+                 np.ascontiguousarray(features),np.ascontiguousarray(response),probability_input,
+                 np.ascontiguousarray(leverage))
+    for first in range(0,n,width):
+        last = min(n,first+width)
+        budget = sampling_panel_bytes(last-first,l,c,p,s)
+        for degree,(ap,_,cp,_,_,moments) in zip((2,3,4),bases):
+            left,right = map(np.asarray,products.module.pcgc_factored_pair_panel(
+                *arguments,ap,cp,first,last,sampled and degree == 4,budget,products.threads))
+            moments += products.tn(left,right)
+            del left,right
+        hrow[first:last] = products.module.pcgc_pair_means(arguments[0],arguments[1],arguments[2],
+            probability_input,np.asarray(pairs,dtype=np.int64),upper,first,last,budget,products.threads)
+        products.drain()
+    columns = np.arange(c)
+    slots = ((columns[:,None],columns[None,:]),
+             (columns[:,None],upper[None,:,0],upper[None,:,1]),
+             (upper[:,None,0],upper[:,None,1],upper[None,:,0],upper[None,:,1]))
+    results = []
+    for (_,ai,cp,expansion,ci,moments),indices in zip(bases,slots):
+        annotation = ai[tuple(i//p for i in indices)]
+        context = ci[tuple(i%p for i in indices)]
+        chunks = np.split(moments,moments.shape[1]//len(expansion),axis=1)
+        for chunk in chunks:
+            expanded = products.nn(chunk,expansion)
+            results.append(expanded[annotation,context])
+    t0,t1,t2 = results[:3]
+    mc = ((results[3]-products.tn(hrow,leverage[:,None]*hrow))/(l-1)
+          if sampled else np.zeros_like(t2))
+    if execution is not None:
+        execution.update(pair_reduction='annotation_context_monomials',
+            pair_moment_dimensions=[list(b[-1].shape) for b in bases])
+    return hrow,t0,t1,t2,mc
+
+
 def sampling_workspace_bytes(n,m,q,k,partners,block_size,risk_rank=0,architecture_probes=0):
     c = k*q*(q+1)//2
     j = 2*c+1
     b = min(m,block_size)
     packed = c*(c+1)//2
     # Pair identities/relatedness, score/actions/diagonals, nuisance arrays,
-    # covariance tensors, assembly copies, and bounded product scratch.
+    # covariance tensors, assembly copies, and bounded product scratch. The
+    # N x block reserve also covers architecture group gathers and protected
+    # genotype snapshots; those execute after sampled-relatedness accumulation.
     # Four copies of the packed influence panel cover the resident values,
     # protected input snapshots, and nuisance/centering scratch.
     result = 8*(n*partners*(k+1)+m*q+n*(6*c+3*k+8*risk_rank+4*packed)+n*b
@@ -212,7 +314,8 @@ class SamplingOperator:
             from summit.prediction.genotype import native_module
             module = native_module()
             required = ("pcgc_accumulate_relatedness","pcgc_pair_panels","pcgc_center_strata",
-                        "pcgc_sampling_direction_terms","pcgc_architecture_features","pcgc_architecture_polynomials")
+                        "pcgc_sampling_direction_terms","pcgc_architecture_features","pcgc_architecture_polynomials",
+                        "pcgc_factored_pair_panel","pcgc_pair_means")
             if any(not callable(getattr(module,name,None)) for name in required):
                 raise RuntimeError("native extension lacks PCGC moment kernels; rebuild SUMMIT")
         self.operator = operator
@@ -361,6 +464,7 @@ def build_sampling_moments(*, pair_kernels, partners, kernel_actions, genotype_d
     from summit.ldscore.matrix_products import MatrixProducts
     products_backend = MatrixProducts(native=native,threads=threads)
     context_only = reference_annotation_gram is not None
+    factorized = native and not context_only and factorized_pair_plan(k,q)
     dimension = p if context_only else c
     upper = np.column_stack(np.triu_indices(dimension)).astype(np.int64)
     pair_index = np.empty((dimension,dimension),dtype=np.int64)
@@ -377,8 +481,17 @@ def build_sampling_moments(*, pair_kernels, partners, kernel_actions, genotype_d
     else:
         index = pair_index
         multiplier = np.ones((c,c))
+        if factorized:
+            # r_a h_u r_b h_v = r_a r_b h_u h_v: annotation and context
+            # pairs can each be packed independently before person reduction.
+            ap,ai = _symmetric_power_basis(k,2)
+            cp,ci = _symmetric_power_basis(p,2)
+            upper = np.column_stack(((ap[:,None,0]*p+cp[None,:,0]).ravel(),
+                                     (ap[:,None,1]*p+cp[None,:,1]).ravel()))
+            columns = np.arange(c)
+            index = ai[columns[:,None]//p,columns[None,:]//p]*len(cp)+ci[columns[:,None]%p,columns[None,:]%p]
     s = len(upper)
-    hrow = np.empty((n,s),order="F")
+    hrow = None if factorized else np.empty((n,s),order="F")
     t0 = np.zeros((c,c))
     t1 = np.zeros((c,s))
     t2 = np.zeros((s,s))
@@ -397,7 +510,12 @@ def build_sampling_moments(*, pair_kernels, partners, kernel_actions, genotype_d
         probability_input = np.empty(0) if probabilities is None else np.ascontiguousarray(probabilities)
     from time import perf_counter
     started = perf_counter()
-    for start in range(0,n,width):
+    if factorized:
+        hrow,t0,t1,t2,mc = _factorized_pair_reduction(base,partner,features,response,probabilities,
+            leverage,pairs,upper,sampled,products_backend,execution)
+    elif execution is not None:
+        execution['pair_reduction'] = 'direct_pair_products'
+    for start in (() if factorized else range(0,n,width)):
         stop = min(n,start+width)
         if native:
             panels = panel_function(base.reshape(n*l,k),partner,features,response,probability_input,

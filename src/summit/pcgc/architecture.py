@@ -38,6 +38,9 @@ class ArchitectureSketch:
                 selected = rows[self.group[rows] == group]
                 self.weights[selected] = len(rows)/n/len(selected)
         self.source = np.zeros((n,k,probes))
+        self.group_rows = tuple(np.flatnonzero(self.group == g) for g in range(4))
+        self.family_rows = (np.flatnonzero(np.isin(self.group,(0,3))),
+                            np.flatnonzero(np.isin(self.group,(1,2))))
         d = k*q*probes
         self.left = np.zeros((k*len(self.pairs),d,d))
         self.right = np.zeros_like(self.left)
@@ -53,32 +56,41 @@ class ArchitectureSketch:
         k = self.annotations.shape[1]
         a = self.annotations[start:stop]/self.mass
         if pass_number == 1:
-            for family,groups in (('a',(0,3)),('b',(1,2))):
+            for family,selected in zip(('a','b'),self.family_rows):
                 probe = self.probe_block(start,stop,family)
-                selected = np.isin(self.group,groups)
                 for annotation in range(k):
-                    values = self.nn.matmul(x,np.asfortranarray(np.sqrt(a[:,annotation,None])*probe))
-                    self.source[selected,annotation,:] += values[selected]
+                    active = np.flatnonzero(a[:,annotation])
+                    if not len(active):
+                        continue
+                    values = self.nn.matmul(np.asfortranarray(x[np.ix_(selected,active)]),
+                        np.asfortranarray(np.sqrt(a[active,annotation,None])*probe[active]))
+                    self.source[selected,annotation,:] += values
         elif pass_number == 2:
             d = k*q*self.probes
             cross = np.empty((4,stop-start,q,d))
             source = self.source.reshape(n,-1)
-            for group in range(4):
-                base_weight = self.weights*(self.group == group)
-                for u in range(q):
-                    for v in range(q):
-                        weights = base_weight*self.features[:,u]*self.features[:,v]
-                        value = self.tn.matmul_tn(x,np.asfortranarray(source*weights[:,None])).reshape(stop-start,k,self.probes)
-                        cross[group,:,u,:].reshape(stop-start,k,q,self.probes)[:,:,v,:] = value
+            for group,selected in enumerate(self.group_rows):
+                genotype = np.asfortranarray(x[selected])
+                group_source = source[selected]
+                for u,v in self.pairs:
+                    weights = self.weights[selected]*self.features[selected,u]*self.features[selected,v]
+                    value = self.tn.matmul_tn(genotype,np.asfortranarray(group_source*weights[:,None])).reshape(stop-start,k,self.probes)
+                    cross[group,:,u,:].reshape(stop-start,k,q,self.probes)[:,:,v,:] = value
+                    if u != v:
+                        cross[group,:,v,:].reshape(stop-start,k,q,self.probes)[:,:,u,:] = value
+                del genotype,group_source
             for annotation in range(k):
+                active = np.flatnonzero(a[:,annotation])
+                if not len(active):
+                    continue
                 for p,(u,v) in enumerate(self.pairs):
                     orientations = ((u,v),) if u == v else ((u,v),(v,u))
                     c = annotation*len(self.pairs)+p
                     for left,right in orientations:
-                        self.left[c] += self.tn.matmul_tn(np.asfortranarray(cross[0,:,left]),
-                            np.asfortranarray(a[:,annotation,None]*cross[1,:,right]))
-                        self.right[c] += self.tn.matmul_tn(np.asfortranarray(cross[2,:,left]),
-                            np.asfortranarray(a[:,annotation,None]*cross[3,:,right]))
+                        self.left[c] += self.tn.matmul_tn(np.asfortranarray(cross[0,active,left]),
+                            np.asfortranarray(a[active,annotation,None]*cross[1,active,right]))
+                        self.right[c] += self.tn.matmul_tn(np.asfortranarray(cross[2,active,left]),
+                            np.asfortranarray(a[active,annotation,None]*cross[3,active,right]))
 
 
 def gaussian_architecture_covariance(theta,q,metric,left,right,probes,*,evaluator=None):

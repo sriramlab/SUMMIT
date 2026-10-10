@@ -202,6 +202,185 @@ nb::tuple pcgc_pair_panels(
     return nb::make_tuple(score_out,weighted_score_out,square_out,weighted_square_out,noise_square_out,mean_out);
 }
 
+// Products of r_a h_p factor into separate annotation and person monomials.
+// The returned panels still go through the shared protected matrix products.
+nb::tuple pcgc_factored_pair_panel(
+    nb_mat2c_ro<double> relatedness, nb_mat2c_ro<int64_t> partners,
+    nb_mat2c_ro<double> features, nb_vec1_ro<double> response,
+    nb_vec1_ro<double> probabilities, nb_vec1_ro<double> leverage,
+    nb_mat2c_ro<int64_t> annotation_powers, nb_mat2c_ro<int64_t> context_powers,
+    int64_t first, int64_t last, bool noise, uint64_t memory_bytes, int threads
+) {
+    validate_protected_gemm_threads(threads);
+    const size_t n=features.shape(0), q=features.shape(1), k=relatedness.shape(1), l=partners.shape(1);
+    const size_t degree=annotation_powers.shape(1), a=annotation_powers.shape(0), f=context_powers.shape(0);
+    if (n<8 || !q || !k || l<2 || !a || !f || degree<2 || degree>4 || (noise && degree!=4) ||
+        context_powers.shape(1)!=degree || partners.shape(0)!=n || response.shape(0)!=n || leverage.shape(0)!=n ||
+        relatedness.shape(0)!=checked_mul(n,l,"PCGC pair count") ||
+        (probabilities.shape(0)!=0 && probabilities.shape(0)!=n) ||
+        first<0 || last<=first || static_cast<uint64_t>(last)>n)
+        throw std::invalid_argument("PCGC factored panel axes disagree");
+    for (size_t j=0;j<checked_mul(a,degree,"PCGC annotation powers");++j)
+        if (annotation_powers.data()[j]<0 || static_cast<uint64_t>(annotation_powers.data()[j])>=k)
+            throw std::invalid_argument("PCGC annotation power is out of range");
+    for (size_t j=0;j<checked_mul(f,degree,"PCGC context powers");++j)
+        if (context_powers.data()[j]<0 || static_cast<uint64_t>(context_powers.data()[j])>=q)
+            throw std::invalid_argument("PCGC context power is out of range");
+    const size_t rows=checked_mul(static_cast<size_t>(last-first),l,"PCGC panel rows");
+    const size_t ff=checked_mul(f,checked_add(f,1,"PCGC context powers"),"PCGC context products")/2;
+    const size_t columns=checked_mul(ff,noise?2:1,"PCGC noise panels");
+    const size_t workspace=checked_mul(rows,checked_add(checked_add(a,columns,"PCGC panels"),
+        checked_add(checked_mul(2,f,"PCGC monomials"),3,"PCGC weights"),"PCGC workspace"),"PCGC panel size");
+    const size_t workspace_bytes=checked_add(checked_mul(workspace,sizeof(double),"PCGC panel bytes"),
+        checked_mul(ff,sizeof(std::pair<size_t,size_t>),"PCGC context index bytes"),"PCGC factored workspace bytes");
+    if (rows>static_cast<size_t>(INT64_MAX) || workspace_bytes>memory_bytes)
+        throw std::runtime_error("PCGC factored panels exceed the admitted workspace");
+    double *left,*right;
+    auto left_out=make_owned_numpy_mat2f<double>(rows,a,&left);
+    auto right_out=make_owned_numpy_mat2f<double>(rows,columns,&right);
+    std::vector<double> own(checked_mul(rows,f,"PCGC own monomials")),other(own.size()),weight(rows),noise_weight(rows);
+    std::vector<int64_t> neighbor(rows);
+    std::vector<std::pair<size_t,size_t>> context_products;
+    context_products.reserve(ff);
+    for (size_t u=0;u<f;++u) for (size_t v=u;v<f;++v) context_products.emplace_back(u,v);
+    int invalid=0;
+    {
+        nb::gil_scoped_release release;
+#pragma omp parallel for num_threads(threads) schedule(static) reduction(|:invalid)
+        for (int64_t row=0;row<static_cast<int64_t>(rows);++row) {
+            const size_t i=static_cast<size_t>(first)+static_cast<size_t>(row)/l;
+            const int64_t j=partners.data()[static_cast<size_t>(first)*l+static_cast<size_t>(row)];
+            neighbor[row]=j;
+            if (j<0 || static_cast<uint64_t>(j)>=n || static_cast<size_t>(j)==i) { invalid|=1; continue; }
+            double w=static_cast<double>(n-1);
+            if (probabilities.shape(0)) {
+                const double pi=probabilities.data()[i], pj=probabilities.data()[j];
+                if (!(pi>0. && pi<1. && pj>0. && pj<1.)) invalid|=1;
+                w=(1.-pi)/pj;
+            }
+            const double y=response.data()[i]*response.data()[j];
+            weight[row]=w/static_cast<double>(l)*(degree==2 ? y*y : degree==3 ? y : 1.);
+            noise_weight[row]=noise ? w/static_cast<double>(l)*w*leverage.data()[i] : 0.;
+            invalid |= !std::isfinite(weight[row]) || !std::isfinite(noise_weight[row]);
+        }
+        if (!invalid) {
+#pragma omp parallel for num_threads(threads) schedule(static) reduction(|:invalid)
+            for (int64_t col=0;col<static_cast<int64_t>(a);++col) {
+                for (size_t row=0;row<rows;++row) {
+                    const double* r=relatedness.data()+(static_cast<size_t>(first)*l+row)*k;
+                    double value=1.;
+                    for (size_t d=0;d<degree;++d) value*=r[annotation_powers.data()[static_cast<size_t>(col)*degree+d]];
+                    left[static_cast<size_t>(col)*rows+row]=value;
+                    invalid |= !std::isfinite(value);
+                }
+            }
+#pragma omp parallel for num_threads(threads) schedule(static) reduction(|:invalid)
+            for (int64_t col=0;col<static_cast<int64_t>(f);++col) {
+                for (size_t row=0;row<rows;++row) {
+                    const size_t i=static_cast<size_t>(first)+row/l, j=static_cast<size_t>(neighbor[row]);
+                    double x=1.,y=1.;
+                    for (size_t d=0;d<degree;++d) {
+                        const size_t index=static_cast<size_t>(context_powers.data()[static_cast<size_t>(col)*degree+d]);
+                        x*=features.data()[i*q+index]; y*=features.data()[j*q+index];
+                    }
+                    own[static_cast<size_t>(col)*rows+row]=x; other[static_cast<size_t>(col)*rows+row]=y;
+                    invalid |= !std::isfinite(x) || !std::isfinite(y);
+                }
+            }
+#pragma omp parallel for num_threads(threads) schedule(static) reduction(|:invalid)
+            for (int64_t col=0;col<static_cast<int64_t>(columns);++col) {
+                const size_t index=static_cast<size_t>(col)%ff;
+                const size_t u=context_products[index].first,v=context_products[index].second;
+                const double* w=static_cast<size_t>(col)<ff ? weight.data() : noise_weight.data();
+                for (size_t row=0;row<rows;++row) {
+                    double value=own[u*rows+row]*other[v*rows+row];
+                    if (u!=v) value+=own[v*rows+row]*other[u*rows+row];
+                    value*=w[row];
+                    right[static_cast<size_t>(col)*rows+row]=value;
+                    invalid |= !std::isfinite(value);
+                }
+            }
+        }
+    }
+    if (invalid) throw std::invalid_argument("PCGC factored panels contain invalid partners or non-finite products");
+    return nb::make_tuple(left_out,right_out);
+}
+
+nb_numpy_mat2f<double> pcgc_pair_means(
+    nb_mat2c_ro<double> relatedness, nb_mat2c_ro<int64_t> partners, nb_mat2c_ro<double> features,
+    nb_vec1_ro<double> probabilities, nb_mat2c_ro<int64_t> context_pairs, nb_mat2c_ro<int64_t> square_pairs,
+    int64_t first, int64_t last, uint64_t memory_bytes, int threads
+) {
+    validate_protected_gemm_threads(threads);
+    const size_t n=features.shape(0),q=features.shape(1),k=relatedness.shape(1),l=partners.shape(1);
+    const size_t p=context_pairs.shape(0),s=square_pairs.shape(0),c=checked_mul(k,p,"PCGC components");
+    if (n<8 || !q || !k || l<2 || !p || !s || partners.shape(0)!=n ||
+        relatedness.shape(0)!=checked_mul(n,l,"PCGC pair count") || context_pairs.shape(1)!=2 || square_pairs.shape(1)!=2 ||
+        (probabilities.shape(0)!=0 && probabilities.shape(0)!=n) || first<0 || last<=first || static_cast<uint64_t>(last)>n)
+        throw std::invalid_argument("PCGC pair mean axes disagree");
+    for (size_t j=0;j<checked_mul(p,2,"PCGC context indices");++j)
+        if (context_pairs.data()[j]<0 || static_cast<uint64_t>(context_pairs.data()[j])>=q)
+            throw std::invalid_argument("PCGC context pair is out of range");
+    for (size_t j=0;j<checked_mul(s,2,"PCGC square indices");++j)
+        if (square_pairs.data()[j]<0 || static_cast<uint64_t>(square_pairs.data()[j])>=c)
+            throw std::invalid_argument("PCGC square pair is out of range");
+    const size_t people=static_cast<size_t>(last-first),rows=checked_mul(people,l,"PCGC panel rows");
+    const size_t workspace=checked_add(checked_mul(rows,checked_add(c,1,"PCGC mean columns"),"PCGC mean panels"),
+        checked_mul(people,s,"PCGC means"),"PCGC mean workspace");
+    if (rows>static_cast<size_t>(INT64_MAX) || checked_mul(workspace,sizeof(double),"PCGC mean bytes")>memory_bytes)
+        throw std::runtime_error("PCGC pair means exceed the admitted workspace");
+    double* mean;
+    auto result=make_owned_numpy_mat2f<double>(people,s,&mean);
+    std::vector<double> kernels(checked_mul(rows,c,"PCGC kernels")),weight(rows);
+    int invalid=0;
+    {
+        nb::gil_scoped_release release;
+#pragma omp parallel for num_threads(threads) schedule(static) reduction(|:invalid)
+        for (int64_t row=0;row<static_cast<int64_t>(rows);++row) {
+            const size_t i=static_cast<size_t>(first)+static_cast<size_t>(row)/l;
+            const int64_t j=partners.data()[static_cast<size_t>(first)*l+static_cast<size_t>(row)];
+            if (j<0 || static_cast<uint64_t>(j)>=n || static_cast<size_t>(j)==i) { invalid|=1; continue; }
+            double w=static_cast<double>(n-1);
+            if (probabilities.shape(0)) {
+                const double pi=probabilities.data()[i],pj=probabilities.data()[j];
+                if (!(pi>0. && pi<1. && pj>0. && pj<1.)) invalid|=1;
+                w=(1.-pi)/pj;
+            }
+            weight[row]=w;
+            invalid |= !std::isfinite(w);
+        }
+        if (!invalid) {
+#pragma omp parallel for num_threads(threads) schedule(static) reduction(|:invalid)
+            for (int64_t column=0;column<static_cast<int64_t>(c);++column) {
+                const size_t a=static_cast<size_t>(column)/p,pair=static_cast<size_t>(column)%p;
+                const size_t u=static_cast<size_t>(context_pairs.data()[2*pair]),v=static_cast<size_t>(context_pairs.data()[2*pair+1]);
+                for (size_t row=0;row<rows;++row) {
+                    const size_t offset=static_cast<size_t>(first)*l+row,i=static_cast<size_t>(first)+row/l,j=static_cast<size_t>(partners.data()[offset]);
+                    double h=features.data()[i*q+u]*features.data()[j*q+v];
+                    if (u!=v) h+=features.data()[i*q+v]*features.data()[j*q+u];
+                    kernels[static_cast<size_t>(column)*rows+row]=relatedness.data()[offset*k+a]*h;
+                    invalid |= !std::isfinite(kernels[static_cast<size_t>(column)*rows+row]);
+                }
+            }
+#pragma omp parallel for num_threads(threads) schedule(static) reduction(|:invalid)
+            for (int64_t column=0;column<static_cast<int64_t>(s);++column) {
+                const size_t u=static_cast<size_t>(square_pairs.data()[2*column]),v=static_cast<size_t>(square_pairs.data()[2*column+1]);
+                for (size_t person=0;person<people;++person) {
+                    double sum=0.;
+                    for (size_t draw=0;draw<l;++draw) {
+                        const size_t row=person*l+draw;
+                        sum+=kernels[u*rows+row]*kernels[v*rows+row]*weight[row];
+                    }
+                    mean[static_cast<size_t>(column)*people+person]=sum/static_cast<double>(l);
+                    invalid |= !std::isfinite(sum);
+                }
+            }
+        }
+    }
+    if (invalid) throw std::invalid_argument("PCGC pair means contain invalid partners or non-finite products");
+    return result;
+}
+
 void pcgc_center_strata(nb_mat2f_rw<double> values, nb_vec1_ro<uint8_t> cases, int requested_threads) {
     validate_protected_gemm_threads(requested_threads);
     const size_t n = values.shape(0), columns = values.shape(1);
@@ -407,6 +586,13 @@ void bind_pcgc_moments(nb::module_& module) {
         nb::arg("relatedness"),nb::arg("partners"),nb::arg("features"),nb::arg("response"),
         nb::arg("probabilities"),nb::arg("leverage"),nb::arg("context_pairs"),nb::arg("square_pairs"),
         nb::arg("first"),nb::arg("last"),nb::arg("context_only"),nb::arg("memory_bytes"),nb::arg("threads"));
+    module.def("pcgc_factored_pair_panel", &pcgc_factored_pair_panel,
+        nb::arg("relatedness"),nb::arg("partners"),nb::arg("features"),nb::arg("response"),
+        nb::arg("probabilities"),nb::arg("leverage"),nb::arg("annotation_powers"),nb::arg("context_powers"),
+        nb::arg("first"),nb::arg("last"),nb::arg("noise"),nb::arg("memory_bytes"),nb::arg("threads"));
+    module.def("pcgc_pair_means", &pcgc_pair_means,
+        nb::arg("relatedness"),nb::arg("partners"),nb::arg("features"),nb::arg("probabilities"),
+        nb::arg("context_pairs"),nb::arg("square_pairs"),nb::arg("first"),nb::arg("last"),nb::arg("memory_bytes"),nb::arg("threads"));
     module.def("pcgc_center_strata", &pcgc_center_strata,nb::arg("values"),nb::arg("cases"),nb::arg("threads"));
     module.def("pcgc_column_products", &pcgc_column_products,nb::arg("values"),nb::arg("pairs"),nb::arg("threads"));
     module.def("pcgc_architecture_features", &pcgc_architecture_features,

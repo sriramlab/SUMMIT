@@ -9,6 +9,43 @@ from prediction_helpers import prediction_threads
 
 
 @pytest.mark.parametrize('native',[False,True])
+@pytest.mark.parametrize('overlapping',[False,True])
+def test_group_sketches_match_dense_random_probe_products(native,overlapping):
+    rng=np.random.default_rng(99613)
+    n,m,q,k,b=29,13,3,3,5
+    x=rng.normal(size=(n,m)); phi=rng.normal(size=(n,q))
+    annotation=(rng.uniform(.1,1,(m,k)) if overlapping else np.eye(k)[np.arange(m)%k])
+    threads=prediction_threads()
+    nn=(ProtectedNNOperator if native else NumpyNNOperator)(threads=threads)
+    tn=(ProtectedTNOperator if native else NumpyTNOperator)(threads=threads)
+    sketch=ArchitectureSketch(phi,annotation,np.arange(n)%3==0,probes=b,seed=539,
+        nn=nn,tn=tn,native=native,threads=threads)
+    a=annotation/annotation.sum(0)
+    source=np.zeros_like(sketch.source)
+    for family,groups in (('a',(0,3)),('b',(1,2))):
+        probes=sketch.probe_block(0,m,family)
+        mask=np.isin(sketch.group,groups)
+        for ann in range(k):
+            source[mask,ann]=x[mask]@(np.sqrt(a[:,ann,None])*probes)
+    cross=[]
+    for group in range(4):
+        weights=sketch.weights*(sketch.group==group)
+        cross.append(np.einsum('ij,iu,iv,iab,i->juavb',x,phi,phi,source,weights).reshape(m,q,k*q*b))
+    left=np.zeros_like(sketch.left); right=np.zeros_like(sketch.right)
+    for ann in range(k):
+        for p,(u,v) in enumerate(context_pairs(q)):
+            for s,t in (((u,v),) if u==v else ((u,v),(v,u))):
+                left[ann*len(context_pairs(q))+p]+=cross[0][:,s].T@(a[:,ann,None]*cross[1][:,t])
+                right[ann*len(context_pairs(q))+p]+=cross[2][:,s].T@(a[:,ann,None]*cross[3][:,t])
+    # Singleton blocks include annotations with no SNPs in that block.
+    for traversal in (1,2):
+        for start in range(m):
+            sketch.read_block(traversal,start,start+1,np.asfortranarray(x[:,start:start+1]))
+    for actual,expected in ((sketch.source,source),(sketch.left,left),(sketch.right,right)):
+        np.testing.assert_allclose(actual,expected,rtol=4e-12,atol=2e-14)
+
+
+@pytest.mark.parametrize('native',[False,True])
 def test_four_group_architecture_matches_exact_variant_trace(native):
     rng = np.random.default_rng(3271)
     n,m,q = 32,9,2
