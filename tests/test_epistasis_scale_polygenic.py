@@ -37,6 +37,25 @@ def test_component_grams_match_dense_and_one_pass():
         assert operator.stream.ledger.traversals == {'polygenic_component_grams':1}
 
 
+def test_genomic_products_check_shared_evidence_inside_block_loops(monkeypatch):
+    rng,make,kernels,a,_,_=fixture()
+    operator=make(a)
+    from summit.ldscore.matrix_products import native_execution_evidence
+    assert operator._evidence is native_execution_evidence(operator.native)
+    checks=[];real_check=operator._evidence.check
+    def check():
+        checks.append(True);real_check()
+    monkeypatch.setattr(operator._evidence,'check',check)
+    v=rng.normal(size=(len(a),2))
+    operator.component_grams(v)
+    assert len(checks)>=4*operator.count
+    checks.clear()
+    theta=np.ones((operator.count,2))
+    np.testing.assert_allclose(operator.apply(v,theta),np.sum(kernels[:,a][:,:,a]@v,axis=0),atol=2e-12)
+    # Weighted covariance products have a direct native entry point too.
+    assert len(checks)>=4*((len(operator.variants)+operator.stream.block_size-1)//operator.stream.block_size)
+
+
 @pytest.mark.parametrize('mode',['omnibus','omnibus_sparse'])
 def test_coefficients_covariance_and_scale_bounds_against_dense(mode):
     from scripts.epistasis.conditional_polygenic_reference import fit_covariance

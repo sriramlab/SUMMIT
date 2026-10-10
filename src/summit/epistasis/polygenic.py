@@ -49,12 +49,21 @@ class PolygenicKernels:
     Contexts and diagonal variance surfaces must be fixed without outcomes.
     Missing calls use the saved training means in both cohorts.
     """
-    product = GenotypeOperator.product
+    def product(self, left, right, *, transpose=False):
+        # MatrixProducts and prediction products share process-wide native
+        # telemetry. Genomic loops can outlive its bounded buffer, so drain
+        # through the same collector rather than waiting for a later QR product.
+        self._evidence.check()
+        value = GenotypeOperator.product(self,left,right,transpose=transpose)
+        self._evidence.check()
+        return value
 
     def __init__(self, source, rows, variants, scales, contexts, noise, *,
                  threads=1, block_size=128, memory_bytes=4*2**30, storage="stream", rhs_columns=None):
         self.native = native_module()
         configure_prediction_threads(self.native, threads)
+        from summit.ldscore.matrix_products import native_execution_evidence
+        self._evidence = native_execution_evidence(self.native)
         if not source.hard_calls or storage not in ("stream", "packed"):
             raise ValueError("research covariance requires hard calls and stream/packed storage")
         self.rows, self.variants = np.array(rows, copy=True), np.array(variants, copy=True)
@@ -178,8 +187,10 @@ class PolygenicKernels:
                         prior=np.zeros((end-begin,qk,qk))
                         coefficients=theta[active,begin:end].T if kind==0 else theta[q,begin:end,None]
                         prior[:,np.arange(qk),np.arange(qk)]=coefficients
+                        self._evidence.check()
                         self.native.prediction_covariance_block(g,packed,prior.reshape(end-begin,-1),
                             context,out[:,begin:end],float(len(self.variants)),self.plan.threads,self.workspace)
+                        self._evidence.check()
                         continue
                     left=(self.contexts[:,active,None]*v[:,None,begin:end]).reshape(n,len(active)*(end-begin)) if kind==0 else v[:,begin:end]
                     inner = self.product(g, left, transpose=True)/len(self.variants)
