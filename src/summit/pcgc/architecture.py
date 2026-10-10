@@ -12,7 +12,9 @@ def architecture_workspace_bytes(n,q,k,probes,block_size):
         raise ValueError("architecture probes must be an integer >=2")
     c = k*q*(q+1)//2
     d = k*q*probes
-    return 8*(4*n*k*probes+6*block_size*q*d+7*c*d*d+3*d*d+4*n)
+    # Context products share a larger protected TN call. Reserve its packed
+    # operands/copies and output, as well as the later covariance workspace.
+    return 8*(4*n*k*probes+10*block_size*q*d+max(7*c+3,2*c+3*q*q)*d*d+4*n)
 
 
 class ArchitectureSketch:
@@ -62,35 +64,53 @@ class ArchitectureSketch:
                     active = np.flatnonzero(a[:,annotation])
                     if not len(active):
                         continue
-                    values = self.nn.matmul(np.asfortranarray(x[np.ix_(selected,active)]),
+                    # Gather in the decoded block's column order. The transpose
+                    # is an F-order view, without a second genotype-sized copy.
+                    values = self.nn.matmul(x.T[np.ix_(active,selected)].T,
                         np.asfortranarray(np.sqrt(a[active,annotation,None])*probe[active]))
                     self.source[selected,annotation,:] += values
         elif pass_number == 2:
             d = k*q*self.probes
             cross = np.empty((4,stop-start,q,d))
             source = self.source.reshape(n,-1)
+            width = k*self.probes
+            # Use the spare N*block gather/protected-input allowance for the
+            # grouped RHS and its protected copy. Account for unequal groups;
+            # the existing source allowance covers the single-product case.
+            largest = max(map(len,self.group_rows))
+            batch = min(len(self.pairs),max(1,(n-2*largest)*(stop-start)//(4*largest*width)))
             for group,selected in enumerate(self.group_rows):
-                genotype = np.asfortranarray(x[selected])
-                group_source = source[selected]
-                for u,v in self.pairs:
-                    weights = self.weights[selected]*self.features[selected,u]*self.features[selected,v]
-                    value = self.tn.matmul_tn(genotype,np.asfortranarray(group_source*weights[:,None])).reshape(stop-start,k,self.probes)
-                    cross[group,:,u,:].reshape(stop-start,k,q,self.probes)[:,:,v,:] = value
-                    if u != v:
-                        cross[group,:,v,:].reshape(stop-start,k,q,self.probes)[:,:,u,:] = value
-                del genotype,group_source
+                genotype = x.T[np.ix_(np.arange(stop-start),selected)].T
+                group_source = np.asfortranarray(source[selected])
+                rhs = np.empty((len(selected),batch*width),order='F')
+                for first in range(0,len(self.pairs),batch):
+                    pairs = self.pairs[first:first+batch]
+                    for offset,(u,v) in enumerate(pairs):
+                        weights = self.weights[selected]*self.features[selected,u]*self.features[selected,v]
+                        np.multiply(group_source,weights[:,None],out=rhs[:,offset*width:(offset+1)*width])
+                    values = self.tn.matmul_tn(genotype,rhs[:,:len(pairs)*width])
+                    for offset,(u,v) in enumerate(pairs):
+                        value = values[:,offset*width:(offset+1)*width].reshape(stop-start,k,self.probes)
+                        cross[group,:,u,:].reshape(stop-start,k,q,self.probes)[:,:,v,:] = value
+                        if u != v:
+                            cross[group,:,v,:].reshape(stop-start,k,q,self.probes)[:,:,u,:] = value
+                del genotype,group_source,rhs,values
             for annotation in range(k):
                 active = np.flatnonzero(a[:,annotation])
                 if not len(active):
                     continue
-                for p,(u,v) in enumerate(self.pairs):
-                    orientations = ((u,v),) if u == v else ((u,v),(v,u))
-                    c = annotation*len(self.pairs)+p
-                    for left,right in orientations:
-                        self.left[c] += self.tn.matmul_tn(np.asfortranarray(cross[0,active,left]),
-                            np.asfortranarray(a[active,annotation,None]*cross[1,active,right]))
-                        self.right[c] += self.tn.matmul_tn(np.asfortranarray(cross[2,active,left]),
-                            np.asfortranarray(a[active,annotation,None]*cross[3,active,right]))
+                for first,second,target in ((0,1,self.left),(2,3,self.right)):
+                    # All ordered target-context products have the same SNP
+                    # weights. One TN product contains every required block.
+                    left = np.asfortranarray(cross[first,active].reshape(len(active),q*d))
+                    right = np.asfortranarray(a[active,annotation,None]*cross[second,active].reshape(len(active),q*d))
+                    moment = self.tn.matmul_tn(left,right)
+                    for p,(u,v) in enumerate(self.pairs):
+                        c = annotation*len(self.pairs)+p
+                        target[c] += moment[u*d:(u+1)*d,v*d:(v+1)*d]
+                        if u != v:
+                            target[c] += moment[v*d:(v+1)*d,u*d:(u+1)*d]
+                    del left,right,moment
 
 
 def gaussian_architecture_covariance(theta,q,metric,left,right,probes,*,evaluator=None):

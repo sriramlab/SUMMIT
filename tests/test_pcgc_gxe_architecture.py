@@ -10,9 +10,10 @@ from prediction_helpers import prediction_threads
 
 @pytest.mark.parametrize('native',[False,True])
 @pytest.mark.parametrize('overlapping',[False,True])
-def test_group_sketches_match_dense_random_probe_products(native,overlapping):
+@pytest.mark.parametrize('block_size',[1,32,79])
+def test_group_sketches_match_dense_random_probe_products(native,overlapping,block_size):
     rng=np.random.default_rng(99613)
-    n,m,q,k,b=29,13,3,3,5
+    n,m,q,k,b=29,79,3,3,5
     x=rng.normal(size=(n,m)); phi=rng.normal(size=(n,q))
     annotation=(rng.uniform(.1,1,(m,k)) if overlapping else np.eye(k)[np.arange(m)%k])
     threads=prediction_threads()
@@ -39,8 +40,9 @@ def test_group_sketches_match_dense_random_probe_products(native,overlapping):
                 right[ann*len(context_pairs(q))+p]+=cross[2][:,s].T@(a[:,ann,None]*cross[3][:,t])
     # Singleton blocks include annotations with no SNPs in that block.
     for traversal in (1,2):
-        for start in range(m):
-            sketch.read_block(traversal,start,start+1,np.asfortranarray(x[:,start:start+1]))
+        for start in range(0,m,block_size):
+            stop=min(start+block_size,m)
+            sketch.read_block(traversal,start,stop,np.asfortranarray(x[:,start:stop]))
     for actual,expected in ((sketch.source,source),(sketch.left,left),(sketch.right,right)):
         np.testing.assert_allclose(actual,expected,rtol=4e-12,atol=2e-14)
 

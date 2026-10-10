@@ -215,6 +215,8 @@ reuses the equal cross-products for context pairs `(u, v)` and `(v, u)`.
 Its diagonal terms share genotype-square sums across context pairs.
 For disjoint annotation bins, source sketches use only the variants in each
 bin, preserving their global probe identities.
+Annotation and context products are batched within the workspace budget.
+Batching and block size do not change the probe identities or estimating equations.
 
 `summit.context.binary` exposes `prepare_gxe_moments`, `prepare_gxe_external`,
 `fit_gxe`, `evaluate_contexts`, and `plan_gxe_reference`. File-backed

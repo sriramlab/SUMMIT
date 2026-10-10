@@ -10137,6 +10137,60 @@ nb_numpy_mat2f<double> numpy_philox_rademacher_block(
     return result;
 }
 
+void generalized_fill_weighted_source(
+    nb::ndarray<const double, nb::ndim<2>, nb::device::cpu> source,
+    nb::ndarray<const double, nb::ndim<1>, nb::device::cpu> weights,
+    nb_mat2f_rw<double> target, int64_t first_column,
+    int64_t column_step, int requested_threads
+) {
+    validate_protected_gemm_threads(requested_threads);
+    const size_t n=source.shape(0), b=source.shape(1);
+    if (!n || !b || weights.shape(0)!=n || target.shape(0)!=n ||
+        first_column<0 || column_step<=0 || source.stride(0)<=0 ||
+        source.stride(1)<=0 || weights.stride(0)<=0 || n>static_cast<size_t>(INT64_MAX-63))
+        throw std::invalid_argument("weighted source axes or strides disagree");
+    const size_t last=checked_add(static_cast<size_t>(first_column),
+        checked_mul(b-1,static_cast<size_t>(column_step),"weighted source columns"),"weighted source column");
+    if (last>=target.shape(1))
+        throw std::invalid_argument("weighted source columns exceed the target");
+    const size_t row_stride=static_cast<size_t>(source.stride(0));
+    const size_t col_stride=static_cast<size_t>(source.stride(1));
+    const size_t weight_stride=static_cast<size_t>(weights.stride(0));
+    const size_t source_span=checked_add(checked_add(
+        checked_mul(n-1,row_stride,"weighted source row span"),
+        checked_mul(b-1,col_stride,"weighted source column span"),"weighted source span"),1,"weighted source span");
+    const size_t weight_span=checked_add(checked_mul(n-1,weight_stride,"weighted source weight span"),1,"weighted source weight span");
+    const size_t target_bytes=checked_mul(checked_mul(n,target.shape(1),"weighted source target size"),sizeof(double),"weighted source target bytes");
+    const auto out=reinterpret_cast<uintptr_t>(target.data());
+    const auto no_alias=[&](const double* input,size_t elements) {
+        const auto begin=reinterpret_cast<uintptr_t>(input);
+        const size_t bytes=checked_mul(elements,sizeof(double),"weighted source input bytes");
+        if ((out<=begin && begin-out<target_bytes) || (begin<out && out-begin<bytes))
+            throw std::invalid_argument("weighted source target overlaps an input");
+    };
+    no_alias(source.data(),source_span);
+    no_alias(weights.data(),weight_span);
+    int invalid=0;
+    {
+        nb::gil_scoped_release release;
+        // Small row tiles keep source cache lines live while writing contiguous
+        // target segments. Workers own disjoint rows of the existing arena.
+#pragma omp parallel for num_threads(requested_threads) schedule(static) reduction(|:invalid)
+        for (int64_t first=0;first<static_cast<int64_t>(n);first+=64) {
+            const size_t stop=std::min(n,static_cast<size_t>(first)+64);
+            for (size_t column=0;column<b;++column) {
+                double* output=target.data()+(static_cast<size_t>(first_column)+column*static_cast<size_t>(column_step))*n;
+                for (size_t row=static_cast<size_t>(first);row<stop;++row) {
+                    const double value=source.data()[row*row_stride+column*col_stride]*weights.data()[row*weight_stride];
+                    output[row]=value;
+                    invalid |= !std::isfinite(value);
+                }
+            }
+        }
+    }
+    if (invalid) throw std::invalid_argument("weighted source contains non-finite products");
+}
+
 uint64_t generalized_probe_splitmix64(uint64_t value) noexcept {
     value += 0x9E3779B97F4A7C15ULL;
     value = (value ^ (value >> 30U)) * 0xBF58476D1CE4E5B9ULL;
@@ -16341,6 +16395,13 @@ NB_MODULE(gxeldcore, module) {
         nb::arg("root_seed"), nb::arg("namespace_key"),
         nb::arg("threads"),
         "Generate globally addressed generalized variant-axis Rademacher probes."
+    );
+    module.def(
+        "generalized_fill_weighted_source", &generalized_fill_weighted_source,
+        nb::arg("source").noconvert(), nb::arg("weights").noconvert(),
+        nb::arg("target").noconvert(), nb::arg("first_column"),
+        nb::arg("column_step"), nb::arg("threads"),
+        "Fill weighted source columns in the existing generalized reference arena."
     );
     nb::class_<ProtectedRightPair>(module, "ProtectedRightPair")
         .def_prop_ro("rows", &ProtectedRightPair::rows)

@@ -39,6 +39,48 @@ from summit.ldscore.generalized_gxe_variant import (
 )
 
 
+def test_native_weighted_source_fills_only_admitted_strided_columns():
+    from summit import gxeldcore
+    from prediction_helpers import prediction_threads
+    rng = np.random.default_rng(83216)
+    source = rng.normal(size=(137, 53))[:, 7:42]
+    weights = rng.normal(size=(137, 3))[:, 1]
+    target = np.full((137, 213), -432., order="F")
+    expected = target.copy(order="F")
+    expected[:, 2:212:6] = source * weights[:, None]
+    gxeldcore.generalized_fill_weighted_source(
+        source, weights, target, 2, 6, prediction_threads()
+    )
+    np.testing.assert_array_equal(target, expected)
+
+
+def test_native_weighted_source_rejects_invalid_axes_and_aliases():
+    from summit import gxeldcore
+    from prediction_helpers import prediction_threads
+    function = gxeldcore.generalized_fill_weighted_source
+    threads = prediction_threads()
+    source = np.ones((13, 5))
+    weights = np.ones(13)
+    target = np.full((13, 15), -432., order="F")
+    for first, step in ((-1, 1), (0, 0), (0, -1), (3, 3)):
+        with pytest.raises(ValueError):
+            function(source, weights, target, first, step, threads)
+    with pytest.raises(ValueError):
+        function(source[:-1], weights, target, 0, 1, threads)
+    with pytest.raises(ValueError):
+        function(source[::-1], weights, target, 0, 1, threads)
+    with pytest.raises(ValueError):
+        function(target[:, :5], weights, target, 0, 1, threads)
+    with pytest.raises(ValueError):
+        function(source, target[:, 0], target, 0, 1, threads)
+    np.testing.assert_array_equal(target, -432.)
+    with pytest.raises(TypeError):
+        function(source.astype(np.float32), weights, target, 0, 1, threads)
+    source[3, 2] = np.inf
+    with pytest.raises(ValueError, match="non-finite"):
+        function(source, weights, target, 0, 1, threads)
+
+
 def _fixture(
     num_basis: int,
     num_annotations: int,
@@ -97,6 +139,7 @@ def _plan(
     rhs_probe_width: int,
     rhs_policy: str,
     threads: int = 1,
+    annotation_batch_width: int | None = None,
 ):
     q_squared = basis.shape[1] ** 2
     preferred_rhs = q_squared * rhs_probe_width
@@ -112,6 +155,7 @@ def _plan(
             threads=threads,
             preferred_variant_block_width=variant_width,
             preferred_rhs_tile_columns=preferred_rhs,
+            preferred_target_annotation_batch_width=annotation_batch_width,
             rhs_policy=rhs_policy,
         )
     )
@@ -131,6 +175,7 @@ def _run_two_pass(
     threads: int = 1,
     row_complete_sink=None,
     native: bool = False,
+    annotation_batch_width: int | None = None,
 ):
     plan = _plan(
         genotype,
@@ -141,6 +186,7 @@ def _run_two_pass(
         rhs_probe_width=rhs_probe_width,
         rhs_policy=rhs_policy,
         threads=threads,
+        annotation_batch_width=annotation_batch_width,
     )
     operator = ArraySequentialGenotypeOperator(genotype)
     names = tuple(f"annotation_{index}" for index in range(annotations.shape[1]))
@@ -174,6 +220,34 @@ def _run_two_pass(
         row_complete_sink=row_complete_sink,
     ).execute()
     return result, pass1, operator, plan
+
+
+@pytest.mark.parametrize("native", [False, True])
+@pytest.mark.parametrize("projected", [False, True])
+@pytest.mark.parametrize("annotation_batch_width", [1, 2, 3])
+def test_annotation_batches_match_dense_scores_with_partial_tiles(
+    native, projected, annotation_batch_width,
+):
+    from prediction_helpers import prediction_threads
+    genotype, basis, fixed, annotations, spec, probes = _fixture(3, 3, seed=9743, probe_count=11)
+    if not projected:
+        fixed = np.empty((len(genotype), 0))
+    result, _, operator, plan = _run_two_pass(
+        genotype=genotype, basis=basis, fixed=fixed, annotations=annotations,
+        spec=spec, variant_width=4, rhs_probe_width=4,
+        native=native, threads=prediction_threads(),
+        annotation_batch_width=annotation_batch_width,
+    )
+    expected, _, _ = randomized_two_pass_ldscores(genotype, basis, fixed, annotations, probes)
+    np.testing.assert_allclose(result.directional_ldscores, expected.directional_ldscores, rtol=2e-13, atol=2e-13)
+    np.testing.assert_allclose(result.same_person,
+                              exact_same_person_matrix(genotype, basis, fixed, annotations),
+                              rtol=2e-13, atol=2e-13)
+    result.ledger.validate_clean_completion()
+    assert operator.observed_passes == 2
+    allocation = result.telemetry["allocation_ledger"]
+    assert allocation["rhs_arena_bytes"] <= plan.memory["pass2_rhs"]
+    assert allocation["maximum_lsum_bytes"] <= plan.memory["pair_reduction_scratch"]
 
 
 @pytest.mark.parametrize('q', [1, 3])
@@ -705,7 +779,8 @@ def test_protected_native_tn_matches_dense_backend_and_uses_two_passes() -> None
     assert observed.telemetry["native"]["available"] is True
     assert observed.telemetry["native"]["gemm_status"]["dropped_records"] == 0
     assert observed.telemetry["native"]["output_numa_status"]["failed_calls"] == 0
-    expected_calls = 3 * annotations.shape[1] * 6
+    batch = plan.tiling["target_annotation_batch_width"]
+    expected_calls = 3 * ((annotations.shape[1]+batch-1)//batch) * 6
     assert observed.telemetry["target_tn"]["calls"] == expected_calls
 
 

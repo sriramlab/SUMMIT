@@ -338,6 +338,10 @@ class GeneralizedGxEPass2Executor:
         self.genotype_operator = genotype_operator
         self.work_plan = work_plan
         self.tn_operator = tn_operator
+        self._native_weighted_source = getattr(
+            getattr(tn_operator, "_module", None),
+            "generalized_fill_weighted_source", None,
+        )
         self.row_complete_sink = row_complete_sink
         if probe_product_sink is not None and not callable(probe_product_sink):
             raise TypeError("probe_product_sink must be callable")
@@ -356,6 +360,13 @@ class GeneralizedGxEPass2Executor:
         self._product_plan = build_pair_product_plan(basis_array.shape[1])
         self._residual_rank = residual_rank
         self._rhs_precomputed = bool(work_plan.tiling["rhs_precomputed"])
+        self._annotation_batch_width = (
+            1 if self._rhs_precomputed else min(
+                weights.shape[1],
+                _positive_int("target annotation batch width",
+                              int(work_plan.tiling.get("target_annotation_batch_width", 1))),
+            )
+        )
         # With P=I, X.T diag(phi_u) diag(phi_v) S is symmetric in u,v.
         # Projection between the context multiplications breaks this identity.
         self._symmetric_context_cross = fixed.shape[1] == 0
@@ -373,6 +384,17 @@ class GeneralizedGxEPass2Executor:
                 else NumpyNNOperator(threads=tn_operator.threads)
             )
 
+    def _weighted_source(self, target: Array, source: Array, weights: Array,
+                         first_column: int, column_step: int) -> None:
+        if callable(self._native_weighted_source):
+            self._native_weighted_source(source, weights, target, first_column,
+                                         column_step, self.tn_operator.threads)
+        else:
+            _fill_weighted_source(
+                target[:, first_column:first_column+source.shape[1]*column_step:column_step],
+                source, weights,
+            )
+
     def _precompute_rhs(self) -> Array:
         sources = self.pass1_result.contextual_sources
         k_count, q_count, n, b_count = sources.shape
@@ -385,9 +407,10 @@ class GeneralizedGxEPass2Executor:
         for annotation in range(k_count):
             base = annotation * b_count * family_count
             for family, (target, source) in enumerate(self._rhs_pairs):
-                _fill_weighted_source(
-                    rhs[:, base+family:base+b_count*family_count:family_count],
+                self._weighted_source(
+                    rhs,
                     sources[annotation, source], self._basis[:, target],
+                    base+family, family_count,
                 )
         return _readonly(rhs)
 
@@ -404,14 +427,14 @@ class GeneralizedGxEPass2Executor:
         target = arena[:, :required_columns]
         sources = self.pass1_result.contextual_sources
         for family, (target_coordinate, source_coordinate) in enumerate(self._rhs_pairs):
-            _fill_weighted_source(
-                target[:, family::family_count],
+            self._weighted_source(
+                target,
                 sources[
                     annotation,
                     source_coordinate,
                     :,
                     probe_start:probe_stop,
-                ], self._basis[:, target_coordinate],
+                ], self._basis[:, target_coordinate], family, family_count,
             )
         return target
 
@@ -445,7 +468,7 @@ class GeneralizedGxEPass2Executor:
             rhs_arena = np.empty(
                 (
                     n,
-                    self.probe_tile_width * family_count,
+                    self.probe_tile_width * family_count * self._annotation_batch_width,
                 ),
                 dtype=np.float64,
                 order="F",
@@ -575,100 +598,81 @@ class GeneralizedGxEPass2Executor:
                 (block_width, p_count, c_count), dtype=np.float64, order="C"
             )
             maximum_lrow_bytes = max(maximum_lrow_bytes, lrow.nbytes)
-            for annotation in range(k_count):
+            for annotation_start in range(0, k_count, self._annotation_batch_width):
+                annotation_stop = min(k_count, annotation_start + self._annotation_batch_width)
+                annotation_count = annotation_stop - annotation_start
                 lsum = np.zeros(
-                    (block_width, p_count, p_count), dtype=np.float64
+                    (annotation_count, block_width, p_count, p_count), dtype=np.float64
                 )
                 maximum_lsum_bytes = max(maximum_lsum_bytes, lsum.nbytes)
                 for probe_start in range(0, b_count, self.probe_tile_width):
-                    probe_stop = min(
-                        b_count, probe_start + self.probe_tile_width
-                    )
+                    probe_stop = min(b_count, probe_start + self.probe_tile_width)
+                    probe_count = probe_stop - probe_start
+                    columns_per_annotation = probe_count * family_count
                     rhs_prepare_started = time.perf_counter()
                     if precomputed_rhs is not None:
-                        annotation_base = annotation * b_count * family_count
-                        column_start = (
-                            annotation_base + probe_start * family_count
-                        )
+                        # Precomputed annotation slabs are contiguous only for
+                        # their full probe axis; retain one annotation here.
+                        annotation_base = annotation_start * b_count * family_count
+                        column_start = annotation_base + probe_start * family_count
                         column_stop = annotation_base + probe_stop * family_count
                         rhs = precomputed_rhs[:, column_start:column_stop]
                     else:
                         assert rhs_arena is not None
-                        rhs = self._fill_rhs_tile(
-                            rhs_arena, annotation, probe_start, probe_stop
-                        )
-                    phase_seconds["rhs_prepare"] += (
-                        time.perf_counter() - rhs_prepare_started
-                    )
+                        rhs = rhs_arena[:, :annotation_count * columns_per_annotation]
+                        for offset, annotation in enumerate(range(annotation_start, annotation_stop)):
+                            self._fill_rhs_tile(
+                                rhs[:, offset*columns_per_annotation:(offset+1)*columns_per_annotation],
+                                annotation, probe_start, probe_stop,
+                            )
+                    phase_seconds["rhs_prepare"] += time.perf_counter() - rhs_prepare_started
                     maximum_rhs_bytes = max(maximum_rhs_bytes, rhs.nbytes)
                     tn_started = time.perf_counter()
                     cross_raw = self.tn_operator.matmul_tn(genotype, rhs)
-                    probe_count = probe_stop - probe_start
-                    if self._symmetric_context_cross:
-                        # Expand only the small target/probe panels. Holding
-                        # raw triangular and expanded panels uses no more space
-                        # than the two full square panels in the general path.
-                        cross = np.empty((q_count, q_count, block_width, probe_count))
-                        unique = cross_raw.T.reshape(probe_count, family_count, block_width).transpose(1, 2, 0)
-                        for family, (u, v) in enumerate(self._rhs_pairs):
-                            np.divide(unique[family], float(self._residual_rank), out=cross[u, v])
-                            if u != v:
-                                cross[v, u] = cross[u, v]
-                        panels = cross
-                        del unique
-                    else:
-                        cross = np.asfortranarray(
-                            cross_raw / float(self._residual_rank),
-                            dtype=np.float64,
-                        )
-                        panels = cross.T.reshape(
-                            probe_count, q_count, q_count, block_width,
-                        ).transpose(1, 2, 3, 0)
-                    phase_seconds["protected_tn"] += (
-                        time.perf_counter() - tn_started
-                    )
-                    maximum_cross_bytes = max(
-                        maximum_cross_bytes, cross_raw.nbytes + cross.nbytes
-                    )
-                    product_started = time.perf_counter()
-                    if self.probe_product_sink is not None:
-                        # The consumer owns and budgets its accumulators. It
-                        # receives completed source/target products, with no
-                        # jackknife groups or reference recomputation.
-                        view = panels.view()
-                        view.setflags(write=False)
-                        self.probe_product_sink(row_start,row_stop,annotation,probe_start,view,self._product_plan)
-                    for target_pair in range(p_count):
-                        for source_pair in range(p_count):
-                            for term in self._product_plan.terms[
-                                target_pair
-                            ][source_pair]:
-                                lsum[:, target_pair, source_pair] += np.einsum(
-                                    "vb,vb->v",
-                                    panels[
-                                        term.first_target,
-                                        term.first_source,
-                                    ],
-                                    panels[
-                                        term.second_target,
-                                        term.second_source,
-                                    ],
-                                    dtype=np.float64,
-                                    optimize=False,
-                                )
-                    phase_seconds["row_products"] += (
-                        time.perf_counter() - product_started
-                    )
-                    columns = probe_count * family_count
+                    phase_seconds["protected_tn"] += time.perf_counter() - tn_started
+                    columns = annotation_count * columns_per_annotation
                     tn_flops += 2 * block_width * n * columns
                     dimension_key = f"{block_width}x{n}x{columns}"
-                    tn_dimension_counts[dimension_key] = (
-                        tn_dimension_counts.get(dimension_key, 0) + 1
-                    )
-                    del panels, cross, cross_raw, rhs
-                lrow[
-                    :, :, annotation * p_count : (annotation + 1) * p_count
-                ] = lsum / float(b_count)
+                    tn_dimension_counts[dimension_key] = tn_dimension_counts.get(dimension_key, 0) + 1
+                    for offset, annotation in enumerate(range(annotation_start, annotation_stop)):
+                        tn_started = time.perf_counter()
+                        raw = cross_raw[:, offset*columns_per_annotation:(offset+1)*columns_per_annotation]
+                        if self._symmetric_context_cross:
+                            cross = np.empty((q_count, q_count, block_width, probe_count))
+                            unique = raw.T.reshape(probe_count, family_count, block_width).transpose(1, 2, 0)
+                            for family, (u, v) in enumerate(self._rhs_pairs):
+                                np.divide(unique[family], float(self._residual_rank), out=cross[u, v])
+                                if u != v:
+                                    cross[v, u] = cross[u, v]
+                            panels = cross
+                            del unique
+                        else:
+                            cross = np.asfortranarray(raw / float(self._residual_rank), dtype=np.float64)
+                            panels = cross.T.reshape(probe_count, q_count, q_count, block_width).transpose(1, 2, 3, 0)
+                        phase_seconds["protected_tn"] += time.perf_counter() - tn_started
+                        maximum_cross_bytes = max(maximum_cross_bytes, cross_raw.nbytes + cross.nbytes)
+                        product_started = time.perf_counter()
+                        if self.probe_product_sink is not None:
+                            # Per-annotation probe identities and the order of
+                            # probe accumulation remain unchanged by batching.
+                            view = panels.view()
+                            view.setflags(write=False)
+                            self.probe_product_sink(row_start,row_stop,annotation,probe_start,view,self._product_plan)
+                            del view
+                        for target_pair in range(p_count):
+                            for source_pair in range(p_count):
+                                for term in self._product_plan.terms[target_pair][source_pair]:
+                                    lsum[offset, :, target_pair, source_pair] += np.einsum(
+                                        "vb,vb->v",
+                                        panels[term.first_target, term.first_source],
+                                        panels[term.second_target, term.second_source],
+                                        dtype=np.float64, optimize=False,
+                                    )
+                        phase_seconds["row_products"] += time.perf_counter() - product_started
+                        del panels, cross, raw
+                    del cross_raw, rhs
+                for offset, annotation in enumerate(range(annotation_start, annotation_stop)):
+                    lrow[:, :, annotation*p_count:(annotation+1)*p_count] = lsum[offset] / float(b_count)
                 del lsum
             if not np.all(np.isfinite(lrow)):
                 ledger.record_integrity_failure()
@@ -802,6 +806,7 @@ class GeneralizedGxEPass2Executor:
                     "rhs_precomputed": self._rhs_precomputed,
                     "symmetric_context_cross": self._symmetric_context_cross,
                     "context_products_per_probe": family_count,
+                    "target_annotation_batch_width": self._annotation_batch_width,
                     "factored_diagonal_tiles": factored_diagonal_tiles,
                     "rhs_tile_columns": int(
                         self.work_plan.tiling["rhs_tile_columns"]
