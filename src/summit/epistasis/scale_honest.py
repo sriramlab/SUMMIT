@@ -53,6 +53,7 @@ def _rotate_geometry(geometry, index, direction):
 def _score_geometry(geometry, index, score):
     """Put one coefficient contrast first, retaining the full feature span."""
     _, _, vh = np.linalg.svd((score/np.linalg.norm(score))[None,:],full_matrices=True)
+    if vh[0] @ score < 0:vh[0]*=-1
     rotation = np.eye(geometry.r.shape[1])
     rotation[np.ix_(index,index)] = vh.T
     result = copy(geometry)
@@ -120,7 +121,8 @@ def boxcox_honest_scale_test(pilot_geometry, pilot_phenotype,
         domain = pilot['confidence_sets'][name]
         anchor = pilot['tests'][name]['sampled_maximizer']
         item = dict(original_df=len(index),pilot_anchor=anchor,pilot_confidence_set=domain,
-                    gamma=gamma,threshold=alpha)
+                    gamma=gamma,threshold=alpha,
+                    pilot_influence_screen_passed=pilot['tests'][name]['influence_screen_passed_at_evaluated_powers'])
         if not domain:
             item.update(p_upper=gamma,p_sup_lower=gamma,df=len(index),
                 status='rejected_by_pilot_confidence_set',projection='not_needed',
@@ -140,7 +142,7 @@ def boxcox_honest_scale_test(pilot_geometry, pilot_phenotype,
         # For a strong scale direction, maximize pilot signal/noise subject
         # to l'd=0. Otherwise use the unconstrained pilot Wald direction.
         score = None
-        if contrast_mode == 'hybrid' and len(index)-int(projected)>1:
+        if contrast_mode == 'hybrid' and len(index)>1:
             v = pilot_geometry.inverse @ meat[0] @ pilot_geometry.inverse.T
             try:
                 vi,_ = _inverse(v[np.ix_(index,index)])
@@ -160,10 +162,15 @@ def boxcox_honest_scale_test(pilot_geometry, pilot_phenotype,
                 if (np.all(np.isfinite(candidate)) and np.linalg.norm(candidate) >
                         1e-12*max(original_norm,np.finfo(float).tiny)):
                     score = candidate/np.linalg.norm(candidate)
+                    if score @ b < 0:score *= -1
             except (ValueError,np.linalg.LinAlgError):
                 pass  # Pilot-only singular/zero score: retain the omnibus.
         component_alpha = (alpha-gamma)/(2 if score is not None else 1)
-        if projected:
+        # A curve can stay nonzero while moving only along d. Dropping d
+        # would then erase the alternative. The hybrid therefore retains
+        # the ORIGINAL full coefficient block as its omnibus safeguard.
+        omnibus_projected = projected and contrast_mode == 'omnibus'
+        if omnibus_projected:
             geometry, contrast = _rotate_geometry(confirmation_geometry,index,d)
             tested = index[:-1].tolist()
         else:
@@ -177,15 +184,18 @@ def boxcox_honest_scale_test(pilot_geometry, pilot_phenotype,
         item.update(p_upper=upper,p_sup_lower=lower,df=len(tested),
             status=('rejected_specified_scale_family' if upper<alpha else
                     'compatible_scale_found' if lower>=alpha else test['status']),
-            projection='pilot_direction_removed' if projected else 'full_block_fallback',
+            projection=('pilot_direction_removed' if omnibus_projected else
+                        'full_block_guard' if contrast_mode=='hybrid' else 'full_block_fallback'),
+            pilot_scale_direction_removed_from_score=bool(projected and score is not None),
             pilot_direction_p=direction_p,contrast=contrast.tolist(),
             confirmation_evaluations=result['evaluations'],confirmation=result)
+        item['confirmation_influence_screen_passed'] = test['influence_screen_passed_at_evaluated_powers']
         del geometry
         if score is not None:
             score_geometry,score_contrast = _score_geometry(confirmation_geometry,index,score)
             score_result = boxcox_scale_test(score_geometry,cy,groups={name:index[:1].tolist()},
                 bounds=bounds,alpha=component_alpha,max_evaluations=max_evaluations,
-                batch_size=batch_size,order=order,search_intervals=domain)
+                batch_size=batch_size,order=order,search_intervals=domain,alternative='greater')
             st = score_result['tests'][name]
             upper = min(1.,gamma+2*min(test['p_upper'],st['p_upper']))
             lower = min(1.,gamma+2*min(test['p_sup_lower'],st['p_sup_lower']))
@@ -195,6 +205,7 @@ def boxcox_honest_scale_test(pilot_geometry, pilot_phenotype,
                 score_contrast=score_contrast.tolist(),score_df=1,
                 score_confirmation=score_result,component_weights=[.5,.5],
                 confirmation_evaluations=result['evaluations']+score_result['evaluations'])
+            item['confirmation_influence_screen_passed'] &= st['influence_screen_passed_at_evaluated_powers']
             del score_geometry
         item['contrast_mode'] = 'hybrid' if score is not None else 'omnibus'
         tests[name] = item

@@ -8,7 +8,7 @@ this is not an arbitrary-monotone or causal epistasis test.
 from math import factorial
 
 import numpy as np
-from scipy.stats import chi2
+from scipy.stats import chi2, norm
 
 from .robust import _inverse
 
@@ -53,7 +53,7 @@ def boxcox_derivatives(log_values, power, *, order=3):
 
 def boxcox_scale_test(geometry, phenotype, *, groups=None, bounds=(-2., 2.),
                       alpha=.05, max_evaluations=129, batch_size=8, order=3,
-                      search_intervals=None, confidence_width=None):
+                      search_intervals=None, confidence_width=None, alternative='two_sided'):
     """Bound the supremum HC3 p over a continuous Box--Cox power interval.
 
     ``geometry`` is ``prepare_robust_geometry`` on fixed/frozen features and
@@ -117,6 +117,9 @@ def boxcox_scale_test(geometry, phenotype, *, groups=None, bounds=(-2., 2.),
             raise ValueError('distinct valid integer coefficient indices required per named group')
         indices[name] = index
     names = list(indices)
+    if alternative not in ('two_sided','greater') or (
+            alternative=='greater' and any(len(index)!=1 for index in indices.values())):
+        raise ValueError('greater alternative requires scalar coefficient groups')
     # This outcome-dependent unit choice is exactly irrelevant to every Wald
     # test: changing units adds an intercept and multiplies the outcome by a
     # positive lambda-dependent constant. It does not fit a transformation.
@@ -135,11 +138,20 @@ def boxcox_scale_test(geometry, phenotype, *, groups=None, bounds=(-2., 2.),
         for start in range(0, len(powers), batch_size):
             batch = powers[start:start+batch_size]
             values = np.column_stack([boxcox_derivatives(t, v, order=order) for v in batch])
-            _, beta, _, meat, _ = geometry.fit(values)
+            _, beta, residual, meat, _ = geometry.fit(values)
             covariances = np.stack([geometry.inverse @ v @ geometry.inverse.T for v in meat])
             for j, power in enumerate(batch):
                 sl = slice(j*(order+1), (j+1)*(order+1))
                 b, cov = beta[:, sl].copy(), covariances[sl].copy()
+                influence = weights*(residual[:,j*(order+1)]/geometry.denominator)[:,None]
+                scale = np.max(abs(influence),axis=0)
+                influence /= np.where(scale>0,scale,1.)
+                np.square(influence,out=influence)
+                sums = influence.sum(axis=0)
+                fourth = np.einsum('ij,ij->j',influence,influence)
+                ess = np.divide(sums*sums,fourth,out=np.zeros(p),where=fourth>0)
+                share = np.divide(influence.max(axis=0),sums,out=np.ones(p),where=sums>0)
+                del influence
                 records = {}
                 for name, index in indices.items():
                     v = cov[0][np.ix_(index, index)]
@@ -150,10 +162,17 @@ def boxcox_scale_test(geometry, phenotype, *, groups=None, bounds=(-2., 2.),
                         if not np.isfinite(statistic) or statistic < 0:
                             raise ValueError('unresolved scale covariance')
                         direction = direction/np.sqrt(statistic) if statistic > 0 else np.zeros(len(index))
-                        records[name] = dict(p=float(chi2.sf(statistic, len(index))),
+                        z = float(b[index[0],0]/np.sqrt(v[0,0])) if alternative=='greater' else None
+                        if alternative=='greater':direction=np.asarray([1/np.sqrt(v[0,0])])
+                        records[name] = dict(p=float(norm.sf(z) if z is not None else chi2.sf(statistic, len(index))),
+                            signed_z=z,
                             statistic=statistic, direction=direction, inverse=inverse, resolved=True)
                     except (ValueError, np.linalg.LinAlgError):
                         records[name] = dict(p=1., statistic=0., direction=np.zeros(len(index)), resolved=False)
+                    records[name]['influence_support'] = dict(
+                        minimum_coordinate_ess=float(ess[index].min()),
+                        maximum_coordinate_variance_share=float(share[index].max()),
+                        flagged=bool(ess[index].min()<100 or share[index].max()>.1))
                 cache[power] = dict(beta=b, covariance=cov, records=records,
                     outcome_norm=float(np.linalg.norm(values[:, j*(order+1)])))
 
@@ -200,9 +219,15 @@ def boxcox_scale_test(geometry, phenotype, *, groups=None, bounds=(-2., 2.),
             denominator_change += (1+1e-8)*float(np.max(abs(influence/geometry.denominator)))*remainder_norm
             numerical_slack = 1e-8*(1+np.sqrt(record['statistic'])+numerator_change
                 +np.linalg.norm(influence)*value['outcome_norm'])
-            numerator = max(0., np.sqrt(record['statistic'])-numerator_change-numerical_slack)
-            denominator = 1+denominator_change+numerical_slack
-            bound = float(chi2.sf((numerator/denominator)**2, len(index)))
+            if alternative=='greater':
+                numerator=record['signed_z']-numerator_change-numerical_slack
+                denominator=(1+denominator_change+numerical_slack if numerator>=0 else
+                             1-denominator_change-numerical_slack)
+                bound=float(norm.sf(numerator/denominator)) if denominator>0 else 1.
+            else:
+                numerator = max(0., np.sqrt(record['statistic'])-numerator_change-numerical_slack)
+                denominator = 1+denominator_change+numerical_slack
+                bound = float(chi2.sf((numerator/denominator)**2, len(index)))
             limits[name] = min(1., max(bound, record['p'])+1e-12)
         return dict(lower=a, upper=b, center=center, p_upper=limits)
 
@@ -245,8 +270,10 @@ def boxcox_scale_test(geometry, phenotype, *, groups=None, bounds=(-2., 2.),
         status = ('unresolved_covariance' if not cache[best]['records'][name]['resolved'] else
                   'rejected_specified_scale_family' if hi < alpha else
                   'compatible_scale_found' if lo >= alpha else 'unresolved_search_bound')
-        tests[name] = dict(p_sup_lower=lo, p_upper=hi, status=status,
-            sampled_maximizer=best, df=len(indices[name]), threshold=alpha)
+        tests[name] = dict(p_sup_lower=lo, p_upper=hi, status=status,alternative=alternative,
+            sampled_maximizer=best, df=len(indices[name]), threshold=alpha,
+            influence_screen_passed_at_evaluated_powers=all(
+                not value['records'][name]['influence_support']['flagged'] for value in cache.values()))
     support = []
     normalized = geometry.r/np.sqrt(np.diag(geometry.h))
     effective = float(np.min(1/np.sum(normalized**4,axis=0)))
@@ -270,12 +297,13 @@ def boxcox_scale_test(geometry, phenotype, *, groups=None, bounds=(-2., 2.),
                 else:
                     retained.append([leaf['lower'],leaf['upper']])
             confidence_sets[name] = retained
-    return dict(method='continuous_boxcox_HC3_union_envelope_v1', bounds=[lower,upper],
+    return dict(method='continuous_boxcox_HC3_union_envelope_v1', bounds=[lower,upper],alternative=alternative,
         search_intervals=domains, domain_coarsened=domain_coarsened,
         confidence_sets=confidence_sets, confidence_width=confidence_width,
         log_reference=log_reference, tests=tests, evaluations=len(cache),
         derivative_order=order, max_evaluations=max_evaluations,
         points=[dict(power=power,p={name:v['records'][name]['p'] for name in names},
+                     influence_support={name:v['records'][name]['influence_support'] for name in names},
                      covariance_resolved={name:v['records'][name]['resolved'] for name in names})
             for power,v in sorted(cache.items())], intervals=sorted(leaves,key=lambda v:v['lower']),
         diagnostics=dict(n=len(y),fixed_rank=geometry.u.shape[1],feature_rank=geometry.rank,
@@ -283,6 +311,8 @@ def boxcox_scale_test(geometry, phenotype, *, groups=None, bounds=(-2., 2.),
             information_condition=geometry.condition,outside_confirmation_design=support),
         inference='Asymptotic HC3 pointwise inference; continuous union-null envelope with float64 numerical slack.',
         null='Some common power in the declared interval makes the tested finite-projection coefficients zero.',
-        scope='Declared Box-Cox family and supplied finite feature span only; neither arbitrary monotone invariance '
+        scope='Influence concentration is a descriptive, coordinate-dependent screen, not a calibration guarantee; '
+              'a failed screen limits interpretation even when the nominal numerical decision resolves. '
+              'Declared Box-Cox family and supplied finite feature span only; neither arbitrary monotone invariance '
               'nor biological causality. A compatible scale is a failure to reject, not proof of latent additivity. '
               'Support flags remain applicable; these are not interval-arithmetic roundoff certificates.')

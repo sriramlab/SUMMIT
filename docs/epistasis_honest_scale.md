@@ -125,7 +125,7 @@ continuous-search envelopes. No independent genotype decoder is introduced.
 
 ## Optional pilot-score hybrid
 
-`--contrast-mode hybrid` retains the omnibus component and adds a single
+`--contrast-mode hybrid` retains the ORIGINAL full-block omnibus and adds a single
 pilot-learned coefficient contrast. At the pilot anchor, let b and V be the
 full conditional coefficient estimate and its HC3 covariance for the block.
 Soft threshold b_j by sqrt(2 log(q)) times its pilot standard error; use b
@@ -146,8 +146,16 @@ in the set, rejection requires at least one pointwise p at that witness to
 be at most (alpha-gamma)/2. Bonferroni bounds this probability by
 alpha-gamma; the common set-miss budget is paid once. This argument does
 not assume independence between the two confirmation tests. If the
-omnibus already has one degree of freedom, or a usable pilot score cannot
+original block has one degree of freedom, or a usable pilot score cannot
 be constructed, no redundant component or multiplicity cost is introduced.
+
+The pilot also fixes the sign so l'b_pilot is nonnegative. The score uses a
+one-sided normal HC3 tail in that frozen direction; the full-block omnibus
+remains two-sided. This uses directional replication without selecting a
+sign on confirmation. Its continuous envelope bounds signed standardized
+coefficients, including negative numerators and their lower variance bounds.
+Under a full null, each conditional one-sided pointwise p is superuniform,
+so the same Bonferroni/confidence-set proof applies.
 
 This combines two supremum tests, rather than taking a supremum of
 pointwise combined p values. The former can be more conservative but has
@@ -157,3 +165,18 @@ Outputs label it `combined_test_nonrejection` and retain both bounds.
 The hybrid can improve sparse-signal power and can lose power for diffuse
 or poorly learned patterns. It is optional, not uniformly more powerful.
 Splits, mode, and thresholds must be fixed before confirmation analysis.
+
+Keeping the original block matters: beta(lambda)=a(lambda)b with a(lambda)>0
+has no null scale, but annihilating its derivative can annihilate the whole
+alternative. The full-block safeguard preserves sensitivity to this case.
+It also remains full-block if the pilot cannot construct a nonzero score.
+
+Each evaluated power now reports coefficient-influence concentration:
+(sum_i IF_i^2)^2/sum_i IF_i^4 and max_i IF_i^2/sum_i IF_i^2. Values below100
+or above.1 respectively trigger a descriptive flag. These diagnostics use
+the actual transformed outcomes and full-model HC3 residuals. They reveal
+information concentrated in a few participants despite large nominal N.
+They are coordinate-dependent, are not a universal calibration certificate,
+and do not remove observations or powers or modify p values. Interpret
+flagged nominal decisions as requiring further qualification; nonrejection
+does not establish a latent additive explanation.
