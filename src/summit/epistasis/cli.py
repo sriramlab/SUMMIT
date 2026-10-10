@@ -44,6 +44,7 @@ def main(argv=None):
     honest.add_argument("--lambda-max",type=float,default=2.)
     honest.add_argument("--alpha",type=float,default=.05)
     honest.add_argument("--gamma",type=float)
+    honest.add_argument("--contrast-mode",choices=("omnibus","hybrid"),default="omnibus")
     honest.add_argument("--max-pilot-evaluations",type=int,default=257)
     honest.add_argument("--max-evaluations",type=int,default=129)
     honest.add_argument("--num-threads",type=int,default=1)
@@ -125,7 +126,8 @@ def main(argv=None):
             groups=None if args.groups is None else json.loads(args.groups.read_text()),
             threads=args.num_threads,memory_bytes=int(args.memory_gib*2**30),
             bounds=(args.lambda_min,args.lambda_max),alpha=args.alpha,gamma=args.gamma,
-            max_pilot_evaluations=args.max_pilot_evaluations,max_evaluations=args.max_evaluations)
+            max_pilot_evaluations=args.max_pilot_evaluations,max_evaluations=args.max_evaluations,
+            contrast_mode=args.contrast_mode)
         return 0
     if args.command == "scale-test":
         from .scale_workflow import run_scale_arrays

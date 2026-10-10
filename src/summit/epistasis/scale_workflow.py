@@ -66,7 +66,8 @@ def run_scale_arrays(path, output, *, groups=None, threads=1, memory_bytes=4*2**
 
 def run_honest_scale_arrays(path, output, *, groups=None, threads=1,
                            memory_bytes=4*2**30, bounds=(-2.,2.), alpha=.05,
-                           gamma=None, max_pilot_evaluations=257,max_evaluations=129):
+                           gamma=None, max_pilot_evaluations=257,max_evaluations=129,
+                           contrast_mode='omnibus'):
     """Aligned NPZ: features, fixed_effects, phenotype, sample_ids, pilot_mask.
 
     One common feature/nuisance encoding is split by a frozen Boolean mask.
@@ -100,7 +101,8 @@ def run_honest_scale_arrays(path, output, *, groups=None, threads=1,
     confirmation=prepare_robust_geometry(f[~mask],c[~mask],nn=nn,tn=tn)
     result=boxcox_honest_scale_test(pilot,y[mask],confirmation,y[~mask],
         pilot_ids=ids[mask],confirmation_ids=ids[~mask],groups=groups,bounds=bounds,
-        alpha=alpha,gamma=gamma,max_pilot_evaluations=max_pilot_evaluations,max_evaluations=max_evaluations)
+        alpha=alpha,gamma=gamma,max_pilot_evaluations=max_pilot_evaluations,max_evaluations=max_evaluations,
+        contrast_mode=contrast_mode)
     if file_digest(path)!=input_digest:raise ValueError('honest scale input changed during analysis')
     native=products.finish_execution()
     result.update(input_sha256=input_digest,feature_shape=f.shape,fixed_shape=c.shape,

@@ -122,3 +122,38 @@ overwrite an existing output. The original `scale-test` remains available.
 The API is `summit.epistasis.scale_honest.boxcox_honest_scale_test`; the array
 workflow reuses shared native products, existing fixed-effect geometry and
 continuous-search envelopes. No independent genotype decoder is introduced.
+
+## Optional pilot-score hybrid
+
+`--contrast-mode hybrid` retains the omnibus component and adds a single
+pilot-learned coefficient contrast. At the pilot anchor, let b and V be the
+full conditional coefficient estimate and its HC3 covariance for the block.
+Soft threshold b_j by sqrt(2 log(q)) times its pilot standard error; use b
+itself if every coordinate is removed. This fixed rule targets sparse
+regional alternatives without selecting a threshold on confirmation data.
+Let the resulting vector be b_s. The score direction is V^-1 b_s, with
+its component along V^-1 d removed when the existing pilot rule identifies
+a scale direction. This enforces l'd=0. All original coefficients remain
+fitted; only the tested contrast is reduced to one dimension.
+
+Write P_o and P_s for the two separate continuous supremum p values over
+the SAME outer pilot confidence set. The hybrid reports a bound on
+
+    min(1, gamma + 2 min(P_o, P_s)).
+
+Conditional on the pilot, both contrasts are fixed. If a null witness is
+in the set, rejection requires at least one pointwise p at that witness to
+be at most (alpha-gamma)/2. Bonferroni bounds this probability by
+alpha-gamma; the common set-miss budget is paid once. This argument does
+not assume independence between the two confirmation tests. If the
+omnibus already has one degree of freedom, or a usable pilot score cannot
+be constructed, no redundant component or multiplicity cost is introduced.
+
+This combines two supremum tests, rather than taking a supremum of
+pointwise combined p values. The former can be more conservative but has
+a direct guarantee using the existing continuous envelopes. A combined
+nonrejection need not have one scale that maximizes both components.
+Outputs label it `combined_test_nonrejection` and retain both bounds.
+The hybrid can improve sparse-signal power and can lose power for diffuse
+or poorly learned patterns. It is optional, not uniformly more powerful.
+Splits, mode, and thresholds must be fixed before confirmation analysis.

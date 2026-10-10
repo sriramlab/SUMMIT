@@ -122,10 +122,42 @@ def test_honest_cli_native_path_schema_memory_and_no_overwrite(tmp_path):
     np.savez(path,features=f,fixed_effects=c,phenotype=y,sample_ids=np.arange(len(y)),
              pilot_mask=np.arange(len(y))<700)
     args=['scale-test-honest',str(path),'--out',str(out),'--num-threads',str(epistasis_threads()),
-          '--max-pilot-evaluations','17','--max-evaluations','9']
+          '--max-pilot-evaluations','17','--max-evaluations','9','--contrast-mode','hybrid']
     with pytest.raises(MemoryError):main(args+['--memory-gib','.00001'])
     assert main(args)==0
     result=json.loads(out.read_text())
     assert result['pilot_n']==700 and result['confirmation_n']==1100
+    assert result['contrast_mode']=='hybrid'
     assert result['native_execution']['output_numa_status']
     with pytest.raises(FileExistsError):main(args)
+
+
+def test_hybrid_score_dense_oracle_combination_and_pilot_only_selection():
+    pc,pf,py=design(8,1800);cc,cf,cy=design(9,2200)
+    pg=prepare_robust_geometry(pf,pc);cg=prepare_robust_geometry(cf,cc)
+    args=dict(pilot_ids=np.arange(len(py)),confirmation_ids=np.arange(len(py),len(py)+len(cy)),
+        max_pilot_evaluations=33,max_evaluations=17,contrast_mode='hybrid')
+    result=boxcox_honest_scale_test(pg,py,cg,cy,**args)
+    test=result['tests']['joint'];assert test['contrast_mode']=='hybrid'
+    contrast=np.asarray(test['score_contrast'])
+    x=np.column_stack([cc,cf]);inv=np.linalg.inv(x.T@x)
+    weights=x@inv;h=np.sum(weights*x,axis=1)
+    t=np.log(cy)-np.log(cy).mean()
+    for point in test['score_confirmation']['points']:
+        power=point['power'];z=t if power==0 else np.expm1(power*t)/power
+        b=inv@x.T@z;e=z-x@b
+        influence=weights[:,-3:]*(e/(1-h))[:,None]
+        v=contrast@(influence.T@influence)@contrast.T;eta=contrast@b[-3:]
+        expected=chi2.sf(eta@np.linalg.solve(v,eta),1)
+        np.testing.assert_allclose(point['p']['joint'],expected,rtol=1e-7,atol=1e-10)
+    components=[test[k]['tests']['joint'] for k in ('confirmation','score_confirmation')]
+    assert test['p_upper']==min(1.,result['gamma']+2*min(v['p_upper'] for v in components))
+    changed=boxcox_honest_scale_test(pg,py,cg,cy[::-1],**args)['tests']['joint']
+    np.testing.assert_array_equal(changed['score_contrast'],test['score_contrast'])
+    assert changed['pilot_confidence_set']==test['pilot_confidence_set']
+    # A two-dimensional block projected to one direction must not pay twice
+    # for two identical tests.
+    small=boxcox_honest_scale_test(pg,py,cg,cy,groups={'pair':[0,1]},**args)['tests']['pair']
+    assert small['df']==1 and small['contrast_mode']=='omnibus'
+    with pytest.raises(ValueError,match='contrast_mode'):
+        boxcox_honest_scale_test(pg,py,cg,cy,**(args|{'contrast_mode':'best_p'}))
