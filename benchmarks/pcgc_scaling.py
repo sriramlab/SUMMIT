@@ -21,9 +21,9 @@ from summit.ldscore.matrix_products import MatrixProducts
 from summit.sumstats.binary import prepare_binary_risk
 
 
-def previous(root,name):
-    path=root/'src/summit/pcgc'/f'{name}.py'
-    spec=importlib.util.spec_from_file_location(f'summit.pcgc._baseline_{name}',path)
+def previous(root,name,package='pcgc'):
+    path=root/'src/summit'/package/f'{name}.py'
+    spec=importlib.util.spec_from_file_location(f'summit.{package}._baseline_{name}',path)
     module=importlib.util.module_from_spec(spec)
     sys.modules[spec.name]=module
     spec.loader.exec_module(module)
@@ -38,12 +38,14 @@ def main():
     parser.add_argument('--m',type=int,default=256)
     parser.add_argument('--partners',type=int,default=32)
     parser.add_argument('--architecture-probes',type=int,default=8)
+    parser.add_argument('--reference-probes',type=int,default=64)
     parser.add_argument('--block-size',type=int,default=128)
     parser.add_argument('--repeats',type=int,default=2)
     args=parser.parse_args()
     if args.out.exists(): raise FileExistsError(args.out)
     old_sampling,sh=previous(args.baseline,'sampling')
     old_architecture,ah=previous(args.baseline,'architecture')
+    old_pass2,ph=previous(args.baseline,'generalized_gxe_pass2','ldscore')
     backend=MatrixProducts(native=True)
     threads=backend.threads
     rng=np.random.default_rng(20261009)
@@ -109,13 +111,48 @@ def main():
             differences[name]=float(np.max(np.abs(left-right)))
         records.append(dict(stage='architecture_agreement',repeat=repeat,max_absolute_difference=differences))
         del results,sketch,left,right
+    from summit.pcgc import reference
+    from summit.ldscore.generalized_gxe_pass1 import ArraySequentialGenotypeOperator
+    current_pass2=reference.GeneralizedGxEPass2Executor
+    x=np.asfortranarray(np.column_stack([block for _,_,block in blocks]))
+    try:
+        for repeat in range(args.repeats):
+            results={}
+            order=('baseline','optimized') if repeat%2==0 else ('optimized','baseline')
+            for name in order:
+                reference.GeneralizedGxEPass2Executor=(old_pass2.GeneralizedGxEPass2Executor
+                    if name=='baseline' else current_pass2)
+                collector=reference.ProbeGramCollector(annotation,q,args.reference_probes,n,native=True,threads=threads)
+                gc.collect()
+                started=perf_counter()
+                result,operator,_=reference.generalized_reference(ArraySequentialGenotypeOperator(x),annotation,features,
+                    probes=args.reference_probes,seed=76413,native=True,threads=threads,block_size=args.block_size,
+                    memory_bytes=4*2**30,probe_product_sink=collector)
+                record=dict(stage='reference',repeat=repeat,version=name,seconds=perf_counter()-started,
+                    pass2=dict(result.telemetry['phase_seconds']),target_tn=dict(result.telemetry['target_tn']))
+                assert operator.observed_passes==2
+                results[name]=(result,collector.deviations())
+                records.append(record); print(json.dumps(record),flush=True)
+            differences={}
+            for name in ('directional_ldscores','genetic_gram','same_person'):
+                left,right=getattr(results['baseline'][0],name),getattr(results['optimized'][0],name)
+                np.testing.assert_allclose(left,right,rtol=3e-11,atol=2e-12)
+                differences[name]=float(np.max(np.abs(left-right)))
+            left,right=results['baseline'][1],results['optimized'][1]
+            np.testing.assert_allclose(left,right,rtol=3e-10,atol=3e-11)
+            differences['probe_deviations']=float(np.max(np.abs(left-right)))
+            records.append(dict(stage='reference_agreement',repeat=repeat,max_absolute_difference=differences))
+            del results,result,collector,left,right
+    finally:
+        reference.GeneralizedGxEPass2Executor=current_pass2
     import summit
     root=Path(summit.__file__).resolve().parents[2]
     result=dict(passed=True,n=n,m=m,k=k,q=q,partners=args.partners,architecture_probes=args.architecture_probes,
         block_size=args.block_size,threads=threads,numpy=np.__version__,records=records,
-        baseline_sha256=dict(sampling=sh,architecture=ah),
+        baseline_sha256=dict(sampling=sh,architecture=ah,pass2=ph),
         current_sha256={name:hashlib.sha256((root/name).read_bytes()).hexdigest() for name in
-            ('src/summit/pcgc/sampling.py','src/summit/pcgc/architecture.py','src/native/pcgc_moments.inc')},
+            ('src/summit/pcgc/sampling.py','src/summit/pcgc/architecture.py','src/native/pcgc_moments.inc',
+             'src/summit/ldscore/generalized_gxe_pass2.py')},
         combined_peak_rss_gib=resource.getrusage(resource.RUSAGE_SELF).ru_maxrss/2**20,
         native_build=backend.module.build_info())
     with args.out.open('x') as stream:

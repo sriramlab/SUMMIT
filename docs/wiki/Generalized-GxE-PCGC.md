@@ -210,6 +210,8 @@ annotation and context combinations are evaluated once, then expanded into
 the full coefficient covariance. This is an algebraic simplification and adds
 no Monte Carlo approximation. Gaussian SNP-effect covariance uses separate
 probe families and four participant groups.
+When no projection follows context weighting, the reference calculation also
+reuses the equal cross-products for context pairs `(u, v)` and `(v, u)`.
 
 `summit.context.binary` exposes `prepare_gxe_moments`, `prepare_gxe_external`,
 `fit_gxe`, `evaluate_contexts`, and `plan_gxe_reference`. File-backed

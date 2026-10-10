@@ -116,3 +116,35 @@ def test_native_pair_means_match_explicit_kernels():
     broken=partners.copy(); broken[first,0]=-1
     with pytest.raises(ValueError,match='partners'):
         gxeldcore.pcgc_pair_means(args[0],broken,*args[2:])
+
+
+@pytest.mark.parametrize('exponent',[-400,400])
+def test_reciprocal_kernel_scaling_uses_direct_products(exponent):
+    data,_,base=fixture(n=24,m=19)
+    data.pop('x')
+    n=len(base)
+    other=np.array([np.delete(np.arange(n),i) for i in range(n)])
+    # Three annotations and three contexts admit the factorized reducer.
+    phi=np.column_stack((data['contexts'],data['contexts'][:,1]**2))
+    features=phi*(data['risk'].sensitivity/data['sd'])[:,None]
+    kernels=[]
+    for _ in range(3):
+        for u,v in context_pairs(3):
+            value=base*np.outer(features[:,u],features[:,v])
+            if u!=v: value+=value.T.copy()
+            np.fill_diagonal(value,0.)
+            kernels.append(value)
+    data.update(contexts=phi,features=features,partners=other,sampled=False,
+        pair_kernels=np.repeat(base[np.arange(n)[:,None],other,None],3,axis=2),
+        kernel_actions=np.asarray([value@data['response'] for value in kernels]).T,
+        genotype_diagonal=np.repeat(data['genotype_diagonal'],3,axis=1))
+    expected=build_sampling_moments(**data,native=False)
+    data['pair_kernels']=np.ldexp(data['pair_kernels'],exponent)
+    data['genotype_diagonal']=np.ldexp(data['genotype_diagonal'],exponent)
+    data['contexts']=np.ldexp(data['contexts'],-exponent//2)
+    data['features']=np.ldexp(data['features'],-exponent//2)
+    evidence={}
+    actual=build_sampling_moments(**data,native=True,threads=prediction_threads(),execution=evidence)
+    assert evidence['pair_reduction']=='direct_pair_products'
+    for name in ('constant','linear','quadratic','pair_constant','pair_linear','pair_quadratic'):
+        np.testing.assert_allclose(getattr(actual,name),getattr(expected,name),rtol=2e-10,atol=2e-14)

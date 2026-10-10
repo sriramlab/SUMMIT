@@ -336,11 +336,18 @@ class GeneralizedGxEPass2Executor:
         self._product_plan = build_pair_product_plan(basis_array.shape[1])
         self._residual_rank = residual_rank
         self._rhs_precomputed = bool(work_plan.tiling["rhs_precomputed"])
+        # With P=I, X.T diag(phi_u) diag(phi_v) S is symmetric in u,v.
+        # Projection between the context multiplications breaks this identity.
+        self._symmetric_context_cross = fixed.shape[1] == 0
+        self._rhs_pairs = tuple(
+            (u, v) for u in range(basis_array.shape[1])
+            for v in range(u if self._symmetric_context_cross else 0, basis_array.shape[1])
+        )
 
     def _precompute_rhs(self) -> Array:
         sources = self.pass1_result.contextual_sources
         k_count, q_count, n, b_count = sources.shape
-        family_count = q_count * q_count
+        family_count = len(self._rhs_pairs)
         rhs = np.empty(
             (n, k_count * b_count * family_count),
             dtype=np.float64,
@@ -349,13 +356,12 @@ class GeneralizedGxEPass2Executor:
         probe_offsets = np.arange(b_count, dtype=np.int64) * family_count
         for annotation in range(k_count):
             base = annotation * b_count * family_count
-            for target in range(q_count):
-                for source in range(q_count):
-                    columns = base + probe_offsets + target * q_count + source
-                    rhs[:, columns] = (
-                        self._basis[:, target, None]
-                        * sources[annotation, source]
-                    )
+            for family, (target, source) in enumerate(self._rhs_pairs):
+                columns = base + probe_offsets + family
+                rhs[:, columns] = (
+                    self._basis[:, target, None]
+                    * sources[annotation, source]
+                )
         return _readonly(rhs)
 
     def _fill_rhs_tile(
@@ -367,27 +373,22 @@ class GeneralizedGxEPass2Executor:
     ) -> Array:
         q_count = self._basis.shape[1]
         probe_count = probe_stop - probe_start
-        family_count = q_count * q_count
+        family_count = len(self._rhs_pairs)
         required_columns = probe_count * family_count
         target = arena[:, :required_columns]
         probe_offsets = np.arange(probe_count, dtype=np.int64) * family_count
         sources = self.pass1_result.contextual_sources
-        for target_coordinate in range(q_count):
-            for source_coordinate in range(q_count):
-                columns = (
-                    probe_offsets
-                    + target_coordinate * q_count
-                    + source_coordinate
-                )
-                target[:, columns] = (
-                    self._basis[:, target_coordinate, None]
-                    * sources[
-                        annotation,
-                        source_coordinate,
-                        :,
-                        probe_start:probe_stop,
-                    ]
-                )
+        for family, (target_coordinate, source_coordinate) in enumerate(self._rhs_pairs):
+            columns = probe_offsets + family
+            target[:, columns] = (
+                self._basis[:, target_coordinate, None]
+                * sources[
+                    annotation,
+                    source_coordinate,
+                    :,
+                    probe_start:probe_stop,
+                ]
+            )
         return target
 
     def execute(self) -> GeneralizedGxEPass2Result:
@@ -397,7 +398,7 @@ class GeneralizedGxEPass2Executor:
         p_count = len(self._pairs)
         c_count = len(self._components)
         variant_width = int(self.work_plan.tiling["variant_block_width"])
-        family_count = q_count * q_count
+        family_count = len(self._rhs_pairs)
         phase_seconds = {
             "pass2_total": 0.0,
             "rhs_precompute": 0.0,
@@ -545,23 +546,33 @@ class GeneralizedGxEPass2Executor:
                     maximum_rhs_bytes = max(maximum_rhs_bytes, rhs.nbytes)
                     tn_started = time.perf_counter()
                     cross_raw = self.tn_operator.matmul_tn(genotype, rhs)
-                    cross = np.asfortranarray(
-                        cross_raw / float(self._residual_rank),
-                        dtype=np.float64,
-                    )
+                    probe_count = probe_stop - probe_start
+                    if self._symmetric_context_cross:
+                        # Expand only the small target/probe panels. Holding
+                        # raw triangular and expanded panels uses no more space
+                        # than the two full square panels in the general path.
+                        cross = np.empty((q_count, q_count, block_width, probe_count))
+                        unique = cross_raw.T.reshape(probe_count, family_count, block_width).transpose(1, 2, 0)
+                        for family, (u, v) in enumerate(self._rhs_pairs):
+                            np.divide(unique[family], float(self._residual_rank), out=cross[u, v])
+                            if u != v:
+                                cross[v, u] = cross[u, v]
+                        panels = cross
+                        del unique
+                    else:
+                        cross = np.asfortranarray(
+                            cross_raw / float(self._residual_rank),
+                            dtype=np.float64,
+                        )
+                        panels = cross.T.reshape(
+                            probe_count, q_count, q_count, block_width,
+                        ).transpose(1, 2, 3, 0)
                     phase_seconds["protected_tn"] += (
                         time.perf_counter() - tn_started
                     )
                     maximum_cross_bytes = max(
                         maximum_cross_bytes, cross_raw.nbytes + cross.nbytes
                     )
-                    probe_count = probe_stop - probe_start
-                    panels = cross.T.reshape(
-                        probe_count,
-                        q_count,
-                        q_count,
-                        block_width,
-                    ).transpose(1, 2, 3, 0)
                     product_started = time.perf_counter()
                     if self.probe_product_sink is not None:
                         # The consumer owns and budgets its accumulators. It
@@ -730,6 +741,8 @@ class GeneralizedGxEPass2Executor:
                     "tn_operator": self.tn_operator.backend_name,
                     "threads": int(self.tn_operator.threads),
                     "rhs_precomputed": self._rhs_precomputed,
+                    "symmetric_context_cross": self._symmetric_context_cross,
+                    "context_products_per_probe": family_count,
                     "rhs_tile_columns": int(
                         self.work_plan.tiling["rhs_tile_columns"]
                     ),

@@ -176,6 +176,25 @@ def _symmetric_power_basis(size,degree):
     return powers,index
 
 
+def _factorization_scale_safe(base,features,response,leverage,probabilities):
+    """Keep separately formed powers away from float64 overflow/underflow.
+
+    Reciprocal rescalings of genotype and context can leave every kernel
+    unchanged while making its individual factors extreme. In that case use
+    the direct native kernel products. No values or weights are clipped.
+    Bounded scans avoid a second cohort-sized relatedness allocation.
+    """
+    if base.shape[1] > 2**32 or (probabilities is not None and probabilities.min() < 2.**-32):
+        return False
+    for array,power in ((base,192),(features,96),(response,96),(leverage,96)):
+        array = np.asarray(array)
+        for first in range(0,array.size,2**18):
+            values = np.abs(array.flat[first:first+2**18])
+            if values.max(initial=0.) > 2.**power or np.any((values != 0.) & (values < 2.**-power)):
+                return False
+    return True
+
+
 def _context_power_expansion(q,degree):
     """Expand products of symmetric context kernels into person monomials."""
     from itertools import product
@@ -465,6 +484,8 @@ def build_sampling_moments(*, pair_kernels, partners, kernel_actions, genotype_d
     products_backend = MatrixProducts(native=native,threads=threads)
     context_only = reference_annotation_gram is not None
     factorized = native and not context_only and factorized_pair_plan(k,q)
+    if factorized:
+        factorized = _factorization_scale_safe(base,features,response,leverage,probabilities)
     dimension = p if context_only else c
     upper = np.column_stack(np.triu_indices(dimension)).astype(np.int64)
     pair_index = np.empty((dimension,dimension),dtype=np.int64)

@@ -130,6 +130,7 @@ def _run_two_pass(
     pass1_probe_width: int = 5,
     threads: int = 1,
     row_complete_sink=None,
+    native: bool = False,
 ):
     plan = _plan(
         genotype,
@@ -152,7 +153,7 @@ def _run_two_pass(
         annotation_masses=np.sum(annotations, axis=0),
         probe_spec=spec,
         work_plan=plan,
-        nn_operator=NumpyNNOperator(threads=threads),
+        nn_operator=(ProtectedNNOperator if native else NumpyNNOperator)(threads=threads),
         annotation_tile_width=annotations.shape[1],
         probe_tile_width=min(pass1_probe_width, spec.probe_count),
         same_person_sample_tile_width=4,
@@ -166,13 +167,36 @@ def _run_two_pass(
         annotations=annotations,
         annotation_names=names,
         work_plan=plan,
-        tn_operator=NumpyTNOperator(threads=threads),
+        tn_operator=(ProtectedTNOperator if native else NumpyTNOperator)(threads=threads),
         probe_tile_width=(
             spec.probe_count if rhs_policy == "precompute" else rhs_probe_width
         ),
         row_complete_sink=row_complete_sink,
     ).execute()
     return result, pass1, operator, plan
+
+
+@pytest.mark.parametrize('q', [1, 3])
+@pytest.mark.parametrize('policy', ['tiled', 'precompute'])
+@pytest.mark.parametrize('native', [False, True])
+def test_unprojected_context_symmetry_preserves_directional_scores(q, policy, native):
+    from prediction_helpers import prediction_threads
+    genotype, basis, _, annotations, spec, probes = _fixture(q, 2, seed=51663)
+    fixed = np.empty((len(genotype), 0))
+    observed, _, operator, _ = _run_two_pass(
+        genotype=genotype, basis=basis, fixed=fixed, annotations=annotations,
+        spec=spec, variant_width=4, rhs_probe_width=spec.probe_count if policy=='precompute' else 3, rhs_policy=policy,
+        threads=prediction_threads(), native=native,
+    )
+    expected, _, _ = randomized_two_pass_ldscores(genotype, basis, fixed, annotations, probes)
+    np.testing.assert_allclose(observed.directional_ldscores, expected.directional_ldscores, rtol=1e-13, atol=1e-13)
+    np.testing.assert_allclose(observed.genetic_gram, expected.gram, rtol=2e-13, atol=2e-13)
+    np.testing.assert_allclose(observed.same_person, exact_same_person_matrix(genotype, basis, fixed, annotations),
+                               rtol=2e-13, atol=2e-13)
+    assert observed.telemetry['backend']['symmetric_context_cross']
+    assert observed.telemetry['backend']['context_products_per_probe'] == q*(q+1)//2
+    assert operator.observed_passes == 2
+    assert operator.observed_variant_visits == 2*genotype.shape[1]
 
 
 def test_pair_product_plan_derives_one_two_four_from_orientations_only() -> None:
