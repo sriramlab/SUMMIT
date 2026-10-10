@@ -189,6 +189,54 @@ def test_pass1_fixed_global_probes_match_dense_oracle_and_seal_barrier() -> None
     )
 
 
+@pytest.mark.parametrize("layout", ["disjoint", "unassigned", "overlap"])
+@pytest.mark.parametrize("variant_width", [1, 4, 10])
+@pytest.mark.parametrize("native", [False, True])
+def test_annotation_source_packing_matches_global_probe_oracle(layout, variant_width, native):
+    from prediction_helpers import prediction_threads
+    genotype, basis, fixed, annotations, spec, probes = _fixture(probe_count=13)
+    annotations[:8, 1] = 0.
+    annotations[8:, 0] = 0.
+    if layout == "unassigned":
+        annotations[[2, 5]] = 0.
+    elif layout == "overlap":
+        annotations[0, 1] = .7
+    plan = _plan(genotype, basis, annotations, spec.probe_count, variant_width=variant_width, rhs_width=5)
+    operator = ArraySequentialGenotypeOperator(genotype)
+    result = GeneralizedGxEPass1Executor(
+        genotype_operator=operator, basis=basis, fixed_effect_basis=fixed, annotations=annotations,
+        annotation_names=("first", "second"), annotation_masses=annotations.sum(0),
+        probe_spec=spec, work_plan=plan, probe_tile_width=5, retain_base_sources=True,
+        nn_operator=(ProtectedNNOperator if native else NumpyNNOperator)(threads=prediction_threads()),
+    ).execute()
+    expected_base, expected_context = pass1_sources(genotype, basis, fixed, annotations, probes)
+    np.testing.assert_allclose(result.base_sources, expected_base, rtol=5e-14, atol=5e-14)
+    np.testing.assert_allclose(result.contextual_sources, expected_context, rtol=5e-14, atol=5e-14)
+    compact = layout != "overlap"
+    assert result.telemetry["backend"]["compact_annotation_sources"] == compact
+    products = np.count_nonzero(annotations) if compact else annotations.size
+    assert result.telemetry["source_nn"]["leading_flops"] == 2*len(genotype)*spec.probe_count*products
+    assert result.telemetry["allocation_ledger"]["maximum_annotation_pack_bytes"] <= plan.memory["singleton_annotation_source_genotype"]
+    assert operator.observed_variant_visits == genotype.shape[1]
+    result.ledger.validate_pass1_barrier()
+
+
+def test_annotation_packing_requires_reserved_workspace():
+    from dataclasses import replace
+    genotype, basis, fixed, annotations, spec, _ = _fixture(probe_count=13)
+    annotations[::2, 1] = 0.
+    annotations[1::2, 0] = 0.
+    plan = _plan(genotype, basis, annotations, spec.probe_count, variant_width=4, rhs_width=5)
+    plan = replace(plan, memory=dict(plan.memory, singleton_annotation_source_genotype=0))
+    result = GeneralizedGxEPass1Executor(
+        genotype_operator=ArraySequentialGenotypeOperator(genotype), basis=basis, fixed_effect_basis=fixed,
+        annotations=annotations, annotation_names=("first", "second"), annotation_masses=annotations.sum(0),
+        probe_spec=spec, work_plan=plan, probe_tile_width=5, nn_operator=NumpyNNOperator(),
+    ).execute()
+    assert not result.telemetry["backend"]["compact_annotation_sources"]
+    assert result.telemetry["allocation_ledger"]["maximum_annotation_pack_bytes"] == 0
+
+
 @pytest.mark.parametrize(
     ("variant_width", "probe_width", "annotation_width"),
     ((1, 1, 1), (4, 7, 2), (10, 37, 1)),

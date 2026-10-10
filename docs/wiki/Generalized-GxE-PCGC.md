@@ -212,6 +212,8 @@ no Monte Carlo approximation. Gaussian SNP-effect covariance uses separate
 probe families and four participant groups.
 When no projection follows context weighting, the reference calculation also
 reuses the equal cross-products for context pairs `(u, v)` and `(v, u)`.
+For disjoint annotation bins, source sketches use only the variants in each
+bin, preserving their global probe identities.
 
 `summit.context.binary` exposes `prepare_gxe_moments`, `prepare_gxe_external`,
 `fit_gxe`, `evaluate_contexts`, and `plan_gxe_reference`. File-backed

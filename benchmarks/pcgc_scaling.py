@@ -46,6 +46,8 @@ def main():
     old_sampling,sh=previous(args.baseline,'sampling')
     old_architecture,ah=previous(args.baseline,'architecture')
     old_pass2,ph=previous(args.baseline,'generalized_gxe_pass2','ldscore')
+    old_pass1,p1h=previous(args.baseline,'generalized_gxe_pass1','ldscore')
+    old_pass2.GeneralizedGxEPass1Result=old_pass1.GeneralizedGxEPass1Result
     backend=MatrixProducts(native=True)
     threads=backend.threads
     rng=np.random.default_rng(20261009)
@@ -114,6 +116,7 @@ def main():
     from summit.pcgc import reference
     from summit.ldscore.generalized_gxe_pass1 import ArraySequentialGenotypeOperator
     current_pass2=reference.GeneralizedGxEPass2Executor
+    current_pass1=reference.GeneralizedGxEPass1Executor
     x=np.asfortranarray(np.column_stack([block for _,_,block in blocks]))
     try:
         for repeat in range(args.repeats):
@@ -122,6 +125,8 @@ def main():
             for name in order:
                 reference.GeneralizedGxEPass2Executor=(old_pass2.GeneralizedGxEPass2Executor
                     if name=='baseline' else current_pass2)
+                reference.GeneralizedGxEPass1Executor=(old_pass1.GeneralizedGxEPass1Executor
+                    if name=='baseline' else current_pass1)
                 collector=reference.ProbeGramCollector(annotation,q,args.reference_probes,n,native=True,threads=threads)
                 gc.collect()
                 started=perf_counter()
@@ -145,14 +150,15 @@ def main():
             del results,result,collector,left,right
     finally:
         reference.GeneralizedGxEPass2Executor=current_pass2
+        reference.GeneralizedGxEPass1Executor=current_pass1
     import summit
     root=Path(summit.__file__).resolve().parents[2]
     result=dict(passed=True,n=n,m=m,k=k,q=q,partners=args.partners,architecture_probes=args.architecture_probes,
         block_size=args.block_size,threads=threads,numpy=np.__version__,records=records,
-        baseline_sha256=dict(sampling=sh,architecture=ah,pass2=ph),
+        baseline_sha256=dict(sampling=sh,architecture=ah,pass1=p1h,pass2=ph),
         current_sha256={name:hashlib.sha256((root/name).read_bytes()).hexdigest() for name in
             ('src/summit/pcgc/sampling.py','src/summit/pcgc/architecture.py','src/native/pcgc_moments.inc',
-             'src/summit/ldscore/generalized_gxe_pass2.py')},
+             'src/summit/ldscore/generalized_gxe_pass1.py','src/summit/ldscore/generalized_gxe_pass2.py')},
         combined_peak_rss_gib=resource.getrusage(resource.RUSAGE_SELF).ru_maxrss/2**20,
         native_build=backend.module.build_info())
     with args.out.open('x') as stream:

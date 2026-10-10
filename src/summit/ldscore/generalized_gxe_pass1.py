@@ -554,6 +554,12 @@ class GeneralizedGxEPass1Executor:
         self._masses = _readonly(np.array(masses, copy=True))
         self._pairs = pair_index
         self._components = component_index
+        self._compact_annotation_sources = (
+            weights.shape[1] > 1
+            and int(work_plan.memory.get("singleton_annotation_source_genotype", 0))
+            >= 8 * n * int(work_plan.tiling["variant_block_width"])
+            and bool(np.all(np.count_nonzero(weights, axis=1) <= 1))
+        )
 
     def _global_probes(self, variants: Array, probes: Array) -> Array:
         if self.native_probe_module is False:
@@ -587,6 +593,7 @@ class GeneralizedGxEPass1Executor:
         phase_seconds = {
             "pass1_total": 0.0,
             "decode": 0.0,
+            "annotation_pack": 0.0,
             "probe_rhs": 0.0,
             "protected_nn": 0.0,
             "projection": 0.0,
@@ -599,6 +606,7 @@ class GeneralizedGxEPass1Executor:
         maximum_probe_bytes = 0
         maximum_rhs_bytes = 0
         maximum_nn_output_bytes = 0
+        maximum_annotation_pack_bytes = 0
         nn_flops = 0
         nn_dimension_counts: dict[str, int] = {}
 
@@ -620,6 +628,26 @@ class GeneralizedGxEPass1Executor:
                 raise RuntimeError("decoded genotype block identity/scale mismatch")
             genotype = block.values
             maximum_decoded_bytes = max(maximum_decoded_bytes, genotype.nbytes)
+            source_columns = source_genotypes = packed_genotype = None
+            if self._compact_annotation_sources:
+                pack_started = time.perf_counter()
+                source_columns = tuple(
+                    np.flatnonzero(self._annotations[row_start:row_stop, annotation])
+                    for annotation in range(k_count)
+                )
+                order = np.concatenate(source_columns)
+                # Disjoint bins occupy at most one additional genotype block,
+                # already reserved by the shared reference memory planner.
+                packed_genotype = np.asfortranarray(genotype[:, order])
+                offsets = np.cumsum([0, *(len(columns) for columns in source_columns)])
+                source_genotypes = tuple(
+                    packed_genotype[:, offsets[a]:offsets[a + 1]]
+                    for a in range(k_count)
+                )
+                maximum_annotation_pack_bytes = max(
+                    maximum_annotation_pack_bytes, packed_genotype.nbytes
+                )
+                phase_seconds["annotation_pack"] += time.perf_counter() - pack_started
             variants = np.arange(row_start, row_stop, dtype=np.int64)
             for probe_start in range(0, b_count, self.probe_tile_width):
                 probe_stop = min(b_count, probe_start + self.probe_tile_width)
@@ -638,11 +666,18 @@ class GeneralizedGxEPass1Executor:
                         k_count, annotation_start + self.annotation_tile_width
                     )
                     for annotation in range(annotation_start, annotation_stop):
+                        selected = (slice(None) if source_columns is None
+                                    else source_columns[annotation])
+                        source = (genotype if source_genotypes is None
+                                  else source_genotypes[annotation])
+                        if not source.shape[1]:
+                            del source
+                            continue
                         rhs = np.asfortranarray(
                             np.sqrt(
-                                self._annotations[row_start:row_stop, annotation]
+                                self._annotations[row_start:row_stop, annotation][selected]
                             )[:, None]
-                            * probes,
+                            * probes[selected],
                             dtype=np.float64,
                         )
                         maximum_rhs_bytes = max(maximum_rhs_bytes, rhs.nbytes)
@@ -650,7 +685,7 @@ class GeneralizedGxEPass1Executor:
                             time.perf_counter() - rhs_started
                         )
                         nn_started = time.perf_counter()
-                        contribution = self.nn_operator.matmul(genotype, rhs)
+                        contribution = self.nn_operator.matmul(source, rhs)
                         phase_seconds["protected_nn"] += (
                             time.perf_counter() - nn_started
                         )
@@ -660,7 +695,7 @@ class GeneralizedGxEPass1Executor:
                         base[
                             annotation, :, probe_start:probe_stop
                         ] += contribution
-                        length = row_stop - row_start
+                        length = source.shape[1]
                         columns = probe_stop - probe_start
                         nn_flops += 2 * n * length * columns
                         shape_key = f"{n}x{length}x{columns}"
@@ -668,10 +703,10 @@ class GeneralizedGxEPass1Executor:
                             nn_dimension_counts.get(shape_key, 0) + 1
                         )
                         rhs_started = time.perf_counter()
-                        del rhs, contribution
+                        del rhs, contribution, source
                 del probes
             ledger.record_block(row_start, row_stop)
-            del genotype, block
+            del genotype, block, source_genotypes, packed_genotype
         self.genotype_operator.finish_pass()
         ledger.finish_pass()
         ledger.validate_pass1_barrier()
@@ -737,6 +772,7 @@ class GeneralizedGxEPass1Executor:
             "maximum_probe_tile_bytes": maximum_probe_bytes,
             "maximum_rhs_tile_bytes": maximum_rhs_bytes,
             "maximum_nn_output_bytes": maximum_nn_output_bytes,
+            "maximum_annotation_pack_bytes": maximum_annotation_pack_bytes,
             "maximum_projection_scratch_bytes": maximum_projection_scratch_bytes,
             "planned_peak_resident_bytes": self.work_plan.peak_resident_bytes,
             "memory_limit_bytes": self.work_plan.memory_limit_bytes,
@@ -751,6 +787,7 @@ class GeneralizedGxEPass1Executor:
                     "genotype_operator": self.genotype_operator.backend_name,
                     "nn_operator": self.nn_operator.backend_name,
                     "threads": int(self.nn_operator.threads),
+                    "compact_annotation_sources": self._compact_annotation_sources,
                     "genotype_scale_id": self.genotype_operator.genotype_scale_id,
                     "descriptor": self.genotype_operator.descriptor_record,
                     "packed_backend_used": False,
