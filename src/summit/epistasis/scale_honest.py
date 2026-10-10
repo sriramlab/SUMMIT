@@ -19,9 +19,12 @@ def _sample_keys(values, n):
     ids = np.asarray(values)
     if ids.ndim != 1 or len(ids) != n or ids.dtype.kind not in 'USiu':
         raise ValueError('aligned, nonmissing string or integer sample IDs required')
-    keys = [str(v) for v in ids.tolist()]
-    if any(not v for v in keys) or len(set(keys)) != len(keys):
-        raise ValueError('unique nonempty sample IDs required')
+    try:
+        keys = [v.decode('utf-8') if isinstance(v,bytes) else str(v) for v in ids.tolist()]
+    except UnicodeDecodeError as error:
+        raise ValueError('sample ID bytes must be valid UTF-8') from error
+    if any(not v or '\n' in v for v in keys) or len(set(keys)) != len(keys):
+        raise ValueError('unique nonempty single-line sample IDs required')
     return keys
 
 

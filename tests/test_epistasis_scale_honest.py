@@ -91,6 +91,13 @@ def test_full_fallback_scalar_and_independence_validation():
         boxcox_honest_scale_test(pg,py,cg,cy,gamma=.05,**args)
     with pytest.raises(ValueError,match='unique'):
         boxcox_honest_scale_test(pg,py,cg,cy,**(args|{'pilot_ids':np.zeros(700,dtype=int)}))
+    with pytest.raises(ValueError,match='overlap'):
+        boxcox_honest_scale_test(pg,py,cg,cy,**(args|{
+            'pilot_ids':np.arange(700).astype('S'),
+            'confirmation_ids':np.arange(900).astype('U')}))
+    bad=np.arange(700).astype('U20');bad[0]='first\nsecond'
+    with pytest.raises(ValueError,match='single-line'):
+        boxcox_honest_scale_test(pg,py,cg,cy,**(args|{'pilot_ids':bad}))
 
 
 def test_empty_pilot_set_requires_no_confirmation_fit():

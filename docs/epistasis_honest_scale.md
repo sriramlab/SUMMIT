@@ -30,6 +30,8 @@ The default projects out one direction when q>1 and its pilot derivative
 Wald p<.01; otherwise it retains q coefficients. This threshold affects power,
 not the size proof. Pilot selection and uncertainty in d are allowed because
 L is fixed conditional on A and the null full vector is zero.
+The derivative tail probability at the data-selected anchor is a selection
+score, not a separately calibrated test establishing scale identification.
 
 For each lambda in C_A, B fits the exact transformed outcome and computes
 
