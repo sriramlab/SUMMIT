@@ -32,6 +32,26 @@ def _readonly(value: Array) -> Array:
     return value
 
 
+def _moderate_product_factors(value: Array) -> bool:
+    """Admit separate squares without losing reciprocal-scale cancellation."""
+    flat = value.ravel(order="K")
+    for first in range(0, flat.size, 2**18):
+        magnitude = np.abs(flat[first:first + 2**18])
+        if (magnitude.max(initial=0.) > 2.**128
+                or np.any((magnitude != 0.) & (magnitude < 2.**-128))):
+            return False
+    return True
+
+
+def _fill_weighted_source(target: Array, source: Array, weights: Array) -> None:
+    # A small row-major product avoids repeatedly traversing the full
+    # participant axis while copying into strided probe/family columns.
+    width = max(1, 32768 // source.shape[1])
+    for first in range(0, len(source), width):
+        last = min(len(source), first + width)
+        target[first:last] = weights[first:last, None] * source[first:last]
+
+
 @dataclass(frozen=True)
 class PairProductTerm:
     first_target: int
@@ -343,6 +363,15 @@ class GeneralizedGxEPass2Executor:
             (u, v) for u in range(basis_array.shape[1])
             for v in range(u if self._symmetric_context_cross else 0, basis_array.shape[1])
         )
+        self._diagonal_nn = None
+        if (self._symmetric_context_cross and _moderate_product_factors(basis_array)
+                and _moderate_product_factors(weights)):
+            from .generalized_gxe_pass1 import NumpyNNOperator, ProtectedNNOperator
+            self._diagonal_nn = (
+                ProtectedNNOperator(threads=tn_operator.threads, native_module=tn_operator._module)
+                if isinstance(tn_operator, ProtectedTNOperator)
+                else NumpyNNOperator(threads=tn_operator.threads)
+            )
 
     def _precompute_rhs(self) -> Array:
         sources = self.pass1_result.contextual_sources
@@ -353,14 +382,12 @@ class GeneralizedGxEPass2Executor:
             dtype=np.float64,
             order="F",
         )
-        probe_offsets = np.arange(b_count, dtype=np.int64) * family_count
         for annotation in range(k_count):
             base = annotation * b_count * family_count
             for family, (target, source) in enumerate(self._rhs_pairs):
-                columns = base + probe_offsets + family
-                rhs[:, columns] = (
-                    self._basis[:, target, None]
-                    * sources[annotation, source]
+                _fill_weighted_source(
+                    rhs[:, base+family:base+b_count*family_count:family_count],
+                    sources[annotation, source], self._basis[:, target],
                 )
         return _readonly(rhs)
 
@@ -371,23 +398,20 @@ class GeneralizedGxEPass2Executor:
         probe_start: int,
         probe_stop: int,
     ) -> Array:
-        q_count = self._basis.shape[1]
         probe_count = probe_stop - probe_start
         family_count = len(self._rhs_pairs)
         required_columns = probe_count * family_count
         target = arena[:, :required_columns]
-        probe_offsets = np.arange(probe_count, dtype=np.int64) * family_count
         sources = self.pass1_result.contextual_sources
         for family, (target_coordinate, source_coordinate) in enumerate(self._rhs_pairs):
-            columns = probe_offsets + family
-            target[:, columns] = (
-                self._basis[:, target_coordinate, None]
-                * sources[
+            _fill_weighted_source(
+                target[:, family::family_count],
+                sources[
                     annotation,
                     source_coordinate,
                     :,
                     probe_start:probe_stop,
-                ]
+                ], self._basis[:, target_coordinate],
             )
         return target
 
@@ -446,9 +470,13 @@ class GeneralizedGxEPass2Executor:
         maximum_lrow_bytes = 0
         maximum_reduction_bytes = 0
         maximum_component_diagonal_scratch_bytes = 0
+        factored_diagonal_tiles = 0
+        diagonal_nn_flops = 0
         tn_flops = 0
         tn_dimension_counts: dict[str, int] = {}
 
+        if self._diagonal_nn is not None:
+            self._diagonal_nn.begin_execution()
         self.tn_operator.begin_execution()
         ledger = self.pass1_result.ledger
         ledger.begin_pass(2)
@@ -482,6 +510,35 @@ class GeneralizedGxEPass2Executor:
                 )
                 sample_slice = slice(sample_start, sample_stop)
                 sample_width = sample_stop - sample_start
+                squares = None
+                if self._diagonal_nn is not None:
+                    squares = np.absolute(genotype[sample_slice], order="F")
+                    if not _moderate_product_factors(squares):
+                        squares = None
+                if squares is not None:
+                    # With P=I, every contextual diagonal is phi_u phi_v
+                    # times the same annotation-weighted genotype square sum.
+                    # Square each genotype tile once, then expand the small
+                    # participant-by-annotation result across context pairs.
+                    np.square(squares, out=squares)
+                    annotation_product = self._diagonal_nn.matmul(
+                        squares, np.asfortranarray(annotation_block)
+                    )
+                    for pair in self._pairs.entries:
+                        factors = (float(pair.kernel_factor)
+                                   * self._basis[sample_slice, pair.q]
+                                   * self._basis[sample_slice, pair.r])
+                        component_diagonal_numerator[
+                            pair.index::p_count, sample_slice
+                        ] += annotation_product.T * factors[None, :]
+                    maximum_component_diagonal_scratch_bytes = max(
+                        maximum_component_diagonal_scratch_bytes,
+                        squares.nbytes + annotation_product.nbytes + factors.nbytes,
+                    )
+                    del squares, annotation_product, factors
+                    factored_diagonal_tiles += 1
+                    diagonal_nn_flops += 2 * sample_width * block_width * k_count
+                    continue
                 feature_tile = np.empty(
                     (q_count, sample_width, block_width), dtype=np.float64
                 )
@@ -646,7 +703,9 @@ class GeneralizedGxEPass2Executor:
         self.genotype_operator.finish_pass()
         ledger.finish_pass()
         native_telemetry = self.tn_operator.finish_execution()
-        for _ in range(int(self.tn_operator.repaired_columns)):
+        diagonal_repairs = (0 if self._diagonal_nn is None
+                            else int(self._diagonal_nn.repaired_columns))
+        for _ in range(int(self.tn_operator.repaired_columns) + diagonal_repairs):
             ledger.record_repair()
 
         if (
@@ -743,6 +802,7 @@ class GeneralizedGxEPass2Executor:
                     "rhs_precomputed": self._rhs_precomputed,
                     "symmetric_context_cross": self._symmetric_context_cross,
                     "context_products_per_probe": family_count,
+                    "factored_diagonal_tiles": factored_diagonal_tiles,
                     "rhs_tile_columns": int(
                         self.work_plan.tiling["rhs_tile_columns"]
                     ),
@@ -780,6 +840,11 @@ class GeneralizedGxEPass2Executor:
                         )
                         / 1.0e9
                     ),
+                },
+                "component_diagonal_nn": {
+                    "calls": 0 if self._diagonal_nn is None else int(self._diagonal_nn.calls),
+                    "repaired_columns": diagonal_repairs,
+                    "leading_flops": diagonal_nn_flops,
                 },
                 "allocation_ledger": allocation_ledger,
                 "native": native_telemetry,

@@ -724,6 +724,10 @@ class GeneralizedGxEPass1Executor:
         maximum_relative_leakage = 0.0
         for annotation in range(k_count):
             for coordinate in range(q_count):
+                if not self._fixed.shape[1]:
+                    np.multiply(self._basis[:, coordinate, None], base[annotation],
+                                out=contextual[annotation, coordinate])
+                    continue
                 weighted = np.asfortranarray(
                     self._basis[:, coordinate, None] * base[annotation]
                 )

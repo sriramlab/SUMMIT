@@ -195,8 +195,61 @@ def test_unprojected_context_symmetry_preserves_directional_scores(q, policy, na
                                rtol=2e-13, atol=2e-13)
     assert observed.telemetry['backend']['symmetric_context_cross']
     assert observed.telemetry['backend']['context_products_per_probe'] == q*(q+1)//2
+    assert observed.telemetry['backend']['factored_diagonal_tiles'] > 0
     assert operator.observed_passes == 2
     assert operator.observed_variant_visits == 2*genotype.shape[1]
+
+
+@pytest.mark.parametrize("exponent", [-550, 550])
+def test_unprojected_diagonal_preserves_reciprocal_genotype_context_scales(exponent):
+    genotype, basis, _, annotations, spec, probes = _fixture(3, 2, seed=42156)
+    fixed = np.empty((len(genotype), 0))
+    expected, _, _ = randomized_two_pass_ldscores(genotype, basis, fixed, annotations, probes)
+    observed, _, _, _ = _run_two_pass(
+        genotype=np.ldexp(genotype, exponent), basis=np.ldexp(basis, -exponent), fixed=fixed,
+        annotations=annotations, spec=spec, variant_width=4, rhs_probe_width=3, rhs_policy="tiled",
+    )
+    np.testing.assert_allclose(observed.directional_ldscores, expected.directional_ldscores, rtol=2e-13, atol=2e-13)
+    np.testing.assert_allclose(observed.same_person,
+                               exact_same_person_matrix(genotype, basis, fixed, annotations),
+                               rtol=2e-13, atol=2e-13)
+    assert observed.telemetry['backend']['factored_diagonal_tiles'] == 0
+
+
+@pytest.mark.parametrize("exponent", [-200, 200])
+def test_unprojected_diagonal_falls_back_for_extreme_genotype_tiles(exponent):
+    genotype, basis, _, annotations, spec, probes = _fixture(3, 2, seed=42156)
+    fixed = np.empty((len(genotype), 0))
+    expected, _, _ = randomized_two_pass_ldscores(genotype, basis, fixed, annotations, probes)
+    observed, _, _, _ = _run_two_pass(
+        genotype=np.ldexp(genotype, exponent), basis=basis, fixed=fixed,
+        annotations=annotations, spec=spec, variant_width=4, rhs_probe_width=3, rhs_policy="tiled",
+    )
+    np.testing.assert_allclose(np.ldexp(observed.directional_ldscores, -4*exponent),
+                               expected.directional_ldscores, rtol=2e-13, atol=2e-13)
+    np.testing.assert_allclose(np.ldexp(observed.same_person, -4*exponent),
+                               exact_same_person_matrix(genotype, basis, fixed, annotations),
+                               rtol=2e-13, atol=2e-13)
+    assert observed.telemetry['backend']['factored_diagonal_tiles'] == 0
+
+
+def test_unprojected_diagonal_repairs_are_included_in_reference_ledger(monkeypatch):
+    import summit.ldscore.generalized_gxe_pass1 as pass1_module
+    class RepairedNN(NumpyNNOperator):
+        def matmul(self, left, right):
+            result = super().matmul(left, right)
+            self.repaired_columns += 1
+            return result
+    monkeypatch.setattr(pass1_module, "NumpyNNOperator", RepairedNN)
+    genotype, basis, _, annotations, spec, _ = _fixture(3, 2, seed=42156)
+    observed, _, _, _ = _run_two_pass(
+        genotype=genotype, basis=basis, fixed=np.empty((len(genotype), 0)),
+        annotations=annotations, spec=spec, variant_width=4, rhs_probe_width=3, rhs_policy="tiled",
+    )
+    evidence = observed.telemetry["component_diagonal_nn"]
+    assert evidence["calls"] > 0
+    assert evidence["repaired_columns"] == evidence["calls"]
+    assert observed.telemetry["pass_ledger"]["repair_count"] == evidence["repaired_columns"]
 
 
 def test_pair_product_plan_derives_one_two_four_from_orientations_only() -> None:
