@@ -705,8 +705,46 @@ def _panel_projected_solve(operator, rhs, fixed, theta):
     return result, report
 
 
+def conditional_score_memory_plan(training, complete, *, feature_count,
+                                  training_fixed_count, confirmation_fixed_count,
+                                  mean_tangents=False):
+    """Plan a joint panel before covariance estimation or phenotype fitting.
+
+    Counts are stored columns (not fitted ranks). The total covers both
+    operators, panel inputs and conservative simultaneous workspaces. Unrelated
+    caller-owned arrays must be reserved separately. Per-operator memory limits
+    are local product/solver caps, not the aggregate budget for this plan.
+    """
+    counts = (feature_count, training_fixed_count, confirmation_fixed_count)
+    if (any(isinstance(v, (bool, np.bool_)) or not isinstance(v, (int, np.integer))
+            or v < 1 for v in counts) or feature_count > 512):
+        raise ValueError('positive fixed-column counts and 1..512 panel features required')
+    p, d0, d1 = map(int, counts)
+    n0, n = len(training.rows), len(complete.rows)
+    n1, k = n-n0, training.count
+    if n0 < 2 or n1 < 2 or k != complete.count:
+        raise ValueError('compatible training and complete operator dimensions required')
+    inputs = 8*(n0*(1+p+d0)+n1*(1+p+d1)+k)
+    # Confirmation QR holds the tangent-augmented nuisance matrix, its
+    # normalized copies, basis and factorization workspace simultaneously.
+    workspace = 8*(10*n0*(p+1)+6*n*p+6*n1*(d1+k*bool(mean_tangents))+6*p*p)
+    workspace += 8*n0*(k*(24+2*d0) if mean_tangents else 4*d0)
+    if mean_tangents:
+        workspace += 24*k*n1
+    # Reserve the widest native product even when the operator can afford to
+    # process every RHS at once. Smaller operator caps may still force tiling.
+    width = max(p+1, k-1 if mean_tangents else 0)
+    products = max(8*len(op.rows)*width*(op.count+4+8*op.contexts.shape[1]+8)
+                   for op in (training, complete))
+    operators = int(training.base_bytes+complete.base_bytes)
+    return dict(operator_bytes=operators, input_bytes=inputs,
+        workspace_bytes=workspace, product_workspace_bytes=products,
+        total_bytes=operators+inputs+workspace+products)
+
+
 def conditional_score(training, complete, training_index, confirmation_index,
-                      y0, y1, f0, f1, c0, c1, theta, *, mean_tangents=False):
+                      y0, y1, f0, f1, c0, c1, theta, *, mean_tangents=False,
+                      memory_bytes=None):
     """Joint finite-panel response and full covariance through native products.
 
     Feature columns belong to one phenotype, unlike the independent scalar
@@ -714,6 +752,11 @@ def conditional_score(training, complete, training_index, confirmation_index,
     only their estimable span. Near singular independent directions are
     rejected, rather than silently changing the tested hypothesis. Estimated
     covariance and tangent adjustment still require statistical validation.
+
+    memory_bytes is the aggregate allowance for both operators and this panel,
+    after reserving unrelated caller-owned arrays. If omitted, the smaller
+    operator cap is retained as the conservative legacy aggregate allowance.
+    Explicit aggregate admission never raises either operator's own cap.
     """
     i0, i1 = np.asarray(training_index), np.asarray(confirmation_index)
     n = len(complete.rows)
@@ -741,15 +784,17 @@ def conditional_score(training, complete, training_index, confirmation_index,
             or theta.shape != (training.count,) or np.any(theta < 0)
             or not all(np.all(np.isfinite(v)) for v in (y0,y1,f0,f1,c0,c1,theta))):
         raise ValueError("finite aligned phenotype, nuisance, covariance and 1..512 panel features required")
-    p = f0.shape[1]
-    workspace = sum(v.nbytes for v in (y0,y1,f0,f1,c0,c1,theta))
-    workspace += 8*(10*len(i0)*(p+1)+6*n*p+6*len(i1)*c1.shape[1]+6*p*p)
-    if mean_tangents:
-        workspace += 8*training.count*(24+2*c0.shape[1])*len(i0)
-        workspace += 24*training.count*len(i1)
-    planned = training.base_bytes+complete.base_bytes+workspace
-    if planned > min(training.memory_bytes,complete.memory_bytes):
-        raise MemoryError('joint conditional panel exceeds aggregate operator memory budget')
+    memory_plan = conditional_score_memory_plan(training, complete,
+        feature_count=f0.shape[1], training_fixed_count=c0.shape[1],
+        confirmation_fixed_count=c1.shape[1], mean_tangents=mean_tangents)
+    planned = memory_plan['total_bytes']
+    budget = min(training.memory_bytes, complete.memory_bytes) if memory_bytes is None else memory_bytes
+    if (isinstance(budget, (bool, np.bool_)) or not isinstance(budget, (int, np.integer))
+            or budget <= 0):
+        raise ValueError('positive integer aggregate memory_bytes required')
+    if planned > budget:
+        raise MemoryError(f'joint conditional panel requires {planned} bytes; aggregate budget is {budget}; '
+            'reserve caller arrays separately and supply memory_bytes when operator caps are partitioned')
     # Use training and confirmation mean-free coordinates separately.
     # Q1'(Y1 - V10 P0 Y0) is independent of Q0'Y0 for known covariance,
     # where Qj'Cj=0 and P0=Q0 (Q0'V00 Q0)^-1 Q0'. This does not require
@@ -813,6 +858,7 @@ def conditional_score(training, complete, training_index, confirmation_index,
     return dict(beta=beta, covariance=covariance, contrast=contrast.T, response=response,
         information=response.T@response, prediction=prediction, solver_reports=reports,
         rhs_spans=[first.panel_span,second.panel_span],memory_plan_bytes=planned,
+        memory_plan=memory_plan, memory_budget_bytes=int(budget),
         diagnostics=dict(nuisance_training_n=len(i0),confirmation_n=len(i1),
             fixed_rank=basis.shape[1],feature_rank=int(keep.sum()),
             max_leverage=float(leverage.max()),minimum_feature_effective_support=effective,

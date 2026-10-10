@@ -135,6 +135,71 @@ def test_training_absorbed_products_keep_confirmation_information():
     assert fit['rhs_spans'][0]['rhs_columns']==3
     assert fit['diagnostics']['feature_rank']==2
 
+
+def test_joint_memory_budget_with_partitioned_operator_caps():
+    from summit.epistasis.polygenic import conditional_score, conditional_score_memory_plan
+    from scripts.epistasis.conditional_polygenic_reference import conditional_null, innovation_score
+    rng, make, kernels, i0, i1, c = fixture()
+    training, complete = make(i0, 'packed'), make(np.arange(len(c)))
+    y = rng.normal(size=len(c)); f = rng.normal(size=(len(c), 2))
+    theta = np.array([.8, .3, .4, .7, .2])
+    plan = conditional_score_memory_plan(training, complete, feature_count=2,
+        training_fixed_count=c.shape[1], confirmation_fixed_count=c.shape[1])
+    # The caller reserves the other operator before assigning each local cap.
+    # Both operators fit in the shared allocation, but neither local cap is an
+    # aggregate allowance. This reproduces the full-cohort driver's failure.
+    budget = plan['total_bytes']+2**20
+    training.memory_bytes = budget-complete.base_bytes
+    complete.memory_bytes = budget-training.base_bytes
+    caps = training.memory_bytes, complete.memory_bytes
+    args = (training, complete, i0, i1, y[i0], y[i1], f[i0], f[i1], c[i0], c[i1], theta)
+    calls = training.stream.ledger.operator_calls, complete.stream.ledger.operator_calls
+    with pytest.raises(MemoryError, match='aggregate budget'):
+        conditional_score(*args)
+    with pytest.raises(MemoryError, match='aggregate budget'):
+        conditional_score(*args, memory_bytes=plan['total_bytes']-1)
+    assert calls == (training.stream.ledger.operator_calls, complete.stream.ledger.operator_calls)
+    actual = conditional_score(*args, memory_bytes=budget)
+    assert caps == (training.memory_bytes, complete.memory_bytes)
+    assert actual['memory_plan'] == plan
+    assert actual['memory_budget_bytes'] == budget
+    order = np.r_[i0, i1]
+    v = np.einsum('k,kij->ij', theta, kernels[:, order][:, :, order])
+    transfer, q = conditional_null(v, c[order], len(i0))
+    expected = innovation_score(y[i0], y[i1], f[i0], f[i1], c[i1], transfer, q)
+    np.testing.assert_allclose(actual['beta'], expected['beta'], atol=3e-8, rtol=2e-6)
+    np.testing.assert_allclose(actual['covariance'], expected['covariance'], atol=3e-8, rtol=2e-6)
+    # An explicit aggregate allowance must not disable local product admission.
+    training.memory_bytes = training.base_bytes
+    with pytest.raises(MemoryError, match='memory'):
+        conditional_score(*args, memory_bytes=budget)
+    for invalid in (0, -1, True, float(budget)):
+        with pytest.raises(ValueError, match='integer aggregate'):
+            conditional_score(*args, memory_bytes=invalid)
+
+
+def test_joint_memory_preflight_includes_tangent_nuisance_and_product_workspace():
+    from types import SimpleNamespace
+    from summit.epistasis.polygenic import conditional_score_memory_plan
+    # Shape-only preflight runs before genotype loading or expensive HE fits.
+    def operator(n, base):
+        return SimpleNamespace(rows=range(n), count=5, base_bytes=base,
+            contexts=SimpleNamespace(shape=(n, 2)))
+    training, complete = operator(63784, 9*2**30), operator(319132, 3*2**30)
+    plain = conditional_score_memory_plan(training, complete, feature_count=4,
+        training_fixed_count=1590, confirmation_fixed_count=1590)
+    tangent = conditional_score_memory_plan(training, complete, feature_count=4,
+        training_fixed_count=1590, confirmation_fixed_count=1590, mean_tangents=True)
+    assert tangent['total_bytes'] > plain['total_bytes']
+    assert tangent['total_bytes'] < 48*2**30
+    assert tangent['product_workspace_bytes'] > 0
+    for key in ('feature_count', 'training_fixed_count', 'confirmation_fixed_count'):
+        for invalid in (0, -1, True, 2.5):
+            counts = dict(feature_count=4, training_fixed_count=1590, confirmation_fixed_count=1590)
+            counts[key] = invalid
+            with pytest.raises(ValueError, match='counts'):
+                conditional_score_memory_plan(training, complete, **counts)
+
 def test_redundant_panel_never_reports_nonidentifiable_standard_errors():
     from summit.epistasis.robust import RobustScoreSummary, robust_score_tests
     basis=np.array([[1.,0.],[0.,1.],[1.,1.]])

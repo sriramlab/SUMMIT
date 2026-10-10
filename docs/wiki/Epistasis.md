@@ -177,6 +177,17 @@ traits, and follow-up families.
 
 ## Computation
 
+Joint finite-panel Python callers can run
+`conditional_score_memory_plan(training, complete, feature_count=p,
+training_fixed_count=k0, confirmation_fixed_count=k1, mean_tangents=True)`
+before expensive covariance estimation. Its `total_bytes` covers both
+operators, panel inputs, tangent-augmented nuisance projection, and product
+workspaces. Reserve unrelated resident arrays separately. Pass the remaining
+shared allowance as `conditional_score(..., memory_bytes=available_bytes)`.
+Each operator retains its own product/solver cap; those caps may already
+reserve the other operator and must not be mistaken for the shared allowance.
+Omitting the argument preserves the conservative smaller-cap default.
+
 ### Continuous phenotype-scale test
 
 `scale-test` tests whether some Box--Cox power in a declared continuous
