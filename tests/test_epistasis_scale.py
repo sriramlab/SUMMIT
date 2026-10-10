@@ -127,3 +127,8 @@ def test_public_scale_cli_native_products_and_no_overwrite(tmp_path):
     assert len(result['input_sha256'])==64
     with pytest.raises(FileExistsError):
         main(args)
+    from summit.epistasis.scale_workflow import run_scale_arrays
+    wide=tmp_path/'wide.npz'
+    np.savez(wide,features=np.zeros((150,120)),fixed_effects=np.ones((150,1)),phenotype=np.ones(150))
+    with pytest.raises(MemoryError,match='covariance cache'):
+        run_scale_arrays(wide,tmp_path/'wide.json',memory_bytes=300*2**20)

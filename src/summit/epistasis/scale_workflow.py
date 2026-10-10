@@ -42,6 +42,21 @@ def run_scale_arrays(path, output, *, groups=None, threads=1, memory_bytes=4*2**
         raise MemoryError('scale input and reusable geometry exceed the declared memory budget')
     with np.load(path,allow_pickle=False) as archive:
         f,c,y = (archive[k] for k in ('features','fixed_effects','phenotype'))
+    if f.ndim != 2 or c.ndim != 2 or y.shape != (len(f),) or len(c) != len(f):
+        raise ValueError('sample-aligned feature/fixed matrices and one phenotype required')
+    if type(max_evaluations) is not int or max_evaluations < 3:
+        raise ValueError('at least three integer scale evaluations required')
+    # Four covariance matrices per cached power (outcome + three derivatives),
+    # each requested block inverse, simultaneous batch meat/covariance, and
+    # transformed-outcome work. Include overlapping user-supplied groups.
+    # ZIP expansion alone misses the quadratic feature-space search cache.
+    n,p = f.shape
+    group_sizes = [p] if groups is None else [np.asarray(v).size for v in groups.values()]
+    planned = 6*expanded+256*2**20+8*((4*max_evaluations+72)*p*p
+        +max_evaluations*sum(q*q+q for q in group_sizes)
+        +192*n+8*max_evaluations*p)
+    if planned > memory_bytes:
+        raise MemoryError('scale geometry and continuous-search covariance cache exceed the declared memory budget')
     nn,tn,products=protected_scale_products(threads)
     geometry=prepare_robust_geometry(f,c,nn=nn,tn=tn)
     result=boxcox_scale_test(geometry,y,groups=groups,bounds=bounds,
