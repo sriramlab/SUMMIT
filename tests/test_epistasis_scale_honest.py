@@ -1,7 +1,7 @@
 """Honest projection, independent OLS contrasts, and outer-set coverage."""
 import numpy as np
 import pytest
-from scipy.stats import chi2
+from scipy.stats import chi2, norm
 
 from summit.epistasis.robust import prepare_robust_geometry
 from summit.epistasis.scale import boxcox_scale_test
@@ -122,10 +122,89 @@ def test_honest_cli_native_path_schema_memory_and_no_overwrite(tmp_path):
     np.savez(path,features=f,fixed_effects=c,phenotype=y,sample_ids=np.arange(len(y)),
              pilot_mask=np.arange(len(y))<700)
     args=['scale-test-honest',str(path),'--out',str(out),'--num-threads',str(epistasis_threads()),
-          '--max-pilot-evaluations','17','--max-evaluations','9']
+          '--max-pilot-evaluations','17','--max-evaluations','9','--contrast-mode','hybrid']
     with pytest.raises(MemoryError):main(args+['--memory-gib','.00001'])
     assert main(args)==0
     result=json.loads(out.read_text())
     assert result['pilot_n']==700 and result['confirmation_n']==1100
+    assert result['contrast_mode']=='hybrid'
     assert result['native_execution']['output_numa_status']
     with pytest.raises(FileExistsError):main(args)
+
+
+def test_hybrid_score_dense_oracle_combination_and_pilot_only_selection():
+    pc,pf,py=design(8,1800);cc,cf,cy=design(9,2200)
+    pg=prepare_robust_geometry(pf,pc);cg=prepare_robust_geometry(cf,cc)
+    args=dict(pilot_ids=np.arange(len(py)),confirmation_ids=np.arange(len(py),len(py)+len(cy)),
+        max_pilot_evaluations=33,max_evaluations=17,contrast_mode='hybrid')
+    result=boxcox_honest_scale_test(pg,py,cg,cy,**args)
+    test=result['tests']['joint'];assert test['contrast_mode']=='hybrid'
+    contrast=np.asarray(test['score_contrast'])
+    x=np.column_stack([cc,cf]);inv=np.linalg.inv(x.T@x)
+    weights=x@inv;h=np.sum(weights*x,axis=1)
+    t=np.log(cy)-np.log(cy).mean()
+    for point in test['confirmation']['points']:
+        power=point['power'];z=t if power==0 else np.expm1(power*t)/power
+        b=inv@x.T@z;e=z-x@b
+        influence=weights[:,-3:]*(e/(1-h))[:,None]
+        v=contrast@(influence.T@influence)@contrast.T;eta=contrast@b[-3:]
+        expected=norm.sf(float(eta[0]/np.sqrt(v[0,0])))
+        components=point['p_components']['joint']
+        np.testing.assert_allclose(components['score'],expected,rtol=1e-7,atol=1e-10)
+        full_v=influence.T@influence
+        full_p=chi2.sf(b[-3:]@np.linalg.solve(full_v,b[-3:]),3)
+        np.testing.assert_allclose(components['omnibus'],full_p,rtol=1e-7,atol=1e-10)
+        assert point['p']['joint']==min(1.,2*min(components.values()))
+        si=(influence@contrast.T)[:,0]**2
+        diagnostic=point['score_influence_support']['joint']
+        np.testing.assert_allclose(diagnostic['minimum_coordinate_ess'],si.sum()**2/(si@si),rtol=1e-7)
+        np.testing.assert_allclose(diagnostic['maximum_coordinate_variance_share'],si.max()/si.sum(),rtol=1e-7)
+    assert test['p_upper']==min(1.,result['gamma']+test['confirmation']['tests']['joint']['p_upper'])
+    for leaf in test['confirmation']['intervals']:
+        for power in np.linspace(leaf['lower'],leaf['upper'],7):
+            z=t if power==0 else np.expm1(power*t)/power
+            b=inv@x.T@z;e=z-x@b;influence=weights[:,-3:]*(e/(1-h))[:,None]
+            full_v=influence.T@influence;eta=contrast@b[-3:]
+            full_p=chi2.sf(b[-3:]@np.linalg.solve(full_v,b[-3:]),3)
+            score_p=norm.sf(eta[0]/np.sqrt((contrast@full_v@contrast.T)[0,0]))
+            assert min(1.,2*min(full_p,score_p))<=leaf['p_upper']['joint']+1e-8
+    changed=boxcox_honest_scale_test(pg,py,cg,cy[::-1],**args)['tests']['joint']
+    np.testing.assert_array_equal(changed['score_contrast'],test['score_contrast'])
+    assert changed['pilot_confidence_set']==test['pilot_confidence_set']
+    # The hybrid keeps the ORIGINAL block: an alternative parallel to the
+    # scale derivative must remain visible in its omnibus safeguard.
+    small=boxcox_honest_scale_test(pg,py,cg,cy,groups={'pair':[0,1]},**args)['tests']['pair']
+    assert small['df']==2 and small['contrast_mode']=='hybrid'
+    np.testing.assert_array_equal(small['contrast'],np.eye(3)[:2])
+    scalar=boxcox_honest_scale_test(pg,py,cg,cy,groups={'one':[0]},**args)['tests']['one']
+    assert scalar['df']==1 and scalar['contrast_mode']=='omnibus'
+    with pytest.raises(ValueError,match='contrast_mode'):
+        boxcox_honest_scale_test(pg,py,cg,cy,**(args|{'contrast_mode':'best_p'}))
+
+
+def test_influence_screen_flags_concentrated_transformed_outcomes():
+    c,f,y=design(903,2000);g=prepare_robust_geometry(f,c)
+    y[0]*=1000
+    result=boxcox_scale_test(g,y,max_evaluations=3)
+    extreme=next(v for v in result['points'] if v['power']==2.)
+    support=extreme['influence_support']['joint']
+    assert support['flagged'] and support['minimum_coordinate_ess']<10
+    assert not result['tests']['joint']['influence_screen_passed_at_evaluated_powers']
+
+
+@pytest.mark.parametrize('sign',[-1.,1.])
+def test_signed_continuous_envelope_covers_dense_ols_for_both_orientations(sign):
+    c,f,y=design(916,700);f=f.copy();f[:,0]*=sign
+    geometry=prepare_robust_geometry(f,c)
+    result=boxcox_scale_test(geometry,y,groups={'signed':[0]},alternative='greater',
+        max_evaluations=17,confidence_width=.1)
+    x=np.column_stack([c,f]);inv=np.linalg.inv(x.T@x)
+    w=x@inv;h=np.sum(w*x,axis=1);t=np.log(y)-np.log(y).mean()
+    for leaf in result['intervals']:
+        for power in np.linspace(leaf['lower'],leaf['upper'],7):
+            z=t if power==0 else np.expm1(power*t)/power
+            b=inv@x.T@z;e=z-x@b;influence=w[:,-3]*(e/(1-h))
+            expected=norm.sf(b[-3]/np.linalg.norm(influence))
+            assert expected<=leaf['p_upper']['signed']+1e-8
+    with pytest.raises(ValueError,match='scalar'):
+        boxcox_scale_test(geometry,y,alternative='greater')

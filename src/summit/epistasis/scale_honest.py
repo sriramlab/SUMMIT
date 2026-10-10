@@ -50,13 +50,28 @@ def _rotate_geometry(geometry, index, direction):
     return result, rotation[:,index[:-1]].T
 
 
+def _score_geometry(geometry, index, score):
+    """Put one coefficient contrast first, retaining the full feature span."""
+    _, _, vh = np.linalg.svd((score/np.linalg.norm(score))[None,:],full_matrices=True)
+    if vh[0] @ score < 0:vh[0]*=-1
+    rotation = np.eye(geometry.r.shape[1])
+    rotation[np.ix_(index,index)] = vh.T
+    result = copy(geometry)
+    result.r = geometry.nn(geometry.r,rotation)
+    result.h = rotation.T @ geometry.h @ rotation
+    result.inverse,result.condition = _inverse((result.h+result.h.T)/2)
+    for value in (result.r,result.h,result.inverse):
+        value.setflags(write=False)
+    return result,rotation[:,index[:1]].T
+
+
 def boxcox_honest_scale_test(pilot_geometry, pilot_phenotype,
                             confirmation_geometry, confirmation_phenotype, *,
                             pilot_ids, confirmation_ids, groups=None,
                             bounds=(-2.,2.), alpha=.05, gamma=None,
                             max_pilot_evaluations=257, max_evaluations=129,
                             confidence_width=None, direction_alpha=.01,
-                            batch_size=8, order=3):
+                            batch_size=8, order=3, contrast_mode='omnibus'):
     """Test the same full-coefficient scale union null using an honest pilot.
 
     Rows must be independent across splits, and feature/nuisance coordinates
@@ -69,11 +84,18 @@ def boxcox_honest_scale_test(pilot_geometry, pilot_phenotype,
     and is added to the confirmation supremum p. A training-only derivative
     test selects q-1 contrasts or the full-q fallback; either choice is valid
     at every true null power conditional on the pilot. q=1 always falls back.
+
+    ``contrast_mode='hybrid'`` adds a pilot-learned coefficient contrast and
+    uses an equal-weight pointwise Bonferroni combination BEFORE the
+    continuous supremum, paying gamma once for the pilot confidence set.
+    The default preserves the original omnibus procedure.
     """
     gamma = alpha/10 if gamma is None else gamma
     if (not np.isfinite(alpha+gamma+direction_alpha) or not 0 < gamma < alpha < 1
             or not 0 < direction_alpha < 1):
         raise ValueError('require 0 < gamma < alpha < 1 and a valid direction threshold')
+    if contrast_mode not in ('omnibus','hybrid'):
+        raise ValueError('contrast_mode must be omnibus or hybrid')
     p = pilot_geometry.r.shape[1]
     if confirmation_geometry.r.shape[1] != p:
         raise ValueError('pilot and confirmation feature axes must agree')
@@ -99,7 +121,8 @@ def boxcox_honest_scale_test(pilot_geometry, pilot_phenotype,
         domain = pilot['confidence_sets'][name]
         anchor = pilot['tests'][name]['sampled_maximizer']
         item = dict(original_df=len(index),pilot_anchor=anchor,pilot_confidence_set=domain,
-                    gamma=gamma,threshold=alpha)
+                    gamma=gamma,threshold=alpha,
+                    pilot_influence_screen_passed=pilot['tests'][name]['influence_screen_passed_at_evaluated_powers'])
         if not domain:
             item.update(p_upper=gamma,p_sup_lower=gamma,df=len(index),
                 status='rejected_by_pilot_confidence_set',projection='not_needed',
@@ -115,29 +138,70 @@ def boxcox_honest_scale_test(pilot_geometry, pilot_phenotype,
         except (ValueError,np.linalg.LinAlgError):
             direction_p = 1.
         projected = len(index)>1 and direction_p < direction_alpha
-        if projected:
+        # Everything deciding the score and its availability uses pilot data.
+        # For a strong scale direction, maximize pilot signal/noise subject
+        # to l'd=0. Otherwise use the unconstrained pilot Wald direction.
+        score = None
+        if contrast_mode == 'hybrid' and len(index)>1:
+            v = pilot_geometry.inverse @ meat[0] @ pilot_geometry.inverse.T
+            try:
+                vi,_ = _inverse(v[np.ix_(index,index)])
+                # Fixed pilot-only soft threshold in the original coefficient
+                # coordinates. This can concentrate sparse regional signals;
+                # retain the unshrunk direction if all coordinates disappear.
+                se = np.sqrt(np.diag(v)[index])
+                b = beta[index,0]
+                shrunk = np.sign(b)*np.maximum(0.,abs(b)-np.sqrt(2*np.log(len(index)))*se)
+                item['score_selected_coordinates'] = int(np.count_nonzero(shrunk))
+                item['score_shrinkage'] = 'pilot_universal_soft_threshold_or_unshrunk_fallback'
+                candidate = vi @ (shrunk if np.any(shrunk) else b)
+                original_norm = np.linalg.norm(candidate)
+                if projected:
+                    vd = vi @ d
+                    candidate -= vd * (d @ candidate)/(d @ vd)
+                if (np.all(np.isfinite(candidate)) and np.linalg.norm(candidate) >
+                        1e-12*max(original_norm,np.finfo(float).tiny)):
+                    score = candidate/np.linalg.norm(candidate)
+                    if score @ b < 0:score *= -1
+            except (ValueError,np.linalg.LinAlgError):
+                pass  # Pilot-only singular/zero score: retain the omnibus.
+        # A curve can stay nonzero while moving only along d. Dropping d
+        # would then erase the alternative. The hybrid therefore retains
+        # the ORIGINAL full coefficient block as its omnibus safeguard.
+        omnibus_projected = projected and contrast_mode == 'omnibus'
+        if omnibus_projected:
             geometry, contrast = _rotate_geometry(confirmation_geometry,index,d)
             tested = index[:-1].tolist()
         else:
             geometry, tested = confirmation_geometry, index.tolist()
             contrast = np.eye(p)[index]
+        if score is not None:
+            geometry,score_contrast = _score_geometry(confirmation_geometry,index,score)
         result = boxcox_scale_test(geometry,cy,groups={name:tested},bounds=bounds,
             alpha=alpha-gamma,max_evaluations=max_evaluations,batch_size=batch_size,
-            order=order,search_intervals=domain)
+            order=order,search_intervals=domain,
+            hybrid_score_indices={name:int(index[0])} if score is not None else None)
         test = result['tests'][name]
         upper, lower = min(1.,gamma+test['p_upper']),min(1.,gamma+test['p_sup_lower'])
         item.update(p_upper=upper,p_sup_lower=lower,df=len(tested),
             status=('rejected_specified_scale_family' if upper<alpha else
                     'compatible_scale_found' if lower>=alpha else test['status']),
-            projection='pilot_direction_removed' if projected else 'full_block_fallback',
+            projection=('pilot_direction_removed' if omnibus_projected else
+                        'full_block_guard' if contrast_mode=='hybrid' else 'full_block_fallback'),
+            pilot_scale_direction_removed_from_score=bool(projected and score is not None),
             pilot_direction_p=direction_p,contrast=contrast.tolist(),
             confirmation_evaluations=result['evaluations'],confirmation=result)
-        tests[name] = item
+        item['confirmation_influence_screen_passed'] = test['influence_screen_passed_at_evaluated_powers']
         del geometry
+        if score is not None:
+            item.update(score_contrast=score_contrast.tolist(),score_df=1,component_weights=[.5,.5],
+                combination='pointwise_before_continuous_supremum')
+        item['contrast_mode'] = 'hybrid' if score is not None else 'omnibus'
+        tests[name] = item
     def digest(ids):
         return hashlib.sha256(('\n'.join(ids)+'\n').encode()).hexdigest()
     return dict(method='honest_pilot_projection_Berger_Boos_boxcox_HC3_v1',
-        tests=tests,pilot=pilot,bounds=list(bounds),alpha=alpha,gamma=gamma,
+        tests=tests,pilot=pilot,bounds=list(bounds),alpha=alpha,gamma=gamma,contrast_mode=contrast_mode,
         direction_alpha=direction_alpha,pilot_n=len(pid),confirmation_n=len(cid),
         pilot_sample_order_sha256=digest(pid),confirmation_sample_order_sha256=digest(cid),
         inference='Independent-split HC3 pointwise inference plus continuous outer confidence-set inversion; '

@@ -122,3 +122,64 @@ overwrite an existing output. The original `scale-test` remains available.
 The API is `summit.epistasis.scale_honest.boxcox_honest_scale_test`; the array
 workflow reuses shared native products, existing fixed-effect geometry and
 continuous-search envelopes. No independent genotype decoder is introduced.
+
+## Optional pilot-score hybrid
+
+`--contrast-mode hybrid` retains the ORIGINAL full-block omnibus and adds a single
+pilot-learned coefficient contrast. At the pilot anchor, let b and V be the
+full conditional coefficient estimate and its HC3 covariance for the block.
+Soft threshold b_j by sqrt(2 log(q)) times its pilot standard error; use b
+itself if every coordinate is removed. This fixed rule targets sparse
+regional alternatives without selecting a threshold on confirmation data.
+Let the resulting vector be b_s. The score direction is V^-1 b_s, with
+its component along V^-1 d removed when the existing pilot rule identifies
+a scale direction. This enforces l'd=0. All original coefficients remain
+fitted; only the tested contrast is reduced to one dimension.
+
+At each power, combine the full-block two-sided p and the pilot-oriented
+score p with equal-weight Bonferroni. The reported bound covers
+
+    min(1, gamma + sup_{lambda in C_A} min(1, 2 min(p_o(lambda),p_s(lambda)))).
+
+Conditional on the pilot, both contrasts are fixed. At a true null witness,
+the combined pointwise p is superuniform by Bonferroni, without independence
+between its components. Taking the supremum over a set containing that
+witness and paying gamma for a possible set miss preserves the size bound.
+The original full block is retained if no usable score exists; a scalar
+block has no extra component or multiplicity cost.
+
+The pilot also fixes the sign so l'b_pilot is nonnegative. The score uses a
+one-sided normal HC3 tail in that frozen direction; the full-block omnibus
+remains two-sided. This uses directional replication without selecting a
+sign on confirmation. Its continuous envelope bounds signed standardized
+coefficients, including negative numerators and their lower variance bounds.
+Under a full null, each conditional one-sided pointwise p is superuniform,
+so the same Bonferroni/confidence-set proof applies.
+
+Combining at a common power before taking the supremum is essential:
+
+    sup_lambda min(p_o(lambda),p_s(lambda))
+        <= min(sup_lambda p_o(lambda),sup_lambda p_s(lambda)).
+
+The previous development candidate used the more conservative right-hand
+side. The implementation now bounds each component on a common interval,
+combines their bounds pointwise, and refines the combined envelope. Both
+components share one rotated full-model geometry and regression cache.
+A reported nonrejecting witness refers to a single common evaluated power.
+There is no claim of uniform power improvement over the original omnibus.
+Splits, mode, and thresholds must be fixed before confirmation analysis.
+
+Keeping the original block matters: beta(lambda)=a(lambda)b with a(lambda)>0
+has no null scale, but annihilating its derivative can annihilate the whole
+alternative. The full-block safeguard preserves sensitivity to this case.
+It also remains full-block if the pilot cannot construct a nonzero score.
+
+Each evaluated power now reports coefficient-influence concentration:
+(sum_i IF_i^2)^2/sum_i IF_i^4 and max_i IF_i^2/sum_i IF_i^2. Values below100
+or above.1 respectively trigger a descriptive flag. These diagnostics use
+the actual transformed outcomes and full-model HC3 residuals. They reveal
+information concentrated in a few participants despite large nominal N.
+They are coordinate-dependent, are not a universal calibration certificate,
+and do not remove observations or powers or modify p values. Interpret
+flagged nominal decisions as requiring further qualification; nonrejection
+does not establish a latent additive explanation.
