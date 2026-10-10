@@ -36,6 +36,18 @@ def main(argv=None):
     scale.add_argument("--max-evaluations",type=int,default=129)
     scale.add_argument("--num-threads",type=int,default=1)
     scale.add_argument("--memory-gib",type=float,default=4.)
+    honest = sub.add_parser("scale-test-honest",help="independent-pilot projection and continuous scale confidence set")
+    honest.add_argument("arrays",type=Path)
+    honest.add_argument("--out",type=Path,required=True)
+    honest.add_argument("--groups",type=Path)
+    honest.add_argument("--lambda-min",type=float,default=-2.)
+    honest.add_argument("--lambda-max",type=float,default=2.)
+    honest.add_argument("--alpha",type=float,default=.05)
+    honest.add_argument("--gamma",type=float)
+    honest.add_argument("--max-pilot-evaluations",type=int,default=257)
+    honest.add_argument("--max-evaluations",type=int,default=129)
+    honest.add_argument("--num-threads",type=int,default=1)
+    honest.add_argument("--memory-gib",type=float,default=4.)
     inputs = sub.add_parser(
         "make-inputs", help="construct supplied-target manifests using training genotype support"
     )
@@ -107,6 +119,14 @@ def main(argv=None):
     followup.add_argument("manifest", type=Path)
     followup.add_argument("--out", type=Path, required=True)
     args = parser.parse_args(argv)
+    if args.command == "scale-test-honest":
+        from .scale_workflow import run_honest_scale_arrays
+        run_honest_scale_arrays(args.arrays,args.out,
+            groups=None if args.groups is None else json.loads(args.groups.read_text()),
+            threads=args.num_threads,memory_bytes=int(args.memory_gib*2**30),
+            bounds=(args.lambda_min,args.lambda_max),alpha=args.alpha,gamma=args.gamma,
+            max_pilot_evaluations=args.max_pilot_evaluations,max_evaluations=args.max_evaluations)
+        return 0
     if args.command == "scale-test":
         from .scale_workflow import run_scale_arrays
         run_scale_arrays(args.arrays,args.out,

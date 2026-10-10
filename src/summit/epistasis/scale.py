@@ -52,7 +52,8 @@ def boxcox_derivatives(log_values, power, *, order=3):
 
 
 def boxcox_scale_test(geometry, phenotype, *, groups=None, bounds=(-2., 2.),
-                      alpha=.05, max_evaluations=129, batch_size=8, order=3):
+                      alpha=.05, max_evaluations=129, batch_size=8, order=3,
+                      search_intervals=None, confidence_width=None):
     """Bound the supremum HC3 p over a continuous Box--Cox power interval.
 
     ``geometry`` is ``prepare_robust_geometry`` on fixed/frozen features and
@@ -64,6 +65,11 @@ def boxcox_scale_test(geometry, phenotype, *, groups=None, bounds=(-2., 2.),
     Reuse one QR and protected NN/TN products. Each transformed outcome and
     derivative is refit, including the nuisance mean and HC3 covariance.
     Unresolved intervals retain a conservative upper bound (possibly one).
+
+    ``search_intervals`` optionally supplies a closed union within ``bounds``.
+    With ``confidence_width``, refine all possibly accepted intervals to that
+    width or the evaluation budget. ``confidence_sets`` then contains outer
+    sets for inversion at ``alpha``; unresolved pieces are always retained.
     """
     y = np.asarray(phenotype, float)
     lower, upper = map(float, bounds)
@@ -76,6 +82,24 @@ def boxcox_scale_test(geometry, phenotype, *, groups=None, bounds=(-2., 2.),
         raise ValueError('positive aligned outcome, finite ordered interval and valid search settings required')
     if not np.all(geometry.estimable):
         raise ValueError('scale tests require identifiable supplied feature coefficients')
+    if confidence_width is not None and (not np.isfinite(confidence_width) or confidence_width <= 0):
+        raise ValueError('positive finite confidence interval width required')
+    domains = [(lower, upper)] if search_intervals is None else list(search_intervals)
+    if not domains:
+        raise ValueError('nonempty search intervals required')
+    merged = []
+    for a,b in sorted(tuple(map(float, pair)) for pair in domains):
+        if not np.isfinite(a+b) or not lower <= a < b <= upper:
+            raise ValueError('search intervals must be finite, ordered and within bounds')
+        if merged and a <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(b, merged[-1][1]))
+        else:
+            merged.append((a,b))
+    domains = merged
+    # A wider search is conservative; silently dropping a component is not.
+    domain_coarsened = len({v for a,b in domains for v in (a,(a+b)/2,b)}) > max_evaluations
+    if domain_coarsened:
+        domains = [(domains[0][0], domains[-1][1])]
     one = np.ones((len(y), 1))
     constant_residual = one-geometry.nn(geometry.u, geometry.tn(geometry.u, one))
     if np.linalg.norm(constant_residual) > 1e-9*np.sqrt(len(y)):
@@ -182,18 +206,24 @@ def boxcox_scale_test(geometry, phenotype, *, groups=None, bounds=(-2., 2.),
             limits[name] = min(1., max(bound, record['p'])+1e-12)
         return dict(lower=a, upper=b, center=center, p_upper=limits)
 
-    evaluate([lower, (lower+upper)/2, upper])
-    leaves = [interval(lower, upper)]
+    evaluate(sorted({v for a,b in domains for v in (a,(a+b)/2,b)}))
+    leaves = [interval(a,b) for a,b in domains]
     while True:
         sampled = {name: max(v['records'][name]['p'] for v in cache.values()) for name in names}
         envelope = {name: max(v['p_upper'][name] for v in leaves) for name in names}
         unresolved = [name for name in names if sampled[name] < alpha <= envelope[name]]
         remaining = (max_evaluations-len(cache))//2
-        if not unresolved or remaining < 1:
+        if (confidence_width is None and not unresolved) or remaining < 1:
             break
-        candidates = [j for j, leaf in enumerate(leaves)
-            if any(leaf['p_upper'][name] >= alpha for name in unresolved)]
-        candidates.sort(key=lambda j: max(leaves[j]['p_upper'][name] for name in unresolved), reverse=True)
+        if confidence_width is None:
+            candidates = [j for j, leaf in enumerate(leaves)
+                if any(leaf['p_upper'][name] >= alpha for name in unresolved)]
+            candidates.sort(key=lambda j: max(leaves[j]['p_upper'][name] for name in unresolved), reverse=True)
+        else:
+            candidates = [j for j, leaf in enumerate(leaves)
+                if leaf['upper']-leaf['lower'] > confidence_width
+                and any(leaf['p_upper'][name] >= alpha for name in names)]
+            candidates.sort(key=lambda j: leaves[j]['upper']-leaves[j]['lower'], reverse=True)
         selected = candidates[:min(remaining, batch_size//2)]
         if not selected:
             break
@@ -228,7 +258,21 @@ def boxcox_scale_test(geometry, phenotype, *, groups=None, bounds=(-2., 2.),
             (geometry.condition>1e6,'normalized information condition exceeds 1e6')]:
         if failed:
             support.append(reason)
+    confidence_sets = {}
+    if confidence_width is not None:
+        for name in names:
+            retained = []
+            for leaf in sorted(leaves,key=lambda v:v['lower']):
+                if leaf['p_upper'][name] < alpha:
+                    continue
+                if retained and leaf['lower'] <= retained[-1][1]:
+                    retained[-1][1] = leaf['upper']
+                else:
+                    retained.append([leaf['lower'],leaf['upper']])
+            confidence_sets[name] = retained
     return dict(method='continuous_boxcox_HC3_union_envelope_v1', bounds=[lower,upper],
+        search_intervals=domains, domain_coarsened=domain_coarsened,
+        confidence_sets=confidence_sets, confidence_width=confidence_width,
         log_reference=log_reference, tests=tests, evaluations=len(cache),
         derivative_order=order, max_evaluations=max_evaluations,
         points=[dict(power=power,p={name:v['records'][name]['p'] for name in names},
