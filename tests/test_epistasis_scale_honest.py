@@ -143,19 +143,31 @@ def test_hybrid_score_dense_oracle_combination_and_pilot_only_selection():
     x=np.column_stack([cc,cf]);inv=np.linalg.inv(x.T@x)
     weights=x@inv;h=np.sum(weights*x,axis=1)
     t=np.log(cy)-np.log(cy).mean()
-    for point in test['score_confirmation']['points']:
+    for point in test['confirmation']['points']:
         power=point['power'];z=t if power==0 else np.expm1(power*t)/power
         b=inv@x.T@z;e=z-x@b
         influence=weights[:,-3:]*(e/(1-h))[:,None]
         v=contrast@(influence.T@influence)@contrast.T;eta=contrast@b[-3:]
         expected=norm.sf(float(eta[0]/np.sqrt(v[0,0])))
-        np.testing.assert_allclose(point['p']['joint'],expected,rtol=1e-7,atol=1e-10)
+        components=point['p_components']['joint']
+        np.testing.assert_allclose(components['score'],expected,rtol=1e-7,atol=1e-10)
+        full_v=influence.T@influence
+        full_p=chi2.sf(b[-3:]@np.linalg.solve(full_v,b[-3:]),3)
+        np.testing.assert_allclose(components['omnibus'],full_p,rtol=1e-7,atol=1e-10)
+        assert point['p']['joint']==min(1.,2*min(components.values()))
         si=(influence@contrast.T)[:,0]**2
-        diagnostic=point['influence_support']['joint']
+        diagnostic=point['score_influence_support']['joint']
         np.testing.assert_allclose(diagnostic['minimum_coordinate_ess'],si.sum()**2/(si@si),rtol=1e-7)
         np.testing.assert_allclose(diagnostic['maximum_coordinate_variance_share'],si.max()/si.sum(),rtol=1e-7)
-    components=[test[k]['tests']['joint'] for k in ('confirmation','score_confirmation')]
-    assert test['p_upper']==min(1.,result['gamma']+2*min(v['p_upper'] for v in components))
+    assert test['p_upper']==min(1.,result['gamma']+test['confirmation']['tests']['joint']['p_upper'])
+    for leaf in test['confirmation']['intervals']:
+        for power in np.linspace(leaf['lower'],leaf['upper'],7):
+            z=t if power==0 else np.expm1(power*t)/power
+            b=inv@x.T@z;e=z-x@b;influence=weights[:,-3:]*(e/(1-h))[:,None]
+            full_v=influence.T@influence;eta=contrast@b[-3:]
+            full_p=chi2.sf(b[-3:]@np.linalg.solve(full_v,b[-3:]),3)
+            score_p=norm.sf(eta[0]/np.sqrt((contrast@full_v@contrast.T)[0,0]))
+            assert min(1.,2*min(full_p,score_p))<=leaf['p_upper']['joint']+1e-8
     changed=boxcox_honest_scale_test(pg,py,cg,cy[::-1],**args)['tests']['joint']
     np.testing.assert_array_equal(changed['score_contrast'],test['score_contrast'])
     assert changed['pilot_confidence_set']==test['pilot_confidence_set']

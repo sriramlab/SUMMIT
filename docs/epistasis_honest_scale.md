@@ -136,18 +136,17 @@ its component along V^-1 d removed when the existing pilot rule identifies
 a scale direction. This enforces l'd=0. All original coefficients remain
 fitted; only the tested contrast is reduced to one dimension.
 
-Write P_o and P_s for the two separate continuous supremum p values over
-the SAME outer pilot confidence set. The hybrid reports a bound on
+At each power, combine the full-block two-sided p and the pilot-oriented
+score p with equal-weight Bonferroni. The reported bound covers
 
-    min(1, gamma + 2 min(P_o, P_s)).
+    min(1, gamma + sup_{lambda in C_A} min(1, 2 min(p_o(lambda),p_s(lambda)))).
 
-Conditional on the pilot, both contrasts are fixed. If a null witness is
-in the set, rejection requires at least one pointwise p at that witness to
-be at most (alpha-gamma)/2. Bonferroni bounds this probability by
-alpha-gamma; the common set-miss budget is paid once. This argument does
-not assume independence between the two confirmation tests. If the
-original block has one degree of freedom, or a usable pilot score cannot
-be constructed, no redundant component or multiplicity cost is introduced.
+Conditional on the pilot, both contrasts are fixed. At a true null witness,
+the combined pointwise p is superuniform by Bonferroni, without independence
+between its components. Taking the supremum over a set containing that
+witness and paying gamma for a possible set miss preserves the size bound.
+The original full block is retained if no usable score exists; a scalar
+block has no extra component or multiplicity cost.
 
 The pilot also fixes the sign so l'b_pilot is nonnegative. The score uses a
 one-sided normal HC3 tail in that frozen direction; the full-block omnibus
@@ -157,13 +156,17 @@ coefficients, including negative numerators and their lower variance bounds.
 Under a full null, each conditional one-sided pointwise p is superuniform,
 so the same Bonferroni/confidence-set proof applies.
 
-This combines two supremum tests, rather than taking a supremum of
-pointwise combined p values. The former can be more conservative but has
-a direct guarantee using the existing continuous envelopes. A combined
-nonrejection need not have one scale that maximizes both components.
-Outputs label it `combined_test_nonrejection` and retain both bounds.
-The hybrid can improve sparse-signal power and can lose power for diffuse
-or poorly learned patterns. It is optional, not uniformly more powerful.
+Combining at a common power before taking the supremum is essential:
+
+    sup_lambda min(p_o(lambda),p_s(lambda))
+        <= min(sup_lambda p_o(lambda),sup_lambda p_s(lambda)).
+
+The previous development candidate used the more conservative right-hand
+side. The implementation now bounds each component on a common interval,
+combines their bounds pointwise, and refines the combined envelope. Both
+components share one rotated full-model geometry and regression cache.
+A reported nonrejecting witness refers to a single common evaluated power.
+There is no claim of uniform power improvement over the original omnibus.
 Splits, mode, and thresholds must be fixed before confirmation analysis.
 
 Keeping the original block matters: beta(lambda)=a(lambda)b with a(lambda)>0

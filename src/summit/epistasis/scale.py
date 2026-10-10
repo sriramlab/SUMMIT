@@ -53,7 +53,8 @@ def boxcox_derivatives(log_values, power, *, order=3):
 
 def boxcox_scale_test(geometry, phenotype, *, groups=None, bounds=(-2., 2.),
                       alpha=.05, max_evaluations=129, batch_size=8, order=3,
-                      search_intervals=None, confidence_width=None, alternative='two_sided'):
+                      search_intervals=None, confidence_width=None, alternative='two_sided',
+                      hybrid_score_indices=None):
     """Bound the supremum HC3 p over a continuous Box--Cox power interval.
 
     ``geometry`` is ``prepare_robust_geometry`` on fixed/frozen features and
@@ -120,6 +121,14 @@ def boxcox_scale_test(geometry, phenotype, *, groups=None, bounds=(-2., 2.),
     if alternative not in ('two_sided','greater') or (
             alternative=='greater' and any(len(index)!=1 for index in indices.values())):
         raise ValueError('greater alternative requires scalar coefficient groups')
+    hybrid_score_indices = {} if hybrid_score_indices is None else dict(hybrid_score_indices)
+    component_indices = dict(indices)
+    for name,index in hybrid_score_indices.items():
+        if (alternative!='two_sided' or name not in indices or len(indices[name])<2
+                or isinstance(index,bool) or not isinstance(index,(int,np.integer))
+                or index not in indices[name]):
+            raise ValueError('hybrid scores must name one coefficient in a nonscalar two-sided block')
+        component_indices[('score',name)] = np.asarray([index],dtype=int)
     # This outcome-dependent unit choice is exactly irrelevant to every Wald
     # test: changing units adds an intercept and multiplies the outcome by a
     # positive lambda-dependent constant. It does not fit a transformation.
@@ -153,7 +162,8 @@ def boxcox_scale_test(geometry, phenotype, *, groups=None, bounds=(-2., 2.),
                 share = np.divide(influence.max(axis=0),sums,out=np.ones(p),where=sums>0)
                 del influence
                 records = {}
-                for name, index in indices.items():
+                for name, index in component_indices.items():
+                    tail = 'greater' if isinstance(name,tuple) else alternative
                     v = cov[0][np.ix_(index, index)]
                     try:
                         inverse, _ = _inverse((v+v.T)/2)
@@ -162,17 +172,22 @@ def boxcox_scale_test(geometry, phenotype, *, groups=None, bounds=(-2., 2.),
                         if not np.isfinite(statistic) or statistic < 0:
                             raise ValueError('unresolved scale covariance')
                         direction = direction/np.sqrt(statistic) if statistic > 0 else np.zeros(len(index))
-                        z = float(b[index[0],0]/np.sqrt(v[0,0])) if alternative=='greater' else None
-                        if alternative=='greater':direction=np.asarray([1/np.sqrt(v[0,0])])
+                        z = float(b[index[0],0]/np.sqrt(v[0,0])) if tail=='greater' else None
+                        if tail=='greater':direction=np.asarray([1/np.sqrt(v[0,0])])
                         records[name] = dict(p=float(norm.sf(z) if z is not None else chi2.sf(statistic, len(index))),
                             signed_z=z,
                             statistic=statistic, direction=direction, inverse=inverse, resolved=True)
                     except (ValueError, np.linalg.LinAlgError):
                         records[name] = dict(p=1., statistic=0., direction=np.zeros(len(index)), resolved=False)
+                    records[name]['alternative'] = tail
                     records[name]['influence_support'] = dict(
                         minimum_coordinate_ess=float(ess[index].min()),
                         maximum_coordinate_variance_share=float(share[index].max()),
                         flagged=bool(ess[index].min()<100 or share[index].max()>.1))
+                for name in hybrid_score_indices:
+                    full,score = records[name],records[('score',name)]
+                    full['full_p'] = full['p']
+                    full['p'] = min(1.,2*min(full['p'],score['p']))
                 cache[power] = dict(beta=b, covariance=cov, records=records,
                     outcome_norm=float(np.linalg.norm(values[:, j*(order+1)])))
 
@@ -185,7 +200,7 @@ def boxcox_scale_test(geometry, phenotype, *, groups=None, bounds=(-2., 2.),
             * abs(t)**(order+2)*np.exp(np.maximum(0., center*t+radius*abs(t))))
         remainder_norm = float(np.linalg.norm(remainder))
         limits = {}
-        for name, index in indices.items():
+        for name, index in component_indices.items():
             record = value['records'][name]
             if not record['resolved'] or record['statistic'] == 0:
                 limits[name] = 1.
@@ -219,7 +234,7 @@ def boxcox_scale_test(geometry, phenotype, *, groups=None, bounds=(-2., 2.),
             denominator_change += (1+1e-8)*float(np.max(abs(influence/geometry.denominator)))*remainder_norm
             numerical_slack = 1e-8*(1+np.sqrt(record['statistic'])+numerator_change
                 +np.linalg.norm(influence)*value['outcome_norm'])
-            if alternative=='greater':
+            if record['alternative']=='greater':
                 numerator=record['signed_z']-numerator_change-numerical_slack
                 denominator=(1+denominator_change+numerical_slack if numerator>=0 else
                              1-denominator_change-numerical_slack)
@@ -228,8 +243,10 @@ def boxcox_scale_test(geometry, phenotype, *, groups=None, bounds=(-2., 2.),
                 numerator = max(0., np.sqrt(record['statistic'])-numerator_change-numerical_slack)
                 denominator = 1+denominator_change+numerical_slack
                 bound = float(chi2.sf((numerator/denominator)**2, len(index)))
-            limits[name] = min(1., max(bound, record['p'])+1e-12)
-        return dict(lower=a, upper=b, center=center, p_upper=limits)
+            limits[name] = min(1., max(bound, record.get('full_p',record['p']))+1e-12)
+        combined = {name:(min(1.,2*min(limits[name],limits[('score',name)]))
+                         if name in hybrid_score_indices else limits[name]) for name in names}
+        return dict(lower=a, upper=b, center=center, p_upper=combined)
 
     evaluate(sorted({v for a,b in domains for v in (a,(a+b)/2,b)}))
     leaves = [interval(a,b) for a,b in domains]
@@ -267,13 +284,18 @@ def boxcox_scale_test(geometry, phenotype, *, groups=None, bounds=(-2., 2.),
         best = max(cache, key=lambda x: cache[x]['records'][name]['p'])
         lo = cache[best]['records'][name]['p']
         hi = max(lo, max(leaf['p_upper'][name] for leaf in leaves))
-        status = ('unresolved_covariance' if not cache[best]['records'][name]['resolved'] else
+        resolved = cache[best]['records'][name]['resolved'] or (
+            name in hybrid_score_indices and cache[best]['records'][('score',name)]['resolved'])
+        status = ('unresolved_covariance' if not resolved else
                   'rejected_specified_scale_family' if hi < alpha else
                   'compatible_scale_found' if lo >= alpha else 'unresolved_search_bound')
-        tests[name] = dict(p_sup_lower=lo, p_upper=hi, status=status,alternative=alternative,
+        tests[name] = dict(p_sup_lower=lo, p_upper=hi, status=status,
+            alternative='pointwise_full_block_signed_score_hybrid' if name in hybrid_score_indices else alternative,
             sampled_maximizer=best, df=len(indices[name]), threshold=alpha,
             influence_screen_passed_at_evaluated_powers=all(
-                not value['records'][name]['influence_support']['flagged'] for value in cache.values()))
+                not value['records'][name]['influence_support']['flagged'] and
+                (name not in hybrid_score_indices or not value['records'][('score',name)]['influence_support']['flagged'])
+                for value in cache.values()))
     support = []
     normalized = geometry.r/np.sqrt(np.diag(geometry.h))
     effective = float(np.min(1/np.sum(normalized**4,axis=0)))
@@ -303,7 +325,11 @@ def boxcox_scale_test(geometry, phenotype, *, groups=None, bounds=(-2., 2.),
         log_reference=log_reference, tests=tests, evaluations=len(cache),
         derivative_order=order, max_evaluations=max_evaluations,
         points=[dict(power=power,p={name:v['records'][name]['p'] for name in names},
+                     p_components={name:dict(omnibus=v['records'][name]['full_p'],score=v['records'][('score',name)]['p'])
+                                   for name in hybrid_score_indices},
                      influence_support={name:v['records'][name]['influence_support'] for name in names},
+                     score_influence_support={name:v['records'][('score',name)]['influence_support']
+                                              for name in hybrid_score_indices},
                      covariance_resolved={name:v['records'][name]['resolved'] for name in names})
             for power,v in sorted(cache.items())], intervals=sorted(leaves,key=lambda v:v['lower']),
         diagnostics=dict(n=len(y),fixed_rank=geometry.u.shape[1],feature_rank=geometry.rank,
