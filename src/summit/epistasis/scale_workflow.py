@@ -11,17 +11,10 @@ from .scale import boxcox_scale_test
 
 def protected_scale_products(threads):
     """Use the existing shared NN/TN implementation; no new native backend."""
-    from summit.prediction.genotype import native_module
-    from summit.prediction.runtime import configure_prediction_threads
-    from summit.ldscore.generalized_gxe_pass1 import ProtectedNNOperator
-    from summit.ldscore.generalized_gxe_pass2 import ProtectedTNOperator
-    native = native_module()
-    configure_prediction_threads(native, threads)
-    left = ProtectedNNOperator(threads=threads, native_module=native)
-    right = ProtectedTNOperator(threads=threads, native_module=native)
-    left.begin_execution(); right.begin_execution()
-    return (lambda a,b:left.matmul(np.asfortranarray(a),np.asfortranarray(b)),
-            lambda a,b:right.matmul_tn(np.asfortranarray(a),np.asfortranarray(b)),left)
+    from summit.ldscore.matrix_products import MatrixProducts
+    products = MatrixProducts(native=True, threads=threads)
+    products.left.begin_execution()
+    return products.nn, products.tn, products.left
 
 
 def run_scale_arrays(path, output, *, groups=None, threads=1, memory_bytes=4*2**30,
