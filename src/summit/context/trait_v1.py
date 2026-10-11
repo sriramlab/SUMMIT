@@ -46,7 +46,9 @@ from .spec import (
     array_sha256,
     canonical_json,
     canonical_sha256,
+    context_fourth_moments,
     freeze_context_mapping,
+    validate_context_fourth_moments,
 )
 
 
@@ -81,7 +83,40 @@ _ARRAY_NAMES = (
     "group_annotation_masses",
     "group_variant_counts",
 )
-_FILE_KEYS = frozenset((*_ARRAY_NAMES, "manifest_json", "manifest_sha256"))
+# Optional study context fourth moments G_S (P x P) over the trait's own
+# people; older artifacts omit both the array and its layout entry.
+_OPTIONAL_ARRAY_NAMES = ("context_fourth_moments",)
+_OPTIONAL_LAYOUTS = {"context_fourth_moments": ["context_pair", "context_pair"]}
+_FILE_KEYS = frozenset(
+    (*_ARRAY_NAMES, *_OPTIONAL_ARRAY_NAMES, "manifest_json", "manifest_sha256")
+)
+
+
+def _declared_array_names(arrays: Any) -> tuple[str, ...]:
+    """Return the manifest's array names: all required, optional ones known."""
+    if not isinstance(arrays, Mapping):
+        raise ValueError("Contextual trait V1 array schema mismatch.")
+    names = set(arrays)
+    if not set(_ARRAY_NAMES) <= names or not names <= {
+        *_ARRAY_NAMES,
+        *_OPTIONAL_ARRAY_NAMES,
+    }:
+        raise ValueError("Contextual trait V1 array schema mismatch.")
+    return (*_ARRAY_NAMES, *(name for name in _OPTIONAL_ARRAY_NAMES if name in names))
+
+
+def _layouts_for(names: Any) -> dict[str, list[str]]:
+    return {
+        **{name: list(layout) for name, layout in _LAYOUTS.items()},
+        **{name: list(_OPTIONAL_LAYOUTS[name]) for name in names if name in _OPTIONAL_LAYOUTS},
+    }
+
+
+def _artifact_array_names(artifact: Any) -> tuple[str, ...]:
+    return (
+        *_ARRAY_NAMES,
+        *(name for name in _OPTIONAL_ARRAY_NAMES if getattr(artifact, name) is not None),
+    )
 
 _LAYOUTS = {
     "genetic_rhs": ["component", "trait"],
@@ -1755,6 +1790,8 @@ class ContextualTraitArtifactV1:
     annotation_masses: np.ndarray
     group_annotation_masses: np.ndarray
     group_variant_counts: np.ndarray
+    # Study context fourth moments G_S (P x P); None when not recorded.
+    context_fourth_moments: np.ndarray | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.component_index, ContextComponentIndex):
@@ -1768,6 +1805,16 @@ class ContextualTraitArtifactV1:
             dtype = np.int64 if name == "group_variant_counts" else np.float64
             object.__setattr__(
                 self, name, _immutable_array(getattr(self, name), dtype=dtype)
+            )
+        if self.context_fourth_moments is not None:
+            object.__setattr__(
+                self,
+                "context_fourth_moments",
+                validate_context_fourth_moments(
+                    _immutable_array(self.context_fourth_moments, dtype=np.float64),
+                    len(self.component_index.pair_index),
+                    name="Contextual trait V1 context_fourth_moments",
+                ),
             )
         manifest = _json_value(self.manifest)
         _validate_artifact(self, manifest)
@@ -1976,6 +2023,7 @@ def _expected_shapes(dimensions: Mapping[str, int]) -> dict[str, tuple[int, ...]
         "annotation_masses": (k,),
         "group_annotation_masses": (j, k),
         "group_variant_counts": (j,),
+        "context_fourth_moments": (dimensions["P_g"], dimensions["P_g"]),
     }
 
 
@@ -2022,7 +2070,8 @@ def _validate_manifest_before_arrays(
         raise ValueError("Contextual trait V1 scientific policy mismatch.")
     if manifest["deletion"] != _DELETION_POLICY:
         raise ValueError("Contextual trait V1 deletion policy mismatch.")
-    if manifest["layouts"] != _LAYOUTS:
+    declared_arrays = _declared_array_names(manifest["arrays"])
+    if manifest["layouts"] != _layouts_for(declared_arrays):
         raise ValueError("Contextual trait V1 logical array layouts mismatch.")
     if manifest["terminal_status"] != "published":
         raise ValueError("Contextual trait V1 is not published.")
@@ -2114,9 +2163,9 @@ def _validate_manifest_before_arrays(
             raise ValueError(f"Contextual trait V1 authority {name} mismatch.")
 
     arrays = manifest["arrays"]
-    if not isinstance(arrays, Mapping) or set(arrays) != set(_ARRAY_NAMES):
-        raise ValueError("Contextual trait V1 array schema mismatch.")
-    for name, shape in _expected_shapes(dimensions).items():
+    shapes = _expected_shapes(dimensions)
+    for name in declared_arrays:
+        shape = shapes[name]
         envelope = arrays[name]
         expected_dtype = "<i8" if name == "group_variant_counts" else "<f8"
         if not isinstance(envelope, Mapping) or set(envelope) != {
@@ -2150,7 +2199,12 @@ def _validate_artifact(
     if residuals != artifact.residual_names:
         raise ValueError("Contextual trait V1 residual map differs from the artifact.")
     dimensions = _dimensions(manifest["dimensions"])
-    for name, shape in _expected_shapes(dimensions).items():
+    present_arrays = _artifact_array_names(artifact)
+    if set(manifest["arrays"]) != set(present_arrays):
+        raise ValueError("Contextual trait V1 array manifest mismatch.")
+    shapes = _expected_shapes(dimensions)
+    for name in present_arrays:
+        shape = shapes[name]
         value = np.asarray(getattr(artifact, name))
         expected_dtype = np.dtype(
             np.int64 if name == "group_variant_counts" else np.float64
@@ -2339,8 +2393,15 @@ def _validate_artifact(
 def adapt_native_contextual_trait_v1(
     native_result: Mapping[str, Any],
     publication_identity: ContextualTraitPublicationIdentityV1,
+    *,
+    basis: Any | None = None,
 ) -> ContextualTraitArtifactV1:
-    """Validate and publish one complete native compact trait result."""
+    """Validate and publish one complete native compact trait result.
+
+    ``basis`` is the study's evaluated ``N x Q`` context basis.  When supplied
+    it must match ``evaluated_phi_sha256``; its context fourth moments are
+    then published for the study same-person transport.
+    """
     if not isinstance(native_result, Mapping):
         raise ValueError("Native contextual trait result must be a mapping.")
     if set(native_result) != _NATIVE_RESULT_KEYS:
@@ -2586,6 +2647,18 @@ def adapt_native_contextual_trait_v1(
         name: _immutable_array(value, dtype=value.dtype)
         for name, value in native_arrays.items()
     }
+    if basis is not None:
+        values = np.asarray(basis, dtype=np.float64)
+        if array_sha256(values) != publication_identity.evaluated_phi_sha256:
+            raise ValueError("Supplied study basis does not match evaluated_phi_sha256.")
+        if values.shape != (
+            _required_native(native_result, "study_n"),
+            components.pair_index.num_basis,
+        ):
+            raise ValueError("Supplied study basis has the wrong shape.")
+        arrays["context_fourth_moments"] = _immutable_array(
+            context_fourth_moments(values), dtype=np.float64
+        )
     scientific_values = {**native_arrays, **expected_maps}
     for name, value in scientific_values.items():
         if scientific_array_sha256[name] != array_sha256(value):
@@ -2619,7 +2692,9 @@ def adapt_native_contextual_trait_v1(
         "L": len(trait_ids),
         "residual_rank": residual_rank,
     }
-    for name, shape in _expected_shapes(dimensions).items():
+    expected_shapes = _expected_shapes(dimensions)
+    for name in arrays:
+        shape = expected_shapes[name]
         if arrays[name].shape != shape:
             raise ValueError(
                 f"Native contextual trait {name} has shape {arrays[name].shape}, "
@@ -2731,7 +2806,7 @@ def adapt_native_contextual_trait_v1(
             "telemetry": telemetry,
         },
         "deletion": dict(_DELETION_POLICY),
-        "layouts": {name: list(layout) for name, layout in _LAYOUTS.items()},
+        "layouts": _layouts_for(tuple(arrays)),
         "maps": maps,
         "arrays": {name: _array_envelope(value) for name, value in arrays.items()},
         "terminal_status": "published",
@@ -2750,12 +2825,14 @@ def adapt_native_contextual_trait_v1(
 def run_contextual_trait_v1(
     executor: Any,
     publication_identity: ContextualTraitPublicationIdentityV1,
+    *,
+    basis: Any | None = None,
 ) -> ContextualTraitArtifactV1:
     """Make exactly one native ``run`` call and publish its compact result."""
     run = getattr(executor, "run", None)
     if run is None or not callable(run):
         raise ValueError("executor must expose a callable run() method.")
-    return adapt_native_contextual_trait_v1(run(), publication_identity)
+    return adapt_native_contextual_trait_v1(run(), publication_identity, basis=basis)
 
 
 def write_contextual_trait_v1(
@@ -2768,7 +2845,7 @@ def write_contextual_trait_v1(
     manifest_json, manifest_sha256, arrays = _preflight_stable_npz_members(
         manifest_json=canonical_json(artifact.manifest),
         manifest_sha256=artifact.manifest_sha256,
-        arrays={name: getattr(artifact, name) for name in _ARRAY_NAMES},
+        arrays={name: getattr(artifact, name) for name in _artifact_array_names(artifact)},
         family="Contextual trait V1",
     )
     path = Path(output)
@@ -2833,14 +2910,15 @@ def load_contextual_trait_v1(path: str | Path) -> ContextualTraitArtifactV1:
                 residual_names,
             ) = _validate_manifest_before_arrays(manifest)
             shapes = _expected_shapes(_dimensions(manifest["dimensions"]))
+            declared_arrays = _declared_array_names(manifest["arrays"])
             array_specs = {}
-            for name in _ARRAY_NAMES:
+            for name in declared_arrays:
                 expected_dtype = np.dtype(
                     np.int64 if name == "group_variant_counts" else np.float64
                 ).newbyteorder("<")
                 array_specs[name] = (expected_dtype, shapes[name])
             archive.preflight_arrays(array_specs)
-            arrays = {name: archive.load_array(name) for name in _ARRAY_NAMES}
+            arrays = {name: archive.load_array(name) for name in declared_arrays}
     except (OSError, ValueError) as exc:
         if isinstance(exc, ValueError) and str(exc).startswith("Contextual trait V1"):
             raise

@@ -12,7 +12,13 @@ from typing import Sequence
 
 import numpy as np
 
-from .spec import ContextComponentIndex, owned_readonly_array
+from .spec import (
+    ContextComponentIndex,
+    context_fourth_moments,
+    owned_readonly_array,
+    validate_context_fourth_moments,
+)
+from .spec import validate_sample_rows as _sample_rows
 
 
 @dataclass(frozen=True)
@@ -408,68 +414,6 @@ is an exchangeable subset of the reference.
 
 class SamePersonTransportWarning(UserWarning):
     """The legacy scaled same-person term was used for a different-size study."""
-
-
-def _sample_rows(name: str, rows: object, n_samples: int) -> np.ndarray:
-    values = np.asarray(rows)
-    if (
-        values.ndim != 1
-        or values.dtype.kind not in "iu"
-        or values.size < 1
-        or np.any(values < 0)
-        or np.any(values >= n_samples)
-    ):
-        raise ValueError(
-            f"{name} must be a nonempty integer vector of sample indices "
-            f"in [0, {n_samples})."
-        )
-    if np.unique(values).size != values.size:
-        raise ValueError(f"{name} must not repeat a sample.")
-    return values.astype(np.int64, copy=False)
-
-
-def context_fourth_moments(basis: object, rows: object | None = None) -> np.ndarray:
-    """Return the ``P x P`` context fourth moments ``G = sum_i u(i) u(i)'``.
-
-    ``u_p(i) = kappa_p phi_q(i) phi_r(i)`` for the pairs ``p = (q, r)`` in
-    :class:`ContextPairIndex` order, with ``kappa_p = 1`` on the diagonal and
-    ``2`` off it.  This is the saved symmetric kernel convention: a kernel
-    diagonal entry of component ``(a, p)`` is ``kappa_p phi_q phi_r`` times the
-    person's (projected) squared-genotype mass.  The sum runs over ``rows`` of
-    ``basis`` (all rows when ``rows`` is ``None``).  ``G`` is a person-summed
-    aggregate, safe to publish like the same-person matrix itself.
-    """
-    from .spec import ContextPairIndex
-
-    phi = _finite_float64("basis", basis, ndim=2)
-    if phi.shape[0] < 1 or phi.shape[1] < 1:
-        raise ValueError("basis must have at least one row and one column.")
-    if rows is not None:
-        phi = phi[_sample_rows("rows", rows, phi.shape[0])]
-    pairs = ContextPairIndex(phi.shape[1]).entries
-    products = np.empty((phi.shape[0], len(pairs)), dtype=np.float64)
-    for pair in pairs:
-        products[:, pair.index] = (
-            float(pair.kernel_factor) * phi[:, pair.q] * phi[:, pair.r]
-        )
-    moments = products.T @ products
-    return 0.5 * (moments + moments.T)
-
-
-def validate_context_fourth_moments(
-    value: object, pair_count: int, *, name: str = "context_fourth_moments"
-) -> np.ndarray:
-    """Return an owned read-only copy of a valid ``P x P`` fourth-moment matrix."""
-    result = np.array(value, dtype=np.float64, order="C", copy=True)
-    if result.shape != (pair_count, pair_count) or not np.all(np.isfinite(result)):
-        raise ValueError(f"{name} must be a finite {pair_count} by {pair_count} matrix.")
-    scale = max(float(np.max(np.abs(result), initial=0.0)), 1.0)
-    if float(np.max(np.abs(result - result.T), initial=0.0)) > 1.0e-12 * scale:
-        raise ValueError(f"{name} must be symmetric.")
-    if not result[0, 0] > 0.0:
-        raise ValueError(f"{name} has no intercept-pair mass.")
-    result.setflags(write=False)
-    return result
 
 
 def exact_study_same_person(
