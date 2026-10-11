@@ -571,18 +571,37 @@ def assemble_contextual_normal_equations_from_moments_v1(
     deleted_groups: Sequence[str],
     reference_moments: ReferenceMoments,
     trait_moments: ContextualTraitMomentsV1,
+    study_same_person: np.ndarray | None = None,
+    same_person_transport: str | None = None,
 ) -> ContextNormalEquations:
-    """Assemble the shared population-transfer system from compact moments."""
+    """Assemble the shared population-transfer system from compact moments.
+
+    ``study_same_person`` replaces the legacy ``(n_S/n_R) D_R`` and must come
+    with its ``same_person_transport`` label.  Deleted systems reuse the full
+    study same-person term, as they reuse the full reference ``D_R``.
+    """
     requested = tuple(deleted_groups)
     if array_sha256(reference_moments.annotation_masses) != array_sha256(
         trait_moments.annotation_masses
     ):
         raise ValueError("Reference and trait retained annotation masses differ.")
+    if study_same_person is None:
+        if same_person_transport not in (None, "scaled_legacy"):
+            raise ValueError(
+                f"{same_person_transport!r} requires a study same-person matrix."
+            )
+        same_person_transport = "scaled_legacy"
+    elif same_person_transport not in ("own_rows_exact", "fourth_moment_difference"):
+        raise ValueError(
+            "A study same-person matrix requires its own_rows_exact or "
+            "fourth_moment_difference label."
+        )
     transferred = transfer_reference_gram(
         reference_moments.gram,
         reference_moments.same_person,
         reference_n=reference_n,
         study_n=trait.n_samples,
+        study_same_person=study_same_person,
     )
     c = len(component_index)
     h = len(trait.residual_names)
@@ -613,6 +632,7 @@ def assemble_contextual_normal_equations_from_moments_v1(
         transferred_genetic_gram=transferred,
         reference_n=reference_n,
         study_n=trait.n_samples,
+        same_person_transport=same_person_transport,
     )
 
 

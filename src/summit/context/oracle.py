@@ -456,6 +456,22 @@ def context_fourth_moments(basis: object, rows: object | None = None) -> np.ndar
     return 0.5 * (moments + moments.T)
 
 
+def validate_context_fourth_moments(
+    value: object, pair_count: int, *, name: str = "context_fourth_moments"
+) -> np.ndarray:
+    """Return an owned read-only copy of a valid ``P x P`` fourth-moment matrix."""
+    result = np.array(value, dtype=np.float64, order="C", copy=True)
+    if result.shape != (pair_count, pair_count) or not np.all(np.isfinite(result)):
+        raise ValueError(f"{name} must be a finite {pair_count} by {pair_count} matrix.")
+    scale = max(float(np.max(np.abs(result), initial=0.0)), 1.0)
+    if float(np.max(np.abs(result - result.T), initial=0.0)) > 1.0e-12 * scale:
+        raise ValueError(f"{name} must be symmetric.")
+    if not result[0, 0] > 0.0:
+        raise ValueError(f"{name} has no intercept-pair mass.")
+    result.setflags(write=False)
+    return result
+
+
 def exact_study_same_person(
     component_kernel_diagonal: object, rows: object
 ) -> np.ndarray:

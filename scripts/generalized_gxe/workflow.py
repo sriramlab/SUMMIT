@@ -573,6 +573,7 @@ def run_reference(
         diagnostics=diagnostics,
         include_directional_panel=include_directional_panel,
         mode=mode,
+        basis=basis,
     )
     artifact_path = None
     if output is not None:
@@ -665,9 +666,14 @@ def run_trait_batch(
 def full_fits(
     reference: GeneralizedGxEVariantReferenceArtifactV1,
     trait: GeneralizedGxETraitSummary,
+    *,
+    study_rows: Sequence[int] | np.ndarray | None = None,
 ) -> tuple[GeneralizedGxEVariantFitResultV1, ...]:
+    """Fit every trait; ``study_rows`` index the trait's people in the reference."""
     return tuple(
-        fit_generalized_gxe_variant_model_v1(reference, trait, trait_selector=index)
+        fit_generalized_gxe_variant_model_v1(
+            reference, trait, trait_selector=index, study_rows=study_rows
+        )
         for index in range(trait.n_traits)
     )
 

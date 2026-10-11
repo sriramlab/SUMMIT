@@ -11,6 +11,8 @@ from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 import numpy as np
+from summit.context.oracle import context_fourth_moments as _context_fourth_moments
+from summit.context.oracle import validate_context_fourth_moments
 from summit.context.reference import ReferenceMoments
 from summit.context.schema import GenotypeScalePlanV1
 from summit.context.spec import (
@@ -57,7 +59,12 @@ _OPTIONAL_ARRAY_NAMES = (
     "component_kernel_diagonal",
     "affine_mean",
     "affine_inverse_scale",
+    "context_fourth_moments",
 )
+# ``context_fourth_moments`` is the P x P aggregate G_R = sum_i u(i) u(i)' of
+# the reference contexts (summit.context.oracle.context_fourth_moments).  It is
+# person-summed, so both publication modes may carry it.  Older artifacts lack
+# it; a fit then falls back to another same-person transport.
 
 
 def _owned_readonly(value: Any) -> np.ndarray:
@@ -402,6 +409,7 @@ def _validate_reference_structure(
         "component_kernel_diagonal": (c_count, n),
         "affine_mean": (m,),
         "affine_inverse_scale": (m,),
+        "context_fourth_moments": (len(pairs), len(pairs)),
     }
     for name, shape in expected.items():
         if name not in arrays or np.asarray(arrays[name]).shape != shape:
@@ -442,6 +450,12 @@ def _validate_reference_structure(
         arrays["affine_inverse_scale"] <= 0.0
     ):
         raise ValueError("genotype affine inverse scales must be positive")
+    if "context_fourth_moments" in arrays:
+        validate_context_fourth_moments(
+            arrays["context_fourth_moments"],
+            len(pairs),
+            name="generalized reference context_fourth_moments",
+        )
     if not np.allclose(
         np.sum(arrays["block_annotation_mass"], axis=0),
         annotation_masses,
@@ -475,6 +489,7 @@ class GeneralizedGxEVariantReferenceArtifactV1:
     component_kernel_diagonal: np.ndarray | None = None
     affine_mean: np.ndarray | None = None
     affine_inverse_scale: np.ndarray | None = None
+    context_fourth_moments: np.ndarray | None = None
     component_index: ContextComponentIndex = field(init=False)
     scale_plan: None = field(init=False)
     genotype_scale: Mapping[str, str] = field(init=False)
@@ -762,8 +777,14 @@ def build_generalized_gxe_variant_reference_from_native_v1(
     diagnostics: Mapping[str, Any],
     include_directional_panel: bool = False,
     mode: str = "summary",
+    basis: np.ndarray | None = None,
 ) -> GeneralizedGxEVariantReferenceArtifactV1:
-    """Publishable adapter from the Stage 06 native result, without genotypes."""
+    """Publishable adapter from the Stage 06 native result, without genotypes.
+
+    ``basis`` is the reference's ``N x Q`` context basis on its retained
+    samples.  When supplied, its context fourth moments are published so that
+    fits can form the study same-person term from aggregates.
+    """
     if not isinstance(include_directional_panel, bool):
         raise ValueError("native artifact inclusion policy must be boolean")
     if mode not in GENERALIZED_GXE_VARIANT_REFERENCE_MODES:
@@ -815,6 +836,18 @@ def build_generalized_gxe_variant_reference_from_native_v1(
     arrays["affine_inverse_scale"] = np.asarray(
         getattr(native_result, "affine_inverse_scale")
     )
+    if basis is not None:
+        values = np.asarray(basis, dtype=np.float64)
+        expected_shape = (
+            int(axes["samples"]["count"]),
+            len(axes["basis"]["names"]),
+        )
+        if values.shape != expected_shape:
+            raise ValueError(
+                "reference basis must have one row per retained sample and one "
+                "column per basis name"
+            )
+        arrays["context_fourth_moments"] = _context_fourth_moments(values)
     raw_ledger = getattr(native_result, "ledger", None)
     if not isinstance(raw_ledger, Mapping):
         raise ValueError("native result lacks a pass ledger")
@@ -1007,6 +1040,16 @@ def compose_generalized_gxe_variant_references_v1(
         arrays["affine_mean"] = first.affine_mean
         assert first.affine_inverse_scale is not None
         arrays["affine_inverse_scale"] = first.affine_inverse_scale
+    # The fourth moments depend only on the shared samples and basis.  They
+    # are kept when every source carries them; a source without them (an
+    # older artifact) leaves the composition without them.
+    fourth_moments = [artifact.context_fourth_moments for artifact, _ in selections]
+    if all(value is not None for value in fourth_moments):
+        if any(not np.array_equal(value, fourth_moments[0]) for value in fourth_moments):
+            raise ValueError(
+                "incompatible generalized reference bundles: context_fourth_moments"
+            )
+        arrays["context_fourth_moments"] = fourth_moments[0]
     if mode == "composable":
         arrays.update(
             {

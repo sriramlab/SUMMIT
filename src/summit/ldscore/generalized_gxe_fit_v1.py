@@ -18,7 +18,11 @@ from summit.context.fit_v1 import (
     DEFAULT_FIT_V1_RTOL,
     assemble_contextual_normal_equations_from_moments_v1,
 )
-from summit.context.oracle import coefficients_to_omegas, omegas_to_coefficients
+from summit.context.oracle import (
+    coefficients_to_omegas,
+    omegas_to_coefficients,
+    resolve_study_same_person,
+)
 from summit.context.spec import (
     ContextComponentIndex,
     freeze_context_mapping,
@@ -471,20 +475,60 @@ def _trait_moments_after_deleting_blocks(
     )
 
 
+def resolve_generalized_gxe_study_same_person_v1(
+    reference: GeneralizedGxEVariantReferenceArtifactV1,
+    trait: GeneralizedGxETraitSummary,
+    *,
+    study_rows: object | None = None,
+    same_person_transport: str | None = None,
+) -> tuple[np.ndarray | None, str]:
+    """Choose the trait's same-person term for the transported reference Gram.
+
+    ``study_rows`` are the trait's people as indices into the reference
+    sample axis.  With a composable reference (per-person kernel diagonals)
+    they give the exact own-row term.  Otherwise the reference and trait
+    context fourth moments give the release-safe summary form.  Without
+    either, the legacy ``(n_S/n_R) D_R`` is kept, with a warning when the
+    sample sizes differ.  ``same_person_transport`` forces one choice.
+    """
+    return resolve_study_same_person(
+        reference.same_person,
+        reference_n=reference.n_samples,
+        study_n=trait.n_samples,
+        annotation_count=len(reference.component_index.annotation_names),
+        component_kernel_diagonal=reference.component_kernel_diagonal,
+        study_rows=study_rows,
+        reference_fourth_moments=reference.context_fourth_moments,
+        study_fourth_moments=trait.context_fourth_moments,
+        requested=same_person_transport,
+        stacklevel=3,
+    )
+
+
 def assemble_generalized_gxe_normal_equations_v1(
     reference: GeneralizedGxEVariantReferenceArtifactV1,
     trait: GeneralizedGxETraitSummary,
     *,
     trait_selector: str | int | None = None,
     deleted_blocks: Sequence[str] = (),
+    study_rows: object | None = None,
+    same_person_transport: str | None = None,
 ) -> ContextNormalEquations:
     """Use the shared fit assembly from compact reference and trait moments."""
     validate_generalized_gxe_trait_compatibility_v1(reference, trait)
+    study_same_person, transport = resolve_generalized_gxe_study_same_person_v1(
+        reference,
+        trait,
+        study_rows=study_rows,
+        same_person_transport=same_person_transport,
+    )
     return _assemble_generalized_gxe_normal_equations_prevalidated_v1(
         reference,
         trait,
         trait_selector=trait_selector,
         deleted_blocks=deleted_blocks,
+        study_same_person=study_same_person,
+        same_person_transport=transport,
     )
 
 
@@ -494,6 +538,8 @@ def _assemble_generalized_gxe_normal_equations_prevalidated_v1(
     *,
     trait_selector: str | int | None,
     deleted_blocks: Sequence[str],
+    study_same_person: np.ndarray | None = None,
+    same_person_transport: str | None = None,
 ) -> ContextNormalEquations:
     """Assemble after one enclosing compatibility validation."""
     trait_index, _ = _select_trait(trait, trait_selector)
@@ -514,6 +560,8 @@ def _assemble_generalized_gxe_normal_equations_prevalidated_v1(
         deleted_groups=requested,
         reference_moments=reference_moments,
         trait_moments=trait_moments,
+        study_same_person=study_same_person,
+        same_person_transport=same_person_transport,
     )
 
 
@@ -523,17 +571,31 @@ def assemble_generalized_gxe_normal_equation_batch_v1(
     *,
     trait_selector: str | int | None = None,
     deleted_block_sets: Sequence[Sequence[str]],
+    study_rows: object | None = None,
+    same_person_transport: str | None = None,
 ) -> tuple[ContextNormalEquations, ...]:
-    """Validate once and assemble several full/deleted summary systems."""
+    """Validate once and assemble several full/deleted summary systems.
+
+    The study same-person term is formed once and reused by every deleted
+    system, as the full reference same-person term was.
+    """
     validate_generalized_gxe_trait_compatibility_v1(reference, trait)
     if isinstance(deleted_block_sets, (str, bytes)):
         raise ValueError("deleted_block_sets must be a sequence of sequences")
+    study_same_person, transport = resolve_generalized_gxe_study_same_person_v1(
+        reference,
+        trait,
+        study_rows=study_rows,
+        same_person_transport=same_person_transport,
+    )
     return tuple(
         _assemble_generalized_gxe_normal_equations_prevalidated_v1(
             reference,
             trait,
             trait_selector=trait_selector,
             deleted_blocks=deleted,
+            study_same_person=study_same_person,
+            same_person_transport=transport,
         )
         for deleted in deleted_block_sets
     )
@@ -605,8 +667,15 @@ def fit_generalized_gxe_variant_model_v1(
     *,
     trait_selector: str | int | None = None,
     rtol: float | None = None,
+    study_rows: object | None = None,
+    same_person_transport: str | None = None,
 ) -> GeneralizedGxEVariantFitResultV1:
-    """Run the existing raw symmetric solve and compact every-block jackknife."""
+    """Run the existing raw symmetric solve and compact every-block jackknife.
+
+    See :func:`resolve_generalized_gxe_study_same_person_v1` for
+    ``study_rows`` and ``same_person_transport``.  The choice is recorded in
+    the fit manifest as ``same_person_transport``.
+    """
     compatibility = validate_generalized_gxe_trait_compatibility_v1(
         reference, trait
     )
@@ -629,6 +698,8 @@ def fit_generalized_gxe_variant_model_v1(
         trait,
         trait_selector=trait_index,
         deleted_block_sets=((), *((group,) for group in groups)),
+        study_rows=study_rows,
+        same_person_transport=same_person_transport,
     )
     equations = assembled[0]
     solve = solve_context_normal_equations(
@@ -670,6 +741,7 @@ def fit_generalized_gxe_variant_model_v1(
         "selected_trait_index": trait_index,
         "jackknife_method": GENERALIZED_GXE_VARIANT_JACKKNIFE_METHOD,
         "same_person_jackknife": "reuse_full_same_person_v1",
+        "same_person_transport": equations.same_person_transport,
         "summary_only_fit": True,
         "per_variant_panel_accessed": False,
         "compatibility": dict(compatibility),

@@ -18,6 +18,10 @@ from typing import Sequence
 
 import numpy as np
 
+from summit.context.oracle import (
+    context_fourth_moments,
+    validate_context_fourth_moments,
+)
 from summit.context.spec import ContextComponentIndex, ContextPairIndex
 from summit.context.trait_v1 import ContextualTraitMomentsV1
 
@@ -35,6 +39,11 @@ def _readonly(value: object, *, dtype: np.dtype | type = np.float64) -> np.ndarr
     return result
 
 
+def _fourth_moments(value: object, pair_count: int) -> np.ndarray:
+    """Validate an optional P x P study context fourth-moment matrix."""
+    return validate_context_fourth_moments(value, pair_count)
+
+
 @dataclass(frozen=True)
 class GeneralizedGxEPerVariantTraitStatistics:
     """Per-SNP score, information, and heteroskedastic information rows."""
@@ -47,6 +56,9 @@ class GeneralizedGxEPerVariantTraitStatistics:
     residual_traces: np.ndarray
     residual_gram: np.ndarray
     residual_rank: int
+    # Study context fourth moments G_S over the study's own people (P x P);
+    # None for statistics computed before they were recorded.
+    context_fourth_moments: np.ndarray | None = None
 
     def __post_init__(self) -> None:
         for name in (
@@ -68,6 +80,12 @@ class GeneralizedGxEPerVariantTraitStatistics:
             raise ValueError("scores must have shape M by Q by L")
         m, q, _ = self.scores.shape
         p = q * (q + 1) // 2
+        if self.context_fourth_moments is not None:
+            object.__setattr__(
+                self,
+                "context_fourth_moments",
+                _fourth_moments(self.context_fourth_moments, p),
+            )
         if self.information.shape != (m, p):
             raise ValueError("information must have shape M by Q(Q+1)/2")
         if self.residual_information.ndim != 3 or (
@@ -152,6 +170,10 @@ class GeneralizedGxETraitSummary:
     group_annotation_masses: np.ndarray
     group_variant_counts: np.ndarray
     per_variant: GeneralizedGxEPerVariantTraitStatistics | None = None
+    # Study context fourth moments G_S (P x P) over the trait's own people.
+    # They let a transported fit form its same-person term from aggregates;
+    # None (older summaries) means they are not available.
+    context_fourth_moments: np.ndarray | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "group_ids", tuple(self.group_ids))
@@ -228,6 +250,14 @@ class GeneralizedGxETraitSummary:
             raise ValueError("annotation masses and group counts must be positive")
         if int(np.sum(self.group_variant_counts)) != self.n_variants:
             raise ValueError("group counts do not reconstruct the variant count")
+        if self.context_fourth_moments is not None:
+            object.__setattr__(
+                self,
+                "context_fourth_moments",
+                _fourth_moments(
+                    self.context_fourth_moments, len(self.component_index.pair_index)
+                ),
+            )
         if not np.allclose(
             np.sum(self.group_annotation_masses, axis=0),
             self.annotation_masses,
@@ -394,6 +424,7 @@ def generalized_gxe_per_variant_trait_statistics(
         residual_traces=residual_traces,
         residual_gram=residual_gram,
         residual_rank=residual_rank,
+        context_fourth_moments=context_fourth_moments(phi),
     )
 
 
@@ -408,8 +439,13 @@ def aggregate_generalized_gxe_trait_statistics(
     residual_names: Sequence[str],
     n_samples: int,
     retain_per_variant: bool = True,
+    context_fourth_moments: object | None = None,
 ) -> GeneralizedGxETraitSummary:
-    """Reduce per-SNP rows to full and block numerators in one linear pass."""
+    """Reduce per-SNP rows to full and block numerators in one linear pass.
+
+    The study context fourth moments are taken from ``statistics`` unless
+    ``context_fourth_moments`` supplies them.
+    """
     if not isinstance(statistics, GeneralizedGxEPerVariantTraitStatistics):
         raise TypeError("statistics must be generalized per-variant statistics")
     weights = _finite_matrix("annotations", annotations)
@@ -495,6 +531,11 @@ def aggregate_generalized_gxe_trait_statistics(
         group_annotation_masses=group_masses,
         group_variant_counts=group_counts,
         per_variant=statistics if retain_per_variant else None,
+        context_fourth_moments=(
+            statistics.context_fourth_moments
+            if context_fourth_moments is None
+            else context_fourth_moments
+        ),
     )
 
 
@@ -525,6 +566,7 @@ def reaggregate_generalized_gxe_trait_summary(
         residual_names=summary.residual_names,
         n_samples=summary.n_samples,
         retain_per_variant=retain_per_variant,
+        context_fourth_moments=summary.context_fourth_moments,
     )
 
 
@@ -832,6 +874,7 @@ def stream_generalized_gxe_per_variant_trait_statistics_from_bed(
         residual_traces=residual_traces,
         residual_gram=residual_gram,
         residual_rank=residual_rank,
+        context_fourth_moments=context_fourth_moments(phi),
     )
     report: dict[str, object] = {
         "backend": "pgenlib_direct_bed_linear_and_squared_v1",
@@ -878,6 +921,7 @@ def write_generalized_gxe_trait_summary(
         "trait_ids": list(summary.trait_ids),
         "residual_names": list(summary.residual_names),
         "per_variant_included": summary.per_variant is not None,
+        "context_fourth_moments_included": summary.context_fourth_moments is not None,
     }
     arrays = {
         "metadata_json": np.asarray(
@@ -896,6 +940,8 @@ def write_generalized_gxe_trait_summary(
         "group_annotation_masses": summary.group_annotation_masses,
         "group_variant_counts": summary.group_variant_counts,
     }
+    if summary.context_fourth_moments is not None:
+        arrays["context_fourth_moments"] = summary.context_fourth_moments
     if summary.per_variant is not None:
         arrays.update(
             {
@@ -992,6 +1038,18 @@ def load_generalized_gxe_trait_summary(
             if included is True
             else None
         )
+        # Summaries written before the fourth moments were recorded have no
+        # declaration and no array; both mean "not available".
+        fourth_included = metadata.get("context_fourth_moments_included", False)
+        if not isinstance(fourth_included, bool) or fourth_included != (
+            "context_fourth_moments" in archive.files
+        ):
+            raise ValueError(
+                "generalized trait summary context fourth-moment declaration is invalid"
+            )
+        fourth_moments = (
+            np.asarray(archive["context_fourth_moments"]) if fourth_included else None
+        )
     try:
         pair_index = ContextPairIndex(int(metadata["basis_count"]))
         component_index = ContextComponentIndex(
@@ -1011,6 +1069,7 @@ def load_generalized_gxe_trait_summary(
                 residual_traces=arrays["residual_traces"],
                 residual_gram=arrays["residual_gram"],
                 residual_rank=int(metadata["residual_rank"]),
+                context_fourth_moments=fourth_moments,
             )
         summary = GeneralizedGxETraitSummary(
             n_samples=int(metadata["n_samples"]),
@@ -1023,6 +1082,7 @@ def load_generalized_gxe_trait_summary(
                 str(value) for value in metadata["residual_names"]
             ),
             per_variant=per_variant,
+            context_fourth_moments=fourth_moments,
             **arrays,
         )
     except (KeyError, TypeError, ValueError) as exc:
