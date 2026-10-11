@@ -8,6 +8,8 @@ import numpy as np
 import pytest
 
 from summit.context import (
+    SamePersonTransportWarning,
+    approximate_study_same_person,
     ContextRankError,
     DirectionCrossFitArmContractions,
     array_sha256,
@@ -630,7 +632,7 @@ def test_objective_ids_remain_distinct_when_coefficient_and_trace_rank_oppositel
         evaluate_context_direction(contractions, first, objective="generic_gxe_signal")
 
 
-def test_independent_reference_genetic_block_uses_exact_same_person_transfer() -> None:
+def test_independent_reference_genetic_block_uses_study_same_person_transfer() -> None:
     fixture = _fixture(
         l_count=2,
         seed=7220,
@@ -638,11 +640,12 @@ def test_independent_reference_genetic_block_uses_exact_same_person_transfer() -
         n_study=29,
         n_variants=25,
     )
-    _, _, contractions = _build_contractions(fixture)
+    reference, trait, contractions = _build_contractions(fixture)
     direction = _canonical_direction(np.asarray([0.7, -0.5]), fixture["context_metric"])
     evaluation = evaluate_context_direction(
         contractions, direction, objective="interaction_coefficient"
     )
+    assert evaluation.equations.same_person_transport == "fourth_moment_difference"
     reference_kernels = _dense_kernels(fixture, direction, reference=True)[:2]
     reference_gram = np.einsum(
         "aij,bij->ab", reference_kernels, reference_kernels, optimize=True
@@ -652,9 +655,37 @@ def test_independent_reference_genetic_block_uses_exact_same_person_transfer() -
     study_n = fixture["study_genotype"].shape[0]
     alpha = study_n / reference_n
     beta = study_n * (study_n - 1.0) / (reference_n * (reference_n - 1.0))
-    expected = alpha * same_person + beta * (reference_gram - same_person)
+    # The study's same-person term is formed on the compact [G, I_pairs]
+    # axis from the two cohorts' context fourth moments, then reduced.
+    reduction = np.zeros((reference.compact_dimension, 2))
+    reduction[0, 0] = 1.0
+    reduction[1:, 1] = direction_pair_weights(direction, reference.pair_index)
+    study_same = reduction.T @ approximate_study_same_person(
+        reference.same_person,
+        reference.context_fourth_moments,
+        trait.context_fourth_moments,
+        reference_n=reference_n,
+        study_n=study_n,
+        annotation_count=1,
+    ) @ reduction
+    expected = study_same + beta * (reference_gram - same_person)
     np.testing.assert_allclose(
         evaluation.matrix[:2, :2], expected, rtol=2e-11, atol=2e-10
+    )
+    # Without fourth moments the legacy (n_S/n_R) D_R term is kept, with a warning.
+    legacy = combine_context_direction_contractions(
+        replace(reference, context_fourth_moments=None), trait
+    )
+    with pytest.warns(SamePersonTransportWarning):
+        legacy_evaluation = evaluate_context_direction(
+            legacy, direction, objective="interaction_coefficient"
+        )
+    assert legacy_evaluation.equations.same_person_transport == "scaled_legacy"
+    np.testing.assert_allclose(
+        legacy_evaluation.matrix[:2, :2],
+        alpha * same_person + beta * (reference_gram - same_person),
+        rtol=2e-11,
+        atol=2e-10,
     )
 
 
