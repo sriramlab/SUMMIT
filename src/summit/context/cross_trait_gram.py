@@ -304,10 +304,12 @@ def within_trait_equations(reference_chromosomes, study_chromosomes, *,
         residual_traces=residual_traces, residual_names=residual_names,
         deleted_blocks=deleted_blocks, expected_chromosomes=expected_chromosomes)
     if mode == 'legacy_transport' and same_person_mode == 'scaled':
+        # The historical comparison arm: an explicit, acknowledged legacy term.
         return transferred_chromosome_equations(ref, study,
             reference_residual_gram=reference_residual_gram,
             reference_residual_traces=reference_residual_traces,
-            reference_same_person=reference_same_person, **common)
+            reference_same_person=reference_same_person,
+            same_person_transport='scaled_legacy', **common)
     target = joint_chromosome_equations(study, **common)
     if len(rows) != target.study_n:
         raise ValueError('trait rows disagree with study sample count')

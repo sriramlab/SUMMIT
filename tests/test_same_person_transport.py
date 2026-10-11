@@ -287,3 +287,143 @@ def test_summary_form_validates_dimensions() -> None:
         approximate_study_same_person(
             same, 0 * g, g, reference_n=10, study_n=5, annotation_count=2
         )
+
+
+def _chromosome_design():
+    from dataclasses import replace
+
+    from summit.ldscore.generalized_gxe_chromosome import ChromosomeMoments
+
+    rng = np.random.default_rng(18)
+    n, q, k = 40, 3, 2
+    p = q * (q + 1) // 2
+    c = k * p
+    phi = _basis(rng, n)
+    rows = _selective_rows(rng, phi)
+    ns = len(rows)
+    reference, study = [], []
+    for chromosome in (1, 2):
+        directed = rng.normal(size=(2, c, c))
+        directed = np.einsum("bij,bkj->bik", directed, directed)
+        chunk = ChromosomeMoments(
+            str(chromosome), "master", ("a", "b"), ("trait",), q, n, n - 2,
+            np.array([2 * chromosome - 2, 2 * chromosome - 1]),
+            np.array([[9.0, 4.0], [11.0, 6.0]]), directed,
+            rng.normal(size=(2, c, 1)), rng.normal(size=(2, c, 2)),
+        )
+        reference.append(chunk)
+        study.append(
+            replace(
+                chunk,
+                cohort_identity="study",
+                n_samples=ns,
+                residual_rank=ns - 2,
+                block_genetic_rhs=chunk.block_genetic_rhs * 0.8,
+                block_genetic_residual=chunk.block_genetic_residual * 0.8,
+            )
+        )
+    pairs = ContextPairIndex(q).entries
+    unit = np.stack(
+        [p_.kernel_factor * phi[:, p_.q] * phi[:, p_.r] for p_ in pairs]
+    )
+    mass = rng.uniform(0.95, 1.05, size=(k, n))
+    diagonal = np.vstack([unit * mass[a] for a in range(k)])
+    options = dict(
+        reference_residual_gram=np.diag([n - 2.0, float(n)]),
+        reference_residual_traces=np.array([n - 2.0, 0.0]),
+        reference_same_person=diagonal @ diagonal.T,
+        residual_gram=np.diag([ns - 2.0, float(ns)]),
+        residual_rhs=np.ones((2, 1)),
+        residual_traces=np.array([ns - 2.0, 0.0]),
+        residual_names=("one", "context"),
+    )
+    return reference, study, phi, rows, diagonal, options
+
+
+def test_chromosome_transfer_uses_the_study_same_person_term() -> None:
+    from summit.ldscore.generalized_gxe_chromosome import (
+        joint_chromosome_equations,
+        transferred_chromosome_equations,
+    )
+
+    reference, study, phi, rows, diagonal, options = _chromosome_design()
+    same = options["reference_same_person"]
+    n, ns = reference[0].n_samples, len(rows)
+    exact = exact_study_same_person(diagonal, rows)
+    summary = approximate_study_same_person(
+        same,
+        context_fourth_moments(phi),
+        context_fourth_moments(phi, rows),
+        reference_n=n,
+        study_n=ns,
+        annotation_count=2,
+    )
+    for deleted in ((), (1,), (0, 3)):
+        joint = joint_chromosome_equations(
+            reference,
+            residual_gram=options["reference_residual_gram"],
+            residual_traces=options["reference_residual_traces"],
+            residual_rhs=np.zeros((2, 1)),
+            residual_names=options["residual_names"],
+            deleted_blocks=deleted,
+        )
+        own = transferred_chromosome_equations(
+            reference, study, deleted_blocks=deleted,
+            reference_kernel_diagonal=diagonal, study_rows=rows, **options,
+        )
+        assert own.same_person_transport == "own_rows_exact"
+        # Deletions reuse the full study term, as they reuse the full D_R.
+        np.testing.assert_array_equal(
+            own.transferred_genetic_gram,
+            transfer_reference_gram(
+                joint.reference_genetic_gram, same, reference_n=n, study_n=ns,
+                study_same_person=exact,
+            ),
+        )
+        explicit = transferred_chromosome_equations(
+            reference, study, deleted_blocks=deleted, study_same_person=exact,
+            same_person_transport="own_rows_exact", **options,
+        )
+        np.testing.assert_array_equal(explicit.matrix, own.matrix)
+        moments = transferred_chromosome_equations(
+            reference, study, deleted_blocks=deleted,
+            reference_fourth_moments=context_fourth_moments(phi),
+            study_fourth_moments=context_fourth_moments(phi, rows), **options,
+        )
+        assert moments.same_person_transport == "fourth_moment_difference"
+        np.testing.assert_array_equal(
+            moments.transferred_genetic_gram,
+            transfer_reference_gram(
+                joint.reference_genetic_gram, same, reference_n=n, study_n=ns,
+                study_same_person=summary,
+            ),
+        )
+        with pytest.warns(SamePersonTransportWarning):
+            legacy = transferred_chromosome_equations(
+                reference, study, deleted_blocks=deleted, **options
+            )
+        assert legacy.same_person_transport == "scaled_legacy"
+        np.testing.assert_array_equal(
+            legacy.transferred_genetic_gram,
+            transfer_reference_gram(
+                joint.reference_genetic_gram, same, reference_n=n, study_n=ns
+            ),
+        )
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            acknowledged = transferred_chromosome_equations(
+                reference, study, deleted_blocks=deleted,
+                same_person_transport="scaled_legacy", **options,
+            )
+        np.testing.assert_array_equal(acknowledged.matrix, legacy.matrix)
+    # Per-person masses vary, so the summary form is close but not exact.
+    assert np.linalg.norm(summary - exact) < 0.2 * np.linalg.norm(ns / n * same - exact)
+    with pytest.raises(ValueError, match="label"):
+        transferred_chromosome_equations(
+            reference, study, study_same_person=exact, **options
+        )
+    with pytest.raises(ValueError, match="C by C"):
+        transferred_chromosome_equations(
+            reference, study, study_same_person=exact[:-1, :-1],
+            same_person_transport="own_rows_exact", **options,
+        )
