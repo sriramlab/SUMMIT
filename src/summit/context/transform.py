@@ -48,6 +48,8 @@ from .spec import (
     array_sha256,
     canonical_json,
     canonical_sha256,
+    context_fourth_moments,
+    validate_context_fourth_moments,
 )
 from .summary import ContextTraitSummary
 
@@ -219,6 +221,9 @@ class ContextTransformSummary:
     decode_passes: int
     decoded_blocks: int
     maximum_rhs_columns: int
+    # Study context fourth moments G_S (P x P) for the same-person transport;
+    # None for summaries written before they were recorded.
+    context_fourth_moments: np.ndarray | None = None
 
     @property
     def transform_ids(self) -> tuple[str, ...]:
@@ -293,6 +298,7 @@ class ContextTransformSummary:
             peak_rss_bytes=self.peak_rss_bytes,
             decode_passes=self.decode_passes,
             decoded_blocks=self.decoded_blocks,
+            context_fourth_moments=self.context_fourth_moments,
         )
 
     def rhs_after_deleting_groups(self, groups: Sequence[str]) -> np.ndarray:
@@ -424,6 +430,12 @@ def validate_context_transform_summary(
     }
     if observed_hash != canonical_sha256(without_hash):
         raise ValueError("Transformation-summary manifest SHA-256 mismatch.")
+    if summary.context_fourth_moments is not None:
+        validate_context_fourth_moments(
+            summary.context_fourth_moments,
+            len(summary.component_index.pair_index),
+            name="Transformation-summary context_fourth_moments",
+        )
     valid_ids = tuple(
         record.spec.transform_id for record in summary.transform_records if record.valid
     )
@@ -1057,6 +1069,7 @@ def build_context_transform_summary(
         decode_passes=1,
         decoded_blocks=decoded_blocks,
         maximum_rhs_columns=maximum_rhs_columns,
+        context_fourth_moments=context_fourth_moments(basis_array),
     )
     validate_context_transform_summary(result)
     return result
@@ -1247,6 +1260,7 @@ def fit_context_transform_scan(
             "maximum_relative_residual": float(np.max(solve.relative_residuals)),
             "factorizations": 1 + group_count,
         },
+        "same_person_transport": equations.same_person_transport,
         "approximate_loo": {
             "method": "snp_contribution_delete_group_v1",
             "full_reference_same_person_reused": True,
@@ -1755,9 +1769,15 @@ def write_context_transform_summary(
         prefix=f".{arrays_path.name}.", dir=arrays_path.parent
     )
     try:
+        optional = (
+            {}
+            if summary.context_fourth_moments is None
+            else {"context_fourth_moments": summary.context_fourth_moments}
+        )
         with os.fdopen(descriptor, "wb") as handle:
             np.savez_compressed(
                 handle,
+                **optional,
                 annotation_weights=summary.annotation_weights,
                 annotation_masses=summary.annotation_masses,
                 genetic_rhs=summary.genetic_rhs,
@@ -1851,6 +1871,9 @@ def load_context_transform_summary(
         raise ValueError("Transformation-summary component order is not canonical.")
     with np.load(arrays_path, allow_pickle=False) as arrays:
         values = {name: np.array(arrays[name], copy=True) for name in arrays.files}
+    fourth_moments = values.get("context_fourth_moments")
+    if fourth_moments is not None and fourth_moments.dtype != np.dtype(np.float64):
+        raise ValueError("Transformation-summary fourth moments must be float64.")
     performance = payload.get("performance", {})
     clean_manifest = {
         key: value
@@ -1890,6 +1913,7 @@ def load_context_transform_summary(
         decode_passes=int(performance.get("decode_passes", 1)),
         decoded_blocks=int(performance.get("decoded_blocks", 0)),
         maximum_rhs_columns=int(performance.get("maximum_rhs_columns", 0)),
+        context_fourth_moments=fourth_moments,
     )
     validate_context_transform_summary(result)
     return result

@@ -10,6 +10,7 @@ from __future__ import annotations
 import dataclasses
 import importlib.util
 import json
+import sys
 from pathlib import Path
 
 import numpy as np
@@ -82,7 +83,12 @@ def _generator():
     )
     module = importlib.util.module_from_spec(spec)
     assert spec.loader is not None
-    spec.loader.exec_module(module)
+    previous = sys.dont_write_bytecode
+    sys.dont_write_bytecode = True  # keep the fixture directory clean
+    try:
+        spec.loader.exec_module(module)
+    finally:
+        sys.dont_write_bytecode = previous
     return module
 
 
@@ -639,3 +645,51 @@ def test_development_fit_of_selective_study_approaches_matched_reference() -> No
     assert np.all(gram_errors[:, 1] < 0.3 * gram_errors[:, 0])
     # Coefficients, in the matched fit's jackknife s.e., averaged over draws.
     assert deviations[:, 1].mean() < 0.5 * deviations[:, 0].mean()
+
+
+def test_transform_scan_carries_study_fourth_moments(tmp_path: Path) -> None:
+    from summit.context.transform import (
+        PhenotypeTransformSpec,
+        build_context_transform_summary,
+        fit_context_transform_scan,
+        load_context_transform_summary,
+        write_context_transform_summary,
+    )
+
+    generator = _generator()
+    design = generator.legacy_design()
+    reference, _ = generator.context_objects(design)
+    rows = design["rows"]
+    summary = build_context_transform_summary(
+        genotype=design["genotype"][rows],
+        basis=design["basis"][rows],
+        projector=rank_revealing_projector(design["fixed_design"][rows]),
+        annotations=design["annotations"],
+        component_index=reference.component_index,
+        basis_hash=reference.manifest["basis_hash"],
+        fixed_effect_hash=canonical_sha256({"fixed": "study"}),
+        variant_hash=reference.manifest["variant_hash"],
+        loo_groups=tuple(f"group:{index % 3}" for index in range(design["m"])),
+        original_phenotype=np.exp(0.2 * design["phenotype"]),
+        transformations=(
+            PhenotypeTransformSpec("identity", "identity"),
+            PhenotypeTransformSpec("log", "log", shift=0.0),
+        ),
+        residual_basis=np.ones((len(rows), 1)),
+        residual_names=("residual:constant",),
+        original_trait="fixture_trait",
+    )
+    np.testing.assert_array_equal(
+        summary.context_fourth_moments, context_fourth_moments(design["basis"], rows)
+    )
+    np.testing.assert_array_equal(
+        summary.to_single_summary(0).context_fourth_moments, summary.context_fourth_moments
+    )
+    manifest_path, _ = write_context_transform_summary(summary, tmp_path / "scan")
+    loaded = load_context_transform_summary(manifest_path)
+    np.testing.assert_array_equal(
+        loaded.context_fourth_moments, summary.context_fourth_moments
+    )
+    fit = fit_context_transform_scan(reference, loaded)
+    assert fit.equations.same_person_transport == "fourth_moment_difference"
+    assert fit.manifest["same_person_transport"] == "fourth_moment_difference"
