@@ -36,8 +36,10 @@ from .fit import (
     solve_context_normal_equations,
 )
 from .oracle import (
+    SAME_PERSON_TRANSPORTS,
     coefficients_to_omegas,
     context_covariance_surface,
+    resolve_study_same_person,
     transfer_reference_gram,
 )
 from .reference import ReferenceMoments
@@ -571,18 +573,37 @@ def assemble_contextual_normal_equations_from_moments_v1(
     deleted_groups: Sequence[str],
     reference_moments: ReferenceMoments,
     trait_moments: ContextualTraitMomentsV1,
+    study_same_person: np.ndarray | None = None,
+    same_person_transport: str | None = None,
 ) -> ContextNormalEquations:
-    """Assemble the shared population-transfer system from compact moments."""
+    """Assemble the shared population-transfer system from compact moments.
+
+    ``study_same_person`` replaces the legacy ``(n_S/n_R) D_R`` and must come
+    with its ``same_person_transport`` label.  Deleted systems reuse the full
+    study same-person term, as they reuse the full reference ``D_R``.
+    """
     requested = tuple(deleted_groups)
     if array_sha256(reference_moments.annotation_masses) != array_sha256(
         trait_moments.annotation_masses
     ):
         raise ValueError("Reference and trait retained annotation masses differ.")
+    if study_same_person is None:
+        if same_person_transport not in (None, "scaled_legacy"):
+            raise ValueError(
+                f"{same_person_transport!r} requires a study same-person matrix."
+            )
+        same_person_transport = "scaled_legacy"
+    elif same_person_transport not in ("own_rows_exact", "fourth_moment_difference"):
+        raise ValueError(
+            "A study same-person matrix requires its own_rows_exact or "
+            "fourth_moment_difference label."
+        )
     transferred = transfer_reference_gram(
         reference_moments.gram,
         reference_moments.same_person,
         reference_n=reference_n,
         study_n=trait.n_samples,
+        study_same_person=study_same_person,
     )
     c = len(component_index)
     h = len(trait.residual_names)
@@ -613,6 +634,7 @@ def assemble_contextual_normal_equations_from_moments_v1(
         transferred_genetic_gram=transferred,
         reference_n=reference_n,
         study_n=trait.n_samples,
+        same_person_transport=same_person_transport,
     )
 
 
@@ -642,6 +664,15 @@ def assemble_contextual_normal_equations_v1(
         reference, requested
     )
     trait_moments = trait_moments_after_deleting_groups_v1(trait, requested)
+    # Full (undeleted) moments only, so every deletion reuses the same term.
+    study_same_person, transport = resolve_study_same_person(
+        reference.same_person,
+        reference_n=reference.n_samples,
+        study_n=trait.n_samples,
+        annotation_count=len(reference.component_index.annotation_names),
+        reference_fourth_moments=reference.context_fourth_moments,
+        study_fourth_moments=trait.context_fourth_moments,
+    )
     return assemble_contextual_normal_equations_from_moments_v1(
         component_index=reference.component_index,
         reference_n=reference.n_samples,
@@ -650,6 +681,8 @@ def assemble_contextual_normal_equations_v1(
         deleted_groups=requested,
         reference_moments=reference_moments,
         trait_moments=trait_moments,
+        study_same_person=study_same_person,
+        same_person_transport=transport,
     )
 
 
@@ -746,6 +779,11 @@ class ContextualFitArtifactV1:
     @property
     def n_samples(self) -> int:
         return int(self.manifest["dimensions"]["N_study"])
+
+    @property
+    def same_person_transport(self) -> str:
+        """How the transported Gram's same-person term was formed."""
+        return str(self.manifest.get("same_person_transport", "scaled_legacy"))
 
     def verify(self) -> None:
         _validate_artifact(self, _json_value(self.manifest))
@@ -1122,6 +1160,7 @@ def fit_contextual_model_v1(
             name: _array_envelope(value) for name, value in immutable_arrays.items()
         },
         "terminal_status": "published",
+        "same_person_transport": equations.same_person_transport,
     }
     return ContextualFitArtifactV1(
         manifest=manifest,
@@ -1189,8 +1228,16 @@ def _validate_manifest_before_arrays(
     str,
     int,
 ]:
-    if not isinstance(manifest, Mapping) or set(manifest) != _MANIFEST_KEYS:
+    # ``same_person_transport`` is optional: fits written before it was
+    # recorded omit it, and they used the legacy scaled same-person term.
+    if not isinstance(manifest, Mapping) or set(manifest) - {
+        "same_person_transport"
+    } != _MANIFEST_KEYS:
         raise ValueError("Contextual fit V1 manifest key mismatch.")
+    if manifest.get("same_person_transport", "scaled_legacy") not in (
+        SAME_PERSON_TRANSPORTS
+    ):
+        raise ValueError("Contextual fit V1 same-person transport is invalid.")
     if manifest.get("magic") != CONTEXTUAL_FIT_V1_MAGIC:
         raise ValueError("Contextual fit V1 magic mismatch.")
     try:

@@ -38,6 +38,7 @@ from .oracle import (
     kernel_gram,
     kernel_rhs,
     kernel_traces,
+    resolve_study_same_person,
     transfer_reference_gram,
 )
 from .spec import (
@@ -47,6 +48,7 @@ from .spec import (
     array_sha256,
     canonical_json,
     canonical_sha256,
+    validate_context_fourth_moments,
 )
 
 
@@ -245,6 +247,21 @@ def _pair_product_basis(
     return result
 
 
+def _direction_fourth_moments(
+    context: np.ndarray, pair_index: ContextPairIndex
+) -> np.ndarray:
+    """Fourth moments of the compact genetic kernels ``[G, I_pairs]``.
+
+    Their per-person kernel diagonals are ``u_k(i) h(i)`` with
+    ``u = [1, kappa_qr e_q e_r]``; ``G = sum_i u(i) u(i)'``.
+    """
+    units = np.column_stack(
+        [np.ones(context.shape[0]), _pair_product_basis(context, pair_index)]
+    )
+    moments = units.T @ units
+    return 0.5 * (moments + moments.T)
+
+
 def _genetic_base_kernels(
     genotype: np.ndarray,
     context: np.ndarray,
@@ -309,6 +326,8 @@ class DirectionReferenceContractions:
     selected_variant_hash: str
     phase_times_seconds: dict[str, float]
     peak_rss_bytes: int
+    # Reference fourth moments of ``[G, I_pairs]``; None when absent.
+    context_fourth_moments: np.ndarray | None = None
 
     @property
     def compact_dimension(self) -> int:
@@ -342,6 +361,8 @@ class DirectionTraitContractions:
     selected_variant_hash: str
     phase_times_seconds: dict[str, float]
     peak_rss_bytes: int
+    # Study fourth moments of ``[G, I_pairs]`` over its own people.
+    context_fourth_moments: np.ndarray | None = None
 
     @property
     def compact_dimension(self) -> int:
@@ -682,6 +703,7 @@ def build_direction_reference_contractions(
             "small_moment_reduction": moments_elapsed,
         },
         peak_rss_bytes=int(psutil.Process().memory_info().rss),
+        context_fourth_moments=_direction_fourth_moments(context_array, pair_index),
     )
 
 
@@ -818,6 +840,7 @@ def build_direction_trait_contractions(
             "small_moment_reduction": moments_elapsed,
         },
         peak_rss_bytes=int(psutil.Process().memory_info().rss),
+        context_fourth_moments=_direction_fourth_moments(context_array, pair_index),
     )
 
 
@@ -843,6 +866,12 @@ def validate_direction_reference(
         or traces.shape != (p_base,)
     ):
         raise ValueError("Direction-reference compact tensor shapes are invalid.")
+    if reference.context_fourth_moments is not None:
+        validate_context_fourth_moments(
+            reference.context_fourth_moments,
+            p_base,
+            name="Direction-reference context_fourth_moments",
+        )
     hashes = reference.manifest.get("array_hashes", {})
     expected = {
         "base_gram": array_sha256(gram),
@@ -928,6 +957,12 @@ def validate_direction_trait(summary: DirectionTraitContractions) -> dict[str, A
         or traces.shape != (p_base,)
     ):
         raise ValueError("Direction-trait compact tensor shapes are invalid.")
+    if summary.context_fourth_moments is not None:
+        validate_context_fourth_moments(
+            summary.context_fourth_moments,
+            1 + len(pair_index),
+            name="Direction-trait context_fourth_moments",
+        )
     if len(summary.base_component_names) != p_base:
         raise ValueError("Direction-trait component names have the wrong length.")
     hashes = summary.manifest.get("array_hashes", {})
@@ -1089,11 +1124,26 @@ def _contract_normal_equations(
     )
     reference_gram = genetic_reduction.T @ reference.base_gram @ genetic_reduction
     same_person = genetic_reduction.T @ reference.same_person @ genetic_reduction
+    # The study same-person term is formed on the compact [G, I_pairs] axis
+    # and reduced with the same direction weights as the reference term.
+    study_same, transport = resolve_study_same_person(
+        reference.same_person,
+        reference_n=reference.n_samples,
+        study_n=summary.n_samples,
+        annotation_count=1,
+        reference_fourth_moments=reference.context_fourth_moments,
+        study_fourth_moments=summary.context_fourth_moments,
+    )
     transferred = transfer_reference_gram(
         reference_gram,
         same_person,
         reference_n=reference.n_samples,
         study_n=summary.n_samples,
+        study_same_person=(
+            None
+            if study_same is None
+            else genetic_reduction.T @ study_same @ genetic_reduction
+        ),
     )
     matrix = reduction.T @ summary.base_gram @ reduction
     matrix[:2, :2] = transferred
@@ -1112,6 +1162,7 @@ def _contract_normal_equations(
         transferred_genetic_gram=np.ascontiguousarray(transferred),
         reference_n=reference.n_samples,
         study_n=summary.n_samples,
+        same_person_transport=transport,
     )
     return equations, reduction
 

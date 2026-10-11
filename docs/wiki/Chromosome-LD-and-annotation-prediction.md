@@ -3,8 +3,9 @@
 The chromosome estimator computes within-chromosome SNP-pair LD and combines
 the moments in a single genome-wide fit. It estimates one covariance matrix
 per annotation using the same participants, genotype scaling, context basis,
-and fixed-effect span for reference and trait summaries. Population transfer
-is not implemented for these summaries.
+and fixed-effect span for reference and trait summaries. A shared reference
+can be transferred to one trait's own moments with
+`transferred_chromosome_equations` (see below).
 
 ## Normalization and approximation
 
@@ -54,6 +55,31 @@ passes.
 SNP-block deletion removes selected target rows and updates retained annotation
 masses while holding source reference sketches fixed. This is an approximate
 jackknife; it excludes reference-probe variation and cross-chromosome LD.
+
+## Transferring a shared reference to a trait
+
+`transferred_chromosome_equations` keeps the trait's own score, trace and
+residual moments and transfers the reference genetic Gram to the trait's
+sample size. Its different-person part is scaled by
+`N_S(N_S-1)/(N_R(N_R-1))`. Its same-person part should be the trait's own
+([Methods](Methods.md#reference-transfer-and-fitting)).
+
+- Pass `reference_kernel_diagonal` (the genome-wide `C x N_R` diagonal, the sum
+  of the chromosome diagonals) and `study_rows` (the trait's people as
+  reference sample indices) for the exact own-row term.
+- Or pass `reference_fourth_moments` and `study_fourth_moments`
+  (`summit.context.oracle.context_fourth_moments` on each cohort's basis
+  rows) for the summary form. `MaskedTraitBatch` stores each trait's value as
+  `common.context_fourth_moments`.
+- When fitting many deletions, form the term once with
+  `exact_study_same_person` or `approximate_study_same_person` and pass it as
+  `study_same_person` with its `same_person_transport` label.
+
+Without these inputs the function keeps the legacy `(N_S/N_R) D_R`, which is
+biased when missingness depends on the contexts, and warns when the sizes
+differ. Pass `same_person_transport="scaled_legacy"` to request it on purpose.
+The returned equations record the term used. Deletions reuse the full study
+term.
 
 ## Annotation-dependent prediction
 

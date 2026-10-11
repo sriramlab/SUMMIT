@@ -30,7 +30,11 @@ from ._artifact_io import (
     validate_native_fault_selector_targets_event,
     validate_python_source_runtime_provenance,
 )
-from .oracle import transfer_reference_gram
+from .oracle import (
+    context_fourth_moments,
+    transfer_reference_gram,
+    validate_context_fourth_moments,
+)
 from .reference import GroupedContextReference, ReferenceMoments
 from .schema import (
     AnnotationMode,
@@ -96,7 +100,43 @@ _ARRAY_NAMES = (
     "group_annotation_masses",
     "group_variant_counts",
 )
-_FILE_KEYS = frozenset((*_ARRAY_NAMES, "manifest_json", "manifest_sha256"))
+# Optional person-summed context fourth moments G_R (P x P).  They let a fit
+# form the study same-person term from aggregates.  Artifacts written before
+# they existed omit both the array and its layout entry.
+_OPTIONAL_ARRAY_NAMES = ("context_fourth_moments",)
+_OPTIONAL_LAYOUTS = {"context_fourth_moments": ["context_pair", "context_pair"]}
+_FILE_KEYS = frozenset(
+    (*_ARRAY_NAMES, *_OPTIONAL_ARRAY_NAMES, "manifest_json", "manifest_sha256")
+)
+
+
+def _declared_array_names(arrays: Any) -> tuple[str, ...]:
+    """Return the manifest's array names: all required, optional ones known."""
+    if not isinstance(arrays, Mapping):
+        raise ValueError("Contextual reference V1 array schema mismatch.")
+    names = set(arrays)
+    if not set(_ARRAY_NAMES) <= names or not names <= {
+        *_ARRAY_NAMES,
+        *_OPTIONAL_ARRAY_NAMES,
+    }:
+        raise ValueError("Contextual reference V1 array schema mismatch.")
+    return (*_ARRAY_NAMES, *(name for name in _OPTIONAL_ARRAY_NAMES if name in names))
+
+
+def _layouts_for(names: Sequence[str]) -> dict[str, list[str]]:
+    return {
+        **{name: list(layout) for name, layout in _LAYOUTS.items()},
+        **{name: list(_OPTIONAL_LAYOUTS[name]) for name in names if name in _OPTIONAL_LAYOUTS},
+    }
+
+
+def _artifact_array_names(artifact: Any) -> tuple[str, ...]:
+    return (
+        *_ARRAY_NAMES,
+        *(name for name in _OPTIONAL_ARRAY_NAMES if getattr(artifact, name) is not None),
+    )
+
+
 _MANIFEST_KEYS = frozenset(
     {
         "magic",
@@ -899,7 +939,8 @@ def _validate_manifest_before_arrays(
         raise ValueError("Contextual reference V1 scientific policy mismatch.")
     if manifest.get("deletion") != _DELETION_POLICY:
         raise ValueError("Contextual reference V1 deletion policy mismatch.")
-    if manifest.get("layouts") != _LAYOUTS:
+    declared_arrays = _declared_array_names(manifest.get("arrays"))
+    if manifest.get("layouts") != _layouts_for(declared_arrays):
         raise ValueError("Contextual reference V1 logical array layouts mismatch.")
     if manifest.get("terminal_status") != "published":
         raise ValueError("Contextual reference V1 is not published.")
@@ -1019,8 +1060,6 @@ def _validate_manifest_before_arrays(
         raise ValueError("Contextual reference V1 authority group names mismatch.")
 
     arrays = manifest.get("arrays")
-    if not isinstance(arrays, Mapping) or set(arrays) != set(_ARRAY_NAMES):
-        raise ValueError("Contextual reference V1 array schema mismatch.")
     expected_shapes = {
         "gram": [dimensions["C"], dimensions["C"]],
         "same_person": [dimensions["C"], dimensions["C"]],
@@ -1032,8 +1071,10 @@ def _validate_manifest_before_arrays(
         "annotation_masses": [dimensions["K"]],
         "group_annotation_masses": [dimensions["J"], dimensions["K"]],
         "group_variant_counts": [dimensions["J"]],
+        "context_fourth_moments": [dimensions["P_g"], dimensions["P_g"]],
     }
-    for name, shape in expected_shapes.items():
+    for name in declared_arrays:
+        shape = expected_shapes[name]
         envelope = arrays[name]
         expected_dtype = "<i8" if name == "group_variant_counts" else "<f8"
         if not isinstance(envelope, Mapping) or set(envelope) != {
@@ -1155,6 +1196,8 @@ class ContextualReferenceArtifactV1:
     annotation_masses: np.ndarray
     group_annotation_masses: np.ndarray
     group_variant_counts: np.ndarray
+    # Reference context fourth moments G_R (P x P); None when not published.
+    context_fourth_moments: np.ndarray | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.component_index, ContextComponentIndex):
@@ -1167,6 +1210,16 @@ class ContextualReferenceArtifactV1:
             dtype = np.int64 if name == "group_variant_counts" else np.float64
             array = _immutable_array(getattr(self, name), dtype=dtype)
             object.__setattr__(self, name, array)
+        if self.context_fourth_moments is not None:
+            object.__setattr__(
+                self,
+                "context_fourth_moments",
+                validate_context_fourth_moments(
+                    _immutable_array(self.context_fourth_moments, dtype=np.float64),
+                    len(self.component_index.pair_index),
+                    name="Contextual reference V1 context_fourth_moments",
+                ),
+            )
         manifest = _json_value(self.manifest)
         _validate_artifact(self, manifest)
         object.__setattr__(self, "manifest", freeze_context_mapping(manifest))
@@ -1321,6 +1374,7 @@ class ContextualReferenceArtifactV1:
             group_variant_counts=self.group_variant_counts,
             phase_times_seconds={},
             peak_rss_bytes=0,
+            context_fourth_moments=self.context_fourth_moments,
         )
 
 
@@ -1406,7 +1460,8 @@ def _validate_artifact(
         raise ValueError("Contextual reference V1 scientific policy mismatch.")
     if manifest["deletion"] != _DELETION_POLICY:
         raise ValueError("Contextual reference V1 deletion policy mismatch.")
-    if manifest["layouts"] != _LAYOUTS:
+    present_arrays = _artifact_array_names(artifact)
+    if manifest["layouts"] != _layouts_for(present_arrays):
         raise ValueError("Contextual reference V1 logical array layouts mismatch.")
     if manifest["terminal_status"] != "published":
         raise ValueError("Contextual reference V1 is not published.")
@@ -1462,8 +1517,10 @@ def _validate_artifact(
         "annotation_masses": (k,),
         "group_annotation_masses": (j, k),
         "group_variant_counts": (j,),
+        "context_fourth_moments": (p, p),
     }
-    for name, shape in expected_shapes.items():
+    for name in present_arrays:
+        shape = expected_shapes[name]
         value = np.asarray(getattr(artifact, name))
         if value.shape != shape:
             raise ValueError(
@@ -1597,9 +1654,9 @@ def _validate_artifact(
             raise ValueError(f"Contextual reference V1 authority {name} mismatch.")
 
     arrays = manifest["arrays"]
-    if not isinstance(arrays, Mapping) or set(arrays) != set(_ARRAY_NAMES):
+    if not isinstance(arrays, Mapping) or set(arrays) != set(present_arrays):
         raise ValueError("Contextual reference V1 array manifest mismatch.")
-    for name in _ARRAY_NAMES:
+    for name in present_arrays:
         if arrays[name] != _array_envelope(np.asarray(getattr(artifact, name))):
             raise ValueError(
                 f"Contextual reference V1 array digest mismatch for {name}."
@@ -2888,8 +2945,16 @@ def _validate_native_execution_evidence(
 def adapt_native_contextual_reference_v1(
     native_result: Mapping[str, Any],
     publication_identity: ContextualReferencePublicationIdentityV1,
+    *,
+    basis: Any | None = None,
 ) -> ContextualReferenceArtifactV1:
-    """Validate and publish one complete native compact result in memory."""
+    """Validate and publish one complete native compact result in memory.
+
+    ``basis`` is the evaluated ``N x Q`` context basis the native run used.
+    When supplied it must match the publication identity's
+    ``evaluated_phi_sha256``; its context fourth moments are then published
+    as ``context_fourth_moments`` for the study same-person transport.
+    """
     if not isinstance(native_result, Mapping):
         raise ValueError("Native contextual reference result must be a mapping.")
     if set(native_result) != _NATIVE_RESULT_KEYS:
@@ -3188,6 +3253,20 @@ def adapt_native_contextual_reference_v1(
         name: owned_readonly_array(value, dtype=value.dtype)
         for name, value in native_arrays.items()
     }
+    if basis is not None:
+        values = np.asarray(basis, dtype=np.float64)
+        if array_sha256(values) != publication_identity.evaluated_phi_sha256:
+            raise ValueError(
+                "Supplied reference basis does not match evaluated_phi_sha256."
+            )
+        if values.shape != (
+            _required_native(native_result, "reference_n"),
+            components.pair_index.num_basis,
+        ):
+            raise ValueError("Supplied reference basis has the wrong shape.")
+        arrays["context_fourth_moments"] = owned_readonly_array(
+            context_fourth_moments(values)
+        )
     if _sha256(
         "same_person_sha256", _required_native(native_result, "same_person_sha256")
     ) != array_sha256(arrays["same_person"]):
@@ -3374,7 +3453,7 @@ def adapt_native_contextual_reference_v1(
             "telemetry": telemetry,
         },
         "deletion": dict(_DELETION_POLICY),
-        "layouts": {name: list(layout) for name, layout in _LAYOUTS.items()},
+        "layouts": _layouts_for(tuple(arrays)),
         "maps": maps,
         "arrays": {name: _array_envelope(value) for name, value in arrays.items()},
         "terminal_status": "published",
@@ -3391,12 +3470,16 @@ def adapt_native_contextual_reference_v1(
 def run_contextual_reference_v1(
     executor: Any,
     publication_identity: ContextualReferencePublicationIdentityV1,
+    *,
+    basis: Any | None = None,
 ) -> ContextualReferenceArtifactV1:
     """Make exactly one native ``run`` call and publish its compact result."""
     run = getattr(executor, "run", None)
     if run is None or not callable(run):
         raise ValueError("executor must expose a callable run() method.")
-    return adapt_native_contextual_reference_v1(run(), publication_identity)
+    return adapt_native_contextual_reference_v1(
+        run(), publication_identity, basis=basis
+    )
 
 
 def write_contextual_reference_v1(
@@ -3409,7 +3492,7 @@ def write_contextual_reference_v1(
     manifest_json, manifest_sha256, arrays = _preflight_stable_npz_members(
         manifest_json=canonical_json(artifact.manifest),
         manifest_sha256=artifact.manifest_sha256,
-        arrays={name: getattr(artifact, name) for name in _ARRAY_NAMES},
+        arrays={name: getattr(artifact, name) for name in _artifact_array_names(artifact)},
         family="Contextual reference V1",
     )
     path = Path(output)
@@ -3469,8 +3552,10 @@ def load_contextual_reference_v1(path: str | Path) -> ContextualReferenceArtifac
             components, scale_plan, group_ids = _validate_manifest_before_arrays(
                 manifest
             )
+            declared_arrays = _declared_array_names(manifest.get("arrays"))
             dimensions = manifest.get("dimensions")
             expected_shapes = {
+                "context_fourth_moments": (dimensions.get("P_g"), dimensions.get("P_g")),
                 "gram": (dimensions.get("C"), dimensions.get("C")),
                 "same_person": (dimensions.get("C"), dimensions.get("C")),
                 "group_gram_unnormalized_num": (
@@ -3483,13 +3568,13 @@ def load_contextual_reference_v1(path: str | Path) -> ContextualReferenceArtifac
                 "group_variant_counts": (dimensions.get("J"),),
             }
             array_specs = {}
-            for name in _ARRAY_NAMES:
+            for name in declared_arrays:
                 expected_dtype = np.dtype(
                     np.int64 if name == "group_variant_counts" else np.float64
                 ).newbyteorder("<")
                 array_specs[name] = (expected_dtype, expected_shapes[name])
             archive.preflight_arrays(array_specs)
-            arrays = {name: archive.load_array(name) for name in _ARRAY_NAMES}
+            arrays = {name: archive.load_array(name) for name in declared_arrays}
     except (OSError, ValueError) as exc:
         if isinstance(exc, ValueError) and str(exc).startswith(
             "Contextual reference V1"

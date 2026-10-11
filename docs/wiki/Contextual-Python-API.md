@@ -36,6 +36,15 @@ annotations, residual components, and deletion groups. Use the same definitions
 for reference and study. The native loaders and writers use their own versioned
 formats, separate from the dense Python summaries.
 
+When the reference and study have different people, the fit forms the study's
+same-person term from both cohorts' context fourth moments
+([Methods](Methods.md#reference-transfer-and-fitting)). The dense builders,
+phenotype-transform scans and direction contractions record them. The native
+adapters record them when given the evaluated basis (`basis=`), which must
+match the publication identity's `evaluated_phi_sha256`. Without them the fit
+keeps the legacy `(N_S/N_R) D_R` scaling and warns when the sizes differ.
+Fits record the choice as `same_person_transport`.
+
 The fit returns raw covariance coefficients, joint jackknife covariance, and
 rank/conditioning diagnostics. A rank-deficient model is reported explicitly.
 Optional PSD projections are separate outputs.

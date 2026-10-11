@@ -22,11 +22,13 @@ import psutil
 from scipy.optimize import minimize
 
 from .oracle import (
+    SAME_PERSON_TRANSPORTS,
     SymmetricRankDiagnostics,
     _finite_float64,
     coefficients_to_omegas,
     context_covariance_surface,
     omegas_to_coefficients,
+    resolve_study_same_person,
     transfer_reference_gram,
 )
 from .reference import (
@@ -73,8 +75,18 @@ class ContextNormalEquations:
     reference_n: int
     study_n: int
     target_source: bool = False
+    # How the study same-person term of a transported Gram was formed (one of
+    # SAME_PERSON_TRANSPORTS); None for systems that use exact study moments.
+    same_person_transport: str | None = None
 
     def __post_init__(self) -> None:
+        if (
+            self.same_person_transport is not None
+            and self.same_person_transport not in SAME_PERSON_TRANSPORTS
+        ):
+            raise ValueError(
+                f"same_person_transport must be None or one of {SAME_PERSON_TRANSPORTS}."
+            )
         object.__setattr__(self, "component_names", tuple(self.component_names))
         object.__setattr__(self, "deleted_groups", tuple(self.deleted_groups))
         for name in (
@@ -308,11 +320,22 @@ def assemble_context_normal_equations(
         > 1.0e-12
     ):
         raise ValueError("Reference and trait retained annotation masses differ.")
+    # The study same-person term uses only full (undeleted) moments, so every
+    # approximate-LOO system reuses it, as it reused the full reference D_R.
+    study_same_person, transport = resolve_study_same_person(
+        reference.same_person,
+        reference_n=reference.n_samples,
+        study_n=summary.n_samples,
+        annotation_count=len(summary.component_index.annotation_names),
+        reference_fourth_moments=getattr(reference, "context_fourth_moments", None),
+        study_fourth_moments=getattr(summary, "context_fourth_moments", None),
+    )
     transferred = transfer_reference_gram(
         reference_moments.gram,
         reference_moments.same_person,
         reference_n=reference.n_samples,
         study_n=summary.n_samples,
+        study_same_person=study_same_person,
     )
     p_genetic = len(summary.component_index)
     h_count = len(summary.residual_names)
@@ -339,6 +362,7 @@ def assemble_context_normal_equations(
         transferred_genetic_gram=transferred,
         reference_n=reference.n_samples,
         study_n=summary.n_samples,
+        same_person_transport=transport,
     )
 
 
@@ -1114,6 +1138,7 @@ def fit_context_model(
         "assembly": {
             "ordering": "genetic_annotation_major_pair_minor_then_residual",
             "genetic_transfer": "N_and_N_times_N_minus_1",
+            "same_person_transport": equations.same_person_transport,
             "residual_elimination": False,
         },
         "solve": {
@@ -1515,6 +1540,10 @@ def load_context_fit(
         transferred_genetic_gram=values["transferred_genetic_gram"],
         reference_n=int(dimensions["reference_n"]),
         study_n=int(dimensions["n_samples"]),
+        # Fits written before the choice was recorded used the legacy scaling.
+        same_person_transport=payload.get("assembly", {}).get(
+            "same_person_transport", "scaled_legacy"
+        ),
     )
     projection_payload = payload.get("projection_result")
     projection: PSDProjectionResult | None = None

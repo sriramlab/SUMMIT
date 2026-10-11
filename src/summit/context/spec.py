@@ -681,3 +681,71 @@ def validate_context_manifest(
                 )
     canonical_json(result)
     return result
+
+
+# Context fourth moments for the study same-person transport.  They live here
+# (not in oracle.py) so the V1 artifact adapters, whose provenance lists spec.py,
+# can compute them; summit.context.oracle re-exports them.
+
+
+def validate_sample_rows(name: str, rows: object, n_samples: int) -> np.ndarray:
+    """Return unique in-range integer sample indices as int64."""
+    values = np.asarray(rows)
+    if (
+        values.ndim != 1
+        or values.dtype.kind not in "iu"
+        or values.size < 1
+        or np.any(values < 0)
+        or np.any(values >= n_samples)
+    ):
+        raise ValueError(
+            f"{name} must be a nonempty integer vector of sample indices "
+            f"in [0, {n_samples})."
+        )
+    if np.unique(values).size != values.size:
+        raise ValueError(f"{name} must not repeat a sample.")
+    return values.astype(np.int64, copy=False)
+
+
+def context_fourth_moments(basis: object, rows: object | None = None) -> np.ndarray:
+    """Return the ``P x P`` context fourth moments ``G = sum_i u(i) u(i)'``.
+
+    ``u_p(i) = kappa_p phi_q(i) phi_r(i)`` for the pairs ``p = (q, r)`` in
+    :class:`ContextPairIndex` order, with ``kappa_p = 1`` on the diagonal and
+    ``2`` off it.  This is the saved symmetric kernel convention: a kernel
+    diagonal entry of component ``(a, p)`` is ``kappa_p phi_q phi_r`` times the
+    person's (projected) squared-genotype mass.  The sum runs over ``rows`` of
+    ``basis`` (all rows when ``rows`` is ``None``).  ``G`` is a person-summed
+    aggregate, safe to publish like the same-person matrix itself.
+    """
+    phi = np.asarray(basis, dtype=np.float64)
+    if phi.ndim != 2 or not np.all(np.isfinite(phi)):
+        raise ValueError("basis must be a finite 2-dimensional array.")
+    if phi.shape[0] < 1 or phi.shape[1] < 1:
+        raise ValueError("basis must have at least one row and one column.")
+    if rows is not None:
+        phi = phi[validate_sample_rows("rows", rows, phi.shape[0])]
+    pairs = ContextPairIndex(phi.shape[1]).entries
+    products = np.empty((phi.shape[0], len(pairs)), dtype=np.float64)
+    for pair in pairs:
+        products[:, pair.index] = (
+            float(pair.kernel_factor) * phi[:, pair.q] * phi[:, pair.r]
+        )
+    moments = products.T @ products
+    return 0.5 * (moments + moments.T)
+
+
+def validate_context_fourth_moments(
+    value: object, pair_count: int, *, name: str = "context_fourth_moments"
+) -> np.ndarray:
+    """Return an owned read-only copy of a valid ``P x P`` fourth-moment matrix."""
+    result = np.array(value, dtype=np.float64, order="C", copy=True)
+    if result.shape != (pair_count, pair_count) or not np.all(np.isfinite(result)):
+        raise ValueError(f"{name} must be a finite {pair_count} by {pair_count} matrix.")
+    scale = max(float(np.max(np.abs(result), initial=0.0)), 1.0)
+    if float(np.max(np.abs(result - result.T), initial=0.0)) > 1.0e-12 * scale:
+        raise ValueError(f"{name} must be symmetric.")
+    if not result[0, 0] > 0.0:
+        raise ValueError(f"{name} has no intercept-pair mass.")
+    result.setflags(write=False)
+    return result

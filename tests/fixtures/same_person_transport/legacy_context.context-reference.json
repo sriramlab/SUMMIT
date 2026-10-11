@@ -1,0 +1,125 @@
+{
+  "annotation_hash": "8184283304b13f3cab4dbb318d3e3719f1e2b9f39817a1ed26bdf1beca2e19d4",
+  "annotation_names": [
+    "all"
+  ],
+  "approximate_loo": {
+    "contribution_storage": "snp",
+    "exact_deleted_kernels": false,
+    "group_annotation_masses_hash": "1516401c9b112af5f9ec6b2b73c1af38501df99c36ceef0c4c5e3554108b321c",
+    "group_labels": [
+      "group:0",
+      "group:1",
+      "group:2"
+    ],
+    "group_variant_counts": [
+      6,
+      6,
+      6
+    ],
+    "groups": 3,
+    "method": "symmetric_snp_gram_numerator_v1",
+    "same_person_deletion": "reuse_full_reference_D"
+  },
+  "artifact": {
+    "format": "npz_development_v1",
+    "path": "legacy_context.context-reference.npz",
+    "sha256": "6b46fc893d823c41198110f1f57279544c57b8abf5233b74fd3ef7a89fa0d68d"
+  },
+  "backend": {
+    "abft": "not_applicable_python_prototype",
+    "dtype": "float64",
+    "name": "python_numpy_reference",
+    "native_protected_gemm": false
+  },
+  "basis_array_hash": "29539d3ac74caca5bcd1b4f3c036136656803ac6904fff58cc4e8efdcf478ccb",
+  "basis_hash": "f846236d80c364383ed784e320a62b2d712687e11ef22940e9fc5a8b5dabcf5e",
+  "component_index_hash": "fa27d8880f732391505b3488554d9a78143820cbacb2d3a996c5e7e867fc807a",
+  "component_order": [
+    "context:all:0,0",
+    "context:all:1,1",
+    "context:all:2,2",
+    "context:all:0,1",
+    "context:all:0,2",
+    "context:all:1,2"
+  ],
+  "context_moments": {
+    "mean": [
+      1.0,
+      0.0,
+      0.15104298712870196
+    ],
+    "second_moment": [
+      [
+        1.0,
+        0.0,
+        0.15104298712870196
+      ],
+      [
+        0.0,
+        0.25,
+        -0.04254568304968647
+      ],
+      [
+        0.15104298712870196,
+        -0.04254568304968647,
+        0.5614124177589959
+      ]
+    ]
+  },
+  "dimensions": {
+    "k": 1,
+    "loo_groups": 3,
+    "n_samples": 24,
+    "n_variants": 18,
+    "p_genetic": 6,
+    "q": 3,
+    "residual_rank": 21
+  },
+  "feature_mode": "raw_projected",
+  "fixed_effect_hash": "7353fab09e038ec5b97b2b03a7b5b725586935f7b71ac5ee3061421110849ebb",
+  "genotype_scaling": "pre_scaled_input",
+  "kind": "summit.context.reference",
+  "loo_grouping_hash": "6d1c6d9bbb4caf64a74b1f43ca251b6dc86bf4692bee60142f41b5dfa6c5c11c",
+  "numerical_diagnostics": {
+    "gram_min_eigenvalue": 1.9237104897352315,
+    "gram_pre_symmetry_max_abs": 0.0,
+    "same_person_min_eigenvalue": 0.015438524855586992,
+    "same_person_pre_symmetry_max_abs": 0.0,
+    "snp_contribution_reconstruction_relative_max": 1.9065027276291933e-15
+  },
+  "performance": {
+    "peak_rss_bytes": 100175872,
+    "phase_times_seconds": {
+      "feature_construction": 8.548999903723598e-05,
+      "gram_and_snp_contributions": 0.00253965996671468,
+      "same_person": 4.998000804334879e-05,
+      "total": 0.0031351399957202375
+    }
+  },
+  "probes": {
+    "gram": {
+      "count": 0,
+      "digest": null,
+      "method": "exact",
+      "seed": null,
+      "shared_across_components": true,
+      "tile_size": 32
+    },
+    "same_person": {
+      "count": 0,
+      "digest": null,
+      "method": "exact",
+      "seed": null,
+      "tile_size": 32
+    }
+  },
+  "rank_diagnostics": {
+    "fixed_effect_rank": 3,
+    "maximum_leverage": 0.3164023529725545,
+    "residual_rank": 21,
+    "svd_tolerance": 3.0181910135767557e-14
+  },
+  "schema_version": 1,
+  "variant_hash": "14d9ef43fa6558775b15a9ae3009669bccffabea78600dcdb203688f1bb8863d"
+}

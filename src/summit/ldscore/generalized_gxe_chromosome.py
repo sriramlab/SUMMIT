@@ -269,19 +269,37 @@ def transferred_chromosome_equations(
     reference_chromosomes, study_chromosomes, *, reference_residual_gram,
     reference_residual_traces, reference_same_person, residual_gram,
     residual_rhs, residual_traces, residual_names, deleted_blocks=(),
-    expected_chromosomes=None,
+    expected_chromosomes=None, study_same_person=None,
+    same_person_transport=None, reference_kernel_diagonal=None,
+    study_rows=None, reference_fourth_moments=None,
+    study_fourth_moments=None,
 ):
     """Transfer one shared chromosome reference to one trait's exact moments.
 
-    This uses the existing same-person/distinct-person population transfer.
-    Shared environment/covariate definitions and compatible populations remain
-    caller requirements: sample-size scaling cannot correct selective missingness.
-    Genotype affine scaling must be identical for the reference and study.
-    Approximate target-row jackknife reuses full-reference same-person moments,
-    matching the existing generalized-GxE variant-reference convention.
+    The distinct-person part of the reference Gram is scaled by
+    n_S(n_S-1)/(n_R(n_R-1)); the same-person part is the study's own term:
+
+    - ``study_same_person`` (C x C), when the caller formed it, with
+      ``same_person_transport`` naming how ("own_rows_exact" or
+      "fourth_moment_difference");
+    - else the exact own-row term from ``reference_kernel_diagonal`` (the
+      genome-wide C x N_R diagonal, i.e. the sum of every chromosome's
+      sample-aligned component diagonal) on ``study_rows`` (the trait's people
+      as reference sample indices);
+    - else the fourth-moment difference form from ``reference_fourth_moments``
+      and ``study_fourth_moments`` (summit.context.oracle.context_fourth_moments);
+    - else the legacy ``(n_S/n_R) D_R``, with a SamePersonTransportWarning when
+      the sizes differ unless ``same_person_transport="scaled_legacy"``.
+
+    The choice is recorded as ``same_person_transport`` on the returned
+    equations. For approximate target-row deletions the full study term is
+    reused, as the full reference D_R is; callers looping over deletions
+    should form it once and pass ``study_same_person``. Shared
+    environment/covariate definitions, compatible populations and identical
+    genotype affine scaling remain caller requirements.
     """
     from dataclasses import replace
-    from summit.context.oracle import transfer_reference_gram
+    from summit.context.oracle import resolve_study_same_person, transfer_reference_gram
 
     ref, study = tuple(reference_chromosomes), tuple(study_chromosomes)
     if not ref or not study:
@@ -302,11 +320,29 @@ def transferred_chromosome_equations(
         residual_rhs=np.zeros((len(residual_names), len(ref[0].trait_names))), **options)
     target = joint_chromosome_equations(study, residual_gram=residual_gram,
         residual_traces=residual_traces, residual_rhs=residual_rhs, **options)
-    transferred = transfer_reference_gram(reference.reference_genetic_gram,
-        reference_same_person, reference_n=reference.reference_n, study_n=target.study_n)
-    matrix = target.matrix.copy()
     c = target.genetic_count
+    if study_same_person is not None:
+        if same_person_transport not in ('own_rows_exact', 'fourth_moment_difference'):
+            raise ValueError('an explicit study_same_person needs its own_rows_exact '
+                             'or fourth_moment_difference label')
+        transport = same_person_transport
+        study_same = np.asarray(study_same_person, dtype=float)
+        if study_same.shape != (c, c) or not np.isfinite(study_same).all():
+            raise ValueError('study_same_person must be a finite C by C matrix')
+    else:
+        study_same, transport = resolve_study_same_person(
+            reference_same_person, reference_n=reference.reference_n,
+            study_n=target.study_n, annotation_count=len(ref[0].annotation_names),
+            component_kernel_diagonal=reference_kernel_diagonal, study_rows=study_rows,
+            reference_fourth_moments=reference_fourth_moments,
+            study_fourth_moments=study_fourth_moments,
+            requested=same_person_transport, stacklevel=2)
+    transferred = transfer_reference_gram(reference.reference_genetic_gram,
+        reference_same_person, reference_n=reference.reference_n, study_n=target.study_n,
+        study_same_person=study_same)
+    matrix = target.matrix.copy()
     matrix[:c, :c] = transferred
     return replace(target, matrix=matrix,
         reference_genetic_gram=reference.reference_genetic_gram,
-        transferred_genetic_gram=transferred, reference_n=reference.reference_n)
+        transferred_genetic_gram=transferred, reference_n=reference.reference_n,
+        same_person_transport=transport)

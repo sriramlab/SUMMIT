@@ -12,7 +12,13 @@ from typing import Sequence
 
 import numpy as np
 
-from .spec import ContextComponentIndex, owned_readonly_array
+from .spec import (
+    ContextComponentIndex,
+    context_fourth_moments,
+    owned_readonly_array,
+    validate_context_fourth_moments,
+)
+from .spec import validate_sample_rows as _sample_rows
 
 
 @dataclass(frozen=True)
@@ -390,13 +396,208 @@ def exact_same_person_matrix(genetic_kernels: object) -> np.ndarray:
     return diagonals @ diagonals.T
 
 
+SAME_PERSON_TRANSPORTS = (
+    "own_rows_exact",
+    "fourth_moment_difference",
+    "scaled_legacy",
+)
+"""Recorded choices of the study same-person term in a transported Gram.
+
+``own_rows_exact``: ``D_S = d[:, rows] d[:, rows]'`` from the reference's
+per-person kernel diagonals on the study's own rows.
+``fourth_moment_difference``: the release-safe summary form
+``f D_R + kron(c, G_S - f G_R)``.
+``scaled_legacy``: the historical ``(n_S / n_R) D_R``, which assumes the study
+is an exchangeable subset of the reference.
+"""
+
+
+class SamePersonTransportWarning(UserWarning):
+    """The legacy scaled same-person term was used for a different-size study."""
+
+
+def exact_study_same_person(
+    component_kernel_diagonal: object, rows: object
+) -> np.ndarray:
+    """Return the study same-person matrix on its own reference rows.
+
+    ``component_kernel_diagonal`` is the reference's sample-aligned ``C x N_R``
+    kernel diagonal (composable references publish it); ``rows`` are the
+    study's people as reference sample indices.  The result is
+    ``D_S = d[:, rows] d[:, rows]'``.
+    """
+    diagonal = _finite_float64(
+        "component_kernel_diagonal", component_kernel_diagonal, ndim=2
+    )
+    selected = _sample_rows("rows", rows, diagonal.shape[1])
+    values = np.ascontiguousarray(diagonal[:, selected])
+    result = values @ values.T
+    return 0.5 * (result + result.T)
+
+
+def approximate_study_same_person(
+    reference_same_person: object,
+    reference_fourth_moments: object,
+    study_fourth_moments: object,
+    *,
+    reference_n: int,
+    study_n: int,
+    annotation_count: int,
+) -> np.ndarray:
+    """Release-safe study same-person matrix from aggregate moments only.
+
+    ``D_S ~ f D_R + kron(c, G_S - f G_R)`` with ``f = n_S / n_R``.  ``G`` are
+    :func:`context_fourth_moments` over each cohort's people, and ``c`` is the
+    ``A x A`` matrix of intercept-pair entries of ``D_R`` divided by
+    ``G_R[0, 0]``: ``c[a, b] = D_R[(a, 0), (b, 0)] / G_R[0, 0]``.  With the
+    constant-one first basis column ``G_R[0, 0] = n_R`` exactly, so ``c`` is
+    the reference mean of the per-person squared-genotype products.  The
+    components are annotation-major, so the correction is ``kron(c, .)``.
+
+    The form is exact when the study is the reference (``f = 1`` and
+    ``G_S = G_R`` give ``D_R`` bit for bit), unbiased for an exchangeable
+    subset, and corrects the composition difference otherwise.  It treats the
+    per-person squared-genotype mass as unrelated to the contexts.  It is
+    meant for bases that begin with the constant-one column (the SUMMIT-GxE
+    convention); for another first column ``c`` is a ``phi_0^2``-weighted mean.
+    """
+    same = _finite_float64("reference_same_person", reference_same_person, ndim=2)
+    reference_g = _finite_float64(
+        "reference_fourth_moments", reference_fourth_moments, ndim=2
+    )
+    study_g = _finite_float64("study_fourth_moments", study_fourth_moments, ndim=2)
+    if (
+        isinstance(annotation_count, bool)
+        or not isinstance(annotation_count, (int, np.integer))
+        or annotation_count < 1
+    ):
+        raise ValueError("annotation_count must be a positive integer.")
+    pair_count = reference_g.shape[0]
+    if (
+        reference_g.shape != (pair_count, pair_count)
+        or study_g.shape != reference_g.shape
+    ):
+        raise ValueError("Context fourth-moment matrices must be equally square.")
+    if same.shape != (int(annotation_count) * pair_count,) * 2:
+        raise ValueError(
+            "Same-person and fourth-moment dimensions disagree with the "
+            "annotation count."
+        )
+    if (
+        isinstance(reference_n, bool)
+        or not isinstance(reference_n, (int, np.integer))
+        or reference_n < 2
+    ):
+        raise ValueError("reference_n must be an integer >= 2.")
+    if isinstance(study_n, bool) or not isinstance(study_n, (int, np.integer)) or study_n < 1:
+        raise ValueError("study_n must be a positive integer.")
+    intercept_mass = float(reference_g[0, 0])
+    if not intercept_mass > 0.0:
+        raise ValueError("Reference fourth moments have no intercept-pair mass.")
+    fraction = float(study_n) / float(reference_n)
+    scale = same[::pair_count, ::pair_count] / intercept_mass
+    difference = study_g - fraction * reference_g
+    # No symmetrization here: at S = R the difference is exactly zero and the
+    # result is D_R bit for bit.  The transported Gram is symmetrized once.
+    return fraction * same + np.kron(scale, difference)
+
+
+def resolve_study_same_person(
+    reference_same_person: object,
+    *,
+    reference_n: int,
+    study_n: int,
+    annotation_count: int,
+    component_kernel_diagonal: object | None = None,
+    study_rows: object | None = None,
+    reference_fourth_moments: object | None = None,
+    study_fourth_moments: object | None = None,
+    requested: str | None = None,
+    stacklevel: int = 2,
+) -> tuple[np.ndarray | None, str]:
+    """Choose the study same-person term for a transported Gram.
+
+    Returns ``(D_S, transport)``.  The exact own-row term is used when the
+    reference kernel diagonals and the study's reference rows are both given,
+    else the fourth-moment difference when both fourth-moment matrices are
+    given, else ``(None, "scaled_legacy")`` (the caller then keeps the
+    historical ``(n_S / n_R) D_R``).  ``requested`` forces one choice and
+    fails when its inputs are missing; an explicit ``"scaled_legacy"`` request
+    suppresses the :class:`SamePersonTransportWarning` that an automatic
+    fallback emits when ``n_S != n_R``.
+    """
+    if requested is not None and requested not in SAME_PERSON_TRANSPORTS:
+        raise ValueError(
+            f"same_person_transport must be one of {SAME_PERSON_TRANSPORTS}."
+        )
+    exact_ready = component_kernel_diagonal is not None and study_rows is not None
+    summary_ready = (
+        reference_fourth_moments is not None and study_fourth_moments is not None
+    )
+    if requested == "own_rows_exact" and not exact_ready:
+        raise ValueError(
+            "own_rows_exact requires reference kernel diagonals and study rows."
+        )
+    if requested == "fourth_moment_difference" and not summary_ready:
+        raise ValueError(
+            "fourth_moment_difference requires reference and study fourth moments."
+        )
+    if requested in (None, "own_rows_exact") and exact_ready:
+        rows = np.asarray(study_rows)
+        if rows.ndim != 1 or rows.size != int(study_n):
+            raise ValueError("study_rows must list exactly the study's people.")
+        diagonal = np.asarray(component_kernel_diagonal)
+        if diagonal.ndim != 2 or diagonal.shape[1] != int(reference_n):
+            raise ValueError(
+                "Reference kernel diagonals must have one column per reference person."
+            )
+        result = exact_study_same_person(diagonal, rows)
+        same = np.asarray(reference_same_person)
+        if result.shape != same.shape:
+            raise ValueError("Kernel diagonals and same-person matrix disagree.")
+        return result, "own_rows_exact"
+    if requested in (None, "fourth_moment_difference") and summary_ready:
+        return (
+            approximate_study_same_person(
+                reference_same_person,
+                reference_fourth_moments,
+                study_fourth_moments,
+                reference_n=reference_n,
+                study_n=study_n,
+                annotation_count=annotation_count,
+            ),
+            "fourth_moment_difference",
+        )
+    if requested is None and int(study_n) != int(reference_n):
+        import warnings
+
+        warnings.warn(
+            "Transported SUMMIT-GxE Gram uses the legacy scaled same-person term "
+            "(n_S/n_R) D_R; it is biased when the study's people are not an "
+            "exchangeable subset of the reference. Supply reference kernel "
+            "diagonals with study rows, or reference and study context fourth "
+            "moments.",
+            SamePersonTransportWarning,
+            stacklevel=stacklevel + 1,
+        )
+    return None, "scaled_legacy"
+
+
 def transfer_reference_gram(
     reference_gram: object,
     same_person: object,
     *,
     reference_n: int,
     study_n: int,
+    study_same_person: object | None = None,
 ) -> np.ndarray:
+    """Transport a reference genetic Gram to a study of ``study_n`` people.
+
+    ``T_S = D_S + n_S(n_S-1)/(n_R(n_R-1)) (T_R - D_R)``.  ``D_S`` is
+    ``study_same_person`` when supplied (see :func:`resolve_study_same_person`),
+    else the legacy ``(n_S / n_R) D_R``.  The different-person scaling is the
+    same in both cases.
+    """
     gram = _finite_float64("reference_gram", reference_gram, ndim=2)
     diagonal = _finite_float64("same_person", same_person, ndim=2)
     if gram.shape[0] != gram.shape[1] or diagonal.shape != gram.shape:
@@ -411,11 +612,20 @@ def transfer_reference_gram(
         raise ValueError("reference_n must be an integer >= 2.")
     if isinstance(study_n, bool) or not isinstance(study_n, int) or study_n < 1:
         raise ValueError("study_n must be a positive integer.")
-    if reference_n == study_n:
+    if study_same_person is None:
+        if reference_n == study_n:
+            return gram.copy()
+        same_scale = study_n / reference_n
+        different_scale = study_n * (study_n - 1) / (reference_n * (reference_n - 1))
+        result = same_scale * diagonal + different_scale * (gram - diagonal)
+        return 0.5 * (result + result.T)
+    study = _finite_float64("study_same_person", study_same_person, ndim=2)
+    if study.shape != gram.shape:
+        raise ValueError("study_same_person must match the reference Gram shape.")
+    if reference_n == study_n and np.array_equal(study, diagonal):
         return gram.copy()
-    same_scale = study_n / reference_n
     different_scale = study_n * (study_n - 1) / (reference_n * (reference_n - 1))
-    result = same_scale * diagonal + different_scale * (gram - diagonal)
+    result = study + different_scale * (gram - diagonal)
     return 0.5 * (result + result.T)
 
 

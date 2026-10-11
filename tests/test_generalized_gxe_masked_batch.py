@@ -39,6 +39,8 @@ def test_masked_batch_matches_separate_projected_traits():
             common = next(t['common'] for t in batch.traits if t['name'] == name)
             for key in ('residual_rhs', 'residual_traces', 'residual_gram', 'normalized_phenotypes'):
                 np.testing.assert_allclose(getattr(common, key), getattr(oracle, key), rtol=2e-11, atol=2e-11)
+            # Each trait's own context fourth moments, for same-person transport.
+            np.testing.assert_array_equal(common.context_fourth_moments, oracle.context_fourth_moments)
     assert batch.report['equivalent_cohort_products'] < 2
 
 

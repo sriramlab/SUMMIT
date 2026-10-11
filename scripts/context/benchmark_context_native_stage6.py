@@ -1993,7 +1993,9 @@ def _execute_worker(request_path: Path, result_path: Path) -> None:
     reference_preflight = _jsonable(dict(reference_executor.preflight()))
     reference_started_ns = time.perf_counter_ns()
     reference_cpu_started_ns = time.process_time_ns()
-    reference = run_contextual_reference_v1(reference_executor, publication)
+    reference = run_contextual_reference_v1(
+        reference_executor, publication, basis=arrays["context_basis"]
+    )
     reference_performance = _jsonable(dict(reference_executor.performance_report()))
     reference_wall_seconds = (time.perf_counter_ns() - reference_started_ns) / 1.0e9
     reference_cpu_seconds = (time.process_time_ns() - reference_cpu_started_ns) / 1.0e9
@@ -2081,7 +2083,9 @@ def _execute_worker(request_path: Path, result_path: Path) -> None:
     trait_preflight = _jsonable(dict(trait_executor.preflight()))
     trait_started_ns = time.perf_counter_ns()
     trait_cpu_started_ns = time.process_time_ns()
-    trait = run_contextual_trait_v1(trait_executor, trait_publication)
+    trait = run_contextual_trait_v1(
+        trait_executor, trait_publication, basis=arrays["context_basis"]
+    )
     trait_performance = _jsonable(dict(trait_executor.performance_report()))
     trait_wall_seconds = (time.perf_counter_ns() - trait_started_ns) / 1.0e9
     trait_cpu_seconds = (time.process_time_ns() - trait_cpu_started_ns) / 1.0e9
