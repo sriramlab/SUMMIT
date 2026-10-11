@@ -364,3 +364,92 @@ def test_intercept_ld_scalars_validate_axes() -> None:
     out = intercept_ld_scalars(np.ones((2, 6, 6)), np.ones((2, 1)), np.eye(1),
                                reference_n=10, pair_count=6)
     np.testing.assert_allclose(out, np.full((2, 1, 1), 0.5 / 90))
+
+
+def test_selective_study_gram_and_fit_approach_its_own_with_the_correction() -> None:
+    import test_same_person_transport_artifacts as artifacts
+    from generalized_gxe_variant_ldscore_oracle import orthonormalize
+    from summit.context.oracle import dense_genetic_kernels, kernel_gram, rank_revealing_projector
+    from summit.context.spec import ContextComponentIndex
+    from summit.ldscore.generalized_gxe_fit_v1 import fit_generalized_gxe_variant_model_v1
+    from summit.ldscore.generalized_gxe_variant import GlobalVariantProbeSpec
+
+    gram_errors, deviations = [], []
+    for seed in (3, 4, 5, 6):
+        _, basis, genotype, fixed_design, rows, phenotype = artifacts._selective_cohort(seed)
+        m = genotype.shape[1]
+        annotations, names = np.ones((m, 1)), ("all",)
+        blocks = np.arange(m, dtype=np.int64) % 10
+        labels = tuple(f"b{index}" for index in range(10))
+        reference = artifacts._reference(
+            genotype, basis, orthonormalize(fixed_design), annotations, names, blocks,
+            labels, GlobalVariantProbeSpec(seed, 0, 64), "composable",
+        )
+        trait = artifacts._trait(
+            genotype[rows], basis[rows], fixed_design[rows], phenotype, annotations,
+            names, blocks, labels,
+        )
+        # Known answer: the study's own exact Gram (own people and projector).
+        projector = rank_revealing_projector(fixed_design[rows]).projector
+        features = np.stack([projector @ (basis[rows, q, None] * genotype[rows]) for q in range(3)])
+        own = kernel_gram(dense_genetic_kernels(
+            features, annotations, ContextComponentIndex(names, ContextPairIndex(3))))
+        fits = [
+            fit_generalized_gxe_variant_model_v1(
+                reference, trait, study_rows=rows, different_person_transport=label
+            )
+            for label in ("scaled_legacy", None)
+        ]
+        assert [fit.manifest["different_person_transport"] for fit in fits] == [
+            "scaled_legacy", "composition_corrected"]
+        c = len(reference.component_index)
+        matrix = np.array(fits[1].normal_matrix)
+        matrix[:c, :c] = own
+        target = np.linalg.solve(matrix, fits[1].normal_rhs)[:c]
+        se = fits[1].raw_standard_errors[:c]
+        gram_errors.append([
+            np.linalg.norm(fit.transferred_genetic_gram - own) / np.linalg.norm(own) for fit in fits])
+        deviations.append([
+            np.max(np.abs(fit.raw_coefficients[:c] - target) / se) for fit in fits])
+    gram_errors, deviations = np.asarray(gram_errors), np.asarray(deviations)
+    # With the exact own-row same-person term in both arms, the remaining
+    # transport error falls on every draw once the different-person term is
+    # corrected for composition; the rest is probe noise and the projector.
+    assert np.all(gram_errors[:, 1] < 0.6 * gram_errors[:, 0])
+    assert deviations[:, 1].mean() < 0.5 * deviations[:, 0].mean()
+
+
+def test_main_era_artifacts_keep_their_fits_and_lack_only_second_moments() -> None:
+    """Artifacts written by SUMMIT 4757960 carry fourth but not second moments."""
+    import json
+    from pathlib import Path
+
+    from summit.context import fit_context_model, load_context_reference, load_context_trait_summary
+    from summit.ldscore.generalized_gxe_fit_v1 import fit_generalized_gxe_variant_model_v1
+    from summit.ldscore.generalized_gxe_reference_v1 import load_generalized_gxe_variant_reference_v1
+    from summit.ldscore.generalized_gxe_trait_summary import load_generalized_gxe_trait_summary
+
+    root = Path(__file__).parent / "fixtures" / "different_person_transport"
+    expected = json.loads((root / "main_expected.json").read_text())
+    reference = load_generalized_gxe_variant_reference_v1(
+        root / "main_reference.generalized-gxe-variant-ldscore-v1.npz")
+    trait = load_generalized_gxe_trait_summary(root / "main_trait.generalized-gxe-trait-summary-v1.npz")
+    assert reference.context_fourth_moments is not None and reference.context_second_moments is None
+    assert trait.context_fourth_moments is not None and trait.context_second_moments is None
+    with pytest.warns(DifferentPersonTransportWarning):
+        fit = fit_generalized_gxe_variant_model_v1(reference, trait)
+    assert fit.manifest["same_person_transport"] == expected["generalized_same_person_transport"]
+    assert fit.manifest["different_person_transport"] == "scaled_legacy"
+    np.testing.assert_allclose(fit.raw_coefficients, expected["generalized_raw_coefficients"], rtol=1e-12)
+    np.testing.assert_allclose(
+        fit.raw_standard_errors, expected["generalized_raw_standard_errors"], rtol=1e-12)
+    context_reference = load_context_reference(root / "main_context.context-reference.json")
+    context_summary = load_context_trait_summary(root / "main_context.context-trait.json")
+    assert context_reference.context_second_moments is None
+    with pytest.warns(DifferentPersonTransportWarning):
+        context_fit = fit_context_model(context_reference, context_summary)
+    assert context_fit.manifest["assembly"]["same_person_transport"] == (
+        expected["context_same_person_transport"])
+    assert context_fit.manifest["assembly"]["different_person_transport"] == "scaled_legacy"
+    np.testing.assert_allclose(context_fit.raw_coefficients, expected["context_raw_coefficients"], rtol=1e-12)
+    np.testing.assert_allclose(context_fit.standard_errors, expected["context_standard_errors"], rtol=1e-12)

@@ -13,6 +13,12 @@ from typing import Any, Mapping, Sequence
 import numpy as np
 from summit.context.oracle import context_fourth_moments as _context_fourth_moments
 from summit.context.oracle import validate_context_fourth_moments
+from summit.context.oracle import context_second_moments as _context_second_moments
+from summit.context.oracle import (
+    intercept_ld_scalars,
+    raw_same_person_intercept,
+    validate_context_second_moments,
+)
 from summit.context.reference import ReferenceMoments
 from summit.context.schema import GenotypeScalePlanV1
 from summit.context.spec import (
@@ -60,7 +66,12 @@ _OPTIONAL_ARRAY_NAMES = (
     "affine_mean",
     "affine_inverse_scale",
     "context_fourth_moments",
+    "context_second_moments",
 )
+# ``context_second_moments`` (Q x Q, sum of phi phi') with the fourth moments
+# give the reference's distinct-person exposure for the different-person
+# composition correction; the per-block LD scalars it also needs are derived
+# from the block numerators, block masses and same-person matrix.
 # ``context_fourth_moments`` is the P x P aggregate G_R = sum_i u(i) u(i)' of
 # the reference contexts (summit.context.oracle.context_fourth_moments).  It is
 # person-summed, so both publication modes may carry it.  Older artifacts lack
@@ -410,6 +421,7 @@ def _validate_reference_structure(
         "affine_mean": (m,),
         "affine_inverse_scale": (m,),
         "context_fourth_moments": (len(pairs), len(pairs)),
+        "context_second_moments": (len(basis_names), len(basis_names)),
     }
     for name, shape in expected.items():
         if name not in arrays or np.asarray(arrays[name]).shape != shape:
@@ -456,6 +468,12 @@ def _validate_reference_structure(
             len(pairs),
             name="generalized reference context_fourth_moments",
         )
+    if "context_second_moments" in arrays:
+        validate_context_second_moments(
+            arrays["context_second_moments"],
+            len(basis_names),
+            name="generalized reference context_second_moments",
+        )
     if not np.allclose(
         np.sum(arrays["block_annotation_mass"], axis=0),
         annotation_masses,
@@ -490,6 +508,7 @@ class GeneralizedGxEVariantReferenceArtifactV1:
     affine_mean: np.ndarray | None = None
     affine_inverse_scale: np.ndarray | None = None
     context_fourth_moments: np.ndarray | None = None
+    context_second_moments: np.ndarray | None = None
     component_index: ContextComponentIndex = field(init=False)
     scale_plan: None = field(init=False)
     genotype_scale: Mapping[str, str] = field(init=False)
@@ -589,6 +608,25 @@ class GeneralizedGxEVariantReferenceArtifactV1:
             annotation_masses=self.annotation_masses,
             gram=self.genetic_gram,
             same_person=self.same_person,
+        )
+
+    @property
+    def ld_scalars(self) -> np.ndarray:
+        """Raw per-block intercept-pair LD scalars (blocks x K x K).
+
+        Derived from the block numerators ``residual_rank**2 *
+        block_directed_numerator``, the block masses and the genome-wide
+        same-person matrix (summit.context.oracle.intercept_ld_scalars).
+        """
+        pair_count = len(self.component_index.pair_index)
+        return intercept_ld_scalars(
+            float(self.residual_rank**2) * self.block_directed_numerator,
+            self.block_annotation_mass,
+            raw_same_person_intercept(
+                self.same_person, self.annotation_masses, pair_count=pair_count
+            ),
+            reference_n=self.n_samples,
+            pair_count=pair_count,
         )
 
     def verify(self) -> None:
@@ -848,6 +886,7 @@ def build_generalized_gxe_variant_reference_from_native_v1(
                 "column per basis name"
             )
         arrays["context_fourth_moments"] = _context_fourth_moments(values)
+        arrays["context_second_moments"] = _context_second_moments(values)
     raw_ledger = getattr(native_result, "ledger", None)
     if not isinstance(raw_ledger, Mapping):
         raise ValueError("native result lacks a pass ledger")
@@ -1043,13 +1082,14 @@ def compose_generalized_gxe_variant_references_v1(
     # The fourth moments depend only on the shared samples and basis.  They
     # are kept when every source carries them; a source without them (an
     # older artifact) leaves the composition without them.
-    fourth_moments = [artifact.context_fourth_moments for artifact, _ in selections]
-    if all(value is not None for value in fourth_moments):
-        if any(not np.array_equal(value, fourth_moments[0]) for value in fourth_moments):
-            raise ValueError(
-                "incompatible generalized reference bundles: context_fourth_moments"
-            )
-        arrays["context_fourth_moments"] = fourth_moments[0]
+    for name in ("context_fourth_moments", "context_second_moments"):
+        values = [getattr(artifact, name) for artifact, _ in selections]
+        if all(value is not None for value in values):
+            if any(not np.array_equal(value, values[0]) for value in values):
+                raise ValueError(
+                    f"incompatible generalized reference bundles: {name}"
+                )
+            arrays[name] = values[0]
     if mode == "composable":
         arrays.update(
             {

@@ -32,8 +32,10 @@ from ._artifact_io import (
 )
 from .oracle import (
     context_fourth_moments,
+    context_second_moments,
     transfer_reference_gram,
     validate_context_fourth_moments,
+    validate_context_second_moments,
 )
 from .reference import GroupedContextReference, ReferenceMoments
 from .schema import (
@@ -103,8 +105,11 @@ _ARRAY_NAMES = (
 # Optional person-summed context fourth moments G_R (P x P).  They let a fit
 # form the study same-person term from aggregates.  Artifacts written before
 # they existed omit both the array and its layout entry.
-_OPTIONAL_ARRAY_NAMES = ("context_fourth_moments",)
-_OPTIONAL_LAYOUTS = {"context_fourth_moments": ["context_pair", "context_pair"]}
+_OPTIONAL_ARRAY_NAMES = ("context_fourth_moments", "context_second_moments")
+_OPTIONAL_LAYOUTS = {
+    "context_fourth_moments": ["context_pair", "context_pair"],
+    "context_second_moments": ["basis", "basis"],
+}
 _FILE_KEYS = frozenset(
     (*_ARRAY_NAMES, *_OPTIONAL_ARRAY_NAMES, "manifest_json", "manifest_sha256")
 )
@@ -1072,6 +1077,7 @@ def _validate_manifest_before_arrays(
         "group_annotation_masses": [dimensions["J"], dimensions["K"]],
         "group_variant_counts": [dimensions["J"]],
         "context_fourth_moments": [dimensions["P_g"], dimensions["P_g"]],
+        "context_second_moments": [dimensions["Q"], dimensions["Q"]],
     }
     for name in declared_arrays:
         shape = expected_shapes[name]
@@ -1198,6 +1204,8 @@ class ContextualReferenceArtifactV1:
     group_variant_counts: np.ndarray
     # Reference context fourth moments G_R (P x P); None when not published.
     context_fourth_moments: np.ndarray | None = None
+    # Context second moments M (Q x Q); None when not published.
+    context_second_moments: np.ndarray | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.component_index, ContextComponentIndex):
@@ -1218,6 +1226,16 @@ class ContextualReferenceArtifactV1:
                     _immutable_array(self.context_fourth_moments, dtype=np.float64),
                     len(self.component_index.pair_index),
                     name="Contextual reference V1 context_fourth_moments",
+                ),
+            )
+        if self.context_second_moments is not None:
+            object.__setattr__(
+                self,
+                "context_second_moments",
+                validate_context_second_moments(
+                    _immutable_array(self.context_second_moments, dtype=np.float64),
+                    self.component_index.pair_index.num_basis,
+                    name="Contextual reference V1 context_second_moments",
                 ),
             )
         manifest = _json_value(self.manifest)
@@ -1375,6 +1393,7 @@ class ContextualReferenceArtifactV1:
             phase_times_seconds={},
             peak_rss_bytes=0,
             context_fourth_moments=self.context_fourth_moments,
+            context_second_moments=self.context_second_moments,
         )
 
 
@@ -1518,6 +1537,7 @@ def _validate_artifact(
         "group_annotation_masses": (j, k),
         "group_variant_counts": (j,),
         "context_fourth_moments": (p, p),
+        "context_second_moments": (q, q),
     }
     for name in present_arrays:
         shape = expected_shapes[name]
@@ -2953,7 +2973,9 @@ def adapt_native_contextual_reference_v1(
     ``basis`` is the evaluated ``N x Q`` context basis the native run used.
     When supplied it must match the publication identity's
     ``evaluated_phi_sha256``; its context fourth moments are then published
-    as ``context_fourth_moments`` for the study same-person transport.
+    as ``context_fourth_moments`` for the study same-person transport, and its
+    second moments as ``context_second_moments`` for the different-person
+    composition correction.
     """
     if not isinstance(native_result, Mapping):
         raise ValueError("Native contextual reference result must be a mapping.")
@@ -3267,6 +3289,9 @@ def adapt_native_contextual_reference_v1(
         arrays["context_fourth_moments"] = owned_readonly_array(
             context_fourth_moments(values)
         )
+        arrays["context_second_moments"] = owned_readonly_array(
+            context_second_moments(values)
+        )
     if _sha256(
         "same_person_sha256", _required_native(native_result, "same_person_sha256")
     ) != array_sha256(arrays["same_person"]):
@@ -3556,6 +3581,7 @@ def load_contextual_reference_v1(path: str | Path) -> ContextualReferenceArtifac
             dimensions = manifest.get("dimensions")
             expected_shapes = {
                 "context_fourth_moments": (dimensions.get("P_g"), dimensions.get("P_g")),
+                "context_second_moments": (dimensions.get("Q"), dimensions.get("Q")),
                 "gram": (dimensions.get("C"), dimensions.get("C")),
                 "same_person": (dimensions.get("C"), dimensions.get("C")),
                 "group_gram_unnormalized_num": (

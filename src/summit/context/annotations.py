@@ -704,6 +704,7 @@ def group_context_reference(
         phase_times_seconds=dict(reference.phase_times_seconds),
         peak_rss_bytes=reference.peak_rss_bytes,
         context_fourth_moments=reference.context_fourth_moments,
+        context_second_moments=reference.context_second_moments,
     )
 
 
@@ -783,6 +784,7 @@ def group_context_trait_summary(
         decode_passes=summary.decode_passes,
         decoded_blocks=summary.decoded_blocks,
         context_fourth_moments=summary.context_fourth_moments,
+        context_second_moments=summary.context_second_moments,
     )
 
 

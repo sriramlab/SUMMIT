@@ -83,6 +83,10 @@ def test_interval_fused_statistics_and_joint_profile(tmp_path, q, k, backend):
             active_annotations=np.arange(k), block_ids=np.arange(start, stop)//3,
             chromosome=str(chromosome), cohort_identity='same-cohort-and-design', trait_names=('t1', 't2'))
         chunks.append(chunk)
+        # Raw (mass-free) intercept same-person entries: local-mass diagonals
+        # multiplied back by their local masses.
+        raw = result.component_kernel_diagonal[::p]*a.sum(axis=0)[:, None]
+        np.testing.assert_allclose(chunk.same_person_intercept, raw@raw.T, rtol=1e-12)
         scale = np.repeat(a.sum(axis=0)/masses, p)
         expected_grams.append(result.genetic_gram*scale[:, None]*scale[None, :])
         expected_cross.append(result.component_kernel_diagonal@residual*scale[:, None])
