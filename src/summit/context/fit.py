@@ -22,11 +22,13 @@ import psutil
 from scipy.optimize import minimize
 
 from .oracle import (
+    SAME_PERSON_TRANSPORTS,
     SymmetricRankDiagnostics,
     _finite_float64,
     coefficients_to_omegas,
     context_covariance_surface,
     omegas_to_coefficients,
+    resolve_study_same_person,
     transfer_reference_gram,
 )
 from .reference import (
@@ -73,8 +75,18 @@ class ContextNormalEquations:
     reference_n: int
     study_n: int
     target_source: bool = False
+    # How the study same-person term of a transported Gram was formed (one of
+    # SAME_PERSON_TRANSPORTS); None for systems that use exact study moments.
+    same_person_transport: str | None = None
 
     def __post_init__(self) -> None:
+        if (
+            self.same_person_transport is not None
+            and self.same_person_transport not in SAME_PERSON_TRANSPORTS
+        ):
+            raise ValueError(
+                f"same_person_transport must be None or one of {SAME_PERSON_TRANSPORTS}."
+            )
         object.__setattr__(self, "component_names", tuple(self.component_names))
         object.__setattr__(self, "deleted_groups", tuple(self.deleted_groups))
         for name in (
