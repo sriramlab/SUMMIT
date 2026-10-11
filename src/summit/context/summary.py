@@ -25,6 +25,8 @@ from .oracle import (
     project_normalize_phenotype,
     residual_moments_low_rank,
     validate_annotations,
+    context_fourth_moments,
+    validate_context_fourth_moments,
 )
 from .spec import (
     CONTEXT_SCHEMA_VERSION,
@@ -85,6 +87,9 @@ class ContextTraitSummary:
     peak_rss_bytes: int
     decode_passes: int
     decoded_blocks: int
+    # Study context fourth moments G_S (P x P) over this trait's people; they
+    # let a transported fit form its same-person term.  None when absent.
+    context_fourth_moments: np.ndarray | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "manifest", freeze_context_mapping(self.manifest))
@@ -95,6 +100,14 @@ class ContextTraitSummary:
             "phase_times_seconds",
             freeze_context_mapping(self.phase_times_seconds),
         )
+        if self.context_fourth_moments is not None:
+            object.__setattr__(
+                self,
+                "context_fourth_moments",
+                validate_context_fourth_moments(
+                    self.context_fourth_moments, len(self.component_index.pair_index)
+                ),
+            )
         for name in (
             "annotation_weights",
             "annotation_masses",
@@ -159,6 +172,9 @@ class GroupedContextTraitSummary:
     peak_rss_bytes: int
     decode_passes: int
     decoded_blocks: int
+    # Study context fourth moments G_S (P x P) over this trait's people; they
+    # let a transported fit form its same-person term.  None when absent.
+    context_fourth_moments: np.ndarray | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "manifest", freeze_context_mapping(self.manifest))
@@ -169,6 +185,14 @@ class GroupedContextTraitSummary:
             "phase_times_seconds",
             freeze_context_mapping(self.phase_times_seconds),
         )
+        if self.context_fourth_moments is not None:
+            object.__setattr__(
+                self,
+                "context_fourth_moments",
+                validate_context_fourth_moments(
+                    self.context_fourth_moments, len(self.component_index.pair_index)
+                ),
+            )
         for name in (
             "annotation_masses",
             "genetic_rhs",
@@ -559,6 +583,7 @@ def build_context_trait_summary(
             peak_rss_bytes=int(peak_rss),
             decode_passes=1,
             decoded_blocks=decoded_blocks,
+            context_fourth_moments=context_fourth_moments(basis_array),
         )
     return ContextTraitSummary(
         manifest=manifest,
@@ -580,6 +605,7 @@ def build_context_trait_summary(
         peak_rss_bytes=int(peak_rss),
         decode_passes=1,
         decoded_blocks=decoded_blocks,
+        context_fourth_moments=context_fourth_moments(basis_array),
     )
 
 
@@ -684,6 +710,8 @@ def write_context_trait_summary(
                 ),
                 "loo_group_ids": np.asarray(summary.loo_group_ids, dtype=np.str_),
             }
+            if summary.context_fourth_moments is not None:
+                common["context_fourth_moments"] = summary.context_fourth_moments
             if isinstance(summary, GroupedContextTraitSummary):
                 np.savez_compressed(
                     handle,
@@ -772,6 +800,14 @@ def load_context_trait_summary(
         raise ValueError("Trait-summary component order is not canonical.")
     with np.load(arrays_path, allow_pickle=False) as arrays:
         values = {name: np.array(arrays[name], copy=True) for name in arrays.files}
+    # Optional study context fourth moments; older summaries lack them.
+    fourth_moments = values.pop("context_fourth_moments", None)
+    if fourth_moments is not None:
+        if fourth_moments.dtype != np.dtype(np.float64):
+            raise ValueError("Trait-summary fourth moments must be float64.")
+        fourth_moments = validate_context_fourth_moments(
+            fourth_moments, len(component_index.pair_index)
+        )
     phase = payload.get("performance", {})
     if grouped_format:
         n_groups = int(dimensions.get("loo_groups", 0))
@@ -942,6 +978,7 @@ def load_context_trait_summary(
             peak_rss_bytes=int(phase.get("peak_rss_bytes", 0)),
             decode_passes=int(payload["backend"]["decode_passes"]),
             decoded_blocks=int(phase.get("decoded_blocks", 0)),
+            context_fourth_moments=fourth_moments,
         )
     return ContextTraitSummary(
         manifest={
@@ -969,4 +1006,5 @@ def load_context_trait_summary(
         peak_rss_bytes=int(phase.get("peak_rss_bytes", 0)),
         decode_passes=int(payload["backend"]["decode_passes"]),
         decoded_blocks=int(phase.get("decoded_blocks", 0)),
+        context_fourth_moments=fourth_moments,
     )

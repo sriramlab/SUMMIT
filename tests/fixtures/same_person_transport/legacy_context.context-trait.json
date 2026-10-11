@@ -1,0 +1,109 @@
+{
+  "annotation_hash": "8184283304b13f3cab4dbb318d3e3719f1e2b9f39817a1ed26bdf1beca2e19d4",
+  "annotation_names": [
+    "all"
+  ],
+  "approximate_loo": {
+    "contribution_storage": "snp",
+    "exact_deleted_kernels": false,
+    "group_annotation_masses_hash": "1516401c9b112af5f9ec6b2b73c1af38501df99c36ceef0c4c5e3554108b321c",
+    "group_labels": [
+      "group:0",
+      "group:1",
+      "group:2"
+    ],
+    "group_variant_counts": [
+      6,
+      6,
+      6
+    ],
+    "groups": 3,
+    "method": "snp_contribution_summary_v1"
+  },
+  "artifact": {
+    "format": "npz_development_v1",
+    "path": "legacy_context.context-trait.npz",
+    "sha256": "168fec06f091a082ba3ea15185f37e934005ae8190b02b962834a24df17a63ac"
+  },
+  "backend": {
+    "block_size": 256,
+    "decode_passes": 1,
+    "dtype": "float64",
+    "name": "python_numpy_reference"
+  },
+  "basis_array_hash": "82bf11aee5f42b244bd48deab937b4403dc1a2077ddcecef2e55ab51fa85cb1a",
+  "basis_hash": "f846236d80c364383ed784e320a62b2d712687e11ef22940e9fc5a8b5dabcf5e",
+  "component_index_hash": "fa27d8880f732391505b3488554d9a78143820cbacb2d3a996c5e7e867fc807a",
+  "component_order": [
+    "context:all:0,0",
+    "context:all:1,1",
+    "context:all:2,2",
+    "context:all:0,1",
+    "context:all:0,2",
+    "context:all:1,2"
+  ],
+  "context_moments": {
+    "mean": [
+      1.0,
+      0.16666666666666666,
+      0.3415090164423172
+    ],
+    "second_moment": [
+      [
+        1.0,
+        0.16666666666666666,
+        0.3415090164423172
+      ],
+      [
+        0.16666666666666666,
+        0.25,
+        -0.12678676086827256
+      ],
+      [
+        0.3415090164423172,
+        -0.12678676086827256,
+        0.6446423744063566
+      ]
+    ]
+  },
+  "dimensions": {
+    "h": 1,
+    "k": 1,
+    "loo_groups": 3,
+    "n_samples": 18,
+    "n_variants": 18,
+    "p_genetic": 6,
+    "q": 3,
+    "residual_rank": 15
+  },
+  "feature_mode": "raw_projected",
+  "fixed_effect_hash": "1dcdfad0ea3ac88c6258c91762be8c4da6f992e884f33db8d4629a9ba64feba6",
+  "genotype_scaling": "pre_scaled_input",
+  "kind": "summit.context.trait_summary",
+  "loo_grouping_hash": "6d1c6d9bbb4caf64a74b1f43ca251b6dc86bf4692bee60142f41b5dfa6c5c11c",
+  "performance": {
+    "decoded_blocks": 1,
+    "peak_rss_bytes": 100175872,
+    "phase_times_seconds": {
+      "genotype_pass": 0.0011949189938604832,
+      "phenotype_and_residual": 0.00016241002595052123,
+      "total": 0.0016913189901970327
+    }
+  },
+  "phenotype_scale": {
+    "normalization": "projected_sum_squares_equals_residual_rank",
+    "projected_sum_squares": 15.000000000000002
+  },
+  "rank_diagnostics": {
+    "fixed_effect_rank": 3,
+    "maximum_leverage": 0.5223177604231171,
+    "residual_rank": 15,
+    "svd_tolerance": 2.1536971532260052e-14
+  },
+  "residual_basis_hash": "36111f7c228d2202db025b4d4fa5a8b6e143c7b5d1c0d74faa757e375e6aaa90",
+  "residual_order": [
+    "residual:constant"
+  ],
+  "schema_version": 1,
+  "variant_hash": "14d9ef43fa6558775b15a9ae3009669bccffabea78600dcdb203688f1bb8863d"
+}

@@ -24,12 +24,14 @@ from .oracle import (
     ProjectorResult,
     _finite_float64,
     common_scale_features,
+    context_fourth_moments,
     context_kernel_actions,
     dense_genetic_kernels,
     exact_same_person_matrix,
     kernel_gram,
     transfer_reference_gram,
     validate_annotations,
+    validate_context_fourth_moments,
 )
 from .spec import (
     CONTEXT_REFERENCE_KIND,
@@ -66,6 +68,18 @@ class ReferenceMoments:
         )
 
 
+def _own_fourth_moments(artifact: Any) -> None:
+    value = getattr(artifact, "context_fourth_moments")
+    if value is not None:
+        object.__setattr__(
+            artifact,
+            "context_fourth_moments",
+            validate_context_fourth_moments(
+                value, len(artifact.component_index.pair_index)
+            ),
+        )
+
+
 @dataclass(frozen=True)
 class ContextReference:
     """Versioned standalone reference object for contextual genetic kernels."""
@@ -80,6 +94,8 @@ class ContextReference:
     loo_group_ids: tuple[str, ...]
     phase_times_seconds: dict[str, float]
     peak_rss_bytes: int
+    # Reference context fourth moments G_R (P x P); None when not recorded.
+    context_fourth_moments: np.ndarray | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "manifest", freeze_context_mapping(self.manifest))
@@ -89,6 +105,7 @@ class ContextReference:
             "phase_times_seconds",
             freeze_context_mapping(self.phase_times_seconds),
         )
+        _own_fourth_moments(self)
         for name in (
             "annotation_weights",
             "annotation_masses",
@@ -146,6 +163,8 @@ class GroupedContextReference:
     group_variant_counts: np.ndarray
     phase_times_seconds: dict[str, float]
     peak_rss_bytes: int
+    # Reference context fourth moments G_R (P x P); None when not recorded.
+    context_fourth_moments: np.ndarray | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "manifest", freeze_context_mapping(self.manifest))
@@ -155,6 +174,7 @@ class GroupedContextReference:
             "phase_times_seconds",
             freeze_context_mapping(self.phase_times_seconds),
         )
+        _own_fourth_moments(self)
         for name in (
             "annotation_masses",
             "gram",
@@ -702,6 +722,7 @@ def build_context_reference(
         },
     }
     validate_context_manifest(manifest, expected_kind=CONTEXT_REFERENCE_KIND)
+    fourth_moments = context_fourth_moments(basis_array)
     if contribution_storage == "loo_grouped":
         return GroupedContextReference(
             manifest=manifest,
@@ -715,6 +736,7 @@ def build_context_reference(
             group_variant_counts=group_variant_counts,
             phase_times_seconds=phase_times,
             peak_rss_bytes=int(peak_rss),
+            context_fourth_moments=fourth_moments,
         )
     return ContextReference(
         manifest=manifest,
@@ -727,6 +749,7 @@ def build_context_reference(
         loo_group_ids=groups,
         phase_times_seconds=phase_times,
         peak_rss_bytes=int(peak_rss),
+        context_fourth_moments=fourth_moments,
     )
 
 
@@ -801,10 +824,16 @@ def write_context_reference(
         prefix=f".{arrays_path.name}.", dir=arrays_path.parent
     )
     try:
+        optional = (
+            {}
+            if reference.context_fourth_moments is None
+            else {"context_fourth_moments": reference.context_fourth_moments}
+        )
         with os.fdopen(descriptor, "wb") as handle:
             if isinstance(reference, GroupedContextReference):
                 np.savez_compressed(
                     handle,
+                    **optional,
                     annotation_masses=reference.annotation_masses,
                     gram=reference.gram,
                     same_person=reference.same_person,
@@ -818,6 +847,7 @@ def write_context_reference(
             else:
                 np.savez_compressed(
                     handle,
+                    **optional,
                     annotation_weights=reference.annotation_weights,
                     annotation_masses=reference.annotation_masses,
                     gram=reference.gram,
@@ -898,6 +928,14 @@ def load_context_reference(
         raise ValueError("Context-reference component order is not canonical.")
     with np.load(arrays_path, allow_pickle=False) as arrays:
         values = {name: np.array(arrays[name], copy=True) for name in arrays.files}
+    # Optional reference context fourth moments; older artifacts lack them.
+    fourth_moments = values.pop("context_fourth_moments", None)
+    if fourth_moments is not None:
+        if fourth_moments.dtype != np.dtype(np.float64):
+            raise ValueError("Context-reference fourth moments must be float64.")
+        fourth_moments = validate_context_fourth_moments(
+            fourth_moments, len(components.pair_index)
+        )
     if grouped_format:
         n_groups = int(dimensions.get("loo_groups", 0))
         expected_shapes = {
@@ -1055,6 +1093,7 @@ def load_context_reference(
             ),
             phase_times_seconds=dict(performance.get("phase_times_seconds", {})),
             peak_rss_bytes=int(performance.get("peak_rss_bytes", 0)),
+            context_fourth_moments=fourth_moments,
         )
     expected_shapes = {
         "annotation_weights": (
@@ -1166,4 +1205,5 @@ def load_context_reference(
         loo_group_ids=tuple(str(value) for value in values["loo_group_ids"]),
         phase_times_seconds=dict(performance.get("phase_times_seconds", {})),
         peak_rss_bytes=int(performance.get("peak_rss_bytes", 0)),
+        context_fourth_moments=fourth_moments,
     )
