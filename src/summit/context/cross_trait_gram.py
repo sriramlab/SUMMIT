@@ -309,7 +309,8 @@ def within_trait_equations(reference_chromosomes, study_chromosomes, *,
             reference_residual_gram=reference_residual_gram,
             reference_residual_traces=reference_residual_traces,
             reference_same_person=reference_same_person,
-            same_person_transport='scaled_legacy', **common)
+            same_person_transport='scaled_legacy',
+            different_person_transport='scaled_legacy', **common)
     target = joint_chromosome_equations(study, **common)
     if len(rows) != target.study_n:
         raise ValueError('trait rows disagree with study sample count')

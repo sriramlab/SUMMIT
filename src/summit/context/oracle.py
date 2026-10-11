@@ -14,9 +14,12 @@ import numpy as np
 
 from .spec import (
     ContextComponentIndex,
+    ContextPairIndex,
     context_fourth_moments,
+    context_second_moments,
     owned_readonly_array,
     validate_context_fourth_moments,
+    validate_context_second_moments,
 )
 from .spec import validate_sample_rows as _sample_rows
 
@@ -583,6 +586,220 @@ def resolve_study_same_person(
     return None, "scaled_legacy"
 
 
+DIFFERENT_PERSON_TRANSPORTS = ("composition_corrected", "scaled_legacy")
+"""Recorded choices of the different-person part of a transported Gram.
+
+``composition_corrected``: ``s O_R + kron(L, F_S - s F_R)``, the scaled
+reference different-person part plus a correction for the study's context
+composition (cross_trait_gram mode ``factorized_plus_residual``).
+``scaled_legacy``: ``s O_R`` alone, which assumes the study's people are an
+exchangeable subset of the reference.  ``s = n_S(n_S-1)/(n_R(n_R-1))``.
+"""
+
+
+class DifferentPersonTransportWarning(UserWarning):
+    """The legacy scaled different-person term was used for a different-size study."""
+
+
+def distinct_pair_exposure(second_moments: object, fourth_moments: object) -> np.ndarray:
+    """Return the distinct-person exposure factor in the saved pair basis.
+
+    ``F[p, s] = sum_{(a,b) in O(p)} sum_{(c,d) in O(s)} M[a,c] M[b,d] - G[p,s]``,
+    where ``O(p)`` lists the orientations of pair ``p`` (one for a diagonal
+    pair, two otherwise), ``M`` are a cohort's context second moments and
+    ``G`` its fourth moments.  This equals
+    ``cross_trait_gram.saved(exposure_factor(phi, rows), q)``: the sum over
+    ordered pairs of distinct people ``i != j`` of the context products that
+    multiply their kernel entries.
+    """
+    second = validate_context_second_moments(
+        second_moments, np.asarray(second_moments).shape[0], name="second_moments"
+    )
+    q = second.shape[0]
+    pairs = ContextPairIndex(q).entries
+    fourth = _finite_float64("fourth_moments", fourth_moments, ndim=2)
+    if fourth.shape != (len(pairs), len(pairs)):
+        raise ValueError("fourth_moments must be P x P for the second moments' Q.")
+    orientation = np.zeros((len(pairs), q * q), dtype=np.float64)
+    for pair in pairs:
+        orientation[pair.index, pair.q * q + pair.r] = 1.0
+        orientation[pair.index, pair.r * q + pair.q] = 1.0
+    result = orientation @ np.kron(second, second) @ orientation.T - fourth
+    return 0.5 * (result + result.T)
+
+
+def intercept_ld_scalars(
+    block_numerators: object,
+    block_masses: object,
+    same_person_intercept: object,
+    *,
+    reference_n: int,
+    pair_count: int,
+) -> np.ndarray:
+    """Per-block intercept-pair LD scalars ``ell_b`` in raw (mass-free) units.
+
+    For block ``b`` with raw (mass-unnormalized) Gram numerator ``N_b`` the
+    different-person part is ``N_b - frac_b D_raw``: the unit's same-person
+    matrix in raw units, apportioned to blocks by each row annotation's block
+    mass fraction ``frac_b[a] = m_b[a] / sum_b m_b[a]``.  Its intercept-pair
+    entries over ``n_R(n_R-1)`` give
+
+    ``ell_raw_b[a, c] = (N_b[(a,0),(c,0)] - frac_b[a] D_raw[a, c]) / (n_R(n_R-1))``
+
+    where ``same_person_intercept`` is ``D_raw[a, c] = D[(a,0),(c,0)] M_a M_c``
+    (K x K) for the masses ``M`` that normalize ``D``.  Dividing ``ell_raw`` by
+    ``m_a m_c`` gives Gram units; with the full masses this is
+    ``cross_trait_gram.chromosome_gram``'s ``ld_scalar``.  ``block_numerators``
+    must be raw, e.g. ``residual_rank**2 * block_directed`` for chromosome and
+    variant-LD-score references.  The "unit" is one chromosome for chromosome
+    references and the whole genome for genome-wide references.
+    """
+    numerators = _finite_float64("block_numerators", block_numerators, ndim=3)
+    masses = _finite_float64("block_masses", block_masses, ndim=2)
+    intercept = _finite_float64("same_person_intercept", same_person_intercept, ndim=2)
+    if (
+        isinstance(pair_count, bool)
+        or not isinstance(pair_count, (int, np.integer))
+        or pair_count < 1
+    ):
+        raise ValueError("pair_count must be a positive integer.")
+    if (
+        isinstance(reference_n, bool)
+        or not isinstance(reference_n, (int, np.integer))
+        or reference_n < 2
+    ):
+        raise ValueError("reference_n must be an integer >= 2.")
+    k = masses.shape[1]
+    c = k * int(pair_count)
+    if numerators.shape != (masses.shape[0], c, c) or intercept.shape != (k, k):
+        raise ValueError("LD-scalar inputs have inconsistent block/component axes.")
+    if np.any(masses < 0.0):
+        raise ValueError("Block masses must be nonnegative.")
+    totals = np.sum(masses, axis=0, dtype=np.float64)
+    fractions = np.divide(
+        masses, totals, out=np.zeros_like(masses), where=totals > 0.0
+    )
+    off = (
+        numerators[:, ::pair_count, ::pair_count]
+        - fractions[:, :, None] * intercept[None]
+    )
+    return off / (float(reference_n) * (float(reference_n) - 1.0))
+
+
+def raw_same_person_intercept(
+    same_person: object, masses: object, *, pair_count: int
+) -> np.ndarray:
+    """``D[(a,0),(c,0)] M_a M_c``: a mass-normalized same-person matrix in raw units."""
+    same = _finite_float64("same_person", same_person, ndim=2)
+    normalizing = _finite_float64("masses", masses, ndim=1)
+    if same.shape != (normalizing.size * pair_count,) * 2:
+        raise ValueError("Same-person matrix and masses disagree.")
+    return same[::pair_count, ::pair_count] * np.outer(normalizing, normalizing)
+
+
+def different_person_correction(
+    ld_scalars: object,
+    exposure_difference: object,
+    *,
+    masses: object,
+    retained: object | None = None,
+) -> np.ndarray:
+    """Return ``kron(L, F_S - s F_R)`` with ``L = sum_retained ell_raw_b / (m m')``.
+
+    ``ld_scalars`` are :func:`intercept_ld_scalars` (blocks x K x K, raw);
+    ``masses`` are the annotation masses that normalize the (possibly
+    deleted) reference Gram; ``retained`` is a boolean block mask (all blocks
+    when None).  Components are annotation-major, so the Kronecker order is
+    annotation then pair.
+    """
+    scalars = _finite_float64("ld_scalars", ld_scalars, ndim=3)
+    difference = _finite_float64("exposure_difference", exposure_difference, ndim=2)
+    normalizing = _finite_float64("masses", masses, ndim=1)
+    if scalars.shape[1:] != (normalizing.size, normalizing.size):
+        raise ValueError("LD scalars and masses disagree on the annotation axis.")
+    if difference.shape[0] != difference.shape[1]:
+        raise ValueError("exposure_difference must be square.")
+    if np.any(normalizing <= 0.0):
+        raise ValueError("Normalizing masses must be positive.")
+    if retained is not None:
+        keep = np.asarray(retained)
+        if keep.dtype != np.bool_ or keep.shape != (scalars.shape[0],):
+            raise ValueError("retained must be a boolean block mask.")
+        scalars = scalars[keep]
+    total = np.sum(scalars, axis=0, dtype=np.float64) / np.outer(normalizing, normalizing)
+    return np.kron(total, difference)
+
+
+def resolve_different_person_exposure(
+    *,
+    reference_n: int,
+    study_n: int,
+    reference_second_moments: object | None = None,
+    reference_fourth_moments: object | None = None,
+    study_second_moments: object | None = None,
+    study_fourth_moments: object | None = None,
+    ld_scalars_available: bool = True,
+    requested: str | None = None,
+    stacklevel: int = 2,
+) -> tuple[np.ndarray | None, str]:
+    """Choose the different-person transport; return ``(F_S - s F_R, label)``.
+
+    The composition correction needs the reference's per-block LD scalars
+    (``ld_scalars_available``) and both cohorts' context second and fourth
+    moments.  Otherwise ``(None, "scaled_legacy")``, with a
+    :class:`DifferentPersonTransportWarning` when ``n_S != n_R`` unless the
+    legacy term was requested explicitly.  ``requested`` forces a choice.
+    """
+    if requested is not None and requested not in DIFFERENT_PERSON_TRANSPORTS:
+        raise ValueError(
+            f"different_person_transport must be one of {DIFFERENT_PERSON_TRANSPORTS}."
+        )
+    ready = bool(ld_scalars_available) and all(
+        value is not None
+        for value in (
+            reference_second_moments,
+            reference_fourth_moments,
+            study_second_moments,
+            study_fourth_moments,
+        )
+    )
+    if requested == "composition_corrected" and not ready:
+        raise ValueError(
+            "composition_corrected requires reference LD scalars and both cohorts' "
+            "context second and fourth moments."
+        )
+    if requested in (None, "composition_corrected") and ready:
+        if (
+            isinstance(reference_n, bool)
+            or not isinstance(reference_n, (int, np.integer))
+            or reference_n < 2
+            or isinstance(study_n, bool)
+            or not isinstance(study_n, (int, np.integer))
+            or study_n < 1
+        ):
+            raise ValueError("reference_n must be >= 2 and study_n positive.")
+        scale = (float(study_n) * (float(study_n) - 1.0)) / (
+            float(reference_n) * (float(reference_n) - 1.0)
+        )
+        study = distinct_pair_exposure(study_second_moments, study_fourth_moments)
+        reference = distinct_pair_exposure(
+            reference_second_moments, reference_fourth_moments
+        )
+        return study - scale * reference, "composition_corrected"
+    if requested is None and int(study_n) != int(reference_n):
+        import warnings
+
+        warnings.warn(
+            "Transported SUMMIT-GxE Gram scales the reference different-person "
+            "term by n_S(n_S-1)/(n_R(n_R-1)); it is biased when the study's "
+            "people are not an exchangeable subset of the reference. Supply "
+            "reference and study context second and fourth moments.",
+            DifferentPersonTransportWarning,
+            stacklevel=stacklevel + 1,
+        )
+    return None, "scaled_legacy"
+
+
 def transfer_reference_gram(
     reference_gram: object,
     same_person: object,
@@ -590,13 +807,15 @@ def transfer_reference_gram(
     reference_n: int,
     study_n: int,
     study_same_person: object | None = None,
+    different_person_correction: object | None = None,
 ) -> np.ndarray:
     """Transport a reference genetic Gram to a study of ``study_n`` people.
 
-    ``T_S = D_S + n_S(n_S-1)/(n_R(n_R-1)) (T_R - D_R)``.  ``D_S`` is
-    ``study_same_person`` when supplied (see :func:`resolve_study_same_person`),
-    else the legacy ``(n_S / n_R) D_R``.  The different-person scaling is the
-    same in both cases.
+    ``T_S = D_S + s (T_R - D_R) + Delta_O`` with ``s = n_S(n_S-1)/(n_R(n_R-1))``.
+    ``D_S`` is ``study_same_person`` when supplied (see
+    :func:`resolve_study_same_person`), else the legacy ``(n_S / n_R) D_R``.
+    ``Delta_O`` is ``different_person_correction`` (see
+    :func:`different_person_correction`), else zero.
     """
     gram = _finite_float64("reference_gram", reference_gram, ndim=2)
     diagonal = _finite_float64("same_person", same_person, ndim=2)
@@ -612,20 +831,38 @@ def transfer_reference_gram(
         raise ValueError("reference_n must be an integer >= 2.")
     if isinstance(study_n, bool) or not isinstance(study_n, int) or study_n < 1:
         raise ValueError("study_n must be a positive integer.")
+    correction = None
+    if different_person_correction is not None:
+        correction = _finite_float64(
+            "different_person_correction", different_person_correction, ndim=2
+        )
+        if correction.shape != gram.shape:
+            raise ValueError(
+                "different_person_correction must match the reference Gram shape."
+            )
+        if not np.any(correction):
+            # An exactly zero correction (study = reference) leaves the
+            # historical result bit for bit.
+            correction = None
+    different_scale = study_n * (study_n - 1) / (reference_n * (reference_n - 1))
     if study_same_person is None:
-        if reference_n == study_n:
+        if correction is None and reference_n == study_n:
             return gram.copy()
         same_scale = study_n / reference_n
-        different_scale = study_n * (study_n - 1) / (reference_n * (reference_n - 1))
         result = same_scale * diagonal + different_scale * (gram - diagonal)
-        return 0.5 * (result + result.T)
-    study = _finite_float64("study_same_person", study_same_person, ndim=2)
-    if study.shape != gram.shape:
-        raise ValueError("study_same_person must match the reference Gram shape.")
-    if reference_n == study_n and np.array_equal(study, diagonal):
-        return gram.copy()
-    different_scale = study_n * (study_n - 1) / (reference_n * (reference_n - 1))
-    result = study + different_scale * (gram - diagonal)
+    else:
+        study = _finite_float64("study_same_person", study_same_person, ndim=2)
+        if study.shape != gram.shape:
+            raise ValueError("study_same_person must match the reference Gram shape.")
+        if (
+            correction is None
+            and reference_n == study_n
+            and np.array_equal(study, diagonal)
+        ):
+            return gram.copy()
+        result = study + different_scale * (gram - diagonal)
+    if correction is not None:
+        result = result + correction
     return 0.5 * (result + result.T)
 
 

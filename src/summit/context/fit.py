@@ -22,6 +22,7 @@ import psutil
 from scipy.optimize import minimize
 
 from .oracle import (
+    DIFFERENT_PERSON_TRANSPORTS,
     SAME_PERSON_TRANSPORTS,
     SymmetricRankDiagnostics,
     _finite_float64,
@@ -78,6 +79,8 @@ class ContextNormalEquations:
     # How the study same-person term of a transported Gram was formed (one of
     # SAME_PERSON_TRANSPORTS); None for systems that use exact study moments.
     same_person_transport: str | None = None
+    # How its different-person part was formed (DIFFERENT_PERSON_TRANSPORTS).
+    different_person_transport: str | None = None
 
     def __post_init__(self) -> None:
         if (
@@ -86,6 +89,14 @@ class ContextNormalEquations:
         ):
             raise ValueError(
                 f"same_person_transport must be None or one of {SAME_PERSON_TRANSPORTS}."
+            )
+        if (
+            self.different_person_transport is not None
+            and self.different_person_transport not in DIFFERENT_PERSON_TRANSPORTS
+        ):
+            raise ValueError(
+                "different_person_transport must be None or one of "
+                f"{DIFFERENT_PERSON_TRANSPORTS}."
             )
         object.__setattr__(self, "component_names", tuple(self.component_names))
         object.__setattr__(self, "deleted_groups", tuple(self.deleted_groups))

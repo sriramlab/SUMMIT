@@ -749,3 +749,38 @@ def validate_context_fourth_moments(
         raise ValueError(f"{name} has no intercept-pair mass.")
     result.setflags(write=False)
     return result
+
+
+def context_second_moments(basis: object, rows: object | None = None) -> np.ndarray:
+    """Return the ``Q x Q`` context second moments ``M = sum_i phi(i) phi(i)'``.
+
+    The sum runs over ``rows`` of ``basis`` (all rows when ``rows`` is None).
+    With the fourth moments it gives the distinct-person exposure factor of a
+    cohort (summit.context.oracle.distinct_pair_exposure).  ``M`` is a
+    person-summed aggregate, safe to publish like the same-person matrix.
+    """
+    phi = np.asarray(basis, dtype=np.float64)
+    if phi.ndim != 2 or not np.all(np.isfinite(phi)):
+        raise ValueError("basis must be a finite 2-dimensional array.")
+    if phi.shape[0] < 1 or phi.shape[1] < 1:
+        raise ValueError("basis must have at least one row and one column.")
+    if rows is not None:
+        phi = phi[validate_sample_rows("rows", rows, phi.shape[0])]
+    moments = phi.T @ phi
+    return 0.5 * (moments + moments.T)
+
+
+def validate_context_second_moments(
+    value: object, num_basis: int, *, name: str = "context_second_moments"
+) -> np.ndarray:
+    """Return an owned read-only copy of a valid ``Q x Q`` second-moment matrix."""
+    result = np.array(value, dtype=np.float64, order="C", copy=True)
+    if result.shape != (num_basis, num_basis) or not np.all(np.isfinite(result)):
+        raise ValueError(f"{name} must be a finite {num_basis} by {num_basis} matrix.")
+    scale = max(float(np.max(np.abs(result), initial=0.0)), 1.0)
+    if float(np.max(np.abs(result - result.T), initial=0.0)) > 1.0e-12 * scale:
+        raise ValueError(f"{name} must be symmetric.")
+    if not result[0, 0] > 0.0:
+        raise ValueError(f"{name} has no intercept mass.")
+    result.setflags(write=False)
+    return result

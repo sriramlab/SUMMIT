@@ -413,7 +413,8 @@ def test_chromosome_transfer_uses_the_study_same_person_term() -> None:
             warnings.simplefilter("error")
             acknowledged = transferred_chromosome_equations(
                 reference, study, deleted_blocks=deleted,
-                same_person_transport="scaled_legacy", **options,
+                same_person_transport="scaled_legacy",
+                different_person_transport="scaled_legacy", **options,
             )
         np.testing.assert_array_equal(acknowledged.matrix, legacy.matrix)
     # Per-person masses vary, so the summary form is close but not exact.
