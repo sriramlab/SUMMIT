@@ -80,6 +80,12 @@ same-person terms removed. The NPZ format retains their multiple context and
 annotation dimensions. The files record variant order, alleles, context names,
 and the sample, risk, genotype-scale, and liability-scale definitions.
 
+Because the same-person terms are removed per SNP on the analyzed people, PCGC
+never scales a reference same-person matrix by sample size. The own-row
+correction used for transferred quantitative fits
+([Methods](Methods.md#reference-transfer-and-fitting)) is therefore not needed
+here. `pcgc-ld` likewise forms its context factor from the study's own contexts.
+
 Add `--annot annotations.tsv` for partitioned estimates. Changes to risks,
 prevalence, genotype scaling, context coding, or sample selection require new
 preparation. Choose a new output prefix for each preparation.

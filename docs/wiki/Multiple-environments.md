@@ -97,17 +97,40 @@ effects. [PCGC preparation](Generalized-GxE-PCGC.md) also saves separate referen
 trait files, using `.binary.ldscores.npz` and `.binary.sumstats.npz`. Its fitter
 requires the reference identified by the trait summary.
 
+## The trait's same-person term
+
+A fit transfers the reference Gram to the trait's sample. The same-person part
+of that Gram depends on the contexts of the people actually measured, so it is
+formed for the trait's own people ([Methods](Methods.md#reference-transfer-and-fitting)).
+Trait summaries record the study's context fourth moments. References record
+the reference's fourth moments when the basis is supplied, which
+`scripts/generalized_gxe/workflow.py` does.
+
+- Against a `summary` reference, the fit uses the fourth-moment difference form.
+- Against a `composable` reference, pass the trait's people as indices into the
+  reference sample, `fit_generalized_gxe_variant_model_v1(reference, trait,
+  study_rows=rows)`, to use the exact own-row term.
+- References and summaries written before the fourth moments existed still
+  load. Their fits keep the legacy `(N_S/N_R) D_R` scaling, which is biased when
+  missingness depends on the contexts, and warn when the sample sizes differ.
+
+`fit.manifest["same_person_transport"]` records the term used.
+
 ## Reusing annotation columns
 
-Default `summary` output stores the reference summaries needed for fitting.
-Optional `composable` output also retains annotations, directional panels,
-and sample-aligned component diagonals. **Keep composable files in protected
-storage when the input is participant data.**
+Default `summary` output stores the reference summaries needed for fitting,
+including the same-person matrix and the reference context fourth moments.
+Both are sums over people. Optional `composable` output also retains
+annotations, directional panels, and sample-aligned component diagonals, which
+give the exact own-row term. **Keep composable files in protected storage when
+the input is participant data.**
 
 `compose_generalized_gxe_variant_references_v1` combines compatible annotation
 columns without reading genotypes again. It requires the same ordered samples,
 variants, context definitions, and scaling. Verify those inputs from the
 original reference records; equal dimensions do not establish equivalence.
+The composed reference keeps the context fourth moments when every source
+carries them.
 
 ## Reading a joint fit
 

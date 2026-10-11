@@ -154,13 +154,47 @@ annotation masses, and reuses the full same-person matrix.
 
 ## Reference transfer and fitting
 
-When reference and study sample the same relevant genotype–context distribution,
-separate same-person and different-person contributions scale as
+A reference Gram is moved to a study of N_S people by separating its
+same-person part D from its different-person part:
 
 ```math
-T_S=\frac{N_S}{N_R}D_R+
-\frac{N_S(N_S-1)}{N_R(N_R-1)}(T_R-D_R).
+T_S=D_S+\frac{N_S(N_S-1)}{N_R(N_R-1)}(T_R-D_R).
 ```
+
+The different-person scaling assumes that reference and study sample the same
+relevant genotype–context distribution. The same-person part is formed for the
+study's own people, because it depends on the fourth moments of their contexts.
+A person's kernel diagonal is `d_(a,p)(i) = kappa_p phi_q(i) phi_r(i) h_a(i)`
+for annotation a and context pair p = (q, r), with `kappa_p` equal to 1 when
+q = r and 2 otherwise, and `h_a(i)` the person's projected squared-genotype mass.
+Fits use the first available of three terms.
+
+1. **Exact own rows.** With the reference's sample-aligned diagonals d
+   (composable references) and the study's people S given as reference sample
+   indices, `D_S = d[:, S] d[:, S]'`.
+2. **Fourth-moment difference.** With the context fourth moments
+   `G = sum_i u(i) u(i)'`, `u_p(i) = kappa_p phi_q(i) phi_r(i)`, of both cohorts,
+
+   ```math
+   D_S\approx fD_R+c\otimes(G_S-fG_R),\qquad f=N_S/N_R,
+   ```
+
+   where `c[a,b] = D_R[(a,0),(b,0)] / G_R[0,0]` uses the intercept pair. With
+   the constant-one first basis column, `G_R[0,0] = N_R`. Components are
+   annotation-major, which fixes the Kronecker order. The form is exact when
+   the study is the reference, unbiased for an exchangeable subset, and
+   otherwise corrects the difference in context composition. It neglects the
+   weak dependence of `h` on the contexts. G is a person-summed aggregate and
+   can be released like D_R.
+3. **Legacy scaling** `D_S = (N_S/N_R) D_R`, used only when neither input is
+   available. It is biased when missingness depends on the contexts, and fits
+   warn (`SamePersonTransportWarning`) when it is used with N_S ≠ N_R.
+
+Fits record the choice as `same_person_transport` (`own_rows_exact`,
+`fourth_moment_difference` or `scaled_legacy`). Approximate jackknife
+deletions reuse the full study term, as they reuse the full reference D_R.
+The exact term uses diagonals computed with the reference projector; when the
+covariates are few relative to N, they differ little from the study projector's.
 
 These factors use sample counts, not residual rank. Genetic–residual and
 residual-only moments are computed in the study cohort. Traits are projected
