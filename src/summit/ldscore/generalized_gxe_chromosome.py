@@ -19,11 +19,16 @@ from pathlib import Path
 import numpy as np
 
 from summit.context.fit import ContextNormalEquations
+from summit.context.oracle import intercept_ld_scalars
 from summit.context.spec import ContextComponentIndex, ContextPairIndex, owned_readonly_array
 from summit.context.spec import array_sha256, canonical_json, canonical_sha256
 from summit.ldscore.generalized_gxe_native import GeneralizedGxENativeResult
 
 CHROMOSOME_LD_POLICY = "within_chromosome_residual_profile_global_mass_v1"
+# Optional raw intercept-pair same-person entries of one chromosome (K x K,
+# mass-free).  With block_directed and block_masses they give the per-block
+# LD scalars of the different-person transport.  Older artifacts lack them.
+_OPTIONAL_CHROMOSOME_ARRAYS = ("same_person_intercept",)
 
 
 def write_chromosome_moments(path, moments, *, provenance):
@@ -33,6 +38,8 @@ def write_chromosome_moments(path, moments, *, provenance):
     arrays, scalar = {}, {}
     for field in fields(moments):
         value = getattr(moments, field.name)
+        if value is None and field.name in _OPTIONAL_CHROMOSOME_ARRAYS:
+            continue  # absent optional arrays keep the earlier manifest layout
         (arrays if isinstance(value, np.ndarray) else scalar)[field.name] = value
     manifest = dict(schema=CHROMOSOME_LD_POLICY, scalar=scalar, provenance=provenance,
                     arrays={name: array_sha256(value) for name, value in arrays.items()})
@@ -67,6 +74,9 @@ class ChromosomeMoments:
     block_directed: np.ndarray
     block_genetic_rhs: np.ndarray
     block_genetic_residual: np.ndarray
+    # This chromosome's same-person matrix at the intercept pairs, in raw
+    # (mass-free) units: D_c[(a,0),(b,0)] * M_a * M_b.  K x K, person-summed.
+    same_person_intercept: np.ndarray | None = None
 
     def __post_init__(self):
         if self.chromosome not in tuple(map(str, range(1, 23))) or not self.cohort_identity:
@@ -96,6 +106,24 @@ class ChromosomeMoments:
                 or self.block_genetic_residual.shape[:2] != (b, c)
                 or self.block_genetic_residual.shape[2] < 1):
             raise ValueError("incompatible chromosome moment axes")
+        if self.same_person_intercept is not None:
+            value = np.asarray(self.same_person_intercept, dtype=float)
+            if (value.shape != (k, k) or not np.isfinite(value).all()
+                    or not np.allclose(value, value.T, rtol=1e-12, atol=0)):
+                raise ValueError("same_person_intercept must be a finite symmetric K x K array")
+            object.__setattr__(self, 'same_person_intercept', owned_readonly_array(value))
+
+    def ld_scalars(self, same_person_intercept=None):
+        """Raw per-block intercept LD scalars (blocks x K x K), or None.
+
+        Uses ``same_person_intercept`` (raw K x K) when given, else the stored
+        one. See summit.context.oracle.intercept_ld_scalars.
+        """
+        intercept = self.same_person_intercept if same_person_intercept is None else same_person_intercept
+        if intercept is None:
+            return None
+        return intercept_ld_scalars(self.block_directed*self.residual_rank**2, self.block_masses,
+            intercept, reference_n=self.n_samples, pair_count=self.num_basis*(self.num_basis+1)//2)
 
 
 def reduce_chromosome_result(
@@ -143,10 +171,17 @@ embedded here on the shared genome-wide component axis. No source is rebuilt.
             factor = 1. if left == right else 2.
             rhs[block, pair::p] = factor*(weights.T @ (scores[:, left]*scores[:, right]))
             cross[block, pair::p] = factor*(weights.T @ result.trait_residual_information[lo:hi, pair])
+    # Raw (mass-free) intercept-pair same-person entries of this chromosome.
+    # The native diagonals use local masses; multiply each annotation back.
+    intercepts = np.zeros((k, result.component_kernel_diagonal.shape[1]))
+    intercepts[active] = (result.component_kernel_diagonal[::p]
+        * np.asarray(result.annotation_masses, dtype=float)[:, None])
+    same_intercept = intercepts@intercepts.T
     return ChromosomeMoments(
         str(chromosome), cohort_identity, tuple(annotation_names), tuple(trait_names), q,
         result.component_kernel_diagonal.shape[1],
-        result.residual_rank, labels, masses, directed, rhs, cross)
+        result.residual_rank, labels, masses, directed, rhs, cross,
+        (same_intercept+same_intercept.T)/2)
 
 
 def combine_chromosome_annotations(chunk, weights, annotation_names):
@@ -175,13 +210,16 @@ def combine_chromosome_annotations(chunk, weights, annotation_names):
     transform = np.kron(weights, np.eye(p))
     identity = canonical_sha256(dict(cohort=chunk.cohort_identity,
         annotation_combination=array_sha256(weights), annotation_names=names))
+    intercept = (None if chunk.same_person_intercept is None
+                 else weights.T@chunk.same_person_intercept@weights)
     return ChromosomeMoments(
         chunk.chromosome, identity, names, chunk.trait_names, chunk.num_basis,
         chunk.n_samples, chunk.residual_rank, chunk.block_ids,
         chunk.block_masses@weights,
         transform.T@chunk.block_directed@transform,
         transform.T@chunk.block_genetic_rhs,
-        transform.T@chunk.block_genetic_residual)
+        transform.T@chunk.block_genetic_residual,
+        None if intercept is None else (intercept+intercept.T)/2)
 
 
 def joint_chromosome_equations(
@@ -272,12 +310,27 @@ def transferred_chromosome_equations(
     expected_chromosomes=None, study_same_person=None,
     same_person_transport=None, reference_kernel_diagonal=None,
     study_rows=None, reference_fourth_moments=None,
-    study_fourth_moments=None,
+    study_fourth_moments=None, reference_second_moments=None,
+    study_second_moments=None, reference_same_person_intercepts=None,
+    different_person_transport=None,
 ):
     """Transfer one shared chromosome reference to one trait's exact moments.
 
-    The distinct-person part of the reference Gram is scaled by
-    n_S(n_S-1)/(n_R(n_R-1)); the same-person part is the study's own term:
+    ``T_S = D_S + s (T_R - D_R) + kron(L, F_S - s F_R)``, s = n_S(n_S-1)/(n_R(n_R-1)).
+
+    Different-person part (``different_person_transport``):
+
+    - "composition_corrected" when every reference chromosome has its raw
+      intercept same-person entries (``reference_same_person_intercepts``, a
+      mapping chromosome -> K x K, or the chunks' ``same_person_intercept``)
+      and both cohorts' context second and fourth moments are given. ``L`` sums
+      the retained blocks' raw LD scalars (ChromosomeMoments.ld_scalars) over
+      the retained annotation masses of this deletion, the masses that
+      normalize the deleted T_R; ``F`` is distinct_pair_exposure(M, G).
+    - else "scaled_legacy" (s O_R only), with a DifferentPersonTransportWarning
+      when the sizes differ unless requested explicitly.
+
+    Same-person part (``same_person_transport``):
 
     - ``study_same_person`` (C x C), when the caller formed it, with
       ``same_person_transport`` naming how ("own_rows_exact" or
@@ -291,15 +344,17 @@ def transferred_chromosome_equations(
     - else the legacy ``(n_S/n_R) D_R``, with a SamePersonTransportWarning when
       the sizes differ unless ``same_person_transport="scaled_legacy"``.
 
-    The choice is recorded as ``same_person_transport`` on the returned
-    equations. For approximate target-row deletions the full study term is
-    reused, as the full reference D_R is; callers looping over deletions
-    should form it once and pass ``study_same_person``. Shared
-    environment/covariate definitions, compatible populations and identical
-    genotype affine scaling remain caller requirements.
+    Both choices are recorded on the returned equations. For approximate
+    target-row deletions the full study same-person term is reused, as the
+    full reference D_R is; callers looping over deletions should form it once
+    and pass ``study_same_person`` (ChromosomeTransport.for_study does this).
+    Shared environment/covariate definitions, compatible populations and
+    identical genotype affine scaling remain caller requirements.
     """
     from dataclasses import replace
-    from summit.context.oracle import resolve_study_same_person, transfer_reference_gram
+    from summit.context.oracle import (
+        different_person_correction, resolve_different_person_exposure,
+        resolve_study_same_person, transfer_reference_gram)
 
     ref, study = tuple(reference_chromosomes), tuple(study_chromosomes)
     if not ref or not study:
@@ -337,12 +392,139 @@ def transferred_chromosome_equations(
             reference_fourth_moments=reference_fourth_moments,
             study_fourth_moments=study_fourth_moments,
             requested=same_person_transport, stacklevel=2)
+    intercepts = reference_same_person_intercepts
+    if intercepts is None and all(x.same_person_intercept is not None for x in ref):
+        intercepts = {x.chromosome: x.same_person_intercept for x in ref}
+    if intercepts is not None and set(map(str, intercepts)) != set(ref_by_chr):
+        raise ValueError('same-person intercepts must cover every reference chromosome')
+    exposure, different_transport = resolve_different_person_exposure(
+        reference_n=reference.reference_n, study_n=target.study_n,
+        reference_second_moments=reference_second_moments,
+        reference_fourth_moments=reference_fourth_moments,
+        study_second_moments=study_second_moments,
+        study_fourth_moments=study_fourth_moments,
+        ld_scalars_available=intercepts is not None,
+        requested=different_person_transport, stacklevel=2)
+    correction = None
+    if exposure is not None:
+        lookup = {str(key): value for key, value in intercepts.items()}
+        deleted = tuple(deleted_blocks)
+        scalars = np.concatenate([x.ld_scalars(lookup[x.chromosome]) for x in ref])
+        keep = np.concatenate([~np.isin(x.block_ids, deleted) for x in ref])
+        correction = different_person_correction(
+            scalars, exposure, masses=reference.annotation_masses, retained=keep)
     transferred = transfer_reference_gram(reference.reference_genetic_gram,
         reference_same_person, reference_n=reference.reference_n, study_n=target.study_n,
-        study_same_person=study_same)
+        study_same_person=study_same, different_person_correction=correction)
     matrix = target.matrix.copy()
     matrix[:c, :c] = transferred
     return replace(target, matrix=matrix,
         reference_genetic_gram=reference.reference_genetic_gram,
         transferred_genetic_gram=transferred, reference_n=reference.reference_n,
-        same_person_transport=transport)
+        same_person_transport=transport,
+        different_person_transport=different_transport)
+
+
+def chromosome_same_person_intercept(diagonal, masses):
+    """Raw intercept same-person entries (K x K) of one chromosome.
+
+    ``diagonal`` is the chromosome's sample-aligned C x N component diagonal
+    normalized by ``masses`` (the K annotation masses, e.g. the genome-wide
+    masses of a reference_aux ``global_kernel_diagonal``). Only its intercept
+    rows are used: ``x = diagonal[::P] * masses``, returning ``x x'``.
+    """
+    d = np.asarray(diagonal, dtype=float)
+    m = np.asarray(masses, dtype=float)
+    if d.ndim != 2 or m.ndim != 1 or d.shape[0] % len(m) or not np.isfinite(d).all():
+        raise ValueError('diagonal must be a finite C by N array with C a multiple of K')
+    pairs = d.shape[0]//len(m)
+    x = d[::pairs]*m[:, None]
+    value = x@x.T
+    return (value+value.T)/2
+
+
+@dataclass(frozen=True)
+class ChromosomeTransport:
+    """Reference-side inputs of the own-row, composition-corrected transport.
+
+    Built once per reference root by :func:`prepare_chromosome_transport`.
+    :meth:`for_study` returns the keyword arguments of
+    :func:`transferred_chromosome_equations` for one trait's rows, so loops
+    over jackknife deletions reuse every study-level term.
+    """
+    reference_n: int
+    diagonal: np.ndarray
+    reference_same_person: np.ndarray
+    same_person_intercepts: dict
+    basis: np.ndarray
+    reference_second_moments: np.ndarray
+    reference_fourth_moments: np.ndarray
+
+    def for_study(self, rows):
+        from summit.context.oracle import exact_study_same_person
+        from summit.context.spec import context_fourth_moments, context_second_moments
+        return dict(
+            reference_same_person=self.reference_same_person,
+            study_same_person=exact_study_same_person(self.diagonal, rows),
+            same_person_transport='own_rows_exact',
+            reference_same_person_intercepts=self.same_person_intercepts,
+            reference_second_moments=self.reference_second_moments,
+            reference_fourth_moments=self.reference_fourth_moments,
+            study_second_moments=context_second_moments(self.basis, rows),
+            study_fourth_moments=context_fourth_moments(self.basis, rows))
+
+
+def prepare_chromosome_transport(reference_chromosomes, reference_chromosome_diagonals,
+                                 basis, *, diagonal_masses=None):
+    """Prepare a reference root for own-row, composition-corrected transport.
+
+    ``reference_chromosome_diagonals`` maps each chromosome to its C x N
+    per-person component diagonal normalized by ``diagonal_masses`` (default:
+    the genome-wide annotation masses, the sum of every chunk's block masses,
+    as in reference_aux ``global_kernel_diagonal``). ``basis`` is the
+    reference's N x Q context basis, first column constant one. The genome-wide
+    D_R uses the summed diagonals, so it includes cross-chromosome products.
+    """
+    from summit.context.oracle import exact_study_same_person
+    from summit.context.spec import context_fourth_moments, context_second_moments
+    ref = tuple(reference_chromosomes)
+    if not ref:
+        raise ValueError('reference chromosomes are required')
+    lookup = {str(key): value for key, value in reference_chromosome_diagonals.items()}
+    if set(lookup) != {x.chromosome for x in ref}:
+        raise ValueError('diagonals must cover exactly the reference chromosomes')
+    n = ref[0].n_samples
+    k, p = len(ref[0].annotation_names), ref[0].num_basis*(ref[0].num_basis+1)//2
+    masses = (sum(x.block_masses.sum(axis=0) for x in ref) if diagonal_masses is None
+              else np.asarray(diagonal_masses, dtype=float))
+    phi = np.asarray(basis, dtype=float)
+    if phi.shape != (n, ref[0].num_basis) or not np.array_equal(phi[:, 0], np.ones(n)):
+        raise ValueError('basis must be N x Q and begin with the constant-one column')
+    total = None
+    intercepts = {}
+    for chunk in ref:
+        d = np.asarray(lookup[chunk.chromosome], dtype=float)
+        if d.shape != (k*p, n):
+            raise ValueError('chromosome diagonal axes disagree with the reference')
+        intercepts[chunk.chromosome] = chromosome_same_person_intercept(d, masses)
+        total = d.copy() if total is None else total+d
+    total.setflags(write=False)
+    return ChromosomeTransport(
+        reference_n=n, diagonal=total,
+        reference_same_person=exact_study_same_person(total, np.arange(n)),
+        same_person_intercepts=intercepts, basis=phi,
+        reference_second_moments=context_second_moments(phi),
+        reference_fourth_moments=context_fourth_moments(phi))
+
+
+def own_row_transported_equations(reference_chromosomes, study_chromosomes, *, transport,
+                                  study_rows, **moments):
+    """One call: own-row exact same-person and composition-corrected
+    different-person transport of a prepared reference to one trait.
+
+    ``moments`` are the remaining transferred_chromosome_equations arguments
+    (reference/study residual moments, residual_names, deleted_blocks,
+    expected_chromosomes).
+    """
+    return transferred_chromosome_equations(reference_chromosomes, study_chromosomes,
+        **transport.for_study(study_rows), **moments)

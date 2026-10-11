@@ -155,15 +155,16 @@ annotation masses, and reuses the full same-person matrix.
 ## Reference transfer and fitting
 
 A reference Gram is moved to a study of N_S people by separating its
-same-person part D from its different-person part:
+same-person part D from its different-person part O = T − D. Both depend on
+the contexts of the people included, so both are formed for the study's own
+people:
 
 ```math
-T_S=D_S+\frac{N_S(N_S-1)}{N_R(N_R-1)}(T_R-D_R).
+T_S=D_S+s\,(T_R-D_R)+\Delta_O,\qquad s=\frac{N_S(N_S-1)}{N_R(N_R-1)}.
 ```
 
-The different-person scaling assumes that reference and study sample the same
-relevant genotype–context distribution. The same-person part is formed for the
-study's own people, because it depends on the fourth moments of their contexts.
+### Same-person part
+
 A person's kernel diagonal is `d_(a,p)(i) = kappa_p phi_q(i) phi_r(i) h_a(i)`
 for annotation a and context pair p = (q, r), with `kappa_p` equal to 1 when
 q = r and 2 otherwise, and `h_a(i)` the person's projected squared-genotype mass.
@@ -184,17 +185,67 @@ Fits use the first available of three terms.
    annotation-major, which fixes the Kronecker order. The form is exact when
    the study is the reference, unbiased for an exchangeable subset, and
    otherwise corrects the difference in context composition. It neglects the
-   weak dependence of `h` on the contexts. G is a person-summed aggregate and
-   can be released like D_R.
+   weak dependence of `h` on the contexts.
 3. **Legacy scaling** `D_S = (N_S/N_R) D_R`, used only when neither input is
-   available. It is biased when missingness depends on the contexts, and fits
-   warn (`SamePersonTransportWarning`) when it is used with N_S ≠ N_R.
+   available.
 
-Fits record the choice as `same_person_transport` (`own_rows_exact`,
-`fourth_moment_difference` or `scaled_legacy`). Approximate jackknife
-deletions reuse the full study term, as they reuse the full reference D_R.
 The exact term uses diagonals computed with the reference projector; when the
 covariates are few relative to N, they differ little from the study projector's.
+
+### Different-person part
+
+`s O_R` assumes the study is an exchangeable subset of the reference. The
+composition correction is the difference form of the factorized model
+(cross-trait mode `factorized_plus_residual`):
+
+```math
+\Delta_O=\sum_b \ell_b\otimes(F_S-sF_R),\qquad
+F=\mathrm{saved}(M\otimes M)-G.
+```
+
+- `M = sum_i phi(i) phi(i)'` (Q×Q) and G are each cohort's context second and
+  fourth moments. `F[p,s]` sums `M[a,c] M[b,d]` over the orientations (a,b) of
+  pair p and (c,d) of pair s. It equals the sum over distinct people `i ≠ j`
+  of the context products that multiply their kernel entries.
+- `ell_b` (K×K) is block b's intercept-pair LD scalar. With the block's raw
+  Gram numerator `N_b` (for example `residual_rank^2 * block_directed`) and the
+  same-person matrix in raw units `D_raw[a,c] = D[(a,0),(c,0)] M_a M_c`,
+
+  ```math
+  \ell_b[a,c]=\frac{N_b[(a,0),(c,0)]-\mathrm{frac}_b[a]\,D_{\mathrm{raw}}[a,c]}
+  {N_R(N_R-1)\,m_a m_c},\qquad \mathrm{frac}_b[a]=\frac{A_b[a]}{\sum_{b'} A_{b'}[a]}.
+  ```
+
+  `A_b` is the block's annotation mass. The same-person matrix is apportioned
+  to blocks by each row annotation's block mass fraction. For chromosome
+  references the sum over blocks and the same-person matrix are per
+  chromosome. `m` are the annotation masses that normalize the reference Gram.
+
+The correction is exactly zero when the study is the reference
+(`F_S = F_R`, `s = 1`), and only corrects the difference in context
+composition. A basis with only the constant column gives `F_S = s F_R`, so no
+correction.
+
+### Selection, labels and jackknife
+
+Each part uses its corrected form whenever its inputs are present. Otherwise
+the fit keeps the legacy term, which is biased when missingness depends on the
+contexts. It warns (`SamePersonTransportWarning`,
+`DifferentPersonTransportWarning`) when the legacy term is used with N_S ≠ N_R,
+unless the caller requested it explicitly. Fits record the choices as
+`same_person_transport` (`own_rows_exact`, `fourth_moment_difference` or
+`scaled_legacy`) and `different_person_transport` (`composition_corrected` or
+`scaled_legacy`).
+
+Approximate jackknife deletions reuse the full study same-person term, as they
+reuse the full reference D_R. For the different-person correction each
+deletion drops the deleted blocks' `ell_b`. It divides the retained raw
+numerators by that deletion's retained annotation masses, the masses that
+normalize the deleted reference Gram. Equivalently, `ell_b` at full masses is
+multiplied by `(M_a M_c)/(m_a m_c)`.
+
+All inputs are person-summed aggregates (D, G, M and the block numerators)
+and can be released with a summary reference.
 
 These factors use sample counts, not residual rank. Genetic–residual and
 residual-only moments are computed in the study cohort. Traits are projected

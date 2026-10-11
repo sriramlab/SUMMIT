@@ -22,12 +22,17 @@ import psutil
 from scipy.optimize import minimize
 
 from .oracle import (
+    DIFFERENT_PERSON_TRANSPORTS,
     SAME_PERSON_TRANSPORTS,
     SymmetricRankDiagnostics,
     _finite_float64,
     coefficients_to_omegas,
     context_covariance_surface,
     omegas_to_coefficients,
+    different_person_correction,
+    intercept_ld_scalars,
+    raw_same_person_intercept,
+    resolve_different_person_exposure,
     resolve_study_same_person,
     transfer_reference_gram,
 )
@@ -78,6 +83,8 @@ class ContextNormalEquations:
     # How the study same-person term of a transported Gram was formed (one of
     # SAME_PERSON_TRANSPORTS); None for systems that use exact study moments.
     same_person_transport: str | None = None
+    # How its different-person part was formed (DIFFERENT_PERSON_TRANSPORTS).
+    different_person_transport: str | None = None
 
     def __post_init__(self) -> None:
         if (
@@ -86,6 +93,14 @@ class ContextNormalEquations:
         ):
             raise ValueError(
                 f"same_person_transport must be None or one of {SAME_PERSON_TRANSPORTS}."
+            )
+        if (
+            self.different_person_transport is not None
+            and self.different_person_transport not in DIFFERENT_PERSON_TRANSPORTS
+        ):
+            raise ValueError(
+                "different_person_transport must be None or one of "
+                f"{DIFFERENT_PERSON_TRANSPORTS}."
             )
         object.__setattr__(self, "component_names", tuple(self.component_names))
         object.__setattr__(self, "deleted_groups", tuple(self.deleted_groups))
@@ -330,12 +345,33 @@ def assemble_context_normal_equations(
         reference_fourth_moments=getattr(reference, "context_fourth_moments", None),
         study_fourth_moments=getattr(summary, "context_fourth_moments", None),
     )
+    exposure, different_transport = resolve_different_person_exposure(
+        reference_n=reference.n_samples,
+        study_n=summary.n_samples,
+        reference_second_moments=getattr(reference, "context_second_moments", None),
+        reference_fourth_moments=getattr(reference, "context_fourth_moments", None),
+        study_second_moments=getattr(summary, "context_second_moments", None),
+        study_fourth_moments=getattr(summary, "context_fourth_moments", None),
+    )
+    correction = None
+    if exposure is not None:
+        scalars, labels = development_reference_ld_scalars(reference)
+        deleted = set(groups)
+        correction = different_person_correction(
+            scalars,
+            exposure,
+            masses=reference_moments.annotation_masses,
+            retained=np.fromiter(
+                (label not in deleted for label in labels), dtype=bool, count=len(labels)
+            ),
+        )
     transferred = transfer_reference_gram(
         reference_moments.gram,
         reference_moments.same_person,
         reference_n=reference.n_samples,
         study_n=summary.n_samples,
         study_same_person=study_same_person,
+        different_person_correction=correction,
     )
     p_genetic = len(summary.component_index)
     h_count = len(summary.residual_names)
@@ -363,7 +399,37 @@ def assemble_context_normal_equations(
         reference_n=reference.n_samples,
         study_n=summary.n_samples,
         same_person_transport=transport,
+        different_person_transport=different_transport,
     )
+
+
+def development_reference_ld_scalars(
+    reference: ContextReference | GroupedContextReference,
+) -> tuple[np.ndarray, tuple[str, ...]]:
+    """Raw intercept-pair LD scalars per contribution unit, with unit labels.
+
+    Units are the stored contributions: frozen LOO groups for a grouped
+    reference, single SNPs (labelled by their LOO group) otherwise.  The
+    contributions are symmetric raw Gram numerators, so off-diagonal annotation
+    entries use the symmetrized numerator (their sum over units is unchanged).
+    """
+    pair_count = len(reference.component_index.pair_index)
+    if isinstance(reference, GroupedContextReference) or hasattr(
+        reference, "group_annotation_masses"
+    ):
+        unit_masses = reference.group_annotation_masses
+    else:
+        unit_masses = reference.annotation_weights
+    scalars = intercept_ld_scalars(
+        reference.gram_numerator_contributions,
+        unit_masses,
+        raw_same_person_intercept(
+            reference.same_person, reference.annotation_masses, pair_count=pair_count
+        ),
+        reference_n=reference.n_samples,
+        pair_count=pair_count,
+    )
+    return scalars, tuple(reference.loo_group_ids)
 
 
 def _rank_diagnostics(
@@ -1139,6 +1205,7 @@ def fit_context_model(
             "ordering": "genetic_annotation_major_pair_minor_then_residual",
             "genetic_transfer": "N_and_N_times_N_minus_1",
             "same_person_transport": equations.same_person_transport,
+            "different_person_transport": equations.different_person_transport,
             "residual_elimination": False,
         },
         "solve": {
@@ -1543,6 +1610,9 @@ def load_context_fit(
         # Fits written before the choice was recorded used the legacy scaling.
         same_person_transport=payload.get("assembly", {}).get(
             "same_person_transport", "scaled_legacy"
+        ),
+        different_person_transport=payload.get("assembly", {}).get(
+            "different_person_transport", "scaled_legacy"
         ),
     )
     projection_payload = payload.get("projection_result")

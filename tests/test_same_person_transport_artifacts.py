@@ -29,10 +29,14 @@ from summit.context import (
     write_context_reference,
     write_context_trait_summary,
 )
+from summit.context.fit import development_reference_ld_scalars
 from summit.context.oracle import (
     SamePersonTransportWarning,
     approximate_study_same_person,
     context_fourth_moments,
+    context_second_moments,
+    different_person_correction,
+    resolve_different_person_exposure,
     dense_genetic_kernels,
     exact_study_same_person,
     kernel_gram,
@@ -168,6 +172,7 @@ def _reference(genotype, basis, fixed, annotations, names, block_ids, labels, pr
         "block_annotation_mass": block_masses,
         "same_person": result.same_person,
         "context_fourth_moments": context_fourth_moments(basis),
+        "context_second_moments": context_second_moments(basis),
     }
     if mode == "composable":
         arrays.update(
@@ -290,9 +295,19 @@ def test_development_artifacts_round_trip_fourth_moments_and_change_the_fit(
     np.testing.assert_array_equal(
         loaded_summary.context_fourth_moments, summary.context_fourth_moments
     )
+    np.testing.assert_array_equal(
+        loaded_reference.context_second_moments, context_second_moments(design["basis"])
+    )
+    np.testing.assert_array_equal(
+        loaded_summary.context_second_moments,
+        context_second_moments(design["basis"], design["rows"]),
+    )
     fit = fit_context_model(loaded_reference, loaded_summary)
     assert fit.manifest["assembly"]["same_person_transport"] == (
         "fourth_moment_difference"
+    )
+    assert fit.manifest["assembly"]["different_person_transport"] == (
+        "composition_corrected"
     )
     study_same = approximate_study_same_person(
         reference.same_person,
@@ -302,6 +317,15 @@ def test_development_artifacts_round_trip_fourth_moments_and_change_the_fit(
         study_n=summary.n_samples,
         annotation_count=1,
     )
+    exposure, _ = resolve_different_person_exposure(
+        reference_n=reference.n_samples,
+        study_n=summary.n_samples,
+        reference_second_moments=reference.context_second_moments,
+        reference_fourth_moments=reference.context_fourth_moments,
+        study_second_moments=summary.context_second_moments,
+        study_fourth_moments=summary.context_fourth_moments,
+    )
+    scalars, _ = development_reference_ld_scalars(reference)
     np.testing.assert_allclose(
         fit.equations.transferred_genetic_gram,
         transfer_reference_gram(
@@ -310,8 +334,11 @@ def test_development_artifacts_round_trip_fourth_moments_and_change_the_fit(
             reference_n=reference.n_samples,
             study_n=summary.n_samples,
             study_same_person=study_same,
+            different_person_correction=different_person_correction(
+                scalars, exposure, masses=reference.annotation_masses
+            ),
         ),
-        rtol=1e-14,
+        rtol=1e-13,
     )
     legacy = _expected()["context_raw_coefficients"]
     assert not np.allclose(fit.raw_coefficients, legacy, rtol=1e-6)
@@ -348,10 +375,16 @@ def test_generalized_artifacts_round_trip_and_compose_fourth_moments(
     np.testing.assert_array_equal(
         summary.context_fourth_moments, context_fourth_moments(design["basis"])
     )
+    np.testing.assert_array_equal(
+        summary.context_second_moments, context_second_moments(design["basis"])
+    )
     path = write_generalized_gxe_variant_reference_v1(summary, tmp_path / "public")
     loaded = load_generalized_gxe_variant_reference_v1(path)
     np.testing.assert_array_equal(
         loaded.context_fourth_moments, summary.context_fourth_moments
+    )
+    np.testing.assert_array_equal(
+        loaded.context_second_moments, summary.context_second_moments
     )
     rows = design["rows"]
     trait = _trait(
@@ -369,6 +402,9 @@ def test_generalized_artifacts_round_trip_and_compose_fourth_moments(
     np.testing.assert_array_equal(
         loaded_trait.context_fourth_moments, context_fourth_moments(design["basis"], rows)
     )
+    np.testing.assert_array_equal(
+        loaded_trait.context_second_moments, context_second_moments(design["basis"], rows)
+    )
     reaggregated = reaggregate_generalized_gxe_trait_summary(
         loaded_trait,
         annotations=annotations,
@@ -382,9 +418,11 @@ def test_generalized_artifacts_round_trip_and_compose_fourth_moments(
     fit = fit_generalized_gxe_variant_model_v1(loaded, reaggregated)
     assert fit.manifest["same_person_transport"] == "fourth_moment_difference"
     exact = fit_generalized_gxe_variant_model_v1(
-        composable, reaggregated, study_rows=rows
+        composable, reaggregated, study_rows=rows,
+        different_person_transport="scaled_legacy",
     )
     assert exact.manifest["same_person_transport"] == "own_rows_exact"
+    assert exact.manifest["different_person_transport"] == "scaled_legacy"
     np.testing.assert_allclose(
         exact.transferred_genetic_gram,
         transfer_reference_gram(
@@ -397,6 +435,27 @@ def test_generalized_artifacts_round_trip_and_compose_fourth_moments(
             ),
         ),
         rtol=1e-14,
+    )
+    corrected = fit_generalized_gxe_variant_model_v1(
+        composable, reaggregated, study_rows=rows
+    )
+    assert corrected.manifest["different_person_transport"] == "composition_corrected"
+    exposure, _ = resolve_different_person_exposure(
+        reference_n=composable.n_samples,
+        study_n=len(rows),
+        reference_second_moments=composable.context_second_moments,
+        reference_fourth_moments=composable.context_fourth_moments,
+        study_second_moments=reaggregated.context_second_moments,
+        study_fourth_moments=reaggregated.context_fourth_moments,
+    )
+    correction = different_person_correction(
+        composable.ld_scalars, exposure, masses=composable.annotation_masses
+    )
+    np.testing.assert_allclose(
+        corrected.transferred_genetic_gram - exact.transferred_genetic_gram,
+        0.5 * (correction + correction.T),
+        rtol=1e-10,
+        atol=1e-12,
     )
     # A source without fourth moments (an older bundle) leaves them out.
     older = dataclasses.replace(composable, context_fourth_moments=None)
@@ -492,7 +551,10 @@ def test_selectively_missing_study_recovers_its_own_gram_fit_with_the_fix() -> N
     )
     fits = {
         "scaled_legacy": fit_generalized_gxe_variant_model_v1(
-            reference, trait, same_person_transport="scaled_legacy"
+            reference,
+            trait,
+            same_person_transport="scaled_legacy",
+            different_person_transport="scaled_legacy",
         ),
         "fourth_moment_difference": fit_generalized_gxe_variant_model_v1(
             reference, trait
@@ -544,6 +606,14 @@ def test_deleted_systems_reuse_the_full_study_same_person_term() -> None:
     systems = assemble_generalized_gxe_normal_equation_batch_v1(
         reference, trait, deleted_block_sets=((), *((label,) for label in labels))
     )
+    exposure, _ = resolve_different_person_exposure(
+        reference_n=reference.n_samples,
+        study_n=trait.n_samples,
+        reference_second_moments=reference.context_second_moments,
+        reference_fourth_moments=reference.context_fourth_moments,
+        study_second_moments=trait.context_second_moments,
+        study_fourth_moments=trait.context_fourth_moments,
+    )
     study_same = approximate_study_same_person(
         reference.same_person,
         reference.context_fourth_moments,
@@ -554,7 +624,16 @@ def test_deleted_systems_reuse_the_full_study_same_person_term() -> None:
     )
     for deleted, system in zip(((), *((label,) for label in labels)), systems):
         assert system.same_person_transport == "fourth_moment_difference"
+        assert system.different_person_transport == "composition_corrected"
         moments = reference_moments_after_deleting_variant_blocks_v1(reference, deleted)
+        # The different-person correction drops the deleted block's LD scalar
+        # and uses the retained masses of this deletion.
+        correction = different_person_correction(
+            reference.ld_scalars,
+            exposure,
+            masses=moments.annotation_masses,
+            retained=np.asarray([label not in deleted for label in labels]),
+        )
         np.testing.assert_array_equal(
             system.transferred_genetic_gram,
             transfer_reference_gram(
@@ -563,6 +642,7 @@ def test_deleted_systems_reuse_the_full_study_same_person_term() -> None:
                 reference_n=reference.n_samples,
                 study_n=trait.n_samples,
                 study_same_person=study_same,
+                different_person_correction=correction,
             ),
         )
 
@@ -609,8 +689,12 @@ def _development_selective_fits(seed: int):
     fixed = fit_context_model(reference, summary)
     with pytest.warns(SamePersonTransportWarning):
         legacy = fit_context_model(
-            dataclasses.replace(reference, context_fourth_moments=None), summary
+            dataclasses.replace(
+                reference, context_fourth_moments=None, context_second_moments=None
+            ),
+            summary,
         )
+    assert legacy.manifest["assembly"]["different_person_transport"] == "scaled_legacy"
     np.testing.assert_array_equal(
         target.equations.transferred_genetic_gram, matched.gram
     )
@@ -690,6 +774,10 @@ def test_transform_scan_carries_study_fourth_moments(tmp_path: Path) -> None:
     np.testing.assert_array_equal(
         loaded.context_fourth_moments, summary.context_fourth_moments
     )
+    np.testing.assert_array_equal(
+        loaded.context_second_moments, context_second_moments(design["basis"], rows)
+    )
     fit = fit_context_transform_scan(reference, loaded)
     assert fit.equations.same_person_transport == "fourth_moment_difference"
     assert fit.manifest["same_person_transport"] == "fourth_moment_difference"
+    assert fit.manifest["different_person_transport"] == "composition_corrected"

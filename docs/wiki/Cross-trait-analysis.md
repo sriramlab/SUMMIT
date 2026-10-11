@@ -54,6 +54,11 @@ does not establish calibration for every sampling design. The last mode needs
 compatible Z summaries. Reference-mode choice does not change the scientific
 definition of the ordered cross-trait covariance.
 
+Within-trait fits through `transferred_chromosome_equations` use the
+`factorized_plus_residual` treatment of the different-person part with own-row
+same-person terms, assembled with the joint chromosome profile
+([Chromosome LD](Chromosome-LD-and-annotation-prediction.md#transferring-a-shared-reference-to-a-trait)).
+
 ## Uncertainty and interpretation
 
 `baseline_rg` uses the original context origin; `centered_baseline_rg` uses

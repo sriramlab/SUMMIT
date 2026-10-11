@@ -47,8 +47,10 @@ from .spec import (
     canonical_json,
     canonical_sha256,
     context_fourth_moments,
+    context_second_moments,
     freeze_context_mapping,
     validate_context_fourth_moments,
+    validate_context_second_moments,
 )
 
 
@@ -85,8 +87,11 @@ _ARRAY_NAMES = (
 )
 # Optional study context fourth moments G_S (P x P) over the trait's own
 # people; older artifacts omit both the array and its layout entry.
-_OPTIONAL_ARRAY_NAMES = ("context_fourth_moments",)
-_OPTIONAL_LAYOUTS = {"context_fourth_moments": ["context_pair", "context_pair"]}
+_OPTIONAL_ARRAY_NAMES = ("context_fourth_moments", "context_second_moments")
+_OPTIONAL_LAYOUTS = {
+    "context_fourth_moments": ["context_pair", "context_pair"],
+    "context_second_moments": ["basis", "basis"],
+}
 _FILE_KEYS = frozenset(
     (*_ARRAY_NAMES, *_OPTIONAL_ARRAY_NAMES, "manifest_json", "manifest_sha256")
 )
@@ -1792,6 +1797,8 @@ class ContextualTraitArtifactV1:
     group_variant_counts: np.ndarray
     # Study context fourth moments G_S (P x P); None when not recorded.
     context_fourth_moments: np.ndarray | None = None
+    # Context second moments M (Q x Q); None when not published.
+    context_second_moments: np.ndarray | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.component_index, ContextComponentIndex):
@@ -1814,6 +1821,16 @@ class ContextualTraitArtifactV1:
                     _immutable_array(self.context_fourth_moments, dtype=np.float64),
                     len(self.component_index.pair_index),
                     name="Contextual trait V1 context_fourth_moments",
+                ),
+            )
+        if self.context_second_moments is not None:
+            object.__setattr__(
+                self,
+                "context_second_moments",
+                validate_context_second_moments(
+                    _immutable_array(self.context_second_moments, dtype=np.float64),
+                    self.component_index.pair_index.num_basis,
+                    name="Contextual trait V1 context_second_moments",
                 ),
             )
         manifest = _json_value(self.manifest)
@@ -2024,6 +2041,7 @@ def _expected_shapes(dimensions: Mapping[str, int]) -> dict[str, tuple[int, ...]
         "group_annotation_masses": (j, k),
         "group_variant_counts": (j,),
         "context_fourth_moments": (dimensions["P_g"], dimensions["P_g"]),
+        "context_second_moments": (dimensions["Q"], dimensions["Q"]),
     }
 
 
@@ -2658,6 +2676,9 @@ def adapt_native_contextual_trait_v1(
             raise ValueError("Supplied study basis has the wrong shape.")
         arrays["context_fourth_moments"] = _immutable_array(
             context_fourth_moments(values), dtype=np.float64
+        )
+        arrays["context_second_moments"] = _immutable_array(
+            context_second_moments(values), dtype=np.float64
         )
     scientific_values = {**native_arrays, **expected_maps}
     for name, value in scientific_values.items():

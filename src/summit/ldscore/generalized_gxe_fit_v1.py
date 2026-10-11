@@ -20,7 +20,9 @@ from summit.context.fit_v1 import (
 )
 from summit.context.oracle import (
     coefficients_to_omegas,
+    different_person_correction,
     omegas_to_coefficients,
+    resolve_different_person_exposure,
     resolve_study_same_person,
 )
 from summit.context.spec import (
@@ -505,6 +507,31 @@ def resolve_generalized_gxe_study_same_person_v1(
     )
 
 
+def resolve_generalized_gxe_different_person_v1(
+    reference: GeneralizedGxEVariantReferenceArtifactV1,
+    trait: GeneralizedGxETraitSummary,
+    *,
+    different_person_transport: str | None = None,
+) -> tuple[np.ndarray | None, str]:
+    """Return ``(F_S - s F_R, label)`` for the different-person transport.
+
+    The composition correction needs the reference's and the trait's context
+    second and fourth moments; the reference's per-block LD scalars are
+    derived from its published block numerators and same-person matrix.
+    Otherwise the legacy scaling is kept, with a warning when the sizes differ.
+    """
+    return resolve_different_person_exposure(
+        reference_n=reference.n_samples,
+        study_n=trait.n_samples,
+        reference_second_moments=reference.context_second_moments,
+        reference_fourth_moments=reference.context_fourth_moments,
+        study_second_moments=trait.context_second_moments,
+        study_fourth_moments=trait.context_fourth_moments,
+        requested=different_person_transport,
+        stacklevel=3,
+    )
+
+
 def assemble_generalized_gxe_normal_equations_v1(
     reference: GeneralizedGxEVariantReferenceArtifactV1,
     trait: GeneralizedGxETraitSummary,
@@ -513,23 +540,18 @@ def assemble_generalized_gxe_normal_equations_v1(
     deleted_blocks: Sequence[str] = (),
     study_rows: object | None = None,
     same_person_transport: str | None = None,
+    different_person_transport: str | None = None,
 ) -> ContextNormalEquations:
     """Use the shared fit assembly from compact reference and trait moments."""
-    validate_generalized_gxe_trait_compatibility_v1(reference, trait)
-    study_same_person, transport = resolve_generalized_gxe_study_same_person_v1(
-        reference,
-        trait,
-        study_rows=study_rows,
-        same_person_transport=same_person_transport,
-    )
-    return _assemble_generalized_gxe_normal_equations_prevalidated_v1(
+    return assemble_generalized_gxe_normal_equation_batch_v1(
         reference,
         trait,
         trait_selector=trait_selector,
-        deleted_blocks=deleted_blocks,
-        study_same_person=study_same_person,
-        same_person_transport=transport,
-    )
+        deleted_block_sets=(deleted_blocks,),
+        study_rows=study_rows,
+        same_person_transport=same_person_transport,
+        different_person_transport=different_person_transport,
+    )[0]
 
 
 def _assemble_generalized_gxe_normal_equations_prevalidated_v1(
@@ -540,6 +562,8 @@ def _assemble_generalized_gxe_normal_equations_prevalidated_v1(
     deleted_blocks: Sequence[str],
     study_same_person: np.ndarray | None = None,
     same_person_transport: str | None = None,
+    exposure_difference: np.ndarray | None = None,
+    ld_scalars: np.ndarray | None = None,
 ) -> ContextNormalEquations:
     """Assemble after one enclosing compatibility validation."""
     trait_index, _ = _select_trait(trait, trait_selector)
@@ -552,6 +576,20 @@ def _assemble_generalized_gxe_normal_equations_prevalidated_v1(
         )
     )
     trait_moments = _trait_moments_after_deleting_blocks(trait, requested)
+    correction = None
+    if exposure_difference is not None:
+        # Drop the deleted blocks' LD scalars; normalize by the retained
+        # annotation masses, as the deleted reference Gram is normalized.
+        retained = np.asarray(
+            [label not in set(requested) for label in reference.block_labels],
+            dtype=bool,
+        )
+        correction = different_person_correction(
+            reference.ld_scalars if ld_scalars is None else ld_scalars,
+            exposure_difference,
+            masses=reference_moments.annotation_masses,
+            retained=retained,
+        )
     return assemble_contextual_normal_equations_from_moments_v1(
         component_index=reference.component_index,
         reference_n=reference.n_samples,
@@ -562,6 +600,10 @@ def _assemble_generalized_gxe_normal_equations_prevalidated_v1(
         trait_moments=trait_moments,
         study_same_person=study_same_person,
         same_person_transport=same_person_transport,
+        different_person_correction=correction,
+        different_person_transport=(
+            "scaled_legacy" if correction is None else "composition_corrected"
+        ),
     )
 
 
@@ -573,11 +615,14 @@ def assemble_generalized_gxe_normal_equation_batch_v1(
     deleted_block_sets: Sequence[Sequence[str]],
     study_rows: object | None = None,
     same_person_transport: str | None = None,
+    different_person_transport: str | None = None,
 ) -> tuple[ContextNormalEquations, ...]:
     """Validate once and assemble several full/deleted summary systems.
 
-    The study same-person term is formed once and reused by every deleted
-    system, as the full reference same-person term was.
+    The study same-person term and the exposure difference ``F_S - s F_R``
+    are formed once. Every deleted system reuses the full study same-person
+    term; its different-person correction drops the deleted blocks' LD
+    scalars and uses that deletion's retained annotation masses.
     """
     validate_generalized_gxe_trait_compatibility_v1(reference, trait)
     if isinstance(deleted_block_sets, (str, bytes)):
@@ -588,6 +633,10 @@ def assemble_generalized_gxe_normal_equation_batch_v1(
         study_rows=study_rows,
         same_person_transport=same_person_transport,
     )
+    exposure, _ = resolve_generalized_gxe_different_person_v1(
+        reference, trait, different_person_transport=different_person_transport
+    )
+    scalars = None if exposure is None else reference.ld_scalars
     return tuple(
         _assemble_generalized_gxe_normal_equations_prevalidated_v1(
             reference,
@@ -596,6 +645,8 @@ def assemble_generalized_gxe_normal_equation_batch_v1(
             deleted_blocks=deleted,
             study_same_person=study_same_person,
             same_person_transport=transport,
+            exposure_difference=exposure,
+            ld_scalars=scalars,
         )
         for deleted in deleted_block_sets
     )
@@ -669,12 +720,15 @@ def fit_generalized_gxe_variant_model_v1(
     rtol: float | None = None,
     study_rows: object | None = None,
     same_person_transport: str | None = None,
+    different_person_transport: str | None = None,
 ) -> GeneralizedGxEVariantFitResultV1:
     """Run the existing raw symmetric solve and compact every-block jackknife.
 
     See :func:`resolve_generalized_gxe_study_same_person_v1` for
-    ``study_rows`` and ``same_person_transport``.  The choice is recorded in
-    the fit manifest as ``same_person_transport``.
+    ``study_rows`` and ``same_person_transport`` and
+    :func:`resolve_generalized_gxe_different_person_v1` for
+    ``different_person_transport``.  Both choices are recorded in the fit
+    manifest.
     """
     compatibility = validate_generalized_gxe_trait_compatibility_v1(
         reference, trait
@@ -700,6 +754,7 @@ def fit_generalized_gxe_variant_model_v1(
         deleted_block_sets=((), *((group,) for group in groups)),
         study_rows=study_rows,
         same_person_transport=same_person_transport,
+        different_person_transport=different_person_transport,
     )
     equations = assembled[0]
     solve = solve_context_normal_equations(
@@ -742,6 +797,8 @@ def fit_generalized_gxe_variant_model_v1(
         "jackknife_method": GENERALIZED_GXE_VARIANT_JACKKNIFE_METHOD,
         "same_person_jackknife": "reuse_full_same_person_v1",
         "same_person_transport": equations.same_person_transport,
+        "different_person_transport": equations.different_person_transport,
+        "different_person_jackknife": "drop_deleted_block_ld_scalars_retained_masses_v1",
         "summary_only_fit": True,
         "per_variant_panel_accessed": False,
         "compatibility": dict(compatibility),

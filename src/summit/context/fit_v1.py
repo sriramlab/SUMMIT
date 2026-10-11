@@ -36,9 +36,12 @@ from .fit import (
     solve_context_normal_equations,
 )
 from .oracle import (
+    DIFFERENT_PERSON_TRANSPORTS,
     SAME_PERSON_TRANSPORTS,
     coefficients_to_omegas,
     context_covariance_surface,
+    different_person_correction,
+    resolve_different_person_exposure,
     resolve_study_same_person,
     transfer_reference_gram,
 )
@@ -575,12 +578,17 @@ def assemble_contextual_normal_equations_from_moments_v1(
     trait_moments: ContextualTraitMomentsV1,
     study_same_person: np.ndarray | None = None,
     same_person_transport: str | None = None,
+    different_person_correction: np.ndarray | None = None,
+    different_person_transport: str | None = None,
 ) -> ContextNormalEquations:
     """Assemble the shared population-transfer system from compact moments.
 
     ``study_same_person`` replaces the legacy ``(n_S/n_R) D_R`` and must come
     with its ``same_person_transport`` label.  Deleted systems reuse the full
     study same-person term, as they reuse the full reference ``D_R``.
+    ``different_person_correction`` is this deletion's composition correction
+    (summit.context.oracle.different_person_correction), labelled
+    "composition_corrected"; without it the label is "scaled_legacy".
     """
     requested = tuple(deleted_groups)
     if array_sha256(reference_moments.annotation_masses) != array_sha256(
@@ -598,12 +606,23 @@ def assemble_contextual_normal_equations_from_moments_v1(
             "A study same-person matrix requires its own_rows_exact or "
             "fourth_moment_difference label."
         )
+    if different_person_correction is None:
+        if different_person_transport not in (None, "scaled_legacy"):
+            raise ValueError(
+                f"{different_person_transport!r} requires a different-person correction."
+            )
+        different_person_transport = "scaled_legacy"
+    elif different_person_transport != "composition_corrected":
+        raise ValueError(
+            "A different-person correction requires its composition_corrected label."
+        )
     transferred = transfer_reference_gram(
         reference_moments.gram,
         reference_moments.same_person,
         reference_n=reference_n,
         study_n=trait.n_samples,
         study_same_person=study_same_person,
+        different_person_correction=different_person_correction,
     )
     c = len(component_index)
     h = len(trait.residual_names)
@@ -635,6 +654,7 @@ def assemble_contextual_normal_equations_from_moments_v1(
         reference_n=reference_n,
         study_n=trait.n_samples,
         same_person_transport=same_person_transport,
+        different_person_transport=different_person_transport,
     )
 
 
@@ -673,6 +693,29 @@ def assemble_contextual_normal_equations_v1(
         reference_fourth_moments=reference.context_fourth_moments,
         study_fourth_moments=trait.context_fourth_moments,
     )
+    exposure, _ = resolve_different_person_exposure(
+        reference_n=reference.n_samples,
+        study_n=trait.n_samples,
+        reference_second_moments=reference.context_second_moments,
+        reference_fourth_moments=reference.context_fourth_moments,
+        study_second_moments=trait.context_second_moments,
+        study_fourth_moments=trait.context_fourth_moments,
+    )
+    correction = None
+    if exposure is not None:
+        from .fit import development_reference_ld_scalars
+
+        scalars, labels = development_reference_ld_scalars(reference)
+        correction = different_person_correction(
+            scalars,
+            exposure,
+            masses=reference_moments.annotation_masses,
+            retained=np.fromiter(
+                (label not in set(requested) for label in labels),
+                dtype=bool,
+                count=len(labels),
+            ),
+        )
     return assemble_contextual_normal_equations_from_moments_v1(
         component_index=reference.component_index,
         reference_n=reference.n_samples,
@@ -683,6 +726,10 @@ def assemble_contextual_normal_equations_v1(
         trait_moments=trait_moments,
         study_same_person=study_same_person,
         same_person_transport=transport,
+        different_person_correction=correction,
+        different_person_transport=(
+            "scaled_legacy" if correction is None else "composition_corrected"
+        ),
     )
 
 
@@ -784,6 +831,11 @@ class ContextualFitArtifactV1:
     def same_person_transport(self) -> str:
         """How the transported Gram's same-person term was formed."""
         return str(self.manifest.get("same_person_transport", "scaled_legacy"))
+
+    @property
+    def different_person_transport(self) -> str:
+        """How the transported Gram's different-person term was formed."""
+        return str(self.manifest.get("different_person_transport", "scaled_legacy"))
 
     def verify(self) -> None:
         _validate_artifact(self, _json_value(self.manifest))
@@ -1161,6 +1213,7 @@ def fit_contextual_model_v1(
         },
         "terminal_status": "published",
         "same_person_transport": equations.same_person_transport,
+        "different_person_transport": equations.different_person_transport,
     }
     return ContextualFitArtifactV1(
         manifest=manifest,
@@ -1228,16 +1281,21 @@ def _validate_manifest_before_arrays(
     str,
     int,
 ]:
-    # ``same_person_transport`` is optional: fits written before it was
-    # recorded omit it, and they used the legacy scaled same-person term.
+    # The transport labels are optional: fits written before they were
+    # recorded omit them, and they used the legacy scaled terms.
     if not isinstance(manifest, Mapping) or set(manifest) - {
-        "same_person_transport"
+        "same_person_transport",
+        "different_person_transport",
     } != _MANIFEST_KEYS:
         raise ValueError("Contextual fit V1 manifest key mismatch.")
     if manifest.get("same_person_transport", "scaled_legacy") not in (
         SAME_PERSON_TRANSPORTS
     ):
         raise ValueError("Contextual fit V1 same-person transport is invalid.")
+    if manifest.get("different_person_transport", "scaled_legacy") not in (
+        DIFFERENT_PERSON_TRANSPORTS
+    ):
+        raise ValueError("Contextual fit V1 different-person transport is invalid.")
     if manifest.get("magic") != CONTEXTUAL_FIT_V1_MAGIC:
         raise ValueError("Contextual fit V1 magic mismatch.")
     try:

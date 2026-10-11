@@ -25,6 +25,7 @@ from .oracle import (
     _finite_float64,
     common_scale_features,
     context_fourth_moments,
+    context_second_moments,
     context_kernel_actions,
     dense_genetic_kernels,
     exact_same_person_matrix,
@@ -32,6 +33,7 @@ from .oracle import (
     transfer_reference_gram,
     validate_annotations,
     validate_context_fourth_moments,
+    validate_context_second_moments,
 )
 from .spec import (
     CONTEXT_REFERENCE_KIND,
@@ -78,6 +80,15 @@ def _own_fourth_moments(artifact: Any) -> None:
                 value, len(artifact.component_index.pair_index)
             ),
         )
+    value = getattr(artifact, "context_second_moments")
+    if value is not None:
+        object.__setattr__(
+            artifact,
+            "context_second_moments",
+            validate_context_second_moments(
+                value, artifact.component_index.pair_index.num_basis
+            ),
+        )
 
 
 @dataclass(frozen=True)
@@ -96,6 +107,8 @@ class ContextReference:
     peak_rss_bytes: int
     # Reference context fourth moments G_R (P x P); None when not recorded.
     context_fourth_moments: np.ndarray | None = None
+    # Reference context second moments M_R (Q x Q); None when not recorded.
+    context_second_moments: np.ndarray | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "manifest", freeze_context_mapping(self.manifest))
@@ -165,6 +178,8 @@ class GroupedContextReference:
     peak_rss_bytes: int
     # Reference context fourth moments G_R (P x P); None when not recorded.
     context_fourth_moments: np.ndarray | None = None
+    # Reference context second moments M_R (Q x Q); None when not recorded.
+    context_second_moments: np.ndarray | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "manifest", freeze_context_mapping(self.manifest))
@@ -737,6 +752,7 @@ def build_context_reference(
             phase_times_seconds=phase_times,
             peak_rss_bytes=int(peak_rss),
             context_fourth_moments=fourth_moments,
+            context_second_moments=context_second_moments(basis_array),
         )
     return ContextReference(
         manifest=manifest,
@@ -750,6 +766,7 @@ def build_context_reference(
         phase_times_seconds=phase_times,
         peak_rss_bytes=int(peak_rss),
         context_fourth_moments=fourth_moments,
+        context_second_moments=context_second_moments(basis_array),
     )
 
 
@@ -824,11 +841,11 @@ def write_context_reference(
         prefix=f".{arrays_path.name}.", dir=arrays_path.parent
     )
     try:
-        optional = (
-            {}
-            if reference.context_fourth_moments is None
-            else {"context_fourth_moments": reference.context_fourth_moments}
-        )
+        optional = {
+            name: getattr(reference, name)
+            for name in ("context_fourth_moments", "context_second_moments")
+            if getattr(reference, name) is not None
+        }
         with os.fdopen(descriptor, "wb") as handle:
             if isinstance(reference, GroupedContextReference):
                 np.savez_compressed(
@@ -935,6 +952,13 @@ def load_context_reference(
             raise ValueError("Context-reference fourth moments must be float64.")
         fourth_moments = validate_context_fourth_moments(
             fourth_moments, len(components.pair_index)
+        )
+    second_moments = values.pop("context_second_moments", None)
+    if second_moments is not None:
+        if second_moments.dtype != np.dtype(np.float64):
+            raise ValueError("Context-reference second moments must be float64.")
+        second_moments = validate_context_second_moments(
+            second_moments, components.pair_index.num_basis
         )
     if grouped_format:
         n_groups = int(dimensions.get("loo_groups", 0))
@@ -1094,6 +1118,7 @@ def load_context_reference(
             phase_times_seconds=dict(performance.get("phase_times_seconds", {})),
             peak_rss_bytes=int(performance.get("peak_rss_bytes", 0)),
             context_fourth_moments=fourth_moments,
+            context_second_moments=second_moments,
         )
     expected_shapes = {
         "annotation_weights": (
@@ -1206,4 +1231,5 @@ def load_context_reference(
         phase_times_seconds=dict(performance.get("phase_times_seconds", {})),
         peak_rss_bytes=int(performance.get("peak_rss_bytes", 0)),
         context_fourth_moments=fourth_moments,
+        context_second_moments=second_moments,
     )

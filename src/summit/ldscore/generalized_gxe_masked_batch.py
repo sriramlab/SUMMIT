@@ -11,7 +11,7 @@ from __future__ import annotations
 import numpy as np
 from types import SimpleNamespace
 
-from summit.context.oracle import context_fourth_moments
+from summit.context.oracle import context_fourth_moments, context_second_moments
 from summit.context.spec import ContextPairIndex
 from summit.ldscore.generalized_gxe_trait_summary import (
     _compressed_column_span,
@@ -94,10 +94,11 @@ class MaskedTraitBatch:
             compressed_residual = transform.T @ corrected @ transform
             ds = d[idx]
             leverage = np.sum(fixed*fixed, axis=1)
-            # context_fourth_moments is the trait's own G_S (P x P) for the
-            # release-safe same-person transport of a reference Gram.
+            # The trait's own context moments: G_S (P x P) for the same-person
+            # and with M_S (Q x Q) for the different-person transport.
             common = SimpleNamespace(normalized_phenotypes=y,
                 context_fourth_moments=context_fourth_moments(phi, idx),
+                context_second_moments=context_second_moments(phi, idx),
                 residual_rank=len(idx)-rank, residual_rhs=ds.T @ (y*y),
                 residual_traces=ds.sum(axis=0)-np.trace(compressed_residual, axis1=1, axis2=2),
                 residual_gram=ds.T @ (ds*(1-2*leverage)[:, None])

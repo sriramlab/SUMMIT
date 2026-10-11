@@ -38,6 +38,7 @@ from .oracle import (
     kernel_gram,
     kernel_rhs,
     kernel_traces,
+    resolve_different_person_exposure,
     resolve_study_same_person,
     transfer_reference_gram,
 )
@@ -1134,6 +1135,11 @@ def _contract_normal_equations(
         reference_fourth_moments=reference.context_fourth_moments,
         study_fourth_moments=summary.context_fourth_moments,
     )
+    # Direction contractions keep no jackknife blocks or LD scalars, so the
+    # different-person part keeps the legacy scaling (warned when n differs).
+    _, different_transport = resolve_different_person_exposure(
+        reference_n=reference.n_samples, study_n=summary.n_samples
+    )
     transferred = transfer_reference_gram(
         reference_gram,
         same_person,
@@ -1163,6 +1169,7 @@ def _contract_normal_equations(
         reference_n=reference.n_samples,
         study_n=summary.n_samples,
         same_person_transport=transport,
+        different_person_transport=different_transport,
     )
     return equations, reduction
 
