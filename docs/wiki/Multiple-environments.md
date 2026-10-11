@@ -97,30 +97,33 @@ effects. [PCGC preparation](Generalized-GxE-PCGC.md) also saves separate referen
 trait files, using `.binary.ldscores.npz` and `.binary.sumstats.npz`. Its fitter
 requires the reference identified by the trait summary.
 
-## The trait's same-person term
+## Transferring the reference to the trait's people
 
-A fit transfers the reference Gram to the trait's sample. The same-person part
-of that Gram depends on the contexts of the people actually measured, so it is
-formed for the trait's own people ([Methods](Methods.md#reference-transfer-and-fitting)).
-Trait summaries record the study's context fourth moments. References record
-the reference's fourth moments when the basis is supplied, which
-`scripts/generalized_gxe/workflow.py` does.
+A fit transfers the reference Gram to the trait's sample. Both its same-person
+and its different-person parts depend on the contexts of the people actually
+measured, so both are formed for the trait's own people
+([Methods](Methods.md#reference-transfer-and-fitting)). Trait summaries record
+the study's context second and fourth moments. References record the
+reference's when the basis is supplied, which `scripts/generalized_gxe/workflow.py`
+does; the per-block LD scalars come from arrays every reference already has.
 
-- Against a `summary` reference, the fit uses the fourth-moment difference form.
-- Against a `composable` reference, pass the trait's people as indices into the
-  reference sample, `fit_generalized_gxe_variant_model_v1(reference, trait,
-  study_rows=rows)`, to use the exact own-row term.
-- References and summaries written before the fourth moments existed still
-  load. Their fits keep the legacy `(N_S/N_R) D_R` scaling, which is biased when
-  missingness depends on the contexts, and warn when the sample sizes differ.
+| Reference | Same-person part | Different-person part |
+|---|---|---|
+| `summary` with moments | fourth-moment difference | composition corrected |
+| `composable` with moments, `study_rows=rows` | exact own rows | composition corrected |
+| written before second moments existed (4757960) | as above | legacy scaling, with a warning |
+| written before fourth moments existed | legacy scaling, with a warning | legacy scaling, with a warning |
 
-`fit.manifest["same_person_transport"]` records the term used.
+`rows` are the trait's people as indices into the reference sample, e.g.
+`fit_generalized_gxe_variant_model_v1(reference, trait, study_rows=rows)`.
+The legacy terms are biased when missingness depends on the contexts.
+`fit.manifest` records `same_person_transport` and `different_person_transport`.
 
 ## Reusing annotation columns
 
 Default `summary` output stores the reference summaries needed for fitting,
-including the same-person matrix and the reference context fourth moments.
-Both are sums over people. Optional `composable` output also retains
+including the same-person matrix and the reference context second and fourth
+moments. All are sums over people. Optional `composable` output also retains
 annotations, directional panels, and sample-aligned component diagonals, which
 give the exact own-row term. **Keep composable files in protected storage when
 the input is participant data.**
@@ -129,8 +132,8 @@ the input is participant data.**
 columns without reading genotypes again. It requires the same ordered samples,
 variants, context definitions, and scaling. Verify those inputs from the
 original reference records; equal dimensions do not establish equivalence.
-The composed reference keeps the context fourth moments when every source
-carries them.
+The composed reference keeps the context moments when every source carries
+them.
 
 ## Reading a joint fit
 

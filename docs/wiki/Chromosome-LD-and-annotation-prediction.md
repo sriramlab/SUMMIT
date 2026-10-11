@@ -60,26 +60,58 @@ jackknife; it excludes reference-probe variation and cross-chromosome LD.
 
 `transferred_chromosome_equations` keeps the trait's own score, trace and
 residual moments and transfers the reference genetic Gram to the trait's
-sample size. Its different-person part is scaled by
-`N_S(N_S-1)/(N_R(N_R-1))`. Its same-person part should be the trait's own
-([Methods](Methods.md#reference-transfer-and-fitting)).
+people ([Methods](Methods.md#reference-transfer-and-fitting)):
+`T_S = D_S + s (T_R - D_R) + kron(L, F_S - s F_R)`.
 
-- Pass `reference_kernel_diagonal` (the genome-wide `C x N_R` diagonal, the sum
-  of the chromosome diagonals) and `study_rows` (the trait's people as
-  reference sample indices) for the exact own-row term.
-- Or pass `reference_fourth_moments` and `study_fourth_moments`
-  (`summit.context.oracle.context_fourth_moments` on each cohort's basis
-  rows) for the summary form. `MaskedTraitBatch` stores each trait's value as
-  `common.context_fourth_moments`.
-- When fitting many deletions, form the term once with
-  `exact_study_same_person` or `approximate_study_same_person` and pass it as
-  `study_same_person` with its `same_person_transport` label.
+For a reference root with per-person diagonals, one call does both parts:
 
-Without these inputs the function keeps the legacy `(N_S/N_R) D_R`, which is
-biased when missingness depends on the contexts, and warns when the sizes
-differ. Pass `same_person_transport="scaled_legacy"` to request it on purpose.
-The returned equations record the term used. Deletions reuse the full study
-term.
+```python
+from summit.ldscore.generalized_gxe_chromosome import (
+    prepare_chromosome_transport, transferred_chromosome_equations)
+
+transport = prepare_chromosome_transport(reference_chunks, diagonals, phi)  # once per root
+terms = transport.for_study(rows)                                           # once per trait
+equations = transferred_chromosome_equations(
+    reference_chunks, trait_chunks, **terms, deleted_blocks=deleted, **moments)
+```
+
+`diagonals` maps each chromosome to its `C x N_R` component diagonal (the
+`global_kernel_diagonal` of `reference_aux.npz`, normalized by the genome-wide
+annotation masses). `phi` is the reference basis and `rows` are the trait's
+people as reference sample indices. `moments` are the reference and trait
+residual moments, `residual_names` and `expected_chromosomes`.
+`own_row_transported_equations` wraps the last two steps for a single system.
+The genome-wide D_R and D_S use the summed diagonals, so they include
+cross-chromosome products.
+
+The pieces can also be passed separately:
+
+- Same-person part: `study_same_person` with its `same_person_transport` label;
+  or `reference_kernel_diagonal` with `study_rows` for the exact own-row term;
+  or `reference_fourth_moments` and `study_fourth_moments` for the summary form.
+- Different-person part: each chromosome's raw intercept same-person entries,
+  either `reference_same_person_intercepts` (a mapping built with
+  `chromosome_same_person_intercept`) or the chunks' `same_person_intercept`,
+  plus `reference_second_moments`, `study_second_moments` and the fourth
+  moments. `reduce_chromosome_result` stores `same_person_intercept` (K x K, a
+  sum over people), and `combine_chromosome_annotations` carries it.
+  `MaskedTraitBatch` stores each trait's `context_second_moments` and
+  `context_fourth_moments` in its `common` record.
+
+Without these inputs a part keeps its legacy scaling, which is biased when
+missingness depends on the contexts, and warns when the sizes differ. Pass
+`same_person_transport="scaled_legacy"` or
+`different_person_transport="scaled_legacy"` to request it on purpose. The
+returned equations record both choices. Deletions reuse the full study
+same-person term; the correction drops the deleted blocks' LD scalars and uses
+the retained annotation masses.
+
+This production assembly differs from the research
+`cross_trait_gram.within_trait_equations(mode="factorized_plus_residual",
+same_person_mode="own_rows")` only through the joint chromosome assembly. The
+difference is `s [D_R - sum_c D_c + sum_c B_c C^-1 B_c' - B C^-1 B']`, with
+per-chromosome same-person matrices `D_c` and reference residual cross-moments
+`B_c`. On the 338k master root it is about 0.08% of the Gram.
 
 ## Annotation-dependent prediction
 
