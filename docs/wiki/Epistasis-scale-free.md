@@ -49,14 +49,32 @@ which estimates the background mean of E[x_j y | c1] E[x_j y | c2].
 | `sel_amp[A]` | log α_A − log α_rest, α = θ(hi, hi)/θ(lo, lo) | 0 | selective genetic share |
 | `dosage[A]`, `dosage_diff[A]` | dosage in A, and A minus the complement | 0 | annotation-specific marginal epistasis |
 
-Each statistic has two standard errors:
+Each statistic has two standard errors valid under the null and under
+alternatives:
 
 - a group-level Hoeffding SE, which treats the G random individual groups as
   i.i.d. units;
 - a delete-one SNP-block jackknife SE (chromosome-respecting blocks).
 
-The z score uses the larger of the two. With few groups the Hoeffding
-estimator is heavy-tailed; G = 200 is the qualified default.
+The degenerate statistics (`dosage`, `dosage[A]`, `delta2`) also have a
+null-restricted SE, and their z score uses it. Under the null their group
+kernel T_ab is a product of two group scores with mean zero, so the T_ab
+(a ≠ b) are uncorrelated with mean zero and
+
+    Var0(θ̂) = 2 E[T_ab²] / (G (G − 1))
+
+exactly, whatever the LD, the phenotype distribution or the group sizes.
+E[T_ab²] is estimated by the mean of T_ab² over a ≠ b. The full Hoeffding SE
+also estimates a first-order term that is zero under the null, and that noise
+makes it heavy-tailed (with G = 30 its variance estimate was negative in 15-20%
+of simulated null replicates). On 666 real UK Biobank dosage columns the
+null-restricted SE agreed with the analytic value 2v²τ₂/(n(n − 1)) to 0.4%
+(interquartile range of the ratio 1.000 to 1.008), while the ratio of the full
+Hoeffding SE to it had interquartile range 0.91 to 1.07.
+Under alternatives it omits the first-order term, so intervals should use the
+Hoeffding or jackknife SE. The other statistics are not degenerate at their
+null, and their z score uses the larger of the Hoeffding and jackknife SEs.
+G = 200 is the qualified default.
 
 The background excludes every chromosome of the context. U-statistics need
 the context to be independent of the background SNPs, which fails for SNPs in
@@ -124,7 +142,7 @@ Outputs:
 
 | File | Contents |
 |---|---|
-| `results.tsv` | one row per analysis, scale and statistic: estimate, both SEs, max-SE z and p |
+| `results.tsv` | one row per analysis, scale and statistic: estimate, Hoeffding, jackknife and null-restricted SEs, the test SE (`se_rule` null or max), z and p |
 | `run.json` | manifest, contexts, class sizes, genotype source and scale identities, timings, checksum repairs |
 | `kernels.npz` | optional (`"save_kernels": true`): G × G kernels and jackknife sums, for recomputing statistics without genotypes |
 

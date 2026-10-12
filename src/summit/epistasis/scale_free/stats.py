@@ -8,9 +8,19 @@ For a statistic m = (c1, c2) the between-group U-statistic is
 with S~_j(c, g) the class-normalized score sum_{i in g, c} x_ij y_i / n_{c,g}.
 It estimates the background mean of E[x_j y | c1] E[x_j y | c2]. Group-level
 Hoeffding variance treats the G random individual groups as i.i.d. units. The
-SNP-block delete-one jackknife captures LD and SNP-level heterogeneity. Claims
-use the larger of the two standard errors (max-SE rule). The Hoeffding
-estimator is heavy-tailed for small G; G = 200 is the qualified default.
+SNP-block delete-one jackknife captures LD and SNP-level heterogeneity.
+
+Tests of the degenerate statistics (dosage, dosage[A], delta2) use the
+null-restricted variance. Their kernel is a product of two group scores whose
+expectation is zero under the null, so E[T_ab | group a] = 0 and the T_ab with
+a != b are uncorrelated. Then Var0(theta) = 2 E[T_ab^2] / (G (G - 1)) exactly,
+whatever the LD, the phenotype distribution or the group sizes, and E[T_ab^2]
+is estimated by the mean of T_ab^2 over a != b. This estimate is far less
+noisy than the full Hoeffding variance, whose first-order term is zero under
+the null but estimated with noise. It omits that first-order term under
+alternatives, so intervals use the Hoeffding and jackknife standard errors.
+The other statistics are not degenerate at their null and keep the larger of
+the Hoeffding and jackknife standard errors (max-SE rule).
 
 Statistics (lo = low classes, hi = high classes):
     dosage     theta(gy, gy) = mean_j (E[g x_j y])^2, FAME-equivalent; null 0 (one-sided)
@@ -38,6 +48,7 @@ from scipy.stats import norm
 NULLS = dict(dosage=0., dosage_diff=0., rho=1., log_amp=0., delta2=0., sel_lam=0., sel_amp=0., additive=0.,
              relative_dosage=0., global_excess=0.)
 ONE_SIDED = ('dosage', 'delta2', 'additive', 'relative_dosage')
+DEGENERATE = ('dosage', 'delta2')
 
 
 def hoeffding(kernels):
@@ -61,6 +72,19 @@ def hoeffding(kernels):
     tt = (np.outer(total, total) - 4 * rows @ rows.T + 2 * same) / (g * (g - 1) * (g - 2) * (g - 3))
     cov = 4 * (g - 2) / (g * (g - 1)) * (e1 - tt) + 2 / (g * (g - 1)) * (e2 - tt)
     return theta, cov
+
+
+def null_covariance(kernels):
+    """Covariance of the off-diagonal means when every kernel is degenerate.
+
+    kernels: (m, G, G) symmetric with zero diagonal. If E[T_m[a, b] | group a] = 0
+    for all m, Cov0(theta_m, theta_m') = 2 E[T_m[a, b] T_m'[a, b]] / (G (G - 1)),
+    estimated without bias by the mean product over a != b.
+    """
+    t = np.asarray(kernels, dtype=np.float64)
+    g = t.shape[1]
+    flat = t.reshape(len(t), -1)
+    return 2 * (flat @ flat.T) / (g * (g - 1)) ** 2
 
 
 def _kernel(raw, weight):
@@ -130,6 +154,7 @@ def _family(raw, between, weights, block_weights, function):
     """
     kernels = np.stack([_kernel(r, w) for r, w in zip(raw, weights)])
     theta, cov = hoeffding(kernels)
+    cov0 = null_covariance(kernels)
     est, grads = _gradient(function, theta)
     g = raw.shape[1]
     pairs = g * (g - 1)
@@ -148,7 +173,11 @@ def _family(raw, between, weights, block_weights, function):
         finite = np.isfinite(values)
         se_s = (np.sqrt((nb - 1) / nb * np.sum((values - values.mean()) ** 2))
                 if np.isfinite(value) and finite.all() and nb > 1 else np.nan)
-        result[key] = (float(value), float(se_u), float(se_s))
+        se_0 = np.nan
+        if key.split('[')[0] in DEGENERATE:
+            var0 = float(grads[key] @ cov0 @ grads[key])
+            se_0 = np.sqrt(var0) if np.isfinite(var0) and var0 > 0 else np.nan
+        result[key] = (float(value), float(se_u), float(se_s), float(se_0))
     return result
 
 
@@ -156,8 +185,13 @@ def _null(name):
     return NULLS[name.split('[')[0]]
 
 
-def _record(base, statistic, value, se_u, se_s):
-    se = np.nanmax([se_u, se_s]) if np.isfinite([se_u, se_s]).any() else np.nan
+def _record(base, statistic, value, se_u, se_s, se_0):
+    """The test uses se_0 (null-restricted) for degenerate statistics, else the max-SE rule."""
+    if statistic.split('[')[0] in DEGENERATE:
+        se, rule = se_0, 'null'
+    else:
+        se = np.nanmax([se_u, se_s]) if np.isfinite([se_u, se_s]).any() else np.nan
+        rule = 'max'
     null = _null(statistic)
     z = (value - null) / se if np.isfinite(se) and se > 0 else np.nan
     one_sided = statistic.split('[')[0] in ONE_SIDED
@@ -165,7 +199,8 @@ def _record(base, statistic, value, se_u, se_s):
     zu = (value - null) / se_u if np.isfinite(se_u) and se_u > 0 else np.nan
     zs = (value - null) / se_s if np.isfinite(se_s) and se_s > 0 else np.nan
     return dict(base, statistic=statistic, estimate=value, null=null, se_hoeffding=se_u, se_jackknife=se_s,
-                se=se, z=z, z_hoeffding=zu, z_jackknife=zs, p=p, sided='upper' if one_sided else 'two')
+                se_null=se_0, se=se, se_rule=rule, z=z, z_hoeffding=zu, z_jackknife=zs, p=p,
+                sided='upper' if one_sided else 'two')
 
 
 def summarize(plan, accumulation):

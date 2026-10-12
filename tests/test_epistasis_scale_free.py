@@ -8,7 +8,7 @@ import pytest
 from scipy.stats import norm, rankdata
 
 from summit.epistasis.scale_free.design import Context, Outcome, build_plan
-from summit.epistasis.scale_free.stats import hoeffding, summarize
+from summit.epistasis.scale_free.stats import hoeffding, null_covariance, summarize
 from summit.epistasis.scale_free.stream import accumulate, background_axis, checked_gram
 from summit.epistasis.scale_free.transforms import blom_rank_normal, residualize_within
 from summit.prediction.genotype import ArrayGenotypeSource, estimate_scale
@@ -190,8 +190,17 @@ def test_statistics_match_direct_definitions():
         drops = np.array(drops)
         se = np.sqrt((len(drops) - 1) / len(drops) * np.sum((drops - drops.mean()) ** 2))
         assert np.isclose(records[(a, 'dosage')]['se_jackknife'], se, rtol=1e-8)
+        # null-restricted SE recomputed from the dense oracle kernel: Var0 = 2 mean_{a != b} T^2 / (G (G - 1))
         r = records[(a, 'dosage')]
-        assert np.isclose(r['se'], max(r['se_hoeffding'], r['se_jackknife']))
+        k = oracle_kernel(s, gy, gy, w) / w.sum()
+        k = (k + k.T) / 2
+        np.fill_diagonal(k, 0)
+        se0 = np.sqrt(2 * np.sum(k ** 2) / (g * (g - 1)) ** 2)
+        assert np.isclose(r['se_null'], se0, rtol=1e-9) and r['se'] == r['se_null'] and r['se_rule'] == 'null'
+        assert np.isclose(r['z'], r['estimate'] / se0, rtol=1e-9)
+        r = records[(a, 'rho')]
+        assert r['se_rule'] == 'max'
+        assert np.isclose(r['se'], np.nanmax([r['se_hoeffding'], r['se_jackknife']]), equal_nan=True)
 
 
 def test_within_rank_columns_invariant_to_class_specific_monotone_maps():
@@ -472,3 +481,110 @@ def test_hc3_tolerates_exactly_fitted_rows():
     y = X[:, 1] * .3 + rng.normal(size=n)
     fit = hc3_wald(y, X, [1])
     assert np.isfinite(fit['p']) and np.all(np.isfinite(fit['cov']))
+
+
+def test_null_covariance_matches_definition():
+    rng = np.random.default_rng(4)
+    g = 9
+    t = rng.normal(size=(3, g, g))
+    t = (t + t.transpose(0, 2, 1)) / 2
+    for k in t:
+        np.fill_diagonal(k, 0)
+    off = ~np.eye(g, dtype=bool)
+    expected = 2 * np.array([[np.mean(a[off] * b[off]) for b in t] for a in t]) / (g * (g - 1))
+    np.testing.assert_allclose(null_covariance(t), expected, rtol=1e-12)
+    # the contrast kernel ll + hh - 2 lh has the variance of the linear combination
+    c = np.array([1., 1., -2.])
+    contrast = np.tensordot(c, t, axes=1)
+    np.testing.assert_allclose(c @ null_covariance(t) @ c, null_covariance(contrast[None])[0, 0], rtol=1e-12)
+
+
+def _ld_genotypes(rng, n, m, chromosomes, rho=.8):
+    """Two haplotypes per person from AR(1) Gaussian fields thresholded at allele frequencies."""
+    per = m // chromosomes
+    freq = rng.uniform(.1, .5, m)
+    calls = np.zeros((n, m))
+    for _ in range(2):
+        z = rng.normal(size=(n, m))
+        for j in range(1, m):
+            if j % per:
+                z[:, j] = rho * z[:, j - 1] + np.sqrt(1 - rho ** 2) * z[:, j]
+        calls += z < norm.ppf(freq)
+    return calls.astype(np.int8)
+
+
+def test_null_variance_calibrated_under_no_interaction():
+    """Dosage and delta2 z scores with the null-restricted SE under two exact nulls.
+
+    raw scale: the focal variant changes only the noise variance (no interaction);
+    within-class ranks: the focal variant shifts and stretches the whole liability.
+    """
+    rng = np.random.default_rng(17)
+    n, m, reps = 1500, 90, 200
+    raw = _ld_genotypes(rng, n, m, 3)
+    chrom = tuple(str(c) for c in np.repeat([1, 2, 3], m // 3))
+    axis = VariantAxis(tuple(f'v{i}' for i in range(m)), chrom, tuple(range(1, m + 1)), ('A',) * m, ('G',) * m)
+    source = ArrayGenotypeSource(raw, [(str(i), str(i)) for i in range(n)], axis, hard_calls=True)
+    x = (raw - raw.mean(0)) / raw.std(0)
+    age = rng.normal(size=n)
+    outcomes, ctx, analyses = [], [], []
+    for r in range(reps):
+        # a new focal variant per replicate: the target is the variance over sampled people,
+        # not the variance conditional on one fixed set of genotypes
+        focal = rng.binomial(2, .3, n)
+        spread = np.exp(.2 * (focal - focal.mean()))
+        beta = np.zeros(m)
+        causal = rng.choice(m, 12, replace=False)
+        beta[causal] = rng.normal(0, .2, 12)
+        beta[causal[0]] = .6
+        noise = rng.standard_t(5, n)
+        outcomes.append(Outcome(f'v{r}', x @ beta + .3 * age + spread * noise))
+        liability = x @ beta + .3 * age + noise
+        outcomes.append(Outcome(f'a{r}', np.exp(.4 * (.2 * focal + spread * liability)), positive=True))
+        ctx.append(Context(f'f{r}', focal, {0: 0., 1: 1., 2: 2.}, low=(0,), high=(1, 2), exclude_chromosomes=('1',)))
+        analyses += [(f'f{r}', f'v{r}'), (f'f{r}', f'a{r}')]
+    rows = np.arange(n)
+    plan = build_plan(rows, ctx, outcomes, age[:, None], analyses=analyses, scales=('raw', 'within_rank'),
+                      pattern_scales=('within_rank',), n_groups=30, seed=3)
+    bg = background_axis(source, n_blocks=12)
+    scale = estimate_scale(source, rows, bg.variants)
+    acc = accumulate(source, plan, scale, bg, block_size=64, native=False)
+    records = summarize(plan, acc)
+    sets = {('v', 'raw', 'dosage'): [], ('a', 'within_rank', 'dosage'): [], ('a', 'within_rank', 'delta2'): []}
+    for rec in records:
+        key = (rec['outcome'][0], rec['scale'], rec['statistic'])
+        if key in sets:
+            sets[key].append(rec)
+    for key, recs in sets.items():
+        assert len(recs) == reps
+        est = np.array([r['estimate'] for r in recs])
+        se0 = np.array([r['se_null'] for r in recs])
+        z = est / se0
+        assert all(r['se_rule'] == 'null' and r['se'] == r['se_null'] for r in recs)
+        # Monte Carlo SD of these summaries is about 0.07 (z mean, z SD) and 0.1 (variance ratio)
+        assert abs(z.mean()) < .25, key
+        assert .82 < z.std() < 1.18, key
+        assert .7 < np.var(est) / np.mean(se0 ** 2) < 1.3, key
+        assert np.all(np.isfinite(se0) & (se0 > 0)), key
+        # the full Hoeffding estimate is noisier and can even be negative (reported as NaN)
+        hoeff = np.array([r['se_hoeffding'] for r in recs])
+        finite = np.isfinite(hoeff)
+        assert np.std(np.log(se0)) < np.std(np.log(hoeff[finite])), key
+
+
+def test_records_choose_the_test_standard_error():
+    source, raw, ctx, out, cov = simulated(seed=13)
+    rows = np.arange(len(source.samples))
+    plan = build_plan(rows, ctx, out, cov, scales=('within_rank',), n_groups=8, seed=2)
+    annotation = (np.arange(90) % 3 == 0).astype(float)
+    bg = background_axis(source, annotations=annotation[:, None], names=('A',), n_blocks=6)
+    scale = estimate_scale(source, rows, bg.variants)
+    acc = accumulate(source, plan, scale, bg, block_size=32, native=False)
+    for r in summarize(plan, acc):
+        base = r['statistic'].split('[')[0]
+        if base in ('dosage', 'delta2'):
+            assert r['se_rule'] == 'null' and np.isfinite(r['se_null']) and r['se'] == r['se_null']
+        else:
+            assert r['se_rule'] == 'max' and np.isnan(r['se_null'])
+            finite = [v for v in (r['se_hoeffding'], r['se_jackknife']) if np.isfinite(v)]
+            assert r['se'] == max(finite) if finite else np.isnan(r['se'])
