@@ -206,13 +206,20 @@ def cpm_location_scale(c, X, W, link='probit'):
 
 
 def hc3_wald(y, X, test):
-    """OLS with HC3 covariance; Wald test of coefficients `test` (X includes the intercept)."""
-    Q, R = np.linalg.qr(X)
-    beta = np.linalg.solve(R, Q.T @ y)
+    """OLS with HC3 covariance; Wald test of coefficients `test` (X includes the intercept).
+
+    Uses the eigendecomposition of X^T X (pseudo-inverse over the numerical
+    range): three n p^2 products instead of an explicit QR, which dominates
+    at biobank n.
+    """
+    X = np.asarray(X, dtype=np.float64)
+    gram = X.T @ X
+    w, V = np.linalg.eigh(gram)
+    keep = w > w.max() * 1e-12
+    bread = (V[:, keep] / w[keep]) @ V[:, keep].T
+    beta = bread @ (X.T @ y)
     resid = y - X @ beta
-    leverage = np.sum(Q * Q, axis=1)
-    rinv = np.linalg.inv(R)
-    bread = rinv @ rinv.T
+    leverage = np.einsum('ij,ij->i', X @ bread, X)
     scaled = X * (resid / (1 - leverage))[:, None]
     cov = bread @ (scaled.T @ scaled) @ bread
     bt, vt = beta[test], cov[np.ix_(test, test)]
@@ -221,6 +228,17 @@ def hc3_wald(y, X, test):
     stat = float(np.sum((U[:, keep].T @ bt) ** 2 / w[keep]))
     df = int(keep.sum())
     return dict(beta=beta, cov=cov, stat=stat, df=df, p=float(chi2.sf(stat, df)))
+
+
+def _design(columns, extra=None):
+    """Column-major design matrix: contiguous column writes (column_stack writes rows)."""
+    k = len(columns) + (0 if extra is None else extra.shape[1])
+    out = np.empty((len(columns[0]), k), order='F')
+    for j, c in enumerate(columns):
+        out[:, j] = c
+    if extra is not None:
+        out[:, len(columns):] = extra
+    return out
 
 
 def stratified_rank_test(y, x, z, covariates=None, strata=None, min_cell=50):
@@ -249,11 +267,10 @@ def stratified_rank_test(y, x, z, covariates=None, strata=None, min_cell=50):
         if np.sum((z == s) & (x == 1)) >= min_cell and np.sum((z == s) & (x != 1)) >= min_cell:
             cols.append(xh * (z == s))
             test.append(len(cols) - 1)
-    extra = [] if covariates is None else list(np.asarray(covariates).T)
-    omnibus = hc3_wald(ranked, np.column_stack(cols + extra), test)
-    trend_cols = base + [xa * (z - z.mean())] + extra
+    extra = None if covariates is None else np.asarray(covariates, dtype=np.float64)
+    omnibus = hc3_wald(ranked, _design(cols, extra), test)
     position = len(base)
-    trend = hc3_wald(ranked, np.column_stack(trend_cols), [position])
+    trend = hc3_wald(ranked, _design(base + [xa * (z - z.mean())], extra), [position])
     beta = float(trend['beta'][position])
     return dict(omnibus_p=omnibus['p'], omnibus_stat=omnibus['stat'], omnibus_df=omnibus['df'], trend_beta=beta,
                 trend_z=beta / float(np.sqrt(trend['cov'][position, position])), trend_p=trend['p'],
@@ -347,9 +364,7 @@ def hc3_product_test(y, x, z, covariates=None):
     """Fixed-scale baseline: y ~ x_add + x_het + z_add + z_het + x_add z_add (+ covariates), HC3."""
     xa, za = x - x.mean(), z - z.mean()
     cols = [np.ones(len(y)), xa, (x == 1) - np.mean(x == 1), za, (z == 1) - np.mean(z == 1), xa * za]
-    if covariates is not None:
-        cols += list(np.asarray(covariates).T)
-    r = hc3_wald(y, np.column_stack(cols), [5])
+    r = hc3_wald(y, _design(cols, None if covariates is None else np.asarray(covariates, dtype=np.float64)), [5])
     return dict(beta=float(r['beta'][5]), z=float(r['beta'][5] / np.sqrt(r['cov'][5, 5])), p=r['p'])
 
 

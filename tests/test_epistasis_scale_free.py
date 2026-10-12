@@ -360,3 +360,22 @@ def test_global_ratio_from_class_spreads():
     assert np.isclose(plan.analyses[0]['global_ratio']['raw'], expected, rtol=1e-10)
     assert abs(expected / (np.sum(pi * gv * np.exp(.3 * np.arange(3))) / np.sum(pi * np.exp(.3 * np.arange(3)))) ** 2
                - 1) < .15
+
+
+def test_hc3_matches_qr_reference():
+    from summit.epistasis.scale_free.rank_pairs import hc3_wald
+    rng = np.random.default_rng(4)
+    n = 3000
+    X = np.column_stack([np.ones(n), rng.normal(size=(n, 4)), rng.integers(0, 2, n)])
+    y = X @ [1, .2, 0, -.3, .1, .4] + rng.standard_t(4, n) * (1 + .5 * np.abs(X[:, 1]))
+    Q, R = np.linalg.qr(X)
+    beta = np.linalg.solve(R, Q.T @ y)
+    e = y - X @ beta
+    h = np.sum(Q * Q, axis=1)
+    rinv = np.linalg.inv(R)
+    bread = rinv @ rinv.T
+    s = X * (e / (1 - h))[:, None]
+    cov = bread @ (s.T @ s) @ bread
+    fit = hc3_wald(y, X, [1, 3])
+    np.testing.assert_allclose(fit['beta'], beta, rtol=1e-9)
+    np.testing.assert_allclose(fit['cov'], cov, rtol=1e-8)
