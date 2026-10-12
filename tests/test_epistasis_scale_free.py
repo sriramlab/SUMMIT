@@ -196,7 +196,8 @@ def test_statistics_match_direct_definitions():
         k = (k + k.T) / 2
         np.fill_diagonal(k, 0)
         se0 = np.sqrt(2 * np.sum(k ** 2) / (g * (g - 1)) ** 2)
-        assert np.isclose(r['se_null'], se0, rtol=1e-9) and r['se'] == r['se_null'] and r['se_rule'] == 'null'
+        assert np.isclose(r['se_null'], se0, rtol=1e-9)
+        assert r['se'] == r['se_null'] and r['se_rule'] == 'null_restricted'
         assert np.isclose(r['z'], r['estimate'] / se0, rtol=1e-9)
         r = records[(a, 'rho')]
         assert r['se_rule'] == 'max'
@@ -310,6 +311,11 @@ def test_cli_end_to_end(tmp_path):
     assert set(res.statistic) >= {'dosage', 'dosage[A]', 'dosage_diff[A]', 'rho', 'log_amp', 'delta2',
                                   'sel_lam[A]', 'sel_amp[A]'}
     assert len(res) == 2 * (8 + 3 + 5 + 5)
+    # the SE rule survives a round trip through pandas (whose default NA tokens include 'null')
+    assert res.se_rule.notna().all() and set(res.se_rule) == {'null_restricted', 'max'}
+    degenerate = res.statistic.str.split('[').str[0].isin(['dosage', 'delta2'])
+    assert (res.se_rule[degenerate] == 'null_restricted').all() and np.allclose(res.se[degenerate],
+                                                                                res.se_null[degenerate])
     assert {'additive', 'relative_dosage', 'global_excess', 'additive[A]'} <= set(res.statistic)
     run = json.loads((tmp_path / 'out' / 'run.json').read_text())
     assert run['contexts']['v0']['chromosome'] == '1'
@@ -560,7 +566,7 @@ def test_null_variance_calibrated_under_no_interaction():
         est = np.array([r['estimate'] for r in recs])
         se0 = np.array([r['se_null'] for r in recs])
         z = est / se0
-        assert all(r['se_rule'] == 'null' and r['se'] == r['se_null'] for r in recs)
+        assert all(r['se_rule'] == 'null_restricted' and r['se'] == r['se_null'] for r in recs)
         # Monte Carlo SD of these summaries is about 0.07 (z mean, z SD) and 0.1 (variance ratio)
         assert abs(z.mean()) < .25, key
         assert .82 < z.std() < 1.18, key
@@ -583,7 +589,7 @@ def test_records_choose_the_test_standard_error():
     for r in summarize(plan, acc):
         base = r['statistic'].split('[')[0]
         if base in ('dosage', 'delta2'):
-            assert r['se_rule'] == 'null' and np.isfinite(r['se_null']) and r['se'] == r['se_null']
+            assert r['se_rule'] == 'null_restricted' and np.isfinite(r['se_null']) and r['se'] == r['se_null']
         else:
             assert r['se_rule'] == 'max' and np.isnan(r['se_null'])
             finite = [v for v in (r['se_hoeffding'], r['se_jackknife']) if np.isfinite(v)]

@@ -188,7 +188,7 @@ def _null(name):
 def _record(base, statistic, value, se_u, se_s, se_0):
     """The test uses se_0 (null-restricted) for degenerate statistics, else the max-SE rule."""
     if statistic.split('[')[0] in DEGENERATE:
-        se, rule = se_0, 'null'
+        se, rule = se_0, 'null_restricted'
     else:
         se = np.nanmax([se_u, se_s]) if np.isfinite([se_u, se_s]).any() else np.nan
         rule = 'max'

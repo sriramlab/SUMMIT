@@ -142,7 +142,7 @@ Outputs:
 
 | File | Contents |
 |---|---|
-| `results.tsv` | one row per analysis, scale and statistic: estimate, Hoeffding, jackknife and null-restricted SEs, the test SE (`se_rule` null or max), z and p |
+| `results.tsv` | one row per analysis, scale and statistic: estimate, Hoeffding, jackknife and null-restricted SEs, the test SE (`se_rule` null_restricted or max), z and p |
 | `run.json` | manifest, contexts, class sizes, genotype source and scale identities, timings, checksum repairs |
 | `kernels.npz` | optional (`"save_kernels": true`): G × G kernels and jackknife sums, for recomputing statistics without genotypes |
 
