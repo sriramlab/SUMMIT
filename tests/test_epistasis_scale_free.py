@@ -1,0 +1,332 @@
+"""Scale-free focal-context x background U-statistics against dense oracles."""
+from __future__ import annotations
+
+import json
+
+import numpy as np
+import pytest
+from scipy.stats import norm, rankdata
+
+from summit.epistasis.scale_free.design import Context, Outcome, build_plan
+from summit.epistasis.scale_free.stats import hoeffding, summarize
+from summit.epistasis.scale_free.stream import accumulate, background_axis, checked_gram
+from summit.epistasis.scale_free.transforms import blom_rank_normal, residualize_within
+from summit.prediction.genotype import ArrayGenotypeSource, estimate_scale
+from summit.prediction.spec import VariantAxis
+
+
+def _native_available():
+    try:
+        from summit import gxeldcore  # noqa: F401
+        return True
+    except ImportError:
+        return False
+
+
+BACKENDS = [False] + ([True] if _native_available() else [])
+
+
+def _threads(native):
+    if not native:
+        return 1
+    from epistasis_helpers import epistasis_threads
+    return epistasis_threads()
+
+
+def simulated(seed=3, n=900, m=90):
+    rng = np.random.default_rng(seed)
+    freq = rng.uniform(.1, .5, m)
+    raw = rng.binomial(2, freq, (n, m)).astype(np.int8)
+    raw[rng.random((n, m)) < .01] = -127
+    chrom = tuple(str(c) for c in np.repeat([1, 2, 3], m // 3))
+    axis = VariantAxis(tuple(f'v{i}' for i in range(m)), chrom, tuple(range(1, m + 1)), ('A',) * m, ('G',) * m)
+    source = ArrayGenotypeSource(raw, [(str(i), str(i)) for i in range(n)], axis, hard_calls=True)
+    focal = np.minimum(np.where(raw[:, 0] == -127, 0, raw[:, 0]), 2)
+    other = rng.integers(0, 3, n)
+    x = np.where(raw == -127, np.nan, raw.astype(float))
+    x = (x - np.nanmean(x, 0)) / np.nanstd(x, 0)
+    x[np.isnan(x)] = 0
+    beta, gamma = rng.normal(0, .15, m), rng.normal(0, .15, m)
+    beta[:30] = gamma[:30] = 0
+    latent = x @ beta + (focal - 1) * (x @ gamma) + .4 * focal + rng.normal(size=n)
+    y = np.exp(.5 * latent)
+    y2 = rng.normal(size=n) + .2 * other
+    y2[rng.random(n) < .05] = np.nan
+    cov = np.column_stack([rng.normal(size=n), rng.integers(0, 2, n)])
+    ctx = [Context('focal', focal, {0: 0., 1: 1., 2: 2.}, exclude_chromosomes=('1',)),
+           Context('other', other, {0: 0., 1: 1., 2: 2.}, low=(0, 1), high=(2,), exclude_chromosomes=('2',))]
+    out = [Outcome('y', y, positive=True), Outcome('y2', y2)]
+    return source, raw, ctx, out, cov
+
+
+def subset(rows, ctx, out, cov):
+    from dataclasses import replace
+    return ([replace(c, labels=c.labels[rows]) for c in ctx], [replace(o, values=o.values[rows]) for o in out],
+            cov[rows])
+
+
+def dense_scores(raw, scale, plan):
+    """Independent class-normalized group scores (G, M, q) from the full matrix."""
+    x = np.where(raw == -127, np.nan, raw.astype(float))
+    x = (x - scale.mean) * scale.inverse_scale
+    x[np.isnan(x)] = 0
+    x = x[plan.rows]
+    y = np.zeros((len(plan.rows), plan.n_columns))
+    y[plan.order] = np.vstack(plan.blocks)
+    s = np.stack([x[plan.groups == g].T @ y[plan.groups == g] for g in range(plan.n_groups)])
+    return s / plan.counts[:, None, :]
+
+
+def oracle_kernel(s, c1, c2, w):
+    return np.einsum('gj,hj,j->gh', s[:, :, c1], s[:, :, c2], w)
+
+
+@pytest.mark.parametrize('native', BACKENDS)
+def test_stream_kernels_match_dense_oracle(native):
+    source, raw, ctx, out, cov = simulated()
+    rows = np.flatnonzero(np.arange(len(source.samples)) % 7 != 3)
+    ctx, out, cov = subset(rows, ctx, out, cov)
+    plan = build_plan(rows, ctx, out, cov, scales=('raw', 'within_rank'), pattern_scales=('within_rank',),
+                      n_groups=6, seed=5)
+    annotation = (np.arange(90) % 4 == 0).astype(float)
+    bg = background_axis(source, annotations=annotation[:, None], names=('A',), n_blocks=9)
+    scale = estimate_scale(source, rows, bg.variants, threads=_threads(native))
+    acc = accumulate(source, plan, scale, bg, block_size=17, threads=_threads(native), native=native, batch=3)
+    s = dense_scores(np.asarray(source.values), scale, plan)
+    chrom = np.array(bg.chromosomes)
+    for pair, (k1, k2) in (('gy', ('gy', 'gy')), ('ll', ('lo', 'lo')), ('hh', ('hi', 'hi')), ('lh', ('lo', 'hi'))):
+        first, second = plan.kinds[k1], plan.kinds[k2]
+        for p, (a, _) in enumerate(plan.keys[k1]):
+            keep = ~np.isin(chrom, plan.analyses[a]['exclude_chromosomes'])
+            for i, w in enumerate((np.ones(90), annotation)):
+                expected = oracle_kernel(s, first.start + p, second.start + p, w * keep)
+                np.testing.assert_allclose(acc.kernels[pair][i, p], expected, rtol=1e-10, atol=1e-13)
+                off = np.array([np.sum(oracle_kernel(s, first.start + p, second.start + p, w * keep * (bg.blocks == b)))
+                                - np.trace(oracle_kernel(s, first.start + p, second.start + p,
+                                                         w * keep * (bg.blocks == b))) for b in range(bg.n_blocks)])
+                np.testing.assert_allclose(acc.between[pair][i, p], off, rtol=1e-9, atol=1e-13)
+    assert acc.diagnostics['kernel_checksum_repairs'] == 0
+
+
+def prototype_hoeffding(t):
+    """Reference formula from the frozen prototype (explicit off-diagonal masks)."""
+    g = t.shape[1]
+    off = ~np.eye(g, dtype=bool)
+    flat = t[:, off]
+    theta = flat.mean(1)
+    e2 = flat @ flat.T / flat.shape[1]
+    rows = t.sum(2)
+    sq = np.einsum('mgh,ngh->mng', t, t).sum(2)
+    e1 = (np.einsum('mg,ng->mn', rows, rows) - sq) / (g * (g - 1) * (g - 2))
+    tot = t.sum((1, 2))
+    tt = (np.outer(tot, tot) - 4 * np.einsum('mg,ng->mn', rows, rows) + 2 * sq) / (g * (g - 1) * (g - 2) * (g - 3))
+    return theta, 4 * (g - 2) / (g * (g - 1)) * (e1 - tt) + 2 / (g * (g - 1)) * (e2 - tt)
+
+
+def test_hoeffding_matches_prototype_and_simulated_variance():
+    rng = np.random.default_rng(1)
+    t = rng.normal(size=(3, 12, 12))
+    t = (t + t.transpose(0, 2, 1)) / 2
+    for k in t:
+        np.fill_diagonal(k, 0)
+    theta, cov = hoeffding(t)
+    ref_theta, ref_cov = prototype_hoeffding(t)
+    np.testing.assert_allclose(theta, ref_theta, rtol=1e-13)
+    np.testing.assert_allclose(cov, ref_cov, rtol=1e-10, atol=1e-15)
+    # U-statistic of i.i.d. unit scores: kernel a_g a_h has variance known in closed form
+    # (unbiased per replicate, so single estimates may be negative; compare means)
+    g, reps, estimates, variances = 30, 3000, [], []
+    for _ in range(reps):
+        a = rng.normal(.5, 1, g)
+        k = np.outer(a, a)
+        np.fill_diagonal(k, 0)
+        th, cv = hoeffding(k[None])
+        estimates.append(th[0])
+        variances.append(cv[0, 0])
+    assert abs(np.var(estimates) / np.mean(variances) - 1) < .1
+
+
+def test_statistics_match_direct_definitions():
+    source, raw, ctx, out, cov = simulated(seed=11)
+    rows = np.arange(len(source.samples))
+    plan = build_plan(rows, ctx, out, cov, scales=('within_rank',), n_groups=8, seed=2)
+    bg = background_axis(source, n_blocks=6)
+    scale = estimate_scale(source, rows, bg.variants)
+    acc = accumulate(source, plan, scale, bg, block_size=32, native=False)
+    records = {(r['analysis'], r['statistic']): r for r in summarize(plan, acc)}
+    s = dense_scores(np.asarray(source.values), scale, plan)
+    chrom = np.array(bg.chromosomes)
+    g = plan.n_groups
+
+    def theta(c1, c2, w):
+        k = oracle_kernel(s, c1, c2, w) / w.sum()
+        k = (k + k.T) / 2
+        return (k.sum() - np.trace(k)) / (g * (g - 1))
+
+    for p, (a, _) in enumerate(plan.keys['gy']):
+        w = (~np.isin(chrom, plan.analyses[a]['exclude_chromosomes'])).astype(float)
+        gy, lo, hi = plan.kinds['gy'].start + p, plan.kinds['lo'].start + p, plan.kinds['hi'].start + p
+        assert np.isclose(records[(a, 'dosage')]['estimate'], theta(gy, gy, w), rtol=1e-10)
+        ll, hh, lh = theta(lo, lo, w), theta(hi, hi, w), theta(lo, hi, w)
+        expected_rho = lh / np.sqrt(ll * hh) if ll > 0 and hh > 0 else np.nan
+        assert np.isclose(records[(a, 'rho')]['estimate'], expected_rho, rtol=1e-9, equal_nan=True)
+        assert np.isclose(records[(a, 'delta2')]['estimate'], ll + hh - 2 * lh, rtol=1e-9, atol=1e-15)
+        # SNP-block jackknife recomputed from scratch for the dosage statistic
+        drops = []
+        for b in range(bg.n_blocks):
+            wb = w * (bg.blocks != b)
+            if wb.sum() < w.sum():
+                drops.append(theta(gy, gy, wb))
+        drops = np.array(drops)
+        se = np.sqrt((len(drops) - 1) / len(drops) * np.sum((drops - drops.mean()) ** 2))
+        assert np.isclose(records[(a, 'dosage')]['se_jackknife'], se, rtol=1e-8)
+        r = records[(a, 'dosage')]
+        assert np.isclose(r['se'], max(r['se_hoeffding'], r['se_jackknife']))
+
+
+def test_within_rank_columns_invariant_to_class_specific_monotone_maps():
+    source, raw, ctx, out, cov = simulated(seed=4)
+    rng = np.random.default_rng(9)
+    u = rng.normal(size=len(source.samples))
+    k = ctx[0].labels
+    distorted = np.select([k == 0, k == 1, k == 2], [u, 3 + 2 * u, np.exp(1.5 * u)])
+    outs = [Outcome('u', u), Outcome('h', distorted)]
+    rows = np.arange(len(source.samples))
+    plan = build_plan(rows, ctx[:1], outs, np.zeros((len(rows), 0)), scales=('pooled_rank', 'within_rank'),
+                      n_groups=6)
+    by = {(plan.analyses[c['analysis']]['outcome'], c['scale'], c['kind']): j for j, c in enumerate(plan.columns)}
+    y = np.vstack(plan.blocks)
+    for kind in ('gy', 'lo', 'hi'):
+        np.testing.assert_array_equal(y[:, by[('u', 'within_rank', kind)]], y[:, by[('h', 'within_rank', kind)]])
+    assert not np.allclose(y[:, by[('u', 'pooled_rank', 'gy')]], y[:, by[('h', 'pooled_rank', 'gy')]])
+
+
+def test_transforms():
+    y = np.array([3., 1., 2., 2., 5., 4.])
+    strata = np.array([0, 0, 0, 1, 1, 1])
+    z = blom_rank_normal(y)
+    np.testing.assert_allclose(z, norm.ppf((rankdata(y) - .375) / 6.25))
+    zs = blom_rank_normal(y, strata)
+    for s in (0, 1):
+        m = strata == s
+        np.testing.assert_allclose(zs[m], norm.ppf((rankdata(y[m]) - .375) / 3.25))
+    rng = np.random.default_rng(0)
+    c = rng.normal(size=(6, 1))
+    r = residualize_within(y, c, strata)
+    for s in (0, 1):
+        m = strata == s
+        a = np.column_stack([np.ones(3), c[m]])
+        np.testing.assert_allclose(r[m], y[m] - a @ np.linalg.lstsq(a, y[m], rcond=None)[0], atol=1e-12)
+
+
+def test_checksum_repairs_and_rejects(monkeypatch):
+    rng = np.random.default_rng(0)
+    left = rng.normal(size=(4, 9, 50))
+    left[:, -1] = left[:, :-1].sum(1)
+    right = rng.normal(size=(4, 9, 50))
+    right[:, -1] = right[:, :-1].sum(1)
+    exact, repaired = checked_gram(left, right)
+    assert repaired == 0
+    np.testing.assert_allclose(exact, np.matmul(left, right.transpose(0, 2, 1))[:, :-1, :-1])
+    real = np.matmul
+
+    def faulty(a, b, *args, **kw):
+        r = real(a, b, *args, **kw)
+        if r.ndim == 3 and r.shape[1:] == (9, 9):
+            r[2, 3, 4] += 1e-3 * abs(r[2, 3, 4]) + 1e-6
+        return r
+    monkeypatch.setattr(np, 'matmul', faulty)
+    fixed, repaired = checked_gram(left, right)
+    assert repaired == 1
+    np.testing.assert_allclose(fixed, exact, rtol=1e-12)
+    monkeypatch.setattr(np, 'dot', lambda a, b: real(a, b) + 1.)
+    with pytest.raises(RuntimeError):
+        checked_gram(left, right)
+
+
+def test_group_and_class_checks():
+    source, raw, ctx, out, cov = simulated()
+    rows = np.arange(len(source.samples))
+    with pytest.raises(ValueError, match='groups have fewer'):
+        build_plan(rows, ctx, out, cov, n_groups=400)
+    with pytest.raises(ValueError, match='strictly increasing'):
+        build_plan(rows[::-1], ctx, out, cov)
+
+
+def test_cli_end_to_end(tmp_path):
+    if not _native_available():
+        pytest.skip('native extension is not loaded')
+    from bed_reader import to_bed
+    from epistasis_helpers import entrypoint as main
+    source, raw, ctx, out, cov = simulated(seed=21, n=700, m=60)
+    n, m = raw.shape
+    ids = [str(i) for i in range(n)]
+    values = np.where(raw == -127, np.nan, raw.astype(float))
+    to_bed(tmp_path / 'input.bed', values, properties=dict(
+        fid=ids, iid=ids, sid=[f'v{i}' for i in range(m)], chromosome=list(source.variants.chromosome),
+        bp_position=np.arange(1, m + 1), allele_1=['A'] * m, allele_2=['G'] * m))
+    (tmp_path / 'samples.tsv').write_text('FID IID\n' + ''.join(f'{i} {i}\n' for i in range(n)))
+    y = out[0].values
+    (tmp_path / 'pheno.tsv').write_text('FID IID y sex\n' + ''.join(
+        f'{i} {i} {y[i]} {int(cov[i, 1])}\n' for i in range(n)))
+    (tmp_path / 'cov.tsv').write_text('FID IID c1 batch\n' + ''.join(
+        f'{i} {i} {cov[i, 0]} b{i % 3}\n' for i in range(n)))
+    (tmp_path / 'ctx.tsv').write_text('FID IID k\n' + ''.join(f'{i} {i} {ctx[1].labels[i]}\n' for i in range(n)))
+    (tmp_path / 'ann.tsv').write_text('SNP A\n' + ''.join(f'v{j} {int(j % 3 == 0)}\n' for j in range(m)))
+    manifest = dict(kind='summit.epistasis.scale_free', schema_version=1, genotypes={'geno': 'input.bed'},
+                    samples='samples.tsv', phenotypes={'file': 'pheno.tsv', 'columns': ['y'], 'positive': ['y']},
+                    covariates={'file': 'cov.tsv', 'columns': ['c1'], 'categorical': ['batch']},
+                    strata={'file': 'pheno.tsv', 'column': 'sex'},
+                    contexts=[{'name': 'v0', 'variant': 'v0', 'min_minor_homozygotes': 10},
+                              {'name': 'other', 'file': 'ctx.tsv', 'column': 'k', 'values': {'0': 0, '1': 1, '2': 2},
+                               'low': [0, 1], 'high': [2], 'exclude_chromosomes': ['2']}],
+                    background={'annotations': {'file': 'ann.tsv', 'columns': ['A']}, 'jackknife_blocks': 6},
+                    scales=['pooled_rank', 'within_rank'], groups=5, save_kernels=True)
+    (tmp_path / 'm.json').write_text(json.dumps(manifest))
+    assert main(['epistasis', 'scale-free', str(tmp_path / 'm.json'), '--out', str(tmp_path / 'out'),
+                 '--block-size', '16', '--memory-gib', '1']) == 0
+    import pandas as pd
+    res = pd.read_csv(tmp_path / 'out' / 'results.tsv', sep='\t')
+    assert set(res.statistic) >= {'dosage', 'dosage[A]', 'dosage_diff[A]', 'rho', 'log_amp', 'delta2',
+                                  'sel_lam[A]', 'sel_amp[A]'}
+    assert len(res) == 2 * 2 * (3 + 5)
+    run = json.loads((tmp_path / 'out' / 'run.json').read_text())
+    assert run['contexts']['v0']['chromosome'] == '1'
+    assert (tmp_path / 'out' / 'COMPLETE').exists()
+    assert np.load(tmp_path / 'out' / 'kernels.npz')['kernel_gy'].shape == (2, 4, 5, 5)
+
+
+def _pair_data(seed=0, n=4000):
+    rng = np.random.default_rng(seed)
+    x, z = rng.binomial(2, .35, n), rng.binomial(2, .3, n)
+    cov = rng.normal(size=(n, 2))
+    latent = .3 * x + .2 * z + .15 * x * z + cov @ [.2, -.1] + rng.normal(size=n)
+    return np.exp(.7 * latent), x, z, cov, rng.integers(0, 2, n)
+
+
+def test_cpm_two_bins_is_logistic_regression():
+    from summit.epistasis.scale_free.rank_pairs import cpm_fit
+    y, x, z, cov, _ = _pair_data(1)
+    X = np.column_stack([x - x.mean(), z - z.mean(), cov])
+    c = (y > np.median(y)).astype(np.int64)
+    fit = cpm_fit(c, X, 'logit')
+    A = np.column_stack([np.ones(len(y)), X])
+    b = np.zeros(A.shape[1])
+    for _ in range(50):
+        p = 1 / (1 + np.exp(-A @ b))
+        b += np.linalg.solve(A.T @ (A * (p * (1 - p))[:, None]), A.T @ (c - p))
+    assert fit['converged']
+    np.testing.assert_allclose(fit['beta'], b[1:], rtol=1e-6, atol=1e-8)
+    p = 1 / (1 + np.exp(-A @ b))
+    np.testing.assert_allclose(fit['cov'], np.linalg.inv(A.T @ (A * (p * (1 - p))[:, None]))[1:, 1:], rtol=1e-5)
+
+
+def test_pair_battery_rank_statistics_invariant_to_monotone_maps():
+    from summit.epistasis.scale_free.rank_pairs import pair_battery
+    y, x, z, cov, sex = _pair_data(2)
+    a = pair_battery(y, x, z, cov, strata=sex, links=('logit', 'cloglog'), boot=20)
+    b = pair_battery(np.log(y) ** 3 + 7, x, z, cov, strata=sex, links=('logit', 'cloglog'), boot=20)
+    for key in ('cpm_logit_z', 'cpm_cloglog_z', 'strat_byz_trend_z', 'strat_byx_trend_z', 'auc_trend_z',
+                'R_star', 'R_star_lower'):
+        assert np.isclose(a[key], b[key], rtol=1e-6), key
+    assert a['cpm_logit_z'] > 3 and not np.isclose(a['hc3_raw_z'], b['hc3_raw_z'])

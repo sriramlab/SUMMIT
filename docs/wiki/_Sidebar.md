@@ -15,6 +15,7 @@
 - [G×E models](GxE-models.md)
 - [Multiple environments](Multiple-environments.md)
 - [Quantitative epistasis](Epistasis.md)
+- [Scale-free epistasis](Epistasis-scale-free.md)
 - [Cross-trait response models](Cross-trait-analysis.md)
 - [Binary traits and PCGC](Binary-traits-and-PCGC.md)
 - [Generalized G×E PCGC](Generalized-GxE-PCGC.md)
