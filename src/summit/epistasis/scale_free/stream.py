@@ -25,7 +25,7 @@ from time import perf_counter
 
 import numpy as np
 
-PAIRS = {'gy': ('gy', 'gy'), 'll': ('lo', 'lo'), 'hh': ('hi', 'hi'), 'lh': ('lo', 'hi')}
+PAIRS = {'gy': ('gy', 'gy'), 'll': ('lo', 'lo'), 'hh': ('hi', 'hi'), 'lh': ('lo', 'hi'), 'yy': ('y', 'y')}
 
 
 @dataclass(frozen=True)

@@ -87,14 +87,15 @@ def test_stream_kernels_match_dense_oracle(native):
     rows = np.flatnonzero(np.arange(len(source.samples)) % 7 != 3)
     ctx, out, cov = subset(rows, ctx, out, cov)
     plan = build_plan(rows, ctx, out, cov, scales=('raw', 'within_rank'), pattern_scales=('within_rank',),
-                      n_groups=6, seed=5)
+                      additive_scales=('raw',), n_groups=6, seed=5)
     annotation = (np.arange(90) % 4 == 0).astype(float)
     bg = background_axis(source, annotations=annotation[:, None], names=('A',), n_blocks=9)
     scale = estimate_scale(source, rows, bg.variants, threads=_threads(native))
     acc = accumulate(source, plan, scale, bg, block_size=17, threads=_threads(native), native=native, batch=3)
     s = dense_scores(np.asarray(source.values), scale, plan)
     chrom = np.array(bg.chromosomes)
-    for pair, (k1, k2) in (('gy', ('gy', 'gy')), ('ll', ('lo', 'lo')), ('hh', ('hi', 'hi')), ('lh', ('lo', 'hi'))):
+    for pair, (k1, k2) in (('gy', ('gy', 'gy')), ('ll', ('lo', 'lo')), ('hh', ('hi', 'hi')), ('lh', ('lo', 'hi')),
+                           ('yy', ('y', 'y'))):
         first, second = plan.kinds[k1], plan.kinds[k2]
         for p, (a, _) in enumerate(plan.keys[k1]):
             keep = ~np.isin(chrom, plan.analyses[a]['exclude_chromosomes'])
@@ -149,7 +150,8 @@ def test_hoeffding_matches_prototype_and_simulated_variance():
 def test_statistics_match_direct_definitions():
     source, raw, ctx, out, cov = simulated(seed=11)
     rows = np.arange(len(source.samples))
-    plan = build_plan(rows, ctx, out, cov, scales=('within_rank',), n_groups=8, seed=2)
+    plan = build_plan(rows, ctx, out, cov, scales=('within_rank',), additive_scales=('within_rank',), n_groups=8,
+                      seed=2)
     bg = background_axis(source, n_blocks=6)
     scale = estimate_scale(source, rows, bg.variants)
     acc = accumulate(source, plan, scale, bg, block_size=32, native=False)
@@ -167,6 +169,14 @@ def test_statistics_match_direct_definitions():
         w = (~np.isin(chrom, plan.analyses[a]['exclude_chromosomes'])).astype(float)
         gy, lo, hi = plan.kinds['gy'].start + p, plan.kinds['lo'].start + p, plan.kinds['hi'].start + p
         assert np.isclose(records[(a, 'dosage')]['estimate'], theta(gy, gy, w), rtol=1e-10)
+        yc = plan.kinds['y'].start + p
+        assert np.isclose(records[(a, 'additive')]['estimate'], theta(yc, yc, w), rtol=1e-10)
+        ty = theta(yc, yc, w)
+        assert np.isclose(records[(a, 'relative_dosage')]['estimate'], theta(gy, gy, w) / ty if ty > 0 else np.nan,
+                          rtol=1e-8, equal_nan=True)
+        ratio = plan.analyses[a]['global_ratio']['within_rank']
+        assert np.isclose(records[(a, 'global_excess')]['estimate'], theta(gy, gy, w) - ratio * theta(yc, yc, w),
+                          rtol=1e-8, atol=1e-16)
         ll, hh, lh = theta(lo, lo, w), theta(hi, hi, w), theta(lo, hi, w)
         expected_rho = lh / np.sqrt(ll * hh) if ll > 0 and hh > 0 else np.nan
         assert np.isclose(records[(a, 'rho')]['estimate'], expected_rho, rtol=1e-9, equal_nan=True)
@@ -281,7 +291,8 @@ def test_cli_end_to_end(tmp_path):
                               {'name': 'other', 'file': 'ctx.tsv', 'column': 'k', 'values': {'0': 0, '1': 1, '2': 2},
                                'low': [0, 1], 'high': [2], 'exclude_chromosomes': ['2']}],
                     background={'annotations': {'file': 'ann.tsv', 'columns': ['A']}, 'jackknife_blocks': 6},
-                    scales=['pooled_rank', 'within_rank'], groups=5, save_kernels=True)
+                    scales=['pooled_rank', 'within_rank'], additive_scales=['pooled_rank'], groups=5,
+                    save_kernels=True)
     (tmp_path / 'm.json').write_text(json.dumps(manifest))
     assert main(['epistasis', 'scale-free', str(tmp_path / 'm.json'), '--out', str(tmp_path / 'out'),
                  '--block-size', '16', '--memory-gib', '1']) == 0
@@ -289,7 +300,8 @@ def test_cli_end_to_end(tmp_path):
     res = pd.read_csv(tmp_path / 'out' / 'results.tsv', sep='\t')
     assert set(res.statistic) >= {'dosage', 'dosage[A]', 'dosage_diff[A]', 'rho', 'log_amp', 'delta2',
                                   'sel_lam[A]', 'sel_amp[A]'}
-    assert len(res) == 2 * 2 * (3 + 5)
+    assert len(res) == 2 * (8 + 3 + 5 + 5)
+    assert {'additive', 'relative_dosage', 'global_excess', 'additive[A]'} <= set(res.statistic)
     run = json.loads((tmp_path / 'out' / 'run.json').read_text())
     assert run['contexts']['v0']['chromosome'] == '1'
     assert (tmp_path / 'out' / 'COMPLETE').exists()
@@ -330,3 +342,21 @@ def test_pair_battery_rank_statistics_invariant_to_monotone_maps():
                 'R_star', 'R_star_lower'):
         assert np.isclose(a[key], b[key], rtol=1e-6), key
     assert a['cpm_logit_z'] > 3 and not np.isclose(a['hc3_raw_z'], b['hc3_raw_z'])
+
+
+def test_global_ratio_from_class_spreads():
+    rng = np.random.default_rng(3)
+    n = 30000
+    k = rng.binomial(2, .3, n)
+    u = rng.normal(size=n)
+    y = 1 + .4 * k + np.exp(.3 * k) * u
+    ctx = [Context('k', k, {0: 0., 1: 1., 2: 2.})]
+    plan = build_plan(np.arange(n), ctx, [Outcome('y', y)], np.zeros((n, 0)), scales=('raw',), n_groups=4)
+    g = (k - k.mean()) / k.std()
+    s = np.array([y[k == c].std() for c in range(3)])
+    pi = np.bincount(k) / n
+    gv = np.array([g[k == c][0] for c in range(3)])
+    expected = (np.sum(pi * gv * s) / np.sum(pi * s)) ** 2
+    assert np.isclose(plan.analyses[0]['global_ratio']['raw'], expected, rtol=1e-10)
+    assert abs(expected / (np.sum(pi * gv * np.exp(.3 * np.arange(3))) / np.sum(pi * np.exp(.3 * np.arange(3)))) ** 2
+               - 1) < .15

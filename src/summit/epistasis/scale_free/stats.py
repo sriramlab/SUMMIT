@@ -20,6 +20,12 @@ Statistics (lo = low classes, hi = high classes):
     sel_lam    log lambda_A - log lambda_rest, lambda = theta(lo, hi) / theta(lo, lo); null 0
     sel_amp    log alpha_A - log alpha_rest, alpha = theta(hi, hi) / theta(lo, lo); null 0
     dosage_diff  theta_A(gy, gy) - theta_rest(gy, gy); null 0
+    additive   theta(y, y) = mean_j (E[x_j y])^2 (with an additive column); descriptive
+    relative_dosage  theta(gy, gy) / theta(y, y): marginal epistasis relative to additive signal
+    global_excess    theta(gy, gy) - R theta(y, y), R = (sum_k pi_k g_k s_k / sum_k pi_k s_k)^2 with
+               s_k the class SD of the residual: the dosage statistic that an affine focal action
+               (class-specific location and scale of one common liability) would produce on this
+               scale, subtracted. Approximate (first order) on pooled scales; descriptive
 On the within-class rank scale every null holds exactly under an affine latent
 action of the context. On other scales rho and sel_* are first-order
 scale-free (proportional background), while the others are scale-dependent.
@@ -29,8 +35,9 @@ from __future__ import annotations
 import numpy as np
 from scipy.stats import norm
 
-NULLS = dict(dosage=0., dosage_diff=0., rho=1., log_amp=0., delta2=0., sel_lam=0., sel_amp=0.)
-ONE_SIDED = ('dosage', 'delta2')
+NULLS = dict(dosage=0., dosage_diff=0., rho=1., log_amp=0., delta2=0., sel_lam=0., sel_amp=0., additive=0.,
+             relative_dosage=0., global_excess=0.)
+ONE_SIDED = ('dosage', 'delta2', 'additive', 'relative_dosage')
 
 
 def hoeffding(kernels):
@@ -81,13 +88,24 @@ def _log_ratio(a, b):
     return np.log(a / b) if a > 0 and b > 0 else np.nan
 
 
-def dosage_statistics(theta, annotations, weights):
-    """theta: (1 + K,) for all, A_1..A_K; weights: matching background weights."""
+def dosage_statistics(theta, annotations, weights, global_ratio=None):
+    """theta: (1 + K,) dosage kernels for all, A_1..A_K, optionally followed by the
+    (1 + K,) additive kernels; weights: background weights per annotation."""
+    k_count = len(annotations) + 1
     out = dict(dosage=theta[0])
     for k, name in enumerate(annotations, start=1):
         rest = (weights[0] * theta[0] - weights[k] * theta[k]) / (weights[0] - weights[k])
         out[f'dosage[{name}]'] = theta[k]
         out[f'dosage_diff[{name}]'] = theta[k] - rest
+    if len(theta) == 2 * k_count:
+        additive = theta[k_count:]
+        out['additive'] = additive[0]
+        out['relative_dosage'] = theta[0] / additive[0] if additive[0] > 0 else np.nan
+        if global_ratio is not None:
+            out['global_excess'] = theta[0] - global_ratio * additive[0]
+        for k, name in enumerate(annotations, start=1):
+            out[f'additive[{name}]'] = additive[k]
+            out[f'relative_dosage[{name}]'] = theta[k] / additive[k] if additive[k] > 0 else np.nan
     return out
 
 
@@ -169,13 +187,21 @@ def summarize(plan, accumulation):
         return dict(analysis=a, context=info['context'], outcome=info['outcome'], scale=scale, n=info['n'],
                     n_low=info['n_low'], n_high=info['n_high'])
 
+    additive = {key: i for i, key in enumerate(plan.keys.get('y', ()))}
     if 'gy' in accumulation.kernels:
         for p, (a, scale) in enumerate(plan.keys['gy']):
             w, blocks = weights_for('gy', p)
             if np.any(w <= 0):
                 continue
-            stats = _family(accumulation.kernels['gy'][:, p], accumulation.between['gy'][:, p], w, blocks,
-                            lambda t, w=w: dosage_statistics(t, names, w))
+            raw, between, ww, bb = (accumulation.kernels['gy'][:, p], accumulation.between['gy'][:, p], w, blocks)
+            ratio = None
+            if (a, scale) in additive and 'yy' in accumulation.kernels:
+                i = additive[(a, scale)]
+                raw = np.concatenate([raw, accumulation.kernels['yy'][:, i]])
+                between = np.concatenate([between, accumulation.between['yy'][:, i]])
+                ww, bb = np.r_[w, w], np.concatenate([blocks, blocks])
+                ratio = plan.analyses[a].get('global_ratio', {}).get(scale)
+            stats = _family(raw, between, ww, bb, lambda t, w=w, r=ratio: dosage_statistics(t, names, w, r))
             records += [_record(base(a, scale), k, *v) for k, v in stats.items()]
     if 'll' in accumulation.kernels:
         for p, (a, scale) in enumerate(plan.keys['lo']):

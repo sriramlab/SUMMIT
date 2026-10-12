@@ -15,6 +15,7 @@ Manifest (JSON, paths relative to the manifest):
     background?: {variants?: ID file, annotations?: {file, columns}, jackknife_blocks?: 200}
     scales?: subset of raw/pooled_rank/within_rank (default pooled_rank, within_rank)
     pattern_scales?: scales that also get lo/hi pattern columns (default all)
+    additive_scales?: scales that also get the additive column (default none)
     groups?: 200, seed?: 20261011, genotype_scale?: empirical|hwe, save_kernels?: false
 
 A variant context codes minor-allele counts on the pass rows. With fewer than
@@ -107,13 +108,14 @@ def run(manifest, out, *, threads=1, memory_bytes=16 * 2**30, block_size=1024, n
     from ..cli import _jsonable
 
     started = perf_counter()
+    code = _code_identity()
     if progress is None:
         progress = _reporter()
     path, out = Path(manifest).resolve(), Path(out)
     spec = read_json(path)
     closed(spec, ('kind', 'schema_version', 'genotypes', 'samples', 'phenotypes', 'contexts'),
-           ('covariates', 'strata', 'analyses', 'background', 'scales', 'pattern_scales', 'groups', 'seed',
-            'genotype_scale', 'save_kernels'), name='scale-free manifest')
+           ('covariates', 'strata', 'analyses', 'background', 'scales', 'pattern_scales', 'additive_scales',
+            'groups', 'seed', 'genotype_scale', 'save_kernels'), name='scale-free manifest')
     if spec['kind'] != KIND or spec['schema_version'] != 1:
         raise ValueError('unsupported scale-free manifest')
     root = path.parent
@@ -173,7 +175,8 @@ def run(manifest, out, *, threads=1, memory_bytes=16 * 2**30, block_size=1024, n
             context_info[c['name']] = dict(file=c['file'], column=c['column'])
         plan = build_plan(rows, contexts, outcomes, covariates, analyses=spec.get('analyses'), strata=strata,
                           scales=spec.get('scales', ('pooled_rank', 'within_rank')),
-                          pattern_scales=spec.get('pattern_scales'), n_groups=spec.get('groups', 200),
+                          pattern_scales=spec.get('pattern_scales'), additive_scales=spec.get('additive_scales', ()),
+                          n_groups=spec.get('groups', 200),
                           seed=spec.get('seed', 20261011))
         print(f'scale-free plan: {len(plan.analyses)} analyses, {plan.n_columns} columns, {len(rows)} rows, '
               f'{perf_counter() - started:.0f} s', file=sys.stderr, flush=True)
@@ -213,7 +216,7 @@ def run(manifest, out, *, threads=1, memory_bytes=16 * 2**30, block_size=1024, n
                     genotype_source=source_identity, genotype_scale=scale.identity,
                     groups=plan.n_groups, seed=spec.get('seed', 20261011), diagnostics=result.diagnostics,
                     seconds=perf_counter() - started)
-    run_info['code_sha256'] = _code_identity()
+    run_info['code_sha256'] = code
     if native:
         info = native_module().build_info()
         run_info['native_build'] = {k: info.get(k) for k in ('source_commit', 'backend_version', 'blas_vendor',

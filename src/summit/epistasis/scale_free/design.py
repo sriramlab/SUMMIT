@@ -8,6 +8,7 @@ up to three columns are formed on the analysis rows:
     gy   standardized class value x residual   (dosage statistic, FAME-equivalent)
     lo   residual in the low classes            (pattern and selective statistics)
     hi   residual in the high classes
+    y    residual                               (additive normalizer, optional)
 
 Scales are ``raw``, ``pooled_rank`` (rank-inverse-normal over the analysis rows,
 the FAME convention) and ``within_rank`` (rank-inverse-normal within class x
@@ -29,7 +30,7 @@ import numpy as np
 from .transforms import blom_rank_normal, residualize_within
 
 SCALES = ('raw', 'pooled_rank', 'within_rank')
-KINDS = ('gy', 'lo', 'hi')
+KINDS = ('gy', 'lo', 'hi', 'y')
 
 
 @dataclass(frozen=True)
@@ -79,7 +80,7 @@ class Plan:
 
 
 def build_plan(rows, contexts, outcomes, covariates, *, analyses=None, strata=None,
-               scales=('pooled_rank', 'within_rank'), pattern_scales=None, n_groups=200,
+               scales=('pooled_rank', 'within_rank'), pattern_scales=None, additive_scales=(), n_groups=200,
                seed=20261011, min_group_rows=5):
     """Form outcome columns for every requested (context, outcome) analysis.
 
@@ -88,7 +89,9 @@ def build_plan(rows, contexts, outcomes, covariates, *, analyses=None, strata=No
     strata: optional labels (e.g. sex) crossed with the context classes for
     ranking and residualization. analyses: (context, outcome) names, default all
     combinations. pattern_scales: scales that also receive lo/hi columns
-    (default all scales).
+    (default all scales). additive_scales: scales that also receive the plain
+    residual column y, for theta_y = mean_j (E[x_j y])^2, the relative dosage
+    statistic and the global (affine-modifier) prediction of the dosage statistic.
     """
     rows = np.asarray(rows, dtype=np.int64)
     if rows.ndim != 1 or not len(rows) or np.any(np.diff(rows) <= 0):
@@ -98,8 +101,9 @@ def build_plan(rows, contexts, outcomes, covariates, *, analyses=None, strata=No
     pattern_scales = scales if pattern_scales is None else tuple(pattern_scales)
     if not scales or len(set(scales)) != len(scales) or not set(scales) <= set(SCALES):
         raise ValueError(f'scales must be distinct members of {SCALES}')
-    if not set(pattern_scales) <= set(scales):
-        raise ValueError('pattern scales must be among the analysed scales')
+    additive_scales = tuple(additive_scales)
+    if not set(pattern_scales) <= set(scales) or not set(additive_scales) <= set(scales):
+        raise ValueError('pattern and additive scales must be among the analysed scales')
     if type(n_groups) is not int or n_groups < 4:
         raise ValueError('at least four individual groups are required')
     contexts = {c.name: c for c in contexts}
@@ -156,7 +160,13 @@ def build_plan(rows, contexts, outcomes, covariates, *, analyses=None, strata=No
             else:
                 stacked.append(blom_rank_normal(y[idx], stratum))
         residual = residualize_within(np.column_stack(stacked), cov[idx], stratum)
+        share = np.array([np.mean(lab == k) for k in present])
+        level = np.array([g[lab == k][0] for k in present])
+        spread = {scale: np.array([residual[lab == k, s].std() for k in present]) for s, scale in enumerate(scales)}
         info.append(dict(index=a, context=cname, outcome=oname, n=int(len(idx)),
+                         class_sd={scale: {int(k): float(v) for k, v in zip(present, spread[scale])} for scale in scales},
+                         global_ratio={scale: float((np.sum(share * level * spread[scale])
+                                                     / np.sum(share * spread[scale])) ** 2) for scale in scales},
                          classes={int(k): int(np.sum(lab == k)) for k in present},
                          class_values={int(k): float(c.values[int(k)]) for k in present},
                          low=[int(k) for k in c.low], high=[int(k) for k in c.high],
@@ -174,6 +184,10 @@ def build_plan(rows, contexts, outcomes, covariates, *, analyses=None, strata=No
                 cols['hi'].append((idx[hi], r[hi]))
                 members['hi'].append(idx[hi])
                 keys['hi'].append((a, scale))
+            if scale in additive_scales:
+                cols['y'].append((idx, r))
+                members['y'].append(idx)
+                keys['y'].append((a, scale))
 
     q = sum(len(cols[k]) for k in KINDS)
     position = np.empty(n, dtype=np.int64)
