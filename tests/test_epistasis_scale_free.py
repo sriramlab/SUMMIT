@@ -460,3 +460,15 @@ def test_linear_relative_form_handles_qualitative_interaction():
     assert r['p_linear'] < 1e-6
     y0 = .25 * x + .3 * P + .2 * z + .8 * e * np.exp(.35 * z)  # noise-only modifier
     assert relative_stratified_test(y0, x, z, P)['p_linear'] > 1e-3
+
+
+def test_hc3_tolerates_exactly_fitted_rows():
+    from summit.epistasis.scale_free.rank_pairs import hc3_wald
+    rng = np.random.default_rng(3)
+    n = 500
+    single = np.zeros(n)
+    single[7] = 1                                   # a dummy that isolates one row: leverage 1
+    X = np.column_stack([np.ones(n), rng.normal(size=n), single])
+    y = X[:, 1] * .3 + rng.normal(size=n)
+    fit = hc3_wald(y, X, [1])
+    assert np.isfinite(fit['p']) and np.all(np.isfinite(fit['cov']))

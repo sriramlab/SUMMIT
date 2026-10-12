@@ -220,7 +220,9 @@ def hc3_wald(y, X, test):
     beta = bread @ (X.T @ y)
     resid = y - X @ beta
     leverage = np.einsum('ij,ij->i', X @ bread, X)
-    scaled = X * (resid / (1 - leverage))[:, None]
+    # A row with leverage 1 is fitted exactly (zero residual); its HC3 term is 0, not 0/0.
+    inflate = np.divide(resid, 1 - leverage, out=np.zeros_like(resid), where=leverage < 1 - 1e-10)
+    scaled = X * inflate[:, None]
     cov = bread @ (scaled.T @ scaled) @ bread
     bt, vt = beta[test], cov[np.ix_(test, test)]
     w, U = np.linalg.eigh((vt + vt.T) / 2)
