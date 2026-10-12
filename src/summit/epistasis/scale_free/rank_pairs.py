@@ -428,6 +428,23 @@ def hc3_product_test(y, x, z, covariates=None):
     return dict(beta=float(r['beta'][5]), z=float(r['beta'][5] / np.sqrt(r['cov'][5, 5])), p=r['p'])
 
 
+def covariate_basis(covariates, rcond=1e-8):
+    """Centred orthonormal basis (scaled to unit variance) of the covariate span.
+
+    Nuisance covariates often contain exact collinearities, for example
+    category dummies whose dropped level is empty on the analysed rows. The
+    pair statistics depend on covariates only through their span, so a
+    full-rank basis leaves them unchanged and keeps Newton solves well posed.
+    """
+    c = np.asarray(covariates, float)
+    c = c - c.mean(axis=0)
+    if c.shape[1] == 0:
+        return c
+    u, sv, _ = np.linalg.svd(c, full_matrices=False)
+    keep = sv > rcond * sv[0]
+    return u[:, keep] * np.sqrt(len(c))
+
+
 def pair_battery(y, x, z, covariates, *, strata=None, links=LINKS, bins=40, boot=200, seed=7,
                  min_homozygote_cell=500):
     """All pair statistics for minor-allele counts x, z (0/1/2) and a positive outcome y.
@@ -437,8 +454,7 @@ def pair_battery(y, x, z, covariates, *, strata=None, links=LINKS, bins=40, boot
     flat dict.
     """
     y, x, z = np.asarray(y, float), np.asarray(x, np.int64), np.asarray(z, np.int64)
-    cov = np.asarray(covariates, float)
-    cov = (cov - cov.mean(axis=0)) / np.where(cov.std(axis=0) > 0, cov.std(axis=0), 1)
+    cov = covariate_basis(covariates)
 
     def centred(v):
         v = np.asarray(v, float)

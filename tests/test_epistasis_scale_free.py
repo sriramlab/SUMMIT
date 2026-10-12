@@ -406,3 +406,13 @@ def test_relative_stratified_test_separates_modifier_from_specific():
     # z modifies x specifically: both reject
     y2 = (.25 + .15 * z) * x + .3 * P + .2 * z + .8 * e
     assert relative_stratified_test(y2, x, z, P)['p'] < 1e-6
+
+
+def test_pair_battery_handles_collinear_covariates():
+    from summit.epistasis.scale_free.rank_pairs import pair_battery
+    y, x, z, cov, sex = _pair_data(3, n=6000)
+    centre = np.random.default_rng(1).integers(0, 3, len(y))
+    dummies = np.column_stack([centre == 1, centre == 2, centre == 0]).astype(float)   # sums to one
+    a = pair_battery(y, x, z, np.column_stack([cov, dummies]), strata=sex, links=('logit',), boot=10)
+    b = pair_battery(y, x, z, np.column_stack([cov, dummies[:, :2]]), strata=sex, links=('logit',), boot=10)
+    assert a['cpm_logit_converged'] and np.isclose(a['cpm_logit_z'], b['cpm_logit_z'], rtol=1e-6)
