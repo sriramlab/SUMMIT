@@ -379,3 +379,14 @@ def test_hc3_matches_qr_reference():
     fit = hc3_wald(y, X, [1, 3])
     np.testing.assert_allclose(fit['beta'], beta, rtol=1e-9)
     np.testing.assert_allclose(fit['cov'], cov, rtol=1e-8)
+
+
+def test_stratified_rank_test_calibrated_for_rare_homozygotes():
+    from summit.epistasis.scale_free.rank_pairs import stratified_rank_test
+    rng = np.random.default_rng(7)
+    n, p = 60000, []
+    for _ in range(30):
+        x, z = rng.binomial(2, .02, n), rng.binomial(2, .3, n)
+        y = np.exp(.3 * x + .2 * z + rng.normal(size=n))
+        p.append(stratified_rank_test(y, x, z, strata=rng.integers(0, 2, n))['omnibus_p'])
+    assert min(p) > 1e-3 and np.mean(np.array(p) < .05) <= .15

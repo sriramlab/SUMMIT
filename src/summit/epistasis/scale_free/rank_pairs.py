@@ -224,7 +224,7 @@ def hc3_wald(y, X, test):
     cov = bread @ (scaled.T @ scaled) @ bread
     bt, vt = beta[test], cov[np.ix_(test, test)]
     w, U = np.linalg.eigh((vt + vt.T) / 2)
-    keep = w > w.max() * 1e-10
+    keep = w > w.max() * 1e-8
     stat = float(np.sum((U[:, keep].T @ bt) ** 2 / w[keep]))
     df = int(keep.sum())
     return dict(beta=beta, cov=cov, stat=stat, df=df, p=float(chi2.sf(stat, df)))
@@ -244,11 +244,22 @@ def _design(columns, extra=None):
 def stratified_rank_test(y, x, z, covariates=None, strata=None, min_cell=50):
     """Rank-normalize within z (x strata) and test x effects across z strata (HC3).
 
-    Exact under an affine latent action of z. Returns a 2(S-1)-df omnibus test
-    and a 1-df trend test of x_add x z. z strata lacking support in at least
-    two x classes (min_cell each) are dropped.
+    Exact under an affine latent action of z. Returns an omnibus test (up to
+    2(S-1) df) and a 1-df trend test of x_add x z. z strata lacking support in
+    at least two x classes (min_cell each) are dropped.
+
+    The coding adapts to support. Minor homozygotes of x join the heterozygotes
+    when they number fewer than min_cell. A stratum-specific heterozygote term
+    enters only where all three x classes have min_cell members; otherwise the
+    additive and heterozygote interaction columns are nearly collinear within
+    the stratum, and the Wald statistic is unstable (spuriously small p values
+    under the null for rare variants).
     """
-    supported = [s for s in np.unique(z) if sum(np.sum((z == s) & (x == v)) >= min_cell for v in (0, 1, 2)) >= 2]
+    x = np.asarray(x, dtype=np.int64)
+    if np.sum(x == 2) < min_cell:
+        x = np.minimum(x, 1)
+    classes = np.unique(x)
+    supported = [s for s in np.unique(z) if sum(np.sum((z == s) & (x == v)) >= min_cell for v in classes) >= 2]
     keep = np.isin(z, supported)
     y, x, z = y[keep], x[keep], z[keep]
     covariates = None if covariates is None else covariates[keep]
@@ -259,13 +270,15 @@ def stratified_rank_test(y, x, z, covariates=None, strata=None, min_cell=50):
     xa = x - x.mean()
     xh = (x == 1).astype(float)
     xh -= xh.mean()
-    base = [np.ones(len(y))] + [(z == s).astype(float) for s in levels[1:]] + [xa, xh]
+    three = len(classes) == 3
+    base = [np.ones(len(y))] + [(z == s).astype(float) for s in levels[1:]] + ([xa, xh] if three else [xa])
     cols, test = list(base), []
     for s in levels[1:]:
-        cols.append(xa * (z == s))
+        inside = z == s
+        cols.append(xa * inside)
         test.append(len(cols) - 1)
-        if np.sum((z == s) & (x == 1)) >= min_cell and np.sum((z == s) & (x != 1)) >= min_cell:
-            cols.append(xh * (z == s))
+        if three and min(np.sum(inside & (x == v)) for v in classes) >= min_cell:
+            cols.append(xh * inside)
             test.append(len(cols) - 1)
     extra = None if covariates is None else np.asarray(covariates, dtype=np.float64)
     omnibus = hc3_wald(ranked, _design(cols, extra), test)
