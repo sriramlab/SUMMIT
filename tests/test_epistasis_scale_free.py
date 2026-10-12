@@ -416,3 +416,34 @@ def test_pair_battery_handles_collinear_covariates():
     a = pair_battery(y, x, z, np.column_stack([cov, dummies]), strata=sex, links=('logit',), boot=10)
     b = pair_battery(y, x, z, np.column_stack([cov, dummies[:, :2]]), strata=sex, links=('logit',), boot=10)
     assert a['cpm_logit_converged'] and np.isclose(a['cpm_logit_z'], b['cpm_logit_z'], rtol=1e-6)
+
+
+def test_target_variance_qtl_biases_iid_residual_fit_and_modifier_squares_removes_it():
+    """Same-person terms make the FAME-like moment fit respond to a target variance QTL (theory10 Prop. 8)."""
+    from summit.epistasis.prepare import SelectedStudy, fit_scale
+    from summit.epistasis.summary import fit_epistasis
+    rng = np.random.default_rng(5)
+    n, m = 1500, 200
+    raw = rng.binomial(2, rng.uniform(.1, .5, m), (n, m)).astype(float)
+    raw[:, 0] = rng.binomial(2, .25, n)
+    axis = VariantAxis(tuple(f'v{i}' for i in range(m)), ('1',) * m, tuple(range(1, m + 1)), ('A',) * m, ('G',) * m)
+    make = lambda: ArrayGenotypeSource(raw, [(str(i), str(i)) for i in range(n)], axis)
+    scale = fit_scale(make(), np.arange(n), block_size=64, threads=1)
+    x = (raw - scale.mean) * scale.inverse_scale
+    g = x[:, 0]
+    w = np.ones((m, 2))
+    w[0] = 0
+    noise = rng.normal(size=n) * np.exp(.6 * g)
+    y = (x @ (rng.normal(0, np.sqrt(.4 / m), m) * (np.arange(m) > 0)) + .3 * g + noise * np.sqrt(.6) / noise.std())[:, None]
+    fits = {}
+    for name, extra in (('iid', {}), ('squares', dict(residual_basis=np.column_stack([g ** 2, np.ones(n)]),
+                                                      residual_names=('residual_square:epi', 'residual')))):
+        study = SelectedStudy(make(), np.arange(n), scale, fixed_effects=np.column_stack([np.ones(n), g]),
+                              modifiers=np.column_stack([np.ones(n), g]), weights=w,
+                              component_names=('additive', 'epi'), definitions={'target': 'v0'},
+                              backend='numpy', block_size=64, threads=1, **extra)
+        summary, *_ = study.summarize(study.reference(exact=True), y, trait_names=('y',))
+        fit = fit_epistasis(summary)
+        k = list(fit['component_names']).index('epi')
+        fits[name] = fit['coefficients'][k] / fit['standard_errors'][k]
+    assert fits['iid'] > 3 and abs(fits['squares']) < 2.5
