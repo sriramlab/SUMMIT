@@ -290,6 +290,53 @@ def stratified_rank_test(y, x, z, covariates=None, strata=None, min_cell=50):
                 strata=[int(s) for s in levels])
 
 
+def relative_stratified_test(y, x, z, background, covariates=None, strata=None, min_cell=50, min_z=3.):
+    """Is x's effect modified across z strata differently from the polygenic background?
+
+    Within each z stratum (ranked within z x strata), HC3 OLS of the ranks on
+    x, the background score P and covariates gives b_s (x) and c_s (P). If z
+    acts affinely on the whole liability, rescales only the noise, or rescales
+    every genetic effect equally, then b_s / c_s is constant across strata.
+    Returns the heterogeneity Wald test of the ratios (delta method). Strata
+    whose |b|/SE or |c|/SE is below min_z are excluded; with fewer than two
+    usable strata the test is not evaluable (p = NaN).
+    """
+    y = np.asarray(y, float)
+    x = np.asarray(x, dtype=np.int64)
+    z = np.asarray(z)
+    P = np.asarray(background, float)
+    if np.sum(x == 2) < min_cell:
+        x = np.minimum(x, 1)
+    stratum = z.astype(np.int64) if strata is None else (
+        z.astype(np.int64) * (int(np.max(strata)) + 1) + np.asarray(strata).astype(np.int64))
+    ranked = blom_rank_normal(y, stratum)
+    extra = None if covariates is None else np.asarray(covariates, dtype=np.float64)
+    out = []
+    for s in np.unique(z):
+        inside = z == s
+        if sum(np.sum(inside & (x == v)) >= min_cell for v in np.unique(x)) < 2:
+            continue
+        cov = None if extra is None else extra[inside]
+        if cov is not None:
+            cov = cov[:, cov.std(axis=0) > 0]
+        fit = hc3_wald(ranked[inside], _design([np.ones(inside.sum()), x[inside] - x[inside].mean(),
+                                                 P[inside] - P[inside].mean()], cov), [1, 2])
+        b, c = fit['beta'][1], fit['beta'][2]
+        v = fit['cov'][1:3, 1:3]
+        out.append(dict(stratum=int(s), n=int(inside.sum()), b=float(b), c=float(c), z_b=float(b / np.sqrt(v[0, 0])),
+                        z_c=float(c / np.sqrt(v[1, 1])), ratio=float(b / c),
+                        ratio_var=float((v[0, 0] - 2 * (b / c) * v[0, 1] + (b / c) ** 2 * v[1, 1]) / c ** 2)))
+    usable = [o for o in out if abs(o['z_b']) >= min_z and abs(o['z_c']) >= min_z]
+    if len(usable) < 2:
+        return dict(strata=out, p=np.nan, stat=np.nan, df=0, evaluable=False)
+    r = np.array([o['ratio'] for o in usable])
+    w = 1 / np.array([o['ratio_var'] for o in usable])
+    mean = np.sum(w * r) / w.sum()
+    stat = float(np.sum(w * (r - mean) ** 2))
+    return dict(strata=out, p=float(chi2.sf(stat, len(usable) - 1)), stat=stat, df=len(usable) - 1, evaluable=True,
+                pooled_ratio=float(mean))
+
+
 def _auc(a, b):
     n1, n0 = len(a), len(b)
     r = rankdata(np.r_[a, b])

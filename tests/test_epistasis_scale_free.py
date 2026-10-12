@@ -390,3 +390,19 @@ def test_stratified_rank_test_calibrated_for_rare_homozygotes():
         y = np.exp(.3 * x + .2 * z + rng.normal(size=n))
         p.append(stratified_rank_test(y, x, z, strata=rng.integers(0, 2, n))['omnibus_p'])
     assert min(p) > 1e-3 and np.mean(np.array(p) < .05) <= .15
+
+
+def test_relative_stratified_test_separates_modifier_from_specific():
+    from summit.epistasis.scale_free.rank_pairs import relative_stratified_test, stratified_rank_test
+    rng = np.random.default_rng(11)
+    n = 120000
+    x, z = rng.binomial(2, .3, n), rng.binomial(2, .3, n)
+    P = rng.normal(size=n)
+    e = rng.normal(size=n)
+    # z rescales the noise only: the stratified test rejects, the relative test should not
+    y = .25 * x + .3 * P + .2 * z + .8 * e * np.exp(.35 * z)
+    assert stratified_rank_test(y, x, z)['omnibus_p'] < 1e-6
+    assert relative_stratified_test(y, x, z, P)['p'] > 1e-3
+    # z modifies x specifically: both reject
+    y2 = (.25 + .15 * z) * x + .3 * P + .2 * z + .8 * e
+    assert relative_stratified_test(y2, x, z, P)['p'] < 1e-6
