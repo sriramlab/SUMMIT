@@ -571,6 +571,34 @@ def _stable_center_and_scale(
 
 
 
+CLASSIC_ENVIRONMENT_MOMENTS_METHOD = "analysis_environment_power_sums_v1"
+
+
+def classic_environment_moments(environment: np.ndarray, *, residual_rank: int) -> dict:
+    """Power sums of one cohort's analysis environment for population transport.
+
+    ``environment`` is the centered (and per-SD scaled) environment exactly as
+    the cohort's GxE model uses it.  The sums are deterministic (``math.fsum``)
+    person-summed aggregates, safe to publish.  With the cohort size and
+    residual rank they give the cohort's context moments for the transported
+    same- and different-person terms (summit.inference.gxe).
+    """
+    values = np.asarray(environment, dtype=np.float64)
+    if values.ndim != 1 or values.size < 2 or not np.all(np.isfinite(values)):
+        raise ValueError("Environment moments require a finite vector of at least two values.")
+    rank = int(residual_rank)
+    if rank < 1 or rank >= values.size:
+        raise ValueError("Environment moments require 0 < residual_rank < N.")
+    return {
+        "method": CLASSIC_ENVIRONMENT_MOMENTS_METHOD,
+        "n_samples": int(values.size),
+        "residual_rank": rank,
+        "sum": float(math.fsum(float(value) for value in values)),
+        "sum_squares": float(math.fsum(float(value) ** 2 for value in values)),
+        "sum_fourth_powers": float(math.fsum(float(value) ** 4 for value in values)),
+    }
+
+
 def read_env_and_cov(
     env_filename: str,
     fam_filename: str | None,
@@ -3098,6 +3126,12 @@ class GenomewideEnvLDScore:
                     *[f"GxE:{name}" for name in self.l2cols],
                 ],
                 "same_individual_kernel_products": population_products.tolist(),
+                # Reference context moments for the transported same- and
+                # different-person terms; references without them fall back
+                # to the legacy sample-size scaling.
+                "environment_moments": classic_environment_moments(
+                    self.env, residual_rank=int(self.df_corr)
+                ),
             }
         with self._performance_phase("output_serialization_staging"):
             self._atomic_json(payload, manifest_path)

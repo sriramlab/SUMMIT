@@ -331,6 +331,14 @@ def test_shared_multi_environment_matches_independent_references(tmp_path):
             Path(f"{observed}.gxe.ref.json").read_text(encoding="utf-8")
         )
         assert "jackknife" not in manifest
+        # Each environment's reference records its own analysis-environment
+        # power sums for population transport, as an independent run does.
+        independent_manifest = json.loads(
+            Path(f"{independent[column]}.gxe.ref.json").read_text(encoding="utf-8")
+        )
+        moments = manifest["population_trace"]["environment_moments"]
+        assert moments == independent_manifest["population_trace"]["environment_moments"]
+        assert moments["residual_rank"] == manifest["residual_rank"]
         assert "BLOCK" not in pd.read_csv(
             Path(f"{observed}.gxe.diag.tsv.gz"), sep="\t"
         ).columns
