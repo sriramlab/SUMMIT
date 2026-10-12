@@ -119,6 +119,27 @@ with `--gxe-pheno-col`. The model requires matching variant and feature
 definitions and assumes compatible genotype–environment distributions between
 reference and study. Cohort-specific residual moments are computed in the study.
 
+Each cohort standardizes its own environment and normalizes its own features,
+so the reference's kernel moments are moved to the study's people
+([Methods](Methods.md#classic-one-environment-transfer)). The study's people
+can differ from the reference in their environment distribution, for example
+when missingness depends on age. The reference records its environment's power
+sums, and scoring records the study's. The fit then forms the study's
+same-person moments and corrects the different-person moments for the study's
+environment composition.
+
+A reference or score set made before these sums were recorded still fits. Its
+fit keeps the earlier sample-size scaling and warns: a study that is not a
+random sample of the reference with respect to the environment then
+misestimates the G×E variance. Rebuild the reference and rescore the trait to
+use the correction. The fit's `normal_equation_diagnostics` record
+`same_person_transport` and `different_person_transport`.
+
+The G×E variance refers to the study's own standardized environment. When the
+study's environment mean differs from the reference's, the two cohorts' G×E
+components are not the same quantity, because the model has no G–G×E
+covariance term.
+
 ## Alternative scaling
 
 `--gxe-kernel-mode raw_projected --gxe-genotype-scale hwe` uses the natural

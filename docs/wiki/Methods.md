@@ -257,6 +257,42 @@ method. It estimates aggregate kernel actions and stores grouped numerators;
 its summary deletion is approximate. Its finite-probe outputs and deletion
 procedure are not interchangeable with the per-variant estimator above.
 
+### Classic one-environment transfer
+
+The one-environment G + G×E + N×E model (`--gxe-population-reference`) uses
+the same decomposition with the basis `(1, e)` and only the G = (0,0) and G×E =
+(1,1) kernels. Each cohort centers and per-SD scales its own environment,
+projects out the intercept, covariates and environment, and rescales every
+projected feature to squared norm `r` (the residual rank). For genotypes
+independent of `e` the interaction feature is then about `g_ij e_i / sqrt(m2)`
+with `m2 = sum e^2 / n`, so the scale of `e` cancels:
+
+- kernel diagonals `K_G(i,i) ≈ (r/n) h(i)` and
+  `K_GxE(i,i) ≈ (r/n) h(i) e_i^2 / m2`, giving `u(i) = (r/n)(1, e_i^2/m2)` and
+  `G = (r/n)^2 [[n, S2/m2], [S2/m2, S4/m2^2]]`;
+- different-person entries `K(i,j) ≈ kappa(i,j) psi(i,j)` with
+  `psi = (1, e_i e_j / m2)`, giving
+  `F = [[n(n-1), (S1^2-S2)/m2], [., (S2^2-S4)/m2^2]]`.
+
+`S1, S2, S4` are each cohort's power sums of its analysis environment. A
+cohort's composition enters only through `n`, `r` and the normalized fourth
+moment `n S4 / S2^2`. The fit uses
+`D_S = f D_R + kron(G_S - f G_R, c)`, with `c = D_R[G,G] / G_R[0,0]`, and adds
+`kron(F_S - s F_R, L)`. Here `L` sums the reference's G–G LD scalars over the
+retained jackknife blocks, divided by the retained annotation masses. The
+components are ordered G for every annotation, then G×E for every annotation,
+which fixes the Kronecker order.
+
+Because each cohort re-standardizes its environment, the different-person
+correction is of order `n` against entries of order `n^2`, and is negligible in
+practice. The same-person G×E–G×E entry carries the change in the normalized
+fourth moment. Under the old scaling it biases the G×E variance
+multiplicatively when the environment distribution differs, while a null G×E
+estimate stays unbiased. Per-person kernel diagonals are not stored by this
+mode, so no exact own-row term is available. With unnormalized features
+(`raw_projected`), `u = (1, e^2)` and `psi = (1, e_i e_j)`, the generalized
+formulas restricted to the (0,0) and (1,1) pairs.
+
 ## PGS posterior mean
 
 For each SNP j, let `beta_j ~ N(0, Lambda/M)`. Let R be a positive diagonal
