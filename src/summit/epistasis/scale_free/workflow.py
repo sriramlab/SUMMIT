@@ -55,7 +55,7 @@ def covariate_matrix(table, columns=(), categorical=()):
         if name not in table.columns:
             raise ValueError(f'missing categorical covariate {name}')
         values = table[name].astype(str).replace({'': np.nan, 'NA': np.nan, 'nan': np.nan})
-        dummies = pd.get_dummies(values, drop_first=True, dtype=np.float64).to_numpy()
+        dummies = np.array(pd.get_dummies(values, drop_first=True, dtype=np.float64).to_numpy(), copy=True)
         dummies[values.isna().to_numpy()] = np.nan
         parts.append(dummies)
     return np.column_stack(parts) if parts else np.zeros((len(table), 0))
