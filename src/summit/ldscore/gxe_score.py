@@ -36,6 +36,7 @@ from .gwe_ldscore import (
     _validate_gxe_annotation_names,
     _validate_native_blas_runtime,
     _validate_plink_bed_shape,
+    classic_environment_moments,
     read_env_and_cov,
 )
 
@@ -1479,6 +1480,11 @@ def score_phenotype_from_reference(
                 feature_nxe_x,
                 feature_nxe_w,
                 study_rank,
+            )
+            # The study's own analysis-environment power sums: the fit forms
+            # the study same- and different-person terms from them.
+            population_design["environment_moments"] = classic_environment_moments(
+                environment, residual_rank=study_rank
             )
         else:
             score_x, score_w = score_result

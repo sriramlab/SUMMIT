@@ -151,6 +151,11 @@ class _PreparedGxEReference:
     deleted_matrices: np.ndarray | None
     deleted_traces: np.ndarray | None
     population_same_individual_products: np.ndarray | None
+    # Reference analysis-environment power sums (population_trace
+    # ``environment_moments``) and raw per-block G-G LD scalars; None for
+    # references written before they were recorded.
+    population_environment_moments: dict[str, float] | None = None
+    population_ld_scalars: np.ndarray | None = None
 
 
 def _population_same_individual_products(
@@ -237,6 +242,242 @@ def _study_population_design_moments(
     return full
 
 
+CLASSIC_SAME_PERSON_TRANSPORTS = ("fourth_moment_difference", "scaled_legacy")
+CLASSIC_DIFFERENT_PERSON_TRANSPORTS = ("composition_corrected", "scaled_legacy")
+
+
+def _environment_moments_block(
+    container: Mapping[str, Any] | None, *, label: str
+) -> dict[str, float] | None:
+    """Validate an optional ``environment_moments`` block; None when absent."""
+    if not isinstance(container, Mapping):
+        return None
+    value = container.get("environment_moments")
+    if value is None:
+        return None
+    from ..ldscore.gwe_ldscore import CLASSIC_ENVIRONMENT_MOMENTS_METHOD
+
+    if not isinstance(value, Mapping) or value.get("method") != CLASSIC_ENVIRONMENT_MOMENTS_METHOD:
+        raise ValueError(f"{label} environment_moments use an unsupported method.")
+    n = value.get("n_samples")
+    rank = value.get("residual_rank")
+    if (
+        isinstance(n, bool) or not isinstance(n, int) or n < 2
+        or isinstance(rank, bool) or not isinstance(rank, int) or not 0 < rank < n
+    ):
+        raise ValueError(f"{label} environment_moments have an invalid size or rank.")
+    sums = {key: float(value.get(key, float("nan"))) for key in ("sum", "sum_squares", "sum_fourth_powers")}
+    if (
+        not all(np.isfinite(item) for item in sums.values())
+        or sums["sum_squares"] <= 0.0
+        or sums["sum_fourth_powers"] <= 0.0
+        # Cauchy-Schwarz: n sum(e^4) >= (sum e^2)^2.
+        or n * sums["sum_fourth_powers"] < (1.0 - 1.0e-12) * sums["sum_squares"] ** 2
+    ):
+        raise ValueError(f"{label} environment_moments are invalid.")
+    return {"n_samples": n, "residual_rank": rank, **sums}
+
+
+def classic_context_moments(
+    environment_moments: Mapping[str, Any],
+    *,
+    feature_convention: str = "standardized_projected",
+) -> tuple[np.ndarray, np.ndarray]:
+    """Per-cohort ``(G, F)`` (2 x 2, order G then GxE) for the classic model.
+
+    The classic model is the generalized model with basis ``(1, e)``, keeping
+    only the G = (0,0) and GxE = (1,1) kernels.  ``e`` is the cohort's own
+    analysis environment (centered and per-SD scaled in that cohort), and
+    each projected feature is rescaled per variant to squared norm ``r``.
+    With genotypes independent of ``e`` this gives, for person ``i`` with
+    squared-genotype mass ``h(i)`` and ``m2 = sum e^2 / n``,
+
+    - kernel diagonals ``K_G(i,i) ~ rho h(i)`` and
+      ``K_GxE(i,i) ~ rho h(i) e_i^2 / m2``, ``rho = r/n`` (each kernel has
+      trace ``r``), so ``u(i) = rho (1, e_i^2/m2)`` and
+      ``G = sum_i u u' = rho^2 [[n, S2/m2], [S2/m2, S4/m2^2]]``;
+    - different-person entries ``K(i,j) ~ kappa(i,j) psi(i,j)`` with
+      ``psi = (1, e_i e_j / m2)``, so
+      ``F = sum_{i != j} psi psi' = [[n(n-1), (S1^2-S2)/m2], [., (S2^2-S4)/m2^2]]``.
+
+    ``S1, S2, S4`` are the power sums of ``e``.  Both are invariant to the
+    scale of ``e`` (the per-variant normalization removes it), so a cohort's
+    composition enters only through ``n``, ``r`` and ``n S4 / S2^2``.
+    ``feature_convention="raw_projected"`` (no per-variant normalization)
+    gives ``u = (1, e^2)`` and ``psi = (1, e_i e_j)``, the generalized
+    formulas restricted to the (0,0) and (1,1) pairs.
+    """
+    n = float(environment_moments["n_samples"])
+    r = float(environment_moments["residual_rank"])
+    s1 = float(environment_moments["sum"])
+    s2 = float(environment_moments["sum_squares"])
+    s4 = float(environment_moments["sum_fourth_powers"])
+    if feature_convention == "standardized_projected":
+        m2 = s2 / n
+        rho = r / n
+        g = rho * rho * np.array([[n, s2 / m2], [s2 / m2, s4 / (m2 * m2)]])
+        cross = (s1 * s1 - s2) / m2
+        f = np.array([[n * (n - 1.0), cross], [cross, (s2 * s2 - s4) / (m2 * m2)]])
+    elif feature_convention == "raw_projected":
+        g = np.array([[n, s2], [s2, s4]])
+        cross = s1 * s1 - s2
+        f = np.array([[n * (n - 1.0), cross], [cross, s2 * s2 - s4]])
+    else:
+        raise ValueError(f"Unsupported feature convention {feature_convention!r}.")
+    return g, f
+
+
+def classic_study_same_individual_products(
+    reference_products: np.ndarray,
+    reference_moments: np.ndarray,
+    study_moments: np.ndarray,
+    *,
+    reference_n_samples: int,
+    study_n_samples: int,
+) -> np.ndarray:
+    """Release-safe study same-individual products ``D_S`` (2K x 2K).
+
+    ``D_S ~ f D_R + kron(G_S - f G_R, c)``, ``f = N_S/N_R``, with ``c[a,b] =
+    D_R[G:a, G:b] / G_R[0,0]`` and ``G`` from :func:`classic_context_moments`.
+    Components are ordered G:annotations then GxE:annotations, so the
+    Kronecker order is (G/GxE) then annotation.  Exact when the study is the
+    reference; corrects the study's environment composition otherwise.
+    """
+    products = _as_float_array("reference same-individual products", reference_products, ndim=2)
+    reference_g = _as_float_array("reference context moments", reference_moments, ndim=2)
+    study_g = _as_float_array("study context moments", study_moments, ndim=2)
+    if products.shape[0] != products.shape[1] or products.shape[0] % 2:
+        raise ValueError("Same-individual products must be 2K x 2K.")
+    _require_shape("reference context moments", reference_g, (2, 2))
+    _require_shape("study context moments", study_g, (2, 2))
+    if not reference_g[0, 0] > 0.0:
+        raise ValueError("Reference context moments have no additive mass.")
+    k = products.shape[0] // 2
+    fraction = float(study_n_samples) / float(reference_n_samples)
+    scale = products[:k, :k] / reference_g[0, 0]
+    return fraction * products + np.kron(study_g - fraction * reference_g, scale)
+
+
+def classic_ld_scalars(
+    block_numerators: np.ndarray,
+    block_masses: np.ndarray,
+    reference_products: np.ndarray,
+    annotation_masses: np.ndarray,
+    *,
+    reference_n_samples: int,
+) -> np.ndarray:
+    """Raw per-block additive-kernel LD scalars (blocks x K x K).
+
+    ``block_numerators`` are the raw (mass-unnormalized) G-G Gram numerators
+    of each jackknife block: ``r^2`` times the block's annotation-weighted
+    ``ld_xx`` sums, averaged over the two orientations.  The same-individual
+    G-G products, in raw units, are apportioned to blocks by each row
+    annotation's block mass fraction (summit.context.oracle.intercept_ld_scalars).
+    """
+    from ..context.oracle import intercept_ld_scalars
+
+    products = _as_float_array("reference same-individual products", reference_products, ndim=2)
+    masses = _as_float_array("annotation masses", annotation_masses, ndim=1)
+    k = masses.size
+    raw_same = products[:k, :k] * np.outer(masses, masses)
+    return intercept_ld_scalars(
+        block_numerators,
+        block_masses,
+        raw_same,
+        reference_n=int(reference_n_samples),
+        pair_count=1,
+    )
+
+
+def classic_different_individual_correction(
+    ld_scalars: np.ndarray,
+    exposure_difference: np.ndarray,
+    *,
+    masses: np.ndarray,
+    retained: np.ndarray | None = None,
+) -> np.ndarray:
+    """``kron(F_S - s F_R, L)`` with ``L = sum_retained ell_b / (m m')``.
+
+    ``masses`` normalize the (possibly deleted) reference Gram; ``retained``
+    is a boolean block mask (all blocks when None).
+    """
+    scalars = _as_float_array("LD scalars", ld_scalars, ndim=3)
+    difference = _as_float_array("exposure difference", exposure_difference, ndim=2)
+    normalizing = _as_float_array("masses", masses, ndim=1)
+    _require_shape("exposure difference", difference, (2, 2))
+    if retained is not None:
+        scalars = scalars[np.asarray(retained, dtype=bool)]
+    total = np.sum(scalars, axis=0, dtype=np.float64) / np.outer(normalizing, normalizing)
+    return np.kron(difference, total)
+
+
+def _classic_transport_plan(
+    prepared: "_PreparedGxEReference",
+    study_moments: Mapping[str, Any] | None,
+    *,
+    study_n_samples: int,
+    study_residual_rank: int,
+) -> dict[str, Any]:
+    """Choose the study's same- and different-person terms once per trait."""
+    import warnings
+
+    from ..context.oracle import (
+        DifferentPersonTransportWarning,
+        SamePersonTransportWarning,
+    )
+
+    reference_moments = prepared.population_environment_moments
+    n_ref = int(prepared.payload["n_samples"])
+    n_study = int(study_n_samples)
+    plan: dict[str, Any] = {
+        "study_same": None,
+        "same_person_transport": "scaled_legacy",
+        "exposure_difference": None,
+        "different_person_transport": "scaled_legacy",
+    }
+    if reference_moments is not None and study_moments is not None:
+        if (
+            int(study_moments["n_samples"]) != n_study
+            or int(study_moments["residual_rank"]) != int(study_residual_rank)
+        ):
+            raise ValueError("Study environment moments disagree with the study size/rank.")
+        convention = str(prepared.payload["feature_convention"])
+        g_ref, f_ref = classic_context_moments(reference_moments, feature_convention=convention)
+        g_study, f_study = classic_context_moments(study_moments, feature_convention=convention)
+        assert prepared.population_same_individual_products is not None
+        plan["study_same"] = classic_study_same_individual_products(
+            prepared.population_same_individual_products,
+            g_ref,
+            g_study,
+            reference_n_samples=n_ref,
+            study_n_samples=n_study,
+        )
+        plan["same_person_transport"] = "fourth_moment_difference"
+        if prepared.population_ld_scalars is not None:
+            scale = (n_study * (n_study - 1.0)) / (n_ref * (n_ref - 1.0))
+            plan["exposure_difference"] = f_study - scale * f_ref
+            plan["different_person_transport"] = "composition_corrected"
+    if n_study != n_ref:
+        if plan["same_person_transport"] == "scaled_legacy":
+            warnings.warn(
+                "Population GxE transfer uses the legacy scaled same-individual "
+                "products (N_S/N_R) D_R, biased when the study's environment "
+                "distribution differs from the reference's. Rebuild the reference "
+                "and rescore the study to record environment moments.",
+                SamePersonTransportWarning,
+                stacklevel=4,
+            )
+        if plan["different_person_transport"] == "scaled_legacy":
+            warnings.warn(
+                "Population GxE transfer scales the reference different-individual "
+                "moments by N_S(N_S-1)/(N_R(N_R-1)) without the environment "
+                "composition correction.",
+                DifferentPersonTransportWarning,
+                stacklevel=4,
+            )
+    return plan
+
+
 def transfer_reference_normal_equations(
     reference_equations: GxENormalEquations,
     *,
@@ -250,14 +491,23 @@ def transfer_reference_normal_equations(
     q_residual: float,
     trace_nxe: float,
     trace_nxe_sq: float,
+    study_same_individual_products: np.ndarray | None = None,
+    different_individual_correction: np.ndarray | None = None,
+    same_person_transport: str = "scaled_legacy",
+    different_person_transport: str = "scaled_legacy",
 ) -> GxENormalEquations:
     """Transfer phenotype-independent kernel moments to a study cohort.
 
     The reference genetic block is decomposed into same-person and
-    different-person parts. Under the declared reference-population
-    approximation, those parts scale as N and N(N-1), respectively. The
-    study's genetic-by-NxE and low-dimensional NxE moments are exact and are
-    never borrowed from the reference.
+    different-person parts:
+    ``T_S = D_S + s (T_R - D_R) + Delta_O`` with ``s = N_S(N_S-1)/(N_R(N_R-1))``.
+    ``D_S`` is ``study_same_individual_products`` (see
+    :func:`classic_study_same_individual_products`), else the legacy
+    ``(N_S/N_R) D_R``; ``Delta_O`` is ``different_individual_correction``
+    (see :func:`classic_different_individual_correction`), else zero.  Both
+    legacy forms assume the study is an exchangeable sample of the reference
+    population.  The study's genetic-by-NxE and low-dimensional NxE moments
+    are exact and are never borrowed from the reference.
     """
     n_ref = int(reference_n_samples)
     n_study = int(study_n_samples)
@@ -318,9 +568,32 @@ def transfer_reference_normal_equations(
         float(n_study * (n_study - 1)) / float(n_ref * (n_ref - 1))
     )
     reference_genetic = reference_matrix[:genetic_count, :genetic_count]
+    if study_same_individual_products is None:
+        if same_person_transport != "scaled_legacy":
+            raise ValueError(f"{same_person_transport!r} requires study same-individual products.")
+        study_same = same_scale * diagonal
+    else:
+        if same_person_transport != "fourth_moment_difference":
+            raise ValueError("Study same-individual products need the fourth_moment_difference label.")
+        study_same = _as_float_array(
+            "study same-individual products", study_same_individual_products, ndim=2
+        )
+        _require_shape("study same-individual products", study_same, diagonal.shape)
+    correction = np.zeros_like(diagonal)
+    if different_individual_correction is None:
+        if different_person_transport != "scaled_legacy":
+            raise ValueError(f"{different_person_transport!r} requires a different-individual correction.")
+    else:
+        if different_person_transport != "composition_corrected":
+            raise ValueError("A different-individual correction needs the composition_corrected label.")
+        correction = _as_float_array(
+            "different-individual correction", different_individual_correction, ndim=2
+        )
+        _require_shape("different-individual correction", correction, diagonal.shape)
     matrix[:genetic_count, :genetic_count] = (
-        same_scale * diagonal
+        study_same
         + different_scale * (reference_genetic - diagonal)
+        + correction
     )
     matrix[:genetic_count, genetic_count] = genetic_nxe
     matrix[genetic_count, :genetic_count] = matrix[
@@ -368,6 +641,8 @@ def transfer_reference_normal_equations(
             "same_individual_symmetry_error": diagonal_symmetry_error,
             "same_individual_minimum_eigenvalue": float(diagonal_eigenvalues[0]),
             "same_individual_estimator_psd_expected": False,
+            "same_person_transport": same_person_transport,
+            "different_person_transport": different_person_transport,
         },
     )
 
@@ -1022,6 +1297,28 @@ def _prepare_reference_sufficient_statistics(
             lhs[2 * k + 1, 2 * k + 1] = r
             lhs[:] = 0.5 * (lhs + lhs.T)
 
+    same_individual = (
+        None
+        if payload.get("population_trace") is None
+        else _population_same_individual_products(payload, annotation_names)
+    )
+    environment_moments = _environment_moments_block(
+        payload.get("population_trace"), label="Reference"
+    )
+    ld_scalars = None
+    if same_individual is not None and has_jackknife:
+        # Raw G-G Gram numerators per jackknife block, both orientations
+        # averaged exactly as the reference normal matrix is formed.
+        directed = panel_block["xx"]
+        numerators = r * r * 0.5 * (directed + np.swapaxes(directed, 1, 2))
+        ld_scalars = classic_ld_scalars(
+            numerators,
+            block_masses,
+            same_individual,
+            masses,
+            reference_n_samples=int(payload["n_samples"]),
+        )
+
     return _PreparedGxEReference(
         path=path,
         payload=dict(payload),
@@ -1047,11 +1344,9 @@ def _prepare_reference_sufficient_statistics(
         deleted_traces=(
             None if deleted_traces is None else np.array(deleted_traces, copy=True)
         ),
-        population_same_individual_products=(
-            None
-            if payload.get("population_trace") is None
-            else _population_same_individual_products(payload, annotation_names)
-        ),
+        population_same_individual_products=same_individual,
+        population_environment_moments=environment_moments,
+        population_ld_scalars=ld_scalars,
     )
 
 
@@ -1069,8 +1364,17 @@ def _equations_from_prepared_scores(
     jackknife_genetic_nxe_traces: np.ndarray | None = None,
     trace_nxe: float | None = None,
     trace_nxe_sq: float | None = None,
+    study_environment_moments: Mapping[str, Any] | None = None,
 ) -> tuple[GxENormalEquations, tuple[GxENormalEquations, ...]]:
-    """Insert phenotype score moments into prepared reference templates."""
+    """Insert phenotype score moments into prepared reference templates.
+
+    In population mode the study's same-individual products and the
+    different-individual composition correction are formed from the
+    reference's and the study's ``environment_moments`` when both exist
+    (:func:`_classic_transport_plan`).  Deleted systems reuse the full study
+    same-individual products; their correction drops the deleted block's LD
+    scalar and uses that deletion's retained annotation masses.
+    """
     annot = prepared.annotations
     m, k = annot.shape
     sx = _as_float_array("score_x", score_x, ndim=1)
@@ -1136,6 +1440,31 @@ def _equations_from_prepared_scores(
     rhs[k : 2 * k] = r * score_full["w"] / prepared.annotation_masses
     rhs[2 * k] = q_nxe
     rhs[2 * k + 1] = q_residual
+    plan: dict[str, Any] = {}
+    if population_transfer:
+        plan = _classic_transport_plan(
+            prepared,
+            study_environment_moments,
+            study_n_samples=int(study_n_samples),
+            study_residual_rank=int(r),
+        )
+
+    def transport_terms(retained_masses: np.ndarray, retained: np.ndarray | None) -> dict[str, Any]:
+        correction = None
+        if plan["exposure_difference"] is not None:
+            correction = classic_different_individual_correction(
+                prepared.population_ld_scalars,
+                plan["exposure_difference"],
+                masses=retained_masses,
+                retained=retained,
+            )
+        return {
+            "study_same_individual_products": plan["study_same"],
+            "same_person_transport": plan["same_person_transport"],
+            "different_individual_correction": correction,
+            "different_person_transport": plan["different_person_transport"],
+        }
+
     if population_transfer:
         transferred = transfer_reference_normal_equations(
             GxENormalEquations(
@@ -1154,6 +1483,7 @@ def _equations_from_prepared_scores(
             q_residual=q_residual,
             trace_nxe=float(trace_nxe),
             trace_nxe_sq=float(trace_nxe_sq),
+            **transport_terms(prepared.annotation_masses, None),
         )
         full = replace(transferred, rhs=rhs)
     else:
@@ -1215,6 +1545,10 @@ def _equations_from_prepared_scores(
                     q_residual=q_residual,
                     trace_nxe=float(trace_nxe),
                     trace_nxe_sq=float(trace_nxe_sq),
+                    **transport_terms(
+                        remain[block_id],
+                        np.arange(len(prepared.block_labels)) != block_id,
+                    ),
                 )
                 deleted.append(replace(deleted_template, rhs=deleted_rhs))
             else:
@@ -1679,6 +2013,11 @@ def _fit_prepared_trait(
         jackknife_genetic_nxe_traces=deleted_genetic_nxe,
         trace_nxe=trace_nxe,
         trace_nxe_sq=trace_nxe_sq,
+        study_environment_moments=(
+            _environment_moments_block(moments.get("population_design"), label="Study")
+            if population_transfer
+            else None
+        ),
     )
     fit = solve_normal_equations(
         equations,

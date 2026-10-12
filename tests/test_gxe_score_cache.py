@@ -631,3 +631,118 @@ def test_wide_cached_scoring_rejects_hidden_or_non_alphanumeric_trait_labels(
             pheno_cols=[unsafe_trait],
             output_prefix=tmp_path / "unsafe-output",
         )
+
+
+def _strip_environment_moments(source: Path, target: Path, section: str) -> Path:
+    payload = json.loads(source.read_text())
+    del payload[section]["environment_moments"]
+    target.write_text(json.dumps(payload))
+    return target
+
+
+def test_population_transport_uses_both_cohorts_environment_moments(
+    cached_reference, tmp_path
+):
+    import warnings
+
+    from summit.context.oracle import (
+        DifferentPersonTransportWarning,
+        SamePersonTransportWarning,
+    )
+    from summit.ldscore.gwe_ldscore import classic_environment_moments, read_env_and_cov
+
+    reference_payload = json.loads(cached_reference.manifest.read_text())
+    reference_env = read_env_and_cov(
+        str(cached_reference.environment), str(cached_reference.genotype_prefix) + ".fam",
+        cov_filename=str(cached_reference.covariates), pheno_filename=str(cached_reference.phenotype),
+    )
+    recorded = reference_payload["population_trace"]["environment_moments"]
+    expected = classic_environment_moments(
+        reference_env[0], residual_rank=reference_payload["residual_rank"])
+    assert recorded == pytest.approx(expected, rel=1e-12, abs=1e-12)
+
+    # Environment-dependent missingness: drop the people with the largest E.
+    phenotype = pd.read_csv(cached_reference.phenotype, sep=r"\s+")
+    environment = pd.read_csv(cached_reference.environment, sep=r"\s+")
+    phenotype.loc[environment["E"].rank(ascending=False) <= 9, "Y"] = np.nan
+    study_phenotype = tmp_path / "selected.tsv"
+    phenotype.to_csv(study_phenotype, sep="\t", index=False, na_rep="NA")
+    artifacts = gxe_score.score_phenotype_from_reference(
+        reference_manifest=cached_reference.manifest,
+        bed_path=cached_reference.genotype_prefix,
+        env_path=cached_reference.environment,
+        covar_path=cached_reference.covariates,
+        pheno_path=study_phenotype,
+        pheno_col="Y",
+        output_prefix=tmp_path / "selected",
+        population_transfer=True,
+        step_size=4,
+        num_threads=1,
+    )
+    moments = json.loads(artifacts.moments.read_text())
+    study_env = read_env_and_cov(
+        str(cached_reference.environment), str(cached_reference.genotype_prefix) + ".fam",
+        cov_filename=str(cached_reference.covariates), pheno_filename=str(study_phenotype),
+    )
+    assert moments["population_design"]["environment_moments"] == pytest.approx(
+        classic_environment_moments(study_env[0], residual_rank=moments["residual_rank"]),
+        rel=1e-12, abs=1e-12,
+    )
+    options = dict(njack=3, allow_ill_conditioned=True, max_condition=1e16)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        fitted, equations = fit_from_files(
+            cached_reference.manifest, artifacts.moments, artifacts.gwas, artifacts.gwis,
+            **options)
+    assert equations.diagnostics["same_person_transport"] == "fourth_moment_difference"
+    assert equations.diagnostics["different_person_transport"] == "composition_corrected"
+    assert fitted.normal_equation_diagnostics["same_person_transport"] == (
+        "fourth_moment_difference")
+
+    # Older study moments (no environment moments): legacy terms, with warnings.
+    older = _strip_environment_moments(
+        artifacts.moments, artifacts.moments.with_name("older.json"), "population_design")
+    with pytest.warns(SamePersonTransportWarning), pytest.warns(DifferentPersonTransportWarning):
+        _, legacy = fit_from_files(
+            cached_reference.manifest, older, artifacts.gwas, artifacts.gwis, **options)
+    assert legacy.diagnostics["same_person_transport"] == "scaled_legacy"
+    assert legacy.diagnostics["different_person_transport"] == "scaled_legacy"
+    assert not np.allclose(legacy.matrix, equations.matrix, rtol=1e-12, atol=0)
+    np.testing.assert_array_equal(legacy.matrix[4:, 4:], equations.matrix[4:, 4:])
+
+
+def test_population_fit_with_an_older_reference_keeps_legacy_terms(cached_reference, tmp_path):
+    from summit.context.oracle import (
+        DifferentPersonTransportWarning,
+        SamePersonTransportWarning,
+    )
+
+    phenotype = pd.read_csv(cached_reference.phenotype, sep=r"\s+")
+    phenotype.loc[:6, "Y"] = np.nan
+    study_phenotype = tmp_path / "subset.tsv"
+    phenotype.to_csv(study_phenotype, sep="\t", index=False, na_rep="NA")
+    artifacts = gxe_score.score_phenotype_from_reference(
+        reference_manifest=cached_reference.manifest,
+        bed_path=cached_reference.genotype_prefix,
+        env_path=cached_reference.environment,
+        covar_path=cached_reference.covariates,
+        pheno_path=study_phenotype,
+        pheno_col="Y",
+        output_prefix=tmp_path / "subset",
+        population_transfer=True,
+        step_size=4,
+        num_threads=1,
+    )
+    # A reference written before environment moments were recorded.
+    older = _strip_environment_moments(
+        cached_reference.manifest,
+        cached_reference.manifest.with_name("older-reference.gxe.ref.json"),
+        "population_trace",
+    )
+    with pytest.warns(SamePersonTransportWarning), pytest.warns(DifferentPersonTransportWarning):
+        _, equations = fit_from_files(
+            older, artifacts.moments, artifacts.gwas, artifacts.gwis,
+            njack=3, allow_ill_conditioned=True, max_condition=1e16,
+        )
+    assert equations.diagnostics["same_person_transport"] == "scaled_legacy"
+    assert equations.diagnostics["different_person_transport"] == "scaled_legacy"
