@@ -324,17 +324,43 @@ def relative_stratified_test(y, x, z, background, covariates=None, strata=None, 
         b, c = fit['beta'][1], fit['beta'][2]
         v = fit['cov'][1:3, 1:3]
         out.append(dict(stratum=int(s), n=int(inside.sum()), b=float(b), c=float(c), z_b=float(b / np.sqrt(v[0, 0])),
-                        z_c=float(c / np.sqrt(v[1, 1])), ratio=float(b / c),
+                        z_c=float(c / np.sqrt(v[1, 1])), ratio=float(b / c), cov_bc=float(v[0, 1]),
                         ratio_var=float((v[0, 0] - 2 * (b / c) * v[0, 1] + (b / c) ** 2 * v[1, 1]) / c ** 2)))
+    linear = _linear_relative(out, min_z)
     usable = [o for o in out if abs(o['z_b']) >= min_z and abs(o['z_c']) >= min_z]
     if len(usable) < 2:
-        return dict(strata=out, p=np.nan, stat=np.nan, df=0, evaluable=False)
+        return dict(strata=out, p=np.nan, stat=np.nan, df=0, evaluable=False, **linear)
     r = np.array([o['ratio'] for o in usable])
     w = 1 / np.array([o['ratio_var'] for o in usable])
     mean = np.sum(w * r) / w.sum()
     stat = float(np.sum(w * (r - mean) ** 2))
     return dict(strata=out, p=float(chi2.sf(stat, len(usable) - 1)), stat=stat, df=len(usable) - 1, evaluable=True,
-                pooled_ratio=float(mean))
+                pooled_ratio=float(mean), **linear)
+
+
+def _linear_relative(strata, min_z):
+    """Fieller-type test of b_s = kappa c_s for all strata (kappa free); needs only |c_s|/SE >= min_z.
+
+    Keeps strata where x has no effect (qualitative interaction), unlike the ratio form.
+    """
+    use = [o for o in strata if abs(o['z_c']) >= min_z]
+    if len(use) < 2:
+        return dict(p_linear=np.nan, stat_linear=np.nan, df_linear=0, kappa=np.nan)
+    b = np.array([o['b'] for o in use])
+    c = np.array([o['c'] for o in use])
+    vb = np.array([(o['b'] / o['z_b']) ** 2 for o in use])
+    vc = np.array([(o['c'] / o['z_c']) ** 2 for o in use])
+    cbc = np.array([o['cov_bc'] for o in use])
+
+    def q(k):
+        return float(np.sum((b - k * c) ** 2 / (vb - 2 * k * cbc + k * k * vc)))
+    grid = np.sum(b * c / vb) / np.sum(c * c / vb)
+    from scipy.optimize import minimize_scalar
+    span = 10 * max(abs(grid), np.max(np.abs(b / c)), 1e-6)
+    fit = minimize_scalar(q, bounds=(-span, span), method='bounded', options=dict(xatol=1e-10))
+    stat = min(fit.fun, q(grid))
+    return dict(p_linear=float(chi2.sf(stat, len(use) - 1)), stat_linear=stat, df_linear=len(use) - 1,
+                kappa=float(fit.x if fit.fun <= q(grid) else grid))
 
 
 def _auc(a, b):

@@ -447,3 +447,16 @@ def test_target_variance_qtl_biases_iid_residual_fit_and_modifier_squares_remove
         k = list(fit['component_names']).index('epi')
         fits[name] = fit['coefficients'][k] / fit['standard_errors'][k]
     assert fits['iid'] > 3 and abs(fits['squares']) < 2.5
+
+
+def test_linear_relative_form_handles_qualitative_interaction():
+    from summit.epistasis.scale_free.rank_pairs import relative_stratified_test
+    rng = np.random.default_rng(12)
+    n = 120000
+    x, z = rng.binomial(2, .3, n), rng.binomial(2, .3, n)
+    P, e = rng.normal(size=n), rng.normal(size=n)
+    y = .3 * x * (z > 0) + .3 * P + .2 * z + .8 * e           # x acts only when z > 0
+    r = relative_stratified_test(y, x, z, P)
+    assert r['p_linear'] < 1e-6
+    y0 = .25 * x + .3 * P + .2 * z + .8 * e * np.exp(.35 * z)  # noise-only modifier
+    assert relative_stratified_test(y0, x, z, P)['p_linear'] > 1e-3
