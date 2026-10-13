@@ -54,6 +54,6 @@ else
   echo 'SUMMIT_BACKEND must be portable or private' >&2; exit 2
 fi
 controls=()
-if [[ ${1:-} == make-inputs || ${1:-} == prepare || ${1:-} == train-direction || ${1:-} == prepare-traits ]]; then controls=(--num-threads "$threads"); fi
+if [[ ${1:-} == make-inputs || ${1:-} == prepare || ${1:-} == train-direction || ${1:-} == prepare-traits || ${1:-} == scale-free ]]; then controls=(--num-threads "$threads"); fi
 exec taskset -c "$SUMMIT_CPUS" "$conda_root/bin/conda" run --no-capture-output -n summit \
   python "$launcher" summit.epistasis.cli "$@" "${controls[@]}"

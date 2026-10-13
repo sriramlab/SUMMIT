@@ -14,7 +14,7 @@ def epistasis_threads():
 def cli(argv):
     from summit.epistasis.cli import main
     args=list(argv)
-    if args[0] in ('make-inputs','prepare','prepare-traits','train-direction') and '--num-threads' not in args:
+    if args[0] in ('make-inputs','prepare','prepare-traits','train-direction','scale-free') and '--num-threads' not in args:
         args+=['--num-threads',str(epistasis_threads())]
     keys=('OMP_NUM_THREADS','OPENBLAS_NUM_THREADS','BLIS_NUM_THREADS')
     previous={k:os.environ.get(k) for k in keys}

@@ -73,6 +73,15 @@ def main(argv=None):
         action="store_true",
         help="resume cohort preparation and solver checkpoints, or validate completed jobs",
     )
+    free = sub.add_parser(
+        "scale-free",
+        help="scale-free focal-context x background U-statistics (dosage, pattern, selective) in one genotype pass",
+    )
+    free.add_argument("manifest", type=Path)
+    free.add_argument("--out", type=Path, required=True)
+    free.add_argument("--num-threads", type=int, default=1)
+    free.add_argument("--block-size", type=int, default=1024)
+    free.add_argument("--memory-gib", type=float, default=16)
     train = sub.add_parser(
         "train-direction",
         help="train a frozen target-specific direction on independent samples",
@@ -278,6 +287,12 @@ def main(argv=None):
         if key in os.environ and os.environ[key] != str(args.num_threads):
             raise ValueError(f"{key} conflicts with --num-threads")
         os.environ.setdefault(key, str(args.num_threads))
+    if args.command == "scale-free":
+        from .scale_free.workflow import run as run_scale_free
+
+        run_scale_free(args.manifest, args.out, threads=args.num_threads, block_size=args.block_size,
+                       memory_bytes=int(args.memory_gib * 2**30))
+        return 0
     if args.command == "train-direction":
         from .directions import train_direction
 
