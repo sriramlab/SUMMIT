@@ -124,11 +124,30 @@ def build_plan(rows, contexts, outcomes, covariates, *, analyses=None, strata=No
     groups = np.random.default_rng(seed).integers(n_groups, size=n)
     order = np.argsort(groups, kind='stable')
     bounds = np.r_[0, np.cumsum(np.bincount(groups, minlength=n_groups))]
+    position = np.empty(n, dtype=np.int64)
+    position[order] = np.arange(n)
 
-    cols = {kind: [] for kind in KINDS}
-    members = {kind: [] for kind in KINDS}
+    # columns are ordered by kind, then analysis, then scale; each is written as soon as it is formed
+    kind_scales = dict(gy=scales, lo=tuple(x for x in scales if x in pattern_scales),
+                       hi=tuple(x for x in scales if x in pattern_scales),
+                       y=tuple(x for x in scales if x in additive_scales))
+    kinds, start = {}, 0
+    for kind in KINDS:
+        kinds[kind] = slice(start, start + len(pairs) * len(kind_scales[kind]))
+        start = kinds[kind].stop
+    q = start
+    ordered = np.zeros((n, q), dtype=np.float64, order='F')
+    counts = np.zeros((n_groups, q), dtype=np.int64)
+    columns = [None] * q
     keys = {kind: [] for kind in KINDS}
     info = []
+
+    def put(kind, a, scale, where, vec):
+        j = kinds[kind].start + a * len(kind_scales[kind]) + kind_scales[kind].index(scale)
+        ordered[position[where], j] = vec
+        counts[:, j] = np.bincount(groups[where], minlength=n_groups)
+        columns[j] = dict(kind=kind, analysis=a, scale=scale)
+        keys[kind].append((a, scale))
     for a, (cname, oname) in enumerate(pairs):
         if cname not in contexts or oname not in outcomes:
             raise ValueError(f'unknown context or outcome in analysis {cname}/{oname}')
@@ -174,35 +193,13 @@ def build_plan(rows, contexts, outcomes, covariates, *, analyses=None, strata=No
                          exclude_chromosomes=[str(x) for x in c.exclude_chromosomes]))
         for s, scale in enumerate(scales):
             r = residual[:, s]
-            cols['gy'].append((idx, g * r))
-            members['gy'].append(idx)
-            keys['gy'].append((a, scale))
+            put('gy', a, scale, idx, g * r)
             if scale in pattern_scales:
-                cols['lo'].append((idx[lo], r[lo]))
-                members['lo'].append(idx[lo])
-                keys['lo'].append((a, scale))
-                cols['hi'].append((idx[hi], r[hi]))
-                members['hi'].append(idx[hi])
-                keys['hi'].append((a, scale))
+                put('lo', a, scale, idx[lo], r[lo])
+                put('hi', a, scale, idx[hi], r[hi])
             if scale in additive_scales:
-                cols['y'].append((idx, r))
-                members['y'].append(idx)
-                keys['y'].append((a, scale))
+                put('y', a, scale, idx, r)
 
-    q = sum(len(cols[k]) for k in KINDS)
-    position = np.empty(n, dtype=np.int64)
-    position[order] = np.arange(n)
-    ordered = np.zeros((n, q), dtype=np.float64, order='F')
-    counts = np.zeros((n_groups, q), dtype=np.int64)
-    columns, kinds, j = [], {}, 0
-    for kind in KINDS:
-        start = j
-        for (where, vec), member, (a, scale) in zip(cols[kind], members[kind], keys[kind]):
-            ordered[position[where], j] = vec
-            counts[:, j] = np.bincount(groups[member], minlength=n_groups)
-            columns.append(dict(kind=kind, analysis=a, scale=scale))
-            j += 1
-        kinds[kind] = slice(start, j)
     short = np.flatnonzero(counts.min(axis=0) < min_group_rows)
     if len(short):
         bad = columns[int(short[0])]

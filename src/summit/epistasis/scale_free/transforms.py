@@ -52,8 +52,13 @@ def residualize_within(values, covariates, strata=None, *, rcond=1e-10):
     """Least-squares residuals of ``values`` on [1, covariates] within each stratum.
 
     ``values`` may be one- or two-dimensional (columns transformed jointly).
-    Rank-deficient covariate columns within a stratum are handled by SVD
-    truncation; strata need more rows than retained columns.
+    Within a stratum the covariates are centred (the intercept) and scaled to
+    unit length; columns that are constant there are dropped. The projection
+    uses the eigendecomposition of the small correlation matrix of the
+    remaining columns, keeping eigenvalues above ``rcond`` times the largest,
+    so exactly collinear columns drop out. This needs one cache-blocked pass
+    over the stratum's rows, where a QR or SVD of the tall design would sweep
+    it once per column. Strata need more rows than retained columns.
     """
     y = np.asarray(values, dtype=np.float64)
     one = y.ndim == 1
@@ -66,12 +71,22 @@ def residualize_within(values, covariates, strata=None, *, rcond=1e-10):
     out = np.empty_like(y2)
     for s in range(k):
         rows = np.flatnonzero(code == s)
-        design = np.column_stack([np.ones(len(rows)), c[rows]])
-        u, sv, _ = np.linalg.svd(design, full_matrices=False)
-        keep = sv > rcond * sv[0]
-        if keep.sum() >= len(rows):
-            raise ValueError('a residualization stratum has no residual degrees of freedom')
-        basis = u[:, keep]
         block = y2[rows]
-        out[rows] = block - basis @ (basis.T @ block)
+        resid = block - block.mean(axis=0)
+        retained = 1
+        if c.shape[1]:
+            x = c[rows]
+            x = x - x.mean(axis=0)
+            norm = np.sqrt(np.einsum('ij,ij->j', x, x))
+            live = norm > 1e-12 * np.sqrt(len(rows)) * np.maximum(np.abs(c[rows]).max(axis=0), 1.)
+            if live.any():
+                z = x[:, live] / norm[live]
+                eigenvalues, vectors = np.linalg.eigh(z.T @ z)
+                keep = eigenvalues > rcond * eigenvalues[-1]
+                basis = vectors[:, keep] / np.sqrt(eigenvalues[keep])
+                resid -= (z @ basis) @ (basis.T @ (z.T @ block))
+                retained += int(keep.sum())
+        if retained >= len(rows):
+            raise ValueError('a residualization stratum has no residual degrees of freedom')
+        out[rows] = resid
     return out[:, 0] if one else out

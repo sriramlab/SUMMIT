@@ -91,6 +91,7 @@ def variant_contexts(source, rows, specs, *, threads=1):
             labels, values, coding = np.where(observed, np.minimum(calls, 1), -1), {0: 0., 1: 1.}, 'carrier'
         else:
             labels, values = np.where(observed, calls, -1), {0: 0., 1: 1., 2: 2.}
+        labels = labels.astype(np.int8)    # thousands of focal contexts would otherwise hold 8 bytes per row each
         contexts.append((Context(name=s['name'], labels=labels, values=values, low=(0,), high=(1, 2),
                                  exclude_chromosomes=(source.variants.chromosome[j],)),
                          dict(variant=s['variant'], coding=coding, minor_homozygotes=homozygotes,

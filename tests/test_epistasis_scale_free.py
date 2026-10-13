@@ -594,3 +594,41 @@ def test_records_choose_the_test_standard_error():
             assert r['se_rule'] == 'max' and np.isnan(r['se_null'])
             finite = [v for v in (r['se_hoeffding'], r['se_jackknife']) if np.isfinite(v)]
             assert r['se'] == max(finite) if finite else np.isnan(r['se'])
+
+
+def _svd_residualize(values, covariates, strata, rcond=1e-10):
+    """The SVD residualization used up to d265bf4, kept as the reference."""
+    y2 = values[:, None] if values.ndim == 1 else values
+    codes = np.unique(strata, return_inverse=True)[1].reshape(-1)
+    out = np.empty_like(y2)
+    for s in np.unique(codes):
+        rows = np.flatnonzero(codes == s)
+        design = np.column_stack([np.ones(len(rows)), covariates[rows]])
+        u, sv, _ = np.linalg.svd(design, full_matrices=False)
+        basis = u[:, sv > rcond * sv[0]]
+        out[rows] = y2[rows] - basis @ (basis.T @ y2[rows])
+    return out[:, 0] if values.ndim == 1 else out
+
+
+def test_residualize_within_matches_svd_reference_on_collinear_covariates():
+    rng = np.random.default_rng(8)
+    n = 6000
+    sex = rng.integers(0, 2, n)
+    age = rng.uniform(40, 70, n)
+    centre = rng.choice(22, n, p=np.r_[np.full(20, .049), .019, .001])
+    dummies = (centre[:, None] == np.arange(1, 22)).astype(float)
+    pcs = rng.normal(size=(n, 20)) * np.linspace(5, .5, 20)
+    cov = np.column_stack([age, age ** 2, sex, age * sex, pcs, dummies, pcs[:, :1]])
+    focal = rng.binomial(2, .3, n)
+    strata = focal * 2 + sex
+    y = np.column_stack([rng.normal(size=n) + .01 * age, rng.standard_t(3, n)])
+    new, ref = residualize_within(y, cov, strata), _svd_residualize(y, cov, strata)
+    np.testing.assert_allclose(new, ref, rtol=0, atol=1e-9)
+    np.testing.assert_allclose(residualize_within(y[:, 0], cov, strata), ref[:, 0], rtol=0, atol=1e-9)
+    for s in np.unique(strata):
+        m = strata == s
+        np.testing.assert_allclose(new[m].mean(0), 0, atol=1e-10)
+        bound = 1e-9 * np.abs(cov[m]).sum(0)[:, None] * np.abs(new[m]).max(0)
+        assert np.all(np.abs(cov[m].T @ new[m]) <= bound)
+    with pytest.raises(ValueError, match='no residual degrees of freedom'):
+        residualize_within(y[:3], cov[:3, :4], None)
