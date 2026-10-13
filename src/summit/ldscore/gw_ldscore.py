@@ -1620,8 +1620,12 @@ class GenomewideLDScore:
             self.log._log("No covariates: standard LD scores (squared correlations).")
 
         H = self.num_threads
-        t_blas1 = min(4, max(1, H // 4))
-        t_omp1 = max(1, H // t_blas1)
+        # Phase 1 calls BLAS on small per-tile products from inside an OpenMP team. A multithreaded BLAS called from
+        # several OpenMP threads at once (pthreads OpenBLAS) serialises those calls, so the team runs one BLAS thread
+        # per member. 50,000 samples, 32 threads: single-component LD scores 321 s -> 195 s, 24-bin 467 s -> 399 s,
+        # identical output. SUMMIT_P1_OMP and SUMMIT_P1_BLAS override the split.
+        t_blas1 = max(1, int(os.environ.get("SUMMIT_P1_BLAS", "1")))
+        t_omp1 = max(1, int(os.environ.get("SUMMIT_P1_OMP", str(max(1, H // t_blas1)))))
 
         self._mu22_precomputed = None
         gwldcore.clear_phase1_csr_cache()
