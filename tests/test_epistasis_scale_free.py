@@ -632,3 +632,25 @@ def test_residualize_within_matches_svd_reference_on_collinear_covariates():
         assert np.all(np.abs(cov[m].T @ new[m]) <= bound)
     with pytest.raises(ValueError, match='no residual degrees of freedom'):
         residualize_within(y[:3], cov[:3, :4], None)
+
+
+def test_kernel_pool_matches_serial_with_segments_inside_blocks():
+    source, raw, ctx, out, cov = simulated(seed=5)
+    rows = np.arange(len(source.samples))
+    plan = build_plan(rows, ctx, out, cov, scales=('pooled_rank', 'within_rank'), pattern_scales=('within_rank',),
+                      additive_scales=('pooled_rank',), n_groups=7, seed=4)
+    annotation = (np.arange(90) % 5 < 2).astype(float) * .5
+    bg = background_axis(source, annotations=annotation[:, None], names=('A',), n_blocks=11)
+    scale = estimate_scale(source, rows, bg.variants)
+    serial = accumulate(source, plan, scale, bg, block_size=13, threads=1, native=False, batch=1)
+    pooled = accumulate(source, plan, scale, bg, block_size=13, threads=4, native=False, batch=1)
+    for p in serial.kernels:
+        np.testing.assert_allclose(pooled.kernels[p], serial.kernels[p], rtol=1e-12, atol=1e-15)
+        np.testing.assert_allclose(pooled.between[p], serial.between[p], rtol=1e-12, atol=1e-15)
+    np.testing.assert_array_equal(pooled.block_weight, serial.block_weight)
+    s = dense_scores(np.asarray(source.values), scale, plan)
+    chrom = np.array(bg.chromosomes)
+    for p, (a, _) in enumerate(plan.keys['gy']):
+        keep = ~np.isin(chrom, plan.analyses[a]['exclude_chromosomes'])
+        expected = oracle_kernel(s, plan.kinds['gy'].start + p, plan.kinds['gy'].start + p, annotation * keep)
+        np.testing.assert_allclose(pooled.kernels['gy'][1, p], expected, rtol=1e-10, atol=1e-13)

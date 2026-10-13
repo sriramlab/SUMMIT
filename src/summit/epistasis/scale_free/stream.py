@@ -16,10 +16,14 @@ The kernels are many small products, for which the native protected TN is
 dominated by per-call overhead. They are formed with batched BLAS on scores
 augmented by a sum-over-groups row, so each product carries its own row and
 column checksums (Huang-Abraham). Mismatching kernels are recomputed, or
-rejected if the mismatch persists.
+rejected if the mismatch persists. A (G + 1) x (G + 1) product is far too small
+to share across BLAS threads, so the kernel step runs single-threaded BLAS in
+a pool of ``threads`` workers. Each task owns one batch of columns across all
+jackknife segments of the block, so no two tasks add into the same kernel.
 """
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from time import perf_counter
 
@@ -179,46 +183,56 @@ def accumulate(source, plan, scale, background, *, block_size=1024, threads=1, n
     inverse_counts = 1.0 / plan.counts
     group_rows = [plan.order[plan.bounds[g]:plan.bounds[g + 1]] for g in range(g_count)]
     scores = np.empty((q, g_count + 1, block_size))
+    tasks = [(p, a, b0, min(sizes[p], b0 + batch)) for a in range(a_count) for p in pairs
+             for b0 in range(0, sizes[p], batch)]
+    pool = ThreadPoolExecutor(max_workers=threads) if threads > 1 else None
     repaired, kernel_seconds, score_seconds, started = 0, 0., 0., perf_counter()
-    for start, variants, raw in stream.blocks('scale_free_scores'):
-        width = len(variants)
-        local = np.arange(width, dtype=np.int64)
-        mean = scale.mean[start:start + width]
-        inverse = scale.inverse_scale[start:start + width]
-        tick = perf_counter()
-        for g in range(g_count):
-            x = standardizer.prepare(raw, group_rows[g], local, mean, inverse)
-            s = products.tn(x, plan.blocks[g])
-            np.multiply(s.T, inverse_counts[g][:, None], out=scores[:, g, :width])
-        np.sum(scores[:, :g_count, :width], axis=1, out=scores[:, g_count, :width])
-        score_seconds += perf_counter() - tick
-        tick = perf_counter()
-        for j0, j1, block in _segments(background.blocks[start:start + width]):
-            for a in range(a_count):
-                w = background.weights[start + j0:start + j1, a]
-                total = w.sum()
-                block_weight[a, block] += total
-                if total == 0:
-                    continue
-                unit = bool(np.all(w == 1))
-                for p in pairs:
-                    left_kind, right_kind = PAIRS[p]
-                    ls, rs = plan.kinds[left_kind], plan.kinds[right_kind]
-                    for b0 in range(0, sizes[p], batch):
-                        b1 = min(sizes[p], b0 + batch)
-                        left = scores[ls.start + b0:ls.start + b1, :, j0:j1]
-                        right = scores[rs.start + b0:rs.start + b1, :, j0:j1]
-                        if not unit:
-                            left = left * w
-                        product, fixed = checked_gram(left, right)
-                        repaired += fixed
-                        use = keep[p][b0:b1, block]
-                        np.add(kernels[p][a, b0:b1], product, out=kernels[p][a, b0:b1], where=use[:, None, None])
-                        off = product.sum(axis=(1, 2)) - np.trace(product, axis1=1, axis2=2)
-                        between[p][a, b0:b1, block] += np.where(use, off, 0.)
-        kernel_seconds += perf_counter() - tick
-        if progress is not None:
-            progress(start + width, len(background.variants), perf_counter() - started)
+    try:
+        for start, variants, raw in stream.blocks('scale_free_scores'):
+            width = len(variants)
+            local = np.arange(width, dtype=np.int64)
+            mean = scale.mean[start:start + width]
+            inverse = scale.inverse_scale[start:start + width]
+            tick = perf_counter()
+            for g in range(g_count):
+                x = standardizer.prepare(raw, group_rows[g], local, mean, inverse)
+                s = products.tn(x, plan.blocks[g])
+                np.multiply(s.T, inverse_counts[g][:, None], out=scores[:, g, :width])
+            np.sum(scores[:, :g_count, :width], axis=1, out=scores[:, g_count, :width])
+            score_seconds += perf_counter() - tick
+            tick = perf_counter()
+            segments = _segments(background.blocks[start:start + width])
+            for j0, j1, block in segments:
+                block_weight[:, block] += background.weights[start + j0:start + j1].sum(axis=0)
+
+            def kernel_task(task, segments=segments, start=start):
+                p, a, b0, b1 = task
+                ls, rs = plan.kinds[PAIRS[p][0]], plan.kinds[PAIRS[p][1]]
+                fixed = 0
+                for j0, j1, block in segments:
+                    w = background.weights[start + j0:start + j1, a]
+                    if w.sum() == 0:
+                        continue
+                    left = scores[ls.start + b0:ls.start + b1, :, j0:j1]
+                    right = scores[rs.start + b0:rs.start + b1, :, j0:j1]
+                    if not np.all(w == 1):
+                        left = left * w
+                    product, repairs = checked_gram(left, right)
+                    fixed += repairs
+                    use = keep[p][b0:b1, block]
+                    np.add(kernels[p][a, b0:b1], product, out=kernels[p][a, b0:b1], where=use[:, None, None])
+                    off = product.sum(axis=(1, 2)) - np.trace(product, axis1=1, axis2=2)
+                    between[p][a, b0:b1, block] += np.where(use, off, 0.)
+                return fixed
+
+            with _single_threaded_blas():
+                repaired += sum(pool.map(kernel_task, tasks) if pool else map(kernel_task, tasks))
+            kernel_seconds += perf_counter() - tick
+            if progress is not None:
+                progress(start + width, len(background.variants), perf_counter() - started)
+    finally:
+        if pool is not None:
+            pool.shutdown()
     execution = products.drain()
     diagnostics = dict(variants=int(len(background.variants)), rows=int(len(plan.rows)), groups=g_count,
                        columns=q, block_size=int(block_size), score_seconds=score_seconds,
@@ -228,3 +242,9 @@ def accumulate(source, plan, scale, background, *, block_size=1024, threads=1, n
                        native=bool(native), threads=int(threads))
     return Accumulation(names=background.names, kernels=kernels, between=between, block_weight=block_weight,
                         block_chromosomes=block_chrom, keep=keep, diagnostics=diagnostics)
+
+
+def _single_threaded_blas():
+    """BLAS limited to one thread inside the context (the pool supplies the parallelism)."""
+    from threadpoolctl import threadpool_limits
+    return threadpool_limits(1, user_api='blas')
