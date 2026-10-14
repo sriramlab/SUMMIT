@@ -48,7 +48,7 @@ def blom_rank_normal(values, strata=None):
     return out
 
 
-def residualize_within(values, covariates, strata=None, *, rcond=1e-10):
+def residualize_within(values, covariates, strata=None, *, rcond=1e-10, leverage=False):
     """Least-squares residuals of ``values`` on [1, covariates] within each stratum.
 
     ``values`` may be one- or two-dimensional (columns transformed jointly).
@@ -58,7 +58,9 @@ def residualize_within(values, covariates, strata=None, *, rcond=1e-10):
     remaining columns, keeping eigenvalues above ``rcond`` times the largest,
     so exactly collinear columns drop out. This needs one cache-blocked pass
     over the stratum's rows, where a QR or SVD of the tall design would sweep
-    it once per column. Strata need more rows than retained columns.
+    it once per column. Strata need more rows than retained columns. With
+    ``leverage=True`` the diagonal of the projection (the intercept included)
+    is returned as well.
     """
     y = np.asarray(values, dtype=np.float64)
     one = y.ndim == 1
@@ -69,10 +71,12 @@ def residualize_within(values, covariates, strata=None, *, rcond=1e-10):
         raise ValueError('finite aligned values and covariates required')
     code, k = _stratum_codes(strata, n)
     out = np.empty_like(y2)
+    hat = np.empty(n)
     for s in range(k):
         rows = np.flatnonzero(code == s)
         block = y2[rows]
         resid = block - block.mean(axis=0)
+        hat[rows] = 1. / len(rows)
         retained = 1
         if c.shape[1]:
             x = c[rows]
@@ -84,9 +88,12 @@ def residualize_within(values, covariates, strata=None, *, rcond=1e-10):
                 eigenvalues, vectors = np.linalg.eigh(z.T @ z)
                 keep = eigenvalues > rcond * eigenvalues[-1]
                 basis = vectors[:, keep] / np.sqrt(eigenvalues[keep])
-                resid -= (z @ basis) @ (basis.T @ (z.T @ block))
+                projected = z @ basis
+                resid -= projected @ (projected.T @ block)
+                hat[rows] += np.einsum('ij,ij->i', projected, projected)
                 retained += int(keep.sum())
         if retained >= len(rows):
             raise ValueError('a residualization stratum has no residual degrees of freedom')
         out[rows] = resid
-    return out[:, 0] if one else out
+    out = out[:, 0] if one else out
+    return (out, hat) if leverage else out

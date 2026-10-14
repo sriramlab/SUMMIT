@@ -19,8 +19,12 @@ is estimated by the mean of T_ab^2 over a != b. This estimate is far less
 noisy than the full Hoeffding variance, whose first-order term is zero under
 the null but estimated with noise. It omits that first-order term under
 alternatives, so intervals use the Hoeffding and jackknife standard errors.
-The other statistics are not degenerate at their null and keep the larger of
-the Hoeffding and jackknife standard errors (max-SE rule).
+relative_dosage tests the same null as dosage and uses the same variance.
+The ratio statistics keep the larger of the Hoeffding and jackknife standard
+errors (max-SE rule). rho = 1 lies on the Cauchy-Schwarz boundary, where the
+first-order delta-method term vanishes; its Hoeffding SE alone is then
+unreliable, and the max-SE rule was checked by simulation (ITEM_23b: nominal
+in all null scenarios).
 
 Statistics (lo = low classes, hi = high classes):
     dosage     theta(gy, gy) = mean_j (E[g x_j y])^2, FAME-equivalent; null 0 (one-sided)
@@ -48,7 +52,7 @@ from scipy.stats import norm
 NULLS = dict(dosage=0., dosage_diff=0., rho=1., log_amp=0., delta2=0., sel_lam=0., sel_amp=0., additive=0.,
              relative_dosage=0., global_excess=0.)
 ONE_SIDED = ('dosage', 'delta2', 'additive', 'relative_dosage')
-DEGENERATE = ('dosage', 'delta2')
+DEGENERATE = ('dosage', 'delta2', 'relative_dosage')
 
 
 def hoeffding(kernels):
@@ -112,13 +116,19 @@ def _log_ratio(a, b):
     return np.log(a / b) if a > 0 and b > 0 else np.nan
 
 
+def _rest(weights, k, total, part):
+    """Kernel mean over the complement of annotation k (NaN when the annotation covers everything)."""
+    left = weights[0] - weights[k]
+    return (weights[0] * total - weights[k] * part) / left if left > 0 else total * np.nan
+
+
 def dosage_statistics(theta, annotations, weights, global_ratio=None):
     """theta: (1 + K,) dosage kernels for all, A_1..A_K, optionally followed by the
     (1 + K,) additive kernels; weights: background weights per annotation."""
     k_count = len(annotations) + 1
     out = dict(dosage=theta[0])
     for k, name in enumerate(annotations, start=1):
-        rest = (weights[0] * theta[0] - weights[k] * theta[k]) / (weights[0] - weights[k])
+        rest = _rest(weights, k, theta[0], theta[k])
         out[f'dosage[{name}]'] = theta[k]
         out[f'dosage_diff[{name}]'] = theta[k] - rest
     if len(theta) == 2 * k_count:
@@ -140,22 +150,25 @@ def pattern_statistics(theta, annotations, weights):
                log_amp=_log_ratio(hh, ll), delta2=ll + hh - 2 * lh)
     for k, name in enumerate(annotations, start=1):
         a = theta[3 * k:3 * k + 3]
-        rest = (weights[0] * theta[:3] - weights[k] * a) / (weights[0] - weights[k])
+        rest = _rest(weights, k, theta[:3], a)
         out[f'sel_lam[{name}]'] = _log_ratio(a[2], a[0]) - _log_ratio(rest[2], rest[0])
         out[f'sel_amp[{name}]'] = _log_ratio(a[1], a[0]) - _log_ratio(rest[1], rest[0])
     return out
 
 
-def _family(raw, between, weights, block_weights, function):
+def _family(raw, between, weights, block_weights, function, annotation_weights, annotation_blocks):
     """Estimates with Hoeffding (delta method) and SNP-block jackknife SEs.
 
     raw: (m, G, G) unnormalized kernels; between: (m, n_blocks) between-group
-    sums; weights: (m,) background weights; block_weights: (m, n_blocks).
+    sums; weights: (m,) background weight of each kernel; block_weights:
+    (m, n_blocks). function(theta, annotation_weights) gives the statistics;
+    annotation_weights: (A,) and annotation_blocks: (A, n_blocks), so that each
+    delete-one-block estimate uses its own complement weights.
     """
     kernels = np.stack([_kernel(r, w) for r, w in zip(raw, weights)])
     theta, cov = hoeffding(kernels)
     cov0 = null_covariance(kernels)
-    est, grads = _gradient(function, theta)
+    est, grads = _gradient(lambda t: function(t, annotation_weights), theta)
     g = raw.shape[1]
     pairs = g * (g - 1)
     total = between.sum(axis=1)
@@ -163,7 +176,7 @@ def _family(raw, between, weights, block_weights, function):
     drops = []
     for b in np.flatnonzero(used):
         w = weights - block_weights[:, b]
-        drops.append(function((total - between[:, b]) / (w * pairs)))
+        drops.append(function((total - between[:, b]) / (w * pairs), annotation_weights - annotation_blocks[:, b]))
     nb = len(drops)
     result = {}
     for key, value in est.items():
@@ -206,7 +219,9 @@ def _record(base, statistic, value, se_u, se_s, se_0):
 def summarize(plan, accumulation):
     """One record per analysis, scale and statistic.
 
-    Analyses with an empty background (or an empty annotation) are omitted.
+    Analyses with an empty background are omitted. An annotation with no kept
+    weight for an analysis (for example one confined to the context's own
+    chromosome) is dropped from that analysis only.
     """
     names = accumulation.names[1:]
     bw = accumulation.block_weight
@@ -222,32 +237,41 @@ def summarize(plan, accumulation):
         return dict(analysis=a, context=info['context'], outcome=info['outcome'], scale=scale, n=info['n'],
                     n_low=info['n_low'], n_high=info['n_high'])
 
+    def annotations_used(w):
+        return [0] + [k for k in range(1, len(w)) if w[k] > 0]
+
     additive = {key: i for i, key in enumerate(plan.keys.get('y', ()))}
     if 'gy' in accumulation.kernels:
         for p, (a, scale) in enumerate(plan.keys['gy']):
             w, blocks = weights_for('gy', p)
-            if np.any(w <= 0):
+            if w[0] <= 0:
                 continue
-            raw, between, ww, bb = (accumulation.kernels['gy'][:, p], accumulation.between['gy'][:, p], w, blocks)
+            sel = annotations_used(w)
+            sub = [names[k - 1] for k in sel[1:]]
+            w, blocks = w[sel], blocks[sel]
+            raw, between = accumulation.kernels['gy'][sel, p], accumulation.between['gy'][sel, p]
+            ww, bb = w, blocks
             ratio = None
             if (a, scale) in additive and 'yy' in accumulation.kernels:
                 i = additive[(a, scale)]
-                raw = np.concatenate([raw, accumulation.kernels['yy'][:, i]])
-                between = np.concatenate([between, accumulation.between['yy'][:, i]])
+                raw = np.concatenate([raw, accumulation.kernels['yy'][sel, i]])
+                between = np.concatenate([between, accumulation.between['yy'][sel, i]])
                 ww, bb = np.r_[w, w], np.concatenate([blocks, blocks])
                 ratio = plan.analyses[a].get('global_ratio', {}).get(scale)
-            stats = _family(raw, between, ww, bb, lambda t, w=w, r=ratio: dosage_statistics(t, names, w, r))
+            stats = _family(raw, between, ww, bb, lambda t, aw, s=sub, r=ratio: dosage_statistics(t, s, aw, r),
+                            w, blocks)
             records += [_record(base(a, scale), k, *v) for k, v in stats.items()]
     if 'll' in accumulation.kernels:
         for p, (a, scale) in enumerate(plan.keys['lo']):
             w, blocks = weights_for('ll', p)
-            if np.any(w <= 0):
+            if w[0] <= 0:
                 continue
-            raw = np.stack([accumulation.kernels[k][i, p] for i in range(len(accumulation.names))
-                            for k in ('ll', 'hh', 'lh')])
-            between = np.stack([accumulation.between[k][i, p] for i in range(len(accumulation.names))
-                                for k in ('ll', 'hh', 'lh')])
+            sel = annotations_used(w)
+            sub = [names[k - 1] for k in sel[1:]]
+            w, blocks = w[sel], blocks[sel]
+            raw = np.stack([accumulation.kernels[k][i, p] for i in sel for k in ('ll', 'hh', 'lh')])
+            between = np.stack([accumulation.between[k][i, p] for i in sel for k in ('ll', 'hh', 'lh')])
             ww, bb = np.repeat(w, 3), np.repeat(blocks, 3, axis=0)
-            stats = _family(raw, between, ww, bb, lambda t, w=w: pattern_statistics(t, names, w))
+            stats = _family(raw, between, ww, bb, lambda t, aw, s=sub: pattern_statistics(t, s, aw), w, blocks)
             records += [_record(base(a, scale), k, *v) for k, v in stats.items()]
     return records

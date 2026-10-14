@@ -14,8 +14,8 @@ Scales are ``raw``, ``pooled_rank`` (rank-inverse-normal over the analysis rows,
 the FAME convention) and ``within_rank`` (rank-inverse-normal within class x
 stratum, exactly null under an affine latent action of the context; see
 docs/wiki/Epistasis-scale-free.md). Columns are ordered by kind (all gy, then
-lo, then hi) so that the pass can form every G x G kernel from contiguous
-batched views.
+lo, then hi, then y) so that the pass can form every G x G kernel from
+contiguous batched views.
 
 Individuals are assigned to G random groups. The pass reads them in group order
 and keeps per-group scores, which is what the group-level Hoeffding variance
@@ -68,7 +68,7 @@ class Plan:
     order: np.ndarray             # pass-row positions in group order
     bounds: np.ndarray            # (G + 1,) group offsets into order
     blocks: list                  # G F-order arrays (n_g x q): outcome columns in group order
-    counts: np.ndarray            # (G, q) rows contributing to each column in each group
+    counts: np.ndarray            # (G, q) effective rows per column and group: sum of 1 - leverage
     columns: list                 # per column: dict(kind, analysis, scale)
     kinds: dict                   # kind -> slice of columns
     keys: dict                    # kind -> list of (analysis, scale) in column order
@@ -81,7 +81,7 @@ class Plan:
 
 def build_plan(rows, contexts, outcomes, covariates, *, analyses=None, strata=None,
                scales=('pooled_rank', 'within_rank'), pattern_scales=None, additive_scales=(), n_groups=200,
-               seed=20261011, min_group_rows=5, covariate_slopes='class'):
+               seed=20261011, min_group_rows=5, covariate_slopes='common'):
     """Form outcome columns for every requested (context, outcome) analysis.
 
     rows: strictly increasing source rows (N); every array below is aligned to them.
@@ -92,14 +92,17 @@ def build_plan(rows, contexts, outcomes, covariates, *, analyses=None, strata=No
     (default all scales). additive_scales: scales that also receive the plain
     residual column y, for theta_y = mean_j (E[x_j y])^2, the relative dosage
     statistic and the global (affine-modifier) prediction of the dosage statistic.
-    covariate_slopes: 'class' fits covariate slopes within each class x stratum; 'common' fits
-    them once per stratum (e.g. sex) with an intercept for each class. Class-specific slopes
-    absorb any context x covariate interaction, but where a covariate tracks genetic
-    similarity (principal components, assessment centre) the in-sample fit makes residuals
-    of related people in the same class slightly negatively correlated, which biases the
-    dosage and contrast statistics downwards by about sum_k (lambda_k - 1) / (n sqrt(2 tau2))
-    null standard errors (lambda_k: relatedness eigenvalue along covariate k). With common
-    slopes the weights g_i g_i' take both signs and the term is of order 1/n.
+    covariate_slopes: 'common' (default) fits covariate slopes once per stratum (e.g. sex)
+    with an intercept for each class; 'class' fits them within each class x stratum.
+    Class-specific slopes also absorb a context x covariate interaction (for example focal
+    variant x ancestry), but where a covariate tracks genetic similarity (principal
+    components, assessment centre) the in-sample fit makes residuals of related people in
+    the same class slightly negatively correlated. That biases the dosage and contrast
+    statistics downwards by about sum_k (lambda_k - 1) / (n sqrt(2 tau2)) null standard
+    errors (lambda_k: relatedness eigenvalue along covariate k; -0.135 in UK Biobank with 20
+    principal components and assessment centre). With common slopes the pair weights
+    g_i g_i' take both signs and the term is of order 1/n. Use 'class' as a conservative
+    sensitivity analysis for significant findings.
     """
     rows = np.asarray(rows, dtype=np.int64)
     if rows.ndim != 1 or not len(rows) or np.any(np.diff(rows) <= 0):
@@ -134,8 +137,6 @@ def build_plan(rows, contexts, outcomes, covariates, *, analyses=None, strata=No
     groups = np.random.default_rng(seed).integers(n_groups, size=n)
     order = np.argsort(groups, kind='stable')
     bounds = np.r_[0, np.cumsum(np.bincount(groups, minlength=n_groups))]
-    position = np.empty(n, dtype=np.int64)
-    position[order] = np.arange(n)
 
     # columns are ordered by kind, then analysis, then scale; each is written as soon as it is formed
     kind_scales = dict(gy=scales, lo=tuple(x for x in scales if x in pattern_scales),
@@ -146,16 +147,27 @@ def build_plan(rows, contexts, outcomes, covariates, *, analyses=None, strata=No
         kinds[kind] = slice(start, start + len(pairs) * len(kind_scales[kind]))
         start = kinds[kind].stop
     q = start
-    ordered = np.zeros((n, q), dtype=np.float64, order='F')
-    counts = np.zeros((n_groups, q), dtype=np.int64)
+    # each group's block is written in place (no full-size intermediate copy)
+    blocks = [np.zeros((bounds[g + 1] - bounds[g], q), dtype=np.float64, order='F') for g in range(n_groups)]
+    counts = np.zeros((n_groups, q), dtype=np.float64)
+    rows_used = np.zeros((n_groups, q), dtype=np.int64)
     columns = [None] * q
     keys = {kind: [] for kind in KINDS}
     info = []
+    scratch = np.zeros(n)
 
-    def put(kind, a, scale, where, vec):
+    def put(kind, a, scale, where, vec, effective):
         j = kinds[kind].start + a * len(kind_scales[kind]) + kind_scales[kind].index(scale)
-        ordered[position[where], j] = vec
-        counts[:, j] = np.bincount(groups[where], minlength=n_groups)
+        scratch[:] = 0.
+        scratch[where] = vec
+        in_order = scratch[order]
+        for gi in range(n_groups):
+            blocks[gi][:, j] = in_order[bounds[gi]:bounds[gi + 1]]
+        # residuals lose one degree of freedom per fitted parameter; normalizing class sums by
+        # sum(1 - h_ii) instead of the row count keeps E[class score] = E[x y | class] whatever the
+        # number of covariates per class (otherwise class-specific slopes bias log_amp)
+        counts[:, j] = np.bincount(groups[where], weights=effective, minlength=n_groups)
+        rows_used[:, j] = np.bincount(groups[where], minlength=n_groups)
         columns[j] = dict(kind=kind, analysis=a, scale=scale)
         keys[kind].append((a, scale))
     for a, (cname, oname) in enumerate(pairs):
@@ -189,11 +201,12 @@ def build_plan(rows, contexts, outcomes, covariates, *, analyses=None, strata=No
             else:
                 stacked.append(blom_rank_normal(y[idx], stratum))
         if covariate_slopes == 'class':
-            residual = residualize_within(np.column_stack(stacked), cov[idx], stratum)
+            residual, hat = residualize_within(np.column_stack(stacked), cov[idx], stratum, leverage=True)
         else:
             intercepts = (lab[:, None] == present[None, 1:]).astype(np.float64)
-            residual = residualize_within(np.column_stack(stacked), np.column_stack([intercepts, cov[idx]]),
-                                          extra[idx])
+            residual, hat = residualize_within(np.column_stack(stacked), np.column_stack([intercepts, cov[idx]]),
+                                               extra[idx], leverage=True)
+        effective = 1. - hat
         share = np.array([np.mean(lab == k) for k in present])
         level = np.array([g[lab == k][0] for k in present])
         spread = {scale: np.array([residual[lab == k, s].std() for k in present]) for s, scale in enumerate(scales)}
@@ -208,19 +221,18 @@ def build_plan(rows, contexts, outcomes, covariates, *, analyses=None, strata=No
                          exclude_chromosomes=[str(x) for x in c.exclude_chromosomes]))
         for s, scale in enumerate(scales):
             r = residual[:, s]
-            put('gy', a, scale, idx, g * r)
+            put('gy', a, scale, idx, g * r, effective)
             if scale in pattern_scales:
-                put('lo', a, scale, idx[lo], r[lo])
-                put('hi', a, scale, idx[hi], r[hi])
+                put('lo', a, scale, idx[lo], r[lo], effective[lo])
+                put('hi', a, scale, idx[hi], r[hi], effective[hi])
             if scale in additive_scales:
-                put('y', a, scale, idx, r)
+                put('y', a, scale, idx, r, effective)
 
-    short = np.flatnonzero(counts.min(axis=0) < min_group_rows)
+    short = np.flatnonzero(rows_used.min(axis=0) < min_group_rows)
     if len(short):
         bad = columns[int(short[0])]
         name = info[bad['analysis']]
         raise ValueError(f"{name['context']}/{name['outcome']} ({bad['kind']}): some of the {n_groups} groups have "
                          f'fewer than {min_group_rows} rows; use fewer groups or larger classes')
-    blocks = [np.asfortranarray(ordered[bounds[g]:bounds[g + 1]]) for g in range(n_groups)]
     return Plan(rows=rows, groups=groups, n_groups=n_groups, order=order, bounds=bounds, blocks=blocks,
                 counts=counts, columns=columns, kinds=kinds, keys=keys, analyses=info)

@@ -319,6 +319,7 @@ def test_cli_end_to_end(tmp_path):
     assert {'additive', 'relative_dosage', 'global_excess', 'additive[A]'} <= set(res.statistic)
     run = json.loads((tmp_path / 'out' / 'run.json').read_text())
     assert run['contexts']['v0']['chromosome'] == '1'
+    assert run['covariate_slopes'] == 'common'
     assert (tmp_path / 'out' / 'COMPLETE').exists()
     assert np.load(tmp_path / 'out' / 'kernels.npz')['kernel_gy'].shape == (2, 4, 5, 5)
 
@@ -662,7 +663,7 @@ def test_covariate_slopes_match_direct_least_squares(slopes):
     n = len(source.samples)
     rows = np.arange(n)
     sex = np.random.default_rng(2).integers(0, 2, n)
-    kwargs = {} if slopes == 'class' else dict(covariate_slopes='common')
+    kwargs = {} if slopes == 'common' else dict(covariate_slopes='class')    # common is the default
     plan = build_plan(rows, ctx[:1], out[1:], cov, strata=sex, scales=('raw',), pattern_scales=(), n_groups=6,
                       seed=1, **kwargs)
     y = np.zeros((n, plan.n_columns))
@@ -686,3 +687,172 @@ def test_covariate_slopes_match_direct_least_squares(slopes):
     np.testing.assert_allclose(y[idx, plan.kinds['gy'].start], g * expected, rtol=1e-9, atol=1e-10)
     with pytest.raises(ValueError, match='covariate_slopes'):
         build_plan(rows, ctx[:1], out[1:], cov, scales=('raw',), n_groups=6, covariate_slopes='none')
+
+
+def test_jackknife_complements_use_leave_one_out_weights():
+    """dosage_diff[A] and sel_*[A] jackknife: each delete-one estimate uses its own complement weights."""
+    from summit.epistasis.scale_free.stats import dosage_statistics, pattern_statistics
+    source, raw, ctx, out, cov = simulated(seed=11, n=3000, m=90)
+    rows = np.arange(len(source.samples))
+    plan = build_plan(rows, ctx, out, cov, scales=('raw',), n_groups=8, seed=2)
+    annotation = np.where(np.arange(90) % 30 < 15, .9, .1)      # dense in some blocks, sparse in others
+    bg = background_axis(source, annotations=annotation[:, None], names=('A',), n_blocks=12)
+    scale = estimate_scale(source, rows, bg.variants)
+    acc = accumulate(source, plan, scale, bg, block_size=32, native=False)
+    recs = {(r['analysis'], r['statistic']): r for r in summarize(plan, acc)}
+    pairs = plan.n_groups * (plan.n_groups - 1)
+
+    def jackknife(function, betweens, keep):
+        w = (acc.block_weight * keep).sum(axis=1)
+        values = []
+        for b in np.flatnonzero((acc.block_weight * keep).sum(axis=0) > 0):
+            wb = w - acc.block_weight[:, b] * keep[b]
+            values.append(function([(bt.sum(axis=1) - bt[:, b]) / (wb * pairs) for bt in betweens], wb))
+        return {k: np.sqrt((len(values) - 1) / len(values) * np.sum((np.array([v[k] for v in values])
+                                                                       - np.mean([v[k] for v in values])) ** 2))
+                for k in values[0]}
+
+    checked = 0
+    for p, (a, _) in enumerate(plan.keys['gy']):
+        se = jackknife(lambda th, wb: dosage_statistics(th[0], ('A',), wb), [acc.between['gy'][:, p]],
+                       acc.keep['gy'][p])
+        r = recs[(a, 'dosage_diff[A]')]
+        assert np.isclose(r['se_jackknife'], se['dosage_diff[A]'], rtol=1e-8)
+        checked += 1
+    for p, (a, _) in enumerate(plan.keys['lo']):
+        def pattern(th, wb):
+            return pattern_statistics(np.concatenate([[th[0][i], th[1][i], th[2][i]] for i in range(len(wb))]),
+                                      ('A',), wb)
+        se = jackknife(pattern, [acc.between[k][:, p] for k in ('ll', 'hh', 'lh')], acc.keep['ll'][p])
+        for key in ('sel_lam[A]', 'sel_amp[A]'):
+            r = recs[(a, key)]
+            if np.isfinite(r['se_jackknife']):
+                assert np.isclose(r['se_jackknife'], se[key], rtol=1e-8)
+                checked += 1
+    assert checked >= 3
+
+
+def test_effective_counts_remove_degree_of_freedom_bias_in_log_amp():
+    """Class-specific slopes with many covariates: scores normalized by sum(1 - h) keep log_amp unbiased."""
+    rng = np.random.default_rng(3)
+    n, m, p, reps = 3000, 150, 100, 8
+    raw = rng.binomial(2, rng.uniform(.1, .5, m), (n, m)).astype(np.int8)
+    chrom = tuple(str(c) for c in np.repeat([1, 2, 3], m // 3))
+    axis = VariantAxis(tuple(f'v{i}' for i in range(m)), chrom, tuple(range(1, m + 1)), ('A',) * m, ('G',) * m)
+    source = ArrayGenotypeSource(raw, [(str(i), str(i)) for i in range(n)], axis, hard_calls=True)
+    x = (raw - raw.mean(0)) / raw.std(0)
+    rows = np.arange(n)
+    bg = background_axis(source, n_blocks=12)
+    scale = estimate_scale(source, rows, bg.variants)
+    values = []
+    for r in range(reps):
+        focal = (rng.random(n) < .12).astype(int)
+        liability = x @ rng.normal(0, np.sqrt(.7 / m), m) + rng.normal(0, np.sqrt(.3), n)
+        y = np.exp(.5 * (.3 * focal + np.exp(.2 * focal) * liability))      # exact affine-modifier null
+        plan = build_plan(rows, [Context('f', focal, {0: 0., 1: 1.}, low=(0,), high=(1,), exclude_chromosomes=('1',))],
+                          [Outcome('y', y, positive=True)], rng.normal(size=(n, p)), scales=('within_rank',),
+                          n_groups=10, seed=r, covariate_slopes='class')
+        hi = plan.kinds['hi'].start
+        n_hi = plan.analyses[0]['n_high']
+        assert np.isclose(plan.counts[:, hi].sum(), n_hi - (1 + p), rtol=1e-8)    # sum of 1 - leverage
+        acc = accumulate(source, plan, scale, bg, block_size=64, native=False)
+        values += [rec['estimate'] for rec in summarize(plan, acc) if rec['statistic'] == 'log_amp']
+    # with raw counts the shift would be about 2 log((1 - 101/360) / (1 - 101/2640)), i.e. -0.58
+    assert abs(np.mean(values)) < .25
+
+
+def test_variant_contexts_reject_fractional_dosages():
+    from summit.epistasis.scale_free.workflow import variant_contexts
+    n = 8
+    dosage = np.array([[0, .4, .9, 1.1, 1.6, 1.95, 2, .2]], dtype=float).T
+    axis = VariantAxis(('v0',), ('1',), (1,), ('A',), ('G',))
+    source = ArrayGenotypeSource(dosage, [(str(i), str(i)) for i in range(n)], axis, hard_calls=False)
+    with pytest.raises(ValueError, match='hard calls'):
+        variant_contexts(source, np.arange(n), [{'name': 'v0', 'variant': 'v0', 'min_minor_homozygotes': 1}])
+
+
+def test_background_blocks_are_contiguous_when_blocks_exceed_variants():
+    source, raw, ctx, out, cov = simulated(seed=2, n=200, m=90)
+    bg = background_axis(source, n_blocks=200)
+    assert bg.n_blocks == len(np.unique(bg.blocks)) == len(bg.block_chromosomes)
+    assert np.array_equal(np.unique(bg.blocks), np.arange(bg.n_blocks))
+
+
+def test_empty_annotation_drops_only_that_annotation():
+    source, raw, ctx, out, cov = simulated(seed=6)
+    rows = np.arange(len(source.samples))
+    plan = build_plan(rows, ctx[:1], out[1:], cov, scales=('within_rank',), n_groups=6, seed=1)
+    chrom1 = (np.array(source.variants.chromosome) == '1').astype(float)    # the context's own chromosome
+    bg = background_axis(source, annotations=chrom1[:, None], names=('own',), n_blocks=6)
+    scale = estimate_scale(source, rows, bg.variants)
+    acc = accumulate(source, plan, scale, bg, block_size=32, native=False)
+    stats = {r['statistic'] for r in summarize(plan, acc)}
+    assert {'dosage', 'rho', 'log_amp', 'delta2'} <= stats
+    assert not any('[own]' in s for s in stats)
+
+
+def test_pair_battery_runs_without_minor_homozygotes():
+    from summit.epistasis.scale_free.rank_pairs import pair_battery
+    rng = np.random.default_rng(4)
+    n = 3000
+    x = (rng.random(n) < .1).astype(int)                     # no minor homozygotes
+    z = rng.binomial(2, .3, n)
+    y = np.exp(.3 * x + .2 * z + .2 * x * z + rng.normal(size=n))
+    out = pair_battery(y, x, z, rng.normal(size=(n, 2)), boot=20)
+    assert np.isfinite(out['cpm_logit_z']) and np.isfinite(out['ls_probit_z'])
+
+
+def _write_cli_inputs(tmp_path, seed=21, n=700, m=60):
+    from bed_reader import to_bed
+    source, raw, ctx, out, cov = simulated(seed=seed, n=n, m=m)
+    ids = [str(i) for i in range(n)]
+    values = np.where(raw == -127, np.nan, raw.astype(float))
+    to_bed(tmp_path / 'input.bed', values, properties=dict(
+        fid=ids, iid=ids, sid=[f'v{i}' for i in range(m)], chromosome=list(source.variants.chromosome),
+        bp_position=np.arange(1, m + 1), allele_1=['A'] * m, allele_2=['G'] * m))
+    (tmp_path / 'samples.tsv').write_text('FID IID\n' + ''.join(f'{i} {i}\n' for i in range(n)))
+    y = out[0].values
+    sex = [str(int(cov[i, 1])) if i % 50 else 'NA' for i in range(n)]       # some missing strata
+    (tmp_path / 'pheno.tsv').write_text('FID IID y sex\n' + ''.join(f'{i} {i} {y[i]} {sex[i]}\n' for i in range(n)))
+    (tmp_path / 'cov.tsv').write_text('FID IID c1\n' + ''.join(f'{i} {i} {cov[i, 0]}\n' for i in range(n)))
+    (tmp_path / 'ctx.tsv').write_text('FID IID k\n' + ''.join(f'{i} {i} {ctx[1].labels[i]}\n' for i in range(n)))
+    return dict(kind='summit.epistasis.scale_free', schema_version=1, genotypes={'geno': 'input.bed'},
+                samples='samples.tsv', phenotypes={'file': 'pheno.tsv', 'columns': ['y'], 'positive': ['y']},
+                covariates={'file': 'cov.tsv', 'columns': ['c1']}, strata={'file': 'pheno.tsv', 'column': 'sex'},
+                contexts=[{'name': 'v0', 'variant': 'v0', 'min_minor_homozygotes': 10},
+                          {'name': 'other', 'file': 'ctx.tsv', 'column': 'k', 'values': {'0': 0, '1': 1, '2': 2},
+                           'low': [0, 1], 'high': [2], 'exclude_chromosomes': ['2']}],
+                background={'jackknife_blocks': 6}, scales=['within_rank'], groups=5)
+
+
+@pytest.mark.parametrize('change, message', [
+    (lambda m: m['contexts'][1].update(exclude_chromosomes=['chr2']), 'exclude_chromosomes'),
+    (lambda m: m['contexts'][1].update(low=[0, 1], high=[1, 2]), 'disjoint'),
+    (lambda m: m['phenotypes'].update(positive=['y', 'z']), 'unknown columns'),
+])
+def test_manifest_validation(tmp_path, change, message):
+    if not _native_available():
+        pytest.skip('native extension is not loaded')
+    from summit.epistasis.scale_free.workflow import run
+    manifest = _write_cli_inputs(tmp_path)
+    change(manifest)
+    (tmp_path / 'm.json').write_text(json.dumps(manifest))
+    with pytest.raises(ValueError, match=message):
+        run(tmp_path / 'm.json', tmp_path / 'out', threads=1)
+
+
+def test_missing_strata_and_memory_budget(tmp_path):
+    if not _native_available():
+        pytest.skip('native extension is not loaded')
+    import pandas as pd
+    from summit.epistasis.scale_free.workflow import run
+    manifest = _write_cli_inputs(tmp_path)
+    (tmp_path / 'm.json').write_text(json.dumps(manifest))
+    with pytest.raises(MemoryError, match='split the analyses'):
+        run(tmp_path / 'm.json', tmp_path / 'tiny', threads=1, memory_bytes=1000)
+    run(tmp_path / 'm.json', tmp_path / 'out', threads=1, memory_bytes=2**30)
+    res = pd.read_csv(tmp_path / 'out' / 'results.tsv', sep='\t')
+    run_info = json.loads((tmp_path / 'out' / 'run.json').read_text())
+    for a in run_info['analyses']:          # the 14 rows with a missing stratum are dropped, not a third stratum
+        assert a['n'] <= 700 - 14
+    assert set(res.statistic) >= {'dosage', 'rho'}

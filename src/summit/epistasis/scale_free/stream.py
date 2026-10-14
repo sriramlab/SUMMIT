@@ -83,7 +83,7 @@ def background_axis(source, *, variants=None, annotations=None, names=(), n_bloc
     starts = np.r_[np.flatnonzero(change), len(variants)]
     next_id = 0
     for a, b in zip(starts[:-1], starts[1:]):
-        k = max(1, int(round((b - a) / target)))
+        k = min(b - a, max(1, int(round((b - a) / target))))     # never more blocks than variants
         blocks[a:b] = next_id + (np.arange(b - a) * k) // (b - a)
         next_id += k
     return Background(variants=variants, chromosomes=chromosomes, weights=weights,

@@ -17,7 +17,7 @@ Manifest (JSON, paths relative to the manifest):
     pattern_scales?: scales that also get lo/hi pattern columns (default all)
     additive_scales?: scales that also get the additive column (default none)
     groups?: 200, seed?: 20261011, genotype_scale?: empirical|hwe, save_kernels?: false
-    covariate_slopes?: class|common (default class; see design.build_plan)
+    covariate_slopes?: common|class (default common; see design.build_plan)
 
 A variant context codes minor-allele counts on the pass rows. With fewer than
 min_minor_homozygotes, the minor homozygotes are merged with the
@@ -38,6 +38,7 @@ from .stats import summarize
 from .stream import accumulate, background_axis, plan_block_size
 
 KIND = 'summit.epistasis.scale_free'
+NA_TOKENS = ('', 'NA', 'nan', 'NaN', 'N/A', 'None', '<NA>')
 
 
 def _numeric(table, columns):
@@ -55,7 +56,7 @@ def covariate_matrix(table, columns=(), categorical=()):
     for name in categorical:
         if name not in table.columns:
             raise ValueError(f'missing categorical covariate {name}')
-        values = table[name].astype(str).replace({'': np.nan, 'NA': np.nan, 'nan': np.nan})
+        values = table[name].astype(str).str.strip().replace({t: np.nan for t in NA_TOKENS})
         dummies = np.array(pd.get_dummies(values, drop_first=True, dtype=np.float64).to_numpy(), copy=True)
         dummies[values.isna().to_numpy()] = np.nan
         parts.append(dummies)
@@ -78,10 +79,12 @@ def variant_contexts(source, rows, specs, *, threads=1):
     contexts = []
     for s in specs:
         j = lookup[s['variant']]
-        calls = raw[:, column[j]].astype(np.int64)
-        observed = calls != -127
-        if np.any((calls[observed] < 0) | (calls[observed] > 2)):
-            raise ValueError(f"{s['variant']}: variant contexts require hard calls")
+        dosage = raw[:, column[j]].astype(np.float64)
+        observed = np.isfinite(dosage) & (dosage != -127)
+        if np.any(dosage[observed] != np.round(dosage[observed])) or np.any((dosage[observed] < 0)
+                                                                            | (dosage[observed] > 2)):
+            raise ValueError(f"{s['variant']}: variant contexts require hard calls (allele counts 0, 1, 2)")
+        calls = np.where(observed, np.round(dosage), -127).astype(np.int64)
         if calls[observed].mean() > 1:
             calls = np.where(observed, 2 - calls, calls)
         coding = s.get('coding', 'additive')
@@ -147,6 +150,8 @@ def run(manifest, out, *, threads=1, memory_bytes=16 * 2**30, block_size=1024, n
         table = _aligned_table(root / phen['file'], samples)
         values = _numeric(table, phen['columns'])
         positive = set(phen.get('positive', ()))
+        if not positive <= set(phen['columns']):
+            raise ValueError(f"phenotypes.positive names unknown columns: {sorted(positive - set(phen['columns']))}")
         outcomes = [Outcome(c, values[:, k], positive=c in positive) for k, c in enumerate(phen['columns'])]
         covariates = np.zeros((len(rows), 0))
         if 'covariates' in spec:
@@ -158,28 +163,51 @@ def run(manifest, out, *, threads=1, memory_bytes=16 * 2**30, block_size=1024, n
         if 'strata' in spec:
             closed(spec['strata'], ('file', 'column'), (), name='strata')
             column = _aligned_table(root / spec['strata']['file'], samples)[spec['strata']['column']]
-            strata = column.astype(str).to_numpy()
+            strata = column.astype(str).str.strip().to_numpy()
+            missing_strata = np.isin(strata, NA_TOKENS) | column.isna().to_numpy()
+            if missing_strata.any():
+                # a missing stratum is missing data, not an extra stratum: drop those rows from every analysis
+                flag = np.where(missing_strata, np.nan, 0.)[:, None]
+                covariates = np.column_stack([covariates, flag])
+                strata = np.where(missing_strata, 'missing', strata)
         variant_specs = [c for c in spec['contexts'] if 'variant' in c]
         focal = variant_contexts(source, rows, variant_specs, threads=threads)
         contexts, context_info = [], {}
         for ctx, info in focal:
             contexts.append(ctx)
             context_info[ctx.name] = info
+        chromosomes = set(map(str, source.variants.chromosome))
         for c in spec['contexts']:
             if 'variant' in c:
                 continue
             labels = _numeric(_aligned_table(root / c['file'], samples), [c['column']])[:, 0]
-            labels = np.where(np.isfinite(labels), labels, -1).astype(np.int64)
-            contexts.append(Context(name=c['name'], labels=labels,
-                                    values={int(k): float(v) for k, v in c['values'].items()},
-                                    low=tuple(c['low']), high=tuple(c['high']),
-                                    exclude_chromosomes=tuple(str(x) for x in c['exclude_chromosomes'])))
+            finite = np.isfinite(labels)
+            if np.any(labels[finite] != np.round(labels[finite])) or np.any(labels[finite] < 0):
+                raise ValueError(f"{c['name']}: context labels must be non-negative integers")
+            labels = np.where(finite, labels, -1).astype(np.int64)
+            values = {int(k): float(v) for k, v in c['values'].items()}
+            low, high = tuple(int(v) for v in c['low']), tuple(int(v) for v in c['high'])
+            if set(low) & set(high) or not set(low) | set(high) <= set(values):
+                raise ValueError(f"{c['name']}: low and high classes must be disjoint and have values")
+            exclude = tuple(str(x) for x in c['exclude_chromosomes'])
+            if not set(exclude) <= chromosomes:
+                raise ValueError(f"{c['name']}: exclude_chromosomes {sorted(set(exclude) - chromosomes)} are not "
+                                 'chromosome names of the genotype source')
+            contexts.append(Context(name=c['name'], labels=labels, values=values, low=low, high=high,
+                                    exclude_chromosomes=exclude))
             context_info[c['name']] = dict(file=c['file'], column=c['column'])
+        n_analyses = len(spec['analyses']) if 'analyses' in spec else len(contexts) * len(outcomes)
+        scales = tuple(spec.get('scales', ('pooled_rank', 'within_rank')))
+        columns = n_analyses * (len(scales) + 2 * len(spec.get('pattern_scales', scales))
+                                + len(spec.get('additive_scales', ())))
+        if 8 * len(rows) * columns > memory_bytes:
+            raise MemoryError(f'the plan needs {8 * len(rows) * columns / 2**30:.1f} GiB for {columns} outcome '
+                              'columns; split the analyses into several passes or raise --memory-gib')
         plan = build_plan(rows, contexts, outcomes, covariates, analyses=spec.get('analyses'), strata=strata,
                           scales=spec.get('scales', ('pooled_rank', 'within_rank')),
                           pattern_scales=spec.get('pattern_scales'), additive_scales=spec.get('additive_scales', ()),
                           n_groups=spec.get('groups', 200),
-                          seed=spec.get('seed', 20261011), covariate_slopes=spec.get('covariate_slopes', 'class'))
+                          seed=spec.get('seed', 20261011), covariate_slopes=spec.get('covariate_slopes', 'common'))
         print(f'scale-free plan: {len(plan.analyses)} analyses, {plan.n_columns} columns, {len(rows)} rows, '
               f'{perf_counter() - started:.0f} s', file=sys.stderr, flush=True)
         bg = spec.get('background', {})
@@ -216,7 +244,8 @@ def run(manifest, out, *, threads=1, memory_bytes=16 * 2**30, block_size=1024, n
                     contexts=context_info, analyses=plan.analyses, annotations=list(background.names),
                     background=dict(variants=int(len(background.variants)), jackknife_blocks=background.n_blocks),
                     genotype_source=source_identity, genotype_scale=scale.identity,
-                    groups=plan.n_groups, seed=spec.get('seed', 20261011), diagnostics=result.diagnostics,
+                    groups=plan.n_groups, seed=spec.get('seed', 20261011),
+                    covariate_slopes=spec.get('covariate_slopes', 'common'), diagnostics=result.diagnostics,
                     seconds=perf_counter() - started)
     run_info['code_sha256'] = code
     if native:

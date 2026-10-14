@@ -11,6 +11,9 @@ through ranks, or is exact under a stated scale null:
     stratified_rank_test rank-inverse-normal within z (x sex) strata; tests whether
                          x effects differ across z strata. Exact when z acts on
                          the latent scale only by an affine map.
+    relative_stratified_test  x effects across z strata relative to an independent
+                         polygenic score (b_s = kappa c_s; ratio and linear forms);
+                         null also when z rescales every genetic effect equally
     auc_contrasts        Mann-Whitney contrasts of x within z strata (DeLong SEs)
     robustness_radius    R* = max(P/N, N/P) of the CDF interaction D(t) on the
                          pooled-rank scale, with a sup-t band lower bound; R*_lo =
@@ -488,7 +491,11 @@ def pair_battery(y, x, z, covariates, *, strata=None, links=LINKS, bins=40, boot
         v = np.asarray(v, float)
         return v - v.mean()
 
-    X = np.column_stack([centred(x), centred(x == 1), centred(z), centred(z == 1), cov, centred(x) * centred(z)])
+    # without minor homozygotes the heterozygote indicator duplicates the count and the
+    # homozygote dispersion column is empty; drop them so the designs stay full rank
+    x_hom, z_hom = bool(np.any(x == 2)), bool(np.any(z == 2))
+    X = np.column_stack([centred(x)] + ([centred(x == 1)] if x_hom else []) + [centred(z)]
+                        + ([centred(z == 1)] if z_hom else []) + [cov, centred(x) * centred(z)])
     c = rank_bins(y, bins)
     out = dict(n=int(len(y)), maf_x=float(x.mean() / 2), maf_z=float(z.mean() / 2))
     for link in links:
@@ -496,7 +503,8 @@ def pair_battery(y, x, z, covariates, *, strata=None, links=LINKS, bins=40, boot
         out[f'cpm_{link}_beta'] = float(r['beta'][-1])
         out[f'cpm_{link}_z'] = float(r['beta'][-1] / np.sqrt(r['cov_sandwich'][-1, -1])) if r['converged'] else np.nan
         out[f'cpm_{link}_converged'] = bool(r['converged'])
-    dispersion = [centred(x == 1), centred(x == 2), centred(z == 1), centred(z == 2)]
+    dispersion = ([centred(x == 1)] + ([centred(x == 2)] if x_hom else []) + [centred(z == 1)]
+                  + ([centred(z == 2)] if z_hom else []))
     if strata is not None:
         dispersion.append(centred(strata))
     r = cpm_location_scale(c, X, np.column_stack(dispersion), 'probit')

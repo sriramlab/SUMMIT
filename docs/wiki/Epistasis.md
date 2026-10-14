@@ -164,7 +164,19 @@ nonnegative weights, and include relevant additive annotations in
 `additive_annotations`. Saved variance summaries use `.epistasis.npz`.
 
 Moment estimates remain signed. Approximate Wald probabilities from a
-variance fit need particular care at the zero-variance boundary. Gaussian
+variance fit need particular care at the zero-variance boundary.
+
+**Variance effects of the target.** With the default `residual_model: iid`,
+the moment equations include same-person terms x_i² y_i². A target that
+changes the phenotypic variance (a variance QTL, including one produced by
+the measurement scale) then inflates the interaction coefficient even without
+any interaction: in simulation a pure noise-variance effect gave false
+positives in 72-100% of replicates. `residual_model: modifier_squares` adds a
+residual component proportional to the squared target modifier, which removes
+the bias when the residual variance is linear in x²; it requires declared
+`components`. The between-person statistics in
+[Scale-free epistasis](Epistasis-scale-free.md) use no same-person terms and
+are not affected. Gaussian
 score and fitted-null procedures are also available through
 `summit.epistasis.score` and `summit.epistasis.inference_workflow`, with their
 stated covariance assumptions.
