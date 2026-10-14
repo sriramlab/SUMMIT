@@ -9,7 +9,11 @@ Point estimates have independent dense-kernel checks, and uncertainty has
 been tested with repeated simulations that vary sample size, SNP count and
 block count separately. Inference remains experimental outside the validated
 settings below, especially with rare outcomes, fitted nuisance models or
-weak genetic-variance denominators.
+weak genetic-variance denominators. Within-trait binary intervals are
+anti-conservative for rare outcomes or strong per-SNP signal; the fit marks
+them uncalibrated (see [Uncertainty](#uncertainty-and-validation-limits)).
+Validation used at most 8,192 SNPs and 32,768 participants per trait; the
+genome-wide array regime has not been simulated.
 
 ## Estimand
 
@@ -55,11 +59,18 @@ population liability variance when those means vary.
 | Design | Support |
 |---|---|
 | Outcome-independent cohort membership, no/partial/full overlap | Supported, conditional on fixed exogenous contexts and covariates |
-| Binary case–control sampling based solely on that trait’s own status, cohorts disjoint before selection | Supported by the first-order PCGC model |
-| Ascertained overlapping trait cohorts | Rejected; needs a supported joint selection model |
-| Controls restricted by several diagnoses | Rejected |
-| Quantitative sample selected on a diagnosis | Rejected |
-| Recognition conditional on measured illness, or treatment-restricted samples | Rejected without a separate target and selection model |
+| Binary case–control sampling based solely on that trait’s own status, cohorts disjoint before selection | Supported by the first-order PCGC model, with fitted risks whose design includes the contexts |
+| Ascertained overlapping trait cohorts | Unsupported; rejected only when declared (an `own_case_status` trait overlapping another cohort) |
+| Controls restricted by several diagnoses | Unsupported, not detected |
+| Quantitative sample selected on a diagnosis | Unsupported; rejected only when declared (`own_case_status` on a quantitative trait) |
+| Recognition conditional on measured illness, or treatment-restricted samples | Unsupported without a separate target and selection model; not detected |
+
+The program checks the declared `selection` labels and cohort overlap only.
+It cannot recognize an undeclared ascertainment, a restricted control group
+or treatment-based exclusions in the supplied tables, so a design listed as
+unsupported can run without error when it is not declared. The fit records
+this as `selection_law_declared_not_verified`; the analyst attests to the
+sampling design.
 
 The binary approximation comes from differentiating the selected joint latent
 distribution at zero distinct-person correlation. It assumes correctly
@@ -73,9 +84,32 @@ do not estimate a heterogeneous liability variance. Supplied heterogeneous
 SDs require supplied population risks. Fitted probit risks currently assume
 unit conditional liability variance.
 
+A fitted probit risk design always contains every context column; columns
+not already spanned by the intercept and the risk covariates are added. At
+the fit, the score equations make the risk-weighted contexts orthogonal to
+the binary responses. Case–control (`own_case_status`) sampling requires
+these fitted risks. With supplied risks, even the true population risks,
+null within-trait context covariances were rejected too often in
+retrospective case–control calibration: 8.1–9.2% of rare-disease
+replicates in the original experiment and 8.7% when repeated, against
+4.3–4.8% with fitted risks (see the results below). The excess behaves like
+sample-level variation shared by all SNP blocks, which the block jackknife
+cannot see and the fitted risk model absorbs. Recentring the supplied-risk
+responses on the risk-weighted contexts removed only part of it, so it is
+not a substitute for the fit. Supplied risks in that design are therefore
+refused unless `allow_uncalibrated_supplied_risks` is set, and the fit then
+marks that trait's within-trait intervals uncalibrated. This also applies
+to heterogeneous liability SDs, which need supplied risks. Under
+outcome-independent sampling, supplied risks remain supported and should
+come from a model that includes the contexts.
+
 Quantitative outcomes are divided by a supplied, fixed population SD. Use 1
 to retain their original units. The program does not estimate or apply a
-sample phenotype SD. Quantitative fixed effects include an intercept.
+sample phenotype SD. Quantitative fixed effects include an intercept, and by
+default the context columns also enter the projected design as main
+effects. An omitted context main effect remains in the residual and is
+correlated with the context-weighted kernels. Set `context_main_effects` to
+false only when the contexts are known to have no mean effect.
 
 Distinct participants must have no residual covariance after the declared mean
 model. Shared-household or other off-person residual dependence requires an
@@ -127,11 +161,15 @@ A preparation manifest can contain:
 
 Paths resolve relative to the manifest. The program adds a context intercept.
 For a fitted binary risk model, omit `risk_column` and supply
-`risk_covariates`; the context columns also enter that fit. Replace
-`unit_liability` with `"liability_sd_column": "SD"` for known heterogeneous
-SDs. For `selection: "own_case_status"`, supply population `prevalence`
-or known `sampling_odds`, the case/control inclusion-probability ratio.
-Outcome-independent sampling fixes that ratio at one.
+`risk_covariates`, or neither; the context columns always enter that fit.
+Replace `unit_liability` with `"liability_sd_column": "SD"` for known
+heterogeneous SDs. For `selection: "own_case_status"`, supply either the
+population `prevalence` or the known `sampling_odds`, the case/control
+inclusion-probability ratio, and use fitted risks; a `risk_column` there also
+needs `"allow_uncalibrated_supplied_risks": true`. Outcome-independent
+sampling fixes the ratio at one and rejects a `prevalence`, which it would
+not use. A quantitative trait accepts `"context_main_effects": false` to
+leave its context columns out of the fixed design.
 
 Optional `genotype_adjustment` contains a `table` of unique FID/IID and
 `columns` listing ancestry PCs. It projects population-scaled genotypes
@@ -193,7 +231,11 @@ The Python API provides `binary_trait`, `quantitative_trait`,
 `prepare_cross_gxe`, `prepare_cross_from_source`, `fit_cross_gxe`,
 `derived_covariance`, and `evaluate_cross_contexts` in
 `summit.pcgc.cross_gxe_model`, `cross_gxe`, `cross_gxe_io`, and
-`cross_gxe_fit`. The context evaluator reports an effect covariance surface
+`cross_gxe_fit`. `quantitative_trait(fixed_effects=None)` projects an
+intercept; pass an n × 0 array for no fixed design. Its
+`context_main_effects` and `binary_trait`'s
+`allow_uncalibrated_supplied_risks` match the manifest fields.
+The context evaluator reports an effect covariance surface
 and matching genetic-variance denominators. A nonpositive denominator gives
 an undefined correlation; a variance interval reaching zero makes the
 correlation unreliable. Weak normal equations are reported separately.
@@ -222,7 +264,9 @@ the original diagonal. The estimating instruments remove the entire projected
 same-person nuisance space. This permits arbitrary same-person residual
 cross-covariance under the supported sampling model, including unequal
 projectors. High-leverage designs that make this correction unstable are
-rejected.
+rejected before genotype reading. The same-person diagonal 1 − h_A − h_B,
+for combined leverage h_A + h_B, must exceed 10⁻⁴ times its largest value,
+and the condition number of the overlap system must stay below 10⁸.
 
 Jackknife blocks are assigned only at fitting. Deleting a target block reuses
 the saved rows, renormalizes retained target annotation mass, and keeps full
@@ -242,6 +286,53 @@ general decomposition into participant, effect and nuisance uncertainty.
 Adding separate estimates of those pieces without their joint influence
 calculation can double count variation. The output reports annotation mass
 concentration across blocks and flags use of fewer than 30 blocks.
+
+The delete-block replicates keep the realized reference rows, so their spread
+already contains part of the randomized-reference error, which the reference
+term then adds in full. This double counting is conservative; in the
+independent review's checks it was 0.1–0.2% of the reported variance.
+
+### Calibration flags
+
+Within-trait binary intervals are anti-conservative when the outcome is rare
+or the per-SNP signal is strong. The cause is threshold heteroscedasticity.
+For a binary trait, the variance of the response given the genetic liability
+changes with that liability, by approximately δ = (η² − 1)/2 at
+η = Φ⁻¹(K). This correlates the signal-by-noise parts of the estimating
+function across SNP blocks, Cov(u_b, u_b′) ∝ 2δ h_b h_b′. The delete-block
+jackknife assumes independent blocks and omits this covariance, which is
+positive, making intervals too narrow, when K < Φ(−1) ≈ 0.16, and grows with
+h·N/M. Drift in the realized liability variance does not explain the
+deficit: once that drift was removed, the predicted variance ratio (0.47)
+matched the observed one (0.49). In a quantitative control, genotype-dependent
+residual variance alone lowered the variance ratio of a null within-trait
+context covariance from 0.81 to 0.60.
+
+An independent reproduction used two binary traits with K = 0.02,
+N = 32,768, M = 1,024 and intercept genetic variance 0.36. The reported
+variance was 0.32 times the empirical variance for the intercept component
+(72.8% coverage). A null within-trait context covariance had variance ratio
+0.44 and 80.3% coverage, so it was rejected in about 20% of replicates at a
+nominal 5% level. Cross-trait components were affected only mildly, with
+variance ratios 0.87–0.95. The single-trait
+[Generalized G×E PCGC](Generalized-GxE-PCGC.md) fit uses the same
+within-trait estimator and SNP-block intervals.
+
+The fit output therefore includes `calibration` and `component_calibration`.
+Within-trait binary components are marked `uncalibrated` when the trait's
+reference prevalence is below Φ(−1) or ĥ·N/M ≥ 1. Here ĥ is the sample
+liability genetic variance implied by the fitted Ω and the mean context
+second moment, N is that trait's sample size and M the number of SNPs. With
+LD, M overstates the number of independent SNPs, so this screen is
+optimistic. Supplied risks kept under case–control sampling are also marked.
+Every interval reports the flag of its contrast. Genetic variances,
+heritabilities and correlations that use a flagged component inherit the
+flag; cross-trait covariances do not. `not_flagged` means only that no known
+deficit applies, not that calibration is established. No variance correction
+is applied. `fit_cross_gxe(participant_covariance=...)` accepts a
+participant-level covariance for within-trait binary pairs as an additional
+known term, reserved for a calibrated model of the omitted between-block
+covariance; none is computed here.
 
 Intervals use a working Student approximation, with Welch–Satterthwaite
 degrees of freedom from the SNP-block and reference-draw variance estimates.
@@ -287,17 +378,18 @@ arbitrary prevalence, effect size, LD or nuisance estimation. With rare
 outcomes, 32,768 participants, 4,096 SNPs and larger intercept genetic
 variances (0.36 and 0.30), coverage fell to 87.9% for a within-trait component.
 Cross-trait components covered 94.2–95.2% in that experiment. Increasing the
-block count did not resolve the within-trait deficit. This is a reproducible
-uncertainty limitation, and the favorable correlation coverage in that setting
-does not validate all covariance-surface contrasts.
+block count did not resolve the within-trait deficit, as expected from the
+between-block covariance described under [Calibration flags](#calibration-flags),
+and the favorable correlation coverage in that setting does not validate all
+covariance-surface contrasts.
 
 Follow-up held the larger genetic variance and 8,192 SNPs fixed. With 8,192
 participants, coverage was 93.4–95.6%; with 32,768 participants it was
 91.1–95.1%. In the latter experiment, cross-trait components covered
 94.2–95.1%, while some within-trait variances remained underestimated.
-Increasing the sample size can therefore expose a deficit that response noise
-masks in a smaller cohort. These results concern the tested LD and genetic
-architecture; they do not establish a universal sample-size threshold.
+Increasing the sample size raises h·N/M and so the omitted covariance.
+These results concern the tested LD and genetic architecture; they do not
+establish a universal sample-size threshold.
 
 Further 5,000-replicate tests used shared contexts, unequal disease risks,
 strong genetic covariance and same-person residual correlation 0.8.
@@ -328,6 +420,13 @@ variances were 0.94–1.03 times the paired empirical errors at 32 probes and
 covariance matrix was 2.85 Monte Carlo SEs. This checks correlated reference
 draws in that model; it does not remove finite-probe inversion bias.
 
+All of these experiments used at most 8,192 SNPs and 32,768 participants per
+trait, with independent SNPs or short LD groups. The genome-wide array
+regime, about 448,000 SNPs with long-range LD, has not been simulated. There
+the effective number of independent SNPs is much smaller than M, which raises
+the effective h·N/M; neither the interval approximations nor the calibration
+screen have been tested in that regime.
+
 Separate retrospective case–control experiments use cohorts disjoint before
 selection. At 2,048 people per cohort, 256 SNPs and 128 blocks, 1,000
 replicates with correctly specified fitted two-stratum probit risks gave
@@ -337,6 +436,27 @@ results qualify that particular nuisance model, not general fitted-risk
 inference. Correlation coverage is reported with the frequencies of undefined
 and weak denominators; conditional coverage among successful fits cannot
 qualify weak correlations.
+
+The same design was repeated after fitted risks with contexts became the
+required default, with 3,000 rare-disease (population prevalences 0.020 and
+0.026) and 2,000 common-disease (0.16 and 0.18) replicates. The two null within-trait context
+covariances were rejected in 4.70% and 4.97% of rare-disease replicates
+(pooled 4.83%, Monte Carlo SE 0.28%) and in 4.25% and 4.75% of
+common-disease replicates (pooled 4.50%, SE 0.33%). Within-trait coverage
+was 94.3–95.3% for rare and 93.8–95.8% for common disease; cross-trait
+coverage was 94.1–95.4%. Supplied true risks, kept with the override, gave
+9.00% and 8.47% for rare disease (pooled 8.73%, SE 0.36%), with within-trait
+coverage down to 90.7% and variance ratios down to 0.80, and 5.27% (SE 0.35%)
+for common disease. Responses recentred on the risk-weighted contexts gave
+7.37% (SE 0.34%) for rare disease. With fitted risks, the largest component
+bias was 1% of the rare-disease intercept variance (3.1 Monte Carlo SEs).
+The calibration screen flags these rare-disease within-trait components
+(prevalence below Φ(−1), ĥ·N/M about 1.0–1.2). The screen follows the
+unascertained derivation; in these balanced case–control samples the
+fitted-risk intervals were nonetheless calibrated, so it is conservative
+there. The driver is `scripts/pcgc/calibrate_cross_ascertainment.py --variant
+--n 2048 --m 256 --blocks 128`, with `--risk-modes` and `--settings`
+selecting the arms.
 
 The validation drivers report bias and its Monte Carlo SE, empirical and
 reported covariance, coverage Wilson intervals, null rejection and denominator

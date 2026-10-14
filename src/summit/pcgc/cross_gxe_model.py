@@ -199,12 +199,15 @@ def binary_trait(name, samples, y, contexts, *, context_names, liability_sd,
 
     A fitted probit design always contains every context column (added unless
     already in the span of risk_covariates and the intercept). The score
-    equations of that fit make the weighted contexts orthogonal to z.
-    Own-case-status sampling requires such fitted risks: supplied risks, even
-    the true ones, leave a sample-level weighted mean of z in each context
-    stratum that multiplies the case-enriched genotype means; the resulting
-    term is common to every SNP block and the jackknife misses it (null
-    within-trait type-I error 8-9% instead of 5% in retrospective tests).
+    equations of that fit make the risk-weighted contexts orthogonal to z.
+    Own-case-status sampling requires such fitted risks. With supplied risks,
+    even the true ones, null within-trait components over-rejected in
+    retrospective case-control tests (8.7% against 4.8% with fitted risks;
+    within-trait variance ratios down to 0.80). The excess behaves like
+    sample-level variation shared by all SNP blocks, which the block
+    jackknife cannot see and the fitted risk model absorbs. Recentring the
+    supplied-risk z on the risk-weighted contexts removed only part of it
+    (7.4%), so it is not a substitute.
     allow_uncalibrated_supplied_risks=True keeps supplied risks there; the fit
     then marks that trait's within-trait intervals uncalibrated.
     """
