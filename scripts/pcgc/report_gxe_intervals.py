@@ -43,9 +43,50 @@ def cell(block, j):
             f"{100*block['coverage'][j]:.1f} ({100*block['coverage_mcse'][j]:.1f})")
 
 
+def decision(rows):
+    """Apply the predeclared default rule (decision_rule.txt) to every cell."""
+    from scipy import stats
+    failures, cells = [], []
+    for name, result in rows:
+        data = np.load(Path(result["_path"]).with_suffix(".npz"))
+        ok = ~data["failed"]
+        est, truth = data["estimate"][ok], data["truth"]
+        jk = data["jk_var"][ok]
+        new = jk+data["between_var"][ok]+data["nuisance_var"][ok]
+        n = len(est)
+        err = est-truth
+        for j in range(est.shape[1]):
+            cj = np.abs(err[:, j]) <= 1.959963984540054*np.sqrt(jk[:, j])
+            cn = np.abs(err[:, j]) <= 1.959963984540054*np.sqrt(new[:, j])
+            diff = cn.astype(float)-cj
+            dse = diff.std(ddof=1)/np.sqrt(n)
+            mcse = np.sqrt(cn.mean()*(1-cn.mean())/n)
+            ratio, ratio_mcse = result["crossblock"]["variance_ratio"][j], result["crossblock"]["variance_ratio_mcse"][j]
+            sd = est[:, j].std(ddof=1)
+            se = np.sqrt(new[:, j])
+            cell = dict(setting=name, component=j, truth=float(truth[j]), coverage=float(cn.mean()), mcse=float(mcse),
+                        jk_coverage=float(cj.mean()), ratio=ratio, jk_ratio=result["jackknife"]["variance_ratio"][j],
+                        oracle_coverage=float(np.mean(np.abs(err[:, j]) <= 1.959963984540054*sd)),
+                        se_estimate_correlation=float(np.corrcoef(se, err[:, j])[0, 1]),
+                        relative_sd_of_se=float(se.std()/se.mean()),
+                        t_coverage=float(np.mean(np.abs(err[:, j]) <= stats.t.ppf(.975, result["spec"]["blocks"]-1)*se)))
+            flags = ""
+            if abs(ratio-1) > max(.1, 3*ratio_mcse): flags += "a"
+            if cell["coverage"] < .95-2.58*mcse: flags += "b"
+            if truth[j] == 0 and 1-cell["coverage"] > .05+2.58*mcse: flags += "c"
+            if dse > 0 and diff.mean() < -2.58*dse: flags += "d"
+            cell["failed_rules"] = flags
+            cells.append(cell)
+            if flags:
+                failures.append(cell)
+    return cells, failures
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("directories", nargs="+", type=Path)
+    parser.add_argument("--decision", action="store_true", help="apply the predeclared default rule")
+    parser.add_argument("--exclude", nargs="*", default=[], help="setting names excluded from the rule")
     args = parser.parse_args()
     rows = []
     for directory in args.directories:
@@ -56,7 +97,18 @@ def main():
                 continue
             if "spec" not in result or "jackknife" not in result:
                 continue
+            result["_path"] = str(path)
             rows.append((path.stem, result))
+    if args.decision:
+        cells, failures = decision([r for r in rows if r[0] not in args.exclude])
+        coverage = np.array([c["coverage"] for c in cells])
+        print(json.dumps(dict(cells=len(cells), mean_coverage=coverage.mean(),
+            minimum_coverage=coverage.min(), failures=[(c["setting"], c["component"], c["failed_rules"],
+            round(c["coverage"], 3), round(c["jk_coverage"], 3)) for c in failures],
+            ranges={k: [min(c[k] for c in cells), max(c[k] for c in cells)] for k in
+                    ("ratio", "jk_ratio", "coverage", "jk_coverage", "oracle_coverage", "t_coverage",
+                     "se_estimate_correlation", "relative_sd_of_se")}), indent=1))
+        return
     print("| Setting | Component | Truth | Rel. bias | Jackknife | Sampling | Sampling + architecture | Cross-block |")
     print("|---|---|---:|---:|---|---|---|---|")
     for name, result in rows:

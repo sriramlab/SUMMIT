@@ -63,10 +63,14 @@ summit --binary-method pcgc \
   --binary-context-columns E1,E2 --binary-unit-liability \
   --binary-covariates AGE,PC1,PC2 \
   --binary-genotype-covariates PC1,PC2 \
-  --binary-sampling-partners 128 --binary-architecture-probes 32 \
+  --binary-crossblock-blocks 200 \
   --nvecs 256 --memory-gib 8 --num-threads 2 \
   --out results/disease_gxe
 ```
+
+`--binary-crossblock-blocks 200` records the participant rows for the
+opt-in interval correction described under [Standard errors](#standard-errors);
+fit with the default 200 jackknife blocks.
 
 Preparation writes two NumPy archives:
 
@@ -176,24 +180,103 @@ Population moments use inverse ascertainment weights by default. The Python
 API also accepts supplied population moments. Context-specific heritability
 requires the corresponding context-specific liability variance.
 
+### Standard errors
+
+Fits report SNP-block jackknife SEs. An opt-in correction adds covariance
+that the jackknife cannot see. The jackknife treats SNP blocks as
+independent. That holds for SNP effects and LD, but every block's estimating
+equation is a sum over the same participants. Several participant-level
+terms make block equations covary:
+
+- threshold noise whose variance depends on the genetic value (positive for
+  rare diseases, negative near a prevalence of 0.5);
+- each participant's own genetic signal, which enters every block;
+- selection on case status, which correlates blocks' genetic values within
+  cases and within controls;
+- risk and context weights shared by all blocks.
+
+Their share grows with the signal in the data (roughly ĥ·N/M). With the
+jackknife alone, a simulated rare disease (K = 0.02, N = 32,768, M = 1,024)
+had 82% coverage for a null additive-by-context covariance. Near K = 0.5 the
+jackknife was slightly conservative for that component.
+
+With `--binary-crossblock-blocks`, preparation records each participant's
+contribution to each SNP block's estimating equation, in the first genotype
+pass. The fit adds the covariance between different blocks' contributions
+from the same participants. The within-block part is already in the
+jackknife and is not added again.
+[The development report](../../reports/pcgc_development/pcgc_gxe_binary_intervals.md)
+gives the derivation, assumptions and calibration results.
+
+In simulations with 22 designs (prevalence 0.02–0.5, Q = 1–3, N/M = 8–128,
+fitted and supplied risks, case–control ascertainment, LD and overlapping
+annotations), the corrected variance was close to the true variance (ratio
+0.89–1.14, mean 1.00) and null components had 4–7% type-I error, against
+0.44–1.26 and up to 19% for the jackknife. Coverage of 95% intervals for
+variance components (diagonal Ω entries) was still 90.8–94% in some designs:
+the SE estimate is strongly correlated with the estimate, which affects any
+normal interval, including the jackknife's where its variance is right. The
+correction is therefore opt-in and labelled
+`variance_calibrated_in_simulation_wald_coverage_can_be_below_nominal`. It is
+recommended for rare diseases with supplied risks and large ĥ·N/M, where
+the jackknife alone is most anti-conservative. Like the jackknife, it
+requires blocks larger than local LD.
+
+The correction needs the same SNP blocks at preparation and fit. Set
+`--binary-crossblock-blocks` to the intended jackknife block count, usually
+the binary default of 200. Without `--njack`, the fit uses the prepared
+blocks. With a different `--njack`, the fit reports the jackknife alone and
+says so. In the Python API, pass `crossblock_blocks` (and `risk_covariates`
+for fitted risks) to `prepare_gxe_moments` and fit with the same `block_ids`.
+
+With fitted risks (`--binary-covariates` or the context columns), the
+correction includes uncertainty from the probit risk fit. Supplied risks,
+prevalence, genotype scaling, liability SDs, genotype adjustment and
+reference probes are treated as fixed, as is the population metric used for
+`population_heritability`.
+
+Output fields:
+
+| Field | Meaning |
+|---|---|
+| `standard_errors`, `covariance` | Primary result: calibrated when `crossblock_status` is `applied` |
+| `snp_block_standard_errors`, `snp_block_covariance` | SNP-block jackknife alone |
+| `person_crossblock_covariance`, `risk_fit_covariance` | The two added terms |
+| `uncertainty_method` | `snp_block_jackknife_plus_person_crossblock_v1` or the jackknife |
+| `uncertainty_calibration_status` | Calibration status of the primary result |
+| `crossblock_status` | `applied`, or why the correction was not applied |
+
+A jackknife-only result is labelled
+`not_calibrated_snp_block_jackknife_omits_between_block_person_covariance`.
+In very small samples the between-block estimate can be noisy enough to give
+a nonpositive variance; the fit then keeps the jackknife and reports
+`not_applied_nonpositive_calibrated_variance`.
+
+### Experimental sampling SEs
+
 `--binary-sampling-partners` enables participant-sampling covariance, including
 a same-study fitted risk model, estimated population moments, and randomized
 reference error. `--binary-architecture-probes` additionally models variation
 in Gaussian SNP effects. Outputs include component SEs, their full covariance,
 normal intervals, and score confidence sets. A score set can be unbounded.
-The counts in the example are starting values; assess simulation precision
-for the study size and model being analyzed.
+Counts such as 128 partners and 32 probes are starting values; assess
+simulation precision for the study size and model being analyzed.
 
-These intervals remain experimental. Simulations have shown undercoverage
-for some rare-disease inverse-weighted and overlapping-LD models. Supplied
-prevalence, genotype scaling, liability SDs, genotype adjustment, and supplied
-risks are treated as fixed. Uncertainty from estimating those external inputs
-is not included.
+These SEs remain experimental. Without architecture probes they target a
+fixed genome and omit SNP-effect variation, so they are much too small when
+the estimand is the effect covariance Ω (variance ratios 0.10–0.72 for the
+additive component in the 2026-10-13 simulations). With architecture probes
+their variance ratios were 0.94–1.03 at N = 8,192, with coverage similar to
+the cross-block correction, but preparation is far slower (about five
+minutes single-threaded with 64 partners at N = 32,768 in our runs, against
+seconds for the jackknife and correction). Supplied prevalence, genotype
+scaling, liability SDs, genotype adjustment, and supplied risks are treated
+as fixed.
 
-With zero sampling partners, inference uses the SNP-block jackknife. It holds
-risks, population moments, and reference probes fixed. When both calculations
-are available, `snp_block_standard_errors` preserves the jackknife result and
-`standard_errors` reports the sampling result.
+When the cross-block correction is applied, the sampling result is reported
+separately under `individual_sampling`. Otherwise, as before,
+`snp_block_standard_errors` keeps the jackknife and `standard_errors` reports
+the sampling result.
 
 ## Computation and Python API
 
@@ -210,6 +293,8 @@ trace calculations also run in the compiled extension. Python handles risk
 fitting, preparation order, and the small estimating equations.
 `--num-threads` controls native work during preparation and fitting.
 
+Cross-block participant rows add three small products per genotype block to
+the first pass and O(N) memory; they need no participant pairs or extra pass.
 Reference LD scores use randomized variant probes. Sampling covariance reuses
 the genotype passes and accumulates sampled-pair moments. Products shared by
 annotation and context combinations are evaluated once, then expanded into

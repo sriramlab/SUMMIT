@@ -48,6 +48,10 @@ independent-covariate liability model. Supplied-risk input can include known
 population `V_cov`; otherwise the variance of the risk predictor is estimated
 with inverse-ascertainment weights. Outputs retain the scale and risk metadata.
 The jackknife does not refit risks or capture uncertain external prevalence.
+It also omits covariance between SNP blocks through the same participants,
+which can make its SEs too small for rare diseases with large ĥ·N/M (or too
+large in other designs); see
+[Binary traits and PCGC](Binary-traits-and-PCGC.md#standard-errors-and-interpretation).
 
 ## Methods
 
