@@ -6,6 +6,9 @@ import sys
 
 def main(argv=None):
     tokens = list(sys.argv[1:] if argv is None else argv)
+    if tokens[:1] == ["pcgc-cross"]:
+        from .pcgc.cross_gxe_cli import main as cross_main
+        return cross_main(tokens[1:])
     if tokens[:1] == ["epistasis"]:
         from .epistasis.cli import main as epistasis_main
         return epistasis_main(tokens[1:])

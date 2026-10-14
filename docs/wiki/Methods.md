@@ -13,6 +13,8 @@ Ordered cross-trait G×E equations and their paired uncertainty are described in
 [Cross-trait genetic response covariance](Cross-trait-response-covariance.md).
 Their directional target-block deletion convention is distinct from the
 generalized within-trait convention below.
+Study-specific binary/quantitative pairs with distinct bases and projections
+use [Generalized cross-trait PCGC](Generalized-cross-trait-PCGC.md).
 
 ## h² and rg summary statistics
 

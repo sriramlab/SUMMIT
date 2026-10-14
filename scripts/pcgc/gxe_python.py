@@ -48,6 +48,7 @@ def main():
         raise RuntimeError("process-local THP guard failed")
     root = Path(__file__).resolve().parents[2]
     extensions = Path(extension_dir).resolve(strict=True)
+    os.environ["SUMMIT_PRIVATE_NATIVE_DIR" if mode == "private" else "SUMMIT_NATIVE_DIR"] = str(extensions)
     sys.dont_write_bytecode = True
     os.environ["PYTHONDONTWRITEBYTECODE"] = "1"
     boot = Path("/proc/sys/kernel/random/boot_id").read_text().strip()
@@ -97,26 +98,32 @@ def main():
         import summit
         if Path(summit.__file__).resolve() != root/"src/summit/__init__.py":
             raise RuntimeError("wrong Python checkout")
+        before_numpy = {int(p.name) for p in Path("/proc/self/task").iterdir()}
         import numpy as np
-        warm = np.ones((512,512)); assert (warm@warm)[0,0] == 512
+        from threadpoolctl import threadpool_limits
+        # Warm the complete NumPy pool while the calling thread still has the
+        # allocation mask. A later threadpool_limits call must not create
+        # NumPy workers inheriting OpenMP's singleton mask.
+        with threadpool_limits(limits=threads, user_api="blas"):
+            warm = np.ones((512,512)); assert (warm@warm)[0,0] == 512
         del warm
-        numpy_workers = {int(p.name):sorted(os.sched_getaffinity(int(p.name)))
-            for p in Path('/proc/self/task').iterdir() if int(p.name) != os.getpid()}
-        if any(mask != sorted(cpus) for mask in numpy_workers.values()):
-            raise RuntimeError('NumPy workers did not inherit the allocated CPU set before OpenMP initialization')
+        numpy_worker_affinity = {int(p.name): sorted(os.sched_getaffinity(int(p.name)))
+            for p in Path("/proc/self/task").iterdir() if int(p.name) not in before_numpy}
+        if any(set(mask) != cpus for mask in numpy_worker_affinity.values()):
+            raise RuntimeError("NumPy workers did not inherit the complete allocated mask")
         from summit import gxeldcore
         from summit.prediction.runtime import configure_prediction_threads
         configure_prediction_threads(gxeldcore,threads)
         info = gxeldcore.build_info()
+        sys.path.insert(0,str(root/"scripts/generalized_gxe"))
+        import workflow
+        workflow._PRE_NUMERICAL_CPU_AFFINITY = tuple(sorted(cpus))
         if mode == "private":
             if info.get("private_blas_backend") != "upstream_blis":
                 raise RuntimeError("wrong private backend")
             if not (info.get("gemm_integrity_enabled") and info.get("gemm_checksum_enabled")):
                 raise RuntimeError("private verification requires GEMM integrity and checksum checks")
-            sys.path.insert(0,str(root/"scripts/generalized_gxe"))
-            import workflow
-            workflow._PRE_NUMERICAL_CPU_AFFINITY = tuple(sorted(cpus))
-            workflow._NUMPY_POOL_WORKER_AFFINITY = numpy_workers
+            workflow._NUMPY_POOL_WORKER_AFFINITY = numpy_worker_affinity
             workflow.require_private_blis(gxeldcore)
         elif info.get("blas_vendor") != "OpenBLAS":
             raise RuntimeError("wrong portable backend")
