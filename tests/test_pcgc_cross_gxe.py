@@ -526,3 +526,28 @@ def test_projection_subtraction_cancellation_uses_direct_products(native):
     # This target's genetic feature was removed by the fixed-effect model.
     # A raw-Gram subtraction leaves substantially larger roundoff here.
     assert np.max(np.abs(actual.pairs[0].ldscores[0]))<1e-20
+
+
+def test_native_vendor_timing_counts_every_record(monkeypatch):
+    """Vendor GEMM totals come from the full summary, not retained records."""
+    from prediction_helpers import prediction_threads
+    from summit.prediction.genotype import native_module
+    from summit.ldscore.matrix_products import native_execution_evidence
+    module=native_module()
+    if not callable(getattr(module,"consume_gemm_telemetry",None)):
+        pytest.skip("native build has no GEMM telemetry")
+    # Retain no detailed records: every call must still enter the totals.
+    monkeypatch.setattr(native_execution_evidence(module),"record_limit",0)
+    rng=np.random.default_rng(5)
+    n,m=1024,256
+    x=rng.normal(size=(n,m))
+    ids=tuple(("f",str(i)) for i in range(n))
+    trait=quantitative_trait("t",ids,rng.normal(size=n),np.ones((n,1)),
+        context_names=("intercept",),population_sd=1.)
+    result=prepare_cross_gxe(ArraySequentialGenotypeOperator(x),np.ones((m,1)),[trait],ids,
+        probes=2048,seed=3,block_size=256,probe_tile=2048,native=True,threads=prediction_threads())
+    vendor=result.diagnostics["native_vendor_gemm"]
+    assert vendor["available"]
+    assert vendor["records"]==sum(v["calls"] for v in vendor["operations"].values())
+    assert vendor["records"]>0
+    assert all(v["wall_seconds"]>0 for v in vendor["operations"].values())

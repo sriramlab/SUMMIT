@@ -14,7 +14,8 @@ from time import perf_counter
 import numpy as np
 from scipy.special import ndtr, ndtri
 from scipy.stats import t as student_t
-from summit.pcgc.cross_gxe import Products, pair_layout, project
+from summit.ldscore.matrix_products import MatrixProducts
+from summit.pcgc.cross_gxe import pair_layout, project
 from summit.pcgc.cross_gxe_model import binary_trait, quantitative_trait, DiagonalRemoval
 from summit.ldscore.generalized_gxe_pass1 import _peak_rss_bytes
 from scripts.pcgc.calibrate_cross_gxe import wilson
@@ -89,7 +90,7 @@ def make_design(n, m, *, kind, overlap, annotations=1, seed=729103,
             fixed=np.ones((n,1)) if t==0 else np.column_stack((np.ones(n),
                 np.cos(np.arange(n)*2*np.pi/n),np.sin(np.arange(n)*2*np.pi/n)))
             traits.append(quantitative_trait(y=np.zeros(n),population_sd=1.,fixed_effects=fixed,**common))
-    products=Products(native,threads)
+    products=MatrixProducts(native=native,threads=threads)
     bases=[np.asfortranarray(x[r]) for r in rows]
     features=[[project(base*(t.sensitivity*t.contexts[:,q])[:,None],t.fixed_basis,products)
                for q in range(2)] for base,t in zip(bases,traits)]

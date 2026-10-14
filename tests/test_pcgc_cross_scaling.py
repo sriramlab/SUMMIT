@@ -53,11 +53,11 @@ def test_scaling_variant_gram_oracle(kind, overlap, native):
 @pytest.mark.parametrize("fitted", [False, True])
 def test_retrospective_variant_oracle_matches_person_kernels(fitted):
     from scripts.pcgc.calibrate_cross_ascertainment import one
-    from summit.pcgc.cross_gxe import Products
+    from summit.ldscore.matrix_products import MatrixProducts
     from prediction_helpers import prediction_threads
     dense, truth = one(87211, 64, 16, fitted=fitted, rare=False)
     fast, expected = one(87211, 64, 16, fitted=fitted, rare=False, blocks=[4,8],
-                         products=Products(True,prediction_threads()))
+                         products=MatrixProducts(native=True,threads=prediction_threads()))
     np.testing.assert_array_equal(truth, expected)
     for point, _ in fast.values():
         np.testing.assert_allclose(point[0], dense, rtol=2e-11, atol=2e-11)

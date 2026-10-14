@@ -9,8 +9,7 @@ import numpy as np
 from summit.ldscore.generalized_gxe_pass1 import _peak_rss_bytes
 
 from summit.context.spec import array_sha256, canonical_sha256
-from summit.ldscore.generalized_gxe_pass1 import NumpyNNOperator, ProtectedNNOperator
-from summit.ldscore.generalized_gxe_pass2 import NumpyTNOperator, ProtectedTNOperator
+from summit.ldscore.matrix_products import MatrixProducts
 from summit.ldscore.generalized_gxe_variant import (
     GlobalVariantProbeSpec, native_global_variant_probes, plan_generalized_gxe_variant_work,
     GeneralizedGxEPlanInputs,
@@ -18,40 +17,6 @@ from summit.ldscore.generalized_gxe_variant import (
 from .cross_gxe_model import DiagonalRemoval
 from .gxe import context_pairs
 from .moments import annotations_array
-
-
-class Products:
-    def __init__(self, native, threads):
-        self.left = (ProtectedNNOperator if native else NumpyNNOperator)(threads=threads)
-        self.right = (ProtectedTNOperator if native else NumpyTNOperator)(threads=threads)
-        self.seconds = 0.
-        self.vendor_operations = {}
-        self.vendor_available = False
-        self.left.begin_execution()
-
-    def nn(self, a, b):
-        start = perf_counter()
-        result = self.left.matmul(np.asfortranarray(a), np.asfortranarray(b))
-        self.seconds += perf_counter()-start
-        return result
-
-    def tn(self, a, b):
-        start = perf_counter()
-        result = self.right.matmul_tn(np.asfortranarray(a), np.asfortranarray(b))
-        self.seconds += perf_counter()-start
-        return result
-
-    def drain(self):
-        # Consume bounded telemetry after each block; do not retain large logs.
-        value = self.left.finish_execution()
-        self.vendor_available |= bool(value.get("available", False))
-        for record in value.get("gemm_records", ()):
-            operation = self.vendor_operations.setdefault(record["operation"],
-                dict(calls=0, wall_seconds=0., process_cpu_seconds=0., flop_count=0.))
-            operation["calls"] += 1
-            for key in ("wall_seconds", "process_cpu_seconds", "flop_count"):
-                operation[key] += record[key]
-        return value.get("gemm_status", {})
 
 
 def project(value, u, products):
@@ -242,7 +207,10 @@ def prepare_cross_gxe(operator, annotations, traits, master_samples, *,
     context_tile=plan["context_tile"]
     if hasattr(operator, "configure_block_width"):
         operator.configure_block_width(block_size)
-    products = Products(native, threads)
+    # Shared protected products: configures the native thread contract and
+    # summarizes every vendor GEMM record, not only the retained sample.
+    products = MatrixProducts(native=native, threads=threads)
+    products.left.begin_execution()
     k = a.shape[1]
     context_weights=[np.asfortranarray(t.contexts*t.sensitivity[:,None]) for t in traits]
     if any(not np.isfinite(value).all() for value in context_weights):
@@ -412,19 +380,22 @@ def prepare_cross_gxe(operator, annotations, traits, master_samples, *,
         pair.ldscores /= pair.sample_product
         mass = np.repeat(a.sum(0), pair.p)
         pair.probe_grams /= np.outer(mass, mass)[None]
-    products.drain()
-    diagnostics = dict(plan=plan, timings={**timings, "protected_gemm_seconds": products.seconds,
+    execution = products.drain()
+    diagnostics = dict(plan=plan, timings={**timings, "protected_gemm_seconds": execution["matrix_product_seconds"],
         "decode_scale_seconds": operator.decode_seconds, "total_seconds": perf_counter()-start_time},
         peak_rss_bytes=_peak_rss_bytes(),
         genotype_passes=operator.observed_passes, variant_visits=operator.observed_variant_visits,
         genotype_scale_identity=operator.genotype_scale_id, probes=spec.to_metadata(),
         panel_method="diagonal_weights_with_ordered_projection_correction_v1",
         projection_cancellation_fallbacks=projection_fallbacks,
-        native_vendor_gemm=dict(available=products.vendor_available,
-                                scope="native_process_calls_during_preparation_including_genotype_projection",
-                                operations=products.vendor_operations),
-        native=native, threads=threads, gemm_calls=products.left.calls+products.right.calls,
-        repaired_columns=products.left.repaired_columns+products.right.repaired_columns)
+        native_vendor_gemm=dict(
+            available=bool(native and callable(getattr(products.module, "consume_gemm_telemetry", None))),
+            scope="native_process_calls_during_preparation_including_genotype_projection",
+            accounting="matrix_products_gemm_summary_all_records_v1",
+            records=execution["native_records"], operations=execution["vendor_operations"]),
+        native=native, threads=threads,
+        gemm_calls=execution["protected_nn_calls"]+execution["protected_tn_calls"],
+        repaired_columns=execution["repaired_columns"])
     identity = dict(master_sample_sha256=canonical_sha256({"samples": master_samples}),
                     genotype_scale_identity=operator.genotype_scale_id,
                     annotations_sha256=array_sha256(a), reference_probes=spec.to_metadata(),

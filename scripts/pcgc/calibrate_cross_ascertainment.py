@@ -48,9 +48,9 @@ def one(seed,n,m,*,fitted,rare,blocks=None,products=None):
     features=[[x*(t.sensitivity*t.contexts[:,q])[:,None] for q in range(2)] for x,t in zip(xs,traits)]
     if blocks is not None:
         from scripts.pcgc.calibrate_cross_scaling import exact_equations, fit_responses
-        from summit.pcgc.cross_gxe import Products
+        from summit.ldscore.matrix_products import MatrixProducts
         design=dict(features=features,traits=traits,ann=np.ones((m,1)),
-            products=Products(False,1) if products is None else products,
+            products=MatrixProducts(native=False,threads=1) if products is None else products,
             rows=[np.arange(n),np.arange(n,2*n)],truth_matrices=(aa,ab,bb))
         models,truth=exact_equations(design,blocks)
         return fit_responses(design,models,[t.response[:,None] for t in traits]),truth
@@ -125,12 +125,12 @@ def main():
 def variant_main(args):
     import hashlib
     import resource
-    from summit.pcgc.cross_gxe import Products
+    from summit.ldscore.matrix_products import MatrixProducts
     from summit.ldscore.generalized_gxe_pass1 import _peak_rss_bytes
     from scripts.pcgc.calibrate_cross_scaling import report
     if args.n<16 or args.m>2048 or min(args.blocks)<2 or max(args.blocks)>args.m:
         raise ValueError("invalid bounded ascertainment dimensions")
-    products=Products(True,args.threads)
+    products=MatrixProducts(native=True,threads=args.threads)
     start=time.perf_counter();cpu_start=resource.getrusage(resource.RUSAGE_SELF)
     results={}
     for fitted in (False,True):
