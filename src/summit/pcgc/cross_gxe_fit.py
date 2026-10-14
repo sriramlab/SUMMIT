@@ -4,7 +4,16 @@ import numpy as np
 from summit.ldscore.generalized_gxe_pass1 import _peak_rss_bytes
 from summit.context.annotations import _jackknife_covariance
 from summit.ldscore.generalized_gxe_reference_v1 import reduce_generalized_gxe_reference_for_inference
+from .cross_gxe_model import RARE_PREVALENCE
 from .moments import solve
+
+CALIBRATION_SCHEMA = "summit.pcgc.cross_interval_calibration.v1"
+# Rare outcomes or h N / M at or above one: the regimes in which the
+# independent review and the original calibration found within-trait binary
+# SNP-block variance deficits (h is the sample liability genetic variance).
+LARGE_SIGNAL_RATIO = 1.
+CROSS_TRAIT_BINARY_NOTE = ("threshold heteroscedasticity affects cross-trait components only mildly "
+                           "(independent review: variance ratio 0.87-0.95)")
 
 
 def omega(theta, pair, qa, qb):
@@ -67,8 +76,102 @@ def _reference_inverse_diagnostics(h, deviations, theta):
                 reference_inverse_second_order_bias=bias.tolist())
 
 
-def fit_cross_gxe(moments, *, block_ids=None, memory_bytes=None, confidence=.95):
-    """No genotype access; reference draws and deletion IDs are shared."""
+def calibration_status(moments, pairs, *, modeled_pairs=()):
+    """Interval calibration flags; diagnostics only, no variance correction.
+
+    For a binary trait, Var(z | g) depends on the genetic liability (threshold
+    heteroscedasticity, delta ~ (eta^2-1)/2 at eta = Phi^-1(K)). This
+    correlates the signal-by-noise parts of the estimating function across
+    SNP blocks, Cov(u_b, u_b') ~ 2 delta h_b h_b'. The delete-block jackknife
+    assumes independent blocks and omits that covariance, which is positive
+    (anticonservative intervals) for K < Phi(-1) and grows with h N / M.
+    Within-trait binary components are therefore marked uncalibrated for rare
+    outcomes or h N / M >= 1, and when supplied risks were kept under
+    own-case-status sampling. Contrasts that use them inherit the flag.
+    modeled_pairs lists within-trait pairs whose omitted covariance a supplied
+    participant-level term models (see fit_cross_gxe).
+    """
+    variants = len(moments.annotations)
+    size = max(pairs[f"{p.left}:{p.right}"]["coefficient_slice"][1] for p in moments.pairs)
+    components = ["not_flagged"]*size
+    by_pair = {}
+    for pair in moments.pairs:
+        key = f"{pair.left}:{pair.right}"
+        kinds = [moments.traits[t]["metadata"]["kind"] for t in (pair.left, pair.right)]
+        entry = dict(status="not_flagged", reasons=[], notes=[])
+        if pair.left == pair.right and kinds[0] == "binary":
+            meta = moments.traits[pair.left]["metadata"]
+            prevalence = meta.get("reference_prevalence")
+            second = meta.get("context_second_moment")
+            h = None if second is None else max(0., float(np.sum(
+                np.asarray(pairs[key]["omega_total"])*np.asarray(second, dtype=float))))
+            ratio = None if h is None else h*meta["sample_size"]/variants
+            triggers = []
+            if prevalence is None or prevalence < RARE_PREVALENCE:
+                triggers.append("rare_outcome")
+            if ratio is None or ratio >= LARGE_SIGNAL_RATIO:
+                triggers.append("large_h_N_over_M")
+            entry.update(reference_prevalence=prevalence, sample_liability_genetic_variance=h,
+                         sample_size=meta["sample_size"], variants=variants, h_N_over_M=ratio,
+                         heteroscedasticity_triggers=triggers)
+            if triggers and key not in modeled_pairs:
+                entry["reasons"].append("SNP_block_variance_omits_threshold_heteroscedasticity_covariance")
+            if meta.get("selection") == "own_case_status" and meta.get("risk_source") == "supplied":
+                entry["reasons"].append("supplied_risks_under_case_status_sampling")
+            if key in modeled_pairs:
+                entry["notes"].append("participant_covariance_term_supplied")
+        elif pair.left != pair.right and "binary" in kinds:
+            entry["notes"].append(CROSS_TRAIT_BINARY_NOTE)
+        if entry["reasons"]:
+            entry["status"] = "uncalibrated"
+            begin, end = pairs[key]["coefficient_slice"]
+            components[begin:end] = ["uncalibrated"]*(end-begin)
+        by_pair[key] = entry
+    return dict(schema=CALIBRATION_SCHEMA, components=components, pairs=by_pair,
+                rare_prevalence_threshold=RARE_PREVALENCE, large_h_N_over_M_threshold=LARGE_SIGNAL_RATIO,
+                scope=("flags known interval deficits only; not_flagged does not establish calibration "
+                       "outside the validated settings"))
+
+
+def _participant_term(term, moments, pairs, size):
+    """Validate a supplied participant-level covariance for within-trait binary pairs."""
+    if not isinstance(term, dict) or set(term) != {"method", "pairs", "covariance"}:
+        raise ValueError("participant covariance needs method, pairs and covariance")
+    method, keys = term["method"], tuple(term["pairs"])
+    if not isinstance(method, str) or not method:
+        raise ValueError("participant covariance needs a method name")
+    eligible = {f"{p.left}:{p.right}" for p in moments.pairs
+                if p.left == p.right and moments.traits[p.left]["metadata"]["kind"] == "binary"}
+    if not keys or len(set(keys)) != len(keys) or not set(keys) <= eligible:
+        raise ValueError("participant covariance applies to declared within-trait binary pairs only")
+    value = np.asarray(term["covariance"], dtype=float)
+    if value.shape != (size, size) or not np.isfinite(value).all() or not np.allclose(value, value.T, rtol=1e-12, atol=0):
+        raise ValueError("participant covariance must be a finite symmetric matrix on the component axis")
+    mask = np.zeros(size, dtype=bool)
+    for key in keys:
+        begin, end = pairs[key]["coefficient_slice"]
+        mask[begin:end] = True
+    if np.any(value[~mask]) or np.any(value[:, ~mask]):
+        raise ValueError("participant covariance must be zero outside its declared pairs")
+    if np.linalg.eigvalsh(value).min() < -1e-12*max(1., float(np.abs(value).max())):
+        raise ValueError("participant covariance must be positive semidefinite")
+    return value, keys, method
+
+
+def fit_cross_gxe(moments, *, block_ids=None, memory_bytes=None, confidence=.95,
+                  participant_covariance=None):
+    """No genotype access; reference draws and deletion IDs are shared.
+
+    participant_covariance is an extension point for a calibrated
+    participant-level sampling covariance of within-trait binary components:
+    the between-block covariance the SNP-block jackknife omits (see
+    calibration_status). It is a mapping with "method" (name), "pairs"
+    (within-trait binary pair keys such as "0:0") and "covariance" (a
+    component-axis matrix that is zero outside those pairs). It is added to
+    the joint covariance as a known term and clears the heteroscedasticity
+    flag for those pairs. The supplier must exclude variation the jackknife
+    already captures. No such covariance is computed here.
+    """
     start = perf_counter()
     if not np.isfinite(confidence) or not 0 < confidence < 1:
         raise ValueError("confidence must lie strictly inside (0,1)")
@@ -145,6 +248,10 @@ def fit_cross_gxe(moments, *, block_ids=None, memory_bytes=None, confidence=.95)
             "no_fitted_risk_or_estimated_population_metric_influence",
             "external_prevalence_genotype_scale_and_liability_SD_fixed",
             "finite_probe_inverse_bias_not_removed",
+            "within_trait_binary_SNP_block_variance_omits_threshold_heteroscedasticity_see_calibration",
+            "reference_noise_partly_counted_in_both_SNP_block_and_reference_terms_conservative",
+            "selection_law_declared_not_verified",
+            "validated_only_up_to_M_8192_and_N_32768_without_long_range_LD",
             "interval_calibration_not_established"])
     if labels is not None:
         block_mass=np.column_stack([np.bincount(ids,weights=column,minlength=len(labels)) for column in a.T])
@@ -160,6 +267,15 @@ def fit_cross_gxe(moments, *, block_ids=None, memory_bytes=None, confidence=.95)
             jackknife_labels=labels.tolist(),
             jackknife_method="frozen_full_genome_variant_ldscore_delete_block_v1",
             uncertainty_status="experimental_joint_SNP_blocks_plus_reference_MC")
+    modeled=()
+    if participant_covariance is not None:
+        extra,modeled,method=_participant_term(participant_covariance,moments,results,len(point))
+        covariance+=extra
+        result.update(participant_covariance=extra.tolist(),participant_covariance_method=method,
+                      participant_covariance_pairs=list(modeled),
+                      uncertainty_status=result["uncertainty_status"]+"_plus_participant_term")
+    calibration=calibration_status(moments,results,modeled_pairs=modeled)
+    result.update(calibration=calibration,component_calibration=calibration["components"])
     result.update(covariance=covariance.tolist(),standard_errors=np.sqrt(np.maximum(0,np.diag(covariance))).tolist(),
                   fit_uncertainty_seconds=perf_counter()-start)
     for pair in moments.pairs:
@@ -174,12 +290,28 @@ def fit_cross_gxe(moments, *, block_ids=None, memory_bytes=None, confidence=.95)
     return result
 
 
+def contrast_calibration(result, contrast):
+    """Calibration flag of a contrast: uncalibrated if it uses a flagged pair."""
+    calibration = result.get("calibration")
+    if calibration is None:
+        return dict(status="unknown", uncalibrated_pairs=[])
+    c = np.asarray(contrast, dtype=float)
+    flagged = []
+    for key, entry in calibration["pairs"].items():
+        begin, end = result["pairs"][key]["coefficient_slice"]
+        if entry["status"] == "uncalibrated" and np.any(c[begin:end] != 0):
+            flagged.append(key)
+    return dict(status="uncalibrated" if flagged else "not_flagged", uncalibrated_pairs=flagged)
+
+
 def linear_interval(result, contrast, *, value=None, confidence=None):
     """Working finite-block interval for a linear contrast or delta gradient.
 
     The Welch-Satterthwaite degrees of freedom assume independent variance
     estimates from approximately independent, balanced SNP blocks and probes.
-    This is not an exact t pivot for arbitrary LD or fitted nuisance models.
+    A supplied participant covariance term is treated as known. This is not
+    an exact t pivot for arbitrary LD or fitted nuisance models. The returned
+    calibration flag marks contrasts that use components with known deficits.
     """
     from scipy.stats import norm, t
     c=np.asarray(contrast,dtype=float)
@@ -193,13 +325,16 @@ def linear_interval(result, contrast, *, value=None, confidence=None):
     if not np.isfinite(estimate):
         raise ValueError("interval estimate must be finite")
     out=dict(estimate=estimate,confidence=float(level),interval=None,
-             method="undefined_without_trait_uncertainty",degrees_of_freedom=None)
+             method="undefined_without_trait_uncertainty",degrees_of_freedom=None,
+             calibration=contrast_calibration(result,c))
     blocks=result.get("jackknife_block_count",0)
     if blocks<2:
         return out
     vs=max(0.,float(c@np.asarray(result["snp_block_covariance"])@c))
     vr=max(0.,float(c@np.asarray(result["reference_mc_covariance"])@c))
-    variance=vs+vr
+    vp=(max(0.,float(c@np.asarray(result["participant_covariance"])@c))
+        if "participant_covariance" in result else 0.)
+    variance=vs+vr+vp
     if variance==0:
         out.update(interval=[estimate,estimate],standard_error=0.,method="degenerate_zero_variance")
         return out
@@ -212,6 +347,8 @@ def linear_interval(result, contrast, *, value=None, confidence=None):
                method="approximate_SNP_block_reference_Satterthwaite",
                degrees_of_freedom=float(df) if np.isfinite(df) else None,
                reference_variance_fraction=vr/variance)
+    if "participant_covariance" in result:
+        out["participant_variance_fraction"]=vp/variance
     return out
 
 
@@ -263,6 +400,12 @@ def derived_covariance(result, left, right, metric_aa, metric_bb, metric_ab, *,
              uncertainty_status=result["uncertainty_status"])
     out["variance_intervals"]=[linear_interval(result,direction) for direction in contrasts[:2]]
     out["genetic_covariance_interval"]=linear_interval(result,contrasts[2])
+    # Variances, heritabilities and correlations use the within-trait
+    # components; they inherit those components' interval calibration flags.
+    variance_flags=[item["calibration"]["status"] for item in out["variance_intervals"]]
+    out["calibration"]=dict(genetic_variances=variance_flags,heritabilities=variance_flags,
+        genetic_covariance=out["genetic_covariance_interval"]["calibration"]["status"],
+        genetic_correlation=contrast_calibration(result,contrasts.sum(0))["status"])
     if va>0 and vb>0:
         denom=np.sqrt(va*vb);r=c/denom
         jac=np.array([-r/(2*va),-r/(2*vb),1/denom])

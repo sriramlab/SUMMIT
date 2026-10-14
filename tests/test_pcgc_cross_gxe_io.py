@@ -130,3 +130,44 @@ def test_cli_runtime_sets_no_host_cpu_policy(monkeypatch):
     assert os.environ["OMP_THREAD_LIMIT"]=="8"
     with pytest.raises(ValueError,match="positive"):
         cross_gxe_cli._runtime(0)
+
+
+def test_manifest_case_status_risks_and_fit_calibration_flags(tmp_path):
+    from summit.entrypoint import main
+    from test_pcgc_io import fixture as raw_fixture
+    from test_pcgc_gxe_io import write_bed
+    from prediction_helpers import prediction_threads
+    raw,x,axis,risk,scale=raw_fixture(144,96)
+    write_bed(tmp_path/"study.bed",raw,axis)
+    rng=np.random.default_rng(345)
+    people=pd.DataFrame(dict(FID=["study"]*len(raw),IID=[f"i{i}" for i in range(len(raw))],
+        Y=(risk.z>0).astype(int),E=rng.uniform(-1,1,len(raw)),RISK=risk.population_risk))
+    people.to_csv(tmp_path/"a.tsv",sep="\t",index=False)
+    pd.DataFrame(dict(SNP=axis.ids,A1=axis.counted,A2=axis.other,MEAN=scale.mean,
+                     INV_SD=scale.inverse_scale)).to_csv(tmp_path/"scale.tsv",sep="\t",index=False)
+    trait=dict(name="A",kind="binary",table="a.tsv",contexts=["E"],selection="own_case_status",
+               prevalence=.05,unit_liability=True,risk_column="RISK")
+    config=dict(genotype="study.bed",population_scale="scale.tsv",traits=[trait])
+    (tmp_path/"input.json").write_text(json.dumps(config))
+    command=["pcgc-cross","prepare",str(tmp_path/"input.json"),"--nvecs","32","--block-size","31",
+             "--memory-gib","3","--num-threads",str(prediction_threads())]
+    with pytest.raises(ValueError,match="fitted probit risks"):
+        main(command+["--out",str(tmp_path/"refused")])
+    trait["allow_uncalibrated_supplied_risks"]=True
+    (tmp_path/"input.json").write_text(json.dumps(config))
+    assert main(command+["--out",str(tmp_path/"kept")])==0
+    del trait["allow_uncalibrated_supplied_risks"],trait["risk_column"]
+    (tmp_path/"input.json").write_text(json.dumps(config))
+    assert main(command+["--out",str(tmp_path/"fitted")])==0
+    flags={}
+    for name in ("kept","fitted"):
+        ref,summary=output_paths(tmp_path/name)
+        assert main(["pcgc-cross","fit","--sumstats",str(summary),"--ldscores",str(ref),
+                     "--out",str(tmp_path/(name+"_fit")),"--njack","8"])==0
+        result=json.loads((tmp_path/(name+"_fit.cross.json")).read_text())
+        flags[name]=result["calibration"]["pairs"]["0:0"]
+        assert [i["calibration"]["status"] for i in result["component_intervals"]]==result["component_calibration"]
+    assert "supplied_risks_under_case_status_sampling" in flags["kept"]["reasons"]
+    assert "supplied_risks_under_case_status_sampling" not in flags["fitted"]["reasons"]
+    # Prevalence 0.05 is rare: the heteroscedasticity flag remains for fitted risks.
+    assert flags["fitted"]["status"]=="uncalibrated" and "rare_outcome" in flags["fitted"]["heteroscedasticity_triggers"]

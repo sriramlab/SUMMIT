@@ -641,3 +641,78 @@ def test_overlap_leverage_is_relative_and_condition_checked():
     with pytest.raises(ValueError,match="leverage"):
         overlap_diagonal(a,a)
     assert len(overlap_diagonal(np.empty((0,2)),np.empty((0,1))))==0
+
+
+def _known_fit(kind="bq", **options):
+    from summit.pcgc.cross_gxe_fit import fit_cross_gxe
+    moments,oracle,_=exact_moments(kind)
+    for pair in moments.pairs:
+        k=moments.annotations.shape[1]
+        theta=np.tile([.2,.07,.03] if pair.left==pair.right else [.08,.01,-.02,.025],k)
+        mass=np.repeat(moments.annotations.sum(0),pair.p)
+        covariance=np.einsum("c,cij->ij",theta/mass,oracle[pair.left,pair.right]["source"])
+        pair.rhs_rows=np.einsum("jpuv,uv->jp",oracle[pair.left,pair.right]["tests"],covariance)
+        # Noisy rows give nonzero SNP-block variance for the interval checks.
+        pair.rhs_rows=pair.rhs_rows*(1+.05*np.sin(np.arange(pair.rhs_rows.size)).reshape(pair.rhs_rows.shape))
+    return moments,lambda m: fit_cross_gxe(m,block_ids=np.arange(len(m.annotations))%4,**options)
+
+
+def test_within_trait_binary_calibration_flags_and_inheritance():
+    from summit.pcgc.cross_gxe_fit import derived_covariance,RARE_PREVALENCE
+    moments,fit=_known_fit("bq")
+    meta=moments.traits[0]["metadata"]
+    assert meta["reference_prevalence"]>RARE_PREVALENCE
+    common=fit(moments)
+    entry=common["calibration"]["pairs"]["0:0"]
+    assert entry["h_N_over_M"]<1 and entry["status"]=="not_flagged"
+    assert common["calibration"]["pairs"]["1:1"]["status"]=="not_flagged"
+    assert common["calibration"]["pairs"]["0:1"]["notes"]
+    assert set(common["component_calibration"])=={"not_flagged"}
+    meta["reference_prevalence"]=.02
+    rare=fit(moments)
+    entry=rare["calibration"]["pairs"]["0:0"]
+    assert entry["status"]=="uncalibrated" and entry["heteroscedasticity_triggers"]==["rare_outcome"]
+    begin,end=rare["pairs"]["0:0"]["coefficient_slice"]
+    assert rare["component_calibration"][begin:end]==["uncalibrated"]*(end-begin)
+    assert all(rare["component_calibration"][i]=="not_flagged" for i in range(len(rare["components"]))
+               if not begin<=i<end)
+    status=[item["calibration"]["status"] for item in rare["component_intervals"]]
+    assert status==rare["component_calibration"]
+    unit=np.ones((moments.annotations.shape[1],2,2))
+    derived=derived_covariance(rare,0,1,unit,unit,unit,total_variances=[1.,1.])
+    assert derived["calibration"]["genetic_variances"]==["uncalibrated","not_flagged"]
+    assert derived["calibration"]["heritabilities"]==["uncalibrated","not_flagged"]
+    assert derived["calibration"]["genetic_covariance"]=="not_flagged"
+    assert derived["calibration"]["genetic_correlation"]=="uncalibrated"
+    # Large h N / M alone also flags, and supplied case-status risks are named.
+    meta["reference_prevalence"]=.3
+    meta["context_second_moment"]=(1e3*np.asarray(meta["context_second_moment"])).tolist()
+    meta["selection"],meta["risk_source"]="own_case_status","supplied"
+    large=fit(moments)["calibration"]["pairs"]["0:0"]
+    assert large["heteroscedasticity_triggers"]==["large_h_N_over_M"]
+    assert "supplied_risks_under_case_status_sampling" in large["reasons"]
+
+
+def test_participant_covariance_extension_point():
+    moments,fit=_known_fit("bb")
+    moments.traits[0]["metadata"]["reference_prevalence"]=.02
+    base=fit(moments)
+    begin,end=base["pairs"]["0:0"]["coefficient_slice"]
+    size=len(base["components"])
+    extra=np.zeros((size,size));extra[begin:end,begin:end]=np.diag(np.arange(1,end-begin+1))*1e-3
+    _,refit=_known_fit("bb",participant_covariance=dict(method="test",pairs=["0:0"],covariance=extra))
+    moments.traits[0]["metadata"]["reference_prevalence"]=.02
+    added=refit(moments)
+    assert added["calibration"]["pairs"]["0:0"]["status"]=="not_flagged"
+    assert added["uncertainty_status"].endswith("_plus_participant_term")
+    np.testing.assert_allclose(np.asarray(added["covariance"])-np.asarray(base["covariance"]),extra,atol=1e-15)
+    interval=added["component_intervals"][begin]
+    assert interval["participant_variance_fraction"]>0
+    assert interval["standard_error"]>base["component_intervals"][begin]["standard_error"]
+    from summit.pcgc.cross_gxe_fit import fit_cross_gxe
+    blocks=np.arange(len(moments.annotations))%4
+    with pytest.raises(ValueError,match="within-trait binary"):
+        fit_cross_gxe(moments,block_ids=blocks,participant_covariance=dict(method="x",pairs=["0:1"],covariance=extra))
+    bad=extra.copy();bad[0,-1]=bad[-1,0]=1e-4
+    with pytest.raises(ValueError,match="zero outside"):
+        fit_cross_gxe(moments,block_ids=blocks,participant_covariance=dict(method="x",pairs=["0:0"],covariance=bad))
