@@ -114,3 +114,19 @@ def test_actual_bed_cli_and_genotype_free_fit(tmp_path,kind):
     metric_path.write_text(json.dumps(metric))
     with pytest.raises(ValueError,match="ordered pair axis"):
         main(args)
+
+
+def test_cli_runtime_sets_no_host_cpu_policy(monkeypatch):
+    # Placement is the caller's contract (outer taskset or scheduler binding).
+    # The library keeps only the process-local THP guard, as the epistasis CLI.
+    from types import SimpleNamespace
+    from summit.pcgc import cross_gxe_cli
+    environment=dict(os.environ)
+    environment.pop("OMP_THREAD_LIMIT",None)
+    monkeypatch.setattr(os,"environ",environment)
+    monkeypatch.setattr(os,"uname",lambda: SimpleNamespace(nodename="tabla"))
+    monkeypatch.setattr(os,"sched_getaffinity",lambda pid: set(range(40,48)))
+    cross_gxe_cli._runtime(8)
+    assert os.environ["OMP_THREAD_LIMIT"]=="8"
+    with pytest.raises(ValueError,match="positive"):
+        cross_gxe_cli._runtime(0)

@@ -9,16 +9,17 @@ from time import perf_counter
 def _runtime(threads):
     if threads < 1:
         raise ValueError("thread count must be positive")
-    for key in ("OPENBLAS_NUM_THREADS","MKL_NUM_THREADS","BLIS_NUM_THREADS","OMP_NUM_THREADS","OMP_THREAD_LIMIT"):
-        os.environ.setdefault(key,str(threads))
-    if os.uname().nodename.lower()=="tabla":
-        cpus=set(os.sched_getaffinity(0))
-        if not cpus <= set(range(8,64)) or not 1 <= len(cpus) <= 2:
-            raise RuntimeError("Tabla cross-PCGC requires outer taskset on one or two available physical cores 8-63")
+    # Same Linux process-local allocation guard as the epistasis CLI and
+    # SUMMIT's research launchers. CPU placement is the caller's contract
+    # (outer taskset or scheduler binding); the library sets no host policy.
+    import sys
+    if sys.platform.startswith("linux"):
         import ctypes
         libc=ctypes.CDLL(None,use_errno=True)
         if libc.prctl(41,1,0,0,0)!=0 or libc.prctl(42,0,0,0,0)!=1:
             raise RuntimeError("process-local THP guard failed")
+    for key in ("OPENBLAS_NUM_THREADS","MKL_NUM_THREADS","BLIS_NUM_THREADS","OMP_NUM_THREADS","OMP_THREAD_LIMIT"):
+        os.environ.setdefault(key,str(threads))
 
 
 def prepare_manifest(path, **options):
