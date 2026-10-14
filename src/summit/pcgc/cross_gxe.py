@@ -14,7 +14,7 @@ from summit.ldscore.generalized_gxe_variant import (
     GlobalVariantProbeSpec, native_global_variant_probes, plan_generalized_gxe_variant_work,
     GeneralizedGxEPlanInputs,
 )
-from .cross_gxe_model import DiagonalRemoval
+from .cross_gxe_model import DiagonalRemoval, overlap_diagonal
 from .gxe import context_pairs
 from .moments import annotations_array
 
@@ -193,9 +193,8 @@ def prepare_cross_gxe(operator, annotations, traits, master_samples, *,
         if left != right and len(ia) and any(
                 traits[t].metadata["selection"] != "outcome_independent" for t in (left, right)):
             raise ValueError("ascertained cross-trait overlap requires a joint selection model; unsupported")
-        if np.any(1-np.sum(traits[left].fixed_basis[ia]**2,axis=1)-
-                  np.sum(traits[right].fixed_basis[ib]**2,axis=1) <= 1e-8):
-            raise ValueError("overlap projection has excessive leverage; diagonal removal is unstable")
+        # Same relative leverage and conditioning checks as the removal itself.
+        overlap_diagonal(traits[left].fixed_basis[ia], traits[right].fixed_basis[ib])
         overlap_indices.append((ia, ib))
     row_views = [row_selector(index) for index in rows]
     overlap_views = [(row_selector(ia), row_selector(ib)) for ia, ib in overlap_indices]

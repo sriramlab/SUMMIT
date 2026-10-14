@@ -54,7 +54,8 @@ def prepare_manifest(path, **options):
         risk_start=perf_counter()
         for spec in config["traits"]:
             allowed={"name","kind","table","contexts","selection","population_sd","fixed_effects",
-                     "risk_column","risk_covariates","prevalence","sampling_odds","liability_sd_column","unit_liability"}
+                     "context_main_effects","risk_column","risk_covariates","prevalence","sampling_odds",
+                     "liability_sd_column","unit_liability","allow_uncalibrated_supplied_risks"}
             if set(spec)-allowed:
                 raise ValueError("unknown cross-PCGC trait fields")
             rows,table=sample_table(resolve(spec["table"]),source)
@@ -66,16 +67,19 @@ def prepare_manifest(path, **options):
             common=dict(context_names=("intercept",*contexts),selection=spec["selection"])
             y=table.Y.to_numpy(dtype=float)
             if spec["kind"]=="quantitative":
-                forbidden={"risk_column","risk_covariates","prevalence","sampling_odds","liability_sd_column","unit_liability"}&set(spec)
+                forbidden={"risk_column","risk_covariates","prevalence","sampling_odds","liability_sd_column",
+                           "unit_liability","allow_uncalibrated_supplied_risks"}&set(spec)
                 if forbidden:
                     raise ValueError("binary options supplied for a quantitative trait")
                 fixed=spec.get("fixed_effects",[])
                 design=np.column_stack((np.ones(len(rows)),table[fixed].to_numpy(dtype=float)))
+                # Context columns enter as main effects unless declared otherwise.
                 traits.append(quantitative_trait(spec["name"],ids,y,phi,population_sd=spec["population_sd"],
-                                                  fixed_effects=design,**common))
+                                                  fixed_effects=design,
+                                                  context_main_effects=spec.get("context_main_effects",True),**common))
             elif spec["kind"]=="binary":
-                if "fixed_effects" in spec or "population_sd" in spec:
-                    raise ValueError("binary fixed covariates belong in the risk model")
+                if "fixed_effects" in spec or "population_sd" in spec or "context_main_effects" in spec:
+                    raise ValueError("binary fixed covariates belong in the risk model; fitted risk designs always include the contexts")
                 if "unit_liability" in spec and type(spec["unit_liability"]) is not bool:
                     raise ValueError("unit_liability must be a JSON Boolean")
                 if bool(spec.get("unit_liability"))==bool(spec.get("liability_sd_column")):
@@ -93,7 +97,8 @@ def prepare_manifest(path, **options):
                     raise ValueError("choose supplied risk_column or fitted risk_covariates")
                 traits.append(binary_trait(spec["name"],ids,y,phi,liability_sd=sd,
                     population_risk=k,risk_covariates=cov,prevalence=spec.get("prevalence"),
-                    sampling_odds=spec.get("sampling_odds"),**common))
+                    sampling_odds=spec.get("sampling_odds"),
+                    allow_uncalibrated_supplied_risks=spec.get("allow_uncalibrated_supplied_risks",False),**common))
             else:
                 raise ValueError("trait kind must be quantitative or binary")
         risk_seconds=perf_counter()-risk_start

@@ -89,7 +89,9 @@ def make_design(n, m, *, kind, overlap, annotations=1, seed=729103,
         else:
             fixed=np.ones((n,1)) if t==0 else np.column_stack((np.ones(n),
                 np.cos(np.arange(n)*2*np.pi/n),np.sin(np.arange(n)*2*np.pi/n)))
-            traits.append(quantitative_trait(y=np.zeros(n),population_sd=1.,fixed_effects=fixed,**common))
+            # Recorded experiments used exactly these designs (no added context main effects).
+            traits.append(quantitative_trait(y=np.zeros(n),population_sd=1.,fixed_effects=fixed,
+                                             context_main_effects=False,**common))
     products=MatrixProducts(native=native,threads=threads)
     bases=[np.asfortranarray(x[r]) for r in rows]
     features=[[project(base*(t.sensitivity*t.contexts[:,q])[:,None],t.fixed_basis,products)

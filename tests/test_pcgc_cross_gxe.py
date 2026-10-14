@@ -26,9 +26,11 @@ def fixture(kind="qq", overlap=8, qa=2, qb=3, seed=913, projected=True):
                 liability_sd=np.linspace(.7, 1.5, len(rr)), selection="outcome_independent",
                 population_risk=np.linspace(.002, .8, len(rr)), **options)
         else:
-            design = np.column_stack((np.ones(len(rr)), np.column_stack([np.cos((j+1)*np.arange(len(rr))*2*np.pi/len(rr)) for j in range(1+index)]))) if projected else None
+            # Explicit designs: these tiny cohorts cannot also carry context
+            # main effects within the same-person leverage limit.
+            design = np.column_stack((np.ones(len(rr)), np.column_stack([np.cos((j+1)*np.arange(len(rr))*2*np.pi/len(rr)) for j in range(1+index)]))) if projected else np.empty((len(rr), 0))
             t = quantitative_trait(str(index), samples, rng.normal(size=len(rr)), phi,
-                population_sd=1.7, fixed_effects=design, **options)
+                population_sd=1.7, fixed_effects=design, context_main_effects=False, **options)
         traits.append(t)
     return x, a, traits, ids, rows
 
@@ -283,7 +285,8 @@ def test_supplied_fitted_risks_and_common_heterogeneous_scale():
                    selection="outcome_independent",risk_covariates=env[:,None])
     assert t.metadata["risk_source"]=="fitted_probit"
     common=dict(name="a",samples=ids,y=y,contexts=phi,context_names=("i","e"),
-                selection="own_case_status",population_risk=ndtr(-2+env),prevalence=.03)
+                selection="own_case_status",population_risk=ndtr(-2+env),prevalence=.03,
+                allow_uncalibrated_supplied_risks=True)
     u=binary_trait(liability_sd=1.,**common)
     v=binary_trait(liability_sd=np.full(n,2.),**common)
     np.testing.assert_allclose(v.sensitivity,u.sensitivity/2)
@@ -312,7 +315,8 @@ def test_selected_bivariate_normal_derivative(odds):
         table=np.array([[1-k1-k2+joint,k2-joint],[k1-joint,joint]])*inclusion
         return np.sum(table*np.outer(z1,z2))/table.sum()
     ids=(("f","a"),("f","b"),("f","c"))
-    common=dict(samples=ids,y=[0,1,0],contexts=np.ones((3,1)),context_names=("i",),selection="own_case_status")
+    common=dict(samples=ids,y=[0,1,0],contexts=np.ones((3,1)),context_names=("i",),selection="own_case_status",
+                allow_uncalibrated_supplied_risks=True)
     a=binary_trait("a",population_risk=np.full(3,k1),liability_sd=sd1,sampling_odds=odds[0],**common)
     b=binary_trait("b",population_risk=np.full(3,k2),liability_sd=sd2,sampling_odds=odds[1],**common)
     derivative=(moment(1e-5)-moment(-1e-5))/2e-5
@@ -422,7 +426,8 @@ def test_constant_context_binary_additive_reduction(kind):
             y=np.arange(len(t.samples))%2
             k=np.linspace(.02,.4,len(y))
             traits[index]=binary_trait(t.name,t.samples,y,t.contexts,context_names=t.context_names,
-                liability_sd=1.,selection="own_case_status",population_risk=k,prevalence=.1)
+                liability_sd=1.,selection="own_case_status",population_risk=k,prevalence=.1,
+                allow_uncalibrated_supplied_risks=True)
             old_traits.append(prepare_binary_risk(y,.1,population_risk=k))
         else:
             old_traits.append(QuantitativeResponse(t.response))
@@ -551,3 +556,88 @@ def test_native_vendor_timing_counts_every_record(monkeypatch):
     assert vendor["records"]==sum(v["calls"] for v in vendor["operations"].values())
     assert vendor["records"]>0
     assert all(v["wall_seconds"]>0 for v in vendor["operations"].values())
+
+
+def _case_control(n=400, seed=17):
+    from scipy.special import ndtr
+    rng=np.random.default_rng(seed)
+    ids=tuple(("f",str(i)) for i in range(n))
+    env=rng.normal(size=n)
+    phi=np.column_stack((np.ones(n),env))
+    y=(np.arange(n)%2).astype(float)
+    return ids,phi,y,ndtr(-1.6+.4*env)
+
+
+def test_case_status_sampling_requires_fitted_risks_with_contexts():
+    ids,phi,y,risk=_case_control()
+    common=dict(context_names=("i","e"),liability_sd=1.,selection="own_case_status",prevalence=.05)
+    with pytest.raises(ValueError,match="fitted probit risks"):
+        binary_trait("a",ids,y,phi,population_risk=risk,**common)
+    kept=binary_trait("a",ids,y,phi,population_risk=risk,allow_uncalibrated_supplied_risks=True,**common)
+    assert kept.metadata["risk_calibration"]=="supplied_case_status_uncalibrated"
+    default=binary_trait("a",ids,y,phi,**common)
+    explicit=binary_trait("a",ids,y,phi,risk_covariates=phi[:,1:],**common)
+    assert default.metadata["risk_calibration"]=="fitted_probit_contexts_in_design"
+    assert default.metadata["risk_design_context_columns_added"]==1
+    assert explicit.metadata["risk_design_context_columns_added"]==0
+    np.testing.assert_array_equal(default.response,explicit.response)
+    np.testing.assert_array_equal(default.sensitivity,explicit.sensitivity)
+    # Probit score equations: risk-weighted contexts are orthogonal to z,
+    # which removes the per-context sample mean that supplied risks leave.
+    weighted=default.sensitivity[:,None]*default.contexts
+    scale=np.linalg.norm(weighted,axis=0)*np.linalg.norm(default.response)
+    assert np.all(np.abs(weighted.T@default.response)<1e-6*scale)
+    assert np.any(np.abs((kept.sensitivity[:,None]*kept.contexts).T@kept.response)>1e-3*scale)
+    with pytest.raises(ValueError,match="not both"):
+        binary_trait("a",ids,y,phi,sampling_odds=3.,**common)
+    with pytest.raises(ValueError,match="does not use a population prevalence"):
+        binary_trait("a",ids,y,phi,population_risk=risk,context_names=("i","e"),liability_sd=1.,
+                     selection="outcome_independent",prevalence=.05)
+    with pytest.raises(ValueError,match="Boolean"):
+        binary_trait("a",ids,y,phi,population_risk=risk,allow_uncalibrated_supplied_risks=1,**common)
+
+
+def test_retrospective_default_fit_is_the_context_probit():
+    from scripts.pcgc.calibrate_cross_ascertainment import one
+    explicit,truth=one(87211,64,16,fitted=True,rare=False,risk_mode="fitted")
+    default,_=one(87211,64,16,fitted=True,rare=False,risk_mode="fitted_default")
+    np.testing.assert_array_equal(explicit,default)
+
+
+def test_quantitative_default_intercept_and_context_main_effects():
+    rng=np.random.default_rng(3)
+    n=60
+    ids=tuple(("f",str(i)) for i in range(n))
+    env=rng.normal(size=n)
+    phi=np.column_stack((np.ones(n),env))
+    y=rng.normal(size=n)+3+2*env
+    t=quantitative_trait("q",ids,y,phi,context_names=("i","e"),population_sd=1.)
+    assert t.fixed_basis.shape[1]==2
+    assert t.metadata["default_intercept"] and t.metadata["context_main_effects_added"]==1
+    residual=t.response-t.fixed_basis@(t.fixed_basis.T@t.response)
+    np.testing.assert_allclose(phi.T@residual,0,atol=1e-10)
+    # Contexts already in the supplied design are not duplicated.
+    same=quantitative_trait("q",ids,y,phi,context_names=("i","e"),population_sd=1.,
+                            fixed_effects=np.column_stack((np.ones(n),3*env-1)))
+    assert same.fixed_basis.shape[1]==2 and same.metadata["context_main_effects_added"]==0
+    plain=quantitative_trait("q",ids,y,phi,context_names=("i","e"),population_sd=1.,
+                             fixed_effects=np.empty((n,0)),context_main_effects=False)
+    assert plain.fixed_basis.shape==(n,0)
+    intercept=quantitative_trait("q",ids,y,phi,context_names=("i","e"),population_sd=1.,
+                                 context_main_effects=False)
+    np.testing.assert_allclose(np.abs(intercept.fixed_basis[:,0]),1/np.sqrt(n))
+
+
+def test_overlap_leverage_is_relative_and_condition_checked():
+    from summit.pcgc.cross_gxe_model import overlap_diagonal
+    n=50
+    u=np.zeros((n,1));u[0]=np.sqrt(.9);u[1:]=np.sqrt(.1/(n-1))
+    np.testing.assert_allclose(overlap_diagonal(u,np.empty((n,0))),1-u[:,0]**2)
+    tight=np.zeros((n,1));tight[0]=np.sqrt(1-1e-5);tight[1:]=np.sqrt(1e-5/(n-1))
+    with pytest.raises(ValueError,match="leverage"):
+        overlap_diagonal(tight,np.empty((n,0)))
+    # Combined same-person leverage near one also fails for two projectors.
+    a=np.zeros((n,1));a[0]=np.sqrt(.5);a[1:]=np.sqrt(.5/(n-1))
+    with pytest.raises(ValueError,match="leverage"):
+        overlap_diagonal(a,a)
+    assert len(overlap_diagonal(np.empty((0,2)),np.empty((0,1))))==0

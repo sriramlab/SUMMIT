@@ -34,8 +34,10 @@ def generated_traits(ids,indices,q):
             traits.append(binary_trait(f"T{index}",samples,y,phi,liability_sd=1.,
                                        population_risk=risk,**common))
         else:
+            # Recorded timings used this two-column design (no added context main effects).
             traits.append(quantitative_trait(f"T{index}",samples,rng.normal(size=len(rr)),phi,
-                population_sd=1.,fixed_effects=np.column_stack((np.ones(len(rr)),rng.uniform(-1,1,len(rr)))),**common))
+                population_sd=1.,fixed_effects=np.column_stack((np.ones(len(rr)),rng.uniform(-1,1,len(rr)))),
+                context_main_effects=False,**common))
     return traits,time.perf_counter()-start
 
 

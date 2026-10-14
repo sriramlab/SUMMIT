@@ -44,7 +44,9 @@ def scenario(seed,kind,n,m,q,k,overlap,signal,risk_strength,prevalence,heterogen
         else:
             design=np.column_stack((np.ones(n),np.cos(np.arange(n)*2*np.pi/n),
                                     np.sin(np.arange(n)*2*np.pi/n))) if t else np.ones((n,1))
-            traits.append(quantitative_trait(y=np.zeros(n),population_sd=1.,fixed_effects=design,**common))
+            # Recorded experiments used exactly these designs (no added context main effects).
+            traits.append(quantitative_trait(y=np.zeros(n),population_sd=1.,fixed_effects=design,
+                                             context_main_effects=False,**common))
     aa=np.diag([.12]+[.035]*(q-1));bb=np.diag([.10]+[.03]*(q-1))
     ab=np.diag([signal]+[signal/3]*(q-1))
     if q>1 and signal:
