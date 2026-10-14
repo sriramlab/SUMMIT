@@ -58,6 +58,12 @@ Binary inference uses 200 contiguous SNP blocks by default. HE/LDSC uses
 chromosome deletion (`--njack chr`). Input formats and method-specific
 settings are described in the individual analysis guides.
 
+For binary G×E PCGC, `--binary-crossblock-blocks N` at preparation (opt-in)
+records the participant rows that correct the SNP-block jackknife for
+covariance between blocks through the same participants. Fit with the same
+block count: omit `--njack` to use the prepared blocks. See
+[Generalized G×E PCGC](Generalized-GxE-PCGC.md#standard-errors).
+
 ## Memory
 
 For LD/G×E, `--memory-gib` budgets the sketch panels or windowed-LD workspace.

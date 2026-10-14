@@ -17,11 +17,13 @@ approximation. See [Generalized G×E PCGC](Generalized-GxE-PCGC.md) for the mode
 inputs, examples, and interpretation.
 
 Contextual preparation also supports genotype-PC adjustment through
-`--binary-genotype-covariates`. Experimental sampling SEs use
+`--binary-genotype-covariates`. An opt-in participant-level correction to
+the SNP-block jackknife is recorded during preparation with
+`--binary-crossblock-blocks`. Experimental sampling SEs use
 `--binary-sampling-partners`; `--binary-architecture-probes` adds a Gaussian
-SNP-effect variance model. These intervals remain experimental, with
-undercoverage in some rare-disease and overlapping-LD simulations. The
-[G×E guide](Generalized-GxE-PCGC.md#estimates-and-uncertainty) explains their scope.
+SNP-effect variance model. The
+[G×E guide](Generalized-GxE-PCGC.md#standard-errors) explains both and their
+calibration.
 
 ## Inputs
 
@@ -142,6 +144,20 @@ Use genotypes ordered by chromosome and position, with blocks large enough
 to contain local LD.
 It holds the risk fit, prevalence, population scales, and reference probes fixed.
 It therefore excludes uncertainty in those quantities.
+
+The SNP-block jackknife also assumes that blocks' estimating equations are
+independent. They are not: every block is a sum over the same participants.
+Threshold noise whose variance depends on the genetic value, each
+participant's own genetic signal, case–control selection and shared risk
+weights make blocks covary through people. The omitted covariance can have
+either sign and grows with ĥ·N/M. In simulated rare diseases (K = 0.02,
+N/M = 32) the jackknife understated the variance of a null
+additive-by-context covariance by half, but overstated the variance of the
+additive-only component by about a quarter. G×E fits can correct this (see
+the [G×E guide](Generalized-GxE-PCGC.md#standard-errors)); the Python G×E
+API also accepts an intercept-only context, which gives the additive model
+with the correction. The additive path described on this page does not apply
+it.
 
 Conditional genetic variance is measured relative to liability variance after
 the covariate predictor, fixed at one. Marginal estimates divide by

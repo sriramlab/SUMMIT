@@ -19,6 +19,12 @@ KERNEL_ARRAY = "population_kernel_second_moment"
 SAMPLING_ARRAYS = ("sampling_constant","sampling_linear","sampling_quadratic")
 ARCHITECTURE_ARRAYS = ("architecture_left","architecture_right")
 PAIR_ARRAYS = ("pair_constant","pair_linear","pair_quadratic")
+CROSSBLOCK_FIELDS = ("block_ids","block_gram","block_context","total_gram","total_context",
+                     "context_fourth","context_total")
+CROSSBLOCK_NUISANCE_FIELDS = ("nuisance_jacobian","nuisance_context","score_influence",
+                              "context_influence","influence_gram")
+CROSSBLOCK_ARRAYS = tuple("crossblock_"+name for name in CROSSBLOCK_FIELDS)
+CROSSBLOCK_NUISANCE_ARRAYS = tuple("crossblock_"+name for name in CROSSBLOCK_NUISANCE_FIELDS)
 FEATURE_ARRAYS = {
     "population_kernel_metric": (KERNEL_ARRAY,),
     "individual_sampling_covariance": SAMPLING_ARRAYS,
@@ -26,6 +32,8 @@ FEATURE_ARRAYS = {
     "reference_probe_covariance": ("reference_probe_deviations",),
     "external_reference_covariance": ("external_reference_covariance","external_context_gram"),
     "hoeffding_pair_covariance": PAIR_ARRAYS,
+    "person_crossblock_covariance": CROSSBLOCK_ARRAYS,
+    "person_crossblock_risk_fit": CROSSBLOCK_NUISANCE_ARRAYS,
 }
 
 
@@ -43,6 +51,10 @@ def _features(moments):
         result.append("reference_probe_covariance")
     if moments.external_reference_covariance is not None:
         result.append("external_reference_covariance")
+    if moments.crossblock_moments is not None:
+        result.append("person_crossblock_covariance")
+        if moments.crossblock_moments.has_nuisance:
+            result.append("person_crossblock_risk_fit")
     return tuple(sorted(result))
 
 
@@ -59,6 +71,8 @@ def _manifest_features(header):
         raise ValueError("unsupported or duplicated contextual artifact features")
     if set(features) & {"gaussian_architecture_covariance", "reference_probe_covariance", "external_reference_covariance", "hoeffding_pair_covariance"} and "individual_sampling_covariance" not in features:
         raise ValueError("extended covariance requires individual-sampling moments")
+    if "person_crossblock_risk_fit" in features and "person_crossblock_covariance" not in features:
+        raise ValueError("cross-block risk-fit moments require cross-block covariance moments")
     return tuple(features)
 
 
@@ -71,6 +85,8 @@ def _array_value(moments,name):
         return getattr(moments.sampling_moments,name.removeprefix("sampling_"))
     if name in ARCHITECTURE_ARRAYS+PAIR_ARRAYS:
         return getattr(moments.sampling_moments,name)
+    if name in CROSSBLOCK_ARRAYS+CROSSBLOCK_NUISANCE_ARRAYS:
+        return getattr(moments.crossblock_moments,name.removeprefix("crossblock_"))
     return getattr(moments,name)
 
 
@@ -197,7 +213,16 @@ def _artifact_from_arrays(h, data):
     names = ("n_samples", "num_contexts", "method", "population_liability_variance")
     if not set(names) <= set(h):
         raise ValueError("contextual PCGC moment metadata are incomplete")
-    values = {k:data[k] for k in arrays if k not in SAMPLING_ARRAYS+ARCHITECTURE_ARRAYS+PAIR_ARRAYS}
+    values = {k:data[k] for k in arrays if k not in SAMPLING_ARRAYS+ARCHITECTURE_ARRAYS+PAIR_ARRAYS
+              +CROSSBLOCK_ARRAYS+CROSSBLOCK_NUISANCE_ARRAYS}
+    if "person_crossblock_covariance" in features:
+        from .crossblock import CrossBlockMoments
+        fields = {name:data["crossblock_"+name] for name in CROSSBLOCK_FIELDS}
+        if "person_crossblock_risk_fit" in features:
+            fields.update({name:data["crossblock_"+name] for name in CROSSBLOCK_NUISANCE_FIELDS})
+        if fields["block_ids"].dtype.kind not in "iu":
+            raise ValueError("cross-block IDs must be stored as integers")
+        values["crossblock_moments"] = CrossBlockMoments(**fields, n_samples=h["n_samples"])
     if "individual_sampling_covariance" in features:
         from .sampling import SamplingMoments
         architecture = ({**{k:data[k] for k in ARCHITECTURE_ARRAYS},"architecture_probes":h.get("architecture_probes")} if "gaussian_architecture_covariance" in features else {})
