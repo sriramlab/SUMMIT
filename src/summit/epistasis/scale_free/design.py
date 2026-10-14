@@ -81,7 +81,7 @@ class Plan:
 
 def build_plan(rows, contexts, outcomes, covariates, *, analyses=None, strata=None,
                scales=('pooled_rank', 'within_rank'), pattern_scales=None, additive_scales=(), n_groups=200,
-               seed=20261011, min_group_rows=5):
+               seed=20261011, min_group_rows=5, covariate_slopes='class'):
     """Form outcome columns for every requested (context, outcome) analysis.
 
     rows: strictly increasing source rows (N); every array below is aligned to them.
@@ -92,6 +92,14 @@ def build_plan(rows, contexts, outcomes, covariates, *, analyses=None, strata=No
     (default all scales). additive_scales: scales that also receive the plain
     residual column y, for theta_y = mean_j (E[x_j y])^2, the relative dosage
     statistic and the global (affine-modifier) prediction of the dosage statistic.
+    covariate_slopes: 'class' fits covariate slopes within each class x stratum; 'common' fits
+    them once per stratum (e.g. sex) with an intercept for each class. Class-specific slopes
+    absorb any context x covariate interaction, but where a covariate tracks genetic
+    similarity (principal components, assessment centre) the in-sample fit makes residuals
+    of related people in the same class slightly negatively correlated, which biases the
+    dosage and contrast statistics downwards by about sum_k (lambda_k - 1) / (n sqrt(2 tau2))
+    null standard errors (lambda_k: relatedness eigenvalue along covariate k). With common
+    slopes the weights g_i g_i' take both signs and the term is of order 1/n.
     """
     rows = np.asarray(rows, dtype=np.int64)
     if rows.ndim != 1 or not len(rows) or np.any(np.diff(rows) <= 0):
@@ -106,6 +114,8 @@ def build_plan(rows, contexts, outcomes, covariates, *, analyses=None, strata=No
         raise ValueError('pattern and additive scales must be among the analysed scales')
     if type(n_groups) is not int or n_groups < 4:
         raise ValueError('at least four individual groups are required')
+    if covariate_slopes not in ('class', 'common'):
+        raise ValueError("covariate_slopes must be 'class' or 'common'")
     contexts = {c.name: c for c in contexts}
     outcomes = {o.name: o for o in outcomes}
     pairs = (list(analyses) if analyses is not None else
@@ -178,7 +188,12 @@ def build_plan(rows, contexts, outcomes, covariates, *, analyses=None, strata=No
                 stacked.append(blom_rank_normal(y[idx]))
             else:
                 stacked.append(blom_rank_normal(y[idx], stratum))
-        residual = residualize_within(np.column_stack(stacked), cov[idx], stratum)
+        if covariate_slopes == 'class':
+            residual = residualize_within(np.column_stack(stacked), cov[idx], stratum)
+        else:
+            intercepts = (lab[:, None] == present[None, 1:]).astype(np.float64)
+            residual = residualize_within(np.column_stack(stacked), np.column_stack([intercepts, cov[idx]]),
+                                          extra[idx])
         share = np.array([np.mean(lab == k) for k in present])
         level = np.array([g[lab == k][0] for k in present])
         spread = {scale: np.array([residual[lab == k, s].std() for k in present]) for s, scale in enumerate(scales)}

@@ -654,3 +654,35 @@ def test_kernel_pool_matches_serial_with_segments_inside_blocks():
         keep = ~np.isin(chrom, plan.analyses[a]['exclude_chromosomes'])
         expected = oracle_kernel(s, plan.kinds['gy'].start + p, plan.kinds['gy'].start + p, annotation * keep)
         np.testing.assert_allclose(pooled.kernels['gy'][1, p], expected, rtol=1e-10, atol=1e-13)
+
+
+@pytest.mark.parametrize('slopes', ['class', 'common'])
+def test_covariate_slopes_match_direct_least_squares(slopes):
+    source, raw, ctx, out, cov = simulated(seed=9)
+    n = len(source.samples)
+    rows = np.arange(n)
+    sex = np.random.default_rng(2).integers(0, 2, n)
+    kwargs = {} if slopes == 'class' else dict(covariate_slopes='common')
+    plan = build_plan(rows, ctx[:1], out[1:], cov, strata=sex, scales=('raw',), pattern_scales=(), n_groups=6,
+                      seed=1, **kwargs)
+    y = np.zeros((n, plan.n_columns))
+    y[plan.order] = np.vstack(plan.blocks)
+    c, o = ctx[0], out[1]
+    idx = np.flatnonzero((c.labels >= 0) & np.isfinite(o.values) & np.all(np.isfinite(cov), axis=1))
+    lab, yy = c.labels[idx], o.values[idx]
+    value = np.array([c.values[int(k)] for k in lab])
+    g = (value - value.mean()) / value.std()
+    expected = np.empty(len(idx))
+    for s in (0, 1):
+        if slopes == 'class':
+            for k in np.unique(lab):
+                m = (sex[idx] == s) & (lab == k)
+                d = np.column_stack([np.ones(m.sum()), cov[idx][m]])
+                expected[m] = yy[m] - d @ np.linalg.lstsq(d, yy[m], rcond=None)[0]
+        else:
+            m = sex[idx] == s
+            d = np.column_stack([(lab[m][:, None] == np.unique(lab)[None, :]).astype(float), cov[idx][m]])
+            expected[m] = yy[m] - d @ np.linalg.lstsq(d, yy[m], rcond=None)[0]
+    np.testing.assert_allclose(y[idx, plan.kinds['gy'].start], g * expected, rtol=1e-9, atol=1e-10)
+    with pytest.raises(ValueError, match='covariate_slopes'):
+        build_plan(rows, ctx[:1], out[1:], cov, scales=('raw',), n_groups=6, covariate_slopes='none')

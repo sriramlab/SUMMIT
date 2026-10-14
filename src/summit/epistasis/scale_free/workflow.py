@@ -17,6 +17,7 @@ Manifest (JSON, paths relative to the manifest):
     pattern_scales?: scales that also get lo/hi pattern columns (default all)
     additive_scales?: scales that also get the additive column (default none)
     groups?: 200, seed?: 20261011, genotype_scale?: empirical|hwe, save_kernels?: false
+    covariate_slopes?: class|common (default class; see design.build_plan)
 
 A variant context codes minor-allele counts on the pass rows. With fewer than
 min_minor_homozygotes, the minor homozygotes are merged with the
@@ -116,7 +117,7 @@ def run(manifest, out, *, threads=1, memory_bytes=16 * 2**30, block_size=1024, n
     spec = read_json(path)
     closed(spec, ('kind', 'schema_version', 'genotypes', 'samples', 'phenotypes', 'contexts'),
            ('covariates', 'strata', 'analyses', 'background', 'scales', 'pattern_scales', 'additive_scales',
-            'groups', 'seed', 'genotype_scale', 'save_kernels'), name='scale-free manifest')
+            'groups', 'seed', 'genotype_scale', 'save_kernels', 'covariate_slopes'), name='scale-free manifest')
     if spec['kind'] != KIND or spec['schema_version'] != 1:
         raise ValueError('unsupported scale-free manifest')
     root = path.parent
@@ -178,7 +179,7 @@ def run(manifest, out, *, threads=1, memory_bytes=16 * 2**30, block_size=1024, n
                           scales=spec.get('scales', ('pooled_rank', 'within_rank')),
                           pattern_scales=spec.get('pattern_scales'), additive_scales=spec.get('additive_scales', ()),
                           n_groups=spec.get('groups', 200),
-                          seed=spec.get('seed', 20261011))
+                          seed=spec.get('seed', 20261011), covariate_slopes=spec.get('covariate_slopes', 'class'))
         print(f'scale-free plan: {len(plan.analyses)} analyses, {plan.n_columns} columns, {len(rows)} rows, '
               f'{perf_counter() - started:.0f} s', file=sys.stderr, flush=True)
         bg = spec.get('background', {})
