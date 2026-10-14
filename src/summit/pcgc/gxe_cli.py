@@ -7,7 +7,7 @@ from .gxe_io import prepare_gxe_from_source
 
 OPTIONS = {"--binary-context-columns", "--binary-unit-liability", "--binary-liability-sd-column",
            "--binary-ld-factorization", "--binary-genotype-covariates", "--binary-reference-covariates",
-           "--binary-sampling-partners", "--binary-architecture-probes"}
+           "--binary-sampling-partners", "--binary-architecture-probes", "--binary-crossblock-blocks"}
 
 
 def add_arguments(group):
@@ -25,6 +25,20 @@ def add_arguments(group):
         help="Experimental individual-sampling SEs: partner draws per person (>=2); 0 retains the SNP-block jackknife.")
     group.add_argument("--binary-architecture-probes",type=int,default=0,
         help="Experimental Gaussian SNP-effect uncertainty: variant probes per family (>=2), with individual-sampling SEs.")
+    group.add_argument("--binary-crossblock-blocks",type=int,default=None,
+        help="Opt-in participant-level correction to the SNP-block jackknife: record rows for this many SNP blocks "
+             "(use the fit's --njack, default 200); the fit then adds between-block participant covariance. 0 or omitted: off.")
+
+
+def crossblock_block_count(requested, num_variants):
+    """Preparation-time partition; it must equal the fit-time jackknife blocks."""
+    from .cli import DEFAULT_BINARY_NJACK
+    from .crossblock import DEFAULT_ENABLED
+    if requested is None:
+        return min(DEFAULT_BINARY_NJACK, num_variants) if DEFAULT_ENABLED else 0
+    if type(requested) is not int or requested < 0 or requested == 1 or requested > num_variants:
+        raise ValueError("--binary-crossblock-blocks must be 0 or an integer from 2 to the SNP count")
+    return requested
 
 
 def prepare(args):
@@ -76,6 +90,9 @@ def prepare(args):
             sd = sd[:, 0]
         a, annot_names = annotation_table(args.annot, source)
         options = dict(probes=args.nvecs, seed=args.seed, memory_bytes=int(args.memory_gib*2**30))
+        crossblock = crossblock_block_count(args.binary_crossblock_blocks, len(a))
+        if crossblock:
+            options.update(crossblock_blocks=crossblock, risk_covariates=risk_covariates)
         if args.binary_sampling_partners:
             options.update(sampling_partners=args.binary_sampling_partners,sampling_seed=args.seed,
                            risk_covariates=risk_covariates,architecture_probes=args.binary_architecture_probes)

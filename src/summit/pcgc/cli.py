@@ -118,7 +118,8 @@ def prepare(args):
         from .gxe_cli import prepare as prepare_contextual
         return prepare_contextual(args)
     if any(getattr(args, name, None) for name in ("binary_unit_liability", "binary_liability_sd_column", "binary_ld_factorization",
-                                                "binary_genotype_covariates", "binary_reference_covariates", "binary_sampling_partners", "binary_architecture_probes")):
+                                                "binary_genotype_covariates", "binary_reference_covariates", "binary_sampling_partners", "binary_architecture_probes",
+                                                "binary_crossblock_blocks")):
         raise ValueError("contextual binary options require --binary-context-columns")
     with ExitStack() as stack:
         source = stack.enter_context(FileGenotypeSource(args.geno, genome_build=args.genome_build))
@@ -196,8 +197,10 @@ def run(args, argv):
         from summit.inference.jackknife import JackknifeDesign, JackknifeSpec
         # The root parser's chromosome default belongs to HE/LDSC. Binary
         # inference uses equal-count SNP blocks and always computes uncertainty.
+        crossblock = getattr(artifact.moments, "crossblock_moments", None) if contextual else None
         try:
-            count = int(args.njack) if "--njack" in explicit else DEFAULT_BINARY_NJACK
+            count = (int(args.njack) if "--njack" in explicit else
+                     DEFAULT_BINARY_NJACK if crossblock is None else crossblock.block_count)
         except (ValueError, TypeError) as exc:
             raise ValueError("binary jackknife requires an integer block count >=2") from exc
         if count < 2:
@@ -206,6 +209,9 @@ def run(args, argv):
         if count > view.nsnps:
             raise ValueError(f"binary --njack ({count}) exceeds the {view.nsnps} SNPs; choose a smaller block count >=2")
         blocks = JackknifeDesign.from_trace_view(view, JackknifeSpec.parse(count)).unit_id
+        if crossblock is not None and "--njack" not in explicit:
+            # Calibrated intervals need the jackknife blocks used at preparation.
+            blocks = np.asarray(crossblock.block_ids)
         if contextual:
             from .gxe_cli import fit as fit_contextual
             result = fit_contextual(artifact, blocks, threads=args.num_threads)

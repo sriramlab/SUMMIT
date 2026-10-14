@@ -110,6 +110,7 @@ class GxEMoments:
     reference_probe_deviations: np.ndarray | None = None
     external_reference_covariance: np.ndarray | None = None
     external_context_gram: np.ndarray | None = None
+    crossblock_moments: object | None = None
 
     def __post_init__(self):
         if type(self.num_contexts) is not int or self.num_contexts < 1:
@@ -170,6 +171,13 @@ class GxEMoments:
             object.__setattr__(self,"external_context_gram",readonly(gram))
         elif self.external_context_gram is not None:
             raise ValueError("external context Gram requires reference covariance")
+        if self.crossblock_moments is not None:
+            from .crossblock import CrossBlockMoments
+            cb = self.crossblock_moments
+            if (not isinstance(cb, CrossBlockMoments) or cb.n_samples != self.n_samples
+                    or cb.component_count != self.component_count or len(cb.block_ids) != len(a)
+                    or cb.context_total.shape != (p, p)):
+                raise ValueError("person cross-block moments and genetic moment axes disagree")
 
     @property
     def pairs(self):
@@ -236,7 +244,7 @@ def fit_gxe(moments, *, block_ids=None,native=True,threads=None):
                   relative_solve_residual=float(np.linalg.norm(H@theta-b)/max(1., np.linalg.norm(b))),
                   estimates_constrained=False, uncertainty_status="not_requested")
     if block_ids is not None:
-        ids = np.asarray(block_ids)
+        ids = original_ids = np.asarray(block_ids)
         if ids.dtype.kind not in "iu" or ids.shape != (len(moments.annotations),):
             raise ValueError("block IDs must be integers on the SNP axis")
         labels, ids, sizes = np.unique(ids, return_inverse=True, return_counts=True)
@@ -262,6 +270,7 @@ def fit_gxe(moments, *, block_ids=None,native=True,threads=None):
         covariance = _jackknife_covariance(np.asarray(replicates))
         se = np.sqrt(np.maximum(0., covariance.diagonal()))
         variance_se = float(np.sqrt(max(0., contrast@covariance@contrast)))
+        from .crossblock import JACKKNIFE_STATUS
         result.update(uncertainty_status="estimated", covariance=covariance.tolist(),
                       standard_errors=se.tolist(), omega_standard_errors=_omega(se, q).tolist(),
                       population_genetic_variance_se=variance_se,
@@ -271,14 +280,50 @@ def fit_gxe(moments, *, block_ids=None,native=True,threads=None):
                       jackknife_method=FROZEN_JACKKNIFE,
                       jackknife_reconstruction_error=float(reconstruction),
                       uncertainty_conditioning="fixed_risks_liability_sd_population_metric_genotype_scale_reference_probes",
-                      external_reference_uncertainty_included=False)
+                      external_reference_uncertainty_included=False,
+                      uncertainty_method=FROZEN_JACKKNIFE, uncertainty_calibration_status=JACKKNIFE_STATUS,
+                      snp_block_covariance=covariance.tolist(), snp_block_standard_errors=se.tolist(),
+                      snp_block_population_heritability_se=variance_se/denominator)
+        crossblock = moments.crossblock_moments
+        if crossblock is not None and not crossblock.matches(original_ids):
+            result["crossblock_status"] = "not_applied_inference_blocks_differ_from_preparation_blocks"
+        elif crossblock is not None:
+            from .crossblock import calibrated_covariance, METHOD as CROSSBLOCK_METHOD, CALIBRATION_STATUS, CALIBRATION_NOTE
+            between, nuisance, details = calibrated_covariance(moments, theta, H, bd, len(labels))
+            total = covariance+between+nuisance
+            total = (total+total.T)/2
+            details["minimum_covariance_eigenvalue"] = float(np.linalg.eigvalsh(total).min())
+            added = dict(person_crossblock_covariance=between.tolist(), risk_fit_covariance=nuisance.tolist(),
+                         crossblock_diagnostics=details)
+            if np.any(np.diag(total) <= 0):
+                # The between-block estimate is too noisy here (few people or
+                # blocks); keep the jackknife and say so.
+                result.update(crossblock_status="not_applied_nonpositive_calibrated_variance", **added)
+            else:
+                se = np.sqrt(np.diag(total))
+                variance_se = float(np.sqrt(max(0., contrast@total@contrast)))
+                conditioning = ("fixed_population_prevalence_liability_sd_population_metric_genotype_scale_reference_probes"
+                                if crossblock.has_nuisance else
+                                "fixed_supplied_risks_liability_sd_population_metric_genotype_scale_reference_probes")
+                result.update(covariance=total.tolist(), standard_errors=se.tolist(),
+                              omega_standard_errors=_omega(se, q).tolist(),
+                              population_genetic_variance_se=variance_se,
+                              population_heritability_se=variance_se/denominator,
+                              uncertainty_method=CROSSBLOCK_METHOD, uncertainty_calibration_status=CALIBRATION_STATUS,
+                              uncertainty_calibration_note=CALIBRATION_NOTE,
+                              uncertainty_conditioning=conditioning, crossblock_status="applied",
+                              component_normal_intervals_95=np.column_stack(
+                                  (theta-1.959963984540054*se, theta+1.959963984540054*se)).tolist(), **added)
     if moments.sampling_moments is not None:
         from .sampling import sampling_inference
-        if "covariance" in result:
-            result["snp_block_covariance"] = result["covariance"]
-            result["snp_block_standard_errors"] = result["standard_errors"]
-        result.update(sampling_inference(moments,theta,H,contrast,native=native,threads=threads))
-        result["omega_standard_errors"] = _omega(result["standard_errors"],q).tolist()
+        from .crossblock import METHOD as CROSSBLOCK_METHOD
+        sampling = sampling_inference(moments,theta,H,contrast,native=native,threads=threads)
+        sampling["omega_standard_errors"] = _omega(sampling["standard_errors"],q).tolist()
+        if result.get("uncertainty_method") == CROSSBLOCK_METHOD:
+            # Keep the experimental sampling result separate from calibrated intervals.
+            result["individual_sampling"] = sampling
+        else:
+            result.update(sampling)
     return result
 
 
@@ -323,7 +368,8 @@ def _gxe_reserved_bytes(n, m, q, k):
 
 def plan_gxe_reference(*, num_samples, num_variants, num_contexts, num_annotations,
                        probes=256, memory_bytes=2**30, block_size=256, threads=1,
-                       genotype_format="bed", sampling_partners=0, risk_rank=0, architecture_probes=0):
+                       genotype_format="bed", sampling_partners=0, risk_rank=0, architecture_probes=0,
+                       crossblock_blocks=0):
     """Dimension-only workspace admission; no genotypes, risks, or arrays."""
     from math import comb
     from dataclasses import replace
@@ -336,6 +382,9 @@ def plan_gxe_reference(*, num_samples, num_variants, num_contexts, num_annotatio
         preferred_rhs_tile_columns=q*q*min(probes,64), rhs_policy="tiled")
     p, t, b = q*(q+1)//2, comb(q+3,4), min(block_size,m)
     reserve = _gxe_reserved_bytes(n,m,q,k)
+    if crossblock_blocks:
+        from .crossblock import crossblock_workspace_bytes
+        reserve += crossblock_workspace_bytes(n,m,q,k,crossblock_blocks,risk_rank,block_size)
     if sampling_partners:
         from .sampling import sampling_workspace_bytes
         if type(sampling_partners) is not int or sampling_partners < 2:
@@ -361,8 +410,13 @@ def prepare_gxe_moments(operator, annotations, risk, contexts, method="pcgc", *,
                         population_second_moment=None, population_liability_variance=None,
                         population_kernel_second_moment=None,
                         sampling_partners=0, sampling_seed=0, risk_covariates=None, architecture_probes=0,
-                        memory_bytes=2**30, **options):
-    """Two passes, variant-axis probes, exact same-person removal in every row."""
+                        crossblock_blocks=None, memory_bytes=2**30, **options):
+    """Two passes, variant-axis probes, exact same-person removal in every row.
+
+    crossblock_blocks (an inference block count or SNP block IDs) records the
+    participant rows needed for calibrated jackknife intervals. Fitting with
+    the same blocks then adds the between-block person covariance.
+    """
     if method == "pcgc-ld":
         raise ValueError("pcgc-ld requires prepare_gxe_external with an independent reference")
     if operator.num_samples != risk.n_samples:
@@ -379,6 +433,10 @@ def prepare_gxe_moments(operator, annotations, risk, contexts, method="pcgc", *,
     sampler = None
     probe_collector = None
     risk_rank = 0 if risk_covariates is None else finite_array("risk inference covariates",risk_covariates,2).shape[1]+1
+    from .crossblock import resolve_blocks, crossblock_workspace_bytes
+    crossblock_ids = resolve_blocks(crossblock_blocks, m)
+    if crossblock_ids is not None:
+        reserve += crossblock_workspace_bytes(n,m,q,k,int(crossblock_ids.max())+1,risk_rank,options.get("block_size",256))
     if sampling_partners:
         from .sampling import SamplingOperator,sampling_workspace_bytes
         if type(sampling_partners) is not int or sampling_partners < 2:
@@ -386,8 +444,8 @@ def prepare_gxe_moments(operator, annotations, risk, contexts, method="pcgc", *,
         reserve += sampling_workspace_bytes(n,m,q,k,sampling_partners,options.get("block_size",256),risk_rank,architecture_probes)
         probes = options.get("probes",256)
         reserve += 8*(4*probes*(k*p)**2+4*min(m,options.get("block_size",256))*(min(probes,64)+k)+k*min(probes,64))
-    elif risk_covariates is not None:
-        raise ValueError("risk inference covariates require individual-sampling inference")
+    elif risk_covariates is not None and crossblock_ids is None:
+        raise ValueError("risk inference covariates require individual-sampling or cross-block inference")
     elif architecture_probes:
         raise ValueError("architecture inference requires individual-sampling partners")
     if not isinstance(memory_bytes, int) or memory_bytes <= reserve:
@@ -395,12 +453,20 @@ def prepare_gxe_moments(operator, annotations, risk, contexts, method="pcgc", *,
     plan_gxe_reference(num_samples=n, num_variants=m, num_contexts=q, num_annotations=k,
         probes=options.get("probes",256), memory_bytes=memory_bytes,
         block_size=options.get("block_size",256), threads=options.get("threads",1),
-        genotype_format=operator.genotype_format,sampling_partners=sampling_partners,risk_rank=risk_rank,architecture_probes=architecture_probes)
+        genotype_format=operator.genotype_format,sampling_partners=sampling_partners,risk_rank=risk_rank,architecture_probes=architecture_probes,
+        crossblock_blocks=0 if crossblock_ids is None else int(crossblock_ids.max())+1)
+    response = risk.z/(risk.sensitivity/sd) if method == "pcgc-inverse" else risk.z
+    accumulator = None
+    if crossblock_ids is not None:
+        from .crossblock import make_accumulator
+        # Validate nuisance ownership before any genotype traversal.
+        accumulator = make_accumulator(a, phi, risk, sd, psi, response, method, crossblock_ids,
+                                       risk_covariates=risk_covariates,
+                                       **_matrix_operators(options.get("native", True), options.get("threads", 1)))
     if sampling_partners:
         from .reference import ProbeGramCollector
         probe_collector = ProbeGramCollector(a,q,options.get("probes",256),n,
             native=options.get("native",True),threads=options.get("threads",1))
-        response = risk.z/(risk.sensitivity/sd) if method == "pcgc-inverse" else risk.z
         sampler = SamplingOperator(operator,a,phi,risk,sd,psi,response,method,
             partners=sampling_partners,seed=sampling_seed,risk_covariates=risk_covariates,
             threads=options.get("threads",1),native=options.get("native",True),
@@ -408,6 +474,9 @@ def prepare_gxe_moments(operator, annotations, risk, contexts, method="pcgc", *,
             estimate_population_metric=population_kernel_second_moment is None and population_second_moment is None,
             estimate_population_variance=population_liability_variance is None)
         operator = sampler
+    if accumulator is not None:
+        from .crossblock import CrossBlockOperator
+        operator = CrossBlockOperator(operator, accumulator)
     fourth = np.column_stack([np.prod(psi[:, term], axis=1) for term in monomials])
     finite_array("context fourth products", fourth)
     ref, scored, plan = generalized_reference(operator, a, psi, responses=responses,
@@ -431,8 +500,10 @@ def prepare_gxe_moments(operator, annotations, risk, contexts, method="pcgc", *,
     if km is None and population_second_moment is None:
         km = _kernel_metric(scored.kernel_summary, a.sum(0), q)
     sampling = sampler.finalize() if sampler is not None else None
+    crossblock = accumulator.finalize() if accumulator is not None else None
     moments = GxEMoments(a, ld, rhs, q, n, method, metric, variance, km, sampling,
-                         None if probe_collector is None else probe_collector.deviations())
+                         None if probe_collector is None else probe_collector.deviations(),
+                         crossblock_moments=crossblock)
     diagnostics = dict(genotype_passes=operator.observed_passes, reference_kind="study_specific_context_variant_probes",
                        liability_scale_contract=SCALE_CONTRACT, liability_sd_range=[float(sd.min()), float(sd.max())],
                        context_sha256=array_sha256(phi), liability_sd_sha256=array_sha256(sd),
@@ -449,7 +520,30 @@ def prepare_gxe_moments(operator, annotations, risk, contexts, method="pcgc", *,
     if sampler is not None:
         diagnostics["sampling_inference"] = sampler.diagnostics
         diagnostics["sampling_inference"]["reference_probe_uncertainty_included"] = True
+    if crossblock is not None:
+        diagnostics["person_crossblock"] = _crossblock_diagnostics(crossblock)
     return moments, diagnostics
+
+
+def _matrix_operators(native, threads):
+    """SUMMIT's protected NN/TN products, or the NumPy differential backend."""
+    from summit.ldscore.generalized_gxe_pass1 import NumpyNNOperator, ProtectedNNOperator
+    from summit.ldscore.generalized_gxe_pass2 import NumpyTNOperator, ProtectedTNOperator
+    if not native:
+        return dict(nn=NumpyNNOperator(threads=threads), tn=NumpyTNOperator(threads=threads))
+    from summit.prediction.genotype import native_module
+    from summit.prediction.runtime import configure_prediction_threads
+    module = native_module()
+    configure_prediction_threads(module, threads)
+    return dict(nn=ProtectedNNOperator(threads=threads, native_module=module),
+                tn=ProtectedTNOperator(threads=threads, native_module=module))
+
+
+def _crossblock_diagnostics(crossblock):
+    from .crossblock import METHOD as CROSSBLOCK_METHOD, PERSON_ROW_MODEL
+    return dict(method=CROSSBLOCK_METHOD, person_row_model=PERSON_ROW_MODEL,
+                blocks=crossblock.block_count, risk_fit_uncertainty_included=crossblock.has_nuisance,
+                block_partition_sha256=array_sha256(crossblock.block_ids.astype(float)))
 
 
 def context_pair_gram(psi):
@@ -471,7 +565,7 @@ def prepare_gxe_external(operator, reference_operator, annotations, risk, contex
                          population_second_moment=None, population_liability_variance=None,
                          population_kernel_second_moment=None,
                          sampling_partners=0, sampling_seed=0, risk_covariates=None, architecture_probes=0,
-                         memory_bytes=2**30, block_size=256, threads=1, native=True, **options):
+                         crossblock_blocks=None, memory_bytes=2**30, block_size=256, threads=1, native=True, **options):
     """External-LD approximation with two complete reference traversals.
 
     Study scoring uses one traversal, or two with sampling inference.
@@ -496,6 +590,10 @@ def prepare_gxe_external(operator, reference_operator, annotations, risk, contex
     probe_collector = None
     reference_sampler = None
     risk_rank = 0 if risk_covariates is None else finite_array("risk inference covariates",risk_covariates,2).shape[1]+1
+    from .crossblock import resolve_blocks, crossblock_workspace_bytes
+    crossblock_ids = resolve_blocks(crossblock_blocks, m)
+    if crossblock_ids is not None:
+        reserve += crossblock_workspace_bytes(n,m,q,k,int(crossblock_ids.max())+1,risk_rank,block_size)
     if sampling_partners:
         from .sampling import SamplingOperator,sampling_workspace_bytes
         if type(sampling_partners) is not int or sampling_partners < 2:
@@ -505,8 +603,8 @@ def prepare_gxe_external(operator, reference_operator, annotations, risk, contex
         reserve += 8*(4*probes*(k*p)**2+4*probes*k*k+4*min(m,block_size)*(min(probes,64)+k))
         from .reference_sampling import reference_sampling_workspace_bytes
         reserve += reference_sampling_workspace_bytes(reference_operator.num_samples,k,sampling_partners,block_size)
-    elif risk_covariates is not None:
-        raise ValueError("risk inference covariates require individual-sampling inference")
+    elif risk_covariates is not None and crossblock_ids is None:
+        raise ValueError("risk inference covariates require individual-sampling or cross-block inference")
     elif architecture_probes:
         raise ValueError("architecture inference requires individual-sampling partners")
     if not isinstance(memory_bytes, int) or memory_bytes <= reserve:
@@ -516,6 +614,11 @@ def prepare_gxe_external(operator, reference_operator, annotations, risk, contex
     plan_pcgc_reference(num_samples=reference_operator.num_samples, num_variants=m,
         num_annotations=k, probes=options.get("probes", 256), memory_bytes=memory_bytes-reserve,
         block_size=block_size, threads=threads, genotype_format=reference_operator.genotype_format)
+    accumulator = None
+    if crossblock_ids is not None:
+        from .crossblock import make_accumulator
+        accumulator = make_accumulator(a, phi, risk, sd, psi, risk.z, "pcgc-ld", crossblock_ids,
+                                       risk_covariates=risk_covariates, **_matrix_operators(native, threads))
     if sampling_partners:
         from .reference import ProbeGramCollector
         probe_collector = ProbeGramCollector(a,1,options.get("probes",256),reference_operator.num_samples,
@@ -531,6 +634,9 @@ def prepare_gxe_external(operator, reference_operator, annotations, risk, contex
         reference_sampler = ReferenceSamplingOperator(reference_operator,a,partners=sampling_partners,
             seed=sampling_seed,threads=threads,native=native)
         reference_operator = reference_sampler
+    if accumulator is not None:
+        from .crossblock import CrossBlockOperator
+        operator = CrossBlockOperator(operator, accumulator)
     from summit.ldscore.generalized_gxe_pass2 import ProtectedTNOperator, NumpyTNOperator
     if native:
         from summit.prediction.genotype import native_module
@@ -573,9 +679,10 @@ def prepare_gxe_external(operator, reference_operator, annotations, risk, contex
         nr = reference_operator.num_samples
         annotation_deviations = probe_collector.deviations()/(nr*(nr-1))
         deviations = np.einsum('lab,ps->lapbs',annotation_deviations,factor).reshape(-1,k*p,k*p)
+    crossblock = accumulator.finalize() if accumulator is not None else None
     moments = GxEMoments(a, ld, rhs, q, n, "pcgc-ld", metric, variance, km, sampling,deviations,
         None if reference_sampler is None else reference_sampler.covariance(),
-        None if reference_sampler is None else factor)
+        None if reference_sampler is None else factor, crossblock_moments=crossblock)
     diagnostics = dict(reference_kind="external_population_risk_context_factorization_approximation",
                        factorization_contract=EXTERNAL_CONTRACT, study_genotype_passes=operator.observed_passes,
                        reference_genotype_passes=reference_operator.observed_passes,
@@ -591,4 +698,6 @@ def prepare_gxe_external(operator, reference_operator, annotations, risk, contex
         diagnostics["sampling_inference"] = sampler.diagnostics
         diagnostics["sampling_inference"]["reference_probe_uncertainty_included"] = True
         diagnostics["sampling_inference"]["external_reference_uncertainty_included"] = True
+    if crossblock is not None:
+        diagnostics["person_crossblock"] = _crossblock_diagnostics(crossblock)
     return moments, diagnostics
