@@ -125,7 +125,7 @@ def test_cli_runtime_sets_no_host_cpu_policy(monkeypatch):
     environment.pop("OMP_THREAD_LIMIT",None)
     monkeypatch.setattr(os,"environ",environment)
     monkeypatch.setattr(os,"uname",lambda: SimpleNamespace(nodename="tabla"))
-    monkeypatch.setattr(os,"sched_getaffinity",lambda pid: set(range(40,48)))
+    monkeypatch.setattr(os,"sched_getaffinity",lambda pid: set(range(40,48)),raising=False)
     cross_gxe_cli._runtime(8)
     assert os.environ["OMP_THREAD_LIMIT"]=="8"
     with pytest.raises(ValueError,match="positive"):

@@ -14,6 +14,8 @@ from summit.epistasis.scale_free.transforms import blom_rank_normal, residualize
 from summit.prediction.genotype import ArrayGenotypeSource, estimate_scale
 from summit.prediction.spec import VariantAxis
 
+from prediction_helpers import prediction_threads
+
 
 def _native_available():
     try:
@@ -900,7 +902,7 @@ def test_manifest_validation(tmp_path, change, message):
     change(manifest)
     (tmp_path / 'm.json').write_text(json.dumps(manifest))
     with pytest.raises(ValueError, match=message):
-        run(tmp_path / 'm.json', tmp_path / 'out', threads=1)
+        run(tmp_path / 'm.json', tmp_path / 'out', threads=prediction_threads())
 
 
 def test_missing_strata_and_memory_budget(tmp_path):
@@ -911,8 +913,8 @@ def test_missing_strata_and_memory_budget(tmp_path):
     manifest = _write_cli_inputs(tmp_path)
     (tmp_path / 'm.json').write_text(json.dumps(manifest))
     with pytest.raises(MemoryError, match='split the analyses'):
-        run(tmp_path / 'm.json', tmp_path / 'tiny', threads=1, memory_bytes=1000)
-    run(tmp_path / 'm.json', tmp_path / 'out', threads=1, memory_bytes=2**30)
+        run(tmp_path / 'm.json', tmp_path / 'tiny', threads=prediction_threads(), memory_bytes=1000)
+    run(tmp_path / 'm.json', tmp_path / 'out', threads=prediction_threads(), memory_bytes=2**30)
     res = pd.read_csv(tmp_path / 'out' / 'results.tsv', sep='\t')
     run_info = json.loads((tmp_path / 'out' / 'run.json').read_text())
     for a in run_info['analyses']:          # the 14 rows with a missing stratum are dropped, not a third stratum

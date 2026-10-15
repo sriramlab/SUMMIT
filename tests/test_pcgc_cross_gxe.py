@@ -1,4 +1,5 @@
 """Independent person-kernel checks; deliberately small dense matrices only."""
+import sys
 import numpy as np
 import pytest
 
@@ -533,6 +534,7 @@ def test_projection_subtraction_cancellation_uses_direct_products(native):
     assert np.max(np.abs(actual.pairs[0].ldscores[0]))<1e-20
 
 
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="protected native matrix products are Linux-only")
 def test_native_vendor_timing_counts_every_record(monkeypatch):
     """Vendor GEMM totals come from the full summary, not retained records."""
     from prediction_helpers import prediction_threads

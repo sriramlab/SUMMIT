@@ -1,11 +1,17 @@
 """Check the large-N research oracle against independent person kernels."""
+import sys
 import numpy as np
 import pytest
 from scripts.pcgc.calibrate_cross_scaling import make_design, exact_equations, fit_responses
 from test_pcgc_cross_gxe import dense_oracle
 
+# Protected native products use integrity snapshot mappings and output NUMA
+# verification, which are Linux-only (as are the production runs).
+LINUX_NATIVE = pytest.mark.skipif(not sys.platform.startswith("linux"),
+                                  reason="protected native matrix products are Linux-only")
 
-@pytest.mark.parametrize("native", [False, True])
+
+@pytest.mark.parametrize("native", [False, pytest.param(True, marks=LINUX_NATIVE)])
 @pytest.mark.parametrize("kind", ["qq", "bq", "bb"])
 @pytest.mark.parametrize("overlap", [0., .5, 1.])
 def test_scaling_variant_gram_oracle(kind, overlap, native):
@@ -50,6 +56,7 @@ def test_scaling_variant_gram_oracle(kind, overlap, native):
 
 
 
+@LINUX_NATIVE
 @pytest.mark.parametrize("fitted", [False, True])
 def test_retrospective_variant_oracle_matches_person_kernels(fitted):
     from scripts.pcgc.calibrate_cross_ascertainment import one
