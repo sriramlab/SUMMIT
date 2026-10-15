@@ -17,9 +17,9 @@ approximation. See [Generalized G×E PCGC](Generalized-GxE-PCGC.md) for the mode
 inputs, examples, and interpretation.
 
 Contextual preparation also supports genotype-PC adjustment through
-`--binary-genotype-covariates`. An opt-in participant-level correction to
-the SNP-block jackknife is recorded during preparation with
-`--binary-crossblock-blocks`. Experimental sampling SEs use
+`--binary-genotype-covariates`. A participant-level correction to the
+SNP-block jackknife is recorded during preparation by default
+(`--binary-crossblock-blocks 0` turns it off). Experimental sampling SEs use
 `--binary-sampling-partners`; `--binary-architecture-probes` adds a Gaussian
 SNP-effect variance model. The
 [G×E guide](Generalized-GxE-PCGC.md#standard-errors) explains both and their

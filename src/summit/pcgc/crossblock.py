@@ -429,10 +429,11 @@ def calibrated_covariance(moments, theta, normal, block_directed, block_count):
 JACKKNIFE_STATUS = "not_calibrated_snp_block_jackknife_omits_between_block_person_covariance"
 CALIBRATION_STATUS = "variance_calibrated_in_simulation_wald_coverage_can_be_below_nominal"
 CALIBRATION_NOTE = (
-    "Opt-in. In the 2026-10-13 simulation grid the variance ratio was near one, but 95% normal "
-    "intervals for variance components covered 92-94% where SNP-effect variance dominated "
-    "(small M relative to N) and with fitted risks; see reports/pcgc_development/"
-    "pcgc_gxe_binary_intervals.md.")
-# The grid did not meet the predeclared default rule, so CLI preparation
-# records cross-block moments only when --binary-crossblock-blocks is given.
-DEFAULT_ENABLED = False
+    "In the 2026-10-13 simulation grid the variance ratio was 0.89-1.14 and null type-I error "
+    "4-7%, but 95% normal intervals for variance components covered 91-94% where SNP-effect "
+    "variance dominated (small M relative to N), with few blocks and with fitted risks; see "
+    "reports/pcgc_development/pcgc_gxe_binary_intervals.md.")
+# CLI preparation records cross-block moments by default (since 2026-10-15):
+# the jackknife alone is not calibrated for binary G x E components, and the
+# corrected variance is. --binary-crossblock-blocks 0 turns it off.
+DEFAULT_ENABLED = True

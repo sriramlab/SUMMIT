@@ -34,7 +34,14 @@ variance is unbiased. Main's experimental sampling SEs were also evaluated:
 without architecture probes they are far too small for Ω; with them they
 behaved like the new estimator at N = 8,192 but cost minutes per replicate.
 
-**Default.** The predeclared rule (§5) was not met, so the correction is
+**Update, 15 October 2026.** The correction is now the CLI default for binary G×E
+PCGC (`--binary-crossblock-blocks 0` turns it off). Bronson judged the rule below
+too stringent: the corrected variance is reasonably calibrated (ratio 0.89–1.14,
+null type-I 4–7%), while the jackknife alone reaches 17–19% type-I error. The
+Wald-interval shortfall for variance components is being studied separately.
+The Python API still takes `crossblock_blocks` explicitly. Additive PCGC is unchanged.
+
+**Default (13 October).** The predeclared rule (§5) was not met, so the correction was
 opt-in (`--binary-crossblock-blocks`, or `crossblock_blocks` in Python). Fit
 outputs say which estimator was used and label jackknife-only results as not
 calibrated.

@@ -333,9 +333,9 @@ is applied. `fit_cross_gxe(participant_covariance=...)` accepts a
 participant-level covariance for within-trait binary pairs as an additional
 known term, reserved for a calibrated model of the omitted between-block
 covariance; none is computed here. Single-trait binary
-[Generalized G×E PCGC](Generalized-GxE-PCGC.md) fits now offer an opt-in correction for this
-between-block participant covariance (`--binary-crossblock-blocks`); it is not yet wired into
-cross-trait fits.
+[Generalized G×E PCGC](Generalized-GxE-PCGC.md) fits apply a correction for this
+between-block participant covariance by default (`--binary-crossblock-blocks`); it is not yet
+wired into cross-trait fits.
 
 Intervals use a working Student approximation, with Welch–Satterthwaite
 degrees of freedom from the SNP-block and reference-draw variance estimates.

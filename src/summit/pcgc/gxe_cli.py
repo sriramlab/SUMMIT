@@ -26,8 +26,9 @@ def add_arguments(group):
     group.add_argument("--binary-architecture-probes",type=int,default=0,
         help="Experimental Gaussian SNP-effect uncertainty: variant probes per family (>=2), with individual-sampling SEs.")
     group.add_argument("--binary-crossblock-blocks",type=int,default=None,
-        help="Opt-in participant-level correction to the SNP-block jackknife: record rows for this many SNP blocks "
-             "(use the fit's --njack, default 200); the fit then adds between-block participant covariance. 0 or omitted: off.")
+        help="Participant-level correction to the SNP-block jackknife: record rows for this many SNP blocks "
+             "(default: the fit's default of 200, or the SNP count if smaller); the fit then adds "
+             "between-block participant covariance. 0: off (jackknife only, labelled not calibrated).")
 
 
 def crossblock_block_count(requested, num_variants):
@@ -35,7 +36,8 @@ def crossblock_block_count(requested, num_variants):
     from .cli import DEFAULT_BINARY_NJACK
     from .crossblock import DEFAULT_ENABLED
     if requested is None:
-        return min(DEFAULT_BINARY_NJACK, num_variants) if DEFAULT_ENABLED else 0
+        count = min(DEFAULT_BINARY_NJACK, num_variants)
+        return count if DEFAULT_ENABLED and count >= 2 else 0
     if type(requested) is not int or requested < 0 or requested == 1 or requested > num_variants:
         raise ValueError("--binary-crossblock-blocks must be 0 or an integer from 2 to the SNP count")
     return requested

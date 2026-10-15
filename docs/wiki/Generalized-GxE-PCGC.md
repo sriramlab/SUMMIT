@@ -67,14 +67,13 @@ summit --binary-method pcgc \
   --binary-context-columns E1,E2 --binary-unit-liability \
   --binary-covariates AGE,PC1,PC2 \
   --binary-genotype-covariates PC1,PC2 \
-  --binary-crossblock-blocks 200 \
   --nvecs 256 --memory-gib 8 --num-threads 2 \
   --out results/disease_gxe
 ```
 
-`--binary-crossblock-blocks 200` records the participant rows for the
-opt-in interval correction described under [Standard errors](#standard-errors);
-fit with the default 200 jackknife blocks.
+Preparation also records the participant rows for the standard-error
+correction described under [Standard errors](#standard-errors), for the
+binary default of 200 jackknife blocks; fit without `--njack` to use them.
 
 Preparation writes two NumPy archives:
 
@@ -186,8 +185,8 @@ requires the corresponding context-specific liability variance.
 
 ### Standard errors
 
-Fits report SNP-block jackknife SEs. An opt-in correction adds covariance
-that the jackknife cannot see. The jackknife treats SNP blocks as
+Fits report SNP-block jackknife SEs plus, by default, a correction for
+covariance that the jackknife cannot see. The jackknife treats SNP blocks as
 independent. That holds for SNP effects and LD, but every block's estimating
 equation is a sum over the same participants. Several participant-level
 terms make block equations covary:
@@ -204,7 +203,7 @@ jackknife alone, a simulated rare disease (K = 0.02, N = 32,768, M = 1,024)
 had 82% coverage for a null additive-by-context covariance. Near K = 0.5 the
 jackknife was slightly conservative for that component.
 
-With `--binary-crossblock-blocks`, preparation records each participant's
+Preparation records each participant's
 contribution to each SNP block's estimating equation, in the first genotype
 pass. The fit adds the covariance between different blocks' contributions
 from the same participants. The within-block part is already in the
@@ -217,20 +216,19 @@ fitted and supplied risks, case–control ascertainment, LD and overlapping
 annotations), the corrected variance was close to the true variance (ratio
 0.89–1.14, mean 1.00) and null components had 4–7% type-I error, against
 0.44–1.26 and up to 19% for the jackknife. Coverage of 95% intervals for
-variance components (diagonal Ω entries) was still 90.8–94% in some designs:
-the SE estimate is strongly correlated with the estimate, which affects any
-normal interval, including the jackknife's where its variance is right. The
-correction is therefore opt-in and labelled
+variance components (diagonal Ω entries) was still 90.8–94% in some designs
+(small M relative to N, 32 blocks, the rare-disease intercept): the estimate
+and its SE are skewed together, which affects any normal interval, including
+the jackknife's where its variance is right. The corrected result is labelled
 `variance_calibrated_in_simulation_wald_coverage_can_be_below_nominal`. It is
-recommended for rare diseases with supplied risks and large ĥ·N/M, where
-the jackknife alone is most anti-conservative. Like the jackknife, it
-requires blocks larger than local LD.
+the default since 15 October 2026; `--binary-crossblock-blocks 0` turns it
+off. Like the jackknife, it requires blocks larger than local LD.
 
-The correction needs the same SNP blocks at preparation and fit. Set
-`--binary-crossblock-blocks` to the intended jackknife block count, usually
-the binary default of 200. Without `--njack`, the fit uses the prepared
-blocks. With a different `--njack`, the fit reports the jackknife alone and
-says so. In the Python API, pass `crossblock_blocks` (and `risk_covariates`
+The correction needs the same SNP blocks at preparation and fit. By default
+preparation records rows for the binary default of 200 blocks (or one block
+per SNP when there are fewer SNPs); `--binary-crossblock-blocks N` chooses
+another count. Without `--njack`, the fit uses the prepared blocks. With a
+different `--njack`, the fit reports the jackknife alone and says so. In the Python API, pass `crossblock_blocks` (and `risk_covariates`
 for fitted risks) to `prepare_gxe_moments` and fit with the same `block_ids`.
 
 With fitted risks (`--binary-covariates` or the context columns), the
@@ -299,6 +297,8 @@ fitting, preparation order, and the small estimating equations.
 
 Cross-block participant rows add three small products per genotype block to
 the first pass and O(N) memory; they need no participant pairs or extra pass.
+In a benchmark (N = 20,000, M = 4,000, Q = 3, two annotations, 64 probes),
+preparation time rose from 24.7 to 31.0 s and workspace from 677 to 759 MB.
 Reference LD scores use randomized variant probes. Sampling covariance reuses
 the genotype passes and accumulates sampled-pair moments. Products shared by
 annotation and context combinations are evaluated once, then expanded into
