@@ -317,9 +317,12 @@ def test_cli_end_to_end(tmp_path):
     assert (res.se_rule[degenerate] == 'null_restricted').all() and np.allclose(res.se[degenerate],
                                                                                 res.se_null[degenerate])
     assert {'additive', 'relative_dosage', 'global_excess', 'additive[A]'} <= set(res.statistic)
+    flipped = res.statistic.str.split('[').str[0].isin(['dosage', 'delta2', 'relative_dosage'])
+    assert set(res.p_method[flipped]) == {'signflip'} and set(res.p_method[~flipped]) == {'normal'}
+    assert np.allclose(res.p[~flipped], res.p_normal[~flipped], equal_nan=True)
     run = json.loads((tmp_path / 'out' / 'run.json').read_text())
     assert run['contexts']['v0']['chromosome'] == '1'
-    assert run['covariate_slopes'] == 'common'
+    assert run['covariate_slopes'] == 'common' and run['null_p'] == 'signflip'
     assert (tmp_path / 'out' / 'COMPLETE').exists()
     assert np.load(tmp_path / 'out' / 'kernels.npz')['kernel_gy'].shape == (2, 4, 5, 5)
 
@@ -687,6 +690,65 @@ def test_covariate_slopes_match_direct_least_squares(slopes):
     np.testing.assert_allclose(y[idx, plan.kinds['gy'].start], g * expected, rtol=1e-9, atol=1e-10)
     with pytest.raises(ValueError, match='covariate_slopes'):
         build_plan(rows, ctx[:1], out[1:], cov, scales=('raw',), n_groups=6, covariate_slopes='none')
+
+
+def test_signflip_p_matches_exact_enumeration():
+    """Sign-flip p of dosage and delta2 against all 2^G sign patterns of the oracle kernels."""
+    source, raw, ctx, out, cov = simulated(seed=11)
+    rows = np.arange(len(source.samples))
+    plan = build_plan(rows, ctx, out, cov, scales=('within_rank',), additive_scales=('within_rank',), n_groups=8,
+                      seed=2)
+    bg = background_axis(source, n_blocks=6)
+    scale = estimate_scale(source, rows, bg.variants)
+    acc = accumulate(source, plan, scale, bg, block_size=32, native=False)
+    records = {(r['analysis'], r['statistic']): r for r in summarize(plan, acc)}
+    s = dense_scores(np.asarray(source.values), scale, plan)
+    chrom = np.array(bg.chromosomes)
+    g = plan.n_groups
+    signs = np.array(np.meshgrid(*[[-1., 1.]] * g)).reshape(g, -1).T
+
+    def exact(k):
+        k = (k + k.T) / 2
+        np.fill_diagonal(k, 0.)
+        q = np.einsum('ij,ij->i', signs @ k, signs)
+        return np.mean(q >= k.sum() * (1 - 1e-12))
+
+    checked = 0
+    for p, (a, _) in enumerate(plan.keys['gy']):
+        w = (~np.isin(chrom, plan.analyses[a]['exclude_chromosomes'])).astype(float)
+        gy, lo, hi = plan.kinds['gy'].start + p, plan.kinds['lo'].start + p, plan.kinds['hi'].start + p
+        kern = {c: oracle_kernel(s, c[0], c[1], w) / w.sum() for c in ((gy, gy), (lo, lo), (hi, hi), (lo, hi))}
+        for name, k in (('dosage', kern[(gy, gy)]),
+                        ('delta2', kern[(lo, lo)] + kern[(hi, hi)] - 2 * kern[(lo, hi)])):
+            r = records[(a, name)]
+            assert r['p_method'] == 'signflip' and r['flips'] >= 20_000
+            e = exact(k)
+            assert abs(r['p'] - e) < 5 * np.sqrt(e * (1 - e) / r['flips']) + 2e-4
+            assert np.isclose(r['p_normal'], norm.sf(r['z']))
+            checked += 1
+        assert records[(a, 'relative_dosage')]['p'] == records[(a, 'dosage')]['p']
+        assert records[(a, 'rho')]['p_method'] == 'normal'
+    assert checked >= 4
+
+
+def test_signflip_p_is_calibrated_when_the_null_is_skewed():
+    """Two dominant score components: the normal tail over-rejects, the sign flip stays nominal."""
+    from summit.epistasis.scale_free.stats import signflip_sf
+    rng = np.random.default_rng(8)
+    g, reps = 40, 500
+    flip, normal = [], []
+    for _ in range(reps):
+        sc = rng.normal(size=(g, 2)) * [3., 1.]
+        t = sc @ sc.T
+        np.fill_diagonal(t, 0.)
+        p, used, skew = signflip_sf(t, flips=(2000, 2000, 0.), seed=int(rng.integers(2**31)))
+        flip.append(p)
+        normal.append(norm.sf(t.sum() / np.sqrt(2 * np.sum(t ** 2))))
+    flip, normal = np.array(flip), np.array(normal)
+    assert skew > 1
+    assert .025 <= np.mean(flip < .05) <= .08
+    assert np.mean(flip < .01) <= .022
+    assert np.mean(normal < .01) > 2 * max(np.mean(flip < .01), 1 / reps)
 
 
 def test_jackknife_complements_use_leave_one_out_weights():

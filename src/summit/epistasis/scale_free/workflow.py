@@ -18,6 +18,7 @@ Manifest (JSON, paths relative to the manifest):
     additive_scales?: scales that also get the additive column (default none)
     groups?: 200, seed?: 20261011, genotype_scale?: empirical|hwe, save_kernels?: false
     covariate_slopes?: common|class (default common; see design.build_plan)
+    null_p?: signflip|normal (default signflip: sign-flip p-values for dosage-type tests; see stats)
 
 A variant context codes minor-allele counts on the pass rows. With fewer than
 min_minor_homozygotes, the minor homozygotes are merged with the
@@ -34,7 +35,7 @@ from time import perf_counter
 import numpy as np
 
 from .design import Context, Outcome, build_plan
-from .stats import summarize
+from .stats import FLIPS, summarize
 from .stream import accumulate, background_axis, plan_block_size
 
 KIND = 'summit.epistasis.scale_free'
@@ -120,9 +121,12 @@ def run(manifest, out, *, threads=1, memory_bytes=16 * 2**30, block_size=1024, n
     spec = read_json(path)
     closed(spec, ('kind', 'schema_version', 'genotypes', 'samples', 'phenotypes', 'contexts'),
            ('covariates', 'strata', 'analyses', 'background', 'scales', 'pattern_scales', 'additive_scales',
-            'groups', 'seed', 'genotype_scale', 'save_kernels', 'covariate_slopes'), name='scale-free manifest')
+            'groups', 'seed', 'genotype_scale', 'save_kernels', 'covariate_slopes', 'null_p'),
+           name='scale-free manifest')
     if spec['kind'] != KIND or spec['schema_version'] != 1:
         raise ValueError('unsupported scale-free manifest')
+    if spec.get('null_p', 'signflip') not in ('signflip', 'normal'):
+        raise ValueError("null_p must be 'signflip' or 'normal'")
     root = path.parent
     phen = spec['phenotypes']
     closed(phen, ('file', 'columns'), ('positive',), name='phenotypes')
@@ -233,7 +237,7 @@ def run(manifest, out, *, threads=1, memory_bytes=16 * 2**30, block_size=1024, n
         width = plan_block_size(plan, len(rows), memory_bytes=memory_bytes, block_size=block_size)
         result = accumulate(source, plan, scale, background, block_size=width, threads=threads, native=native,
                             progress=progress)
-        records = summarize(plan, result)
+        records = summarize(plan, result, flips=FLIPS if spec.get('null_p', 'signflip') == 'signflip' else None)
         source_identity = source.identity
     finally:
         source.close()
@@ -245,7 +249,8 @@ def run(manifest, out, *, threads=1, memory_bytes=16 * 2**30, block_size=1024, n
                     background=dict(variants=int(len(background.variants)), jackknife_blocks=background.n_blocks),
                     genotype_source=source_identity, genotype_scale=scale.identity,
                     groups=plan.n_groups, seed=spec.get('seed', 20261011),
-                    covariate_slopes=spec.get('covariate_slopes', 'common'), diagnostics=result.diagnostics,
+                    covariate_slopes=spec.get('covariate_slopes', 'common'), null_p=spec.get('null_p', 'signflip'),
+                    diagnostics=result.diagnostics,
                     seconds=perf_counter() - started)
     run_info['code_sha256'] = code
     if native:

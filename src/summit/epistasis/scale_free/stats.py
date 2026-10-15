@@ -20,6 +20,18 @@ noisy than the full Hoeffding variance, whose first-order term is zero under
 the null but estimated with noise. It omits that first-order term under
 alternatives, so intervals use the Hoeffding and jackknife standard errors.
 relative_dosage tests the same null as dosage and uses the same variance.
+
+The p-values of these tests come from sign flips of the group scores. Under the
+null the score vectors of different groups are independent with mean zero and,
+being sums over about n / G people, symmetric, so
+theta(eps) = sum_{a != b} eps_a eps_b T_ab / (G (G - 1)) with Rademacher eps has
+the null distribution of theta given the scores. Its variance is the
+null-restricted variance, but its skewness, 2 sqrt(2) sum nu^3 / (sum nu^2)^1.5
+over the eigenvalues nu of T, is not negligible when the background is a set
+of a few hundred loci (0.1-0.3 in UK Biobank trait loci; 0.02 for all
+variants), and the normal tail is then several-fold too light near z = 4.
+Monte Carlo flips are adaptive (more flips for small p) and seeded from the
+kernel, so results are reproducible. p_normal keeps the normal-tail value.
 The ratio statistics keep the larger of the Hoeffding and jackknife standard
 errors (max-SE rule). rho = 1 lies on the Cauchy-Schwarz boundary, where the
 first-order delta-method term vanishes; its Hoeffding SE alone is then
@@ -46,6 +58,8 @@ scale-free (proportional background), while the others are scale-dependent.
 """
 from __future__ import annotations
 
+import zlib
+
 import numpy as np
 from scipy.stats import norm
 
@@ -53,6 +67,8 @@ NULLS = dict(dosage=0., dosage_diff=0., rho=1., log_amp=0., delta2=0., sel_lam=0
              relative_dosage=0., global_excess=0.)
 ONE_SIDED = ('dosage', 'delta2', 'additive', 'relative_dosage')
 DEGENERATE = ('dosage', 'delta2', 'relative_dosage')
+LINEAR = ('dosage', 'delta2')       # degenerate statistics that are linear in the kernels
+FLIPS = (20_000, 2_000_000, 2e-3)  # first flips, flips when the first p is below the third value
 
 
 def hoeffding(kernels):
@@ -89,6 +105,39 @@ def null_covariance(kernels):
     g = t.shape[1]
     flat = t.reshape(len(t), -1)
     return 2 * (flat @ flat.T) / (g * (g - 1)) ** 2
+
+
+def signflip_sf(kernel, flips=FLIPS, seed=None):
+    """Upper-tail sign-flip p-value of the off-diagonal sum of a symmetric G x G kernel.
+
+    Returns (p, flips used, null skewness). p = (exceedances + 1) / (flips + 1).
+    The default seed is a checksum of the kernel, so equal inputs give equal p.
+    """
+    t = np.asarray(kernel, dtype=np.float64)
+    t = (t + t.T) / 2
+    np.fill_diagonal(t, 0.)
+    obs = t.sum()
+    nu = np.linalg.eigvalsh(t)
+    power = np.sum(nu ** 2)
+    if not np.isfinite(obs) or power <= 0:
+        return np.nan, 0, np.nan
+    skew = float(2 * np.sqrt(2) * np.sum(nu ** 3) / power ** 1.5)
+    rng = np.random.default_rng(zlib.crc32(t.tobytes()) if seed is None else seed)
+    first, most, refine = flips
+
+    def tail(count):
+        hits, done = 0, 0
+        while done < count:
+            m = min(100_000, count - done)
+            e = rng.integers(0, 2, size=(m, len(t))).astype(np.float64) * 2 - 1
+            hits += int(np.sum(np.einsum('ij,ij->i', e @ t, e) >= obs * (1 - 1e-12)))
+            done += m
+        return (hits + 1) / (count + 1)
+
+    p, used = tail(first), first
+    if p < refine and most > first:
+        p, used = tail(most), most
+    return float(p), used, skew
 
 
 def _kernel(raw, weight):
@@ -156,14 +205,17 @@ def pattern_statistics(theta, annotations, weights):
     return out
 
 
-def _family(raw, between, weights, block_weights, function, annotation_weights, annotation_blocks):
+def _family(raw, between, weights, block_weights, function, annotation_weights, annotation_blocks, flips=FLIPS):
     """Estimates with Hoeffding (delta method) and SNP-block jackknife SEs.
 
     raw: (m, G, G) unnormalized kernels; between: (m, n_blocks) between-group
     sums; weights: (m,) background weight of each kernel; block_weights:
     (m, n_blocks). function(theta, annotation_weights) gives the statistics;
     annotation_weights: (A,) and annotation_blocks: (A, n_blocks), so that each
-    delete-one-block estimate uses its own complement weights.
+    delete-one-block estimate uses its own complement weights. Values are
+    (estimate, se_hoeffding, se_jackknife, se_null, p_signflip, flips); the last two
+    are set for dosage-type statistics when flips is not None (relative_dosage
+    takes the p of its dosage statistic, which tests the same null).
     """
     kernels = np.stack([_kernel(r, w) for r, w in zip(raw, weights)])
     theta, cov = hoeffding(kernels)
@@ -190,7 +242,15 @@ def _family(raw, between, weights, block_weights, function, annotation_weights, 
         if key.split('[')[0] in DEGENERATE:
             var0 = float(grads[key] @ cov0 @ grads[key])
             se_0 = np.sqrt(var0) if np.isfinite(var0) and var0 > 0 else np.nan
-        result[key] = (float(value), float(se_u), float(se_s), float(se_0))
+        p_flip, used = np.nan, 0
+        if flips is not None and key.split('[')[0] in LINEAR and np.isfinite(value):
+            p_flip, used, _ = signflip_sf(np.tensordot(grads[key], kernels, axes=1), flips)
+        result[key] = (float(value), float(se_u), float(se_s), float(se_0), p_flip, used)
+    for key in result:
+        if key.split('[')[0] == 'relative_dosage':
+            source = result.get(key.replace('relative_dosage', 'dosage', 1))
+            if source is not None:
+                result[key] = result[key][:4] + source[4:]
     return result
 
 
@@ -198,8 +258,10 @@ def _null(name):
     return NULLS[name.split('[')[0]]
 
 
-def _record(base, statistic, value, se_u, se_s, se_0):
-    """The test uses se_0 (null-restricted) for degenerate statistics, else the max-SE rule."""
+def _record(base, statistic, value, se_u, se_s, se_0, p_flip=np.nan, flips=0):
+    """The test uses se_0 (null-restricted) for degenerate statistics, else the max-SE rule.
+
+    p is the sign-flip p-value when one was computed, else the normal tail of z."""
     if statistic.split('[')[0] in DEGENERATE:
         se, rule = se_0, 'null_restricted'
     else:
@@ -208,16 +270,21 @@ def _record(base, statistic, value, se_u, se_s, se_0):
     null = _null(statistic)
     z = (value - null) / se if np.isfinite(se) and se > 0 else np.nan
     one_sided = statistic.split('[')[0] in ONE_SIDED
-    p = (norm.sf(z) if one_sided else 2 * norm.sf(abs(z))) if np.isfinite(z) else np.nan
+    p_normal = (norm.sf(z) if one_sided else 2 * norm.sf(abs(z))) if np.isfinite(z) else np.nan
+    p = p_flip if np.isfinite(p_flip) else p_normal
     zu = (value - null) / se_u if np.isfinite(se_u) and se_u > 0 else np.nan
     zs = (value - null) / se_s if np.isfinite(se_s) and se_s > 0 else np.nan
     return dict(base, statistic=statistic, estimate=value, null=null, se_hoeffding=se_u, se_jackknife=se_s,
-                se_null=se_0, se=se, se_rule=rule, z=z, z_hoeffding=zu, z_jackknife=zs, p=p,
+                se_null=se_0, se=se, se_rule=rule, z=z, z_hoeffding=zu, z_jackknife=zs, p=p, p_normal=p_normal,
+                p_method='signflip' if np.isfinite(p_flip) else 'normal', flips=int(flips),
                 sided='upper' if one_sided else 'two')
 
 
-def summarize(plan, accumulation):
+def summarize(plan, accumulation, flips=FLIPS):
     """One record per analysis, scale and statistic.
+
+    flips: (first, most, refine) for the sign-flip p-values of dosage-type
+    statistics, or None for normal-tail p-values only.
 
     Analyses with an empty background are omitted. An annotation with no kept
     weight for an analysis (for example one confined to the context's own
@@ -259,7 +326,7 @@ def summarize(plan, accumulation):
                 ww, bb = np.r_[w, w], np.concatenate([blocks, blocks])
                 ratio = plan.analyses[a].get('global_ratio', {}).get(scale)
             stats = _family(raw, between, ww, bb, lambda t, aw, s=sub, r=ratio: dosage_statistics(t, s, aw, r),
-                            w, blocks)
+                            w, blocks, flips)
             records += [_record(base(a, scale), k, *v) for k, v in stats.items()]
     if 'll' in accumulation.kernels:
         for p, (a, scale) in enumerate(plan.keys['lo']):
@@ -272,6 +339,7 @@ def summarize(plan, accumulation):
             raw = np.stack([accumulation.kernels[k][i, p] for i in sel for k in ('ll', 'hh', 'lh')])
             between = np.stack([accumulation.between[k][i, p] for i in sel for k in ('ll', 'hh', 'lh')])
             ww, bb = np.repeat(w, 3), np.repeat(blocks, 3, axis=0)
-            stats = _family(raw, between, ww, bb, lambda t, aw, s=sub: pattern_statistics(t, s, aw), w, blocks)
+            stats = _family(raw, between, ww, bb, lambda t, aw, s=sub: pattern_statistics(t, s, aw), w, blocks,
+                            flips)
             records += [_record(base(a, scale), k, *v) for k, v in stats.items()]
     return records

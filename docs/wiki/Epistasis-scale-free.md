@@ -91,6 +91,21 @@ max-SE z for `rho` was nominal in every null scenario we simulated.
 `relative_dosage` uses the null-restricted SE, like `dosage`. G = 200 is the
 qualified default.
 
+**p-values of the dosage-type tests come from sign flips** (`"null_p":
+"signflip"`, default). Under the null the score vectors of different groups
+are independent with mean zero and, as sums over about n/G people, symmetric,
+so θ(ε) = Σ_{a≠b} ε_a ε_b T_ab / (G(G − 1)) with random signs ε has the null
+distribution of θ̂ given the scores. Its variance is the null-restricted
+variance, but the distribution is skewed, with skewness
+2√2 Σν³ / (Σν²)^{3/2} over the eigenvalues ν of T. Over all trans variants
+the skewness is about 0.02 and the normal tail is accurate. For an annotation
+set confined to a few hundred loci it is 0.1-0.3 in UK Biobank, and near z = 4
+the normal tail was 3-20 times too small (for example normal p 3.0e-5 against
+sign-flip p 1.0e-4). The flips are adaptive (20,000, then 2,000,000 when
+p < 0.002) and seeded from the kernel, so results are reproducible. `p_normal`
+keeps the normal-tail value and `p_method` says which one `p` is; z is
+unchanged. `"null_p": "normal"` skips the flips.
+
 The background excludes the chromosome of a variant context and the
 chromosomes listed for a file context (validated against the genotype
 source). U-statistics need the context to be independent of the background
@@ -157,7 +172,9 @@ and 448,562 array SNPs:
   cholesterol, bilirubin, Lp(a), testosterone and platelet count): z mean
   +0.023, SD 0.999, 5.3% below p = 0.05, 60 below 0.01 (64 expected) and 9 below
   0.001 (6.4 expected). The full Hoeffding SE gave a maximum z of 4.6; the
-  null-restricted SE 3.6.
+  null-restricted SE 3.6. These are dosage tests over the whole trans
+  background, where the sign-flip and normal p-values agree; annotation-set
+  tests need the sign-flip p-values (see above).
 - **Power.** Simulated phenotypes on the same genotypes follow
   z = κ² σ²_γ n √τ₂ / (√2 v), with σ²_γ FAME's interaction variance and κ ≤ 1
   a within-class standardization factor (κ² ≈ 0.82-0.99), to within 4%. At the
@@ -234,7 +251,9 @@ groups and seed, and concatenate their `results.tsv`.
 - **Other keys:** `additive_scales` adds the plain residual column (for
   `additive`, `relative_dosage` and `global_excess`); `genotype_scale`
   `"empirical"` (default) or `"hwe"` standardizes background genotypes with
-  observed or Hardy-Weinberg variances; `save_kernels` keeps the kernels.
+  observed or Hardy-Weinberg variances; `save_kernels` keeps the kernels;
+  `null_p` `"signflip"` (default) or `"normal"` chooses the p-values of the
+  dosage-type tests.
 
 Run with explicit threads and memory:
 
@@ -246,7 +265,7 @@ Outputs:
 
 | File | Contents |
 |---|---|
-| `results.tsv` | one row per analysis, scale and statistic: estimate, Hoeffding, jackknife and null-restricted SEs, the test SE (`se_rule` null_restricted or max), z and p |
+| `results.tsv` | one row per analysis, scale and statistic: estimate, Hoeffding, jackknife and null-restricted SEs, the test SE (`se_rule` null_restricted or max), z, p (sign-flip for dosage-type tests, `p_method`), `p_normal` and the number of flips |
 | `run.json` | manifest, contexts, class sizes, covariate slopes, genotype source and scale identities, timings, checksum repairs |
 | `kernels.npz` | optional (`"save_kernels": true`): G × G kernels and jackknife sums, for recomputing statistics without genotypes |
 
@@ -289,3 +308,5 @@ test and 1.07-1.08 (tails nominal) for the relative test.
    implicated pairs with the stratified and background-relative tests.
 3. Report intervals from the Hoeffding or jackknife SE; the null-restricted SE
    is for testing.
+4. Use the sign-flip p-values (the default) for thresholds, in particular for
+   annotation-set statistics such as `dosage[A]`.
