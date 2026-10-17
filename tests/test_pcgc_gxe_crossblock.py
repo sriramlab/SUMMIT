@@ -240,11 +240,9 @@ def test_artifacts_round_trip_cross_block_moments(tmp_path):
         GxEArtifact(replace(moments, crossblock_moments=tampered), artifact.manifest)
 
 
-def test_cli_default_block_count_follows_the_binary_jackknife_default():
+def test_cli_block_count_is_opt_in():
     from summit.pcgc.gxe_cli import crossblock_block_count
-    assert crossblock_block_count(None, 10_000) == 200
-    assert crossblock_block_count(None, 128) == 128
-    assert crossblock_block_count(None, 1) == 0
+    assert crossblock_block_count(None, 10_000) == 0 and crossblock_block_count(None, 1) == 0
     assert crossblock_block_count(0, 10_000) == 0 and crossblock_block_count(64, 10_000) == 64
     for bad in (1, -3, 10_001):
         with pytest.raises(ValueError):
@@ -267,9 +265,14 @@ def test_cli_prepares_cross_block_moments_and_fits_matching_blocks(tmp_path):
             "--binary-scale", str(tmp_path/"scale.tsv"), "--binary-prevalence", ".1", "--binary-context-columns", "E",
             "--binary-covariates", "AGE", "--binary-unit-liability", "--nvecs", "64", "--seed", "8", "--block-size", "37",
             "--memory-gib", "1", "--num-threads", str(prediction_threads())]
-    # The correction is on by default, with the fit's default block count
-    # capped at the SNP count (128 here).
-    assert main([*base, "--out", str(tmp_path/"default")]) == 0
+    # The correction is opt-in.
+    assert main([*base, "--out", str(tmp_path/"plain")]) == 0
+    assert load_split_artifact(*output_paths(tmp_path/"plain")).moments.crossblock_moments is None
+    assert main(["--binary-method", "pcgc", "--h2", str(output_paths(tmp_path/"plain")[0]), "--ldscores",
+                 str(output_paths(tmp_path/"plain")[1]), "--njack", "8", "--out", str(tmp_path/"plain_fit")]) == 0
+    plain = json.loads((tmp_path/"plain_fit.binary.json").read_text())
+    assert plain["uncertainty_calibration_status"].startswith("not_calibrated") and "crossblock_status" not in plain
+    assert main([*base, "--binary-crossblock-blocks", "128", "--out", str(tmp_path/"default")]) == 0
     artifact = load_split_artifact(*output_paths(tmp_path/"default"))
     assert artifact.moments.crossblock_moments.block_count == 128 and artifact.moments.crossblock_moments.has_nuisance
     assert main(["--binary-method", "pcgc", "--h2", str(output_paths(tmp_path/"default")[0]), "--ldscores",

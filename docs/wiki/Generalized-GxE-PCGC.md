@@ -71,9 +71,9 @@ summit --binary-method pcgc \
   --out results/disease_gxe
 ```
 
-Preparation also records the participant rows for the standard-error
-correction described under [Standard errors](#standard-errors), for the
-binary default of 200 jackknife blocks; fit without `--njack` to use them.
+For very large N/M, `--binary-crossblock-blocks 200` also records the
+participant rows for the optional standard-error correction described under
+[Standard errors](#standard-errors).
 
 Preparation writes two NumPy archives:
 
@@ -185,8 +185,8 @@ requires the corresponding context-specific liability variance.
 
 ### Standard errors
 
-Fits report SNP-block jackknife SEs plus, by default, a correction for
-covariance that the jackknife cannot see. The jackknife treats SNP blocks as
+Fits report SNP-block jackknife SEs. An optional correction adds covariance
+that the jackknife cannot see. The jackknife treats SNP blocks as
 independent. That holds for SNP effects and LD, but every block's estimating
 equation is a sum over the same participants. Several participant-level
 terms make block equations covary:
@@ -198,12 +198,14 @@ terms make block equations covary:
   cases and within controls;
 - risk and context weights shared by all blocks.
 
-Their share grows with the signal in the data (roughly ĥ·N/M). With the
-jackknife alone, a simulated rare disease (K = 0.02, N = 32,768, M = 1,024)
-had 82% coverage for a null additive-by-context covariance. Near K = 0.5 the
-jackknife was slightly conservative for that component.
+Their share grows with N/M. With the jackknife alone, a simulated rare disease
+(K = 0.02, h² = 0.36) had 82% coverage for a null additive-by-context covariance
+at N/M = 32, and its variance ratio was 0.65 at N/M = 8 and 0.83 at N/M = 2.
+At array scale the jackknife was calibrated: at N/M = 0.75 with Gaussian
+genotypes (four designs) and on real UK Biobank genotypes (N = 337,845,
+M = 448,562). Near K = 0.5 the jackknife was slightly conservative.
 
-Preparation records each participant's
+With `--binary-crossblock-blocks`, preparation records each participant's
 contribution to each SNP block's estimating equation, in the first genotype
 pass. The fit adds the covariance between different blocks' contributions
 from the same participants. The within-block part is already in the
@@ -220,14 +222,17 @@ variance components (diagonal Ω entries) was still 90.8–94% in some designs
 (small M relative to N, 32 blocks, the rare-disease intercept): the estimate
 and its SE are skewed together, which affects any normal interval, including
 the jackknife's where its variance is right. The corrected result is labelled
-`variance_calibrated_in_simulation_wald_coverage_can_be_below_nominal`. It is
-the default since 15 October 2026; `--binary-crossblock-blocks 0` turns it
-off. Like the jackknife, it requires blocks larger than local LD.
+`variance_calibrated_in_simulation_wald_coverage_can_be_below_nominal`.
+At array scale the correction did not help. At N/M = 0.75 it never improved
+coverage and sometimes made it worse by adding noise to the SE. On real
+genotypes at N = 337,845 it inflated the null covariance's variance by about 22%,
+where the jackknife was already right. It is therefore
+opt-in, for analyses with large N/M (about 8 or more). Like the jackknife, it
+requires blocks larger than local LD.
 
-The correction needs the same SNP blocks at preparation and fit. By default
-preparation records rows for the binary default of 200 blocks (or one block
-per SNP when there are fewer SNPs); `--binary-crossblock-blocks N` chooses
-another count. Without `--njack`, the fit uses the prepared blocks. With a
+The correction needs the same SNP blocks at preparation and fit. Set
+`--binary-crossblock-blocks` to the intended jackknife block count, usually
+the binary default of 200. Without `--njack`, the fit uses the prepared blocks. With a
 different `--njack`, the fit reports the jackknife alone and says so. In the Python API, pass `crossblock_blocks` (and `risk_covariates`
 for fitted risks) to `prepare_gxe_moments` and fit with the same `block_ids`.
 

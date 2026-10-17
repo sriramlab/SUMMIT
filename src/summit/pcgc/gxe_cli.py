@@ -26,9 +26,9 @@ def add_arguments(group):
     group.add_argument("--binary-architecture-probes",type=int,default=0,
         help="Experimental Gaussian SNP-effect uncertainty: variant probes per family (>=2), with individual-sampling SEs.")
     group.add_argument("--binary-crossblock-blocks",type=int,default=None,
-        help="Participant-level correction to the SNP-block jackknife: record rows for this many SNP blocks "
-             "(default: the fit's default of 200, or the SNP count if smaller); the fit then adds "
-             "between-block participant covariance. 0: off (jackknife only, labelled not calibrated).")
+        help="Opt-in participant-level correction to the SNP-block jackknife, for large N/M (about 8 or more): "
+             "record rows for this many SNP blocks (use the fit's --njack, default 200); the fit then adds "
+             "between-block participant covariance. 0 or omitted: off.")
 
 
 def crossblock_block_count(requested, num_variants):

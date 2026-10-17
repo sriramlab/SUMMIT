@@ -34,7 +34,22 @@ variance is unbiased. Main's experimental sampling SEs were also evaluated:
 without architecture probes they are far too small for Ω; with them they
 behaved like the new estimator at N = 8,192 but cost minutes per replicate.
 
-**Update, 15 October 2026.** The correction is now the CLI default for binary G×E
+**Update, 17 October 2026: opt-in again.** Simulations at realistic N/M reversed the
+15 October decision.
+- On real UK Biobank genotypes (EUR_338k, M = 448,562, 200 blocks, K = 0.02,
+  h = 0.36, 500 replicates), the jackknife alone was calibrated at N = 337,845. Its variance
+  ratios were 1.01, 1.12 and 1.02, and its null type-I error was 4.0%.
+- In the same runs the correction inflated the null covariance's variance by 22%: ratio
+  1.25 ± 0.09, E[z²] 0.80.
+- With Gaussian genotypes at N/M = 0.75, in four designs (base, risk slope 0.6, fitted risks,
+  Q = 3), the jackknife was calibrated or mildly anti-conservative, with ratios 0.84–1.06.
+  The correction never improved coverage, and its E[z²] reached 1.68.
+- The jackknife's deficit appears as N/M grows: ratio 0.83 at N/M = 2, 0.65 at 8, and 0.5
+  at 32.
+- Outputs, drivers and notes are in `/data1/bronsonj/summit_pcgc_interval_shape_20261015/`
+  (`realscale/`, `gaussian/`, `PLAN_20261015.md`).
+
+**Update, 15 October 2026 (superseded).** The correction was made the CLI default for binary G×E
 PCGC (`--binary-crossblock-blocks 0` turns it off). Bronson judged the rule below
 too stringent: the corrected variance is reasonably calibrated (ratio 0.89–1.14,
 null type-I 4–7%), while the jackknife alone reaches 17–19% type-I error. The
