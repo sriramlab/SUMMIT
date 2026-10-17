@@ -270,7 +270,7 @@ def fit_gxe(moments, *, block_ids=None,native=True,threads=None):
         covariance = _jackknife_covariance(np.asarray(replicates))
         se = np.sqrt(np.maximum(0., covariance.diagonal()))
         variance_se = float(np.sqrt(max(0., contrast@covariance@contrast)))
-        from .crossblock import JACKKNIFE_STATUS
+        from .crossblock import JACKKNIFE_STATUS, JACKKNIFE_NOTE
         result.update(uncertainty_status="estimated", covariance=covariance.tolist(),
                       standard_errors=se.tolist(), omega_standard_errors=_omega(se, q).tolist(),
                       population_genetic_variance_se=variance_se,
@@ -282,6 +282,7 @@ def fit_gxe(moments, *, block_ids=None,native=True,threads=None):
                       uncertainty_conditioning="fixed_risks_liability_sd_population_metric_genotype_scale_reference_probes",
                       external_reference_uncertainty_included=False,
                       uncertainty_method=FROZEN_JACKKNIFE, uncertainty_calibration_status=JACKKNIFE_STATUS,
+                      uncertainty_calibration_note=JACKKNIFE_NOTE,
                       snp_block_covariance=covariance.tolist(), snp_block_standard_errors=se.tolist(),
                       snp_block_population_heritability_se=variance_se/denominator)
         crossblock = moments.crossblock_moments

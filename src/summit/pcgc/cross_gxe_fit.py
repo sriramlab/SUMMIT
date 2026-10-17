@@ -4,10 +4,9 @@ import numpy as np
 from summit.ldscore.generalized_gxe_pass1 import _peak_rss_bytes
 from summit.context.annotations import _jackknife_covariance
 from summit.ldscore.generalized_gxe_reference_v1 import reduce_generalized_gxe_reference_for_inference
-from .cross_gxe_model import RARE_PREVALENCE
 from .moments import solve
 
-CALIBRATION_SCHEMA = "summit.pcgc.cross_interval_calibration.v1"
+CALIBRATION_SCHEMA = "summit.pcgc.cross_interval_calibration.v2"
 # Rare outcomes or h N / M at or above one: the regimes in which the
 # independent review and the original calibration found within-trait binary
 # SNP-block variance deficits (h is the sample liability genetic variance).
@@ -83,11 +82,12 @@ def calibration_status(moments, pairs, *, modeled_pairs=()):
     heteroscedasticity, delta ~ (eta^2-1)/2 at eta = Phi^-1(K)). This
     correlates the signal-by-noise parts of the estimating function across
     SNP blocks, Cov(u_b, u_b') ~ 2 delta h_b h_b'. The delete-block jackknife
-    assumes independent blocks and omits that covariance, which is positive
-    (anticonservative intervals) for K < Phi(-1) and grows with h N / M.
-    Within-trait binary components are therefore marked uncalibrated for rare
-    outcomes or h N / M >= 1, and when supplied risks were kept under
-    own-case-status sampling. Contrasts that use them inherit the flag.
+    assumes independent blocks and omits that covariance, which grows with N / M.
+    Simulations at array scale (N/M <= 1, including real UK Biobank genotypes,
+    K = 0.02) found the jackknife calibrated, so a rare outcome alone is not
+    flagged (schema v2). Within-trait binary components are marked uncalibrated
+    when h N / M >= 1, and when supplied risks were kept under own-case-status
+    sampling. Contrasts that use them inherit the flag.
     modeled_pairs lists within-trait pairs whose omitted covariance a supplied
     participant-level term models (see fit_cross_gxe).
     """
@@ -107,8 +107,6 @@ def calibration_status(moments, pairs, *, modeled_pairs=()):
                 np.asarray(pairs[key]["omega_total"])*np.asarray(second, dtype=float))))
             ratio = None if h is None else h*meta["sample_size"]/variants
             triggers = []
-            if prevalence is None or prevalence < RARE_PREVALENCE:
-                triggers.append("rare_outcome")
             if ratio is None or ratio >= LARGE_SIGNAL_RATIO:
                 triggers.append("large_h_N_over_M")
             entry.update(reference_prevalence=prevalence, sample_liability_genetic_variance=h,
@@ -128,7 +126,7 @@ def calibration_status(moments, pairs, *, modeled_pairs=()):
             components[begin:end] = ["uncalibrated"]*(end-begin)
         by_pair[key] = entry
     return dict(schema=CALIBRATION_SCHEMA, components=components, pairs=by_pair,
-                rare_prevalence_threshold=RARE_PREVALENCE, large_h_N_over_M_threshold=LARGE_SIGNAL_RATIO,
+                large_h_N_over_M_threshold=LARGE_SIGNAL_RATIO,
                 scope=("flags known interval deficits only; not_flagged does not establish calibration "
                        "outside the validated settings"))
 

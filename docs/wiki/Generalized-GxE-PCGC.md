@@ -253,8 +253,8 @@ Output fields:
 | `uncertainty_calibration_status` | Calibration status of the primary result |
 | `crossblock_status` | `applied`, or why the correction was not applied |
 
-A jackknife-only result is labelled
-`not_calibrated_snp_block_jackknife_omits_between_block_person_covariance`.
+A jackknife-only result is labelled `calibrated_in_simulation_for_N_over_M_up_to_1`,
+with a note on its validated scope.
 In very small samples the between-block estimate can be noisy enough to give
 a nonpositive variance; the fit then keeps the jackknife and reports
 `not_applied_nonpositive_calibrated_variance`.

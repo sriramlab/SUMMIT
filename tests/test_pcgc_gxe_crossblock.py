@@ -7,7 +7,7 @@ from scipy.special import ndtr, ndtri
 
 from summit.pcgc.crossblock import (
     CrossBlockAccumulator, CrossBlockMoments, canonical_blocks, context_pair_sums,
-    contiguous_blocks, crossblock_covariance, _center, METHOD,
+    contiguous_blocks, crossblock_covariance, _center, METHOD, JACKKNIFE_STATUS, JACKKNIFE_NOTE,
 )
 from summit.pcgc.gxe import context_pairs, fit_gxe, prepare_gxe_moments
 from summit.sumstats.binary import fit_binary_risk, prepare_binary_risk
@@ -271,7 +271,8 @@ def test_cli_prepares_cross_block_moments_and_fits_matching_blocks(tmp_path):
     assert main(["--binary-method", "pcgc", "--h2", str(output_paths(tmp_path/"plain")[0]), "--ldscores",
                  str(output_paths(tmp_path/"plain")[1]), "--njack", "8", "--out", str(tmp_path/"plain_fit")]) == 0
     plain = json.loads((tmp_path/"plain_fit.binary.json").read_text())
-    assert plain["uncertainty_calibration_status"].startswith("not_calibrated") and "crossblock_status" not in plain
+    assert plain["uncertainty_calibration_status"] == JACKKNIFE_STATUS and "crossblock_status" not in plain
+    assert plain["uncertainty_calibration_note"] == JACKKNIFE_NOTE
     assert main([*base, "--binary-crossblock-blocks", "128", "--out", str(tmp_path/"default")]) == 0
     artifact = load_split_artifact(*output_paths(tmp_path/"default"))
     assert artifact.moments.crossblock_moments.block_count == 128 and artifact.moments.crossblock_moments.has_nuisance
@@ -296,7 +297,7 @@ def test_cli_prepares_cross_block_moments_and_fits_matching_blocks(tmp_path):
     assert main(["--binary-method", "pcgc", "--h2", str(output_paths(tmp_path/"off")[0]), "--ldscores",
                  str(output_paths(tmp_path/"off")[1]), "--njack", "8", "--out", str(tmp_path/"off_fit")]) == 0
     off = json.loads((tmp_path/"off_fit.binary.json").read_text())
-    assert off["uncertainty_calibration_status"].startswith("not_calibrated") and "crossblock_status" not in off
+    assert off["uncertainty_calibration_status"] == JACKKNIFE_STATUS and "crossblock_status" not in off
     with pytest.raises(SystemExit):
         main([*base, "--binary-crossblock-blocks", "1", "--out", str(tmp_path/"bad")])
     assert not output_paths(tmp_path/"bad")[0].exists()

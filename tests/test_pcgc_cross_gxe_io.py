@@ -169,5 +169,6 @@ def test_manifest_case_status_risks_and_fit_calibration_flags(tmp_path):
         assert [i["calibration"]["status"] for i in result["component_intervals"]]==result["component_calibration"]
     assert "supplied_risks_under_case_status_sampling" in flags["kept"]["reasons"]
     assert "supplied_risks_under_case_status_sampling" not in flags["fitted"]["reasons"]
-    # Prevalence 0.05 is rare: the heteroscedasticity flag remains for fitted risks.
-    assert flags["fitted"]["status"]=="uncalibrated" and "rare_outcome" in flags["fitted"]["heteroscedasticity_triggers"]
+    # A rare outcome (prevalence 0.05) alone is no longer flagged; the screen keys on h N / M.
+    assert "rare_outcome" not in flags["fitted"]["heteroscedasticity_triggers"]
+    assert (flags["fitted"]["status"]=="uncalibrated")==(flags["fitted"]["h_N_over_M"]>=1)

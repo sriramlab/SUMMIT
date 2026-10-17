@@ -426,7 +426,12 @@ def calibrated_covariance(moments, theta, normal, block_directed, block_count):
 
 # Status labels written to every binary G x E fit with uncertainty. See
 # reports/pcgc_development/pcgc_gxe_binary_intervals.md for the grid behind them.
-JACKKNIFE_STATUS = "not_calibrated_snp_block_jackknife_omits_between_block_person_covariance"
+JACKKNIFE_STATUS = "calibrated_in_simulation_for_N_over_M_up_to_1"
+JACKKNIFE_NOTE = (
+    "SNP-block jackknife. Calibrated in simulations at array scale (N/M <= 1, including real UK "
+    "Biobank genotypes with 448,562 SNPs at N = 337,845). It omits covariance between blocks "
+    "through shared participants, which matters only when N/M is large (about 8 or more); "
+    "--binary-crossblock-blocks adds it. See reports/pcgc_development/pcgc_gxe_binary_intervals.md.")
 CALIBRATION_STATUS = "variance_calibrated_in_simulation_wald_coverage_can_be_below_nominal"
 CALIBRATION_NOTE = (
     "Opt-in correction for large N/M. With N/M = 8-128 in simulation the variance ratio was "

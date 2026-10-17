@@ -537,7 +537,9 @@ Code is in `src/summit/pcgc/crossblock.py`, with hooks in `gxe.py`,
   terms; `uncertainty_method`, `uncertainty_calibration_status`,
   `uncertainty_calibration_note` and `crossblock_status` state what was done.
   Every jackknife-only binary G×E result is labelled
-  `not_calibrated_snp_block_jackknife_omits_between_block_person_covariance`.
+  `not_calibrated_snp_block_jackknife_omits_between_block_person_covariance` (until
+  17 October 2026; since then `calibrated_in_simulation_for_N_over_M_up_to_1`, see the
+  update at the top).
   If main's experimental sampling moments are also present, the cross-block
   result stays primary and the sampling result moves to `individual_sampling`;
   without the cross-block statistics the sampling path behaves as before.

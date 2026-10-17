@@ -660,7 +660,8 @@ def _known_fit(kind="bq", **options):
 
 
 def test_within_trait_binary_calibration_flags_and_inheritance():
-    from summit.pcgc.cross_gxe_fit import derived_covariance,RARE_PREVALENCE
+    from summit.pcgc.cross_gxe_fit import derived_covariance
+    from summit.pcgc.cross_gxe_model import RARE_PREVALENCE
     moments,fit=_known_fit("bq")
     meta=moments.traits[0]["metadata"]
     assert meta["reference_prevalence"]>RARE_PREVALENCE
@@ -670,10 +671,13 @@ def test_within_trait_binary_calibration_flags_and_inheritance():
     assert common["calibration"]["pairs"]["1:1"]["status"]=="not_flagged"
     assert common["calibration"]["pairs"]["0:1"]["notes"]
     assert set(common["component_calibration"])=={"not_flagged"}
+    # A rare outcome alone is not flagged (calibrated at array scale); strong per-SNP signal is.
     meta["reference_prevalence"]=.02
+    assert fit(moments)["calibration"]["pairs"]["0:0"]["status"]=="not_flagged"
+    meta["sample_size"]=int(np.ceil(1.5*len(moments.annotations)/entry["sample_liability_genetic_variance"]))
     rare=fit(moments)
     entry=rare["calibration"]["pairs"]["0:0"]
-    assert entry["status"]=="uncalibrated" and entry["heteroscedasticity_triggers"]==["rare_outcome"]
+    assert entry["status"]=="uncalibrated" and entry["heteroscedasticity_triggers"]==["large_h_N_over_M"]
     begin,end=rare["pairs"]["0:0"]["coefficient_slice"]
     assert rare["component_calibration"][begin:end]==["uncalibrated"]*(end-begin)
     assert all(rare["component_calibration"][i]=="not_flagged" for i in range(len(rare["components"]))

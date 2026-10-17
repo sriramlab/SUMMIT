@@ -10,7 +10,7 @@ been tested with repeated simulations that vary sample size, SNP count and
 block count separately. Inference remains experimental outside the validated
 settings below, especially with rare outcomes, fitted nuisance models or
 weak genetic-variance denominators. Within-trait binary intervals are
-anti-conservative for rare outcomes or strong per-SNP signal; the fit marks
+anti-conservative when the per-SNP signal is strong (ĥ·N/M ≥ 1); the fit marks
 them uncalibrated (see [Uncertainty](#uncertainty-and-validation-limits)).
 Validation used at most 8,192 SNPs and 32,768 participants per trait; the
 genome-wide array regime has not been simulated.
@@ -302,7 +302,9 @@ changes with that liability, by approximately δ = (η² − 1)/2 at
 function across SNP blocks, Cov(u_b, u_b′) ∝ 2δ h_b h_b′. The delete-block
 jackknife assumes independent blocks and omits this covariance, which is
 positive, making intervals too narrow, when K < Φ(−1) ≈ 0.16, and grows with
-h·N/M. Drift in the realized liability variance does not explain the
+N/M. At array scale it is negligible: in simulations on real UK Biobank
+genotypes (N = 337,845, M = 448,562, K = 0.02) the single-trait jackknife was
+calibrated. Drift in the realized liability variance does not explain the
 deficit: once that drift was removed, the predicted variance ratio (0.47)
 matched the observed one (0.49). In a quantitative control, genotype-dependent
 residual variance alone lowered the variance ratio of a null within-trait
@@ -319,8 +321,8 @@ variance ratios 0.87–0.95. The single-trait
 within-trait estimator and SNP-block intervals.
 
 The fit output therefore includes `calibration` and `component_calibration`.
-Within-trait binary components are marked `uncalibrated` when the trait's
-reference prevalence is below Φ(−1) or ĥ·N/M ≥ 1. Here ĥ is the sample
+Within-trait binary components are marked `uncalibrated` when ĥ·N/M ≥ 1
+(schema v2; v1 also flagged every outcome with prevalence below Φ(−1)). Here ĥ is the sample
 liability genetic variance implied by the fitted Ω and the mean context
 second moment, N is that trait's sample size and M the number of SNPs. With
 LD, M overstates the number of independent SNPs, so this screen is
