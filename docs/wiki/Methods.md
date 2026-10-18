@@ -259,6 +259,79 @@ method. It estimates aggregate kernel actions and stores grouped numerators;
 its summary deletion is approximate. Its finite-probe outputs and deletion
 procedure are not interchangeable with the per-variant estimator above.
 
+### Between-block signal covariance
+
+The delete-one-block jackknife treats the genetic moments of different SNP
+blocks as independent. For a quantitative trait they are not. The phenotype
+contains the genetic value of every block, so the moment of block `b`,
+`y' H_u^b y`, contains products of block `b`'s realized genetic values with
+those of every other block `b'`. The product for a pair of blocks appears in
+the moments of both blocks; deleting block `b` removes only the copy carried by
+block `b`'s own kernel. Summed over blocks, these products form the
+participants' realized covariance between each context and their squared
+genetic value, `sum_i c_ik g_i^2`, which has the form of a G–G×E covariance.
+The jackknife therefore understates the variance of the G–G×E covariances
+(amplification). G×E variances are not affected to leading order, because the
+centered contexts cannot align a block's kernel with its own genetic values,
+and the effect on the additive variance is small relative to its LD
+fourth-moment variance.
+
+For the residual-profiled genetic moments, the between-block covariance is,
+to leading order,
+
+```text
+C[(a,u),(c,v)] = 4 sum_{b,d} G[a,b,c,d] sum_i w_u^(b)(i) w_v^(d)(i)
+G[a,b,c,d]     = sum_{x != y} abar_x[a,b] abar_y[c,d]
+w_qr^(a)(i)    = phi_iq z_r^(a)(i) + phi_ir z_q^(a)(i)   (q != r)
+w_qq^(a)(i)    = phi_iq z_q^(a)(i)
+z^(a)(i)       = phi_i' Omega^(a) Sigma_phi,   Sigma_phi = sum_i phi_i phi_i' / n
+```
+
+`abar_x[a,b] = (n - 1) ell_x[a,b] / (M_a M_b)` is block `x`'s different-person
+additive (intercept-pair) trace between annotations `a` and `b`, divided by the
+study size. `ell_x` are the per-block intercept LD scalars of the transport
+(`intercept_ld_scalars`), which already exclude each person paired with
+themselves. The sum over people `sum_i w w` is a contraction of the study's
+context fourth moments (`context_fourth_moments`) with `Omega Sigma_phi`. The
+corrected covariance of the coefficients is
+
+```text
+V = V_jk + B/(B-1) T^-1 [C 0; 0 0] T^-1
+```
+
+whose genetic block is `B/(B-1) S^-1 C S^-1`, with `S` the residual-profiled
+genetic information. With one annotation, centered contexts and
+`Omega = diag(omega_00, 0, ...)`, the added variance of the amplification
+`omega_0k/omega_00` reduces to `(1 - sum_x s_x^2) [Sigma_c^-1]_kk / n`, with
+`s_x` the block shares of the additive trace and `Sigma_c` the context
+covariance: it depends on neither M, LD nor heritability. The jackknife's own
+variance shrinks as heritability rises, so the shortfall grows with h2.
+
+Derived quantities use the delta method: the jackknife variance of the derived
+quantity over the deletion replicates plus `grad f' A grad f`, with `A` the
+added covariance. When several nested models are fitted to one trait, C is
+evaluated once at the estimate of the most general model, so the models share
+it, and a paired contrast between models subtracts twice their cross term
+`B/(B-1) T_a^-1 [C 0; 0 0] T_b^-1`.
+
+All inputs are person-summed aggregates that a fit already has (the LD scalars,
+annotation masses, normal matrix, coefficients and the study's context second
+and fourth moments), so the term needs no genotype pass and no extra
+parameter. It is the default (`standard_errors="crossblock"`) for
+`fit_generalized_gxe_variant_model_v1` and
+`fit_transferred_chromosome_models`; `standard_errors="jackknife"` keeps the
+jackknife alone. Fits record `uncertainty.method`
+(`snp_block_jackknife_plus_crossblock_signal_v1`) and `crossblock_status`.
+Trait summaries without context moments fall back to the jackknife with a
+`CrossBlockSignalUnavailableWarning`. In simulations on 448,562 array
+variants and 317,694 participants with nine correlated contexts, the jackknife
+z-scores of null amplification had a standard deviation of 1.065 (6.4%
+rejected at 5%), and 1.020 (5.4%) with the correction; at h2 = 0.45 the
+corrected ratio of the empirical standard deviation to the root-mean-square
+standard error was 1.00. The classic one-environment model, binary G×E PCGC
+(see [Generalized G×E PCGC](Generalized-GxE-PCGC.md)), h2, rg and cross-trait
+fits keep their existing uncertainty estimates.
+
 ### Classic one-environment transfer
 
 The one-environment G + G×E + N×E model (`--gxe-population-reference`) uses

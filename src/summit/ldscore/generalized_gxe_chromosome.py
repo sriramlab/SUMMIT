@@ -528,3 +528,210 @@ def own_row_transported_equations(reference_chromosomes, study_chromosomes, *, t
     """
     return transferred_chromosome_equations(reference_chromosomes, study_chromosomes,
         **transport.for_study(study_rows), **moments)
+
+
+@dataclass(frozen=True)
+class ChromosomeModelFit:
+    """One model fitted from transferred chromosome equations.
+
+    Coefficient vectors and covariances are on the full coefficient axis
+    (genetic components first, then residual components); entries outside
+    ``keep`` are zero. ``covariance`` is ``jackknife_covariance +
+    crossblock_covariance`` and ``standard_errors`` its square-root diagonal.
+    ``uncertainty`` records how it was formed
+    (summit.context.crossblock_signal).
+    """
+    name: str
+    keep: np.ndarray
+    component_index: ContextComponentIndex
+    coefficients: np.ndarray
+    loo_coefficients: np.ndarray
+    jackknife_covariance: np.ndarray
+    crossblock_covariance: np.ndarray
+    covariance: np.ndarray
+    standard_errors: np.ndarray
+    omegas: np.ndarray
+    normal_matrix: np.ndarray
+    normal_rhs: np.ndarray
+    annotation_masses: np.ndarray
+    block_ids: np.ndarray
+    same_person_transport: str | None
+    different_person_transport: str | None
+    uncertainty: dict
+    crossblock_inputs: object | None = None
+    # The between-block moment covariance C used for this fit (c x c), shared
+    # by all models of one call; None when the correction was not applied.
+    crossblock_moment_covariance: np.ndarray | None = None
+
+    def derived(self, function):
+        """Estimate, jackknife and between-block variance of ``function(omegas)``.
+
+        ``function`` maps the genome-wide K x Q x Q omega array to a scalar.
+        """
+        from summit.context.crossblock_signal import derived_variance
+        from summit.context.oracle import coefficients_to_omegas
+        c = len(self.component_index)
+        f = lambda theta: function(coefficients_to_omegas(theta[:c], self.component_index))
+        return derived_variance(f, self.coefficients, self.loo_coefficients,
+                                self.crossblock_covariance)
+
+
+def _chromosome_crossblock_inputs(reference, options, study_n, masses):
+    from summit.context.crossblock_signal import CrossBlockSignalInputs, block_traces_from_ld_scalars
+    second, fourth = options.get('study_second_moments'), options.get('study_fourth_moments')
+    if second is None or fourth is None:
+        return None, 'missing_study_context_moments'
+    intercepts = options.get('reference_same_person_intercepts')
+    if intercepts is None and all(x.same_person_intercept is not None for x in reference):
+        intercepts = {x.chromosome: x.same_person_intercept for x in reference}
+    if intercepts is None:
+        return None, 'missing_reference_same_person_intercepts'
+    lookup = {str(key): value for key, value in intercepts.items()}
+    scalars = np.concatenate([x.ld_scalars(lookup[x.chromosome]) for x in reference])
+    ids = np.concatenate([x.block_ids for x in reference])
+    traces = block_traces_from_ld_scalars(scalars, masses, study_n, block_ids=ids)
+    return CrossBlockSignalInputs(block_traces=traces, study_n=int(study_n),
+                                  study_second_moments=second, study_fourth_moments=fourth), 'applied'
+
+
+def fit_transferred_chromosome_models(
+    reference_chromosomes, study_chromosomes, *, models=None, transport=None,
+    study_rows=None, standard_errors=None, rtol=None, **options,
+):
+    """Fit one or more models with SNP-block jackknife standard errors.
+
+    Builds the full transferred system and one system per deleted jackknife
+    block once (:func:`transferred_chromosome_equations`), then solves every
+    model on them. ``models`` maps a name to the kept coefficient indices
+    (default ``{"full": all}``); a restricted model solves ``T[keep, keep]``.
+    With ``transport`` (:func:`prepare_chromosome_transport`) and
+    ``study_rows`` the own-row, composition-corrected terms are formed;
+    otherwise ``options`` carry the same-person and different-person inputs
+    and the reference/trait residual moments, as for
+    :func:`transferred_chromosome_equations`.
+
+    ``standard_errors="crossblock"`` (default) adds the between-block signal
+    covariance (summit.context.crossblock_signal) to the jackknife; it needs
+    the study's context second and fourth moments and the reference's raw
+    intercept same-person entries, both of which the composition-corrected
+    transport already uses. ``"jackknife"`` keeps the jackknife alone. The
+    moment covariance C is evaluated once, at the estimate of a model that
+    keeps every genetic component when there is one (otherwise at each
+    model's own estimate), so that the models of one trait share it and
+    paired contrasts (:func:`chromosome_paired_contrast`) are coherent.
+    Returns ``{name: ChromosomeModelFit}``.
+    """
+    import types
+    from summit.context.crossblock_signal import (
+        added_covariance_from_moments, crossblock_moment_covariance, resolve_standard_errors,
+        uncertainty_record, warn_unavailable)
+    from summit.context.fit import solve_context_normal_equations
+    from summit.context.oracle import coefficients_to_omegas
+    requested = resolve_standard_errors(standard_errors)
+    ref = tuple(reference_chromosomes)
+    study = tuple(study_chromosomes)
+    if transport is not None:
+        if study_rows is None:
+            raise ValueError('transport requires study_rows')
+        options = {**{k: v for k, v in options.items() if k != 'reference_same_person'},
+                   **transport.for_study(study_rows)}
+    elif study_rows is not None:
+        options = {**options, 'study_rows': study_rows}
+    blocks = np.unique(np.concatenate([x.block_ids for x in ref]))
+    systems = [transferred_chromosome_equations(ref, study, **options)]
+    systems += [transferred_chromosome_equations(ref, study, **options, deleted_blocks=(int(b),))
+                for b in blocks]
+    full = systems[0]
+    total = full.matrix.shape[0]
+    c = full.genetic_count
+    components = ContextComponentIndex(ref[0].annotation_names, ContextPairIndex(ref[0].num_basis))
+    if models is None:
+        models = {'full': np.arange(total)}
+    inputs, status = (None, 'not_requested')
+    if requested == 'crossblock':
+        inputs, status = _chromosome_crossblock_inputs(ref, options, full.study_n, full.annotation_masses)
+        if inputs is None:
+            status = warn_unavailable(status)
+    keeps = {}
+    for name, keep in models.items():
+        keep = np.sort(np.asarray(keep, dtype=np.int64))
+        if keep.ndim != 1 or len(np.unique(keep)) != len(keep) or np.any(keep < 0) or np.any(keep >= total):
+            raise ValueError(f'model {name}: keep must be unique coefficient indices')
+        keeps[name] = keep
+    general = next((name for name, keep in keeps.items() if np.all(np.isin(np.arange(c), keep))), None)
+    out = {}
+    for name in sorted(keeps, key=lambda n: n != general):
+        keep = keeps[name]
+        solutions = []
+        for system in systems:
+            ns = types.SimpleNamespace(matrix=system.matrix[np.ix_(keep, keep)], rhs=system.rhs[keep],
+                                       component_names=None, target_source=False)
+            solution = np.zeros(total)
+            solution[keep] = solve_context_normal_equations(ns, rtol=rtol, require_full_rank=True).coefficients
+            solutions.append(solution)
+        point, loo = solutions[0], np.array(solutions[1:])
+        centered = loo - loo.mean(axis=0)
+        jackknife = (len(loo) - 1.0) / len(loo) * centered.T @ centered
+        jackknife = 0.5 * (jackknife + jackknife.T)
+        added = np.zeros((total, total))
+        diagnostics = moment = None
+        if inputs is not None:
+            if general is not None:
+                source = f'model:{general}'
+                omegas = out[general].omegas if name != general else coefficients_to_omegas(point[:c], components)
+            else:
+                source = 'own'
+                theta = np.zeros(c); genetic = keep[keep < c]; theta[genetic] = point[genetic]
+                omegas = coefficients_to_omegas(theta, components)
+            moment, diagnostics = crossblock_moment_covariance(components, omegas, inputs)
+            diagnostics['omega_source'] = source
+            added[np.ix_(keep, keep)] = added_covariance_from_moments(
+                full.matrix, moment, c, inputs.block_count, keep=keep)
+        covariance = jackknife + added
+        out[name] = ChromosomeModelFit(
+            name=str(name), keep=keep, component_index=components, coefficients=point,
+            loo_coefficients=loo, jackknife_covariance=jackknife, crossblock_covariance=added,
+            covariance=covariance, standard_errors=np.sqrt(np.maximum(np.diag(covariance), 0.0)),
+            omegas=coefficients_to_omegas(point[:c], components), normal_matrix=full.matrix,
+            normal_rhs=full.rhs, annotation_masses=full.annotation_masses, block_ids=blocks,
+            same_person_transport=getattr(full, 'same_person_transport', None),
+            different_person_transport=getattr(full, 'different_person_transport', None),
+            uncertainty=uncertainty_record(requested, status, diagnostics), crossblock_inputs=inputs,
+            crossblock_moment_covariance=moment)
+    return {name: out[name] for name in keeps}
+
+
+def chromosome_paired_contrast(fit_a, function_a, fit_b, function_b):
+    """Variance of ``function_a(fit_a) - function_b(fit_b)`` for two models of one trait.
+
+    Both fits must come from one :func:`fit_transferred_chromosome_models`
+    call (same systems and deletions). The jackknife part uses the paired
+    deletions; the between-block part adds both models' terms and subtracts
+    twice their cross term (crossblock_signal.cross_model_crossblock_covariance).
+    """
+    from summit.context.crossblock_signal import added_covariance_from_moments, numerical_gradient
+    from summit.context.oracle import coefficients_to_omegas
+    if fit_a.loo_coefficients.shape != fit_b.loo_coefficients.shape or not np.array_equal(fit_a.block_ids, fit_b.block_ids):
+        raise ValueError('paired contrasts need fits from the same systems')
+    comp = fit_a.component_index; c = len(comp)
+    fa = lambda theta: function_a(coefficients_to_omegas(theta[:c], comp))
+    fb = lambda theta: function_b(coefficients_to_omegas(theta[:c], comp))
+    diffs = np.array([fa(x) - fb(y) for x, y in zip(fit_a.loo_coefficients, fit_b.loo_coefficients)])
+    nb = len(diffs)
+    jackknife = float((nb - 1.0) / nb * np.sum((diffs - diffs.mean()) ** 2))
+    added = 0.0
+    moment = fit_a.crossblock_moment_covariance
+    if moment is not None and fit_b.crossblock_moment_covariance is not None:
+        if not np.array_equal(moment, fit_b.crossblock_moment_covariance):
+            raise ValueError('paired contrasts need one shared moment covariance (fit the models in one call '
+                             'that includes a model with every genetic component)')
+        ga = numerical_gradient(fa, fit_a.coefficients)[fit_a.keep]
+        gb = numerical_gradient(fb, fit_b.coefficients)[fit_b.keep]
+        aa = fit_a.crossblock_covariance[np.ix_(fit_a.keep, fit_a.keep)]
+        bb = fit_b.crossblock_covariance[np.ix_(fit_b.keep, fit_b.keep)]
+        ab = added_covariance_from_moments(fit_a.normal_matrix, moment, c, fit_a.crossblock_inputs.block_count,
+                                           keep=fit_a.keep, keep_b=fit_b.keep)
+        added = float(ga @ aa @ ga + gb @ bb @ gb - 2.0 * ga @ ab @ gb)
+    estimate = float(fa(fit_a.coefficients) - fb(fit_b.coefficients))
+    return {'estimate': estimate, 'jackknife_variance': jackknife, 'crossblock_variance': added,
+            'variance': jackknife + added, 'standard_error': float(np.sqrt(max(jackknife + added, 0.0)))}

@@ -91,7 +91,21 @@ fit = fit_generalized_gxe_variant_model_v1(reference, trait, trait_selector="tra
 ```
 
 Use a trait name saved in the summary. The fitter checks compatibility and
-uses the saved SNP-block definitions for its jackknife. A reference can be
+uses the saved SNP-block definitions for its jackknife.
+
+Standard errors add the between-block signal covariance to the SNP-block
+jackknife by default ([Methods](Methods.md#between-block-signal-covariance)).
+The jackknife alone understates the variance of G–G×E covariances
+(amplification), increasingly so at higher heritability. The term is computed
+from the reference's block LD scalars and the trait's context second and fourth
+moments, which current trait summaries record. `fit.raw_standard_errors` and
+`fit.raw_covariance` include it; `fit.raw_jackknife_covariance`,
+`fit.raw_crossblock_covariance` and `fit.raw_jackknife_standard_errors` keep the
+parts, and `fit.manifest["uncertainty"]` records the method. Pass
+`standard_errors="jackknife"` to use the jackknife alone. For a derived quantity
+`f`, `summit.context.crossblock_signal.derived_variance(f, fit.raw_coefficients,
+fit.raw_loo_coefficients, fit.raw_crossblock_covariance)` returns its jackknife
+and added variances. A reference can be
 reused across traits with compatible samples, scaling, contexts, and fixed
 effects. [PCGC preparation](Generalized-GxE-PCGC.md) also saves separate reference and
 trait files, using `.binary.ldscores.npz` and `.binary.sumstats.npz`. Its fitter

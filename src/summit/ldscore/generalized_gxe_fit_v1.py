@@ -18,6 +18,7 @@ from summit.context.fit_v1 import (
     DEFAULT_FIT_V1_RTOL,
     assemble_contextual_normal_equations_from_moments_v1,
 )
+from summit.context import crossblock_signal as _crossblock
 from summit.context.oracle import (
     coefficients_to_omegas,
     different_person_correction,
@@ -676,10 +677,25 @@ class GeneralizedGxEVariantFitResultV1:
     raw_solve_singular_values: np.ndarray
     raw_solve_retained_directions: np.ndarray
     raw_solve_null_space: np.ndarray
+    # Between-block signal covariance added to the jackknife (zeros when not
+    # applied), their sum, and the jackknife-only standard errors.
+    # ``raw_standard_errors`` are the square roots of ``raw_covariance``.
+    raw_crossblock_covariance: np.ndarray | None = None
+    raw_covariance: np.ndarray | None = None
+    raw_jackknife_standard_errors: np.ndarray | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.component_index, ContextComponentIndex):
             raise ValueError("component_index must be a ContextComponentIndex")
+        if self.raw_crossblock_covariance is None:
+            object.__setattr__(self, "raw_crossblock_covariance",
+                               np.zeros_like(self.raw_jackknife_covariance))
+        if self.raw_covariance is None:
+            object.__setattr__(self, "raw_covariance", np.asarray(
+                self.raw_jackknife_covariance) + np.asarray(self.raw_crossblock_covariance))
+        if self.raw_jackknife_standard_errors is None:
+            object.__setattr__(self, "raw_jackknife_standard_errors", np.sqrt(
+                np.maximum(np.diag(np.asarray(self.raw_jackknife_covariance)), 0.0)))
         for name in (
             "normal_matrix",
             "normal_rhs",
@@ -699,6 +715,9 @@ class GeneralizedGxEVariantFitResultV1:
             "raw_solve_singular_values",
             "raw_solve_retained_directions",
             "raw_solve_null_space",
+            "raw_crossblock_covariance",
+            "raw_covariance",
+            "raw_jackknife_standard_errors",
         ):
             object.__setattr__(
                 self, name, owned_readonly_array(getattr(self, name))
@@ -721,6 +740,7 @@ def fit_generalized_gxe_variant_model_v1(
     study_rows: object | None = None,
     same_person_transport: str | None = None,
     different_person_transport: str | None = None,
+    standard_errors: str | None = None,
 ) -> GeneralizedGxEVariantFitResultV1:
     """Run the existing raw symmetric solve and compact every-block jackknife.
 
@@ -729,7 +749,16 @@ def fit_generalized_gxe_variant_model_v1(
     :func:`resolve_generalized_gxe_different_person_v1` for
     ``different_person_transport``.  Both choices are recorded in the fit
     manifest.
+
+    ``standard_errors="crossblock"`` (the default) adds the between-block
+    signal covariance of the genetic moments to the jackknife covariance
+    (:mod:`summit.context.crossblock_signal`); it uses the reference's
+    per-block LD scalars and the trait's context second and fourth moments.
+    ``"jackknife"`` keeps the SNP-block jackknife alone. A trait summary
+    without context moments falls back to the jackknife with a
+    :class:`~summit.context.crossblock_signal.CrossBlockSignalUnavailableWarning`.
     """
+    requested_standard_errors = _crossblock.resolve_standard_errors(standard_errors)
     compatibility = validate_generalized_gxe_trait_compatibility_v1(
         reference, trait
     )
@@ -786,7 +815,26 @@ def fit_generalized_gxe_variant_model_v1(
     diagonal = np.diag(covariance)
     if np.min(diagonal) < -1.0e-10 * covariance_scale:
         raise RuntimeError("raw jackknife covariance has negative variance")
-    standard_errors = np.sqrt(np.maximum(diagonal, 0.0))
+    jackknife_standard_errors = np.sqrt(np.maximum(diagonal, 0.0))
+    added = np.zeros_like(covariance)
+    crossblock_diagnostics = None
+    if requested_standard_errors == "jackknife":
+        crossblock_status = "not_requested"
+    elif trait.context_second_moments is None or trait.context_fourth_moments is None:
+        crossblock_status = _crossblock.warn_unavailable("missing_study_context_moments")
+    else:
+        inputs = _crossblock.CrossBlockSignalInputs(
+            block_traces=_crossblock.block_traces_from_ld_scalars(
+                reference.ld_scalars, reference.annotation_masses, trait.n_samples),
+            study_n=trait.n_samples,
+            study_second_moments=trait.context_second_moments,
+            study_fourth_moments=trait.context_fourth_moments,
+        )
+        added, crossblock_diagnostics = _crossblock.crossblock_signal_covariance(
+            equations.matrix, raw, reference.component_index, inputs)
+        crossblock_status = "applied"
+    total_covariance = covariance + added
+    standard_errors = np.sqrt(np.maximum(np.diag(total_covariance), 0.0))
     manifest = {
         "kind": GENERALIZED_GXE_VARIANT_FIT_KIND,
         "schema_version": 1,
@@ -799,6 +847,8 @@ def fit_generalized_gxe_variant_model_v1(
         "same_person_transport": equations.same_person_transport,
         "different_person_transport": equations.different_person_transport,
         "different_person_jackknife": "drop_deleted_block_ld_scalars_retained_masses_v1",
+        "uncertainty": _crossblock.uncertainty_record(
+            requested_standard_errors, crossblock_status, crossblock_diagnostics),
         "summary_only_fit": True,
         "per_variant_panel_accessed": False,
         "compatibility": dict(compatibility),
@@ -838,4 +888,7 @@ def fit_generalized_gxe_variant_model_v1(
         raw_solve_singular_values=solve.diagnostics.singular_values,
         raw_solve_retained_directions=solve.retained_directions,
         raw_solve_null_space=solve.null_space,
+        raw_crossblock_covariance=added,
+        raw_covariance=total_covariance,
+        raw_jackknife_standard_errors=jackknife_standard_errors,
     )

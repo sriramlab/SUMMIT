@@ -106,6 +106,34 @@ returned equations record both choices. Deletions reuse the full study
 same-person term; the correction drops the deleted blocks' LD scalars and uses
 the retained annotation masses.
 
+### Fitting with standard errors
+
+`fit_transferred_chromosome_models` builds the full system and one system per
+deleted jackknife block once, then solves each requested model on them:
+
+```python
+from summit.ldscore.generalized_gxe_chromosome import (
+    chromosome_paired_contrast, fit_transferred_chromosome_models)
+
+fits = fit_transferred_chromosome_models(
+    reference_chunks, trait_chunks, transport=transport, study_rows=rows,
+    models={"full": all_coefficients, "single_age": kept_for_age}, **moments)
+amplification = lambda om: om.sum(axis=0)[0, 1] / om.sum(axis=0)[0, 0]
+fits["full"].derived(amplification)            # estimate, jackknife and added variance
+chromosome_paired_contrast(fits["full"], amplification, fits["single_age"], amplification)
+```
+
+A restricted model solves `T[keep, keep]`; coefficient vectors and covariances
+are returned on the full coefficient axis. Without `transport`, pass the
+same-person and different-person inputs listed above in `moments`; a
+summary-only reference (D_R, intercept entries, reference context moments) and
+the trait's own context moments are enough. Standard errors add the
+between-block signal covariance to the jackknife by default
+([Methods](Methods.md#between-block-signal-covariance)); it is evaluated once at
+the estimate of a model that keeps every genetic component, so the models share
+it and paired contrasts include the cross term. `standard_errors="jackknife"`
+keeps the jackknife alone.
+
 This production assembly differs from the research
 `cross_trait_gram.within_trait_equations(mode="factorized_plus_residual",
 same_person_mode="own_rows")` only through the joint chromosome assembly. The
