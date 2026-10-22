@@ -115,3 +115,8 @@ Jeong, M., Pazokitoroudi, A., Liu, Z., & Sankararaman, S. (2024).
 Scalable summary statistics-based heritability estimation method with individual
 genotype level accuracy. *Genome Research*, gr.279207.124.
 [Paper](https://doi.org/10.1101/gr.279207.124).
+
+Jeong, M., Liu, Z., Ni, J., An, U., Han, S., Anand, A., Anand, P., Boffelli, M., &
+Sankararaman, S. (2026). Genome-wide LD scores enable robust heritability and genetic
+correlation estimation from summary statistics across genetic ancestries. *bioRxiv*,
+2026.10.20.760508. [Preprint](https://doi.org/10.64898/2026.10.20.760508).
