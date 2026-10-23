@@ -9,6 +9,7 @@ as `summit pgs fit`.
 |---|---|
 | Genome-wide or windowed LD scores | `summit --geno ...` |
 | Heritability or genetic correlation | `summit --h2 ...` or `summit --rg ...` |
+| Related-pair moments for h²/rg with relatives | `summit relatives {moments,append,adjust-ld,cross-m12}` |
 | Additive and generalized G×E PCGC | `summit --binary-method pcgc ...` |
 | Generalized cross-trait PCGC | `summit pcgc-cross {prepare,fit}` |
 | One-environment G×E | `summit --geno ... --env ...`, `--gxe-score-reference`, `--gxe-fit`, or `--gxe-fit-batch` |

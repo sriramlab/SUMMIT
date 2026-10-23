@@ -12,6 +12,9 @@ def main(argv=None):
     if tokens[:1] == ["epistasis"]:
         from .epistasis.cli import main as epistasis_main
         return epistasis_main(tokens[1:])
+    if tokens[:1] == ["relatives"]:
+        from .relatives.__main__ import main as relatives_main
+        return relatives_main(tokens[1:])
     if tokens[:1] == ["pgs"]:
         from .prediction.cli import main as pgs_main
         return pgs_main(tokens[1:])

@@ -555,7 +555,7 @@ def build_parser() -> argparse.ArgumentParser:
         type=str,
         help=(
             "Cross-trait related-pair HE moments (SNP, REL_M12) for the --rg pair, from "
-            "`python -m summit.relatives moments --cross` and `cross-m12`. Required, together with "
+            "`summit relatives moments --cross` and `cross-m12`. Required, together with "
             "REL_M columns in both sumstats files, to exclude related pairs from genetic covariance."
         ),
     )

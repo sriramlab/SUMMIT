@@ -76,6 +76,64 @@ Working-variance floors affect regression weights. They do not impose
 nonnegative h² or bounded rg. For overlapping annotations, component estimates
 are coefficient contributions, not estimates restricted to an annotation's SNP set.
 
+## Related individuals
+
+Write `y` for the phenotype and `x_j` for SNP j, both projected on the GWAS
+covariates and scaled to sum of squares `N_eff = n - p - 1`, and `K` for the
+GRM of these genotypes. With a set P of related pairs, the model is
+
+```text
+E[y yᵀ | G] = σ²_g K + σ²_e I + Δ,     Δ_ii' unrestricted for (i,i') in P, zero elsewhere.
+```
+
+Δ holds whatever relatives share beyond the kernel: untagged variants,
+household environment, indirect effects. Removing P from the HE quadratic form,
+
+```text
+yᵀ K_u y = yᵀ K y - Σ_{(i,i') in P, ordered} K_ii' y_i y_i',
+E[yᵀ K_u y - yᵀ y] = σ²_g {tr(K_u²) - N_eff},
+```
+
+gives an estimator that is unbiased for every Δ. Its h²_g equals the
+method-of-moments estimate of the two-kernel model σ²_g K + σ²_r K_P + σ²_e I.
+
+The removed term splits over SNPs. With
+`s_j = Σ_{(i,i') in P, ordered} x_ij x_i'j y_i y_i'`, the HE-scale moment loses
+
+```text
+REL_M_j = κ s_j,     κ = (n - 1)(n - p - 2) / {(n - 2) N_eff²},
+```
+
+the derivative of `z*_j²` (h² convention, c = 0) with respect to `(x_jᵀ y)²`
+at zero association. The h² response becomes `1 + q_j - REL_M_j`. Without
+covariates `(N*/M) Σ_j (z*_j² - REL_M_j) = yᵀ K_u y` holds exactly; with p
+covariates the error is of relative order `r_j² p / n`. Because the correction
+is per SNP, annotation sums and every jackknife deletion use it unchanged.
+`c_rel = mean_j REL_M_j` is the relative-pair covariance in HE scale.
+
+With LD scores from an unrelated sample of the same ancestry composition, the
+trace needs no change. SUMMIT's in-sample LD scores satisfy
+`N_eff + N_eff² Σ_j l_j / M² = tr(K²)`, which includes the relatives' pairs.
+Their share is the relatedness LD score
+
+```text
+LD_REL_{j,k} = N_eff⁻² Σ_{(i,i') in P, ordered} x_ij x_i'j W_k,ii',     W_k,ii' = Σ_j' a_j'k x_ij' x_i'j',
+```
+
+and `l_{j,k} - LD_REL_{j,k}` reconstructs the pair-excluded traces exactly.
+
+For rg, the cross-trait moment `z*_1j z*_2j` has the same derivative κ with
+respect to `(x_jᵀ y_1)(x_jᵀ y_2)` when both traits use one sample, so
+
+```text
+REL_M12_j = κ Σ_{(i,i') in P, ordered} x_ij x_i'j y_1i y_2i'
+```
+
+is subtracted from the bivariate response. rg resolves c from the input
+metadata; at c = p the derivative differs from κ by a relative `p/n²`. The
+overlap covariance concerns each person's own pair of phenotypes and keeps
+its usual meaning.
+
 ## LD-score Monte Carlo variance
 
 For target SNP i, annotation k, and random vector v, write its contribution as

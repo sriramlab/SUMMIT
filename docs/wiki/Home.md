@@ -23,6 +23,7 @@ results go to `example/out/`.
 |---|---|
 | Genome-wide or windowed LD scores | [LD scores](LD-scores.md) |
 | Total or partitioned h² and rg | [Heritability and genetic correlation](Heritability-and-genetic-correlation.md) |
+| h² and rg keeping related individuals | [Related individuals](Related-individuals.md) |
 | Many traits or annotation models | [Batch analyses](Batch-analyses.md) |
 | One environment, including heterogeneous residual variance | [G×E models](GxE-models.md) |
 | Joint continuous and categorical environments | [Multiple environments](Multiple-environments.md) |

@@ -10,6 +10,7 @@ gene–environment interaction models and polygenic scores.
 
 - Genome-wide and windowed LD-score estimation.
 - SNP heritability and genetic correlation, including annotation partitions.
+- h² and rg in cohorts with related individuals, keeping everyone and excluding related pairs.
 - Batch analysis of many traits and annotation models.
 - Gene–environment interaction (G×E) and environment-dependent residual variance.
 - Joint models of multiple continuous or categorical environments.
@@ -80,6 +81,7 @@ that also runs on macOS.
 - [Input files](https://github.com/sriramlab/SUMMIT/wiki/Input-files)
 - [LD scores](https://github.com/sriramlab/SUMMIT/wiki/LD-scores)
 - [Heritability and genetic correlation](https://github.com/sriramlab/SUMMIT/wiki/Heritability-and-genetic-correlation)
+- [Related individuals](https://github.com/sriramlab/SUMMIT/wiki/Related-individuals)
 - [Batch analyses](https://github.com/sriramlab/SUMMIT/wiki/Batch-analyses)
 - [G×E models](https://github.com/sriramlab/SUMMIT/wiki/GxE-models)
 - [Multiple environments](https://github.com/sriramlab/SUMMIT/wiki/Multiple-environments)

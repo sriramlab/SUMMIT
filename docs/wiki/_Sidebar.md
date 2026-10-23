@@ -11,6 +11,7 @@
 
 - [LD scores](LD-scores.md)
 - [h² and rg](Heritability-and-genetic-correlation.md)
+- [Related individuals](Related-individuals.md)
 - [Batch analyses](Batch-analyses.md)
 - [G×E models](GxE-models.md)
 - [Multiple environments](Multiple-environments.md)

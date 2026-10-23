@@ -48,6 +48,11 @@ the file maximum. SUMMIT accounts for these differences in its null moments
 and regression weights. For rg, see the sample-overlap assumptions in
 [Methods](Methods.md).
 
+Optional `REL_M` gives each SNP's related-pair HE moment for a GWAS that
+includes relatives; h² subtracts it. It is computed from individual-level data
+by `summit relatives`, and rg additionally needs `--rel-m12`. See
+[Related individuals](Related-individuals.md).
+
 Optional `COV_RANK` or `P_EFF` gives the number of non-intercept GWAS covariates;
 `--cov-rank` overrides it. The rg calculation uses this metadata. The current
 h² calculation uses a covariate-rank value of zero, including when h² supplies

@@ -1,9 +1,9 @@
-"""Command line for related-pair HE moments.
+"""Command line for related-pair HE moments (`summit relatives ...`, or `python -m summit.relatives ...`).
 
-  python -m summit.relatives moments --geno PREFIX --pheno FILE --pairs FILE [--covar FILE] --out PREFIX
-  python -m summit.relatives append  --sumstats FILE --rel PREFIX.tsv.gz --pheno NAME --out FILE
-  python -m summit.relatives adjust-ld --ldscores IN.gw.ldscore.gz --rel PREFIX.tsv.gz --out OUT.gw.ldscore.gz
-  python -m summit.relatives cross-m12 --rel PREFIX.tsv.gz --pheno1 A --pheno2 B --out FILE   (for summit --rg --rel-m12)
+  summit relatives moments --geno PREFIX --pheno FILE --pairs FILE [--covar FILE] --out PREFIX
+  summit relatives append  --sumstats FILE --rel PREFIX.tsv.gz --pheno NAME --out FILE
+  summit relatives adjust-ld --ldscores IN.gw.ldscore.gz --rel PREFIX.tsv.gz --out OUT.gw.ldscore.gz
+  summit relatives cross-m12 --rel PREFIX.tsv.gz --pheno1 A --pheno2 B --out FILE   (for summit --rg --rel-m12)
 """
 import argparse
 import sys
@@ -13,7 +13,7 @@ from .moments import adjust_ldscores, append_rel_m_to_sumstats, compute_relative
 
 
 def main(argv=None):
-    ap = argparse.ArgumentParser(prog="python -m summit.relatives")
+    ap = argparse.ArgumentParser(prog="summit relatives")
     sub = ap.add_subparsers(dest="cmd", required=True)
     m = sub.add_parser("moments", help="per-SNP related-pair HE moments (REL_M) and optional LD_REL")
     m.add_argument("--geno", required=True, help="PLINK 1 BED prefix (the GWAS genotypes)")

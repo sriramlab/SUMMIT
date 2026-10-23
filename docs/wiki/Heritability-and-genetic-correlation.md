@@ -22,6 +22,10 @@ or chromosome-split paths.
 Results are written to `<out>.results.tsv` and `<out>.log`. The table includes
 component estimates, standard errors, and enrichment where applicable.
 
+For a GWAS that includes related individuals, add the related-pair moments
+described in [Related individuals](Related-individuals.md) instead of pruning
+to an unrelated set.
+
 ## Genetic correlation
 
 For studies with no overlapping participants:
