@@ -155,15 +155,27 @@ def build_h2_summary_moment(
         cov_rank=resolved_cov_rank,
     )
 
+    rel_info = None
+    rel_m = getattr(matched, "rel_m", None)
+    if rel_m is not None:
+        # Exclude related pairs from the HE numerator (summit.relatives): subtract
+        # each SNP's related-pair share of the HE-scale moment.
+        rel_m = np.asarray(rel_m, dtype=np.float64)
+        y = y - rel_m
+        rel_info = {"c_rel": float(np.nanmean(rel_m)), "sum_rel_m": float(np.nansum(rel_m))}
+
     y[~np.isfinite(y)] = np.nan
 
-    return y, {
+    info = {
         "mode": "beta_se_exact",
         "cov_rank": int(resolved_cov_rank),
         "cov_rank_source": source,
         "n_scale": float(effective_n_scale(matched.nsamp, resolved_cov_rank)),
         "n_nonfinite": int(np.sum(~np.isfinite(y))),
     }
+    if rel_info is not None:
+        info["related_pairs"] = rel_info
+    return y, info
 
 
 def build_rg_summary_moment(

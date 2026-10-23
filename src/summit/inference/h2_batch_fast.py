@@ -289,6 +289,11 @@ def _stream_trait_column(
                 f"Phenotype [{spec.phen}] must contain SNP, A1, A2, N, BETA, and SE columns."
             )
 
+        if "REL_M" in columns:
+            raise RuntimeError(
+                f"Phenotype [{spec.phen}] carries a REL_M (related-pair) column, which the batch "
+                "fast path does not apply. Use the regular --h2 path."
+            )
         usecols = [id_column, n_column, beta_column, se_column]
         if cov_rank_column is not None:
             usecols.append(cov_rank_column)

@@ -357,6 +357,17 @@ class Sumrhe:
             nsamp=float(ss.nsamp),
             cov_rank=0,
         )
+        rel_info = None
+        if ss.rel_m is not None:
+            # Exclude related pairs from the HE numerator (summit.relatives).
+            rel_used = ss.rel_m[pos]
+            y_used = y_used - rel_used
+            rel_info = {"c_rel": float(np.nanmean(rel_used)), "sum_rel_m": float(np.nansum(rel_used))}
+            if self.log is not None:
+                self.log._log(
+                    f"[relatives] [{ss.name}] subtracting related-pair HE moments: "
+                    f"relative-pair covariance in HE scale c_rel={rel_info['c_rel']:.6g}."
+                )
         y_used[~np.isfinite(y_used)] = np.nan
 
         y = np.full(M, np.nan, dtype=np.float64)
@@ -369,6 +380,8 @@ class Sumrhe:
             "n_scale": float(effective_n_scale(ss.nsamp, 0)),
             "n_nonfinite": int(np.sum(~np.isfinite(y_used))),
         }
+        if rel_info is not None:
+            info["related_pairs"] = rel_info
         return y, info
 
     def _build_h2_matched_metadata(self, ss, aligned, keep_mask):

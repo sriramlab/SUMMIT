@@ -137,6 +137,7 @@ class MatchedSumstats:
     used_top: list | None = None
     clip_count: int = 0
     clip_threshold: float | None = None
+    rel_m: np.ndarray | None = None   # per-SNP related-pair HE moment (subtracted from the h2 response)
 
     @property
     def nsnps(self) -> int:
@@ -166,6 +167,7 @@ class MatchedSumstats:
             used_top=self.used_top,
             clip_count=self.clip_count,
             clip_threshold=self.clip_threshold,
+            rel_m=None if self.rel_m is None else self.rel_m[keep_mask],
         )
 
 
@@ -239,6 +241,7 @@ class AlignedSumstats:
         n = self.sumstats.n[pos].astype(np.float64, copy=False)
         a1 = self.sumstats.a1[pos]
         a2 = self.sumstats.a2[pos]
+        rel_m = None if self.sumstats.rel_m is None else self.sumstats.rel_m[pos].astype(np.float64, copy=True)
 
         if allele_flip_mask is not None:
             flip = np.asarray(allele_flip_mask, dtype=bool)
@@ -291,6 +294,7 @@ class AlignedSumstats:
             used_top=used_top,
             clip_count=clip_count,
             clip_threshold=clip_threshold,
+            rel_m=rel_m,
         )
 
     def diagnostics_for_keep(
@@ -386,8 +390,12 @@ class Sumstats:
         removed_snps=None,
         read_summary=None,
         read_top=None,
+        rel_m=None,
     ):
         self.snps = np.asarray(snps, dtype=str)
+        # Optional per-SNP related-pair HE moment (REL_M column; see summit.relatives).
+        # It is invariant to allele orientation, so no flipping is needed on alignment.
+        self.rel_m = None if rel_m is None else np.asarray(rel_m, dtype=np.float64)
         self.z = np.asarray(z, dtype=np.float64)
         self.beta = np.asarray(beta, dtype=np.float64)
         self.se = np.asarray(se, dtype=np.float64)
@@ -414,6 +422,8 @@ class Sumstats:
             == self.n.shape == self.a1.shape == self.a2.shape
         ):
             raise RuntimeError("Sumstats arrays do not all have the same length.")
+        if self.rel_m is not None and self.rel_m.shape != self.snps.shape:
+            raise RuntimeError("REL_M must have one value per SNP.")
 
         self.index = pd.Index(self.snps)
         if self.index.has_duplicates:
@@ -473,10 +483,13 @@ class Sumstats:
             )
 
         covrankcol = _maybe_find_column(cols, ["COV_RANK", "cov_rank", "P_EFF", "p_eff"])
+        relcol = _maybe_find_column(cols, ["REL_M"])
 
         usecols = [idcol, a1col, a2col, ncol, betacol, secol]
         if covrankcol is not None:
             usecols.append(covrankcol)
+        if relcol is not None:
+            usecols.append(relcol)
         usecols = list(dict.fromkeys(usecols))
 
         df = utils._read_csv_maybe_chr_split(
@@ -497,6 +510,8 @@ class Sumstats:
         }
         if covrankcol is not None:
             rename_map[covrankcol] = "COV_RANK"
+        if relcol is not None:
+            rename_map[relcol] = "REL_M"
 
         df = df.rename(columns=rename_map)
         df["SNP"] = df["SNP"].astype(str)
@@ -505,6 +520,8 @@ class Sumstats:
         df["N"] = pd.to_numeric(df["N"], errors="coerce")
         df["BETA"] = pd.to_numeric(df["BETA"], errors="coerce")
         df["SE"] = pd.to_numeric(df["SE"], errors="coerce")
+        if relcol is not None:
+            df["REL_M"] = pd.to_numeric(df["REL_M"], errors="coerce")
 
         file_cov_rank = None
         if "COV_RANK" in df.columns:
@@ -544,6 +561,14 @@ class Sumstats:
             (~np.isfinite(beta_arr)) |
             (~np.isfinite(se_arr)) | (se_arr <= 0.0)
         )
+        if relcol is not None:
+            bad_rel = ~np.isfinite(df["REL_M"].to_numpy(dtype=np.float64, copy=False))
+            if log is not None:
+                log._log(
+                    f"[relatives] [{name or path}] REL_M present; dropping "
+                    f"{int(np.sum(bad_rel & ~bad))} SNPs with missing REL_M."
+                )
+            bad = bad | bad_rel
 
         removed = []
         if bad.any():
@@ -639,6 +664,7 @@ class Sumstats:
             removed_snps=removed,
             read_summary=read_summary,
             read_top=read_top,
+            rel_m=(df["REL_M"].to_numpy(dtype=np.float64, copy=False) if relcol is not None else None),
         )
 
     def align_to_trace(self, trace) -> AlignedSumstats:

@@ -362,6 +362,12 @@ class Sumcore:
                 require_alleles=self.align_alleles,
             )
 
+            if ss1.rel_m is not None or ss2.rel_m is not None:
+                raise NotImplementedError(
+                    "REL_M (related-pair) columns are supported for h2 only. Genetic covariance with "
+                    "related individuals needs the cross-trait related-pair moment as well; remove REL_M "
+                    "from rg inputs or use unrelated samples."
+                )
             aligned1 = ss1.align_to_trace(self.trace)
             aligned2 = ss2.align_to_trace(self.trace)
 
