@@ -4,7 +4,7 @@ import pytest
 
 bed_reader = pytest.importorskip("bed_reader")
 
-from summit.relatives.moments import compute_relative_pair_moments, read_relative_pairs
+from summit.relatives.moments import adjust_ldscores, compute_relative_pair_moments, read_relative_pairs
 from summit.sumstats.moments import build_h2_summary_moment, h2_moment_from_arrays
 from summit.sumstats.sumstats import Sumstats
 
@@ -138,3 +138,88 @@ def test_sumstats_rel_m_column_is_subtracted(tmp_path):
     df2 = df.drop(columns=["REL_M"])
     df2.to_csv(tmp_path / "ss2.txt", sep="\t", index=False)
     assert Sumstats.from_file(str(tmp_path / "ss2.txt"), name="t2").rel_m is None
+
+
+def _brute_ld_rel(X, pi, pj, n_eff, A):
+    """(1/N_eff^2) sum over ordered related pairs of x_ij x_i'j W_k,ii', W_k = sum_j' a_j'k x_ij' x_i'j'."""
+    G = X[pi] * X[pj]
+    return 2.0 * (G.T @ (G @ A)) / n_eff ** 2
+
+
+def _snp_meta(M):
+    return {"CHR": np.repeat([1, 2], [M // 2, M - M // 2]), "BP": np.arange(1, M + 1) * 1000,
+            "SNP": [f"rs{j}" for j in range(M)]}
+
+
+@pytest.mark.parametrize("ncov", [0, 2])
+def test_ld_rel_partitioned_matches_brute_force(tmp_path, ncov):
+    prefix, G, y, covs, iid, cov_path = _simulate(tmp_path, ncov=ncov)
+    M = G.shape[1]
+    b = (np.random.default_rng(5).random(M) < 0.4).astype(int)
+    annot = pd.DataFrame({**_snp_meta(M), "binA": b, "binB": 1 - b})
+    annot.to_csv(tmp_path / "annot.txt", sep=" ", index=False)
+    common = dict(pairs=str(tmp_path / "pairs.txt"), covar=cov_path, step_size=97, ld_rel=True)
+    compute_relative_pair_moments(prefix, str(tmp_path / "pheno.txt"), str(tmp_path / "relp"),
+                                  annot=str(tmp_path / "annot.txt"), **common)
+    compute_relative_pair_moments(prefix, str(tmp_path / "pheno.txt"), str(tmp_path / "rel1"), **common)
+    X, _, p, n_eff = _projected(G, y, covs if ncov else None)
+    pi, pj = _family_pairs(str(tmp_path / "pairs.txt"), iid)
+    brute = _brute_ld_rel(X, pi, pj, n_eff, annot[["binA", "binB"]].to_numpy(float))
+    tab = pd.read_csv(tmp_path / "relp.tsv.gz", sep="\t")
+    np.testing.assert_allclose(tab[["LD_REL_binA", "LD_REL_binB"]].to_numpy(), brute, rtol=1e-8, atol=1e-10)
+    one = pd.read_csv(tmp_path / "rel1.tsv.gz", sep="\t")["LD_REL"].to_numpy()
+    np.testing.assert_allclose(one, brute.sum(1), rtol=1e-8, atol=1e-10)
+
+
+def test_missing_phenotype_rel_m_and_ld_rel_sample(tmp_path):
+    """REL_M uses the phenotype's complete cases; LD_REL uses every sample with complete covariates."""
+    prefix, G, y, covs, iid, cov_path = _simulate(tmp_path, ncov=2)
+    ph = pd.read_csv(tmp_path / "pheno.txt", sep=" ", dtype={"FID": str, "IID": str})
+    ph.loc[::7, "y"] = np.nan
+    ph.to_csv(tmp_path / "pheno.txt", sep=" ", index=False, na_rep="NA")
+    out = str(tmp_path / "rel")
+    compute_relative_pair_moments(prefix, str(tmp_path / "pheno.txt"), out, pairs=str(tmp_path / "pairs.txt"),
+                                  covar=cov_path, step_size=97, ld_rel=True)
+    tab = pd.read_csv(out + ".tsv.gz", sep="\t")
+    pi, pj = _family_pairs(str(tmp_path / "pairs.txt"), iid)
+    X, _, _, n_eff = _projected(G, y, covs)
+    np.testing.assert_allclose(tab["LD_REL"].to_numpy(), _brute_ld_rel(X, pi, pj, n_eff, np.ones((G.shape[1], 1)))[:, 0],
+                               rtol=1e-8, atol=1e-10)
+    keep = ph["y"].notna().to_numpy()
+    pos = -np.ones(keep.size, dtype=int)
+    pos[keep] = np.arange(keep.sum())
+    use = keep[pi] & keep[pj]
+    a, b = pos[pi[use]], pos[pj[use]]
+    Xs, ys, p, ne = _projected(G[keep], y[keep], covs[keep])
+    n = int(keep.sum())
+    kappa = (n - 1.0) * (n - p - 2.0) / ((n - 2.0) * ne ** 2)
+    brute = kappa * 2.0 * ((Xs[a] * Xs[b]) * (ys[a] * ys[b])[:, None]).sum(0)
+    np.testing.assert_allclose(tab["REL_M_y"].to_numpy(), brute, rtol=1e-8, atol=1e-12)
+
+
+@pytest.mark.parametrize("ncov", [0, 2])
+def test_adjust_ld_gives_pair_excluded_trace(tmp_path, ncov):
+    """With in-sample LD scores l_j = sum_j' r_jj'^2 - M/N_eff (SUMMIT's convention), the adjusted scores
+    reconstruct the pair-excluded trace exactly: N_eff + N_eff^2/M^2 sum_j (l_j - LD_REL_j) = tr(K_u^2)."""
+    prefix, G, y, covs, iid, cov_path = _simulate(tmp_path, ncov=ncov, missing=0.0)
+    out = str(tmp_path / "rel")
+    compute_relative_pair_moments(prefix, str(tmp_path / "pheno.txt"), out, pairs=str(tmp_path / "pairs.txt"),
+                                  covar=cov_path, ld_rel=True)
+    X, _, p, n_eff = _projected(G, y, covs if ncov else None)
+    N, M = X.shape
+    ld_exact = ((X.T @ X / n_eff) ** 2).sum(1) - M / n_eff
+    pd.DataFrame({**_snp_meta(M), "L2_0": ld_exact})[["CHR", "SNP", "BP", "L2_0"]].to_csv(
+        tmp_path / "in.gw.ldscore.gz", sep="\t", index=False, float_format="%.6f")
+    info = adjust_ldscores(str(tmp_path / "in.gw.ldscore.gz"), out + ".tsv.gz", str(tmp_path / "adj.gw.ldscore.gz"))
+    adj = pd.read_csv(tmp_path / "adj.gw.ldscore.gz", sep="\t")
+    pi, pj = _family_pairs(str(tmp_path / "pairs.txt"), iid)
+    K = X @ X.T / M
+    full = n_eff + n_eff ** 2 / M ** 2 * info["columns"]["L2_0"]["sum_ld"]
+    assert full == pytest.approx((K * K).sum(), rel=1e-6)
+    K[pi, pj] = 0.0
+    K[pj, pi] = 0.0
+    assert n_eff + n_eff ** 2 / M ** 2 * adj["L2_0"].sum() == pytest.approx((K * K).sum(), rel=1e-6)
+    with pytest.raises(ValueError, match="LD_REL_L2_1"):
+        pd.DataFrame({**_snp_meta(M), "L2_0": ld_exact, "L2_1": ld_exact})[["CHR", "SNP", "BP", "L2_0", "L2_1"]].to_csv(
+            tmp_path / "two.gw.ldscore.gz", sep="\t", index=False)
+        adjust_ldscores(str(tmp_path / "two.gw.ldscore.gz"), out + ".tsv.gz", str(tmp_path / "x.gz"))
