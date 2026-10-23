@@ -3,12 +3,13 @@
   python -m summit.relatives moments --geno PREFIX --pheno FILE --pairs FILE [--covar FILE] --out PREFIX
   python -m summit.relatives append  --sumstats FILE --rel PREFIX.tsv.gz --pheno NAME --out FILE
   python -m summit.relatives adjust-ld --ldscores IN.gw.ldscore.gz --rel PREFIX.tsv.gz --out OUT.gw.ldscore.gz
+  python -m summit.relatives cross-m12 --rel PREFIX.tsv.gz --pheno1 A --pheno2 B --out FILE   (for summit --rg --rel-m12)
 """
 import argparse
 import sys
 
 from ..logger import Logger
-from .moments import adjust_ldscores, append_rel_m_to_sumstats, compute_relative_pair_moments
+from .moments import adjust_ldscores, append_rel_m_to_sumstats, compute_relative_pair_moments, extract_rel_m12
 
 
 def main(argv=None):
@@ -25,6 +26,8 @@ def main(argv=None):
     m.add_argument("--no-closure", action="store_true", help="exclude only listed pairs, not all within-family pairs")
     m.add_argument("--step-size", type=int, default=5000)
     m.add_argument("--ld-rel", action="store_true", help="also write the related-pair share of in-sample LD scores")
+    m.add_argument("--cross", action="store_true",
+                   help="also write REL_M12_<a>__<b> for every phenotype pair with the same samples (for rg)")
     m.add_argument("--annot", default=None,
                    help="annotation of partitioned in-sample LD scores (LD_REL_<column> per annotation column)")
     m.add_argument("--out", required=True)
@@ -37,6 +40,11 @@ def main(argv=None):
     d.add_argument("--ldscores", required=True)
     d.add_argument("--rel", required=True, help="moments output (.tsv.gz) written with --ld-rel")
     d.add_argument("--out", required=True)
+    x = sub.add_parser("cross-m12", help="write SNP/REL_M12 for one phenotype pair (summit --rg --rel-m12)")
+    x.add_argument("--rel", required=True, help="moments output (.tsv.gz) written with --cross")
+    x.add_argument("--pheno1", required=True)
+    x.add_argument("--pheno2", required=True)
+    x.add_argument("--out", required=True)
     args = ap.parse_args(argv)
 
     if args.cmd == "moments":
@@ -46,16 +54,21 @@ def main(argv=None):
         summary = compute_relative_pair_moments(
             args.geno, args.pheno, args.out, pairs=args.pairs, covar=args.covar, pheno_cols=cols,
             kinship_col=args.kinship_col, kinship_min=args.kinship_min, closure=not args.no_closure,
-            step_size=args.step_size, ld_rel=args.ld_rel, annot=args.annot, log=log,
+            step_size=args.step_size, ld_rel=args.ld_rel, annot=args.annot, cross=args.cross, log=log,
         )
         for name, info in summary["phenotypes"].items():
             log._log(f"[relatives] {name}: n={info['n']} pairs={info['pairs_used']} c_rel={info['c_rel']:.6g}")
+        for name, info in summary.get("cross", {}).items():
+            log._log(f"[relatives] {name}: c_rel12={info['c_rel12']:.6g}")
         if "ld_rel" in summary:
             sums = ", ".join(f"{c}={v:.6g}" for c, v in zip(summary["ld_rel"]["columns"], summary["ld_rel"]["sums"]))
             log._log(f"[relatives] LD_REL sums: {sums}")
     elif args.cmd == "append":
         missing = append_rel_m_to_sumstats(args.sumstats, args.rel, args.pheno, args.out)
         print(f"wrote {args.out}; SNPs without REL_M: {missing}")
+    elif args.cmd == "cross-m12":
+        c12 = extract_rel_m12(args.rel, args.pheno1, args.pheno2, args.out)
+        print(f"wrote {args.out}; c_rel12={c12:.6g}")
     else:
         info = adjust_ldscores(args.ldscores, args.rel, args.out)
         for c, v in info["columns"].items():

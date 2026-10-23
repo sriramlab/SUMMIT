@@ -63,6 +63,7 @@ class Sumcore:
         intercept_rg_source: str = "cli",
         pheno_rg=None,
         pheno_rg_cov=None,
+        rel_m12=None,
         pheno_rg_missing_values=None,
         pheno_rg_cov_missing_values=None,
         chisq_action: str = "drop",
@@ -278,6 +279,7 @@ class Sumcore:
         self.intercept_rg_source = str(intercept_rg_source).strip() or "cli"
         self.pheno_rg_paths = None if pheno_rg is None else utils._parse_rg_pair(pheno_rg)
         self.pheno_rg_cov_paths = None if pheno_rg_cov is None else utils._parse_rg_pair(pheno_rg_cov)
+        self.rel_m12_path = rel_m12
 
         if self.intercept_rg is not None and (
             self.pheno_rg_paths is not None or self.pheno_rg_cov_paths is not None
@@ -362,12 +364,6 @@ class Sumcore:
                 require_alleles=self.align_alleles,
             )
 
-            if ss1.rel_m is not None or ss2.rel_m is not None:
-                raise NotImplementedError(
-                    "REL_M (related-pair) columns are supported for h2 only. Genetic covariance with "
-                    "related individuals needs the cross-trait related-pair moment as well; remove REL_M "
-                    "from rg inputs or use unrelated samples."
-                )
             aligned1 = ss1.align_to_trace(self.trace)
             aligned2 = ss2.align_to_trace(self.trace)
 
@@ -429,6 +425,8 @@ class Sumcore:
             compute_diagnostics=self.collect_diagnostics,
             allele_flip_mask=flip_keep,
         )
+
+        rel_m12 = self._related_pair_cross_moment(matched1, matched2)
 
         if self.jackknife_spec.mode == "chr":
             full_tv = self.trace.materialize_view()
@@ -501,6 +499,15 @@ class Sumcore:
                 f"trait2_n_scale={summary_y_info.get('trait2_n_scale', np.nan):.6g}, "
                 f"nonfinite_reconstructed_snps={summary_y_info.get('n_nonfinite', 0)}"
             )
+
+        if rel_m12 is not None:
+            summary_y = summary_y - rel_m12
+            summary_y_info = {**summary_y_info, "related_pairs": {"c_rel12": float(np.nanmean(rel_m12))}}
+            if self.log is not None:
+                self.log._log(
+                    "[relatives] subtracting cross-trait related-pair HE moments: relative-pair covariance "
+                    f"in HE scale c_rel12={float(np.nanmean(rel_m12)):.6g}."
+                )
 
         rg_prepared = prepare_rg(
             tv,
@@ -905,6 +912,29 @@ class Sumcore:
             "n_cov": cov_info["n_cov"],
         }
     
+    def _related_pair_cross_moment(self, matched1, matched2):
+        """REL_M12 on the matched SNP axis, or None; pair exclusion must cover both h2 parts and the cross part."""
+        has1 = getattr(matched1, "rel_m", None) is not None
+        has2 = getattr(matched2, "rel_m", None) is not None
+        if not (has1 or has2 or self.rel_m12_path is not None):
+            return None
+        if not (has1 and has2 and self.rel_m12_path is not None):
+            raise ValueError(
+                "Excluding related pairs from rg needs REL_M in both sumstats files and --rel-m12 for the pair "
+                f"(REL_M: trait 1 {'yes' if has1 else 'no'}, trait 2 {'yes' if has2 else 'no'}; "
+                f"--rel-m12: {'yes' if self.rel_m12_path is not None else 'no'})."
+            )
+        tab = pd.read_csv(self.rel_m12_path, sep=r"\s+", usecols=["SNP", "REL_M12"], dtype={"SNP": str})
+        if tab["SNP"].duplicated().any():
+            raise ValueError(f"{self.rel_m12_path} has duplicate SNP IDs.")
+        pos = pd.Index(tab["SNP"]).get_indexer(np.asarray(matched1.snps).astype(str))
+        vals = np.full(pos.size, np.nan)
+        vals[pos >= 0] = tab["REL_M12"].to_numpy(dtype=np.float64)[pos[pos >= 0]]
+        bad = ~np.isfinite(vals)
+        if bad.any():
+            raise ValueError(f"{int(bad.sum())} rg SNPs have no finite REL_M12 in {self.rel_m12_path}.")
+        return vals
+
     @staticmethod
     def _read_overlap_covariate_file(path: str, missing_tokens):
         """

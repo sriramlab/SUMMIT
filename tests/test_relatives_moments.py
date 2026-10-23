@@ -4,8 +4,14 @@ import pytest
 
 bed_reader = pytest.importorskip("bed_reader")
 
-from summit.relatives.moments import adjust_ldscores, compute_relative_pair_moments, read_relative_pairs
-from summit.sumstats.moments import build_h2_summary_moment, h2_moment_from_arrays
+from summit.relatives.moments import (
+    adjust_ldscores,
+    append_rel_m_to_sumstats,
+    compute_relative_pair_moments,
+    extract_rel_m12,
+    read_relative_pairs,
+)
+from summit.sumstats.moments import build_h2_summary_moment, exact_score_z_from_arrays, h2_moment_from_arrays
 from summit.sumstats.sumstats import Sumstats
 
 
@@ -223,3 +229,89 @@ def test_adjust_ld_gives_pair_excluded_trace(tmp_path, ncov):
         pd.DataFrame({**_snp_meta(M), "L2_0": ld_exact, "L2_1": ld_exact})[["CHR", "SNP", "BP", "L2_0", "L2_1"]].to_csv(
             tmp_path / "two.gw.ldscore.gz", sep="\t", index=False)
         adjust_ldscores(str(tmp_path / "two.gw.ldscore.gz"), out + ".tsv.gz", str(tmp_path / "x.gz"))
+
+
+def _two_phenotypes(tmp_path, y, iid, seed=11):
+    rng = np.random.default_rng(seed)
+    y2 = 0.5 * y + rng.standard_normal(y.size)
+    f2 = rng.standard_normal(50)                          # an extra effect shared within the first 50 pairs
+    y2[0:100:2] += f2
+    y2[1:100:2] += f2
+    pd.DataFrame({"FID": iid, "IID": iid, "y": y, "y2": y2}).to_csv(tmp_path / "pheno2.txt", sep=" ", index=False)
+    return y2
+
+
+def _ols_sumstats(path, X, yy, p, rel_m=None):
+    """Write a SUMMIT sumstats file whose beta/SE reproduce the partial correlations of the projected data."""
+    N, M = X.shape
+    n_eff = N - p - 1
+    r = (X.T @ yy) / n_eff
+    df = pd.DataFrame({"SNP": [f"rs{j}" for j in range(M)], "A1": "A", "A2": "G", "N": N,
+                       "BETA": r, "SE": np.sqrt((1 - r * r) / (N - p - 2))})
+    if rel_m is not None:
+        df["REL_M"] = rel_m
+    df.to_csv(path, sep="\t", index=False, float_format="%.15g")
+    return r
+
+
+@pytest.mark.parametrize("ncov", [0, 2])
+def test_rel_m12_matches_brute_force_and_cross_identity(tmp_path, ncov):
+    prefix, G, y, covs, iid, cov_path = _simulate(tmp_path, ncov=ncov, missing=0.0)
+    y2 = _two_phenotypes(tmp_path, y, iid)
+    out = str(tmp_path / "rel")
+    compute_relative_pair_moments(prefix, str(tmp_path / "pheno2.txt"), out, pairs=str(tmp_path / "pairs.txt"),
+                                  covar=cov_path, step_size=97, cross=True)
+    tab = pd.read_csv(out + ".tsv.gz", sep="\t")
+    X, y1t, p, n_eff = _projected(G, y, covs if ncov else None)
+    _, y2t, _, _ = _projected(G, y2, covs if ncov else None)
+    pi, pj = _family_pairs(str(tmp_path / "pairs.txt"), iid)
+    N, M = X.shape
+    kappa = (N - 1.0) * (N - p - 2.0) / ((N - 2.0) * n_eff ** 2)
+    brute = kappa * ((X[pi] * X[pj]) * (y1t[pi] * y2t[pj] + y1t[pj] * y2t[pi])[:, None]).sum(0)
+    np.testing.assert_allclose(tab["REL_M12_y__y2"].to_numpy(), brute, rtol=1e-8, atol=1e-12)
+    # the self pair would equal REL_M: check REL_M from the same run against its own formula
+    np.testing.assert_allclose(tab["REL_M_y"].to_numpy(),
+                               kappa * 2.0 * ((X[pi] * X[pj]) * (y1t[pi] * y1t[pj])[:, None]).sum(0), rtol=1e-8, atol=1e-12)
+    if ncov == 0:                                         # exact: (1/M) sum_j (z1* z2* - REL_M12_j) = y1'K_u y2 / N_eff
+        r1, r2 = (X.T @ y1t) / n_eff, (X.T @ y2t) / n_eff
+        z1 = exact_score_z_from_arrays(r1, np.sqrt((1 - r1 ** 2) / (N - 2)), np.full(M, N), N, 0)
+        z2 = exact_score_z_from_arrays(r2, np.sqrt((1 - r2 ** 2) / (N - 2)), np.full(M, N), N, 0)
+        K = X @ X.T / M
+        K[pi, pj] = 0.0
+        K[pj, pi] = 0.0
+        assert np.mean(z1 * z2 - tab["REL_M12_y__y2"].to_numpy()) == pytest.approx(y1t @ K @ y2t / n_eff, rel=1e-9)
+    c12 = extract_rel_m12(out + ".tsv.gz", "y2", "y", str(tmp_path / "m12.tsv"))
+    assert c12 == pytest.approx(float(brute.mean()))
+
+
+def test_rg_self_pair_with_relatives_equals_h2(tmp_path):
+    """SUM-CORE with REL_M in both files and REL_M12 for the pair: a trait paired with itself (c_ov = 1) gives
+    gamma = pair-excluded h2, so the cross part is excluded exactly like the h2 parts."""
+    from summit.inference.sumcore import Sumcore
+    prefix, G, y, covs, iid, cov_path = _simulate(tmp_path, ncov=2, missing=0.0)
+    pd.DataFrame({"FID": iid, "IID": iid, "y": y, "yb": y}).to_csv(tmp_path / "pheno_self.txt", sep=" ", index=False)
+    out = str(tmp_path / "rel")
+    compute_relative_pair_moments(prefix, str(tmp_path / "pheno_self.txt"), out, pairs=str(tmp_path / "pairs.txt"),
+                                  covar=cov_path, cross=True, ld_rel=True)
+    X, yy, p, n_eff = _projected(G, y, covs)
+    N, M = X.shape
+    _ols_sumstats(tmp_path / "ss.tsv", X, yy, p)
+    append_rel_m_to_sumstats(str(tmp_path / "ss.tsv"), out + ".tsv.gz", "y", str(tmp_path / "ssa.tsv"))
+    append_rel_m_to_sumstats(str(tmp_path / "ss.tsv"), out + ".tsv.gz", "yb", str(tmp_path / "ssb.tsv"))
+    extract_rel_m12(out + ".tsv.gz", "y", "yb", str(tmp_path / "m12.tsv"))
+    ld_exact = ((X.T @ X / n_eff) ** 2).sum(1) - M / n_eff
+    pd.DataFrame({**_snp_meta(M), "L2_0": ld_exact})[["CHR", "SNP", "BP", "L2_0"]].to_csv(
+        tmp_path / "in.gw.ldscore.gz", sep="\t", index=False, float_format="%.6f")
+    adjust_ldscores(str(tmp_path / "in.gw.ldscore.gz"), out + ".tsv.gz", str(tmp_path / "adj.gw.ldscore.gz"))
+    common = dict(ldscores=str(tmp_path / "adj.gw.ldscore.gz"), njack="chr", chisq_threshold=None,
+                  intercept_chisq_thr=None, intercept_rg=1.0, align_alleles=False)
+    res = Sumcore(rg=f"{tmp_path / 'ssa.tsv'},{tmp_path / 'ssb.tsv'}", rel_m12=str(tmp_path / "m12.tsv"), **common)._run()
+    gamma = float(res["rg_fit"].gamma_total[0])
+    assert gamma == pytest.approx(float(res["h2_fit1"].h2[-1, 0]), rel=1e-8)
+    assert float(res["h2_fit2"].h2[-1, 0]) == pytest.approx(float(res["h2_fit1"].h2[-1, 0]), rel=1e-12)
+    # the pair-excluded h2 differs from the naive one, so the check is not vacuous
+    naive = Sumcore(rg=f"{tmp_path / 'ss.tsv'},{tmp_path / 'ss.tsv'}",
+                    **{**common, "ldscores": str(tmp_path / "in.gw.ldscore.gz")})._run()
+    assert abs(float(naive["rg_fit"].gamma_total[0]) - gamma) > 1e-4
+    with pytest.raises(ValueError, match="--rel-m12"):
+        Sumcore(rg=f"{tmp_path / 'ssa.tsv'},{tmp_path / 'ssb.tsv'}", **common)._run()

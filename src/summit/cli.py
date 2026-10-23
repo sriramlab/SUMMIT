@@ -550,6 +550,16 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     cross.add_argument(
+        "--rel-m12",
+        default=None,
+        type=str,
+        help=(
+            "Cross-trait related-pair HE moments (SNP, REL_M12) for the --rg pair, from "
+            "`python -m summit.relatives moments --cross` and `cross-m12`. Required, together with "
+            "REL_M columns in both sumstats files, to exclude related pairs from genetic covariance."
+        ),
+    )
+    cross.add_argument(
         "--pheno-rg-missing-values",
         default="-9",
         type=str,
@@ -2115,6 +2125,7 @@ def _dispatch_rg(args, log):
         intercept_rg=args.intercept_rg,
         pheno_rg=args.pheno_rg,
         pheno_rg_cov=args.pheno_rg_cov,
+        rel_m12=args.rel_m12,
         pheno_rg_missing_values=args.pheno_rg_missing_values,
         pheno_rg_cov_missing_values=args.pheno_rg_cov_missing_values,
         intercept_weight_mode=args.intercept_weight_mode,
@@ -2477,6 +2488,9 @@ def _load_manifest_trait_entry(
 def _dispatch_rg_manifest(args, log):
     if args.ldscores is None:
         log._log("!!! --ldscores must be provided for rg estimation. !!!")
+        raise SystemExit(1)
+    if getattr(args, "rel_m12", None) is not None:
+        log._log("!!! --rel-m12 applies to a single --rg pair; it is not supported in rg manifest mode. !!!")
         raise SystemExit(1)
     if args.intercept_rg is not None or args.pheno_rg is not None or args.pheno_rg_cov is not None:
         log._log(

@@ -154,6 +154,7 @@ def compute_relative_pair_moments(
     step_size: int = 5000,
     ld_rel: bool = False,
     annot: str | None = None,
+    cross: bool = False,
     log=None,
 ) -> dict:
     """Write per-SNP REL_M (one column per phenotype) and optional LD_REL to `out`.tsv.gz.
@@ -162,6 +163,10 @@ def compute_relative_pair_moments(
     non-missing) are processed together; each set gets its own covariate basis.
     LD_REL (one column, or LD_REL_<annotation> per column of `annot`) is computed on
     the samples with complete covariates, the sample of SUMMIT's in-sample LD scores.
+    With `cross`, REL_M12_<a>__<b> is also written for every pair of phenotypes with the
+    same complete-case sample (the cross-trait moment z*_a z*_b has the same derivative
+    kappa with respect to (x_j'y_a)(x_j'y_b), so REL_M12_j = kappa * sum over ordered pairs
+    of x_ij x_i'j y_a,i y_b,i').
     """
     def _log(msg):
         if log is not None:
@@ -245,7 +250,14 @@ def compute_relative_pair_moments(
         groups.setdefault(mask.tobytes(), []).append(k)
 
     rel_m = np.zeros((M, len(pheno_cols)), dtype=np.float64)
+    rel_m12: dict[tuple[int, int], np.ndarray] = {}
     summary = {"nsnps": int(M), "phenotypes": {}, "npairs_listed": int(rp.npairs)}
+    if cross:
+        skipped = [(pheno_cols[k1], pheno_cols[k2]) for g1, ks1 in groups.items() for g2, ks2 in groups.items()
+                   if g1 < g2 for k1 in ks1 for k2 in ks2]
+        if skipped:
+            _log(f"[relatives] REL_M12 not computed for {len(skipped)} phenotype pair(s) with different "
+                 f"complete-case samples, e.g. {skipped[:3]}.")
     for gkey, ks in groups.items():
         mask = np.frombuffer(gkey, dtype=bool)
         idx = np.flatnonzero(mask)
@@ -257,11 +269,20 @@ def compute_relative_pair_moments(
         a, b = _pairs_in(idx)
         Y, _ = _project_normalize(Yall[idx][:, ks].copy(), C, n_eff)
         wp = Y[a] * Y[b]                                          # pairs x phenotypes
+        xpairs = [(t1, t2) for t1 in range(len(ks)) for t2 in range(t1 + 1, len(ks))] if cross else []
+        if xpairs:                                                # pairs x phenotype pairs, both orders of (i, i')
+            wx = np.stack([Y[a, t1] * Y[b, t2] + Y[b, t1] * Y[a, t2] for t1, t2 in xpairs], axis=1)
+            for t1, t2 in xpairs:
+                rel_m12[(ks[t1], ks[t2])] = np.zeros(M, dtype=np.float64)
         share_ld = ld_rel and not ld_done and np.array_equal(idx, ld_idx)
         for s, e in _blocks():
             X, ok = _project_normalize(bed.read(index=np.s_[idx, s:e], dtype="float64"), C, n_eff)
             G = X[a] * X[b]                                       # pairs x SNPs
             rel_m[s:e, ks] = kappa * 2.0 * (G.T @ wp)
+            if xpairs:
+                blk = kappa * (G.T @ wx)
+                for c_, (t1, t2) in enumerate(xpairs):
+                    rel_m12[(ks[t1], ks[t2])][s:e] = blk[:, c_]
             if share_ld:
                 ld_rel_out[s:e] = ld_scale * (G.T @ W)
         if share_ld:
@@ -285,6 +306,12 @@ def compute_relative_pair_moments(
     table = bim[["CHR", "SNP", "BP", "A1", "A2"]].copy()
     for k, name in enumerate(pheno_cols):
         table[f"REL_M_{name}"] = rel_m[:, k]
+    if rel_m12:
+        summary["cross"] = {}
+        for (k1, k2), v in rel_m12.items():
+            name = f"{pheno_cols[k1]}__{pheno_cols[k2]}"
+            table[f"REL_M12_{name}"] = v
+            summary["cross"][name] = {"c_rel12": float(v.mean()), "sum_rel_m12": float(v.sum())}
     if ld_rel:
         for k, name in enumerate(ld_cols):
             table[name] = ld_rel_out[:, k]
@@ -312,6 +339,18 @@ def append_rel_m_to_sumstats(sumstats: str, rel_table: str, pheno: str, out: str
     missing = int(merged["REL_M"].isna().sum())
     merged.to_csv(out, sep="\t", index=False, float_format="%.10g")
     return missing
+
+
+def extract_rel_m12(rel_table: str, pheno1: str, pheno2: str, out: str) -> float:
+    """Write SNP and REL_M12 for one phenotype pair (either order) for `summit --rg ... --rel-m12`."""
+    cols = pd.read_csv(rel_table, sep="\t", nrows=0).columns
+    name = next((f"REL_M12_{a}__{b}" for a, b in ((pheno1, pheno2), (pheno2, pheno1))
+                 if f"REL_M12_{a}__{b}" in cols), None)
+    if name is None:
+        raise ValueError(f"{rel_table} has no REL_M12 for {pheno1} and {pheno2}; run moments with --cross.")
+    t = pd.read_csv(rel_table, sep="\t", usecols=["SNP", name], dtype={"SNP": str}).rename(columns={name: "REL_M12"})
+    t.to_csv(out, sep="\t", index=False, float_format="%.10g")
+    return float(t["REL_M12"].mean())
 
 
 def adjust_ldscores(ldscores: str, rel_table: str, out: str) -> dict:

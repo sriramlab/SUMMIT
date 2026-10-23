@@ -530,6 +530,11 @@ def _build_fast_traits(
             compute_diagnostics=(verbose_level >= 1),
             require_alleles=bool(args.align_alleles),
         )
+        if ss.rel_m is not None:
+            raise RuntimeError(
+                f"{ss.name}: REL_M (related-pair) columns are not supported by the rg manifest fast path; "
+                "run single --rg pairs with --rel-m12."
+            )
         aligned = ss.align_to_trace(shared_trace)
         a1_code, a2_code = _full_axis_allele_codes(aligned, shared_trace)
         keep = np.asarray(
