@@ -60,8 +60,9 @@ finite-vector estimate.
 | Generalized reference plan | Required | — | 4,096 | Required |
 | Reference Z moments | — | — | 128 | — |
 
-Binary inference uses 200 contiguous SNP blocks by default. HE/LDSC uses
-chromosome deletion (`--njack chr`). Input formats and method-specific
+h², rg and binary inference use 200 contiguous SNP blocks by default;
+`--njack chr` deletes one chromosome at a time instead. One-environment G×E
+fits default to chromosome deletion. Input formats and method-specific
 settings are described in the individual analysis guides.
 
 For binary G×E PCGC, `--binary-crossblock-blocks N` at preparation (opt-in,

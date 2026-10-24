@@ -17,13 +17,27 @@ def test_shared_options_preserve_workflow_defaults():
     assert (binary.nvecs, binary.seed, binary.step_size, binary.memory_gib, binary.genome_build) == (256, 0, 256, 1., None)
     assert binary.binary_output_format == "separate"
     ordinary = parser.parse_args([])
-    assert (ordinary.nvecs, ordinary.seed, ordinary.step_size, ordinary.memory_gib, ordinary.njack) == (1000, None, 1000, "auto", "chr")
+    assert (ordinary.nvecs, ordinary.seed, ordinary.step_size, ordinary.memory_gib, ordinary.njack) == (1000, None, 1000, "auto", None)
     args = parser.parse_args(["--binary-method", "pcgc", "--nvecs=31", "--seed", "19", "--block-size=7", "--memory-gib", "2"])
     assert (args.nvecs, args.seed, args.step_size, args.memory_gib) == (31, 19, 7, 2.)
     assert parser.parse_args(["--block-size", "auto"]).step_size == "auto"
     assert _provided_long_options(["--block-size=10"]) & _GXE_BATCH_REFERENCE_OPTIONS == {"--block-size"}
     assert parser.parse_args([]).nvecs == 1000
     assert explicit_options(["--seed=1", "--", "--nvecs"]) == {"--seed"}
+
+
+def test_unset_njack_resolves_per_analysis():
+    """h2/rg default to 200 contiguous SNP blocks; one-environment GxE fits keep chromosome deletion."""
+    from argparse import Namespace
+    from summit.cli import DEFAULT_HE_NJACK, _resolve_njack, build_parser
+    from summit.inference.jackknife import JackknifeSpec
+    assert DEFAULT_HE_NJACK == "200"
+    assert _resolve_njack(Namespace(njack=None), DEFAULT_HE_NJACK) == "200"
+    assert _resolve_njack(Namespace(njack=None), "chr") == "chr"
+    assert _resolve_njack(Namespace(njack="chr"), DEFAULT_HE_NJACK) == "chr"
+    assert build_parser().parse_args(["--njack", "50"]).njack == "50"
+    spec = JackknifeSpec.parse(None)
+    assert (spec.mode, spec.nblocks) == ("block", 200)
 
 
 @pytest.mark.parametrize("flag", ["--binary-probes", "--binary-seed", "--binary-block-size",

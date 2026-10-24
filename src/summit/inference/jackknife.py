@@ -44,7 +44,7 @@ class JackknifeSpec:
         if njack is None:
             return cls(
                 mode="block",
-                nblocks=100,
+                nblocks=200,
                 block_balance=block_balance,
                 min_block_snps=min_block_snps,
             )

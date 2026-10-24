@@ -606,8 +606,8 @@ def build_parser() -> argparse.ArgumentParser:
     regression.add_argument("--enrich-mode", choices=["auto", "overlap", "non-overlap", "both"], default="auto")
 
     # SE / jackknife
-    jackknife.add_argument("--njack", default="chr", type=str, help=(
-        "Jackknife scheme for LD-score input (default: chr). "
+    jackknife.add_argument("--njack", default=None, type=str, help=(
+        "Jackknife scheme for LD-score input (default: 200 contiguous SNP blocks for h2/rg; one-environment GxE fits default to chr). "
         "Binary inference instead defaults to 200 contiguous SNP blocks and accepts integer counts >=2.\n"
         "  * integer (e.g., 1000): contiguous SNP blocks\n"
         "  * 'chr'               : LOCO delete-1\n"
@@ -1983,7 +1983,18 @@ def _dispatch_ldscore(args, log, verbose_on, low_level):
         gwld.close()
 
 
+
+DEFAULT_HE_NJACK = "200"
+
+
+def _resolve_njack(args, default):
+    """Fill the unset --njack with the analysis default (h2/rg: 200 contiguous blocks; GxE fits: chr)."""
+    if getattr(args, "njack", None) is None:
+        args.njack = default
+    return args.njack
+
 def _dispatch_h2(args, log):
+    _resolve_njack(args, DEFAULT_HE_NJACK)
     if args.ldscores is None:
         log._log("!!! --ldscores must be provided for refactored h2 estimation. !!!")
         raise SystemExit(1)
@@ -2029,6 +2040,7 @@ def _dispatch_h2(args, log):
 
 
 def _dispatch_gxe_fit_batch(args, log):
+    _resolve_njack(args, "chr")
     reference, entries = load_gxe_fit_batch_manifest(
         args.gxe_fit_batch,
     )
@@ -2063,6 +2075,7 @@ def _dispatch_gxe_fit_batch(args, log):
 
 
 def _dispatch_gxe_fit(args, log):
+    _resolve_njack(args, "chr")
     missing = [
         name
         for name, value in (
@@ -2113,6 +2126,7 @@ def _dispatch_gxe_fit(args, log):
 
 
 def _dispatch_rg(args, log):
+    _resolve_njack(args, DEFAULT_HE_NJACK)
     if args.ldscores is None:
         log._log("!!! --ldscores must be provided for rg estimation. !!!")
         raise SystemExit(1)
@@ -2486,6 +2500,7 @@ def _load_manifest_trait_entry(
 
 
 def _dispatch_rg_manifest(args, log):
+    _resolve_njack(args, DEFAULT_HE_NJACK)
     if args.ldscores is None:
         log._log("!!! --ldscores must be provided for rg estimation. !!!")
         raise SystemExit(1)

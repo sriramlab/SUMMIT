@@ -12,7 +12,7 @@ genetic responses, use the [cross-trait research API](Cross-trait-analysis.md).
 
 ```bash
 summit --h2 trait.sumstats.gz --ldscores reference.gw.ldscore.gz \
-  --out results/trait --njack chr --num-threads 4
+  --out results/trait --num-threads 4
 ```
 
 For partitioned heritability, add `--annot annotations.tsv` and use the
@@ -33,7 +33,7 @@ For studies with no overlapping participants:
 ```bash
 summit --rg trait1.sumstats.gz,trait2.sumstats.gz \
   --ldscores reference.gw.ldscore.gz --overlap-covariance-rg 0 \
-  --out results/trait1.trait2 --njack chr
+  --out results/trait1.trait2
 ```
 
 For overlapping studies, either supply `--overlap-covariance-rg` or let SUMMIT
@@ -57,7 +57,7 @@ regression LD score:
 ```bash
 summit --rg trait1.sumstats.gz,trait2.sumstats.gz \
   --ldscores partitioned.gw.ldscore.gz --annot annotations.tsv \
-  --ldscores-reg total.gw.ldscore.gz --out results/pair --njack chr
+  --ldscores-reg total.gw.ldscore.gz --out results/pair
 ```
 
 For disjoint annotations, partition LD scores can be summed to obtain total LD.
@@ -75,7 +75,12 @@ because their strand is ambiguous.
 
 ## Standard errors and filtering
 
-`--njack chr` deletes one chromosome at a time. An integer requests SNP blocks.
+The default jackknife deletes one of 200 contiguous SNP blocks at a time; an
+integer sets another block count and `--njack chr` deletes chromosomes. With 200
+blocks the SE is far less variable than with 22 chromosomes. In recently
+admixed cohorts, long-range admixture LD links neighbouring blocks on a
+chromosome and block-jackknife SEs can be too small; chromosome deletion is
+less affected.
 The default jackknife supports varying per-SNP N. The optional
 `--rg-se-method kmoments` and full SCORE normal-equation export require
 constant per-SNP sample sizes because they assume one shared sample matrix.

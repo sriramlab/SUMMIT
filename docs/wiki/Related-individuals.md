@@ -81,7 +81,7 @@ summit relatives append --sumstats trait.sumstats.gz \
   --rel results/relmoments.tsv.gz --pheno TRAIT --out trait.rel.sumstats.gz
 
 summit --h2 trait.rel.sumstats.gz --ldscores reference.gw.ldscore.gz \
-  --out results/trait --njack chr
+  --out results/trait
 ```
 
 When a summary-statistics file has a `REL_M` column, SUMMIT subtracts it from
@@ -141,7 +141,7 @@ summit relatives cross-m12 --rel results/relmoments.tsv.gz \
 summit --rg a.rel.sumstats.gz,b.rel.sumstats.gz --rel-m12 a_b.relm12.tsv \
   --ldscores reference.gw.ldscore.gz \
   --pheno-rg a.pheno.tsv,b.pheno.tsv --pheno-rg-cov covariates.tsv,covariates.tsv \
-  --out results/a.b --njack chr
+  --out results/a.b
 ```
 
 SUMMIT requires `REL_M` in both files together with `--rel-m12`; a partial
