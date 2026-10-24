@@ -53,10 +53,13 @@ includes relatives; h² subtracts it. It is computed from individual-level data
 by `summit relatives`, and rg additionally needs `--rel-m12`. See
 [Related individuals](Related-individuals.md).
 
-Optional `COV_RANK` or `P_EFF` gives the number of non-intercept GWAS covariates;
-`--cov-rank` overrides it. The rg calculation uses this metadata. The current
-h² calculation uses a covariate-rank value of zero, including when h² supplies
-the denominator for rg. [Methods](Methods.md) explains the calculation.
+Optional `COV_RANK` or `P_EFF` gives the number of GWAS covariates other than
+the intercept, counting each indicator column of a categorical covariate;
+`--cov-rank` overrides it. For linearly independent covariates this count is
+their rank. h² and rg then reproduce HE regression on the GWAS sample
+exactly. Without it the value is 0, and h² reads about `(n - p - 1)/(n - 1)` of
+the exact value for p covariates, which matters only when p is not small
+relative to n. [Methods](Methods.md) explains the calculation.
 
 PCGC uses moments prepared from individual binary outcomes and genotypes.
 The [PCGC guide](Binary-traits-and-PCGC.md) describes its sample table,

@@ -26,9 +26,13 @@ z*_j = sqrt(N_max - c - 1) * beta_j
        / sqrt(beta_j² + (n_j - c - 2) * se_j²).
 ```
 
-Here c is the non-intercept covariate rank. The current h² implementation sets
-c=0; rg resolves c from the input metadata. Heritability denominators in rg
-retain the h² convention. This distinction matters when comparing implementations.
+Here c is the rank of the GWAS covariates other than the intercept, taken from
+`--cov-rank`, a `COV_RANK` or `P_EFF` column, or for rg the `--pheno-rg-cov`
+files, and 0 when none is given. With c equal to that rank, the reconstruction
+reproduces HE regression on the projected genotypes and phenotype exactly for
+OLS summary statistics. With c = 0, h² and the covariance are both multiplied
+by about `(n - p - 1)/(n - 1)` for p covariates, which leaves rg unchanged. h²
+and rg use the same c for each trait.
 
 Write `N* = N_max - c - 1` and `n*_j = n_j - c - 1`. Under the
 linear-regression null, the variance of this reference-scaled score is
@@ -134,13 +138,13 @@ The removed term splits over SNPs. With
 `s_j = Σ_{(i,i') in P, ordered} x_ij x_i'j y_i y_i'`, the HE-scale moment loses
 
 ```text
-REL_M_j = κ s_j,     κ = (n - 1)(n - p - 2) / {(n - 2) N_eff²},
+REL_M_j = s_j / N_eff.
 ```
 
-the derivative of `z*_j²` (h² convention, c = 0) with respect to `(x_jᵀ y)²`
-at zero association. The h² response becomes `1 + q_j - REL_M_j`. Without
-covariates `(N*/M) Σ_j (z*_j² - REL_M_j) = yᵀ K_u y` holds exactly; with p
-covariates the error is of relative order `r_j² p / n`. Because the correction
+With c = p, `z*_j² = (x_jᵀ y)² / N_eff` for OLS statistics, so the h² response
+`1 + q_j - REL_M_j` gives `(N*/M) Σ_j (z*_j² - REL_M_j) = yᵀ K_u y` exactly.
+With c = 0, the derivative of `z*_j²` with respect to `(x_jᵀ y)²` differs from
+`1/N_eff` by a relative `p/n²`. Because the correction
 is per SNP, annotation sums and every jackknife deletion use it unchanged.
 `c_rel = mean_j REL_M_j` is the relative-pair covariance in HE scale.
 
@@ -156,15 +160,14 @@ LD_REL_{j,k} = N_eff⁻² Σ_{(i,i') in P, ordered} x_ij x_i'j W_k,ii',     W_k,
 with `a_j'k V_j'` in place of `a_j'k` for V-weighted LD scores, and
 `l_{j,k} - LD_REL_{j,k}` reconstructs the pair-excluded traces exactly.
 
-For rg, the cross-trait moment `z*_1j z*_2j` has the same derivative κ with
-respect to `(x_jᵀ y_1)(x_jᵀ y_2)` when both traits use one sample, so
+For rg, the cross-trait moment is `z*_1j z*_2j = (x_jᵀ y_1)(x_jᵀ y_2) / N_eff`
+when both traits use one sample, so
 
 ```text
-REL_M12_j = κ Σ_{(i,i') in P, ordered} x_ij x_i'j y_1i y_2i'
+REL_M12_j = N_eff⁻¹ Σ_{(i,i') in P, ordered} x_ij x_i'j y_1i y_2i'
 ```
 
-is subtracted from the bivariate response. rg resolves c from the input
-metadata; at c = p the derivative differs from κ by a relative `p/n²`. The
+is subtracted from the bivariate response. The
 overlap covariance concerns each person's own pair of phenotypes and keeps
 its usual meaning.
 

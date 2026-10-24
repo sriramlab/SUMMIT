@@ -143,9 +143,13 @@ def build_h2_summary_moment(
     cov_rank=None,
     cov_rank_source=None,
 ):
-    """Build the h2 response using the intercept-only GWAS convention."""
-    resolved_cov_rank = 0
-    source = "forced0_no_covrank_h2"
+    """Build the h2 response with the GWAS covariate rank (explicit, then sumstats metadata, else 0)."""
+    resolved_cov_rank, source = resolve_cov_rank(
+        explicit=cov_rank,
+        explicit_source=cov_rank_source,
+        sumstats_value=getattr(matched, "cov_rank", None),
+        sumstats_source=getattr(matched, "cov_rank_source", None),
+    )
 
     y = h2_moment_from_arrays(
         beta=np.asarray(matched.beta, dtype=np.float64),

@@ -1444,8 +1444,7 @@ class Sumcore:
         """
         If --pheno-rg and --pheno-rg-cov are both provided, derive cov_rank
         (non-intercept df) from the external covariate designs and attach those
-        values to the rg summary-moment path. h2 summary mode still forces
-        cov_rank=0 inside moments.build_h2_summary_moment().
+        values to the trait sumstats, which both the h2 and rg moments use.
         """
         if self.pheno_rg_paths is None or self.pheno_rg_cov_paths is None:
             return None

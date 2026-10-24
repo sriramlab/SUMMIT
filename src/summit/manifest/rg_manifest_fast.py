@@ -543,7 +543,7 @@ def _build_fast_traits(
         )
         entry = type("Entry", (), {"aligned": aligned, "sumstats": ss})
         beta, se, n = _full_axis_sumstats_arrays(entry, shared_trace)
-        y_h2 = h2_moment_from_arrays(beta, se, n, nsamp=float(ss.nsamp), cov_rank=0)
+        y_h2 = h2_moment_from_arrays(beta, se, n, nsamp=float(ss.nsamp), cov_rank=int(ss.cov_rank))
         z_rg = exact_score_z_from_arrays(beta, se, n, nsamp=float(ss.nsamp), cov_rank=int(ss.cov_rank))
         keep &= np.isfinite(y_h2) & np.isfinite(z_rg)
 
@@ -1148,9 +1148,9 @@ def dispatch_rg_manifest_fast(args, log, manifest_df, trait_meta, verbose_level:
 
         h2_info = {
             "mode": "beta_se_exact_sparse_drop",
-            "cov_rank": 0,
-            "cov_rank_source": "forced0_no_covrank_h2",
-            "n_scale": float(effective_n_scale(tr.nsamp, 0)),
+            "cov_rank": int(tr.cov_rank),
+            "cov_rank_source": str(tr.cov_rank_source),
+            "n_scale": float(effective_n_scale(tr.nsamp, tr.cov_rank)),
             "n_nonfinite": 0,
         }
         fit = _stack_h2_prepared(

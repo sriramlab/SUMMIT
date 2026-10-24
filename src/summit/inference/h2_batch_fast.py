@@ -174,7 +174,7 @@ def _parse_trait_column(
         se=ss.se[source_rows],
         n_obs=ss.n[source_rows],
         nsamp=float(ss.nsamp),
-        cov_rank=0,
+        cov_rank=int(ss.cov_rank),
     )
     finite = np.isfinite(y_used)
     active_rows = used_rows[finite]
@@ -210,9 +210,9 @@ def _parse_trait_column(
     )
     info = {
         "mode": "beta_se_exact_fast_batch",
-        "cov_rank": 0,
-        "cov_rank_source": "forced0_no_covrank_h2",
-        "n_scale": float(effective_n_scale(ss.nsamp, 0)),
+        "cov_rank": int(ss.cov_rank),
+        "cov_rank_source": str(ss.cov_rank_source),
+        "n_scale": float(effective_n_scale(ss.nsamp, ss.cov_rank)),
         "n_nonfinite": int(np.sum(~finite)),
     }
 
@@ -392,7 +392,7 @@ def _stream_trait_column(
         se=se[rows],
         n_obs=obs_n[rows],
         nsamp=nmax,
-        cov_rank=0,
+        cov_rank=int(resolved_cov_rank),
     )
     finite_h2 = np.isfinite(y_used)
     active_rows = rows[finite_h2]
@@ -415,9 +415,9 @@ def _stream_trait_column(
     )
     info = {
         "mode": "beta_se_exact_fast_batch",
-        "cov_rank": 0,
-        "cov_rank_source": "forced0_no_covrank_h2",
-        "n_scale": float(effective_n_scale(nmax, 0)),
+        "cov_rank": int(resolved_cov_rank),
+        "cov_rank_source": str(resolved_source),
+        "n_scale": float(effective_n_scale(nmax, resolved_cov_rank)),
         "n_nonfinite": int(np.sum(~finite_h2)),
     }
     return _LoadedTrait(

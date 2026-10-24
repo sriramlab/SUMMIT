@@ -10,12 +10,13 @@ over SNPs:
     s_j = sum_{(i,i') in P, ordered} x_ij x_i'j y_i y_i'.
 
 With genotypes and phenotype projected on the GWAS covariates and normalized to
-N_eff = n - p - 1, the per-SNP correction on SUMMIT's m_j scale is
+N_eff = n - p - 1, SUMMIT's beta/SE moment with the GWAS covariate rank (c = p) is
+m_j = (x_j'y)^2 / N_eff exactly, so the per-SNP correction on the m_j scale is
 
-    REL_M_j = kappa * s_j,   kappa = (n - 1)(n - p - 2) / ((n - 2) N_eff^2),
+    REL_M_j = s_j / N_eff.
 
-the derivative of SUMMIT's beta/SE moment (cov_rank 0 convention) with respect to
-(x_j'y)^2 at zero association. SUMMIT subtracts REL_M_j from m_j when a sumstats
+With c = 0 (no covariate rank supplied) the moment's derivative with respect to (x_j'y)^2
+differs by a relative p / n^2. SUMMIT subtracts REL_M_j from m_j when a sumstats
 file carries a REL_M column, which excludes the related pairs from the numerator
 of every SUM-RHE normal equation, for any annotation model or jackknife design.
 
@@ -193,9 +194,8 @@ def compute_relative_pair_moments(
     Phenotypes sharing the same complete-case sample set (phenotype and covariates
     non-missing) are processed together; each set gets its own covariate basis.
     With `cross`, REL_M12_<a>__<b> is also written for every pair of phenotypes with the
-    same complete-case sample (the cross-trait moment z*_a z*_b has the same derivative
-    kappa with respect to (x_j'y_a)(x_j'y_b), so REL_M12_j = kappa * sum over ordered pairs
-    of x_ij x_i'j y_a,i y_b,i').
+    same complete-case sample (the cross-trait moment z*_a z*_b = (x_j'y_a)(x_j'y_b) / N_eff,
+    so REL_M12_j = (1 / N_eff) * sum over ordered pairs of x_ij x_i'j y_a,i y_b,i').
     """
     def _log(msg):
         if log is not None:
@@ -266,7 +266,7 @@ def compute_relative_pair_moments(
         C = _basis(idx)
         p = int(C.shape[1])
         n_eff = float(n - p - 1)
-        kappa = (n - 1.0) * (n - p - 2.0) / ((n - 2.0) * n_eff * n_eff)
+        kappa = 1.0 / n_eff
         a, b = _pairs_in(idx)
         Y, _ = _project_normalize(Yall[idx][:, ks].copy(), C, n_eff)
         wp = Y[a] * Y[b]                                          # pairs x phenotypes

@@ -408,7 +408,7 @@ class Sumrhe:
             se=ss.se[pos],
             n_obs=ss.n[pos],
             nsamp=float(ss.nsamp),
-            cov_rank=0,
+            cov_rank=int(ss.cov_rank),
         )
         rel_info = None
         if ss.rel_m is not None:
@@ -428,9 +428,9 @@ class Sumrhe:
 
         info = {
             "mode": "beta_se_exact",
-            "cov_rank": 0,
-            "cov_rank_source": "forced0_no_covrank_h2",
-            "n_scale": float(effective_n_scale(ss.nsamp, 0)),
+            "cov_rank": int(ss.cov_rank),
+            "cov_rank_source": str(ss.cov_rank_source),
+            "n_scale": float(effective_n_scale(ss.nsamp, ss.cov_rank)),
             "n_nonfinite": int(np.sum(~np.isfinite(y_used))),
         }
         if rel_info is not None:

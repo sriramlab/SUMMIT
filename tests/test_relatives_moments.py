@@ -81,8 +81,7 @@ def test_rel_m_matches_brute_force(tmp_path, ncov):
     X, yy, p, n_eff = _projected(G, y, covs if ncov else None)
     pi, pj = _family_pairs(str(tmp_path / "pairs.txt"), iid)
     N = G.shape[0]
-    kappa = (N - 1.0) * (N - p - 2.0) / ((N - 2.0) * n_eff ** 2)
-    brute = kappa * 2.0 * ((X[pi] * X[pj]) * (yy[pi] * yy[pj])[:, None]).sum(0)
+    brute = 2.0 * ((X[pi] * X[pj]) * (yy[pi] * yy[pj])[:, None]).sum(0) / n_eff
     np.testing.assert_allclose(tab["REL_M_y"].to_numpy(), brute, rtol=1e-8, atol=1e-12)
 
 
@@ -95,12 +94,10 @@ def test_family_closure_adds_chain_pair(tmp_path):
     assert (0, 3) not in set(zip(rp.i.tolist(), rp.j.tolist()))
 
 
-@pytest.mark.parametrize("ncov,rtol", [(0, 1e-9), (2, 2e-3)])
-def test_pair_excluded_quadratic_form_identity(tmp_path, ncov, rtol):
-    """(n_scale/M) sum_j (m_j - REL_M_j) equals y'K_u y, K_u = GRM with related pairs removed.
-
-    Exact without covariates; with p covariates SUMMIT's h2 moment uses the intercept-only (cov_rank 0)
-    convention, which matches the projected scale up to O(p^2/N^2)."""
+@pytest.mark.parametrize("ncov", [0, 2])
+def test_pair_excluded_quadratic_form_identity(tmp_path, ncov):
+    """(n_scale/M) sum_j (m_j - REL_M_j) equals y'K_u y, K_u = GRM with related pairs removed, exactly when the
+    h2 moment uses the GWAS covariate rank."""
     prefix, G, y, covs, iid, cov_path = _simulate(tmp_path, ncov=ncov, missing=0.0)
     out = str(tmp_path / "rel")
     compute_relative_pair_moments(prefix, str(tmp_path / "pheno.txt"), out, pairs=str(tmp_path / "pairs.txt"),
@@ -114,14 +111,13 @@ def test_pair_excluded_quadratic_form_identity(tmp_path, ncov, rtol):
     resid_var = (1 - r * r) / nu_true
     beta = r            # on the normalized scale; SUMMIT's moment depends on beta/SE only through r
     se = np.sqrt(resid_var)
-    m = h2_moment_from_arrays(beta=beta, se=se, n_obs=np.full(M, float(N)), nsamp=float(N), cov_rank=0)
-    lhs = (N - 1.0) / M * (m - rel).sum()
+    m = h2_moment_from_arrays(beta=beta, se=se, n_obs=np.full(M, float(N)), nsamp=float(N), cov_rank=p)
+    lhs = n_eff / M * (m - rel).sum()
     pi, pj = _family_pairs(str(tmp_path / "pairs.txt"), iid)
     K = X @ X.T / M
     K[pi, pj] = 0.0
     K[pj, pi] = 0.0
-    rhs = yy @ K @ yy * (N - 1.0) / n_eff
-    np.testing.assert_allclose(lhs, rhs, rtol=rtol)
+    np.testing.assert_allclose(lhs, yy @ K @ yy, rtol=1e-9)
 
 
 def test_sumstats_rel_m_column_is_subtracted(tmp_path):
@@ -201,8 +197,7 @@ def test_missing_phenotype_rel_m_uses_complete_cases(tmp_path):
     a, b = pos[pi[use]], pos[pj[use]]
     Xs, ys, p, ne = _projected(G[keep], y[keep], covs[keep])
     n = int(keep.sum())
-    kappa = (n - 1.0) * (n - p - 2.0) / ((n - 2.0) * ne ** 2)
-    brute = kappa * 2.0 * ((Xs[a] * Xs[b]) * (ys[a] * ys[b])[:, None]).sum(0)
+    brute = 2.0 * ((Xs[a] * Xs[b]) * (ys[a] * ys[b])[:, None]).sum(0) / ne
     np.testing.assert_allclose(tab["REL_M_y"].to_numpy(), brute, rtol=1e-8, atol=1e-12)
 
 
@@ -258,20 +253,20 @@ def test_rel_m12_matches_brute_force_and_cross_identity(tmp_path, ncov):
     _, y2t, _, _ = _projected(G, y2, covs if ncov else None)
     pi, pj = _family_pairs(str(tmp_path / "pairs.txt"), iid)
     N, M = X.shape
-    kappa = (N - 1.0) * (N - p - 2.0) / ((N - 2.0) * n_eff ** 2)
+    kappa = 1.0 / n_eff
     brute = kappa * ((X[pi] * X[pj]) * (y1t[pi] * y2t[pj] + y1t[pj] * y2t[pi])[:, None]).sum(0)
     np.testing.assert_allclose(tab["REL_M12_y__y2"].to_numpy(), brute, rtol=1e-8, atol=1e-12)
     # the self pair would equal REL_M: check REL_M from the same run against its own formula
     np.testing.assert_allclose(tab["REL_M_y"].to_numpy(),
                                kappa * 2.0 * ((X[pi] * X[pj]) * (y1t[pi] * y1t[pj])[:, None]).sum(0), rtol=1e-8, atol=1e-12)
-    if ncov == 0:                                         # exact: (1/M) sum_j (z1* z2* - REL_M12_j) = y1'K_u y2 / N_eff
-        r1, r2 = (X.T @ y1t) / n_eff, (X.T @ y2t) / n_eff
-        z1 = exact_score_z_from_arrays(r1, np.sqrt((1 - r1 ** 2) / (N - 2)), np.full(M, N), N, 0)
-        z2 = exact_score_z_from_arrays(r2, np.sqrt((1 - r2 ** 2) / (N - 2)), np.full(M, N), N, 0)
-        K = X @ X.T / M
-        K[pi, pj] = 0.0
-        K[pj, pi] = 0.0
-        assert np.mean(z1 * z2 - tab["REL_M12_y__y2"].to_numpy()) == pytest.approx(y1t @ K @ y2t / n_eff, rel=1e-9)
+    # exact with the GWAS covariate rank: (1/M) sum_j (z1* z2* - REL_M12_j) = y1'K_u y2 / N_eff
+    r1, r2 = (X.T @ y1t) / n_eff, (X.T @ y2t) / n_eff
+    z1 = exact_score_z_from_arrays(r1, np.sqrt((1 - r1 ** 2) / (N - p - 2)), np.full(M, N), N, p)
+    z2 = exact_score_z_from_arrays(r2, np.sqrt((1 - r2 ** 2) / (N - p - 2)), np.full(M, N), N, p)
+    K = X @ X.T / M
+    K[pi, pj] = 0.0
+    K[pj, pi] = 0.0
+    assert np.mean(z1 * z2 - tab["REL_M12_y__y2"].to_numpy()) == pytest.approx(y1t @ K @ y2t / n_eff, rel=1e-9)
     c12 = extract_rel_m12(out + ".tsv.gz", "y2", "y", str(tmp_path / "m12.tsv"))
     assert c12 == pytest.approx(float(brute.mean()))
 

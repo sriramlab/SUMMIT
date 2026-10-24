@@ -580,7 +580,9 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     regression.add_argument("--cov-rank", default=None, type=str,
-                        help="Specify the rank of the covariate matrix (comma-separated). Must be non-negative. Default is 0.")
+                        help=("Rank of the GWAS covariates other than the intercept, one value per trait "
+                              "(comma-separated); overrides COV_RANK/P_EFF in the sumstats. Default: the sumstats "
+                              "value, else 0."))
 
 
     # Additional input
