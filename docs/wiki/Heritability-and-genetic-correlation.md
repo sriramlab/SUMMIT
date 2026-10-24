@@ -26,16 +26,16 @@ For a GWAS that includes related individuals, add the related-pair moments
 described in [Related individuals](Related-individuals.md) instead of pruning
 to an unrelated set.
 
-When the LD-score file has a `V` column, from an LD-score run with covariates
-([LD scores](LD-scores.md#covariates-and-snp-variance-weights)), `--h2` and
-`--rg` fit the covariate-adjusted GRM of the genotypes before adjustment.
-h², per-bin h², enrichment and rg then refer to that GRM, as in GCTA or
-RHE-mc with the GWAS covariates. The log reports `SNP-variance weights: on`.
-Files without V are fitted as before. `--snp-var-weights-off` refuses a V file,
-whose LD scores are valid only with the weights; recompute them with
-`--snp-var-weights-off` for an ordinary file. V files do not yet support
-`--weight-mode ldsc`, `--adjust-delta`, `--rg-se-method robust` or
-`kmoments`, or `--rg-manifest-fast`.
+When the LD-score file has a `V` column, written by an LD-score run with
+covariates ([LD scores](LD-scores.md#covariates-and-snp-variance-weights)),
+`--h2` and `--rg` fit the GRM of the standardized genotypes with the covariates
+as fixed effects, as GCTA and RHE-mc do. h², per-bin h², enrichment and rg then
+refer to that model, and the log reports `SNP-variance weights: on`. Files
+without V are fitted as before. With `--snp-var-weights-off`, `--h2` and `--rg`
+stop with an error on a file with V, because its LD scores are valid only with
+the weights. Recompute the LD scores with `--snp-var-weights-off` for an
+ordinary file. Files with V do not yet support `--weight-mode ldsc`,
+`--adjust-delta`, `--rg-se-method robust` or `kmoments`, or `--rg-manifest-fast`.
 
 ## Genetic correlation
 
@@ -89,7 +89,7 @@ because their strand is ambiguous.
 The default jackknife deletes one of 200 contiguous SNP blocks at a time; an
 integer sets another block count and `--njack chr` deletes chromosomes. With 200
 blocks the SE is far less variable than with 22 chromosomes. In recently
-admixed cohorts, long-range admixture LD links neighbouring blocks on a
+admixed cohorts, long-range admixture LD links neighboring blocks on a
 chromosome and block-jackknife SEs can be too small; chromosome deletion is
 less affected. For confidence intervals and tests, use t quantiles with B - 1
 degrees of freedom for B jackknife blocks: 1.97 instead of 1.96 for 200 blocks,

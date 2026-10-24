@@ -5,10 +5,11 @@ share untagged genetic variation and often environment, so including them
 inflates the estimates. Pruning to an unrelated set avoids this but discards
 people, which matters most in small or admixed cohorts.
 
-This workflow keeps every individual and removes the related *pairs* from the
-estimating equations instead. Run the GWAS on everyone as usual. The study then
-computes a per-SNP related-pair moment, `REL_M`, from genotypes and phenotypes
-and adds it to the summary statistics; `summit --h2` subtracts it. The estimate
+This workflow keeps every individual and removes the related pairs from the
+estimating equations instead. Run the GWAS on everyone as usual. SUMMIT then
+computes a per-SNP related-pair moment, `REL_M`, from the genotypes and
+phenotypes, which is added to the summary statistics and subtracted by
+`summit --h2`. The estimate
 stays unbiased whatever the phenotypic covariance between relatives.
 [Methods](Methods.md#related-individuals) gives the estimating equations.
 
@@ -25,7 +26,7 @@ stays unbiased whatever the phenotypic covariance between relatives.
   (BOLT-LMM, REGENIE, fastGWA) are not valid inputs.
 
 ```text
-IID1 IID2 KINSHIP
+IID1 IID2 RELATEDNESS
 SIM000001 SIM000002 0.51
 SIM000002 SIM000417 0.06
 ```
@@ -33,8 +34,8 @@ SIM000002 SIM000417 0.06
 Listed pairs are closed into families (connected components) by default, and
 every within-family pair is excluded. `--no-closure` excludes only the listed
 pairs. With `--kinship-col` and `--kinship-min`, only pairs above the threshold
-are used. Relatedness (twice the kinship coefficient) above 0.0442, fourth
-degree or closer, is a reasonable default.
+in that column are used. For relatedness (twice the kinship coefficient), 0.0442
+keeps fourth-degree and closer relatives and is a reasonable default.
 
 SUMMIT's PC-adjusted GRM on LD-pruned SNPs and PC-Relate give practically the
 same families. KING-robust overstates kinship for individuals of intermediate
@@ -47,7 +48,7 @@ families do not form their own components.
 ```bash
 summit relatives moments \
   --geno study.bed --pheno phenotypes.tsv --covar covariates.tsv \
-  --pairs pairs.tsv --kinship-col KINSHIP --kinship-min 0.0442 \
+  --pairs pairs.tsv --kinship-col RELATEDNESS --kinship-min 0.0442 \
   --out results/relmoments
 ```
 
@@ -107,13 +108,13 @@ same pairs and options as `moments`:
 
 ```bash
 summit --geno study.bed --covar covariates.tsv \
-  --relative-pairs pairs.tsv --kinship-col KINSHIP --kinship-min 0.0442 \
+  --relative-pairs pairs.tsv --kinship-col RELATEDNESS --kinship-min 0.0442 \
   --nvecs 20000 --block-size 16384 --num-threads 16 --out ld/study
 ```
 
-`ld/study.gw.ldscore.gz` then has an `LD_REL_<column>` column after the LD
-scores for each LD-score column: the related pairs' share of that LD score.
-Fit with this file as usual. `--h2` and `--rg` subtract LD_REL for summary
+`ld/study.gw.ldscore.gz` then has one `LD_REL_<column>` column per LD-score
+column, holding the related pairs' share of that LD score. Fit with this file
+as usual. `--h2` and `--rg` subtract LD_REL for summary
 statistics with `REL_M` and use the LD scores unchanged otherwise; the log says
 which. The LD-score step uses every sample with complete covariates, regardless
 of phenotype missingness, and computes LD_REL with the same samples, covariates,
@@ -144,8 +145,8 @@ summit --rg a.rel.sumstats.gz,b.rel.sumstats.gz --rel-m12 a_b.relm12.tsv \
   --out results/a.b
 ```
 
-SUMMIT requires `REL_M` in both files together with `--rel-m12`; a partial
-specification would remove the pairs from some equations but not others. With
+SUMMIT requires `REL_M` in both files and `--rel-m12`. With only some of them,
+the pairs would be removed from some estimating equations and kept in others. With
 in-sample LD scores that carry LD_REL, the same file serves h² and rg.
 `REL_M12` exists only for phenotypes with identical complete-case samples.
 The sample-overlap covariance describes each person's own two phenotypes and
@@ -153,10 +154,10 @@ needs no change. rg manifests do not accept `REL_M`.
 
 ## Interpretation
 
-The target is the usual SNP heritability of the kernel's SNPs, not a
-family-based heritability. Excess covariance between relatives, from shared
-environment or untagged variants, leaves with their pairs whatever its form.
-Pairs below the threshold remain; their contribution scales with their
+The estimate is the SNP heritability of the SNPs in the GRM, the quantity
+SUMMIT estimates in unrelated samples. Covariance between relatives from
+shared environment or untagged variants is removed with their pairs, whatever
+its form. Pairs below the threshold remain; their contribution scales with their
 squared relatedness and is small for distant relatives.
 
 Jackknife standard errors are computed as for unrelated samples.

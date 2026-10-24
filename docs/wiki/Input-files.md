@@ -96,8 +96,8 @@ for the quantitative Python interface.
 
 LD-score files begin with `CHR SNP BP`, optionally `CM`, then an optional
 `V` column, the LD-score columns, and optional `LD_REL_<column>` columns. V
-marks LD scores weighted by each SNP's variance left after covariate adjustment
-([LD scores](LD-scores.md#covariates-and-snp-variance-weights)). LD_REL holds the
+marks LD scores that weight each SNP by its share of variance left after
+covariate adjustment ([LD scores](LD-scores.md#covariates-and-snp-variance-weights)). LD_REL holds the
 related pairs' share of each LD score ([Related individuals](Related-individuals.md#ld-scores)).
 Files without these columns are fitted as before. `V` and names beginning with
 `LD_REL` are reserved and cannot be annotation names. An annotation file

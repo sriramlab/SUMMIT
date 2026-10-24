@@ -26,36 +26,38 @@ holds the annotation masses (SNP counts per annotation).
 
 ## Covariates and SNP-variance weights
 
-With `--covar`, genome-wide LD scores are built from covariate-adjusted
-genotypes, and the output gains a `V` column after `BP`. V is each SNP's
-share of genotype variance left after covariate adjustment, `1 - adjusted R²`
-of the SNP on the covariates. It is close to 1 for a SNP that the covariates
-explain no better than chance and 0 for a monomorphic SNP. The LD scores
-weight each partner SNP by its V:
+With `--covar`, genome-wide LD scores are computed from genotypes adjusted
+for the covariates, and the output gains a `V` column after `BP`. V is one
+minus the adjusted R² of the SNP on the covariates, the share of its variance
+that the covariates leave. It is close to 1 for a SNP that the covariates
+explain no better than chance and 0 for a monomorphic SNP. Each LD score
+weights its partner SNPs by their V. The file then begins
 
 ```text
 CHR SNP BP V L2_0
 1 sim_variant_000001 10583 0.991204 41.802113
 ```
 
-With these weights, `--h2` and `--rg` fit the covariate-adjusted GRM of the
-genotypes before adjustment, the GRM that GCTA and RHE-mc use with the same
-covariates, and report h² on that scale. Without them, each SNP is rescaled
-to unit variance after adjustment, which down-weights SNPs that the
-covariates partly explain. h² is then too low in admixed cohorts: in
-simulations on UK Biobank AFR genotypes with 10 PCs, h² of 0.5 was estimated
-at about 0.48.
+With these weights, `--h2` and `--rg` fit the GRM of the standardized
+genotypes with the covariates as fixed effects, as GCTA and RHE-mc do, and
+report h² for that model. Ordinary LD scores rescale each SNP to unit variance
+after adjustment, which gives more weight to SNPs that the covariates partly
+explain. In admixed cohorts h² is then too low. In simulations on UK Biobank
+AFR genotypes with 10 PCs, an h² of 0.5 was estimated at about 0.48 without
+the weights.
 
-The weights describe the LD-score sample and its covariates. Use the GWAS
-covariates; in admixed cohorts, compute the LD scores in the GWAS sample
-itself. `--snp-var-weights-off` writes ordinary LD scores without V.
-Windowed LD scores are written without V. `--correct-skew` and
+Use the GWAS covariates for the LD scores, and in admixed cohorts compute the
+LD scores in the GWAS sample itself. Because V uses the adjusted R², it does
+not depend on the size of the LD-score sample, so LD scores from a random
+subset of the GWAS sample (`--rand-samp`) can be used as with ordinary LD
+scores. `--snp-var-weights-off` writes ordinary
+LD scores without V. Windowed LD scores have no V column. `--correct-skew` and
 `--write-kmoments` require `--snp-var-weights-off`.
 
 ## Related individuals in the LD sample
 
 When in-sample LD scores include relatives, `--relative-pairs pairs.tsv`
-adds an `LD_REL_<column>` column after the LD scores for each LD-score column.
+adds one `LD_REL_<column>` column per LD-score column, after the LD scores.
 Each holds the related pairs' share of that LD score, computed with the same
 samples, covariates, annotation and V weights. `--kinship-col`, `--kinship-min` and
 `--no-closure` select pairs as in `summit relatives moments`; use the same

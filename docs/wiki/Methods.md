@@ -90,8 +90,9 @@ V_j = (1 - R²_j)(n - 1) / (n - p - 1),
 
 one minus the adjusted R² of SNP j on the p covariates. For an infinitesimal
 model on the unadjusted genotypes, the ordinary fit targets approximately
-`h² (1 - Σ_j w_j R²_j)` with LD-dependent weights `w_j`. It is low when the
-covariates explain genotype variation, as in admixed cohorts.
+`h² (1 - Σ_j w_j R²_j)` with LD-dependent weights `w_j`. This target is below
+h² when the covariates explain part of the genotype variance, as in admixed
+cohorts.
 
 With V, the LD scores weight partner SNPs by `a_j'k V_j'` and the fit uses
 `a_jk V_j` as instruments, which is HE regression with the kernels
@@ -117,8 +118,9 @@ GRM of these genotypes. With a set P of related pairs, the model is
 E[y yᵀ | G] = σ²_g K + σ²_e I + Δ,     Δ_ii' unrestricted for (i,i') in P, zero elsewhere.
 ```
 
-Δ holds whatever relatives share beyond the kernel: untagged variants,
-household environment, indirect effects. Removing P from the HE quadratic form,
+Δ holds any covariance between relatives beyond the kernel, for example from
+untagged variants, household environment or indirect genetic effects. Removing
+P from the HE quadratic form,
 
 ```text
 yᵀ K_u y = yᵀ K y - Σ_{(i,i') in P, ordered} K_ii' y_i y_i',
@@ -145,7 +147,7 @@ is per SNP, annotation sums and every jackknife deletion use it unchanged.
 With LD scores from an unrelated sample of the same ancestry composition, the
 trace needs no change. SUMMIT's in-sample LD scores satisfy
 `N_eff + N_eff² Σ_j l_j / M² = tr(K²)`, which includes the relatives' pairs.
-Their share is the relatedness LD score
+Their share of each LD score is
 
 ```text
 LD_REL_{j,k} = N_eff⁻² Σ_{(i,i') in P, ordered} x_ij x_i'j W_k,ii',     W_k,ii' = Σ_j' a_j'k x_ij' x_i'j',
