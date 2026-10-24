@@ -94,8 +94,14 @@ for the quantitative Python interface.
 
 ## LD scores and annotations
 
-LD-score files begin with `CHR SNP BP`, optionally `CM`, followed by LD-score
-columns. An annotation file contains either:
+LD-score files begin with `CHR SNP BP`, optionally `CM`, then an optional
+`V` column, the LD-score columns, and optional `LD_REL_<column>` columns. V
+marks LD scores weighted by each SNP's variance left after covariate adjustment
+([LD scores](LD-scores.md#covariates-and-snp-variance-weights)). LD_REL holds the
+related pairs' share of each LD score ([Related individuals](Related-individuals.md#ld-scores)).
+Files without these columns are fitted as before. `V` and names beginning with
+`LD_REL` are reserved and cannot be annotation names. An annotation file
+contains either:
 
 - `CHR BP SNP`, optional `CM`, and named annotation columns; or
 - a numeric matrix with one row per input SNP, optionally headed by column names.

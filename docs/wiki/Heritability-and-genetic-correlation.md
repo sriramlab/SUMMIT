@@ -26,6 +26,17 @@ For a GWAS that includes related individuals, add the related-pair moments
 described in [Related individuals](Related-individuals.md) instead of pruning
 to an unrelated set.
 
+When the LD-score file has a `V` column, from an LD-score run with covariates
+([LD scores](LD-scores.md#covariates-and-snp-variance-weights)), `--h2` and
+`--rg` fit the covariate-adjusted GRM of the genotypes before adjustment.
+h², per-bin h², enrichment and rg then refer to that GRM, as in GCTA or
+RHE-mc with the GWAS covariates. The log reports `SNP-variance weights: on`.
+Files without V are fitted as before. `--snp-var-weights-off` refuses a V file,
+whose LD scores are valid only with the weights; recompute them with
+`--snp-var-weights-off` for an ordinary file. V files do not yet support
+`--weight-mode ldsc`, `--adjust-delta`, `--rg-se-method robust` or
+`kmoments`, or `--rg-manifest-fast`.
+
 ## Genetic correlation
 
 For studies with no overlapping participants:
@@ -80,7 +91,9 @@ integer sets another block count and `--njack chr` deletes chromosomes. With 200
 blocks the SE is far less variable than with 22 chromosomes. In recently
 admixed cohorts, long-range admixture LD links neighbouring blocks on a
 chromosome and block-jackknife SEs can be too small; chromosome deletion is
-less affected.
+less affected. For confidence intervals and tests, use t quantiles with B - 1
+degrees of freedom for B jackknife blocks: 1.97 instead of 1.96 for 200 blocks,
+and 2.08 for 22 chromosomes, including `--njack chr:d`.
 The default jackknife supports varying per-SNP N. The optional
 `--rg-se-method kmoments` and full SCORE normal-equation export require
 constant per-SNP sample sizes because they assume one shared sample matrix.

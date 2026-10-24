@@ -1211,7 +1211,12 @@ class GenomewideLDScore:
                 estimate_mc_noise: bool = True,
                 write_ld_mc_var: bool = False,
                 use_mailman: bool | str = "auto",
-                impute_method: str = 'mean'):
+                impute_method: str = 'mean',
+                snp_var_weights: bool = True,
+                relative_pairs: str | None = None,
+                kinship_col: str | None = None,
+                kinship_min: float | None = None,
+                pair_closure: bool = True):
 
         self.eps_var = float(eps_var)
         self.genotype_input = resolve_genotype_input(bed_path)
@@ -1462,6 +1467,49 @@ class GenomewideLDScore:
         if self.N_eff <= 1:
             raise ValueError(f"N_eff={self.N_eff} is too small after projection.")
 
+        # SNP-variance weights: V_j = 1 - adjusted R2 of SNP j on the covariates, (||P x_j||^2 / ||x_j||^2)(N - 1) /
+        # (N - p - 1), which is 1 for a SNP the covariates explain no better than chance. Re-standardized projected
+        # genotypes have squared norm N - p - 1, so P x_j = x~_j sqrt(V_j) on the N - 1 scale of the unadjusted
+        # standardized genotypes: weighting the partner SNPs by V gives the LD scores of the kernel P X X' P / M, and
+        # the V column lets the fit report h2 on the scale of the genotypes before adjustment.
+        self.snp_var = None
+        self.annot_mass = None
+        self.snp_var_weights = bool(snp_var_weights) and self.C is not None
+        if self.snp_var_weights:
+            unsupported = [name for name, on in (("--correct-skew", self.correct_skew),
+                                                 ("--write-kmoments", self.write_kmoments)) if on]
+            if unsupported:
+                raise ValueError(
+                    f"{' and '.join(unsupported)} cannot be combined with SNP-variance weights; "
+                    "add --snp-var-weights-off for ordinary LD scores."
+                )
+            self.log._log(
+                "[snp-var] SNP-variance weights on: the output has a V column (1 - adjusted R2 of each SNP on the "
+                "covariates, the share of its variance left after covariate adjustment relative to chance) and the "
+                "LD scores weight partner SNPs by V. --snp-var-weights-off writes ordinary LD scores."
+            )
+        elif snp_var_weights:
+            self.log._log("[snp-var] No covariates, so every SNP keeps its full variance; no V column is written.")
+        else:
+            self.log._log("[snp-var] SNP-variance weights off (--snp-var-weights-off): ordinary LD scores.")
+
+        # Related pairs of the LD sample, whose share of each LD score is written as LD_REL_<column>.
+        self.ld_rel = None
+        self._rel_pairs = None
+        if relative_pairs is not None:
+            from ..relatives.moments import pairs_within_sample, read_relative_pairs
+            rp = read_relative_pairs(relative_pairs, self.sample_ids, kinship_col=kinship_col,
+                                     kinship_min=kinship_min, closure=pair_closure)
+            rows = self.row_sel if self.row_sel is not None else np.arange(self.raw_nsamp)
+            a, b = pairs_within_sample(rp, rows, self.raw_nsamp)
+            if a.size == 0:
+                raise ValueError(f"None of the {rp.npairs} related pairs in {relative_pairs} is in the LD sample.")
+            self._rel_pairs = (a, b)
+            self.log._log(
+                f"[relatives] {rp.npairs} unordered related pairs ({'family closure' if pair_closure else 'as listed'}); "
+                f"{a.size} with both members in the LD sample. Their share of each LD score is written as LD_REL_<column>."
+            )
+
         self.outpath = out_path
         self.inv_sqrt_resvar_all = None
         if self.genotype_format == "pgen":
@@ -1496,12 +1544,16 @@ class GenomewideLDScore:
 
     def _precompute_residual_variances(self):
         if self.genotype_format != "bed":
+            if self.snp_var_weights:
+                return self._precompute_residual_variances_pgen()
             raise RuntimeError("The standalone residual-variance pass is BED-only.")
         self.log._log(
             "[resvar] Using fused gwldcore C++ kernel for projected residual variances"
             + (" + μ22." if self.correct_skew else ".")
+            + (" + V." if self.snp_var_weights else "")
         )
 
+        snp_var = np.zeros(int(self.nsnps), dtype=np.float64) if self.snp_var_weights else None
         inv_all, mu22 = gwldcore.precompute_residual_variances_bed(
             bed_prefix=self.bed_prefix,
             fam_path=self.fam_path,
@@ -1516,10 +1568,72 @@ class GenomewideLDScore:
             R=(self.cov_R if self.C is not None else None),
             impute_mode=self.impute_method,
             impute_seed=int(self.impute_seed),
+            snp_var_out=snp_var,
         )
 
         self._mu22_precomputed = None if mu22 is None else np.asarray(mu22, dtype=np.float64, order="C")
+        if snp_var is not None:
+            self.snp_var = snp_var * self._adjusted_r2_scale()
         return np.ascontiguousarray(inv_all.astype(self.dtype, copy=False))
+
+    def _adjusted_r2_scale(self) -> float:
+        """(N - 1) / (N - p - 1), taking 1 - R2 to 1 - adjusted R2."""
+        return float(self.nsamp - 1) / float(self.nsamp - self.C.shape[1] - 1)
+
+    def _precompute_residual_variances_pgen(self):
+        """PGEN residual variances and V before phase 1, from the reader's standardized dosages."""
+        self.log._log("[resvar] Projected residual variances + V from standardized PGEN dosages.")
+        C = np.asarray(self.C, dtype=np.float64)
+        proj_df = float(self.nsamp - C.shape[1] - 1)
+        inv_all = np.empty(int(self.nsnps), dtype=np.float64)
+        snp_var = np.empty(int(self.nsnps), dtype=np.float64)
+        for s, e in self._make_compute_blocks():
+            X = np.array(self._pgen_reader.read_standardized_block(s, e), dtype=np.float64)
+            raw = np.einsum("ij,ij->j", X, X)
+            X -= C @ (C.T @ X)
+            ss = np.einsum("ij,ij->j", X, X)
+            var = ss / proj_df
+            inv_all[s:e] = 1.0 / np.sqrt(np.where(np.isnan(var), np.nan, np.maximum(var, self.eps_var)))
+            with np.errstate(divide="ignore", invalid="ignore"):
+                snp_var[s:e] = np.where((raw > 0.0) & np.isfinite(ss), np.minimum(1.0, ss / raw), 0.0)   # 1 - R2
+        self.snp_var = snp_var * self._adjusted_r2_scale()
+        return np.ascontiguousarray(inv_all.astype(self.dtype, copy=False))
+
+    def _apply_snp_var_weights(self):
+        """Weight every annotation column by V, so partner SNPs enter the LD scores with weight a_jk V_j."""
+        v = np.asarray(self.snp_var, dtype=np.float64)
+        self.annot_mass = np.asarray(self.nsnps_bin, dtype=np.float64).copy()
+        weighted = np.asarray(self.annot, dtype=np.float64) * v[:, None]
+        self.nsnps_bin = weighted.sum(axis=0, dtype=np.float64)
+        self.annot = np.ascontiguousarray(weighted.astype(self.dtype, copy=False))
+        q = np.quantile(v, [0.0, 0.01, 0.5])
+        self.log._log(
+            f"[snp-var] V: mean {v.mean():.6f}, min {q[0]:.6f}, 1st percentile {q[1]:.6f}, median {q[2]:.6f}; "
+            f"{int(np.sum(v == 0.0))} monomorphic SNP(s) have V = 0."
+        )
+
+    def _compute_ld_rel(self):
+        """Related pairs' share of each LD score, with the LD scores' samples, covariates and partner weights."""
+        from ..relatives.moments import relative_pair_ld_rel
+        a, b = self._rel_pairs
+        rows = self.row_sel if self.row_sel is not None else np.arange(self.raw_nsamp)
+        step = max(1, min(int(self.step_size), int(2 ** 28 // (8 * max(1, len(rows))))))
+        if self.genotype_format == "bed":
+            def read_block(s, e):
+                return self.G.read(index=np.s_[rows, s:e], dtype="float64", num_threads=int(self.num_threads))
+        else:
+            def read_block(s, e):
+                return self._pgen_reader.read_standardized_block(s, e)
+        C = None if self.C is None else np.asarray(self.C, dtype=np.float64)
+        n_eff = float(self.N_eff - 1.0) if C is not None else float(self.nsamp - self.ddof)
+        t0 = time.perf_counter()
+        out = relative_pair_ld_rel(read_block, int(self.nsnps), a, b, np.asarray(self.annot, dtype=np.float64),
+                                   C, n_eff, step_size=step)
+        self.log._log(
+            f"[relatives] LD_REL for {a.size} pairs in {time.perf_counter() - t0:.1f}s; column sums: "
+            + ", ".join(f"{c}={v:.6g}" for c, v in zip(self.l2cols, out.sum(axis=0)))
+        )
+        return out
 
     def _estimate_mu22_bins(self, blocks=None):
         mu22 = getattr(self, "_mu22_precomputed", None)
@@ -1585,6 +1699,11 @@ class GenomewideLDScore:
         )
         self.nbins = int(self.annot.shape[1])
         self.log._log(f"Read aligned annotation matrix with shape {self.annot.shape}")
+        reserved = [c for c in self.l2cols if str(c) == "V" or str(c).startswith("LD_REL")]
+        if reserved:
+            raise ValueError(
+                f"Annotation column name(s) {reserved} are reserved in LD-score files (V and LD_REL_*); rename them."
+            )
 
         self.nsnps_bin = self.annot.sum(axis=0, dtype=np.float64)
         self.annot = np.ascontiguousarray(self.annot.astype(self.dtype, copy=False))
@@ -1636,6 +1755,9 @@ class GenomewideLDScore:
         )
         if self.genotype_format == "pgen":
             fuse_resvar = True
+        if self.snp_var_weights:
+            # V weights the partner SNPs in phase 1, so it is computed in a separate pass first.
+            fuse_resvar = False
         if fuse_resvar:
             self.log._log("[resvar] Fusing residual-variance estimation into the first phase-1 genotype pass.")
             self.inv_sqrt_resvar_all = np.empty(int(self.nsnps), dtype=self.dtype, order="C")
@@ -1647,6 +1769,8 @@ class GenomewideLDScore:
             except Exception:
                 _clear_gwld_native_scratch()
                 raise
+            if self.snp_var_weights:
+                self._apply_snp_var_weights()
 
         blocks = self._make_compute_blocks()
         self.nblks = len(blocks)
@@ -2076,6 +2200,9 @@ class GenomewideLDScore:
         if self.gwldscore is not meansq_accum:
             del meansq_accum
 
+        if self._rel_pairs is not None:
+            self.ld_rel = self._compute_ld_rel()
+
         self.log._log(f"Saving the genome-wide (partitioned) LD scores into: {self.outpath}.gw.ldscore.gz")
         snpcols = ['CHR', 'SNP', 'BP']
         if self.snplist is None:
@@ -2085,7 +2212,13 @@ class GenomewideLDScore:
             self.snpdf.columns = snpcols
 
         scores_df = pd.DataFrame(self.gwldscore, columns=self.l2cols)
-        out_df = pd.concat([self.snpdf, scores_df], axis=1)
+        parts = [self.snpdf]
+        if self.snp_var is not None:
+            parts.append(pd.DataFrame({"V": self.snp_var}))
+        parts.append(scores_df)
+        if self.ld_rel is not None:
+            parts.append(pd.DataFrame(self.ld_rel, columns=[f"LD_REL_{c}" for c in self.l2cols]))
+        out_df = pd.concat(parts, axis=1)
         out_df.to_csv(f'{self.outpath}.gw.ldscore.gz', index=False, compression='gzip', sep='\t', float_format='%.6f')
 
         if self.estimate_mc_noise:
@@ -2184,8 +2317,9 @@ class GenomewideLDScore:
                     f"pointwise 95% conditional MC intervals to: {mc_var_out}"
                 )
         out_M = f"{self.outpath}.gw.M"
+        masses = self.nsnps_bin if self.annot_mass is None else self.annot_mass
         with open(out_M, "w") as fout:
-            fout.write("\t".join(f"{float(x):.10g}" for x in self.nsnps_bin) + "\n")
+            fout.write("\t".join(f"{float(x):.10g}" for x in masses) + "\n")
         self.log._log(f"Saved fixed reference annotation masses to: {out_M}")
 
         if trace_k2_from_ldscore is not None and self.write_kmoments:
@@ -2215,7 +2349,8 @@ class GenomewideLDScore:
                 self.log._log("\n" + corr.to_string())
 
             col_sums = pd.Series(self.nsnps_bin, index=self.l2cols)
-            lines = ["Annotation Column Sums"] + [f"{k:<35} {v:.6f}" for k, v in col_sums.items()]
+            title = "Annotation Column Sums" + (" (weighted by V)" if self.snp_var is not None else "")
+            lines = [title] + [f"{k:<35} {v:.6f}" for k, v in col_sums.items()]
             self.log._log("\n" + "\n".join(lines))
 
             row_sums = self.annot.sum(axis=1, dtype=np.float64)

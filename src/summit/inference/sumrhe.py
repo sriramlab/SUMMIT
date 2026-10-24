@@ -12,6 +12,7 @@ from .trace import Trace
 from ..sumstats.sumstats import Sumstats
 from .h2core import (
     H2MatchedMetadata,
+    compute_h2_mass_unit_stats,
     compute_h2_structural_unit_stats,
     prepare_h2,
     prepare_h2_reference_axis,
@@ -66,6 +67,7 @@ class Sumrhe:
         ldsc_m=None,
         ldsc_irwls_iters: int = 3,
         ldsc_irwls_tol: float = 0.0,
+        snp_var_weights: bool = True,
     ):
 
         self.log = log
@@ -101,7 +103,17 @@ class Sumrhe:
             annot=annot,
             verbose=bool(self.verbose_level),
             delta=delta,
+            snp_var_weights=snp_var_weights,
         )
+        if self.trace.annot_mass is not None:
+            unsupported = [name for name, on in (("--weight-mode ldsc", self.weight_mode == "ldsc"),
+                                                 ("--adjust-delta", bool(adjust_delta))) if on]
+            if unsupported:
+                raise ValueError(
+                    f"{' and '.join(unsupported)} cannot be used with SNP-variance-weighted LD scores (V column); "
+                    "recompute the LD scores with --snp-var-weights-off."
+                )
+        self._rel_notes = set()
 
         self.jackknife_spec = JackknifeSpec.parse(njack)
         self.ldsc_irwls_iters = int(ldsc_irwls_iters)
@@ -159,6 +171,9 @@ class Sumrhe:
             self.full_trace_view = None
             self.full_jackknife = None
         self.full_struct = None
+        self.full_mass = None
+        self.full_trace_view_rel = None
+        self.full_struct_rel = None
         self.chisq_threshold = chisq_threshold
         self.chisq_action = str(chisq_action).strip().lower()
         self.report_tau = bool(report_tau)
@@ -223,11 +238,45 @@ class Sumrhe:
             self.full_jackknife,
             ld_kind="main",
         )
+        if self.full_trace_view.annot_mass is not None:
+            self.full_mass = compute_h2_mass_unit_stats(self.full_trace_view.annot_mass, self.full_jackknife)
         if self.log is not None:
             self.log._log(
                 f"[h2] precomputed full reference-axis structural stats in "
                 f"{utils._get_time() - t0:.3f}s."
             )
+
+    def _reference_axis_for(self, exclude_pairs: bool):
+        """Full reference-axis view and structural stats, with LD_REL subtracted when related pairs are excluded."""
+        self._ensure_reference_precompute()
+        if not exclude_pairs:
+            return self.full_trace_view, self.full_struct
+        if self.full_struct_rel is None:
+            self.full_trace_view_rel = self.full_trace_view.pair_excluded()
+            self.full_struct_rel = compute_h2_structural_unit_stats(
+                self.full_trace_view_rel,
+                self.full_jackknife,
+                ld_kind="main",
+            )
+        return self.full_trace_view_rel, self.full_struct_rel
+
+    def _exclude_related_pairs(self, ss) -> bool:
+        """Subtract LD_REL for sumstats with REL_M; LD scores without LD_REL are taken to be from unrelated samples."""
+        has_rel_m = getattr(ss, "rel_m", None) is not None
+        has_ld_rel = self.trace.ldscores_rel is not None
+        note = None
+        if has_rel_m and has_ld_rel:
+            note = "[relatives] subtracting the LD_REL columns from the LD scores for sumstats with REL_M."
+        elif has_rel_m and not has_ld_rel:
+            note = ("[relatives] sumstats have REL_M but the LD-score file has no LD_REL columns: the LD scores are "
+                    "taken to come from unrelated individuals.")
+        elif has_ld_rel and not has_rel_m:
+            note = ("[relatives] sumstats without REL_M keep the related pairs, so the LD_REL columns are not "
+                    "subtracted for them.")
+        if note is not None and note not in self._rel_notes and self.log is not None:
+            self._rel_notes.add(note)
+            self.log._log(note)
+        return has_rel_m and has_ld_rel
 
     def _fit_one(self, path: str, phen_name: str, cov_rank_value):
         ss = Sumstats.from_file(
@@ -252,8 +301,9 @@ class Sumrhe:
                 f"Matched {n_keep} SNPs in phenotype {phen_name} out of {n_base} Trace SNPs."
             )
 
+        exclude_pairs = self._exclude_related_pairs(ss)
         if self.jackknife_spec.mode == "chr" and self.weight_mode == "he":
-            self._ensure_reference_precompute()
+            ref_view, ref_struct = self._reference_axis_for(exclude_pairs)
             summary_y, summary_y_info = self._build_full_axis_h2_summary_y(
                 ss,
                 aligned,
@@ -262,17 +312,20 @@ class Sumrhe:
             matched = self._build_h2_matched_metadata(ss, aligned, keep_mask)
 
             prepared = prepare_h2_reference_axis(
-                self.full_trace_view,
+                ref_view,
                 matched,
                 self.full_jackknife,
                 keep_mask,
                 summary_y=summary_y,
                 summary_y_info=summary_y_info,
-                full_struct=self.full_struct,
+                full_struct=ref_struct,
                 adjust_delta=self.adjust_delta,
+                full_mass=self.full_mass,
             )
         else:
             tv = self.trace.materialize_view(keep_mask)
+            if exclude_pairs:
+                tv = tv.pair_excluded()
             if self.ldsc_weight_ld is not None:
                 tv = replace(
                     tv,

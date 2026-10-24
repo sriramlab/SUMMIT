@@ -34,6 +34,10 @@ class H2Prepared:
     AL_rep: np.ndarray             # (R+1,K,K)
     lhs: np.ndarray                # (R+1,K+1,K+1)
     rhs: np.ndarray                # (R+1,K+1)
+    # Unweighted annotation masses, set when the annotation carries the SNP-variance weights V (LD-score V column).
+    mass_Ak_rep: np.ndarray | None = None     # (R+1,K)
+    mass_Ak2_rep: np.ndarray | None = None    # (R+1,K)
+    mass_AA_rep: np.ndarray | None = None     # (R+1,K,K)
 
 @dataclass(frozen=True)
 class H2Fit:
@@ -56,6 +60,9 @@ class H2Fit:
     enrich_mode_used: str
     weight_mode: str = "he"
     weight_info: dict | None = None
+    # SNP-variance-weighted fits: phenotypic variance before covariate adjustment, G + sigma_e, in units of the
+    # adjusted phenotype's variance, per replicate (None otherwise).
+    pheno_var_reps: np.ndarray | None = None
 
 
 @dataclass(frozen=True)
@@ -90,6 +97,14 @@ class H2StructuralUnitStats:
     Ak2: np.ndarray               # (U,K)
     AA: np.ndarray                # (U,K,K)
     AL: np.ndarray                # (U,K,K)
+
+
+@dataclass(frozen=True)
+class H2MassUnitStats:
+    """Per-unit sums of the unweighted annotation, for reporting SNP-variance-weighted fits."""
+    Ak: np.ndarray                # (U,K)
+    Ak2: np.ndarray               # (U,K)
+    AA: np.ndarray                # (U,K,K)
 
 
 class H2ResultWriter:
@@ -396,6 +411,45 @@ def _compute_h2_structural_from_rows(
     return out
 
 
+def compute_h2_mass_unit_stats(A_mass, jackknife, *, active_mask=None, rows=None) -> H2MassUnitStats:
+    """Unit sums of the unweighted annotation over active SNPs (or over the given row indices)."""
+    A = np.asarray(A_mass, dtype=np.float64, order="C")
+    U = int(jackknife.nunit)
+    K = int(A.shape[1])
+    out = H2MassUnitStats(Ak=np.zeros((U, K)), Ak2=np.zeros((U, K)), AA=np.zeros((U, K, K)))
+    if rows is not None:
+        idx = np.asarray(rows, dtype=np.int64).ravel()
+        uids = np.asarray(jackknife.unit_id, dtype=np.int64)[idx]
+        groups = [(u, idx[uids == u]) for u in np.unique(uids)]
+    else:
+        mask = None if active_mask is None else np.asarray(active_mask, dtype=bool)
+        groups = []
+        for u in range(U):
+            s0, e0 = int(jackknife.starts[u]), int(jackknife.ends[u])
+            groups.append((u, np.arange(s0, e0) if mask is None else s0 + np.flatnonzero(mask[s0:e0])))
+    for u, r in groups:
+        if r.size == 0:
+            continue
+        Au = A[r, :]
+        out.Ak[u] = Au.sum(axis=0, dtype=np.float64)
+        out.Ak2[u] = (Au * Au).sum(axis=0, dtype=np.float64)
+        out.AA[u] = Au.T @ Au
+    return out
+
+
+def _h2_mass_for_active(trace_view, jackknife, active_mask, full_mass, use_drop_correction):
+    A_mass = getattr(trace_view, "annot_mass", None)
+    if A_mass is None:
+        return None
+    if full_mass is None or not use_drop_correction:
+        return compute_h2_mass_unit_stats(A_mass, jackknife, active_mask=active_mask)
+    drop = np.flatnonzero(~np.asarray(active_mask, dtype=bool))
+    if drop.size == 0:
+        return full_mass
+    corr = compute_h2_mass_unit_stats(A_mass, jackknife, rows=drop)
+    return H2MassUnitStats(Ak=full_mass.Ak - corr.Ak, Ak2=full_mass.Ak2 - corr.Ak2, AA=full_mass.AA - corr.AA)
+
+
 def compute_h2_structural_unit_stats(
     trace_view,
     jackknife,
@@ -611,6 +665,7 @@ def _finish_prepare_h2(
     has_overlap: bool,
     adjust_delta: bool,
     store_y: bool = True,
+    mass: H2MassUnitStats | None = None,
 ) -> H2Prepared:
     K = int(trace_view.nbins)
     R = int(jackknife.nrep)
@@ -678,6 +733,13 @@ def _finish_prepare_h2(
 
     y_store = np.asarray(y, dtype=np.float64) if store_y else np.empty(0, dtype=np.float64)
 
+    mass_reps = (None, None, None)
+    if mass is not None:
+        mass_reps = tuple(
+            _stack_delete_replicates(np.asarray(x, dtype=np.float64).sum(axis=0), x, jackknife.D)
+            for x in (mass.Ak, mass.Ak2, mass.AA)
+        )
+
     return H2Prepared(
         trace_view=trace_view,
         matched=matched,
@@ -702,6 +764,9 @@ def _finish_prepare_h2(
         AL_rep=AL_rep,
         lhs=lhs,
         rhs=rhs,
+        mass_Ak_rep=mass_reps[0],
+        mass_Ak2_rep=mass_reps[1],
+        mass_AA_rep=mass_reps[2],
     )
 
 
@@ -763,6 +828,7 @@ def prepare_h2(
     )
     Ay_unit = _compute_h2_ay_unit(A, jackknife, y, active_mask)
     has_overlap = _has_overlapping_annotations(A, active_mask=active_mask)
+    mass = _h2_mass_for_active(trace_view, jackknife, active_mask, None, False)
 
     return _finish_prepare_h2(
         trace_view=trace_view,
@@ -777,6 +843,7 @@ def prepare_h2(
         has_overlap=has_overlap,
         adjust_delta=adjust_delta,
         store_y=True,
+        mass=mass,
     )
 
 
@@ -792,6 +859,7 @@ def prepare_h2_reference_axis(
     ld_kind: str = "main",
     adjust_delta: bool = False,
     prefer_drop_correction: bool = True,
+    full_mass: H2MassUnitStats | None = None,
 ):
     """
     Prepare h2 normal equations on the immutable reference SNP axis.
@@ -862,6 +930,7 @@ def prepare_h2_reference_axis(
 
     Ay_unit = _compute_h2_ay_unit(A, jackknife, y, active_mask)
     has_overlap = _has_overlapping_annotations(A, active_mask=active_mask)
+    mass = _h2_mass_for_active(trace_view, jackknife, active_mask, full_mass, use_drop_correction)
 
     trace_meta = _make_h2_trace_metadata(trace_view)
 
@@ -878,6 +947,7 @@ def prepare_h2_reference_axis(
         has_overlap=has_overlap,
         adjust_delta=adjust_delta,
         store_y=False,
+        mass=mass,
     )
 
 
@@ -895,6 +965,7 @@ def prepare_h2_reference_axis_from_sufficient_stats(
     adjust_delta: bool = False,
     prefer_drop_correction: bool = True,
     has_overlap: bool | None = None,
+    full_mass: H2MassUnitStats | None = None,
 ):
     """Prepare h2 from exact full-axis sufficient statistics.
 
@@ -963,6 +1034,7 @@ def prepare_h2_reference_axis_from_sufficient_stats(
 
     if has_overlap is None:
         has_overlap = _has_overlapping_annotations(A, active_mask=active_mask)
+    mass = _h2_mass_for_active(trace_view, jackknife, active_mask, full_mass, use_drop_correction)
 
     return _finish_prepare_h2(
         trace_view=_make_h2_trace_metadata(trace_view),
@@ -977,6 +1049,7 @@ def prepare_h2_reference_axis_from_sufficient_stats(
         has_overlap=bool(has_overlap),
         adjust_delta=adjust_delta,
         store_y=False,
+        mass=mass,
     )
 
 
@@ -1036,6 +1109,11 @@ def fit_h2(
     K = p.trace_view.nbins
 
     sigma_core = _solve_linear_batch(p.lhs, p.rhs)                 # (R+1, K+1)
+    Ak_rep, Ak2_rep, AA_rep = p.Ak_rep, p.Ak2_rep, p.AA_rep
+    pheno_var_reps = None
+    if p.mass_Ak_rep is not None:
+        sigma_core, pheno_var_reps = snp_var_weighted_to_unadjusted(sigma_core, p.Ak_rep, p.mass_Ak_rep)
+        Ak_rep, Ak2_rep, AA_rep = p.mass_Ak_rep, p.mass_Ak2_rep, p.mass_AA_rep
     sigma_reps = np.zeros((R + 1, K + 2), dtype=np.float64)
     sigma_reps[:, :K + 1] = sigma_core
     sigma_reps[:, K + 1] = np.nansum(sigma_core[:, :K], axis=1)
@@ -1044,8 +1122,8 @@ def fit_h2(
     h2_tot = np.nansum(sigma_g, axis=1)
 
     with np.errstate(divide="ignore", invalid="ignore"):
-        w = sigma_g / p.Ak_rep
-        h2_cat_overlap = np.einsum("bkl,bl->bk", p.AA_rep, w, optimize=True)
+        w = sigma_g / Ak_rep
+        h2_cat_overlap = np.einsum("bkl,bl->bk", AA_rep, w, optimize=True)
 
     bad_overlap = ~np.isfinite(h2_cat_overlap)
     if clip_nonfinite_vals:
@@ -1058,7 +1136,7 @@ def fit_h2(
     h2_reps[:, K] = h2_tot
 
     with np.errstate(divide="ignore", invalid="ignore"):
-        prop = p.Ak_rep / p.M_rep[:, None]
+        prop = Ak_rep / p.M_rep[:, None]
 
     requested = enrich_mode
     if requested == "auto":
@@ -1096,9 +1174,9 @@ def fit_h2(
     tau_star_reps = None
     if report_tau:
         with np.errstate(divide="ignore", invalid="ignore"):
-            tau_reps = sigma_g / p.Ak_rep
-            meanA = p.Ak_rep / p.M_rep[:, None]
-            meanA2 = p.Ak2_rep / p.M_rep[:, None]
+            tau_reps = sigma_g / Ak_rep
+            meanA = Ak_rep / p.M_rep[:, None]
+            meanA2 = Ak2_rep / p.M_rep[:, None]
             varA = np.maximum(meanA2 - meanA * meanA, 0.0)
             sdA = np.sqrt(varA, dtype=np.float64)
             denom = h2_tot / p.M_rep
@@ -1203,4 +1281,24 @@ def fit_h2(
         enrich_mode_used=enrich_mode_used,
         weight_mode="he",
         weight_info=None,
+        pheno_var_reps=pheno_var_reps,
     )
+
+
+def snp_var_weighted_to_unadjusted(sigma_core, Av_rep, A_rep):
+    """Report a fit with SNP-variance-weighted kernels on the genotypes before covariate adjustment.
+
+    With kernel weights a_jk V_j the solve gives sigma_k = tau_k A^v_k (A^v_k = sum_j a_jk V_j) and sigma_e, in units
+    of the adjusted phenotype's variance, tau_k being the per-SNP effect variance of the unadjusted genotypes. Their
+    genetic variance is G_k = tau_k A_k (A_k = sum_j a_jk) and the phenotypic variance G + sigma_e. Returns
+    [G_k, sigma_e] / (G + sigma_e) per replicate and G + sigma_e.
+    """
+    sigma_core = np.asarray(sigma_core, dtype=np.float64)
+    K = int(Av_rep.shape[1])
+    with np.errstate(divide="ignore", invalid="ignore"):
+        G = sigma_core[:, :K] / Av_rep * A_rep
+        vp = np.nansum(G, axis=1) + sigma_core[:, K]
+        out = np.empty_like(sigma_core)
+        out[:, :K] = G / vp[:, None]
+        out[:, K] = sigma_core[:, K] / vp
+    return out, vp

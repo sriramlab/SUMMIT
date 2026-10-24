@@ -651,6 +651,10 @@ def build_parser() -> argparse.ArgumentParser:
                         help="LD/GxE sketch-panel, windowed-LD, or binary reference workspace in GiB (LD/GxE default: auto; binary: 1).")
     inputs.add_argument("--covar", default=None, type=str,
                         help="Covariate file for LD-score estimation.")
+    inputs.add_argument("--snp-var-weights-off", action="store_true", default=False,
+                        help=("LD-score step with --covar: write ordinary LD scores, without the V column (each "
+                              "SNP's share of genotype variance left after covariate adjustment). h2/rg: refuse "
+                              "LD-score files that have a V column instead of fitting them with SNP-variance weights."))
     gxe.add_argument("--env", default=None, type=str,
                         help=("Environment file for genome-wide GxE LD-score estimation. "
                               "Must be used with --geno. File must contain FID, IID, and one environment column "
@@ -794,6 +798,16 @@ def build_parser() -> argparse.ArgumentParser:
     )
     ld.add_argument("--impute-method", default='mean', type=str, choices=['mean', 'hwe'],
                         help="Method for imputing missing genotype.")
+    ld.add_argument("--relative-pairs", default=None, type=str,
+                    help=("Related pairs of the LD sample (IID1 IID2 [FID1 FID2] [kinship]); genome-wide LD scores "
+                          "then also carry LD_REL_<column>, the pairs' share of each LD score, which h2/rg subtract "
+                          "for sumstats with REL_M. Use the same pairs and options as `summit relatives moments`."))
+    ld.add_argument("--kinship-col", default=None, type=str,
+                    help="Kinship column of --relative-pairs used with --kinship-min.")
+    ld.add_argument("--kinship-min", default=None, type=float,
+                    help="Keep only --relative-pairs rows whose kinship exceeds this value.")
+    ld.add_argument("--no-closure", action="store_true", default=False,
+                    help="Use only the listed --relative-pairs, not every pair within a family (connected component).")
 
     # Resource / performance knobs
     shared.add_argument("--num-threads", default=None, type=int,
@@ -1865,6 +1879,10 @@ def _dispatch_gxe_multi_reference(args, log, verbose_on, low_level):
 
 
 def _dispatch_ldscore(args, log, verbose_on, low_level):
+    relative_pairs = getattr(args, "relative_pairs", None)
+    snp_var_weights_off = bool(getattr(args, "snp_var_weights_off", False))
+    if relative_pairs is not None and (args.env is not None or args.ld_wind_kb is not None):
+        raise ValueError("--relative-pairs is available for genome-wide additive LD scores only.")
     if args.env is not None:
         if args.write_ld_mc_var or args.skip_ld_mc:
             raise ValueError(
@@ -1924,6 +1942,8 @@ def _dispatch_ldscore(args, log, verbose_on, low_level):
             log._log("!!! --ld-wind-kb must be finite and positive !!!")
             raise SystemExit(1)
         log._log(f">>> LD score mode: windowed, --ld-wind-kb {args.ld_wind_kb}")
+        if args.covar is not None and not snp_var_weights_off:
+            log._log("[snp-var] Windowed LD scores are written without SNP-variance weights (no V column).")
         _require_integer_step_size(args, "windowed LD scores")
         winld = WindowedLDScore(
             bed_path=args.geno,
@@ -1976,6 +1996,11 @@ def _dispatch_ldscore(args, log, verbose_on, low_level):
         use_mailman=args.use_mailman,
         impute_method=args.impute_method,
         ddof=args.ddof,
+        snp_var_weights=not snp_var_weights_off,
+        relative_pairs=relative_pairs,
+        kinship_col=getattr(args, "kinship_col", None),
+        kinship_min=getattr(args, "kinship_min", None),
+        pair_closure=not getattr(args, "no_closure", False),
     )
     try:
         gwld._compute_ldscore()
@@ -2034,6 +2059,7 @@ def _dispatch_h2(args, log):
         ldsc_m=args.ldsc_m,
         ldsc_irwls_iters=args.ldsc_irwls_iters,
         ldsc_irwls_tol=args.ldsc_irwls_tol,
+        snp_var_weights=not getattr(args, "snp_var_weights_off", False),
     )
     sums._run()
     sums._logoff()
@@ -2170,6 +2196,7 @@ def _dispatch_rg(args, log):
         ldsc_m=args.ldsc_m,
         ldsc_irwls_iters=args.ldsc_irwls_iters,
         ldsc_irwls_tol=args.ldsc_irwls_tol,
+        snp_var_weights=not getattr(args, "snp_var_weights_off", False),
     )
     rg._run()
     rg._logoff()
@@ -2560,6 +2587,7 @@ def _dispatch_rg_manifest(args, log):
         annot=args.annot,
         verbose=bool(verbose_level),
         delta=None,
+        snp_var_weights=not getattr(args, "snp_var_weights_off", False),
     )
 
     trait_cache: dict[str, _ManifestTraitCacheEntry] = {}

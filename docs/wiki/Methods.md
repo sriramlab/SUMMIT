@@ -76,6 +76,37 @@ Working-variance floors affect regression weights. They do not impose
 nonnegative h² or bounded rg. For overlapping annotations, component estimates
 are coefficient contributions, not estimates restricted to an annotation's SNP set.
 
+### SNP-variance weights
+
+Partial correlations rescale each SNP to unit variance after projection on the
+covariates, so the ordinary kernel is `Σ_j x̃_j x̃_jᵀ / M` with every projected
+SNP at full weight. The GRM of the genotypes before adjustment, projected on the
+covariates as in GCTA or RHE-mc, is `P X Xᵀ P / M`, and `P x_j = sqrt(V_j) x̃_j`
+on the scale of the standardized genotypes, with
+
+```text
+V_j = (1 - R²_j)(n - 1) / (n - p - 1),
+```
+
+one minus the adjusted R² of SNP j on the p covariates. For an infinitesimal
+model on the unadjusted genotypes, the ordinary fit targets approximately
+`h² (1 - Σ_j w_j R²_j)` with LD-dependent weights `w_j`. It is low when the
+covariates explain genotype variation, as in admixed cohorts.
+
+With V, the LD scores weight partner SNPs by `a_j'k V_j'` and the fit uses
+`a_jk V_j` as instruments, which is HE regression with the kernels
+`P X_k X_kᵀ P`. The solve gives `σ_k = τ_k A^v_k`, with `A^v_k = Σ_j a_jk V_j`
+and τ_k the per-SNP effect variance of the unadjusted genotypes, and the
+residual σ_e, both in units of the adjusted phenotype's variance. SUMMIT reports
+
+```text
+G_k = τ_k M_k,   M_k = Σ_j a_jk,   V_p = Σ_l G_l + σ_e,   h²_k = G_k / V_p,
+```
+
+per-bin overlap h², enrichment and τ with the unweighted masses, and rg from
+`γ_k = τ_12,k M_k / sqrt(V_p1 V_p2)`. The conversion is applied in every
+jackknife replicate.
+
 ## Related individuals
 
 Write `y` for the phenotype and `x_j` for SNP j, both projected on the GWAS
@@ -120,7 +151,8 @@ Their share is the relatedness LD score
 LD_REL_{j,k} = N_eff⁻² Σ_{(i,i') in P, ordered} x_ij x_i'j W_k,ii',     W_k,ii' = Σ_j' a_j'k x_ij' x_i'j',
 ```
 
-and `l_{j,k} - LD_REL_{j,k}` reconstructs the pair-excluded traces exactly.
+with `a_j'k V_j'` in place of `a_j'k` for V-weighted LD scores, and
+`l_{j,k} - LD_REL_{j,k}` reconstructs the pair-excluded traces exactly.
 
 For rg, the cross-trait moment `z*_1j z*_2j` has the same derivative κ with
 respect to `(x_jᵀ y_1)(x_jᵀ y_2)` when both traits use one sample, so

@@ -30,6 +30,8 @@ class RGPrepared:
     overlap_scale: np.ndarray | float = 1.0
     Ac_unit: np.ndarray | None = None
     Ac_rep: np.ndarray | None = None
+    # Unweighted annotation masses, set when the annotation carries the SNP-variance weights V (LD-score V column).
+    mass_Ak_rep: np.ndarray | None = None
 
     @property
     def intercept_mass_unit(self):
@@ -547,6 +549,16 @@ def prepare_rg(
     )
     Ac_unit, Ac_rep = overlap_unit_sums(A, jackknife, active_mask, overlap_scale)
 
+    mass_Ak_rep = None
+    if getattr(trace_view, "annot_mass", None) is not None:
+        A_mass = np.asarray(trace_view.annot_mass, dtype=np.float64)
+        mass_unit = np.zeros((U, K), dtype=np.float64)
+        for u in range(U):
+            s, e = int(jackknife.starts[u]), int(jackknife.ends[u])
+            if e > s:
+                mass_unit[u] = A_mass[s:e][active_mask[s:e]].sum(axis=0, dtype=np.float64)
+        mass_Ak_rep = _stack_delete_replicates(mass_unit.sum(axis=0), mass_unit, jackknife.D)
+
     return RGPrepared(
         trace_view=trace_view,
         matched1=matched1,
@@ -568,7 +580,21 @@ def prepare_rg(
         overlap_scale=overlap_scale,
         Ac_unit=Ac_unit,
         Ac_rep=Ac_rep,
+        mass_Ak_rep=mass_Ak_rep,
     )
+
+
+def _unadjusted_gamma_scale(prepared: RGPrepared, h2_fit1, h2_fit2):
+    """Per-replicate, per-bin factor taking SNP-variance-weighted genetic covariances to the genotypes before
+    covariate adjustment (tau_12,k A_k over the root product of both phenotypic variances), or None."""
+    if prepared.mass_Ak_rep is None:
+        return None
+    vp1 = getattr(h2_fit1, "pheno_var_reps", None)
+    vp2 = getattr(h2_fit2, "pheno_var_reps", None)
+    if vp1 is None or vp2 is None:
+        raise ValueError("SNP-variance-weighted rg needs h2 fits from the same SNP-variance-weighted LD scores.")
+    with np.errstate(divide="ignore", invalid="ignore"):
+        return (prepared.mass_Ak_rep / prepared.Ak_rep) / np.sqrt(np.asarray(vp1) * np.asarray(vp2))[:, None]
 
 
 def _estimate_total_rg_delta_se(gamma_tot, h2_tot1, h2_tot2, jackknife, *, unit_sizes, center, nan_policy):
@@ -1231,6 +1257,13 @@ def fit_rg(
     rhs[bad_rhs] = np.nan
 
     gamma_reps = _solve_linear_batch(p.lhs, rhs)
+    unadjusted = _unadjusted_gamma_scale(p, h2_fit1, h2_fit2)
+    if unadjusted is not None:
+        if str(rg_se_method).strip().lower() in {"robust", "kmoments"}:
+            raise ValueError(
+                f"--rg-se-method {rg_se_method} is not available with SNP-variance-weighted LD scores (V column)."
+            )
+        gamma_reps = gamma_reps * unadjusted
     est, se = p.jackknife.summarize(
         gamma_reps,
         unit_sizes=p.unit_sizes,
@@ -2454,6 +2487,12 @@ def fit_intercept(
     beta_se = np.asarray(beta_se, dtype=np.float64)
 
     gamma_reg_reps = _intercept_gamma_total_from_beta(beta_reps, mass_rep, sqrt_n1n2)
+    vp1 = getattr(h2_fit1, "pheno_var_reps", None)
+    vp2 = getattr(h2_fit2, "pheno_var_reps", None)
+    if vp1 is not None and vp2 is not None:
+        # The regression slope already refers to the unadjusted genotypes (mass = SNP count); put it on the
+        # scale of the SNP-variance-weighted h2 fits.
+        gamma_reg_reps = gamma_reg_reps / np.sqrt(np.asarray(vp1) * np.asarray(vp2))
     gamma_reg_est, gamma_reg_se = jackknife.summarize(
         gamma_reg_reps,
         unit_sizes=unit_sizes,

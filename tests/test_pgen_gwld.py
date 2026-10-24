@@ -262,7 +262,7 @@ def _numpy_standardize(raw: np.ndarray, ddof: int = 1) -> np.ndarray:
     return out
 
 
-def _run_gwld(genotype_path: Path, out: Path, covar_path: Path | None = None):
+def _run_gwld(genotype_path: Path, out: Path, covar_path: Path | None = None, snp_var_weights: bool = True):
     estimator = GenomewideLDScore(
         bed_path=str(genotype_path),
         annot_path=None,
@@ -280,6 +280,7 @@ def _run_gwld(genotype_path: Path, out: Path, covar_path: Path | None = None):
         target_xz_mem=0.01,
         use_mailman=False,
         impute_method="mean",
+        snp_var_weights=snp_var_weights,
     )
     try:
         estimator._compute_ldscore()
@@ -491,13 +492,17 @@ def test_hardcall_pgen_and_bed_have_identical_end_to_end_scores_with_covariates(
     cov.to_csv(covar, sep="\t", index=False, na_rep="NA")
 
     pgen_scores, pgen_rows = _run_gwld(
-        pgen_prefix.with_suffix(".pgen"), tmp_path / "pgen_out", covar
+        pgen_prefix.with_suffix(".pgen"), tmp_path / "pgen_out", covar, snp_var_weights=False
     )
     bed_scores, bed_rows = _run_gwld(
-        bed_prefix.with_suffix(".bed"), tmp_path / "bed_out", covar
+        bed_prefix.with_suffix(".bed"), tmp_path / "bed_out", covar, snp_var_weights=False
     )
     np.testing.assert_array_equal(pgen_rows, bed_rows)
     np.testing.assert_array_equal(pgen_scores, bed_scores)
+    # With SNP-variance weights (the default with covariates) V comes from two different pre-passes.
+    pgen_v, _ = _run_gwld(pgen_prefix.with_suffix(".pgen"), tmp_path / "pgen_v", covar)
+    bed_v, _ = _run_gwld(bed_prefix.with_suffix(".bed"), tmp_path / "bed_v", covar)
+    np.testing.assert_allclose(pgen_v, bed_v, rtol=1e-6, atol=1e-6)
     np.testing.assert_array_equal(
         np.atleast_1d(np.loadtxt(tmp_path / "pgen_out.gw.M")),
         np.asarray([alt.shape[0]], dtype=np.float64),

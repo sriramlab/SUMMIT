@@ -3346,7 +3346,8 @@ nb::tuple precompute_residual_variances_bed_impl(
     nb::object C_opt,
     nb::object R_opt,
     const std::string& impute_mode_str,
-    nb::object impute_seed_obj)
+    nb::object impute_seed_obj,
+    nb::object snp_var_out_obj)
 {
     const ImputeMode impute_mode = parse_impute_mode(impute_mode_str);
     const uint64_t impute_seed = impute_seed_obj.is_none() ? 0ULL : nb::cast<uint64_t>(impute_seed_obj);
@@ -3357,6 +3358,17 @@ nb::tuple precompute_residual_variances_bed_impl(
     const int64_t M_total = count_lines_cached(bim_path);
     if (nsnps < 0 || nsnps > (int) M_total)
         throw std::runtime_error("nsnps is out of range in precompute_residual_variances_bed");
+
+    // Optional per-SNP share of genotype variance left after projection, ||P x_j||^2 / ||x_j||^2 = 1 - R2_j
+    // (0 for monomorphic SNPs), on the same decoded and imputed genotypes as the residual variances.
+    double* snp_var = nullptr;
+    nb_vec1_rw<double> snp_var_arr;
+    if (!snp_var_out_obj.is_none()) {
+        snp_var_arr = nb::cast<nb_vec1_rw<double>>(snp_var_out_obj);
+        if ((int64_t) snp_var_arr.shape(0) != (int64_t) nsnps)
+            throw std::runtime_error("snp_var_out shape mismatch in precompute_residual_variances_bed");
+        snp_var = snp_var_arr.data();
+    }
     if (step_size <= 0)
         throw std::runtime_error("step_size must be > 0 in precompute_residual_variances_bed");
 
@@ -3445,6 +3457,26 @@ nb::tuple precompute_residual_variances_bed_impl(
             if (N_blk != N_rows || L_blk != L)
                 throw std::runtime_error("Unexpected block dimensions in precompute_residual_variances_bed");
 
+            static thread_local std::vector<double> ss_raw_tls;
+            double* ss_raw = nullptr;
+            if (snp_var) {
+                if (ss_raw_tls.size() < (size_t) L)
+                    ss_raw_tls.resize((size_t) L);
+                ss_raw = ss_raw_tls.data();
+#ifdef _OPENMP
+                #pragma omp parallel for schedule(static)
+#endif
+                for (int j = 0; j < L; ++j) {
+                    const T* col = Geno + (size_t) j * (size_t) N_blk;
+                    double ss = 0.0;
+                    for (int i = 0; i < N_blk; ++i) {
+                        const double x = (double) col[(size_t) i];
+                        ss += x * x;
+                    }
+                    ss_raw[(size_t) j] = ss;
+                }
+            }
+
             if (have_proj)
                 project_target_block_inplace<T>(Geno, N_blk, L_blk, Cptr, Rptr, p, proj_tmp);
 
@@ -3471,6 +3503,10 @@ nb::tuple precompute_residual_variances_bed_impl(
                 else safe = (var > eps ? var : eps);
                 const double invj = 1.0 / std::sqrt(safe);
                 invp[(size_t) (s + j)] = (T) invj;
+                if (snp_var) {
+                    const double raw = ss_raw[(size_t) j];
+                    snp_var[(size_t) (s + j)] = (raw > 0.0 && std::isfinite(ss)) ? std::min(1.0, ss / raw) : 0.0;
+                }
                 if (inv2_local)
                     inv2_local[(size_t) j] = invj * invj;
             }
@@ -3712,11 +3748,13 @@ NB_MODULE(gwldcore, m) {
     m.def("precompute_residual_variances_bed", &precompute_residual_variances_bed_impl<float>,
           nb::arg("bed_prefix"), nb::arg("fam_path"), nb::arg("nsnps"), nb::arg("step_size"), nb::arg("row_sel") = nb::none(),
           nb::arg("ddof") = 1, nb::arg("eps") = 1e-10, nb::arg("compute_mu22") = false, nb::arg("annot_all") = nb::none(),
-          nb::arg("C") = nb::none(), nb::arg("R") = nb::none(), nb::arg("impute_mode") = "hwe", nb::arg("impute_seed") = nb::none());
+          nb::arg("C") = nb::none(), nb::arg("R") = nb::none(), nb::arg("impute_mode") = "hwe", nb::arg("impute_seed") = nb::none(),
+          nb::arg("snp_var_out") = nb::none());
     m.def("precompute_residual_variances_bed", &precompute_residual_variances_bed_impl<double>,
           nb::arg("bed_prefix"), nb::arg("fam_path"), nb::arg("nsnps"), nb::arg("step_size"), nb::arg("row_sel") = nb::none(),
           nb::arg("ddof") = 1, nb::arg("eps") = 1e-10, nb::arg("compute_mu22") = false, nb::arg("annot_all") = nb::none(),
-          nb::arg("C") = nb::none(), nb::arg("R") = nb::none(), nb::arg("impute_mode") = "hwe", nb::arg("impute_seed") = nb::none());
+          nb::arg("C") = nb::none(), nb::arg("R") = nb::none(), nb::arg("impute_mode") = "hwe", nb::arg("impute_seed") = nb::none(),
+          nb::arg("snp_var_out") = nb::none());
 
     m.def("phase2_accum_XtXz_bed", &phase2_accum_XtXz_bed_impl<float>,
           nb::arg("bed_prefix"), nb::arg("fam_path"), nb::arg("blk_start"), nb::arg("blk_end"), nb::arg("row_sel") = nb::none(),

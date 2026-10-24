@@ -82,6 +82,7 @@ class Sumcore:
         ldsc_m=None,
         ldsc_irwls_iters: int = 3,
         ldsc_irwls_tol: float = 0.0,
+        snp_var_weights: bool = True,
         **_unused_kwargs,
     ):
 
@@ -173,6 +174,7 @@ class Sumcore:
                 annot=annot,
                 verbose=bool(self.verbose_level),
                 delta=None,
+                snp_var_weights=snp_var_weights,
             )
         else:
             self.trace = trace_obj
@@ -270,6 +272,17 @@ class Sumcore:
                 "--adjust-delta is an HE trace correction and is incompatible with "
                 "--weight-mode ldsc."
             )
+        if getattr(self.trace, "annot_mass", None) is not None:
+            unsupported = [name for name, on in (
+                ("--weight-mode ldsc", self.weight_mode == "ldsc"),
+                ("--adjust-delta", self.adjust_delta),
+                (f"--rg-se-method {self.rg_se_method}", self.rg_se_method in {"robust", "kmoments"}),
+            ) if on]
+            if unsupported:
+                raise ValueError(
+                    f"{' and '.join(unsupported)} cannot be used with SNP-variance-weighted LD scores (V column); "
+                    "recompute the LD scores with --snp-var-weights-off."
+                )
         if self.chisq_action not in ("drop", "clip", "warn", "none"):
             raise ValueError("chisq_action must be one of {'drop','clip','warn','none'}")
         if self.intercept_weight_mode not in {"ldsc", "score"}:
@@ -427,6 +440,16 @@ class Sumcore:
         )
 
         rel_m12 = self._related_pair_cross_moment(matched1, matched2)
+        if rel_m12 is not None and tv.ldscores_rel is not None:
+            tv = tv.pair_excluded()
+            if self.log is not None:
+                self.log._log("[relatives] subtracting the LD_REL columns from the LD scores (related pairs excluded).")
+        elif rel_m12 is not None and self.log is not None:
+            self.log._log("[relatives] the LD-score file has no LD_REL columns: the LD scores are taken to come from "
+                          "unrelated individuals.")
+        elif tv.ldscores_rel is not None and self.log is not None:
+            self.log._log("[relatives] sumstats without REL_M keep the related pairs, so the LD_REL columns are not "
+                          "subtracted.")
 
         if self.jackknife_spec.mode == "chr":
             full_tv = self.trace.materialize_view()

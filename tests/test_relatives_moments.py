@@ -5,11 +5,12 @@ import pytest
 bed_reader = pytest.importorskip("bed_reader")
 
 from summit.relatives.moments import (
-    adjust_ldscores,
     append_rel_m_to_sumstats,
     compute_relative_pair_moments,
     extract_rel_m12,
+    pairs_within_sample,
     read_relative_pairs,
+    relative_pair_ld_rel,
 )
 from summit.sumstats.moments import build_h2_summary_moment, exact_score_z_from_arrays, h2_moment_from_arrays
 from summit.sumstats.sumstats import Sumstats
@@ -157,40 +158,42 @@ def _snp_meta(M):
             "SNP": [f"rs{j}" for j in range(M)]}
 
 
+def _ld_rel(G, covs, pairs_path, iid, A, step_size=97):
+    """LD_REL from relative_pair_ld_rel on the whole sample; the basis includes the intercept, which centered
+    genotypes are orthogonal to, so it spans the same projection as SUMMIT's LD-score step."""
+    N, M = G.shape
+    p = 0 if covs is None or not covs.size else covs.shape[1]
+    C = None if p == 0 else np.linalg.qr(np.column_stack([np.ones(N), covs]))[0]
+    rp = read_relative_pairs(pairs_path, pd.DataFrame({"FID": iid, "IID": iid}))
+    a, b = pairs_within_sample(rp, np.arange(N), N)
+    n_eff = N - p - 1
+    return relative_pair_ld_rel(lambda s, e: G[:, s:e], M, a, b, A, C, n_eff, step_size=step_size), n_eff
+
+
 @pytest.mark.parametrize("ncov", [0, 2])
 def test_ld_rel_partitioned_matches_brute_force(tmp_path, ncov):
-    prefix, G, y, covs, iid, cov_path = _simulate(tmp_path, ncov=ncov)
+    _, G, y, covs, iid, _ = _simulate(tmp_path, ncov=ncov)
     M = G.shape[1]
-    b = (np.random.default_rng(5).random(M) < 0.4).astype(int)
-    annot = pd.DataFrame({**_snp_meta(M), "binA": b, "binB": 1 - b})
-    annot.to_csv(tmp_path / "annot.txt", sep=" ", index=False)
-    common = dict(pairs=str(tmp_path / "pairs.txt"), covar=cov_path, step_size=97, ld_rel=True)
-    compute_relative_pair_moments(prefix, str(tmp_path / "pheno.txt"), str(tmp_path / "relp"),
-                                  annot=str(tmp_path / "annot.txt"), **common)
-    compute_relative_pair_moments(prefix, str(tmp_path / "pheno.txt"), str(tmp_path / "rel1"), **common)
-    X, _, p, n_eff = _projected(G, y, covs if ncov else None)
+    b = (np.random.default_rng(5).random(M) < 0.4).astype(float)
+    A = np.column_stack([b, 1 - b]) * np.random.default_rng(6).uniform(0.9, 1.0, M)[:, None]   # V-like weights
+    got, n_eff = _ld_rel(G, covs if ncov else None, str(tmp_path / "pairs.txt"), iid, A)
+    X, _, p, n_eff2 = _projected(G, y, covs if ncov else None)
+    assert n_eff == n_eff2
     pi, pj = _family_pairs(str(tmp_path / "pairs.txt"), iid)
-    brute = _brute_ld_rel(X, pi, pj, n_eff, annot[["binA", "binB"]].to_numpy(float))
-    tab = pd.read_csv(tmp_path / "relp.tsv.gz", sep="\t")
-    np.testing.assert_allclose(tab[["LD_REL_binA", "LD_REL_binB"]].to_numpy(), brute, rtol=1e-8, atol=1e-10)
-    one = pd.read_csv(tmp_path / "rel1.tsv.gz", sep="\t")["LD_REL"].to_numpy()
-    np.testing.assert_allclose(one, brute.sum(1), rtol=1e-8, atol=1e-10)
+    np.testing.assert_allclose(got, _brute_ld_rel(X, pi, pj, n_eff, A), rtol=1e-8, atol=1e-10)
 
 
-def test_missing_phenotype_rel_m_and_ld_rel_sample(tmp_path):
-    """REL_M uses the phenotype's complete cases; LD_REL uses every sample with complete covariates."""
+def test_missing_phenotype_rel_m_uses_complete_cases(tmp_path):
+    """REL_M uses the phenotype's complete cases (with complete covariates)."""
     prefix, G, y, covs, iid, cov_path = _simulate(tmp_path, ncov=2)
     ph = pd.read_csv(tmp_path / "pheno.txt", sep=" ", dtype={"FID": str, "IID": str})
     ph.loc[::7, "y"] = np.nan
     ph.to_csv(tmp_path / "pheno.txt", sep=" ", index=False, na_rep="NA")
     out = str(tmp_path / "rel")
     compute_relative_pair_moments(prefix, str(tmp_path / "pheno.txt"), out, pairs=str(tmp_path / "pairs.txt"),
-                                  covar=cov_path, step_size=97, ld_rel=True)
+                                  covar=cov_path, step_size=97)
     tab = pd.read_csv(out + ".tsv.gz", sep="\t")
     pi, pj = _family_pairs(str(tmp_path / "pairs.txt"), iid)
-    X, _, _, n_eff = _projected(G, y, covs)
-    np.testing.assert_allclose(tab["LD_REL"].to_numpy(), _brute_ld_rel(X, pi, pj, n_eff, np.ones((G.shape[1], 1)))[:, 0],
-                               rtol=1e-8, atol=1e-10)
     keep = ph["y"].notna().to_numpy()
     pos = -np.ones(keep.size, dtype=int)
     pos[keep] = np.arange(keep.sum())
@@ -204,31 +207,20 @@ def test_missing_phenotype_rel_m_and_ld_rel_sample(tmp_path):
 
 
 @pytest.mark.parametrize("ncov", [0, 2])
-def test_adjust_ld_gives_pair_excluded_trace(tmp_path, ncov):
-    """With in-sample LD scores l_j = sum_j' r_jj'^2 - M/N_eff (SUMMIT's convention), the adjusted scores
-    reconstruct the pair-excluded trace exactly: N_eff + N_eff^2/M^2 sum_j (l_j - LD_REL_j) = tr(K_u^2)."""
-    prefix, G, y, covs, iid, cov_path = _simulate(tmp_path, ncov=ncov, missing=0.0)
-    out = str(tmp_path / "rel")
-    compute_relative_pair_moments(prefix, str(tmp_path / "pheno.txt"), out, pairs=str(tmp_path / "pairs.txt"),
-                                  covar=cov_path, ld_rel=True)
+def test_ld_rel_gives_pair_excluded_trace(tmp_path, ncov):
+    """With in-sample LD scores l_j = sum_j' r_jj'^2 - M/N_eff (SUMMIT's convention), l - LD_REL reconstructs the
+    pair-excluded trace exactly: N_eff + N_eff^2/M^2 sum_j (l_j - LD_REL_j) = tr(K_u^2)."""
+    _, G, y, covs, iid, _ = _simulate(tmp_path, ncov=ncov, missing=0.0)
     X, _, p, n_eff = _projected(G, y, covs if ncov else None)
     N, M = X.shape
     ld_exact = ((X.T @ X / n_eff) ** 2).sum(1) - M / n_eff
-    pd.DataFrame({**_snp_meta(M), "L2_0": ld_exact})[["CHR", "SNP", "BP", "L2_0"]].to_csv(
-        tmp_path / "in.gw.ldscore.gz", sep="\t", index=False, float_format="%.6f")
-    info = adjust_ldscores(str(tmp_path / "in.gw.ldscore.gz"), out + ".tsv.gz", str(tmp_path / "adj.gw.ldscore.gz"))
-    adj = pd.read_csv(tmp_path / "adj.gw.ldscore.gz", sep="\t")
+    rel, _ = _ld_rel(G, covs if ncov else None, str(tmp_path / "pairs.txt"), iid, np.ones((M, 1)))
     pi, pj = _family_pairs(str(tmp_path / "pairs.txt"), iid)
     K = X @ X.T / M
-    full = n_eff + n_eff ** 2 / M ** 2 * info["columns"]["L2_0"]["sum_ld"]
-    assert full == pytest.approx((K * K).sum(), rel=1e-6)
+    assert n_eff + n_eff ** 2 / M ** 2 * ld_exact.sum() == pytest.approx((K * K).sum(), rel=1e-9)
     K[pi, pj] = 0.0
     K[pj, pi] = 0.0
-    assert n_eff + n_eff ** 2 / M ** 2 * adj["L2_0"].sum() == pytest.approx((K * K).sum(), rel=1e-6)
-    with pytest.raises(ValueError, match="LD_REL_L2_1"):
-        pd.DataFrame({**_snp_meta(M), "L2_0": ld_exact, "L2_1": ld_exact})[["CHR", "SNP", "BP", "L2_0", "L2_1"]].to_csv(
-            tmp_path / "two.gw.ldscore.gz", sep="\t", index=False)
-        adjust_ldscores(str(tmp_path / "two.gw.ldscore.gz"), out + ".tsv.gz", str(tmp_path / "x.gz"))
+    assert n_eff + n_eff ** 2 / M ** 2 * (ld_exact - rel[:, 0]).sum() == pytest.approx((K * K).sum(), rel=1e-9)
 
 
 def _two_phenotypes(tmp_path, y, iid, seed=11):
@@ -292,7 +284,7 @@ def test_rg_self_pair_with_relatives_equals_h2(tmp_path):
     pd.DataFrame({"FID": iid, "IID": iid, "y": y, "yb": y}).to_csv(tmp_path / "pheno_self.txt", sep=" ", index=False)
     out = str(tmp_path / "rel")
     compute_relative_pair_moments(prefix, str(tmp_path / "pheno_self.txt"), out, pairs=str(tmp_path / "pairs.txt"),
-                                  covar=cov_path, cross=True, ld_rel=True)
+                                  covar=cov_path, cross=True)
     X, yy, p, n_eff = _projected(G, y, covs)
     N, M = X.shape
     _ols_sumstats(tmp_path / "ss.tsv", X, yy, p)
@@ -300,18 +292,19 @@ def test_rg_self_pair_with_relatives_equals_h2(tmp_path):
     append_rel_m_to_sumstats(str(tmp_path / "ss.tsv"), out + ".tsv.gz", "yb", str(tmp_path / "ssb.tsv"))
     extract_rel_m12(out + ".tsv.gz", "y", "yb", str(tmp_path / "m12.tsv"))
     ld_exact = ((X.T @ X / n_eff) ** 2).sum(1) - M / n_eff
-    pd.DataFrame({**_snp_meta(M), "L2_0": ld_exact})[["CHR", "SNP", "BP", "L2_0"]].to_csv(
+    rel, _ = _ld_rel(G, covs, str(tmp_path / "pairs.txt"), iid, np.ones((M, 1)))
+    pd.DataFrame({**_snp_meta(M), "L2_0": ld_exact, "LD_REL_L2_0": rel[:, 0]})[
+        ["CHR", "SNP", "BP", "L2_0", "LD_REL_L2_0"]].to_csv(
         tmp_path / "in.gw.ldscore.gz", sep="\t", index=False, float_format="%.6f")
-    adjust_ldscores(str(tmp_path / "in.gw.ldscore.gz"), out + ".tsv.gz", str(tmp_path / "adj.gw.ldscore.gz"))
-    common = dict(ldscores=str(tmp_path / "adj.gw.ldscore.gz"), njack="chr", chisq_threshold=None,
+    common = dict(ldscores=str(tmp_path / "in.gw.ldscore.gz"), njack="chr", chisq_threshold=None,
                   intercept_chisq_thr=None, intercept_rg=1.0, align_alleles=False)
     res = Sumcore(rg=f"{tmp_path / 'ssa.tsv'},{tmp_path / 'ssb.tsv'}", rel_m12=str(tmp_path / "m12.tsv"), **common)._run()
     gamma = float(res["rg_fit"].gamma_total[0])
     assert gamma == pytest.approx(float(res["h2_fit1"].h2[-1, 0]), rel=1e-8)
     assert float(res["h2_fit2"].h2[-1, 0]) == pytest.approx(float(res["h2_fit1"].h2[-1, 0]), rel=1e-12)
-    # the pair-excluded h2 differs from the naive one, so the check is not vacuous
-    naive = Sumcore(rg=f"{tmp_path / 'ss.tsv'},{tmp_path / 'ss.tsv'}",
-                    **{**common, "ldscores": str(tmp_path / "in.gw.ldscore.gz")})._run()
+    # the pair-excluded h2 differs from the naive one (sumstats without REL_M keep LD_REL unused), so the check is
+    # not vacuous
+    naive = Sumcore(rg=f"{tmp_path / 'ss.tsv'},{tmp_path / 'ss.tsv'}", **common)._run()
     assert abs(float(naive["rg_fit"].gamma_total[0]) - gamma) > 1e-4
     with pytest.raises(ValueError, match="--rel-m12"):
         Sumcore(rg=f"{tmp_path / 'ssa.tsv'},{tmp_path / 'ssb.tsv'}", **common)._run()

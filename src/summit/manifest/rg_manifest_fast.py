@@ -1028,7 +1028,13 @@ def dispatch_rg_manifest_fast(args, log, manifest_df, trait_meta, verbose_level:
         annot=args.annot,
         verbose=bool(verbose_level),
         delta=None,
+        snp_var_weights=not getattr(args, "snp_var_weights_off", False),
     )
+    if shared_trace.annot_mass is not None:
+        raise ValueError(
+            "--rg-manifest-fast does not support SNP-variance-weighted LD scores (V column) yet; use regular rg "
+            "manifest mode, or recompute the LD scores with --snp-var-weights-off."
+        )
     full_tv = shared_trace.materialize_view()
     model_manifest = getattr(args, "rg_model_manifest", None)
     multi_model = bool(model_manifest)

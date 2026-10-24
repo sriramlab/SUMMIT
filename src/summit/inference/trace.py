@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 import numpy as np
@@ -97,6 +97,8 @@ class TraceView:
     kmoments: dict | None = None
     kmoments_path: str | None = None
     kmoments_valid: bool = False
+    annot_mass: np.ndarray | None = None      # unweighted annotation when `annot` carries the V weights
+    ldscores_rel: np.ndarray | None = None    # related pairs' share of each LD score (LD_REL_<column>)
 
     @property
     def nsnps(self) -> int:
@@ -126,7 +128,15 @@ class TraceView:
             kmoments=self.kmoments,
             kmoments_path=self.kmoments_path,
             kmoments_valid=bool(self.kmoments is not None and self.kmoments_valid and full_keep),
+            annot_mass=None if self.annot_mass is None else self.annot_mass[keep_mask, :],
+            ldscores_rel=None if self.ldscores_rel is None else self.ldscores_rel[keep_mask, :],
         )
+
+    def pair_excluded(self) -> "TraceView":
+        """The view with the related pairs' share (LD_REL) removed from every LD score."""
+        if self.ldscores_rel is None:
+            raise ValueError("The LD-score file has no LD_REL columns.")
+        return replace(self, ldscores=self.ldscores - self.ldscores_rel, ldscores_rel=None)
 
 
 class Trace:
@@ -152,6 +162,7 @@ class Trace:
         ldscores_reg_w=None,
         verbose=False,
         delta=None,
+        snp_var_weights=True,
     ):
         if sumpath is not None:
             raise NotImplementedError(
@@ -169,6 +180,8 @@ class Trace:
         self.delta = None if delta is None else np.asarray(delta, dtype=np.float64)
 
         main_df, main_L, main_start = self._read_ldscores_file(ldscores, which="main")
+        ld_cols, rel_cols, has_v = self._ldscore_columns(main_df.columns.tolist(), main_start, path=ldscores,
+                                                         which="main")
         reg_df = None
         reg_L = None
         reg_start = None
@@ -248,7 +261,9 @@ class Trace:
         # Align main (and reg) LD-scores to the annotation-pruned SNP order.
         main_index = main_df.set_index("SNP")
         main_df = main_index.loc[annot_df["SNP"].astype(str).to_numpy()].reset_index()
-        main_L = main_df.iloc[:, main_start:].to_numpy(dtype=np.float64, copy=False)
+        main_L = main_df[ld_cols].to_numpy(dtype=np.float64, copy=False)
+        snp_var = main_df["V"].to_numpy(dtype=np.float64, copy=True) if has_v else None
+        rel_L = main_df[rel_cols].to_numpy(dtype=np.float64, copy=False) if rel_cols else None
 
         if reg_df is not None:
             reg_df = reg_df.set_index("SNP").loc[annot_df["SNP"].astype(str).to_numpy()].reset_index()
@@ -272,6 +287,22 @@ class Trace:
         self.annot = np.asarray(annot_matrix, dtype=np.float64, order="C")[order, :]
         self.annot_header = np.asarray(annot_header)
         self.ldscores = np.asarray(main_L, dtype=np.float64, order="C")[order, :]
+        self.ldscores_rel = None if rel_L is None else np.asarray(rel_L, dtype=np.float64, order="C")[order, :]
+        self.snp_var = None if snp_var is None else snp_var[order]
+        self.annot_mass = None
+        if self.snp_var is not None:
+            if not snp_var_weights:
+                raise ValueError(
+                    f"The LD-score file '{ldscores}' has a V column: its LD scores weight partner SNPs by the share "
+                    "of genotype variance left after covariate adjustment (1 - adjusted R2) and are only valid with "
+                    "those weights. "
+                    "Recompute the LD scores with --snp-var-weights-off for an ordinary file, or drop "
+                    "--snp-var-weights-off here."
+                )
+            # Kernels P X diag(a_k) X' P / M of the genotypes before covariate adjustment: in the re-standardized
+            # SNP basis their weights are a_jk V_j; the unweighted annotation gives the masses for reporting.
+            self.annot_mass = self.annot
+            self.annot = np.ascontiguousarray(self.annot * self.snp_var[:, None])
         self.ldscores_reg_w = None if regw_L is None else np.asarray(regw_L, dtype=np.float64, order="C")[order, :]
         self.ldscores_reg = None if reg_L is None else np.asarray(reg_L, dtype=np.float64, order="C")[order, :]
 
@@ -315,6 +346,15 @@ class Trace:
                 f"Loaded Trace with {self.nsnps} SNPs, {self.nbins} annotation bins, "
                 f"{reg_bins} regression LD bins, and {regw_bins} regression-weight LD bins."
             )
+            if self.snp_var is not None:
+                self.log._log(
+                    "SNP-variance weights: on (V column in the LD-score file). h2, rg and enrichment refer to "
+                    "the genotypes before covariate adjustment, as in GCTA or RHE-mc with the same covariates."
+                )
+            else:
+                self.log._log("SNP-variance weights: off (no V column in the LD-score file).")
+            if self.ldscores_rel is not None:
+                self.log._log("LD_REL columns found: subtracted for sumstats with REL_M (related pairs excluded).")
 
     def materialize_view(self, keep_mask=None) -> TraceView:
         if keep_mask is None:
@@ -357,6 +397,10 @@ class Trace:
             kmoments=self.kmoments,
             kmoments_path=self.kmoments_path,
             kmoments_valid=bool(self.kmoments is not None and full_keep),
+            annot_mass=(None if self.annot_mass is None
+                        else (self.annot_mass if full_keep else self.annot_mass[keep_mask, :])),
+            ldscores_rel=(None if self.ldscores_rel is None
+                          else (self.ldscores_rel if full_keep else self.ldscores_rel[keep_mask, :])),
         )
 
     def _read_ldscores_file(self, path, *, which: str):
@@ -383,7 +427,8 @@ class Trace:
             )
         start_idx = 4 if ("CM" in first4) else 3
         df = _normalize_variant_keys(df, source=f"LD-score input ({which}) '{path}'")
-        L = df.iloc[:, start_idx:].to_numpy(dtype=np.float64, copy=False)
+        ld_cols, rel_cols, has_v = self._ldscore_columns(cols, start_idx, path=path, which=which)
+        L = df[ld_cols].to_numpy(dtype=np.float64, copy=False)
 
         if which == "reg_w" and L.ndim == 2 and L.shape[1] != 1:
             raise ValueError(
@@ -391,6 +436,9 @@ class Trace:
             )
 
         finite = np.isfinite(L).all(axis=1)
+        extra = (["V"] if has_v else []) + rel_cols
+        if extra:
+            finite &= np.isfinite(df[extra].to_numpy(dtype=np.float64, copy=False)).all(axis=1)
         if which in {"reg", "reg_w"}:
             ltot = L.sum(axis=1)
             finite &= np.isfinite(ltot) & (ltot > 0.0)
@@ -405,6 +453,32 @@ class Trace:
         df = df.loc[finite].reset_index(drop=True)
         L = L[finite, :]
         return df, L, start_idx
+
+    @staticmethod
+    def _ldscore_columns(cols, start_idx: int, *, path, which: str):
+        """Split LD-score data columns into LD scores, LD_REL_<column> and the optional V column after the metadata."""
+        data = [str(c) for c in cols[start_idx:]]
+        has_v = bool(data) and data[0] == "V"
+        if "V" in data[1:]:
+            raise ValueError(f"LD-score file '{path}': V, when present, must directly follow the SNP metadata columns.")
+        rel_cols = [c for c in data if c.startswith("LD_REL")]
+        ld_cols = [c for c in data[(1 if has_v else 0):] if not c.startswith("LD_REL")]
+        if not ld_cols:
+            raise ValueError(f"LD-score file '{path}' has no LD-score columns.")
+        if which != "main" and (has_v or rel_cols):
+            raise ValueError(
+                f"The {which} LD-score file '{path}' has V or LD_REL columns; regression LD-score inputs must be "
+                "ordinary LD-score files."
+            )
+        if rel_cols:
+            expected = [f"LD_REL_{c}" for c in ld_cols]
+            if sorted(rel_cols) != sorted(expected):
+                raise ValueError(
+                    f"LD-score file '{path}': LD_REL columns {rel_cols} do not match the LD-score columns "
+                    f"(expected {expected})."
+                )
+            rel_cols = expected
+        return ld_cols, rel_cols, has_v
 
     def _read_annotation(self, *, annot_path, bimpath, snps_main, chr_main, bp_main):
         snps_main = np.asarray(snps_main, dtype=str)

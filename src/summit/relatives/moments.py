@@ -23,16 +23,17 @@ With LD scores computed in an unrelated sample of the same population no trace
 change is needed. If LD scores are computed in the related sample itself, the
 related pairs' share of each in-sample LD score is
 
-    LD_REL_j = (M / N_eff^2) sum_{(i,i') in P, ordered} x_ij x_i'j K_ii',
+    LD_REL_j = (M / N_eff^2) sum_{(i,i') in P, ordered} x_ij x_i'j K_ii'.
 
-which this module can also write. SUMMIT's in-sample LD scores are l_j = sum_j' r_jj'^2 - M / N_eff, so
-N_eff + (N_eff^2 / M^2) sum_j (l_j - LD_REL_j) is exactly the trace of the pair-excluded GRM. For partitioned LD
-scores l_{j,k} = sum_j' a_j'k r_jj'^2 - M_k / N_eff the related share is
+SUMMIT's in-sample LD scores are l_j = sum_j' r_jj'^2 - M / N_eff, so N_eff + (N_eff^2 / M^2) sum_j (l_j - LD_REL_j)
+is exactly the trace of the pair-excluded GRM. For partitioned LD scores l_{j,k} = sum_j' a_j'k r_jj'^2 - M_k / N_eff
+the related share is
 
-    LD_REL_{j,k} = (1 / N_eff^2) sum_{(i,i') in P, ordered} x_ij x_i'j W_{k,ii'},   W_{k,ii'} = sum_j' a_j'k x_ij' x_i'j',
+    LD_REL_{j,k} = (1 / N_eff^2) sum_{(i,i') in P, ordered} x_ij x_i'j W_{k,ii'},   W_{k,ii'} = sum_j' a_j'k x_ij' x_i'j'.
 
-computed on the samples SUMMIT's LD-score step uses (all genotyped samples with complete covariates), whatever the
-phenotypes' missingness. `adjust_ldscores` subtracts these columns from an in-sample LD-score file.
+The LD-score step computes these columns (`summit --geno ... --relative-pairs FILE`, via `relative_pair_ld_rel`) on
+its own samples, covariates and annotation weights and writes them as LD_REL_<column> next to the LD scores; the fit
+subtracts them when the sumstats carry REL_M.
 
 Pairs: a file with IID1/IID2 (optionally FID1/FID2 and a kinship column with a
 threshold). By default pairs are closed into families (connected components) and
@@ -48,12 +49,7 @@ import numpy as np
 import pandas as pd
 from bed_reader import open_bed
 
-from ..ldscore.genotype_source import (
-    read_aligned_annotations,
-    read_fam_sample_ids,
-    resolve_genotype_input,
-    validate_variant_metadata,
-)
+from ..ldscore.genotype_source import read_fam_sample_ids, resolve_genotype_input
 from ..ldscore.gw_ldscore import read_cov
 
 
@@ -140,6 +136,43 @@ def _project_normalize(X: np.ndarray, C: np.ndarray, n_eff: float) -> tuple[np.n
     return X, ok
 
 
+def pairs_within_sample(rp: RelativePairs, idx: np.ndarray, n_all: int) -> tuple[np.ndarray, np.ndarray]:
+    """Positions within the sample `idx` (indices into the genotype sample order) of the pairs with both members in it."""
+    pos = -np.ones(int(n_all), dtype=np.int64)
+    pos[np.asarray(idx, dtype=np.int64)] = np.arange(len(idx))
+    a, b = pos[rp.i], pos[rp.j]
+    use = (a >= 0) & (b >= 0)
+    return a[use], b[use]
+
+
+def relative_pair_ld_rel(read_block, nsnps: int, a: np.ndarray, b: np.ndarray, A: np.ndarray, C, n_eff: float,
+                         step_size: int = 5000) -> np.ndarray:
+    """LD_REL_{j,k} (nsnps x K) for unordered pairs (a, b) of one sample, in two genotype passes.
+
+    `read_block(s, e)` returns the sample's genotypes of SNPs s..e-1 (samples x SNPs, NaN or mean-imputed for missing
+    calls); C is the orthonormal covariate basis of that sample (or None); A holds the per-SNP weights of the LD-score
+    columns (the annotation, times V for SNP-variance-weighted LD scores).
+    """
+    A = np.asarray(A, dtype=np.float64)
+    if A.shape[0] != int(nsnps):
+        raise ValueError(f"LD_REL weights have {A.shape[0]} rows for {nsnps} SNPs.")
+
+    def _blocks():
+        for s in range(0, int(nsnps), int(step_size)):
+            yield s, min(int(nsnps), s + int(step_size))
+
+    W = np.zeros((a.size, A.shape[1]))                          # first pass: W_k on pairs
+    for s, e in _blocks():
+        X, _ = _project_normalize(np.array(read_block(s, e), dtype=np.float64), C, n_eff)
+        W += (X[a] * X[b]) @ A[s:e]
+    out = np.zeros((int(nsnps), A.shape[1]), dtype=np.float64)
+    scale = 2.0 / float(n_eff) ** 2                              # unordered pairs counted twice
+    for s, e in _blocks():
+        X, _ = _project_normalize(np.array(read_block(s, e), dtype=np.float64), C, n_eff)
+        out[s:e] = scale * ((X[a] * X[b]).T @ W)
+    return out
+
+
 def compute_relative_pair_moments(
     geno: str,
     pheno: str,
@@ -152,17 +185,13 @@ def compute_relative_pair_moments(
     kinship_min: float | None = None,
     closure: bool = True,
     step_size: int = 5000,
-    ld_rel: bool = False,
-    annot: str | None = None,
     cross: bool = False,
     log=None,
 ) -> dict:
-    """Write per-SNP REL_M (one column per phenotype) and optional LD_REL to `out`.tsv.gz.
+    """Write per-SNP REL_M (one column per phenotype) to `out`.tsv.gz.
 
     Phenotypes sharing the same complete-case sample set (phenotype and covariates
     non-missing) are processed together; each set gets its own covariate basis.
-    LD_REL (one column, or LD_REL_<annotation> per column of `annot`) is computed on
-    the samples with complete covariates, the sample of SUMMIT's in-sample LD scores.
     With `cross`, REL_M12_<a>__<b> is also written for every pair of phenotypes with the
     same complete-case sample (the cross-trait moment z*_a z*_b has the same derivative
     kappa with respect to (x_j'y_a)(x_j'y_b), so REL_M12_j = kappa * sum over ordered pairs
@@ -209,39 +238,11 @@ def compute_relative_pair_moments(
         return np.asarray(C, dtype=np.float64)
 
     def _pairs_in(idx):
-        pos = -np.ones(n_all, dtype=np.int64)
-        pos[idx] = np.arange(idx.size)
-        a, b = pos[rp.i], pos[rp.j]
-        use = (a >= 0) & (b >= 0)
-        return a[use], b[use]
+        return pairs_within_sample(rp, idx, n_all)
 
     def _blocks():
         for s in range(0, M, step_size):
             yield s, min(M, s + step_size)
-
-    ld_cols, ld_rel_out, ld_summary = None, None, None
-    if ld_rel:
-        if annot is None:
-            ld_cols, A = ["LD_REL"], np.ones((M, 1), dtype=np.float64)
-        else:
-            variants = validate_variant_metadata(bim.copy(), source=f"BIM '{gi.variant_path}'")
-            names, A, _ = read_aligned_annotations(annot, variants, log=log, source_label="BIM")
-            ld_cols, A = [f"LD_REL_{c}" for c in names], np.asarray(A, dtype=np.float64)
-        ld_idx = np.flatnonzero(cov_ok)
-        C_ld = _basis(ld_idx)
-        ne_ld = float(ld_idx.size - C_ld.shape[1] - 1)
-        a_ld, b_ld = _pairs_in(ld_idx)
-        W = np.zeros((a_ld.size, A.shape[1]))                    # first pass: W_k on pairs
-        for s, e in _blocks():
-            X, _ = _project_normalize(bed.read(index=np.s_[ld_idx, s:e], dtype="float64"), C_ld, ne_ld)
-            W += (X[a_ld] * X[b_ld]) @ A[s:e]
-        ld_rel_out = np.zeros((M, A.shape[1]), dtype=np.float64)
-        ld_scale = 2.0 / ne_ld ** 2                                  # unordered pairs counted twice
-        ld_done = False
-        ld_summary = {"n": int(ld_idx.size), "n_covariates": int(C_ld.shape[1]), "n_eff": ne_ld,
-                      "pairs_used": int(a_ld.size), "columns": ld_cols}
-        _log(f"[relatives] LD_REL on {ld_idx.size} samples with complete covariates, {a_ld.size} pairs, "
-             f"{len(ld_cols)} column(s).")
 
     # group phenotypes by complete-case sample set
     groups: dict[bytes, list[int]] = {}
@@ -274,7 +275,6 @@ def compute_relative_pair_moments(
             wx = np.stack([Y[a, t1] * Y[b, t2] + Y[b, t1] * Y[a, t2] for t1, t2 in xpairs], axis=1)
             for t1, t2 in xpairs:
                 rel_m12[(ks[t1], ks[t2])] = np.zeros(M, dtype=np.float64)
-        share_ld = ld_rel and not ld_done and np.array_equal(idx, ld_idx)
         for s, e in _blocks():
             X, ok = _project_normalize(bed.read(index=np.s_[idx, s:e], dtype="float64"), C, n_eff)
             G = X[a] * X[b]                                       # pairs x SNPs
@@ -283,10 +283,6 @@ def compute_relative_pair_moments(
                 blk = kappa * (G.T @ wx)
                 for c_, (t1, t2) in enumerate(xpairs):
                     rel_m12[(ks[t1], ks[t2])][s:e] = blk[:, c_]
-            if share_ld:
-                ld_rel_out[s:e] = ld_scale * (G.T @ W)
-        if share_ld:
-            ld_done = True
         for t, k in enumerate(ks):
             summary["phenotypes"][pheno_cols[k]] = {
                 "n": n, "n_covariates": p, "pairs_used": int(a.size),
@@ -294,14 +290,6 @@ def compute_relative_pair_moments(
                 "sum_rel_m": float(rel_m[:, k].sum()),
             }
         _log(f"[relatives] phenotypes {[pheno_cols[k] for k in ks]}: n={n}, p={p}, pairs used={a.size}.")
-
-    if ld_rel and not ld_done:                                     # no phenotype group used the LD sample
-        for s, e in _blocks():
-            X, _ = _project_normalize(bed.read(index=np.s_[ld_idx, s:e], dtype="float64"), C_ld, ne_ld)
-            ld_rel_out[s:e] = ld_scale * ((X[a_ld] * X[b_ld]).T @ W)
-    if ld_rel:
-        ld_summary["sums"] = [float(v) for v in ld_rel_out.sum(axis=0)]
-        summary["ld_rel"] = ld_summary
 
     table = bim[["CHR", "SNP", "BP", "A1", "A2"]].copy()
     for k, name in enumerate(pheno_cols):
@@ -312,9 +300,6 @@ def compute_relative_pair_moments(
             name = f"{pheno_cols[k1]}__{pheno_cols[k2]}"
             table[f"REL_M12_{name}"] = v
             summary["cross"][name] = {"c_rel12": float(v.mean()), "sum_rel_m12": float(v.sum())}
-    if ld_rel:
-        for k, name in enumerate(ld_cols):
-            table[name] = ld_rel_out[:, k]
     os.makedirs(os.path.dirname(os.path.abspath(out)) or ".", exist_ok=True)
     table.to_csv(out + ".tsv.gz", sep="\t", index=False, float_format="%.10g")
     with open(out + ".json", "w") as fh:
@@ -351,43 +336,3 @@ def extract_rel_m12(rel_table: str, pheno1: str, pheno2: str, out: str) -> float
     t = pd.read_csv(rel_table, sep="\t", usecols=["SNP", name], dtype={"SNP": str}).rename(columns={name: "REL_M12"})
     t.to_csv(out, sep="\t", index=False, float_format="%.10g")
     return float(t["REL_M12"].mean())
-
-
-def adjust_ldscores(ldscores: str, rel_table: str, out: str) -> dict:
-    """Subtract the related pairs' share (LD_REL columns) from an in-sample genome-wide LD-score file.
-
-    `ldscores` is SUMMIT's .gw.ldscore.gz computed on the related sample with the GWAS covariates; `rel_table` is
-    the .tsv.gz written by compute_relative_pair_moments(ld_rel=True) for the same genotypes, covariates and (for
-    partitioned scores) annotation. A single LD-score column pairs with LD_REL; column c otherwise pairs with
-    LD_REL_c. The result is the pair-excluded LD score, whose sum gives tr(K_u^2) in SUMMIT's reconstruction.
-    """
-    ld = pd.read_csv(ldscores, sep=r"\s+", dtype={"SNP": str})
-    meta = [c for c in ("CHR", "SNP", "BP", "CM") if c in ld.columns]
-    if meta[:3] != ["CHR", "SNP", "BP"]:
-        raise ValueError(f"{ldscores} must begin with CHR SNP BP.")
-    ldcols = [c for c in ld.columns if c not in meta]
-    rel = pd.read_csv(rel_table, sep="\t", dtype={"SNP": str})
-    relcols = [c for c in rel.columns if c == "LD_REL" or c.startswith("LD_REL_")]
-    if len(ldcols) == 1 and relcols == ["LD_REL"]:
-        mapping = {ldcols[0]: "LD_REL"}
-    else:
-        mapping = {c: f"LD_REL_{c}" for c in ldcols}
-        missing = [v for v in mapping.values() if v not in rel.columns]
-        if missing:
-            raise ValueError(f"{rel_table} lacks {missing}; compute LD_REL with the LD scores' annotation.")
-    if rel["SNP"].duplicated().any() or ld["SNP"].duplicated().any():
-        raise ValueError("Duplicate SNP IDs; LD_REL cannot be matched unambiguously.")
-    pos = pd.Index(rel["SNP"]).get_indexer(ld["SNP"])
-    if np.any(pos < 0):
-        raise ValueError(f"{int(np.sum(pos < 0))} LD-score SNPs have no LD_REL, e.g. {ld['SNP'][pos < 0].head(5).tolist()}.")
-    bp_bad = rel["BP"].to_numpy()[pos] != ld["BP"].to_numpy()
-    if np.any(bp_bad):
-        raise ValueError(f"BP disagrees between the LD scores and LD_REL for {int(bp_bad.sum())} SNPs.")
-    info = {"nsnps": int(len(ld)), "columns": {}}
-    for c, r in mapping.items():
-        sub = rel[r].to_numpy(dtype=np.float64)[pos]
-        info["columns"][c] = {"ld_rel_column": r, "sum_ld": float(ld[c].sum()), "sum_ld_rel": float(sub.sum())}
-        ld[c] = ld[c].to_numpy(dtype=np.float64) - sub
-    ld.to_csv(out, sep="\t", index=False, float_format="%.6f",
-              compression="gzip" if str(out).endswith(".gz") else None)
-    return info

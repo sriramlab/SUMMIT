@@ -20,6 +20,7 @@ from ..sumstats.sumstats import Sumstats
 from .h2core import (
     H2MatchedMetadata,
     H2ResultWriter,
+    compute_h2_mass_unit_stats,
     compute_h2_structural_unit_stats,
     fit_h2,
     prepare_h2_reference_axis_from_sufficient_stats,
@@ -582,7 +583,13 @@ def dispatch_h2_batch_fast(args, log):
         annot=args.annot,
         verbose=bool(verbose_level),
         delta=None,
+        snp_var_weights=not getattr(args, "snp_var_weights_off", False),
     )
+    if trace.annot_mass is not None and args.adjust_delta:
+        raise ValueError(
+            "--adjust-delta cannot be used with SNP-variance-weighted LD scores (V column); recompute the LD "
+            "scores with --snp-var-weights-off."
+        )
     trace_view = trace.materialize_view()
     jackknife = JackknifeDesign.from_trace_view(trace_view, jk_spec, log=log)
     # Build pandas' immutable lookup engine before concurrent readers share it.
@@ -615,6 +622,7 @@ def dispatch_h2_batch_fast(args, log):
     elif args.h2_cache_only:
         raise ValueError("--h2-cache-only requires --h2-cache-dir.")
 
+    full_mass = None
     if args.h2_cache_only:
         full_struct = None
         A = None
@@ -626,6 +634,8 @@ def dispatch_h2_batch_fast(args, log):
             jackknife,
             ld_kind="main",
         )
+        if trace_view.annot_mass is not None:
+            full_mass = compute_h2_mass_unit_stats(trace_view.annot_mass, jackknife)
         A = np.asarray(trace_view.annot, dtype=np.float64, order="C")
         overlap_rows = np.empty(M, dtype=bool)
         for start in range(0, M, 200_000):
@@ -716,6 +726,7 @@ def dispatch_h2_batch_fast(args, log):
                 full_struct=full_struct,
                 adjust_delta=args.adjust_delta,
                 has_overlap=bool(np.any(overlap_rows & active_mask)),
+                full_mass=full_mass,
             )
             fit = fit_h2(
                 prepared,

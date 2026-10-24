@@ -9,7 +9,7 @@ as `summit pgs fit`.
 |---|---|
 | Genome-wide or windowed LD scores | `summit --geno ...` |
 | Heritability or genetic correlation | `summit --h2 ...` or `summit --rg ...` |
-| Related-pair moments for h²/rg with relatives | `summit relatives {moments,append,adjust-ld,cross-m12}` |
+| Related-pair moments for h²/rg with relatives | `summit relatives {moments,append,cross-m12}` |
 | Additive and generalized G×E PCGC | `summit --binary-method pcgc ...` |
 | Generalized cross-trait PCGC | `summit pcgc-cross {prepare,fit}` |
 | One-environment G×E | `summit --geno ... --env ...`, `--gxe-score-reference`, `--gxe-fit`, or `--gxe-fit-batch` |
@@ -45,6 +45,8 @@ and experimental joint uncertainty are described in that guide.
 | `--num-threads` | Compute thread count |
 | `--memory-gib` | Working-memory budget in GiB |
 | `--njack` | Jackknife block count or scheme |
+| `--snp-var-weights-off` | LD scores without the `V` column; h²/rg refuse `V` files |
+| `--relative-pairs` | Add `LD_REL_<column>` for related pairs in the LD sample |
 
 Use complete option names. `--block-size` controls computation; `--njack`
 controls uncertainty estimation. Windowed LD scores do not use random vectors.

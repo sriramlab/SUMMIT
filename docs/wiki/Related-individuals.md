@@ -14,7 +14,7 @@ stays unbiased whatever the phenotypic covariance between relatives.
 
 ## Inputs
 
-- The BED genotypes used for the GWAS. PGEN is not yet supported here.
+- The BED genotypes used for the GWAS. `summit relatives moments` does not yet read PGEN.
 - A phenotype table with `FID IID` followed by one or more phenotype columns,
   as given to the GWAS.
 - The GWAS covariates, `FID IID` followed by numeric columns, without an
@@ -65,12 +65,12 @@ projected on its own covariate basis, as in a GWAS that drops missing values.
 `REL_M` does not depend on allele coding. Missing genotypes are mean-imputed,
 which agrees with complete-case GWAS to first order in the missing fraction.
 The cost is proportional to the number of related pairs times the number of
-SNPs; genotypes are read once, or twice with `--ld-rel`.
+SNPs; genotypes are read once.
 
 Add `--cross` to write `REL_M12_<a>__<b>` for every pair of phenotypes with the
 same complete-case samples (see [Genetic correlation](#genetic-correlation)).
-Add `--ld-rel` when the LD scores are computed in the study itself (see
-[LD scores](#ld-scores)).
+When the LD scores are computed in the study itself, the LD-score step adds the
+relatives' share (see [LD scores](#ld-scores)).
 
 ## Estimate h²
 
@@ -102,27 +102,27 @@ different admixture LD. Its LD scores then misstate the trace for the full
 sample. In a UK Biobank admixed cohort this lowered h² by about 9%; in-sample
 LD scores removed the bias.
 
-In-sample LD scores include the relatives' pairs. Remove them with LD_REL:
+In-sample LD scores include the relatives' pairs. Give the LD-score step the
+same pairs and options as `moments`:
 
 ```bash
 summit --geno study.bed --covar covariates.tsv \
+  --relative-pairs pairs.tsv --kinship-col KINSHIP --kinship-min 0.0442 \
   --nvecs 20000 --block-size 16384 --num-threads 16 --out ld/study
-
-summit relatives moments --geno study.bed --pheno phenotypes.tsv \
-  --covar covariates.tsv --pairs pairs.tsv --kinship-col KINSHIP \
-  --kinship-min 0.0442 --ld-rel --out results/relmoments
-
-summit relatives adjust-ld --ldscores ld/study.gw.ldscore.gz \
-  --rel results/relmoments.tsv.gz --out ld/study.pairexcl.gw.ldscore.gz
 ```
 
-Fit h² with `ld/study.pairexcl.gw.ldscore.gz`. Use the same genotypes, samples
-and covariates for the LD scores and for LD_REL. LD_REL uses every sample with
-complete covariates, the sample of the LD-score step, regardless of phenotype
-missingness. For partitioned LD scores, also pass the LD-score annotation with
-`--annot`; `moments` then writes one `LD_REL_<annotation>` column per LD-score
-column and `adjust-ld` matches them by name. `adjust-ld` reads one LD-score
-file, not chromosome-split paths.
+`ld/study.gw.ldscore.gz` then has an `LD_REL_<column>` column after the LD
+scores for each LD-score column: the related pairs' share of that LD score.
+Fit with this file as usual. `--h2` and `--rg` subtract LD_REL for summary
+statistics with `REL_M` and use the LD scores unchanged otherwise; the log says
+which. The LD-score step uses every sample with complete covariates, regardless
+of phenotype missingness, and computes LD_REL with the same samples, covariates,
+annotation and `V` weights as the LD scores. Partitioned LD scores need no
+extra option, whatever the annotation. `--relative-pairs` reads BED or PGEN and
+applies to genome-wide LD scores only.
+
+An LD-score file without LD_REL columns is taken to come from unrelated
+individuals.
 
 ## Genetic correlation
 
@@ -145,7 +145,8 @@ summit --rg a.rel.sumstats.gz,b.rel.sumstats.gz --rel-m12 a_b.relm12.tsv \
 ```
 
 SUMMIT requires `REL_M` in both files together with `--rel-m12`; a partial
-specification would remove the pairs from some equations but not others.
+specification would remove the pairs from some equations but not others. With
+in-sample LD scores that carry LD_REL, the same file serves h² and rg.
 `REL_M12` exists only for phenotypes with identical complete-case samples.
 The sample-overlap covariance describes each person's own two phenotypes and
 needs no change. rg manifests do not accept `REL_M`.
