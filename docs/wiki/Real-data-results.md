@@ -17,6 +17,21 @@ Reproduced without modification from Figure 5 of
 under [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/).
 These are results from the published SUM-RHE implementation.
 
+### Across ancestries
+
+The SUMMIT preprint estimated total SNP heritability for 40 UK Biobank traits
+in participants of European, South Asian and African ancestry, and compared
+SUMMIT with cov-LDSC and SumHer-LDAK.
+
+![SNP heritability estimates for UK Biobank traits in four cohorts from SUMMIT, cov-LDSC and SumHer-LDAK, comparison with whole-genome sequencing estimates, and differences between cohorts.](assets/summit-preprint-ukb-h2.png)
+
+Panel A shows estimates for 20 traits by method and cohort. Panel B compares
+each method's estimates with common-variant heritability from whole-genome
+sequencing, and panel C shows standardized differences between cohorts in
+SUMMIT's estimates.
+
+Reproduced from [Jeong et al., bioRxiv (2026)](https://doi.org/10.64898/2026.10.20.760508) under [CC BY-NC-ND 4.0](https://creativecommons.org/licenses/by-nc-nd/4.0/), resized but otherwise unmodified. These results come from the SUMMIT version used for the preprint, before LD scores computed with covariates carried the `V` column ([LD scores](LD-scores.md#covariates-and-snp-variance-weights)). With the current defaults, estimates in admixed cohorts are slightly higher.
+
 For commands, see [Heritability and genetic correlation](Heritability-and-genetic-correlation.md).
 
 ## Gene–environment interaction

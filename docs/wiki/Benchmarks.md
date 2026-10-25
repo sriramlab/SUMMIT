@@ -47,6 +47,38 @@ The 480 serialized component values differed by at most `2.7e-12`. Cached trait
 processing took 6.43 seconds for four traits, but the common model load dominated
 the end-to-end run. Uncached batching was not faster in this comparison.
 
+## Accuracy in simulations
+
+The SUMMIT preprint compared heritability and genetic correlation estimates
+with cov-LDSC and SumHer-LDAK in simulations from UK Biobank genotypes of
+participants of European, South Asian and African ancestry.
+
+![Missing genome-wide LD with windowed LD scores, and mean squared error of heritability estimates relative to SUMMIT, across three ancestries.](assets/summit-preprint-h2-simulations.png)
+
+Panel A shows how much of the genome-wide LD windowed LD scores miss, with
+and without PC adjustment. Panels B and C show the mean squared error of
+heritability estimates relative to SUMMIT for single-component and MAF-LD
+architectures, and panel D the distribution of absolute relative bias across
+simulation settings.
+
+![False-positive rate and error of genetic correlation estimates in simulations across three ancestries.](assets/summit-preprint-rg-simulations.png)
+
+Panel A shows the false-positive rate of genetic correlation tests under the
+null, panels B and C the error of genome-wide rg estimates with partitioned
+models, and panel D the estimated genetic covariance against the heritability
+scale in each replicate.
+
+## LD-score runtime
+
+![Runtime of genome-wide LD-score estimation by sample size, number of variants and number of annotation bins.](assets/summit-preprint-ldscore-runtime.png)
+
+Genome-wide LD-score estimation time grows linearly with the number of
+samples, variants and annotation bins. Later versions run phase 1 of the
+calculation faster, so these times are upper bounds for the current code.
+
+Figures in this section are reproduced from [Jeong et al., bioRxiv (2026)](https://doi.org/10.64898/2026.10.20.760508) under [CC BY-NC-ND 4.0](https://creativecommons.org/licenses/by-nc-nd/4.0/), resized but
+otherwise unmodified. These results come from the SUMMIT version used for the preprint, before LD scores computed with covariates carried the `V` column ([LD scores](LD-scores.md#covariates-and-snp-variance-weights)). With the current defaults, estimates in admixed cohorts are slightly higher.
+
 ## Measuring a new workload
 
 Measure complete wall time through result writing and reload, peak RSS, and
