@@ -218,12 +218,13 @@ def _exact_setting(tmp_path, *, N=500, M=240, seed=4):
 
 
 def _sumstats(path, PXs, yp, N, p):
-    """PLINK-style beta/SE for the polymorphic SNPs (monomorphic SNPs have no GWAS row)."""
+    """PLINK-style beta/SE with the covariate rank, for the polymorphic SNPs (monomorphic SNPs have no GWAS row)."""
     ss = (PXs ** 2).sum(0)
     ok = ss > 1e-10
     r = (PXs[:, ok].T @ yp) / np.sqrt(ss[ok] * (yp @ yp))
     pd.DataFrame({"SNP": [f"rs{j}" for j in np.flatnonzero(ok)], "A1": "A", "A2": "G", "N": N, "BETA": r,
-                  "SE": np.sqrt((1 - r ** 2) / (N - p - 2))}).to_csv(path, sep="\t", index=False, float_format="%.15g")
+                  "SE": np.sqrt((1 - r ** 2) / (N - p - 2)), "COV_RANK": p}).to_csv(
+        path, sep="\t", index=False, float_format="%.15g")
     return str(path)
 
 
@@ -254,9 +255,9 @@ def test_v_mode_h2_and_rg_match_exact_he_with_the_unadjusted_kernel(tmp_path):
             assert np.isfinite(h.results[0].h2[-1, 1])
         e = {k: _exact_he(K, P, y1p, y1p) for k, K in kernels.items()}
         exact = {k: s[0] / s.sum() for k, s in e.items()}
-        # SUMMIT's intercept-only (cov_rank 0) convention moves both modes by the same O(p/N) amount
-        assert abs((fit["v"] - exact["v"]) - (fit["ord"] - exact["ord"])) < 2e-4
-        assert abs(fit["v"] - exact["v"]) < 3e-3
+        # with the covariate rank, both modes equal exact HE with their kernels
+        assert fit["ord"] == pytest.approx(exact["ord"], rel=1e-8)
+        assert fit["v"] == pytest.approx(exact["v"], rel=1e-8)
 
         # plumbing: V mode = the ordinary fit of the V-weighted kernel, converted to the unadjusted scale
         h = Sumrhe(h2_path=s1, ldscores=paths["proto"], annot=str(tmp_path / "annV.txt"), njack="chr",

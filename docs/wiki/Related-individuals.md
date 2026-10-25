@@ -152,6 +152,63 @@ in-sample LD scores that carry LD_REL, the same file serves h² and rg.
 The sample-overlap covariance describes each person's own two phenotypes and
 needs no change. rg manifests do not accept `REL_M`.
 
+## Simulations
+
+We simulated phenotypes from UK Biobank genotypes in three cohorts that
+include relatives, with families defined by GRM relatedness above 0.0442.
+
+| Cohort | Individuals | Maximal unrelated subset | Within-family pairs | SNPs | PCs |
+|---|---:|---:|---:|---:|---:|
+| EUR | 14,561 | 12,151 | 4,216 | 454,207 | 10 |
+| SAS | 8,566 | 7,484 | 2,506 | 448,403 | 20 |
+| AFR | 4,327 | 3,903 | 721 | 1,002,034 | 10 |
+
+Every SNP had an effect, except in scenario E, where 1% of SNPs did. The
+heritability was 0.25, or 0.10 in scenario D. In scenarios B to E, relatives
+also shared an untagged genetic component with variance 0.25 and covariance
+proportional to their relatedness. In scenarios C to E they also shared
+a household effect with variance 0.10. Scenario A had neither. Each scenario
+had 100 replicates. The GWAS used PLINK 2 with the PCs as covariates, and
+the summary statistics carried `COV_RANK`. Each analysis used in-sample LD
+scores with the `V` column, computed in its own GWAS sample, and 200-block
+jackknife standard errors. We compared the maximal unrelated subset with
+everyone, keeping or excluding the related pairs. The truth is the simulated
+heritability.
+
+![Bias of h² and coverage of 95% confidence intervals in five scenarios, and bias of the genetic covariance, for three cohorts, comparing the unrelated subset with everyone, with related pairs kept or excluded.](assets/related-individuals-benchmark-h2.png)
+
+Excluding related pairs gave unbiased estimates in every cohort and scenario
+(panel A), and so did the unrelated subset. Keeping the related pairs biased
+h² upward by 0.05 to 0.11 whenever relatives shared more than the SNP
+kernel. Confidence intervals from excluding pairs covered the truth in 89% to
+95% of replicates (panel B). Coverage was lowest in the admixed AFR cohort,
+where jackknife standard errors are somewhat small.
+
+For genetic correlation we simulated 50 pairs of traits per cohort with
+h² 0.25 and rg 0.5, in which relatives also shared correlated untagged and
+household effects. The overlap covariance came from `--pheno-rg` and
+`--pheno-rg-cov`, and the pair-excluded fits used `REL_M` in both files and
+`--rel-m12`. Excluding related pairs estimated the genetic covariance as well
+as the unrelated subset did, and keeping them inflated it by 0.09 to 0.10
+(panel C; labels give the coverage of 95% intervals).
+
+![Sampling variance of the unrelated-subset estimate relative to the pair-excluded estimate, and power to detect heritability by true h².](assets/related-individuals-benchmark-power.png)
+
+Keeping everyone made the estimates more precise. The sampling variance of
+the unrelated-subset estimate was 1.15 to 1.50 times that of the
+pair-excluded estimate (panel A), a mean of 1.35 in EUR, 1.26 in SAS and 1.23
+in AFR, where 17%, 13% and 10% of individuals were outside the unrelated
+subset. Panel B shows the power to detect heritability at the 5% level
+implied by each analysis's sampling variance.
+
+In AFR, the same pair-excluded analysis with ordinary LD scores
+(`--snp-var-weights-off`) underestimated h² by 0.010 to 0.023 because the PCs
+explain part of the genotype variance
+([LD scores](LD-scores.md#covariates-and-snp-variance-weights)).
+
+The simulation and plotting scripts are in
+`benchmarks/related_individuals/`.
+
 ## Interpretation
 
 The estimate is the SNP heritability of the SNPs in the GRM, the quantity
