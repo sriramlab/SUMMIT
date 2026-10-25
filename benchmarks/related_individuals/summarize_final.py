@@ -187,7 +187,7 @@ def figure_power(s, e):
     """(A) sampling variance of the unrelated-subset estimate relative to pair exclusion; (B) power to detect h2 > 0
     at the 5% level, from each arm's empirical sampling SD pooled over scenarios A-E (500 replicates)."""
     set_style()
-    fig, axes = plt.subplots(1, 2, figsize=(11.5, 4.4), gridspec_kw=dict(wspace=0.32))
+    fig, axes = plt.subplots(1, 2, figsize=(13.8, 4.4), gridspec_kw=dict(wspace=0.32))
     ax = axes[0]
     x = np.arange(len(POPS))
     for i, pop in enumerate(POPS):
@@ -207,7 +207,8 @@ def figure_power(s, e):
     from matplotlib.lines import Line2D
     hl = [Line2D([], [], color=COLOR[a], lw=2, label=LABEL[a]) for a in ('unrel', 'pairexcl')]
     hl += [Line2D([], [], color='#555555', ls=ls[p], lw=2, label=p) for p in POPS]
-    ax.legend(handles=hl, loc='upper left', fontsize=10.5)
+    ax.legend(handles=hl, loc='center left', bbox_to_anchor=(1.03, 0.5), fontsize=10.5)
+    ax.set_xticks(np.arange(0, 0.201, 0.05))
     ax.set_xlabel('True $h^2$'); ax.set_ylabel('Power, one-sided 5% test'); ax.set_ylim(0, 1.02); style_axis(ax)
     panel_label(fig, axes[0], 'A'); panel_label(fig, axes[1], 'B')
     fig.savefig(f'{OUT}/related_benchmark_power.png', bbox_inches='tight')
