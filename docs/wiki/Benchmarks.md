@@ -76,7 +76,7 @@ Genome-wide LD-score estimation time grows linearly with the number of
 samples, variants and annotation bins. Later versions run phase 1 of the
 calculation faster, so these times are upper bounds for the current code.
 
-Figures in this section are reproduced from [Jeong et al., bioRxiv (2026)](https://doi.org/10.64898/2026.10.20.760508) under [CC BY-NC-ND 4.0](https://creativecommons.org/licenses/by-nc-nd/4.0/), resized but
+The preprint figures on this page are Figures 1 and 3 and Supplementary Figure S23 of [Jeong et al., bioRxiv (2026)](https://doi.org/10.64898/2026.10.20.760508), reproduced under [CC BY-NC-ND 4.0](https://creativecommons.org/licenses/by-nc-nd/4.0/), resized but
 otherwise unmodified. These results come from the SUMMIT version used for the preprint, before LD scores computed with covariates carried the `V` column ([LD scores](LD-scores.md#covariates-and-snp-variance-weights)). With the current defaults, estimates in admixed cohorts are slightly higher.
 
 ## Measuring a new workload

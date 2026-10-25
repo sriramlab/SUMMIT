@@ -202,7 +202,8 @@ def test_actual_summit_cli_prepares_and_fits_binary_artifact(tmp_path, monkeypat
 def test_root_cli_documents_binary_default_and_removes_research_flags():
     from summit.cli import build_parser
     root = build_parser()
-    assert root.parse_args([]).njack == "chr"
+    # unset at parse time; each analysis fills its own default (h2/rg/binary: 200 blocks, GxE fits: chr)
+    assert root.parse_args([]).njack is None
     assert "200 contiguous SNP blocks" in " ".join(root.format_help().split())
     for flag in ("--binary-research", "--_binary-research"):
         with pytest.raises(SystemExit):

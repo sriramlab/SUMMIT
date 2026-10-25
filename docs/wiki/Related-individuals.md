@@ -13,6 +13,9 @@ phenotypes, which is added to the summary statistics and subtracted by
 stays unbiased whatever the phenotypic covariance between relatives.
 [Methods](Methods.md#related-individuals) gives the estimating equations.
 
+For a runnable synthetic example of the whole workflow (sibling pairs, h² and
+rg), run `bash example/related_individuals.sh` from the repository root.
+
 ## Inputs
 
 - The BED genotypes used for the GWAS. `summit relatives moments` does not yet read PGEN.

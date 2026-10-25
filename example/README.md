@@ -13,6 +13,16 @@ its own completed example directory and refuses other existing directories.
 Generated files are excluded from Git. See the [user guide](../docs/wiki/Home.md)
 for real-analysis input requirements.
 
+## Related individuals
+
+`bash example/related_individuals.sh` generates a cohort of 1,200 people with
+400 sibling pairs under `example/out/related/` and runs the whole workflow:
+related-pair moments, in-sample LD scores with `LD_REL`, h² and rg with the
+related pairs excluded, and h² with the pairs kept for comparison. The traits
+have h² 0.3 and rg 0.5, and siblings share a family effect. Expected results
+are h² of about 0.34 (SE 0.07) and rg of about 0.44 (SE 0.15) with the pairs
+excluded, and h² of about 0.47 with the pairs kept.
+
 ## Manuscript methods demo
 
 After installing SUMMIT, run these commands from the repository root:
