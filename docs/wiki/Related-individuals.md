@@ -75,7 +75,9 @@ related pairs times the number of SNPs. `REL_M` does not depend on allele
 coding.
 
 One value per trait keeps the point estimate of the single-component model,
-and of each class of the annotation used, exactly as with per-SNP values.
+and of each class of the annotation used, exactly as with per-SNP values when
+the LD scores come from the same sample (with LD scores from another sample,
+the two differ only through the difference between the samples' `V` weights).
 Only the jackknife changes, because each block's share of the total is then
 proportional to its number of SNPs (weighted by `V`). In UK Biobank simulations
 this moved standard errors by less than 0.1% ([Simulations](#simulations)). The

@@ -181,7 +181,8 @@ over all SNPs, or over the SNPs of each class of a partitioning annotation,
 and it sets `REL_M_j` to that value for every SNP (the class's value with an
 annotation; `REL_M12` likewise). The single-component estimate, and each
 class of the annotation used, depend on REL_M only through
-`Σ_j V_j a_jk REL_M_j`, so they are unchanged. Only the jackknife changes:
+`Σ_j V_j a_jk REL_M_j`, so they are unchanged when the LD scores' `V_j` are those
+of the GWAS sample. Only the jackknife changes:
 each deleted block removes its share of the total in proportion to its SNPs'
 `V_j`, not its own related-pair part. In the UK Biobank simulations this moved
 h² and genetic-covariance standard errors by less than 0.1%. All phenotypes'
