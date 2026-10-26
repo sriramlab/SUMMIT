@@ -53,11 +53,10 @@ every phenotype:
 
     sum_j V_j a_jk REL_M_j = (2 / N_eff) sum_{(i,i') in P} y_i y_i' W_{k,ii'},   W_{k,ii'} = sum_j V_j a_jk x_ij x_i'j,
 
-with the pair kernels W computed once, in the union of the phenotypes' complete-case
-samples (each phenotype keeps its own pairs, covariate projection and N_eff; for a
-phenotype measured in a subset this is exact up to the subset's own projection of the
-genotypes). `--per-snp` writes the exact per-SNP REL_M instead (one genotype pass per
-complete-case sample).
+with the pair kernels W accumulated in one genotype pass for every complete-case sample,
+each with its own covariate basis, mean imputation, projection, N_eff and V weights, so the
+values equal those computed from the exact per-SNP REL_M. `--per-snp` also writes the
+per-SNP REL_M (one genotype pass per complete-case sample).
 """
 from __future__ import annotations
 
@@ -334,8 +333,16 @@ def compute_relative_pair_totals(
     """One REL_M value per phenotype (and per class of `annot`): the V-weighted mean sum_j V_j REL_M_j / sum_j V_j.
 
     Writes `out`.rel_m.tsv (PHENO N N_COVARIATES PAIRS REL_M [REL_M_<class> ...]), with `cross` also `out`.rel_m12.tsv
-    (PHENO1 PHENO2 N PAIRS REL_M12, phenotype pairs with identical complete-case samples), and `out`.json. One genotype
-    pass serves every phenotype (see the module docstring)."""
+    (PHENO1 PHENO2 N PAIRS REL_M12, phenotype pairs with identical complete-case samples), and `out`.json.
+
+    One genotype pass serves every phenotype, and the values equal those computed from the exact per-SNP REL_M
+    (`compute_relative_pair_moments`): each complete-case sample keeps its own covariate basis (the same as the per-SNP
+    path), mean imputation, projection, N_eff and V weights. The sample's means, sums of squares and covariate
+    cross-products come from products of the union's genotype block with indicator and basis matrices (missing calls
+    through a sparse correction), and projected genotypes are formed only for people in families.
+    """
+    from scipy import sparse
+
     def _log(msg):
         if log is not None:
             log._log(msg)
@@ -348,13 +355,10 @@ def compute_relative_pair_totals(
     idx0 = np.flatnonzero(union)
     if idx0.size == 0:
         raise ValueError("No sample has a phenotype and complete covariates.")
-    C0 = _covariate_basis(covar, sample_ids, idx0)
-    n0, p0 = int(idx0.size), int(C0.shape[1])
-    n_eff0 = float(n0 - p0 - 1)
-    adj0 = float(n0 - 1) / float(n0 - p0 - 1)                      # 1 - R2 -> 1 - adjusted R2, as the LD-score step
+    n0 = int(idx0.size)
     rp = read_relative_pairs(pairs, sample_ids, kinship_col=kinship_col, kinship_min=kinship_min, closure=closure)
     _log(f"[relatives] {rp.npairs} unordered related pairs ({'family closure' if closure else 'as listed'}).")
-    a0, b0 = pairs_within_sample(rp, idx0, n_all)
+    a0, b0 = pairs_within_sample(rp, idx0, n_all)                 # positions within the union
     rows, inv = np.unique(np.concatenate([a0, b0]), return_inverse=True)
     ar, br = inv[:a0.size], inv[a0.size:]
     if annot is not None:
@@ -362,55 +366,97 @@ def compute_relative_pair_totals(
     else:
         A, classes = np.zeros((M, 0)), []
     K = 1 + len(classes)
-    W = np.zeros((a0.size, K))                                     # pair kernels: all SNPs, then each class
-    vsum = np.zeros(K)
-    step = _auto_step(step_size, n0)
-    _log(f"[relatives] one genotype pass over {M} SNPs in blocks of {step} for {len(pheno_cols)} phenotype(s): "
-         f"union sample n={n0}, {p0} covariates, {a0.size} pairs, {rows.size} individuals in families.")
-    nblk = -(-M // step)
-    for b, s in enumerate(range(0, M, step)):
-        e = min(M, s + step)
-        X = _center_impute(np.asarray(bed.read(index=np.s_[idx0, s:e], dtype="float64")))
-        Xr, r1 = _pair_rows_block(X, C0, n_eff0, rows)
-        wcols = (r1 * adj0)[:, None] * np.column_stack([np.ones(e - s), A[s:e]])
-        W += (Xr[ar] * Xr[br]) @ wcols
-        vsum += wcols.sum(axis=0)
-        if (b + 1) % max(1, nblk // 10) == 0:
-            _log(f"[relatives] {e} of {M} SNPs")
-    pos0 = -np.ones(n_all, dtype=np.int64)
-    pos0[idx0] = np.arange(n0)
-    rows_out, cross_rows = [], ([] if cross else None)
-    summary = {"nsnps": int(M), "approximation": "one REL_M value per phenotype (and class): V-weighted mean",
-               "union_n": n0, "classes": classes, "npairs_listed": int(rp.npairs), "phenotypes": {}}
+    G = []                                                        # one entry per complete-case sample
+    cols, off = [], 0
     for gkey, ks in groups.items():
         mask = np.frombuffer(gkey, dtype=bool)
         idx = np.flatnonzero(mask)
-        n = int(idx.size)
-        C = _covariate_basis(covar, sample_ids, idx)
-        p = int(C.shape[1])
-        n_eff = float(n - p - 1)
-        Y, _ = _project_normalize(Yall[idx][:, ks].copy(), C, n_eff)
+        C = _covariate_basis(covar, sample_ids, idx)              # the per-SNP path's basis for this sample
+        n, p = int(idx.size), int(C.shape[1])
+        m0 = mask[idx0]
+        Cfull = np.zeros((n0, p))
+        Cfull[m0] = C
+        cols.append(Cfull)
+        inside = m0[a0] & m0[b0]
+        G.append(dict(ks=ks, idx=idx, m0=m0, C=C, n=n, p=p, n_eff=float(n - p - 1), adj=float(n - 1) / float(n - p - 1),
+                      off=off, inside=inside, pa=ar[inside], pb=br[inside], Cf=Cfull[rows],
+                      W=np.zeros((int(inside.sum()), K)), vsum=np.zeros(K)))
+        off += p
+    Call = np.asfortranarray(np.hstack(cols)) if off else np.zeros((n0, 0))
+    del cols
+    Mmask = np.column_stack([g["m0"] for g in G]).astype(np.float64)
+    ng = np.array([g["n"] for g in G], dtype=np.float64)
+    step = _auto_step(step_size, n0)
+    _log(f"[relatives] one genotype pass over {M} SNPs in blocks of {step} for {len(pheno_cols)} phenotype(s) in "
+         f"{len(G)} complete-case sample(s): union n={n0}, {a0.size} pairs, {rows.size} individuals in families.")
+    nblk = -(-M // step)
+    for b_, s in enumerate(range(0, M, step)):
+        e = min(M, s + step)
+        X = np.asarray(bed.read(index=np.s_[idx0, s:e], dtype="float64"))
+        nan = np.isnan(X)
+        anynan = bool(nan.any())
+        if anynan:
+            X[nan] = 0.0
+            NAN = sparse.csc_matrix(nan, dtype=np.float64)
+            nmiss = np.asarray((NAN.T @ Mmask).T)                 # samples x SNPs: missing calls per sample
+            CN = np.asarray((NAN.T @ Call).T) if off else np.zeros((0, e - s))
+        S1 = Mmask.T @ X
+        S2 = Mmask.T @ (X * X)
+        S0 = ng[:, None] - (nmiss if anynan else 0.0)
+        CX = Call.T @ X if off else np.zeros((0, e - s))
+        Xf = X[rows]
+        Of = ~nan[rows] if anynan else None
+        A_blk = np.column_stack([np.ones(e - s), A[s:e]])
+        for k, g in enumerate(G):
+            mu = S1[k] / np.maximum(S0[k], 1.0)
+            raw = S2[k] - mu * S1[k]                              # sum over called genotypes of (x - mu)^2
+            B = CX[g["off"]:g["off"] + g["p"]]
+            if anynan:
+                B = B + mu[None, :] * CN[g["off"]:g["off"] + g["p"]]   # sum_i C_i (x_i - mu) o_i
+            ss = raw - np.einsum("ij,ij->j", B, B)
+            ok = np.isfinite(ss) & (ss > 1e-10)
+            scale = np.zeros(ss.shape)
+            scale[ok] = np.sqrt(g["n_eff"] / ss[ok])
+            with np.errstate(divide="ignore", invalid="ignore"):
+                r1 = np.where(ok & (raw > 0.0), np.minimum(1.0, ss / raw), 0.0)
+            xh = Xf - mu[None, :]
+            if anynan:
+                xh *= Of
+            if g["p"]:
+                xh -= g["Cf"] @ B
+            xh *= scale[None, :]
+            wcols = (r1 * g["adj"])[:, None] * A_blk
+            g["W"] += (xh[g["pa"]] * xh[g["pb"]]) @ wcols
+            g["vsum"] += wcols.sum(axis=0)
+        if (b_ + 1) % max(1, nblk // 10) == 0:
+            _log(f"[relatives] {e} of {M} SNPs")
+    rows_out, cross_rows = [], ([] if cross else None)
+    summary = {"nsnps": int(M), "method": "one REL_M value per phenotype (and class): V-weighted mean, one genotype pass",
+               "union_n": n0, "classes": classes, "npairs_listed": int(rp.npairs), "phenotypes": {}}
+    for g in G:
+        ks, idx, n, p, n_eff = g["ks"], g["idx"], g["n"], g["p"], g["n_eff"]
+        Y, _ = _project_normalize(Yall[idx][:, ks].copy(), g["C"], n_eff)
         yfull = np.zeros((n0, len(ks)))
-        yfull[pos0[idx]] = Y
-        inside = mask[idx0[a0]] & mask[idx0[b0]]                   # pairs with both members in this sample
-        wp = (yfull[a0] * yfull[b0]) * inside[:, None]
-        tot = (2.0 / n_eff) * (wp.T @ W)                           # phenotypes x (all, classes): sum_j V_j a_jk REL_M_j
-        vals = tot / np.where(vsum > 0, vsum, np.nan)
+        yfull[g["m0"]] = Y
+        ga, gb = a0[g["inside"]], b0[g["inside"]]
+        wp = yfull[ga] * yfull[gb]
+        tot = (2.0 / n_eff) * (wp.T @ g["W"])                     # phenotypes x (all, classes): sum_j V_j a_jk REL_M_j
+        vals = tot / np.where(g["vsum"] > 0, g["vsum"], np.nan)
+        npair = int(g["inside"].sum())
         for t, k in enumerate(ks):
             name = pheno_cols[k]
-            rows_out.append([name, n, p, int(inside.sum()), *vals[t].tolist()])
-            summary["phenotypes"][name] = {"n": n, "n_covariates": p, "pairs_used": int(inside.sum()),
-                                           "rel_m": float(vals[t, 0]),
+            rows_out.append([name, n, p, npair, *vals[t].tolist()])
+            summary["phenotypes"][name] = {"n": n, "n_covariates": p, "pairs_used": npair, "rel_m": float(vals[t, 0]),
                                            "rel_m_class": dict(zip(classes, map(float, vals[t, 1:])))}
         if cross:
             for t1 in range(len(ks)):
                 for t2 in range(t1 + 1, len(ks)):
-                    w12 = (yfull[a0, t1] * yfull[b0, t2] + yfull[b0, t1] * yfull[a0, t2]) * inside
-                    v12 = float((w12 @ W[:, 0]) / n_eff / vsum[0])
-                    cross_rows.append([pheno_cols[ks[t1]], pheno_cols[ks[t2]], n, int(inside.sum()), v12])
-        _log(f"[relatives] phenotypes {[pheno_cols[k] for k in ks]}: n={n}, p={p}, pairs used={int(inside.sum())}.")
+                    w12 = yfull[ga, t1] * yfull[gb, t2] + yfull[gb, t1] * yfull[ga, t2]
+                    v12 = float((w12 @ g["W"][:, 0]) / n_eff / g["vsum"][0])
+                    cross_rows.append([pheno_cols[ks[t1]], pheno_cols[ks[t2]], n, npair, v12])
+        _log(f"[relatives] phenotypes {[pheno_cols[k] for k in ks][:5]}: n={n}, p={p}, pairs used={npair}.")
     if cross:
-        skipped = sum(len(ks1) * len(ks2) for g1, ks1 in groups.items() for g2, ks2 in groups.items() if g1 < g2)
+        skipped = sum(len(g1["ks"]) * len(g2["ks"]) for i1, g1 in enumerate(G) for g2 in G[i1 + 1:])
         if skipped:
             _log(f"[relatives] REL_M12 not computed for {skipped} phenotype pair(s) with different complete-case samples.")
     _write_totals(out, rows_out, cross_rows, classes, summary)

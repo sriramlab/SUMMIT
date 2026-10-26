@@ -67,7 +67,8 @@ The command writes:
 
 One genotype pass gives the values of every phenotype. Each phenotype keeps
 its own complete-case sample, related pairs, covariate projection and `N_eff`,
-as in a GWAS that drops missing values. Missing genotypes are mean-imputed,
+as in a GWAS that drops missing values, and its values equal those computed
+from the per-SNP moments of that sample. Missing genotypes are mean-imputed,
 which agrees with complete-case GWAS to first order in the missing fraction.
 The pass reads all genotypes but forms the projected genotypes only for people
 in families, so its cost is mainly reading the genotypes, plus the number of
@@ -80,11 +81,7 @@ the LD scores come from the same sample (with LD scores from another sample,
 the two differ only through the difference between the samples' `V` weights).
 Only the jackknife changes, because each block's share of the total is then
 proportional to its number of SNPs (weighted by `V`). In UK Biobank simulations
-this moved standard errors by less than 0.1% ([Simulations](#simulations)). The
-genotypes are projected in the union of the phenotypes' samples. For a
-phenotype observed in only part of that union, this changed `REL_M` by 0.04% to
-0.15% in simulations with 9,600 individuals. Running `moments` for that
-phenotype alone (`--pheno-cols`) makes its value exact.
+this moved standard errors by less than 0.1% ([Simulations](#simulations)).
 
 `--per-snp` also writes the exact per-SNP values,
 `results/relmoments.tsv.gz` (`CHR SNP BP A1 A2` and one `REL_M_<phenotype>`

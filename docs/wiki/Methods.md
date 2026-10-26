@@ -192,12 +192,12 @@ totals come from one genotype pass:
 Σ_j V_j a_jk REL_M_j = (2 / N_eff) Σ_{(i,i') in P} y_i y_i' W_k,ii',     W_k,ii' = Σ_j V_j a_jk x_ij x_i'j,
 ```
 
-with the pair kernels W computed once in the union of the phenotypes'
-complete-case samples. Each phenotype keeps its own pairs, covariate
-projection of y and `N_eff`. For a phenotype observed in only part of the
-union, the genotypes' projection and scaling come from the union, a
-difference of order 1/n. In simulations with 9,600 individuals it changed
-REL_M by 0.04% to 0.15%.
+accumulated for every complete-case sample. Each sample keeps its own
+covariate basis, mean imputation, projection, `N_eff` and `V` weights, so the
+values equal those from the per-SNP column. The sample's means, sums of
+squares and covariate cross-products come from products of the genotype block
+with indicator and basis matrices, and projected genotypes are formed only for
+people in families.
 
 ## LD-score Monte Carlo variance
 

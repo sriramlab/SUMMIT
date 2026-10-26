@@ -355,23 +355,31 @@ def test_totals_are_v_weighted_means_of_per_snp_rel_m(tmp_path, ncov):
     assert int(t1.loc["y", "PAIRS"]) == int(t2.loc["y", "PAIRS"]) > 0
 
 
-def test_totals_for_a_phenotype_measured_in_a_subset(tmp_path):
-    """A phenotype missing for some people keeps its own pairs, covariate projection and N_eff; only the genotype
-    projection comes from the union sample, which leaves its value close to the exact one."""
-    prefix, G, y, covs, iid, cov_path = _simulate(tmp_path, N=600, M=300, npairs=120, ncov=2)
+@pytest.mark.parametrize("missing", [0.0, 0.01])
+def test_totals_are_exact_for_phenotypes_measured_in_subsets(tmp_path, missing):
+    """Phenotypes observed in different subsets (one where a covariate is constant, so the sample has a lower covariate
+    rank) get exactly the per-SNP values of their own samples from the single pass, overall and per class."""
+    prefix, G, y, covs, iid, cov_path = _simulate(tmp_path, N=500, M=260, npairs=100, ncov=2, missing=missing)
+    rng = np.random.default_rng(4)
+    cv = pd.read_csv(cov_path, sep=" ", dtype={"FID": str, "IID": str})
+    cv["grp"] = (rng.random(len(cv)) < 0.6).astype(float)
+    cv.to_csv(tmp_path / "covar3.txt", sep=" ", index=False)
     y2 = _two_phenotypes(tmp_path, y, iid)
-    ph = pd.read_csv(tmp_path / "pheno2.txt", sep=" ", dtype={"FID": str, "IID": str})
-    ph.loc[::9, "y"] = np.nan
-    ph.to_csv(tmp_path / "pheno2.txt", sep=" ", index=False, na_rep="NA")
-    kw = dict(pairs=str(tmp_path / "pairs.txt"), covar=cov_path)
-    compute_relative_pair_totals(prefix, str(tmp_path / "pheno2.txt"), str(tmp_path / "tot"), **kw)
-    compute_relative_pair_moments(prefix, str(tmp_path / "pheno2.txt"), str(tmp_path / "ex"), **kw)
+    ph = pd.DataFrame({"FID": iid, "IID": iid, "full": y, "ninth": y2, "grp1": y + y2})
+    ph.loc[::9, "ninth"] = np.nan
+    ph.loc[cv.grp.to_numpy() == 0, "grp1"] = np.nan
+    ph.to_csv(tmp_path / "pheno3.txt", sep=" ", index=False, na_rep="NA")
+    annot, A = _annot(tmp_path, G.shape[1])
+    kw = dict(pairs=str(tmp_path / "pairs.txt"), covar=str(tmp_path / "covar3.txt"), annot=annot)
+    s1 = compute_relative_pair_totals(prefix, str(tmp_path / "pheno3.txt"), str(tmp_path / "tot"), step_size=37, **kw)
+    compute_relative_pair_moments(prefix, str(tmp_path / "pheno3.txt"), str(tmp_path / "ex"), step_size=97, **kw)
     t1 = pd.read_csv(tmp_path / "tot.rel_m.tsv", sep="\t").set_index("PHENO")
     t2 = pd.read_csv(tmp_path / "ex.rel_m.tsv", sep="\t").set_index("PHENO")
-    assert t1.loc["y", "N"] == t2.loc["y", "N"] == int(ph["y"].notna().sum())
-    assert t1.loc["y", "PAIRS"] == t2.loc["y", "PAIRS"]
-    assert t1.loc["y2", "REL_M"] == pytest.approx(t2.loc["y2", "REL_M"], rel=1e-9)   # observed in the whole union
-    assert t1.loc["y", "REL_M"] == pytest.approx(t2.loc["y", "REL_M"], rel=0.02)
+    assert s1["phenotypes"]["grp1"]["n_covariates"] == 2 and s1["phenotypes"]["full"]["n_covariates"] == 3
+    for name in ("full", "ninth", "grp1"):
+        assert t1.loc[name, ["N", "N_COVARIATES", "PAIRS"]].tolist() == t2.loc[name, ["N", "N_COVARIATES", "PAIRS"]].tolist()
+        np.testing.assert_allclose(t1.loc[name, ["REL_M", "REL_M_lowmaf", "REL_M_highmaf"]].to_numpy(dtype=float),
+                                   t2.loc[name, ["REL_M", "REL_M_lowmaf", "REL_M_highmaf"]].to_numpy(dtype=float), rtol=1e-9)
 
 
 def test_append_writes_constant_or_per_class_rel_m(tmp_path):
