@@ -171,6 +171,33 @@ is subtracted from the bivariate response. The
 overlap covariance concerns each person's own pair of phenotypes and keeps
 its usual meaning.
 
+By default SUMMIT uses one value per phenotype instead of the per-SNP column:
+
+```text
+REL_M = Σ_j V_j REL_M_j / Σ_j V_j,
+```
+
+over all SNPs, or over the SNPs of each class of a partitioning annotation,
+and it sets `REL_M_j` to that value for every SNP (the class's value with an
+annotation; `REL_M12` likewise). The single-component estimate, and each
+class of the annotation used, depend on REL_M only through
+`Σ_j V_j a_jk REL_M_j`, so they are unchanged. Only the jackknife changes:
+each deleted block removes its share of the total in proportion to its SNPs'
+`V_j`, not its own related-pair part. In the UK Biobank simulations this moved
+h² and genetic-covariance standard errors by less than 0.1%. All phenotypes'
+totals come from one genotype pass:
+
+```text
+Σ_j V_j a_jk REL_M_j = (2 / N_eff) Σ_{(i,i') in P} y_i y_i' W_k,ii',     W_k,ii' = Σ_j V_j a_jk x_ij x_i'j,
+```
+
+with the pair kernels W computed once in the union of the phenotypes'
+complete-case samples. Each phenotype keeps its own pairs, covariate
+projection of y and `N_eff`. For a phenotype observed in only part of the
+union, the genotypes' projection and scaling come from the union, a
+difference of order 1/n. In simulations with 9,600 individuals it changed
+REL_M by 0.04% to 0.15%.
+
 ## LD-score Monte Carlo variance
 
 For target SNP i, annotation k, and random vector v, write its contribution as

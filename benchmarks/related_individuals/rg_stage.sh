@@ -21,7 +21,7 @@ for ((b=0; b<npairs; b+=5)); do
   cols=$(seq $b $((b + 4 < npairs - 1 ? b + 4 : npairs - 1)) | awk '{printf "%sa%d,b%d", (NR>1?",":""), $1, $1}')
   env PYTHONPATH=summit_dev_install_v2 OMP_NUM_THREADS=$th OPENBLAS_NUM_THREADS=$th $PY -m summit relatives moments \
       --geno panels/$pop/${pop}_full --pheno $O/pheno.txt --pheno-cols $cols --covar $F/covar_all.txt \
-      --pairs $F/pairs.txt --kinship-col K_grm --kinship-min 0.0442 --cross --out $O/rel/b$b > $O/rel/b$b.stdout 2>&1
+      --pairs $F/pairs.txt --kinship-col K_grm --kinship-min 0.0442 --per-snp --cross --out $O/rel/b$b > $O/rel/b$b.stdout 2>&1
   touch $O/rel/b$b.done
 done
 for ((r=0; r<npairs; r++)); do

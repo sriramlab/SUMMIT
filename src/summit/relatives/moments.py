@@ -39,6 +39,25 @@ subtracts them when the sumstats carry REL_M.
 Pairs: a file with IID1/IID2 (optionally FID1/FID2 and a kinship column with a
 threshold). By default pairs are closed into families (connected components) and
 every within-family pair is excluded.
+
+One number per phenotype (the default). The point estimate needs REL_M only through
+sum_j V_j a_jk REL_M_j for each annotation column k; the jackknife needs it block by
+block. By default `summit relatives moments` returns, per phenotype, the V-weighted mean
+of REL_M over all SNPs (and over each class of a partitioning annotation), and
+`summit relatives append` writes that value as a constant REL_M column (class by class
+with --annot). The point estimate is unchanged for the single-component model (and for
+each class of the annotation used); only the jackknife replicates are approximated, by
+spreading each total evenly over its SNPs. In the UK Biobank simulations this changed
+jackknife standard errors by less than 0.1%. The totals come from one genotype pass for
+every phenotype:
+
+    sum_j V_j a_jk REL_M_j = (2 / N_eff) sum_{(i,i') in P} y_i y_i' W_{k,ii'},   W_{k,ii'} = sum_j V_j a_jk x_ij x_i'j,
+
+with the pair kernels W computed once, in the union of the phenotypes' complete-case
+samples (each phenotype keeps its own pairs, covariate projection and N_eff; for a
+phenotype measured in a subset this is exact up to the subset's own projection of the
+genotypes). `--per-snp` writes the exact per-SNP REL_M instead (one genotype pass per
+complete-case sample).
 """
 from __future__ import annotations
 
@@ -174,6 +193,230 @@ def relative_pair_ld_rel(read_block, nsnps: int, a: np.ndarray, b: np.ndarray, A
     return out
 
 
+
+
+def _center_impute(X: np.ndarray) -> np.ndarray:
+    """Mean-impute missing calls (NaN) and center every column, in place (all-missing columns become 0)."""
+    nan = np.isnan(X)
+    if nan.any():
+        X[nan] = 0.0
+        cnt = X.shape[0] - nan.sum(axis=0)
+        X -= X.sum(axis=0) / np.maximum(cnt, 1)
+        X[nan] = 0.0
+    else:
+        X -= X.mean(axis=0)
+    return X
+
+
+def _pair_rows_block(X: np.ndarray, C, n_eff: float, rows: np.ndarray):
+    """Projected, normalized genotypes of the sample rows `rows`, from centered genotypes X (samples x SNPs).
+
+    Columns are projected on the orthonormal covariate basis C and scaled so that the projected column has sum of
+    squares n_eff over the whole sample, as `_project_normalize` does, but only the requested rows are formed:
+    ||P x||^2 = ||x||^2 - ||C'x||^2. Returns (rows x SNPs, 1 - R^2 of each SNP on the covariates)."""
+    raw = np.einsum("ij,ij->j", X, X)
+    Xr = X[rows]
+    if C is not None and C.shape[1]:
+        B = C.T @ X
+        ss = raw - np.einsum("ij,ij->j", B, B)
+        Xr -= C[rows] @ B
+    else:
+        ss = raw.copy()
+    ok = np.isfinite(ss) & (ss > 1e-10)
+    scale = np.zeros(ss.shape)
+    scale[ok] = np.sqrt(n_eff / ss[ok])
+    Xr *= scale[None, :]
+    with np.errstate(divide="ignore", invalid="ignore"):
+        r1 = np.where(ok & (raw > 0.0), np.minimum(1.0, ss / raw), 0.0)
+    return Xr, r1
+
+
+def _auto_step(step_size, n: int) -> int:
+    """SNPs per genotype block: `step_size`, or about 512 MiB of float64 genotypes (64 to 5000 SNPs)."""
+    if step_size is not None:
+        return max(1, int(step_size))
+    return int(np.clip((1 << 29) // (8 * max(int(n), 1)), 64, 5000))
+
+
+def read_annotation_classes(annot: str, snps) -> tuple[np.ndarray, list[str]]:
+    """0/1 class indicators (SNPs x classes) of a partitioning annotation, aligned to `snps` (absent SNPs: all 0).
+
+    The file has a SNP column (CHR, BP and CM are ignored) and one column per class; every listed SNP must belong to
+    exactly one class, as in SUMMIT's MAF/LD bins."""
+    df = pd.read_csv(annot, sep=r"\s+", dtype={"SNP": str})
+    if "SNP" not in df.columns:
+        raise ValueError(f"{annot} has no SNP column.")
+    cls = [c for c in df.columns if c not in ("CHR", "BP", "SNP", "CM")]
+    if not cls:
+        raise ValueError(f"{annot} has no annotation columns.")
+    vals = df[cls].apply(pd.to_numeric, errors="coerce").to_numpy(np.float64)
+    if not (np.isin(vals, (0.0, 1.0)).all() and (vals.sum(axis=1) == 1.0).all()):
+        raise ValueError(f"{annot} is not a partition (each SNP in exactly one class, 0/1 values); per-class REL_M values "
+                         "need one. Leave out --annot to get one REL_M value per phenotype.")
+    if df["SNP"].duplicated().any():
+        raise ValueError(f"{annot} has duplicate SNP IDs.")
+    pos = pd.Index(df["SNP"]).get_indexer(np.asarray(snps).astype(str))
+    out = np.zeros((pos.size, len(cls)))
+    out[pos >= 0] = vals[pos[pos >= 0]]
+    return out, cls
+
+
+def _read_inputs(geno, pheno, covar, pheno_cols):
+    gi = resolve_genotype_input(geno)
+    if gi.format != "bed":
+        raise ValueError("Relative-pair moments currently read PLINK 1 BED input.")
+    sample_ids = read_fam_sample_ids(gi.sample_path)
+    bim = pd.read_csv(gi.variant_path, sep=r"\s+", header=None,
+                      names=["CHR", "SNP", "CM", "BP", "A1", "A2"], dtype={"SNP": str, "A1": str, "A2": str})
+    bed = open_bed(gi.genotype_path)
+    n_all, M = bed.shape
+    if len(bim) != M:
+        raise ValueError("BIM/BED variant count mismatch.")
+    ph = pd.read_csv(pheno, sep=r"\s+", dtype={"FID": str, "IID": str})
+    if pheno_cols is None:
+        pheno_cols = [c for c in ph.columns if c not in ("FID", "IID")]
+    merged = sample_ids.merge(ph[["FID", "IID"] + list(pheno_cols)], on=["FID", "IID"], how="left")
+    Yall = merged[pheno_cols].apply(pd.to_numeric, errors="coerce").to_numpy(np.float64)
+    cov_ok = np.ones(n_all, dtype=bool)
+    if covar is not None:
+        cv = pd.read_csv(covar, sep=r"\s+", dtype={"FID": str, "IID": str}, keep_default_na=False)
+        cm = sample_ids.merge(cv, on=["FID", "IID"], how="left")
+        vals = cm.drop(columns=["FID", "IID"]).apply(pd.to_numeric, errors="coerce")
+        cov_ok = ~vals.isna().any(axis=1).to_numpy()
+    return sample_ids, bim, bed, n_all, M, list(pheno_cols), Yall, cov_ok
+
+
+def _covariate_basis(covar, sample_ids, idx):
+    if covar is None:
+        return np.zeros((idx.size, 0))
+    C, _, keep_global = read_cov(cov_filename=covar, fam_filename=None, std=True, cov_impute_method="ignore",
+                                 logger=None, sample_idx=idx, ddof=1, sample_ids=sample_ids)
+    if not np.array_equal(np.asarray(keep_global), idx):
+        raise RuntimeError("Covariate sample selection disagrees with the complete-case set.")
+    return np.asarray(C, dtype=np.float64)
+
+
+def _complete_case_groups(Yall, cov_ok):
+    groups: dict[bytes, list[int]] = {}
+    for k in range(Yall.shape[1]):
+        mask = np.isfinite(Yall[:, k]) & cov_ok
+        groups.setdefault(mask.tobytes(), []).append(k)
+    return groups
+
+
+def _write_totals(out, rows, cross_rows, classes, summary):
+    os.makedirs(os.path.dirname(os.path.abspath(out)) or ".", exist_ok=True)
+    cols = ["PHENO", "N", "N_COVARIATES", "PAIRS", "REL_M"] + [f"REL_M_{c}" for c in classes]
+    pd.DataFrame(rows, columns=cols).to_csv(out + ".rel_m.tsv", sep="\t", index=False, float_format="%.10g")
+    if cross_rows is not None:
+        pd.DataFrame(cross_rows, columns=["PHENO1", "PHENO2", "N", "PAIRS", "REL_M12"]).to_csv(
+            out + ".rel_m12.tsv", sep="\t", index=False, float_format="%.10g")
+    with open(out + ".json", "w") as fh:
+        json.dump(summary, fh, indent=1)
+
+
+def compute_relative_pair_totals(
+    geno: str,
+    pheno: str,
+    out: str,
+    *,
+    pairs: str,
+    covar: str | None = None,
+    pheno_cols: list[str] | None = None,
+    kinship_col: str | None = None,
+    kinship_min: float | None = None,
+    closure: bool = True,
+    step_size: int | None = None,
+    cross: bool = False,
+    annot: str | None = None,
+    log=None,
+) -> dict:
+    """One REL_M value per phenotype (and per class of `annot`): the V-weighted mean sum_j V_j REL_M_j / sum_j V_j.
+
+    Writes `out`.rel_m.tsv (PHENO N N_COVARIATES PAIRS REL_M [REL_M_<class> ...]), with `cross` also `out`.rel_m12.tsv
+    (PHENO1 PHENO2 N PAIRS REL_M12, phenotype pairs with identical complete-case samples), and `out`.json. One genotype
+    pass serves every phenotype (see the module docstring)."""
+    def _log(msg):
+        if log is not None:
+            log._log(msg)
+
+    sample_ids, bim, bed, n_all, M, pheno_cols, Yall, cov_ok = _read_inputs(geno, pheno, covar, pheno_cols)
+    groups = _complete_case_groups(Yall, cov_ok)
+    union = np.zeros(n_all, dtype=bool)
+    for gkey in groups:
+        union |= np.frombuffer(gkey, dtype=bool)
+    idx0 = np.flatnonzero(union)
+    if idx0.size == 0:
+        raise ValueError("No sample has a phenotype and complete covariates.")
+    C0 = _covariate_basis(covar, sample_ids, idx0)
+    n0, p0 = int(idx0.size), int(C0.shape[1])
+    n_eff0 = float(n0 - p0 - 1)
+    adj0 = float(n0 - 1) / float(n0 - p0 - 1)                      # 1 - R2 -> 1 - adjusted R2, as the LD-score step
+    rp = read_relative_pairs(pairs, sample_ids, kinship_col=kinship_col, kinship_min=kinship_min, closure=closure)
+    _log(f"[relatives] {rp.npairs} unordered related pairs ({'family closure' if closure else 'as listed'}).")
+    a0, b0 = pairs_within_sample(rp, idx0, n_all)
+    rows, inv = np.unique(np.concatenate([a0, b0]), return_inverse=True)
+    ar, br = inv[:a0.size], inv[a0.size:]
+    if annot is not None:
+        A, classes = read_annotation_classes(annot, bim["SNP"].to_numpy())
+    else:
+        A, classes = np.zeros((M, 0)), []
+    K = 1 + len(classes)
+    W = np.zeros((a0.size, K))                                     # pair kernels: all SNPs, then each class
+    vsum = np.zeros(K)
+    step = _auto_step(step_size, n0)
+    _log(f"[relatives] one genotype pass over {M} SNPs in blocks of {step} for {len(pheno_cols)} phenotype(s): "
+         f"union sample n={n0}, {p0} covariates, {a0.size} pairs, {rows.size} individuals in families.")
+    nblk = -(-M // step)
+    for b, s in enumerate(range(0, M, step)):
+        e = min(M, s + step)
+        X = _center_impute(np.asarray(bed.read(index=np.s_[idx0, s:e], dtype="float64")))
+        Xr, r1 = _pair_rows_block(X, C0, n_eff0, rows)
+        wcols = (r1 * adj0)[:, None] * np.column_stack([np.ones(e - s), A[s:e]])
+        W += (Xr[ar] * Xr[br]) @ wcols
+        vsum += wcols.sum(axis=0)
+        if (b + 1) % max(1, nblk // 10) == 0:
+            _log(f"[relatives] {e} of {M} SNPs")
+    pos0 = -np.ones(n_all, dtype=np.int64)
+    pos0[idx0] = np.arange(n0)
+    rows_out, cross_rows = [], ([] if cross else None)
+    summary = {"nsnps": int(M), "approximation": "one REL_M value per phenotype (and class): V-weighted mean",
+               "union_n": n0, "classes": classes, "npairs_listed": int(rp.npairs), "phenotypes": {}}
+    for gkey, ks in groups.items():
+        mask = np.frombuffer(gkey, dtype=bool)
+        idx = np.flatnonzero(mask)
+        n = int(idx.size)
+        C = _covariate_basis(covar, sample_ids, idx)
+        p = int(C.shape[1])
+        n_eff = float(n - p - 1)
+        Y, _ = _project_normalize(Yall[idx][:, ks].copy(), C, n_eff)
+        yfull = np.zeros((n0, len(ks)))
+        yfull[pos0[idx]] = Y
+        inside = mask[idx0[a0]] & mask[idx0[b0]]                   # pairs with both members in this sample
+        wp = (yfull[a0] * yfull[b0]) * inside[:, None]
+        tot = (2.0 / n_eff) * (wp.T @ W)                           # phenotypes x (all, classes): sum_j V_j a_jk REL_M_j
+        vals = tot / np.where(vsum > 0, vsum, np.nan)
+        for t, k in enumerate(ks):
+            name = pheno_cols[k]
+            rows_out.append([name, n, p, int(inside.sum()), *vals[t].tolist()])
+            summary["phenotypes"][name] = {"n": n, "n_covariates": p, "pairs_used": int(inside.sum()),
+                                           "rel_m": float(vals[t, 0]),
+                                           "rel_m_class": dict(zip(classes, map(float, vals[t, 1:])))}
+        if cross:
+            for t1 in range(len(ks)):
+                for t2 in range(t1 + 1, len(ks)):
+                    w12 = (yfull[a0, t1] * yfull[b0, t2] + yfull[b0, t1] * yfull[a0, t2]) * inside
+                    v12 = float((w12 @ W[:, 0]) / n_eff / vsum[0])
+                    cross_rows.append([pheno_cols[ks[t1]], pheno_cols[ks[t2]], n, int(inside.sum()), v12])
+        _log(f"[relatives] phenotypes {[pheno_cols[k] for k in ks]}: n={n}, p={p}, pairs used={int(inside.sum())}.")
+    if cross:
+        skipped = sum(len(ks1) * len(ks2) for g1, ks1 in groups.items() for g2, ks2 in groups.items() if g1 < g2)
+        if skipped:
+            _log(f"[relatives] REL_M12 not computed for {skipped} phenotype pair(s) with different complete-case samples.")
+    _write_totals(out, rows_out, cross_rows, classes, summary)
+    return summary
+
+
 def compute_relative_pair_moments(
     geno: str,
     pheno: str,
@@ -185,74 +428,38 @@ def compute_relative_pair_moments(
     kinship_col: str | None = None,
     kinship_min: float | None = None,
     closure: bool = True,
-    step_size: int = 5000,
+    step_size: int | None = None,
     cross: bool = False,
+    annot: str | None = None,
     log=None,
 ) -> dict:
-    """Write per-SNP REL_M (one column per phenotype) to `out`.tsv.gz.
+    """Exact per-SNP REL_M (one column per phenotype) in `out`.tsv.gz (`summit relatives moments --per-snp`).
 
     Phenotypes sharing the same complete-case sample set (phenotype and covariates
-    non-missing) are processed together; each set gets its own covariate basis.
+    non-missing) are processed together; each set gets its own covariate basis and genotype pass.
     With `cross`, REL_M12_<a>__<b> is also written for every pair of phenotypes with the
     same complete-case sample (the cross-trait moment z*_a z*_b = (x_j'y_a)(x_j'y_b) / N_eff,
     so REL_M12_j = (1 / N_eff) * sum over ordered pairs of x_ij x_i'j y_a,i y_b,i').
+    The per-phenotype values of `compute_relative_pair_totals` are also written (`out`.rel_m.tsv), computed exactly
+    from the per-SNP values with each sample's own V weights.
     """
     def _log(msg):
         if log is not None:
             log._log(msg)
 
-    gi = resolve_genotype_input(geno)
-    if gi.format != "bed":
-        raise ValueError("Relative-pair moments currently read PLINK 1 BED input.")
-    sample_ids = read_fam_sample_ids(gi.sample_path)
-    bim = pd.read_csv(gi.variant_path, sep=r"\s+", header=None,
-                      names=["CHR", "SNP", "CM", "BP", "A1", "A2"], dtype={"SNP": str, "A1": str, "A2": str})
-    bed = open_bed(gi.genotype_path)
-    n_all, M = bed.shape
-    if len(bim) != M:
-        raise ValueError("BIM/BED variant count mismatch.")
-
-    ph = pd.read_csv(pheno, sep=r"\s+", dtype={"FID": str, "IID": str})
-    if pheno_cols is None:
-        pheno_cols = [c for c in ph.columns if c not in ("FID", "IID")]
-    merged = sample_ids.merge(ph[["FID", "IID"] + list(pheno_cols)], on=["FID", "IID"], how="left")
-    Yall = merged[pheno_cols].apply(pd.to_numeric, errors="coerce").to_numpy(np.float64)
-
-    cov_ok = np.ones(n_all, dtype=bool)
-    if covar is not None:
-        cv = pd.read_csv(covar, sep=r"\s+", dtype={"FID": str, "IID": str}, keep_default_na=False)
-        cm = sample_ids.merge(cv, on=["FID", "IID"], how="left")
-        vals = cm.drop(columns=["FID", "IID"]).apply(pd.to_numeric, errors="coerce")
-        cov_ok = ~vals.isna().any(axis=1).to_numpy()
-
+    sample_ids, bim, bed, n_all, M, pheno_cols, Yall, cov_ok = _read_inputs(geno, pheno, covar, pheno_cols)
     rp = read_relative_pairs(pairs, sample_ids, kinship_col=kinship_col, kinship_min=kinship_min, closure=closure)
     _log(f"[relatives] {rp.npairs} unordered related pairs ({'family closure' if closure else 'as listed'}).")
-
-    def _basis(idx):
-        if covar is None:
-            return np.zeros((idx.size, 0))
-        C, _, keep_global = read_cov(cov_filename=covar, fam_filename=None, std=True, cov_impute_method="ignore",
-                                     logger=None, sample_idx=idx, ddof=1, sample_ids=sample_ids)
-        if not np.array_equal(np.asarray(keep_global), idx):
-            raise RuntimeError("Covariate sample selection disagrees with the complete-case set.")
-        return np.asarray(C, dtype=np.float64)
-
-    def _pairs_in(idx):
-        return pairs_within_sample(rp, idx, n_all)
-
-    def _blocks():
-        for s in range(0, M, step_size):
-            yield s, min(M, s + step_size)
-
-    # group phenotypes by complete-case sample set
-    groups: dict[bytes, list[int]] = {}
-    for k in range(len(pheno_cols)):
-        mask = np.isfinite(Yall[:, k]) & cov_ok
-        groups.setdefault(mask.tobytes(), []).append(k)
+    groups = _complete_case_groups(Yall, cov_ok)
+    if annot is not None:
+        A, classes = read_annotation_classes(annot, bim["SNP"].to_numpy())
+    else:
+        A, classes = np.zeros((M, 0)), []
 
     rel_m = np.zeros((M, len(pheno_cols)), dtype=np.float64)
     rel_m12: dict[tuple[int, int], np.ndarray] = {}
-    summary = {"nsnps": int(M), "phenotypes": {}, "npairs_listed": int(rp.npairs)}
+    summary = {"nsnps": int(M), "phenotypes": {}, "npairs_listed": int(rp.npairs), "classes": classes}
+    rows_out, cross_rows = [], ([] if cross else None)
     if cross:
         skipped = [(pheno_cols[k1], pheno_cols[k2]) for g1, ks1 in groups.items() for g2, ks2 in groups.items()
                    if g1 < g2 for k1 in ks1 for k2 in ks2]
@@ -263,11 +470,14 @@ def compute_relative_pair_moments(
         mask = np.frombuffer(gkey, dtype=bool)
         idx = np.flatnonzero(mask)
         n = int(idx.size)
-        C = _basis(idx)
+        C = _covariate_basis(covar, sample_ids, idx)
         p = int(C.shape[1])
         n_eff = float(n - p - 1)
+        adj = float(n - 1) / float(n - p - 1)
         kappa = 1.0 / n_eff
-        a, b = _pairs_in(idx)
+        a, b = pairs_within_sample(rp, idx, n_all)
+        rows, inv = np.unique(np.concatenate([a, b]), return_inverse=True)
+        ar, br = inv[:a.size], inv[a.size:]
         Y, _ = _project_normalize(Yall[idx][:, ks].copy(), C, n_eff)
         wp = Y[a] * Y[b]                                          # pairs x phenotypes
         xpairs = [(t1, t2) for t1 in range(len(ks)) for t2 in range(t1 + 1, len(ks))] if cross else []
@@ -275,20 +485,36 @@ def compute_relative_pair_moments(
             wx = np.stack([Y[a, t1] * Y[b, t2] + Y[b, t1] * Y[a, t2] for t1, t2 in xpairs], axis=1)
             for t1, t2 in xpairs:
                 rel_m12[(ks[t1], ks[t2])] = np.zeros(M, dtype=np.float64)
-        for s, e in _blocks():
-            X, ok = _project_normalize(bed.read(index=np.s_[idx, s:e], dtype="float64"), C, n_eff)
-            G = X[a] * X[b]                                       # pairs x SNPs
+        v = np.zeros(M)
+        step = _auto_step(step_size, n)
+        nblk = -(-M // step)
+        for b, s in enumerate(range(0, M, step)):
+            e = min(M, s + step)
+            if (b + 1) % max(1, nblk // 10) == 0:
+                _log(f"[relatives] phenotypes {[pheno_cols[k] for k in ks][:3]}: {e} of {M} SNPs")
+            X = _center_impute(np.asarray(bed.read(index=np.s_[idx, s:e], dtype="float64")))
+            Xr, r1 = _pair_rows_block(X, C, n_eff, rows)
+            v[s:e] = r1 * adj
+            G = Xr[ar] * Xr[br]                                   # pairs x SNPs
             rel_m[s:e, ks] = kappa * 2.0 * (G.T @ wp)
             if xpairs:
                 blk = kappa * (G.T @ wx)
                 for c_, (t1, t2) in enumerate(xpairs):
                     rel_m12[(ks[t1], ks[t2])][s:e] = blk[:, c_]
+        wcols = v[:, None] * np.column_stack([np.ones(M), A])
+        vsum = wcols.sum(axis=0)
         for t, k in enumerate(ks):
+            vals = (wcols.T @ rel_m[:, k]) / np.where(vsum > 0, vsum, np.nan)
+            rows_out.append([pheno_cols[k], n, p, int(a.size), *vals.tolist()])
             summary["phenotypes"][pheno_cols[k]] = {
                 "n": n, "n_covariates": p, "pairs_used": int(a.size),
                 "c_rel": float(rel_m[:, k].mean()),
                 "sum_rel_m": float(rel_m[:, k].sum()),
+                "rel_m": float(vals[0]), "rel_m_class": dict(zip(classes, map(float, vals[1:]))),
             }
+        for t1, t2 in xpairs:
+            cross_rows.append([pheno_cols[ks[t1]], pheno_cols[ks[t2]], n, int(a.size),
+                               float(v @ rel_m12[(ks[t1], ks[t2])] / vsum[0])])
         _log(f"[relatives] phenotypes {[pheno_cols[k] for k in ks]}: n={n}, p={p}, pairs used={a.size}.")
 
     table = bim[["CHR", "SNP", "BP", "A1", "A2"]].copy()
@@ -296,23 +522,49 @@ def compute_relative_pair_moments(
         table[f"REL_M_{name}"] = rel_m[:, k]
     if rel_m12:
         summary["cross"] = {}
-        for (k1, k2), v in rel_m12.items():
+        for (k1, k2), v12 in rel_m12.items():
             name = f"{pheno_cols[k1]}__{pheno_cols[k2]}"
-            table[f"REL_M12_{name}"] = v
-            summary["cross"][name] = {"c_rel12": float(v.mean()), "sum_rel_m12": float(v.sum())}
+            table[f"REL_M12_{name}"] = v12
+            summary["cross"][name] = {"c_rel12": float(v12.mean()), "sum_rel_m12": float(v12.sum())}
     os.makedirs(os.path.dirname(os.path.abspath(out)) or ".", exist_ok=True)
     table.to_csv(out + ".tsv.gz", sep="\t", index=False, float_format="%.10g")
-    with open(out + ".json", "w") as fh:
-        json.dump(summary, fh, indent=1)
+    _write_totals(out, rows_out, cross_rows, classes, summary)
     return summary
 
 
-def append_rel_m_to_sumstats(sumstats: str, rel_table: str, pheno: str, out: str) -> int:
-    """Copy a sumstats file adding REL_M (matched by SNP ID; REL_M is invariant to allele orientation)."""
+def _is_totals_table(path: str, key: str) -> bool:
+    return key in pd.read_csv(path, sep="\t", nrows=0).columns
+
+
+def append_rel_m_to_sumstats(sumstats: str, rel_table: str, pheno: str, out: str, annot: str | None = None) -> int:
+    """Copy a sumstats file adding REL_M; returns the number of SNPs without a value.
+
+    `rel_table` is either the per-phenotype table of `summit relatives moments` (`.rel_m.tsv`): REL_M is then the
+    phenotype's value for every SNP or, with `annot` (the annotation used in `moments`), its class's value (SNPs outside
+    the annotation get the all-SNP value); or the per-SNP table of `--per-snp` (`.tsv.gz`), matched by SNP ID (REL_M is
+    invariant to allele orientation)."""
     ss = pd.read_csv(sumstats, sep=r"\s+")
     snp_col = next((c for c in ("SNP", "ID", "snp", "rsid") if c in ss.columns), None)
     if snp_col is None:
         raise ValueError("Sumstats need a SNP/ID column.")
+    if _is_totals_table(rel_table, "PHENO"):
+        tab = pd.read_csv(rel_table, sep="\t", dtype={"PHENO": str})
+        row = tab[tab["PHENO"] == str(pheno)]
+        if len(row) != 1:
+            raise ValueError(f"{rel_table} has no single row for phenotype {pheno!r}.")
+        row = row.iloc[0]
+        out_df = ss.copy()
+        out_df["REL_M"] = float(row["REL_M"])
+        if annot is not None:
+            A, classes = read_annotation_classes(annot, ss[snp_col].astype(str).to_numpy())
+            missing = [c for c in classes if f"REL_M_{c}" not in tab.columns]
+            if missing:
+                raise ValueError(f"{rel_table} has no per-class values for {missing[:3]}: run `moments` with this --annot.")
+            inside = A.sum(axis=1) > 0
+            cls_vals = np.array([float(row[f"REL_M_{c}"]) for c in classes])
+            out_df.loc[inside, "REL_M"] = A[inside] @ cls_vals
+        out_df.to_csv(out, sep="\t", index=False, float_format="%.10g")
+        return 0
     rel = pd.read_csv(rel_table, sep="\t", usecols=["SNP", f"REL_M_{pheno}"]).rename(columns={f"REL_M_{pheno}": "REL_M"})
     if rel["SNP"].duplicated().any():
         raise ValueError(f"{rel_table} has duplicate SNP IDs; REL_M cannot be matched unambiguously.")
@@ -327,7 +579,19 @@ def append_rel_m_to_sumstats(sumstats: str, rel_table: str, pheno: str, out: str
 
 
 def extract_rel_m12(rel_table: str, pheno1: str, pheno2: str, out: str) -> float:
-    """Write SNP and REL_M12 for one phenotype pair (either order) for `summit --rg ... --rel-m12`."""
+    """Write REL_M12 for one phenotype pair (either order) for `summit --rg ... --rel-m12`.
+
+    From the per-pair table of `moments --cross` (`.rel_m12.tsv`) the file holds one value (column REL_M12); from the
+    per-SNP table of `--per-snp --cross` it holds SNP and REL_M12. Returns the value (or the per-SNP mean)."""
+    if _is_totals_table(rel_table, "PHENO1"):
+        tab = pd.read_csv(rel_table, sep="\t", dtype={"PHENO1": str, "PHENO2": str})
+        hit = tab[((tab.PHENO1 == pheno1) & (tab.PHENO2 == pheno2)) | ((tab.PHENO1 == pheno2) & (tab.PHENO2 == pheno1))]
+        if len(hit) != 1:
+            raise ValueError(f"{rel_table} has no REL_M12 for {pheno1} and {pheno2}; run moments with --cross "
+                             "(both phenotypes need the same complete-case sample).")
+        val = float(hit["REL_M12"].iloc[0])
+        pd.DataFrame({"REL_M12": [val]}).to_csv(out, sep="\t", index=False, float_format="%.10g")
+        return val
     cols = pd.read_csv(rel_table, sep="\t", nrows=0).columns
     name = next((f"REL_M12_{a}__{b}" for a, b in ((pheno1, pheno2), (pheno2, pheno1))
                  if f"REL_M12_{a}__{b}" in cols), None)

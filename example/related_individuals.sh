@@ -12,15 +12,15 @@ else
   SUMMIT=(env PYTHONPATH=../src python -m summit)
 fi
 
-# 1. Related-pair moments for both traits (REL_M) and for the pair (REL_M12)
+# 1. Related-pair moments: one REL_M value per trait and one REL_M12 value for the pair (one genotype pass)
 "${SUMMIT[@]}" relatives moments --geno "$D/cohort.bed" --pheno "$D/traits.tsv" \
   --covar "$D/cohort.cov" --pairs "$D/pairs.tsv" --kinship-col RELATEDNESS --kinship-min 0.0442 \
   --cross --out "$D/relmoments"
 for t in trait_a trait_b; do
-  "${SUMMIT[@]}" relatives append --sumstats "$D/$t.sumstats" --rel "$D/relmoments.tsv.gz" \
+  "${SUMMIT[@]}" relatives append --sumstats "$D/$t.sumstats" --rel "$D/relmoments.rel_m.tsv" \
     --pheno "$t" --out "$D/$t.rel.sumstats"
 done
-"${SUMMIT[@]}" relatives cross-m12 --rel "$D/relmoments.tsv.gz" --pheno1 trait_a --pheno2 trait_b \
+"${SUMMIT[@]}" relatives cross-m12 --rel "$D/relmoments.rel_m12.tsv" --pheno1 trait_a --pheno2 trait_b \
   --out "$D/trait_a_b.relm12.tsv"
 
 # 2. In-sample LD scores with the related pairs' share (LD_REL) and SNP-variance weights (V)

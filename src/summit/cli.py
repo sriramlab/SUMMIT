@@ -554,9 +554,10 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         type=str,
         help=(
-            "Cross-trait related-pair HE moments (SNP, REL_M12) for the --rg pair, from "
-            "`summit relatives moments --cross` and `cross-m12`. Required, together with "
-            "REL_M columns in both sumstats files, to exclude related pairs from genetic covariance."
+            "Cross-trait related-pair HE moment for the --rg pair: the file written by "
+            "`summit relatives cross-m12` (one REL_M12 value, or SNP and REL_M12 with --per-snp), or the value "
+            "itself. Required, together with REL_M columns in both sumstats files, to exclude related pairs "
+            "from genetic covariance."
         ),
     )
     cross.add_argument(

@@ -947,7 +947,19 @@ class Sumcore:
                 f"(REL_M: trait 1 {'yes' if has1 else 'no'}, trait 2 {'yes' if has2 else 'no'}; "
                 f"--rel-m12: {'yes' if self.rel_m12_path is not None else 'no'})."
             )
-        tab = pd.read_csv(self.rel_m12_path, sep=r"\s+", usecols=["SNP", "REL_M12"], dtype={"SNP": str})
+        src = str(self.rel_m12_path)
+        if not os.path.exists(src):
+            try:
+                value = float(src)
+            except ValueError:
+                raise FileNotFoundError(f"--rel-m12: {src} is neither a file nor a number.") from None
+            return np.full(np.asarray(matched1.snps).size, value)
+        tab = pd.read_csv(src, sep=r"\s+", dtype={"SNP": str})
+        if "SNP" not in tab.columns:                             # one value for the pair (`summit relatives cross-m12`)
+            if "REL_M12" not in tab.columns or len(tab) != 1:
+                raise ValueError(f"{src} must hold SNP and REL_M12 columns, or one REL_M12 value.")
+            return np.full(np.asarray(matched1.snps).size, float(tab["REL_M12"].iloc[0]))
+        tab = tab[["SNP", "REL_M12"]]
         if tab["SNP"].duplicated().any():
             raise ValueError(f"{self.rel_m12_path} has duplicate SNP IDs.")
         pos = pd.Index(tab["SNP"]).get_indexer(np.asarray(matched1.snps).astype(str))

@@ -15,6 +15,6 @@ glm="--glm hide-covar cols=chrom,pos,ref,alt,omitted,nobs,beta,se --covar-varian
     --pheno $O/pheno.txt --covar $O/covar_unrel.txt $glm --out $O/gwas_unrel/g > $O/gwas_unrel.stdout 2>&1 && touch $O/gwas_unrel.done; }
 [ -e $O/rel.done ] || { nice -n 5 env PYTHONPATH=summit_dev_install_v2 OMP_NUM_THREADS=$th OPENBLAS_NUM_THREADS=$th \
     $PY -m summit relatives moments --geno panels/$pop/${pop}_full --pheno $O/pheno.txt --covar $O/covar_all.txt \
-    --pairs $O/pairs.txt --kinship-col K_grm --kinship-min 0.0442 --out $O/rel > $O/rel.stdout 2>&1 && touch $O/rel.done; }
+    --pairs $O/pairs.txt --kinship-col K_grm --kinship-min 0.0442 --per-snp --out $O/rel > $O/rel.stdout 2>&1 && touch $O/rel.done; }
 nice -n 5 env OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 $PY scripts/convert_sumstats.py $pop $npc $th
 echo "$pop done"

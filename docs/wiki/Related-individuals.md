@@ -7,10 +7,11 @@ people, which matters most in small or admixed cohorts.
 
 This workflow keeps every individual and removes the related pairs from the
 estimating equations instead. Run the GWAS on everyone as usual. SUMMIT then
-computes a per-SNP related-pair moment, `REL_M`, from the genotypes and
-phenotypes, which is added to the summary statistics and subtracted by
-`summit --h2`. The estimate
-stays unbiased whatever the phenotypic covariance between relatives.
+computes the related pairs' part of each trait's association statistics,
+`REL_M`, from the genotypes and phenotypes. By default this is one number per
+trait, which is added to the summary statistics as a constant column and
+subtracted by `summit --h2`. The estimate stays unbiased whatever the
+phenotypic covariance between relatives.
 [Methods](Methods.md#related-individuals) gives the estimating equations.
 
 For a runnable synthetic example of the whole workflow (sibling pairs, h² and
@@ -57,22 +58,41 @@ summit relatives moments \
 
 The command writes:
 
-- `results/relmoments.tsv.gz`: `CHR SNP BP A1 A2` and one `REL_M_<phenotype>`
-  column per phenotype.
-- `results/relmoments.json`: sample sizes, covariate counts, pairs used and
-  each phenotype's relative-pair covariance in HE scale, `c_rel` (the mean of
-  `REL_M`).
-- `results/relmoments.log`.
+- `results/relmoments.rel_m.tsv`: one row per phenotype, `PHENO N N_COVARIATES
+  PAIRS REL_M`, where `REL_M` is the related-pair moment per SNP in HE scale
+  (the `V`-weighted mean over SNPs of the per-SNP moments). With
+  `--annot annot.txt`, a partitioning annotation such as SUMMIT's MAF/LD bins,
+  the table also has one `REL_M_<class>` column per class, for partitioned fits.
+- `results/relmoments.json` and `results/relmoments.log`.
 
-Phenotypes are grouped by their complete-case samples, and each group is
-projected on its own covariate basis, as in a GWAS that drops missing values.
-`REL_M` does not depend on allele coding. Missing genotypes are mean-imputed,
+One genotype pass gives the values of every phenotype. Each phenotype keeps
+its own complete-case sample, related pairs, covariate projection and `N_eff`,
+as in a GWAS that drops missing values. Missing genotypes are mean-imputed,
 which agrees with complete-case GWAS to first order in the missing fraction.
-The cost is proportional to the number of related pairs times the number of
-SNPs; genotypes are read once.
+The pass reads all genotypes but forms the projected genotypes only for people
+in families, so its cost is mainly reading the genotypes, plus the number of
+related pairs times the number of SNPs. `REL_M` does not depend on allele
+coding.
 
-Add `--cross` to write `REL_M12_<a>__<b>` for every pair of phenotypes with the
-same complete-case samples (see [Genetic correlation](#genetic-correlation)).
+One value per trait keeps the point estimate of the single-component model,
+and of each class of the annotation used, exactly as with per-SNP values.
+Only the jackknife changes, because each block's share of the total is then
+proportional to its number of SNPs (weighted by `V`). In UK Biobank simulations
+this moved standard errors by less than 0.1% ([Simulations](#simulations)). The
+genotypes are projected in the union of the phenotypes' samples. For a
+phenotype observed in only part of that union, this changed `REL_M` by 0.04% to
+0.15% in simulations with 9,600 individuals. Running `moments` for that
+phenotype alone (`--pheno-cols`) makes its value exact.
+
+`--per-snp` also writes the exact per-SNP values,
+`results/relmoments.tsv.gz` (`CHR SNP BP A1 A2` and one `REL_M_<phenotype>`
+column per phenotype). This needs one genotype pass per distinct complete-case
+sample, and `append` and `cross-m12` accept the file in place of the
+per-phenotype tables.
+
+Add `--cross` to write `results/relmoments.rel_m12.tsv`, the cross-trait value
+`REL_M12` for every pair of phenotypes with the same complete-case samples
+(see [Genetic correlation](#genetic-correlation)).
 When the LD scores are computed in the study itself, the LD-score step adds the
 relatives' share (see [LD scores](#ld-scores)).
 
@@ -82,16 +102,24 @@ Add the column to the summary statistics and fit as usual:
 
 ```bash
 summit relatives append --sumstats trait.sumstats.gz \
-  --rel results/relmoments.tsv.gz --pheno TRAIT --out trait.rel.sumstats.gz
+  --rel results/relmoments.rel_m.tsv --pheno TRAIT --out trait.rel.sumstats.gz
 
 summit --h2 trait.rel.sumstats.gz --ldscores reference.gw.ldscore.gz \
   --out results/trait
 ```
 
-When a summary-statistics file has a `REL_M` column, SUMMIT subtracts it from
-each SNP's HE-scale moment. Annotations, partitioned models and every jackknife
-design work unchanged. The log reports `c_rel`; SNPs with a missing `REL_M` are
-dropped. `--h2-batch-fast` does not accept `REL_M`.
+`append` writes the trait's value in a `REL_M` column, the same for every SNP.
+For a partitioned fit, run `moments` and `append` with the same `--annot`, and
+each SNP gets its class's value. When a summary-statistics file has a `REL_M`
+column, SUMMIT subtracts it from each SNP's HE-scale moment. Annotations,
+partitioned models and every jackknife design work unchanged. The log reports
+`c_rel` and the number of distinct `REL_M` values; SNPs with a missing `REL_M`
+are dropped. `--h2-batch-fast` does not accept `REL_M`.
+
+A study that releases summary statistics can add the constant `REL_M` column
+itself, as it adds `COV_RANK`. Users then fit them with the related pairs
+excluded and need nothing else, unless they compute LD scores in the same
+sample.
 
 ## LD scores
 
@@ -135,11 +163,11 @@ Pair exclusion must cover both h² denominators and the cross-trait moment:
 ```bash
 summit relatives moments --geno study.bed --pheno phenotypes.tsv \
   --covar covariates.tsv --pairs pairs.tsv --cross --out results/relmoments
-summit relatives append --sumstats a.sumstats.gz --rel results/relmoments.tsv.gz \
+summit relatives append --sumstats a.sumstats.gz --rel results/relmoments.rel_m.tsv \
   --pheno A --out a.rel.sumstats.gz
-summit relatives append --sumstats b.sumstats.gz --rel results/relmoments.tsv.gz \
+summit relatives append --sumstats b.sumstats.gz --rel results/relmoments.rel_m.tsv \
   --pheno B --out b.rel.sumstats.gz
-summit relatives cross-m12 --rel results/relmoments.tsv.gz \
+summit relatives cross-m12 --rel results/relmoments.rel_m12.tsv \
   --pheno1 A --pheno2 B --out a_b.relm12.tsv
 
 summit --rg a.rel.sumstats.gz,b.rel.sumstats.gz --rel-m12 a_b.relm12.tsv \
@@ -148,7 +176,9 @@ summit --rg a.rel.sumstats.gz,b.rel.sumstats.gz --rel-m12 a_b.relm12.tsv \
   --out results/a.b
 ```
 
-SUMMIT requires `REL_M` in both files and `--rel-m12`. With only some of them,
+`a_b.relm12.tsv` holds the pair's single `REL_M12` value; `--rel-m12` also
+accepts the value itself, or a per-SNP file from `--per-snp --cross`. SUMMIT
+requires `REL_M` in both files and `--rel-m12`. With only some of them,
 the pairs would be removed from some estimating equations and kept in others. With
 in-sample LD scores that carry LD_REL, the same file serves h² and rg.
 `REL_M12` exists only for phenotypes with identical complete-case samples.
@@ -204,6 +234,14 @@ in AFR, where 17%, 13% and 10% of individuals were outside the unrelated
 subset. Panel B shows the power to detect heritability at the 5% level
 implied by each analysis's sampling variance.
 
+The simulations used per-SNP `REL_M`. Refitting every pair-excluded analysis
+with one value per trait (the default) left the h² and rg estimates unchanged.
+It moved the jackknife standard errors by +0.01% to +0.09% on average (0.993 to
+1.009 times the per-SNP standard error in individual fits) and left coverage
+unchanged in every cohort and scenario. The genetic-covariance standard errors
+moved by +0.08% to +0.10%. A second approximation, which spread each total in
+proportion to a genotype-only per-SNP sum over the related pairs, did no better.
+
 In AFR, the same pair-excluded analysis with ordinary LD scores
 (`--snp-var-weights-off`) underestimated h² by 0.010 to 0.023 because the PCs
 explain part of the genotype variance
@@ -220,8 +258,13 @@ shared environment or untagged variants is removed with their pairs, whatever
 its form. Pairs below the threshold remain; their contribution scales with their
 squared relatedness and is small for distant relatives.
 
-Jackknife standard errors are computed as for unrelated samples.
+Jackknife standard errors are computed as for unrelated samples. With one
+`REL_M` value per trait, a deleted block removes the related pairs' part in
+proportion to its SNPs rather than its own part; the simulations below compare
+both.
 
-`REL_M` and `REL_M12` computed from few pairs carry information about those
-individuals' genotypes and phenotypes. Keep per-SNP values in the secure
-environment where they were computed. Binary traits (PCGC) are not covered.
+A single `REL_M` value per trait is a weighted sum of phenotype products over
+all related pairs and reveals little about any one pair. Per-SNP values
+computed from few pairs carry information about those individuals' genotypes
+and phenotypes. Keep `--per-snp` output in the secure environment where it was
+computed. Binary traits (PCGC) are not covered.

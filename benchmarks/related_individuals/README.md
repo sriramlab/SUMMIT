@@ -14,5 +14,7 @@ directory used for the runs.
 | h² fits for each analysis and jackknife | `fit_arms.sh` |
 | Genetic correlation (bivariate phenotypes, REL_M12) | `sim_bivariate_final.py`, `rg_stage.sh`, `convert_rg.py` |
 | Summary tables and wiki figures | `summarize_final.py` |
+| One `REL_M` value per trait (A1) and a genotype-weighted spread (A2) against per-SNP values | `approx_relm.py`, `fit_approx.sh`, `summarize_approx.py` |
 
-`results/` holds the summary tables behind the figures.
+`results/` holds the summary tables behind the figures and the approximation comparison
+(`approx_h2_summary.tsv`, `approx_rg_summary.tsv`). The benchmark itself used per-SNP values (`--per-snp`).

@@ -7,6 +7,7 @@ bed_reader = pytest.importorskip("bed_reader")
 from summit.relatives.moments import (
     append_rel_m_to_sumstats,
     compute_relative_pair_moments,
+    compute_relative_pair_totals,
     extract_rel_m12,
     pairs_within_sample,
     read_relative_pairs,
@@ -303,3 +304,156 @@ def test_rg_self_pair_with_relatives_equals_h2(tmp_path):
     assert abs(float(naive["rg_fit"].gamma_total[0]) - gamma) > 1e-4
     with pytest.raises(ValueError, match="--rel-m12"):
         Sumcore(rg=f"{tmp_path / 'ssa.tsv'},{tmp_path / 'ssb.tsv'}", **common)._run()
+
+
+# ---------------------------------------------------------------------------------------------- one value per phenotype
+def _annot(tmp_path, M, seed=5):
+    b = (np.random.default_rng(seed).random(M) < 0.4).astype(int)
+    df = pd.DataFrame({**_snp_meta(M), "CM": 0, "lowmaf": b, "highmaf": 1 - b})
+    df.to_csv(tmp_path / "annot.txt", sep="\t", index=False)
+    return str(tmp_path / "annot.txt"), np.column_stack([b, 1 - b]).astype(float)
+
+
+def _v_weights(G, covs):
+    """1 - adjusted R2 of each SNP on the covariates (the LD-score step's V)."""
+    N = G.shape[0]
+    X = np.where(np.isnan(G), np.nanmean(G, 0)[None, :], np.asarray(G, dtype=np.float64))
+    X = X - X.mean(0)
+    p = 0 if covs is None else covs.shape[1]
+    Q = np.linalg.qr(np.column_stack([np.ones(N)] + ([covs] if p else [])))[0]
+    raw = (X ** 2).sum(0)
+    ss = ((X - Q @ (Q.T @ X)) ** 2).sum(0)
+    return np.minimum(1.0, ss / raw) * (N - 1) / (N - p - 1)
+
+
+@pytest.mark.parametrize("ncov", [0, 2])
+def test_totals_are_v_weighted_means_of_per_snp_rel_m(tmp_path, ncov):
+    """With every phenotype observed in the same sample, the one-pass totals equal sum_j V_j a_jk REL_M_j / sum V_j a_jk
+    of the exact per-SNP values, overall and per class, and the same for REL_M12."""
+    prefix, G, y, covs, iid, cov_path = _simulate(tmp_path, ncov=ncov)
+    _two_phenotypes(tmp_path, y, iid)
+    M = G.shape[1]
+    annot, A = _annot(tmp_path, M)
+    kw = dict(pairs=str(tmp_path / "pairs.txt"), covar=cov_path, cross=True, annot=annot)
+    compute_relative_pair_totals(prefix, str(tmp_path / "pheno2.txt"), str(tmp_path / "tot"), step_size=61, **kw)
+    compute_relative_pair_moments(prefix, str(tmp_path / "pheno2.txt"), str(tmp_path / "ex"), step_size=97, **kw)
+    t1 = pd.read_csv(tmp_path / "tot.rel_m.tsv", sep="\t").set_index("PHENO")
+    t2 = pd.read_csv(tmp_path / "ex.rel_m.tsv", sep="\t").set_index("PHENO")
+    cols = ["REL_M", "REL_M_lowmaf", "REL_M_highmaf"]
+    np.testing.assert_allclose(t1.loc[["y", "y2"], cols].to_numpy(), t2.loc[["y", "y2"], cols].to_numpy(), rtol=1e-9)
+    per_snp = pd.read_csv(tmp_path / "ex.tsv.gz", sep="\t")
+    v = _v_weights(G, covs if ncov else None)
+    for name in ("y", "y2"):
+        r = per_snp[f"REL_M_{name}"].to_numpy()
+        want = [v @ r / v.sum()] + [(v * A[:, k]) @ r / (v * A[:, k]).sum() for k in range(2)]
+        np.testing.assert_allclose(t2.loc[name, cols].to_numpy(dtype=float), want, rtol=1e-8)
+    m1 = pd.read_csv(tmp_path / "tot.rel_m12.tsv", sep="\t")
+    m2 = pd.read_csv(tmp_path / "ex.rel_m12.tsv", sep="\t")
+    r12 = per_snp["REL_M12_y__y2"].to_numpy()
+    assert float(m1.REL_M12[0]) == pytest.approx(float(m2.REL_M12[0]), rel=1e-9)
+    assert float(m2.REL_M12[0]) == pytest.approx(v @ r12 / v.sum(), rel=1e-8)
+    assert int(t1.loc["y", "PAIRS"]) == int(t2.loc["y", "PAIRS"]) > 0
+
+
+def test_totals_for_a_phenotype_measured_in_a_subset(tmp_path):
+    """A phenotype missing for some people keeps its own pairs, covariate projection and N_eff; only the genotype
+    projection comes from the union sample, which leaves its value close to the exact one."""
+    prefix, G, y, covs, iid, cov_path = _simulate(tmp_path, N=600, M=300, npairs=120, ncov=2)
+    y2 = _two_phenotypes(tmp_path, y, iid)
+    ph = pd.read_csv(tmp_path / "pheno2.txt", sep=" ", dtype={"FID": str, "IID": str})
+    ph.loc[::9, "y"] = np.nan
+    ph.to_csv(tmp_path / "pheno2.txt", sep=" ", index=False, na_rep="NA")
+    kw = dict(pairs=str(tmp_path / "pairs.txt"), covar=cov_path)
+    compute_relative_pair_totals(prefix, str(tmp_path / "pheno2.txt"), str(tmp_path / "tot"), **kw)
+    compute_relative_pair_moments(prefix, str(tmp_path / "pheno2.txt"), str(tmp_path / "ex"), **kw)
+    t1 = pd.read_csv(tmp_path / "tot.rel_m.tsv", sep="\t").set_index("PHENO")
+    t2 = pd.read_csv(tmp_path / "ex.rel_m.tsv", sep="\t").set_index("PHENO")
+    assert t1.loc["y", "N"] == t2.loc["y", "N"] == int(ph["y"].notna().sum())
+    assert t1.loc["y", "PAIRS"] == t2.loc["y", "PAIRS"]
+    assert t1.loc["y2", "REL_M"] == pytest.approx(t2.loc["y2", "REL_M"], rel=1e-9)   # observed in the whole union
+    assert t1.loc["y", "REL_M"] == pytest.approx(t2.loc["y", "REL_M"], rel=0.02)
+
+
+def test_append_writes_constant_or_per_class_rel_m(tmp_path):
+    prefix, G, y, covs, iid, cov_path = _simulate(tmp_path, ncov=2)
+    M = G.shape[1]
+    annot, A = _annot(tmp_path, M)
+    compute_relative_pair_totals(prefix, str(tmp_path / "pheno.txt"), str(tmp_path / "tot"),
+                                 pairs=str(tmp_path / "pairs.txt"), covar=cov_path, annot=annot)
+    X, yy, p, n_eff = _projected(G, y, covs)
+    _ols_sumstats(tmp_path / "ss.tsv", X, yy, p)
+    tab = pd.read_csv(tmp_path / "tot.rel_m.tsv", sep="\t").iloc[0]
+    assert append_rel_m_to_sumstats(str(tmp_path / "ss.tsv"), str(tmp_path / "tot.rel_m.tsv"), "y",
+                                    str(tmp_path / "a.tsv")) == 0
+    a = pd.read_csv(tmp_path / "a.tsv", sep="\t")
+    np.testing.assert_allclose(a.REL_M.to_numpy(), tab.REL_M)
+    append_rel_m_to_sumstats(str(tmp_path / "ss.tsv"), str(tmp_path / "tot.rel_m.tsv"), "y", str(tmp_path / "b.tsv"),
+                             annot=annot)
+    b = pd.read_csv(tmp_path / "b.tsv", sep="\t")
+    np.testing.assert_allclose(b.REL_M.to_numpy(), A @ np.array([tab.REL_M_lowmaf, tab.REL_M_highmaf]))
+    with pytest.raises(ValueError, match="no single row"):
+        append_rel_m_to_sumstats(str(tmp_path / "ss.tsv"), str(tmp_path / "tot.rel_m.tsv"), "zz", str(tmp_path / "c.tsv"))
+
+
+def test_constant_rel_m_keeps_the_h2_point_estimate(tmp_path):
+    """The single-component estimate depends on REL_M only through sum_j V_j REL_M_j, so the per-phenotype value gives
+    the exact per-SNP estimate when the LD scores' V weights are those of the GWAS sample; only the SE changes."""
+    from summit.inference.sumrhe import Sumrhe
+    prefix, G, y, covs, iid, cov_path = _simulate(tmp_path, N=400, M=400, npairs=80, ncov=2, missing=0.0)
+    kw = dict(pairs=str(tmp_path / "pairs.txt"), covar=cov_path)
+    compute_relative_pair_moments(prefix, str(tmp_path / "pheno.txt"), str(tmp_path / "ex"), **kw)
+    compute_relative_pair_totals(prefix, str(tmp_path / "pheno.txt"), str(tmp_path / "tot"), **kw)
+    X, yy, p, n_eff = _projected(G, y, covs)
+    N, M = X.shape
+    _ols_sumstats(tmp_path / "ss.tsv", X, yy, p)
+    for f, rel in (("sx.tsv", "ex.tsv.gz"), ("st.tsv", "tot.rel_m.tsv")):
+        append_rel_m_to_sumstats(str(tmp_path / "ss.tsv"), str(tmp_path / rel), "y", str(tmp_path / f))
+    v = _v_weights(G, covs)
+    ld = ((X.T @ X / n_eff) ** 2).sum(1) - M / n_eff
+    rel_ld, _ = _ld_rel(G, covs, str(tmp_path / "pairs.txt"), iid, v[:, None])
+    pd.DataFrame({**_snp_meta(M), "V": v, "L2_0": ld, "LD_REL_L2_0": rel_ld[:, 0]})[
+        ["CHR", "SNP", "BP", "V", "L2_0", "LD_REL_L2_0"]].to_csv(
+        tmp_path / "in.gw.ldscore.gz", sep="\t", index=False, float_format="%.10g")
+    fits = {}
+    for f in ("sx.tsv", "st.tsv"):
+        s = Sumrhe(h2_path=str(tmp_path / f), ldscores=str(tmp_path / "in.gw.ldscore.gz"), njack="20", chisq_threshold=None)
+        s._run()
+        fits[f] = s.results[0].h2[-1]
+    assert fits["st.tsv"][0] == pytest.approx(fits["sx.tsv"][0], rel=1e-6)
+    assert fits["st.tsv"][1] == pytest.approx(fits["sx.tsv"][1], rel=0.1)
+
+
+def test_rg_with_one_rel_m12_value_matches_per_snp(tmp_path):
+    """rg with the pair's single REL_M12 value (file or number) gives the per-SNP point estimate."""
+    from summit.inference.sumcore import Sumcore
+    prefix, G, y, covs, iid, cov_path = _simulate(tmp_path, ncov=2, missing=0.0)
+    y2 = _two_phenotypes(tmp_path, y, iid)
+    kw = dict(pairs=str(tmp_path / "pairs.txt"), covar=cov_path, cross=True)
+    compute_relative_pair_moments(prefix, str(tmp_path / "pheno2.txt"), str(tmp_path / "ex"), **kw)
+    compute_relative_pair_totals(prefix, str(tmp_path / "pheno2.txt"), str(tmp_path / "tot"), **kw)
+    X, y1t, p, n_eff = _projected(G, y, covs)
+    _, y2t, _, _ = _projected(G, y2, covs)
+    N, M = X.shape
+    _ols_sumstats(tmp_path / "s1.tsv", X, y1t, p)
+    _ols_sumstats(tmp_path / "s2.tsv", X, y2t, p)
+    for tag, rel in (("x", "ex.tsv.gz"), ("t", "tot.rel_m.tsv")):
+        append_rel_m_to_sumstats(str(tmp_path / "s1.tsv"), str(tmp_path / rel), "y", str(tmp_path / f"a{tag}.tsv"))
+        append_rel_m_to_sumstats(str(tmp_path / "s2.tsv"), str(tmp_path / rel), "y2", str(tmp_path / f"b{tag}.tsv"))
+    vx = extract_rel_m12(str(tmp_path / "ex.tsv.gz"), "y", "y2", str(tmp_path / "m12x.tsv"))
+    vt = extract_rel_m12(str(tmp_path / "tot.rel_m12.tsv"), "y2", "y", str(tmp_path / "m12t.tsv"))
+    assert list(pd.read_csv(tmp_path / "m12t.tsv", sep="\t").columns) == ["REL_M12"]
+    v = _v_weights(G, covs)
+    ld = ((X.T @ X / n_eff) ** 2).sum(1) - M / n_eff
+    rel_ld, _ = _ld_rel(G, covs, str(tmp_path / "pairs.txt"), iid, v[:, None])
+    pd.DataFrame({**_snp_meta(M), "V": v, "L2_0": ld, "LD_REL_L2_0": rel_ld[:, 0]})[
+        ["CHR", "SNP", "BP", "V", "L2_0", "LD_REL_L2_0"]].to_csv(
+        tmp_path / "in.gw.ldscore.gz", sep="\t", index=False, float_format="%.10g")
+    common = dict(ldscores=str(tmp_path / "in.gw.ldscore.gz"), njack="chr", chisq_threshold=None,
+                  intercept_chisq_thr=None, intercept_rg=1.0, align_alleles=False)
+    gx = Sumcore(rg=f"{tmp_path / 'ax.tsv'},{tmp_path / 'bx.tsv'}", rel_m12=str(tmp_path / "m12x.tsv"), **common)._run()
+    gt = Sumcore(rg=f"{tmp_path / 'at.tsv'},{tmp_path / 'bt.tsv'}", rel_m12=str(tmp_path / "m12t.tsv"), **common)._run()
+    gn = Sumcore(rg=f"{tmp_path / 'at.tsv'},{tmp_path / 'bt.tsv'}", rel_m12=repr(vt), **common)._run()
+    gam = lambda r: float(r["rg_fit"].gamma_total[0])
+    assert gam(gt) == pytest.approx(gam(gx), rel=1e-6)
+    assert gam(gn) == pytest.approx(gam(gt), rel=1e-9)
+    assert vt == pytest.approx(v @ pd.read_csv(tmp_path / "m12x.tsv", sep="\t").REL_M12.to_numpy() / v.sum(), rel=1e-8)

@@ -564,8 +564,10 @@ class Sumstats:
         if relcol is not None:
             bad_rel = ~np.isfinite(df["REL_M"].to_numpy(dtype=np.float64, copy=False))
             if log is not None:
+                nval = int(np.unique(df["REL_M"].to_numpy(dtype=np.float64, copy=False)[~bad_rel]).size)
                 log._log(
-                    f"[relatives] [{name or path}] REL_M present; dropping "
+                    f"[relatives] [{name or path}] REL_M present ({nval} distinct value(s)"
+                    f"{': one per trait or annotation class' if nval <= 64 else ''}); dropping "
                     f"{int(np.sum(bad_rel & ~bad))} SNPs with missing REL_M."
                 )
             bad = bad | bad_rel
