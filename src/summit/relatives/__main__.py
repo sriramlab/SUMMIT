@@ -2,7 +2,7 @@
 
   summit relatives moments --geno PREFIX --pheno FILE --pairs FILE [--covar FILE] [--annot FILE] [--inbreeding] --out PREFIX
   summit relatives append  --sumstats FILE --rel PREFIX.rel_m.tsv --pheno NAME [--annot FILE] --out FILE
-  summit relatives cross-m12 --rel PREFIX.rel_m12.tsv --pheno1 A --pheno2 B --out FILE   (for summit --rg --rel-m12)
+  summit relatives cross-m12 --rel PREFIX.rel_m12.tsv --pheno1 A --pheno2 B [--annot FILE] --out FILE   (summit --rg --rel-m12)
 
 By default `moments` writes one REL_M value per phenotype (and per class of --annot), the V-weighted mean of the
 per-SNP related-pair moments, and `append` writes it as a constant REL_M column. `--per-snp` writes the exact per-SNP
@@ -44,8 +44,9 @@ def main(argv=None):
                    help="also leave each individual paired with themselves (the diagonal of the GRM) out of the h2 "
                         "estimating equation, which removes bias from inbreeding (residual variance that grows with "
                         "inbreeding) and the covariate leverage of the related pairs. Writes REL_S, REL_LAMBDA and "
-                        "REL_DIAG; `append` copies them and `summit --h2` uses them. Costs one extra projection of the "
-                        "genotypes per complete-case sample, and a few percent of precision in samples of a few thousand.")
+                        "REL_DIAG (and REL_S12 with --cross); `append` and `cross-m12` copy them, and `summit --h2` and `--rg` use "
+                        "them. Costs one extra projection of the genotypes per complete-case sample, and a few percent "
+                        "of precision in samples of a few thousand.")
     m.add_argument("--out", required=True)
     a_ = sub.add_parser("append", help="copy a sumstats file adding a REL_M column")
     a_.add_argument("--sumstats", required=True)
@@ -58,6 +59,8 @@ def main(argv=None):
     x.add_argument("--rel", required=True, help="PREFIX.rel_m12.tsv (moments --cross) or PREFIX.tsv.gz (--per-snp --cross)")
     x.add_argument("--pheno1", required=True)
     x.add_argument("--pheno2", required=True)
+    x.add_argument("--annot", default=None,
+                   help="with PREFIX.rel_m12.tsv: the annotation given to `moments`, for per-class values (partitioned rg)")
     x.add_argument("--out", required=True)
     args = ap.parse_args(argv)
 
@@ -65,8 +68,6 @@ def main(argv=None):
         log = Logger()
         log.attach_file(args.out + ".log", mode="w")
         cols = None if args.pheno_cols is None else [c.strip() for c in args.pheno_cols.split(",") if c.strip()]
-        if args.inbreeding and args.per_snp:
-            ap.error("--inbreeding works with the per-phenotype values (leave out --per-snp).")
         run = compute_relative_pair_moments if args.per_snp else compute_relative_pair_totals
         extra = {"inbreeding": True} if args.inbreeding else {}
         summary = run(
@@ -82,7 +83,7 @@ def main(argv=None):
         missing = append_rel_m_to_sumstats(args.sumstats, args.rel, args.pheno, args.out, annot=args.annot)
         print(f"wrote {args.out}; SNPs without REL_M: {missing}")
     else:
-        c12 = extract_rel_m12(args.rel, args.pheno1, args.pheno2, args.out)
+        c12 = extract_rel_m12(args.rel, args.pheno1, args.pheno2, args.out, annot=args.annot)
         print(f"wrote {args.out}; REL_M12={c12:.6g}")
     return 0
 

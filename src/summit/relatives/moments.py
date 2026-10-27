@@ -335,8 +335,10 @@ def _write_totals(out, rows, cross_rows, classes, summary, inbreeding=False):
         cols += _inbreeding_columns(classes)
     pd.DataFrame(rows, columns=cols).to_csv(out + ".rel_m.tsv", sep="\t", index=False, float_format="%.12g")
     if cross_rows is not None:
-        pd.DataFrame(cross_rows, columns=["PHENO1", "PHENO2", "N", "PAIRS", "REL_M12"]).to_csv(
-            out + ".rel_m12.tsv", sep="\t", index=False, float_format="%.10g")
+        ccols = ["PHENO1", "PHENO2", "N", "PAIRS", "REL_M12"] + [f"REL_M12_{c}" for c in classes]
+        if inbreeding:
+            ccols += ["REL_S12"] + [f"REL_S12_{c}" for c in classes]
+        pd.DataFrame(cross_rows, columns=ccols).to_csv(out + ".rel_m12.tsv", sep="\t", index=False, float_format="%.12g")
     with open(out + ".json", "w") as fh:
         json.dump(summary, fh, indent=1)
 
@@ -486,7 +488,10 @@ def compute_relative_pair_totals(
         tot = (2.0 / n_eff) * (wp.T @ g["W"])                     # phenotypes x (all, classes): sum_j V_j a_jk REL_M_j
         vals = tot / np.where(g["vsum"] > 0, g["vsum"], np.nan)
         npair = int(g["inside"].sum())
-        inb = _diagonal_terms(g, Y, ga, gb, len(classes)) if inbreeding else None
+        inb = None
+        if inbreeding:
+            gpos = np.cumsum(g["m0"]) - 1                         # union position -> position in the sample
+            inb = _diagonal_terms(g["D"], g["W"], g["vsum"], g["C"], n, n_eff, gpos[ga], gpos[gb], Y, len(classes))
         for t, k in enumerate(ks):
             name = pheno_cols[k]
             extra = [] if inb is None else inb["row"](t)
@@ -497,15 +502,14 @@ def compute_relative_pair_totals(
                 summary["phenotypes"][name].update({"rel_s": float(inb["c_s"][0, t]), "rel_lambda": float(inb["lam"][0]),
                                                     "rel_diag": float(inb["s"][0, 0])})
         if inb is not None:
-            _log(f"[relatives] diagonal terms (--inbreeding), n={n}: lambda={inb['lam'][0]:.6g} "
-                 f"(sum_i K_ii H_ii={inb['eta_s'][0]:.6g}, related pairs {inb['eta_r'][0]:.6g}), "
-                 f"REL_DIAG={inb['s'][0, 0]:.6g}, REL_S of the first phenotype={inb['c_s'][0, 0]:.6g}.")
+            _log_diagonal_terms(_log, n, inb)
         if cross:
             for t1 in range(len(ks)):
                 for t2 in range(t1 + 1, len(ks)):
                     w12 = yfull[ga, t1] * yfull[gb, t2] + yfull[gb, t1] * yfull[ga, t2]
-                    v12 = float((w12 @ g["W"][:, 0]) / n_eff / g["vsum"][0])
-                    cross_rows.append([pheno_cols[ks[t1]], pheno_cols[ks[t2]], n, npair, v12])
+                    v12 = (w12 @ g["W"]) / n_eff / np.where(g["vsum"] > 0, g["vsum"], np.nan)
+                    cross_rows.append([pheno_cols[ks[t1]], pheno_cols[ks[t2]], n, npair, *v12.tolist(),
+                                       *(inb["cross"](t1, t2) if inb is not None else [])])
         _log(f"[relatives] phenotypes {[pheno_cols[k] for k in ks][:5]}: n={n}, p={p}, pairs used={npair}.")
     if cross:
         skipped = sum(len(g1["ks"]) * len(g2["ks"]) for i1, g1 in enumerate(G) for g2 in G[i1 + 1:])
@@ -515,26 +519,28 @@ def compute_relative_pair_totals(
     return summary
 
 
-def _diagonal_terms(g, Y, ga, gb, nclass):
+def _diagonal_terms(D, W, vsum, C, n, n_eff, pa, pb, Y, nclass):
     """Values that leave the diagonal terms out of the first estimating equation, for one complete-case sample.
 
-    In the units of SUMMIT's kernels K~_k = sum_j a_jk V_j x_j x_j' / sum_j a_jk V_j (column 0: all SNPs):
-    REL_S_k = sum_i (K~_k,ii - 1) y_i^2 / N_eff per phenotype, REL_LAMBDA_k = sum_i K~_k,ii H_ii + sum_{ordered pairs}
-    K~_k,ii' H_ii' and REL_DIAG_kl = sum_i K~_k,ii K~_l,ii - N_eff, with H = 11'/n + CC' the projection on the
-    covariates. Y holds the sample's projected phenotypes normalized to sum of squares N_eff."""
-    n, n_eff, C = g["n"], g["n_eff"], g["C"]
-    vs = np.where(g["vsum"] > 0, g["vsum"], np.nan)
-    Kd = g["D"] / vs[None, :]                                     # n x (all, classes): K~_k,ii
-    Hii = np.full(n, 1.0 / n) + ((C * C).sum(axis=1) if g["p"] else 0.0)
-    gpos = np.cumsum(g["m0"]) - 1                                 # union position -> position in the sample
-    pa, pb = gpos[ga], gpos[gb]
-    Hab = np.full(pa.size, 1.0 / n) + ((C[pa] * C[pb]).sum(axis=1) if g["p"] else 0.0)
+    D (n x (1 + C)) holds sum_j a_jk V_j x_ij^2 and W (pairs x (1 + C)) sum_j a_jk V_j x_ij x_i'j for the unordered
+    related pairs (pa, pb) (positions in the sample); vsum = sum_j a_jk V_j (column 0: all SNPs). In the units of
+    SUMMIT's kernels K~_k = sum_j a_jk V_j x_j x_j' / vsum_k: REL_S_k = sum_i (K~_k,ii - 1) y_i^2 / N_eff per phenotype,
+    REL_LAMBDA_k = sum_i K~_k,ii H_ii + sum_{ordered pairs} K~_k,ii' H_ii' and REL_DIAG_kl = sum_i K~_k,ii K~_l,ii - N_eff,
+    with H = 11'/n + CC' the projection on the covariates (C orthonormal and centered). Y holds the sample's projected
+    phenotypes normalized to sum of squares N_eff. The cross-trait value of two phenotypes is
+    REL_S12_k = sum_i (K~_k,ii - 1) y_1i y_2i / N_eff."""
+    vs = np.where(vsum > 0, vsum, np.nan)
+    Kd = D / vs[None, :]                                          # n x (all, classes): K~_k,ii
+    p = C.shape[1]
+    Hii = np.full(n, 1.0 / n) + ((C * C).sum(axis=1) if p else 0.0)
+    Hab = np.full(pa.size, 1.0 / n) + ((C[pa] * C[pb]).sum(axis=1) if p else 0.0)
     eta_s = Kd.T @ Hii
-    eta_r = 2.0 * ((g["W"] / vs[None, :]).T @ Hab)                # ordered pairs: twice the unordered sum
+    eta_r = 2.0 * ((W / vs[None, :]).T @ Hab)                     # ordered pairs: twice the unordered sum
     lam = eta_s + eta_r
     s = Kd.T @ Kd - n_eff                                         # (1 + C) x (1 + C)
-    c_s = ((Kd - 1.0).T @ (Y * Y)) / n_eff                        # (1 + C) x phenotypes
-    w = g["vsum"][1:] / g["vsum"][1:].sum() if nclass else np.zeros(0)
+    Kc = Kd - 1.0
+    c_s = (Kc.T @ (Y * Y)) / n_eff                                # (1 + C) x phenotypes
+    w = vsum[1:] / vsum[1:].sum() if nclass else np.zeros(0)
     rowsum = s[1:, 1:] @ w if nclass else np.zeros(0)            # class-mass-weighted row sums (single-component fits)
 
     def row(t):
@@ -544,7 +550,16 @@ def _diagonal_terms(g, Y, ga, gb, nclass):
         out += [float(s[1 + c, 1 + d]) for c in range(nclass) for d in range(nclass)]
         return out
 
-    return {"c_s": c_s, "lam": lam, "s": s, "eta_s": eta_s, "eta_r": eta_r, "row": row}
+    def cross(t1, t2):
+        return ((Kc.T @ (Y[:, t1] * Y[:, t2])) / n_eff).tolist()
+
+    return {"c_s": c_s, "lam": lam, "s": s, "eta_s": eta_s, "eta_r": eta_r, "row": row, "cross": cross}
+
+
+def _log_diagonal_terms(_log, n, inb):
+    _log(f"[relatives] diagonal terms (--inbreeding), n={n}: lambda={inb['lam'][0]:.6g} "
+         f"(sum_i K_ii H_ii={inb['eta_s'][0]:.6g}, related pairs {inb['eta_r'][0]:.6g}), "
+         f"REL_DIAG={inb['s'][0, 0]:.6g}, REL_S of the first phenotype={inb['c_s'][0, 0]:.6g}.")
 
 
 def compute_relative_pair_moments(
@@ -561,6 +576,7 @@ def compute_relative_pair_moments(
     step_size: int | None = None,
     cross: bool = False,
     annot: str | None = None,
+    inbreeding: bool = False,
     log=None,
 ) -> dict:
     """Exact per-SNP REL_M (one column per phenotype) in `out`.tsv.gz (`summit relatives moments --per-snp`).
@@ -571,7 +587,8 @@ def compute_relative_pair_moments(
     same complete-case sample (the cross-trait moment z*_a z*_b = (x_j'y_a)(x_j'y_b) / N_eff,
     so REL_M12_j = (1 / N_eff) * sum over ordered pairs of x_ij x_i'j y_a,i y_b,i').
     The per-phenotype values of `compute_relative_pair_totals` are also written (`out`.rel_m.tsv), computed exactly
-    from the per-SNP values with each sample's own V weights.
+    from the per-SNP values with each sample's own V weights, and with `inbreeding` the same diagonal-term values,
+    from the projected genotypes of every individual in the same pass.
     """
     def _log(msg):
         if log is not None:
@@ -588,7 +605,9 @@ def compute_relative_pair_moments(
 
     rel_m = np.zeros((M, len(pheno_cols)), dtype=np.float64)
     rel_m12: dict[tuple[int, int], np.ndarray] = {}
-    summary = {"nsnps": int(M), "phenotypes": {}, "npairs_listed": int(rp.npairs), "classes": classes}
+    summary = {"nsnps": int(M), "phenotypes": {}, "npairs_listed": int(rp.npairs), "classes": classes,
+               "inbreeding": bool(inbreeding)}
+    Aw = np.column_stack([np.ones(M), A])
     rows_out, cross_rows = [], ([] if cross else None)
     if cross:
         skipped = [(pheno_cols[k1], pheno_cols[k2]) for g1, ks1 in groups.items() for g2, ks2 in groups.items()
@@ -616,26 +635,41 @@ def compute_relative_pair_moments(
             for t1, t2 in xpairs:
                 rel_m12[(ks[t1], ks[t2])] = np.zeros(M, dtype=np.float64)
         v = np.zeros(M)
+        if inbreeding:
+            D = np.zeros((n, Aw.shape[1]))
+            W = np.zeros((a.size, Aw.shape[1]))
         step = _auto_step(step_size, n)
         nblk = -(-M // step)
-        for b, s in enumerate(range(0, M, step)):
+        for ib, s in enumerate(range(0, M, step)):
             e = min(M, s + step)
-            if (b + 1) % max(1, nblk // 10) == 0:
+            if (ib + 1) % max(1, nblk // 10) == 0:
                 _log(f"[relatives] phenotypes {[pheno_cols[k] for k in ks][:3]}: {e} of {M} SNPs")
             X = _center_impute(np.asarray(bed.read(index=np.s_[idx, s:e], dtype="float64")))
             Xr, r1 = _pair_rows_block(X, C, n_eff, rows)
             v[s:e] = r1 * adj
             G = Xr[ar] * Xr[br]                                   # pairs x SNPs
             rel_m[s:e, ks] = kappa * 2.0 * (G.T @ wp)
+            if inbreeding:                                        # projected genotypes of everyone in the sample
+                wblk = (r1 * adj)[:, None] * Aw[s:e]
+                W += G @ wblk
+                Xp = X - C @ (C.T @ X) if p else X.copy()
+                ssq = np.einsum("ij,ij->j", Xp, Xp)
+                ok = ssq > 1e-10
+                Xp[:, ok] *= np.sqrt(n_eff / ssq[ok])[None, :]
+                Xp[:, ~ok] = 0.0
+                D += (Xp * Xp) @ wblk
             if xpairs:
                 blk = kappa * (G.T @ wx)
                 for c_, (t1, t2) in enumerate(xpairs):
                     rel_m12[(ks[t1], ks[t2])][s:e] = blk[:, c_]
-        wcols = v[:, None] * np.column_stack([np.ones(M), A])
+        wcols = v[:, None] * Aw
         vsum = wcols.sum(axis=0)
+        inb = _diagonal_terms(D, W, vsum, C, n, n_eff, a, b, Y, len(classes)) if inbreeding else None
+        if inb is not None:
+            _log_diagonal_terms(_log, n, inb)
         for t, k in enumerate(ks):
             vals = (wcols.T @ rel_m[:, k]) / np.where(vsum > 0, vsum, np.nan)
-            rows_out.append([pheno_cols[k], n, p, int(a.size), *vals.tolist()])
+            rows_out.append([pheno_cols[k], n, p, int(a.size), *vals.tolist(), *(inb["row"](t) if inb is not None else [])])
             summary["phenotypes"][pheno_cols[k]] = {
                 "n": n, "n_covariates": p, "pairs_used": int(a.size),
                 "c_rel": float(rel_m[:, k].mean()),
@@ -643,8 +677,9 @@ def compute_relative_pair_moments(
                 "rel_m": float(vals[0]), "rel_m_class": dict(zip(classes, map(float, vals[1:]))),
             }
         for t1, t2 in xpairs:
-            cross_rows.append([pheno_cols[ks[t1]], pheno_cols[ks[t2]], n, int(a.size),
-                               float(v @ rel_m12[(ks[t1], ks[t2])] / vsum[0])])
+            v12 = (wcols.T @ rel_m12[(ks[t1], ks[t2])]) / np.where(vsum > 0, vsum, np.nan)
+            cross_rows.append([pheno_cols[ks[t1]], pheno_cols[ks[t2]], n, int(a.size), *v12.tolist(),
+                               *(inb["cross"](t1, t2) if inb is not None else [])])
         _log(f"[relatives] phenotypes {[pheno_cols[k] for k in ks]}: n={n}, p={p}, pairs used={a.size}.")
 
     table = bim[["CHR", "SNP", "BP", "A1", "A2"]].copy()
@@ -658,12 +693,53 @@ def compute_relative_pair_moments(
             summary["cross"][name] = {"c_rel12": float(v12.mean()), "sum_rel_m12": float(v12.sum())}
     os.makedirs(os.path.dirname(os.path.abspath(out)) or ".", exist_ok=True)
     table.to_csv(out + ".tsv.gz", sep="\t", index=False, float_format="%.10g")
-    _write_totals(out, rows_out, cross_rows, classes, summary)
+    _write_totals(out, rows_out, cross_rows, classes, summary, inbreeding=inbreeding)
     return summary
 
 
 def _is_totals_table(path: str, key: str) -> bool:
     return key in pd.read_csv(path, sep="\t", nrows=0).columns
+
+
+def _sibling_totals(per_snp_table: str, suffix: str) -> str | None:
+    """PREFIX.<suffix> next to a per-SNP table PREFIX.tsv.gz (both written by one `moments --per-snp` run), if it exists."""
+    base = str(per_snp_table)
+    for ext in (".tsv.gz", ".tsv"):
+        if base.endswith(ext):
+            path = base[: -len(ext)] + suffix
+            return path if os.path.exists(path) else None
+    return None
+
+
+def _class_column(row, name: str, classes, A, inside) -> np.ndarray:
+    """Per-SNP values of a per-class column: the class's value inside the annotation, the all-SNP value outside."""
+    out = np.full(A.shape[0], float(row[name]))
+    if classes:
+        out[inside] = A[inside] @ np.array([float(row[f"{name}_{c}"]) for c in classes])
+    return out
+
+
+def _annot_or_none(annot, snps, cols, need):
+    """Class indicators for `snps`, checking that the per-class columns `need(c)` exist; ([], zeros, all-False) without annot."""
+    if annot is None:
+        return [], np.zeros((len(snps), 0)), np.zeros(len(snps), dtype=bool)
+    A, classes = read_annotation_classes(annot, np.asarray(snps).astype(str))
+    missing = [x for c in classes for x in need(c) if x not in cols]
+    if missing:
+        raise ValueError(f"no per-class values for {missing[:3]}: run `summit relatives moments` with this --annot.")
+    return classes, A, A.sum(axis=1) > 0
+
+
+def _add_diagonal_columns(df: pd.DataFrame, row, cols, snps, annot) -> None:
+    """Add the `moments --inbreeding` values (REL_S, REL_LAMBDA, REL_DIAG; with annot their class values and one
+    REL_DIAG_<class> column per class, row d of the class-by-class REL_DIAG matrix) to a sumstats frame."""
+    classes, A, inside = _annot_or_none(annot, snps, cols, lambda c: (f"REL_S_{c}", f"REL_DIAG_{c}__{c}"))
+    for col in ("REL_S", "REL_LAMBDA", "REL_DIAG"):
+        df[col] = _class_column(row, col, classes, A, inside)
+    for d in classes:
+        vals = np.full(len(snps), float(row["REL_DIAG"]))
+        vals[inside] = A[inside] @ np.array([float(row[f"REL_DIAG_{c}__{d}"]) for c in classes])
+        df[f"REL_DIAG_{d}"] = vals
 
 
 def append_rel_m_to_sumstats(sumstats: str, rel_table: str, pheno: str, out: str, annot: str | None = None) -> int:
@@ -672,77 +748,83 @@ def append_rel_m_to_sumstats(sumstats: str, rel_table: str, pheno: str, out: str
     `rel_table` is either the per-phenotype table of `summit relatives moments` (`.rel_m.tsv`): REL_M is then the
     phenotype's value for every SNP or, with `annot` (the annotation used in `moments`), its class's value (SNPs outside
     the annotation get the all-SNP value); or the per-SNP table of `--per-snp` (`.tsv.gz`), matched by SNP ID (REL_M is
-    invariant to allele orientation). If the table has the `--inbreeding` values, they are written too: REL_S,
-    REL_LAMBDA and REL_DIAG (the class's values with `annot`) and, with `annot`, one REL_DIAG_<class> column per class
-    (row d of the class-by-class REL_DIAG matrix), which SUMMIT's partitioned fits use."""
+    invariant to allele orientation). If `moments` ran with `--inbreeding`, the diagonal-term values are written too
+    (REL_S, REL_LAMBDA and REL_DIAG, the class's values with `annot`, and with `annot` one REL_DIAG_<class> column per
+    class); for a per-SNP table they come from PREFIX.rel_m.tsv of the same run."""
     ss = pd.read_csv(sumstats, sep=r"\s+")
     snp_col = next((c for c in ("SNP", "ID", "snp", "rsid") if c in ss.columns), None)
     if snp_col is None:
         raise ValueError("Sumstats need a SNP/ID column.")
-    if _is_totals_table(rel_table, "PHENO"):
-        tab = pd.read_csv(rel_table, sep="\t", dtype={"PHENO": str})
-        row = tab[tab["PHENO"] == str(pheno)]
-        if len(row) != 1:
-            raise ValueError(f"{rel_table} has no single row for phenotype {pheno!r}.")
-        row = row.iloc[0]
+    per_snp = not _is_totals_table(rel_table, "PHENO")
+    totals = _sibling_totals(rel_table, ".rel_m.tsv") if per_snp else rel_table
+    row = tcols = None
+    if totals is not None:
+        tab = pd.read_csv(totals, sep="\t", dtype={"PHENO": str})
+        hit = tab[tab["PHENO"] == str(pheno)]
+        if len(hit) != 1:
+            raise ValueError(f"{totals} has no single row for phenotype {pheno!r}.")
+        row, tcols = hit.iloc[0], tab.columns
+    if per_snp:
+        rel = pd.read_csv(rel_table, sep="\t", usecols=["SNP", f"REL_M_{pheno}"]).rename(columns={f"REL_M_{pheno}": "REL_M"})
+        if rel["SNP"].duplicated().any():
+            raise ValueError(f"{rel_table} has duplicate SNP IDs; REL_M cannot be matched unambiguously.")
+        out_df = ss.merge(rel, left_on=snp_col, right_on="SNP", how="left", suffixes=("", "_rel"))
+        if "SNP_rel" in out_df.columns:
+            out_df = out_df.drop(columns=["SNP_rel"])
+        if snp_col != "SNP" and "SNP" in out_df.columns and "SNP" not in ss.columns:
+            out_df = out_df.drop(columns=["SNP"])
+        missing = int(out_df["REL_M"].isna().sum())
+    else:
         out_df = ss.copy()
-        out_df["REL_M"] = float(row["REL_M"])
-        if annot is not None:
-            A, classes = read_annotation_classes(annot, ss[snp_col].astype(str).to_numpy())
-            missing = [c for c in classes if f"REL_M_{c}" not in tab.columns]
-            if missing:
-                raise ValueError(f"{rel_table} has no per-class values for {missing[:3]}: run `moments` with this --annot.")
-            inside = A.sum(axis=1) > 0
-            cls_vals = np.array([float(row[f"REL_M_{c}"]) for c in classes])
-            out_df.loc[inside, "REL_M"] = A[inside] @ cls_vals
-        if "REL_S" in tab.columns:                                # written by `moments --inbreeding`
-            for col in ("REL_S", "REL_LAMBDA", "REL_DIAG"):
-                out_df[col] = float(row[col])
-            if annot is not None:
-                need = [x for c in classes for x in (f"REL_S_{c}", f"REL_DIAG_{c}__{c}")]
-                if any(x not in tab.columns for x in need):
-                    raise ValueError(f"{rel_table} has no per-class --inbreeding values: run `moments --inbreeding` with "
-                                     "this --annot.")
-                for col in ("REL_S", "REL_LAMBDA", "REL_DIAG"):
-                    out_df.loc[inside, col] = A[inside] @ np.array([float(row[f"{col}_{c}"]) for c in classes])
-                for d in classes:
-                    out_df[f"REL_DIAG_{d}"] = float(row["REL_DIAG"])
-                    out_df.loc[inside, f"REL_DIAG_{d}"] = A[inside] @ np.array([float(row[f"REL_DIAG_{c}__{d}"])
-                                                                                for c in classes])
-        out_df.to_csv(out, sep="\t", index=False, float_format="%.12g")
-        return 0
-    rel = pd.read_csv(rel_table, sep="\t", usecols=["SNP", f"REL_M_{pheno}"]).rename(columns={f"REL_M_{pheno}": "REL_M"})
-    if rel["SNP"].duplicated().any():
-        raise ValueError(f"{rel_table} has duplicate SNP IDs; REL_M cannot be matched unambiguously.")
-    merged = ss.merge(rel, left_on=snp_col, right_on="SNP", how="left", suffixes=("", "_rel"))
-    if "SNP_rel" in merged.columns:
-        merged = merged.drop(columns=["SNP_rel"])
-    if snp_col != "SNP" and "SNP" in merged.columns and "SNP" not in ss.columns:
-        merged = merged.drop(columns=["SNP"])
-    missing = int(merged["REL_M"].isna().sum())
-    merged.to_csv(out, sep="\t", index=False, float_format="%.10g")
+        classes, A, inside = _annot_or_none(annot, ss[snp_col], tcols, lambda c: (f"REL_M_{c}",))
+        out_df["REL_M"] = _class_column(row, "REL_M", classes, A, inside)
+        missing = 0
+    if row is not None and "REL_S" in tcols:                     # written by `moments --inbreeding`
+        _add_diagonal_columns(out_df, row, tcols, out_df[snp_col], annot)
+    out_df.to_csv(out, sep="\t", index=False, float_format="%.12g")
     return missing
 
 
-def extract_rel_m12(rel_table: str, pheno1: str, pheno2: str, out: str) -> float:
+def extract_rel_m12(rel_table: str, pheno1: str, pheno2: str, out: str, annot: str | None = None) -> float:
     """Write REL_M12 for one phenotype pair (either order) for `summit --rg ... --rel-m12`.
 
-    From the per-pair table of `moments --cross` (`.rel_m12.tsv`) the file holds one value (column REL_M12); from the
-    per-SNP table of `--per-snp --cross` it holds SNP and REL_M12. Returns the value (or the per-SNP mean)."""
-    if _is_totals_table(rel_table, "PHENO1"):
-        tab = pd.read_csv(rel_table, sep="\t", dtype={"PHENO1": str, "PHENO2": str})
+    From the per-pair table of `moments --cross` (`.rel_m12.tsv`) the file holds one value (column REL_M12) or, with
+    `annot`, SNP and the class's REL_M12 for every SNP of the annotation; from the per-SNP table of `--per-snp --cross`
+    it holds SNP and REL_M12. If `moments` ran with `--inbreeding`, REL_S12 (the cross-trait diagonal-term value) is
+    written next to REL_M12, in the same layout. Returns the REL_M12 value (or its mean over SNPs)."""
+    per_snp = not _is_totals_table(rel_table, "PHENO1")
+    totals = _sibling_totals(rel_table, ".rel_m12.tsv") if per_snp else rel_table
+    row = tcols = None
+    if totals is not None:
+        tab = pd.read_csv(totals, sep="\t", dtype={"PHENO1": str, "PHENO2": str})
         hit = tab[((tab.PHENO1 == pheno1) & (tab.PHENO2 == pheno2)) | ((tab.PHENO1 == pheno2) & (tab.PHENO2 == pheno1))]
         if len(hit) != 1:
-            raise ValueError(f"{rel_table} has no REL_M12 for {pheno1} and {pheno2}; run moments with --cross "
+            raise ValueError(f"{totals} has no REL_M12 for {pheno1} and {pheno2}; run moments with --cross "
                              "(both phenotypes need the same complete-case sample).")
-        val = float(hit["REL_M12"].iloc[0])
-        pd.DataFrame({"REL_M12": [val]}).to_csv(out, sep="\t", index=False, float_format="%.10g")
-        return val
-    cols = pd.read_csv(rel_table, sep="\t", nrows=0).columns
-    name = next((f"REL_M12_{a}__{b}" for a, b in ((pheno1, pheno2), (pheno2, pheno1))
-                 if f"REL_M12_{a}__{b}" in cols), None)
-    if name is None:
-        raise ValueError(f"{rel_table} has no REL_M12 for {pheno1} and {pheno2}; run moments with --cross.")
-    t = pd.read_csv(rel_table, sep="\t", usecols=["SNP", name], dtype={"SNP": str}).rename(columns={name: "REL_M12"})
-    t.to_csv(out, sep="\t", index=False, float_format="%.10g")
-    return float(t["REL_M12"].mean())
+        row, tcols = hit.iloc[0], tab.columns
+    inb = row is not None and "REL_S12" in tcols
+    if per_snp:
+        cols = pd.read_csv(rel_table, sep="\t", nrows=0).columns
+        name = next((f"REL_M12_{a}__{b}" for a, b in ((pheno1, pheno2), (pheno2, pheno1))
+                     if f"REL_M12_{a}__{b}" in cols), None)
+        if name is None:
+            raise ValueError(f"{rel_table} has no REL_M12 for {pheno1} and {pheno2}; run moments with --cross.")
+        t = pd.read_csv(rel_table, sep="\t", usecols=["SNP", name], dtype={"SNP": str}).rename(columns={name: "REL_M12"})
+        if inb:
+            classes, A, inside = _annot_or_none(annot, t["SNP"], tcols, lambda c: (f"REL_S12_{c}",))
+            t["REL_S12"] = _class_column(row, "REL_S12", classes, A, inside)
+        t.to_csv(out, sep="\t", index=False, float_format="%.12g")
+        return float(t["REL_M12"].mean())
+    if annot is None:
+        t = pd.DataFrame({"REL_M12": [float(row["REL_M12"])]})
+        if inb:
+            t["REL_S12"] = float(row["REL_S12"])
+    else:
+        snps = pd.read_csv(annot, sep=r"\s+", usecols=["SNP"], dtype={"SNP": str})["SNP"]
+        need = lambda c: (f"REL_M12_{c}",) + ((f"REL_S12_{c}",) if inb else ())
+        classes, A, inside = _annot_or_none(annot, snps, tcols, need)
+        t = pd.DataFrame({"SNP": snps, "REL_M12": _class_column(row, "REL_M12", classes, A, inside)})
+        if inb:
+            t["REL_S12"] = _class_column(row, "REL_S12", classes, A, inside)
+    t.to_csv(out, sep="\t", index=False, float_format="%.12g")
+    return float(row["REL_M12"])

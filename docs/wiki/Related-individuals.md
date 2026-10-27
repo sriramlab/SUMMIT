@@ -155,7 +155,17 @@ than 0.1% larger. The bias it removed in these cohorts was a few percent of the
 standard error, about the same as this cost. The cost falls with sample size,
 so the option is most useful in large samples with much inbreeding. The extra genotype pass projects the genotypes of everyone in each
 complete-case sample, which adds roughly one GWAS-sized projection per sample.
-Genetic correlation (`--rg`) keeps the diagonal terms and says so in its log.
+For genetic correlation, run `moments` with `--cross --inbreeding`; `cross-m12`
+then also writes `REL_S12`, the cross-trait value, and `summit --rg` leaves the
+diagonal terms out of both h² fits and the cross-trait equations. This needs
+the values in both summary-statistics files and in the `--rel-m12` file, and
+the overlapping covariance in HE scale (`--pheno-rg`/`--pheno-rg-cov` or
+`--overlap-covariance-rg`) rather than an estimated intercept, with the jackknife
+or delta standard errors; SUMMIT stops with a message if any of these is missing. `--per-snp` works with `--inbreeding`
+too: the run's `PREFIX.rel_m.tsv` and `PREFIX.rel_m12.tsv` hold the values,
+and `append` and `cross-m12` read them next to the per-SNP table. LDSC
+weighting (`--weight-mode ldsc`) runs on LD scores without the `V` column,
+whereas these values are defined with it, so it refuses them.
 A mean shift with inbreeding (inbreeding depression) is handled by adding an
 inbreeding coefficient to the covariates of the GWAS, `moments` and the LD
 scores.
@@ -215,8 +225,10 @@ summit --rg a.rel.sumstats.gz,b.rel.sumstats.gz --rel-m12 a_b.relm12.tsv \
   --out results/a.b
 ```
 
-`a_b.relm12.tsv` holds the pair's single `REL_M12` value; `--rel-m12` also
-accepts the value itself, or a per-SNP file from `--per-snp --cross`. SUMMIT
+`a_b.relm12.tsv` holds the pair's single `REL_M12` value. For a partitioned
+fit, give `cross-m12` the annotation used in `moments` (`--annot`): the file
+then holds each SNP's class value. `--rel-m12` also accepts the value itself,
+or a per-SNP file from `--per-snp --cross`. SUMMIT
 requires `REL_M` in both files and `--rel-m12`. With only some of them,
 the pairs would be removed from some estimating equations and kept in others. With
 in-sample LD scores that carry LD_REL, the same file serves h² and rg.

@@ -632,3 +632,113 @@ def test_inbreeding_columns_are_appended_and_validated(tmp_path):
     b.drop(columns=["REL_M"]).to_csv(tmp_path / "d.tsv", sep="\t", index=False)
     with pytest.raises(RuntimeError, match="no REL_M|need REL_M"):
         Sumstats.from_file(str(tmp_path / "d.tsv"), name="d")
+
+
+def test_inbreeding_per_snp_path_matches_totals(tmp_path):
+    """moments --per-snp --inbreeding writes the same diagonal-term values (and per-class REL_M12, REL_S12) as the
+    one-pass totals, and append/cross-m12 take them from the per-SNP run's PREFIX.rel_m(12).tsv."""
+    prefix, G, y, covs, iid, cov_path = _simulate(tmp_path, ncov=2, missing=0.004)
+    _two_phenotypes(tmp_path, y, iid)
+    annot, A = _annot(tmp_path, G.shape[1])
+    kw = dict(pairs=str(tmp_path / "pairs.txt"), covar=cov_path, cross=True, annot=annot, inbreeding=True)
+    compute_relative_pair_totals(prefix, str(tmp_path / "pheno2.txt"), str(tmp_path / "tot"), step_size=61, **kw)
+    compute_relative_pair_moments(prefix, str(tmp_path / "pheno2.txt"), str(tmp_path / "ex"), step_size=97, **kw)
+    t1 = pd.read_csv(tmp_path / "tot.rel_m.tsv", sep="\t").set_index("PHENO")
+    t2 = pd.read_csv(tmp_path / "ex.rel_m.tsv", sep="\t").set_index("PHENO")
+    assert list(t1.columns) == list(t2.columns) and "REL_DIAG_lowmaf__highmaf" in t1.columns
+    np.testing.assert_allclose(t1.loc[["y", "y2"]].to_numpy(float), t2.loc[["y", "y2"]].to_numpy(float), rtol=1e-8, atol=1e-12)
+    c1 = pd.read_csv(tmp_path / "tot.rel_m12.tsv", sep="\t")
+    c2 = pd.read_csv(tmp_path / "ex.rel_m12.tsv", sep="\t")
+    assert {"REL_M12_lowmaf", "REL_S12", "REL_S12_highmaf"} <= set(c1.columns)
+    num = [c for c in c1.columns if c.startswith("REL_")]
+    np.testing.assert_allclose(c1[num].to_numpy(float), c2[num].to_numpy(float), rtol=1e-8, atol=1e-12)
+    X, yy, p, n_eff = _projected(G, y, covs)
+    _ols_sumstats(tmp_path / "ss.tsv", X, yy, p)
+    append_rel_m_to_sumstats(str(tmp_path / "ss.tsv"), str(tmp_path / "ex.tsv.gz"), "y", str(tmp_path / "a.tsv"), annot=annot)
+    a = pd.read_csv(tmp_path / "a.tsv", sep="\t")
+    np.testing.assert_allclose(a.REL_S.to_numpy(), A @ t1.loc["y", ["REL_S_lowmaf", "REL_S_highmaf"]].to_numpy(float))
+    assert "REL_DIAG_highmaf" in a.columns
+    extract_rel_m12(str(tmp_path / "tot.rel_m12.tsv"), "y", "y2", str(tmp_path / "m12.tsv"), annot=annot)
+    m12 = pd.read_csv(tmp_path / "m12.tsv", sep="\t")
+    row = c1.iloc[0]
+    np.testing.assert_allclose(m12.REL_M12.to_numpy(), A @ row[["REL_M12_lowmaf", "REL_M12_highmaf"]].to_numpy(float))
+    np.testing.assert_allclose(m12.REL_S12.to_numpy(), A @ row[["REL_S12_lowmaf", "REL_S12_highmaf"]].to_numpy(float))
+    extract_rel_m12(str(tmp_path / "ex.tsv.gz"), "y2", "y", str(tmp_path / "m12x.tsv"))
+    assert set(pd.read_csv(tmp_path / "m12x.tsv", sep="\t").columns) == {"SNP", "REL_M12", "REL_S12"}
+
+
+def _exact_sigmas(G, covs, pi, pj, ya, yb, A=None):
+    """Exact method-of-moments components (sigma_1..C, sigma_e) without related pairs and diagonal terms, for the
+    cross products of ya and yb (ya = yb for h2)."""
+    G = np.asarray(G, dtype=np.float64)
+    N, M = G.shape
+    Xs = (G - G.mean(0)) / G.std(0, ddof=1)
+    Q = np.linalg.qr(np.column_stack([np.ones(N)] + ([covs] if covs is not None else [])))[0]
+    P = np.eye(N) - Q @ Q.T
+    PXs = P @ Xs
+    pa, pb = P @ ya, P @ yb
+    cols = [np.ones(M)] if A is None else [A[:, c] for c in range(A.shape[1])]
+    Ks = [(PXs * a[None, :]) @ PXs.T / a.sum() for a in cols]
+    C = len(Ks)
+    L = np.zeros((C + 1, C + 1)); rhs = np.zeros(C + 1)
+    for k, Kk in enumerate(Ks):
+        S = Kk.copy()
+        S[pi, pj] = 0.0; S[pj, pi] = 0.0
+        np.fill_diagonal(S, 0.0)
+        for l, Kl in enumerate(Ks):
+            L[k, l] = (S * Kl).sum()
+        L[k, C] = np.trace(S @ P)
+        rhs[k] = pa @ S @ pb
+        L[C, k] = np.trace(Kk)
+    L[C, C] = np.trace(P); rhs[C] = pa @ pb
+    return np.linalg.solve(L, rhs)
+
+
+@pytest.mark.parametrize("partitioned", [False, True])
+def test_inbreeding_rg_equals_exact_estimator_without_diagonal_terms(tmp_path, partitioned):
+    """--rg with the --inbreeding values (both sumstats and REL_S12 from cross-m12) reproduces the exact genetic
+    correlation whose h2 and cross-trait equations use only pairs of different, unrelated individuals."""
+    from summit.inference.sumcore import Sumcore
+    prefix, G, y, covs, iid, cov_path = _simulate(tmp_path, N=360, M=300, npairs=70, ncov=2, missing=0.0)
+    rng = np.random.default_rng(21)
+    Gs = np.asarray(G, dtype=np.float64)
+    Gs = (Gs - Gs.mean(0)) / Gs.std(0)
+    g1 = Gs @ rng.normal(0, np.sqrt(0.6 / G.shape[1]), G.shape[1])
+    g2 = 0.6 * g1 + Gs @ rng.normal(0, np.sqrt(0.3 / G.shape[1]), G.shape[1])
+    y = g1 + 0.5 * y                                              # keeps the shared family effect and covariates
+    y2 = g2 + 0.3 * y + rng.standard_normal(y.size) * np.linspace(0.6, 1.2, y.size)
+    pd.DataFrame({"FID": iid, "IID": iid, "y": y, "y2": y2}).to_csv(tmp_path / "pheno2.txt", sep=" ", index=False)
+    annot, A = _annot(tmp_path, G.shape[1]) if partitioned else (None, None)
+    compute_relative_pair_totals(prefix, str(tmp_path / "pheno2.txt"), str(tmp_path / "tot"), pairs=str(tmp_path / "pairs.txt"),
+                                 covar=cov_path, annot=annot, cross=True, inbreeding=True)
+    s1, ld, fit_annot = _write_fit_inputs(tmp_path, G, y, covs, iid, A, ["lowmaf", "highmaf"])
+    X, y2t, p, n_eff = _projected(G, y2, covs)
+    N, M = X.shape
+    r = (X.T @ y2t) / n_eff
+    pd.DataFrame({"SNP": [f"rs{j}" for j in range(M)], "A1": "A", "A2": "G", "N": N, "BETA": r,
+                  "SE": np.sqrt((1 - r * r) / (N - p - 2)), "COV_RANK": p}).to_csv(
+        tmp_path / "s2.tsv", sep="\t", index=False, float_format="%.15g")
+    append_rel_m_to_sumstats(s1, str(tmp_path / "tot.rel_m.tsv"), "y", str(tmp_path / "a.tsv"), annot=annot)
+    append_rel_m_to_sumstats(str(tmp_path / "s2.tsv"), str(tmp_path / "tot.rel_m.tsv"), "y2", str(tmp_path / "b.tsv"),
+                             annot=annot)
+    extract_rel_m12(str(tmp_path / "tot.rel_m12.tsv"), "y", "y2", str(tmp_path / "m12.tsv"), annot=annot)
+    _, y1t, _, _ = _projected(G, y, covs)
+    c_ov = float(y1t @ y2t / n_eff)
+    common = dict(ldscores=ld, annot=fit_annot, njack="chr", chisq_threshold=None, intercept_chisq_thr=None,
+                  intercept_rg=c_ov, align_alleles=False)
+    res = Sumcore(rg=f"{tmp_path / 'a.tsv'},{tmp_path / 'b.tsv'}", rel_m12=str(tmp_path / "m12.tsv"), **common)._run()
+    pi, pj = _family_pairs(str(tmp_path / "pairs.txt"), iid)
+    s11 = _exact_sigmas(G, covs, pi, pj, y, y, A)
+    s22 = _exact_sigmas(G, covs, pi, pj, y2, y2, A)
+    s12 = _exact_sigmas(G, covs, pi, pj, y, y2, A)
+    rg_exact = s12[:-1].sum() / np.sqrt(s11[:-1].sum() * s22[:-1].sum())
+    assert np.isfinite(rg_exact) and abs(rg_exact) > 0.1
+    assert float(res["rg_fit"].rg_total[0]) == pytest.approx(rg_exact, rel=1e-6)
+    h2_1 = s11[:-1].sum() / s11.sum()
+    assert float(res["h2_fit1"].h2[-1, 0]) == pytest.approx(h2_1, rel=1e-6)
+    # every input is required, and an estimated intercept is refused
+    with pytest.raises(ValueError, match="REL_S12 in --rel-m12 no"):
+        Sumcore(rg=f"{tmp_path / 'a.tsv'},{tmp_path / 'b.tsv'}", rel_m12="0.01", **common)._run()
+    free = {**common, "intercept_rg": None}
+    with pytest.raises(ValueError, match="overlapping covariance"):
+        Sumcore(rg=f"{tmp_path / 'a.tsv'},{tmp_path / 'b.tsv'}", rel_m12=str(tmp_path / "m12.tsv"), **free)._run()

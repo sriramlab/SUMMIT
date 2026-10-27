@@ -32,6 +32,9 @@ class RGPrepared:
     Ac_rep: np.ndarray | None = None
     # Unweighted annotation masses, set when the annotation carries the SNP-variance weights V (LD-score V column).
     mass_Ak_rep: np.ndarray | None = None
+    # Diagonal terms left out of the cross-trait equations (`summit relatives moments --inbreeding`): per bin lambda_k
+    # and REL_S12_k; lhs already holds -(REL_DIAG_kl + lambda_k), fit_rg subtracts the rest from the right-hand side.
+    diag_terms: dict | None = None
 
     @property
     def intercept_mass_unit(self):
@@ -463,6 +466,8 @@ def prepare_rg(
     summary_y=None,
     summary_y_info=None,
     adjust_delta: bool = False,
+    diag=None,
+    diag_cross=None,
 ):
     _validate_common_axis(trace_view, matched1, matched2, jackknife)
 
@@ -543,6 +548,17 @@ def prepare_rg(
 
     lhs = _symmetrize_with_design(lhs, jackknife, unit_sizes)
 
+    diag_terms = None
+    if diag is not None:
+        # Cross-trait equations without the diagonal terms (same sample for both traits): with the overlapping
+        # covariance c, sum_l [T_kl - REL_DIAG_kl - lambda_k] g_l = n (mean_k y - c - REL_S12_k) - lambda_k c.
+        from .h2core import h2_diagonal_terms
+        terms = h2_diagonal_terms(A, active_mask, diag)
+        Aa = A[active_mask]
+        cs12 = (Aa.T @ np.asarray(diag_cross, dtype=np.float64)[active_mask]) / Aa.sum(axis=0)
+        lhs = lhs - (terms["s"] + terms["lam"][:, None])[None, :, :]
+        diag_terms = {"lam": terms["lam"], "cs12": cs12}
+
     overlap_scale = np.sqrt(
         summary_noise_scale(matched1, summary_y_info, trait=1)
         * summary_noise_scale(matched2, summary_y_info, trait=2)
@@ -581,6 +597,7 @@ def prepare_rg(
         Ac_unit=Ac_unit,
         Ac_rep=Ac_rep,
         mass_Ak_rep=mass_Ak_rep,
+        diag_terms=diag_terms,
     )
 
 
@@ -1253,6 +1270,10 @@ def fit_rg(
     rhs = np.full((R + 1, K), np.nan, dtype=np.float64)
     with np.errstate(divide="ignore", invalid="ignore"):
         rhs = ((p.Ay_rep - c_reps[:, None] * p.intercept_mass_rep) * sqrt_n1n2) / p.Ak_rep
+    if p.diag_terms is not None:
+        with np.errstate(divide="ignore", invalid="ignore"):
+            rhs = rhs - sqrt_n1n2 * p.diag_terms["cs12"][None, :] \
+                - p.diag_terms["lam"][None, :] * c_reps[:, None] * (p.intercept_mass_rep / p.Ak_rep)
     bad_rhs = (~np.isfinite(rhs)) | (~np.isfinite(p.Ak_rep)) | (p.Ak_rep <= 0.0)
     rhs[bad_rhs] = np.nan
 

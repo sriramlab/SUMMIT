@@ -651,6 +651,40 @@ def _pair_correction_from_deleted_mass(A_keep, A_del, delta):
 # -----------------------------------------------------------------------------
 
 
+def relatives_diagonal_inputs(sumstats, pos, trace, *, full_mask=None) -> dict | None:
+    """Per-SNP `summit relatives moments --inbreeding` values of a sumstats object on a fit's SNP axis, or None.
+
+    `pos` gives the sumstats rows of the axis SNPs; with `full_mask` the values are placed on the full trace axis (NaN
+    elsewhere). Bins are matched to REL_DIAG columns by name: one bin uses REL_DIAG, several bins REL_DIAG_<bin> (the
+    class names of the annotation given to `moments` and `append`). The values are defined on SUMMIT's V-weighted
+    kernels, so the LD scores must carry the V column."""
+    rd = getattr(sumstats, "rel_diag", None)
+    if rd is None:
+        return None
+    if getattr(trace, "annot_mass", None) is None:
+        raise ValueError(f"[{sumstats.name}] has --inbreeding values, which need LD scores with the V column (SUMMIT's "
+                         "default for LD scores computed with covariates).")
+    names = [str(x) for x in np.asarray(trace.annot_header).ravel()]
+    dcols = ["REL_DIAG"] if len(names) == 1 else [f"REL_DIAG_{nm}" for nm in names]
+    missing = [c for c in dcols if c not in rd]
+    if missing:
+        raise ValueError(
+            f"[{sumstats.name}] has --inbreeding values but no {missing[0]} column: run `summit relatives moments "
+            "--inbreeding --annot` and `append --annot` with the annotation of this fit "
+            f"(bins: {names[:4]}{'...' if len(names) > 4 else ''}).")
+    pos = np.asarray(pos, dtype=np.int64)
+
+    def vec(col):
+        v = rd[col][pos]
+        if full_mask is None:
+            return v
+        out = np.full(np.asarray(full_mask).size, np.nan, dtype=np.float64)
+        out[full_mask] = v
+        return out
+
+    return {"REL_S": vec("REL_S"), "REL_LAMBDA": vec("REL_LAMBDA"), "REL_DIAG": np.column_stack([vec(c) for c in dcols])}
+
+
 def h2_diagonal_terms(A: np.ndarray, active_mask: np.ndarray, diag: dict | None) -> dict | None:
     """Class values of the `summit relatives moments --inbreeding` columns (constant within classes): the
     A-weighted means over the active SNPs of REL_S and REL_LAMBDA (K,) and of the REL_DIAG columns (K x K)."""

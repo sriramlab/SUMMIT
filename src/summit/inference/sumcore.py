@@ -10,7 +10,7 @@ from .. import utils
 from .jackknife import JackknifeSpec, JackknifeDesign
 from .trace import Trace
 from ..sumstats.sumstats import Sumstats, MatchedSumstats, harmonize_allele_codes
-from .h2core import prepare_h2, fit_h2
+from .h2core import prepare_h2, fit_h2, relatives_diagonal_inputs
 from .rgcore import prepare_rg, fit_intercept, fit_rg, RGResultWriter
 from .ldsc_h2 import (
     prepare_h2_ldsc,
@@ -439,11 +439,8 @@ class Sumcore:
             allele_flip_mask=flip_keep,
         )
 
-        rel_m12 = self._related_pair_cross_moment(matched1, matched2)
-        if self.log is not None and any(getattr(getattr(x, "sumstats", x), "rel_diag", None) is not None
-                                        for x in (aligned1, aligned2)):
-            self.log._log("[relatives] the --inbreeding values (REL_S, REL_LAMBDA, REL_DIAG) are used by --h2 only; --rg "
-                          "excludes the related pairs and keeps the diagonal terms, for both traits and their covariance.")
+        rel_m12, rel_s12 = self._related_pair_cross_moment(matched1, matched2)
+        diag1, diag2 = self._diagonal_inputs(aligned1, aligned2, main_mask, rel_s12)
         if rel_m12 is not None and tv.ldscores_rel is not None:
             tv = tv.pair_excluded()
             if self.log is not None:
@@ -467,7 +464,7 @@ class Sumcore:
         h2_prepared1 = (
             prepare_h2_ldsc(tv, matched1, jk)
             if self.weight_mode == "ldsc"
-            else prepare_h2(tv, matched1, jk, adjust_delta=self.adjust_delta)
+            else prepare_h2(tv, matched1, jk, adjust_delta=self.adjust_delta, diag=diag1)
         )
         h2_fit1 = fit_h2(
             h2_prepared1,
@@ -490,7 +487,7 @@ class Sumcore:
         h2_prepared2 = (
             prepare_h2_ldsc(tv, matched2, jk)
             if self.weight_mode == "ldsc"
-            else prepare_h2(tv, matched2, jk, adjust_delta=self.adjust_delta)
+            else prepare_h2(tv, matched2, jk, adjust_delta=self.adjust_delta, diag=diag2)
         )
         h2_fit2 = fit_h2(
             h2_prepared2,
@@ -544,6 +541,8 @@ class Sumcore:
             summary_y=summary_y,
             summary_y_info=summary_y_info,
             adjust_delta=self.adjust_delta,
+            diag=diag1,
+            diag_cross=rel_s12,
         )
         _stage_stop("prepare_rg", t_stage)
 
@@ -940,11 +939,12 @@ class Sumcore:
         }
     
     def _related_pair_cross_moment(self, matched1, matched2):
-        """REL_M12 on the matched SNP axis, or None; pair exclusion must cover both h2 parts and the cross part."""
+        """(REL_M12, REL_S12) on the matched SNP axis; (None, None) without related pairs, and REL_S12 is None unless
+        the --rel-m12 file carries the `--inbreeding` value. Pair exclusion must cover both h2 parts and the cross part."""
         has1 = getattr(matched1, "rel_m", None) is not None
         has2 = getattr(matched2, "rel_m", None) is not None
         if not (has1 or has2 or self.rel_m12_path is not None):
-            return None
+            return None, None
         if not (has1 and has2 and self.rel_m12_path is not None):
             raise ValueError(
                 "Excluding related pairs from rg needs REL_M in both sumstats files and --rel-m12 for the pair "
@@ -957,22 +957,60 @@ class Sumcore:
                 value = float(src)
             except ValueError:
                 raise FileNotFoundError(f"--rel-m12: {src} is neither a file nor a number.") from None
-            return np.full(np.asarray(matched1.snps).size, value)
+            return np.full(np.asarray(matched1.snps).size, value), None
         tab = pd.read_csv(src, sep=r"\s+", dtype={"SNP": str})
+        cols = ["REL_M12"] + (["REL_S12"] if "REL_S12" in tab.columns else [])
+        nsnp = np.asarray(matched1.snps).size
         if "SNP" not in tab.columns:                             # one value for the pair (`summit relatives cross-m12`)
             if "REL_M12" not in tab.columns or len(tab) != 1:
                 raise ValueError(f"{src} must hold SNP and REL_M12 columns, or one REL_M12 value.")
-            return np.full(np.asarray(matched1.snps).size, float(tab["REL_M12"].iloc[0]))
-        tab = tab[["SNP", "REL_M12"]]
-        if tab["SNP"].duplicated().any():
-            raise ValueError(f"{self.rel_m12_path} has duplicate SNP IDs.")
-        pos = pd.Index(tab["SNP"]).get_indexer(np.asarray(matched1.snps).astype(str))
-        vals = np.full(pos.size, np.nan)
-        vals[pos >= 0] = tab["REL_M12"].to_numpy(dtype=np.float64)[pos[pos >= 0]]
-        bad = ~np.isfinite(vals)
-        if bad.any():
-            raise ValueError(f"{int(bad.sum())} rg SNPs have no finite REL_M12 in {self.rel_m12_path}.")
-        return vals
+            out = [np.full(nsnp, float(tab[c].iloc[0])) for c in cols]
+        else:
+            tab = tab[["SNP"] + cols]
+            if tab["SNP"].duplicated().any():
+                raise ValueError(f"{self.rel_m12_path} has duplicate SNP IDs.")
+            pos = pd.Index(tab["SNP"]).get_indexer(np.asarray(matched1.snps).astype(str))
+            out = []
+            for c in cols:
+                vals = np.full(pos.size, np.nan)
+                vals[pos >= 0] = tab[c].to_numpy(dtype=np.float64)[pos[pos >= 0]]
+                bad = ~np.isfinite(vals)
+                if bad.any():
+                    raise ValueError(f"{int(bad.sum())} rg SNPs have no finite {c} in {self.rel_m12_path}.")
+                out.append(vals)
+        return out[0], (out[1] if len(out) > 1 else None)
+
+    def _diagonal_inputs(self, aligned1, aligned2, main_mask, rel_s12):
+        """Per-SNP `--inbreeding` values of both traits on the rg axis, or (None, None). They are used only together:
+        both sumstats from `append` of a `moments --inbreeding` run and REL_S12 in the --rel-m12 file."""
+        ss1, ss2 = aligned1.sumstats, aligned2.sumstats
+        have = {"trait 1": getattr(ss1, "rel_diag", None) is not None, "trait 2": getattr(ss2, "rel_diag", None) is not None,
+                "REL_S12 in --rel-m12": rel_s12 is not None}
+        if not any(have.values()):
+            return None, None
+        if not all(have.values()):
+            raise ValueError("Leaving the diagonal terms out of rg (`summit relatives moments --inbreeding`) needs the "
+                             "values in both sumstats files (`append`) and REL_S12 in the --rel-m12 file (`cross-m12` "
+                             "from `moments --cross --inbreeding`); present: "
+                             + ", ".join(f"{k} {'yes' if v else 'no'}" for k, v in have.items()) + ".")
+        if self.weight_mode != "he":
+            raise ValueError("The --inbreeding values need the default HE weighting.")
+        if self.rg_se_method in {"robust", "kmoments"}:
+            raise ValueError(f"--rg-se-method {self.rg_se_method} does not support the --inbreeding values; use jackknife "
+                             "or delta.")
+        if self.intercept_rg is None and self.pheno_rg_paths is None:
+            raise ValueError("rg with the --inbreeding values needs the overlapping covariance in HE scale "
+                             "(--overlap-covariance-rg, or the phenotypes with --pheno-rg), not an estimated intercept.")
+        d1 = relatives_diagonal_inputs(ss1, aligned1.pos_on_trace[main_mask], self.trace)
+        d2 = relatives_diagonal_inputs(ss2, aligned2.pos_on_trace[main_mask], self.trace)
+        for col in ("REL_LAMBDA", "REL_DIAG"):
+            if not np.allclose(d1[col], d2[col], rtol=1e-6, atol=1e-9):
+                raise ValueError(f"{col} differs between the two sumstats files: rg with the --inbreeding values needs "
+                                 "both traits measured on the same individuals (one `moments` run).")
+        if self.log is not None:
+            self.log._log("[relatives] diagonal terms left out of the h2 and cross-trait estimating equations "
+                          "(--inbreeding).")
+        return d1, d2
 
     @staticmethod
     def _read_overlap_covariate_file(path: str, missing_tokens):
