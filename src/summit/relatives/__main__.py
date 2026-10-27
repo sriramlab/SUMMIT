@@ -1,6 +1,6 @@
 """Command line for related-pair HE moments (`summit relatives ...`, or `python -m summit.relatives ...`).
 
-  summit relatives moments --geno PREFIX --pheno FILE --pairs FILE [--covar FILE] [--annot FILE] --out PREFIX
+  summit relatives moments --geno PREFIX --pheno FILE --pairs FILE [--covar FILE] [--annot FILE] [--inbreeding] --out PREFIX
   summit relatives append  --sumstats FILE --rel PREFIX.rel_m.tsv --pheno NAME [--annot FILE] --out FILE
   summit relatives cross-m12 --rel PREFIX.rel_m12.tsv --pheno1 A --pheno2 B --out FILE   (for summit --rg --rel-m12)
 
@@ -40,6 +40,12 @@ def main(argv=None):
     m.add_argument("--step-size", type=int, default=None, help="SNPs per genotype block (default: about 512 MiB)")
     m.add_argument("--cross", action="store_true",
                    help="also REL_M12 for every phenotype pair with the same samples (for rg)")
+    m.add_argument("--inbreeding", action="store_true",
+                   help="also leave each individual paired with themselves (the diagonal of the GRM) out of the h2 "
+                        "estimating equation, which removes bias from inbreeding (residual variance that grows with "
+                        "inbreeding) and the covariate leverage of the related pairs. Writes REL_S, REL_LAMBDA and "
+                        "REL_DIAG; `append` copies them and `summit --h2` uses them. Costs one extra projection of the "
+                        "genotypes per complete-case sample, and a few percent of precision in samples of a few thousand.")
     m.add_argument("--out", required=True)
     a_ = sub.add_parser("append", help="copy a sumstats file adding a REL_M column")
     a_.add_argument("--sumstats", required=True)
@@ -59,11 +65,14 @@ def main(argv=None):
         log = Logger()
         log.attach_file(args.out + ".log", mode="w")
         cols = None if args.pheno_cols is None else [c.strip() for c in args.pheno_cols.split(",") if c.strip()]
+        if args.inbreeding and args.per_snp:
+            ap.error("--inbreeding works with the per-phenotype values (leave out --per-snp).")
         run = compute_relative_pair_moments if args.per_snp else compute_relative_pair_totals
+        extra = {"inbreeding": True} if args.inbreeding else {}
         summary = run(
             args.geno, args.pheno, args.out, pairs=args.pairs, covar=args.covar, pheno_cols=cols,
             kinship_col=args.kinship_col, kinship_min=args.kinship_min, closure=not args.no_closure,
-            step_size=args.step_size, cross=args.cross, annot=args.annot, log=log,
+            step_size=args.step_size, cross=args.cross, annot=args.annot, log=log, **extra,
         )
         for name, info in summary["phenotypes"].items():
             log._log(f"[relatives] {name}: n={info['n']} pairs={info['pairs_used']} REL_M={info['rel_m']:.6g}")

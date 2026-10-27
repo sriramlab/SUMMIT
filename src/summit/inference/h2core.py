@@ -651,6 +651,27 @@ def _pair_correction_from_deleted_mass(A_keep, A_del, delta):
 # -----------------------------------------------------------------------------
 
 
+def h2_diagonal_terms(A: np.ndarray, active_mask: np.ndarray, diag: dict | None) -> dict | None:
+    """Class values of the `summit relatives moments --inbreeding` columns (constant within classes): the
+    A-weighted means over the active SNPs of REL_S and REL_LAMBDA (K,) and of the REL_DIAG columns (K x K)."""
+    if diag is None:
+        return None
+    A = np.asarray(A, dtype=np.float64)
+    act = np.asarray(active_mask, dtype=bool)
+    Aa = A[act]
+    Ak = Aa.sum(axis=0)
+    if np.any(~np.isfinite(Ak) | (Ak <= 0.0)):
+        raise RuntimeError("A bin has no weight; the --inbreeding values cannot be assigned to it.")
+    c_s = (Aa.T @ np.asarray(diag["REL_S"], dtype=np.float64)[act]) / Ak
+    lam = (Aa.T @ np.asarray(diag["REL_LAMBDA"], dtype=np.float64)[act]) / Ak
+    D = np.asarray(diag["REL_DIAG"], dtype=np.float64)
+    D = D.reshape(-1, 1) if D.ndim == 1 else D
+    if D.shape != (A.shape[0], A.shape[1]):
+        raise ValueError(f"REL_DIAG must have one column per bin ({A.shape[1]}); got {D.shape[1]}.")
+    S = (Aa.T @ D[act]) / Ak[:, None]
+    return {"c_s": c_s, "lam": lam, "s": 0.5 * (S + S.T)}
+
+
 def _finish_prepare_h2(
     *,
     trace_view,
@@ -666,6 +687,7 @@ def _finish_prepare_h2(
     adjust_delta: bool,
     store_y: bool = True,
     mass: H2MassUnitStats | None = None,
+    diag_terms: dict | None = None,
 ) -> H2Prepared:
     K = int(trace_view.nbins)
     R = int(jackknife.nrep)
@@ -724,6 +746,14 @@ def _finish_prepare_h2(
     bad_rhs = (~np.isfinite(rhs[:, :K])) | (~np.isfinite(Ak_rep)) | (Ak_rep <= 0.0)
     rhs[:, :K][bad_rhs] = np.nan
 
+    if diag_terms is not None:
+        # Diagonal terms left out of the first equations (`summit relatives moments --inbreeding`): with the kernels
+        # K~_k (trace n_scale), sum_l [tr(K~u_k K~u_l) - D_kl] s_l + lambda_k s_e = y'K~u_k y - sum_i K~_k,ii y_i^2,
+        # D_kl = REL_DIAG_kl + n_scale and sum_i K~_k,ii y_i^2 = n_scale (1 + REL_S_k); the last equation is unchanged.
+        lhs[:, :K, :K] -= (np.asarray(diag_terms["s"], dtype=np.float64) + n_scale)[None, :, :]
+        lhs[:, :K, K] = np.asarray(diag_terms["lam"], dtype=np.float64)[None, :]
+        rhs[:, :K] -= (n_scale * (1.0 + np.asarray(diag_terms["c_s"], dtype=np.float64)))[None, :]
+
     bad_bins = np.flatnonzero(~np.isfinite(Ak_rep[-1]) | (Ak_rep[-1] <= 0.0))
     if bad_bins.size:
         raise RuntimeError(
@@ -780,6 +810,7 @@ def prepare_h2(
     summary_y_info=None,
     ld_kind: str = "main",
     adjust_delta: bool = False,
+    diag=None,
 ):
     if trace_view.nsnps != matched.nsnps:
         raise ValueError("TraceView and MatchedSumstats must have the same number of SNPs.")
@@ -829,6 +860,7 @@ def prepare_h2(
     Ay_unit = _compute_h2_ay_unit(A, jackknife, y, active_mask)
     has_overlap = _has_overlapping_annotations(A, active_mask=active_mask)
     mass = _h2_mass_for_active(trace_view, jackknife, active_mask, None, False)
+    diag_terms = h2_diagonal_terms(A, active_mask, diag)
 
     return _finish_prepare_h2(
         trace_view=trace_view,
@@ -844,6 +876,7 @@ def prepare_h2(
         adjust_delta=adjust_delta,
         store_y=True,
         mass=mass,
+        diag_terms=diag_terms,
     )
 
 
@@ -860,6 +893,7 @@ def prepare_h2_reference_axis(
     adjust_delta: bool = False,
     prefer_drop_correction: bool = True,
     full_mass: H2MassUnitStats | None = None,
+    diag=None,
 ):
     """
     Prepare h2 normal equations on the immutable reference SNP axis.
@@ -931,6 +965,7 @@ def prepare_h2_reference_axis(
     Ay_unit = _compute_h2_ay_unit(A, jackknife, y, active_mask)
     has_overlap = _has_overlapping_annotations(A, active_mask=active_mask)
     mass = _h2_mass_for_active(trace_view, jackknife, active_mask, full_mass, use_drop_correction)
+    diag_terms = h2_diagonal_terms(A, active_mask, diag)
 
     trace_meta = _make_h2_trace_metadata(trace_view)
 
@@ -948,6 +983,7 @@ def prepare_h2_reference_axis(
         adjust_delta=adjust_delta,
         store_y=False,
         mass=mass,
+        diag_terms=diag_terms,
     )
 
 
@@ -1050,6 +1086,7 @@ def prepare_h2_reference_axis_from_sufficient_stats(
         adjust_delta=adjust_delta,
         store_y=False,
         mass=mass,
+        diag_terms=None,
     )
 
 

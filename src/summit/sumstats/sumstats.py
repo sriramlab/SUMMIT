@@ -391,11 +391,15 @@ class Sumstats:
         read_summary=None,
         read_top=None,
         rel_m=None,
+        rel_diag=None,
     ):
         self.snps = np.asarray(snps, dtype=str)
         # Optional per-SNP related-pair HE moment (REL_M column; see summit.relatives).
         # It is invariant to allele orientation, so no flipping is needed on alignment.
         self.rel_m = None if rel_m is None else np.asarray(rel_m, dtype=np.float64)
+        # Optional values of `summit relatives moments --inbreeding` (REL_S, REL_LAMBDA, REL_DIAG, REL_DIAG_<class>),
+        # constant within classes: the fit then leaves the diagonal terms out of the h2 estimating equations.
+        self.rel_diag = None if rel_diag is None else {k: np.asarray(v, dtype=np.float64) for k, v in rel_diag.items()}
         self.z = np.asarray(z, dtype=np.float64)
         self.beta = np.asarray(beta, dtype=np.float64)
         self.se = np.asarray(se, dtype=np.float64)
@@ -424,6 +428,11 @@ class Sumstats:
             raise RuntimeError("Sumstats arrays do not all have the same length.")
         if self.rel_m is not None and self.rel_m.shape != self.snps.shape:
             raise RuntimeError("REL_M must have one value per SNP.")
+        if self.rel_diag is not None:
+            if self.rel_m is None:
+                raise RuntimeError("REL_S/REL_LAMBDA/REL_DIAG need REL_M (both come from `summit relatives`).")
+            if any(v.shape != self.snps.shape for v in self.rel_diag.values()):
+                raise RuntimeError("REL_S, REL_LAMBDA and REL_DIAG columns must have one value per SNP.")
 
         self.index = pd.Index(self.snps)
         if self.index.has_duplicates:
@@ -484,12 +493,17 @@ class Sumstats:
 
         covrankcol = _maybe_find_column(cols, ["COV_RANK", "cov_rank", "P_EFF", "p_eff"])
         relcol = _maybe_find_column(cols, ["REL_M"])
+        diagcols = [c for c in cols if c in ("REL_S", "REL_LAMBDA", "REL_DIAG") or str(c).startswith("REL_DIAG_")]
+        if diagcols and not all(c in diagcols for c in ("REL_S", "REL_LAMBDA", "REL_DIAG")):
+            raise RuntimeError(f"Phenotype [{name or path}] has some but not all of REL_S, REL_LAMBDA and REL_DIAG; "
+                               "write them with `summit relatives append` from `moments --inbreeding`.")
 
         usecols = [idcol, a1col, a2col, ncol, betacol, secol]
         if covrankcol is not None:
             usecols.append(covrankcol)
         if relcol is not None:
             usecols.append(relcol)
+        usecols.extend(diagcols)
         usecols = list(dict.fromkeys(usecols))
 
         df = utils._read_csv_maybe_chr_split(
@@ -522,6 +536,8 @@ class Sumstats:
         df["SE"] = pd.to_numeric(df["SE"], errors="coerce")
         if relcol is not None:
             df["REL_M"] = pd.to_numeric(df["REL_M"], errors="coerce")
+        for c in diagcols:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
 
         file_cov_rank = None
         if "COV_RANK" in df.columns:
@@ -571,6 +587,15 @@ class Sumstats:
                     f"{int(np.sum(bad_rel & ~bad))} SNPs with missing REL_M."
                 )
             bad = bad | bad_rel
+        if diagcols:
+            if relcol is None:
+                raise RuntimeError(f"Phenotype [{name or path}] has REL_S/REL_LAMBDA/REL_DIAG but no REL_M.")
+            bad_diag = ~np.isfinite(df[diagcols].to_numpy(dtype=np.float64)).all(axis=1)
+            if log is not None:
+                log._log(f"[relatives] [{name or path}] --inbreeding values present (REL_S, REL_LAMBDA, REL_DIAG"
+                         f"{', ' + str(len(diagcols) - 3) + ' REL_DIAG_<class> columns' if len(diagcols) > 3 else ''}): "
+                         "the h2 fit leaves the diagonal terms out of its estimating equations.")
+            bad = bad | bad_diag
 
         removed = []
         if bad.any():
@@ -667,6 +692,7 @@ class Sumstats:
             read_summary=read_summary,
             read_top=read_top,
             rel_m=(df["REL_M"].to_numpy(dtype=np.float64, copy=False) if relcol is not None else None),
+            rel_diag=({c: df[c].to_numpy(dtype=np.float64, copy=False) for c in diagcols} if diagcols else None),
         )
 
     def align_to_trace(self, trace) -> AlignedSumstats:

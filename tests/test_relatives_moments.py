@@ -465,3 +465,170 @@ def test_rg_with_one_rel_m12_value_matches_per_snp(tmp_path):
     assert gam(gt) == pytest.approx(gam(gx), rel=1e-6)
     assert gam(gn) == pytest.approx(gam(gt), rel=1e-9)
     assert vt == pytest.approx(v @ pd.read_csv(tmp_path / "m12x.tsv", sep="\t").REL_M12.to_numpy() / v.sum(), rel=1e-8)
+
+
+# ---------------------------------------------------------------------------------------- --inbreeding (diagonal terms)
+def _kernels_tilde(X, v, A):
+    """SUMMIT's kernels K~_k = sum_j a_jk V_j x_j x_j' / sum_j a_jk V_j (column 0 of the list: all SNPs)."""
+    out = []
+    for a in [np.ones(X.shape[1])] + [A[:, c] for c in range(A.shape[1])]:
+        w = a * v
+        out.append((X * w[None, :]) @ X.T / w.sum())
+    return out
+
+
+@pytest.mark.parametrize("ncov", [0, 2])
+def test_inbreeding_values_match_brute_force(tmp_path, ncov):
+    """REL_S, REL_LAMBDA and REL_DIAG (overall, per class and per pair of classes) equal their definitions."""
+    prefix, G, y, covs, iid, cov_path = _simulate(tmp_path, ncov=ncov, missing=0.0)
+    M = G.shape[1]
+    annot, A = _annot(tmp_path, M)
+    compute_relative_pair_totals(prefix, str(tmp_path / "pheno.txt"), str(tmp_path / "tot"), pairs=str(tmp_path / "pairs.txt"),
+                                 covar=cov_path, annot=annot, inbreeding=True, step_size=61)
+    tab = pd.read_csv(tmp_path / "tot.rel_m.tsv", sep="\t").iloc[0]
+    X, yy, p, n_eff = _projected(G, y, covs if ncov else None)
+    N = X.shape[0]
+    v = _v_weights(G, covs if ncov else None)
+    Q = np.linalg.qr(np.column_stack([np.ones(N)] + ([covs] if ncov else [])))[0]
+    H = Q @ Q.T
+    pi, pj = _family_pairs(str(tmp_path / "pairs.txt"), iid)
+    Ks = _kernels_tilde(X, v, A)
+    names = ["", "_lowmaf", "_highmaf"]
+    for K, nm in zip(Ks, names):
+        d = np.diag(K)
+        np.testing.assert_allclose(d.sum(), n_eff, rtol=1e-10)
+        assert tab[f"REL_S{nm}"] == pytest.approx(float((d - 1.0) @ (yy * yy)) / n_eff, rel=1e-8, abs=1e-12)
+        lam = float(d @ np.diag(H)) + 2.0 * float((K[pi, pj] * H[pi, pj]).sum())
+        assert tab[f"REL_LAMBDA{nm}"] == pytest.approx(lam, rel=1e-8)
+    assert tab["REL_DIAG"] == pytest.approx(float(np.diag(Ks[0]) @ np.diag(Ks[0])) - n_eff, rel=1e-7)
+    cls = ["lowmaf", "highmaf"]
+    for c, Kc in zip(cls, Ks[1:]):
+        for d_, Kd in zip(cls, Ks[1:]):
+            assert tab[f"REL_DIAG_{c}__{d_}"] == pytest.approx(float(np.diag(Kc) @ np.diag(Kd)) - n_eff, rel=1e-7)
+    # the single-component value is the class-mass-weighted combination of the class values
+    w = np.array([(A[:, c] * v).sum() for c in range(2)]); w /= w.sum()
+    S = np.array([[tab[f"REL_DIAG_{c}__{d_}"] for d_ in cls] for c in cls])
+    assert tab["REL_DIAG"] == pytest.approx(float(w @ S @ w), rel=1e-7)
+    for c, row in zip(cls, S):
+        assert tab[f"REL_DIAG_{c}"] == pytest.approx(float(row @ w), rel=1e-9)
+
+
+def _exact_offdiagonal(G, y, covs, pi, pj, A=None, drop_diagonal=True, exact_leverage=True):
+    """Exact individual-level method of moments with kernels K_k = P Xs_k Xs_k' P / M_k (Xs standardized genotypes):
+    the first equations use pairs outside the related pairs (and, with drop_diagonal, no diagonal terms), with
+    coefficient tr(K^S_k P) (or tr(K_k), SUMMIT's convention without the leverage term); returns total h2."""
+    G = np.asarray(G, dtype=np.float64)
+    N, M = G.shape
+    Xs = (G - G.mean(0)) / G.std(0, ddof=1)
+    Q = np.linalg.qr(np.column_stack([np.ones(N)] + ([covs] if covs is not None else [])))[0]
+    P = np.eye(N) - Q @ Q.T
+    PXs = P @ Xs
+    yp = P @ y
+    cols = [np.ones(M)] if A is None else [A[:, c] for c in range(A.shape[1])]
+    Ks = [(PXs * a[None, :]) @ PXs.T / a.sum() for a in cols]
+    C = len(Ks)
+    L = np.zeros((C + 1, C + 1)); rhs = np.zeros(C + 1)
+    for k, Kk in enumerate(Ks):
+        S = Kk.copy()
+        S[pi, pj] = 0.0; S[pj, pi] = 0.0
+        if drop_diagonal:
+            np.fill_diagonal(S, 0.0)
+        for l, Kl in enumerate(Ks):
+            L[k, l] = (S * Kl).sum()
+        L[k, C] = np.trace(S @ P) if exact_leverage else np.trace(Kk)
+        rhs[k] = yp @ S @ yp
+        L[C, k] = np.trace(Kk)
+    L[C, C] = np.trace(P); rhs[C] = yp @ yp
+    sig = np.linalg.solve(L, rhs)
+    return sig[:C].sum() / sig.sum()
+
+
+def _write_fit_inputs(tmp_path, G, y, covs, iid, A=None, names=None):
+    """Sumstats with the covariate rank, and exact V-weighted in-sample LD scores with their related-pair parts."""
+    X, yy, p, n_eff = _projected(G, y, covs)
+    N, M = X.shape
+    r = (X.T @ yy) / n_eff
+    pd.DataFrame({"SNP": [f"rs{j}" for j in range(M)], "A1": "A", "A2": "G", "N": N, "BETA": r,
+                  "SE": np.sqrt((1 - r * r) / (N - p - 2)), "COV_RANK": p}).to_csv(
+        tmp_path / "ss.tsv", sep="\t", index=False, float_format="%.15g")
+    v = _v_weights(G, covs)
+    R2 = (X.T @ X / n_eff) ** 2
+    W = v[:, None] if A is None else v[:, None] * A
+    ld = R2 @ W - W.sum(0)[None, :] / n_eff
+    rel, _ = _ld_rel(G, covs, str(tmp_path / "pairs.txt"), iid, W)
+    df = pd.DataFrame(_snp_meta(M))[["CHR", "SNP", "BP"]]
+    df["V"] = v
+    for k in range(W.shape[1]):
+        df[f"L2_{k}"] = ld[:, k]
+    for k in range(W.shape[1]):
+        df[f"LD_REL_L2_{k}"] = rel[:, k]
+    df.to_csv(tmp_path / "in.gw.ldscore.gz", sep="\t", index=False, float_format="%.15g")
+    fit_annot = None
+    if A is not None:
+        fa = pd.DataFrame(_snp_meta(M))[["CHR", "BP", "SNP"]]
+        for k, nm in enumerate(names):
+            fa[nm] = A[:, k]
+        fa.to_csv(tmp_path / "fit_annot.txt", sep="\t", index=False)
+        fit_annot = str(tmp_path / "fit_annot.txt")
+    return str(tmp_path / "ss.tsv"), str(tmp_path / "in.gw.ldscore.gz"), fit_annot
+
+
+@pytest.mark.parametrize("partitioned,njack", [(False, "20"), (True, "20"), (False, "chr"), (True, "chr")])
+def test_inbreeding_h2_equals_exact_estimator_without_diagonal_terms(tmp_path, partitioned, njack):
+    """moments --inbreeding, append and --h2 reproduce the exact individual-level estimator whose first equations use
+    only pairs of different, unrelated individuals (with exact LD scores and complete genotypes); without the option
+    the fit is the usual pair-excluded estimator."""
+    from summit.inference.sumrhe import Sumrhe
+    prefix, G, y, covs, iid, cov_path = _simulate(tmp_path, N=360, M=300, npairs=70, ncov=2, missing=0.0)
+    rng = np.random.default_rng(11)
+    y = y + rng.standard_normal(y.size) * np.linspace(0.5, 1.5, y.size)        # residual variance varies between people
+    pd.DataFrame({"FID": iid, "IID": iid, "y": y}).to_csv(tmp_path / "pheno.txt", sep=" ", index=False)
+    annot, A = _annot(tmp_path, G.shape[1]) if partitioned else (None, None)
+    kw = dict(pairs=str(tmp_path / "pairs.txt"), covar=cov_path, annot=annot)
+    compute_relative_pair_totals(prefix, str(tmp_path / "pheno.txt"), str(tmp_path / "inb"), inbreeding=True, **kw)
+    compute_relative_pair_totals(prefix, str(tmp_path / "pheno.txt"), str(tmp_path / "std"), **kw)
+    ss, ld, fit_annot = _write_fit_inputs(tmp_path, G, y, covs, iid, A, ["lowmaf", "highmaf"])
+    for tag in ("inb", "std"):
+        append_rel_m_to_sumstats(ss, str(tmp_path / f"{tag}.rel_m.tsv"), "y", str(tmp_path / f"{tag}.tsv"), annot=annot)
+    pi, pj = _family_pairs(str(tmp_path / "pairs.txt"), iid)
+    fit = {}
+    for tag in ("inb", "std"):
+        s = Sumrhe(h2_path=str(tmp_path / f"{tag}.tsv"), ldscores=ld, annot=fit_annot, njack=njack, chisq_threshold=None)
+        s._run()
+        fit[tag] = float(s.results[0].h2[-1, 0])
+        assert np.isfinite(s.results[0].h2[-1, 1])
+    exact_inb = _exact_offdiagonal(G, y, covs, pi, pj, A)
+    exact_std = _exact_offdiagonal(G, y, covs, pi, pj, A, drop_diagonal=False, exact_leverage=False)
+    assert fit["inb"] == pytest.approx(exact_inb, rel=1e-7)
+    assert fit["std"] == pytest.approx(exact_std, rel=1e-7)
+    assert abs(fit["inb"] - fit["std"]) > 1e-6
+
+
+def test_inbreeding_columns_are_appended_and_validated(tmp_path):
+    prefix, G, y, covs, iid, cov_path = _simulate(tmp_path, ncov=2, missing=0.0)
+    annot, A = _annot(tmp_path, G.shape[1])
+    compute_relative_pair_totals(prefix, str(tmp_path / "pheno.txt"), str(tmp_path / "tot"), pairs=str(tmp_path / "pairs.txt"),
+                                 covar=cov_path, annot=annot, inbreeding=True)
+    X, yy, p, n_eff = _projected(G, y, covs)
+    _ols_sumstats(tmp_path / "ss.tsv", X, yy, p)
+    tab = pd.read_csv(tmp_path / "tot.rel_m.tsv", sep="\t").iloc[0]
+    append_rel_m_to_sumstats(str(tmp_path / "ss.tsv"), str(tmp_path / "tot.rel_m.tsv"), "y", str(tmp_path / "a.tsv"))
+    a = pd.read_csv(tmp_path / "a.tsv", sep="\t")
+    for col in ("REL_S", "REL_LAMBDA", "REL_DIAG"):
+        np.testing.assert_allclose(a[col].to_numpy(), tab[col])
+    assert not any(c.startswith("REL_DIAG_") for c in a.columns)
+    append_rel_m_to_sumstats(str(tmp_path / "ss.tsv"), str(tmp_path / "tot.rel_m.tsv"), "y", str(tmp_path / "b.tsv"),
+                             annot=annot)
+    b = pd.read_csv(tmp_path / "b.tsv", sep="\t")
+    cls = ["lowmaf", "highmaf"]
+    np.testing.assert_allclose(b.REL_S.to_numpy(), A @ np.array([tab[f"REL_S_{c}"] for c in cls]))
+    for d in cls:
+        np.testing.assert_allclose(b[f"REL_DIAG_{d}"].to_numpy(), A @ np.array([tab[f"REL_DIAG_{c}__{d}"] for c in cls]))
+    ss = Sumstats.from_file(str(tmp_path / "b.tsv"), name="b")
+    assert set(ss.rel_diag) == {"REL_S", "REL_LAMBDA", "REL_DIAG", "REL_DIAG_lowmaf", "REL_DIAG_highmaf"}
+    b.drop(columns=["REL_LAMBDA"]).to_csv(tmp_path / "c.tsv", sep="\t", index=False)
+    with pytest.raises(RuntimeError, match="some but not all"):
+        Sumstats.from_file(str(tmp_path / "c.tsv"), name="c")
+    b.drop(columns=["REL_M"]).to_csv(tmp_path / "d.tsv", sep="\t", index=False)
+    with pytest.raises(RuntimeError, match="no REL_M|need REL_M"):
+        Sumstats.from_file(str(tmp_path / "d.tsv"), name="d")

@@ -120,6 +120,46 @@ itself, as it adds `COV_RANK`. Users then fit them with the related pairs
 excluded and need nothing else, unless they compute LD scores in the same
 sample.
 
+## Inbreeding (optional)
+
+Each individual is also paired with themselves in the h² estimating equation,
+with the weight `K_ii`, the diagonal of the GRM. Inbred individuals have a
+larger `K_ii`. When their residual variance is also larger, for example because
+the effects of untagged causal variants grow with inbreeding, the fit credits
+that excess to the SNPs. This happens in related and unrelated samples alike.
+Add `--inbreeding` to `moments` to leave these diagonal terms out of the
+equation as well, in the same way as the related pairs:
+
+```bash
+summit relatives moments --geno study --pheno phenotypes.txt --covar covariates.txt \
+  --pairs pairs.tsv --kinship-col RELATEDNESS --kinship-min 0.0442 --inbreeding \
+  --out results/relmoments
+```
+
+Nothing else changes. `append` copies three more values (`REL_S`, `REL_LAMBDA`
+and `REL_DIAG`, plus one `REL_DIAG_<class>` column per class with `--annot`),
+and `summit --h2` uses them whenever they are present. The log then says
+"diagonal terms left out of the estimating equations". `REL_S` depends on the
+phenotype; `REL_LAMBDA` and `REL_DIAG` depend only on the genotypes, the
+covariates and the related pairs. The option also removes the small bias from
+the related pairs' leverage on the covariates.
+
+With LD scores computed exactly in the GWAS sample, the estimate equals the
+individual-level method-of-moments estimate whose first equation uses only
+pairs of different, unrelated individuals (tested to a relative difference of
+1e-7). The cost is precision, because the diagonal terms also carry a little
+information. In exact calculations for UK Biobank cohorts of 4,000 to 9,000
+people (South Asian and African ancestry, 10 to 20 PCs), the standard deviation
+of the estimate was 2% to 3% larger, and in a European cohort of 15,000 less
+than 0.1% larger. The bias it removed in these cohorts was a few percent of the
+standard error, about the same as this cost. The cost falls with sample size,
+so the option is most useful in large samples with much inbreeding. The extra genotype pass projects the genotypes of everyone in each
+complete-case sample, which adds roughly one GWAS-sized projection per sample.
+Genetic correlation (`--rg`) keeps the diagonal terms and says so in its log.
+A mean shift with inbreeding (inbreeding depression) is handled by adding an
+inbreeding coefficient to the covariates of the GWAS, `moments` and the LD
+scores.
+
 ## LD scores
 
 | LD scores | Use when | Extra step |

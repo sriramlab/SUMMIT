@@ -440,6 +440,10 @@ class Sumcore:
         )
 
         rel_m12 = self._related_pair_cross_moment(matched1, matched2)
+        if self.log is not None and any(getattr(getattr(x, "sumstats", x), "rel_diag", None) is not None
+                                        for x in (aligned1, aligned2)):
+            self.log._log("[relatives] the --inbreeding values (REL_S, REL_LAMBDA, REL_DIAG) are used by --h2 only; --rg "
+                          "excludes the related pairs and keeps the diagonal terms, for both traits and their covariance.")
         if rel_m12 is not None and tv.ldscores_rel is not None:
             tv = tv.pair_excluded()
             if self.log is not None:

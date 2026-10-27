@@ -278,6 +278,46 @@ class Sumrhe:
             self.log._log(note)
         return has_rel_m and has_ld_rel
 
+    def _diagonal_inputs(self, ss, aligned, keep_mask, full_axis: bool):
+        """Per-SNP `--inbreeding` values (REL_S, REL_LAMBDA, REL_DIAG columns per bin) on the fit's SNP axis, or None.
+
+        Bins are matched to REL_DIAG columns by name: one bin uses REL_DIAG, several bins REL_DIAG_<bin> (the class
+        names of the annotation given to `summit relatives moments` and `append`)."""
+        rd = getattr(ss, "rel_diag", None)
+        if rd is None:
+            return None
+        if self.weight_mode != "he":
+            raise ValueError("The --inbreeding values (REL_S, REL_LAMBDA, REL_DIAG) need the default HE weighting.")
+        names = [str(x) for x in np.asarray(self.trace.annot_header).ravel()]
+        if len(names) == 1:
+            dcols = ["REL_DIAG"]
+        else:
+            dcols = [f"REL_DIAG_{nm}" for nm in names]
+            missing = [c for c in dcols if c not in rd]
+            if missing:
+                raise ValueError(
+                    f"[{ss.name}] has --inbreeding values but no {missing[0]} column (and {len(missing) - 1} more): run "
+                    "`summit relatives moments --inbreeding --annot` and `append --annot` with the annotation of this fit "
+                    f"(bins: {names[:4]}{'...' if len(names) > 4 else ''}).")
+        pos = np.asarray(aligned.pos_on_trace[keep_mask], dtype=np.int64)
+        M = int(self.trace.nsnps)
+
+        def vec(col):
+            v = ss.rel_diag[col][pos]
+            if not full_axis:
+                return v
+            out = np.full(M, np.nan, dtype=np.float64)
+            out[keep_mask] = v
+            return out
+
+        diag = {"REL_S": vec("REL_S"), "REL_LAMBDA": vec("REL_LAMBDA"),
+                "REL_DIAG": np.column_stack([vec(c) for c in dcols])}
+        if self.log is not None:
+            self.log._log(f"[relatives] [{ss.name}] diagonal terms left out of the estimating equations (--inbreeding): "
+                          f"REL_S={np.nanmean(diag['REL_S']):.6g}, REL_LAMBDA={np.nanmean(diag['REL_LAMBDA']):.6g}, "
+                          f"REL_DIAG={np.nanmean(diag['REL_DIAG']):.6g} (means over SNPs).")
+        return diag
+
     def _fit_one(self, path: str, phen_name: str, cov_rank_value):
         ss = Sumstats.from_file(
             path,
@@ -321,6 +361,7 @@ class Sumrhe:
                 full_struct=ref_struct,
                 adjust_delta=self.adjust_delta,
                 full_mass=self.full_mass,
+                diag=self._diagonal_inputs(ss, aligned, keep_mask, full_axis=True),
             )
         else:
             tv = self.trace.materialize_view(keep_mask)
@@ -344,6 +385,8 @@ class Sumrhe:
             )
             jk = JackknifeDesign.from_trace_view(tv, self.jackknife_spec, log=self.log)
             if self.weight_mode == "ldsc":
+                if getattr(ss, "rel_diag", None) is not None:
+                    raise ValueError("The --inbreeding values (REL_S, REL_LAMBDA, REL_DIAG) need the default HE weighting.")
                 prepared = prepare_h2_ldsc(tv, matched, jk)
             else:
                 prepared = prepare_h2(
@@ -351,6 +394,7 @@ class Sumrhe:
                     matched,
                     jk,
                     adjust_delta=self.adjust_delta,
+                    diag=self._diagonal_inputs(ss, aligned, keep_mask, full_axis=False),
                 )
         fit = fit_h2(
             prepared,
