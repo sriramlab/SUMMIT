@@ -71,7 +71,11 @@ the covariates, intercept included); the second equation is unchanged. Per pheno
 REL_S_k = sum_i (K~_k,ii - 1) y_i^2 / N_eff, and per sample REL_LAMBDA_k = lambda_k and REL_DIAG_kl = D_kl - N_eff,
 which the same genotype pass computes from the projected genotypes of everyone in the sample. `append` writes them as
 constant columns (REL_S, REL_LAMBDA, REL_DIAG and, with --annot, REL_DIAG_<class>), and `summit --h2` uses them when
-present.
+present. Constant columns give exact point estimates, but every jackknife replicate then keeps the deleted SNPs'
+diagonal terms. `--per-snp --inbreeding` writes per-SNP values whose V-weighted means over any set of SNPs are that set's
+values: REL_S_j = sum_i x_ij^2 y_i^2 / N_eff - 1 and REL_LAMBDA_j = sum_i x_ij^2 H_ii + sum_{ordered pairs} x_ij x_i'j H_ii'
+exactly, and REL_DIAG_j,l = sum_i x_ij^2 K~_l,ii - N_eff (a second genotype pass), which pairs the set's kernel with the
+whole-genome one; the fit forms each replicate's D_kl from it to first order in the deleted SNPs (h2core).
 """
 from __future__ import annotations
 
@@ -243,6 +247,17 @@ def _pair_rows_block(X: np.ndarray, C, n_eff: float, rows: np.ndarray):
     with np.errstate(divide="ignore", invalid="ignore"):
         r1 = np.where(ok & (raw > 0.0), np.minimum(1.0, ss / raw), 0.0)
     return Xr, r1
+
+
+def _projected_everyone(X: np.ndarray, C, n_eff: float) -> np.ndarray:
+    """Projected genotypes of everyone in the sample, from centered genotypes X, each column scaled to sum of squares n_eff
+    (zero for monomorphic or fully explained SNPs)."""
+    Xp = X - C @ (C.T @ X) if C is not None and C.shape[1] else X.copy()
+    ssq = np.einsum("ij,ij->j", Xp, Xp)
+    ok = ssq > 1e-10
+    Xp[:, ok] *= np.sqrt(n_eff / ssq[ok])[None, :]
+    Xp[:, ~ok] = 0.0
+    return Xp
 
 
 def _auto_step(step_size, n: int) -> int:
@@ -604,6 +619,10 @@ def compute_relative_pair_moments(
         A, classes = np.zeros((M, 0)), []
 
     rel_m = np.zeros((M, len(pheno_cols)), dtype=np.float64)
+    if inbreeding:
+        rel_s = np.zeros((M, len(pheno_cols)), dtype=np.float64)
+        rel_lam = np.zeros((M, len(pheno_cols)), dtype=np.float64)
+        rel_dg = np.zeros((M, len(pheno_cols), 1 + len(classes)), dtype=np.float64)
     rel_m12: dict[tuple[int, int], np.ndarray] = {}
     summary = {"nsnps": int(M), "phenotypes": {}, "npairs_listed": int(rp.npairs), "classes": classes,
                "inbreeding": bool(inbreeding)}
@@ -638,6 +657,8 @@ def compute_relative_pair_moments(
         if inbreeding:
             D = np.zeros((n, Aw.shape[1]))
             W = np.zeros((a.size, Aw.shape[1]))
+            Hii = np.full(n, 1.0 / n) + ((C * C).sum(axis=1) if p else 0.0)
+            Hab = np.full(a.size, 1.0 / n) + ((C[a] * C[b]).sum(axis=1) if p else 0.0)
         step = _auto_step(step_size, n)
         nblk = -(-M // step)
         for ib, s in enumerate(range(0, M, step)):
@@ -652,12 +673,11 @@ def compute_relative_pair_moments(
             if inbreeding:                                        # projected genotypes of everyone in the sample
                 wblk = (r1 * adj)[:, None] * Aw[s:e]
                 W += G @ wblk
-                Xp = X - C @ (C.T @ X) if p else X.copy()
-                ssq = np.einsum("ij,ij->j", Xp, Xp)
-                ok = ssq > 1e-10
-                Xp[:, ok] *= np.sqrt(n_eff / ssq[ok])[None, :]
-                Xp[:, ~ok] = 0.0
-                D += (Xp * Xp) @ wblk
+                Xp2 = _projected_everyone(X, C, n_eff) ** 2
+                D += Xp2 @ wblk
+                # per-SNP diagonal values (their V-weighted class means are REL_S and REL_LAMBDA)
+                rel_s[s:e, ks] = (Xp2.T @ (Y * Y)) / n_eff - 1.0
+                rel_lam[s:e, ks] = (Xp2.T @ Hii + 2.0 * (G.T @ Hab))[:, None]
             if xpairs:
                 blk = kappa * (G.T @ wx)
                 for c_, (t1, t2) in enumerate(xpairs):
@@ -667,6 +687,13 @@ def compute_relative_pair_moments(
         inb = _diagonal_terms(D, W, vsum, C, n, n_eff, a, b, Y, len(classes)) if inbreeding else None
         if inb is not None:
             _log_diagonal_terms(_log, n, inb)
+            # second pass: per-SNP REL_DIAG against the whole-genome diagonals (all SNPs and each class); its V-weighted
+            # mean over class k is REL_DIAG_kl, and over a jackknife replicate it gives the replicate's value to first order
+            Kd = D / np.where(vsum > 0, vsum, np.nan)[None, :]
+            for s in range(0, M, step):
+                e = min(M, s + step)
+                X = _center_impute(np.asarray(bed.read(index=np.s_[idx, s:e], dtype="float64")))
+                rel_dg[s:e, ks, :] = ((_projected_everyone(X, C, n_eff) ** 2).T @ Kd - n_eff)[:, None, :]
         for t, k in enumerate(ks):
             vals = (wcols.T @ rel_m[:, k]) / np.where(vsum > 0, vsum, np.nan)
             rows_out.append([pheno_cols[k], n, p, int(a.size), *vals.tolist(), *(inb["row"](t) if inb is not None else [])])
@@ -685,6 +712,13 @@ def compute_relative_pair_moments(
     table = bim[["CHR", "SNP", "BP", "A1", "A2"]].copy()
     for k, name in enumerate(pheno_cols):
         table[f"REL_M_{name}"] = rel_m[:, k]
+    if inbreeding:
+        for k, name in enumerate(pheno_cols):
+            table[f"REL_S_{name}"] = rel_s[:, k]
+            table[f"REL_LAMBDA_{name}"] = rel_lam[:, k]
+            table[f"REL_DIAG_{name}"] = rel_dg[:, k, 0]
+            for c, cls in enumerate(classes):
+                table[f"REL_DIAG_{name}__{cls}"] = rel_dg[:, k, 1 + c]
     if rel_m12:
         summary["cross"] = {}
         for (k1, k2), v12 in rel_m12.items():
@@ -779,7 +813,20 @@ def append_rel_m_to_sumstats(sumstats: str, rel_table: str, pheno: str, out: str
         classes, A, inside = _annot_or_none(annot, ss[snp_col], tcols, lambda c: (f"REL_M_{c}",))
         out_df["REL_M"] = _class_column(row, "REL_M", classes, A, inside)
         missing = 0
-    if row is not None and "REL_S" in tcols:                     # written by `moments --inbreeding`
+    snp_diag = []
+    if per_snp:
+        cols = pd.read_csv(rel_table, sep="\t", nrows=0).columns
+        snp_diag = [c for c in cols if c in (f"REL_S_{pheno}", f"REL_LAMBDA_{pheno}", f"REL_DIAG_{pheno}")
+                    or c.startswith(f"REL_DIAG_{pheno}__")]
+    if snp_diag:                                                 # per-SNP values of `moments --per-snp --inbreeding`
+        d = pd.read_csv(rel_table, sep="\t", usecols=["SNP"] + snp_diag, dtype={"SNP": str})
+        names = {f"REL_S_{pheno}": "REL_S", f"REL_LAMBDA_{pheno}": "REL_LAMBDA", f"REL_DIAG_{pheno}": "REL_DIAG"}
+        names.update({c: "REL_DIAG_" + c[len(f"REL_DIAG_{pheno}__"):] for c in snp_diag if c.startswith(f"REL_DIAG_{pheno}__")})
+        d = d.rename(columns=names)
+        d = d.set_index("SNP").reindex(out_df[snp_col].astype(str).to_numpy())
+        for c in d.columns:
+            out_df[c] = d[c].to_numpy()
+    elif row is not None and "REL_S" in tcols:                   # written by `moments --inbreeding`
         _add_diagonal_columns(out_df, row, tcols, out_df[snp_col], annot)
     out_df.to_csv(out, sep="\t", index=False, float_format="%.12g")
     return missing
