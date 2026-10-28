@@ -618,6 +618,10 @@ def build_parser() -> argparse.ArgumentParser:
         "  * 'chr:d:R'           : random R delete-d replicates\n"
         "  * 'chr:d:R:seed'      : random R delete-d replicates with fixed seed\n"
     ))
+    jackknife.add_argument("--jk-traces", default=None, type=str,
+                        help=("h2: PREFIX of `summit relatives traces`; rescales the jackknife SE by sqrt(AV / E[V_jk]), the "
+                              "model's ratio of the estimate's variance to the jackknife's expectation (covariance between "
+                              "blocks). Writes h2_se (rescaled), h2_se_jk and jk_factor."))
     jackknife.add_argument("--jack-mode", default="mean", type=str,
                         choices=["mean", "median", "full"],
                         help="Center used in jackknife SE calculation.")
@@ -2063,6 +2067,7 @@ def _dispatch_h2(args, log):
         ldsc_irwls_iters=args.ldsc_irwls_iters,
         ldsc_irwls_tol=args.ldsc_irwls_tol,
         snp_var_weights=not getattr(args, "snp_var_weights_off", False),
+        jk_traces=getattr(args, "jk_traces", None),
     )
     sums._run()
     sums._logoff()

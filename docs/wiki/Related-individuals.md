@@ -170,6 +170,51 @@ A mean shift with inbreeding (inbreeding depression) is handled by adding an
 inbreeding coefficient to the covariates of the GWAS, `moments` and the LD
 scores.
 
+The values from the default `moments` run are one number per phenotype (and
+class), which gives exact point estimates but leaves the deleted block's
+diagonal terms in every jackknife replicate. `moments --per-snp --inbreeding`
+writes per-SNP values instead (one more genotype pass), `append` copies them,
+and each replicate then uses its own diagonal terms (exactly for `REL_S` and
+`REL_LAMBDA`, to first order in the deleted SNPs for `REL_DIAG`). In the test
+data the jackknife SE then matched the exact replicate-wise SE to within 0.5%,
+against 1% to 20% with one value per phenotype.
+
+## Rescaled jackknife standard errors
+
+The block jackknife cannot see covariance between blocks: long-range LD in
+admixed samples, and the self-pair terms when self-relatedness tracks ancestry.
+Under the fitted model both the variance of the estimate (`AV`) and the
+expectation of the jackknife variance (`E[V_jk]`) are quadratic forms in
+genotype-only traces of the jackknife blocks, so SUMMIT can rescale the
+jackknife:
+
+    SE = SE_jk * sqrt(AV / E[V_jk])
+
+The jackknife keeps the variance it sees but the model misses (large-effect
+loci, heavy-tailed traits); the factor adds what it cannot see. The traces come
+from one genotype pass on the GWAS genotypes and samples:
+
+```bash
+summit relatives traces --geno study --covar covariates.txt --pairs pairs.tsv \
+  --kinship-col RELATEDNESS --kinship-min 0.0442 [--annot mafld8.annot] [--inbreeding] --out results/traces
+summit --h2 study.with_rel_m.tsv --ldscores study.gw.ldscore.gz [--annot ...] --jk-traces results/traces --out results/h2
+```
+
+Use the fit's annotation (one class per SNP) for partitioned fits; a
+one-component fit can use traces with or without classes. `--inbreeding` adds
+the traces without self-pairs, used automatically for fits with the
+`moments --inbreeding` values. Cells are SUMMIT's 200 contiguous blocks split by
+chromosome, so the same traces serve `--njack 200` and `--njack chr`; when the
+fit's SNPs differ from the trace SNPs, cells are mapped to jackknife units by
+SNP and the log gives the share of mismatched SNPs. The results table then has
+`h2_se` (rescaled), `h2_se_jk` (the block jackknife) and `jk_factor`. The
+pass holds the projected genotypes in memory (4 bytes per sample and SNP); with
+100 probes it took about 5 minutes for 9,600 people and 406,000 SNPs (8 minutes
+for 12,000 and 454,000) and about 15 to 20 minutes with 8 classes and 60
+probes, on 16 cores. In UK Biobank simulations the rescaled SE was 0.93 to 1.06
+of the empirical SD (one component) and 0.98 to 1.05 (8 classes) in every
+cohort, against 0.68 for the block jackknife in a wide African-ancestry group.
+
 ## LD scores
 
 | LD scores | Use when | Extra step |

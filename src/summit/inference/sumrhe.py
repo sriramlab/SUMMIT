@@ -8,6 +8,7 @@ import numpy as np
 
 from .. import utils
 from .jackknife import JackknifeSpec, JackknifeDesign
+from .jktraces import jackknife_rescaling, load_jk_traces
 from .trace import Trace
 from ..sumstats.sumstats import Sumstats
 from .h2core import (
@@ -69,6 +70,7 @@ class Sumrhe:
         ldsc_irwls_iters: int = 3,
         ldsc_irwls_tol: float = 0.0,
         snp_var_weights: bool = True,
+        jk_traces: str | None = None,
     ):
 
         self.log = log
@@ -192,6 +194,17 @@ class Sumrhe:
 
         self.results = []
         self.nsamp = []
+        self.jk_traces = None
+        self.jk_rescale = []
+        self._last_jk = None
+        if jk_traces is not None:
+            if self.weight_mode != "he":
+                raise ValueError("--jk-traces needs the default HE weighting.")
+            self.jk_traces = load_jk_traces(jk_traces)
+            if self.log is not None:
+                m = self.jk_traces["meta"]
+                self.log._log(f"[jk-traces] {jk_traces}: n={m['n']}, {m['M']} SNPs, {m['probes']} probes, classes "
+                              f"{m['classes'] or ['(one)']}, self-pair-free values: {m['inbreeding']}.")
 
         self.out = out
         self.annot_header = self.trace.annot_header
@@ -200,6 +213,7 @@ class Sumrhe:
     def _run(self):
         self.results = []
         self.nsamp = []
+        self.jk_rescale = []
 
         self._ensure_reference_precompute()
 
@@ -210,6 +224,7 @@ class Sumrhe:
         )):
             fit = self._fit_one(path, phen_name, cov_rank_value)
             self.nsamp.append(float(fit.prepared.matched.nsamp))
+            self.jk_rescale.append(self._last_jk)
             if self.npheno > 1:
                 # Directory/batch h2 mode should stream phenotypes. H2Fit.prepared
                 # holds the heavy per-SNP TraceView/MatchedSumstats/H2Prepared
@@ -218,9 +233,12 @@ class Sumrhe:
                 object.__setattr__(fit, "prepared", None)
             self.results.append(fit)
             if self.log is not None:
+                jk = self._last_jk
+                rescaled = (f" (rescaled jackknife; block jackknife SE={fit.h2[-1, 1]:.6g})"
+                            if jk is not None and np.isfinite(jk["factor"]) else "")
                 self.log._log(
                     f"[h2] completed phenotype {i + 1}/{self.npheno} {phen_name}: "
-                    f"h2={fit.h2[-1, 0]:.6g} SE={fit.h2[-1, 1]:.6g}"
+                    f"h2={fit.h2[-1, 0]:.6g} SE={self._total_se(fit, jk):.6g}{rescaled}"
                 )
             self._write_results_table()
             if self.npheno > 1:
@@ -394,6 +412,26 @@ class Sumrhe:
                 f"iterations={info.get('irwls_iters', 'NA')}."
             )
 
+        self._last_jk = None
+        if self.jk_traces is not None:
+            p = fit.prepared
+            axis_snps = self.trace.snps if self.jackknife_spec.mode == "chr" else tv.snps
+            sol = np.linalg.solve(p.lhs[-1], p.rhs[-1])
+            K = int(self.nbins)
+            self._last_jk = jackknife_rescaling(
+                self.jk_traces,
+                axis_snps=axis_snps,
+                unit_id=p.jackknife.unit_id,
+                D=p.jackknife.D,
+                unit_sizes=p.unit_sizes,
+                bin_names=[str(x) for x in np.asarray(self.trace.annot_header).ravel()],
+                sigma=sol[:K],
+                sigma_e=sol[K],
+                noself=getattr(ss, "rel_diag", None) is not None,
+                log=self.log,
+                label=f"[{phen_name}]",
+            )
+
         if hasattr(ss, "log_chisq_diagnostics"):
             ss.log_chisq_diagnostics(
                 matched,
@@ -474,6 +512,14 @@ class Sumrhe:
             clip_threshold=clip_threshold,
         )
 
+    @staticmethod
+    def _total_se(fit, jk):
+        """Total-h2 SE: the jackknife SE, rescaled when --jk-traces gave a factor."""
+        se = float(fit.h2[-1, 1])
+        if jk is None or not np.isfinite(jk["factor"]):
+            return se
+        return se * float(np.sqrt(jk["factor"]))
+
     def _write_results_table(self):
         if self.out is None or not self.results:
             return
@@ -483,6 +529,8 @@ class Sumrhe:
         k = int(self.nbins)
 
         header = ["phen_index", "phen", "num_bins", "h2", "h2_se"]
+        if self.jk_traces is not None:
+            header.extend(["h2_se_jk", "jk_factor"])
         header.extend([f"h2bin_{j}" for j in range(k)])
         header.extend([f"h2bin_se_{j}" for j in range(k)])
         header.extend([f"enrichment_{j}" for j in range(k)])
@@ -494,14 +542,17 @@ class Sumrhe:
             fout.write("\t".join(header) + "\n")
             for i, fit in enumerate(self.results):
                 h2tot = fit.h2[-1, 0]
-                h2totse = fit.h2[-1, 1]
+                jk = self.jk_rescale[i] if i < len(self.jk_rescale) else None
                 row = [
                     str(i),
                     str(self.phen_names[i] if i < len(self.phen_names) else i),
                     str(k),
                     format(float(h2tot), ".12g"),
-                    format(float(h2totse), ".12g"),
+                    format(self._total_se(fit, jk), ".12g"),
                 ]
+                if self.jk_traces is not None:
+                    row.extend([format(float(fit.h2[-1, 1]), ".12g"),
+                                format(float(jk["factor"]) if jk is not None else float("nan"), ".12g")])
                 row.extend(format(float(fit.h2[j, 0]), ".12g") for j in range(k))
                 row.extend(format(float(fit.h2[j, 1]), ".12g") for j in range(k))
                 row.extend(format(float(fit.enrich[j, 0]), ".12g") for j in range(k))

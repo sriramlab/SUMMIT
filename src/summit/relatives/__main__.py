@@ -3,6 +3,8 @@
   summit relatives moments --geno PREFIX --pheno FILE --pairs FILE [--covar FILE] [--annot FILE] [--inbreeding] --out PREFIX
   summit relatives append  --sumstats FILE --rel PREFIX.rel_m.tsv --pheno NAME [--annot FILE] --out FILE
   summit relatives cross-m12 --rel PREFIX.rel_m12.tsv --pheno1 A --pheno2 B [--annot FILE] --out FILE   (summit --rg --rel-m12)
+  summit relatives traces  --geno PREFIX [--covar FILE] [--pairs FILE] [--annot FILE] [--inbreeding] --out PREFIX
+                                                                                        (summit --h2 --jk-traces)
 
 By default `moments` writes one REL_M value per phenotype (and per class of --annot), the V-weighted mean of the
 per-SNP related-pair moments, and `append` writes it as a constant REL_M column. `--per-snp` writes the exact per-SNP
@@ -17,6 +19,7 @@ import sys
 from ..logger import Logger
 from .moments import (append_rel_m_to_sumstats, compute_relative_pair_moments, compute_relative_pair_totals,
                       extract_rel_m12)
+from .traces import compute_jackknife_traces
 
 
 def main(argv=None):
@@ -62,6 +65,24 @@ def main(argv=None):
     x.add_argument("--annot", default=None,
                    help="with PREFIX.rel_m12.tsv: the annotation given to `moments`, for per-class values (partitioned rg)")
     x.add_argument("--out", required=True)
+    t = sub.add_parser("traces", help="genotype-only block-pair traces for the rescaled jackknife (summit --h2 --jk-traces)")
+    t.add_argument("--geno", required=True, help="PLINK 1 BED prefix or .bed path (the GWAS and LD-score genotypes)")
+    t.add_argument("--covar", default=None, help="the GWAS covariates (FID IID ...), without an intercept column")
+    t.add_argument("--pairs", default=None, help="related pairs left out of the first equation (as for `moments`)")
+    t.add_argument("--kinship-col", default=None)
+    t.add_argument("--kinship-min", type=float, default=None)
+    t.add_argument("--no-closure", action="store_true")
+    t.add_argument("--annot", default=None, help="the partitioning annotation of the fits (every SNP in one class)")
+    t.add_argument("--inbreeding", action="store_true",
+                   help="also the traces without self-pairs, for fits with the `moments --inbreeding` values")
+    t.add_argument("--keep", default=None, help="FID IID of the samples to use (default: all with complete covariates)")
+    t.add_argument("--nblocks", type=int, default=200,
+                   help="SUMMIT's contiguous jackknife blocks on this SNP axis (cells also split by chromosome, so "
+                        "--njack chr fits can use the same traces)")
+    t.add_argument("--probes", type=int, default=100, help="Rademacher probes (default 100)")
+    t.add_argument("--seed", type=int, default=20261029)
+    t.add_argument("--step-size", type=int, default=None)
+    t.add_argument("--out", required=True)
     args = ap.parse_args(argv)
 
     if args.cmd == "moments":
@@ -79,6 +100,14 @@ def main(argv=None):
             log._log(f"[relatives] {name}: n={info['n']} pairs={info['pairs_used']} REL_M={info['rel_m']:.6g}")
         written = [args.out + ".rel_m.tsv"] + ([args.out + ".rel_m12.tsv"] if args.cross else [])
         log._log("[relatives] wrote " + ", ".join(written + ([args.out + ".tsv.gz"] if args.per_snp else [])))
+    elif args.cmd == "traces":
+        log = Logger()
+        log.attach_file(args.out + ".jktraces.log", mode="w")
+        compute_jackknife_traces(
+            args.geno, args.out, covar=args.covar, pairs=args.pairs, kinship_col=args.kinship_col,
+            kinship_min=args.kinship_min, closure=not args.no_closure, annot=args.annot, inbreeding=args.inbreeding,
+            keep=args.keep, nblocks=args.nblocks, probes=args.probes, seed=args.seed, step_size=args.step_size, log=log,
+        )
     elif args.cmd == "append":
         missing = append_rel_m_to_sumstats(args.sumstats, args.rel, args.pheno, args.out, annot=args.annot)
         print(f"wrote {args.out}; SNPs without REL_M: {missing}")
