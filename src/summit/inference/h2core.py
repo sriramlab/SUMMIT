@@ -706,39 +706,6 @@ def h2_diagonal_terms(A: np.ndarray, active_mask: np.ndarray, diag: dict | None)
     return {"c_s": c_s, "lam": lam, "s": 0.5 * (S + S.T)}
 
 
-def h2_diagonal_unit_sums(A: np.ndarray, jackknife, active_mask: np.ndarray, diag: dict | None) -> dict | None:
-    """Jackknife-unit sums over the active SNPs of A-weighted `summit relatives moments --inbreeding` values: REL_S and
-    REL_LAMBDA (U x K) and the REL_DIAG columns (U x K x K). Dividing replicate sums by the replicate's A mass gives each
-    replicate's values: exact for REL_S and REL_LAMBDA, and to first order for REL_DIAG (see _finish_prepare_h2). With
-    values constant within classes the replicate values equal the full-sample ones."""
-    if diag is None:
-        return None
-    A = np.asarray(A, dtype=np.float64)
-    act = np.asarray(active_mask, dtype=bool)
-    U, K = int(jackknife.nunit), int(A.shape[1])
-    if np.any(~np.isfinite(A[act].sum(axis=0)) | (A[act].sum(axis=0) <= 0.0)):
-        raise RuntimeError("A bin has no weight; the --inbreeding values cannot be assigned to it.")
-    D = np.asarray(diag["REL_DIAG"], dtype=np.float64)
-    D = D.reshape(-1, 1) if D.ndim == 1 else D
-    if D.shape != (A.shape[0], K):
-        raise ValueError(f"REL_DIAG must have one column per bin ({K}); got {D.shape[1]}.")
-    vs = np.where(act, np.asarray(diag["REL_S"], dtype=np.float64), 0.0)
-    vl = np.where(act, np.asarray(diag["REL_LAMBDA"], dtype=np.float64), 0.0)
-    D = np.where(act[:, None], D, 0.0)
-    Aa = np.where(act[:, None], A, 0.0)
-    out = {"s": np.zeros((U, K)), "lam": np.zeros((U, K)), "D": np.zeros((U, K, K))}
-    uid = np.asarray(jackknife.unit_id, dtype=np.int64)
-    for u in range(U):
-        r = uid == u
-        if not np.any(r & act):
-            continue
-        Au = Aa[r]
-        out["s"][u] = Au.T @ vs[r]
-        out["lam"][u] = Au.T @ vl[r]
-        out["D"][u] = Au.T @ D[r]
-    return out
-
-
 def _finish_prepare_h2(
     *,
     trace_view,
@@ -817,18 +784,9 @@ def _finish_prepare_h2(
         # Diagonal terms left out of the first equations (`summit relatives moments --inbreeding`): with the kernels
         # K~_k (trace n_scale), sum_l [tr(K~u_k K~u_l) - D_kl] s_l + lambda_k s_e = y'K~u_k y - sum_i K~_k,ii y_i^2,
         # D_kl = REL_DIAG_kl + n_scale and sum_i K~_k,ii y_i^2 = n_scale (1 + REL_S_k); the last equation is unchanged.
-        # Each replicate uses its own SNPs: REL_S and REL_LAMBDA are linear in the SNPs, so replicate means are exact;
-        # the per-SNP REL_DIAG pairs a replicate's kernel with the whole-genome one, S_kl = sum_i K~(r)_k,ii K~_l,ii, and
-        # D(r) = S + S' - S_full is exact to first order in the deleted SNPs (constant values give the full-sample D).
-        with np.errstate(divide="ignore", invalid="ignore"):
-            c_s = _stack_delete_replicates(diag_terms["s"].sum(axis=0), diag_terms["s"], jackknife.D) / Ak_rep
-            lam = _stack_delete_replicates(diag_terms["lam"].sum(axis=0), diag_terms["lam"], jackknife.D) / Ak_rep
-            S = _stack_delete_replicates(diag_terms["D"].sum(axis=0), diag_terms["D"], jackknife.D) / Ak_rep[:, :, None]
-        Dd = S + np.transpose(S, (0, 2, 1)) - S[-1][None, :, :]
-        Dd = 0.5 * (Dd + np.transpose(Dd, (0, 2, 1)))
-        lhs[:, :K, :K] -= Dd + n_scale
-        lhs[:, :K, K] = lam
-        rhs[:, :K] -= n_scale * (1.0 + c_s)
+        lhs[:, :K, :K] -= (np.asarray(diag_terms["s"], dtype=np.float64) + n_scale)[None, :, :]
+        lhs[:, :K, K] = np.asarray(diag_terms["lam"], dtype=np.float64)[None, :]
+        rhs[:, :K] -= (n_scale * (1.0 + np.asarray(diag_terms["c_s"], dtype=np.float64)))[None, :]
 
     bad_bins = np.flatnonzero(~np.isfinite(Ak_rep[-1]) | (Ak_rep[-1] <= 0.0))
     if bad_bins.size:
@@ -936,7 +894,7 @@ def prepare_h2(
     Ay_unit = _compute_h2_ay_unit(A, jackknife, y, active_mask)
     has_overlap = _has_overlapping_annotations(A, active_mask=active_mask)
     mass = _h2_mass_for_active(trace_view, jackknife, active_mask, None, False)
-    diag_terms = h2_diagonal_unit_sums(A, jackknife, active_mask, diag)
+    diag_terms = h2_diagonal_terms(A, active_mask, diag)
 
     return _finish_prepare_h2(
         trace_view=trace_view,
@@ -1041,7 +999,7 @@ def prepare_h2_reference_axis(
     Ay_unit = _compute_h2_ay_unit(A, jackknife, y, active_mask)
     has_overlap = _has_overlapping_annotations(A, active_mask=active_mask)
     mass = _h2_mass_for_active(trace_view, jackknife, active_mask, full_mass, use_drop_correction)
-    diag_terms = h2_diagonal_unit_sums(A, jackknife, active_mask, diag)
+    diag_terms = h2_diagonal_terms(A, active_mask, diag)
 
     trace_meta = _make_h2_trace_metadata(trace_view)
 

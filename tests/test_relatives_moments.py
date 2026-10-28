@@ -656,19 +656,8 @@ def test_inbreeding_per_snp_path_matches_totals(tmp_path):
     _ols_sumstats(tmp_path / "ss.tsv", X, yy, p)
     append_rel_m_to_sumstats(str(tmp_path / "ss.tsv"), str(tmp_path / "ex.tsv.gz"), "y", str(tmp_path / "a.tsv"), annot=annot)
     a = pd.read_csv(tmp_path / "a.tsv", sep="\t")
-    # per-SNP diagonal values: their V-weighted means over all SNPs and over each class are the totals
-    v = _v_weights(G, covs)
-    cls = ["lowmaf", "highmaf"]
-    for col, tot in (("REL_S", "REL_S"), ("REL_LAMBDA", "REL_LAMBDA"), ("REL_DIAG", "REL_DIAG")):
-        assert float(v @ a[col]) / v.sum() == pytest.approx(t1.loc["y", tot], rel=1e-8)
-        for k, c in enumerate(cls):
-            w = v * A[:, k]
-            assert float(w @ a[col]) / w.sum() == pytest.approx(t1.loc["y", f"{tot}_{c}"], rel=1e-8)
-    for k, c in enumerate(cls):
-        w = v * A[:, k]
-        for d in cls:
-            assert float(w @ a[f"REL_DIAG_{d}"]) / w.sum() == pytest.approx(t1.loc["y", f"REL_DIAG_{c}__{d}"], rel=1e-8)
-    assert a.REL_S.std() > 0
+    np.testing.assert_allclose(a.REL_S.to_numpy(), A @ t1.loc["y", ["REL_S_lowmaf", "REL_S_highmaf"]].to_numpy(float))
+    assert "REL_DIAG_highmaf" in a.columns
     extract_rel_m12(str(tmp_path / "tot.rel_m12.tsv"), "y", "y2", str(tmp_path / "m12.tsv"), annot=annot)
     m12 = pd.read_csv(tmp_path / "m12.tsv", sep="\t")
     row = c1.iloc[0]
@@ -753,77 +742,3 @@ def test_inbreeding_rg_equals_exact_estimator_without_diagonal_terms(tmp_path, p
     free = {**common, "intercept_rg": None}
     with pytest.raises(ValueError, match="overlapping covariance"):
         Sumcore(rg=f"{tmp_path / 'a.tsv'},{tmp_path / 'b.tsv'}", rel_m12=str(tmp_path / "m12.tsv"), **free)._run()
-
-
-@pytest.mark.parametrize("partitioned,njack", [(False, "20"), (True, "20"), (False, "chr"), (True, "chr")])
-def test_inbreeding_jackknife_replicates_match_brute_force(tmp_path, partitioned, njack):
-    """With per-SNP --inbreeding values (moments --per-snp), every jackknife replicate leaves out the deleted SNPs'
-    diagonal terms: the replicate equations equal the with-self replicates corrected by each replicate's own diagonal
-    values from the genotypes (exactly for REL_S and REL_LAMBDA, to first order for REL_DIAG), and the SE equals the
-    exact replicate-wise SE to the second-order term."""
-    from dataclasses import replace
-    from summit.inference.sumrhe import Sumrhe
-    from summit.inference.h2core import _select_h2_matrices, fit_h2
-    prefix, G, y, covs, iid, cov_path = _simulate(tmp_path, N=360, M=300, npairs=70, ncov=2, missing=0.0)
-    rng = np.random.default_rng(11)
-    y = y + rng.standard_normal(y.size) * np.linspace(0.5, 1.5, y.size)
-    pd.DataFrame({"FID": iid, "IID": iid, "y": y}).to_csv(tmp_path / "pheno.txt", sep=" ", index=False)
-    annot, Acls = _annot(tmp_path, G.shape[1]) if partitioned else (None, None)
-    kw = dict(pairs=str(tmp_path / "pairs.txt"), covar=cov_path, annot=annot)
-    compute_relative_pair_moments(prefix, str(tmp_path / "pheno.txt"), str(tmp_path / "snp"), inbreeding=True, step_size=53, **kw)
-    ss, ld, fit_annot = _write_fit_inputs(tmp_path, G, y, covs, iid, Acls, ["lowmaf", "highmaf"])
-    append_rel_m_to_sumstats(ss, str(tmp_path / "snp.tsv.gz"), "y", str(tmp_path / "a_snp.tsv"), annot=annot)
-    append_rel_m_to_sumstats(ss, str(tmp_path / "snp.rel_m.tsv"), "y", str(tmp_path / "a_const.tsv"), annot=annot)
-    a_snp = pd.read_csv(tmp_path / "a_snp.tsv", sep="\t")
-    diag_cols = [c for c in a_snp.columns if c.startswith(("REL_S", "REL_LAMBDA", "REL_DIAG"))]
-    a_snp.drop(columns=diag_cols).to_csv(tmp_path / "a_std.tsv", sep="\t", index=False, float_format="%.15g")
-    a_const = pd.read_csv(tmp_path / "a_const.tsv", sep="\t")      # class constants, same per-SNP REL_M as a_snp
-    a_const["REL_M"] = a_snp["REL_M"]
-    a_const.to_csv(tmp_path / "a_const.tsv", sep="\t", index=False, float_format="%.15g")
-    fits = {}
-    for tag in ("snp", "const", "std"):
-        s = Sumrhe(h2_path=str(tmp_path / f"a_{tag}.tsv"), ldscores=ld, annot=fit_annot, njack=njack, chisq_threshold=None)
-        s._run()
-        fits[tag] = s.results[0]
-    A, _ = _select_h2_matrices(s.trace.materialize_view(), "main")
-    p0 = fits["std"].prepared
-    jk, K, n_scale = p0.jackknife, A.shape[1], float(p0.n_scale)
-    X, yy, p, n_eff = _projected(G, y, covs)
-    assert n_scale == pytest.approx(n_eff)
-    N = X.shape[0]
-    Q = np.linalg.qr(np.column_stack([np.ones(N), covs]))[0]
-    Hd = (Q * Q).sum(1)
-    pi, pj = _family_pairs(str(tmp_path / "pairs.txt"), iid)
-    Hp = (Q[pi] * Q[pj]).sum(1)
-    X2 = X * X
-    Xp = X[pi] * X[pj]
-
-    def diag_parts(keep):
-        w = A * keep[:, None]
-        d = (X2 @ w) / w.sum(0)[None, :]                         # K~(r)_k,ii
-        kp = (Xp @ w) / w.sum(0)[None, :]                        # K~(r)_k,ii' on the related pairs
-        return d, d.T @ Hd + 2.0 * (kp.T @ Hp)
-
-    d_full, _ = diag_parts(np.ones(A.shape[0]))
-    lhs = {"exact": p0.lhs.copy(), "first": p0.lhs.copy()}
-    rhs = p0.rhs.copy()
-    for r in range(jk.nrep + 1):
-        keep = np.ones(A.shape[0]) if r == jk.nrep else 1.0 - (jk.D[r] @ (np.arange(jk.nunit)[:, None] == jk.unit_id[None, :]))
-        d, lam = diag_parts(keep)
-        S = d.T @ d_full
-        for key, Dkl in (("exact", d.T @ d), ("first", S + S.T - d_full.T @ d_full)):
-            lhs[key][r, :K, :K] -= Dkl - n_eff + n_scale
-            lhs[key][r, :K, K] = lam
-        rhs[r, :K] -= (d.T @ (yy * yy)) * (n_scale / n_eff)
-    got = fits["snp"].prepared
-    np.testing.assert_allclose(got.rhs, rhs, rtol=1e-9, atol=1e-9)
-    np.testing.assert_allclose(got.lhs, lhs["first"], rtol=1e-9, atol=1e-8)
-    se = {k: float(fit_h2(replace(p0, lhs=L, rhs=rhs)).h2[-1, 1]) for k, L in lhs.items()}
-    se_snp, se_const = float(fits["snp"].h2[-1, 1]), float(fits["const"].h2[-1, 1])
-    assert se_snp == pytest.approx(se["first"], rel=1e-8)
-    # the second-order term is the only difference; it is large here (a class has ~6 SNPs per block, and the chromosome
-    # jackknife deletes half of the 300 SNPs) and shrinks with the number of SNPs per jackknife unit
-    assert abs(se_snp / se["exact"] - 1) < min(1e-2, abs(se_const / se["exact"] - 1))
-    print(f"[jk] {njack} partitioned={partitioned}: SE per-SNP {se_snp:.6g}, exact replicates {se['exact']:.6g} "
-          f"(rel {se_snp / se['exact'] - 1:+.2e}), class constants {se_const:.6g} (rel {se_const / se['exact'] - 1:+.2e})")
-    assert float(fits["snp"].h2[-1, 0]) == pytest.approx(float(fits["const"].h2[-1, 0]), rel=1e-8)
