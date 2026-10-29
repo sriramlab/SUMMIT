@@ -402,7 +402,7 @@ def _sample_projection(G, Z, mask):
 
 
 @pytest.mark.parametrize("missing", [0.0, 0.01])
-def test_rel_m12_for_phenotypes_in_different_samples(tmp_path, missing):
+def test_rel_m12_for_phenotypes_in_different_samples(tmp_path, monkeypatch, missing):
     """REL_M12 of phenotypes in different complete-case samples (one with a lower covariate rank) equals
     y_a'(K_ab o R) y_b / sqrt(N_eff,a N_eff,b) / sum_j w_j, with K_ab = sum_j w_j x_a,j x_b,j' between the two samples'
     projected genotypes, R the related pairs of different individuals and w_j = a_jk sqrt(V_a,j V_b,j), overall, per
@@ -478,6 +478,13 @@ def test_rel_m12_for_phenotypes_in_different_samples(tmp_path, missing):
     assert ti.loc[same, "REL_S12"].notna().all() and ti.loc[~same, ["REL_S12", "REL_S12_lowmaf"]].isna().all().all()
     extract_rel_m12(str(tmp_path / "inb.rel_m12.tsv"), "full", "grp1", str(tmp_path / "m12i.tsv"))
     assert list(pd.read_csv(tmp_path / "m12i.tsv", sep="\t").columns) == ["REL_M12"]
+    # products split into many chunks of SNPs and pairs, and the default block size, give the same values
+    import summit.relatives.moments as mom
+    monkeypatch.setattr(mom, "_PAIR_CHUNK_ELEMS", 50)
+    for step in (37, None):
+        compute_relative_pair_totals(prefix, str(tmp_path / "pheno4.txt"), str(tmp_path / "chunk"), step_size=step, **kw)
+        tc = pd.read_csv(tmp_path / "chunk.rel_m12.tsv", sep="\t")
+        np.testing.assert_allclose(tc[num].to_numpy(float), tab[num].to_numpy(float), rtol=1e-10, atol=1e-13)
 
 
 def test_append_writes_constant_or_per_class_rel_m(tmp_path):

@@ -452,7 +452,7 @@ def compute_relative_pair_totals(
     step = _auto_step(step_size, n0)
     xs = None
     if cross and len(G) > 1:                                      # phenotype pairs in different samples
-        xs = _CrossSamplePairs(G, A, a0, b0, ar, br, len(classes))
+        xs = _CrossSamplePairs(G, A, a0, b0, ar, br, len(classes), rows.size)
         if step_size is None:
             step = min(step, xs.max_step)
     _log(f"[relatives] one genotype pass over {M} SNPs in blocks of {step} for {len(pheno_cols)} phenotype(s) in "
@@ -569,10 +569,11 @@ class _CrossSamplePairs:
     For SNP j of class c (the annotation's class, or one extra class for SNPs outside it) and phenotypes t1, t2 with
     samples g, h: num_c[t1, t2] = sum_j sum over unordered related pairs (i, i') of u_t1,ij u_t2,i'j, with
     u_t,ij = y_t,i x_g(t),ij sqrt(V_g(t),j) (genotypes projected and normalized in the phenotype's own sample, y zero
-    outside it), and den_c[g, h] = sum_j sqrt(V_gj V_hj). Each block's pair rows are kept per sample (`store`); `accumulate`
-    then adds one matrix product of (phenotypes x pairs*SNPs) arrays per class."""
+    outside it), and den_c[g, h] = sum_j sqrt(V_gj V_hj). Each block's family rows are kept per sample (`store`);
+    `accumulate` then adds matrix products of (phenotypes x pairs*SNPs) arrays per class, in chunks of SNPs and pairs
+    of at most _PAIR_CHUNK_ELEMS / 2 elements per factor."""
 
-    def __init__(self, G, A, a0, b0, ar, br, nclass):
+    def __init__(self, G, A, a0, b0, ar, br, nclass, nrows):
         self.G, self.ar, self.br, self.nclass = G, ar, br, nclass
         self.cls = (np.where(A.sum(axis=1) > 0, A.argmax(axis=1), nclass) if nclass
                     else np.zeros(A.shape[0], dtype=np.int64))
@@ -580,23 +581,20 @@ class _CrossSamplePairs:
         self.gof = np.repeat(np.arange(len(G)), [len(g["ks"]) for g in G])
         self.ya = np.vstack([g["yfull"][a0].T for g in G])        # phenotypes x pairs: y at the first member
         self.yb = np.vstack([g["yfull"][b0].T for g in G])
-        T, P = self.ya.shape
+        T = self.ya.shape[0]
         self.num = np.zeros((nclass + 1, T, T))
         self.den = np.zeros((nclass + 1, len(G), len(G)))
-        self.width = int(max(1, (1 << 23) // max(1, T * P)))     # SNPs per product (64 MiB per factor)
-        self.max_step = int(max(1, (1 << 26) // max(1, 2 * len(G) * P)))    # block size for the stored pair rows
-        self.xa = self.xb = self.sv = None
+        self.max_step = int(max(1, (1 << 26) // max(1, len(G) * int(nrows))))   # block size for the stored family rows
+        self.xh = self.sv = None
         self.m0 = [g["m0"] for g in G]
         self.a0, self.b0 = a0, b0
 
     def store(self, k, xh, v):
         """Projected genotypes xh (family rows x block SNPs) and V weights of sample k for the current block."""
-        if self.xa is None or self.xa.shape[2] != xh.shape[1]:
-            shape = (len(self.G), self.ar.size, xh.shape[1])
-            self.xa, self.xb, self.sv = np.empty(shape), np.empty(shape), np.empty((len(self.G), xh.shape[1]))
+        if self.xh is None or self.xh.shape[1:] != xh.shape:
+            self.xh, self.sv = np.empty((len(self.G),) + xh.shape), np.empty((len(self.G), xh.shape[1]))
         sv = np.sqrt(v)
-        np.multiply(xh[self.ar], sv[None, :], out=self.xa[k])
-        np.multiply(xh[self.br], sv[None, :], out=self.xb[k])
+        np.multiply(xh, sv[None, :], out=self.xh[k])
         self.sv[k] = sv
 
     def accumulate(self, s, e):
@@ -604,25 +602,28 @@ class _CrossSamplePairs:
         perm = np.argsort(cls, kind="stable")
         cls = cls[perm]
         T, P = self.ya.shape
+        half = max(1, _PAIR_CHUNK_ELEMS // 2)                     # elements of each factor of one product
+        width = max(1, half // max(1, T * P))                     # SNPs per product
         cuts = np.flatnonzero(np.diff(cls)) + 1
-        buf_a, buf_b = np.empty(T * P * self.width), np.empty(T * P * self.width)
         for r0, r1 in zip(np.concatenate([[0], cuts]), np.concatenate([cuts, [cls.size]])):
             c = int(cls[r0])
-            for q0 in range(r0, r1, self.width):
-                cj = perm[q0:min(r1, q0 + self.width)]
+            for q0 in range(r0, r1, width):
+                cj = perm[q0:min(r1, q0 + width)]
                 w = cj.size
                 sv = self.sv[:, cj]
                 self.den[c] += sv @ sv.T
-                if P == 0:
-                    continue
-                za, zb = buf_a[:T * P * w].reshape(T, P, w), buf_b[:T * P * w].reshape(T, P, w)
-                o = 0
-                for k, g in enumerate(self.G):
-                    t = len(g["ks"])
-                    np.multiply(self.ya[o:o + t, :, None], self.xa[k][None, :, cj], out=za[o:o + t])
-                    np.multiply(self.yb[o:o + t, :, None], self.xb[k][None, :, cj], out=zb[o:o + t])
-                    o += t
-                self.num[c] += za.reshape(T, -1) @ zb.reshape(T, -1).T
+                xs = self.xh[:, :, cj]                            # samples x family rows x SNPs
+                pc = max(1, half // (T * w))                      # pairs per product
+                for p0 in range(0, P, pc):
+                    p1 = min(P, p0 + pc)
+                    za, zb = np.empty((T, p1 - p0, w)), np.empty((T, p1 - p0, w))
+                    o = 0
+                    for k, g in enumerate(self.G):
+                        t = len(g["ks"])
+                        np.multiply(self.ya[o:o + t, p0:p1, None], xs[k][self.ar[p0:p1]][None], out=za[o:o + t])
+                        np.multiply(self.yb[o:o + t, p0:p1, None], xs[k][self.br[p0:p1]][None], out=zb[o:o + t])
+                        o += t
+                    self.num[c] += za.reshape(T, -1) @ zb.reshape(T, -1).T
 
     def values(self):
         """(phenotype 1, phenotype 2, N in both samples, related pairs with a member in each, REL_M12 (all, classes))
