@@ -37,6 +37,23 @@ the weights. Recompute the LD scores with `--snp-var-weights-off` for an
 ordinary file. Files with V do not yet support `--weight-mode ldsc`,
 `--adjust-delta`, `--rg-se-method robust` or `kmoments`, or `--rg-manifest-fast`.
 
+## Local ancestry
+
+In admixed samples, local-ancestry dosages (the number of haplotypes from one
+ancestry at loci on a grid) can be added to the genotype file as markers with
+their own annotation column. The fit then estimates the SNP heritability and
+the variance tagged only by local ancestry jointly; the moments of the dosages
+are those of an admixture-mapping scan. Global ancestry estimated from the same
+local-ancestry calls must be among the covariates of the GWAS, of the scan and
+of the LD scores. PCs are not enough. Every dosage contains the individual's
+global ancestry, so the local-ancestry kernel amplifies whatever global
+ancestry the covariates leave behind, by a factor of order `n (1 - R2)` where
+`R2` is the share of its variance that the covariates explain. In a sample of
+9,600 people the PCs left 0.5% of it and the factor was 160, which gave
+spurious local-ancestry components. Unadmixed individuals have zero dosages
+after this adjustment, so a sample can mix admixed and unadmixed people. Local
+ancestry is correlated over tens of centimorgans; use `--njack chr`.
+
 ## Genetic correlation
 
 For studies with no overlapping participants:
@@ -91,7 +108,9 @@ integer sets another block count and `--njack chr` deletes chromosomes. With 200
 blocks the SE is far less variable than with 22 chromosomes. In recently
 admixed cohorts, long-range admixture LD links neighboring blocks on a
 chromosome and block-jackknife SEs can be too small; chromosome deletion is
-less affected. For confidence intervals and tests, use t quantiles with B - 1
+less affected. `--long-range-se` corrects either design for the covariance
+between blocks ([Related individuals](Related-individuals.md#long-range-ld-correction-of-standard-errors)).
+For confidence intervals and tests, use t quantiles with B - 1
 degrees of freedom for B jackknife blocks: 1.97 instead of 1.96 for 200 blocks,
 and 2.08 for 22 chromosomes, including `--njack chr:d`.
 The default jackknife supports varying per-SNP N. The optional

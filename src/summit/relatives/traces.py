@@ -61,26 +61,10 @@ def _units(bim: pd.DataFrame, nblocks: int, cls: np.ndarray, nclass: int):
     return cell, ucell // 1000, unit, ukeys // nclass, ukeys % nclass
 
 
-def compute_jackknife_traces(
-    geno: str,
-    out: str,
-    *,
-    covar: str | None = None,
-    pairs: str | None = None,
-    kinship_col: str | None = None,
-    kinship_min: float | None = None,
-    closure: bool = True,
-    annot: str | None = None,
-    inbreeding: bool = False,
-    keep: str | None = None,
-    nblocks: int = 200,
-    probes: int = 100,
-    seed: int = 20261029,
-    step_size: int | None = None,
-    log=None,
-) -> dict:
-    """Write `out`.jktraces.npz (G1, G2, G3, Tb and, with `inbreeding`, the self-pair-free G1n, G2n, G3n, Tbn) and
-    `out`.jktraces.snps.tsv.gz (each SNP's cell), for everyone with complete covariates (and in `keep`, if given)."""
+def _load_units(geno, *, covar, pairs, kinship_col, kinship_min, closure, annot, inbreeding, keep, nblocks,
+                step_size, log):
+    """Projected standardized genotypes in memory, grouped by unit (block cell x chromosome x class), and the unit
+    products shared by `summit relatives traces` and `summit relatives longrange`."""
     def _log(msg):
         if log is not None:
             log._log(msg)
@@ -189,6 +173,44 @@ def compute_jackknife_traces(
     def kmul(U):
         return (X @ (X.T @ U.astype(np.float32))).astype(np.float64) / vsum_all
 
+    return dict(t0=t0, n=n, p=p, nu=nu, C=C, X=X, M=M, K=K, classes=classes, cls=cls, cell=cell, cell_blk=cell_blk,
+                cell_chr=cell_chr, unit_cell=unit_cell, unit_cls=unit_cls, NU=NU, ustart=ustart, order=order,
+                vsum=vsum, vsum_all=vsum_all, Vb=Vb, a=a, b=b, PK=PK, Hd=Hd, nb=nblocks,
+                dK=dK if inbreeding else None, lam=lam if inbreeding else None, bim=bim,
+                proj=proj, unit_mul=unit_mul, rel_mul=rel_mul, kmul=kmul, log=_log)
+
+
+def compute_jackknife_traces(
+    geno: str,
+    out: str,
+    *,
+    covar: str | None = None,
+    pairs: str | None = None,
+    kinship_col: str | None = None,
+    kinship_min: float | None = None,
+    closure: bool = True,
+    annot: str | None = None,
+    inbreeding: bool = False,
+    keep: str | None = None,
+    nblocks: int = 200,
+    probes: int = 100,
+    seed: int = 20261029,
+    step_size: int | None = None,
+    log=None,
+) -> dict:
+    """Write `out`.jktraces.npz (G1, G2, G3, Tb and, with `inbreeding`, the self-pair-free G1n, G2n, G3n, Tbn) and
+    `out`.jktraces.snps.tsv.gz (each SNP's cell), for everyone with complete covariates (and in `keep`, if given)."""
+    d = _load_units(geno, covar=covar, pairs=pairs, kinship_col=kinship_col, kinship_min=kinship_min,
+                    closure=closure, annot=annot, inbreeding=inbreeding, keep=keep, nblocks=nblocks,
+                    step_size=step_size, log=log)
+    t0, n, nu, M, K, classes, cell, cell_blk, cell_chr = (d[k] for k in ("t0", "n", "nu", "M", "K", "classes", "cell",
+                                                                   "cell_blk", "cell_chr"))
+    unit_cell, unit_cls, NU, Vb, a, vsum, vsum_all, bim = (d[k] for k in ("unit_cell", "unit_cls", "NU", "Vb", "a",
+                                                                     "vsum", "vsum_all", "bim"))
+    ucls = unit_cls
+    dK, lam = d["dK"], d["lam"]
+    proj, unit_mul, rel_mul, kmul, _log = d["proj"], d["unit_mul"], d["rel_mul"], d["kmul"], d["log"]
+
     rng = np.random.default_rng(seed)
     acc = {k: np.zeros((NU, NU)) for k in ("G1", "G2", "G3")}
     acc["Tb"] = np.zeros((NU, K))
@@ -231,3 +253,99 @@ def compute_jackknife_traces(
         out + ".jktraces.snps.tsv.gz", sep="\t", index=False)
     _log(f"[traces] wrote {out}.jktraces.npz ({NU} units, {probes} probes) in {time.time() - t0:.0f}s.")
     return meta
+
+
+def compute_long_range_sums(
+    geno: str,
+    out: str,
+    *,
+    covar: str | None = None,
+    pairs: str | None = None,
+    kinship_col: str | None = None,
+    kinship_min: float | None = None,
+    closure: bool = True,
+    annot: str | None = None,
+    inbreeding: bool = False,
+    keep: str | None = None,
+    nblocks: int = 200,
+    probes: int = 100,
+    seed: int = 20261030,
+    step_size: int | None = None,
+    log=None,
+) -> dict:
+    """Write `out`.longrange.json: the bin x bin sums of the LD-score mass (L = tr(A~_c A~_d), the moment matrix
+    T = tr(A~_c K~_d)) and, for the chromosome and the `nblocks`-block jackknife designs, the part of L from pairs of
+    SNPs in the same group (W). L - W is the LD-score mass between groups, which the block jackknife does not see.
+    The self-pair-free versions (suffix n) are always added: the correction treats the self-pair part separately, and
+    fits with the --inbreeding values use them. Rademacher-probe estimates. `inbreeding` is accepted for symmetry with
+    `compute_jackknife_traces` and ignored."""
+    from scipy import sparse
+
+    inbreeding = True                                             # both sums are always needed (self-pair part)
+    d = _load_units(geno, covar=covar, pairs=pairs, kinship_col=kinship_col, kinship_min=kinship_min, closure=closure,
+                    annot=annot, inbreeding=inbreeding, keep=keep, nblocks=nblocks, step_size=step_size, log=log)
+    n, nu, M, K, classes = d["n"], d["nu"], d["M"], d["K"], d["classes"]
+    NU, unit_cell, unit_cls, Vb = d["NU"], d["unit_cell"], d["unit_cls"], d["Vb"]
+    proj, unit_mul, rel_mul, _log = d["proj"], d["unit_mul"], d["rel_mul"], d["log"]
+    chr_codes, chr_names = pd.factorize(pd.Series(d["cell_chr"]))
+    designs = {"chr": np.asarray(chr_codes, dtype=np.int64)[unit_cell],
+               "blocks": np.asarray(d["cell_blk"], dtype=np.int64)[unit_cell]}
+    ones = np.ones(NU)
+    agg = {k: sparse.csr_matrix((ones, (np.arange(NU), g * K + unit_cls)), shape=(NU, (int(g.max()) + 1) * K))
+           for k, g in designs.items()}
+    to_cls = sparse.csr_matrix((ones, (np.arange(NU), unit_cls)), shape=(NU, K))
+    sfxs = ["", "n"] if inbreeding else [""]
+    acc = {}
+    for sfx in sfxs:
+        acc["L" + sfx] = np.zeros((K, K)); acc["T" + sfx] = np.zeros((K, K))
+        for k in designs:
+            acc[f"W_{k}{sfx}"] = np.zeros((K, K))
+    rng = np.random.default_rng(seed)
+    for it in range(int(probes)):
+        z = proj(rng.choice([-1.0, 1.0], size=n))
+        Ku, _ = unit_mul(z)
+        Ru = proj(rel_mul(z))
+        Kd = np.asarray((to_cls.T @ Ku.T).T)                     # K~_d z by class (pairs and diagonal included)
+        variants = [("", Ku - Ru - z[:, None] * Vb[None, :])]
+        if inbreeding:
+            variants.append(("n", Ku - Ru - proj(d["dK"] * z[:, None]) - z[:, None] * (d["lam"] / nu)[None, :]))
+        for sfx, U in variants:                                   # U = A~_u z
+            Yc = np.asarray((to_cls.T @ U.T).T)
+            acc["L" + sfx] += Yc.T @ Yc
+            acc["T" + sfx] += Yc.T @ Kd
+            for k, S in agg.items():
+                Y = np.asarray((S.T @ U.T).T).reshape(n, -1, K)
+                acc[f"W_{k}{sfx}"] += np.einsum("ngk,ngl->kl", Y, Y)
+        if (it + 1) % max(1, int(probes) // 10) == 0:
+            _log(f"[longrange] probe {it + 1}/{probes} ({time.time() - d['t0']:.0f}s)")
+    for k in acc:
+        acc[k] /= float(probes)
+        if not k.startswith("T"):
+            acc[k] = 0.5 * (acc[k] + acc[k].T)
+    snp_group = {"chr": np.asarray(chr_codes, dtype=np.int64)[d["cell"]], "blocks": np.asarray(d["cell_blk"])[d["cell"]]}
+    res = dict(n=int(n), nu=float(nu), M=int(M), probes=int(probes), nblocks=int(nblocks), seed=int(seed),
+               npairs=int(d["a"].size), inbreeding=bool(inbreeding), classes=list(classes),
+               vsum=[float(x) for x in d["vsum"]], vsum_all=float(d["vsum_all"]),
+               L={sfx or "self": acc["L" + sfx].tolist() for sfx in sfxs},
+               T={sfx or "self": acc["T" + sfx].tolist() for sfx in sfxs},
+               designs={k: dict(groups=int(designs[k].max()) + 1,
+                                group_snps=np.bincount(snp_group[k]).astype(int).tolist(),
+                                group_names=[str(x) for x in chr_names] if k == "chr" else None,
+                                W={sfx or "self": acc[f"W_{k}{sfx}"].tolist() for sfx in sfxs})
+                        for k in designs})
+    for k in designs:
+        for sfx in sfxs:
+            L, W = acc["L" + sfx], acc[f"W_{k}{sfx}"]
+            if K == 1:
+                rho = 1.0 - W[0, 0] / L[0, 0]
+            else:
+                om = np.linalg.solve(acc["T" + sfx].T, np.ones(K))
+                rho = 1.0 - (om @ W @ om) / (om @ L @ om)
+            res["designs"][k].setdefault("rho", {})[sfx or "self"] = float(rho)
+            _log(f"[longrange] {k}: between-group share of the LD-score mass {rho:.4g}"
+                 f" ({'self-pairs out' if sfx else 'self-pairs in'}; {'one class' if K == 1 else f'{K} classes'}).")
+    os.makedirs(os.path.dirname(os.path.abspath(out)) or ".", exist_ok=True)
+    with open(out + ".longrange.json", "w") as fh:
+        json.dump(res, fh, indent=1)
+    _log(f"[longrange] wrote {out}.longrange.json ({probes} probes) in {time.time() - d['t0']:.0f}s.")
+    return res

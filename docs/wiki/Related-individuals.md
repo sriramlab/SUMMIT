@@ -179,41 +179,56 @@ and each replicate then uses its own diagonal terms (exactly for `REL_S` and
 data the jackknife SE then matched the exact replicate-wise SE to within 0.5%,
 against 1% to 20% with one value per phenotype.
 
-## Rescaled jackknife standard errors
+## Long-range LD correction of standard errors
 
-The block jackknife cannot see covariance between blocks: long-range LD in
-admixed samples, and the self-pair terms when self-relatedness tracks ancestry.
-Under the fitted model both the variance of the estimate (`AV`) and the
-expectation of the jackknife variance (`E[V_jk]`) are quadratic forms in
-genotype-only traces of the jackknife blocks, so SUMMIT can rescale the
-jackknife:
-
-    SE = SE_jk * sqrt(AV / E[V_jk])
-
-The jackknife keeps the variance it sees but the model misses (large-effect
-loci, heavy-tailed traits); the factor adds what it cannot see. The traces come
-from one genotype pass on the GWAS genotypes and samples:
+The block jackknife sees the covariance of the moments within each block but
+not the covariance between blocks. In admixed and other structured samples that
+covariance comes from long-range LD and from the self-pair terms, whose `K_ii`
+tracks ancestry on every chromosome, so the jackknife SE is too small.
+`--long-range-se` adds it back. It needs the share of the LD-score mass that
+comes from SNP pairs in different blocks, which `summit relatives longrange`
+computes from the GWAS genotypes:
 
 ```bash
-summit relatives traces --geno study --covar covariates.txt --pairs pairs.tsv \
-  --kinship-col RELATEDNESS --kinship-min 0.0442 [--annot mafld8.annot] [--inbreeding] --out results/traces
-summit --h2 study.with_rel_m.tsv --ldscores study.gw.ldscore.gz [--annot ...] --jk-traces results/traces --out results/h2
+summit relatives longrange --geno study --covar covariates.txt --pairs pairs.tsv \
+  --kinship-col RELATEDNESS --kinship-min 0.0442 --annot mafld8.annot --out results/longrange
+summit --h2 study.with_rel_m.tsv --ldscores study.gw.ldscore.gz --annot mafld8.annot \
+  --long-range-se results/longrange --out results/h2
 ```
 
-Use the fit's annotation (one class per SNP) for partitioned fits; a
-one-component fit can use traces with or without classes. `--inbreeding` adds
-the traces without self-pairs, used automatically for fits with the
-`moments --inbreeding` values. Cells are SUMMIT's 200 contiguous blocks split by
-chromosome, so the same traces serve `--njack 200` and `--njack chr`; when the
-fit's SNPs differ from the trace SNPs, cells are mapped to jackknife units by
-SNP and the log gives the share of mismatched SNPs. The results table then has
-`h2_se` (rescaled), `h2_se_jk` (the block jackknife) and `jk_factor`. The
-pass holds the projected genotypes in memory (4 bytes per sample and SNP); with
-100 probes it took about 5 minutes for 9,600 people and 406,000 SNPs (8 minutes
-for 12,000 and 454,000) and about 15 to 20 minutes with 8 classes and 60
-probes, on 16 cores. In UK Biobank simulations the rescaled SE was 0.93 to 1.06
-of the empirical SD (one component) and 0.98 to 1.05 (8 classes) in every
-cohort, against 0.68 for the block jackknife in a wide African-ancestry group.
+The variance is then
+
+    Var = V_jk / (1 - rho_s - rho_l (1 + 2 h2)) + 4 h2^2 (1 - sum f^2) / n
+
+`rho_s` is the part of the between-block share carried by the self-pair terms
+and `rho_l` the rest, which comes from long-range LD. Long-range LD also links
+the blocks' genetic-signal terms, hence the factor `1 + 2 h2`. The second term
+is the variance of products of different blocks' genetic values, which the
+jackknife misses even in homogeneous samples; `f` are the blocks' shares of the
+SNPs and `n` is the sample size. Fits with the `moments --inbreeding` values
+have no self-pair part. Negative shares are set to 0, so the corrected SE is
+never below the jackknife SE.
+
+`longrange` writes bin-by-bin sums, with and without self-pairs, for the
+chromosome design and for 200 blocks (`--nblocks`), so one file serves
+`--njack 200` and `--njack chr`. Run it on the GWAS samples with the GWAS
+covariates and the fit's annotation. The results table then has `h2_se`
+(corrected), `h2_se_jk`, `jk_factor` and `long_range_rho`. The pass holds the
+projected genotypes in memory (4 bytes per sample and SNP). With 8 MAF-LD bins
+and 100 probes it took 1.5 to 6.5 minutes on 16 cores for 3,400 to 12,000
+people and 0.4 to 1 million SNPs.
+
+In UK Biobank cohorts the corrected SE was 0.98 to 1.02 times the exact
+rescaled SE with 8 MAF-LD bins, and 1.00 to 1.19 times with one component,
+against 0.89 to 1.00 for the jackknife alone. At h² of 0.25 and 200 blocks the
+correction raised the SE by about 1% in white British participants, 5% to 11%
+in South Asian participants, 5% to 7% in African-European admixed participants
+and 5% in a wider African-ancestry group. Only `--h2` uses it for now.
+
+`--jk-traces`, with the traces of `summit relatives traces`, computes the exact
+rescaling `SE_jk * sqrt(AV / E[V_jk])` from the traces of every pair of blocks.
+The traces are much larger and tied to the SNP set; use them to check the
+correction.
 
 ## LD scores
 

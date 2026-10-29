@@ -8,7 +8,7 @@ import numpy as np
 
 from .. import utils
 from .jackknife import JackknifeSpec, JackknifeDesign
-from .jktraces import jackknife_rescaling, load_jk_traces
+from .jktraces import jackknife_rescaling, load_jk_traces, load_long_range, long_range_se
 from .trace import Trace
 from ..sumstats.sumstats import Sumstats
 from .h2core import (
@@ -71,6 +71,7 @@ class Sumrhe:
         ldsc_irwls_tol: float = 0.0,
         snp_var_weights: bool = True,
         jk_traces: str | None = None,
+        long_range: str | None = None,
     ):
 
         self.log = log
@@ -205,6 +206,17 @@ class Sumrhe:
                 m = self.jk_traces["meta"]
                 self.log._log(f"[jk-traces] {jk_traces}: n={m['n']}, {m['M']} SNPs, {m['probes']} probes, classes "
                               f"{m['classes'] or ['(one)']}, self-pair-free values: {m['inbreeding']}.")
+        self.long_range = None
+        if long_range is not None:
+            if jk_traces is not None:
+                raise ValueError("Use either --jk-traces or --long-range-se, not both.")
+            if self.weight_mode != "he":
+                raise ValueError("--long-range-se needs the default HE weighting.")
+            self.long_range = load_long_range(long_range)
+            if self.log is not None:
+                m = self.long_range
+                self.log._log(f"[long-range] {long_range}: n={m['n']}, {m['M']} SNPs, {m['probes']} probes, classes "
+                              f"{m['classes'] or ['(one)']}, self-pair-free sums: {m['inbreeding']}.")
 
         self.out = out
         self.annot_header = self.trace.annot_header
@@ -432,6 +444,31 @@ class Sumrhe:
                 label=f"[{phen_name}]",
             )
 
+        if self.long_range is not None:
+            p = fit.prepared
+            Dm = np.asarray(p.jackknife.D, dtype=np.float64)
+            mask = Dm > 0.5
+            delete1 = Dm.shape[0] == Dm.shape[1] and np.all(mask.sum(axis=0) == 1) and np.all(mask.sum(axis=1) == 1)
+            mode = self.jackknife_spec.mode
+            if not delete1 or mode not in ("chr", "block"):
+                if self.log is not None:
+                    self.log._log(f"[long-range] [{phen_name}]: only delete-1 block or chromosome jackknife designs are "
+                                  "corrected; SE left unchanged.")
+            else:
+                self._last_jk = long_range_se(
+                    self.long_range,
+                    design="chr" if mode == "chr" else "blocks",
+                    nunits=int(Dm.shape[0]),
+                    bin_names=[str(x) for x in np.asarray(self.trace.annot_header).ravel()],
+                    h2=float(fit.h2[-1, 0]),
+                    se_jk=float(fit.h2[-1, 1]),
+                    n=float(p.matched.nsamp),
+                    unit_sizes=p.unit_sizes,
+                    noself=getattr(ss, "rel_diag", None) is not None,
+                    log=self.log,
+                    label=f"[{phen_name}]",
+                )
+
         if hasattr(ss, "log_chisq_diagnostics"):
             ss.log_chisq_diagnostics(
                 matched,
@@ -529,8 +566,10 @@ class Sumrhe:
         k = int(self.nbins)
 
         header = ["phen_index", "phen", "num_bins", "h2", "h2_se"]
-        if self.jk_traces is not None:
+        if self.jk_traces is not None or self.long_range is not None:
             header.extend(["h2_se_jk", "jk_factor"])
+        if self.long_range is not None:
+            header.append("long_range_rho")
         header.extend([f"h2bin_{j}" for j in range(k)])
         header.extend([f"h2bin_se_{j}" for j in range(k)])
         header.extend([f"enrichment_{j}" for j in range(k)])
@@ -550,9 +589,11 @@ class Sumrhe:
                     format(float(h2tot), ".12g"),
                     format(self._total_se(fit, jk), ".12g"),
                 ]
-                if self.jk_traces is not None:
+                if self.jk_traces is not None or self.long_range is not None:
                     row.extend([format(float(fit.h2[-1, 1]), ".12g"),
                                 format(float(jk["factor"]) if jk is not None else float("nan"), ".12g")])
+                if self.long_range is not None:
+                    row.append(format(float(jk["rho"]) if jk is not None else float("nan"), ".12g"))
                 row.extend(format(float(fit.h2[j, 0]), ".12g") for j in range(k))
                 row.extend(format(float(fit.h2[j, 1]), ".12g") for j in range(k))
                 row.extend(format(float(fit.enrich[j, 0]), ".12g") for j in range(k))

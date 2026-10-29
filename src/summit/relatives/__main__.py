@@ -5,6 +5,8 @@
   summit relatives cross-m12 --rel PREFIX.rel_m12.tsv --pheno1 A --pheno2 B [--annot FILE] --out FILE   (summit --rg --rel-m12)
   summit relatives traces  --geno PREFIX [--covar FILE] [--pairs FILE] [--annot FILE] [--inbreeding] --out PREFIX
                                                                                         (summit --h2 --jk-traces)
+  summit relatives longrange --geno PREFIX [--covar FILE] [--pairs FILE] [--annot FILE] --out PREFIX
+                                                                                        (summit --h2 --long-range-se)
 
 By default `moments` writes one REL_M value per phenotype (and per class of --annot), the V-weighted mean of the
 per-SNP related-pair moments, and `append` writes it as a constant REL_M column. `--per-snp` writes the exact per-SNP
@@ -19,7 +21,7 @@ import sys
 from ..logger import Logger
 from .moments import (append_rel_m_to_sumstats, compute_relative_pair_moments, compute_relative_pair_totals,
                       extract_rel_m12)
-from .traces import compute_jackknife_traces
+from .traces import compute_jackknife_traces, compute_long_range_sums
 
 
 def main(argv=None):
@@ -83,6 +85,21 @@ def main(argv=None):
     t.add_argument("--seed", type=int, default=20261029)
     t.add_argument("--step-size", type=int, default=None)
     t.add_argument("--out", required=True)
+    lr = sub.add_parser("longrange", help="LD-score mass between jackknife blocks, for the long-range LD correction of "
+                                          "h2 standard errors (summit --h2 --long-range-se)")
+    lr.add_argument("--geno", required=True, help="PLINK 1 BED prefix or .bed path (the GWAS and LD-score genotypes)")
+    lr.add_argument("--covar", default=None, help="the GWAS covariates (FID IID ...), without an intercept column")
+    lr.add_argument("--pairs", default=None, help="related pairs left out of the first equation (as for `moments`)")
+    lr.add_argument("--kinship-col", default=None)
+    lr.add_argument("--kinship-min", type=float, default=None)
+    lr.add_argument("--no-closure", action="store_true")
+    lr.add_argument("--annot", default=None, help="the partitioning annotation of the fits (every SNP in one class)")
+    lr.add_argument("--keep", default=None, help="FID IID of the samples to use (default: all with complete covariates)")
+    lr.add_argument("--nblocks", type=int, default=200, help="SUMMIT's contiguous jackknife blocks (default 200)")
+    lr.add_argument("--probes", type=int, default=100, help="Rademacher probes (default 100)")
+    lr.add_argument("--seed", type=int, default=20261030)
+    lr.add_argument("--step-size", type=int, default=None)
+    lr.add_argument("--out", required=True)
     args = ap.parse_args(argv)
 
     if args.cmd == "moments":
@@ -107,6 +124,14 @@ def main(argv=None):
             args.geno, args.out, covar=args.covar, pairs=args.pairs, kinship_col=args.kinship_col,
             kinship_min=args.kinship_min, closure=not args.no_closure, annot=args.annot, inbreeding=args.inbreeding,
             keep=args.keep, nblocks=args.nblocks, probes=args.probes, seed=args.seed, step_size=args.step_size, log=log,
+        )
+    elif args.cmd == "longrange":
+        log = Logger()
+        log.attach_file(args.out + ".longrange.log", mode="w")
+        compute_long_range_sums(
+            args.geno, args.out, covar=args.covar, pairs=args.pairs, kinship_col=args.kinship_col,
+            kinship_min=args.kinship_min, closure=not args.no_closure, annot=args.annot, keep=args.keep,
+            nblocks=args.nblocks, probes=args.probes, seed=args.seed, step_size=args.step_size, log=log,
         )
     elif args.cmd == "append":
         missing = append_rel_m_to_sumstats(args.sumstats, args.rel, args.pheno, args.out, annot=args.annot)

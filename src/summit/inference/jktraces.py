@@ -131,3 +131,74 @@ def jackknife_rescaling(tr: dict, *, axis_snps, unit_id, D, unit_sizes, bin_name
                  f"{100 * info['fit_snps_without_trace']:.2f}% without traces, "
                  f"{100 * info['trace_snps_not_in_fit']:.2f}% of trace SNPs not in the fit).")
     return out
+
+
+def load_long_range(path: str) -> dict:
+    """Sums of `summit relatives longrange` from PREFIX (or PREFIX.longrange.json)."""
+    base = path[: -len(".longrange.json")] if str(path).endswith(".longrange.json") else str(path)
+    with open(base + ".longrange.json") as fh:
+        lr = json.load(fh)
+    lr["path"] = base
+    return lr
+
+
+def long_range_se(lr: dict, *, design: str, nunits: int, bin_names, h2: float, se_jk: float, n: float, unit_sizes,
+                  noself: bool, log=None, label: str = "") -> dict:
+    """Long-range LD correction of the block-jackknife SE of total h2.
+
+    The jackknife sees the covariance of the moments within its groups and none between them. rho is the share of
+    the (weighted) LD-score mass between groups, with self-pairs (rho_self) and without (rho_n). The part carried by
+    the self-pairs, rho_diag = max(rho_self - rho_n, 0), enters the variance as it is; the rest, rho_off, also enters
+    the cross and signal terms, whose between-group shares are about 2 and 3 times larger, so
+    Var = V_jk / (1 - rho_diag - rho_off (1 + 2 h2)). Products of different groups' genetic values add
+    4 h2^2 (1 - sum_g f_g^2) / n, f_g the groups' shares of the SNPs. Fits without self-pairs use rho_diag = 0 and
+    rho_off = rho_n."""
+    dz = lr["designs"][design]
+    if design == "blocks" and int(nunits) != int(lr["nblocks"]) and log is not None:
+        log._log(f"[long-range] {label}: the sums are for {lr['nblocks']} blocks and the fit has {nunits}; using them "
+                 "as an approximation.")
+    names = list(bin_names)
+    cls = list(lr["classes"])
+    if len(names) > 1 and sorted(cls) != sorted(names):
+        raise ValueError(f"{lr['path']}: classes {cls[:4]} differ from the fit's bins {names[:4]}; compute the sums "
+                         "with the fit's annotation.")
+
+    def share(key):
+        L = np.asarray(lr["L"][key], dtype=np.float64)
+        W = np.asarray(dz["W"][key], dtype=np.float64)
+        if len(names) == 1:
+            w = np.asarray(lr["vsum"], dtype=np.float64) / float(lr["vsum_all"])
+        else:
+            o = [cls.index(b) for b in names]
+            L, W = L[np.ix_(o, o)], W[np.ix_(o, o)]
+            T = np.asarray(lr["T"][key], dtype=np.float64)[np.ix_(o, o)]
+            w = np.linalg.solve(T.T, np.ones(len(names)))
+        return 1.0 - float(w @ W @ w) / float(w @ L @ w)
+
+    rho_n = share("n")
+    if noself:
+        rho, rho_diag, rho_off = rho_n, 0.0, max(rho_n, 0.0)
+    else:
+        rho = share("self")
+        rho_diag = max(rho - rho_n, 0.0)
+        rho_off = max(rho - rho_diag, 0.0)
+    mult = 1.0 + 2.0 * min(max(float(h2), 0.0), 1.0)
+    denom = 1.0 - rho_diag - rho_off * mult                          # never below the jackknife (shares >= 0)
+    if denom < 0.2:
+        if log is not None:
+            log._log(f"[long-range] {label}: between-group share too large for the correction "
+                     f"(1 - {rho_diag:.3g} - {rho_off:.3g} x {mult:.3g} = {denom:.3g}); limited to 0.2.")
+        denom = 0.2
+    f = np.asarray(unit_sizes, dtype=np.float64)
+    f = f[f > 0] / f[f > 0].sum()
+    hh = min(max(float(h2), 0.0), 1.0)
+    signal = 4.0 * hh ** 2 * (1.0 - float((f * f).sum())) / float(n)        # 4 (h2)^2 (1 - sum f^2) / n
+    var = float(se_jk) ** 2 / denom + signal
+    out = dict(rho=float(rho), rho_diag=float(rho_diag), rho_off=float(rho_off), mult=float(mult), denom=float(denom),
+               signal=float(signal), se_jk=float(se_jk), se=float(np.sqrt(var)),
+               factor=var / float(se_jk) ** 2 if se_jk > 0 else np.nan, design=design)
+    if log is not None:
+        log._log(f"[long-range] {label}: {design} design, between-group share of the LD-score mass {rho:.4g} "
+                 f"(self-pairs {rho_diag:.4g}, rest {rho_off:.4g}), jackknife SE {se_jk:.4g} -> {out['se']:.4g} "
+                 f"({'self-pairs out' if noself else 'self-pairs in'}).")
+    return out

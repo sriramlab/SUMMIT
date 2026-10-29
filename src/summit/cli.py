@@ -622,6 +622,12 @@ def build_parser() -> argparse.ArgumentParser:
                         help=("h2: PREFIX of `summit relatives traces`; rescales the jackknife SE by sqrt(AV / E[V_jk]), the "
                               "model's ratio of the estimate's variance to the jackknife's expectation (covariance between "
                               "blocks). Writes h2_se (rescaled), h2_se_jk and jk_factor."))
+    jackknife.add_argument("--long-range-se", default=None, type=str,
+                        help=("h2: PREFIX of `summit relatives longrange`; adds the covariance between jackknife blocks "
+                              "that the jackknife misses (long-range LD, self-pairs in structured samples): "
+                              "Var = V_jk / (1 - rho_diag - rho_off (1 + 2 h2)) + 4 h2^2 (1 - sum f^2) / n, with "
+                              "rho_diag + rho_off the between-block share of the LD-score mass and rho_diag its "
+                              "self-pair part. Writes h2_se (corrected), h2_se_jk, jk_factor and long_range_rho."))
     jackknife.add_argument("--jack-mode", default="mean", type=str,
                         choices=["mean", "median", "full"],
                         help="Center used in jackknife SE calculation.")
@@ -2068,6 +2074,7 @@ def _dispatch_h2(args, log):
         ldsc_irwls_tol=args.ldsc_irwls_tol,
         snp_var_weights=not getattr(args, "snp_var_weights_off", False),
         jk_traces=getattr(args, "jk_traces", None),
+        long_range=getattr(args, "long_range_se", None),
     )
     sums._run()
     sums._logoff()
