@@ -179,31 +179,47 @@ def pairs_within_sample(rp: RelativePairs, idx: np.ndarray, n_all: int) -> tuple
     return a[use], b[use]
 
 
+_PAIR_CHUNK_ELEMS = 2 ** 24   # elements of one pairs x SNPs product (about 128 MiB in float64)
+
+
 def relative_pair_ld_rel(read_block, nsnps: int, a: np.ndarray, b: np.ndarray, A: np.ndarray, C, n_eff: float,
-                         step_size: int = 5000) -> np.ndarray:
+                         step_size: int = 5000, pair_chunk: int | None = None) -> np.ndarray:
     """LD_REL_{j,k} (nsnps x K) for unordered pairs (a, b) of one sample, in two genotype passes.
 
     `read_block(s, e)` returns the sample's genotypes of SNPs s..e-1 (samples x SNPs, NaN or mean-imputed for missing
     calls); C is the orthonormal covariate basis of that sample (or None); A holds the per-SNP weights of the LD-score
-    columns (the annotation, times V for SNP-variance-weighted LD scores).
+    columns (the annotation, times V for SNP-variance-weighted LD scores). The pair products are formed `pair_chunk`
+    pairs at a time (by default _PAIR_CHUNK_ELEMS elements per product), so beyond the pairs x K matrix W the memory
+    does not grow with the number of pairs.
     """
     A = np.asarray(A, dtype=np.float64)
     if A.shape[0] != int(nsnps):
         raise ValueError(f"LD_REL weights have {A.shape[0]} rows for {nsnps} SNPs.")
+    npairs = int(a.size)
 
     def _blocks():
         for s in range(0, int(nsnps), int(step_size)):
             yield s, min(int(nsnps), s + int(step_size))
 
-    W = np.zeros((a.size, A.shape[1]))                          # first pass: W_k on pairs
+    def _chunks(width):
+        size = int(pair_chunk) if pair_chunk else max(1, int(_PAIR_CHUNK_ELEMS // max(1, int(width))))
+        for p in range(0, npairs, size):
+            yield p, min(npairs, p + size)
+
+    W = np.zeros((npairs, A.shape[1]))                          # first pass: W_k on pairs
     for s, e in _blocks():
         X, _ = _project_normalize(np.array(read_block(s, e), dtype=np.float64), C, n_eff)
-        W += (X[a] * X[b]) @ A[s:e]
+        As = A[s:e]
+        for p, q in _chunks(e - s):
+            W[p:q] += (X[a[p:q]] * X[b[p:q]]) @ As
     out = np.zeros((int(nsnps), A.shape[1]), dtype=np.float64)
     scale = 2.0 / float(n_eff) ** 2                              # unordered pairs counted twice
     for s, e in _blocks():
         X, _ = _project_normalize(np.array(read_block(s, e), dtype=np.float64), C, n_eff)
-        out[s:e] = scale * ((X[a] * X[b]).T @ W)
+        acc = np.zeros((e - s, A.shape[1]))
+        for p, q in _chunks(e - s):
+            acc += (X[a[p:q]] * X[b[p:q]]).T @ W[p:q]
+        out[s:e] = scale * acc
     return out
 
 
@@ -478,7 +494,11 @@ def compute_relative_pair_totals(
                 xh -= g["Cf"] @ B
             xh *= scale[None, :]
             wcols = (r1 * g["adj"])[:, None] * A_blk
-            g["W"] += (xh[g["pa"]] * xh[g["pb"]]) @ wcols
+            pa, pb = g["pa"], g["pb"]
+            csz = max(1, int(_PAIR_CHUNK_ELEMS // max(1, e - s)))   # pair products in chunks
+            for p0 in range(0, pa.size, csz):
+                p1 = min(pa.size, p0 + csz)
+                g["W"][p0:p1] += (xh[pa[p0:p1]] * xh[pb[p0:p1]]) @ wcols
             g["vsum"] += wcols.sum(axis=0)
             if xs is not None:
                 xs.store(k, xh, r1 * g["adj"])
@@ -564,7 +584,7 @@ class _CrossSamplePairs:
         self.num = np.zeros((nclass + 1, T, T))
         self.den = np.zeros((nclass + 1, len(G), len(G)))
         self.width = int(max(1, (1 << 23) // max(1, T * P)))     # SNPs per product (64 MiB per factor)
-        self.max_step = int(max(16, (1 << 26) // max(1, 2 * len(G) * P)))   # block size for the stored pair rows
+        self.max_step = int(max(1, (1 << 26) // max(1, 2 * len(G) * P)))    # block size for the stored pair rows
         self.xa = self.xb = self.sv = None
         self.m0 = [g["m0"] for g in G]
         self.a0, self.b0 = a0, b0
@@ -754,11 +774,20 @@ def compute_relative_pair_moments(
             X = _center_impute(np.asarray(bed.read(index=np.s_[idx, s:e], dtype="float64")))
             Xr, r1 = _pair_rows_block(X, C, n_eff, rows)
             v[s:e] = r1 * adj
-            G = Xr[ar] * Xr[br]                                   # pairs x SNPs
-            rel_m[s:e, ks] = kappa * 2.0 * (G.T @ wp)
+            wblk = (r1 * adj)[:, None] * Aw[s:e] if inbreeding else None
+            acc = np.zeros((e - s, len(ks)))
+            accx = np.zeros((e - s, len(xpairs))) if xpairs else None
+            csize = max(1, int(_PAIR_CHUNK_ELEMS // max(1, e - s)))   # pair products in chunks
+            for p0 in range(0, a.size, csize):
+                p1 = min(a.size, p0 + csize)
+                G = Xr[ar[p0:p1]] * Xr[br[p0:p1]]                 # pairs x SNPs
+                acc += G.T @ wp[p0:p1]
+                if inbreeding:
+                    W[p0:p1] += G @ wblk
+                if xpairs:
+                    accx += G.T @ wx[p0:p1]
+            rel_m[s:e, ks] = kappa * 2.0 * acc
             if inbreeding:                                        # projected genotypes of everyone in the sample
-                wblk = (r1 * adj)[:, None] * Aw[s:e]
-                W += G @ wblk
                 Xp = X - C @ (C.T @ X) if p else X.copy()
                 ssq = np.einsum("ij,ij->j", Xp, Xp)
                 ok = ssq > 1e-10
@@ -766,7 +795,7 @@ def compute_relative_pair_moments(
                 Xp[:, ~ok] = 0.0
                 D += (Xp * Xp) @ wblk
             if xpairs:
-                blk = kappa * (G.T @ wx)
+                blk = kappa * accx
                 for c_, (t1, t2) in enumerate(xpairs):
                     rel_m12[(ks[t1], ks[t2])][s:e] = blk[:, c_]
         wcols = v[:, None] * Aw

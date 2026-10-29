@@ -840,3 +840,34 @@ def test_inbreeding_rg_equals_exact_estimator_without_diagonal_terms(tmp_path, p
     free = {**common, "intercept_rg": None}
     with pytest.raises(ValueError, match="overlapping covariance"):
         Sumcore(rg=f"{tmp_path / 'a.tsv'},{tmp_path / 'b.tsv'}", rel_m12=str(tmp_path / "m12.tsv"), **free)._run()
+
+
+def test_pair_products_in_chunks_match_one_chunk(tmp_path, monkeypatch):
+    """REL_M (totals and per-SNP, with cross-trait and diagonal terms) and LD_REL do not depend on how the related
+    pairs are split into chunks; with a tiny chunk every block is split into many pieces."""
+    import summit.relatives.moments as mom
+    prefix, G, y, covs, iid, cov_path = _simulate(tmp_path, ncov=2, missing=0.004)
+    _two_phenotypes(tmp_path, y, iid)
+    annot, A = _annot(tmp_path, G.shape[1])
+    kw = dict(pairs=str(tmp_path / "pairs.txt"), covar=cov_path, cross=True, annot=annot, inbreeding=True)
+
+    def run(tag):
+        compute_relative_pair_totals(prefix, str(tmp_path / "pheno2.txt"), str(tmp_path / f"tot{tag}"), step_size=61, **kw)
+        compute_relative_pair_moments(prefix, str(tmp_path / "pheno2.txt"), str(tmp_path / f"ex{tag}"), step_size=97, **kw)
+        ld, _ = _ld_rel(G, covs, str(tmp_path / "pairs.txt"), iid, A)
+        return ([pd.read_csv(tmp_path / f"{f}{tag}.rel_m.tsv", sep="\t").set_index("PHENO") for f in ("tot", "ex")]
+                + [pd.read_csv(tmp_path / f"{f}{tag}.rel_m12.tsv", sep="\t") for f in ("tot", "ex")]
+                + [pd.read_csv(tmp_path / f"ex{tag}.tsv.gz", sep="\t")], ld)
+
+    base, ld0 = run("a")
+    monkeypatch.setattr(mom, "_PAIR_CHUNK_ELEMS", 7)
+    small, ld1 = run("b")
+    for t0, t1 in zip(base, small):
+        num = [c for c in t0.columns if t0[c].dtype.kind == "f"]
+        np.testing.assert_allclose(t0[num].to_numpy(float), t1[num].to_numpy(float), rtol=1e-10, atol=1e-13)
+    np.testing.assert_allclose(ld0, ld1, rtol=1e-10, atol=1e-13)
+    a, b = pairs_within_sample(read_relative_pairs(str(tmp_path / "pairs.txt"), pd.DataFrame({"FID": iid, "IID": iid})),
+                               np.arange(G.shape[0]), G.shape[0])
+    C = np.linalg.qr(np.column_stack([np.ones(G.shape[0]), covs]))[0]
+    ld2 = relative_pair_ld_rel(lambda s, e: G[:, s:e], G.shape[1], a, b, A, C, G.shape[0] - 3, step_size=97, pair_chunk=3)
+    np.testing.assert_allclose(ld0, ld2, rtol=1e-10, atol=1e-13)
