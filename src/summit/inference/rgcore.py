@@ -277,6 +277,10 @@ def build_manifest_summary_row(
     h2_fit2,
     intercept: InterceptFit,
     rg_fit: RGFit,
+    rel_m12_input=None,
+    long_range_info: dict | None = None,
+    report_rel: bool = False,
+    report_long_range: bool = False,
 ) -> dict:
     row = {
         "phen1": phen1,
@@ -305,6 +309,18 @@ def build_manifest_summary_row(
         "rg_total_se": float(rg_fit.rg_total[1]),
         "estimator": str((rg_fit.weight_info or {}).get("estimator", "he")),
     }
+
+    if report_rel:
+        row["rel_m12_input"] = rel_m12_input
+    if report_long_range:
+        li = long_range_info or {}
+        get = lambda part, key: float(li.get(part, {}).get(key, np.nan))
+        row["h2_trait1_se_jk"] = get("h2_1", "se_jk")
+        row["h2_trait2_se_jk"] = get("h2_2", "se_jk")
+        row["gamma_g_total_se_jk"] = get("rg", "se_jk")
+        row["rg_total_se_jk"] = get("rg", "se_jk_rg")
+        row["jk_factor_rg"] = get("rg", "factor")
+        row["long_range_rho"] = get("rg", "rho")
 
     for j, header in enumerate(annot_header):
         token = str(header)

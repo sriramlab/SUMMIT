@@ -8,6 +8,7 @@ import pandas as pd
 
 from .. import utils
 from .jackknife import JackknifeSpec, JackknifeDesign
+from .jktraces import load_long_range, long_range_rg, long_range_se
 from .trace import Trace
 from ..sumstats.sumstats import Sumstats, MatchedSumstats, harmonize_allele_codes
 from .h2core import prepare_h2, fit_h2, relatives_diagonal_inputs
@@ -83,6 +84,7 @@ class Sumcore:
         ldsc_irwls_iters: int = 3,
         ldsc_irwls_tol: float = 0.0,
         snp_var_weights: bool = True,
+        long_range=None,
         **_unused_kwargs,
     ):
 
@@ -293,6 +295,14 @@ class Sumcore:
         self.pheno_rg_paths = None if pheno_rg is None else utils._parse_rg_pair(pheno_rg)
         self.pheno_rg_cov_paths = None if pheno_rg_cov is None else utils._parse_rg_pair(pheno_rg_cov)
         self.rel_m12_path = rel_m12
+        self.long_range = None
+        self.long_range_info = None
+        if long_range is not None:
+            if self.weight_mode != "he":
+                raise ValueError("--long-range-se needs the default HE weighting.")
+            if self.rg_se_method != "jackknife":
+                raise ValueError("--long-range-se corrects jackknife SEs; use --rg-se-method jackknife.")
+            self.long_range = long_range if isinstance(long_range, dict) else load_long_range(str(long_range))
 
         if self.intercept_rg is not None and (
             self.pheno_rg_paths is not None or self.pheno_rg_cov_paths is not None
@@ -593,6 +603,11 @@ class Sumcore:
             )
         _stage_stop("fit_rg", t_stage)
 
+        if self.long_range is not None:
+            h2_fit1, h2_fit2, rg_fit = self._apply_long_range(
+                h2_fit1, h2_fit2, rg_fit, intercept, noself=(diag1 is not None, diag2 is not None, rel_s12 is not None)
+            )
+
         self.trace_view = tv
         self.jackknife = jk
         self.matched1 = matched1
@@ -653,6 +668,57 @@ class Sumcore:
                 self.log._log("[perf] " + ", ".join(parts))
 
         return self.result
+
+    def _apply_long_range(self, h2_fit1, h2_fit2, rg_fit, intercept, *, noself):
+        """Long-range LD correction (`summit relatives longrange` sums) of the total h2, genetic covariance and rg SEs.
+
+        Only the totals change; their jackknife SEs are kept in self.long_range_info. Designs other than delete-1 blocks
+        or chromosomes are left as they are."""
+        D = np.asarray(h2_fit1.prepared.jackknife.D, dtype=np.float64)
+        mask = D > 0.5
+        delete1 = D.shape[0] == D.shape[1] and np.all(mask.sum(axis=0) == 1) and np.all(mask.sum(axis=1) == 1)
+        mode = self.jackknife_spec.mode
+        if not delete1 or mode not in ("chr", "block"):
+            if self.log is not None:
+                self.log._log("[long-range] only delete-1 block or chromosome jackknife designs are corrected; SEs left "
+                              "unchanged.")
+            return h2_fit1, h2_fit2, rg_fit
+        design = "chr" if mode == "chr" else "blocks"
+        bins = [str(x) for x in np.asarray(self.trace.annot_header).ravel()]
+        common = dict(design=design, nunits=int(D.shape[0]), bin_names=bins, log=self.log)
+        info = {}
+        fits = []
+        for t, fit in enumerate((h2_fit1, h2_fit2)):
+            p = fit.prepared
+            lr = long_range_se(self.long_range, h2=float(fit.h2[-1, 0]), se_jk=float(fit.h2[-1, 1]),
+                               n=float(p.matched.nsamp), unit_sizes=p.unit_sizes, noself=bool(noself[t]),
+                               label=f"[{self.phen_names[t]}]", **common)
+            info[f"h2_{t + 1}"] = lr
+            if np.isfinite(lr["factor"]):
+                h2 = np.array(fit.h2, dtype=np.float64, copy=True)
+                h2[-1, 1] = lr["se"]
+                fit = replace(fit, h2=h2)
+            fits.append(fit)
+        n12 = float(np.sqrt(float(h2_fit1.prepared.matched.nsamp) * float(h2_fit2.prepared.matched.nsamp)))
+        lrg = long_range_rg(self.long_range, h2_2=float(h2_fit2.h2[-1, 0]), h2_1=float(h2_fit1.h2[-1, 0]),
+                            rg=float(rg_fit.rg_total[0]), c=float(intercept.c[0]),
+                            se_jk_gamma=float(rg_fit.gamma_total[1]), n=n12, unit_sizes=rg_fit.prepared.unit_sizes,
+                            noself=bool(noself[2]), label=f"[{self.phen_names[0]}] & [{self.phen_names[1]}]",
+                            **common)
+        lrg["se_jk_rg"] = float(rg_fit.rg_total[1])
+        info["rg"] = lrg
+        if np.isfinite(lrg["factor"]):
+            k = float(np.sqrt(lrg["factor"]))
+            gamma_total = np.array(rg_fit.gamma_total, dtype=np.float64, copy=True)
+            rg_total = np.array(rg_fit.rg_total, dtype=np.float64, copy=True)
+            gamma_total[1] *= k
+            rg_total[1] *= k
+            rg_fit = replace(rg_fit, gamma_total=gamma_total, rg_total=rg_total, h2_fit1=fits[0], h2_fit2=fits[1])
+        else:
+            rg_fit = replace(rg_fit, h2_fit1=fits[0], h2_fit2=fits[1])
+        lrg["se_rg"] = float(rg_fit.rg_total[1])
+        self.long_range_info = info
+        return fits[0], fits[1], rg_fit
 
     def _logoff(self):
         if self.result is None:
@@ -737,6 +803,14 @@ class Sumcore:
             f"Total genetic correlation (rg): {rg_fit.rg_total[0]:.6g} "
             f"(SE: {rg_fit.rg_total[1]:.6g})"
         )
+        if self.long_range_info is not None:
+            li = self.long_range_info
+            self.log._log(
+                "^^^ Long-range LD correction: jackknife SEs before correction: "
+                f"h2 [{self.phen_names[0]}] {li['h2_1']['se_jk']:.6g}, h2 [{self.phen_names[1]}] {li['h2_2']['se_jk']:.6g}, "
+                f"gamma_g {li['rg']['se_jk']:.6g}, rg {li['rg']['se_jk_rg']:.6g}; between-block share "
+                f"{li['rg']['rho']:.4g}."
+            )
 
         self.end_time = utils._get_time()
         self.log._log("Analysis ended at: " + utils._get_timestr(self.end_time))

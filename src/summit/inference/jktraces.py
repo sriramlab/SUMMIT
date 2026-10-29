@@ -142,17 +142,13 @@ def load_long_range(path: str) -> dict:
     return lr
 
 
-def long_range_se(lr: dict, *, design: str, nunits: int, bin_names, h2: float, se_jk: float, n: float, unit_sizes,
-                  noself: bool, log=None, label: str = "") -> dict:
-    """Long-range LD correction of the block-jackknife SE of total h2.
+def long_range_shares(lr: dict, *, design: str, nunits: int, bin_names, noself: bool, log=None,
+                      label: str = "") -> dict:
+    """Between-group share of the weighted LD-score mass for one jackknife design (`summit relatives longrange` sums).
 
-    The jackknife sees the covariance of the moments within its groups and none between them. rho is the share of
-    the (weighted) LD-score mass between groups, with self-pairs (rho_self) and without (rho_n). The part carried by
-    the self-pairs, rho_diag = max(rho_self - rho_n, 0), enters the variance as it is; the rest, rho_off, also enters
-    the cross and signal terms, whose between-group shares are about 2 and 3 times larger, so
-    Var = V_jk / (1 - rho_diag - rho_off (1 + 2 h2)). Products of different groups' genetic values add
-    4 h2^2 (1 - sum_g f_g^2) / n, f_g the groups' shares of the SNPs. Fits without self-pairs use rho_diag = 0 and
-    rho_off = rho_n."""
+    rho is the share with self-pairs (rho_self) or without them (rho_n). The part carried by the self-pairs,
+    rho_diag = max(rho_self - rho_n, 0), enters the variance as it is; the rest, rho_off, also enters the cross and signal
+    terms. Fits without self-pairs use rho_diag = 0 and rho_off = rho_n. Negative shares are set to 0."""
     dz = lr["designs"][design]
     if design == "blocks" and int(nunits) != int(lr["nblocks"]) and log is not None:
         log._log(f"[long-range] {label}: the sums are for {lr['nblocks']} blocks and the fit has {nunits}; using them "
@@ -182,23 +178,81 @@ def long_range_se(lr: dict, *, design: str, nunits: int, bin_names, h2: float, s
         rho = share("self")
         rho_diag = max(rho - rho_n, 0.0)
         rho_off = max(rho - rho_diag, 0.0)
-    mult = 1.0 + 2.0 * min(max(float(h2), 0.0), 1.0)
-    denom = 1.0 - rho_diag - rho_off * mult                          # never below the jackknife (shares >= 0)
+    return dict(rho=float(rho), rho_diag=float(rho_diag), rho_off=float(rho_off), design=design)
+
+
+def _between_group_signal_share(unit_sizes) -> float:
+    """1 - sum_g f_g^2, f_g the groups' shares of the SNPs (products of different groups' genetic values)."""
+    f = np.asarray(unit_sizes, dtype=np.float64)
+    f = f[f > 0] / f[f > 0].sum()
+    return 1.0 - float((f * f).sum())
+
+
+def _corrected(sh: dict, *, mult: float, signal: float, se_jk: float, log, label: str, what: str) -> dict:
+    denom = 1.0 - sh["rho_diag"] - sh["rho_off"] * mult             # never below the jackknife (shares >= 0)
     if denom < 0.2:
         if log is not None:
             log._log(f"[long-range] {label}: between-group share too large for the correction "
-                     f"(1 - {rho_diag:.3g} - {rho_off:.3g} x {mult:.3g} = {denom:.3g}); limited to 0.2.")
+                     f"(1 - {sh['rho_diag']:.3g} - {sh['rho_off']:.3g} x {mult:.3g} = {denom:.3g}); limited to 0.2.")
         denom = 0.2
-    f = np.asarray(unit_sizes, dtype=np.float64)
-    f = f[f > 0] / f[f > 0].sum()
+    se_jk = float(se_jk)
+    if not (np.isfinite(se_jk) and se_jk > 0):
+        out = dict(sh, mult=float(mult), denom=float(denom), signal=float(signal), se_jk=se_jk, se=se_jk, factor=np.nan)
+        if log is not None:
+            log._log(f"[long-range] {label}: {what} jackknife SE {se_jk:.4g} is not positive; SE left unchanged.")
+        return out
+    var = se_jk ** 2 / denom + signal
+    return dict(sh, mult=float(mult), denom=float(denom), signal=float(signal), se_jk=se_jk, se=float(np.sqrt(var)),
+                factor=var / se_jk ** 2)
+
+
+def long_range_se(lr: dict, *, design: str, nunits: int, bin_names, h2: float, se_jk: float, n: float, unit_sizes,
+                  noself: bool, log=None, label: str = "") -> dict:
+    """Long-range LD correction of the block-jackknife SE of total h2.
+
+    The jackknife sees the covariance of the moments within its groups and none between them (long_range_shares):
+    Var = V_jk / (1 - rho_diag - rho_off (1 + 2 h2)) + 4 h2^2 (1 - sum_g f_g^2) / n, where the cross and signal terms
+    have between-group shares about 2 and 3 times rho_off, and products of different groups' genetic values add the
+    last term."""
+    sh = long_range_shares(lr, design=design, nunits=nunits, bin_names=bin_names, noself=noself, log=log, label=label)
     hh = min(max(float(h2), 0.0), 1.0)
-    signal = 4.0 * hh ** 2 * (1.0 - float((f * f).sum())) / float(n)        # 4 (h2)^2 (1 - sum f^2) / n
-    var = float(se_jk) ** 2 / denom + signal
-    out = dict(rho=float(rho), rho_diag=float(rho_diag), rho_off=float(rho_off), mult=float(mult), denom=float(denom),
-               signal=float(signal), se_jk=float(se_jk), se=float(np.sqrt(var)),
-               factor=var / float(se_jk) ** 2 if se_jk > 0 else np.nan, design=design)
-    if log is not None:
-        log._log(f"[long-range] {label}: {design} design, between-group share of the LD-score mass {rho:.4g} "
-                 f"(self-pairs {rho_diag:.4g}, rest {rho_off:.4g}), jackknife SE {se_jk:.4g} -> {out['se']:.4g} "
-                 f"({'self-pairs out' if noself else 'self-pairs in'}).")
+    signal = 4.0 * hh ** 2 * _between_group_signal_share(unit_sizes) / float(n)
+    out = _corrected(sh, mult=1.0 + 2.0 * hh, signal=signal, se_jk=se_jk, log=log, label=label, what="h2")
+    if log is not None and np.isfinite(out["factor"]):
+        log._log(f"[long-range] {label}: {design} design, between-group share of the LD-score mass {out['rho']:.4g} "
+                 f"(self-pairs {out['rho_diag']:.4g}, rest {out['rho_off']:.4g}), jackknife SE {se_jk:.4g} -> "
+                 f"{out['se']:.4g} ({'self-pairs out' if noself else 'self-pairs in'}).")
+    return out
+
+
+def long_range_rg(lr: dict, *, design: str, nunits: int, bin_names, h2_1: float, h2_2: float, rg: float, c: float,
+                  se_jk_gamma: float, n: float, unit_sizes, noself: bool, log=None, label: str = "") -> dict:
+    """Long-range LD correction of the block-jackknife SEs of total genetic covariance and rg.
+
+    For the cross-trait moments under y_a ~ N(0, h_a K + e_a P) with genetic covariance gamma = rg sqrt(h_1 h_2) and
+    residual cross-covariance c - gamma (c the overlapping covariance in HE scale), the noise, cross and signal terms
+    have weights w1 = e1 e2 + (c - gamma)^2, w2 = h1 e2 + h2 e1 + 2 gamma (c - gamma) and w3 = h1 h2 + gamma^2, and their
+    between-group shares are about 1, 2 and 3 times rho_off. Hence
+    Var(gamma) = V_jk / (1 - rho_diag - rho_off m12) + 2 (h1 h2 + gamma^2)(1 - sum f^2) / n,
+    m12 = (w1 + 2 w2 + 3 w3) / (w1 + w2 + w3) (1 + 2 h2 for one trait). The ratio Var / V_jk of the genetic covariance
+    is applied to the rg jackknife variance as well (in exact traces it is never smaller than rg's own ratio)."""
+    sh = long_range_shares(lr, design=design, nunits=nunits, bin_names=bin_names, noself=noself, log=log, label=label)
+    h1 = min(max(float(h2_1), 0.0), 1.0)
+    h2 = min(max(float(h2_2), 0.0), 1.0)
+    r = min(max(float(rg), -1.0), 1.0) if np.isfinite(rg) else 0.0
+    gam = r * float(np.sqrt(h1 * h2))
+    e12 = min(max(float(c) - gam, -1.0), 1.0) if np.isfinite(c) else 0.0
+    w1 = (1.0 - h1) * (1.0 - h2) + e12 * e12
+    w2 = h1 * (1.0 - h2) + h2 * (1.0 - h1) + 2.0 * gam * e12
+    w3 = h1 * h2 + gam * gam
+    tot = w1 + w2 + w3
+    m12 = (w1 + 2.0 * w2 + 3.0 * w3) / tot if tot > 0 else 1.0
+    m12 = min(max(m12, 1.0), 3.0)
+    signal = 2.0 * w3 * _between_group_signal_share(unit_sizes) / float(n)
+    out = _corrected(sh, mult=m12, signal=signal, se_jk=se_jk_gamma, log=log, label=label, what="genetic covariance")
+    if log is not None and np.isfinite(out["factor"]):
+        log._log(f"[long-range] {label}: {design} design, between-group share of the LD-score mass {out['rho']:.4g} "
+                 f"(self-pairs {out['rho_diag']:.4g}, rest {out['rho_off']:.4g}), m12 {m12:.4g}; genetic covariance "
+                 f"jackknife SE {float(se_jk_gamma):.4g} -> {out['se']:.4g}, variance factor {out['factor']:.4g} "
+                 f"applied to rg ({'self-pairs out' if noself else 'self-pairs in'}).")
     return out

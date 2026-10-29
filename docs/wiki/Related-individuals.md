@@ -223,7 +223,20 @@ rescaled SE with 8 MAF-LD bins, and 1.00 to 1.19 times with one component,
 against 0.89 to 1.00 for the jackknife alone. At h² of 0.25 and 200 blocks the
 correction raised the SE by about 1% in white British participants, 5% to 11%
 in South Asian participants, 5% to 7% in African-European admixed participants
-and 5% in a wider African-ancestry group. Only `--h2` uses it for now.
+and 5% in a wider African-ancestry group.
+
+`--rg` takes the same option. Each trait's h² SE is corrected as above. For the
+genetic covariance, `1 + 2 h2` becomes
+
+    m12 = (w1 + 2 w2 + 3 w3) / (w1 + w2 + w3)
+
+with `w1 = (1 - h1)(1 - h2) + (c - g)^2`, `w2 = h1 (1 - h2) + h2 (1 - h1) + 2 g (c - g)`
+and `w3 = h1 h2 + g^2`, where `g` is the genetic covariance and `c` the
+overlapping covariance in HE scale, and the second term becomes
+`2 w3 (1 - sum f^2) / n`. The ratio of the corrected to the jackknife variance of
+the genetic covariance is applied to rg. Only the totals change; per-bin SEs are
+the jackknife SEs, and the log lists the jackknife SEs of the totals. In the same
+cohorts the rg SE was 0.99 to 1.03 times the exact rescaled SE with 8 MAF-LD bins.
 
 `--jk-traces`, with the traces of `summit relatives traces`, computes the exact
 rescaling `SE_jk * sqrt(AV / E[V_jk])` from the traces of every pair of blocks.
@@ -294,7 +307,13 @@ the pairs would be removed from some estimating equations and kept in others. Wi
 in-sample LD scores that carry LD_REL, the same file serves h² and rg.
 `REL_M12` exists only for phenotypes with identical complete-case samples.
 The sample-overlap covariance describes each person's own two phenotypes and
-needs no change. rg manifests do not accept `REL_M`.
+needs no change.
+
+In rg manifest mode, give each pair's `--rel-m12` file or value in an optional
+`rel_m12` column. `--long-range-se` applies to every pair, and the results table
+then also has the jackknife SEs (`rg_total_se_jk` and the others), `jk_factor_rg`
+and `long_range_rho`. `--rg-manifest-fast` accepts neither `REL_M` nor these
+options.
 
 ## Simulations
 

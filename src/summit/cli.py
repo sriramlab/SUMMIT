@@ -557,7 +557,7 @@ def build_parser() -> argparse.ArgumentParser:
             "Cross-trait related-pair HE moment for the --rg pair: the file written by "
             "`summit relatives cross-m12` (one REL_M12 value, or SNP and REL_M12 with --per-snp), or the value "
             "itself. Required, together with REL_M columns in both sumstats files, to exclude related pairs "
-            "from genetic covariance."
+            "from genetic covariance. In rg manifest mode, give it per pair in an optional rel_m12 column."
         ),
     )
     cross.add_argument(
@@ -623,11 +623,14 @@ def build_parser() -> argparse.ArgumentParser:
                               "model's ratio of the estimate's variance to the jackknife's expectation (covariance between "
                               "blocks). Writes h2_se (rescaled), h2_se_jk and jk_factor."))
     jackknife.add_argument("--long-range-se", default=None, type=str,
-                        help=("h2: PREFIX of `summit relatives longrange`; adds the covariance between jackknife blocks "
-                              "that the jackknife misses (long-range LD, self-pairs in structured samples): "
+                        help=("h2 and rg: PREFIX of `summit relatives longrange`; adds the covariance between jackknife "
+                              "blocks that the jackknife misses (long-range LD, self-pairs in structured samples): "
                               "Var = V_jk / (1 - rho_diag - rho_off (1 + 2 h2)) + 4 h2^2 (1 - sum f^2) / n, with "
                               "rho_diag + rho_off the between-block share of the LD-score mass and rho_diag its "
-                              "self-pair part. Writes h2_se (corrected), h2_se_jk, jk_factor and long_range_rho."))
+                              "self-pair part. h2 writes h2_se (corrected), h2_se_jk, jk_factor and long_range_rho; "
+                              "rg corrects the total h2, genetic covariance and rg SEs (the genetic covariance's "
+                              "factor, with 1 + 2 h2 replaced by its two-trait analogue, is applied to rg) and logs "
+                              "the jackknife SEs."))
     jackknife.add_argument("--jack-mode", default="mean", type=str,
                         choices=["mean", "median", "full"],
                         help="Center used in jackknife SE calculation.")
@@ -2212,6 +2215,7 @@ def _dispatch_rg(args, log):
         ldsc_irwls_iters=args.ldsc_irwls_iters,
         ldsc_irwls_tol=args.ldsc_irwls_tol,
         snp_var_weights=not getattr(args, "snp_var_weights_off", False),
+        long_range=getattr(args, "long_range_se", None),
     )
     rg._run()
     rg._logoff()
@@ -2230,6 +2234,23 @@ def _read_rg_manifest(path: str) -> pd.DataFrame:
     if df.shape[0] == 0:
         raise ValueError(f"RG manifest '{path}' has no rows.")
     return df
+
+
+def _coerce_optional_rel_m12(val, *, row_label: str):
+    """Optional per-pair --rel-m12 of an rg manifest row: a `summit relatives cross-m12` file or one finite value."""
+    if pd.isna(val) or str(val).strip() == "":
+        return None
+    raw = str(val).strip()
+    try:
+        fv = float(raw)
+    except ValueError:
+        path = os.path.expanduser(raw)
+        if not os.path.isfile(path):
+            raise ValueError(f"Manifest row {row_label}: rel_m12 '{raw}' is neither a file nor a number.") from None
+        return path
+    if not np.isfinite(fv):
+        raise ValueError(f"Manifest row {row_label}: rel_m12 must be finite; got {raw!r}.")
+    return raw
 
 
 def _coerce_optional_cov_rank(val, *, row_label: str, col_name: str):
@@ -2276,6 +2297,7 @@ def _normalize_rg_manifest(path: str, log=None, *, require_intercept: bool = Tru
         )
     opt_cov1 = _manifest_column(raw, "cov_rank1")
     opt_cov2 = _manifest_column(raw, "cov_rank2")
+    opt_rel = _manifest_column(raw, "rel_m12")
 
     rows = []
     for idx, row in raw.iterrows():
@@ -2323,6 +2345,7 @@ def _normalize_rg_manifest(path: str, log=None, *, require_intercept: bool = Tru
 
         cov_rank1 = _coerce_optional_cov_rank(row[opt_cov1], row_label=str(row_id), col_name="cov_rank1") if opt_cov1 is not None else None
         cov_rank2 = _coerce_optional_cov_rank(row[opt_cov2], row_label=str(row_id), col_name="cov_rank2") if opt_cov2 is not None else None
+        rel_m12 = _coerce_optional_rel_m12(row[opt_rel], row_label=str(row_id)) if opt_rel is not None else None
 
         rows.append({
             "row_id": row_id,
@@ -2333,6 +2356,7 @@ def _normalize_rg_manifest(path: str, log=None, *, require_intercept: bool = Tru
             "intercept_rg": intercept_rg,
             "cov_rank1": cov_rank1,
             "cov_rank2": cov_rank2,
+            "rel_m12": rel_m12,
             "out_stem": utils._pair_output_stem(phen1, phen2),
         })
 
@@ -2340,7 +2364,7 @@ def _normalize_rg_manifest(path: str, log=None, *, require_intercept: bool = Tru
     if df.shape[0] == 0:
         raise ValueError(f"RG manifest '{path}' has no usable rows.")
 
-    dup_cols = ["phen1", "phen2", "sumstats1", "sumstats2", "intercept_rg", "cov_rank1", "cov_rank2"]
+    dup_cols = ["phen1", "phen2", "sumstats1", "sumstats2", "intercept_rg", "cov_rank1", "cov_rank2", "rel_m12"]
     dup_mask = df.duplicated(subset=dup_cols, keep=False)
     if dup_mask.any():
         bad_rows = ", ".join(str(x) for x in df.loc[dup_mask, "row_id"].tolist())
@@ -2547,7 +2571,8 @@ def _dispatch_rg_manifest(args, log):
         log._log("!!! --ldscores must be provided for rg estimation. !!!")
         raise SystemExit(1)
     if getattr(args, "rel_m12", None) is not None:
-        log._log("!!! --rel-m12 applies to a single --rg pair; it is not supported in rg manifest mode. !!!")
+        log._log("!!! --rel-m12 applies to a single --rg pair; in rg manifest mode give each pair's value or file in "
+                 "an optional rel_m12 column. !!!")
         raise SystemExit(1)
     if args.intercept_rg is not None or args.pheno_rg is not None or args.pheno_rg_cov is not None:
         log._log(
@@ -2577,6 +2602,15 @@ def _dispatch_rg_manifest(args, log):
         log=log,
         require_intercept=False,
     )
+    has_rel = bool(manifest_df["rel_m12"].notna().any())
+    if bool(getattr(args, "rg_manifest_fast", False)) and (has_rel or getattr(args, "long_range_se", None) is not None):
+        log._log("!!! The rel_m12 manifest column and --long-range-se are not available with --rg-manifest-fast; use "
+                 "regular rg manifest mode. !!!")
+        raise SystemExit(1)
+    long_range = None
+    if getattr(args, "long_range_se", None) is not None:
+        from .inference.jktraces import load_long_range
+        long_range = load_long_range(args.long_range_se)
 
     if bool(getattr(args, "rg_manifest_fast", False)):
         if args.weight_mode != "he":
@@ -2668,6 +2702,9 @@ def _dispatch_rg_manifest(args, log):
             intercept_weight_mode=args.intercept_weight_mode,
             intercept_rg=row_intercept,
             intercept_rg_source="manifest",
+            rel_m12=(None if row.rel_m12 is None or (isinstance(row.rel_m12, float) and np.isnan(row.rel_m12))
+                     else row.rel_m12),
+            long_range=long_range,
             chisq_action=args.chisq_action,
             report_tau=True,
             allow_neg_enr=args.allow_neg_enr,
@@ -2716,6 +2753,10 @@ def _dispatch_rg_manifest(args, log):
             h2_fit2=h2_fit2,
             intercept=intercept,
             rg_fit=rg_fit,
+            rel_m12_input=(row.rel_m12 if has_rel else None),
+            long_range_info=rg.long_range_info,
+            report_rel=has_rel,
+            report_long_range=long_range is not None,
         )
         row_summary["_row_id"] = int(row.row_id)
         results_rows.append(row_summary)
