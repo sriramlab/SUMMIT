@@ -90,8 +90,9 @@ sample, and `append` and `cross-m12` accept the file in place of the
 per-phenotype tables.
 
 Add `--cross` to write `results/relmoments.rel_m12.tsv`, the cross-trait value
-`REL_M12` for every pair of phenotypes with the same complete-case samples
-(see [Genetic correlation](#genetic-correlation)).
+`REL_M12` for every pair of phenotypes
+(see [Genetic correlation](#genetic-correlation)). With `--per-snp` it covers
+only pairs with the same complete-case sample.
 When the LD scores are computed in the study itself, the LD-score step adds the
 relatives' share (see [LD scores](#ld-scores)).
 
@@ -305,7 +306,12 @@ or a per-SNP file from `--per-snp --cross`. SUMMIT
 requires `REL_M` in both files and `--rel-m12`. With only some of them,
 the pairs would be removed from some estimating equations and kept in others. With
 in-sample LD scores that carry LD_REL, the same file serves h² and rg.
-`REL_M12` exists only for phenotypes with identical complete-case samples.
+Two phenotypes measured in different complete-case samples are each projected
+and normalized in their own sample, as in their GWAS. `REL_M12` then sums over
+related pairs with one member in each sample, and its weights are
+`sqrt(V_a V_b)`. The same genotype pass computes it for every pair of phenotypes,
+about 15% more time with 40 phenotypes. For these pairs `--inbreeding` writes no
+`REL_S12`.
 The sample-overlap covariance describes each person's own two phenotypes and
 needs no change.
 

@@ -367,7 +367,15 @@ def compute_relative_pair_totals(
     each complete-case sample, so the pass costs about one extra projection of the genotype matrix per sample.
 
     Writes `out`.rel_m.tsv (PHENO N N_COVARIATES PAIRS REL_M [REL_M_<class> ...]), with `cross` also `out`.rel_m12.tsv
-    (PHENO1 PHENO2 N PAIRS REL_M12, phenotype pairs with identical complete-case samples), and `out`.json.
+    (PHENO1 PHENO2 N PAIRS REL_M12 [REL_M12_<class> ...] for every phenotype pair; N is the number of individuals in both
+    samples and PAIRS the number of related pairs with a member in each), and `out`.json.
+
+    Phenotypes a and b measured in different complete-case samples have the cross-trait moment
+    z*_a z*_b = (x_a'y_a)(x_b'y_b) / sqrt(N_eff,a N_eff,b), each factor projected and normalized in its own sample, so
+    REL_M12_j = sum over ordered related pairs (i in sample a, i' in sample b) of x_a,ij y_a,i x_b,i'j y_b,i' divided by
+    sqrt(N_eff,a N_eff,b), and the per-pair values are its means weighted by sqrt(V_a,j V_b,j) (V_j when the samples are
+    the same). The same pass accumulates these sums for every pair of phenotypes as one matrix product per class over the
+    related pairs and SNPs; REL_S12 (`inbreeding`) is left empty (NaN) for such pairs.
 
     One genotype pass serves every phenotype, and the values equal those computed from the exact per-SNP REL_M
     (`compute_relative_pair_moments`): each complete-case sample keeps its own covariate basis (the same as the per-SNP
@@ -412,8 +420,11 @@ def compute_relative_pair_totals(
         Cfull[m0] = C
         cols.append(Cfull)
         inside = m0[a0] & m0[b0]
+        Y, _ = _project_normalize(Yall[idx][:, ks].copy(), C, float(n - p - 1))
+        yfull = np.zeros((n0, len(ks)))
+        yfull[m0] = Y
         G.append(dict(ks=ks, idx=idx, m0=m0, C=C, n=n, p=p, n_eff=float(n - p - 1), adj=float(n - 1) / float(n - p - 1),
-                      off=off, inside=inside, pa=ar[inside], pb=br[inside], Cf=Cfull[rows],
+                      off=off, inside=inside, pa=ar[inside], pb=br[inside], Cf=Cfull[rows], Y=Y, yfull=yfull,
                       W=np.zeros((int(inside.sum()), K)), vsum=np.zeros(K),
                       rows=(np.flatnonzero(m0) if inbreeding else None),
                       D=(np.zeros((n, K)) if inbreeding else None)))
@@ -423,6 +434,11 @@ def compute_relative_pair_totals(
     Mmask = np.column_stack([g["m0"] for g in G]).astype(np.float64)
     ng = np.array([g["n"] for g in G], dtype=np.float64)
     step = _auto_step(step_size, n0)
+    xs = None
+    if cross and len(G) > 1:                                      # phenotype pairs in different samples
+        xs = _CrossSamplePairs(G, A, a0, b0, ar, br, len(classes))
+        if step_size is None:
+            step = min(step, xs.max_step)
     _log(f"[relatives] one genotype pass over {M} SNPs in blocks of {step} for {len(pheno_cols)} phenotype(s) in "
          f"{len(G)} complete-case sample(s): union n={n0}, {a0.size} pairs, {rows.size} individuals in families.")
     nblk = -(-M // step)
@@ -464,6 +480,8 @@ def compute_relative_pair_totals(
             wcols = (r1 * g["adj"])[:, None] * A_blk
             g["W"] += (xh[g["pa"]] * xh[g["pb"]]) @ wcols
             g["vsum"] += wcols.sum(axis=0)
+            if xs is not None:
+                xs.store(k, xh, r1 * g["adj"])
             if inbreeding:                                        # diagonal sum_j V_j a_jk x_ij^2 for everyone in the sample
                 xg = X[g["rows"]] - mu[None, :]
                 if anynan:
@@ -472,6 +490,8 @@ def compute_relative_pair_totals(
                     xg -= g["C"] @ B
                 xg *= scale[None, :]
                 g["D"] += (xg * xg) @ wcols
+        if xs is not None:
+            xs.accumulate(s, e)
         if (b_ + 1) % max(1, nblk // 10) == 0:
             _log(f"[relatives] {e} of {M} SNPs")
     rows_out, cross_rows = [], ([] if cross else None)
@@ -479,10 +499,7 @@ def compute_relative_pair_totals(
                "union_n": n0, "classes": classes, "npairs_listed": int(rp.npairs), "inbreeding": bool(inbreeding),
                "phenotypes": {}}
     for g in G:
-        ks, idx, n, p, n_eff = g["ks"], g["idx"], g["n"], g["p"], g["n_eff"]
-        Y, _ = _project_normalize(Yall[idx][:, ks].copy(), g["C"], n_eff)
-        yfull = np.zeros((n0, len(ks)))
-        yfull[g["m0"]] = Y
+        ks, idx, n, p, n_eff, Y, yfull = g["ks"], g["idx"], g["n"], g["p"], g["n_eff"], g["Y"], g["yfull"]
         ga, gb = a0[g["inside"]], b0[g["inside"]]
         wp = yfull[ga] * yfull[gb]
         tot = (2.0 / n_eff) * (wp.T @ g["W"])                     # phenotypes x (all, classes): sum_j V_j a_jk REL_M_j
@@ -512,11 +529,101 @@ def compute_relative_pair_totals(
                                        *(inb["cross"](t1, t2) if inb is not None else [])])
         _log(f"[relatives] phenotypes {[pheno_cols[k] for k in ks][:5]}: n={n}, p={p}, pairs used={npair}.")
     if cross:
-        skipped = sum(len(g1["ks"]) * len(g2["ks"]) for i1, g1 in enumerate(G) for g2 in G[i1 + 1:])
-        if skipped:
-            _log(f"[relatives] REL_M12 not computed for {skipped} phenotype pair(s) with different complete-case samples.")
+        nsame = len(cross_rows)
+        if xs is not None:
+            nan_s12 = [np.nan] * K if inbreeding else []
+            for k1, k2, n12, npair, v12 in xs.values():
+                cross_rows.append([pheno_cols[k1], pheno_cols[k2], n12, npair, *v12.tolist(), *nan_s12])
+        order = {name: k for k, name in enumerate(pheno_cols)}
+        cross_rows.sort(key=lambda r: (order[r[0]], order[r[1]]))
+        summary["cross_pairs"] = {"same_sample": nsame, "different_samples": len(cross_rows) - nsame}
+        _log(f"[relatives] REL_M12 for {len(cross_rows)} phenotype pair(s), {len(cross_rows) - nsame} of them with "
+             "different complete-case samples" + (" (REL_S12 is not computed for those)." if inbreeding else "."))
     _write_totals(out, rows_out, cross_rows, classes, summary, inbreeding=inbreeding)
     return summary
+
+
+class _CrossSamplePairs:
+    """REL_M12 sums for phenotypes in different complete-case samples, accumulated in the totals pass.
+
+    For SNP j of class c (the annotation's class, or one extra class for SNPs outside it) and phenotypes t1, t2 with
+    samples g, h: num_c[t1, t2] = sum_j sum over unordered related pairs (i, i') of u_t1,ij u_t2,i'j, with
+    u_t,ij = y_t,i x_g(t),ij sqrt(V_g(t),j) (genotypes projected and normalized in the phenotype's own sample, y zero
+    outside it), and den_c[g, h] = sum_j sqrt(V_gj V_hj). Each block's pair rows are kept per sample (`store`); `accumulate`
+    then adds one matrix product of (phenotypes x pairs*SNPs) arrays per class."""
+
+    def __init__(self, G, A, a0, b0, ar, br, nclass):
+        self.G, self.ar, self.br, self.nclass = G, ar, br, nclass
+        self.cls = (np.where(A.sum(axis=1) > 0, A.argmax(axis=1), nclass) if nclass
+                    else np.zeros(A.shape[0], dtype=np.int64))
+        self.slot = np.concatenate([g["ks"] for g in G])          # phenotype of each row of ya/yb, grouped by sample
+        self.gof = np.repeat(np.arange(len(G)), [len(g["ks"]) for g in G])
+        self.ya = np.vstack([g["yfull"][a0].T for g in G])        # phenotypes x pairs: y at the first member
+        self.yb = np.vstack([g["yfull"][b0].T for g in G])
+        T, P = self.ya.shape
+        self.num = np.zeros((nclass + 1, T, T))
+        self.den = np.zeros((nclass + 1, len(G), len(G)))
+        self.width = int(max(1, (1 << 23) // max(1, T * P)))     # SNPs per product (64 MiB per factor)
+        self.max_step = int(max(16, (1 << 26) // max(1, 2 * len(G) * P)))   # block size for the stored pair rows
+        self.xa = self.xb = self.sv = None
+        self.m0 = [g["m0"] for g in G]
+        self.a0, self.b0 = a0, b0
+
+    def store(self, k, xh, v):
+        """Projected genotypes xh (family rows x block SNPs) and V weights of sample k for the current block."""
+        if self.xa is None or self.xa.shape[2] != xh.shape[1]:
+            shape = (len(self.G), self.ar.size, xh.shape[1])
+            self.xa, self.xb, self.sv = np.empty(shape), np.empty(shape), np.empty((len(self.G), xh.shape[1]))
+        sv = np.sqrt(v)
+        np.multiply(xh[self.ar], sv[None, :], out=self.xa[k])
+        np.multiply(xh[self.br], sv[None, :], out=self.xb[k])
+        self.sv[k] = sv
+
+    def accumulate(self, s, e):
+        cls = self.cls[s:e]
+        perm = np.argsort(cls, kind="stable")
+        cls = cls[perm]
+        T, P = self.ya.shape
+        cuts = np.flatnonzero(np.diff(cls)) + 1
+        buf_a, buf_b = np.empty(T * P * self.width), np.empty(T * P * self.width)
+        for r0, r1 in zip(np.concatenate([[0], cuts]), np.concatenate([cuts, [cls.size]])):
+            c = int(cls[r0])
+            for q0 in range(r0, r1, self.width):
+                cj = perm[q0:min(r1, q0 + self.width)]
+                w = cj.size
+                sv = self.sv[:, cj]
+                self.den[c] += sv @ sv.T
+                if P == 0:
+                    continue
+                za, zb = buf_a[:T * P * w].reshape(T, P, w), buf_b[:T * P * w].reshape(T, P, w)
+                o = 0
+                for k, g in enumerate(self.G):
+                    t = len(g["ks"])
+                    np.multiply(self.ya[o:o + t, :, None], self.xa[k][None, :, cj], out=za[o:o + t])
+                    np.multiply(self.yb[o:o + t, :, None], self.xb[k][None, :, cj], out=zb[o:o + t])
+                    o += t
+                self.num[c] += za.reshape(T, -1) @ zb.reshape(T, -1).T
+
+    def values(self):
+        """(phenotype 1, phenotype 2, N in both samples, related pairs with a member in each, REL_M12 (all, classes))
+        for every pair of phenotypes in different samples, phenotype 1 first in the phenotype order."""
+        num = self.num + self.num.transpose(0, 2, 1)              # both orders of each related pair
+        out = []
+        for s1 in range(self.slot.size):
+            for s2 in range(self.slot.size):
+                k1, k2 = int(self.slot[s1]), int(self.slot[s2])
+                g, h = int(self.gof[s1]), int(self.gof[s2])
+                if g == h or k1 > k2:
+                    continue
+                norm = np.sqrt(self.G[g]["n_eff"] * self.G[h]["n_eff"])
+                nc, dc = num[:, s1, s2] / norm, self.den[:, g, h]
+                vals = np.concatenate([[nc.sum() / dc.sum() if dc.sum() > 0 else np.nan],
+                                       np.where(dc[:self.nclass] > 0, nc[:self.nclass], np.nan)
+                                       / np.where(dc[:self.nclass] > 0, dc[:self.nclass], 1.0)])
+                mg, mh = self.m0[g], self.m0[h]
+                npair = int(((mg[self.a0] & mh[self.b0]) | (mg[self.b0] & mh[self.a0])).sum())
+                out.append((k1, k2, int((mg & mh).sum()), npair, vals))
+        return out
 
 
 def _diagonal_terms(D, W, vsum, C, n, n_eff, pa, pb, Y, nclass):
@@ -791,7 +898,8 @@ def extract_rel_m12(rel_table: str, pheno1: str, pheno2: str, out: str, annot: s
     From the per-pair table of `moments --cross` (`.rel_m12.tsv`) the file holds one value (column REL_M12) or, with
     `annot`, SNP and the class's REL_M12 for every SNP of the annotation; from the per-SNP table of `--per-snp --cross`
     it holds SNP and REL_M12. If `moments` ran with `--inbreeding`, REL_S12 (the cross-trait diagonal-term value) is
-    written next to REL_M12, in the same layout. Returns the REL_M12 value (or its mean over SNPs)."""
+    written next to REL_M12, in the same layout, unless it is empty (phenotypes in different complete-case samples).
+    Returns the REL_M12 value (or its mean over SNPs)."""
     per_snp = not _is_totals_table(rel_table, "PHENO1")
     totals = _sibling_totals(rel_table, ".rel_m12.tsv") if per_snp else rel_table
     row = tcols = None
@@ -799,10 +907,10 @@ def extract_rel_m12(rel_table: str, pheno1: str, pheno2: str, out: str, annot: s
         tab = pd.read_csv(totals, sep="\t", dtype={"PHENO1": str, "PHENO2": str})
         hit = tab[((tab.PHENO1 == pheno1) & (tab.PHENO2 == pheno2)) | ((tab.PHENO1 == pheno2) & (tab.PHENO2 == pheno1))]
         if len(hit) != 1:
-            raise ValueError(f"{totals} has no REL_M12 for {pheno1} and {pheno2}; run moments with --cross "
-                             "(both phenotypes need the same complete-case sample).")
+            raise ValueError(f"{totals} has no REL_M12 for {pheno1} and {pheno2}; run moments with --cross (with "
+                             "--per-snp, both phenotypes need the same complete-case sample).")
         row, tcols = hit.iloc[0], tab.columns
-    inb = row is not None and "REL_S12" in tcols
+    inb = row is not None and "REL_S12" in tcols and bool(np.isfinite(float(row["REL_S12"])))
     if per_snp:
         cols = pd.read_csv(rel_table, sep="\t", nrows=0).columns
         name = next((f"REL_M12_{a}__{b}" for a, b in ((pheno1, pheno2), (pheno2, pheno1))

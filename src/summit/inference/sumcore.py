@@ -1065,7 +1065,8 @@ class Sumcore:
         if not all(have.values()):
             raise ValueError("Leaving the diagonal terms out of rg (`summit relatives moments --inbreeding`) needs the "
                              "values in both sumstats files (`append`) and REL_S12 in the --rel-m12 file (`cross-m12` "
-                             "from `moments --cross --inbreeding`); present: "
+                             "from `moments --cross --inbreeding`, which has no REL_S12 for phenotypes in different "
+                             "complete-case samples); present: "
                              + ", ".join(f"{k} {'yes' if v else 'no'}" for k, v in have.items()) + ".")
         if self.weight_mode != "he":
             raise ValueError("The --inbreeding values need the default HE weighting.")

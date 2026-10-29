@@ -382,6 +382,104 @@ def test_totals_are_exact_for_phenotypes_measured_in_subsets(tmp_path, missing):
                                    t2.loc[name, ["REL_M", "REL_M_lowmaf", "REL_M_highmaf"]].to_numpy(dtype=float), rtol=1e-9)
 
 
+def _sample_projection(G, Z, mask):
+    """Genotypes and covariates of one complete-case sample, projected and normalized as SUMMIT's GWAS sees them:
+    rows outside the sample are zero; returns (X, V, Q, n_eff), V = (1 - R2 on the covariates) (n - 1) / N_eff."""
+    N, M = G.shape
+    g = np.asarray(G[mask], dtype=np.float64)
+    g = np.where(np.isnan(g), np.nanmean(g, 0)[None, :], g)
+    g -= g.mean(0)
+    n = int(mask.sum())
+    U, sv, _ = np.linalg.svd(np.column_stack([np.ones(n), Z[mask]]), full_matrices=False)
+    Q = U[:, sv > 1e-10 * sv[0]]
+    n_eff = n - Q.shape[1]
+    raw = (g ** 2).sum(0)
+    g -= Q @ (Q.T @ g)
+    ss = (g ** 2).sum(0)
+    X = np.zeros((N, M))
+    X[mask] = g * np.sqrt(n_eff / ss)[None, :]
+    return X, np.minimum(1.0, ss / raw) * (n - 1) / n_eff, Q, n_eff
+
+
+@pytest.mark.parametrize("missing", [0.0, 0.01])
+def test_rel_m12_for_phenotypes_in_different_samples(tmp_path, missing):
+    """REL_M12 of phenotypes in different complete-case samples (one with a lower covariate rank) equals
+    y_a'(K_ab o R) y_b / sqrt(N_eff,a N_eff,b) / sum_j w_j, with K_ab = sum_j w_j x_a,j x_b,j' between the two samples'
+    projected genotypes, R the related pairs of different individuals and w_j = a_jk sqrt(V_a,j V_b,j), overall, per
+    class and outside the annotation; it is the related-pair part of SUMMIT's cross moment z*_a z*_b, and pairs in the
+    same sample keep the existing values."""
+    prefix, G, y, covs, iid, _ = _simulate(tmp_path, N=500, M=260, npairs=100, ncov=2, missing=missing)
+    rng = np.random.default_rng(4)
+    grp = (rng.random(len(iid)) < 0.6).astype(float)
+    cdf = pd.DataFrame({"FID": iid, "IID": iid, "c0": covs[:, 0], "c1": covs[:, 1], "grp": grp})
+    cdf.to_csv(tmp_path / "covar3.txt", sep=" ", index=False)
+    y2 = _two_phenotypes(tmp_path, y, iid)
+    ph = pd.DataFrame({"FID": iid, "IID": iid, "full": y, "ninth": y2, "grp1": y + y2,
+                       "full2": y2 + rng.standard_normal(len(iid))})
+    ph.loc[::9, "ninth"] = np.nan
+    ph.loc[grp == 0, "grp1"] = np.nan
+    ph.to_csv(tmp_path / "pheno4.txt", sep=" ", index=False, na_rep="NA")
+    M = G.shape[1]
+    b = (np.random.default_rng(5).random(M) < 0.4).astype(int)
+    A = np.column_stack([b, 1 - b]).astype(float)
+    A[-30:] = 0.0                                          # SNPs outside the annotation
+    pd.DataFrame({**_snp_meta(M), "CM": 0, "lowmaf": b, "highmaf": 1 - b}).iloc[:-30].to_csv(
+        tmp_path / "annot.txt", sep="\t", index=False)
+    annot = str(tmp_path / "annot.txt")
+    kw = dict(pairs=str(tmp_path / "pairs.txt"), covar=str(tmp_path / "covar3.txt"), annot=annot, cross=True)
+    s1 = compute_relative_pair_totals(prefix, str(tmp_path / "pheno4.txt"), str(tmp_path / "tot"), step_size=37, **kw)
+    assert s1["cross_pairs"] == {"same_sample": 1, "different_samples": 5}
+    tab = pd.read_csv(tmp_path / "tot.rel_m12.tsv", sep="\t")
+    assert list(zip(tab.PHENO1, tab.PHENO2)) == [("full", "ninth"), ("full", "grp1"), ("full", "full2"),
+                                                 ("ninth", "grp1"), ("ninth", "full2"), ("grp1", "full2")]
+    Z = np.column_stack([covs, grp])
+    fam = read_relative_pairs(str(tmp_path / "pairs.txt"), pd.DataFrame({"FID": iid, "IID": iid})).family
+    R = (fam[:, None] == fam[None, :]) & ~np.eye(len(iid), dtype=bool)
+    proj = {}
+    for name in ph.columns[2:]:
+        mask = np.isfinite(ph[name].to_numpy())
+        X, V, Q, n_eff = _sample_projection(G, Z, mask)
+        yy = np.zeros(len(iid))
+        v = ph[name].to_numpy()[mask]
+        v = v - Q @ (Q.T @ v)
+        yy[mask] = v * np.sqrt(n_eff / (v ** 2).sum())
+        proj[name] = (X, V, yy, n_eff, mask)
+    for _, row in tab.iterrows():
+        Xa, Va, ya, na, ma = proj[row.PHENO1]
+        Xb, Vb, yb, nb, mb = proj[row.PHENO2]
+        assert row.N == int((ma & mb).sum())
+        assert row.PAIRS == int((R & (ma[:, None] & mb[None, :] | mb[:, None] & ma[None, :])).sum() // 2)
+        for col, a_k in (("REL_M12", np.ones(M)), ("REL_M12_lowmaf", A[:, 0]), ("REL_M12_highmaf", A[:, 1])):
+            w = a_k * np.sqrt(Va * Vb)
+            K = (Xa * w[None, :]) @ Xb.T
+            want = ya @ (K * R) @ yb / np.sqrt(na * nb) / w.sum()
+            assert row[col] == pytest.approx(want, rel=1e-9, abs=1e-12), (row.PHENO1, row.PHENO2, col)
+        if not np.array_equal(ma, mb):                     # the related-pair part of SUMMIT's cross moment
+            zs = []
+            for X, yy, ne, m in ((Xa, ya, na, ma), (Xb, yb, nb, mb)):
+                r, n = (X.T @ yy) / ne, int(m.sum())
+                zs.append(exact_score_z_from_arrays(r, np.sqrt((1 - r * r) / (ne - 1)), np.full(M, n), n, n - ne - 1))
+            za, zb = zs
+            w = np.sqrt(Va * Vb)
+            K = (Xa * w[None, :]) @ Xb.T
+            assert w @ (za * zb) - row.REL_M12 * w.sum() == pytest.approx(ya @ (K * ~R) @ yb / np.sqrt(na * nb), rel=1e-9)
+    c = extract_rel_m12(str(tmp_path / "tot.rel_m12.tsv"), "grp1", "ninth", str(tmp_path / "m12.tsv"), annot=annot)
+    m12 = pd.read_csv(tmp_path / "m12.tsv", sep="\t")
+    r = tab[(tab.PHENO1 == "ninth") & (tab.PHENO2 == "grp1")].iloc[0]
+    assert c == pytest.approx(r.REL_M12) and list(m12.columns) == ["SNP", "REL_M12"]
+    np.testing.assert_allclose(m12.REL_M12.to_numpy(), A[:-30] @ r[["REL_M12_lowmaf", "REL_M12_highmaf"]].to_numpy(float))
+    # with --inbreeding the cross-sample pairs carry no REL_S12, and cross-m12 then writes REL_M12 alone
+    compute_relative_pair_totals(prefix, str(tmp_path / "pheno4.txt"), str(tmp_path / "inb"), step_size=37,
+                                 inbreeding=True, **kw)
+    ti = pd.read_csv(tmp_path / "inb.rel_m12.tsv", sep="\t")
+    num = [c_ for c_ in tab.columns if c_.startswith("REL_M12")]
+    np.testing.assert_allclose(ti[num].to_numpy(float), tab[num].to_numpy(float), rtol=1e-12)
+    same = (ti.PHENO1 == "full") & (ti.PHENO2 == "full2")
+    assert ti.loc[same, "REL_S12"].notna().all() and ti.loc[~same, ["REL_S12", "REL_S12_lowmaf"]].isna().all().all()
+    extract_rel_m12(str(tmp_path / "inb.rel_m12.tsv"), "full", "grp1", str(tmp_path / "m12i.tsv"))
+    assert list(pd.read_csv(tmp_path / "m12i.tsv", sep="\t").columns) == ["REL_M12"]
+
+
 def test_append_writes_constant_or_per_class_rel_m(tmp_path):
     prefix, G, y, covs, iid, cov_path = _simulate(tmp_path, ncov=2)
     M = G.shape[1]

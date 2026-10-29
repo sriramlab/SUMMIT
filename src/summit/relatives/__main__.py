@@ -44,7 +44,8 @@ def main(argv=None):
                         "as well as the per-phenotype values")
     m.add_argument("--step-size", type=int, default=None, help="SNPs per genotype block (default: about 512 MiB)")
     m.add_argument("--cross", action="store_true",
-                   help="also REL_M12 for every phenotype pair with the same samples (for rg)")
+                   help="also REL_M12 for every phenotype pair (for rg; with --per-snp only pairs with the same "
+                        "complete-case sample)")
     m.add_argument("--inbreeding", action="store_true",
                    help="also leave each individual paired with themselves (the diagonal of the GRM) out of the h2 "
                         "estimating equation, which removes bias from inbreeding (residual variance that grows with "
@@ -86,7 +87,7 @@ def main(argv=None):
     t.add_argument("--step-size", type=int, default=None)
     t.add_argument("--out", required=True)
     lr = sub.add_parser("longrange", help="LD-score mass between jackknife blocks, for the long-range LD correction of "
-                                          "h2 standard errors (summit --h2 --long-range-se)")
+                                          "h2 and rg standard errors (summit --h2/--rg --long-range-se)")
     lr.add_argument("--geno", required=True, help="PLINK 1 BED prefix or .bed path (the GWAS and LD-score genotypes)")
     lr.add_argument("--covar", default=None, help="the GWAS covariates (FID IID ...), without an intercept column")
     lr.add_argument("--pairs", default=None, help="related pairs left out of the first equation (as for `moments`)")
