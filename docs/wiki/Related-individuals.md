@@ -309,9 +309,11 @@ in-sample LD scores that carry LD_REL, the same file serves h² and rg.
 Two phenotypes measured in different complete-case samples are each projected
 and normalized in their own sample, as in their GWAS. `REL_M12` then sums over
 related pairs with one member in each sample, and its weights are
-`sqrt(V_a V_b)`. The same genotype pass computes it for every pair of phenotypes,
-about 15% more time with 40 phenotypes. For these pairs `--inbreeding` writes no
-`REL_S12`.
+`sqrt(V_a V_b)`. The same genotype pass computes it for every pair of phenotypes.
+Its cost grows with the square of the number of phenotypes times the number of
+related pairs: in the EUR cohort below (40 phenotypes in 33 complete-case samples,
+4,216 pairs) the pass took 35 minutes on 16 cores. For these pairs `--inbreeding`
+writes no `REL_S12`.
 The sample-overlap covariance describes each person's own two phenotypes and
 needs no change.
 
