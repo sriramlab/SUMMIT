@@ -640,6 +640,16 @@ def _strip_environment_moments(source: Path, target: Path, section: str) -> Path
     return target
 
 
+def _assert_environment_moments_equal(recorded: dict, expected: dict) -> None:
+    # pytest >= 9.2 rejects strings inside approx, so the method tag is compared exactly.
+    assert recorded.keys() == expected.keys()
+    for key, value in expected.items():
+        if isinstance(value, str):
+            assert recorded[key] == value
+        else:
+            assert recorded[key] == pytest.approx(value, rel=1e-12, abs=1e-12)
+
+
 def test_population_transport_uses_both_cohorts_environment_moments(
     cached_reference, tmp_path
 ):
@@ -659,7 +669,7 @@ def test_population_transport_uses_both_cohorts_environment_moments(
     recorded = reference_payload["population_trace"]["environment_moments"]
     expected = classic_environment_moments(
         reference_env[0], residual_rank=reference_payload["residual_rank"])
-    assert recorded == pytest.approx(expected, rel=1e-12, abs=1e-12)
+    _assert_environment_moments_equal(recorded, expected)
 
     # Environment-dependent missingness: drop the people with the largest E.
     phenotype = pd.read_csv(cached_reference.phenotype, sep=r"\s+")
@@ -684,9 +694,9 @@ def test_population_transport_uses_both_cohorts_environment_moments(
         str(cached_reference.environment), str(cached_reference.genotype_prefix) + ".fam",
         cov_filename=str(cached_reference.covariates), pheno_filename=str(study_phenotype),
     )
-    assert moments["population_design"]["environment_moments"] == pytest.approx(
+    _assert_environment_moments_equal(
+        moments["population_design"]["environment_moments"],
         classic_environment_moments(study_env[0], residual_rank=moments["residual_rank"]),
-        rel=1e-12, abs=1e-12,
     )
     options = dict(njack=3, allow_ill_conditioned=True, max_condition=1e16)
     with warnings.catch_warnings():
