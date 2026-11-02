@@ -1,4 +1,4 @@
-"""Bivariate phenotypes for the final benchmark's rg arm (run in ~/summit_relatives on veena).
+"""Bivariate phenotypes for the final benchmark's rg arm (run from the benchmark working folder).
 
 y_k = sqrt(h2) g_k + u_k + c_k + e_k (k = a, b) with h2 0.25, rg 0.5 (g_b = 0.5 g_a + sqrt(0.75) g'), untagged values
 u with covariance 0.25 K_f within families and cross-trait correlation 0.8, household effects (variance 0.10)

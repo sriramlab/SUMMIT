@@ -1,20 +1,20 @@
 #!/bin/bash
-# rg arm of the final benchmark (veena, ~/summit_relatives): bivariate phenotypes, PLINK 2 GWAS on everyone and on
+# rg arm of the final benchmark (run from the benchmark working folder, $ROOT): bivariate phenotypes, PLINK 2 GWAS on everyone and on
 # the unrelated set, `summit relatives moments --cross` in batches of five pairs, REL_M12 per pair with
 # `summit relatives cross-m12`, SUMMIT sumstats, and `summit --rg` for the three arms and both jackknifes.
 # usage: rg_stage.sh POP NPC NPAIRS THREADS
 set -euo pipefail
-cd ~/summit_relatives
+cd "${ROOT:?set ROOT to the benchmark working folder}"
 pop=$1; npc=$2; npairs=${3:-50}; th=${4:-4}
 O=final/$pop/rg; F=final/$pop
-PY=~/anaconda3/envs/summit/bin/python
+PY=${PY:-python}
 SUMMIT="env PYTHONPATH=summit_dev_install_v2 OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 $PY -m summit"
 [ -s $O/pheno.txt ] || $PY scripts/sim_bivariate_final.py $pop $npairs
 glm="--glm hide-covar cols=chrom,pos,ref,alt,omitted,nobs,beta,se --covar-variance-standardize"
 mkdir -p $O/gwas_all $O/gwas_unrel $O/rel $O/ss/all $O/ss/unrel $O/ss/frel $O/m12 $O/fit
-[ -e $O/gwas_all.done ] || { ~/bin/plink2 --threads $th --memory 12000 --bfile panels/$pop/${pop}_full --pheno $O/pheno.txt \
+[ -e $O/gwas_all.done ] || { ${PLINK2:-plink2} --threads $th --memory 12000 --bfile panels/$pop/${pop}_full --pheno $O/pheno.txt \
     --covar $F/covar_all.txt $glm --out $O/gwas_all/g > $O/gwas_all.stdout 2>&1 && touch $O/gwas_all.done; }
-[ -e $O/gwas_unrel.done ] || { ~/bin/plink2 --threads $th --memory 12000 --bfile $F/geno_unrel --pheno $O/pheno.txt \
+[ -e $O/gwas_unrel.done ] || { ${PLINK2:-plink2} --threads $th --memory 12000 --bfile $F/geno_unrel --pheno $O/pheno.txt \
     --covar $F/covar_unrel.txt $glm --out $O/gwas_unrel/g > $O/gwas_unrel.stdout 2>&1 && touch $O/gwas_unrel.done; }
 for ((b=0; b<npairs; b+=5)); do
   [ -e $O/rel/b$b.done ] && continue

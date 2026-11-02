@@ -1,10 +1,10 @@
 #!/bin/bash
-# In-sample LD scores for the final benchmark (veena, ~/summit_relatives). Full cohort: V + LD_REL; unrelated set: V.
+# In-sample LD scores for the final benchmark (run from the benchmark working folder, $ROOT). Full cohort: V + LD_REL; unrelated set: V.
 # AFR full-cohort files are those of unified_check_v2.sh (same genotypes, PCs and pairs).
 set -euo pipefail
-cd ~/summit_relatives
+cd "${ROOT:?set ROOT to the benchmark working folder}"
 th=${1:-6}
-PY=~/anaconda3/envs/summit/bin/python
+PY=${PY:-python}
 SUMMIT="env PYTHONPATH=summit_dev_install_v2 OMP_NUM_THREADS=$th OPENBLAS_NUM_THREADS=$th MKL_NUM_THREADS=$th $PY -m summit"
 common="--nvecs 20000 --block-size 16384 --dtype float64 --memory-gib 24 --num-threads $th"
 mkdir -p final/AFR/ld

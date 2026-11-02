@@ -1,4 +1,4 @@
-"""Approximate related-pair parts for the final benchmark (veena, ~/summit_relatives).
+"""Approximate related-pair parts for the final benchmark (run from the benchmark working folder, $ROOT).
 
 The exact estimator subtracts REL_M_j (one value per SNP and trait). The approximations replace it by one number per trait,
 S = sum_j V_j REL_M_j over the SNPs shared with the LD scores, spread over SNPs:
@@ -8,7 +8,7 @@ where kappa_j = (1/nu) sum over ordered related pairs x_ij x_i'j is a genotype-o
 (the related-pair part of a constant phenotype). Both keep sum_j V_j REL_M_j, so the genome-wide estimate with one class of
 SNPs is unchanged; they change the jackknife replicates and per-class sums. The same is done for REL_M12 (rg).
 
-Steps (run from ~/summit_relatives):
+Steps (run from the benchmark working folder):
   kappa POP          writes final/POP/kappa.tsv.gz and checks the code path against rel.tsv.gz for one phenotype
   h2 POP NPROC       writes final/POP/ss/frel_A1 and frel_A2 from final/POP/ss/frel
   rg POP NPROC       writes final/POP/rg/ss/frel_A{1,2} and final/POP/rg/m12_A{1,2}

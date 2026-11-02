@@ -1,13 +1,13 @@
 #!/bin/bash
-# Fits of the approximate related-pair parts (veena, ~/summit_relatives), with the same settings as fit_arms.sh and
+# Fits of the approximate related-pair parts (run from the benchmark working folder, $ROOT), with the same settings as fit_arms.sh and
 # rg_stage.sh: pairexcl_A1 / pairexcl_A2 use ss/frel_A1, ss/frel_A2 (and m12_A1, m12_A2 for rg) and the in-sample LD
 # scores of everyone (V, LD_REL). 200-block jackknife only.
 # usage: fit_approx.sh POP NPROC
 set -euo pipefail
-cd ~/summit_relatives
+cd "${ROOT:?set ROOT to the benchmark working folder}"
 pop=$1; nproc=${2:-12}
 O=final/$pop; R=$O/rg
-PY=~/anaconda3/envs/summit/bin/python
+PY=${PY:-python}
 SUMMIT="env PYTHONPATH=summit_dev_install_v2 OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 $PY -m summit"
 jobs=$O/fit_approx_jobs.txt; : > $jobs
 mkdir -p $O/fit $R/fit

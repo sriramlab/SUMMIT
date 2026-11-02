@@ -3,7 +3,9 @@
 Scripts for the simulations on the [Related individuals](../../docs/wiki/Related-individuals.md#simulations)
 wiki page. They need UK Biobank genotypes, so they record the analysis rather
 than run as a self-contained example. Paths are relative to the working
-directory used for the runs.
+directory used for the runs. The shell scripts read it from `ROOT`, and the
+Python interpreter and PLINK 2 from `PY` and `PLINK2` (defaults `python` and
+`plink2`).
 
 | Step | Script |
 |---|---|

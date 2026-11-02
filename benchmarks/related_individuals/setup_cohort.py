@@ -1,4 +1,4 @@
-"""Inputs for the final CLI benchmark of one cohort (run in ~/summit_relatives on veena).
+"""Inputs for the final CLI benchmark of one cohort (run from the benchmark working folder).
 
 Writes final/<pop>/: covar_all.txt and covar_unrel.txt (FID IID PCs), keep_unrel.txt, pheno.txt (FID IID y<col> for
 scenarios A-E of runs/<pop>_v3, 100 replicates each), pairs.txt (IID1 IID2 K_grm), meta.tsv.

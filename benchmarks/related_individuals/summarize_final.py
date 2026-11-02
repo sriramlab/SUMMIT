@@ -1,4 +1,4 @@
-"""Summarize the final related-individuals benchmark and draw the wiki figures (run in ~/summit_relatives on veena).
+"""Summarize the final related-individuals benchmark and draw the wiki figures (run from the benchmark working folder).
 
 Inputs: final/<pop>/meta.tsv, final/<pop>/fit/<arm>_<njack>_<chunk>.results.tsv (h2) and
 final/<pop>/rg/fit/<arm>_<njack>_<pair>.log (rg). Truth for every arm is the simulated h2 of the unadjusted

@@ -1,4 +1,4 @@
-"""Compare exact and approximate related-pair parts (run from ~/summit_relatives on veena).
+"""Compare exact and approximate related-pair parts (run from the benchmark working folder).
 
 For each ancestry group and scenario: mean and SD of h2, mean jackknife SE, SE/SD, coverage of 95% t intervals, and the
 replicate-wise ratio of the approximate SE to the exact SE (the estimates themselves should agree to rounding, because both
