@@ -172,7 +172,7 @@ def accumulate(lay, As, m, n_m, yd, observed, Wq, yp):
     return acc
 
 
-def _delete_groups(full, delete):
+def _jackknife_se(full, delete):
     G = delete.shape[0]
     return float(np.sqrt((G - 1) / G * ((delete - delete.mean(0)) ** 2).sum(0)))
 
@@ -192,7 +192,7 @@ def population_fit(acc, nu, n_obs_g):
     return full, dele
 
 
-def direct_fit_groups(acc):
+def direct_fit(acc):
     T, W, Gr, Wg = acc["T"], acc["W"], acc["Gr"], acc["Wg"]
     rhs, gram = T.sum(0), Gr.sum(0)
     full = np.linalg.solve(gram, rhs)
@@ -285,14 +285,14 @@ def direct_effects(geno: str, sibships: str, annot: str, pheno: str, out: str, *
         yo = np.where(observed, pd.to_numeric(ph[t], errors="coerce").reindex(lay.iid).to_numpy(float), 0.0)
         yp = (yo - Wq @ (Wq.T @ yo)) * observed
         acc = accumulate(lay, As, m, n_m, yd, observed, Wq, yp)
-        gram, rhs, dfull, ddel = direct_fit_groups(acc)
+        gram, rhs, dfull, ddel = direct_fit(acc)
         n_obs_g = np.array([observed[s:e].sum() for s, e in zip(lay.g_start, lay.g_end)])
         pfull, pdel = population_fit(acc, int(observed.sum()) - Q.shape[1], n_obs_g)
         h_d, h_d_del = dfull.sum() / var_full, ddel.sum(1) / var_full
         rows.append(dict(trait=t, n_members=int(m.sum()), n_sibships=int((n_m >= 2).sum()), h2_direct=float(h_d),
-                         h2_population=float(pfull), h2_population_se=_delete_groups(pfull, pdel),
-                         difference=float(pfull - h_d), difference_se=_delete_groups(pfull - h_d, pdel - h_d_del),
-                         ratio=float(h_d / pfull), ratio_se=_delete_groups(h_d / pfull, h_d_del / pdel),
+                         h2_population=float(pfull), h2_population_se=_jackknife_se(pfull, pdel),
+                         difference=float(pfull - h_d), difference_se=_jackknife_se(pfull - h_d, pdel - h_d_del),
+                         ratio=float(h_d / pfull), ratio_se=_jackknife_se(h_d / pfull, h_d_del / pdel),
                          var_full=var_full, _gram=gram, _rhs=rhs, _classes=dfull / var_full))
         Ys.append(yd)
         log(f"[direct] {t}: direct {h_d:.3f}, population {pfull:.3f} in {int(m.sum())} siblings")
@@ -304,7 +304,7 @@ def direct_effects(geno: str, sibships: str, annot: str, pheno: str, out: str, *
         if np.abs(nb.sum(0) - rhs).max() > 1e-5 * np.abs(rhs).max():
             raise RuntimeError(f"{r['trait']}: SNP-block numerators do not add up to the exact numerators.")
         dele = np.array([np.linalg.solve(gram * (1 - frac[b]), rhs - nb[b]).sum() for b in range(nblocks)])
-        r["h2_direct_se"] = _delete_groups(r["h2_direct"], dele / r["var_full"])
+        r["h2_direct_se"] = _jackknife_se(r["h2_direct"], dele / r["var_full"])
         for c, v in zip(classes, r.pop("_classes")):
             r[f"h2_direct_{c}"] = float(v)
     cols = ["trait", "n_members", "n_sibships", "h2_direct", "h2_direct_se", "h2_population", "h2_population_se",
