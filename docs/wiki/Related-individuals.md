@@ -320,6 +320,43 @@ then also has the jackknife SEs (`rg_total_se_jk` and the others), `jk_factor_rg
 and `long_range_rho`. `--rg-manifest-fast` accepts neither `REL_M` nor these
 options.
 
+## Direct genetic effects
+
+Siblings allow heritability due to direct genetic effects, which excludes what
+siblings share: effects of parental genotypes, assortative mating and population
+structure. Phenotypes and genotypes are centered within sibships, and every pair of
+individuals of the same extended family is left out of the estimating equations,
+each individual's pairing with themselves included. The remaining equations have no
+residual term and are unbiased for any terms shared within sibships and any residual
+covariance within extended families.
+
+```bash
+summit relatives direct \
+  --geno siblings --sibships sibships.tsv --annot siblings.annot.tsv.gz \
+  --pheno phenotypes.tsv --covar covariates.tsv \
+  --within-covar age,sex,age_sex,age2,age2_sex --grm grm/siblings --out results/direct
+```
+
+`sibships.tsv` has columns `IID SIBSHIP FAMILY` (sibship and extended-family
+labels) for the siblings in `siblings.bed`. The phenotype file holds all individuals of
+the analysis. Heritability is scaled by the phenotype's residual variance after the
+covariates among them, the scale of the population heritability. `--within-covar` names
+the covariates regressed out before centering. Leave genotype PCs out of this list,
+because siblings differ in their PCs by Mendelian segregation.
+
+`results/direct.direct.tsv` reports, for each phenotype, the direct-effect heritability
+and its standard error from a jackknife over 200 contiguous SNP blocks. A jackknife over
+groups of families counts the products of pairs of families twice and overstates it.
+The file also gives the population heritability of the same individuals, the difference
+between the two and their ratio, with standard errors from a jackknife over groups of
+families. The difference combines assortative mating, effects of parental genotypes and
+population structure, and does not separate them. Sibling effects make the estimate
+target the variance of direct minus sibling effects, as in sibling GWAS.
+
+The command computes one N × N GRM per annotation class of the siblings and keeps them
+in `--grm` for reuse. The SNP-block pass multiplies these matrices by the genotypes,
+so the run time grows with the square of the number of siblings.
+
 ## Simulations
 
 We simulated phenotypes from UK Biobank genotypes in three cohorts that

@@ -11,6 +11,8 @@ as `summit pgs fit`.
 | Heritability or genetic correlation | `summit --h2 ...` or `summit --rg ...` |
 | Related-pair moments for h²/rg with relatives | `summit relatives {moments,append,cross-m12}` |
 | Long-range LD correction of h²/rg standard errors | `summit relatives longrange`, then `--long-range-se` |
+| Heritability due to direct genetic effects from sibships | `summit relatives direct` |
+| Local-ancestry markers, merged with the SNPs, and the test of their component | `summit local-ancestry {markers,merge,test}` |
 | Additive and generalized G×E PCGC | `summit --binary-method pcgc ...` |
 | Generalized cross-trait PCGC | `summit pcgc-cross {prepare,fit}` |
 | One-environment G×E | `summit --geno ... --env ...`, `--gxe-score-reference`, `--gxe-fit`, or `--gxe-fit-batch` |

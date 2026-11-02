@@ -7,6 +7,8 @@
                                                                                         (summit --h2 --jk-traces)
   summit relatives longrange --geno PREFIX [--covar FILE] [--pairs FILE] [--annot FILE] --out PREFIX
                                                                                         (summit --h2 --long-range-se)
+  summit relatives direct  --geno PREFIX --sibships FILE --annot FILE --pheno FILE --covar FILE [--within-covar COLS]
+                           [--grm DIR] --out PREFIX                      (heritability due to direct genetic effects)
 
 By default `moments` writes one REL_M value per phenotype (and per class of --annot), the V-weighted mean of the
 per-SNP related-pair moments, and `append` writes it as a constant REL_M column. `--per-snp` writes the exact per-SNP
@@ -101,6 +103,20 @@ def main(argv=None):
     lr.add_argument("--seed", type=int, default=20261030)
     lr.add_argument("--step-size", type=int, default=None)
     lr.add_argument("--out", required=True)
+    d = sub.add_parser("direct", help="heritability due to direct genetic effects from sibships (exact class GRMs)")
+    d.add_argument("--geno", required=True, help="PLINK 1 BED prefix with the siblings")
+    d.add_argument("--sibships", required=True, help="IID SIBSHIP FAMILY: sibship and extended-family labels")
+    d.add_argument("--annot", required=True, help="partitioning annotation (SNP + one 0/1 column per class)")
+    d.add_argument("--pheno", required=True, help="FID IID pheno1 ... (all individuals; the siblings are taken from it)")
+    d.add_argument("--pheno-cols", default=None, help="comma-separated phenotype columns (default: all)")
+    d.add_argument("--covar", required=True, help="FID IID covariates of the population analysis (no intercept)")
+    d.add_argument("--within-covar", default=None,
+                   help="comma-separated columns of --covar regressed out before centering within sibships "
+                        "(for example age and sex terms; not genotype PCs, which differ between siblings)")
+    d.add_argument("--grm", default=None, help="folder for the siblings' class GRMs, reused when present "
+                                              "(default PREFIX.grm)")
+    d.add_argument("--nblocks", type=int, default=200, help="contiguous SNP blocks of the jackknife (default 200)")
+    d.add_argument("--out", required=True)
     args = ap.parse_args(argv)
 
     if args.cmd == "moments":
@@ -134,6 +150,15 @@ def main(argv=None):
             kinship_min=args.kinship_min, closure=not args.no_closure, annot=args.annot, keep=args.keep,
             nblocks=args.nblocks, probes=args.probes, seed=args.seed, step_size=args.step_size, log=log,
         )
+    elif args.cmd == "direct":
+        from .direct import direct_effects
+        log = Logger()
+        log.attach_file(args.out + ".direct.log", mode="w")
+        split = lambda v: None if v is None else [c.strip() for c in v.split(",") if c.strip()]
+        direct_effects(args.geno, args.sibships, args.annot, args.pheno, args.out, covar=args.covar,
+                       within_covar=split(args.within_covar), pheno_cols=split(args.pheno_cols), grm=args.grm,
+                       nblocks=args.nblocks, log=log._log)
+        log._log(f"[direct] wrote {args.out}.direct.tsv")
     elif args.cmd == "append":
         missing = append_rel_m_to_sumstats(args.sumstats, args.rel, args.pheno, args.out, annot=args.annot)
         print(f"wrote {args.out}; SNPs without REL_M: {missing}")

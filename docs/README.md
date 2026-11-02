@@ -9,6 +9,8 @@ and [Commands and options](wiki/Commands-and-options.md).
 
 - [LD scores](wiki/LD-scores.md)
 - [Heritability and genetic correlation](wiki/Heritability-and-genetic-correlation.md)
+- [Related individuals](wiki/Related-individuals.md)
+- [Local ancestry](wiki/Local-ancestry.md)
 - [Batch analyses](wiki/Batch-analyses.md)
 - [One-environment G×E](wiki/GxE-models.md)
 - [Multiple environments](wiki/Multiple-environments.md)
