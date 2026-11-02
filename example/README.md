@@ -23,6 +23,29 @@ have h² 0.3 and rg 0.5, and siblings share a family effect. Expected results
 are h² of about 0.34 (SE 0.07) and rg of about 0.44 (SE 0.15) with the pairs
 excluded, and h² of about 0.47 with the pairs kept.
 
+## Local ancestry
+
+`bash example/local_ancestry.sh` generates an admixed cohort of 2,000 people with
+two source populations and local-ancestry calls in admix-kit format under
+`example/out/local_ancestry/`. It then makes the local-ancestry markers, merges them
+with the SNPs, computes summary statistics with global ancestry among the covariates,
+and fits h² from the SNPs alone and from SNPs and local ancestry jointly. The trait
+has SNP heritability 0.3 and a further 0.1 from untagged variants whose frequencies
+differ between the populations. The SNP-only h² is about 0.42 (SE 0.05). The joint
+fit gives a SNP component of about 0.37 and a local-ancestry component of about
+0.03 (SE 0.01), and `summit local-ancestry test` gives z of about 2.1 for that
+component. The run takes about 15 seconds.
+
+## Direct genetic effects
+
+`bash example/direct_effects.sh` generates 300 extended families of cousins
+(1,500 siblings in 600 sibships) under `example/out/siblings/` and runs
+`summit relatives direct`. Siblings share an environment and an effect of their
+parents' genotypes. The direct heritability is about 0.30 (SE 0.07), against a true
+value of 0.34 on the scale of the phenotype's variance after the covariates. The
+output also gives the population heritability of the same people, about 0.35
+(SE 0.10). The run takes a few seconds.
+
 ## Manuscript methods demo
 
 After installing SUMMIT, run these commands from the repository root:

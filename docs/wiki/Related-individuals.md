@@ -322,9 +322,9 @@ options.
 
 ## Direct genetic effects
 
-Siblings allow heritability due to direct genetic effects, which excludes what
-siblings share: effects of parental genotypes, assortative mating and population
-structure. Phenotypes and genotypes are centered within sibships, and every pair of
+Siblings allow estimation of heritability due to direct genetic effects, which
+excludes the effects of parental genotypes, assortative mating and population
+structure that siblings share. Phenotypes and genotypes are centered within sibships, and every pair of
 individuals of the same extended family is left out of the estimating equations,
 each individual's pairing with themselves included. The remaining equations have no
 residual term and are unbiased for any terms shared within sibships and any residual
@@ -336,6 +336,8 @@ summit relatives direct \
   --pheno phenotypes.tsv --covar covariates.tsv \
   --within-covar age,sex,age_sex,age2,age2_sex --grm grm/siblings --out results/direct
 ```
+
+`bash example/direct_effects.sh` runs this command on synthetic sibships.
 
 `sibships.tsv` has columns `IID SIBSHIP FAMILY` (sibship and extended-family
 labels) for the siblings in `siblings.bed`. The phenotype file holds all individuals of

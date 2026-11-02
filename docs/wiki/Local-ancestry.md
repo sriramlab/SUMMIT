@@ -14,6 +14,9 @@ with the SNPs then separate SNP heritability from heritability tagged only by lo
 ancestry, in the same `summit --h2` fit with the SNP annotation classes. Relatives can be
 kept as described in [Related individuals](Related-individuals.md).
 
+For a runnable synthetic example of the whole workflow, run
+`bash example/local_ancestry.sh` from the repository root.
+
 ## Inputs
 
 - Local-ancestry calls for each autosome. Two formats are read:
@@ -76,19 +79,17 @@ local-ancestry component. The SNP heritability is the sum of the other classes.
 
 The local-ancestry component is on the scale of the dosages before covariate
 adjustment. After the adjustment it explains about a third of this value in a typical
-African–European admixed sample, because global ancestry accounts for about two thirds
+African-European admixed sample, because global ancestry accounts for about two thirds
 of the variance of the dosages.
 
 ## Test and interval
 
 A jackknife over SNP blocks or chromosomes cannot test the component when it comes from
 one locus, because deleting the block that carries the locus removes the whole component.
-`summit local-ancestry test` instead computes, exactly from the genotypes:
-
-- a z statistic against the component's standard deviation under no local-ancestry
-  effect, from the SNP-only fit;
-- a standard error from a sandwich over families (related individuals form one unit),
-  for intervals.
+`summit local-ancestry test` computes the test and the interval exactly from the
+genotypes. The z statistic divides the component by its standard deviation under no
+local-ancestry effect, computed at the SNP-only fit. The standard error for intervals
+comes from a sandwich over families, in which related individuals form one unit.
 
 ```bash
 summit local-ancestry test --geno la/joint --annot la/joint.annot.tsv.gz \
