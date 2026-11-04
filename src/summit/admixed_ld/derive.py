@@ -73,10 +73,15 @@ def _simplex_ls(Y, P, fixed=None, YP=None):
     return theta
 
 
-def _als(Y, Pk, fixed, p0, *, iters, tol=1e-9):
+def _als(Y, Pk, fixed, p0, *, iters, tol=1e-9, bounds=(1e-3, 1 - 1e-3)):
     """Alternating least squares for E(Y) = theta [Pk, p] with theta on the simplex (rows `fixed` held at their given
-    theta) and p the missing source's frequencies. Stops when the relative decrease of the residual sum of squares falls
-    below tol. Each iteration reads Y twice (Y P and w' Y). Returns theta, p, iterations, the objective trace."""
+    theta) and p the missing source's frequencies, kept within `bounds`. Stops when the relative decrease of the residual
+    sum of squares falls below tol. Each iteration reads Y twice (Y P and w' Y). Returns theta, p, iterations, the
+    objective trace.
+
+    Bounds at [0, 1] bias the fit along the family of equivalent sources: at SNPs where the source's frequency is 0 or 1
+    they stop the frequencies from following noise, and a pseudo-source shrunk toward the known sources moves those SNPs
+    inside the bounds and fits better. With anchors, which fix the family's position, wide bounds remove this bias."""
     p = p0.copy()
     trace = []
     theta = None
@@ -88,7 +93,7 @@ def _als(Y, Pk, fixed, p0, *, iters, tol=1e-9):
         theta = _simplex_ls(Y, P, fixed, YP=YP)
         w = theta[:, -1]
         wY = w @ Y
-        p = np.clip((wY - (w @ theta[:, :-1]) @ Pk.T) / max(float(w @ w), 1e-12), 1e-3, 1 - 1e-3)
+        p = np.clip((wY - (w @ theta[:, :-1]) @ Pk.T) / max(float(w @ w), 1e-12), *bounds)
         # residual sum of squares at (theta, p): |Y|^2 - 2 sum_i theta_i' (Y P)_i + sum_i theta_i' P'P theta_i
         P = np.column_stack([Pk, p])
         YP = np.column_stack([YPk, Y @ p])
@@ -292,7 +297,10 @@ def derive_source(geno, ref_path, out, *, name, known=None, panel=None, covar=No
         p0 = np.clip(Ys[N:].mean(axis=0), 0.02, 0.98)
     else:
         p0 = np.clip(2.0 * Ys[:N].mean(axis=0) - Psub.mean(axis=1), 0.02, 0.98)
-    theta, _, n_it, trace = _als(Ys, Psub, fixed_rows, p0, iters=als_iter, tol=als_tol)
+    # with anchors the frequencies may leave [0, 1] during the fit (see _als); without them the bounds are the only
+    # thing that fixes the family's position
+    bounds = (-0.5, 1.5) if fixed_rows is not None else (1e-3, 1 - 1e-3)
+    theta, _, n_it, trace = _als(Ys, Psub, fixed_rows, p0, iters=als_iter, tol=als_tol, bounds=bounds)
     th_c = theta[:N].copy()
     log(f"[admixed-ld] derive {name}: ancestry after {n_it} iterations (residual sum of squares {trace[0]:.6g} -> "
         f"{trace[-1]:.6g}); mean " + ", ".join(f"{s} {x:.4f}" for s, x in zip(known + [name], th_c.mean(axis=0))))
@@ -386,7 +394,8 @@ def derive_source(geno, ref_path, out, *, name, known=None, panel=None, covar=No
                          n_freq_weights=n_eff, noise_mix={s: float(-x) for s, x in zip(known, c_mix)}, derived=True,
                          ld=ld, cohort=os.path.basename(geno), n_people=int(N),
                          panel=None if panel is None else os.path.basename(panel), calibration=calib,
-                         als=dict(iterations=int(n_it), snps=int(sub.size), rss_first=trace[0], rss_last=trace[-1])))
+                         als=dict(iterations=int(n_it), snps=int(sub.size), rss_first=trace[0], rss_last=trace[-1],
+                                  frequency_bounds=list(bounds))))
     chrom = rv["CHR"].to_numpy()[r_idx]
     local = rv["LOCAL"].to_numpy()[r_idx]
     ki = [ref.source_index(s) for s in known]
