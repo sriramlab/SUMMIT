@@ -405,6 +405,7 @@ def test_derived_source_with_panel_ld(sim3, tmp_path):
     mass_c = float((got.V.to_numpy()[:, None] * L_c).sum())
     mass_in = float((V_in[:, None] * L_in).sum())
     assert abs(mass_c / mass_in - 1) < 0.05, (mass_c, mass_in)
+    _check_matrix_with_derived_source(ref3, tmp_path, out, names)
 
 
 def test_curve_removes_panel_noise_from_its_denominators(sim, tmp_path):
@@ -595,6 +596,19 @@ def test_window_noise_counts_derived_panel_noise_once():
     np.testing.assert_allclose(same, VR, rtol=1e-12)
 
 
+def _check_matrix_with_derived_source(ref, tmp_path, params_prefix, names):
+    """The regional matrix (with the automatic taper) works for a reference with a derived source."""
+    from summit.admixed_ld.matrix import compose_matrix
+    z = ref.load(ref.chromosomes[0])
+    ids = tmp_path / "region.txt"
+    pd.Series(z["snp"][10:40]).to_csv(ids, index=False, header=False)
+    R, snp, info = compose_matrix(ref.path, str(tmp_path / "mat"), snps=str(ids), sources=names,
+                                  params=params_prefix + ".admixed_ld.json", curve=str(tmp_path / "c3"),
+                                  taper="auto", log=lambda *a: None)
+    assert len(snp) == 30 and np.allclose(np.diag(R), 1.0) and info["min_eigenvalue"] > -1e-8
+    assert all(np.isfinite(info["taper"][s]["tau_cm"]) for s in names)
+
+
 def test_inversion_counts_panel_noise_once(sim3, tmp_path):
     """LD by inversion with small known panels: their noise enters the derived covariances with a minus sign and enters
     the composition again, so compose must remove it once. With 200-person panels and a 3,000-person cohort the
@@ -622,6 +636,7 @@ def test_inversion_counts_panel_noise_once(sim3, tmp_path):
     params = compose_ldscores(str(tmp_path / "ref3"), [str(d / "ss")], str(d / "annot.tsv"), out, sources=names,
                               curve=str(tmp_path / "c3"), log=lambda *a: None)
     assert {x["panel"] for x in params["derived_covariance_cross_noise"]} == {"S0", "S1"}
+    _check_matrix_with_derived_source(ref3, tmp_path, out, names)
     got = pd.read_csv(out + ".gw.ldscore.gz", sep="\t")
     keep = v.SNP.isin(got.SNP).to_numpy()
     L_in, V_in = insample_ldscores(S["cohort"][:, keep], sim3["C"], sim3["cls"][keep], 2)

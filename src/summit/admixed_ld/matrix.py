@@ -119,9 +119,15 @@ def taper_scales(ref, si, z, taus=_TAUS, max_pairs=2_000_000):
     out_t, out_r = [], []
     for s in si:
         n = ref.n[ref.names[s]]
-        v = z[f"v_{s}"].astype(np.float64)
+        # the variances of the people behind the covariances (a derived source with an anchor panel's LD keeps them as
+        # vld), and for a source that stores each covariance's sampling variance (covvar: derived by inversion, masked
+        # admixed haplotypes) U = c^2 - covvar, as in compose
+        v = (z[f"vld_{s}"] if f"vld_{s}" in z.files else z[f"v_{s}"]).astype(np.float64)
         c = z[f"cov_{s}"].astype(np.float64)
-        U = unbiased_squared_covariance(c, z[f"m22_{s}"].astype(np.float64), v[rows] * v[ix], n)
+        if f"covvar_{s}" in z.files:
+            U = c * c - z[f"covvar_{s}"].astype(np.float64)
+        else:
+            U = unbiased_squared_covariance(c, z[f"m22_{s}"].astype(np.float64), v[rows] * v[ix], n)
         ok = (v[rows] > 0) & (v[ix] > 0) & np.isfinite(U)
         if ok.sum() > max_pairs:                                     # a fixed random subset keeps this fast
             idx = np.flatnonzero(ok)
