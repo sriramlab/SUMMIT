@@ -21,13 +21,14 @@ import pandas as pd
 
 
 # ----------------------------------------------------------------------------------------------------- SE regression
-def regress_standard_errors(n, se, beta, vA, vE, delta, *, max_chisq=80.0):
+def regress_standard_errors(n, se, beta, vA, vE, delta, *, delta_var=0.0, max_chisq=80.0):
     """Mean ancestry m and kappa_res(0) from one GWAS (arrays aligned to the reference SNPs). Returns a dict with m,
     kappa0, the number of SNPs used and the R2 of the fit; SNPs with large chi-square (strong effects), non-finite
     values or zero variance in both sources are left out, and residual outliers (beyond 8 robust SDs) are dropped
     once before the final fit."""
     n, se, beta = (np.asarray(x, np.float64) for x in (n, se, beta))
-    vA, vE, d2 = np.asarray(vA, np.float64), np.asarray(vE, np.float64), np.asarray(delta, np.float64) ** 2
+    vA, vE = np.asarray(vA, np.float64), np.asarray(vE, np.float64)
+    d2 = np.asarray(delta, np.float64) ** 2 - delta_var            # unbiased for the squared frequency difference
     with np.errstate(divide="ignore", invalid="ignore"):
         z2 = (beta / se) ** 2
         y = 1.0 / (n * se * se + beta * beta)
@@ -45,12 +46,12 @@ def regress_standard_errors(n, se, beta, vA, vE, delta, *, max_chisq=80.0):
     return dict(m=float(b[0] / s), kappa0=float(b[2] / s), n_snps=int(use.sum()), fit_r2=float(r2))
 
 
-def parameters_from_sumstats(tables, vA, vE, delta, log=print):
+def parameters_from_sumstats(tables, vA, vE, delta, log=print, delta_var=0.0):
     """`tables`: list of (name, DataFrame with N, SE, BETA aligned to the reference SNPs; rows may be NaN). Returns
     (m, kappa0, per-trait DataFrame); m and kappa0 are medians over traits."""
     rows = []
     for name, t in tables:
-        r = regress_standard_errors(t["N"], t["SE"], t["BETA"], vA, vE, delta)
+        r = regress_standard_errors(t["N"], t["SE"], t["BETA"], vA, vE, delta, delta_var=delta_var)
         r["trait"] = name
         rows.append(r)
         log(f"[admixed-ld] standard errors of {name}: m = {r['m']:.4f}, kappa_res(0) = {r['kappa0']:.4f} "

@@ -72,7 +72,11 @@ chromosome column), otherwise from the CM column of the panel. Without either, 1
 per Mb is assumed with a warning.
 
 The resource is built once and serves every cohort with these sources. The covariance
-products use SUMMIT's native protected matrix products.
+products use SUMMIT's native protected matrix products. `compose` replaces each squared
+panel covariance by its unbiased estimate (a U-statistic), so small panels do not inflate
+the LD scores. Rare variants are the least accurate in a small panel, since only a few
+people carry them. In the check below, a random 85 of the 4,905 African-ancestry panel
+members gave mean h² within 2% of the in-sample value.
 
 ## The cohort's curve
 
@@ -145,11 +149,11 @@ participants of African and European ancestry (3,787 and 6,111 people, mean Afri
 ancestry 0.61 and 0.76), with 32 traits, 405,807 array SNPs and eight MAF/LD classes. The
 references were panels of African-ancestry (4,905 and 2,452 people) and white British
 (12,148) participants outside the cohorts. With the curve and the relatives' term, mean h²
-over traits was 0.7% and 1.0% higher than with in-sample LD scores. The mean absolute
+over traits was 0.8% and 1.1% higher than with in-sample LD scores. The mean absolute
 difference was 0.03 standard errors, and standard errors were within 1%. Without the
-relatives' term the differences were 1.6% and 1.3%. With an admixture date of 5
+relatives' term the differences were 1.7% and 1.4%. With an admixture date of 5
 generations (the decay that the curves measured) in place of the curve, and without the
-relatives' term, they were 1.8% and 3.4%.
+relatives' term, they were 1.9% and 3.5%.
 
 On 16 cores, the reference took about 18 minutes for 17,000 panel members. The curve took
 about a minute for 3,787 people, and the composition about 90 seconds, most of it spent

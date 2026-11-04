@@ -203,6 +203,23 @@ def test_command_line_end_to_end(sim, tmp_path):
                  "--out", out + "_date"]) == 0
 
 
+def test_unbiased_squared_covariance_is_the_u_statistic():
+    """The closed form equals the U-statistic of h(i,j) h(k,l), h(i,j) = (x_i - x_j)(y_i - y_j) / 2, over all ordered
+    quadruples of distinct people, which is unbiased for the squared covariance."""
+    from itertools import permutations
+    from summit.admixed_ld.compose import unbiased_squared_covariance
+    rng = np.random.default_rng(7)
+    n = 8
+    x = rng.binomial(2, 0.3, n).astype(float)
+    y = np.clip(x + rng.binomial(1, 0.4, n) - rng.binomial(1, 0.3, n), 0, 2)
+    h = lambda i, j: (x[i] - x[j]) * (y[i] - y[j]) / 2.0
+    brute = np.mean([h(i, j) * h(k, l) for i, j, k, l in permutations(range(n), 4)])
+    a, b = x - x.mean(), y - y.mean()
+    c, m22 = (a * b).sum() / (n - 1), (a * a * b * b).mean()
+    vv = (a * a).sum() / (n - 1) * (b * b).sum() / (n - 1)
+    assert unbiased_squared_covariance(c, m22, vv, n) == pytest.approx(brute, rel=1e-10, abs=1e-12)
+
+
 def test_kernel_forms():
     k = Kernel.from_decay(0.2, 0.08, 3500.0, source="t")
     assert k(0.0) == pytest.approx(0.2)

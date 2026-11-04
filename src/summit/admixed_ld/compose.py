@@ -6,8 +6,8 @@ The population value of SUMMIT's V-weighted LD score of SNP j in class c is
 the second sum being the part of the in-sample score from each person's pairing with themselves, which SUMMIT's
 noise correction leaves when heterozygosity follows ancestry. With s_k^2 = C(k,k) and C_res the covariance after the
 covariates, it is computed as:
-  pairs within the reference window   pi_A(d) C^A + pi_E(d) C^E + delta_j delta_k kappa(d), squared, minus the sampling
-                                      variance of the squared reference covariances;
+  pairs within the reference window   pi_A(d) C^A + pi_E(d) C^E + delta_j delta_k kappa(d), squared, with each squared
+                                      panel covariance replaced by its unbiased estimate (order-4 U-statistic);
   every pair on the same chromosome   delta_j^2 delta_k^2 kappa(d)^2, by FFT convolution on a grid of `grid_cm`
                                       (the window pairs' admixture-only part is taken out of the first sum);
   pairs on different chromosomes      delta_j^2 delta_k^2 far^2;
@@ -76,6 +76,15 @@ def _target_variants(snps_path, first_sumstats):
     return out
 
 
+def unbiased_squared_covariance(c, m22, vv, n):
+    """Unbiased estimate of the squared covariance of two variants from a panel of n people (the order-4 U-statistic):
+    c the sample covariance (n - 1 denominator), m22 the mean of x_j^2 x_k^2 over people (centred dosages), vv the
+    product of the two sample variances (n - 1). Exact for any genotype distribution, so small panels are not biased
+    (the first-order correction c^2 - (m22 - c^2)/n leaves a bias of about 4/n of the noise)."""
+    n = float(n)
+    return ((n - 1.0) ** 2 * (n - 2.0) * c * c - n * n * m22 + (n - 1.0) * vv) / (n * (n - 2.0) * (n - 3.0))
+
+
 def _fft_conv_sym(W: np.ndarray, kern: np.ndarray) -> np.ndarray:
     """F[g] = sum_g' W[g'] kern[|g - g'|] for every column of W (grid x classes)."""
     n = W.shape[0]
@@ -131,6 +140,9 @@ def compose_ldscores(ref_path, sumstats, annot, out, *, sources=None, snps=None,
     good = np.isfinite(delta) & np.isfinite(vA) & np.isfinite(vE) & (vA + vE > 0)
     t_idx, r_idx, cls_mat = t_idx[good], r_idx[good], cls_mat[good]
     pA, pE, vA, vE, delta = pA[good], pE[good], vA[good], vE[good], delta[good]
+    # squared frequency differences without the panels' sampling variance (Var(p) = Var(dosage) / 4n)
+    delta_var = vA / (4.0 * nA) + vE / (4.0 * nE)
+    d2 = delta ** 2 - delta_var
     cls = np.argmax(cls_mat, axis=1)
     K = len(classes)
     M = r_idx.size
@@ -153,7 +165,7 @@ def compose_ldscores(ref_path, sumstats, annot, out, *, sources=None, snps=None,
     N = float(np.median(n_med))
     p = int(np.median(p_rank))
     if mean_ancestry is None or kappa0 is None:
-        m_se, k_se, per_trait = parameters_from_sumstats(tables, vA, vE, delta, log=log)
+        m_se, k_se, per_trait = parameters_from_sumstats(tables, vA, vE, delta, log=log, delta_var=delta_var)
     else:
         m_se, k_se, per_trait = float("nan"), float("nan"), None
     m = float(mean_ancestry) if mean_ancestry is not None else m_se
@@ -196,8 +208,8 @@ def compose_ldscores(ref_path, sumstats, annot, out, *, sources=None, snps=None,
         rel_sum = float(relatedness)
 
     # ---------------------------------------------------------------------------------------- per-SNP model
-    cres = m * vA + (1.0 - m) * vE + delta ** 2 * k0
-    s2 = cres + delta ** 2 * 4.0 * r2 * th["var"]
+    cres = m * vA + (1.0 - m) * vE + d2 * k0
+    s2 = cres + d2 * 4.0 * r2 * th["var"]
     ok = cres > 1e-8
     if not ok.all():
         raise ValueError(f"{int((~ok).sum())} SNPs have no variance in the model; they should have been removed.")
@@ -206,7 +218,7 @@ def compose_ldscores(ref_path, sumstats, annot, out, *, sources=None, snps=None,
     chrom_out = rv["CHR"].to_numpy()[r_idx]
     local_out = rv["LOCAL"].to_numpy()[r_idx]
     cm_out = rv["CM"].to_numpy()[r_idx]
-    wd = delta ** 2 / s2                                           # partner weight of the admixture terms
+    wd = d2 / s2                                                   # partner weight of the admixture terms
     W_tot = np.bincount(cls, weights=wd, minlength=K)
     far2 = kern.far ** 2
     n_pairs = 0
@@ -220,6 +232,7 @@ def compose_ldscores(ref_path, sumstats, annot, out, *, sources=None, snps=None,
         tmap[local_out[sel]] = sel
         indptr, indices, cm_ref = z["indptr"], z["indices"], z["cm"]
         covA, covE, m22A, m22E = z[f"cov_{iA}"], z[f"cov_{iE}"], z[f"m22_{iA}"], z[f"m22_{iE}"]
+        vrA, vrE = z[f"v_{iA}"], z[f"v_{iE}"]
         # pairs within the window (upper band), in chunks of rows
         r0 = 0
         while r0 < nloc:
@@ -236,8 +249,9 @@ def compose_ldscores(ref_path, sumstats, annot, out, *, sources=None, snps=None,
                     j, k, jl, kl = j[use], k[use], jl[use], kl[use]
                     cA = covA[s0:s1][use].astype(np.float64)
                     cE = covE[s0:s1][use].astype(np.float64)
-                    vAp = np.maximum(m22A[s0:s1][use] - cA * cA, 0.0) / nA
-                    vEp = np.maximum(m22E[s0:s1][use] - cE * cE, 0.0) / nE
+                    # sampling noise of the squared panel covariances: c^2 minus its unbiased estimate
+                    vAp = cA * cA - unbiased_squared_covariance(cA, m22A[s0:s1][use], vrA[jl] * vrA[kl], nA)
+                    vEp = cE * cE - unbiased_squared_covariance(cE, m22E[s0:s1][use], vrE[jl] * vrE[kl], nE)
                     d = np.abs(cm_ref[kl] - cm_ref[jl])
                     rec = np.exp(-kern.lam * d)
                     piA, piE = m * rec, (1.0 - m) * rec
@@ -258,12 +272,12 @@ def compose_ldscores(ref_path, sumstats, annot, out, *, sources=None, snps=None,
         F = _fft_conv_sym(Wg, k2)[g]                                # (SNPs on chr) x classes, includes each SNP itself
         F[np.arange(sel.size), cls[sel]] -= wd[sel] * k2[0]
         W_chr = Wg.sum(axis=0)
-        L[sel] += (delta[sel] ** 2 / cres[sel])[:, None] * (F + far2 * (W_tot - W_chr)[None, :])
+        L[sel] += (d2[sel] / cres[sel])[:, None] * (F + far2 * (W_tot - W_chr)[None, :])
         log(f"[admixed-ld] compose chr{c}: {sel.size} SNPs ({time.perf_counter() - t0:.0f} s)")
     # same-person term, each SNP with itself, relatives
     pbar = m * pA + (1.0 - m) * pE
     beta_ = 2.0 * delta * (1.0 - 2.0 * pbar)
-    gam = -2.0 * delta ** 2
+    gam = -2.0 * d2
     Bc = np.bincount(cls, weights=beta_ / s2, minlength=K)
     Gc = np.bincount(cls, weights=gam / s2, minlength=K)
     mu2, mu3, mu4 = th["var"], th["m3"], th["m4"]

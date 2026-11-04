@@ -4,7 +4,8 @@ For every source panel (unadmixed samples of one source population) and every ch
 variants shared by all panels (oriented to the first panel's counted allele):
   p_<s>, v_<s>      allele frequency of the counted allele and dosage variance (n - 1 denominator)
   cov_<s>           dosage covariance of each pair (j, k), k > j, within the window (upper band, CSR by j)
-  m22_<s>           mean of x_j^2 x_k^2 over samples (centred dosages), so that Var(cov_jk) ~ (m22_jk - cov_jk^2) / n_s
+  m22_<s>           mean of x_j^2 x_k^2 over samples (centred dosages); with cov and v it gives the unbiased estimate of
+                    the squared covariance (compose.unbiased_squared_covariance)
   indptr, indices   the band structure (indices are positions within the chromosome)
   snp, bp, cm, counted, other
 A manifest.json records the sources, sample sizes, window, genetic map, and format version. Files are uncompressed
@@ -84,9 +85,12 @@ def build_reference(panels, names, out, *, window_kb=3000, genetic_map=None, mat
         raise ValueError("Give at least two source panels, each with a name.")
     if len(set(names)) != len(names):
         raise ValueError("Source names must be distinct.")
+    blocks = [DosageBlocks(p, threads=threads, step=max(step, 1)) for p in panels]
+    small = [n for n, b in zip(names, blocks) if b.n < 10]
+    if small:
+        raise ValueError(f"Source panels need at least 10 people: {', '.join(small)}.")
     os.makedirs(out, exist_ok=True)
     t0 = time.perf_counter()
-    blocks = [DosageBlocks(p, threads=threads, step=max(step, 1)) for p in panels]
     base = blocks[0].variants
     keep = np.ones(len(base), dtype=bool)
     cols = [np.arange(len(base))]
