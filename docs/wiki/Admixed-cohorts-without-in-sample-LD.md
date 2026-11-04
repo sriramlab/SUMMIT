@@ -131,6 +131,14 @@ summit --h2 gwas/ --ldscores ld/cohort.gw.ldscore.gz --annot annot.tsv.gz --out 
 
 ## Accuracy and limits
 
+![The cohort's curve with the kernel from a 5-generation admixture date, per-SNP composed against in-sample LD scores, and h² of 32 traits from composed against in-sample LD scores in two admixed UK Biobank cohorts.](assets/admixed-ld-ukb.png)
+
+(a) The curve measured in cohort 1, the kernel from an admixture date of 5 generations,
+and the curve's between-chromosome value. (b) Composed LD scores, with the curve and the
+relatives' term, against in-sample LD scores of the same SNPs in cohort 1, summed over
+the eight classes. (c) h² of 32 traits fitted with composed and with in-sample LD scores,
+from the same summary statistics.
+
 We compared composed with in-sample LD scores in two cohorts of admixed UK Biobank
 participants of African and European ancestry (3,787 and 6,111 people, mean African
 ancestry 0.61 and 0.76), with 32 traits, 405,807 array SNPs and eight MAF/LD classes. The
