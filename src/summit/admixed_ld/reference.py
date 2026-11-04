@@ -194,8 +194,36 @@ class Reference:
         self.n = {s["name"]: int(s["n"]) for s in self.manifest["sources"]}
         # sample size behind the frequencies, when it differs from the panel's (e.g. frequencies derived from a cohort)
         self.n_freq = {s["name"]: float(s.get("n_freq", s["n"])) for s in self.manifest["sources"]}
+        # a derived source's frequency error contains the known panels' errors with these coefficients
+        self.noise_mix = {s["name"]: dict(s.get("noise_mix", {})) for s in self.manifest["sources"]}
         self.chromosomes = list(self.manifest["chromosomes"])
         self.genome_cm = float(self.manifest["genome_cm"])
+
+    def frequency_noise(self, sources, V, r_idx, rv=None):
+        """Inputs of model.contrast_noise for these sources: V (M x T: the sources' dosage variances, then those of
+        panels that enter only through a derived source), n (T) and the mixing matrix G (K x T). V and r_idx: the
+        selected SNPs' dosage variances of `sources` and their rows in variants(); rv: that variants() table, whose
+        fvar_<s> columns (sources derived from a cohort) replace V / 4n by each SNP's own frequency variance."""
+        sources = list(sources)
+        extra = [t for s in sources for t in self.noise_mix[s] if t not in sources]
+        extra = list(dict.fromkeys(extra))
+        cols = sources + extra
+        G = np.zeros((len(sources), len(cols)))
+        for i, s in enumerate(sources):
+            G[i, i] = 1.0
+            for t, c in self.noise_mix[s].items():
+                G[i, cols.index(t)] += float(c)
+        n = np.array([self.n_freq[t] for t in cols], np.float64)
+        V = np.array(V, np.float64, copy=True)
+        if extra:
+            Vx = self.variants(extra)
+            V = np.column_stack([V] + [Vx[f"v_{t}"].to_numpy()[r_idx] for t in extra])
+        if rv is not None:
+            for i, s in enumerate(sources):
+                if f"fvar_{s}" in rv:
+                    fv = rv[f"fvar_{s}"].to_numpy()[r_idx]
+                    V[:, i] = np.where(np.isfinite(fv), 4.0 * n[i] * fv, V[:, i])
+        return V, n, G, cols
 
     def source_index(self, name: str) -> int:
         if name not in self.names:
@@ -214,6 +242,8 @@ class Reference:
             for nm in sources:
                 s = self.source_index(nm)
                 d[f"p_{nm}"], d[f"v_{nm}"] = z[f"p_{s}"], z[f"v_{s}"]
+                if f"fvar_{s}" in z.files:                     # a derived source's per-SNP frequency variance
+                    d[f"fvar_{nm}"] = z[f"fvar_{s}"]
             df = pd.DataFrame(d)
             df["LOCAL"] = np.arange(len(df))
             frames.append(df)

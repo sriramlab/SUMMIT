@@ -319,3 +319,89 @@ def test_derived_source_from_the_cohort(sim3, tmp_path):
     mass_c = float((got.V.to_numpy()[:, None] * L_c).sum())
     assert abs(mass_c / mass_in - 1) < 0.05, (mass_c, mass_in)
     assert np.corrcoef(L_c.sum(1), L_in.sum(1))[0, 1] > 0.93
+
+
+def test_contrast_noise_identity_and_mixing():
+    """Panels alone give the independent-noise products; a derived source's errors that carry the panels' errors give
+    the covariance of the contrasts' errors (checked by simulation)."""
+    from summit.admixed_ld.model import contrast_noise, unbiased_products, unbiased_products_cov
+    rng = np.random.default_rng(1)
+    M = 40
+    V = rng.uniform(0.05, 0.5, (M, 3))
+    n = np.array([400.0, 300.0, 40.0])
+    D = rng.normal(size=(M, 2))
+    S, R = contrast_noise(V, n)
+    np.testing.assert_allclose(unbiased_products_cov(D, S),
+                               unbiased_products(D, V[:, :2] / (4 * n[:2]), V[:, 2] / (4 * n[2])))
+    np.testing.assert_allclose(R, -np.repeat((V[:, 2] / (4 * n[2]))[:, None], 2, axis=1))
+    G = np.array([[1, 0, 0], [0, 1, 0], [-0.2, -0.8, 1.0]])
+    S2, R2 = contrast_noise(V, n, G)
+    eta = rng.standard_normal((400000, 3)) * np.sqrt(V[0] / (4 * n))
+    e = eta @ G.T
+    dn = e[:, :2] - e[:, 2:3]
+    np.testing.assert_allclose(np.cov(dn.T), S2[0], rtol=0.02)
+    np.testing.assert_allclose([np.cov(dn[:, a], e[:, 2])[0, 1] for a in range(2)], R2[0], rtol=0.03)
+
+
+def test_ridge_calibration_recovers_the_family_position():
+    """Frequencies of a pseudo-source p' = (pN - b pK) / alpha, noisy and carrying the panels' errors, and a small
+    anchor panel of N: the calibration recovers alpha and b, also with errors in every input."""
+    from summit.admixed_ld.derive import ridge_calibration
+    rng = np.random.default_rng(3)
+    M = 60000
+    anc = rng.beta(0.5, 0.5, M)
+    pA = np.clip(anc + rng.normal(0, 0.15, M), 0.01, 0.99)
+    pE = np.clip(anc + rng.normal(0, 0.15, M), 0.01, 0.99)
+    pN = np.clip(anc + rng.normal(0, 0.15, M), 0.01, 0.99)
+    alpha, b = 1.08, np.array([0.02, -0.10])
+    nk, n0, na = np.array([400.0, 400.0]), 1500.0, 40
+    eA = rng.normal(0, np.sqrt(pA * (1 - pA) / (2 * nk[0])))
+    eE = rng.normal(0, np.sqrt(pE * (1 - pE) / (2 * nk[1])))
+    c = np.array([0.2, 0.8])
+    pp = (pN - b[0] * pA - b[1] * pE) / alpha
+    var0 = np.abs(pp * (1 - pp)) / (2 * n0) + 1e-6
+    p_der = pp + rng.normal(0, np.sqrt(var0)) - c[0] * eA - c[1] * eE
+    f = rng.binomial(2 * na, pN) / (2 * na)
+    Pk = np.column_stack([pA + eA, pE + eE])
+    Vk = 2 * Pk * (1 - Pk)
+    out = ridge_calibration(f, na, p_der, var0, c, Pk, Vk, nk)
+    assert abs(out["alpha"] - alpha) < 4 * out["se_alpha"] + 0.003, out
+    np.testing.assert_allclose(out["b"], b, atol=0.01)
+
+
+def test_derived_source_with_panel_ld(sim3, tmp_path):
+    """The derived source with the anchor panel's window LD: frequencies calibrated to the anchors, the manifest
+    carries their error structure, and composed LD scores match in-sample LD scores."""
+    from summit.admixed_ld.compose import compose_ldscores
+    from summit.admixed_ld.curve import genotype_curve
+    from summit.admixed_ld.derive import derive_source
+    d, S, names = sim3["dir"], sim3["S"], sim3["names"]
+    v = S["variants"]
+    write_bed(str(tmp_path / "small"), S["panels"][2][:40], v, "s")
+    build_reference([str(d / "panelS0"), str(d / "panelS1")], names[:2], str(tmp_path / "ref2"), step=256,
+                    log=lambda *a: None)
+    man = derive_source(str(d / "cohort"), str(tmp_path / "ref2"), str(tmp_path / "ref3"), name="S2",
+                        panel=str(tmp_path / "small"), covar=str(d / "cohort.cov"), ld="panel", step=256,
+                        log=lambda *a: None)
+    src = man["sources"][2]
+    assert src["n"] == 40 and src["ld"] == "panel" and set(src["noise_mix"]) == {"S0", "S1"}
+    assert 0 < src["n_freq"] <= src["n_freq_weights"] * 1.05
+    ref3 = Reference(str(tmp_path / "ref3"))
+    z = ref3.load(ref3.chromosomes[0])
+    assert {"cov_2", "m22_2", "vld_2", "fvar_2"} <= set(z.files) and "covvar_2" not in z.files
+    assert (z["fvar_2"] > 0).all() and np.isfinite(z["v_2"]).all()
+    rv = ref3.variants(["S2"]).set_index("SNP")
+    p_true = pd.Series(S["panels"][2].mean(0) / 2, index=v.SNP).reindex(rv.index)
+    assert np.corrcoef(rv.p_S2, p_true)[0, 1] > 0.98
+    genotype_curve(str(d / "cohort"), str(tmp_path / "ref3"), str(tmp_path / "c3"), sources=names,
+                   covar=str(d / "cohort.cov"), cell_cm=0.5, log=lambda *a: None)
+    out = str(tmp_path / "derived")
+    compose_ldscores(str(tmp_path / "ref3"), [str(d / "ss")], str(d / "annot.tsv"), out, sources=names,
+                     curve=str(tmp_path / "c3"), log=lambda *a: None)
+    got = pd.read_csv(out + ".gw.ldscore.gz", sep="\t")
+    keep = v.SNP.isin(got.SNP).to_numpy()
+    L_in, V_in = insample_ldscores(S["cohort"][:, keep], sim3["C"], sim3["cls"][keep], 2)
+    L_c = got[["low", "high"]].to_numpy()
+    mass_c = float((got.V.to_numpy()[:, None] * L_c).sum())
+    mass_in = float((V_in[:, None] * L_in).sum())
+    assert abs(mass_c / mass_in - 1) < 0.05, (mass_c, mass_in)
