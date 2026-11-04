@@ -36,6 +36,18 @@ fit gives a SNP component of about 0.37 and a local-ancestry component of about
 0.03 (SE 0.01), and `summit local-ancestry test` gives z of about 2.1 for that
 component. The run takes about 15 seconds.
 
+## Admixed cohorts without in-sample LD
+
+`bash example/admixed_ld.sh` generates two source panels of 1,000 people each and an
+admixed cohort of 3,000 people (mean ancestry 0.75 from the first source, admixed 8
+generations ago) on six chromosomes of 60 cM, under `example/out/admixed_ld/`. It builds
+the reference resource from the panels, measures the cohort's curve, and composes LD
+scores from the resource, the trait's summary statistics and the decay, once with the
+curve and once with the admixture date. It then fits h² with each and with in-sample LD
+scores. The estimates are about 0.238 (SE 0.026) with the curve, 0.230 with the date and
+0.234 in-sample. The two PCs among the covariates take up part of the simulated h² of
+0.3. The run takes about 30 seconds.
+
 ## Direct genetic effects
 
 `bash example/direct_effects.sh` generates 300 extended families of cousins

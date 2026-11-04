@@ -13,6 +13,7 @@ as `summit pgs fit`.
 | Long-range LD correction of h²/rg standard errors | `summit relatives longrange`, then `--long-range-se` |
 | Heritability due to direct genetic effects from sibships | `summit relatives direct` |
 | Local-ancestry markers, merged with the SNPs, and the test of their component | `summit local-ancestry {markers,merge,test}` |
+| LD scores of an admixed cohort without its genotypes | `summit admixed-ld {reference,curve,compose}` |
 | Additive and generalized G×E PCGC | `summit --binary-method pcgc ...` |
 | Generalized cross-trait PCGC | `summit pcgc-cross {prepare,fit}` |
 | One-environment G×E | `summit --geno ... --env ...`, `--gxe-score-reference`, `--gxe-fit`, or `--gxe-fit-batch` |

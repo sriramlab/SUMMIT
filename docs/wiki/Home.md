@@ -25,6 +25,7 @@ results go to `example/out/`.
 | Total or partitioned h² and rg | [Heritability and genetic correlation](Heritability-and-genetic-correlation.md) |
 | h² and rg keeping related individuals | [Related individuals](Related-individuals.md) |
 | SNP and local-ancestry heritability in admixed samples | [Local ancestry](Local-ancestry.md) |
+| LD scores of an admixed GWAS sample from summary statistics and source panels | [Admixed cohorts without in-sample LD](Admixed-cohorts-without-in-sample-LD.md) |
 | Many traits or annotation models | [Batch analyses](Batch-analyses.md) |
 | One environment, including heterogeneous residual variance | [G×E models](GxE-models.md) |
 | Joint continuous and categorical environments | [Multiple environments](Multiple-environments.md) |

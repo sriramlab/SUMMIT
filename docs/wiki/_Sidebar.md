@@ -13,6 +13,7 @@
 - [h² and rg](Heritability-and-genetic-correlation.md)
 - [Related individuals](Related-individuals.md)
 - [Local ancestry](Local-ancestry.md)
+- [Admixed cohorts without in-sample LD](Admixed-cohorts-without-in-sample-LD.md)
 - [Batch analyses](Batch-analyses.md)
 - [G×E models](GxE-models.md)
 - [Multiple environments](Multiple-environments.md)

@@ -47,7 +47,9 @@ AFR genotypes with 10 PCs, an h² of 0.5 was estimated at about 0.48 without
 the weights.
 
 Use the GWAS covariates for the LD scores, and in admixed cohorts compute the
-LD scores in the GWAS sample itself. Because V uses the adjusted R², it does
+LD scores in the GWAS sample itself. Without its genotypes, they can be composed from
+source panels and the summary statistics
+([Admixed cohorts without in-sample LD](Admixed-cohorts-without-in-sample-LD.md)). Because V uses the adjusted R², it does
 not depend on the size of the LD-score sample, so LD scores from a random
 subset of the GWAS sample (`--rand-samp`) can be used as with ordinary LD
 scores. `--snp-var-weights-off` writes ordinary

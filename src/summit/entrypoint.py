@@ -15,6 +15,9 @@ def main(argv=None):
     if tokens[:1] == ["local-ancestry"]:
         from .local_ancestry.__main__ import main as local_ancestry_main
         return local_ancestry_main(tokens[1:])
+    if tokens[:1] == ["admixed-ld"]:
+        from .admixed_ld.__main__ import main as admixed_ld_main
+        return admixed_ld_main(tokens[1:])
     if tokens[:1] == ["relatives"]:
         from .relatives.__main__ import main as relatives_main
         return relatives_main(tokens[1:])
