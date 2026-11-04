@@ -63,8 +63,10 @@ The scripts reproduce the paper's computations with these exceptions.
   variant's own position.
 - Origin covariates drop rare and collinear categories with frequency and rank filters, not the per-trait variance-inflation
   screen of the paper's runs.
-- The 291,273-participant white British reference for genetic correlation is refitted from the SUMMIT paper's GWAS and LD
-  scores; cov-LDSC is an external dependency.
+- The white British reference of Fig. 4A, B and Table 4 is the unrelated subset of `white_british.py` (337,845
+  participants), fitted like the cohorts (8 MAF-LD bins, 200 blocks, no `--max-chisq`) on the panel LD scores given to
+  `white_british.py` (`--ld8`, `--annot8`), with the origin covariates of `traits.py` added for the comparisons with
+  origin covariates, and without the long-range correction of its standard errors. cov-LDSC is an external dependency.
 
 ## Resources
 

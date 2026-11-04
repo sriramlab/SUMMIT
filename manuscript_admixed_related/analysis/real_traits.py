@@ -70,7 +70,7 @@ for arm in arms:
         pre = f'{W}/fit_{arm}.{model}'
         if not os.path.exists(pre + '.results.tsv'):
             cmds.append(f'{ONE_THREAD} {a.summit} --h2 {W}/{ss} --ldscores {C}/ld/{s}.{ld}.gw.ldscore.gz {annot} --njack 200 '
-                        f'--max-chisq auto --long-range-se {W}/longrange_{s} --num-threads 1 --out {pre} > {pre}.out 2>&1')
+                        f'--long-range-se {W}/longrange_{s} --num-threads 1 --out {pre} > {pre}.out 2>&1')
 run_all(cmds, a.threads)
 
 prev = pd.read_csv(f'{P}/prevalence.tsv', sep='\t').set_index(['sample', 'trait']).prevalence

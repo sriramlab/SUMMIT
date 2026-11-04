@@ -29,10 +29,9 @@ OUT = ap.parse_args().out
 SRC = {k: os.path.join(DATA, v) for k, v in dict(
     grid='simulations.tsv.gz', reml='simulations_reml.tsv.gz', covldsc='simulations_covldsc.tsv.gz',
     la_sims='local_ancestry_simulations.tsv.gz', wide='wider_group_simulations.tsv.gz',
-    sib_sim='direct_effects_simulations.tsv.gz', traits40='cohort_traits.tsv', cohort_tests='cohort_tests.tsv',
+    sib_sim='direct_effects_simulations.tsv.gz', traits40='cohort_traits.tsv',
     la_real='local_ancestry_traits.tsv', sib32='direct_effects_traits.tsv', sib_extra='direct_effects_traits_extra.tsv',
-    sib_extra2='direct_effects_traits_extra2.tsv', rg='genetic_correlation_cohorts.tsv.gz',
-    rg_ref='genetic_correlation_reference.tsv').items()}
+    sib_extra2='direct_effects_traits_extra2.tsv', rg='genetic_correlation_cohorts.tsv.gz').items()}
 SRC['ukb406'] = [os.path.join(DATA, 'white_british_traits.tsv')]
 os.makedirs(OUT, exist_ok=True)
 plt.rcParams.update({'font.size': 8, 'axes.titlesize': 8.5, 'axes.labelsize': 8, 'xtick.labelsize': 7, 'ytick.labelsize': 7,
@@ -217,9 +216,6 @@ plt.close(fig)
 R = pd.read_csv(SRC['rg'], sep='\t')
 def rga(v, a_, m='8bin'):
     return R[(R.variant == v) & (R.arm == a_) & (R.model == m)].set_index('key')
-ref = pd.read_csv(SRC['rg_ref'], sep='\t')
-ref['key'] = ['|'.join(sorted(p)) for p in zip(ref.phen1, ref.phen2)]
-ref = ref.set_index('key')
 fig, axB = plt.subplots(1, 1, figsize=(2.8, 2.6), gridspec_kw=dict(left=0.2, right=0.96, bottom=0.17, top=0.9))
 e_x, e_u = rga('EUR', 'XA'), rga('EUR', 'U')
 jj = e_x.join(e_u[['rg_total', 'rg_total_se']], rsuffix='_u', how='inner')

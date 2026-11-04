@@ -152,13 +152,13 @@ def p_rg(ax, ylabel='Wider group (9,647)'):
                 ms=4, capsize=1.2, elinewidth=0.7, label='FDR < 0.05')
     ax.plot([-1, 1], [-1, 1], ls='--', color='0.4', lw=0.8)
     ax.set_xlim(-1, 1); ax.set_ylim(-1.5, 1.5)
-    ax.set_xlabel('White British (291,273)'); ax.set_ylabel(ylabel); ax.set_title('r̂$_g$', fontsize=8)
+    ax.set_xlabel('White British (337,845)'); ax.set_ylabel(ylabel); ax.set_title('r̂$_g$', fontsize=8)
     ax.legend(loc='lower right', fontsize=6.5); grid(ax, 'both')
 
 
 def p_cmp_wb(ax):
-    o = CT[(CT.set == 'origin') & (CT.ref == 'EUR300k') & (CT.cohort == 'Wider African group')].set_index('trait')
-    bb = CT[(CT.set == 'base') & (CT.ref == 'EUR300k') & (CT.cohort == 'Wider African group')].set_index('trait')
+    o = CT[(CT.set == 'origin') & (CT.ref == 'EUR338k') & (CT.cohort == 'Wider African group')].set_index('trait')
+    bb = CT[(CT.set == 'base') & (CT.ref == 'EUR338k') & (CT.cohort == 'Wider African group')].set_index('trait')
     ax.errorbar(o.ref_h2, o.h2, yerr=1.96 * o.se, fmt='o', color=C['XA'], mec='black', mew=0.5, ms=4, capsize=1.2,
                 elinewidth=0.6)
     fi = 'fluid_intelligence_score'
@@ -167,7 +167,7 @@ def p_cmp_wb(ax):
                 arrowprops=dict(arrowstyle='->', color='tab:red', lw=0.9))
     ax.plot([-0.25, 1], [-0.25, 1], ls='--', color='0.4', lw=0.8)
     ax.set_xlim(-0.02, 0.62); ax.set_ylim(-0.25, 1.0)
-    ax.set_xlabel('White British (291,273)'); ax.set_ylabel('Wider group (9,647)')
+    ax.set_xlabel('White British (337,845)'); ax.set_ylabel('Wider group (9,647)')
     ax.set_title('ĥ² with origin covariates', fontsize=8); grid(ax, 'both')
 
 

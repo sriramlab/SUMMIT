@@ -60,12 +60,12 @@ where a column says so (`h2L_*`, `liab_mult`).
 | `ancestry_environment_simulations.tsv.gz` | Environments that depend nonlinearly on global ancestry, with and without the ancestry covariates |
 | `white_british_traits.tsv` | 40 traits in 406,657 white British participants with relatives against the 337,845 unrelated participants |
 | `cohort_traits.tsv` | 40 traits in each cohort and arm, with origin covariates (`set = origin`) and without (`base`) |
-| `cohort_tests.tsv` | Differences of each cohort's heritability from the white British reference, with Bonferroni and FDR |
+| `cohort_tests.tsv` | Differences of each cohort's heritability from that of the 337,845 unrelated white British participants (`ref = EUR338k`), fitted with the same covariate set, with Bonferroni and FDR over the 40 traits of each cohort (`bonf_pooled`, Bonferroni over the cohorts of a covariate set) |
 | `local_ancestry_traits.tsv` | Local-ancestry and SNP components of the 40 traits, with the test against the null variance and sandwich SEs |
 | `direct_effects_simulations.tsv.gz` | Direct and population estimators on the siblings' genotypes, by setting |
 | `direct_effects_traits*.tsv` | Direct-effect and population heritability of the traits in 35,365 white British siblings |
 | `genetic_correlation_cohorts.tsv.gz` | Genetic correlation of the 780 trait pairs in each cohort and arm |
-| `genetic_correlation_reference.tsv` | The same pairs in 291,273 unrelated white British participants |
+| `genetic_correlation_reference.tsv` | The same pairs in the 337,845 unrelated white British participants |
 | `ancestry_groups_traits.tsv` | European group and wider group in one analysis: heritability of each group, genetic covariance and correlation between them, local-ancestry component and one-kernel heritability (origin covariates) |
 | `ancestry_groups_simulations.tsv.gz` | Simulations of the analysis of the two groups, one row per replicate (`scenario` gives the setting) |
 
