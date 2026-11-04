@@ -244,6 +244,12 @@ class Reference:
             return own, {t: tuple(float(x) for x in v) for t, v in cn["mix"].items()}
         if not src.get("derived") or src.get("ld", "inversion") != "inversion" or "m_anchor" not in src:
             return None
+        # inversion stores each covariance with its sampling variance (covvar); a reference that kept the manifest
+        # entry but took the source's covariances from a panel (m22, e.g. derived frequencies with a small panel's LD)
+        # carries no panel errors
+        i = self.source_index(name)
+        if f"covvar_{i}" not in self.load(self.chromosomes[0]).files:
+            return None
         names = [x["name"] for x in self.manifest["sources"]]
         m, lam = src["m_anchor"], src["decay_anchor"]
         if len(m) != len(names) or len(lam) != len(names) or names[-1] != name:

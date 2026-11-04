@@ -393,6 +393,16 @@ def test_derived_source_with_panel_ld(sim3, tmp_path):
     rv = ref3.variants(["S2"]).set_index("SNP")
     p_true = pd.Series(S["panels"][2].mean(0) / 2, index=v.SNP).reindex(rv.index)
     assert np.corrcoef(rv.p_S2, p_true)[0, 1] > 0.98
+    # panel covariances under a manifest entry that looks like an inversion source (m_anchor, no ld key): no mix
+    assert ref3.covariance_noise_mix("S2") is None
+    look = json.load(open(tmp_path / "ref3" / "manifest.json"))
+    look["sources"][2].pop("ld")
+    look["sources"][2].update(m_anchor=[0.5, 0.3, 0.2], decay_anchor=[0.1, 0.1, 0.1])
+    os.makedirs(tmp_path / "look")
+    json.dump(look, open(tmp_path / "look" / "manifest.json", "w"))
+    for c in ref3.chromosomes:
+        os.symlink(tmp_path / "ref3" / f"chr{c}.npz", tmp_path / "look" / f"chr{c}.npz")
+    assert Reference(str(tmp_path / "look")).covariance_noise_mix("S2") is None
     genotype_curve(str(d / "cohort"), str(tmp_path / "ref3"), str(tmp_path / "c3"), sources=names,
                    covar=str(d / "cohort.cov"), cell_cm=0.5, log=lambda *a: None)
     out = str(tmp_path / "derived")
@@ -633,6 +643,8 @@ def test_inversion_counts_panel_noise_once(sim3, tmp_path):
     old = json.load(open(tmp_path / "ref3" / "manifest.json"))             # the layout before covariance_noise
     del old["sources"][2]["covariance_noise"]
     os.makedirs(tmp_path / "old_layout")
+    for c in ref3.chromosomes:
+        os.symlink(tmp_path / "ref3" / f"chr{c}.npz", tmp_path / "old_layout" / f"chr{c}.npz")
     json.dump(old, open(tmp_path / "old_layout" / "manifest.json", "w"))
     assert Reference(str(tmp_path / "old_layout")).covariance_noise_mix("S2") == ref3.covariance_noise_mix("S2")
     old["sources"][2]["how"] = "derive, covvar without the doubly counted panel noise (test)"

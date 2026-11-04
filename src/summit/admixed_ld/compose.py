@@ -392,6 +392,7 @@ def compose_ldscores(ref_path, sumstats, annot, out, *, sources=None, snps=None,
         # the variances of the people behind each covariance (a derived source with a small panel's LD keeps that
         # panel's variances apart from the dosage variances its frequencies imply)
         vr = [z[f"vld_{i}"] if f"vld_{i}" in z.files else z[f"v_{i}"] for i in si]
+        cross_c = [x for x in cross if cvar[x[0]] is not None]          # only covariances stored with covvar
         # pairs within the window (upper band), in chunks of rows
         r0 = 0
         while r0 < nloc:
@@ -422,7 +423,7 @@ def compose_ldscores(ref_path, sumstats, annot, out, *, sources=None, snps=None,
                                                                           vr[s][jl] * vr[s][kl], ns[s])
                         cr += pi_s * cs_
                         pis[s], vnss[s] = pi_s, vns
-                    noise = window_noise(pis, vnss, cross, d)
+                    noise = window_noise(pis, vnss, cross_c, d)
                     sq = cr * cr - noise - adm * adm
                     L += np.bincount(j * K + cls[k], weights=sq / (cres[j] * s2[k]), minlength=M * K).reshape(M, K)
                     L += np.bincount(k * K + cls[j], weights=sq / (cres[k] * s2[j]), minlength=M * K).reshape(M, K)
