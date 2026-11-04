@@ -98,6 +98,73 @@ def _fft_conv_sym(W: np.ndarray, kern: np.ndarray) -> np.ndarray:
     return np.fft.irfft(fw * fk[:, None], n=size, axis=0)[:n]
 
 
+def _cell_correction(path, kern, chrom_out, cm_out, Oflat, Wn, cls, K, k1, switch_cm, log):
+    """Long-range admixture LD from the cohort's cell matrix in place of the kernel: for pairs of cells on the same
+    chromosome at least switch_cm apart and for every pair of cells on different chromosomes, the kernel's square
+    (Kt(d) x Kt(d), or far x far) is replaced by the product of the two half-sample estimates of the cells' covariance
+    matrix, which is unbiased for its square. Returns (M x K correction to multiply by 1 / cres, summary)."""
+    from .curve import _solve_kernel
+    from .model import contrast_pairs
+    z = np.load(path)
+    if int(z["k1"]) != k1:
+        raise ValueError(f"The cell matrix has {int(z['k1'])} contrasts, the composition {k1}.")
+    Q = z["Q"]                                                     # cells x k1 x k1
+    nC = Q.shape[0]
+    chrom_c = z["chrom"].astype(str)
+    start, width = z["start_cm"], z["width_cm"]
+    mid = start + width / 2.0
+    Kh = []
+    for key in ("S1", "S2"):
+        Sr = z[key].reshape(k1, nC, k1, nC)                        # [a, cell, b, cell']
+        num = np.transpose(Sr, (1, 3, 0, 2))                       # cell, cell', a, b
+        den = np.einsum("iau,jbv->ijabuv", Q, Q)
+        Kc = np.zeros((nC, nC, k1, k1))
+        if k1 == 1:
+            with np.errstate(divide="ignore", invalid="ignore"):
+                Kc[..., 0, 0] = np.where(den[..., 0, 0, 0, 0] > 0, num[..., 0, 0] / den[..., 0, 0, 0, 0], 0.0)
+        else:
+            pairs = contrast_pairs(k1)
+            A = np.stack([den[..., u, v] + (den[..., v, u] if u != v else 0.0) for u, v in pairs], axis=-1)
+            A = A.reshape(nC, nC, k1 * k1, len(pairs))
+            AtA = np.einsum("ijep,ijeq->ijpq", A, A) + 1e-12 * np.eye(len(pairs))
+            Atb = np.einsum("ijep,ije->ijp", A, num.reshape(nC, nC, k1 * k1))
+            sol = np.linalg.solve(AtA, Atb[..., None])[..., 0]
+            for t, (u, v) in enumerate(pairs):
+                Kc[..., u, v] = Kc[..., v, u] = sol[..., t]
+        Kh.append(Kc)
+    uu = [(a, c) for a in range(k1) for c in range(k1)]
+    same = chrom_c[:, None] == chrom_c[None, :]
+    dist = np.abs(mid[:, None] - mid[None, :])
+    use = (~same) | (dist >= switch_cm)
+    Kd = kern(np.where(same, dist, 0.0))                           # kernel at the cells' distance
+    k2 = k1 * k1
+    delta_F = np.zeros((nC, nC, k2, k2))
+    for ui, (a, c) in enumerate(uu):
+        for vi, (b, e) in enumerate(uu):
+            cell_sq = 0.5 * (Kh[0][..., a, b] * Kh[1][..., c, e] + Kh[1][..., a, b] * Kh[0][..., c, e])
+            model_sq = np.where(same, Kd[..., a, b] * Kd[..., c, e], kern.far[a, b] * kern.far[c, e])
+            delta_F[..., ui, vi] = np.where(use, cell_sq - model_sq, 0.0)
+    # the composed SNPs' cells
+    cell_of = np.full(chrom_out.size, -1, dtype=np.int64)
+    for c in np.unique(chrom_c):
+        rows = np.flatnonzero(chrom_c == c)
+        sel = np.flatnonzero(chrom_out == str(c))
+        if sel.size == 0:
+            continue
+        k = np.floor((cm_out[sel] - start[rows[0]]) / width[rows[0]]).astype(np.int64)
+        cell_of[sel] = rows[0] + np.clip(k, 0, rows.size - 1)
+    have = cell_of >= 0
+    Wc = np.zeros((nC, k2, K))
+    for v in range(k2):
+        np.add.at(Wc[:, v, :], (cell_of[have], cls[have]), Wn[have, v])
+    per_cell = np.einsum("ijuv,jvk->iuk", delta_F, Wc)             # cells x k2 x classes
+    corr = np.zeros((chrom_out.size, K))
+    corr[have] = np.einsum("ju,juk->jk", Oflat[have], per_cell[cell_of[have]])
+    log(f"[admixed-ld] compose: cell matrix of {nC} cells used beyond {switch_cm} cM and between chromosomes "
+        f"({int((~have).sum())} SNPs outside the cells)")
+    return corr, dict(file=path, n_cells=int(nC), switch_cm=float(switch_cm))
+
+
 def _parse_values(x):
     if x is None:
         return None
@@ -108,7 +175,8 @@ def _parse_values(x):
 
 def compose_ldscores(ref_path, sumstats, annot, out, *, sources=None, snps=None, match="position", curve=None,
                      generations=None, decay_per_cm=None, mean_ancestry=None, kappa0=None, theta_sd=None,
-                     relatedness=None, nu=None, r2=0.99, grid_cm=0.02, pair_chunk=1 << 23, log=print):
+                     relatedness=None, nu=None, r2=0.99, grid_cm=0.02, cell_matrix=False, cell_switch_cm=10.0,
+                     pair_chunk=1 << 23, log=print):
     """Composed LD scores for an admixed GWAS sample with two or more sources (the last is the baseline of the
     contrasts). mean_ancestry: K-1 or K values (comma-separated); kappa0: the upper triangle of Kt_res(0) row by row."""
     from ..ldscore.gw_ldscore import write_gw_annotation_masses, write_gw_ldscore_table
@@ -337,6 +405,13 @@ def compose_ldscores(ref_path, sumstats, annot, out, *, sources=None, snps=None,
         acc[np.arange(sel.size), cls[sel]] -= self_                 # the convolution includes each SNP itself
         L[sel] += acc / cres[sel][:, None]
         log(f"[admixed-ld] compose chr{c}: {sel.size} SNPs ({time.perf_counter() - t0:.0f} s)")
+    cells_used = None
+    if cell_matrix:
+        if curve is None:
+            raise ValueError("--cell-matrix needs --curve (the curve writes the cell matrix).")
+        corr, cells_used = _cell_correction(f"{curve}.cells.npz", kern, chrom_out, cm_out, Oflat, Wn, cls, K, k1,
+                                            cell_switch_cm, log)
+        L += corr / cres[:, None]
     # same-person term, each SNP with itself, relatives
     pbar = Pm @ m_vec                                               # frequency at the mean ancestry
     beta_ = 2.0 * Dm * (1.0 - 2.0 * pbar)[:, None]
@@ -354,7 +429,7 @@ def compose_ldscores(ref_path, sumstats, annot, out, *, sources=None, snps=None,
                   n_window_pairs=int(n_pairs), mean_ancestry_vector=m_vec.tolist(), kappa0_matrix=k0.tolist(),
                   mean_ancestry_from_se=np.asarray(m_se).tolist(), kappa0_from_se=np.asarray(k_se).tolist(),
                   gwas_n=N, covariate_rank=p, nu=nu, kernel=kern.describe(), theta=th, theta_source=th_source,
-                  relatedness=rel_sum, r2=r2, grid_cm=grid_cm,
+                  relatedness=rel_sum, r2=r2, grid_cm=grid_cm, cell_matrix=cells_used,
                   reference=dict(sources=ref.manifest["sources"], window_kb=ref.manifest["window_kb"],
                                  genetic_map=ref.manifest["genetic_map"]),
                   per_trait=None if per_trait is None else per_trait.to_dict(orient="records"),

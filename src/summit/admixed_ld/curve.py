@@ -87,8 +87,11 @@ class _PairRelatedness:
 
 def genotype_curve(geno, ref_path, out, *, sources=None, covar=None, keep=None, match="position", cell_cm=0.25,
                    max_cm=None, theta_min_delta=0.2, relative_pairs=None, kinship_col=None, kinship_min=None,
-                   closure=False, step=4096, threads=1, native=True, log=print):
-    """The weighted-LD curve of the cohort for two or more sources. With K sources and the last as baseline, each of the
+                   closure=False, cells_cm=2.0, step=4096, threads=1, native=True, log=print):
+    """The weighted-LD curve of the cohort for two or more sources. With cells_cm, also the genome-wide matrix of
+    covariances between cells of cells_cm cM (within and between chromosomes) and the sampling variance of each entry,
+    written to out.cells.npz: it carries long-range structure that one value per distance cannot (for example what the
+    genotype PCs leave). With K sources and the last as baseline, each of the
     K-1 contrasts D_a = p^a - p^B gives its own cell sums; per distance, the (K-1)^2 products of cell sums are linear in
     the unique entries of Kt_res(d) and are solved by least squares (two sources: numerator / denominator)."""
     t0 = time.perf_counter()
@@ -141,6 +144,7 @@ def genotype_curve(geno, ref_path, out, *, sources=None, covar=None, keep=None, 
     num = np.zeros((L + 1, k1, k1))                            # sum over cell pairs at lag L of U_a(b) U_b(b + L)
     den = np.zeros((L + 1, k1, k1, k1, k1))                    # sum of Q_au(b) Q_bv(b + L)
     T, Qtot = [], []                                           # per person chromosome totals (projected), and Q
+    coarse_U, coarse_q, coarse_tab = [], [], []                # cells of cells_cm for the cell matrix
     th_num = np.zeros((N, k1))
     th_den = np.zeros((k1, k1))
     th_c = np.zeros(k1)
@@ -194,6 +198,19 @@ def genotype_curve(geno, ref_path, out, *, sources=None, covar=None, keep=None, 
             den[lag] += np.einsum("iau,ibv->abuv", q[:-lag], q[lag:])
         T.append(U.reshape(N, k1, nc).sum(axis=2))
         Qtot.append(q.sum(axis=0))
+        if cells_cm:
+            per = max(1, int(round(cells_cm / cell_cm)))           # fine cells per coarse cell
+            ncc = (nc + per - 1) // per
+            Ur = U.reshape(N, k1, nc)
+            Uc = np.zeros((N, k1, ncc))
+            qc = np.zeros((ncc, k1, k1))
+            for cc in range(ncc):
+                Uc[:, :, cc] = Ur[:, :, cc * per:(cc + 1) * per].sum(axis=2)
+                qc[cc] = q[cc * per:(cc + 1) * per].sum(axis=0)
+            coarse_U.append(Uc)
+            coarse_q.append(qc)
+            coarse_tab.append(pd.DataFrame({"CHR": c, "start_cm": cm[ix].min() + np.arange(ncc) * per * cell_cm,
+                                            "width_cm": per * cell_cm}))
         log(f"[admixed-ld] curve chr{c}: {ix.size} SNPs, {nc} cells ({time.perf_counter() - t0:.0f} s)")
     T = np.stack(T, axis=2)                                    # N x k1 x chromosomes
     Qtot = np.stack(Qtot)                                      # chromosomes x k1 x k1
@@ -236,6 +253,22 @@ def genotype_curve(geno, ref_path, out, *, sources=None, covar=None, keep=None, 
         r = info["relatedness"]
         log(f"[admixed-ld] curve: {r['pairs']} relative pairs, mean relatedness after the covariates {r['mean']:.4f} "
             f"(largest |g| {r['max_abs']:.3f}); sum over ordered pairs of g^2 {r['sum_squared_ordered']:.4g}")
+    if cells_cm and coarse_U:
+        # two random halves of the people give independent estimates of each cell-pair covariance, whose product is
+        # unbiased for its square (and, with K sources, for the products of kernel entries)
+        Uall = np.concatenate(coarse_U, axis=2)                 # N x k1 x cells
+        nC = Uall.shape[2]
+        half = np.random.default_rng(20261104).permutation(N) < N // 2
+        Sh = []
+        for h in (half, ~half):
+            Uh = Uall[h].reshape(int(h.sum()), k1 * nC)          # column a * n_cells + cell
+            Sh.append(mp.tn(Uh, Uh) / (h.sum() - 1 - p_rank))
+        tab = pd.concat(coarse_tab, ignore_index=True)
+        np.savez(f"{out}.cells.npz", S1=Sh[0], S2=Sh[1], Q=np.concatenate(coarse_q), chrom=tab.CHR.to_numpy().astype(str),
+                 start_cm=tab.start_cm.to_numpy(), width_cm=tab.width_cm.to_numpy(), k1=k1)
+        info["cells"] = dict(file=f"{out}.cells.npz", n_cells=int(nC), cells_cm=float(cells_cm),
+                             estimator="split halves")
+        del Uall
     curve.to_csv(f"{out}.curve.tsv", sep="\t", index=False, float_format="%.8g")
     with open(f"{out}.curve.json", "w") as f:
         json.dump(info, f, indent=1)

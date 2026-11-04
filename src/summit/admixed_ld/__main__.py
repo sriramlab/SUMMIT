@@ -98,6 +98,9 @@ def main(argv=None):
                         "covariate-adjusted genotypes, or 'curve' to take it from the curve")
     m.add_argument("--nu", type=float, default=None, help="sample size minus covariates (default from the GWAS)")
     m.add_argument("--grid-cm", type=float, default=0.02, help="grid of the long-range convolution (default 0.02)")
+    m.add_argument("--cell-matrix", action="store_true",
+                   help="use the cohort's cell matrix (written by curve) beyond --cell-switch-cm and between chromosomes")
+    m.add_argument("--cell-switch-cm", type=float, default=10.0)
     m.add_argument("--out", required=True)
 
     v = sub.add_parser("derive", help="a source without a reference panel, estimated from an admixed cohort that "
@@ -145,7 +148,8 @@ def main(argv=None):
         compose_ldscores(a.ref, a.sumstats, a.annot, a.out, sources=_sources(a.sources), snps=a.snps, match=a.match,
                          curve=a.curve, generations=a.admixture_generations, decay_per_cm=a.decay_per_cm,
                          mean_ancestry=a.mean_ancestry, kappa0=a.kappa0, theta_sd=a.ancestry_sd,
-                         relatedness=a.relatedness, nu=a.nu, grid_cm=a.grid_cm, log=log._log)
+                         relatedness=a.relatedness, nu=a.nu, grid_cm=a.grid_cm, cell_matrix=a.cell_matrix,
+                         cell_switch_cm=a.cell_switch_cm, log=log._log)
     return 0
 
 
