@@ -491,3 +491,70 @@ def test_panel_admixture_removed(tmp_path):
                for s in man["sources"])
     with pytest.raises(ValueError):                                 # cleaning twice is refused
         remove_panel_admixture(str(tmp_path / "pure_clean"), {"A": str(tmp_path / "A")}, match="id", log=quiet)
+
+
+def test_regional_matrix(sim, tmp_path):
+    """summit admixed-ld matrix: the composed correlation equals the formula evaluated on the panel genotypes, is
+    positive semi-definite, is closer to the cohort's covariate-adjusted in-sample correlation than the matrix without
+    the admixture term, and the command line writes the three files."""
+    from summit.admixed_ld.compose import compose_ldscores
+    from summit.admixed_ld.curve import genotype_curve
+    from summit.admixed_ld.matrix import compose_matrix
+    from summit.admixed_ld.model import KernelMatrix
+    from summit.entrypoint import main
+    d, S = sim["dir"], sim["S"]
+    if not os.path.exists(f"{d / 'cohort'}.curve.json"):
+        genotype_curve(str(d / "cohort"), str(d / "ref"), str(d / "cohort"), covar=str(d / "cohort.cov"),
+                       cell_cm=0.5, log=lambda *a: None)
+    comp = str(d / "composed_curve")
+    if not os.path.exists(comp + ".admixed_ld.json"):
+        compose_ldscores(str(d / "ref"), [str(d / "ss")], str(d / "annot.tsv"), comp, curve=str(d / "cohort"),
+                         log=lambda *a: None)
+    v = S["variants"]
+    c0 = v.CHR.astype(str).iloc[0]
+    on = np.flatnonzero((v.CHR.astype(str) == c0).to_numpy())
+    on = on[(v.BP.to_numpy()[on] >= v.BP.to_numpy()[on[100]]) & (v.BP.to_numpy()[on] < v.BP.to_numpy()[on[100]] + 2_900_000)]
+    assert on.size >= 20                                              # inside one reference window (3000 kb)
+    ids = tmp_path / "snps.txt"
+    v.SNP.iloc[on].to_csv(ids, index=False, header=False)
+    R, snp, info = compose_matrix(str(d / "ref"), str(tmp_path / "m"), snps=str(ids), params=comp + ".admixed_ld.json",
+                                  curve=str(d / "cohort"), taper="none", log=lambda *a: None)
+    sel = pd.Index(v.SNP).get_indexer(snp.SNP)
+    assert np.allclose(R, R.T) and np.allclose(np.diag(R), 1.0) and info["min_eigenvalue"] > -1e-8
+    assert info["complete_band"]
+    # the formula on the panel genotypes
+    GA, GE = S["panel_A"][:, sel].astype(float), S["panel_E"][:, sel].astype(float)
+    CA, CE = np.cov(GA, rowvar=False), np.cov(GE, rowvar=False)
+    Dv = GA.mean(0) / 2 - GE.mean(0) / 2
+    pr = json.load(open(comp + ".admixed_ld.json"))
+    m = float(pr["mean_ancestry"])
+    ci, cdf = json.load(open(f"{d / 'cohort'}.curve.json")), pd.read_csv(f"{d / 'cohort'}.curve.tsv", sep="\t")
+    lam = ci["fit_2_to_20cm"]["lam"]
+    kern = KernelMatrix.from_curve(cdf.d_cm.to_numpy(), cdf.kernel.to_numpy(), [[ci["inter_kernel"]]],
+                                   [[pr["kappa0"]]], [lam, lam])
+    cm = v.CM.to_numpy()[sel]
+    dd = np.abs(cm[:, None] - cm[None, :])
+    C = m * np.exp(-lam * dd) * CA + (1 - m) * np.exp(-lam * dd) * CE + Dv[:, None] * Dv[None, :] * kern(dd)[..., 0, 0]
+    sd = np.sqrt(np.diag(C))
+    np.testing.assert_allclose(R, C / sd[:, None] / sd[None, :], atol=1e-6)
+    # against the in-sample correlation of the covariate-adjusted cohort genotypes
+    X = S["cohort"][:, sel].astype(float)
+    X -= X.mean(0)
+    Q = np.linalg.qr(np.column_stack([np.ones(len(X)), sim["C"]]))[0]
+    X -= Q @ (Q.T @ X)
+    Rin = np.corrcoef(X, rowvar=False)
+    R0, _, _ = compose_matrix(str(d / "ref"), str(tmp_path / "m0"), snps=str(ids), params=comp + ".admixed_ld.json",
+                              curve=str(d / "cohort"), taper="none", admixture=False, log=lambda *a: None)
+    iu = np.triu_indices(len(sel), 1)
+    err, err0 = np.sqrt(np.mean((R - Rin)[iu] ** 2)), np.sqrt(np.mean((R0 - Rin)[iu] ** 2))
+    assert err < 0.8 * err0, (err, err0)          # 0.62 in this small simulation (in-sample noise at n = 3000)
+    Rt, _, it = compose_matrix(str(d / "ref"), str(tmp_path / "mt"), snps=str(ids), params=comp + ".admixed_ld.json",
+                               curve=str(d / "cohort"), taper="auto", log=lambda *a: None)
+    assert all(np.isfinite(x["tau_cm"]) for x in it["taper"].values()) and it["min_eigenvalue"] > -1e-8
+    out = str(tmp_path / "cli")
+    assert main(["admixed-ld", "matrix", "--ref", str(d / "ref"), "--params", comp + ".admixed_ld.json",
+                 "--region", f"{c0}:{int(v.BP.iloc[on[0]])}-{int(v.BP.iloc[on[-1]])}", "--admixture-generations",
+                 str(S["generations"]), "--taper", "none", "--out", out]) == 0
+    for ext in (".ld", ".ld.npz", ".snps.tsv", ".matrix.json"):
+        assert os.path.exists(out + ext)
+    assert len(pd.read_csv(out + ".snps.tsv", sep="\t")) == len(sel)
