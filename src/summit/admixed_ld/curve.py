@@ -87,13 +87,16 @@ class _PairRelatedness:
 
 def genotype_curve(geno, ref_path, out, *, sources=None, covar=None, keep=None, match="position", cell_cm=0.25,
                    max_cm=None, theta_min_delta=0.2, relative_pairs=None, kinship_col=None, kinship_min=None,
-                   closure=False, cells_cm=2.0, step=4096, threads=1, native=True, log=print):
+                   closure=False, cells_cm=2.0, step=4096, threads=1, native=True, noise_correction=True, log=print):
     """The weighted-LD curve of the cohort for two or more sources. With cells_cm, also the genome-wide matrix of
     covariances between cells of cells_cm cM (within and between chromosomes) and the sampling variance of each entry,
     written to out.cells.npz: it carries long-range structure that one value per distance cannot (for example what the
     genotype PCs leave). With K sources and the last as baseline, each of the
     K-1 contrasts D_a = p^a - p^B gives its own cell sums; per distance, the (K-1)^2 products of cell sums are linear in
-    the unique entries of Kt_res(d) and are solved by least squares (two sources: numerator / denominator)."""
+    the unique entries of Kt_res(d) and are solved by least squares (two sources: numerator / denominator).
+    noise_correction: remove the sampling (co)variance of the reference frequencies from the squared contrasts of each
+    SNP in the denominators (and in the global-ancestry regression); without it the kernel is attenuated by the
+    reliability of the contrasts (errors in variables), which matters for small panels and derived sources."""
     t0 = time.perf_counter()
     ref = Reference(ref_path)
     sources = list(sources or ref.names[:2])
@@ -133,6 +136,13 @@ def genotype_curve(geno, ref_path, out, *, sources=None, covar=None, keep=None, 
     pB_c = np.where(flip, 1.0 - P[:, -1], P[:, -1])
     good = np.isfinite(D).all(axis=1) & np.isfinite(pB_c)
     t_idx, r_idx, D, pB_c = t_idx[good], r_idx[good], D[good], pB_c[good]
+    if noise_correction:                                       # sampling covariance of the contrasts, per SNP
+        from .model import contrast_noise
+        Vs = np.column_stack([rv[f"v_{s}"].to_numpy()[r_idx] for s in sources])
+        Vn, nn, Gn, _ = ref.frequency_noise(sources, np.nan_to_num(Vs), r_idx)
+        S_noise, R_noise = contrast_noise(Vn, nn, Gn)
+    else:
+        S_noise, R_noise = np.zeros((t_idx.size, k1, k1)), np.zeros((t_idx.size, k1))
     chrom = rv["CHR"].to_numpy()[r_idx]
     cm = rv["CM"].to_numpy()[r_idx]
     log(f"[admixed-ld] curve: {t_idx.size} of {len(blocks.variants)} cohort variants matched to the reference "
@@ -164,10 +174,11 @@ def genotype_curve(geno, ref_path, out, *, sources=None, covar=None, keep=None, 
             center_impute(X)
             d = D[sl]
             inf = np.isfinite(mu) & (np.abs(d).max(axis=1) >= theta_min_delta)
+            Sn = S_noise[sl]
             if inf.any():                                      # ancestry: g/2 - pB = x/2 + (mu/2 - pB), on D
                 th_num += X[:, inf] @ (d[inf] / 2.0)
-                th_c += d[inf].T @ (mu[inf] / 2.0 - pB_c[sl][inf])
-                th_den += d[inf].T @ d[inf]
+                th_c += d[inf].T @ (mu[inf] / 2.0 - pB_c[sl][inf]) + R_noise[sl][inf].sum(axis=0)
+                th_den += d[inf].T @ d[inf] - Sn[inf].sum(axis=0)
             ss = np.einsum("ij,ij->j", X, X)
             Bx = C.T @ X if p_rank else np.zeros((0, X.shape[1]))
             ss_res = ss - np.einsum("ij,ij->j", Bx, Bx)
@@ -185,7 +196,7 @@ def genotype_curve(geno, ref_path, out, *, sources=None, covar=None, keep=None, 
                 if p_rank:
                     B[:, a * nc + cs[starts]] += np.add.reduceat(Bx * w[None, :], starts, axis=1)
                 for b in range(a, k1):
-                    qq = np.bincount(cs, weights=d[:, a] * d[:, b] * inv, minlength=nc)
+                    qq = np.bincount(cs, weights=(d[:, a] * d[:, b] - Sn[:, a, b]) * inv, minlength=nc)
                     q[:, a, b] += qq
                     if b != a:
                         q[:, b, a] += qq
@@ -240,6 +251,7 @@ def genotype_curve(geno, ref_path, out, *, sources=None, covar=None, keep=None, 
     U_th = (th_num + th_c[None, :]) @ np.linalg.inv(th_den)    # people x k1: ancestries of the non-baseline sources
     info = dict(format="summit-admixed-ld-curve", version=1, sources=list(sources), baseline=sources[-1],
                 n_samples=int(N), n_snps=int(t_idx.size), covariate_rank=int(p_rank), cell_cm=float(cell_cm),
+                noise_correction=bool(noise_correction),
                 max_cm=float(max_cm), inter_matrix=inter.tolist(), fit_per_source=fits,
                 theta=moments_from_vectors(U_th),
                 reference=dict(sources=ref.manifest["sources"], window_kb=ref.manifest["window_kb"],

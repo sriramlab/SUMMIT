@@ -181,6 +181,36 @@ def contrast_pairs(k1):
     return [(a, b) for a in range(k1) for b in range(a, k1)]
 
 
+def contrast_noise(V, n, mix=None):
+    """Sampling covariance of the contrasts D_a = p^a - p^B (B the last source) at each SNP, and their covariance with
+    the baseline's frequency error.
+
+    Each source's frequency error is e_s = sum_t G_st eta_t, with independent base errors eta_t of variance
+    V_jt / (4 n_t) (V: M x T dosage variances, n: T effective sizes; the first K columns are the sources in order, any
+    further ones are panels that enter only through a derived source). Panels have G = identity; a source derived from a
+    cohort carries minus the cohort's weights on the known sources' panel errors (its frequencies subtract their
+    contributions). mix: K x T matrix G (default identity, which gives 1[a=b] var_a + var_B).
+    Returns S (M x (K-1) x (K-1)) and R (M x (K-1)) with R_a = Cov(e_a - e_B, e_B)."""
+    V = np.asarray(V, np.float64)
+    T = V.shape[1]
+    n = np.asarray(n, np.float64)
+    G = np.eye(T) if mix is None else np.asarray(mix, np.float64)
+    K = G.shape[0]
+    L = np.zeros((K, K - 1))
+    L[np.arange(K - 1), np.arange(K - 1)] = 1.0
+    L[K - 1, :] = -1.0
+    H = L.T @ G                                                    # contrast errors = H eta
+    var_eta = V / (4.0 * n[None, :])
+    S = np.einsum("at,jt,bt->jab", H, var_eta, H)
+    R = np.einsum("at,jt,t->ja", H, var_eta, G[K - 1])
+    return S, R
+
+
+def unbiased_products_cov(D, S):
+    """O[j, a, b] = D_ja D_jb - S_jab, with S the sampling covariance of the contrasts (contrast_noise)."""
+    return D[:, :, None] * D[:, None, :] - S
+
+
 def unbiased_products(D, var_c, var_base):
     """O[j, a, b] = D_ja D_jb without the panels' sampling covariance, Cov(e_a - e_B, e_b - e_B) = 1[a=b] var_a + var_B
     with var = Var(dosage) / 4n. D: M x (K-1); var_c: M x (K-1); var_base: M."""

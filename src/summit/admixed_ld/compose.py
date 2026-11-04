@@ -31,7 +31,7 @@ import pandas as pd
 
 from ._io import match_variants
 from .model import (KernelMatrix, contrast_pairs, dirichlet_moments, moments_tensors, parameters_from_sumstats_k,
-                    same_person_term, unbiased_products)
+                    contrast_noise, same_person_term, unbiased_products_cov)
 from .reference import Reference
 
 
@@ -219,10 +219,11 @@ def compose_ldscores(ref_path, sumstats, annot, out, *, sources=None, snps=None,
     good = np.isfinite(Pm).all(axis=1) & np.isfinite(Vm).all(axis=1) & (Vm.sum(axis=1) > 0)
     t_idx, r_idx, cls_mat = t_idx[good], r_idx[good], cls_mat[good]
     Pm, Vm, Dm = Pm[good], Vm[good], Dm[good]
-    # products of contrasts without the panels' sampling (co)variance (Var(p) = Var(dosage) / 4n)
-    nfreq = np.array([ref.n_freq[s] for s in sources], np.float64)
-    pvar = Vm / (4.0 * nfreq[None, :])
-    O = unbiased_products(Dm, pvar[:, :-1], pvar[:, -1])
+    # products of contrasts without the sampling (co)variance of the frequencies (Var(p) = Var(dosage) / 4n), including
+    # the panels' errors that a derived source's frequencies carry
+    Vn, nn, Gn, _ = ref.frequency_noise(sources, Vm, r_idx)
+    S_noise, _ = contrast_noise(Vn, nn, Gn)
+    O = unbiased_products_cov(Dm, S_noise)
     cls = np.argmax(cls_mat, axis=1)
     K = len(classes)
     M = r_idx.size
@@ -347,7 +348,9 @@ def compose_ldscores(ref_path, sumstats, annot, out, *, sources=None, snps=None,
         # a derived source carries the sampling variance of each covariance (covvar) instead of the panel moments
         cvar = [z[f"covvar_{i}"] if f"covvar_{i}" in z.files else None for i in si]
         m22 = [z[f"m22_{i}"] if cvar[n_] is None else None for n_, i in enumerate(si)]
-        vr = [z[f"v_{i}"] for i in si]
+        # the variances of the people behind each covariance (a derived source with a small panel's LD keeps that
+        # panel's variances apart from the dosage variances its frequencies imply)
+        vr = [z[f"vld_{i}"] if f"vld_{i}" in z.files else z[f"v_{i}"] for i in si]
         # pairs within the window (upper band), in chunks of rows
         r0 = 0
         while r0 < nloc:

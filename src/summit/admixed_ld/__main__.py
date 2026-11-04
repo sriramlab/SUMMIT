@@ -65,6 +65,9 @@ def main(argv=None):
     c.add_argument("--kinship-min", type=float, default=None, help="keep only pairs whose kinship exceeds this value")
     c.add_argument("--closure", action="store_true",
                    help="also use every pair within a family (connected component of the listed pairs)")
+    c.add_argument("--no-noise-correction", action="store_true",
+                   help="do not remove the reference frequencies' sampling noise from the squared contrasts (the "
+                        "kernel is then attenuated for small panels and derived sources)")
     c.add_argument("--step", type=int, default=4096)
     c.add_argument("--threads", type=int, default=1)
     c.add_argument("--out", required=True)
@@ -115,6 +118,14 @@ def main(argv=None):
     v.add_argument("--keep", default=None)
     v.add_argument("--match", choices=["position", "id"], default="position")
     v.add_argument("--als-snps", type=int, default=20000, help="SNPs used to estimate ancestry (default 20000)")
+    v.add_argument("--als-iter", type=int, default=500,
+                   help="most iterations of the ancestry fit (default 500; it stops when the fit no longer improves)")
+    v.add_argument("--ld", choices=["inversion", "panel"], default="inversion",
+                   help="window LD of the derived source: by inverting the cohort's composition, or that of the anchor "
+                        "panel (--panel) with its own moments; the frequencies come from the cohort either way")
+    v.add_argument("--no-calibration", action="store_true",
+                   help="keep the fit's position on the family of equivalent sources instead of placing it with the "
+                        "anchor panel")
     v.add_argument("--threads", type=int, default=1)
     v.add_argument("--out", required=True, help="output reference directory")
 
@@ -136,13 +147,14 @@ def main(argv=None):
     elif a.cmd == "derive":
         from .derive import derive_source
         derive_source(a.geno, a.ref, a.out, name=a.name, known=_sources(a.known), panel=a.panel, covar=a.covar,
-                      keep=a.keep, match=a.match, als_snps=a.als_snps, threads=a.threads, log=log._log)
+                      keep=a.keep, match=a.match, als_snps=a.als_snps, als_iter=a.als_iter, ld=a.ld,
+                      calibrate=not a.no_calibration, threads=a.threads, log=log._log)
     elif a.cmd == "curve":
         from .curve import genotype_curve
         genotype_curve(a.geno, a.ref, a.out, sources=_sources(a.sources), covar=a.covar, keep=a.keep, match=a.match,
                        cell_cm=a.cell_cm, max_cm=a.max_cm, relative_pairs=a.relative_pairs, kinship_col=a.kinship_col,
                        kinship_min=a.kinship_min, closure=a.closure, step=a.step, threads=a.threads,
-                       log=log._log)
+                       noise_correction=not a.no_noise_correction, log=log._log)
     else:
         from .compose import compose_ldscores
         compose_ldscores(a.ref, a.sumstats, a.annot, a.out, sources=_sources(a.sources), snps=a.snps, match=a.match,
