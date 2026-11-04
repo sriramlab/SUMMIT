@@ -65,6 +65,9 @@ def main(argv=None):
     c.add_argument("--kinship-min", type=float, default=None, help="keep only pairs whose kinship exceeds this value")
     c.add_argument("--closure", action="store_true",
                    help="also use every pair within a family (connected component of the listed pairs)")
+    c.add_argument("--keep-panel-noise", action="store_true",
+                   help="use raw squared reference contrasts in the denominators (before 4 Nov 2026), which shrinks "
+                        "the kernel by the panels' sampling variance")
     c.add_argument("--step", type=int, default=4096)
     c.add_argument("--threads", type=int, default=1)
     c.add_argument("--out", required=True)
@@ -141,8 +144,8 @@ def main(argv=None):
         from .curve import genotype_curve
         genotype_curve(a.geno, a.ref, a.out, sources=_sources(a.sources), covar=a.covar, keep=a.keep, match=a.match,
                        cell_cm=a.cell_cm, max_cm=a.max_cm, relative_pairs=a.relative_pairs, kinship_col=a.kinship_col,
-                       kinship_min=a.kinship_min, closure=a.closure, step=a.step, threads=a.threads,
-                       log=log._log)
+                       kinship_min=a.kinship_min, closure=a.closure, panel_noise=not a.keep_panel_noise, step=a.step,
+                       threads=a.threads, log=log._log)
     else:
         from .compose import compose_ldscores
         compose_ldscores(a.ref, a.sumstats, a.annot, a.out, sources=_sources(a.sources), snps=a.snps, match=a.match,

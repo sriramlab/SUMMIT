@@ -319,3 +319,27 @@ def test_derived_source_from_the_cohort(sim3, tmp_path):
     mass_c = float((got.V.to_numpy()[:, None] * L_c).sum())
     assert abs(mass_c / mass_in - 1) < 0.05, (mass_c, mass_in)
     assert np.corrcoef(L_c.sum(1), L_in.sum(1))[0, 1] > 0.93
+
+
+def test_curve_removes_panel_noise_from_its_denominators(sim, tmp_path):
+    """With small panels the raw squared contrasts carry the panels' sampling variance, which shrinks the kernel; the
+    curve uses the products without it, so a 12-person reference gives about the kernel of the full panels."""
+    from summit.admixed_ld.curve import genotype_curve
+    d = sim["dir"]
+    S, v = sim["S"], sim["S"]["variants"]
+    write_bed(str(tmp_path / "smallA"), S["panel_A"][:12], v, "sa")
+    write_bed(str(tmp_path / "smallE"), S["panel_E"][:12], v, "se")
+    build_reference([str(tmp_path / "smallA"), str(tmp_path / "smallE")], ["AFR", "EUR"], str(tmp_path / "ref"),
+                    window_kb=3000, step=256, log=lambda *a: None)
+    kw = dict(covar=str(d / "cohort.cov"), cell_cm=0.5, cells_cm=0, log=lambda *a: None)
+    full, _ = genotype_curve(str(d / "cohort"), str(d / "ref"), str(tmp_path / "full"), **kw)
+    fixed, info = genotype_curve(str(d / "cohort"), str(tmp_path / "ref"), str(tmp_path / "fixed"), **kw)
+    raw, _ = genotype_curve(str(d / "cohort"), str(tmp_path / "ref"), str(tmp_path / "raw"), panel_noise=False, **kw)
+    sel = (full.d_cm >= 1) & (full.d_cm <= 20)
+    k_full = float(full.kernel[sel].mean())
+    r_fixed = float(fixed.set_index("d_cm").kernel.reindex(full.d_cm[sel]).mean()) / k_full
+    r_raw = float(raw.set_index("d_cm").kernel.reindex(full.d_cm[sel]).mean()) / k_full
+    print(f"kernel ratio to the full panels: raw {r_raw:.3f}, corrected {r_fixed:.3f}")
+    assert info["panel_noise_removed"] and info["panel_n_freq"]["AFR"] == 12
+    assert r_raw < 0.9                       # the raw denominators shrink the kernel
+    assert abs(r_fixed - 1) < abs(r_raw - 1) and abs(r_fixed - 1) < 0.08
