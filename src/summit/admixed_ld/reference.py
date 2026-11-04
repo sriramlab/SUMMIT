@@ -234,6 +234,10 @@ class Reference:
         admixed haplotypes). References written before the mix was recorded explicitly (no `covariance_noise` key)
         are read from m_anchor and decay_anchor, which derive aligns with the reference's sources."""
         src = self.manifest["sources"][self.source_index(name)]
+        if "covvar without the doubly counted panel noise" in str(src.get("how", "")):
+            raise ValueError(f"The covvar of {name} in {self.path} was already reduced by the research fix "
+                             "(fix_derived_covvar.py); compose now removes the known panels' noise once by itself. "
+                             "Use the reference as derive wrote it.")
         cn = src.get("covariance_noise")
         if cn is not None:
             own = tuple(float(x) for x in cn["pi"])

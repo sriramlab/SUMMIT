@@ -630,6 +630,15 @@ def test_inversion_counts_panel_noise_once(sim3, tmp_path):
     assert set(cn["mix"]) == {"S0", "S1"} and len(cn["pi"]) == 2
     ref3 = Reference(str(tmp_path / "ref3"))
     assert ref3.covariance_noise_mix("S0") is None and ref3.covariance_noise_mix("S2")[1].keys() == {"S0", "S1"}
+    old = json.load(open(tmp_path / "ref3" / "manifest.json"))             # the layout before covariance_noise
+    del old["sources"][2]["covariance_noise"]
+    os.makedirs(tmp_path / "old_layout")
+    json.dump(old, open(tmp_path / "old_layout" / "manifest.json", "w"))
+    assert Reference(str(tmp_path / "old_layout")).covariance_noise_mix("S2") == ref3.covariance_noise_mix("S2")
+    old["sources"][2]["how"] = "derive, covvar without the doubly counted panel noise (test)"
+    json.dump(old, open(tmp_path / "old_layout" / "manifest.json", "w"))
+    with pytest.raises(ValueError):                                         # the research fix must not be stacked
+        Reference(str(tmp_path / "old_layout")).covariance_noise_mix("S2")
     genotype_curve(str(d / "cohort"), str(tmp_path / "ref3"), str(tmp_path / "c3"), sources=names,
                    covar=str(d / "cohort.cov"), cell_cm=0.5, log=lambda *a: None)
     out = str(tmp_path / "inv")
