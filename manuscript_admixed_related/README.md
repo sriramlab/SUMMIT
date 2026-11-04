@@ -16,10 +16,14 @@ From this folder, with Python 3, NumPy, pandas, SciPy and matplotlib:
 ```bash
 python scripts/make_fig1.py
 python scripts/make_figures.py
+python scripts/make_fig34.py
+python scripts/make_fig_ancestry_groups.py
 ```
 
-The figures are written to `output/`, together with `output/numbers.txt`, which lists every plotted summary. Use
-`--out DIR` to write them elsewhere. Drawing all figures takes about a minute on one CPU.
+The figures are written to `output/`, together with `output/numbers.txt`, which lists the plotted summaries of Figs. 2,
+5 and 6. Use `--out DIR` to write them elsewhere. Drawing all figures takes about a minute on one CPU. The All of Us
+results (Fig. 3B-D, Table 5) are aggregate statistics from the All of Us Researcher Workbench and are not included in
+this folder; `make_fig34.py --aou FILE` draws Fig. 3B-D from that table.
 
 | Figure | Script | Data |
 |---|---|---|
@@ -27,11 +31,15 @@ The figures are written to `output/`, together with `output/numbers.txt`, which 
 | 2A-C | `make_figures.py` | `simulations.tsv.gz`, `simulations_reml.tsv.gz`, `simulations_covldsc.tsv.gz` |
 | 2D | `make_figures.py` | `local_ancestry_simulations.tsv.gz` |
 | 2E | `make_figures.py` | `wider_group_simulations.tsv.gz` |
-| 3A | `make_figures.py` | `white_british_traits.tsv` |
-| 3B, 3C | `make_figures.py` | `cohort_traits.tsv`, `cohort_tests.tsv` |
-| 3D | `make_figures.py` | `local_ancestry_traits.tsv` |
-| S1 | `make_figures.py` | `direct_effects_simulations.tsv.gz`, `direct_effects_traits*.tsv` |
-| S2 | `make_figures.py` | `genetic_correlation_cohorts.tsv.gz`, `genetic_correlation_reference.tsv` |
+| 3A | `make_fig34.py` | `white_british_traits.tsv` |
+| 3B-D | `make_fig34.py` | All of Us aggregate table (not included) |
+| 4A | `make_fig34.py` | `cohort_tests.tsv` |
+| 4B, 4D | `make_fig34.py` | `genetic_correlation_cohorts.tsv.gz`, `genetic_correlation_reference.tsv` |
+| 4C | `make_fig34.py` | `cohort_traits.tsv` |
+| 4E | `make_fig34.py` | `local_ancestry_traits.tsv` |
+| 5 | `make_figures.py` | `genetic_correlation_cohorts.tsv.gz` |
+| 6 | `make_figures.py` | `direct_effects_simulations.tsv.gz`, `direct_effects_traits*.tsv` |
+| 7 | `make_fig_ancestry_groups.py` | `ancestry_groups_traits.tsv`, `ancestry_groups_simulations.tsv.gz` |
 
 ## Data
 
@@ -58,6 +66,8 @@ where a column says so (`h2L_*`, `liab_mult`).
 | `direct_effects_traits*.tsv` | Direct-effect and population heritability of the traits in 35,365 white British siblings |
 | `genetic_correlation_cohorts.tsv.gz` | Genetic correlation of the 780 trait pairs in each cohort and arm |
 | `genetic_correlation_reference.tsv` | The same pairs in 291,273 unrelated white British participants |
+| `ancestry_groups_traits.tsv` | European group and wider group in one analysis: heritability of each group, genetic covariance and correlation between them, local-ancestry component and one-kernel heritability (origin covariates) |
+| `ancestry_groups_simulations.tsv.gz` | Simulations of the analysis of the two groups, one row per replicate (`scenario` gives the setting) |
 
 ## Analysis scripts
 

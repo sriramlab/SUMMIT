@@ -12,16 +12,17 @@ commands: `summit relatives moments/append/cross-m12/longrange`, the LD-score st
 | Cohort inputs: genotypes, PCs, related pairs, families, unrelated subset, covariates, 8 MAF-LD bins, in-sample LD scores | `prepare_cohort.py` | all |
 | UK Biobank traits (40), age and sex covariates, origin covariates | `traits.py` | all real-trait results |
 | Simulation settings | `designs.py` | Fig. 2 |
-| One simulation task (phenotypes, GWAS, related-pair parts, fits of U, K and XA) | `simulate.py` | Fig. 2A-C, E; Tables A1-A2 |
-| Two-kernel REML and cov-LDSC for a task | `compare_methods.py` | Fig. 2A-C; Tables A1-A2; Appendix D |
-| Summaries of the simulations | `summarize.py` | Fig. 2; Tables A1-A2 |
-| Real traits in the cohorts (U, K, XA; long-range SE correction) | `real_traits.py` | Fig. 3B; Results |
-| Heritability against a reference cohort | `compare_groups.py` | Fig. 3C |
-| Local-ancestry markers, simulations, real traits and the local-ancestry test | `local_ancestry.py` | Fig. 2D, 3D; Appendix C |
-| White British participants with relatives against the unrelated subset; cov-LDSC | `white_british.py` | Fig. 3A; Appendix D |
-| Sibships, direct-effect simulations and real traits | `direct_effects.py` | Fig. S1; Appendix B |
-| Genetic correlation in the cohorts and agreement with a reference | `genetic_correlation.py` | Table A3; Fig. S2 |
-| Factors of the long-range LD correction | `standard_errors.py` | Table E (LD-score columns) |
+| One simulation task (phenotypes, GWAS, related-pair parts, fits of U, K and XA) | `simulate.py` | Fig. 2A-C, E; Tables 2-3 |
+| Two-kernel REML and cov-LDSC for a task | `compare_methods.py` | Fig. 2A-C; Tables 2-3; Appendix E |
+| Summaries of the simulations | `summarize.py` | Fig. 2; Tables 2-3 |
+| Real traits in the cohorts (U, K, XA; long-range SE correction) | `real_traits.py` | Fig. 4C; Results |
+| Heritability against a reference cohort | `compare_groups.py` | Fig. 4A |
+| Local-ancestry markers, simulations, real traits and the local-ancestry test | `local_ancestry.py` | Fig. 2D, 4E; Appendix B |
+| White British participants with relatives against the unrelated subset; cov-LDSC | `white_british.py` | Fig. 3A; Appendix E |
+| Sibships, direct-effect simulations and real traits | `direct_effects.py` | Fig. 6; Appendix F |
+| Genetic correlation in the cohorts and agreement with a reference | `genetic_correlation.py` | Table 4; Fig. 4B, D and Fig. 5 |
+| Factors of the long-range LD correction | `standard_errors.py` | Table 6 (LD-score columns) |
+| European and African-ancestry participants in one analysis | `ancestry_groups.py` | Fig. 7; Appendix G |
 | All of Us | `aou/` | Results, All of Us |
 
 `common.py` holds the helpers the scripts share (GWAS to SUMMIT summary statistics, transforms).
@@ -36,7 +37,7 @@ commands: `summit relatives moments/append/cross-m12/longrange`, the LD-score st
    the origin covariates; for the white British analysis, samples named `rel` and `unrel`.
 3. Simulations: `simulate.py` for every setting of `designs.py` in EUR, SAS and AFR, the main grid and MAF-LD settings in AFRW
    and AFRWA (Fig. 2E lists them in `designs.WIDER_GROUP`), and the ancestry settings in AFRW and AFRWX (with `--ancestry`);
-   genetic-correlation settings with `--long-range`. Then `compare_methods.py --ld genome` (and `--ld window` for Appendix D)
+   genetic-correlation settings with `--long-range`. Then `compare_methods.py --ld genome` (and `--ld window` for Appendix E)
    on the grid and MAF-LD tasks, and `summarize.py`.
 4. Real traits with `real_traits.py` (and `--origin`), `compare_groups.py` against the unrelated white British reference, and
    `genetic_correlation.py`.
@@ -44,7 +45,9 @@ commands: `summit relatives moments/append/cross-m12/longrange`, the LD-score st
    members (AFRWA), then `simulate` (settings null, model, untagged, untagged2 in AFR) and `real`.
 6. `white_british.py sample`, `genotypes` and `fit`; `direct_effects.py sibships`, `simulate` and `real` on the white
    British siblings; `standard_errors.py` on the `summit relatives longrange` outputs.
-7. The figures are drawn from the aggregate results by `../scripts/make_figures.py` and `../scripts/make_fig1.py`.
+7. `ancestry_groups.py` for the European group and the wider group in one analysis (its docstring gives the options of
+   the paper's runs).
+8. The figures are drawn from the aggregate results by the scripts in `../scripts/`.
 
 ## Differences from the runs in the paper
 
@@ -52,7 +55,7 @@ The scripts reproduce the paper's computations with these exceptions.
 
 - Simulation replicates use different random seeds, so individual replicates differ from the paper's draws.
 - Real-trait standard errors use `--long-range-se`. The paper's trait tables used the exact rescaling factors, which differ by at
-  most 2%. Table E's exact columns need block-pair traces and are not reproduced; its LD-score columns are.
+  most 2%. Table 6's exact columns need block-pair traces and are not reproduced; its LD-score columns are.
 - The white British fits compute LD scores and bins in the unrelated subset unless `--ld1`, `--ld8` and `--annot8` supply the
   panel LD scores used in the paper.
 - Local-ancestry simulations add the global ancestry THETA to the covariates unless built and run with `--without-theta`, as

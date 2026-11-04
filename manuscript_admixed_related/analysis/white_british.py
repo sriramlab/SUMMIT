@@ -1,4 +1,4 @@
-"""White British participants with their relatives against the unrelated subset (Fig. 3A; cov-LDSC in Appendix D).
+"""White British participants with their relatives against the unrelated subset (Fig. 3A; cov-LDSC in Appendix E).
 
   sample     participants of the with-relatives genotype release that pass UK Biobank sample QC (genetic sex equal to
              reported sex, 22001 = 31; no sex-chromosome aneuploidy, 22019; not a heterozygosity or missingness outlier,

@@ -4,7 +4,7 @@ Per cohort, setting, analysis (arm) and model: mean, bias with its Monte Carlo S
 coverage of 95% t intervals (199 degrees of freedom for the 200-block jackknife) and the variance of the unrelated-subset
 estimate divided by that of the analysis (single-component unrelated subset for REML). For the 'ancestry' designs bias is
 also given against the target after adjustment for the environment terms (columns *_adjusted). Genetic-correlation settings
-also report rg. Tables A1/A2 pool the main grid by cohort-free averages over its settings without and with shared effects;
+also report rg. Tables 2 and 3 pool the main grid by cohort-free averages over its settings without and with shared effects;
 their variance ratio is the sum of the unrelated-subset variances over settings divided by the sum for the analysis.
 Writes OUT/replicates.tsv, OUT/summary.tsv, OUT/table_grid.tsv.
 usage: python summarize.py OUT TASK [TASK ...]

@@ -1,12 +1,11 @@
-"""Figures 2, 3, S1 and S2 of "Heritability from summary statistics of admixed and related biobank participants",
-from the aggregate results in ../data. Every heritability result uses 8 MAF-LD bins unless a panel says otherwise.
+"""Figures 2, 5 and 6 of "Heritability from summary statistics of admixed and related biobank participants", from the
+aggregate results in ../data. Every heritability result uses 8 MAF-LD bins unless a panel says otherwise.
 
 Figure 2   simulations: bias and coverage of the methods that keep relatives, precision against the unrelated subset,
            local ancestry, and precision of the wider African-ancestry group.
-Figure 3   UK Biobank: white British participants with relatives, standard errors in the wider group, the wider group
-           against white British participants, and the local-ancestry component of each trait.
-Figure S1  heritability due to direct genetic effects (simulations and 40 traits in the siblings).
-Figure S2  genetic correlation.
+Figure 5   genetic correlation in all participants of the European group against its unrelated subset.
+Figure 6   heritability due to direct genetic effects (simulations and 40 traits in the siblings).
+Figures 1, 3, 4 and 7 are drawn by make_fig1.py, make_fig34.py and make_fig_ancestry_groups.py.
 OUT/numbers.txt lists every plotted summary.
 usage: python make_figures.py [--out DIR]
 """
@@ -176,77 +175,6 @@ for ext in ('pdf', 'png'):
     fig.savefig(f'{OUT}/fig2_simulations.{ext}')
 plt.close(fig)
 
-# ============================================================================================== Figure 3: UK Biobank
-fig = plt.figure(figsize=(7.2, 5.2))
-gs = fig.add_gridspec(2, 3, height_ratios=[1, 0.9], wspace=0.42, hspace=0.5, left=0.08, right=0.99, top=0.95, bottom=0.1)
-axA, axB, axC = fig.add_subplot(gs[0, 0]), fig.add_subplot(gs[0, 1]), fig.add_subplot(gs[0, 2])
-axD = fig.add_subplot(gs[1, :])
-src = first(SRC['ukb406']); U = pd.read_csv(src, sep='\t'); u = U[U.model == '8bin']
-if 'h2L_xa' in u:   # binary traits on the liability scale
-    u = u.assign(h2_unrel=u.h2L_unrel, h2_kept=u.h2L_kept, h2_xa=u.h2L_xa)
-axA.plot(u.h2_unrel, u.h2_kept, 'D', color=C['K'], mec='black', mew=0.5, ms=4.5, label='Kept')
-axA.plot(u.h2_unrel, u.h2_xa, 'o', color=C['XA'], mec='black', mew=0.5, ms=5, label='Excluded')
-hi = 0.05 * np.ceil(max(u.h2_unrel.max(), u.h2_kept.max()) / 0.05 + 0.5)
-axA.plot([0, hi], [0, hi], ls='--', color='0.4', lw=0.8); axA.set_xlim(0, hi); axA.set_ylim(0, hi)
-axA.set_xlabel('Unrelated subset (337,845)'); axA.set_ylabel('All participants (406,657)')
-axA.set_title('White British ĥ²'); axA.legend(loc='lower right', title='Related pairs'); grid(axA, 'both')
-d_ = u.h2_xa - u.h2_unrel
-note(f'Fig3A {os.path.basename(src)} {len(u)} traits: XA - unrel mean {d_.mean():.5f}; kept > XA {int((u.h2_kept > u.h2_xa).sum())}/{len(u)}')
-
-E = pd.read_csv(SRC['traits40'], sep='\t')
-def arm(cohort, a_, s='base', m='8bin'):
-    return E[(E.cohort == cohort) & (E.arm == a_) & (E.model == m) & (E.set == s)].set_index('trait')   # liability scale already
-w, r0 = arm('Wider African group', 'XA'), arm('African (standard)', 'U')
-j = w[['se']].join(r0[['se']], rsuffix='_ref')
-ratio = j.se / j.se_ref
-axB.plot(j.se_ref, j.se, 'o', color=C['XA'], mec='black', mew=0.5, ms=5)
-lo_, hi_ = 0.03, 0.8
-axB.plot([lo_, hi_], [lo_, hi_], ls='--', color='0.4', lw=0.8, label='Equal')
-axB.plot([lo_, hi_], [lo_ / 2, hi_ / 2], ls=':', color='0.4', lw=1.0, label='Half')
-axB.set_xscale('log'); axB.set_yscale('log'); axB.set_xlim(lo_, hi_); axB.set_ylim(lo_, hi_)
-log_ticks(axB.xaxis, [0.05, 0.1, 0.2, 0.5]); log_ticks(axB.yaxis, [0.05, 0.1, 0.2, 0.5])
-axB.set_xlabel('Unrelated admixed subset'); axB.set_ylabel('Wider group (9,647)')
-axB.set_title(f'SE of ĥ² (median ratio {ratio.median():.2f})'); axB.legend(loc='upper left'); grid(axB, 'both')
-note(f'Fig3B {len(j)} traits: median SE ratio {ratio.median():.3f}')
-
-ct = pd.read_csv(SRC['cohort_tests'], sep='\t')
-o = ct[(ct.set == 'origin') & (ct.ref == 'EUR300k') & (ct.cohort == 'Wider African group')].set_index('trait')
-bb = ct[(ct.set == 'base') & (ct.ref == 'EUR300k') & (ct.cohort == 'Wider African group')].set_index('trait')
-axC.errorbar(o.ref_h2, o.h2, yerr=1.96 * o.se, fmt='o', color=C['XA'], mec='black', mew=0.5, ms=4.5, capsize=1.5,
-             elinewidth=0.7)
-fi = 'fluid_intelligence_score'
-axC.plot(bb.ref_h2[fi], bb.h2[fi], 'o', mfc='white', mec='tab:red', mew=1.0, ms=5)
-axC.annotate('', xy=(o.ref_h2[fi], o.h2[fi] + 0.03), xytext=(bb.ref_h2[fi], bb.h2[fi] - 0.03),
-             arrowprops=dict(arrowstyle='->', color='tab:red', lw=0.9))
-axC.annotate('FI, without origin\ncovariates', (bb.ref_h2[fi], bb.h2[fi]), xytext=(6, 0), textcoords='offset points',
-             fontsize=7, color='tab:red', va='center', ha='left')
-axC.plot([-0.25, 1], [-0.25, 1], ls='--', color='0.4', lw=0.8)
-axC.set_xlim(-0.02, 0.62); axC.set_ylim(-0.25, 1.0)
-axC.set_xlabel('White British (291,273)'); axC.set_ylabel('Wider group (9,647)')
-axC.set_title('ĥ² with origin covariates'); grid(axC, 'both')
-note(f'Fig3C: Bonferroni-significant {int((o.bonf < 0.05).sum())}/{len(o)}; FI {bb.h2[fi]:.3f} -> {o.h2[fi]:.3f}')
-
-L = pd.read_csv(SRC['la_real'], sep='\t')
-lw_, la_ = L[L.group == 'AFRW'].set_index('trait'), L[L.group == 'AFRWA'].set_index('trait')
-order = lw_.la.sort_values().index
-x = np.arange(len(order))
-for k, (dd, col, mk, lab) in enumerate([(la_, 'tab:blue', 's', 'Admixed members (4,202)'), (lw_, 'tab:green', 'o', 'Wider group (9,647)')]):
-    dd = dd.reindex(order)
-    axD.errorbar(x + (k - 0.5) * 0.3, dd.la, yerr=1.96 * dd.la_se, fmt=mk, color=col, mec='black', mew=0.4, ms=3.8, capsize=1.2,
-                 elinewidth=0.7, label=lab)
-axD.axhline(0, color='black', lw=0.8)
-axD.set_xticks(x); axD.set_xticklabels([NAMES.get(t, t) for t in order], rotation=90, fontsize=6.5)
-axD.set_xlim(-0.7, len(order) - 0.3); axD.set_ylim(-0.12, 0.27)
-axD.set_ylabel('Local-ancestry component'); axD.legend(loc='upper left'); grid(axD)
-wbc = 'white_blood_cell_count'
-note(f'Fig3D WBC wider {lw_.la[wbc]:.3f} (SE {lw_.la_se[wbc]:.3f}, null z {lw_.z_null[wbc]:.1f}), admixed members {la_.la[wbc]:.3f}')
-for ax, s in zip((axA, axB, axC), 'ABC'):
-    letter(ax, s, dx=-0.3)
-letter(axD, 'D', dx=-0.075, dy=1.02)
-for ext in ('pdf', 'png'):
-    fig.savefig(f'{OUT}/fig3_ukb.{ext}')
-plt.close(fig)
-
 # ============================================================================================== Figure S1: direct effects
 fig, (axA, axB) = plt.subplots(1, 2, figsize=(7.2, 2.9), gridspec_kw=dict(wspace=0.28, left=0.08, right=0.98, bottom=0.2, top=0.9))
 sr = pd.read_csv(SRC['sib_sim'], sep='\t')
@@ -285,43 +213,20 @@ for ext in ('pdf', 'png'):
     fig.savefig(f'{OUT}/figS1_direct.{ext}')
 plt.close(fig)
 
-# ============================================================================================== Figure S2: genetic correlation
+# ============================================================================================== Figure 5: genetic correlation, European group
 R = pd.read_csv(SRC['rg'], sep='\t')
 def rga(v, a_, m='8bin'):
     return R[(R.variant == v) & (R.arm == a_) & (R.model == m)].set_index('key')
 ref = pd.read_csv(SRC['rg_ref'], sep='\t')
 ref['key'] = ['|'.join(sorted(p)) for p in zip(ref.phen1, ref.phen2)]
 ref = ref.set_index('key')
-fig, (axA, axB, axC) = plt.subplots(1, 3, figsize=(7.2, 2.6), gridspec_kw=dict(wspace=0.38, left=0.075, right=0.99, bottom=0.17, top=0.88))
-w = rga('AFRWX', 'XA').join(ref[['rg', 'rg_se']], how='inner')
-sig = w.q < 0.05
-axA.plot(w.rg[~sig], w.rg_total[~sig], '.', color='0.7', ms=3, label='Other pairs')
-axA.errorbar(w.rg[sig], w.rg_total[sig], yerr=1.96 * w.rg_total_se[sig], fmt='o', color='tab:green', mec='black', mew=0.5, ms=4.5,
-             capsize=1.5, elinewidth=0.8, label='FDR < 0.05')
-axA.plot([-1, 1], [-1, 1], ls='--', color='0.4', lw=0.8)
-axA.set_xlim(-1, 1); axA.set_ylim(-1.5, 1.5)
-axA.set_xlabel('White British (291,273)'); axA.set_ylabel('Wider group (9,647)'); axA.set_title('r̂$_g$')
-axA.legend(loc='upper left'); grid(axA, 'both')
-note(f'FigS2A {len(w)} pairs, {int(sig.sum())} FDR-significant')
+fig, axB = plt.subplots(1, 1, figsize=(2.8, 2.6), gridspec_kw=dict(left=0.2, right=0.96, bottom=0.17, top=0.9))
 e_x, e_u = rga('EUR', 'XA'), rga('EUR', 'U')
 jj = e_x.join(e_u[['rg_total', 'rg_total_se']], rsuffix='_u', how='inner')
-axB.plot(jj.rg_total_u, jj.rg_total, '.', color='tab:green', ms=3, alpha=0.6)
+axB.plot(jj.rg_total_u, jj.rg_total, '.', color=C['XA'], ms=3, alpha=0.6)
 axB.plot([-1.2, 1.2], [-1.2, 1.2], ls='--', color='0.4', lw=0.8); axB.set_xlim(-1.2, 1.2); axB.set_ylim(-1.2, 1.2)
-axB.set_xlabel('Unrelated subset (12,148)'); axB.set_ylabel('All participants (14,558)'); axB.set_title('r̂$_g$, white British group')
+axB.set_xlabel('Unrelated subset (12,148)'); axB.set_ylabel('All participants (14,558)'); axB.set_title('r̂$_g$, European group')
 grid(axB, 'both')
-a0 = rga('AFR', 'U')
-ss = w.join(a0[['rg_total_se']], rsuffix='_a', how='inner')
-axC.plot(ss.rg_total_se_a, ss.rg_total_se, '.', color='tab:green', ms=3, alpha=0.6)
-axC.set_xscale('log'); axC.set_yscale('log'); lo_, hi_ = 0.02, 5
-axC.plot([lo_, hi_], [lo_, hi_], ls='--', color='0.4', lw=0.8, label='Equal')
-axC.plot([lo_, hi_], [lo_ / 2, hi_ / 2], ls=':', color='0.4', lw=1.0, label='Half')
-axC.set_xlim(lo_, hi_); axC.set_ylim(lo_, hi_)
-log_ticks(axC.xaxis, [0.05, 0.1, 0.2, 0.5, 1, 2]); log_ticks(axC.yaxis, [0.05, 0.1, 0.2, 0.5, 1, 2])
-axC.set_xlabel('Unrelated admixed subset'); axC.set_ylabel('Wider group (9,647)')
-axC.set_title(f'SE of r̂$_g$ (median ratio {(ss.rg_total_se / ss.rg_total_se_a).median():.2f})')
-axC.legend(loc='upper left'); grid(axC, 'both')
-for ax, s in zip((axA, axB, axC), 'ABC'):
-    letter(ax, s, dx=-0.27)
 for ext in ('pdf', 'png'):
     fig.savefig(f'{OUT}/figS2_rg.{ext}')
 plt.close(fig)

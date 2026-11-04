@@ -1,4 +1,4 @@
-"""Heritability of each trait in a cohort against a reference cohort (Fig. 3C): z = (h2 - h2_ref) / sqrt(se^2 + se_ref^2),
+"""Heritability of each trait in a cohort against a reference cohort (Fig. 4A): z = (h2 - h2_ref) / sqrt(se^2 + se_ref^2),
 two-sided p, Bonferroni and Benjamini-Hochberg adjustment over the traits, for the analysis and model given.
 Inputs are real_h2.tsv files of real_traits.py (the reference, e.g. unrelated white British participants, analysis U).
 usage: python compare_groups.py COHORT_REAL_H2 REFERENCE_REAL_H2 OUT [--arm XA] [--reference-arm U] [--model 8bin]

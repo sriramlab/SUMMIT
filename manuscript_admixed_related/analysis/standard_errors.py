@@ -1,4 +1,4 @@
-"""Factors of the long-range LD correction of jackknife standard errors (Table E, LD-score columns), per cohort, jackknife
+"""Factors of the long-range LD correction of jackknife standard errors (Table 6, LD-score columns), per cohort, jackknife
 design (200 blocks or chromosomes) and heritability, from `summit relatives longrange` sums with 8 MAF-LD bins.
 
 With weights w of the bin estimates in total h2 (from the bin-by-bin LD-score sums), rho the between-group share of the

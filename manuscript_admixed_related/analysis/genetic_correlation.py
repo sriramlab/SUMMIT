@@ -1,4 +1,4 @@
-"""Genetic correlation among the 40 traits in one prepared cohort, and agreement with a reference cohort (Table A3, Fig. S2).
+"""Genetic correlation among the 40 traits in one prepared cohort, and agreement with a reference cohort (Table 4, Fig. 4B, D and Fig. 5).
 
   fit      every pair of traits for U (unrelated subset) and XA (everyone, related pairs excluded with REL_M and REL_M12),
            with one component and 8 MAF-LD bins, the overlapping covariance in HE scale built from the phenotypes and
