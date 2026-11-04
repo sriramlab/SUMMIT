@@ -200,7 +200,7 @@ def derive_source(geno, ref_path, out, *, name, known=None, panel=None, covar=No
         stats[c] = dict(n_snps=int(sel.size), n_pairs=0, cm_length=float(z["cm"][lo].max() - z["cm"][lo].min()))
     src_meta = [dict(name=s, n=int(ref.n[s]), panel=next(x.get("panel", "") for x in ref.manifest["sources"]
                                                      if x["name"] == s)) for s in known]
-    src_meta.append(dict(name=name, n=int(round(n_eff)), derived=True, cohort=os.path.basename(geno),
+    src_meta.append(dict(name=name, n=int(round(n_eff)), n_freq=float(n_eff), derived=True, cohort=os.path.basename(geno),
                          n_people=int(N), panel=None if panel is None else os.path.basename(panel)))
     write_manifest(prov, src_meta, window_kb=ref.manifest["window_kb"], genetic_map=ref.manifest["genetic_map"],
                    match=match, dtype="float32", counted_allele=ref.manifest["counted_allele"], stats=stats,

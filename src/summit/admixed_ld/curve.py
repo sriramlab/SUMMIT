@@ -258,7 +258,14 @@ def genotype_curve(geno, ref_path, out, *, sources=None, covar=None, keep=None, 
         # unbiased for its square (and, with K sources, for the products of kernel entries)
         Uall = np.concatenate(coarse_U, axis=2)                 # N x k1 x cells
         nC = Uall.shape[2]
-        half = np.random.default_rng(20261104).permutation(N) < N // 2
+        rng_h = np.random.default_rng(20261104)
+        if rel is not None:                                    # relatives in one half, so the halves stay independent
+            fam = rp.family[rows]
+            labels, inv = np.unique(fam, return_inverse=True)
+            side = rng_h.permutation(labels.size) % 2 == 0
+            half = side[inv]
+        else:
+            half = rng_h.permutation(N) < N // 2
         Sh = []
         for h in (half, ~half):
             Uh = Uall[h].reshape(int(h.sum()), k1 * nC)          # column a * n_cells + cell

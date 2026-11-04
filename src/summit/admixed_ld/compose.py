@@ -220,7 +220,8 @@ def compose_ldscores(ref_path, sumstats, annot, out, *, sources=None, snps=None,
     t_idx, r_idx, cls_mat = t_idx[good], r_idx[good], cls_mat[good]
     Pm, Vm, Dm = Pm[good], Vm[good], Dm[good]
     # products of contrasts without the panels' sampling (co)variance (Var(p) = Var(dosage) / 4n)
-    pvar = Vm / (4.0 * ns[None, :])
+    nfreq = np.array([ref.n_freq[s] for s in sources], np.float64)
+    pvar = Vm / (4.0 * nfreq[None, :])
     O = unbiased_products(Dm, pvar[:, :-1], pvar[:, -1])
     cls = np.argmax(cls_mat, axis=1)
     K = len(classes)

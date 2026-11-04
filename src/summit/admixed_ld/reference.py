@@ -192,6 +192,8 @@ class Reference:
             raise ValueError(f"{path} is not a {FORMAT} v{VERSION} resource.")
         self.names = [s["name"] for s in self.manifest["sources"]]
         self.n = {s["name"]: int(s["n"]) for s in self.manifest["sources"]}
+        # sample size behind the frequencies, when it differs from the panel's (e.g. frequencies derived from a cohort)
+        self.n_freq = {s["name"]: float(s.get("n_freq", s["n"])) for s in self.manifest["sources"]}
         self.chromosomes = list(self.manifest["chromosomes"])
         self.genome_cm = float(self.manifest["genome_cm"])
 
