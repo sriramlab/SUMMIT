@@ -7,12 +7,19 @@
   summit admixed-ld compose   --ref REF_DIR --sumstats FILE_OR_DIR [...] --annot ANNOT --out PREFIX
                               (--curve PREFIX | --admixture-generations T | --decay-per-cm LAMBDA)
                               [--sources AFR,EUR] [--ancestry-sd SD] [--relatedness X|curve] [--snps FILE]
+  summit admixed-ld matrix    --ref REF_DIR --params PREFIX.admixed_ld.json (--region CHR:START-END | --snps FILE)
+                              (--curve PREFIX | --admixture-generations T | --decay-per-cm LAMBDA)
+                              [--taper auto|none|TAU_CM] [--no-admixture] --out PREFIX
 
 `reference` is built once from unadmixed panels of the two source populations. `curve` is run by the cohort on its
 genotypes and writes only aggregates (PREFIX.curve.tsv and PREFIX.curve.json). `compose` needs the GWAS summary
 statistics (BETA, SE, N; CHR and BP for matching by position, or --snps), the annotation of the fit (e.g. MAF/LD bins),
 and the decay of the local-ancestry covariance: the cohort's curve, a published admixture date in generations, or a
 decay rate per cM. It writes PREFIX.gw.ldscore.gz and PREFIX.gw.M for `summit --h2/--rg`, and PREFIX.admixed_ld.json.
+`matrix` writes the regional correlation matrix of the covariate-adjusted dosages (PREFIX.ld, PREFIX.ld.npz,
+PREFIX.snps.tsv with the counted allele) for fine-mapping or conditional analysis, from the reference, compose's
+parameters (mean ancestry and kappa(0)) and the same decay inputs; --taper auto tapers the panel term against its
+sampling noise.
 """
 import argparse
 import sys
@@ -118,6 +125,24 @@ def main(argv=None):
     v.add_argument("--threads", type=int, default=1)
     v.add_argument("--out", required=True, help="output reference directory")
 
+    x = sub.add_parser("matrix", help="regional LD matrix of the GWAS sample (fine-mapping, conditional analysis)")
+    x.add_argument("--ref", required=True)
+    x.add_argument("--params", default=None, help="compose's PREFIX.admixed_ld.json (mean ancestry and kappa(0))")
+    rg = x.add_mutually_exclusive_group(required=True)
+    rg.add_argument("--region", default=None, help="CHR:START-END in base pairs of the reference (inclusive)")
+    rg.add_argument("--snps", default=None, help="file with SNP IDs (first column) on one chromosome")
+    x.add_argument("--sources", default=None, help="as in compose (the last is the baseline)")
+    gx = x.add_mutually_exclusive_group(required=True)
+    gx.add_argument("--curve", default=None)
+    gx.add_argument("--admixture-generations", type=float, default=None)
+    gx.add_argument("--decay-per-cm", type=float, default=None)
+    x.add_argument("--mean-ancestry", default=None, help="override: K-1 or K comma-separated values")
+    x.add_argument("--kappa0", default=None, help="override: upper triangle of kappa_res(0), row by row")
+    x.add_argument("--taper", default="auto",
+                   help="taper of the panel term: auto (scale from the panel's sampling noise), none, or a scale in cM")
+    x.add_argument("--no-admixture", action="store_true", help="leave out the admixture term (for comparison only)")
+    x.add_argument("--out", required=True)
+
     a = ap.parse_args(argv)
     log = Logger()
     if a.cmd not in ("reference", "derive"):
@@ -142,6 +167,12 @@ def main(argv=None):
         genotype_curve(a.geno, a.ref, a.out, sources=_sources(a.sources), covar=a.covar, keep=a.keep, match=a.match,
                        cell_cm=a.cell_cm, max_cm=a.max_cm, relative_pairs=a.relative_pairs, kinship_col=a.kinship_col,
                        kinship_min=a.kinship_min, closure=a.closure, step=a.step, threads=a.threads,
+                       log=log._log)
+    elif a.cmd == "matrix":
+        from .matrix import compose_matrix
+        compose_matrix(a.ref, a.out, region=a.region, snps=a.snps, sources=_sources(a.sources), params=a.params,
+                       curve=a.curve, generations=a.admixture_generations, decay_per_cm=a.decay_per_cm,
+                       mean_ancestry=a.mean_ancestry, kappa0=a.kappa0, taper=a.taper, admixture=not a.no_admixture,
                        log=log._log)
     else:
         from .compose import compose_ldscores
