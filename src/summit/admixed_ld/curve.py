@@ -87,7 +87,7 @@ class _PairRelatedness:
 
 def genotype_curve(geno, ref_path, out, *, sources=None, covar=None, keep=None, match="position", cell_cm=0.25,
                    max_cm=None, theta_min_delta=0.2, relative_pairs=None, kinship_col=None, kinship_min=None,
-                   closure=False, cells_cm=2.0, step=4096, threads=1, native=True, log=print):
+                   closure=False, cells_cm=2.0, per_chromosome=False, step=4096, threads=1, native=True, log=print):
     """The weighted-LD curve of the cohort for two or more sources. With cells_cm, also the genome-wide matrix of
     covariances between cells of cells_cm cM (within and between chromosomes) and the sampling variance of each entry,
     written to out.cells.npz: it carries long-range structure that one value per distance cannot (for example what the
@@ -145,6 +145,7 @@ def genotype_curve(geno, ref_path, out, *, sources=None, covar=None, keep=None, 
     den = np.zeros((L + 1, k1, k1, k1, k1))                    # sum of Q_au(b) Q_bv(b + L)
     T, Qtot = [], []                                           # per person chromosome totals (projected), and Q
     coarse_U, coarse_q, coarse_tab = [], [], []                # cells of cells_cm for the cell matrix
+    chr_parts = []                                             # per-chromosome lag sums (per_chromosome)
     th_num = np.zeros((N, k1))
     th_den = np.zeros((k1, k1))
     th_c = np.zeros(k1)
@@ -191,11 +192,16 @@ def genotype_curve(geno, ref_path, out, *, sources=None, covar=None, keep=None, 
                         q[:, b, a] += qq
         U = Y - C @ B if p_rank else Y
         S = mp.tn(U, U) / df_res
+        num_c, den_c = np.zeros_like(num), np.zeros_like(den)
         for lag in range(1, min(L, nc - 1) + 1):
             for a in range(k1):
                 for b in range(k1):
-                    num[lag, a, b] += float(np.trace(S[a * nc:(a + 1) * nc, b * nc:(b + 1) * nc], offset=lag))
-            den[lag] += np.einsum("iau,ibv->abuv", q[:-lag], q[lag:])
+                    num_c[lag, a, b] = float(np.trace(S[a * nc:(a + 1) * nc, b * nc:(b + 1) * nc], offset=lag))
+            den_c[lag] = np.einsum("iau,ibv->abuv", q[:-lag], q[lag:])
+        num += num_c
+        den += den_c
+        if per_chromosome:
+            chr_parts.append((str(c), num_c, den_c))
         T.append(U.reshape(N, k1, nc).sum(axis=2))
         Qtot.append(q.sum(axis=0))
         if cells_cm:
@@ -276,6 +282,11 @@ def genotype_curve(geno, ref_path, out, *, sources=None, covar=None, keep=None, 
         info["cells"] = dict(file=f"{out}.cells.npz", n_cells=int(nC), cells_cm=float(cells_cm),
                              estimator="split halves")
         del Uall
+    if per_chromosome:
+        # each chromosome's lag sums, for a leave-one-chromosome-out jackknife of the curve (aggregates only)
+        np.savez(f"{out}.curve_chr.npz", chrom=np.array([x[0] for x in chr_parts]), cell_cm=float(cell_cm),
+                 num=np.stack([x[1] for x in chr_parts]), den=np.stack([x[2] for x in chr_parts]))
+        info["per_chromosome"] = f"{out}.curve_chr.npz"
     curve.to_csv(f"{out}.curve.tsv", sep="\t", index=False, float_format="%.8g")
     with open(f"{out}.curve.json", "w") as f:
         json.dump(info, f, indent=1)

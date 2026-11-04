@@ -1,14 +1,17 @@
 """Command line for LD scores of admixed cohorts without in-sample LD (`summit admixed-ld ...`).
 
   summit admixed-ld reference --panel AFR_PREFIX --panel EUR_PREFIX --names AFR,EUR [--window-kb 3000]
-                              [--genetic-map MAP] --out REF_DIR
+                              [--genetic-map MAP] [--remove-panel-admixture] --out REF_DIR
+  summit admixed-ld clean-panels --ref REF_DIR --panel AFR_PREFIX --panel EUR_PREFIX --names AFR,EUR --out NEW_DIR
   summit admixed-ld curve     --geno COHORT --ref REF_DIR [--covar FILE] [--keep FILE] [--sources AFR,EUR]
                               [--relative-pairs FILE [--kinship-col COL --kinship-min X] [--closure]] --out PREFIX
   summit admixed-ld compose   --ref REF_DIR --sumstats FILE_OR_DIR [...] --annot ANNOT --out PREFIX
                               (--curve PREFIX | --admixture-generations T | --decay-per-cm LAMBDA)
                               [--sources AFR,EUR] [--ancestry-sd SD] [--relatedness X|curve] [--snps FILE]
 
-`reference` is built once from unadmixed panels of the two source populations. `curve` is run by the cohort on its
+`reference` is built once from unadmixed panels of the two source populations. Panels drawn from a biobank carry some
+admixture of their own; --remove-panel-admixture (or `clean-panels` on an existing reference) measures it with the
+panel's weighted-LD curve and removes it from the panel's covariances and variances. `curve` is run by the cohort on its
 genotypes and writes only aggregates (PREFIX.curve.tsv and PREFIX.curve.json). `compose` needs the GWAS summary
 statistics (BETA, SE, N; CHR and BP for matching by position, or --snps), the annotation of the fit (e.g. MAF/LD bins),
 and the decay of the local-ancestry covariance: the cohort's curve, a published admixture date in generations, or a
@@ -44,7 +47,21 @@ def main(argv=None):
                    help="storage of covariances (float16 halves the size; default float32)")
     r.add_argument("--step", type=int, default=2048, help="variants per block (default 2048)")
     r.add_argument("--threads", type=int, default=1)
+    r.add_argument("--remove-panel-admixture", action="store_true",
+                   help="remove each panel's own admixture LD (measured with the weighted-LD curve of the panel) from "
+                        "its covariances and variances; recommended for panels drawn from a biobank, and together with "
+                        "compose --cell-matrix")
     r.add_argument("--out", required=True)
+
+    cp = sub.add_parser("clean-panels", help="remove the panels' own admixture LD from an existing reference (copy)")
+    cp.add_argument("--ref", required=True, help="reference written by `summit admixed-ld reference`")
+    cp.add_argument("--panel", action="append", required=True,
+                    help="PLINK prefix of a panel the reference was built from (repeat, in the order of --names)")
+    cp.add_argument("--names", required=True, help="comma-separated source names of the panels given")
+    cp.add_argument("--match", choices=["position", "id"], default="position")
+    cp.add_argument("--fit-cm", default="3,40", help="distance range of the panel curve fit, in cM (default 3,40)")
+    cp.add_argument("--threads", type=int, default=1)
+    cp.add_argument("--out", required=True, help="output reference directory (a cleaned copy)")
 
     c = sub.add_parser("curve", help="the cohort's weighted-LD curve and global-ancestry moments (aggregates only)")
     c.add_argument("--geno", required=True, help="PLINK 1 BED or PLINK 2 PGEN prefix of the GWAS sample")
@@ -120,7 +137,7 @@ def main(argv=None):
 
     a = ap.parse_args(argv)
     log = Logger()
-    if a.cmd not in ("reference", "derive"):
+    if a.cmd not in ("reference", "derive", "clean-panels"):
         log.attach_file(a.out + f".{a.cmd}.log", mode="w")
     else:
         import os
@@ -133,6 +150,17 @@ def main(argv=None):
         chroms = None if a.chromosomes is None else _sources(a.chromosomes)
         build_reference(a.panel, names, a.out, window_kb=a.window_kb, genetic_map=a.genetic_map, match=a.match,
                         chromosomes=chroms, step=a.step, threads=a.threads, dtype=a.dtype, log=log._log)
+        if a.remove_panel_admixture:
+            from .panel_admixture import remove_panel_admixture
+            remove_panel_admixture(a.out, dict(zip(names, a.panel)), match=a.match, threads=a.threads, log=log._log)
+    elif a.cmd == "clean-panels":
+        from .panel_admixture import remove_panel_admixture
+        names = _sources(a.names)
+        if len(names) != len(a.panel):
+            raise SystemExit("Give one --panel per name in --names.")
+        lo, hi = (float(x) for x in a.fit_cm.split(","))
+        remove_panel_admixture(a.ref, dict(zip(names, a.panel)), out=a.out, match=a.match, lo=lo, hi=hi,
+                               threads=a.threads, log=log._log)
     elif a.cmd == "derive":
         from .derive import derive_source
         derive_source(a.geno, a.ref, a.out, name=a.name, known=_sources(a.known), panel=a.panel, covar=a.covar,
