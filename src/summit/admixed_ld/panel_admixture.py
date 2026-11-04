@@ -1,0 +1,175 @@
+"""Admixture LD inside the source panels (`summit admixed-ld reference --remove-panel-admixture`, `clean-panels`).
+
+A source panel drawn from a biobank is rarely free of admixture: a few percent of ancestry from another source, varying
+between people and along the genome, gives the panel its own admixture LD. In the panel's covariances it appears as
+D_j' Kt_p(d) D_k, the same form as in an admixed cohort but small (D_j the contrasts of the reference sources against
+the baseline, Kt_p(d) the covariance of the panel's local-ancestry dosages of the non-baseline sources at distance d),
+and in its dosage variances as D_j' Kt_p(0) D_j. Composition adds the cohort's admixture LD to the within-source LD
+of the panels, so a panel's own admixture LD would be counted twice at the distances of the reference band; in
+UK Biobank target 1 (African panel, ancestry SD 0.03) it inflated the composed LD at 1-3 cM by 13%.
+
+Kt_p is the panel's weighted-LD curve (`genotype_curve` on the panel, without covariates), fitted entry by entry over
+lo-hi cM (default 3-40) as A + H exp(-lam d) with lam in [0.005, 0.5] per cM (admixture 0.5 to 50 generations ago)
+and A, H >= 0 on the diagonal (a panel is not adjusted for covariates, so its ancestry variance is not negative).
+Below lo the measured curve also carries within-source LD of the weighted sums, so the fit is extrapolated there.
+A panel is cleaned only when its Kt_p(0) is clearly above zero (at least 3 jackknife standard errors, leaving one
+chromosome out), so that a panel without admixture keeps its covariances. The cleaned covariance is
+c - D_j' Kt_p(d) D_k, with m22 changed so that the sampling variance of the covariance is kept (m22 - c^2 + c'^2);
+the variance becomes v - D_j' Kt_p(0) D_j. Frequencies are kept: a panel's mean admixture
+shortens every contrast by the same factor, which the cohort's curve and the standard errors absorb.
+"""
+from __future__ import annotations
+
+import json
+import os
+import shutil
+
+import numpy as np
+import pandas as pd
+
+from .model import contrast_pairs
+from .reference import Reference
+
+LAM_BOUNDS = (0.005, 0.5)
+
+
+def fit_panel_kernel(d, k, w=None, *, nonnegative=True, lo=3.0, hi=40.0):
+    """A + H exp(-lam d) fitted to a weighted-LD curve over lo-hi cM (weights w, e.g. the curve's denominators).
+    Returns dict(A, H, lam)."""
+    from scipy.optimize import least_squares
+    d, k = np.asarray(d, np.float64), np.asarray(k, np.float64)
+    w = np.ones_like(d) if w is None else np.asarray(w, np.float64)
+    s = (d >= lo) & (d <= hi) & np.isfinite(k) & np.isfinite(w) & (w > 0)
+    if s.sum() < 4:
+        raise ValueError(f"The panel curve has fewer than 4 points between {lo} and {hi} cM.")
+    d, k, sw = d[s], k[s], np.sqrt(w[s] / w[s].mean())
+    # diagonal entries: a panel has no covariates, so the asymptote (its global-ancestry variance) and H are >= 0
+    lower = [0.0 if nonnegative else -np.inf, 0.0 if nonnegative else -np.inf, LAM_BOUNDS[0]]
+    upper = [np.inf, np.inf, LAM_BOUNDS[1]]
+    best = None
+    for lam0 in (0.01, 0.05, 0.2):
+        h0 = max(float(k[0]), 0.0) if nonnegative else float(k[0])
+        r = least_squares(lambda t: sw * (t[0] + t[1] * np.exp(-t[2] * d) - k), [0.0, h0, lam0], bounds=(lower, upper))
+        if best is None or r.cost < best.cost:
+            best = r
+    A, H, lam = (float(x) for x in best.x)
+    return dict(A=A, H=H, lam=lam)
+
+
+class PanelKernel:
+    """Kt_p(d) of one panel, (K-1) x (K-1), from the entry-wise fits."""
+
+    def __init__(self, fits: dict, k1: int):
+        self.k1 = k1
+        self.fits = fits
+
+    def __call__(self, d):
+        d = np.asarray(d, np.float64)
+        out = np.zeros(d.shape + (self.k1, self.k1))
+        for (a, b), f in self.fits.items():
+            val = f["A"] + f["H"] * np.exp(-f["lam"] * d)
+            out[..., a, b] = out[..., b, a] = val
+        return out
+
+
+def _kernel_from_sums(num, den, cell_cm):
+    """Distances and Kt per lag (L x k1 x k1) from the lag sums of `genotype_curve`, with the k1 = 1 weights."""
+    from .curve import _solve_kernel
+    lags = [g for g in range(1, num.shape[0]) if np.any(den[g])]
+    k = np.stack([_solve_kernel(num[g], den[g]) for g in lags])
+    return np.array(lags) * float(cell_cm), k, np.array([den[g, 0, 0, 0, 0] for g in lags])
+
+
+def _fit_entries(d, k, w, k1, lo, hi):
+    fits = {}
+    for a, b in contrast_pairs(k1):
+        fits[(a, b)] = fit_panel_kernel(d, k[:, a, b], w if k1 == 1 else None, nonnegative=(a == b), lo=lo, hi=hi)
+    return fits
+
+
+def panel_curve_kernel(chr_sums, *, lo=3.0, hi=40.0):
+    """The PanelKernel of a panel from its per-chromosome curve sums (`genotype_curve(..., per_chromosome=True)`), with
+    leave-one-chromosome-out jackknife standard errors of Kt_p(0). Returns (kernel, se of Kt_p(0))."""
+    z = np.load(chr_sums)
+    num, den, cell_cm = z["num"], z["den"], float(z["cell_cm"])
+    k1 = num.shape[2]
+    fits = _fit_entries(*_kernel_from_sums(num.sum(0), den.sum(0), cell_cm), k1, lo, hi)
+    kern = PanelKernel(fits, k1)
+    C = num.shape[0]
+    jk = []
+    for c in range(C):
+        f = _fit_entries(*_kernel_from_sums(num.sum(0) - num[c], den.sum(0) - den[c], cell_cm), k1, lo, hi)
+        jk.append(PanelKernel(f, k1)(np.zeros(1))[0])
+    jk = np.stack(jk)
+    se = np.sqrt((C - 1) / C * ((jk - jk.mean(0)) ** 2).sum(0)) if C > 1 else np.full((k1, k1), np.inf)
+    return kern, se
+
+
+def remove_panel_admixture(ref_path, panels: dict, out=None, *, match="position", lo=3.0, hi=40.0, z_min=3.0,
+                           threads=1, step=4096, native=True, log=print):
+    """Remove each listed panel's admixture LD from the reference at ref_path (in place when out is None, otherwise
+    into a copy at out). panels: {source name: PLINK prefix of the panel the reference was built from}. A panel is
+    cleaned only if some diagonal entry of its Kt_p(0) is at least z_min jackknife standard errors (leave one
+    chromosome out) above zero; otherwise the fit is noise and the panel is left as it is (recorded in the manifest)."""
+    from .curve import genotype_curve
+    if out is not None and os.path.abspath(out) != os.path.abspath(ref_path):
+        if os.path.exists(os.path.join(out, "manifest.json")):
+            raise ValueError(f"{out} already holds a reference.")
+        shutil.copytree(ref_path, out, dirs_exist_ok=True)
+        ref_path = out
+    ref = Reference(ref_path)
+    names = list(ref.names)
+    k1 = len(names) - 1
+    man = ref.manifest
+    kernels = {}
+    for s, prefix in panels.items():
+        i = ref.source_index(s)
+        src = man["sources"][i]
+        if "panel_admixture" in src:
+            raise ValueError(f"The panel admixture of {s} was already removed from {ref_path}.")
+        if src.get("derived"):
+            raise ValueError(f"{s} is a derived source; only panels with genotypes can be cleaned.")
+        cprefix = os.path.join(ref_path, f"panel_admixture_{s}")
+        log(f"[admixed-ld] panel admixture: weighted-LD curve of the {s} panel ({prefix})")
+        _, info = genotype_curve(prefix, ref_path, cprefix, sources=names, covar=None, match=match, max_cm=hi,
+                                 cells_cm=0, per_chromosome=True, step=step, threads=threads, native=native, log=log)
+        kern, se = panel_curve_kernel(f"{cprefix}.curve_chr.npz", lo=lo, hi=hi)
+        k0 = kern(np.zeros(1))[0]
+        zdiag = np.diag(k0) / np.maximum(np.diag(se), 1e-300)
+        removed_ok = bool(np.max(zdiag) >= z_min)
+        if removed_ok:
+            kernels[i] = kern
+        src["panel_admixture"] = dict(removed=removed_ok, fits={f"{names[a]},{names[b]}": f for (a, b), f in
+                                                               kern.fits.items()},
+                                      kappa0=k0.tolist(), kappa0_se=se.tolist(), z=zdiag.tolist(), z_min=z_min,
+                                      fit_cm=[lo, hi], curve=os.path.basename(cprefix),
+                                      ancestry_cov=info["theta"].get("cov", info["theta"].get("var")))
+        log(f"[admixed-ld] panel admixture of {s}: Kt_p(0) = {np.array2string(k0, precision=5)} (jackknife SE "
+            f"{np.array2string(se, precision=5)}; z {np.array2string(zdiag, precision=1)}), fits "
+            + "; ".join(f"{names[a]}/{names[b]} A {f['A']:.2e} H {f['H']:.2e} lam {f['lam']:.3f}"
+                        for (a, b), f in kern.fits.items())
+            + ("" if removed_ok else f"; not removed (z below {z_min})"))
+    removed = {i: 0.0 for i in kernels}
+    for c in ref.chromosomes:
+        path = os.path.join(ref_path, f"chr{c}.npz")
+        with np.load(path, allow_pickle=False) as zf:
+            z = {k: zf[k] for k in zf.files}
+        P = np.column_stack([z[f"p_{t}"] for t in range(len(names))])
+        D = P[:, :-1] - P[:, -1:]
+        ip, ix = z["indptr"], z["indices"].astype(np.int64)
+        jl = np.repeat(np.arange(z["snp"].size), np.diff(ip))
+        d = np.abs(z["cm"][ix] - z["cm"][jl])
+        for i, kern in kernels.items():
+            a = np.einsum("pa,pab,pb->p", D[jl], kern(d), D[ix])
+            cov = z[f"cov_{i}"].astype(np.float64)
+            new = cov - a
+            z[f"m22_{i}"] = (z[f"m22_{i}"].astype(np.float64) - cov * cov + new * new).astype(z[f"m22_{i}"].dtype)
+            z[f"cov_{i}"] = new.astype(z[f"cov_{i}"].dtype)
+            z[f"v_{i}"] = z[f"v_{i}"] - np.einsum("ja,ab,jb->j", D, kern(np.zeros(1))[0], D)
+            removed[i] += float(np.abs(a).sum())
+        np.savez(path, **z)
+    with open(os.path.join(ref_path, "manifest.json"), "w") as f:
+        json.dump(man, f, indent=1)
+    log("[admixed-ld] panel admixture removed: " + ", ".join(f"{names[i]} (sum |change| {v:.4g})"
+                                                             for i, v in removed.items()) + f"; reference {ref_path}")
+    return man

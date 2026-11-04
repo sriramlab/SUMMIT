@@ -430,3 +430,64 @@ def test_curve_removes_panel_noise_from_its_denominators(sim, tmp_path):
     assert info["noise_correction"] and info["panel_n_freq"]["AFR"] == 12
     assert r_raw < 0.9                       # the raw denominators shrink the kernel
     assert abs(r_fixed - 1) < abs(r_raw - 1) and abs(r_fixed - 1) < 0.08
+
+
+def _dweighted_cov(path, lo=1.0, hi=3.0):
+    """sum D_j D_k c_jk / sum (D_j D_k)^2 of the first source's covariances over band pairs lo-hi cM apart."""
+    R = Reference(path)
+    num = den = 0.0
+    for c in R.chromosomes:
+        z = R.load(c)
+        D = z["p_0"] - z["p_1"]
+        jl = np.repeat(np.arange(z["snp"].size), np.diff(z["indptr"]))
+        kl = z["indices"].astype(np.int64)
+        d = np.abs(z["cm"][kl] - z["cm"][jl])
+        s = (d >= lo) & (d <= hi)
+        w = D[jl[s]] * D[kl[s]]
+        num += float((w * z["cov_0"][s]).sum())
+        den += float((w * w).sum())
+    return num / den
+
+
+def test_panel_admixture_removed(tmp_path):
+    """A source panel with some admixture of its own carries admixture LD; clean-panels removes it and leaves a pure
+    panel's reference as it was."""
+    import admixed_ld_sim
+    from summit.admixed_ld.panel_admixture import remove_panel_admixture
+    rng = np.random.default_rng(11)
+    n_chr, spc = 8, 300                                            # enough chromosomes for the jackknife
+    chrom = np.repeat(np.arange(1, n_chr + 1), spc)
+    cm = np.concatenate([np.sort(rng.uniform(0, 60.0, spc)) for _ in range(n_chr)])
+    M = cm.size
+    pE = rng.uniform(0.05, 0.95, M)
+    pA = np.clip(pE + rng.normal(0, 0.25, M), 0.03, 0.97)
+    founders = {s: (rng.random((40, M)) < p[None, :]).astype(np.int8) for s, p in (("A", pA), ("E", pE))}
+    hap = admixed_ld_sim._example._haplotypes
+    n = 800
+    hA, _ = hap(rng, {"A": founders["A"]}, cm, 2 * n, 3.0)
+    hE, _ = hap(rng, {"E": founders["E"]}, cm, 2 * n, 3.0)
+    k = 0.9 * 0.1 / 0.05 ** 2 - 1                                  # panel of source A with 10% of source E (SD 0.05)
+    hX, _ = hap(rng, founders, cm, 2 * n, 3.0, anc=np.repeat(rng.beta(0.9 * k, 0.1 * k, n), 2), break_rate=0.08)
+    var = pd.DataFrame({"CHR": chrom.astype(str), "SNP": [f"sim{j:05d}" for j in range(M)], "CM": cm,
+                        "BP": np.rint(cm * 1e6).astype(np.int64) + 1, "A1": "A", "A2": "G"})
+    for nm, h in (("A", hA), ("E", hE), ("X", hX)):
+        write_bed(tmp_path / nm, (h[0::2] + h[1::2]).astype(np.float64), var, nm)
+    quiet = lambda *a, **k: None
+    for out, a in (("pure", "A"), ("adm", "X")):
+        build_reference([str(tmp_path / a), str(tmp_path / "E")], ["A", "E"], str(tmp_path / out), match="id",
+                        log=quiet)
+    for r, a in (("pure", "A"), ("adm", "X")):
+        remove_panel_admixture(str(tmp_path / r), {"A": str(tmp_path / a), "E": str(tmp_path / "E")},
+                               out=str(tmp_path / f"{r}_clean"), match="id", log=quiet)
+    base = _dweighted_cov(tmp_path / "pure")
+    raw = _dweighted_cov(tmp_path / "adm") - base
+    cleaned = _dweighted_cov(tmp_path / "adm_clean") - base
+    assert raw > 0.1                                                # the panel's admixture LD is visible
+    assert abs(cleaned) < 0.15 * raw                                # and mostly removed
+    assert json.load(open(tmp_path / "adm_clean" / "manifest.json"))["sources"][0]["panel_admixture"]["removed"]
+    assert abs(_dweighted_cov(tmp_path / "pure_clean") - base) < 0.002   # a pure panel stays as it was
+    man = json.load(open(tmp_path / "pure_clean" / "manifest.json"))
+    assert all((not s["panel_admixture"]["removed"]) or s["panel_admixture"]["kappa0"][0][0] < 0.005
+               for s in man["sources"])
+    with pytest.raises(ValueError):                                 # cleaning twice is refused
+        remove_panel_admixture(str(tmp_path / "pure_clean"), {"A": str(tmp_path / "A")}, match="id", log=quiet)
