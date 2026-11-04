@@ -275,7 +275,9 @@ def compose_ldscores(ref_path, sumstats, annot, out, *, sources=None, snps=None,
         tmap[local_out[sel]] = sel
         indptr, indices, cm_ref = z["indptr"], z["indices"], z["cm"]
         cov = [z[f"cov_{i}"] for i in si]
-        m22 = [z[f"m22_{i}"] for i in si]
+        # a derived source carries the sampling variance of each covariance (covvar) instead of the panel moments
+        cvar = [z[f"covvar_{i}"] if f"covvar_{i}" in z.files else None for i in si]
+        m22 = [z[f"m22_{i}"] if cvar[n_] is None else None for n_, i in enumerate(si)]
         vr = [z[f"v_{i}"] for i in si]
         # pairs within the window (upper band), in chunks of rows
         r0 = 0
@@ -300,8 +302,11 @@ def compose_ldscores(ref_path, sumstats, annot, out, *, sources=None, snps=None,
                         cs_ = cov[s][s0:s1][use].astype(np.float64)
                         pi_s = m_vec[s] * np.exp(-kern.lam[s] * d)
                         # sampling noise of the squared panel covariance: c^2 minus its unbiased estimate
-                        vns = cs_ * cs_ - unbiased_squared_covariance(cs_, m22[s][s0:s1][use], vr[s][jl] * vr[s][kl],
-                                                                      ns[s])
+                        if cvar[s] is not None:
+                            vns = cvar[s][s0:s1][use].astype(np.float64)
+                        else:
+                            vns = cs_ * cs_ - unbiased_squared_covariance(cs_, m22[s][s0:s1][use],
+                                                                          vr[s][jl] * vr[s][kl], ns[s])
                         cr += pi_s * cs_
                         noise += pi_s * pi_s * vns
                     sq = cr * cr - noise - adm * adm

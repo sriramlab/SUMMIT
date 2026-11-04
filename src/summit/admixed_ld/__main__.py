@@ -100,14 +100,29 @@ def main(argv=None):
     m.add_argument("--grid-cm", type=float, default=0.02, help="grid of the long-range convolution (default 0.02)")
     m.add_argument("--out", required=True)
 
+    v = sub.add_parser("derive", help="a source without a reference panel, estimated from an admixed cohort that "
+                                      "carries it (writes a reference with the known sources and the derived one)")
+    v.add_argument("--geno", required=True, help="PLINK 1 BED or PLINK 2 PGEN prefix of the admixed cohort")
+    v.add_argument("--ref", required=True, help="reference with the other sources")
+    v.add_argument("--name", required=True, help="name of the derived source (e.g. NAT)")
+    v.add_argument("--known", default=None, help="sources of --ref to keep (default: all)")
+    v.add_argument("--panel", default=None,
+                   help="optional small panel of the derived source, whose members anchor its frequencies")
+    v.add_argument("--covar", default=None, help="the cohort's covariates (FID IID ...), including its PCs")
+    v.add_argument("--keep", default=None)
+    v.add_argument("--match", choices=["position", "id"], default="position")
+    v.add_argument("--als-snps", type=int, default=20000, help="SNPs used to estimate ancestry (default 20000)")
+    v.add_argument("--threads", type=int, default=1)
+    v.add_argument("--out", required=True, help="output reference directory")
+
     a = ap.parse_args(argv)
     log = Logger()
-    if a.cmd != "reference":
+    if a.cmd not in ("reference", "derive"):
         log.attach_file(a.out + f".{a.cmd}.log", mode="w")
     else:
         import os
         os.makedirs(a.out, exist_ok=True)
-        log.attach_file(os.path.join(a.out, "reference.log"), mode="w")
+        log.attach_file(os.path.join(a.out, f"{a.cmd}.log"), mode="w")
     log._log("summit admixed-ld " + " ".join(argv if argv is not None else sys.argv[2:]))
     if a.cmd == "reference":
         from .reference import build_reference
@@ -115,6 +130,10 @@ def main(argv=None):
         chroms = None if a.chromosomes is None else _sources(a.chromosomes)
         build_reference(a.panel, names, a.out, window_kb=a.window_kb, genetic_map=a.genetic_map, match=a.match,
                         chromosomes=chroms, step=a.step, threads=a.threads, dtype=a.dtype, log=log._log)
+    elif a.cmd == "derive":
+        from .derive import derive_source
+        derive_source(a.geno, a.ref, a.out, name=a.name, known=_sources(a.known), panel=a.panel, covar=a.covar,
+                      keep=a.keep, match=a.match, als_snps=a.als_snps, threads=a.threads, log=log._log)
     elif a.cmd == "curve":
         from .curve import genotype_curve
         genotype_curve(a.geno, a.ref, a.out, sources=_sources(a.sources), covar=a.covar, keep=a.keep, match=a.match,

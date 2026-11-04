@@ -287,3 +287,35 @@ def test_three_sources_compose_matches_insample(sim3):
     mass_c = float((got.V.to_numpy()[:, None] * L_c).sum())
     assert abs(mass_c / mass_in - 1) < 0.03, (mass_c, mass_in)
     assert np.corrcoef(L_c.sum(1), L_in.sum(1))[0, 1] > 0.95
+
+
+def test_derived_source_from_the_cohort(sim3, tmp_path):
+    """A third source with only a small panel: derived from the cohort, its frequencies match the source's and the
+    composed LD scores match in-sample LD scores about as well as with a full panel of that source."""
+    from summit.admixed_ld.compose import compose_ldscores
+    from summit.admixed_ld.curve import genotype_curve
+    from summit.admixed_ld.derive import derive_source
+    d, S, names = sim3["dir"], sim3["S"], sim3["names"]
+    v = S["variants"]
+    write_bed(str(tmp_path / "small"), S["panels"][2][:40], v, "s")
+    build_reference([str(d / "panelS0"), str(d / "panelS1")], names[:2], str(tmp_path / "ref2"), step=256,
+                    log=lambda *a: None)
+    derive_source(str(d / "cohort"), str(tmp_path / "ref2"), str(tmp_path / "ref3"), name="S2",
+                  panel=str(tmp_path / "small"), covar=str(d / "cohort.cov"), step=256, log=lambda *a: None)
+    ref3 = Reference(str(tmp_path / "ref3"))
+    rv = ref3.variants(["S2"]).set_index("SNP")
+    p_true = pd.Series(S["panels"][2].mean(0) / 2, index=v.SNP).reindex(rv.index)
+    assert np.corrcoef(rv.p_S2, p_true)[0, 1] > 0.98
+    genotype_curve(str(d / "cohort"), str(tmp_path / "ref3"), str(tmp_path / "c3"), sources=names,
+                   covar=str(d / "cohort.cov"), cell_cm=0.5, log=lambda *a: None)
+    out = str(tmp_path / "derived")
+    compose_ldscores(str(tmp_path / "ref3"), [str(d / "ss")], str(d / "annot.tsv"), out, sources=names,
+                     curve=str(tmp_path / "c3"), log=lambda *a: None)
+    got = pd.read_csv(out + ".gw.ldscore.gz", sep="\t")
+    keep = v.SNP.isin(got.SNP).to_numpy()
+    L_in, V_in = insample_ldscores(S["cohort"][:, keep], sim3["C"], sim3["cls"][keep], 2)
+    L_c = got[["low", "high"]].to_numpy()
+    mass_in = float((V_in[:, None] * L_in).sum())
+    mass_c = float((got.V.to_numpy()[:, None] * L_c).sum())
+    assert abs(mass_c / mass_in - 1) < 0.05, (mass_c, mass_in)
+    assert np.corrcoef(L_c.sum(1), L_in.sum(1))[0, 1] > 0.93

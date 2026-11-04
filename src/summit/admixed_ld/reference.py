@@ -159,17 +159,25 @@ def build_reference(panels, names, out, *, window_kb=3000, genetic_map=None, mat
         log(f"[admixed-ld] reference chr{c}: {ci.size} variants, {nnz} pairs within {window_kb} kb "
             f"({time.perf_counter() - t0:.0f} s)")
     info = mp.drain()
-    manifest = dict(format=FORMAT, version=VERSION, created=datetime.datetime.now().isoformat(timespec="seconds"),
-                    sources=[dict(name=nm, n=int(b.n), panel=os.path.basename(p)) for nm, b, p in zip(names, blocks, panels)],
-                    window_kb=int(window_kb), genetic_map=map_source, match=match, dtype=out_dtype.name,
-                    counted_allele="first panel's counted allele (BED A1, PGEN REF)",
-                    chromosomes=stats, genome_cm=float(sum(v["cm_length"] for v in stats.values())),
-                    products=dict(native=info["native"], repaired_columns=int(info["repaired_columns"])))
-    with open(os.path.join(out, "manifest.json"), "w") as f:
-        json.dump(manifest, f, indent=1)
+    manifest = write_manifest(out, [dict(name=nm, n=int(b.n), panel=os.path.basename(p))
+                                    for nm, b, p in zip(names, blocks, panels)],
+                              window_kb=window_kb, genetic_map=map_source, match=match, dtype=out_dtype.name,
+                              counted_allele="first panel's counted allele (BED A1, PGEN REF)", stats=stats,
+                              products=dict(native=info["native"], repaired_columns=int(info["repaired_columns"])))
     for b in blocks:
         b.close()
     log(f"[admixed-ld] reference written to {out} ({time.perf_counter() - t0:.0f} s)")
+    return manifest
+
+
+def write_manifest(out, sources, *, window_kb, genetic_map, match, dtype, counted_allele, stats, products):
+    """The manifest of a reference directory (sources: name, n and, for a derived source, how it was made)."""
+    manifest = dict(format=FORMAT, version=VERSION, created=datetime.datetime.now().isoformat(timespec="seconds"),
+                    sources=sources, window_kb=int(window_kb), genetic_map=genetic_map, match=match, dtype=dtype,
+                    counted_allele=counted_allele, chromosomes=stats,
+                    genome_cm=float(sum(v["cm_length"] for v in stats.values())), products=products)
+    with open(os.path.join(out, "manifest.json"), "w") as f:
+        json.dump(manifest, f, indent=1)
     return manifest
 
 
