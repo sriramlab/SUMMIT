@@ -139,6 +139,15 @@ def test_curve_relatedness_is_that_of_adjusted_genotypes(sim, tmp_path):
     r = info["relatedness"]
     assert r["pairs"] == 4 and r["n_snps"] == ok.sum()
     assert r["sum_squared_ordered"] == pytest.approx(2 * np.sum(g ** 2), rel=1e-8)
+    # --closure adds the pairs implied within a family: (0, 1) and (1, 2) give (0, 2)
+    pd.DataFrame({"IID1": [iid[0], iid[1]], "IID2": [iid[1], iid[2]]}).to_csv(tmp_path / "chain.tsv", sep="\t",
+                                                                           index=False)
+    _, info = genotype_curve(str(d / "cohort"), str(d / "ref"), str(tmp_path / "c2"), covar=str(d / "cohort.cov"),
+                             cell_cm=0.5, relative_pairs=str(tmp_path / "chain.tsv"), closure=True,
+                             log=lambda *a: None)
+    g = np.array([Z[a] @ Z[b] / ok.sum() for a, b in ((0, 1), (0, 2), (1, 2))])
+    assert info["relatedness"]["pairs"] == 3
+    assert info["relatedness"]["sum_squared_ordered"] == pytest.approx(2 * np.sum(g ** 2), rel=1e-8)
 
 
 @pytest.mark.parametrize("decay", ["curve", "date"])

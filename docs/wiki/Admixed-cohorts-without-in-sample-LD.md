@@ -84,9 +84,10 @@ Run this where the genotypes are. It measures κ(d) as the weighted-LD curve of 
 and ALDER on the genotypes adjusted for the GWAS covariates, in cells of `--cell-cm`
 (default 0.25 cM), along with its between-chromosome value and the moments of global
 ancestry. With `--relative-pairs pairs.tsv`, it also computes the relatedness of each pair
-in the genotypes adjusted for the covariates and writes the sum of its square. Pairs are
-selected as in `summit relatives moments` (`--kinship-col`, `--kinship-min`,
-`--no-closure`). The relatedness after adjustment is what enters the in-sample LD scores,
+in the genotypes adjusted for the covariates and writes the sum of its square. The listed
+pairs are used, selected with `--kinship-col` and `--kinship-min`. `--closure` adds every
+pair within a family (connected component), which helps when the list holds only some
+pairs of each family. Do not use it with a dense list of distant relatives. The relatedness after adjustment is what enters the in-sample LD scores,
 and it can differ greatly from the relatedness in a pair file. In a cohort of a few
 thousand people, a large family can take up a PC of its own, and first-degree pairs with
 a GRM of 0.5 then have a relatedness near zero after the covariates. The outputs,

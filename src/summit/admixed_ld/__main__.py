@@ -3,7 +3,7 @@
   summit admixed-ld reference --panel AFR_PREFIX --panel EUR_PREFIX --names AFR,EUR [--window-kb 3000]
                               [--genetic-map MAP] --out REF_DIR
   summit admixed-ld curve     --geno COHORT --ref REF_DIR [--covar FILE] [--keep FILE] [--sources AFR,EUR]
-                              [--relative-pairs FILE [--kinship-col COL --kinship-min X] [--no-closure]] --out PREFIX
+                              [--relative-pairs FILE [--kinship-col COL --kinship-min X] [--closure]] --out PREFIX
   summit admixed-ld compose   --ref REF_DIR --sumstats FILE_OR_DIR [...] --annot ANNOT --out PREFIX
                               (--curve PREFIX | --admixture-generations T | --decay-per-cm LAMBDA)
                               [--sources AFR,EUR] [--ancestry-sd SD] [--relatedness X|curve] [--snps FILE]
@@ -59,11 +59,11 @@ def main(argv=None):
     c.add_argument("--relative-pairs", default=None,
                    help="relative pairs (IID1 IID2 [FID1 FID2] [kinship]): also write the sum of their squared "
                         "relatedness after the covariates, computed from the genotypes, for `compose --relatedness "
-                        "curve`. Pairs are selected as in `summit relatives moments`")
+                        "curve`. The listed pairs are used, selected with --kinship-col and --kinship-min")
     c.add_argument("--kinship-col", default=None, help="kinship column of --relative-pairs used with --kinship-min")
     c.add_argument("--kinship-min", type=float, default=None, help="keep only pairs whose kinship exceeds this value")
-    c.add_argument("--no-closure", action="store_true",
-                   help="use only the listed pairs, not every pair within a family (connected component)")
+    c.add_argument("--closure", action="store_true",
+                   help="also use every pair within a family (connected component of the listed pairs)")
     c.add_argument("--step", type=int, default=4096)
     c.add_argument("--threads", type=int, default=1)
     c.add_argument("--out", required=True)
@@ -114,7 +114,7 @@ def main(argv=None):
         from .curve import genotype_curve
         genotype_curve(a.geno, a.ref, a.out, sources=_sources(a.sources), covar=a.covar, keep=a.keep, match=a.match,
                        cell_cm=a.cell_cm, max_cm=a.max_cm, relative_pairs=a.relative_pairs, kinship_col=a.kinship_col,
-                       kinship_min=a.kinship_min, closure=not a.no_closure, step=a.step, threads=a.threads,
+                       kinship_min=a.kinship_min, closure=a.closure, step=a.step, threads=a.threads,
                        log=log._log)
     else:
         from .compose import compose_ldscores

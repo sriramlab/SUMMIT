@@ -87,7 +87,7 @@ class _PairRelatedness:
 
 def genotype_curve(geno, ref_path, out, *, sources=None, covar=None, keep=None, match="position", cell_cm=0.25,
                    max_cm=None, theta_min_delta=0.2, relative_pairs=None, kinship_col=None, kinship_min=None,
-                   closure=True, step=4096, threads=1, native=True, log=print):
+                   closure=False, step=4096, threads=1, native=True, log=print):
     t0 = time.perf_counter()
     ref = Reference(ref_path)
     sources = sources or ref.names[:2]
@@ -103,7 +103,16 @@ def genotype_curve(geno, ref_path, out, *, sources=None, covar=None, keep=None, 
     if relative_pairs is not None:                             # SUMMIT's pair reader, with its options
         from ..relatives.moments import pairs_within_sample, read_relative_pairs
         rp = read_relative_pairs(relative_pairs, samples, kinship_col=kinship_col, kinship_min=kinship_min,
-                                 closure=closure)
+                                 closure=False)
+        if closure:                                            # a dense list of distant pairs can join most people
+            sizes = np.bincount(np.unique(rp.family, return_inverse=True)[1])
+            n_closed = int(np.sum(sizes * (sizes - 1) // 2))
+            if n_closed > max(10 * rp.npairs, 10 ** 7):
+                raise ValueError(f"Closing the {rp.npairs} listed pairs into families gives {n_closed} pairs (largest "
+                                 f"family {int(sizes.max())} people). Use the listed pairs (without --closure) or a "
+                                 "higher --kinship-min.")
+            rp = read_relative_pairs(relative_pairs, samples, kinship_col=kinship_col, kinship_min=kinship_min,
+                                     closure=True)
         pa, pb = pairs_within_sample(rp, rows, len(samples))
         rel = _PairRelatedness(pa, pb)
         log(f"[admixed-ld] curve: {pa.size} relative pairs among the {N} samples")
