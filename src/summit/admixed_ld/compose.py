@@ -30,7 +30,8 @@ import numpy as np
 import pandas as pd
 
 from ._io import match_variants
-from .model import Kernel, beta_moments, parameters_from_sumstats
+from .model import (KernelMatrix, contrast_pairs, dirichlet_moments, moments_tensors, parameters_from_sumstats_k,
+                    same_person_term, unbiased_products)
 from .reference import Reference
 
 
@@ -97,20 +98,30 @@ def _fft_conv_sym(W: np.ndarray, kern: np.ndarray) -> np.ndarray:
     return np.fft.irfft(fw * fk[:, None], n=size, axis=0)[:n]
 
 
+def _parse_values(x):
+    if x is None:
+        return None
+    if isinstance(x, (int, float)):
+        return [float(x)]
+    return [float(v) for v in str(x).split(",") if v.strip()]
+
+
 def compose_ldscores(ref_path, sumstats, annot, out, *, sources=None, snps=None, match="position", curve=None,
                      generations=None, decay_per_cm=None, mean_ancestry=None, kappa0=None, theta_sd=None,
                      relatedness=None, nu=None, r2=0.99, grid_cm=0.02, pair_chunk=1 << 23, log=print):
+    """Composed LD scores for an admixed GWAS sample with two or more sources (the last is the baseline of the
+    contrasts). mean_ancestry: K-1 or K values (comma-separated); kappa0: the upper triangle of Kt_res(0) row by row."""
     from ..ldscore.gw_ldscore import write_gw_annotation_masses, write_gw_ldscore_table
     from ..relatives.moments import read_annotation_classes
     from ..sumstats.sumstats import Sumstats
     t0 = time.perf_counter()
     ref = Reference(ref_path)
-    sources = sources or ref.names[:2]
-    if len(sources) != 2:
-        raise ValueError("Composition uses exactly two sources (the first is the ancestry whose mean is m).")
-    A, E = sources
-    iA, iE = ref.source_index(A), ref.source_index(E)
-    nA, nE = ref.n[A], ref.n[E]
+    sources = list(sources or ref.names[:2])
+    if len(sources) < 2 or len(set(sources)) != len(sources):
+        raise ValueError("Composition needs two or more distinct sources.")
+    nK, k1 = len(sources), len(sources) - 1
+    si = [ref.source_index(s) for s in sources]
+    ns = np.array([ref.n[s] for s in sources], np.float64)
     if sum(x is not None for x in (curve, generations, decay_per_cm)) != 1:
         raise ValueError("Give exactly one source for the decay: --curve, --admixture-generations or --decay-per-cm.")
 
@@ -134,23 +145,23 @@ def compose_ldscores(ref_path, sumstats, annot, out, *, sources=None, snps=None,
     t_idx, r_idx, cls_mat = t_idx[in_annot], r_idx[in_annot], cls_mat[in_annot]
     order = np.argsort(r_idx, kind="stable")                       # reference (genome) order
     t_idx, r_idx, cls_mat = t_idx[order], r_idx[order], cls_mat[order]
-    pA, pE = rv[f"p_{A}"].to_numpy()[r_idx], rv[f"p_{E}"].to_numpy()[r_idx]
-    vA, vE = rv[f"v_{A}"].to_numpy()[r_idx], rv[f"v_{E}"].to_numpy()[r_idx]
-    delta = pA - pE
-    good = np.isfinite(delta) & np.isfinite(vA) & np.isfinite(vE) & (vA + vE > 0)
+    Pm = np.column_stack([rv[f"p_{s}"].to_numpy()[r_idx] for s in sources])
+    Vm = np.column_stack([rv[f"v_{s}"].to_numpy()[r_idx] for s in sources])
+    Dm = Pm[:, :-1] - Pm[:, -1:]                                    # contrasts against the baseline source
+    good = np.isfinite(Pm).all(axis=1) & np.isfinite(Vm).all(axis=1) & (Vm.sum(axis=1) > 0)
     t_idx, r_idx, cls_mat = t_idx[good], r_idx[good], cls_mat[good]
-    pA, pE, vA, vE, delta = pA[good], pE[good], vA[good], vE[good], delta[good]
-    # squared frequency differences without the panels' sampling variance (Var(p) = Var(dosage) / 4n)
-    delta_var = vA / (4.0 * nA) + vE / (4.0 * nE)
-    d2 = delta ** 2 - delta_var
+    Pm, Vm, Dm = Pm[good], Vm[good], Dm[good]
+    # products of contrasts without the panels' sampling (co)variance (Var(p) = Var(dosage) / 4n)
+    pvar = Vm / (4.0 * ns[None, :])
+    O = unbiased_products(Dm, pvar[:, :-1], pvar[:, -1])
     cls = np.argmax(cls_mat, axis=1)
     K = len(classes)
     M = r_idx.size
     if M == 0:
         raise ValueError("No GWAS variant is in the reference and the annotation.")
     snp_ids = tv.SNP.to_numpy()[t_idx]
-    log(f"[admixed-ld] compose: {M} of {len(tv)} GWAS variants are in the reference ({A}, {E}) and the annotation "
-        f"({K} classes)")
+    log(f"[admixed-ld] compose: {M} of {len(tv)} GWAS variants are in the reference ({', '.join(sources)}) and the "
+        f"annotation ({K} classes)")
 
     # ---------------------------------------------------------------------------------------- parameters
     tables, n_med, p_rank = [], [], []
@@ -164,12 +175,28 @@ def compose_ldscores(ref_path, sumstats, annot, out, *, sources=None, snps=None,
         p_rank.append(int(ss.cov_rank))
     N = float(np.median(n_med))
     p = int(np.median(p_rank))
-    if mean_ancestry is None or kappa0 is None:
-        m_se, k_se, per_trait = parameters_from_sumstats(tables, vA, vE, delta, log=log, delta_var=delta_var)
+    m_in, k_in = _parse_values(mean_ancestry), _parse_values(kappa0)
+    if m_in is None or k_in is None:
+        m_se, k_se, per_trait = parameters_from_sumstats_k(tables, Vm, O, sources, log=log)
     else:
-        m_se, k_se, per_trait = float("nan"), float("nan"), None
-    m = float(mean_ancestry) if mean_ancestry is not None else m_se
-    k0 = float(kappa0) if kappa0 is not None else k_se
+        m_se, k_se, per_trait = np.full(nK, np.nan), np.full((k1, k1), np.nan), None
+    if m_in is not None:
+        if len(m_in) == k1:
+            m_in = m_in + [1.0 - sum(m_in)]
+        if len(m_in) != nK or min(m_in) <= 0:
+            raise ValueError(f"--mean-ancestry needs {k1} or {nK} values in (0, 1).")
+        m_vec = np.asarray(m_in) / np.sum(m_in)
+    else:
+        m_vec = np.asarray(m_se)
+    if k_in is not None:
+        pairs = contrast_pairs(k1)
+        if len(k_in) != len(pairs):
+            raise ValueError(f"--kappa0 needs {len(pairs)} values (the upper triangle of Kt_res(0), row by row).")
+        k0 = np.zeros((k1, k1))
+        for (a, b), v in zip(pairs, k_in):
+            k0[a, b] = k0[b, a] = v
+    else:
+        k0 = np.asarray(k_se)
     nu = float(nu) if nu is not None else N - p - 1.0
 
     # ---------------------------------------------------------------------------------------- kernel and ancestry
@@ -180,24 +207,36 @@ def compose_ldscores(ref_path, sumstats, annot, out, *, sources=None, snps=None,
             curve_info = json.load(fh)
         if list(curve_info.get("sources", sources)) != list(sources):
             raise ValueError(f"The curve was made with sources {curve_info.get('sources')}, not {sources}.")
-        kern = Kernel.from_curve(cdf.d_cm, cdf.kernel, curve_info["inter_kernel"], k0)
+        d_c = cdf.d_cm.to_numpy()
+        kc = np.zeros((d_c.size, k1, k1))
+        if k1 == 1:
+            kc[:, 0, 0] = cdf.kernel.to_numpy()
+            inter = np.array([[curve_info["inter_kernel"]]])
+            lam = np.full(nK, curve_info["fit_2_to_20cm"]["lam"])
+        else:
+            for a, b in contrast_pairs(k1):
+                kc[:, a, b] = kc[:, b, a] = cdf[f"kernel_{sources[a]}_{sources[b]}"].to_numpy()
+            inter = np.asarray(curve_info["inter_matrix"])
+            lam = np.array([curve_info["fit_per_source"][s]["lam"] for s in sources])
+        kern = KernelMatrix.from_curve(d_c, kc, inter, k0, lam)
     elif generations is not None:
-        kern = Kernel.from_decay(k0, float(generations) / 100.0, ref.genome_cm,
-                                 source=f"admixture {generations} generations ago")
+        kern = KernelMatrix.from_decay(k0, float(generations) / 100.0, ref.genome_cm, nK,
+                                       source=f"admixture {generations} generations ago")
     else:
-        kern = Kernel.from_decay(k0, float(decay_per_cm), ref.genome_cm, source=f"decay {decay_per_cm} per cM")
+        kern = KernelMatrix.from_decay(k0, float(decay_per_cm), ref.genome_cm, nK, source=f"decay {decay_per_cm} per cM")
     if kern.note:
         log(f"[admixed-ld] note: {kern.note}")
     if theta_sd is not None:
-        th = beta_moments(m, theta_sd)
-        th_source = f"Beta with mean {m:.3f} and SD {theta_sd}"
+        th = dirichlet_moments(m_vec, theta_sd)
+        th_source = f"Beta/Dirichlet with mean {np.round(m_vec, 3).tolist()} and SD {theta_sd} (first source)"
     elif curve_info is not None:
         th, th_source = curve_info["theta"], "the cohort's curve"
     else:
-        th = beta_moments(m, 0.12)
-        th_source = "Beta with SD 0.12 (default; pass --ancestry-sd)"
+        th = dirichlet_moments(m_vec, 0.12)
+        th_source = "Beta/Dirichlet with SD 0.12 (default; pass --ancestry-sd)"
         log("[admixed-ld] note: global-ancestry moments default to SD 0.12; they enter only the same-person term, "
             "which is small at biobank sample sizes.")
+    mom = moments_tensors(th, k1)
     if relatedness is None:                 # optional input
         rel_sum = None
     elif str(relatedness) == "curve":
@@ -208,8 +247,9 @@ def compose_ldscores(ref_path, sumstats, annot, out, *, sources=None, snps=None,
         rel_sum = float(relatedness)
 
     # ---------------------------------------------------------------------------------------- per-SNP model
-    cres = m * vA + (1.0 - m) * vE + d2 * k0
-    s2 = cres + d2 * 4.0 * r2 * th["var"]
+    quad = lambda Mx: np.einsum("jab,ab->j", O, Mx)                 # D_j' Mx D_j without sampling noise
+    cres = Vm @ m_vec + quad(k0)
+    s2 = cres + 4.0 * r2 * quad(mom[1])
     ok = cres > 1e-8
     if not ok.all():
         raise ValueError(f"{int((~ok).sum())} SNPs have no variance in the model; they should have been removed.")
@@ -218,9 +258,12 @@ def compose_ldscores(ref_path, sumstats, annot, out, *, sources=None, snps=None,
     chrom_out = rv["CHR"].to_numpy()[r_idx]
     local_out = rv["LOCAL"].to_numpy()[r_idx]
     cm_out = rv["CM"].to_numpy()[r_idx]
-    wd = d2 / s2                                                   # partner weight of the admixture terms
-    W_tot = np.bincount(cls, weights=wd, minlength=K)
-    far2 = kern.far ** 2
+    k2 = k1 * k1
+    Oflat = O.reshape(M, k2)                                       # o_j[u], u = (a, c): D_ja D_jc
+    Wn = Oflat / s2[:, None]                                       # partner weights of the admixture terms
+    W_tot = np.stack([np.bincount(cls, weights=Wn[:, u], minlength=K) for u in range(k2)])   # k2 x K
+    uu = [(a, c) for a in range(k1) for c in range(k1)]
+    far_F = np.array([[kern.far[a, b] * kern.far[c, e] for (b, e) in uu] for (a, c) in uu])  # F_uv(inf)
     n_pairs = 0
     for c in ref.chromosomes:
         sel = np.flatnonzero(chrom_out == c)
@@ -231,8 +274,9 @@ def compose_ldscores(ref_path, sumstats, annot, out, *, sources=None, snps=None,
         tmap = -np.ones(nloc, dtype=np.int64)
         tmap[local_out[sel]] = sel
         indptr, indices, cm_ref = z["indptr"], z["indices"], z["cm"]
-        covA, covE, m22A, m22E = z[f"cov_{iA}"], z[f"cov_{iE}"], z[f"m22_{iA}"], z[f"m22_{iE}"]
-        vrA, vrE = z[f"v_{iA}"], z[f"v_{iE}"]
+        cov = [z[f"cov_{i}"] for i in si]
+        m22 = [z[f"m22_{i}"] for i in si]
+        vr = [z[f"v_{i}"] for i in si]
         # pairs within the window (upper band), in chunks of rows
         r0 = 0
         while r0 < nloc:
@@ -247,43 +291,51 @@ def compose_ldscores(ref_path, sumstats, annot, out, *, sources=None, snps=None,
                 use = (j >= 0) & (k >= 0)
                 if use.any():
                     j, k, jl, kl = j[use], k[use], jl[use], kl[use]
-                    cA = covA[s0:s1][use].astype(np.float64)
-                    cE = covE[s0:s1][use].astype(np.float64)
-                    # sampling noise of the squared panel covariances: c^2 minus its unbiased estimate
-                    vAp = cA * cA - unbiased_squared_covariance(cA, m22A[s0:s1][use], vrA[jl] * vrA[kl], nA)
-                    vEp = cE * cE - unbiased_squared_covariance(cE, m22E[s0:s1][use], vrE[jl] * vrE[kl], nE)
                     d = np.abs(cm_ref[kl] - cm_ref[jl])
-                    rec = np.exp(-kern.lam * d)
-                    piA, piE = m * rec, (1.0 - m) * rec
-                    adm = delta[j] * delta[k] * kern(d)
-                    cr = piA * cA + piE * cE + adm
-                    sq = cr * cr - piA * piA * vAp - piE * piE * vEp - adm * adm
+                    Kd = kern(d)                                    # pairs x k1 x k1
+                    adm = np.einsum("pa,pab,pb->p", Dm[j], Kd, Dm[k])
+                    cr = adm.copy()
+                    noise = np.zeros_like(adm)
+                    for s in range(nK):
+                        cs_ = cov[s][s0:s1][use].astype(np.float64)
+                        pi_s = m_vec[s] * np.exp(-kern.lam[s] * d)
+                        # sampling noise of the squared panel covariance: c^2 minus its unbiased estimate
+                        vns = cs_ * cs_ - unbiased_squared_covariance(cs_, m22[s][s0:s1][use], vr[s][jl] * vr[s][kl],
+                                                                      ns[s])
+                        cr += pi_s * cs_
+                        noise += pi_s * pi_s * vns
+                    sq = cr * cr - noise - adm * adm
                     L += np.bincount(j * K + cls[k], weights=sq / (cres[j] * s2[k]), minlength=M * K).reshape(M, K)
                     L += np.bincount(k * K + cls[j], weights=sq / (cres[k] * s2[j]), minlength=M * K).reshape(M, K)
                     n_pairs += int(use.sum())
             r0 = r1
-        # admixture LD of every pair on the chromosome
+        # admixture LD of every pair on the chromosome: (D_j' Kt D_k)^2 = sum_{u,v} o_j[u] F_uv(d) o_k[v] with
+        # F_{(a,c),(b,e)} = Kt_ab Kt_ce, by FFT convolution on a grid
         x = cm_out[sel]
         g = np.floor((x - x.min()) / grid_cm).astype(np.int64)
         ng = int(g.max()) + 1
-        Wg = np.zeros((ng, K))
-        np.add.at(Wg, (g, cls[sel]), wd[sel])
-        k2 = kern(np.arange(ng) * grid_cm) ** 2
-        F = _fft_conv_sym(Wg, k2)[g]                                # (SNPs on chr) x classes, includes each SNP itself
-        F[np.arange(sel.size), cls[sel]] -= wd[sel] * k2[0]
-        W_chr = Wg.sum(axis=0)
-        L[sel] += (d2[sel] / cres[sel])[:, None] * (F + far2 * (W_tot - W_chr)[None, :])
+        grid_d = np.arange(ng) * grid_cm
+        kg = kern(grid_d)                                           # ng x k1 x k1
+        Wg = np.zeros((k2, ng, K))
+        for v in range(k2):
+            np.add.at(Wg[v], (g, cls[sel]), Wn[sel, v])
+        acc = np.zeros((sel.size, K))
+        self_ = np.zeros(sel.size)
+        for ui, (a, c_) in enumerate(uu):
+            Fu = np.zeros((sel.size, K))
+            for vi, (b, e) in enumerate(uu):
+                fk = kg[:, a, b] * kg[:, c_, e]
+                Fu += _fft_conv_sym(Wg[vi], fk)[g]
+                self_ += Oflat[sel, ui] * fk[0] * Wn[sel, vi]
+                Fu += far_F[ui, vi] * (W_tot[vi] - Wg[vi].sum(axis=0))[None, :]
+            acc += Oflat[sel, ui][:, None] * Fu
+        acc[np.arange(sel.size), cls[sel]] -= self_                 # the convolution includes each SNP itself
+        L[sel] += acc / cres[sel][:, None]
         log(f"[admixed-ld] compose chr{c}: {sel.size} SNPs ({time.perf_counter() - t0:.0f} s)")
     # same-person term, each SNP with itself, relatives
-    pbar = m * pA + (1.0 - m) * pE
-    beta_ = 2.0 * delta * (1.0 - 2.0 * pbar)
-    gam = -2.0 * d2
-    Bc = np.bincount(cls, weights=beta_ / s2, minlength=K)
-    Gc = np.bincount(cls, weights=gam / s2, minlength=K)
-    mu2, mu3, mu4 = th["var"], th["m3"], th["m4"]
-    same = (beta_[:, None] * mu2 * Bc[None, :] + (beta_[:, None] * Gc[None, :] + gam[:, None] * Bc[None, :]) * mu3
-            + gam[:, None] * Gc[None, :] * (mu4 - mu2 * mu2)) / (nu * cres)[:, None]
-    L += same
+    pbar = Pm @ m_vec                                               # frequency at the mean ancestry
+    beta_ = 2.0 * Dm * (1.0 - 2.0 * pbar)[:, None]
+    L += same_person_term(beta_, O, s2, cres, cls, K, mom, nu)
     L[np.arange(M), cls] += Vpop
     if rel_sum is not None:
         L += (rel_sum / nu ** 2) * np.bincount(cls, weights=Vpop, minlength=K)[None, :]
@@ -293,16 +345,21 @@ def compose_ldscores(ref_path, sumstats, annot, out, *, sources=None, snps=None,
     snpdf = pd.DataFrame({"CHR": chrom_out, "SNP": snp_ids, "BP": rv["BP"].to_numpy()[r_idx]})
     write_gw_ldscore_table(out, snpdf, pd.DataFrame(L, columns=classes), snp_var=V)
     write_gw_annotation_masses(out, np.bincount(cls, minlength=K).astype(float))
-    params = dict(format="summit-admixed-ld-compose", version=1, sources=[A, E], n_snps=int(M),
-                  n_window_pairs=int(n_pairs), mean_ancestry=m, kappa0=k0,
-                  mean_ancestry_from_se=m_se, kappa0_from_se=k_se, gwas_n=N, covariate_rank=p, nu=nu,
-                  kernel=kern.describe(), theta=th, theta_source=th_source, relatedness=rel_sum, r2=r2,
-                  grid_cm=grid_cm, reference=dict(sources=ref.manifest["sources"], window_kb=ref.manifest["window_kb"],
-                                                  genetic_map=ref.manifest["genetic_map"]),
+    params = dict(format="summit-admixed-ld-compose", version=1, sources=sources, baseline=sources[-1], n_snps=int(M),
+                  n_window_pairs=int(n_pairs), mean_ancestry_vector=m_vec.tolist(), kappa0_matrix=k0.tolist(),
+                  mean_ancestry_from_se=np.asarray(m_se).tolist(), kappa0_from_se=np.asarray(k_se).tolist(),
+                  gwas_n=N, covariate_rank=p, nu=nu, kernel=kern.describe(), theta=th, theta_source=th_source,
+                  relatedness=rel_sum, r2=r2, grid_cm=grid_cm,
+                  reference=dict(sources=ref.manifest["sources"], window_kb=ref.manifest["window_kb"],
+                                 genetic_map=ref.manifest["genetic_map"]),
                   per_trait=None if per_trait is None else per_trait.to_dict(orient="records"),
                   ld_mass=float((V[:, None] * L).sum()))
+    if k1 == 1:                                                    # the two-source keys
+        params.update(mean_ancestry=float(m_vec[0]), kappa0=float(k0[0, 0]))
     with open(f"{out}.admixed_ld.json", "w") as fh:
         json.dump(params, fh, indent=1)
-    log(f"[admixed-ld] compose: wrote {out}.gw.ldscore.gz and {out}.gw.M ({M} SNPs; m {m:.4f}, kappa_res(0) "
-        f"{k0:.4f}, decay {kern.lam:.4f} per cM, far {kern.far:.5f}) in {time.perf_counter() - t0:.0f} s")
+    log(f"[admixed-ld] compose: wrote {out}.gw.ldscore.gz and {out}.gw.M ({M} SNPs; m "
+        + ", ".join(f"{s} {x:.4f}" for s, x in zip(sources, m_vec)) + "; kappa_res(0) "
+        + np.array2string(k0, precision=4).replace("\n", "") + "; decay "
+        + ", ".join(f"{x:.4f}" for x in kern.lam) + " per cM) in " + f"{time.perf_counter() - t0:.0f} s")
     return params

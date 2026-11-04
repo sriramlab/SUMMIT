@@ -25,7 +25,7 @@ import numpy as np
 import pandas as pd
 
 from ._io import DosageBlocks, center_impute, match_variants
-from .model import fit_exponential, moments_from_values
+from .model import fit_exponential
 from .reference import Reference, _products
 
 
@@ -88,12 +88,15 @@ class _PairRelatedness:
 def genotype_curve(geno, ref_path, out, *, sources=None, covar=None, keep=None, match="position", cell_cm=0.25,
                    max_cm=None, theta_min_delta=0.2, relative_pairs=None, kinship_col=None, kinship_min=None,
                    closure=False, step=4096, threads=1, native=True, log=print):
+    """The weighted-LD curve of the cohort for two or more sources. With K sources and the last as baseline, each of the
+    K-1 contrasts D_a = p^a - p^B gives its own cell sums; per distance, the (K-1)^2 products of cell sums are linear in
+    the unique entries of Kt_res(d) and are solved by least squares (two sources: numerator / denominator)."""
     t0 = time.perf_counter()
     ref = Reference(ref_path)
-    sources = sources or ref.names[:2]
-    if len(sources) != 2:
-        raise ValueError("The curve needs exactly two sources.")
-    A, E = sources
+    sources = list(sources or ref.names[:2])
+    if len(sources) < 2 or len(set(sources)) != len(sources):
+        raise ValueError("The curve needs two or more distinct sources.")
+    k1 = len(sources) - 1
     samples, rows, C = _cohort_samples(geno, covar, keep, log)
     from ..relatives.moments import _auto_step
     step = min(int(step), _auto_step(None, rows.size))           # about 512 MiB of float64 genotypes per block
@@ -122,45 +125,45 @@ def genotype_curve(geno, ref_path, out, *, sources=None, covar=None, keep=None, 
     rv = ref.variants(sources)
     t_idx, r_idx, flip = match_variants(blocks.variants, rv, how=match)
     sign = np.where(flip, -1.0, 1.0)
-    pA, pE = rv[f"p_{A}"].to_numpy()[r_idx], rv[f"p_{E}"].to_numpy()[r_idx]
-    delta = (pA - pE) * sign                                   # oriented to the cohort's counted allele
-    pE_c = np.where(flip, 1.0 - pE, pE)
-    good = np.isfinite(delta) & np.isfinite(pE_c)
-    t_idx, r_idx, delta, pE_c = t_idx[good], r_idx[good], delta[good], pE_c[good]
+    P = np.column_stack([rv[f"p_{s}"].to_numpy()[r_idx] for s in sources])
+    D = (P[:, :-1] - P[:, -1:]) * sign[:, None]                 # contrasts, oriented to the cohort's counted allele
+    pB_c = np.where(flip, 1.0 - P[:, -1], P[:, -1])
+    good = np.isfinite(D).all(axis=1) & np.isfinite(pB_c)
+    t_idx, r_idx, D, pB_c = t_idx[good], r_idx[good], D[good], pB_c[good]
     chrom = rv["CHR"].to_numpy()[r_idx]
     cm = rv["CM"].to_numpy()[r_idx]
-    log(f"[admixed-ld] curve: {t_idx.size} of {len(blocks.variants)} cohort variants matched to the reference; "
-        f"{N} samples")
+    log(f"[admixed-ld] curve: {t_idx.size} of {len(blocks.variants)} cohort variants matched to the reference "
+        f"({', '.join(sources)}; baseline {sources[-1]}); {N} samples")
     mp = _products(threads, native)
     span = max(float(np.ptp(cm[chrom == c])) for c in pd.unique(chrom))
     max_cm = span if max_cm is None else min(float(max_cm), span)
     L = int(np.ceil(max_cm / cell_cm))
-    num, den = np.zeros(L + 1), np.zeros(L + 1)
-    T = []                                                     # per person chromosome totals (projected)
-    Q = []
-    theta_num = np.zeros(N)
-    theta_den = 0.0
-    theta_c = 0.0
+    num = np.zeros((L + 1, k1, k1))                            # sum over cell pairs at lag L of U_a(b) U_b(b + L)
+    den = np.zeros((L + 1, k1, k1, k1, k1))                    # sum of Q_au(b) Q_bv(b + L)
+    T, Qtot = [], []                                           # per person chromosome totals (projected), and Q
+    th_num = np.zeros((N, k1))
+    th_den = np.zeros((k1, k1))
+    th_c = np.zeros(k1)
     p_rank = C.shape[1]
     for c in pd.unique(chrom):
         ix = np.flatnonzero(chrom == c)
         ix = ix[np.argsort(cm[ix], kind="stable")]
         cell = ((cm[ix] - cm[ix].min()) / cell_cm).astype(np.int64)
         nc = int(cell.max()) + 1
-        Y = np.zeros((N, nc), order="F")
-        B = np.zeros((p_rank, nc))
-        q = np.zeros(nc)
+        Y = np.zeros((N, k1 * nc), order="F")                  # column a * nc + cell
+        B = np.zeros((p_rank, k1 * nc))
+        q = np.zeros((nc, k1, k1))
         for s in range(0, ix.size, step):
             sl = ix[s:s + step]
             X = blocks.read(t_idx[sl])
             mu = np.nanmean(X, axis=0)
             center_impute(X)
-            d = delta[sl]
-            inf = np.isfinite(mu) & (np.abs(d) >= theta_min_delta)
-            if inf.any():                                      # global ancestry: g/2 - pE = x/2 + (mu/2 - pE)
-                theta_num += X[:, inf] @ (d[inf] / 2.0)
-                theta_c += float(np.sum(d[inf] * (mu[inf] / 2.0 - pE_c[sl][inf])))
-                theta_den += float(np.sum(d[inf] ** 2))
+            d = D[sl]
+            inf = np.isfinite(mu) & (np.abs(d).max(axis=1) >= theta_min_delta)
+            if inf.any():                                      # ancestry: g/2 - pB = x/2 + (mu/2 - pB), on D
+                th_num += X[:, inf] @ (d[inf] / 2.0)
+                th_c += d[inf].T @ (mu[inf] / 2.0 - pB_c[sl][inf])
+                th_den += d[inf].T @ d[inf]
             ss = np.einsum("ij,ij->j", X, X)
             Bx = C.T @ X if p_rank else np.zeros((0, X.shape[1]))
             ss_res = ss - np.einsum("ij,ij->j", Bx, Bx)
@@ -168,42 +171,65 @@ def genotype_curve(geno, ref_path, out, *, sources=None, covar=None, keep=None, 
             ok = np.isfinite(var_res) & (var_res > 1e-8) & np.isfinite(mu)
             if rel is not None and ok.any():
                 rel.add(X[:, ok], C, Bx[:, ok], var_res[ok])
-            w = np.zeros(sl.size)
-            w[ok] = d[ok] / var_res[ok]                         # a_j / sd_j, applied to unscaled adjusted genotypes
-            a2 = np.zeros(sl.size)
-            a2[ok] = d[ok] ** 2 / var_res[ok]
+            inv = np.zeros(sl.size)
+            inv[ok] = 1.0 / var_res[ok]
             cs = cell[s:s + step]
             starts = np.r_[0, np.flatnonzero(np.diff(cs)) + 1]
-            Y[:, cs[starts]] += np.add.reduceat(X * w[None, :], starts, axis=1)
-            if p_rank:
-                B[:, cs[starts]] += np.add.reduceat(Bx * w[None, :], starts, axis=1)
-            q += np.bincount(cs, weights=a2, minlength=nc)
+            for a in range(k1):
+                w = d[:, a] * inv                               # a_j / sd_j, applied to unscaled adjusted genotypes
+                Y[:, a * nc + cs[starts]] += np.add.reduceat(X * w[None, :], starts, axis=1)
+                if p_rank:
+                    B[:, a * nc + cs[starts]] += np.add.reduceat(Bx * w[None, :], starts, axis=1)
+                for b in range(a, k1):
+                    qq = np.bincount(cs, weights=d[:, a] * d[:, b] * inv, minlength=nc)
+                    q[:, a, b] += qq
+                    if b != a:
+                        q[:, b, a] += qq
         U = Y - C @ B if p_rank else Y
         S = mp.tn(U, U) / df_res
         for lag in range(1, min(L, nc - 1) + 1):
-            num[lag] += float(np.trace(S, offset=lag))
-            den[lag] += float(q[:-lag] @ q[lag:])
-        T.append(U.sum(axis=1))
-        Q.append(float(q.sum()))
+            for a in range(k1):
+                for b in range(k1):
+                    num[lag, a, b] += float(np.trace(S[a * nc:(a + 1) * nc, b * nc:(b + 1) * nc], offset=lag))
+            den[lag] += np.einsum("iau,ibv->abuv", q[:-lag], q[lag:])
+        T.append(U.reshape(N, k1, nc).sum(axis=2))
+        Qtot.append(q.sum(axis=0))
         log(f"[admixed-ld] curve chr{c}: {ix.size} SNPs, {nc} cells ({time.perf_counter() - t0:.0f} s)")
-    T = np.column_stack(T)
-    Qv = np.asarray(Q)
-    inter_num = float(np.sum(T.sum(axis=1) ** 2 - np.sum(T * T, axis=1)) / df_res)
-    inter_den = float(Qv.sum() ** 2 - np.sum(Qv * Qv))
-    d = np.arange(1, L + 1) * cell_cm
-    with np.errstate(divide="ignore", invalid="ignore"):
-        k = num[1:] / den[1:]
-    curve = pd.DataFrame({"d_cm": d, "numerator": num[1:], "denominator": den[1:], "kernel": k})
-    curve = curve[curve.denominator > 0]
-    fit = fit_exponential(curve.d_cm, curve.kernel, 2.0, 20.0)
-    theta = (theta_num + theta_c) / theta_den
-    info = dict(format="summit-admixed-ld-curve", version=1, sources=list(sources), n_samples=int(N),
-                n_snps=int(t_idx.size), covariate_rank=int(p_rank), cell_cm=float(cell_cm), max_cm=float(max_cm),
-                inter_numerator=inter_num, inter_denominator=inter_den,
-                inter_kernel=(inter_num / inter_den if inter_den > 0 else float("nan")),
-                fit_2_to_20cm=fit, theta=moments_from_values(theta),
+    T = np.stack(T, axis=2)                                    # N x k1 x chromosomes
+    Qtot = np.stack(Qtot)                                      # chromosomes x k1 x k1
+    Ts = T.sum(axis=2)
+    inter_num = (Ts.T @ Ts - np.einsum("iac,ibc->ab", T, T)) / df_res
+    qs = Qtot.sum(axis=0)
+    inter_den = np.einsum("au,bv->abuv", qs, qs) - np.einsum("cau,cbv->abuv", Qtot, Qtot)
+    inter = _solve_kernel(inter_num, inter_den)
+    dist = np.arange(1, L + 1) * cell_cm
+    kern = np.full((L, k1, k1), np.nan)
+    pos = np.array([den[lag].reshape(k1 * k1, -1).any() for lag in range(1, L + 1)])
+    for i in np.flatnonzero(pos):
+        kern[i] = _solve_kernel(num[i + 1], den[i + 1])
+    keep_rows = pos & np.isfinite(kern).all(axis=(1, 2))
+    from .model import contrast_pairs, full_from_contrasts, moments_from_vectors
+    if k1 == 1:                                                # the two-source layout, unchanged
+        curve = pd.DataFrame({"d_cm": dist, "numerator": num[1:, 0, 0], "denominator": den[1:, 0, 0, 0, 0],
+                              "kernel": kern[:, 0, 0]})
+        curve = curve[curve.denominator > 0]
+    else:
+        curve = pd.DataFrame({"d_cm": dist})
+        for a, b in contrast_pairs(k1):
+            curve[f"kernel_{sources[a]}_{sources[b]}"] = kern[:, a, b]
+        curve = curve[keep_rows]
+    kfull = full_from_contrasts(kern[keep_rows])                # K x K covariance of local-ancestry dosages
+    fits = {s: fit_exponential(dist[keep_rows], kfull[:, i, i], 2.0, 20.0) for i, s in enumerate(sources)}
+    U_th = (th_num + th_c[None, :]) @ np.linalg.inv(th_den)    # people x k1: ancestries of the non-baseline sources
+    info = dict(format="summit-admixed-ld-curve", version=1, sources=list(sources), baseline=sources[-1],
+                n_samples=int(N), n_snps=int(t_idx.size), covariate_rank=int(p_rank), cell_cm=float(cell_cm),
+                max_cm=float(max_cm), inter_matrix=inter.tolist(), fit_per_source=fits,
+                theta=moments_from_vectors(U_th),
                 reference=dict(sources=ref.manifest["sources"], window_kb=ref.manifest["window_kb"],
                                genetic_map=ref.manifest["genetic_map"]))
+    if k1 == 1:
+        info.update(inter_numerator=float(inter_num[0, 0]), inter_denominator=float(inter_den[0, 0, 0, 0]),
+                    inter_kernel=float(inter[0, 0]), fit_2_to_20cm=fit_exponential(curve.d_cm, curve.kernel, 2.0, 20.0))
     if rel is not None:
         info["relatedness"] = dict(**rel.summary(), kinship_col=kinship_col, kinship_min=kinship_min, closure=closure,
                                    definition="relatedness of the covariate-adjusted, standardized genotypes")
@@ -215,8 +241,24 @@ def genotype_curve(geno, ref_path, out, *, sources=None, covar=None, keep=None, 
         json.dump(info, f, indent=1)
     blocks.close()
     mp.drain()
-    log(f"[admixed-ld] curve: kernel at 2 cM {np.interp(2.0, curve.d_cm, curve.kernel):.4f}, between chromosomes "
-        f"{info['inter_kernel']:.5f}, decay {fit['lam']:.4f} per cM (2-20 cM); mean ancestry {info['theta']['mean']:.3f} "
-        f"(SD {np.sqrt(info['theta']['var']):.3f}). Wrote {out}.curve.tsv and {out}.curve.json "
-        f"({time.perf_counter() - t0:.0f} s)")
+    mean_th = np.asarray(info["theta"]["mean_vector"])
+    log(f"[admixed-ld] curve: between chromosomes " + np.array2string(inter, precision=5).replace("\n", "")
+        + "; decay per cM (2-20 cM) " + ", ".join(f"{s} {fits[s]['lam']:.4f}" for s in sources)
+        + "; mean ancestry " + ", ".join(f"{s} {x:.3f}" for s, x in zip(sources[:-1], mean_th))
+        + f". Wrote {out}.curve.tsv and {out}.curve.json ({time.perf_counter() - t0:.0f} s)")
     return curve, info
+
+
+def _solve_kernel(num, den):
+    """Unique entries of the symmetric Kt from num[a, b] = sum_{u,v} Kt_uv den[a, b, u, v] (least squares)."""
+    k1 = num.shape[0]
+    if k1 == 1:
+        return np.array([[num[0, 0] / den[0, 0, 0, 0]]]) if den[0, 0, 0, 0] > 0 else np.full((1, 1), np.nan)
+    from .model import contrast_pairs
+    pairs = contrast_pairs(k1)
+    A = np.column_stack([den[:, :, u, v].ravel() + (den[:, :, v, u].ravel() if u != v else 0.0) for u, v in pairs])
+    sol, *_ = np.linalg.lstsq(A, num.ravel(), rcond=None)
+    out = np.zeros((k1, k1))
+    for (u, v), x in zip(pairs, sol):
+        out[u, v] = out[v, u] = x
+    return out

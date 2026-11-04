@@ -51,7 +51,8 @@ def main(argv=None):
     c.add_argument("--ref", required=True, help="resource written by `summit admixed-ld reference`")
     c.add_argument("--covar", default=None, help="the GWAS covariates (FID IID ...), as for the LD-score step")
     c.add_argument("--keep", default=None, help="samples to use (FID IID or IID per line)")
-    c.add_argument("--sources", default=None, help="two source names of the reference (default: its first two)")
+    c.add_argument("--sources", default=None,
+                   help="two or more source names of the reference (default: its first two); the last is the baseline")
     c.add_argument("--match", choices=["position", "id"], default="position")
     c.add_argument("--cell-cm", type=float, default=0.25, help="cell width in cM (default 0.25)")
     c.add_argument("--max-cm", type=float, default=None,
@@ -76,16 +77,20 @@ def main(argv=None):
     m.add_argument("--snps", default=None,
                    help="variant table of the GWAS (BIM, PVAR, or CHR BP SNP A1 A2) if the summary statistics lack "
                         "CHR and BP")
-    m.add_argument("--sources", default=None, help="two source names (default: the reference's first two); the mean "
-                                                   "ancestry is that of the first")
+    m.add_argument("--sources", default=None,
+                   help="two or more source names (default: the reference's first two); the last is the baseline of "
+                        "the contrasts")
     m.add_argument("--match", choices=["position", "id"], default="position")
     g = m.add_mutually_exclusive_group(required=True)
     g.add_argument("--curve", default=None, help="prefix of the cohort's curve (`summit admixed-ld curve`)")
     g.add_argument("--admixture-generations", type=float, default=None,
                    help="generations since admixture (e.g. a published date); decay = generations / 100 per cM")
     g.add_argument("--decay-per-cm", type=float, default=None, help="decay rate of kappa per cM")
-    m.add_argument("--mean-ancestry", type=float, default=None, help="override the mean ancestry from the SEs")
-    m.add_argument("--kappa0", type=float, default=None, help="override kappa_res(0) from the SEs")
+    m.add_argument("--mean-ancestry", default=None,
+                   help="override the mean ancestry from the SEs: K-1 or K comma-separated values in source order")
+    m.add_argument("--kappa0", default=None,
+                   help="override kappa_res(0) from the SEs: one value for two sources, otherwise the upper triangle "
+                        "of the contrast matrix, row by row")
     m.add_argument("--ancestry-sd", type=float, default=None,
                    help="SD of global ancestry for the same-person term (default: the curve's, else 0.12)")
     m.add_argument("--relatedness", default=None,

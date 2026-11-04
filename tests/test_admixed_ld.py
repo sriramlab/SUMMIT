@@ -231,3 +231,59 @@ def test_kernel_forms():
     assert kc(10.0) == pytest.approx(0.18 * np.exp(-0.7) - 0.001, rel=1e-6)
     assert kc(100.0) == pytest.approx(-0.001)
     assert kc.lam == pytest.approx(0.07, rel=0.05)
+
+
+@pytest.fixture(scope="module")
+def sim3(tmp_path_factory):
+    from admixed_ld_sim import simulate_k
+    d = tmp_path_factory.mktemp("admixed_ld_k3")
+    S = simulate_k(seed=4)
+    v = S["variants"]
+    names = ["S0", "S1", "S2"]
+    for nm, G in zip(names, S["panels"]):
+        write_bed(str(d / f"panel{nm}"), G, v, nm)
+    iid = write_bed(str(d / "cohort"), S["cohort"], v, "c")
+    # as many PCs as ancestry axes: in a three-chromosome genome further PCs take up chromosome-level ancestry
+    C = principal_components(S["cohort"], 2)
+    pd.DataFrame({"FID": iid, "IID": iid, **{f"PC{k + 1}": C[:, k] for k in range(2)}}).to_csv(
+        d / "cohort.cov", sep="\t", index=False)
+    rng = np.random.default_rng(6)
+    os.makedirs(d / "ss")
+    for t in range(3):
+        y = rng.standard_normal(S["cohort"].shape[0])
+        beta, se = gwas(S["cohort"], y, C)
+        ok = np.isfinite(beta)
+        pd.DataFrame({"SNP": v.SNP, "CHR": v.CHR, "BP": v.BP, "A1": v.A1, "A2": v.A2, "N": len(y), "BETA": beta,
+                      "SE": se, "COV_RANK": 2})[ok].to_csv(d / "ss" / f"trait{t}.tsv", sep="\t", index=False)
+    p = S["cohort"].mean(0) / 2
+    cls = (np.minimum(p, 1 - p) >= 0.2).astype(int)
+    pd.DataFrame({"SNP": v.SNP, "low": (cls == 0).astype(int), "high": (cls == 1).astype(int)}).to_csv(
+        d / "annot.tsv", sep="\t", index=False)
+    build_reference([str(d / f"panel{nm}") for nm in names], names, str(d / "ref"), window_kb=3000, step=256,
+                    log=lambda *a: None)
+    return dict(dir=d, S=S, C=C, cls=cls, names=names)
+
+
+def test_three_sources_compose_matches_insample(sim3):
+    """Three sources: the curve recovers the ancestry vector and the decay, the standard errors the mean ancestry, and
+    the composed LD scores match exact in-sample LD scores."""
+    from summit.admixed_ld.compose import compose_ldscores
+    from summit.admixed_ld.curve import genotype_curve
+    d, S, names = sim3["dir"], sim3["S"], sim3["names"]
+    _, info = genotype_curve(str(d / "cohort"), str(d / "ref"), str(d / "cohort"), sources=names,
+                             covar=str(d / "cohort.cov"), cell_cm=0.5, log=lambda *a: None)
+    np.testing.assert_allclose(info["theta"]["mean_vector"], S["theta"].mean(0)[:2], atol=0.03)
+    for s in names:
+        assert abs(info["fit_per_source"][s]["lam"] / (S["generations"] / 100) - 1) < 0.5
+    out = str(d / "composed3")
+    params = compose_ldscores(str(d / "ref"), [str(d / "ss")], str(d / "annot.tsv"), out, sources=names,
+                              curve=str(d / "cohort"), log=lambda *a: None)
+    np.testing.assert_allclose(params["mean_ancestry_vector"], S["m"], atol=0.05)
+    got = pd.read_csv(out + ".gw.ldscore.gz", sep="\t")
+    keep = S["variants"].SNP.isin(got.SNP).to_numpy()
+    L_in, V_in = insample_ldscores(S["cohort"][:, keep], sim3["C"], sim3["cls"][keep], 2)
+    L_c = got[["low", "high"]].to_numpy()
+    mass_in = float((V_in[:, None] * L_in).sum())
+    mass_c = float((got.V.to_numpy()[:, None] * L_c).sum())
+    assert abs(mass_c / mass_in - 1) < 0.03, (mass_c, mass_in)
+    assert np.corrcoef(L_c.sum(1), L_in.sum(1))[0, 1] > 0.95

@@ -170,3 +170,231 @@ def beta_moments(mean, sd) -> dict:
     m3 = 2 * (b - a) * np.sqrt(a + b + 1) / ((a + b + 2) * np.sqrt(a * b)) * v ** 1.5
     ex = 6 * ((a - b) ** 2 * (a + b + 1) - a * b * (a + b + 2)) / (a * b * (a + b + 2) * (a + b + 3))
     return dict(mean=float(mean), var=v, m3=float(m3), m4=float((ex + 3) * v * v))
+
+
+# ===================================================================================================== K sources
+# With sources s = 0..K-1 and the last as baseline B, the contrasts D_ja = p^a_j - p^B_j (a < B) carry the admixture
+# terms: the covariance of local-ancestry dosages enters as D_j' Kt(d) D_k with Kt the (K-1) x (K-1) block of the K x K
+# matrix (whose rows sum to zero). Two sources give the scalar model above (D = delta, Kt = kappa).
+def contrast_pairs(k1):
+    """Unique contrast pairs (a, b), a <= b."""
+    return [(a, b) for a in range(k1) for b in range(a, k1)]
+
+
+def unbiased_products(D, var_c, var_base):
+    """O[j, a, b] = D_ja D_jb without the panels' sampling covariance, Cov(e_a - e_B, e_b - e_B) = 1[a=b] var_a + var_B
+    with var = Var(dosage) / 4n. D: M x (K-1); var_c: M x (K-1); var_base: M."""
+    O = D[:, :, None] * D[:, None, :] - np.asarray(var_base, np.float64)[:, None, None]
+    idx = np.arange(D.shape[1])
+    O[:, idx, idx] -= var_c
+    return O
+
+
+def regress_standard_errors_k(n, se, beta, V, O, *, max_chisq=80.0):
+    """Mean ancestry vector m (K) and Kt_res(0) ((K-1) x (K-1)) from one GWAS: 1 / (N SE^2 + beta^2) on the source
+    dosage variances V (M x K) and the unique products O_ab (off-diagonal ones counted twice), without an intercept,
+    with the same exclusions as regress_standard_errors. Two sources reproduce it exactly."""
+    n, se, beta = (np.asarray(x, np.float64) for x in (n, se, beta))
+    V, O = np.asarray(V, np.float64), np.asarray(O, np.float64)
+    K, k1 = V.shape[1], O.shape[1]
+    pairs = contrast_pairs(k1)
+    X = np.column_stack([V] + [O[:, a, b] * (1.0 if a == b else 2.0) for a, b in pairs])
+    with np.errstate(divide="ignore", invalid="ignore"):
+        z2 = (beta / se) ** 2
+        y = 1.0 / (n * se * se + beta * beta)
+    use = np.isfinite(y) & np.isfinite(z2) & (z2 < max_chisq) & (V.sum(axis=1) > 0) & np.isfinite(X).all(axis=1)
+    for it in range(2):
+        b, *_ = np.linalg.lstsq(X[use], y[use], rcond=None)
+        if it == 0:
+            r = y - X @ b
+            mad = np.median(np.abs(r[use] - np.median(r[use]))) * 1.4826
+            use &= np.abs(r) < 8 * max(mad, np.finfo(float).tiny)
+    fit = X[use] @ b
+    r2 = 1.0 - np.sum((y[use] - fit) ** 2) / np.sum((y[use] - y[use].mean()) ** 2)
+    s = b[:K].sum()
+    kt = np.zeros((k1, k1))
+    for (a, c), v in zip(pairs, b[K:]):
+        kt[a, c] = kt[c, a] = v / s
+    return dict(m=(b[:K] / s).tolist(), kappa0=kt.tolist(), n_snps=int(use.sum()), fit_r2=float(r2))
+
+
+def parameters_from_sumstats_k(tables, V, O, names, log=print):
+    """Medians over traits of m (renormalized to sum to one) and of each entry of Kt_res(0)."""
+    rows = []
+    for name, t in tables:
+        r = regress_standard_errors_k(t["N"], t["SE"], t["BETA"], V, O)
+        r["trait"] = name
+        rows.append(r)
+        log(f"[admixed-ld] standard errors of {name}: m = " + ", ".join(f"{s} {x:.4f}" for s, x in zip(names, r["m"]))
+            + "; kappa_res(0) = " + np.array2string(np.asarray(r["kappa0"]), precision=4).replace("\n", "")
+            + f" ({r['n_snps']} SNPs, R2 {r['fit_r2']:.4f})")
+    m = np.median(np.array([r["m"] for r in rows]), axis=0)
+    m = m / m.sum()
+    kt = np.median(np.array([r["kappa0"] for r in rows]), axis=0)
+    if np.any(m <= 0) or np.any(m >= 1) or np.any(np.diag(kt) < 0):
+        raise ValueError(f"The standard errors give mean ancestry {np.round(m, 4)} and kappa_res(0) diagonal "
+                         f"{np.round(np.diag(kt), 4)}, outside the model. Check that the reference sources match the "
+                         "cohort, or pass --mean-ancestry and --kappa0.")
+    return m, kt, pd.DataFrame(rows)
+
+
+def full_from_contrasts(kt):
+    """The K x K local-ancestry covariance (rows summing to zero) from its (K-1) x (K-1) contrast block (any leading
+    shape)."""
+    kt = np.asarray(kt, np.float64)
+    k1 = kt.shape[-1]
+    out = np.zeros(kt.shape[:-2] + (k1 + 1, k1 + 1))
+    out[..., :k1, :k1] = kt
+    out[..., :k1, k1] = -kt.sum(axis=-1)
+    out[..., k1, :k1] = -kt.sum(axis=-2)
+    out[..., k1, k1] = kt.sum(axis=(-1, -2))
+    return out
+
+
+class _Entry:
+    """One entry of the kernel matrix as a function of distance (cM): the smoothed curve beyond d0, joined below d0 to
+    kappa_res(0), and the between-chromosome value beyond the curve; or far + (k0 - far) exp(-lam d) from a date."""
+
+    def __init__(self, k0, far, lam=None, d=None, k=None, d0=2.0, diagonal=True):
+        self.k0, self.far, self.lam, self.d, self.k, self.d0 = float(k0), float(far), lam, d, k, d0
+        self.mode, self.lam_short, self.note = "decay", 0.0, ""
+        if d is not None:
+            kd0 = float(np.interp(d0, d, k))
+            if diagonal and not kd0 > 0.0:
+                raise ValueError(f"The curve at {d0} cM is {kd0:.4g}; a positive value is needed to join it to "
+                                 "kappa_res(0). Check that the curve comes from this cohort and reference.")
+            self.kd0 = kd0
+            if self.k0 > 0 and 0 < kd0 < self.k0:
+                self.mode, self.lam_short = "exp", float(-np.log(kd0 / self.k0) / d0)
+            elif self.k0 > 0 and kd0 >= self.k0:
+                self.mode = "flat"
+                self.note = (f"curve at {d0} cM ({kd0:.4g}) is not below kappa_res(0) ({self.k0:.4g}); "
+                             "kappa is held at the curve value below it")
+            else:
+                self.mode = "linear"
+
+    def __call__(self, dist):
+        if self.d is None:
+            return self.far + (self.k0 - self.far) * np.exp(-self.lam * dist)
+        out = np.interp(dist, self.d, self.k)
+        if self.mode == "exp":
+            short = self.k0 * np.exp(-self.lam_short * dist)
+        elif self.mode == "flat":
+            short = np.full_like(dist, self.kd0)
+        else:
+            short = self.k0 + (self.kd0 - self.k0) * dist / self.d0
+        out = np.where(dist < self.d0, short, out)
+        return np.where(dist > self.d[-1], self.far, out)
+
+
+class KernelMatrix:
+    """Kt_res(d) of the K-1 contrasts ((K-1) x (K-1), symmetric) and the per-source decay rates lam (K) of the
+    recombination factor exp(-lam_s d) on within-source LD. For two sources this is the scalar Kernel."""
+
+    def __init__(self, kappa0, far, lam, source, entries, note="", d=None):
+        self.kappa0, self.far = np.atleast_2d(kappa0).astype(float), np.atleast_2d(far).astype(float)
+        self.lam = np.atleast_1d(np.asarray(lam, float))
+        self.source, self.entries, self.note, self.d = source, entries, note, d
+        self.k1 = self.kappa0.shape[0]
+
+    @classmethod
+    def from_curve(cls, d, k, inter, kappa0, lam, *, half_width=0.75, rel_width=0.1, d0=2.0):
+        """d (n_d), k (n_d x k1 x k1) curve, inter (k1 x k1) between-chromosome values, kappa0 from the SEs, lam (K)."""
+        d = np.asarray(d, np.float64)
+        k = np.asarray(k, np.float64).reshape(d.size, *np.atleast_2d(kappa0).shape)
+        kappa0, inter = np.atleast_2d(kappa0), np.atleast_2d(inter)
+        k1 = kappa0.shape[0]
+        entries, notes = {}, []
+        for a, b in contrast_pairs(k1):
+            ks = smooth_curve(d, k[:, a, b], half_width=half_width, rel_width=rel_width)
+            e = _Entry(kappa0[a, b], inter[a, b], d=d, k=ks, d0=d0, diagonal=(a == b))
+            entries[(a, b)] = e
+            if e.note:
+                notes.append(e.note)
+        return cls(kappa0, inter, lam, "genotype curve", entries, note="; ".join(notes), d=d)
+
+    @classmethod
+    def from_decay(cls, kappa0, lam, genome_cm, n_sources, source):
+        if not lam > 0:
+            raise ValueError("The decay rate must be positive.")
+        kappa0 = np.atleast_2d(kappa0)
+        far = -2.0 * kappa0 / (lam * genome_cm)
+        entries = {(a, b): _Entry(kappa0[a, b], far[a, b], lam=float(lam)) for a, b in contrast_pairs(kappa0.shape[0])}
+        return cls(kappa0, far, np.full(n_sources, float(lam)), source, entries)
+
+    def __call__(self, dist):
+        """Kt(d) with shape dist.shape + (k1, k1)."""
+        dist = np.asarray(dist, np.float64)
+        out = np.empty(dist.shape + (self.k1, self.k1))
+        for (a, b), e in self.entries.items():
+            v = e(dist)
+            out[..., a, b] = v
+            out[..., b, a] = v
+        return out
+
+    def entry(self, a, b, dist):
+        return self.entries[(min(a, b), max(a, b))](np.asarray(dist, np.float64))
+
+    def describe(self):
+        return dict(source=self.source, kappa0=self.kappa0.tolist(), far=self.far.tolist(),
+                    decay_per_cm=self.lam.tolist(), curve_points=None if self.d is None else int(self.d.size),
+                    note=self.note)
+
+
+def moments_from_vectors(U) -> dict:
+    """Central moments of ancestry vectors U (people x k1): mean, cov, third and fourth moment tensors; for k1 = 1 also
+    the scalar keys of moments_from_values."""
+    U = np.atleast_2d(np.asarray(U, np.float64))
+    if U.shape[0] == 1 and U.shape[1] > 1:
+        U = U.T
+    W = U - U.mean(axis=0)
+    n = W.shape[0]
+    out = dict(mean_vector=U.mean(axis=0).tolist(), cov=(W.T @ W / n).tolist(),
+               m3_tensor=np.einsum("ia,ib,ic->abc", W, W, W, optimize=True).__truediv__(n).tolist(),
+               m4_tensor=np.einsum("ia,ib,ic,id->abcd", W, W, W, W, optimize=True).__truediv__(n).tolist())
+    if U.shape[1] == 1:
+        out.update(moments_from_values(U[:, 0]))
+    return out
+
+
+def moments_tensors(th, k1):
+    """(mean (k1), cov (k1 x k1), m3 (k1^3), m4 (k1^4)) from a moments dict (vector keys, or scalar keys when k1 = 1)."""
+    if "cov" in th:
+        return (np.asarray(th["mean_vector"]), np.asarray(th["cov"]), np.asarray(th["m3_tensor"]),
+                np.asarray(th["m4_tensor"]))
+    if k1 != 1:
+        raise ValueError("Vector moments of global ancestry are needed for more than two sources.")
+    return (np.array([th["mean"]]), np.array([[th["var"]]]), np.array([[[th["m3"]]]]), np.array([[[[th["m4"]]]]]))
+
+
+def dirichlet_moments(m, sd_first, draws=400_000, seed=0) -> dict:
+    """Moments of the first K-1 ancestries under Dirichlet(c m), with c set so that the first ancestry has SD sd_first
+    (two sources: the Beta moments, in closed form)."""
+    m = np.asarray(m, np.float64)
+    if m.size == 2:
+        return beta_moments(float(m[0]), sd_first)
+    c = m[0] * (1 - m[0]) / sd_first ** 2 - 1.0
+    if not c > 0:
+        raise ValueError("The SD of global ancestry is too large for its mean.")
+    U = np.random.default_rng(seed).dirichlet(c * m, size=draws)[:, :-1]
+    return moments_from_vectors(U)
+
+
+def same_person_term(beta, O, s2, cres, cls, n_classes, mom, nu):
+    """(1 / nu) sum_{k in c} Cov(h_j, h_k) / (cres_j s2_k) for K sources, with h(theta) = 2 p (1 - p) quadratic in the
+    ancestry contrasts w: h_j = h_j(mean) + beta_j' w - 2 (D_j' w)^2. beta: M x k1; O: M x k1 x k1 (unbiased products);
+    mom = (mean, cov, m3, m4). Two sources reproduce the scalar formula."""
+    _, S, M3, M4 = mom
+    k1 = beta.shape[1]
+    B = np.zeros((n_classes, k1))
+    G = np.zeros((n_classes, k1, k1))
+    for a in range(k1):
+        B[:, a] = np.bincount(cls, weights=beta[:, a] / s2, minlength=n_classes)
+        for b in range(k1):
+            G[:, a, b] = np.bincount(cls, weights=O[:, a, b] / s2, minlength=n_classes)
+    C4 = M4 - np.einsum("ab,cd->abcd", S, S)
+    t1 = np.einsum("ja,ab,cb->jc", beta, S, B)
+    t2 = -2.0 * np.einsum("ja,abe,cbe->jc", beta, M3, G)
+    t3 = -2.0 * np.einsum("jab,abe,ce->jc", O, M3, B)
+    t4 = 4.0 * np.einsum("jab,abef,cef->jc", O, C4, G)
+    return (t1 + t2 + t3 + t4) / (nu * cres)[:, None]
