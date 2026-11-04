@@ -7,7 +7,9 @@ the second sum being the part of the in-sample score from each person's pairing 
 noise correction leaves when heterozygosity follows ancestry. With s_k^2 = C(k,k) and C_res the covariance after the
 covariates, it is computed as:
   pairs within the reference window   pi_A(d) C^A + pi_E(d) C^E + delta_j delta_k kappa(d), squared, with each squared
-                                      panel covariance replaced by its unbiased estimate (order-4 U-statistic);
+                                      panel covariance replaced by its unbiased estimate (order-4 U-statistic) and
+                                      the sampling covariance of a source derived by inversion with the known panels
+                                      it was computed from removed once (Reference.covariance_noise_mix);
   every pair on the same chromosome   delta_j^2 delta_k^2 kappa(d)^2, by FFT convolution on a grid of `grid_cm`
                                       (the window pairs' admixture-only part is taken out of the first sum);
   pairs on different chromosomes      delta_j^2 delta_k^2 far^2;
@@ -84,6 +86,19 @@ def unbiased_squared_covariance(c, m22, vv, n):
     (the first-order correction c^2 - (m22 - c^2)/n leaves a bias of about 4/n of the noise)."""
     n = float(n)
     return ((n - 1.0) ** 2 * (n - 2.0) * c * c - n * n * m22 + (n - 1.0) * vv) / (n * (n - 2.0) * (n - 3.0))
+
+
+def window_noise(pis, vns, cross, d):
+    """Sampling variance of a composed window covariance sum_s pi_s(d) c_s: sum_s pi_s^2 Var(c_s), plus twice the
+    covariance of the errors of a source n derived by inversion and of each known panel t it was computed from,
+    pi_n pi_t Cov(e_n, e_t) = -pi_n pi_t (pi^a_t / pi^a_n) Var(e_t), with the anchor cohort's pi^a(d) = m^a exp(-lam^a d).
+    pis, vns: per source, pi_s(d) and Var(c_s) over the pairs; cross: (n, t, m^a_n, lam^a_n, m^a_t, lam^a_t) tuples."""
+    noise = np.zeros_like(np.asarray(d, np.float64))
+    for p_, v_ in zip(pis, vns):
+        noise += p_ * p_ * v_
+    for n_, t, ma_n, la_n, ma_t, la_t in cross:
+        noise -= 2.0 * pis[n_] * pis[t] * (ma_t / ma_n) * np.exp(-(la_t - la_n) * d) * vns[t]
+    return noise
 
 
 def _fft_conv_sym(W: np.ndarray, kern: np.ndarray) -> np.ndarray:
@@ -343,6 +358,23 @@ def compose_ldscores(ref_path, sumstats, annot, out, *, sources=None, snps=None,
     W_tot = np.stack([np.bincount(cls, weights=Wn[:, u], minlength=K) for u in range(k2)])   # k2 x K
     uu = [(a, c) for a in range(k1) for c in range(k1)]
     far_F = np.array([[kern.far[a, b] * kern.far[c, e] for (b, e) in uu] for (a, c) in uu])  # F_uv(inf)
+    # a source derived by inversion carries minus the known panels' covariance errors (Reference.covariance_noise_mix):
+    # with the anchor cohort's pi^a, Cov(e_N, e_t) = -pi^a_t(d) Var(e_t) / pi^a_N(d), so the composed covariance's
+    # noise variance has the cross term -2 pi_N(d) pi_t(d) pi^a_t(d) / pi^a_N(d) Var(e_t) for every known panel t that
+    # is also composed. Without it the panels' noise is removed twice (once in covvar_N, once in their own terms).
+    cross = []                                                     # (n, t, m^a_n, lam^a_n, m^a_t, lam^a_t)
+    for n_, s in enumerate(sources):
+        mix = ref.covariance_noise_mix(s)
+        if mix is None:
+            continue
+        (ma_n, la_n), others = mix
+        for t, (ma_t, la_t) in others.items():
+            if t in sources:
+                cross.append((n_, sources.index(t), ma_n, la_n, ma_t, la_t))
+    if cross:
+        log("[admixed-ld] compose: window covariances of " + ", ".join(sorted({sources[x[0]] for x in cross}))
+            + " were derived by inversion; their covariance with the errors of "
+            + ", ".join(sorted({sources[x[1]] for x in cross})) + " is removed once")
     n_pairs = 0
     for c in ref.chromosomes:
         sel = np.flatnonzero(chrom_out == c)
@@ -378,7 +410,7 @@ def compose_ldscores(ref_path, sumstats, annot, out, *, sources=None, snps=None,
                     Kd = kern(d)                                    # pairs x k1 x k1
                     adm = np.einsum("pa,pab,pb->p", Dm[j], Kd, Dm[k])
                     cr = adm.copy()
-                    noise = np.zeros_like(adm)
+                    pis, vnss = [None] * nK, [None] * nK
                     for s in range(nK):
                         cs_ = cov[s][s0:s1][use].astype(np.float64)
                         pi_s = m_vec[s] * np.exp(-kern.lam[s] * d)
@@ -389,7 +421,8 @@ def compose_ldscores(ref_path, sumstats, annot, out, *, sources=None, snps=None,
                             vns = cs_ * cs_ - unbiased_squared_covariance(cs_, m22[s][s0:s1][use],
                                                                           vr[s][jl] * vr[s][kl], ns[s])
                         cr += pi_s * cs_
-                        noise += pi_s * pi_s * vns
+                        pis[s], vnss[s] = pi_s, vns
+                    noise = window_noise(pis, vnss, cross, d)
                     sq = cr * cr - noise - adm * adm
                     L += np.bincount(j * K + cls[k], weights=sq / (cres[j] * s2[k]), minlength=M * K).reshape(M, K)
                     L += np.bincount(k * K + cls[j], weights=sq / (cres[k] * s2[j]), minlength=M * K).reshape(M, K)
@@ -443,6 +476,7 @@ def compose_ldscores(ref_path, sumstats, annot, out, *, sources=None, snps=None,
                   mean_ancestry_from_se=np.asarray(m_se).tolist(), kappa0_from_se=np.asarray(k_se).tolist(),
                   gwas_n=N, covariate_rank=p, nu=nu, kernel=kern.describe(), theta=th, theta_source=th_source,
                   relatedness=rel_sum, r2=r2, grid_cm=grid_cm, cell_matrix=cells_used,
+                  derived_covariance_cross_noise=[dict(source=sources[x[0]], panel=sources[x[1]]) for x in cross],
                   reference=dict(sources=ref.manifest["sources"], window_kb=ref.manifest["window_kb"],
                                  genetic_map=ref.manifest["genetic_map"]),
                   per_trait=None if per_trait is None else per_trait.to_dict(orient="records"),

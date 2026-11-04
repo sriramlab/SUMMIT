@@ -13,7 +13,10 @@ missing source, the command estimates:
    with pi_s(d) = m_s exp(-lam_s d), Kt(d) and the decays from the cohort's curve on a provisional reference, and m and
    Kt_res(0) from the regression of the cohort's adjusted genotype variances on the source variances and contrasts.
    The sampling variance of each derived covariance, [Var(C_res) + sum_s pi_s^2 Var(C^s)] / pi_N^2, is stored with it
-   (covvar) and replaces the panel moments when `compose` removes sampling noise from squares.
+   (covvar) and replaces the panel moments when `compose` removes sampling noise from squares. Its error contains
+   -pi_s / pi_N times each known panel's error, and the same panels enter the composition again, so `compose` also
+   subtracts their covariance (the manifest's covariance_noise; Reference.covariance_noise_mix); otherwise the known
+   panels' noise would be removed twice.
 
 The output is a reference with the known sources and the derived one, restricted to the cohort's matched SNPs, for
 `curve` and `compose` of any cohort with these sources. It holds only aggregates: frequencies, covariances and their
@@ -505,7 +508,13 @@ def derive_source(geno, ref_path, out, *, name, known=None, panel=None, covar=No
     info = mp.drain()
     blocks.close()
     if ld == "inversion":
-        src_meta[-1].update(m_anchor=m_vec.tolist(), kappa0_anchor=np.asarray(k0).tolist(), decay_anchor=lam.tolist())
+        src_meta[-1].update(m_anchor=m_vec.tolist(), kappa0_anchor=np.asarray(k0).tolist(), decay_anchor=lam.tolist(),
+                            covariance_noise=dict(
+                                pi=[float(m_vec[-1]), float(lam[-1])],
+                                mix={s: [float(m_vec[n_]), float(lam[n_])] for n_, s in enumerate(known)},
+                                note="covvar is the full variance of the derived covariance; its error carries "
+                                     "-pi_t(d) / pi_N(d) times each known panel's (pi from these m, decay), which "
+                                     "compose counts once through their covariance"))
     if fixed_rows is not None:
         pb.close()
     manifest = write_manifest(out, src_meta, window_kb=ref.manifest["window_kb"], genetic_map=ref.manifest["genetic_map"],

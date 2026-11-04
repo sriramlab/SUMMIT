@@ -225,6 +225,27 @@ class Reference:
                     V[:, i] = np.where(np.isfinite(fv), 4.0 * n[i] * fv, V[:, i])
         return V, n, G, cols
 
+    def covariance_noise_mix(self, name: str):
+        """For a source whose window covariances were derived by inverting a cohort's composition (`derive`, LD by
+        inversion): C^N = [C_res - sum_t pi_t(d) C^t - adm] / pi_N(d) with the anchor cohort's pi_t(d) =
+        m_t exp(-lam_t d), so its sampling error carries -pi_t(d) / pi_N(d) times the error of each known panel t, and
+        Cov(e_N, e_t) = -pi_t(d) Var(e_t) / pi_N(d). Returns ((m_N, lam_N), {t: (m_t, lam_t)}) of the anchor cohort, or
+        None for a panel or a source whose covariances are independent of the known panels' (anchor-panel LD, masked
+        admixed haplotypes). References written before the mix was recorded explicitly (no `covariance_noise` key)
+        are read from m_anchor and decay_anchor, which derive aligns with the reference's sources."""
+        src = self.manifest["sources"][self.source_index(name)]
+        cn = src.get("covariance_noise")
+        if cn is not None:
+            own = tuple(float(x) for x in cn["pi"])
+            return own, {t: tuple(float(x) for x in v) for t, v in cn["mix"].items()}
+        if not src.get("derived") or src.get("ld", "inversion") != "inversion" or "m_anchor" not in src:
+            return None
+        names = [x["name"] for x in self.manifest["sources"]]
+        m, lam = src["m_anchor"], src["decay_anchor"]
+        if len(m) != len(names) or len(lam) != len(names) or names[-1] != name:
+            raise ValueError(f"The anchor parameters of the derived source {name} do not match the reference's sources.")
+        return (float(m[-1]), float(lam[-1])), {t: (float(m[i]), float(lam[i])) for i, t in enumerate(names[:-1])}
+
     def source_index(self, name: str) -> int:
         if name not in self.names:
             raise ValueError(f"Source {name!r} is not in the reference ({', '.join(self.names)}).")

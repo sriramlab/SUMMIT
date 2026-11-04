@@ -558,3 +558,130 @@ def test_regional_matrix(sim, tmp_path):
     for ext in (".ld", ".ld.npz", ".snps.tsv", ".matrix.json"):
         assert os.path.exists(out + ext)
     assert len(pd.read_csv(out + ".snps.tsv", sep="\t")) == len(sel)
+
+
+def test_window_noise_counts_derived_panel_noise_once():
+    """A source derived by inversion, C^N = [R - sum_t pi^a_t C^t] / pi^a_N with the anchor cohort's pi^a, carries minus
+    the known panels' errors. Composed for a target with other proportions and decays (pi != pi^a), the noise variance
+    that compose subtracts equals the variance of the composed covariance (simulated), and leaving out the covariance
+    with the panels' errors (the error before 4 Nov 2026) removes their noise twice."""
+    from summit.admixed_ld.compose import window_noise
+    rng = np.random.default_rng(12)
+    d = np.array([0.0, 0.02, 0.1, 0.3, 1.0])
+    ma, la = np.array([0.10, 0.50, 0.40]), np.array([0.09, 0.12, 0.10])    # anchor cohort: known S0, S1, derived S2
+    mt, lt = np.array([0.25, 0.45, 0.30]), np.array([0.15, 0.08, 0.12])    # target
+    pa = ma[:, None] * np.exp(-la[:, None] * d[None, :])
+    pt = mt[:, None] * np.exp(-lt[:, None] * d[None, :])
+    Ck = rng.uniform(0.05, 0.3, (2, d.size))
+    CN = rng.uniform(0.05, 0.3, d.size)
+    Vk = np.array([2.0, 1.0])[:, None] * rng.uniform(0.5, 1.5, (2, d.size)) * 1e-3     # panels' Var(c_t)
+    VR = 2e-4 * np.ones(d.size)                                            # the cohort's Var(c_R)
+    B = 400_000
+    ek = rng.standard_normal((B, 2, d.size)) * np.sqrt(Vk)[None]
+    eR = rng.standard_normal((B, d.size)) * np.sqrt(VR)[None]
+    R = (pa[:2] * Ck).sum(0) + pa[2] * CN
+    cN = (R + eR - (pa[:2][None] * (Ck[None] + ek)).sum(1)) / pa[2]
+    covvar = (VR + (pa[:2] ** 2 * Vk).sum(0)) / pa[2] ** 2
+    np.testing.assert_allclose(np.var(cN, axis=0), covvar, rtol=0.02)     # covvar is the derived covariance's own
+    comp = (pt[:2][None] * (Ck[None] + ek)).sum(1) + pt[2] * cN
+    cross = [(2, t, ma[2], la[2], ma[t], la[t]) for t in range(2)]
+    pis, vns = [pt[0], pt[1], pt[2]], [Vk[0], Vk[1], covvar]
+    got = window_noise(pis, vns, cross, d)
+    np.testing.assert_allclose(got, np.var(comp, axis=0), rtol=0.02)
+    old = window_noise(pis, vns, [], d)
+    assert np.all(old - np.var(comp, axis=0) > 10 * 0.02 * np.var(comp, axis=0))
+    # with the target's pi equal to the anchor's, the cross term is twice the panels' part of covvar
+    same = window_noise([pa[0], pa[1], pa[2]], [Vk[0], Vk[1], covvar], cross, d)
+    np.testing.assert_allclose(same, VR, rtol=1e-12)
+
+
+def test_inversion_counts_panel_noise_once(sim3, tmp_path):
+    """LD by inversion with small known panels: their noise enters the derived covariances with a minus sign and enters
+    the composition again, so compose must remove it once. With 200-person panels and a 3,000-person cohort the
+    composed LD mass is then within 2.5% of in-sample (0.992 here); counting the noise twice, as before 4 Nov 2026,
+    gave 0.919."""
+    from summit.admixed_ld.compose import compose_ldscores
+    from summit.admixed_ld.curve import genotype_curve
+    from summit.admixed_ld.derive import derive_source
+    d, S, names = sim3["dir"], sim3["S"], sim3["names"]
+    v = S["variants"]
+    for i in range(2):
+        write_bed(str(tmp_path / f"p{i}"), S["panels"][i][:200], v, f"p{i}")
+    write_bed(str(tmp_path / "small"), S["panels"][2][:40], v, "s")
+    build_reference([str(tmp_path / "p0"), str(tmp_path / "p1")], names[:2], str(tmp_path / "ref2"), step=256,
+                    log=lambda *a: None)
+    man = derive_source(str(d / "cohort"), str(tmp_path / "ref2"), str(tmp_path / "ref3"), name="S2",
+                        panel=str(tmp_path / "small"), covar=str(d / "cohort.cov"), step=256, log=lambda *a: None)
+    cn = man["sources"][2]["covariance_noise"]
+    assert set(cn["mix"]) == {"S0", "S1"} and len(cn["pi"]) == 2
+    ref3 = Reference(str(tmp_path / "ref3"))
+    assert ref3.covariance_noise_mix("S0") is None and ref3.covariance_noise_mix("S2")[1].keys() == {"S0", "S1"}
+    genotype_curve(str(d / "cohort"), str(tmp_path / "ref3"), str(tmp_path / "c3"), sources=names,
+                   covar=str(d / "cohort.cov"), cell_cm=0.5, log=lambda *a: None)
+    out = str(tmp_path / "inv")
+    params = compose_ldscores(str(tmp_path / "ref3"), [str(d / "ss")], str(d / "annot.tsv"), out, sources=names,
+                              curve=str(tmp_path / "c3"), log=lambda *a: None)
+    assert {x["panel"] for x in params["derived_covariance_cross_noise"]} == {"S0", "S1"}
+    got = pd.read_csv(out + ".gw.ldscore.gz", sep="\t")
+    keep = v.SNP.isin(got.SNP).to_numpy()
+    L_in, V_in = insample_ldscores(S["cohort"][:, keep], sim3["C"], sim3["cls"][keep], 2)
+    mass_c = float((got.V.to_numpy()[:, None] * got[["low", "high"]].to_numpy()).sum())
+    mass_in = float((V_in[:, None] * L_in).sum())
+    assert abs(mass_c / mass_in - 1) < 0.025, (mass_c, mass_in)
+
+
+def test_curve_corrects_frequency_noise_once(sim, tmp_path):
+    """The curve's denominators and global ancestry, recomputed here from the genotypes, the covariates and the
+    reference: each SNP's squared contrast loses the frequencies' sampling variance exactly once, and the ancestry
+    regression's right-hand side loses the covariance of the contrast's error with the baseline's (both wp/derived
+    and wp/localanc corrected the curve; the merge keeps one correction)."""
+    from summit.admixed_ld.curve import genotype_curve
+    d, S, G, C = sim["dir"], sim["S"], sim["S"]["cohort"], sim["C"]
+    v = S["variants"]
+    n = 15
+    write_bed(str(tmp_path / "sA"), S["panel_A"][:n], v, "sa")
+    write_bed(str(tmp_path / "sE"), S["panel_E"][:n], v, "se")
+    build_reference([str(tmp_path / "sA"), str(tmp_path / "sE")], ["AFR", "EUR"], str(tmp_path / "ref"),
+                    step=256, log=lambda *a: None)
+    cell = 0.5
+    curve, info = genotype_curve(str(d / "cohort"), str(tmp_path / "ref"), str(tmp_path / "c"),
+                                 covar=str(d / "cohort.cov"), cell_cm=cell, cells_cm=0, log=lambda *a: None)
+    raw, info_raw = genotype_curve(str(d / "cohort"), str(tmp_path / "ref"), str(tmp_path / "r"),
+                                   covar=str(d / "cohort.cov"), cell_cm=cell, cells_cm=0, noise_correction=False,
+                                   log=lambda *a: None)
+    rv = Reference(str(tmp_path / "ref")).variants(["AFR", "EUR"]).set_index("SNP").loc[v.SNP]
+    D = (rv.p_AFR - rv.p_EUR).to_numpy()
+    S_ = (rv.v_AFR / (4 * n) + rv.v_EUR / (4 * n)).to_numpy()            # Var(e_A - e_E)
+    R_ = -(rv.v_EUR / (4 * n)).to_numpy()                                  # Cov(e_A - e_E, e_E)
+    X = G - G.mean(0)
+    Q, _ = np.linalg.qr((C - C.mean(0)) / C.std(0, ddof=1))
+    Xr = X - Q @ (Q.T @ X)
+    var = np.einsum("ij,ij->j", Xr, Xr) / (G.shape[0] - 1 - C.shape[1])
+    inv = np.divide(1.0, var, out=np.zeros_like(var), where=var > 1e-8)
+    chrom, cm = rv.CHR.to_numpy(), rv.CM.to_numpy()
+
+    def den(times):
+        out = {}
+        for c in pd.unique(chrom):
+            ix = np.flatnonzero(chrom == c)
+            b = ((cm[ix] - cm[ix].min()) / cell).astype(int)
+            q = np.bincount(b, weights=(D[ix] ** 2 - times * S_[ix]) * inv[ix])
+            for lag in (2, 6, 20):
+                out[lag] = out.get(lag, 0.0) + float(q[:-lag] @ q[lag:])
+        return out
+
+    def theta_mean(times):
+        inf = np.abs(D) >= 0.2
+        num = D[inf] @ (G.mean(0)[inf] / 2 - rv.p_EUR.to_numpy()[inf]) + times * R_[inf].sum()
+        return num / float((D[inf] ** 2 - times * S_[inf]).sum())
+
+    got = curve.set_index("d_cm").denominator
+    got_raw = raw.set_index("d_cm").denominator
+    once, twice, none = den(1), den(2), den(0)
+    for lag in once:
+        assert got[lag * cell] == pytest.approx(once[lag], rel=1e-6)
+        assert got_raw[lag * cell] == pytest.approx(none[lag], rel=1e-6)
+        assert abs(twice[lag] / once[lag] - 1) > 0.05 and abs(none[lag] / once[lag] - 1) > 0.05
+    assert info["theta"]["mean"] == pytest.approx(theta_mean(1), rel=1e-6)
+    assert info_raw["theta"]["mean"] == pytest.approx(theta_mean(0), rel=1e-6)
+    assert abs(theta_mean(2) - theta_mean(1)) > 0.01
