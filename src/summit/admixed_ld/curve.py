@@ -139,7 +139,7 @@ def genotype_curve(geno, ref_path, out, *, sources=None, covar=None, keep=None, 
     if noise_correction:                                       # sampling covariance of the contrasts, per SNP
         from .model import contrast_noise
         Vs = np.column_stack([rv[f"v_{s}"].to_numpy()[r_idx] for s in sources])
-        Vn, nn, Gn, _ = ref.frequency_noise(sources, np.nan_to_num(Vs), r_idx)
+        Vn, nn, Gn, _ = ref.frequency_noise(sources, np.nan_to_num(Vs), r_idx, rv)
         S_noise, R_noise = contrast_noise(Vn, nn, Gn)
     else:
         S_noise, R_noise = np.zeros((t_idx.size, k1, k1)), np.zeros((t_idx.size, k1))

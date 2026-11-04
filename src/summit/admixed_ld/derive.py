@@ -180,7 +180,7 @@ def _panel_band_moments(pb, pt, pf, hv, j, k, v_fallback, chunk=20_000_000):
 
 
 def _inversion_parameters(geno, out, ref, known, name, src_meta, chrom, local, ki, pN_ref, vN, Pk, rv, r_idx, var_res,
-                          M, K, c_mix, n_freq, *, covar, keep, match, cell_cm, threads, native, log):
+                          M, K, c_mix, n_freq, var_p, *, covar, keep, match, cell_cm, threads, native, log):
     """Steps 3-4 of the inversion: the cohort's curve on a provisional reference (frequencies only), and m and
     Kt_res(0) from the regression of its adjusted variances. Returns m, Kt_res(0), decays, the kernel."""
     from .curve import genotype_curve
@@ -198,7 +198,7 @@ def _inversion_parameters(geno, out, ref, known, name, src_meta, chrom, local, k
         for n_, i in enumerate(ki):
             arrays[f"p_{n_}"], arrays[f"v_{n_}"] = z[f"p_{i}"][lo], z[f"v_{i}"][lo]
             arrays[f"cov_{n_}"] = arrays[f"m22_{n_}"] = np.zeros(0, np.float32)
-        arrays[f"p_{K - 1}"], arrays[f"v_{K - 1}"] = pN_ref[sel], vN[sel]
+        arrays[f"p_{K - 1}"], arrays[f"v_{K - 1}"], arrays[f"fvar_{K - 1}"] = pN_ref[sel], vN[sel], var_p[sel]
         arrays[f"cov_{K - 1}"] = arrays[f"covvar_{K - 1}"] = np.zeros(0, np.float32)
         np.savez(os.path.join(prov, f"chr{c}.npz"), **arrays)
         stats[c] = dict(n_snps=int(sel.size), n_pairs=0, cm_length=float(z["cm"][lo].max() - z["cm"][lo].min()))
@@ -217,7 +217,9 @@ def _inversion_parameters(geno, out, ref, known, name, src_meta, chrom, local, k
     Dm = Pm[:, :-1] - Pm[:, -1:]
     G = np.eye(K)
     G[K - 1, :K - 1] = -np.asarray(c_mix)                       # the derived source carries the panels' errors
-    S_noise, _ = contrast_noise(Vm, np.array([ref.n_freq[s] for s in known] + [n_freq]), G)
+    Vn = Vm.copy()
+    Vn[:, -1] = 4.0 * n_freq * var_p                           # the derived source's own frequency variance per SNP
+    S_noise, _ = contrast_noise(Vn, np.array([ref.n_freq[s] for s in known] + [n_freq]), G)
     O = unbiased_products_cov(Dm, S_noise)
     reg = regress_standard_errors_k(np.ones(M), 1.0 / np.sqrt(np.maximum(var_res, 1e-12)), np.zeros(M), Vm, O)
     m_vec, k0 = np.asarray(reg["m"]), np.asarray(reg["kappa0"])
@@ -366,7 +368,9 @@ def derive_source(geno, ref_path, out, *, name, known=None, panel=None, covar=No
     p_hat = (a_num + ysum) / den
     # sampling variance of p_hat from the people's residuals (sandwich): cohort sum w^2 (r - w p)^2 and anchors (y - p)^2
     var_p = (s_r2 - 2 * p_hat * s_w3r + p_hat ** 2 * s4 + ysq - 2 * p_hat * ysum + cnt * p_hat ** 2) / den ** 2
-    pN_c = np.clip(p_hat, 1e-3, 1 - 1e-3)
+    # unclipped: near 0 or 1 the regression's noise comes from the other sources' alleles, and clipping would bias the
+    # frequency and its variance at exactly the SNPs where the source is fixed
+    pN_c = p_hat
     n_eff = float(np.median(den))
     with np.errstate(divide="ignore", invalid="ignore"):
         n0_j = 2.0 * pN_c * (1.0 - pN_c) / (4.0 * var_p)
@@ -377,11 +381,12 @@ def derive_source(geno, ref_path, out, *, name, known=None, panel=None, covar=No
         f"(sum of squared ancestry weights {n_eff:.0f}); errors carry " + ", ".join(
             f"{-x:.3f} x the {s} panel's" for s, x in zip(known, c_mix)))
     pN_ref = np.where(flip, 1.0 - pN_c, pN_c)                     # in the reference's orientation
-    vN = 2.0 * pN_ref * (1.0 - pN_ref)                           # dosage variance of the source (Hardy-Weinberg)
+    # dosage variance of the source, 2p(1 - p), estimated without bias (E p_hat(1 - p_hat) = p(1 - p) - Var p_hat)
+    vN = 2.0 * (pN_ref * (1.0 - pN_ref) + var_p)
     poly = var_res > 1e-8                                        # SNPs without variance in the cohort tell nothing
     if not poly.all():
         t_idx, r_idx, flip, Pk, Pk_c = t_idx[poly], r_idx[poly], flip[poly], Pk[poly], Pk_c[poly]
-        pN_ref, vN, var_res = pN_ref[poly], vN[poly], var_res[poly]
+        pN_ref, vN, var_res, var_p = pN_ref[poly], vN[poly], var_res[poly], var_p[poly]
         M = int(poly.sum())
 
     if ld not in ("inversion", "panel"):
@@ -402,7 +407,8 @@ def derive_source(geno, ref_path, out, *, name, known=None, panel=None, covar=No
     if ld == "inversion":
         m_vec, k0, lam, kern = _inversion_parameters(
             geno, out, ref, known, name, src_meta, chrom, local, ki, pN_ref, vN, Pk, rv, r_idx, var_res, M, K, c_mix,
-            n_freq, covar=covar, keep=keep, match=match, cell_cm=cell_cm, threads=threads, native=native, log=log)
+            n_freq, var_p, covar=covar, keep=keep, match=match, cell_cm=cell_cm, threads=threads, native=native,
+            log=log)
         Dm = np.column_stack([Pk, pN_ref])
         Dm = Dm[:, :-1] - Dm[:, -1:]
     else:
@@ -441,7 +447,7 @@ def derive_source(geno, ref_path, out, *, name, known=None, panel=None, covar=No
                 arrays[f"covvar_{n_}"] = z[f"covvar_{i}"][src]
             else:
                 arrays[f"m22_{n_}"] = z[f"m22_{i}"][src]
-        arrays[f"p_{K - 1}"], arrays[f"v_{K - 1}"] = pN_ref[sel], vN[sel]
+        arrays[f"p_{K - 1}"], arrays[f"v_{K - 1}"], arrays[f"fvar_{K - 1}"] = pN_ref[sel], vN[sel], var_p[sel]
         if ld == "panel":
             cov_, m22_, vld_, n_miss = _panel_band_moments(pb, pt, pf, hv_all[sel], j, k, vN[sel])
             arrays[f"cov_{K - 1}"], arrays[f"m22_{K - 1}"], arrays[f"vld_{K - 1}"] = cov_, m22_, vld_

@@ -221,7 +221,7 @@ def compose_ldscores(ref_path, sumstats, annot, out, *, sources=None, snps=None,
     Pm, Vm, Dm = Pm[good], Vm[good], Dm[good]
     # products of contrasts without the sampling (co)variance of the frequencies (Var(p) = Var(dosage) / 4n), including
     # the panels' errors that a derived source's frequencies carry
-    Vn, nn, Gn, _ = ref.frequency_noise(sources, Vm, r_idx)
+    Vn, nn, Gn, _ = ref.frequency_noise(sources, Vm, r_idx, rv)
     S_noise, _ = contrast_noise(Vn, nn, Gn)
     O = unbiased_products_cov(Dm, S_noise)
     cls = np.argmax(cls_mat, axis=1)

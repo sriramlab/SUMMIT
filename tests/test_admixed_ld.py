@@ -388,7 +388,8 @@ def test_derived_source_with_panel_ld(sim3, tmp_path):
     assert 0 < src["n_freq"] <= src["n_freq_weights"] * 1.05
     ref3 = Reference(str(tmp_path / "ref3"))
     z = ref3.load(ref3.chromosomes[0])
-    assert {"cov_2", "m22_2", "vld_2"} <= set(z.files) and "covvar_2" not in z.files
+    assert {"cov_2", "m22_2", "vld_2", "fvar_2"} <= set(z.files) and "covvar_2" not in z.files
+    assert (z["fvar_2"] > 0).all() and np.isfinite(z["v_2"]).all()
     rv = ref3.variants(["S2"]).set_index("SNP")
     p_true = pd.Series(S["panels"][2].mean(0) / 2, index=v.SNP).reindex(rv.index)
     assert np.corrcoef(rv.p_S2, p_true)[0, 1] > 0.98
