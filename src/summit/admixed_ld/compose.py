@@ -322,7 +322,16 @@ def compose_ldscores(ref_path, sumstats, annot, out, *, sources=None, snps=None,
     s2 = cres + 4.0 * r2 * quad(mom[1])
     ok = cres > 1e-8
     if not ok.all():
-        raise ValueError(f"{int((~ok).sum())} SNPs have no variance in the model; they should have been removed.")
+        # a source derived from a cohort carries unbiased dosage variances, which can be slightly negative where its
+        # frequency is estimated below 0 or above 1; where every source is nearly fixed the modelled variance can then
+        # be zero or negative, and such a SNP gets no LD score
+        if not ok.any():
+            raise ValueError("No SNP has a positive variance in the model.")
+        log(f"[admixed-ld] compose: {int((~ok).sum())} SNPs without positive variance in the model (nearly fixed in "
+            "every source) are left out")
+        t_idx, r_idx, cls_mat, cls = t_idx[ok], r_idx[ok], cls_mat[ok], cls[ok]
+        Pm, Vm, Dm, O, snp_ids, cres, s2 = Pm[ok], Vm[ok], Dm[ok], O[ok], snp_ids[ok], cres[ok], s2[ok]
+        M = int(ok.sum())
     Vpop = cres / s2
     L = np.zeros((M, K))
     chrom_out = rv["CHR"].to_numpy()[r_idx]
