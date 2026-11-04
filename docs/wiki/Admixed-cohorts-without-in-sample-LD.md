@@ -145,7 +145,7 @@ participants of African and European ancestry (3,787 and 6,111 people, mean Afri
 ancestry 0.61 and 0.76), with 32 traits, 405,807 array SNPs and eight MAF/LD classes. The
 references were panels of African-ancestry (4,905 and 2,452 people) and white British
 (12,148) participants outside the cohorts. With the curve and the relatives' term, mean h²
-over traits was 0.6% and 1.0% higher than with in-sample LD scores. The mean absolute
+over traits was 0.7% and 1.0% higher than with in-sample LD scores. The mean absolute
 difference was 0.03 standard errors, and standard errors were within 1%. Without the
 relatives' term the differences were 1.6% and 1.3%. With an admixture date of 5
 generations (the decay that the curves measured) in place of the curve, and without the
