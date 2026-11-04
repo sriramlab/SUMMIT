@@ -94,9 +94,15 @@ def genotype_curve(geno, ref_path, out, *, sources=None, covar=None, keep=None, 
     genotype PCs leave). With K sources and the last as baseline, each of the
     K-1 contrasts D_a = p^a - p^B gives its own cell sums; per distance, the (K-1)^2 products of cell sums are linear in
     the unique entries of Kt_res(d) and are solved by least squares (two sources: numerator / denominator).
-    noise_correction: remove the sampling (co)variance of the reference frequencies from the squared contrasts of each
-    SNP in the denominators (and in the global-ancestry regression); without it the kernel is attenuated by the
-    reliability of the contrasts (errors in variables), which matters for small panels and derived sources."""
+    noise_correction: remove the sampling (co)variance of the reference frequencies from the products of contrasts
+    of each SNP in the denominators, and from both sides of the global-ancestry regression (the products D D' in its
+    normal matrix, and the covariance of the contrasts' errors with the baseline frequency's error in its right-hand
+    side). The cohort's covariances in the numerators are linear in each contrast, so their expectation is the
+    noise-free product, while raw squared contrasts include the frequencies' sampling variance and shrink the kernel by
+    the reliability of the contrasts (errors in variables). The noise model is Reference.frequency_noise: Var(dosage)
+    / 4 n_freq per panel, a derived source's per-SNP fvar, and the panels' errors that a derived source's frequencies
+    carry (noise_mix). It matters for small panels and derived sources; noise_correction=False (CLI
+    --keep-panel-noise) restores the raw products used before 4 Nov 2026."""
     t0 = time.perf_counter()
     ref = Reference(ref_path)
     sources = list(sources or ref.names[:2])
@@ -252,6 +258,7 @@ def genotype_curve(geno, ref_path, out, *, sources=None, covar=None, keep=None, 
     info = dict(format="summit-admixed-ld-curve", version=1, sources=list(sources), baseline=sources[-1],
                 n_samples=int(N), n_snps=int(t_idx.size), covariate_rank=int(p_rank), cell_cm=float(cell_cm),
                 noise_correction=bool(noise_correction),
+                panel_n_freq={s: float(ref.n_freq[s]) for s in sources},
                 max_cm=float(max_cm), inter_matrix=inter.tolist(), fit_per_source=fits,
                 theta=moments_from_vectors(U_th),
                 reference=dict(sources=ref.manifest["sources"], window_kb=ref.manifest["window_kb"],
