@@ -8,6 +8,18 @@ and in its dosage variances as D_j' Kt_p(0) D_j. Composition adds the cohort's a
 of the panels, so a panel's own admixture LD would be counted twice at the distances of the reference band; in
 UK Biobank target 1 (African panel, ancestry SD 0.03) it inflated the composed LD at 1-3 cM by 13%.
 
+The second count does not depend on who is in the target. Beyond 2 cM the kernel is the target's own curve, its
+covariance along D at each distance, and kappa_res(0) comes from its own standard errors, so the composition's
+admixture term already holds all of the target's admixture LD, that of members drawn from the panel's own population
+included, at their share of the target (the GWAS PCs remove their global-ancestry part from the target and from its
+curve alike). The panel's copy is added on top inside the band with weight pi_s(d) = m_s exp(-lam d). Cleaning is
+optional and off by default. It matters when the panel's kernel passes the gate below and its duplicated share of the
+target's kernel in the band, sum_s pi_s(d) Kt_s(d) / Kt_T(d) at 2 cM, is not negligible (UK Biobank African panel of
+4,905: 9% for admixed members only, 15% when 40% of the target are unadmixed members of the panel's population, 97% for
+a target of those members alone; simulated pure panels stay below the gate). It would remove real LD only if the
+composition's kernel were not measured on the target along D, for example a kernel from local-ancestry calls that do
+not see the panel-like tracts.
+
 Kt_p is the panel's weighted-LD curve (`genotype_curve` on the panel, without covariates), fitted entry by entry over
 lo-hi cM (default 3-40) as A + H exp(-lam d) with lam in [0.005, 0.5] per cM (admixture 0.5 to 50 generations ago)
 and A, H >= 0 on the diagonal (a panel is not adjusted for covariates, so its ancestry variance is not negative).

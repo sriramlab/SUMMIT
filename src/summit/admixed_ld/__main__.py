@@ -56,9 +56,11 @@ def main(argv=None):
     r.add_argument("--threads", type=int, default=1)
     r.add_argument("--remove-panel-admixture", action="store_true",
                    help="remove each panel's own admixture LD (measured with the weighted-LD curve of the panel) from "
-                        "its covariances and variances. Optional and off by default: it removes LD that the target "
-                        "cohort lacks only when the target's segments of that ancestry do not share the panel's own "
-                        "admixture (see the documentation)")
+                        "its covariances and variances. Optional and off by default. The target's curve and standard "
+                        "errors already hold all of the target's admixture LD (members from the panel's own population "
+                        "included), so a panel's own admixture LD in the band is counted twice whoever the target is; "
+                        "use it when the panel's kernel passes the gate (z >= 3, reported by clean-panels) and its "
+                        "duplicated share of the target's kernel is not negligible (see the documentation)")
     r.add_argument("--out", required=True)
 
     cp = sub.add_parser("clean-panels", help="remove the panels' own admixture LD from an existing reference (copy)")
