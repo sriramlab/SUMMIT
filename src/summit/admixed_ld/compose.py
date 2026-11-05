@@ -371,7 +371,8 @@ class SmoothBackground:
 
     def describe(self) -> dict:
         at = [0, 0.5, 1, 2, 3, 5, 10, 20, 40, 80]
-        return dict(mode="background", name=self.name, between=self.between, n=self.n, fit_min_cm=self.fit_min_cm,
+        return dict(mode="background", window="panels", name=self.name, between=self.between, n=self.n,
+                    fit_min_cm=self.fit_min_cm,
                     rates=self.rates.tolist(), amplitudes=self.amp.tolist(), source=self.source,
                     phi_at={str(x): float(self(x)) for x in at})
 

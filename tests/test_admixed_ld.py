@@ -1043,4 +1043,4 @@ def test_panel_background_removed_inside_the_band(tmp_path):
     # (here half of the panel's members are sibs; in a biobank panel it is a small part of the band's LD)
     assert abs(gap_panels) < 0.4 * gap_zero
     params = json.load(open(str(tmp_path / "ld_rel_panels") + ".admixed_ld.json"))
-    assert set(params["panel_background"]) == {"AFR", "EUR"}
+    assert set(params["panel_background"]) == {"AFR", "EUR"} and params["relatedness_profile"]["window"] == "panels"
