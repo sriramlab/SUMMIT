@@ -94,9 +94,28 @@ pair within a family (connected component), which helps when the list holds only
 pairs of each family. Do not use it with a dense list of distant relatives. The relatedness after adjustment is what enters the in-sample LD scores,
 and it can differ greatly from the relatedness in a pair file. In a cohort of a few
 thousand people, a large family can take up a PC of its own, and first-degree pairs with
-a GRM of 0.5 then have a relatedness near zero after the covariates. The outputs,
-`cohort.curve.tsv` and `cohort.curve.json`, hold aggregates only and can be released
-with the summary statistics.
+a GRM of 0.5 then have a relatedness near zero after the covariates.
+
+Relatives share segments identical by descent, so their LD on one chromosome is far larger
+than between chromosomes; for distant relatives, per SNP pair at a few cM, it is ten to
+twenty times their g². The curve therefore also writes `cohort.relatedness.tsv`, the
+listed pairs' products of local relatedness by distance on one chromosome (cells of
+`--relatedness-cell-cm`, default 0.5 cM), and their product between chromosomes, both
+net of what random unlisted pairs (`--relatedness-controls`) contribute to the same sums.
+The controls remove the LD that two unrelated people share and the covariates' projection,
+which the population part of the LD score already counts, and the products leave out each
+SNP with itself, so the noise floor of g² (about the mean LD score over the number of SNPs
+per pair) is gone too. `--no-relatedness-profile` restores the sum of g² alone.
+
+Pair lists miss most of the relatedness that matters: distant and cryptic relatives, whose
+LD per SNP pair is a property of the population rather than of the cohort's families.
+`--background` measures the relatedness LD of all pairs of people without a list, from the
+cross-person LD among the least differentiated SNPs (`--background-quantile`, default the
+lowest fifth of the source contrast), less its admixture part and SUMMIT's null, by
+distance and between chromosomes (`cohort.background.tsv`). Beyond a few cM this is what
+relatives add; closer, the same products also hold within-source LD. The outputs,
+`cohort.curve.tsv`, `cohort.curve.json` and these tables, hold aggregates only and can be
+released with the summary statistics.
 
 ## Compose the LD scores
 
@@ -124,8 +143,14 @@ ancestry leaves and G is the genetic length of the genome. The SD of global ance
 enters only the term of each person's pairing with themselves. It comes from the curve,
 from `--ancestry-sd`, or defaults to 0.12. `--mean-ancestry` and `--kappa0` replace the
 values from the standard errors. `--relatedness curve` adds the relatives' part of the
-LD scores, from the curve. `--relatedness X` gives it directly, with X the sum over ordered
-pairs of the squared relatedness after the covariates.
+LD scores from the curve: B between chromosomes and φ(d) along each chromosome, inside the
+reference window too. With a curve made with `--background`, the term is the measured LD
+of all pairs from `--background-min-cm` (default 3) on and between chromosomes, smoothed as
+a sum of decaying exponentials, and the listed pairs' profile below it, where the panels'
+own covariances already hold their populations' background relatedness
+(`--background-window flat` adds the unlisted part there as well). `--relatedness uniform`
+adds the curve's sum of g² to every SNP pair, as before 5 Nov 2026, and `--relatedness X`
+gives that sum directly.
 
 The outputs are `ld/cohort.gw.ldscore.gz`, `ld/cohort.gw.M` and
 `ld/cohort.admixed_ld.json`, which records every parameter used. Fit as usual:

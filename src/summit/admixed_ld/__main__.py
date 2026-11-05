@@ -4,10 +4,11 @@
                               [--genetic-map MAP] [--remove-panel-admixture] --out REF_DIR
   summit admixed-ld clean-panels --ref REF_DIR --panel AFR_PREFIX --panel EUR_PREFIX --names AFR,EUR --out NEW_DIR
   summit admixed-ld curve     --geno COHORT --ref REF_DIR [--covar FILE] [--keep FILE] [--sources AFR,EUR]
-                              [--relative-pairs FILE [--kinship-col COL --kinship-min X] [--closure]] --out PREFIX
+                              [--relative-pairs FILE [--kinship-col COL --kinship-min X] [--closure]
+                               [--relatedness-cell-cm 0.5] [--relatedness-controls N]] --out PREFIX
   summit admixed-ld compose   --ref REF_DIR --sumstats FILE_OR_DIR [...] --annot ANNOT --out PREFIX
                               (--curve PREFIX | --admixture-generations T | --decay-per-cm LAMBDA)
-                              [--sources AFR,EUR] [--ancestry-sd SD] [--relatedness X|curve] [--snps FILE]
+                              [--sources AFR,EUR] [--ancestry-sd SD] [--relatedness X|curve|uniform] [--snps FILE]
   summit admixed-ld matrix    --ref REF_DIR --params PREFIX.admixed_ld.json (--region CHR:START-END | --snps FILE)
                               (--curve PREFIX | --admixture-generations T | --decay-per-cm LAMBDA)
                               [--taper auto|none|TAU_CM] [--no-admixture] --out PREFIX
@@ -96,6 +97,27 @@ def main(argv=None):
     c.add_argument("--kinship-min", type=float, default=None, help="keep only pairs whose kinship exceeds this value")
     c.add_argument("--closure", action="store_true",
                    help="also use every pair within a family (connected component of the listed pairs)")
+    c.add_argument("--relatedness-cell-cm", type=float, default=0.5,
+                   help="cells of the relatives' profile in cM (default 0.5): with --relative-pairs the curve also "
+                        "writes PREFIX.relatedness.tsv, the listed pairs' local relatedness products by distance on "
+                        "one chromosome and between chromosomes, net of random control pairs (aggregates only), for "
+                        "the within-chromosome relatives term of `compose --relatedness curve`")
+    c.add_argument("--relatedness-controls", type=int, default=None,
+                   help="random unlisted pairs that measure what unrelated pairs contribute to the same products "
+                        "(default: as many as the listed pairs, 20,000 to 200,000)")
+    c.add_argument("--relatedness-memory-gb", type=float, default=4.0,
+                   help="memory for the pairs' cell sums; more pairs take extra genotype passes (default 4)")
+    c.add_argument("--no-relatedness-profile", action="store_true",
+                   help="only the sum of g^2 of the listed pairs (the behaviour before 5 Nov 2026)")
+    c.add_argument("--background", action="store_true",
+                   help="also measure the relatedness LD of all pairs of people, listed or not (distant and cryptic "
+                        "relatives), from the cross-person LD among the least differentiated SNPs, by distance and "
+                        "between chromosomes (PREFIX.background.tsv; aggregates only)")
+    c.add_argument("--background-quantile", type=float, default=0.2,
+                   help="share of SNPs with the smallest source contrasts used for --background (default 0.2)")
+    c.add_argument("--background-snps", type=int, default=None,
+                   help="of these, SNPs used between chromosomes (default: what --relatedness-memory-gb holds in "
+                        "float32, at most 40,000)")
     c.add_argument("--keep-panel-noise", "--no-noise-correction", dest="keep_panel_noise", action="store_true",
                    help="use raw products of the reference contrasts in the denominators and the global-ancestry "
                         "estimator (the behaviour before 4 Nov 2026), which shrinks the kernel by the frequencies' "
@@ -129,8 +151,21 @@ def main(argv=None):
     m.add_argument("--ancestry-sd", type=float, default=None,
                    help="SD of global ancestry for the same-person term (default: the curve's, else 0.12)")
     m.add_argument("--relatedness", default=None,
-                   help="optional: sum over ordered pairs of relatives of their squared relatedness in the "
-                        "covariate-adjusted genotypes, or 'curve' to take it from the curve")
+                   help="optional relatives' term: 'curve' for the curve's profile (B between chromosomes, phi(d) on "
+                        "one chromosome, which carries the segments that relatives share identical by descent; a "
+                        "curve made before 5 Nov 2026 gives the uniform term), 'uniform' for the uniform term from "
+                        "the curve's sum of g^2, or a number: the sum over ordered pairs of relatives of their squared "
+                        "relatedness in the covariate-adjusted genotypes, added uniformly to every SNP pair")
+    m.add_argument("--relatedness-smooth", type=float, default=0.1,
+                   help="width of the bins that pool the profile's lags, as a fraction of the distance (default 0.1)")
+    m.add_argument("--background-min-cm", type=float, default=3.0,
+                   help="with a curve made with --background: from this distance on, the relatives' term is the "
+                        "measured LD of all pairs; below it, the listed pairs' profile plus the unlisted pairs' part "
+                        "as specified by --background-window (default 3)")
+    m.add_argument("--background-window", choices=["zero", "flat"], default="zero",
+                   help="the unlisted pairs' part below --background-min-cm: none (zero, the default: inside the "
+                        "reference window the panels' unbiased squared covariances hold their own populations' "
+                        "background relatedness) or its value at that distance (flat)")
     m.add_argument("--nu", type=float, default=None, help="sample size minus covariates (default from the GWAS)")
     m.add_argument("--grid-cm", type=float, default=0.02, help="grid of the long-range convolution (default 0.02)")
     m.add_argument("--cell-matrix", action="store_true",
@@ -222,7 +257,11 @@ def main(argv=None):
         genotype_curve(a.geno, a.ref, a.out, sources=_sources(a.sources), covar=a.covar, keep=a.keep, match=a.match,
                        cell_cm=a.cell_cm, max_cm=a.max_cm, relative_pairs=a.relative_pairs, kinship_col=a.kinship_col,
                        kinship_min=a.kinship_min, closure=a.closure, step=a.step, threads=a.threads,
-                       noise_correction=not a.keep_panel_noise, log=log._log)
+                       noise_correction=not a.keep_panel_noise, relatedness_profile=not a.no_relatedness_profile,
+                       relatedness_cell_cm=a.relatedness_cell_cm, relatedness_controls=a.relatedness_controls,
+                       relatedness_memory_gb=a.relatedness_memory_gb, background=a.background,
+                       background_quantile=a.background_quantile, background_between_snps=a.background_snps,
+                       log=log._log)
     elif a.cmd == "matrix":
         from .matrix import compose_matrix
         compose_matrix(a.ref, a.out, region=a.region, snps=a.snps, sources=_sources(a.sources), params=a.params,
@@ -234,7 +273,9 @@ def main(argv=None):
         compose_ldscores(a.ref, a.sumstats, a.annot, a.out, sources=_sources(a.sources), snps=a.snps, match=a.match,
                          curve=a.curve, generations=a.admixture_generations, decay_per_cm=a.decay_per_cm,
                          mean_ancestry=a.mean_ancestry, kappa0=a.kappa0, theta_sd=a.ancestry_sd,
-                         relatedness=a.relatedness, nu=a.nu, grid_cm=a.grid_cm, cell_matrix=a.cell_matrix,
+                         relatedness=a.relatedness, relatedness_smooth=a.relatedness_smooth,
+                         background_min_cm=a.background_min_cm, background_window=a.background_window, nu=a.nu,
+                         grid_cm=a.grid_cm, cell_matrix=a.cell_matrix,
                          cell_switch_cm=a.cell_switch_cm, log=log._log)
     return 0
 

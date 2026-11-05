@@ -13,7 +13,9 @@ covariates, it is computed as:
   every pair on the same chromosome   delta_j^2 delta_k^2 kappa(d)^2, by FFT convolution on a grid of `grid_cm`
                                       (the window pairs' admixture-only part is taken out of the first sum);
   pairs on different chromosomes      delta_j^2 delta_k^2 far^2;
-  the same-person term, each SNP with itself (V_j), and, optionally, relatives
+  the same-person term, each SNP with itself (V_j), and, optionally, relatives: with the curve's profile
+                                      (1 / nu^2) [B sum_{k in c, k != j} V_k + sum_{k in c on j's chromosome}
+                                      (phi(d_jk) - B) V_k] (RelatednessProfile, BackgroundProfile), or the uniform
                                       (sum over their ordered pairs of g^2) / nu^2 * sum_{k in c} V_k, with g the
                                       relatedness of the covariate-adjusted, standardized genotypes.
 V_j = C_res(j,j) / s_j^2 is the population share of SNP j's variance that the covariates leave, which SUMMIT's
@@ -180,6 +182,143 @@ def _cell_correction(path, kern, chrom_out, cm_out, Oflat, Wn, cls, K, k1, switc
     return corr, dict(file=path, n_cells=int(nC), switch_cm=float(switch_cm))
 
 
+class RelatednessProfile:
+    """The relatives' term of the LD scores from the curve's relatedness profile (`curve --relative-pairs`).
+
+    For SNPs j and k the excess of nu^2 E(r_jk^2) over the population LD and the iid noise that relative pairs create
+    is sum over ordered pairs of E(y_j y_k) less what unrelated pairs give, y_j = u_aj u_bj the pair's local relatedness
+    in the covariate-adjusted, standardized genotypes. Between chromosomes it is B (about sum of g^2 over ordered pairs);
+    on one chromosome it is phi(d), which exceeds B by the autocovariance of local relatedness at distance d (identical
+    by descent segments). The term of SNP j in class c is
+        (1 / nu^2) [B sum_{k in c, k != j} V_k + sum_{k in c on j's chromosome, k != j} (phi(d_jk) - B) V_k].
+    phi is pooled in bins of lags whose width grows with distance (`smooth` times the distance, at least one lag), so
+    that the noise of long lags averages out, and interpolated linearly between bin centres; beyond the last bin it
+    keeps the last value."""
+
+    def __init__(self, table: pd.DataFrame, between: float, n_listed: int, n_controls: int, smooth: float = 0.1,
+                 source: str = ""):
+        t = table[table.w > 0].sort_values("lag")
+        ratio = n_listed / n_controls if n_controls else 0.0
+        d = (t.dsum.to_numpy() if "dsum" in t else t.d_cm.to_numpy() * t.w.to_numpy())
+        num = t.listed.to_numpy() - ratio * t.controls.to_numpy()
+        w = t.w.to_numpy()
+        lag = t.lag.to_numpy()
+        cell = float(np.nanmedian(np.diff(t.d_cm.to_numpy()[1:]))) if len(t) > 2 else 1.0
+        centers, values, weights, i = [], [], [], 0
+        while i < len(t):
+            d0 = t.d_cm.to_numpy()[i]
+            width = max(cell, smooth * d0) if lag[i] > 0 else 0.0     # lag 0 (within a cell) stays its own bin
+            j = i + 1
+            while j < len(t) and lag[j] > 0 and t.d_cm.to_numpy()[j] < d0 + width:
+                j += 1
+            centers.append(d[i:j].sum() / w[i:j].sum())
+            values.append(num[i:j].sum() / w[i:j].sum())
+            weights.append(w[i:j].sum())
+            i = j
+        self.d = np.asarray(centers)
+        self.phi = np.asarray(values)
+        self.w = np.asarray(weights)
+        self.between = float(between)
+        self.smooth = float(smooth)
+        self.source = source
+
+    @classmethod
+    def from_curve(cls, curve_prefix: str, info: dict, smooth: float = 0.1, background_min_cm: float = 3.0,
+                   background_window: str = "zero"):
+        """The listed pairs' profile, or, when the curve also measured all pairs (--background), that measurement from
+        background_min_cm on and between chromosomes, with the listed profile plus the unlisted part (flat: its value
+        at background_min_cm; zero: none) below."""
+        r = info.get("relatedness")
+        prof = None
+        if r is not None and "profile" in r:
+            t = pd.read_csv(f"{curve_prefix}.relatedness.tsv", sep="\t")
+            if "dsum" not in t:
+                t["dsum"] = t.d_cm * t.w
+            prof = cls(t, r["between"]["value"], int(r["pairs"]), int(r["profile"]["n_controls"]), smooth,
+                       source=f"{curve_prefix}.relatedness.tsv")
+        if "background" not in info:
+            return prof
+        b = info["background"]
+        t = pd.read_csv(b["file"] if os.path.exists(b["file"]) else f"{curve_prefix}.background.tsv", sep="\t")
+        tb = pd.DataFrame({"lag": t.lag, "d_cm": t.d_cm, "w": t.w, "dsum": t.d_cm * t.w,
+                           "listed": (t.excess * t.w).to_numpy(), "controls": 0.0})
+        bgp = cls(tb, b["between"]["value"], 1, 0, smooth, source=b["file"])
+        return BackgroundProfile(prof, bgp, background_min_cm, background_window)
+
+    def __call__(self, d):
+        d = np.asarray(d, np.float64)
+        return np.interp(d, self.d, self.phi, left=self.phi[0], right=self.phi[-1])
+
+    def describe(self) -> dict:
+        at = [0.5, 1, 2, 5, 10, 20, 40, 80]
+        return dict(mode="profile", between=self.between, smooth=self.smooth, source=self.source,
+                    phi_at={str(x): float(self(x)) for x in at if x <= self.d.max()})
+
+
+class BackgroundProfile:
+    """The relatives' term of all pairs of people. The curve's measurement of all pairs (`background`, from the least
+    differentiated SNPs) gives B between chromosomes and, beyond d0, the relatedness LD on one chromosome; the part of
+    it that the listed pairs do not carry, r(d) = background(d) - listed(d), is smoothed as B_u + sum_m A_m exp(-l_m d)
+    with A_m >= 0 (weighted non-negative least squares over d >= d0 on a grid of rates; B_u = B - B_listed), the form
+    of the identity-by-descent autocovariance of any mix of relationships, which removes the noise of long lags. The
+    term is listed(d) + r(d) from d0 on. Below d0 the measurement also holds within-source LD, and inside the
+    reference window the panels' unbiased squared covariances already hold their own populations' background
+    relatedness with weight pi_s(d)^2, so there the term is the listed profile plus r(d0) (flat) or plus nothing
+    (zero, the default)."""
+
+    RATES = np.array([0.01, 0.02, 0.04, 0.08, 0.15, 0.3, 0.6, 1.2])
+
+    def __init__(self, listed, background, d0=3.0, window="zero"):
+        from scipy.optimize import nnls
+        self.listed, self.bg, self.d0, self.window = listed, background, float(d0), window
+        self.between = background.between
+        self._listed = (lambda d: listed(d)) if listed is not None else (lambda d: np.zeros(np.shape(d)))
+        self.b_unlisted = background.between - (listed.between if listed is not None else 0.0)
+        use = (background.d >= self.d0) & (background.w > 0)
+        dd, ww = background.d[use], background.w[use]
+        r = background.phi[use] - self._listed(dd) - self.b_unlisted
+        A = np.exp(-np.outer(dd, self.RATES)) * np.sqrt(ww)[:, None]
+        self.amp, _ = nnls(A, r * np.sqrt(ww)) if dd.size else (np.zeros(self.RATES.size), 0.0)
+        self.rem0 = float(self.remainder(self.d0))
+        self.source = background.source
+        self.d = background.d
+
+    def remainder(self, d):
+        d = np.asarray(d, np.float64)
+        return self.b_unlisted + np.exp(-np.multiply.outer(d, self.RATES)) @ self.amp
+
+    def __call__(self, d):
+        d = np.asarray(d, np.float64)
+        below = self._listed(d) + (self.rem0 if self.window == "flat" else 0.0)
+        return np.where(d >= self.d0, self._listed(d) + self.remainder(d), below)
+
+    def describe(self) -> dict:
+        at = [0.5, 1, 2, 5, 10, 20, 40, 80]
+        return dict(mode="background", between=self.between, between_listed=None if self.listed is None else
+                    self.listed.between, d0=self.d0, window=self.window, unlisted_at_d0=self.rem0,
+                    unlisted_rates=self.RATES.tolist(), unlisted_amplitudes=self.amp.tolist(), source=self.source,
+                    phi_at={str(x): float(self(x)) for x in at if x <= self.d.max()})
+
+
+def relatedness_term(L, rel, chrom, cm, cls, V, K, nu, grid_cm):
+    """Add the relatives' term of `rel` (RelatednessProfile) to the LD scores L (M x K) in place: B between all pairs
+    (each SNP without itself) and phi(d) - B along each chromosome, by FFT convolution on a grid of grid_cm."""
+    Vtot = np.bincount(cls, weights=V, minlength=K)
+    L += (rel.between / nu ** 2) * Vtot[None, :]
+    L[np.arange(cls.size), cls] -= (rel.between / nu ** 2) * V
+    for c in pd.unique(chrom):
+        sel = np.flatnonzero(chrom == c)
+        x = cm[sel]
+        g = np.floor((x - x.min()) / grid_cm).astype(np.int64)
+        ng = int(g.max()) + 1
+        kern = rel(np.arange(ng) * grid_cm) - rel.between
+        Vg = np.zeros((ng, K))
+        np.add.at(Vg, (g, cls[sel]), V[sel])
+        acc = _fft_conv_sym(Vg, kern)[g]
+        acc[np.arange(sel.size), cls[sel]] -= kern[0] * V[sel]          # the convolution includes each SNP itself
+        L[sel] += acc / nu ** 2
+
+
 def _parse_values(x):
     if x is None:
         return None
@@ -190,7 +329,9 @@ def _parse_values(x):
 
 def compose_ldscores(ref_path, sumstats, annot, out, *, sources=None, snps=None, match="position", curve=None,
                      generations=None, decay_per_cm=None, mean_ancestry=None, kappa0=None, theta_sd=None,
-                     relatedness=None, nu=None, r2=0.99, grid_cm=0.02, cell_matrix=False, cell_switch_cm=10.0,
+                     relatedness=None, relatedness_smooth=0.1, background_min_cm=3.0, background_window="zero",
+                     nu=None, r2=0.99, grid_cm=0.02, cell_matrix=False,
+                     cell_switch_cm=10.0,
                      pair_chunk=1 << 23, log=print):
     """Composed LD scores for an admixed GWAS sample with two or more sources (the last is the baseline of the
     contrasts). mean_ancestry: K-1 or K values (comma-separated); kappa0: the upper triangle of Kt_res(0) row by row."""
@@ -322,12 +463,26 @@ def compose_ldscores(ref_path, sumstats, annot, out, *, sources=None, snps=None,
         log("[admixed-ld] note: global-ancestry moments default to SD 0.12; they enter only the same-person term, "
             "which is small at biobank sample sizes.")
     mom = moments_tensors(th, k1)
-    if relatedness is None:                 # optional input
-        rel_sum = None
-    elif str(relatedness) == "curve":
-        if curve_info is None or "relatedness" not in curve_info:
-            raise ValueError("--relatedness curve needs a curve made with --relative-pairs.")
-        rel_sum = float(curve_info["relatedness"]["sum_squared_ordered"])
+    rel_sum, rel_prof = None, None          # optional input: uniform sum of g^2, or the curve's profile
+    if relatedness is None:
+        pass
+    elif str(relatedness) in ("curve", "uniform"):
+        if curve_info is None or ("relatedness" not in curve_info
+                                  and not (str(relatedness) == "curve" and "background" in curve_info)):
+            raise ValueError(f"--relatedness {relatedness} needs a curve made with --relative-pairs.")
+        if str(relatedness) == "curve" and ("profile" in curve_info.get("relatedness", {})
+                                            or "background" in curve_info):
+            rel_prof = RelatednessProfile.from_curve(curve, curve_info, smooth=relatedness_smooth,
+                                                     background_min_cm=background_min_cm,
+                                                     background_window=background_window)
+            log(f"[admixed-ld] compose: relatives' term from the curve's profile, B = {rel_prof.between:.4g} between "
+                "chromosomes, phi(d) within (" + ", ".join(f"{k} cM {v:.4g}" for k, v in
+                                                          rel_prof.describe()["phi_at"].items()) + ")")
+        else:
+            if str(relatedness) == "curve":
+                log("[admixed-ld] note: the curve has no relatedness profile (made before 5 Nov 2026); the relatives' "
+                    "term is the uniform sum of g^2")
+            rel_sum = float(curve_info["relatedness"]["sum_squared_ordered"])
     else:
         rel_sum = float(relatedness)
 
@@ -466,6 +621,8 @@ def compose_ldscores(ref_path, sumstats, annot, out, *, sources=None, snps=None,
     L[np.arange(M), cls] += Vpop
     if rel_sum is not None:
         L += (rel_sum / nu ** 2) * np.bincount(cls, weights=Vpop, minlength=K)[None, :]
+    if rel_prof is not None:
+        relatedness_term(L, rel_prof, chrom_out, cm_out, cls, Vpop, K, nu, grid_cm)
     V = Vpop
 
     # ---------------------------------------------------------------------------------------- write
@@ -476,7 +633,8 @@ def compose_ldscores(ref_path, sumstats, annot, out, *, sources=None, snps=None,
                   n_window_pairs=int(n_pairs), mean_ancestry_vector=m_vec.tolist(), kappa0_matrix=k0.tolist(),
                   mean_ancestry_from_se=np.asarray(m_se).tolist(), kappa0_from_se=np.asarray(k_se).tolist(),
                   gwas_n=N, covariate_rank=p, nu=nu, kernel=kern.describe(), theta=th, theta_source=th_source,
-                  relatedness=rel_sum, r2=r2, grid_cm=grid_cm, cell_matrix=cells_used,
+                  relatedness=rel_sum, relatedness_profile=None if rel_prof is None else rel_prof.describe(),
+                  r2=r2, grid_cm=grid_cm, cell_matrix=cells_used,
                   derived_covariance_cross_noise=[dict(source=sources[x[0]], panel=sources[x[1]]) for x in cross],
                   reference=dict(sources=ref.manifest["sources"], window_kb=ref.manifest["window_kb"],
                                  genetic_map=ref.manifest["genetic_map"]),
