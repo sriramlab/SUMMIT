@@ -502,6 +502,17 @@ def test_panel_admixture_removed(tmp_path):
                for s in man["sources"])
     with pytest.raises(ValueError):                                 # cleaning twice is refused
         remove_panel_admixture(str(tmp_path / "pure_clean"), {"A": str(tmp_path / "A")}, match="id", log=quiet)
+    # the same fits applied without the panels' genotypes reproduce the cleaned reference exactly
+    from summit.admixed_ld.panel_admixture import apply_panel_admixture
+    apply_panel_admixture(str(tmp_path / "adm"), str(tmp_path / "adm_clean"), out=str(tmp_path / "adm_applied"),
+                          log=quiet)
+    for c in json.load(open(tmp_path / "adm_clean" / "manifest.json"))["chromosomes"]:
+        za, zb = np.load(tmp_path / "adm_clean" / f"chr{c}.npz"), np.load(tmp_path / "adm_applied" / f"chr{c}.npz")
+        assert set(za.files) == set(zb.files)
+        for key in za.files:
+            np.testing.assert_array_equal(za[key], zb[key])
+    with pytest.raises(ValueError):                                 # applying twice is refused
+        apply_panel_admixture(str(tmp_path / "adm_applied"), str(tmp_path / "adm_clean"), log=quiet)
 
 
 def test_regional_matrix(sim, tmp_path):

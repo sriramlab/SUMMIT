@@ -149,6 +149,16 @@ def remove_panel_admixture(ref_path, panels: dict, out=None, *, match="position"
             + "; ".join(f"{names[a]}/{names[b]} A {f['A']:.2e} H {f['H']:.2e} lam {f['lam']:.3f}"
                         for (a, b), f in kern.fits.items())
             + ("" if removed_ok else f"; not removed (z below {z_min})"))
+    _apply_kernels(ref_path, ref, kernels, names, log)
+    with open(os.path.join(ref_path, "manifest.json"), "w") as f:
+        json.dump(man, f, indent=1)
+    return man
+
+
+def _apply_kernels(ref_path, ref, kernels, names, log):
+    """Subtract D_j' Kt_p(d) D_k from the band covariances (and D_j' Kt_p(0) D_j from the variances) of each source
+    whose kernel is given, keeping the sampling variance (m22 - cov^2) of every covariance. Rewrites the chromosome
+    files of ref_path in place."""
     removed = {i: 0.0 for i in kernels}
     for c in ref.chromosomes:
         path = os.path.join(ref_path, f"chr{c}.npz")
@@ -168,8 +178,59 @@ def remove_panel_admixture(ref_path, panels: dict, out=None, *, match="position"
             z[f"v_{i}"] = z[f"v_{i}"] - np.einsum("ja,ab,jb->j", D, kern(np.zeros(1))[0], D)
             removed[i] += float(np.abs(a).sum())
         np.savez(path, **z)
-    with open(os.path.join(ref_path, "manifest.json"), "w") as f:
-        json.dump(man, f, indent=1)
     log("[admixed-ld] panel admixture removed: " + ", ".join(f"{names[i]} (sum |change| {v:.4g})"
                                                              for i, v in removed.items()) + f"; reference {ref_path}")
+    return removed
+
+
+def kernels_from_manifest(manifest, names):
+    """{source index: PanelKernel} from the panel_admixture records of a cleaned reference's manifest, for a reference
+    with the same sources in the same order (names). Sources whose fit was not removed (z below z_min) are left out."""
+    src_names = [s["name"] for s in manifest["sources"]]
+    if src_names != list(names):
+        raise ValueError(f"The fits are for sources {src_names}, not {list(names)} (same names and order needed).")
+    k1 = len(names) - 1
+    kernels = {}
+    for i, s in enumerate(manifest["sources"]):
+        pa = s.get("panel_admixture")
+        if not pa or not pa.get("removed"):
+            continue
+        fits = {}
+        for key, f in pa["fits"].items():
+            a_name, b_name = key.split(",")
+            fits[(names.index(a_name), names.index(b_name))] = dict(A=float(f["A"]), H=float(f["H"]),
+                                                                     lam=float(f["lam"]))
+        kernels[i] = PanelKernel(fits, k1)
+    return kernels
+
+
+def apply_panel_admixture(ref_path, fits_from, out=None, *, log=print):
+    """Remove the panels' admixture LD with kernels fitted elsewhere: fits_from is a reference cleaned by
+    remove_panel_admixture (its directory or manifest.json), made from the same panels. For a reference converted or
+    subset from those panels' reference (another SNP set or build) where the panel genotypes are not available, e.g.
+    inside a data enclave. In place when out is None, otherwise into a copy at out."""
+    src_man = fits_from if not os.path.isdir(fits_from) else os.path.join(fits_from, "manifest.json")
+    with open(src_man) as f:
+        fm = json.load(f)
+    if out is not None and os.path.abspath(out) != os.path.abspath(ref_path):
+        if os.path.exists(os.path.join(out, "manifest.json")):
+            raise ValueError(f"{out} already holds a reference.")
+        shutil.copytree(ref_path, out, dirs_exist_ok=True)
+        ref_path = out
+    ref = Reference(ref_path)
+    names = list(ref.names)
+    man = ref.manifest
+    if any("panel_admixture" in s for s in man["sources"]):
+        raise ValueError(f"The panel admixture was already removed from {ref_path}.")
+    kernels = kernels_from_manifest(fm, names)
+    for i, s in enumerate(fm["sources"]):
+        if "panel_admixture" in s:
+            man["sources"][i]["panel_admixture"] = dict(s["panel_admixture"], applied_from=os.path.abspath(src_man))
+    for i in kernels:
+        log(f"[admixed-ld] panel admixture of {names[i]} from {src_man}: "
+            + "; ".join(f"{k} A {f['A']:.2e} H {f['H']:.2e} lam {f['lam']:.3f}" for k, f in
+                        fm["sources"][i]["panel_admixture"]["fits"].items()))
+    _apply_kernels(ref_path, ref, kernels, names, log)
+    with open(os.path.join(ref_path, "manifest.json"), "w") as f:
+        json.dump(man, f, indent=1)
     return man

@@ -56,15 +56,20 @@ def main(argv=None):
     r.add_argument("--threads", type=int, default=1)
     r.add_argument("--remove-panel-admixture", action="store_true",
                    help="remove each panel's own admixture LD (measured with the weighted-LD curve of the panel) from "
-                        "its covariances and variances; recommended for panels drawn from a biobank, and together with "
-                        "compose --cell-matrix")
+                        "its covariances and variances. Optional and off by default: it removes LD that the target "
+                        "cohort lacks only when the target's segments of that ancestry do not share the panel's own "
+                        "admixture (see the documentation)")
     r.add_argument("--out", required=True)
 
     cp = sub.add_parser("clean-panels", help="remove the panels' own admixture LD from an existing reference (copy)")
     cp.add_argument("--ref", required=True, help="reference written by `summit admixed-ld reference`")
-    cp.add_argument("--panel", action="append", required=True,
+    cp.add_argument("--panel", action="append",
                     help="PLINK prefix of a panel the reference was built from (repeat, in the order of --names)")
-    cp.add_argument("--names", required=True, help="comma-separated source names of the panels given")
+    cp.add_argument("--names", help="comma-separated source names of the panels given")
+    cp.add_argument("--from-fits",
+                    help="instead of --panel: a reference cleaned from the same panels (directory or manifest.json); "
+                         "its fitted panel kernels are applied to --ref, e.g. a subset or converted copy of that "
+                         "reference where the panels' genotypes are not available")
     cp.add_argument("--match", choices=["position", "id"], default="position")
     cp.add_argument("--fit-cm", default="3,40", help="distance range of the panel curve fit, in cM (default 3,40)")
     cp.add_argument("--threads", type=int, default=1)
@@ -190,8 +195,15 @@ def main(argv=None):
         if a.remove_panel_admixture:
             from .panel_admixture import remove_panel_admixture
             remove_panel_admixture(a.out, dict(zip(names, a.panel)), match=a.match, threads=a.threads, log=log._log)
+    elif a.cmd == "clean-panels" and a.from_fits:
+        if a.panel:
+            raise SystemExit("Give either --panel (with --names) or --from-fits, not both.")
+        from .panel_admixture import apply_panel_admixture
+        apply_panel_admixture(a.ref, a.from_fits, out=a.out, log=log._log)
     elif a.cmd == "clean-panels":
         from .panel_admixture import remove_panel_admixture
+        if not a.panel or not a.names:
+            raise SystemExit("clean-panels needs --panel and --names, or --from-fits.")
         names = _sources(a.names)
         if len(names) != len(a.panel):
             raise SystemExit("Give one --panel per name in --names.")
