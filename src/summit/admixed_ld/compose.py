@@ -9,13 +9,16 @@ covariates, it is computed as:
   pairs within the reference window   pi_A(d) C^A + pi_E(d) C^E + delta_j delta_k kappa(d), squared, with each squared
                                       panel covariance replaced by its unbiased estimate (order-4 U-statistic) and
                                       the sampling covariance of a source derived by inversion with the known panels
-                                      it was computed from removed once (Reference.covariance_noise_mix);
+                                      it was computed from removed once (Reference.covariance_noise_mix); with the
+                                      cohort's background at every distance, also less each panel's own background,
+                                      pi_s(d)^2 v_sj v_sk S_s(d) / (n_s (n_s - 3)) (SmoothBackground);
   every pair on the same chromosome   delta_j^2 delta_k^2 kappa(d)^2, by FFT convolution on a grid of `grid_cm`
                                       (the window pairs' admixture-only part is taken out of the first sum);
   pairs on different chromosomes      delta_j^2 delta_k^2 far^2;
   the same-person term, each SNP with itself (V_j), and, optionally, relatives: with the curve's profile
                                       (1 / nu^2) [B sum_{k in c, k != j} V_k + sum_{k in c on j's chromosome}
-                                      (phi(d_jk) - B) V_k] (RelatednessProfile, BackgroundProfile), or the uniform
+                                      (phi(d_jk) - B) V_k] (RelatednessProfile, BackgroundProfile, or the cohort's
+                                      all-pairs background at every distance, SmoothBackground), or the uniform
                                       (sum over their ordered pairs of g^2) / nu^2 * sum_{k in c} V_k, with g the
                                       relatedness of the covariate-adjusted, standardized genotypes.
 V_j = C_res(j,j) / s_j^2 is the population share of SNP j's variance that the covariates leave, which SUMMIT's
@@ -225,9 +228,13 @@ class RelatednessProfile:
     @classmethod
     def from_curve(cls, curve_prefix: str, info: dict, smooth: float = 0.1, background_min_cm: float = 3.0,
                    background_window: str = "zero"):
-        """The listed pairs' profile, or, when the curve also measured all pairs (--background), that measurement from
-        background_min_cm on and between chromosomes, with the listed profile plus the unlisted part (flat: its value
-        at background_min_cm; zero: none) below."""
+        """The listed pairs' profile, or, when the curve also measured all pairs (--background): with
+        background_window 'panels' the smooth all-pairs background at every distance (SmoothBackground, fitted from
+        background_min_cm on; compose then removes the panels' own background inside the band), otherwise (the rules
+        of 5 Nov 2026) that measurement from background_min_cm on and between chromosomes, with the listed profile
+        plus the unlisted part (flat: its value at background_min_cm; zero: none) below."""
+        if background_window == "panels" and "background" in info:
+            return SmoothBackground.from_curve(curve_prefix, info, fit_min_cm=background_min_cm, smooth=smooth)
         r = info.get("relatedness")
         prof = None
         if r is not None and "profile" in r:
@@ -300,6 +307,92 @@ class BackgroundProfile:
                     phi_at={str(x): float(self(x)) for x in at if x <= self.d.max()})
 
 
+def background_rates(fit_min_cm, n=8):
+    """Decay rates per cM of SmoothBackground: geometric from 0.01 to 1 / fit_min_cm, the components whose
+    autocovariance a fit from fit_min_cm on resolves (a component decaying faster is mostly gone by fit_min_cm, and
+    its amplitude at short distance would be an extrapolation of noise or of within-source LD)."""
+    return np.geomspace(0.01, 1.0 / float(fit_min_cm), n)
+
+
+class SmoothBackground:
+    """The background LD of a group of people, a cohort (`curve --background`) or a source panel (recorded by
+    `clean-panels`), as a smooth function of genetic distance:
+        S(d) = B + sum_m A_m exp(-l_m d),   A_m >= 0,
+    with B the between-chromosome value and the rates of background_rates(fit_min_cm), fitted by least squares
+    weighted by SNP pairs to the measured profile (lags pooled in bins growing at 10% of the distance) on
+    d >= fit_min_cm. This is the form of the autocovariance of identity by descent for any mix of relationships and of
+    structure from recent admixture, and it is evaluated at every distance. Below fit_min_cm the measured profile also
+    holds within-source LD (in the cohort pi_s(d)^2 W_s, in a panel W_s), which the panels supply; the fit keeps only
+    the components the fitting range resolves, sharing on segments longer than about fit_min_cm (the last 10 to 20
+    generations), so its extrapolation into the band does not take up within-source LD. Values are sums over ordered
+    pairs of people per SNP pair, the scale of `curve --background`; per_pair divides by n (n - 3), the scale on which
+    a panel's background enters its unbiased squared covariances (E U_s = c_s^2 + v_j v_k S_s(d) / (n_s (n_s - 3)))."""
+
+    def __init__(self, table, between, n, fit_min_cm=3.0, smooth=0.1, source="", name=""):
+        from scipy.optimize import lsq_linear
+        t = pd.DataFrame(table)
+        tb = pd.DataFrame({"lag": t["lag"].to_numpy(), "d_cm": t["d_cm"].to_numpy(), "w": t["w"].to_numpy(),
+                           "dsum": t["d_cm"].to_numpy() * t["w"].to_numpy(),
+                           "listed": t["excess"].to_numpy() * t["w"].to_numpy(), "controls": 0.0})
+        tb = tb[np.isfinite(tb.listed) & np.isfinite(tb.d_cm)]
+        pool = RelatednessProfile(tb, between, 1, 0, smooth, source=source)
+        self.between, self.n, self.fit_min_cm = float(between), int(n), float(fit_min_cm)
+        self.rates = background_rates(fit_min_cm)
+        use = (pool.d >= self.fit_min_cm) & (pool.w > 0)
+        if use.sum() < 2:
+            raise ValueError(f"The background profile {source or name} has fewer than 2 points beyond "
+                             f"{fit_min_cm} cM.")
+        dd, ww = pool.d[use], pool.w[use]
+        A = np.exp(-np.outer(dd, self.rates)) * np.sqrt(ww)[:, None]
+        self.amp = lsq_linear(A, (pool.phi[use] - self.between) * np.sqrt(ww), bounds=(0.0, np.inf),
+                              method="bvls").x
+        self.source, self.name, self.smooth = source, name, float(smooth)
+        self.d = pool.d
+
+    @classmethod
+    def from_curve(cls, curve_prefix: str, info: dict, fit_min_cm=3.0, smooth=0.1):
+        b = info["background"]
+        path = b["file"] if os.path.exists(b["file"]) else f"{curve_prefix}.background.tsv"
+        return cls(pd.read_csv(path, sep="\t"), b["between"]["value"], info["n_samples"], fit_min_cm, smooth,
+                   source=path, name="cohort")
+
+    @classmethod
+    def from_record(cls, rec: dict, fit_min_cm=3.0, smooth=0.1, name=""):
+        """From a panel's `panel_background` record in a reference manifest (written by clean-panels)."""
+        return cls(rec["table"], rec["between"]["value"], rec["n"], fit_min_cm, smooth,
+                   source=rec.get("file", ""), name=name)
+
+    def __call__(self, d):
+        d = np.asarray(d, np.float64)
+        return self.between + np.exp(-np.multiply.outer(d, self.rates)) @ self.amp
+
+    def per_pair(self, d):
+        return self(d) / (self.n * (self.n - 3.0))
+
+    def describe(self) -> dict:
+        at = [0, 0.5, 1, 2, 3, 5, 10, 20, 40, 80]
+        return dict(mode="background", name=self.name, between=self.between, n=self.n, fit_min_cm=self.fit_min_cm,
+                    rates=self.rates.tolist(), amplitudes=self.amp.tolist(), source=self.source,
+                    phi_at={str(x): float(self(x)) for x in at})
+
+
+def panel_background_record(info: dict, table: pd.DataFrame, file: str = "") -> dict:
+    """The aggregates of a panel's background measurement (genotype_curve(..., background=True) on the panel, without
+    covariates) that a reference manifest keeps: the table by lag and the between-chromosome value."""
+    b = info["background"]
+    keep = table[np.isfinite(table.excess)]
+    return dict(n=int(info["n_samples"]), quantile=float(b["quantile"]), cell_cm=float(b["cell_cm"]),
+                null=float(b["null"]), n_snps=int(b["n_snps"]),
+                between=dict(value=float(b["between"]["value"]), n_snps=int(b["between"]["n_snps"])),
+                table={k: keep[k].astype(float).round(10).tolist() if k != "lag" else keep[k].astype(int).tolist()
+                       for k in ("lag", "d_cm", "w", "excess")},
+                file=file,
+                definition="the panel's all-pairs cross-person LD among its least differentiated SNPs per SNP pair "
+                           "(sum over ordered pairs of members), less its admixture part and the null, without "
+                           "covariates (curve --background on the panel); its unbiased squared covariances hold "
+                           "v_j v_k S(d) / (n (n - 3)) of it")
+
+
 def relatedness_term(L, rel, chrom, cm, cls, V, K, nu, grid_cm):
     """Add the relatives' term of `rel` (RelatednessProfile) to the LD scores L (M x K) in place: B between all pairs
     (each SNP without itself) and phi(d) - B along each chromosome, by FFT convolution on a grid of grid_cm."""
@@ -329,7 +422,7 @@ def _parse_values(x):
 
 def compose_ldscores(ref_path, sumstats, annot, out, *, sources=None, snps=None, match="position", curve=None,
                      generations=None, decay_per_cm=None, mean_ancestry=None, kappa0=None, theta_sd=None,
-                     relatedness=None, relatedness_smooth=0.1, background_min_cm=3.0, background_window="zero",
+                     relatedness=None, relatedness_smooth=0.1, background_min_cm=3.0, background_window="panels",
                      nu=None, r2=0.99, grid_cm=0.02, cell_matrix=False,
                      cell_switch_cm=10.0,
                      pair_chunk=1 << 23, log=print):
@@ -475,9 +568,10 @@ def compose_ldscores(ref_path, sumstats, annot, out, *, sources=None, snps=None,
             rel_prof = RelatednessProfile.from_curve(curve, curve_info, smooth=relatedness_smooth,
                                                      background_min_cm=background_min_cm,
                                                      background_window=background_window)
-            log(f"[admixed-ld] compose: relatives' term from the curve's profile, B = {rel_prof.between:.4g} between "
-                "chromosomes, phi(d) within (" + ", ".join(f"{k} cM {v:.4g}" for k, v in
-                                                          rel_prof.describe()["phi_at"].items()) + ")")
+            log("[admixed-ld] compose: relatives' term from the curve's "
+                + ("all-pairs background at every distance" if isinstance(rel_prof, SmoothBackground) else "profile")
+                + f", B = {rel_prof.between:.4g} between chromosomes, phi(d) within ("
+                + ", ".join(f"{k} cM {v:.4g}" for k, v in rel_prof.describe()["phi_at"].items()) + ")")
         else:
             if str(relatedness) == "curve":
                 log("[admixed-ld] note: the curve has no relatedness profile (made before 5 Nov 2026); the relatives' "
@@ -485,6 +579,30 @@ def compose_ldscores(ref_path, sumstats, annot, out, *, sources=None, snps=None,
             rel_sum = float(curve_info["relatedness"]["sum_squared_ordered"])
     else:
         rel_sum = float(relatedness)
+    # the panels' own background LD, which their unbiased squared covariances hold inside the band: removed when the
+    # cohort's background is applied at every distance (background_window 'panels')
+    panel_bg = {}
+    if isinstance(rel_prof, SmoothBackground):
+        missing = []
+        for n_, s in enumerate(sources):
+            src_m = ref.manifest["sources"][si[n_]]
+            rec = src_m.get("panel_background")
+            if rec is not None:
+                panel_bg[n_] = SmoothBackground.from_record(rec, fit_min_cm=background_min_cm,
+                                                            smooth=relatedness_smooth, name=s)
+            elif src_m.get("derived"):
+                log(f"[admixed-ld] note: {s} is a derived source without genotypes; its covariances' own background "
+                    "LD is not removed")
+            else:
+                missing.append(s)
+        if missing:
+            raise ValueError("--relatedness curve with the cohort's background at every distance needs each panel's "
+                             f"own background, which {ref_path} does not record for {', '.join(missing)}: run "
+                             "`summit admixed-ld clean-panels` (it measures it), or pass --background-window zero for "
+                             "the rule of 5 Nov 2026.")
+        log("[admixed-ld] compose: the panels' own background LD is removed inside the band ("
+            + ", ".join(f"{sources[n_]}: {pb.per_pair(2.0):.3g} per SNP pair at 2 cM, n {pb.n}"
+                        for n_, pb in panel_bg.items()) + ")")
 
     # ---------------------------------------------------------------------------------------- per-SNP model
     quad = lambda Mx: np.einsum("jab,ab->j", O, Mx)                 # D_j' Mx D_j without sampling noise
@@ -579,6 +697,9 @@ def compose_ldscores(ref_path, sumstats, annot, out, *, sources=None, snps=None,
                         cr += pi_s * cs_
                         pis[s], vnss[s] = pi_s, vns
                     noise = window_noise(pis, vnss, cross_c, d)
+                    for n_, pb in panel_bg.items():               # the panel's own background (SmoothBackground)
+                        noise += (pis[n_] * pis[n_] * vr[n_][jl].astype(np.float64) * vr[n_][kl].astype(np.float64)
+                                  * pb.per_pair(d))
                     sq = cr * cr - noise - adm * adm
                     L += np.bincount(j * K + cls[k], weights=sq / (cres[j] * s2[k]), minlength=M * K).reshape(M, K)
                     L += np.bincount(k * K + cls[j], weights=sq / (cres[k] * s2[j]), minlength=M * K).reshape(M, K)
@@ -634,6 +755,7 @@ def compose_ldscores(ref_path, sumstats, annot, out, *, sources=None, snps=None,
                   mean_ancestry_from_se=np.asarray(m_se).tolist(), kappa0_from_se=np.asarray(k_se).tolist(),
                   gwas_n=N, covariate_rank=p, nu=nu, kernel=kern.describe(), theta=th, theta_source=th_source,
                   relatedness=rel_sum, relatedness_profile=None if rel_prof is None else rel_prof.describe(),
+                  panel_background={sources[n_]: pb.describe() for n_, pb in panel_bg.items()},
                   r2=r2, grid_cm=grid_cm, cell_matrix=cells_used,
                   derived_covariance_cross_noise=[dict(source=sources[x[0]], panel=sources[x[1]]) for x in cross],
                   reference=dict(sources=ref.manifest["sources"], window_kb=ref.manifest["window_kb"],

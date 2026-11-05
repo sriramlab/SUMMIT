@@ -78,6 +78,25 @@ the LD scores. Rare variants are the least accurate in a small panel, since only
 people carry them. In the check below, a random 85 of the 4,905 African-ancestry panel
 members gave mean h² within 2% of the in-sample value.
 
+Panels drawn from a biobank carry LD of their own sample. Their members have a little
+admixture between the sources, and they are cryptic relatives and a structured sample, so
+their unbiased squared covariances hold the cross-person LD of their members on top of
+the population's LD (for a panel of n, v_j v_k S(d) / (n (n - 3)), with S the panel's
+background below). The cohort's curve and its own background measurement already hold the
+cohort's versions of both, so the panels' copies are counted twice inside the band.
+
+```bash
+summit admixed-ld clean-panels --ref ref/afr_eur --panel ref/afr --panel ref/eur --names AFR,EUR \
+  --threads 16 --out ref/afr_eur_clean
+```
+
+`clean-panels` runs the curve on each panel. It removes the panel's admixture LD from its
+covariances and variances when the panel's kernel at zero is at least 3 jackknife SEs above
+zero, and it records the panel's own background LD (the cohort estimator of
+`curve --background`, run on the panel without covariates; aggregates only) in the
+manifest whether or not anything is removed. `--from-fits` applies both to a converted or
+subset copy of the same panels' reference where the genotypes are not available.
+
 ## The cohort's curve
 
 ```bash
@@ -145,12 +164,16 @@ from `--ancestry-sd`, or defaults to 0.12. `--mean-ancestry` and `--kappa0` repl
 values from the standard errors. `--relatedness curve` adds the relatives' part of the
 LD scores from the curve: B between chromosomes and φ(d) along each chromosome, inside the
 reference window too. With a curve made with `--background`, the term is the measured LD
-of all pairs from `--background-min-cm` (default 3) on and between chromosomes, smoothed as
-a sum of decaying exponentials, and the listed pairs' profile below it, where the panels'
-own covariances already hold their populations' background relatedness
-(`--background-window flat` adds the unlisted part there as well). `--relatedness uniform`
-adds the curve's sum of g² to every SNP pair, as before 5 Nov 2026, and `--relatedness X`
-gives that sum directly.
+of all pairs of the cohort at every distance, inside the reference band too. It is smoothed
+as B plus a sum of decaying exponentials fitted from `--background-min-cm` (default 3) on,
+with rates up to one over that distance, the components that the fitting range resolves;
+closer, the measurement also holds within-source LD, which the panels supply. Inside the
+band the panels' own background LD, recorded by `clean-panels`, is removed with its
+weight π_s(d)² and the panel's variances. This needs a reference from `clean-panels`
+(compose stops otherwise). `--background-window zero` and `flat` keep the rules of 5 Nov
+2026, which used the measurement only from `--background-min-cm` on, with the listed
+pairs' profile below. `--relatedness uniform` adds the curve's sum of g² to every SNP pair,
+as before 5 Nov 2026, and `--relatedness X` gives that sum directly.
 
 The outputs are `ld/cohort.gw.ldscore.gz`, `ld/cohort.gw.M` and
 `ld/cohort.admixed_ld.json`, which records every parameter used. Fit as usual:

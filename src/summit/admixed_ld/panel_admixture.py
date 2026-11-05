@@ -29,6 +29,13 @@ chromosome out), so that a panel without admixture keeps its covariances. The cl
 c - D_j' Kt_p(d) D_k, with m22 changed so that the sampling variance of the covariance is kept (m22 - c^2 + c'^2);
 the variance becomes v - D_j' Kt_p(0) D_j. Frequencies are kept: a panel's mean admixture
 shortens every contrast by the same factor, which the cohort's curve and the standard errors absorb.
+
+The same pass records each panel's own background LD (`panel_background` in the manifest): the cross-person LD of its
+members among the least differentiated SNPs, less its admixture part and the null, by distance (the estimator of
+`curve --background`, without covariates). It is the panel's cryptic relatedness and the structure among its members,
+which its unbiased squared covariances hold on top of the population's LD, E U = c^2 + v_j v_k S(d) / (n (n - 3)).
+The cohort's own background measurement holds the cohort's version, so when compose applies it at every distance it
+removes the panels' copy inside the band (compose.SmoothBackground), as cleaning removes the panels' admixture LD.
 """
 from __future__ import annotations
 
@@ -118,11 +125,19 @@ def panel_curve_kernel(chr_sums, *, lo=3.0, hi=40.0):
 
 
 def remove_panel_admixture(ref_path, panels: dict, out=None, *, match="position", lo=3.0, hi=40.0, z_min=3.0,
-                           threads=1, step=4096, native=True, log=print):
+                           threads=1, step=4096, native=True, background=True, background_snps=20000,
+                           background_quantile=0.2, log=print):
     """Remove each listed panel's admixture LD from the reference at ref_path (in place when out is None, otherwise
     into a copy at out). panels: {source name: PLINK prefix of the panel the reference was built from}. A panel is
     cleaned only if some diagonal entry of its Kt_p(0) is at least z_min jackknife standard errors (leave one
-    chromosome out) above zero; otherwise the fit is noise and the panel is left as it is (recorded in the manifest)."""
+    chromosome out) above zero; otherwise the fit is noise and the panel is left as it is (recorded in the manifest).
+    With background (the default) the same pass also measures the panel's own background LD (the cross-person LD of
+    its members among the least differentiated SNPs: their cryptic relatedness and the structure among them, which the
+    panel's unbiased squared covariances hold; `curve --background` on the panel, between chromosomes on
+    background_snps SNPs) and records it in the manifest as `panel_background`. Compose removes it inside the band
+    when it applies the cohort's own background at every distance (compose.SmoothBackground). It is recorded whether
+    or not the panel's admixture is removed."""
+    from .compose import panel_background_record
     from .curve import genotype_curve
     if out is not None and os.path.abspath(out) != os.path.abspath(ref_path):
         if os.path.exists(os.path.join(out, "manifest.json")):
@@ -144,7 +159,12 @@ def remove_panel_admixture(ref_path, panels: dict, out=None, *, match="position"
         cprefix = os.path.join(ref_path, f"panel_admixture_{s}")
         log(f"[admixed-ld] panel admixture: weighted-LD curve of the {s} panel ({prefix})")
         _, info = genotype_curve(prefix, ref_path, cprefix, sources=names, covar=None, match=match, max_cm=hi,
-                                 cells_cm=0, per_chromosome=True, step=step, threads=threads, native=native, log=log)
+                                 cells_cm=0, per_chromosome=True, step=step, threads=threads, native=native,
+                                 background=background, background_quantile=background_quantile,
+                                 background_between_snps=background_snps, log=log)
+        if background:
+            src["panel_background"] = panel_background_record(info, pd.read_csv(f"{cprefix}.background.tsv", sep="\t"),
+                                                              file=os.path.basename(cprefix) + ".background.tsv")
         kern, se = panel_curve_kernel(f"{cprefix}.curve_chr.npz", lo=lo, hi=hi)
         k0 = kern(np.zeros(1))[0]
         zdiag = np.diag(k0) / np.maximum(np.diag(se), 1e-300)
@@ -238,6 +258,10 @@ def apply_panel_admixture(ref_path, fits_from, out=None, *, log=print):
     for i, s in enumerate(fm["sources"]):
         if "panel_admixture" in s:
             man["sources"][i]["panel_admixture"] = dict(s["panel_admixture"], applied_from=os.path.abspath(src_man))
+        if "panel_background" in s:                # a property of the panel's people, carried with the fits
+            man["sources"][i]["panel_background"] = dict(s["panel_background"], applied_from=os.path.abspath(src_man))
+            log(f"[admixed-ld] panel background of {names[i]} from {src_man}: between chromosomes "
+                f"{s['panel_background']['between']['value']:.4g} per SNP pair, n {s['panel_background']['n']}")
     for i in kernels:
         log(f"[admixed-ld] panel admixture of {names[i]} from {src_man}: "
             + "; ".join(f"{k} A {f['A']:.2e} H {f['H']:.2e} lam {f['lam']:.3f}" for k, f in

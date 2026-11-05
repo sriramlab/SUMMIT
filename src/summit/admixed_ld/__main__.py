@@ -5,17 +5,20 @@
   summit admixed-ld clean-panels --ref REF_DIR --panel AFR_PREFIX --panel EUR_PREFIX --names AFR,EUR --out NEW_DIR
   summit admixed-ld curve     --geno COHORT --ref REF_DIR [--covar FILE] [--keep FILE] [--sources AFR,EUR]
                               [--relative-pairs FILE [--kinship-col COL --kinship-min X] [--closure]
-                               [--relatedness-cell-cm 0.5] [--relatedness-controls N]] --out PREFIX
+                               [--relatedness-cell-cm 0.5] [--relatedness-controls N]] [--background] --out PREFIX
   summit admixed-ld compose   --ref REF_DIR --sumstats FILE_OR_DIR [...] --annot ANNOT --out PREFIX
                               (--curve PREFIX | --admixture-generations T | --decay-per-cm LAMBDA)
                               [--sources AFR,EUR] [--ancestry-sd SD] [--relatedness X|curve|uniform] [--snps FILE]
+                              [--background-window panels|zero|flat] [--background-min-cm 3]
   summit admixed-ld matrix    --ref REF_DIR --params PREFIX.admixed_ld.json (--region CHR:START-END | --snps FILE)
                               (--curve PREFIX | --admixture-generations T | --decay-per-cm LAMBDA)
                               [--taper auto|none|TAU_CM] [--no-admixture] --out PREFIX
 
 `reference` is built once from unadmixed panels of the two source populations. Panels drawn from a biobank carry some
 admixture of their own; --remove-panel-admixture (or `clean-panels` on an existing reference) measures it with the
-panel's weighted-LD curve and removes it from the panel's covariances and variances. `curve` is run by the cohort on its
+panel's weighted-LD curve and removes it from the panel's covariances and variances; both also record each panel's own
+background LD (cryptic relatedness and structure among its members), which compose removes inside the band when a
+cohort's background (`curve --background`) is applied at every distance. `curve` is run by the cohort on its
 genotypes and writes only aggregates (PREFIX.curve.tsv and PREFIX.curve.json). `compose` needs the GWAS summary
 statistics (BETA, SE, N; CHR and BP for matching by position, or --snps), the annotation of the fit (e.g. MAF/LD bins),
 and the decay of the local-ancestry covariance: the cohort's curve, a published admixture date in generations, or a
@@ -64,7 +67,8 @@ def main(argv=None):
                         "duplicated share of the target's kernel is not negligible (see the documentation)")
     r.add_argument("--out", required=True)
 
-    cp = sub.add_parser("clean-panels", help="remove the panels' own admixture LD from an existing reference (copy)")
+    cp = sub.add_parser("clean-panels", help="remove the panels' own admixture LD from an existing reference (copy) "
+                                             "and record each panel's own background LD")
     cp.add_argument("--ref", required=True, help="reference written by `summit admixed-ld reference`")
     cp.add_argument("--panel", action="append",
                     help="PLINK prefix of a panel the reference was built from (repeat, in the order of --names)")
@@ -76,6 +80,14 @@ def main(argv=None):
     cp.add_argument("--match", choices=["position", "id"], default="position")
     cp.add_argument("--fit-cm", default="3,40", help="distance range of the panel curve fit, in cM (default 3,40)")
     cp.add_argument("--threads", type=int, default=1)
+    cp.add_argument("--no-panel-background", action="store_true",
+                    help="do not measure the panels' own background LD (the cross-person LD of their members: cryptic "
+                         "relatedness and structure, which their unbiased squared covariances hold inside the band). "
+                         "By default it is measured with `curve --background` on each panel and recorded in the "
+                         "manifest (panel_background, aggregates only), which `compose --relatedness curve` needs to "
+                         "apply a cohort's background at every distance; --from-fits copies it")
+    cp.add_argument("--panel-background-snps", type=int, default=20000,
+                    help="SNPs used between chromosomes for the panels' background (default 20000)")
     cp.add_argument("--out", required=True, help="output reference directory (a cleaned copy)")
 
     c = sub.add_parser("curve", help="the cohort's weighted-LD curve and global-ancestry moments (aggregates only)")
@@ -159,13 +171,17 @@ def main(argv=None):
     m.add_argument("--relatedness-smooth", type=float, default=0.1,
                    help="width of the bins that pool the profile's lags, as a fraction of the distance (default 0.1)")
     m.add_argument("--background-min-cm", type=float, default=3.0,
-                   help="with a curve made with --background: from this distance on, the relatives' term is the "
-                        "measured LD of all pairs; below it, the listed pairs' profile plus the unlisted pairs' part "
-                        "as specified by --background-window (default 3)")
-    m.add_argument("--background-window", choices=["zero", "flat"], default="zero",
-                   help="the unlisted pairs' part below --background-min-cm: none (zero, the default: inside the "
-                        "reference window the panels' unbiased squared covariances hold their own populations' "
-                        "background relatedness) or its value at that distance (flat)")
+                   help="with a curve made with --background: the distance from which the smooth form of the "
+                        "cohort's and the panels' background LD is fitted (default 3; its rates reach 1 / this value "
+                        "per cM); with --background-window zero or flat, the distance from which the measurement is "
+                        "used")
+    m.add_argument("--background-window", choices=["panels", "zero", "flat"], default="panels",
+                   help="with a curve made with --background: 'panels' (the default) applies the cohort's all-pairs "
+                        "background LD at every distance, inside the reference band too, and removes there the "
+                        "panels' own background LD that their unbiased squared covariances hold (recorded by "
+                        "clean-panels); 'zero' and 'flat' are the rules of 5 Nov 2026 (the measurement from "
+                        "--background-min-cm on, below it the listed pairs' profile plus nothing or plus the unlisted "
+                        "part's value there)")
     m.add_argument("--nu", type=float, default=None, help="sample size minus covariates (default from the GWAS)")
     m.add_argument("--grid-cm", type=float, default=0.02, help="grid of the long-range convolution (default 0.02)")
     m.add_argument("--cell-matrix", action="store_true",
@@ -231,7 +247,8 @@ def main(argv=None):
                         chromosomes=chroms, step=a.step, threads=a.threads, dtype=a.dtype, log=log._log)
         if a.remove_panel_admixture:
             from .panel_admixture import remove_panel_admixture
-            remove_panel_admixture(a.out, dict(zip(names, a.panel)), match=a.match, threads=a.threads, log=log._log)
+            remove_panel_admixture(a.out, dict(zip(names, a.panel)), match=a.match, threads=a.threads,
+                                   log=log._log)
     elif a.cmd == "clean-panels" and a.from_fits:
         if a.panel:
             raise SystemExit("Give either --panel (with --names) or --from-fits, not both.")
@@ -246,7 +263,8 @@ def main(argv=None):
             raise SystemExit("Give one --panel per name in --names.")
         lo, hi = (float(x) for x in a.fit_cm.split(","))
         remove_panel_admixture(a.ref, dict(zip(names, a.panel)), out=a.out, match=a.match, lo=lo, hi=hi,
-                               threads=a.threads, log=log._log)
+                               threads=a.threads, background=not a.no_panel_background,
+                               background_snps=a.panel_background_snps, log=log._log)
     elif a.cmd == "derive":
         from .derive import derive_source
         derive_source(a.geno, a.ref, a.out, name=a.name, known=_sources(a.known), panel=a.panel, covar=a.covar,

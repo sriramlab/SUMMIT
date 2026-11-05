@@ -924,6 +924,123 @@ def test_background_measures_all_pairs(fam, tmp_path):
     # every relative is listed: what the listed pairs do not carry is small
     assert abs(float(prof.remainder(20.0))) < 0.1 * float(prof.listed(20.0))
     compose_ldscores(str(d / "ref"), [str(d / "ss")], str(d / "annot.tsv"), str(tmp_path / "ld"),
-                     curve=str(tmp_path / "cb"), relatedness="curve", log=lambda *a: None)
+                     curve=str(tmp_path / "cb"), relatedness="curve", background_window="zero", log=lambda *a: None)
     params = json.load(open(f"{tmp_path / 'ld'}.admixed_ld.json"))
     assert params["relatedness_profile"]["mode"] == "background"
+    with pytest.raises(ValueError, match="clean-panels"):          # the default needs the panels' own background
+        compose_ldscores(str(d / "ref"), [str(d / "ss")], str(d / "annot.tsv"), str(tmp_path / "ld2"),
+                         curve=str(tmp_path / "cb"), relatedness="curve", log=lambda *a: None)
+
+
+def _panel_with_sibs(rng, founders, chrom, cm, n_unrelated, n_sibships, copy_rate=3.0):
+    """Dosages of an unadmixed panel (one source's founders) with n_sibships pairs of full sibs among its members."""
+    import admixed_ld_sim
+    hap = admixed_ld_sim._example._haplotypes
+    h, _ = hap(rng, founders, cm, 2 * (n_unrelated + 2 * n_sibships), copy_rate)
+    people = [h[2 * i:2 * i + 2] for i in range(n_unrelated + 2 * n_sibships)]
+    out = [p[0] + p[1] for p in people[:n_unrelated]]
+    for s in range(n_sibships):
+        P, Q = people[n_unrelated + 2 * s], people[n_unrelated + 2 * s + 1]
+        for _ in range(2):
+            out.append(admixed_ld_sim._gamete(rng, P[0], P[1], chrom, cm) + admixed_ld_sim._gamete(rng, Q[0], Q[1],
+                                                                                                   chrom, cm))
+    return np.stack(out).astype(np.float64)
+
+
+def test_panel_background_removed_inside_the_band(tmp_path):
+    """A panel with relatives among its members carries their background LD in its unbiased squared covariances
+    (E U = c^2 + v_j v_k S(d) / (n (n - 3))). clean-panels measures it with the cohort's background estimator, and
+    compose with the cohort's background at every distance removes it inside the band, so that a panel with relatives
+    and one without compose nearly the same LD; with the rule of 5 Nov 2026 (no removal) they do not."""
+    from summit.admixed_ld.compose import SmoothBackground, compose_ldscores, unbiased_squared_covariance
+    from summit.admixed_ld.curve import genotype_curve
+    from summit.admixed_ld.panel_admixture import apply_panel_admixture, remove_panel_admixture
+    import admixed_ld_sim
+    rng = np.random.default_rng(23)
+    n_chr, spc, chr_cm = 4, 500, 60.0
+    chrom = np.repeat(np.arange(1, n_chr + 1), spc)
+    cm = np.concatenate([np.sort(rng.uniform(0, chr_cm, spc)) for _ in range(n_chr)])
+    M = cm.size
+    pE = rng.uniform(0.05, 0.95, M)
+    pA = np.clip(pE + rng.normal(0, 0.25, M), 0.03, 0.97)
+    founders = {s: (rng.random((40, M)) < p[None, :]).astype(np.int8) for s, p in (("A", pA), ("E", pE))}
+    var = pd.DataFrame({"CHR": chrom.astype(str), "SNP": [f"sim{j:05d}" for j in range(M)], "CM": cm,
+                        "BP": np.rint(cm * 1e6).astype(np.int64) + 1, "A1": "A", "A2": "G"})
+    n = 600
+    panels = {"Arel": _panel_with_sibs(rng, {"A": founders["A"]}, chrom, cm, 300, 150),
+              "Aunrel": _panel_with_sibs(rng, {"A": founders["A"]}, chrom, cm, n, 0),
+              "E": _panel_with_sibs(rng, {"E": founders["E"]}, chrom, cm, n, 0)}
+    for nm, G in panels.items():
+        write_bed(str(tmp_path / nm), G, var, nm)
+    hap = admixed_ld_sim._example._haplotypes
+    nc = 1500
+    th = rng.beta(0.75 * 20, 0.25 * 20, nc)
+    hC, _ = hap(rng, founders, cm, 2 * nc, 3.0, anc=np.repeat(th, 2), break_rate=0.08)
+    GC = (hC[0::2] + hC[1::2]).astype(np.float64)
+    iid = write_bed(str(tmp_path / "cohort"), GC, var, "c")
+    C = principal_components(GC, 2)
+    pd.DataFrame({"FID": iid, "IID": iid, "PC1": C[:, 0], "PC2": C[:, 1]}).to_csv(tmp_path / "cohort.cov", sep="\t",
+                                                                                   index=False)
+    os.makedirs(tmp_path / "ss")
+    for t in range(2):
+        beta, se = gwas(GC, rng.standard_normal(nc), C)
+        pd.DataFrame({"SNP": var.SNP, "CHR": var.CHR, "BP": var.BP, "A1": var.A1, "A2": var.A2, "N": nc,
+                      "BETA": beta, "SE": se, "Z": beta / se, "COV_RANK": 2}).to_csv(tmp_path / "ss" / f"t{t}.tsv",
+                                                                                     sep="\t", index=False)
+    pc = GC.mean(0) / 2
+    lo = (np.minimum(pc, 1 - pc) < 0.2).astype(int)
+    pd.DataFrame({"SNP": var.SNP, "low": lo, "high": 1 - lo}).to_csv(tmp_path / "annot.tsv", sep="\t", index=False)
+    quiet = lambda *a, **k: None
+    for r in ("rel", "unrel"):
+        build_reference([str(tmp_path / f"A{r}"), str(tmp_path / "E")], ["AFR", "EUR"], str(tmp_path / f"ref_{r}"),
+                        match="id", log=quiet)
+        remove_panel_admixture(str(tmp_path / f"ref_{r}"), {"AFR": str(tmp_path / f"A{r}"), "EUR": str(tmp_path / "E")},
+                               out=str(tmp_path / f"ref_{r}_c"), match="id", background_snps=2000,
+                               background_quantile=1.0, log=quiet)
+    man = json.load(open(tmp_path / "ref_rel_c" / "manifest.json"))
+    rec = man["sources"][0]["panel_background"]
+    assert rec["n"] == n and set(rec["table"]) == {"lag", "d_cm", "w", "excess"}
+    # the unbiased squared covariances of the panel with sibs hold its background: band pairs at 1-3 cM, where the
+    # founder-copying model leaves no within-source LD, against the panel's measured background per pair
+    ref = Reference(str(tmp_path / "ref_rel"))
+    num, cnt = 0.0, 0
+    for c in ref.chromosomes:
+        z = ref.load(c)
+        jl = np.repeat(np.arange(z["bp"].size), np.diff(z["indptr"]))
+        kl = z["indices"].astype(np.int64)
+        dd = np.abs(z["cm"][kl] - z["cm"][jl])
+        sel = (dd >= 1.0) & (dd < 3.0) & (z["v_0"][jl] > 0.05) & (z["v_0"][kl] > 0.05)
+        vv = z["v_0"][jl][sel].astype(np.float64) * z["v_0"][kl][sel]
+        U = unbiased_squared_covariance(z["cov_0"][sel].astype(np.float64), z["m22_0"][sel].astype(np.float64), vv, n)
+        num += float((U / vv).sum())
+        cnt += int(sel.sum())
+    sm = SmoothBackground.from_record(rec, fit_min_cm=1.5)
+    pooled = float(np.mean([sm.per_pair(x) for x in np.linspace(1.0, 3.0, 9)]))
+    assert num / cnt == pytest.approx(pooled, rel=0.15)
+    assert num / cnt > 1e-4                                       # sibs: about (1/4 + 1/8) x 300 / (n (n - 3))
+    # --from-fits carries the record
+    apply_panel_admixture(str(tmp_path / "ref_rel"), str(tmp_path / "ref_rel_c"), out=str(tmp_path / "ref_rel_f"),
+                          log=quiet)
+    assert json.load(open(tmp_path / "ref_rel_f" / "manifest.json"))["sources"][0]["panel_background"]["table"] == \
+        rec["table"]
+    # compose: the panel's relatives' LD is removed inside the band
+    genotype_curve(str(tmp_path / "cohort"), str(tmp_path / "ref_rel"), str(tmp_path / "cv"),
+                   covar=str(tmp_path / "cohort.cov"), match="id", background=True, background_quantile=0.5, log=quiet)
+    mass = {}
+    for r in ("rel", "unrel"):
+        for win in ("panels", "zero"):
+            o = str(tmp_path / f"ld_{r}_{win}")
+            compose_ldscores(str(tmp_path / f"ref_{r}_c"), [str(tmp_path / "ss")], str(tmp_path / "annot.tsv"), o,
+                             match="id", curve=str(tmp_path / "cv"), relatedness="curve", background_window=win,
+                             background_min_cm=1.5, log=quiet)
+            L = pd.read_csv(f"{o}.gw.ldscore.gz", sep="\t")
+            mass[r, win] = float((L.V.to_numpy()[:, None] * L[["low", "high"]].to_numpy()).sum())
+    gap_zero = mass["rel", "zero"] - mass["unrel", "zero"]
+    gap_panels = mass["rel", "panels"] - mass["unrel", "panels"]
+    assert gap_zero > 0.001 * mass["unrel", "zero"]                # the panel's sibs inflate the band
+    # most of it is removed; what stays is noise and, within a few tenths of a cM, the sibs' sharing of haplotypes in
+    # strong LD (the fourth moments of the shared haplotype), which the smooth form fitted beyond 1.5 cM leaves out
+    # (here half of the panel's members are sibs; in a biobank panel it is a small part of the band's LD)
+    assert abs(gap_panels) < 0.4 * gap_zero
+    params = json.load(open(str(tmp_path / "ld_rel_panels") + ".admixed_ld.json"))
+    assert set(params["panel_background"]) == {"AFR", "EUR"}
