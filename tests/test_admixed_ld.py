@@ -9,7 +9,8 @@ import pandas as pd
 import pytest
 
 sys.path.insert(0, os.path.dirname(__file__))
-from admixed_ld_sim import gwas, insample_ldscores, principal_components, simulate, write_bed  # noqa: E402
+from admixed_ld_sim import (gwas, insample_ldscores, principal_components, simulate, simulate_families,  # noqa: E402
+                            write_bed)
 
 from summit.admixed_ld._io import match_variants  # noqa: E402
 from summit.admixed_ld.model import Kernel, regress_standard_errors  # noqa: E402
@@ -732,3 +733,197 @@ def test_curve_corrects_frequency_noise_once(sim, tmp_path):
     assert info["theta"]["mean"] == pytest.approx(theta_mean(1), rel=1e-6)
     assert info_raw["theta"]["mean"] == pytest.approx(theta_mean(0), rel=1e-6)
     assert abs(theta_mean(2) - theta_mean(1)) > 0.01
+
+
+@pytest.fixture(scope="module")
+def fam(tmp_path_factory):
+    """An admixed cohort with sibships and first cousins (IBD segments from simulated meioses), its panels, PCs,
+    summary statistics, annotation, reference and listed relative pairs."""
+    d = tmp_path_factory.mktemp("admixed_ld_fam")
+    S = simulate_families(seed=11, n_sibships=150, sibs=3, n_cousin_families=300, n_unrelated=600)
+    v = S["variants"]
+    write_bed(str(d / "panelA"), S["panel_A"], v, "a")
+    write_bed(str(d / "panelE"), S["panel_E"], v, "e")
+    iid = write_bed(str(d / "cohort"), S["cohort"], v, "c")
+    C = principal_components(S["cohort"], 2)
+    pd.DataFrame({"FID": iid, "IID": iid, "PC1": C[:, 0], "PC2": C[:, 1]}).to_csv(d / "cohort.cov", sep="\t",
+                                                                                   index=False)
+    P = S["pairs"]
+    pd.DataFrame({"IID1": iid[P[:, 0]], "IID2": iid[P[:, 1]]}).to_csv(d / "pairs.tsv", sep="\t", index=False)
+    rng = np.random.default_rng(5)
+    os.makedirs(d / "ss")
+    for t in range(3):
+        y = rng.standard_normal(S["cohort"].shape[0])
+        beta, se = gwas(S["cohort"], y, C)
+        pd.DataFrame({"SNP": v.SNP, "CHR": v.CHR, "BP": v.BP, "A1": v.A1, "A2": v.A2, "N": len(y), "BETA": beta,
+                      "SE": se, "Z": beta / se, "COV_RANK": 2}).to_csv(d / "ss" / f"trait{t}.tsv", sep="\t",
+                                                                       index=False)
+    p = S["cohort"].mean(0) / 2
+    cls = (np.minimum(p, 1 - p) >= 0.2).astype(int)
+    pd.DataFrame({"SNP": v.SNP, "low": (cls == 0).astype(int), "high": (cls == 1).astype(int)}).to_csv(
+        d / "annot.tsv", sep="\t", index=False)
+    build_reference([str(d / "panelA"), str(d / "panelE")], ["AFR", "EUR"], str(d / "ref"), window_kb=3000,
+                    step=256, log=lambda *a: None)
+    from summit.admixed_ld.curve import genotype_curve
+    _, info = genotype_curve(str(d / "cohort"), str(d / "ref"), str(d / "c"), covar=str(d / "cohort.cov"),
+                             cell_cm=0.5, relative_pairs=str(d / "pairs.tsv"), relatedness_cell_cm=0.5,
+                             relatedness_memory_gb=0.0005, threads=3, log=lambda *a: None)   # several passes
+    # the adjusted, standardized genotypes of the curve
+    G = S["cohort"]
+    X = G - G.mean(0)
+    Q, _ = np.linalg.qr((C - C.mean(0)) / C.std(0, ddof=1))
+    Xr = X - Q @ (Q.T @ X)
+    var = np.einsum("ij,ij->j", Xr, Xr) / (G.shape[0] - 1 - C.shape[1])
+    ok = var > 1e-8
+    U = np.zeros_like(Xr)
+    U[:, ok] = Xr[:, ok] / np.sqrt(var[ok])
+    return dict(dir=d, S=S, C=C, cls=cls, info=info, U=U, ok=ok)
+
+
+def test_relatives_profile_sums_are_exact(fam):
+    """The curve's lag sums of the listed pairs' local relatedness, their SNP-pair counts and the between-chromosome
+    sum equal a direct computation from the adjusted genotypes (with the pairs split over several passes)."""
+    U, ok, v = fam["U"], fam["ok"], fam["S"]["variants"]
+    P = fam["S"]["pairs"]
+    Y = U[P[:, 0]] * U[P[:, 1]]                                   # pairs x SNPs
+    tab = pd.read_csv(f"{fam['dir'] / 'c'}.relatedness.tsv", sep="\t").set_index("lag")
+    chrom, cm = v.CHR.to_numpy(), v.CM.to_numpy()
+    lag_sum, w, dsum = {}, {}, {}
+    G = []
+    for c in pd.unique(chrom):
+        ix = np.flatnonzero((chrom == c) & ok)
+        x = cm[ix]
+        cell = ((x - cm[chrom == c].min()) / 0.5).astype(int)
+        R = np.zeros((P.shape[0], cell.max() + 1))
+        np.add.at(R.T, cell, Y[:, ix].T)
+        jj, kk = np.triu_indices(ix.size, 1)
+        lag_jk = np.abs(cell[jj] - cell[kk])
+        for L in range(R.shape[1]):
+            if L == 0:
+                s_ = ((R ** 2).sum() - (Y[:, ix] ** 2).sum()) / 2
+            else:
+                s_ = (R[:, :-L] * R[:, L:]).sum()
+            lag_sum[L] = lag_sum.get(L, 0.0) + 2 * s_
+            sel = lag_jk == L
+            w[L] = w.get(L, 0) + int(sel.sum())
+            dsum[L] = dsum.get(L, 0.0) + float(np.abs(x[jj] - x[kk])[sel].sum())
+        G.append(Y[:, ix].sum(axis=1))
+    for L in (0, 1, 2, 7, 40, 150):
+        assert tab.loc[L, "listed"] == pytest.approx(lag_sum[L], rel=1e-8)
+        assert tab.loc[L, "w"] == w[L]
+        assert tab.loc[L, "d_cm"] == pytest.approx(dsum[L] / w[L], rel=1e-5)        # the reference stores cM in float32
+    G = np.stack(G)
+    r = fam["info"]["relatedness"]
+    assert r["between"]["listed"] == pytest.approx(2 * float(((G.sum(0)) ** 2 - (G ** 2).sum(0)).sum()), rel=1e-8)
+    assert r["pairs"] == P.shape[0] and r["profile"]["n_controls"] == 20000
+    g = Y[:, ok].sum(1) / ok.sum()
+    assert r["sum_squared_ordered"] == pytest.approx(2 * np.sum(g ** 2), rel=1e-8)
+
+
+def test_relatives_profile_term_matches_realized_ld(fam):
+    """With relatives sharing IBD segments, the composed relatives' term reproduces their realized excess of in-sample
+    LD on one chromosome and between chromosomes (the uniform term does not), and the composed LD mass follows."""
+    from summit.admixed_ld.compose import RelatednessProfile, compose_ldscores
+    d, S = fam["dir"], fam["S"]
+    out = {}
+    for arm, rel in (("none", None), ("uniform", "uniform"), ("profile", "curve")):
+        compose_ldscores(str(d / "ref"), [str(d / "ss")], str(d / "annot.tsv"), str(d / f"comp_{arm}"),
+                         curve=str(d / "c"), relatedness=rel, log=lambda *a: None)
+        out[arm] = pd.read_csv(str(d / f"comp_{arm}") + ".gw.ldscore.gz", sep="\t")
+    keep = S["variants"].SNP.isin(out["none"].SNP).to_numpy()
+    V = out["none"].V.to_numpy()
+    n = S["cohort"].shape[0]
+    nu = n - 1 - fam["C"].shape[1]
+    term = {k: (out[k][["low", "high"]].to_numpy() - out["none"][["low", "high"]].to_numpy()).sum(1)
+            for k in ("uniform", "profile")}
+    # realized excess of the listed pairs: sum over ordered pairs of y_j y_k, less what random pairs give (rho^2)
+    U = fam["U"][:, keep]
+    P = S["pairs"]
+    Y = U[P[:, 0]] * U[P[:, 1]]
+    rho2 = (U.T @ U / nu) ** 2 - 1.0 / nu
+    E = 2 * (Y.T @ Y) - 2 * P.shape[0] * rho2
+    np.fill_diagonal(E, 0.0)
+    chrom = S["variants"].CHR.to_numpy()[keep]
+    same = chrom[:, None] == chrom[None, :]
+    real_same, real_other = V @ (E * same) @ V / nu ** 2, V @ (E * ~same) @ V / nu ** 2
+    # the composed term split the same way (brute force from the profile; compose convolves on a grid)
+    info = json.load(open(f"{d / 'c'}.curve.json"))
+    prof = RelatednessProfile.from_curve(str(d / "c"), info)
+    cm = S["variants"].CM.to_numpy()[keep]
+    Dd = np.abs(cm[:, None] - cm[None, :])
+    Ks = np.where(same, prof(Dd), 0.0)
+    np.fill_diagonal(Ks, 0.0)
+    comp_same = V @ Ks @ V / nu ** 2
+    comp_other = prof.between * (V @ (~same) @ V) / nu ** 2
+    assert V @ term["profile"] == pytest.approx(comp_same + comp_other, rel=1e-3)
+    assert comp_same == pytest.approx(real_same, rel=0.03)
+    assert comp_other == pytest.approx(real_other, rel=0.03)
+    unif = info["relatedness"]["sum_squared_ordered"] * (V @ (~same) @ V) / nu ** 2
+    assert unif / real_other - 1 > 0.05                           # g^2 also counts IBD within chromosomes and noise
+    from admixed_ld_sim import insample_ldscores
+    L_in, V_in = insample_ldscores(S["cohort"][:, keep], fam["C"], fam["cls"][keep], 2)
+    mass_in = float((V_in[:, None] * L_in).sum())
+    mass = {k: float((v_.V.to_numpy()[:, None] * v_[["low", "high"]].to_numpy()).sum()) for k, v_ in out.items()}
+    assert abs(mass["profile"] / mass_in - 1) < 0.01 < abs(mass["none"] / mass_in - 1)
+
+
+def test_relatives_profile_absent_pairs_change_nothing(fam, tmp_path):
+    """No listed pair in the sample: no profile, and compose with --relatedness curve equals compose without it; the
+    uniform term from a curve with a profile is the old sum of g^2."""
+    from summit.admixed_ld.compose import compose_ldscores
+    from summit.admixed_ld.curve import genotype_curve
+    d = fam["dir"]
+    pd.DataFrame({"IID1": ["nobody1"], "IID2": ["nobody2"]}).to_csv(tmp_path / "none.tsv", sep="\t", index=False)
+    _, info = genotype_curve(str(d / "cohort"), str(d / "ref"), str(tmp_path / "c0"), covar=str(d / "cohort.cov"),
+                             cell_cm=0.5, relative_pairs=str(tmp_path / "none.tsv"), log=lambda *a: None)
+    assert info["relatedness"]["pairs"] == 0 and "profile" not in info["relatedness"]
+    assert not os.path.exists(f"{tmp_path / 'c0'}.relatedness.tsv")
+    kw = dict(curve=str(tmp_path / "c0"), log=lambda *a: None)
+    compose_ldscores(str(d / "ref"), [str(d / "ss")], str(d / "annot.tsv"), str(tmp_path / "a"), **kw)
+    compose_ldscores(str(d / "ref"), [str(d / "ss")], str(d / "annot.tsv"), str(tmp_path / "b"), relatedness="curve",
+                     **kw)
+    A = pd.read_csv(f"{tmp_path / 'a'}.gw.ldscore.gz", sep="\t")
+    B = pd.read_csv(f"{tmp_path / 'b'}.gw.ldscore.gz", sep="\t")
+    pd.testing.assert_frame_equal(A, B)
+    # the uniform term: the curve's sum of g^2, as a number
+    s = fam["info"]["relatedness"]["sum_squared_ordered"]
+    for name, rel in (("u1", "uniform"), ("u2", s)):
+        compose_ldscores(str(d / "ref"), [str(d / "ss")], str(d / "annot.tsv"), str(tmp_path / name),
+                         curve=str(d / "c"), relatedness=rel, log=lambda *a: None)
+    U1 = pd.read_csv(f"{tmp_path / 'u1'}.gw.ldscore.gz", sep="\t")
+    U2 = pd.read_csv(f"{tmp_path / 'u2'}.gw.ldscore.gz", sep="\t")
+    pd.testing.assert_frame_equal(U1, U2)
+
+
+def test_background_measures_all_pairs(fam, tmp_path):
+    """Without a pair list, the cross-person LD among weakly differentiated SNPs measures the relatedness LD of all
+    pairs; here every relative is listed, so it matches the listed pairs' profile beyond the window and between
+    chromosomes, and compose uses it from --background-min-cm on."""
+    from summit.admixed_ld.compose import BackgroundProfile, RelatednessProfile, compose_ldscores
+    from summit.admixed_ld.curve import genotype_curve
+    d = fam["dir"]
+    _, info = genotype_curve(str(d / "cohort"), str(d / "ref"), str(tmp_path / "cb"), covar=str(d / "cohort.cov"),
+                             cell_cm=0.5, relative_pairs=str(d / "pairs.tsv"), relatedness_cell_cm=0.5,
+                             background=True, background_quantile=0.5, log=lambda *a: None)
+    b = pd.read_csv(f"{tmp_path / 'cb'}.background.tsv", sep="\t")
+    r = pd.read_csv(f"{tmp_path / 'cb'}.relatedness.tsv", sep="\t")
+    m = b.merge(r[["lag", "phi", "w"]], on="lag", suffixes=("", "_l"))
+    s = (m.d_cm >= 3) & (m.d_cm < 150)
+    bg = float((m.excess * m.w)[s].sum() / m.w[s].sum())
+    li = float((m.phi * m.w_l)[s].sum() / m.w_l[s].sum())
+    assert bg == pytest.approx(li, rel=0.10)
+    assert info["background"]["between"]["value"] == pytest.approx(info["relatedness"]["between"]["value"], rel=0.05)
+    assert info["background"]["null"] == pytest.approx(3 * (fam["S"]["cohort"].shape[0] - 3) /
+                                                       fam["S"]["cohort"].shape[0])
+    prof = RelatednessProfile.from_curve(str(tmp_path / "cb"), info, background_min_cm=3.0, background_window="zero")
+    assert isinstance(prof, BackgroundProfile)
+    assert prof.between == info["background"]["between"]["value"]
+    assert float(prof(1.0)) == pytest.approx(float(prof.listed(1.0)))
+    assert float(prof(20.0)) == pytest.approx(float(prof.listed(20.0) + prof.remainder(20.0)))
+    assert (prof.amp >= 0).all()
+    # every relative is listed: what the listed pairs do not carry is small
+    assert abs(float(prof.remainder(20.0))) < 0.1 * float(prof.listed(20.0))
+    compose_ldscores(str(d / "ref"), [str(d / "ss")], str(d / "annot.tsv"), str(tmp_path / "ld"),
+                     curve=str(tmp_path / "cb"), relatedness="curve", log=lambda *a: None)
+    params = json.load(open(f"{tmp_path / 'ld'}.admixed_ld.json"))
+    assert params["relatedness_profile"]["mode"] == "background"

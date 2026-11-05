@@ -92,3 +92,70 @@ def simulate_k(seed=1, n_chr=3, snps_per_chr=400, chr_cm=60.0, n_panel=1000, n_c
     variants = pd.DataFrame({"CHR": chrom.astype(str), "SNP": [f"sim{j:05d}" for j in range(M)], "CM": cm, "BP": bp,
                              "A1": np.where(rng.random(M) < 0.5, "A", "C"), "A2": "G"})
     return dict(variants=variants, panels=panels, cohort=geno(hC), theta=theta, m=np.asarray(m), generations=generations)
+
+
+def _gamete(rng, h1, h2, chrom, cm):
+    """One gamete from a parent's two haplotypes: crossovers at 1 per Morgan (Poisson, Haldane) on each chromosome, the
+    first segment from either haplotype with probability 1/2."""
+    out = np.empty_like(h1)
+    for c in np.unique(chrom):
+        ix = np.flatnonzero(chrom == c)
+        x = cm[ix]
+        brk = np.sort(rng.uniform(x.min(), x.max(), rng.poisson((x.max() - x.min()) / 100.0)))
+        first = rng.random() < 0.5
+        take1 = first ^ (np.searchsorted(brk, x) % 2 == 1)
+        out[ix] = np.where(take1, h1[ix], h2[ix])
+    return out
+
+
+def simulate_families(seed=11, n_chr=2, snps_per_chr=500, chr_cm=150.0, n_panel=1000, n_unrelated=600,
+                      n_sibships=300, sibs=3, n_cousin_families=0, mean_theta=0.75, sd_theta=0.12, generations=8.0,
+                      n_founders=40, copy_rate=3.0):
+    """Panels of two sources and an admixed cohort with relatives, in the model of `simulate`: unrelated admixed
+    people, sibships (two admixed parents, `sibs` children) and, optionally, first-cousin pairs (a sib pair's two
+    children with unrelated admixed spouses). Children inherit gametes made with crossovers at 1 per Morgan, so
+    relatives share segments identical by descent of the lengths that meioses give. Returns the dosages, the variants,
+    and the listed relative pairs (indices into the cohort) with their expected relatedness."""
+    rng = np.random.default_rng(seed)
+    chrom = np.repeat(np.arange(1, n_chr + 1), snps_per_chr)
+    cm = np.concatenate([np.sort(rng.uniform(0, chr_cm, snps_per_chr)) for _ in range(n_chr)])
+    bp = np.rint(cm * 1e6).astype(np.int64) + 1
+    M = cm.size
+    pE = rng.uniform(0.05, 0.95, M)
+    pA = np.clip(pE + rng.normal(0, 0.25, M), 0.03, 0.97)
+    founders = {s: (rng.random((n_founders, M)) < p[None, :]).astype(np.int8) for s, p in (("A", pA), ("E", pE))}
+    hap = _example._haplotypes
+    hA, _ = hap(rng, {"A": founders["A"]}, cm, 2 * n_panel, copy_rate)
+    hE, _ = hap(rng, {"E": founders["E"]}, cm, 2 * n_panel, copy_rate)
+    k = mean_theta * (1 - mean_theta) / sd_theta ** 2 - 1
+    n_adm = n_unrelated + 2 * n_sibships + 4 * n_cousin_families
+    theta = rng.beta(mean_theta * k, (1 - mean_theta) * k, n_adm)
+    th_hap = np.clip(np.repeat(theta, 2) + rng.normal(0, 0.05, 2 * n_adm), 0.0, 1.0)
+    H, _ = hap(rng, founders, cm, 2 * n_adm, copy_rate, anc=th_hap, break_rate=generations / 100.0)
+    people = [H[2 * i:2 * i + 2] for i in range(n_adm)]           # each: 2 x M haplotypes
+    nxt = iter(range(n_adm))
+    child = lambda P, Q: np.stack([_gamete(rng, P[0], P[1], chrom, cm), _gamete(rng, Q[0], Q[1], chrom, cm)])
+    cohort, pairs, rel = [], [], []
+    for _ in range(n_unrelated):
+        cohort.append(people[next(nxt)])
+    for _ in range(n_sibships):
+        P, Q = people[next(nxt)], people[next(nxt)]
+        first = len(cohort)
+        for _ in range(sibs):
+            cohort.append(child(P, Q))
+        for a in range(first, first + sibs):
+            for b in range(a + 1, first + sibs):
+                pairs.append((a, b)); rel.append(0.5)
+    for _ in range(n_cousin_families):
+        P, Q = people[next(nxt)], people[next(nxt)]
+        s1, s2 = child(P, Q), child(P, Q)
+        c1 = child(s1, people[next(nxt)])
+        c2 = child(s2, people[next(nxt)])
+        cohort += [c1, c2]
+        pairs.append((len(cohort) - 2, len(cohort) - 1)); rel.append(0.125)
+    G = np.stack([h[0] + h[1] for h in cohort]).astype(np.float64)
+    geno = lambda h: (h[0::2] + h[1::2]).astype(np.float64)
+    variants = pd.DataFrame({"CHR": chrom.astype(str), "SNP": [f"sim{j:05d}" for j in range(M)], "CM": cm, "BP": bp,
+                             "A1": np.where(rng.random(M) < 0.5, "A", "C"), "A2": "G"})
+    return dict(variants=variants, panel_A=geno(hA), panel_E=geno(hE), cohort=G, pairs=np.array(pairs, np.int64),
+                relatedness=np.array(rel), generations=generations)

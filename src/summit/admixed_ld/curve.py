@@ -14,7 +14,10 @@ The pass also gives each person's global ancestry, theta_i = sum_j delta_j (g_ij
 differentiated SNPs, whose moments enter the same-person term, and, for listed relative pairs, their relatedness in the
 covariate-adjusted, standardized genotypes, g_ab = (1/M) sum_j x_aj x_bj. The relatives' part of the in-sample LD scores
 depends on these values, not on relatedness before adjustment: in a small cohort a large family can take up a PC of its
-own, which removes most of its members' relatedness. Only aggregates are written.
+own, which removes most of its members' relatedness. A pass of its own then gives the listed pairs' local relatedness
+products by distance on one chromosome and between chromosomes, net of random control pairs (_RelativesProfile), and,
+with background=True, the cross-person LD of all pairs of people among the least differentiated SNPs (_Background).
+Only aggregates are written.
 """
 from __future__ import annotations
 
@@ -85,10 +88,354 @@ class _PairRelatedness:
                     max_abs=float(np.abs(g).max()) if g.size else float("nan"))
 
 
+def _control_pairs(n, pa, pb, count, seed=20261105):
+    """`count` distinct random pairs (a < b) of the n cohort rows that are not listed (control pairs)."""
+    total = n * (n - 1) // 2
+    listed = np.unique(np.minimum(pa, pb).astype(np.int64) * n + np.maximum(pa, pb))
+    count = int(min(count, total - listed.size))
+    if count <= 0:
+        return np.zeros(0, np.int64), np.zeros(0, np.int64)
+    rng = np.random.default_rng(seed)
+    got = np.zeros(0, np.int64)
+    while got.size < count:
+        k = 2 * (count - got.size) + 16
+        a, b = rng.integers(0, n, k), rng.integers(0, n, k)
+        a, b = a[a != b], b[a != b]
+        key = np.minimum(a, b) * n + np.maximum(a, b)
+        key = key[~np.isin(key, listed)]
+        _, first = np.unique(key, return_index=True)       # keep the order of the draws
+        key = key[np.sort(first)]
+        got = np.concatenate([got, key[~np.isin(key, got)]])
+    got = got[:count]
+    return got // n, got % n
+
+
+def _lag_traces(G, nc):
+    """Sums of the diagonals of the symmetric cells x cells matrix G: out[L] = sum_b G[b, b + L], L = 0 .. nc - 1."""
+    out = np.zeros(nc)
+    for L in range(nc):
+        out[L] = np.trace(G, offset=L)
+    return out
+
+
+class _RelativesProfile:
+    """Local relatedness of the listed relative pairs, and of random control pairs, in the covariate-adjusted,
+    standardized genotypes u (as _PairRelatedness), accumulated chromosome by chromosome in a pass of its own.
+
+    For a pair p = (a, b) the local relatedness at SNP j is y_j = u_aj u_bj, with cell sums R_pb = sum_{j in b} y_j over
+    cells of `cell_cm` and chromosome sums G_pc = sum_{j in c} y_j. Written (sums over ordered pairs, i.e. twice the
+    sums over listed pairs; aggregates only):
+      lag sums      P(L) = 2 sum_p sum_b R_pb R_p,b+L (L >= 1), P(0) = 2 sum_p sum_b (R_pb^2 - sum_{j in b} y_j^2),
+                    with the number of SNP pairs W(L) = sum_b n_b n_{b+L} (W(0) = sum_b n_b (n_b - 1) / 2) and their
+                    mean genetic distance;
+      between       Pb = 2 sum_p [(sum_c G_pc)^2 - sum_c G_pc^2] over Wb = M^2 - sum_c M_c^2 ordered SNP pairs,
+    the same for the control pairs, and g = sum_c G_pc / M per listed pair (the uniform term's relatedness). The
+    control pairs give what a pair of unrelated members contributes to the same sums (within-source and admixture LD
+    of the two people, which the population part of the LD score already holds, and the covariates' projection), so
+    phi(L) = [P(L) - (n_listed / n_controls) Pc(L)] / W(L) is the relatives' excess per SNP pair at that distance, and
+    B = [Pb - ratio Pbc] / Wb between chromosomes; both are sums over ordered pairs, the scale of g^2."""
+
+    _CHUNK = 1 << 24                         # elements of one pairs x SNPs product (128 MiB in float64)
+
+    def __init__(self, a, b, ca, cb, cell_cm, memory_gb=4.0, threads=1):
+        self.a = np.concatenate([a, ca]).astype(np.int64)
+        self.b = np.concatenate([b, cb]).astype(np.int64)
+        self.n_listed, self.n_controls = int(a.size), int(ca.size)
+        self.cell_cm, self.memory = float(cell_cm), float(memory_gb) * 2 ** 30
+        self.threads = max(1, int(threads))
+        if self.threads > 1:                     # numpy releases the GIL in the products and reductions
+            from concurrent.futures import ThreadPoolExecutor
+            self.pool = ThreadPoolExecutor(self.threads)
+        self.dot = np.zeros(self.a.size)                 # sum_c G_pc
+        self.sq = np.zeros(self.a.size)                  # sum_c G_pc^2
+        self.m = 0
+        self.mc = []
+        self.chr = []
+
+    def chunks(self, nc):
+        """Pair ranges whose cell sums (pairs x nc, float64) fit the memory budget, one genotype pass each."""
+        size = max(64, int(self.memory // (8 * max(nc, 1))))
+        return [(s, min(self.a.size, s + size)) for s in range(0, self.a.size, size)]
+
+    def chromosome(self, name, read_block, ix_blocks, cell, nc, cm):
+        """One chromosome: `read_block(sl, rows)` returns (u, ok) for SNP positions sl (the given cohort rows x SNPs,
+        adjusted and standardized; ok marks SNPs with variance); `ix_blocks` the blocks of positions in genetic order,
+        `cell` the cell of each position, `cm` its genetic position."""
+        P = {"listed": np.zeros(nc), "controls": np.zeros(nc)}
+        okc = None
+        for c0, c1 in self.chunks(nc):
+            a, b = self.a[c0:c1], self.b[c0:c1]
+            mem, inv = np.unique(np.concatenate([a, b]), return_inverse=True)
+            ia, ib = inv[:a.size], inv[a.size:]
+            R = np.zeros((c1 - c0, nc))
+            G = np.zeros(c1 - c0)
+            ysq = np.zeros(c1 - c0)
+            ok_all = []
+            for sl in ix_blocks:
+                u, ok = read_block(sl, mem)
+                ok_all.append(ok)
+                cs = cell[sl][ok]
+                if cs.size == 0:
+                    continue
+                u = np.ascontiguousarray(u[:, ok])
+                starts = np.r_[0, np.flatnonzero(np.diff(cs)) + 1]
+                step = max(1, min(self._CHUNK // u.shape[1], -(-a.size // self.threads)))
+                cols = cs[starts]
+
+                def work(s, u=u, cols=cols, starts=starts, step=step):   # rows s..s+step of R, G, ysq (disjoint)
+                    Pr = u[ia[s:s + step]] * u[ib[s:s + step]]
+                    R[s:s + step, cols] += np.add.reduceat(Pr, starts, axis=1)
+                    G[s:s + step] += Pr.sum(axis=1)
+                    ysq[s:s + step] += np.einsum("ij,ij->i", Pr, Pr)
+
+                if self.threads > 1:
+                    list(self.pool.map(work, range(0, a.size, step)))
+                else:
+                    for s in range(0, a.size, step):
+                        work(s)
+            if okc is None:
+                okc = np.concatenate(ok_all)
+            for kind, lo, hi in (("listed", c0, min(c1, self.n_listed)), ("controls", max(c0, self.n_listed), c1)):
+                if hi <= lo:
+                    continue
+                Rk = R[lo - c0:hi - c0]
+                t = _lag_traces(Rk.T @ Rk, nc)
+                t[0] = (t[0] - ysq[lo - c0:hi - c0].sum()) / 2.0    # unordered SNP pairs within a cell, as W(0)
+                P[kind] += 2.0 * t                                  # ordered pairs of people
+            self.dot[c0:c1] += G
+            self.sq[c0:c1] += G * G
+        # SNP pairs per lag and their mean distance (SNPs with variance only)
+        pos = np.concatenate(ix_blocks)
+        cl, x = cell[pos][okc], cm[pos][okc]
+        nb = np.bincount(cl, minlength=nc).astype(np.float64)
+        sb = np.bincount(cl, weights=x, minlength=nc)
+        w, dsum = np.zeros(nc), np.zeros(nc)
+        for L in range(1, nc):
+            w[L] = float(nb[:-L] @ nb[L:])
+            dsum[L] = float(nb[:-L] @ sb[L:] - nb[L:] @ sb[:-L])
+        w[0] = float((nb * (nb - 1)).sum() / 2.0)
+        # within a cell, sum over j < k of x_k - x_j = sum_k x_(k) (2 r_k - n_b + 1) with x sorted and r its rank
+        o = np.lexsort((x, cl))
+        xs, cs_ = x[o], cl[o]
+        first = np.r_[0, np.flatnonzero(np.diff(cs_)) + 1]
+        size = np.diff(np.r_[first, xs.size])
+        rank = np.arange(xs.size) - np.repeat(first, size)
+        dsum[0] = float((xs * (2 * rank - np.repeat(size, size) + 1)).sum())
+        self.chr.append(dict(name=str(name), listed=P["listed"], controls=P["controls"], w=w, dsum=dsum))
+        self.mc.append(int(okc.sum()))
+        self.m += int(okc.sum())
+
+    def summary(self):
+        nl, nct = self.n_listed, self.n_controls
+        g = self.dot[:nl] / max(self.m, 1)
+        ratio = nl / nct if nct else 0.0
+        between = 2.0 * (self.dot * self.dot - self.sq)
+        bl, bc = float(between[:nl].sum()), float(between[nl:].sum())
+        wb = float(self.m) ** 2 - float(np.sum(np.square(np.asarray(self.mc, np.float64))))
+        return dict(sum_squared_ordered=float(2.0 * np.sum(g * g)), pairs=int(nl), n_snps=int(self.m),
+                    mean=float(g.mean()) if g.size else float("nan"),
+                    max_abs=float(np.abs(g).max()) if g.size else float("nan"),
+                    between=dict(listed=bl, controls=bc, n_controls=int(nct), w=wb,
+                                 value=(bl - ratio * bc) / wb if wb > 0 else float("nan")))
+
+    def table(self):
+        """Lag sums pooled over chromosomes, with the relatives' excess per SNP pair phi."""
+        L = max(x["w"].size for x in self.chr)
+        pad = lambda v: np.pad(v, (0, L - v.size))
+        tot = {k: sum(pad(x[k]) for x in self.chr) for k in ("listed", "controls", "w", "dsum")}
+        ratio = self.n_listed / self.n_controls if self.n_controls else 0.0
+        use = tot["w"] > 0
+        with np.errstate(invalid="ignore", divide="ignore"):
+            phi = np.where(use, (tot["listed"] - ratio * tot["controls"]) / tot["w"], np.nan)
+            d = np.where(use, tot["dsum"] / tot["w"], np.nan)
+        return pd.DataFrame({"lag": np.arange(L), "d_cm": d, "w": tot["w"], "listed": tot["listed"],
+                             "controls": tot["controls"], "phi": phi})[use]
+
+
+class _Background:
+    """All ordered pairs of people, without a list: the cross-person LD among the least differentiated SNPs (aggregates).
+
+    For SNPs j, k with adjusted, standardized genotypes u (unit residual variance), the cross-person sum
+    x_jk = (u_j . u_k)^2 - sum_i u_ij^2 u_ik^2 = sum over ordered pairs i != i' of y_j(i, i') y_k(i, i') is what all pairs
+    of people add to nu^2 r_jk^2 beyond each person with themselves. Its expectation is n(n - 1) rho_jk^2 (population LD)
+    + p_tot nu / n (the covariates' projection, which SUMMIT's in-sample noise correction removes) + the relatedness of
+    every pair, listed or not. Among SNPs whose source contrast is small (lowest `quantile` of max_a |D_ja|), rho_jk^2
+    beyond within-source LD is only the admixture term (a_j' Kt(d) a_k)^2 with a = D / sd, which the curve's own kernel
+    gives and which is subtracted; what remains is the relatedness LD of all pairs, a property of the people that does
+    not depend on the SNPs. Within chromosomes: exact sums over SNP pairs by lag of `cell_cm` cells (per chromosome,
+    n x m_c genotypes held); between chromosomes: exact over at most `between_snps` of these SNPs (n x m float32 held).
+    Below a few cM the same sums also hold within-source LD, which is not subtracted (compose uses the measurement only
+    beyond its --background-min-cm)."""
+
+    def __init__(self, select, N, df_res, p_rank, cell_cm, k1, between_snps, seed=20261105):
+        self.select = np.asarray(select, bool)                 # per matched SNP
+        self.N, self.df_res, self.ptot = int(N), int(df_res), int(p_rank) + 1
+        self.cell_cm, self.k1 = float(cell_cm), int(k1)
+        idx = np.flatnonzero(self.select)
+        rng = np.random.default_rng(seed)
+        keep = idx if idx.size <= between_snps else np.sort(rng.choice(idx, int(between_snps), replace=False))
+        self.between_mask = np.zeros(self.select.size, bool)
+        self.between_mask[keep] = True
+        self.cur, self.cur_o, self.cur_x = [], [], []
+        self.bU, self.bO, self.bchr = [], [], []
+        self.x, self.w, self.dsum, self.oo = None, None, None, None
+        self.n_snps = 0
+
+    def add(self, pos, X, C, Bx, var_res, ok, Ofl, cmv, chrom_name):
+        """A block of the curve's pass: pos (matched-SNP indices), centred genotypes X, Bx = C'X, residual variances,
+        ok, the products of contrasts (D D' - S) / var_res flattened (k1^2 per SNP) and the genetic positions."""
+        use = ok & self.select[pos]
+        if not use.any():
+            return
+        Xu = X[:, use] - C @ Bx[:, use] if C.shape[1] else X[:, use].copy()
+        Xu /= np.sqrt(var_res[use])[None, :]
+        self.cur.append(Xu)
+        self.cur_o.append(Ofl[use])
+        self.cur_x.append(cmv[use])
+        bsel = self.between_mask[pos][use]
+        if bsel.any():
+            self.bU.append(Xu[:, bsel].astype(np.float32))
+            self.bO.append(Ofl[use][bsel])
+            self.bchr += [str(chrom_name)] * int(bsel.sum())
+
+    def end_chromosome(self, cm_min):
+        if not self.cur:
+            return
+        U = np.concatenate(self.cur, axis=1)
+        O = np.concatenate(self.cur_o)
+        x = np.concatenate(self.cur_x)
+        self.cur, self.cur_o, self.cur_x = [], [], []
+        o = np.argsort(x, kind="stable")
+        U, O, x = U[:, o], O[o], x[o]
+        cell = ((x - cm_min) / self.cell_cm).astype(np.int64)
+        U2 = U * U
+        m = U.shape[1]
+        self.n_snps += m
+        k2 = O.shape[1]
+        for s0 in range(0, m, 1024):
+            s1 = min(m, s0 + 1024)
+            T = (U[:, s0:s1].T @ U[:, s0:], U2[:, s0:s1].T @ U2[:, s0:])
+            T = T[0] * T[0] - T[1]                              # j in s0..s1, k >= s0
+            jj, kk = np.nonzero(np.arange(s0, s1)[:, None] < np.arange(s0, m)[None, :])
+            lag = np.abs(cell[s0 + jj] - cell[s0 + kk])
+            dd = np.abs(x[s0 + jj] - x[s0 + kk])
+            L = int(lag.max()) + 1 if lag.size else 1
+            self._add("x", np.bincount(lag, weights=T[jj, kk], minlength=L))
+            self._add("w", np.bincount(lag, minlength=L).astype(np.float64))
+            self._add("dsum", np.bincount(lag, weights=dd, minlength=L))
+            oo = np.zeros((L, k2, k2))
+            for u_ in range(k2):
+                for v_ in range(k2):
+                    oo[:, u_, v_] = np.bincount(lag, weights=O[s0 + jj, u_] * O[s0 + kk, v_], minlength=L)
+            self._add("oo", oo)
+
+    def _add(self, key, v):
+        cur = getattr(self, key)
+        if cur is None:
+            setattr(self, key, v.copy())
+            return
+        if cur.shape[0] < v.shape[0]:
+            cur = np.concatenate([cur, np.zeros((v.shape[0] - cur.shape[0],) + cur.shape[1:])])
+        elif v.shape[0] < cur.shape[0]:
+            v = np.concatenate([v, np.zeros((cur.shape[0] - v.shape[0],) + v.shape[1:])])
+        cur += v
+        setattr(self, key, cur)
+
+    def between(self):
+        """Sums over ordered pairs of the subsample's SNPs on different chromosomes."""
+        if not self.bU:
+            return dict(x=0.0, w=0.0, oo=np.zeros((1, 1)), n_snps=0)
+        U = np.concatenate(self.bU, axis=1)
+        O = np.concatenate(self.bO)
+        ch = np.asarray(self.bchr)
+        self.bU = None
+        xs, ws = 0.0, 0.0
+        oo = np.zeros((O.shape[1], O.shape[1]))
+        for s0 in range(0, U.shape[1], 1024):
+            s1 = min(U.shape[1], s0 + 1024)
+            A = U[:, s0:s1].astype(np.float64)
+            G = A.T @ U
+            F = (A * A).T @ (U * U)
+            diff = ch[s0:s1][:, None] != ch[None, :]
+            xs += float(((G * G - F) * diff).sum())
+            ws += float(diff.sum())
+            oo += O[s0:s1].T @ (diff @ O)
+        return dict(x=xs, w=ws, oo=oo, n_snps=int(U.shape[1]))
+
+    def finish(self, kernel_at, far):
+        """Table by lag and the between-chromosome value; kernel_at(d) -> k1 x k1 kernels (n_d x k1 x k1)."""
+        n = self.N
+        null = self.ptot * self.df_res / n
+        w = self.w
+        d = np.where(w > 0, self.dsum / np.maximum(w, 1), np.nan)
+        Kd = kernel_at(np.nan_to_num(d))
+        k1 = self.k1
+        F = np.einsum("lab,lce->lacbe", Kd, Kd).reshape(d.size, k1 * k1, k1 * k1)
+        adm = n * (n - 1) * np.einsum("luv,luv->l", F, self.oo)
+        tab = pd.DataFrame({"lag": np.arange(w.size), "d_cm": d, "w": w, "x": self.x, "adm": adm,
+                            "excess": np.where(w > 0, (self.x - adm) / np.maximum(w, 1) - null, np.nan)})[w > 0]
+        b = self.between()
+        Ff = np.einsum("ab,ce->acbe", far, far).reshape(k1 * k1, k1 * k1)
+        adm_b = n * (n - 1) * float(np.sum(Ff * b["oo"]))
+        val = (b["x"] - adm_b) / b["w"] - null if b["w"] > 0 else float("nan")
+        return tab, dict(null=null, n_snps=int(self.n_snps), cell_cm=self.cell_cm,
+                         between=dict(x=b["x"], w=b["w"], adm=adm_b, n_snps=b["n_snps"], value=val))
+
+
+def _relatives_pass(blocks, t_idx, chrom, cm, C, df_res, step, pa, pb, cell_cm, n_controls, memory_gb, log,
+                    threads=1):
+    """A genotype pass of its own for the relatives' profile (repeated per chunk of pairs if their cell sums exceed
+    memory_gb): the adjusted, standardized genotypes of each block exactly as in the curve's pass (mean-imputed,
+    centred, projected on the covariates, divided by the residual SD with df_res degrees of freedom)."""
+    N = blocks.n
+    if n_controls is None:                                     # as many controls as listed pairs, 20,000 to 200,000
+        n_controls = int(min(max(pa.size, 20000), 200000))
+    ca, cb = _control_pairs(N, pa, pb, n_controls)
+    prof = _RelativesProfile(pa, pb, ca, cb, cell_cm, memory_gb, threads)
+    p_rank = C.shape[1]
+    t0 = time.perf_counter()
+
+    def reader(cols):
+        def read(sl, mem):
+            X = blocks.read(cols[sl])
+            mu = np.nanmean(X, axis=0)
+            center_impute(X)
+            ss = np.einsum("ij,ij->j", X, X)
+            Bx = C.T @ X if p_rank else np.zeros((0, X.shape[1]))
+            var_res = (ss - np.einsum("ij,ij->j", Bx, Bx)) / df_res
+            ok = np.isfinite(var_res) & (var_res > 1e-8) & np.isfinite(mu)
+            Xu = X[mem]
+            if p_rank:
+                Xu = Xu - C[mem] @ Bx
+            return Xu / np.sqrt(np.where(ok, var_res, 1.0))[None, :], ok
+        return read
+
+    for c in pd.unique(chrom):
+        ix = np.flatnonzero(chrom == c)
+        ix = ix[np.argsort(cm[ix], kind="stable")]
+        x = cm[ix]
+        cell = ((x - x.min()) / cell_cm).astype(np.int64)
+        nc = int(cell.max()) + 1
+        bl = [np.arange(s, min(ix.size, s + step)) for s in range(0, ix.size, step)]
+        prof.chromosome(c, reader(t_idx[ix]), bl, cell, nc, x)
+        log(f"[admixed-ld] curve relatives chr{c}: {pa.size} listed and {ca.size} control pairs, {nc} cells of "
+            f"{cell_cm} cM, {len(prof.chunks(nc))} pass(es) ({time.perf_counter() - t0:.0f} s)")
+    if prof.threads > 1:
+        prof.pool.shutdown()
+    return prof
+
+
+def _phi_at(tab, ds):
+    t = tab[np.isfinite(tab.phi)]
+    return [(d, float(np.interp(d, t.d_cm, t.phi))) for d in ds if d <= t.d_cm.max()]
+
+
 def genotype_curve(geno, ref_path, out, *, sources=None, covar=None, keep=None, match="position", cell_cm=0.25,
                    max_cm=None, theta_min_delta=0.2, relative_pairs=None, kinship_col=None, kinship_min=None,
                    closure=False, cells_cm=2.0, per_chromosome=False, step=4096, threads=1, native=True,
-                   noise_correction=True, log=print):
+                   noise_correction=True, relatedness_profile=True, relatedness_cell_cm=0.5, relatedness_controls=None,
+                   relatedness_memory_gb=4.0, background=False, background_quantile=0.2, background_between_snps=None,
+                   log=print):
     """The weighted-LD curve of the cohort for two or more sources. With cells_cm, also the genome-wide matrix of
     covariances between cells of cells_cm cM (within and between chromosomes) and the sampling variance of each entry,
     written to out.cells.npz: it carries long-range structure that one value per distance cannot (for example what the
@@ -130,7 +477,8 @@ def genotype_curve(geno, ref_path, out, *, sources=None, covar=None, keep=None, 
             rp = read_relative_pairs(relative_pairs, samples, kinship_col=kinship_col, kinship_min=kinship_min,
                                      closure=True)
         pa, pb = pairs_within_sample(rp, rows, len(samples))
-        rel = _PairRelatedness(pa, pb)
+        relatedness_profile = bool(relatedness_profile) and pa.size > 0
+        rel = None if relatedness_profile else _PairRelatedness(pa, pb)
         log(f"[admixed-ld] curve: {pa.size} relative pairs among the {N} samples")
     df_res = N - 1 - C.shape[1]                                 # degrees of freedom of the adjusted genotypes
     if df_res < 10:
@@ -167,6 +515,16 @@ def genotype_curve(geno, ref_path, out, *, sources=None, covar=None, keep=None, 
     th_den = np.zeros((k1, k1))
     th_c = np.zeros(k1)
     p_rank = C.shape[1]
+    bg = None
+    if background:                                             # all pairs, least differentiated SNPs (aggregates)
+        amax = np.abs(D).max(axis=1)
+        sel_bg = amax <= np.quantile(amax, float(background_quantile))
+        nb_max = int(background_between_snps) if background_between_snps is not None else \
+            int(min(40000, relatedness_memory_gb * 2 ** 30 // (4 * N)))
+        bg = _Background(sel_bg, N, df_res, p_rank, relatedness_cell_cm, k1, nb_max)
+        log(f"[admixed-ld] curve: background relatedness LD from all pairs of people, on the {int(sel_bg.sum())} SNPs "
+            f"with the smallest source contrasts (|D| <= {np.quantile(amax, float(background_quantile)):.4f}); "
+            f"between chromosomes on {int(bg.between_mask.sum())} of them")
     for c in pd.unique(chrom):
         ix = np.flatnonzero(chrom == c)
         ix = ix[np.argsort(cm[ix], kind="stable")]
@@ -196,6 +554,9 @@ def genotype_curve(geno, ref_path, out, *, sources=None, covar=None, keep=None, 
                 rel.add(X[:, ok], C, Bx[:, ok], var_res[ok])
             inv = np.zeros(sl.size)
             inv[ok] = 1.0 / var_res[ok]
+            if bg is not None:
+                Ofl = ((d[:, :, None] * d[:, None, :] - Sn) * inv[:, None, None]).reshape(sl.size, k1 * k1)
+                bg.add(sl, X, C, Bx, np.where(ok, var_res, 1.0), ok, Ofl, cm[sl], c)
             cs = cell[s:s + step]
             starts = np.r_[0, np.flatnonzero(np.diff(cs)) + 1]
             for a in range(k1):
@@ -208,6 +569,8 @@ def genotype_curve(geno, ref_path, out, *, sources=None, covar=None, keep=None, 
                     q[:, a, b] += qq
                     if b != a:
                         q[:, b, a] += qq
+        if bg is not None:
+            bg.end_chromosome(cm[ix].min())
         U = Y - C @ B if p_rank else Y
         S = mp.tn(U, U) / df_res
         num_c, den_c = np.zeros_like(num), np.zeros_like(den)
@@ -273,9 +636,55 @@ def genotype_curve(geno, ref_path, out, *, sources=None, covar=None, keep=None, 
     if k1 == 1:
         info.update(inter_numerator=float(inter_num[0, 0]), inter_denominator=float(inter_den[0, 0, 0, 0]),
                     inter_kernel=float(inter[0, 0]), fit_2_to_20cm=fit_exponential(curve.d_cm, curve.kernel, 2.0, 20.0))
-    if rel is not None:
+    if bg is not None:
+        kc = kern.copy()
+        fin = np.isfinite(kc).all(axis=(1, 2))
+
+        def kernel_at(dd):
+            out_ = np.zeros((np.size(dd), k1, k1))
+            for a_ in range(k1):
+                for b_ in range(k1):
+                    out_[:, a_, b_] = np.interp(np.asarray(dd), dist[fin], kc[fin, a_, b_])
+            return out_
+        btab, binfo = bg.finish(kernel_at, inter)
+        btab.to_csv(f"{out}.background.tsv", sep="\t", index=False, float_format="%.10g")
+        info["background"] = dict(**binfo, file=f"{out}.background.tsv", quantile=float(background_quantile),
+                                  definition="excess = (x - adm) / w - null: the cross-person LD of all ordered pairs of "
+                                             "people per pair of the least differentiated SNPs at the lag's mean "
+                                             "distance d_cm, less the admixture LD of the curve's kernel and SUMMIT's "
+                                             "null p_tot nu / n; below a few cM it also holds within-source LD")
+        bb = binfo["between"]
+        log(f"[admixed-ld] curve: background (all pairs) between chromosomes {bb['value']:.4g} per SNP pair "
+            f"({bb['n_snps']} SNPs; null {binfo['null']:.4f}); within chromosomes "
+            + ", ".join(f"{dd:.0f} cM {vv:.4g}" for dd, vv in _phi_at(btab.rename(columns={"excess": "phi"}),
+                                                                   (3.0, 5.0, 10.0, 20.0, 40.0)))
+            + f"; wrote {out}.background.tsv")
+    if relative_pairs is not None and relatedness_profile:
+        prof = _relatives_pass(blocks, t_idx, chrom, cm, C, df_res, step, pa, pb, relatedness_cell_cm,
+                               relatedness_controls, relatedness_memory_gb, log, threads=threads)
+        summ = prof.summary()
+        tab = prof.table()
+        tab.to_csv(f"{out}.relatedness.tsv", sep="\t", index=False, float_format="%.10g")
+        np.savez(f"{out}.relatedness_chr.npz", chrom=np.array([x["name"] for x in prof.chr]),
+                 **{k: np.stack([np.pad(x[k], (0, max(y["w"].size for y in prof.chr) - x[k].size)) for x in prof.chr])
+                    for k in ("listed", "controls", "w", "dsum")})
+        summ["profile"] = dict(file=f"{out}.relatedness.tsv", per_chromosome=f"{out}.relatedness_chr.npz",
+                               cell_cm=float(relatedness_cell_cm), n_controls=int(prof.n_controls),
+                               definition="phi(L) = [P(L) - (n_listed / n_controls) Pc(L)] / W(L): the relatives' "
+                                          "excess of sum_{ordered pairs} u_aj u_bj u_ak u_bk per SNP pair at the lag's "
+                                          "mean distance d_cm, net of what random (control) pairs contribute")
+        rel = prof
+        info["relatedness"] = dict(**summ, kinship_col=kinship_col, kinship_min=kinship_min, closure=closure,
+                                   definition="relatedness of the covariate-adjusted, standardized genotypes")
+        b = summ["between"]
+        log(f"[admixed-ld] curve: relatives between chromosomes B = {b['value']:.4g} per SNP pair (controls "
+            f"{b['n_controls']}); within chromosomes phi at "
+            + ", ".join(f"{d:.0f} cM {v:.4g}" for d, v in _phi_at(tab, (1.0, 5.0, 20.0, 50.0)))
+            + f"; wrote {out}.relatedness.tsv")
+    elif rel is not None:
         info["relatedness"] = dict(**rel.summary(), kinship_col=kinship_col, kinship_min=kinship_min, closure=closure,
                                    definition="relatedness of the covariate-adjusted, standardized genotypes")
+    if "relatedness" in info:
         r = info["relatedness"]
         log(f"[admixed-ld] curve: {r['pairs']} relative pairs, mean relatedness after the covariates {r['mean']:.4f} "
             f"(largest |g| {r['max_abs']:.3f}); sum over ordered pairs of g^2 {r['sum_squared_ordered']:.4g}")
@@ -285,7 +694,7 @@ def genotype_curve(geno, ref_path, out, *, sources=None, covar=None, keep=None, 
         Uall = np.concatenate(coarse_U, axis=2)                 # N x k1 x cells
         nC = Uall.shape[2]
         rng_h = np.random.default_rng(20261104)
-        if rel is not None:                                    # relatives in one half, so the halves stay independent
+        if relative_pairs is not None:                         # relatives in one half, so the halves stay independent
             fam = rp.family[rows]
             labels, inv = np.unique(fam, return_inverse=True)
             side = rng_h.permutation(labels.size) % 2 == 0
