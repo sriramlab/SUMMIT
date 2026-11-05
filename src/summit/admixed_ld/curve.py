@@ -341,26 +341,33 @@ class _Background:
         cur += v
         setattr(self, key, cur)
 
-    def between(self):
-        """Sums over ordered pairs of the subsample's SNPs on different chromosomes."""
+    def between(self, cols=2048):
+        """Sums over ordered pairs of the subsample's SNPs on different chromosomes. The float32 genotypes are converted
+        to float64 `cols` columns at a time, so that the peak memory is the float32 matrix plus about 4 n cols float64
+        values (not two float64 copies of the whole matrix)."""
         if not self.bU:
             return dict(x=0.0, w=0.0, oo=np.zeros((1, 1)), n_snps=0)
         U = np.concatenate(self.bU, axis=1)
         O = np.concatenate(self.bO)
         ch = np.asarray(self.bchr)
         self.bU = None
+        m = U.shape[1]
         xs, ws = 0.0, 0.0
         oo = np.zeros((O.shape[1], O.shape[1]))
-        for s0 in range(0, U.shape[1], 1024):
-            s1 = min(U.shape[1], s0 + 1024)
+        for s0 in range(0, m, 1024):
+            s1 = min(m, s0 + 1024)
             A = U[:, s0:s1].astype(np.float64)
-            G = A.T @ U
-            F = (A * A).T @ (U * U)
-            diff = ch[s0:s1][:, None] != ch[None, :]
-            xs += float(((G * G - F) * diff).sum())
-            ws += float(diff.sum())
-            oo += O[s0:s1].T @ (diff @ O)
-        return dict(x=xs, w=ws, oo=oo, n_snps=int(U.shape[1]))
+            A2 = A * A
+            for c0 in range(0, m, cols):
+                c1 = min(m, c0 + cols)
+                Uc = U[:, c0:c1]
+                G = A.T @ Uc.astype(np.float64)
+                F = A2.T @ (Uc * Uc).astype(np.float64)
+                diff = ch[s0:s1][:, None] != ch[None, c0:c1]
+                xs += float(((G * G - F) * diff).sum())
+                ws += float(diff.sum())
+                oo += O[s0:s1].T @ (diff @ O[c0:c1])
+        return dict(x=xs, w=ws, oo=oo, n_snps=int(m))
 
     def finish(self, kernel_at, far):
         """Table by lag and the between-chromosome value; kernel_at(d) -> k1 x k1 kernels (n_d x k1 x k1)."""
