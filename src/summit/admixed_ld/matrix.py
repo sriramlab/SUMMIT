@@ -211,6 +211,13 @@ def compose_matrix(ref_path, out, *, region=None, snps=None, sources=None, param
     for n_, s in enumerate(si):
         Cs = np.zeros((p, p))
         cv = z[f"cov_{s}"][lo:hi][use].astype(np.float64)
+        if f"vld_{s}" in z.files:
+            # a derived source whose window LD comes from a panel: the panel's correlations on the source's variances
+            # (its covariances carry the panel's variances; with the source's on the diagonal the matrix need not be
+            # positive semidefinite)
+            vl = z[f"vld_{s}"][loc].astype(np.float64)
+            g = np.where(vl > 0, np.sqrt(np.maximum(V[:, n_], 0) / np.where(vl > 0, vl, 1.0)), 0.0)
+            cv = cv * g[a] * g[b]
         Cs[a, b] = cv
         Cs[b, a] = cv
         Cs[np.arange(p), np.arange(p)] = V[:, n_]

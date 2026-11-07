@@ -93,6 +93,67 @@ def unbiased_squared_covariance(c, m22, vv, n):
     return ((n - 1.0) ** 2 * (n - 2.0) * c * c - n * n * m22 + (n - 1.0) * vv) / (n * (n - 2.0) * (n - 3.0))
 
 
+def panel_variance_scale(ref, i, n_panel, bins=20):
+    """Scale factors that put the window covariances of a derived source whose LD comes from a panel (stored with the
+    panel's own variances, vld) on the source's scale, for the LD scores.
+
+    The source's dosage variance v_j comes from its derived frequencies; the panel's population has variance vP_j,
+    which the panel's sample variance vld_j estimates with sampling variance about vld_j (1 - vld_j) / n (the dosage's
+    fourth moment under Hardy-Weinberg is 2pq). The panel's covariance c_jk enters as c_jk f_j f_k with
+    f_j = sqrt(v_j / vP~_j), the panel's correlation on the source's variances, vP~_j being the empirical-Bayes estimate
+    of vP_j: in bins of the source's minor allele frequency, r_j = vld_j - v_j has mean mu_b and, beyond the sampling
+    variances of vld_j and v_j, between-SNP variance tau_b^2 (method of moments), and
+    vP~_j = v_j + mu_b + B_j (r_j - mu_b), B_j = tau_b^2 / (tau_b^2 + s_j^2).
+    A panel drawn from the source has tau_b ~ 0, and its covariances are used as they are (f ~ 1): dividing by the
+    noisy variances of a small panel would bias the squared correlations down (about 34% for 34 people). A panel of
+    another population has tau_b^2 >> s_j^2, and its correlations are transferred (B ~ 1): its covariances, which
+    carry that population's variances, would bias the squared correlations up (about 50% in the coalescent test of
+    7 Nov 2026, source-panel F_ST 0.024). Returns ({chromosome: f over the chromosome file's SNPs}, summary)."""
+    per, rs, s2s, mafs = {}, [], [], []
+    for c in ref.chromosomes:
+        z = ref.load(c)
+        v = z[f"v_{i}"].astype(np.float64)
+        vld = z[f"vld_{i}"].astype(np.float64)
+        p = z[f"p_{i}"].astype(np.float64)
+        fv = z[f"fvar_{i}"].astype(np.float64) if f"fvar_{i}" in z.files else np.zeros_like(v)
+        # SNPs missing from the panel carry vld = v (no LD there); they inform nothing and keep f = 1
+        present = (vld != v) & np.isfinite(vld) & np.isfinite(v) & (vld > 0) & (v > 0)
+        s2 = np.clip(vld, 0, 1) * (1 - np.clip(vld, 0, 1)) / float(n_panel) + (2 * (1 - 2 * p)) ** 2 * fv
+        maf = np.minimum(np.clip(p, 0, 1), 1 - np.clip(p, 0, 1))
+        per[c] = (v, vld, s2, maf, present)
+        rs.append((vld - v)[present])
+        s2s.append(s2[present])
+        mafs.append(maf[present])
+    r, s2, maf = np.concatenate(rs), np.concatenate(s2s), np.concatenate(mafs)
+    if r.size < 10 * bins:
+        bins = max(1, r.size // 10)
+    edges = np.unique(np.quantile(maf, np.linspace(0, 1, bins + 1))) if r.size else np.array([0.0, 0.5])
+    edges[0], edges[-1] = -np.inf, np.inf
+    b_of = lambda x: np.clip(np.searchsorted(edges, x, side="right") - 1, 0, edges.size - 2)
+    nb = edges.size - 1
+    bi = b_of(maf)
+    cnt = np.maximum(np.bincount(bi, minlength=nb), 1)
+    mu = np.bincount(bi, weights=r, minlength=nb) / cnt
+    tau2 = np.maximum(np.bincount(bi, weights=(r - mu[bi]) ** 2, minlength=nb) / cnt
+                      - np.bincount(bi, weights=s2, minlength=nb) / cnt, 0.0)
+    out, Bs, f2s = {}, [], []
+    for c, (v, vld, s2c, mafc, present) in per.items():
+        b = b_of(mafc)
+        B = tau2[b] / (tau2[b] + s2c)
+        vP = np.maximum(v + mu[b] + B * (vld - v - mu[b]), 1e-6)
+        f = np.where(present, np.sqrt(np.maximum(v, 0) / vP), 1.0)
+        out[c] = f
+        Bs.append(B[present])
+        f2s.append((f * f)[present])
+    Bs, f2s = np.concatenate(Bs), np.concatenate(f2s)
+    info = dict(n_panel=int(n_panel), snps=int(r.size), bins=int(nb),
+                shrinkage_weight_median=float(np.median(Bs)) if Bs.size else None,
+                shrinkage_weight_mean=float(np.mean(Bs)) if Bs.size else None,
+                tau2_mean=float(np.mean(tau2)), mean_shift=float(np.mean(mu)),
+                mean_f2=float(np.mean(f2s)) if f2s.size else None)
+    return out, info
+
+
 def window_noise(pis, vns, cross, d):
     """Sampling variance of a composed window covariance sum_s pi_s(d) c_s: sum_s pi_s^2 Var(c_s), plus twice the
     covariance of the errors of a source n derived by inversion and of each known panel t it was computed from,
@@ -649,6 +710,16 @@ def compose_ldscores(ref_path, sumstats, annot, out, *, sources=None, snps=None,
         log("[admixed-ld] compose: window covariances of " + ", ".join(sorted({sources[x[0]] for x in cross}))
             + " were derived by inversion; their covariance with the errors of "
             + ", ".join(sorted({sources[x[1]] for x in cross})) + " is removed once")
+    # a derived source with a panel's window LD: the panel's covariances on the source's scale (panel_variance_scale)
+    z0 = ref.load(ref.chromosomes[0])
+    fsc, fsc_info = {}, {}
+    for n_, i in enumerate(si):
+        if f"vld_{i}" in z0.files:
+            fsc[n_], fsc_info[sources[n_]] = panel_variance_scale(ref, i, ns[n_])
+            q = fsc_info[sources[n_]]
+            log(f"[admixed-ld] compose: {sources[n_]}'s window covariances from its {q['n_panel']}-person panel put on "
+                f"its own variances (shrinkage weight median {q['shrinkage_weight_median']:.3f}: 0 keeps the panel's "
+                f"covariances, 1 transfers its correlations; mean f^2 {q['mean_f2']:.4f})")
     n_pairs = 0
     for c in ref.chromosomes:
         sel = np.flatnonzero(chrom_out == c)
@@ -695,6 +766,9 @@ def compose_ldscores(ref_path, sumstats, annot, out, *, sources=None, snps=None,
                         else:
                             vns = cs_ * cs_ - unbiased_squared_covariance(cs_, m22[s][s0:s1][use],
                                                                           vr[s][jl] * vr[s][kl], ns[s])
+                        if s in fsc:                              # panel covariances on the source's scale
+                            g = fsc[s][c][jl] * fsc[s][c][kl]
+                            cs_, vns = cs_ * g, vns * g * g
                         cr += pi_s * cs_
                         pis[s], vnss[s] = pi_s, vns
                     noise = window_noise(pis, vnss, cross_c, d)
@@ -759,6 +833,7 @@ def compose_ldscores(ref_path, sumstats, annot, out, *, sources=None, snps=None,
                   panel_background={sources[n_]: pb.describe() for n_, pb in panel_bg.items()},
                   r2=r2, grid_cm=grid_cm, cell_matrix=cells_used,
                   derived_covariance_cross_noise=[dict(source=sources[x[0]], panel=sources[x[1]]) for x in cross],
+                  derived_panel_scale=fsc_info,
                   reference=dict(sources=ref.manifest["sources"], window_kb=ref.manifest["window_kb"],
                                  genetic_map=ref.manifest["genetic_map"]),
                   per_trait=None if per_trait is None else per_trait.to_dict(orient="records"),

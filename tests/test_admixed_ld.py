@@ -1044,3 +1044,83 @@ def test_panel_background_removed_inside_the_band(tmp_path):
     assert abs(gap_panels) < 0.4 * gap_zero
     params = json.load(open(str(tmp_path / "ld_rel_panels") + ".admixed_ld.json"))
     assert set(params["panel_background"]) == {"AFR", "EUR"} and params["relatedness_profile"]["window"] == "panels"
+
+
+class _FakeRef:
+    """The parts of Reference that panel_variance_scale reads: chromosomes and load()."""
+
+    def __init__(self, arrays):
+        self.chromosomes = ["1"]
+        self._z = arrays
+
+    def load(self, c):
+        class Z(dict):
+            files = property(lambda self: list(self.keys()))
+        return Z(self._z)
+
+
+def test_panel_variance_scale_limits():
+    """A small panel drawn from the source keeps its covariances (f ~ 1); a large panel of another population has its
+    correlations transferred (f ~ sqrt(v / vld))."""
+    from summit.admixed_ld.compose import panel_variance_scale
+    rng = np.random.default_rng(7)
+    m = 40_000
+    p = rng.uniform(0.03, 0.97, m)
+    v = 2 * p * (1 - p)
+    fvar = np.full(m, 1e-6)
+    # panel of 34 drawn from the source: sample variances of 34 dosages
+    n = 34
+    X = rng.binomial(2, p[None, :], size=(n, m)).astype(float)
+    vld = X.var(axis=0, ddof=1)
+    ok = vld > 0
+    z = {"v_0": v[ok], "vld_0": vld[ok], "p_0": p[ok], "fvar_0": fvar[ok]}
+    f, info = panel_variance_scale(_FakeRef(z), 0, n)
+    assert info["shrinkage_weight_median"] < 0.15, info
+    assert abs(np.mean(f["1"] ** 2) - 1) < 0.03, info
+    # panel of 2,000 from another population (frequencies drifted, F_ST about 0.02)
+    n = 2000
+    k = m // 4
+    q = np.clip(p[:k] + rng.normal(0, np.sqrt(0.02 * p[:k] * (1 - p[:k]))), 0.005, 0.995)
+    X = rng.binomial(2, q[None, :], size=(n, k)).astype(float)
+    vld = X.var(axis=0, ddof=1)
+    z = {"v_0": v[:k], "vld_0": vld, "p_0": p[:k], "fvar_0": fvar[:k]}
+    f, info = panel_variance_scale(_FakeRef(z), 0, n)
+    assert info["shrinkage_weight_median"] > 0.9, info
+    np.testing.assert_allclose(f["1"], np.sqrt(v[:k] / vld), rtol=0.1)            # an estimate, close to it
+
+
+def test_matrix_with_derived_source_from_another_population_is_psd(sim3, tmp_path):
+    """A derived source whose panel's variances differ from its own (a panel of another population): the regional
+    matrix transfers the panel's correlations and stays positive semidefinite."""
+    from summit.admixed_ld.derive import derive_source
+    from summit.admixed_ld.matrix import compose_matrix
+    d, S, names = sim3["dir"], sim3["S"], sim3["names"]
+    v = S["variants"]
+    write_bed(str(tmp_path / "other"), S["panels"][0][:200], v, "o")       # anchors from source S0, not S2
+    build_reference([str(d / "panelS0"), str(d / "panelS1")], names[:2], str(tmp_path / "ref2"), step=256,
+                    log=lambda *a: None)
+    derive_source(str(d / "cohort"), str(tmp_path / "ref2"), str(tmp_path / "ref3"), name="S2",
+                  panel=str(tmp_path / "other"), covar=str(d / "cohort.cov"), ld="panel", step=256, log=lambda *a: None)
+    ref3 = Reference(str(tmp_path / "ref3"))
+    z = ref3.load(ref3.chromosomes[0])
+    assert np.median(np.abs(np.log(z["vld_2"] / z["v_2"]))[z["v_2"] > 0.05]) > 0.02     # the scales differ
+    ids = tmp_path / "region.txt"
+    pd.Series(z["snp"][:120]).to_csv(ids, index=False, header=False)
+    R, snp, info = compose_matrix(ref3.path, str(tmp_path / "mat"), snps=str(ids), sources=names,
+                                  mean_ancestry="0.5,0.3,0.2", kappa0="0.1,0.0,0.1", decay_per_cm=0.1,
+                                  taper="none", log=lambda *a: None)
+    assert info["min_eigenvalue"] > -1e-8, info["min_eigenvalue"]
+    assert np.all(np.abs(R) <= 1 + 1e-9)
+    # with nearly all ancestry from S2 and no admixture term, the matrix is the anchor panel's correlation matrix
+    R1, snp1, _ = compose_matrix(ref3.path, str(tmp_path / "mat1"), snps=str(ids), sources=names,
+                                 mean_ancestry="0.0005,0.0005,0.999", kappa0="0.1,0.0,0.1", decay_per_cm=1e-6,
+                                 taper="none", admixture=False, log=lambda *a: None)
+    col = pd.Index(v.SNP.astype(str)).get_indexer(snp1.SNP.astype(str))
+    Xp = S["panels"][0][:200][:, col].astype(float)
+    poly = np.flatnonzero(Xp.var(axis=0) > 0)                     # SNPs the panel has variation at
+    Rp = np.corrcoef(Xp[:, poly], rowvar=False)
+    iu = np.triu_indices(poly.size, 1)
+    bp = snp1.BP.to_numpy()[poly]
+    inside = np.abs(bp[iu[0]] - bp[iu[1]]) < ref3.manifest["window_kb"] * 1000 * 0.95   # pairs the reference stores
+    err = np.max(np.abs(R1[np.ix_(poly, poly)][iu] - Rp[iu])[inside])
+    assert poly.size > 60 and inside.sum() > 1000 and err < 5e-3, (poly.size, inside.sum(), err)
