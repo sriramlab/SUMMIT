@@ -552,7 +552,7 @@ def test_native_vendor_timing_counts_every_record(monkeypatch):
     trait=quantitative_trait("t",ids,rng.normal(size=n),np.ones((n,1)),
         context_names=("intercept",),population_sd=1.)
     result=prepare_cross_gxe(ArraySequentialGenotypeOperator(x),np.ones((m,1)),[trait],ids,
-        probes=2048,seed=3,block_size=256,probe_tile=2048,native=True,threads=prediction_threads())
+        probes=2048,seed=3,block_size=256,probe_tile=2048,memory_bytes=2**34,native=True,threads=prediction_threads())
     vendor=result.diagnostics["native_vendor_gemm"]
     assert vendor["available"]
     assert vendor["records"]==sum(v["calls"] for v in vendor["operations"].values())
