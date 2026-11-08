@@ -37,8 +37,8 @@ import numpy as np
 import pandas as pd
 
 from ._io import match_variants
-from .model import (KernelMatrix, contrast_pairs, dirichlet_moments, moments_tensors, parameters_from_sumstats_k,
-                    contrast_noise, same_person_term, unbiased_products_cov)
+from .model import (KernelMatrix, check_kernel_join, contrast_pairs, dirichlet_moments, moments_tensors,
+                    parameters_from_sumstats_k, contrast_noise, same_person_term, unbiased_products_cov)
 from .reference import Reference
 
 
@@ -486,10 +486,12 @@ def compose_ldscores(ref_path, sumstats, annot, out, *, sources=None, snps=None,
                      generations=None, decay_per_cm=None, mean_ancestry=None, kappa0=None, theta_sd=None,
                      relatedness=None, relatedness_smooth=0.1, background_min_cm=3.0, background_window="panels",
                      nu=None, r2=0.99, grid_cm=0.02, cell_matrix=False,
-                     cell_switch_cm=10.0,
+                     cell_switch_cm=10.0, allow_flat_kernel_join=False,
                      pair_chunk=1 << 23, log=print):
     """Composed LD scores for an admixed GWAS sample with two or more sources (the last is the baseline of the
-    contrasts). mean_ancestry: K-1 or K values (comma-separated); kappa0: the upper triangle of Kt_res(0) row by row."""
+    contrasts). mean_ancestry: K-1 or K values (comma-separated); kappa0: the upper triangle of Kt_res(0) row by row.
+    Departures from the standard recipe that are allowed but should be visible are recorded in the params json under
+    `flags` (and logged as warnings); inconsistent inputs raise."""
     from ..ldscore.gw_ldscore import write_gw_annotation_masses, write_gw_ldscore_table
     from ..relatives.moments import read_annotation_classes
     from ..sumstats.sumstats import Sumstats
@@ -605,8 +607,13 @@ def compose_ldscores(ref_path, sumstats, annot, out, *, sources=None, snps=None,
                                        source=f"admixture {generations} generations ago")
     else:
         kern = KernelMatrix.from_decay(k0, float(decay_per_cm), ref.genome_cm, nK, source=f"decay {decay_per_cm} per cM")
-    if kern.note:
-        log(f"[admixed-ld] note: {kern.note}")
+    flags = check_kernel_join(kern, allow_flat_kernel_join, log)
+    for n_, s in enumerate(sources):           # panels whose own admixture LD was never measured (clean-panels)
+        src_m = ref.manifest["sources"][si[n_]]
+        if "panel_admixture" not in src_m and not (src_m.get("derived") and src_m.get("ld") != "panel"):
+            flags.append(dict(flag="panel_admixture_unmeasured", detail=s))
+            log(f"[admixed-ld] WARNING (recorded flag panel_admixture_unmeasured): the {s} panel's own admixture LD "
+                "was not measured; run `summit admixed-ld clean-panels` (it removes it when its gate passes)")
     if theta_sd is not None:
         th = dirichlet_moments(m_vec, theta_sd)
         th_source = f"Beta/Dirichlet with mean {np.round(m_vec, 3).tolist()} and SD {theta_sd} (first source)"
@@ -615,8 +622,10 @@ def compose_ldscores(ref_path, sumstats, annot, out, *, sources=None, snps=None,
     else:
         th = dirichlet_moments(m_vec, 0.12)
         th_source = "Beta/Dirichlet with SD 0.12 (default; pass --ancestry-sd)"
-        log("[admixed-ld] note: global-ancestry moments default to SD 0.12; they enter only the same-person term, "
-            "which is small at biobank sample sizes.")
+        flags.append(dict(flag="ancestry_sd_default", detail="global-ancestry SD 0.12 (same-person term only)"))
+        log("[admixed-ld] WARNING (recorded flag ancestry_sd_default): global-ancestry moments default to SD 0.12; "
+            "they enter only the same-person term, which is small at biobank sample sizes. Pass --ancestry-sd with a "
+            "published value, or a curve.")
     mom = moments_tensors(th, k1)
     rel_sum, rel_prof = None, None          # optional input: uniform sum of g^2, or the curve's profile
     if relatedness is None:
@@ -636,8 +645,14 @@ def compose_ldscores(ref_path, sumstats, annot, out, *, sources=None, snps=None,
                 + ", ".join(f"{k} cM {v:.4g}" for k, v in rel_prof.describe()["phi_at"].items()) + ")")
         else:
             if str(relatedness) == "curve":
-                log("[admixed-ld] note: the curve has no relatedness profile (made before 5 Nov 2026); the relatives' "
-                    "term is the uniform sum of g^2")
+                if int(curve_info["relatedness"].get("pairs", -1)) == 0:   # listed pairs, none in the sample: no term
+                    flags.append(dict(flag="relatedness_no_pairs", detail="no listed relative pair in the sample"))
+                    log("[admixed-ld] WARNING (recorded flag relatedness_no_pairs): no listed relative pair is in the "
+                        "sample, so the relatives' term is zero")
+                else:
+                    raise ValueError("--relatedness curve needs a curve with a relatedness profile or --background; "
+                                     "this curve has neither (made before 5 Nov 2026). Pass --relatedness uniform for "
+                                     "the uniform sum of g^2, or remake the curve.")
             rel_sum = float(curve_info["relatedness"]["sum_squared_ordered"])
     else:
         rel_sum = float(relatedness)
@@ -840,7 +855,7 @@ def compose_ldscores(ref_path, sumstats, annot, out, *, sources=None, snps=None,
                   reference=dict(sources=ref.manifest["sources"], window_kb=ref.manifest["window_kb"],
                                  genetic_map=ref.manifest["genetic_map"]),
                   per_trait=None if per_trait is None else per_trait.to_dict(orient="records"),
-                  ld_mass=float((V[:, None] * L).sum()))
+                  ld_mass=float((V[:, None] * L).sum()), flags=flags)
     if k1 == 1:                                                    # the two-source keys
         params.update(mean_ancestry=float(m_vec[0]), kappa0=float(k0[0, 0]))
     with open(f"{out}.admixed_ld.json", "w") as fh:

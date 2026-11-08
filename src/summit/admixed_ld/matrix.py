@@ -28,7 +28,7 @@ import numpy as np
 import pandas as pd
 
 from .compose import unbiased_squared_covariance
-from .model import KernelMatrix, contrast_pairs
+from .model import KernelMatrix, check_kernel_join, contrast_pairs
 from .reference import Reference
 
 _TAUS = np.exp(np.linspace(np.log(0.002), np.log(5.0), 120))
@@ -144,7 +144,8 @@ def taper_scales(ref, si, z, taus=_TAUS, max_pairs=2_000_000):
 
 
 def compose_matrix(ref_path, out, *, region=None, snps=None, sources=None, params=None, curve=None, generations=None,
-                   decay_per_cm=None, mean_ancestry=None, kappa0=None, taper="auto", admixture=True, log=print):
+                   decay_per_cm=None, mean_ancestry=None, kappa0=None, taper="auto", admixture=True,
+                   allow_flat_kernel_join=False, log=print):
     """Write out.ld (text, one row per SNP), out.ld.npz (R, float64) and out.snps.tsv for a region 'CHR:START-END'
     (base pairs, inclusive) or a file of SNP IDs on one chromosome."""
     t0 = time.perf_counter()
@@ -156,6 +157,7 @@ def compose_matrix(ref_path, out, *, region=None, snps=None, sources=None, param
     k1 = len(sources) - 1
     m, k0 = _parameters(params, sources, mean_ancestry, kappa0)
     kern = _kernel(ref, sources, k0, curve, generations, decay_per_cm)
+    flags = check_kernel_join(kern, allow_flat_kernel_join, log)
     if (region is None) == (snps is None):
         raise ValueError("Give exactly one of --region and --snps.")
     if region is not None:
@@ -250,7 +252,7 @@ def compose_matrix(ref_path, out, *, region=None, snps=None, sources=None, param
     info = dict(format="summit-admixed-ld-matrix", version=1, sources=sources, n_snps=int(p), chrom=str(c),
                 mean_ancestry=m.tolist(), kappa0=k0.tolist(), kernel=kern.describe(), taper=tau_note,
                 admixture_term=bool(admixture), complete_band=bool(complete), min_eigenvalue=ev, psd_note=psd_note,
-                reference=dict(sources=ref.manifest["sources"], window_kb=ref.manifest["window_kb"]))
+                reference=dict(sources=ref.manifest["sources"], window_kb=ref.manifest["window_kb"]), flags=flags)
     with open(out + ".matrix.json", "w") as f:
         json.dump(info, f, indent=1)
     log(f"[admixed-ld] matrix: {p} SNPs on chr{c}, taper {tau_note}, smallest eigenvalue {ev:.3g}; wrote {out}.ld, "

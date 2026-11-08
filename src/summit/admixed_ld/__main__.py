@@ -188,6 +188,10 @@ def main(argv=None):
     m.add_argument("--cell-matrix", action="store_true",
                    help="use the cohort's cell matrix (written by curve) beyond --cell-switch-cm and between chromosomes")
     m.add_argument("--cell-switch-cm", type=float, default=10.0)
+    m.add_argument("--allow-flat-kernel-join", action="store_true",
+                   help="proceed when the curve at 2 cM is not below kappa_res(0) from the standard errors (the "
+                        "kernel is then held at the curve's value below 2 cM and the flag is recorded); by default "
+                        "this inconsistency is an error")
     m.add_argument("--out", required=True)
 
     v = sub.add_parser("derive", help="a source without a reference panel, estimated from an admixed cohort that "
@@ -229,6 +233,8 @@ def main(argv=None):
     x.add_argument("--taper", default="auto",
                    help="taper of the panel term: auto (scale from the panel's sampling noise), none, or a scale in cM")
     x.add_argument("--no-admixture", action="store_true", help="leave out the admixture term (for comparison only)")
+    x.add_argument("--allow-flat-kernel-join", action="store_true",
+                   help="as in compose: proceed when the curve at 2 cM is not below kappa_res(0), with the flag recorded")
     x.add_argument("--out", required=True)
 
     a = ap.parse_args(argv)
@@ -286,7 +292,7 @@ def main(argv=None):
         compose_matrix(a.ref, a.out, region=a.region, snps=a.snps, sources=_sources(a.sources), params=a.params,
                        curve=a.curve, generations=a.admixture_generations, decay_per_cm=a.decay_per_cm,
                        mean_ancestry=a.mean_ancestry, kappa0=a.kappa0, taper=a.taper, admixture=not a.no_admixture,
-                       log=log._log)
+                       allow_flat_kernel_join=a.allow_flat_kernel_join, log=log._log)
     else:
         from .compose import compose_ldscores
         compose_ldscores(a.ref, a.sumstats, a.annot, a.out, sources=_sources(a.sources), snps=a.snps, match=a.match,
@@ -295,7 +301,8 @@ def main(argv=None):
                          relatedness=a.relatedness, relatedness_smooth=a.relatedness_smooth,
                          background_min_cm=a.background_min_cm, background_window=a.background_window, nu=a.nu,
                          grid_cm=a.grid_cm, cell_matrix=a.cell_matrix,
-                         cell_switch_cm=a.cell_switch_cm, log=log._log)
+                         cell_switch_cm=a.cell_switch_cm, allow_flat_kernel_join=a.allow_flat_kernel_join,
+                         log=log._log)
     return 0
 
 

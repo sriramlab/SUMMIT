@@ -885,6 +885,7 @@ def test_relatives_profile_absent_pairs_change_nothing(fam, tmp_path):
     A = pd.read_csv(f"{tmp_path / 'a'}.gw.ldscore.gz", sep="\t")
     B = pd.read_csv(f"{tmp_path / 'b'}.gw.ldscore.gz", sep="\t")
     pd.testing.assert_frame_equal(A, B)
+    assert "relatedness_no_pairs" in {f["flag"] for f in json.load(open(f"{tmp_path / 'b'}.admixed_ld.json"))["flags"]}
     # the uniform term: the curve's sum of g^2, as a number
     s = fam["info"]["relatedness"]["sum_squared_ordered"]
     for name, rel in (("u1", "uniform"), ("u2", s)):
@@ -1210,3 +1211,38 @@ def test_matrix_with_derived_source_from_another_population_is_psd(sim3, tmp_pat
     inside = np.abs(bp[iu[0]] - bp[iu[1]]) < ref3.manifest["window_kb"] * 1000 * 0.95   # pairs the reference stores
     err = np.max(np.abs(R1[np.ix_(poly, poly)][iu] - Rp[iu])[inside])
     assert poly.size > 60 and inside.sum() > 1000 and err < 5e-3, (poly.size, inside.sum(), err)
+
+
+def test_compose_fails_closed_and_records_flags(sim, tmp_path):
+    """Inputs that disagree raise; allowed departures from the standard recipe are recorded in the params json (7 Nov
+    2026). A curve above kappa_res(0) at 2 cM is an error unless allowed (then flagged); a date without a published
+    ancestry SD flags the default SD; a panel whose own admixture was never measured is flagged."""
+    from summit.admixed_ld.compose import compose_ldscores
+    from summit.admixed_ld.curve import genotype_curve
+    d = sim["dir"]
+    quiet = lambda *a, **k: None
+    if not os.path.exists(f"{d / 'cohort'}.curve.json"):
+        genotype_curve(str(d / "cohort"), str(d / "ref"), str(d / "cohort"), covar=str(d / "cohort.cov"),
+                       cell_cm=0.5, log=quiet)
+    cdf = pd.read_csv(f"{d / 'cohort'}.curve.tsv", sep="\t")
+    k2 = float(np.interp(2.0, cdf.d_cm.to_numpy(), cdf.kernel.to_numpy()))
+    assert k2 > 0
+    args = (str(d / "ref"), [str(d / "ss")], str(d / "annot.tsv"))
+
+    def flags(out):
+        return {f["flag"] for f in json.load(open(out + ".admixed_ld.json"))["flags"]}
+
+    out = str(tmp_path / "curve")
+    compose_ldscores(*args, out, curve=str(d / "cohort"), log=quiet)
+    assert flags(out) == {"panel_admixture_unmeasured"}            # the test reference was never cleaned
+    low = dict(curve=str(d / "cohort"), mean_ancestry="0.6", kappa0=f"{0.5 * k2:.6g}", log=quiet)
+    with pytest.raises(ValueError, match="allow-flat-kernel-join"):
+        compose_ldscores(*args, str(tmp_path / "flat"), **low)
+    assert not os.path.exists(str(tmp_path / "flat") + ".gw.ldscore.gz")
+    compose_ldscores(*args, str(tmp_path / "flat"), allow_flat_kernel_join=True, **low)
+    assert flags(str(tmp_path / "flat")) == {"kernel_flat_join", "panel_admixture_unmeasured"}
+    out = str(tmp_path / "date")
+    compose_ldscores(*args, out, generations=sim["S"]["generations"], log=quiet)
+    assert flags(out) == {"ancestry_sd_default", "panel_admixture_unmeasured"}
+    compose_ldscores(*args, out + "_sd", generations=sim["S"]["generations"], theta_sd=0.1, log=quiet)
+    assert flags(out + "_sd") == {"panel_admixture_unmeasured"}

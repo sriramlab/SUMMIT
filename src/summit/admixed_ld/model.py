@@ -317,6 +317,22 @@ class _Entry:
         return np.where(dist > self.d[-1], self.far, out)
 
 
+def check_kernel_join(kern, allow=False, log=print):
+    """Fail closed when the cohort's curve at d0 is not below kappa_res(0) from the standard errors. The kernel decays
+    with distance, so a curve above kappa_res(0) means the two inputs disagree (for example kappa_res(0) from SEs of
+    another covariate model or SNP set, a curve from another sample, or background LD in the curve at d0). Returns the
+    recorded flags (empty when the join is regular); raises unless `allow`, in which case the kernel is held at the
+    curve's value below d0 and the flag is recorded."""
+    if not kern.note:
+        return []
+    if not allow:
+        raise ValueError(f"{kern.note}. The curve and the standard errors disagree. Check that both come from this GWAS "
+                         "sample and covariate model, give --kappa0, or pass --allow-flat-kernel-join to proceed with "
+                         "the flag recorded.")
+    log(f"[admixed-ld] WARNING (recorded flag kernel_flat_join): {kern.note}")
+    return [dict(flag="kernel_flat_join", detail=kern.note)]
+
+
 class KernelMatrix:
     """Kt_res(d) of the K-1 contrasts ((K-1) x (K-1), symmetric) and the per-source decay rates lam (K) of the
     recombination factor exp(-lam_s d) on within-source LD. For two sources this is the scalar Kernel."""
