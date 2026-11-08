@@ -162,7 +162,8 @@ def main(argv=None):
                    help="override kappa_res(0) from the SEs: one value for two sources, otherwise the upper triangle "
                         "of the contrast matrix, row by row")
     m.add_argument("--ancestry-sd", type=float, default=None,
-                   help="SD of global ancestry for the same-person term (default: the curve's, else 0.12)")
+                   help="SD of global ancestry for the same-person term, e.g. a published value (default: the curve's "
+                        "moments, else the SD implied by the SEs' m and kappa_res(0) under random mating)")
     m.add_argument("--relatedness", default=None,
                    help="optional relatives' term: 'curve' for the curve's profile (B between chromosomes, phi(d) on "
                         "one chromosome, which carries the segments that relatives share identical by descent; a "

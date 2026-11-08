@@ -1243,6 +1243,9 @@ def test_compose_fails_closed_and_records_flags(sim, tmp_path):
     assert flags(str(tmp_path / "flat")) == {"kernel_flat_join", "panel_admixture_unmeasured"}
     out = str(tmp_path / "date")
     compose_ldscores(*args, out, generations=sim["S"]["generations"], log=quiet)
-    assert flags(out) == {"ancestry_sd_default", "panel_admixture_unmeasured"}
+    assert flags(out) == {"ancestry_sd_from_identity", "panel_admixture_unmeasured"}
+    p = json.load(open(out + ".admixed_ld.json"))
+    sd_id = np.sqrt((2 * p["mean_ancestry"] * (1 - p["mean_ancestry"]) - p["kappa0"]) / 4)
+    assert p["theta"]["var"] == pytest.approx(sd_id ** 2, rel=1e-6)
     compose_ldscores(*args, out + "_sd", generations=sim["S"]["generations"], theta_sd=0.1, log=quiet)
     assert flags(out + "_sd") == {"panel_admixture_unmeasured"}

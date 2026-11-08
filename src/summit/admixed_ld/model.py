@@ -413,6 +413,19 @@ def moments_tensors(th, k1):
     return (np.array([th["mean"]]), np.array([[th["var"]]]), np.array([[[th["m3"]]]]), np.array([[[[th["m4"]]]]]))
 
 
+def ancestry_sd_from_kernel(m_first, kappa0_first):
+    """SD of the first source's global ancestry implied by the cohort quantities of the standard errors, for Tier S
+    without a published value (decision of 7 Nov 2026). With independent haplotypes (random mating), the local-ancestry
+    dosage of a source at one SNP has variance 2 m (1 - m) = 4 Var(theta) + H, and the GWAS PCs leave kappa_res(0) ~ H,
+    so Var(theta) = (2 m (1 - m) - kappa_res(0)) / 4. Assortative mating raises Var(theta) above this, so the value is
+    a lower bound in practice (UK Biobank t1 / t2: 0.261 / 0.242 against 0.293 / 0.301 from the genotypes)."""
+    v = (2.0 * m_first * (1.0 - m_first) - kappa0_first) / 4.0
+    if not v > 0:
+        raise ValueError(f"kappa_res(0) {kappa0_first:.4g} is not below 2 m (1 - m) = {2 * m_first * (1 - m_first):.4g}, "
+                         "so the standard errors imply no variance of global ancestry; give --ancestry-sd.")
+    return float(np.sqrt(v))
+
+
 def dirichlet_moments(m, sd_first, draws=400_000, seed=0) -> dict:
     """Moments of the first K-1 ancestries under Dirichlet(c m), with c set so that the first ancestry has SD sd_first
     (two sources: the Beta moments, in closed form)."""

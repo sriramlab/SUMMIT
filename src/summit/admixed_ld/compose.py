@@ -37,8 +37,9 @@ import numpy as np
 import pandas as pd
 
 from ._io import match_variants
-from .model import (KernelMatrix, check_kernel_join, contrast_pairs, dirichlet_moments, moments_tensors,
-                    parameters_from_sumstats_k, contrast_noise, same_person_term, unbiased_products_cov)
+from .model import (KernelMatrix, ancestry_sd_from_kernel, check_kernel_join, contrast_pairs, dirichlet_moments,
+                    moments_tensors, parameters_from_sumstats_k, contrast_noise, same_person_term,
+                    unbiased_products_cov)
 from .reference import Reference
 
 
@@ -619,13 +620,17 @@ def compose_ldscores(ref_path, sumstats, annot, out, *, sources=None, snps=None,
         th_source = f"Beta/Dirichlet with mean {np.round(m_vec, 3).tolist()} and SD {theta_sd} (first source)"
     elif curve_info is not None:
         th, th_source = curve_info["theta"], "the cohort's curve"
-    else:
-        th = dirichlet_moments(m_vec, 0.12)
-        th_source = "Beta/Dirichlet with SD 0.12 (default; pass --ancestry-sd)"
-        flags.append(dict(flag="ancestry_sd_default", detail="global-ancestry SD 0.12 (same-person term only)"))
-        log("[admixed-ld] WARNING (recorded flag ancestry_sd_default): global-ancestry moments default to SD 0.12; "
-            "they enter only the same-person term, which is small at biobank sample sizes. Pass --ancestry-sd with a "
-            "published value, or a curve.")
+    else:                                   # Tier S without a published SD: the SEs' m and kappa_res(0)
+        sd_id = ancestry_sd_from_kernel(float(m_vec[0]), float(k0[0, 0]))
+        th = dirichlet_moments(m_vec, sd_id)
+        th_source = (f"Beta/Dirichlet with mean {np.round(m_vec, 3).tolist()} and SD {sd_id:.4f} (first source) from "
+                     "m and kappa_res(0), Var = (2 m (1 - m) - kappa_res(0)) / 4")
+        flags.append(dict(flag="ancestry_sd_from_identity", detail=f"global-ancestry SD {sd_id:.4f} from m and "
+                          "kappa_res(0) under random mating (a lower bound when mating is assortative)"))
+        log(f"[admixed-ld] WARNING (recorded flag ancestry_sd_from_identity): global-ancestry SD {sd_id:.4f} from m and "
+            "kappa_res(0) (random mating; assortative mating makes the true SD larger). The moments set the "
+            "same-person term, whose share of LD mass grows with SNPs per person (21% of the exact in-sample mass in "
+            "UK Biobank t1); pass --ancestry-sd with a published value when the cohort reports one.")
     mom = moments_tensors(th, k1)
     rel_sum, rel_prof = None, None          # optional input: uniform sum of g^2, or the curve's profile
     if relatedness is None:
