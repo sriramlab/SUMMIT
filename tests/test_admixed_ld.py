@@ -1046,6 +1046,92 @@ def test_panel_background_removed_inside_the_band(tmp_path):
     assert set(params["panel_background"]) == {"AFR", "EUR"} and params["relatedness_profile"]["window"] == "panels"
 
 
+def test_derived_source_anchor_background_removed_inside_the_band(tmp_path):
+    """A derived source with a panel's window LD (derive --ld panel) holds its anchors' background in the panel's
+    unbiased squared covariances, like any panel. clean-panels given the anchor panel records it, and compose removes it
+    inside the band, so anchors with sibs and anchors without compose nearly the same LD; without the record compose
+    refuses the cohort's background at every distance (it would count the anchors' background twice)."""
+    from summit.admixed_ld.compose import compose_ldscores
+    from summit.admixed_ld.curve import genotype_curve
+    from summit.admixed_ld.derive import derive_source
+    from summit.admixed_ld.panel_admixture import remove_panel_admixture
+    import admixed_ld_sim
+    rng = np.random.default_rng(29)
+    n_chr, spc, chr_cm = 4, 500, 60.0
+    chrom = np.repeat(np.arange(1, n_chr + 1), spc)
+    cm = np.concatenate([np.sort(rng.uniform(0, chr_cm, spc)) for _ in range(n_chr)])
+    M = cm.size
+    pE = rng.uniform(0.05, 0.95, M)
+    pA = np.clip(pE + rng.normal(0, 0.25, M), 0.03, 0.97)
+    founders = {s: (rng.random((40, M)) < p[None, :]).astype(np.int8) for s, p in (("A", pA), ("E", pE))}
+    var = pd.DataFrame({"CHR": chrom.astype(str), "SNP": [f"sim{j:05d}" for j in range(M)], "CM": cm,
+                        "BP": np.rint(cm * 1e6).astype(np.int64) + 1, "A1": "A", "A2": "G"})
+    n = 600
+    panels = {"Arel": _panel_with_sibs(rng, {"A": founders["A"]}, chrom, cm, 300, 150),
+              "Aunrel": _panel_with_sibs(rng, {"A": founders["A"]}, chrom, cm, n, 0),
+              "E": _panel_with_sibs(rng, {"E": founders["E"]}, chrom, cm, n, 0)}
+    for nm, G in panels.items():
+        write_bed(str(tmp_path / nm), G, var, nm)
+    hap = admixed_ld_sim._example._haplotypes
+    nc = 1500
+    th = rng.beta(0.75 * 20, 0.25 * 20, nc)
+    hC, _ = hap(rng, founders, cm, 2 * nc, 3.0, anc=np.repeat(th, 2), break_rate=0.08)
+    GC = (hC[0::2] + hC[1::2]).astype(np.float64)
+    iid = write_bed(str(tmp_path / "cohort"), GC, var, "c")
+    C = principal_components(GC, 2)
+    pd.DataFrame({"FID": iid, "IID": iid, "PC1": C[:, 0], "PC2": C[:, 1]}).to_csv(tmp_path / "cohort.cov", sep="\t",
+                                                                                   index=False)
+    os.makedirs(tmp_path / "ss")
+    for t in range(2):
+        beta, se = gwas(GC, rng.standard_normal(nc), C)
+        pd.DataFrame({"SNP": var.SNP, "CHR": var.CHR, "BP": var.BP, "A1": var.A1, "A2": var.A2, "N": nc,
+                      "BETA": beta, "SE": se, "Z": beta / se, "COV_RANK": 2}).to_csv(tmp_path / "ss" / f"t{t}.tsv",
+                                                                                     sep="\t", index=False)
+    pc = GC.mean(0) / 2
+    lo = (np.minimum(pc, 1 - pc) < 0.2).astype(int)
+    pd.DataFrame({"SNP": var.SNP, "low": lo, "high": 1 - lo}).to_csv(tmp_path / "annot.tsv", sep="\t", index=False)
+    quiet = lambda *a, **k: None
+    build_reference([str(tmp_path / "Aunrel"), str(tmp_path / "E")], ["AFR", "EUR"], str(tmp_path / "ref"),
+                    match="id", log=quiet)
+    cov = str(tmp_path / "cohort.cov")
+    for r in ("rel", "unrel"):
+        derive_source(str(tmp_path / "cohort"), str(tmp_path / "ref"), str(tmp_path / f"refd_{r}"), name="AFRd",
+                      known=["EUR"], panel=str(tmp_path / f"A{r}"), covar=cov, match="id", ld="panel", step=256,
+                      log=quiet)
+    # the European panel cleaned, the anchors not: compose refuses
+    remove_panel_admixture(str(tmp_path / "refd_rel"), {"EUR": str(tmp_path / "E")}, out=str(tmp_path / "refd_rel_e"),
+                           match="id", background_snps=2000, background_quantile=1.0, log=quiet)
+    genotype_curve(str(tmp_path / "cohort"), str(tmp_path / "refd_rel_e"), str(tmp_path / "cv_e"), covar=cov,
+                   match="id", background=True, background_quantile=0.5, log=quiet)
+    with pytest.raises(ValueError, match="AFRd"):
+        compose_ldscores(str(tmp_path / "refd_rel_e"), [str(tmp_path / "ss")], str(tmp_path / "annot.tsv"),
+                         str(tmp_path / "ld_e"), match="id", curve=str(tmp_path / "cv_e"), relatedness="curve",
+                         background_window="panels", background_min_cm=1.5, log=quiet)
+    mass = {}
+    for r in ("rel", "unrel"):
+        rc = str(tmp_path / f"refd_{r}_c")
+        remove_panel_admixture(str(tmp_path / f"refd_{r}"), {"AFRd": str(tmp_path / f"A{r}"), "EUR": str(tmp_path / "E")},
+                               out=rc, match="id", background_snps=2000, background_quantile=1.0, log=quiet)
+        man = json.load(open(os.path.join(rc, "manifest.json")))
+        rec = {s["name"]: s for s in man["sources"]}["AFRd"]["panel_background"]
+        assert rec["n"] == n and set(rec["table"]) == {"lag", "d_cm", "w", "excess"}
+        genotype_curve(str(tmp_path / "cohort"), rc, str(tmp_path / f"cv_{r}"), covar=cov, match="id",
+                       background=True, background_quantile=0.5, log=quiet)
+        for win in ("panels", "zero"):
+            o = str(tmp_path / f"ld_{r}_{win}")
+            compose_ldscores(rc, [str(tmp_path / "ss")], str(tmp_path / "annot.tsv"), o, match="id",
+                             curve=str(tmp_path / f"cv_{r}"), relatedness="curve", background_window=win,
+                             background_min_cm=1.5, log=quiet)
+            L = pd.read_csv(f"{o}.gw.ldscore.gz", sep="\t")
+            mass[r, win] = float((L.V.to_numpy()[:, None] * L[["low", "high"]].to_numpy()).sum())
+    gap_zero = mass["rel", "zero"] - mass["unrel", "zero"]
+    gap_panels = mass["rel", "panels"] - mass["unrel", "panels"]
+    assert gap_zero > 0.001 * mass["unrel", "zero"], mass          # the anchors' sibs inflate the band
+    assert abs(gap_panels) < 0.4 * gap_zero, mass
+    params = json.load(open(str(tmp_path / "ld_rel_panels") + ".admixed_ld.json"))
+    assert set(params["panel_background"]) == {"AFRd", "EUR"}
+
+
 class _FakeRef:
     """The parts of Reference that panel_variance_scale reads: chromosomes and load()."""
 

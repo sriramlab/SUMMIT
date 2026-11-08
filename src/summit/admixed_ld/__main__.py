@@ -71,7 +71,8 @@ def main(argv=None):
                                              "and record each panel's own background LD")
     cp.add_argument("--ref", required=True, help="reference written by `summit admixed-ld reference`")
     cp.add_argument("--panel", action="append",
-                    help="PLINK prefix of a panel the reference was built from (repeat, in the order of --names)")
+                    help="PLINK prefix of a panel the reference was built from, or the anchor panel of a derived "
+                         "source with a panel's LD (`derive --ld panel`) (repeat, in the order of --names)")
     cp.add_argument("--names", help="comma-separated source names of the panels given")
     cp.add_argument("--from-fits",
                     help="instead of --panel: a reference cleaned from the same panels (directory or manifest.json); "

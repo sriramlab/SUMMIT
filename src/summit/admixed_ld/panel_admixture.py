@@ -36,6 +36,12 @@ members among the least differentiated SNPs, less its admixture part and the nul
 which its unbiased squared covariances hold on top of the population's LD, E U = c^2 + v_j v_k S(d) / (n (n - 3)).
 The cohort's own background measurement holds the cohort's version, so when compose applies it at every distance it
 removes the panels' copy inside the band (compose.SmoothBackground), as cleaning removes the panels' admixture LD.
+
+A derived source whose window LD comes from a panel (`derive --ld panel`, its anchors) is cleaned the same way when its
+anchor panel is given: the anchors' admixture LD is removed from its covariances and from the panel variances behind
+them (vld; the source's own variances v come from the cohort's frequencies and are kept), and the anchors' background
+is recorded. Without the record compose would count the anchors' background twice at the distances of the band (7 Nov
+2026: 5-6% too much LD mass in the coalescent testbed).
 """
 from __future__ import annotations
 
@@ -154,8 +160,10 @@ def remove_panel_admixture(ref_path, panels: dict, out=None, *, match="position"
         src = man["sources"][i]
         if "panel_admixture" in src:
             raise ValueError(f"The panel admixture of {s} was already removed from {ref_path}.")
-        if src.get("derived"):
-            raise ValueError(f"{s} is a derived source; only panels with genotypes can be cleaned.")
+        if src.get("derived") and src.get("ld") != "panel":
+            raise ValueError(f"{s} is a derived source whose window LD comes from the cohort (ld '{src.get('ld')}'); "
+                             "only panels with genotypes, and derived sources with a panel's LD (their anchors), can "
+                             "be cleaned.")
         cprefix = os.path.join(ref_path, f"panel_admixture_{s}")
         log(f"[admixed-ld] panel admixture: weighted-LD curve of the {s} panel ({prefix})")
         _, info = genotype_curve(prefix, ref_path, cprefix, sources=names, covar=None, match=match, max_cm=hi,
@@ -188,9 +196,10 @@ def remove_panel_admixture(ref_path, panels: dict, out=None, *, match="position"
 
 
 def _apply_kernels(ref_path, ref, kernels, names, log):
-    """Subtract D_j' Kt_p(d) D_k from the band covariances (and D_j' Kt_p(0) D_j from the variances) of each source
-    whose kernel is given, keeping the sampling variance (m22 - cov^2) of every covariance. Rewrites the chromosome
-    files of ref_path in place."""
+    """Subtract D_j' Kt_p(d) D_k from the band covariances (and D_j' Kt_p(0) D_j from the variances of the people
+    behind them: the panel variances vld of a derived source with a panel's LD, otherwise v) of each source whose
+    kernel is given, keeping the sampling variance (m22 - cov^2) of every covariance. Rewrites the chromosome files of
+    ref_path in place."""
     removed = {i: 0.0 for i in kernels}
     for c in ref.chromosomes:
         path = os.path.join(ref_path, f"chr{c}.npz")
@@ -207,7 +216,8 @@ def _apply_kernels(ref_path, ref, kernels, names, log):
             new = cov - a
             z[f"m22_{i}"] = (z[f"m22_{i}"].astype(np.float64) - cov * cov + new * new).astype(z[f"m22_{i}"].dtype)
             z[f"cov_{i}"] = new.astype(z[f"cov_{i}"].dtype)
-            z[f"v_{i}"] = z[f"v_{i}"] - np.einsum("ja,ab,jb->j", D, kern(np.zeros(1))[0], D)
+            vk = f"vld_{i}" if f"vld_{i}" in z else f"v_{i}"
+            z[vk] = z[vk] - np.einsum("ja,ab,jb->j", D, kern(np.zeros(1))[0], D)
             removed[i] += float(np.abs(a).sum())
         np.savez(path, **z)
     log("[admixed-ld] panel admixture removed: " + ", ".join(f"{names[i]} (sum |change| {v:.4g})"

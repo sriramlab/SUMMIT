@@ -652,16 +652,16 @@ def compose_ldscores(ref_path, sumstats, annot, out, *, sources=None, snps=None,
             if rec is not None:
                 panel_bg[n_] = SmoothBackground.from_record(rec, fit_min_cm=background_min_cm,
                                                             smooth=relatedness_smooth, name=s)
-            elif src_m.get("derived"):
-                log(f"[admixed-ld] note: {s} is a derived source without genotypes; its covariances' own background "
-                    "LD is not removed")
+            elif src_m.get("derived") and src_m.get("ld") != "panel":
+                log(f"[admixed-ld] note: {s} is a derived source with the cohort's own window covariances; no panel "
+                    "background to remove")
             else:
                 missing.append(s)
         if missing:
             raise ValueError("--relatedness curve with the cohort's background at every distance needs each panel's "
                              f"own background, which {ref_path} does not record for {', '.join(missing)}: run "
-                             "`summit admixed-ld clean-panels` (it measures it), or pass --background-window zero for "
-                             "the rule of 5 Nov 2026.")
+                             "`summit admixed-ld clean-panels` (it measures it; for a derived source with a panel's "
+                             "LD give its anchor panel), or pass --background-window zero for the rule of 5 Nov 2026.")
         log("[admixed-ld] compose: the panels' own background LD is removed inside the band ("
             + ", ".join(f"{sources[n_]}: {pb.per_pair(2.0):.3g} per SNP pair at 2 cM, n {pb.n}"
                         for n_, pb in panel_bg.items()) + ")")
@@ -773,8 +773,11 @@ def compose_ldscores(ref_path, sumstats, annot, out, *, sources=None, snps=None,
                         pis[s], vnss[s] = pi_s, vns
                     noise = window_noise(pis, vnss, cross_c, d)
                     for n_, pb in panel_bg.items():               # the panel's own background (SmoothBackground)
-                        noise += (pis[n_] * pis[n_] * vr[n_][jl].astype(np.float64) * vr[n_][kl].astype(np.float64)
-                                  * pb.per_pair(d))
+                        bg = (pis[n_] * pis[n_] * vr[n_][jl].astype(np.float64) * vr[n_][kl].astype(np.float64)
+                              * pb.per_pair(d))
+                        if n_ in fsc:                             # on the source's scale, as its covariances
+                            bg *= (fsc[n_][c][jl] * fsc[n_][c][kl]) ** 2
+                        noise += bg
                     sq = cr * cr - noise - adm * adm
                     L += np.bincount(j * K + cls[k], weights=sq / (cres[j] * s2[k]), minlength=M * K).reshape(M, K)
                     L += np.bincount(k * K + cls[j], weights=sq / (cres[k] * s2[j]), minlength=M * K).reshape(M, K)
