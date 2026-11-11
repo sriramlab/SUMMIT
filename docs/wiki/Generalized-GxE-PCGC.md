@@ -7,6 +7,15 @@ interaction variances, and their three covariances. Continuous exposures,
 categorical variables encoded numerically, and supplied nonlinear basis
 columns use the same interface.
 
+For quantitative traits, the same covariance model with the basis
+`[1, E1, ..., EK]` is SUMMIT-GxE, the multi-exposure model of Jeong and
+Sankararaman ([SUMMIT-GxE: many exposures](GxE-models.md#summit-gxe-many-exposures)).
+This page describes its binary-trait form, which estimates Ω on the liability
+scale. With exposures standardized as in SUMMIT-GxE, amplification
+`omega_total[0, k] / omega_total[0, 0]` and effect heterogeneity
+`Omega_EE - omega_0E omega_0E' / omega_00` follow from `omega_total` in the
+same way.
+
 For covariance between two traits, see
 [Generalized cross-trait PCGC](Generalized-cross-trait-PCGC.md). That workflow
 requires joint preparation and has separate selection and uncertainty limits.
@@ -228,7 +237,10 @@ coverage and sometimes made it worse by adding noise to the SE. On real
 genotypes at N = 337,845 it inflated the null covariance's variance by about 22%,
 where the jackknife was already right. It is therefore
 opt-in, for analyses with large N/M (about 8 or more). Like the jackknife, it
-requires blocks larger than local LD.
+requires blocks larger than local LD. This differs from quantitative
+SUMMIT-GxE fits, which add a between-block signal term by default
+([G×E models](GxE-models.md#outputs-and-standard-errors)); that term is
+derived for quantitative traits and is not applied to PCGC fits.
 
 The correction needs the same SNP blocks at preparation and fit. Set
 `--binary-crossblock-blocks` to the intended jackknife block count, usually

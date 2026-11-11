@@ -15,11 +15,21 @@ gene–environment interaction models and polygenic scores.
 - Heritability due to direct genetic effects from sibships.
 - Batch analysis of many traits and annotation models.
 - Gene–environment interaction (G×E) and environment-dependent residual variance.
-- Joint models of multiple continuous or categorical environments.
+- Joint models of multiple continuous or categorical environments (SUMMIT-GxE).
 - Cross-trait genetic response covariance through the research Python API.
 - Additive and generalized G×E estimation for binary traits with PCGC.
 - Quantitative epistasis with supplied targets and genetic backgrounds.
 - G×E polygenic score fitting, scoring, and calibration.
+
+SUMMIT-GxE jointly estimates the covariance Ω of additive and context-specific
+SNP effects across many exposures. It uses per-trait interaction statistics
+and a reference of stochastic directional LD scores, which is computed once
+for a set of individuals and exposures and reused across traits. Ω gives the
+amplification of genetic effects by each exposure,
+`a_k = omega_0k / omega_00`, the effect heterogeneity
+`S = Omega_EE - omega_0E omega_0E' / omega_00`, and the G×E heritability.
+Standard errors combine a SNP-block jackknife with a between-block term.
+See [SUMMIT-GxE](https://github.com/sriramlab/SUMMIT/wiki/GxE-models#summit-gxe-many-exposures).
 
 Genotype input can be PLINK BED hard calls or biallelic diploid PGEN dosages.
 See the [user guide](https://github.com/sriramlab/SUMMIT/wiki) for the inputs and availability of each method.
@@ -86,7 +96,7 @@ that also runs on macOS.
 - [Related individuals](https://github.com/sriramlab/SUMMIT/wiki/Related-individuals)
 - [Local ancestry](https://github.com/sriramlab/SUMMIT/wiki/Local-ancestry)
 - [Batch analyses](https://github.com/sriramlab/SUMMIT/wiki/Batch-analyses)
-- [G×E models](https://github.com/sriramlab/SUMMIT/wiki/GxE-models)
+- [G×E models and SUMMIT-GxE](https://github.com/sriramlab/SUMMIT/wiki/GxE-models)
 - [Multiple environments](https://github.com/sriramlab/SUMMIT/wiki/Multiple-environments)
 - [Cross-trait response models](https://github.com/sriramlab/SUMMIT/wiki/Cross-trait-analysis)
 - [Binary traits and PCGC](https://github.com/sriramlab/SUMMIT/wiki/Binary-traits-and-PCGC)
