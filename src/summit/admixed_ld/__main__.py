@@ -169,7 +169,11 @@ def main(argv=None):
                         "one chromosome, which carries the segments that relatives share identical by descent; a "
                         "curve made before 5 Nov 2026 gives the uniform term), 'uniform' for the uniform term from "
                         "the curve's sum of g^2, or a number: the sum over ordered pairs of relatives of their squared "
-                        "relatedness in the covariate-adjusted genotypes, added uniformly to every SNP pair")
+                        "relatedness in the covariate-adjusted genotypes, added uniformly to every SNP pair. The "
+                        "curve's sums run over the ordered pairs of its own people and are put on the GWAS's sample "
+                        "by N (N - 1) / (n (n - 1)), n the curve's people and N the GWAS's (exactly 1 when the curve "
+                        "is made on the GWAS's people; recorded flag when they differ by more than 1%%); a number is "
+                        "used as given")
     m.add_argument("--relatedness-smooth", type=float, default=0.1,
                    help="width of the bins that pool the profile's lags, as a fraction of the distance (default 0.1)")
     m.add_argument("--background-min-cm", type=float, default=3.0,

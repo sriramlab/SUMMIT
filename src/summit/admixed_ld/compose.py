@@ -16,11 +16,14 @@ covariates, it is computed as:
                                       (the window pairs' admixture-only part is taken out of the first sum);
   pairs on different chromosomes      delta_j^2 delta_k^2 far^2;
   the same-person term, each SNP with itself (V_j), and, optionally, relatives: with the curve's profile
-                                      (1 / nu^2) [B sum_{k in c, k != j} V_k + sum_{k in c on j's chromosome}
+                                      (f / nu^2) [B sum_{k in c, k != j} V_k + sum_{k in c on j's chromosome}
                                       (phi(d_jk) - B) V_k] (RelatednessProfile, BackgroundProfile, or the cohort's
                                       all-pairs background at every distance, SmoothBackground), or the uniform
-                                      (sum over their ordered pairs of g^2) / nu^2 * sum_{k in c} V_k, with g the
-                                      relatedness of the covariate-adjusted, standardized genotypes.
+                                      f (sum over their ordered pairs of g^2) / nu^2 * sum_{k in c} V_k, with g the
+                                      relatedness of the covariate-adjusted, standardized genotypes. B, phi and the
+                                      sum of g^2 are sums over the ordered pairs of the curve's n people; a GWAS of N
+                                      of them taken at random holds the share f = N (N - 1) / (n (n - 1)) of those
+                                      pairs (f = 1 when the curve is made on the GWAS's people).
 V_j = C_res(j,j) / s_j^2 is the population share of SNP j's variance that the covariates leave, which SUMMIT's
 in-sample V (one minus the adjusted R2) estimates, so neither V nor the partner weights need a degrees-of-freedom
 factor. The output is written with SUMMIT's own LD-score writer, so `summit --h2/--rg --ldscores <out>.gw.ldscore.gz
@@ -255,7 +258,9 @@ class RelatednessProfile:
     in the covariate-adjusted, standardized genotypes. Between chromosomes it is B (about sum of g^2 over ordered pairs);
     on one chromosome it is phi(d), which exceeds B by the autocovariance of local relatedness at distance d (identical
     by descent segments). The term of SNP j in class c is
-        (1 / nu^2) [B sum_{k in c, k != j} V_k + sum_{k in c on j's chromosome, k != j} (phi(d_jk) - B) V_k].
+        (f / nu^2) [B sum_{k in c, k != j} V_k + sum_{k in c on j's chromosome, k != j} (phi(d_jk) - B) V_k],
+    B and phi being sums over the ordered pairs of the curve's people and f the share of them that the GWAS holds
+    (relatedness_scale).
     phi is pooled in bins of lags whose width grows with distance (`smooth` times the distance, at least one lag), so
     that the noise of long lags averages out, and interpolated linearly between bin centres; beyond the last bin it
     keeps the last value."""
@@ -456,12 +461,25 @@ def panel_background_record(info: dict, table: pd.DataFrame, file: str = "") -> 
                            "v_j v_k S(d) / (n (n - 3)) of it")
 
 
-def relatedness_term(L, rel, chrom, cm, cls, V, K, nu, grid_cm):
+def relatedness_scale(n_curve, n_gwas):
+    """The share of the curve's ordered pairs of people that a GWAS of n_gwas of them, taken at random, holds:
+    N (N - 1) / (n (n - 1)). The relatives' sums of the curve (B, phi, the sum of g^2) are sums over the ordered pairs
+    of its n people, so they enter the GWAS's LD scores times this share: exactly 1 when the curve is made on the
+    GWAS's people, above 1 when the GWAS has more people than the curve (the same density of relatives assumed)."""
+    n, N = float(n_curve), float(n_gwas)
+    if not (n >= 2 and N >= 2):
+        raise ValueError(f"The relatives' term needs at least 2 people in the curve and in the GWAS (curve {n_curve}, "
+                         f"GWAS {n_gwas}).")
+    return N * (N - 1.0) / (n * (n - 1.0))
+
+
+def relatedness_term(L, rel, chrom, cm, cls, V, K, nu, grid_cm, scale=1.0):
     """Add the relatives' term of `rel` (RelatednessProfile) to the LD scores L (M x K) in place: B between all pairs
-    (each SNP without itself) and phi(d) - B along each chromosome, by FFT convolution on a grid of grid_cm."""
+    (each SNP without itself) and phi(d) - B along each chromosome, by FFT convolution on a grid of grid_cm, times
+    `scale` (relatedness_scale: the share of the curve's pairs of people that the GWAS holds)."""
     Vtot = np.bincount(cls, weights=V, minlength=K)
-    L += (rel.between / nu ** 2) * Vtot[None, :]
-    L[np.arange(cls.size), cls] -= (rel.between / nu ** 2) * V
+    L += (scale * rel.between / nu ** 2) * Vtot[None, :]
+    L[np.arange(cls.size), cls] -= (scale * rel.between / nu ** 2) * V
     for c in pd.unique(chrom):
         sel = np.flatnonzero(chrom == c)
         x = cm[sel]
@@ -472,7 +490,7 @@ def relatedness_term(L, rel, chrom, cm, cls, V, K, nu, grid_cm):
         np.add.at(Vg, (g, cls[sel]), V[sel])
         acc = _fft_conv_sym(Vg, kern)[g]
         acc[np.arange(sel.size), cls[sel]] -= kern[0] * V[sel]          # the convolution includes each SNP itself
-        L[sel] += acc / nu ** 2
+        L[sel] += (scale * acc) / nu ** 2
 
 
 def _parse_values(x):
@@ -661,6 +679,30 @@ def compose_ldscores(ref_path, sumstats, annot, out, *, sources=None, snps=None,
             rel_sum = float(curve_info["relatedness"]["sum_squared_ordered"])
     else:
         rel_sum = float(relatedness)
+    # the curve's relatives' sums run over the ordered pairs of its own people (a number given by the user is the
+    # GWAS's own sum and is not rescaled)
+    rel_scale, rel_scale_info = 1.0, None
+    if (rel_prof is not None or rel_sum is not None) and str(relatedness) in ("curve", "uniform"):
+        if "n_samples" not in curve_info:
+            raise ValueError("The curve does not record its number of people (n_samples), which the relatives' term "
+                             "needs; remake the curve.")
+        n_curve = int(curve_info["n_samples"])
+        rel_scale = relatedness_scale(n_curve, N)
+        rel_scale_info = dict(curve_people=n_curve, gwas_n=float(N), factor=float(rel_scale),
+                              definition="N (N - 1) / (n (n - 1)): the share of the curve's ordered pairs of people "
+                                         "that the GWAS holds, its people taken as a random subset of the curve's "
+                                         "(or the curve's of the GWAS's)")
+        log(f"[admixed-ld] compose: the curve's relatives' sums are over its {n_curve} people; times "
+            f"{rel_scale:.6g} for the GWAS's N {N:.0f}")
+        if abs(rel_scale - 1.0) > 0.01:
+            flags.append(dict(flag="relatedness_curve_sample_differs",
+                              detail=f"curve of {n_curve} people, GWAS N {N:.0f}: the relatives' term is scaled by "
+                                     f"{rel_scale:.4g}, which assumes the GWAS's people are a random subset of the "
+                                     "curve's (or the reverse)"))
+            log(f"[admixed-ld] WARNING (recorded flag relatedness_curve_sample_differs): the curve was made on "
+                f"{n_curve} people and the GWAS has N {N:.0f}; the relatives' term is scaled by {rel_scale:.4g}, "
+                "the GWAS's people taken as a random subset of the curve's. Make the curve on the GWAS's people "
+                "where possible.")
     # the panels' own background LD, which their unbiased squared covariances hold inside the band: removed when the
     # cohort's background is applied at every distance (background_window 'panels')
     panel_bg = {}
@@ -839,9 +881,9 @@ def compose_ldscores(ref_path, sumstats, annot, out, *, sources=None, snps=None,
     L += same_person_term(beta_, O, s2, cres, cls, K, mom, nu)
     L[np.arange(M), cls] += Vpop
     if rel_sum is not None:
-        L += (rel_sum / nu ** 2) * np.bincount(cls, weights=Vpop, minlength=K)[None, :]
+        L += (rel_scale * rel_sum / nu ** 2) * np.bincount(cls, weights=Vpop, minlength=K)[None, :]
     if rel_prof is not None:
-        relatedness_term(L, rel_prof, chrom_out, cm_out, cls, Vpop, K, nu, grid_cm)
+        relatedness_term(L, rel_prof, chrom_out, cm_out, cls, Vpop, K, nu, grid_cm, scale=rel_scale)
     V = Vpop
 
     # ---------------------------------------------------------------------------------------- write
@@ -853,6 +895,7 @@ def compose_ldscores(ref_path, sumstats, annot, out, *, sources=None, snps=None,
                   mean_ancestry_from_se=np.asarray(m_se).tolist(), kappa0_from_se=np.asarray(k_se).tolist(),
                   gwas_n=N, covariate_rank=p, nu=nu, kernel=kern.describe(), theta=th, theta_source=th_source,
                   relatedness=rel_sum, relatedness_profile=None if rel_prof is None else rel_prof.describe(),
+                  relatedness_scale=rel_scale_info,
                   panel_background={sources[n_]: pb.describe() for n_, pb in panel_bg.items()},
                   r2=r2, grid_cm=grid_cm, cell_matrix=cells_used,
                   derived_covariance_cross_noise=[dict(source=sources[x[0]], panel=sources[x[1]]) for x in cross],

@@ -896,6 +896,142 @@ def test_relatives_profile_absent_pairs_change_nothing(fam, tmp_path):
     pd.testing.assert_frame_equal(U1, U2)
 
 
+def _copy_curve(src, dst, **changes):
+    """A copy of the curve files at prefix src under prefix dst, with keys of the curve's json replaced."""
+    import glob
+    import shutil
+    for f in glob.glob(f"{src}.*"):
+        shutil.copy(f, f"{dst}{f[len(str(src)):]}")
+    info = json.load(open(f"{src}.curve.json"))
+    info.update(changes)
+    json.dump(info, open(f"{dst}.curve.json", "w"))
+
+
+def test_relatives_term_is_put_on_the_gwas_sample(fam, tmp_path):
+    """The curve's relatives' sums run over the ordered pairs of its own people: compose multiplies the relatives'
+    term (profile and uniform) by N (N - 1) / (n (n - 1)), exactly 1 (bit-identical) when the curve and the GWAS have
+    the same people, records the factor, and flags a factor away from 1. Nothing else in the composition changes, and
+    a number given with --relatedness is used as given."""
+    from summit.admixed_ld.compose import compose_ldscores, relatedness_scale
+    d = fam["dir"]
+    n = int(fam["info"]["n_samples"])
+    N = fam["S"]["cohort"].shape[0]
+    assert n == N
+    _copy_curve(d / "c", tmp_path / "c2", n_samples=2 * n)        # the same sums said to be over twice the people
+    f = N * (N - 1.0) / (2 * n * (2 * n - 1.0))
+    assert relatedness_scale(2 * n, N) == f and relatedness_scale(n, N) == 1.0
+    out, par = {}, {}
+    for c in ("c", "c2"):
+        cpref = str(d / "c") if c == "c" else str(tmp_path / "c2")
+        for arm, rel in (("none", None), ("profile", "curve"), ("uniform", "uniform"), ("number", 123.0)):
+            o = str(tmp_path / f"{c}_{arm}")
+            compose_ldscores(str(d / "ref"), [str(d / "ss")], str(d / "annot.tsv"), o, curve=cpref, relatedness=rel,
+                             log=lambda *a: None)
+            out[c, arm] = pd.read_csv(o + ".gw.ldscore.gz", sep="\t")
+            par[c, arm] = json.load(open(o + ".admixed_ld.json"))
+    cols = ["low", "high"]
+    pd.testing.assert_frame_equal(out["c", "none"], out["c2", "none"])
+    pd.testing.assert_frame_equal(out["c", "number"], out["c2", "number"])
+    for arm in ("profile", "uniform"):
+        t1 = out["c", arm][cols].to_numpy() - out["c", "none"][cols].to_numpy()
+        t2 = out["c2", arm][cols].to_numpy() - out["c2", "none"][cols].to_numpy()
+        # exact up to the writer's rounding (%.6f: each value within 5e-7, so a difference within 1e-6 and f times
+        # one within (1 + f) 1e-6); the unscaled term of before is off by (1 - f) t1, over a thousand times that
+        np.testing.assert_allclose(t2, f * t1, rtol=0, atol=(1 + f) * 1e-6 + 1e-12)
+        assert np.abs((1 - f) * t1).max() > 1000 * (1 + f) * 1e-6
+        assert par["c", arm]["relatedness_scale"]["factor"] == 1.0
+        assert par["c", arm]["relatedness_scale"]["curve_people"] == n
+        assert par["c2", arm]["relatedness_scale"]["factor"] == pytest.approx(f, rel=1e-12)
+        assert "relatedness_curve_sample_differs" not in {x["flag"] for x in par["c", arm]["flags"]}
+        assert "relatedness_curve_sample_differs" in {x["flag"] for x in par["c2", arm]["flags"]}
+    for c in ("c", "c2"):
+        assert par[c, "none"]["relatedness_scale"] is None and par[c, "number"]["relatedness_scale"] is None
+    # the matched case is the composition of before the scale (f = 1 exactly): the profile term equals the brute-force
+    # (1 / nu^2) sums of test_relatives_profile_term_matches_realized_ld, which that test checks; here, bit-identity of
+    # the curve and its copy with the same n
+    _copy_curve(d / "c", tmp_path / "c1")
+    compose_ldscores(str(d / "ref"), [str(d / "ss")], str(d / "annot.tsv"), str(tmp_path / "c1_profile"),
+                     curve=str(tmp_path / "c1"), relatedness="curve", log=lambda *a: None)
+    pd.testing.assert_frame_equal(out["c", "profile"], pd.read_csv(f"{tmp_path / 'c1_profile'}.gw.ldscore.gz", sep="\t"))
+    with pytest.raises(ValueError, match="at least 2 people"):
+        relatedness_scale(1, N)
+
+
+def test_relatives_term_of_a_gwas_on_part_of_the_curve(fam, tmp_path):
+    """A GWAS of a random 60% of the curve's people: with the whole cohort's curve, the relatives' term matches the
+    realized excess of in-sample LD that the listed pairs inside the GWAS create, and the term composed with a curve
+    made on the GWAS's own people; without the scale it would be about 1 / 0.36 times too large."""
+    from summit.admixed_ld.compose import compose_ldscores
+    from summit.admixed_ld.curve import genotype_curve
+    d, S, C = fam["dir"], fam["S"], fam["C"]
+    G = S["cohort"]
+    n = G.shape[0]
+    rng = np.random.default_rng(3)
+    sub = np.sort(rng.choice(n, int(0.6 * n), replace=False))
+    N = sub.size
+    iid = np.array([f"c{i:06d}" for i in range(n)])
+    pd.DataFrame({"FID": iid[sub], "IID": iid[sub]}).to_csv(tmp_path / "sub.keep", sep="\t", header=False,
+                                                            index=False)
+    v = S["variants"]
+    os.makedirs(tmp_path / "ss_sub")
+    for t in range(3):
+        y = rng.standard_normal(N)
+        beta, se = gwas(G[sub], y, C[sub])
+        pd.DataFrame({"SNP": v.SNP, "CHR": v.CHR, "BP": v.BP, "A1": v.A1, "A2": v.A2, "N": N, "BETA": beta,
+                      "SE": se, "Z": beta / se, "COV_RANK": 2}).to_csv(tmp_path / "ss_sub" / f"trait{t}.tsv",
+                                                                       sep="\t", index=False)
+    _, info_s = genotype_curve(str(d / "cohort"), str(d / "ref"), str(tmp_path / "cs"), covar=str(d / "cohort.cov"),
+                               keep=str(tmp_path / "sub.keep"), cell_cm=0.5, relative_pairs=str(d / "pairs.tsv"),
+                               relatedness_cell_cm=0.5, log=lambda *a: None)
+    assert info_s["n_samples"] == N
+    out, par = {}, {}
+    for arm, cpref, rel in (("none", d / "c", None), ("whole", d / "c", "curve"), ("own", tmp_path / "cs", "curve")):
+        o = str(tmp_path / f"sub_{arm}")
+        compose_ldscores(str(d / "ref"), [str(tmp_path / "ss_sub")], str(d / "annot.tsv"), o, curve=str(cpref),
+                         relatedness=rel, log=lambda *a: None)
+        out[arm] = pd.read_csv(o + ".gw.ldscore.gz", sep="\t")
+        par[arm] = json.load(open(o + ".admixed_ld.json"))
+    f = N * (N - 1.0) / (n * (n - 1.0))
+    assert par["whole"]["relatedness_scale"]["factor"] == pytest.approx(f, rel=1e-12)
+    assert par["own"]["relatedness_scale"]["factor"] == 1.0
+    keep = v.SNP.isin(out["none"].SNP).to_numpy()
+    V = out["none"].V.to_numpy()
+    nu = N - 1 - C.shape[1]
+    mass = lambda X: float(V @ X[["low", "high"]].to_numpy().sum(1))
+    term = {a: mass(out[a]) - mass(out["none"]) for a in ("whole", "own")}
+    # realized excess of the listed pairs inside the GWAS, in its own adjusted, standardized genotypes
+    Gs = G[sub][:, keep]
+    X = Gs - Gs.mean(0)
+    Q, _ = np.linalg.qr((C[sub] - C[sub].mean(0)) / C[sub].std(0, ddof=1))
+    Xr = X - Q @ (Q.T @ X)
+    var = np.einsum("ij,ij->j", Xr, Xr) / nu
+    U = np.where(var > 1e-8, Xr / np.sqrt(np.maximum(var, 1e-300)), 0.0)
+    pos = np.full(n, -1)
+    pos[sub] = np.arange(N)
+    P = pos[S["pairs"]]
+    P = P[(P >= 0).all(1)]
+    Y = U[P[:, 0]] * U[P[:, 1]]
+    rho2 = (U.T @ U / nu) ** 2 - 1.0 / nu
+    E = 2 * (Y.T @ Y) - 2 * P.shape[0] * rho2
+    np.fill_diagonal(E, 0.0)
+    real = float(V @ E @ V) / nu ** 2
+    share = P.shape[0] / S["pairs"].shape[0]                      # the listed pairs the GWAS holds (expected f)
+    assert abs(share / f - 1) < 0.25
+    # the whole cohort's curve, scaled, against the realized term (corrected for the random share of pairs held)
+    assert term["whole"] / (real * f / share) == pytest.approx(1.0, abs=0.05)
+    assert term["own"] / real == pytest.approx(1.0, abs=0.05)
+    assert term["whole"] / term["own"] == pytest.approx(f / share, rel=0.05)
+    assert (term["whole"] / f) / real > 2.0                       # the unscaled term of before
+    from admixed_ld_sim import insample_ldscores
+    L_in, V_in = insample_ldscores(Gs, C[sub], fam["cls"][keep], 2)
+    mass_in = float((V_in[:, None] * L_in).sum())
+    print(f"\nsubset {N} of {n}; f {f:.4f}, pairs held {share:.4f}; term whole {term['whole']:.4g}, own "
+          f"{term['own']:.4g}, realized {real:.4g}; mass none / whole / own / in-sample {mass(out['none']):.5g} / "
+          f"{mass(out['whole']):.5g} / {mass(out['own']):.5g} / {mass_in:.5g}; unscaled whole "
+          f"{mass(out['none']) + term['whole'] / f:.5g}")
+    assert abs(mass(out["whole"]) / mass_in - 1) < 0.015 < 0.1 < (mass(out["none"]) + term["whole"] / f) / mass_in - 1
+
+
 def test_background_measures_all_pairs(fam, tmp_path):
     """Without a pair list, the cross-person LD among weakly differentiated SNPs measures the relatedness LD of all
     pairs; here every relative is listed, so it matches the listed pairs' profile beyond the window and between
