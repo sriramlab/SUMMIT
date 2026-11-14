@@ -1768,3 +1768,51 @@ def test_compose_with_sample_factors(sim, tmp_path):
         compose_ldscores(str(d / "ref"), [str(tmp_path / "ss")], str(tmp_path / "annot.tsv"), str(tmp_path / "x"),
                          generations=S["generations"], sample_factors=str(tmp_path / "bad.sample_factors.json"),
                          log=lambda *a: None)
+
+
+def test_compose_writes_one_file_per_gwas_sample_size(fam, tmp_path):
+    """Traits with two sample sizes (the whole cohort and a random 60% of it): compose writes one LD-score file per N,
+    each equal to a compose of that N's traits alone (the population part is shared; the same-person and relatives'
+    terms follow each N), and the main file is the median N's."""
+    import shutil
+    from summit.admixed_ld.compose import compose_ldscores
+    d, S, C = fam["dir"], fam["S"], fam["C"]
+    G = S["cohort"]
+    n = G.shape[0]
+    rng = np.random.default_rng(8)
+    sub = np.sort(rng.choice(n, int(0.6 * n), replace=False))
+    v = S["variants"]
+    for nm in ("mix", "full", "part"):
+        os.makedirs(tmp_path / nm)
+    for t in range(2):
+        shutil.copy(d / "ss" / f"trait{t}.tsv", tmp_path / "mix" / f"full{t}.tsv")
+        shutil.copy(d / "ss" / f"trait{t}.tsv", tmp_path / "full" / f"full{t}.tsv")
+    for t in range(3):
+        beta, se = gwas(G[sub], rng.standard_normal(sub.size), C[sub])
+        df = pd.DataFrame({"SNP": v.SNP, "CHR": v.CHR, "BP": v.BP, "A1": v.A1, "A2": v.A2, "N": sub.size, "BETA": beta,
+                           "SE": se, "Z": beta / se, "COV_RANK": 2})
+        df.to_csv(tmp_path / "mix" / f"part{t}.tsv", sep="\t", index=False)
+        df.to_csv(tmp_path / "part" / f"part{t}.tsv", sep="\t", index=False)
+    first = str(tmp_path / "first")
+    compose_ldscores(str(d / "ref"), [str(tmp_path / "full")], str(d / "annot.tsv"), first, curve=str(d / "c"),
+                     relatedness="curve", log=lambda *a: None)
+    pj = json.load(open(first + ".admixed_ld.json"))
+    kw = dict(curve=str(d / "c"), relatedness="curve", mean_ancestry=str(pj["mean_ancestry"]),
+              kappa0=str(pj["kappa0"]), log=lambda *a: None)
+    out = {}
+    for nm in ("mix", "full", "part"):
+        compose_ldscores(str(d / "ref"), [str(tmp_path / nm)], str(d / "annot.tsv"), str(tmp_path / f"c_{nm}"), **kw)
+        out[nm] = pd.read_csv(str(tmp_path / f"c_{nm}") + ".gw.ldscore.gz", sep="\t")
+    groups = pd.read_csv(str(tmp_path / "c_mix") + ".n_groups.tsv", sep="\t")
+    assert sorted(groups.N.unique()) == [sub.size, n]
+    for N_, ref_ in ((n, "full"), (sub.size, "part")):
+        f = groups[groups.N == N_].ldscores.iloc[0]
+        got = pd.read_csv(f, sep="\t")
+        np.testing.assert_allclose(got[["V", "low", "high"]].to_numpy(), out[ref_][["V", "low", "high"]].to_numpy(),
+                                   rtol=1e-8, atol=1e-10)
+    np.testing.assert_allclose(out["mix"][["low", "high"]].to_numpy(), out["part"][["low", "high"]].to_numpy(),
+                               rtol=1e-8, atol=1e-10)                # 3 of 5 traits have the smaller N (the median)
+    pm = json.load(open(str(tmp_path / "c_mix") + ".admixed_ld.json"))
+    assert len(pm["n_groups"]) == 2
+    assert {g["label"] for g in pm["n_groups"]} == {str(n), str(sub.size)}
+    assert not os.path.exists(str(tmp_path / "c_full") + ".n_groups.tsv")   # one sample size: no extra files

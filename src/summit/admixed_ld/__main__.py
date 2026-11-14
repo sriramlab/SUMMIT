@@ -207,6 +207,11 @@ def main(argv=None):
                         "people with its covariates): the same-person term from it instead of the random-mating "
                         "covariance of heterozygosity (for a few hundred people, first-generation groups, in-sample "
                         "PCs)")
+    m.add_argument("--single-n", action="store_true",
+                   help="write only the LD-score file for the traits' median N (by default, traits whose N differ by more "
+                        "than --n-tol get one file per sample size: the same-person and relatives' terms belong to the "
+                        "GWAS's sample)")
+    m.add_argument("--n-tol", type=float, default=0.01, help="relative difference of N within which traits share a file")
     m.add_argument("--sample-factors-no-calibration", action="store_true",
                    help="do not scale the sample-factor term to the cohort's realized between-chromosome mass")
     m.add_argument("--out", required=True)
@@ -336,7 +341,8 @@ def main(argv=None):
                          grid_cm=a.grid_cm, cell_matrix=a.cell_matrix,
                          cell_switch_cm=a.cell_switch_cm, allow_flat_kernel_join=a.allow_flat_kernel_join,
                          cross_source=a.cross_source, sample_factors=a.sample_factors,
-                         sample_factors_calibrate=not a.sample_factors_no_calibration, log=log._log)
+                         sample_factors_calibrate=not a.sample_factors_no_calibration,
+                         per_trait_n=not a.single_n, n_tol=a.n_tol, log=log._log)
     return 0
 
 

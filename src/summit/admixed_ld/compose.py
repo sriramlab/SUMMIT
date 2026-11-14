@@ -501,13 +501,32 @@ def _parse_values(x):
     return [float(v) for v in str(x).split(",") if v.strip()]
 
 
+def _n_groups(tables, n_med, N, nu, p, nu_given, tol):
+    """Groups of traits whose median N agree within tol (relative to the group's smallest), each with its N (the
+    group's median) and nu."""
+    items = sorted(zip([t[0] for t in tables], [float(x) for x in n_med]), key=lambda x: x[1])
+    groups, cur = [], []
+    for name, n in items:
+        if cur and n > cur[0][1] * (1 + tol):
+            groups.append(cur)
+            cur = []
+        cur.append((name, n))
+    if cur:
+        groups.append(cur)
+    out = []
+    for g in groups:
+        Ng = float(np.median([n for _, n in g]))
+        out.append(dict(N=Ng, nu=float(Ng - p - 1.0), label=str(int(round(Ng))), traits=[[t, n] for t, n in g]))
+    return out
+
+
 def compose_ldscores(ref_path, sumstats, annot, out, *, sources=None, snps=None, match="position", curve=None,
                      generations=None, decay_per_cm=None, mean_ancestry=None, kappa0=None, theta_sd=None,
                      relatedness=None, relatedness_smooth=0.1, background_min_cm=3.0, background_window="panels",
                      nu=None, r2=0.99, grid_cm=0.02, cell_matrix=False,
                      cell_switch_cm=10.0, allow_flat_kernel_join=False, cross_source=None,
-                     sample_factors=None, sample_factors_calibrate=True, pair_chunk=1 << 23,
-                     log=print):
+                     sample_factors=None, sample_factors_calibrate=True, per_trait_n=True, n_tol=0.01,
+                     pair_chunk=1 << 23, log=print):
     """Composed LD scores for an admixed GWAS sample with two or more sources (the last is the baseline of the
     contrasts). mean_ancestry: K-1 or K values (comma-separated); kappa0: the upper triangle of Kt_res(0) row by row.
     Departures from the standard recipe that are allowed but should be visible are recorded in the params json under
@@ -525,7 +544,13 @@ def compose_ldscores(ref_path, sumstats, annot, out, *, sources=None, snps=None,
     with its covariates). The same-person term is then (n / (nu_sf nu)) sum_{k in c} a_j' Sigma_u a_k / (cres_j s2_k)
     in place of the random-mating covariance of heterozygosity (sample_factors.py); both are recorded. With
     sample_factors_calibrate (default), the term is scaled so that its mass over pairs on different chromosomes equals
-    the cohort's realized one, which the statistic records; the factors then allocate it across SNPs and classes."""
+    the cohort's realized one, which the statistic records; the factors then allocate it across SNPs and classes.
+
+    per_trait_n: the same-person term (1 / nu) and the relatives' term (f(N) / nu^2) belong to the GWAS's sample, and in a
+    small cohort (with a strong background) traits with different missingness have measurably different in-sample LD.
+    When the traits' median N differ by more than n_tol, one LD-score file is written per group of traits with the same N
+    (out.n<N>.gw.ldscore.gz, listed in out.n_groups.tsv; nu = N - rank - 1 with the traits' covariate rank), the
+    population part composed once; out.gw.ldscore.gz stays the file for the median N (with the given nu, if any)."""
     from ..ldscore.gw_ldscore import write_gw_annotation_masses, write_gw_ldscore_table
     from ..relatives.moments import read_annotation_classes
     from ..sumstats.sumstats import Sumstats
@@ -621,6 +646,7 @@ def compose_ldscores(ref_path, sumstats, annot, out, *, sources=None, snps=None,
             k0[a, b] = k0[b, a] = v
     else:
         k0 = np.asarray(k_se)
+    nu_given = nu is not None
     nu = float(nu) if nu is not None else N - p - 1.0
 
     # ---------------------------------------------------------------------------------------- kernel and ancestry
@@ -938,7 +964,9 @@ def compose_ldscores(ref_path, sumstats, annot, out, *, sources=None, snps=None,
             # the cohort's realized between-chromosome same-person mass fixes the term's size; the factors allocate it
             # (a signed loading sum makes the term sensitive to small errors of the model variances s2 that follow the
             # sources' heterozygosity difference, and the factors themselves leave a few per cent out)
-            btw = factor_between_chromosome_mass(a_sf, s2, chrom_out, sfi["sigma"], sfi["n_samples"], sfi["nu"], nu)
+            # compared at the statistic's own nu, so that the factor is a pure model correction for any GWAS sample
+            btw = factor_between_chromosome_mass(a_sf, s2, chrom_out, sfi["sigma"], sfi["n_samples"], sfi["nu"],
+                                                 float(sfi["nu"])) * float(sfi["nu"]) / nu
             m_ratio = M / float(sfi["n_snps"])
             target = float(realized) * m_ratio ** 2
             if btw > 0 and target > 0:
@@ -976,15 +1004,42 @@ def compose_ldscores(ref_path, sumstats, annot, out, *, sources=None, snps=None,
         log(f"[admixed-ld] compose: same-person term from the sample factors ({sfi['path']}): LD mass "
             f"{sf_info['same_person_mass']:.6g}, against {sf_info['same_person_mass_random_mating']:.6g} under random "
             "mating")
-        L += sp
     else:
-        L += sp_rm
+        sp = sp_rm
+    # the GWAS-sample terms: the same-person term (1 / nu) and the relatives' term (f(N) / nu^2); the rest is a population
+    # quantity shared by every GWAS sample of the cohort
     L[np.arange(M), cls] += Vpop
-    if rel_sum is not None:
-        L += (rel_scale * rel_sum / nu ** 2) * np.bincount(cls, weights=Vpop, minlength=K)[None, :]
-    if rel_prof is not None:
-        relatedness_term(L, rel_prof, chrom_out, cm_out, cls, Vpop, K, nu, grid_cm, scale=rel_scale)
+    R1 = None
+    if rel_sum is not None or rel_prof is not None:
+        R1 = np.zeros((M, K))
+        if rel_sum is not None:
+            R1 += rel_sum * np.bincount(cls, weights=Vpop, minlength=K)[None, :]
+        if rel_prof is not None:
+            relatedness_term(R1, rel_prof, chrom_out, cm_out, cls, Vpop, K, 1.0, grid_cm, scale=1.0)
+    L_pop = L
+    L = L_pop + sp + (0.0 if R1 is None else (rel_scale / nu ** 2) * R1)
     V = Vpop
+    groups_info = None
+    if nu_given and abs(nu - (N - p - 1.0)) > 0.02 * (N - p - 1.0):
+        flags.append(dict(flag="nu_differs_from_gwas_n", detail=f"nu {nu:.0f} given; the traits' median N {N:.0f} and "
+                                                                f"covariate rank {p} give {N - p - 1.0:.0f}"))
+    if per_trait_n:
+        groups_info = _n_groups(tables, n_med, N, nu, p, nu_given, n_tol)
+        if len(groups_info) > 1:
+            n_curve_rel = int(curve_info["n_samples"]) if (R1 is not None and curve_info is not None
+                                                           and "n_samples" in curve_info) else None
+            for g in groups_info:
+                fg = relatedness_scale(n_curve_rel, g["N"]) if (R1 is not None and n_curve_rel) else rel_scale
+                Lg = L_pop + sp * (nu / g["nu"]) + (0.0 if R1 is None else (fg / g["nu"] ** 2) * R1)
+                g.update(relatedness_scale=float(fg), file=f"{out}.n{g['label']}.gw.ldscore.gz",
+                         ld_mass=float((V[:, None] * Lg).sum()))
+                snpdf_g = pd.DataFrame({"CHR": chrom_out, "SNP": snp_ids, "BP": rv["BP"].to_numpy()[r_idx]})
+                write_gw_ldscore_table(f"{out}.n{g['label']}", snpdf_g, pd.DataFrame(Lg, columns=classes), snp_var=V)
+                write_gw_annotation_masses(f"{out}.n{g['label']}", np.bincount(cls, minlength=K).astype(float))
+            pd.DataFrame([dict(trait=t, N=nn, ldscores=g["file"]) for g in groups_info for t, nn in g["traits"]]).to_csv(
+                f"{out}.n_groups.tsv", sep="\t", index=False)
+            log(f"[admixed-ld] compose: {len(groups_info)} GWAS sample sizes among the traits (within {n_tol:.0%}); "
+                f"one LD-score file each (N {', '.join(g['label'] for g in groups_info)}), listed in {out}.n_groups.tsv")
 
     # ---------------------------------------------------------------------------------------- write
     snpdf = pd.DataFrame({"CHR": chrom_out, "SNP": snp_ids, "BP": rv["BP"].to_numpy()[r_idx]})
@@ -1003,7 +1058,7 @@ def compose_ldscores(ref_path, sumstats, annot, out, *, sources=None, snps=None,
                   reference=dict(sources=ref.manifest["sources"], window_kb=ref.manifest["window_kb"],
                                  genetic_map=ref.manifest["genetic_map"]),
                   per_trait=None if per_trait is None else per_trait.to_dict(orient="records"),
-                  ld_mass=float((V[:, None] * L).sum()), sample_factors=sf_info, flags=flags)
+                  ld_mass=float((V[:, None] * L).sum()), sample_factors=sf_info, n_groups=groups_info, flags=flags)
     if xs_i is not None:                                          # each SNP with itself: sqrt(V_1 V_2), V_2 = 1
         keep = v2_out > 0
         Lx[np.arange(M), cls] += np.sqrt(Vpop)
