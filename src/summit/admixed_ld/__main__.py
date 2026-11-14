@@ -202,7 +202,24 @@ def main(argv=None):
                         "a GWAS of other people from an unadmixed population whose LD is that of source NAME's panel "
                         "in the reference (e.g. EUR): sum_k rho_1 rho_2 sqrt(V_1 V_2) within the window, for "
                         "cross-population genetic correlation")
+    m.add_argument("--sample-factors", default=None,
+                   help="the cohort's person-factor statistic (`summit admixed-ld sample-factors`, on the GWAS's "
+                        "people with its covariates): the same-person term from it instead of the random-mating "
+                        "covariance of heterozygosity (for a few hundred people, first-generation groups, in-sample "
+                        "PCs)")
     m.add_argument("--out", required=True)
+
+    f = sub.add_parser("sample-factors", help="the cohort's person-factor statistic for the same-person term "
+                                              "(aggregates only)")
+    f.add_argument("--geno", required=True, help="PLINK 1 BED or PLINK 2 PGEN prefix of the GWAS sample")
+    f.add_argument("--ref", required=True, help="resource written by `summit admixed-ld reference`")
+    f.add_argument("--covar", default=None, help="the GWAS covariates (FID IID ...), as for the LD-score step")
+    f.add_argument("--keep", default=None, help="samples to use (FID IID or IID per line)")
+    f.add_argument("--sources", default=None,
+                   help="two or more source names of the reference (default: its first two); the last is the baseline")
+    f.add_argument("--match", choices=["position", "id"], default="position")
+    f.add_argument("--threads", type=int, default=1)
+    f.add_argument("--out", required=True)
 
     v = sub.add_parser("derive", help="a source without a reference panel, estimated from an admixed cohort that "
                                       "carries it (writes a reference with the known sources and the derived one)")
@@ -282,6 +299,10 @@ def main(argv=None):
         remove_panel_admixture(a.ref, dict(zip(names, a.panel)), out=a.out, match=a.match, lo=lo, hi=hi,
                                threads=a.threads, background=not a.no_panel_background,
                                background_snps=a.panel_background_snps, log=log._log)
+    elif a.cmd == "sample-factors":
+        from .sample_factors import sample_factors
+        sample_factors(a.geno, a.ref, a.out, sources=_sources(a.sources), covar=a.covar, keep=a.keep, match=a.match,
+                       threads=a.threads, log=log._log)
     elif a.cmd == "derive":
         from .derive import derive_source
         derive_source(a.geno, a.ref, a.out, name=a.name, known=_sources(a.known), panel=a.panel, covar=a.covar,
@@ -312,7 +333,7 @@ def main(argv=None):
                          background_min_cm=a.background_min_cm, background_window=a.background_window, nu=a.nu,
                          grid_cm=a.grid_cm, cell_matrix=a.cell_matrix,
                          cell_switch_cm=a.cell_switch_cm, allow_flat_kernel_join=a.allow_flat_kernel_join,
-                         cross_source=a.cross_source, log=log._log)
+                         cross_source=a.cross_source, sample_factors=a.sample_factors, log=log._log)
     return 0
 
 

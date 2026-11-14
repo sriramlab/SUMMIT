@@ -506,7 +506,7 @@ def compose_ldscores(ref_path, sumstats, annot, out, *, sources=None, snps=None,
                      relatedness=None, relatedness_smooth=0.1, background_min_cm=3.0, background_window="panels",
                      nu=None, r2=0.99, grid_cm=0.02, cell_matrix=False,
                      cell_switch_cm=10.0, allow_flat_kernel_join=False, cross_source=None,
-                     pair_chunk=1 << 23, log=print):
+                     sample_factors=None, pair_chunk=1 << 23, log=print):
     """Composed LD scores for an admixed GWAS sample with two or more sources (the last is the baseline of the
     contrasts). mean_ancestry: K-1 or K values (comma-separated); kappa0: the upper triangle of Kt_res(0) row by row.
     Departures from the standard recipe that are allowed but should be visible are recorded in the params json under
@@ -518,7 +518,11 @@ def compose_ldscores(ref_path, sumstats, annot, out, *, sources=None, snps=None,
     rho_1 the composed correlation of this sample's covariate-adjusted genotypes, rho_2 the panel's correlation (its
     population has no admixture LD, so only pairs within the window count) and V_2 = 1. The samples are disjoint, so
     there is no same-person or relatives' term. When the panel is also one of this sample's sources, its squared
-    covariance takes the unbiased estimate and its own background is removed once."""
+    covariance takes the unbiased estimate and its own background is removed once.
+
+    sample_factors: the cohort's person-factor statistic (`summit admixed-ld sample-factors`, made on the GWAS's people
+    with its covariates). The same-person term is then (n / (nu_sf nu)) sum_{k in c} a_j' Sigma_u a_k / (cres_j s2_k)
+    in place of the random-mating covariance of heterozygosity (sample_factors.py); both are recorded."""
     from ..ldscore.gw_ldscore import write_gw_annotation_masses, write_gw_ldscore_table
     from ..relatives.moments import read_annotation_classes
     from ..sumstats.sumstats import Sumstats
@@ -912,7 +916,39 @@ def compose_ldscores(ref_path, sumstats, annot, out, *, sources=None, snps=None,
     # same-person term, each SNP with itself, relatives
     pbar = Pm @ m_vec                                               # frequency at the mean ancestry
     beta_ = 2.0 * Dm * (1.0 - 2.0 * pbar)[:, None]
-    L += same_person_term(beta_, O, s2, cres, cls, K, mom, nu)
+    sp_rm = same_person_term(beta_, O, s2, cres, cls, K, mom, nu)
+    sf_info = None
+    Vpop_sp = cres / s2
+    if sample_factors is not None:
+        from .sample_factors import factor_loadings, factor_same_person_term, read_sample_factors
+        sfi = read_sample_factors(sample_factors)
+        if list(sfi["sources"]) != list(sources):
+            raise ValueError(f"The sample factors were made with sources {sfi['sources']}, compose uses {sources} (same "
+                             "names, same order, baseline last).")
+        sp = factor_same_person_term(factor_loadings(Vm, O), s2, cres, cls, K, sfi["sigma"], sfi["n_samples"],
+                                     sfi["nu"], nu)
+        sf_info = dict(file=sfi["path"], n_samples=sfi["n_samples"], nu=sfi["nu"], factors=sfi["factors"],
+                       sigma=sfi["sigma"], diagnostics=sfi.get("diagnostics"), leverage=sfi.get("leverage"),
+                       same_person_mass=float((Vpop_sp[:, None] * sp).sum()),
+                       same_person_mass_random_mating=float((Vpop_sp[:, None] * sp_rm).sum()))
+        ev = np.linalg.eigvalsh(np.asarray(sfi["sigma"], np.float64))
+        if ev.min() < 0:                                            # the split-half estimate need not be PSD
+            flags.append(dict(flag="sample_factors_not_psd",
+                              detail=f"smallest eigenvalue of Sigma_u {ev.min():.3g} (largest {ev.max():.3g}); used as "
+                                     "estimated"))
+            log(f"[admixed-ld] note (recorded flag sample_factors_not_psd): Sigma_u has the eigenvalue {ev.min():.3g} "
+                f"(largest {ev.max():.3g}); the split-half estimate is used as it is")
+        if abs(sfi["n_samples"] - N) > 0.01 * N:
+            flags.append(dict(flag="sample_factors_sample_differs",
+                              detail=f"sample factors of {sfi['n_samples']} people, GWAS N {N:.0f}"))
+            log(f"[admixed-ld] WARNING (recorded flag sample_factors_sample_differs): the sample factors were made on "
+                f"{sfi['n_samples']} people and the GWAS has N {N:.0f}; make them on the GWAS's people.")
+        log(f"[admixed-ld] compose: same-person term from the sample factors ({sfi['path']}): LD mass "
+            f"{sf_info['same_person_mass']:.6g}, against {sf_info['same_person_mass_random_mating']:.6g} under random "
+            "mating")
+        L += sp
+    else:
+        L += sp_rm
     L[np.arange(M), cls] += Vpop
     if rel_sum is not None:
         L += (rel_scale * rel_sum / nu ** 2) * np.bincount(cls, weights=Vpop, minlength=K)[None, :]
@@ -937,7 +973,7 @@ def compose_ldscores(ref_path, sumstats, annot, out, *, sources=None, snps=None,
                   reference=dict(sources=ref.manifest["sources"], window_kb=ref.manifest["window_kb"],
                                  genetic_map=ref.manifest["genetic_map"]),
                   per_trait=None if per_trait is None else per_trait.to_dict(orient="records"),
-                  ld_mass=float((V[:, None] * L).sum()), flags=flags)
+                  ld_mass=float((V[:, None] * L).sum()), sample_factors=sf_info, flags=flags)
     if xs_i is not None:                                          # each SNP with itself: sqrt(V_1 V_2), V_2 = 1
         keep = v2_out > 0
         Lx[np.arange(M), cls] += np.sqrt(Vpop)

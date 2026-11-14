@@ -1578,3 +1578,181 @@ def test_compose_fails_closed_and_records_flags(sim, tmp_path):
     assert p["theta"]["var"] == pytest.approx(sd_id ** 2, rel=1e-6)
     compose_ldscores(*args, out + "_sd", generations=sim["S"]["generations"], theta_sd=0.1, log=quiet)
     assert flags(out + "_sd") == {"panel_admixture_unmeasured"}
+
+
+# ------------------------------------------------------------------------------------------------- sample factors
+@pytest.mark.parametrize("k", [2, 3])
+def test_factor_same_person_term_is_the_random_mating_term_under_random_mating(k):
+    """With the factors random mating implies (level 1, theta, Lambda = 2 (diag theta - theta theta')), the factor
+    same-person term equals compose's random-mating term exactly, for two and three sources."""
+    from summit.admixed_ld.model import moments_from_vectors, moments_tensors, same_person_term
+    from summit.admixed_ld.sample_factors import factor_loadings, factor_names, factor_same_person_term
+    rng = np.random.default_rng(4 + k)
+    M, K, k1 = 400, 3, k - 1
+    P = rng.uniform(0.05, 0.95, (M, k))                              # baseline last
+    V = 2 * P * (1 - P)
+    D = P[:, :-1] - P[:, -1:]
+    O = D[:, :, None] * D[:, None, :]
+    theta = rng.dirichlet(4.0 * np.arange(1, k + 1), 20000)[:, :-1]     # the non-baseline ancestries
+    mom = moments_tensors(moments_from_vectors(theta), k1)
+    m_vec = np.append(theta.mean(0), 1 - theta.mean(0).sum())
+    pbar = P @ m_vec
+    beta_ = 2.0 * D * (1.0 - 2.0 * pbar)[:, None]
+    s2 = V @ m_vec + rng.uniform(0.01, 0.05, M)
+    cres = s2 * rng.uniform(0.8, 0.95, M)
+    cls = rng.integers(0, K, M)
+    nu = 700.0
+    rm = same_person_term(beta_, O, s2, cres, cls, K, mom, nu)
+    lam = [2 * ((a == b) * theta[:, a] - theta[:, a] * theta[:, b]) for a in range(k1) for b in range(a, k1)]
+    U = np.column_stack([np.ones(len(theta)), theta] + lam)
+    assert U.shape[1] == len(factor_names(list("ABC")[:k]))
+    W = U - U.mean(0)
+    sf = factor_same_person_term(factor_loadings(V, O), s2, cres, cls, K, W.T @ W / len(W), n_sf=nu, nu_sf=nu, nu=nu)
+    np.testing.assert_allclose(sf, rm, rtol=1e-9, atol=1e-13)
+
+
+def _between_chromosome_sp(G, C, chrom):
+    """The referee's same-person excess summed over pairs of SNPs on different chromosomes, by brute force."""
+    n = G.shape[0]
+    X = G - G.mean(0)
+    s2 = (X ** 2).sum(0) / (n - 1)
+    ok = s2 > 0
+    X = X[:, ok] / np.sqrt(s2[ok])
+    Q = np.linalg.qr(np.column_stack([np.ones(n), C]))[0]
+    nu = n - Q.shape[1]
+    Y = (X - Q @ (Q.T @ X)) ** 2
+    ch = chrom[ok]
+    tot = 0.0
+    for c in np.unique(ch):
+        Yc, Yo = Y[:, ch == c], Y[:, ch != c]
+        tot += (Yc.sum(1) @ Yo.sum(1)) / nu ** 2 - Yc.sum() * Yo.sum() / (n * nu ** 2)
+    return tot
+
+
+def test_sample_factors_give_the_realized_same_person_term(sim, tmp_path):
+    """The statistic's realized between-chromosome same-person mass is the referee's (brute force); its factors
+    predict it in the full cohort and in 400 people with ten in-sample PCs."""
+    from summit.admixed_ld.sample_factors import sample_factors
+    d, S = sim["dir"], sim["S"]
+    chrom = S["variants"].CHR.to_numpy()
+    info = sample_factors(str(d / "cohort"), str(d / "ref"), str(tmp_path / "full"), covar=str(d / "cohort.cov"),
+                          log=lambda *a: None)
+    real = _between_chromosome_sp(S["cohort"], sim["C"], chrom)
+    np.testing.assert_allclose(info["diagnostics"]["between_chromosome_same_person_mass"], real, rtol=1e-8)
+    assert abs(info["diagnostics"]["share_predicted"] - 1) < 0.03
+    rng = np.random.default_rng(11)
+    idx = np.sort(rng.choice(S["cohort"].shape[0], 400, replace=False))
+    G = S["cohort"][idx]
+    iid = write_bed(str(tmp_path / "sub"), G, S["variants"], "s")
+    C = principal_components(G, 10)
+    pd.DataFrame({"FID": iid, "IID": iid, **{f"PC{i + 1}": C[:, i] for i in range(10)}}).to_csv(
+        tmp_path / "sub.cov", sep="\t", index=False)
+    info = sample_factors(str(tmp_path / "sub"), str(d / "ref"), str(tmp_path / "sub"), covar=str(tmp_path / "sub.cov"),
+                          log=lambda *a: None)
+    np.testing.assert_allclose(info["diagnostics"]["between_chromosome_same_person_mass"],
+                               _between_chromosome_sp(G, C, chrom), rtol=1e-8)
+    assert abs(info["diagnostics"]["share_predicted"] - 1) < 0.12
+    assert info["n_samples"] == 400 and info["nu"] == 400 - 1 - 10
+
+
+def test_sample_factors_follow_first_generation_people(tmp_path):
+    """A cohort of F1s (one haplotype from each source) and random-mating admixed people: the random-mating model of
+    the same-person term misses the spread of local-ancestry variance across people; the factors do not."""
+    from summit.admixed_ld.sample_factors import factor_loadings, sample_factors
+    from admixed_ld_sim import _haplotypes_k
+    rng = np.random.default_rng(21)
+    n_chr, per, chr_cm, M = 6, 300, 60.0, 1800
+    chrom = np.repeat(np.arange(1, n_chr + 1), per)
+    cm = np.concatenate([np.sort(rng.uniform(0, chr_cm, per)) for _ in range(n_chr)])
+    base = rng.uniform(0.05, 0.95, M)
+    freqs = [np.clip(base + rng.normal(0, 0.25, M), 0.03, 0.97), base]
+    founders = [(rng.random((40, M)) < p[None, :]).astype(np.int8) for p in freqs]
+    geno = lambda h: (h[0::2] + h[1::2]).astype(np.float64)
+    panels = [geno(_haplotypes_k(rng, founders, cm, 2 * 1500, 3.0, source=s)[0]) for s in range(2)]
+    n_f1, n_rm = 700, 700
+    th_rm = rng.beta(4, 4, n_rm)
+    th_h = np.concatenate([np.tile([[1.0, 0.0], [0.0, 1.0]], (n_f1, 1)),
+                           np.repeat(np.column_stack([th_rm, 1 - th_rm]), 2, axis=0)])
+    G = geno(_haplotypes_k(rng, founders, cm, 2 * (n_f1 + n_rm), 3.0, theta_h=th_h, break_rate=0.06)[0])
+    v = pd.DataFrame({"CHR": chrom.astype(str), "SNP": [f"f{j:05d}" for j in range(M)], "CM": cm,
+                      "BP": np.rint(cm * 1e6).astype(np.int64) + 1, "A1": "A", "A2": "G"})
+    write_bed(str(tmp_path / "pA"), panels[0], v, "a")
+    write_bed(str(tmp_path / "pE"), panels[1], v, "e")
+    build_reference([str(tmp_path / "pA"), str(tmp_path / "pE")], ["AFR", "EUR"], str(tmp_path / "ref"),
+                    window_kb=3000, step=256, log=lambda *a: None)
+    iid = write_bed(str(tmp_path / "co"), G, v, "c")
+    C = principal_components(G, 2)
+    pd.DataFrame({"FID": iid, "IID": iid, "PC1": C[:, 0], "PC2": C[:, 1]}).to_csv(tmp_path / "co.cov", sep="\t",
+                                                                                 index=False)
+    info = sample_factors(str(tmp_path / "co"), str(tmp_path / "ref"), str(tmp_path / "co"),
+                          covar=str(tmp_path / "co.cov"), log=lambda *a: None)
+    real = _between_chromosome_sp(G, C, chrom)
+    np.testing.assert_allclose(info["diagnostics"]["between_chromosome_same_person_mass"], real, rtol=1e-8)
+    # the random-mating model, with each person's true expected ancestry (F1s 0.5)
+    th = np.concatenate([np.full(n_f1, 0.5), th_rm])
+    U = np.column_stack([np.ones(th.size), th, 2 * th * (1 - th)])
+    W = U - U.mean(0)
+    S_rm = W.T @ W / th.size
+    Pp = np.column_stack(freqs)
+    Vv = 2 * Pp * (1 - Pp)
+    Dd = (Pp[:, 0] - Pp[:, 1])[:, None]
+    A = factor_loadings(Vv, Dd[:, :, None] * Dd[:, None, :]) / (G.var(0, ddof=1))[:, None]
+    n, nu = G.shape[0], G.shape[0] - 3
+    Ac = np.stack([A[chrom == c].sum(0) for c in range(1, n_chr + 1)])
+    At = Ac.sum(0)
+    pred_rm = n / nu ** 2 * (At @ S_rm @ At - np.einsum("ca,ab,cb->", Ac, S_rm, Ac))
+    sf_share, rm_share = info["diagnostics"]["share_predicted"], pred_rm / real   # 0.97 and 0.82 for this seed
+    assert abs(sf_share - 1) < 0.06 and rm_share < 0.9 and abs(sf_share - 1) < abs(rm_share - 1) / 3, (sf_share, rm_share)
+    lam_sd = np.sqrt(max(np.asarray(info["sigma"])[2, 2], 0))
+    assert lam_sd > 0.15                                             # F1s have lambda 0, the others about 0.45
+
+
+def test_compose_with_sample_factors(sim, tmp_path):
+    """In 400 people with ten in-sample PCs, compose with the sample factors is closer to the exact in-sample LD than
+    the random-mating term; both terms are recorded, and the inputs are checked."""
+    from summit.admixed_ld.compose import compose_ldscores
+    from summit.admixed_ld.sample_factors import sample_factors
+    d, S = sim["dir"], sim["S"]
+    v = S["variants"]
+    rng = np.random.default_rng(11)
+    idx = np.sort(rng.choice(S["cohort"].shape[0], 400, replace=False))
+    G = S["cohort"][idx]
+    iid = write_bed(str(tmp_path / "sub"), G, v, "s")
+    C = principal_components(G, 10)
+    pd.DataFrame({"FID": iid, "IID": iid, **{f"PC{i + 1}": C[:, i] for i in range(10)}}).to_csv(
+        tmp_path / "sub.cov", sep="\t", index=False)
+    os.makedirs(tmp_path / "ss")
+    for t in range(2):
+        beta, se = gwas(G, rng.standard_normal(400), C)
+        pd.DataFrame({"SNP": v.SNP, "CHR": v.CHR, "BP": v.BP, "A1": v.A1, "A2": v.A2, "N": 400, "BETA": beta,
+                      "SE": se, "Z": beta / se, "COV_RANK": 10}).to_csv(tmp_path / "ss" / f"t{t}.tsv", sep="\t",
+                                                                        index=False)
+    p = G.mean(0) / 2
+    cls = (np.minimum(p, 1 - p) >= 0.2).astype(int)
+    pd.DataFrame({"SNP": v.SNP, "low": (cls == 0).astype(int), "high": (cls == 1).astype(int)}).to_csv(
+        tmp_path / "annot.tsv", sep="\t", index=False)
+    sample_factors(str(tmp_path / "sub"), str(d / "ref"), str(tmp_path / "sub"), covar=str(tmp_path / "sub.cov"),
+                   log=lambda *a: None)
+    sf = str(tmp_path / "sub.sample_factors.json")
+    ratio = {}
+    for arm, kw in (("rm", {}), ("sf", dict(sample_factors=sf))):
+        out = str(tmp_path / arm)
+        compose_ldscores(str(d / "ref"), [str(tmp_path / "ss")], str(tmp_path / "annot.tsv"), out,
+                         generations=S["generations"], log=lambda *a: None, **kw)
+        got = pd.read_csv(out + ".gw.ldscore.gz", sep="\t")
+        keep = v.SNP.isin(got.SNP).to_numpy()
+        L_in, V_in = insample_ldscores(G[:, keep], C, cls[keep], 2)
+        ok = np.isfinite(L_in).all(1) & np.isfinite(V_in)
+        Lc, Vc = got[["low", "high"]].to_numpy()[ok], got.V.to_numpy()[ok]
+        ratio[arm] = float((Vc[:, None] * Lc).sum() / (V_in[ok, None] * L_in[ok]).sum())
+    assert abs(ratio["sf"] - 1) < abs(ratio["rm"] - 1) and abs(ratio["sf"] - 1) < 0.08, ratio
+    pj = json.load(open(str(tmp_path / "sf") + ".admixed_ld.json"))
+    assert pj["sample_factors"]["n_samples"] == 400
+    assert pj["sample_factors"]["same_person_mass"] < pj["sample_factors"]["same_person_mass_random_mating"]
+    bad = json.load(open(sf))
+    bad["sources"] = ["EUR", "AFR"]
+    json.dump(bad, open(tmp_path / "bad.sample_factors.json", "w"))
+    with pytest.raises(ValueError, match="sources"):
+        compose_ldscores(str(d / "ref"), [str(tmp_path / "ss")], str(tmp_path / "annot.tsv"), str(tmp_path / "x"),
+                         generations=S["generations"], sample_factors=str(tmp_path / "bad.sample_factors.json"),
+                         log=lambda *a: None)
