@@ -197,6 +197,11 @@ def main(argv=None):
                    help="proceed when the curve at 2 cM is not below kappa_res(0) from the standard errors (the "
                         "kernel is then held at the curve's value below 2 cM and the flag is recorded); by default "
                         "this inconsistency is an error")
+    m.add_argument("--cross-source", default=None,
+                   help="also write PREFIX.cross_NAME.gw.ldscore.gz, the cross-population LD scores of this GWAS with "
+                        "a GWAS of other people from an unadmixed population whose LD is that of source NAME's panel "
+                        "in the reference (e.g. EUR): sum_k rho_1 rho_2 sqrt(V_1 V_2) within the window, for "
+                        "cross-population genetic correlation")
     m.add_argument("--out", required=True)
 
     v = sub.add_parser("derive", help="a source without a reference panel, estimated from an admixed cohort that "
@@ -307,7 +312,7 @@ def main(argv=None):
                          background_min_cm=a.background_min_cm, background_window=a.background_window, nu=a.nu,
                          grid_cm=a.grid_cm, cell_matrix=a.cell_matrix,
                          cell_switch_cm=a.cell_switch_cm, allow_flat_kernel_join=a.allow_flat_kernel_join,
-                         log=log._log)
+                         cross_source=a.cross_source, log=log._log)
     return 0
 
 

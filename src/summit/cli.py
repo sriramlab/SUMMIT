@@ -424,6 +424,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     output.add_argument("--compact", action="store_true", help="Write a compact rg manifest with only the core columns needed downstream.",)
+    cross.add_argument("--ldscores-h2-1", default=None, type=str,
+                       help=("Cross-population rg (with --ldscores-h2-2): --ldscores holds the cross LD scores of the "
+                             "two traits' samples (e.g. `summit admixed-ld compose --cross-source`), and trait 1's h2 is "
+                             "fitted with these LD scores of its own sample, on the same SNPs in the same order. Give "
+                             "--overlap-covariance-rg 0 when the samples are disjoint. HE weights only."))
+    cross.add_argument("--ldscores-h2-2", default=None, type=str,
+                       help="Cross-population rg: trait 2's own LD scores (see --ldscores-h2-1).")
     cross.add_argument("--rg-manifest-fast", action="store_true", default=False,
                         help=(
                             "Use the HE/jackknife sparse-drop fast path for supplied-overlap rg manifest mode. "
@@ -2169,6 +2176,17 @@ def _dispatch_gxe_fit(args, log):
     log._log(f"[gxe] wrote {table_path} and {json_path}.")
 
 
+def _cross_h2_ldscores(args, log):
+    """The two traits' own LD scores for cross-population rg, or None."""
+    a, b = getattr(args, "ldscores_h2_1", None), getattr(args, "ldscores_h2_2", None)
+    if a is None and b is None:
+        return None
+    if a is None or b is None:
+        log._log("!!! Cross-population rg needs both --ldscores-h2-1 and --ldscores-h2-2. !!!")
+        raise SystemExit(1)
+    return (a, b)
+
+
 def _dispatch_rg(args, log):
     _resolve_njack(args, DEFAULT_HE_NJACK)
     if args.ldscores is None:
@@ -2216,6 +2234,7 @@ def _dispatch_rg(args, log):
         ldsc_irwls_tol=args.ldsc_irwls_tol,
         snp_var_weights=not getattr(args, "snp_var_weights_off", False),
         long_range=getattr(args, "long_range_se", None),
+        ldscores_h2=_cross_h2_ldscores(args, log),
     )
     rg._run()
     rg._logoff()

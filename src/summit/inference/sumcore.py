@@ -85,6 +85,7 @@ class Sumcore:
         ldsc_irwls_tol: float = 0.0,
         snp_var_weights: bool = True,
         long_range=None,
+        ldscores_h2=None,
         **_unused_kwargs,
     ):
 
@@ -182,6 +183,29 @@ class Sumcore:
             self.trace = trace_obj
             if hasattr(self.trace, "log"):
                 self.trace.log = self.log
+
+        # cross-population rg: --ldscores holds the cross LD scores of the two samples (e.g. `summit admixed-ld compose
+        # --cross-source`), and each trait's h2 is fitted with its own sample's LD scores on the same SNPs
+        self.h2_traces = None
+        if ldscores_h2 is not None:
+            if len(ldscores_h2) != 2:
+                raise ValueError("Cross-population rg needs the two traits' own LD scores (--ldscores-h2-1/-2).")
+            if str(weight_mode).strip().lower() not in {"he", "summit", "score", "he_regression"}:
+                raise ValueError("Cross-population rg uses --weight-mode he.")
+            if long_range is not None:
+                raise ValueError("--long-range-se is not available with cross-population rg.")
+            self.h2_traces = []
+            for p in ldscores_h2:
+                t = Trace(bimpath=bim_path, sumpath=None, savepath=None, log=self.log, ldscores=p, ldscores_reg=None,
+                          ldscores_reg_w=None, annot=annot, verbose=bool(self.verbose_level), delta=None,
+                          snp_var_weights=snp_var_weights)
+                if t.nsnps != self.trace.nsnps or not np.array_equal(np.asarray(t.snps), np.asarray(self.trace.snps)):
+                    raise ValueError(f"{p} must list the same SNPs in the same order as the cross LD scores "
+                                     f"({t.nsnps} against {self.trace.nsnps} SNPs).")
+                self.h2_traces.append(t)
+            if self.log is not None:
+                self.log._log("[rg:cross] cross-population rg: the genetic covariance with the cross LD scores, each "
+                              "trait's h2 with its own LD scores: " + ", ".join(str(p) for p in ldscores_h2))
 
         self.ldsc_irwls_iters = int(ldsc_irwls_iters)
         self.ldsc_irwls_tol = float(ldsc_irwls_tol)
@@ -405,6 +429,9 @@ class Sumcore:
         keep1 = np.asarray(keep1, dtype=bool)
         keep2 = np.asarray(keep2, dtype=bool)
         main_mask = keep1 & keep2
+        if self.h2_traces is not None:                       # SNPs with every trait's own LD scores
+            for t in self.h2_traces:
+                main_mask &= np.isfinite(np.asarray(t.ldscores, dtype=np.float64)).all(axis=1)
         if self.ldsc_weight_present is not None:
             main_mask &= self.ldsc_weight_present
         _stage_stop("load_align_filter", t_stage)
@@ -470,11 +497,13 @@ class Sumcore:
             jk = JackknifeDesign.from_trace_view(tv, self.jackknife_spec, log=self.log)
         _stage_stop("materialize_jackknife", t_stage)
 
+        tv1, tv2 = (tv, tv) if self.h2_traces is None else (
+            self.h2_traces[0].materialize_view(main_mask), self.h2_traces[1].materialize_view(main_mask))
         t_stage = _stage_start()
         h2_prepared1 = (
             prepare_h2_ldsc(tv, matched1, jk)
             if self.weight_mode == "ldsc"
-            else prepare_h2(tv, matched1, jk, adjust_delta=self.adjust_delta, diag=diag1)
+            else prepare_h2(tv1, matched1, jk, adjust_delta=self.adjust_delta, diag=diag1)
         )
         h2_fit1 = fit_h2(
             h2_prepared1,
@@ -497,7 +526,7 @@ class Sumcore:
         h2_prepared2 = (
             prepare_h2_ldsc(tv, matched2, jk)
             if self.weight_mode == "ldsc"
-            else prepare_h2(tv, matched2, jk, adjust_delta=self.adjust_delta, diag=diag2)
+            else prepare_h2(tv2, matched2, jk, adjust_delta=self.adjust_delta, diag=diag2)
         )
         h2_fit2 = fit_h2(
             h2_prepared2,

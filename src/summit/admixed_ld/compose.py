@@ -505,12 +505,20 @@ def compose_ldscores(ref_path, sumstats, annot, out, *, sources=None, snps=None,
                      generations=None, decay_per_cm=None, mean_ancestry=None, kappa0=None, theta_sd=None,
                      relatedness=None, relatedness_smooth=0.1, background_min_cm=3.0, background_window="panels",
                      nu=None, r2=0.99, grid_cm=0.02, cell_matrix=False,
-                     cell_switch_cm=10.0, allow_flat_kernel_join=False,
+                     cell_switch_cm=10.0, allow_flat_kernel_join=False, cross_source=None,
                      pair_chunk=1 << 23, log=print):
     """Composed LD scores for an admixed GWAS sample with two or more sources (the last is the baseline of the
     contrasts). mean_ancestry: K-1 or K values (comma-separated); kappa0: the upper triangle of Kt_res(0) row by row.
     Departures from the standard recipe that are allowed but should be visible are recorded in the params json under
-    `flags` (and logged as warnings); inconsistent inputs raise."""
+    `flags` (and logged as warnings); inconsistent inputs raise.
+
+    cross_source: also write the cross-population LD scores of this GWAS with a second GWAS on other people from an
+    unadmixed population whose LD is that of this reference source's panel (e.g. EUR), to <out>.cross_<name>:
+        lx_jc = sum_{k in c} rho_1(j,k) rho_2(j,k) sqrt(V_1k V_2k),
+    rho_1 the composed correlation of this sample's covariate-adjusted genotypes, rho_2 the panel's correlation (its
+    population has no admixture LD, so only pairs within the window count) and V_2 = 1. The samples are disjoint, so
+    there is no same-person or relatives' term. When the panel is also one of this sample's sources, its squared
+    covariance takes the unbiased estimate and its own background is removed once."""
     from ..ldscore.gw_ldscore import write_gw_annotation_masses, write_gw_ldscore_table
     from ..relatives.moments import read_annotation_classes
     from ..sumstats.sumstats import Sumstats
@@ -522,6 +530,13 @@ def compose_ldscores(ref_path, sumstats, annot, out, *, sources=None, snps=None,
     nK, k1 = len(sources), len(sources) - 1
     si = [ref.source_index(s) for s in sources]
     ns = np.array([ref.n[s] for s in sources], np.float64)
+    xs_i = xs_n = None                       # cross_source: its index in the reference, and in sources (if one)
+    if cross_source is not None:
+        xs_i = ref.source_index(cross_source)
+        xm = ref.manifest["sources"][xs_i]
+        if xm.get("derived"):
+            raise ValueError(f"--cross-source {cross_source} is a derived source; it needs a panel's own LD.")
+        xs_n = sources.index(cross_source) if cross_source in sources else None
     if sum(x is not None for x in (curve, generations, decay_per_cm)) != 1:
         raise ValueError("Give exactly one source for the decay: --curve, --admixture-generations or --decay-per-cm.")
 
@@ -746,6 +761,8 @@ def compose_ldscores(ref_path, sumstats, annot, out, *, sources=None, snps=None,
         M = int(ok.sum())
     Vpop = cres / s2
     L = np.zeros((M, K))
+    Lx = np.zeros((M, K)) if xs_i is not None else None
+    v2_out = np.zeros(M) if xs_i is not None else None
     chrom_out = rv["CHR"].to_numpy()[r_idx]
     local_out = rv["LOCAL"].to_numpy()[r_idx]
     cm_out = rv["CM"].to_numpy()[r_idx]
@@ -800,6 +817,9 @@ def compose_ldscores(ref_path, sumstats, annot, out, *, sources=None, snps=None,
         # panel's variances apart from the dosage variances its frequencies imply)
         vr = [z[f"vld_{i}"] if f"vld_{i}" in z.files else z[f"v_{i}"] for i in si]
         cross_c = [x for x in cross if cvar[x[0]] is not None]          # only covariances stored with covvar
+        if xs_i is not None:                                            # the second population's panel
+            cov_x, v_x = z[f"cov_{xs_i}"], z[f"v_{xs_i}"].astype(np.float64)
+            v2_out[sel] = v_x[local_out[sel]]
         # pairs within the window (upper band), in chunks of rows
         r0 = 0
         while r0 < nloc:
@@ -840,6 +860,20 @@ def compose_ldscores(ref_path, sumstats, annot, out, *, sources=None, snps=None,
                         if n_ in fsc:                             # on the source's scale, as its covariances
                             bg *= (fsc[n_][c][jl] * fsc[n_][c][kl]) ** 2
                         noise += bg
+                    if xs_i is not None:
+                        c2 = cov_x[s0:s1][use].astype(np.float64)
+                        v2j, v2k = v_x[jl], v_x[kl]
+                        px = cr * c2
+                        if xs_n is not None:                      # pi_s c_s^2 of the shared panel: unbiased, less
+                            px -= pis[xs_n] * vnss[xs_n]          # its own background
+                            if xs_n in panel_bg:
+                                px -= pis[xs_n] * v2j * v2k * panel_bg[xs_n].per_pair(d)
+                        okx = (v2j > 0) & (v2k > 0)
+                        px = np.where(okx, px, 0.0)
+                        dj = np.sqrt(np.where(okx, cres[j] * v2j * s2[k] * v2k, 1.0))
+                        dk = np.sqrt(np.where(okx, cres[k] * v2k * s2[j] * v2j, 1.0))
+                        Lx += np.bincount(j * K + cls[k], weights=px / dj, minlength=M * K).reshape(M, K)
+                        Lx += np.bincount(k * K + cls[j], weights=px / dk, minlength=M * K).reshape(M, K)
                     sq = cr * cr - noise - adm * adm
                     L += np.bincount(j * K + cls[k], weights=sq / (cres[j] * s2[k]), minlength=M * K).reshape(M, K)
                     L += np.bincount(k * K + cls[j], weights=sq / (cres[k] * s2[j]), minlength=M * K).reshape(M, K)
@@ -904,6 +938,20 @@ def compose_ldscores(ref_path, sumstats, annot, out, *, sources=None, snps=None,
                                  genetic_map=ref.manifest["genetic_map"]),
                   per_trait=None if per_trait is None else per_trait.to_dict(orient="records"),
                   ld_mass=float((V[:, None] * L).sum()), flags=flags)
+    if xs_i is not None:                                          # each SNP with itself: sqrt(V_1 V_2), V_2 = 1
+        keep = v2_out > 0
+        Lx[np.arange(M), cls] += np.sqrt(Vpop)
+        xout = f"{out}.cross_{cross_source}"
+        write_gw_ldscore_table(xout, snpdf[keep].reset_index(drop=True),
+                               pd.DataFrame(Lx[keep], columns=classes), snp_var=np.sqrt(Vpop[keep]))
+        write_gw_annotation_masses(xout, np.bincount(cls[keep], minlength=K).astype(float))
+        params["cross"] = dict(source=cross_source, panel_n=int(ref.n[cross_source]),
+                               panel_is_a_source=xs_n is not None, file=f"{xout}.gw.ldscore.gz",
+                               n_snps=int(keep.sum()), ld_mass=float((np.sqrt(Vpop[keep])[:, None] * Lx[keep]).sum()),
+                               definition="sum_k rho_1(j,k) rho_2(j,k) sqrt(V_1k V_2k) over pairs within the window, "
+                                          "rho_2 and V_2 = 1 from the panel of the second population")
+        log(f"[admixed-ld] compose: wrote {xout}.gw.ldscore.gz, cross-population LD scores with {cross_source}'s "
+            f"panel ({int(keep.sum())} SNPs polymorphic in it)")
     if k1 == 1:                                                    # the two-source keys
         params.update(mean_ancestry=float(m_vec[0]), kappa0=float(k0[0, 0]))
     with open(f"{out}.admixed_ld.json", "w") as fh:
