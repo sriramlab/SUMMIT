@@ -354,7 +354,8 @@ def test_cross_population_rg(simx, tmp_path):
          "own1_c": _ld_table(tmp_path / "own1_c", snps, chrom, bp, c1[["low", "high"]].to_numpy(), c1.V.to_numpy()),
          "cross_c": _ld_table(tmp_path / "cross_c", snps, chrom, bp, cx[["low", "high"]].to_numpy(), cx.V.to_numpy())}
     kw = dict(rg=f"{tmp_path / 't1.tsv'},{tmp_path / 't2.tsv'}", annot=str(tmp_path / "annot.tsv"), njack=50,
-              chisq_threshold=None, intercept_chisq_thr=None, align_alleles=True, intercept_rg=0.0)
+              chisq_threshold=None, intercept_chisq_thr=None, align_alleles=True, intercept_rg=0.0,
+              drop_ambiguous=False)                              # the simulator's C/G SNPs are strand-ambiguous
     run = lambda ld, h2=None: (lambda sc: (sc._run(), sc.result)[1])(Sumcore(ldscores=ld, ldscores_h2=h2, **kw))
     ex = run(f["cross"], (f["own1"], f["own2"]))
     co = run(f["cross_c"], (f["own1_c"], f["own2"]))
