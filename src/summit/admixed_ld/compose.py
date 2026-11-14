@@ -506,7 +506,8 @@ def compose_ldscores(ref_path, sumstats, annot, out, *, sources=None, snps=None,
                      relatedness=None, relatedness_smooth=0.1, background_min_cm=3.0, background_window="panels",
                      nu=None, r2=0.99, grid_cm=0.02, cell_matrix=False,
                      cell_switch_cm=10.0, allow_flat_kernel_join=False, cross_source=None,
-                     sample_factors=None, pair_chunk=1 << 23, log=print):
+                     sample_factors=None, sample_factors_calibrate=True, pair_chunk=1 << 23,
+                     log=print):
     """Composed LD scores for an admixed GWAS sample with two or more sources (the last is the baseline of the
     contrasts). mean_ancestry: K-1 or K values (comma-separated); kappa0: the upper triangle of Kt_res(0) row by row.
     Departures from the standard recipe that are allowed but should be visible are recorded in the params json under
@@ -522,7 +523,9 @@ def compose_ldscores(ref_path, sumstats, annot, out, *, sources=None, snps=None,
 
     sample_factors: the cohort's person-factor statistic (`summit admixed-ld sample-factors`, made on the GWAS's people
     with its covariates). The same-person term is then (n / (nu_sf nu)) sum_{k in c} a_j' Sigma_u a_k / (cres_j s2_k)
-    in place of the random-mating covariance of heterozygosity (sample_factors.py); both are recorded."""
+    in place of the random-mating covariance of heterozygosity (sample_factors.py); both are recorded. With
+    sample_factors_calibrate (default), the term is scaled so that its mass over pairs on different chromosomes equals
+    the cohort's realized one, which the statistic records; the factors then allocate it across SNPs and classes."""
     from ..ldscore.gw_ldscore import write_gw_annotation_masses, write_gw_ldscore_table
     from ..relatives.moments import read_annotation_classes
     from ..sumstats.sumstats import Sumstats
@@ -920,15 +923,42 @@ def compose_ldscores(ref_path, sumstats, annot, out, *, sources=None, snps=None,
     sf_info = None
     Vpop_sp = cres / s2
     if sample_factors is not None:
-        from .sample_factors import factor_loadings, factor_same_person_term, read_sample_factors
+        from .sample_factors import (factor_between_chromosome_mass, factor_loadings, factor_same_person_term,
+                                     read_sample_factors)
         sfi = read_sample_factors(sample_factors)
         if list(sfi["sources"]) != list(sources):
             raise ValueError(f"The sample factors were made with sources {sfi['sources']}, compose uses {sources} (same "
                              "names, same order, baseline last).")
-        sp = factor_same_person_term(factor_loadings(Vm, O), s2, cres, cls, K, sfi["sigma"], sfi["n_samples"],
-                                     sfi["nu"], nu)
+        a_sf = factor_loadings(Vm, O)
+        sp = factor_same_person_term(a_sf, s2, cres, cls, K, sfi["sigma"], sfi["n_samples"], sfi["nu"], nu)
+        mass_uncal = float((Vpop_sp[:, None] * sp).sum())
+        calib = None
+        realized = (sfi.get("diagnostics") or {}).get("between_chromosome_same_person_mass")
+        if sample_factors_calibrate and realized is not None:
+            # the cohort's realized between-chromosome same-person mass fixes the term's size; the factors allocate it
+            # (a signed loading sum makes the term sensitive to small errors of the model variances s2 that follow the
+            # sources' heterozygosity difference, and the factors themselves leave a few per cent out)
+            btw = factor_between_chromosome_mass(a_sf, s2, chrom_out, sfi["sigma"], sfi["n_samples"], sfi["nu"], nu)
+            m_ratio = M / float(sfi["n_snps"])
+            target = float(realized) * m_ratio ** 2
+            if btw > 0 and target > 0:
+                f = target / btw
+                sp = sp * f
+                calib = dict(factor=f, compose_between_chromosome_mass=btw, realized_between_chromosome_mass=realized,
+                             snp_ratio=m_ratio, target=target)
+                log(f"[admixed-ld] compose: sample-factor term scaled by {f:.4f} so that its between-chromosome mass "
+                    f"equals the cohort's realized {realized:.6g} (x {m_ratio ** 2:.4f} for the SNP count)")
+                if abs(m_ratio - 1) > 0.02:
+                    flags.append(dict(flag="sample_factors_snps_differ",
+                                      detail=f"{M} SNPs here, {sfi['n_snps']} in the sample factors"))
+                if not 0.8 <= f <= 1.25:
+                    flags.append(dict(flag="sample_factors_calibration_large", detail=f"factor {f:.4g}"))
+            else:
+                flags.append(dict(flag="sample_factors_not_calibrated",
+                                  detail=f"between-chromosome masses {btw:.4g} (compose), {realized:.4g} (realized)"))
         sf_info = dict(file=sfi["path"], n_samples=sfi["n_samples"], nu=sfi["nu"], factors=sfi["factors"],
                        sigma=sfi["sigma"], diagnostics=sfi.get("diagnostics"), leverage=sfi.get("leverage"),
+                       calibration=calib, same_person_mass_uncalibrated=mass_uncal,
                        same_person_mass=float((Vpop_sp[:, None] * sp).sum()),
                        same_person_mass_random_mating=float((Vpop_sp[:, None] * sp_rm).sum()))
         ev = np.linalg.eigvalsh(np.asarray(sfi["sigma"], np.float64))

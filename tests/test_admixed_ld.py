@@ -1747,8 +1747,20 @@ def test_compose_with_sample_factors(sim, tmp_path):
         ratio[arm] = float((Vc[:, None] * Lc).sum() / (V_in[ok, None] * L_in[ok]).sum())
     assert abs(ratio["sf"] - 1) < abs(ratio["rm"] - 1) and abs(ratio["sf"] - 1) < 0.08, ratio
     pj = json.load(open(str(tmp_path / "sf") + ".admixed_ld.json"))
-    assert pj["sample_factors"]["n_samples"] == 400
-    assert pj["sample_factors"]["same_person_mass"] < pj["sample_factors"]["same_person_mass_random_mating"]
+    sfj = pj["sample_factors"]
+    assert sfj["n_samples"] == 400
+    assert sfj["same_person_mass"] < sfj["same_person_mass_random_mating"]
+    cal = sfj["calibration"]                                         # scaled to the realized between-chromosome mass
+    real = json.load(open(sf))["diagnostics"]["between_chromosome_same_person_mass"]
+    np.testing.assert_allclose(cal["factor"], real / cal["compose_between_chromosome_mass"], rtol=1e-12)
+    np.testing.assert_allclose(sfj["same_person_mass"], cal["factor"] * sfj["same_person_mass_uncalibrated"],
+                               rtol=1e-10)
+    compose_ldscores(str(d / "ref"), [str(tmp_path / "ss")], str(tmp_path / "annot.tsv"), str(tmp_path / "sfu"),
+                     generations=S["generations"], sample_factors=sf, sample_factors_calibrate=False,
+                     log=lambda *a: None)
+    pu = json.load(open(str(tmp_path / "sfu") + ".admixed_ld.json"))["sample_factors"]
+    assert pu["calibration"] is None
+    np.testing.assert_allclose(pu["same_person_mass"], sfj["same_person_mass_uncalibrated"], rtol=1e-12)
     bad = json.load(open(sf))
     bad["sources"] = ["EUR", "AFR"]
     json.dump(bad, open(tmp_path / "bad.sample_factors.json", "w"))

@@ -161,6 +161,16 @@ def read_sample_factors(path) -> dict:
     return info
 
 
+def factor_between_chromosome_mass(a, s2, chrom, sigma, n_sf, nu_sf, nu):
+    """The factor term's LD mass over pairs of SNPs on different chromosomes, in compose's units: (n_sf / (nu_sf nu))
+    [A' Sigma A - sum_c A_c' Sigma A_c], A = sum_j a_j / s2_j (A_c over chromosome c)."""
+    A = a / s2[:, None]
+    S = np.asarray(sigma)
+    At = A.sum(axis=0)
+    within = sum(float(A[chrom == c].sum(axis=0) @ S @ A[chrom == c].sum(axis=0)) for c in pd.unique(chrom))
+    return (n_sf / (nu_sf * nu)) * (float(At @ S @ At) - within)
+
+
 def factor_same_person_term(a, s2, cres, cls, n_classes, sigma, n_sf, nu_sf, nu):
     """(n_sf / (nu_sf nu)) a_j' Sigma_u sum_{k in c} a_k / s2_k / cres_j (M x classes): the same-person term with the
     cohort's person factors; with nu_sf = nu and n_sf = n it is (n / nu^2) Cov(y_j, y_k) summed over the class, the

@@ -207,6 +207,8 @@ def main(argv=None):
                         "people with its covariates): the same-person term from it instead of the random-mating "
                         "covariance of heterozygosity (for a few hundred people, first-generation groups, in-sample "
                         "PCs)")
+    m.add_argument("--sample-factors-no-calibration", action="store_true",
+                   help="do not scale the sample-factor term to the cohort's realized between-chromosome mass")
     m.add_argument("--out", required=True)
 
     f = sub.add_parser("sample-factors", help="the cohort's person-factor statistic for the same-person term "
@@ -333,7 +335,8 @@ def main(argv=None):
                          background_min_cm=a.background_min_cm, background_window=a.background_window, nu=a.nu,
                          grid_cm=a.grid_cm, cell_matrix=a.cell_matrix,
                          cell_switch_cm=a.cell_switch_cm, allow_flat_kernel_join=a.allow_flat_kernel_join,
-                         cross_source=a.cross_source, sample_factors=a.sample_factors, log=log._log)
+                         cross_source=a.cross_source, sample_factors=a.sample_factors,
+                         sample_factors_calibrate=not a.sample_factors_no_calibration, log=log._log)
     return 0
 
 
