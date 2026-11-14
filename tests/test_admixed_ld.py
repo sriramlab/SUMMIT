@@ -1816,3 +1816,47 @@ def test_compose_writes_one_file_per_gwas_sample_size(fam, tmp_path):
     assert len(pm["n_groups"]) == 2
     assert {g["label"] for g in pm["n_groups"]} == {str(n), str(sub.size)}
     assert not os.path.exists(str(tmp_path / "c_full") + ".n_groups.tsv")   # one sample size: no extra files
+
+
+def test_sample_factors_ld_mass_and_its_check_in_compose(sim, tmp_path):
+    """The statistic's realized in-sample LD mass (total, and over pairs on different chromosomes) equals a brute-force
+    computation from the genotypes; compose records its own mass against it and, with calibrate_between_chromosomes,
+    matches it by a uniform term on pairs of SNPs on different chromosomes."""
+    from summit.admixed_ld.compose import compose_ldscores
+    from summit.admixed_ld.sample_factors import sample_factors
+    d, S = sim["dir"], sim["S"]
+    G, C = S["cohort"], sim["C"]
+    info = sample_factors(str(d / "cohort"), str(d / "ref"), str(tmp_path / "sf"), covar=str(d / "cohort.cov"),
+                          log=lambda *a: None)
+    n = G.shape[0]
+    X = G - G.mean(0)
+    s2 = (X ** 2).sum(0) / (n - 1)
+    ok = s2 > 0
+    X = X[:, ok] / np.sqrt(s2[ok])
+    Q = np.linalg.qr(np.column_stack([np.ones(n), C]))[0]
+    nu = n - Q.shape[1]
+    X -= Q @ (Q.T @ X)
+    R = X.T @ X / nu
+    V = np.diag(R).copy()
+    P = R ** 2 - np.outer(V, V) / nu
+    chrom = S["variants"].CHR.to_numpy()[ok]
+    diff = chrom[:, None] != chrom[None, :]
+    np.testing.assert_allclose(info["ld_mass"]["total"], P.sum(), rtol=1e-9)
+    np.testing.assert_allclose(info["ld_mass"]["between_chromosomes"], P[diff].sum(), rtol=1e-9)
+    L_in, V_in = insample_ldscores(G[:, ok], C, sim["cls"][ok], 2)
+    np.testing.assert_allclose(info["ld_mass"]["total"], float((V_in[:, None] * L_in).sum()), rtol=1e-6)
+    sf = str(tmp_path / "sf.sample_factors.json")
+    for arm, cal in (("check", False), ("cal", True)):
+        out = str(tmp_path / arm)
+        compose_ldscores(str(d / "ref"), [str(d / "ss")], str(d / "annot.tsv"), out, generations=S["generations"],
+                         sample_factors=sf, calibrate_between_chromosomes=cal, log=lambda *a: None)
+        chk = json.load(open(out + ".admixed_ld.json"))["ld_mass_check"]
+        got = pd.read_csv(out + ".gw.ldscore.gz", sep="\t")
+        mass = float((got.V.to_numpy()[:, None] * got[["low", "high"]].to_numpy()).sum())
+        if cal:
+            assert abs(mass / chk["realized_total"] - 1) < 1e-6         # GWAS N = the statistic's n here
+            assert chk["between_chromosome_shift_per_pair"] == pytest.approx(
+                (chk["realized_total"] - chk["composed_total"]) / chk["shift_mass"] * chk["between_chromosome_shift_per_pair"])
+        else:
+            np.testing.assert_allclose(chk["composed_total"], mass, rtol=1e-6)   # the file holds about 7 digits
+            assert 0.8 < chk["ratio"] < 1.25

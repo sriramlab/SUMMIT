@@ -207,6 +207,10 @@ def main(argv=None):
                         "people with its covariates): the same-person term from it instead of the random-mating "
                         "covariance of heterozygosity (for a few hundred people, first-generation groups, in-sample "
                         "PCs)")
+    m.add_argument("--calibrate-between-chromosomes", action="store_true",
+                   help="with sample factors that carry the cohort's realized LD mass: put the difference between it and "
+                        "the composed mass on pairs of SNPs on different chromosomes, uniformly per pair (for structure "
+                        "the sources do not represent); by default the difference is only checked and recorded")
     m.add_argument("--single-n", action="store_true",
                    help="write only the LD-score file for the traits' median N (by default, traits whose N differ by more "
                         "than --n-tol get one file per sample size: the same-person and relatives' terms belong to the "
@@ -226,6 +230,10 @@ def main(argv=None):
                    help="two or more source names of the reference (default: its first two); the last is the baseline")
     f.add_argument("--match", choices=["position", "id"], default="position")
     f.add_argument("--threads", type=int, default=1)
+    f.add_argument("--no-ld-mass", action="store_true",
+                   help="skip the realized in-sample LD mass (two n x n matrices, O(n^2 M))")
+    f.add_argument("--memory-gb", type=float, default=32.0,
+                   help="largest memory for the two n x n matrices of the LD mass; above it the mass is skipped")
     f.add_argument("--out", required=True)
 
     v = sub.add_parser("derive", help="a source without a reference panel, estimated from an admixed cohort that "
@@ -309,7 +317,7 @@ def main(argv=None):
     elif a.cmd == "sample-factors":
         from .sample_factors import sample_factors
         sample_factors(a.geno, a.ref, a.out, sources=_sources(a.sources), covar=a.covar, keep=a.keep, match=a.match,
-                       threads=a.threads, log=log._log)
+                       threads=a.threads, ld_mass=not a.no_ld_mass, memory_gb=a.memory_gb, log=log._log)
     elif a.cmd == "derive":
         from .derive import derive_source
         derive_source(a.geno, a.ref, a.out, name=a.name, known=_sources(a.known), panel=a.panel, covar=a.covar,
@@ -342,7 +350,8 @@ def main(argv=None):
                          cell_switch_cm=a.cell_switch_cm, allow_flat_kernel_join=a.allow_flat_kernel_join,
                          cross_source=a.cross_source, sample_factors=a.sample_factors,
                          sample_factors_calibrate=not a.sample_factors_no_calibration,
-                         per_trait_n=not a.single_n, n_tol=a.n_tol, log=log._log)
+                         per_trait_n=not a.single_n, n_tol=a.n_tol,
+                         calibrate_between_chromosomes=a.calibrate_between_chromosomes, log=log._log)
     return 0
 
 

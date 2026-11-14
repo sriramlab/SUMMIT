@@ -58,8 +58,15 @@ def _sym_cross_cov(U0, U1):
 
 
 def sample_factors(geno, ref_path, out, *, sources=None, covar=None, keep=None, match="position", step=4096,
-                   threads=1, log=print) -> dict:
-    """Estimate Sigma_u on the GWAS's people (with the GWAS's covariates) and write out.sample_factors.json."""
+                   threads=1, ld_mass=True, memory_gb=32.0, log=print) -> dict:
+    """Estimate Sigma_u on the GWAS's people (with the GWAS's covariates) and write out.sample_factors.json.
+
+    ld_mass: also the sample's realized in-sample LD mass, in total and over pairs of SNPs on different chromosomes,
+    exactly as SUMMIT's in-sample LD scores define it (sum over pairs of V_j V_k (r_jk^2 - 1/nu), each SNP with itself
+    included), from the per-chromosome Gram matrices G_c = X~_c X~_c' of the adjusted, standardized genotypes:
+    total = <G, G> / nu^2 - (sum V)^2 / nu, between = (<G, G> - sum_c <G_c, G_c>) / nu^2 - ((sum V)^2 - sum_c (sum V_c)^2)
+    / nu. A model-free check of a composition (O(n^2 M), the cost of a GRM; two n x n matrices in memory, skipped with a
+    note above memory_gb)."""
     from .curve import _cohort_samples
     from .model import contrast_noise
     t0 = time.perf_counter()
@@ -93,6 +100,9 @@ def sample_factors(geno, ref_path, out, *, sources=None, covar=None, keep=None, 
     YA = [np.zeros((N, nf)), np.zeros((N, nf))]
     AA = [np.zeros((nf, nf)), np.zeros((nf, nf))]
     R = np.zeros((len(chroms), N))                                 # per chromosome: each person's sum of y
+    do_mass = bool(ld_mass) and 2.0 * N * N * 8 / 2 ** 30 <= float(memory_gb)
+    G_tot = np.zeros((N, N)) if do_mass else None
+    frob_c, Vsum_c = [], []
     Ac = np.zeros((len(chroms), nf))
     n_used = 0
     log(f"[admixed-ld] sample-factors: {t_idx.size} variants matched to the reference ({', '.join(sources)}; "
@@ -100,6 +110,8 @@ def sample_factors(geno, ref_path, out, *, sources=None, covar=None, keep=None, 
     for ci, c in enumerate(chroms):
         ix = np.flatnonzero(chrom == c)
         h = ci % 2
+        G_c = np.zeros((N, N)) if do_mass else None
+        v_c = 0.0
         for s in range(0, ix.size, step):
             sl = ix[s:s + step]
             X = blocks.read(t_idx[sl])
@@ -112,12 +124,21 @@ def sample_factors(geno, ref_path, out, *, sources=None, covar=None, keep=None, 
             if p_rank:
                 X -= C @ (C.T @ X)
             Y = X * X / s2[ok][None, :]
+            if do_mass:
+                Xs = X / np.sqrt(s2[ok])[None, :]
+                G_c += Xs @ Xs.T
+                v_c += float(Y.sum()) / nu
             A = a_all[sl][ok] / s2[ok][:, None]
             YA[h] += Y @ A
             AA[h] += A.T @ A
             R[ci] += Y.sum(axis=1)
             Ac[ci] += A.sum(axis=0)
             n_used += int(ok.sum())
+        if do_mass:
+            frob_c.append(float(np.vdot(G_c, G_c)))
+            Vsum_c.append(v_c)
+            G_tot += G_c
+            del G_c
         log(f"[admixed-ld] sample-factors chr{c}: {ix.size} variants ({time.perf_counter() - t0:.0f} s)")
     U = [YA[h] @ np.linalg.inv(AA[h]) for h in (0, 1)]
     Sigma = _sym_cross_cov(U[0], U[1])
@@ -129,6 +150,20 @@ def sample_factors(geno, ref_path, out, *, sources=None, covar=None, keep=None, 
     realized = tot / nu ** 2 - vv / (N * nu ** 2)
     At = Ac.sum(axis=0)
     predicted = float(N / nu ** 2 * (At @ Sigma @ At - np.einsum("ca,ab,cb->", Ac, Sigma, Ac)))
+    ld_info = None
+    if do_mass:
+        frob_tot = float(np.vdot(G_tot, G_tot))
+        Vs = np.array(Vsum_c)
+        total = frob_tot / nu ** 2 - Vs.sum() ** 2 / nu
+        between = (frob_tot - sum(frob_c)) / nu ** 2 - (Vs.sum() ** 2 - (Vs ** 2).sum()) / nu
+        ld_info = dict(total=total, between_chromosomes=between,
+                       between_chromosomes_population_part=between - realized,
+                       definition="sum over SNP pairs of V_j V_k (r_jk^2 - 1/nu), each SNP with itself included (SUMMIT's "
+                                  "in-sample LD scores), V-weighted; from per-chromosome Gram matrices")
+        del G_tot
+    elif ld_mass:
+        log(f"[admixed-ld] sample-factors: the in-sample LD mass needs two {N} x {N} matrices "
+            f"({2.0 * N * N * 8 / 2 ** 30:.1f} GiB > memory_gb {memory_gb}); skipped")
     lev = 1.0 / N + (C ** 2).sum(axis=1) if p_rank else np.full(N, 1.0 / N)
     eig = np.linalg.eigvalsh(Sigma)
     info = dict(format="summit-admixed-ld-sample-factors", version=1, sources=sources, baseline=sources[-1],
@@ -138,6 +173,7 @@ def sample_factors(geno, ref_path, out, *, sources=None, covar=None, keep=None, 
                 halves="least squares per person on the odd and on the even chromosomes (in genome order); sigma is "
                        "the symmetrized covariance between the halves' estimates",
                 loadings="(v_B, v_s - v_B, D_s D_t less its sampling covariance, twice for s < t) / s_j^2",
+                ld_mass=ld_info,
                 diagnostics=dict(between_chromosome_same_person_mass=realized,
                                  predicted_by_factors=predicted,
                                  share_predicted=predicted / realized if realized != 0 else None),

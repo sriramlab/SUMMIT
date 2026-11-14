@@ -525,7 +525,8 @@ def compose_ldscores(ref_path, sumstats, annot, out, *, sources=None, snps=None,
                      relatedness=None, relatedness_smooth=0.1, background_min_cm=3.0, background_window="panels",
                      nu=None, r2=0.99, grid_cm=0.02, cell_matrix=False,
                      cell_switch_cm=10.0, allow_flat_kernel_join=False, cross_source=None,
-                     sample_factors=None, sample_factors_calibrate=True, per_trait_n=True, n_tol=0.01,
+                     sample_factors=None, sample_factors_calibrate=True, calibrate_between_chromosomes=False,
+                     per_trait_n=True, n_tol=0.01,
                      pair_chunk=1 << 23, log=print):
     """Composed LD scores for an admixed GWAS sample with two or more sources (the last is the baseline of the
     contrasts). mean_ancestry: K-1 or K values (comma-separated); kappa0: the upper triangle of Kt_res(0) row by row.
@@ -1017,6 +1018,41 @@ def compose_ldscores(ref_path, sumstats, annot, out, *, sources=None, snps=None,
         if rel_prof is not None:
             relatedness_term(R1, rel_prof, chrom_out, cm_out, cls, Vpop, K, 1.0, grid_cm, scale=1.0)
     L_pop = L
+    mass_check = None
+    if sample_factors is not None and sfi.get("ld_mass"):
+        # the cohort's realized in-sample LD mass (total) against this composition for the statistic's own sample
+        n_sf, nu_sf = float(sfi["n_samples"]), float(sfi["nu"])
+        n_curve_c = int(curve_info["n_samples"]) if (R1 is not None and curve_info is not None
+                                                     and "n_samples" in curve_info) else None
+        f_sf = relatedness_scale(n_curve_c, n_sf) if (R1 is not None and n_curve_c) else rel_scale
+        L_sf = L_pop + sp * (nu / nu_sf) + (0.0 if R1 is None else (f_sf / nu_sf ** 2) * R1)
+        comp_tot = float((Vpop[:, None] * L_sf).sum())
+        m_ratio = M / float(sfi["n_snps"])
+        real_tot = float(sfi["ld_mass"]["total"]) * m_ratio ** 2
+        mass_check = dict(composed_total=comp_tot, realized_total=real_tot, ratio=comp_tot / real_tot,
+                          realized_between_chromosomes=float(sfi["ld_mass"]["between_chromosomes"]) * m_ratio ** 2)
+        log(f"[admixed-ld] compose: LD mass {comp_tot:.6g} for the sample factors' {n_sf:.0f} people, against their "
+            f"realized {real_tot:.6g} ({comp_tot / real_tot:.4f})")
+        if abs(comp_tot / real_tot - 1) > 0.05:
+            flags.append(dict(flag="ld_mass_differs_from_cohort", detail=f"composed / realized {comp_tot / real_tot:.4f}"))
+            log(f"[admixed-ld] WARNING (recorded flag ld_mass_differs_from_cohort): the composed LD mass is "
+                f"{comp_tot / real_tot:.3f} of the cohort's realized in-sample LD mass")
+        if calibrate_between_chromosomes:
+            # the remainder is put on pairs of SNPs on different chromosomes, uniformly per pair (as relatedness is):
+            # where unmodelled structure (a source the panels do not represent) shows
+            Vc_tot = np.bincount(cls, weights=Vpop, minlength=K)
+            uch = pd.unique(chrom_out)
+            Vc_chr = {c: np.bincount(cls[chrom_out == c], weights=Vpop[chrom_out == c], minlength=K) for c in uch}
+            Vchr = {c: float(Vpop[chrom_out == c].sum()) for c in uch}
+            pairs_btw = float(Vpop.sum() ** 2 - sum(v ** 2 for v in Vchr.values()))
+            cshift = (real_tot - comp_tot) / pairs_btw
+            shift = np.zeros((M, K))
+            for c in uch:
+                shift[chrom_out == c] = cshift * (Vc_tot - Vc_chr[c])[None, :]
+            L_pop = L_pop + shift
+            mass_check.update(between_chromosome_shift_per_pair=cshift, shift_mass=float(cshift * pairs_btw))
+            log(f"[admixed-ld] compose: between-chromosome LD shifted by {cshift:.4g} per V-weighted pair "
+                f"({cshift * pairs_btw:.6g} of mass) to the cohort's realized total")
     L = L_pop + sp + (0.0 if R1 is None else (rel_scale / nu ** 2) * R1)
     V = Vpop
     groups_info = None
@@ -1058,7 +1094,8 @@ def compose_ldscores(ref_path, sumstats, annot, out, *, sources=None, snps=None,
                   reference=dict(sources=ref.manifest["sources"], window_kb=ref.manifest["window_kb"],
                                  genetic_map=ref.manifest["genetic_map"]),
                   per_trait=None if per_trait is None else per_trait.to_dict(orient="records"),
-                  ld_mass=float((V[:, None] * L).sum()), sample_factors=sf_info, n_groups=groups_info, flags=flags)
+                  ld_mass=float((V[:, None] * L).sum()), sample_factors=sf_info, n_groups=groups_info,
+                  ld_mass_check=mass_check, flags=flags)
     if xs_i is not None:                                          # each SNP with itself: sqrt(V_1 V_2), V_2 = 1
         keep = v2_out > 0
         Lx[np.arange(M), cls] += np.sqrt(Vpop)
