@@ -496,22 +496,11 @@ def build_parser() -> argparse.ArgumentParser:
         type=str,
         choices=["ldsc", "score"],
         help=(
-            "Weights for estimating the overlapping covariance in HE scale from summary statistics: 'ldsc' "
-            "(default), LDSC's heteroskedasticity weights fitted once on the full sample and reused in every "
-            "jackknife replicate (1/l weights if that iteration fails); 'score', w_j = 1 / w_ld,j."
-        ),
-    )
-    cross.add_argument(
-        "--overlap-covariance-ld-point",
-        dest="intercept_ld_point",
-        default="self",
-        type=str,
-        choices=["self", "zero"],
-        help=(
-            "Without a supplied overlap, the overlapping covariance in HE scale is the value of the fitted line "
-            "of z1*z2 on the regression LD score at each SNP's own LD term ('self', default), the LD score of a "
-            "SNP that tags no other SNP. 'zero' reads the line at zero LD, which is right only when the LD scores "
-            "are computed over the causal variants or the causal variants are the GWAS SNPs themselves."
+            "Without a supplied overlap, the overlapping covariance in HE scale is the value of the fitted line of "
+            "z1*z2 on the regression LD score at each SNP's own LD term (the LD score of a SNP that tags no other "
+            "SNP). Weights for that fit: 'ldsc' (default), LDSC's heteroskedasticity weights fitted once on the "
+            "full sample and reused in every jackknife replicate (1/l weights if that iteration fails); 'score', "
+            "w_j = 1 / w_ld,j."
         ),
     )
     regression.add_argument("--weight-mode", default="he", type=str,
@@ -2218,7 +2207,6 @@ def _dispatch_rg(args, log):
         pheno_rg_missing_values=args.pheno_rg_missing_values,
         pheno_rg_cov_missing_values=args.pheno_rg_cov_missing_values,
         intercept_weight_mode=args.intercept_weight_mode,
-        intercept_ld_point=args.intercept_ld_point,
         chisq_action=args.chisq_action,
         log=log,
         verbose=args.verbose,
@@ -2733,7 +2721,6 @@ def _dispatch_rg_manifest(args, log):
             rg_se_method=args.rg_se_method,
             intercept_chisq_thr=args.intercept_chisq_thr,
             intercept_weight_mode=args.intercept_weight_mode,
-            intercept_ld_point=args.intercept_ld_point,
             intercept_rg=row_intercept,
             intercept_rg_source="manifest",
             rel_m12=(None if row.rel_m12 is None or (isinstance(row.rel_m12, float) and np.isnan(row.rel_m12))
