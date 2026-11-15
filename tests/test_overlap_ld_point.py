@@ -137,13 +137,15 @@ def test_self_reads_the_line_at_the_own_term(weights):
     np.testing.assert_allclose(_fit(tv, jk, ss, ss, intercept_weight_mode=weights).c_reps, 1.0, atol=1e-10)
 
 
-def test_supplied_overlap_is_unchanged_bitwise():
+def test_supplied_overlap_is_unchanged():
+    """The supplied-overlap path is untouched: the replicates equal origin/main 97307e4's (bitwise on the platform that
+    recorded them; to 1e-12 here, since BLAS builds differ in the last bits)."""
     tv, jk, s1, s2, h1, h2, p = _legacy_fixture()
     fx = fit_intercept(tv, s1, s2, jk, h1, h2, fixed_c=0.21)
     np.testing.assert_array_equal(fx.c_reps, 0.21)
     f = fit_rg(p, h1, h2, fx)
-    assert [float(v).hex() for v in f.gamma_reps[:, 0]] == LEGACY_FIXED_GAMMA
-    assert [float(v).hex() for v in f.rg_reps[:, 0]] == LEGACY_FIXED_RG
+    np.testing.assert_allclose(f.gamma_reps[:, 0], [float.fromhex(v) for v in LEGACY_FIXED_GAMMA], rtol=1e-12, atol=0)
+    np.testing.assert_allclose(f.rg_reps[:, 0], [float.fromhex(v) for v in LEGACY_FIXED_RG], rtol=1e-12, atol=0)
 
 
 @pytest.mark.parametrize("weights", ["score", "ldsc"])
@@ -192,3 +194,25 @@ def test_nonfinite_own_terms_leave_the_fit():
 def test_cli_default_weights():
     from summit.cli import build_parser
     assert build_parser().parse_args([]).intercept_weight_mode == "ldsc"
+
+
+def test_replicate_that_cannot_identify_the_overlap_keeps_the_full_sample_value():
+    """A delete-block replicate that leaves a single SNP in the overlap regression cannot separate the overlap from the
+    slope (its denominator is zero up to rounding). It is held at the full-sample value on every platform, rather than
+    taking a quotient of rounding errors."""
+    tv, jk = _trace(nblocks=4)
+    l = tv.ldscores[:, 0]
+    rng = np.random.default_rng(8)
+    ss = _matched(tv, np.sqrt(1.0 + 0.05 * (l - 1.0)) * (1.0 + 0.01 * rng.standard_normal(M)))
+    unit = np.asarray(jk.unit_id)
+    keep_one = np.flatnonzero(unit != unit[0])[:1]                    # outside block 0: a single SNP
+    big = np.zeros(M, bool)
+    big[unit == unit[0]] = True
+    big[keep_one] = True
+    z = np.where(big, ss.z, 50.0)                                      # the chi^2 filter drops all other SNPs
+    ss = MatchedSumstats(snps=ss.snps, n=ss.n, nsamp=ss.nsamp, n_scale=ss.n_scale, z=z, chi2=z * z, beta=ss.beta,
+                         se=ss.se, a1=ss.a1, a2=ss.a2, cov_rank=0, cov_rank_source="test", name="t")
+    for weights in ("score", "ldsc"):
+        fit = _fit(tv, jk, ss, ss, intercept_weight_mode=weights, intercept_chisq_threshold=30.0)
+        assert np.isfinite(fit.c_reps).all()
+        assert fit.info["n_reps_overlap_held_at_full_sample"] >= 1

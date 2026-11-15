@@ -1858,12 +1858,13 @@ def _solve_constrained_intercept_from_sums(
             + np.einsum("ri,rij,rj->r", delta, XXW, delta)
         )
 
-        if denom_floor is not None:
-            denom_floor = float(denom_floor)
-            if np.isfinite(denom_floor) and denom_floor > 0.0:
-                den = np.where(np.isfinite(den) & (den > 0.0), np.maximum(den, denom_floor), den)
-
-        good = good & np.isfinite(num) & np.isfinite(den) & (den > 0.0)
+        # A denominator at or below the floor (e.g. a delete-block replicate that leaves too few SNPs to separate the
+        # overlap from the slope) does not identify c; it is reported as such rather than raised to the floor, whose
+        # quotient would depend only on rounding.
+        floor = float(denom_floor) if denom_floor is not None else 0.0
+        if not (np.isfinite(floor) and floor > 0.0):
+            floor = 0.0
+        good = good & np.isfinite(num) & np.isfinite(den) & (den > floor)
         if np.any(good):
             c[good] = num[good] / den[good]
             beta[good] = alpha[good] - c[good, None] * delta[good]
@@ -2419,6 +2420,21 @@ def fit_intercept(
                 log._log(f"[rg:c] LDSC-style overlap-covariance weights failed ({exc}); using 1/l weights.")
     info["weight_mode"] = mode_used
 
+    # A delete-block replicate whose retained SNPs cannot identify the overlap is held at the full-sample value
+    # (the block's own information on c is then not propagated); with genome-wide SNP sets this does not arise.
+    held = ~np.isfinite(c_reps[:R]) | ~np.isfinite(beta_reps[:R]).all(axis=1)
+    info["n_reps_overlap_held_at_full_sample"] = int(np.sum(held))
+    if np.any(held):
+        c_reps = c_reps.copy()
+        beta_reps = beta_reps.copy()
+        c_reps[:R][held] = c_reps[-1]
+        beta_reps[:R][held] = beta_reps[-1]
+        if log is not None:
+            log._log(
+                f"[rg:c] {int(np.sum(held))}/{R} jackknife replicate(s) retain too few SNPs to estimate the overlapping "
+                "covariance; they keep the full-sample value."
+            )
+
     est, se = jackknife.summarize(
         c_reps,
         unit_sizes=unit_sizes,
@@ -2510,11 +2526,12 @@ def fit_intercept(
             )
 
     if log is not None:
-        n_bad = int(np.sum(~np.isfinite(c_reps[:R])))
+        n_held = info["n_reps_overlap_held_at_full_sample"]
         weights = "LDSC-style" if mode_used == "ldsc" else "1/l"
         log._log(
             f"[rg:c] overlapping covariance in HE scale from summary statistics: c={c[0]:.6g} (SE: {c[1]:.6g}), "
-            f"the fitted line read at each SNP's own LD term, {weights} weights, bad_reps={n_bad}/{R}."
+            f"the fitted line read at each SNP's own LD term, {weights} weights, replicates held at the full-sample "
+            f"value={n_held}/{R}."
         )
 
     return InterceptFit(
