@@ -149,6 +149,48 @@ def _open_text_maybe_gzip(file_path, mode="rt"):
     return open(path, mode)
 
 
+SNP_METADATA_COLUMNS = ("CHR", "BP", "SNP", "CM")
+
+
+def _snp_metadata_rule(required=("CHR", "BP", "SNP")) -> str:
+    req = ", ".join(required)
+    return (f"the metadata block is the leading run of columns named CHR, BP, SNP and CM, in any order "
+            f"({req} required, the others optional); every other column follows it")
+
+
+def _split_snp_metadata(columns, *, source, required=("CHR", "BP", "SNP"), allow_thin=False):
+    """Split an LD-score or annotation header into its metadata block and its data columns, by name.
+
+    The metadata block is the leading run of columns named CHR, BP, SNP or CM, in any order; `required` must all be
+    in it (CM is optional). Data columns are everything after the block. A metadata name after the first data
+    column, a duplicated metadata name (also as pandas' ``SNP.1`` renaming) or a missing required name is malformed.
+    With ``allow_thin``, a header without any metadata name is a thin matrix: ``([], columns)``.
+    Returns (metadata columns in file order, data columns in file order).
+    """
+    cols = [str(c) for c in columns]
+    names = set(SNP_METADATA_COLUMNS)
+    dup = sorted({c for c in cols if c in names and cols.count(c) > 1}
+                 | {c.split(".")[0] for c in cols if re.fullmatch(r"(CHR|BP|SNP|CM)\.\d+", c)})
+    if dup:
+        raise ValueError(f"Malformed {source} metadata: duplicated column(s) {dup}; {_snp_metadata_rule(required)}.")
+    k = 0
+    while k < len(cols) and cols[k] in names:
+        k += 1
+    meta, data = cols[:k], cols[k:]
+    late = [c for c in data if c in names]
+    if late:
+        raise ValueError(
+            f"Malformed {source} metadata: {late} after the first data column '{data[0]}'; "
+            f"{_snp_metadata_rule(required)}."
+        )
+    if not meta and allow_thin:
+        return [], data
+    missing = [c for c in required if c not in meta]
+    if missing:
+        raise ValueError(f"Malformed {source} metadata: missing {missing}; {_snp_metadata_rule(required)}.")
+    return meta, data
+
+
 def _read_with_optional_header(file_path):
     paths = _resolve_chr_split_paths(file_path, require=True)
     if len(paths) == 1 and not _is_chr_split_spec(file_path):

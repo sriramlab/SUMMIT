@@ -244,19 +244,8 @@ def read_aligned_annotations(
         paths[0], sep=r"\s+", compression="infer", nrows=0
     )
     cols = probe.columns.tolist()
-    first4 = cols[:4]
-    required = {"CHR", "BP", "SNP"}
-    is_full = required.issubset(set(first4))
-    if (not is_full) and required.intersection(set(cols)):
-        raise ValueError(
-            "Malformed annotation metadata: a full annotation must contain CHR, BP, SNP "
-            "in its first columns (and optional CM as the 4th column)."
-        )
-    if "CM" in cols and (len(first4) < 4 or first4[3] != "CM"):
-        raise ValueError(
-            "Malformed annotation metadata: CM is reserved for the optional "
-            "4th metadata column."
-        )
+    meta, annot_cols = utils._split_snp_metadata(cols, source=f"annotation '{annot_path}'", allow_thin=True)
+    is_full = bool(meta)
 
     if is_full:
         df = utils._read_csv_maybe_chr_split(
@@ -265,8 +254,6 @@ def read_aligned_annotations(
             compression="infer",
             index_col=False,
         )
-        start = 4 if "CM" in first4 else 3
-        annot_cols = [str(c) for c in cols[start:]]
         if not annot_cols:
             raise ValueError("Annotation file contains no annotation columns.")
         ann = validate_variant_metadata(

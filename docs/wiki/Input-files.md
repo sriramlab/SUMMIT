@@ -97,8 +97,12 @@ for the quantitative Python interface.
 
 ## LD scores and annotations
 
-LD-score files begin with `CHR SNP BP`, optionally `CM`, then an optional
-`V` column, the LD-score columns, and optional `LD_REL_<column>` columns. V
+LD-score and annotation files begin with a block of metadata columns named
+`CHR`, `BP`, `SNP` and, optionally, `CM`, in any order (LDSC and PLINK layouts
+such as `CHR SNP CM BP` work as is); they are matched by name. LD-score files
+then have an optional `V` column, the LD-score columns, and optional
+`LD_REL_<column>` columns. A metadata name after the first data column, a
+missing `CHR`, `BP` or `SNP`, or a repeated metadata name is an error. V
 marks LD scores that weight each SNP by its share of variance left after
 covariate adjustment ([LD scores](LD-scores.md#covariates-and-snp-variance-weights)). LD_REL holds the
 related pairs' share of each LD score ([Related individuals](Related-individuals.md#ld-scores)).
@@ -106,7 +110,8 @@ Files without these columns are fitted as before. `V` and names beginning with
 `LD_REL` are reserved and cannot be annotation names. An annotation file
 contains either:
 
-- `CHR BP SNP`, optional `CM`, and named annotation columns; or
+- the metadata block (`CHR`, `BP`, `SNP`, optional `CM`, in any order) and
+  named annotation columns; or
 - a numeric matrix with one row per input SNP, optionally headed by column names.
 
 Row order must match the genotype or LD-score SNP order. Omit `--annot` for a

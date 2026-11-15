@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import os
 
+from .. import utils
 import numpy as np
 import pandas as pd
 from bed_reader import to_bed
@@ -195,7 +196,7 @@ def merge_markers(geno: str, markers: str, annot: str, out: str, log=print) -> d
     fs.to_csv(out + ".fam", sep=" ", header=False, index=False)
 
     an = pd.read_csv(annot, sep=r"\s+", dtype={"SNP": str})
-    classes = [c for c in an.columns if c not in ("CHR", "BP", "SNP", "CM")]
+    _, classes = utils._split_snp_metadata(an.columns, source=f"annotation '{annot}'", required=("SNP",))
     pos = pd.Index(an["SNP"]).get_indexer(bs[1])
     if (pos < 0).any():
         raise ValueError(f"{(pos < 0).sum()} SNPs of {geno}.bim are missing from {annot}.")
