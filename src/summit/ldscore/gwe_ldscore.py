@@ -1539,11 +1539,13 @@ class GenomewideEnvLDScore:
             dtype={"CHR": str, "SNP": str},
             float_precision="round_trip",
         )
-        base_cols = {"CHR", "BP", "SNP", "CM"}
-        if {"CHR", "BP", "SNP"}.issubset(set(df.columns)):
+        meta_cols, data_cols = utils._split_snp_metadata(
+            df.columns, source=f"annotation '{annot_path}'", allow_thin=True
+        )
+        if meta_cols:
             if df["SNP"].duplicated().any():
                 raise ValueError("Annotation file contains duplicate SNP identifiers.")
-            annot_cols = [c for c in df.columns if c not in base_cols]
+            annot_cols = list(data_cols)
             if len(annot_cols) == 0:
                 raise ValueError("No annotation columns found after CHR/SNP/BP metadata columns.")
             if len(set(annot_cols)) != len(annot_cols):

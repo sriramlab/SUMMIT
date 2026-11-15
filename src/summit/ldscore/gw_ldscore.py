@@ -1183,6 +1183,28 @@ def read_cov(
     return C, R, keep_idx_global
 
 
+def write_gw_ldscore_table(outpath, snpdf, scores_df, *, snp_var=None, ld_rel=None):
+    """Write `<outpath>.gw.ldscore.gz`: CHR SNP BP, V (when given), one column per annotation, and LD_REL_<column>
+    (when given), tab-separated with six decimals. `snpdf` and `scores_df` share a row index."""
+    parts = [snpdf]
+    if snp_var is not None:
+        parts.append(pd.DataFrame({"V": snp_var}))
+    parts.append(scores_df)
+    if ld_rel is not None:
+        parts.append(pd.DataFrame(ld_rel, columns=[f"LD_REL_{c}" for c in scores_df.columns]))
+    out_df = pd.concat(parts, axis=1)
+    out_df.to_csv(f'{outpath}.gw.ldscore.gz', index=False, compression='gzip', sep='\t', float_format='%.6f')
+    return f'{outpath}.gw.ldscore.gz'
+
+
+def write_gw_annotation_masses(outpath, masses):
+    """Write `<outpath>.gw.M`, the annotation masses (one line, tab-separated)."""
+    out_M = f"{outpath}.gw.M"
+    with open(out_M, "w") as fout:
+        fout.write("\t".join(f"{float(x):.10g}" for x in masses) + "\n")
+    return out_M
+
+
 class GenomewideLDScore:
     def __init__(self,
                 bed_path,
@@ -2212,14 +2234,7 @@ class GenomewideLDScore:
             self.snpdf.columns = snpcols
 
         scores_df = pd.DataFrame(self.gwldscore, columns=self.l2cols)
-        parts = [self.snpdf]
-        if self.snp_var is not None:
-            parts.append(pd.DataFrame({"V": self.snp_var}))
-        parts.append(scores_df)
-        if self.ld_rel is not None:
-            parts.append(pd.DataFrame(self.ld_rel, columns=[f"LD_REL_{c}" for c in self.l2cols]))
-        out_df = pd.concat(parts, axis=1)
-        out_df.to_csv(f'{self.outpath}.gw.ldscore.gz', index=False, compression='gzip', sep='\t', float_format='%.6f')
+        write_gw_ldscore_table(self.outpath, self.snpdf, scores_df, snp_var=self.snp_var, ld_rel=self.ld_rel)
 
         if self.estimate_mc_noise:
             integrated_var = self._ld_mc_integrated_variance
@@ -2316,10 +2331,8 @@ class GenomewideLDScore:
                     f"[mc] Saved optional per-SNP MC variances, SEs, and "
                     f"pointwise 95% conditional MC intervals to: {mc_var_out}"
                 )
-        out_M = f"{self.outpath}.gw.M"
         masses = self.nsnps_bin if self.annot_mass is None else self.annot_mass
-        with open(out_M, "w") as fout:
-            fout.write("\t".join(f"{float(x):.10g}" for x in masses) + "\n")
+        out_M = write_gw_annotation_masses(self.outpath, masses)
         self.log._log(f"Saved fixed reference annotation masses to: {out_M}")
 
         if trace_k2_from_ldscore is not None and self.write_kmoments:

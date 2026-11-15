@@ -821,9 +821,10 @@ def test_sumcore_ldsc_rg_uses_summary_overlap_covariance_delete_refits(tmp_path)
     h2_fit2 = forward["h2_fit2"]
 
     # --weight-mode ldsc changes h2/covariance weighting, not SUMMIT's
-    # overlap-covariance refit semantics. No supplied c_ov was provided here.
+    # overlap-covariance refit semantics (its own LDSC-style weights by default,
+    # refitted in every delete-block replicate). No supplied c_ov was provided here.
     assert intercept.info.get("fixed", False) is False
-    assert intercept.info["weight_mode"] == "score"
+    assert intercept.info["weight_mode"] == "ldsc"
     assert rg_fit.weight_info["intercept_fixed"] is False
     assert rg_fit.weight_info["intercept_replicates"] == "summit_delete_refits"
     assert rg_fit.weight_info["overlap_covariance_supplied"] is False

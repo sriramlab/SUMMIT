@@ -1576,12 +1576,7 @@ def _select_intercept_weight_ld(trace_view, regsys: InterceptRegressionSystem, *
             )
         return np.asarray(w, dtype=np.float64, order="C"), str(source or "reg-w")
 
-    if log is not None and mode == "ldsc":
-        log._log(
-            "[rg:c] no ldscores_reg_w provided; scalar LDSC-weighted overlap-covariance regression "
-            "falls back to the legacy total regression LD weights."
-        )
-    return np.asarray(regsys.total_ld, dtype=np.float64, order="C"), "fallback-total-ld"
+    return np.asarray(regsys.total_ld, dtype=np.float64, order="C"), "total-regression-ld"
 
 
 def _make_intercept_keep_mask(
@@ -1948,18 +1943,6 @@ def _score_gamma_total_from_c(prepared: RGPrepared, c, *, rep_index: int):
     return float(np.nansum(gamma))
 
 
-def _replicate_active_mask(jackknife, keep, rep_index: int) -> np.ndarray:
-    keep = np.asarray(keep, dtype=bool)
-    rep_index = int(rep_index)
-    if rep_index == int(jackknife.nrep):
-        return keep
-    unit_id = np.asarray(jackknife.unit_id, dtype=np.int64)
-    D = np.asarray(jackknife.D, dtype=np.float64)
-    if D.shape[0] != int(jackknife.nrep) or unit_id.size != keep.size:
-        raise ValueError("Jackknife replicate mask shape mismatch.")
-    return keep & (D[rep_index, unit_id] < 0.5)
-
-
 def _ldsc_gencov_weights_1d(
     ld,
     w_ld,
@@ -2024,6 +2007,91 @@ def _ldsc_gencov_weights_1d(
     if not np.isfinite(w).all():
         raise ValueError("Non-finite LDSC overlap-covariance weights encountered.")
     return w
+
+
+OVERLAP_LD_POINTS = ("self", "zero")
+
+
+def _normalize_overlap_ld_point(ld_point) -> str:
+    mode = str(ld_point).strip().lower()
+    if mode not in OVERLAP_LD_POINTS:
+        raise ValueError(f"overlap-covariance LD point must be one of {OVERLAP_LD_POINTS}; got {ld_point!r}")
+    return mode
+
+
+def _overlap_own_ld(trace_view, regsys: InterceptRegressionSystem) -> np.ndarray:
+    """Each SNP's own term in each column of the overlap regression's LD design, shape (M, P).
+
+    A primary LD score counts the SNP with itself in its own annotation column, weighted by the annotation and by its
+    SNP-variance weight V when the file has a V column (the trace annotation already carries both; for cross scores
+    V is sqrt(V1 V2)). Collapsed columns sum. A separate --ldscores-reg file holds plain r^2 sums over disjoint
+    columns: its own term is 1.
+    """
+    M = int(trace_view.nsnps)
+    P = int(regsys.x.shape[1])
+    if regsys.source != "main":
+        return np.ones((M, P), dtype=np.float64)
+    A = np.asarray(trace_view.annot, dtype=np.float64).reshape(M, -1)
+    if A.shape[1] == P:
+        return A
+    return A.sum(axis=1, keepdims=True)
+
+
+def _ldsc_overlap_weights(
+    score_prepared,
+    *,
+    c_start,
+    x,
+    y,
+    keep,
+    overlap_scale,
+    noise1,
+    noise2,
+    total_ld,
+    weight_ld,
+    n1,
+    n2,
+    m_tot,
+    h1,
+    h2,
+    sums,
+    n_iter,
+    intercept_hsq1,
+    intercept_hsq2,
+    intercept_hsq_floor,
+    intercept_weight_floor,
+):
+    """LDSC heteroskedasticity weights by IRWLS on the full sample (as LDSC: the jackknife then reuses them).
+
+    Plug-ins: both h2 totals and the HE genetic covariance at the current overlapping covariance.
+    """
+    if int(n_iter) < 1:
+        raise ValueError("LDSC-style overlap weights need at least one IRWLS update.")
+    m_full, S_full, t_full = sums
+    c_full = float(c_start)
+    nvec1 = np.full(total_ld.size, float(n1))
+    nvec2 = np.full(total_ld.size, float(n2))
+    h1 = float(np.clip(h1, 0.0, 1.0))
+    h2 = float(np.clip(h2, 0.0, 1.0))
+    w = None
+    for _ in range(int(n_iter)):
+        rho = _score_gamma_total_from_c(score_prepared, c_full, rep_index=-1)
+        if not np.isfinite(rho):
+            raise RuntimeError("no finite plug-in genetic covariance for the LDSC weights")
+        w = _ldsc_gencov_weights_1d(
+            ld=total_ld, w_ld=weight_ld, n1=nvec1, n2=nvec2, m_tot=m_tot, h1=h1, h2=h2, rho_g=rho,
+            intercept_gencov=c_full * overlap_scale, intercept_hsq1=intercept_hsq1 * noise1,
+            intercept_hsq2=intercept_hsq2 * noise2, intercept_hsq_floor=intercept_hsq_floor,
+            weight_floor=intercept_weight_floor,
+        )
+        w = np.where(keep, w, 0.0)
+        c_new, _, ok = _solve_constrained_intercept_from_sums(
+            m_full, S_full, t_full, *_compute_weighted_intercept_summaries(x, y, w, overlap_scale), denom_floor=0.0
+        )
+        if not ok:
+            raise RuntimeError("LDSC-weight update failed on the full sample")
+        c_full = float(c_new)
+    return w, {"h1_plugin": h1, "h2_plugin": h2, "irwls_iters": int(n_iter)}
 
 
 def _make_fixed_intercept_fit(
@@ -2125,9 +2193,21 @@ def fit_intercept(
     log=None,
     jack_mode: str = "mean",
     nan_policy: str = "omit",
+    ld_point: str = "self",
     **_unused_kwargs,
 ) -> InterceptFit:
+    """Overlapping covariance in HE scale: supplied (fixed_c), or estimated from the summary statistics.
+
+    The estimate is the value of the fitted line y_j = c b_j + beta'(x_j - s_j) at a SNP's own LD term s_j, i.e. at
+    the LD score of a SNP that tags no other SNP (ld_point 'self'; 'zero' reads the line at zero LD). With causal
+    variants denser than the GWAS SNPs, a SNP's own term carries little of the genetic signal, so the line passes
+    through the overlapping covariance there. The slope is tied to the HE sum (unweighted residuals sum to zero),
+    the weights are LDSC's heteroskedasticity weights fitted once on the full sample ('ldsc') or 1/l ('score'), and
+    every delete-block replicate is refitted with those weights. If the LDSC-weight iteration fails, 1/l weights are
+    used and the fallback is logged.
+    """
     _validate_common_axis(trace_view, matched1, matched2, jackknife)
+    ld_point = _normalize_overlap_ld_point(ld_point)
     if fixed_c is not None:
         return _make_fixed_intercept_fit(
             trace_view,
@@ -2216,11 +2296,23 @@ def fit_intercept(
         chisq_mode=chisq_mode,
     )
 
+    # Reading point: one shift of the regression design (the weights keep the full LD score).
+    if ld_point == "self":
+        own = _overlap_own_ld(trace_view, regsys)
+        bad = keep & ~np.isfinite(own).all(axis=1)
+        if np.any(bad):
+            keep = keep & ~bad
+            info["n_kept"] = int(np.sum(keep))
+            info["n_removed"] = int(np.sum(~keep))
+        info["n_removed_nonfinite_own_ld"] = int(np.sum(bad))
+        x = x - np.where(keep[:, None], own, 0.0)
+
     info["ld_source"] = regsys.source
     info["weight_ld_source"] = weight_ld_source
     info["regression_design_mode"] = regsys.mode
     info["regression_ncoef"] = P
-    info["weight_mode"] = mode
+    info["weight_mode_requested"] = mode
+    info["ld_point"] = ld_point
     info["fixed"] = False
     info["source"] = "summit_intercept_regression"
     info["overlap_covariance_mode"] = "summary_only"
@@ -2291,218 +2383,55 @@ def fit_intercept(
             "Overlap-covariance regression retained zero score-side mass after filtering."
         )
 
-    w_score = _build_simple_intercept_weights(weight_ld, keep)
-    W_u0, XW_u0, XXW_u0, Sy_u0, XWy_u0 = _compute_weighted_intercept_unit_summaries(
-        jackknife,
-        x,
-        y,
-        w_score,
-        overlap_scale,
-    )
-    W_rep0 = _stack_delete_replicates(np.sum(W_u0, dtype=np.float64), W_u0, D)
-    XW_rep0 = _stack_delete_replicates(np.sum(XW_u0, axis=0, dtype=np.float64), XW_u0, D)
-    XXW_rep0 = _stack_delete_replicates(np.sum(XXW_u0, axis=0, dtype=np.float64), XXW_u0, D)
-    Sy_rep0 = _stack_delete_replicates(np.sum(Sy_u0, dtype=np.float64), Sy_u0, D)
-    XWy_rep0 = _stack_delete_replicates(np.sum(XWy_u0, axis=0, dtype=np.float64), XWy_u0, D)
-
-    den0 = _full_intercept_denominator(m_full, S_full, W_rep0[-1], XW_rep0[-1], XXW_rep0[-1])
     floor_rel = float(denom_floor_rel)
     if not (np.isfinite(floor_rel) and floor_rel >= 0.0):
         floor_rel = 1e-12
-    denom_floor0 = 0.0 if not np.isfinite(den0) else max(floor_rel * max(float(den0), 1.0), 0.0)
 
-    c_reps, beta_reps, good0 = _solve_constrained_intercept_from_sums(
-        m_rep,
-        S_rep,
-        t_rep,
-        W_rep0,
-        XW_rep0,
-        XXW_rep0,
-        Sy_rep0,
-        XWy_rep0,
-        denom_floor=denom_floor0,
-    )
+    def _solve_all(w):
+        """Full sample and every delete-block replicate with fixed weights w."""
+        W_u, XW_u, XXW_u, Sy_u, XWy_u = _compute_weighted_intercept_unit_summaries(
+            jackknife, x, y, w, overlap_scale
+        )
+        W_rep = _stack_delete_replicates(np.sum(W_u, dtype=np.float64), W_u, D)
+        XW_rep = _stack_delete_replicates(np.sum(XW_u, axis=0, dtype=np.float64), XW_u, D)
+        XXW_rep = _stack_delete_replicates(np.sum(XXW_u, axis=0, dtype=np.float64), XXW_u, D)
+        Sy_rep = _stack_delete_replicates(np.sum(Sy_u, dtype=np.float64), Sy_u, D)
+        XWy_rep = _stack_delete_replicates(np.sum(XWy_u, axis=0, dtype=np.float64), XWy_u, D)
+        den = _full_intercept_denominator(m_full, S_full, W_rep[-1], XW_rep[-1], XXW_rep[-1])
+        floor = 0.0 if not np.isfinite(den) else max(floor_rel * max(float(den), 1.0), 0.0)
+        return _solve_constrained_intercept_from_sums(
+            m_rep, S_rep, t_rep, W_rep, XW_rep, XXW_rep, Sy_rep, XWy_rep, denom_floor=floor
+        )
+
+    w_score = _build_simple_intercept_weights(weight_ld, keep)
+    c_reps, beta_reps, good0 = _solve_all(w_score)
     if not bool(good0[-1]):
         raise RuntimeError("Failed to initialize constrained overlap-covariance fit.")
 
-    w_final_full = w_score
-
+    mode_used = "score"
+    info["irwls_iters"] = 0
     if mode == "ldsc":
-        n_iter = int(irwls_iters)
-        if n_iter < 0:
-            raise ValueError("irwls_iters must be >= 0.")
-        if not (
-            np.isfinite(n1_scalar) and np.isfinite(n2_scalar) and n1_scalar > 0.0 and n2_scalar > 0.0
-        ):
-            raise RuntimeError(
-                f"Invalid n_scale values for overlap-covariance IRWLS: "
-                f"n1={n1_scalar}, n2={n2_scalar}."
+        try:
+            h1_tot = float(np.asarray(h2_fit1.h2_reps)[-1, -1])
+            h2_tot = float(np.asarray(h2_fit2.h2_reps)[-1, -1])
+            w_ldsc, ldsc_info = _ldsc_overlap_weights(
+                score_prepared_local, c_start=float(c_reps[-1]), x=x, y=y, keep=keep,
+                overlap_scale=overlap_scale, noise1=noise1, noise2=noise2, total_ld=total_ld,
+                weight_ld=weight_ld, n1=n1_scalar, n2=n2_scalar, m_tot=m_tot_weight, h1=h1_tot, h2=h2_tot,
+                sums=(m_full, S_full, t_full), n_iter=irwls_iters, intercept_hsq1=intercept_hsq1,
+                intercept_hsq2=intercept_hsq2, intercept_hsq_floor=intercept_hsq_floor,
+                intercept_weight_floor=intercept_weight_floor,
             )
-
-        h1_tot_reps = np.asarray(h2_fit1.h2_reps[:, -1], dtype=np.float64)
-        h2_tot_reps = np.asarray(h2_fit2.h2_reps[:, -1], dtype=np.float64)
-        if h1_tot_reps.shape != (R + 1,) or h2_tot_reps.shape != (R + 1,):
-            raise ValueError("h2 jackknife replicate shape mismatch with rg overlap-covariance replicates.")
-
-        n1_vec = np.full(total_ld.size, n1_scalar, dtype=np.float64)
-        n2_vec = np.full(total_ld.size, n2_scalar, dtype=np.float64)
-
-        c_full = float(c_reps[-1])
-        beta_full = np.asarray(beta_reps[-1], dtype=np.float64).copy()
-        h1_plugin = float(np.clip(h1_tot_reps[-1], 0.0, 1.0))
-        h2_plugin = float(np.clip(h2_tot_reps[-1], 0.0, 1.0))
-
-        for _ in range(n_iter):
-            rho_full = _score_gamma_total_from_c(score_prepared_local, c_full, rep_index=R)
-            if not np.isfinite(rho_full):
-                raise RuntimeError(
-                    "Failed to obtain a finite full-sample SCORE plug-in gamma_g for "
-                    "LDSC-IRWLS overlap-covariance weighting."
-                )
-            w_cur = _ldsc_gencov_weights_1d(
-                ld=total_ld,
-                w_ld=weight_ld,
-                n1=n1_vec,
-                n2=n2_vec,
-                m_tot=m_tot_weight,
-                h1=h1_plugin,
-                h2=h2_plugin,
-                rho_g=rho_full,
-                intercept_gencov=c_full * overlap_scale,
-                intercept_hsq1=intercept_hsq1 * noise1,
-                intercept_hsq2=intercept_hsq2 * noise2,
-                intercept_hsq_floor=intercept_hsq_floor,
-                weight_floor=intercept_weight_floor,
-            )
-            w_cur = np.where(keep, w_cur, 0.0)
-            Wf, XWf, XXWf, Syf, XWyf = _compute_weighted_intercept_summaries(x, y, w_cur, overlap_scale)
-            c_new, beta_new, ok = _solve_constrained_intercept_from_sums(
-                m_full,
-                S_full,
-                t_full,
-                Wf,
-                XWf,
-                XXWf,
-                Syf,
-                XWyf,
-                denom_floor=0.0,
-            )
-            if not ok:
-                raise RuntimeError("LDSC-IRWLS overlap-covariance update failed on the full sample.")
-            c_full = float(c_new)
-            beta_full = np.asarray(beta_new, dtype=np.float64)
-            w_final_full = w_cur
-
-        den_full = _full_intercept_denominator(m_full, S_full, Wf, XWf, XXWf)
-        denom_floor_full = 0.0 if not np.isfinite(den_full) else max(floor_rel * max(float(den_full), 1.0), 0.0)
-        c_fin, beta_fin, ok = _solve_constrained_intercept_from_sums(
-            m_full,
-            S_full,
-            t_full,
-            Wf,
-            XWf,
-            XXWf,
-            Syf,
-            XWyf,
-            denom_floor=denom_floor_full,
-        )
-        if not ok:
-            raise RuntimeError("Final constrained full-sample overlap-covariance solve failed.")
-        c_reps[-1] = float(c_fin)
-        beta_reps[-1] = np.asarray(beta_fin, dtype=np.float64)
-
-        for r in range(R):
-            active = _replicate_active_mask(jackknife, keep, r)
-            if int(np.sum(active)) <= 1:
-                c_reps[r] = np.nan
-                beta_reps[r] = np.nan
-                continue
-
-            h1_r = float(np.clip(h1_tot_reps[r], 0.0, 1.0))
-            h2_r = float(np.clip(h2_tot_reps[r], 0.0, 1.0))
-            if not (np.isfinite(h1_r) and np.isfinite(h2_r)):
-                c_reps[r] = np.nan
-                beta_reps[r] = np.nan
-                continue
-
-            c_r = float(c_reps[r]) if np.isfinite(c_reps[r]) else float(c_reps[-1])
-            beta_r = np.asarray(beta_reps[r], dtype=np.float64)
-            if beta_r.shape != (P,) or not np.isfinite(beta_r).all():
-                beta_r = np.asarray(beta_reps[-1], dtype=np.float64).copy()
-
-            W_last = XW_last = XXW_last = Sy_last = XWy_last = None
-            for _ in range(n_iter):
-                rho_r = _score_gamma_total_from_c(score_prepared_local, c_r, rep_index=r)
-                if not np.isfinite(rho_r):
-                    c_r = np.nan
-                    beta_r[:] = np.nan
-                    W_last = None
-                    break
-                w_r = _ldsc_gencov_weights_1d(
-                    ld=total_ld,
-                    w_ld=weight_ld,
-                    n1=n1_vec,
-                    n2=n2_vec,
-                    m_tot=m_tot_weight,
-                    h1=h1_r,
-                    h2=h2_r,
-                    rho_g=rho_r,
-                    intercept_gencov=c_r * overlap_scale,
-                    intercept_hsq1=intercept_hsq1 * noise1,
-                    intercept_hsq2=intercept_hsq2 * noise2,
-                    intercept_hsq_floor=intercept_hsq_floor,
-                    weight_floor=intercept_weight_floor,
-                )
-                w_r = np.where(active, w_r, 0.0)
-                W_last, XW_last, XXW_last, Sy_last, XWy_last = _compute_weighted_intercept_summaries(x, y, w_r, overlap_scale)
-                c_new, beta_new, ok = _solve_constrained_intercept_from_sums(
-                    m_rep[r],
-                    S_rep[r],
-                    t_rep[r],
-                    W_last,
-                    XW_last,
-                    XXW_last,
-                    Sy_last,
-                    XWy_last,
-                    denom_floor=0.0,
-                )
-                if not ok:
-                    c_r = np.nan
-                    beta_r[:] = np.nan
-                    W_last = None
-                    break
-                c_r = float(c_new)
-                beta_r = np.asarray(beta_new, dtype=np.float64)
-
-            if W_last is not None and np.isfinite(c_r) and np.isfinite(beta_r).all():
-                den_r = _full_intercept_denominator(m_rep[r], S_rep[r], W_last, XW_last, XXW_last)
-                denom_floor_r = 0.0 if not np.isfinite(den_r) else max(floor_rel * max(float(den_r), 1.0), 0.0)
-                c_fin, beta_fin, ok = _solve_constrained_intercept_from_sums(
-                    m_rep[r],
-                    S_rep[r],
-                    t_rep[r],
-                    W_last,
-                    XW_last,
-                    XXW_last,
-                    Sy_last,
-                    XWy_last,
-                    denom_floor=denom_floor_r,
-                )
-                if ok:
-                    c_r = float(c_fin)
-                    beta_r = np.asarray(beta_fin, dtype=np.float64)
-                else:
-                    c_r = np.nan
-                    beta_r[:] = np.nan
-
-            c_reps[r] = c_r
-            beta_reps[r] = beta_r
-
-        info["h1_plugin"] = h1_plugin
-        info["h2_plugin"] = h2_plugin
-        info["irwls_iters"] = n_iter
-    else:
-        info["irwls_iters"] = 0
+            c_l, beta_l, good_l = _solve_all(w_ldsc)
+            if not (bool(good_l[-1]) and np.isfinite(c_l[-1])):
+                raise RuntimeError("the LDSC-weight solve failed on the full sample")
+            c_reps, beta_reps, mode_used = c_l, beta_l, "ldsc"
+            info.update(ldsc_info)
+        except (RuntimeError, ValueError, FloatingPointError, np.linalg.LinAlgError) as exc:
+            info["ldsc_weight_fallback"] = str(exc)
+            if log is not None:
+                log._log(f"[rg:c] LDSC-style overlap-covariance weights failed ({exc}); using 1/l weights.")
+    info["weight_mode"] = mode_used
 
     est, se = jackknife.summarize(
         c_reps,
@@ -2596,19 +2525,12 @@ def fit_intercept(
 
     if log is not None:
         n_bad = int(np.sum(~np.isfinite(c_reps[:R])))
-        if mode == "ldsc":
-            tag = "partitioned" if P > 1 else "scalar"
-            log._log(
-                f"[rg:c] constrained LDSC-IRWLS ({tag}): h1={info['h1_plugin']:.6g}, "
-                f"h2={info['h2_plugin']:.6g}, final_c={c[0]:.6g}, "
-                f"bad_reps={n_bad}/{R}, iters={info['irwls_iters']}"
-            )
-        else:
-            tag = "partitioned" if P > 1 else "scalar"
-            log._log(
-                f"[rg:c] constrained SCORE-weight overlap covariance ({tag}): "
-                f"final_c={c[0]:.6g}, bad_reps={n_bad}/{R}"
-            )
+        where = "each SNP's own LD term" if ld_point == "self" else "zero LD"
+        weights = "LDSC-style" if mode_used == "ldsc" else "1/l"
+        log._log(
+            f"[rg:c] overlapping covariance in HE scale from summary statistics: c={c[0]:.6g} (SE: {c[1]:.6g}), "
+            f"the fitted line read at {where}, {weights} weights, bad_reps={n_bad}/{R}."
+        )
 
     return InterceptFit(
         trace_view=trace_view,

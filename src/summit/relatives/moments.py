@@ -79,6 +79,7 @@ import json
 import os
 from dataclasses import dataclass
 
+from .. import utils
 import numpy as np
 import pandas as pd
 from bed_reader import open_bed
@@ -274,9 +275,7 @@ def read_annotation_classes(annot: str, snps) -> tuple[np.ndarray, list[str]]:
     The file has a SNP column (CHR, BP and CM are ignored) and one column per class; every listed SNP must belong to
     exactly one class, as in SUMMIT's MAF/LD bins."""
     df = pd.read_csv(annot, sep=r"\s+", dtype={"SNP": str})
-    if "SNP" not in df.columns:
-        raise ValueError(f"{annot} has no SNP column.")
-    cls = [c for c in df.columns if c not in ("CHR", "BP", "SNP", "CM")]
+    _, cls = utils._split_snp_metadata(df.columns, source=f"annotation '{annot}'", required=("SNP",))
     if not cls:
         raise ValueError(f"{annot} has no annotation columns.")
     vals = df[cls].apply(pd.to_numeric, errors="coerce").to_numpy(np.float64)

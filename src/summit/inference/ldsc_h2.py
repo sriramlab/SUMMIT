@@ -123,17 +123,7 @@ def read_ldsc_weight_ld_aligned(
         index_col=False,
     )
     cols = df.columns.tolist()
-    first4 = cols[:4]
-    if not {"CHR", "BP", "SNP"}.issubset(set(first4)):
-        raise ValueError(
-            "LDSC weight-LD input must have CHR, BP, SNP in its first columns."
-        )
-    if "CM" in cols and (len(first4) < 4 or first4[3] != "CM"):
-        raise ValueError(
-            "Malformed LDSC weight-LD metadata: CM, when present, must be the 4th column."
-        )
-    start = 4 if "CM" in first4 else 3
-    value_cols = cols[start:]
+    _, value_cols = utils._split_snp_metadata(cols, source=f"LDSC weight-LD '{path_spec}'")
     if len(value_cols) != 1:
         raise ValueError(
             f"LDSC weight-LD input must have exactly one score column; got {len(value_cols)}."
@@ -251,24 +241,19 @@ def resolve_ldsc_reference_moments(
             index_col=False,
         )
         cols = df.columns.tolist()
-        first4 = cols[:4]
-        is_full = {"CHR", "BP", "SNP"}.issubset(set(first4))
+        meta, annot_cols = utils._split_snp_metadata(
+            cols, source=f"reference annotation '{annot_path}'", allow_thin=True
+        )
+        is_full = bool(meta)
         if is_full:
-            if "CM" in cols and (len(first4) < 4 or first4[3] != "CM"):
-                raise ValueError(
-                    "Malformed reference annotation metadata: CM, when present, "
-                    "must be the 4th column."
-                )
             if df["SNP"].astype(str).duplicated().any():
                 raise ValueError("Reference annotation file contains duplicate SNP IDs.")
-            start = 4 if "CM" in first4 else 3
-            annot_cols = [str(x) for x in cols[start:]]
             if annot_cols != headers:
                 raise ValueError(
                     "Reference annotation columns do not match the fitted LD-score columns: "
                     f"annotation={annot_cols}, fitted={headers}."
                 )
-            A_ref = df.iloc[:, start:].to_numpy(dtype=np.float64, copy=False)
+            A_ref = df[annot_cols].to_numpy(dtype=np.float64, copy=False)
             source = "full_reference_annotation_file"
         else:
             thin_header, A_ref = utils._read_with_optional_header(annot_path)
