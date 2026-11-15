@@ -12,7 +12,7 @@ from .jktraces import load_long_range, long_range_rg, long_range_se
 from .trace import Trace
 from ..sumstats.sumstats import Sumstats, MatchedSumstats, harmonize_allele_codes
 from .h2core import prepare_h2, fit_h2, relatives_diagonal_inputs
-from .rgcore import prepare_rg, fit_intercept, fit_rg, RGResultWriter
+from .rgcore import prepare_rg, fit_intercept, fit_rg, RGResultWriter, _normalize_overlap_ld_point
 from .ldsc_h2 import (
     prepare_h2_ldsc,
     read_ldsc_m,
@@ -59,7 +59,8 @@ class Sumcore:
         clip_nonfinite_vals=False,
         rg_se_method: str = "jackknife",
         intercept_chisq_thr=None,
-        intercept_weight_mode: str = "score",
+        intercept_weight_mode: str = "ldsc",
+        intercept_ld_point: str = "self",
         intercept_rg=None,
         intercept_rg_source: str = "cli",
         pheno_rg=None,
@@ -278,6 +279,7 @@ class Sumcore:
         self.chisq_threshold = chisq_threshold
         self.intercept_chisq_thr = intercept_chisq_thr
         self.intercept_weight_mode = str(intercept_weight_mode).strip().lower()
+        self.intercept_ld_point = _normalize_overlap_ld_point(intercept_ld_point)
         self.chisq_action = str(chisq_action).strip().lower()
         self.enrich_mode = enrich_mode
         self.jack_mode = jack_mode
@@ -599,6 +601,7 @@ class Sumcore:
             fixed_info=fixed_info,
             intercept_chisq_threshold=self.intercept_chisq_thr,
             intercept_weight_mode=self.intercept_weight_mode,
+            ld_point=self.intercept_ld_point,
             collapse_reg_ld=self.collapse_reg_ld,
             score_prepared=rg_prepared,
             log=self.log,
