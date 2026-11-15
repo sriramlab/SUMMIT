@@ -179,24 +179,19 @@ class Trace:
         self.verbose = verbose
         self.delta = None if delta is None else np.asarray(delta, dtype=np.float64)
 
-        main_df, main_L, main_start = self._read_ldscores_file(ldscores, which="main")
-        ld_cols, rel_cols, has_v = self._ldscore_columns(main_df.columns.tolist(), main_start, path=ldscores,
-                                                         which="main")
+        main_df, main_L, main_data = self._read_ldscores_file(ldscores, which="main")
+        ld_cols, rel_cols, has_v = self._ldscore_columns(main_data, path=ldscores, which="main")
         reg_df = None
         reg_L = None
-        reg_start = None
+        reg_data = None
         if ldscores_reg is not None:
-            reg_df, reg_L, reg_start = self._read_ldscores_file(ldscores_reg, which="reg")
+            reg_df, reg_L, reg_data = self._read_ldscores_file(ldscores_reg, which="reg")
 
         regw_df = None
         regw_L = None
-        regw_start = None
+        regw_data = None
         if ldscores_reg_w is not None:
-            regw_df, regw_L, regw_start = self._read_ldscores_file(ldscores_reg_w, which="reg_w")
-
-        self._ldscore_start_idx = int(main_start)
-        self._ldscore_reg_start_idx = None if reg_start is None else int(reg_start)
-        self._ldscore_reg_w_start_idx = None if regw_start is None else int(regw_start)
+            regw_df, regw_L, regw_data = self._read_ldscores_file(ldscores_reg_w, which="reg_w")
 
         main_ld_nsnps_raw = int(main_df.shape[0])
         # Preserve the effect-reference universe before optional regression-LD
@@ -231,7 +226,7 @@ class Trace:
             main_L = main_L[keep, :]
             reg_df = reg_df.iloc[idx[keep]].reset_index(drop=True)
             _assert_matching_coordinates(main_df, reg_df, other_source="regression LD scores")
-            reg_L = reg_df.iloc[:, reg_start:].to_numpy(dtype=np.float64, copy=False)
+            reg_L = reg_df[reg_data].to_numpy(dtype=np.float64, copy=False)
 
         if regw_df is not None:
             regw_index = pd.Index(regw_df["SNP"].to_numpy())
@@ -246,10 +241,10 @@ class Trace:
             main_L = main_L[keep, :]
             if reg_df is not None:
                 reg_df = reg_df.loc[keep].reset_index(drop=True)
-                reg_L = reg_df.iloc[:, reg_start:].to_numpy(dtype=np.float64, copy=False)
+                reg_L = reg_df[reg_data].to_numpy(dtype=np.float64, copy=False)
             regw_df = regw_df.iloc[idx[keep]].reset_index(drop=True)
             _assert_matching_coordinates(main_df, regw_df, other_source="weight LD scores")
-            regw_L = regw_df.iloc[:, regw_start:].to_numpy(dtype=np.float64, copy=False)
+            regw_L = regw_df[regw_data].to_numpy(dtype=np.float64, copy=False)
         annot_df, annot_header, annot_matrix = self._read_annotation(
             annot_path=annot,
             bimpath=bimpath,
@@ -267,11 +262,11 @@ class Trace:
 
         if reg_df is not None:
             reg_df = reg_df.set_index("SNP").loc[annot_df["SNP"].astype(str).to_numpy()].reset_index()
-            reg_L = reg_df.iloc[:, reg_start:].to_numpy(dtype=np.float64, copy=False)
+            reg_L = reg_df[reg_data].to_numpy(dtype=np.float64, copy=False)
 
         if regw_df is not None:
             regw_df = regw_df.set_index("SNP").loc[annot_df["SNP"].astype(str).to_numpy()].reset_index()
-            regw_L = regw_df.iloc[:, regw_start:].to_numpy(dtype=np.float64, copy=False)
+            regw_L = regw_df[regw_data].to_numpy(dtype=np.float64, copy=False)
         # Sort once to stable genomic order. This keeps block jackknife contiguous on the genome
         # and makes chr jackknife valid without any further mutation.
         chr_arr = main_df["CHR"].to_numpy(dtype=np.int32, copy=False)
@@ -414,20 +409,9 @@ class Trace:
             path, compression="infer", sep=r"\s+", index_col=False
         )
         cols = df.columns.tolist()
-        first4 = cols[:4]
-        required = {"CHR", "BP", "SNP"}
-        if not required.issubset(set(first4)):
-            raise ValueError(
-                "Input LD score file must have CHR, BP, SNP in the first columns "
-                "(and optional CM as the 4th column)."
-            )
-        if "CM" in cols and (len(first4) < 4 or first4[3] != "CM"):
-            raise ValueError(
-                "Malformed LD-score metadata: CM, when present, must be the 4th column."
-            )
-        start_idx = 4 if ("CM" in first4) else 3
+        _, data_cols = utils._split_snp_metadata(cols, source=f"LD-score ({which}) '{path}'")
         df = _normalize_variant_keys(df, source=f"LD-score input ({which}) '{path}'")
-        ld_cols, rel_cols, has_v = self._ldscore_columns(cols, start_idx, path=path, which=which)
+        ld_cols, rel_cols, has_v = self._ldscore_columns(data_cols, path=path, which=which)
         L = df[ld_cols].to_numpy(dtype=np.float64, copy=False)
 
         if which == "reg_w" and L.ndim == 2 and L.shape[1] != 1:
@@ -452,12 +436,12 @@ class Trace:
 
         df = df.loc[finite].reset_index(drop=True)
         L = L[finite, :]
-        return df, L, start_idx
+        return df, L, data_cols
 
     @staticmethod
-    def _ldscore_columns(cols, start_idx: int, *, path, which: str):
+    def _ldscore_columns(data_cols, *, path, which: str):
         """Split LD-score data columns into LD scores, LD_REL_<column> and the optional V column after the metadata."""
-        data = [str(c) for c in cols[start_idx:]]
+        data = [str(c) for c in data_cols]
         has_v = bool(data) and data[0] == "V"
         if "V" in data[1:]:
             raise ValueError(f"LD-score file '{path}': V, when present, must directly follow the SNP metadata columns.")
@@ -504,22 +488,10 @@ class Trace:
             annot_path, sep=r"\s+", compression="infer"
         )
         cols = df.columns.tolist()
-        first4 = cols[:4]
-        required = {"CHR", "BP", "SNP"}
-        is_full = required.issubset(set(first4))
-        if (not is_full) and required.intersection(set(cols)):
-            raise ValueError(
-                "Malformed annotation metadata: a full annotation must contain CHR, BP, SNP "
-                "in its first columns (and optional CM as the 4th column)."
-            )
-        if "CM" in cols and (len(first4) < 4 or first4[3] != "CM"):
-            raise ValueError(
-                "Malformed annotation metadata: CM, when present, must be the 4th column."
-            )
+        meta, annot_cols = utils._split_snp_metadata(cols, source=f"annotation '{annot_path}'", allow_thin=True)
+        is_full = bool(meta)
 
         if is_full:
-            start_idx = 4 if ("CM" in first4) else 3
-            annot_cols = cols[start_idx:]
             if len(annot_cols) == 0:
                 raise ValueError("Annotation file contains no annotation columns.")
 
