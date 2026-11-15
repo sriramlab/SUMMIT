@@ -159,3 +159,19 @@ def simulate_families(seed=11, n_chr=2, snps_per_chr=500, chr_cm=150.0, n_panel=
                              "A1": np.where(rng.random(M) < 0.5, "A", "C"), "A2": "G"})
     return dict(variants=variants, panel_A=geno(hA), panel_E=geno(hE), cohort=G, pairs=np.array(pairs, np.int64),
                 relatedness=np.array(rel), generations=generations)
+
+
+def simulate_int8(**kw):
+    """simulate() with the dosages as int8 and without the local ancestry: for fixtures that run it in a child process,
+    so that its float64 arrays never count toward the test process's peak memory (the cross-trait GxE tests plan their
+    memory from that peak)."""
+    S = simulate(**kw)
+    return dict(variants=S["variants"], **{k: S[k].astype(np.int8) for k in ("cohort", "panel_A", "panel_E")})
+
+
+def in_child(fn, **kw):
+    """fn(**kw) in a fresh child process (spawn, so nothing is inherited); returns its result."""
+    import multiprocessing
+    from concurrent.futures import ProcessPoolExecutor
+    with ProcessPoolExecutor(1, mp_context=multiprocessing.get_context("spawn")) as ex:
+        return ex.submit(fn, **kw).result()
