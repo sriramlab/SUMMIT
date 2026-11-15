@@ -77,20 +77,18 @@ overlap information; per-SNP N alone is insufficient.
 
 Without a supplied value, SUMMIT estimates the overlapping covariance in HE scale
 from the summary statistics: it is the value of the fitted line of z1*z2 on
-the regression LD score at each SNP's own LD term, the LD score of a SNP that
-tags no other GWAS SNP (`--overlap-covariance-ld-point self`, the default).
-Causal variants are much denser than GWAS SNPs, so a SNP's own term carries
-little of the genetic signal and the line passes through the overlapping
-covariance there; at zero LD it is about one slope lower. The slope is tied to
-the HE sum, and the line is fitted with LDSC-style heteroskedasticity weights
-estimated once on the full sample and reused in every jackknife replicate
+the regression LD score at each SNP's own LD term (1, or the SNP's V for
+SNP-variance-weighted scores), the LD score of a SNP that tags no other GWAS
+SNP. Causal variants are much denser than GWAS SNPs, so a SNP's own term
+carries little of the genetic signal and the line passes through the
+overlapping covariance there. The slope is tied to the HE sum, and the line is
+fitted with LDSC-style heteroskedasticity weights estimated once on the full
+sample and reused in every jackknife replicate
 (`--overlap-covariance-weight-mode ldsc`, the default; `score` uses 1/l
-weights, which are also used if the LDSC-style iteration fails).
-`--overlap-covariance-ld-point zero` reads the line at zero LD; that is right
-only when the LD scores are computed over the causal variants, or when the
-causal variants are the GWAS SNPs themselves, as in simulations that place
-effects on the genotyped SNPs. A supplied overlapping covariance is always
-more precise.
+weights, which are also used if the LDSC-style iteration fails). This reading
+assumes the GWAS SNPs are a tag-like set (genotyping arrays, HapMap3 or pruned
+sets), as SUMMIT's in-sample LD scores are. A supplied overlapping covariance
+is always more precise.
 
 If you have participant-level inputs locally, `--pheno-rg a.tsv,b.tsv` and
 optional `--pheno-rg-cov a.cov,b.cov` compute this value. Phenotype tables have

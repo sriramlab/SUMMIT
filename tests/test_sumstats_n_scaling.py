@@ -136,14 +136,14 @@ def test_estimated_overlap_uses_snp_scaling_in_every_refit(mode, q):
     b = scale/np.sqrt((n1-q-1)*(n2-q-1))
     c = 0.17
     gamma = 0.06
-    raw_y = c*b + scale*tv.ldscores[:, 0]*gamma/tv.nsnps
+    # The response is linear in the LD score less each SNP's own term (here 1), where the fitted line is read.
+    raw_y = c*b + scale*(tv.ldscores[:, 0] - 1.0)*gamma/tv.nsnps
     ss1 = _matched(tv, n1, np.sqrt(raw_y), q=q)
     ss2 = _matched(tv, n2, np.sqrt(raw_y), q=q)
     p = prepare_rg(tv, ss1, ss2, jk)
     h = SimpleNamespace(h2_reps=np.full((jk.nrep+1, 1), 0.3))
-    # The response is linear in the LD score through zero (causal variants = these SNPs): read the line at zero LD.
     fit = fit_intercept(tv, ss1, ss2, jk, h, h, intercept_weight_mode=mode,
-                        intercept_chisq_threshold=None, score_prepared=p, ld_point="zero")
+                        intercept_chisq_threshold=None, score_prepared=p)
     np.testing.assert_allclose(fit.c_reps, c, atol=2e-11)
     np.testing.assert_allclose(fit.info['regression_gamma_g_total_full'], gamma, atol=2e-11)
 

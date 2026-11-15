@@ -2009,16 +2009,6 @@ def _ldsc_gencov_weights_1d(
     return w
 
 
-OVERLAP_LD_POINTS = ("self", "zero")
-
-
-def _normalize_overlap_ld_point(ld_point) -> str:
-    mode = str(ld_point).strip().lower()
-    if mode not in OVERLAP_LD_POINTS:
-        raise ValueError(f"overlap-covariance LD point must be one of {OVERLAP_LD_POINTS}; got {ld_point!r}")
-    return mode
-
-
 def _overlap_own_ld(trace_view, regsys: InterceptRegressionSystem) -> np.ndarray:
     """Each SNP's own term in each column of the overlap regression's LD design, shape (M, P).
 
@@ -2193,13 +2183,12 @@ def fit_intercept(
     log=None,
     jack_mode: str = "mean",
     nan_policy: str = "omit",
-    ld_point: str = "self",
     **_unused_kwargs,
 ) -> InterceptFit:
     """Overlapping covariance in HE scale: supplied (fixed_c), or estimated from the summary statistics.
 
     The estimate is the value of the fitted line y_j = c b_j + beta'(x_j - s_j) at a SNP's own LD term s_j, i.e. at
-    the LD score of a SNP that tags no other SNP (ld_point 'self'; 'zero' reads the line at zero LD). With causal
+    the LD score of a SNP that tags no other SNP. With causal
     variants denser than the GWAS SNPs, a SNP's own term carries little of the genetic signal, so the line passes
     through the overlapping covariance there. The slope is tied to the HE sum (unweighted residuals sum to zero),
     the weights are LDSC's heteroskedasticity weights fitted once on the full sample ('ldsc') or 1/l ('score'), and
@@ -2207,7 +2196,6 @@ def fit_intercept(
     used and the fallback is logged.
     """
     _validate_common_axis(trace_view, matched1, matched2, jackknife)
-    ld_point = _normalize_overlap_ld_point(ld_point)
     if fixed_c is not None:
         return _make_fixed_intercept_fit(
             trace_view,
@@ -2296,23 +2284,21 @@ def fit_intercept(
         chisq_mode=chisq_mode,
     )
 
-    # Reading point: one shift of the regression design (the weights keep the full LD score).
-    if ld_point == "self":
-        own = _overlap_own_ld(trace_view, regsys)
-        bad = keep & ~np.isfinite(own).all(axis=1)
-        if np.any(bad):
-            keep = keep & ~bad
-            info["n_kept"] = int(np.sum(keep))
-            info["n_removed"] = int(np.sum(~keep))
-        info["n_removed_nonfinite_own_ld"] = int(np.sum(bad))
-        x = x - np.where(keep[:, None], own, 0.0)
+    # Reading point: one shift of the regression design to each SNP's own LD term (the weights keep the full LD).
+    own = _overlap_own_ld(trace_view, regsys)
+    bad = keep & ~np.isfinite(own).all(axis=1)
+    if np.any(bad):
+        keep = keep & ~bad
+        info["n_kept"] = int(np.sum(keep))
+        info["n_removed"] = int(np.sum(~keep))
+    info["n_removed_nonfinite_own_ld"] = int(np.sum(bad))
+    x = x - np.where(keep[:, None], own, 0.0)
 
     info["ld_source"] = regsys.source
     info["weight_ld_source"] = weight_ld_source
     info["regression_design_mode"] = regsys.mode
     info["regression_ncoef"] = P
     info["weight_mode_requested"] = mode
-    info["ld_point"] = ld_point
     info["fixed"] = False
     info["source"] = "summit_intercept_regression"
     info["overlap_covariance_mode"] = "summary_only"
@@ -2525,11 +2511,10 @@ def fit_intercept(
 
     if log is not None:
         n_bad = int(np.sum(~np.isfinite(c_reps[:R])))
-        where = "each SNP's own LD term" if ld_point == "self" else "zero LD"
         weights = "LDSC-style" if mode_used == "ldsc" else "1/l"
         log._log(
             f"[rg:c] overlapping covariance in HE scale from summary statistics: c={c[0]:.6g} (SE: {c[1]:.6g}), "
-            f"the fitted line read at {where}, {weights} weights, bad_reps={n_bad}/{R}."
+            f"the fitted line read at each SNP's own LD term, {weights} weights, bad_reps={n_bad}/{R}."
         )
 
     return InterceptFit(
