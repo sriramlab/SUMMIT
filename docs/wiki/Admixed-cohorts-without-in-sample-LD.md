@@ -264,9 +264,9 @@ reports the difference with its jackknife SE.
 
 Partition the fit by MAF and LD, as for h². The per-class variances then take up how the
 effect variance depends on frequency between classes, but not within them. When the true
-dependence differs from the weights, what is left is a few per cent with SUMMIT's eight
-MAF/LD bins, whose MAF classes split only at 0.1, and under 1% with five MAF classes
-(see the numbers below). Local-ancestry errors put alleles on the wrong track and push r
+dependence differs from the weights, what is left is 1% to 2.5% with SUMMIT's eight MAF/LD
+bins, whose MAF classes split only at 0.1, and under 1% with five MAF classes (see the
+numbers below). Local-ancestry errors put alleles on the wrong track and push r
 up, by about 2.5 times the share of miscalled positions in simulations, so interpret r
 next to the caller's accuracy.
 
@@ -294,6 +294,21 @@ relatives' term, they were 1.9% and 3.5%.
 On 16 cores, the reference took about 18 minutes for 17,000 panel members. The curve took
 about a minute for 3,787 people, and the composition about 90 seconds, most of it spent
 reading the 32 summary-statistic files.
+
+For the correlation across ancestry tracks we computed, on the same array SNPs (404,980
+with MAF of at least 1%) and the same panels, what the estimator returns in expectation
+when the effect variance depends on frequency in another way than its weights assume
+(mean African ancestry 0.59, admixture 6 generations ago, the correlation the same for
+every SNP). With weights 1/s² and a true variance proportional to [2 f (1 - f)]^-0.38, r
+came out 11.3% high with one class, 2.0% with two MAF classes, 0.9% with the eight MAF/LD
+bins and 0.4% with five MAF classes (0.0, 0.02, 0.05, 0.1, 0.2, 0.5). With a variance that
+does not depend on frequency the four values were 16.6%, 3.3%, 1.4% and 0.7%, and with the
+weights of α = -0.38 and a true variance proportional to 1/s² they were -10.5%, -2.6%,
+-2.5% and -0.6%. Partners denser than the array, with rarer variants, widen the low-MAF
+class, so split it more finely there. In simulations with known local ancestry, composed
+track LD scores were within 1.1% of the cohort's exact ones in mass, and r with sandwich
+SEs covered the truth, while OLS SEs gave 1.4 for a truth of 0.6 when the residual variance
+rose with ancestry.
 
 The model covers two-way admixture. It does not cover three or more sources, or panels
 whose LD differs from that of the cohort's sources. The relatives' term covers the LD
