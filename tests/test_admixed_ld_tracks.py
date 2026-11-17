@@ -21,7 +21,7 @@ from admixed_ld_tracks_sim import build_all  # noqa: E402
 # GWAS SNP), 'hetero' lets the residual variance rise with ancestry, 'bins' gives the low-MAF class 3 times the
 # per-allele variance; the European GWAS of 'sparse' has effects correlated 0.8 with the E track's
 TRAITS = dict(sparse=dict(rho=0.6, reps=8, r_ex=0.8, sA=1.2, sE=0.8),
-              dense=dict(rho=0.6, reps=8, causal="all"),
+              dense=dict(rho=0.6, reps=24, causal="all"),
               hetero=dict(rho=0.6, reps=6, eta=0.6, h2=0.3, sA=1.5, sE=0.75),
               bins=dict(rho=0.6, reps=6, causal="all", classes=(3.0, 1.0)))
 QUIET = lambda *a: None
@@ -198,25 +198,33 @@ def test_sandwich_against_ols_standard_errors(trk):
 
 
 def test_dense_partners(trk):
-    """Causal variants on every eligible variant, three per GWAS SNP: with the GWAS SNPs as partners r is attenuated by
-    the factor the scores predict, f_X / sqrt(f_A f_E) with f_t = (rows / partners) sum_j V_j l^dense_j / sum_j V_j
-    l^rows_j; with the dense partners r covers the truth. Options measured on the GWAS SNPs are refused."""
+    """Causal variants on every eligible variant, three per GWAS SNP. With the GWAS SNPs as partners r is attenuated by
+    f_X / sqrt(f_A f_E), f_t = (rows / partners) sum_j V_j l^dense_j / sum_j V_j l^rows_j: with one class and the
+    intercepts known, the two fits use the same z statistics and row weights, so this holds trait by trait (an identity
+    of the estimator, checked here as plumbing). With the dense partners the pooled r (ratio of the mean per-moment
+    estimates over traits, free of the ratio bias of single traits) covers the truth. Options measured on the GWAS
+    SNPs are refused."""
     from summit.admixed_ld.compose import compose_ldscores
     d = trk["dir"]
     comp_r, pr = trk["compose"]()
     comp_d, pd_ = trk["compose"](partners="reference")
-    rr = _mean(_fits(trk, "dense", comp_r, "annot1"), lambda x: x["pairs"]["A_E"]["r"][0])
-    rd = _mean(_fits(trk, "dense", comp_d, "annot1"), lambda x: x["pairs"]["A_E"]["r"][0])
+    fr, fd = (_fits(trk, "dense", c, "annot1") for c in (comp_r, comp_d))
     f = {}
     for name in ("track_A", "track_E", "track_A_E"):
         a, b = (pd.read_csv(f"{o}.{name}.gw.ldscore.gz", sep="\t") for o in (comp_d, comp_r))
         f[name] = (pr["tracks"]["n_partners"] / pd_["tracks"]["n_partners"]) * (a.V * a["all"]).sum() / (b.V * b["all"]).sum()
     pred = f["track_A_E"] / np.sqrt(f["track_A"] * f["track_E"])
-    print(f"\ndense causal (truth 0.6): GWAS-SNP partners {rr:.4f}, dense partners {rd:.4f}; predicted factor "
-          f"{pred:.4f}, observed {rr / rd:.4f}")
+    r = lambda fits: np.array([x["pairs"]["A_E"]["r"][0] for x in fits])
+    ok = np.isfinite(r(fr)) & np.isfinite(r(fd))
+    np.testing.assert_allclose(r(fr)[ok] / r(fd)[ok], pred, rtol=1e-4)
+    pooled = lambda fits: (lambda t: t["tau_12"].mean() / np.sqrt(t["tau_1"].mean() * t["tau_2"].mean()))(
+        {k: np.array([x["pairs"]["A_E"]["classes"]["all"][k][0] for x in fits]) for k in ("tau_1", "tau_2", "tau_12")})
+    rd, rr = pooled(fd), pooled(fr)
+    print(f"\ndense causal (truth 0.6), pooled over {len(fd)} traits: dense partners {rd:.4f}, GWAS-SNP partners {rr:.4f}"
+          f" (factor {pred:.4f})")
     assert pred < 0.97
-    assert abs(rd - 0.6) < 0.1, rd
-    assert abs(rr / rd - pred) < 0.08, (rr, rd, pred)
+    assert abs(rd - 0.6) < 0.08, rd
+    assert rr == pytest.approx(rd * pred, rel=1e-4)
     with pytest.raises(ValueError, match="measured on the GWAS SNPs"):
         compose_ldscores(f"{d}/ref", [f"{d}/ts0.A.sumstats"], f"{d}/annot1.tsv", f"{d}/refused", sources=["A", "E"],
                          generations=8, mean_ancestry=trk["rec"]["mean_ancestry_arg"], theta_sd=0.25,
