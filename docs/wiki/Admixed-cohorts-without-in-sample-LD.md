@@ -182,6 +182,94 @@ The outputs are `ld/cohort.gw.ldscore.gz`, `ld/cohort.gw.M` and
 summit --h2 gwas/ --ldscores ld/cohort.gw.ldscore.gz --annot annot.tsv.gz --out results/h2
 ```
 
+By default the partner SNPs of each LD score are the GWAS SNPs themselves. When the causal
+variants are denser than the GWAS SNPs (an array GWAS, or HapMap3 SNPs from imputed data),
+LD scores over the GWAS SNPs miss the LD with untyped causal variants, and the estimates
+are biased by an amount that differs between LD scores of different kinds. With
+`--partners reference`, every reference variant listed in `--annot` is a partner and the
+GWAS SNPs are the rows, as in LDSC's LD scores from 1000 Genomes. Build the reference on
+the dense variant set (it must contain the GWAS SNPs), and list every partner in the
+annotation. `.gw.M` then holds the partners' counts per class. The cohort's cell matrix
+and sample factors are measured on the GWAS SNPs and cannot be combined with this option.
+
+## Correlation of effects across ancestry tracks
+
+In an admixed person, the alleles on African-ancestry segments and those on
+European-ancestry segments can have different causal effects. Hou et al. (2023) called the
+correlation of these per-allele effects r_admix and estimated it from individual genotypes.
+`summit admixed-ld` estimates it from summary statistics of a local-ancestry-aware GWAS
+such as Tractor, which regresses the phenotype at each SNP on the covariates, the
+local-ancestry dosage and the allele counts on each ancestry's segments. Because the
+local-ancestry dosage is in the model, the variable each track's effect is estimated on is
+the allele's deviation within that track. This deviation carries no admixture LD and is
+uncorrelated with the other track's alleles. So the track LD scores are short-range, and
+the two tracks' estimates have zero noise covariance (at one SNP the two alleles lie on
+different haplotypes).
+
+The estimate needs sandwich (HC) standard errors. With ordinary least squares, the
+residual variance is assumed equal for everyone, but the track variable's variance follows
+each person's local ancestry, and so does the phenotype's variance when environment or
+scale differ by ancestry. The own-track moments then hold terms that the LD scores do not
+model, and these are not small (in simulations with variance that rises with ancestry,
+r_admix came out at 1.4 for a truth of 0.6). Sandwich SEs remove them exactly. Tractor
+itself writes only OLS SEs, so add HC1 SEs to the regression (a sum over people of
+x_a x_b e², cheap to compute alongside the fit).
+
+```bash
+summit admixed-ld tractor-sumstats --tractor tractor/height.tsv --sources AFR,EUR \
+  --covariates 13 --out tracks/height
+summit admixed-ld compose --ref ref/afr_eur_dense --sumstats tracks/height.AFR.sumstats \
+  --annot annot.tsv.gz --admixture-generations 6 --mean-ancestry 0.59,0.41 --ancestry-sd 0.29 \
+  --tracks --partners reference --cross-source EUR --out ld/tracks
+summit admixed-ld track-rg --tracks ld/tracks --sumstats tracks/height --annot annot.tsv.gz \
+  --external eur/height.sumstats --out results/height
+```
+
+`tractor-sumstats` reads Tractor's table (`beta_anc0`, `se_anc0` or `tval_anc0`,
+`AF_anc0`, `LAprop_anc0`, ... and the sandwich SEs `se_hc_anc0`, ...) and writes one
+summary-statistic file per track, with the ALT allele counted. It stops when the sandwich
+SEs are missing; `--se ols --allow-ols` proceeds with a recorded flag. Its
+`tracks.json` lists the mean local-ancestry share of each track, which `compose` takes as
+`--mean-ancestry`. Because a track's standard errors do not give the cohort's kappa(0),
+give `--kappa0` or `--ancestry-sd` (from which kappa(0) is taken as 2 m (1 - m) - 4 SD²).
+
+`compose --tracks` writes the own LD scores of each track (`ld/tracks.track_AFR`,
+`.track_EUR`), their cross scores (`.track_AFR_EUR`) and, with `--cross-source EUR`, the
+scores of each track against a GWAS of other people from that population
+(`.track_AFR_vs_EUR`, `.track_EUR_vs_EUR`) with that population's own LD scores
+(`.cohort_EUR`). They are on the per-allele scale: effects whose variance is proportional
+to one over the cohort's genotype variance (SUMMIT's own scale), or to
+[2 f (1 - f)]^α with `--track-alpha α` (Hou et al.'s model, α = -0.38).
+
+`track-rg` fits each pair of tracks with SUMMIT's cross-population equations and the noise
+covariance fixed at zero, the same fit as
+
+```bash
+summit --rg tracks/height.AFR.sumstats,tracks/height.EUR.sumstats \
+  --ldscores ld/tracks.track_AFR_EUR.gw.ldscore.gz \
+  --ldscores-h2-1 ld/tracks.track_AFR.gw.ldscore.gz --ldscores-h2-2 ld/tracks.track_EUR.gw.ldscore.gz \
+  --overlap-covariance-rg 0 --annot annot.tsv.gz
+```
+
+and combines the classes of the annotation as
+r = Σ_c τ_AE,c n_c / √(Σ_c τ_A,c n_c · Σ_c τ_E,c n_c), with τ the per-allele variances and
+covariance in class c and n_c the number of partner variants in it. With the GWAS SNPs as
+partners this is the rg of the `summit --rg` call above. It also reports r in each class,
+over groups of classes (`--group low=maf1_ld1,maf1_ld2,...`), and each track's heritability.
+With `--external`, it adds r of each track with the other population's GWAS. In the same
+people, r_admix separates ancestry from everything else, and with the ancestry held fixed
+r(EUR track, EUR cohort) separates the cohorts. If the two effects multiply,
+r(AFR track, EUR cohort) is about r_admix · r(EUR track, EUR cohort), and the output
+reports the difference with its jackknife SE.
+
+Partition the fit by MAF and LD, as for h². The per-class variances then take up how the
+effect variance depends on frequency between classes, but not within them. When the true
+dependence differs from the weights, what is left is a few per cent with SUMMIT's eight
+MAF/LD bins, whose MAF classes split only at 0.1, and under 1% with five MAF classes
+(see the numbers below). Local-ancestry errors put alleles on the wrong track and push r
+up, by about 2.5 times the share of miscalled positions in simulations, so interpret r
+next to the caller's accuracy.
+
 ## Accuracy and limits
 
 ![The cohort's curve with the kernel from a 5-generation admixture date, per-SNP composed against in-sample LD scores, and h² of 32 traits from composed against in-sample LD scores in two admixed UK Biobank cohorts.](assets/admixed-ld-ukb.png)

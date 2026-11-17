@@ -10,6 +10,10 @@
                               (--curve PREFIX | --admixture-generations T | --decay-per-cm LAMBDA)
                               [--sources AFR,EUR] [--ancestry-sd SD] [--relatedness X|curve|uniform] [--snps FILE]
                               [--background-window panels|zero|flat] [--background-min-cm 3]
+  summit admixed-ld tractor-sumstats --tractor TRACTOR.tsv --sources AFR,EUR [--covariates C] --out PREFIX
+  summit admixed-ld compose   ... --tracks [--track-alpha A] [--partners reference] [--cross-source EUR]
+  summit admixed-ld track-rg  --tracks COMPOSE_PREFIX --sumstats PREFIX --annot ANNOT [--external EUR.sumstats]
+                              [--group NAME=CLASS,...] --out OUT
   summit admixed-ld matrix    --ref REF_DIR --params PREFIX.admixed_ld.json (--region CHR:START-END | --snps FILE)
                               (--curve PREFIX | --admixture-generations T | --decay-per-cm LAMBDA)
                               [--taper auto|none|TAU_CM] [--no-admixture] --out PREFIX
@@ -23,6 +27,13 @@ genotypes and writes only aggregates (PREFIX.curve.tsv and PREFIX.curve.json). `
 statistics (BETA, SE, N; CHR and BP for matching by position, or --snps), the annotation of the fit (e.g. MAF/LD bins),
 and the decay of the local-ancestry covariance: the cohort's curve, a published admixture date in generations, or a
 decay rate per cM. It writes PREFIX.gw.ldscore.gz and PREFIX.gw.M for `summit --h2/--rg`, and PREFIX.admixed_ld.json.
+`compose --partners reference` takes every reference variant listed in the annotation as a partner of the LD scores
+(a dense reference that holds the causal variants), with the GWAS SNPs as the rows. `tractor-sumstats` splits a
+Tractor GWAS (local-ancestry-aware, with sandwich SEs) into one summary-statistic file per local-ancestry track;
+`compose --tracks` writes the tracks' own and cross LD scores (and, with --cross-source, those of each track against
+another population's GWAS); `track-rg` fits SUMMIT's cross-population equations with the noise covariance fixed at 0
+for each pair and reports the correlation of per-allele effects across tracks (Hou et al.'s r_admix), per class and
+over the classes weighted by the partners' counts, with each track's heritability (tracks.py).
 `matrix` writes the regional correlation matrix of the covariate-adjusted dosages (PREFIX.ld, PREFIX.ld.npz,
 PREFIX.snps.tsv with the counted allele) for fine-mapping or conditional analysis, from the reference, compose's
 parameters (mean ancestry and kappa(0)) and the same decay inputs; --taper auto tapers the panel term against its
@@ -218,6 +229,17 @@ def main(argv=None):
     m.add_argument("--n-tol", type=float, default=0.01, help="relative difference of N within which traits share a file")
     m.add_argument("--sample-factors-no-calibration", action="store_true",
                    help="do not scale the sample-factor term to the cohort's realized between-chromosome mass")
+    m.add_argument("--partners", choices=["rows", "reference"], default="rows",
+                   help="partner variants of the LD scores: 'rows', the GWAS SNPs themselves (the default), or "
+                        "'reference', every reference variant listed in --annot (a dense reference that holds the "
+                        "causal variants), with the GWAS SNPs as the rows; .gw.M then holds the partners' counts")
+    m.add_argument("--tracks", action="store_true",
+                   help="also write the LD scores of the local-ancestry tracks of a Tractor-style GWAS (own score of "
+                        "each track, the cross score of each pair of tracks, and with --cross-source the tracks against "
+                        "that population's GWAS), on the per-allele scale, for `summit admixed-ld track-rg`")
+    m.add_argument("--track-alpha", type=float, default=None,
+                   help="with --tracks: per-allele weights [2 f (1 - f)]^ALPHA (f the frequency at the mean ancestry; "
+                        "Hou et al. use -0.38) instead of 1 / s^2 with s^2 the cohort's genotype variance")
     m.add_argument("--out", required=True)
 
     f = sub.add_parser("sample-factors", help="the cohort's person-factor statistic for the same-person term "
@@ -279,6 +301,48 @@ def main(argv=None):
                    help="as in compose: proceed when the curve at 2 cM is not below kappa_res(0), with the flag recorded")
     x.add_argument("--out", required=True)
 
+    ts = sub.add_parser("tractor-sumstats", help="split a Tractor GWAS into one summary-statistic file per "
+                                                 "local-ancestry track (sandwich SEs required)")
+    ts.add_argument("--tractor", required=True, help="Tractor output table (CHR POS ID REF ALT N, per ancestry s: "
+                                                     "beta_anc{s}, se_anc{s} or tval_anc{s}, AF_anc{s}, "
+                                                     "LAprop_anc{s}, and the sandwich SEs se_hc_anc{s})")
+    ts.add_argument("--sources", required=True,
+                    help="comma-separated names of the ancestries anc0, anc1, ... as in the reference (e.g. AFR,EUR)")
+    ts.add_argument("--se", choices=["hc", "ols"], default="hc",
+                    help="standard errors used: 'hc' (sandwich, the default and required for the track moments) or "
+                         "'ols' (Tractor's own; needs --allow-ols)")
+    ts.add_argument("--allow-ols", action="store_true",
+                    help="accept OLS SEs, with the flag recorded (their own-track moments hold same-person terms that "
+                         "the track LD scores do not model)")
+    ts.add_argument("--covariates", type=int, default=None,
+                    help="number of covariates of the Tractor model (for COV_RANK = covariates + 2 (K - 1), unless the "
+                         "table has a COV_RANK column)")
+    ts.add_argument("--out", required=True)
+
+    tr = sub.add_parser("track-rg", help="correlation of per-allele causal effects across local-ancestry tracks (Hou "
+                                         "et al.'s r_admix), and of each track with another population's GWAS")
+    tr.add_argument("--tracks", required=True, help="prefix of `compose --tracks` (its .admixed_ld.json)")
+    tr.add_argument("--sumstats", required=True,
+                    help="the tractor-sumstats prefix, or the track files comma-separated in compose's source order")
+    tr.add_argument("--annot", required=True, help="the annotation of the fit (as given to compose)")
+    tr.add_argument("--external", default=None,
+                    help="summary statistics of a GWAS of other people from the population of compose's "
+                         "--cross-source (e.g. a European cohort): the triangle r(track, cohort) for every track")
+    tr.add_argument("--cohort-track", default=None,
+                    help="with --external: the track of the external cohort's ancestry, for the triangle check "
+                         "r(other track, cohort) = r(tracks) r(this track, cohort) (default: the --cross-source name "
+                         "when it is one of the sources)")
+    tr.add_argument("--njack", default="200", help="jackknife blocks (default 200 contiguous blocks)")
+    tr.add_argument("--group", action="append", default=None,
+                    help="NAME=CLASS1,CLASS2,...: also report r over a group of the annotation's classes (repeat; "
+                         "e.g. two MAF classes of the eight MAF/LD bins)")
+    tr.add_argument("--max-chisq", default=None, help="chi-square threshold of the fits (default: none)")
+    tr.add_argument("--keep-ambiguous", action="store_true",
+                    help="keep strand-ambiguous SNPs in the fits against --external (the tracks of one Tractor run are "
+                         "always aligned)")
+    tr.add_argument("--allow-ols", action="store_true", help="accept track summary statistics with OLS SEs (flagged)")
+    tr.add_argument("--out", required=True)
+
     a = ap.parse_args(argv)
     log = Logger()
     if a.cmd not in ("reference", "derive", "clean-panels"):
@@ -333,6 +397,16 @@ def main(argv=None):
                        relatedness_memory_gb=a.relatedness_memory_gb, background=a.background,
                        background_quantile=a.background_quantile, background_between_snps=a.background_snps,
                        log=log._log)
+    elif a.cmd == "tractor-sumstats":
+        from .tracks import tractor_sumstats
+        tractor_sumstats(a.tractor, a.out, sources=_sources(a.sources), se=a.se, allow_ols=a.allow_ols,
+                         n_covariates=a.covariates, log=log._log)
+    elif a.cmd == "track-rg":
+        from .tracks import track_rg
+        njack = int(a.njack) if str(a.njack).isdigit() else a.njack
+        track_rg(a.tracks, a.sumstats, a.annot, a.out, external=a.external, cohort_track=a.cohort_track,
+                 njack=njack, groups=a.group,
+                 allow_ols=a.allow_ols, max_chisq=a.max_chisq, keep_ambiguous=a.keep_ambiguous, log=log._log)
     elif a.cmd == "matrix":
         from .matrix import compose_matrix
         compose_matrix(a.ref, a.out, region=a.region, snps=a.snps, sources=_sources(a.sources), params=a.params,
@@ -351,7 +425,8 @@ def main(argv=None):
                          cross_source=a.cross_source, sample_factors=a.sample_factors,
                          sample_factors_calibrate=not a.sample_factors_no_calibration,
                          per_trait_n=not a.single_n, n_tol=a.n_tol,
-                         calibrate_between_chromosomes=a.calibrate_between_chromosomes, log=log._log)
+                         calibrate_between_chromosomes=a.calibrate_between_chromosomes, tracks=a.tracks,
+                         track_alpha=a.track_alpha, partners=a.partners, log=log._log)
     return 0
 
 

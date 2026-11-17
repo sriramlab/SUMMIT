@@ -88,6 +88,12 @@ def _target_variants(snps_path, first_sumstats):
     return out
 
 
+def _track_sumstats(path):
+    """Whether a summary-statistic file is one local-ancestry track's (`tractor-sumstats` writes a TRACK column)."""
+    head = pd.read_csv(path, sep=r"\s+", nrows=0, compression="infer")
+    return "TRACK" in head.columns
+
+
 def unbiased_squared_covariance(c, m22, vv, n):
     """Unbiased estimate of the squared covariance of two variants from a panel of n people (the order-4 U-statistic):
     c the sample covariance (n - 1 denominator), m22 the mean of x_j^2 x_k^2 over people (centred dosages), vv the
@@ -169,6 +175,149 @@ def window_noise(pis, vns, cross, d):
     for n_, t, ma_n, la_n, ma_t, la_t in cross:
         noise -= 2.0 * pis[n_] * pis[t] * (ma_t / ma_n) * np.exp(-(la_t - la_n) * d) * vns[t]
     return noise
+
+
+def track_weights(s2, freq, alpha=None):
+    """Per-allele weights w_k of the track LD scores: 1 / s_k^2 (s_k^2 the cohort's genotype variance; per-allele
+    effects with variance proportional to 1 / s^2, SUMMIT's scale) or, with alpha, [2 f_k (1 - f_k)]^alpha with f_k the
+    frequency at the mean ancestry (Hou et al.'s frequency-dependent model; alpha -0.38 by default there)."""
+    if alpha is None:
+        return 1.0 / np.asarray(s2, np.float64)
+    h = 2.0 * np.asarray(freq, np.float64) * (1.0 - np.asarray(freq, np.float64))
+    out = np.zeros_like(h)
+    np.power(h, float(alpha), out=out, where=h > 0)
+    return out
+
+
+class _TrackScores:
+    """Accumulators of the ancestry-track LD scores inside compose's window loop (compose_ldscores, `tracks`).
+
+    Partner arrays (over compose's partners): q^s_k = m_s v^s_k (variance of the track variable), w_k (per-allele
+    weight), V^s_k = q^s_k w_k. Rows receive, for every window pair, the own scores pi_s^2 U[c_s^2] w_k / q^s_j, the
+    cross scores pi_s pi_t c_s c_t w_k / sqrt(q^s_j q^t_j), and, with a second population X (its panel's covariance
+    c_X and variance v^X), the scores of each track against X, pi_s c_s c_X w_k / sqrt(q^s_j v^X_j), and X's own
+    U[c_X^2] w_k / v^X_j. The own terms (k = j) are added by finish()."""
+
+    def __init__(self, sources, m_vec, VmP, PmP, s2P, clsP, M, K, alpha, cross_name, xs_n, vxP=None):
+        self.sources, self.nK = list(sources), len(sources)
+        self.m = np.asarray(m_vec, np.float64)
+        self.alpha = alpha
+        self.w = track_weights(s2P, PmP @ self.m, alpha)
+        self.v = [np.asarray(VmP[:, s], np.float64) for s in range(self.nK)]
+        self.q = [self.m[s] * self.v[s] for s in range(self.nK)]
+        self.iq = [np.divide(1.0, q, out=np.zeros_like(q), where=q > 0) for q in self.q]
+        self.V = [q * self.w for q in self.q]
+        self.clsP, self.M, self.K = clsP, M, K
+        self.pairs = [(s, t) for s in range(self.nK) for t in range(s + 1, self.nK)]
+        self.own = [np.zeros((M, K)) for _ in range(self.nK)]
+        self.cross = {p: np.zeros((M, K)) for p in self.pairs}
+        self.cross_name, self.xs_n = cross_name, xs_n
+        if cross_name is not None:
+            self.vx = np.asarray(vxP, np.float64)
+            self.Vx = self.vx * self.w
+            self.vs_x = [np.zeros((M, K)) for _ in range(self.nK)]
+            self.x_own = np.zeros((M, K))
+
+    def add_pairs(self, scatter, j, k, rj, rk, d, pis, css, vnss, bgs, cross_c, xpanel=None):
+        """One chunk of window pairs (partners j < k, their rows rj, rk or -1); pis, css, vnss, bgs: per source
+        pi_s(d), the covariance on the source's scale, its sampling variance and the panel's own background;
+        cross_c: compose's (n, t, m^a_n, lam^a_n, m^a_t, lam^a_t) tuples of sources derived by inversion from panel t;
+        xpanel: (c_X, v^X_j, v^X_k, Var(c_X), background of X's panel) or None."""
+        wj, wk, cj, ck = self.w[j], self.w[k], self.clsP[j], self.clsP[k]
+        for s in range(self.nK):
+            sq = pis[s] * pis[s] * (css[s] * css[s] - vnss[s]) - bgs[s]
+            scatter(self.own[s], rj, ck, sq * wk * self.iq[s][j])
+            scatter(self.own[s], rk, cj, sq * wj * self.iq[s][k])
+        for s, t in self.pairs:
+            prod = css[s] * css[t]
+            for n_, t_, ma_n, la_n, ma_t, la_t in cross_c:   # E[c_N c_t] = C_N C_t - (pi^a_t / pi^a_N) Var(e_t)
+                if {n_, t_} == {s, t}:
+                    prod = prod + (ma_t / ma_n) * np.exp(-(la_t - la_n) * d) * vnss[t_]
+            prod = pis[s] * pis[t] * prod
+            scatter(self.cross[(s, t)], rj, ck, prod * wk * np.sqrt(self.iq[s][j] * self.iq[t][j]))
+            scatter(self.cross[(s, t)], rk, cj, prod * wj * np.sqrt(self.iq[s][k] * self.iq[t][k]))
+        if xpanel is None:
+            return
+        c2, vxj, vxk, vnx, bgx = xpanel
+        ixj = np.divide(1.0, vxj, out=np.zeros_like(vxj), where=vxj > 0)
+        ixk = np.divide(1.0, vxk, out=np.zeros_like(vxk), where=vxk > 0)
+        for s in range(self.nK):
+            if s == self.xs_n:                                 # the same panel: its square, unbiased
+                prod = css[s] * c2 - vnx - bgx
+            else:
+                prod = css[s] * c2
+                for n_, t_, ma_n, la_n, ma_t, la_t in cross_c:
+                    if n_ == s and t_ == self.xs_n:
+                        prod = prod + (ma_t / ma_n) * np.exp(-(la_t - la_n) * d) * vnx
+            prod = pis[s] * prod
+            scatter(self.vs_x[s], rj, ck, prod * wk * np.sqrt(self.iq[s][j] * ixj))
+            scatter(self.vs_x[s], rk, cj, prod * wj * np.sqrt(self.iq[s][k] * ixk))
+        sqx = c2 * c2 - vnx - bgx
+        scatter(self.x_own, rj, ck, sqx * wk * ixj)
+        scatter(self.x_own, rk, cj, sqx * wj * ixk)
+
+    def finish(self, out, snpdf, classes, row_part, cls, writer, masses_writer, flags):
+        """Add each row's own term, keep the rows polymorphic in every track (and in X), write the files and return
+        the params block."""
+        rows = np.arange(self.M)
+        keep = np.ones(self.M, dtype=bool)
+        for s in range(self.nK):
+            keep &= self.q[s][row_part] > 0
+        if self.cross_name is not None:
+            keep &= self.vx[row_part] > 0
+        files, masses = {}, {}
+        counts = np.bincount(self.clsP, minlength=self.K).astype(float)
+
+        def put(name, Lm, Vrow, kind, definition):
+            Lm[rows, cls] += Vrow
+            path = f"{out}.{name}"
+            writer(path, snpdf[keep].reset_index(drop=True), pd.DataFrame(Lm[keep], columns=classes),
+                   snp_var=Vrow[keep])
+            masses_writer(path, counts)
+            Vk = Vrow[keep][:, None]
+            files[name] = dict(file=f"{path}.gw.ldscore.gz", kind=kind, definition=definition,
+                               ld_mass=float((Vk * Lm[keep]).sum()),
+                               own_term_share=float((Vrow[keep] ** 2).sum() / (Vk * Lm[keep]).sum()))
+
+        nm = self.sources
+        Vr = [self.V[s][row_part] for s in range(self.nK)]
+        for s in range(self.nK):
+            put(f"track_{nm[s]}", self.own[s], Vr[s], "own",
+                f"sum_k pi_{nm[s]}(d)^2 U[C_jk^2] w_k / q_j over the window, k = j: V_j = m v_j w_j")
+        for s, t in self.pairs:
+            put(f"track_{nm[s]}_{nm[t]}", self.cross[(s, t)], np.sqrt(Vr[s] * Vr[t]), "cross",
+                f"sum_k pi_{nm[s]}(d) pi_{nm[t]}(d) C^{nm[s]}_jk C^{nm[t]}_jk w_k / sqrt(q^{nm[s]}_j q^{nm[t]}_j), "
+                "k = j: sqrt(V V)")
+        for s in range(self.nK):
+            masses[nm[s]] = np.bincount(self.clsP, weights=np.where(self.q[s] > 0, self.V[s], 0.0),
+                                        minlength=self.K).tolist()
+        if self.cross_name is not None:
+            X = self.cross_name
+            Vxr = self.Vx[row_part]
+            for s in range(self.nK):
+                put(f"track_{nm[s]}_vs_{X}", self.vs_x[s], np.sqrt(Vr[s] * Vxr), "track_vs_cohort",
+                    f"sum_k pi_{nm[s]}(d) C^{nm[s]}_jk C^{X}_jk w_k / sqrt(q_j v^{X}_j), k = j: sqrt(V V^{X}); "
+                    f"a GWAS of other people from {X}'s population")
+            put(f"cohort_{X}", self.x_own, Vxr, "cohort",
+                f"sum_k U[(C^{X}_jk)^2] w_k / v^{X}_j over the window, k = j: V^{X}_j = v^{X}_j w_j (per-allele "
+                f"LD scores of a GWAS of {X}'s population)")
+            masses[f"cohort_{X}"] = np.bincount(self.clsP, weights=np.where(self.vx > 0, self.Vx, 0.0),
+                                                minlength=self.K).tolist()
+        phi = {}
+        for s, t in self.pairs:
+            num = float((self.w * np.sqrt(self.v[s].clip(0) * self.v[t].clip(0))).sum())
+            phi[f"{nm[s]}_{nm[t]}"] = num / float(np.sqrt((self.w * self.v[s].clip(0)).sum()
+                                                         * (self.w * self.v[t].clip(0)).sum()))
+        return dict(sources=nm, mean_ancestry=self.m.tolist(),
+                    weights=("1 / s_k^2 (the cohort's genotype variance in the model)" if self.alpha is None
+                             else f"[2 f_k (1 - f_k)]^{self.alpha} (f_k the frequency at the mean ancestry)"),
+                    alpha=self.alpha, n_rows=int(keep.sum()), n_rows_dropped=int((~keep).sum()),
+                    n_partners=int(self.clsP.size), partner_counts=counts.tolist(), partner_V_mass=masses,
+                    classes=list(classes), files=files, cross_source=self.cross_name, phi=phi, flags=flags,
+                    definition="per-allele effects with Var(b^s_k) = tau_s,c w_k and Cov(b^s_k, b^t_k) = tau_st,c "
+                               "w_k for partners k in class c; E[(z^s_j)^2] - 1 = N sum_c tau_s,c l^ss_jc and "
+                               "E[z^s_j z^t_j] = N sum_c tau_st,c l^st_jc for Tractor's z statistics with sandwich "
+                               "SEs; the track heritability is sum_c tau_s,c partner_V_mass[s][c]")
 
 
 def _fft_conv_sym(W: np.ndarray, kern: np.ndarray) -> np.ndarray:
@@ -473,10 +622,28 @@ def relatedness_scale(n_curve, n_gwas):
     return N * (N - 1.0) / (n * (n - 1.0))
 
 
-def relatedness_term(L, rel, chrom, cm, cls, V, K, nu, grid_cm, scale=1.0):
+def relatedness_term(L, rel, chrom, cm, cls, V, K, nu, grid_cm, scale=1.0, partners=None):
     """Add the relatives' term of `rel` (RelatednessProfile) to the LD scores L (M x K) in place: B between all pairs
     (each SNP without itself) and phi(d) - B along each chromosome, by FFT convolution on a grid of grid_cm, times
-    `scale` (relatedness_scale: the share of the curve's pairs of people that the GWAS holds)."""
+    `scale` (relatedness_scale: the share of the curve's pairs of people that the GWAS holds). partners: (chrom, cm,
+    cls, V) of compose's partners when they are not the rows (`--partners reference`; every row is one of them)."""
+    if partners is not None:
+        chP, cmP, clsP, VP = partners
+        L += (scale * rel.between / nu ** 2) * np.bincount(clsP, weights=VP, minlength=K)[None, :]
+        L[np.arange(cls.size), cls] -= (scale * rel.between / nu ** 2) * V
+        for c in pd.unique(chrom):
+            sel, selP = np.flatnonzero(chrom == c), np.flatnonzero(chP == c)
+            x0 = cmP[selP].min()
+            gP = np.floor((cmP[selP] - x0) / grid_cm).astype(np.int64)
+            g = np.floor((cm[sel] - x0) / grid_cm).astype(np.int64)
+            ng = int(gP.max()) + 1
+            kern = rel(np.arange(ng) * grid_cm) - rel.between
+            Vg = np.zeros((ng, K))
+            np.add.at(Vg, (gP, clsP[selP]), VP[selP])
+            acc = _fft_conv_sym(Vg, kern)[g]
+            acc[np.arange(sel.size), cls[sel]] -= kern[0] * V[sel]
+            L[sel] += (scale * acc) / nu ** 2
+        return
     Vtot = np.bincount(cls, weights=V, minlength=K)
     L += (scale * rel.between / nu ** 2) * Vtot[None, :]
     L[np.arange(cls.size), cls] -= (scale * rel.between / nu ** 2) * V
@@ -526,7 +693,7 @@ def compose_ldscores(ref_path, sumstats, annot, out, *, sources=None, snps=None,
                      nu=None, r2=0.99, grid_cm=0.02, cell_matrix=False,
                      cell_switch_cm=10.0, allow_flat_kernel_join=False, cross_source=None,
                      sample_factors=None, sample_factors_calibrate=True, calibrate_between_chromosomes=False,
-                     per_trait_n=True, n_tol=0.01,
+                     per_trait_n=True, n_tol=0.01, tracks=False, track_alpha=None, partners="rows",
                      pair_chunk=1 << 23, log=print):
     """Composed LD scores for an admixed GWAS sample with two or more sources (the last is the baseline of the
     contrasts). mean_ancestry: K-1 or K values (comma-separated); kappa0: the upper triangle of Kt_res(0) row by row.
@@ -551,7 +718,30 @@ def compose_ldscores(ref_path, sumstats, annot, out, *, sources=None, snps=None,
     small cohort (with a strong background) traits with different missingness have measurably different in-sample LD.
     When the traits' median N differ by more than n_tol, one LD-score file is written per group of traits with the same N
     (out.n<N>.gw.ldscore.gz, listed in out.n_groups.tsv; nu = N - rank - 1 with the traits' covariate rank), the
-    population part composed once; out.gw.ldscore.gz stays the file for the median N (with the given nu, if any)."""
+    population part composed once; out.gw.ldscore.gz stays the file for the median N (with the given nu, if any).
+
+    partners: 'rows' (the default) takes the partners k of every LD score to be the GWAS SNPs themselves; 'reference'
+    takes every reference variant listed in the annotation (a dense reference holding the causal variants), with the
+    GWAS SNPs as the rows j. Each SNP of the annotation is then a partner, the masses in <out>.gw.M are the partners'
+    counts per class, and every term is a sum over the partners (the window pairs, the admixture LD, the same-person
+    and relatives' terms); the cohort's cell matrix and sample factors, which are measured on the GWAS SNPs, are not
+    available with it.
+
+    tracks: also write the LD scores of the within-ancestry allele deviations that a local-ancestry-aware GWAS
+    (Tractor: y ~ covariates + local-ancestry dosages + ancestry-specific allele counts) regresses on, for the
+    correlation of per-allele causal effects across ancestry tracks in the same people (tracks.py):
+        own track s     l^ss_j = sum_k pi_s(d)^2 U[(C^s_jk)^2] w_k / q^s_j                     (k = j: V^s_j)
+        tracks s, t     l^st_j = sum_k pi_s(d) pi_t(d) C^s_jk C^t_jk w_k / sqrt(q^s_j q^t_j)   (k = j: sqrt(V^s_j V^t_j))
+    over pairs within the reference window, pi_s(d) = m_s exp(-lam_s d), q^s_j = m_s v^s_j the variance of the track
+    variable, V^s_k = q^s_k w_k and w_k the per-allele weight (1 / s_k^2 with s_k^2 the cohort's genotype variance, or
+    [2 f_k (1 - f_k)]^track_alpha with f_k the frequency at the mean ancestry). The track variables carry no admixture
+    LD, so the scores are short-range only, without same-person or relatives' terms (the sandwich standard errors of
+    the GWAS take the heteroscedasticity out). Independent panels make the plain product of two sources' covariances
+    unbiased; a source derived by inversion from a known panel has the covariance of their errors removed. With
+    cross_source X the tracks against a GWAS of other people from population X are written too (per-allele scale,
+    V^X_k = v^X_k w_k), and X's own per-allele LD scores from its panel. Files: <out>.track_<s>, <out>.track_<s>_<t>,
+    <out>.track_<s>_vs_<X>, <out>.cohort_<X> (.gw.ldscore.gz and .gw.M), all on the same rows; the definitions, the
+    partners' masses and the track parameters are in the params json under `tracks`."""
     from ..ldscore.gw_ldscore import write_gw_annotation_masses, write_gw_ldscore_table
     from ..relatives.moments import read_annotation_classes
     from ..sumstats.sumstats import Sumstats
@@ -572,6 +762,15 @@ def compose_ldscores(ref_path, sumstats, annot, out, *, sources=None, snps=None,
         xs_n = sources.index(cross_source) if cross_source in sources else None
     if sum(x is not None for x in (curve, generations, decay_per_cm)) != 1:
         raise ValueError("Give exactly one source for the decay: --curve, --admixture-generations or --decay-per-cm.")
+    if partners not in ("rows", "reference"):
+        raise ValueError("partners must be 'rows' (the GWAS SNPs) or 'reference' (every reference variant in the "
+                         "annotation).")
+    dense = partners == "reference"
+    if dense and (cell_matrix or sample_factors is not None or calibrate_between_chromosomes):
+        raise ValueError("--partners reference cannot be combined with --cell-matrix, --sample-factors or "
+                         "--calibrate-between-chromosomes: those are measured on the GWAS SNPs.")
+    if track_alpha is not None and not tracks:
+        raise ValueError("--track-alpha sets the per-allele weights of the track LD scores; it needs --tracks.")
 
     # ---------------------------------------------------------------------------------------- target variants
     files = _sumstats_files(sumstats)
@@ -612,6 +811,28 @@ def compose_ldscores(ref_path, sumstats, annot, out, *, sources=None, snps=None,
     snp_ids = tv.SNP.to_numpy()[t_idx]
     log(f"[admixed-ld] compose: {M} of {len(tv)} GWAS variants are in the reference ({', '.join(sources)}) and the "
         f"annotation ({K} classes)")
+    # the partners: the GWAS SNPs themselves (the default), or every reference variant of the annotation, the GWAS SNPs
+    # keeping the class of their own ID (prow maps each partner to its row, -1 for a partner off the GWAS)
+    if dense:
+        pc_mat, pclasses = read_annotation_classes(annot, rv.SNP.to_numpy())
+        if list(pclasses) != list(classes):
+            raise ValueError(f"{annot}: the classes differ between the GWAS SNPs and the reference variants.")
+        pc_mat[r_idx] = cls_mat
+        p_idx = np.flatnonzero(pc_mat.sum(axis=1) == 1)
+        PmP = np.column_stack([rv[f"p_{s}"].to_numpy()[p_idx] for s in sources])
+        VmP = np.column_stack([rv[f"v_{s}"].to_numpy()[p_idx] for s in sources])
+        goodP = np.isfinite(PmP).all(axis=1) & np.isfinite(VmP).all(axis=1) & (VmP.sum(axis=1) > 0)
+        p_idx, PmP, VmP = p_idx[goodP], PmP[goodP], VmP[goodP]
+        DmP = PmP[:, :-1] - PmP[:, -1:]
+        VnP, nnP, GnP, _ = ref.frequency_noise(sources, VmP, p_idx, rv)
+        OP = unbiased_products_cov(DmP, contrast_noise(VnP, nnP, GnP)[0])
+        clsP = np.argmax(pc_mat[p_idx], axis=1)
+        n_listed = int((pc_mat.sum(axis=1) == 1).sum())
+        log(f"[admixed-ld] compose: partners are the {p_idx.size} reference variants of the annotation ({n_listed} "
+            f"listed, {len(rv) - n_listed} reference variants without a class are not partners); the {M} GWAS "
+            "variants are the rows")
+        if not np.isin(r_idx, p_idx).all():
+            raise ValueError("Every GWAS variant must also be a partner.")
 
     # ---------------------------------------------------------------------------------------- parameters
     tables, n_med, p_rank = [], [], []
@@ -626,6 +847,26 @@ def compose_ldscores(ref_path, sumstats, annot, out, *, sources=None, snps=None,
     N = float(np.median(n_med))
     p = int(np.median(p_rank))
     m_in, k_in = _parse_values(mean_ancestry), _parse_values(kappa0)
+    flags = []
+    if _track_sumstats(files[0]):
+        # one track's summary statistics (tractor-sumstats): their SEs follow the track variable, not the genotype, so
+        # the SE regression for m and kappa_res(0) does not apply
+        if m_in is None or (k_in is None and (theta_sd is None or nK != 2)):
+            raise ValueError("The summary statistics are those of one local-ancestry track (tractor-sumstats); their "
+                             "SEs do not give the cohort's mean ancestry and kappa_res(0). Pass --mean-ancestry (the "
+                             "reader's tracks.json lists the mean local-ancestry share of each track) and --kappa0, or "
+                             "--ancestry-sd for two sources.")
+        if k_in is None:
+            m0 = m_in[0] / (sum(m_in) if len(m_in) == nK else 1.0)
+            k_in = [2.0 * m0 * (1.0 - m0) - 4.0 * float(theta_sd) ** 2]
+            if not k_in[0] > 0:
+                raise ValueError(f"--ancestry-sd {theta_sd} leaves no local-ancestry variance within people at mean "
+                                 f"ancestry {m0:.3f}; pass --kappa0.")
+            flags.append(dict(flag="kappa0_from_ancestry_sd", detail=f"kappa_res(0) = 2 m (1 - m) - 4 SD^2 = "
+                                                                     f"{k_in[0]:.4g} (random mating, PCs taking up "
+                                                                     "global ancestry)"))
+            log(f"[admixed-ld] compose: kappa_res(0) {k_in[0]:.4g} from the mean ancestry and --ancestry-sd (random "
+                "mating; the PCs take up global ancestry)")
     if m_in is None or k_in is None:
         m_se, k_se, per_trait = parameters_from_sumstats_k(tables, Vm, O, sources, log=log)
     else:
@@ -675,7 +916,7 @@ def compose_ldscores(ref_path, sumstats, annot, out, *, sources=None, snps=None,
                                        source=f"admixture {generations} generations ago")
     else:
         kern = KernelMatrix.from_decay(k0, float(decay_per_cm), ref.genome_cm, nK, source=f"decay {decay_per_cm} per cM")
-    flags = check_kernel_join(kern, allow_flat_kernel_join, log)
+    flags = flags + check_kernel_join(kern, allow_flat_kernel_join, log)
     for n_, s in enumerate(sources):           # panels whose own admixture LD was never measured (clean-panels)
         src_m = ref.manifest["sources"][si[n_]]
         if "panel_admixture" not in src_m and not (src_m.get("derived") and src_m.get("ld") != "panel"):
@@ -794,6 +1035,23 @@ def compose_ldscores(ref_path, sumstats, annot, out, *, sources=None, snps=None,
         Pm, Vm, Dm, O, snp_ids, cres, s2 = Pm[ok], Vm[ok], Dm[ok], O[ok], snp_ids[ok], cres[ok], s2[ok]
         M = int(ok.sum())
     Vpop = cres / s2
+    if dense:                                                      # the same model over the partners
+        quadP = lambda Mx: np.einsum("jab,ab->j", OP, Mx)
+        cresP = VmP @ m_vec + quadP(k0)
+        s2P = cresP + 4.0 * r2 * quadP(mom[1])
+        okP = cresP > 1e-8
+        p_idx, PmP, VmP, DmP, OP, clsP, cresP, s2P = (x[okP] for x in (p_idx, PmP, VmP, DmP, OP, clsP, cresP, s2P))
+        row_of = np.searchsorted(p_idx, r_idx)                     # each row's partner index
+        if not (row_of < p_idx.size).all() or not (p_idx[np.minimum(row_of, p_idx.size - 1)] == r_idx).all():
+            raise ValueError("Every GWAS variant must also be a partner.")
+        prow = -np.ones(p_idx.size, dtype=np.int64)
+        prow[row_of] = np.arange(M)
+    else:
+        p_idx, PmP, VmP, DmP, OP, clsP, cresP, s2P, prow = r_idx, Pm, Vm, Dm, O, cls, cres, s2, None
+    MP = int(p_idx.size)
+    VpopP = cresP / s2P
+    chromP = rv["CHR"].to_numpy()[p_idx]
+    cmP = rv["CM"].to_numpy()[p_idx]
     L = np.zeros((M, K))
     Lx = np.zeros((M, K)) if xs_i is not None else None
     v2_out = np.zeros(M) if xs_i is not None else None
@@ -803,7 +1061,8 @@ def compose_ldscores(ref_path, sumstats, annot, out, *, sources=None, snps=None,
     k2 = k1 * k1
     Oflat = O.reshape(M, k2)                                       # o_j[u], u = (a, c): D_ja D_jc
     Wn = Oflat / s2[:, None]                                       # partner weights of the admixture terms
-    W_tot = np.stack([np.bincount(cls, weights=Wn[:, u], minlength=K) for u in range(k2)])   # k2 x K
+    WnP = Wn if not dense else OP.reshape(MP, k2) / s2P[:, None]
+    W_tot = np.stack([np.bincount(clsP, weights=WnP[:, u], minlength=K) for u in range(k2)])   # k2 x K
     uu = [(a, c) for a in range(k1) for c in range(k1)]
     far_F = np.array([[kern.far[a, b] * kern.far[c, e] for (b, e) in uu] for (a, c) in uu])  # F_uv(inf)
     # a source derived by inversion carries minus the known panels' covariance errors (Reference.covariance_noise_mix):
@@ -833,15 +1092,30 @@ def compose_ldscores(ref_path, sumstats, annot, out, *, sources=None, snps=None,
             log(f"[admixed-ld] compose: {sources[n_]}'s window covariances from its {q['n_panel']}-person panel put on "
                 f"its own variances (shrinkage weight median {q['shrinkage_weight_median']:.3f}: 0 keeps the panel's "
                 f"covariances, 1 transfers its correlations; mean f^2 {q['mean_f2']:.4f})")
+    T = None
+    if tracks:
+        vxP = (None if xs_i is None else
+               ref.variants([cross_source])[f"v_{cross_source}"].to_numpy(np.float64)[p_idx])
+        T = _TrackScores(sources, m_vec, VmP, PmP, s2P, clsP, M, K, track_alpha, cross_source, xs_n, vxP)
+    localP = rv["LOCAL"].to_numpy()[p_idx]
+
+    def scatter(acc_, r, cl, w):
+        """acc_[r, cl] += w over the pairs (r: the receiving row; partners off the GWAS, r < 0, receive nothing)."""
+        if prow is not None:
+            m_ = r >= 0
+            r, cl, w = r[m_], cl[m_], w[m_]
+        acc_ += np.bincount(r * K + cl, weights=w, minlength=M * K).reshape(M, K)
+
     n_pairs = 0
     for c in ref.chromosomes:
         sel = np.flatnonzero(chrom_out == c)
         if sel.size == 0:
             continue
+        selP = sel if not dense else np.flatnonzero(chromP == c)
         z = ref.load(c)
         nloc = z["bp"].size
-        tmap = -np.ones(nloc, dtype=np.int64)
-        tmap[local_out[sel]] = sel
+        tmap = -np.ones(nloc, dtype=np.int64)                      # local position -> partner (the row by default)
+        tmap[localP[selP]] = selP
         indptr, indices, cm_ref = z["indptr"], z["indices"], z["cm"]
         cov = [z[f"cov_{i}"] for i in si]
         # a derived source carries the sampling variance of each covariance (covvar) instead of the panel moments
@@ -854,6 +1128,7 @@ def compose_ldscores(ref_path, sumstats, annot, out, *, sources=None, snps=None,
         if xs_i is not None:                                            # the second population's panel
             cov_x, v_x = z[f"cov_{xs_i}"], z[f"v_{xs_i}"].astype(np.float64)
             v2_out[sel] = v_x[local_out[sel]]
+            m22_x = z[f"m22_{xs_i}"] if (T is not None and xs_n is None) else None
         # pairs within the window (upper band), in chunks of rows
         r0 = 0
         while r0 < nloc:
@@ -866,13 +1141,16 @@ def compose_ldscores(ref_path, sumstats, annot, out, *, sources=None, snps=None,
                 kl = indices[s0:s1].astype(np.int64)
                 j, k = tmap[jl], tmap[kl]
                 use = (j >= 0) & (k >= 0)
+                if prow is not None:                                # a pair needs a row at one end at least
+                    use &= (prow[np.maximum(j, 0)] >= 0) | (prow[np.maximum(k, 0)] >= 0)
                 if use.any():
                     j, k, jl, kl = j[use], k[use], jl[use], kl[use]
+                    rj, rk = (j, k) if prow is None else (prow[j], prow[k])
                     d = np.abs(cm_ref[kl] - cm_ref[jl])
                     Kd = kern(d)                                    # pairs x k1 x k1
-                    adm = np.einsum("pa,pab,pb->p", Dm[j], Kd, Dm[k])
+                    adm = np.einsum("pa,pab,pb->p", DmP[j], Kd, DmP[k])
                     cr = adm.copy()
-                    pis, vnss = [None] * nK, [None] * nK
+                    pis, vnss, css, bgs = [None] * nK, [None] * nK, [None] * nK, [0.0] * nK
                     for s in range(nK):
                         cs_ = cov[s][s0:s1][use].astype(np.float64)
                         pi_s = m_vec[s] * np.exp(-kern.lam[s] * d)
@@ -886,7 +1164,7 @@ def compose_ldscores(ref_path, sumstats, annot, out, *, sources=None, snps=None,
                             g = fsc[s][c][jl] * fsc[s][c][kl]
                             cs_, vns = cs_ * g, vns * g * g
                         cr += pi_s * cs_
-                        pis[s], vnss[s] = pi_s, vns
+                        pis[s], vnss[s], css[s] = pi_s, vns, cs_
                     noise = window_noise(pis, vnss, cross_c, d)
                     for n_, pb in panel_bg.items():               # the panel's own background (SmoothBackground)
                         bg = (pis[n_] * pis[n_] * vr[n_][jl].astype(np.float64) * vr[n_][kl].astype(np.float64)
@@ -894,6 +1172,7 @@ def compose_ldscores(ref_path, sumstats, annot, out, *, sources=None, snps=None,
                         if n_ in fsc:                             # on the source's scale, as its covariances
                             bg *= (fsc[n_][c][jl] * fsc[n_][c][kl]) ** 2
                         noise += bg
+                        bgs[n_] = bg
                     if xs_i is not None:
                         c2 = cov_x[s0:s1][use].astype(np.float64)
                         v2j, v2k = v_x[jl], v_x[kl]
@@ -904,25 +1183,37 @@ def compose_ldscores(ref_path, sumstats, annot, out, *, sources=None, snps=None,
                                 px -= pis[xs_n] * v2j * v2k * panel_bg[xs_n].per_pair(d)
                         okx = (v2j > 0) & (v2k > 0)
                         px = np.where(okx, px, 0.0)
-                        dj = np.sqrt(np.where(okx, cres[j] * v2j * s2[k] * v2k, 1.0))
-                        dk = np.sqrt(np.where(okx, cres[k] * v2k * s2[j] * v2j, 1.0))
-                        Lx += np.bincount(j * K + cls[k], weights=px / dj, minlength=M * K).reshape(M, K)
-                        Lx += np.bincount(k * K + cls[j], weights=px / dk, minlength=M * K).reshape(M, K)
+                        dj = np.sqrt(np.where(okx, cresP[j] * v2j * s2P[k] * v2k, 1.0))
+                        dk = np.sqrt(np.where(okx, cresP[k] * v2k * s2P[j] * v2j, 1.0))
+                        scatter(Lx, rj, clsP[k], px / dj)
+                        scatter(Lx, rk, clsP[j], px / dk)
+                    if T is not None:
+                        xpanel = None
+                        if xs_i is not None:                      # X's panel: Var(c_X) and its own background
+                            vnx = (vnss[xs_n] if xs_n is not None else
+                                   c2 * c2 - unbiased_squared_covariance(c2, m22_x[s0:s1][use], v2j * v2k,
+                                                                         float(ref.n[cross_source])))
+                            bgx = (v2j * v2k * panel_bg[xs_n].per_pair(d) if (xs_n is not None and xs_n in panel_bg)
+                                   else 0.0)
+                            xpanel = (c2, v2j, v2k, vnx, bgx)
+                        T.add_pairs(scatter, j, k, rj, rk, d, pis, css, vnss, bgs, cross_c, xpanel)
                     sq = cr * cr - noise - adm * adm
-                    L += np.bincount(j * K + cls[k], weights=sq / (cres[j] * s2[k]), minlength=M * K).reshape(M, K)
-                    L += np.bincount(k * K + cls[j], weights=sq / (cres[k] * s2[j]), minlength=M * K).reshape(M, K)
+                    scatter(L, rj, clsP[k], sq / (cresP[j] * s2P[k]))
+                    scatter(L, rk, clsP[j], sq / (cresP[k] * s2P[j]))
                     n_pairs += int(use.sum())
             r0 = r1
         # admixture LD of every pair on the chromosome: (D_j' Kt D_k)^2 = sum_{u,v} o_j[u] F_uv(d) o_k[v] with
-        # F_{(a,c),(b,e)} = Kt_ab Kt_ce, by FFT convolution on a grid
-        x = cm_out[sel]
-        g = np.floor((x - x.min()) / grid_cm).astype(np.int64)
-        ng = int(g.max()) + 1
+        # F_{(a,c),(b,e)} = Kt_ab Kt_ce, by FFT convolution on a grid (over the partners; read at the rows)
+        x = cmP[selP]
+        x0 = x.min()
+        gP = np.floor((x - x0) / grid_cm).astype(np.int64)
+        g = gP if not dense else np.floor((cm_out[sel] - x0) / grid_cm).astype(np.int64)
+        ng = int(gP.max()) + 1
         grid_d = np.arange(ng) * grid_cm
         kg = kern(grid_d)                                           # ng x k1 x k1
         Wg = np.zeros((k2, ng, K))
         for v in range(k2):
-            np.add.at(Wg[v], (g, cls[sel]), Wn[sel, v])
+            np.add.at(Wg[v], (gP, clsP[selP]), WnP[selP, v])
         acc = np.zeros((sel.size, K))
         self_ = np.zeros(sel.size)
         for ui, (a, c_) in enumerate(uu):
@@ -935,7 +1226,8 @@ def compose_ldscores(ref_path, sumstats, annot, out, *, sources=None, snps=None,
             acc += Oflat[sel, ui][:, None] * Fu
         acc[np.arange(sel.size), cls[sel]] -= self_                 # the convolution includes each SNP itself
         L[sel] += acc / cres[sel][:, None]
-        log(f"[admixed-ld] compose chr{c}: {sel.size} SNPs ({time.perf_counter() - t0:.0f} s)")
+        log(f"[admixed-ld] compose chr{c}: {sel.size} SNPs" + (f", {selP.size} partners" if dense else "")
+            + f" ({time.perf_counter() - t0:.0f} s)")
     cells_used = None
     if cell_matrix:
         if curve is None:
@@ -946,7 +1238,12 @@ def compose_ldscores(ref_path, sumstats, annot, out, *, sources=None, snps=None,
     # same-person term, each SNP with itself, relatives
     pbar = Pm @ m_vec                                               # frequency at the mean ancestry
     beta_ = 2.0 * Dm * (1.0 - 2.0 * pbar)[:, None]
-    sp_rm = same_person_term(beta_, O, s2, cres, cls, K, mom, nu)
+    if dense:                                                       # the class sums run over the partners
+        pbarP = PmP @ m_vec
+        sp_rm = same_person_term(beta_, O, s2, cres, cls, K, mom, nu,
+                                 partners=(2.0 * DmP * (1.0 - 2.0 * pbarP)[:, None], OP, s2P, clsP))
+    else:
+        sp_rm = same_person_term(beta_, O, s2, cres, cls, K, mom, nu)
     sf_info = None
     Vpop_sp = cres / s2
     if sample_factors is not None:
@@ -1014,9 +1311,10 @@ def compose_ldscores(ref_path, sumstats, annot, out, *, sources=None, snps=None,
     if rel_sum is not None or rel_prof is not None:
         R1 = np.zeros((M, K))
         if rel_sum is not None:
-            R1 += rel_sum * np.bincount(cls, weights=Vpop, minlength=K)[None, :]
+            R1 += rel_sum * np.bincount(clsP, weights=VpopP, minlength=K)[None, :]
         if rel_prof is not None:
-            relatedness_term(R1, rel_prof, chrom_out, cm_out, cls, Vpop, K, 1.0, grid_cm, scale=1.0)
+            relatedness_term(R1, rel_prof, chrom_out, cm_out, cls, Vpop, K, 1.0, grid_cm, scale=1.0,
+                             partners=None if not dense else (chromP, cmP, clsP, VpopP))
     L_pop = L
     mass_check = None
     if sample_factors is not None and sfi.get("ld_mass"):
@@ -1071,7 +1369,7 @@ def compose_ldscores(ref_path, sumstats, annot, out, *, sources=None, snps=None,
                          ld_mass=float((V[:, None] * Lg).sum()))
                 snpdf_g = pd.DataFrame({"CHR": chrom_out, "SNP": snp_ids, "BP": rv["BP"].to_numpy()[r_idx]})
                 write_gw_ldscore_table(f"{out}.n{g['label']}", snpdf_g, pd.DataFrame(Lg, columns=classes), snp_var=V)
-                write_gw_annotation_masses(f"{out}.n{g['label']}", np.bincount(cls, minlength=K).astype(float))
+                write_gw_annotation_masses(f"{out}.n{g['label']}", np.bincount(clsP, minlength=K).astype(float))
             pd.DataFrame([dict(trait=t, N=nn, ldscores=g["file"]) for g in groups_info for t, nn in g["traits"]]).to_csv(
                 f"{out}.n_groups.tsv", sep="\t", index=False)
             log(f"[admixed-ld] compose: {len(groups_info)} GWAS sample sizes among the traits (within {n_tol:.0%}); "
@@ -1080,7 +1378,8 @@ def compose_ldscores(ref_path, sumstats, annot, out, *, sources=None, snps=None,
     # ---------------------------------------------------------------------------------------- write
     snpdf = pd.DataFrame({"CHR": chrom_out, "SNP": snp_ids, "BP": rv["BP"].to_numpy()[r_idx]})
     write_gw_ldscore_table(out, snpdf, pd.DataFrame(L, columns=classes), snp_var=V)
-    write_gw_annotation_masses(out, np.bincount(cls, minlength=K).astype(float))
+    masses_P = np.bincount(clsP, minlength=K).astype(float)        # the partners' counts (the rows' by default)
+    write_gw_annotation_masses(out, masses_P)
     params = dict(format="summit-admixed-ld-compose", version=1, sources=sources, baseline=sources[-1], n_snps=int(M),
                   n_window_pairs=int(n_pairs), mean_ancestry_vector=m_vec.tolist(), kappa0_matrix=k0.tolist(),
                   mean_ancestry_from_se=np.asarray(m_se).tolist(), kappa0_from_se=np.asarray(k_se).tolist(),
@@ -1102,7 +1401,7 @@ def compose_ldscores(ref_path, sumstats, annot, out, *, sources=None, snps=None,
         xout = f"{out}.cross_{cross_source}"
         write_gw_ldscore_table(xout, snpdf[keep].reset_index(drop=True),
                                pd.DataFrame(Lx[keep], columns=classes), snp_var=np.sqrt(Vpop[keep]))
-        write_gw_annotation_masses(xout, np.bincount(cls[keep], minlength=K).astype(float))
+        write_gw_annotation_masses(xout, masses_P if dense else np.bincount(cls[keep], minlength=K).astype(float))
         params["cross"] = dict(source=cross_source, panel_n=int(ref.n[cross_source]),
                                panel_is_a_source=xs_n is not None, file=f"{xout}.gw.ldscore.gz",
                                n_snps=int(keep.sum()), ld_mass=float((np.sqrt(Vpop[keep])[:, None] * Lx[keep]).sum()),
@@ -1110,6 +1409,24 @@ def compose_ldscores(ref_path, sumstats, annot, out, *, sources=None, snps=None,
                                           "rho_2 and V_2 = 1 from the panel of the second population")
         log(f"[admixed-ld] compose: wrote {xout}.gw.ldscore.gz, cross-population LD scores with {cross_source}'s "
             f"panel ({int(keep.sum())} SNPs polymorphic in it)")
+    if dense:
+        params["partners"] = dict(mode="reference", n_partners=MP, counts=masses_P.tolist(),
+                                  definition="the reference variants listed in the annotation; the GWAS variants are "
+                                             "the rows, and .gw.M holds the partners' counts per class")
+    if T is not None:
+        tflags = []
+        if R1 is not None:
+            tflags.append(dict(flag="track_scores_without_relatives",
+                               detail="the relatives' term enters the own-track moments; the track scores leave it out"))
+        tb = T.finish(out, snpdf, classes, np.arange(M) if prow is None else row_of, cls, write_gw_ldscore_table,
+                      write_gw_annotation_masses, tflags)
+        tb.update(partners=partners, decay_per_cm=dict(zip(sources, np.asarray(kern.lam, float).tolist())))
+        params["tracks"] = tb
+        log(f"[admixed-ld] compose: wrote the track LD scores ({', '.join(tb['files'])}) on {tb['n_rows']} SNPs "
+            f"polymorphic in every track; per-allele weights {tb['weights']}; partners: {partners} ({tb['n_partners']})")
+        if tb["n_rows_dropped"]:
+            log(f"[admixed-ld] compose: {tb['n_rows_dropped']} SNPs monomorphic in a track (or in "
+                f"{cross_source}) have no track scores")
     if k1 == 1:                                                    # the two-source keys
         params.update(mean_ancestry=float(m_vec[0]), kappa0=float(k0[0, 0]))
     with open(f"{out}.admixed_ld.json", "w") as fh:

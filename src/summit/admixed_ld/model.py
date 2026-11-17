@@ -439,18 +439,20 @@ def dirichlet_moments(m, sd_first, draws=400_000, seed=0) -> dict:
     return moments_from_vectors(U)
 
 
-def same_person_term(beta, O, s2, cres, cls, n_classes, mom, nu):
+def same_person_term(beta, O, s2, cres, cls, n_classes, mom, nu, partners=None):
     """(1 / nu) sum_{k in c} Cov(h_j, h_k) / (cres_j s2_k) for K sources, with h(theta) = 2 p (1 - p) quadratic in the
     ancestry contrasts w: h_j = h_j(mean) + beta_j' w - 2 (D_j' w)^2. beta: M x k1; O: M x k1 x k1 (unbiased products);
-    mom = (mean, cov, m3, m4). Two sources reproduce the scalar formula."""
+    mom = (mean, cov, m3, m4). Two sources reproduce the scalar formula. partners: (beta, O, s2, cls) of the partners k
+    when they are not the rows j (compose --partners reference)."""
     _, S, M3, M4 = mom
     k1 = beta.shape[1]
+    bP, OP, s2P, clsP = (beta, O, s2, cls) if partners is None else partners
     B = np.zeros((n_classes, k1))
     G = np.zeros((n_classes, k1, k1))
     for a in range(k1):
-        B[:, a] = np.bincount(cls, weights=beta[:, a] / s2, minlength=n_classes)
+        B[:, a] = np.bincount(clsP, weights=bP[:, a] / s2P, minlength=n_classes)
         for b in range(k1):
-            G[:, a, b] = np.bincount(cls, weights=O[:, a, b] / s2, minlength=n_classes)
+            G[:, a, b] = np.bincount(clsP, weights=OP[:, a, b] / s2P, minlength=n_classes)
     C4 = M4 - np.einsum("ab,cd->abcd", S, S)
     t1 = np.einsum("ja,ab,cb->jc", beta, S, B)
     t2 = -2.0 * np.einsum("ja,abe,cbe->jc", beta, M3, G)
