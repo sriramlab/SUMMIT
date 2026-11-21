@@ -12,8 +12,9 @@ theta_h (1 - theta_h) exp(-T d / 100), and global ancestry theta that varies bet
   python prepare_admixed_ld_inputs.py     write the inputs under out/admixed_ld/
 
 The output holds panel_afr and panel_eur (1,000 people each), the cohort (3,000 people with mean global ancestry 0.75
-from the first population, admixed 8 generations ago), cohort.cov (two genotype PCs), trait.sumstats (OLS summary
-statistics of a trait with h2 0.3 adjusted for the PCs) and cohort.annot (two MAF classes). The second panel lists a
+from the first population, admixed 8 generations ago), cohort.cov (two genotype PCs), trait.sumstats and
+trait2.sumstats (OLS summary statistics of two traits with h2 0.3 and genetic correlation 0.6, adjusted for the PCs),
+their phenotypes (trait.pheno, trait2.pheno, for the overlapping covariance of the rg fit) and cohort.annot (two MAF classes). The second panel lists a
 third of the alleles the other way round. No participant dataset is read.
 """
 from __future__ import annotations
@@ -28,7 +29,7 @@ import pandas as pd
 SEED = 3
 DEFAULT_OUTPUT = Path(__file__).resolve().parent / "out" / "admixed_ld"
 FILES = [f"{p}.{e}" for p in ("panel_afr", "panel_eur", "cohort") for e in ("bed", "bim", "fam")] + [
-    "cohort.cov", "trait.sumstats", "cohort.annot"]
+    "cohort.cov", "trait.sumstats", "trait2.sumstats", "trait.pheno", "trait2.pheno", "cohort.annot"]
 
 
 def _haplotypes(rng, founders, cm, n_hap, copy_rate, anc=None, break_rate=0.0):
@@ -126,7 +127,7 @@ def gwas(G, y, C):
 def generate(output: Path, h2: float = 0.3) -> None:
     output = output.resolve()
     params = dict(seed=SEED, n_chr=6, snps_per_chr=400, chr_cm=60.0, n_panel=1000, n_cohort=3000, generations=8.0)
-    description = {"kind": "summit.admixed_ld_example", "version": 1, "h2": h2, **params}
+    description = {"kind": "summit.admixed_ld_example", "version": 2, "h2": h2, "rg": 0.6, **params}
     marker = output / "admixed_ld.json"
     if output.exists():
         if (marker.is_file() and json.loads(marker.read_text()) == description
@@ -151,13 +152,20 @@ def generate(output: Path, h2: float = 0.3) -> None:
     rng = np.random.default_rng(SEED + 1)
     sd = G.std(0)
     poly = sd > 0
-    g = ((G[:, poly] - G[:, poly].mean(0)) / sd[poly]) @ rng.normal(0.0, 1.0, int(poly.sum()))
-    y = np.sqrt(h2) * g / g.std() + np.sqrt(1 - h2) * rng.standard_normal(G.shape[0]) + 0.3 * C[:, 0] / C[:, 0].std()
-    beta, se = gwas(G, y, C)
-    ok = np.isfinite(beta) & np.isfinite(se) & (se > 0)
-    pd.DataFrame({"SNP": v.SNP, "CHR": v.CHR, "BP": v.BP, "A1": v.A1, "A2": v.A2, "N": len(y), "BETA": beta, "SE": se,
-                  "Z": beta / se, "COV_RANK": C.shape[1]})[ok].to_csv(output / "trait.sumstats", sep="\t",
-                                                                     index=False, float_format="%.8g")
+    Xs = (G[:, poly] - G[:, poly].mean(0)) / sd[poly]
+    b1 = rng.normal(0.0, 1.0, int(poly.sum()))
+    b2 = 0.6 * b1 + 0.8 * rng.normal(0.0, 1.0, int(poly.sum()))     # effects with correlation 0.6
+    for name, b in (("trait", b1), ("trait2", b2)):
+        g = Xs @ b
+        y = np.sqrt(h2) * g / g.std() + np.sqrt(1 - h2) * rng.standard_normal(G.shape[0]) + 0.3 * C[:, 0] / C[:, 0].std()
+        pd.DataFrame({"FID": iid, "IID": iid, name: y}).to_csv(output / f"{name}.pheno", sep="\t", index=False,
+                                                               float_format="%.8g")
+        beta, se = gwas(G, y, C)
+        ok = np.isfinite(beta) & np.isfinite(se) & (se > 0)
+        pd.DataFrame({"SNP": v.SNP, "CHR": v.CHR, "BP": v.BP, "A1": v.A1, "A2": v.A2, "N": len(y), "BETA": beta,
+                      "SE": se, "Z": beta / se, "COV_RANK": C.shape[1]})[ok].to_csv(output / f"{name}.sumstats",
+                                                                                     sep="\t", index=False,
+                                                                                     float_format="%.8g")
     p = G.mean(0) / 2
     common = (np.minimum(p, 1 - p) >= 0.2).astype(int)
     pd.DataFrame({"CHR": v.CHR, "BP": v.BP, "SNP": v.SNP, "CM": v.CM, "maf_low": 1 - common,

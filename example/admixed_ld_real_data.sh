@@ -1,0 +1,85 @@
+#!/usr/bin/env bash
+# SUMMIT-MIX on a real admixed cohort: a template. Fill in the inputs below, then run the steps in order. Steps 2-3
+# (and the optional 2b) read individual-level genotypes and run where the cohort's data are; they write aggregates
+# only. Steps 1 and 4-6 need no individual-level data. See the wiki page "Admixed cohorts without in-sample LD".
+#
+# Times and memory were measured on 3,787 and 6,111 people at 405,807 array SNPs with two sources (UK Biobank). The
+# curve's main pass grows with people x SNPs. Its background term grows with people and with the square of the least
+# differentiated SNPs per chromosome, and dominates at biobank scale. Plan for hours and tens of GB at 10^5 people at
+# HapMap3 density.
+set -euo pipefail
+
+# ------------------------------------------------------------------------------------------------ inputs (fill in)
+PANELS=(/path/to/panels/afr /path/to/panels/eur)  # PLINK prefixes of unadmixed source panels, e.g. 1000 Genomes YRI, ESN,
+                                                # GWD, MSL and CEU, GBR, TSI, IBS, FIN, in the cohort's genome build
+NAMES=AFR,EUR                                   # source names, in the order of PANELS (the last is the baseline)
+MAP=/path/to/maps/genetic_map_chr{chr}_combined_b38.txt   # genetic map of the same build ({chr} per chromosome)
+COHORT=/path/to/cohort/qc                       # QC'd PLINK 1 BED or PLINK 2 PGEN prefix of the cohort (autosomes)
+GWAS_SAMPLE=/path/to/gwas_sample.txt            # FID IID of the GWAS's people (one file per GWAS sample)
+GWAS_COV=/path/to/gwas_covariates.txt           # FID IID and exactly the GWAS's covariates, PCs included
+PAIRS=/path/to/related_pairs.tsv                # IID1 IID2 of related pairs (e.g. relatedness > 0.0442 in a GRM of
+                                                # PC-adjusted genotypes); keeps families in one half of the cell matrix
+SUMSTATS=/path/to/sumstats                      # SUMMIT summary statistics of the GWAS (BETA SE N COV_RANK, CHR BP),
+                                                # least-squares or linear-probability, one file per trait
+ANNOT=/path/to/annot.tsv.gz                     # annotation of the fit (e.g. eight MAF/LD bins)
+DATE=6                                          # published admixture date in generations, for date mode (6 for African
+                                                # American and African Caribbean groups, 11 for US Latino groups)
+THREADS=16
+OUT=/path/to/output
+
+missing() { echo "$1 not found; fill in the inputs at the top of $0" >&2; exit 2; }
+for f in "${PANELS[@]}" "$COHORT"; do [ -e "$f.bed" ] || [ -e "$f.pgen" ] || missing "$f"; done
+for f in "$GWAS_SAMPLE" "$GWAS_COV" "$PAIRS" "$SUMSTATS" "$ANNOT"; do [ -e "$f" ] || missing "$f"; done
+mkdir -p "$OUT"
+PANEL_ARGS=(); for p in "${PANELS[@]}"; do PANEL_ARGS+=(--panel "$p"); done
+
+# ------------------------------------------------------------------------------------------------ 1. reference (anyone)
+# Once per set of panels. About 18 minutes on 16 cores for 17,000 panel members at array density (1000 Genomes panels
+# are much faster), a few GB of memory; the resource is about 4 GB for 400,000 SNPs. Add --drop-ambiguous to every step
+# if the panels and the cohort may be on different strands (the curve stops when it sees it).
+summit admixed-ld reference "${PANEL_ARGS[@]}" --names "$NAMES" --genetic-map "$MAP" --threads "$THREADS" --out "$OUT/ref"
+# The panels' own admixture LD and background: about 15 minutes on 4 cores for the same panels, 3 GB.
+summit admixed-ld clean-panels --ref "$OUT/ref" "${PANEL_ARGS[@]}" --names "$NAMES" --threads 4 --out "$OUT/ref_clean"
+
+# ------------------------------------------------------------------------------------------------ 2. curve (cohort)
+# Curve mode. Run where the genotypes are, on the GWAS's people with the GWAS's covariates. 9-16 minutes on 8 cores for
+# 3,800-6,100 people at 405,807 SNPs, 3 GB. Writes aggregates only (may leave the controlled environment):
+# curve.curve.tsv, .curve.json, .background.tsv, .cells.npz (and .relatedness.tsv, .relatedness_chr.npz). The json
+# records the number of people and of related pairs; check them against the cohort's rules on small counts.
+summit admixed-ld curve --geno "$COHORT" --ref "$OUT/ref_clean" --keep "$GWAS_SAMPLE" --covar "$GWAS_COV" \
+  --relative-pairs "$PAIRS" --background --threads 8 --out "$OUT/curve"
+
+# 2b (optional, a few hundred people only): the sample statistic, the cost of a GRM; aggregates only.
+# summit admixed-ld sample-factors --geno "$COHORT" --ref "$OUT/ref_clean" --keep "$GWAS_SAMPLE" --covar "$GWAS_COV" \
+#   --threads 8 --out "$OUT/sample"
+
+# ------------------------------------------------------------------------------------------------ 3. compose (anyone)
+# About 6 minutes on one core and 3 GB at array density, half of it writing one file per GWAS sample size; linear in
+# the SNP pairs within 3 Mb. Read the warnings and the flags in each .admixed_ld.json.
+summit admixed-ld compose --ref "$OUT/ref_clean" --sumstats "$SUMSTATS" --annot "$ANNOT" \
+  --curve "$OUT/curve" --relatedness curve --cell-matrix --out "$OUT/ld_curve"
+# Date mode, from the summary statistics and a published date alone (add --ancestry-sd with a published value if one
+# exists):
+summit admixed-ld compose --ref "$OUT/ref_clean" --sumstats "$SUMSTATS" --annot "$ANNOT" \
+  --admixture-generations "$DATE" --out "$OUT/ld_date"
+
+# ------------------------------------------------------------------------------------------------ 4. h2 and rg (anyone)
+# One LD-score file per GWAS sample size: OUT/ld_curve.n_groups.tsv lists each trait's file (OUT/ld_curve.gw.ldscore.gz
+# when every trait has the same N). For rg, give each GWAS's phenotype and covariate files (--pheno-rg, --pheno-rg-cov)
+# where they are at hand, so that the overlapping covariance is computed from them.
+groups="$OUT/ld_curve.n_groups.tsv"
+for ss in "$SUMSTATS"/*; do
+  t=$(basename "$ss")
+  ld="$OUT/ld_curve.gw.ldscore.gz"
+  [ -f "$groups" ] && ld=$(awk -F'\t' -v t="$t" '$1 == t {print $3}' "$groups")
+  summit --h2 "$ss" --ldscores "$ld" --annot "$ANNOT" --num-threads 4 --out "$OUT/h2_${t%%.*}"
+done
+
+# ------------------------------------------------------------------------------------------------ 5. fine-mapping (anyone)
+# A regional matrix per region (seconds), oriented to the counted allele in region.snps.tsv; align the z-scores to it.
+# summit admixed-ld matrix --ref "$OUT/ref_clean" --params "$OUT/ld_curve.admixed_ld.json" --curve "$OUT/curve" \
+#   --region 4:1000000-4000000 --out "$OUT/fm/region1"
+
+# ------------------------------------------------------------------------------------------------ 6. track rg (optional)
+# Needs a Tractor-style GWAS with sandwich SEs from the covariates-only residuals (se_hcn_anc<s>); see the wiki.
+echo "SUMMIT-MIX template finished; outputs in $OUT"
