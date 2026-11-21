@@ -210,3 +210,69 @@ def test_tractor_sumstats_prefers_the_covariates_only_sandwich(tmp_path):
     _tractor_table(tmp_path / "ols.tsv", [])
     with pytest.raises(ValueError, match="covariates-only model"):
         tractor_sumstats(str(tmp_path / "ols.tsv"), str(tmp_path / "ols"), sources=["AFR", "EUR"], log=quiet)
+
+
+# ----------------------------------------------------------------------------------------------- curve-mode defaults
+def test_command_line_defaults_are_curve_mode(small, tmp_path):
+    from summit.entrypoint import main
+    d = small["dir"]
+    ref = str(tmp_path / "ref_clean")
+    assert main(["admixed-ld", "clean-panels", "--ref", str(d / "ref"), "--panel", str(d / "panelA"), "--panel",
+                 str(d / "panelE"), "--names", "AFR,EUR", "--out", ref]) == 0
+    assert main(["admixed-ld", "curve", "--geno", str(d / "cohort"), "--ref", ref, "--covar", str(d / "cohort.cov"),
+                 "--cell-cm", "0.5", "--out", str(tmp_path / "c")]) == 0
+    info = json.load(open(tmp_path / "c.curve.json"))
+    assert "background" in info and "cells" in info                  # the background term by default
+    out = str(tmp_path / "ld")
+    base = ["admixed-ld", "compose", "--ref", ref, "--sumstats", str(d / "ss"), "--annot", str(d / "annot.tsv"),
+            "--curve", str(tmp_path / "c")]
+    assert main(base + ["--out", out]) == 0
+    p = json.load(open(out + ".admixed_ld.json"))
+    assert p["relatedness_profile"]["mode"] == "background" and p["cell_matrix"] is not None
+    assert main(base + ["--relatedness", "none", "--no-cell-matrix", "--out", out + "_bare"]) == 0
+    q = json.load(open(out + "_bare.admixed_ld.json"))
+    assert q["relatedness_profile"] is None and q["cell_matrix"] is None
+    # the same curve with a reference that was never cleaned: the background term needs the panels' own
+    with pytest.raises(ValueError, match="--relatedness none"):
+        compose_ldscores(str(d / "ref"), [str(d / "ss")], str(d / "annot.tsv"), str(tmp_path / "x"),
+                         curve=str(tmp_path / "c"), relatedness="auto", cell_matrix="auto", log=quiet)
+
+
+def test_listed_pairs_profile_only_without_background(small, tmp_path):
+    d, iid = small["dir"], small["iid"]
+    pd.DataFrame({"IID1": iid[0:40:2], "IID2": iid[1:40:2]}).to_csv(tmp_path / "pairs.tsv", sep="\t", index=False)
+    _, info = genotype_curve(str(d / "cohort"), str(d / "ref"), str(tmp_path / "c"), covar=str(d / "cohort.cov"),
+                             cell_cm=0.5, relative_pairs=str(tmp_path / "pairs.tsv"), background=True, log=quiet)
+    assert info["relatedness"]["pairs"] == 20 and "profile" not in info["relatedness"]
+    assert not os.path.exists(tmp_path / "c.relatedness.tsv")
+    _, info = genotype_curve(str(d / "cohort"), str(d / "ref"), str(tmp_path / "c2"), covar=str(d / "cohort.cov"),
+                             cell_cm=0.5, relative_pairs=str(tmp_path / "pairs.tsv"), background=False, log=quiet)
+    assert "profile" in info["relatedness"] and os.path.exists(tmp_path / "c2.relatedness.tsv")
+
+
+def test_background_memory_budget_subsamples(small, tmp_path):
+    d = small["dir"]
+    kw = dict(covar=str(d / "cohort.cov"), cell_cm=0.5, background=True, background_quantile=0.5, log=quiet)
+    _, full = genotype_curve(str(d / "cohort"), str(d / "ref"), str(tmp_path / "f"), **kw)
+    _, cut = genotype_curve(str(d / "cohort"), str(d / "ref"), str(tmp_path / "s"), background_memory_gb=0.0005, **kw)
+    assert not full["background"]["subsampled"] and set(cut["background"]["subsampled"]) == {"1", "2"}
+    assert cut["background"]["n_snps"] < full["background"]["n_snps"]
+    a, b = (pd.read_csv(tmp_path / f"{x}.background.tsv", sep="\t") for x in ("f", "s"))
+    far = lambda t: float((t.excess * t.w)[t.d_cm > 5].sum() / t.w[t.d_cm > 5].sum())
+    assert np.isfinite(far(b)) and abs(far(b) - far(a)) < 5 * abs(far(a)) + 1.0     # same quantity, noisier
+
+
+def test_per_sample_size_files_only_when_they_differ(small, tmp_path):
+    d = small["dir"]
+    ss = pd.read_csv(d / "ss" / "trait0.tsv", sep="\t")
+    for tag, (n1, n2) in {"small": (900, 1800), "large": (100000, 120000)}.items():
+        os.makedirs(tmp_path / tag)
+        for i, n in enumerate((n1, n2)):                 # N scales SE^2, so m and kappa_res(0) do not move
+            ss.assign(N=n, SE=ss.SE * np.sqrt(900.0 / n)).to_csv(tmp_path / tag / f"t{i}.tsv", sep="\t", index=False)
+        p = compose_ldscores(str(d / "ref"), [str(tmp_path / tag)], str(d / "annot.tsv"), str(tmp_path / f"ld_{tag}"),
+                             generations=8, log=quiet)
+        files = sorted(x.name for x in tmp_path.glob(f"ld_{tag}.n*.gw.ldscore.gz"))
+        if tag == "small":
+            assert len(files) == 2 and os.path.exists(tmp_path / f"ld_{tag}.n_groups.tsv")
+        else:
+            assert files == [] and all(g.get("merged") for g in p["n_groups"])

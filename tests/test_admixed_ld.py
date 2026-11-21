@@ -196,7 +196,7 @@ def test_command_line_end_to_end(sim, tmp_path):
     assert main(["admixed-ld", "reference", "--panel", str(d / "panelA"), "--panel", str(d / "panelE"),
                  "--names", "AFR,EUR", "--out", ref, "--step", "300"]) == 0
     assert main(["admixed-ld", "curve", "--geno", str(d / "cohort"), "--ref", ref, "--covar", str(d / "cohort.cov"),
-                 "--cell-cm", "0.5", "--out", str(tmp_path / "c")]) == 0
+                 "--cell-cm", "0.5", "--no-background", "--out", str(tmp_path / "c")]) == 0
     out = str(tmp_path / "ld")
     assert main(["admixed-ld", "compose", "--ref", ref, "--sumstats", str(d / "ss"), "--annot", str(d / "annot.tsv"),
                  "--curve", str(tmp_path / "c"), "--out", out]) == 0
@@ -1052,7 +1052,8 @@ def test_background_measures_all_pairs(fam, tmp_path):
     d = fam["dir"]
     _, info = genotype_curve(str(d / "cohort"), str(d / "ref"), str(tmp_path / "cb"), covar=str(d / "cohort.cov"),
                              cell_cm=0.5, relative_pairs=str(d / "pairs.tsv"), relatedness_cell_cm=0.5,
-                             background=True, background_quantile=0.5, log=lambda *a: None)
+                             background=True, background_quantile=0.5, relatedness_profile=True,
+                             log=lambda *a: None)
     b = pd.read_csv(f"{tmp_path / 'cb'}.background.tsv", sep="\t")
     r = pd.read_csv(f"{tmp_path / 'cb'}.relatedness.tsv", sep="\t")
     m = b.merge(r[["lag", "phi", "w"]], on="lag", suffixes=("", "_l"))

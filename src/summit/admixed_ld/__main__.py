@@ -3,9 +3,9 @@
   summit admixed-ld reference    --panel AFR_PREFIX --panel EUR_PREFIX --names AFR,EUR [--genetic-map MAP] --out REF
   summit admixed-ld clean-panels --ref REF --panel AFR_PREFIX --panel EUR_PREFIX --names AFR,EUR --out REF_CLEAN
   summit admixed-ld curve        --geno COHORT --ref REF_CLEAN --keep GWAS_SAMPLE --covar GWAS_COVARIATES
-                                 --relative-pairs PAIRS --background --out CURVE        (curve mode; aggregates only)
+                                 --relative-pairs PAIRS --out CURVE                     (curve mode; aggregates only)
   summit admixed-ld compose      --ref REF_CLEAN --sumstats FILE_OR_DIR [...] --annot ANNOT --out PREFIX
-                                 (--curve CURVE --relatedness curve --cell-matrix | --admixture-generations T)
+                                 (--curve CURVE | --admixture-generations T)
   summit admixed-ld sample-factors --geno COHORT --ref REF_CLEAN --keep GWAS_SAMPLE --covar GWAS_COVARIATES --out SF
   summit admixed-ld derive       --geno COHORT --ref REF --name NAT --panel NAT_ANCHORS --out REF_WITH_NAT
   summit admixed-ld matrix       --ref REF_CLEAN --params PREFIX.admixed_ld.json --region CHR:START-END
@@ -119,10 +119,17 @@ def main(argv=None):
                         "(default 4)")
     c.add_argument("--no-relatedness-profile", action="store_true",
                    help=argparse.SUPPRESS)
-    c.add_argument("--background", action="store_true",
+    c.add_argument("--no-background", dest="background", action="store_false",
+                   help="leave out the background term (by default it is measured; it is part of curve mode)")
+    c.add_argument("--background", dest="background", action="store_true", default=True,
                    help="also measure the background term, the LD that all pairs of people add by sharing segments "
                         "identical by descent (relatives included), from the least differentiated SNPs, by distance "
                         "and between chromosomes (PREFIX.background.tsv; aggregates only). Part of curve mode")
+    c.add_argument("--background-memory-gb", type=float, default=32.0,
+                   help="memory for each chromosome's background SNPs (people x SNPs float64); above it a random "
+                        "subset of them is used, which keeps the term unbiased (default 32)")
+    c.add_argument("--relatedness-profile", dest="relatedness_profile_on", action="store_true",
+                   help=argparse.SUPPRESS)
     c.add_argument("--background-quantile", type=float, default=0.2,
                    help="share of SNPs with the smallest source contrasts used for --background (default 0.2)")
     c.add_argument("--background-snps", type=int, default=None,
@@ -164,9 +171,9 @@ def main(argv=None):
                    help="SD of global ancestry for the same-person term, a published value (default: the curve's "
                         "moments in curve mode, else the SD implied by the SEs' m and kappa_res(0) under random "
                         "mating)")
-    m.add_argument("--relatedness", default=None,
-                   help="the background term: 'curve' for the cohort's background at every distance from a curve "
-                        "made with --background (curve mode). The curve's sums run over its own people and are "
+    m.add_argument("--relatedness", default="auto",
+                   help="the background term: by default (with --curve) the cohort's background at every distance "
+                        "from the curve; 'none' leaves it out. The curve's sums run over its own people and are "
                         "put on the GWAS's sample by N (N - 1) / (n (n - 1)), with a recorded flag when the two "
                         "differ by more than 1%%")
     m.add_argument("--relatedness-smooth", type=float, default=0.1,
@@ -177,9 +184,11 @@ def main(argv=None):
                    help=argparse.SUPPRESS)
     m.add_argument("--nu", type=float, default=None, help="sample size minus covariates (default from the GWAS)")
     m.add_argument("--grid-cm", type=float, default=0.02, help=argparse.SUPPRESS)
-    m.add_argument("--cell-matrix", action="store_true",
+    m.add_argument("--no-cell-matrix", dest="cell_matrix", action="store_const", const=False, default="auto",
+                   help="leave out the cohort's cell matrix (used by default with --curve)")
+    m.add_argument("--cell-matrix", dest="cell_matrix", action="store_const", const=True, default="auto",
                    help="use the cohort's cell matrix (written by curve) for pairs of 2-cM cells at least 10 cM apart "
-                        "and between chromosomes (curve mode)")
+                        "and between chromosomes (the default with --curve)")
     m.add_argument("--cell-switch-cm", type=float, default=10.0, help=argparse.SUPPRESS)
     m.add_argument("--allow-flat-kernel-join", action="store_true",
                    help="proceed when the curve at 2 cM is not below kappa_res(0) from the standard errors (the "
@@ -396,7 +405,10 @@ def _run(a, log):
         genotype_curve(a.geno, a.ref, a.out, sources=_sources(a.sources), covar=a.covar, keep=a.keep, match=a.match,
                        cell_cm=a.cell_cm, max_cm=a.max_cm, relative_pairs=a.relative_pairs, kinship_col=a.kinship_col,
                        kinship_min=a.kinship_min, closure=a.closure, step=a.step, threads=a.threads,
-                       noise_correction=not a.keep_panel_noise, relatedness_profile=not a.no_relatedness_profile,
+                       noise_correction=not a.keep_panel_noise,
+                       relatedness_profile=(False if a.no_relatedness_profile else True if a.relatedness_profile_on
+                                            else None),
+                       background_memory_gb=a.background_memory_gb,
                        relatedness_cell_cm=a.relatedness_cell_cm, relatedness_controls=a.relatedness_controls,
                        relatedness_memory_gb=a.relatedness_memory_gb, background=a.background,
                        background_quantile=a.background_quantile, background_between_snps=a.background_snps,

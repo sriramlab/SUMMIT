@@ -1193,7 +1193,9 @@ def write_gw_ldscore_table(outpath, snpdf, scores_df, *, snp_var=None, ld_rel=No
     if ld_rel is not None:
         parts.append(pd.DataFrame(ld_rel, columns=[f"LD_REL_{c}" for c in scores_df.columns]))
     out_df = pd.concat(parts, axis=1)
-    out_df.to_csv(f'{outpath}.gw.ldscore.gz', index=False, compression='gzip', sep='\t', float_format='%.6f')
+    # gzip level 6: the same text as level 9 in about half the time, about 1% larger
+    out_df.to_csv(f'{outpath}.gw.ldscore.gz', index=False, compression={'method': 'gzip', 'compresslevel': 6},
+                  sep='\t', float_format='%.6f')
     return f'{outpath}.gw.ldscore.gz'
 
 

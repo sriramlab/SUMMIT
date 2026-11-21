@@ -267,10 +267,24 @@ class _Background:
     Below a few cM the same sums also hold within-source LD, which is not subtracted (compose uses the measurement only
     beyond its --background-min-cm)."""
 
-    def __init__(self, select, N, df_res, p_rank, cell_cm, k1, between_snps, seed=20261105):
-        self.select = np.asarray(select, bool)                 # per matched SNP
+    def __init__(self, select, N, df_res, p_rank, cell_cm, k1, between_snps, seed=20261105, chrom=None,
+                 memory_gb=None, mp=None):
+        self.select = np.asarray(select, bool).copy()          # per matched SNP
         self.N, self.df_res, self.ptot = int(N), int(df_res), int(p_rank) + 1
         self.cell_cm, self.k1 = float(cell_cm), int(k1)
+        self.mp = mp                                           # SUMMIT's protected products (numpy without it)
+        # within a chromosome all of its background SNPs are held (N x m_c float64); above memory_gb a random subset
+        # of them is kept, which leaves the per-pair sums unbiased (the between-chromosome part is capped as well)
+        self.subsampled = {}
+        if memory_gb is not None and chrom is not None:
+            chrom = np.asarray(chrom).astype(str)
+            cap = max(64, int(float(memory_gb) * 2 ** 30 // (8 * max(int(N), 1))))
+            rng0 = np.random.default_rng(seed + 1)
+            for c in pd.unique(chrom):
+                ix = np.flatnonzero(self.select & (chrom == c))
+                if ix.size > cap:
+                    self.select[rng0.choice(ix, ix.size - cap, replace=False)] = False
+                    self.subsampled[str(c)] = [int(ix.size), int(cap)]
         idx = np.flatnonzero(self.select)
         rng = np.random.default_rng(seed)
         keep = idx if idx.size <= between_snps else np.sort(rng.choice(idx, int(between_snps), replace=False))
@@ -308,26 +322,35 @@ class _Background:
         o = np.argsort(x, kind="stable")
         U, O, x = U[:, o], O[o], x[o]
         cell = ((x - cm_min) / self.cell_cm).astype(np.int64)
-        U2 = U * U
         m = U.shape[1]
         self.n_snps += m
         k2 = O.shape[1]
-        for s0 in range(0, m, 1024):
-            s1 = min(m, s0 + 1024)
-            T = (U[:, s0:s1].T @ U[:, s0:], U2[:, s0:s1].T @ U2[:, s0:])
-            T = T[0] * T[0] - T[1]                              # j in s0..s1, k >= s0
-            jj, kk = np.nonzero(np.arange(s0, s1)[:, None] < np.arange(s0, m)[None, :])
-            lag = np.abs(cell[s0 + jj] - cell[s0 + kk])
-            dd = np.abs(x[s0 + jj] - x[s0 + kk])
-            L = int(lag.max()) + 1 if lag.size else 1
-            self._add("x", np.bincount(lag, weights=T[jj, kk], minlength=L))
-            self._add("w", np.bincount(lag, minlength=L).astype(np.float64))
-            self._add("dsum", np.bincount(lag, weights=dd, minlength=L))
-            oo = np.zeros((L, k2, k2))
-            for u_ in range(k2):
-                for v_ in range(k2):
-                    oo[:, u_, v_] = np.bincount(lag, weights=O[s0 + jj, u_] * O[s0 + kk, v_], minlength=L)
-            self._add("oo", oo)
+        for s0 in range(0, m, 1024):                           # blocks of pairs (j in s0..s1, k in c0..c1, j < k); the
+            s1 = min(m, s0 + 1024)                             # squares are formed block by block, so only U is held
+            A = U[:, s0:s1]
+            A2 = A * A
+            for c0 in range(s0, m, 4096):
+                c1 = min(m, c0 + 4096)
+                Bk = U[:, c0:c1]
+                T = self._tn(A, Bk)
+                T = T * T - self._tn(A2, Bk * Bk)
+                jj, kk = np.nonzero(np.arange(s0, s1)[:, None] < np.arange(c0, c1)[None, :])
+                if jj.size == 0:
+                    continue
+                lag = np.abs(cell[s0 + jj] - cell[c0 + kk])
+                dd = np.abs(x[s0 + jj] - x[c0 + kk])
+                L = int(lag.max()) + 1
+                self._add("x", np.bincount(lag, weights=T[jj, kk], minlength=L))
+                self._add("w", np.bincount(lag, minlength=L).astype(np.float64))
+                self._add("dsum", np.bincount(lag, weights=dd, minlength=L))
+                oo = np.zeros((L, k2, k2))
+                for u_ in range(k2):
+                    for v_ in range(k2):
+                        oo[:, u_, v_] = np.bincount(lag, weights=O[s0 + jj, u_] * O[c0 + kk, v_], minlength=L)
+                self._add("oo", oo)
+
+    def _tn(self, a, b):
+        return self.mp.tn(a, b) if self.mp is not None else a.T @ b
 
     def _add(self, key, v):
         cur = getattr(self, key)
@@ -360,9 +383,9 @@ class _Background:
             A2 = A * A
             for c0 in range(0, m, cols):
                 c1 = min(m, c0 + cols)
-                Uc = U[:, c0:c1]
-                G = A.T @ Uc.astype(np.float64)
-                F = A2.T @ (Uc * Uc).astype(np.float64)
+                Uc = U[:, c0:c1].astype(np.float64)
+                G = self._tn(A, Uc)
+                F = self._tn(A2, Uc * Uc)
                 diff = ch[s0:s1][:, None] != ch[None, c0:c1]
                 xs += float(((G * G - F) * diff).sum())
                 ws += float(diff.sum())
@@ -385,7 +408,7 @@ class _Background:
         Ff = np.einsum("ab,ce->acbe", far, far).reshape(k1 * k1, k1 * k1)
         adm_b = n * (n - 1) * float(np.sum(Ff * b["oo"]))
         val = (b["x"] - adm_b) / b["w"] - null if b["w"] > 0 else float("nan")
-        return tab, dict(null=null, n_snps=int(self.n_snps), cell_cm=self.cell_cm,
+        return tab, dict(null=null, n_snps=int(self.n_snps), cell_cm=self.cell_cm, subsampled=self.subsampled,
                          between=dict(x=b["x"], w=b["w"], adm=adm_b, n_snps=b["n_snps"], value=val))
 
 
@@ -440,9 +463,9 @@ def _phi_at(tab, ds):
 def genotype_curve(geno, ref_path, out, *, sources=None, covar=None, keep=None, match="position", cell_cm=0.25,
                    max_cm=None, theta_min_delta=0.2, relative_pairs=None, kinship_col=None, kinship_min=None,
                    closure=False, cells_cm=2.0, per_chromosome=False, step=4096, threads=1, native=True,
-                   noise_correction=True, relatedness_profile=True, relatedness_cell_cm=0.5, relatedness_controls=None,
+                   noise_correction=True, relatedness_profile=None, relatedness_cell_cm=0.5, relatedness_controls=None,
                    relatedness_memory_gb=4.0, background=False, background_quantile=0.2, background_between_snps=None,
-                   drop_ambiguous=False, log=print):
+                   background_memory_gb=32.0, drop_ambiguous=False, log=print):
     """The weighted-LD curve of the cohort for two or more sources. With cells_cm, also the genome-wide matrix of
     covariances between cells of cells_cm cM (within and between chromosomes) and the sampling variance of each entry,
     written to out.cells.npz: it carries long-range structure that one value per distance cannot (for example what the
@@ -484,6 +507,8 @@ def genotype_curve(geno, ref_path, out, *, sources=None, covar=None, keep=None, 
             rp = read_relative_pairs(relative_pairs, samples, kinship_col=kinship_col, kinship_min=kinship_min,
                                      closure=True)
         pa, pb = pairs_within_sample(rp, rows, len(samples))
+        if relatedness_profile is None:                        # the all-pairs background holds the listed pairs too;
+            relatedness_profile = not background               # their profile is needed only without it
         relatedness_profile = bool(relatedness_profile) and pa.size > 0
         rel = None if relatedness_profile else _PairRelatedness(pa, pb)
         log(f"[admixed-ld] curve: {pa.size} relative pairs among the {N} samples")
@@ -534,7 +559,11 @@ def genotype_curve(geno, ref_path, out, *, sources=None, covar=None, keep=None, 
         sel_bg = amax <= np.quantile(amax, float(background_quantile))
         nb_max = int(background_between_snps) if background_between_snps is not None else \
             int(min(40000, relatedness_memory_gb * 2 ** 30 // (4 * N)))
-        bg = _Background(sel_bg, N, df_res, p_rank, relatedness_cell_cm, k1, nb_max)
+        bg = _Background(sel_bg, N, df_res, p_rank, relatedness_cell_cm, k1, nb_max, chrom=chrom,
+                         memory_gb=background_memory_gb, mp=mp)
+        if bg.subsampled:
+            log("[admixed-ld] curve: background SNPs subsampled to fit --background-memory-gb on chromosomes "
+                + ", ".join(f"{c} ({a} to {b})" for c, a, b in ((c, *v) for c, v in bg.subsampled.items())))
         log(f"[admixed-ld] curve: background relatedness LD from all pairs of people, on the {int(sel_bg.sum())} SNPs "
             f"with the smallest source contrasts (|D| <= {np.quantile(amax, float(background_quantile)):.4f}); "
             f"between chromosomes on {int(bg.between_mask.sum())} of them")

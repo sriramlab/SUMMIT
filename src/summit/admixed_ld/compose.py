@@ -791,7 +791,7 @@ def compose_ldscores(ref_path, sumstats, annot, out, *, sources=None, snps=None,
         raise ValueError("partners must be 'rows' (the GWAS SNPs) or 'reference' (every reference variant in the "
                          "annotation).")
     dense = partners == "reference"
-    if dense and (cell_matrix or sample_factors is not None or calibrate_between_chromosomes):
+    if dense and (cell_matrix is True or sample_factors is not None or calibrate_between_chromosomes):
         raise ValueError("--partners reference cannot be combined with --cell-matrix, --sample-factors or "
                          "--calibrate-between-chromosomes: those are measured on the GWAS SNPs.")
     if track_alpha is not None and not tracks:
@@ -951,6 +951,17 @@ def compose_ldscores(ref_path, sumstats, annot, out, *, sources=None, snps=None,
                                        source=f"admixture {generations} generations ago")
     else:
         kern = KernelMatrix.from_decay(k0, float(decay_per_cm), ref.genome_cm, nK, source=f"decay {decay_per_cm} per cM")
+    # curve mode by default: with a curve, its background term and cell matrix whenever it has them ('auto', the
+    # command line's default); 'none' / False leave them out
+    if str(relatedness) == "auto":
+        relatedness = "curve" if (curve_info is not None and "background" in curve_info) else None
+    elif str(relatedness).lower() == "none":
+        relatedness = None
+    if isinstance(cell_matrix, str) and cell_matrix == "auto":
+        cell_matrix = bool(curve_info is not None and "cells" in curve_info and not dense)
+    if curve_info is not None:
+        log(f"[admixed-ld] compose: curve mode; background term {'from the curve' if relatedness else 'none'}, cell "
+            f"matrix {'used' if cell_matrix else 'not used'}")
     flags = flags + check_kernel_join(kern, allow_flat_kernel_join, log)
     for n_, s in enumerate(sources):           # panels whose own admixture LD was never measured (clean-panels)
         src_m = ref.manifest["sources"][si[n_]]
@@ -1048,7 +1059,8 @@ def compose_ldscores(ref_path, sumstats, annot, out, *, sources=None, snps=None,
             raise ValueError("--relatedness curve with the cohort's background at every distance needs each panel's "
                              f"own background, which {ref_path} does not record for {', '.join(missing)}: run "
                              "`summit admixed-ld clean-panels` (it measures it; for a derived source with a panel's "
-                             "LD give its anchor panel).")
+                             "LD give its anchor panel), or pass --relatedness none to compose without the "
+                             "background term.")
         log("[admixed-ld] compose: the panels' own background LD is removed inside the band ("
             + ", ".join(f"{sources[n_]}: {pb.per_pair(2.0):.3g} per SNP pair at 2 cM, n {pb.n}"
                         for n_, pb in panel_bg.items()) + ")")
@@ -1397,6 +1409,20 @@ def compose_ldscores(ref_path, sumstats, annot, out, *, sources=None, snps=None,
         if len(groups_info) > 1:
             n_curve_rel = int(curve_info["n_samples"]) if (R1 is not None and curve_info is not None
                                                            and "n_samples" in curve_info) else None
+            # the groups' files differ from the main one only in the sample terms; when no group's LD mass differs
+            # from the main file's by 0.1% (large samples, few SNPs per person), the main file serves every trait
+            mvec = lambda X: float((V[:, None] * X).sum())
+            m_pop, m_sp = mvec(L_pop), mvec(sp)
+            m_r1 = 0.0 if R1 is None else mvec(R1)
+            m_main = m_pop + m_sp + (0.0 if R1 is None else rel_scale / nu ** 2 * m_r1)
+            dev = max(abs(m_pop + m_sp * nu / g["nu"] + (0.0 if R1 is None else (
+                relatedness_scale(n_curve_rel, g["N"]) if n_curve_rel else rel_scale) / g["nu"] ** 2 * m_r1)
+                - m_main) / m_main for g in groups_info)
+            if dev < 1e-3:
+                log(f"[admixed-ld] compose: {len(groups_info)} GWAS sample sizes among the traits, but their LD masses "
+                    f"differ from the median N's by at most {dev:.2e}; one file serves every trait")
+                groups_info = [dict(g, file=f"{out}.gw.ldscore.gz", merged=True) for g in groups_info]
+        if len(groups_info) > 1 and not groups_info[0].get("merged"):
             for g in groups_info:
                 fg = relatedness_scale(n_curve_rel, g["N"]) if (R1 is not None and n_curve_rel) else rel_scale
                 Lg = L_pop + sp * (nu / g["nu"]) + (0.0 if R1 is None else (fg / g["nu"] ** 2) * R1)
