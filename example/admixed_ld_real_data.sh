@@ -86,4 +86,12 @@ done
 # ------------------------------------------------------------------------------------------------ 6. track rg (optional)
 # Needs phased genotypes and local-ancestry calls of the GWAS sample, and a Tractor-style GWAS with sandwich SEs from
 # the covariates-only residuals (se_hcn_anc<s>); the GWAS runs where the genotypes are, the rest anywhere. See the wiki.
+# summit admixed-ld tractor-gwas --pgen /path/to/phased_chr{chr} --lanc /path/to/lanc_chr{chr}.lanc --pheno PHENO \
+#   --covar "$GWAS_COV" --keep "$GWAS_SAMPLE" --sources AFR,EUR --threads 16 --out "$OUT/tractor/gwas"
+# for t in height bmi ldl; do summit admixed-ld tractor-sumstats --tractor "$OUT/tractor/gwas.$t.tractor.tsv" \
+#   --sources AFR,EUR --out "$OUT/tracks/$t"; done
+# summit admixed-ld compose --ref "$OUT/ref_clean" --sumstats "$OUT/tracks/height.AFR.sumstats" --annot MAF5_ANNOT \
+#   --curve "$OUT/curve" --mean-ancestry M_AFR,M_EUR --ancestry-sd SD --tracks --out "$OUT/ld_tracks"
+# summit admixed-ld track-rg --tracks "$OUT/ld_tracks" --sumstats "$OUT"/tracks/height "$OUT"/tracks/bmi \
+#   "$OUT"/tracks/ldl --annot MAF5_ANNOT --out "$OUT/track_rg"
 echo "SUMMIT-MIX template finished; outputs in $OUT"

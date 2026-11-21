@@ -13,7 +13,7 @@ as `summit pgs fit`.
 | Long-range LD correction of h²/rg standard errors | `summit relatives longrange`, then `--long-range-se` |
 | Heritability due to direct genetic effects from sibships | `summit relatives direct` |
 | Local-ancestry markers, merged with the SNPs, and the test of their component | `summit local-ancestry {markers,merge,test}` |
-| LD scores, regional matrices and track correlations of an admixed cohort without its genotypes (SUMMIT-MIX) | `summit admixed-ld {reference,clean-panels,curve,compose,sample-factors,derive,matrix,finemap-variance,tractor-sumstats,track-rg}` |
+| LD scores, regional matrices and track correlations of an admixed cohort without its genotypes (SUMMIT-MIX) | `summit admixed-ld {reference,clean-panels,curve,compose,sample-factors,derive,matrix,finemap-variance,tractor-gwas,tractor-sumstats,track-rg}` |
 | Additive and generalized G×E PCGC | `summit --binary-method pcgc ...` |
 | Generalized cross-trait PCGC | `summit pcgc-cross {prepare,fit}` |
 | One-environment G×E | `summit --geno ... --env ...`, `--gxe-score-reference`, `--gxe-fit`, or `--gxe-fit-batch` |
@@ -52,6 +52,7 @@ curve (curve mode, the default) or a published admixture date (date mode). See
 | `derive` | an admixed cohort that carries a source without a panel, and anchor members | a reference with that source |
 | `matrix` | reference, compose's `.admixed_ld.json`, a region, optionally the GWAS | a regional LD matrix, the aligned z-scores and the predicted error of its entries |
 | `finemap-variance` | a matrix with `--error-variance` and a first SuSiE fit's posterior | the residual variance of the second fit |
+| `tractor-gwas` | phased genotypes, local-ancestry calls, phenotypes and covariates of the GWAS sample | a Tractor-style GWAS with the covariates-only sandwich SEs |
 | `tractor-sumstats` | a Tractor-style GWAS with sandwich SEs | one summary-statistic file per local-ancestry track |
 | `track-rg` | `compose --tracks` LD scores and the track summary statistics | the correlation of effects across tracks |
 

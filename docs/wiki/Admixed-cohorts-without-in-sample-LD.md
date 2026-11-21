@@ -273,7 +273,9 @@ uncorrelated with the other track's alleles. The track LD scores are therefore s
 covariance is zero.
 
 ```bash
-summit admixed-ld tractor-sumstats --tractor tractor/height.tsv --sources AFR,EUR --covariates 13 --out tracks/height
+summit admixed-ld tractor-gwas --pgen phased/chr{chr} --lanc lanc/chr{chr}.lanc --pheno pheno.tsv --covar gwas.cov \
+  --sources AFR,EUR --threads 16 --out tractor/gwas
+summit admixed-ld tractor-sumstats --tractor tractor/gwas.height.tractor.tsv --sources AFR,EUR --out tracks/height
 summit admixed-ld compose --ref ref/afr_eur_clean --sumstats tracks/height.AFR.sumstats --annot maf5.tsv.gz \
   --curve cohort --mean-ancestry 0.59,0.41 --ancestry-sd 0.29 --tracks --cross-source EUR --out ld/tracks
 summit admixed-ld track-rg --tracks ld/tracks --sumstats tracks/height tracks/bmi tracks/ldl --annot maf5.tsv.gz \
@@ -285,10 +287,13 @@ model, σ_i² = e0_i²/(1 − h_ii), with h_ii the person's hat value under the 
 residual variance for everyone, but the track variable's variance follows each person's local ancestry and the residual
 variance of many traits changes with ancestry, so their own-track moments hold same-person terms that the LD scores do
 not model. The usual HC1 sandwich takes σ_i² from the residuals of the full model, which the fit shrinks at alleles
-carried by few people on one ancestry's segments, and its estimates are biased low. Tractor writes only OLS SEs, so
-compute these SEs alongside the regression (a sum over people of x_a x_b σ_i², cheap). `tractor-sumstats` reads them as
-`se_hcn_anc0`, ..., stops without a sandwich column, and records a flag when only full-model sandwich columns (HC0-HC3)
-are present. Leave out rare binary traits, whose sandwich z-scores are heavy-tailed.
+carried by few people on one ancestry's segments, and its estimates are biased low. Tractor writes only OLS SEs.
+`tractor-gwas` fits Tractor's model (the phenotype on the covariates, the local-ancestry dosage and the allele counts on
+each ancestry's haplotypes, from phased PLINK 2 genotypes and admix-kit local-ancestry calls) on each trait's complete
+cases and writes Tractor's columns with these SEs beside the OLS ones (`se_hcn_anc0`, ...; `--hc1` adds HC1 for
+comparison). It runs where the genotypes are and writes summary statistics only. With another GWAS tool, compute the
+SEs alongside the regression (a sum over people of x_a x_b σ_i²). `tractor-sumstats` reads them as `se_hcn_anc0`, ...,
+stops without a sandwich column, and records a flag when only full-model sandwich columns (HC0-HC3) are present. Leave out rare binary traits, whose sandwich z-scores are heavy-tailed.
 
 `compose --tracks` writes each track's own LD scores (`ld/tracks.track_AFR`, `.track_EUR`), their cross scores
 (`.track_AFR_EUR`) and, with `--cross-source EUR`, each track against a GWAS of other people from that population. They
@@ -307,8 +312,8 @@ errors put alleles on the wrong track and push r up, so read r next to the calle
 
 ## Compute
 
-On the UK Biobank development data (3,787 people, 405,807 array SNPs, two sources), `curve` with the background and 592
-related pairs took about 9 minutes on 8 cores with a peak of 2.9 GB. `compose` in curve mode took about 6 minutes on one
+On the UK Biobank development data (3,787 people, 405,807 array SNPs, two sources), `curve` with 592 related pairs
+took about 10 minutes on 8 cores of a busy machine with a peak of 2.2 GB. `compose` in curve mode took about 6 minutes on one
 core with a peak of 3.3 GB, about half of it writing the per-sample-size files. The curve's main pass is linear in
 people and SNPs. The background is linear in people and quadratic in the least differentiated SNPs of each chromosome,
 and at biobank scale it is the largest cost. Compose is linear in the number of SNP pairs within the band and does not
