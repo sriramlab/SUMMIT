@@ -14,6 +14,7 @@
 - [Related individuals](Related-individuals.md)
 - [Local ancestry](Local-ancestry.md)
 - [Admixed cohorts without in-sample LD (SUMMIT-MIX)](Admixed-cohorts-without-in-sample-LD.md)
+  - [SUMMIT-MIX details](SUMMIT-MIX-details.md)
 - [Batch analyses](Batch-analyses.md)
 - [G×E models](GxE-models.md)
 - [Multiple environments](Multiple-environments.md)

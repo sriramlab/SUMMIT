@@ -40,7 +40,8 @@ and experimental joint uncertainty are described in that guide.
 
 LD scores of an admixed GWAS sample composed from source panels, the GWAS summary statistics and either the cohort's
 curve (curve mode, the default) or a published admixture date (date mode). See
-[Admixed cohorts without in-sample LD](Admixed-cohorts-without-in-sample-LD.md).
+[Admixed cohorts without in-sample LD](Admixed-cohorts-without-in-sample-LD.md), and
+[SUMMIT-MIX details](SUMMIT-MIX-details.md) for every option.
 
 | Command | Needs | Writes |
 |---|---|---|
