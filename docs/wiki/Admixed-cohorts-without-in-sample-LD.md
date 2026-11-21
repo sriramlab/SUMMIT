@@ -1,319 +1,313 @@
-# Admixed cohorts without in-sample LD
+# Admixed cohorts without in-sample LD (SUMMIT-MIX)
 
-LD scores for an admixed GWAS sample are best computed in the sample itself, with the
-GWAS covariates ([LD scores](LD-scores.md#covariates-and-snp-variance-weights)). When
-the genotypes are not at hand, for example for published summary statistics or a cohort
-that releases only aggregates, `summit admixed-ld` composes them from three inputs:
+LD scores for an admixed GWAS sample are best computed in the sample itself, with the GWAS covariates
+([LD scores](LD-scores.md#covariates-and-snp-variance-weights)). When the genotypes are not at hand, for example for a
+cohort that releases only aggregates or for published summary statistics, SUMMIT-MIX (`summit admixed-ld`) composes
+them from:
 
-- unadmixed panels of the two source populations, made once into a reference resource;
-- the GWAS summary statistics, whose standard errors give the mean ancestry and the
-  variance of local ancestry that the covariates leave;
-- the decay of local-ancestry covariance with genetic distance, as the cohort's measured
-  curve, a published admixture date, or a decay rate.
+- unadmixed panels of the source populations, made once into a reference;
+- the GWAS summary statistics, whose standard errors give the mean ancestry and the variance of local ancestry that the
+  covariates leave;
+- the decay of local-ancestry covariance with genetic distance, either from a curve that the cohort computes on its
+  genotypes (**curve mode**, the default and recommended) or from a published admixture date (**date mode**).
 
-The sum of squared relatedness of relatives in the sample is an optional fourth input. The
-output is an ordinary `.gw.ldscore.gz` file with a `V` column, which `summit --h2` and
-`--rg` read unchanged.
+The output is an ordinary `.gw.ldscore.gz` file with a `V` column, which `summit --h2` and `--rg` read unchanged. The
+same composition also gives cross-population LD scores for genetic correlation with a European cohort, regional LD
+matrices for fine-mapping, and LD scores for segments of each local ancestry.
 
-For a runnable synthetic example, run `bash example/admixed_ld.sh` from the repository
-root. It composes LD scores in two ways and fits h² with them and with in-sample LD
-scores.
+For a runnable synthetic example, run `bash example/admixed_ld.sh` from the repository root (about a minute). For a
+template with real inputs, see `example/admixed_ld_real_data.sh`.
+
+## Who runs what
+
+| Step | Command | Run by | Needs | Writes |
+|---|---|---|---|---|
+| 1 | `reference`, `clean-panels` | anyone, once per set of panels | panel genotypes, genetic map | reference directory |
+| 2 | `curve` (curve mode only) | the cohort, where the genotypes are | QC'd genotypes, the GWAS covariates, related pairs | aggregates only |
+| 3 | `compose` | anyone | reference, summary statistics, curve or date | LD scores |
+| 4 | `summit --h2`, `--rg` | anyone | summary statistics, LD scores | estimates |
+
+Optional steps: `sample-factors` (the cohort, for samples of a few hundred people), `derive` (a source without a
+panel), `matrix` (fine-mapping), `tractor-sumstats` and `track-rg` (correlation of effects across local ancestries).
+
+What the curve releases is aggregate: the kernel every 0.25 cM and between chromosomes (a few thousand numbers), the
+moments of global ancestry, the background term every 0.5 cM, and a covariance matrix between 2-cM cells of the genome
+(about 1,800 cells, a few MB). No row of it describes a person.
 
 ## Model
 
-The composition rests on these assumptions.
-
-1. The cohort descends from two source populations, and each person's genome is a
-   mosaic of segments of one ancestry.
-2. On a stretch of one ancestry with no recombination since admixture, LD between two
-   SNPs is that of the source population, as measured in its panel. Recombination since
-   admixture, at rate λ per cM, breaks this LD.
-3. Local ancestry makes SNPs whose allele frequencies differ between the sources
-   correlated over long distances. After the covariates, the covariance of local ancestry
-   at distance d is κ(d), which decays with d.
-4. The GWAS used least squares with the covariates of the cohort, including genotype
-   PCs or global ancestry.
-
-The covariance of the dosages of SNPs j and k after the covariates is then
+The GWAS sample descends from source populations s (two in the simple case, A and B). Each person has global ancestry
+θ_i and local ancestry L_ij (0, 1 or 2 copies from A at SNP j). The covariance of the dosages of SNPs j and k, d cM
+apart, is
 
 ```text
-C(j,k) = m exp(-λ d) C_A(j,k) + (1 - m) exp(-λ d) C_E(j,k) + δ_j δ_k κ(d),
+C(j,k) = Σ_s π_s(d) C_s(j,k) + δ_j δ_k κ(d),        π_s(d) = m_s exp(-λ_s d),
+C(j,j) = Σ_s m_s v_s(j) + δ_j² κ(0),
 ```
 
-where m is the mean ancestry from the first source, C_A and C_E are the panel
-covariances, and δ is the difference of allele frequencies between the sources. On
-different chromosomes only the last term remains, with the between-chromosome value of κ.
-The LD scores follow SUMMIT's definition with these covariances. They include each
-person's pairing with themselves, which SUMMIT's noise correction leaves when
-heterozygosity follows ancestry, and V weights from the same model.
-[Methods](Methods.md) gives the in-sample definition.
+with C_s and v_s the panels' covariances and variances, m_s the mean ancestry, δ_j = p_A(j) − p_B(j) the difference of
+the sources' allele frequencies and κ(d) the covariance of local ancestry at distance d, the kernel. Within-source LD
+survives only on segments of one ancestry that have not recombined since admixture. With more than two sources,
+δ_j δ_k κ(d) becomes D_j' K(d) D_k, with D_j the frequency differences against the last source and K(d) a matrix.
 
-Mean ancestry and κ(0) come from the standard errors. For least squares,
-`N SE² + β²` is proportional to one over the dosage variance after the covariates, which
-the model gives as `m v_A + (1 - m) v_E + δ² κ(0)`. A regression across SNPs without an
-intercept gives both. SNPs with χ² ≥ 80 and outlying residuals are left out, and with
-several traits the medians are used.
+The GWAS adjusts for PCs, which track each person's global ancestry. Everything therefore uses the adjusted genotypes
+and the residual kernel κ_res(d): it starts at the variance of local ancestry, decays at a rate set by the time since
+admixture, and is a small negative constant between chromosomes. The variance before adjustment adds back the
+global-ancestry variance that the PCs remove.
 
-## Build the reference
+The LD score of SNP j is the sum over all SNPs of the genome of the squared correlations (SUMMIT's genome-wide LD
+scores). Pairs within 3 Mb use the panel covariances, with each squared panel covariance replaced by its unbiased
+estimate. Pairs farther apart carry only admixture LD and are summed by a fast Fourier transform along each chromosome.
+Pairs on different chromosomes use the between-chromosome value of the kernel.
+
+A GWAS of N people adds a sample part to the expected squared correlation:
+
+- the same-person term, because each person's genotype variance depends on their ancestry. It is of order 1/N per pair
+  but is summed over M partners, so its share of the LD mass grows with M/N;
+- a background term from people who share segments identical by descent, relatives included, measured by the curve;
+- in curve mode, a cell matrix that holds the long-range structure that PCs leave on single chromosomes.
+
+**Cohort quantities from the standard errors.** For a least-squares GWAS, 1/(N SE² + β̂²) is proportional to the
+variance of the adjusted genotype, `m v_A + (1 - m) v_B + δ² κ_res(0)`. A regression across SNPs without an intercept
+gives m and κ_res(0). SNPs with χ² ≥ 80 and outlying residuals are left out, and with several traits the medians are
+used. Use least-squares or linear-probability statistics. Logistic and mixed-model standard errors weight people
+differently and move m; compose names traits whose values stand apart.
+
+## 1. The reference
 
 ```bash
 summit admixed-ld reference --panel ref/afr --panel ref/eur --names AFR,EUR \
   --genetic-map maps/genetic_map_chr{chr}_combined_b37.txt --threads 16 --out ref/afr_eur
-```
-
-Each `--panel` is a PLINK 1 BED or PLINK 2 PGEN prefix of one source population. Use the
-SNP set of the GWAS, or a superset of it. Variants are matched between panels by position
-and alleles (`--match id` matches by ID). Strand flips are resolved except for A/T and
-C/G SNPs, which are matched as listed. For each chromosome the resource stores allele
-frequencies, dosage variances and the covariances of all pairs within `--window-kb`
-(default 3,000 kb), with the moments that give their sampling variance. Positions in cM
-come from `--genetic-map` (one file per chromosome with `{chr}`, or one file with a
-chromosome column), otherwise from the CM column of the panel. Without either, 1.2 cM
-per Mb is assumed with a warning.
-
-The resource is built once and serves every cohort with these sources. The covariance
-products use SUMMIT's native protected matrix products. `compose` replaces each squared
-panel covariance by its unbiased estimate (a U-statistic), so small panels do not inflate
-the LD scores. Rare variants are the least accurate in a small panel, since only a few
-people carry them. In the check below, a random 85 of the 4,905 African-ancestry panel
-members gave mean h² within 2% of the in-sample value.
-
-Panels drawn from a biobank carry LD of their own sample. Their members have a little
-admixture between the sources, and they are cryptic relatives and a structured sample, so
-their unbiased squared covariances hold the cross-person LD of their members on top of
-the population's LD (for a panel of n, v_j v_k S(d) / (n (n - 3)), with S the panel's
-background below). The cohort's curve and its own background measurement already hold the
-cohort's versions of both, so the panels' copies are counted twice inside the band.
-
-```bash
 summit admixed-ld clean-panels --ref ref/afr_eur --panel ref/afr --panel ref/eur --names AFR,EUR \
   --threads 16 --out ref/afr_eur_clean
 ```
 
-`clean-panels` runs the curve on each panel. It removes the panel's admixture LD from its
-covariances and variances when the panel's kernel at zero is at least 3 jackknife SEs above
-zero, and it records the panel's own background LD (the cohort estimator of
-`curve --background`, run on the panel without covariates; aggregates only) in the
-manifest whether or not anything is removed. `--from-fits` applies both to a converted or
-subset copy of the same panels' reference where the genotypes are not available.
+Each `--panel` is a PLINK 1 BED or PLINK 2 PGEN prefix of one source population, in the genome build of the cohort and
+of the summary statistics. Use the cohort's SNP set or a superset. Variants are matched between panels by position and
+alleles (`--match id` matches by ID). Strand flips are resolved except for A/T and C/G SNPs, which are matched as
+listed; `--drop-ambiguous` leaves them out, and should be given to every step when the data sets may be on different
+strands. Positions in cM come from `--genetic-map` (one file per chromosome with `{chr}`, or one file with a chromosome
+column), otherwise from the CM column of the panel, otherwise 1.2 cM per Mb with a warning. Autosomes only.
 
-## The cohort's curve
+The resource stores, for each chromosome, the frequencies, variances and covariances of all pairs within `--window-kb`
+(default 3,000 kb), with the moments that give each covariance's sampling variance. For about 400,000 array SNPs and two
+sources it is about 4 GB.
 
-```bash
-summit admixed-ld curve --geno cohort --ref ref/afr_eur --covar gwas.cov --out cohort
-```
+Panels carry LD of their own sample. Panels drawn from a biobank have a little admixture between the sources, and their
+members are cryptic relatives. Inside the band the composition would add both to the cohort's own terms, so
+`clean-panels` measures them with the cohort's estimators, run on each panel without covariates. It removes a panel's
+admixture LD when its kernel at zero distance is at least 3 jackknife SEs above zero, and it records the panel's own
+background, which compose removes inside the band. Run it on every reference; compose records a flag otherwise and
+stops when the background term needs the records. `--from-fits` applies the fits of a cleaned reference to a
+converted or subset copy made from the same panels, where the panel genotypes are not available.
 
-Run this where the genotypes are. It measures κ(d) as the weighted-LD curve of ROLLOFF
-and ALDER on the genotypes adjusted for the GWAS covariates, in cells of `--cell-cm`
-(default 0.25 cM), along with its between-chromosome value and the moments of global
-ancestry. With `--relative-pairs pairs.tsv`, it also computes the relatedness of each pair
-in the genotypes adjusted for the covariates and writes the sum of its square. The listed
-pairs are used, selected with `--kinship-col` and `--kinship-min`. `--closure` adds every
-pair within a family (connected component), which helps when the list holds only some
-pairs of each family. Do not use it with a dense list of distant relatives. The relatedness after adjustment is what enters the in-sample LD scores,
-and it can differ greatly from the relatedness in a pair file. In a cohort of a few
-thousand people, a large family can take up a PC of its own, and first-degree pairs with
-a GRM of 0.5 then have a relatedness near zero after the covariates.
-
-Relatives share segments identical by descent, so their LD on one chromosome is far larger
-than between chromosomes; for distant relatives, per SNP pair at a few cM, it is ten to
-twenty times their g². The curve therefore also writes `cohort.relatedness.tsv`, the
-listed pairs' products of local relatedness by distance on one chromosome (cells of
-`--relatedness-cell-cm`, default 0.5 cM), and their product between chromosomes, both
-net of what random unlisted pairs (`--relatedness-controls`) contribute to the same sums.
-The controls remove the LD that two unrelated people share and the covariates' projection,
-which the population part of the LD score already counts, and the products leave out each
-SNP with itself, so the noise floor of g² (about the mean LD score over the number of SNPs
-per pair) is gone too. `--no-relatedness-profile` restores the sum of g² alone.
-
-Pair lists miss most of the relatedness that matters: distant and cryptic relatives, whose
-LD per SNP pair is a property of the population rather than of the cohort's families.
-`--background` measures the relatedness LD of all pairs of people without a list, from the
-cross-person LD among the least differentiated SNPs (`--background-quantile`, default the
-lowest fifth of the source contrast), less its admixture part and SUMMIT's null, by
-distance and between chromosomes (`cohort.background.tsv`). Beyond a few cM this is what
-relatives add; closer, the same products also hold within-source LD. The outputs,
-`cohort.curve.tsv`, `cohort.curve.json` and these tables, hold aggregates only and can be
-released with the summary statistics.
-
-## Compose the LD scores
+## 2. The cohort's curve (curve mode)
 
 ```bash
-summit admixed-ld compose --ref ref/afr_eur --sumstats gwas/ --annot annot.tsv.gz \
-  --curve cohort --out ld/cohort
+summit admixed-ld curve --geno cohort --ref ref/afr_eur_clean --keep gwas_sample.txt --covar gwas.cov \
+  --relative-pairs related_pairs.tsv --background --threads 16 --out cohort
 ```
 
-`--sumstats` takes SUMMIT summary statistics (files or a directory) with `BETA`, `SE`
-and `N`. Variants are matched by `CHR` and `BP`; if the summary statistics lack them,
-give the GWAS variant table with `--snps` (BIM, PVAR, or a table with SNP CHR BP A1 A2).
-`--annot` is the annotation of the fit, such as MAF/LD bins.
+Run this where the genotypes are, on the GWAS sample (`--keep`) with the GWAS's own covariate matrix (`--covar`,
+including its PCs). It measures κ_res(d) as the weighted LD curve of ROLLOFF and ALDER on the adjusted genotypes, every
+0.25 cM up to the longest chromosome and between chromosomes, the moments of global ancestry (mean, variance, third and
+fourth moments), and the cell matrix, estimated in two halves of the people so that its square is unbiased.
 
-The decay is given in one of three ways.
+- `--background` measures the background term from all pairs of people among the least differentiated fifth of the
+  SNPs, by distance and between chromosomes. It is part of curve mode.
+- `--relative-pairs` lists related pairs (IID1 IID2, optionally FID1 FID2 and a kinship column), for example pairs with
+  relatedness above 0.0442 in a GRM of PC-adjusted genotypes. They keep each family within one half of the cell matrix.
+  `--kinship-col` and `--kinship-min` select pairs.
 
-| Option | Decay |
-|---|---|
-| `--curve PREFIX` | the cohort's measured curve; recommended |
-| `--admixture-generations T` | a published admixture date; λ = T/100 per cM |
-| `--decay-per-cm λ` | a decay rate per cM |
+When the traits' GWAS samples differ, make the curve on a set of people that holds all of them; compose then scales the
+background term by N (N − 1) / (n (n − 1)) and records a flag. A curve on each trait's own sample is better when the
+samples differ much, for example when a trait is measured mostly in one subgroup.
 
-With a date or a rate, κ(d) is `far + (κ(0) - far) exp(-λ d)`, where
-`far = -2 κ(0) / (λ G)` is the constant that adjustment for each person's realized
-ancestry leaves and G is the genetic length of the genome. The SD of global ancestry
-enters only the term of each person's pairing with themselves. It comes from the curve,
-from `--ancestry-sd`, or defaults to 0.12. `--mean-ancestry` and `--kappa0` replace the
-values from the standard errors. `--relatedness curve` adds the relatives' part of the
-LD scores from the curve: B between chromosomes and φ(d) along each chromosome, inside the
-reference window too. With a curve made with `--background`, the term is the measured LD
-of all pairs of the cohort at every distance, inside the reference band too. It is smoothed
-as B plus a sum of decaying exponentials fitted from `--background-min-cm` (default 3) on,
-with rates up to one over that distance, the components that the fitting range resolves;
-closer, the measurement also holds within-source LD, which the panels supply. Inside the
-band the panels' own background LD, recorded by `clean-panels`, is removed with its
-weight π_s(d)² and the panel's variances. This needs a reference from `clean-panels`
-(compose stops otherwise). `--background-window zero` and `flat` keep the rules of 5 Nov
-2026, which used the measurement only from `--background-min-cm` on, with the listed
-pairs' profile below. `--relatedness uniform` adds the curve's sum of g² to every SNP pair,
-as before 5 Nov 2026, and `--relatedness X` gives that sum directly.
+The curve stops when the cohort's alleles disagree with the reference at many shared positions (another genome build)
+and when strand-ambiguous SNPs have frequencies that fit the other strand (pass `--drop-ambiguous`). It records the share
+of missing genotypes.
 
-The outputs are `ld/cohort.gw.ldscore.gz`, `ld/cohort.gw.M` and
-`ld/cohort.admixed_ld.json`, which records every parameter used. Fit as usual:
+## 3. Compose the LD scores
+
+Curve mode:
+
+```bash
+summit admixed-ld compose --ref ref/afr_eur_clean --sumstats gwas/ --annot annot.tsv.gz \
+  --curve cohort --relatedness curve --cell-matrix --out ld/cohort
+```
+
+Date mode, with only the summary statistics and a published date:
+
+```bash
+summit admixed-ld compose --ref ref/afr_eur_clean --sumstats gwas/ --annot annot.tsv.gz \
+  --admixture-generations 6 --out ld/cohort_date
+```
+
+`--sumstats` takes SUMMIT summary statistics (files or a directory) with `BETA`, `SE`, `N` and `COV_RANK`. Variants are
+matched by `CHR` and `BP`; if the summary statistics lack them, give the GWAS variant table with `--snps` (BIM, PVAR, or
+a table with SNP CHR BP A1 A2). `--annot` is the annotation of the fit, such as MAF/LD bins.
+
+In curve mode the kernel beyond 2 cM, the decay of the within-source weights and the moments of global ancestry come from
+the curve. Below 2 cM the curve also holds within-source LD, so the kernel there is an exponential from κ_res(0) of the
+standard errors to the curve's value at 2 cM. `--relatedness curve` adds the background term at every distance,
+smoothed as a constant plus decaying exponentials fitted from 3 cM on, and removes the panels' own background inside the
+band. `--cell-matrix` uses the cell matrix for pairs of 2-cM cells at least 10 cM apart and between chromosomes. Compose
+stops when the curve at 2 cM is above κ_res(0) of the standard errors, because then the two inputs describe different
+samples or covariates.
+
+In date mode the kernel decays at T/100 per cM from κ_res(0) to the between-chromosome constant −2 κ_res(0)/(T G), G the
+genetic length of the genome. The dates we used were 6 generations for African American and African Caribbean groups and
+11 generations for US Latino groups. The same-person term needs the standard deviation of global ancestry: give a
+published value with `--ancestry-sd`; otherwise compose uses the value that m and κ_res(0) imply under random mating,
+(2 m (1 − m) − κ_res(0))/4, which assortative mating makes too small. There is no background term or cell matrix.
+
+`--sources AFR,EUR,NAT` composes three or more sources (the last is the baseline); give the same `--sources` to every
+step. `--mean-ancestry` and `--kappa0` replace the values from the standard errors.
+
+**One file per GWAS sample size.** The same-person and background terms belong to each GWAS's sample. When the traits'
+median N differ by more than 1%, compose writes one file per group of traits (`ld/cohort.n<N>.gw.ldscore.gz`, listed
+with their traits in `ld/cohort.n_groups.tsv`); fit each trait with its group's file. `ld/cohort.gw.ldscore.gz` is
+the file for the median N. `--single-n` writes only that file.
+
+**Checks.** Compose stops when the GWAS's alleles disagree with the reference at many shared positions. It records
+flags in `ld/cohort.admixed_ld.json` (and logs a warning) when a panel was not cleaned, when the ancestry SD is the
+derived one, when the curve was made on other people or with another number of covariates than the GWAS reports, and
+when the standard errors of some traits give cohort quantities that stand apart from the others. The json also records
+every parameter, m and κ_res(0) per trait, and the matching counts.
+
+Fit as usual:
 
 ```bash
 summit --h2 gwas/ --ldscores ld/cohort.gw.ldscore.gz --annot annot.tsv.gz --out results/h2
+summit --rg gwas/height.tsv,gwas/bmi.tsv --ldscores ld/cohort.gw.ldscore.gz --annot annot.tsv.gz --out results/rg
 ```
 
-By default the partner SNPs of each LD score are the GWAS SNPs themselves. When the causal
-variants are denser than the GWAS SNPs (an array GWAS, or HapMap3 SNPs from imputed data),
-LD scores over the GWAS SNPs miss the LD with untyped causal variants, and the estimates
-are biased by an amount that differs between LD scores of different kinds. With
-`--partners reference`, every reference variant listed in `--annot` is a partner and the
-GWAS SNPs are the rows, as in LDSC's LD scores from 1000 Genomes. Build the reference on
-the dense variant set (it must contain the GWAS SNPs), and list every partner in the
-annotation. `.gw.M` then holds the partners' counts per class. The cohort's cell matrix
-and sample factors are measured on the GWAS SNPs and cannot be combined with this option.
+**Dense partners.** By default the partners of each LD score are the GWAS SNPs. When the causal variants are denser
+than the GWAS SNPs, `--partners reference` takes every reference variant listed in `--annot` as a partner, with the
+GWAS SNPs as rows. Build the reference on the dense set; `.gw.M` then holds the partners' counts. The cell matrix and
+sample factors are measured on the GWAS SNPs and cannot be combined with it.
 
-## Correlation of effects across ancestry tracks
+## Small samples: the sample statistic
 
-In an admixed person, the alleles on African-ancestry segments and those on
-European-ancestry segments can have different causal effects. Hou et al. (2023) called the
-correlation of these per-allele effects r_admix and estimated it from individual genotypes.
-`summit admixed-ld` estimates it from summary statistics of a local-ancestry-aware GWAS
-such as Tractor, which regresses the phenotype at each SNP on the covariates, the
-local-ancestry dosage and the allele counts on each ancestry's segments. Because the
-local-ancestry dosage is in the model, the variable each track's effect is estimated on is
-the allele's deviation within that track. This deviation carries no admixture LD and is
-uncorrelated with the other track's alleles. So the track LD scores are short-range, and
-the two tracks' estimates have zero noise covariance (at one SNP the two alleles lie on
-different haplotypes).
-
-The estimate needs sandwich (HC) standard errors. With ordinary least squares, the
-residual variance is assumed equal for everyone, but the track variable's variance follows
-each person's local ancestry, and so does the phenotype's variance when environment or
-scale differ by ancestry. The own-track moments then hold terms that the LD scores do not
-model, and these are not small (in simulations with variance that rises with ancestry,
-r_admix came out at 1.4 for a truth of 0.6). Sandwich SEs remove them exactly. Tractor
-itself writes only OLS SEs, so add HC1 SEs to the regression (a sum over people of
-x_a x_b e², cheap to compute alongside the fit).
+The same-person term assumes that each person's genotype variance follows their global ancestry. In samples of a few
+hundred people it is carried as much by the leverage of the covariates, and in first-generation groups by the parents'
+ancestries. The cohort can then release a sample statistic made on the GWAS sample with its covariates:
 
 ```bash
-summit admixed-ld tractor-sumstats --tractor tractor/height.tsv --sources AFR,EUR \
-  --covariates 13 --out tracks/height
-summit admixed-ld compose --ref ref/afr_eur_dense --sumstats tracks/height.AFR.sumstats \
-  --annot annot.tsv.gz --admixture-generations 6 --mean-ancestry 0.59,0.41 --ancestry-sd 0.29 \
-  --tracks --partners reference --cross-source EUR --out ld/tracks
-summit admixed-ld track-rg --tracks ld/tracks --sumstats tracks/height --annot annot.tsv.gz \
+summit admixed-ld sample-factors --geno cohort --ref ref/afr_eur_clean --keep gwas_sample.txt --covar gwas.cov \
+  --threads 8 --out cohort
+summit admixed-ld compose ... --curve cohort --relatedness curve --cell-matrix --sample-factors cohort --out ld/cohort
+```
+
+The statistic is a small covariance matrix of person factors (a level, the ancestry proportions and the local-ancestry
+variances), estimated from odd and even chromosomes separately so that each person's noise cancels, plus the sample's
+realized LD mass in total and between chromosomes, from per-chromosome Gram matrices (the cost of a GRM; `--no-ld-mass`
+skips it). Compose scales the factor term to the realized between-chromosome same-person mass and flags a difference of
+more than 5% between its LD mass and the realized one. `--calibrate-between-chromosomes` puts that difference on pairs
+of SNPs on different chromosomes, equally per pair, which makes the composed LD mass equal to the realized one.
+
+## Sources without a panel
+
+When a source has no unadmixed panel of at least about 100 people, `derive` estimates its frequencies from an admixed
+cohort that carries it, by supervised admixture with the other sources' frequencies fixed:
+
+```bash
+summit admixed-ld derive --geno cohort --ref ref/afr_eur_clean --name NAT --panel ref/nat_small --covar gwas.cov \
+  --ld panel --threads 16 --out ref/afr_eur_nat
+summit admixed-ld clean-panels --ref ref/afr_eur_nat --panel ref/nat_small --names NAT --out ref/afr_eur_nat_clean
+```
+
+Members of the small panel (`--panel`) anchor the frequencies, which supervised admixture alone does not identify.
+With `--ld panel` the source's window LD is the anchor panel's, on the derived source's variances. Every source in the
+cohort should be included: a missing source makes the background term take up its admixture LD, in total but along the
+wrong frequency differences. A proxy panel from a related population attenuates the admixture LD by r⁴, with r the
+correlation of the true and proxy frequency differences, so we do not recommend proxies.
+
+## Cross-population LD
+
+`compose --cross-source EUR` also writes `ld/cohort.cross_EUR.gw.ldscore.gz`, the cross LD scores of this GWAS with a
+GWAS of other people whose LD is that of the EUR panel: the products of the two samples' correlations within the band,
+signed, with each sample's own V. Fit the genetic covariance with SUMMIT's cross mode, each sample's own LD scores for
+its heritability, and the intercept fixed at zero for disjoint samples.
+
+## Regional LD matrices and fine-mapping
+
+```bash
+summit admixed-ld matrix --ref ref/afr_eur_clean --params ld/cohort.admixed_ld.json --curve cohort \
+  --region 4:1000000-4000000 --out fm/region1
+```
+
+`matrix` writes the correlation matrix of the adjusted genotypes of the GWAS sample over a region (`fm/region1.ld`,
+`.ld.npz`) and the SNPs with the counted allele of each (`fm/region1.snps.tsv`). Align the z-scores to that allele
+before fine-mapping. The admixture term enters linearly and is computed for every pair; if the kernel over the region's
+positions is not positive semi-definite, it is projected onto that cone. The panel term carries sampling noise at every
+pair, so by default (`--taper auto`) it is tapered exponentially with distance, at a scale chosen from the panels alone
+by an unbiased estimate of its squared error. Use the same mode (`--curve` or `--admixture-generations`) as compose.
+
+The error of a composed matrix has the shape of the matrix itself, so the RSS-λ model of SuSiE, which treats it as
+independent noise, finds almost none. Fine-mapping with SUMMIT-MIX matrices therefore uses two SuSiE fits: the first
+with the residual variance fixed at 1, then a second with the residual variance s² = 1 + (N/P) Σ_j Σ_{c≠j} V_jc E(b_c²),
+from the first fit's posterior second moments and V, the predicted variance of the error of each entry of the matrix
+from the panels' sampling. `matrix` does not write V yet. At strongly differentiated loci with very strong signals, and at loci that define how the
+sample was selected, composed matrices carry error beyond this prediction.
+
+## Correlation of effects across local ancestries
+
+In an admixed person, alleles on segments of each ancestry can have different causal effects. Hou et al. (2023) called
+the correlation of these per-allele effects r_admix. SUMMIT-MIX estimates it from the summary statistics of a
+local-ancestry-aware GWAS such as Tractor, which regresses the phenotype at each SNP on the covariates, the
+local-ancestry dosage and the allele counts on each ancestry's segments. With the local-ancestry dosage in the model,
+the variable of each track is the allele's deviation within that track, which carries no admixture LD and is
+uncorrelated with the other track's alleles. The track LD scores are therefore short-range and the two tracks' noise
+covariance is zero.
+
+```bash
+summit admixed-ld tractor-sumstats --tractor tractor/height.tsv --sources AFR,EUR --covariates 13 --out tracks/height
+summit admixed-ld compose --ref ref/afr_eur_clean --sumstats tracks/height.AFR.sumstats --annot maf5.tsv.gz \
+  --curve cohort --mean-ancestry 0.59,0.41 --ancestry-sd 0.29 --tracks --cross-source EUR --out ld/tracks
+summit admixed-ld track-rg --tracks ld/tracks --sumstats tracks/height --annot maf5.tsv.gz \
   --external eur/height.sumstats --out results/height
 ```
 
-`tractor-sumstats` reads Tractor's table (`beta_anc0`, `se_anc0` or `tval_anc0`,
-`AF_anc0`, `LAprop_anc0`, ... and the sandwich SEs `se_hc_anc0`, ...) and writes one
-summary-statistic file per track, with the ALT allele counted. It stops when the sandwich
-SEs are missing; `--se ols --allow-ols` proceeds with a recorded flag. Its
-`tracks.json` lists the mean local-ancestry share of each track, which `compose` takes as
-`--mean-ancestry`. Because a track's standard errors do not give the cohort's kappa(0),
-give `--kappa0` or `--ancestry-sd` (from which kappa(0) is taken as 2 m (1 - m) - 4 SD²).
+**Standard errors.** The estimate needs sandwich standard errors whose meat uses the residuals of the covariates-only
+model, σ_i² = e0_i²/(1 − h_ii), with h_ii the person's hat value under the covariates. Least-squares SEs assume equal
+residual variance for everyone, but the track variable's variance follows each person's local ancestry and the residual
+variance of many traits changes with ancestry, so their own-track moments hold same-person terms that the LD scores do
+not model. The usual HC1 sandwich takes σ_i² from the residuals of the full model, which the fit shrinks at alleles
+carried by few people on one ancestry's segments, and its estimates are biased low. Tractor writes only OLS SEs, so
+compute these SEs alongside the regression (a sum over people of x_a x_b σ_i², cheap). `tractor-sumstats` reads them as
+`se_hcn_anc0`, ..., stops without a sandwich column, and records a flag when only full-model sandwich columns (HC0-HC3)
+are present. Leave out rare binary traits, whose sandwich z-scores are heavy-tailed.
 
-`compose --tracks` writes the own LD scores of each track (`ld/tracks.track_AFR`,
-`.track_EUR`), their cross scores (`.track_AFR_EUR`) and, with `--cross-source EUR`, the
-scores of each track against a GWAS of other people from that population
-(`.track_AFR_vs_EUR`, `.track_EUR_vs_EUR`) with that population's own LD scores
-(`.cohort_EUR`). They are on the per-allele scale: effects whose variance is proportional
-to one over the cohort's genotype variance (SUMMIT's own scale), or to
-[2 f (1 - f)]^α with `--track-alpha α` (Hou et al.'s model, α = -0.38).
+`compose --tracks` writes each track's own LD scores (`ld/tracks.track_AFR`, `.track_EUR`), their cross scores
+(`.track_AFR_EUR`) and, with `--cross-source EUR`, each track against a GWAS of other people from that population. They
+are on the per-allele scale, with effect variance proportional to one over the cohort's genotype variance. `track-rg`
+fits each pair of tracks with SUMMIT's cross-population equations with the noise covariance fixed at zero, and
+combines the classes as r = Σ_c τ_AE,c n_c / √(Σ_c τ_A,c n_c · Σ_c τ_E,c n_c), n_c the partners in class c. Partition by
+five MAF classes (edges 0.01, 0.02, 0.05, 0.1, 0.2, 0.5), which take up the dependence of the effect variance on
+frequency between classes. One trait is noisy at biobank sizes. Pool traits by summing their moments over traits on
+shared jackknife blocks, rather than averaging per-trait ratios. Local-ancestry errors put alleles on the wrong track
+and push r up, so read r next to the caller's accuracy.
 
-`track-rg` fits each pair of tracks with SUMMIT's cross-population equations and the noise
-covariance fixed at zero, the same fit as
+## Compute
 
-```bash
-summit --rg tracks/height.AFR.sumstats,tracks/height.EUR.sumstats \
-  --ldscores ld/tracks.track_AFR_EUR.gw.ldscore.gz \
-  --ldscores-h2-1 ld/tracks.track_AFR.gw.ldscore.gz --ldscores-h2-2 ld/tracks.track_EUR.gw.ldscore.gz \
-  --overlap-covariance-rg 0 --annot annot.tsv.gz
-```
-
-and combines the classes of the annotation as
-r = Σ_c τ_AE,c n_c / √(Σ_c τ_A,c n_c · Σ_c τ_E,c n_c), with τ the per-allele variances and
-covariance in class c and n_c the number of partner variants in it. With the GWAS SNPs as
-partners this is the rg of the `summit --rg` call above. It also reports r in each class,
-over groups of classes (`--group low=maf1_ld1,maf1_ld2,...`), and each track's heritability.
-With `--external`, it adds r of each track with the other population's GWAS. In the same
-people, r_admix separates ancestry from everything else, and with the ancestry held fixed
-r(EUR track, EUR cohort) separates the cohorts. If the two effects multiply,
-r(AFR track, EUR cohort) is about r_admix · r(EUR track, EUR cohort), and the output
-reports the difference with its jackknife SE.
-
-Partition the fit by MAF and LD, as for h². The per-class variances then take up how the
-effect variance depends on frequency between classes, but not within them. When the true
-dependence differs from the weights, what is left is 1% to 2.5% with SUMMIT's eight MAF/LD
-bins, whose MAF classes split only at 0.1, and under 1% with five MAF classes (see the
-numbers below). Local-ancestry errors put alleles on the wrong track and push r
-up, by about 2.5 times the share of miscalled positions in simulations, so interpret r
-next to the caller's accuracy.
+On the UK Biobank development data (3,787 people, 405,807 array SNPs, two sources), `curve` with the background and 592
+related pairs took about 9 minutes on 8 cores with a peak of 2.9 GB. `compose` in curve mode took about 6 minutes on one
+core with a peak of 3.3 GB, about half of it writing the per-sample-size files. The curve's main pass is linear in
+people and SNPs. The background is linear in people and quadratic in the least differentiated SNPs of each chromosome,
+and at biobank scale it is the largest cost. Compose is linear in the number of SNP pairs within the band and does not
+read genotypes.
 
 ## Accuracy and limits
 
-![The cohort's curve with the kernel from a 5-generation admixture date, per-SNP composed against in-sample LD scores, and h² of 32 traits from composed against in-sample LD scores in two admixed UK Biobank cohorts.](assets/admixed-ld-ukb.png)
+In two admixed UK Biobank samples (3,787 and 6,111 people, 405,807 array SNPs, 32 traits), curve mode gave a sum of h²
+over traits 0.996 and 0.994 times that with in-sample LD scores (eight MAF/LD bins; 1.001 and 0.993 with two MAF
+classes). The panels were African-ancestry (4,905 and 2,452 people) and white British (12,148) participants outside the
+samples.
 
-(a) The curve measured in cohort 1, the kernel from an admixture date of 5 generations,
-and the curve's between-chromosome value. (b) Composed LD scores, with the curve and the
-relatives' term, against in-sample LD scores of the same SNPs in cohort 1, summed over
-the eight classes. (c) h² of 32 traits fitted with composed and with in-sample LD scores,
-from the same summary statistics.
-
-We compared composed with in-sample LD scores in two cohorts of admixed UK Biobank
-participants of African and European ancestry (3,787 and 6,111 people, mean African
-ancestry 0.61 and 0.76), with 32 traits, 405,807 array SNPs and eight MAF/LD classes. The
-references were panels of African-ancestry (4,905 and 2,452 people) and white British
-(12,148) participants outside the cohorts. With the curve and the relatives' term, mean h²
-over traits was 0.8% and 1.1% higher than with in-sample LD scores. The mean absolute
-difference was 0.03 standard errors, and standard errors were within 1%. Without the
-relatives' term the differences were 1.7% and 1.4%. With an admixture date of 5
-generations (the decay that the curves measured) in place of the curve, and without the
-relatives' term, they were 1.9% and 3.5%.
-
-On 16 cores, the reference took about 18 minutes for 17,000 panel members. The curve took
-about a minute for 3,787 people, and the composition about 90 seconds, most of it spent
-reading the 32 summary-statistic files.
-
-For the correlation across ancestry tracks we computed, on the same array SNPs (404,980
-with MAF of at least 1%) and the same panels, what the estimator returns in expectation
-when the effect variance depends on frequency in another way than its weights assume
-(mean African ancestry 0.59, admixture 6 generations ago, the correlation the same for
-every SNP). With weights 1/s² and a true variance proportional to [2 f (1 - f)]^-0.38, r
-came out 11.3% high with one class, 2.0% with two MAF classes, 0.9% with the eight MAF/LD
-bins and 0.4% with five MAF classes (0.0, 0.02, 0.05, 0.1, 0.2, 0.5). With a variance that
-does not depend on frequency the four values were 16.6%, 3.3%, 1.4% and 0.7%, and with the
-weights of α = -0.38 and a true variance proportional to 1/s² they were -10.5%, -2.6%,
--2.5% and -0.6%. Partners denser than the array, with rarer variants, widen the low-MAF
-class, so split it more finely there. In simulations with known local ancestry, composed
-track LD scores were within 1.1% of the cohort's exact ones in mass, and r with sandwich
-SEs covered the truth, while OLS SEs gave 1.4 for a truth of 0.6 when the residual variance
-rose with ancestry.
-
-The model covers two-way admixture. It does not cover three or more sources, or panels
-whose LD differs from that of the cohort's sources. The relatives' term covers the LD
-scores only. Close relatives also share environment, which enters the summary statistics
-themselves, so prune them before the GWAS or use [Related individuals](Related-individuals.md)
-with in-sample LD scores. Resource size grows with the number of SNP pairs within the
-window. For about 400,000 array SNPs and a 3,000 kb window it is about 4 GB for two
-sources.
+The method assumes that the cohort's sources have panels whose LD is that of the sources, and correct local-ancestry
+calls for the track correlation. It covers the LD scores and matrices only. Close relatives also share environment,
+which enters the summary statistics themselves, so prune them before the GWAS or use
+[Related individuals](Related-individuals.md) with in-sample LD scores. A GWAS sample selected on the phenotype carries
+LD at the loci that drive the selection that no composition holds; genome-wide estimates are little affected, but
+fine-mapping at those loci needs in-sample LD.
