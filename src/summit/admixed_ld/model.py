@@ -14,54 +14,8 @@ genetic length of the genome in cM). lambda also sets the recombination factor e
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-
 import numpy as np
 import pandas as pd
-
-
-# ----------------------------------------------------------------------------------------------------- SE regression
-def regress_standard_errors(n, se, beta, vA, vE, delta, *, delta_var=0.0, max_chisq=80.0):
-    """Mean ancestry m and kappa_res(0) from one GWAS (arrays aligned to the reference SNPs). Returns a dict with m,
-    kappa0, the number of SNPs used and the R2 of the fit; SNPs with large chi-square (strong effects), non-finite
-    values or zero variance in both sources are left out, and residual outliers (beyond 8 robust SDs) are dropped
-    once before the final fit."""
-    n, se, beta = (np.asarray(x, np.float64) for x in (n, se, beta))
-    vA, vE = np.asarray(vA, np.float64), np.asarray(vE, np.float64)
-    d2 = np.asarray(delta, np.float64) ** 2 - delta_var            # unbiased for the squared frequency difference
-    with np.errstate(divide="ignore", invalid="ignore"):
-        z2 = (beta / se) ** 2
-        y = 1.0 / (n * se * se + beta * beta)
-    use = np.isfinite(y) & np.isfinite(z2) & (z2 < max_chisq) & (vA + vE > 0) & np.isfinite(d2)
-    X = np.column_stack([vA, vE, d2])
-    for it in range(2):
-        b, *_ = np.linalg.lstsq(X[use], y[use], rcond=None)
-        if it == 0:
-            r = y - X @ b
-            mad = np.median(np.abs(r[use] - np.median(r[use]))) * 1.4826
-            use &= np.abs(r) < 8 * max(mad, np.finfo(float).tiny)
-    fit = X[use] @ b
-    r2 = 1.0 - np.sum((y[use] - fit) ** 2) / np.sum((y[use] - y[use].mean()) ** 2)
-    s = b[0] + b[1]
-    return dict(m=float(b[0] / s), kappa0=float(b[2] / s), n_snps=int(use.sum()), fit_r2=float(r2))
-
-
-def parameters_from_sumstats(tables, vA, vE, delta, log=print, delta_var=0.0):
-    """`tables`: list of (name, DataFrame with N, SE, BETA aligned to the reference SNPs; rows may be NaN). Returns
-    (m, kappa0, per-trait DataFrame); m and kappa0 are medians over traits."""
-    rows = []
-    for name, t in tables:
-        r = regress_standard_errors(t["N"], t["SE"], t["BETA"], vA, vE, delta, delta_var=delta_var)
-        r["trait"] = name
-        rows.append(r)
-        log(f"[admixed-ld] standard errors of {name}: m = {r['m']:.4f}, kappa_res(0) = {r['kappa0']:.4f} "
-            f"({r['n_snps']} SNPs, R2 {r['fit_r2']:.4f})")
-    df = pd.DataFrame(rows)[["trait", "m", "kappa0", "n_snps", "fit_r2"]]
-    m, k0 = float(df.m.median()), float(df.kappa0.median())
-    if not (0.0 < m < 1.0) or k0 < 0.0:
-        raise ValueError(f"The standard errors give mean ancestry {m:.4f} and kappa_res(0) {k0:.4f}, outside the model. "
-                         "Check that the reference sources match the cohort, or pass --mean-ancestry and --kappa0.")
-    return m, k0, df
 
 
 # ----------------------------------------------------------------------------------------------------- kernel
@@ -98,67 +52,6 @@ def smooth_curve(d, k, *, half_width=0.75, rel_width=0.1):
     hi = np.searchsorted(d, d + w, side="right")
     cs = np.concatenate([[0.0], np.cumsum(k)])
     return (cs[hi] - cs[lo]) / (hi - lo)
-
-
-@dataclass
-class Kernel:
-    """kappa_res(d) for d in cM. `lam` (per cM) also gives the recombination factor of within-source LD."""
-    kappa0: float
-    lam: float
-    far: float
-    source: str
-    d: np.ndarray | None = None
-    k: np.ndarray | None = None
-    d0: float = 2.0
-    lam_short: float = field(init=False, default=0.0)
-    note: str = field(init=False, default="")
-
-    def __post_init__(self):
-        if self.d is not None:
-            if np.any(np.diff(self.d) <= 0):
-                raise ValueError("Curve distances must be strictly increasing.")
-            k_d0 = float(np.interp(self.d0, self.d, self.k))
-            if not k_d0 > 0.0:
-                raise ValueError(f"The curve at {self.d0} cM is {k_d0:.4g}; a positive value is needed to join it to "
-                                 "kappa_res(0). Check that the curve comes from this cohort and reference.")
-            if k_d0 < self.kappa0:
-                self.lam_short = float(-np.log(k_d0 / self.kappa0) / self.d0)
-            else:                       # the curve at d0 exceeds kappa_res(0) from the SEs: join it flat
-                self.lam_short = 0.0
-                self.note = (f"curve at {self.d0} cM ({k_d0:.4g}) is not below kappa_res(0) ({self.kappa0:.4g}); "
-                             "kappa is held at the curve value below it")
-
-    @classmethod
-    def from_curve(cls, d, k, inter, kappa0, *, half_width=0.75, rel_width=0.1, d0=2.0, fit_min=2.0, fit_max=20.0):
-        """The curve smoothed by a moving average over distances within max(half_width, rel_width * d) of each point
-        (pairs thin out with distance, so the window widens), its decay fitted from fit_min, and the
-        between-chromosome value `inter`."""
-        d = np.asarray(d, np.float64)
-        k = np.asarray(k, np.float64)
-        ks = smooth_curve(d, k, half_width=half_width, rel_width=rel_width)
-        lam = fit_exponential(d, k, fit_min, fit_max)["lam"]
-        return cls(kappa0=float(kappa0), lam=lam, far=float(inter), source="genotype curve", d=d, k=ks, d0=d0)
-
-    @classmethod
-    def from_decay(cls, kappa0, lam, genome_cm, source):
-        if not lam > 0:
-            raise ValueError("The decay rate must be positive.")
-        far = -2.0 * kappa0 / (lam * genome_cm)
-        return cls(kappa0=float(kappa0), lam=float(lam), far=float(far), source=source)
-
-    def __call__(self, dist):
-        dist = np.asarray(dist, np.float64)
-        if self.d is None:
-            return self.far + (self.kappa0 - self.far) * np.exp(-self.lam * dist)
-        out = np.interp(dist, self.d, self.k)
-        short = (self.kappa0 * np.exp(-self.lam_short * dist) if self.lam_short > 0
-                 else np.full_like(dist, float(np.interp(self.d0, self.d, self.k))))
-        out = np.where(dist < self.d0, short, out)
-        return np.where(dist > self.d[-1], self.far, out)
-
-    def describe(self):
-        return dict(source=self.source, kappa0=self.kappa0, decay_per_cm=self.lam, far=self.far,
-                    curve_points=None if self.d is None else int(self.d.size), d0_cm=self.d0, note=self.note)
 
 
 # ----------------------------------------------------------------------------------------------------- global ancestry
@@ -219,19 +112,11 @@ def unbiased_products_cov(D, S):
     return D[:, :, None] * D[:, None, :] - S
 
 
-def unbiased_products(D, var_c, var_base):
-    """O[j, a, b] = D_ja D_jb without the panels' sampling covariance, Cov(e_a - e_B, e_b - e_B) = 1[a=b] var_a + var_B
-    with var = Var(dosage) / 4n. D: M x (K-1); var_c: M x (K-1); var_base: M."""
-    O = D[:, :, None] * D[:, None, :] - np.asarray(var_base, np.float64)[:, None, None]
-    idx = np.arange(D.shape[1])
-    O[:, idx, idx] -= var_c
-    return O
-
-
 def regress_standard_errors_k(n, se, beta, V, O, *, max_chisq=80.0):
     """Mean ancestry vector m (K) and Kt_res(0) ((K-1) x (K-1)) from one GWAS: 1 / (N SE^2 + beta^2) on the source
     dosage variances V (M x K) and the unique products O_ab (off-diagonal ones counted twice), without an intercept,
-    with the same exclusions as regress_standard_errors. Two sources reproduce it exactly."""
+    SNPs with chi-square of at least max_chisq (strong effects), non-finite values or zero variance in every source are
+    left out, and residual outliers (beyond 8 robust SDs) are dropped once before the final fit."""
     n, se, beta = (np.asarray(x, np.float64) for x in (n, se, beta))
     V, O = np.asarray(V, np.float64), np.asarray(O, np.float64)
     K, k1 = V.shape[1], O.shape[1]
@@ -422,8 +307,8 @@ def moments_tensors(th, k1):
 
 
 def ancestry_sd_from_kernel(m_first, kappa0_first):
-    """SD of the first source's global ancestry implied by the cohort quantities of the standard errors, for Tier S
-    without a published value (decision of 7 Nov 2026). With independent haplotypes (random mating), the local-ancestry
+    """SD of the first source's global ancestry implied by the cohort quantities of the standard errors, for date mode
+    without a published value. With independent haplotypes (random mating), the local-ancestry
     dosage of a source at one SNP has variance 2 m (1 - m) = 4 Var(theta) + H, and the GWAS PCs leave kappa_res(0) ~ H,
     so Var(theta) = (2 m (1 - m) - kappa_res(0)) / 4. Assortative mating raises Var(theta) above this, so the value is
     a lower bound in practice (UK Biobank t1 / t2: 0.261 / 0.242 against 0.293 / 0.301 from the genotypes)."""

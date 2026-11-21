@@ -456,8 +456,8 @@ def genotype_curve(geno, ref_path, out, *, sources=None, covar=None, keep=None, 
     noise-free product, while raw squared contrasts include the frequencies' sampling variance and shrink the kernel by
     the reliability of the contrasts (errors in variables). The noise model is Reference.frequency_noise: Var(dosage)
     / 4 n_freq per panel, a derived source's per-SNP fvar, and the panels' errors that a derived source's frequencies
-    carry (noise_mix). It matters for small panels and derived sources; noise_correction=False (CLI
-    --keep-panel-noise) restores the raw products used before 4 Nov 2026."""
+    carry (noise_mix). It matters for small panels and derived sources; noise_correction=False (hidden CLI option
+    --keep-panel-noise) keeps the raw products, for comparison only."""
     t0 = time.perf_counter()
     ref = Reference(ref_path)
     sources = list(sources or ref.names[:2])

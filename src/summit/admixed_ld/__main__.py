@@ -1,43 +1,31 @@
-"""Command line for LD scores of admixed cohorts without in-sample LD (`summit admixed-ld ...`).
+"""SUMMIT-MIX: LD scores of admixed GWAS samples without in-sample LD (`summit admixed-ld ...`).
 
-  summit admixed-ld reference --panel AFR_PREFIX --panel EUR_PREFIX --names AFR,EUR [--window-kb 3000]
-                              [--genetic-map MAP] [--remove-panel-admixture] --out REF_DIR
-  summit admixed-ld clean-panels --ref REF_DIR --panel AFR_PREFIX --panel EUR_PREFIX --names AFR,EUR --out NEW_DIR
-  summit admixed-ld curve     --geno COHORT --ref REF_DIR [--covar FILE] [--keep FILE] [--sources AFR,EUR]
-                              [--relative-pairs FILE [--kinship-col COL --kinship-min X] [--closure]
-                               [--relatedness-cell-cm 0.5] [--relatedness-controls N]] [--background] --out PREFIX
-  summit admixed-ld compose   --ref REF_DIR --sumstats FILE_OR_DIR [...] --annot ANNOT --out PREFIX
-                              (--curve PREFIX | --admixture-generations T | --decay-per-cm LAMBDA)
-                              [--sources AFR,EUR] [--ancestry-sd SD] [--relatedness X|curve|uniform] [--snps FILE]
-                              [--background-window panels|zero|flat] [--background-min-cm 3]
-  summit admixed-ld tractor-sumstats --tractor TRACTOR.tsv --sources AFR,EUR [--covariates C] --out PREFIX
-  summit admixed-ld compose   ... --tracks [--track-alpha A] [--partners reference] [--cross-source EUR]
-  summit admixed-ld track-rg  --tracks COMPOSE_PREFIX --sumstats PREFIX --annot ANNOT [--external EUR.sumstats]
-                              [--group NAME=CLASS,...] --out OUT
-  summit admixed-ld matrix    --ref REF_DIR --params PREFIX.admixed_ld.json (--region CHR:START-END | --snps FILE)
-                              (--curve PREFIX | --admixture-generations T | --decay-per-cm LAMBDA)
-                              [--taper auto|none|TAU_CM] [--no-admixture] --out PREFIX
+  summit admixed-ld reference    --panel AFR_PREFIX --panel EUR_PREFIX --names AFR,EUR [--genetic-map MAP] --out REF
+  summit admixed-ld clean-panels --ref REF --panel AFR_PREFIX --panel EUR_PREFIX --names AFR,EUR --out REF_CLEAN
+  summit admixed-ld curve        --geno COHORT --ref REF_CLEAN --keep GWAS_SAMPLE --covar GWAS_COVARIATES
+                                 --relative-pairs PAIRS --background --out CURVE        (curve mode; aggregates only)
+  summit admixed-ld compose      --ref REF_CLEAN --sumstats FILE_OR_DIR [...] --annot ANNOT --out PREFIX
+                                 (--curve CURVE --relatedness curve --cell-matrix | --admixture-generations T)
+  summit admixed-ld sample-factors --geno COHORT --ref REF_CLEAN --keep GWAS_SAMPLE --covar GWAS_COVARIATES --out SF
+  summit admixed-ld derive       --geno COHORT --ref REF --name NAT --panel NAT_ANCHORS --out REF_WITH_NAT
+  summit admixed-ld matrix       --ref REF_CLEAN --params PREFIX.admixed_ld.json --region CHR:START-END
+                                 (--curve CURVE | --admixture-generations T) --out REGION
+  summit admixed-ld tractor-sumstats --tractor TRACTOR.tsv --sources AFR,EUR --covariates C --out TRACKS
+  summit admixed-ld track-rg     --tracks COMPOSE_PREFIX --sumstats TRACKS --annot ANNOT [--external EUR.sumstats]
+                                 --out OUT
 
-`reference` is built once from unadmixed panels of the two source populations. Panels drawn from a biobank carry some
-admixture of their own; --remove-panel-admixture (or `clean-panels` on an existing reference) measures it with the
-panel's weighted-LD curve and removes it from the panel's covariances and variances; both also record each panel's own
-background LD (cryptic relatedness and structure among its members), which compose removes inside the band when a
-cohort's background (`curve --background`) is applied at every distance. `curve` is run by the cohort on its
-genotypes and writes only aggregates (PREFIX.curve.tsv and PREFIX.curve.json). `compose` needs the GWAS summary
-statistics (BETA, SE, N; CHR and BP for matching by position, or --snps), the annotation of the fit (e.g. MAF/LD bins),
-and the decay of the local-ancestry covariance: the cohort's curve, a published admixture date in generations, or a
-decay rate per cM. It writes PREFIX.gw.ldscore.gz and PREFIX.gw.M for `summit --h2/--rg`, and PREFIX.admixed_ld.json.
-`compose --partners reference` takes every reference variant listed in the annotation as a partner of the LD scores
-(a dense reference that holds the causal variants), with the GWAS SNPs as the rows. `tractor-sumstats` splits a
-Tractor GWAS (local-ancestry-aware, with sandwich SEs) into one summary-statistic file per local-ancestry track;
-`compose --tracks` writes the tracks' own and cross LD scores (and, with --cross-source, those of each track against
-another population's GWAS); `track-rg` fits SUMMIT's cross-population equations with the noise covariance fixed at 0
-for each pair and reports the correlation of per-allele effects across tracks (Hou et al.'s r_admix), per class and
-over the classes weighted by the partners' counts, with each track's heritability (tracks.py).
-`matrix` writes the regional correlation matrix of the covariate-adjusted dosages (PREFIX.ld, PREFIX.ld.npz,
-PREFIX.snps.tsv with the counted allele) for fine-mapping or conditional analysis, from the reference, compose's
-parameters (mean ancestry and kappa(0)) and the same decay inputs; --taper auto tapers the panel term against its
-sampling noise.
+`reference` is built once from unadmixed panels of the source populations, and `clean-panels` removes the panels' own
+admixture LD and records their own background, which compose removes inside the reference band. In curve mode (the
+default and recommended) the cohort runs `curve` on the GWAS sample with the GWAS's covariates; it writes only
+aggregates (PREFIX.curve.tsv, .curve.json, .background.tsv, .cells.npz). Date mode needs only the summary statistics
+and a published admixture date. `compose` takes the summary statistics (BETA, SE, N, COV_RANK; CHR and BP for
+matching by position, or --snps), whose standard errors give the mean ancestry and kappa_res(0), the annotation of the
+fit, and the curve or the date; it writes PREFIX.gw.ldscore.gz and PREFIX.gw.M for `summit --h2/--rg` (one file per
+GWAS sample size when the traits' N differ, listed in PREFIX.n_groups.tsv) and PREFIX.admixed_ld.json with every
+parameter and flag. `sample-factors` is an optional aggregate for samples of a few hundred people, `derive` estimates a
+source without a panel, `matrix` writes regional LD matrices for fine-mapping (aligned to PREFIX.snps.tsv's counted
+allele), and `tractor-sumstats`, `compose --tracks` and `track-rg` estimate the correlation of per-allele effects
+across local-ancestry tracks. The wiki page "Admixed cohorts without in-sample LD" describes each step.
 """
 import argparse
 import sys
@@ -50,7 +38,8 @@ def _sources(value):
 
 
 def main(argv=None):
-    ap = argparse.ArgumentParser(prog="summit admixed-ld")
+    ap = argparse.ArgumentParser(prog="summit admixed-ld",
+                                 description="SUMMIT-MIX: LD scores of admixed GWAS samples without in-sample LD")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     r = sub.add_parser("reference", help="build the resource from source panels (once per reference)")
@@ -71,12 +60,7 @@ def main(argv=None):
     r.add_argument("--threads", "--num-threads", dest="threads", type=int, default=1,
                     help="threads for genotype decoding and matrix products; also the BLAS limit (default 1)")
     r.add_argument("--remove-panel-admixture", action="store_true",
-                   help="remove each panel's own admixture LD (measured with the weighted-LD curve of the panel) from "
-                        "its covariances and variances. Optional and off by default. The target's curve and standard "
-                        "errors already hold all of the target's admixture LD (members from the panel's own population "
-                        "included), so a panel's own admixture LD in the band is counted twice whoever the target is; "
-                        "use it when the panel's kernel passes the gate (z >= 3, reported by clean-panels) and its "
-                        "duplicated share of the target's kernel is not negligible (see the documentation)")
+                   help=argparse.SUPPRESS)
     r.add_argument("--drop-ambiguous", action="store_true",
                     help="leave out strand-ambiguous (A/T, C/G) SNPs, which are otherwise matched as listed; use it when the "
                     "data sets may be on different strands")
@@ -119,38 +103,33 @@ def main(argv=None):
     c.add_argument("--max-cm", type=float, default=None,
                    help="largest distance of the curve in cM (default: the longest chromosome)")
     c.add_argument("--relative-pairs", default=None,
-                   help="relative pairs (IID1 IID2 [FID1 FID2] [kinship]): also write the sum of their squared "
-                        "relatedness after the covariates, computed from the genotypes, for `compose --relatedness "
-                        "curve`. The listed pairs are used, selected with --kinship-col and --kinship-min")
+                   help="related pairs (IID1 IID2 [FID1 FID2] [kinship]), e.g. relatedness above 0.0442 in a GRM of "
+                        "PC-adjusted genotypes: each family is kept within one half of the cell matrix. Select "
+                        "pairs with --kinship-col and --kinship-min")
     c.add_argument("--kinship-col", default=None, help="kinship column of --relative-pairs used with --kinship-min")
     c.add_argument("--kinship-min", type=float, default=None, help="keep only pairs whose kinship exceeds this value")
     c.add_argument("--closure", action="store_true",
                    help="also use every pair within a family (connected component of the listed pairs)")
     c.add_argument("--relatedness-cell-cm", type=float, default=0.5,
-                   help="cells of the relatives' profile in cM (default 0.5): with --relative-pairs the curve also "
-                        "writes PREFIX.relatedness.tsv, the listed pairs' local relatedness products by distance on "
-                        "one chromosome and between chromosomes, net of random control pairs (aggregates only), for "
-                        "the within-chromosome relatives term of `compose --relatedness curve`")
+                   help=argparse.SUPPRESS)
     c.add_argument("--relatedness-controls", type=int, default=None,
-                   help="random unlisted pairs that measure what unrelated pairs contribute to the same products "
-                        "(default: as many as the listed pairs, 20,000 to 200,000)")
+                   help=argparse.SUPPRESS)
     c.add_argument("--relatedness-memory-gb", type=float, default=4.0,
-                   help="memory for the pairs' cell sums; more pairs take extra genotype passes (default 4)")
+                   help="memory for the background term between chromosomes and for the listed pairs' cell sums "
+                        "(default 4)")
     c.add_argument("--no-relatedness-profile", action="store_true",
-                   help="only the sum of g^2 of the listed pairs (the behaviour before 5 Nov 2026)")
+                   help=argparse.SUPPRESS)
     c.add_argument("--background", action="store_true",
-                   help="also measure the relatedness LD of all pairs of people, listed or not (distant and cryptic "
-                        "relatives), from the cross-person LD among the least differentiated SNPs, by distance and "
-                        "between chromosomes (PREFIX.background.tsv; aggregates only)")
+                   help="also measure the background term, the LD that all pairs of people add by sharing segments "
+                        "identical by descent (relatives included), from the least differentiated SNPs, by distance "
+                        "and between chromosomes (PREFIX.background.tsv; aggregates only). Part of curve mode")
     c.add_argument("--background-quantile", type=float, default=0.2,
                    help="share of SNPs with the smallest source contrasts used for --background (default 0.2)")
     c.add_argument("--background-snps", type=int, default=None,
                    help="of these, SNPs used between chromosomes (default: what --relatedness-memory-gb holds in "
                         "float32, at most 40,000)")
     c.add_argument("--keep-panel-noise", "--no-noise-correction", dest="keep_panel_noise", action="store_true",
-                   help="use raw products of the reference contrasts in the denominators and the global-ancestry "
-                        "estimator (the behaviour before 4 Nov 2026), which shrinks the kernel by the frequencies' "
-                        "sampling variance (small panels, derived sources)")
+                   help=argparse.SUPPRESS)
     c.add_argument("--step", type=int, default=4096)
     c.add_argument("--threads", "--num-threads", dest="threads", type=int, default=1,
                     help="threads for genotype decoding and matrix products; also the BLAS limit (default 1)")
@@ -172,47 +151,36 @@ def main(argv=None):
                         "the contrasts")
     m.add_argument("--match", choices=["position", "id"], default="position")
     g = m.add_mutually_exclusive_group(required=True)
-    g.add_argument("--curve", default=None, help="prefix of the cohort's curve (`summit admixed-ld curve`)")
+    g.add_argument("--curve", default=None, help="prefix of the cohort's curve (`summit admixed-ld curve`): curve mode")
     g.add_argument("--admixture-generations", type=float, default=None,
-                   help="generations since admixture (e.g. a published date); decay = generations / 100 per cM")
-    g.add_argument("--decay-per-cm", type=float, default=None, help="decay rate of kappa per cM")
+                   help="generations since admixture, a published date: date mode (decay generations / 100 per cM)")
+    g.add_argument("--decay-per-cm", type=float, default=None, help=argparse.SUPPRESS)
     m.add_argument("--mean-ancestry", default=None,
                    help="override the mean ancestry from the SEs: K-1 or K comma-separated values in source order")
     m.add_argument("--kappa0", default=None,
                    help="override kappa_res(0) from the SEs: one value for two sources, otherwise the upper triangle "
                         "of the contrast matrix, row by row")
     m.add_argument("--ancestry-sd", type=float, default=None,
-                   help="SD of global ancestry for the same-person term, e.g. a published value (default: the curve's "
-                        "moments, else the SD implied by the SEs' m and kappa_res(0) under random mating)")
+                   help="SD of global ancestry for the same-person term, a published value (default: the curve's "
+                        "moments in curve mode, else the SD implied by the SEs' m and kappa_res(0) under random "
+                        "mating)")
     m.add_argument("--relatedness", default=None,
-                   help="optional relatives' term: 'curve' for the curve's profile (B between chromosomes, phi(d) on "
-                        "one chromosome, which carries the segments that relatives share identical by descent; a "
-                        "curve made before 5 Nov 2026 gives the uniform term), 'uniform' for the uniform term from "
-                        "the curve's sum of g^2, or a number: the sum over ordered pairs of relatives of their squared "
-                        "relatedness in the covariate-adjusted genotypes, added uniformly to every SNP pair. The "
-                        "curve's sums run over the ordered pairs of its own people and are put on the GWAS's sample "
-                        "by N (N - 1) / (n (n - 1)), n the curve's people and N the GWAS's (exactly 1 when the curve "
-                        "is made on the GWAS's people; recorded flag when they differ by more than 1%%); a number is "
-                        "used as given")
+                   help="the background term: 'curve' for the cohort's background at every distance from a curve "
+                        "made with --background (curve mode). The curve's sums run over its own people and are "
+                        "put on the GWAS's sample by N (N - 1) / (n (n - 1)), with a recorded flag when the two "
+                        "differ by more than 1%%")
     m.add_argument("--relatedness-smooth", type=float, default=0.1,
-                   help="width of the bins that pool the profile's lags, as a fraction of the distance (default 0.1)")
+                   help=argparse.SUPPRESS)
     m.add_argument("--background-min-cm", type=float, default=3.0,
-                   help="with a curve made with --background: the distance from which the smooth form of the "
-                        "cohort's and the panels' background LD is fitted (default 3; its rates reach 1 / this value "
-                        "per cM); with --background-window zero or flat, the distance from which the measurement is "
-                        "used")
+                   help=argparse.SUPPRESS)
     m.add_argument("--background-window", choices=["panels", "zero", "flat"], default="panels",
-                   help="with a curve made with --background: 'panels' (the default) applies the cohort's all-pairs "
-                        "background LD at every distance, inside the reference band too, and removes there the "
-                        "panels' own background LD that their unbiased squared covariances hold (recorded by "
-                        "clean-panels); 'zero' and 'flat' are the rules of 5 Nov 2026 (the measurement from "
-                        "--background-min-cm on, below it the listed pairs' profile plus nothing or plus the unlisted "
-                        "part's value there)")
+                   help=argparse.SUPPRESS)
     m.add_argument("--nu", type=float, default=None, help="sample size minus covariates (default from the GWAS)")
-    m.add_argument("--grid-cm", type=float, default=0.02, help="grid of the long-range convolution (default 0.02)")
+    m.add_argument("--grid-cm", type=float, default=0.02, help=argparse.SUPPRESS)
     m.add_argument("--cell-matrix", action="store_true",
-                   help="use the cohort's cell matrix (written by curve) beyond --cell-switch-cm and between chromosomes")
-    m.add_argument("--cell-switch-cm", type=float, default=10.0)
+                   help="use the cohort's cell matrix (written by curve) for pairs of 2-cM cells at least 10 cM apart "
+                        "and between chromosomes (curve mode)")
+    m.add_argument("--cell-switch-cm", type=float, default=10.0, help=argparse.SUPPRESS)
     m.add_argument("--allow-flat-kernel-join", action="store_true",
                    help="proceed when the curve at 2 cM is not below kappa_res(0) from the standard errors (the "
                         "kernel is then held at the curve's value below 2 cM and the flag is recorded); by default "
@@ -233,11 +201,11 @@ def main(argv=None):
                         "the sources do not represent); by default the difference is only checked and recorded")
     m.add_argument("--single-n", action="store_true",
                    help="write only the LD-score file for the traits' median N (by default, traits whose N differ by more "
-                        "than --n-tol get one file per sample size: the same-person and relatives' terms belong to the "
-                        "GWAS's sample)")
-    m.add_argument("--n-tol", type=float, default=0.01, help="relative difference of N within which traits share a file")
+                        "than 1%% get one file per sample size, listed in PREFIX.n_groups.tsv: the same-person and "
+                        "background terms belong to each GWAS's sample)")
+    m.add_argument("--n-tol", type=float, default=0.01, help=argparse.SUPPRESS)
     m.add_argument("--sample-factors-no-calibration", action="store_true",
-                   help="do not scale the sample-factor term to the cohort's realized between-chromosome mass")
+                   help=argparse.SUPPRESS)
     m.add_argument("--partners", choices=["rows", "reference"], default="rows",
                    help="partner variants of the LD scores: 'rows', the GWAS SNPs themselves (the default), or "
                         "'reference', every reference variant listed in --annot (a dense reference that holds the "
@@ -247,8 +215,7 @@ def main(argv=None):
                         "each track, the cross score of each pair of tracks, and with --cross-source the tracks against "
                         "that population's GWAS), on the per-allele scale, for `summit admixed-ld track-rg`")
     m.add_argument("--track-alpha", type=float, default=None,
-                   help="with --tracks: per-allele weights [2 f (1 - f)]^ALPHA (f the frequency at the mean ancestry; "
-                        "Hou et al. use -0.38) instead of 1 / s^2 with s^2 the cohort's genotype variance")
+                   help=argparse.SUPPRESS)
     m.add_argument("--drop-ambiguous", action="store_true",
                     help="leave out strand-ambiguous (A/T, C/G) SNPs, which are otherwise matched as listed; use it when the "
                     "data sets may be on different strands")
@@ -292,8 +259,7 @@ def main(argv=None):
                    help="window LD of the derived source: by inverting the cohort's composition, or that of the anchor "
                         "panel (--panel) with its own moments; the frequencies come from the cohort either way")
     v.add_argument("--no-calibration", action="store_true",
-                   help="keep the fit's position on the family of equivalent sources instead of placing it with the "
-                        "anchor panel")
+                   help=argparse.SUPPRESS)
     v.add_argument("--threads", "--num-threads", dest="threads", type=int, default=1,
                     help="threads for genotype decoding and matrix products; also the BLAS limit (default 1)")
     v.add_argument("--drop-ambiguous", action="store_true",
@@ -311,12 +277,12 @@ def main(argv=None):
     gx = x.add_mutually_exclusive_group(required=True)
     gx.add_argument("--curve", default=None)
     gx.add_argument("--admixture-generations", type=float, default=None)
-    gx.add_argument("--decay-per-cm", type=float, default=None)
+    gx.add_argument("--decay-per-cm", type=float, default=None, help=argparse.SUPPRESS)
     x.add_argument("--mean-ancestry", default=None, help="override: K-1 or K comma-separated values")
     x.add_argument("--kappa0", default=None, help="override: upper triangle of kappa_res(0), row by row")
     x.add_argument("--taper", default="auto",
                    help="taper of the panel term: auto (scale from the panel's sampling noise), none, or a scale in cM")
-    x.add_argument("--no-admixture", action="store_true", help="leave out the admixture term (for comparison only)")
+    x.add_argument("--no-admixture", action="store_true", help=argparse.SUPPRESS)
     x.add_argument("--allow-flat-kernel-join", action="store_true",
                    help="as in compose: proceed when the curve at 2 cM is not below kappa_res(0), with the flag recorded")
     x.add_argument("--out", required=True)

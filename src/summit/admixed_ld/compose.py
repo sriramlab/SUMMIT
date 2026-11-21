@@ -963,7 +963,7 @@ def compose_ldscores(ref_path, sumstats, annot, out, *, sources=None, snps=None,
         th_source = f"Beta/Dirichlet with mean {np.round(m_vec, 3).tolist()} and SD {theta_sd} (first source)"
     elif curve_info is not None:
         th, th_source = curve_info["theta"], "the cohort's curve"
-    else:                                   # Tier S without a published SD: the SEs' m and kappa_res(0)
+    else:                                   # date mode without a published SD: the SEs' m and kappa_res(0)
         sd_id = ancestry_sd_from_kernel(float(m_vec[0]), float(k0[0, 0]))
         th = dirichlet_moments(m_vec, sd_id)
         th_source = (f"Beta/Dirichlet with mean {np.round(m_vec, 3).tolist()} and SD {sd_id:.4f} (first source) from "
@@ -999,7 +999,7 @@ def compose_ldscores(ref_path, sumstats, annot, out, *, sources=None, snps=None,
                         "sample, so the relatives' term is zero")
                 else:
                     raise ValueError("--relatedness curve needs a curve with a relatedness profile or --background; "
-                                     "this curve has neither (made before 5 Nov 2026). Pass --relatedness uniform for "
+                                     "this curve has neither. Pass --relatedness uniform for "
                                      "the uniform sum of g^2, or remake the curve.")
             rel_sum = float(curve_info["relatedness"]["sum_squared_ordered"])
     else:
@@ -1048,7 +1048,7 @@ def compose_ldscores(ref_path, sumstats, annot, out, *, sources=None, snps=None,
             raise ValueError("--relatedness curve with the cohort's background at every distance needs each panel's "
                              f"own background, which {ref_path} does not record for {', '.join(missing)}: run "
                              "`summit admixed-ld clean-panels` (it measures it; for a derived source with a panel's "
-                             "LD give its anchor panel), or pass --background-window zero for the rule of 5 Nov 2026.")
+                             "LD give its anchor panel).")
         log("[admixed-ld] compose: the panels' own background LD is removed inside the band ("
             + ", ".join(f"{sources[n_]}: {pb.per_pair(2.0):.3g} per SNP pair at 2 cM, n {pb.n}"
                         for n_, pb in panel_bg.items()) + ")")

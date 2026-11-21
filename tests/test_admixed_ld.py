@@ -13,7 +13,7 @@ from admixed_ld_sim import (gwas, insample_ldscores, principal_components, simul
                             write_bed)
 
 from summit.admixed_ld._io import match_variants  # noqa: E402
-from summit.admixed_ld.model import Kernel, regress_standard_errors  # noqa: E402
+from summit.admixed_ld.model import KernelMatrix, fit_exponential, regress_standard_errors_k  # noqa: E402
 from summit.admixed_ld.reference import Reference, _band_structure, build_reference  # noqa: E402
 
 
@@ -95,7 +95,9 @@ def test_standard_error_regression_recovers_ancestry(sim):
     ref = Reference(str(sim["dir"] / "ref"))
     rv = ref.variants(["AFR", "EUR"])
     ss = pd.read_csv(sim["dir"] / "ss" / "trait0.tsv", sep="\t").set_index("SNP").loc[rv.SNP]
-    r = regress_standard_errors(ss.N, ss.SE, ss.BETA, rv.v_AFR, rv.v_EUR, rv.p_AFR - rv.p_EUR)
+    d = (rv.p_AFR - rv.p_EUR).to_numpy()
+    r = regress_standard_errors_k(ss.N, ss.SE, ss.BETA, np.column_stack([rv.v_AFR, rv.v_EUR]), (d * d)[:, None, None])
+    r = dict(m=r["m"][0], kappa0=r["kappa0"][0][0])
     assert abs(r["m"] - S["theta"].mean()) < 0.03
     la = S["local_ancestry"]
     Z = np.column_stack([np.ones(la.shape[0]), C])
@@ -222,16 +224,19 @@ def test_unbiased_squared_covariance_is_the_u_statistic():
 
 
 def test_kernel_forms():
-    k = Kernel.from_decay(0.2, 0.08, 3500.0, source="t")
-    assert k(0.0) == pytest.approx(0.2)
-    assert k.far == pytest.approx(-2 * 0.2 / (0.08 * 3500))
-    assert k(1e6) == pytest.approx(k.far)
+    k = KernelMatrix.from_decay(0.2, 0.08, 3500.0, 2, source="t")
+    assert k(0.0)[0, 0] == pytest.approx(0.2)
+    assert k.far[0, 0] == pytest.approx(-2 * 0.2 / (0.08 * 3500))
+    assert k(1e6)[0, 0] == pytest.approx(k.far[0, 0])
     d = np.arange(0.5, 40.5, 0.5)
-    kc = Kernel.from_curve(d, 0.18 * np.exp(-0.07 * d) - 0.001, -0.001, 0.2, half_width=0, rel_width=0)
-    assert kc(0.0) == pytest.approx(0.2)
-    assert kc(10.0) == pytest.approx(0.18 * np.exp(-0.7) - 0.001, rel=1e-6)
-    assert kc(100.0) == pytest.approx(-0.001)
-    assert kc.lam == pytest.approx(0.07, rel=0.05)
+    curve = 0.18 * np.exp(-0.07 * d) - 0.001
+    assert fit_exponential(d, curve)["lam"] == pytest.approx(0.07, rel=0.05)
+    kc = KernelMatrix.from_curve(d, curve[:, None, None], [[-0.001]], [[0.2]], [0.07, 0.07], half_width=0,
+                                 rel_width=0)
+    assert kc(0.0)[0, 0] == pytest.approx(0.2)
+    assert kc(1.0)[0, 0] == pytest.approx(0.2 * (np.interp(2.0, d, curve) / 0.2) ** 0.5, rel=1e-9)   # the join
+    assert kc(10.0)[0, 0] == pytest.approx(0.18 * np.exp(-0.7) - 0.001, rel=1e-6)
+    assert kc(100.0)[0, 0] == pytest.approx(-0.001)
 
 
 @pytest.fixture(scope="module")
@@ -325,7 +330,13 @@ def test_derived_source_from_the_cohort(sim3, tmp_path):
 def test_contrast_noise_identity_and_mixing():
     """Panels alone give the independent-noise products; a derived source's errors that carry the panels' errors give
     the covariance of the contrasts' errors (checked by simulation)."""
-    from summit.admixed_ld.model import contrast_noise, unbiased_products, unbiased_products_cov
+    from summit.admixed_ld.model import contrast_noise, unbiased_products_cov
+
+    def unbiased_products(D, var_c, var_base):                 # the two-source-panel formula written out
+        O = D[:, :, None] * D[:, None, :] - np.asarray(var_base, np.float64)[:, None, None]
+        idx = np.arange(D.shape[1])
+        O[:, idx, idx] -= var_c
+        return O
     rng = np.random.default_rng(1)
     M = 40
     V = rng.uniform(0.05, 0.5, (M, 3))
