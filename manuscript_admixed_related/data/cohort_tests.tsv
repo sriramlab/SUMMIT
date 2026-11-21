@@ -1,0 +1,321 @@
+set	cohort	ref	trait	h2	se	ref_h2	ref_se	z	p	bonf	fdr	bonf_pooled
+base	South Asian	EUR338k	alanine_aminotransferase	0.1371	0.07015	0.148	0.00776	-0.1546	0.8772	1	0.989	1
+base	South Asian	EUR338k	albumin	0.2383	0.07896	0.1657	0.00941	0.9125	0.3615	1	0.8677	1
+base	South Asian	EUR338k	alka_phos	0.3505	0.1133	0.3233	0.05943	0.2126	0.8316	1	0.989	1
+base	South Asian	EUR338k	apo_b	0.2106	0.07954	0.2123	0.07665	-0.0153	0.9878	1	0.989	1
+base	South Asian	EUR338k	asp_at	0.1355	0.07095	0.1713	0.01825	-0.4887	0.6251	1	0.893	1
+base	South Asian	EUR338k	blood_mscv	0.2341	0.0801	0.2507	0.01989	-0.2006	0.841	1	0.989	1
+base	South Asian	EUR338k	blood_platelet	0.4371	0.07233	0.3306	0.0223	1.407	0.1595	1	0.5801	1
+base	South Asian	EUR338k	blood_rbc_count	0.321	0.06726	0.2673	0.02031	0.7647	0.4444	1	0.8677	1
+base	South Asian	EUR338k	bmi	0.2808	0.07344	0.2818	0.00714	-0.01382	0.989	1	0.989	1
+base	South Asian	EUR338k	bp_systolic	0.1271	0.06151	0.1679	0.00479	-0.6618	0.5081	1	0.8677	1
+base	South Asian	EUR338k	calcium	0.06418	0.08091	0.1516	0.01106	-1.07	0.2845	1	0.7587	1
+base	South Asian	EUR338k	creatinine	0.3901	0.06998	0.2343	0.01006	2.203	0.02757	1	0.2205	1
+base	South Asian	EUR338k	cystatin_c	0.3315	0.09208	0.2899	0.05416	0.3893	0.697	1	0.9614	1
+base	South Asian	EUR338k	diastolic_blood_pressure	0.07666	0.0671	0.1554	0.00507	-1.17	0.2421	1	0.7254	1
+base	South Asian	EUR338k	fluid_intelligence_score	0.5472	0.135	0.2834	0.00779	1.951	0.05107	1	0.2823	1
+base	South Asian	EUR338k	ggt	0.3175	0.07585	0.2638	0.03513	0.6424	0.5206	1	0.8677	1
+base	South Asian	EUR338k	glucose	0.3165	0.07764	0.09826	0.01018	2.787	0.005319	0.2128	0.07675	0.851
+base	South Asian	EUR338k	haemoglobin_concentration	0.2757	0.06544	0.1998	0.01205	1.141	0.2539	1	0.7254	1
+base	South Asian	EUR338k	hba1c	0.3949	0.06673	0.2639	0.02351	1.851	0.06415	1	0.2851	1
+base	South Asian	EUR338k	hdl	0.3312	0.0867	0.334	0.05323	-0.02713	0.9784	1	0.989	1
+base	South Asian	EUR338k	heel_bone_mineral_density	0.1657	0.2059	0.3504	0.02369	-0.8914	0.3727	1	0.8677	1
+base	South Asian	EUR338k	height	0.5247	0.07272	0.5805	0.02368	-0.729	0.466	1	0.8677	1
+base	South Asian	EUR338k	igf_1	0.2367	0.07665	0.2777	0.01636	-0.5232	0.6008	1	0.893	1
+base	South Asian	EUR338k	ldl	0.16	0.07394	0.1628	0.04398	-0.03208	0.9744	1	0.989	1
+base	South Asian	EUR338k	neuroticism_score	0.07898	0.1039	0.1332	0.00433	-0.5218	0.6018	1	0.893	1
+base	South Asian	EUR338k	sleep_duration	0.2011	0.06354	0.07977	0.00294	1.907	0.05646	1	0.2823	1
+base	South Asian	EUR338k	testosterone	-0.06035	0.07186	0.0891	0.00916	-2.063	0.03911	1	0.2607	1
+base	South Asian	EUR338k	triglycerides	0.2779	0.08132	0.2501	0.032	0.318	0.7505	1	0.989	1
+base	South Asian	EUR338k	urate	0.2519	0.0891	0.2485	0.06321	0.03131	0.975	1	0.989	1
+base	South Asian	EUR338k	urea	0.1148	0.07282	0.1344	0.00702	-0.2676	0.789	1	0.989	1
+base	South Asian	EUR338k	vitamin_d	0.1277	0.0811	0.118	0.02212	0.1149	0.9085	1	0.989	1
+base	South Asian	EUR338k	white_blood_cell_count	0.1838	0.06762	0.2283	0.0105	-0.6499	0.5158	1	0.8677	1
+base	South Asian	EUR338k	chronic_ischaemic_heart_disease_i25	0.4081	0.1389	0.1754	0.01046	1.671	0.09479	1	0.3791	1
+base	South Asian	EUR338k	dyslipidaemia_e78	0.2762	0.1137	0.1854	0.01555	0.7911	0.4289	1	0.8677	1
+base	South Asian	EUR338k	educational_qualification	0.6132	0.06771	0.265	0.00592	5.123	3.015e-07	1.206e-05	1.206e-05	4.823e-05
+base	South Asian	EUR338k	ever_smoked	0.3858	0.1115	0.1354	0.004614	2.244	0.02485	0.9941	0.2205	1
+base	South Asian	EUR338k	hand_grip_strength	0.3254	0.06036	0.1583	0.00411	2.761	0.005757	0.2303	0.07675	0.9211
+base	South Asian	EUR338k	hypertension_i10	0.3108	0.1012	0.2605	0.008267	0.4956	0.6202	1	0.893	1
+base	South Asian	EUR338k	type2_diabetes_e11	0.4387	0.1203	0.2952	0.01424	1.184	0.2362	1	0.7254	1
+base	South Asian	EUR338k	whr	0.2507	0.06681	0.2005	0.0057	0.7488	0.454	1	0.8677	1
+base	African (standard)	EUR338k	alanine_aminotransferase	0.2443	0.1238	0.148	0.00776	0.7763	0.4376	1	0.7775	1
+base	African (standard)	EUR338k	albumin	0.4015	0.143	0.1657	0.00941	1.645	0.09995	1	0.6515	1
+base	African (standard)	EUR338k	alka_phos	0.1662	0.1352	0.3233	0.05943	-1.064	0.2874	1	0.7654	1
+base	African (standard)	EUR338k	apo_b	0.3458	0.1427	0.2123	0.07665	0.8242	0.4098	1	0.7775	1
+base	African (standard)	EUR338k	asp_at	0.2869	0.1227	0.1713	0.01825	0.9319	0.3514	1	0.7775	1
+base	African (standard)	EUR338k	blood_mscv	0.4473	0.1239	0.2507	0.01989	1.567	0.1171	1	0.6515	1
+base	African (standard)	EUR338k	blood_platelet	0.2677	0.1337	0.3306	0.0223	-0.4643	0.6425	1	0.8025	1
+base	African (standard)	EUR338k	blood_rbc_count	0.3197	0.1356	0.2673	0.02031	0.3824	0.7022	1	0.8025	1
+base	African (standard)	EUR338k	bmi	0.242	0.1037	0.2818	0.00714	-0.3831	0.7017	1	0.8025	1
+base	African (standard)	EUR338k	bp_systolic	0.3388	0.1202	0.1679	0.00479	1.42	0.1555	1	0.691	1
+base	African (standard)	EUR338k	calcium	0.03087	0.1411	0.1516	0.01106	-0.8529	0.3937	1	0.7775	1
+base	African (standard)	EUR338k	creatinine	0.311	0.1264	0.2343	0.01006	0.6047	0.5454	1	0.8025	1
+base	African (standard)	EUR338k	cystatin_c	-0.02314	0.1294	0.2899	0.05416	-2.232	0.02564	1	0.595	1
+base	African (standard)	EUR338k	diastolic_blood_pressure	0.152	0.1146	0.1554	0.00507	-0.02938	0.9766	1	0.9766	1
+base	African (standard)	EUR338k	fluid_intelligence_score	0.1876	0.2312	0.2834	0.00779	-0.4141	0.6788	1	0.8025	1
+base	African (standard)	EUR338k	ggt	0.4193	0.1351	0.2638	0.03513	1.114	0.2653	1	0.7654	1
+base	African (standard)	EUR338k	glucose	0.2267	0.1251	0.09826	0.01018	1.023	0.3062	1	0.7654	1
+base	African (standard)	EUR338k	haemoglobin_concentration	0.2162	0.126	0.1998	0.01205	0.1297	0.8968	1	0.9198	1
+base	African (standard)	EUR338k	hba1c	0.241	0.1273	0.2639	0.02351	-0.1771	0.8594	1	0.9168	1
+base	African (standard)	EUR338k	hdl	0.3984	0.1484	0.334	0.05323	0.4087	0.6827	1	0.8025	1
+base	African (standard)	EUR338k	heel_bone_mineral_density	-0.2956	0.2963	0.3504	0.02369	-2.173	0.02975	1	0.595	1
+base	African (standard)	EUR338k	height	0.7552	0.1374	0.5805	0.02368	1.253	0.2101	1	0.7654	1
+base	African (standard)	EUR338k	igf_1	0.422	0.1341	0.2777	0.01636	1.068	0.2855	1	0.7654	1
+base	African (standard)	EUR338k	ldl	0.3129	0.1346	0.1628	0.04398	1.06	0.289	1	0.7654	1
+base	African (standard)	EUR338k	neuroticism_score	0.442	0.1558	0.1332	0.00433	1.981	0.04759	1	0.6345	1
+base	African (standard)	EUR338k	sleep_duration	-0.1004	0.1102	0.07977	0.00294	-1.634	0.1022	1	0.6515	1
+base	African (standard)	EUR338k	testosterone	0.02784	0.1355	0.0891	0.00916	-0.4511	0.6519	1	0.8025	1
+base	African (standard)	EUR338k	triglycerides	0.1861	0.1122	0.2501	0.032	-0.5486	0.5833	1	0.8025	1
+base	African (standard)	EUR338k	urate	0.139	0.1273	0.2485	0.06321	-0.7703	0.4411	1	0.7775	1
+base	African (standard)	EUR338k	urea	-0.06593	0.1134	0.1344	0.00702	-1.763	0.0779	1	0.6515	1
+base	African (standard)	EUR338k	vitamin_d	0.2276	0.1421	0.118	0.02212	0.7618	0.4462	1	0.7775	1
+base	African (standard)	EUR338k	white_blood_cell_count	0.468	0.4304	0.2283	0.0105	0.5568	0.5776	1	0.8025	1
+base	African (standard)	EUR338k	chronic_ischaemic_heart_disease_i25	0.2478	0.4457	0.1754	0.01046	0.1624	0.871	1	0.9168	1
+base	African (standard)	EUR338k	dyslipidaemia_e78	0.03595	0.2058	0.1854	0.01555	-0.7242	0.4689	1	0.7816	1
+base	African (standard)	EUR338k	educational_qualification	0.167	0.1288	0.265	0.00592	-0.7603	0.4471	1	0.7775	1
+base	African (standard)	EUR338k	ever_smoked	0.4101	0.1815	0.1354	0.004614	1.513	0.1303	1	0.6515	1
+base	African (standard)	EUR338k	hand_grip_strength	0.2843	0.1173	0.1583	0.00411	1.073	0.2832	1	0.7654	1
+base	African (standard)	EUR338k	hypertension_i10	0.3372	0.1844	0.2605	0.008267	0.4156	0.6777	1	0.8025	1
+base	African (standard)	EUR338k	type2_diabetes_e11	0.3727	0.2547	0.2952	0.01424	0.3038	0.7613	1	0.8459	1
+base	African (standard)	EUR338k	whr	0.1298	0.1196	0.2005	0.0057	-0.5904	0.5549	1	0.8025	1
+base	Admixed members	EUR338k	albumin	0.4471	0.142	0.1657	0.00941	1.977	0.04803	1	0.3843	1
+base	Admixed members	EUR338k	alka_phos	0.2498	0.1394	0.3233	0.05943	-0.485	0.6277	1	0.8929	1
+base	Admixed members	EUR338k	alanine_aminotransferase	0.2224	0.1278	0.148	0.00776	0.581	0.5612	1	0.8929	1
+base	Admixed members	EUR338k	asp_at	0.2517	0.1261	0.1713	0.01825	0.631	0.528	1	0.8929	1
+base	Admixed members	EUR338k	creatinine	0.4816	0.1426	0.2343	0.01006	1.73	0.08367	1	0.524	1
+base	Admixed members	EUR338k	cystatin_c	-0.1105	0.1438	0.2899	0.05416	-2.606	0.009166	0.3666	0.1534	1
+base	Admixed members	EUR338k	ggt	0.5203	0.1693	0.2638	0.03513	1.483	0.138	1	0.6131	1
+base	Admixed members	EUR338k	glucose	0.09721	0.1376	0.09826	0.01018	-0.00761	0.9939	1	0.9939	1
+base	Admixed members	EUR338k	hba1c	0.2083	0.146	0.2639	0.02351	-0.3762	0.7068	1	0.9289	1
+base	Admixed members	EUR338k	hdl	0.1396	0.1474	0.334	0.05323	-1.24	0.2149	1	0.7796	1
+base	Admixed members	EUR338k	igf_1	0.2732	0.1362	0.2777	0.01636	-0.03288	0.9738	1	0.9939	1
+base	Admixed members	EUR338k	ldl	0.2306	0.1852	0.1628	0.04398	0.3564	0.7215	1	0.9289	1
+base	Admixed members	EUR338k	testosterone	0.07206	0.1494	0.0891	0.00916	-0.1138	0.9094	1	0.9853	1
+base	Admixed members	EUR338k	triglycerides	0.338	0.1279	0.2501	0.032	0.6666	0.505	1	0.8929	1
+base	Admixed members	EUR338k	urate	0.1736	0.1338	0.2485	0.06321	-0.506	0.6128	1	0.8929	1
+base	Admixed members	EUR338k	vitamin_d	0.3056	0.156	0.118	0.02212	1.19	0.2339	1	0.7796	1
+base	Admixed members	EUR338k	blood_rbc_count	0.19	0.1465	0.2673	0.02031	-0.5224	0.6014	1	0.8929	1
+base	Admixed members	EUR338k	white_blood_cell_count	0.4206	0.4176	0.2283	0.0105	0.4604	0.6452	1	0.8929	1
+base	Admixed members	EUR338k	blood_platelet	0.2505	0.1326	0.3306	0.0223	-0.5959	0.5512	1	0.8929	1
+base	Admixed members	EUR338k	blood_mscv	0.4583	0.1215	0.2507	0.01989	1.687	0.0917	1	0.524	1
+base	Admixed members	EUR338k	haemoglobin_concentration	0.08891	0.1447	0.1998	0.01205	-0.7636	0.4451	1	0.8929	1
+base	Admixed members	EUR338k	height	0.5962	0.1361	0.5805	0.02368	0.114	0.9092	1	0.9853	1
+base	Admixed members	EUR338k	bmi	0.2092	0.1035	0.2818	0.00714	-0.7	0.4839	1	0.8929	1
+base	Admixed members	EUR338k	bp_systolic	0.125	0.1309	0.1679	0.00479	-0.3277	0.7431	1	0.9289	1
+base	Admixed members	EUR338k	diastolic_blood_pressure	0.07802	0.1263	0.1554	0.00507	-0.6119	0.5406	1	0.8929	1
+base	Admixed members	EUR338k	heel_bone_mineral_density	-0.6518	0.31	0.3504	0.02369	-3.224	0.001266	0.05063	0.05063	0.2025
+base	Admixed members	EUR338k	calcium	0.1117	0.1387	0.1516	0.01106	-0.2866	0.7744	1	0.9387	1
+base	Admixed members	EUR338k	urea	-0.1729	0.1214	0.1344	0.00702	-2.527	0.01151	0.4603	0.1534	1
+base	Admixed members	EUR338k	apo_b	0.3565	0.2309	0.2123	0.07665	0.5927	0.5533	1	0.8929	1
+base	Admixed members	EUR338k	fluid_intelligence_score	0.7745	0.2473	0.2834	0.00779	1.985	0.04716	1	0.3843	1
+base	Admixed members	EUR338k	neuroticism_score	0.1426	0.1572	0.1332	0.00433	0.05952	0.9525	1	0.9939	1
+base	Admixed members	EUR338k	sleep_duration	-0.09894	0.1166	0.07977	0.00294	-1.532	0.1255	1	0.6131	1
+base	Admixed members	EUR338k	educational_qualification	0.1743	0.1201	0.265	0.00592	-0.7545	0.4505	1	0.8929	1
+base	Admixed members	EUR338k	hand_grip_strength	0.1445	0.1189	0.1583	0.00411	-0.1163	0.9074	1	0.9853	1
+base	Admixed members	EUR338k	whr	0.02813	0.1261	0.2005	0.0057	-1.365	0.1721	1	0.6884	1
+base	Admixed members	EUR338k	ever_smoked	0.2674	0.2013	0.1354	0.004614	0.6555	0.5121	1	0.8929	1
+base	Admixed members	EUR338k	chronic_ischaemic_heart_disease_i25	-0.1964	0.4431	0.1754	0.01046	-0.8388	0.4016	1	0.8929	1
+base	Admixed members	EUR338k	dyslipidaemia_e78	0.008563	0.2299	0.1854	0.01555	-0.7675	0.4428	1	0.8929	1
+base	Admixed members	EUR338k	hypertension_i10	0.284	0.2112	0.2605	0.008267	0.1113	0.9114	1	0.9853	1
+base	Admixed members	EUR338k	type2_diabetes_e11	0.4237	0.2805	0.2952	0.01424	0.4575	0.6473	1	0.8929	1
+base	Wider African group	EUR338k	albumin	0.3764	0.07225	0.1657	0.00941	2.891	0.003837	0.1535	0.07673	0.6139
+base	Wider African group	EUR338k	alka_phos	0.2	0.07879	0.3233	0.05943	-1.249	0.2115	1	0.5079	1
+base	Wider African group	EUR338k	alanine_aminotransferase	0.204	0.05926	0.148	0.00776	0.9368	0.3489	1	0.6164	1
+base	Wider African group	EUR338k	asp_at	0.2077	0.05758	0.1713	0.01825	0.6026	0.5468	1	0.7342	1
+base	Wider African group	EUR338k	creatinine	0.3318	0.06372	0.2343	0.01006	1.511	0.1308	1	0.4755	1
+base	Wider African group	EUR338k	cystatin_c	0.2314	0.08188	0.2899	0.05416	-0.596	0.5512	1	0.7342	1
+base	Wider African group	EUR338k	ggt	0.3655	0.1067	0.2638	0.03513	0.9053	0.3653	1	0.6164	1
+base	Wider African group	EUR338k	glucose	0.03702	0.06546	0.09826	0.01018	-0.9244	0.3553	1	0.6164	1
+base	Wider African group	EUR338k	hba1c	0.09281	0.06993	0.2639	0.02351	-2.319	0.02037	0.8148	0.1798	1
+base	Wider African group	EUR338k	hdl	0.2815	0.07902	0.334	0.05323	-0.5506	0.5819	1	0.7342	1
+base	Wider African group	EUR338k	igf_1	0.2634	0.06488	0.2777	0.01636	-0.2139	0.8307	1	0.9402	1
+base	Wider African group	EUR338k	ldl	0.3635	0.1486	0.1628	0.04398	1.295	0.1952	1	0.5079	1
+base	Wider African group	EUR338k	testosterone	0.1045	0.0656	0.0891	0.00916	0.2325	0.8161	1	0.9402	1
+base	Wider African group	EUR338k	triglycerides	0.3657	0.07563	0.2501	0.032	1.408	0.1593	1	0.5079	1
+base	Wider African group	EUR338k	urate	0.2423	0.09055	0.2485	0.06321	-0.05596	0.9554	1	0.9554	1
+base	Wider African group	EUR338k	vitamin_d	0.07111	0.06281	0.118	0.02212	-0.7047	0.481	1	0.7125	1
+base	Wider African group	EUR338k	blood_rbc_count	0.4758	0.1173	0.2673	0.02031	1.752	0.07983	1	0.3548	1
+base	Wider African group	EUR338k	white_blood_cell_count	0.4985	0.2648	0.2283	0.0105	1.02	0.3079	1	0.6157	1
+base	Wider African group	EUR338k	blood_platelet	0.2841	0.06174	0.3306	0.0223	-0.7088	0.4784	1	0.7125	1
+base	Wider African group	EUR338k	blood_mscv	0.4079	0.07674	0.2507	0.01989	1.983	0.04732	1	0.2366	1
+base	Wider African group	EUR338k	haemoglobin_concentration	0.1919	0.07414	0.1998	0.01205	-0.1049	0.9164	1	0.9554	1
+base	Wider African group	EUR338k	height	0.4131	0.06898	0.5805	0.02368	-2.295	0.02175	0.8702	0.1798	1
+base	Wider African group	EUR338k	bmi	0.2941	0.06288	0.2818	0.00714	0.194	0.8461	1	0.9402	1
+base	Wider African group	EUR338k	bp_systolic	0.2431	0.06055	0.1679	0.00479	1.238	0.2159	1	0.5079	1
+base	Wider African group	EUR338k	diastolic_blood_pressure	0.1878	0.05955	0.1554	0.00507	0.5426	0.5874	1	0.7342	1
+base	Wider African group	EUR338k	heel_bone_mineral_density	0.02998	0.1384	0.3504	0.02369	-2.282	0.02247	0.8989	0.1798	1
+base	Wider African group	EUR338k	calcium	0.1752	0.06548	0.1516	0.01106	0.3557	0.7221	1	0.8752	1
+base	Wider African group	EUR338k	urea	0.0834	0.05641	0.1344	0.00702	-0.8968	0.3698	1	0.6164	1
+base	Wider African group	EUR338k	apo_b	0.4313	0.1984	0.2123	0.07665	1.03	0.3031	1	0.6157	1
+base	Wider African group	EUR338k	fluid_intelligence_score	0.8048	0.1235	0.2834	0.00779	4.214	2.514e-05	0.001005	0.001005	0.004022
+base	Wider African group	EUR338k	neuroticism_score	0.185	0.08304	0.1332	0.00433	0.6225	0.5336	1	0.7342	1
+base	Wider African group	EUR338k	sleep_duration	0.01132	0.06205	0.07977	0.00294	-1.102	0.2705	1	0.6011	1
+base	Wider African group	EUR338k	educational_qualification	0.3981	0.06007	0.265	0.00592	2.205	0.02748	1	0.1832	1
+base	Wider African group	EUR338k	hand_grip_strength	0.1632	0.06266	0.1583	0.00411	0.0774	0.9383	1	0.9554	1
+base	Wider African group	EUR338k	whr	0.113	0.05317	0.2005	0.0057	-1.636	0.1018	1	0.4073	1
+base	Wider African group	EUR338k	ever_smoked	0.3199	0.09008	0.1354	0.004614	2.045	0.04082	1	0.2333	1
+base	Wider African group	EUR338k	chronic_ischaemic_heart_disease_i25	0.4444	0.21	0.1754	0.01046	1.279	0.2007	1	0.5079	1
+base	Wider African group	EUR338k	dyslipidaemia_e78	0.09842	0.1187	0.1854	0.01555	-0.7267	0.4674	1	0.7125	1
+base	Wider African group	EUR338k	hypertension_i10	0.2746	0.08686	0.2605	0.008267	0.1618	0.8715	1	0.9421	1
+base	Wider African group	EUR338k	type2_diabetes_e11	0.1476	0.1157	0.2952	0.01424	-1.266	0.2054	1	0.5079	1
+origin	South Asian	EUR338k	albumin	0.2326	0.07918	0.1656	0.00941	0.8406	0.4006	1	0.8433	1
+origin	South Asian	EUR338k	alka_phos	0.3622	0.113	0.3214	0.05964	0.3192	0.7495	1	0.9145	1
+origin	South Asian	EUR338k	alanine_aminotransferase	0.1448	0.07097	0.1471	0.0078	-0.03165	0.9747	1	0.9747	1
+origin	South Asian	EUR338k	asp_at	0.1423	0.07124	0.1714	0.01826	-0.3954	0.6925	1	0.9145	1
+origin	South Asian	EUR338k	creatinine	0.3871	0.06816	0.2339	0.01007	2.223	0.02619	1	0.223	1
+origin	South Asian	EUR338k	cystatin_c	0.3198	0.09276	0.2867	0.05432	0.3078	0.7582	1	0.9145	1
+origin	South Asian	EUR338k	ggt	0.3105	0.075	0.2599	0.03522	0.6104	0.5416	1	0.8829	1
+origin	South Asian	EUR338k	glucose	0.3181	0.07856	0.09706	0.01029	2.79	0.005274	0.211	0.07032	0.8438
+origin	South Asian	EUR338k	hba1c	0.3765	0.06578	0.2632	0.02357	1.622	0.1049	1	0.4155	1
+origin	South Asian	EUR338k	hdl	0.338	0.08952	0.3302	0.05356	0.07439	0.9407	1	0.9747	1
+origin	South Asian	EUR338k	igf_1	0.2273	0.07473	0.2769	0.01633	-0.6488	0.5165	1	0.8829	1
+origin	South Asian	EUR338k	ldl	0.1463	0.07346	0.1626	0.04405	-0.1905	0.8489	1	0.9702	1
+origin	South Asian	EUR338k	testosterone	-0.06448	0.07155	0.08892	0.00916	-2.127	0.03345	1	0.223	1
+origin	South Asian	EUR338k	triglycerides	0.2706	0.0818	0.2457	0.0321	0.2828	0.7773	1	0.9145	1
+origin	South Asian	EUR338k	urate	0.2538	0.08849	0.2471	0.06327	0.06177	0.9507	1	0.9747	1
+origin	South Asian	EUR338k	vitamin_d	0.06186	0.0802	0.1129	0.02273	-0.6118	0.5407	1	0.8829	1
+origin	South Asian	EUR338k	blood_rbc_count	0.3283	0.06696	0.2672	0.02049	0.8724	0.383	1	0.8433	1
+origin	South Asian	EUR338k	white_blood_cell_count	0.164	0.0671	0.2263	0.01051	-0.9165	0.3594	1	0.8433	1
+origin	South Asian	EUR338k	blood_platelet	0.4556	0.07094	0.3328	0.02266	1.649	0.09913	1	0.4155	1
+origin	South Asian	EUR338k	blood_mscv	0.2465	0.07838	0.2563	0.02119	-0.1212	0.9035	1	0.9747	1
+origin	South Asian	EUR338k	haemoglobin_concentration	0.2728	0.06563	0.2002	0.01213	1.088	0.2764	1	0.7898	1
+origin	South Asian	EUR338k	height	0.4952	0.07383	0.5705	0.02376	-0.971	0.3315	1	0.8289	1
+origin	South Asian	EUR338k	bmi	0.2274	0.07314	0.2711	0.007	-0.595	0.5518	1	0.8829	1
+origin	South Asian	EUR338k	bp_systolic	0.1423	0.0615	0.1635	0.00477	-0.3437	0.7311	1	0.9145	1
+origin	South Asian	EUR338k	diastolic_blood_pressure	0.07632	0.06731	0.1507	0.00505	-1.102	0.2703	1	0.7898	1
+origin	South Asian	EUR338k	heel_bone_mineral_density	0.2785	0.2056	0.3494	0.02377	-0.3427	0.7318	1	0.9145	1
+origin	South Asian	EUR338k	calcium	0.06056	0.08109	0.1502	0.01122	-1.095	0.2735	1	0.7898	1
+origin	South Asian	EUR338k	urea	0.1002	0.07071	0.1334	0.00702	-0.4676	0.64	1	0.9145	1
+origin	South Asian	EUR338k	apo_b	0.1987	0.0787	0.2122	0.07674	-0.1229	0.9022	1	0.9747	1
+origin	South Asian	EUR338k	fluid_intelligence_score	0.5398	0.1307	0.2577	0.00756	2.155	0.03116	1	0.223	1
+origin	South Asian	EUR338k	neuroticism_score	0.0824	0.1032	0.1306	0.0043	-0.4664	0.641	1	0.9145	1
+origin	South Asian	EUR338k	sleep_duration	0.1917	0.06412	0.07946	0.00294	1.749	0.08035	1	0.4018	1
+origin	South Asian	EUR338k	educational_qualification	0.5488	0.06771	0.2271	0.00532	4.737	2.172e-06	8.689e-05	8.689e-05	0.0003476
+origin	South Asian	EUR338k	hand_grip_strength	0.3442	0.0618	0.15	0.00414	3.135	0.001719	0.06877	0.03438	0.2751
+origin	South Asian	EUR338k	whr	0.223	0.06514	0.1921	0.00564	0.4724	0.6366	1	0.9145	1
+origin	South Asian	EUR338k	ever_smoked	0.3367	0.1127	0.1329	0.00463	1.807	0.07081	1	0.4018	1
+origin	South Asian	EUR338k	chronic_ischaemic_heart_disease_i25	0.3882	0.1394	0.1674	0.01043	1.579	0.1143	1	0.4155	1
+origin	South Asian	EUR338k	dyslipidaemia_e78	0.2511	0.1128	0.1705	0.01587	0.7079	0.479	1	0.8829	1
+origin	South Asian	EUR338k	hypertension_i10	0.314	0.101	0.2505	0.008186	0.6266	0.531	1	0.8829	1
+origin	South Asian	EUR338k	type2_diabetes_e11	0.4089	0.1204	0.2872	0.01427	1.004	0.3156	1	0.8289	1
+origin	African (standard)	EUR338k	albumin	0.4046	0.1401	0.1656	0.00941	1.702	0.0887	1	0.7023	1
+origin	African (standard)	EUR338k	alka_phos	0.1471	0.1337	0.3214	0.05964	-1.191	0.2338	1	0.7917	1
+origin	African (standard)	EUR338k	alanine_aminotransferase	0.2219	0.1219	0.1471	0.0078	0.6127	0.5401	1	0.8161	1
+origin	African (standard)	EUR338k	asp_at	0.2749	0.1194	0.1714	0.01826	0.857	0.3914	1	0.7917	1
+origin	African (standard)	EUR338k	creatinine	0.3321	0.1255	0.2339	0.01007	0.7799	0.4355	1	0.7917	1
+origin	African (standard)	EUR338k	cystatin_c	0.02579	0.128	0.2867	0.05432	-1.876	0.06059	1	0.7023	1
+origin	African (standard)	EUR338k	ggt	0.4337	0.135	0.2599	0.03522	1.246	0.2129	1	0.7917	1
+origin	African (standard)	EUR338k	glucose	0.2212	0.1237	0.09706	0.01029	1	0.3173	1	0.7917	1
+origin	African (standard)	EUR338k	hba1c	0.2383	0.1245	0.2632	0.02357	-0.1964	0.8443	1	0.9128	1
+origin	African (standard)	EUR338k	hdl	0.401	0.1462	0.3302	0.05356	0.4545	0.6495	1	0.8161	1
+origin	African (standard)	EUR338k	igf_1	0.3889	0.1329	0.2769	0.01633	0.8362	0.403	1	0.7917	1
+origin	African (standard)	EUR338k	ldl	0.3277	0.1331	0.1626	0.04405	1.177	0.239	1	0.7917	1
+origin	African (standard)	EUR338k	testosterone	0.07266	0.1319	0.08892	0.00916	-0.123	0.9021	1	0.9496	1
+origin	African (standard)	EUR338k	triglycerides	0.1886	0.1093	0.2457	0.0321	-0.5017	0.6159	1	0.8161	1
+origin	African (standard)	EUR338k	urate	0.1321	0.1264	0.2471	0.06327	-0.8134	0.416	1	0.7917	1
+origin	African (standard)	EUR338k	vitamin_d	0.2155	0.1396	0.1129	0.02273	0.7257	0.468	1	0.814	1
+origin	African (standard)	EUR338k	blood_rbc_count	0.2979	0.1351	0.2672	0.02049	0.2246	0.8223	1	0.9128	1
+origin	African (standard)	EUR338k	white_blood_cell_count	0.4904	0.424	0.2263	0.01051	0.6228	0.5334	1	0.8161	1
+origin	African (standard)	EUR338k	blood_platelet	0.2002	0.1278	0.3328	0.02266	-1.022	0.307	1	0.7917	1
+origin	African (standard)	EUR338k	blood_mscv	0.3918	0.1216	0.2563	0.02119	1.097	0.2724	1	0.7917	1
+origin	African (standard)	EUR338k	haemoglobin_concentration	0.1582	0.1236	0.2002	0.01213	-0.3379	0.7355	1	0.8915	1
+origin	African (standard)	EUR338k	height	0.6526	0.1359	0.5705	0.02376	0.595	0.5518	1	0.8161	1
+origin	African (standard)	EUR338k	bmi	0.2446	0.1045	0.2711	0.007	-0.2532	0.8001	1	0.9128	1
+origin	African (standard)	EUR338k	bp_systolic	0.348	0.1207	0.1635	0.00477	1.527	0.1267	1	0.7238	1
+origin	African (standard)	EUR338k	diastolic_blood_pressure	0.1425	0.1147	0.1507	0.00505	-0.07168	0.9429	1	0.967	1
+origin	African (standard)	EUR338k	heel_bone_mineral_density	-0.2391	0.2904	0.3494	0.02377	-2.02	0.0434	1	0.7023	1
+origin	African (standard)	EUR338k	calcium	0.08045	0.1374	0.1502	0.01122	-0.506	0.6128	1	0.8161	1
+origin	African (standard)	EUR338k	urea	-0.09644	0.1118	0.1334	0.00702	-2.052	0.04017	1	0.7023	1
+origin	African (standard)	EUR338k	apo_b	0.351	0.1408	0.2122	0.07674	0.8655	0.3868	1	0.7917	1
+origin	African (standard)	EUR338k	fluid_intelligence_score	0.03284	0.2322	0.2577	0.00756	-0.9677	0.3332	1	0.7917	1
+origin	African (standard)	EUR338k	neuroticism_score	0.41	0.1558	0.1306	0.0043	1.793	0.073	1	0.7023	1
+origin	African (standard)	EUR338k	sleep_duration	-0.09907	0.1102	0.07946	0.00294	-1.619	0.1053	1	0.7023	1
+origin	African (standard)	EUR338k	educational_qualification	0.1645	0.1263	0.2271	0.00532	-0.4951	0.6205	1	0.8161	1
+origin	African (standard)	EUR338k	hand_grip_strength	0.256	0.1145	0.15	0.00414	0.9249	0.355	1	0.7917	1
+origin	African (standard)	EUR338k	whr	0.1185	0.1201	0.1921	0.00564	-0.6122	0.5404	1	0.8161	1
+origin	African (standard)	EUR338k	ever_smoked	0.361	0.1771	0.1329	0.00463	1.287	0.1979	1	0.7917	1
+origin	African (standard)	EUR338k	chronic_ischaemic_heart_disease_i25	0.1557	0.4401	0.1674	0.01043	-0.02665	0.9787	1	0.9787	1
+origin	African (standard)	EUR338k	dyslipidaemia_e78	-0.03045	0.2092	0.1705	0.01587	-0.9576	0.3383	1	0.7917	1
+origin	African (standard)	EUR338k	hypertension_i10	0.3021	0.1831	0.2505	0.008186	0.2815	0.7783	1	0.9128	1
+origin	African (standard)	EUR338k	type2_diabetes_e11	0.4017	0.2541	0.2872	0.01427	0.4498	0.6529	1	0.8161	1
+origin	Admixed members	EUR338k	albumin	0.4296	0.1383	0.1656	0.00941	1.905	0.05682	1	0.5682	1
+origin	Admixed members	EUR338k	alka_phos	0.2386	0.1385	0.3214	0.05964	-0.5492	0.5829	1	0.8244	1
+origin	Admixed members	EUR338k	alanine_aminotransferase	0.2181	0.1263	0.1471	0.0078	0.5614	0.5745	1	0.8244	1
+origin	Admixed members	EUR338k	asp_at	0.2574	0.1235	0.1714	0.01826	0.689	0.4908	1	0.8244	1
+origin	Admixed members	EUR338k	creatinine	0.4855	0.1401	0.2339	0.01007	1.791	0.07327	1	0.5861	1
+origin	Admixed members	EUR338k	cystatin_c	-0.07641	0.1397	0.2867	0.05432	-2.423	0.01541	0.6164	0.2055	1
+origin	Admixed members	EUR338k	ggt	0.5257	0.1658	0.2599	0.03522	1.568	0.1169	1	0.6679	1
+origin	Admixed members	EUR338k	glucose	0.1139	0.1352	0.09706	0.01029	0.1242	0.9012	1	0.9742	1
+origin	Admixed members	EUR338k	hba1c	0.204	0.1445	0.2632	0.02357	-0.4042	0.6861	1	0.8387	1
+origin	Admixed members	EUR338k	hdl	0.1392	0.1441	0.3302	0.05356	-1.243	0.214	1	0.8244	1
+origin	Admixed members	EUR338k	igf_1	0.2313	0.135	0.2769	0.01633	-0.3356	0.7372	1	0.8425	1
+origin	Admixed members	EUR338k	ldl	0.253	0.1823	0.1626	0.04405	0.4819	0.6299	1	0.8244	1
+origin	Admixed members	EUR338k	testosterone	0.1073	0.1474	0.08892	0.00916	0.1245	0.901	1	0.9742	1
+origin	Admixed members	EUR338k	triglycerides	0.3348	0.1253	0.2457	0.0321	0.6885	0.4912	1	0.8244	1
+origin	Admixed members	EUR338k	urate	0.1778	0.1334	0.2471	0.06327	-0.4692	0.6389	1	0.8244	1
+origin	Admixed members	EUR338k	vitamin_d	0.2747	0.1531	0.1129	0.02273	1.046	0.2957	1	0.8244	1
+origin	Admixed members	EUR338k	blood_rbc_count	0.171	0.1438	0.2672	0.02049	-0.6624	0.5077	1	0.8244	1
+origin	Admixed members	EUR338k	white_blood_cell_count	0.4358	0.4093	0.2263	0.01051	0.5118	0.6088	1	0.8244	1
+origin	Admixed members	EUR338k	blood_platelet	0.1931	0.1258	0.3328	0.02266	-1.093	0.2745	1	0.8244	1
+origin	Admixed members	EUR338k	blood_mscv	0.4463	0.1176	0.2563	0.02119	1.59	0.1119	1	0.6679	1
+origin	Admixed members	EUR338k	haemoglobin_concentration	0.04113	0.1368	0.2002	0.01213	-1.158	0.2469	1	0.8244	1
+origin	Admixed members	EUR338k	height	0.5192	0.1374	0.5705	0.02376	-0.368	0.7129	1	0.8387	1
+origin	Admixed members	EUR338k	bmi	0.2135	0.1023	0.2711	0.007	-0.5619	0.5742	1	0.8244	1
+origin	Admixed members	EUR338k	bp_systolic	0.09259	0.1318	0.1635	0.00477	-0.5377	0.5908	1	0.8244	1
+origin	Admixed members	EUR338k	diastolic_blood_pressure	0.03528	0.1263	0.1507	0.00505	-0.9134	0.3611	1	0.8244	1
+origin	Admixed members	EUR338k	heel_bone_mineral_density	-0.5325	0.3071	0.3494	0.02377	-2.863	0.004193	0.1677	0.1214	0.6709
+origin	Admixed members	EUR338k	calcium	0.1378	0.1381	0.1502	0.01122	-0.08957	0.9286	1	0.9775	1
+origin	Admixed members	EUR338k	urea	-0.1956	0.1197	0.1334	0.00702	-2.744	0.006068	0.2427	0.1214	0.9709
+origin	Admixed members	EUR338k	apo_b	0.3687	0.2262	0.2122	0.07674	0.6551	0.5124	1	0.8244	1
+origin	Admixed members	EUR338k	fluid_intelligence_score	0.5248	0.2469	0.2577	0.00756	1.081	0.2795	1	0.8244	1
+origin	Admixed members	EUR338k	neuroticism_score	0.137	0.157	0.1306	0.0043	0.04094	0.9673	1	0.9921	1
+origin	Admixed members	EUR338k	sleep_duration	-0.07967	0.117	0.07946	0.00294	-1.36	0.1739	1	0.7731	1
+origin	Admixed members	EUR338k	educational_qualification	0.1818	0.1194	0.2271	0.00532	-0.3789	0.7047	1	0.8387	1
+origin	Admixed members	EUR338k	hand_grip_strength	0.08862	0.1204	0.15	0.00414	-0.5097	0.6102	1	0.8244	1
+origin	Admixed members	EUR338k	whr	0.01527	0.1245	0.1921	0.00564	-1.419	0.1559	1	0.7731	1
+origin	Admixed members	EUR338k	ever_smoked	0.2272	0.1921	0.1329	0.00463	0.4907	0.6236	1	0.8244	1
+origin	Admixed members	EUR338k	chronic_ischaemic_heart_disease_i25	-0.2568	0.4333	0.1674	0.01043	-0.9788	0.3277	1	0.8244	1
+origin	Admixed members	EUR338k	dyslipidaemia_e78	-0.01588	0.2319	0.1705	0.01587	-0.8017	0.4228	1	0.8244	1
+origin	Admixed members	EUR338k	hypertension_i10	0.2498	0.2089	0.2505	0.008186	-0.0034	0.9973	1	0.9973	1
+origin	Admixed members	EUR338k	type2_diabetes_e11	0.5014	0.2735	0.2872	0.01427	0.782	0.4342	1	0.8244	1
+origin	Wider African group	EUR338k	albumin	0.3218	0.07147	0.1656	0.00941	2.167	0.03022	1	0.3964	1
+origin	Wider African group	EUR338k	alka_phos	0.1875	0.07958	0.3214	0.05964	-1.347	0.1781	1	0.5614	1
+origin	Wider African group	EUR338k	alanine_aminotransferase	0.2121	0.0592	0.1471	0.0078	1.089	0.2761	1	0.5614	1
+origin	Wider African group	EUR338k	asp_at	0.2129	0.05834	0.1714	0.01826	0.6792	0.497	1	0.671	1
+origin	Wider African group	EUR338k	creatinine	0.3164	0.06343	0.2339	0.01007	1.284	0.199	1	0.5614	1
+origin	Wider African group	EUR338k	cystatin_c	0.2362	0.08142	0.2867	0.05432	-0.5161	0.6058	1	0.7817	1
+origin	Wider African group	EUR338k	ggt	0.3601	0.1065	0.2599	0.03522	0.8931	0.3718	1	0.6005	1
+origin	Wider African group	EUR338k	glucose	0.04393	0.06543	0.09706	0.01029	-0.8022	0.4225	1	0.6035	1
+origin	Wider African group	EUR338k	hba1c	0.1005	0.0691	0.2632	0.02357	-2.228	0.02587	1	0.3964	1
+origin	Wider African group	EUR338k	hdl	0.2466	0.07767	0.3302	0.05356	-0.8865	0.3753	1	0.6005	1
+origin	Wider African group	EUR338k	igf_1	0.2215	0.06492	0.2769	0.01633	-0.828	0.4077	1	0.6035	1
+origin	Wider African group	EUR338k	ldl	0.358	0.1492	0.1626	0.04405	1.256	0.2091	1	0.5614	1
+origin	Wider African group	EUR338k	testosterone	0.09965	0.06714	0.08892	0.00916	0.1583	0.8742	1	0.9202	1
+origin	Wider African group	EUR338k	triglycerides	0.3338	0.07526	0.2457	0.0321	1.076	0.2819	1	0.5614	1
+origin	Wider African group	EUR338k	urate	0.2443	0.08969	0.2471	0.06327	-0.02533	0.9798	1	0.9798	1
+origin	Wider African group	EUR338k	vitamin_d	0.03171	0.06457	0.1129	0.02273	-1.185	0.2358	1	0.5614	1
+origin	Wider African group	EUR338k	blood_rbc_count	0.4412	0.1154	0.2672	0.02049	1.484	0.1377	1	0.5614	1
+origin	Wider African group	EUR338k	white_blood_cell_count	0.4869	0.2691	0.2263	0.01051	0.9679	0.3331	1	0.5793	1
+origin	Wider African group	EUR338k	blood_platelet	0.2631	0.06253	0.3328	0.02266	-1.048	0.2947	1	0.5614	1
+origin	Wider African group	EUR338k	blood_mscv	0.4304	0.07323	0.2563	0.02119	2.283	0.02242	0.8967	0.3964	1
+origin	Wider African group	EUR338k	haemoglobin_concentration	0.1738	0.07204	0.2002	0.01213	-0.3608	0.7182	1	0.8735	1
+origin	Wider African group	EUR338k	height	0.4196	0.06939	0.5705	0.02376	-2.058	0.03964	1	0.3964	1
+origin	Wider African group	EUR338k	bmi	0.2885	0.06177	0.2711	0.007	0.2796	0.7798	1	0.8912	1
+origin	Wider African group	EUR338k	bp_systolic	0.2302	0.06224	0.1635	0.00477	1.069	0.2853	1	0.5614	1
+origin	Wider African group	EUR338k	diastolic_blood_pressure	0.1711	0.06069	0.1507	0.00505	0.3345	0.738	1	0.8735	1
+origin	Wider African group	EUR338k	heel_bone_mineral_density	0.09023	0.1362	0.3494	0.02377	-1.875	0.06083	1	0.4866	1
+origin	Wider African group	EUR338k	calcium	0.1629	0.06409	0.1502	0.01122	0.195	0.8454	1	0.9177	1
+origin	Wider African group	EUR338k	urea	0.07197	0.05564	0.1334	0.00702	-1.096	0.2731	1	0.5614	1
+origin	Wider African group	EUR338k	apo_b	0.4262	0.1976	0.2122	0.07674	1.009	0.3127	1	0.5686	1
+origin	Wider African group	EUR338k	fluid_intelligence_score	0.4611	0.124	0.2577	0.00756	1.638	0.1015	1	0.5614	1
+origin	Wider African group	EUR338k	neuroticism_score	0.1579	0.08307	0.1306	0.0043	0.3286	0.7425	1	0.8735	1
+origin	Wider African group	EUR338k	sleep_duration	0.006506	0.06177	0.07946	0.00294	-1.18	0.2381	1	0.5614	1
+origin	Wider African group	EUR338k	educational_qualification	0.2163	0.05638	0.2271	0.00532	-0.1905	0.8489	1	0.9177	1
+origin	Wider African group	EUR338k	hand_grip_strength	0.1084	0.06205	0.15	0.00414	-0.6694	0.5032	1	0.671	1
+origin	Wider African group	EUR338k	whr	0.1151	0.05389	0.1921	0.00564	-1.421	0.1552	1	0.5614	1
+origin	Wider African group	EUR338k	ever_smoked	0.2299	0.08907	0.1329	0.00463	1.087	0.2768	1	0.5614	1
+origin	Wider African group	EUR338k	chronic_ischaemic_heart_disease_i25	0.4443	0.2118	0.1674	0.01043	1.306	0.1917	1	0.5614	1
+origin	Wider African group	EUR338k	dyslipidaemia_e78	0.07066	0.117	0.1705	0.01587	-0.8452	0.398	1	0.6035	1
+origin	Wider African group	EUR338k	hypertension_i10	0.2616	0.08745	0.2505	0.008186	0.1263	0.8995	1	0.9226	1
+origin	Wider African group	EUR338k	type2_diabetes_e11	0.1023	0.1148	0.2872	0.01427	-1.599	0.1099	1	0.5614	1

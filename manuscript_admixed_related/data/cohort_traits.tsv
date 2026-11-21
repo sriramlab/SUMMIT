@@ -1,0 +1,1601 @@
+trait	arm	model	est	se	n	cohort	set	se_resc	liab_mult
+alanine_aminotransferase	U	single	0.16245	0.033082	8064	Wider African group	base		1
+albumin	U	single	0.10661	0.038604	7455	Wider African group	base		1
+alka_phos	U	single	0.1578	0.053153	8066	Wider African group	base		1
+apo_b	U	single	0.26296	0.14017	7997	Wider African group	base		1
+asp_at	U	single	0.18745	0.031672	8018	Wider African group	base		1
+blood_mscv	U	single	0.13395	0.04187	7918	Wider African group	base		1
+blood_platelet	U	single	0.080565	0.035622	8135	Wider African group	base		1
+blood_rbc_count	U	single	0.12269	0.056343	8135	Wider African group	base		1
+bmi	U	single	0.34826	0.032382	8446	Wider African group	base		1
+bp_systolic	U	single	0.12393	0.032027	8418	Wider African group	base		1
+calcium	U	single	-0.00078711	0.034593	7453	Wider African group	base		1
+creatinine	U	single	0.20819	0.0362	8062	Wider African group	base		1
+cystatin_c	U	single	0.094843	0.043602	8063	Wider African group	base		1
+diastolic_blood_pressure	U	single	0.077126	0.030333	8418	Wider African group	base		1
+fluid_intelligence_score	U	single	0.89987	0.063058	4196	Wider African group	base		1
+ggt	U	single	0.37959	0.053166	8060	Wider African group	base		1
+glucose	U	single	-0.091549	0.036943	7442	Wider African group	base		1
+haemoglobin_concentration	U	single	0.084007	0.042018	8135	Wider African group	base		1
+hba1c	U	single	-0.2272	0.041911	7025	Wider African group	base		1
+hdl	U	single	0.2573	0.048322	7451	Wider African group	base		1
+heel_bone_mineral_density	U	single	-0.71615	0.076544	3260	Wider African group	base		1
+height	U	single	0.37711	0.040348	8462	Wider African group	base		1
+igf_1	U	single	0.15472	0.033408	8007	Wider African group	base		1
+ldl	U	single	0.20992	0.10451	8048	Wider African group	base		1
+neuroticism_score	U	single	0.11625	0.048574	5821	Wider African group	base		1
+sleep_duration	U	single	-0.16986	0.03223	8268	Wider African group	base		1
+testosterone	U	single	0.098445	0.036626	7311	Wider African group	base		1
+triglycerides	U	single	0.23277	0.042553	8060	Wider African group	base		1
+urate	U	single	0.17044	0.086329	8054	Wider African group	base		1
+urea	U	single	0.022438	0.034745	8059	Wider African group	base		1
+vitamin_d	U	single	0.22892	0.033852	7823	Wider African group	base		1
+white_blood_cell_count	U	single	0.47111	0.20935	8135	Wider African group	base		1
+alanine_aminotransferase	U	8bin	0.19248	0.065442	8064	Wider African group	base	0.068724	1
+albumin	U	8bin	0.3437	0.072614	7455	Wider African group	base	0.077602	1
+alka_phos	U	8bin	0.14447	0.079654	8066	Wider African group	base	0.083229	1
+apo_b	U	8bin	0.44908	0.18435	7997	Wider African group	base	0.19929	1
+asp_at	U	8bin	0.2151	0.058677	8018	Wider African group	base	0.06179	1
+blood_mscv	U	8bin	0.46266	0.078679	7918	Wider African group	base	0.085362	1
+blood_platelet	U	8bin	0.26433	0.065601	8135	Wider African group	base	0.069451	1
+blood_rbc_count	U	8bin	0.51514	0.10966	8135	Wider African group	base	0.11976	1
+bmi	U	8bin	0.29502	0.062927	8446	Wider African group	base	0.066809	1
+bp_systolic	U	8bin	0.2757	0.06238	8418	Wider African group	base	0.066158	1
+calcium	U	8bin	0.22756	0.067967	7453	Wider African group	base	0.071715	1
+creatinine	U	8bin	0.3382	0.06696	8062	Wider African group	base	0.07148	1
+cystatin_c	U	8bin	0.28942	0.085074	8063	Wider African group	base	0.090343	1
+diastolic_blood_pressure	U	8bin	0.19897	0.063864	8418	Wider African group	base	0.067194	1
+fluid_intelligence_score	U	8bin	0.80369	0.11781	4196	Wider African group	base	0.13393	1
+ggt	U	8bin	0.35127	0.096416	8060	Wider African group	base	0.10299	1
+glucose	U	8bin	0.034989	0.073684	7442	Wider African group	base	0.076422	1
+haemoglobin_concentration	U	8bin	0.21699	0.080326	8135	Wider African group	base	0.08462	1
+hba1c	U	8bin	0.072176	0.073138	7025	Wider African group	base	0.076051	1
+hdl	U	8bin	0.28285	0.079805	7451	Wider African group	base	0.084615	1
+heel_bone_mineral_density	U	8bin	-0.010621	0.14796	3260	Wider African group	base	0.15315	1
+height	U	8bin	0.43088	0.067774	8462	Wider African group	base	0.073126	1
+igf_1	U	8bin	0.31218	0.066071	8007	Wider African group	base	0.070321	1
+ldl	U	8bin	0.39649	0.14254	8048	Wider African group	base	0.15314	1
+neuroticism_score	U	8bin	0.25291	0.091639	5821	Wider African group	base	0.096942	1
+sleep_duration	U	8bin	-0.018219	0.066286	8268	Wider African group	base	0.06854	1
+testosterone	U	8bin	0.16357	0.071254	7311	Wider African group	base	0.074678	1
+triglycerides	U	8bin	0.40389	0.075546	8060	Wider African group	base	0.081269	1
+urate	U	8bin	0.21687	0.093591	8054	Wider African group	base	0.098542	1
+urea	U	8bin	0.12147	0.06209	8059	Wider African group	base	0.064833	1
+vitamin_d	U	8bin	0.091904	0.063537	7823	Wider African group	base	0.066177	1
+white_blood_cell_count	U	8bin	0.5264	0.20764	8135	Wider African group	base	0.22641	1
+albumin	XA	single	0.15279	0.037192	8387	Wider African group	base		1
+alka_phos	XA	single	0.18541	0.051171	9084	Wider African group	base		1
+alanine_aminotransferase	XA	single	0.15871	0.03068	9082	Wider African group	base		1
+asp_at	XA	single	0.16052	0.031498	9031	Wider African group	base		1
+creatinine	XA	single	0.21433	0.03402	9079	Wider African group	base		1
+cystatin_c	XA	single	0.081084	0.041229	9081	Wider African group	base		1
+ggt	XA	single	0.39849	0.059881	9077	Wider African group	base		1
+glucose	XA	single	-0.090034	0.034543	8373	Wider African group	base		1
+hba1c	XA	single	-0.1784	0.039681	7929	Wider African group	base		1
+hdl	XA	single	0.27017	0.04755	8383	Wider African group	base		1
+igf_1	XA	single	0.14597	0.033739	9021	Wider African group	base		1
+ldl	XA	single	0.22631	0.10399	9064	Wider African group	base		1
+testosterone	XA	single	0.088246	0.033961	8221	Wider African group	base		1
+triglycerides	XA	single	0.20267	0.039625	9078	Wider African group	base		1
+urate	XA	single	0.19084	0.088061	9070	Wider African group	base		1
+vitamin_d	XA	single	0.20814	0.03404	8806	Wider African group	base		1
+blood_rbc_count	XA	single	0.15277	0.056522	9174	Wider African group	base		1
+white_blood_cell_count	XA	single	0.50683	0.2595	9174	Wider African group	base		1
+blood_platelet	XA	single	0.11228	0.031679	9174	Wider African group	base		1
+blood_mscv	XA	single	0.12177	0.038692	8939	Wider African group	base		1
+haemoglobin_concentration	XA	single	0.095544	0.040553	9174	Wider African group	base		1
+height	XA	single	0.36017	0.039082	9534	Wider African group	base		1
+bmi	XA	single	0.33951	0.031577	9517	Wider African group	base		1
+bp_systolic	XA	single	0.12294	0.030057	9489	Wider African group	base		1
+diastolic_blood_pressure	XA	single	0.080193	0.02774	9489	Wider African group	base		1
+heel_bone_mineral_density	XA	single	-0.6082	0.070191	3647	Wider African group	base		1
+calcium	XA	single	0.014851	0.031783	8384	Wider African group	base		1
+urea	XA	single	0.008382	0.030636	9077	Wider African group	base		1
+apo_b	XA	single	0.28189	0.14243	9009	Wider African group	base		1
+fluid_intelligence_score	XA	single	0.86088	0.060851	4761	Wider African group	base		1
+neuroticism_score	XA	single	0.10855	0.042014	6596	Wider African group	base		1
+sleep_duration	XA	single	-0.14195	0.028918	9320	Wider African group	base		1
+albumin	XA	8bin	0.37644	0.066567	8387	Wider African group	base	0.072247	1
+alka_phos	XA	8bin	0.19997	0.074537	9084	Wider African group	base	0.078791	1
+alanine_aminotransferase	XA	8bin	0.20404	0.055988	9082	Wider African group	base	0.059256	1
+asp_at	XA	8bin	0.20773	0.054346	9031	Wider African group	base	0.057582	1
+creatinine	XA	8bin	0.33179	0.059131	9079	Wider African group	base	0.063719	1
+cystatin_c	XA	8bin	0.23137	0.077018	9081	Wider African group	base	0.081877	1
+ggt	XA	8bin	0.36553	0.098636	9077	Wider African group	base	0.10671	1
+glucose	XA	8bin	0.037015	0.062941	8373	Wider African group	base	0.065461	1
+hba1c	XA	8bin	0.092813	0.066879	7929	Wider African group	base	0.069928	1
+hdl	XA	8bin	0.28146	0.073893	8383	Wider African group	base	0.079019	1
+igf_1	XA	8bin	0.26344	0.060781	9021	Wider African group	base	0.06488	1
+ldl	XA	8bin	0.36347	0.13736	9064	Wider African group	base	0.14858	1
+testosterone	XA	8bin	0.10452	0.062663	8221	Wider African group	base	0.065598	1
+triglycerides	XA	8bin	0.36569	0.069834	9078	Wider African group	base	0.075634	1
+urate	XA	8bin	0.24231	0.085125	9070	Wider African group	base	0.090552	1
+vitamin_d	XA	8bin	0.071105	0.060213	8806	Wider African group	base	0.062809	1
+blood_rbc_count	XA	8bin	0.47584	0.10643	9174	Wider African group	base	0.11727	1
+white_blood_cell_count	XA	8bin	0.49845	0.2403	9174	Wider African group	base	0.26481	1
+blood_platelet	XA	8bin	0.28406	0.057672	9174	Wider African group	base	0.061743	1
+blood_mscv	XA	8bin	0.40794	0.070349	8939	Wider African group	base	0.076744	1
+haemoglobin_concentration	XA	8bin	0.19193	0.07012	9174	Wider African group	base	0.074141	1
+height	XA	8bin	0.41311	0.063274	9534	Wider African group	base	0.068977	1
+bmi	XA	8bin	0.29411	0.058701	9517	Wider African group	base	0.062885	1
+bp_systolic	XA	8bin	0.24307	0.056855	9489	Wider African group	base	0.060552	1
+diastolic_blood_pressure	XA	8bin	0.18776	0.056305	9489	Wider African group	base	0.059551	1
+heel_bone_mineral_density	XA	8bin	0.029977	0.133	3647	Wider African group	base	0.13839	1
+calcium	XA	8bin	0.17516	0.062029	8384	Wider African group	base	0.065484	1
+urea	XA	8bin	0.083402	0.053994	9077	Wider African group	base	0.05641	1
+apo_b	XA	8bin	0.43126	0.18156	9009	Wider African group	base	0.19835	1
+fluid_intelligence_score	XA	8bin	0.80476	0.10621	4761	Wider African group	base	0.12345	1
+neuroticism_score	XA	8bin	0.18501	0.07858	6596	Wider African group	base	0.083042	1
+sleep_duration	XA	8bin	0.011318	0.059773	9320	Wider African group	base	0.062054	1
+chronic_ischaemic_heart_disease_i25	U	single	0.63713	0.11512	8563	Wider African group	base		3.6617
+dyslipidaemia_e78	U	single	0.10173	0.066012	8563	Wider African group	base		1.9595
+educational_qualification	U	single	0.24929	0.031942	8213	Wider African group	base		1
+ever_smoked	U	single	0.36549	0.047215	8440	Wider African group	base		1.5807
+hand_grip_strength	U	single	0.088694	0.03128	8469	Wider African group	base		1
+hypertension_i10	U	single	0.14313	0.050037	8563	Wider African group	base		1.5733
+type2_diabetes_e11	U	single	-0.54158	0.066603	8563	Wider African group	base		2.193
+whr	U	single	0.14264	0.029299	8473	Wider African group	base		1
+chronic_ischaemic_heart_disease_i25	U	8bin	0.55293	0.22349	8563	Wider African group	base	0.23679	3.6617
+dyslipidaemia_e78	U	8bin	0.081237	0.13004	8563	Wider African group	base	0.13777	1.9595
+educational_qualification	U	8bin	0.32131	0.062056	8213	Wider African group	base	0.065747	1
+ever_smoked	U	8bin	0.40194	0.085472	8440	Wider African group	base	0.090556	1.5807
+hand_grip_strength	U	8bin	0.17917	0.060316	8469	Wider African group	base	0.063904	1
+hypertension_i10	U	8bin	0.2923	0.095656	8563	Wider African group	base	0.10135	1.5733
+type2_diabetes_e11	U	8bin	0.092738	0.12364	8563	Wider African group	base	0.13099	2.193
+whr	U	8bin	0.099542	0.052724	8473	Wider African group	base	0.05586	1
+educational_qualification	XA	single	0.26836	0.031013	9259	Wider African group	base		1
+hand_grip_strength	XA	single	0.08225	0.031418	9541	Wider African group	base		1
+whr	XA	single	0.15059	0.02828	9545	Wider African group	base		1
+ever_smoked	XA	single	0.2935	0.047333	9513	Wider African group	base		1.5789
+chronic_ischaemic_heart_disease_i25	XA	single	0.47751	0.10672	9647	Wider African group	base		3.6487
+dyslipidaemia_e78	XA	single	0.11798	0.06158	9647	Wider African group	base		1.9531
+hypertension_i10	XA	single	0.16108	0.048106	9647	Wider African group	base		1.5728
+type2_diabetes_e11	XA	single	-0.46239	0.058949	9647	Wider African group	base		2.1723
+educational_qualification	XA	8bin	0.3981	0.05644	9259	Wider African group	base	0.060074	1
+hand_grip_strength	XA	8bin	0.1632	0.058872	9541	Wider African group	base	0.062663	1
+whr	XA	8bin	0.11298	0.049955	9545	Wider African group	base	0.053171	1
+ever_smoked	XA	8bin	0.3199	0.084627	9513	Wider African group	base	0.090076	1.5789
+chronic_ischaemic_heart_disease_i25	XA	8bin	0.44435	0.19731	9647	Wider African group	base	0.21002	3.6487
+dyslipidaemia_e78	XA	8bin	0.09842	0.11151	9647	Wider African group	base	0.11869	1.9531
+hypertension_i10	XA	8bin	0.27463	0.081602	9647	Wider African group	base	0.086856	1.5728
+type2_diabetes_e11	XA	8bin	0.14757	0.10871	9647	Wider African group	base	0.11571	2.1723
+alanine_aminotransferase	U	single	0.16456	0.033099	8064	Wider African group	origin		1
+albumin	U	single	0.077382	0.038694	7455	Wider African group	origin		1
+alka_phos	U	single	0.15574	0.053546	8066	Wider African group	origin		1
+apo_b	U	single	0.25631	0.13922	7997	Wider African group	origin		1
+asp_at	U	single	0.18703	0.032223	8018	Wider African group	origin		1
+blood_mscv	U	single	0.1749	0.041363	7918	Wider African group	origin		1
+blood_platelet	U	single	0.078846	0.03536	8135	Wider African group	origin		1
+blood_rbc_count	U	single	0.11122	0.055955	8135	Wider African group	origin		1
+bmi	U	single	0.34735	0.032491	8446	Wider African group	origin		1
+bp_systolic	U	single	0.11527	0.032972	8418	Wider African group	origin		1
+calcium	U	single	-0.012638	0.034706	7453	Wider African group	origin		1
+creatinine	U	single	0.20401	0.036491	8062	Wider African group	origin		1
+cystatin_c	U	single	0.093747	0.044013	8063	Wider African group	origin		1
+diastolic_blood_pressure	U	single	0.078843	0.030888	8418	Wider African group	origin		1
+fluid_intelligence_score	U	single	0.73443	0.063128	4196	Wider African group	origin		1
+ggt	U	single	0.37478	0.053044	8060	Wider African group	origin		1
+glucose	U	single	-0.088338	0.035929	7442	Wider African group	origin		1
+haemoglobin_concentration	U	single	0.074949	0.040932	8135	Wider African group	origin		1
+hba1c	U	single	-0.21046	0.042091	7025	Wider African group	origin		1
+hdl	U	single	0.24037	0.048802	7451	Wider African group	origin		1
+heel_bone_mineral_density	U	single	-0.69321	0.077792	3260	Wider African group	origin		1
+height	U	single	0.37737	0.041532	8462	Wider African group	origin		1
+igf_1	U	single	0.1412	0.033579	8007	Wider African group	origin		1
+ldl	U	single	0.20462	0.1045	8048	Wider African group	origin		1
+neuroticism_score	U	single	0.1058	0.048858	5821	Wider African group	origin		1
+sleep_duration	U	single	-0.17014	0.032454	8268	Wider African group	origin		1
+testosterone	U	single	0.10144	0.037385	7311	Wider African group	origin		1
+triglycerides	U	single	0.23161	0.042919	8060	Wider African group	origin		1
+urate	U	single	0.17024	0.087201	8054	Wider African group	origin		1
+urea	U	single	0.024587	0.035068	8059	Wider African group	origin		1
+vitamin_d	U	single	0.20967	0.033761	7823	Wider African group	origin		1
+white_blood_cell_count	U	single	0.46981	0.21413	8135	Wider African group	origin		1
+alanine_aminotransferase	U	8bin	0.19018	0.066738	8064	Wider African group	origin	0.070085	1
+albumin	U	8bin	0.27932	0.07256	7455	Wider African group	origin	0.077544	1
+alka_phos	U	8bin	0.12846	0.080751	8066	Wider African group	origin	0.084375	1
+apo_b	U	8bin	0.43833	0.18425	7997	Wider African group	origin	0.19918	1
+asp_at	U	8bin	0.21714	0.060557	8018	Wider African group	origin	0.06377	1
+blood_mscv	U	8bin	0.50225	0.076474	7918	Wider African group	origin	0.08297	1
+blood_platelet	U	8bin	0.24457	0.066157	8135	Wider African group	origin	0.070039	1
+blood_rbc_count	U	8bin	0.46674	0.10991	8135	Wider African group	origin	0.12003	1
+bmi	U	8bin	0.28324	0.062673	8446	Wider African group	origin	0.06654	1
+bp_systolic	U	8bin	0.24003	0.064337	8418	Wider African group	origin	0.068234	1
+calcium	U	8bin	0.21965	0.068039	7453	Wider African group	origin	0.071791	1
+creatinine	U	8bin	0.32082	0.067363	8062	Wider African group	origin	0.071909	1
+cystatin_c	U	8bin	0.27622	0.085066	8063	Wider African group	origin	0.090335	1
+diastolic_blood_pressure	U	8bin	0.17498	0.064955	8418	Wider African group	origin	0.068342	1
+fluid_intelligence_score	U	8bin	0.4149	0.11875	4196	Wider African group	origin	0.135	1
+ggt	U	8bin	0.33414	0.096635	8060	Wider African group	origin	0.10322	1
+glucose	U	8bin	0.046998	0.073414	7442	Wider African group	origin	0.076142	1
+haemoglobin_concentration	U	8bin	0.19846	0.079143	8135	Wider African group	origin	0.083374	1
+hba1c	U	8bin	0.074889	0.071984	7025	Wider African group	origin	0.074851	1
+hdl	U	8bin	0.23185	0.080177	7451	Wider African group	origin	0.08501	1
+heel_bone_mineral_density	U	8bin	0.0072246	0.14802	3260	Wider African group	origin	0.15321	1
+height	U	8bin	0.43661	0.069002	8462	Wider African group	origin	0.074451	1
+igf_1	U	8bin	0.27352	0.065944	8007	Wider African group	origin	0.070186	1
+ldl	U	8bin	0.38529	0.14374	8048	Wider African group	origin	0.15443	1
+neuroticism_score	U	8bin	0.20661	0.093052	5821	Wider African group	origin	0.098437	1
+sleep_duration	U	8bin	-0.022062	0.067131	8268	Wider African group	origin	0.069414	1
+testosterone	U	8bin	0.15752	0.073116	7311	Wider African group	origin	0.076629	1
+triglycerides	U	8bin	0.36087	0.07611	8060	Wider African group	origin	0.081875	1
+urate	U	8bin	0.21373	0.094054	8054	Wider African group	origin	0.09903	1
+urea	U	8bin	0.11059	0.062586	8059	Wider African group	origin	0.065351	1
+vitamin_d	U	8bin	0.051046	0.065689	7823	Wider African group	origin	0.068418	1
+white_blood_cell_count	U	8bin	0.49311	0.21329	8135	Wider African group	origin	0.23257	1
+albumin	XA	single	0.12876	0.036925	8387	Wider African group	origin		1
+alka_phos	XA	single	0.18237	0.051544	9084	Wider African group	origin		1
+alanine_aminotransferase	XA	single	0.16492	0.030171	9082	Wider African group	origin		1
+asp_at	XA	single	0.1612	0.031795	9031	Wider African group	origin		1
+creatinine	XA	single	0.21163	0.033898	9079	Wider African group	origin		1
+cystatin_c	XA	single	0.086466	0.041353	9081	Wider African group	origin		1
+ggt	XA	single	0.40246	0.060156	9077	Wider African group	origin		1
+glucose	XA	single	-0.088722	0.034236	8373	Wider African group	origin		1
+hba1c	XA	single	-0.15944	0.039892	7929	Wider African group	origin		1
+hdl	XA	single	0.25807	0.047733	8383	Wider African group	origin		1
+igf_1	XA	single	0.12786	0.033461	9021	Wider African group	origin		1
+ldl	XA	single	0.22552	0.10411	9064	Wider African group	origin		1
+testosterone	XA	single	0.092665	0.034794	8221	Wider African group	origin		1
+triglycerides	XA	single	0.20272	0.039914	9078	Wider African group	origin		1
+urate	XA	single	0.19377	0.088191	9070	Wider African group	origin		1
+vitamin_d	XA	single	0.18102	0.034112	8806	Wider African group	origin		1
+blood_rbc_count	XA	single	0.14367	0.055499	9174	Wider African group	origin		1
+white_blood_cell_count	XA	single	0.51349	0.26425	9174	Wider African group	origin		1
+blood_platelet	XA	single	0.10604	0.031446	9174	Wider African group	origin		1
+blood_mscv	XA	single	0.15245	0.038021	8939	Wider African group	origin		1
+haemoglobin_concentration	XA	single	0.086961	0.039279	9174	Wider African group	origin		1
+height	XA	single	0.36485	0.040037	9534	Wider African group	origin		1
+bmi	XA	single	0.34288	0.031451	9517	Wider African group	origin		1
+bp_systolic	XA	single	0.12353	0.031105	9489	Wider African group	origin		1
+diastolic_blood_pressure	XA	single	0.079798	0.028394	9489	Wider African group	origin		1
+heel_bone_mineral_density	XA	single	-0.55604	0.071249	3647	Wider African group	origin		1
+calcium	XA	single	0.0025073	0.031592	8384	Wider African group	origin		1
+urea	XA	single	0.0066536	0.030604	9077	Wider African group	origin		1
+apo_b	XA	single	0.27965	0.14174	9009	Wider African group	origin		1
+fluid_intelligence_score	XA	single	0.69594	0.060773	4761	Wider African group	origin		1
+neuroticism_score	XA	single	0.10241	0.041784	6596	Wider African group	origin		1
+sleep_duration	XA	single	-0.1433	0.028704	9320	Wider African group	origin		1
+albumin	XA	8bin	0.32184	0.065854	8387	Wider African group	origin	0.071473	1
+alka_phos	XA	8bin	0.18748	0.075282	9084	Wider African group	origin	0.079578	1
+alanine_aminotransferase	XA	8bin	0.21212	0.05594	9082	Wider African group	origin	0.059205	1
+asp_at	XA	8bin	0.21294	0.055065	9031	Wider African group	origin	0.058343	1
+creatinine	XA	8bin	0.31635	0.058867	9079	Wider African group	origin	0.063434	1
+cystatin_c	XA	8bin	0.23618	0.076592	9081	Wider African group	origin	0.081424	1
+ggt	XA	8bin	0.36005	0.098469	9077	Wider African group	origin	0.10653	1
+glucose	XA	8bin	0.04393	0.062915	8373	Wider African group	origin	0.065434	1
+hba1c	XA	8bin	0.10052	0.066088	7929	Wider African group	origin	0.069102	1
+hdl	XA	8bin	0.24661	0.072628	8383	Wider African group	origin	0.077666	1
+igf_1	XA	8bin	0.22149	0.060816	9021	Wider African group	origin	0.064917	1
+ldl	XA	8bin	0.35801	0.13794	9064	Wider African group	origin	0.14921	1
+testosterone	XA	8bin	0.099652	0.064134	8221	Wider African group	origin	0.067138	1
+triglycerides	XA	8bin	0.33384	0.069493	9078	Wider African group	origin	0.075264	1
+urate	XA	8bin	0.24432	0.084313	9070	Wider African group	origin	0.089688	1
+vitamin_d	XA	8bin	0.031706	0.061903	8806	Wider African group	origin	0.064571	1
+blood_rbc_count	XA	8bin	0.44122	0.10471	9174	Wider African group	origin	0.11538	1
+white_blood_cell_count	XA	8bin	0.48687	0.24422	9174	Wider African group	origin	0.26913	1
+blood_platelet	XA	8bin	0.26307	0.058411	9174	Wider African group	origin	0.062534	1
+blood_mscv	XA	8bin	0.43044	0.067128	8939	Wider African group	origin	0.07323	1
+haemoglobin_concentration	XA	8bin	0.17382	0.068131	9174	Wider African group	origin	0.072038	1
+height	XA	8bin	0.41965	0.06365	9534	Wider African group	origin	0.069387	1
+bmi	XA	8bin	0.28853	0.057658	9517	Wider African group	origin	0.061767	1
+bp_systolic	XA	8bin	0.23019	0.058441	9489	Wider African group	origin	0.062241	1
+diastolic_blood_pressure	XA	8bin	0.17107	0.057384	9489	Wider African group	origin	0.060692	1
+heel_bone_mineral_density	XA	8bin	0.090227	0.13086	3647	Wider African group	origin	0.13616	1
+calcium	XA	8bin	0.16293	0.060712	8384	Wider African group	origin	0.064094	1
+urea	XA	8bin	0.071969	0.053254	9077	Wider African group	origin	0.055637	1
+apo_b	XA	8bin	0.42618	0.18086	9009	Wider African group	origin	0.19759	1
+fluid_intelligence_score	XA	8bin	0.46111	0.10664	4761	Wider African group	origin	0.12395	1
+neuroticism_score	XA	8bin	0.15791	0.07861	6596	Wider African group	origin	0.083074	1
+sleep_duration	XA	8bin	0.0065055	0.059502	9320	Wider African group	origin	0.061773	1
+chronic_ischaemic_heart_disease_i25	U	single	0.67073	0.1162	8563	Wider African group	origin		3.6617
+dyslipidaemia_e78	U	single	0.090652	0.065478	8563	Wider African group	origin		1.9595
+educational_qualification	U	single	0.20311	0.031036	8212	Wider African group	origin		1
+ever_smoked	U	single	0.39394	0.046544	8440	Wider African group	origin		1.5807
+hand_grip_strength	U	single	0.077698	0.031635	8469	Wider African group	origin		1
+hypertension_i10	U	single	0.14167	0.050199	8563	Wider African group	origin		1.5733
+type2_diabetes_e11	U	single	-0.55254	0.068304	8563	Wider African group	origin		2.193
+whr	U	single	0.1607	0.030456	8473	Wider African group	origin		1
+chronic_ischaemic_heart_disease_i25	U	8bin	0.53908	0.22546	8563	Wider African group	origin	0.23887	3.6617
+dyslipidaemia_e78	U	8bin	0.068495	0.12817	8563	Wider African group	origin	0.13579	1.9595
+educational_qualification	U	8bin	0.14332	0.060794	8212	Wider African group	origin	0.06441	1
+ever_smoked	U	8bin	0.31933	0.087049	8440	Wider African group	origin	0.092226	1.5807
+hand_grip_strength	U	8bin	0.12166	0.059603	8469	Wider African group	origin	0.063149	1
+hypertension_i10	U	8bin	0.27638	0.096431	8563	Wider African group	origin	0.10217	1.5733
+type2_diabetes_e11	U	8bin	0.066462	0.12462	8563	Wider African group	origin	0.13203	2.193
+whr	U	8bin	0.095073	0.053549	8473	Wider African group	origin	0.056734	1
+educational_qualification	XA	single	0.21805	0.02922	9258	Wider African group	origin		1
+hand_grip_strength	XA	single	0.073122	0.031321	9541	Wider African group	origin		1
+whr	XA	single	0.16945	0.029371	9545	Wider African group	origin		1
+ever_smoked	XA	single	0.31608	0.045905	9513	Wider African group	origin		1.5789
+chronic_ischaemic_heart_disease_i25	XA	single	0.50426	0.10813	9647	Wider African group	origin		3.6487
+dyslipidaemia_e78	XA	single	0.10302	0.060935	9647	Wider African group	origin		1.9531
+hypertension_i10	XA	single	0.15592	0.048113	9647	Wider African group	origin		1.5728
+type2_diabetes_e11	XA	single	-0.48654	0.06029	9647	Wider African group	origin		2.1723
+educational_qualification	XA	8bin	0.21626	0.05297	9258	Wider African group	origin	0.05638	1
+hand_grip_strength	XA	8bin	0.10836	0.058294	9541	Wider African group	origin	0.062048	1
+whr	XA	8bin	0.11508	0.050633	9545	Wider African group	origin	0.053893	1
+ever_smoked	XA	8bin	0.22989	0.083681	9513	Wider African group	origin	0.089069	1.5789
+chronic_ischaemic_heart_disease_i25	XA	8bin	0.44433	0.19895	9647	Wider African group	origin	0.21176	3.6487
+dyslipidaemia_e78	XA	8bin	0.070656	0.10997	9647	Wider African group	origin	0.11705	1.9531
+hypertension_i10	XA	8bin	0.2616	0.082156	9647	Wider African group	origin	0.087446	1.5728
+type2_diabetes_e11	XA	8bin	0.10234	0.10785	9647	Wider African group	origin	0.11479	2.1723
+alanine_aminotransferase	U	single	0.23854	0.091938	3589	Admixed members	base		1
+albumin	U	single	0.18199	0.098151	3300	Admixed members	base		1
+alka_phos	U	single	0.25036	0.1024	3589	Admixed members	base		1
+apo_b	U	single	0.43476	0.15634	3565	Admixed members	base		1
+asp_at	U	single	0.36285	0.094085	3567	Admixed members	base		1
+blood_mscv	U	single	0.3289	0.098209	3541	Admixed members	base		1
+blood_platelet	U	single	0.16212	0.095547	3625	Admixed members	base		1
+blood_rbc_count	U	single	0.077553	0.10407	3625	Admixed members	base		1
+bmi	U	single	0.22101	0.081032	3756	Admixed members	base		1
+bp_systolic	U	single	0.053927	0.085154	3711	Admixed members	base		1
+calcium	U	single	-0.059395	0.084321	3300	Admixed members	base		1
+creatinine	U	single	0.181	0.093948	3590	Admixed members	base		1
+cystatin_c	U	single	-0.08261	0.1001	3589	Admixed members	base		1
+diastolic_blood_pressure	U	single	0.0645	0.078581	3711	Admixed members	base		1
+fluid_intelligence_score	U	single	0.69734	0.17835	1944	Admixed members	base		1
+ggt	U	single	0.57937	0.11116	3588	Admixed members	base		1
+glucose	U	single	-0.055935	0.093743	3296	Admixed members	base		1
+haemoglobin_concentration	U	single	0.0055152	0.10028	3625	Admixed members	base		1
+hba1c	U	single	-0.091046	0.10506	3310	Admixed members	base		1
+hdl	U	single	0.26059	0.10769	3299	Admixed members	base		1
+heel_bone_mineral_density	U	single	-0.69314	0.22388	1526	Admixed members	base		1
+height	U	single	0.7152	0.095218	3765	Admixed members	base		1
+igf_1	U	single	0.1445	0.095212	3567	Admixed members	base		1
+ldl	U	single	0.33452	0.13286	3583	Admixed members	base		1
+neuroticism_score	U	single	0.25898	0.12124	2775	Admixed members	base		1
+sleep_duration	U	single	-0.2948	0.088949	3688	Admixed members	base		1
+testosterone	U	single	0.11692	0.099266	3205	Admixed members	base		1
+triglycerides	U	single	0.39304	0.10765	3590	Admixed members	base		1
+urate	U	single	0.083865	0.13849	3585	Admixed members	base		1
+urea	U	single	-0.087665	0.08634	3588	Admixed members	base		1
+vitamin_d	U	single	0.19008	0.098714	3469	Admixed members	base		1
+white_blood_cell_count	U	single	0.76132	0.46903	3625	Admixed members	base		1
+alanine_aminotransferase	U	8bin	0.22274	0.13485	3589	Admixed members	base	0.14227	1
+albumin	U	8bin	0.40567	0.14968	3300	Admixed members	base	0.15996	1
+alka_phos	U	8bin	0.24802	0.14087	3589	Admixed members	base	0.1488	1
+apo_b	U	8bin	0.49025	0.23802	3565	Admixed members	base	0.25582	1
+asp_at	U	8bin	0.29344	0.13307	3567	Admixed members	base	0.14099	1
+blood_mscv	U	8bin	0.49299	0.13039	3541	Admixed members	base	0.14014	1
+blood_platelet	U	8bin	0.2054	0.14214	3625	Admixed members	base	0.14975	1
+blood_rbc_count	U	8bin	0.24244	0.14855	3625	Admixed members	base	0.15687	1
+bmi	U	8bin	0.16232	0.11	3756	Admixed members	base	0.11563	1
+bp_systolic	U	8bin	0.10152	0.13878	3711	Admixed members	base	0.1455	1
+calcium	U	8bin	0.22987	0.14171	3300	Admixed members	base	0.14967	1
+creatinine	U	8bin	0.41912	0.14639	3590	Admixed members	base	0.15662	1
+cystatin_c	U	8bin	0.01561	0.15388	3589	Admixed members	base	0.16062	1
+diastolic_blood_pressure	U	8bin	0.05808	0.13742	3711	Admixed members	base	0.14373	1
+fluid_intelligence_score	U	8bin	0.67944	0.25988	1944	Admixed members	base	0.28423	1
+ggt	U	8bin	0.55379	0.16141	3588	Admixed members	base	0.17434	1
+glucose	U	8bin	0.094158	0.14882	3296	Admixed members	base	0.15599	1
+haemoglobin_concentration	U	8bin	0.023822	0.14509	3625	Admixed members	base	0.15148	1
+hba1c	U	8bin	0.23374	0.14556	3310	Admixed members	base	0.15365	1
+hdl	U	8bin	0.083383	0.15318	3299	Admixed members	base	0.16029	1
+heel_bone_mineral_density	U	8bin	-0.6421	0.30388	1526	Admixed members	base	0.31647	1
+height	U	8bin	0.67773	0.1379	3765	Admixed members	base	0.15048	1
+igf_1	U	8bin	0.20228	0.13629	3567	Admixed members	base	0.14361	1
+ldl	U	8bin	0.35417	0.20081	3583	Admixed members	base	0.21364	1
+neuroticism_score	U	8bin	0.25575	0.17491	2775	Admixed members	base	0.18485	1
+sleep_duration	U	8bin	-0.16546	0.12997	3688	Admixed members	base	0.1349	1
+testosterone	U	8bin	0.067913	0.16202	3205	Admixed members	base	0.16954	1
+triglycerides	U	8bin	0.38383	0.13985	3590	Admixed members	base	0.14903	1
+urate	U	8bin	0.051386	0.14087	3585	Admixed members	base	0.14723	1
+urea	U	8bin	-0.18205	0.13178	3588	Admixed members	base	0.1367	1
+vitamin_d	U	8bin	0.28885	0.16535	3469	Admixed members	base	0.17534	1
+white_blood_cell_count	U	8bin	0.56303	0.36512	3625	Admixed members	base	0.39358	1
+albumin	XA	single	0.25558	0.091837	3651	Admixed members	base		1
+alka_phos	XA	single	0.24909	0.09605	3982	Admixed members	base		1
+alanine_aminotransferase	XA	single	0.21376	0.083536	3982	Admixed members	base		1
+asp_at	XA	single	0.32381	0.083346	3957	Admixed members	base		1
+creatinine	XA	single	0.24516	0.08485	3982	Admixed members	base		1
+cystatin_c	XA	single	-0.16976	0.087022	3982	Admixed members	base		1
+ggt	XA	single	0.55664	0.11787	3981	Admixed members	base		1
+glucose	XA	single	-0.026195	0.084616	3647	Admixed members	base		1
+hba1c	XA	single	-0.080324	0.098746	3677	Admixed members	base		1
+hdl	XA	single	0.26689	0.099586	3649	Admixed members	base		1
+igf_1	XA	single	0.1941	0.088677	3960	Admixed members	base		1
+ldl	XA	single	0.27127	0.11812	3975	Admixed members	base		1
+testosterone	XA	single	0.11412	0.087584	3556	Admixed members	base		1
+triglycerides	XA	single	0.35899	0.091531	3983	Admixed members	base		1
+urate	XA	single	0.11146	0.13121	3976	Admixed members	base		1
+vitamin_d	XA	single	0.21975	0.088865	3845	Admixed members	base		1
+blood_rbc_count	XA	single	0.10244	0.097324	4025	Admixed members	base		1
+white_blood_cell_count	XA	single	0.70639	0.50997	4025	Admixed members	base		1
+blood_platelet	XA	single	0.16358	0.082287	4025	Admixed members	base		1
+blood_mscv	XA	single	0.26916	0.08137	3931	Admixed members	base		1
+haemoglobin_concentration	XA	single	0.083399	0.094718	4025	Admixed members	base		1
+height	XA	single	0.60886	0.083568	4174	Admixed members	base		1
+bmi	XA	single	0.24301	0.072759	4165	Admixed members	base		1
+bp_systolic	XA	single	0.13429	0.078101	4122	Admixed members	base		1
+diastolic_blood_pressure	XA	single	0.094106	0.073208	4122	Admixed members	base		1
+heel_bone_mineral_density	XA	single	-0.69993	0.22297	1689	Admixed members	base		1
+calcium	XA	single	-0.082235	0.075875	3650	Admixed members	base		1
+urea	XA	single	-0.11682	0.077257	3981	Admixed members	base		1
+apo_b	XA	single	0.36035	0.14249	3958	Admixed members	base		1
+fluid_intelligence_score	XA	single	0.77815	0.15286	2157	Admixed members	base		1
+neuroticism_score	XA	single	0.20239	0.10075	3093	Admixed members	base		1
+sleep_duration	XA	single	-0.22536	0.074266	4090	Admixed members	base		1
+albumin	XA	8bin	0.44713	0.13123	3651	Admixed members	base	0.14198	1
+alka_phos	XA	8bin	0.24979	0.13107	3982	Admixed members	base	0.13936	1
+alanine_aminotransferase	XA	8bin	0.22242	0.12039	3982	Admixed members	base	0.12779	1
+asp_at	XA	8bin	0.25174	0.11858	3957	Admixed members	base	0.1261	1
+creatinine	XA	8bin	0.48163	0.13141	3982	Admixed members	base	0.14261	1
+cystatin_c	XA	8bin	-0.1105	0.13802	3982	Admixed members	base	0.14378	1
+ggt	XA	8bin	0.52027	0.15563	3981	Admixed members	base	0.16934	1
+glucose	XA	8bin	0.097212	0.13069	3647	Admixed members	base	0.13763	1
+hba1c	XA	8bin	0.20829	0.13774	3677	Admixed members	base	0.14604	1
+hdl	XA	8bin	0.13956	0.13973	3649	Admixed members	base	0.14737	1
+igf_1	XA	8bin	0.27318	0.12785	3960	Admixed members	base	0.13624	1
+ldl	XA	8bin	0.23056	0.17445	3975	Admixed members	base	0.1852	1
+testosterone	XA	8bin	0.072062	0.14216	3556	Admixed members	base	0.14943	1
+triglycerides	XA	8bin	0.33797	0.1195	3983	Admixed members	base	0.12789	1
+urate	XA	8bin	0.17361	0.12654	3976	Admixed members	base	0.13384	1
+vitamin_d	XA	8bin	0.30555	0.14588	3845	Admixed members	base	0.15597	1
+blood_rbc_count	XA	8bin	0.19005	0.13835	4025	Admixed members	base	0.14645	1
+white_blood_cell_count	XA	8bin	0.42061	0.3885	4025	Admixed members	base	0.41762	1
+blood_platelet	XA	8bin	0.25046	0.1247	4025	Admixed members	base	0.13263	1
+blood_mscv	XA	8bin	0.4583	0.11231	3931	Admixed members	base	0.12152	1
+haemoglobin_concentration	XA	8bin	0.08891	0.13758	4025	Admixed members	base	0.14469	1
+height	XA	8bin	0.59619	0.12418	4174	Admixed members	base	0.13607	1
+bmi	XA	8bin	0.20925	0.097634	4165	Admixed members	base	0.10353	1
+bp_systolic	XA	8bin	0.12503	0.12411	4122	Admixed members	base	0.13089	1
+diastolic_blood_pressure	XA	8bin	0.078021	0.12013	4122	Admixed members	base	0.12631	1
+heel_bone_mineral_density	XA	8bin	-0.65184	0.29691	1689	Admixed members	base	0.30997	1
+calcium	XA	8bin	0.11169	0.13161	3650	Admixed members	base	0.13874	1
+urea	XA	8bin	-0.17294	0.11682	3981	Admixed members	base	0.12144	1
+apo_b	XA	8bin	0.35653	0.21533	3958	Admixed members	base	0.23086	1
+fluid_intelligence_score	XA	8bin	0.77451	0.22141	2157	Admixed members	base	0.24727	1
+neuroticism_score	XA	8bin	0.14256	0.14899	3093	Admixed members	base	0.15721	1
+sleep_duration	XA	8bin	-0.098938	0.11185	4090	Admixed members	base	0.11659	1
+chronic_ischaemic_heart_disease_i25	U	single	-0.078914	0.31771	3787	Admixed members	base		3.4923
+dyslipidaemia_e78	U	single	0.1127	0.14686	3787	Admixed members	base		1.9708
+educational_qualification	U	single	0.27077	0.087463	3650	Admixed members	base		1
+ever_smoked	U	single	0.17298	0.12586	3748	Admixed members	base		1.5924
+hand_grip_strength	U	single	0.13707	0.08592	3769	Admixed members	base		1
+hypertension_i10	U	single	0.33877	0.13953	3787	Admixed members	base		1.5922
+type2_diabetes_e11	U	single	-0.88679	0.20581	3787	Admixed members	base		2.3476
+whr	U	single	0.09886	0.091649	3770	Admixed members	base		1
+chronic_ischaemic_heart_disease_i25	U	8bin	-0.47577	0.47387	3787	Admixed members	base	0.50031	3.4923
+dyslipidaemia_e78	U	8bin	-0.061548	0.2455	3787	Admixed members	base	0.25919	1.9708
+educational_qualification	U	8bin	0.14524	0.12517	3650	Admixed members	base	0.13215	1
+ever_smoked	U	8bin	0.31329	0.2023	3748	Admixed members	base	0.21359	1.5924
+hand_grip_strength	U	8bin	0.1512	0.13065	3769	Admixed members	base	0.13794	1
+hypertension_i10	U	8bin	0.2922	0.22166	3787	Admixed members	base	0.23403	1.5922
+type2_diabetes_e11	U	8bin	0.45702	0.30475	3787	Admixed members	base	0.32175	2.3476
+whr	U	8bin	0.017289	0.12866	3770	Admixed members	base	0.13584	1
+educational_qualification	XA	single	0.2923	0.082197	4053	Admixed members	base		1
+hand_grip_strength	XA	single	0.13842	0.076251	4178	Admixed members	base		1
+whr	XA	single	0.072012	0.080179	4180	Admixed members	base		1
+ever_smoked	XA	single	0.13654	0.11667	4160	Admixed members	base		1.59
+chronic_ischaemic_heart_disease_i25	XA	single	-0.063843	0.2772	4202	Admixed members	base		3.4699
+dyslipidaemia_e78	XA	single	0.062384	0.13025	4202	Admixed members	base		1.9651
+hypertension_i10	XA	single	0.39182	0.1269	4202	Admixed members	base		1.59
+type2_diabetes_e11	XA	single	-0.76758	0.17155	4202	Admixed members	base		2.3328
+educational_qualification	XA	8bin	0.17425	0.1132	4053	Admixed members	base	0.1201	1
+hand_grip_strength	XA	8bin	0.1445	0.11203	4178	Admixed members	base	0.11885	1
+whr	XA	8bin	0.028131	0.11889	4180	Admixed members	base	0.12613	1
+ever_smoked	XA	8bin	0.26744	0.18978	4160	Admixed members	base	0.20134	1.59
+chronic_ischaemic_heart_disease_i25	XA	8bin	-0.19635	0.41765	4202	Admixed members	base	0.4431	3.4699
+dyslipidaemia_e78	XA	8bin	0.0085635	0.21667	4202	Admixed members	base	0.22987	1.9651
+hypertension_i10	XA	8bin	0.28401	0.19908	4202	Admixed members	base	0.21121	1.59
+type2_diabetes_e11	XA	8bin	0.42367	0.26439	4202	Admixed members	base	0.2805	2.3328
+alanine_aminotransferase	U	single	0.21614	0.09015	3589	Admixed members	origin		1
+albumin	U	single	0.17537	0.097826	3300	Admixed members	origin		1
+alka_phos	U	single	0.25125	0.10397	3589	Admixed members	origin		1
+apo_b	U	single	0.43702	0.15606	3565	Admixed members	origin		1
+asp_at	U	single	0.35594	0.093139	3567	Admixed members	origin		1
+blood_mscv	U	single	0.34952	0.096523	3541	Admixed members	origin		1
+blood_platelet	U	single	0.13425	0.094007	3625	Admixed members	origin		1
+blood_rbc_count	U	single	0.071168	0.10704	3625	Admixed members	origin		1
+bmi	U	single	0.20589	0.082765	3756	Admixed members	origin		1
+bp_systolic	U	single	0.061542	0.087949	3711	Admixed members	origin		1
+calcium	U	single	-0.03656	0.087678	3300	Admixed members	origin		1
+creatinine	U	single	0.16917	0.094604	3590	Admixed members	origin		1
+cystatin_c	U	single	-0.066923	0.10127	3589	Admixed members	origin		1
+diastolic_blood_pressure	U	single	0.063514	0.080941	3711	Admixed members	origin		1
+fluid_intelligence_score	U	single	0.48231	0.1853	1944	Admixed members	origin		1
+ggt	U	single	0.57741	0.11106	3588	Admixed members	origin		1
+glucose	U	single	-0.043582	0.096624	3296	Admixed members	origin		1
+haemoglobin_concentration	U	single	-0.02258	0.097765	3625	Admixed members	origin		1
+hba1c	U	single	-0.091741	0.10746	3310	Admixed members	origin		1
+hdl	U	single	0.24945	0.1081	3299	Admixed members	origin		1
+heel_bone_mineral_density	U	single	-0.66171	0.22861	1526	Admixed members	origin		1
+height	U	single	0.63939	0.09554	3765	Admixed members	origin		1
+igf_1	U	single	0.13239	0.09726	3567	Admixed members	origin		1
+ldl	U	single	0.34253	0.13201	3583	Admixed members	origin		1
+neuroticism_score	U	single	0.25814	0.12191	2775	Admixed members	origin		1
+sleep_duration	U	single	-0.27403	0.090984	3688	Admixed members	origin		1
+testosterone	U	single	0.15538	0.10233	3205	Admixed members	origin		1
+triglycerides	U	single	0.40198	0.10716	3590	Admixed members	origin		1
+urate	U	single	0.0771	0.13982	3585	Admixed members	origin		1
+urea	U	single	-0.1137	0.08699	3588	Admixed members	origin		1
+vitamin_d	U	single	0.16674	0.095135	3469	Admixed members	origin		1
+white_blood_cell_count	U	single	0.74269	0.47462	3625	Admixed members	origin		1
+alanine_aminotransferase	U	8bin	0.19583	0.13588	3589	Admixed members	origin	0.14335	1
+albumin	U	8bin	0.39724	0.1496	3300	Admixed members	origin	0.15988	1
+alka_phos	U	8bin	0.24006	0.14123	3589	Admixed members	origin	0.14918	1
+apo_b	U	8bin	0.49215	0.23648	3565	Admixed members	origin	0.25417	1
+asp_at	U	8bin	0.28207	0.13333	3567	Admixed members	origin	0.14126	1
+blood_mscv	U	8bin	0.49208	0.12626	3541	Admixed members	origin	0.1357	1
+blood_platelet	U	8bin	0.13978	0.13886	3625	Admixed members	origin	0.14629	1
+blood_rbc_count	U	8bin	0.21901	0.14949	3625	Admixed members	origin	0.15786	1
+bmi	U	8bin	0.14748	0.1096	3756	Admixed members	origin	0.11521	1
+bp_systolic	U	8bin	0.065452	0.13899	3711	Admixed members	origin	0.14572	1
+calcium	U	8bin	0.26999	0.14497	3300	Admixed members	origin	0.15311	1
+creatinine	U	8bin	0.41834	0.14702	3590	Admixed members	origin	0.15728	1
+cystatin_c	U	8bin	0.035276	0.15244	3589	Admixed members	origin	0.15912	1
+diastolic_blood_pressure	U	8bin	0.027424	0.14013	3711	Admixed members	origin	0.14656	1
+fluid_intelligence_score	U	8bin	0.28841	0.26241	1944	Admixed members	origin	0.287	1
+ggt	U	8bin	0.53995	0.16008	3588	Admixed members	origin	0.1729	1
+glucose	U	8bin	0.11852	0.1503	3296	Admixed members	origin	0.15754	1
+haemoglobin_concentration	U	8bin	-0.0077798	0.14153	3625	Admixed members	origin	0.14776	1
+hba1c	U	8bin	0.22055	0.14751	3310	Admixed members	origin	0.15571	1
+hdl	U	8bin	0.069377	0.15188	3299	Admixed members	origin	0.15893	1
+heel_bone_mineral_density	U	8bin	-0.5415	0.30489	1526	Admixed members	origin	0.31752	1
+height	U	8bin	0.59238	0.14031	3765	Admixed members	origin	0.15311	1
+igf_1	U	8bin	0.17019	0.13872	3567	Admixed members	origin	0.14617	1
+ldl	U	8bin	0.36695	0.19955	3583	Admixed members	origin	0.2123	1
+neuroticism_score	U	8bin	0.27557	0.17849	2775	Admixed members	origin	0.18863	1
+sleep_duration	U	8bin	-0.15427	0.13282	3688	Admixed members	origin	0.13786	1
+testosterone	U	8bin	0.12541	0.16341	3205	Admixed members	origin	0.171	1
+triglycerides	U	8bin	0.3827	0.1388	3590	Admixed members	origin	0.14792	1
+urate	U	8bin	0.037828	0.14307	3585	Admixed members	origin	0.14953	1
+urea	U	8bin	-0.19992	0.1319	3588	Admixed members	origin	0.13683	1
+vitamin_d	U	8bin	0.27028	0.16082	3469	Admixed members	origin	0.17053	1
+white_blood_cell_count	U	8bin	0.55978	0.36404	3625	Admixed members	origin	0.39243	1
+albumin	XA	single	0.24791	0.089839	3651	Admixed members	origin		1
+alka_phos	XA	single	0.23672	0.096198	3982	Admixed members	origin		1
+alanine_aminotransferase	XA	single	0.20435	0.081906	3982	Admixed members	origin		1
+asp_at	XA	single	0.32228	0.082207	3957	Admixed members	origin		1
+creatinine	XA	single	0.2497	0.085192	3982	Admixed members	origin		1
+cystatin_c	XA	single	-0.15512	0.087107	3982	Admixed members	origin		1
+ggt	XA	single	0.56581	0.11754	3981	Admixed members	origin		1
+glucose	XA	single	-0.018581	0.086056	3647	Admixed members	origin		1
+hba1c	XA	single	-0.072466	0.10024	3677	Admixed members	origin		1
+hdl	XA	single	0.26529	0.09903	3649	Admixed members	origin		1
+igf_1	XA	single	0.17396	0.088647	3960	Admixed members	origin		1
+ldl	XA	single	0.28545	0.11738	3975	Admixed members	origin		1
+testosterone	XA	single	0.1375	0.089895	3556	Admixed members	origin		1
+triglycerides	XA	single	0.36512	0.090713	3983	Admixed members	origin		1
+urate	XA	single	0.11101	0.13132	3976	Admixed members	origin		1
+vitamin_d	XA	single	0.18177	0.086082	3845	Admixed members	origin		1
+blood_rbc_count	XA	single	0.084764	0.097821	4025	Admixed members	origin		1
+white_blood_cell_count	XA	single	0.69842	0.50892	4025	Admixed members	origin		1
+blood_platelet	XA	single	0.13333	0.078605	4025	Admixed members	origin		1
+blood_mscv	XA	single	0.27262	0.080296	3931	Admixed members	origin		1
+haemoglobin_concentration	XA	single	0.039422	0.090703	4025	Admixed members	origin		1
+height	XA	single	0.54224	0.084266	4174	Admixed members	origin		1
+bmi	XA	single	0.23848	0.073328	4165	Admixed members	origin		1
+bp_systolic	XA	single	0.1392	0.08189	4122	Admixed members	origin		1
+diastolic_blood_pressure	XA	single	0.081445	0.074146	4122	Admixed members	origin		1
+heel_bone_mineral_density	XA	single	-0.63158	0.22659	1689	Admixed members	origin		1
+calcium	XA	single	-0.059323	0.078093	3650	Admixed members	origin		1
+urea	XA	single	-0.14711	0.077306	3981	Admixed members	origin		1
+apo_b	XA	single	0.36895	0.14177	3958	Admixed members	origin		1
+fluid_intelligence_score	XA	single	0.60295	0.15739	2157	Admixed members	origin		1
+neuroticism_score	XA	single	0.19107	0.099903	3093	Admixed members	origin		1
+sleep_duration	XA	single	-0.2003	0.075433	4090	Admixed members	origin		1
+albumin	XA	8bin	0.42964	0.12782	3651	Admixed members	origin	0.13829	1
+alka_phos	XA	8bin	0.23859	0.13022	3982	Admixed members	origin	0.13845	1
+alanine_aminotransferase	XA	8bin	0.21813	0.11902	3982	Admixed members	origin	0.12634	1
+asp_at	XA	8bin	0.25741	0.1161	3957	Admixed members	origin	0.12346	1
+creatinine	XA	8bin	0.48546	0.12913	3982	Admixed members	origin	0.14014	1
+cystatin_c	XA	8bin	-0.076414	0.13407	3982	Admixed members	origin	0.13966	1
+ggt	XA	8bin	0.52574	0.15241	3981	Admixed members	origin	0.16583	1
+glucose	XA	8bin	0.1139	0.12836	3647	Admixed members	origin	0.13518	1
+hba1c	XA	8bin	0.20404	0.13627	3677	Admixed members	origin	0.14448	1
+hdl	XA	8bin	0.13916	0.1366	3649	Admixed members	origin	0.14407	1
+igf_1	XA	8bin	0.2313	0.12666	3960	Admixed members	origin	0.13497	1
+ldl	XA	8bin	0.25301	0.17176	3975	Admixed members	origin	0.18234	1
+testosterone	XA	8bin	0.10733	0.14024	3556	Admixed members	origin	0.14741	1
+triglycerides	XA	8bin	0.33483	0.11708	3983	Admixed members	origin	0.1253	1
+urate	XA	8bin	0.17784	0.12613	3976	Admixed members	origin	0.1334	1
+vitamin_d	XA	8bin	0.2747	0.1432	3845	Admixed members	origin	0.1531	1
+blood_rbc_count	XA	8bin	0.17105	0.13583	4025	Admixed members	origin	0.14379	1
+white_blood_cell_count	XA	8bin	0.43577	0.38075	4025	Admixed members	origin	0.40929	1
+blood_platelet	XA	8bin	0.19308	0.11826	4025	Admixed members	origin	0.12578	1
+blood_mscv	XA	8bin	0.44632	0.10872	3931	Admixed members	origin	0.11764	1
+haemoglobin_concentration	XA	8bin	0.041129	0.13012	4025	Admixed members	origin	0.13684	1
+height	XA	8bin	0.51924	0.12538	4174	Admixed members	origin	0.13739	1
+bmi	XA	8bin	0.21355	0.096471	4165	Admixed members	origin	0.1023	1
+bp_systolic	XA	8bin	0.092586	0.12494	4122	Admixed members	origin	0.13177	1
+diastolic_blood_pressure	XA	8bin	0.035276	0.12014	4122	Admixed members	origin	0.12632	1
+heel_bone_mineral_density	XA	8bin	-0.53253	0.29416	1689	Admixed members	origin	0.30711	1
+calcium	XA	8bin	0.13784	0.13097	3650	Admixed members	origin	0.13807	1
+urea	XA	8bin	-0.19561	0.11513	3981	Admixed members	origin	0.11968	1
+apo_b	XA	8bin	0.3687	0.21099	3958	Admixed members	origin	0.22621	1
+fluid_intelligence_score	XA	8bin	0.52476	0.22107	2157	Admixed members	origin	0.24689	1
+neuroticism_score	XA	8bin	0.13701	0.1488	3093	Admixed members	origin	0.15701	1
+sleep_duration	XA	8bin	-0.079667	0.11223	4090	Admixed members	origin	0.11699	1
+chronic_ischaemic_heart_disease_i25	U	single	-0.070463	0.33037	3787	Admixed members	origin		3.4923
+dyslipidaemia_e78	U	single	0.041101	0.14947	3787	Admixed members	origin		1.9708
+educational_qualification	U	single	0.26918	0.090327	3650	Admixed members	origin		1
+ever_smoked	U	single	0.21068	0.12665	3748	Admixed members	origin		1.5924
+hand_grip_strength	U	single	0.10379	0.085933	3769	Admixed members	origin		1
+hypertension_i10	U	single	0.33586	0.14151	3787	Admixed members	origin		1.5922
+type2_diabetes_e11	U	single	-0.89132	0.20454	3787	Admixed members	origin		2.3476
+whr	U	single	0.097016	0.095822	3770	Admixed members	origin		1
+chronic_ischaemic_heart_disease_i25	U	8bin	-0.52531	0.47863	3787	Admixed members	origin	0.50534	3.4923
+dyslipidaemia_e78	U	8bin	-0.091314	0.25116	3787	Admixed members	origin	0.26517	1.9708
+educational_qualification	U	8bin	0.14376	0.12657	3650	Admixed members	origin	0.13363	1
+ever_smoked	U	8bin	0.2949	0.19634	3748	Admixed members	origin	0.20729	1.5924
+hand_grip_strength	U	8bin	0.08803	0.13196	3769	Admixed members	origin	0.13932	1
+hypertension_i10	U	8bin	0.25602	0.22196	3787	Admixed members	origin	0.23434	1.5922
+type2_diabetes_e11	U	8bin	0.51977	0.30045	3787	Admixed members	origin	0.31722	2.3476
+whr	U	8bin	-0.0090008	0.12868	3770	Admixed members	origin	0.13586	1
+educational_qualification	XA	single	0.29491	0.085068	4053	Admixed members	origin		1
+hand_grip_strength	XA	single	0.1117	0.076396	4178	Admixed members	origin		1
+whr	XA	single	0.070643	0.081746	4180	Admixed members	origin		1
+ever_smoked	XA	single	0.16365	0.11575	4160	Admixed members	origin		1.59
+chronic_ischaemic_heart_disease_i25	XA	single	-0.067255	0.283	4202	Admixed members	origin		3.4699
+dyslipidaemia_e78	XA	single	-0.0081019	0.13223	4202	Admixed members	origin		1.9651
+hypertension_i10	XA	single	0.38379	0.12793	4202	Admixed members	origin		1.59
+type2_diabetes_e11	XA	single	-0.77162	0.17068	4202	Admixed members	origin		2.3328
+educational_qualification	XA	8bin	0.18179	0.11252	4053	Admixed members	origin	0.11938	1
+hand_grip_strength	XA	8bin	0.088623	0.11349	4178	Admixed members	origin	0.12041	1
+whr	XA	8bin	0.015266	0.11737	4180	Admixed members	origin	0.12452	1
+ever_smoked	XA	8bin	0.2272	0.18103	4160	Admixed members	origin	0.19206	1.59
+chronic_ischaemic_heart_disease_i25	XA	8bin	-0.25679	0.40845	4202	Admixed members	origin	0.43334	3.4699
+dyslipidaemia_e78	XA	8bin	-0.015881	0.21855	4202	Admixed members	origin	0.23186	1.9651
+hypertension_i10	XA	8bin	0.24979	0.1969	4202	Admixed members	origin	0.20889	1.59
+type2_diabetes_e11	XA	8bin	0.5014	0.25781	4202	Admixed members	origin	0.27352	2.3328
+alanine_aminotransferase	U	single	0.23948	0.10132	3693	African (standard)	base		1
+albumin	U	single	0.16232	0.10446	3394	African (standard)	base		1
+alka_phos	U	single	0.20754	0.098353	3693	African (standard)	base		1
+apo_b	U	single	0.35434	0.10859	3668	African (standard)	base		1
+asp_at	U	single	0.34952	0.097902	3671	African (standard)	base		1
+blood_mscv	U	single	0.3381	0.10155	3648	African (standard)	base		1
+blood_platelet	U	single	0.2674	0.10246	3732	African (standard)	base		1
+blood_rbc_count	U	single	0.19961	0.099053	3732	African (standard)	base		1
+bmi	U	single	0.15922	0.080854	3868	African (standard)	base		1
+bp_systolic	U	single	0.2459	0.085288	3821	African (standard)	base		1
+calcium	U	single	0.0039027	0.10412	3394	African (standard)	base		1
+creatinine	U	single	0.16504	0.091154	3693	African (standard)	base		1
+cystatin_c	U	single	0.058374	0.10613	3693	African (standard)	base		1
+diastolic_blood_pressure	U	single	0.21315	0.090518	3821	African (standard)	base		1
+fluid_intelligence_score	U	single	0.30507	0.18194	1985	African (standard)	base		1
+ggt	U	single	0.49282	0.10131	3692	African (standard)	base		1
+glucose	U	single	0.076899	0.10384	3391	African (standard)	base		1
+haemoglobin_concentration	U	single	0.10287	0.10137	3732	African (standard)	base		1
+hba1c	U	single	-0.01374	0.088931	3419	African (standard)	base		1
+hdl	U	single	0.29723	0.10172	3392	African (standard)	base		1
+heel_bone_mineral_density	U	single	-0.058941	0.22928	1589	African (standard)	base		1
+height	U	single	0.70614	0.10243	3878	African (standard)	base		1
+igf_1	U	single	0.29215	0.093979	3673	African (standard)	base		1
+ldl	U	single	0.36816	0.10991	3687	African (standard)	base		1
+neuroticism_score	U	single	0.5032	0.1334	2867	African (standard)	base		1
+sleep_duration	U	single	-0.21438	0.092565	3796	African (standard)	base		1
+testosterone	U	single	-0.018213	0.10856	3301	African (standard)	base		1
+triglycerides	U	single	0.15579	0.09709	3694	African (standard)	base		1
+urate	U	single	0.21144	0.18388	3689	African (standard)	base		1
+urea	U	single	0.055532	0.093875	3692	African (standard)	base		1
+vitamin_d	U	single	0.12476	0.10032	3566	African (standard)	base		1
+white_blood_cell_count	U	single	0.45466	0.31858	3732	African (standard)	base		1
+alanine_aminotransferase	U	8bin	0.23119	0.13327	3693	African (standard)	base	0.13984	1
+albumin	U	8bin	0.32436	0.14992	3394	African (standard)	base	0.15857	1
+alka_phos	U	8bin	0.13566	0.13535	3693	African (standard)	base	0.14102	1
+apo_b	U	8bin	0.33778	0.14841	3668	African (standard)	base	0.15704	1
+asp_at	U	8bin	0.36835	0.12936	3671	African (standard)	base	0.13725	1
+blood_mscv	U	8bin	0.50671	0.13379	3648	African (standard)	base	0.14381	1
+blood_platelet	U	8bin	0.28006	0.14356	3732	African (standard)	base	0.1512	1
+blood_rbc_count	U	8bin	0.39122	0.13321	3732	African (standard)	base	0.14168	1
+bmi	U	8bin	0.1879	0.11005	3868	African (standard)	base	0.11511	1
+bp_systolic	U	8bin	0.31003	0.12001	3821	African (standard)	base	0.12676	1
+calcium	U	8bin	0.067116	0.14712	3394	African (standard)	base	0.15265	1
+creatinine	U	8bin	0.26041	0.12863	3693	African (standard)	base	0.13532	1
+cystatin_c	U	8bin	0.060174	0.13538	3693	African (standard)	base	0.1404	1
+diastolic_blood_pressure	U	8bin	0.13441	0.12065	3821	African (standard)	base	0.12571	1
+fluid_intelligence_score	U	8bin	0.17513	0.24901	1985	African (standard)	base	0.26028	1
+ggt	U	8bin	0.40817	0.13321	3692	African (standard)	base	0.14179	1
+glucose	U	8bin	0.22545	0.13798	3391	African (standard)	base	0.14478	1
+haemoglobin_concentration	U	8bin	0.17359	0.1289	3732	African (standard)	base	0.13472	1
+hba1c	U	8bin	0.19229	0.12588	3419	African (standard)	base	0.13173	1
+hdl	U	8bin	0.33465	0.14911	3392	African (standard)	base	0.15778	1
+heel_bone_mineral_density	U	8bin	-0.094321	0.30514	1589	African (standard)	base	0.31376	1
+height	U	8bin	0.74966	0.13794	3878	African (standard)	base	0.15186	1
+igf_1	U	8bin	0.40288	0.12961	3673	African (standard)	base	0.13797	1
+ldl	U	8bin	0.3227	0.14473	3687	African (standard)	base	0.15294	1
+neuroticism_score	U	8bin	0.56574	0.17188	2867	African (standard)	base	0.18574	1
+sleep_duration	U	8bin	-0.078755	0.12313	3796	African (standard)	base	0.12677	1
+testosterone	U	8bin	0.073987	0.15346	3301	African (standard)	base	0.15934	1
+triglycerides	U	8bin	0.17515	0.12176	3694	African (standard)	base	0.12724	1
+urate	U	8bin	0.080037	0.13116	3689	African (standard)	base	0.13614	1
+urea	U	8bin	-0.047086	0.12576	3692	African (standard)	base	0.12961	1
+vitamin_d	U	8bin	0.26838	0.14531	3566	African (standard)	base	0.15303	1
+white_blood_cell_count	U	8bin	0.5212	0.36645	3732	African (standard)	base	0.39431	1
+alanine_aminotransferase	XA	single	0.23256	0.090818	4095	African (standard)	base		1
+albumin	XA	single	0.26546	0.10128	3754	African (standard)	base		1
+alka_phos	XA	single	0.20678	0.088596	4095	African (standard)	base		1
+apo_b	XA	single	0.31615	0.097541	4070	African (standard)	base		1
+asp_at	XA	single	0.33252	0.085454	4070	African (standard)	base		1
+blood_mscv	XA	single	0.25887	0.091191	4048	African (standard)	base		1
+blood_platelet	XA	single	0.25295	0.089955	4143	African (standard)	base		1
+blood_rbc_count	XA	single	0.18297	0.090945	4143	African (standard)	base		1
+bmi	XA	single	0.18065	0.071899	4285	African (standard)	base		1
+bp_systolic	XA	single	0.24446	0.080093	4240	African (standard)	base		1
+calcium	XA	single	-0.016526	0.092964	3753	African (standard)	base		1
+creatinine	XA	single	0.17478	0.082956	4095	African (standard)	base		1
+cystatin_c	XA	single	0.005108	0.098324	4095	African (standard)	base		1
+diastolic_blood_pressure	XA	single	0.20636	0.082687	4240	African (standard)	base		1
+fluid_intelligence_score	XA	single	0.32855	0.16128	2205	African (standard)	base		1
+ggt	XA	single	0.50375	0.10233	4094	African (standard)	base		1
+glucose	XA	single	0.10299	0.094893	3750	African (standard)	base		1
+haemoglobin_concentration	XA	single	0.1483	0.090358	4143	African (standard)	base		1
+hba1c	XA	single	0.037914	0.086037	3790	African (standard)	base		1
+hdl	XA	single	0.32031	0.095644	3752	African (standard)	base		1
+heel_bone_mineral_density	XA	single	-0.19885	0.22014	1754	African (standard)	base		1
+height	XA	single	0.63433	0.088989	4295	African (standard)	base		1
+igf_1	XA	single	0.27175	0.089266	4073	African (standard)	base		1
+ldl	XA	single	0.31775	0.095262	4088	African (standard)	base		1
+neuroticism_score	XA	single	0.40771	0.11011	3189	African (standard)	base		1
+sleep_duration	XA	single	-0.14334	0.077474	4209	African (standard)	base		1
+testosterone	XA	single	-0.0062039	0.09043	3659	African (standard)	base		1
+triglycerides	XA	single	0.14529	0.085523	4096	African (standard)	base		1
+urate	XA	single	0.21649	0.17318	4089	African (standard)	base		1
+urea	XA	single	-0.013738	0.080298	4094	African (standard)	base		1
+vitamin_d	XA	single	0.13711	0.091544	3952	African (standard)	base		1
+white_blood_cell_count	XA	single	0.46268	0.35084	4143	African (standard)	base		1
+alanine_aminotransferase	XA	8bin	0.24428	0.11767	4095	African (standard)	base	0.12384	1
+albumin	XA	8bin	0.40145	0.13397	3754	African (standard)	base	0.14296	1
+alka_phos	XA	8bin	0.16625	0.12928	4095	African (standard)	base	0.13522	1
+apo_b	XA	8bin	0.34578	0.13442	4070	African (standard)	base	0.14267	1
+asp_at	XA	8bin	0.28695	0.11618	4070	African (standard)	base	0.12266	1
+blood_mscv	XA	8bin	0.44732	0.11559	4048	African (standard)	base	0.12389	1
+blood_platelet	XA	8bin	0.26772	0.1268	4143	African (standard)	base	0.13369	1
+blood_rbc_count	XA	8bin	0.31966	0.12803	4143	African (standard)	base	0.1356	1
+bmi	XA	8bin	0.24202	0.098511	4285	African (standard)	base	0.10367	1
+bp_systolic	XA	8bin	0.33883	0.11323	4240	African (standard)	base	0.12017	1
+calcium	XA	8bin	0.030872	0.13609	3753	African (standard)	base	0.14111	1
+creatinine	XA	8bin	0.311	0.11942	4095	African (standard)	base	0.12643	1
+cystatin_c	XA	8bin	-0.023141	0.12519	4095	African (standard)	base	0.1294	1
+diastolic_blood_pressure	XA	8bin	0.152	0.10967	4240	African (standard)	base	0.11461	1
+fluid_intelligence_score	XA	8bin	0.18759	0.22066	2205	African (standard)	base	0.23123	1
+ggt	XA	8bin	0.41928	0.12647	4094	African (standard)	base	0.13508	1
+glucose	XA	8bin	0.22672	0.11896	3750	African (standard)	base	0.12506	1
+haemoglobin_concentration	XA	8bin	0.21621	0.12	4143	African (standard)	base	0.12604	1
+hba1c	XA	8bin	0.24102	0.12093	3790	African (standard)	base	0.12726	1
+hdl	XA	8bin	0.39843	0.13916	3752	African (standard)	base	0.14844	1
+heel_bone_mineral_density	XA	8bin	-0.29562	0.2894	1754	African (standard)	base	0.29633	1
+height	XA	8bin	0.75517	0.12422	4295	African (standard)	base	0.13738	1
+igf_1	XA	8bin	0.42195	0.12545	4073	African (standard)	base	0.13413	1
+ldl	XA	8bin	0.31293	0.12721	4088	African (standard)	base	0.13462	1
+neuroticism_score	XA	8bin	0.44198	0.14547	3189	African (standard)	base	0.15577	1
+sleep_duration	XA	8bin	-0.10043	0.10704	4209	African (standard)	base	0.11024	1
+testosterone	XA	8bin	0.027844	0.13068	3659	African (standard)	base	0.1355	1
+triglycerides	XA	8bin	0.18612	0.10707	4096	African (standard)	base	0.11219	1
+urate	XA	8bin	0.13904	0.12198	4089	African (standard)	base	0.12733	1
+urea	XA	8bin	-0.065934	0.10996	4094	African (standard)	base	0.11341	1
+vitamin_d	XA	8bin	0.22759	0.13516	3952	African (standard)	base	0.14211	1
+white_blood_cell_count	XA	8bin	0.46798	0.40101	4143	African (standard)	base	0.43037	1
+chronic_ischaemic_heart_disease_i25	U	single	0.42855	0.33532	3900	African (standard)	base		3.473
+dyslipidaemia_e78	U	single	0.22625	0.1601	3900	African (standard)	base		1.9672
+educational_qualification	U	single	0.13086	0.099049	3761	African (standard)	base		1
+ever_smoked	U	single	0.25054	0.13053	3860	African (standard)	base		1.5909
+hand_grip_strength	U	single	0.15639	0.097486	3882	African (standard)	base		1
+hypertension_i10	U	single	0.43569	0.14836	3900	African (standard)	base		1.5916
+type2_diabetes_e11	U	single	-0.19732	0.21904	3900	African (standard)	base		2.3453
+whr	U	single	0.10306	0.091332	3883	African (standard)	base		1
+chronic_ischaemic_heart_disease_i25	U	8bin	0.23258	0.47536	3900	African (standard)	base	0.49944	3.473
+dyslipidaemia_e78	U	8bin	0.038647	0.21573	3900	African (standard)	base	0.22666	1.9672
+educational_qualification	U	8bin	0.09666	0.13525	3761	African (standard)	base	0.1421	1
+ever_smoked	U	8bin	0.45506	0.18559	3860	African (standard)	base	0.19499	1.5909
+hand_grip_strength	U	8bin	0.24571	0.1274	3882	African (standard)	base	0.13386	1
+hypertension_i10	U	8bin	0.39981	0.2	3900	African (standard)	base	0.21013	1.5916
+type2_diabetes_e11	U	8bin	0.40032	0.26875	3900	African (standard)	base	0.28237	2.3453
+whr	U	8bin	0.14823	0.12829	3883	African (standard)	base	0.13479	1
+chronic_ischaemic_heart_disease_i25	XA	single	0.27188	0.29525	4324	African (standard)	base		3.4448
+dyslipidaemia_e78	XA	single	0.14289	0.1492	4324	African (standard)	base		1.9584
+educational_qualification	XA	single	0.14971	0.088957	4174	African (standard)	base		1
+ever_smoked	XA	single	0.24304	0.12227	4281	African (standard)	base		1.5896
+hand_grip_strength	XA	single	0.17718	0.087294	4299	African (standard)	base		1
+hypertension_i10	XA	single	0.36038	0.13255	4324	African (standard)	base		1.5899
+type2_diabetes_e11	XA	single	-0.1574	0.18039	4324	African (standard)	base		2.3282
+whr	XA	single	0.047379	0.079452	4301	African (standard)	base		1
+chronic_ischaemic_heart_disease_i25	XA	8bin	0.24776	0.42347	4324	African (standard)	base	0.44566	3.4448
+dyslipidaemia_e78	XA	8bin	0.035953	0.19555	4324	African (standard)	base	0.20579	1.9584
+educational_qualification	XA	8bin	0.16695	0.12242	4174	African (standard)	base	0.12883	1
+ever_smoked	XA	8bin	0.41006	0.17246	4281	African (standard)	base	0.18149	1.5896
+hand_grip_strength	XA	8bin	0.2843	0.11143	4299	African (standard)	base	0.11726	1
+hypertension_i10	XA	8bin	0.33722	0.17522	4324	African (standard)	base	0.1844	1.5899
+type2_diabetes_e11	XA	8bin	0.37268	0.24204	4324	African (standard)	base	0.25473	2.3282
+whr	XA	8bin	0.12982	0.11362	4301	African (standard)	base	0.11957	1
+alanine_aminotransferase	U	single	0.21261	0.10116	3693	African (standard)	origin		1
+albumin	U	single	0.13948	0.10609	3394	African (standard)	origin		1
+alka_phos	U	single	0.19901	0.098994	3693	African (standard)	origin		1
+apo_b	U	single	0.34935	0.10871	3668	African (standard)	origin		1
+asp_at	U	single	0.33317	0.097861	3671	African (standard)	origin		1
+blood_mscv	U	single	0.31591	0.1007	3648	African (standard)	origin		1
+blood_platelet	U	single	0.22512	0.1009	3732	African (standard)	origin		1
+blood_rbc_count	U	single	0.20456	0.10225	3732	African (standard)	origin		1
+bmi	U	single	0.16416	0.082607	3868	African (standard)	origin		1
+bp_systolic	U	single	0.25222	0.086185	3821	African (standard)	origin		1
+calcium	U	single	0.012339	0.10314	3394	African (standard)	origin		1
+creatinine	U	single	0.1597	0.09236	3693	African (standard)	origin		1
+cystatin_c	U	single	0.086936	0.10763	3693	African (standard)	origin		1
+diastolic_blood_pressure	U	single	0.22235	0.090615	3821	African (standard)	origin		1
+fluid_intelligence_score	U	single	0.10135	0.18779	1985	African (standard)	origin		1
+ggt	U	single	0.4929	0.102	3692	African (standard)	origin		1
+glucose	U	single	0.078287	0.10129	3391	African (standard)	origin		1
+haemoglobin_concentration	U	single	0.069759	0.10104	3732	African (standard)	origin		1
+hba1c	U	single	-0.0031469	0.090254	3419	African (standard)	origin		1
+hdl	U	single	0.31262	0.1029	3392	African (standard)	origin		1
+heel_bone_mineral_density	U	single	-0.06825	0.2302	1589	African (standard)	origin		1
+height	U	single	0.66431	0.10365	3878	African (standard)	origin		1
+igf_1	U	single	0.26334	0.094893	3673	African (standard)	origin		1
+ldl	U	single	0.3688	0.11019	3687	African (standard)	origin		1
+neuroticism_score	U	single	0.48894	0.13536	2867	African (standard)	origin		1
+sleep_duration	U	single	-0.22183	0.094857	3796	African (standard)	origin		1
+testosterone	U	single	0.017462	0.10842	3301	African (standard)	origin		1
+triglycerides	U	single	0.17352	0.098172	3694	African (standard)	origin		1
+urate	U	single	0.18852	0.18547	3689	African (standard)	origin		1
+urea	U	single	0.012205	0.094217	3692	African (standard)	origin		1
+vitamin_d	U	single	0.11485	0.10351	3566	African (standard)	origin		1
+white_blood_cell_count	U	single	0.45318	0.32615	3732	African (standard)	origin		1
+alanine_aminotransferase	U	8bin	0.20327	0.13564	3693	African (standard)	origin	0.14233	1
+albumin	U	8bin	0.31611	0.15158	3394	African (standard)	origin	0.16032	1
+alka_phos	U	8bin	0.12247	0.13847	3693	African (standard)	origin	0.14427	1
+apo_b	U	8bin	0.33636	0.14994	3668	African (standard)	origin	0.15866	1
+asp_at	U	8bin	0.35689	0.1283	3671	African (standard)	origin	0.13612	1
+blood_mscv	U	8bin	0.46739	0.13618	3648	African (standard)	origin	0.14638	1
+blood_platelet	U	8bin	0.21587	0.1431	3732	African (standard)	origin	0.15071	1
+blood_rbc_count	U	8bin	0.38724	0.13656	3732	African (standard)	origin	0.14524	1
+bmi	U	8bin	0.18829	0.11249	3868	African (standard)	origin	0.11766	1
+bp_systolic	U	8bin	0.31485	0.12132	3821	African (standard)	origin	0.12815	1
+calcium	U	8bin	0.10677	0.14692	3394	African (standard)	origin	0.15244	1
+creatinine	U	8bin	0.28126	0.13133	3693	African (standard)	origin	0.13816	1
+cystatin_c	U	8bin	0.11576	0.13838	3693	African (standard)	origin	0.14351	1
+diastolic_blood_pressure	U	8bin	0.13454	0.12243	3821	African (standard)	origin	0.12757	1
+fluid_intelligence_score	U	8bin	-0.073644	0.25877	1985	African (standard)	origin	0.27048	1
+ggt	U	8bin	0.41276	0.13607	3692	African (standard)	origin	0.14483	1
+glucose	U	8bin	0.25697	0.14032	3391	African (standard)	origin	0.14724	1
+haemoglobin_concentration	U	8bin	0.13309	0.13142	3732	African (standard)	origin	0.13735	1
+hba1c	U	8bin	0.20112	0.12715	3419	African (standard)	origin	0.13306	1
+hdl	U	8bin	0.35966	0.15188	3392	African (standard)	origin	0.16071	1
+heel_bone_mineral_density	U	8bin	-0.084434	0.3084	1589	African (standard)	origin	0.31712	1
+height	U	8bin	0.64718	0.14071	3878	African (standard)	origin	0.15491	1
+igf_1	U	8bin	0.37311	0.13188	3673	African (standard)	origin	0.1404	1
+ldl	U	8bin	0.32767	0.14576	3687	African (standard)	origin	0.15403	1
+neuroticism_score	U	8bin	0.56271	0.17772	2867	African (standard)	origin	0.19205	1
+sleep_duration	U	8bin	-0.10451	0.12776	3796	African (standard)	origin	0.13153	1
+testosterone	U	8bin	0.12232	0.15452	3301	African (standard)	origin	0.16044	1
+triglycerides	U	8bin	0.18869	0.12196	3694	African (standard)	origin	0.12745	1
+urate	U	8bin	0.059618	0.13469	3689	African (standard)	origin	0.13981	1
+urea	U	8bin	-0.084194	0.12809	3692	African (standard)	origin	0.13201	1
+vitamin_d	U	8bin	0.26448	0.14549	3566	African (standard)	origin	0.15322	1
+white_blood_cell_count	U	8bin	0.54266	0.37655	3732	African (standard)	origin	0.40517	1
+albumin	XA	single	0.25399	0.10087	3754	African (standard)	origin		1
+alka_phos	XA	single	0.1875	0.08787	4095	African (standard)	origin		1
+alanine_aminotransferase	XA	single	0.20607	0.089535	4095	African (standard)	origin		1
+asp_at	XA	single	0.31792	0.084426	4070	African (standard)	origin		1
+creatinine	XA	single	0.17839	0.082627	4095	African (standard)	origin		1
+cystatin_c	XA	single	0.023881	0.097968	4095	African (standard)	origin		1
+ggt	XA	single	0.50707	0.10213	4094	African (standard)	origin		1
+glucose	XA	single	0.083298	0.091933	3750	African (standard)	origin		1
+hba1c	XA	single	0.050022	0.086745	3790	African (standard)	origin		1
+hdl	XA	single	0.32609	0.095426	3752	African (standard)	origin		1
+igf_1	XA	single	0.25184	0.088715	4073	African (standard)	origin		1
+ldl	XA	single	0.32549	0.094752	4088	African (standard)	origin		1
+testosterone	XA	single	0.016949	0.08966	3659	African (standard)	origin		1
+triglycerides	XA	single	0.15672	0.085641	4096	African (standard)	origin		1
+urate	XA	single	0.20473	0.17231	4089	African (standard)	origin		1
+vitamin_d	XA	single	0.12251	0.091492	3952	African (standard)	origin		1
+blood_rbc_count	XA	single	0.17315	0.092267	4143	African (standard)	origin		1
+white_blood_cell_count	XA	single	0.46614	0.34996	4143	African (standard)	origin		1
+blood_platelet	XA	single	0.20314	0.087007	4143	African (standard)	origin		1
+blood_mscv	XA	single	0.22684	0.086873	4048	African (standard)	origin		1
+haemoglobin_concentration	XA	single	0.10849	0.088087	4143	African (standard)	origin		1
+height	XA	single	0.59411	0.089082	4295	African (standard)	origin		1
+bmi	XA	single	0.18476	0.073391	4285	African (standard)	origin		1
+bp_systolic	XA	single	0.24771	0.080854	4240	African (standard)	origin		1
+diastolic_blood_pressure	XA	single	0.20327	0.081926	4240	African (standard)	origin		1
+heel_bone_mineral_density	XA	single	-0.17509	0.2193	1754	African (standard)	origin		1
+calcium	XA	single	0.0012584	0.092834	3753	African (standard)	origin		1
+urea	XA	single	-0.046998	0.080042	4094	African (standard)	origin		1
+apo_b	XA	single	0.31885	0.096578	4070	African (standard)	origin		1
+fluid_intelligence_score	XA	single	0.16439	0.16484	2205	African (standard)	origin		1
+neuroticism_score	XA	single	0.38528	0.10982	3189	African (standard)	origin		1
+sleep_duration	XA	single	-0.13702	0.078066	4209	African (standard)	origin		1
+albumin	XA	8bin	0.40458	0.13128	3754	African (standard)	origin	0.14008	1
+alka_phos	XA	8bin	0.14714	0.12779	4095	African (standard)	origin	0.13366	1
+alanine_aminotransferase	XA	8bin	0.22195	0.11579	4095	African (standard)	origin	0.12186	1
+asp_at	XA	8bin	0.27486	0.1131	4070	African (standard)	origin	0.11941	1
+creatinine	XA	8bin	0.3321	0.11859	4095	African (standard)	origin	0.12555	1
+cystatin_c	XA	8bin	0.025793	0.12381	4095	African (standard)	origin	0.12797	1
+ggt	XA	8bin	0.43367	0.12642	4094	African (standard)	origin	0.13502	1
+glucose	XA	8bin	0.22116	0.11771	3750	African (standard)	origin	0.12375	1
+hba1c	XA	8bin	0.23831	0.11832	3790	African (standard)	origin	0.12451	1
+hdl	XA	8bin	0.40104	0.1371	3752	African (standard)	origin	0.14624	1
+igf_1	XA	8bin	0.38893	0.12426	4073	African (standard)	origin	0.13286	1
+ldl	XA	8bin	0.32771	0.12582	4088	African (standard)	origin	0.13315	1
+testosterone	XA	8bin	0.072659	0.12719	3659	African (standard)	origin	0.13188	1
+triglycerides	XA	8bin	0.18857	0.1043	4096	African (standard)	origin	0.10929	1
+urate	XA	8bin	0.13209	0.12106	4089	African (standard)	origin	0.12637	1
+vitamin_d	XA	8bin	0.21546	0.13275	3952	African (standard)	origin	0.13957	1
+blood_rbc_count	XA	8bin	0.29795	0.12752	4143	African (standard)	origin	0.13506	1
+white_blood_cell_count	XA	8bin	0.49038	0.39508	4143	African (standard)	origin	0.42401	1
+blood_platelet	XA	8bin	0.20019	0.12121	4143	African (standard)	origin	0.1278	1
+blood_mscv	XA	8bin	0.39179	0.11346	4048	African (standard)	origin	0.12161	1
+haemoglobin_concentration	XA	8bin	0.15816	0.1177	4143	African (standard)	origin	0.12362	1
+height	XA	8bin	0.65255	0.12284	4295	African (standard)	origin	0.13586	1
+bmi	XA	8bin	0.24456	0.099299	4285	African (standard)	origin	0.1045	1
+bp_systolic	XA	8bin	0.34805	0.11376	4240	African (standard)	origin	0.12073	1
+diastolic_blood_pressure	XA	8bin	0.14249	0.10972	4240	African (standard)	origin	0.11466	1
+heel_bone_mineral_density	XA	8bin	-0.23915	0.28362	1754	African (standard)	origin	0.29041	1
+calcium	XA	8bin	0.080447	0.13255	3753	African (standard)	origin	0.13744	1
+urea	XA	8bin	-0.096439	0.10835	4094	African (standard)	origin	0.11175	1
+apo_b	XA	8bin	0.351	0.1327	4070	African (standard)	origin	0.14084	1
+fluid_intelligence_score	XA	8bin	0.032843	0.2216	2205	African (standard)	origin	0.23222	1
+neuroticism_score	XA	8bin	0.41	0.14554	3189	African (standard)	origin	0.15585	1
+sleep_duration	XA	8bin	-0.099067	0.10701	4209	African (standard)	origin	0.11021	1
+chronic_ischaemic_heart_disease_i25	U	single	0.41599	0.34386	3900	African (standard)	origin		3.473
+dyslipidaemia_e78	U	single	0.24285	0.16287	3900	African (standard)	origin		1.9672
+educational_qualification	U	single	0.14407	0.10111	3761	African (standard)	origin		1
+ever_smoked	U	single	0.22803	0.12942	3860	African (standard)	origin		1.5909
+hand_grip_strength	U	single	0.13727	0.09785	3882	African (standard)	origin		1
+hypertension_i10	U	single	0.41402	0.15013	3900	African (standard)	origin		1.5916
+type2_diabetes_e11	U	single	-0.19181	0.22035	3900	African (standard)	origin		2.3453
+whr	U	single	0.11397	0.09422	3883	African (standard)	origin		1
+chronic_ischaemic_heart_disease_i25	U	8bin	0.13737	0.48255	3900	African (standard)	origin	0.507	3.473
+dyslipidaemia_e78	U	8bin	0.0088566	0.22323	3900	African (standard)	origin	0.23453	1.9672
+educational_qualification	U	8bin	0.083716	0.13706	3761	African (standard)	origin	0.144	1
+ever_smoked	U	8bin	0.41847	0.1892	3860	African (standard)	origin	0.19879	1.5909
+hand_grip_strength	U	8bin	0.22705	0.12806	3882	African (standard)	origin	0.13454	1
+hypertension_i10	U	8bin	0.37503	0.20465	3900	African (standard)	origin	0.21501	1.5916
+type2_diabetes_e11	U	8bin	0.49107	0.27448	3900	African (standard)	origin	0.28838	2.3453
+whr	U	8bin	0.15157	0.13158	3883	African (standard)	origin	0.13824	1
+educational_qualification	XA	single	0.16804	0.08956	4174	African (standard)	origin		1
+hand_grip_strength	XA	single	0.16211	0.087933	4299	African (standard)	origin		1
+whr	XA	single	0.043299	0.080941	4301	African (standard)	origin		1
+ever_smoked	XA	single	0.21629	0.11882	4281	African (standard)	origin		1.5896
+chronic_ischaemic_heart_disease_i25	XA	single	0.26017	0.29812	4324	African (standard)	origin		3.4448
+dyslipidaemia_e78	XA	single	0.12882	0.14921	4324	African (standard)	origin		1.9584
+hypertension_i10	XA	single	0.33266	0.13297	4324	African (standard)	origin		1.5899
+type2_diabetes_e11	XA	single	-0.17836	0.17814	4324	African (standard)	origin		2.3282
+educational_qualification	XA	8bin	0.1645	0.12001	4174	African (standard)	origin	0.1263	1
+hand_grip_strength	XA	8bin	0.25596	0.10882	4299	African (standard)	origin	0.11453	1
+whr	XA	8bin	0.11848	0.11409	4301	African (standard)	origin	0.12007	1
+ever_smoked	XA	8bin	0.36105	0.16829	4281	African (standard)	origin	0.17711	1.5896
+chronic_ischaemic_heart_disease_i25	XA	8bin	0.15568	0.41818	4324	African (standard)	origin	0.4401	3.4448
+dyslipidaemia_e78	XA	8bin	-0.030449	0.19878	4324	African (standard)	origin	0.2092	1.9584
+hypertension_i10	XA	8bin	0.30213	0.17397	4324	African (standard)	origin	0.18309	1.5899
+type2_diabetes_e11	XA	8bin	0.40169	0.24143	4324	African (standard)	origin	0.25408	2.3282
+alanine_aminotransferase	U	single	0.1964	0.066646	7093	South Asian	base		1
+albumin	U	single	0.32591	0.074789	6485	South Asian	base		1
+alka_phos	U	single	0.48605	0.12388	7104	South Asian	base		1
+apo_b	U	single	0.29117	0.083003	7044	South Asian	base		1
+asp_at	U	single	0.17114	0.065776	7082	South Asian	base		1
+blood_mscv	U	single	0.32978	0.07715	7020	South Asian	base		1
+blood_platelet	U	single	0.46234	0.068461	7206	South Asian	base		1
+blood_rbc_count	U	single	0.34923	0.064368	7206	South Asian	base		1
+bmi	U	single	0.25482	0.066805	7301	South Asian	base		1
+bp_systolic	U	single	0.12157	0.065359	7306	South Asian	base		1
+calcium	U	single	0.19065	0.071349	6489	South Asian	base		1
+creatinine	U	single	0.44209	0.069595	7103	South Asian	base		1
+cystatin_c	U	single	0.36069	0.096193	7103	South Asian	base		1
+diastolic_blood_pressure	U	single	0.10698	0.066193	7306	South Asian	base		1
+fluid_intelligence_score	U	single	0.59111	0.13027	3888	South Asian	base		1
+ggt	U	single	0.44641	0.082463	7102	South Asian	base		1
+glucose	U	single	0.21019	0.074047	6488	South Asian	base		1
+haemoglobin_concentration	U	single	0.27946	0.063706	7206	South Asian	base		1
+hba1c	U	single	0.38922	0.060812	7033	South Asian	base		1
+hdl	U	single	0.50226	0.10971	6482	South Asian	base		1
+heel_bone_mineral_density	U	single	0.24366	0.17939	2190	South Asian	base		1
+height	U	single	0.59842	0.071974	7310	South Asian	base		1
+igf_1	U	single	0.29575	0.07209	7058	South Asian	base		1
+ldl	U	single	0.2501	0.073179	7087	South Asian	base		1
+neuroticism_score	U	single	0.19181	0.09324	4618	South Asian	base		1
+sleep_duration	U	single	0.1887	0.05762	7345	South Asian	base		1
+testosterone	U	single	-0.034353	0.073843	6458	South Asian	base		1
+triglycerides	U	single	0.37577	0.099635	7097	South Asian	base		1
+urate	U	single	0.37658	0.14666	7095	South Asian	base		1
+urea	U	single	0.168	0.073285	7103	South Asian	base		1
+vitamin_d	U	single	0.13831	0.070992	6245	South Asian	base		1
+white_blood_cell_count	U	single	0.29151	0.070407	7206	South Asian	base		1
+alanine_aminotransferase	U	8bin	0.19219	0.073716	7093	South Asian	base	0.077391	1
+albumin	U	8bin	0.26994	0.082661	6485	South Asian	base	0.087003	1
+alka_phos	U	8bin	0.28603	0.11206	7104	South Asian	base	0.11803	1
+apo_b	U	8bin	0.20726	0.078827	7044	South Asian	base	0.082794	1
+asp_at	U	8bin	0.1685	0.074646	7082	South Asian	base	0.078315	1
+blood_mscv	U	8bin	0.24459	0.08464	7020	South Asian	base	0.089005	1
+blood_platelet	U	8bin	0.38548	0.074796	7206	South Asian	base	0.079099	1
+blood_rbc_count	U	8bin	0.33605	0.0757	7206	South Asian	base	0.079881	1
+bmi	U	8bin	0.25943	0.077446	7301	South Asian	base	0.081483	1
+bp_systolic	U	8bin	0.16177	0.070556	7306	South Asian	base	0.074011	1
+calcium	U	8bin	0.087978	0.084616	6489	South Asian	base	0.088609	1
+creatinine	U	8bin	0.43212	0.07787	7103	South Asian	base	0.08253	1
+cystatin_c	U	8bin	0.2652	0.096427	7103	South Asian	base	0.10147	1
+diastolic_blood_pressure	U	8bin	0.1392	0.073554	7306	South Asian	base	0.077112	1
+fluid_intelligence_score	U	8bin	0.6064	0.13991	3888	South Asian	base	0.14971	1
+ggt	U	8bin	0.40225	0.080116	7102	South Asian	base	0.084789	1
+glucose	U	8bin	0.18162	0.079568	6488	South Asian	base	0.08351	1
+haemoglobin_concentration	U	8bin	0.21806	0.07017	7206	South Asian	base	0.073726	1
+hba1c	U	8bin	0.37038	0.067818	7033	South Asian	base	0.07167	1
+hdl	U	8bin	0.39827	0.093762	6482	South Asian	base	0.099211	1
+heel_bone_mineral_density	U	8bin	0.26708	0.22127	2190	South Asian	base	0.23287	1
+height	U	8bin	0.47797	0.073843	7310	South Asian	base	0.078444	1
+igf_1	U	8bin	0.20328	0.080068	7058	South Asian	base	0.084086	1
+ldl	U	8bin	0.17128	0.077592	7087	South Asian	base	0.081412	1
+neuroticism_score	U	8bin	0.15197	0.10839	4618	South Asian	base	0.11367	1
+sleep_duration	U	8bin	0.19769	0.067719	7345	South Asian	base	0.071107	1
+testosterone	U	8bin	-0.091228	0.079304	6458	South Asian	base	0.082897	1
+triglycerides	U	8bin	0.32739	0.077706	7097	South Asian	base	0.081969	1
+urate	U	8bin	0.2913	0.094401	7095	South Asian	base	0.099438	1
+urea	U	8bin	0.16979	0.074627	7103	South Asian	base	0.078299	1
+vitamin_d	U	8bin	0.20478	0.085054	6245	South Asian	base	0.089329	1
+white_blood_cell_count	U	8bin	0.22403	0.073152	7206	South Asian	base	0.076874	1
+alanine_aminotransferase	XA	single	0.15617	0.059089	8112	South Asian	base		1
+albumin	XA	single	0.31435	0.071083	7424	South Asian	base		1
+alka_phos	XA	single	0.51546	0.1205	8127	South Asian	base		1
+apo_b	XA	single	0.30208	0.079905	8059	South Asian	base		1
+asp_at	XA	single	0.13067	0.056972	8101	South Asian	base		1
+blood_mscv	XA	single	0.30285	0.069359	8036	South Asian	base		1
+blood_platelet	XA	single	0.49182	0.06309	8242	South Asian	base		1
+blood_rbc_count	XA	single	0.33679	0.056017	8242	South Asian	base		1
+bmi	XA	single	0.26955	0.060815	8350	South Asian	base		1
+bp_systolic	XA	single	0.11894	0.053986	8362	South Asian	base		1
+calcium	XA	single	0.17496	0.068031	7427	South Asian	base		1
+creatinine	XA	single	0.42137	0.065222	8126	South Asian	base		1
+cystatin_c	XA	single	0.40201	0.089113	8126	South Asian	base		1
+diastolic_blood_pressure	XA	single	0.054669	0.057647	8362	South Asian	base		1
+fluid_intelligence_score	XA	single	0.48494	0.13031	4455	South Asian	base		1
+ggt	XA	single	0.36426	0.073449	8125	South Asian	base		1
+glucose	XA	single	0.30562	0.066122	7424	South Asian	base		1
+haemoglobin_concentration	XA	single	0.30471	0.055873	8242	South Asian	base		1
+hba1c	XA	single	0.39305	0.058929	8038	South Asian	base		1
+hdl	XA	single	0.42829	0.10221	7418	South Asian	base		1
+heel_bone_mineral_density	XA	single	0.11905	0.16518	2521	South Asian	base		1
+height	XA	single	0.63144	0.066401	8361	South Asian	base		1
+igf_1	XA	single	0.33173	0.066666	8072	South Asian	base		1
+ldl	XA	single	0.2451	0.067885	8109	South Asian	base		1
+neuroticism_score	XA	single	0.13692	0.082749	5286	South Asian	base		1
+sleep_duration	XA	single	0.19035	0.052116	8409	South Asian	base		1
+testosterone	XA	single	0.026353	0.067489	7394	South Asian	base		1
+triglycerides	XA	single	0.35848	0.10123	8119	South Asian	base		1
+urate	XA	single	0.34406	0.13704	8115	South Asian	base		1
+urea	XA	single	0.17167	0.070109	8126	South Asian	base		1
+vitamin_d	XA	single	0.073632	0.062985	7126	South Asian	base		1
+white_blood_cell_count	XA	single	0.23707	0.064537	8242	South Asian	base		1
+alanine_aminotransferase	XA	8bin	0.13706	0.06701	8112	South Asian	base	0.070153	1
+albumin	XA	8bin	0.23828	0.075158	7424	South Asian	base	0.078963	1
+alka_phos	XA	8bin	0.3505	0.10728	8127	South Asian	base	0.11329	1
+apo_b	XA	8bin	0.21061	0.075794	8059	South Asian	base	0.079544	1
+asp_at	XA	8bin	0.13554	0.06777	8101	South Asian	base	0.070946	1
+blood_mscv	XA	8bin	0.23408	0.076249	8036	South Asian	base	0.080096	1
+blood_platelet	XA	8bin	0.43707	0.068176	8242	South Asian	base	0.072332	1
+blood_rbc_count	XA	8bin	0.32105	0.063787	8242	South Asian	base	0.067262	1
+bmi	XA	8bin	0.28083	0.069776	8350	South Asian	base	0.073441	1
+bp_systolic	XA	8bin	0.12714	0.058767	8362	South Asian	base	0.061506	1
+calcium	XA	8bin	0.064182	0.077429	7427	South Asian	base	0.080906	1
+creatinine	XA	8bin	0.39007	0.06613	8126	South Asian	base	0.069977	1
+cystatin_c	XA	8bin	0.33148	0.087278	8126	South Asian	base	0.092077	1
+diastolic_blood_pressure	XA	8bin	0.076658	0.064194	8362	South Asian	base	0.067097	1
+fluid_intelligence_score	XA	8bin	0.54715	0.12641	4455	South Asian	base	0.13502	1
+ggt	XA	8bin	0.31746	0.071949	8125	South Asian	base	0.075855	1
+glucose	XA	8bin	0.31649	0.073645	7424	South Asian	base	0.07764	1
+haemoglobin_concentration	XA	8bin	0.27565	0.062187	8242	South Asian	base	0.065438	1
+hba1c	XA	8bin	0.39491	0.063041	8038	South Asian	base	0.066726	1
+hdl	XA	8bin	0.3312	0.082179	7418	South Asian	base	0.086696	1
+heel_bone_mineral_density	XA	8bin	0.16565	0.19655	2521	South Asian	base	0.20595	1
+height	XA	8bin	0.52471	0.068186	8361	South Asian	base	0.072725	1
+igf_1	XA	8bin	0.23668	0.072964	8072	South Asian	base	0.076653	1
+ldl	XA	8bin	0.15999	0.070576	8109	South Asian	base	0.073938	1
+neuroticism_score	XA	8bin	0.078983	0.099409	5286	South Asian	base	0.10391	1
+sleep_duration	XA	8bin	0.20109	0.060562	8409	South Asian	base	0.063538	1
+testosterone	XA	8bin	-0.060348	0.068895	7394	South Asian	base	0.071863	1
+triglycerides	XA	8bin	0.27786	0.077268	8119	South Asian	base	0.081316	1
+urate	XA	8bin	0.25192	0.084762	8115	South Asian	base	0.089103	1
+urea	XA	8bin	0.11475	0.0696	8126	South Asian	base	0.072817	1
+vitamin_d	XA	8bin	0.1277	0.07749	7126	South Asian	base	0.081102	1
+white_blood_cell_count	XA	8bin	0.18383	0.064492	8242	South Asian	base	0.067618	1
+chronic_ischaemic_heart_disease_i25	U	single	0.48275	0.12664	7484	South Asian	base		2.103
+dyslipidaemia_e78	U	single	0.30162	0.10631	7484	South Asian	base		1.6057
+educational_qualification	U	single	0.50293	0.06389	7060	South Asian	base		1
+ever_smoked	U	single	0.40209	0.11033	7373	South Asian	base		1.7018
+hand_grip_strength	U	single	0.36743	0.067512	7410	South Asian	base		1
+hypertension_i10	U	single	0.3095	0.098912	7484	South Asian	base		1.572
+type2_diabetes_e11	U	single	0.30002	0.11047	7484	South Asian	base		1.7723
+whr	U	single	0.23247	0.060858	7411	South Asian	base		1
+chronic_ischaemic_heart_disease_i25	U	8bin	0.46374	0.14594	7484	South Asian	base	0.15342	2.103
+dyslipidaemia_e78	U	8bin	0.27185	0.1164	7484	South Asian	base	0.12237	1.6057
+educational_qualification	U	8bin	0.6145	0.072466	7060	South Asian	base	0.076179	1
+ever_smoked	U	8bin	0.47266	0.1188	7373	South Asian	base	0.12488	1.7018
+hand_grip_strength	U	8bin	0.35253	0.070668	7410	South Asian	base	0.074288	1
+hypertension_i10	U	8bin	0.41712	0.11105	7484	South Asian	base	0.11674	1.572
+type2_diabetes_e11	U	8bin	0.36578	0.12725	7484	South Asian	base	0.13377	1.7723
+whr	U	8bin	0.30898	0.071731	7411	South Asian	base	0.075405	1
+chronic_ischaemic_heart_disease_i25	XA	single	0.37692	0.11062	8566	South Asian	base		2.1229
+dyslipidaemia_e78	XA	single	0.31202	0.096856	8566	South Asian	base		1.6058
+educational_qualification	XA	single	0.49822	0.060116	8087	South Asian	base		1
+ever_smoked	XA	single	0.2952	0.095916	8439	South Asian	base		1.7083
+hand_grip_strength	XA	single	0.33456	0.052703	8481	South Asian	base		1
+hypertension_i10	XA	single	0.22229	0.084234	8566	South Asian	base		1.5724
+type2_diabetes_e11	XA	single	0.35111	0.098599	8566	South Asian	base		1.7761
+whr	XA	single	0.19504	0.056648	8482	South Asian	base		1
+chronic_ischaemic_heart_disease_i25	XA	8bin	0.40808	0.13222	8566	South Asian	base	0.13891	2.1229
+dyslipidaemia_e78	XA	8bin	0.27618	0.10819	8566	South Asian	base	0.11366	1.6058
+educational_qualification	XA	8bin	0.61318	0.064446	8087	South Asian	base	0.067707	1
+ever_smoked	XA	8bin	0.38581	0.10614	8439	South Asian	base	0.11151	1.7083
+hand_grip_strength	XA	8bin	0.32541	0.05745	8481	South Asian	base	0.060356	1
+hypertension_i10	XA	8bin	0.31085	0.096321	8566	South Asian	base	0.10119	1.5724
+type2_diabetes_e11	XA	8bin	0.4387	0.11451	8566	South Asian	base	0.12031	1.7761
+whr	XA	8bin	0.25072	0.063597	8482	South Asian	base	0.066814	1
+alanine_aminotransferase	U	single	0.19588	0.066341	7093	South Asian	origin		1
+albumin	U	single	0.31895	0.076249	6485	South Asian	origin		1
+alka_phos	U	single	0.48937	0.12584	7104	South Asian	origin		1
+apo_b	U	single	0.28167	0.08189	7044	South Asian	origin		1
+asp_at	U	single	0.16015	0.065833	7082	South Asian	origin		1
+blood_mscv	U	single	0.33245	0.075885	7020	South Asian	origin		1
+blood_platelet	U	single	0.48432	0.068259	7206	South Asian	origin		1
+blood_rbc_count	U	single	0.34908	0.065201	7206	South Asian	origin		1
+bmi	U	single	0.19604	0.065373	7301	South Asian	origin		1
+bp_systolic	U	single	0.1269	0.065654	7306	South Asian	origin		1
+calcium	U	single	0.1806	0.072973	6489	South Asian	origin		1
+creatinine	U	single	0.43299	0.070018	7103	South Asian	origin		1
+cystatin_c	U	single	0.33496	0.097328	7103	South Asian	origin		1
+diastolic_blood_pressure	U	single	0.10469	0.066751	7306	South Asian	origin		1
+fluid_intelligence_score	U	single	0.57529	0.12334	3888	South Asian	origin		1
+ggt	U	single	0.43231	0.08181	7102	South Asian	origin		1
+glucose	U	single	0.20775	0.075619	6488	South Asian	origin		1
+haemoglobin_concentration	U	single	0.26999	0.063803	7206	South Asian	origin		1
+hba1c	U	single	0.36573	0.060344	7033	South Asian	origin		1
+hdl	U	single	0.49332	0.11545	6482	South Asian	origin		1
+heel_bone_mineral_density	U	single	0.23776	0.18104	2190	South Asian	origin		1
+height	U	single	0.592	0.071283	7310	South Asian	origin		1
+igf_1	U	single	0.2697	0.072255	7058	South Asian	origin		1
+ldl	U	single	0.23913	0.072799	7087	South Asian	origin		1
+neuroticism_score	U	single	0.20152	0.093821	4618	South Asian	origin		1
+sleep_duration	U	single	0.18098	0.060214	7345	South Asian	origin		1
+testosterone	U	single	-0.045678	0.07508	6458	South Asian	origin		1
+triglycerides	U	single	0.35472	0.10099	7097	South Asian	origin		1
+urate	U	single	0.3727	0.1442	7095	South Asian	origin		1
+urea	U	single	0.14462	0.069698	7103	South Asian	origin		1
+vitamin_d	U	single	0.086237	0.070924	6245	South Asian	origin		1
+white_blood_cell_count	U	single	0.27164	0.069523	7206	South Asian	origin		1
+alanine_aminotransferase	U	8bin	0.1868	0.073911	7093	South Asian	origin	0.077596	1
+albumin	U	8bin	0.24602	0.082919	6485	South Asian	origin	0.087274	1
+alka_phos	U	8bin	0.27711	0.11348	7104	South Asian	origin	0.11952	1
+apo_b	U	8bin	0.19388	0.078208	7044	South Asian	origin	0.082144	1
+asp_at	U	8bin	0.15553	0.075298	7082	South Asian	origin	0.078999	1
+blood_mscv	U	8bin	0.25246	0.083063	7020	South Asian	origin	0.087347	1
+blood_platelet	U	8bin	0.40893	0.073409	7206	South Asian	origin	0.077632	1
+blood_rbc_count	U	8bin	0.33752	0.076958	7206	South Asian	origin	0.081208	1
+bmi	U	8bin	0.17922	0.077448	7301	South Asian	origin	0.081486	1
+bp_systolic	U	8bin	0.17271	0.070155	7306	South Asian	origin	0.07359	1
+calcium	U	8bin	0.07286	0.086321	6489	South Asian	origin	0.090395	1
+creatinine	U	8bin	0.41616	0.076853	7103	South Asian	origin	0.081453	1
+cystatin_c	U	8bin	0.24513	0.098435	7103	South Asian	origin	0.10358	1
+diastolic_blood_pressure	U	8bin	0.13634	0.073803	7306	South Asian	origin	0.077373	1
+fluid_intelligence_score	U	8bin	0.61346	0.14009	3888	South Asian	origin	0.1499	1
+ggt	U	8bin	0.37764	0.080018	7102	South Asian	origin	0.084685	1
+glucose	U	8bin	0.17384	0.08226	6488	South Asian	origin	0.086336	1
+haemoglobin_concentration	U	8bin	0.21087	0.070514	7206	South Asian	origin	0.074087	1
+hba1c	U	8bin	0.33866	0.068126	7033	South Asian	origin	0.071996	1
+hdl	U	8bin	0.38941	0.096131	6482	South Asian	origin	0.10172	1
+heel_bone_mineral_density	U	8bin	0.29671	0.22515	2190	South Asian	origin	0.23696	1
+height	U	8bin	0.45056	0.074676	7310	South Asian	origin	0.079329	1
+igf_1	U	8bin	0.18264	0.0792	7058	South Asian	origin	0.083174	1
+ldl	U	8bin	0.16059	0.077351	7087	South Asian	origin	0.08116	1
+neuroticism_score	U	8bin	0.15249	0.10789	4618	South Asian	origin	0.11315	1
+sleep_duration	U	8bin	0.18215	0.069634	7345	South Asian	origin	0.073117	1
+testosterone	U	8bin	-0.10618	0.080325	6458	South Asian	origin	0.083965	1
+triglycerides	U	8bin	0.31013	0.078682	7097	South Asian	origin	0.082998	1
+urate	U	8bin	0.28454	0.094981	7095	South Asian	origin	0.10005	1
+urea	U	8bin	0.142	0.073415	7103	South Asian	origin	0.077028	1
+vitamin_d	U	8bin	0.13583	0.087001	6245	South Asian	origin	0.091374	1
+white_blood_cell_count	U	8bin	0.19543	0.073301	7206	South Asian	origin	0.077031	1
+albumin	XA	single	0.31824	0.073292	7424	South Asian	origin		1
+alka_phos	XA	single	0.53349	0.1215	8127	South Asian	origin		1
+alanine_aminotransferase	XA	single	0.1669	0.059842	8112	South Asian	origin		1
+asp_at	XA	single	0.13604	0.056822	8101	South Asian	origin		1
+creatinine	XA	single	0.42109	0.06489	8126	South Asian	origin		1
+cystatin_c	XA	single	0.38668	0.089557	8126	South Asian	origin		1
+ggt	XA	single	0.36394	0.071936	8125	South Asian	origin		1
+glucose	XA	single	0.3017	0.06538	7424	South Asian	origin		1
+hba1c	XA	single	0.37935	0.057233	8038	South Asian	origin		1
+hdl	XA	single	0.42846	0.1086	7418	South Asian	origin		1
+igf_1	XA	single	0.31909	0.065565	8072	South Asian	origin		1
+ldl	XA	single	0.23447	0.067579	8109	South Asian	origin		1
+testosterone	XA	single	0.021564	0.067932	7394	South Asian	origin		1
+triglycerides	XA	single	0.34951	0.10214	8119	South Asian	origin		1
+urate	XA	single	0.35161	0.13389	8115	South Asian	origin		1
+vitamin_d	XA	single	0.023805	0.06139	7126	South Asian	origin		1
+blood_rbc_count	XA	single	0.34337	0.056579	8242	South Asian	origin		1
+white_blood_cell_count	XA	single	0.22483	0.062928	8242	South Asian	origin		1
+blood_platelet	XA	single	0.51258	0.062867	8242	South Asian	origin		1
+blood_mscv	XA	single	0.30614	0.068191	8036	South Asian	origin		1
+haemoglobin_concentration	XA	single	0.30565	0.055997	8242	South Asian	origin		1
+height	XA	single	0.61935	0.067148	8361	South Asian	origin		1
+bmi	XA	single	0.22997	0.059943	8350	South Asian	origin		1
+bp_systolic	XA	single	0.12643	0.054079	8362	South Asian	origin		1
+diastolic_blood_pressure	XA	single	0.055789	0.0573	8362	South Asian	origin		1
+heel_bone_mineral_density	XA	single	0.18069	0.16491	2521	South Asian	origin		1
+calcium	XA	single	0.16638	0.068487	7427	South Asian	origin		1
+urea	XA	single	0.15477	0.065667	8126	South Asian	origin		1
+apo_b	XA	single	0.29337	0.078845	8059	South Asian	origin		1
+fluid_intelligence_score	XA	single	0.44607	0.1164	4455	South Asian	origin		1
+neuroticism_score	XA	single	0.14249	0.082901	5286	South Asian	origin		1
+sleep_duration	XA	single	0.18528	0.053682	8409	South Asian	origin		1
+albumin	XA	8bin	0.23263	0.075367	7424	South Asian	origin	0.079183	1
+alka_phos	XA	8bin	0.3622	0.10702	8127	South Asian	origin	0.11302	1
+alanine_aminotransferase	XA	8bin	0.14482	0.067788	8112	South Asian	origin	0.070968	1
+asp_at	XA	8bin	0.14227	0.068049	8101	South Asian	origin	0.071237	1
+creatinine	XA	8bin	0.38715	0.064412	8126	South Asian	origin	0.068159	1
+cystatin_c	XA	8bin	0.31983	0.087924	8126	South Asian	origin	0.092758	1
+ggt	XA	8bin	0.31046	0.07114	8125	South Asian	origin	0.075002	1
+glucose	XA	8bin	0.31811	0.074519	7424	South Asian	origin	0.078562	1
+hba1c	XA	8bin	0.37652	0.062147	8038	South Asian	origin	0.06578	1
+hdl	XA	8bin	0.33803	0.08486	7418	South Asian	origin	0.089524	1
+igf_1	XA	8bin	0.22729	0.071136	8072	South Asian	origin	0.074733	1
+ldl	XA	8bin	0.14631	0.070117	8109	South Asian	origin	0.073458	1
+testosterone	XA	8bin	-0.06448	0.068591	7394	South Asian	origin	0.071546	1
+triglycerides	XA	8bin	0.27056	0.077723	8119	South Asian	origin	0.081795	1
+urate	XA	8bin	0.25377	0.084182	8115	South Asian	origin	0.088494	1
+vitamin_d	XA	8bin	0.061857	0.076624	7126	South Asian	origin	0.080196	1
+blood_rbc_count	XA	8bin	0.32825	0.063503	8242	South Asian	origin	0.066963	1
+white_blood_cell_count	XA	8bin	0.16395	0.063999	8242	South Asian	origin	0.067102	1
+blood_platelet	XA	8bin	0.45564	0.066869	8242	South Asian	origin	0.070945	1
+blood_mscv	XA	8bin	0.2465	0.074612	8036	South Asian	origin	0.078376	1
+haemoglobin_concentration	XA	8bin	0.27278	0.062374	8242	South Asian	origin	0.065635	1
+height	XA	8bin	0.49523	0.069225	8361	South Asian	origin	0.073834	1
+bmi	XA	8bin	0.22735	0.069495	8350	South Asian	origin	0.073145	1
+bp_systolic	XA	8bin	0.14229	0.058763	8362	South Asian	origin	0.061501	1
+diastolic_blood_pressure	XA	8bin	0.076315	0.064396	8362	South Asian	origin	0.067308	1
+heel_bone_mineral_density	XA	8bin	0.27851	0.19619	2521	South Asian	origin	0.20557	1
+calcium	XA	8bin	0.060561	0.077601	7427	South Asian	origin	0.081086	1
+urea	XA	8bin	0.10023	0.067583	8126	South Asian	origin	0.070707	1
+apo_b	XA	8bin	0.19867	0.074988	8059	South Asian	origin	0.078699	1
+fluid_intelligence_score	XA	8bin	0.53979	0.12234	4455	South Asian	origin	0.13067	1
+neuroticism_score	XA	8bin	0.0824	0.098683	5286	South Asian	origin	0.10315	1
+sleep_duration	XA	8bin	0.19174	0.061118	8409	South Asian	origin	0.064122	1
+chronic_ischaemic_heart_disease_i25	U	single	0.47129	0.12767	7484	South Asian	origin		2.103
+dyslipidaemia_e78	U	single	0.276	0.10683	7484	South Asian	origin		1.6057
+educational_qualification	U	single	0.46105	0.062719	7060	South Asian	origin		1
+ever_smoked	U	single	0.35662	0.10957	7373	South Asian	origin		1.7018
+hand_grip_strength	U	single	0.38226	0.070568	7410	South Asian	origin		1
+hypertension_i10	U	single	0.32742	0.10014	7484	South Asian	origin		1.572
+type2_diabetes_e11	U	single	0.26963	0.10873	7484	South Asian	origin		1.7723
+whr	U	single	0.19709	0.057891	7411	South Asian	origin		1
+chronic_ischaemic_heart_disease_i25	U	8bin	0.43307	0.147	7484	South Asian	origin	0.15454	2.103
+dyslipidaemia_e78	U	8bin	0.24207	0.11637	7484	South Asian	origin	0.12233	1.6057
+educational_qualification	U	8bin	0.56697	0.07269	7060	South Asian	origin	0.076414	1
+ever_smoked	U	8bin	0.40871	0.12246	7373	South Asian	origin	0.12874	1.7018
+hand_grip_strength	U	8bin	0.36973	0.075359	7410	South Asian	origin	0.07922	1
+hypertension_i10	U	8bin	0.4324	0.11178	7484	South Asian	origin	0.11751	1.572
+type2_diabetes_e11	U	8bin	0.32384	0.12607	7484	South Asian	origin	0.13253	1.7723
+whr	U	8bin	0.27123	0.071319	7411	South Asian	origin	0.074973	1
+educational_qualification	XA	single	0.43926	0.058177	8087	South Asian	origin		1
+hand_grip_strength	XA	single	0.3506	0.05386	8481	South Asian	origin		1
+whr	XA	single	0.16764	0.05429	8482	South Asian	origin		1
+ever_smoked	XA	single	0.25287	0.095113	8439	South Asian	origin		1.7083
+chronic_ischaemic_heart_disease_i25	XA	single	0.37922	0.11207	8566	South Asian	origin		2.1229
+dyslipidaemia_e78	XA	single	0.28794	0.097308	8566	South Asian	origin		1.6058
+hypertension_i10	XA	single	0.22842	0.083263	8566	South Asian	origin		1.5724
+type2_diabetes_e11	XA	single	0.33446	0.097065	8566	South Asian	origin		1.7761
+educational_qualification	XA	8bin	0.54881	0.064446	8087	South Asian	origin	0.067706	1
+hand_grip_strength	XA	8bin	0.34421	0.058821	8481	South Asian	origin	0.061797	1
+whr	XA	8bin	0.22302	0.062006	8482	South Asian	origin	0.065143	1
+ever_smoked	XA	8bin	0.33668	0.10732	8439	South Asian	origin	0.11274	1.7083
+chronic_ischaemic_heart_disease_i25	XA	8bin	0.38821	0.13272	8566	South Asian	origin	0.13943	2.1229
+dyslipidaemia_e78	XA	8bin	0.25109	0.10738	8566	South Asian	origin	0.11281	1.6058
+hypertension_i10	XA	8bin	0.31399	0.096153	8566	South Asian	origin	0.10102	1.5724
+type2_diabetes_e11	XA	8bin	0.40894	0.11462	8566	South Asian	origin	0.12042	1.7761
+alanine_aminotransferase	U	single	0.24103	0.046469	11597	White British 12k	base		1
+albumin	U	single	0.22573	0.046823	10666	White British 12k	base		1
+alka_phos	U	single	0.51304	0.14555	11602	White British 12k	base		1
+apo_b	U	single	0.34637	0.18208	11552	White British 12k	base		1
+asp_at	U	single	0.26694	0.050961	11560	White British 12k	base		1
+blood_mscv	U	single	0.30836	0.054322	11595	White British 12k	base		1
+blood_platelet	U	single	0.37495	0.054595	11825	White British 12k	base		1
+blood_rbc_count	U	single	0.3507	0.061703	11825	White British 12k	base		1
+bmi	U	single	0.3559	0.047376	12116	White British 12k	base		1
+bp_systolic	U	single	0.13948	0.046555	11510	White British 12k	base		1
+calcium	U	single	0.11947	0.052776	10661	White British 12k	base		1
+creatinine	U	single	0.27111	0.047823	11599	White British 12k	base		1
+cystatin_c	U	single	0.49006	0.083907	11605	White British 12k	base		1
+diastolic_blood_pressure	U	single	0.14472	0.04652	11510	White British 12k	base		1
+fluid_intelligence_score	U	single	0.33324	0.097527	5144	White British 12k	base		1
+ggt	U	single	0.3485	0.05354	11599	White British 12k	base		1
+glucose	U	single	0.15808	0.052682	10661	White British 12k	base		1
+haemoglobin_concentration	U	single	0.187	0.045274	11825	White British 12k	base		1
+hba1c	U	single	0.28335	0.054603	11592	White British 12k	base		1
+hdl	U	single	0.55108	0.13618	10665	White British 12k	base		1
+heel_bone_mineral_density	U	single	0.3457	0.084924	7048	White British 12k	base		1
+height	U	single	0.73825	0.057801	12125	White British 12k	base		1
+igf_1	U	single	0.35967	0.05239	11544	White British 12k	base		1
+ldl	U	single	0.28077	0.10218	11586	White British 12k	base		1
+neuroticism_score	U	single	0.14189	0.053332	9837	White British 12k	base		1
+sleep_duration	U	single	0.070346	0.046391	12080	White British 12k	base		1
+testosterone	U	single	0.13624	0.050156	10546	White British 12k	base		1
+triglycerides	U	single	0.37409	0.088118	11600	White British 12k	base		1
+urate	U	single	0.33455	0.15703	11585	White British 12k	base		1
+urea	U	single	0.10858	0.045229	11599	White British 12k	base		1
+vitamin_d	U	single	0.28096	0.06185	11077	White British 12k	base		1
+white_blood_cell_count	U	single	0.30701	0.048126	11825	White British 12k	base		1
+alanine_aminotransferase	U	8bin	0.19823	0.050134	11597	White British 12k	base	0.050475	1
+albumin	U	8bin	0.20001	0.054383	10666	White British 12k	base	0.054756	1
+alka_phos	U	8bin	0.29486	0.082233	11602	White British 12k	base	0.083067	1
+apo_b	U	8bin	0.20105	0.089198	11552	White British 12k	base	0.089812	1
+asp_at	U	8bin	0.22775	0.056529	11560	White British 12k	base	0.056965	1
+blood_mscv	U	8bin	0.25824	0.056825	11595	White British 12k	base	0.057322	1
+blood_platelet	U	8bin	0.29472	0.055016	11825	White British 12k	base	0.055574	1
+blood_rbc_count	U	8bin	0.26663	0.051968	11825	White British 12k	base	0.052439	1
+bmi	U	8bin	0.26146	0.048808	12116	White British 12k	base	0.049241	1
+bp_systolic	U	8bin	0.15806	0.055986	11510	White British 12k	base	0.056307	1
+calcium	U	8bin	0.05829	0.054931	10661	White British 12k	base	0.055151	1
+creatinine	U	8bin	0.2215	0.050759	11599	White British 12k	base	0.05114	1
+cystatin_c	U	8bin	0.37512	0.076868	11605	White British 12k	base	0.077922	1
+diastolic_blood_pressure	U	8bin	0.12492	0.054804	11510	White British 12k	base	0.05508	1
+fluid_intelligence_score	U	8bin	0.37667	0.10816	5144	White British 12k	base	0.10965	1
+ggt	U	8bin	0.30337	0.058061	11599	White British 12k	base	0.05867	1
+glucose	U	8bin	0.16961	0.057721	10661	White British 12k	base	0.058069	1
+haemoglobin_concentration	U	8bin	0.11153	0.050676	11825	White British 12k	base	0.050918	1
+hba1c	U	8bin	0.17421	0.058452	11592	White British 12k	base	0.058811	1
+hdl	U	8bin	0.38813	0.082586	10665	White British 12k	base	0.083771	1
+heel_bone_mineral_density	U	8bin	0.23033	0.091542	7048	White British 12k	base	0.092256	1
+height	U	8bin	0.61375	0.051111	12125	White British 12k	base	0.052544	1
+igf_1	U	8bin	0.2754	0.056152	11544	White British 12k	base	0.056679	1
+ldl	U	8bin	0.19685	0.062115	11586	White British 12k	base	0.062535	1
+neuroticism_score	U	8bin	0.12714	0.061893	9837	White British 12k	base	0.062207	1
+sleep_duration	U	8bin	0.020213	0.055017	12080	White British 12k	base	0.055221	1
+testosterone	U	8bin	0.061838	0.057123	10546	White British 12k	base	0.057354	1
+triglycerides	U	8bin	0.25068	0.063008	11600	White British 12k	base	0.063543	1
+urate	U	8bin	0.17478	0.087767	11585	White British 12k	base	0.088308	1
+urea	U	8bin	0.075501	0.05281	11599	White British 12k	base	0.053032	1
+vitamin_d	U	8bin	0.29049	0.062248	11077	White British 12k	base	0.062869	1
+white_blood_cell_count	U	8bin	0.22408	0.051504	11825	White British 12k	base	0.051895	1
+alanine_aminotransferase	XA	single	0.24711	0.043383	13902	White British 12k	base		1
+albumin	XA	single	0.20512	0.042361	12769	White British 12k	base		1
+alka_phos	XA	single	0.47376	0.14052	13907	White British 12k	base		1
+apo_b	XA	single	0.35717	0.1853	13853	White British 12k	base		1
+asp_at	XA	single	0.2818	0.046224	13855	White British 12k	base		1
+blood_mscv	XA	single	0.30673	0.050465	13906	White British 12k	base		1
+blood_platelet	XA	single	0.35413	0.047808	14168	White British 12k	base		1
+blood_rbc_count	XA	single	0.34329	0.060518	14168	White British 12k	base		1
+bmi	XA	single	0.33111	0.041395	14516	White British 12k	base		1
+bp_systolic	XA	single	0.18935	0.039792	13776	White British 12k	base		1
+calcium	XA	single	0.14181	0.044679	12760	White British 12k	base		1
+creatinine	XA	single	0.23421	0.042332	13903	White British 12k	base		1
+cystatin_c	XA	single	0.45992	0.080443	13908	White British 12k	base		1
+diastolic_blood_pressure	XA	single	0.17202	0.040951	13776	White British 12k	base		1
+fluid_intelligence_score	XA	single	0.35866	0.088134	6064	White British 12k	base		1
+ggt	XA	single	0.3341	0.049786	13902	White British 12k	base		1
+glucose	XA	single	0.14611	0.044609	12759	White British 12k	base		1
+haemoglobin_concentration	XA	single	0.2419	0.03797	14168	White British 12k	base		1
+hba1c	XA	single	0.29257	0.046393	13883	White British 12k	base		1
+hdl	XA	single	0.55052	0.12976	12766	White British 12k	base		1
+heel_bone_mineral_density	XA	single	0.32175	0.070248	8547	White British 12k	base		1
+height	XA	single	0.7197	0.057169	14530	White British 12k	base		1
+igf_1	XA	single	0.35204	0.043953	13832	White British 12k	base		1
+ldl	XA	single	0.26822	0.10473	13888	White British 12k	base		1
+neuroticism_score	XA	single	0.17749	0.047642	11810	White British 12k	base		1
+sleep_duration	XA	single	0.083686	0.038497	14482	White British 12k	base		1
+testosterone	XA	single	0.16438	0.043184	12633	White British 12k	base		1
+triglycerides	XA	single	0.38128	0.078865	13903	White British 12k	base		1
+urate	XA	single	0.34398	0.16202	13889	White British 12k	base		1
+urea	XA	single	0.10073	0.036429	13902	White British 12k	base		1
+vitamin_d	XA	single	0.24593	0.053918	13284	White British 12k	base		1
+white_blood_cell_count	XA	single	0.31265	0.044155	14168	White British 12k	base		1
+alanine_aminotransferase	XA	8bin	0.18796	0.043763	13902	White British 12k	base	0.044112	1
+albumin	XA	8bin	0.16845	0.047162	12769	White British 12k	base	0.04751	1
+alka_phos	XA	8bin	0.29431	0.077535	13907	White British 12k	base	0.078485	1
+apo_b	XA	8bin	0.21195	0.088918	13853	White British 12k	base	0.089701	1
+asp_at	XA	8bin	0.24713	0.051226	13855	White British 12k	base	0.051747	1
+blood_mscv	XA	8bin	0.24274	0.05196	13906	White British 12k	base	0.052479	1
+blood_platelet	XA	8bin	0.25255	0.047444	14168	White British 12k	base	0.047937	1
+blood_rbc_count	XA	8bin	0.28093	0.047264	14168	White British 12k	base	0.047814	1
+bmi	XA	8bin	0.25044	0.043527	14516	White British 12k	base	0.043976	1
+bp_systolic	XA	8bin	0.20396	0.04691	13776	White British 12k	base	0.04731	1
+calcium	XA	8bin	0.078574	0.041622	12760	White British 12k	base	0.041842	1
+creatinine	XA	8bin	0.16884	0.04393	13903	White British 12k	base	0.044254	1
+cystatin_c	XA	8bin	0.33879	0.070584	13908	White British 12k	base	0.071605	1
+diastolic_blood_pressure	XA	8bin	0.17307	0.045782	13776	White British 12k	base	0.046126	1
+fluid_intelligence_score	XA	8bin	0.36475	0.10162	6064	White British 12k	base	0.10323	1
+ggt	XA	8bin	0.28558	0.054629	13902	White British 12k	base	0.055276	1
+glucose	XA	8bin	0.14759	0.049353	12759	White British 12k	base	0.049687	1
+haemoglobin_concentration	XA	8bin	0.18252	0.040839	14168	White British 12k	base	0.041158	1
+hba1c	XA	8bin	0.20647	0.049484	13883	White British 12k	base	0.04991	1
+hdl	XA	8bin	0.37525	0.076299	12766	White British 12k	base	0.077555	1
+heel_bone_mineral_density	XA	8bin	0.1972	0.075336	8547	White British 12k	base	0.07596	1
+height	XA	8bin	0.60172	0.047381	14530	White British 12k	base	0.048891	1
+igf_1	XA	8bin	0.26337	0.045897	13832	White British 12k	base	0.046395	1
+ldl	XA	8bin	0.18284	0.05957	13888	White British 12k	base	0.060036	1
+neuroticism_score	XA	8bin	0.16638	0.050029	11810	White British 12k	base	0.050395	1
+sleep_duration	XA	8bin	0.042448	0.045608	14482	White British 12k	base	0.045827	1
+testosterone	XA	8bin	0.11438	0.045933	12633	White British 12k	base	0.046207	1
+triglycerides	XA	8bin	0.26449	0.055794	13903	White British 12k	base	0.056402	1
+urate	XA	8bin	0.19385	0.086994	13889	White British 12k	base	0.087706	1
+urea	XA	8bin	0.065835	0.043417	13902	White British 12k	base	0.043638	1
+vitamin_d	XA	8bin	0.24757	0.051926	13284	White British 12k	base	0.052455	1
+white_blood_cell_count	XA	8bin	0.22444	0.044676	14168	White British 12k	base	0.045091	1
+chronic_ischaemic_heart_disease_i25	U	single	0.16614	0.11024	12148	White British 12k	base		2.7646
+dyslipidaemia_e78	U	single	0.33744	0.097267	12148	White British 12k	base		1.8498
+educational_qualification	U	single	0.35243	0.045453	12028	White British 12k	base		1
+ever_smoked	U	single	0.023811	0.068506	12116	White British 12k	base		1.6165
+hand_grip_strength	U	single	0.17606	0.041326	12129	White British 12k	base		1
+hypertension_i10	U	single	0.3381	0.078287	12148	White British 12k	base		1.6066
+type2_diabetes_e11	U	single	0.51501	0.14494	12148	White British 12k	base		3.2506
+whr	U	single	0.22596	0.042367	12131	White British 12k	base		1
+chronic_ischaemic_heart_disease_i25	U	8bin	0.19041	0.13153	12148	White British 12k	base	0.13253	2.7646
+dyslipidaemia_e78	U	8bin	0.26333	0.099508	12148	White British 12k	base	0.10026	1.8498
+educational_qualification	U	8bin	0.33419	0.048294	12028	White British 12k	base	0.048659	1
+ever_smoked	U	8bin	-0.036547	0.076847	12116	White British 12k	base	0.077427	1.6165
+hand_grip_strength	U	8bin	0.13969	0.047965	12129	White British 12k	base	0.048327	1
+hypertension_i10	U	8bin	0.25955	0.086081	12148	White British 12k	base	0.086731	1.6066
+type2_diabetes_e11	U	8bin	0.47063	0.16114	12148	White British 12k	base	0.16235	3.2506
+whr	U	8bin	0.16312	0.046585	12131	White British 12k	base	0.046937	1
+chronic_ischaemic_heart_disease_i25	XA	single	0.18914	0.094192	14558	White British 12k	base		2.7692
+dyslipidaemia_e78	XA	single	0.28562	0.0816	14558	White British 12k	base		1.8541
+educational_qualification	XA	single	0.33279	0.0401	14417	White British 12k	base		1
+ever_smoked	XA	single	0.10063	0.060756	14519	White British 12k	base		1.6146
+hand_grip_strength	XA	single	0.18455	0.034186	14534	White British 12k	base		1
+hypertension_i10	XA	single	0.3473	0.063645	14558	White British 12k	base		1.6067
+type2_diabetes_e11	XA	single	0.43838	0.12203	14558	White British 12k	base		3.2065
+whr	XA	single	0.22764	0.036929	14535	White British 12k	base		1
+chronic_ischaemic_heart_disease_i25	XA	8bin	0.19972	0.11564	14558	White British 12k	base	0.11665	2.7692
+dyslipidaemia_e78	XA	8bin	0.23559	0.083142	14558	White British 12k	base	0.083866	1.8541
+educational_qualification	XA	8bin	0.3088	0.042457	14417	White British 12k	base	0.042827	1
+ever_smoked	XA	8bin	0.061447	0.070997	14519	White British 12k	base	0.071615	1.6146
+hand_grip_strength	XA	8bin	0.1633	0.041678	14534	White British 12k	base	0.042041	1
+hypertension_i10	XA	8bin	0.27418	0.069897	14558	White British 12k	base	0.070506	1.6067
+type2_diabetes_e11	XA	8bin	0.37726	0.13661	14558	White British 12k	base	0.1378	3.2065
+whr	XA	8bin	0.17806	0.041815	14535	White British 12k	base	0.042179	1
+alanine_aminotransferase	U	single	0.23529	0.046851	11597	White British 12k	origin		1
+albumin	U	single	0.2166	0.047088	10666	White British 12k	origin		1
+alka_phos	U	single	0.51015	0.1452	11602	White British 12k	origin		1
+apo_b	U	single	0.34819	0.18228	11552	White British 12k	origin		1
+asp_at	U	single	0.26509	0.051382	11560	White British 12k	origin		1
+blood_mscv	U	single	0.31914	0.054116	11595	White British 12k	origin		1
+blood_platelet	U	single	0.37329	0.055388	11825	White British 12k	origin		1
+blood_rbc_count	U	single	0.36078	0.062689	11825	White British 12k	origin		1
+bmi	U	single	0.35372	0.047493	12116	White British 12k	origin		1
+bp_systolic	U	single	0.1415	0.047453	11510	White British 12k	origin		1
+calcium	U	single	0.12852	0.053894	10661	White British 12k	origin		1
+creatinine	U	single	0.27089	0.048196	11599	White British 12k	origin		1
+cystatin_c	U	single	0.49264	0.083697	11605	White British 12k	origin		1
+diastolic_blood_pressure	U	single	0.14377	0.046983	11510	White British 12k	origin		1
+fluid_intelligence_score	U	single	0.2916	0.10048	5144	White British 12k	origin		1
+ggt	U	single	0.34479	0.053989	11599	White British 12k	origin		1
+glucose	U	single	0.17141	0.052935	10661	White British 12k	origin		1
+haemoglobin_concentration	U	single	0.18346	0.045374	11825	White British 12k	origin		1
+hba1c	U	single	0.28885	0.054949	11592	White British 12k	origin		1
+hdl	U	single	0.54608	0.13656	10665	White British 12k	origin		1
+heel_bone_mineral_density	U	single	0.35459	0.085462	7048	White British 12k	origin		1
+height	U	single	0.72622	0.05767	12125	White British 12k	origin		1
+igf_1	U	single	0.36159	0.052356	11544	White British 12k	origin		1
+ldl	U	single	0.28253	0.10259	11586	White British 12k	origin		1
+neuroticism_score	U	single	0.14118	0.054139	9837	White British 12k	origin		1
+sleep_duration	U	single	0.067599	0.046549	12080	White British 12k	origin		1
+testosterone	U	single	0.12833	0.049826	10546	White British 12k	origin		1
+triglycerides	U	single	0.36408	0.088226	11600	White British 12k	origin		1
+urate	U	single	0.33369	0.15723	11585	White British 12k	origin		1
+urea	U	single	0.10915	0.045358	11599	White British 12k	origin		1
+vitamin_d	U	single	0.27098	0.061301	11077	White British 12k	origin		1
+white_blood_cell_count	U	single	0.30467	0.047718	11825	White British 12k	origin		1
+alanine_aminotransferase	U	8bin	0.19249	0.050251	11597	White British 12k	origin	0.050593	1
+albumin	U	8bin	0.19242	0.054951	10666	White British 12k	origin	0.055328	1
+alka_phos	U	8bin	0.29469	0.081686	11602	White British 12k	origin	0.082515	1
+apo_b	U	8bin	0.20376	0.088855	11552	White British 12k	origin	0.089466	1
+asp_at	U	8bin	0.22596	0.056848	11560	White British 12k	origin	0.057286	1
+blood_mscv	U	8bin	0.2501	0.057216	11595	White British 12k	origin	0.057716	1
+blood_platelet	U	8bin	0.29365	0.055151	11825	White British 12k	origin	0.05571	1
+blood_rbc_count	U	8bin	0.2662	0.051976	11825	White British 12k	origin	0.052447	1
+bmi	U	8bin	0.26083	0.048587	12116	White British 12k	origin	0.049018	1
+bp_systolic	U	8bin	0.15563	0.056161	11510	White British 12k	origin	0.056483	1
+calcium	U	8bin	0.07176	0.055093	10661	White British 12k	origin	0.055313	1
+creatinine	U	8bin	0.22087	0.050825	11599	White British 12k	origin	0.051207	1
+cystatin_c	U	8bin	0.37321	0.076099	11605	White British 12k	origin	0.077142	1
+diastolic_blood_pressure	U	8bin	0.12293	0.054822	11510	White British 12k	origin	0.055098	1
+fluid_intelligence_score	U	8bin	0.31952	0.11205	5144	White British 12k	origin	0.11359	1
+ggt	U	8bin	0.29923	0.058343	11599	White British 12k	origin	0.058955	1
+glucose	U	8bin	0.17706	0.057088	10661	White British 12k	origin	0.057432	1
+haemoglobin_concentration	U	8bin	0.10265	0.049898	11825	White British 12k	origin	0.050137	1
+hba1c	U	8bin	0.17492	0.058105	11592	White British 12k	origin	0.058462	1
+hdl	U	8bin	0.3815	0.082554	10665	White British 12k	origin	0.083738	1
+heel_bone_mineral_density	U	8bin	0.23398	0.091475	7048	White British 12k	origin	0.092188	1
+height	U	8bin	0.59846	0.051663	12125	White British 12k	origin	0.053112	1
+igf_1	U	8bin	0.27423	0.056061	11544	White British 12k	origin	0.056587	1
+ldl	U	8bin	0.20019	0.061987	11586	White British 12k	origin	0.062406	1
+neuroticism_score	U	8bin	0.1304	0.062125	9837	White British 12k	origin	0.06244	1
+sleep_duration	U	8bin	0.019028	0.054978	12080	White British 12k	origin	0.055182	1
+testosterone	U	8bin	0.056748	0.056656	10546	White British 12k	origin	0.056885	1
+triglycerides	U	8bin	0.24032	0.062598	11600	White British 12k	origin	0.06313	1
+urate	U	8bin	0.17154	0.087386	11585	White British 12k	origin	0.087924	1
+urea	U	8bin	0.069894	0.052912	11599	White British 12k	origin	0.053135	1
+vitamin_d	U	8bin	0.27329	0.061519	11077	White British 12k	origin	0.062132	1
+white_blood_cell_count	U	8bin	0.2164	0.051309	11825	White British 12k	origin	0.051699	1
+albumin	XA	single	0.1972	0.042405	12769	White British 12k	origin		1
+alka_phos	XA	single	0.47273	0.14032	13907	White British 12k	origin		1
+alanine_aminotransferase	XA	single	0.24834	0.043854	13902	White British 12k	origin		1
+asp_at	XA	single	0.28297	0.046534	13855	White British 12k	origin		1
+creatinine	XA	single	0.23539	0.042522	13903	White British 12k	origin		1
+cystatin_c	XA	single	0.46131	0.080021	13908	White British 12k	origin		1
+ggt	XA	single	0.33231	0.050114	13902	White British 12k	origin		1
+glucose	XA	single	0.15894	0.044649	12759	White British 12k	origin		1
+hba1c	XA	single	0.29624	0.046747	13883	White British 12k	origin		1
+hdl	XA	single	0.54765	0.13033	12766	White British 12k	origin		1
+igf_1	XA	single	0.35356	0.043802	13832	White British 12k	origin		1
+ldl	XA	single	0.27225	0.10525	13888	White British 12k	origin		1
+testosterone	XA	single	0.16063	0.043251	12633	White British 12k	origin		1
+triglycerides	XA	single	0.37222	0.078882	13903	White British 12k	origin		1
+urate	XA	single	0.34599	0.16248	13889	White British 12k	origin		1
+vitamin_d	XA	single	0.24108	0.053409	13284	White British 12k	origin		1
+blood_rbc_count	XA	single	0.35155	0.061468	14168	White British 12k	origin		1
+white_blood_cell_count	XA	single	0.31487	0.043935	14168	White British 12k	origin		1
+blood_platelet	XA	single	0.35635	0.048641	14168	White British 12k	origin		1
+blood_mscv	XA	single	0.31155	0.050615	13906	White British 12k	origin		1
+haemoglobin_concentration	XA	single	0.2391	0.038267	14168	White British 12k	origin		1
+height	XA	single	0.71126	0.056901	14530	White British 12k	origin		1
+bmi	XA	single	0.32851	0.041495	14516	White British 12k	origin		1
+bp_systolic	XA	single	0.18496	0.040322	13776	White British 12k	origin		1
+diastolic_blood_pressure	XA	single	0.1663	0.040929	13776	White British 12k	origin		1
+heel_bone_mineral_density	XA	single	0.32836	0.070922	8547	White British 12k	origin		1
+calcium	XA	single	0.1529	0.045429	12760	White British 12k	origin		1
+urea	XA	single	0.10238	0.036525	13902	White British 12k	origin		1
+apo_b	XA	single	0.36115	0.18583	13853	White British 12k	origin		1
+fluid_intelligence_score	XA	single	0.32998	0.088392	6064	White British 12k	origin		1
+neuroticism_score	XA	single	0.17836	0.04848	11810	White British 12k	origin		1
+sleep_duration	XA	single	0.083744	0.038635	14482	White British 12k	origin		1
+albumin	XA	8bin	0.16265	0.04772	12769	White British 12k	origin	0.048072	1
+alka_phos	XA	8bin	0.29575	0.07726	13907	White British 12k	origin	0.078207	1
+alanine_aminotransferase	XA	8bin	0.18854	0.044043	13902	White British 12k	origin	0.044395	1
+asp_at	XA	8bin	0.24853	0.051186	13855	White British 12k	origin	0.051706	1
+creatinine	XA	8bin	0.17111	0.04392	13903	White British 12k	origin	0.044244	1
+cystatin_c	XA	8bin	0.33716	0.069669	13908	White British 12k	origin	0.070676	1
+ggt	XA	8bin	0.28276	0.054955	13902	White British 12k	origin	0.055606	1
+glucose	XA	8bin	0.1517	0.048361	12759	White British 12k	origin	0.048688	1
+hba1c	XA	8bin	0.20742	0.049425	13883	White British 12k	origin	0.049851	1
+hdl	XA	8bin	0.36883	0.076283	12766	White British 12k	origin	0.077539	1
+igf_1	XA	8bin	0.26232	0.045575	13832	White British 12k	origin	0.04607	1
+ldl	XA	8bin	0.18804	0.059643	13888	White British 12k	origin	0.06011	1
+testosterone	XA	8bin	0.11257	0.045855	12633	White British 12k	origin	0.046128	1
+triglycerides	XA	8bin	0.25593	0.055534	13903	White British 12k	origin	0.056139	1
+urate	XA	8bin	0.19418	0.086862	13889	White British 12k	origin	0.087573	1
+vitamin_d	XA	8bin	0.23127	0.051718	13284	White British 12k	origin	0.052244	1
+blood_rbc_count	XA	8bin	0.28097	0.047319	14168	White British 12k	origin	0.047869	1
+white_blood_cell_count	XA	8bin	0.22126	0.044502	14168	White British 12k	origin	0.044915	1
+blood_platelet	XA	8bin	0.25541	0.048069	14168	White British 12k	origin	0.048569	1
+blood_mscv	XA	8bin	0.22866	0.051147	13906	White British 12k	origin	0.051658	1
+haemoglobin_concentration	XA	8bin	0.17575	0.040698	14168	White British 12k	origin	0.041016	1
+height	XA	8bin	0.58991	0.047452	14530	White British 12k	origin	0.048964	1
+bmi	XA	8bin	0.24802	0.043315	14516	White British 12k	origin	0.043762	1
+bp_systolic	XA	8bin	0.19278	0.046869	13776	White British 12k	origin	0.047269	1
+diastolic_blood_pressure	XA	8bin	0.16339	0.045675	13776	White British 12k	origin	0.046018	1
+heel_bone_mineral_density	XA	8bin	0.19933	0.075914	8547	White British 12k	origin	0.076543	1
+calcium	XA	8bin	0.092983	0.041957	12760	White British 12k	origin	0.042179	1
+urea	XA	8bin	0.064857	0.043528	13902	White British 12k	origin	0.043749	1
+apo_b	XA	8bin	0.21744	0.088856	13853	White British 12k	origin	0.089639	1
+fluid_intelligence_score	XA	8bin	0.32349	0.10187	6064	White British 12k	origin	0.10348	1
+neuroticism_score	XA	8bin	0.16764	0.050178	11810	White British 12k	origin	0.050545	1
+sleep_duration	XA	8bin	0.043242	0.045709	14482	White British 12k	origin	0.045928	1
+chronic_ischaemic_heart_disease_i25	U	single	0.16064	0.11129	12148	White British 12k	origin		2.7646
+dyslipidaemia_e78	U	single	0.29747	0.095233	12148	White British 12k	origin		1.8498
+educational_qualification	U	single	0.32307	0.045226	12028	White British 12k	origin		1
+ever_smoked	U	single	0.021229	0.069278	12116	White British 12k	origin		1.6165
+hand_grip_strength	U	single	0.17348	0.04279	12129	White British 12k	origin		1
+hypertension_i10	U	single	0.3192	0.078453	12148	White British 12k	origin		1.6066
+type2_diabetes_e11	U	single	0.52289	0.14514	12148	White British 12k	origin		3.2506
+whr	U	single	0.22972	0.042955	12131	White British 12k	origin		1
+chronic_ischaemic_heart_disease_i25	U	8bin	0.17639	0.13225	12148	White British 12k	origin	0.13324	2.7646
+dyslipidaemia_e78	U	8bin	0.21765	0.097856	12148	White British 12k	origin	0.098594	1.8498
+educational_qualification	U	8bin	0.3022	0.048245	12028	White British 12k	origin	0.048609	1
+ever_smoked	U	8bin	-0.046113	0.077636	12116	White British 12k	origin	0.078222	1.6165
+hand_grip_strength	U	8bin	0.12617	0.049463	12129	White British 12k	origin	0.049837	1
+hypertension_i10	U	8bin	0.22672	0.085742	12148	White British 12k	origin	0.086389	1.6066
+type2_diabetes_e11	U	8bin	0.46756	0.1604	12148	White British 12k	origin	0.16161	3.2506
+whr	U	8bin	0.16975	0.047027	12131	White British 12k	origin	0.047382	1
+educational_qualification	XA	single	0.30416	0.039289	14417	White British 12k	origin		1
+hand_grip_strength	XA	single	0.18013	0.034931	14534	White British 12k	origin		1
+whr	XA	single	0.22901	0.037722	14535	White British 12k	origin		1
+ever_smoked	XA	single	0.10104	0.060896	14519	White British 12k	origin		1.6146
+chronic_ischaemic_heart_disease_i25	XA	single	0.18626	0.095085	14558	White British 12k	origin		2.7692
+dyslipidaemia_e78	XA	single	0.25433	0.079324	14558	White British 12k	origin		1.8541
+hypertension_i10	XA	single	0.33514	0.063959	14558	White British 12k	origin		1.6067
+type2_diabetes_e11	XA	single	0.44903	0.12199	14558	White British 12k	origin		3.2065
+educational_qualification	XA	8bin	0.2853	0.042097	14417	White British 12k	origin	0.042464	1
+hand_grip_strength	XA	8bin	0.15141	0.043059	14534	White British 12k	origin	0.043434	1
+whr	XA	8bin	0.18185	0.042265	14535	White British 12k	origin	0.042633	1
+ever_smoked	XA	8bin	0.057342	0.071531	14519	White British 12k	origin	0.072154	1.6146
+chronic_ischaemic_heart_disease_i25	XA	8bin	0.18942	0.116	14558	White British 12k	origin	0.11701	2.7692
+dyslipidaemia_e78	XA	8bin	0.19651	0.081511	14558	White British 12k	origin	0.082221	1.8541
+hypertension_i10	XA	8bin	0.24914	0.069627	14558	White British 12k	origin	0.070233	1.6067
+type2_diabetes_e11	XA	8bin	0.38525	0.1359	14558	White British 12k	origin	0.13709	3.2065
