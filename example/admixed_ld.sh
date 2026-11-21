@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # SUMMIT-MIX on simulated data, end to end (about a minute): LD scores of an admixed cohort without its in-sample LD,
 # composed from source panels, the GWAS summary statistics and the cohort's curve (curve mode) or an admixture date
-# (date mode); h2 and genetic correlation with them and with in-sample LD scores; a regional LD matrix.
+# (date mode); h2 and genetic correlation with them and with in-sample LD scores; two-stage fine-mapping.
 # For real data see admixed_ld_real_data.sh.
 set -euo pipefail
 
@@ -46,9 +46,15 @@ for ld in composed_curve composed_date insample; do
     --annot "$D/cohort.annot" --num-threads 2 --out "./out/admixed_ld_rg_$ld"
 done
 
-# 6. A regional LD matrix (curve mode) for fine-mapping, with each SNP's counted allele in .snps.tsv; align the
-#    z-scores to it before fitting SuSiE
+# 6. Fine-mapping: a regional LD matrix (curve mode) with the trait's z-scores aligned to its counted alleles and the
+#    predicted error variance of its entries; then SuSiE twice, the second time with the residual variance s^2 that
+#    the first fit's posterior and the predicted error give (needs R with susieR; finemap-variance gives the same s^2)
 "${SUMMIT[@]}" admixed-ld matrix --ref "$D/ref_clean" --params "$D/composed_curve.admixed_ld.json" \
-  --curve "$D/cohort" --region 1:5000000-8000000 --out "$D/region1"
+  --curve "$D/cohort" --region 1:5000000-8000000 --sumstats "$D/trait.sumstats" --error-variance --out "$D/region1"
+if command -v Rscript >/dev/null 2>&1 && Rscript -e 'quit(status = !requireNamespace("susieR", quietly = TRUE))'; then
+  Rscript ./finemap_two_stage.R "$D/region1"
+  "${SUMMIT[@]}" admixed-ld finemap-variance --matrix "$D/region1" --posterior "$D/region1.posterior1.tsv" \
+    --out "$D/region1"
+fi
 
 echo "SUMMIT-MIX example finished; LD scores in $D, fits in ./out/admixed_ld_*"

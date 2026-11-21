@@ -276,3 +276,62 @@ def test_per_sample_size_files_only_when_they_differ(small, tmp_path):
             assert len(files) == 2 and os.path.exists(tmp_path / f"ld_{tag}.n_groups.tsv")
         else:
             assert files == [] and all(g.get("merged") for g in p["n_groups"])
+
+
+# ----------------------------------------------------------------------------------------------- fine-mapping error
+def test_delta_method_variance_of_a_sample_correlation():
+    """var_corr / n against the variance of sample correlations of genotypes drawn under Hardy-Weinberg equilibrium
+    from two-SNP haplotypes with LD."""
+    from summit.admixed_ld.finemap import var_corr
+    rng = np.random.default_rng(11)
+    n, reps = 400, 3000
+    for pa, pb, D in ((0.3, 0.4, 0.06), (0.1, 0.5, 0.02), (0.45, 0.2, -0.05)):
+        hp = np.array([pa * pb + D, pa * (1 - pb) - D, (1 - pa) * pb - D, (1 - pa) * (1 - pb) + D])
+        h = rng.choice(4, size=(reps, 2 * n), p=hp)
+        a, b = (h <= 1).astype(float), np.isin(h, (0, 2)).astype(float)
+        ga, gb = a[:, 0::2] + a[:, 1::2], b[:, 0::2] + b[:, 1::2]
+        ga -= ga.mean(1, keepdims=True)
+        gb -= gb.mean(1, keepdims=True)
+        r = (ga * gb).sum(1) / np.sqrt((ga * ga).sum(1) * (gb * gb).sum(1))
+        rho = D / np.sqrt(pa * (1 - pa) * pb * (1 - pb))
+        pred = var_corr(np.array([pa, pb]), np.array([[1.0, rho], [rho, 1.0]]))[0, 1] / n
+        assert r.var() == pytest.approx(pred, rel=0.1)
+
+
+def test_matrix_aligns_z_and_predicts_its_error(small, tmp_path):
+    from summit.admixed_ld.finemap import finemap_variance, residual_variance
+    from summit.admixed_ld.matrix import compose_matrix
+    d = small["dir"]
+    compose_ldscores(str(d / "ref"), [str(d / "ss")], str(d / "annot.tsv"), str(tmp_path / "ld"), generations=8,
+                     log=quiet)
+    ss = pd.read_csv(d / "ss" / "trait0.tsv", sep="\t")
+    sw = np.arange(len(ss)) % 4 == 1                             # the GWAS counts the other allele at a quarter of SNPs
+    flipped = ss.copy()
+    flipped.loc[sw, ["A1", "A2"]] = flipped.loc[sw, ["A2", "A1"]].to_numpy()
+    flipped.loc[sw, ["BETA", "Z"]] *= -1
+    flipped.to_csv(tmp_path / "flipped.tsv", sep="\t", index=False)
+    kw = dict(region="1:1-20000000", params=str(tmp_path / "ld.admixed_ld.json"), generations=8, log=quiet)
+    R0, snp0, _ = compose_matrix(str(d / "ref"), str(tmp_path / "m0"), sumstats=str(d / "ss" / "trait0.tsv"),
+                                 keep_ambiguous=True, **kw)
+    R1, snp1, info = compose_matrix(str(d / "ref"), str(tmp_path / "m1"), sumstats=str(tmp_path / "flipped.tsv"),
+                                    keep_ambiguous=True, error_variance=True, **kw)
+    z0, z1 = (pd.read_csv(tmp_path / f"{x}.z.tsv", sep="\t") for x in ("m0", "m1"))
+    assert np.allclose(R0, R1) and np.allclose(z0.Z, z1.Z)       # the same z on the matrix's alleles
+    _, snp2, _ = compose_matrix(str(d / "ref"), str(tmp_path / "m2"), sumstats=str(tmp_path / "flipped.tsv"), **kw)
+    amb = snp1.COUNTED + snp1.OTHER
+    assert len(snp2) == int((~amb.isin(["AT", "TA", "CG", "GC"])).sum()) < len(snp1)   # ambiguous left out by default
+    z = np.load(tmp_path / "m1.ld_var.npz")
+    V = z["V"]
+    assert V.shape == R1.shape and np.allclose(V, V.T) and (np.diag(V) == 0).all() and np.isfinite(V).all()
+    off = ~np.eye(V.shape[0], dtype=bool)
+    assert V[off].mean() > 0 and float(z["n"]) == 900.0
+    compose_matrix(str(d / "ref"), str(tmp_path / "m3"), sumstats=str(tmp_path / "flipped.tsv"), keep_ambiguous=True,
+                   error_variance=True, n=1800, **kw)
+    z3 = np.load(tmp_path / "m3.ld_var.npz")                       # twice the people: half the GWAS sample's own term
+    assert np.allclose(z3["v_gwas_hap"], z["v_gwas_hap"] / 2) and np.allclose(z3["v_panel_hap"], z["v_panel_hap"])
+    eb2 = np.linspace(0.0, 4.0, V.shape[0])
+    pd.DataFrame({"SNP": snp1.SNP, "EB2": eb2}).sample(frac=1, random_state=1).to_csv(tmp_path / "post.tsv", sep="\t",
+                                                                                      index=False)
+    rec = finemap_variance(str(tmp_path / "m1"), str(tmp_path / "post.tsv"), log=quiet)
+    assert rec["s2"] == pytest.approx(1 + np.mean(V @ eb2)) == pytest.approx(residual_variance(V, eb2))
+    assert info["error_variance"]["n"] == 900.0

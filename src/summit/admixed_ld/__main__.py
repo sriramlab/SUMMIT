@@ -10,6 +10,8 @@
   summit admixed-ld derive       --geno COHORT --ref REF --name NAT --panel NAT_ANCHORS --out REF_WITH_NAT
   summit admixed-ld matrix       --ref REF_CLEAN --params PREFIX.admixed_ld.json --region CHR:START-END
                                  (--curve CURVE | --admixture-generations T) --out REGION
+  summit admixed-ld matrix ... --sumstats GWAS --error-variance      then SuSiE twice (example/finemap_two_stage.R)
+  summit admixed-ld finemap-variance --matrix REGION --posterior FIT1.tsv --out REGION
   summit admixed-ld tractor-sumstats --tractor TRACTOR.tsv --sources AFR,EUR --covariates C --out TRACKS
   summit admixed-ld track-rg     --tracks COMPOSE_PREFIX --sumstats TRACKS --annot ANNOT [--external EUR.sumstats]
                                  --out OUT
@@ -292,9 +294,28 @@ def main(argv=None):
     x.add_argument("--taper", default="auto",
                    help="taper of the panel term: auto (scale from the panel's sampling noise), none, or a scale in cM")
     x.add_argument("--no-admixture", action="store_true", help=argparse.SUPPRESS)
+    x.add_argument("--sumstats", default=None,
+                   help="the GWAS summary statistics: the matrix keeps the region's SNPs in them, and PREFIX.z.tsv holds "
+                        "their z-scores on the matrix's counted allele (strand-ambiguous SNPs left out unless "
+                        "--keep-ambiguous)")
+    x.add_argument("--keep-ambiguous", action="store_true",
+                   help="with --sumstats: keep A/T and C/G SNPs, aligned as listed")
+    x.add_argument("--error-variance", action="store_true",
+                   help="also write PREFIX.ld_var.npz and PREFIX.ld_var: the predicted variance of the error of every "
+                        "entry of the matrix, for the residual variance of the second SuSiE fit (finemap-variance)")
+    x.add_argument("--n", type=float, default=None,
+                   help="the GWAS sample size for --error-variance (default: the median N of --sumstats)")
     x.add_argument("--allow-flat-kernel-join", action="store_true",
                    help="as in compose: proceed when the curve at 2 cM is not below kappa_res(0), with the flag recorded")
     x.add_argument("--out", required=True)
+
+    fv = sub.add_parser("finemap-variance", help="residual variance s^2 of the second SuSiE fit from a matrix made with "
+                                                 "--error-variance and the first fit's posterior")
+    fv.add_argument("--matrix", required=True, help="prefix of `matrix --error-variance`")
+    fv.add_argument("--posterior", required=True,
+                    help="the first fit's posterior second moments per SNP on the z scale (columns SNP and EB2; "
+                         "susieR: colSums(alpha * mu2) / X_column_scale_factors^2)")
+    fv.add_argument("--out", required=True, help="output prefix (PREFIX.s2.json)")
 
     ts = sub.add_parser("tractor-sumstats", help="split a Tractor GWAS into one summary-statistic file per "
                                                  "local-ancestry track (sandwich SEs required)")
@@ -428,7 +449,11 @@ def _run(a, log):
         compose_matrix(a.ref, a.out, region=a.region, snps=a.snps, sources=_sources(a.sources), params=a.params,
                        curve=a.curve, generations=a.admixture_generations, decay_per_cm=a.decay_per_cm,
                        mean_ancestry=a.mean_ancestry, kappa0=a.kappa0, taper=a.taper, admixture=not a.no_admixture,
-                       allow_flat_kernel_join=a.allow_flat_kernel_join, log=log._log)
+                       allow_flat_kernel_join=a.allow_flat_kernel_join, sumstats=a.sumstats,
+                       keep_ambiguous=a.keep_ambiguous, error_variance=a.error_variance, n=a.n, log=log._log)
+    elif a.cmd == "finemap-variance":
+        from .finemap import finemap_variance
+        finemap_variance(a.matrix, a.posterior, out=a.out + ".s2.json", log=log._log)
     else:
         from .compose import compose_ldscores
         compose_ldscores(a.ref, a.sumstats, a.annot, a.out, sources=_sources(a.sources), snps=a.snps, match=a.match,

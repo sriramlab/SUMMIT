@@ -143,11 +143,41 @@ def taper_scales(ref, si, z, taus=_TAUS, max_pairs=2_000_000):
     return np.array(out_t), np.array(out_r)
 
 
+def _align_sumstats(path, z, loc, keep_ambiguous, log):
+    """The GWAS z-scores of the region's SNPs, on the matrix's counted allele: matched by SNP ID and alleles, the sign
+    flipped where the GWAS counts the other allele; strand-ambiguous SNPs are left out unless keep_ambiguous. Returns
+    (the region rows kept, z, N)."""
+    from ..sumstats.sumstats import Sumstats
+    from ._io import match_variants
+    ss = Sumstats.from_file(path, name=str(path), compute_diagnostics=False)
+    tv = pd.DataFrame({"SNP": ss.snps, "CHR": "0", "BP": 0, "COUNTED": pd.Series(ss.a1).str.upper().to_numpy(),
+                       "OTHER": pd.Series(ss.a2).str.upper().to_numpy()})
+    rv = pd.DataFrame({"SNP": z["snp"][loc].astype(str), "CHR": "0", "BP": 0, "COUNTED": z["counted"][loc].astype(str),
+                       "OTHER": z["other"][loc].astype(str)})
+    rep = {}
+    ti, ri, flip = match_variants(tv, rv, how="id", drop_ambiguous=not keep_ambiguous, report=rep)
+    if ri.size < 2:
+        raise ValueError(f"Fewer than two of the region's SNPs are in {path} with matching alleles.")
+    o = np.argsort(ri)
+    ti, ri, flip = ti[o], ri[o], flip[o]
+    zz = np.where(flip, -1.0, 1.0) * ss.z[ti]
+    log(f"[admixed-ld] matrix: {ri.size} of the region's {loc.size} SNPs in {path} ({int(flip.sum())} on the other "
+        f"allele, flipped; {rep['n_ambiguous_dropped']} strand-ambiguous left out, {rep['n_allele_mismatch']} with "
+        "other alleles)")
+    return ri, zz, ss.n[ti]
+
+
 def compose_matrix(ref_path, out, *, region=None, snps=None, sources=None, params=None, curve=None, generations=None,
                    decay_per_cm=None, mean_ancestry=None, kappa0=None, taper="auto", admixture=True,
-                   allow_flat_kernel_join=False, log=print):
+                   allow_flat_kernel_join=False, sumstats=None, keep_ambiguous=False, error_variance=False, n=None,
+                   log=print):
     """Write out.ld (text, one row per SNP), out.ld.npz (R, float64) and out.snps.tsv for a region 'CHR:START-END'
-    (base pairs, inclusive) or a file of SNP IDs on one chromosome."""
+    (base pairs, inclusive) or a file of SNP IDs on one chromosome.
+
+    sumstats: the GWAS summary statistics; the matrix is then restricted to the region's SNPs in them, and out.z.tsv
+    holds their z-scores on the matrix's counted allele. error_variance: also out.ld_var.npz and out.ld_var (text), V,
+    the predicted variance of the error of every entry of R for a GWAS of n people (finemap.py; n defaults to the
+    summary statistics' median N), for the residual variance of the second SuSiE fit (finemap-variance)."""
     t0 = time.perf_counter()
     ref = Reference(ref_path)
     sources = list(sources or ref.names[:2])
@@ -185,11 +215,18 @@ def compose_matrix(ref_path, out, *, region=None, snps=None, sources=None, param
             log(f"[admixed-ld] matrix: {ids.size - loc.size} of {ids.size} listed SNPs are not in the reference")
     if loc.size < 2:
         raise ValueError("Fewer than two reference SNPs in the region.")
+    zs = None
+    if sumstats is not None:
+        rows_kept, zz, nn = _align_sumstats(sumstats, z, loc, keep_ambiguous, log)
+        loc = loc[rows_kept]
+        zs = (zz, nn)
     V = np.column_stack([z[f"v_{s}"][loc].astype(np.float64) for s in si])
     keep = V.sum(axis=1) > 0
     if not keep.all():
         log(f"[admixed-ld] matrix: {int((~keep).sum())} SNPs without variance in every panel are left out")
         loc, V = loc[keep], V[keep]
+        if zs is not None:
+            zs = (zs[0][keep], zs[1][keep])
     p = loc.size
     a, b, lo, hi, use = _band(z, loc)
     complete = a.size == p * (p - 1) // 2
@@ -210,6 +247,7 @@ def compose_matrix(ref_path, out, *, region=None, snps=None, sources=None, param
         tau = np.full(len(si), float(taper))
         tau_note = float(taper)
     C = np.zeros((p, p))
+    pieces = dict(C_s=[], M_s=[], w0=[], T=[])                       # for the predicted error (error_variance)
     for n_, s in enumerate(si):
         Cs = np.zeros((p, p))
         cv = z[f"cov_{s}"][lo:hi][use].astype(np.float64)
@@ -225,6 +263,16 @@ def compose_matrix(ref_path, out, *, region=None, snps=None, sources=None, param
         Cs[np.arange(p), np.arange(p)] = V[:, n_]
         T = np.exp(-d / tau[n_]) if np.isfinite(tau[n_]) else 1.0
         C += m[n_] * np.exp(-kern.lam[n_] * d) * T * Cs
+        if error_variance:
+            if f"vld_{s}" in z.files or f"covvar_{s}" in z.files:
+                raise ValueError(f"--error-variance covers panels only; {sources[n_]} is a derived source.")
+            Ms = np.full((p, p), np.nan)
+            mm = z[f"m22_{s}"][lo:hi][use].astype(np.float64)
+            Ms[a, b], Ms[b, a] = mm, mm
+            pieces["C_s"].append(Cs)
+            pieces["M_s"].append(Ms)
+            pieces["w0"].append(m[n_] * np.exp(-kern.lam[n_] * d))
+            pieces["T"].append(T * np.ones_like(d))
     psd_note = None
     if admixture:
         Kd = kern(d)                                                  # p x p x k1 x k1
@@ -249,10 +297,34 @@ def compose_matrix(ref_path, out, *, region=None, snps=None, sources=None, param
     snp.to_csv(out + ".snps.tsv", sep="\t", index=False, float_format="%.6g")
     np.savez(out + ".ld.npz", R=R, snps=snp.SNP.to_numpy())
     np.savetxt(out + ".ld", R, fmt="%.6f")
+    if zs is not None:
+        snp.assign(Z=zs[0], N=zs[1])[["SNP", "CHR", "BP", "COUNTED", "OTHER", "Z", "N"]].to_csv(
+            out + ".z.tsv", sep="\t", index=False, float_format="%.8g")
+    ev_info = None
+    if error_variance:
+        from .finemap import predict_error_variance
+        N = float(n) if n is not None else (float(np.median(zs[1])) if zs is not None else None)
+        if N is None or not N > 0:
+            raise ValueError("--error-variance needs the GWAS sample size: --n, or --sumstats with an N column.")
+        ns = np.array([ref.n[sources[i]] for i in range(len(si))], np.float64)
+        pr = predict_error_variance(pieces["C_s"], pieces["M_s"], V, P, m, pieces["w0"], pieces["T"], np.diag(C).copy(),
+                                    R, ns, N)
+        off = ~np.eye(p, dtype=bool)
+        np.savez(out + ".ld_var.npz", V=pr["V"], n=N, snps=snp.SNP.to_numpy(),
+                 **{k: v for k, v in pr["parts"].items()})
+        np.savetxt(out + ".ld_var", pr["V"], fmt="%.6e")
+        ev_info = dict(n=N, panel_n=ns.tolist(), mean_offdiagonal=float(pr["V"][off].mean()),
+                       parts_mean={k: float(v[off].mean()) for k, v in pr["parts"].items()},
+                       files=[out + ".ld_var.npz", out + ".ld_var"],
+                       definition="V_jk: predicted variance of the error of R_jk from the panels' sampling (Hardy-"
+                                  "Weinberg moments), the taper's squared bias and the GWAS sample's own 1/N term")
     info = dict(format="summit-admixed-ld-matrix", version=1, sources=sources, n_snps=int(p), chrom=str(c),
                 mean_ancestry=m.tolist(), kappa0=k0.tolist(), kernel=kern.describe(), taper=tau_note,
                 admixture_term=bool(admixture), complete_band=bool(complete), min_eigenvalue=ev, psd_note=psd_note,
-                reference=dict(sources=ref.manifest["sources"], window_kb=ref.manifest["window_kb"]), flags=flags)
+                reference=dict(sources=ref.manifest["sources"], window_kb=ref.manifest["window_kb"]), flags=flags,
+                sumstats=None if zs is None else dict(file=str(sumstats), n_snps=int(p), keep_ambiguous=bool(keep_ambiguous),
+                                                     file_z=out + ".z.tsv"),
+                error_variance=ev_info)
     with open(out + ".matrix.json", "w") as f:
         json.dump(info, f, indent=1)
     log(f"[admixed-ld] matrix: {p} SNPs on chr{c}, taper {tau_note}, smallest eigenvalue {ev:.3g}; wrote {out}.ld, "
