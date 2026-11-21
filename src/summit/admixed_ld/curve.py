@@ -27,7 +27,7 @@ import time
 import numpy as np
 import pandas as pd
 
-from ._io import DosageBlocks, center_impute, match_variants
+from ._io import DosageBlocks, _ambiguous, center_impute, check_match, match_variants, strand_check, strand_check_fails
 from .model import fit_exponential
 from .reference import Reference, _products
 
@@ -442,7 +442,7 @@ def genotype_curve(geno, ref_path, out, *, sources=None, covar=None, keep=None, 
                    closure=False, cells_cm=2.0, per_chromosome=False, step=4096, threads=1, native=True,
                    noise_correction=True, relatedness_profile=True, relatedness_cell_cm=0.5, relatedness_controls=None,
                    relatedness_memory_gb=4.0, background=False, background_quantile=0.2, background_between_snps=None,
-                   log=print):
+                   drop_ambiguous=False, log=print):
     """The weighted-LD curve of the cohort for two or more sources. With cells_cm, also the genome-wide matrix of
     covariances between cells of cells_cm cM (within and between chromosomes) and the sampling variance of each entry,
     written to out.cells.npz: it carries long-range structure that one value per distance cannot (for example what the
@@ -491,13 +491,19 @@ def genotype_curve(geno, ref_path, out, *, sources=None, covar=None, keep=None, 
     if df_res < 10:
         raise ValueError("Too few samples for the number of covariates.")
     rv = ref.variants(sources)
-    t_idx, r_idx, flip = match_variants(blocks.variants, rv, how=match)
+    match_info = {}
+    t_idx, r_idx, flip = match_variants(blocks.variants, rv, how=match, drop_ambiguous=drop_ambiguous,
+                                        report=match_info)
+    check_match(match_info, "curve: the cohort", log)
     sign = np.where(flip, -1.0, 1.0)
     P = np.column_stack([rv[f"p_{s}"].to_numpy()[r_idx] for s in sources])
     D = (P[:, :-1] - P[:, -1:]) * sign[:, None]                 # contrasts, oriented to the cohort's counted allele
     pB_c = np.where(flip, 1.0 - P[:, -1], P[:, -1])
     good = np.isfinite(D).all(axis=1) & np.isfinite(pB_c)
     t_idx, r_idx, D, pB_c = t_idx[good], r_idx[good], D[good], pB_c[good]
+    amb = _ambiguous(blocks.variants["COUNTED"].to_numpy(str)[t_idx], blocks.variants["OTHER"].to_numpy(str)[t_idx])
+    freq_c = np.full(t_idx.size, np.nan)                       # the cohort's frequencies, for the strand check
+    n_missing, n_calls, strand = 0, 0, None
     if noise_correction:                                       # sampling covariance of the contrasts, per SNP
         from .model import contrast_noise
         Vs = np.column_stack([rv[f"v_{s}"].to_numpy()[r_idx] for s in sources])
@@ -543,7 +549,10 @@ def genotype_curve(geno, ref_path, out, *, sources=None, covar=None, keep=None, 
         for s in range(0, ix.size, step):
             sl = ix[s:s + step]
             X = blocks.read(t_idx[sl])
+            n_missing += int(np.isnan(X).sum())
+            n_calls += X.size
             mu = np.nanmean(X, axis=0)
+            freq_c[sl] = mu / 2.0
             center_impute(X)
             d = D[sl]
             inf = np.isfinite(mu) & (np.abs(d).max(axis=1) >= theta_min_delta)
@@ -606,6 +615,9 @@ def genotype_curve(geno, ref_path, out, *, sources=None, covar=None, keep=None, 
             coarse_tab.append(pd.DataFrame({"CHR": c, "start_cm": cm[ix].min() + np.arange(ncc) * per * cell_cm,
                                             "width_cm": per * cell_cm}))
         log(f"[admixed-ld] curve chr{c}: {ix.size} SNPs, {nc} cells ({time.perf_counter() - t0:.0f} s)")
+        if strand is None:                                     # after the first chromosome, then for the genome
+            strand = _check_strand(freq_c, pB_c, D, amb, drop_ambiguous, log)
+    strand = _check_strand(freq_c, pB_c, D, amb, drop_ambiguous, log, final=True)
     T = np.stack(T, axis=2)                                    # N x k1 x chromosomes
     Qtot = np.stack(Qtot)                                      # chromosomes x k1 x k1
     Ts = T.sum(axis=2)
@@ -637,9 +649,16 @@ def genotype_curve(geno, ref_path, out, *, sources=None, covar=None, keep=None, 
                 noise_correction=bool(noise_correction),
                 panel_n_freq={s: float(ref.n_freq[s]) for s in sources},
                 max_cm=float(max_cm), inter_matrix=inter.tolist(), fit_per_source=fits,
+                match=dict(match_info, drop_ambiguous=bool(drop_ambiguous)), strand_check=strand,
+                missing_share=float(n_missing / max(n_calls, 1)), flags=[],
                 theta=moments_from_vectors(U_th),
                 reference=dict(sources=ref.manifest["sources"], window_kb=ref.manifest["window_kb"],
                                genetic_map=ref.manifest["genetic_map"]))
+    if info["missing_share"] > 0.05:
+        info["flags"].append(dict(flag="missing_genotypes", detail=f"{info['missing_share']:.1%} of the calls"))
+        log(f"[admixed-ld] WARNING (recorded flag missing_genotypes): {info['missing_share']:.1%} of the genotype calls "
+            "are missing. They are imputed with the SNP's mean, which shrinks each SNP's variance and covariances by "
+            "about the missing share; filter SNPs on missingness before the curve.")
     if k1 == 1:
         info.update(inter_numerator=float(inter_num[0, 0]), inter_denominator=float(inter_den[0, 0, 0, 0]),
                     inter_kernel=float(inter[0, 0]), fit_2_to_20cm=fit_exponential(curve.d_cm, curve.kernel, 2.0, 20.0))
@@ -734,6 +753,26 @@ def genotype_curve(geno, ref_path, out, *, sources=None, covar=None, keep=None, 
         + "; mean ancestry " + ", ".join(f"{s} {x:.3f}" for s, x in zip(sources[:-1], mean_th))
         + f". Wrote {out}.curve.tsv and {out}.curve.json ({time.perf_counter() - t0:.0f} s)")
     return curve, info
+
+
+def _check_strand(freq, p_base, D, amb, dropped, log, final=False):
+    """strand_check on the SNPs read so far; raises when the strand-ambiguous SNPs look flipped (strand_check_fails)."""
+    res = strand_check(freq, p_base, D, amb)
+    if res is None:
+        return None if not final else dict(note="too few differentiated SNPs to check")
+    if strand_check_fails(res):
+        raise ValueError(f"{res['ambiguous_discordant']:.1%} of the {res['ambiguous_snps']} strand-ambiguous (A/T, C/G) "
+                         "SNPs have cohort frequencies that fit the other strand of the reference, against "
+                         f"{(res['other_discordant'] or 0.0):.1%} of the other SNPs. The cohort and the reference "
+                         "panels are on different strands at these SNPs; pass --drop-ambiguous (also to compose), or "
+                         "align the strands before building the reference.")
+    if final:
+        log(f"[admixed-ld] curve: strand check, discordant frequencies at {res['other_discordant']:.2%} of "
+            f"{res['other_snps']} differentiated SNPs and "
+            + ("no strand-ambiguous SNPs" if res["ambiguous_discordant"] is None else
+               f"{res['ambiguous_discordant']:.2%} of {res['ambiguous_snps']} strand-ambiguous ones")
+            + (" (strand-ambiguous SNPs dropped)" if dropped else ""))
+    return res
 
 
 def _solve_kernel(num, den):

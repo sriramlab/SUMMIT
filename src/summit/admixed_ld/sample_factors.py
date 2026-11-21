@@ -31,7 +31,7 @@ import time
 import numpy as np
 import pandas as pd
 
-from ._io import DosageBlocks, center_impute, match_variants
+from ._io import DosageBlocks, center_impute, check_match, match_variants
 from .reference import Reference
 
 
@@ -58,7 +58,7 @@ def _sym_cross_cov(U0, U1):
 
 
 def sample_factors(geno, ref_path, out, *, sources=None, covar=None, keep=None, match="position", step=4096,
-                   threads=1, ld_mass=True, memory_gb=32.0, log=print) -> dict:
+                   threads=1, ld_mass=True, memory_gb=32.0, drop_ambiguous=False, log=print) -> dict:
     """Estimate Sigma_u on the GWAS's people (with the GWAS's covariates) and write out.sample_factors.json.
 
     ld_mass: also the sample's realized in-sample LD mass, in total and over pairs of SNPs on different chromosomes,
@@ -83,7 +83,10 @@ def sample_factors(geno, ref_path, out, *, sources=None, covar=None, keep=None, 
     if nu < 10:
         raise ValueError("Too few samples for the number of covariates.")
     rv = ref.variants(sources)
-    t_idx, r_idx, _flip = match_variants(blocks.variants, rv, how=match)
+    match_info = {}
+    t_idx, r_idx, _flip = match_variants(blocks.variants, rv, how=match, drop_ambiguous=drop_ambiguous,
+                                         report=match_info)
+    check_match(match_info, "sample-factors: the cohort", log)
     P = np.column_stack([rv[f"p_{s}"].to_numpy()[r_idx] for s in sources])
     Vd = np.column_stack([rv[f"v_{s}"].to_numpy()[r_idx] for s in sources])
     D = P[:, :-1] - P[:, -1:]                                      # the orientation cancels in every loading

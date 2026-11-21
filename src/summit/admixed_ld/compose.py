@@ -39,7 +39,7 @@ import time
 import numpy as np
 import pandas as pd
 
-from ._io import match_variants
+from ._io import check_match, match_variants
 from .model import (KernelMatrix, ancestry_sd_from_kernel, check_kernel_join, contrast_pairs, dirichlet_moments,
                     moments_tensors, parameters_from_sumstats_k, contrast_noise, same_person_term,
                     unbiased_products_cov)
@@ -660,6 +660,31 @@ def relatedness_term(L, rel, chrom, cm, cls, V, K, nu, grid_cm, scale=1.0, partn
         L[sel] += (scale * acc) / nu ** 2
 
 
+def se_regression_outliers(per_trait, log=print, max_m=0.05, max_kappa=0.25, min_r2=0.9):
+    """Traits whose standard-error regression stands apart from the others (first source's m more than max_m from the
+    median, kappa_res(0) more than max_kappa of the median away, or a fit R2 below min_r2): logistic, mixed-model or
+    otherwise weighted SEs, other covariates or another sample. The medians over traits are used either way; the
+    traits are recorded and logged."""
+    if per_trait is None or len(per_trait) < 2:
+        return []
+    m1 = np.array([np.atleast_1d(x)[0] for x in per_trait["m"]], np.float64)
+    k1 = np.array([np.atleast_2d(x)[0, 0] for x in per_trait["kappa0"]], np.float64)
+    r2 = per_trait["fit_r2"].to_numpy(np.float64)
+    km = float(np.median(k1))
+    odd = (np.abs(m1 - np.median(m1)) > max_m) | (np.abs(k1 - km) > max_kappa * abs(km)) | (r2 < min_r2)
+    if not odd.any():
+        return []
+    names = per_trait["trait"].to_numpy()[odd]
+    detail = ", ".join(f"{t} (m {a:.3f}, kappa_res(0) {b:.4f}, R2 {c:.3f})" for t, a, b, c in
+                       zip(names, m1[odd], k1[odd], r2[odd]))
+    log(f"[admixed-ld] WARNING (recorded flag se_regression_outlier_traits): the standard errors of {names.size} "
+        f"trait(s) give other cohort quantities than the rest (median m {np.median(m1):.3f}, kappa_res(0) {km:.4f}): "
+        f"{detail}. Logistic, mixed-model or otherwise weighted SEs do this, and so does a trait analysed in another "
+        "subset of people or with other covariates; such a trait needs its own composition (for a GWAS sample of its "
+        "own, its own curve).")
+    return [dict(flag="se_regression_outlier_traits", detail=detail)]
+
+
 def _parse_values(x):
     if x is None:
         return None
@@ -694,7 +719,7 @@ def compose_ldscores(ref_path, sumstats, annot, out, *, sources=None, snps=None,
                      cell_switch_cm=10.0, allow_flat_kernel_join=False, cross_source=None,
                      sample_factors=None, sample_factors_calibrate=True, calibrate_between_chromosomes=False,
                      per_trait_n=True, n_tol=0.01, tracks=False, track_alpha=None, partners="rows",
-                     pair_chunk=1 << 23, log=print):
+                     drop_ambiguous=False, pair_chunk=1 << 23, log=print):
     """Composed LD scores for an admixed GWAS sample with two or more sources (the last is the baseline of the
     contrasts). mean_ancestry: K-1 or K values (comma-separated); kappa0: the upper triangle of Kt_res(0) row by row.
     Departures from the standard recipe that are allowed but should be visible are recorded in the params json under
@@ -785,7 +810,10 @@ def compose_ldscores(ref_path, sumstats, annot, out, *, sources=None, snps=None,
         tv = tv[tv.BP.notna()].copy()
         tv["BP"] = tv.BP.astype(np.int64)
     rv = ref.variants(sources)
-    t_idx, r_idx, _ = match_variants(tv.reset_index(drop=True), rv, how=how)
+    match_info = {}
+    t_idx, r_idx, _ = match_variants(tv.reset_index(drop=True), rv, how=how, drop_ambiguous=drop_ambiguous,
+                                     report=match_info)
+    check_match(match_info, "compose: the GWAS", log)
     tv = tv.reset_index(drop=True)
     cls_mat, classes = read_annotation_classes(annot, tv.SNP.to_numpy()[t_idx])
     in_annot = cls_mat.sum(axis=1) == 1
@@ -869,6 +897,7 @@ def compose_ldscores(ref_path, sumstats, annot, out, *, sources=None, snps=None,
                 "mating; the PCs take up global ancestry)")
     if m_in is None or k_in is None:
         m_se, k_se, per_trait = parameters_from_sumstats_k(tables, Vm, O, sources, log=log)
+        flags += se_regression_outliers(per_trait, log)
     else:
         m_se, k_se, per_trait = np.full(nK, np.nan), np.full((k1, k1), np.nan), None
     if m_in is not None:
@@ -911,6 +940,12 @@ def compose_ldscores(ref_path, sumstats, annot, out, *, sources=None, snps=None,
             inter = np.asarray(curve_info["inter_matrix"])
             lam = np.array([curve_info["fit_per_source"][s]["lam"] for s in sources])
         kern = KernelMatrix.from_curve(d_c, kc, inter, k0, lam)
+        c_rank = curve_info.get("covariate_rank")
+        if c_rank is not None and p > 0 and int(c_rank) != p:
+            flags.append(dict(flag="covariates_differ_from_curve",
+                              detail=f"curve covariate rank {int(c_rank)}, GWAS COV_RANK {p}"))
+            log(f"[admixed-ld] WARNING (recorded flag covariates_differ_from_curve): the curve was made with {int(c_rank)} "
+                f"covariates and the GWAS reports {p}. The curve must use the GWAS's own covariates (and its PCs).")
     elif generations is not None:
         kern = KernelMatrix.from_decay(k0, float(generations) / 100.0, ref.genome_cm, nK,
                                        source=f"admixture {generations} generations ago")
@@ -1394,6 +1429,7 @@ def compose_ldscores(ref_path, sumstats, annot, out, *, sources=None, snps=None,
                                  genetic_map=ref.manifest["genetic_map"]),
                   per_trait=None if per_trait is None else per_trait.to_dict(orient="records"),
                   ld_mass=float((V[:, None] * L).sum()), sample_factors=sf_info, n_groups=groups_info,
+                  match=dict(match_info, drop_ambiguous=bool(drop_ambiguous)),
                   ld_mass_check=mass_check, flags=flags)
     if xs_i is not None:                                          # each SNP with itself: sqrt(V_1 V_2), V_2 = 1
         keep = v2_out > 0

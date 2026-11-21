@@ -21,7 +21,7 @@ import time
 import numpy as np
 import pandas as pd
 
-from ._io import DosageBlocks, center_impute, genetic_positions, match_variants
+from ._io import AUTOSOMES, DosageBlocks, center_impute, check_match, genetic_positions, match_variants
 
 FORMAT = "summit-admixed-ld-reference"
 VERSION = 1
@@ -79,12 +79,18 @@ class _SlidingPanel:
 
 
 def build_reference(panels, names, out, *, window_kb=3000, genetic_map=None, match="position", chromosomes=None,
-                    step=2048, threads=1, dtype="float32", native=True, log=print):
+                    step=2048, threads=1, dtype="float32", native=True, drop_ambiguous=False, log=print):
     """Build the resource from source panels (PLINK 1 BED or PLINK 2 PGEN prefixes), one per source."""
     if len(panels) != len(names) or len(panels) < 2:
         raise ValueError("Give at least two source panels, each with a name.")
     if len(set(names)) != len(names):
         raise ValueError("Source names must be distinct.")
+    chromosomes = AUTOSOMES if chromosomes is None else [str(c).replace("chr", "") for c in chromosomes]
+    other = [c for c in chromosomes if c not in AUTOSOMES]
+    if other:
+        raise ValueError(f"The reference holds autosomes only (1-22); --chromosomes lists {', '.join(other)}. The "
+                         "composition models two copies of every SNP, which sex chromosomes and mitochondrial "
+                         "DNA do not have; leave them out.")
     blocks = [DosageBlocks(p, threads=threads, step=max(step, 1)) for p in panels]
     small = [n for n, b in zip(names, blocks) if b.n < 10]
     if small:
@@ -95,17 +101,19 @@ def build_reference(panels, names, out, *, window_kb=3000, genetic_map=None, mat
     keep = np.ones(len(base), dtype=bool)
     cols = [np.arange(len(base))]
     flips = [np.zeros(len(base), dtype=bool)]
-    for b in blocks[1:]:
-        t_idx, r_idx, flip = match_variants(base, b.variants, how=match)
+    if drop_ambiguous and len(blocks) == 1:
+        raise ValueError("--drop-ambiguous needs at least two panels.")
+    for nm, b in zip(names[1:], blocks[1:]):
+        match_info = {}
+        t_idx, r_idx, flip = match_variants(base, b.variants, how=match, drop_ambiguous=drop_ambiguous,
+                                            report=match_info)
+        check_match(match_info, f"reference: the {nm} panel against the {names[0]} panel", log)
         col = np.full(len(base), -1, dtype=np.int64)
         fl = np.zeros(len(base), dtype=bool)
         col[t_idx], fl[t_idx] = r_idx, flip
         keep &= col >= 0
         cols.append(col)
         flips.append(fl)
-    if chromosomes is None:
-        chromosomes = [str(c) for c in range(1, 23)]
-    chromosomes = [str(c) for c in chromosomes]
     keep &= base["CHR"].isin(chromosomes).to_numpy()
     idx = np.flatnonzero(keep)
     if idx.size == 0:
@@ -162,6 +170,7 @@ def build_reference(panels, names, out, *, window_kb=3000, genetic_map=None, mat
     manifest = write_manifest(out, [dict(name=nm, n=int(b.n), panel=os.path.basename(p))
                                     for nm, b, p in zip(names, blocks, panels)],
                               window_kb=window_kb, genetic_map=map_source, match=match, dtype=out_dtype.name,
+                              drop_ambiguous=bool(drop_ambiguous),
                               counted_allele="first panel's counted allele (BED A1, PGEN REF)", stats=stats,
                               products=dict(native=info["native"], repaired_columns=int(info["repaired_columns"])))
     for b in blocks:
@@ -170,12 +179,15 @@ def build_reference(panels, names, out, *, window_kb=3000, genetic_map=None, mat
     return manifest
 
 
-def write_manifest(out, sources, *, window_kb, genetic_map, match, dtype, counted_allele, stats, products):
+def write_manifest(out, sources, *, window_kb, genetic_map, match, dtype, counted_allele, stats, products,
+                   drop_ambiguous=None):
     """The manifest of a reference directory (sources: name, n and, for a derived source, how it was made)."""
     manifest = dict(format=FORMAT, version=VERSION, created=datetime.datetime.now().isoformat(timespec="seconds"),
                     sources=sources, window_kb=int(window_kb), genetic_map=genetic_map, match=match, dtype=dtype,
                     counted_allele=counted_allele, chromosomes=stats,
                     genome_cm=float(sum(v["cm_length"] for v in stats.values())), products=products)
+    if drop_ambiguous is not None:
+        manifest["drop_ambiguous"] = bool(drop_ambiguous)
     with open(os.path.join(out, "manifest.json"), "w") as f:
         json.dump(manifest, f, indent=1)
     return manifest

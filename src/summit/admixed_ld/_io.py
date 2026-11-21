@@ -16,6 +16,10 @@ from ..ldscore.genotype_source import (PgenBlockReader, read_fam_sample_ids, rea
 
 CM_PER_MB_FALLBACK = 1.2          # sex-averaged autosomal recombination rate, used only without any genetic map
 _COMPLEMENT = {"A": "T", "C": "G", "G": "C", "T": "A"}
+AUTOSOMES = [str(c) for c in range(1, 23)]
+# genome-wide autosomal rates lie near 0.5-3 cM per Mb (chromosome 19 is the highest, about 2); a value far outside
+# means a map in Morgans, a map of another build or of another chromosome, or base-pair positions in the CM column
+CM_PER_MB_PLAUSIBLE = (0.2, 6.0)
 
 
 # ----------------------------------------------------------------------------------------------------- genotypes
@@ -177,7 +181,29 @@ def genetic_positions(variants: pd.DataFrame, genetic_map: str | None = None, lo
         ix = np.flatnonzero(chrom == c)
         o = ix[np.argsort(bp[ix], kind="stable")]
         cm[o] = np.maximum.accumulate(cm[o])
+    check_map_rates(chrom, bp, cm, source)
     return cm, source
+
+
+def check_map_rates(chrom, bp, cm, source, min_snps=50, min_mb=10.0):
+    """Fail closed when a chromosome's genetic length per Mb is implausible (CM_PER_MB_PLAUSIBLE): a map in Morgans
+    or with base-pair positions, a map for another genome build or the wrong chromosome. Chromosomes with fewer than
+    min_snps variants or a span under min_mb Mb are not checked."""
+    chrom, bp, cm = np.asarray(chrom).astype(str), np.asarray(bp, np.float64), np.asarray(cm, np.float64)
+    lo, hi = CM_PER_MB_PLAUSIBLE
+    bad = []
+    for c in pd.unique(chrom):
+        ix = chrom == c
+        span_mb = (bp[ix].max() - bp[ix].min()) / 1e6 if ix.sum() else 0.0
+        if ix.sum() < min_snps or span_mb < min_mb:
+            continue
+        rate = (np.nanmax(cm[ix]) - np.nanmin(cm[ix])) / span_mb
+        if not (lo <= rate <= hi):
+            bad.append(f"chr{c} {rate:.3g}")
+    if bad:
+        raise ValueError(f"Genetic positions from {source} give implausible lengths in cM per Mb ({', '.join(bad)}; "
+                         f"autosomes lie within {lo}-{hi}). Check that the map is in cM (not Morgans), that it is "
+                         "for the genome build of the variant positions, and that each file holds one chromosome.")
 
 
 # ----------------------------------------------------------------------------------------------------- matching
@@ -191,11 +217,14 @@ def _complement(a):
     return s.map(lambda x: _COMPLEMENT.get(x, "?") if len(x) == 1 else "?").to_numpy()
 
 
-def match_variants(target: pd.DataFrame, ref: pd.DataFrame, how: str = "position"):
+def match_variants(target: pd.DataFrame, ref: pd.DataFrame, how: str = "position", *, drop_ambiguous: bool = False,
+                   report: dict | None = None):
     """Indices of variants found in both tables (CHR, BP, SNP, COUNTED, OTHER) and whether the target's counted allele
     is the reference's other allele (flip). `how` is 'position' (CHR:BP plus alleles) or 'id' (SNP plus alleles).
     Keys that occur twice in either table are not used. Strand flips are resolved for non-ambiguous SNPs only; A/T and
-    C/G SNPs are matched as listed. Returns (target_idx, ref_idx, flip) sorted by target_idx."""
+    C/G SNPs are matched as listed, or left out with drop_ambiguous. Returns (target_idx, ref_idx, flip) sorted by
+    target_idx. `report`, if given, receives the counts that check_match reads: target and reference variants, keys
+    found in both, those whose alleles agree (the matches), and strand-ambiguous matches kept or dropped."""
     if how == "position":
         tk = target["CHR"].astype(str) + ":" + target["BP"].astype(np.int64).astype(str)
         rk = ref["CHR"].astype(str) + ":" + ref["BP"].astype(np.int64).astype(str)
@@ -220,6 +249,68 @@ def match_variants(target: pd.DataFrame, ref: pd.DataFrame, how: str = "position
     same_c = ~amb & (ctc == rc) & (cto == ro)
     swap_c = ~amb & (ctc == ro) & (cto == rc)
     ok = same | swap | same_c | swap_c
+    n_amb_dropped = 0
+    if drop_ambiguous:
+        n_amb_dropped = int((ok & amb).sum())
+        ok &= ~amb
     flip = (swap | swap_c) & ~same
+    if report is not None:
+        report.update(n_target=int(len(target)), n_reference=int(len(ref)), n_keys=int(t_idx.size),
+                      n_matched=int(ok.sum()), n_allele_mismatch=int((~(same | swap | same_c | swap_c)).sum()),
+                      n_ambiguous=int((ok & amb).sum()), n_ambiguous_dropped=n_amb_dropped, how=how)
     order = np.argsort(t_idx[ok], kind="stable")
     return t_idx[ok][order], r_idx[ok][order], flip[ok][order]
+
+
+def check_match(report: dict, what: str, log=print, min_keys: int = 1000, min_allele_share: float = 0.9,
+                low_share: float = 0.5):
+    """Fail closed when the variants at shared positions (or IDs) mostly disagree in their alleles, the sign of another
+    genome build or allele coding; log the counts, and warn when few of the target's variants are matched."""
+    nk, nm, nx = report["n_keys"], report["n_matched"], report["n_allele_mismatch"]
+    log(f"[admixed-ld] {what}: {nm} of {report['n_target']} variants matched to the reference by {report['how']} "
+        f"({nk} shared {'positions' if report['how'] == 'position' else 'IDs'}, {nx} with other alleles; "
+        f"{report['n_ambiguous']} strand-ambiguous kept" + (f", {report['n_ambiguous_dropped']} dropped" if
+                                                              report["n_ambiguous_dropped"] else "") + ")")
+    if nk >= min_keys and (nk - nx) / nk < min_allele_share:
+        raise ValueError(f"{what}: {nx} of the {nk} variants at shared {report['how']}s have other alleles than the "
+                         "reference. The genome builds or the allele coding differ; lift the data over to the "
+                         "reference's build (or rebuild the reference) before composing.")
+    if report["n_target"] >= min_keys and nm < low_share * report["n_target"]:
+        log(f"[admixed-ld] WARNING: only {nm / report['n_target']:.1%} of the {what} variants are in the reference; "
+            "check the genome build and the variant IDs.")
+
+
+def strand_check(freq, p_base, D, ambiguous, *, min_delta=0.2, min_snps=50, margin=0.05):
+    """Whether strand-ambiguous (A/T, C/G) SNPs look strand-flipped against the reference, from the cohort's allele
+    frequencies. freq: the cohort's frequency of its counted allele; p_base and D: the baseline source's frequency and
+    the contrasts, oriented to the cohort's counted allele; ambiguous: per SNP. The cohort's mean ancestry is fitted on
+    the non-ambiguous differentiated SNPs (freq - p_base = D m), and a SNP is discordant when its frequency is closer,
+    by `margin`, to the flipped expectation 1 - (p_base + D m) than to the expectation itself. Only SNPs whose expected
+    frequency is at least 0.1 from one half are counted, where a flip is visible. Returns None when there are too few
+    SNPs, else the two discordance rates and their counts."""
+    freq, p_base, D = np.asarray(freq, np.float64), np.asarray(p_base, np.float64), np.atleast_2d(D)
+    if D.shape[0] != freq.size:
+        D = D.T
+    amb = np.asarray(ambiguous, bool)
+    inf = np.isfinite(freq) & np.isfinite(p_base) & np.isfinite(D).all(axis=1) & (np.abs(D).max(axis=1) >= min_delta)
+    base = inf & ~amb
+    if base.sum() < min_snps:
+        return None
+    m, *_ = np.linalg.lstsq(D[base], freq[base] - p_base[base], rcond=None)
+    f_exp = np.clip(p_base + D @ m, 0.0, 1.0)
+    visible = np.abs(2.0 * f_exp - 1.0) > 0.2
+    disc = np.abs(freq - (1.0 - f_exp)) + margin < np.abs(freq - f_exp)
+    sa, sn = inf & amb & visible, base & visible
+    return dict(ambiguous_snps=int(sa.sum()), ambiguous_discordant=float(disc[sa].mean()) if sa.any() else None,
+                other_snps=int(sn.sum()), other_discordant=float(disc[sn].mean()) if sn.any() else None,
+                mean_ancestry_fit=[float(x) for x in np.atleast_1d(m)])
+
+
+def strand_check_fails(res, min_snps=50):
+    """The fail-closed rule of strand_check: the ambiguous SNPs' discordance exceeds 5% and three times the other SNPs'
+    (plus 1%)."""
+    if res is None or res["ambiguous_discordant"] is None or res["ambiguous_snps"] < min_snps:
+        return False
+    other = res["other_discordant"] or 0.0
+    return res["ambiguous_discordant"] > max(0.05, 3.0 * other + 0.01)
+

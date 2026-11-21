@@ -32,7 +32,7 @@ import time
 import numpy as np
 import pandas as pd
 
-from ._io import DosageBlocks, center_impute, match_variants
+from ._io import DosageBlocks, center_impute, check_match, match_variants
 from .compose import unbiased_squared_covariance
 from .model import contrast_noise, full_from_contrasts, regress_standard_errors_k, unbiased_products_cov
 from .reference import Reference, _products, write_manifest
@@ -243,7 +243,7 @@ def _inversion_parameters(geno, out, ref, known, name, src_meta, chrom, local, k
 
 def derive_source(geno, ref_path, out, *, name, known=None, panel=None, covar=None, keep=None, match="position",
                   als_snps=20000, als_iter=500, als_tol=1e-9, calibrate=True, ld="inversion", cell_cm=0.25, step=1024,
-                  threads=1, native=True, log=print):
+                  threads=1, native=True, drop_ambiguous=False, log=print):
     """Write a reference with the known sources of `ref_path` and `name` derived from the cohort `geno`.
 
     ld: "inversion" (window LD from the cohort's covariances, steps 3-6) or "panel" (window LD of the anchor panel, with
@@ -259,7 +259,10 @@ def derive_source(geno, ref_path, out, *, name, known=None, panel=None, covar=No
     blocks = DosageBlocks(geno, rows=rows, threads=threads, step=step)
     N = blocks.n
     rv = ref.variants(known)
-    t_idx, r_idx, flip = match_variants(blocks.variants, rv, how=match)
+    match_info = {}
+    t_idx, r_idx, flip = match_variants(blocks.variants, rv, how=match, drop_ambiguous=drop_ambiguous,
+                                        report=match_info)
+    check_match(match_info, f"derive {name}: the cohort", log)
     order = np.argsort(r_idx, kind="stable")                    # reference (genome) order
     t_idx, r_idx, flip = t_idx[order], r_idx[order], flip[order]
     M = t_idx.size
@@ -280,7 +283,9 @@ def derive_source(geno, ref_path, out, *, name, known=None, panel=None, covar=No
     fixed_rows = None
     if panel is not None:                                        # small panel of the missing source, theta = e_N
         pb = DosageBlocks(panel, threads=threads, step=step)
-        pt, pr, pf = match_variants(pb.variants, rv, how=match)
+        panel_info = {}
+        pt, pr, pf = match_variants(pb.variants, rv, how=match, drop_ambiguous=drop_ambiguous, report=panel_info)
+        check_match(panel_info, f"derive {name}: the anchor panel", log)
         pos = pd.Series(np.arange(pr.size), index=pr)
         have = pos.reindex(r_idx[sub]).to_numpy()
         ok = ~np.isnan(have)

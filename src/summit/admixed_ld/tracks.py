@@ -18,8 +18,12 @@ SNPs as partners this is SUMMIT's own rg_total; with a dense reference as partne
 
 Ordinary (OLS) standard errors assume residuals that do not vary between people, but the track variable's variance
 follows each person's local ancestry, so the own moments of OLS z statistics carry first-order same-person terms
-(including the other track's heritability). Sandwich (HC) standard errors remove them exactly, so the reader requires
-them and the fit refuses OLS input unless asked.
+(including the other track's heritability). Sandwich standard errors remove them, so the reader requires them and the
+fit refuses OLS input unless asked. The sandwich must take each person's variance from the residuals of the
+covariates-only model, e0_i^2 / (1 - h_ii) with h_ii the hat value under the covariates (columns se_hcn_anc<s>): then
+z^2 - 1 is the moment over distinct people that the track LD scores model, at any MAF and with heteroscedastic noise.
+The usual HC0-HC3 sandwich takes the residuals of the full model, which the fit shrinks at alleles carried by few
+people on one track, so its SEs are biased low there; it is accepted with a recorded flag.
 """
 from __future__ import annotations
 
@@ -55,11 +59,15 @@ def _col(cols, names, anc=None):
     return None
 
 
-def _hc_column(cols, anc, kind="se"):
-    """The sandwich SE (kind 'se') or t statistic ('t') column of ancestry `anc`: se_hc_anc0, sehc_anc0, se_hc1_anc0,
-    se_robust_anc0 (any case), and tval_hc_anc0, thc_anc0 for the t statistic."""
-    pat = (r"^(se_?hc[0-3]?|se_?robust|se_?sandwich)_anc%d$" if kind == "se"
-           else r"^(tval_?hc[0-3]?|t_?hc[0-3]?|tval_?robust)_anc%d$") % int(anc)
+def _hc_column(cols, anc, kind="se", null=False):
+    """The sandwich SE (kind 'se') or t statistic ('t') column of ancestry `anc`. null=True: the sandwich with the
+    covariates-only residuals, se_hcn_anc0 or sehcn_anc0 (tval_hcn_anc0, thcn_anc0); otherwise a full-model sandwich,
+    se_hc_anc0, sehc_anc0, se_hc1_anc0, se_robust_anc0 (any case), and tval_hc_anc0, thc_anc0 for the t statistic."""
+    if null:
+        pat = (r"^se_?hcn_anc%d$" if kind == "se" else r"^(tval_?hcn|t_?hcn)_anc%d$") % int(anc)
+    else:
+        pat = (r"^(se_?hc[0-3]?|se_?robust|se_?sandwich)_anc%d$" if kind == "se"
+               else r"^(tval_?hc[0-3]?|t_?hc[0-3]?|tval_?robust)_anc%d$") % int(anc)
     hits = [c for c in cols if re.match(pat, str(c), flags=re.IGNORECASE)]
     if len(hits) > 1:
         raise ValueError(f"Several sandwich {kind.upper()} columns for ancestry {anc}: {', '.join(hits)}.")
@@ -71,8 +79,10 @@ def tractor_sumstats(path, out, *, sources=None, se="hc", allow_ols=False, n_cov
 
     Columns read (Tractor 1.4 names, any case): CHR, POS, ID, REF, ALT, N and, per ancestry index s (anc0, anc1, ...),
     beta_anc{s}, se_anc{s} and/or tval_anc{s}, AF_anc{s} (the track's allele frequency), LAprop_anc{s} (the
-    local-ancestry share at the SNP), and the sandwich SEs se_hc_anc{s} (or sehc_, se_hc1_, se_robust_; optionally
-    tval_hc_anc{s}). Tractor counts the ALT allele, which becomes A1. Optional: COV_RANK (covariates plus the
+    local-ancestry share at the SNP), and the sandwich SEs: se_hcn_anc{s} (or sehcn_; optionally tval_hcn_anc{s}),
+    whose meat takes each person's variance from the covariates-only residuals, or else a full-model sandwich
+    se_hc_anc{s} (sehc_, se_hc1_, se_robust_; tval_hc_anc{s}), with a recorded flag. Tractor counts the ALT allele,
+    which becomes A1. Optional: COV_RANK (covariates plus the
     local-ancestry and other-track terms); otherwise n_covariates (the user's covariates) gives
     COV_RANK = n_covariates + 2 (K - 1), the other regressors of each track's partial regression.
 
@@ -86,8 +96,8 @@ def tractor_sumstats(path, out, *, sources=None, se="hc", allow_ols=False, n_cov
     if se == "ols" and not allow_ols:
         raise ValueError("OLS standard errors of a Tractor GWAS leave first-order same-person terms in the own-track "
                          "moments (the track variable's variance follows each person's local ancestry), which the "
-                         "track LD scores do not model; ask the cohort for sandwich (HC1) SEs. Pass --allow-ols to "
-                         "proceed with the flag recorded.")
+                         "track LD scores do not model; ask the cohort for sandwich SEs from the covariates-only "
+                         "residuals (se_hcn_anc<s>). Pass --allow-ols to proceed with the flag recorded.")
     df = pd.read_csv(path, sep=r"\s+", compression="infer", dtype={"ID": str, "REF": str, "ALT": str})
     cols = list(df.columns)
     anc = sorted(int(m.group(1)) for c in cols for m in [re.match(r"^beta_anc(\d+)$", str(c), flags=re.IGNORECASE)]
@@ -128,6 +138,7 @@ def tractor_sumstats(path, out, *, sources=None, se="hc", allow_ols=False, n_cov
                                                 "COV_RANK, AF (the track's allele frequency), LA_PROP (the "
                                                 "local-ancestry share), TRACK")
     se_type = "HC" if se == "hc" else "OLS"
+    full_model = []                                            # full-model sandwich columns used
     la_sum = np.zeros(len(df))
     for s, name in zip(anc, sources):
         b = _col(cols, ("beta_anc{s}",), s)
@@ -137,11 +148,16 @@ def tractor_sumstats(path, out, *, sources=None, se="hc", allow_ols=False, n_cov
             raise ValueError(f"{path} lacks AF_anc{s} or LAprop_anc{s} (the track's frequency and local-ancestry share).")
         beta = pd.to_numeric(df[b], errors="coerce").to_numpy(np.float64)
         if se == "hc":
-            sc, tc = _hc_column(cols, s, "se"), _hc_column(cols, s, "t")
+            sc, tc = _hc_column(cols, s, "se", null=True), _hc_column(cols, s, "t", null=True)
             if sc is None and tc is None:
-                raise ValueError(f"{path} has no sandwich SE column for ancestry {s} (se_hc_anc{s}; Tractor itself "
-                                 "writes only OLS SEs). Add HC1 SEs to the regression, or pass --se ols --allow-ols "
-                                 "to proceed with the flag recorded.")
+                sc, tc = _hc_column(cols, s, "se"), _hc_column(cols, s, "t")
+                if sc is not None or tc is not None:
+                    full_model.append(sc or tc)
+            if sc is None and tc is None:
+                raise ValueError(f"{path} has no sandwich SE column for ancestry {s} (se_hcn_anc{s}; Tractor itself "
+                                 "writes only OLS SEs). Add sandwich SEs whose meat takes each person's variance from "
+                                 "the residuals of the covariates-only model, e0^2 / (1 - h) (see the documentation), or "
+                                 "pass --se ols --allow-ols to proceed with the flag recorded.")
             sev = (pd.to_numeric(df[sc], errors="coerce").to_numpy(np.float64) if sc is not None
                    else np.full(len(df), np.nan))
             if tc is not None:                                 # beta / t keeps the precision rounding takes away
@@ -183,6 +199,13 @@ def tractor_sumstats(path, out, *, sources=None, se="hc", allow_ols=False, n_cov
                                    noise_variance_iqr=([float(np.quantile(sig, 0.25)), float(np.quantile(sig, 0.75))]
                                                        if sig.size else None))
     rec["se_type"] = se_type
+    if full_model:
+        flags.append(dict(flag="sandwich_from_full_model_residuals",
+                          detail=f"{', '.join(full_model)}: the meat uses the full model's residuals, which are shrunk "
+                                 "at alleles rare on a track, so these SEs are biased low there"))
+        log(f"[admixed-ld] WARNING (recorded flag sandwich_from_full_model_residuals): {', '.join(full_model)} take "
+            "each person's variance from the full model's residuals; at alleles rare on a track they are biased low. "
+            "Prefer se_hcn_anc<s>, the sandwich with the covariates-only residuals e0^2 / (1 - h).")
     if se_type == "OLS":
         flags.append(dict(flag="ols_standard_errors",
                           detail="OLS SEs: the own-track moments hold same-person terms that the track LD scores do "

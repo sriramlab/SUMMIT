@@ -68,7 +68,8 @@ def main(argv=None):
     r.add_argument("--dtype", choices=["float32", "float16"], default="float32",
                    help="storage of covariances (float16 halves the size; default float32)")
     r.add_argument("--step", type=int, default=2048, help="variants per block (default 2048)")
-    r.add_argument("--threads", type=int, default=1)
+    r.add_argument("--threads", "--num-threads", dest="threads", type=int, default=1,
+                    help="threads for genotype decoding and matrix products; also the BLAS limit (default 1)")
     r.add_argument("--remove-panel-admixture", action="store_true",
                    help="remove each panel's own admixture LD (measured with the weighted-LD curve of the panel) from "
                         "its covariances and variances. Optional and off by default. The target's curve and standard "
@@ -76,6 +77,9 @@ def main(argv=None):
                         "included), so a panel's own admixture LD in the band is counted twice whoever the target is; "
                         "use it when the panel's kernel passes the gate (z >= 3, reported by clean-panels) and its "
                         "duplicated share of the target's kernel is not negligible (see the documentation)")
+    r.add_argument("--drop-ambiguous", action="store_true",
+                    help="leave out strand-ambiguous (A/T, C/G) SNPs, which are otherwise matched as listed; use it when the "
+                    "data sets may be on different strands")
     r.add_argument("--out", required=True)
 
     cp = sub.add_parser("clean-panels", help="remove the panels' own admixture LD from an existing reference (copy) "
@@ -91,7 +95,8 @@ def main(argv=None):
                          "reference where the panels' genotypes are not available")
     cp.add_argument("--match", choices=["position", "id"], default="position")
     cp.add_argument("--fit-cm", default="3,40", help="distance range of the panel curve fit, in cM (default 3,40)")
-    cp.add_argument("--threads", type=int, default=1)
+    cp.add_argument("--threads", "--num-threads", dest="threads", type=int, default=1,
+                     help="threads for genotype decoding and matrix products; also the BLAS limit (default 1)")
     cp.add_argument("--no-panel-background", action="store_true",
                     help="do not measure the panels' own background LD (the cross-person LD of their members: cryptic "
                          "relatedness and structure, which their unbiased squared covariances hold inside the band). "
@@ -147,7 +152,11 @@ def main(argv=None):
                         "estimator (the behaviour before 4 Nov 2026), which shrinks the kernel by the frequencies' "
                         "sampling variance (small panels, derived sources)")
     c.add_argument("--step", type=int, default=4096)
-    c.add_argument("--threads", type=int, default=1)
+    c.add_argument("--threads", "--num-threads", dest="threads", type=int, default=1,
+                    help="threads for genotype decoding and matrix products; also the BLAS limit (default 1)")
+    c.add_argument("--drop-ambiguous", action="store_true",
+                    help="leave out strand-ambiguous (A/T, C/G) SNPs, which are otherwise matched as listed; use it when the "
+                    "data sets may be on different strands")
     c.add_argument("--out", required=True)
 
     m = sub.add_parser("compose", help="LD scores from the resource, the GWAS and the decay of local-ancestry covariance")
@@ -240,6 +249,9 @@ def main(argv=None):
     m.add_argument("--track-alpha", type=float, default=None,
                    help="with --tracks: per-allele weights [2 f (1 - f)]^ALPHA (f the frequency at the mean ancestry; "
                         "Hou et al. use -0.38) instead of 1 / s^2 with s^2 the cohort's genotype variance")
+    m.add_argument("--drop-ambiguous", action="store_true",
+                    help="leave out strand-ambiguous (A/T, C/G) SNPs, which are otherwise matched as listed; use it when the "
+                    "data sets may be on different strands")
     m.add_argument("--out", required=True)
 
     f = sub.add_parser("sample-factors", help="the cohort's person-factor statistic for the same-person term "
@@ -251,11 +263,15 @@ def main(argv=None):
     f.add_argument("--sources", default=None,
                    help="two or more source names of the reference (default: its first two); the last is the baseline")
     f.add_argument("--match", choices=["position", "id"], default="position")
-    f.add_argument("--threads", type=int, default=1)
+    f.add_argument("--threads", "--num-threads", dest="threads", type=int, default=1,
+                    help="threads for genotype decoding and matrix products; also the BLAS limit (default 1)")
     f.add_argument("--no-ld-mass", action="store_true",
                    help="skip the realized in-sample LD mass (two n x n matrices, O(n^2 M))")
     f.add_argument("--memory-gb", type=float, default=32.0,
                    help="largest memory for the two n x n matrices of the LD mass; above it the mass is skipped")
+    f.add_argument("--drop-ambiguous", action="store_true",
+                    help="leave out strand-ambiguous (A/T, C/G) SNPs, which are otherwise matched as listed; use it when the "
+                    "data sets may be on different strands")
     f.add_argument("--out", required=True)
 
     v = sub.add_parser("derive", help="a source without a reference panel, estimated from an admixed cohort that "
@@ -278,7 +294,11 @@ def main(argv=None):
     v.add_argument("--no-calibration", action="store_true",
                    help="keep the fit's position on the family of equivalent sources instead of placing it with the "
                         "anchor panel")
-    v.add_argument("--threads", type=int, default=1)
+    v.add_argument("--threads", "--num-threads", dest="threads", type=int, default=1,
+                    help="threads for genotype decoding and matrix products; also the BLAS limit (default 1)")
+    v.add_argument("--drop-ambiguous", action="store_true",
+                    help="leave out strand-ambiguous (A/T, C/G) SNPs, which are otherwise matched as listed; use it when the "
+                    "data sets may be on different strands")
     v.add_argument("--out", required=True, help="output reference directory")
 
     x = sub.add_parser("matrix", help="regional LD matrix of the GWAS sample (fine-mapping, conditional analysis)")
@@ -305,12 +325,13 @@ def main(argv=None):
                                                  "local-ancestry track (sandwich SEs required)")
     ts.add_argument("--tractor", required=True, help="Tractor output table (CHR POS ID REF ALT N, per ancestry s: "
                                                      "beta_anc{s}, se_anc{s} or tval_anc{s}, AF_anc{s}, "
-                                                     "LAprop_anc{s}, and the sandwich SEs se_hc_anc{s})")
+                                                     "LAprop_anc{s}, and the sandwich SEs se_hcn_anc{s} from the "
+                                                     "covariates-only residuals, or se_hc_anc{s} with a flag)")
     ts.add_argument("--sources", required=True,
                     help="comma-separated names of the ancestries anc0, anc1, ... as in the reference (e.g. AFR,EUR)")
     ts.add_argument("--se", choices=["hc", "ols"], default="hc",
-                    help="standard errors used: 'hc' (sandwich, the default and required for the track moments) or "
-                         "'ols' (Tractor's own; needs --allow-ols)")
+                    help="standard errors used: 'hc' (sandwich, the default and required for the track moments; "
+                         "se_hcn_anc<s> when present) or 'ols' (Tractor's own; needs --allow-ols)")
     ts.add_argument("--allow-ols", action="store_true",
                     help="accept OLS SEs, with the flag recorded (their own-track moments hold same-person terms that "
                          "the track LD scores do not model)")
@@ -352,12 +373,27 @@ def main(argv=None):
         os.makedirs(a.out, exist_ok=True)
         log.attach_file(os.path.join(a.out, f"{a.cmd}.log"), mode="w")
     log._log("summit admixed-ld " + " ".join(argv if argv is not None else sys.argv[2:]))
+    # BLAS threads follow --threads, as in SUMMIT's LD-score commands, so that plain numpy products do not take every
+    # core of a shared machine; commands without --threads leave the BLAS setting as it is
+    threads = getattr(a, "threads", None)
+    try:
+        from threadpoolctl import threadpool_limits
+    except Exception:                                   # pragma: no cover - threadpoolctl is a SUMMIT dependency
+        threadpool_limits = None
+    if threads is not None and threadpool_limits is not None:
+        with threadpool_limits(limits=max(1, int(threads)), user_api="blas"):
+            return _run(a, log)
+    return _run(a, log)
+
+
+def _run(a, log):
     if a.cmd == "reference":
         from .reference import build_reference
         names = _sources(a.names)
         chroms = None if a.chromosomes is None else _sources(a.chromosomes)
         build_reference(a.panel, names, a.out, window_kb=a.window_kb, genetic_map=a.genetic_map, match=a.match,
-                        chromosomes=chroms, step=a.step, threads=a.threads, dtype=a.dtype, log=log._log)
+                        chromosomes=chroms, step=a.step, threads=a.threads, dtype=a.dtype,
+                        drop_ambiguous=a.drop_ambiguous, log=log._log)
         if a.remove_panel_admixture:
             from .panel_admixture import remove_panel_admixture
             remove_panel_admixture(a.out, dict(zip(names, a.panel)), match=a.match, threads=a.threads,
@@ -381,12 +417,14 @@ def main(argv=None):
     elif a.cmd == "sample-factors":
         from .sample_factors import sample_factors
         sample_factors(a.geno, a.ref, a.out, sources=_sources(a.sources), covar=a.covar, keep=a.keep, match=a.match,
-                       threads=a.threads, ld_mass=not a.no_ld_mass, memory_gb=a.memory_gb, log=log._log)
+                       threads=a.threads, ld_mass=not a.no_ld_mass, memory_gb=a.memory_gb,
+                       drop_ambiguous=a.drop_ambiguous, log=log._log)
     elif a.cmd == "derive":
         from .derive import derive_source
         derive_source(a.geno, a.ref, a.out, name=a.name, known=_sources(a.known), panel=a.panel, covar=a.covar,
                       keep=a.keep, match=a.match, als_snps=a.als_snps, als_iter=a.als_iter, ld=a.ld,
-                      calibrate=not a.no_calibration, threads=a.threads, log=log._log)
+                      calibrate=not a.no_calibration, threads=a.threads, drop_ambiguous=a.drop_ambiguous,
+                      log=log._log)
     elif a.cmd == "curve":
         from .curve import genotype_curve
         genotype_curve(a.geno, a.ref, a.out, sources=_sources(a.sources), covar=a.covar, keep=a.keep, match=a.match,
@@ -396,7 +434,7 @@ def main(argv=None):
                        relatedness_cell_cm=a.relatedness_cell_cm, relatedness_controls=a.relatedness_controls,
                        relatedness_memory_gb=a.relatedness_memory_gb, background=a.background,
                        background_quantile=a.background_quantile, background_between_snps=a.background_snps,
-                       log=log._log)
+                       drop_ambiguous=a.drop_ambiguous, log=log._log)
     elif a.cmd == "tractor-sumstats":
         from .tracks import tractor_sumstats
         tractor_sumstats(a.tractor, a.out, sources=_sources(a.sources), se=a.se, allow_ols=a.allow_ols,
@@ -426,7 +464,8 @@ def main(argv=None):
                          sample_factors_calibrate=not a.sample_factors_no_calibration,
                          per_trait_n=not a.single_n, n_tol=a.n_tol,
                          calibrate_between_chromosomes=a.calibrate_between_chromosomes, tracks=a.tracks,
-                         track_alpha=a.track_alpha, partners=a.partners, log=log._log)
+                         track_alpha=a.track_alpha, partners=a.partners, drop_ambiguous=a.drop_ambiguous,
+                         log=log._log)
     return 0
 
 

@@ -73,10 +73,18 @@ def fit_exponential(d, k, min_d=2.0, max_d=20.0):
     d, k = np.asarray(d, np.float64), np.asarray(k, np.float64)
     use = (d >= min_d) & (d <= max_d) & np.isfinite(k)
     if use.sum() < 5:
-        raise ValueError("Too few curve points beyond the fitting start to fit the decay.")
+        raise ValueError(f"Too few curve points between {min_d:g} and {max_d:g} cM to fit the decay; the cohort has "
+                         "too few SNPs for curve mode, so use date mode with a published admixture date.")
     f = lambda x, A, H, lam: A + H * np.exp(-lam * x)
-    p0 = (float(k[use][-1]), float(max(k[use][0], 1e-3)), 0.05)
-    p, _ = curve_fit(f, d[use], k[use], p0=p0, bounds=([-1.0, 0.0, 1e-5], [1.0, 2.0, 5.0]), maxfev=20000)
+    lo, hi = [-1.0, 0.0, 1e-5], [1.0, 2.0, 5.0]
+    # a start inside the bounds (a noisy curve of few SNPs can begin or end outside them); unchanged otherwise
+    p0 = tuple(float(np.clip(x, a, b)) for x, a, b in zip((k[use][-1], max(k[use][0], 1e-3), 0.05), lo, hi))
+    try:
+        p, _ = curve_fit(f, d[use], k[use], p0=p0, bounds=(lo, hi), maxfev=20000)
+    except (RuntimeError, ValueError) as e:
+        raise ValueError(f"The decay of the curve could not be fitted between {min_d:g} and {max_d:g} cM ({e}). The "
+                         "curve is too noisy: the cohort has too few people or SNPs for curve mode; use date mode "
+                         "with a published admixture date.") from None
     return dict(A=float(p[0]), H=float(p[1]), lam=float(p[2]))
 
 
