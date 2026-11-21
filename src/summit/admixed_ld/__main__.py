@@ -12,6 +12,8 @@
                                  (--curve CURVE | --admixture-generations T) --out REGION
   summit admixed-ld matrix ... --sumstats GWAS --error-variance      then SuSiE twice (example/finemap_two_stage.R)
   summit admixed-ld finemap-variance --matrix REGION --posterior FIT1.tsv --out REGION
+  summit admixed-ld tractor-gwas --pgen PHASED[_{chr}] --lanc LANC[_{chr}].lanc --pheno PHENO --covar COVAR
+                                 --sources AFR,EUR --out GWAS        (writes GWAS.<trait>.tractor.tsv with se_hcn)
   summit admixed-ld tractor-sumstats --tractor TRACTOR.tsv --sources AFR,EUR --covariates C --out TRACKS
   summit admixed-ld track-rg     --tracks COMPOSE_PREFIX --sumstats TRACKS --annot ANNOT [--external EUR.sumstats]
                                  --out OUT
@@ -316,6 +318,36 @@ def main(argv=None):
                     help="the first fit's posterior second moments per SNP on the z scale (columns SNP and EB2; "
                          "susieR: colSums(alpha * mu2) / X_column_scale_factors^2)")
     fv.add_argument("--out", required=True, help="output prefix (PREFIX.s2.json)")
+    tg = sub.add_parser("tractor-gwas", help="Tractor-style GWAS from phased genotypes and local ancestry, with the "
+                                             "sandwich SEs that tractor-sumstats needs (se_hcn_anc<s>)")
+    tg.add_argument("--pgen", required=True,
+                    help="phased PLINK 2 prefix (.pgen/.pvar/.psam; biallelic, no missing calls), or a path containing "
+                         "{chr} with one PGEN per chromosome")
+    tg.add_argument("--lanc", required=True,
+                    help="admix-kit .lanc local ancestry aligned to the PGEN's variants and samples (codes 0 and 1), "
+                         "or a path containing {chr}")
+    tg.add_argument("--pheno", required=True, help="FID IID and one column per trait (NA for missing values)")
+    tg.add_argument("--covar", required=True,
+                    help="FID IID and the covariates, PCs included; each trait uses the people with the trait and "
+                         "every covariate")
+    tg.add_argument("--keep", default=None, help="samples to use (FID IID or IID per line)")
+    tg.add_argument("--sources", default=None,
+                    help="names of the .lanc's ancestry codes 0 and 1, Tractor's anc0 and anc1 (e.g. AFR,EUR when code "
+                         "0 is African), for the record and tractor-sumstats --sources (default anc0,anc1)")
+    tg.add_argument("--chromosomes", default=None,
+                    help="with {chr}: comma-separated chromosomes (default: those of 1-22 whose PGEN exists)")
+    tg.add_argument("--hc1", action="store_true",
+                    help="also write the HC1 sandwich from the full model's residuals (se_hc_anc<s>), which is biased "
+                         "low at alleles rare on a track")
+    tg.add_argument("--min-cases", type=int, default=50,
+                    help="fewest complete cases a trait may have (default 50); a trait with fewer is an error")
+    tg.add_argument("--step", type=int, default=None,
+                    help="SNPs per block (default: 2 million people x SNPs per block, at most 2048; about 64 bytes "
+                         "each per thread)")
+    tg.add_argument("--threads", "--num-threads", dest="threads", type=int, default=1,
+                    help="blocks fitted in parallel, each with one BLAS thread (default 1)")
+    tg.add_argument("--out", required=True,
+                    help="output prefix: OUT.<trait>.tractor.tsv per trait and OUT.tractor_gwas.json")
 
     ts = sub.add_parser("tractor-sumstats", help="split a Tractor GWAS into one summary-statistic file per "
                                                  "local-ancestry track (sandwich SEs required)")
@@ -440,6 +472,11 @@ def _run(a, log):
                        relatedness_memory_gb=a.relatedness_memory_gb, background=a.background,
                        background_quantile=a.background_quantile, background_between_snps=a.background_snps,
                        drop_ambiguous=a.drop_ambiguous, log=log._log)
+    elif a.cmd == "tractor-gwas":
+        from .tractor_gwas import tractor_gwas
+        tractor_gwas(a.pgen, a.lanc, a.pheno, a.covar, a.out, keep=a.keep, sources=_sources(a.sources),
+                     chromosomes=_sources(a.chromosomes), hc1=a.hc1, min_cases=a.min_cases, step=a.step,
+                     threads=a.threads, log=log._log)
     elif a.cmd == "tractor-sumstats":
         from .tracks import tractor_sumstats
         tractor_sumstats(a.tractor, a.out, sources=_sources(a.sources), se=a.se, allow_ols=a.allow_ols,
