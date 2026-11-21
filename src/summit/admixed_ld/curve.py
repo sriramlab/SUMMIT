@@ -761,8 +761,11 @@ def genotype_curve(geno, ref_path, out, *, sources=None, covar=None, keep=None, 
             Uh = Uall[h].reshape(int(h.sum()), k1 * nC)          # column a * n_cells + cell
             Sh.append(mp.tn(Uh, Uh) / (h.sum() - 1 - p_rank))
         tab = pd.concat(coarse_tab, ignore_index=True)
-        np.savez(f"{out}.cells.npz", S1=Sh[0], S2=Sh[1], Q=np.concatenate(coarse_q), chrom=tab.CHR.to_numpy().astype(str),
-                 start_cm=tab.start_cm.to_numpy(), width_cm=tab.width_cm.to_numpy(), k1=k1)
+        # each half's covariance matrix is symmetric: its upper triangle (row by row) is stored, half the size
+        iu = np.triu_indices(Sh[0].shape[0])
+        np.savez(f"{out}.cells.npz", S1_upper=Sh[0][iu], S2_upper=Sh[1][iu], size=Sh[0].shape[0],
+                 Q=np.concatenate(coarse_q), chrom=tab.CHR.to_numpy().astype(str), start_cm=tab.start_cm.to_numpy(),
+                 width_cm=tab.width_cm.to_numpy(), k1=k1)
         info["cells"] = dict(file=f"{out}.cells.npz", n_cells=int(nC), cells_cm=float(cells_cm),
                              estimator="split halves")
         del Uall

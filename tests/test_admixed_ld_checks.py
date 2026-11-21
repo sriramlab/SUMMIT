@@ -335,3 +335,15 @@ def test_matrix_aligns_z_and_predicts_its_error(small, tmp_path):
     rec = finemap_variance(str(tmp_path / "m1"), str(tmp_path / "post.tsv"), log=quiet)
     assert rec["s2"] == pytest.approx(1 + np.mean(V @ eb2)) == pytest.approx(residual_variance(V, eb2))
     assert info["error_variance"]["n"] == 900.0
+
+
+def test_cell_matrix_stored_as_upper_triangles_reads_back(tmp_path):
+    from summit.admixed_ld.compose import cell_half
+    rng = np.random.default_rng(2)
+    A = rng.standard_normal((7, 7))
+    S = A @ A.T
+    iu = np.triu_indices(7)
+    np.savez(tmp_path / "new.npz", S1_upper=S[iu], size=7)
+    np.savez(tmp_path / "old.npz", S1=S)
+    assert np.array_equal(cell_half(np.load(tmp_path / "new.npz"), "S1"), S)
+    assert np.array_equal(cell_half(np.load(tmp_path / "old.npz"), "S1"), S)

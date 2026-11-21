@@ -332,6 +332,19 @@ def _fft_conv_sym(W: np.ndarray, kern: np.ndarray) -> np.ndarray:
     return np.fft.irfft(fw * fk[:, None], n=size, axis=0)[:n]
 
 
+def cell_half(z, key):
+    """One half's cell covariance matrix from a curve's cells.npz: stored whole (S1, S2) or as its upper triangle row
+    by row (S1_upper, S2_upper, with its size)."""
+    if key in z.files:
+        return z[key]
+    n = int(z["size"])
+    S = np.zeros((n, n))
+    iu = np.triu_indices(n)
+    S[iu] = z[f"{key}_upper"]
+    S[(iu[1], iu[0])] = z[f"{key}_upper"]
+    return S
+
+
 def _cell_correction(path, kern, chrom_out, cm_out, Oflat, Wn, cls, K, k1, switch_cm, log):
     """Long-range admixture LD from the cohort's cell matrix in place of the kernel: for pairs of cells on the same
     chromosome at least switch_cm apart and for every pair of cells on different chromosomes, the kernel's square
@@ -349,7 +362,7 @@ def _cell_correction(path, kern, chrom_out, cm_out, Oflat, Wn, cls, K, k1, switc
     mid = start + width / 2.0
     Kh = []
     for key in ("S1", "S2"):
-        Sr = z[key].reshape(k1, nC, k1, nC)                        # [a, cell, b, cell']
+        Sr = cell_half(z, key).reshape(k1, nC, k1, nC)             # [a, cell, b, cell']
         num = np.transpose(Sr, (1, 3, 0, 2))                       # cell, cell', a, b
         den = np.einsum("iau,jbv->ijabuv", Q, Q)
         Kc = np.zeros((nC, nC, k1, k1))
