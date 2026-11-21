@@ -47,7 +47,7 @@ summit admixed-ld clean-panels --ref "$OUT/ref" "${PANEL_ARGS[@]}" --names "$NAM
 # curve.curve.tsv, .curve.json, .background.tsv, .cells.npz (and .relatedness.tsv, .relatedness_chr.npz). The json
 # records the number of people and of related pairs; check them against the cohort's rules on small counts.
 summit admixed-ld curve --geno "$COHORT" --ref "$OUT/ref_clean" --keep "$GWAS_SAMPLE" --covar "$GWAS_COV" \
-  --relative-pairs "$PAIRS" --background --threads 8 --out "$OUT/curve"
+  --relative-pairs "$PAIRS" --threads 8 --out "$OUT/curve"
 
 # 2b (optional, a few hundred people only): the sample statistic, the cost of a GRM; aggregates only.
 # summit admixed-ld sample-factors --geno "$COHORT" --ref "$OUT/ref_clean" --keep "$GWAS_SAMPLE" --covar "$GWAS_COV" \
@@ -56,8 +56,8 @@ summit admixed-ld curve --geno "$COHORT" --ref "$OUT/ref_clean" --keep "$GWAS_SA
 # ------------------------------------------------------------------------------------------------ 3. compose (anyone)
 # About 6 minutes on one core and 3 GB at array density, half of it writing one file per GWAS sample size; linear in
 # the SNP pairs within 3 Mb. Read the warnings and the flags in each .admixed_ld.json.
-summit admixed-ld compose --ref "$OUT/ref_clean" --sumstats "$SUMSTATS" --annot "$ANNOT" \
-  --curve "$OUT/curve" --relatedness curve --cell-matrix --out "$OUT/ld_curve"
+summit admixed-ld compose --ref "$OUT/ref_clean" --sumstats "$SUMSTATS" --annot "$ANNOT" --curve "$OUT/curve" \
+  --out "$OUT/ld_curve"
 # Date mode, from the summary statistics and a published date alone (add --ancestry-sd with a published value if one
 # exists):
 summit admixed-ld compose --ref "$OUT/ref_clean" --sumstats "$SUMSTATS" --annot "$ANNOT" \
@@ -76,10 +76,14 @@ for ss in "$SUMSTATS"/*; do
 done
 
 # ------------------------------------------------------------------------------------------------ 5. fine-mapping (anyone)
-# A regional matrix per region (seconds), oriented to the counted allele in region.snps.tsv; align the z-scores to it.
+# Per region (seconds to a minute): the matrix restricted to the GWAS's SNPs, the z-scores on its counted alleles and the
+# predicted error variance; then the two SuSiE fits (R with susieR), the second with the residual variance s^2.
+# mkdir -p "$OUT/fm"
 # summit admixed-ld matrix --ref "$OUT/ref_clean" --params "$OUT/ld_curve.admixed_ld.json" --curve "$OUT/curve" \
-#   --region 4:1000000-4000000 --out "$OUT/fm/region1"
+#   --region 4:1000000-4000000 --sumstats "$SUMSTATS/height.tsv" --error-variance --out "$OUT/fm/region1"
+# Rscript "$(dirname "$0")/finemap_two_stage.R" "$OUT/fm/region1"
 
 # ------------------------------------------------------------------------------------------------ 6. track rg (optional)
-# Needs a Tractor-style GWAS with sandwich SEs from the covariates-only residuals (se_hcn_anc<s>); see the wiki.
+# Needs phased genotypes and local-ancestry calls of the GWAS sample, and a Tractor-style GWAS with sandwich SEs from
+# the covariates-only residuals (se_hcn_anc<s>); the GWAS runs where the genotypes are, the rest anywhere. See the wiki.
 echo "SUMMIT-MIX template finished; outputs in $OUT"

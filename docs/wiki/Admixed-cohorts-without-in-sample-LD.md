@@ -28,7 +28,8 @@ template with real inputs, see `example/admixed_ld_real_data.sh`.
 | 4 | `summit --h2`, `--rg` | anyone | summary statistics, LD scores | estimates |
 
 Optional steps: `sample-factors` (the cohort, for samples of a few hundred people), `derive` (a source without a
-panel), `matrix` (fine-mapping), `tractor-sumstats` and `track-rg` (correlation of effects across local ancestries).
+panel), `matrix` and `finemap-variance` (fine-mapping), `tractor-gwas`, `tractor-sumstats` and `track-rg` (correlation
+of effects across local ancestries).
 
 What the curve releases is aggregate: the kernel every 0.25 cM and between chromosomes (a few thousand numbers), the
 moments of global ancestry, the background term every 0.5 cM, and a covariance matrix between 2-cM cells of the genome
@@ -105,7 +106,7 @@ converted or subset copy made from the same panels, where the panel genotypes ar
 
 ```bash
 summit admixed-ld curve --geno cohort --ref ref/afr_eur_clean --keep gwas_sample.txt --covar gwas.cov \
-  --relative-pairs related_pairs.tsv --background --threads 16 --out cohort
+  --relative-pairs related_pairs.tsv --threads 16 --out cohort
 ```
 
 Run this where the genotypes are, on the GWAS sample (`--keep`) with the GWAS's own covariate matrix (`--covar`,
@@ -113,8 +114,10 @@ including its PCs). It measures κ_res(d) as the weighted LD curve of ROLLOFF an
 0.25 cM up to the longest chromosome and between chromosomes, the moments of global ancestry (mean, variance, third and
 fourth moments), and the cell matrix, estimated in two halves of the people so that its square is unbiased.
 
-- `--background` measures the background term from all pairs of people among the least differentiated fifth of the
-  SNPs, by distance and between chromosomes. It is part of curve mode.
+- The background term is measured from all pairs of people among the least differentiated fifth of the SNPs, by
+  distance and between chromosomes. It is part of curve mode; `--no-background` leaves it out. Each chromosome's
+  background SNPs are held in memory (people x SNPs); above `--background-memory-gb` (default 32) a random subset of
+  them is used, which keeps the term unbiased and is recorded.
 - `--relative-pairs` lists related pairs (IID1 IID2, optionally FID1 FID2 and a kinship column), for example pairs with
   relatedness above 0.0442 in a GRM of PC-adjusted genotypes. They keep each family within one half of the cell matrix.
   `--kinship-col` and `--kinship-min` select pairs.
@@ -132,8 +135,7 @@ of missing genotypes.
 Curve mode:
 
 ```bash
-summit admixed-ld compose --ref ref/afr_eur_clean --sumstats gwas/ --annot annot.tsv.gz \
-  --curve cohort --relatedness curve --cell-matrix --out ld/cohort
+summit admixed-ld compose --ref ref/afr_eur_clean --sumstats gwas/ --annot annot.tsv.gz --curve cohort --out ld/cohort
 ```
 
 Date mode, with only the summary statistics and a published date:
@@ -149,11 +151,11 @@ a table with SNP CHR BP A1 A2). `--annot` is the annotation of the fit, such as 
 
 In curve mode the kernel beyond 2 cM, the decay of the within-source weights and the moments of global ancestry come from
 the curve. Below 2 cM the curve also holds within-source LD, so the kernel there is an exponential from κ_res(0) of the
-standard errors to the curve's value at 2 cM. `--relatedness curve` adds the background term at every distance,
-smoothed as a constant plus decaying exponentials fitted from 3 cM on, and removes the panels' own background inside the
-band. `--cell-matrix` uses the cell matrix for pairs of 2-cM cells at least 10 cM apart and between chromosomes. Compose
-stops when the curve at 2 cM is above κ_res(0) of the standard errors, because then the two inputs describe different
-samples or covariates.
+standard errors to the curve's value at 2 cM. The background term is added at every distance, smoothed as a constant
+plus decaying exponentials fitted from 3 cM on, and the panels' own background is removed inside the band. The cell
+matrix is used for pairs of 2-cM cells at least 10 cM apart and between chromosomes. Both are used whenever the curve
+has them; `--relatedness none` and `--no-cell-matrix` leave them out. Compose stops when the curve at 2 cM is above
+κ_res(0) of the standard errors, because then the two inputs describe different samples or covariates.
 
 In date mode the kernel decays at T/100 per cM from κ_res(0) to the between-chromosome constant −2 κ_res(0)/(T G), G the
 genetic length of the genome. The dates we used were 6 generations for African American and African Caribbean groups and
@@ -167,7 +169,8 @@ step. `--mean-ancestry` and `--kappa0` replace the values from the standard erro
 **One file per GWAS sample size.** The same-person and background terms belong to each GWAS's sample. When the traits'
 median N differ by more than 1%, compose writes one file per group of traits (`ld/cohort.n<N>.gw.ldscore.gz`, listed
 with their traits in `ld/cohort.n_groups.tsv`); fit each trait with its group's file. `ld/cohort.gw.ldscore.gz` is
-the file for the median N. `--single-n` writes only that file.
+the file for the median N. When no group's LD mass differs from it by 0.1% (large samples), it serves every trait and
+no group files are written. `--single-n` writes only that file.
 
 **Checks.** Compose stops when the GWAS's alleles disagree with the reference at many shared positions. It records
 flags in `ld/cohort.admixed_ld.json` (and logs a warning) when a panel was not cleaned, when the ancestry SD is the
@@ -196,7 +199,7 @@ ancestries. The cohort can then release a sample statistic made on the GWAS samp
 ```bash
 summit admixed-ld sample-factors --geno cohort --ref ref/afr_eur_clean --keep gwas_sample.txt --covar gwas.cov \
   --threads 8 --out cohort
-summit admixed-ld compose ... --curve cohort --relatedness curve --cell-matrix --sample-factors cohort --out ld/cohort
+summit admixed-ld compose ... --curve cohort --sample-factors cohort --out ld/cohort
 ```
 
 The statistic is a small covariance matrix of person factors (a level, the ancestry proportions and the local-ancestry
@@ -234,22 +237,30 @@ its heritability, and the intercept fixed at zero for disjoint samples.
 
 ```bash
 summit admixed-ld matrix --ref ref/afr_eur_clean --params ld/cohort.admixed_ld.json --curve cohort \
-  --region 4:1000000-4000000 --out fm/region1
+  --region 4:1000000-4000000 --sumstats gwas/height.tsv --error-variance --out fm/region1
+Rscript example/finemap_two_stage.R fm/region1
 ```
 
 `matrix` writes the correlation matrix of the adjusted genotypes of the GWAS sample over a region (`fm/region1.ld`,
-`.ld.npz`) and the SNPs with the counted allele of each (`fm/region1.snps.tsv`). Align the z-scores to that allele
-before fine-mapping. The admixture term enters linearly and is computed for every pair; if the kernel over the region's
-positions is not positive semi-definite, it is projected onto that cone. The panel term carries sampling noise at every
-pair, so by default (`--taper auto`) it is tapered exponentially with distance, at a scale chosen from the panels alone
-by an unbiased estimate of its squared error. Use the same mode (`--curve` or `--admixture-generations`) as compose.
+`.ld.npz`) and the SNPs with the counted allele of each (`fm/region1.snps.tsv`). With `--sumstats` it keeps the region's
+SNPs in the summary statistics and writes their z-scores on that allele (`fm/region1.z.tsv`; flipped where the GWAS
+counts the other allele, strand-ambiguous SNPs left out unless `--keep-ambiguous`). The admixture term enters linearly
+and is computed for every pair; if the kernel over the region's positions is not positive semi-definite, it is
+projected onto that cone. The panel term carries sampling noise at every pair, so by default (`--taper auto`) it is
+tapered exponentially with distance, at a scale chosen from the panels alone by an unbiased estimate of its squared
+error. Use the same mode (`--curve` or `--admixture-generations`) as compose.
 
 The error of a composed matrix has the shape of the matrix itself, so the RSS-λ model of SuSiE, which treats it as
-independent noise, finds almost none. Fine-mapping with SUMMIT-MIX matrices therefore uses two SuSiE fits: the first
-with the residual variance fixed at 1, then a second with the residual variance s² = 1 + (N/P) Σ_j Σ_{c≠j} V_jc E(b_c²),
-from the first fit's posterior second moments and V, the predicted variance of the error of each entry of the matrix
-from the panels' sampling. `matrix` does not write V yet. At strongly differentiated loci with very strong signals, and at loci that define how the
-sample was selected, composed matrices carry error beyond this prediction.
+independent noise, finds almost none. Fine-mapping with SUMMIT-MIX matrices therefore uses two SuSiE fits of
+z = R b + e with e ~ N(0, s² (R + λI)) and λ = 10⁻⁴: the first with s² = 1, the second with
+s² = 1 + mean_j Σ_{c≠j} V_jc E(b_c²), from the first fit's posterior second moments (on the z scale) and V, the
+predicted variance of the error of each entry of the matrix. `--error-variance` writes V (`fm/region1.ld_var`,
+`.ld_var.npz`) for a GWAS of `--n` people (default: the median N of `--sumstats`): the panels' sampling with
+Hardy-Weinberg moments, the taper's squared bias, and the sampling variance of the correlation in the GWAS sample
+itself. V depends only on the panels and the composition, never on in-sample LD. `example/finemap_two_stage.R`
+(susieR) runs both fits; `summit admixed-ld finemap-variance --matrix fm/region1 --posterior FIT1.tsv --out fm/region1`
+gives s² from any first fit's posterior (columns SNP and EB2). At strongly differentiated loci with very strong
+signals, and at loci that define how the sample was selected, composed matrices carry error beyond this prediction.
 
 ## Correlation of effects across local ancestries
 
@@ -265,8 +276,8 @@ covariance is zero.
 summit admixed-ld tractor-sumstats --tractor tractor/height.tsv --sources AFR,EUR --covariates 13 --out tracks/height
 summit admixed-ld compose --ref ref/afr_eur_clean --sumstats tracks/height.AFR.sumstats --annot maf5.tsv.gz \
   --curve cohort --mean-ancestry 0.59,0.41 --ancestry-sd 0.29 --tracks --cross-source EUR --out ld/tracks
-summit admixed-ld track-rg --tracks ld/tracks --sumstats tracks/height --annot maf5.tsv.gz \
-  --external eur/height.sumstats --out results/height
+summit admixed-ld track-rg --tracks ld/tracks --sumstats tracks/height tracks/bmi tracks/ldl --annot maf5.tsv.gz \
+  --out results/pooled
 ```
 
 **Standard errors.** The estimate needs sandwich standard errors whose meat uses the residuals of the covariates-only
@@ -285,9 +296,14 @@ are on the per-allele scale, with effect variance proportional to one over the c
 fits each pair of tracks with SUMMIT's cross-population equations with the noise covariance fixed at zero, and
 combines the classes as r = Σ_c τ_AE,c n_c / √(Σ_c τ_A,c n_c · Σ_c τ_E,c n_c), n_c the partners in class c. Partition by
 five MAF classes (edges 0.01, 0.02, 0.05, 0.1, 0.2, 0.5), which take up the dependence of the effect variance on
-frequency between classes. One trait is noisy at biobank sizes. Pool traits by summing their moments over traits on
-shared jackknife blocks, rather than averaging per-trait ratios. Local-ancestry errors put alleles on the wrong track
-and push r up, so read r next to the caller's accuracy.
+frequency between classes. One trait is noisy at biobank sizes, so `track-rg` with several traits' prefixes pools them
+as the ratio of their summed moments (over traits and classes, τ_AE,c n_c over the root of the two tracks' sums) on
+shared jackknife blocks, which weighs traits by their track heritability as a pooled likelihood does. Each MAF class
+can also be split at the median LD score of its SNPs (classes named `maf1_ld1`, `maf1_ld2`, ...): with
+`--merge-ld-halves` a class keeps its split only when all four of its own-track moments pooled over the traits have a
+jackknife z of at least 2 (`--merge-z`), and the traits are fitted again on the merged classes. `--external` (one trait
+at a time) adds each track's correlation with a GWAS of other people from the cross-source population. Local-ancestry
+errors put alleles on the wrong track and push r up, so read r next to the caller's accuracy.
 
 ## Compute
 

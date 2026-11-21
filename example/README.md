@@ -44,7 +44,9 @@ generations ago) on six chromosomes of 60 cM, with two traits of h² 0.3 and gen
 correlation 0.6, under `example/out/admixed_ld/`. It builds the reference from the
 panels and cleans it, measures the cohort's curve with its background term, and
 composes LD scores in curve mode and in date mode. It then fits h² and the genetic
-correlation with each and with in-sample LD scores, and writes a regional LD matrix.
+correlation with each and with in-sample LD scores, and fine-maps one region: a regional
+LD matrix with the trait's aligned z-scores and the predicted error of its entries, then
+two SuSiE fits with `finemap_two_stage.R` when R and susieR are installed.
 h² is about 0.234 (SE 0.028) in curve mode, 0.231 in date mode and 0.234 in-sample;
 the two PCs among the covariates take up part of the simulated 0.3. The genetic
 correlation is about 0.62 (SE 0.09) with every set of LD scores. The run takes about

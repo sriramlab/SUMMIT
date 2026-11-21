@@ -22,14 +22,15 @@ fi
 "${SUMMIT[@]}" admixed-ld clean-panels --ref "$D/ref" --panel "$D/panel_afr" --panel "$D/panel_eur" --names AFR,EUR \
   --out "$D/ref_clean"
 
-# 2. Curve mode: the cohort's curve, with the GWAS covariates and the background term (aggregates only; run where the
-#    genotypes are). A real cohort also gives --keep (the GWAS sample) and --relative-pairs.
-"${SUMMIT[@]}" admixed-ld curve --geno "$D/cohort" --ref "$D/ref_clean" --covar "$D/cohort.cov" --background \
-  --cell-cm 0.5 --out "$D/cohort"
+# 2. Curve mode: the cohort's curve with the GWAS covariates, its background term included (aggregates only; run where
+#    the genotypes are). A real cohort also gives --keep (the GWAS sample) and --relative-pairs.
+"${SUMMIT[@]}" admixed-ld curve --geno "$D/cohort" --ref "$D/ref_clean" --covar "$D/cohort.cov" --cell-cm 0.5 \
+  --out "$D/cohort"
 
-# 3. Composed LD scores: curve mode, and date mode from the summary statistics and the admixture date alone
+# 3. Composed LD scores: curve mode (with the curve's background term and cell matrix, the defaults), and date mode
+#    from the summary statistics and the admixture date alone
 "${SUMMIT[@]}" admixed-ld compose --ref "$D/ref_clean" --sumstats "$D/trait.sumstats" "$D/trait2.sumstats" \
-  --annot "$D/cohort.annot" --curve "$D/cohort" --relatedness curve --cell-matrix --out "$D/composed_curve"
+  --annot "$D/cohort.annot" --curve "$D/cohort" --out "$D/composed_curve"
 "${SUMMIT[@]}" admixed-ld compose --ref "$D/ref_clean" --sumstats "$D/trait.sumstats" "$D/trait2.sumstats" \
   --annot "$D/cohort.annot" --admixture-generations 8 --out "$D/composed_date"
 
