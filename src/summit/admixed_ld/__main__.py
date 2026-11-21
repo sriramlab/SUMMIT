@@ -339,8 +339,14 @@ def main(argv=None):
     tr = sub.add_parser("track-rg", help="correlation of per-allele causal effects across local-ancestry tracks (Hou "
                                          "et al.'s r_admix), and of each track with another population's GWAS")
     tr.add_argument("--tracks", required=True, help="prefix of `compose --tracks` (its .admixed_ld.json)")
-    tr.add_argument("--sumstats", required=True,
-                    help="the tractor-sumstats prefix, or the track files comma-separated in compose's source order")
+    tr.add_argument("--sumstats", required=True, nargs="+",
+                    help="the tractor-sumstats prefix, or the track files comma-separated in compose's source order; "
+                         "several traits' prefixes pool r over the traits (ratio of their summed moments, one "
+                         "jackknife)")
+    tr.add_argument("--merge-ld-halves", action="store_true",
+                    help="with several traits and classes named <maf class>_<half>: merge a MAF class's two LD halves "
+                         "when any of its pooled own-track moments has a jackknife z below --merge-z")
+    tr.add_argument("--merge-z", type=float, default=2.0, help="z threshold of --merge-ld-halves (default 2)")
     tr.add_argument("--annot", required=True, help="the annotation of the fit (as given to compose)")
     tr.add_argument("--external", default=None,
                     help="summary statistics of a GWAS of other people from the population of compose's "
@@ -443,7 +449,8 @@ def _run(a, log):
         njack = int(a.njack) if str(a.njack).isdigit() else a.njack
         track_rg(a.tracks, a.sumstats, a.annot, a.out, external=a.external, cohort_track=a.cohort_track,
                  njack=njack, groups=a.group,
-                 allow_ols=a.allow_ols, max_chisq=a.max_chisq, keep_ambiguous=a.keep_ambiguous, log=log._log)
+                 allow_ols=a.allow_ols, max_chisq=a.max_chisq, keep_ambiguous=a.keep_ambiguous,
+                 merge_ld_halves=a.merge_ld_halves, merge_z=a.merge_z, log=log._log)
     elif a.cmd == "matrix":
         from .matrix import compose_matrix
         compose_matrix(a.ref, a.out, region=a.region, snps=a.snps, sources=_sources(a.sources), params=a.params,

@@ -355,8 +355,171 @@ def parse_groups(specs, classes):
     return groups
 
 
+# ----------------------------------------------------------------------------------------------- pooling over traits
+def _maf_of(c):
+    return str(c).split("_")[0]
+
+
+def pool_reps(T, n, sel):
+    """Per-replicate pooled r over the traits in sel: sum_traits sum_c tau_12,c n_c / sqrt(sum sum tau_1,c n_c
+    sum sum tau_2,c n_c), from each trait's per-replicate moments T[trait] = (tau_1, tau_2, tau_12) (_taus)."""
+    tot = lambda t: (t * n[None, :]).sum(axis=1)
+    return _ratio(sum(tot(T[k][2]) for k in sel), sum(tot(T[k][0]) for k in sel), sum(tot(T[k][1]) for k in sel))
+
+
+def merge_rule(T, jk, us, n, classes, sel, thr=2.0):
+    """The classes whose two LD halves are merged: per class the own-track moments pooled over the traits in sel,
+    sum_traits tau_s,c n_c (s = each track), and their jackknife z; a MAF class (the class name up to its first '_')
+    with two halves is merged when any of its four moments has z below thr or no finite z. Returns (merged MAF
+    classes, the z table)."""
+    z = {}
+    for i in (0, 1):
+        est, se = _summ(jk, us, sum(T[k][i] * n[None, :] for k in sel))
+        with np.errstate(invalid="ignore", divide="ignore"):
+            z[i] = np.where(se > 0, est / se, np.nan)
+    merge = []
+    for m in dict.fromkeys(_maf_of(c) for c in classes):
+        idx = [i for i, c in enumerate(classes) if _maf_of(c) == m]
+        if len(idx) == 2 and not all(np.isfinite(z[s][i]) and z[s][i] >= thr for s in (0, 1) for i in idx):
+            merge.append(m)
+    return merge, {str(s): dict(zip(classes, map(float, z[s]))) for s in z}
+
+
+def merged_classes(classes, merge):
+    """Classes after merging the LD halves of the MAF classes in merge, in order, with their member columns."""
+    out = {}
+    for c in classes:
+        out.setdefault(_maf_of(c) if _maf_of(c) in merge else c, []).append(c)
+    return out
+
+
+def write_merged(tracks, annot, members, out):
+    """Merged copies of a `compose --tracks` prefix (every file of its tracks block) and of the annotation: sums of the
+    member classes' columns, partner counts (.gw.M) and partner V masses. Returns (prefix, annotation path)."""
+    import copy
+    from ..ldscore.gw_ldscore import write_gw_annotation_masses, write_gw_ldscore_table
+    with open(f"{tracks}.admixed_ld.json") as fh:
+        params = json.load(fh)
+    tb = params["tracks"]
+    cls = list(tb["classes"])
+    idx = {c: [cls.index(x) for x in mem] for c, mem in members.items()}
+    p2 = copy.deepcopy(params)
+    t2 = p2["tracks"]
+    t2["classes"] = list(members)
+    t2["partner_counts"] = [float(sum(tb["partner_counts"][i] for i in idx[c])) for c in members]
+    t2["partner_V_mass"] = {k: [float(sum(v[i] for i in idx[c])) for c in members] for k, v in tb["partner_V_mass"].items()}
+    for nm, rec in tb["files"].items():
+        df = pd.read_csv(rec["file"], sep="\t", dtype={"SNP": str, "CHR": str})
+        if [c for c in df.columns if c not in ("CHR", "SNP", "BP", "V")] != cls:
+            raise ValueError(f"{rec['file']}: its columns are not the classes {cls}.")
+        scores = pd.DataFrame({c: df[mem].to_numpy(np.float64).sum(axis=1) for c, mem in members.items()})
+        dst = f"{out}.{nm}"
+        write_gw_ldscore_table(dst, df[["CHR", "SNP", "BP"]], scores, snp_var=df["V"].to_numpy() if "V" in df else None)
+        M = np.array(open(rec["file"][:-len(".gw.ldscore.gz")] + ".gw.M").read().split(), dtype=np.float64)
+        write_gw_annotation_masses(dst, np.array([M[idx[c]].sum() for c in members]))
+        t2["files"][nm]["file"] = f"{dst}.gw.ldscore.gz"
+    p2["class_merge"] = dict(prefix=os.path.abspath(tracks), members=members)
+    with open(f"{out}.admixed_ld.json", "w") as fh:
+        json.dump(p2, fh, indent=1)
+    A = pd.read_csv(annot, sep=r"\s+", dtype={"SNP": str})
+    meta = [c for c in A.columns if c in ("CHR", "BP", "SNP", "CM")]
+    if [c for c in A.columns if c not in meta] != cls:
+        raise ValueError(f"{annot}: its class columns are not the track LD scores' classes {cls}.")
+    B = A[meta].copy()
+    for c, mem in members.items():
+        B[c] = A[mem].sum(axis=1)
+    af = f"{out}.annot.tsv.gz"
+    B.to_csv(af, sep="\t", index=False, compression="gzip")
+    return out, af
+
+
+def _pooled_track_rg(tracks, sumstats, annot, out, *, njack, groups, allow_ols, max_chisq, merge_ld_halves,
+                     merge_z, log):
+    """track_rg over several traits (one tractor-sumstats prefix each): every trait's pair fit, and r pooled over the
+    traits on shared jackknife blocks (traits whose SNPs differ from the first trait's are left out of the pool), with
+    the optional merge of LD halves decided on the pooled own-track moments."""
+    with open(f"{tracks}.admixed_ld.json") as fh:
+        tb = json.load(fh)["tracks"]
+    sources = tb["sources"]
+    if len(sources) != 2:
+        raise ValueError("Pooling over traits covers two tracks.")
+    s, t = sources
+    names = [os.path.basename(str(x).rstrip("/")) for x in sumstats]
+    if len(set(names)) != len(names):
+        raise ValueError("The trait prefixes must have distinct names.")
+    files = {}
+    for nm, pre in zip(names, sumstats):
+        f, _ = _track_files(pre, sources)
+        for x in f:
+            st = _se_type(x)
+            if st not in (None, "HC") and not allow_ols:
+                raise ValueError(f"{x} has {st} standard errors; use sandwich SEs or pass --allow-ols.")
+        files[nm] = f
+
+    def fit_all(pre, annot_file, classes):
+        with open(f"{pre}.admixed_ld.json") as fh:
+            tb_ = json.load(fh)["tracks"]
+        fl, n, pv = tb_["files"], np.asarray(tb_["partner_counts"], np.float64), tb_["partner_V_mass"]
+        T, per, snps0, jk0, excluded = {}, {}, None, None, []
+        for nm in names:
+            res = _fit_pair(files[nm][0], files[nm][1], fl[f"track_{s}_{t}"]["file"], fl[f"track_{s}"]["file"],
+                            fl[f"track_{t}"]["file"], annot_file, njack=njack, max_chisq=max_chisq,
+                            drop_ambiguous=False, log=lambda m: None)
+            ps = _pair_summary(res, n, pv[s], pv[t], classes, groups)
+            if snps0 is None:
+                snps0, jk0 = ps["_snps"], ps["_jk"]
+            if np.array_equal(ps["_snps"], snps0):
+                T[nm] = _taus(res)
+            else:
+                excluded.append(nm)
+            per[nm] = _jsonable(dict(r=ps["r"], track_h2={s: ps["track_h2"][0], t: ps["track_h2"][1]},
+                                     n_snps=ps["n_snps"]))
+            log(f"[admixed-ld] track-rg: {nm}: r {per[nm]['r'][0]:.4f} (SE {per[nm]['r'][1]:.4f}), {ps['n_snps']} SNPs")
+        return T, per, jk0, excluded, n
+
+    classes = list(tb["classes"])
+    T, per, (jk, us), excluded, n = fit_all(tracks, annot, classes)
+    sel = [k for k in names if k in T]
+    merge_info = None
+    if merge_ld_halves:
+        merge, ztab = merge_rule(T, jk, us, n, classes, sel, merge_z)
+        members = merged_classes(classes, merge)
+        merge_info = dict(threshold=float(merge_z), merged=merge, z={sources[int(k)]: v for k, v in ztab.items()},
+                          classes=list(members))
+        log(f"[admixed-ld] track-rg: merge rule (pooled own-track z < {merge_z:g}): the LD halves of "
+            f"{', '.join(merge) if merge else 'no MAF class'} are merged")
+        if merge:
+            pre2, annot2 = write_merged(tracks, annot, members, f"{out}.merged")
+            classes = list(members)
+            T, per, (jk, us), excluded, n = fit_all(pre2, annot2, classes)
+            sel = [k for k in names if k in T]
+            merge_info.update(prefix=pre2, annot=annot2)
+    reps = pool_reps(T, n, sel)
+    r = _summ(jk, us, reps)
+    by_class = {}
+    for c, name in enumerate(classes):
+        tot = lambda i: sum(T[k][i][:, c] * n[c] for k in sel)
+        by_class[name] = _summ(jk, us, _ratio(tot(2), tot(0), tot(1)))
+    pooled = _jsonable(dict(r=r, classes=by_class, n_traits=len(sel), traits=sel, excluded=excluded,
+                            definition="sum over traits and classes of tau_12,c n_c over the root of the products of the "
+                                       "two tracks' sums; one jackknife over the traits' shared blocks"))
+    if excluded:
+        log(f"[admixed-ld] WARNING: {', '.join(excluded)} use other SNPs than {sel[0]} and are left out of the pool")
+    log(f"[admixed-ld] track-rg: pooled r({s}, {t}) over {len(sel)} traits = {float(r[0]):.4f} (SE {float(r[1]):.4f})")
+    summary = dict(format="summit-admixed-ld-track-rg", version=1, tracks=tracks, sources=sources, annot=annot,
+                   classes=classes, njack=njack, traits=per, pooled=pooled, class_merge=merge_info)
+    with open(f"{out}.track_rg.json", "w") as fh:
+        json.dump(_jsonable(summary), fh, indent=1)
+    rows = [dict(pair=f"{s}_{t}", what="r pooled", est=float(r[0]), se=float(r[1]))]
+    rows += [dict(pair=f"{s}_{t}", what=f"r pooled[{c}]", est=float(v[0]), se=float(v[1])) for c, v in by_class.items()]
+    rows += [dict(pair=f"{s}_{t}", what=f"r[{k}]", est=v["r"][0], se=v["r"][1]) for k, v in per.items()]
+    pd.DataFrame(rows).to_csv(f"{out}.track_rg.tsv", sep="\t", index=False, float_format="%.6g")
+    log(f"[admixed-ld] track-rg: wrote {out}.track_rg.json and {out}.track_rg.tsv")
+    return _jsonable(summary)
+
+
 def track_rg(tracks, sumstats, annot, out, *, external=None, cohort_track=None, njack=200, groups=None,
-             allow_ols=False, max_chisq=None, keep_ambiguous=False, log=print):
+             allow_ols=False, max_chisq=None, keep_ambiguous=False, merge_ld_halves=False, merge_z=2.0, log=print):
     """Correlation of per-allele causal effects across local-ancestry tracks (and, with `external`, of each track with a
     GWAS of other people from the cross-source population of compose).
 
@@ -366,7 +529,23 @@ def track_rg(tracks, sumstats, annot, out, *, external=None, cohort_track=None, 
     triangle check r(s, X) = r(s, t) r(t, X) (default: X itself when it is one of the sources). Each pair is SUMMIT's cross-mode fit with the overlapping covariance
     fixed at 0 (Sumcore: --rg S,T --ldscores track_S_T --ldscores-h2-1 track_S --ldscores-h2-2 track_T
     --overlap-covariance-rg 0); the summary weights the classes by the partners' counts (see the module docstring).
-    Writes <out>.track_rg.json and <out>.track_rg.tsv and returns the summary."""
+    Writes <out>.track_rg.json and <out>.track_rg.tsv and returns the summary.
+
+    Several traits (sumstats a list of tractor-sumstats prefixes, one per trait): each trait is fitted, and r is pooled
+    over the traits as the ratio of their summed moments, with one jackknife over the shared blocks (_pooled_track_rg).
+    merge_ld_halves: annotation classes named <maf class>_<half>, two halves per MAF class (e.g. ten classes, five MAF
+    classes split at their median LD score); a MAF class's halves are merged when any of its four own-track moments,
+    pooled over the traits, has a jackknife z below merge_z, and the traits are fitted again on the merged classes."""
+    if not isinstance(sumstats, str) and len(sumstats) > 1 and all(os.path.exists(f"{x}.tracks.json") for x in sumstats):
+        if external is not None:
+            raise ValueError("--external is fitted one trait at a time; give one trait's --sumstats.")
+        return _pooled_track_rg(tracks, list(sumstats), annot, out, njack=njack, groups=parse_groups(groups, list(
+            json.load(open(f"{tracks}.admixed_ld.json"))["tracks"]["classes"])), allow_ols=allow_ols,
+            max_chisq=max_chisq, merge_ld_halves=merge_ld_halves, merge_z=merge_z, log=log)
+    if not isinstance(sumstats, str) and len(sumstats) == 1:
+        sumstats = sumstats[0]
+    if merge_ld_halves:
+        raise ValueError("--merge-ld-halves decides on moments pooled over traits; give several traits' --sumstats.")
     with open(f"{tracks}.admixed_ld.json") as fh:
         params = json.load(fh)
     tb = params.get("tracks")

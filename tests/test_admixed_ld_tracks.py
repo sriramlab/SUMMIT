@@ -327,3 +327,43 @@ def test_cli(trk, tmp_path):
     with open(f"{o}.admixed_ld.json") as fh:
         flags = [f["flag"] for f in json.load(fh)["flags"]]
     assert "kappa0_from_ancestry_sd" in flags
+
+
+def test_pooled_track_rg_and_the_merge_of_ld_halves(trk):
+    """r pooled over traits is the ratio of their summed moments with one jackknife; merging the two halves of one MAF
+    class gives the scores and pooled r of the class itself."""
+    from summit.admixed_ld.tracks import _fit_pair, _taus, pool_reps, track_rg
+    d = trk["dir"]
+    comp1, _ = trk["compose"]()
+    _fits(trk, "sparse", comp1, "annot1")                       # writes each trait's tractor-sumstats prefix
+    pres = [f"{d}/ts_sparse{r}_hc" for r in range(trk["truth"]["scenarios"]["sparse"]["reps"])]
+    pooled = track_rg(comp1, pres, f"{d}/annot1.tsv", f"{d}/pooled1", njack=10, log=QUIET)
+    with open(f"{comp1}.admixed_ld.json") as fh:
+        tb = json.load(fh)["tracks"]
+    fl, n = tb["files"], np.asarray(tb["partner_counts"], float)
+    T = {}
+    for p_ in pres:
+        with open(f"{p_}.tracks.json") as fh:
+            f = json.load(fh)["files"]
+        T[p_] = _taus(_fit_pair(f["A"], f["E"], fl["track_A_E"]["file"], fl["track_A"]["file"], fl["track_E"]["file"],
+                                f"{d}/annot1.tsv", njack=10, max_chisq=None, drop_ambiguous=False, log=QUIET))
+    full = float(pool_reps(T, n, list(T))[-1])
+    a = sum(float((T[k][2][-1] * n).sum()) for k in T)
+    b = sum(float((T[k][0][-1] * n).sum()) for k in T)
+    c = sum(float((T[k][1][-1] * n).sum()) for k in T)
+    assert full == pytest.approx(a / np.sqrt(b * c), rel=1e-12)
+    assert pooled["pooled"]["n_traits"] == len(pres) and abs(pooled["pooled"]["r"][0] - 0.6) < 0.1
+    assert pooled["pooled"]["r"][1] > 0
+    # two halves of one MAF class: merged on request, kept otherwise
+    A = pd.read_csv(f"{d}/annot.tsv", sep="\t").rename(columns={"low": "m_a", "high": "m_b"})
+    A.to_csv(f"{d}/annot_halves.tsv", sep="\t", index=False)
+    comp2, _ = trk["compose"](annot="annot_halves")
+    merged = track_rg(comp2, pres, f"{d}/annot_halves.tsv", f"{d}/pooled_m", njack=10, merge_ld_halves=True,
+                      merge_z=1e9, log=QUIET)
+    assert merged["class_merge"]["merged"] == ["m"] and merged["classes"] == ["m"]
+    assert merged["pooled"]["r"][0] == pytest.approx(pooled["pooled"]["r"][0], abs=2e-3)
+    kept = track_rg(comp2, pres, f"{d}/annot_halves.tsv", f"{d}/pooled_k", njack=10, merge_ld_halves=True,
+                    merge_z=-1e9, log=QUIET)
+    assert kept["class_merge"]["merged"] == [] and kept["classes"] == ["m_a", "m_b"]
+    with pytest.raises(ValueError, match="several traits"):
+        track_rg(comp2, pres[0], f"{d}/annot_halves.tsv", f"{d}/x", merge_ld_halves=True, log=QUIET)
