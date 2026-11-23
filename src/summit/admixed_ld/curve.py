@@ -469,8 +469,8 @@ def genotype_curve(geno, ref_path, out, *, sources=None, covar=None, keep=None, 
                    background_memory_gb=32.0, drop_ambiguous=False, sample_factors=True, sample_factors_ld_mass=False,
                    sample_factors_probes=0, log=print):
     """The weighted-LD curve of the cohort for two or more sources. sample_factors: also the sample statistic of
-    the same people with the same covariates (`summit admixed-ld sample-factors`, one more O(N M) pass), written to
-    out.sample_factors.json and used by compose with this curve (curve mode's same-person term); its realized LD mass
+    the same people with the same covariates (as `summit admixed-ld sample-factors` gives it), accumulated in this same
+    pass over the genotypes on the SNPs with finite loadings, written to out.sample_factors.json and used by compose with this curve (curve mode's same-person term); its realized LD mass
     only with sample_factors_ld_mass (exact, a GRM's cost) or sample_factors_probes > 0 (stochastic). With cells_cm, also the genome-wide matrix of
     covariances between cells of cells_cm cM (within and between chromosomes) and the sampling variance of each entry,
     written to out.cells.npz: it carries long-range structure that one value per distance cannot (for example what the
@@ -545,6 +545,16 @@ def genotype_curve(geno, ref_path, out, *, sources=None, covar=None, keep=None, 
     cm = rv["CM"].to_numpy()[r_idx]
     log(f"[admixed-ld] curve: {t_idx.size} of {len(blocks.variants)} cohort variants matched to the reference "
         f"({', '.join(sources)}; baseline {sources[-1]}); {N} samples")
+    sf_acc = None
+    if sample_factors:                                         # the sample statistic, in this same pass
+        from .sample_factors import FactorAccumulator, factor_inputs, factor_names
+        a_sf, good_sf = factor_inputs(ref, rv, r_idx, sources)     # the SNPs sample-factors would use (finite loadings)
+        chroms_sf = list(pd.unique(chrom[good_sf]))
+        ci_sf = {c: i for i, c in enumerate(chroms_sf)}         # its chromosome index (the halves are odd and even)
+        names_sf = factor_names(sources)
+        sf_acc = FactorAccumulator(N, df_res, len(chroms_sf), len(names_sf),
+                                   ld_mass=bool(sample_factors_ld_mass) or int(sample_factors_probes or 0) > 0,
+                                   ld_mass_probes=sample_factors_probes)
     mp = _products(threads, native)
     span = max(float(np.ptp(cm[chrom == c])) for c in pd.unique(chrom))
     max_cm = span if max_cm is None else min(float(max_cm), span)
@@ -580,6 +590,9 @@ def genotype_curve(geno, ref_path, out, *, sources=None, covar=None, keep=None, 
         Y = np.zeros((N, k1 * nc), order="F")                  # column a * nc + cell
         B = np.zeros((p_rank, k1 * nc))
         q = np.zeros((nc, k1, k1))
+        sf_ci = ci_sf.get(c) if sf_acc is not None else None
+        if sf_ci is not None:
+            sf_acc.start_chromosome()
         for s in range(0, ix.size, step):
             sl = ix[s:s + step]
             X = blocks.read(t_idx[sl])
@@ -597,6 +610,10 @@ def genotype_curve(geno, ref_path, out, *, sources=None, covar=None, keep=None, 
                 th_den += d[inf].T @ d[inf] - Sn[inf].sum(axis=0)
             ss = np.einsum("ij,ij->j", X, X)
             Bx = C.T @ X if p_rank else np.zeros((0, X.shape[1]))
+            if sf_ci is not None:
+                msf = good_sf[sl]
+                if msf.any():
+                    sf_acc.add(sf_ci, X[:, msf], C, a_sf[sl][msf], Bx[:, msf])
             ss_res = ss - np.einsum("ij,ij->j", Bx, Bx)
             var_res = ss_res / df_res
             ok = np.isfinite(var_res) & (var_res > 1e-8) & np.isfinite(mu)
@@ -621,6 +638,8 @@ def genotype_curve(geno, ref_path, out, *, sources=None, covar=None, keep=None, 
                         q[:, b, a] += qq
         if bg is not None:
             bg.end_chromosome(cm[ix].min())
+        if sf_ci is not None:
+            sf_acc.end_chromosome(sf_ci)
         U = Y - C @ B if p_rank else Y
         S = mp.tn(U, U) / df_res
         num_c, den_c = np.zeros_like(num), np.zeros_like(den)
@@ -786,11 +805,9 @@ def genotype_curve(geno, ref_path, out, *, sources=None, covar=None, keep=None, 
         json.dump(info, f, indent=1)
     blocks.close()
     mp.drain()
-    if sample_factors:
-        from .sample_factors import sample_factors as _sample_factors
-        _sample_factors(geno, ref_path, out, sources=sources, covar=covar, keep=keep, match=match, step=step,
-                        threads=threads, ld_mass=bool(sample_factors_ld_mass) or int(sample_factors_probes or 0) > 0,
-                        ld_mass_probes=sample_factors_probes, drop_ambiguous=drop_ambiguous, log=log)
+    if sf_acc is not None:
+        from .sample_factors import write_sample_factors
+        write_sample_factors(out, sf_acc.finish(C, sources, names_sf, log), log)
     mean_th = np.asarray(info["theta"]["mean_vector"])
     log(f"[admixed-ld] curve: between chromosomes " + np.array2string(inter, precision=5).replace("\n", "")
         + "; decay per cM (2-20 cM) " + ", ".join(f"{s} {fits[s]['lam']:.4f}" for s in sources)

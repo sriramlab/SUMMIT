@@ -228,6 +228,12 @@ def main(argv=None):
     m.add_argument("--no-sample-factors", dest="release_sample_factors", action="store_false", default=True,
                    help="compose the same-person term under random mating even when the curve's pass wrote a sample "
                         "statistic next to it (PREFIX.sample_factors.json, used by default)")
+    m.add_argument("--dry-run", action="store_true",
+                   help="write the plan (which decay, same-person term, relatives, cell matrix and sample sizes the "
+                        "composition would use) to PREFIX.plan.json and stop before composing")
+    m.add_argument("--require", default=None,
+                   help="comma-separated components the composition must use (curve, statistic, cells, relatives, "
+                        "background); stop with an error if one would be missing, e.g. in a pipeline")
     m.add_argument("--min-release-share", type=float, default=0.85,
                    help="flag traits whose GWAS N is below this share of the curve's people (default 0.85): compose "
                         "them alone with the sample statistic of their own people")
@@ -534,7 +540,7 @@ def _run(a, log):
                          calibrate_between_chromosomes=a.calibrate_between_chromosomes, tracks=a.tracks,
                          track_alpha=a.track_alpha, partners=a.partners, drop_ambiguous=a.drop_ambiguous,
                          release_sample_factors=a.release_sample_factors, min_release_share=a.min_release_share,
-                         log=log._log)
+                         dry_run=a.dry_run, require=a.require, log=log._log)
     return 0
 
 

@@ -1637,6 +1637,30 @@ def test_compose_writes_one_file_per_gwas_sample_size(fam, tmp_path):
     assert len(pm["n_groups"]) == 2
     assert {g["label"] for g in pm["n_groups"]} == {str(n), str(sub.size)}
     assert not os.path.exists(str(tmp_path / "c_full") + ".n_groups.tsv")   # one sample size: no extra files
+    # summit --h2 with the compose output fits each trait with its own group's file (n_groups.tsv), in directory order
+    import subprocess
+    import sys
+    an = pd.read_csv(d / "annot.tsv", sep="\t").merge(v[["CHR", "BP", "SNP"]], on="SNP")
+    an[["CHR", "BP", "SNP", "low", "high"]].to_csv(tmp_path / "annot_h2.tsv", sep="\t", index=False)
+    run = lambda *a: subprocess.run([sys.executable, "-m", "summit", *a, "--annot", str(tmp_path / "annot_h2.tsv"),
+                                     "--njack", "20"], check=True, capture_output=True, text=True)
+    run("--h2", str(tmp_path / "mix"), "--ldscores", str(tmp_path / "c_mix") + ".gw.ldscore.gz", "--out",
+        str(tmp_path / "h_mix"))
+    got = pd.read_csv(str(tmp_path / "h_mix") + ".results.tsv", sep="\t").set_index("phen")
+    assert list(got.index) == ["full0", "full1", "part0", "part1", "part2"]
+    for N_, nm in ((n, "full"), (sub.size, "part")):
+        f = groups[groups.N == N_].ldscores.iloc[0]
+        run("--h2", str(tmp_path / nm), "--ldscores", f, "--ldscore-groups", "off", "--out", str(tmp_path / f"h_{nm}"))
+        ref_ = pd.read_csv(str(tmp_path / f"h_{nm}") + ".results.tsv", sep="\t").set_index("phen")
+        np.testing.assert_allclose(got.loc[ref_.index, "h2"], ref_.h2, rtol=1e-10)
+        np.testing.assert_allclose(got.loc[ref_.index, "h2_se"], ref_.h2_se, rtol=1e-10)
+    used = pd.read_csv(str(tmp_path / "h_mix") + ".ldscore_groups.tsv", sep="\t")
+    assert len(used) == 5 and used.ldscores.nunique() == 2
+    # the main file alone (old behaviour) differs for the traits of the other sample size
+    run("--h2", str(tmp_path / "mix"), "--ldscores", str(tmp_path / "c_mix") + ".gw.ldscore.gz", "--ldscore-groups",
+        "off", "--out", str(tmp_path / "h_main"))
+    main_ = pd.read_csv(str(tmp_path / "h_main") + ".results.tsv", sep="\t").set_index("phen")
+    assert not np.allclose(main_.loc[["full0", "full1"], "h2"], got.loc[["full0", "full1"], "h2"], rtol=1e-8)
 
 
 def test_curve_writes_the_sample_statistic_and_compose_uses_it(sim, tmp_path):
@@ -1652,8 +1676,24 @@ def test_curve_writes_the_sample_statistic_and_compose_uses_it(sim, tmp_path):
     assert cinfo["sample_factors"] == "cv.sample_factors.json" and os.path.exists(cv + ".sample_factors.json")
     alone = sample_factors(str(d / "cohort"), str(d / "ref"), str(tmp_path / "alone"), covar=str(d / "cohort.cov"),
                            ld_mass=False, log=quiet)
-    with_curve = json.load(open(cv + ".sample_factors.json"))
-    np.testing.assert_allclose(with_curve["sigma"], alone["sigma"], rtol=1e-10, atol=1e-14)
+    with_curve = json.load(open(cv + ".sample_factors.json"))          # accumulated in the curve's own pass
+    assert with_curve["n_snps"] == alone["n_snps"] and with_curve["n_samples"] == alone["n_samples"]
+    for k in ("sigma", "mean"):
+        np.testing.assert_allclose(with_curve[k], alone[k], rtol=1e-11, atol=1e-15)
+    for k in ("between_chromosome_same_person_mass", "predicted_by_factors"):
+        np.testing.assert_allclose(with_curve["diagnostics"][k], alone["diagnostics"][k], rtol=1e-11)
+    # the curve itself does not change when the statistic is accumulated in its pass
+    cv0 = str(tmp_path / "cv0")
+    genotype_curve(str(d / "cohort"), str(d / "ref"), cv0, covar=str(d / "cohort.cov"), cell_cm=0.5,
+                   sample_factors=False, log=quiet)
+    assert not os.path.exists(cv0 + ".sample_factors.json")
+    pd.testing.assert_frame_equal(pd.read_csv(cv + ".curve.tsv", sep="\t"), pd.read_csv(cv0 + ".curve.tsv", sep="\t"))
+    strip = lambda j: json.loads(json.dumps(j).replace(cv0, "OUT").replace(cv, "OUT"))
+    j1, j0 = json.load(open(cv + ".curve.json")), json.load(open(cv0 + ".curve.json"))
+    j1.pop("sample_factors")
+    assert strip(j1) == strip(j0)
+    for k in ("S1_upper", "S2_upper"):
+        np.testing.assert_array_equal(np.load(cv + ".cells.npz")[k], np.load(cv0 + ".cells.npz")[k])
     args = (str(d / "ref"), [str(d / "ss")], str(d / "annot.tsv"))
     got = {}
     for arm, kw in (("auto", {}), ("explicit", dict(sample_factors=cv + ".sample_factors.json")),
@@ -1665,6 +1705,76 @@ def test_curve_writes_the_sample_statistic_and_compose_uses_it(sim, tmp_path):
     pj = json.load(open(str(tmp_path / "auto") + ".admixed_ld.json"))
     assert pj["sample_factors"]["from_release"] is True
     assert "sample_factors_sample_differs" not in {f["flag"] for f in pj["flags"]}
+
+
+def test_compose_plan_dry_run_and_require(sim, tmp_path):
+    """compose writes its plan (decay, same-person term, relatives, cell matrix, sample sizes) before composing:
+    --dry-run stops there, --require stops when a component would be missing, and the plan is in the params json."""
+    from summit.admixed_ld.compose import compose_ldscores
+    from summit.admixed_ld.curve import genotype_curve
+    d = sim["dir"]
+    quiet = lambda *a, **k: None
+    cv = str(tmp_path / "cv")
+    genotype_curve(str(d / "cohort"), str(d / "ref"), cv, covar=str(d / "cohort.cov"), cell_cm=0.5, log=quiet)
+    args = (str(d / "ref"), [str(d / "ss")], str(d / "annot.tsv"))
+    out = str(tmp_path / "dry")
+    plan = compose_ldscores(*args, out, curve=cv, dry_run=True, log=quiet)
+    assert os.path.exists(out + ".plan.json") and not os.path.exists(out + ".gw.ldscore.gz")
+    assert plan["mode"] == "curve" and plan["components"]["statistic"] and plan["components"]["curve"]
+    assert plan["same_person_term"].startswith("the sample statistic released") and plan["traits"] == 3
+    assert json.load(open(out + ".plan.json")) == json.loads(json.dumps(plan))
+    with pytest.raises(ValueError, match="--require statistic"):
+        compose_ldscores(*args, str(tmp_path / "no_sf"), curve=cv, release_sample_factors=False, require="statistic",
+                         dry_run=True, log=quiet)
+    with pytest.raises(ValueError, match="unknown component"):
+        compose_ldscores(*args, str(tmp_path / "bad"), curve=cv, require="statistics", dry_run=True, log=quiet)
+    out = str(tmp_path / "run")
+    compose_ldscores(*args, out, curve=cv, require="curve,statistic", log=quiet)
+    pj = json.load(open(out + ".admixed_ld.json"))
+    assert pj["plan"]["mode"] == "curve" and pj["plan"]["components"] == plan["components"]
+    date = compose_ldscores(*args, str(tmp_path / "date"), generations=sim["S"]["generations"], dry_run=True, log=quiet)
+    assert date["mode"] == "date" and date["same_person_term"] == "random mating"
+
+
+def test_compose_overlapping_annotation_columns(sim, tmp_path):
+    """Overlapping 0/1 columns (two MAF classes and a functional column across both) are composed on their disjoint
+    combinations and summed back: each column's LD scores and masses equal the sums of the combinations' when those
+    are given as a partition, and SUMMIT's h2 fit reads the result."""
+    import subprocess
+    import sys
+    from summit.admixed_ld.compose import compose_ldscores
+    d, S = sim["dir"], sim["S"]
+    quiet = lambda *a, **k: None
+    v = S["variants"]
+    a = pd.read_csv(d / "annot.tsv", sep="\t").merge(v[["CHR", "BP", "SNP"]], on="SNP")
+    func = (np.arange(len(a)) % 3 == 0).astype(int)
+    over = pd.DataFrame({"CHR": a.CHR, "BP": a.BP, "SNP": a.SNP, "low": a.low, "high": a.high, "func": func})
+    over.to_csv(tmp_path / "over.tsv", sep="\t", index=False)
+    atoms = pd.DataFrame({"CHR": a.CHR, "BP": a.BP, "SNP": a.SNP, "low0": a.low * (1 - func), "low1": a.low * func,
+                          "high0": a.high * (1 - func), "high1": a.high * func})
+    atoms.to_csv(tmp_path / "atoms.tsv", sep="\t", index=False)
+    kw = dict(generations=S["generations"], log=quiet)
+    compose_ldscores(str(d / "ref"), [str(d / "ss")], str(tmp_path / "over.tsv"), str(tmp_path / "o"), **kw)
+    compose_ldscores(str(d / "ref"), [str(d / "ss")], str(tmp_path / "atoms.tsv"), str(tmp_path / "a"), **kw)
+    lo = pd.read_csv(str(tmp_path / "o") + ".gw.ldscore.gz", sep="\t")
+    la = pd.read_csv(str(tmp_path / "a") + ".gw.ldscore.gz", sep="\t")
+    assert list(lo.columns[-3:]) == ["low", "high", "func"]
+    np.testing.assert_allclose(lo.V, la.V, rtol=1e-6)
+    scale = float(np.abs(la[["low0", "low1", "high0", "high1"]].to_numpy()).max())
+    for col, parts in (("low", ["low0", "low1"]), ("high", ["high0", "high1"]), ("func", ["low1", "high1"])):
+        np.testing.assert_allclose(lo[col], la[parts].sum(axis=1), rtol=1e-6, atol=1e-6 * scale)
+    mo = pd.read_csv(str(tmp_path / "o") + ".gw.M", sep="\t", header=None).to_numpy().ravel()
+    ma = pd.read_csv(str(tmp_path / "a") + ".gw.M", sep="\t", header=None).to_numpy().ravel()
+    np.testing.assert_allclose(mo, [ma[0] + ma[1], ma[2] + ma[3], ma[1] + ma[3]])
+    pj = json.load(open(str(tmp_path / "o") + ".admixed_ld.json"))
+    assert pj["annotation"] == dict(columns=["low", "high", "func"], overlapping=True, combinations=4)
+    np.testing.assert_allclose(pj["ld_mass"], json.load(open(str(tmp_path / "a") + ".admixed_ld.json"))["ld_mass"],
+                               rtol=1e-10)
+    subprocess.run([sys.executable, "-m", "summit", "--h2", str(d / "ss"), "--ldscores",
+                    str(tmp_path / "o") + ".gw.ldscore.gz", "--annot", str(tmp_path / "over.tsv"), "--njack", "20",
+                    "--out", str(tmp_path / "h")], check=True, capture_output=True, text=True)
+    res = pd.read_csv(str(tmp_path / "h") + ".results.tsv", sep="\t")
+    assert len(res) == 3 and (res.num_bins == 3).all() and np.isfinite(res.h2).all()
 
 
 def test_release_coverage_flags_traits_measured_in_part_of_the_cohort(sim, tmp_path):

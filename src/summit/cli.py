@@ -299,6 +299,10 @@ def build_parser() -> argparse.ArgumentParser:
                         help="Reference .bim file used for annotation alignment.")
     inputs.add_argument("--ldscores", default=None, type=str,
                         help="Path to the primary LD-score file, or matching .binary.ldscores.npz for PCGC. HE/LDSC accepts '@' as a chromosome placeholder.")
+    inputs.add_argument("--ldscore-groups", choices=["auto", "off"], default="auto",
+                        help="--h2 with a SUMMIT-MIX compose output whose traits have different GWAS samples: 'auto' "
+                             "(default) reads PREFIX.n_groups.tsv next to --ldscores and fits each trait with its own "
+                             "group's LD-score file; 'off' fits every trait with the file given.")
     inputs.add_argument("--ldscores-reg", default=None, type=str,
                         help=(
                             "Optional LD-score file used only for summary-only overlap-covariance estimation. "
@@ -2043,11 +2047,90 @@ def _resolve_njack(args, default):
         args.njack = default
     return args.njack
 
+def _ldscore_groups(ldscores):
+    """compose's PREFIX.n_groups.tsv next to --ldscores (PREFIX or PREFIX.gw.ldscore.gz): (prefix, table of trait,
+    N, ldscores), or None when there is none."""
+    s = str(ldscores)
+    if "@" in s:
+        return None
+    prefix = s[:-len(".gw.ldscore.gz")] if s.endswith(".gw.ldscore.gz") else s
+    f = f"{prefix}.n_groups.tsv"
+    if not os.path.exists(f):
+        return None
+    tab = pd.read_csv(f, sep="\t", dtype={"trait": str})
+    if not {"trait", "ldscores"} <= set(tab.columns):
+        raise ValueError(f"{f} is not a compose group table (columns trait, N, ldscores).")
+    return prefix, tab
+
+
+def _dispatch_h2_groups(args, log, prefix, tab):
+    """--h2 over traits whose LD scores come from different compose group files: each group's traits are fitted
+    with its file (symlinked into PREFIX-of-out.ldgroups/<k>/ss), and the rows are merged into OUT.results.tsv in the
+    order of the summary-statistics directory; OUT.ldscore_groups.tsv records the file each trait used."""
+    import copy
+    paths = utils._parse_sumdir(args.h2)
+    base_of = {os.path.basename(p): p for p in paths}
+    by_trait = dict(zip(tab.trait.astype(str), tab.ldscores.astype(str)))
+    missing = [b for b in base_of if b not in by_trait]
+    if missing:
+        raise ValueError(f"{len(missing)} trait(s) of --h2 are not in {prefix}.n_groups.tsv (first: {missing[:3]}); "
+                         "compose them, or fit with --ldscore-groups off.")
+    files = list(dict.fromkeys(by_trait[b] for b in base_of))
+    for f in files:
+        if not os.path.exists(f):
+            raise ValueError(f"The group LD-score file {f} listed in {prefix}.n_groups.tsv does not exist.")
+    log._log(f"[h2] {prefix}.n_groups.tsv: {len(base_of)} traits in {len(files)} LD-score groups; each trait is fitted "
+             "with its own group's file (--ldscore-groups off fits every trait with --ldscores)")
+    root = f"{args.out}.ldgroups"
+    merged, used = [], []
+    for k, f in enumerate(files):
+        sd = os.path.join(root, str(k), "ss")
+        os.makedirs(sd, exist_ok=True)
+        for b in base_of:
+            if by_trait[b] == f:
+                dst = os.path.join(sd, b)
+                if not os.path.lexists(dst):
+                    os.symlink(os.path.abspath(base_of[b]), dst)
+                used.append((utils._phen_name_from_path(b), f))
+                log._log(f"[h2] {b}: LD scores {f}")
+        a = copy.copy(args)
+        a.h2, a.ldscores, a.ldscore_groups = sd, f, "off"
+        a.out = os.path.join(root, str(k), "fit")
+        _dispatch_h2(a, log)
+        merged.append(pd.read_csv(f"{a.out}.results.tsv", sep="\t"))
+    res = pd.concat(merged, ignore_index=True)
+    order = {utils._phen_name_from_path(b): i for i, b in enumerate(base_of)}
+    res = res.iloc[np.argsort([order[str(x)] for x in res.phen], kind="stable")].reset_index(drop=True)
+    res["phen_index"] = np.arange(len(res))
+    tmp = f"{args.out}.results.tsv.{os.getpid()}.tmp"
+    res.to_csv(tmp, sep="\t", index=False)
+    os.replace(tmp, f"{args.out}.results.tsv")
+    pd.DataFrame(used, columns=["phen", "ldscores"]).to_csv(f"{args.out}.ldscore_groups.tsv", sep="\t", index=False)
+    log._log(f"Saved h2 results table in {args.out}.results.tsv (traits from {len(files)} LD-score groups; "
+             f"files in {args.out}.ldscore_groups.tsv)")
+
+
 def _dispatch_h2(args, log):
     _resolve_njack(args, DEFAULT_HE_NJACK)
     if args.ldscores is None:
         log._log("!!! --ldscores must be provided for refactored h2 estimation. !!!")
         raise SystemExit(1)
+    if (not str(args.ldscores).endswith(".gw.ldscore.gz") and not os.path.exists(str(args.ldscores))
+            and os.path.exists(f"{args.ldscores}.gw.ldscore.gz")):
+        args.ldscores = f"{args.ldscores}.gw.ldscore.gz"           # a compose output given by its prefix
+    grp = _ldscore_groups(args.ldscores) if getattr(args, "ldscore_groups", "auto") == "auto" else None
+    if grp is not None:
+        if args.h2_batch_fast:
+            raise ValueError("--h2-batch-fast does not read compose's LD-score groups; fit with --ldscore-groups off "
+                             "per group, or without --h2-batch-fast.")
+        if os.path.isdir(str(args.h2)):
+            _dispatch_h2_groups(args, log, *grp)
+            return
+        prefix, tab = grp
+        row = tab[tab.trait.astype(str) == os.path.basename(str(args.h2))]
+        if len(row):
+            log._log(f"[h2] {os.path.basename(str(args.h2))}: LD scores {row.ldscores.iloc[0]} ({prefix}.n_groups.tsv)")
+            args.ldscores = str(row.ldscores.iloc[0])
 
     if (args.h2_cache_dir is not None or args.h2_cache_only) and not args.h2_batch_fast:
         raise ValueError("--h2-cache-dir/--h2-cache-only require --h2-batch-fast.")
@@ -2194,6 +2277,9 @@ def _dispatch_rg(args, log):
     if args.ldscores is None:
         log._log("!!! --ldscores must be provided for rg estimation. !!!")
         raise SystemExit(1)
+    if getattr(args, "ldscore_groups", "auto") == "auto" and _ldscore_groups(args.ldscores) is not None:
+        log._log(f"[rg] note: {args.ldscores} has compose LD-score groups (n_groups.tsv); --rg uses the file given for "
+                 "both traits. For traits of different GWAS samples pass the LD scores of the pair's sample.")
 
     rg = Sumcore(
         bim_path=args.bim,

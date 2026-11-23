@@ -39,6 +39,7 @@ import time
 import numpy as np
 import pandas as pd
 
+from .. import utils
 from ._io import check_match, match_variants
 from .model import (KernelMatrix, ancestry_sd_from_kernel, check_kernel_join, contrast_pairs, dirichlet_moments,
                     moments_tensors, parameters_from_sumstats_k, contrast_noise, same_person_term,
@@ -729,6 +730,29 @@ def _parse_values(x):
     return [float(v) for v in str(x).split(",") if v.strip()]
 
 
+def _annotation_columns(annot, snps):
+    """0/1 annotation columns (SNPs x columns) aligned to `snps` (absent SNPs: all 0). The file has a SNP column (CHR,
+    BP and CM are ignored) and one 0/1 column per annotation; every listed SNP must be in at least one column. The
+    columns may overlap (e.g. MAF/LD bins and functional annotations): compose then works on their disjoint
+    combinations and sums those into the columns."""
+    df = pd.read_csv(annot, sep=r"\s+", dtype={"SNP": str})
+    _, cols = utils._split_snp_metadata(df.columns, source=f"annotation '{annot}'", required=("SNP",))
+    if not cols:
+        raise ValueError(f"{annot} has no annotation columns.")
+    vals = df[cols].apply(pd.to_numeric, errors="coerce").to_numpy(np.float64)
+    if not np.isin(vals, (0.0, 1.0)).all():
+        raise ValueError(f"{annot}: annotation values must be 0 or 1.")
+    if (vals.sum(axis=1) < 1).any():
+        raise ValueError(f"{annot}: {int((vals.sum(axis=1) < 1).sum())} listed SNP(s) are in no annotation column; "
+                         "leave them out of the file or give them a column.")
+    if df["SNP"].duplicated().any():
+        raise ValueError(f"{annot} has duplicate SNP IDs.")
+    pos = pd.Index(df["SNP"]).get_indexer(np.asarray(snps).astype(str))
+    out = np.zeros((pos.size, len(cols)))
+    out[pos >= 0] = vals[pos[pos >= 0]]
+    return out, list(cols)
+
+
 def _n_groups(tables, n_med, N, nu, p, nu_given, tol):
     """Groups of traits whose median N agree within tol (relative to the group's smallest), each with its N (the
     group's median) and nu."""
@@ -756,7 +780,7 @@ def compose_ldscores(ref_path, sumstats, annot, out, *, sources=None, snps=None,
                      sample_factors=None, sample_factors_calibrate=True, calibrate_between_chromosomes=False,
                      per_trait_n=True, n_tol=0.01, tracks=False, track_alpha=None, partners="rows",
                      drop_ambiguous=False, pair_chunk=1 << 23, release_sample_factors=True, min_release_share=0.85,
-                     log=print):
+                     dry_run=False, require=None, log=print):
     """Composed LD scores for an admixed GWAS sample with two or more sources (the last is the baseline of the
     contrasts). mean_ancestry: K-1 or K values (comma-separated); kappa0: the upper triangle of Kt_res(0) row by row.
     Departures from the standard recipe that are allowed but should be visible are recorded in the params json under
@@ -859,7 +883,23 @@ def compose_ldscores(ref_path, sumstats, annot, out, *, sources=None, snps=None,
                                      report=match_info)
     check_match(match_info, "compose: the GWAS", log)
     tv = tv.reset_index(drop=True)
-    cls_mat, classes = read_annotation_classes(annot, tv.SNP.to_numpy()[t_idx])
+    col_mat, col_names = _annotation_columns(annot, tv.SNP.to_numpy()[t_idx])
+    col_pat = None                                  # overlapping columns: composed on their disjoint atoms, summed back
+    if (col_mat.sum(axis=1) > 1).any():
+        if dense or tracks:
+            raise ValueError("Overlapping annotation columns are not supported with --partners reference or --tracks; "
+                             "give a partition (each SNP in one class).")
+        in_any = col_mat.sum(axis=1) >= 1
+        col_pat, atom = np.unique(col_mat[in_any], axis=0, return_inverse=True)
+        cls_mat = np.zeros((col_mat.shape[0], col_pat.shape[0]))
+        cls_mat[np.flatnonzero(in_any), np.asarray(atom).ravel()] = 1.0
+        classes = [f"_atom{a}" for a in range(col_pat.shape[0])]
+        log(f"[admixed-ld] compose: the {len(col_names)} annotation columns overlap; composed on their "
+            f"{col_pat.shape[0]} disjoint combinations and summed into the columns")
+    else:
+        cls_mat, classes = col_mat, col_names
+    to_cols = (lambda X: X) if col_pat is None else (lambda X: np.asarray(X) @ col_pat)   # atoms -> the user's columns
+    out_classes = classes if col_pat is None else list(col_names)
     in_annot = cls_mat.sum(axis=1) == 1
     t_idx, r_idx, cls_mat = t_idx[in_annot], r_idx[in_annot], cls_mat[in_annot]
     order = np.argsort(r_idx, kind="stable")                       # reference (genome) order
@@ -1109,6 +1149,53 @@ def compose_ldscores(ref_path, sumstats, annot, out, *, sources=None, snps=None,
         log("[admixed-ld] compose: the panels' own background LD is removed inside the band ("
             + ", ".join(f"{sources[n_]}: {pb.per_pair(2.0):.3g} per SNP pair at 2 cM, n {pb.n}"
                         for n_, pb in panel_bg.items()) + ")")
+
+    # ---------------------------------------------------------------------------------------- the plan
+    have = dict(curve=curve is not None, statistic=sample_factors is not None, cells=bool(cell_matrix),
+                relatives=rel_prof is not None or rel_sum is not None,
+                background=isinstance(rel_prof, SmoothBackground))
+    plan_groups = (_n_groups(tables, n_med, N, nu, p, nu_given, n_tol) if per_trait_n
+                   else [dict(label=f"{N:.0f}", N=float(N), nu=float(nu), traits=[(t[0], n) for t, n in zip(tables, n_med)])])
+    plan = dict(
+        mode="curve" if curve is not None else "date" if generations is not None else "decay rate",
+        decay=(f"the curve {curve}" if curve is not None else f"{generations} generations" if generations is not None
+               else f"{decay_per_cm} per cM"),
+        same_person_term=("the sample statistic released with the curve" if sf_from_release
+                          else f"the sample statistic {sample_factors}" if sample_factors is not None
+                          else "random mating"),
+        relatives=("the curve's all-pairs background" if have["background"]
+                   else "the curve's relatives' profile" if rel_prof is not None
+                   else f"a uniform sum of {rel_sum:.4g}" if rel_sum is not None else "none"),
+        cell_matrix=bool(cell_matrix),
+        ancestry=("given" if (m_in is not None or k_in is not None) else "from the traits' standard errors (median)"),
+        mean_ancestry=[float(x) for x in np.atleast_1d(m_vec)],
+        traits=len(tables), sample_sizes=[dict(N=float(g["N"]), nu=float(g["nu"]), traits=len(g["traits"]))
+                                          for g in plan_groups],
+        components=have, flags=[f["flag"] for f in flags])
+    sizes_txt = ", ".join("N {:.0f}".format(g["N"]) for g in plan_groups)
+    log("[admixed-ld] compose plan: " + "; ".join([
+        f"{plan['mode']} mode, decay from {plan['decay']}",
+        f"same-person term from {plan['same_person_term']}",
+        f"relatives and background from {plan['relatives']}",
+        f"cell matrix {'used' if cell_matrix else 'not used'}",
+        f"ancestry {plan['ancestry']}",
+        f"{len(tables)} trait(s) in {len(plan_groups)} GWAS sample size(s) ({sizes_txt})",
+        f"flags so far: {', '.join(plan['flags']) or 'none'}"]))
+    if require:
+        want = [x.strip() for x in (require.split(",") if isinstance(require, str) else require) if x.strip()]
+        bad = [x for x in want if x not in have]
+        if bad:
+            raise ValueError(f"--require: unknown component(s) {bad}; choose among {', '.join(have)}.")
+        missing = [x for x in want if not have[x]]
+        if missing:
+            raise ValueError(f"--require {','.join(want)}: this composition would run without {', '.join(missing)} "
+                             f"(plan: {plan['mode']} mode, same-person term from {plan['same_person_term']}, relatives "
+                             f"from {plan['relatives']}, cell matrix {'used' if cell_matrix else 'not used'}).")
+    if dry_run:
+        with open(f"{out}.plan.json", "w") as fh:
+            json.dump(plan, fh, indent=1)
+        log(f"[admixed-ld] compose: --dry-run, wrote {out}.plan.json and stopped before composing")
+        return plan
 
     # ---------------------------------------------------------------------------------------- per-SNP model
     quad = lambda Mx: np.einsum("jab,ab->j", O, Mx)                 # D_j' Mx D_j without sampling noise
@@ -1482,8 +1569,9 @@ def compose_ldscores(ref_path, sumstats, annot, out, *, sources=None, snps=None,
                 g.update(relatedness_scale=float(fg), file=f"{out}.n{g['label']}.gw.ldscore.gz",
                          ld_mass=float((V[:, None] * Lg).sum()))
                 snpdf_g = pd.DataFrame({"CHR": chrom_out, "SNP": snp_ids, "BP": rv["BP"].to_numpy()[r_idx]})
-                write_gw_ldscore_table(f"{out}.n{g['label']}", snpdf_g, pd.DataFrame(Lg, columns=classes), snp_var=V)
-                write_gw_annotation_masses(f"{out}.n{g['label']}", np.bincount(clsP, minlength=K).astype(float))
+                write_gw_ldscore_table(f"{out}.n{g['label']}", snpdf_g, pd.DataFrame(to_cols(Lg), columns=out_classes),
+                                       snp_var=V)
+                write_gw_annotation_masses(f"{out}.n{g['label']}", to_cols(np.bincount(clsP, minlength=K).astype(float)))
             pd.DataFrame([dict(trait=t, N=nn, ldscores=g["file"]) for g in groups_info for t, nn in g["traits"]]).to_csv(
                 f"{out}.n_groups.tsv", sep="\t", index=False)
             log(f"[admixed-ld] compose: {len(groups_info)} GWAS sample sizes among the traits (within {n_tol:.0%}); "
@@ -1491,9 +1579,9 @@ def compose_ldscores(ref_path, sumstats, annot, out, *, sources=None, snps=None,
 
     # ---------------------------------------------------------------------------------------- write
     snpdf = pd.DataFrame({"CHR": chrom_out, "SNP": snp_ids, "BP": rv["BP"].to_numpy()[r_idx]})
-    write_gw_ldscore_table(out, snpdf, pd.DataFrame(L, columns=classes), snp_var=V)
+    write_gw_ldscore_table(out, snpdf, pd.DataFrame(to_cols(L), columns=out_classes), snp_var=V)
     masses_P = np.bincount(clsP, minlength=K).astype(float)        # the partners' counts (the rows' by default)
-    write_gw_annotation_masses(out, masses_P)
+    write_gw_annotation_masses(out, to_cols(masses_P))
     params = dict(format="summit-admixed-ld-compose", version=1, sources=sources, baseline=sources[-1], n_snps=int(M),
                   n_window_pairs=int(n_pairs), mean_ancestry_vector=m_vec.tolist(), kappa0_matrix=k0.tolist(),
                   mean_ancestry_from_se=np.asarray(m_se).tolist(), kappa0_from_se=np.asarray(k_se).tolist(),
@@ -1507,7 +1595,9 @@ def compose_ldscores(ref_path, sumstats, annot, out, *, sources=None, snps=None,
                   reference=dict(sources=ref.manifest["sources"], window_kb=ref.manifest["window_kb"],
                                  genetic_map=ref.manifest["genetic_map"]),
                   per_trait=None if per_trait is None else per_trait.to_dict(orient="records"),
-                  ld_mass=float((V[:, None] * L).sum()), sample_factors=sf_info, n_groups=groups_info,
+                  ld_mass=float((V[:, None] * L).sum()), sample_factors=sf_info, n_groups=groups_info, plan=plan,
+                  annotation=dict(columns=list(out_classes), overlapping=col_pat is not None,
+                                  combinations=None if col_pat is None else int(col_pat.shape[0])),
                   match=dict(match_info, drop_ambiguous=bool(drop_ambiguous)),
                   ld_mass_check=mass_check, flags=flags)
     if xs_i is not None:                                          # each SNP with itself: sqrt(V_1 V_2), V_2 = 1
@@ -1515,8 +1605,9 @@ def compose_ldscores(ref_path, sumstats, annot, out, *, sources=None, snps=None,
         Lx[np.arange(M), cls] += np.sqrt(Vpop)
         xout = f"{out}.cross_{cross_source}"
         write_gw_ldscore_table(xout, snpdf[keep].reset_index(drop=True),
-                               pd.DataFrame(Lx[keep], columns=classes), snp_var=np.sqrt(Vpop[keep]))
-        write_gw_annotation_masses(xout, masses_P if dense else np.bincount(cls[keep], minlength=K).astype(float))
+                               pd.DataFrame(to_cols(Lx[keep]), columns=out_classes), snp_var=np.sqrt(Vpop[keep]))
+        write_gw_annotation_masses(xout, to_cols(masses_P) if dense
+                                   else to_cols(np.bincount(cls[keep], minlength=K).astype(float)))
         params["cross"] = dict(source=cross_source, panel_n=int(ref.n[cross_source]),
                                panel_is_a_source=xs_n is not None, file=f"{xout}.gw.ldscore.gz",
                                n_snps=int(keep.sum()), ld_mass=float((np.sqrt(Vpop[keep])[:, None] * Lx[keep]).sum()),

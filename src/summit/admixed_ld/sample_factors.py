@@ -57,6 +57,171 @@ def _sym_cross_cov(U0, U1):
     return (C + C.T) / 2.0
 
 
+def factor_inputs(ref, rv, r_idx, sources):
+    """The loadings a_j (M x n_factors) of the reference variants r_idx and the mask of SNPs whose loadings are finite:
+    the sources' dosage variances and the contrasts' products less their sampling covariance (the orientation of the
+    counted allele cancels in every loading). Shared by sample-factors and the curve's pass."""
+    from .model import contrast_noise
+    P = np.column_stack([rv[f"p_{s}"].to_numpy()[r_idx] for s in sources])
+    Vd = np.column_stack([rv[f"v_{s}"].to_numpy()[r_idx] for s in sources])
+    D = P[:, :-1] - P[:, -1:]
+    Vn, nn, Gn, _ = ref.frequency_noise(sources, np.nan_to_num(Vd), r_idx, rv)
+    S_noise, _ = contrast_noise(Vn, nn, Gn)
+    O = D[:, :, None] * D[:, None, :] - S_noise
+    a = factor_loadings(Vd, O)
+    return a, np.isfinite(a).all(axis=1)
+
+
+class FactorAccumulator:
+    """The sums of one pass over the GWAS's adjusted genotypes that the sample statistic needs, block by block and
+    chromosome by chromosome (chromosome ci in genome order; the odd and the even ones are the two halves): Y = x~^2 / s2
+    with s2 the genotype variance before the covariates (N - 1), Y A and A'A per half (A = a / s2), each person's sum of
+    Y per chromosome, the loadings' chromosome sums, and optionally the realized LD mass (exact Gram matrices, or
+    Rademacher probes with exact diagonals). Used by sample-factors and, in the same pass, by the curve."""
+
+    def __init__(self, N, nu, n_chroms, n_factors, *, ld_mass=True, memory_gb=32.0, ld_mass_probes=0, seed=0):
+        self.N, self.nu, self.nf = int(N), float(nu), int(n_factors)
+        self.YA = [np.zeros((N, n_factors)), np.zeros((N, n_factors))]
+        self.AA = [np.zeros((n_factors, n_factors)), np.zeros((n_factors, n_factors))]
+        self.R = np.zeros((n_chroms, N))                           # per chromosome: each person's sum of y
+        self.Ac = np.zeros((n_chroms, n_factors))
+        self.n_used = 0
+        self.ld_mass, self.memory_gb = bool(ld_mass), float(memory_gb)
+        self.B = int(ld_mass_probes or 0)
+        self.seed = int(seed)
+        self.do_stoch = self.ld_mass and self.B > 0
+        self.do_mass = self.ld_mass and not self.do_stoch and 2.0 * N * N * 8 / 2 ** 30 <= self.memory_gb
+        self.G_tot = np.zeros((N, N)) if self.do_mass else None
+        if self.do_stoch:
+            self.Zp = np.random.default_rng(self.seed).choice([-1.0, 1.0], size=(N, self.B))
+            self.GZ = np.zeros((N, self.B))
+            self.ec2, self.d2_c = [], []
+        self.frob_c, self.Vsum_c = [], []
+        self._G_c = self._GcZ = None
+        self._v_c = 0.0
+
+    def start_chromosome(self):
+        self._G_c = np.zeros((self.N, self.N)) if self.do_mass else None
+        self._GcZ = np.zeros((self.N, self.B)) if self.do_stoch else None
+        self._v_c = 0.0
+
+    def add(self, ci, X, C, a, Bx=None):
+        """X: N x m centered, imputed genotypes (not adjusted; left unchanged); C: the orthonormal covariate basis
+        (N x p); a: m x n_factors loadings; Bx: C'X if already computed."""
+        s2 = np.einsum("ij,ij->j", X, X) / (self.N - 1)
+        ok = np.isfinite(s2) & (s2 > 1e-8)
+        if not ok.any():
+            return
+        if C.shape[1]:
+            Xp = X[:, ok] - C @ (Bx[:, ok] if Bx is not None else C.T @ X[:, ok])
+        else:
+            Xp = X[:, ok]
+        Y = Xp * Xp / s2[ok][None, :]
+        if self.do_mass or self.do_stoch:
+            Xs = Xp / np.sqrt(s2[ok])[None, :]
+            if self.do_mass:
+                self._G_c += Xs @ Xs.T
+            else:
+                self._GcZ += Xs @ (Xs.T @ self.Zp)
+            self._v_c += float(Y.sum()) / self.nu
+        A = a[ok] / s2[ok][:, None]
+        h = ci % 2
+        self.YA[h] += Y @ A
+        self.AA[h] += A.T @ A
+        self.R[ci] += Y.sum(axis=1)
+        self.Ac[ci] += A.sum(axis=0)
+        self.n_used += int(ok.sum())
+
+    def end_chromosome(self, ci):
+        if self.do_mass:
+            self.frob_c.append(float(np.vdot(self._G_c, self._G_c)))
+            self.Vsum_c.append(self._v_c)
+            self.G_tot += self._G_c
+        if self.do_stoch:                                          # diag(G_c) = R[ci], exact; E_c = G_c - diag
+            Ez = self._GcZ - self.R[ci][:, None] * self.Zp
+            self.ec2.append(np.einsum("ib,ib->b", Ez, Ez))
+            self.d2_c.append(float(self.R[ci] @ self.R[ci]))
+            self.Vsum_c.append(self._v_c)
+            self.GZ += self._GcZ
+        self._G_c = self._GcZ = None
+
+    def finish(self, C, sources, names, log=print) -> dict:
+        """The statistic (Sigma_u, the factor means), the realized between-chromosome same-person mass and its
+        prediction, the realized LD mass when asked for, and the covariates' leverage, as sample_factors.json holds them."""
+        N, nu = self.N, self.nu
+        U = [self.YA[h] @ np.linalg.inv(self.AA[h]) for h in (0, 1)]
+        Sigma = _sym_cross_cov(U[0], U[1])
+        mean_u = (U[0].mean(axis=0) + U[1].mean(axis=0)) / 2.0
+        R = self.R
+        Rall = R.sum(axis=0)
+        tot = float(Rall @ Rall - np.einsum("ci,ci->", R, R))
+        vv = float(Rall.sum() ** 2 - (R.sum(axis=1) ** 2).sum())
+        realized = tot / nu ** 2 - vv / (N * nu ** 2)
+        At = self.Ac.sum(axis=0)
+        predicted = float(N / nu ** 2 * (At @ Sigma @ At - np.einsum("ca,ab,cb->", self.Ac, Sigma, self.Ac)))
+        ld_info = None
+        if self.do_mass:
+            frob_tot = float(np.vdot(self.G_tot, self.G_tot))
+            Vs = np.array(self.Vsum_c)
+            total = frob_tot / nu ** 2 - Vs.sum() ** 2 / nu
+            between = (frob_tot - sum(self.frob_c)) / nu ** 2 - (Vs.sum() ** 2 - (Vs ** 2).sum()) / nu
+            ld_info = dict(total=total, between_chromosomes=between,
+                           between_chromosomes_population_part=between - realized,
+                           method="exact",
+                           definition="sum over SNP pairs of V_j V_k (r_jk^2 - 1/nu), each SNP with itself included "
+                                      "(SUMMIT's in-sample LD scores), V-weighted; from per-chromosome Gram matrices")
+            self.G_tot = None
+        elif self.do_stoch:
+            Vs = np.array(self.Vsum_c)
+            Ez = self.GZ - Rall[:, None] * self.Zp
+            ft = float(Rall @ Rall) + np.einsum("ib,ib->b", Ez, Ez)      # <G, G> per probe
+            fc = sum(d + e for d, e in zip(self.d2_c, self.ec2))         # sum_c <G_c, G_c> per probe
+            tot_b = ft / nu ** 2 - Vs.sum() ** 2 / nu
+            btw_b = (ft - fc) / nu ** 2 - (Vs.sum() ** 2 - (Vs ** 2).sum()) / nu
+            se = lambda x: float(x.std(ddof=1) / np.sqrt(x.size)) if x.size > 1 else float("nan")
+            total, between = float(tot_b.mean()), float(btw_b.mean())
+            ld_info = dict(total=total, between_chromosomes=between,
+                           between_chromosomes_population_part=between - realized,
+                           method="stochastic", probes=self.B, seed=self.seed, se_total=se(tot_b),
+                           se_between_chromosomes=se(btw_b),
+                           definition="sum over SNP pairs of V_j V_k (r_jk^2 - 1/nu), each SNP with itself included "
+                                      "(SUMMIT's in-sample LD scores), V-weighted; the Gram matrices' diagonals exact "
+                                      "and their off-diagonal parts from Rademacher probes")
+            log(f"[admixed-ld] sample-factors: realized in-sample LD mass {total:.6g} (SE {ld_info['se_total']:.3g}), "
+                f"between chromosomes {between:.6g} (SE {ld_info['se_between_chromosomes']:.3g}), from {self.B} probes")
+        elif self.ld_mass:
+            log(f"[admixed-ld] sample-factors: the in-sample LD mass needs two {N} x {N} matrices "
+                f"({2.0 * N * N * 8 / 2 ** 30:.1f} GiB > memory_gb {self.memory_gb}); skipped. --ld-mass-probes "
+                "estimates it at O(N M B) with B random probes")
+        p_rank = C.shape[1]
+        lev = 1.0 / N + (C ** 2).sum(axis=1) if p_rank else np.full(N, 1.0 / N)
+        eig = np.linalg.eigvalsh(Sigma)
+        return dict(format="summit-admixed-ld-sample-factors", version=1, sources=list(sources),
+                    baseline=list(sources)[-1], factors=list(names), sigma=Sigma.tolist(), mean=mean_u.tolist(),
+                    n_samples=int(N), nu=int(nu), sigma_eigenvalues=eig.tolist(),
+                    covariate_rank=int(p_rank), n_snps=int(self.n_used),
+                    halves="least squares per person on the odd and on the even chromosomes (in genome order); sigma "
+                           "is the symmetrized covariance between the halves' estimates",
+                    loadings="(v_B, v_s - v_B, D_s D_t less its sampling covariance, twice for s < t) / s_j^2",
+                    ld_mass=ld_info,
+                    diagnostics=dict(between_chromosome_same_person_mass=realized,
+                                     predicted_by_factors=predicted,
+                                     share_predicted=predicted / realized if realized != 0 else None),
+                    leverage=dict(mean=float(lev.mean()), sd=float(lev.std()), max=float(lev.max()),
+                                  quantiles_90_99=[float(x) for x in np.quantile(lev, [0.9, 0.99])]))
+
+
+def write_sample_factors(out, info, log=print, t0=None):
+    with open(f"{out}.sample_factors.json", "w") as fh:
+        json.dump(info, fh, indent=1)
+    d = info["diagnostics"]
+    realized, predicted, lev = d["between_chromosome_same_person_mass"], d["predicted_by_factors"], info["leverage"]
+    took = f" ({time.perf_counter() - t0:.0f} s)" if t0 is not None else ""
+    log(f"[admixed-ld] sample-factors: wrote {out}.sample_factors.json; between-chromosome same-person mass "
+        f"{realized:.6g}, factors predict {predicted:.6g} ({predicted / realized:.3f}); leverage mean "
+        f"{lev['mean']:.4f}, SD {lev['sd']:.4f}, max {lev['max']:.3f}{took}")
+
+
 def sample_factors(geno, ref_path, out, *, sources=None, covar=None, keep=None, match="position", step=4096,
                    threads=1, ld_mass=True, memory_gb=32.0, ld_mass_probes=0, seed=0, drop_ambiguous=False,
                    log=print) -> dict:
@@ -73,15 +238,13 @@ def sample_factors(geno, ref_path, out, *, sources=None, covar=None, keep=None, 
     off-diagonal part E_c whose squared Frobenius norm is estimated with B Rademacher probes Z (seed),
     ||E_c||^2 ~ mean_b ||E_c z_b||^2, from G_c Z = X~_c (X~_c' Z); G Z is the sum over chromosomes. The diagonal carries
     most of <G_c, G_c>, so a few hundred probes give the masses to about 1% (their standard errors over the probes
-    are recorded)."""
+    are recorded). The curve's pass computes the same statistic with FactorAccumulator (genotype_curve)."""
     from .curve import _cohort_samples
-    from .model import contrast_noise
     t0 = time.perf_counter()
     ref = Reference(ref_path)
     sources = list(sources or ref.names[:2])
     if len(sources) < 2 or len(set(sources)) != len(sources):
         raise ValueError("The sample factors need two or more distinct sources.")
-    k1 = len(sources) - 1
     samples, rows, C = _cohort_samples(geno, covar, keep, log)
     blocks = DosageBlocks(geno, rows=rows, threads=threads, step=step)
     N = blocks.n
@@ -94,143 +257,27 @@ def sample_factors(geno, ref_path, out, *, sources=None, covar=None, keep=None, 
     t_idx, r_idx, _flip = match_variants(blocks.variants, rv, how=match, drop_ambiguous=drop_ambiguous,
                                          report=match_info)
     check_match(match_info, "sample-factors: the cohort", log)
-    P = np.column_stack([rv[f"p_{s}"].to_numpy()[r_idx] for s in sources])
-    Vd = np.column_stack([rv[f"v_{s}"].to_numpy()[r_idx] for s in sources])
-    D = P[:, :-1] - P[:, -1:]                                      # the orientation cancels in every loading
-    Vn, nn, Gn, _ = ref.frequency_noise(sources, np.nan_to_num(Vd), r_idx, rv)
-    S_noise, _ = contrast_noise(Vn, nn, Gn)
-    O = D[:, :, None] * D[:, None, :] - S_noise
-    a_all = factor_loadings(Vd, O)
-    good = np.isfinite(a_all).all(axis=1)
+    a_all, good = factor_inputs(ref, rv, r_idx, sources)
     t_idx, r_idx, a_all = t_idx[good], r_idx[good], a_all[good]
     chrom = rv["CHR"].to_numpy()[r_idx]
     names = factor_names(sources)
-    nf = len(names)
     chroms = list(pd.unique(chrom))
-    YA = [np.zeros((N, nf)), np.zeros((N, nf))]
-    AA = [np.zeros((nf, nf)), np.zeros((nf, nf))]
-    R = np.zeros((len(chroms), N))                                 # per chromosome: each person's sum of y
-    B_probes = int(ld_mass_probes or 0)
-    do_stoch = bool(ld_mass) and B_probes > 0
-    do_mass = bool(ld_mass) and not do_stoch and 2.0 * N * N * 8 / 2 ** 30 <= float(memory_gb)
-    G_tot = np.zeros((N, N)) if do_mass else None
-    if do_stoch:
-        Zp = np.random.default_rng(seed).choice([-1.0, 1.0], size=(N, B_probes))
-        GZ = np.zeros((N, B_probes))
-        ec2, d2_c = [], []
-    frob_c, Vsum_c = [], []
-    Ac = np.zeros((len(chroms), nf))
-    n_used = 0
+    acc = FactorAccumulator(N, nu, len(chroms), len(names), ld_mass=ld_mass, memory_gb=memory_gb,
+                            ld_mass_probes=ld_mass_probes, seed=seed)
     log(f"[admixed-ld] sample-factors: {t_idx.size} variants matched to the reference ({', '.join(sources)}; "
         f"baseline {sources[-1]}); {N} samples; covariate rank {p_rank}; factors {', '.join(names)}")
     for ci, c in enumerate(chroms):
         ix = np.flatnonzero(chrom == c)
-        h = ci % 2
-        G_c = np.zeros((N, N)) if do_mass else None
-        GcZ = np.zeros((N, B_probes)) if do_stoch else None
-        v_c = 0.0
+        acc.start_chromosome()
         for s in range(0, ix.size, step):
             sl = ix[s:s + step]
             X = blocks.read(t_idx[sl])
             center_impute(X)
-            s2 = np.einsum("ij,ij->j", X, X) / (N - 1)
-            ok = np.isfinite(s2) & (s2 > 1e-8)
-            if not ok.any():
-                continue
-            X = X[:, ok]
-            if p_rank:
-                X -= C @ (C.T @ X)
-            Y = X * X / s2[ok][None, :]
-            if do_mass or do_stoch:
-                Xs = X / np.sqrt(s2[ok])[None, :]
-                if do_mass:
-                    G_c += Xs @ Xs.T
-                else:
-                    GcZ += Xs @ (Xs.T @ Zp)
-                v_c += float(Y.sum()) / nu
-            A = a_all[sl][ok] / s2[ok][:, None]
-            YA[h] += Y @ A
-            AA[h] += A.T @ A
-            R[ci] += Y.sum(axis=1)
-            Ac[ci] += A.sum(axis=0)
-            n_used += int(ok.sum())
-        if do_mass:
-            frob_c.append(float(np.vdot(G_c, G_c)))
-            Vsum_c.append(v_c)
-            G_tot += G_c
-            del G_c
-        if do_stoch:                                               # diag(G_c) = R[ci], exact; E_c = G_c - diag
-            Ez = GcZ - R[ci][:, None] * Zp
-            ec2.append(np.einsum("ib,ib->b", Ez, Ez))
-            d2_c.append(float(R[ci] @ R[ci]))
-            Vsum_c.append(v_c)
-            GZ += GcZ
-            del GcZ, Ez
+            acc.add(ci, X, C, a_all[sl])
+        acc.end_chromosome(ci)
         log(f"[admixed-ld] sample-factors chr{c}: {ix.size} variants ({time.perf_counter() - t0:.0f} s)")
-    U = [YA[h] @ np.linalg.inv(AA[h]) for h in (0, 1)]
-    Sigma = _sym_cross_cov(U[0], U[1])
-    mean_u = (U[0].mean(axis=0) + U[1].mean(axis=0)) / 2.0
-    # diagnostics: the realized between-chromosome same-person mass (the referee's definition) and its prediction
-    Rall = R.sum(axis=0)
-    tot = float(Rall @ Rall - np.einsum("ci,ci->", R, R))
-    vv = float(Rall.sum() ** 2 - (R.sum(axis=1) ** 2).sum())
-    realized = tot / nu ** 2 - vv / (N * nu ** 2)
-    At = Ac.sum(axis=0)
-    predicted = float(N / nu ** 2 * (At @ Sigma @ At - np.einsum("ca,ab,cb->", Ac, Sigma, Ac)))
-    ld_info = None
-    if do_mass:
-        frob_tot = float(np.vdot(G_tot, G_tot))
-        Vs = np.array(Vsum_c)
-        total = frob_tot / nu ** 2 - Vs.sum() ** 2 / nu
-        between = (frob_tot - sum(frob_c)) / nu ** 2 - (Vs.sum() ** 2 - (Vs ** 2).sum()) / nu
-        ld_info = dict(total=total, between_chromosomes=between,
-                       between_chromosomes_population_part=between - realized,
-                       method="exact",
-                       definition="sum over SNP pairs of V_j V_k (r_jk^2 - 1/nu), each SNP with itself included (SUMMIT's "
-                                  "in-sample LD scores), V-weighted; from per-chromosome Gram matrices")
-        del G_tot
-    elif do_stoch:
-        Vs = np.array(Vsum_c)
-        Ez = GZ - Rall[:, None] * Zp
-        ft = float(Rall @ Rall) + np.einsum("ib,ib->b", Ez, Ez)          # <G, G> per probe
-        fc = sum(d + e for d, e in zip(d2_c, ec2))                       # sum_c <G_c, G_c> per probe
-        tot_b = ft / nu ** 2 - Vs.sum() ** 2 / nu
-        btw_b = (ft - fc) / nu ** 2 - (Vs.sum() ** 2 - (Vs ** 2).sum()) / nu
-        se = lambda x: float(x.std(ddof=1) / np.sqrt(x.size)) if x.size > 1 else float("nan")
-        total, between = float(tot_b.mean()), float(btw_b.mean())
-        ld_info = dict(total=total, between_chromosomes=between,
-                       between_chromosomes_population_part=between - realized,
-                       method="stochastic", probes=B_probes, seed=int(seed), se_total=se(tot_b),
-                       se_between_chromosomes=se(btw_b),
-                       definition="sum over SNP pairs of V_j V_k (r_jk^2 - 1/nu), each SNP with itself included (SUMMIT's "
-                                  "in-sample LD scores), V-weighted; the Gram matrices' diagonals exact and their "
-                                  "off-diagonal parts from Rademacher probes")
-        log(f"[admixed-ld] sample-factors: realized in-sample LD mass {total:.6g} (SE {ld_info['se_total']:.3g}), "
-            f"between chromosomes {between:.6g} (SE {ld_info['se_between_chromosomes']:.3g}), from {B_probes} probes")
-    elif ld_mass:
-        log(f"[admixed-ld] sample-factors: the in-sample LD mass needs two {N} x {N} matrices "
-            f"({2.0 * N * N * 8 / 2 ** 30:.1f} GiB > memory_gb {memory_gb}); skipped. --ld-mass-probes estimates it "
-            "at O(N M B) with B random probes")
-    lev = 1.0 / N + (C ** 2).sum(axis=1) if p_rank else np.full(N, 1.0 / N)
-    eig = np.linalg.eigvalsh(Sigma)
-    info = dict(format="summit-admixed-ld-sample-factors", version=1, sources=sources, baseline=sources[-1],
-                factors=names, sigma=Sigma.tolist(), mean=mean_u.tolist(), n_samples=int(N), nu=int(nu),
-                sigma_eigenvalues=eig.tolist(),
-                covariate_rank=int(p_rank), n_snps=int(n_used),
-                halves="least squares per person on the odd and on the even chromosomes (in genome order); sigma is "
-                       "the symmetrized covariance between the halves' estimates",
-                loadings="(v_B, v_s - v_B, D_s D_t less its sampling covariance, twice for s < t) / s_j^2",
-                ld_mass=ld_info,
-                diagnostics=dict(between_chromosome_same_person_mass=realized,
-                                 predicted_by_factors=predicted,
-                                 share_predicted=predicted / realized if realized != 0 else None),
-                leverage=dict(mean=float(lev.mean()), sd=float(lev.std()), max=float(lev.max()),
-                              quantiles_90_99=[float(x) for x in np.quantile(lev, [0.9, 0.99])]))
-    with open(f"{out}.sample_factors.json", "w") as fh:
-        json.dump(info, fh, indent=1)
-    log(f"[admixed-ld] sample-factors: wrote {out}.sample_factors.json; between-chromosome same-person mass "
-        f"{realized:.6g}, factors predict {predicted:.6g} ({predicted / realized:.3f}); leverage mean "
-        f"{lev.mean():.4f}, SD {lev.std():.4f}, max {lev.max():.3f} ({time.perf_counter() - t0:.0f} s)")
+    info = acc.finish(C, sources, names, log)
+    write_sample_factors(out, info, log, t0)
     return info
 
 
