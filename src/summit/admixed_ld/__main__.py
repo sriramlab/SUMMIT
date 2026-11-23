@@ -123,6 +123,14 @@ def main(argv=None):
                         "(default 4)")
     c.add_argument("--no-relatedness-profile", action="store_true",
                    help=argparse.SUPPRESS)
+    c.add_argument("--no-sample-factors", dest="sample_factors", action="store_false", default=True,
+                   help="do not write the sample statistic (PREFIX.sample_factors.json: the covariance of a few "
+                        "person-level factors and the realized same-person mass, one more O(N M) pass), which compose "
+                        "uses with this curve for the same-person term")
+    c.add_argument("--sample-factors-ld-mass", action="store_true",
+                   help="also record the realized in-sample LD mass in the sample statistic (exact, a GRM's cost)")
+    c.add_argument("--sample-factors-probes", type=int, default=0,
+                   help="record the realized in-sample LD mass estimated with this many random probes (O(N M B))")
     c.add_argument("--no-background", dest="background", action="store_false",
                    help="leave out the background term (by default it is measured; it is part of curve mode)")
     c.add_argument("--background", dest="background", action="store_true", default=True,
@@ -217,6 +225,12 @@ def main(argv=None):
                         "than 1%% get one file per sample size, listed in PREFIX.n_groups.tsv: the same-person and "
                         "background terms belong to each GWAS's sample)")
     m.add_argument("--n-tol", type=float, default=0.01, help=argparse.SUPPRESS)
+    m.add_argument("--no-sample-factors", dest="release_sample_factors", action="store_false", default=True,
+                   help="compose the same-person term under random mating even when the curve's pass wrote a sample "
+                        "statistic next to it (PREFIX.sample_factors.json, used by default)")
+    m.add_argument("--min-release-share", type=float, default=0.85,
+                   help="flag traits whose GWAS N is below this share of the curve's people (default 0.85): compose "
+                        "them alone with the sample statistic of their own people")
     m.add_argument("--sample-factors-no-calibration", action="store_true",
                    help=argparse.SUPPRESS)
     m.add_argument("--partners", choices=["rows", "reference"], default="rows",
@@ -249,6 +263,11 @@ def main(argv=None):
                    help="skip the realized in-sample LD mass (two n x n matrices, O(n^2 M))")
     f.add_argument("--memory-gb", type=float, default=32.0,
                    help="largest memory for the two n x n matrices of the LD mass; above it the mass is skipped")
+    f.add_argument("--ld-mass-probes", type=int, default=0,
+                   help="estimate the realized LD mass with this many random probes, at O(n M B) instead of a GRM's "
+                        "O(n^2 M) (each Gram matrix's diagonal is exact; a few hundred probes give it to about 1%%, with "
+                        "its standard error recorded). Default 0: exact")
+    f.add_argument("--seed", type=int, default=0, help="seed of the probes (--ld-mass-probes)")
     f.add_argument("--drop-ambiguous", action="store_true",
                     help="leave out strand-ambiguous (A/T, C/G) SNPs, which are otherwise matched as listed; use it when the "
                     "data sets may be on different strands")
@@ -452,7 +471,7 @@ def _run(a, log):
         from .sample_factors import sample_factors
         sample_factors(a.geno, a.ref, a.out, sources=_sources(a.sources), covar=a.covar, keep=a.keep, match=a.match,
                        threads=a.threads, ld_mass=not a.no_ld_mass, memory_gb=a.memory_gb,
-                       drop_ambiguous=a.drop_ambiguous, log=log._log)
+                       ld_mass_probes=a.ld_mass_probes, seed=a.seed, drop_ambiguous=a.drop_ambiguous, log=log._log)
     elif a.cmd == "derive":
         from .derive import derive_source
         derive_source(a.geno, a.ref, a.out, name=a.name, known=_sources(a.known), panel=a.panel, covar=a.covar,
@@ -471,7 +490,9 @@ def _run(a, log):
                        relatedness_cell_cm=a.relatedness_cell_cm, relatedness_controls=a.relatedness_controls,
                        relatedness_memory_gb=a.relatedness_memory_gb, background=a.background,
                        background_quantile=a.background_quantile, background_between_snps=a.background_snps,
-                       drop_ambiguous=a.drop_ambiguous, log=log._log)
+                       drop_ambiguous=a.drop_ambiguous, sample_factors=a.sample_factors,
+                       sample_factors_ld_mass=a.sample_factors_ld_mass, sample_factors_probes=a.sample_factors_probes,
+                       log=log._log)
     elif a.cmd == "tractor-gwas":
         from .tractor_gwas import tractor_gwas
         tractor_gwas(a.pgen, a.lanc, a.pheno, a.covar, a.out, keep=a.keep, sources=_sources(a.sources),
@@ -512,6 +533,7 @@ def _run(a, log):
                          per_trait_n=not a.single_n, n_tol=a.n_tol,
                          calibrate_between_chromosomes=a.calibrate_between_chromosomes, tracks=a.tracks,
                          track_alpha=a.track_alpha, partners=a.partners, drop_ambiguous=a.drop_ambiguous,
+                         release_sample_factors=a.release_sample_factors, min_release_share=a.min_release_share,
                          log=log._log)
     return 0
 

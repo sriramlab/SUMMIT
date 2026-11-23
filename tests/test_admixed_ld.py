@@ -1381,9 +1381,11 @@ def test_compose_fails_closed_and_records_flags(sim, tmp_path):
         return {f["flag"] for f in json.load(open(out + ".admixed_ld.json"))["flags"]}
 
     out = str(tmp_path / "curve")
-    compose_ldscores(*args, out, curve=str(d / "cohort"), log=quiet)
+    # the flags of the inputs themselves: without the curve's sample statistic (tested on its own below)
+    compose_ldscores(*args, out, curve=str(d / "cohort"), release_sample_factors=False, log=quiet)
     assert flags(out) == {"panel_admixture_unmeasured"}            # the test reference was never cleaned
-    low = dict(curve=str(d / "cohort"), mean_ancestry="0.6", kappa0=f"{0.5 * k2:.6g}", log=quiet)
+    low = dict(curve=str(d / "cohort"), mean_ancestry="0.6", kappa0=f"{0.5 * k2:.6g}", release_sample_factors=False,
+               log=quiet)
     with pytest.raises(ValueError, match="allow-flat-kernel-join"):
         compose_ldscores(*args, str(tmp_path / "flat"), **low)
     assert not os.path.exists(str(tmp_path / "flat") + ".gw.ldscore.gz")
@@ -1614,10 +1616,10 @@ def test_compose_writes_one_file_per_gwas_sample_size(fam, tmp_path):
         df.to_csv(tmp_path / "part" / f"part{t}.tsv", sep="\t", index=False)
     first = str(tmp_path / "first")
     compose_ldscores(str(d / "ref"), [str(tmp_path / "full")], str(d / "annot.tsv"), first, curve=str(d / "c"),
-                     relatedness="curve", log=lambda *a: None)
+                     relatedness="curve", release_sample_factors=False, log=lambda *a: None)
     pj = json.load(open(first + ".admixed_ld.json"))
     kw = dict(curve=str(d / "c"), relatedness="curve", mean_ancestry=str(pj["mean_ancestry"]),
-              kappa0=str(pj["kappa0"]), log=lambda *a: None)
+              kappa0=str(pj["kappa0"]), release_sample_factors=False, log=lambda *a: None)
     out = {}
     for nm in ("mix", "full", "part"):
         compose_ldscores(str(d / "ref"), [str(tmp_path / nm)], str(d / "annot.tsv"), str(tmp_path / f"c_{nm}"), **kw)
@@ -1635,6 +1637,78 @@ def test_compose_writes_one_file_per_gwas_sample_size(fam, tmp_path):
     assert len(pm["n_groups"]) == 2
     assert {g["label"] for g in pm["n_groups"]} == {str(n), str(sub.size)}
     assert not os.path.exists(str(tmp_path / "c_full") + ".n_groups.tsv")   # one sample size: no extra files
+
+
+def test_curve_writes_the_sample_statistic_and_compose_uses_it(sim, tmp_path):
+    """The curve's pass writes the sample statistic of the same people (as sample-factors run on its own), and compose
+    with that curve uses it for the same-person term unless told not to (curve mode's default, 22 Nov 2026)."""
+    from summit.admixed_ld.compose import compose_ldscores
+    from summit.admixed_ld.curve import genotype_curve
+    from summit.admixed_ld.sample_factors import sample_factors
+    d = sim["dir"]
+    quiet = lambda *a, **k: None
+    cv = str(tmp_path / "cv")
+    _, cinfo = genotype_curve(str(d / "cohort"), str(d / "ref"), cv, covar=str(d / "cohort.cov"), cell_cm=0.5, log=quiet)
+    assert cinfo["sample_factors"] == "cv.sample_factors.json" and os.path.exists(cv + ".sample_factors.json")
+    alone = sample_factors(str(d / "cohort"), str(d / "ref"), str(tmp_path / "alone"), covar=str(d / "cohort.cov"),
+                           ld_mass=False, log=quiet)
+    with_curve = json.load(open(cv + ".sample_factors.json"))
+    np.testing.assert_allclose(with_curve["sigma"], alone["sigma"], rtol=1e-10, atol=1e-14)
+    args = (str(d / "ref"), [str(d / "ss")], str(d / "annot.tsv"))
+    got = {}
+    for arm, kw in (("auto", {}), ("explicit", dict(sample_factors=cv + ".sample_factors.json")),
+                    ("random_mating", dict(release_sample_factors=False))):
+        compose_ldscores(*args, str(tmp_path / arm), curve=cv, log=quiet, **kw)
+        got[arm] = pd.read_csv(str(tmp_path / arm) + ".gw.ldscore.gz", sep="\t")[["low", "high"]].to_numpy()
+    np.testing.assert_allclose(got["auto"], got["explicit"], rtol=1e-12, atol=1e-14)
+    assert not np.allclose(got["auto"], got["random_mating"], rtol=1e-6, atol=0)
+    pj = json.load(open(str(tmp_path / "auto") + ".admixed_ld.json"))
+    assert pj["sample_factors"]["from_release"] is True
+    assert "sample_factors_sample_differs" not in {f["flag"] for f in pj["flags"]}
+
+
+def test_release_coverage_flags_traits_measured_in_part_of_the_cohort(sim, tmp_path):
+    """A trait whose GWAS N is below 85% of the curve's people is flagged (gwas_sample_smaller_than_release); traits
+    of the curve's size are not."""
+    import shutil
+    from summit.admixed_ld.compose import compose_ldscores
+    from summit.admixed_ld.curve import genotype_curve
+    d = sim["dir"]
+    quiet = lambda *a, **k: None
+    cv = str(tmp_path / "cv")
+    genotype_curve(str(d / "cohort"), str(d / "ref"), cv, covar=str(d / "cohort.cov"), cell_cm=0.5,
+                   sample_factors=False, log=quiet)
+    n = json.load(open(cv + ".curve.json"))["n_samples"]
+    os.makedirs(tmp_path / "ss")
+    for t in range(3):
+        shutil.copy(d / "ss" / f"trait{t}.tsv", tmp_path / "ss" / f"trait{t}.tsv")
+    flags = lambda out: {f["flag"]: f for f in json.load(open(out + ".admixed_ld.json"))["flags"]}
+    out = str(tmp_path / "all")
+    compose_ldscores(str(d / "ref"), [str(tmp_path / "ss")], str(d / "annot.tsv"), out, curve=cv, log=quiet)
+    assert "gwas_sample_smaller_than_release" not in flags(out)
+    t0 = pd.read_csv(tmp_path / "ss" / "trait0.tsv", sep="\t")
+    t0["N"] = int(0.5 * n)
+    t0.to_csv(tmp_path / "ss" / "trait0.tsv", sep="\t", index=False)
+    out = str(tmp_path / "part")
+    compose_ldscores(str(d / "ref"), [str(tmp_path / "ss")], str(d / "annot.tsv"), out, curve=cv, log=quiet)
+    f = flags(out)["gwas_sample_smaller_than_release"]
+    assert "trait0" in f["detail"] and "trait1" not in f["detail"] and f["min_share"] == 0.85
+
+
+def test_stochastic_ld_mass_agrees_with_the_exact_one(sim, tmp_path):
+    """The realized LD mass from random probes (exact diagonals, Rademacher probes for the off-diagonal parts) is
+    within a few of its recorded standard errors of the exact mass, in total and between chromosomes."""
+    from summit.admixed_ld.sample_factors import sample_factors
+    d = sim["dir"]
+    quiet = lambda *a, **k: None
+    kw = dict(covar=str(d / "cohort.cov"), log=quiet)
+    ex = sample_factors(str(d / "cohort"), str(d / "ref"), str(tmp_path / "ex"), **kw)["ld_mass"]
+    st = sample_factors(str(d / "cohort"), str(d / "ref"), str(tmp_path / "st"), ld_mass_probes=300, seed=4,
+                        **kw)["ld_mass"]
+    assert ex["method"] == "exact" and st["method"] == "stochastic" and st["probes"] == 300
+    for k, se in (("total", "se_total"), ("between_chromosomes", "se_between_chromosomes")):
+        assert 0 < st[se] < 0.05 * abs(ex["total"]), (k, st[se], ex["total"])   # the between part is small here
+        assert abs(st[k] - ex[k]) < 4.0 * st[se], (k, st[k], ex[k], st[se])
 
 
 def test_sample_factors_ld_mass_and_its_check_in_compose(sim, tmp_path):

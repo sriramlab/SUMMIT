@@ -22,6 +22,7 @@ Only aggregates are written.
 from __future__ import annotations
 
 import json
+import os
 import time
 
 import numpy as np
@@ -465,8 +466,12 @@ def genotype_curve(geno, ref_path, out, *, sources=None, covar=None, keep=None, 
                    closure=False, cells_cm=2.0, per_chromosome=False, step=4096, threads=1, native=True,
                    noise_correction=True, relatedness_profile=None, relatedness_cell_cm=0.5, relatedness_controls=None,
                    relatedness_memory_gb=4.0, background=False, background_quantile=0.2, background_between_snps=None,
-                   background_memory_gb=32.0, drop_ambiguous=False, log=print):
-    """The weighted-LD curve of the cohort for two or more sources. With cells_cm, also the genome-wide matrix of
+                   background_memory_gb=32.0, drop_ambiguous=False, sample_factors=True, sample_factors_ld_mass=False,
+                   sample_factors_probes=0, log=print):
+    """The weighted-LD curve of the cohort for two or more sources. sample_factors: also the sample statistic of
+    the same people with the same covariates (`summit admixed-ld sample-factors`, one more O(N M) pass), written to
+    out.sample_factors.json and used by compose with this curve (curve mode's same-person term); its realized LD mass
+    only with sample_factors_ld_mass (exact, a GRM's cost) or sample_factors_probes > 0 (stochastic). With cells_cm, also the genome-wide matrix of
     covariances between cells of cells_cm cM (within and between chromosomes) and the sampling variance of each entry,
     written to out.cells.npz: it carries long-range structure that one value per distance cannot (for example what the
     genotype PCs leave). With K sources and the last as baseline, each of the
@@ -774,11 +779,18 @@ def genotype_curve(geno, ref_path, out, *, sources=None, covar=None, keep=None, 
         np.savez(f"{out}.curve_chr.npz", chrom=np.array([x[0] for x in chr_parts]), cell_cm=float(cell_cm),
                  num=np.stack([x[1] for x in chr_parts]), den=np.stack([x[2] for x in chr_parts]))
         info["per_chromosome"] = f"{out}.curve_chr.npz"
+    if sample_factors:
+        info["sample_factors"] = f"{os.path.basename(out)}.sample_factors.json"
     curve.to_csv(f"{out}.curve.tsv", sep="\t", index=False, float_format="%.8g")
     with open(f"{out}.curve.json", "w") as f:
         json.dump(info, f, indent=1)
     blocks.close()
     mp.drain()
+    if sample_factors:
+        from .sample_factors import sample_factors as _sample_factors
+        _sample_factors(geno, ref_path, out, sources=sources, covar=covar, keep=keep, match=match, step=step,
+                        threads=threads, ld_mass=bool(sample_factors_ld_mass) or int(sample_factors_probes or 0) > 0,
+                        ld_mass_probes=sample_factors_probes, drop_ambiguous=drop_ambiguous, log=log)
     mean_th = np.asarray(info["theta"]["mean_vector"])
     log(f"[admixed-ld] curve: between chromosomes " + np.array2string(inter, precision=5).replace("\n", "")
         + "; decay per cM (2-20 cM) " + ", ".join(f"{s} {fits[s]['lam']:.4f}" for s in sources)

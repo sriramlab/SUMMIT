@@ -673,6 +673,28 @@ def relatedness_term(L, rel, chrom, cm, cls, V, K, nu, grid_cm, scale=1.0, partn
         L[sel] += (scale * acc) / nu ** 2
 
 
+def release_coverage(tables, n_med, n_release, min_share=0.85, log=print):
+    """Traits whose GWAS sample holds less than min_share of the people of the cohort's release (the people of the
+    curve and of its sample statistic). Composition follows each GWAS's N, but not the ancestry and relatedness of the
+    people with the trait, which can differ from the release's when the trait was measured in only part of the cohort.
+    Such a trait is composed alone (its own summary statistics) with the cohort's curve and the sample statistic of
+    its own people. The traits and their shares are recorded and logged."""
+    if n_release is None or not tables or min_share is None or min_share <= 0:
+        return []
+    share = np.asarray(n_med, np.float64) / float(n_release)
+    low = np.flatnonzero(share < float(min_share))
+    if low.size == 0:
+        return []
+    names = [t[0] for t in tables]
+    detail = ", ".join(f"{names[i]} (N {n_med[i]:.0f}, {share[i]:.2f} of {int(n_release)})" for i in low)
+    log(f"[admixed-ld] WARNING (recorded flag gwas_sample_smaller_than_release): {low.size} trait(s) were analysed "
+        f"in less than {min_share:.0%} of the release's {int(n_release)} people: {detail}. Their LD can differ from "
+        "the release's in the ancestry and relatedness of the people measured. Compose each alone (its own summary "
+        "statistics) with the cohort's curve and the sample statistic of its own people (summit admixed-ld "
+        "sample-factors --keep <its people>, with the GWAS covariates).")
+    return [dict(flag="gwas_sample_smaller_than_release", detail=detail, min_share=float(min_share))]
+
+
 def se_regression_outliers(per_trait, log=print, max_m=0.05, max_kappa=0.25, min_r2=0.9):
     """Traits whose standard-error regression stands apart from the others (first source's m more than max_m from the
     median, kappa_res(0) more than max_kappa of the median away, or a fit R2 below min_r2): logistic, mixed-model or
@@ -693,8 +715,9 @@ def se_regression_outliers(per_trait, log=print, max_m=0.05, max_kappa=0.25, min
     log(f"[admixed-ld] WARNING (recorded flag se_regression_outlier_traits): the standard errors of {names.size} "
         f"trait(s) give other cohort quantities than the rest (median m {np.median(m1):.3f}, kappa_res(0) {km:.4f}): "
         f"{detail}. Logistic, mixed-model or otherwise weighted SEs do this, and so does a trait analysed in another "
-        "subset of people or with other covariates; such a trait needs its own composition (for a GWAS sample of its "
-        "own, its own curve).")
+        "subset of people or with other covariates; such a trait needs its own composition: for a GWAS sample of its "
+        "own, compose it alone (its own summary statistics) with the cohort's curve and the sample statistic of its "
+        "own people (summit admixed-ld sample-factors --keep <its people>).")
     return [dict(flag="se_regression_outlier_traits", detail=detail)]
 
 
@@ -732,7 +755,8 @@ def compose_ldscores(ref_path, sumstats, annot, out, *, sources=None, snps=None,
                      cell_switch_cm=10.0, allow_flat_kernel_join=False, cross_source=None,
                      sample_factors=None, sample_factors_calibrate=True, calibrate_between_chromosomes=False,
                      per_trait_n=True, n_tol=0.01, tracks=False, track_alpha=None, partners="rows",
-                     drop_ambiguous=False, pair_chunk=1 << 23, log=print):
+                     drop_ambiguous=False, pair_chunk=1 << 23, release_sample_factors=True, min_release_share=0.85,
+                     log=print):
     """Composed LD scores for an admixed GWAS sample with two or more sources (the last is the baseline of the
     contrasts). mean_ancestry: K-1 or K values (comma-separated); kappa0: the upper triangle of Kt_res(0) row by row.
     Departures from the standard recipe that are allowed but should be visible are recorded in the params json under
@@ -804,6 +828,13 @@ def compose_ldscores(ref_path, sumstats, annot, out, *, sources=None, snps=None,
         raise ValueError("partners must be 'rows' (the GWAS SNPs) or 'reference' (every reference variant in the "
                          "annotation).")
     dense = partners == "reference"
+    # curve mode's same-person term: the sample statistic the curve's pass wrote next to it, unless one is given
+    sf_from_release = False
+    if (sample_factors is None and release_sample_factors and curve is not None and not dense
+            and os.path.exists(f"{curve}.sample_factors.json")):
+        sample_factors, sf_from_release = f"{curve}.sample_factors.json", True
+        log(f"[admixed-ld] compose: same-person term from the curve's sample statistic ({sample_factors}); "
+            "--no-sample-factors composes it under random mating instead")
     if dense and (cell_matrix is True or sample_factors is not None or calibrate_between_chromosomes):
         raise ValueError("--partners reference cannot be combined with --cell-matrix, --sample-factors or "
                          "--calibrate-between-chromosomes: those are measured on the GWAS SNPs.")
@@ -959,6 +990,7 @@ def compose_ldscores(ref_path, sumstats, annot, out, *, sources=None, snps=None,
                               detail=f"curve covariate rank {int(c_rank)}, GWAS COV_RANK {p}"))
             log(f"[admixed-ld] WARNING (recorded flag covariates_differ_from_curve): the curve was made with {int(c_rank)} "
                 f"covariates and the GWAS reports {p}. The curve must use the GWAS's own covariates (and its PCs).")
+        flags += release_coverage(tables, n_med, curve_info.get("n_samples"), min_release_share, log)
     elif generations is not None:
         kern = KernelMatrix.from_decay(k0, float(generations) / 100.0, ref.genome_cm, nK,
                                        source=f"admixture {generations} generations ago")
@@ -1342,7 +1374,7 @@ def compose_ldscores(ref_path, sumstats, annot, out, *, sources=None, snps=None,
             else:
                 flags.append(dict(flag="sample_factors_not_calibrated",
                                   detail=f"between-chromosome masses {btw:.4g} (compose), {realized:.4g} (realized)"))
-        sf_info = dict(file=sfi["path"], n_samples=sfi["n_samples"], nu=sfi["nu"], factors=sfi["factors"],
+        sf_info = dict(file=sfi["path"], from_release=bool(sf_from_release), n_samples=sfi["n_samples"], nu=sfi["nu"], factors=sfi["factors"],
                        sigma=sfi["sigma"], diagnostics=sfi.get("diagnostics"), leverage=sfi.get("leverage"),
                        calibration=calib, same_person_mass_uncalibrated=mass_uncal,
                        same_person_mass=float((Vpop_sp[:, None] * sp).sum()),
@@ -1354,7 +1386,15 @@ def compose_ldscores(ref_path, sumstats, annot, out, *, sources=None, snps=None,
                                      "estimated"))
             log(f"[admixed-ld] note (recorded flag sample_factors_not_psd): Sigma_u has the eigenvalue {ev.min():.3g} "
                 f"(largest {ev.max():.3g}); the split-half estimate is used as it is")
-        if abs(sfi["n_samples"] - N) > 0.01 * N:
+        n_rel_people = curve_info.get("n_samples") if curve_info is not None else None
+        if abs(sfi["n_samples"] - N) > 0.01 * N and n_rel_people is not None and int(sfi["n_samples"]) == int(n_rel_people):
+            # the cohort's release (curve and statistic of the same people): the term is scaled to each GWAS's N, and
+            # GWAS samples that hold much less of the release's people are flagged by gwas_sample_smaller_than_release
+            flags.append(dict(flag="sample_factors_from_release",
+                              detail=f"sample statistic of the curve's {sfi['n_samples']} people, GWAS N {N:.0f}"))
+            log(f"[admixed-ld] compose: the sample statistic is the release's ({sfi['n_samples']} people, as the "
+                f"curve); the same-person term is scaled to the GWAS's N {N:.0f}")
+        elif abs(sfi["n_samples"] - N) > 0.01 * N:
             flags.append(dict(flag="sample_factors_sample_differs",
                               detail=f"sample factors of {sfi['n_samples']} people, GWAS N {N:.0f}"))
             log(f"[admixed-ld] WARNING (recorded flag sample_factors_sample_differs): the sample factors were made on "
