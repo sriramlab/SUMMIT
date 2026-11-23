@@ -33,7 +33,8 @@ Pairs on different chromosomes use the between-chromosome value of the kernel.
 A GWAS of N people adds a sample part to the expected squared correlation:
 
 - the same-person term, because each person's genotype variance depends on their ancestry. It is of order 1/N per pair
-  but is summed over M partners, so its share of the LD mass grows with M/N;
+  but is summed over M partners, so its share of the LD mass grows with M/N. Curve mode takes it from the sample
+  statistic that the curve's pass writes, and date mode composes it under random mating;
 - a background term from people who share segments identical by descent, relatives included, measured by the curve;
 - in curve mode, a cell matrix that holds the long-range structure that principal components leave on single
   chromosomes.
@@ -77,7 +78,9 @@ including its principal components). It writes:
 - the background term, from all pairs of people among the least differentiated fifth of the SNPs, by distance and
   between chromosomes (`.background.tsv`);
 - the cell matrix, the covariance between 2-cM cells of the genome, estimated in two halves of the people so that its
-  square is unbiased (`.cells.npz`).
+  square is unbiased (`.cells.npz`);
+- the sample statistic (`.sample_factors.json`), accumulated in the same pass over the genotypes (see
+  [The sample statistic](#the-sample-statistic)). `--no-sample-factors` leaves it out.
 
 Options:
 
@@ -91,15 +94,28 @@ The curve stops when the cohort's alleles disagree with the reference at many sh
 and when strand-ambiguous SNPs have frequencies that fit the other strand (pass `--drop-ambiguous`). It records the
 share of missing genotypes.
 
-When the traits' GWAS samples differ, make the curve on a set of people that holds all of them; compose then scales the
-background term by N (N − 1) / (n (n − 1)) and records a flag. A curve on each trait's own sample is better when the
-samples differ much, for example when a trait is measured mostly in one subgroup.
+One curve serves the cohort. Make it once on the people of the cohort's GWAS with the GWAS covariates. Compose takes
+each trait's N and ancestry from its summary statistics, and scales the same-person term and the background term
+(by N (N − 1) / (n (n − 1))) to each N. A trait measured in only part of the cohort can also differ in the ancestry and
+relatedness of its people. Compose therefore flags traits whose GWAS N is below 85% of the curve's people
+(`gwas_sample_smaller_than_release`, threshold `--min-release-share`) and traits whose standard errors give other cohort
+quantities than the rest (`se_regression_outlier_traits`). Compose such a trait alone, with its own summary statistics,
+the cohort's curve and the sample statistic of its own people.
+
+```bash
+summit admixed-ld sample-factors --geno cohort --ref ref/afr_eur_clean --keep trait_sample.txt --covar gwas.cov \
+  --threads 8 --out trait_sf
+summit admixed-ld compose --ref ref/afr_eur_clean --sumstats gwas/trait.tsv --annot annot.tsv.gz --curve cohort \
+  --sample-factors trait_sf --out ld/trait
+```
 
 ## Compose
 
 `--sumstats` takes SUMMIT summary statistics (files or a directory) with `BETA`, `SE`, `N` and `COV_RANK`. Variants are
 matched by `CHR` and `BP`; if the summary statistics lack them, give the GWAS variant table with `--snps` (BIM, PVAR, or
-a table with SNP CHR BP A1 A2). `--annot` is the annotation of the fit, such as MAF and LD bins.
+a table with SNP CHR BP A1 A2). `--annot` is the annotation of the fit, such as MAF and LD bins. Its 0/1 columns may
+overlap, for example MAF and LD bins with coding or conserved regions as further columns. Compose then works on their
+disjoint combinations and writes the columns as given (not with `--partners reference` or `--tracks`).
 
 **Curve mode** (`--curve`). The kernel beyond 2 cM, the decay of the within-source weights and the moments of global
 ancestry come from the curve. Below 2 cM the curve also holds within-source LD, so the kernel there is an exponential
@@ -107,7 +123,9 @@ from κ_res(0) of the standard errors to the curve's value at 2 cM. The backgrou
 smoothed as a constant plus decaying exponentials fitted from 3 cM on, and the panels' own background is removed inside
 the band. In the squared admixture LD, the cell matrix takes the place of the kernel for pairs of SNPs whose 2-cM
 cells have midpoints at least 10 cM apart on a chromosome, and for pairs on different chromosomes. Both are used whenever the curve has them; `--relatedness none` and
-`--no-cell-matrix` leave them out. Compose stops when the curve at 2 cM is above κ_res(0) of the standard errors,
+`--no-cell-matrix` leave them out. The same-person term comes from the sample statistic written with the curve.
+`--no-sample-factors` composes it under random mating instead, as date mode does, and `--sample-factors FILE` gives
+another statistic. Compose stops when the curve at 2 cM is above κ_res(0) of the standard errors,
 because then the two inputs describe different samples or covariates.
 
 **Date mode** (`--admixture-generations T`). The kernel decays at T/100 per cM from κ_res(0) to the between-chromosome
@@ -122,16 +140,25 @@ and no cell matrix.
 
 **One file per GWAS sample size.** The same-person and background terms belong to each GWAS's sample. When the traits'
 median N differ by more than 1%, compose writes one file per group of traits (`ld/cohort.n<N>.gw.ldscore.gz`, listed
-with their traits in `ld/cohort.n_groups.tsv`); fit each trait with its group's file. `ld/cohort.gw.ldscore.gz` is the
-file for the median N. When no group's LD mass differs from it by 0.1% (large samples), it serves every trait and no
+with their traits in `ld/cohort.n_groups.tsv`). `summit --h2` with `--ldscores ld/cohort` (or
+`ld/cohort.gw.ldscore.gz`) reads that list, fits each trait with its own group's file and writes the file of each
+trait to `.ldscore_groups.tsv`; `--ldscore-groups off` fits every trait with the file given. `--rg` uses the file given
+for both traits. `ld/cohort.gw.ldscore.gz` is the file for the median N. When no group's LD mass differs from it by 0.1% (large samples), it serves every trait and no
 group files are written. `--single-n` writes only that file.
+
+**The plan.** Before composing, compose logs what it will use, namely the mode and the source of the decay, the source
+of the same-person term, of the relatives and of the background, the cell matrix, the ancestry, the sample sizes and the
+flags so far. The plan is stored as `plan` in `ld/cohort.admixed_ld.json`. `--dry-run` writes it to
+`ld/cohort.plan.json` and stops. `--require statistic,cells` (any of curve, statistic, cells, relatives, background)
+stops with an error when one of them would be missing, for example in a pipeline.
 
 **Checks.** Compose stops when the GWAS's alleles disagree with the reference at many shared positions. It records flags
 in `ld/cohort.admixed_ld.json`, and logs a warning, when:
 
 - a panel was not cleaned;
 - the ancestry SD is the derived one (date mode without `--ancestry-sd`);
-- the curve was made on other people, or with another number of covariates, than the GWAS reports;
+- the curve was made with another number of covariates than the GWAS reports;
+- a trait's GWAS N is below 85% of the curve's people;
 - the standard errors of some traits give cohort quantities that stand apart from the others.
 
 The json also records every parameter, m and κ_res(0) per trait, and the matching counts.
@@ -141,25 +168,25 @@ than the GWAS SNPs, `--partners reference` takes every reference variant listed 
 GWAS SNPs as rows. Build the reference on the dense set; `.gw.M` then holds the partners' counts. The cell matrix and
 sample factors are measured on the GWAS SNPs and cannot be combined with it.
 
-## Small samples
+## The sample statistic
 
-The same-person term assumes that each person's genotype variance follows their global ancestry. In samples of a few
-hundred people it is carried as much by the leverage of the covariates, and in first-generation groups by the parents'
-ancestries. The cohort can then release a sample statistic made on the GWAS sample with its covariates:
+Under random mating each person's genotype variance follows their global ancestry. In real samples the leverage of the
+covariates and, in first-generation groups, the parents' ancestries also matter, most in samples of a few hundred
+people. The sample statistic measures this on the GWAS sample with its covariates. It is a small covariance matrix of
+person factors (a level, the ancestry proportions and the local-ancestry variances), estimated from odd and even
+chromosomes separately so that each person's noise cancels, with the realized same-person mass between chromosomes, to
+which compose scales the factor term. It holds no row about a person.
 
-```bash
-summit admixed-ld sample-factors --geno cohort --ref ref/afr_eur_clean --keep gwas_sample.txt --covar gwas.cov \
-  --threads 8 --out cohort
-summit admixed-ld compose ... --curve cohort --sample-factors cohort --out ld/cohort
-```
+The curve's pass writes it. `sample-factors` makes it on its own, for example for one trait's GWAS sample (see
+[The curve](#the-curve)).
 
-The statistic is a small covariance matrix of person factors (a level, the ancestry proportions and the local-ancestry
-variances), estimated from odd and even chromosomes separately so that each person's noise cancels. It also holds the
-sample's realized LD mass in total and between chromosomes, from per-chromosome Gram matrices (the cost of a GRM;
-`--no-ld-mass` skips it). Compose scales the factor term to the realized between-chromosome same-person mass and flags a
-difference of more than 5% between its LD mass and the realized one. `--calibrate-between-chromosomes` puts that
-difference on pairs of SNPs on different chromosomes, equally per pair, which makes the composed LD mass equal to the
-realized one.
+The statistic can also hold the sample's realized LD mass in total and between chromosomes. `sample-factors` computes it
+exactly from per-chromosome Gram matrices (the cost of a GRM; `--no-ld-mass` skips it), and `--ld-mass-probes B`
+estimates it with B random probes, each Gram matrix's diagonal exact and the rest from the probes (a few hundred probes
+give it to about 1%, with its standard error). The curve records it only with `--sample-factors-ld-mass` or
+`--sample-factors-probes B`. With it, compose flags a difference of more than 5% between its LD mass and the realized
+one, and `--calibrate-between-chromosomes` puts the difference on pairs of SNPs on different chromosomes, equally per
+pair.
 
 ## Sources without a panel
 

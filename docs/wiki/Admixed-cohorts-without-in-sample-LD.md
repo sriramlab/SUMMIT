@@ -44,7 +44,8 @@ Two more pieces complete the picture.
   nothing from the cohort.
 - A GWAS sample also carries small LD terms of its own: from each person's ancestry, from people who share segments of
   the genome (relatives included), and from structure that the principal components leave. The cohort's curve measures
-  them. Date mode includes only the first.
+  them, the first through a small sample statistic made in the same pass. Date mode includes only the first, composed
+  under random mating.
 
 ### Curve mode or date mode?
 
@@ -96,10 +97,12 @@ summit admixed-ld clean-panels --ref ref/afr_eur --panel ref/afr --panel ref/eur
   --threads 16 --out ref/afr_eur_clean
 ```
 
-**2. The cohort's curve.** Run it on the GWAS's people (`--keep`) with exactly the GWAS's covariates, principal
-components included (`--covar`). `--relative-pairs` lists related pairs, for example pairs with relatedness above 0.0442 in a GRM.
-The output is under a megabyte of numbers by distance plus a matrix between 2-cM segments of the genome (about 27 MB
-for two sources); none of it describes a person. It takes 10 to 15 minutes on 8 cores for 4,000 to 6,000 people at array density.
+**2. The cohort's curve.** Run it once for the cohort, on the people of its GWAS (`--keep`) with exactly the GWAS's
+covariates, principal components included (`--covar`). `--relative-pairs` lists related pairs, for example pairs with
+relatedness above 0.0442 in a GRM. The output is under a megabyte of numbers by distance, a matrix between 2-cM segments
+of the genome (about 27 MB for two sources) and the sample statistic (`cohort.sample_factors.json`), which compose uses
+for the same-person term. None of it describes a person. It takes 10 to 15 minutes on 8 cores for 4,000 to 6,000 people
+at array density.
 
 ```bash
 summit admixed-ld curve --geno cohort --ref ref/afr_eur_clean --keep gwas_sample.txt --covar gwas.cov \
@@ -107,7 +110,9 @@ summit admixed-ld curve --geno cohort --ref ref/afr_eur_clean --keep gwas_sample
 ```
 
 **3. Compose the LD scores.** `--sumstats` takes SUMMIT summary statistics (files or a directory). `--annot` is the
-annotation you will fit with, such as MAF and LD bins.
+annotation you will fit with, such as MAF and LD bins. Its columns may overlap, for example MAF and LD bins with coding
+regions as a further column. Compose takes each trait's sample size and ancestry from its summary statistics, and logs
+a short plan of what it will use before it starts. `--dry-run` stops after the plan.
 
 ```bash
 # curve mode
@@ -120,10 +125,10 @@ summit admixed-ld compose --ref ref/afr_eur_clean --sumstats gwas/ --annot annot
 When the traits' sample sizes differ, compose writes one LD-score file per sample size and lists each trait's file in
 `ld/cohort.n_groups.tsv`.
 
-**4. Fit.**
+**4. Fit.** Given the compose output, `summit --h2` reads that list and fits each trait with its own file.
 
 ```bash
-summit --h2 gwas/height.tsv --ldscores ld/cohort.gw.ldscore.gz --annot annot.tsv.gz --out results/h2_height
+summit --h2 gwas/ --ldscores ld/cohort --annot annot.tsv.gz --out results/h2
 summit --rg gwas/height.tsv,gwas/bmi.tsv --ldscores ld/cohort.gw.ldscore.gz --annot annot.tsv.gz --out results/rg
 ```
 
@@ -132,8 +137,9 @@ summit --rg gwas/height.tsv,gwas/bmi.tsv --ldscores ld/cohort.gw.ldscore.gz --an
 - Read the warnings in the log and the `flags` list in `ld/cohort.admixed_ld.json`.
 - Use least-squares or linear-probability summary statistics. Logistic and mixed-model standard errors give a wrong
   mean ancestry; compose names traits whose values stand apart from the others.
-- Make the curve on the GWAS's own people and covariates. If a trait was measured in only part of the cohort, make a
-  curve on that trait's sample.
+- One curve serves the cohort. Compose warns when a trait's GWAS sample holds less than 85% of the curve's people, or
+  when its standard errors give another ancestry than the other traits'. Compose such a trait alone, with the cohort's
+  curve and the sample statistic of its own people ([how](SUMMIT-MIX-details.md#the-curve)).
 - If the panels and the cohort may be on different strands, add `--drop-ambiguous` to every step. The curve stops when
   it detects this.
 - Close relatives also share environment, which composed LD scores cannot fix. Remove them before the GWAS, or see
@@ -146,7 +152,7 @@ summit --rg gwas/height.tsv,gwas/bmi.tsv --ldscores ld/cohort.gw.ldscore.gz --an
 | Fine-mapping with a composed LD matrix | `matrix`, `finemap-variance` | [Fine-mapping](SUMMIT-MIX-details.md#regional-ld-matrices-and-fine-mapping) |
 | Correlation of effects across local ancestries | `tractor-gwas`, `tractor-sumstats`, `track-rg` | [Local ancestries](SUMMIT-MIX-details.md#correlation-of-effects-across-local-ancestries) |
 | Genetic correlation with a GWAS of a source population | `compose --cross-source EUR` | [Cross-population LD](SUMMIT-MIX-details.md#cross-population-ld) |
-| Samples of a few hundred people | `sample-factors` | [Small samples](SUMMIT-MIX-details.md#small-samples) |
+| The sample statistic of one trait's GWAS sample | `sample-factors --keep` | [The sample statistic](SUMMIT-MIX-details.md#the-sample-statistic) |
 | A source without a panel | `derive` | [Sources without a panel](SUMMIT-MIX-details.md#sources-without-a-panel) |
 | Three or more sources | `--sources AFR,EUR,NAT` on every step | [Compose](SUMMIT-MIX-details.md#compose) |
 
