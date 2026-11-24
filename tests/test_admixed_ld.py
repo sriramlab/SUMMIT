@@ -1734,6 +1734,29 @@ def test_h2_over_ldscore_groups_rebuilds_its_links_on_a_rerun(fam_groups, tmp_pa
     assert len(used) == 4 and used["part0"] == used["full0"] != used["part1"]
 
 
+def test_h2_over_ldscore_groups_writes_the_single_run_outputs(fam_groups, tmp_path):
+    """With LD-score groups, --write-jack's per-trait files are OUT.<phen>.jack, as in a single-file run and equal to
+    a fit of the group alone, and OUT.log is this run's whole log (every group's fit; a rerun does not append)."""
+    fg = fam_groups
+    out = str(tmp_path / "h")
+    for _ in range(2):                                                  # the second run to the same --out
+        _summit_h2(fg, "--h2", str(fg["dir"] / "mix"), "--ldscores", fg["prefix"] + ".gw.ldscore.gz", "--write-jack",
+                   "--out", out)
+    phen = ["full0", "full1", "part0", "part1", "part2"]
+    assert all(os.path.exists(f"{out}.{p}.jack") for p in phen)
+    left = [f for r, _, fs in os.walk(out + ".ldgroups") for f in fs if f.endswith(".jack")]
+    assert left == []
+    log = open(out + ".log").read()
+    assert log.count("Analysis started at") == 2 and log.count("[h2] part0.tsv: LD scores") == 1
+    assert "Total SNP heritability" in log and f"Saved h2 results table in {out}.results.tsv" in log
+    from summit.cli import _ldscore_groups
+    _, tab = _ldscore_groups(fg["prefix"])
+    alone = str(tmp_path / "alone")
+    _summit_h2(fg, "--h2", str(fg["dir"] / "mix" / "part1.tsv"), "--ldscores",
+               tab.ldscores[tab.trait == "part1.tsv"].iloc[0], "--ldscore-groups", "off", "--write-jack", "--out", alone)
+    assert open(f"{out}.part1.jack").read() == open(f"{alone}.part1.jack").read()
+
+
 def test_n_groups_table_on_a_rerun_from_any_directory_and_for_one_trait(fam, fam_groups, tmp_path, monkeypatch):
     """compose's n_groups.tsv names its files relative to its own directory (read from any working directory; older
     tables with compose's --out paths stay readable); a rerun to the same prefix with one sample size removes it; and

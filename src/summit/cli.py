@@ -303,7 +303,9 @@ def build_parser() -> argparse.ArgumentParser:
                         help="--h2 with a SUMMIT-MIX compose output whose traits have different GWAS samples: 'auto' "
                              "(default) reads PREFIX.n_groups.tsv next to --ldscores and fits each trait with its own "
                              "group's LD-score file (a trait missing from the table stops the run); 'off' fits every "
-                             "trait with the file given.")
+                             "trait with the file given. With groups, OUT.results.tsv, OUT.log and the --write-jack "
+                             "files OUT.<phen>.jack are those of a single-file run; each group's own fit is in "
+                             "OUT.ldgroups/<k>/ (rebuilt on every run).")
     inputs.add_argument("--ldscores-reg", default=None, type=str,
                         help=(
                             "Optional LD-score file used only for summary-only overlap-covariance estimation. "
@@ -2116,7 +2118,10 @@ def _dispatch_h2_groups(args, log, prefix, tab):
     """--h2 over traits whose LD scores come from different compose group files: each group's traits are fitted
     with its file (symlinked into PREFIX-of-out.ldgroups/<k>/ss, rebuilt on every run), and the rows are merged into
     OUT.results.tsv in the order of the summary-statistics directory; OUT.ldscore_groups.tsv records the file each
-    trait used."""
+    trait used. The user-facing outputs are where a single-file run puts them: OUT.results.tsv, OUT.log (this run's
+    whole log, every group's fit included, written at the end as a single-file run writes it) and, with --write-jack,
+    OUT.<phen>.jack (moved from the group's fit); OUT.ldgroups/<k>/fit.results.tsv and fit.log stay as each group's
+    own record."""
     import copy
     paths = utils._parse_sumdir(args.h2)
     base_of = {os.path.basename(p): p for p in paths}
@@ -2153,6 +2158,11 @@ def _dispatch_h2_groups(args, log, prefix, tab):
         a.out = os.path.join(root, str(k), "fit")
         _dispatch_h2(a, log)
         merged.append(pd.read_csv(f"{a.out}.results.tsv", sep="\t", dtype={"phen": str}))
+        for b in base_of:                       # per-trait outputs where a single-file run writes them (--write-jack)
+            src = f"{a.out}.{phen_of[b]}.jack"
+            if by_trait[b] == f and os.path.exists(src):
+                os.replace(src, f"{args.out}.{phen_of[b]}.jack")
+                log._log(f"[h2] {phen_of[b]}: jackknife replicates in {args.out}.{phen_of[b]}.jack")
     res = pd.concat(merged, ignore_index=True)
     want = sorted(phen_of.values())
     if sorted(res.phen.astype(str)) != want:
@@ -2166,7 +2176,9 @@ def _dispatch_h2_groups(args, log, prefix, tab):
     os.replace(tmp, f"{args.out}.results.tsv")
     pd.DataFrame(used, columns=["phen", "ldscores"]).to_csv(f"{args.out}.ldscore_groups.tsv", sep="\t", index=False)
     log._log(f"Saved h2 results table in {args.out}.results.tsv (traits from {len(files)} LD-score groups; "
-             f"files in {args.out}.ldscore_groups.tsv)")
+             f"files in {args.out}.ldscore_groups.tsv). The whole log, every group's fit included, is {args.out}.log; "
+             f"{root}/<k>/fit.results.tsv and fit.log are each group's own fit, rewritten on every run")
+    log._save_log(f"{args.out}.log")            # as a single-file run's (Sumrhe): this run's log, not appended to
 
 
 def _dispatch_h2(args, log):
