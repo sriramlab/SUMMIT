@@ -1854,11 +1854,11 @@ def test_calibrated_sample_factor_term_scales_with_the_gwas_sample(sim, tmp_path
                          generations=S["generations"], mean_ancestry="0.6", kappa0="0.3",
                          sample_factors=str(tmp_path / "sub.sample_factors.json"), log=lambda *a: None)
         pj = json.load(open(out + ".admixed_ld.json"))
-        got[n] = dict(nu=float(pj["nu"]), **pj["sample_factors"])
+        got[n] = dict(pj["sample_factors"], gwas_nu=float(pj["nu"]))
     assert got[400]["calibration"] is not None and got[240]["calibration"] is not None
     f4, f2 = got[400]["calibration"]["factor"], got[240]["calibration"]["factor"]
     assert abs(f2 / f4 - 1) < 1e-9, (f4, f2)
-    r_nu = got[400]["nu"] / got[240]["nu"]
+    r_nu = got[400]["gwas_nu"] / got[240]["gwas_nu"]
     for k in ("same_person_mass", "same_person_mass_uncalibrated"):
         assert abs((got[240][k] / got[400][k]) / r_nu - 1) < 1e-9, (k, got[240][k] / got[400][k], r_nu)
 
