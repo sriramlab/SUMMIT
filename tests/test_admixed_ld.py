@@ -1830,6 +1830,51 @@ def test_curve_writes_the_sample_statistic_and_compose_uses_it(sim, tmp_path):
     assert "sample_factors_sample_differs" not in {f["flag"] for f in pj["flags"]}
 
 
+def test_compose_takes_only_the_statistic_its_curve_lists(sim, tmp_path):
+    """compose with a curve takes the statistic the curve's json lists and stops when it is missing or of other people
+    or covariates (a file of another run); a curve that lists none (here remade with --no-sample-factors over an older
+    statistic) gives the random-mating term with the flag curve_without_sample_factors."""
+    import shutil
+    from summit.admixed_ld.compose import compose_ldscores
+    from summit.admixed_ld.curve import genotype_curve
+    from summit.admixed_ld.sample_factors import sample_factors
+    d = sim["dir"]
+    quiet = lambda *a, **k: None
+    cv = str(tmp_path / "cv")
+    genotype_curve(str(d / "cohort"), str(d / "ref"), cv, covar=str(d / "cohort.cov"), cell_cm=0.5, log=quiet)
+    shutil.copy(cv + ".sample_factors.json", tmp_path / "good.sample_factors.json")
+    args = (str(d / "ref"), [str(d / "ss")], str(d / "annot.tsv"))
+    kw = dict(curve=cv, mean_ancestry="0.6", kappa0="0.3", allow_flat_kernel_join=True, log=quiet)
+    plan = compose_ldscores(*args, str(tmp_path / "ok"), dry_run=True, **kw)
+    assert plan["same_person_term"] == "the sample statistic released with the curve"
+    # another run's statistic in its place: no covariates (rank 0 against the curve's 2)
+    sample_factors(str(d / "cohort"), str(d / "ref"), str(tmp_path / "nocov"), ld_mass=False, log=quiet)
+    shutil.copy(tmp_path / "nocov.sample_factors.json", cv + ".sample_factors.json")
+    for case in ("other run", "missing"):
+        with pytest.raises(ValueError, match="--sample-factors PATH") as e:
+            compose_ldscores(*args, str(tmp_path / "x"), dry_run=True, **kw)
+        assert "--no-sample-factors" in str(e.value)
+        assert ("covariate_rank 0 in the statistic, 2 in the curve" if case == "other run" else "does not exist") \
+            in str(e.value), str(e.value)
+        if case == "other run":
+            os.remove(cv + ".sample_factors.json")
+    # the curve remade without the statistic (and without covariates) over the earlier run's file
+    genotype_curve(str(d / "cohort"), str(d / "ref"), cv, cell_cm=0.5, sample_factors=False, log=quiet)
+    shutil.copy(tmp_path / "good.sample_factors.json", cv + ".sample_factors.json")
+    lines = []
+    compose_ldscores(*args, str(tmp_path / "stale"), **dict(kw, log=lambda *a, **k: lines.append(" ".join(map(str, a)))))
+    compose_ldscores(*args, str(tmp_path / "rm"), release_sample_factors=False, **kw)
+    pj, rm = (json.load(open(str(tmp_path / x) + ".admixed_ld.json")) for x in ("stale", "rm"))
+    assert pj["sample_factors"] is None and pj["plan"]["same_person_term"] == "random mating"
+    fl = {f["flag"]: f["detail"] for f in pj["flags"]}
+    assert "lists no sample statistic" in fl["curve_without_sample_factors"]
+    assert "cv.sample_factors.json is not the curve's and is not used" in fl["curve_without_sample_factors"]
+    assert "curve_without_sample_factors" not in {f["flag"] for f in rm["flags"]}
+    assert any("WARNING (recorded flag curve_without_sample_factors)" in ln for ln in lines)
+    a, b = (pd.read_csv(str(tmp_path / x) + ".gw.ldscore.gz", sep="\t") for x in ("stale", "rm"))
+    pd.testing.assert_frame_equal(a, b)
+
+
 def test_compose_plan_dry_run_and_require(sim, tmp_path):
     """compose writes its plan (decay, same-person term, relatives, cell matrix, sample sizes) before composing:
     --dry-run stops there, --require stops when a component would be missing, and the plan is in the params json."""

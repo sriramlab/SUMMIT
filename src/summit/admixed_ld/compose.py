@@ -674,6 +674,43 @@ def relatedness_term(L, rel, chrom, cm, cls, V, K, nu, grid_cm, scale=1.0, partn
         L[sel] += (scale * acc) / nu ** 2
 
 
+def release_statistic(curve):
+    """The sample statistic released with the curve CURVE (prefix): (path, None), or (None, why) when the curve records
+    none (made with --no-sample-factors, before curves carried it, or its pass could not make it). The curve's json
+    lists the statistic its own pass wrote (key sample_factors, a file next to it); a listed statistic that is missing,
+    or that is not of the curve's people and covariates (n_samples, covariate_rank: a file left by another run), stops
+    the composition. A statistic file next to a curve that does not list it is not used."""
+    from .sample_factors import read_sample_factors
+    cj = f"{curve}.curve.json"
+    with open(cj) as fh:
+        info = json.load(fh)
+    remedy = ("remake the curve, pass --sample-factors PATH with the statistic of the GWAS's people, or "
+              "--no-sample-factors to compose the same-person term under random mating")
+    listed = info.get("sample_factors")
+    if not listed:
+        if "sample_factors" in info:
+            why = (f"the curve {cj} has no sample statistic: its pass could not make one ("
+                   + "; ".join(f["detail"] for f in info.get("flags", []) if f.get("flag") == "sample_factors_not_made")
+                   + ")")
+        else:
+            why = (f"the curve {cj} lists no sample statistic (made with --no-sample-factors, or before curves "
+                   "carried it)")
+        if os.path.exists(f"{curve}.sample_factors.json"):
+            why += (f"; {curve}.sample_factors.json is not the curve's and is not used (pass --sample-factors "
+                    f"{curve}.sample_factors.json if it is of the GWAS's people)")
+        return None, why
+    path = os.path.join(os.path.dirname(curve), os.path.basename(str(listed)))
+    if not os.path.exists(path):
+        raise ValueError(f"The curve {cj} lists the sample statistic {path}, which does not exist; {remedy}.")
+    sfi = read_sample_factors(path)
+    bad = [f"{k} {sfi.get(k)} in the statistic, {info.get(k)} in the curve" for k in ("n_samples", "covariate_rank")
+           if sfi.get(k) is None or info.get(k) is None or int(sfi[k]) != int(info[k])]
+    if bad:
+        raise ValueError(f"The sample statistic {path} is not that of the curve {cj} ({'; '.join(bad)}): a file of "
+                         f"another run; {remedy}.")
+    return path, None
+
+
 def release_coverage(tables, n_med, n_release, min_share=0.85, log=print):
     """Traits whose GWAS sample holds less than min_share of the people of the cohort's release (the people of the
     curve and of its sample statistic). Composition follows each GWAS's N, but not the ancestry and relatedness of the
@@ -799,6 +836,9 @@ def compose_ldscores(ref_path, sumstats, annot, out, *, sources=None, snps=None,
     in place of the random-mating covariance of heterozygosity (sample_factors.py); both are recorded. With
     sample_factors_calibrate (default), the term is scaled so that its mass over pairs on different chromosomes equals
     the cohort's realized one, which the statistic records; the factors then allocate it across SNPs and classes.
+    In curve mode without sample_factors (and release_sample_factors, the default) the statistic that the curve's json
+    lists is used (release_statistic: it must exist and be of the curve's people and covariates, else compose stops); a
+    curve that lists none gives the random-mating term with the flag curve_without_sample_factors.
 
     per_trait_n: the same-person term (1 / nu) and the relatives' term (f(N) / nu^2) belong to the GWAS's sample, and in a
     small cohort (with a strong background) traits with different missingness have measurably different in-sample LD.
@@ -855,14 +895,25 @@ def compose_ldscores(ref_path, sumstats, annot, out, *, sources=None, snps=None,
     dense = partners == "reference"
     # curve mode's same-person term: the sample statistic the curve's pass wrote next to it, unless one is given
     sf_from_release = False
-    if (sample_factors is None and release_sample_factors and curve is not None and not dense
-            and os.path.exists(f"{curve}.sample_factors.json")):
-        sample_factors, sf_from_release = f"{curve}.sample_factors.json", True
-        log(f"[admixed-ld] compose: same-person term from the curve's sample statistic ({sample_factors}); "
-            "--no-sample-factors composes it under random mating instead")
+    pre_flags = []
+    if sample_factors is None and release_sample_factors and curve is not None and not dense:
+        sample_factors, why = release_statistic(curve)
+        if sample_factors is not None:
+            sf_from_release = True
+            log(f"[admixed-ld] compose: same-person term from the curve's sample statistic ({sample_factors}); "
+                "--no-sample-factors composes it under random mating instead")
+        else:
+            pre_flags.append(dict(flag="curve_without_sample_factors", detail=why))
+            log(f"[admixed-ld] WARNING (recorded flag curve_without_sample_factors): {why}; the same-person term is "
+                "composed under random mating. Pass --sample-factors PATH with the statistic of the GWAS's people, or "
+                "--no-sample-factors to compose under random mating without this warning.")
     if dense and (cell_matrix is True or sample_factors is not None or calibrate_between_chromosomes):
         raise ValueError("--partners reference cannot be combined with --cell-matrix, --sample-factors or "
                          "--calibrate-between-chromosomes: those are measured on the GWAS SNPs.")
+    sfi = None
+    if sample_factors is not None:
+        from .sample_factors import read_sample_factors
+        sfi = read_sample_factors(sample_factors)
     if track_alpha is not None and not tracks:
         raise ValueError("--track-alpha sets the per-allele weights of the track LD scores; it needs --tracks.")
 
@@ -960,7 +1011,7 @@ def compose_ldscores(ref_path, sumstats, annot, out, *, sources=None, snps=None,
     N = float(np.median(n_med))
     p = int(np.median(p_rank))
     m_in, k_in = _parse_values(mean_ancestry), _parse_values(kappa0)
-    flags = []
+    flags = list(pre_flags)
     if _track_sumstats(files[0]):
         # one track's summary statistics (tractor-sumstats): their SEs follow the track variable, not the genotype, so
         # the SE regression for m and kappa_res(0) does not apply
@@ -1427,9 +1478,7 @@ def compose_ldscores(ref_path, sumstats, annot, out, *, sources=None, snps=None,
     sf_info = None
     Vpop_sp = cres / s2
     if sample_factors is not None:
-        from .sample_factors import (factor_between_chromosome_mass, factor_loadings, factor_same_person_term,
-                                     read_sample_factors)
-        sfi = read_sample_factors(sample_factors)
+        from .sample_factors import factor_between_chromosome_mass, factor_loadings, factor_same_person_term
         if list(sfi["sources"]) != list(sources):
             raise ValueError(f"The sample factors were made with sources {sfi['sources']}, compose uses {sources} (same "
                              "names, same order, baseline last).")

@@ -227,7 +227,9 @@ def main(argv=None):
     m.add_argument("--n-tol", type=float, default=0.01, help=argparse.SUPPRESS)
     m.add_argument("--no-sample-factors", dest="release_sample_factors", action="store_false", default=True,
                    help="compose the same-person term under random mating even when the curve's pass wrote a sample "
-                        "statistic next to it (PREFIX.sample_factors.json, used by default)")
+                        "statistic next to it (PREFIX.sample_factors.json, listed in PREFIX.curve.json: used by "
+                        "default, and the composition stops when the listed file is missing or not of the curve's "
+                        "people and covariates)")
     m.add_argument("--dry-run", action="store_true",
                    help="write the plan (which decay, same-person term, relatives, cell matrix and sample sizes the "
                         "composition would use) to PREFIX.plan.json and stop before composing")
