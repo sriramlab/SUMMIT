@@ -1625,6 +1625,48 @@ def test_compose_writes_one_file_per_gwas_sample_size(fam, tmp_path):
     assert not os.path.exists(str(tmp_path / "c_full") + ".n_groups.tsv")   # one sample size: no extra files
 
 
+def test_calibrated_sample_factor_term_scales_with_the_gwas_sample(sim, tmp_path):
+    """The cohort's statistic composed for a GWAS of 60% of its people: the calibration factor is the same as for the
+    whole sample (it is fixed at the statistic's own nu), and the calibrated same-person term scales as 1 / nu, as the
+    uncalibrated term does."""
+    from summit.admixed_ld.compose import compose_ldscores
+    from summit.admixed_ld.sample_factors import sample_factors
+    d, S = sim["dir"], sim["S"]
+    v = S["variants"]
+    rng = np.random.default_rng(12)
+    idx = np.sort(rng.choice(S["cohort"].shape[0], 400, replace=False))
+    G = S["cohort"][idx]
+    iid = write_bed(str(tmp_path / "sub"), G, v, "s")
+    C = principal_components(G, 10)
+    pd.DataFrame({"FID": iid, "IID": iid, **{f"PC{i + 1}": C[:, i] for i in range(10)}}).to_csv(
+        tmp_path / "sub.cov", sep="\t", index=False)
+    beta, se = gwas(G, rng.standard_normal(400), C)
+    for n in (400, 240):
+        os.makedirs(tmp_path / f"ss{n}")
+        pd.DataFrame({"SNP": v.SNP, "CHR": v.CHR, "BP": v.BP, "A1": v.A1, "A2": v.A2, "N": n, "BETA": beta, "SE": se,
+                      "Z": beta / se, "COV_RANK": 10}).to_csv(tmp_path / f"ss{n}" / "t0.tsv", sep="\t", index=False)
+    p = G.mean(0) / 2
+    cls = (np.minimum(p, 1 - p) >= 0.2).astype(int)
+    pd.DataFrame({"SNP": v.SNP, "low": (cls == 0).astype(int), "high": (cls == 1).astype(int)}).to_csv(
+        tmp_path / "annot.tsv", sep="\t", index=False)
+    sample_factors(str(tmp_path / "sub"), str(d / "ref"), str(tmp_path / "sub"), covar=str(tmp_path / "sub.cov"),
+                   log=lambda *a: None)
+    got = {}
+    for n in (400, 240):
+        out = str(tmp_path / f"c{n}")
+        compose_ldscores(str(d / "ref"), [str(tmp_path / f"ss{n}")], str(tmp_path / "annot.tsv"), out,
+                         generations=S["generations"], mean_ancestry="0.6", kappa0="0.3",
+                         sample_factors=str(tmp_path / "sub.sample_factors.json"), log=lambda *a: None)
+        pj = json.load(open(out + ".admixed_ld.json"))
+        got[n] = dict(nu=float(pj["nu"]), **pj["sample_factors"])
+    assert got[400]["calibration"] is not None and got[240]["calibration"] is not None
+    f4, f2 = got[400]["calibration"]["factor"], got[240]["calibration"]["factor"]
+    assert abs(f2 / f4 - 1) < 1e-9, (f4, f2)
+    r_nu = got[400]["nu"] / got[240]["nu"]
+    for k in ("same_person_mass", "same_person_mass_uncalibrated"):
+        assert abs((got[240][k] / got[400][k]) / r_nu - 1) < 1e-9, (k, got[240][k] / got[400][k], r_nu)
+
+
 def test_sample_factors_ld_mass_and_its_check_in_compose(sim, tmp_path):
     """The statistic's realized in-sample LD mass (total, and over pairs on different chromosomes) equals a brute-force
     computation from the genotypes; compose records its own mass against it and, with calibrate_between_chromosomes,

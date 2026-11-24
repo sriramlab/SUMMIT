@@ -965,9 +965,10 @@ def compose_ldscores(ref_path, sumstats, annot, out, *, sources=None, snps=None,
             # the cohort's realized between-chromosome same-person mass fixes the term's size; the factors allocate it
             # (a signed loading sum makes the term sensitive to small errors of the model variances s2 that follow the
             # sources' heterozygosity difference, and the factors themselves leave a few per cent out)
-            # compared at the statistic's own nu, so that the factor is a pure model correction for any GWAS sample
+            # compared at the statistic's own nu, so that the factor is a pure model correction for any GWAS sample:
+            # the term sp, at the GWAS's nu, keeps its 1 / nu scaling (realized and model mass both at nu_sf)
             btw = factor_between_chromosome_mass(a_sf, s2, chrom_out, sfi["sigma"], sfi["n_samples"], sfi["nu"],
-                                                 float(sfi["nu"])) * float(sfi["nu"]) / nu
+                                                 float(sfi["nu"]))
             m_ratio = M / float(sfi["n_snps"])
             target = float(realized) * m_ratio ** 2
             if btw > 0 and target > 0:
