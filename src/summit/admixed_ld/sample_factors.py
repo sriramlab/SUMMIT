@@ -296,6 +296,7 @@ def sample_factors(geno, ref_path, out, *, sources=None, covar=None, keep=None, 
         acc.end_chromosome(ci)
         log(f"[admixed-ld] sample-factors chr{c}: {ix.size} variants ({time.perf_counter() - t0:.0f} s)")
     info = acc.finish(C, sources, names, log)
+    info["made_by"] = "sample-factors"
     write_sample_factors(out, info, log, t0)
     return info
 

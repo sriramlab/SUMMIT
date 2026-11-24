@@ -1903,6 +1903,35 @@ def test_compose_takes_only_the_statistic_its_curve_lists(sim, tmp_path):
     pd.testing.assert_frame_equal(a, b)
 
 
+def test_curve_does_not_overwrite_a_statistic_it_did_not_make(sim, tmp_path):
+    """The curve tags its statistic (made_by 'curve') and stops before its pass when PREFIX.sample_factors.json is
+    another file, such as one of sample-factors (made_by 'sample-factors') or an untagged one; it replaces a curve's."""
+    from summit.admixed_ld.curve import genotype_curve
+    from summit.admixed_ld.sample_factors import sample_factors
+    d = sim["dir"]
+    quiet = lambda *a, **k: None
+    cv = str(tmp_path / "cv")
+    sf = sample_factors(str(d / "cohort"), str(d / "ref"), cv, ld_mass=False, log=quiet)      # no covariates
+    assert sf["made_by"] == "sample-factors"
+    before = open(cv + ".sample_factors.json").read()
+    kw = dict(covar=str(d / "cohort.cov"), cell_cm=0.5, cells_cm=0, log=quiet)
+    with pytest.raises(ValueError, match="not written by a curve .*--no-sample-factors"):
+        genotype_curve(str(d / "cohort"), str(d / "ref"), cv, **kw)
+    assert open(cv + ".sample_factors.json").read() == before and not os.path.exists(cv + ".curve.json")
+    untagged = json.loads(before)
+    untagged.pop("made_by")
+    json.dump(untagged, open(cv + ".sample_factors.json", "w"))
+    with pytest.raises(ValueError, match="made_by None"):
+        genotype_curve(str(d / "cohort"), str(d / "ref"), cv, **kw)
+    genotype_curve(str(d / "cohort"), str(d / "ref"), cv, sample_factors=False, **kw)    # leaves the file alone
+    assert json.load(open(cv + ".sample_factors.json")) == untagged
+    os.remove(cv + ".sample_factors.json")
+    for _ in range(2):                                                  # a curve's own statistic is replaced
+        genotype_curve(str(d / "cohort"), str(d / "ref"), cv, **kw)
+        j = json.load(open(cv + ".sample_factors.json"))
+        assert j["made_by"] == "curve" and j["covariate_rank"] == 2
+
+
 def test_single_chromosome_curve_makes_no_statistic(sim, tmp_path):
     """A curve on one chromosome has no second half for the statistic: the curve is written without it (sample_factors
     null and the flag sample_factors_not_made, also over an earlier run's statistic at the same prefix), compose with it

@@ -456,6 +456,24 @@ def _relatives_pass(blocks, t_idx, chrom, cm, C, df_res, step, pa, pb, cell_cm, 
     return prof
 
 
+def _check_statistic_overwrite(out):
+    """The curve writes its sample statistic to out.sample_factors.json and may replace only a statistic that a curve
+    wrote (made_by 'curve'): any other file there (one of `summit admixed-ld sample-factors`, for example of one
+    trait's people, or a file without the tag) stops the curve before it is overwritten."""
+    p = f"{out}.sample_factors.json"
+    if not os.path.lexists(p):
+        return
+    try:
+        with open(p) as fh:
+            made_by = json.load(fh).get("made_by")
+    except (OSError, ValueError, AttributeError):
+        made_by = None
+    if made_by != "curve":
+        raise ValueError(f"{p} exists and was not written by a curve (made_by {made_by!r}); the curve's pass would "
+                         "overwrite it with the statistic of the curve's people. Move it (or give the curve another "
+                         "--out), or pass --no-sample-factors to make the curve without its statistic.")
+
+
 def _phi_at(tab, ds):
     t = tab[np.isfinite(tab.phi)]
     return [(d, float(np.interp(d, t.d_cm, t.phi))) for d in ds if d <= t.d_cm.max()]
@@ -470,7 +488,9 @@ def genotype_curve(geno, ref_path, out, *, sources=None, covar=None, keep=None, 
                    sample_factors_probes=0, log=print):
     """The weighted-LD curve of the cohort for two or more sources. sample_factors: also the sample statistic of
     the same people with the same covariates (as `summit admixed-ld sample-factors` gives it), accumulated in this same
-    pass over the genotypes on the SNPs with finite loadings, written to out.sample_factors.json and used by compose with this curve (curve mode's same-person term); its realized LD mass
+    pass over the genotypes on the SNPs with finite loadings, written to out.sample_factors.json (made_by 'curve'; a
+    file there that a curve did not write stops the curve before its pass) and used by compose with this curve (curve
+    mode's same-person term); its realized LD mass
     only with sample_factors_ld_mass (exact, a GRM's cost) or sample_factors_probes > 0 (stochastic). On one chromosome
     (or halves whose loadings leave the factors unidentified) no statistic is made: the json then has sample_factors
     null and the flag sample_factors_not_made. With cells_cm, also the genome-wide matrix of
@@ -558,6 +578,7 @@ def genotype_curve(geno, ref_path, out, *, sources=None, covar=None, keep=None, 
             sf_skip = (f"the SNPs with finite loadings are on {len(chroms_sf)} chromosome(s); the statistic's two halves "
                        "are the odd and the even chromosomes (in genome order), so it needs two or more")
         else:
+            _check_statistic_overwrite(out)                    # before the pass, not after it
             sf_acc = FactorAccumulator(N, df_res, len(chroms_sf), len(names_sf),
                                        ld_mass=bool(sample_factors_ld_mass) or int(sample_factors_probes or 0) > 0,
                                        ld_mass_probes=sample_factors_probes)
@@ -814,6 +835,8 @@ def genotype_curve(geno, ref_path, out, *, sources=None, covar=None, keep=None, 
             sf_skip = str(e)
     if sample_factors and sf_info is not None:
         from .sample_factors import write_sample_factors
+        sf_info["made_by"] = "curve"
+        _check_statistic_overwrite(out)                        # again: a file may have appeared during the pass
         write_sample_factors(out, sf_info, log)
         info["sample_factors"] = f"{os.path.basename(out)}.sample_factors.json"
     elif sample_factors:
