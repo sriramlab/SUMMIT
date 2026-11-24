@@ -826,7 +826,7 @@ def compose_ldscores(ref_path, sumstats, annot, out, *, sources=None, snps=None,
                      sample_factors=None, sample_factors_calibrate=True, calibrate_between_chromosomes=False,
                      per_trait_n=True, n_tol=0.01, tracks=False, track_alpha=None, partners="rows",
                      drop_ambiguous=False, pair_chunk=1 << 23, release_sample_factors=True, min_release_share=0.85,
-                     dry_run=False, require=None, log=print):
+                     dry_run=False, require=None, max_annotation_atoms=64, log=print):
     """Composed LD scores for an admixed GWAS sample with two or more sources (the last is the baseline of the
     contrasts). mean_ancestry: K-1 or K values (comma-separated); kappa0: the upper triangle of Kt_res(0) row by row.
     Departures from the standard recipe that are allowed but should be visible are recorded in the params json under
@@ -855,6 +855,10 @@ def compose_ldscores(ref_path, sumstats, annot, out, *, sources=None, snps=None,
     (out.n<N>.gw.ldscore.gz, listed by file name in out.n_groups.tsv; nu = N - rank - 1 with the traits' covariate
     rank), the population part composed once; out.gw.ldscore.gz stays the file for the median N (with the given nu, if
     any). A composition with one file for every trait removes an earlier run's out.n_groups.tsv.
+
+    annot: 0/1 columns, which may overlap; overlapping columns are composed on their distinct combinations and summed
+    into the columns. max_annotation_atoms (default 64) stops a composition with more combinations than that before
+    any per-combination array is allocated (memory and time grow with their number).
 
     partners: 'rows' (the default) takes the partners k of every LD score to be the GWAS SNPs themselves; 'reference'
     takes every reference variant listed in the annotation (a dense reference holding the causal variants), with the
@@ -952,7 +956,19 @@ def compose_ldscores(ref_path, sumstats, annot, out, *, sources=None, snps=None,
                              "give a partition (each SNP in one class).")
         in_any = col_mat.sum(axis=1) >= 1
         col_pat, atom = np.unique(col_mat[in_any], axis=0, return_inverse=True)
-        cls_mat = np.zeros((col_mat.shape[0], col_pat.shape[0]))
+        n_atoms, n_rows = int(col_pat.shape[0]), int(in_any.sum())
+        if max_annotation_atoms is not None and n_atoms > int(max_annotation_atoms):
+            # every term is composed per combination: about ten SNPs x combinations arrays, and the window pairs'
+            # accumulation and convolutions per combination, so memory and time grow with their number
+            gib = n_rows * n_atoms * 8 / 2 ** 30
+            raise ValueError(
+                f"{annot}: the {len(col_names)} overlapping annotation columns form {n_atoms} distinct combinations "
+                f"on the {n_rows} GWAS SNPs, more than --max-annotation-atoms {int(max_annotation_atoms)}. Compose "
+                f"works on the combinations, so its memory and time grow with their number: each SNPs x combinations "
+                f"array would take {gib:.1f} GiB and the composition holds about ten of them. Use fewer or coarser "
+                "columns (for example the MAF/LD bins and a few functional columns), or raise --max-annotation-atoms "
+                "if the memory is available.")
+        cls_mat = np.zeros((col_mat.shape[0], n_atoms))
         cls_mat[np.flatnonzero(in_any), np.asarray(atom).ravel()] = 1.0
         classes = [f"_atom{a}" for a in range(col_pat.shape[0])]
         log(f"[admixed-ld] compose: the {len(col_names)} annotation columns overlap; composed on their "

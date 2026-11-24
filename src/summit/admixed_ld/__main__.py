@@ -225,6 +225,7 @@ def main(argv=None):
                         "than 1%% get one file per sample size, listed in PREFIX.n_groups.tsv: the same-person and "
                         "background terms belong to each GWAS's sample)")
     m.add_argument("--n-tol", type=float, default=0.01, help=argparse.SUPPRESS)
+    m.add_argument("--max-annotation-atoms", type=int, default=64, help=argparse.SUPPRESS)
     m.add_argument("--no-sample-factors", dest="release_sample_factors", action="store_false", default=True,
                    help="compose the same-person term under random mating even when the curve's pass wrote a sample "
                         "statistic next to it (PREFIX.sample_factors.json, listed in PREFIX.curve.json: used by "
@@ -543,7 +544,8 @@ def _run(a, log):
                          calibrate_between_chromosomes=a.calibrate_between_chromosomes, tracks=a.tracks,
                          track_alpha=a.track_alpha, partners=a.partners, drop_ambiguous=a.drop_ambiguous,
                          release_sample_factors=a.release_sample_factors, min_release_share=a.min_release_share,
-                         dry_run=a.dry_run, require=a.require, log=log._log)
+                         dry_run=a.dry_run, require=a.require, max_annotation_atoms=a.max_annotation_atoms,
+                         log=log._log)
     return 0
 
 

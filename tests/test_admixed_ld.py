@@ -2016,6 +2016,34 @@ def test_compose_overlapping_annotation_columns(sim, tmp_path):
     assert len(res) == 3 and (res.num_bins == 3).all() and np.isfinite(res.h2).all()
 
 
+def test_compose_stops_on_too_many_annotation_combinations(sim, tmp_path):
+    """Overlapping columns with more distinct combinations than --max-annotation-atoms (default 64) stop compose
+    before any per-combination array, with the memory it would need; a higher limit composes them."""
+    from summit.admixed_ld.compose import compose_ldscores
+    from summit.entrypoint import main
+    d, S = sim["dir"], sim["S"]
+    v = S["variants"]
+    rng = np.random.default_rng(3)
+    a = pd.read_csv(d / "annot.tsv", sep="\t")
+    many = a[["SNP", "low", "high"]].copy()
+    for k in range(6):                                                   # 2 x 2^6 = 128 combinations at most
+        many[f"f{k}"] = (rng.random(len(many)) < 0.5).astype(int)
+    many.to_csv(tmp_path / "many.tsv", sep="\t", index=False)
+    n_comb = len(np.unique(many[["low", "high"] + [f"f{k}" for k in range(6)]].to_numpy(), axis=0))
+    assert n_comb > 64
+    args = (str(d / "ref"), [str(d / "ss")], str(tmp_path / "many.tsv"), str(tmp_path / "o"))
+    with pytest.raises(ValueError, match=f"form {n_comb} distinct combinations .* more than --max-annotation-atoms "
+                                         r"64.*GiB"):
+        compose_ldscores(*args, generations=S["generations"], dry_run=True, log=lambda *a: None)
+    plan = compose_ldscores(*args, generations=S["generations"], dry_run=True, max_annotation_atoms=n_comb,
+                            log=lambda *a: None)
+    assert plan["mode"] == "date"
+    assert main(["admixed-ld", "compose", "--ref", str(d / "ref"), "--sumstats", str(d / "ss"), "--annot",
+                 str(tmp_path / "many.tsv"), "--admixture-generations", str(S["generations"]), "--dry-run",
+                 "--max-annotation-atoms", str(n_comb), "--out", str(tmp_path / "cli")]) == 0
+    assert len(v) == len(many)
+
+
 def test_release_coverage_flags_traits_measured_in_part_of_the_cohort(sim, tmp_path):
     """A trait whose GWAS N is below 85% of the curve's people is flagged (gwas_sample_smaller_than_release); traits
     of the curve's size are not."""
