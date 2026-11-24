@@ -1875,6 +1875,46 @@ def test_compose_takes_only_the_statistic_its_curve_lists(sim, tmp_path):
     pd.testing.assert_frame_equal(a, b)
 
 
+def test_single_chromosome_curve_makes_no_statistic(sim, tmp_path):
+    """A curve on one chromosome has no second half for the statistic: the curve is written without it (sample_factors
+    null and the flag sample_factors_not_made, also over an earlier run's statistic at the same prefix), compose with it
+    takes the random-mating term, and sample-factors alone and an accumulator with an empty half stop with an error."""
+    from summit.admixed_ld.compose import compose_ldscores
+    from summit.admixed_ld.curve import genotype_curve
+    from summit.admixed_ld.sample_factors import (FactorAccumulator, SampleFactorsUnavailable, factor_names,
+                                                  sample_factors)
+    d, S = sim["dir"], sim["S"]
+    quiet = lambda *a, **k: None
+    v = S["variants"]
+    c1 = (v.CHR == v.CHR.iloc[0]).to_numpy()
+    write_bed(str(tmp_path / "one"), S["cohort"][:, c1], v[c1].reset_index(drop=True), "c")
+    cv = str(tmp_path / "cv")
+    genotype_curve(str(d / "cohort"), str(d / "ref"), cv, covar=str(d / "cohort.cov"), cell_cm=0.5, cells_cm=0,
+                   log=quiet)                                             # an earlier run on every chromosome
+    assert json.load(open(cv + ".curve.json"))["sample_factors"] == "cv.sample_factors.json"
+    lines = []
+    _, info = genotype_curve(str(tmp_path / "one"), str(d / "ref"), cv, cell_cm=0.5, cells_cm=0,
+                             log=lambda *a, **k: lines.append(" ".join(map(str, a))))
+    cj = json.load(open(cv + ".curve.json"))
+    assert cj["sample_factors"] is None and info["sample_factors"] is None and cj["n_snps"] == int(c1.sum())
+    detail = {f["flag"]: f["detail"] for f in cj["flags"]}["sample_factors_not_made"]
+    assert "1 chromosome(s)" in detail
+    assert any("WARNING (recorded flag sample_factors_not_made)" in ln for ln in lines)
+    plan = compose_ldscores(str(d / "ref"), [str(d / "ss")], str(d / "annot.tsv"), str(tmp_path / "x"), curve=cv,
+                            mean_ancestry="0.6", kappa0="0.3", allow_flat_kernel_join=True, dry_run=True, log=quiet)
+    assert plan["same_person_term"] == "random mating" and "curve_without_sample_factors" in plan["flags"]
+    with pytest.raises(SampleFactorsUnavailable, match="two or more chromosomes"):
+        sample_factors(str(tmp_path / "one"), str(d / "ref"), str(tmp_path / "sf"), ld_mass=False, log=quiet)
+    assert not os.path.exists(tmp_path / "sf.sample_factors.json")
+    rng = np.random.default_rng(1)                                        # two chromosomes, the second without SNPs
+    names = factor_names(["AFR", "EUR"])
+    acc = FactorAccumulator(50, 49, 2, len(names), ld_mass=False)
+    X = rng.standard_normal((50, 30))
+    acc.add(0, X - X.mean(0), np.zeros((50, 0)), np.abs(rng.standard_normal((30, len(names)))))
+    with pytest.raises(SampleFactorsUnavailable, match="second half .* 0 SNPs on 0 chromosome"):
+        acc.finish(np.zeros((50, 0)), ["AFR", "EUR"], names, log=quiet)
+
+
 def test_compose_plan_dry_run_and_require(sim, tmp_path):
     """compose writes its plan (decay, same-person term, relatives, cell matrix, sample sizes) before composing:
     --dry-run stops there, --require stops when a component would be missing, and the plan is in the params json."""

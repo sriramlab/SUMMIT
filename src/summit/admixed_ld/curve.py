@@ -471,7 +471,9 @@ def genotype_curve(geno, ref_path, out, *, sources=None, covar=None, keep=None, 
     """The weighted-LD curve of the cohort for two or more sources. sample_factors: also the sample statistic of
     the same people with the same covariates (as `summit admixed-ld sample-factors` gives it), accumulated in this same
     pass over the genotypes on the SNPs with finite loadings, written to out.sample_factors.json and used by compose with this curve (curve mode's same-person term); its realized LD mass
-    only with sample_factors_ld_mass (exact, a GRM's cost) or sample_factors_probes > 0 (stochastic). With cells_cm, also the genome-wide matrix of
+    only with sample_factors_ld_mass (exact, a GRM's cost) or sample_factors_probes > 0 (stochastic). On one chromosome
+    (or halves whose loadings leave the factors unidentified) no statistic is made: the json then has sample_factors
+    null and the flag sample_factors_not_made. With cells_cm, also the genome-wide matrix of
     covariances between cells of cells_cm cM (within and between chromosomes) and the sampling variance of each entry,
     written to out.cells.npz: it carries long-range structure that one value per distance cannot (for example what the
     genotype PCs leave). With K sources and the last as baseline, each of the
@@ -545,16 +547,20 @@ def genotype_curve(geno, ref_path, out, *, sources=None, covar=None, keep=None, 
     cm = rv["CM"].to_numpy()[r_idx]
     log(f"[admixed-ld] curve: {t_idx.size} of {len(blocks.variants)} cohort variants matched to the reference "
         f"({', '.join(sources)}; baseline {sources[-1]}); {N} samples")
-    sf_acc = None
+    sf_acc, sf_skip = None, None
     if sample_factors:                                         # the sample statistic, in this same pass
         from .sample_factors import FactorAccumulator, factor_inputs, factor_names
         a_sf, good_sf = factor_inputs(ref, rv, r_idx, sources)     # the SNPs sample-factors would use (finite loadings)
         chroms_sf = list(pd.unique(chrom[good_sf]))
         ci_sf = {c: i for i, c in enumerate(chroms_sf)}         # its chromosome index (the halves are odd and even)
         names_sf = factor_names(sources)
-        sf_acc = FactorAccumulator(N, df_res, len(chroms_sf), len(names_sf),
-                                   ld_mass=bool(sample_factors_ld_mass) or int(sample_factors_probes or 0) > 0,
-                                   ld_mass_probes=sample_factors_probes)
+        if len(chroms_sf) < 2:                                 # no second half: the statistic is not identified
+            sf_skip = (f"the SNPs with finite loadings are on {len(chroms_sf)} chromosome(s); the statistic's two halves "
+                       "are the odd and the even chromosomes (in genome order), so it needs two or more")
+        else:
+            sf_acc = FactorAccumulator(N, df_res, len(chroms_sf), len(names_sf),
+                                       ld_mass=bool(sample_factors_ld_mass) or int(sample_factors_probes or 0) > 0,
+                                       ld_mass_probes=sample_factors_probes)
     mp = _products(threads, native)
     span = max(float(np.ptp(cm[chrom == c])) for c in pd.unique(chrom))
     max_cm = span if max_cm is None else min(float(max_cm), span)
@@ -798,16 +804,29 @@ def genotype_curve(geno, ref_path, out, *, sources=None, covar=None, keep=None, 
         np.savez(f"{out}.curve_chr.npz", chrom=np.array([x[0] for x in chr_parts]), cell_cm=float(cell_cm),
                  num=np.stack([x[1] for x in chr_parts]), den=np.stack([x[2] for x in chr_parts]))
         info["per_chromosome"] = f"{out}.curve_chr.npz"
-    if sample_factors:
+    # the statistic is finished and written before the curve's json, which lists it only when it was made
+    sf_info = None
+    if sf_acc is not None:
+        from .sample_factors import SampleFactorsUnavailable
+        try:
+            sf_info = sf_acc.finish(C, sources, names_sf, log)
+        except SampleFactorsUnavailable as e:
+            sf_skip = str(e)
+    if sample_factors and sf_info is not None:
+        from .sample_factors import write_sample_factors
+        write_sample_factors(out, sf_info, log)
         info["sample_factors"] = f"{os.path.basename(out)}.sample_factors.json"
+    elif sample_factors:
+        info["sample_factors"] = None
+        info["flags"].append(dict(flag="sample_factors_not_made", detail=sf_skip))
+        log(f"[admixed-ld] WARNING (recorded flag sample_factors_not_made): no sample statistic was made ({sf_skip}); "
+            f"{out}.curve.json lists none, and compose with this curve composes the same-person term under random "
+            "mating (flag curve_without_sample_factors) unless given --sample-factors PATH")
     curve.to_csv(f"{out}.curve.tsv", sep="\t", index=False, float_format="%.8g")
     with open(f"{out}.curve.json", "w") as f:
         json.dump(info, f, indent=1)
     blocks.close()
     mp.drain()
-    if sf_acc is not None:
-        from .sample_factors import write_sample_factors
-        write_sample_factors(out, sf_acc.finish(C, sources, names_sf, log), log)
     mean_th = np.asarray(info["theta"]["mean_vector"])
     log(f"[admixed-ld] curve: between chromosomes " + np.array2string(inter, precision=5).replace("\n", "")
         + "; decay per cM (2-20 cM) " + ", ".join(f"{s} {fits[s]['lam']:.4f}" for s in sources)

@@ -72,6 +72,12 @@ def factor_inputs(ref, rv, r_idx, sources):
     return a, np.isfinite(a).all(axis=1)
 
 
+class SampleFactorsUnavailable(ValueError):
+    """The statistic is not identified on these SNPs: its two halves are the odd and the even chromosomes (in genome
+    order), and a half without SNPs (one chromosome) or with loadings of lower rank than the factors leaves the
+    per-person least squares without a solution."""
+
+
 class FactorAccumulator:
     """The sums of one pass over the GWAS's adjusted genotypes that the sample statistic needs, block by block and
     chromosome by chromosome (chromosome ci in genome order; the odd and the even ones are the two halves): Y = x~^2 / s2
@@ -86,6 +92,7 @@ class FactorAccumulator:
         self.R = np.zeros((n_chroms, N))                           # per chromosome: each person's sum of y
         self.Ac = np.zeros((n_chroms, n_factors))
         self.n_used = 0
+        self.n_half = [0, 0]
         self.ld_mass, self.memory_gb = bool(ld_mass), float(memory_gb)
         self.B = int(ld_mass_probes or 0)
         self.seed = int(seed)
@@ -131,6 +138,7 @@ class FactorAccumulator:
         self.R[ci] += Y.sum(axis=1)
         self.Ac[ci] += A.sum(axis=0)
         self.n_used += int(ok.sum())
+        self.n_half[h] += int(ok.sum())
 
     def end_chromosome(self, ci):
         if self.do_mass:
@@ -149,6 +157,14 @@ class FactorAccumulator:
         """The statistic (Sigma_u, the factor means), the realized between-chromosome same-person mass and its
         prediction, the realized LD mass when asked for, and the covariates' leverage, as sample_factors.json holds them."""
         N, nu = self.N, self.nu
+        for h in (0, 1):
+            rank = int(np.linalg.matrix_rank(self.AA[h]))
+            if rank < self.nf:
+                n_chr = int(np.any(self.Ac[h::2] != 0, axis=1).sum())
+                raise SampleFactorsUnavailable(
+                    f"the statistic's {'first' if h == 0 else 'second'} half (the {'odd' if h == 0 else 'even'} "
+                    f"chromosomes in genome order) has {self.n_half[h]} SNPs on {n_chr} chromosome(s) and loadings of "
+                    f"rank {rank} for {self.nf} factors; the two halves need SNPs on two or more chromosomes")
         U = [self.YA[h] @ np.linalg.inv(self.AA[h]) for h in (0, 1)]
         Sigma = _sym_cross_cov(U[0], U[1])
         mean_u = (U[0].mean(axis=0) + U[1].mean(axis=0)) / 2.0
@@ -262,6 +278,9 @@ def sample_factors(geno, ref_path, out, *, sources=None, covar=None, keep=None, 
     chrom = rv["CHR"].to_numpy()[r_idx]
     names = factor_names(sources)
     chroms = list(pd.unique(chrom))
+    if len(chroms) < 2:
+        raise SampleFactorsUnavailable(f"The sample factors need SNPs on two or more chromosomes (their two halves are "
+                                       f"the odd and the even ones); {geno} has {len(chroms)} with finite loadings.")
     acc = FactorAccumulator(N, nu, len(chroms), len(names), ld_mass=ld_mass, memory_gb=memory_gb,
                             ld_mass_probes=ld_mass_probes, seed=seed)
     log(f"[admixed-ld] sample-factors: {t_idx.size} variants matched to the reference ({', '.join(sources)}; "
