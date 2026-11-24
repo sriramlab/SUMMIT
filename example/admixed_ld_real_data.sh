@@ -64,15 +64,14 @@ summit admixed-ld compose --ref "$OUT/ref_clean" --sumstats "$SUMSTATS" --annot 
   --admixture-generations "$DATE" --out "$OUT/ld_date"
 
 # ------------------------------------------------------------------------------------------------ 4. h2 and rg (anyone)
-# One LD-score file per GWAS sample size: OUT/ld_curve.n_groups.tsv lists each trait's file (OUT/ld_curve.gw.ldscore.gz
-# when every trait has the same N). For rg, give each GWAS's phenotype and covariate files (--pheno-rg, --pheno-rg-cov)
-# where they are at hand, so that the overlapping covariance is computed from them.
-groups="$OUT/ld_curve.n_groups.tsv"
+# One LD-score file per GWAS sample size: OUT/ld_curve.n_groups.tsv lists each trait's file by name, next to it
+# (no table when every trait has the same N). summit --h2 with --ldscores OUT/ld_curve.gw.ldscore.gz reads the table and
+# fits each trait with its own file (a trait the table does not list stops the run). For rg, give each GWAS's phenotype
+# and covariate files (--pheno-rg, --pheno-rg-cov) where they are at hand, so that the overlapping covariance is
+# computed from them.
 for ss in "$SUMSTATS"/*; do
   t=$(basename "$ss")
-  ld="$OUT/ld_curve.gw.ldscore.gz"
-  [ -f "$groups" ] && ld=$(awk -F'\t' -v t="$t" '$1 == t {print $3}' "$groups")
-  summit --h2 "$ss" --ldscores "$ld" --annot "$ANNOT" --num-threads 4 --out "$OUT/h2_${t%%.*}"
+  summit --h2 "$ss" --ldscores "$OUT/ld_curve.gw.ldscore.gz" --annot "$ANNOT" --num-threads 4 --out "$OUT/h2_${t%%.*}"
 done
 
 # ------------------------------------------------------------------------------------------------ 5. fine-mapping (anyone)
