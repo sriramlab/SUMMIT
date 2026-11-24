@@ -2013,6 +2013,48 @@ def test_release_coverage_flags_traits_measured_in_part_of_the_cohort(sim, tmp_p
     assert "trait0" in f["detail"] and "trait1" not in f["detail"] and f["min_share"] == 0.85
 
 
+def test_release_share_is_of_the_statistic_used(sim, tmp_path):
+    """A trait measured in half of the cohort is flagged against the release's people when composed with the curve's
+    statistic, and not when composed with the statistic of its own people (the flag's remedy): the share is that of
+    the people of the statistic in use."""
+    from summit.admixed_ld.compose import compose_ldscores
+    from summit.admixed_ld.curve import genotype_curve
+    from summit.admixed_ld.sample_factors import sample_factors
+    d, S = sim["dir"], sim["S"]
+    quiet = lambda *a, **k: None
+    v = S["variants"]
+    cv = str(tmp_path / "cv")
+    genotype_curve(str(d / "cohort"), str(d / "ref"), cv, covar=str(d / "cohort.cov"), cell_cm=0.5, cells_cm=0,
+                   log=quiet)
+    n = json.load(open(cv + ".curve.json"))["n_samples"]
+    rng = np.random.default_rng(21)
+    idx = np.sort(rng.choice(n, n // 2, replace=False))
+    G = S["cohort"][idx]
+    iid = write_bed(str(tmp_path / "half"), G, v, "h")
+    C = principal_components(G, 2)
+    pd.DataFrame({"FID": iid, "IID": iid, "PC1": C[:, 0], "PC2": C[:, 1]}).to_csv(tmp_path / "half.cov", sep="\t",
+                                                                                   index=False)
+    os.makedirs(tmp_path / "ss")
+    beta, se = gwas(G, rng.standard_normal(idx.size), C)
+    pd.DataFrame({"SNP": v.SNP, "CHR": v.CHR, "BP": v.BP, "A1": v.A1, "A2": v.A2, "N": idx.size, "BETA": beta,
+                  "SE": se, "Z": beta / se, "COV_RANK": 2}).to_csv(tmp_path / "ss" / "half.tsv", sep="\t", index=False)
+    sample_factors(str(tmp_path / "half"), str(d / "ref"), str(tmp_path / "half"), covar=str(tmp_path / "half.cov"),
+                   ld_mass=False, log=quiet)
+    flags = lambda p: {f["flag"]: f for f in p["flags"]}
+    kw = dict(curve=cv, mean_ancestry="0.6", kappa0="0.3", dry_run=True, log=quiet)
+    args = (str(d / "ref"), [str(tmp_path / "ss")], str(d / "annot.tsv"))
+    rel = compose_ldscores(*args, str(tmp_path / "rel"), **kw)            # the plan lists the flags' names
+    assert "gwas_sample_smaller_than_release" in rel["flags"]
+    own = compose_ldscores(*args, str(tmp_path / "own"), sample_factors=str(tmp_path / "half.sample_factors.json"), **kw)
+    assert "gwas_sample_smaller_than_release" not in own["flags"]
+    assert own["same_person_term"].startswith("the sample statistic") and "released" not in own["same_person_term"]
+    # composed in full: the flag records the people it was measured against
+    out = str(tmp_path / "rel_full")
+    compose_ldscores(*args, out, **dict(kw, dry_run=False))
+    g = flags(json.load(open(out + ".admixed_ld.json")))["gwas_sample_smaller_than_release"]
+    assert g["against"] == "release" and g["people"] == n and f"0.50 of {n}" in g["detail"]
+
+
 def test_stochastic_ld_mass_agrees_with_the_exact_one(sim, tmp_path):
     """The realized LD mass from random probes (exact diagonals, Rademacher probes for the off-diagonal parts) is
     within a few of its recorded standard errors of the exact mass, in total and between chromosomes."""

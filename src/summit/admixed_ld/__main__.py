@@ -238,7 +238,8 @@ def main(argv=None):
                         "background); stop with an error if one would be missing, e.g. in a pipeline")
     m.add_argument("--min-release-share", type=float, default=0.85,
                    help="flag traits whose GWAS N is below this share of the curve's people (default 0.85): compose "
-                        "them alone with the sample statistic of their own people")
+                        "them alone with the sample statistic of their own people (with --sample-factors the share is "
+                        "of that statistic's people)")
     m.add_argument("--sample-factors-no-calibration", action="store_true",
                    help=argparse.SUPPRESS)
     m.add_argument("--partners", choices=["rows", "reference"], default="rows",

@@ -711,12 +711,14 @@ def release_statistic(curve):
     return path, None
 
 
-def release_coverage(tables, n_med, n_release, min_share=0.85, log=print):
+def release_coverage(tables, n_med, n_release, min_share=0.85, log=print, against="release"):
     """Traits whose GWAS sample holds less than min_share of the people of the cohort's release (the people of the
     curve and of its sample statistic). Composition follows each GWAS's N, but not the ancestry and relatedness of the
     people with the trait, which can differ from the release's when the trait was measured in only part of the cohort.
     Such a trait is composed alone (its own summary statistics) with the cohort's curve and the sample statistic of
-    its own people. The traits and their shares are recorded and logged."""
+    its own people. The traits and their shares are recorded and logged. against: 'release' (n_release the curve's
+    people), or 'statistic' when the same-person term comes from a statistic given to compose (n_release its people:
+    a trait composed with the statistic of its own people is then not flagged)."""
     if n_release is None or not tables or min_share is None or min_share <= 0:
         return []
     share = np.asarray(n_med, np.float64) / float(n_release)
@@ -724,13 +726,15 @@ def release_coverage(tables, n_med, n_release, min_share=0.85, log=print):
     if low.size == 0:
         return []
     names = [t[0] for t in tables]
+    whose = "the release's" if against == "release" else "the sample statistic's"
     detail = ", ".join(f"{names[i]} (N {n_med[i]:.0f}, {share[i]:.2f} of {int(n_release)})" for i in low)
     log(f"[admixed-ld] WARNING (recorded flag gwas_sample_smaller_than_release): {low.size} trait(s) were analysed "
-        f"in less than {min_share:.0%} of the release's {int(n_release)} people: {detail}. Their LD can differ from "
+        f"in less than {min_share:.0%} of {whose} {int(n_release)} people: {detail}. Their LD can differ from "
         "the release's in the ancestry and relatedness of the people measured. Compose each alone (its own summary "
         "statistics) with the cohort's curve and the sample statistic of its own people (summit admixed-ld "
         "sample-factors --keep <its people>, with the GWAS covariates).")
-    return [dict(flag="gwas_sample_smaller_than_release", detail=detail, min_share=float(min_share))]
+    return [dict(flag="gwas_sample_smaller_than_release", detail=detail, min_share=float(min_share),
+                 against=str(against), people=int(n_release))]
 
 
 def se_regression_outliers(per_trait, log=print, max_m=0.05, max_kappa=0.25, min_r2=0.9):
@@ -1082,7 +1086,11 @@ def compose_ldscores(ref_path, sumstats, annot, out, *, sources=None, snps=None,
                               detail=f"curve covariate rank {int(c_rank)}, GWAS COV_RANK {p}"))
             log(f"[admixed-ld] WARNING (recorded flag covariates_differ_from_curve): the curve was made with {int(c_rank)} "
                 f"covariates and the GWAS reports {p}. The curve must use the GWAS's own covariates (and its PCs).")
-        flags += release_coverage(tables, n_med, curve_info.get("n_samples"), min_release_share, log)
+        if sfi is not None and not sf_from_release:
+            # a statistic given to compose (the remedy of the flag: the trait's own people): the share of its people
+            flags += release_coverage(tables, n_med, sfi.get("n_samples"), min_release_share, log, against="statistic")
+        else:
+            flags += release_coverage(tables, n_med, curve_info.get("n_samples"), min_release_share, log)
     elif generations is not None:
         kern = KernelMatrix.from_decay(k0, float(generations) / 100.0, ref.genome_cm, nK,
                                        source=f"admixture {generations} generations ago")
