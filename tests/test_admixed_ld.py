@@ -1627,7 +1627,7 @@ def test_compose_writes_one_file_per_gwas_sample_size(fam, tmp_path):
     groups = pd.read_csv(str(tmp_path / "c_mix") + ".n_groups.tsv", sep="\t")
     assert sorted(groups.N.unique()) == [sub.size, n]
     for N_, ref_ in ((n, "full"), (sub.size, "part")):
-        f = groups[groups.N == N_].ldscores.iloc[0]
+        f = str(tmp_path / groups[groups.N == N_].ldscores.iloc[0])     # file names, next to the table
         got = pd.read_csv(f, sep="\t")
         np.testing.assert_allclose(got[["V", "low", "high"]].to_numpy(), out[ref_][["V", "low", "high"]].to_numpy(),
                                    rtol=1e-8, atol=1e-10)
@@ -1649,7 +1649,7 @@ def test_compose_writes_one_file_per_gwas_sample_size(fam, tmp_path):
     got = pd.read_csv(str(tmp_path / "h_mix") + ".results.tsv", sep="\t").set_index("phen")
     assert list(got.index) == ["full0", "full1", "part0", "part1", "part2"]
     for N_, nm in ((n, "full"), (sub.size, "part")):
-        f = groups[groups.N == N_].ldscores.iloc[0]
+        f = str(tmp_path / groups[groups.N == N_].ldscores.iloc[0])
         run("--h2", str(tmp_path / nm), "--ldscores", f, "--ldscore-groups", "off", "--out", str(tmp_path / f"h_{nm}"))
         ref_ = pd.read_csv(str(tmp_path / f"h_{nm}") + ".results.tsv", sep="\t").set_index("phen")
         np.testing.assert_allclose(got.loc[ref_.index, "h2"], ref_.h2, rtol=1e-10)
@@ -1732,6 +1732,58 @@ def test_h2_over_ldscore_groups_rebuilds_its_links_on_a_rerun(fam_groups, tmp_pa
         assert os.path.realpath(os.path.join(out + ".ldgroups/0/ss", f)) == str((tmp_path / "mix2" / f).resolve())
     used = pd.read_csv(out + ".ldscore_groups.tsv", sep="\t").set_index("phen").ldscores
     assert len(used) == 4 and used["part0"] == used["full0"] != used["part1"]
+
+
+def test_n_groups_table_on_a_rerun_from_any_directory_and_for_one_trait(fam, fam_groups, tmp_path, monkeypatch):
+    """compose's n_groups.tsv names its files relative to its own directory (read from any working directory; older
+    tables with compose's --out paths stay readable); a rerun to the same prefix with one sample size removes it; and
+    --h2 with one file in auto mode stops for a trait the table does not list."""
+    import shutil
+    from summit.admixed_ld.compose import compose_ldscores
+    from summit.cli import _ldscore_groups
+    d, fg = fam["dir"], fam_groups
+    out = str(tmp_path / "same")
+    compose_ldscores(str(d / "ref"), [str(fg["dir"] / "mix")], str(d / "annot.tsv"), out, **fg["compose_kw"])
+    raw = pd.read_csv(out + ".n_groups.tsv", sep="\t")
+    assert len(raw) == 5 and raw.ldscores.nunique() == 2 and not any(os.sep in f for f in raw.ldscores)
+    os.makedirs(tmp_path / "elsewhere")
+    monkeypatch.chdir(tmp_path / "elsewhere")
+    _, tab = _ldscore_groups(out + ".gw.ldscore.gz")
+    assert all(os.path.isabs(f) and os.path.exists(f) and os.path.dirname(f) == str(tmp_path) for f in tab.ldscores)
+    # a table written before the names (compose run in tmp_path with --out res/c): the files next to the table
+    os.makedirs(tmp_path / "res")
+    old = []
+    for t, n_, f in raw[["trait", "N", "ldscores"]].itertuples(index=False):
+        name = f.replace("same.", "c.", 1)
+        if not os.path.exists(tmp_path / "res" / name):
+            os.symlink(tmp_path / f, tmp_path / "res" / name)
+        old.append(dict(trait=t, N=n_, ldscores=f"res/{name}"))
+    pd.DataFrame(old).to_csv(tmp_path / "res" / "c.n_groups.tsv", sep="\t", index=False)
+    for cwd in (tmp_path / "elsewhere", tmp_path):
+        monkeypatch.chdir(cwd)
+        _, tab_old = _ldscore_groups(str(tmp_path / "res" / "c"))
+        assert [os.path.realpath(f) for f in tab_old.ldscores] == [os.path.realpath(f) for f in tab.ldscores]
+    # the same prefix again with one sample size: no table is left for --h2 to read
+    os.makedirs(tmp_path / "full")
+    for i in range(2):
+        shutil.copy(fg["dir"] / "mix" / f"full{i}.tsv", tmp_path / "full" / f"full{i}.tsv")
+    compose_ldscores(str(d / "ref"), [str(tmp_path / "full")], str(d / "annot.tsv"), out, **fg["compose_kw"])
+    assert not os.path.exists(out + ".n_groups.tsv") and _ldscore_groups(out + ".gw.ldscore.gz") is None
+    # one --h2 file: its own group's file, or an error for a trait that the table does not list
+    _, ftab = _ldscore_groups(fg["prefix"])
+    part_file = ftab.ldscores[ftab.trait == "part0.tsv"].iloc[0]
+    one = _summit_h2(fg, "--h2", str(fg["dir"] / "mix" / "part0.tsv"), "--ldscores", fg["prefix"] + ".gw.ldscore.gz",
+                     "--out", str(tmp_path / "one"))
+    assert f"LD scores {part_file}" in one.stdout and ".n_groups.tsv" in one.stdout
+    _summit_h2(fg, "--h2", str(fg["dir"] / "mix" / "part0.tsv"), "--ldscores", part_file, "--ldscore-groups", "off",
+               "--out", str(tmp_path / "off"))
+    a, b = (pd.read_csv(str(tmp_path / x) + ".results.tsv", sep="\t") for x in ("one", "off"))
+    np.testing.assert_allclose(a.h2, b.h2, rtol=1e-12)
+    shutil.copy(fg["dir"] / "mix" / "part0.tsv", tmp_path / "other.tsv")
+    r = _summit_h2(fg, "--h2", str(tmp_path / "other.tsv"), "--ldscores", fg["prefix"] + ".gw.ldscore.gz", "--out",
+                   str(tmp_path / "other"), check=False)
+    assert r.returncode != 0 and "other.tsv of --h2 is not in" in r.stdout + r.stderr
+    assert not os.path.exists(str(tmp_path / "other") + ".results.tsv")
 
 
 def test_curve_writes_the_sample_statistic_and_compose_uses_it(sim, tmp_path):

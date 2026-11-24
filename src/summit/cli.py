@@ -302,7 +302,8 @@ def build_parser() -> argparse.ArgumentParser:
     inputs.add_argument("--ldscore-groups", choices=["auto", "off"], default="auto",
                         help="--h2 with a SUMMIT-MIX compose output whose traits have different GWAS samples: 'auto' "
                              "(default) reads PREFIX.n_groups.tsv next to --ldscores and fits each trait with its own "
-                             "group's LD-score file; 'off' fits every trait with the file given.")
+                             "group's LD-score file (a trait missing from the table stops the run); 'off' fits every "
+                             "trait with the file given.")
     inputs.add_argument("--ldscores-reg", default=None, type=str,
                         help=(
                             "Optional LD-score file used only for summary-only overlap-covariance estimation. "
@@ -2047,9 +2048,24 @@ def _resolve_njack(args, default):
         args.njack = default
     return args.njack
 
+def _group_file_path(f, table):
+    """A file of compose's n_groups.tsv: absolute as written, or relative to the table's own directory (compose writes
+    the file names; its files are next to the table). Tables written before the names held the path as compose's
+    --out gave it, relative to compose's working directory: the file of that name next to the table, else that path
+    from here."""
+    f = str(f)
+    if os.path.isabs(f):
+        return f
+    here = os.path.dirname(os.path.abspath(table))
+    for cand in (os.path.join(here, f), os.path.join(here, os.path.basename(f)), f):
+        if os.path.exists(cand):
+            return cand
+    return os.path.join(here, f)
+
+
 def _ldscore_groups(ldscores):
     """compose's PREFIX.n_groups.tsv next to --ldscores (PREFIX or PREFIX.gw.ldscore.gz): (prefix, table of trait,
-    N, ldscores), or None when there is none."""
+    N, ldscores), or None when there is none. The ldscores column is resolved against the table's directory."""
     s = str(ldscores)
     if "@" in s:
         return None
@@ -2057,9 +2073,10 @@ def _ldscore_groups(ldscores):
     f = f"{prefix}.n_groups.tsv"
     if not os.path.exists(f):
         return None
-    tab = pd.read_csv(f, sep="\t", dtype={"trait": str})
+    tab = pd.read_csv(f, sep="\t", dtype={"trait": str, "ldscores": str})
     if not {"trait", "ldscores"} <= set(tab.columns):
         raise ValueError(f"{f} is not a compose group table (columns trait, N, ldscores).")
+    tab["ldscores"] = [_group_file_path(x, f) for x in tab.ldscores]
     return prefix, tab
 
 
@@ -2169,10 +2186,16 @@ def _dispatch_h2(args, log):
             _dispatch_h2_groups(args, log, *grp)
             return
         prefix, tab = grp
-        row = tab[tab.trait.astype(str) == os.path.basename(str(args.h2))]
-        if len(row):
-            log._log(f"[h2] {os.path.basename(str(args.h2))}: LD scores {row.ldscores.iloc[0]} ({prefix}.n_groups.tsv)")
-            args.ldscores = str(row.ldscores.iloc[0])
+        b = os.path.basename(str(args.h2))
+        row = tab[tab.trait.astype(str) == b]
+        if not len(row):
+            raise ValueError(f"The trait {b} of --h2 is not in {prefix}.n_groups.tsv, which gives each composed trait "
+                             "the LD-score file of its own GWAS sample; compose it, or fit with --ldscore-groups off.")
+        f = str(row.ldscores.iloc[0])
+        if not os.path.exists(f):
+            raise ValueError(f"The group LD-score file {f} listed in {prefix}.n_groups.tsv does not exist.")
+        log._log(f"[h2] {b}: LD scores {f} ({prefix}.n_groups.tsv)")
+        args.ldscores = f
 
     if (args.h2_cache_dir is not None or args.h2_cache_only) and not args.h2_batch_fast:
         raise ValueError("--h2-cache-dir/--h2-cache-only require --h2-batch-fast.")

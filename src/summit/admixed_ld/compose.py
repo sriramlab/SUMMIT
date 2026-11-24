@@ -803,8 +803,9 @@ def compose_ldscores(ref_path, sumstats, annot, out, *, sources=None, snps=None,
     per_trait_n: the same-person term (1 / nu) and the relatives' term (f(N) / nu^2) belong to the GWAS's sample, and in a
     small cohort (with a strong background) traits with different missingness have measurably different in-sample LD.
     When the traits' median N differ by more than n_tol, one LD-score file is written per group of traits with the same N
-    (out.n<N>.gw.ldscore.gz, listed in out.n_groups.tsv; nu = N - rank - 1 with the traits' covariate rank), the
-    population part composed once; out.gw.ldscore.gz stays the file for the median N (with the given nu, if any).
+    (out.n<N>.gw.ldscore.gz, listed by file name in out.n_groups.tsv; nu = N - rank - 1 with the traits' covariate
+    rank), the population part composed once; out.gw.ldscore.gz stays the file for the median N (with the given nu, if
+    any). A composition with one file for every trait removes an earlier run's out.n_groups.tsv.
 
     partners: 'rows' (the default) takes the partners k of every LD score to be the GWAS SNPs themselves; 'reference'
     takes every reference variant listed in the annotation (a dense reference holding the causal variants), with the
@@ -1541,7 +1542,7 @@ def compose_ldscores(ref_path, sumstats, annot, out, *, sources=None, snps=None,
                 f"({cshift * pairs_btw:.6g} of mass) to the cohort's realized total")
     L = L_pop + sp + (0.0 if R1 is None else (rel_scale / nu ** 2) * R1)
     V = Vpop
-    groups_info = None
+    groups_info, wrote_groups = None, False
     if nu_given and abs(nu - (N - p - 1.0)) > 0.02 * (N - p - 1.0):
         flags.append(dict(flag="nu_differs_from_gwas_n", detail=f"nu {nu:.0f} given; the traits' median N {N:.0f} and "
                                                                 f"covariate rank {p} give {N - p - 1.0:.0f}"))
@@ -1573,10 +1574,20 @@ def compose_ldscores(ref_path, sumstats, annot, out, *, sources=None, snps=None,
                 write_gw_ldscore_table(f"{out}.n{g['label']}", snpdf_g, pd.DataFrame(to_cols(Lg), columns=out_classes),
                                        snp_var=V)
                 write_gw_annotation_masses(f"{out}.n{g['label']}", to_cols(np.bincount(clsP, minlength=K).astype(float)))
-            pd.DataFrame([dict(trait=t, N=nn, ldscores=g["file"]) for g in groups_info for t, nn in g["traits"]]).to_csv(
-                f"{out}.n_groups.tsv", sep="\t", index=False)
+            # the files by name, relative to the table's own directory (they are next to it), so that --h2 finds them
+            # from any working directory and after the directory is moved
+            tmp_tab = f"{out}.n_groups.tsv.{os.getpid()}.tmp"
+            pd.DataFrame([dict(trait=t, N=nn, ldscores=os.path.basename(g["file"])) for g in groups_info
+                          for t, nn in g["traits"]]).to_csv(tmp_tab, sep="\t", index=False)
+            os.replace(tmp_tab, f"{out}.n_groups.tsv")
+            wrote_groups = True
             log(f"[admixed-ld] compose: {len(groups_info)} GWAS sample sizes among the traits (within {n_tol:.0%}); "
                 f"one LD-score file each (N {', '.join(g['label'] for g in groups_info)}), listed in {out}.n_groups.tsv")
+    if not wrote_groups and os.path.lexists(f"{out}.n_groups.tsv"):
+        # an earlier run's table to the same prefix: --h2 would fit its traits with its files
+        os.remove(f"{out}.n_groups.tsv")
+        log(f"[admixed-ld] compose: removed {out}.n_groups.tsv of an earlier run; this composition has one LD-score "
+            f"file for every trait ({out}.gw.ldscore.gz)")
 
     # ---------------------------------------------------------------------------------------- write
     snpdf = pd.DataFrame({"CHR": chrom_out, "SNP": snp_ids, "BP": rv["BP"].to_numpy()[r_idx]})
