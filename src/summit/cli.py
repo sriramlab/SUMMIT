@@ -2063,13 +2063,52 @@ def _ldscore_groups(ldscores):
     return prefix, tab
 
 
+def _clear_ldgroups(root):
+    """Remove what an earlier --h2 over compose's LD-score groups left in ROOT (OUT.ldgroups): each group's ss directory
+    of links to the summary statistics and its fit.* outputs. Every run then links and fits only its own traits (a
+    link left in place would fit an earlier run's file, a trait that changed group twice, a trait no longer in --h2
+    once more). Anything else there is not --h2's and stops the run."""
+    if not os.path.lexists(root):
+        return
+    if not os.path.isdir(root) or os.path.islink(root):
+        raise ValueError(f"{root} exists and is not the directory of LD-score groups that --h2 writes; remove it or "
+                         "choose another --out.")
+    for k in os.listdir(root):
+        kd = os.path.join(root, k)
+        if not os.path.isdir(kd) or os.path.islink(kd):
+            raise ValueError(f"{kd} is not a group directory of --h2; remove it or choose another --out.")
+        sd = os.path.join(kd, "ss")
+        if os.path.lexists(sd):
+            if not os.path.isdir(sd) or os.path.islink(sd):
+                raise ValueError(f"{sd} is not a directory of links that --h2 made; remove it or choose another --out.")
+            for name in os.listdir(sd):
+                p = os.path.join(sd, name)
+                if not os.path.islink(p):
+                    raise ValueError(f"{p} is not a link that --h2 made; remove it or choose another --out.")
+                os.unlink(p)
+            os.rmdir(sd)
+        for name in os.listdir(kd):
+            p = os.path.join(kd, name)
+            if name.startswith("fit.") and (os.path.isfile(p) or os.path.islink(p)):
+                os.unlink(p)
+        if not os.listdir(kd):
+            os.rmdir(kd)
+
+
 def _dispatch_h2_groups(args, log, prefix, tab):
     """--h2 over traits whose LD scores come from different compose group files: each group's traits are fitted
-    with its file (symlinked into PREFIX-of-out.ldgroups/<k>/ss), and the rows are merged into OUT.results.tsv in the
-    order of the summary-statistics directory; OUT.ldscore_groups.tsv records the file each trait used."""
+    with its file (symlinked into PREFIX-of-out.ldgroups/<k>/ss, rebuilt on every run), and the rows are merged into
+    OUT.results.tsv in the order of the summary-statistics directory; OUT.ldscore_groups.tsv records the file each
+    trait used."""
     import copy
     paths = utils._parse_sumdir(args.h2)
     base_of = {os.path.basename(p): p for p in paths}
+    phen_of = {b: utils._phen_name_from_path(b) for b in base_of}
+    from collections import Counter
+    dup = sorted(p for p, c in Counter(phen_of.values()).items() if c > 1)
+    if dup:
+        raise ValueError(f"--h2 {args.h2}: several files give the trait name(s) {dup[:3]}; the groups' rows are merged "
+                         "by trait name, so rename them.")
     by_trait = dict(zip(tab.trait.astype(str), tab.ldscores.astype(str)))
     missing = [b for b in base_of if b not in by_trait]
     if missing:
@@ -2082,24 +2121,27 @@ def _dispatch_h2_groups(args, log, prefix, tab):
     log._log(f"[h2] {prefix}.n_groups.tsv: {len(base_of)} traits in {len(files)} LD-score groups; each trait is fitted "
              "with its own group's file (--ldscore-groups off fits every trait with --ldscores)")
     root = f"{args.out}.ldgroups"
+    _clear_ldgroups(root)
     merged, used = [], []
     for k, f in enumerate(files):
         sd = os.path.join(root, str(k), "ss")
-        os.makedirs(sd, exist_ok=True)
+        os.makedirs(sd)
         for b in base_of:
             if by_trait[b] == f:
-                dst = os.path.join(sd, b)
-                if not os.path.lexists(dst):
-                    os.symlink(os.path.abspath(base_of[b]), dst)
-                used.append((utils._phen_name_from_path(b), f))
+                os.symlink(os.path.abspath(base_of[b]), os.path.join(sd, b))
+                used.append((phen_of[b], f))
                 log._log(f"[h2] {b}: LD scores {f}")
         a = copy.copy(args)
         a.h2, a.ldscores, a.ldscore_groups = sd, f, "off"
         a.out = os.path.join(root, str(k), "fit")
         _dispatch_h2(a, log)
-        merged.append(pd.read_csv(f"{a.out}.results.tsv", sep="\t"))
+        merged.append(pd.read_csv(f"{a.out}.results.tsv", sep="\t", dtype={"phen": str}))
     res = pd.concat(merged, ignore_index=True)
-    order = {utils._phen_name_from_path(b): i for i, b in enumerate(base_of)}
+    want = sorted(phen_of.values())
+    if sorted(res.phen.astype(str)) != want:
+        raise RuntimeError(f"--h2 over LD-score groups fitted {sorted(res.phen.astype(str))}, not each trait of "
+                           f"{args.h2} once ({want}).")
+    order = {p: i for i, p in enumerate(phen_of[b] for b in base_of)}
     res = res.iloc[np.argsort([order[str(x)] for x in res.phen], kind="stable")].reset_index(drop=True)
     res["phen_index"] = np.arange(len(res))
     tmp = f"{args.out}.results.tsv.{os.getpid()}.tmp"

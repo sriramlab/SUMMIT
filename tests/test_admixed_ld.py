@@ -1663,6 +1663,77 @@ def test_compose_writes_one_file_per_gwas_sample_size(fam, tmp_path):
     assert not np.allclose(main_.loc[["full0", "full1"], "h2"], got.loc[["full0", "full1"], "h2"], rtol=1e-8)
 
 
+@pytest.fixture(scope="module")
+def fam_groups(fam, tmp_path_factory):
+    """Five traits with two GWAS sample sizes (full0, full1 of the whole cohort; part0-2 of a random 60% of it) composed
+    to one prefix with its n_groups.tsv, and the annotation for --h2."""
+    import shutil
+    from summit.admixed_ld.compose import compose_ldscores
+    d, S, C = fam["dir"], fam["S"], fam["C"]
+    t = tmp_path_factory.mktemp("fam_groups")
+    G, v = S["cohort"], S["variants"]
+    rng = np.random.default_rng(8)
+    sub = np.sort(rng.choice(G.shape[0], int(0.6 * G.shape[0]), replace=False))
+    os.makedirs(t / "mix")
+    for i in range(2):
+        shutil.copy(d / "ss" / f"trait{i}.tsv", t / "mix" / f"full{i}.tsv")
+    for i in range(3):
+        beta, se = gwas(G[sub], rng.standard_normal(sub.size), C[sub])
+        pd.DataFrame({"SNP": v.SNP, "CHR": v.CHR, "BP": v.BP, "A1": v.A1, "A2": v.A2, "N": sub.size, "BETA": beta,
+                      "SE": se, "Z": beta / se, "COV_RANK": 2}).to_csv(t / "mix" / f"part{i}.tsv", sep="\t", index=False)
+    kw = dict(curve=str(d / "c"), relatedness="curve", release_sample_factors=False, log=lambda *a: None)
+    compose_ldscores(str(d / "ref"), [str(t / "mix")], str(d / "annot.tsv"), str(t / "c_mix"), **kw)
+    an = pd.read_csv(d / "annot.tsv", sep="\t").merge(v[["CHR", "BP", "SNP"]], on="SNP")
+    an[["CHR", "BP", "SNP", "low", "high"]].to_csv(t / "annot_h2.tsv", sep="\t", index=False)
+    return dict(dir=t, prefix=str(t / "c_mix"), n=G.shape[0], n_sub=sub.size, compose_kw=kw)
+
+
+def _summit_h2(fg, *a, check=True):
+    import subprocess
+    return subprocess.run([sys.executable, "-m", "summit", *a, "--annot", str(fg["dir"] / "annot_h2.tsv"),
+                           "--njack", "20"], check=check, capture_output=True, text=True)
+
+
+def test_h2_over_ldscore_groups_rebuilds_its_links_on_a_rerun(fam_groups, tmp_path):
+    """A second --h2 to the same --out with other summary statistics of the same names, one trait moved to the other
+    group and one trait left out fits exactly the second run's files, each trait once, as a fresh --out does."""
+    import shutil
+    fg = fam_groups
+    tab = pd.read_csv(fg["prefix"] + ".n_groups.tsv", sep="\t")
+    tab["ldscores"] = [f if os.path.isabs(f) else str(fg["dir"] / f) for f in tab.ldscores]   # the table moves here
+    shutil.copy(fg["prefix"] + ".gw.ldscore.gz", tmp_path / "moved.gw.ldscore.gz")
+    full_file = tab.ldscores[tab.trait == "full0.tsv"].iloc[0]
+    moved = tab[tab.trait != "part2.tsv"].copy()
+    moved.loc[moved.trait == "part0.tsv", "ldscores"] = full_file       # part0 changed group (a recomposition)
+    moved.to_csv(tmp_path / "moved.n_groups.tsv", sep="\t", index=False)
+    os.makedirs(tmp_path / "mix2")
+    for f in sorted(os.listdir(fg["dir"] / "mix")):
+        if f == "part2.tsv":                                            # left out of the second run
+            continue
+        t = pd.read_csv(fg["dir"] / "mix" / f, sep="\t")
+        t["BETA"] *= 3.0
+        t["Z"] = t.BETA / t.SE
+        t.to_csv(tmp_path / "mix2" / f, sep="\t", index=False)
+    out = str(tmp_path / "h")
+    _summit_h2(fg, "--h2", str(fg["dir"] / "mix"), "--ldscores", fg["prefix"] + ".gw.ldscore.gz", "--out", out)
+    first = pd.read_csv(out + ".results.tsv", sep="\t").set_index("phen")
+    assert sorted(os.listdir(out + ".ldgroups/1/ss")) == ["part0.tsv", "part1.tsv", "part2.tsv"]
+    second = []
+    for o in (out, str(tmp_path / "fresh")):                              # the same --out again, and a fresh one
+        _summit_h2(fg, "--h2", str(tmp_path / "mix2"), "--ldscores", str(tmp_path / "moved.gw.ldscore.gz"), "--out", o)
+        second.append(pd.read_csv(o + ".results.tsv", sep="\t").set_index("phen"))
+    rerun, fresh = second
+    assert list(rerun.index) == ["full0", "full1", "part0", "part1"]
+    pd.testing.assert_frame_equal(rerun, fresh)
+    assert not np.allclose(rerun.h2, first.loc[rerun.index, "h2"], rtol=1e-6)
+    assert sorted(os.listdir(out + ".ldgroups/0/ss")) == ["full0.tsv", "full1.tsv", "part0.tsv"]
+    assert sorted(os.listdir(out + ".ldgroups/1/ss")) == ["part1.tsv"]
+    for f in os.listdir(out + ".ldgroups/0/ss"):
+        assert os.path.realpath(os.path.join(out + ".ldgroups/0/ss", f)) == str((tmp_path / "mix2" / f).resolve())
+    used = pd.read_csv(out + ".ldscore_groups.tsv", sep="\t").set_index("phen").ldscores
+    assert len(used) == 4 and used["part0"] == used["full0"] != used["part1"]
+
+
 def test_curve_writes_the_sample_statistic_and_compose_uses_it(sim, tmp_path):
     """The curve's pass writes the sample statistic of the same people (as sample-factors run on its own), and compose
     with that curve uses it for the same-person term unless told not to (curve mode's default, 22 Nov 2026)."""
