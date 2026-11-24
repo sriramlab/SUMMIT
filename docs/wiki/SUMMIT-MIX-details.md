@@ -79,8 +79,10 @@ including its principal components). It writes:
   between chromosomes (`.background.tsv`);
 - the cell matrix, the covariance between 2-cM cells of the genome, estimated in two halves of the people so that its
   square is unbiased (`.cells.npz`);
-- the sample statistic (`.sample_factors.json`), accumulated in the same pass over the genotypes (see
-  [The sample statistic](#the-sample-statistic)). `--no-sample-factors` leaves it out.
+- the sample statistic (`.sample_factors.json`), accumulated in the same pass over the genotypes and listed in
+  `.curve.json` (see [The sample statistic](#the-sample-statistic)). `--no-sample-factors` leaves it out. Its two
+  halves are the odd and the even chromosomes, so a curve on one chromosome is written without it (the flag
+  `sample_factors_not_made` in `.curve.json`).
 
 Options:
 
@@ -100,7 +102,8 @@ each trait's N and ancestry from its summary statistics, and scales the same-per
 relatedness of its people. Compose therefore flags traits whose GWAS N is below 85% of the curve's people
 (`gwas_sample_smaller_than_release`, threshold `--min-release-share`) and traits whose standard errors give other cohort
 quantities than the rest (`se_regression_outlier_traits`). Compose such a trait alone, with its own summary statistics,
-the cohort's curve and the sample statistic of its own people.
+the cohort's curve and the sample statistic of its own people. With `--sample-factors` the share is of that
+statistic's people, so a trait composed this way is not flagged.
 
 ```bash
 summit admixed-ld sample-factors --geno cohort --ref ref/afr_eur_clean --keep trait_sample.txt --covar gwas.cov \
@@ -123,9 +126,11 @@ from κ_res(0) of the standard errors to the curve's value at 2 cM. The backgrou
 smoothed as a constant plus decaying exponentials fitted from 3 cM on, and the panels' own background is removed inside
 the band. In the squared admixture LD, the cell matrix takes the place of the kernel for pairs of SNPs whose 2-cM
 cells have midpoints at least 10 cM apart on a chromosome, and for pairs on different chromosomes. Both are used whenever the curve has them; `--relatedness none` and
-`--no-cell-matrix` leave them out. The same-person term comes from the sample statistic written with the curve.
-`--no-sample-factors` composes it under random mating instead, as date mode does, and `--sample-factors FILE` gives
-another statistic. Compose stops when the curve at 2 cM is above κ_res(0) of the standard errors,
+`--no-cell-matrix` leave them out. The same-person term comes from the sample statistic that the curve's `.curve.json`
+lists. Compose stops when that file is missing or was made on other people or covariates than the curve (a file left
+by another run). A curve that lists no statistic (made with `--no-sample-factors`, or on one chromosome) gives the
+random-mating term, with the flag `curve_without_sample_factors`. `--no-sample-factors` composes it under random mating
+instead, as date mode does, and `--sample-factors FILE` gives another statistic. Compose stops when the curve at 2 cM is above κ_res(0) of the standard errors,
 because then the two inputs describe different samples or covariates.
 
 **Date mode** (`--admixture-generations T`). The kernel decays at T/100 per cM from κ_res(0) to the between-chromosome
@@ -140,11 +145,14 @@ and no cell matrix.
 
 **One file per GWAS sample size.** The same-person and background terms belong to each GWAS's sample. When the traits'
 median N differ by more than 1%, compose writes one file per group of traits (`ld/cohort.n<N>.gw.ldscore.gz`, listed
-with their traits in `ld/cohort.n_groups.tsv`). `summit --h2` with `--ldscores ld/cohort` (or
-`ld/cohort.gw.ldscore.gz`) reads that list, fits each trait with its own group's file and writes the file of each
-trait to `.ldscore_groups.tsv`; `--ldscore-groups off` fits every trait with the file given. `--rg` uses the file given
-for both traits. `ld/cohort.gw.ldscore.gz` is the file for the median N. When no group's LD mass differs from it by 0.1% (large samples), it serves every trait and no
-group files are written. `--single-n` writes only that file.
+by name with their traits in `ld/cohort.n_groups.tsv`, next to the files, so the directory can be moved). `summit --h2`
+with `--ldscores ld/cohort` (or `ld/cohort.gw.ldscore.gz`) reads that list, fits each trait with its own group's file
+and writes the file of each trait to `.ldscore_groups.tsv`; with one `--h2` file, a trait not in the list stops the
+run. The results, the log and the `--write-jack` files (`OUT.<phen>.jack`) are where a run with one LD-score file puts
+them; each group's own fit is in `OUT.ldgroups/<k>/`, rebuilt on every run. `--ldscore-groups off` fits every trait
+with the file given. `--rg` uses the file given for both traits. `ld/cohort.gw.ldscore.gz` is the file for the median
+N. When no group's LD mass differs from it by 0.1% (large samples), it serves every trait and no group files are
+written. `--single-n` writes only that file. A compose that writes no list removes an earlier run's.
 
 **The plan.** Before composing, compose logs what it will use, namely the mode and the source of the decay, the source
 of the same-person term, of the relatives and of the background, the cell matrix, the ancestry, the sample sizes and the
@@ -158,7 +166,8 @@ in `ld/cohort.admixed_ld.json`, and logs a warning, when:
 - a panel was not cleaned;
 - the ancestry SD is the derived one (date mode without `--ancestry-sd`);
 - the curve was made with another number of covariates than the GWAS reports;
-- a trait's GWAS N is below 85% of the curve's people;
+- the curve lists no sample statistic;
+- a trait's GWAS N is below 85% of the curve's people (of the statistic's people with `--sample-factors`);
 - the standard errors of some traits give cohort quantities that stand apart from the others.
 
 The json also records every parameter, m and κ_res(0) per trait, and the matching counts.
@@ -177,8 +186,9 @@ person factors (a level, the ancestry proportions and the local-ancestry varianc
 chromosomes separately so that each person's noise cancels, with the realized same-person mass between chromosomes, to
 which compose scales the factor term. It holds no row about a person.
 
-The curve's pass writes it. `sample-factors` makes it on its own, for example for one trait's GWAS sample (see
-[The curve](#the-curve)).
+The curve's pass writes it and lists it in `.curve.json`; compose uses it only when it has the curve's number of
+people and covariates. `sample-factors` makes it on its own, for example for one trait's GWAS sample (see
+[The curve](#the-curve)). Both need SNPs on two or more chromosomes.
 
 The statistic can also hold the sample's realized LD mass in total and between chromosomes. `sample-factors` computes it
 exactly from per-chromosome Gram matrices (the cost of a GRM; `--no-ld-mass` skips it), and `--ld-mass-probes B`
