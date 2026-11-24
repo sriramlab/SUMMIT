@@ -2052,13 +2052,17 @@ def _resolve_njack(args, default):
 
 def _group_file_path(f, table):
     """A file of compose's n_groups.tsv: absolute as written, or relative to the table's own directory (compose writes
-    the file names; its files are next to the table). Tables written before the names held the path as compose's
-    --out gave it, relative to compose's working directory: the file of that name next to the table, else that path
-    from here."""
+    the file names; its files are next to the table, and a bare name is looked up there only). Tables written before
+    the names held the path as compose's --out gave it, with its directory, relative to compose's working directory:
+    for such an entry the file of that name next to the table, else that path from here."""
     f = str(f)
     if os.path.isabs(f):
         return f
     here = os.path.dirname(os.path.abspath(table))
+    if not os.path.dirname(f):
+        # a file name (compose's tables): next to the table only, so that a missing file is reported and never
+        # replaced by a file of the same name from another run in the working directory
+        return os.path.join(here, f)
     for cand in (os.path.join(here, f), os.path.join(here, os.path.basename(f)), f):
         if os.path.exists(cand):
             return cand

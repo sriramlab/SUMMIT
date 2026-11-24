@@ -1814,6 +1814,39 @@ def test_n_groups_table_on_a_rerun_from_any_directory_and_for_one_trait(fam, fam
     assert not os.path.exists(str(tmp_path / "other") + ".results.tsv")
 
 
+def test_group_file_names_resolve_next_to_their_table_only(fam_groups, tmp_path, monkeypatch):
+    """A file name in n_groups.tsv is looked up next to the table only: when it is missing there, --h2 stops with that
+    path and never takes a file of the same name from the working directory (another run's); an old entry with a
+    directory part keeps its fallbacks."""
+    import shutil
+    import subprocess
+    from summit.cli import _ldscore_groups
+    fg = fam_groups
+    tab = pd.read_csv(fg["prefix"] + ".n_groups.tsv", sep="\t")
+    a, b = tmp_path / "runA", tmp_path / "runB"
+    os.makedirs(a)
+    os.makedirs(b)
+    for f in ["c_mix.gw.ldscore.gz", "c_mix.gw.M", "c_mix.n_groups.tsv"] + sorted(set(tab.ldscores)):
+        shutil.copy(fg["dir"] / f, a / f)
+    gone = tab.ldscores[tab.trait == "part0.tsv"].iloc[0]
+    os.remove(a / gone)
+    shutil.copy(fg["dir"] / gone, b / gone)                             # another run's file of the same name
+    monkeypatch.chdir(b)
+    _, t = _ldscore_groups(str(a / "c_mix"))
+    assert t.ldscores[t.trait == "part0.tsv"].iloc[0] == str(a / gone)
+    r = subprocess.run([sys.executable, "-m", "summit", "--h2", str(fg["dir"] / "mix"), "--ldscores",
+                        str(a / "c_mix.gw.ldscore.gz"), "--annot", str(fg["dir"] / "annot_h2.tsv"), "--njack", "20",
+                        "--out", str(tmp_path / "h")], cwd=b, capture_output=True, text=True)
+    assert r.returncode != 0 and f"{a / gone} listed in" in r.stdout + r.stderr and "does not exist" in r.stdout + r.stderr
+    assert not os.path.exists(str(tmp_path / "h") + ".results.tsv")
+    # an entry with a directory part (a table written before the names): the file next to the table, else from here
+    old = pd.DataFrame([dict(trait="part0.tsv", N=1, ldscores=f"res/{gone}")])
+    old.to_csv(a / "old.n_groups.tsv", sep="\t", index=False)
+    os.makedirs(b / "res")
+    shutil.copy(fg["dir"] / gone, b / "res" / gone)
+    assert _ldscore_groups(str(a / "old"))[1].ldscores.iloc[0] == f"res/{gone}"
+
+
 def test_curve_writes_the_sample_statistic_and_compose_uses_it(sim, tmp_path):
     """The curve's pass writes the sample statistic of the same people (as sample-factors run on its own), and compose
     with that curve uses it for the same-person term unless told not to (curve mode's default, 22 Nov 2026)."""
