@@ -677,7 +677,8 @@ def relatedness_term(L, rel, chrom, cm, cls, V, K, nu, grid_cm, scale=1.0, partn
 def release_statistic(curve):
     """The sample statistic released with the curve CURVE (prefix): (path, None), or (None, why) when the curve records
     none (made with --no-sample-factors, before curves carried it, or its pass could not make it). The curve's json
-    lists the statistic its own pass wrote (key sample_factors, a file next to it); a listed statistic that is missing,
+    lists the statistic its own pass wrote (key sample_factors, a file next to it: CURVE.sample_factors.json, or the
+    name listed when the curve's files were renamed without it); a listed statistic that is missing,
     or that is not of the curve's people and covariates (n_samples, covariate_rank: a file left by another run), stops
     the composition. A statistic file next to a curve that does not list it is not used."""
     from .sample_factors import read_sample_factors
@@ -689,9 +690,9 @@ def release_statistic(curve):
     listed = info.get("sample_factors")
     if not listed:
         if "sample_factors" in info:
-            why = (f"the curve {cj} has no sample statistic: its pass could not make one ("
-                   + "; ".join(f["detail"] for f in info.get("flags", []) if f.get("flag") == "sample_factors_not_made")
-                   + ")")
+            notes = [str(f.get("detail")) for f in info.get("flags", []) if f.get("flag") == "sample_factors_not_made"]
+            why = f"the curve {cj} has no sample statistic: its pass could not make one" + (
+                f" ({'; '.join(notes)})" if notes else "")
         else:
             why = (f"the curve {cj} lists no sample statistic (made with --no-sample-factors, or before curves "
                    "carried it)")
@@ -699,9 +700,13 @@ def release_statistic(curve):
             why += (f"; {curve}.sample_factors.json is not the curve's and is not used (pass --sample-factors "
                     f"{curve}.sample_factors.json if it is of the GWAS's people)")
         return None, why
-    path = os.path.join(os.path.dirname(curve), os.path.basename(str(listed)))
-    if not os.path.exists(path):
-        raise ValueError(f"The curve {cj} lists the sample statistic {path}, which does not exist; {remedy}.")
+    # the file next to the curve under its prefix (a curve's files renamed together keep it), else the name listed
+    cands = list(dict.fromkeys([f"{curve}.sample_factors.json",
+                                os.path.join(os.path.dirname(curve), os.path.basename(str(listed)))]))
+    path = next((c for c in cands if os.path.exists(c)), None)
+    if path is None:
+        raise ValueError(f"The curve {cj} lists a sample statistic ({listed}), which does not exist next to it "
+                         f"({' or '.join(cands)}); {remedy}.")
     sfi = read_sample_factors(path)
     bad = [f"{k} {sfi.get(k)} in the statistic, {info.get(k)} in the curve" for k in ("n_samples", "covariate_rank")
            if sfi.get(k) is None or info.get(k) is None or int(sfi[k]) != int(info[k])]

@@ -932,12 +932,14 @@ def test_relatives_term_is_put_on_the_gwas_sample(fam, tmp_path):
     f = N * (N - 1.0) / (2 * n * (2 * n - 1.0))
     assert relatedness_scale(2 * n, N) == f and relatedness_scale(n, N) == 1.0
     out, par = {}, {}
+    # the copy's json says 2n people and its statistic has n, so compose would stop on the statistic (a file of other
+    # people); the same-person term is random mating in every arm here, the relatives' term being the subject
     for c in ("c", "c2"):
         cpref = str(d / "c") if c == "c" else str(tmp_path / "c2")
         for arm, rel in (("none", None), ("profile", "curve"), ("uniform", "uniform"), ("number", 123.0)):
             o = str(tmp_path / f"{c}_{arm}")
             compose_ldscores(str(d / "ref"), [str(d / "ss")], str(d / "annot.tsv"), o, curve=cpref, relatedness=rel,
-                             log=lambda *a: None)
+                             release_sample_factors=False, log=lambda *a: None)
             out[c, arm] = pd.read_csv(o + ".gw.ldscore.gz", sep="\t")
             par[c, arm] = json.load(open(o + ".admixed_ld.json"))
     cols = ["low", "high"]
@@ -962,7 +964,10 @@ def test_relatives_term_is_put_on_the_gwas_sample(fam, tmp_path):
     # the curve and its copy with the same n
     _copy_curve(d / "c", tmp_path / "c1")
     compose_ldscores(str(d / "ref"), [str(d / "ss")], str(d / "annot.tsv"), str(tmp_path / "c1_profile"),
-                     curve=str(tmp_path / "c1"), relatedness="curve", log=lambda *a: None)
+                     curve=str(tmp_path / "c1"), relatedness="curve", release_sample_factors=False, log=lambda *a: None)
+    with pytest.raises(ValueError, match=f"n_samples {n} in the statistic, {2 * n} in the curve"):
+        compose_ldscores(str(d / "ref"), [str(d / "ss")], str(d / "annot.tsv"), str(tmp_path / "c2_sf"),
+                         curve=str(tmp_path / "c2"), dry_run=True, log=lambda *a: None)
     pd.testing.assert_frame_equal(out["c", "profile"], pd.read_csv(f"{tmp_path / 'c1_profile'}.gw.ldscore.gz", sep="\t"))
     with pytest.raises(ValueError, match="at least 2 people"):
         relatedness_scale(1, N)
@@ -1923,9 +1928,12 @@ def test_single_chromosome_curve_makes_no_statistic(sim, tmp_path):
     detail = {f["flag"]: f["detail"] for f in cj["flags"]}["sample_factors_not_made"]
     assert "1 chromosome(s)" in detail
     assert any("WARNING (recorded flag sample_factors_not_made)" in ln for ln in lines)
+    clog = []
     plan = compose_ldscores(str(d / "ref"), [str(d / "ss")], str(d / "annot.tsv"), str(tmp_path / "x"), curve=cv,
-                            mean_ancestry="0.6", kappa0="0.3", allow_flat_kernel_join=True, dry_run=True, log=quiet)
+                            mean_ancestry="0.6", kappa0="0.3", allow_flat_kernel_join=True, dry_run=True,
+                            log=lambda *a, **k: clog.append(" ".join(map(str, a))))
     assert plan["same_person_term"] == "random mating" and "curve_without_sample_factors" in plan["flags"]
+    assert any("could not make one (the SNPs with finite loadings are on 1 chromosome(s)" in ln for ln in clog)
     with pytest.raises(SampleFactorsUnavailable, match="two or more chromosomes"):
         sample_factors(str(tmp_path / "one"), str(d / "ref"), str(tmp_path / "sf"), ld_mass=False, log=quiet)
     assert not os.path.exists(tmp_path / "sf.sample_factors.json")
