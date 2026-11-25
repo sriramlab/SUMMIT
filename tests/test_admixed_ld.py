@@ -2325,3 +2325,32 @@ def test_compose_weighs_a_stochastic_ld_mass_by_its_standard_error(sim, tmp_path
         pj = run(str(tmp_path / f"{name}.sample_factors.json"), name)
         assert abs(pj["ld_mass_check"]["ratio"] - 1 / 1.08) < 1e-9
         assert ("ld_mass_differs_from_cohort" in flags(pj)) is flagged, name
+
+
+def test_between_chromosome_shift_without_a_realized_ld_mass_is_skipped_with_a_flag(sim, tmp_path):
+    """--calibrate-between-chromosomes needs the realized LD mass: with the curve's statistic made without it (the
+    curve's default) or with no statistic, compose writes the uncalibrated LD scores, warns and records the flag
+    between_chromosome_shift_skipped with the reason."""
+    from summit.admixed_ld.compose import compose_ldscores
+    from summit.admixed_ld.curve import genotype_curve
+    d, S = sim["dir"], sim["S"]
+    quiet = lambda *a, **k: None
+    cv = str(tmp_path / "cv")
+    genotype_curve(str(d / "cohort"), str(d / "ref"), cv, covar=str(d / "cohort.cov"), cell_cm=0.5, cells_cm=0,
+                   log=quiet)
+    assert json.load(open(cv + ".sample_factors.json"))["ld_mass"] is None
+    args = (str(d / "ref"), [str(d / "ss")], str(d / "annot.tsv"))
+    kw = dict(mean_ancestry="0.6", kappa0="0.3", allow_flat_kernel_join=True)
+    for arm, extra, why in (("curve", dict(curve=cv), "records no realized LD mass"),
+                            ("date", dict(generations=S["generations"]), "uses no sample statistic")):
+        got, lines = {}, []
+        for cal in (False, True):
+            out = str(tmp_path / f"{arm}_{cal}")
+            compose_ldscores(*args, out, calibrate_between_chromosomes=cal, **extra, **kw,
+                             log=lambda *a, **k: lines.append(" ".join(map(str, a))))
+            got[cal] = pd.read_csv(out + ".gw.ldscore.gz", sep="\t")
+        fl = {f["flag"]: f["detail"] for f in json.load(open(str(tmp_path / f"{arm}_True") + ".admixed_ld.json"))["flags"]}
+        assert why in fl["between_chromosome_shift_skipped"] and "--sample-factors-ld-mass" in fl[
+            "between_chromosome_shift_skipped"]
+        assert any("WARNING (recorded flag between_chromosome_shift_skipped)" in ln for ln in lines)
+        pd.testing.assert_frame_equal(got[False], got[True])

@@ -1641,6 +1641,15 @@ def compose_ldscores(ref_path, sumstats, annot, out, *, sources=None, snps=None,
             mass_check.update(between_chromosome_shift_per_pair=cshift, shift_mass=float(cshift * pairs_btw))
             log(f"[admixed-ld] compose: between-chromosome LD shifted by {cshift:.4g} per V-weighted pair "
                 f"({cshift * pairs_btw:.6g} of mass) to the cohort's realized total")
+    elif calibrate_between_chromosomes:
+        # the shift needs the cohort's realized LD mass, which only a statistic made with it records
+        why = (("the same-person term uses no sample statistic" if sample_factors is None
+                else f"the sample statistic {sfi['path']} records no realized LD mass")
+               + "; make the statistic with its LD mass (curve --sample-factors-ld-mass or --sample-factors-probes B, "
+                 "or sample-factors without --no-ld-mass) and give it to compose")
+        flags.append(dict(flag="between_chromosome_shift_skipped", detail=f"no realized LD mass: {why}"))
+        log("[admixed-ld] WARNING (recorded flag between_chromosome_shift_skipped): --calibrate-between-chromosomes "
+            f"not applied, no realized LD mass: {why}")
     L = L_pop + sp + (0.0 if R1 is None else (rel_scale / nu ** 2) * R1)
     V = Vpop
     groups_info, wrote_groups = None, False
