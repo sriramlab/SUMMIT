@@ -1593,16 +1593,39 @@ def compose_ldscores(ref_path, sumstats, annot, out, *, sources=None, snps=None,
         L_sf = L_pop + sp * (nu / nu_sf) + (0.0 if R1 is None else (f_sf / nu_sf ** 2) * R1)
         comp_tot = float((Vpop[:, None] * L_sf).sum())
         m_ratio = M / float(sfi["n_snps"])
-        real_tot = float(sfi["ld_mass"]["total"]) * m_ratio ** 2
+        lm = sfi["ld_mass"]
+        real_tot = float(lm["total"]) * m_ratio ** 2
+        real_btw = float(lm["between_chromosomes"]) * m_ratio ** 2
+        method = str(lm.get("method", "exact"))                     # statistics before the probes were exact
+        stoch = method == "stochastic"
+        se_tot = float(lm["se_total"]) * m_ratio ** 2 if stoch and lm.get("se_total") is not None else None
+        se_btw = (float(lm["se_between_chromosomes"]) * m_ratio ** 2
+                  if stoch and lm.get("se_between_chromosomes") is not None else None)
         mass_check = dict(composed_total=comp_tot, realized_total=real_tot, ratio=comp_tot / real_tot,
-                          realized_between_chromosomes=float(sfi["ld_mass"]["between_chromosomes"]) * m_ratio ** 2)
+                          realized_between_chromosomes=real_btw, method=method, probes=lm.get("probes"),
+                          se_realized_total=se_tot, se_realized_between_chromosomes=se_btw)
         log(f"[admixed-ld] compose: LD mass {comp_tot:.6g} for the sample factors' {n_sf:.0f} people, against their "
-            f"realized {real_tot:.6g} ({comp_tot / real_tot:.4f})")
-        if abs(comp_tot / real_tot - 1) > 0.05:
-            flags.append(dict(flag="ld_mass_differs_from_cohort", detail=f"composed / realized {comp_tot / real_tot:.4f}"))
+            f"realized {real_tot:.6g} ({comp_tot / real_tot:.4f}"
+            + (f"; stochastic, SE {se_tot:.3g}" if stoch and se_tot is not None else "") + ")")
+        # a stochastic realized mass carries its probes' error: the difference must also exceed 2 SE
+        beyond_noise = not stoch or (se_tot is not None and abs(comp_tot - real_tot) > 2.0 * se_tot)
+        if abs(comp_tot / real_tot - 1) > 0.05 and beyond_noise:
+            flags.append(dict(flag="ld_mass_differs_from_cohort", detail=f"composed / realized {comp_tot / real_tot:.4f}"
+                              + (f" (realized mass stochastic, SE {se_tot:.4g})" if stoch else "")))
             log(f"[admixed-ld] WARNING (recorded flag ld_mass_differs_from_cohort): the composed LD mass is "
                 f"{comp_tot / real_tot:.3f} of the cohort's realized in-sample LD mass")
-        if calibrate_between_chromosomes:
+        shift_skip = None
+        if calibrate_between_chromosomes and stoch and not (se_tot is not None and se_tot <= 0.1 * abs(real_btw)):
+            # the shift puts the whole difference on pairs on different chromosomes, and with it the probes' error
+            shift_skip = (f"the realized LD mass is stochastic ({lm.get('probes')} probes) and the SE of its total "
+                          + (f"({se_tot:.4g}) " if se_tot is not None else "(not recorded) ")
+                          + f"is more than 10% of the realized between-chromosome mass (|{real_btw:.4g}|); more probes "
+                            "(--ld-mass-probes, --sample-factors-probes) or the exact mass make it usable")
+        if calibrate_between_chromosomes and shift_skip is not None:
+            flags.append(dict(flag="between_chromosome_shift_skipped", detail=shift_skip))
+            log(f"[admixed-ld] WARNING (recorded flag between_chromosome_shift_skipped): "
+                f"--calibrate-between-chromosomes not applied: {shift_skip}")
+        elif calibrate_between_chromosomes:
             # the remainder is put on pairs of SNPs on different chromosomes, uniformly per pair (as relatedness is):
             # where unmodelled structure (a source the panels do not represent) shows
             Vc_tot = np.bincount(cls, weights=Vpop, minlength=K)

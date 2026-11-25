@@ -2276,3 +2276,52 @@ def test_sample_factors_ld_mass_and_its_check_in_compose(sim, tmp_path):
         else:
             np.testing.assert_allclose(chk["composed_total"], mass, rtol=1e-6)   # the file holds about 7 digits
             assert 0.8 < chk["ratio"] < 1.25
+
+
+def test_compose_weighs_a_stochastic_ld_mass_by_its_standard_error(sim, tmp_path):
+    """A realized LD mass from probes is recorded in ld_mass_check with its method and SEs; the 5% flag
+    ld_mass_differs_from_cohort needs the difference to exceed 2 SE as well; and --calibrate-between-chromosomes is
+    skipped (flag between_chromosome_shift_skipped) unless the SE of the total is at most 10% of the realized
+    between-chromosome mass, as an exact mass always allows."""
+    from summit.admixed_ld.compose import compose_ldscores
+    from summit.admixed_ld.sample_factors import sample_factors
+    d, S = sim["dir"], sim["S"]
+    quiet = lambda *a, **k: None
+    sf_ex = sample_factors(str(d / "cohort"), str(d / "ref"), str(tmp_path / "ex"), covar=str(d / "cohort.cov"),
+                           log=quiet)
+    sf_st = sample_factors(str(d / "cohort"), str(d / "ref"), str(tmp_path / "st"), covar=str(d / "cohort.cov"),
+                           ld_mass_probes=3, seed=2, log=quiet)
+    run = lambda sf, out, cal=False: (compose_ldscores(
+        str(d / "ref"), [str(d / "ss")], str(d / "annot.tsv"), str(tmp_path / out), generations=S["generations"],
+        mean_ancestry="0.6", kappa0="0.3", sample_factors=sf, calibrate_between_chromosomes=cal, log=quiet),
+        json.load(open(str(tmp_path / out) + ".admixed_ld.json")))[1]
+    flags = lambda pj: {f["flag"]: f["detail"] for f in pj["flags"]}
+    # 3 probes: the SE of the total is far above 10% of the between-chromosome mass, so no shift
+    st = run(str(tmp_path / "st.sample_factors.json"), "st", cal=True)
+    chk = st["ld_mass_check"]
+    assert chk["method"] == "stochastic" and chk["probes"] == 3
+    assert chk["se_realized_total"] > 0.1 * chk["realized_between_chromosomes"]
+    assert "between_chromosome_shift_per_pair" not in chk
+    assert "stochastic" in flags(st)["between_chromosome_shift_skipped"]
+    # the exact mass (and a stochastic one with a small SE) is shifted
+    ex = run(str(tmp_path / "ex.sample_factors.json"), "ex", cal=True)
+    assert ex["ld_mass_check"]["method"] == "exact" and ex["ld_mass_check"]["se_realized_total"] is None
+    assert "between_chromosome_shift_per_pair" in ex["ld_mass_check"]
+    assert "between_chromosome_shift_skipped" not in flags(ex)
+    btw = sf_ex["ld_mass"]["between_chromosomes"]                     # negative here: the SE is compared with |.|
+    small = dict(sf_st, ld_mass=dict(sf_st["ld_mass"], between_chromosomes=btw, se_total=1e-3 * abs(btw)))
+    json.dump(small, open(tmp_path / "small.sample_factors.json", "w"))
+    sm = run(str(tmp_path / "small.sample_factors.json"), "small", cal=True)
+    assert "between_chromosome_shift_per_pair" in sm["ld_mass_check"]
+    # the 5% flag: a realized total 8% above the composed one, exact or stochastic with a small SE, is flagged; with
+    # an SE of 10% of the total (2 SE = 20%) it is not
+    base = ex["ld_mass_check"]
+    m2 = base["realized_total"] / sf_ex["ld_mass"]["total"]             # the SNP-count factor compose applies
+    tot = 1.08 * base["composed_total"] / m2
+    for name, extra, flagged in (("exact8", dict(total=tot), True),
+                                 ("stoch8", dict(total=tot, method="stochastic", probes=10, se_total=1e-3 * tot), True),
+                                 ("noisy8", dict(total=tot, method="stochastic", probes=10, se_total=0.1 * tot), False)):
+        json.dump(dict(sf_ex, ld_mass=dict(sf_ex["ld_mass"], **extra)), open(tmp_path / f"{name}.sample_factors.json", "w"))
+        pj = run(str(tmp_path / f"{name}.sample_factors.json"), name)
+        assert abs(pj["ld_mass_check"]["ratio"] - 1 / 1.08) < 1e-9
+        assert ("ld_mass_differs_from_cohort" in flags(pj)) is flagged, name
