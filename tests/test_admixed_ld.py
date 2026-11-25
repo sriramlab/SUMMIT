@@ -2398,3 +2398,27 @@ def test_compose_compares_the_fingerprints_of_the_curve_and_its_statistic(sim, t
     json.dump(stripped, open(cv + ".sample_factors.json", "w"))
     plan = compose_ldscores(*args, str(tmp_path / "y"), **ckw)                # counts only, recorded
     assert "sample_factors_without_fingerprint" in plan["flags"]
+
+
+def test_h2_over_ldscore_groups_checks_each_traits_sample_size(fam_groups, tmp_path):
+    """--h2 with compose's n_groups.tsv stops when a trait's summary statistics have another median N than the table
+    gives it (beyond compose's 1%): a GWAS rerun on other people under the same file name is not fitted with the
+    earlier sample's LD scores. Within the tolerance it runs."""
+    import shutil
+    fg = fam_groups
+    for k, (scale, ok) in enumerate(((0.9, False), (1.004, True))):
+        mix = tmp_path / f"mix{k}"
+        shutil.copytree(fg["dir"] / "mix", mix)
+        t = pd.read_csv(mix / "part0.tsv", sep="\t")
+        t["N"] = np.round(t.N * scale).astype(int)
+        t.to_csv(mix / "part0.tsv", sep="\t", index=False)
+        for h2 in (mix, mix / "part0.tsv"):                             # a directory, and one file
+            out = str(tmp_path / f"h{k}_{h2.name}")
+            r = _summit_h2(fg, "--h2", str(h2), "--ldscores", fg["prefix"] + ".gw.ldscore.gz", "--out", out,
+                           check=False)
+            assert (r.returncode == 0) is ok, r.stdout[-2000:] + r.stderr[-2000:]
+            if not ok:
+                msg = r.stdout + r.stderr
+                assert f"median N {int(round(fg['n_sub'] * scale))}" in msg and "part0.tsv the LD scores composed for N" \
+                    f" {fg['n_sub']}" in msg, msg[-2000:]
+                assert not os.path.exists(out + ".results.tsv")

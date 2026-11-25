@@ -2086,6 +2086,41 @@ def _ldscore_groups(ldscores):
     return prefix, tab
 
 
+_GROUP_N_TOL = 0.01                        # compose's default --n-tol: the traits' N that share a group file
+
+
+def _sumstats_median_n(path):
+    """The median N of a summary-statistics file over its SNPs with finite N, BETA and SE, as compose takes it (the
+    columns found as Sumstats.from_file finds them), read without the rest of the file."""
+    from .sumstats.sumstats import _maybe_find_column
+    hdr = utils._read_csv_maybe_chr_split(path, sep=r"\s+", compression="infer", nrows=0)
+    cols = list(hdr.columns)
+    ncol = _maybe_find_column(cols, ["OBS_CT", "obs_ct", "N", "n"]) or utils._parse_column_name(hdr, ["N", "n"], 3)
+    use = list(dict.fromkeys(c for c in (ncol, _maybe_find_column(cols, ["BETA", "beta"]),
+                                         _maybe_find_column(cols, ["SE", "se", "STDERR", "stderr"])) if c is not None))
+    df = pd.read_csv(path, sep=r"\s+", compression="infer", usecols=use).apply(pd.to_numeric, errors="coerce")
+    ok = np.isfinite(df.to_numpy(np.float64)).all(axis=1)
+    if not ok.any():
+        raise ValueError(f"{path} has no SNP with finite N, BETA and SE.")
+    return float(np.median(df[ncol].to_numpy(np.float64)[ok]))
+
+
+def _check_group_n(trait, path, tab, prefix, log):
+    """A trait's summary statistics must have the N that compose composed its group file for (the table's N, within
+    compose's default tolerance): a GWAS rerun on other people under the same file name would otherwise be fitted
+    with the LD scores of the earlier sample."""
+    if "N" not in tab.columns:
+        log._log(f"[h2] note: {prefix}.n_groups.tsv has no N column; the GWAS sample size of {trait} is not checked")
+        return
+    n_tab = float(pd.to_numeric(tab.loc[tab.trait.astype(str) == trait, "N"], errors="coerce").iloc[0])
+    n_ss = _sumstats_median_n(path)
+    if not np.isfinite(n_tab) or abs(n_ss - n_tab) > _GROUP_N_TOL * n_tab:
+        raise ValueError(f"The summary statistics {path} have median N {n_ss:.0f}, and {prefix}.n_groups.tsv gives "
+                         f"{trait} the LD scores composed for N {n_tab:.0f} (more than {_GROUP_N_TOL:.0%} apart): "
+                         "these are not the summary statistics that were composed. Compose them again, or fit with "
+                         "--ldscore-groups off and the LD scores of their own sample.")
+
+
 def _clear_ldgroups(root):
     """Remove what an earlier --h2 over compose's LD-score groups left in ROOT (OUT.ldgroups): each group's ss directory
     of links to the summary statistics and its fit.* outputs. Every run then links and fits only its own traits (a
@@ -2144,6 +2179,8 @@ def _dispatch_h2_groups(args, log, prefix, tab):
     for f in files:
         if not os.path.exists(f):
             raise ValueError(f"The group LD-score file {f} listed in {prefix}.n_groups.tsv does not exist.")
+    for b in base_of:
+        _check_group_n(b, base_of[b], tab, prefix, log)
     log._log(f"[h2] {prefix}.n_groups.tsv: {len(base_of)} traits in {len(files)} LD-score groups; each trait is fitted "
              "with its own group's file (--ldscore-groups off fits every trait with --ldscores)")
     root = f"{args.out}.ldgroups"
@@ -2210,6 +2247,7 @@ def _dispatch_h2(args, log):
         f = str(row.ldscores.iloc[0])
         if not os.path.exists(f):
             raise ValueError(f"The group LD-score file {f} listed in {prefix}.n_groups.tsv does not exist.")
+        _check_group_n(b, str(args.h2), tab, prefix, log)
         log._log(f"[h2] {b}: LD scores {f} ({prefix}.n_groups.tsv)")
         args.ldscores = f
 
