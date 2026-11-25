@@ -57,40 +57,6 @@ def _cohort_samples(blocks_path, covar, keep, log):
     return samples, rows, np.asarray(C, dtype=np.float64)
 
 
-def cohort_fingerprint(covar, variants, t_idx) -> dict:
-    """SHA-256 fingerprints of what a pass over the cohort used, without anything derived from the participants' IDs
-    (released aggregates carry no such hash): the sorted covariate column names of --covar (FID and IID left out) and
-    the sorted cohort variants matched to the reference (CHR:BP:SNP:COUNTED:OTHER of t_idx, before any filter of the
-    pass). The curve and sample-factors write it into their jsons; whether a statistic is the curve's own is told by
-    the checksum of the statistic that the curve records (sample_factors_sha256)."""
-    import hashlib
-
-    def sha(lines):
-        return hashlib.sha256("\n".join(lines).encode()).hexdigest()
-
-    cov = [] if covar is None else sorted(str(c) for c in pd.read_csv(covar, sep=r"\s+", nrows=0).columns
-                                         if c not in ("FID", "IID"))
-    v = variants.iloc[np.asarray(t_idx, np.int64)]
-    snps = (v["CHR"].astype(str) + ":" + v["BP"].astype(str) + ":" + v["SNP"].astype(str) + ":"
-            + v["COUNTED"].astype(str) + ":" + v["OTHER"].astype(str)).to_numpy()
-    parts = dict(covariates=sha(cov), snps=sha(sorted(snps)))
-    return dict(sha256=sha([parts["covariates"], parts["snps"]]), **parts, n_covariate_columns=len(cov),
-                n_snps_matched=int(snps.size),
-                definition="SHA-256 of the sorted covariate column names and of the sorted cohort variants matched to "
-                           "the reference (CHR:BP:SNP:COUNTED:OTHER); sha256 is that of the two. Nothing derived "
-                           "from the participants' IDs")
-
-
-def file_sha256(path) -> str:
-    """SHA-256 of a file's bytes."""
-    import hashlib
-    h = hashlib.sha256()
-    with open(path, "rb") as fh:
-        for chunk in iter(lambda: fh.read(1 << 20), b""):
-            h.update(chunk)
-    return h.hexdigest()
-
-
 class _PairRelatedness:
     """Relatedness of relative pairs in the covariate-adjusted, standardized genotypes, accumulated over blocks:
     g_ab = (1/M) sum_j x_aj x_bj with x_j = (g_j - C C' g_j) / sd_res_j. `a`, `b`: positions within the cohort rows."""
@@ -523,9 +489,8 @@ def genotype_curve(geno, ref_path, out, *, sources=None, covar=None, keep=None, 
     """The weighted-LD curve of the cohort for two or more sources. sample_factors: also the sample statistic of
     the same people with the same covariates (as `summit admixed-ld sample-factors` gives it), accumulated in this same
     pass over the genotypes on the SNPs with finite loadings, written to out.sample_factors.json (made_by 'curve'; a
-    file there that a curve did not write stops the curve before its pass; the file's SHA-256 is recorded in the
-    curve's json as sample_factors_sha256) and used by compose with this curve (curve mode's same-person term); its
-    realized LD mass
+    file there that a curve did not write stops the curve before its pass) and used by compose with this curve (curve
+    mode's same-person term); its realized LD mass
     only with sample_factors_ld_mass (exact, a GRM's cost) or sample_factors_probes > 0 (stochastic). On one chromosome
     (or halves whose loadings leave the factors unidentified) no statistic is made: the json then has sample_factors
     null and the flag sample_factors_not_made. With cells_cm, also the genome-wide matrix of
@@ -582,7 +547,6 @@ def genotype_curve(geno, ref_path, out, *, sources=None, covar=None, keep=None, 
     t_idx, r_idx, flip = match_variants(blocks.variants, rv, how=match, drop_ambiguous=drop_ambiguous,
                                         report=match_info)
     check_match(match_info, "curve: the cohort", log)
-    fingerprint = cohort_fingerprint(covar, blocks.variants, t_idx)   # as sample-factors computes it
     sign = np.where(flip, -1.0, 1.0)
     P = np.column_stack([rv[f"p_{s}"].to_numpy()[r_idx] for s in sources])
     D = (P[:, :-1] - P[:, -1:]) * sign[:, None]                 # contrasts, oriented to the cohort's counted allele
@@ -762,7 +726,7 @@ def genotype_curve(geno, ref_path, out, *, sources=None, covar=None, keep=None, 
     U_th = (th_num + th_c[None, :]) @ np.linalg.inv(th_den)    # people x k1: ancestries of the non-baseline sources
     info = dict(format="summit-admixed-ld-curve", version=1, sources=list(sources), baseline=sources[-1],
                 n_samples=int(N), n_snps=int(t_idx.size), covariate_rank=int(p_rank), cell_cm=float(cell_cm),
-                fingerprint=fingerprint, noise_correction=bool(noise_correction),
+                noise_correction=bool(noise_correction),
                 panel_n_freq={s: float(ref.n_freq[s]) for s in sources},
                 max_cm=float(max_cm), inter_matrix=inter.tolist(), fit_per_source=fits,
                 match=dict(match_info, drop_ambiguous=bool(drop_ambiguous)), strand_check=strand,
@@ -872,12 +836,9 @@ def genotype_curve(geno, ref_path, out, *, sources=None, covar=None, keep=None, 
     if sample_factors and sf_info is not None:
         from .sample_factors import write_sample_factors
         sf_info["made_by"] = "curve"
-        sf_info["fingerprint"] = fingerprint
         _check_statistic_overwrite(out)                        # again: a file may have appeared during the pass
         write_sample_factors(out, sf_info, log)
         info["sample_factors"] = f"{os.path.basename(out)}.sample_factors.json"
-        # the checksum of the file just written: compose takes the listed statistic only while it is this file
-        info["sample_factors_sha256"] = file_sha256(f"{out}.sample_factors.json")
     elif sample_factors:
         info["sample_factors"] = None
         info["flags"].append(dict(flag="sample_factors_not_made", detail=sf_skip))

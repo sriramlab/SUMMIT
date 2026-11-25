@@ -1891,7 +1891,6 @@ def test_curve_writes_the_sample_statistic_and_compose_uses_it(sim, tmp_path):
     strip = lambda j: json.loads(json.dumps(j).replace(cv0, "OUT").replace(cv, "OUT"))
     j1, j0 = json.load(open(cv + ".curve.json")), json.load(open(cv0 + ".curve.json"))
     j1.pop("sample_factors")
-    j1.pop("sample_factors_sha256")
     assert strip(j1) == strip(j0)
     for k in ("S1_upper", "S2_upper"):
         np.testing.assert_array_equal(np.load(cv + ".cells.npz")[k], np.load(cv0 + ".cells.npz")[k])
@@ -2371,66 +2370,6 @@ def test_between_chromosome_shift_without_a_realized_ld_mass_is_skipped_with_a_f
             "between_chromosome_shift_skipped"]
         assert any("WARNING (recorded flag between_chromosome_shift_skipped)" in ln for ln in lines)
         pd.testing.assert_frame_equal(got[False], got[True])
-
-
-def test_compose_takes_the_curves_statistic_only_with_its_recorded_checksum(sim, tmp_path):
-    """The curve records the SHA-256 of the statistic it wrote (sample_factors_sha256) and nothing derived from the
-    participants' IDs; compose stops when the file at that path was replaced, even by the statistic of other people of
-    the same number and covariate rank (which the counts and the covariate/SNP fingerprint let through), and takes
-    such a file only through --sample-factors. A curve without the checksum gets the counts and a flag."""
-    import hashlib
-    import shutil
-    from summit.admixed_ld.compose import compose_ldscores
-    from summit.admixed_ld.curve import file_sha256, genotype_curve
-    from summit.admixed_ld.sample_factors import sample_factors
-    d = sim["dir"]
-    quiet = lambda *a, **k: None
-    fam = pd.read_csv(str(d / "cohort") + ".fam", sep=r"\s+", header=None, dtype=str)
-    for nm, sl in (("a", slice(0, -10)), ("b", slice(10, None))):          # 10 people swapped, the same number
-        fam.iloc[sl, :2].to_csv(tmp_path / f"keep_{nm}.txt", sep="\t", header=False, index=False)
-    cv = str(tmp_path / "cv")
-    kw = dict(covar=str(d / "cohort.cov"), log=quiet)
-    _, cinfo = genotype_curve(str(d / "cohort"), str(d / "ref"), cv, keep=str(tmp_path / "keep_a.txt"), cell_cm=0.5,
-                              cells_cm=0, **kw)
-    assert cinfo["sample_factors_sha256"] == file_sha256(cv + ".sample_factors.json")
-    own = json.load(open(cv + ".sample_factors.json"))
-    alone = sample_factors(str(d / "cohort"), str(d / "ref"), str(tmp_path / "alone"), keep=str(tmp_path / "keep_a.txt"),
-                           ld_mass=False, **kw)
-    other = sample_factors(str(d / "cohort"), str(d / "ref"), str(tmp_path / "other"),
-                           keep=str(tmp_path / "keep_b.txt"), ld_mass=False, **kw)
-    nocov = sample_factors(str(d / "cohort"), str(d / "ref"), str(tmp_path / "nocov"), keep=str(tmp_path / "keep_a.txt"),
-                           ld_mass=False, log=quiet)
-    fp = cinfo["fingerprint"]
-    assert set(fp) >= {"covariates", "snps"} and "samples" not in fp
-    assert own["fingerprint"] == fp and alone["fingerprint"] == fp and other["fingerprint"] == fp
-    assert nocov["fingerprint"]["covariates"] != fp["covariates"] and nocov["fingerprint"]["snps"] == fp["snps"]
-    assert own["n_samples"] == other["n_samples"] and own["covariate_rank"] == other["covariate_rank"]
-    # no hash of the people's IDs in the released files
-    ids = sorted(fam[0] + "\t" + fam[1])
-    id_hashes = {hashlib.sha256("\n".join(x).encode()).hexdigest() for x in (ids, ids[:-10], ids[10:])}
-    for f in (cv + ".curve.json", cv + ".sample_factors.json", str(tmp_path / "other.sample_factors.json")):
-        assert not any(h in open(f).read() for h in id_hashes)
-    args = (str(d / "ref"), [str(d / "ss")], str(d / "annot.tsv"))
-    ckw = dict(curve=cv, mean_ancestry="0.6", kappa0="0.3", allow_flat_kernel_join=True, dry_run=True, log=quiet)
-    plan = compose_ldscores(*args, str(tmp_path / "ok"), **ckw)
-    assert plan["same_person_term"].startswith("the sample statistic released")
-    assert "sample_factors_without_fingerprint" not in plan["flags"]
-    shutil.copy(tmp_path / "other.sample_factors.json", cv + ".sample_factors.json")   # another run's, same size
-    with pytest.raises(ValueError, match="was replaced after the curve .*--sample-factors PATH explicitly"):
-        compose_ldscores(*args, str(tmp_path / "x"), **ckw)
-    plan = compose_ldscores(*args, str(tmp_path / "explicit"), sample_factors=str(tmp_path / "other.sample_factors.json"),
-                            **ckw)
-    assert "released" not in plan["same_person_term"]
-    # a curve without the checksum (made before it): the counts let the same-size file through, with the flag
-    cj = json.load(open(cv + ".curve.json"))
-    cj.pop("sample_factors_sha256")
-    json.dump(cj, open(cv + ".curve.json", "w"))
-    plan = compose_ldscores(*args, str(tmp_path / "y"), **ckw)
-    assert "sample_factors_without_fingerprint" in plan["flags"]
-    shutil.copy(tmp_path / "nocov.sample_factors.json", cv + ".sample_factors.json")   # other covariates: still stops
-    with pytest.raises(ValueError, match="covariate_rank 0 in the statistic, 2 in the curve; their fingerprints differ "
-                                         "in the covariate columns"):
-        compose_ldscores(*args, str(tmp_path / "z"), **ckw)
 
 
 def test_h2_over_ldscore_groups_checks_each_traits_sample_size(fam_groups, tmp_path):

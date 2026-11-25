@@ -132,16 +132,9 @@ smoothed as a constant plus decaying exponentials fitted from 3 cM on, and the p
 the band. In the squared admixture LD, the cell matrix takes the place of the kernel for pairs of SNPs whose 2-cM
 cells have midpoints at least 10 cM apart on a chromosome, and for pairs on different chromosomes. Both are used whenever the curve has them; `--relatedness none` and
 `--no-cell-matrix` leave them out. The same-person term comes from the sample statistic that the curve's `.curve.json`
-lists. The curve records the SHA-256 checksum of the statistic it wrote (`sample_factors_sha256` in `.curve.json`), and
-compose stops when the file at that path has another checksum, that is, when it was replaced after the curve; another
-statistic is given with `--sample-factors PATH`. Compose also stops when the file is missing, when its number of
-people or covariate rank differs from the curve's, and when its fingerprint differs from the curve's. The fingerprint,
-which the curve and `sample-factors` write, is a SHA-256 hash of the sorted covariate column names and of the cohort's
-variants matched to the reference. Nothing in these files is derived from the participants' IDs, so a statistic of
-other people of the same number, covariate names and SNPs is told apart only by the checksum. For curves written
-before the checksum (24 Nov 2026) only the counts (and the fingerprints, when both files carry one) are compared, with
-the flag
-`sample_factors_without_fingerprint`. A curve that lists no statistic (made with
+lists. Compose stops when that file is missing, or when its number of people or covariate rank differs from the
+curve's (a file of another run); another statistic is given with `--sample-factors PATH`. A curve that lists no
+statistic (made with
 `--no-sample-factors`, or on one chromosome) gives the
 random-mating term, with the flag `curve_without_sample_factors`. `--no-sample-factors` composes it under random mating
 instead, as date mode does, and `--sample-factors FILE` gives another statistic. Compose stops when the curve at 2 cM is above κ_res(0) of the standard errors,
@@ -184,7 +177,7 @@ in `ld/cohort.admixed_ld.json`, and logs a warning, when:
 - a panel was not cleaned;
 - the ancestry SD is the derived one (date mode without `--ancestry-sd`);
 - the curve was made with another number of covariates than the GWAS reports;
-- the curve lists no sample statistic, or records no checksum of it (a curve written before 24 Nov 2026);
+- the curve lists no sample statistic;
 - a trait's GWAS N is below 85% of the curve's people (of the statistic's people with `--sample-factors`);
 - `--calibrate-between-chromosomes` could not be applied;
 - the standard errors of some traits give cohort quantities that stand apart from the others.
@@ -205,8 +198,8 @@ person factors (a level, the ancestry proportions and the local-ancestry varianc
 chromosomes separately so that each person's noise cancels, with the realized same-person mass between chromosomes, to
 which compose scales the factor term. It holds no row about a person.
 
-The curve's pass writes it and lists it in `.curve.json` with its checksum; compose uses it only when it is the file
-the curve wrote (the same checksum, number of people, covariate rank and fingerprint, see [Compose](#compose)). `sample-factors` makes it on its own, for example
+The curve's pass writes it and lists it in `.curve.json`; compose uses it when its number of people and covariate
+rank are the curve's (see [Compose](#compose)). `sample-factors` makes it on its own, for example
 for one trait's GWAS sample (see [The curve](#the-curve)); give that file another `--out` than the curve's. Both need
 SNPs on two or more chromosomes.
 

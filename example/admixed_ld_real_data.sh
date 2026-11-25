@@ -46,8 +46,7 @@ summit admixed-ld clean-panels --ref "$OUT/ref" "${PANEL_ARGS[@]}" --names "$NAM
 # 3,800-6,100 people at 405,807 SNPs, 3 GB. Writes aggregates only (may leave the controlled environment):
 # curve.curve.tsv, .curve.json, .background.tsv, .cells.npz, .sample_factors.json (the sample statistic, which compose
 # uses for the same-person term) and, with related pairs, .relatedness.tsv and .relatedness_chr.npz. The jsons record
-# the number of people and of related pairs (check them against the cohort's rules on small counts), SHA-256 hashes of
-# the covariate names and the SNPs, and the checksum of the statistic; nothing is derived from the participants' IDs.
+# the number of people and of related pairs (check them against the cohort's rules on small counts).
 summit admixed-ld curve --geno "$COHORT" --ref "$OUT/ref_clean" --keep "$GWAS_SAMPLE" --covar "$GWAS_COV" \
   --relative-pairs "$PAIRS" --threads 8 --out "$OUT/curve"
 
