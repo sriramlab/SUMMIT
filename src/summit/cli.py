@@ -302,10 +302,11 @@ def build_parser() -> argparse.ArgumentParser:
     inputs.add_argument("--ldscore-groups", choices=["auto", "off"], default="auto",
                         help="--h2 with a SUMMIT-MIX compose output whose traits have different GWAS samples: 'auto' "
                              "(default) reads PREFIX.n_groups.tsv next to --ldscores and fits each trait with its own "
-                             "group's LD-score file (a trait missing from the table stops the run); 'off' fits every "
-                             "trait with the file given. With groups, OUT.results.tsv, OUT.log and the --write-jack "
-                             "files OUT.<phen>.jack are those of a single-file run; each group's own fit is in "
-                             "OUT.ldgroups/<k>/ (rebuilt on every run).")
+                             "group's LD-score file (a trait missing from the table, or whose median N is more than 1%% "
+                             "from the table's, stops the run); 'off' fits every trait with the file given. With "
+                             "groups, OUT.results.tsv, OUT.log and the --write-jack files OUT.<phen>.jack are those of "
+                             "a single-file run; each group's own fit is in OUT.ldgroups/<k>/ (rebuilt on every run, "
+                             "and removed with OUT.ldscore_groups.tsv by a later run with one file to the same --out).")
     inputs.add_argument("--ldscores-reg", default=None, type=str,
                         help=(
                             "Optional LD-score file used only for summary-only overlap-covariance estimation. "

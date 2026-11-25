@@ -253,8 +253,9 @@ def sample_factors(geno, ref_path, out, *, sources=None, covar=None, keep=None, 
     Gram matrix is its diagonal, each person's sum of y over the chromosome (exact, from the factors' own pass), plus an
     off-diagonal part E_c whose squared Frobenius norm is estimated with B Rademacher probes Z (seed),
     ||E_c||^2 ~ mean_b ||E_c z_b||^2, from G_c Z = X~_c (X~_c' Z); G Z is the sum over chromosomes. The diagonal carries
-    most of <G_c, G_c>, so a few hundred probes give the masses to about 1% (their standard errors over the probes
-    are recorded). The curve's pass computes the same statistic with FactorAccumulator (genotype_curve)."""
+    most of <G_c, G_c>, so a few hundred probes give the total mass to about 1%; the between-chromosome mass is a small
+    difference of large sums and much less precise (their standard errors over the probes are recorded, and compose
+    weighs them). The curve's pass computes the same statistic with FactorAccumulator (genotype_curve)."""
     from .curve import _cohort_samples, cohort_fingerprint
     t0 = time.perf_counter()
     ref = Reference(ref_path)

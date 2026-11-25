@@ -101,8 +101,9 @@ summit admixed-ld clean-panels --ref ref/afr_eur --panel ref/afr --panel ref/eur
 covariates, principal components included (`--covar`). `--relative-pairs` lists related pairs, for example pairs with
 relatedness above 0.0442 in a GRM. The output is under a megabyte of numbers by distance, a matrix between 2-cM segments
 of the genome (about 27 MB for two sources) and the sample statistic (`cohort.sample_factors.json`), which compose uses
-for the same-person term. None of it describes a person. It takes 10 to 15 minutes on 8 cores for 4,000 to 6,000 people
-at array density.
+for the same-person term. None of it describes a person; the curve and its statistic carry a SHA-256 hash of the
+people's IDs, the covariate names and the SNPs, so that compose can tell the curve's statistic from another run's. It
+takes 10 to 15 minutes on 8 cores for 4,000 to 6,000 people at array density.
 
 ```bash
 summit admixed-ld curve --geno cohort --ref ref/afr_eur_clean --keep gwas_sample.txt --covar gwas.cov \
@@ -111,8 +112,9 @@ summit admixed-ld curve --geno cohort --ref ref/afr_eur_clean --keep gwas_sample
 
 **3. Compose the LD scores.** `--sumstats` takes SUMMIT summary statistics (files or a directory). `--annot` is the
 annotation you will fit with, such as MAF and LD bins. Its columns may overlap, for example MAF and LD bins with coding
-regions as a further column. Compose takes each trait's sample size and ancestry from its summary statistics, and logs
-a short plan of what it will use before it starts. `--dry-run` stops after the plan.
+regions as a further column. Compose takes each trait's sample size from its summary statistics and the ancestry from
+the median over the traits' standard errors, and logs a short plan of what it will use before it starts. `--dry-run`
+stops after the plan.
 
 ```bash
 # curve mode
@@ -125,7 +127,8 @@ summit admixed-ld compose --ref ref/afr_eur_clean --sumstats gwas/ --annot annot
 When the traits' sample sizes differ, compose writes one LD-score file per sample size and lists each trait's file in
 `ld/cohort.n_groups.tsv`.
 
-**4. Fit.** Given the compose output, `summit --h2` reads that list and fits each trait with its own file.
+**4. Fit.** Given the compose output, `summit --h2` reads that list and fits each trait with its own file. It stops for
+a trait that the list does not hold, or whose summary statistics have another N than the ones composed.
 
 ```bash
 summit --h2 gwas/ --ldscores ld/cohort --annot annot.tsv.gz --out results/h2

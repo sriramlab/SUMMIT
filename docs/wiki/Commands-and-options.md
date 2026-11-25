@@ -47,9 +47,9 @@ curve (curve mode, the default) or a published admixture date (date mode). See
 |---|---|---|
 | `reference` | unadmixed panels of the sources, a genetic map | the reference (once per set of panels) |
 | `clean-panels` | the reference and its panels | a reference without the panels' own admixture LD, with their background |
-| `curve` | the cohort's genotypes, the GWAS sample and covariates, related pairs | aggregates only (curve mode) |
+| `curve` | the cohort's genotypes, the GWAS sample and covariates, related pairs | aggregates only (curve mode), the sample statistic included |
 | `compose` | reference, summary statistics, annotation, curve or `--admixture-generations` | `.gw.ldscore.gz`, `.gw.M`, `.admixed_ld.json` |
-| `sample-factors` | the GWAS sample's genotypes and covariates | aggregates only (samples of a few hundred) |
+| `sample-factors` | the genotypes and covariates of one GWAS sample (for example a trait measured in part of the cohort) | its sample statistic alone (aggregates only); the curve makes the cohort's own |
 | `derive` | an admixed cohort that carries a source without a panel, and anchor members | a reference with that source |
 | `matrix` | reference, compose's `.admixed_ld.json`, a region, optionally the GWAS | a regional LD matrix, the aligned z-scores and the predicted error of its entries |
 | `finemap-variance` | a matrix with `--error-variance` and a first SuSiE fit's posterior | the residual variance of the second fit |

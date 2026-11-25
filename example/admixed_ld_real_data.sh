@@ -44,14 +44,21 @@ summit admixed-ld clean-panels --ref "$OUT/ref" "${PANEL_ARGS[@]}" --names "$NAM
 # ------------------------------------------------------------------------------------------------ 2. curve (cohort)
 # Curve mode. Run where the genotypes are, on the GWAS's people with the GWAS's covariates. 9-16 minutes on 8 cores for
 # 3,800-6,100 people at 405,807 SNPs, 3 GB. Writes aggregates only (may leave the controlled environment):
-# curve.curve.tsv, .curve.json, .background.tsv, .cells.npz (and .relatedness.tsv, .relatedness_chr.npz). The json
-# records the number of people and of related pairs; check them against the cohort's rules on small counts.
+# curve.curve.tsv, .curve.json, .background.tsv, .cells.npz, .sample_factors.json (the sample statistic, which compose
+# uses for the same-person term) and, with related pairs, .relatedness.tsv and .relatedness_chr.npz. The jsons record
+# the number of people and of related pairs, and a SHA-256 hash of the people's IDs, the covariate names and the SNPs;
+# check them against the cohort's rules on small counts.
 summit admixed-ld curve --geno "$COHORT" --ref "$OUT/ref_clean" --keep "$GWAS_SAMPLE" --covar "$GWAS_COV" \
   --relative-pairs "$PAIRS" --threads 8 --out "$OUT/curve"
 
-# 2b (optional, a few hundred people only): the sample statistic, the cost of a GRM; aggregates only.
-# summit admixed-ld sample-factors --geno "$COHORT" --ref "$OUT/ref_clean" --keep "$GWAS_SAMPLE" --covar "$GWAS_COV" \
-#   --threads 8 --out "$OUT/sample"
+# 2b (optional): a trait measured in only part of the cohort. compose flags a GWAS N below 85% of the curve's people
+# (gwas_sample_smaller_than_release); compose such a trait alone with the sample statistic of its own people and the
+# GWAS covariates (aggregates only; by default with its exact realized LD mass, the cost of a GRM, which --no-ld-mass
+# skips), under another --out than the curve's (TRAIT_SAMPLE: FID IID of the trait's people):
+# summit admixed-ld sample-factors --geno "$COHORT" --ref "$OUT/ref_clean" --keep "$TRAIT_SAMPLE" --covar "$GWAS_COV" \
+#   --threads 8 --out "$OUT/trait_sf"
+# summit admixed-ld compose --ref "$OUT/ref_clean" --sumstats "$SUMSTATS/trait.tsv" --annot "$ANNOT" \
+#   --curve "$OUT/curve" --sample-factors "$OUT/trait_sf" --out "$OUT/ld_trait"
 
 # ------------------------------------------------------------------------------------------------ 3. compose (anyone)
 # About 6 minutes on one core and 3 GB at array density, half of it writing one file per GWAS sample size; linear in

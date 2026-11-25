@@ -125,12 +125,15 @@ def main(argv=None):
                    help=argparse.SUPPRESS)
     c.add_argument("--no-sample-factors", dest="sample_factors", action="store_false", default=True,
                    help="do not write the sample statistic (PREFIX.sample_factors.json: the covariance of a few "
-                        "person-level factors and the realized same-person mass, one more O(N M) pass), which compose "
-                        "uses with this curve for the same-person term")
+                        "person-level factors and the realized same-person mass, accumulated in the curve's own pass "
+                        "at O(N M) extra operations), which compose uses with this curve for the same-person term. "
+                        "Without this option the curve stops when PREFIX.sample_factors.json exists and was not "
+                        "written by a curve")
     c.add_argument("--sample-factors-ld-mass", action="store_true",
                    help="also record the realized in-sample LD mass in the sample statistic (exact, a GRM's cost)")
     c.add_argument("--sample-factors-probes", type=int, default=0,
-                   help="record the realized in-sample LD mass estimated with this many random probes (O(N M B))")
+                   help="record the realized in-sample LD mass estimated with this many random probes (O(N M B); the "
+                        "total to about 1%% with a few hundred, the between-chromosome part much less precisely)")
     c.add_argument("--no-background", dest="background", action="store_false",
                    help="leave out the background term (by default it is measured; it is part of curve mode)")
     c.add_argument("--background", dest="background", action="store_true", default=True,
@@ -219,7 +222,10 @@ def main(argv=None):
     m.add_argument("--calibrate-between-chromosomes", action="store_true",
                    help="with sample factors that carry the cohort's realized LD mass: put the difference between it and "
                         "the composed mass on pairs of SNPs on different chromosomes, uniformly per pair (for structure "
-                        "the sources do not represent); by default the difference is only checked and recorded")
+                        "the sources do not represent); by default the difference is only checked and recorded. Skipped "
+                        "with the flag between_chromosome_shift_skipped when the statistic has no realized LD mass "
+                        "(the curve's default) or a stochastic one whose total has an SE above 10%% of the "
+                        "between-chromosome mass")
     m.add_argument("--single-n", action="store_true",
                    help="write only the LD-score file for the traits' median N (by default, traits whose N differ by more "
                         "than 1%% get one file per sample size, listed in PREFIX.n_groups.tsv: the same-person and "
@@ -275,8 +281,9 @@ def main(argv=None):
                    help="largest memory for the two n x n matrices of the LD mass; above it the mass is skipped")
     f.add_argument("--ld-mass-probes", type=int, default=0,
                    help="estimate the realized LD mass with this many random probes, at O(n M B) instead of a GRM's "
-                        "O(n^2 M) (each Gram matrix's diagonal is exact; a few hundred probes give it to about 1%%, with "
-                        "its standard error recorded). Default 0: exact")
+                        "O(n^2 M) (each Gram matrix's diagonal is exact; a few hundred probes give the total to about "
+                        "1%%, the between-chromosome part, a small difference of large sums, much less precisely; both "
+                        "standard errors are recorded). Default 0: exact")
     f.add_argument("--seed", type=int, default=0, help="seed of the probes (--ld-mass-probes)")
     f.add_argument("--drop-ambiguous", action="store_true",
                     help="leave out strand-ambiguous (A/T, C/G) SNPs, which are otherwise matched as listed; use it when the "
