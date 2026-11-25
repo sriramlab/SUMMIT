@@ -2422,3 +2422,26 @@ def test_h2_over_ldscore_groups_checks_each_traits_sample_size(fam_groups, tmp_p
                 assert f"median N {int(round(fg['n_sub'] * scale))}" in msg and "part0.tsv the LD scores composed for N" \
                     f" {fg['n_sub']}" in msg, msg[-2000:]
                 assert not os.path.exists(out + ".results.tsv")
+
+
+def test_h2_with_one_file_removes_an_earlier_group_runs_outputs(fam_groups, tmp_path):
+    """A --h2 run with one LD-score file to an --out where a run over LD-score groups left OUT.ldscore_groups.tsv and
+    OUT.ldgroups/ removes them (logged), so they cannot describe the new results; files that --h2 did not make in
+    OUT.ldgroups/ are left in place."""
+    fg = fam_groups
+    out = str(tmp_path / "h")
+    main = fg["prefix"] + ".gw.ldscore.gz"
+    for extra in (None, "user.txt"):
+        _summit_h2(fg, "--h2", str(fg["dir"] / "mix"), "--ldscores", main, "--out", out)
+        assert os.path.exists(out + ".ldscore_groups.tsv") and os.path.isdir(out + ".ldgroups")
+        if extra:
+            open(os.path.join(out + ".ldgroups", extra), "w").close()
+        r = _summit_h2(fg, "--h2", str(fg["dir"] / "mix"), "--ldscores", main, "--ldscore-groups", "off", "--out", out)
+        assert not os.path.exists(out + ".ldscore_groups.tsv")
+        log = open(out + ".log").read()
+        assert f"removed {out}.ldscore_groups.tsv" in log
+        if extra:
+            assert os.listdir(out + ".ldgroups") == [extra] and "is left in place" in log
+        else:
+            assert not os.path.exists(out + ".ldgroups") and f"removed {out}.ldgroups/" in log
+        assert len(pd.read_csv(out + ".results.tsv", sep="\t")) == 5 and r.returncode == 0

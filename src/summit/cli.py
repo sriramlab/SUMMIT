@@ -2153,6 +2153,33 @@ def _clear_ldgroups(root):
             os.rmdir(kd)
 
 
+def _remove_stale_group_outputs(out, log):
+    """A --h2 run that does not fit over LD-score groups removes what an earlier group run to the same --out left:
+    OUT.ldscore_groups.tsv (its own header only) and OUT.ldgroups/ (its links and fit.* files, as _clear_ldgroups
+    removes them), which would otherwise describe a fit that OUT.results.tsv no longer holds. Anything else there is
+    left in place with a note."""
+    tab = f"{out}.ldscore_groups.tsv"
+    if os.path.isfile(tab) and not os.path.islink(tab):
+        try:
+            with open(tab) as fh:
+                hdr = fh.readline().rstrip("\n").split("\t")
+        except OSError:
+            hdr = None
+        if hdr == ["phen", "ldscores"]:
+            os.remove(tab)
+            log._log(f"[h2] removed {tab} of an earlier --h2 run over LD-score groups to this --out")
+    root = f"{out}.ldgroups"
+    if os.path.isdir(root) and not os.path.islink(root):
+        try:
+            _clear_ldgroups(root)
+        except ValueError as e:
+            log._log(f"[h2] note: {root} holds files that --h2 did not make and is left in place ({e})")
+            return
+        if not os.listdir(root):
+            os.rmdir(root)
+            log._log(f"[h2] removed {root}/ of an earlier --h2 run over LD-score groups to this --out")
+
+
 def _dispatch_h2_groups(args, log, prefix, tab):
     """--h2 over traits whose LD scores come from different compose group files: each group's traits are fitted
     with its file (symlinked into PREFIX-of-out.ldgroups/<k>/ss, rebuilt on every run), and the rows are merged into
@@ -2250,6 +2277,7 @@ def _dispatch_h2(args, log):
         _check_group_n(b, str(args.h2), tab, prefix, log)
         log._log(f"[h2] {b}: LD scores {f} ({prefix}.n_groups.tsv)")
         args.ldscores = f
+    _remove_stale_group_outputs(args.out, log)          # this run fits with one file: no group outputs of another
 
     if (args.h2_cache_dir is not None or args.h2_cache_only) and not args.h2_batch_fast:
         raise ValueError("--h2-cache-dir/--h2-cache-only require --h2-batch-fast.")
