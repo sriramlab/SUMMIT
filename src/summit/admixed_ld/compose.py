@@ -679,11 +679,12 @@ def release_statistic(curve):
     curve records none (made with --no-sample-factors, before curves carried it, or its pass could not make it). The
     curve's json lists the statistic its own pass wrote (key sample_factors, a file next to it: CURVE.sample_factors.json,
     or the name listed when the curve's files were renamed without it). A listed statistic that is missing stops the
-    composition, and so does one of another run: one whose number of people (n_samples) or covariate rank differs
-    from the curve's, or, when both files carry a fingerprint (cohort_fingerprint: SHA-256 of the people's IDs, the
-    covariate column names and the cohort's SNPs matched to the reference), whose fingerprint differs. Without a
-    fingerprint on either file only the counts are compared, and notes holds the flag
-    sample_factors_without_fingerprint. A statistic file next to a curve that does not list it is not used."""
+    composition, and so does one that is not the file the curve wrote: one whose SHA-256 differs from the checksum the
+    curve recorded (sample_factors_sha256), whose number of people (n_samples) or covariate rank differs from the
+    curve's, or, when both files carry a fingerprint (cohort_fingerprint: SHA-256 of the covariate column names and of
+    the cohort's SNPs matched to the reference), whose fingerprint differs. A curve without the checksum gets the
+    other checks and the flag sample_factors_without_fingerprint in notes. A statistic file next to a curve that does
+    not list it is not used."""
     from .sample_factors import read_sample_factors
     cj = f"{curve}.curve.json"
     with open(cj) as fh:
@@ -710,26 +711,31 @@ def release_statistic(curve):
     if path is None:
         raise ValueError(f"The curve {cj} lists a sample statistic ({listed}), which does not exist next to it "
                          f"({' or '.join(cands)}); {remedy}.")
+    from .curve import file_sha256
     sfi = read_sample_factors(path)
     bad = [f"{k} {sfi.get(k)} in the statistic, {info.get(k)} in the curve" for k in ("n_samples", "covariate_rank")
            if sfi.get(k) is None or info.get(k) is None or int(sfi[k]) != int(info[k])]
     fp_s, fp_c = sfi.get("fingerprint"), info.get("fingerprint")
-    notes = []
     if fp_s and fp_c:
-        # the people, the covariate columns and the matched SNPs of the two passes (cohort_fingerprint)
-        parts = [k for k in ("samples", "covariates", "snps") if fp_s.get(k) != fp_c.get(k)]
-        what = {"samples": "the people", "covariates": "the covariate columns",
-                "snps": "the cohort's SNPs matched to the reference"}
+        # the covariate columns and the matched SNPs of the two passes (cohort_fingerprint)
+        what = {"covariates": "the covariate columns", "snps": "the cohort's SNPs matched to the reference"}
+        parts = [k for k in what if fp_s.get(k) != fp_c.get(k)]
         if parts:
             bad.append("their fingerprints differ in " + ", ".join(what[k] for k in parts))
-        elif fp_s.get("sha256") != fp_c.get("sha256"):
-            bad.append("their fingerprints differ")
+    notes = []
+    want = info.get("sample_factors_sha256")
+    if want:
+        # the curve recorded the checksum of the statistic it wrote: any other content at that path is not its own
+        if file_sha256(path) != want:
+            raise ValueError(f"The sample statistic at {path} was replaced after the curve {cj} wrote it: its SHA-256 "
+                             "is not the one the curve recorded" + (f" ({'; '.join(bad)})" if bad else "")
+                             + ". Use --sample-factors PATH explicitly for another statistic, remake the curve, or pass "
+                               "--no-sample-factors to compose the same-person term under random mating.")
     else:
-        which = " and ".join(x for x, f in (("the statistic", fp_s), ("the curve", fp_c)) if not f)
         notes.append(dict(flag="sample_factors_without_fingerprint",
-                          detail=f"{which} records no fingerprint (made before 24 Nov 2026): only the number of "
-                                 f"people ({info.get('n_samples')}) and the covariate rank ({info.get('covariate_rank')}) "
-                                 f"of {path} and {cj} were compared"))
+                          detail=f"the curve {cj} records no checksum of its statistic (made before 24 Nov 2026): "
+                                 f"only the number of people ({info.get('n_samples')}) and the covariate rank "
+                                 f"({info.get('covariate_rank')}) of {path} were compared with the curve's"))
     if bad:
         raise ValueError(f"The sample statistic {path} is not that of the curve {cj} ({'; '.join(bad)}): a file of "
                          f"another run; {remedy}.")

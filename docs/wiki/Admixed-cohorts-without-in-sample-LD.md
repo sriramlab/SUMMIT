@@ -101,9 +101,9 @@ summit admixed-ld clean-panels --ref ref/afr_eur --panel ref/afr --panel ref/eur
 covariates, principal components included (`--covar`). `--relative-pairs` lists related pairs, for example pairs with
 relatedness above 0.0442 in a GRM. The output is under a megabyte of numbers by distance, a matrix between 2-cM segments
 of the genome (about 27 MB for two sources) and the sample statistic (`cohort.sample_factors.json`), which compose uses
-for the same-person term. None of it describes a person; the curve and its statistic carry a SHA-256 hash of the
-people's IDs, the covariate names and the SNPs, so that compose can tell the curve's statistic from another run's. It
-takes 10 to 15 minutes on 8 cores for 4,000 to 6,000 people at array density.
+for the same-person term. None of it describes a person or is derived from the participants' IDs; the curve records
+the checksum of its statistic, so that compose can tell it from a file put in its place. It takes 10 to 15 minutes on 8
+cores for 4,000 to 6,000 people at array density.
 
 ```bash
 summit admixed-ld curve --geno cohort --ref ref/afr_eur_clean --keep gwas_sample.txt --covar gwas.cov \
