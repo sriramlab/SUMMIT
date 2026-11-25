@@ -2461,3 +2461,45 @@ def test_h2_with_one_file_removes_an_earlier_group_runs_outputs(fam_groups, tmp_
         else:
             assert not os.path.exists(out + ".ldgroups") and f"removed {out}.ldgroups/" in log
         assert len(pd.read_csv(out + ".results.tsv", sep="\t")) == 5 and r.returncode == 0
+
+
+def test_overlapping_annotation_columns_in_curve_mode(fam, fam_groups, tmp_path):
+    """Overlapping columns in full curve mode (the sample statistic with its realized LD mass, the cell matrix, the
+    relatives' profile, the between-chromosome shift and one file per GWAS sample size) equal the sums of their
+    combinations composed as a partition, in the main file and in each sample size's file."""
+    from summit.admixed_ld.compose import compose_ldscores
+    from summit.admixed_ld.sample_factors import sample_factors
+    d, fg = fam["dir"], fam_groups
+    quiet = lambda *a, **k: None
+    sample_factors(str(d / "cohort"), str(d / "ref"), str(tmp_path / "sf"), covar=str(d / "cohort.cov"), log=quiet)
+    a = pd.read_csv(d / "annot.tsv", sep="\t")
+    func = (np.arange(len(a)) % 3 == 0).astype(int)
+    pd.DataFrame({"SNP": a.SNP, "low": a.low, "high": a.high, "func": func}).to_csv(tmp_path / "over.tsv", sep="\t",
+                                                                                   index=False)
+    pd.DataFrame({"SNP": a.SNP, "low0": a.low * (1 - func), "low1": a.low * func, "high0": a.high * (1 - func),
+                  "high1": a.high * func}).to_csv(tmp_path / "atoms.tsv", sep="\t", index=False)
+    kw = dict(curve=str(d / "c"), relatedness="curve", cell_matrix="auto", calibrate_between_chromosomes=True,
+              sample_factors=str(tmp_path / "sf.sample_factors.json"), log=quiet)
+    pj = {}
+    for nm in ("over", "atoms"):
+        compose_ldscores(str(d / "ref"), [str(fg["dir"] / "mix")], str(tmp_path / f"{nm}.tsv"), str(tmp_path / nm),
+                         **kw)
+        pj[nm] = json.load(open(str(tmp_path / nm) + ".admixed_ld.json"))
+    p = pj["over"]
+    assert p["plan"]["components"] == dict(curve=True, statistic=True, cells=True, relatives=True, background=False)
+    assert "between_chromosome_shift_per_pair" in p["ld_mass_check"] and len(p["n_groups"]) == 2
+    np.testing.assert_allclose(p["ld_mass"], pj["atoms"]["ld_mass"], rtol=1e-10)
+    tab = {nm: pd.read_csv(str(tmp_path / nm) + ".n_groups.tsv", sep="\t") for nm in pj}
+    pairs = [("over.gw.ldscore.gz", "atoms.gw.ldscore.gz")]
+    for N_ in sorted(tab["over"].N.unique()):
+        pairs.append(tuple(tab[nm][tab[nm].N == N_].ldscores.iloc[0] for nm in ("over", "atoms")))
+    assert len(pairs) == 3
+    for fo, fa in pairs:
+        lo, la = pd.read_csv(tmp_path / fo, sep="\t"), pd.read_csv(tmp_path / fa, sep="\t")
+        np.testing.assert_array_equal(lo.V, la.V)
+        for col, parts in (("low", ["low0", "low1"]), ("high", ["high0", "high1"]), ("func", ["low1", "high1"])):
+            # the files hold six decimals: a column and its two rounded parts differ by at most 1.5e-6
+            np.testing.assert_allclose(lo[col], la[parts].sum(axis=1), rtol=1e-12, atol=1.6e-6)
+        mo = pd.read_csv(tmp_path / fo.replace(".gw.ldscore.gz", ".gw.M"), sep="\t", header=None).to_numpy().ravel()
+        ma = pd.read_csv(tmp_path / fa.replace(".gw.ldscore.gz", ".gw.M"), sep="\t", header=None).to_numpy().ravel()
+        np.testing.assert_array_equal(mo, [ma[0] + ma[1], ma[2] + ma[3], ma[1] + ma[3]])
