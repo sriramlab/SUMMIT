@@ -1642,6 +1642,13 @@ def test_compose_writes_one_file_per_gwas_sample_size(fam, tmp_path):
     assert len(pm["n_groups"]) == 2
     assert {g["label"] for g in pm["n_groups"]} == {str(n), str(sub.size)}
     assert not os.path.exists(str(tmp_path / "c_full") + ".n_groups.tsv")   # one sample size: no extra files
+    # the params json's plan lists the file each trait was given, as n_groups.tsv does, and each sample size's file
+    pf = pd.DataFrame(pm["plan"]["files"])
+    pd.testing.assert_frame_equal(pf.sort_values("trait").reset_index(drop=True),
+                                  groups.sort_values("trait").reset_index(drop=True), check_dtype=False)
+    assert sorted(s["file"] for s in pm["plan"]["sample_sizes"]) == sorted(groups.ldscores.unique())
+    pfull = json.load(open(str(tmp_path / "c_full") + ".admixed_ld.json"))["plan"]
+    assert {f["ldscores"] for f in pfull["files"]} == {"c_full.gw.ldscore.gz"} and len(pfull["files"]) == 2
     # summit --h2 with the compose output fits each trait with its own group's file (n_groups.tsv), in directory order
     import subprocess
     import sys

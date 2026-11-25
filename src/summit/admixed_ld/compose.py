@@ -1275,6 +1275,9 @@ def compose_ldscores(ref_path, sumstats, annot, out, *, sources=None, snps=None,
         mean_ancestry=[float(x) for x in np.atleast_1d(m_vec)],
         traits=len(tables), sample_sizes=[dict(N=float(g["N"]), nu=float(g["nu"]), traits=len(g["traits"]))
                                           for g in plan_groups],
+        # each trait's LD-score file is known only after composing (sample sizes whose LD masses agree within 0.1%
+        # share the main file); the params json's plan lists them
+        files=None,
         components=have, flags=[f["flag"] for f in flags])
     sizes_txt = ", ".join("N {:.0f}".format(g["N"]) for g in plan_groups)
     log("[admixed-ld] compose plan: " + "; ".join([
@@ -1721,6 +1724,16 @@ def compose_ldscores(ref_path, sumstats, annot, out, *, sources=None, snps=None,
         os.remove(f"{out}.n_groups.tsv")
         log(f"[admixed-ld] compose: removed {out}.n_groups.tsv of an earlier run; this composition has one LD-score "
             f"file for every trait ({out}.gw.ldscore.gz)")
+    # the plan in the params json: the file each trait gets (as n_groups.tsv lists it) and each sample size's file
+    main_file = os.path.basename(f"{out}.gw.ldscore.gz")
+    if wrote_groups:
+        plan["sample_sizes"] = [dict(N=float(g["N"]), nu=float(g["nu"]), traits=len(g["traits"]),
+                                     file=os.path.basename(g["file"])) for g in groups_info]
+        plan["files"] = [dict(trait=t, N=float(nn), ldscores=os.path.basename(g["file"])) for g in groups_info
+                         for t, nn in g["traits"]]
+    else:
+        plan["sample_sizes"] = [dict(s, file=main_file) for s in plan["sample_sizes"]]
+        plan["files"] = [dict(trait=t[0], N=float(n_), ldscores=main_file) for t, n_ in zip(tables, n_med)]
 
     # ---------------------------------------------------------------------------------------- write
     snpdf = pd.DataFrame({"CHR": chrom_out, "SNP": snp_ids, "BP": rv["BP"].to_numpy()[r_idx]})
