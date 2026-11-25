@@ -2183,11 +2183,12 @@ def _remove_stale_group_outputs(out, log):
 def _dispatch_h2_groups(args, log, prefix, tab):
     """--h2 over traits whose LD scores come from different compose group files: each group's traits are fitted
     with its file (symlinked into PREFIX-of-out.ldgroups/<k>/ss, rebuilt on every run), and the rows are merged into
-    OUT.results.tsv in the order of the summary-statistics directory; OUT.ldscore_groups.tsv records the file each
-    trait used. The user-facing outputs are where a single-file run puts them: OUT.results.tsv, OUT.log (this run's
-    whole log, every group's fit included, written at the end as a single-file run writes it) and, with --write-jack,
-    OUT.<phen>.jack (moved from the group's fit); OUT.ldgroups/<k>/fit.results.tsv and fit.log stay as each group's
-    own record."""
+    OUT.results.tsv in the order of the summary-statistics directory, as the groups' fits wrote them (phen_index
+    renumbered); OUT.ldscore_groups.tsv records the file each trait used. Before fitting, each trait's median N must
+    be the table's (_check_group_n). The user-facing outputs are where a single-file run puts them: OUT.results.tsv,
+    OUT.log (this run's whole log, every group's fit included, written at the end as a single-file run writes it)
+    and, with --write-jack, OUT.<phen>.jack (moved from the group's fit); OUT.ldgroups/<k>/fit.results.tsv stays as
+    each group's own fit, and fit.log holds this run's log up to the end of that group's fit (the log is shared)."""
     import copy
     paths = utils._parse_sumdir(args.h2)
     base_of = {os.path.basename(p): p for p in paths}
@@ -2225,27 +2226,38 @@ def _dispatch_h2_groups(args, log, prefix, tab):
         a.h2, a.ldscores, a.ldscore_groups = sd, f, "off"
         a.out = os.path.join(root, str(k), "fit")
         _dispatch_h2(a, log)
-        merged.append(pd.read_csv(f"{a.out}.results.tsv", sep="\t", dtype={"phen": str}))
+        with open(f"{a.out}.results.tsv") as fh:
+            merged.append(fh.read().splitlines())
         for b in base_of:                       # per-trait outputs where a single-file run writes them (--write-jack)
             src = f"{a.out}.{phen_of[b]}.jack"
             if by_trait[b] == f and os.path.exists(src):
                 os.replace(src, f"{args.out}.{phen_of[b]}.jack")
                 log._log(f"[h2] {phen_of[b]}: jackknife replicates in {args.out}.{phen_of[b]}.jack")
-    res = pd.concat(merged, ignore_index=True)
+    # the groups' rows as their fits wrote them (the same header, numbers and "nan" as a single-file run), in the order
+    # of the summary-statistics directory, with phen_index renumbered
+    header = merged[0][0]
+    if any(lines[0] != header for lines in merged):
+        raise RuntimeError("--h2 over LD-score groups: the groups' results tables have different columns.")
+    cols = header.split("\t")
+    i_phen, i_idx = cols.index("phen"), cols.index("phen_index")
+    rows = [ln.split("\t") for lines in merged for ln in lines[1:] if ln]
     want = sorted(phen_of.values())
-    if sorted(res.phen.astype(str)) != want:
-        raise RuntimeError(f"--h2 over LD-score groups fitted {sorted(res.phen.astype(str))}, not each trait of "
+    if sorted(r[i_phen] for r in rows) != want:
+        raise RuntimeError(f"--h2 over LD-score groups fitted {sorted(r[i_phen] for r in rows)}, not each trait of "
                            f"{args.h2} once ({want}).")
     order = {p: i for i, p in enumerate(phen_of[b] for b in base_of)}
-    res = res.iloc[np.argsort([order[str(x)] for x in res.phen], kind="stable")].reset_index(drop=True)
-    res["phen_index"] = np.arange(len(res))
+    rows.sort(key=lambda r: order[r[i_phen]])
+    for i, r in enumerate(rows):
+        r[i_idx] = str(i)
     tmp = f"{args.out}.results.tsv.{os.getpid()}.tmp"
-    res.to_csv(tmp, sep="\t", index=False)
+    with open(tmp, "w") as fh:
+        fh.write("\n".join([header] + ["\t".join(r) for r in rows]) + "\n")
     os.replace(tmp, f"{args.out}.results.tsv")
     pd.DataFrame(used, columns=["phen", "ldscores"]).to_csv(f"{args.out}.ldscore_groups.tsv", sep="\t", index=False)
     log._log(f"Saved h2 results table in {args.out}.results.tsv (traits from {len(files)} LD-score groups; "
              f"files in {args.out}.ldscore_groups.tsv). The whole log, every group's fit included, is {args.out}.log; "
-             f"{root}/<k>/fit.results.tsv and fit.log are each group's own fit, rewritten on every run")
+             f"{root}/<k>/fit.results.tsv is each group's own fit and fit.log this run's log up to the end of that "
+             "group's fit, both rewritten on every run")
     log._save_log(f"{args.out}.log")            # as a single-file run's (Sumrhe): this run's log, not appended to
 
 

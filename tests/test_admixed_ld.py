@@ -1760,6 +1760,15 @@ def test_h2_over_ldscore_groups_writes_the_single_run_outputs(fam_groups, tmp_pa
     _summit_h2(fg, "--h2", str(fg["dir"] / "mix" / "part1.tsv"), "--ldscores",
                tab.ldscores[tab.trait == "part1.tsv"].iloc[0], "--ldscore-groups", "off", "--write-jack", "--out", alone)
     assert open(f"{out}.part1.jack").read() == open(f"{alone}.part1.jack").read()
+    # OUT.results.tsv holds the groups' rows as their fits wrote them (numbers and "nan" as in a single-file run)
+    merged = open(out + ".results.tsv").read().splitlines()
+    rows = {ln.split("\t")[1]: ln.split("\t")[2:] for ln in merged[1:]}
+    assert [ln.split("\t")[0] for ln in merged[1:]] == [str(i) for i in range(5)] and list(rows) == phen
+    for k in os.listdir(out + ".ldgroups"):
+        fit = open(os.path.join(out + ".ldgroups", k, "fit.results.tsv")).read().splitlines()
+        assert fit[0] == merged[0]
+        for ln in fit[1:]:
+            assert rows[ln.split("\t")[1]] == ln.split("\t")[2:]
 
 
 def test_n_groups_table_on_a_rerun_from_any_directory_and_for_one_trait(fam, fam_groups, tmp_path, monkeypatch):
