@@ -675,12 +675,15 @@ def relatedness_term(L, rel, chrom, cm, cls, V, K, nu, grid_cm, scale=1.0, partn
 
 
 def release_statistic(curve):
-    """The sample statistic released with the curve CURVE (prefix): (path, None), or (None, why) when the curve records
-    none (made with --no-sample-factors, before curves carried it, or its pass could not make it). The curve's json
-    lists the statistic its own pass wrote (key sample_factors, a file next to it: CURVE.sample_factors.json, or the
-    name listed when the curve's files were renamed without it); a listed statistic that is missing,
-    or that is not of the curve's people and covariates (n_samples, covariate_rank: a file left by another run), stops
-    the composition. A statistic file next to a curve that does not list it is not used."""
+    """The sample statistic released with the curve CURVE (prefix): (path, None, notes), or (None, why, []) when the
+    curve records none (made with --no-sample-factors, before curves carried it, or its pass could not make it). The
+    curve's json lists the statistic its own pass wrote (key sample_factors, a file next to it: CURVE.sample_factors.json,
+    or the name listed when the curve's files were renamed without it). A listed statistic that is missing stops the
+    composition, and so does one of another run: one whose number of people (n_samples) or covariate rank differs
+    from the curve's, or, when both files carry a fingerprint (cohort_fingerprint: SHA-256 of the people's IDs, the
+    covariate column names and the cohort's SNPs matched to the reference), whose fingerprint differs. Without a
+    fingerprint on either file only the counts are compared, and notes holds the flag
+    sample_factors_without_fingerprint. A statistic file next to a curve that does not list it is not used."""
     from .sample_factors import read_sample_factors
     cj = f"{curve}.curve.json"
     with open(cj) as fh:
@@ -699,7 +702,7 @@ def release_statistic(curve):
         if os.path.exists(f"{curve}.sample_factors.json"):
             why += (f"; {curve}.sample_factors.json is not the curve's and is not used (pass --sample-factors "
                     f"{curve}.sample_factors.json if it is of the GWAS's people)")
-        return None, why
+        return None, why, []
     # the file next to the curve under its prefix (a curve's files renamed together keep it), else the name listed
     cands = list(dict.fromkeys([f"{curve}.sample_factors.json",
                                 os.path.join(os.path.dirname(curve), os.path.basename(str(listed)))]))
@@ -710,10 +713,27 @@ def release_statistic(curve):
     sfi = read_sample_factors(path)
     bad = [f"{k} {sfi.get(k)} in the statistic, {info.get(k)} in the curve" for k in ("n_samples", "covariate_rank")
            if sfi.get(k) is None or info.get(k) is None or int(sfi[k]) != int(info[k])]
+    fp_s, fp_c = sfi.get("fingerprint"), info.get("fingerprint")
+    notes = []
+    if fp_s and fp_c:
+        # the people, the covariate columns and the matched SNPs of the two passes (cohort_fingerprint)
+        parts = [k for k in ("samples", "covariates", "snps") if fp_s.get(k) != fp_c.get(k)]
+        what = {"samples": "the people", "covariates": "the covariate columns",
+                "snps": "the cohort's SNPs matched to the reference"}
+        if parts:
+            bad.append("their fingerprints differ in " + ", ".join(what[k] for k in parts))
+        elif fp_s.get("sha256") != fp_c.get("sha256"):
+            bad.append("their fingerprints differ")
+    else:
+        which = " and ".join(x for x, f in (("the statistic", fp_s), ("the curve", fp_c)) if not f)
+        notes.append(dict(flag="sample_factors_without_fingerprint",
+                          detail=f"{which} records no fingerprint (made before 24 Nov 2026): only the number of "
+                                 f"people ({info.get('n_samples')}) and the covariate rank ({info.get('covariate_rank')}) "
+                                 f"of {path} and {cj} were compared"))
     if bad:
         raise ValueError(f"The sample statistic {path} is not that of the curve {cj} ({'; '.join(bad)}): a file of "
                          f"another run; {remedy}.")
-    return path, None
+    return path, None, notes
 
 
 def release_coverage(tables, n_med, n_release, min_share=0.85, log=print, against="release"):
@@ -910,11 +930,14 @@ def compose_ldscores(ref_path, sumstats, annot, out, *, sources=None, snps=None,
     sf_from_release = False
     pre_flags = []
     if sample_factors is None and release_sample_factors and curve is not None and not dense:
-        sample_factors, why = release_statistic(curve)
+        sample_factors, why, notes = release_statistic(curve)
         if sample_factors is not None:
             sf_from_release = True
             log(f"[admixed-ld] compose: same-person term from the curve's sample statistic ({sample_factors}); "
                 "--no-sample-factors composes it under random mating instead")
+            for f_ in notes:
+                pre_flags.append(f_)
+                log(f"[admixed-ld] note (recorded flag {f_['flag']}): {f_['detail']}")
         else:
             pre_flags.append(dict(flag="curve_without_sample_factors", detail=why))
             log(f"[admixed-ld] WARNING (recorded flag curve_without_sample_factors): {why}; the same-person term is "

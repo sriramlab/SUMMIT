@@ -57,6 +57,30 @@ def _cohort_samples(blocks_path, covar, keep, log):
     return samples, rows, np.asarray(C, dtype=np.float64)
 
 
+def cohort_fingerprint(samples, rows, covar, variants, t_idx) -> dict:
+    """SHA-256 fingerprints of what a pass over the cohort used: the sorted FID/IID of its people (rows), the sorted
+    covariate column names of --covar (FID and IID left out), and the sorted cohort variants matched to the reference
+    (CHR:BP:SNP:COUNTED:OTHER of t_idx, before any filter of the pass). The curve and sample-factors write it into their
+    jsons, so compose can tell a statistic of the curve's own pass from a file of another run of the same size."""
+    import hashlib
+
+    def sha(lines):
+        return hashlib.sha256("\n".join(lines).encode()).hexdigest()
+
+    ids = (samples["FID"].astype(str) + "\t" + samples["IID"].astype(str)).to_numpy()[np.asarray(rows, np.int64)]
+    cov = [] if covar is None else sorted(str(c) for c in pd.read_csv(covar, sep=r"\s+", nrows=0).columns
+                                         if c not in ("FID", "IID"))
+    v = variants.iloc[np.asarray(t_idx, np.int64)]
+    snps = (v["CHR"].astype(str) + ":" + v["BP"].astype(str) + ":" + v["SNP"].astype(str) + ":"
+            + v["COUNTED"].astype(str) + ":" + v["OTHER"].astype(str)).to_numpy()
+    parts = dict(samples=sha(sorted(ids)), covariates=sha(cov), snps=sha(sorted(snps)))
+    return dict(sha256=sha([parts["samples"], parts["covariates"], parts["snps"]]), **parts,
+                n_samples=int(ids.size), n_covariate_columns=len(cov), n_snps_matched=int(snps.size),
+                definition="SHA-256 of the sorted FID/IID of the people used, of the sorted covariate column names, "
+                           "and of the sorted cohort variants matched to the reference (CHR:BP:SNP:COUNTED:OTHER); "
+                           "sha256 is that of the three")
+
+
 class _PairRelatedness:
     """Relatedness of relative pairs in the covariate-adjusted, standardized genotypes, accumulated over blocks:
     g_ab = (1/M) sum_j x_aj x_bj with x_j = (g_j - C C' g_j) / sd_res_j. `a`, `b`: positions within the cohort rows."""
@@ -547,6 +571,7 @@ def genotype_curve(geno, ref_path, out, *, sources=None, covar=None, keep=None, 
     t_idx, r_idx, flip = match_variants(blocks.variants, rv, how=match, drop_ambiguous=drop_ambiguous,
                                         report=match_info)
     check_match(match_info, "curve: the cohort", log)
+    fingerprint = cohort_fingerprint(samples, rows, covar, blocks.variants, t_idx)   # as sample-factors computes it
     sign = np.where(flip, -1.0, 1.0)
     P = np.column_stack([rv[f"p_{s}"].to_numpy()[r_idx] for s in sources])
     D = (P[:, :-1] - P[:, -1:]) * sign[:, None]                 # contrasts, oriented to the cohort's counted allele
@@ -726,7 +751,7 @@ def genotype_curve(geno, ref_path, out, *, sources=None, covar=None, keep=None, 
     U_th = (th_num + th_c[None, :]) @ np.linalg.inv(th_den)    # people x k1: ancestries of the non-baseline sources
     info = dict(format="summit-admixed-ld-curve", version=1, sources=list(sources), baseline=sources[-1],
                 n_samples=int(N), n_snps=int(t_idx.size), covariate_rank=int(p_rank), cell_cm=float(cell_cm),
-                noise_correction=bool(noise_correction),
+                fingerprint=fingerprint, noise_correction=bool(noise_correction),
                 panel_n_freq={s: float(ref.n_freq[s]) for s in sources},
                 max_cm=float(max_cm), inter_matrix=inter.tolist(), fit_per_source=fits,
                 match=dict(match_info, drop_ambiguous=bool(drop_ambiguous)), strand_check=strand,
@@ -836,6 +861,7 @@ def genotype_curve(geno, ref_path, out, *, sources=None, covar=None, keep=None, 
     if sample_factors and sf_info is not None:
         from .sample_factors import write_sample_factors
         sf_info["made_by"] = "curve"
+        sf_info["fingerprint"] = fingerprint
         _check_statistic_overwrite(out)                        # again: a file may have appeared during the pass
         write_sample_factors(out, sf_info, log)
         info["sample_factors"] = f"{os.path.basename(out)}.sample_factors.json"

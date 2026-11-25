@@ -255,7 +255,7 @@ def sample_factors(geno, ref_path, out, *, sources=None, covar=None, keep=None, 
     ||E_c||^2 ~ mean_b ||E_c z_b||^2, from G_c Z = X~_c (X~_c' Z); G Z is the sum over chromosomes. The diagonal carries
     most of <G_c, G_c>, so a few hundred probes give the masses to about 1% (their standard errors over the probes
     are recorded). The curve's pass computes the same statistic with FactorAccumulator (genotype_curve)."""
-    from .curve import _cohort_samples
+    from .curve import _cohort_samples, cohort_fingerprint
     t0 = time.perf_counter()
     ref = Reference(ref_path)
     sources = list(sources or ref.names[:2])
@@ -273,6 +273,7 @@ def sample_factors(geno, ref_path, out, *, sources=None, covar=None, keep=None, 
     t_idx, r_idx, _flip = match_variants(blocks.variants, rv, how=match, drop_ambiguous=drop_ambiguous,
                                          report=match_info)
     check_match(match_info, "sample-factors: the cohort", log)
+    fingerprint = cohort_fingerprint(samples, rows, covar, blocks.variants, t_idx)   # as the curve computes it
     a_all, good = factor_inputs(ref, rv, r_idx, sources)
     t_idx, r_idx, a_all = t_idx[good], r_idx[good], a_all[good]
     chrom = rv["CHR"].to_numpy()[r_idx]
@@ -297,6 +298,7 @@ def sample_factors(geno, ref_path, out, *, sources=None, covar=None, keep=None, 
         log(f"[admixed-ld] sample-factors chr{c}: {ix.size} variants ({time.perf_counter() - t0:.0f} s)")
     info = acc.finish(C, sources, names, log)
     info["made_by"] = "sample-factors"
+    info["fingerprint"] = fingerprint
     write_sample_factors(out, info, log, t0)
     return info
 

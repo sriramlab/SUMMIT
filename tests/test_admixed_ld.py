@@ -2354,3 +2354,47 @@ def test_between_chromosome_shift_without_a_realized_ld_mass_is_skipped_with_a_f
             "between_chromosome_shift_skipped"]
         assert any("WARNING (recorded flag between_chromosome_shift_skipped)" in ln for ln in lines)
         pd.testing.assert_frame_equal(got[False], got[True])
+
+
+def test_compose_compares_the_fingerprints_of_the_curve_and_its_statistic(sim, tmp_path):
+    """The curve and sample-factors fingerprint the people, the covariate columns and the matched SNPs of their pass
+    (the same for the same inputs); compose stops on the statistic of other people of the same number and covariate
+    rank, which the counts alone let through, and a file without a fingerprint gets only the counts and a flag."""
+    import shutil
+    from summit.admixed_ld.compose import compose_ldscores
+    from summit.admixed_ld.curve import genotype_curve
+    from summit.admixed_ld.sample_factors import sample_factors
+    d = sim["dir"]
+    quiet = lambda *a, **k: None
+    fam = pd.read_csv(str(d / "cohort") + ".fam", sep=r"\s+", header=None, dtype=str)
+    for nm, sl in (("a", slice(0, -10)), ("b", slice(10, None))):          # 10 people swapped, the same number
+        fam.iloc[sl, :2].to_csv(tmp_path / f"keep_{nm}.txt", sep="\t", header=False, index=False)
+    cv = str(tmp_path / "cv")
+    kw = dict(covar=str(d / "cohort.cov"), log=quiet)
+    _, cinfo = genotype_curve(str(d / "cohort"), str(d / "ref"), cv, keep=str(tmp_path / "keep_a.txt"), cell_cm=0.5,
+                              cells_cm=0, **kw)
+    own = json.load(open(cv + ".sample_factors.json"))
+    alone = sample_factors(str(d / "cohort"), str(d / "ref"), str(tmp_path / "alone"), keep=str(tmp_path / "keep_a.txt"),
+                           ld_mass=False, **kw)
+    other = sample_factors(str(d / "cohort"), str(d / "ref"), str(tmp_path / "other"),
+                           keep=str(tmp_path / "keep_b.txt"), ld_mass=False, **kw)
+    nocov = sample_factors(str(d / "cohort"), str(d / "ref"), str(tmp_path / "nocov"), keep=str(tmp_path / "keep_a.txt"),
+                           ld_mass=False, log=quiet)
+    fp = cinfo["fingerprint"]
+    assert own["fingerprint"] == fp and alone["fingerprint"] == fp
+    assert fp["n_samples"] == other["n_samples"] and own["covariate_rank"] == other["covariate_rank"]
+    assert other["fingerprint"]["samples"] != fp["samples"] and other["fingerprint"]["snps"] == fp["snps"]
+    assert nocov["fingerprint"]["covariates"] != fp["covariates"] and nocov["fingerprint"]["samples"] == fp["samples"]
+    args = (str(d / "ref"), [str(d / "ss")], str(d / "annot.tsv"))
+    ckw = dict(curve=cv, mean_ancestry="0.6", kappa0="0.3", allow_flat_kernel_join=True, dry_run=True, log=quiet)
+    plan = compose_ldscores(*args, str(tmp_path / "ok"), **ckw)
+    assert plan["same_person_term"].startswith("the sample statistic released") and not [
+        f for f in plan["flags"] if f == "sample_factors_without_fingerprint"]
+    shutil.copy(tmp_path / "other.sample_factors.json", cv + ".sample_factors.json")   # another run's, same size
+    with pytest.raises(ValueError, match="fingerprints differ in the people"):
+        compose_ldscores(*args, str(tmp_path / "x"), **ckw)
+    stripped = dict(other)
+    stripped.pop("fingerprint")
+    json.dump(stripped, open(cv + ".sample_factors.json", "w"))
+    plan = compose_ldscores(*args, str(tmp_path / "y"), **ckw)                # counts only, recorded
+    assert "sample_factors_without_fingerprint" in plan["flags"]
