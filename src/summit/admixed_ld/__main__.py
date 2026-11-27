@@ -198,7 +198,9 @@ def main(argv=None):
                     help="threads for genotype decoding and matrix products; also the BLAS limit (default 1)")
     rl.add_argument("--drop-ambiguous", action="store_true",
                     help="leave out strand-ambiguous (A/T, C/G) SNPs from the curve; give it to compose too")
-    rl.add_argument("--out", required=True, help="the release folder (new or empty; a release folder is replaced)")
+    rl.add_argument("--out", required=True,
+                    help="the release folder: new, empty, or an earlier release, which the new one replaces when it "
+                         "is complete")
 
     bn = sub.add_parser("bins", help="the eight MAF/LD bins of the fit, cut on a local in-sample LD score (from the "
                                      "cohort's genotypes), or the two MAF classes alone (from allele frequencies)")
@@ -270,9 +272,10 @@ def main(argv=None):
                    help=argparse.SUPPRESS)
     m.add_argument("--nu", type=float, default=None, help="sample size minus covariates (default from the GWAS)")
     m.add_argument("--cov-rank", type=int, default=None,
-                   help="the number of covariates of the GWAS, principal components included, for summary statistics "
-                        "without a COV_RANK column (default: the curve's covariate rank, recorded with the flag "
-                        "cov_rank_from_curve; in date mode 0, with the flag cov_rank_missing)")
+                   help="the number of covariates of the GWAS, principal components included; it overrides the "
+                        "summary statistics' COV_RANK columns, as summit --h2/--rg --cov-rank does (default: each "
+                        "file's COV_RANK, else the curve's covariate rank with the flag cov_rank_from_curve, else 0 "
+                        "with the flag cov_rank_missing)")
     m.add_argument("--grid-cm", type=float, default=0.02, help=argparse.SUPPRESS)
     m.add_argument("--no-cell-matrix", dest="cell_matrix", action="store_const", const=False, default="auto",
                    help="leave out the cohort's cell matrix (used by default with --curve)")
@@ -508,12 +511,7 @@ def main(argv=None):
 
     a = ap.parse_args(argv)
     log = Logger()
-    if a.cmd not in ("reference", "derive", "clean-panels", "release"):
-        log.attach_file(a.out + f".{a.cmd}.log", mode="w")
-    else:
-        import os
-        os.makedirs(a.out, exist_ok=True)
-        log.attach_file(os.path.join(a.out, f"{a.cmd}.log"), mode="w")
+    _start_log(a, log)
     log._log("summit admixed-ld " + " ".join(argv if argv is not None else sys.argv[2:]))
     # BLAS threads follow --threads, as in SUMMIT's LD-score commands, so that plain numpy products do not take every
     # core of a shared machine; commands without --threads leave the BLAS setting as it is
@@ -526,6 +524,27 @@ def main(argv=None):
         with threadpool_limits(limits=max(1, int(threads)), user_api="blas"):
             return _run(a, log)
     return _run(a, log)
+
+
+def _start_log(a, log):
+    """The log file of a step: OUT.<step>.log next to an output prefix, whose folder is created; <step>.log inside the
+    output folder of reference, clean-panels and derive. release starts its own log once its inputs pass their checks,
+    inside the folder it builds, so a release that is refused writes nothing."""
+    import os
+    if a.cmd == "release":
+        return
+    if a.cmd in ("reference", "derive", "clean-panels"):
+        if os.path.lexists(a.out) and not os.path.isdir(a.out):
+            raise SystemExit(f"--out {a.out} exists and is not a folder; {a.cmd} writes a folder.")
+        os.makedirs(a.out, exist_ok=True)
+        log.attach_file(os.path.join(a.out, f"{a.cmd}.log"), mode="w")
+        return
+    parent = os.path.dirname(a.out)
+    if parent:
+        if os.path.lexists(parent) and not os.path.isdir(parent):
+            raise SystemExit(f"--out {a.out}: {parent} exists and is not a folder.")
+        os.makedirs(parent, exist_ok=True)
+    log.attach_file(a.out + f".{a.cmd}.log", mode="w")
 
 
 def _run(a, log):
@@ -562,7 +581,7 @@ def _run(a, log):
                      kinship_col=a.kinship_col, kinship_min=a.kinship_min, sources=_sources(a.sources), match=a.match,
                      cell_cm=a.cell_cm, step=a.step, threads=a.threads, drop_ambiguous=a.drop_ambiguous,
                      background_memory_gb=a.background_memory_gb, relatedness_memory_gb=a.relatedness_memory_gb,
-                     log=log._log)
+                     log=log._log, attach_log=lambda path: log.attach_file(path, mode="w"))
     elif a.cmd == "bins":
         from .bins import maf_classes, make_bins, write_record
         if a.geno is not None:

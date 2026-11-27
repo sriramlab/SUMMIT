@@ -9,7 +9,9 @@ each, pooled by quartile into two MAF classes (MAF below 0.05, `maf_low`, and at
 with r_jk the correlation of the two SNPs' genotypes in the n people (missing calls at the SNP's mean, no covariates):
 the unbiased squared correlation. A score summed over the whole genome would carry the sample's own sampling noise,
 mostly its same-person part, and quartiles cut on it select SNPs on that noise; a local score carries almost none.
-MAF is the minor allele frequency among the called genotypes of the same people.
+MAF is the minor allele's count among the called genotypes of the same people over twice their number. SNPs without
+variance in these people are neither rows nor partners. The quartiles use every SNP of the genotype file, so the bins
+are cut on the GWAS's SNP set; at least 50 people are needed, as for every released aggregate.
 
 Only the cohort can compute this score. The two MAF classes alone need only the MAF, which an analyst without the
 cohort's bins can take from the summary statistics' allele frequencies or from the panels at the mean ancestry
@@ -39,28 +41,33 @@ CLASS_NAMES = ["maf_low", "maf_high"]
 
 def _standardize(X):
     """Missing calls (NaN) at the SNP's mean, centred and scaled to unit variance (n - 1), float32; monomorphic SNPs
-    become 0. Returns (standardized, mean dosage over the called genotypes)."""
+    become 0. Returns (standardized, MAF, polymorphic). The MAF is the minor allele's count over twice the called
+    genotypes, min(c, 2 n - c) / (2 n), the same number whichever allele is counted, so a SNP exactly at a cut falls in
+    the same bin either way."""
     called = ~np.isnan(X)
     cnt = called.sum(axis=0)
-    mu = np.where(cnt > 0, np.where(called, X, 0.0).sum(axis=0) / np.maximum(cnt, 1), np.nan)
+    c = np.where(called, X, 0.0).sum(axis=0)
+    mu = np.where(cnt > 0, c / np.maximum(cnt, 1), np.nan)
     Xc = np.where(called, X - mu, 0.0)
     sd = np.sqrt((Xc * Xc).sum(axis=0) / (X.shape[0] - 1))
-    return np.divide(Xc, sd, out=np.zeros_like(Xc), where=sd > 0).astype(np.float32), mu
+    maf = np.where(cnt > 0, np.minimum(c, 2.0 * cnt - c) / np.maximum(2.0 * cnt, 1), np.nan)
+    return np.divide(Xc, sd, out=np.zeros_like(Xc), where=sd > 0).astype(np.float32), maf, sd > 0
 
 
 def _window_scores(read, bp, n, window, step, out):
     """Local scores of one chromosome's SNPs (positions bp, sorted) into out: rows in chunks of `step`, each against
-    its partners within `window` bp; read(a, b) gives the standardized genotypes of SNPs a..b-1 (n x (b - a))."""
+    its polymorphic partners within `window` bp (a partner exactly `window` away included); read(a, b) gives the
+    standardized genotypes of SNPs a..b-1 (n x (b - a)) and which of them are polymorphic."""
     m = bp.size
     for s in range(0, m, step):
         e = min(m, s + step)
         lo = int(np.searchsorted(bp, bp[s] - window, "left"))
         hi = int(np.searchsorted(bp, bp[e - 1] + window, "right"))
-        X = read(lo, hi)
+        X, poly = read(lo, hi)
         R = (X[:, s - lo:e - lo].T @ X) / np.float32(n - 1)
         r2 = R.astype(np.float64) ** 2
         d = np.abs(bp[s:e, None] - bp[None, lo:hi])
-        out[s:e] = np.where(d <= window, r2 - (1.0 - r2) / (n - 2), 0.0).sum(axis=1)
+        out[s:e] = np.where((d <= window) & poly[None, :], r2 - (1.0 - r2) / (n - 2), 0.0).sum(axis=1)
 
 
 def local_ld_scores(geno, *, keep=None, rows=None, window_bp=WINDOW_BP, step=None, threads=1, log=print):
@@ -70,11 +77,13 @@ def local_ld_scores(geno, *, keep=None, rows=None, window_bp=WINDOW_BP, step=Non
     from ._io import AUTOSOMES, DosageBlocks
     from .curve import _cohort_samples
     t0 = time.perf_counter()
+    from .sample_factors import MIN_PEOPLE
     if rows is None:
         _, rows, _ = _cohort_samples(geno, None, keep, log)
     n = int(rows.size)
-    if n < 4:
-        raise ValueError(f"The local LD score needs at least 4 people; {geno} has {n} in --keep.")
+    if n < MIN_PEOPLE:
+        raise ValueError(f"The bins would describe {n} people; they need at least {MIN_PEOPLE}, as every released "
+                         "aggregate of SUMMIT-MIX does.")
     if step is None:                                   # rows x partners float32 and the chunk's products
         step = int(np.clip((1 << 28) // (4 * max(n, 1)), 256, 4096))
     blocks = DosageBlocks(geno, rows=rows, threads=threads, step=step)
@@ -86,16 +95,15 @@ def local_ld_scores(geno, *, keep=None, rows=None, window_bp=WINDOW_BP, step=Non
         raise ValueError(f"{geno} has no autosomal SNPs (chromosomes 1-22).")
     if (~auto).any():
         log(f"[admixed-ld] bins: {int((~auto).sum())} SNPs off the autosomes are left out")
-    local, maf = np.full(len(v), np.nan), np.full(len(v), np.nan)
+    local, maf, poly = np.full(len(v), np.nan), np.full(len(v), np.nan), np.zeros(len(v), dtype=bool)
     try:
         for c in [x for x in AUTOSOMES if x in set(chrom[auto])]:
             ix = np.flatnonzero(chrom == c)
             ix = ix[np.argsort(bp[ix], kind="stable")]
             def read(a, b, ix=ix):
-                Xs, mu = _standardize(blocks.read(ix[a:b]))
-                f = mu / 2.0
-                maf[ix[a:b]] = np.minimum(f, 1.0 - f)
-                return Xs
+                Xs, f, pl = _standardize(blocks.read(ix[a:b]))
+                maf[ix[a:b]], poly[ix[a:b]] = f, pl
+                return Xs, pl
 
             out = np.zeros(ix.size)
             _window_scores(read, bp[ix], n, window_bp, step, out)
@@ -104,12 +112,18 @@ def local_ld_scores(geno, *, keep=None, rows=None, window_bp=WINDOW_BP, step=Non
                 f"({time.perf_counter() - t0:.0f} s)")
     finally:
         blocks.close()
-    keep_rows = auto & np.isfinite(local)
+    if (auto & ~np.isfinite(maf)).any():
+        bad = int((auto & ~np.isfinite(maf)).sum())
+        raise ValueError(f"{bad} SNPs of {geno} have no called genotype in these people; filter them out first.")
+    mono = auto & ~poly
+    if mono.any():
+        # no genotype variance: no LD score and no heritability, so neither a row nor a partner of the bins
+        log(f"[admixed-ld] bins: {int(mono.sum())} SNPs monomorphic in these people are left out")
+    keep_rows = auto & poly & np.isfinite(local)
     df = pd.DataFrame({"SNP": v.SNP.astype(str), "CHR": chrom, "BP": bp, "CM": v.CM.to_numpy(np.float64),
                        "MAF": maf, "local": local})[keep_rows].reset_index(drop=True)
-    if not np.isfinite(df.MAF).all():
-        bad = int((~np.isfinite(df.MAF)).sum())
-        raise ValueError(f"{bad} SNPs of {geno} have no called genotype in these people; filter them out first.")
+    if df.empty:
+        raise ValueError(f"{geno} has no polymorphic autosomal SNP in these people.")
     return df, n
 
 
@@ -149,21 +163,26 @@ def _write_annot(path, meta, cols, names, log):
 
 def write_bins(out, table, *, scores=False, log=print) -> dict:
     """PREFIX.bins8.annot.gz and PREFIX.maf2.annot.gz from local_ld_scores' table (and PREFIX.local_ld.tsv.gz with
-    scores). Empty bins are an error, a bin with fewer than 100 SNPs a warning (its heritability is poorly
+    scores). An empty bin or class (for example the MAF class below 0.05 of a SNP set filtered on MAF) is left out of
+    the file, with a log line and a record; a bin with fewer than 100 SNPs is a warning (its heritability is poorly
     determined). Returns the record of what was written."""
     A = maf_ld_bins(table.MAF.to_numpy(), table.local.to_numpy())
     sizes = A.sum(axis=0)
-    empty = [nm for nm, s in zip(BIN_NAMES, sizes) if s == 0]
-    if empty:
-        raise ValueError(f"The eight MAF/LD bins {empty} are empty: no SNP has a MAF in that class. Fit two MAF "
-                         "classes, or one, for this SNP set.")
-    small = [f"{nm} ({int(s)})" for nm, s in zip(BIN_NAMES, sizes) if s < 100]
+    two = np.column_stack([A[:, :4].sum(axis=1), A[:, 4:].sum(axis=1)])
+    sizes2 = two.sum(axis=0)
+    keep8, keep2 = sizes > 0, sizes2 > 0
+    dropped = [nm for nm, k in zip(BIN_NAMES + CLASS_NAMES, list(keep8) + list(keep2)) if not k]
+    if dropped:
+        log(f"[admixed-ld] bins: empty bins and classes left out of the annotations (no SNP has a MAF there): "
+            f"{', '.join(dropped)}")
+    small = [f"{nm} ({int(s)})" for nm, s in zip(BIN_NAMES, sizes) if 0 < s < 100]
     if small:
         log(f"[admixed-ld] bins: WARNING: bins with fewer than 100 SNPs, whose heritability is poorly determined: "
             f"{', '.join(small)}; the two MAF classes are the more robust fit")
-    two = np.column_stack([A[:, :4].sum(axis=1), A[:, 4:].sum(axis=1)])
-    files = dict(bins8=_write_annot(f"{out}.bins8.annot.gz", table, A, BIN_NAMES, log),
-                 maf2=_write_annot(f"{out}.maf2.annot.gz", table, two, CLASS_NAMES, log))
+    names8 = [nm for nm, k in zip(BIN_NAMES, keep8) if k]
+    names2 = [nm for nm, k in zip(CLASS_NAMES, keep2) if k]
+    files = dict(bins8=_write_annot(f"{out}.bins8.annot.gz", table, A[:, keep8], names8, log),
+                 maf2=_write_annot(f"{out}.maf2.annot.gz", table, two[:, keep2], names2, log))
     if scores:
         p = f"{out}.local_ld.tsv.gz"
         table[["SNP", "CHR", "BP", "MAF", "local"]].to_csv(f"{p}.{os.getpid()}.tmp.gz", sep="\t", index=False,
@@ -172,8 +191,8 @@ def write_bins(out, table, *, scores=False, log=print) -> dict:
         files["local_ld"] = p
         log(f"[admixed-ld] bins: wrote {p} (per-SNP MAF and local score; not needed for the fit)")
     return dict(files={k: os.path.basename(v) for k, v in files.items()}, n_snps=int(len(table)),
-                bins={nm: int(s) for nm, s in zip(BIN_NAMES, sizes)},
-                maf_classes={nm: int(s) for nm, s in zip(CLASS_NAMES, two.sum(axis=0))},
+                bins={nm: int(s) for nm, s in zip(BIN_NAMES, sizes) if s > 0},
+                maf_classes={nm: int(s) for nm, s in zip(CLASS_NAMES, sizes2) if s > 0}, empty_left_out=dropped,
                 window_bp=WINDOW_BP, maf_cuts=list(MAF_CUTS), maf_class_cut=MAF_CLASS_CUT,
                 definition="six MAF bins (cuts 0.02, 0.05, 0.1, 0.2, 0.3), quartiles of the local in-sample LD score "
                            "(partners within 1 Mb, r^2 - (1 - r^2) / (n - 2), no covariates) within each, pooled by "
@@ -239,11 +258,21 @@ def maf_classes(out, *, sumstats=None, freq_col=None, ref=None, mean_ancestry=No
         meta = rv.loc[ok, ["CHR", "BP", "SNP", "CM"]].reset_index(drop=True)
         maf = np.minimum(p[ok], 1.0 - p[ok])
         source = f"the panels of {ref} at mean ancestry " + ", ".join(f"{s} {x:.3f}" for s, x in zip(src, m))
+    poly = maf > 0
+    if (~poly).any():
+        log(f"[admixed-ld] bins: {int((~poly).sum())} SNPs with MAF 0 are left out")
+        meta, maf = meta[poly].reset_index(drop=True), maf[poly]
     two = np.column_stack([maf < MAF_CLASS_CUT, maf >= MAF_CLASS_CUT]).astype(np.int8)
-    path = _write_annot(f"{out}.maf2.annot.gz", meta, two, CLASS_NAMES, log)
+    keep2 = two.sum(axis=0) > 0
+    dropped = [nm for nm, k in zip(CLASS_NAMES, keep2) if not k]
+    if dropped:
+        log(f"[admixed-ld] bins: empty classes left out of the annotation: {', '.join(dropped)}")
+    path = _write_annot(f"{out}.maf2.annot.gz", meta, two[:, keep2], [nm for nm, k in zip(CLASS_NAMES, keep2) if k],
+                        log)
     log(f"[admixed-ld] bins: two MAF classes (cut at {MAF_CLASS_CUT}) from {source}")
     return dict(files=dict(maf2=os.path.basename(path)), n_snps=int(len(meta)), source=source,
-                maf_classes={nm: int(s) for nm, s in zip(CLASS_NAMES, two.sum(axis=0))})
+                maf_classes={nm: int(s) for nm, s in zip(CLASS_NAMES, two.sum(axis=0)) if s > 0},
+                empty_left_out=dropped)
 
 
 def write_record(path, rec):
