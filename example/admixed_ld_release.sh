@@ -32,11 +32,14 @@ for c in 1 2 3 4 5 6; do                         # the simulation's map: 1 cM pe
     cohort.bim > "maps/genetic_map_chr${c}_combined_b37.txt"
 done
 
-# the reference (once per set of panels)
-summit admixed-ld reference --panel ref/afr --panel ref/eur --names AFR,EUR \
-  --genetic-map maps/genetic_map_chr{chr}_combined_b37.txt --threads 16 --out ref/afr_eur
-summit admixed-ld clean-panels --ref ref/afr_eur --panel ref/afr --panel ref/eur --names AFR,EUR \
-  --threads 4 --out ref/afr_eur_clean
+# the reference (once per set of panels; kept when the example is run again)
+if [ ! -e ref/afr_eur_clean/manifest.json ]; then
+  rm -rf ref/afr_eur ref/afr_eur_clean
+  summit admixed-ld reference --panel ref/afr --panel ref/eur --names AFR,EUR \
+    --genetic-map maps/genetic_map_chr{chr}_combined_b37.txt --threads 16 --out ref/afr_eur
+  summit admixed-ld clean-panels --ref ref/afr_eur --panel ref/afr --panel ref/eur --names AFR,EUR \
+    --threads 4 --out ref/afr_eur_clean
+fi
 
 # the cohort
 summit admixed-ld release --geno cohort --ref ref/afr_eur_clean --keep gwas_people.txt \
