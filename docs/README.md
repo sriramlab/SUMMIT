@@ -11,6 +11,8 @@ and [Commands and options](wiki/Commands-and-options.md).
 - [Heritability and genetic correlation](wiki/Heritability-and-genetic-correlation.md)
 - [Related individuals](wiki/Related-individuals.md)
 - [Local ancestry](wiki/Local-ancestry.md)
+- [Admixed cohorts without in-sample LD (SUMMIT-MIX)](wiki/Admixed-cohorts-without-in-sample-LD.md) and
+  [SUMMIT-MIX details](wiki/SUMMIT-MIX-details.md)
 - [Batch analyses](wiki/Batch-analyses.md)
 - [One-environment G×E](wiki/GxE-models.md)
 - [Multiple environments](wiki/Multiple-environments.md)

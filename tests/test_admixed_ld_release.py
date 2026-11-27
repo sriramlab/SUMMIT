@@ -1,13 +1,14 @@
 """The cohort's release and the analyst's side of `summit admixed-ld`: the MAF/LD bins against a direct computation,
 the release folder and compose --release, the 50-person rule of the sample statistic, the covariate rank of summary
 statistics without COV_RANK, the summary-statistic files of a directory, LD scores over other partners (refused by
-summit --h2/--rg), compose prefixes in --rg, exactly symmetric regional matrices and the annotation of the
-cross-population SNPs.
+summit --h2/--rg), compose prefixes in --rg, exactly symmetric regional matrices, the annotation of the cross-population
+SNPs, and the table of flags in the docs.
 Small simulations (int8 dosages, 900 people, two chromosomes) keep the test process's memory low."""
 from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -252,7 +253,6 @@ def test_regional_matrices_are_exactly_symmetric(small, tmp_path):
     assert np.array_equal(Rt, Rt.T) and np.array_equal(Vt, Vt.T)
 
 
-
 def test_cross_source_writes_the_annotation_of_its_snps(small, tmp_path):
     """compose --cross-source writes the annotation and the IDs of the cross file's SNPs; composing with that annotation
     puts the admixed GWAS's own LD scores on the same SNPs in the same order, as the cross-population fit needs."""
@@ -270,3 +270,14 @@ def test_cross_source_writes_the_annotation_of_its_snps(small, tmp_path):
                      generations=8, log=quiet)
     own = pd.read_csv(tmp_path / "own.gw.ldscore.gz", sep="\t")
     assert own.SNP.tolist() == cross.SNP.tolist()
+
+
+def test_every_flag_is_in_the_docs():
+    """Every flag that the admixed-ld code records is in the flags table of the SUMMIT-MIX details page."""
+    code = "".join(p.read_text() for p in (REPO / "src" / "summit" / "admixed_ld").glob("*.py"))
+    flags = set(re.findall(r'flag="([a-z0-9_]+)"', code))
+    doc = (REPO / "docs" / "wiki" / "SUMMIT-MIX-details.md").read_text()
+    table = set(re.findall(r"^\| `([a-z0-9_]+)` \|", doc, flags=re.M))
+    assert flags, "no flags found in the code"
+    assert flags <= table, sorted(flags - table)
+    assert table <= flags, sorted(table - flags)

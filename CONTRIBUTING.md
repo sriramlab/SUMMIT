@@ -7,6 +7,15 @@ python -m pip install --no-build-isolation -e .
 python -m pytest -q
 ```
 
+To run only the SUMMIT-MIX tests (`summit admixed-ld`, about four minutes), and its
+two examples:
+
+```bash
+python -m pytest -q tests/test_admixed_ld*.py
+bash example/admixed_ld.sh
+bash example/admixed_ld_release.sh
+```
+
 Rebuild after changing native code. Use the same BLAS configuration for the
 build and runtime. Some tests require a particular native build or optional R
 and plotting packages. GitHub CI builds against OpenBLAS.

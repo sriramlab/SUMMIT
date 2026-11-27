@@ -12,6 +12,7 @@ gene–environment interaction models and polygenic scores.
 - SNP heritability and genetic correlation, including annotation partitions.
 - h² and rg in cohorts with related individuals, keeping everyone and excluding related pairs.
 - Joint SNP and local-ancestry heritability in admixed samples.
+- LD scores and regional LD matrices of admixed GWAS samples without their genotypes (SUMMIT-MIX).
 - Heritability due to direct genetic effects from sibships.
 - Batch analysis of many traits and annotation models.
 - Gene–environment interaction (G×E) and environment-dependent residual variance.
@@ -30,6 +31,15 @@ amplification of genetic effects by each exposure,
 `S = Omega_EE - omega_0E omega_0E' / omega_00`, and the G×E heritability.
 Standard errors combine a SNP-block jackknife with a between-block term.
 See [SUMMIT-GxE](https://github.com/sriramlab/SUMMIT/wiki/GxE-models#summit-gxe-many-exposures).
+
+SUMMIT-MIX (`summit admixed-ld`) composes the LD scores of an admixed GWAS
+sample, such as African American or Latino participants, from reference
+panels of the source populations, the GWAS summary statistics and a release of
+aggregates that the cohort computes once from its genotypes (or a published
+admixture date). `summit --h2` and `summit --rg` read the composed LD scores
+as usual. See
+[Admixed cohorts without in-sample LD](https://github.com/sriramlab/SUMMIT/wiki/Admixed-cohorts-without-in-sample-LD)
+for a quick start for the cohort and one for the analyst.
 
 Genotype input can be PLINK BED hard calls or biallelic diploid PGEN dosages.
 See the [user guide](https://github.com/sriramlab/SUMMIT/wiki) for the inputs and availability of each method.

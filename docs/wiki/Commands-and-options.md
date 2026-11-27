@@ -13,7 +13,7 @@ as `summit pgs fit`.
 | Long-range LD correction of h²/rg standard errors | `summit relatives longrange`, then `--long-range-se` |
 | Heritability due to direct genetic effects from sibships | `summit relatives direct` |
 | Local-ancestry markers, merged with the SNPs, and the test of their component | `summit local-ancestry {markers,merge,test}` |
-| LD scores, regional matrices and track correlations of an admixed cohort without its genotypes (SUMMIT-MIX) | `summit admixed-ld {reference,clean-panels,curve,compose,sample-factors,derive,matrix,finemap-variance,tractor-gwas,tractor-sumstats,track-rg}` |
+| LD scores, regional matrices and track correlations of an admixed cohort without its genotypes (SUMMIT-MIX) | `summit admixed-ld {reference,clean-panels,release,curve,bins,compose,sample-factors,derive,matrix,finemap-variance,tractor-gwas,tractor-sumstats,track-rg}` |
 | Additive and generalized G×E PCGC | `summit --binary-method pcgc ...` |
 | Generalized cross-trait PCGC | `summit pcgc-cross {prepare,fit}` |
 | One-environment G×E | `summit --geno ... --env ...`, `--gxe-score-reference`, `--gxe-fit`, or `--gxe-fit-batch` |
@@ -39,17 +39,19 @@ and experimental joint uncertainty are described in that guide.
 ## SUMMIT-MIX (`summit admixed-ld`)
 
 LD scores of an admixed GWAS sample composed from source panels, the GWAS summary statistics and either the cohort's
-curve (curve mode, the default) or a published admixture date (date mode). See
-[Admixed cohorts without in-sample LD](Admixed-cohorts-without-in-sample-LD.md), and
+release (curve mode, the default) or a published admixture date (date mode). See
+[Admixed cohorts without in-sample LD](Admixed-cohorts-without-in-sample-LD.md) for the two quick starts, and
 [SUMMIT-MIX details](SUMMIT-MIX-details.md) for every option.
 
 | Command | Needs | Writes |
 |---|---|---|
 | `reference` | unadmixed panels of the sources, a genetic map | the reference (once per set of panels) |
 | `clean-panels` | the reference and its panels | a reference without the panels' own admixture LD, with their background |
-| `curve` | the cohort's genotypes, the GWAS sample and covariates, related pairs | aggregates only (curve mode), the sample statistic included |
-| `compose` | reference, summary statistics, annotation, curve or `--admixture-generations` | `.gw.ldscore.gz`, `.gw.M`, `.admixed_ld.json` |
-| `sample-factors` | the genotypes and covariates of one GWAS sample (for example a trait measured in part of the cohort) | its sample statistic alone (aggregates only); the curve makes the cohort's own |
+| `release` | the cohort's genotypes, its GWAS people and covariates, related pairs | one folder of aggregates: the curve with its background term, cell matrix and sample statistic, the MAF/LD bins, and a list of what to share |
+| `curve` | as `release` | the curve files of the release alone |
+| `bins` | the cohort's genotypes, or summary statistics with allele frequencies, or the reference and a mean ancestry | the eight MAF/LD bins and the two MAF classes, or the two MAF classes alone |
+| `compose` | reference, summary statistics, annotation, `--release` or `--admixture-generations` | `.gw.ldscore.gz`, `.gw.M`, `.admixed_ld.json` |
+| `sample-factors` | the genotypes and covariates of one GWAS sample (for example a trait measured in part of the cohort) | its sample statistic alone (aggregates only) |
 | `derive` | an admixed cohort that carries a source without a panel, and anchor members | a reference with that source |
 | `matrix` | reference, compose's `.admixed_ld.json`, a region, optionally the GWAS | a regional LD matrix, the aligned z-scores and the predicted error of its entries |
 | `finemap-variance` | a matrix with `--error-variance` and a first SuSiE fit's posterior | the residual variance of the second fit |
@@ -57,8 +59,16 @@ curve (curve mode, the default) or a published admixture date (date mode). See
 | `tractor-sumstats` | a Tractor-style GWAS with sandwich SEs | one summary-statistic file per local-ancestry track |
 | `track-rg` | `compose --tracks` LD scores and the track summary statistics | the correlation of effects across tracks |
 
-Every step that matches variants takes `--drop-ambiguous` (leave out A/T and C/G SNPs) and logs its matching counts;
-steps that read genotypes take `--threads`.
+`release`, `curve`, `bins --geno`, `sample-factors`, `derive` and `tractor-gwas` read the cohort's individual-level
+data and run where the cohort's data are; they write aggregates or summary statistics only. `reference` and
+`clean-panels` read the panels' genotypes, and the other steps need no individual-level data.
+
+`reference`, `release`, `curve`, `compose`, `sample-factors` and `derive` take `--drop-ambiguous`, which leaves out A/T
+and C/G SNPs; give it to each of them when the data sets may be on different strands. `matrix --sumstats` leaves these
+SNPs out of the z-scores unless `--keep-ambiguous`, and `clean-panels` uses the reference's SNPs. `release`, `curve`,
+`compose`, `sample-factors` and `matrix` take `--sources` (the last source is the baseline); `reference` and
+`clean-panels` name the panels with `--names`, and `derive` the kept sources with `--known`. Each step logs its
+matching counts, and the steps that read genotypes take `--threads`.
 
 ## Shared controls
 

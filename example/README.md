@@ -50,7 +50,14 @@ two SuSiE fits with `finemap_two_stage.R` when R and susieR are installed.
 h² is about 0.234 (SE 0.028) in curve mode, 0.231 in date mode and 0.234 in-sample;
 the two PCs among the covariates take up part of the simulated 0.3. The genetic
 correlation is about 0.62 (SE 0.09) with every set of LD scores. The run takes about
-70 seconds. `example/admixed_ld_real_data.sh` is a template of the same steps for a real
+70 seconds.
+
+`bash example/admixed_ld_release.sh` runs the two quick starts of the wiki on the same
+simulated data, with the commands as the wiki gives them: the cohort's `release` in one
+step, then the analyst's `compose` from the release with its eight MAF/LD bins, `--h2`
+and `--rg`. h² is about 0.241 and 0.225 for the two traits (0.241 and 0.225 with in-sample
+LD scores of the same bins), and the genetic correlation 0.62 with both. It takes about
+30 seconds. `example/admixed_ld_real_data.sh` is a template of every step for a real
 cohort, with the time and memory of each step and the outputs that may leave a
 controlled environment.
 
