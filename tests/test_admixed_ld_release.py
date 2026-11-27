@@ -57,7 +57,8 @@ def small(tmp_path_factory):
 
 
 def _direct_local_scores(G, bp, chrom, window=1_000_000):
-    """r^2 - (1 - r^2) / (n - 2) over the SNPs within `window` on the chromosome, from the full correlation matrix."""
+    """r^2 - (1 - r^2) / (n - 2) over the polymorphic SNPs within `window` on the chromosome, from the full
+    correlation matrix; also which SNPs are polymorphic."""
     X = np.where(np.isnan(G), np.nanmean(G, axis=0), G)
     n = X.shape[0]
     X = X - X.mean(axis=0)
@@ -65,8 +66,8 @@ def _direct_local_scores(G, bp, chrom, window=1_000_000):
     Z = np.divide(X, sd, out=np.zeros_like(X), where=sd > 0)
     R = Z.T @ Z / (n - 1)
     r2 = R * R
-    near = (np.abs(bp[:, None] - bp[None, :]) <= window) & (chrom[:, None] == chrom[None, :])
-    return np.where(near, r2 - (1 - r2) / (n - 2), 0.0).sum(axis=1)
+    near = (np.abs(bp[:, None] - bp[None, :]) <= window) & (chrom[:, None] == chrom[None, :]) & (sd > 0)[None, :]
+    return np.where(near, r2 - (1 - r2) / (n - 2), 0.0).sum(axis=1), sd > 0
 
 
 def test_local_scores_and_bins_match_a_direct_computation(small, tmp_path):
@@ -80,10 +81,10 @@ def test_local_scores_and_bins_match_a_direct_computation(small, tmp_path):
     keep = tmp_path / "keep.txt"
     pd.DataFrame({"FID": iid[50:], "IID": iid[50:]}).to_csv(keep, sep=" ", header=False, index=False)
     tab, n = local_ld_scores(str(tmp_path / "miss"), keep=str(keep), step=97, log=quiet)
-    assert n == 350 and len(tab) == len(v)
-    want = _direct_local_scores(G[50:], v.BP.to_numpy(), v.CHR.to_numpy())
-    np.testing.assert_allclose(tab.local.to_numpy(), want, rtol=1e-5, atol=1e-5)
-    f = np.nanmean(G[50:], axis=0) / 2
+    want, poly = _direct_local_scores(G[50:], v.BP.to_numpy(), v.CHR.to_numpy())
+    assert n == 350 and tab.SNP.tolist() == v.SNP[poly].tolist()
+    np.testing.assert_allclose(tab.local.to_numpy(), want[poly], rtol=1e-5, atol=1e-5)
+    f = np.nanmean(G[50:], axis=0)[poly] / 2
     np.testing.assert_allclose(tab.MAF.to_numpy(), np.minimum(f, 1 - f), atol=1e-12)
     A = maf_ld_bins(tab.MAF.to_numpy(), tab.local.to_numpy())
     assert (A.sum(axis=1) == 1).all()
@@ -141,7 +142,8 @@ def test_release_folder_and_compose_from_it(small, tmp_path):
     text = " ".join((out / "README.txt").read_text().split())
     assert "Never share" in text and "at least 50 people" in text
     sf = json.load(open(out / "cohort.sample_factors.json"))
-    assert "max" not in sf["leverage"] and len(sf["leverage"]["quantiles_90_99"]) == 2
+    assert set(sf["leverage"]) == {"mean", "sd"}                # no maximum or quantile: one person's value
+    assert "max_abs" not in json.load(open(out / "cohort.curve.json")).get("relatedness", {})
     ss = [str(d / "ss" / f"trait{t}.sumstats") for t in range(2)]
     cli = dict(relatedness="auto", cell_matrix="auto", log=quiet)      # the command line's defaults
     p_rel = compose_ldscores(str(d / "ref"), ss, str(out / "cohort.bins8.annot.gz"), str(tmp_path / "c_rel"),
@@ -270,6 +272,184 @@ def test_cross_source_writes_the_annotation_of_its_snps(small, tmp_path):
                      generations=8, log=quiet)
     own = pd.read_csv(tmp_path / "own.gw.ldscore.gz", sep="\t")
     assert own.SNP.tolist() == cross.SNP.tolist()
+
+
+def _cli(*args, cwd):
+    """`summit admixed-ld ...` as a user runs it (the summit that the tests import)."""
+    return subprocess.run([sys.executable, "-m", "summit", "admixed-ld", *args], cwd=cwd, capture_output=True,
+                          text=True)
+
+
+def test_release_command_checks_first_and_creates_parent_folders(small, tmp_path):
+    """The command line's release checks its inputs before it writes anything (a refused release leaves no folder and
+    no log), builds into missing parent folders, and records no pair's relatedness; compose, bins and sample-factors
+    create the parent folder of --out; a folder step given a file as --out stops with a message."""
+    d, iid = small["dir"], small["iid"]
+    few = tmp_path / "few.txt"
+    pd.DataFrame({"FID": iid[:40], "IID": iid[:40]}).to_csv(few, sep=" ", header=False, index=False)
+    pairs = tmp_path / "pairs.tsv"
+    pd.DataFrame({"IID1": iid[[0, 2]], "IID2": iid[[1, 3]]}).to_csv(pairs, sep="\t", index=False)
+    before = set(os.listdir(tmp_path))
+    r = _cli("release", "--geno", str(d / "cohort"), "--ref", str(d / "ref"), "--keep", str(few), "--covar",
+             str(d / "cohort.cov"), "--out", "x/release", cwd=tmp_path)
+    assert r.returncode != 0 and "at least 50" in r.stderr
+    assert set(os.listdir(tmp_path)) == before                      # nothing written, no log
+    r = _cli("release", "--geno", str(d / "cohort"), "--ref", str(d / "ref"), "--covar", str(d / "cohort.cov"),
+             "--relative-pairs", str(pairs), "--cell-cm", "0.5", "--out", "x/y/release", cwd=tmp_path)
+    assert r.returncode == 0, r.stderr[-3000:]
+    rel = tmp_path / "x" / "y" / "release"
+    assert {"release.json", "release.log", "README.txt"} <= set(os.listdir(rel))
+    assert [f for f in os.listdir(rel.parent) if f != "release"] == []    # no work folder left behind
+    cj = json.load(open(rel / "cohort.curve.json"))
+    assert cj["relatedness"]["pairs"] == 2 and "max_abs" not in cj["relatedness"]
+    assert cj["background"]["file"] == "cohort.background.tsv" and cj["cells"]["file"] == "cohort.cells.npz"
+    assert "largest" not in (rel / "release.log").read_text()
+    ss = str(d / "ss" / "trait0.sumstats")
+    r = _cli("compose", "--ref", str(d / "ref"), "--release", str(rel), "--sumstats", ss, "--annot",
+             str(rel / "cohort.bins8.annot.gz"), "--out", "ld/cohort", cwd=tmp_path)
+    assert r.returncode == 0, r.stderr[-3000:]
+    assert os.path.exists(tmp_path / "ld" / "cohort.gw.ldscore.gz") and os.path.exists(tmp_path / "ld" /
+                                                                                      "cohort.compose.log")
+    r = _cli("bins", "--geno", str(d / "cohort"), "--out", "bins/cohort", cwd=tmp_path)
+    assert r.returncode == 0 and os.path.exists(tmp_path / "bins" / "cohort.bins8.annot.gz")
+    r = _cli("bins", "--geno", str(d / "cohort"), "--keep", str(few), "--out", "bins/few", cwd=tmp_path)
+    assert r.returncode != 0 and "at least 50" in r.stderr
+    (tmp_path / "afile").write_text("x\n")
+    r = _cli("reference", "--panel", str(d / "panelA"), "--panel", str(d / "panelE"), "--names", "AFR,EUR", "--out",
+             "afile", cwd=tmp_path)
+    assert r.returncode != 0 and "is not a folder" in r.stderr and "FileExistsError" not in r.stderr
+
+
+def test_release_rerun_keeps_the_earlier_release_until_the_new_one_is_complete(small, tmp_path, monkeypatch):
+    """A rerun that fails leaves the earlier release as it was and its partial folder at OUT.failed; a rerun that
+    succeeds replaces the release and removes OUT.failed; a folder of other files is refused before anything changes."""
+    import summit.admixed_ld.curve as curve_mod
+    d = small["dir"]
+    out = tmp_path / "release"
+    kw = dict(covar=str(d / "cohort.cov"), cell_cm=0.5, log=quiet)
+    make_release(str(d / "cohort"), str(d / "ref"), str(out), **kw)
+    first = (out / "release.json").read_text()
+
+    def broken(*a, **k):
+        raise RuntimeError("the curve stopped")
+    monkeypatch.setattr(curve_mod, "genotype_curve", broken)
+    with pytest.raises(RuntimeError, match="the curve stopped"):
+        make_release(str(d / "cohort"), str(d / "ref"), str(out), **kw)
+    assert (out / "release.json").read_text() == first and os.path.exists(out / "cohort.curve.json")
+    assert os.path.isdir(tmp_path / "release.failed")
+    monkeypatch.undo()
+    make_release(str(d / "cohort"), str(d / "ref"), str(out), **kw)
+    assert not os.path.exists(tmp_path / "release.failed")
+    assert sorted(f for f in os.listdir(tmp_path) if f.startswith(".")) == []
+    other = tmp_path / "other"
+    other.mkdir()
+    (other / "notes.txt").write_text("x\n")
+    with pytest.raises(ValueError, match="not a release folder"):
+        make_release(str(d / "cohort"), str(d / "ref"), str(other), **kw)
+    assert os.listdir(other) == ["notes.txt"]
+
+
+def test_release_on_snps_filtered_on_maf(small, tmp_path):
+    """A cohort whose SNPs were filtered on MAF (no SNP below 0.05): the release leaves the empty bins and class out,
+    says so in its README, and compose and the fit read the annotation."""
+    S, v = small["S"], small["S"]["variants"]
+    G = S["cohort"]
+    f = G.mean(axis=0) / 2
+    common = np.minimum(f, 1 - f) >= 0.05
+    iid = write_bed(str(tmp_path / "common"), G[:, common].astype(np.int8), v[common].reset_index(drop=True), "c")
+    C = principal_components(G, 2)
+    pd.DataFrame({"FID": iid, "IID": iid, "PC1": C[:, 0], "PC2": C[:, 1]}).to_csv(tmp_path / "common.cov",
+                                                                                   sep="\t", index=False)
+    rec = make_release(str(tmp_path / "common"), str(small["dir"] / "ref"), str(tmp_path / "release"),
+                       covar=str(tmp_path / "common.cov"), cell_cm=0.5, log=quiet)
+    assert rec["bins"]["empty_left_out"] == [f"maf_low_ld{q}" for q in range(1, 5)] + ["maf_low"]
+    a8 = pd.read_csv(tmp_path / "release" / "cohort.bins8.annot.gz", sep="\t")
+    assert list(a8.columns)[4:] == [f"maf_high_ld{q}" for q in range(1, 5)]
+    assert "maf_low" in " ".join((tmp_path / "release" / "README.txt").read_text().split())
+    compose_ldscores(str(small["dir"] / "ref"), [str(small["dir"] / "ss" / "trait0.sumstats")],
+                     str(tmp_path / "release" / "cohort.bins8.annot.gz"), str(tmp_path / "ld"),
+                     release=str(tmp_path / "release"), log=quiet)
+    assert list(pd.read_csv(tmp_path / "ld.gw.ldscore.gz", sep="\t", nrows=1).columns)[4:] == list(a8.columns)[4:]
+
+
+def test_a_moved_release_reads_its_own_files(small, tmp_path, monkeypatch):
+    """compose --release other/release, run from a folder that has a release of its own at ./release, reads the
+    background term and the cell matrix of other/release."""
+    d = small["dir"]
+    other = tmp_path / "other"
+    make_release(str(d / "cohort"), str(d / "ref"), str(other / "release"), covar=str(d / "cohort.cov"),
+                 cell_cm=0.5, log=quiet)
+    here = tmp_path / "here"
+    make_release(str(d / "cohort"), str(d / "ref"), str(here / "release"), cell_cm=0.5, log=quiet)   # no covariates
+    monkeypatch.chdir(here)
+    cli = dict(relatedness="auto", cell_matrix="auto", log=quiet)
+    ss, an = [str(d / "ss" / "trait0.sumstats")], str(d / "annot.tsv")
+    p_moved = compose_ldscores(str(d / "ref"), ss, an, str(tmp_path / "moved"), release="../other/release", **cli)
+    monkeypatch.chdir(other)
+    p_home = compose_ldscores(str(d / "ref"), ss, an, str(tmp_path / "home"), release="release", **cli)
+    assert p_moved["relatedness_profile"]["source"] == "../other/release/cohort.background.tsv"
+    assert p_moved["cell_matrix"]["file"] == "../other/release/cohort.cells.npz"
+    a, b = (pd.read_csv(tmp_path / f"{x}.gw.ldscore.gz", sep="\t") for x in ("moved", "home"))
+    pd.testing.assert_frame_equal(a, b)
+
+
+def test_cov_rank_option_overrides_the_column(small, tmp_path):
+    """--cov-rank overrides a COV_RANK column (logged), as summit --h2 --cov-rank does; a negative value is refused;
+    a rank taken from a statistic given to compose is flagged as such; summit --h2 warns when composed LD scores meet
+    summary statistics without COV_RANK and no --cov-rank."""
+    from summit.admixed_ld.sample_factors import sample_factors
+    d = small["dir"]
+    ref, an, ss = str(d / "ref"), str(d / "annot.tsv"), str(d / "ss" / "trait0.sumstats")
+    msgs = []
+    p = compose_ldscores(ref, [ss], an, str(tmp_path / "a"), generations=8, cov_rank=5, log=msgs.append)
+    assert p["covariate_rank"] == 5 and any("--cov-rank 5 overrides the COV_RANK 2" in m for m in msgs)
+    with pytest.raises(ValueError, match="0 or more"):
+        compose_ldscores(ref, [ss], an, str(tmp_path / "b"), generations=8, cov_rank=-1, log=quiet)
+    t = pd.read_csv(ss, sep="\t").drop(columns="COV_RANK")
+    t.to_csv(tmp_path / "norank.tsv", sep="\t", index=False)
+    sample_factors(str(d / "cohort"), ref, str(tmp_path / "sf"), covar=str(d / "cohort.cov"), log=quiet)
+    p = compose_ldscores(ref, [str(tmp_path / "norank.tsv")], an, str(tmp_path / "c"), generations=8,
+                         sample_factors=str(tmp_path / "sf"), log=quiet)
+    assert p["covariate_rank"] == 2 and "cov_rank_from_sample_statistic" in [f["flag"] for f in p["flags"]]
+    r = _summit("--h2", str(tmp_path / "norank.tsv"), "--ldscores", str(tmp_path / "c"), "--annot", an, "--out",
+                str(tmp_path / "h"), cwd=tmp_path)
+    assert r.returncode == 0, r.stderr[-2000:]
+    assert "--cov-rank 2" in open(tmp_path / "h.log").read()
+
+
+def _bed(prefix, G, chrom, bp, a1=None):
+    n, m = G.shape
+    v = pd.DataFrame({"CHR": np.asarray(chrom).astype(str), "SNP": [f"s{j}" for j in range(m)],
+                      "CM": np.asarray(bp) / 1e6, "BP": np.asarray(bp), "A1": a1 if a1 is not None else "A", "A2": "G"})
+    write_bed(prefix, G.astype(np.float32), v, "p")
+    return v
+
+
+def test_bins_edge_cases(tmp_path):
+    """A MAF exactly at a cut falls in the same bin whichever allele is counted; a monomorphic SNP is neither a row
+    nor a partner and leaves the others' scores and quartiles unchanged; a partner exactly 1 Mb away is included."""
+    rng = np.random.default_rng(9)
+    n = 100
+    base = rng.binomial(2, 0.3, (n, 6)).astype(float)
+    at_cut = np.zeros(n)
+    at_cut[:20] = 1.0                                               # 20 copies of 200: MAF exactly 0.1
+    G = np.column_stack([base, at_cut, 2.0 - at_cut])               # the same SNP, the other allele counted
+    bp = np.array([1, 400_001, 1_000_001, 1_000_002, 2_500_000, 3_000_000, 4_000_000, 6_000_000])
+    _bed(str(tmp_path / "e"), G, ["1"] * 8, bp)
+    tab, _ = local_ld_scores(str(tmp_path / "e"), log=quiet)
+    assert tab.MAF.iloc[6] == tab.MAF.iloc[7] == 0.1
+    A = maf_ld_bins(tab.MAF.to_numpy(), tab.local.to_numpy())
+    assert np.digitize([0.1], [0.02, 0.05, 0.1, 0.2, 0.3])[0] + 1 == 4
+    want, _ = _direct_local_scores(G, bp, np.array(["1"] * 8))
+    np.testing.assert_allclose(tab.local.to_numpy(), want, rtol=1e-5, atol=1e-5)   # SNP 0 and 2 are 1 Mb apart
+    G2 = np.column_stack([G[:, :3], np.ones(n), G[:, 3:]])           # a monomorphic SNP in the middle
+    bp2 = np.r_[bp[:3], 1_000_000, bp[3:]]
+    _bed(str(tmp_path / "m"), G2, ["1"] * 9, bp2)
+    msgs = []
+    tab2, _ = local_ld_scores(str(tmp_path / "m"), log=msgs.append)
+    assert len(tab2) == 8 and "s3" not in tab2.SNP.tolist() and any("monomorphic" in m for m in msgs)
+    np.testing.assert_allclose(tab2.local.to_numpy(), tab.local.to_numpy(), rtol=1e-6)
+    np.testing.assert_array_equal(maf_ld_bins(tab2.MAF.to_numpy(), tab2.local.to_numpy()), A)
 
 
 def test_every_flag_is_in_the_docs():

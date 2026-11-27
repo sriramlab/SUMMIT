@@ -169,7 +169,7 @@ def remove_panel_admixture(ref_path, panels: dict, out=None, *, match="position"
         _, info = genotype_curve(prefix, ref_path, cprefix, sources=names, covar=None, match=match, max_cm=hi,
                                  cells_cm=0, per_chromosome=True, step=step, threads=threads, native=native,
                                  background=background, background_quantile=background_quantile,
-                                 background_between_snps=background_snps, log=log)
+                                 background_between_snps=background_snps, sample_factors=False, log=log)
         if background:
             src["panel_background"] = panel_background_record(info, pd.read_csv(f"{cprefix}.background.tsv", sep="\t"),
                                                               file=os.path.basename(cprefix) + ".background.tsv")

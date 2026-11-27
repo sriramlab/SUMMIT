@@ -85,8 +85,7 @@ class _PairRelatedness:
     def summary(self) -> dict:
         g = self.dot / max(self.m, 1)
         return dict(sum_squared_ordered=float(2.0 * np.sum(g * g)), pairs=int(g.size), n_snps=int(self.m),
-                    mean=float(g.mean()) if g.size else float("nan"),
-                    max_abs=float(np.abs(g).max()) if g.size else float("nan"))
+                    mean=float(g.mean()) if g.size else float("nan"))
 
 
 def _control_pairs(n, pa, pb, count, seed=20261105):
@@ -235,7 +234,6 @@ class _RelativesProfile:
         wb = float(self.m) ** 2 - float(np.sum(np.square(np.asarray(self.mc, np.float64))))
         return dict(sum_squared_ordered=float(2.0 * np.sum(g * g)), pairs=int(nl), n_snps=int(self.m),
                     mean=float(g.mean()) if g.size else float("nan"),
-                    max_abs=float(np.abs(g).max()) if g.size else float("nan"),
                     between=dict(listed=bl, controls=bc, n_controls=int(nct), w=wb,
                                  value=(bl - ratio * bc) / wb if wb > 0 else float("nan")))
 
@@ -758,7 +756,8 @@ def genotype_curve(geno, ref_path, out, *, sources=None, covar=None, keep=None, 
             return out_
         btab, binfo = bg.finish(kernel_at, inter)
         btab.to_csv(f"{out}.background.tsv", sep="\t", index=False, float_format="%.10g")
-        info["background"] = dict(**binfo, file=f"{out}.background.tsv", quantile=float(background_quantile),
+        info["background"] = dict(**binfo, file=f"{os.path.basename(out)}.background.tsv",
+                                  quantile=float(background_quantile),
                                   definition="excess = (x - adm) / w - null: the cross-person LD of all ordered pairs of "
                                              "people per pair of the least differentiated SNPs at the lag's mean "
                                              "distance d_cm, less the admixture LD of the curve's kernel and SUMMIT's "
@@ -778,7 +777,8 @@ def genotype_curve(geno, ref_path, out, *, sources=None, covar=None, keep=None, 
         np.savez(f"{out}.relatedness_chr.npz", chrom=np.array([x["name"] for x in prof.chr]),
                  **{k: np.stack([np.pad(x[k], (0, max(y["w"].size for y in prof.chr) - x[k].size)) for x in prof.chr])
                     for k in ("listed", "controls", "w", "dsum")})
-        summ["profile"] = dict(file=f"{out}.relatedness.tsv", per_chromosome=f"{out}.relatedness_chr.npz",
+        summ["profile"] = dict(file=f"{os.path.basename(out)}.relatedness.tsv",
+                               per_chromosome=f"{os.path.basename(out)}.relatedness_chr.npz",
                                cell_cm=float(relatedness_cell_cm), n_controls=int(prof.n_controls),
                                definition="phi(L) = [P(L) - (n_listed / n_controls) Pc(L)] / W(L): the relatives' "
                                           "excess of sum_{ordered pairs} u_aj u_bj u_ak u_bk per SNP pair at the lag's "
@@ -796,8 +796,8 @@ def genotype_curve(geno, ref_path, out, *, sources=None, covar=None, keep=None, 
                                    definition="relatedness of the covariate-adjusted, standardized genotypes")
     if "relatedness" in info:
         r = info["relatedness"]
-        log(f"[admixed-ld] curve: {r['pairs']} relative pairs, mean relatedness after the covariates {r['mean']:.4f} "
-            f"(largest |g| {r['max_abs']:.3f}); sum over ordered pairs of g^2 {r['sum_squared_ordered']:.4g}")
+        log(f"[admixed-ld] curve: {r['pairs']} relative pairs, mean relatedness after the covariates {r['mean']:.4f}; "
+            f"sum over ordered pairs of g^2 {r['sum_squared_ordered']:.4g}")
     if cells_cm and coarse_U:
         # two random halves of the people give independent estimates of each cell-pair covariance, whose product is
         # unbiased for its square (and, with K sources, for the products of kernel entries)
@@ -821,14 +821,14 @@ def genotype_curve(geno, ref_path, out, *, sources=None, covar=None, keep=None, 
         np.savez(f"{out}.cells.npz", S1_upper=Sh[0][iu], S2_upper=Sh[1][iu], size=Sh[0].shape[0],
                  Q=np.concatenate(coarse_q), chrom=tab.CHR.to_numpy().astype(str), start_cm=tab.start_cm.to_numpy(),
                  width_cm=tab.width_cm.to_numpy(), k1=k1)
-        info["cells"] = dict(file=f"{out}.cells.npz", n_cells=int(nC), cells_cm=float(cells_cm),
+        info["cells"] = dict(file=f"{os.path.basename(out)}.cells.npz", n_cells=int(nC), cells_cm=float(cells_cm),
                              estimator="split halves")
         del Uall
     if per_chromosome:
         # each chromosome's lag sums, for a leave-one-chromosome-out jackknife of the curve (aggregates only)
         np.savez(f"{out}.curve_chr.npz", chrom=np.array([x[0] for x in chr_parts]), cell_cm=float(cell_cm),
                  num=np.stack([x[1] for x in chr_parts]), den=np.stack([x[2] for x in chr_parts]))
-        info["per_chromosome"] = f"{out}.curve_chr.npz"
+        info["per_chromosome"] = f"{os.path.basename(out)}.curve_chr.npz"
     # the statistic is finished and written before the curve's json, which lists it only when it was made
     sf_info = None
     if sf_acc is not None:

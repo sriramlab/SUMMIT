@@ -210,7 +210,7 @@ def _inversion_parameters(geno, out, ref, known, name, src_meta, chrom, local, k
                    products=dict(native=False, repaired_columns=0))
     sources = known + [name]
     _, cinfo = genotype_curve(geno, prov, out + ".anchor", sources=sources, covar=covar, keep=keep, match=match,
-                              cell_cm=cell_cm, threads=threads, native=native, log=log)
+                              cell_cm=cell_cm, threads=threads, native=native, sample_factors=False, log=log)
     from .model import KernelMatrix
     d_c = pd.read_csv(out + ".anchor.curve.tsv", sep="\t")
 

@@ -22,8 +22,8 @@ heterozygosity that compose uses without a statistic. The loadings use the refer
 contrasts' products less their sampling covariance, as compose does.
 
 Diagnostics written with the statistic (aggregates): the realized between-chromosome same-person mass of the sample,
-from each person's per-chromosome sums of y, the factor model's prediction of it, and the mean, SD and upper quantiles
-of the covariates' leverage.
+from each person's per-chromosome sums of y, the factor model's prediction of it, and the mean and SD of the
+covariates' leverage (no maximum or quantile, which in a small sample is one person's value).
 """
 from __future__ import annotations
 
@@ -238,9 +238,8 @@ class FactorAccumulator:
                     diagnostics=dict(between_chromosome_same_person_mass=realized,
                                      predicted_by_factors=predicted,
                                      share_predicted=predicted / realized if realized != 0 else None),
-                    # the leverage's mean, SD and upper quantiles (not its maximum, one person's value)
-                    leverage=dict(mean=float(lev.mean()), sd=float(lev.std()),
-                                  quantiles_90_99=[float(x) for x in np.quantile(lev, [0.9, 0.99])]))
+                    # the leverage's mean and SD only: a maximum or an upper quantile is one person's value
+                    leverage=dict(mean=float(lev.mean()), sd=float(lev.std())))
 
 
 def write_sample_factors(out, info, log=print, t0=None):
@@ -251,7 +250,7 @@ def write_sample_factors(out, info, log=print, t0=None):
     took = f" ({time.perf_counter() - t0:.0f} s)" if t0 is not None else ""
     log(f"[admixed-ld] sample-factors: wrote {out}.sample_factors.json; between-chromosome same-person mass "
         f"{realized:.6g}, factors predict {predicted:.6g} ({predicted / realized:.3f}); leverage mean "
-        f"{lev['mean']:.4f}, SD {lev['sd']:.4f}, 99th percentile {lev['quantiles_90_99'][1]:.3f}{took}")
+        f"{lev['mean']:.4f}, SD {lev['sd']:.4f}{took}")
 
 
 def sample_factors(geno, ref_path, out, *, sources=None, covar=None, keep=None, match="position", step=4096,

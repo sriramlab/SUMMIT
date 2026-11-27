@@ -2099,6 +2099,48 @@ def _refuse_partner_ldscores(path, option="--ldscores"):
                          "summit --h2 and --rg; --partners reference serves track-rg and development.")
 
 
+def _composed_cov_rank(ldscores):
+    """The covariate rank that `summit admixed-ld compose` used for an LD-score file (PREFIX.gw.ldscore.gz, or a
+    per-sample-size or cross file PREFIX.<part>.gw.ldscore.gz), from PREFIX.admixed_ld.json, or None."""
+    import json
+    s = str(ldscores)
+    prefix = s[:-len(".gw.ldscore.gz")] if s.endswith(".gw.ldscore.gz") else s
+    for cand in (prefix, prefix.rsplit(".", 1)[0] if "." in os.path.basename(prefix) else None):
+        if cand and os.path.exists(f"{cand}.admixed_ld.json"):
+            try:
+                with open(f"{cand}.admixed_ld.json") as fh:
+                    rank = json.load(fh).get("covariate_rank")
+            except (OSError, ValueError):
+                return None
+            return None if rank is None else int(rank)
+    return None
+
+
+def _warn_missing_cov_rank(args, sumstats_paths, ldscores, log):
+    """Summary statistics without COV_RANK are fitted with covariate rank 0 unless --cov-rank is given. When the LD
+    scores were composed by `summit admixed-ld compose`, which used a covariate rank for these GWAS, say so loudly."""
+    if getattr(args, "cov_rank", None) is not None:
+        return
+    rank = _composed_cov_rank(ldscores)
+    if rank is None or rank == 0:
+        return
+    from .sumstats.sumstats import _maybe_find_column
+    lacking = []
+    for p in sumstats_paths:
+        try:
+            cols = list(utils._read_csv_maybe_chr_split(p, sep=r"\s+", compression="infer", nrows=0).columns)
+        except Exception:
+            continue
+        if _maybe_find_column(cols, ["COV_RANK", "cov_rank", "P_EFF", "p_eff"]) is None:
+            lacking.append(os.path.basename(str(p)))
+    if lacking:
+        log._log(f"!!! WARNING: {len(lacking)} summary-statistic file(s) have no COV_RANK column ("
+                 + ", ".join(lacking[:5]) + (", ..." if len(lacking) > 5 else "")
+                 + f") and are fitted with covariate rank 0, but their LD scores were composed with covariate rank "
+                 f"{rank} ({ldscores}). Pass --cov-rank {rank} (or add a COV_RANK column) so that the fit uses the "
+                 "GWAS's covariates. !!!")
+
+
 def _ldscore_groups(ldscores):
     """compose's PREFIX.n_groups.tsv next to --ldscores (PREFIX or PREFIX.gw.ldscore.gz): (prefix, table of trait,
     N, ldscores), or None when there is none. The ldscores column is resolved against the table's directory."""
@@ -2299,6 +2341,10 @@ def _dispatch_h2(args, log):
         raise SystemExit(1)
     args.ldscores = _resolve_ldscore_prefix(args.ldscores)            # a compose output given by its prefix
     _refuse_partner_ldscores(args.ldscores)
+    try:
+        _warn_missing_cov_rank(args, utils._parse_sumdir(args.h2), args.ldscores, log)
+    except ValueError:
+        pass                                                         # --h2 errors are reported where they are read
     grp = _ldscore_groups(args.ldscores) if getattr(args, "ldscore_groups", "auto") == "auto" else None
     if grp is not None:
         if args.h2_batch_fast:
@@ -2472,6 +2518,10 @@ def _dispatch_rg(args, log):
         raise SystemExit(1)
     args.ldscores = _resolve_ldscore_prefix(args.ldscores)            # a compose output given by its prefix, as --h2
     _refuse_partner_ldscores(args.ldscores)
+    try:
+        _warn_missing_cov_rank(args, utils._parse_rg_pair(args.rg), args.ldscores, log)
+    except ValueError:
+        pass
     if getattr(args, "ldscore_groups", "auto") == "auto" and _ldscore_groups(args.ldscores) is not None:
         log._log(f"[rg] note: {args.ldscores} has compose LD-score groups (n_groups.tsv); --rg uses the file given for "
                  "both traits. For traits of different GWAS samples pass the LD scores of the pair's sample.")

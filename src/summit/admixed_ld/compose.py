@@ -327,6 +327,20 @@ class _TrackScores:
                                "SEs; the track heritability is sum_c tau_s,c partner_V_mass[s][c]")
 
 
+def curve_file(curve_prefix, suffix, recorded=None):
+    """A file of the curve CURVE_PREFIX (its background table, cell matrix, ...): CURVE_PREFIX + suffix, else the name
+    that the curve's json records, looked up next to the curve. A curve's files are always read next to its json, never
+    from the working directory, so a curve or a release moved elsewhere reads its own files."""
+    cands = [f"{curve_prefix}{suffix}"]
+    if recorded:
+        cands.append(os.path.join(os.path.dirname(curve_prefix), os.path.basename(str(recorded))))
+    for c in dict.fromkeys(cands):
+        if os.path.exists(c):
+            return c
+    raise ValueError(f"The curve {curve_prefix} needs its file {' or '.join(dict.fromkeys(cands))}, which does not "
+                     "exist; keep a curve's files together.")
+
+
 def _fft_conv_sym(W: np.ndarray, kern: np.ndarray) -> np.ndarray:
     """F[g] = sum_g' W[g'] kern[|g - g'|] for every column of W (grid x classes)."""
     n = W.shape[0]
@@ -414,8 +428,8 @@ def _cell_correction(path, kern, chrom_out, cm_out, Oflat, Wn, cls, K, k1, switc
     per_cell = np.einsum("ijuv,jvk->iuk", delta_F, Wc)             # cells x k2 x classes
     corr = np.zeros((chrom_out.size, K))
     corr[have] = np.einsum("ju,juk->jk", Oflat[have], per_cell[cell_of[have]])
-    log(f"[admixed-ld] compose: cell matrix of {nC} cells used beyond {switch_cm} cM and between chromosomes "
-        f"({int((~have).sum())} SNPs outside the cells)")
+    log(f"[admixed-ld] compose: cell matrix of {nC} cells from {path} used beyond {switch_cm} cM and between "
+        f"chromosomes ({int((~have).sum())} SNPs outside the cells)")
     return corr, dict(file=path, n_cells=int(nC), switch_cm=float(switch_cm))
 
 
@@ -482,10 +496,11 @@ class RelatednessProfile:
         if "background" not in info:
             return prof
         b = info["background"]
-        t = pd.read_csv(b["file"] if os.path.exists(b["file"]) else f"{curve_prefix}.background.tsv", sep="\t")
+        path = curve_file(curve_prefix, ".background.tsv", b.get("file"))
+        t = pd.read_csv(path, sep="\t")
         tb = pd.DataFrame({"lag": t.lag, "d_cm": t.d_cm, "w": t.w, "dsum": t.d_cm * t.w,
                            "listed": (t.excess * t.w).to_numpy(), "controls": 0.0})
-        bgp = cls(tb, b["between"]["value"], 1, 0, smooth, source=b["file"])
+        bgp = cls(tb, b["between"]["value"], 1, 0, smooth, source=path)
         return BackgroundProfile(prof, bgp, background_min_cm, background_window)
 
     def __call__(self, d):
@@ -588,7 +603,7 @@ class SmoothBackground:
     @classmethod
     def from_curve(cls, curve_prefix: str, info: dict, fit_min_cm=3.0, smooth=0.1):
         b = info["background"]
-        path = b["file"] if os.path.exists(b["file"]) else f"{curve_prefix}.background.tsv"
+        path = curve_file(curve_prefix, ".background.tsv", b.get("file"))
         return cls(pd.read_csv(path, sep="\t"), b["between"]["value"], info["n_samples"], fit_min_cm, smooth,
                    source=path, name="cohort")
 
@@ -910,9 +925,10 @@ def compose_ldscores(ref_path, sumstats, annot, out, *, sources=None, snps=None,
     every LD-score file of such a composition has a marker <prefix>.partners.json next to it, and they refuse it;
     `track-rg` reads the partners' counts.
 
-    cov_rank: the covariate rank of summary statistics without a COV_RANK column (a file's own COV_RANK is kept).
-    Without it such a trait takes the covariate rank of the curve (or of a statistic given to compose), with the flag
-    cov_rank_from_curve, and without either the rank 0, with the flag cov_rank_missing.
+    cov_rank: the covariate rank of every GWAS, which overrides their COV_RANK columns (logged), as summit --h2/--rg's
+    --cov-rank does. Without it a trait without COV_RANK takes the covariate rank of the curve (flag cov_rank_from_curve)
+    or of a statistic given to compose (cov_rank_from_sample_statistic), and without either the rank 0, with the flag
+    cov_rank_missing.
 
     release: a folder written by `summit admixed-ld release` in place of `curve`: its curve (with its sample statistic,
     background term and cell matrix) is used as `curve` would be.
@@ -1091,14 +1107,19 @@ def compose_ldscores(ref_path, sumstats, annot, out, *, sources=None, snps=None,
             raise ValueError("Every GWAS variant must also be a partner.")
 
     # ---------------------------------------------------------------------------------------- parameters
-    # the covariate rank of each GWAS (COV_RANK) sets nu = N - rank - 1; a file without COV_RANK takes --cov-rank, else
-    # the covariate rank that the cohort's curve (or a statistic given to compose) was made with
-    cohort_rank, cohort_rank_from = None, None
+    # the covariate rank of each GWAS sets nu = N - rank - 1: --cov-rank (which overrides a COV_RANK column, as in
+    # summit --h2/--rg), else the file's COV_RANK, else the covariate rank that the cohort's curve (or a statistic
+    # given to compose) was made with
+    if cov_rank is not None and int(cov_rank) < 0:
+        raise ValueError(f"--cov-rank must be 0 or more (the number of covariates of the GWAS); got {cov_rank}.")
+    cohort_rank, cohort_rank_from, rank_flag = None, None, None
     if curve is not None:
         with open(f"{curve}.curve.json") as fh:
-            cohort_rank, cohort_rank_from = json.load(fh).get("covariate_rank"), "the curve"
+            cohort_rank = json.load(fh).get("covariate_rank")
+        cohort_rank_from, rank_flag = "the curve", "cov_rank_from_curve"
     if cohort_rank is None and sfi is not None and sfi.get("covariate_rank") is not None:
-        cohort_rank, cohort_rank_from = sfi["covariate_rank"], "the sample statistic"
+        cohort_rank, cohort_rank_from, rank_flag = (sfi["covariate_rank"], "the sample statistic",
+                                                    "cov_rank_from_sample_statistic")
     tables, n_med, p_rank, p_from = [], [], [], []
     for f in files:
         try:
@@ -1110,12 +1131,15 @@ def compose_ldscores(ref_path, sumstats, annot, out, *, sources=None, snps=None,
                           "BETA": np.where(ix >= 0, ss.beta[ix], np.nan)})
         tables.append((ss.name, t))
         n_med.append(float(np.median(ss.n)))
-        if ss.cov_rank_source != "default0":
-            p_rank.append(int(ss.cov_rank))
-            p_from.append("COV_RANK")
-        elif cov_rank is not None:
+        if cov_rank is not None:
+            if ss.cov_rank_source != "default0" and int(ss.cov_rank) != int(cov_rank):
+                log(f"[admixed-ld] compose: --cov-rank {int(cov_rank)} overrides the COV_RANK {int(ss.cov_rank)} of "
+                    f"{ss.name}")
             p_rank.append(int(cov_rank))
             p_from.append("--cov-rank")
+        elif ss.cov_rank_source != "default0":
+            p_rank.append(int(ss.cov_rank))
+            p_from.append("COV_RANK")
         elif cohort_rank is not None:
             p_rank.append(int(cohort_rank))
             p_from.append(cohort_rank_from)
@@ -1127,13 +1151,15 @@ def compose_ldscores(ref_path, sumstats, annot, out, *, sources=None, snps=None,
     m_in, k_in = _parse_values(mean_ancestry), _parse_values(kappa0)
     flags = list(pre_flags)
     names_ = [t[0] for t in tables]
-    filled = [nm for nm, w in zip(names_, p_from) if w == cohort_rank_from]
+    filled = [nm for nm, w in zip(names_, p_from) if cohort_rank_from is not None and w == cohort_rank_from]
     if filled:
         detail = (f"{len(filled)} of {len(names_)} trait(s) without COV_RANK ({', '.join(filled[:5])}"
                   + (", ..." if len(filled) > 5 else "") + f") take the covariate rank of {cohort_rank_from}, "
                   f"{int(cohort_rank)}")
-        flags.append(dict(flag="cov_rank_from_curve", detail=detail))
-        log(f"[admixed-ld] compose: {detail} (recorded flag cov_rank_from_curve; --cov-rank sets it)")
+        flags.append(dict(flag="cov_rank_from_curve", detail=detail) if rank_flag == "cov_rank_from_curve" else
+                     dict(flag="cov_rank_from_sample_statistic", detail=detail))
+        log(f"[admixed-ld] compose: {detail} (recorded flag {rank_flag}; --cov-rank sets it). Fit them with "
+            f"summit --h2/--rg --cov-rank {int(cohort_rank)}, or add a COV_RANK column")
     unknown = [nm for nm, w in zip(names_, p_from) if w == "none"]
     if unknown:
         detail = (f"{len(unknown)} of {len(names_)} trait(s) have no COV_RANK ({', '.join(unknown[:5])}"
@@ -1281,7 +1307,8 @@ def compose_ldscores(ref_path, sumstats, annot, out, *, sources=None, snps=None,
             log("[admixed-ld] compose: relatives' term from the curve's "
                 + ("all-pairs background at every distance" if isinstance(rel_prof, SmoothBackground) else "profile")
                 + f", B = {rel_prof.between:.4g} between chromosomes, phi(d) within ("
-                + ", ".join(f"{k} cM {v:.4g}" for k, v in rel_prof.describe()["phi_at"].items()) + ")")
+                + ", ".join(f"{k} cM {v:.4g}" for k, v in rel_prof.describe()["phi_at"].items()) + "), read from "
+                + str(rel_prof.describe().get("source") or "the curve"))
         else:
             if str(relatedness) == "curve":
                 if int(curve_info["relatedness"].get("pairs", -1)) == 0:   # listed pairs, none in the sample: no term
@@ -1612,8 +1639,9 @@ def compose_ldscores(ref_path, sumstats, annot, out, *, sources=None, snps=None,
     if cell_matrix:
         if curve is None:
             raise ValueError("--cell-matrix needs --curve (the curve writes the cell matrix).")
-        corr, cells_used = _cell_correction(f"{curve}.cells.npz", kern, chrom_out, cm_out, Oflat, Wn, cls, K, k1,
-                                            cell_switch_cm, log)
+        cells_path = curve_file(curve, ".cells.npz", (curve_info or {}).get("cells", {}).get("file"))
+        corr, cells_used = _cell_correction(cells_path, kern, chrom_out, cm_out, Oflat, Wn, cls, K, k1, cell_switch_cm,
+                                            log)
         L += corr / cres[:, None]
     # same-person term, each SNP with itself, relatives
     pbar = Pm @ m_vec                                               # frequency at the mean ancestry

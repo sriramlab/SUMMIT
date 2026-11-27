@@ -311,7 +311,8 @@ def ancestry_sd_from_kernel(m_first, kappa0_first):
     without a published value. With independent haplotypes (random mating), the local-ancestry
     dosage of a source at one SNP has variance 2 m (1 - m) = 4 Var(theta) + H, and the GWAS PCs leave kappa_res(0) ~ H,
     so Var(theta) = (2 m (1 - m) - kappa_res(0)) / 4. Assortative mating raises Var(theta) above this, so the value is
-    a lower bound in practice (UK Biobank t1 / t2: 0.261 / 0.242 against 0.293 / 0.301 from the genotypes)."""
+    a lower bound in practice (in the two UK Biobank samples of African ancestry, of 3,781 and 6,111 people, 0.263 and
+    0.242 against 0.29 and 0.30 from their curves)."""
     v = (2.0 * m_first * (1.0 - m_first) - kappa0_first) / 4.0
     if not v > 0:
         raise ValueError(f"kappa_res(0) {kappa0_first:.4g} is not below 2 m (1 - m) = {2 * m_first * (1 - m_first):.4g}, "

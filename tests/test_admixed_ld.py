@@ -1889,7 +1889,9 @@ def test_curve_writes_the_sample_statistic_and_compose_uses_it(sim, tmp_path):
                    sample_factors=False, log=quiet)
     assert not os.path.exists(cv0 + ".sample_factors.json")
     pd.testing.assert_frame_equal(pd.read_csv(cv + ".curve.tsv", sep="\t"), pd.read_csv(cv0 + ".curve.tsv", sep="\t"))
-    strip = lambda j: json.loads(json.dumps(j).replace(cv0, "OUT").replace(cv, "OUT"))
+    # the curve's json names its files by their basename (cv.cells.npz), the rest by path
+    strip = lambda j: json.loads(json.dumps(j).replace(cv0, "OUT").replace(cv, "OUT").replace('"cv0.', '"OUT.')
+                                 .replace('"cv.', '"OUT.'))
     j1, j0 = json.load(open(cv + ".curve.json")), json.load(open(cv0 + ".curve.json"))
     j1.pop("sample_factors")
     assert strip(j1) == strip(j0)
