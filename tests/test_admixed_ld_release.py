@@ -212,8 +212,8 @@ def test_sumstats_directory_reads_what_h2_reads(small, tmp_path):
 
 
 def _summit(*args, cwd):
-    env = dict(os.environ, PYTHONPATH=str(REPO / "src") + os.pathsep + os.environ.get("PYTHONPATH", ""))
-    return subprocess.run([sys.executable, "-m", "summit", *args], cwd=cwd, env=env, capture_output=True, text=True)
+    # the summit that the tests import (an installed or editable build), so compiled modules are found
+    return subprocess.run([sys.executable, "-m", "summit", *args], cwd=cwd, capture_output=True, text=True)
 
 
 def test_partner_ldscores_are_refused_and_rg_takes_a_prefix(small, tmp_path):
