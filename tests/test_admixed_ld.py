@@ -1343,7 +1343,8 @@ def test_matrix_with_derived_source_from_another_population_is_psd(sim3, tmp_pat
                   panel=str(tmp_path / "other"), covar=str(d / "cohort.cov"), ld="panel", step=256, log=lambda *a: None)
     ref3 = Reference(str(tmp_path / "ref3"))
     z = ref3.load(ref3.chromosomes[0])
-    assert np.median(np.abs(np.log(z["vld_2"] / z["v_2"]))[z["v_2"] > 0.05]) > 0.02     # the scales differ
+    big = z["v_2"] > 0.05                            # SNPs without variance in the source or its anchors have no ratio
+    assert np.median(np.abs(np.log(z["vld_2"][big] / z["v_2"][big]))) > 0.02     # the scales differ
     ids = tmp_path / "region.txt"
     pd.Series(z["snp"][:120]).to_csv(ids, index=False, header=False)
     R, snp, info = compose_matrix(ref3.path, str(tmp_path / "mat"), snps=str(ids), sources=names,

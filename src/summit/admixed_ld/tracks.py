@@ -415,7 +415,8 @@ def write_merged(tracks, annot, members, out):
         scores = pd.DataFrame({c: df[mem].to_numpy(np.float64).sum(axis=1) for c, mem in members.items()})
         dst = f"{out}.{nm}"
         write_gw_ldscore_table(dst, df[["CHR", "SNP", "BP"]], scores, snp_var=df["V"].to_numpy() if "V" in df else None)
-        M = np.array(open(rec["file"][:-len(".gw.ldscore.gz")] + ".gw.M").read().split(), dtype=np.float64)
+        with open(rec["file"][:-len(".gw.ldscore.gz")] + ".gw.M") as fh:
+            M = np.array(fh.read().split(), dtype=np.float64)
         write_gw_annotation_masses(dst, np.array([M[idx[c]].sum() for c in members]))
         t2["files"][nm]["file"] = f"{dst}.gw.ldscore.gz"
     p2["class_merge"] = dict(prefix=os.path.abspath(tracks), members=members)
