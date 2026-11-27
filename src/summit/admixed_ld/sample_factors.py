@@ -1,6 +1,7 @@
-"""The cohort's person-factor statistic (`summit admixed-ld sample-factors`): an optional aggregate that gives the
-same-person term of the in-sample LD scores for samples where the random-mating model of it fails (a few hundred
-people, first-generation groups, in-sample PCs).
+"""The cohort's sample statistic (`summit admixed-ld sample-factors`, and the curve's own pass): an aggregate that
+gives the same-person term of the in-sample LD scores. The curve writes it for the cohort by default, and compose uses
+it in place of the random-mating model of that term, which fails in small samples, first-generation groups and with
+in-sample PCs. `sample-factors` makes it alone for one GWAS sample, for example the people of one trait.
 
 In-sample LD scores hold, for every pair of SNPs, the part from each person paired with themselves that SUMMIT's
 noise correction leaves: (n / nu^2) Cov_i(y_ij, y_ik), the covariance across the GWAS's people of their squared
@@ -17,11 +18,12 @@ and the cohort releases only Sigma_u, (1 + (K-1) + K(K-1)/2)^2 numbers. u_i is e
 of y_i on A across the SNPs of the odd and, separately, of the even chromosomes; Sigma_u is the covariance across people
 between the two halves' estimates, whose estimation noise is independent (symmetrized). Under random mating
 level = 1 and Lambda = 2 (diag(theta) - theta theta'), and A' Sigma_u A is the random-mating covariance of
-heterozygosity that compose uses by default. The loadings use the reference's dosage variances and the contrasts'
-products less their sampling covariance, as compose does.
+heterozygosity that compose uses without a statistic. The loadings use the reference's dosage variances and the
+contrasts' products less their sampling covariance, as compose does.
 
 Diagnostics written with the statistic (aggregates): the realized between-chromosome same-person mass of the sample,
-from each person's per-chromosome sums of y, the factor model's prediction of it, and the leverage of the covariates.
+from each person's per-chromosome sums of y, the factor model's prediction of it, and the mean, SD and upper quantiles
+of the covariates' leverage.
 """
 from __future__ import annotations
 
@@ -33,6 +35,19 @@ import pandas as pd
 
 from ._io import DosageBlocks, center_impute, check_match, match_variants
 from .reference import Reference
+
+# the fewest people a sample statistic may describe: a statistic of fewer people, or one whose sample differs from
+# another released statistic's by fewer people, says too much about them
+MIN_PEOPLE = 50
+
+
+def check_statistic_people(n, what="The sample statistic", remedy=None):
+    """Refuse a sample statistic of fewer than MIN_PEOPLE people."""
+    if int(n) < MIN_PEOPLE:
+        raise ValueError(f"{what} would describe {int(n)} people; it needs at least {MIN_PEOPLE}. A statistic of so "
+                         "few people says too much about each of them to be released. "
+                         + (remedy or "Use a larger sample, or let compose take the same-person term under random "
+                                      "mating (compose --no-sample-factors)."))
 
 
 def factor_names(sources) -> list:
@@ -223,7 +238,8 @@ class FactorAccumulator:
                     diagnostics=dict(between_chromosome_same_person_mass=realized,
                                      predicted_by_factors=predicted,
                                      share_predicted=predicted / realized if realized != 0 else None),
-                    leverage=dict(mean=float(lev.mean()), sd=float(lev.std()), max=float(lev.max()),
+                    # the leverage's mean, SD and upper quantiles (not its maximum, one person's value)
+                    leverage=dict(mean=float(lev.mean()), sd=float(lev.std()),
                                   quantiles_90_99=[float(x) for x in np.quantile(lev, [0.9, 0.99])]))
 
 
@@ -235,7 +251,7 @@ def write_sample_factors(out, info, log=print, t0=None):
     took = f" ({time.perf_counter() - t0:.0f} s)" if t0 is not None else ""
     log(f"[admixed-ld] sample-factors: wrote {out}.sample_factors.json; between-chromosome same-person mass "
         f"{realized:.6g}, factors predict {predicted:.6g} ({predicted / realized:.3f}); leverage mean "
-        f"{lev['mean']:.4f}, SD {lev['sd']:.4f}, max {lev['max']:.3f}{took}")
+        f"{lev['mean']:.4f}, SD {lev['sd']:.4f}, 99th percentile {lev['quantiles_90_99'][1]:.3f}{took}")
 
 
 def sample_factors(geno, ref_path, out, *, sources=None, covar=None, keep=None, match="position", step=4096,
@@ -265,6 +281,7 @@ def sample_factors(geno, ref_path, out, *, sources=None, covar=None, keep=None, 
     samples, rows, C = _cohort_samples(geno, covar, keep, log)
     blocks = DosageBlocks(geno, rows=rows, threads=threads, step=step)
     N = blocks.n
+    check_statistic_people(N)
     p_rank = C.shape[1]
     nu = N - 1 - p_rank
     if nu < 10:

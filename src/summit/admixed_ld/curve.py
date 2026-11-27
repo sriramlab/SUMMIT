@@ -578,6 +578,10 @@ def genotype_curve(geno, ref_path, out, *, sources=None, covar=None, keep=None, 
             sf_skip = (f"the SNPs with finite loadings are on {len(chroms_sf)} chromosome(s); the statistic's two halves "
                        "are the odd and the even chromosomes (in genome order), so it needs two or more")
         else:
+            from .sample_factors import check_statistic_people
+            check_statistic_people(N, "The curve's sample statistic",
+                                   "Pass --no-sample-factors to make the curve without it (compose then takes the "
+                                   "same-person term under random mating).")
             _check_statistic_overwrite(out)                    # before the pass, not after it
             sf_acc = FactorAccumulator(N, df_res, len(chroms_sf), len(names_sf),
                                        ld_mass=bool(sample_factors_ld_mass) or int(sample_factors_probes or 0) > 0,
