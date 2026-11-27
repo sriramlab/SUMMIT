@@ -104,19 +104,22 @@ Every file holds aggregates over the release's people, and none has a row about 
 who enters any GWAS of the cohort (`--keep`), with the covariates that every GWAS uses, principal components included
 (`--covar`). `--relative-pairs` is a file of related pairs with columns IID1 and IID2 (optionally FID1, FID2 and a
 kinship column), for example pairs with relatedness above 0.0442 in a GRM of PC-adjusted genotypes. They keep each
-family within one half of the cell matrix (`--kinship-col` and `--kinship-min` select pairs). `--out` must be a new or empty folder, or an earlier
-release, which is replaced.
+family within one half of the cell matrix (`--kinship-col` and `--kinship-min` select pairs).
 
-The release refuses a sample of fewer than 50 people. Its curve stops when the cohort's alleles disagree with the
+`--out` is a new folder, an empty one or an earlier release. Missing parent folders are created. The release checks
+its inputs before it writes anything and refuses a sample of fewer than 50 people. It builds the new folder next to
+`--out` and moves it into place when it is complete, so an earlier release stays as it was until then. A run that
+stops leaves its partial folder and log at `OUT.failed`. The curve stops when the cohort's alleles disagree with the
 reference at many shared positions (another genome build) and when strand-ambiguous SNPs have frequencies that fit the
-other strand (pass `--drop-ambiguous` to `reference`, `release` and `compose`). It records the share of missing genotypes.
+other strand (pass `--drop-ambiguous` to `reference`, `release` and `compose`). It records the share of missing
+genotypes. The statistic's two halves are the odd and the even chromosomes, so a release on SNPs of one chromosome has
+no statistic, and its README says so.
 
 `curve` and `bins` can also be run alone. `curve` writes the same curve files under its `--out` prefix.
 `--no-sample-factors` leaves out the statistic, and `--no-background` the background term (with `--relative-pairs` it
-then writes the listed pairs' own profile, `.relatedness.tsv`). The curve's two halves of the statistic are the odd and
-the even chromosomes, so a curve on one chromosome has no statistic (the flag `sample_factors_not_made`). Each
-chromosome's background SNPs are held in memory (people × SNPs); above `--background-memory-gb` (default 32) a random
-subset of them is used, which keeps the term unbiased.
+then writes the listed pairs' own profile, `.relatedness.tsv`). A curve on one chromosome has no statistic (the flag
+`sample_factors_not_made`). Each chromosome's background SNPs are held in memory (people × SNPs); above
+`--background-memory-gb` (default 32) a random subset of them is used, which keeps the term unbiased.
 
 ## The MAF and LD bins
 
@@ -124,14 +127,16 @@ Heritability is fitted with eight bins of MAF and LD score. SNPs are placed in s
 0.2 and 0.3, and in the quartiles of a local in-sample LD score within each. The bins are then pooled by quartile into
 two MAF classes, below 0.05 (`maf_low_ld1` to `maf_low_ld4`) and at least 0.05 (`maf_high_ld1` to `maf_high_ld4`). The
 local score of a SNP is the sum of the unbiased squared correlations, r² − (1 − r²)/(n − 2) in n people, of its
-genotypes with those of the SNPs within 1 Mb on either side, without covariates. MAF is computed among the called
-genotypes of the same people.
+genotypes with those of the SNPs within 1 Mb on either side, without covariates. The MAF is the minor allele's count
+among the called genotypes of the same people, divided by twice their number. SNPs without variance in these people
+are left out, as rows and as partners. The quartiles are taken over every SNP of `--geno`, so cut the bins on the SNP
+set of the GWAS. A bin or class without any SNP, such as the MAF class below 0.05 of SNPs filtered on MAF, is left out
+of the files with a log line.
 
-A score summed over the whole genome holds the sample's own sampling noise, mostly its same-person term, and quartiles
-cut on it select SNPs on that noise, which no composed LD can reproduce. Cutting the bins on composed LD scores selects
-on the panels' noise instead (in the admixed UK Biobank sample the composed LD score per bin was then 0.96 to 4.79 times
-in-sample). A local score carries almost none of either, but only the cohort can compute it, so the release includes
-the bins.
+The score is local because a score summed over the whole genome holds the sample's own sampling noise, mostly its
+same-person term. Quartiles cut on such a score select SNPs on that noise. Quartiles cut on composed LD scores select
+SNPs on the sampling noise of the panels. A local score carries little of either. Only the cohort can compute it, and
+the release therefore includes the bins.
 
 ```bash
 summit admixed-ld bins --geno cohort --keep gwas_people.txt --threads 8 --out bins/cohort
@@ -150,7 +155,8 @@ summit admixed-ld bins --ref ref/afr_eur_clean --mean-ancestry 0.80,0.20 --out b
 ```
 
 Two MAF classes are also the more stable readout in small samples, where the heritability of eight bins is poorly
-determined. In the admixed UK Biobank sample curve mode gave 0.996 with two MAF classes and 0.986 with eight bins.
+determined. In the admixed UK Biobank sample of 3,781 people, curve mode with one release gave a heritability ratio of
+0.997 with two MAF classes and 0.987 with eight bins.
 
 ## Compose
 
@@ -163,11 +169,14 @@ Compose then works on their disjoint combinations and writes the columns as give
 number of combinations, so it stops when the columns form more than 64 of them on the GWAS SNPs
 (`--max-annotation-atoms`).
 
-**COV_RANK.** ν = N − COV_RANK − 1 sets the size of the same-person term. Summary statistics without a COV_RANK column
-take `--cov-rank` if given, else the covariate rank of the release's curve, which compose logs with the flag
-`cov_rank_from_curve`. In date mode without either, ν = N − 1 and compose records `cov_rank_missing`. A COV_RANK that
-differs from the curve's covariate rank records `covariates_differ_from_curve`, because the curve must use the GWAS's
-own covariates.
+**COV_RANK.** ν = N − COV_RANK − 1 sets the size of the same-person term, and `summit --h2` and `--rg` use COV_RANK in
+the same way. Give every summary-statistic file a COV_RANK column. `--cov-rank` sets the rank of every file and
+overrides the column, as it does in `summit --h2` and `--rg`, and compose logs each override. A file without the
+column takes the covariate rank of the release's curve (flag `cov_rank_from_curve`) or of a statistic given with
+`--sample-factors` (flag `cov_rank_from_sample_statistic`). The same files then need `--cov-rank` with that value in
+`summit --h2` and `--rg`, which warn when the LD scores were composed with a covariate rank and the option is missing.
+In date mode without either, ν = N − 1 and compose records `cov_rank_missing`. A COV_RANK that differs from the
+curve's covariate rank records `covariates_differ_from_curve`, because the curve must use the GWAS's own covariates.
 
 **Curve mode** (`--release DIR`, or `--curve PREFIX` for a curve alone). The kernel beyond 2 cM, the decay of the
 within-source weights and the moments of global ancestry come from the curve. Below 2 cM the curve also holds
@@ -182,11 +191,12 @@ sample of its own ([Traits measured in part of the cohort](#traits-measured-in-p
 
 **Date mode** (`--admixture-generations T`). The kernel decays at T/100 per cM from κ_res(0) to the between-chromosome
 constant −2 κ_res(0)/(T G), with G the genetic length of the genome in Morgans. We used 6 generations for African
-American and African Caribbean groups and 11 generations for US Latino groups. In the admixed UK Biobank sample dates of
-5 and 7 generations moved the heritability ratio by 5% either way. The same-person term needs the standard deviation of
-global ancestry. Give a published value with `--ancestry-sd`; otherwise compose uses the value that m and κ_res(0) imply
-under random mating, (2 m (1 − m) − κ_res(0))/4, which assortative mating makes too small. Date mode has no background
-term and no cell matrix.
+American and African Caribbean groups and 11 generations for US Latino groups. In the two UK Biobank samples, of 3,781
+and 6,111 people, dates of 5 and 7 generations gave heritability ratios of 0.950 and 1.051, and of 0.963 and 1.015,
+against 1.006 and 0.992 at 6 generations. The same-person term needs the standard deviation of global ancestry. Give a
+published value with `--ancestry-sd`; otherwise compose uses the value that m and κ_res(0) imply under random mating,
+(2 m (1 − m) − κ_res(0))/4, which assortative mating makes too small. Date mode has no background term and no cell
+matrix.
 
 **Several sources.** `--sources AFR,EUR,NAT` composes three or more sources (the last is the baseline). Give the same
 `--sources` to `release` (or `curve`), `compose`, `sample-factors` and `matrix`; `reference` and `clean-panels` take
@@ -206,8 +216,8 @@ with the file given. `ld/cohort.gw.ldscore.gz` is the file for the median N. Whe
 **The plan.** Before composing, compose logs what it will use. The plan names the mode and the source of the decay,
 the source of the same-person term and of the background term, the cell matrix, the ancestry, the sample sizes and the
 flags so far. It is stored as `plan` in `ld/cohort.admixed_ld.json`, with the LD-score file each trait was given.
-`--dry-run` writes it to `ld/cohort.plan.json` and stops. `--require statistic,cells` (any of curve, statistic, cells, relatives,
-background) stops with an error when one of them would be missing, for example in a pipeline.
+`--dry-run` writes it to `ld/cohort.plan.json` and stops. `--require statistic,cells` (any of curve, statistic, cells,
+relatives, background) stops with an error when one of them would be missing, for example in a pipeline.
 
 **Genetic correlation.** Fit traits of the same GWAS sample with `--keep-ambiguous`, because `summit --rg` otherwise
 drops A/T and C/G SNPs, which need no alignment between two GWAS of the same people. Give each GWAS's phenotype and
@@ -233,15 +243,16 @@ summit admixed-ld compose --ref ref/afr_eur_clean --release release --sumstats g
 ```
 
 For fluid intelligence, measured in half of each UK Biobank sample, the release alone gave heritability ratios of 1.10
-and 1.02, and the release with the trait's statistic 1.02 and 1.01. The statistic carries the trait's people into the
-same-person term, but the admixture LD within chromosomes and the moments of global ancestry still come from the curve
-of all participants. For the 40
-traits of All of Us participants of African ancestry that were measured in fewer than 85% of them, the release with
-each trait's statistic gave heritability ratios of 1.016 to 1.034.
+and 1.02, and the release with the trait's statistic 1.02 and 1.01. The statistic gives the same-person term of the
+trait's people. The admixture LD within chromosomes and the moments of global ancestry come from the curve of all
+participants. For the 40 traits of All of Us participants of African ancestry that were measured in fewer than 85% of
+them, the release with each trait's statistic gave heritability ratios of 1.016 to 1.034.
 
-Do not release a trait's statistic when the trait's people, or the release's people without the trait, number fewer
-than 50. Two statistics whose samples differ by a few people describe those people. `sample-factors` refuses fewer than
-50 people.
+`sample-factors` and `bins` refuse fewer than 50 people, as `release` does. Two released statistics or sets of bins
+whose samples differ by fewer than 50 people would together describe the people who make the difference. This holds
+for every pair of them, such as the release and one trait's statistic, the statistics of two traits, or two sets of
+bins. The cohort therefore releases a further statistic only when its sample differs from every other released sample
+by at least 50 people.
 
 ## The sample statistic
 
@@ -249,8 +260,8 @@ Under random mating each person's genotype variance follows their global ancestr
 covariates and, in first-generation groups, the parents' ancestries also matter, most in samples of a few hundred
 people. The sample statistic measures this on the GWAS sample with its covariates. It is estimated from the odd and the
 even chromosomes separately, so that each person's noise cancels, and holds the realized same-person mass between
-chromosomes, to which compose scales the factor term. It also records the mean, standard deviation and upper quantiles
-of the covariates' leverage. Under random mating, as date mode composes it, the same-person term was 5% to 6% larger
+chromosomes, to which compose scales the factor term. It also records the mean and standard deviation of the
+covariates' leverage. Under random mating, as date mode composes it, the same-person term was 5% to 6% larger
 than with the statistic in the two UK Biobank samples and 26% to 31% larger in a multiracial group of 2,248 All of Us
 participants.
 
@@ -272,13 +283,14 @@ every GWAS of the cohort.
 |---|---|---|---|
 | `relatedness_curve_sample_differs` | compose | The GWAS's N differs from the release's people by more than 1%, and the background term is scaled by N (N − 1)/(n (n − 1)). Expected. | Nothing, unless the trait was measured in a selected part of the cohort (see `gwas_sample_smaller_than_release`). |
 | `sample_factors_from_release` | compose | The same-person term comes from the release's statistic, scaled to the GWAS's N. Expected. | Nothing. |
-| `cov_rank_from_curve` | compose | Summary statistics without COV_RANK took the covariate rank of the release's curve. Expected when every GWAS used the release's covariates. | Pass `--cov-rank` if a GWAS used other covariates. |
+| `cov_rank_from_curve` | compose | Summary statistics without COV_RANK took the covariate rank of the release's curve. Expected when every GWAS used the release's covariates. | Add a COV_RANK column, or pass the same `--cov-rank` to `summit --h2` and `--rg`. |
+| `cov_rank_from_sample_statistic` | compose | Summary statistics without COV_RANK took the covariate rank of the statistic given with `--sample-factors` (date mode). | As for `cov_rank_from_curve`. |
 | `sample_factors_snps_differ` | compose | The GWAS has more than 2% fewer or more SNPs than the statistic, whose realized mass is rescaled by the squared ratio of SNP counts. Expected when the GWAS uses a subset of the release's SNPs. | Nothing for a random subset; make the release on the GWAS's SNPs if the subset is selected (for example by MAF). |
 | `gwas_sample_smaller_than_release` | compose | A trait's GWAS N is below 85% of the release's people (of the given statistic's people with `--sample-factors`). | Compose the trait alone with the statistic of its own people ([Traits measured in part of the cohort](#traits-measured-in-part-of-the-cohort)). |
 | `se_regression_outlier_traits` | compose | A trait's standard errors give a mean ancestry or κ_res(0) far from the other traits'. Logistic or mixed-model SEs, other covariates or another sample of people do this. | Use least-squares or linear-probability statistics; compose a trait of another sample alone with its own statistic. |
 | `covariates_differ_from_curve` | compose | A GWAS's COV_RANK (or `--cov-rank`) differs from the covariate rank of the curve. | Make the release with the GWAS's own covariates, the same for every GWAS. |
 | `cov_rank_missing` | compose | Summary statistics without COV_RANK and nothing else that gives it (date mode); ν = N − 1. | Pass `--cov-rank` or add a COV_RANK column. |
-| `curve_without_sample_factors` | compose | The curve lists no sample statistic, so the same-person term is under random mating. | Make the release (it always has one) or pass `--sample-factors`. |
+| `curve_without_sample_factors` | compose | The curve lists no sample statistic (a curve made with `--no-sample-factors`, or on SNPs of one chromosome), so the same-person term is under random mating. | Make the release on SNPs of two or more chromosomes, or pass `--sample-factors`. |
 | `sample_factors_sample_differs` | compose | A statistic given with `--sample-factors` is of more than 1% more or fewer people than the GWAS's N. | Make the statistic on the GWAS's own people. |
 | `sample_factors_calibration_large` | compose | The statistic's term needed a factor outside 0.8 to 1.25 to match its realized mass. | Check that the statistic and the GWAS have the same people and covariates. |
 | `sample_factors_not_calibrated` | compose | The term could not be scaled to the realized mass (a mass that is not positive); it is used as estimated. | As for `sample_factors_calibration_large`. |
@@ -380,9 +392,9 @@ SuSiE fits of z = R b + e with e ~ N(0, s² (R + λI)) and λ = 10⁻⁴:
    scale) and V, the predicted variance of the error of each entry of the matrix.
 
 `--error-variance` writes V (`fm/region1.ld_var`, `.ld_var.npz`) for a GWAS of `--n` people (by default the median N
-of `--sumstats`). It has three parts, the panels' sampling with Hardy-Weinberg moments, the taper's squared bias, and the
-sampling variance of the correlation in the GWAS sample itself. V depends only on the panels and the composition, never
-on in-sample LD. `example/finemap_two_stage.R` (susieR) runs both fits;
+of `--sumstats`). It has three parts, the panels' sampling with Hardy-Weinberg moments, the taper's squared bias, and
+the sampling variance of the correlation in the GWAS sample itself. V depends on the panels and the composition alone.
+`example/finemap_two_stage.R` (susieR) runs both fits;
 `summit admixed-ld finemap-variance --matrix fm/region1 --posterior FIT1.tsv --out fm/region1` gives s² from any first
 fit's posterior (columns SNP and EB2). At strongly differentiated loci with very strong signals, and at loci that
 define how the sample was selected, composed matrices carry error beyond this prediction.

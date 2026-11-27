@@ -45,8 +45,7 @@ fi
 summit admixed-ld release --geno cohort --ref ref/afr_eur_clean --keep gwas_people.txt \
   --covar gwas_covariates.txt --relative-pairs related_pairs.tsv --threads 8 --out release
 
-# the analyst
-mkdir -p ld results
+# the analyst (compose and summit create the folders of their --out)
 summit admixed-ld compose --ref ref/afr_eur_clean --release release --sumstats gwas/ \
   --annot release/cohort.bins8.annot.gz --out ld/cohort
 summit --h2 gwas/ --ldscores ld/cohort --annot release/cohort.bins8.annot.gz --out results/h2

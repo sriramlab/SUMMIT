@@ -42,11 +42,13 @@ has a row about a person. Share the whole folder, subject to the cohort's own ru
 **What never to share.** The genotypes, the phenotypes, the files given to `--keep`, `--covar` and `--relative-pairs`,
 and any per-person table such as ancestry estimates or principal components.
 
-**The 50-person rule.** A sample statistic needs at least 50 people, and `release` and `sample-factors` refuse fewer.
-For a trait measured in less than 85% of the release's people, the cohort may also release the statistic of that
-trait's people ([Traits measured in part of the cohort](SUMMIT-MIX-details.md#traits-measured-in-part-of-the-cohort)).
-Do not release it when the trait's people, or the release's people without the trait, number fewer than 50, because
-two statistics whose samples differ by a few people describe those people.
+**The 50-person rule.** Every released statistic and set of bins describes at least 50 people, and `release`, `bins`
+and `sample-factors` refuse fewer. For a trait measured in less than 85% of the release's people, the cohort may also
+release the statistic of that trait's people
+([Traits measured in part of the cohort](SUMMIT-MIX-details.md#traits-measured-in-part-of-the-cohort)). Two released
+statistics whose samples differ by fewer than 50 people would together describe the people who make the difference,
+for example the release and one trait's statistic, or the statistics of two traits. The cohort therefore releases a
+further statistic only when its sample differs from every other released sample by at least 50 people.
 
 ## Quick start for the analyst
 
@@ -101,8 +103,8 @@ LD in an admixed sample has two parts.
 sample of 3,781 people (after adjusting for the GWAS's principal components). Curve mode measures it in the cohort.
 Date mode assumes the decay that a single admixture event 6 generations ago would give. (b) The LD score of SNPs on
 chromosome 22, averaged over SNPs, counting only partners up to the distance on the x axis. The panels' LD is complete
-within about 1 cM. Admixture LD keeps adding to the LD score out to about 30 cM and here raises it by two thirds.
-Reference LD scores, which sum over partners within 1 cM or so, miss it.
+within about 1 cM, and admixture LD keeps adding to the LD score out to about 30 cM. LD scores computed in reference
+panels hold only the first part.
 
 Two more pieces complete the picture.
 
@@ -123,9 +125,9 @@ Two more pieces complete the picture.
 | Heritability ratio in All of Us participants of African ancestry | 0.997 to 1.014 | 0.92 to 0.98 (6 generations) |
 | Heritability ratio in All of Us participants of Admixed American ancestry | 1.007 to 1.008 | 1.006 to 1.011 (11 generations) |
 
-Use curve mode whenever the cohort can run one command. Date mode depends on the date. In a multiracial group of 2,248
-All of Us participants it gave 0.979 to 0.999 at the published date of 6 generations and 0.57 to 0.60 at 1 generation
-(two MAF classes).
+We recommend curve mode when the cohort can run the release. The accuracy of date mode depends on the date. In a
+multiracial group of 2,248 All of Us participants, date mode gave 0.979 to 0.999 at the published date of 6
+generations and 0.57 to 0.60 at a date of 1 generation (two MAF classes).
 
 ## Does it work?
 
@@ -137,29 +139,33 @@ and tested it in All of Us.
 ![Per-SNP LD scores from the panels and from SUMMIT-MIX against in-sample LD scores in an admixed UK Biobank sample.](assets/admixed-ld-accuracy.png)
 
 LD scores of each SNP in the admixed UK Biobank sample of 3,781 people. (a) LD scores from the African and European
-panels, mixed in the sample's proportions, miss the admixture LD: on average 3.6 against 5.6 in the sample. (b)
-SUMMIT-MIX in curve mode matches the in-sample LD scores SNP by SNP.
+panels, mixed in the sample's proportions, leave out the admixture LD and are lower than the in-sample LD scores for
+most SNPs. (b) SUMMIT-MIX in curve mode agrees with the in-sample LD scores SNP by SNP.
 
 ![Heritability ratio over 32 traits for SUMMIT-MIX and for reference panels, in two UK Biobank samples of African ancestry.](assets/admixed-ld-h2.png)
 
 The heritability ratio over 32 traits, each compared with the in-sample LD scores of its own GWAS sample, with eight MAF
-and LD bins. Curve mode gave 0.986 and 0.991 in the two samples, and 0.996 and 0.997 with two MAF classes. LD scores
-from reference panels, including the admixed 1000 Genomes panels, gave 0.62 to 1.40, and the error changed between the
-two samples. In All of Us, with each set of panels available to us, curve mode gave 0.997 to 1.014 in participants of
-African ancestry and 1.007 to 1.008 in participants of Admixed American ancestry. The same panels used directly as
-reference LD missed the in-sample sum by up to 63%.
+and LD bins. Curve mode used one release of the whole sample, with the statistic of each trait's people for the four
+traits measured in fewer than 85% of them. It gave 0.987 and 0.993 in the two samples, and 0.997 and 0.998 with two
+MAF classes. LD scores from reference panels, including the admixed 1000 Genomes panels, gave 0.62 to 1.40, and their
+error changed between the two samples. In All of Us, with each set of panels available to us, curve mode gave 0.997 to
+1.014 in participants of African ancestry and 1.007 to 1.008 in participants of Admixed American ancestry. The same
+panels used directly as reference LD missed the in-sample sum by up to 63%.
 
 ## Things to check
 
 - Use least-squares or linear-probability summary statistics. Logistic and mixed-model standard errors give a wrong
   mean ancestry; compose names traits whose values stand apart from the others.
-- Make the release with the covariates of the GWAS, the same for every trait, and give every GWAS its `COV_RANK`.
-  Compose takes the release's covariate rank for summary statistics without one, and logs it.
+- Make the release with the covariates of the GWAS, the same for every trait, and give every summary-statistic file a
+  `COV_RANK` column, the number of covariates with the principal components. For files without one, compose takes the
+  release's covariate rank and logs it, and `summit --h2` and `--rg` need `--cov-rank` with the same value. They warn
+  when it is missing.
 - One release serves the cohort. Compose warns when a trait's GWAS sample holds less than 85% of the release's people.
   Compose such a trait alone, with the statistic of its own people
-  ([how](SUMMIT-MIX-details.md#traits-measured-in-part-of-the-cohort)). The statistic corrects the same-person term but
-  not the admixture LD of the trait's people, which comes from the release's curve. In All of Us traits of participants
-  of African ancestry measured in fewer than 85% of them, composed heritability was 1.6% to 3.4% high.
+  ([how](SUMMIT-MIX-details.md#traits-measured-in-part-of-the-cohort)). The statistic gives the same-person term of the
+  trait's people. The admixture LD within chromosomes comes from the release's curve of all participants. For the 40
+  All of Us traits of participants of African ancestry that were measured in fewer than 85% of them, composed
+  heritability was 1.6% to 3.4% higher than with in-sample LD.
 - If the panels and the cohort may be on different strands, add `--drop-ambiguous` to `reference`, `release` and
   `compose`. The release stops when it detects this.
 - Close relatives also share environment, which composed LD scores cannot fix. Remove them before the GWAS, or see
