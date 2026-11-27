@@ -53,8 +53,20 @@ summit --rg gwas/height.tsv,gwas/bmi.tsv --ldscores ld/cohort --annot release/co
   --pheno-rg pheno/height.txt,pheno/bmi.txt --pheno-rg-cov gwas_covariates.txt,gwas_covariates.txt \
   --keep-ambiguous --out results/rg
 
-# for comparison: in-sample LD scores of the same people with the same bins and covariates, and the same fits
-summit --geno cohort.bed --annot release/cohort.bins8.annot.gz --covar gwas_covariates.txt --nvecs 200 \
+# for comparison: in-sample LD scores of the same people with the same bins and covariates, and the same fits; the
+# bins leave out SNPs without variance, so the genotypes are kept to the bins' SNPs first
+python - <<'PY'
+import pandas as pd
+from bed_reader import open_bed, to_bed
+snps = set(pd.read_csv("release/cohort.bins8.annot.gz", sep="\t", usecols=["SNP"]).SNP.astype(str))
+bed = open_bed("cohort.bed")
+keep = [i for i, s in enumerate(bed.sid) if s in snps]
+to_bed("ld/insample_geno.bed", bed.read(index=(slice(None), keep), dtype="float32"),
+       properties=dict(fid=bed.fid, iid=bed.iid, chromosome=bed.chromosome[keep], sid=bed.sid[keep],
+                       cm_position=bed.cm_position[keep], bp_position=bed.bp_position[keep],
+                       allele_1=bed.allele_1[keep], allele_2=bed.allele_2[keep]))
+PY
+summit --geno ld/insample_geno.bed --annot release/cohort.bins8.annot.gz --covar gwas_covariates.txt --nvecs 200 \
   --block-size 256 --seed 1 --dtype float64 --num-threads 2 --out ld/insample
 summit --h2 gwas/ --ldscores ld/insample.gw.ldscore.gz --annot release/cohort.bins8.annot.gz --out results/h2_insample
 summit --rg gwas/height.tsv,gwas/bmi.tsv --ldscores ld/insample.gw.ldscore.gz --annot release/cohort.bins8.annot.gz \
