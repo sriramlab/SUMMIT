@@ -697,6 +697,23 @@ def partners_marker(prefix, dense, n_partners=None, n_rows=None):
         os.remove(path)
 
 
+def release_curve(folder):
+    """The curve prefix of a release folder (`summit admixed-ld release`) and the release's record."""
+    path = os.path.join(folder, "release.json")
+    if not os.path.exists(path):
+        raise ValueError(f"{folder} is not a release folder: it has no release.json (made by summit admixed-ld "
+                         "release). Give the curve's prefix with --curve instead.")
+    with open(path) as fh:
+        rec = json.load(fh)
+    if rec.get("format") != "summit-admixed-ld-release":
+        raise ValueError(f"{path} is not a release record.")
+    curve = os.path.join(folder, rec["curve"])
+    if not os.path.exists(f"{curve}.curve.json"):
+        raise ValueError(f"The release {folder} lists the curve {rec['curve']}, but {curve}.curve.json is missing.")
+    return curve, dict(folder=str(folder), people=rec.get("people"), covariate_rank=rec.get("covariate_rank"),
+                       curve=rec["curve"])
+
+
 def release_statistic(curve):
     """The sample statistic released with the curve CURVE (prefix): (path, None), or (None, why) when the curve records
     none (made with --no-sample-factors, before curves carried it, or its pass could not make it). The curve's json
@@ -849,7 +866,7 @@ def compose_ldscores(ref_path, sumstats, annot, out, *, sources=None, snps=None,
                      sample_factors=None, sample_factors_calibrate=True, calibrate_between_chromosomes=False,
                      per_trait_n=True, n_tol=0.01, tracks=False, track_alpha=None, partners="rows",
                      drop_ambiguous=False, pair_chunk=1 << 23, release_sample_factors=True, min_release_share=0.85,
-                     dry_run=False, require=None, max_annotation_atoms=64, cov_rank=None, log=print):
+                     dry_run=False, require=None, max_annotation_atoms=64, cov_rank=None, release=None, log=print):
     """Composed LD scores for an admixed GWAS sample with two or more sources (the last is the baseline of the
     contrasts). mean_ancestry: K-1 or K values (comma-separated); kappa0: the upper triangle of Kt_res(0) row by row.
     Departures from the standard recipe that are allowed but should be visible are recorded in the params json under
@@ -897,6 +914,9 @@ def compose_ldscores(ref_path, sumstats, annot, out, *, sources=None, snps=None,
     Without it such a trait takes the covariate rank of the curve (or of a statistic given to compose), with the flag
     cov_rank_from_curve, and without either the rank 0, with the flag cov_rank_missing.
 
+    release: a folder written by `summit admixed-ld release` in place of `curve`: its curve (with its sample statistic,
+    background term and cell matrix) is used as `curve` would be.
+
     tracks: also write the LD scores of the within-ancestry allele deviations that a local-ancestry-aware GWAS
     (Tractor: y ~ covariates + local-ancestry dosages + ancestry-specific allele counts) regresses on, for the
     correlation of per-allele causal effects across ancestry tracks in the same people (tracks.py):
@@ -930,8 +950,16 @@ def compose_ldscores(ref_path, sumstats, annot, out, *, sources=None, snps=None,
         if xm.get("derived"):
             raise ValueError(f"--cross-source {cross_source} is a derived source; it needs a panel's own LD.")
         xs_n = sources.index(cross_source) if cross_source in sources else None
+    release_info = None
+    if release is not None:
+        if curve is not None:
+            raise ValueError("Give --release or --curve, not both.")
+        curve, release_info = release_curve(release)
+        log(f"[admixed-ld] compose: the release {release} ({release_info['people']} people, covariate rank "
+            f"{release_info['covariate_rank']}); its curve {curve}")
     if sum(x is not None for x in (curve, generations, decay_per_cm)) != 1:
-        raise ValueError("Give exactly one source for the decay: --curve, --admixture-generations or --decay-per-cm.")
+        raise ValueError("Give exactly one source for the decay: --release, --curve, --admixture-generations or "
+                         "--decay-per-cm.")
     if partners not in ("rows", "reference"):
         raise ValueError("partners must be 'rows' (the GWAS SNPs) or 'reference' (every reference variant in the "
                          "annotation).")
@@ -1830,7 +1858,7 @@ def compose_ldscores(ref_path, sumstats, annot, out, *, sources=None, snps=None,
                   annotation=dict(columns=list(out_classes), overlapping=col_pat is not None,
                                   combinations=None if col_pat is None else int(col_pat.shape[0])),
                   match=dict(match_info, drop_ambiguous=bool(drop_ambiguous)),
-                  ld_mass_check=mass_check, flags=flags)
+                  ld_mass_check=mass_check, release=release_info, flags=flags)
     if xs_i is not None:                                          # each SNP with itself: sqrt(V_1 V_2), V_2 = 1
         keep = v2_out > 0
         Lx[np.arange(M), cls] += np.sqrt(Vpop)
@@ -1839,13 +1867,22 @@ def compose_ldscores(ref_path, sumstats, annot, out, *, sources=None, snps=None,
                                pd.DataFrame(to_cols(Lx[keep]), columns=out_classes), snp_var=np.sqrt(Vpop[keep]))
         write_gw_annotation_masses(xout, to_cols(masses_P) if dense
                                    else to_cols(np.bincount(cls[keep], minlength=K).astype(float)))
+        # the annotation of the fit on the cross file's SNPs: given to compose and to the other population's LD-score
+        # step, it puts the own LD scores of both GWAS on these SNPs, as the cross-population fit needs
+        xannot = snpdf[keep][["CHR", "BP", "SNP"]].reset_index(drop=True).assign(CM=cm_out[keep])
+        xannot = pd.concat([xannot, pd.DataFrame(to_cols(cls_mat[keep]).astype(int), columns=out_classes)], axis=1)
+        xannot.to_csv(f"{xout}.annot.gz.{os.getpid()}.tmp.gz", sep="\t", index=False, compression="gzip")
+        os.replace(f"{xout}.annot.gz.{os.getpid()}.tmp.gz", f"{xout}.annot.gz")
+        xannot[["SNP"]].to_csv(f"{xout}.snps", index=False, header=False)      # the IDs alone (plink2 --extract)
         params["cross"] = dict(source=cross_source, panel_n=int(ref.n[cross_source]),
                                panel_is_a_source=xs_n is not None, file=f"{xout}.gw.ldscore.gz",
+                               annotation=f"{xout}.annot.gz", snps=f"{xout}.snps",
                                n_snps=int(keep.sum()), ld_mass=float((np.sqrt(Vpop[keep])[:, None] * Lx[keep]).sum()),
                                definition="sum_k rho_1(j,k) rho_2(j,k) sqrt(V_1k V_2k) over pairs within the window, "
                                           "rho_2 and V_2 = 1 from the panel of the second population")
         log(f"[admixed-ld] compose: wrote {xout}.gw.ldscore.gz, cross-population LD scores with {cross_source}'s "
-            f"panel ({int(keep.sum())} SNPs polymorphic in it)")
+            f"panel ({int(keep.sum())} SNPs polymorphic in it), and {xout}.annot.gz and {xout}.snps, the annotation "
+            "and the IDs of these SNPs for the own LD scores of both GWAS")
     if dense:
         params["partners"] = dict(mode="reference", n_partners=MP, counts=masses_P.tolist(),
                                   definition="the reference variants listed in the annotation; the GWAS variants are "

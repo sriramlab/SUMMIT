@@ -1,12 +1,22 @@
 """SUMMIT-MIX: LD scores of admixed GWAS samples without in-sample LD (`summit admixed-ld ...`).
 
+  The cohort (where the genotypes are), once, on everyone who enters any GWAS, with the GWAS covariates:
+  summit admixed-ld release      --geno COHORT --ref REF_CLEAN --keep PEOPLE --covar COVARIATES
+                                 [--relative-pairs PAIRS] --out RELEASE_DIR    (aggregates only; README.txt lists them)
+  The analyst (summary statistics, the same reference and the release):
+  summit admixed-ld compose      --ref REF_CLEAN --release RELEASE_DIR --sumstats GWAS_DIR
+                                 --annot RELEASE_DIR/cohort.bins8.annot.gz --out LD
+  summit --h2 GWAS_DIR --ldscores LD --annot RELEASE_DIR/cohort.bins8.annot.gz --out H2
+
   summit admixed-ld reference    --panel AFR_PREFIX --panel EUR_PREFIX --names AFR,EUR [--genetic-map MAP] --out REF
   summit admixed-ld clean-panels --ref REF --panel AFR_PREFIX --panel EUR_PREFIX --names AFR,EUR --out REF_CLEAN
-  summit admixed-ld curve        --geno COHORT --ref REF_CLEAN --keep GWAS_SAMPLE --covar GWAS_COVARIATES
-                                 --relative-pairs PAIRS --out CURVE                     (curve mode; aggregates only)
+  summit admixed-ld curve        --geno COHORT --ref REF_CLEAN --keep PEOPLE --covar COVARIATES
+                                 --relative-pairs PAIRS --out CURVE                  (the curve alone; aggregates only)
+  summit admixed-ld bins         --geno COHORT --keep PEOPLE --out PREFIX   (the eight MAF/LD bins and two MAF classes)
+  summit admixed-ld bins         --sumstats GWAS --out PREFIX              (the two MAF classes from allele frequencies)
   summit admixed-ld compose      --ref REF_CLEAN --sumstats FILE_OR_DIR [...] --annot ANNOT --out PREFIX
-                                 (--curve CURVE | --admixture-generations T)
-  summit admixed-ld sample-factors --geno COHORT --ref REF_CLEAN --keep GWAS_SAMPLE --covar GWAS_COVARIATES --out SF
+                                 (--release DIR | --curve CURVE | --admixture-generations T)
+  summit admixed-ld sample-factors --geno COHORT --ref REF_CLEAN --keep TRAIT_PEOPLE --covar COVARIATES --out SF
   summit admixed-ld derive       --geno COHORT --ref REF --name NAT --panel NAT_ANCHORS --out REF_WITH_NAT
   summit admixed-ld matrix       --ref REF_CLEAN --params PREFIX.admixed_ld.json --region CHR:START-END
                                  (--curve CURVE | --admixture-generations T) --out REGION
@@ -20,16 +30,17 @@
 
 `reference` is built once from unadmixed panels of the source populations, and `clean-panels` removes the panels' own
 admixture LD and records their own background, which compose removes inside the reference band. In curve mode (the
-default and recommended) the cohort runs `curve` on the GWAS sample with the GWAS's covariates; it writes only
-aggregates (PREFIX.curve.tsv, .curve.json, .background.tsv, .cells.npz). Date mode needs only the summary statistics
-and a published admixture date. `compose` takes the summary statistics (BETA, SE, N, COV_RANK; CHR and BP for
-matching by position, or --snps), whose standard errors give the mean ancestry and kappa_res(0), the annotation of the
-fit, and the curve or the date; it writes PREFIX.gw.ldscore.gz and PREFIX.gw.M for `summit --h2/--rg` (one file per
-GWAS sample size when the traits' N differ, listed in PREFIX.n_groups.tsv) and PREFIX.admixed_ld.json with every
-parameter and flag. `sample-factors` is an optional aggregate for samples of a few hundred people, `derive` estimates a
-source without a panel, `matrix` writes regional LD matrices for fine-mapping (aligned to PREFIX.snps.tsv's counted
-allele), and `tractor-sumstats`, `compose --tracks` and `track-rg` estimate the correlation of per-allele effects
-across local-ancestry tracks. The wiki page "Admixed cohorts without in-sample LD" describes each step.
+default and recommended) the cohort runs `release` (or `curve` and `bins`) on the people of its GWAS with the GWAS's
+covariates; it writes only aggregates (the curve, its background term, cell matrix and sample statistic, and the MAF/LD
+bins). Date mode needs only the summary statistics and a published admixture date. `compose` takes the summary
+statistics (BETA, SE, N, COV_RANK; CHR and BP for matching by position, or --snps), whose standard errors give the mean
+ancestry and kappa_res(0), the annotation of the fit, and the release, the curve or the date; it writes
+PREFIX.gw.ldscore.gz and PREFIX.gw.M for `summit --h2/--rg` (one file per GWAS sample size when the traits' N differ,
+listed in PREFIX.n_groups.tsv) and PREFIX.admixed_ld.json with every parameter and flag. `sample-factors` makes the
+sample statistic of one GWAS sample alone (a trait measured in part of the cohort), `derive` estimates a source without
+a panel, `matrix` writes regional LD matrices for fine-mapping (aligned to PREFIX.snps.tsv's counted allele), and
+`tractor-sumstats`, `compose --tracks` and `track-rg` estimate the correlation of per-allele effects across
+local-ancestry tracks. The wiki page "Admixed cohorts without in-sample LD" describes each step.
 """
 import argparse
 import sys
@@ -160,6 +171,62 @@ def main(argv=None):
                     "data sets may be on different strands")
     c.add_argument("--out", required=True)
 
+    rl = sub.add_parser("release", help="the cohort's side in one step: the curve with its sample statistic and the "
+                                        "MAF/LD bins, in one folder of aggregates with a list of what to share")
+    rl.add_argument("--geno", required=True, help="PLINK 1 BED or PLINK 2 PGEN prefix of the cohort")
+    rl.add_argument("--ref", required=True, help="reference written by `reference` and `clean-panels`")
+    rl.add_argument("--keep", default=None,
+                    help="the release's people: everyone who enters any GWAS of the cohort (FID IID or IID per line)")
+    rl.add_argument("--covar", default=None,
+                    help="the GWAS covariates (FID IID ...), principal components included; every GWAS of the "
+                         "cohort must use the same ones")
+    rl.add_argument("--relative-pairs", default=None,
+                    help="related pairs (IID1 IID2 [FID1 FID2] [kinship]), as for curve: each family is kept within "
+                         "one half of the cell matrix")
+    rl.add_argument("--kinship-col", default=None, help="kinship column of --relative-pairs used with --kinship-min")
+    rl.add_argument("--kinship-min", type=float, default=None, help="keep only pairs whose kinship exceeds this value")
+    rl.add_argument("--sources", default=None,
+                    help="two or more source names of the reference (default: its first two); the last is the baseline")
+    rl.add_argument("--match", choices=["position", "id"], default="position")
+    rl.add_argument("--cell-cm", type=float, default=0.25, help="cell width of the curve in cM (default 0.25)")
+    rl.add_argument("--background-memory-gb", type=float, default=32.0,
+                    help="as for curve: memory for each chromosome's background SNPs (default 32)")
+    rl.add_argument("--relatedness-memory-gb", type=float, default=4.0,
+                    help="as for curve: memory for the background term between chromosomes (default 4)")
+    rl.add_argument("--step", type=int, default=4096, help=argparse.SUPPRESS)
+    rl.add_argument("--threads", "--num-threads", dest="threads", type=int, default=1,
+                    help="threads for genotype decoding and matrix products; also the BLAS limit (default 1)")
+    rl.add_argument("--drop-ambiguous", action="store_true",
+                    help="leave out strand-ambiguous (A/T, C/G) SNPs from the curve; give it to compose too")
+    rl.add_argument("--out", required=True, help="the release folder (new or empty; a release folder is replaced)")
+
+    bn = sub.add_parser("bins", help="the eight MAF/LD bins of the fit, cut on a local in-sample LD score (from the "
+                                     "cohort's genotypes), or the two MAF classes alone (from allele frequencies)")
+    bsrc = bn.add_mutually_exclusive_group(required=True)
+    bsrc.add_argument("--geno", default=None,
+                      help="PLINK 1 BED or PLINK 2 PGEN prefix of the cohort: the eight bins and the two MAF classes")
+    bsrc.add_argument("--sumstats", default=None,
+                      help="summary statistics with an allele-frequency column: the two MAF classes alone")
+    bsrc.add_argument("--ref", default=None,
+                      help="a reference, with --mean-ancestry: the two MAF classes alone, from the panels' frequencies "
+                           "at that mean ancestry")
+    bn.add_argument("--keep", default=None, help="with --geno: the people whose genotypes cut the bins (the release's)")
+    bn.add_argument("--freq-col", default=None, help="with --sumstats: the allele-frequency column (default: the first "
+                                                     "of A1_FREQ, A1FREQ, EAF, AF, AF1, FREQ, FREQ1, FRQ, MAF, A1_AF)")
+    bn.add_argument("--mean-ancestry", default=None,
+                    help="with --ref: K-1 or K comma-separated values in source order (for example the mean_ancestry "
+                         "of compose's plan)")
+    bn.add_argument("--sources", default=None, help="with --ref: the source names (default: its first two)")
+    bn.add_argument("--scores", action="store_true",
+                    help="with --geno: also write PREFIX.local_ld.tsv.gz, each SNP's MAF and local score (not needed "
+                         "for the fit; per-SNP frequencies of the cohort)")
+    bn.add_argument("--step", type=int, default=None, help=argparse.SUPPRESS)
+    bn.add_argument("--threads", "--num-threads", dest="threads", type=int, default=1,
+                    help="threads for genotype decoding and matrix products; also the BLAS limit (default 1)")
+    bn.add_argument("--out", required=True,
+                    help="output prefix: PREFIX.bins8.annot.gz and PREFIX.maf2.annot.gz (with --geno), or "
+                         "PREFIX.maf2.annot.gz; PREFIX.bins.json records them")
+
     m = sub.add_parser("compose", help="LD scores from the resource, the GWAS and the decay of local-ancestry covariance")
     m.add_argument("--ref", required=True)
     m.add_argument("--sumstats", nargs="+", required=True,
@@ -174,6 +241,9 @@ def main(argv=None):
                         "the contrasts")
     m.add_argument("--match", choices=["position", "id"], default="position")
     g = m.add_mutually_exclusive_group(required=True)
+    g.add_argument("--release", default=None,
+                   help="the cohort's release folder (`summit admixed-ld release`): curve mode with its curve, sample "
+                        "statistic, background term and cell matrix")
     g.add_argument("--curve", default=None, help="prefix of the cohort's curve (`summit admixed-ld curve`): curve mode")
     g.add_argument("--admixture-generations", type=float, default=None,
                    help="generations since admixture, a published date: date mode (decay generations / 100 per cM)")
@@ -438,7 +508,7 @@ def main(argv=None):
 
     a = ap.parse_args(argv)
     log = Logger()
-    if a.cmd not in ("reference", "derive", "clean-panels"):
+    if a.cmd not in ("reference", "derive", "clean-panels", "release"):
         log.attach_file(a.out + f".{a.cmd}.log", mode="w")
     else:
         import os
@@ -486,6 +556,21 @@ def _run(a, log):
         remove_panel_admixture(a.ref, dict(zip(names, a.panel)), out=a.out, match=a.match, lo=lo, hi=hi,
                                threads=a.threads, background=not a.no_panel_background,
                                background_snps=a.panel_background_snps, log=log._log)
+    elif a.cmd == "release":
+        from .release import make_release
+        make_release(a.geno, a.ref, a.out, keep=a.keep, covar=a.covar, relative_pairs=a.relative_pairs,
+                     kinship_col=a.kinship_col, kinship_min=a.kinship_min, sources=_sources(a.sources), match=a.match,
+                     cell_cm=a.cell_cm, step=a.step, threads=a.threads, drop_ambiguous=a.drop_ambiguous,
+                     background_memory_gb=a.background_memory_gb, relatedness_memory_gb=a.relatedness_memory_gb,
+                     log=log._log)
+    elif a.cmd == "bins":
+        from .bins import maf_classes, make_bins, write_record
+        if a.geno is not None:
+            rec = make_bins(a.geno, a.out, keep=a.keep, step=a.step, threads=a.threads, scores=a.scores, log=log._log)
+        else:
+            rec = maf_classes(a.out, sumstats=a.sumstats, freq_col=a.freq_col, ref=a.ref,
+                              mean_ancestry=a.mean_ancestry, sources=_sources(a.sources), log=log._log)
+        write_record(f"{a.out}.bins.json", rec)
     elif a.cmd == "sample-factors":
         from .sample_factors import sample_factors
         sample_factors(a.geno, a.ref, a.out, sources=_sources(a.sources), covar=a.covar, keep=a.keep, match=a.match,
@@ -554,7 +639,7 @@ def _run(a, log):
                          track_alpha=a.track_alpha, partners=a.partners, drop_ambiguous=a.drop_ambiguous,
                          release_sample_factors=a.release_sample_factors, min_release_share=a.min_release_share,
                          dry_run=a.dry_run, require=a.require, max_annotation_atoms=a.max_annotation_atoms,
-                         cov_rank=a.cov_rank, log=log._log)
+                         cov_rank=a.cov_rank, release=a.release, log=log._log)
     return 0
 
 
