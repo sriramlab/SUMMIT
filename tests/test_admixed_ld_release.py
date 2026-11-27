@@ -301,7 +301,11 @@ def test_release_command_checks_first_and_creates_parent_folders(small, tmp_path
     assert {"release.json", "release.log", "README.txt"} <= set(os.listdir(rel))
     assert [f for f in os.listdir(rel.parent) if f != "release"] == []    # no work folder left behind
     cj = json.load(open(rel / "cohort.curve.json"))
-    assert cj["relatedness"]["pairs"] == 2 and "max_abs" not in cj["relatedness"]
+    # two listed pairs: no summary over them, a flag and a note; compose (below) works with the background term
+    assert cj["relatedness"]["pairs"] == 2 and cj["relatedness"]["summaries"] is None
+    assert not {"mean", "sum_squared_ordered", "max_abs", "profile"} & set(cj["relatedness"])
+    assert "relative_pair_summaries_omitted" in [f["flag"] for f in cj["flags"]]
+    assert "Fewer than 20 related pairs" in " ".join((rel / "README.txt").read_text().split())
     assert cj["background"]["file"] == "cohort.background.tsv" and cj["cells"]["file"] == "cohort.cells.npz"
     assert "largest" not in (rel / "release.log").read_text()
     ss = str(d / "ss" / "trait0.sumstats")
@@ -450,6 +454,33 @@ def test_bins_edge_cases(tmp_path):
     assert len(tab2) == 8 and "s3" not in tab2.SNP.tolist() and any("monomorphic" in m for m in msgs)
     np.testing.assert_allclose(tab2.local.to_numpy(), tab.local.to_numpy(), rtol=1e-6)
     np.testing.assert_array_equal(maf_ld_bins(tab2.MAF.to_numpy(), tab2.local.to_numpy()), A)
+
+
+def test_few_relative_pairs_record_no_pair_summary(small, tmp_path):
+    """With one listed pair the curve records only the count (flag relative_pair_summaries_omitted), also without the
+    background term, where it skips the listed pairs' profile; compose with the background term is unchanged by the
+    pair, and a relatives' term from the pairs alone is refused with a message."""
+    d, iid = small["dir"], small["iid"]
+    pairs = tmp_path / "pairs.tsv"
+    pd.DataFrame({"IID1": [iid[0]], "IID2": [iid[1]]}).to_csv(pairs, sep="\t", index=False)
+    kw = dict(covar=str(d / "cohort.cov"), cell_cm=0.5, background=True, log=quiet)
+    _, info = genotype_curve(str(d / "cohort"), str(d / "ref"), str(tmp_path / "p"), relative_pairs=str(pairs), **kw)
+    _, info0 = genotype_curve(str(d / "cohort"), str(d / "ref"), str(tmp_path / "n"), **kw)
+    assert info["relatedness"] == dict(pairs=1, summaries=None, kinship_col=None, kinship_min=None, closure=False)
+    assert "relative_pair_summaries_omitted" in [f["flag"] for f in info["flags"]]
+    pd.testing.assert_frame_equal(pd.read_csv(tmp_path / "p.background.tsv", sep="\t"),
+                                  pd.read_csv(tmp_path / "n.background.tsv", sep="\t"))
+    ss, an = [str(d / "ss" / "trait0.sumstats")], str(d / "annot.tsv")
+    cli = dict(relatedness="auto", cell_matrix="auto", log=quiet)
+    p = compose_ldscores(str(d / "ref"), ss, an, str(tmp_path / "c"), curve=str(tmp_path / "p"), **cli)
+    assert p["plan"]["components"]["background"]
+    _, infn = genotype_curve(str(d / "cohort"), str(d / "ref"), str(tmp_path / "nb"), relative_pairs=str(pairs),
+                             **dict(kw, background=False))
+    assert set(infn["relatedness"]) == {"pairs", "summaries", "kinship_col", "kinship_min", "closure"}
+    assert not os.path.exists(tmp_path / "nb.relatedness.tsv")
+    with pytest.raises(ValueError, match="no summary of its listed related pairs"):
+        compose_ldscores(str(d / "ref"), ss, an, str(tmp_path / "u"), curve=str(tmp_path / "nb"),
+                         relatedness="uniform", log=quiet)
 
 
 def test_every_flag_is_in_the_docs():

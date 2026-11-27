@@ -40,7 +40,7 @@ with `README.txt` and `release.json`, which list each file and the counts of peo
 has a row about a person. Share the whole folder, subject to the cohort's own rules on small counts.
 
 **What never to share.** The genotypes, the phenotypes, the files given to `--keep`, `--covar` and `--relative-pairs`,
-and any per-person table such as ancestry estimates or principal components.
+and any per-person or per-pair table such as ancestry estimates, principal components or the relatedness of pairs.
 
 **The 50-person rule.** Every released statistic and set of bins describes at least 50 people, and `release`, `bins`
 and `sample-factors` refuse fewer. For a trait measured in less than 85% of the release's people, the cohort may also

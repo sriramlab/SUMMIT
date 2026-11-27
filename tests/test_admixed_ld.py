@@ -120,14 +120,16 @@ def test_curve_recovers_decay_and_ancestry(sim):
 
 
 def test_curve_relatedness_is_that_of_adjusted_genotypes(sim, tmp_path):
-    """The curve's relatedness of listed pairs equals the GRM of the covariate-adjusted, standardized genotypes."""
+    """The curve's relatedness of listed pairs equals the GRM of the covariate-adjusted, standardized genotypes (with
+    the 20 or more listed pairs over which the curve records summaries)."""
     from summit.admixed_ld.curve import genotype_curve
     d = sim["dir"]
     G, C = sim["S"]["cohort"], sim["C"]
     iid = pd.read_csv(f"{d / 'cohort'}.fam", sep=r"\s+", header=None, dtype=str)[1].to_numpy()
-    pairs = [(0, 1), (2, 7), (10, 11), (5, 40), (100, 3)]
+    pairs = [(0, 1), (2, 7), (10, 11), (5, 40)] + [(100 + 2 * i, 101 + 2 * i) for i in range(20)] + [(100, 3)]
+    kin = [0.5, 0.2, 0.05, 0.3] + [0.1] * 20 + [0.01]
     pd.DataFrame({"IID1": [iid[a] for a, _ in pairs], "IID2": [iid[b] for _, b in pairs],
-                  "K": [0.5, 0.2, 0.05, 0.3, 0.01]}).to_csv(tmp_path / "pairs.tsv", sep="\t", index=False)
+                  "K": kin}).to_csv(tmp_path / "pairs.tsv", sep="\t", index=False)
     _, info = genotype_curve(str(d / "cohort"), str(d / "ref"), str(tmp_path / "c"), covar=str(d / "cohort.cov"),
                              cell_cm=0.5, relative_pairs=str(tmp_path / "pairs.tsv"), kinship_col="K",
                              kinship_min=0.02, closure=False, log=lambda *a: None)
@@ -138,18 +140,19 @@ def test_curve_relatedness_is_that_of_adjusted_genotypes(sim, tmp_path):
     var = np.einsum("ij,ij->j", Xr, Xr) / (G.shape[0] - 1 - C.shape[1])
     ok = var > 1e-8
     Z = Xr[:, ok] / np.sqrt(var[ok])
-    g = np.array([Z[a] @ Z[b] / ok.sum() for a, b in pairs[:4]])     # the last pair is below --kinship-min
+    g = np.array([Z[a] @ Z[b] / ok.sum() for a, b in pairs[:-1]])    # the last pair is below --kinship-min
     r = info["relatedness"]
-    assert r["pairs"] == 4 and r["n_snps"] == ok.sum()
+    assert r["pairs"] == len(pairs) - 1 and r["n_snps"] == ok.sum()
     assert r["sum_squared_ordered"] == pytest.approx(2 * np.sum(g ** 2), rel=1e-8)
     # --closure adds the pairs implied within a family: (0, 1) and (1, 2) give (0, 2)
-    pd.DataFrame({"IID1": [iid[0], iid[1]], "IID2": [iid[1], iid[2]]}).to_csv(tmp_path / "chain.tsv", sep="\t",
-                                                                           index=False)
+    chain = [(0, 1), (1, 2)] + [(100 + 2 * i, 101 + 2 * i) for i in range(20)]
+    pd.DataFrame({"IID1": [iid[a] for a, _ in chain], "IID2": [iid[b] for _, b in chain]}).to_csv(
+        tmp_path / "chain.tsv", sep="\t", index=False)
     _, info = genotype_curve(str(d / "cohort"), str(d / "ref"), str(tmp_path / "c2"), covar=str(d / "cohort.cov"),
                              cell_cm=0.5, relative_pairs=str(tmp_path / "chain.tsv"), closure=True,
                              log=lambda *a: None)
-    g = np.array([Z[a] @ Z[b] / ok.sum() for a, b in ((0, 1), (0, 2), (1, 2))])
-    assert info["relatedness"]["pairs"] == 3
+    g = np.array([Z[a] @ Z[b] / ok.sum() for a, b in [(0, 1), (0, 2), (1, 2)] + chain[2:]])
+    assert info["relatedness"]["pairs"] == 23
     assert info["relatedness"]["sum_squared_ordered"] == pytest.approx(2 * np.sum(g ** 2), rel=1e-8)
 
 

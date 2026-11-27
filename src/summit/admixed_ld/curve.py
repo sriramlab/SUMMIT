@@ -32,6 +32,10 @@ from ._io import DosageBlocks, _ambiguous, center_impute, check_match, match_var
 from .model import fit_exponential
 from .reference import Reference, _products
 
+# the fewest listed related pairs over which the curve records summaries (their mean relatedness, the sum of g^2, the
+# listed pairs' profile); with fewer, such a summary is close to one pair's value and is left out
+MIN_RELATIVE_PAIRS = 20
+
 
 def _cohort_samples(blocks_path, covar, keep, log):
     """Rows (indices into the genotype samples) with every covariate and in --keep, and the orthonormal covariate basis
@@ -535,7 +539,10 @@ def genotype_curve(geno, ref_path, out, *, sources=None, covar=None, keep=None, 
         if relatedness_profile is None:                        # the all-pairs background holds the listed pairs too;
             relatedness_profile = not background               # their profile is needed only without it
         relatedness_profile = bool(relatedness_profile) and pa.size > 0
-        rel = None if relatedness_profile else _PairRelatedness(pa, pb)
+        few_pairs = 0 < pa.size < MIN_RELATIVE_PAIRS
+        if few_pairs:                                          # no summary over a handful of pairs
+            relatedness_profile = False
+        rel = None if (relatedness_profile or few_pairs) else _PairRelatedness(pa, pb)
         log(f"[admixed-ld] curve: {pa.size} relative pairs among the {N} samples")
     df_res = N - 1 - C.shape[1]                                 # degrees of freedom of the adjusted genotypes
     if df_res < 10:
@@ -794,7 +801,16 @@ def genotype_curve(geno, ref_path, out, *, sources=None, covar=None, keep=None, 
     elif rel is not None:
         info["relatedness"] = dict(**rel.summary(), kinship_col=kinship_col, kinship_min=kinship_min, closure=closure,
                                    definition="relatedness of the covariate-adjusted, standardized genotypes")
-    if "relatedness" in info:
+    elif relative_pairs is not None and few_pairs:
+        why = (f"{pa.size} listed related pairs in the sample, fewer than {MIN_RELATIVE_PAIRS}: no summary over them "
+               "is recorded (their mean relatedness, sum of g^2 or profile would be close to one pair's value); they "
+               "still keep each family within one half of the cell matrix, and the background term of all pairs of "
+               "people is unaffected")
+        info["relatedness"] = dict(pairs=int(pa.size), summaries=None, kinship_col=kinship_col,
+                                   kinship_min=kinship_min, closure=closure)
+        info["flags"].append(dict(flag="relative_pair_summaries_omitted", detail=why))
+        log(f"[admixed-ld] curve: note (recorded flag relative_pair_summaries_omitted): {why}")
+    if "relatedness" in info and "mean" in info["relatedness"]:
         r = info["relatedness"]
         log(f"[admixed-ld] curve: {r['pairs']} relative pairs, mean relatedness after the covariates {r['mean']:.4f}; "
             f"sum over ordered pairs of g^2 {r['sum_squared_ordered']:.4g}")

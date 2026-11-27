@@ -104,7 +104,9 @@ Every file holds aggregates over the release's people, and none has a row about 
 who enters any GWAS of the cohort (`--keep`), with the covariates that every GWAS uses, principal components included
 (`--covar`). `--relative-pairs` is a file of related pairs with columns IID1 and IID2 (optionally FID1, FID2 and a
 kinship column), for example pairs with relatedness above 0.0442 in a GRM of PC-adjusted genotypes. They keep each
-family within one half of the cell matrix (`--kinship-col` and `--kinship-min` select pairs).
+family within one half of the cell matrix (`--kinship-col` and `--kinship-min` select pairs). With fewer than 20 listed
+pairs the curve records no summary over them, since such a summary would be close to one pair's value (the flag
+`relative_pair_summaries_omitted`).
 
 `--out` is a new folder, an empty one or an earlier release. Missing parent folders are created. The release checks
 its inputs before it writes anything and refuses a sample of fewer than 50 people. It builds the new folder next to
@@ -307,6 +309,7 @@ every GWAS of the cohort.
 | `track_scores_without_relatives` | compose | `--tracks` in curve mode: the track LD scores leave out the background term. | Nothing; it is small in the own-track moments. |
 | `missing_genotypes` | curve | More than 5% of the genotype calls are missing; they are imputed with the SNP's mean. | Filter SNPs on missingness before the release. |
 | `sample_factors_not_made` | curve | No sample statistic could be made (SNPs on one chromosome). | Make the release on SNPs of two or more chromosomes. |
+| `relative_pair_summaries_omitted` | curve | Fewer than 20 related pairs were listed, so the curve records no summary over them (their mean relatedness, sum of g² or profile). The pairs still keep each family within one half of the cell matrix, and the background term is unaffected. | Nothing. |
 | `cov_rank_without_covariates` | tractor-sumstats | COV_RANK is 2 (K − 1), because the number of covariates was not given. | Pass `--covariates`. |
 | `se_rounded` | tractor-sumstats | Standard errors with four decimals and no t statistics. | Give the t statistics or full-precision SEs. |
 | `sandwich_from_full_model_residuals` | tractor-sumstats | Sandwich SEs from the full model's residuals, which are biased low at alleles rare on a track. | Use `tractor-gwas`, which writes the covariates-only sandwich SEs. |

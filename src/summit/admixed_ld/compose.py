@@ -1319,6 +1319,11 @@ def compose_ldscores(ref_path, sumstats, annot, out, *, sources=None, snps=None,
                     raise ValueError("--relatedness curve needs a curve with a relatedness profile or --background; "
                                      "this curve has neither. Pass --relatedness uniform for "
                                      "the uniform sum of g^2, or remake the curve.")
+            if "sum_squared_ordered" not in curve_info["relatedness"]:
+                raise ValueError("The curve records no summary of its listed related pairs (fewer than 20 were "
+                                 "listed; flag relative_pair_summaries_omitted), so --relatedness "
+                                 f"{relatedness} has nothing to use. Make the curve with its background term (the "
+                                 "default), which measures all pairs of people, or pass --relatedness none.")
             rel_sum = float(curve_info["relatedness"]["sum_squared_ordered"])
     else:
         rel_sum = float(relatedness)

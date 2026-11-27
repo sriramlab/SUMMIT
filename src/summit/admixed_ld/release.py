@@ -137,7 +137,8 @@ def make_release(geno, ref, out, *, keep=None, covar=None, relative_pairs=None, 
                                   window_kb=info["reference"]["window_kb"]),
                    bins=bins, files=files, flags=list(info.get("flags", [])),
                    never_share=["the genotypes", "the phenotypes", "the --keep, --covar and --relative-pairs files",
-                                "any per-person table (ancestry estimates, principal components, relatedness)"],
+                                "any per-person or per-pair table (ancestry estimates, principal components, the "
+                                "relatedness of pairs)"],
                    rules=dict(min_people=MIN_PEOPLE, statement=_rule(MIN_PEOPLE)))
         with open(os.path.join(work, RECORD), "w") as fh:
             json.dump(rec, fh, indent=1)
@@ -195,6 +196,9 @@ def _write_readme(out, rec):
         lines += ["", para("This release has no sample statistic (" + str(rec.get("sample_statistic_missing") or
                                                                          "it could not be made") + "). Compose "
                            "therefore takes the same-person term under random mating.")]
+    if any(f.get("flag") == "relative_pair_summaries_omitted" for f in rec.get("flags", [])):
+        lines += ["", para(f"Fewer than 20 related pairs were listed ({rec['relative_pairs']}), so the curve records "
+                           "no summary over them; they only keep each family within one half of the cell matrix.")]
     empty = rec["bins"].get("empty_left_out") or []
     if empty:
         lines += ["", para("The annotations leave out bins and classes without any SNP of this SNP set ("
