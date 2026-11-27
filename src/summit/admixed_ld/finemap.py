@@ -109,6 +109,7 @@ def predict_error_variance(C_s, M_s, v, p, m, w0, T, cd, R, n_s, N):
     pmix = p @ m
     Vgw, Vgw_h = (1 - R ** 2) ** 2 / N, var_corr(pmix, R) / N
     V = Vh_tot + bias2 + Vgw_h
+    V = 0.5 * (V + V.T)                                  # exactly symmetric, as the matrix R is
     np.fill_diagonal(V, 0.0)
     return dict(V=V, parts=dict(v_panel=Vg_tot, v_panel_hap=Vh_tot, bias2=bias2, v_gwas=Vgw, v_gwas_hap=Vgw_h))
 

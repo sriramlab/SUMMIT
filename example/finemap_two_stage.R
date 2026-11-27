@@ -19,8 +19,10 @@ reg <- a[1]
 L <- if (length(a) >= 2) as.integer(a[2]) else 10L
 LAMBDA <- 1e-4
 
-R <- as.matrix(read.table(paste0(reg, ".ld")))
-V <- as.matrix(read.table(paste0(reg, ".ld_var")))
+# unname: read.table names the columns V1, V2, ... and not the rows, and a matrix whose row and column names differ
+# fails isSymmetric(), which susie_get_cs checks (the values are written exactly symmetric)
+R <- unname(as.matrix(read.table(paste0(reg, ".ld"))))
+V <- unname(as.matrix(read.table(paste0(reg, ".ld_var"))))
 zt <- read.table(paste0(reg, ".z.tsv"), header = TRUE, sep = "\t", stringsAsFactors = FALSE)
 p <- nrow(R)
 stopifnot(ncol(R) == p, all(dim(V) == c(p, p)), nrow(zt) == p)
