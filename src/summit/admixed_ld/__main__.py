@@ -52,6 +52,20 @@ def _sources(value):
     return None if value is None else [x.strip() for x in value.split(",") if x.strip()]
 
 
+def _bin_options(p, release=False):
+    """The MAF/LD bins' options of bins and release."""
+    p.add_argument("--maf-cuts", default="0.02,0.05,0.1,0.2,0.3",
+                   help="MAF cuts of the MAF bins (default 0.02,0.05,0.1,0.2,0.3: six MAF bins)")
+    p.add_argument("--ld-quantiles", type=int, default=4,
+                   help="quantiles of the local LD score within each MAF bin (default 4)")
+    p.add_argument("--maf-class-cut", type=float, default=0.05,
+                   help="the MAF cut, one of --maf-cuts, at which the bins are pooled into two MAF classes (default "
+                        "0.05)" + ("" if release else "; with --sumstats or --ref, the cut of the two MAF classes"))
+    if release:
+        p.add_argument("--no-bins", dest="bins", action="store_false", default=True,
+                       help="make no MAF/LD bins; the analyst then brings the annotation of the fit")
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(prog="summit admixed-ld",
                                  description="SUMMIT-MIX: LD scores of admixed GWAS samples without in-sample LD")
@@ -198,6 +212,7 @@ def main(argv=None):
                     help="threads for genotype decoding and matrix products; also the BLAS limit (default 1)")
     rl.add_argument("--drop-ambiguous", action="store_true",
                     help="leave out strand-ambiguous (A/T, C/G) SNPs from the curve; give it to compose too")
+    _bin_options(rl, release=True)
     rl.add_argument("--out", required=True,
                     help="the release folder: new, empty, or an earlier release, which the new one replaces when it "
                          "is complete")
@@ -225,6 +240,7 @@ def main(argv=None):
     bn.add_argument("--step", type=int, default=None, help=argparse.SUPPRESS)
     bn.add_argument("--threads", "--num-threads", dest="threads", type=int, default=1,
                     help="threads for genotype decoding and matrix products; also the BLAS limit (default 1)")
+    _bin_options(bn)
     bn.add_argument("--out", required=True,
                     help="output prefix: PREFIX.bins8.annot.gz and PREFIX.maf2.annot.gz (with --geno), or "
                          "PREFIX.maf2.annot.gz; PREFIX.bins.json records them")
@@ -526,6 +542,11 @@ def main(argv=None):
     return _run(a, log)
 
 
+def _scheme_of(a):
+    from .bins import bin_scheme
+    return bin_scheme(a.maf_cuts, a.ld_quantiles, a.maf_class_cut)
+
+
 def _start_log(a, log):
     """The log file of a step: OUT.<step>.log next to an output prefix, whose folder is created; <step>.log inside the
     output folder of reference, clean-panels and derive. release starts its own log once its inputs pass their checks,
@@ -581,13 +602,15 @@ def _run(a, log):
                      kinship_col=a.kinship_col, kinship_min=a.kinship_min, sources=_sources(a.sources), match=a.match,
                      cell_cm=a.cell_cm, step=a.step, threads=a.threads, drop_ambiguous=a.drop_ambiguous,
                      background_memory_gb=a.background_memory_gb, relatedness_memory_gb=a.relatedness_memory_gb,
+                     bins=a.bins, bin_scheme=_scheme_of(a) if a.bins else None,
                      log=log._log, attach_log=lambda path: log.attach_file(path, mode="w"))
     elif a.cmd == "bins":
         from .bins import maf_classes, make_bins, write_record
         if a.geno is not None:
-            rec = make_bins(a.geno, a.out, keep=a.keep, step=a.step, threads=a.threads, scores=a.scores, log=log._log)
+            rec = make_bins(a.geno, a.out, keep=a.keep, step=a.step, threads=a.threads, scores=a.scores,
+                            scheme=_scheme_of(a), log=log._log)
         else:
-            rec = maf_classes(a.out, sumstats=a.sumstats, freq_col=a.freq_col, ref=a.ref,
+            rec = maf_classes(a.out, sumstats=a.sumstats, freq_col=a.freq_col, ref=a.ref, class_cut=a.maf_class_cut,
                               mean_ancestry=a.mean_ancestry, sources=_sources(a.sources), log=log._log)
         write_record(f"{a.out}.bins.json", rec)
     elif a.cmd == "sample-factors":

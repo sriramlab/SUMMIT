@@ -28,9 +28,18 @@ _WHAT = {
     "cells.npz": "the cell matrix (covariances between 2-cM segments of the genome, in two halves of the people)",
     "sample_factors.json": "the sample statistic (a small covariance matrix of person factors, for the same-person "
                            "term)",
-    "bins8.annot.gz": "the eight MAF/LD bins of the fit (0/1 columns per SNP)",
-    "maf2.annot.gz": "the two MAF classes of the fit (MAF below 0.05 and at least 0.05; 0/1 columns per SNP)",
 }
+
+
+def _bins_files(bins):
+    """The release's entries for the bins' annotation files (0/1 columns per SNP)."""
+    nq, cut = bins["ld_quantiles"], bins["maf_class_cut"]
+    what = dict(pooled=f"the {2 * nq} MAF/LD bins of the fit, {nq} LD quantiles in each of the MAF classes below "
+                       f"{cut:g} and at least {cut:g} (0/1 columns per SNP)",
+                fine=f"the {len(bins['maf_cuts']) + 1} MAF bins by {nq} LD quantiles, unpooled, for large samples "
+                     "(0/1 columns per SNP)",
+                classes=f"the two MAF classes of the fit, MAF below {cut:g} and at least {cut:g} (0/1 columns per SNP)")
+    return [dict(file=bins["files"][k], what=what[k]) for k in ("pooled", "fine", "classes") if k in bins["files"]]
 
 
 def check_release_target(out):
@@ -80,10 +89,12 @@ def check_release_inputs(geno, ref, out, *, keep=None, covar=None, relative_pair
 
 def make_release(geno, ref, out, *, keep=None, covar=None, relative_pairs=None, kinship_col=None, kinship_min=None,
                  sources=None, match="position", cell_cm=0.25, step=4096, threads=1, drop_ambiguous=False,
-                 background_memory_gb=32.0, relatedness_memory_gb=4.0, name=NAME, log=print, attach_log=None) -> dict:
+                 background_memory_gb=32.0, relatedness_memory_gb=4.0, name=NAME, bins=True, bin_scheme=None,
+                 log=print, attach_log=None) -> dict:
     """The release folder `out`: the MAF/LD bins, the curve with its sample statistic, background term and cell
     matrix, release.json and README.txt. attach_log(path) starts the run's log file (release.log) inside the folder
     being built, once the inputs have passed their checks. Returns the record."""
+    from .bins import bin_scheme as _scheme
     from .bins import make_bins
     from .curve import genotype_curve
     from .sample_factors import MIN_PEOPLE
@@ -91,6 +102,7 @@ def make_release(geno, ref, out, *, keep=None, covar=None, relative_pairs=None, 
     out = os.path.normpath(out)
     rows = check_release_inputs(geno, ref, out, keep=keep, covar=covar, relative_pairs=relative_pairs,
                                 sources=sources)
+    scheme = (bin_scheme or _scheme()) if bins else None
     parent = os.path.dirname(os.path.abspath(out))
     os.makedirs(parent, exist_ok=True)
     work = os.path.join(parent, f".{os.path.basename(out)}.building.{os.getpid()}")
@@ -107,7 +119,7 @@ def make_release(geno, ref, out, *, keep=None, covar=None, relative_pairs=None, 
     prefix = os.path.join(work, name)
     try:
         # the bins first: they are quick and stop a release whose SNP set cannot be binned before the curve's pass
-        bins = make_bins(geno, prefix, rows=rows, threads=threads, log=log)
+        brec = make_bins(geno, prefix, rows=rows, threads=threads, scheme=scheme, log=log) if bins else None
         _, info = genotype_curve(geno, ref, prefix, sources=sources, covar=covar, keep=keep, match=match,
                                  cell_cm=cell_cm, relative_pairs=relative_pairs, kinship_col=kinship_col,
                                  kinship_min=kinship_min, step=step, threads=threads, background=True,
@@ -115,9 +127,9 @@ def make_release(geno, ref, out, *, keep=None, covar=None, relative_pairs=None, 
                                  relatedness_memory_gb=relatedness_memory_gb, drop_ambiguous=drop_ambiguous,
                                  sample_factors=True, log=log)
         files = [dict(file=f"{name}.{suffix}", what=what) for suffix, what in _WHAT.items()
-                 if os.path.exists(f"{prefix}.{suffix}")]
-        missing = [s for s in ("curve.tsv", "curve.json", "bins8.annot.gz", "maf2.annot.gz")
-                   if not os.path.exists(f"{prefix}.{s}")]
+                 if os.path.exists(f"{prefix}.{suffix}")] + (_bins_files(brec) if brec else [])
+        missing = [s for s in ("curve.tsv", "curve.json") if not os.path.exists(f"{prefix}.{s}")]
+        missing += [f["file"] for f in files if not os.path.exists(os.path.join(work, f["file"]))]
         if missing:
             raise RuntimeError(f"The release is missing {missing}.")
         if os.path.exists(os.path.join(work, LOG)):
@@ -128,14 +140,14 @@ def make_release(geno, ref, out, *, keep=None, covar=None, relative_pairs=None, 
                        None)
         rec = dict(format="summit-admixed-ld-release", version=1, curve=name, people=int(info["n_samples"]),
                    covariate_rank=int(info["covariate_rank"]), sources=info["sources"], baseline=info["baseline"],
-                   n_snps_curve=int(info["n_snps"]), n_snps_bins=int(bins["n_snps"]),
+                   n_snps_curve=int(info["n_snps"]), n_snps_bins=int(brec["n_snps"]) if brec else None,
                    relative_pairs=int(rel["pairs"]) if "pairs" in rel else None,
                    sample_statistic=bool(info.get("sample_factors")), sample_statistic_missing=no_stat,
                    reference=dict(name=os.path.basename(os.path.normpath(ref)),
                                   sources=[dict(name=s.get("name"), n=s.get("n"))
                                            for s in info["reference"]["sources"]],
                                   window_kb=info["reference"]["window_kb"]),
-                   bins=bins, files=files, flags=list(info.get("flags", [])),
+                   bins=brec, files=files, flags=list(info.get("flags", [])),
                    never_share=["the genotypes", "the phenotypes", "the --keep, --covar and --relative-pairs files",
                                 "any per-person or per-pair table (ancestry estimates, principal components, the "
                                 "relatedness of pairs)"],
@@ -199,7 +211,11 @@ def _write_readme(out, rec):
     if any(f.get("flag") == "relative_pair_summaries_omitted" for f in rec.get("flags", [])):
         lines += ["", para(f"Fewer than 20 related pairs were listed ({rec['relative_pairs']}), so the curve records "
                            "no summary over them; they only keep each family within one half of the cell matrix.")]
-    empty = rec["bins"].get("empty_left_out") or []
+    empty = (rec["bins"] or {}).get("empty_left_out") or []
+    if rec["bins"] is None:
+        lines += ["", para("This release has no MAF/LD bins (made with --no-bins). The analyst brings the annotation "
+                           "of the fit, for example two MAF classes of the GWAS's allele frequencies (summit "
+                           "admixed-ld bins --sumstats).")]
     if empty:
         lines += ["", para("The annotations leave out bins and classes without any SNP of this SNP set ("
                            + ", ".join(empty) + "), for example the MAF class below 0.05 of SNPs filtered on MAF.")]
@@ -210,6 +226,8 @@ def _write_readme(out, rec):
               "",
               "Never share:"]
     lines += [para(x, "  ") for x in rec["never_share"]]
+    annot = (f"THIS_FOLDER/{rec['bins']['files']['pooled']}" if rec["bins"] and "pooled" in rec["bins"]["files"]
+             else "ANNOTATION")
     lines += [
         "",
         "Releasing more statistics:",
@@ -218,9 +236,9 @@ def _write_readme(out, rec):
         para("The analyst composes the LD scores of every GWAS of the cohort from this folder, the same reference and "
              "the GWAS summary statistics:"),
         "  summit admixed-ld compose --ref REF --release THIS_FOLDER --sumstats GWAS_DIR \\",
-        f"    --annot THIS_FOLDER/{rec['curve']}.bins8.annot.gz --out ld/cohort",
+        f"    --annot {annot} --out ld/cohort",
         "  summit --h2 GWAS_DIR --ldscores ld/cohort \\",
-        f"    --annot THIS_FOLDER/{rec['curve']}.bins8.annot.gz --out results/h2",
+        f"    --annot {annot} --out results/h2",
     ]
     with open(os.path.join(out, README), "w") as fh:
         fh.write("\n".join(lines) + "\n")

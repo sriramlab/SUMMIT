@@ -96,7 +96,7 @@ folder:
 | `cohort.background.tsv` | the background term by distance and between chromosomes |
 | `cohort.cells.npz` | the cell matrix, estimated in two halves of the people so that its square is unbiased (about 27 MB for two sources) |
 | `cohort.sample_factors.json` | the sample statistic |
-| `cohort.bins8.annot.gz`, `cohort.maf2.annot.gz` | the eight MAF and LD bins and the two MAF classes (0/1 columns per SNP) |
+| `cohort.bins8.annot.gz`, `cohort.bins24.annot.gz`, `cohort.maf2.annot.gz` | the eight MAF and LD bins, the 24 unpooled bins and the two MAF classes (0/1 columns per SNP; none with `--no-bins`) |
 | `release.json`, `README.txt` | what was made, from how many people and covariates, with which reference, and the list of what to share and what never to share |
 | `release.log` | the log of the run |
 
@@ -125,9 +125,10 @@ then writes the listed pairs' own profile, `.relatedness.tsv`). A curve on one c
 
 ## The MAF and LD bins
 
-Heritability is fitted with eight bins of MAF and LD score. SNPs are placed in six MAF bins, cut at 0.02, 0.05, 0.1,
-0.2 and 0.3, and in the quartiles of a local in-sample LD score within each. The bins are then pooled by quartile into
-two MAF classes, below 0.05 (`maf_low_ld1` to `maf_low_ld4`) and at least 0.05 (`maf_high_ld1` to `maf_high_ld4`). The
+SNPs are placed in six MAF bins, cut at 0.02, 0.05, 0.1, 0.2 and 0.3, and in the quartiles of a local in-sample LD
+score within each, which gives 24 bins (`maf_0_0.02_ld1` to `maf_0.3_0.5_ld4`). The eight bins pool these by quartile
+into two MAF classes, below 0.05 (`maf_low_ld1` to `maf_low_ld4`) and at least 0.05 (`maf_high_ld1` to
+`maf_high_ld4`). The
 local score of a SNP is the sum of the unbiased squared correlations, r² − (1 − r²)/(n − 2) in n people, of its
 genotypes with those of the SNPs within 1 Mb on either side, without covariates. The MAF is the minor allele's count
 among the called genotypes of the same people, divided by twice their number. SNPs without variance in these people
@@ -144,8 +145,12 @@ the release therefore includes the bins.
 summit admixed-ld bins --geno cohort --keep gwas_people.txt --threads 8 --out bins/cohort
 ```
 
-writes `bins/cohort.bins8.annot.gz`, `bins/cohort.maf2.annot.gz` and `bins/cohort.bins.json`. `--scores` also writes
-each SNP's MAF and local score (`.local_ld.tsv.gz`), which the fit does not need.
+writes `bins/cohort.bins8.annot.gz`, `bins/cohort.bins24.annot.gz`, `bins/cohort.maf2.annot.gz` and
+`bins/cohort.bins.json`. `--scores` also writes each SNP's MAF and local score (`.local_ld.tsv.gz`), which the fit does
+not need. `--maf-cuts`, `--ld-quantiles` and `--maf-class-cut` (one of the MAF cuts) give other bins. For example
+`--maf-cuts 0.01,0.05,0.2 --ld-quantiles 3` writes four MAF bins by three LD tertiles
+(`bins/cohort.mafcuts0.01-0.05-0.2_ld3_class0.05.bins12.annot.gz`), pooled into six bins (`.bins6.annot.gz`) and two
+MAF classes (`.maf2.annot.gz`). `release` takes the same options, and `release --no-bins` makes no bins.
 
 **Two MAF classes.** Without the cohort's bins, fit two MAF classes cut at 0.05 (`maf_low`, `maf_high`). They need only
 the MAF, from an allele-frequency column of the summary statistics or from the panels at the GWAS's mean ancestry (the

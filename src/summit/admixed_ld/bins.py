@@ -18,8 +18,9 @@ cohort's bins can take from the summary statistics' allele frequencies or from t
 (`maf_classes`).
 
 Outputs are SUMMIT annotation files (CHR BP SNP CM and one 0/1 column per class) that compose and `summit --h2/--rg`
-read as `--annot`: PREFIX.bins8.annot.gz (eight bins) and PREFIX.maf2.annot.gz (two MAF classes, the eight bins
-pooled by MAF class). Only these 0/1 columns are written; the per-SNP scores and frequencies, which are not needed to
+read as `--annot`: PREFIX.bins8.annot.gz (eight bins), PREFIX.bins24.annot.gz (the 24 unpooled bins, six MAF bins by
+four LD quartiles, for large samples) and PREFIX.maf2.annot.gz (two MAF classes, the eight bins pooled by MAF class).
+Other MAF cuts, numbers of LD quantiles and class cuts (bin_scheme) give files named after them. Only these 0/1 columns are written; the per-SNP scores and frequencies, which are not needed to
 fit, are written only with scores=True (PREFIX.local_ld.tsv.gz).
 """
 from __future__ import annotations
@@ -33,7 +34,6 @@ import pandas as pd
 
 WINDOW_BP = 1_000_000
 MAF_CUTS = (0.02, 0.05, 0.1, 0.2, 0.3)
-LOW_MAF_BINS = (1, 2)                    # the MAF bins below 0.05
 MAF_CLASS_CUT = 0.05
 BIN_NAMES = [f"maf_{c}_ld{q}" for c in ("low", "high") for q in range(1, 5)]
 CLASS_NAMES = ["maf_low", "maf_high"]
@@ -127,25 +127,71 @@ def local_ld_scores(geno, *, keep=None, rows=None, window_bp=WINDOW_BP, step=Non
     return df, n
 
 
-def maf_ld_bins(maf, score) -> np.ndarray:
-    """The eight MAF/LD bins as an SNPs x 8 0/1 matrix (columns BIN_NAMES): the MAF bins of MAF_CUTS, the quartiles of
-    `score` within each (by rank, ties in order), pooled by quartile into MAF below 0.05 and at least 0.05."""
+def bin_scheme(maf_cuts=MAF_CUTS, ld_quantiles=4, class_cut=MAF_CLASS_CUT) -> dict:
+    """The MAF/LD bins: MAF bins cut at maf_cuts, ld_quantiles quantiles of the local score within each, and the MAF
+    class cut at which they are pooled (one of the MAF cuts). Defaults: the paper's six MAF bins, quartiles, 0.05."""
+    cuts = [float(x) for x in (maf_cuts.split(",") if isinstance(maf_cuts, str) else maf_cuts)]
+    if not cuts or any(not 0 < c < 0.5 for c in cuts) or any(b <= a for a, b in zip(cuts, cuts[1:])):
+        raise ValueError(f"--maf-cuts must be increasing MAF values between 0 and 0.5; got {maf_cuts}.")
+    nq = int(ld_quantiles)
+    if nq < 1:
+        raise ValueError(f"--ld-quantiles must be 1 or more; got {ld_quantiles}.")
+    cut = float(class_cut)
+    if not any(np.isclose(cut, c, rtol=0, atol=1e-12) for c in cuts):
+        raise ValueError(f"--maf-class-cut {cut:g} must be one of the MAF cuts ({', '.join(f'{c:g}' for c in cuts)}), "
+                         "so that the pooled bins hold whole MAF bins.")
+    default = (np.allclose(cuts, MAF_CUTS) if len(cuts) == len(MAF_CUTS) else False) and nq == 4 and \
+        np.isclose(cut, MAF_CLASS_CUT)
+    edges = [0.0] + cuts + [0.5]
+    fine = [f"maf_{edges[b]:g}_{edges[b + 1]:g}_ld{q}" for b in range(len(cuts) + 1) for q in range(1, nq + 1)]
+    pooled = [f"maf_{c}_ld{q}" for c in ("low", "high") for q in range(1, nq + 1)]
+    # file names: bins<n> for n bins; a scheme other than the default also names its cuts and quantiles
+    tag = "" if default else f"mafcuts{'-'.join(f'{c:g}' for c in cuts)}_ld{nq}_class{cut:g}."
+    return dict(maf_cuts=cuts, ld_quantiles=nq, class_cut=cut, default=bool(default), fine_names=fine,
+                pooled_names=pooled, tag=tag, n_maf_bins=len(cuts) + 1)
+
+
+def _mafld_index(maf, score, cuts, nq):
+    """Each SNP's MAF bin (1 .. len(cuts) + 1) and LD quantile within it (1 .. nq, by rank of the score, ties in
+    order; a MAF bin with fewer SNPs than quantiles has one SNP per quantile, lowest first)."""
     maf, score = np.asarray(maf, np.float64), np.asarray(score, np.float64)
     if not (np.isfinite(maf).all() and np.isfinite(score).all()):
         raise ValueError("MAF or local LD scores are missing.")
-    mb = np.digitize(maf, MAF_CUTS) + 1
+    mb = np.digitize(maf, cuts) + 1
     q = np.zeros(maf.size, dtype=np.int64)
-    for b in range(1, len(MAF_CUTS) + 2):
+    for b in range(1, len(cuts) + 2):
         sel = np.flatnonzero(mb == b)
-        if sel.size >= 4:
-            q[sel] = pd.qcut(pd.Series(score[sel]).rank(method="first"), 4, labels=False).to_numpy() + 1
-        elif sel.size:                                 # fewer SNPs than quartiles: one per quartile, lowest first
+        if sel.size >= nq:
+            q[sel] = pd.qcut(pd.Series(score[sel]).rank(method="first"), nq, labels=False).to_numpy() + 1
+        elif sel.size:
             q[sel[np.argsort(score[sel], kind="stable")]] = np.arange(1, sel.size + 1)
-    low = np.isin(mb, LOW_MAF_BINS)
-    A = np.zeros((maf.size, len(BIN_NAMES)), dtype=np.int8)
-    for i, cls in enumerate((low, ~low)):
-        for qq in range(1, 5):
-            A[:, 4 * i + qq - 1] = cls & (q == qq)
+    return mb, q
+
+
+def maf_ld_fine_bins(maf, score, scheme=None) -> np.ndarray:
+    """The unpooled MAF/LD bins as an SNPs x (MAF bins x quantiles) 0/1 matrix (columns scheme['fine_names']; the
+    default scheme gives 24 bins, six MAF bins by four LD quartiles)."""
+    sc = scheme or bin_scheme()
+    mb, q = _mafld_index(maf, score, sc["maf_cuts"], sc["ld_quantiles"])
+    nq = sc["ld_quantiles"]
+    A = np.zeros((mb.size, sc["n_maf_bins"] * nq), dtype=np.int8)
+    for b in range(1, sc["n_maf_bins"] + 1):
+        for qq in range(1, nq + 1):
+            A[:, (b - 1) * nq + qq - 1] = (mb == b) & (q == qq)
+    return A
+
+
+def maf_ld_bins(maf, score, scheme=None) -> np.ndarray:
+    """The pooled MAF/LD bins as an SNPs x (2 x quantiles) 0/1 matrix (columns scheme['pooled_names']; by default the
+    eight bins, columns BIN_NAMES): the fine bins pooled by quantile into MAF below the class cut and at least it."""
+    sc = scheme or bin_scheme()
+    F = maf_ld_fine_bins(maf, score, sc)
+    nq = sc["ld_quantiles"]
+    n_low = int(np.flatnonzero(np.isclose(sc["maf_cuts"], sc["class_cut"], rtol=0, atol=1e-12))[0]) + 1
+    A = np.zeros((F.shape[0], 2 * nq), dtype=np.int8)
+    for qq in range(nq):
+        A[:, qq] = F[:, [b * nq + qq for b in range(n_low)]].sum(axis=1)
+        A[:, nq + qq] = F[:, [b * nq + qq for b in range(n_low, sc["n_maf_bins"])]].sum(axis=1)
     return A
 
 
@@ -161,28 +207,35 @@ def _write_annot(path, meta, cols, names, log):
     return path
 
 
-def write_bins(out, table, *, scores=False, log=print) -> dict:
-    """PREFIX.bins8.annot.gz and PREFIX.maf2.annot.gz from local_ld_scores' table (and PREFIX.local_ld.tsv.gz with
-    scores). An empty bin or class (for example the MAF class below 0.05 of a SNP set filtered on MAF) is left out of
-    the file, with a log line and a record; a bin with fewer than 100 SNPs is a warning (its heritability is poorly
-    determined). Returns the record of what was written."""
-    A = maf_ld_bins(table.MAF.to_numpy(), table.local.to_numpy())
-    sizes = A.sum(axis=0)
-    two = np.column_stack([A[:, :4].sum(axis=1), A[:, 4:].sum(axis=1)])
-    sizes2 = two.sum(axis=0)
-    keep8, keep2 = sizes > 0, sizes2 > 0
-    dropped = [nm for nm, k in zip(BIN_NAMES + CLASS_NAMES, list(keep8) + list(keep2)) if not k]
+def write_bins(out, table, *, scores=False, scheme=None, log=print) -> dict:
+    """The pooled MAF/LD bins, the unpooled bins and the two MAF classes from local_ld_scores' table, as annotation
+    files: by default PREFIX.bins8.annot.gz, PREFIX.bins24.annot.gz and PREFIX.maf2.annot.gz (another scheme also names
+    its cuts and quantiles), and PREFIX.local_ld.tsv.gz with scores. An empty bin or class (for example the MAF class
+    below 0.05 of a SNP set filtered on MAF) is left out of its file, with a log line and a record; a pooled bin with
+    fewer than 100 SNPs is a warning (its heritability is poorly determined). Returns the record of what was written."""
+    sc = scheme or bin_scheme()
+    F = maf_ld_fine_bins(table.MAF.to_numpy(), table.local.to_numpy(), sc)
+    A = maf_ld_bins(table.MAF.to_numpy(), table.local.to_numpy(), sc)
+    nq = sc["ld_quantiles"]
+    two = np.column_stack([A[:, :nq].sum(axis=1), A[:, nq:].sum(axis=1)])
+    parts = [("pooled", A, sc["pooled_names"]), ("fine", F, sc["fine_names"]), ("classes", two, CLASS_NAMES)]
+    if F.shape[1] == A.shape[1]:                     # one MAF cut, the class cut: the fine bins are the pooled ones
+        parts = [parts[0], parts[2]]
+    sizes = {k: M.sum(axis=0) for k, M, _ in parts}
+    dropped = [nm for k, M, names in parts for nm, n_ in zip(names, sizes[k]) if n_ == 0]
     if dropped:
         log(f"[admixed-ld] bins: empty bins and classes left out of the annotations (no SNP has a MAF there): "
             f"{', '.join(dropped)}")
-    small = [f"{nm} ({int(s)})" for nm, s in zip(BIN_NAMES, sizes) if 0 < s < 100]
+    small = [f"{nm} ({int(n_)})" for nm, n_ in zip(sc["pooled_names"], sizes["pooled"]) if 0 < n_ < 100]
     if small:
         log(f"[admixed-ld] bins: WARNING: bins with fewer than 100 SNPs, whose heritability is poorly determined: "
             f"{', '.join(small)}; the two MAF classes are the more robust fit")
-    names8 = [nm for nm, k in zip(BIN_NAMES, keep8) if k]
-    names2 = [nm for nm, k in zip(CLASS_NAMES, keep2) if k]
-    files = dict(bins8=_write_annot(f"{out}.bins8.annot.gz", table, A[:, keep8], names8, log),
-                 maf2=_write_annot(f"{out}.maf2.annot.gz", table, two[:, keep2], names2, log))
+    files = {}
+    for k, M, names in parts:
+        keep = sizes[k] > 0
+        stem = "maf2" if k == "classes" else f"bins{M.shape[1]}"
+        files[k] = _write_annot(f"{out}.{sc['tag']}{stem}.annot.gz", table, M[:, keep],
+                                [nm for nm, k_ in zip(names, keep) if k_], log)
     if scores:
         p = f"{out}.local_ld.tsv.gz"
         table[["SNP", "CHR", "BP", "MAF", "local"]].to_csv(f"{p}.{os.getpid()}.tmp.gz", sep="\t", index=False,
@@ -190,21 +243,26 @@ def write_bins(out, table, *, scores=False, log=print) -> dict:
         os.replace(f"{p}.{os.getpid()}.tmp.gz", p)
         files["local_ld"] = p
         log(f"[admixed-ld] bins: wrote {p} (per-SNP MAF and local score; not needed for the fit)")
+    cuts = ", ".join(f"{c:g}" for c in sc["maf_cuts"])
     return dict(files={k: os.path.basename(v) for k, v in files.items()}, n_snps=int(len(table)),
-                bins={nm: int(s) for nm, s in zip(BIN_NAMES, sizes) if s > 0},
-                maf_classes={nm: int(s) for nm, s in zip(CLASS_NAMES, sizes2) if s > 0}, empty_left_out=dropped,
-                window_bp=WINDOW_BP, maf_cuts=list(MAF_CUTS), maf_class_cut=MAF_CLASS_CUT,
-                definition="six MAF bins (cuts 0.02, 0.05, 0.1, 0.2, 0.3), quartiles of the local in-sample LD score "
-                           "(partners within 1 Mb, r^2 - (1 - r^2) / (n - 2), no covariates) within each, pooled by "
-                           "quartile into MAF below 0.05 (maf_low) and at least 0.05 (maf_high)")
+                bins={nm: int(n_) for nm, n_ in zip(sc["pooled_names"], sizes["pooled"]) if n_ > 0},
+                fine_bins={nm: int(n_) for nm, n_ in zip(sc["fine_names"], F.sum(axis=0)) if n_ > 0},
+                maf_classes={nm: int(n_) for nm, n_ in zip(CLASS_NAMES, sizes["classes"]) if n_ > 0},
+                empty_left_out=dropped, window_bp=WINDOW_BP, maf_cuts=list(sc["maf_cuts"]),
+                ld_quantiles=nq, maf_class_cut=sc["class_cut"],
+                definition=f"{sc['n_maf_bins']} MAF bins (cuts {cuts}) by {nq} quantiles of the local in-sample LD "
+                           "score (partners within 1 Mb, r^2 - (1 - r^2) / (n - 2), no covariates) within each "
+                           f"(the unpooled bins), pooled by quantile into MAF below {sc['class_cut']:g} (maf_low) and "
+                           "at least it (maf_high)")
 
 
-def make_bins(geno, out, *, keep=None, rows=None, step=None, threads=1, scores=False, log=print) -> dict:
+def make_bins(geno, out, *, keep=None, rows=None, step=None, threads=1, scores=False, scheme=None, log=print) -> dict:
     """`summit admixed-ld bins --geno`: the local scores of the people of `keep` (or the sample rows `rows`) and the
-    two annotation files."""
+    annotation files."""
     t0 = time.perf_counter()
+    sc = scheme or bin_scheme()
     table, n = local_ld_scores(geno, keep=keep, rows=rows, step=step, threads=threads, log=log)
-    rec = write_bins(out, table, scores=scores, log=log)
+    rec = write_bins(out, table, scores=scores, scheme=sc, log=log)
     rec["n_people"] = int(n)
     log(f"[admixed-ld] bins: {rec['n_snps']} SNPs in {time.perf_counter() - t0:.0f} s")
     return rec
@@ -213,7 +271,8 @@ def make_bins(geno, out, *, keep=None, rows=None, step=None, threads=1, scores=F
 _FREQ_COLUMNS = ("A1_FREQ", "A1FREQ", "EAF", "AF", "AF1", "FREQ", "FREQ1", "FRQ", "MAF", "A1_AF")
 
 
-def maf_classes(out, *, sumstats=None, freq_col=None, ref=None, mean_ancestry=None, sources=None, log=print) -> dict:
+def maf_classes(out, *, sumstats=None, freq_col=None, ref=None, mean_ancestry=None, sources=None,
+                class_cut=MAF_CLASS_CUT, log=print) -> dict:
     """The two MAF classes alone (PREFIX.maf2.annot.gz), for an analyst without the cohort's bins: MAF from an allele
     frequency column of the summary statistics (freq_col, or the first of _FREQ_COLUMNS present), or from the
     reference panels at the given mean ancestry (frequency sum_s m_s p_s, for the reference variants)."""
@@ -262,14 +321,18 @@ def maf_classes(out, *, sumstats=None, freq_col=None, ref=None, mean_ancestry=No
     if (~poly).any():
         log(f"[admixed-ld] bins: {int((~poly).sum())} SNPs with MAF 0 are left out")
         meta, maf = meta[poly].reset_index(drop=True), maf[poly]
-    two = np.column_stack([maf < MAF_CLASS_CUT, maf >= MAF_CLASS_CUT]).astype(np.int8)
+    cut = float(class_cut)
+    if not 0 < cut < 0.5:
+        raise ValueError(f"--maf-class-cut must be between 0 and 0.5; got {class_cut}.")
+    two = np.column_stack([maf < cut, maf >= cut]).astype(np.int8)
     keep2 = two.sum(axis=0) > 0
     dropped = [nm for nm, k in zip(CLASS_NAMES, keep2) if not k]
     if dropped:
         log(f"[admixed-ld] bins: empty classes left out of the annotation: {', '.join(dropped)}")
-    path = _write_annot(f"{out}.maf2.annot.gz", meta, two[:, keep2], [nm for nm, k in zip(CLASS_NAMES, keep2) if k],
+    tag = "" if np.isclose(cut, MAF_CLASS_CUT) else f"class{cut:g}."
+    path = _write_annot(f"{out}.{tag}maf2.annot.gz", meta, two[:, keep2], [nm for nm, k in zip(CLASS_NAMES, keep2) if k],
                         log)
-    log(f"[admixed-ld] bins: two MAF classes (cut at {MAF_CLASS_CUT}) from {source}")
+    log(f"[admixed-ld] bins: two MAF classes (cut at {cut:g}) from {source}")
     return dict(files=dict(maf2=os.path.basename(path)), n_snps=int(len(meta)), source=source,
                 maf_classes={nm: int(s) for nm, s in zip(CLASS_NAMES, two.sum(axis=0)) if s > 0},
                 empty_left_out=dropped)

@@ -107,6 +107,14 @@ def test_local_scores_and_bins_match_a_direct_computation(small, tmp_path):
     assert list(a2.columns)[4:] == ["maf_low", "maf_high"]
     np.testing.assert_array_equal(a8[BIN_NAMES[:4]].sum(axis=1), a2.maf_low)
     assert rec["n_people"] == 350 and not os.path.exists(tmp_path / "b.local_ld.tsv.gz")
+    # the 24 unpooled bins (six MAF bins by four quartiles) pool by quartile into the eight bins
+    a24 = pd.read_csv(tmp_path / "b.bins24.annot.gz", sep="\t")
+    f24 = [c for c in a24.columns if c not in ("CHR", "BP", "SNP", "CM")]
+    assert len(f24) == 24 and (a24[f24].sum(axis=1) == 1).all() and a24.SNP.tolist() == a8.SNP.tolist()
+    for c in ("low", "high"):
+        for q in range(1, 5):
+            members = [x for x in f24 if x.endswith(f"_ld{q}") and (float(x.split("_")[2]) <= 0.05) == (c == "low")]
+            np.testing.assert_array_equal(a24[members].sum(axis=1), a8[f"maf_{c}_ld{q}"])
 
 
 def test_two_maf_classes_from_frequencies(small, tmp_path):
@@ -137,7 +145,7 @@ def test_release_folder_and_compose_from_it(small, tmp_path):
     names = sorted(os.listdir(out))
     assert names == sorted(["README.txt", "release.json", "cohort.curve.tsv", "cohort.curve.json",
                             "cohort.background.tsv", "cohort.cells.npz", "cohort.sample_factors.json",
-                            "cohort.bins8.annot.gz", "cohort.maf2.annot.gz"])
+                            "cohort.bins8.annot.gz", "cohort.bins24.annot.gz", "cohort.maf2.annot.gz"])
     assert {f["file"] for f in rec["files"]} | {"README.txt", "release.json"} == set(names)
     text = " ".join((out / "README.txt").read_text().split())
     assert "Never share" in text and "at least 50 people" in text
@@ -366,7 +374,9 @@ def test_release_on_snps_filtered_on_maf(small, tmp_path):
                                                                                    sep="\t", index=False)
     rec = make_release(str(tmp_path / "common"), str(small["dir"] / "ref"), str(tmp_path / "release"),
                        covar=str(tmp_path / "common.cov"), cell_cm=0.5, log=quiet)
-    assert rec["bins"]["empty_left_out"] == [f"maf_low_ld{q}" for q in range(1, 5)] + ["maf_low"]
+    assert rec["bins"]["empty_left_out"] == ([f"maf_low_ld{q}" for q in range(1, 5)]
+                                             + [f"maf_{b}_ld{q}" for b in ("0_0.02", "0.02_0.05") for q in range(1, 5)]
+                                             + ["maf_low"])
     a8 = pd.read_csv(tmp_path / "release" / "cohort.bins8.annot.gz", sep="\t")
     assert list(a8.columns)[4:] == [f"maf_high_ld{q}" for q in range(1, 5)]
     assert "maf_low" in " ".join((tmp_path / "release" / "README.txt").read_text().split())
@@ -481,6 +491,48 @@ def test_few_relative_pairs_record_no_pair_summary(small, tmp_path):
     with pytest.raises(ValueError, match="no summary of its listed related pairs"):
         compose_ldscores(str(d / "ref"), ss, an, str(tmp_path / "u"), curve=str(tmp_path / "nb"),
                          relatedness="uniform", log=quiet)
+
+
+def test_custom_bins_and_a_release_without_bins(small, tmp_path):
+    """Other MAF cuts, LD quantiles and class cut give files named after them whose fine bins pool into the coarse
+    ones; a class cut that is not one of the MAF cuts is refused; a release made with bins=False has no annotation,
+    its README asks the analyst for one, and compose reads the release with another annotation."""
+    from summit.admixed_ld.bins import bin_scheme
+    d = small["dir"]
+    sc = bin_scheme("0.01,0.05,0.2", 3, 0.05)
+    rec = make_bins(str(d / "cohort"), str(tmp_path / "c"), scheme=sc, log=quiet)
+    tag = "mafcuts0.01-0.05-0.2_ld3_class0.05"
+    assert rec["files"] == dict(pooled=f"c.{tag}.bins6.annot.gz", fine=f"c.{tag}.bins12.annot.gz",
+                                classes=f"c.{tag}.maf2.annot.gz")
+    fine = pd.read_csv(tmp_path / rec["files"]["fine"], sep="\t")
+    pooled = pd.read_csv(tmp_path / rec["files"]["pooled"], sep="\t")
+    tab, _ = local_ld_scores(str(d / "cohort"), log=quiet)
+    mb = np.digitize(tab.MAF.to_numpy(), [0.01, 0.05, 0.2])
+    names = [f"maf_{lo}_{hi}_ld{q}" for lo, hi in (("0", "0.01"), ("0.01", "0.05"), ("0.05", "0.2"), ("0.2", "0.5"))
+             for q in (1, 2, 3)]
+    assert [c for c in fine.columns[4:]] == [n for n in names if n in fine.columns]
+    for b, (lo, hi) in enumerate((("0", "0.01"), ("0.01", "0.05"), ("0.05", "0.2"), ("0.2", "0.5"))):
+        cols = [f"maf_{lo}_{hi}_ld{q}" for q in (1, 2, 3) if f"maf_{lo}_{hi}_ld{q}" in fine.columns]
+        sel = mb == b
+        assert (fine[cols].sum(axis=1).to_numpy() == sel).all()
+        if sel.sum() >= 3:                                       # tertiles of the local score within the MAF bin
+            q = fine.loc[sel, cols].to_numpy().argmax(axis=1)
+            assert (np.diff(q[np.argsort(tab.local.to_numpy()[sel], kind="stable")]) >= 0).all()
+    for q in (1, 2, 3):
+        low = [c for c in fine.columns[4:] if c.endswith(f"_ld{q}") and float(c.split("_")[2]) <= 0.05]
+        high = [c for c in fine.columns[4:] if c.endswith(f"_ld{q}") and float(c.split("_")[2]) > 0.05]
+        np.testing.assert_array_equal(fine[low].sum(axis=1), pooled[f"maf_low_ld{q}"])
+        np.testing.assert_array_equal(fine[high].sum(axis=1), pooled[f"maf_high_ld{q}"])
+    with pytest.raises(ValueError, match="must be one of the MAF cuts"):
+        bin_scheme("0.01,0.2", 4, 0.05)
+    out = tmp_path / "release"
+    rel = make_release(str(d / "cohort"), str(d / "ref"), str(out), covar=str(d / "cohort.cov"), cell_cm=0.5,
+                       bins=False, log=quiet)
+    assert rel["bins"] is None and not [f for f in os.listdir(out) if f.endswith(".annot.gz")]
+    assert "brings the annotation" in " ".join((out / "README.txt").read_text().split())
+    compose_ldscores(str(d / "ref"), [str(d / "ss" / "trait0.sumstats")], str(tmp_path / rec["files"]["classes"]),
+                     str(tmp_path / "ld"), release=str(out), log=quiet)
+    assert os.path.exists(tmp_path / "ld.gw.ldscore.gz")
 
 
 def test_every_flag_is_in_the_docs():

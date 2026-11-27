@@ -49,7 +49,7 @@ release (curve mode, the default) or a published admixture date (date mode). See
 | `clean-panels` | the reference and its panels | a reference without the panels' own admixture LD, with their background |
 | `release` | the cohort's genotypes, its GWAS people and covariates, related pairs | one folder of aggregates: the curve with its background term, cell matrix and sample statistic, the MAF/LD bins, and a list of what to share |
 | `curve` | as `release` | the curve files of the release alone |
-| `bins` | the cohort's genotypes, or summary statistics with allele frequencies, or the reference and a mean ancestry | the eight MAF/LD bins and the two MAF classes, or the two MAF classes alone |
+| `bins` | the cohort's genotypes, or summary statistics with allele frequencies, or the reference and a mean ancestry | the eight MAF/LD bins, the 24 unpooled bins and the two MAF classes (other cuts with `--maf-cuts`, `--ld-quantiles`, `--maf-class-cut`), or the two MAF classes alone |
 | `compose` | reference, summary statistics, annotation, `--release` or `--admixture-generations` | `.gw.ldscore.gz`, `.gw.M`, `.admixed_ld.json` |
 | `sample-factors` | the genotypes and covariates of one GWAS sample (for example a trait measured in part of the cohort) | its sample statistic alone (aggregates only) |
 | `derive` | an admixed cohort that carries a source without a panel, and anchor members | a reference with that source |

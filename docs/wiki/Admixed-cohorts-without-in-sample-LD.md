@@ -73,17 +73,35 @@ summit --rg gwas/height.tsv,gwas/bmi.tsv --ldscores ld/cohort --annot release/co
 - `--keep-ambiguous` keeps A/T and C/G SNPs, which two GWAS of the same people need not align. `--pheno-rg` and
   `--pheno-rg-cov` give the phenotypes and covariates of the two GWAS, where they are at hand, for the covariance of the
   two samples; without them SUMMIT estimates it from the summary statistics.
-- `release/cohort.bins8.annot.gz` holds the eight MAF and LD bins. In samples of a few thousand people or fewer the
-  heritability of eight bins is poorly determined, and the two MAF classes of `release/cohort.maf2.annot.gz` are the
-  more stable readout.
+- `release/cohort.bins8.annot.gz` holds the eight MAF and LD bins, `release/cohort.bins24.annot.gz` the 24 unpooled
+  bins and `release/cohort.maf2.annot.gz` the two MAF classes. [Annotations](#annotations) says which to fit.
 
 Date mode replaces `--release release` with a published date, for example `--admixture-generations 6` for African
-American groups, and needs nothing from the cohort. Without the cohort's bins, fit two MAF classes cut at 0.05
-([The MAF and LD bins](SUMMIT-MIX-details.md#the-maf-and-ld-bins)).
+American groups, and needs nothing from the cohort.
 
 To try both quick starts on simulated data, run `bash example/admixed_ld_release.sh` from the repository root.
 `bash example/admixed_ld.sh` runs the separate steps, date mode, in-sample LD scores for comparison and fine-mapping.
 Each takes about a minute.
+
+## Annotations
+
+Compose takes any annotation of the fit as `--annot`, as `summit --h2` and `--rg` do. Its 0/1 columns may be MAF
+classes, functional annotations or the baseline model of stratified LD score regression, and they may overlap, up to 64
+distinct combinations of columns on the GWAS SNPs. The release's curve and sample statistic do not depend on the
+annotation, so one release serves every annotation the analyst chooses.
+
+Annotations that depend on the cohort's own LD, such as the MAF and LD bins, can only come from the cohort's release,
+because their local LD score is computed from the cohort's genotypes. For total heritability we recommend a model
+partitioned by MAF and LD. The eight bins suit samples of a few thousand people, such as the UK Biobank samples of
+3,781 and 6,111 people that we used, and traits of low heritability. Large samples can fit the 24 unpooled bins (six
+MAF bins by four LD quartiles). Fit the two MAF classes cut at 0.05 without the cohort's bins, and in samples as small
+as the multiracial group of 2,248 All of Us participants, where the heritability of eight bins is poorly determined
+([The MAF and LD bins](SUMMIT-MIX-details.md#the-maf-and-ld-bins)). For enrichment, split the two MAF classes by
+membership in a functional annotation into four classes, or add the functional annotation as an overlapping column next
+to the eight bins.
+
+`bins` and `release` take `--maf-cuts`, `--ld-quantiles` and `--maf-class-cut` for other MAF and LD bins.
+`release --no-bins` makes none, and the analyst then brings the annotation of the fit.
 
 ## How it works
 
