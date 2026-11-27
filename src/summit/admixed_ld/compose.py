@@ -31,9 +31,9 @@ factor. The output is written with SUMMIT's own LD-score writer, so `summit --h2
 """
 from __future__ import annotations
 
-import glob
 import json
 import os
+import pathlib
 import time
 
 import numpy as np
@@ -48,11 +48,17 @@ from .reference import Reference
 
 
 def _sumstats_files(paths):
+    """The summary-statistic files of --sumstats: each file given, and for a directory every file in it that `summit
+    --h2 DIR` reads (each regular file whose name does not start with a dot), so that compose and the fit see the same
+    traits."""
     files = []
     for p in paths:
         if os.path.isdir(p):
-            files += sorted(f for f in glob.glob(os.path.join(p, "*")) if f.endswith((".tsv", ".tsv.gz", ".txt",
-                                                                                     ".txt.gz", ".gz")))
+            found = sorted(str(x) for x in pathlib.Path(p).iterdir() if x.is_file() and not x.name.startswith("."))
+            if not found:
+                raise ValueError(f"No summary-statistic files in the directory {p} (compose reads every file in it "
+                                 "whose name does not start with a dot, as summit --h2 does).")
+            files += found
         else:
             files.append(p)
     if not files:
@@ -674,6 +680,23 @@ def relatedness_term(L, rel, chrom, cm, cls, V, K, nu, grid_cm, scale=1.0, partn
         L[sel] += (scale * acc) / nu ** 2
 
 
+PARTNERS_MARKER = ".partners.json"
+
+
+def partners_marker(prefix, dense, n_partners=None, n_rows=None):
+    """Write <prefix>.partners.json next to an LD-score file composed with --partners reference (summit --h2/--rg
+    refuse such a file), or remove an earlier run's marker from a composition over the rows."""
+    path = f"{prefix}{PARTNERS_MARKER}"
+    if dense:
+        with open(path, "w") as fh:
+            json.dump(dict(partners="reference", n_partners=n_partners, n_rows=n_rows,
+                           note="composed with summit admixed-ld compose --partners reference (a development option): "
+                                "the partners of these LD scores are not the regression SNPs, so summit --h2 and --rg "
+                                "do not fit them; track-rg reads the partners' counts"), fh, indent=1)
+    elif os.path.lexists(path):
+        os.remove(path)
+
+
 def release_statistic(curve):
     """The sample statistic released with the curve CURVE (prefix): (path, None), or (None, why) when the curve records
     none (made with --no-sample-factors, before curves carried it, or its pass could not make it). The curve's json
@@ -826,7 +849,7 @@ def compose_ldscores(ref_path, sumstats, annot, out, *, sources=None, snps=None,
                      sample_factors=None, sample_factors_calibrate=True, calibrate_between_chromosomes=False,
                      per_trait_n=True, n_tol=0.01, tracks=False, track_alpha=None, partners="rows",
                      drop_ambiguous=False, pair_chunk=1 << 23, release_sample_factors=True, min_release_share=0.85,
-                     dry_run=False, require=None, max_annotation_atoms=64, log=print):
+                     dry_run=False, require=None, max_annotation_atoms=64, cov_rank=None, log=print):
     """Composed LD scores for an admixed GWAS sample with two or more sources (the last is the baseline of the
     contrasts). mean_ancestry: K-1 or K values (comma-separated); kappa0: the upper triangle of Kt_res(0) row by row.
     Departures from the standard recipe that are allowed but should be visible are recorded in the params json under
@@ -861,11 +884,18 @@ def compose_ldscores(ref_path, sumstats, annot, out, *, sources=None, snps=None,
     any per-combination array is allocated (memory and time grow with their number).
 
     partners: 'rows' (the default) takes the partners k of every LD score to be the GWAS SNPs themselves; 'reference'
-    takes every reference variant listed in the annotation (a dense reference holding the causal variants), with the
-    GWAS SNPs as the rows j. Each SNP of the annotation is then a partner, the masses in <out>.gw.M are the partners'
-    counts per class, and every term is a sum over the partners (the window pairs, the admixture LD, the same-person
-    and relatives' terms); the cohort's cell matrix and sample factors, which are measured on the GWAS SNPs, are not
-    available with it.
+    (a development option) takes every reference variant listed in the annotation (a dense reference holding the
+    causal variants), with the GWAS SNPs as the rows j. Each SNP of the annotation is then a partner, the masses in
+    <out>.gw.M are the partners' counts per class, and every term is a sum over the partners (the window pairs, the
+    admixture LD, the same-person and relatives' terms); the cohort's cell matrix and sample statistic, which are
+    measured on the GWAS SNPs, are left out (flag partners_reference). `summit --h2/--rg` fit with the regression
+    SNPs' own class sizes and a symmetrized class trace matrix, both exact only when the rows are the partners, so
+    every LD-score file of such a composition has a marker <prefix>.partners.json next to it, and they refuse it;
+    `track-rg` reads the partners' counts.
+
+    cov_rank: the covariate rank of summary statistics without a COV_RANK column (a file's own COV_RANK is kept).
+    Without it such a trait takes the covariate rank of the curve (or of a statistic given to compose), with the flag
+    cov_rank_from_curve, and without either the rank 0, with the flag cov_rank_missing.
 
     tracks: also write the LD scores of the within-ancestry allele deviations that a local-ancestry-aware GWAS
     (Tractor: y ~ covariates + local-ancestry dosages + ancestry-specific allele counts) regresses on, for the
@@ -923,6 +953,15 @@ def compose_ldscores(ref_path, sumstats, annot, out, *, sources=None, snps=None,
     if dense and (cell_matrix is True or sample_factors is not None or calibrate_between_chromosomes):
         raise ValueError("--partners reference cannot be combined with --cell-matrix, --sample-factors or "
                          "--calibrate-between-chromosomes: those are measured on the GWAS SNPs.")
+    if dense:
+        left = (["the curve's sample statistic (random-mating same-person term)"] if curve is not None else []) + (
+            ["the curve's cell matrix"] if curve is not None else [])
+        detail = ("development option: summit --h2 and --rg refuse these LD scores (marker <prefix>.partners.json), "
+                  "because their fits use the regression SNPs' class sizes and a symmetrized class trace matrix, "
+                  "which are exact only when the partners are the regression SNPs"
+                  + (f"; left out because they are measured on the GWAS SNPs: {', '.join(left)}" if left else ""))
+        pre_flags.append(dict(flag="partners_reference", detail=detail))
+        log(f"[admixed-ld] WARNING (recorded flag partners_reference): --partners reference is a {detail}.")
     sfi = None
     if sample_factors is not None:
         from .sample_factors import read_sample_factors
@@ -1024,19 +1063,57 @@ def compose_ldscores(ref_path, sumstats, annot, out, *, sources=None, snps=None,
             raise ValueError("Every GWAS variant must also be a partner.")
 
     # ---------------------------------------------------------------------------------------- parameters
-    tables, n_med, p_rank = [], [], []
+    # the covariate rank of each GWAS (COV_RANK) sets nu = N - rank - 1; a file without COV_RANK takes --cov-rank, else
+    # the covariate rank that the cohort's curve (or a statistic given to compose) was made with
+    cohort_rank, cohort_rank_from = None, None
+    if curve is not None:
+        with open(f"{curve}.curve.json") as fh:
+            cohort_rank, cohort_rank_from = json.load(fh).get("covariate_rank"), "the curve"
+    if cohort_rank is None and sfi is not None and sfi.get("covariate_rank") is not None:
+        cohort_rank, cohort_rank_from = sfi["covariate_rank"], "the sample statistic"
+    tables, n_med, p_rank, p_from = [], [], [], []
     for f in files:
-        ss = Sumstats.from_file(f, name=os.path.basename(f), compute_diagnostics=False)
+        try:
+            ss = Sumstats.from_file(f, name=os.path.basename(f), compute_diagnostics=False)
+        except Exception as e:
+            raise ValueError(f"Could not read the summary statistics {f}: {e}") from e
         ix = ss.index.get_indexer(snp_ids)
         t = pd.DataFrame({"N": np.where(ix >= 0, ss.n[ix], np.nan), "SE": np.where(ix >= 0, ss.se[ix], np.nan),
                           "BETA": np.where(ix >= 0, ss.beta[ix], np.nan)})
         tables.append((ss.name, t))
         n_med.append(float(np.median(ss.n)))
-        p_rank.append(int(ss.cov_rank))
+        if ss.cov_rank_source != "default0":
+            p_rank.append(int(ss.cov_rank))
+            p_from.append("COV_RANK")
+        elif cov_rank is not None:
+            p_rank.append(int(cov_rank))
+            p_from.append("--cov-rank")
+        elif cohort_rank is not None:
+            p_rank.append(int(cohort_rank))
+            p_from.append(cohort_rank_from)
+        else:
+            p_rank.append(0)
+            p_from.append("none")
     N = float(np.median(n_med))
     p = int(np.median(p_rank))
     m_in, k_in = _parse_values(mean_ancestry), _parse_values(kappa0)
     flags = list(pre_flags)
+    names_ = [t[0] for t in tables]
+    filled = [nm for nm, w in zip(names_, p_from) if w == cohort_rank_from]
+    if filled:
+        detail = (f"{len(filled)} of {len(names_)} trait(s) without COV_RANK ({', '.join(filled[:5])}"
+                  + (", ..." if len(filled) > 5 else "") + f") take the covariate rank of {cohort_rank_from}, "
+                  f"{int(cohort_rank)}")
+        flags.append(dict(flag="cov_rank_from_curve", detail=detail))
+        log(f"[admixed-ld] compose: {detail} (recorded flag cov_rank_from_curve; --cov-rank sets it)")
+    unknown = [nm for nm, w in zip(names_, p_from) if w == "none"]
+    if unknown:
+        detail = (f"{len(unknown)} of {len(names_)} trait(s) have no COV_RANK ({', '.join(unknown[:5])}"
+                  + (", ..." if len(unknown) > 5 else "") + "), and no curve or --cov-rank gives it")
+        flags.append(dict(flag="cov_rank_missing", detail=detail))
+        log(f"[admixed-ld] WARNING (recorded flag cov_rank_missing): {detail}; nu = N - 1 assumes a GWAS without "
+            "covariates. Pass --cov-rank with the number of covariates of the GWAS, principal components included, "
+            "or add a COV_RANK column.")
     if _track_sumstats(files[0]):
         # one track's summary statistics (tractor-sumstats): their SEs follow the track variable, not the genotype, so
         # the SE regression for m and kappa_res(0) does not apply
@@ -1102,11 +1179,19 @@ def compose_ldscores(ref_path, sumstats, annot, out, *, sources=None, snps=None,
             lam = np.array([curve_info["fit_per_source"][s]["lam"] for s in sources])
         kern = KernelMatrix.from_curve(d_c, kc, inter, k0, lam)
         c_rank = curve_info.get("covariate_rank")
-        if c_rank is not None and p > 0 and int(c_rank) != p:
-            flags.append(dict(flag="covariates_differ_from_curve",
-                              detail=f"curve covariate rank {int(c_rank)}, GWAS COV_RANK {p}"))
-            log(f"[admixed-ld] WARNING (recorded flag covariates_differ_from_curve): the curve was made with {int(c_rank)} "
-                f"covariates and the GWAS reports {p}. The curve must use the GWAS's own covariates (and its PCs).")
+        # each GWAS's own covariate rank (COV_RANK or --cov-rank) against the curve's; the summary statistics of
+        # local-ancestry tracks count the local-ancestry terms in COV_RANK, so they are not compared
+        differ = ([(nm, r) for nm, r, w in zip(names_, p_rank, p_from) if w in ("COV_RANK", "--cov-rank")
+                   and int(r) != int(c_rank)] if (c_rank is not None and not _track_sumstats(files[0])) else [])
+        if differ:
+            detail = (f"curve covariate rank {int(c_rank)}; GWAS covariate rank "
+                      + ", ".join(f"{nm} {r}" for nm, r in differ[:5]) + (", ..." if len(differ) > 5 else ""))
+            flags.append(dict(flag="covariates_differ_from_curve", detail=detail))
+            log(f"[admixed-ld] WARNING (recorded flag covariates_differ_from_curve): the curve was made with "
+                f"{int(c_rank)} covariates and {len(differ)} trait(s) report another number ("
+                + ", ".join(f"{nm} {r}" for nm, r in differ[:5]) + (", ..." if len(differ) > 5 else "")
+                + "). The curve must use the GWAS's own covariates, principal components included, and every GWAS "
+                "the same ones.")
         if sfi is not None and not sf_from_release:
             # a statistic given to compose (the remedy of the flag: the trait's own people): the share of its people
             flags += release_coverage(tables, n_med, sfi.get("n_samples"), min_release_share, log, against="statistic")
@@ -1149,8 +1234,9 @@ def compose_ldscores(ref_path, sumstats, annot, out, *, sources=None, snps=None,
                           "kappa_res(0) under random mating (a lower bound when mating is assortative)"))
         log(f"[admixed-ld] WARNING (recorded flag ancestry_sd_from_identity): global-ancestry SD {sd_id:.4f} from m and "
             "kappa_res(0) (random mating; assortative mating makes the true SD larger). The moments set the "
-            "same-person term, whose share of LD mass grows with SNPs per person (21% of the exact in-sample mass in "
-            "UK Biobank t1); pass --ancestry-sd with a published value when the cohort reports one.")
+            "same-person term, whose share of LD mass grows with SNPs per person (20% of the in-sample LD mass in "
+            "an admixed UK Biobank sample of 3,781 people); pass --ancestry-sd with a published value when the "
+            "cohort reports one.")
     mom = moments_tensors(th, k1)
     rel_sum, rel_prof = None, None          # optional input: uniform sum of g^2, or the curve's profile
     if relatedness is None:
@@ -1197,14 +1283,17 @@ def compose_ldscores(ref_path, sumstats, annot, out, *, sources=None, snps=None,
         log(f"[admixed-ld] compose: the curve's relatives' sums are over its {n_curve} people; times "
             f"{rel_scale:.6g} for the GWAS's N {N:.0f}")
         if abs(rel_scale - 1.0) > 0.01:
+            # expected with one release for the cohort: every GWAS of the cohort is composed from the same curve
             flags.append(dict(flag="relatedness_curve_sample_differs",
-                              detail=f"curve of {n_curve} people, GWAS N {N:.0f}: the relatives' term is scaled by "
+                              detail=f"curve of {n_curve} people, GWAS N {N:.0f}: the background term is scaled by "
                                      f"{rel_scale:.4g}, which assumes the GWAS's people are a random subset of the "
-                                     "curve's (or the reverse)"))
-            log(f"[admixed-ld] WARNING (recorded flag relatedness_curve_sample_differs): the curve was made on "
-                f"{n_curve} people and the GWAS has N {N:.0f}; the relatives' term is scaled by {rel_scale:.4g}, "
-                "the GWAS's people taken as a random subset of the curve's. Make the curve on the GWAS's people "
-                "where possible.")
+                                     "curve's"))
+            log(f"[admixed-ld] note (recorded flag relatedness_curve_sample_differs): the curve was made on {n_curve} "
+                f"people and the GWAS has N {N:.0f}, so the background term is scaled by {rel_scale:.4g}. This is "
+                "expected when one release serves every GWAS of the cohort. It assumes the GWAS's people are a random "
+                "subset of the curve's; a trait measured in a selected part of the cohort (another ancestry mix, or "
+                "more or fewer relatives) needs the statistic of its own people (see the flag "
+                "gwas_sample_smaller_than_release).")
     # the panels' own background LD, which their unbiased squared covariances hold inside the band: removed when the
     # cohort's background is applied at every distance (background_window 'panels')
     panel_bg = {}
@@ -1655,6 +1744,13 @@ def compose_ldscores(ref_path, sumstats, annot, out, *, sources=None, snps=None,
             f"not applied, no realized LD mass: {why}")
     L = L_pop + sp + (0.0 if R1 is None else (rel_scale / nu ** 2) * R1)
     V = Vpop
+
+    def write_ld(prefix, *a, **kw):
+        """SUMMIT's LD-score writer, with the marker of a composition over other partners than the rows."""
+        path = write_gw_ldscore_table(prefix, *a, **kw)
+        partners_marker(prefix, dense, n_partners=int(p_idx.size), n_rows=int(M))
+        return path
+
     groups_info, wrote_groups = None, False
     if nu_given and abs(nu - (N - p - 1.0)) > 0.02 * (N - p - 1.0):
         flags.append(dict(flag="nu_differs_from_gwas_n", detail=f"nu {nu:.0f} given; the traits' median N {N:.0f} and "
@@ -1684,7 +1780,7 @@ def compose_ldscores(ref_path, sumstats, annot, out, *, sources=None, snps=None,
                 g.update(relatedness_scale=float(fg), file=f"{out}.n{g['label']}.gw.ldscore.gz",
                          ld_mass=float((V[:, None] * Lg).sum()))
                 snpdf_g = pd.DataFrame({"CHR": chrom_out, "SNP": snp_ids, "BP": rv["BP"].to_numpy()[r_idx]})
-                write_gw_ldscore_table(f"{out}.n{g['label']}", snpdf_g, pd.DataFrame(to_cols(Lg), columns=out_classes),
+                write_ld(f"{out}.n{g['label']}", snpdf_g, pd.DataFrame(to_cols(Lg), columns=out_classes),
                                        snp_var=V)
                 write_gw_annotation_masses(f"{out}.n{g['label']}", to_cols(np.bincount(clsP, minlength=K).astype(float)))
             # the files by name, relative to the table's own directory (they are next to it), so that --h2 finds them
@@ -1714,7 +1810,7 @@ def compose_ldscores(ref_path, sumstats, annot, out, *, sources=None, snps=None,
 
     # ---------------------------------------------------------------------------------------- write
     snpdf = pd.DataFrame({"CHR": chrom_out, "SNP": snp_ids, "BP": rv["BP"].to_numpy()[r_idx]})
-    write_gw_ldscore_table(out, snpdf, pd.DataFrame(to_cols(L), columns=out_classes), snp_var=V)
+    write_ld(out, snpdf, pd.DataFrame(to_cols(L), columns=out_classes), snp_var=V)
     masses_P = np.bincount(clsP, minlength=K).astype(float)        # the partners' counts (the rows' by default)
     write_gw_annotation_masses(out, to_cols(masses_P))
     params = dict(format="summit-admixed-ld-compose", version=1, sources=sources, baseline=sources[-1], n_snps=int(M),
@@ -1739,7 +1835,7 @@ def compose_ldscores(ref_path, sumstats, annot, out, *, sources=None, snps=None,
         keep = v2_out > 0
         Lx[np.arange(M), cls] += np.sqrt(Vpop)
         xout = f"{out}.cross_{cross_source}"
-        write_gw_ldscore_table(xout, snpdf[keep].reset_index(drop=True),
+        write_ld(xout, snpdf[keep].reset_index(drop=True),
                                pd.DataFrame(to_cols(Lx[keep]), columns=out_classes), snp_var=np.sqrt(Vpop[keep]))
         write_gw_annotation_masses(xout, to_cols(masses_P) if dense
                                    else to_cols(np.bincount(cls[keep], minlength=K).astype(float)))
@@ -1759,7 +1855,7 @@ def compose_ldscores(ref_path, sumstats, annot, out, *, sources=None, snps=None,
         if R1 is not None:
             tflags.append(dict(flag="track_scores_without_relatives",
                                detail="the relatives' term enters the own-track moments; the track scores leave it out"))
-        tb = T.finish(out, snpdf, classes, np.arange(M) if prow is None else row_of, cls, write_gw_ldscore_table,
+        tb = T.finish(out, snpdf, classes, np.arange(M) if prow is None else row_of, cls, write_ld,
                       write_gw_annotation_masses, tflags)
         tb.update(partners=partners, decay_per_cm=dict(zip(sources, np.asarray(kern.lam, float).tolist())))
         params["tracks"] = tb

@@ -2070,6 +2070,35 @@ def _group_file_path(f, table):
     return os.path.join(here, f)
 
 
+def _resolve_ldscore_prefix(path):
+    """A compose output given by its prefix (PREFIX for PREFIX.gw.ldscore.gz), as --h2, --rg and the cross-population
+    options accept it; any other path is returned unchanged."""
+    if path is None:
+        return None
+    s = str(path)
+    if "@" not in s and not s.endswith(".gw.ldscore.gz") and not os.path.exists(s) and os.path.exists(
+            f"{s}.gw.ldscore.gz"):
+        return f"{s}.gw.ldscore.gz"
+    return path
+
+
+def _refuse_partner_ldscores(path, option="--ldscores"):
+    """LD scores composed with `summit admixed-ld compose --partners reference` (a marker PREFIX.partners.json next to
+    PREFIX.gw.ldscore.gz) sum over partners other than the regression SNPs. The h2 and rg fits take each class's size
+    from the regression SNPs and symmetrize the class trace matrix, which is exact only when the two sets are the same,
+    so such a file is refused."""
+    if path is None:
+        return
+    s = str(path)
+    prefix = s[:-len(".gw.ldscore.gz")] if s.endswith(".gw.ldscore.gz") else s
+    if os.path.exists(f"{prefix}.partners.json"):
+        raise ValueError(f"{option} {path} was composed with `summit admixed-ld compose --partners reference` "
+                         f"({prefix}.partners.json): its LD scores sum over other partners than the regression SNPs, "
+                         "which the h2 and rg fits do not support (they use the regression SNPs' class sizes and a "
+                         "symmetrized class trace matrix). Compose with the default partners (the GWAS SNPs) for "
+                         "summit --h2 and --rg; --partners reference serves track-rg and development.")
+
+
 def _ldscore_groups(ldscores):
     """compose's PREFIX.n_groups.tsv next to --ldscores (PREFIX or PREFIX.gw.ldscore.gz): (prefix, table of trait,
     N, ldscores), or None when there is none. The ldscores column is resolved against the table's directory."""
@@ -2208,6 +2237,7 @@ def _dispatch_h2_groups(args, log, prefix, tab):
     for f in files:
         if not os.path.exists(f):
             raise ValueError(f"The group LD-score file {f} listed in {prefix}.n_groups.tsv does not exist.")
+        _refuse_partner_ldscores(f, f"the group file of {prefix}.n_groups.tsv")
     for b in base_of:
         _check_group_n(b, base_of[b], tab, prefix, log)
     log._log(f"[h2] {prefix}.n_groups.tsv: {len(base_of)} traits in {len(files)} LD-score groups; each trait is fitted "
@@ -2267,9 +2297,8 @@ def _dispatch_h2(args, log):
     if args.ldscores is None:
         log._log("!!! --ldscores must be provided for refactored h2 estimation. !!!")
         raise SystemExit(1)
-    if (not str(args.ldscores).endswith(".gw.ldscore.gz") and not os.path.exists(str(args.ldscores))
-            and os.path.exists(f"{args.ldscores}.gw.ldscore.gz")):
-        args.ldscores = f"{args.ldscores}.gw.ldscore.gz"           # a compose output given by its prefix
+    args.ldscores = _resolve_ldscore_prefix(args.ldscores)            # a compose output given by its prefix
+    _refuse_partner_ldscores(args.ldscores)
     grp = _ldscore_groups(args.ldscores) if getattr(args, "ldscore_groups", "auto") == "auto" else None
     if grp is not None:
         if args.h2_batch_fast:
@@ -2288,6 +2317,7 @@ def _dispatch_h2(args, log):
         if not os.path.exists(f):
             raise ValueError(f"The group LD-score file {f} listed in {prefix}.n_groups.tsv does not exist.")
         _check_group_n(b, str(args.h2), tab, prefix, log)
+        _refuse_partner_ldscores(f, f"the group file of {prefix}.n_groups.tsv")
         log._log(f"[h2] {b}: LD scores {f} ({prefix}.n_groups.tsv)")
         args.ldscores = f
     _remove_stale_group_outputs(args.out, log)          # this run fits with one file: no group outputs of another
@@ -2422,13 +2452,16 @@ def _dispatch_gxe_fit(args, log):
 
 
 def _cross_h2_ldscores(args, log):
-    """The two traits' own LD scores for cross-population rg, or None."""
+    """The two traits' own LD scores for cross-population rg, or None (compose outputs may be given by prefix)."""
     a, b = getattr(args, "ldscores_h2_1", None), getattr(args, "ldscores_h2_2", None)
     if a is None and b is None:
         return None
     if a is None or b is None:
         log._log("!!! Cross-population rg needs both --ldscores-h2-1 and --ldscores-h2-2. !!!")
         raise SystemExit(1)
+    a, b = _resolve_ldscore_prefix(a), _resolve_ldscore_prefix(b)
+    _refuse_partner_ldscores(a, "--ldscores-h2-1")
+    _refuse_partner_ldscores(b, "--ldscores-h2-2")
     return (a, b)
 
 
@@ -2437,6 +2470,8 @@ def _dispatch_rg(args, log):
     if args.ldscores is None:
         log._log("!!! --ldscores must be provided for rg estimation. !!!")
         raise SystemExit(1)
+    args.ldscores = _resolve_ldscore_prefix(args.ldscores)            # a compose output given by its prefix, as --h2
+    _refuse_partner_ldscores(args.ldscores)
     if getattr(args, "ldscore_groups", "auto") == "auto" and _ldscore_groups(args.ldscores) is not None:
         log._log(f"[rg] note: {args.ldscores} has compose LD-score groups (n_groups.tsv); --rg uses the file given for "
                  "both traits. For traits of different GWAS samples pass the LD scores of the pair's sample.")
@@ -2837,6 +2872,8 @@ def _dispatch_rg_manifest(args, log):
     if args.ldscores is None:
         log._log("!!! --ldscores must be provided for rg estimation. !!!")
         raise SystemExit(1)
+    args.ldscores = _resolve_ldscore_prefix(args.ldscores)
+    _refuse_partner_ldscores(args.ldscores)
     if getattr(args, "rel_m12", None) is not None:
         log._log("!!! --rel-m12 applies to a single --rg pair; in rg manifest mode give each pair's value or file in "
                  "an optional rel_m12 column. !!!")

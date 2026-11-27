@@ -163,7 +163,8 @@ def main(argv=None):
     m = sub.add_parser("compose", help="LD scores from the resource, the GWAS and the decay of local-ancestry covariance")
     m.add_argument("--ref", required=True)
     m.add_argument("--sumstats", nargs="+", required=True,
-                   help="SUMMIT summary statistics (files or a directory); their SEs give mean ancestry and kappa(0)")
+                   help="SUMMIT summary statistics: files, or a directory whose every file (names not starting with a "
+                        "dot) is read, as summit --h2 DIR reads it; their SEs give mean ancestry and kappa(0)")
     m.add_argument("--annot", required=True, help="annotation of the fit: SNP and one 0/1 column per class")
     m.add_argument("--snps", default=None,
                    help="variant table of the GWAS (BIM, PVAR, or CHR BP SNP A1 A2) if the summary statistics lack "
@@ -198,6 +199,10 @@ def main(argv=None):
     m.add_argument("--background-window", choices=["panels", "zero", "flat"], default="panels",
                    help=argparse.SUPPRESS)
     m.add_argument("--nu", type=float, default=None, help="sample size minus covariates (default from the GWAS)")
+    m.add_argument("--cov-rank", type=int, default=None,
+                   help="the number of covariates of the GWAS, principal components included, for summary statistics "
+                        "without a COV_RANK column (default: the curve's covariate rank, recorded with the flag "
+                        "cov_rank_from_curve; in date mode 0, with the flag cov_rank_missing)")
     m.add_argument("--grid-cm", type=float, default=0.02, help=argparse.SUPPRESS)
     m.add_argument("--no-cell-matrix", dest="cell_matrix", action="store_const", const=False, default="auto",
                    help="leave out the cohort's cell matrix (used by default with --curve)")
@@ -215,10 +220,9 @@ def main(argv=None):
                         "in the reference (e.g. EUR): sum_k rho_1 rho_2 sqrt(V_1 V_2) within the window, for "
                         "cross-population genetic correlation")
     m.add_argument("--sample-factors", default=None,
-                   help="the cohort's person-factor statistic (`summit admixed-ld sample-factors`, on the GWAS's "
-                        "people with its covariates): the same-person term from it instead of the random-mating "
-                        "covariance of heterozygosity (for a few hundred people, first-generation groups, in-sample "
-                        "PCs)")
+                   help="a sample statistic made with `summit admixed-ld sample-factors` on one GWAS's people with the "
+                        "GWAS covariates, for example a trait measured in part of the cohort: the same-person term "
+                        "from it in place of the curve's own statistic")
     m.add_argument("--calibrate-between-chromosomes", action="store_true",
                    help="with sample factors that carry the cohort's realized LD mass: put the difference between it and "
                         "the composed mass on pairs of SNPs on different chromosomes, uniformly per pair (for structure "
@@ -249,10 +253,8 @@ def main(argv=None):
                         "of that statistic's people)")
     m.add_argument("--sample-factors-no-calibration", action="store_true",
                    help=argparse.SUPPRESS)
-    m.add_argument("--partners", choices=["rows", "reference"], default="rows",
-                   help="partner variants of the LD scores: 'rows', the GWAS SNPs themselves (the default), or "
-                        "'reference', every reference variant listed in --annot (a dense reference that holds the "
-                        "causal variants), with the GWAS SNPs as the rows; .gw.M then holds the partners' counts")
+    # development option: summit --h2/--rg refuse its LD scores (see compose_ldscores)
+    m.add_argument("--partners", choices=["rows", "reference"], default="rows", help=argparse.SUPPRESS)
     m.add_argument("--tracks", action="store_true",
                    help="also write the LD scores of the local-ancestry tracks of a Tractor-style GWAS (own score of "
                         "each track, the cross score of each pair of tracks, and with --cross-source the tracks against "
@@ -552,7 +554,7 @@ def _run(a, log):
                          track_alpha=a.track_alpha, partners=a.partners, drop_ambiguous=a.drop_ambiguous,
                          release_sample_factors=a.release_sample_factors, min_release_share=a.min_release_share,
                          dry_run=a.dry_run, require=a.require, max_annotation_atoms=a.max_annotation_atoms,
-                         log=log._log)
+                         cov_rank=a.cov_rank, log=log._log)
     return 0
 
 
